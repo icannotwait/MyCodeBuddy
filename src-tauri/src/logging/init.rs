@@ -21,6 +21,7 @@ use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
 use tracing_appender::rolling::Rotation;
 use tracing_subscriber::{fmt, prelude::*, reload, EnvFilter, Registry};
 
+use crate::logging::budget::{self, BudgetedWriter};
 use crate::logging::hub::LogHub;
 use crate::logging::layer::BufferEmitLayer;
 use crate::logging::{LogLevel, LogSettings, LOGGING_LEVEL_KEY};
@@ -142,9 +143,19 @@ pub fn env_level_is_set() -> bool {
     env_level_override().is_some()
 }
 
+/// Shared with [`budget::resume_point`], which reconstructs today's filename
+/// to measure already-written bytes — the prefix/suffix pair must not drift.
+const LOG_FILE_SUFFIX: &str = "log";
+
 /// Create the rotating file writer, returning `None` (degrading to stderr +
 /// buffer only) if the directory or appender can't be initialized. Logging init
 /// must never crash the app.
+///
+/// The appender is wrapped in a [`BudgetedWriter`] so one day's file can't grow
+/// without bound: `Rotation::DAILY` decides *when* a new file starts, never how
+/// large the current one may get. The budget **resumes** the day it starts in
+/// rather than beginning at zero — the appender re-opens an existing dated file
+/// in append mode.
 fn init_file_writer(dir: &Path, prefix: &str) -> Option<(NonBlocking, WorkerGuard)> {
     // Pre-subscriber bootstrap: the subscriber isn't installed yet, so these
     // diagnostics legitimately go straight to stderr rather than via tracing.
@@ -155,7 +166,7 @@ fn init_file_writer(dir: &Path, prefix: &str) -> Option<(NonBlocking, WorkerGuar
     let appender = match tracing_appender::rolling::Builder::new()
         .rotation(Rotation::DAILY)
         .filename_prefix(prefix)
-        .filename_suffix("log")
+        .filename_suffix(LOG_FILE_SUFFIX)
         .max_log_files(file_retention())
         .build(dir)
     {
@@ -168,7 +179,14 @@ fn init_file_writer(dir: &Path, prefix: &str) -> Option<(NonBlocking, WorkerGuar
             return None;
         }
     };
-    Some(tracing_appender::non_blocking(appender))
+    let (day, already_written) = budget::resume_point(dir, prefix, LOG_FILE_SUFFIX);
+    let budgeted = BudgetedWriter::resuming(
+        appender,
+        budget::configured_max_bytes_per_day(),
+        day,
+        already_written,
+    );
+    Some(tracing_appender::non_blocking(budgeted))
 }
 
 /// Build and install the subscriber. `file_dir` is `None` for `codeg-mcp`

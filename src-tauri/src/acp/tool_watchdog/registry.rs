@@ -2400,7 +2400,8 @@ mod tests {
         assert!(reg.scan(t0.advanced(10_000)).await.is_empty());
 
         // last_progress not invented: still original wall time after re-enable path check.
-        reg.apply_settings(ToolWatchdogSettings::enabled_defaults()).await;
+        reg.apply_settings(ToolWatchdogSettings::enabled_defaults())
+            .await;
         // Immediately overdue under original last_progress_at = t0.
         let re_warn = reg.scan(t0.advanced(10_000)).await;
         assert_eq!(re_warn.len(), 1);

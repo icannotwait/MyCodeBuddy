@@ -1,14 +1,9 @@
 "use client"
 
 import { useCallback, useEffect, useState } from "react"
-import { useTranslations } from "next-intl"
-import { toast } from "sonner"
 import { openSettingsWindow } from "@/lib/api"
-import { openFolderWithDraft } from "@/lib/open-folder-with-draft"
 import { useActiveFolder } from "@/contexts/active-folder-context"
 import { useIsActiveChatMode } from "@/hooks/use-is-active-chat-mode"
-import { isDesktop, openFileDialog } from "@/lib/platform"
-import { getActiveRemoteConnectionId } from "@/lib/transport"
 import { useSidebarContext } from "@/contexts/sidebar-context"
 import { useAuxPanelContext } from "@/contexts/aux-panel-context"
 import { useTerminalContext } from "@/contexts/terminal-context"
@@ -23,7 +18,7 @@ import { useSearchDialog } from "@/contexts/search-dialog-context"
 import { useShortcutSettings } from "@/hooks/use-shortcut-settings"
 import { matchShortcutEvent } from "@/lib/keyboard-shortcuts"
 import { SearchCommandDialog } from "@/components/conversations/search-command-dialog"
-import { DirectoryBrowserDialog } from "@/components/shared/directory-browser-dialog"
+import { WorkspaceFolderDialog } from "@/components/layout/workspace-folder-dialog"
 
 /**
  * Headless owner of the workspace's global keyboard shortcuts and the two
@@ -50,34 +45,13 @@ export function WorkspaceChromeController() {
   const { closeFileTab, closeAllFileTabs } = useWorkspaceActions()
   const { openConversations } = useWorkbenchRoute()
   const { shortcuts } = useShortcutSettings()
-  const tSidebar = useTranslations("Folder.sidebar")
-  // Search open-state is shared (see search-dialog-context): the trigger lives
-  // in the sidebar, but this always-mounted controller owns the dialog and the
-  // ⌘K shortcut so search works even when the sidebar is collapsed.
   const { open: searchOpen, setOpen: setSearchOpen } = useSearchDialog()
   const [browserOpen, setBrowserOpen] = useState(false)
 
-  const handleOpenFolder = useCallback(async () => {
-    // The native Tauri dialog browses the LOCAL filesystem, so when bound to a
-    // remote workspace fall through to the in-app DirectoryBrowserDialog (which
-    // browses the remote host via the proxied `list_directory_entries`).
-    if (isDesktop() && getActiveRemoteConnectionId() === null) {
-      try {
-        const result = await openFileDialog({
-          directory: true,
-          multiple: false,
-        })
-        if (!result) return
-        const selected = Array.isArray(result) ? result[0] : result
-        await openFolderWithDraft(selected)
-      } catch (err) {
-        console.error("[WorkspaceChromeController] failed to open folder:", err)
-        toast.error(tSidebar("toasts.openFolderFailed"))
-      }
-    } else {
-      setBrowserOpen(true)
-    }
-  }, [tSidebar])
+  // One dialog on every platform: it owns directory selection *and* the
+  // follow-up step that links other folders into the new workspace, so the
+  // native picker can't be a separate path that skips half the flow.
+  const handleOpenFolder = useCallback(() => setBrowserOpen(true), [])
 
   const handleOpenSettings = useCallback(() => {
     openSettingsWindow().catch((err) => {
@@ -203,19 +177,7 @@ export function WorkspaceChromeController() {
   return (
     <>
       <SearchCommandDialog open={searchOpen} onOpenChange={setSearchOpen} />
-      <DirectoryBrowserDialog
-        open={browserOpen}
-        onOpenChange={setBrowserOpen}
-        onSelect={(path) => {
-          openFolderWithDraft(path).catch((err) => {
-            console.error(
-              "[WorkspaceChromeController] failed to open folder:",
-              err
-            )
-            toast.error(tSidebar("toasts.openFolderFailed"))
-          })
-        }}
-      />
+      <WorkspaceFolderDialog open={browserOpen} onOpenChange={setBrowserOpen} />
     </>
   )
 }

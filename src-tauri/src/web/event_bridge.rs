@@ -249,6 +249,9 @@ pub enum FolderChange {
         folder_id: i32,
         cause: FolderCloseCause,
     },
+    /// Soft-deleted / worktree removed. Distinct from [`Self::Close`]: the
+    /// history row is gone, so clients must drop it from every list.
+    Deleted { id: i32 },
 }
 
 /// Per-agent progress of the import picker's local-session scan. Emitted by
@@ -336,6 +339,26 @@ pub enum AutomationChange {
         status: String,
     },
 }
+
+pub const CHAT_AUTHORING_SETTINGS_CHANGED_EVENT: &str = "chat-authoring-settings://changed";
+
+pub const WORK_TASK_CHANGED_EVENT: &str = "task://changed";
+
+/// Payload for [`WORK_TASK_CHANGED_EVENT`]. Ids only — clients refetch.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WorkTaskChange {
+    /// Insert-or-replace by id (create, edit, any status transition).
+    Upsert { id: i32 },
+    /// Soft-deleted by id.
+    Deleted { id: i32 },
+    /// Something the folder's tasks inherit changed (settings / default agent).
+    Settings { folder_id: i32 },
+    /// Bulk change (e.g. boot reconcile) — refetch everything.
+    Refresh,
+}
+
+pub const TOKEN_USAGE_SYNC_PROGRESS_EVENT: &str = "token-usage-sync://progress";
 
 /// Unified event emission: serializes the payload exactly once and dispatches
 /// the shared `Arc<Value>` to both the Tauri webview and the web broadcaster.

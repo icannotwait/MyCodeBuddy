@@ -98,8 +98,8 @@ async fn completion_http_fixture() -> CompletionHttpFixture {
     let db_arc = Arc::new(codeg_lib::db::AppDatabase {
         conn: db.conn.clone(),
     });
-    with_historical_workflow_fixture_mutations(
-        RunStore::new(db_arc).admit_gen1_reserving(ReservingRunInsert {
+    with_historical_workflow_fixture_mutations(RunStore::new(db_arc).admit_gen1_reserving(
+        ReservingRunInsert {
             task_id: task_id.clone(),
             root_task_id: task_id.clone(),
             previous_task_id: None,
@@ -123,8 +123,8 @@ async fn completion_http_fixture() -> CompletionHttpFixture {
             replaced_task_id: None,
             replacement_reason: None,
             started_at: Some(Utc::now()),
-        }),
-    )
+        },
+    ))
     .await
     .unwrap();
     let run = delegation_task_run::Entity::find_by_id(&task_id)

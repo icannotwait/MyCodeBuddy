@@ -27,7 +27,11 @@ export function TemplateGallery({
         type="button"
         onClick={() => onPick(null)}
         className={cn(
-          "group flex flex-col items-start gap-2 rounded-lg border border-dashed border-border bg-card/40 p-4 text-left transition-colors",
+          // ws-msg-card keeps the card legible over a workspace background
+          // image (translucent tint; inert without one), matching the Tasks
+          // board cards and the automation detail's stat cards; ws-chrome-border
+          // lifts the outline so the edge survives over the image.
+          "group flex flex-col items-start gap-2 rounded-xl border border-dashed border-border ws-chrome-border bg-card/40 ws-msg-card p-4 text-left transition-colors",
           "hover:border-primary/40 hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
         )}
       >
@@ -46,7 +50,7 @@ export function TemplateGallery({
             type="button"
             onClick={() => onPick(tpl)}
             className={cn(
-              "group flex flex-col items-start gap-2 rounded-lg border border-border bg-card p-4 text-left transition-colors",
+              "group flex flex-col items-start gap-2 rounded-xl border border-border ws-chrome-border bg-card ws-msg-card p-4 text-left transition-colors",
               "hover:border-primary/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
             )}
           >

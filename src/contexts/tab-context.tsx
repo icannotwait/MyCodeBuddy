@@ -1,6 +1,6 @@
 "use client"
 
-import { useEffect, type ReactNode } from "react"
+import { useCallback, useEffect, type ReactNode } from "react"
 import { useTranslations } from "next-intl"
 import { useShallow } from "zustand/react/shallow"
 import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
@@ -15,6 +15,7 @@ import {
   useTabStore,
   type TabItem,
 } from "@/stores/tab-store"
+import type { AcpDisconnectOrigin } from "@/lib/api"
 import {
   CONVERSATION_CHANGED_EVENT,
   TABS_CHANGED_EVENT,
@@ -41,7 +42,16 @@ interface TabProviderProps {
 export function TabProvider({ children }: TabProviderProps) {
   const t = useTranslations("Folder.tabContext")
   const { activateConversationPane } = useWorkspaceActions()
-  const { disconnect: acpDisconnect } = useAcpActions()
+  const { disconnect } = useAcpActions()
+  // Tab teardown closes the surface either way, so the store's side effect
+  // stays `Promise<void>` and drops `disconnect`'s teardown-confirmed flag —
+  // that answer only matters to callers that report a restart to the user.
+  const acpDisconnect = useCallback(
+    async (contextKey: string, origin?: AcpDisconnectOrigin) => {
+      await disconnect(contextKey, origin)
+    },
+    [disconnect]
+  )
   const { sortedTypes: sortedAvailableAgents, fresh: agentsFresh } =
     useSortedAvailableAgents()
 

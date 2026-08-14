@@ -181,15 +181,15 @@ describe("AutomationsPage (master-detail)", () => {
     ).not.toBeInTheDocument()
   })
 
-  it("keeps the header switch and surfaces Run now + Edit beneath the prompt", () => {
+  it("keeps the header switch and surfaces Run now + Edit under the title", () => {
     renderPage()
-    // The detail header exposes only the enable toggle...
+    // The detail title row exposes only the enable toggle...
     expect(screen.getByRole("switch")).toBeInTheDocument()
     // ...the per-row ⋯ menu carries the full action set...
     expect(
       screen.getByLabelText(enMessages.Automations.moreActions)
     ).toBeInTheDocument()
-    // ...and the detail surfaces Run now + Edit as buttons below the prompt.
+    // ...and the primary actions sit on their own row under the title.
     expect(
       screen.getByRole("button", { name: enMessages.Automations.runNow })
     ).toBeInTheDocument()

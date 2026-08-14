@@ -61,6 +61,10 @@ const TASK_STATUSES = [
 ] as const
 export type TaskStatus = (typeof TASK_STATUSES)[number]
 
+/** What kind of user decision a blocked sub-agent is parked on. Mirrors Rust
+ *  `BlockedKind`; an unrecognized value degrades to a bare "blocked". */
+export type BlockedKind = "permission" | "question" | "plan_approval"
+
 export type StatusReport = {
   status: TaskStatus | null
   /** The report's own `task_id` — recovered when the structured report parsed.
@@ -74,6 +78,13 @@ export type StatusReport = {
   durationMs: number | null
   /** Soft-watchdog observation for a still-running report (never terminal). */
   observation?: import("@/lib/types").TaskObservation | null
+  /** Set only on a `running` report whose sub-agent is parked on a user
+   *  decision (Rust `DelegationTaskReport.blocked_on`). Deliberately NOT a
+   *  `status` value: the backend keeps `status: "running"` so every consumer
+   *  that predates this field still resolves the poll correctly. `null` means
+   *  either "genuinely working" or "host dropped structuredContent" — the
+   *  message text's own blocked line covers the latter. */
+  blockedOn: BlockedKind | null
 }
 
 /**
@@ -88,16 +99,19 @@ export type StatusReport = {
  * strings (English-only), never localized UI copy.
  *
  * The running marker is the STANDALONE first line `"Running."`. The optional
- * live hint follows on its OWN line — `"Running.\nLatest sub-agent reply: <…>"`
- * — and is child-controlled text we deliberately never match against. Anchoring
- * to the full first line (plus, for the hint variant, the fixed second-line
- * prefix) instead of prefix-matching arbitrary output is what keeps a
- * *completed* result whose text merely starts with "Running. …" from being
- * misread as still-running. The legacy long sentinel is still accepted so
- * already-persisted historical rows resolve correctly.
+ * second line is one of two fixed protocol prefixes — the live hint
+ * (`"Latest sub-agent reply: <…>"`) or the blocked note
+ * (`"Awaiting your decision: <…>"`, `attach_blocked`) — and what follows either
+ * one is child-controlled text we deliberately never match against. Anchoring
+ * to the full first line plus a known second-line prefix, instead of
+ * prefix-matching arbitrary output, is what keeps a *completed* result whose
+ * text merely starts with "Running. …" from being misread as still-running. The
+ * legacy long sentinel is still accepted so already-persisted historical rows
+ * resolve correctly.
  */
 const RUNNING_MARKER = "running."
 const RUNNING_REPLY_LINE_PREFIX = "latest sub-agent reply:"
+const RUNNING_BLOCKED_LINE_PREFIX = "awaiting your decision:"
 const LEGACY_RUNNING_SENTINEL = "sub-agent is still running in the background."
 
 function textRunningStatus(text: string | null): TaskStatus | null {
@@ -105,9 +119,9 @@ function textRunningStatus(text: string | null): TaskStatus | null {
   const normalized = text.trim().toLowerCase()
   if (normalized === LEGACY_RUNNING_SENTINEL) return "running"
   // Anchor on the first line being EXACTLY the bare marker. A bare "Running."
-  // (no second line) is running; the hint variant additionally requires the
-  // second line to start with the fixed protocol prefix — the child's reply
-  // text after it is never inspected.
+  // (no second line) is running; the hint/blocked variants additionally require
+  // the second line to start with a fixed protocol prefix — whatever follows it
+  // is never inspected.
   const newlineIdx = normalized.indexOf("\n")
   const firstLine = (
     newlineIdx === -1 ? normalized : normalized.slice(0, newlineIdx)
@@ -115,7 +129,54 @@ function textRunningStatus(text: string | null): TaskStatus | null {
   if (firstLine !== RUNNING_MARKER) return null
   if (newlineIdx === -1) return "running"
   const secondLine = normalized.slice(newlineIdx + 1).trimStart()
-  return secondLine.startsWith(RUNNING_REPLY_LINE_PREFIX) ? "running" : null
+  return secondLine.startsWith(RUNNING_REPLY_LINE_PREFIX) ||
+    secondLine.startsWith(RUNNING_BLOCKED_LINE_PREFIX)
+    ? "running"
+    : null
+}
+
+/** Whether a running report's message text carries the blocked note. The
+ *  structured `blocked_on` is preferred; this recovers the same fact on hosts
+ *  that persist only `CallToolResult.content` text (Claude Code), where the
+ *  structured field never survives. Assumes `textRunningStatus` already
+ *  validated the shape, so it only has to find the prefix. */
+function textIsBlocked(text: string | null): boolean {
+  if (text == null) return false
+  const newlineIdx = text.indexOf("\n")
+  if (newlineIdx === -1) return false
+  return text
+    .slice(newlineIdx + 1)
+    .trimStart()
+    .toLowerCase()
+    .startsWith(RUNNING_BLOCKED_LINE_PREFIX)
+}
+
+const BLOCKED_KINDS: readonly BlockedKind[] = [
+  "permission",
+  "question",
+  "plan_approval",
+]
+
+/** The report's `blocked_on.kind`, when it carried a structured one. Falls back
+ *  to `"permission"` for a text-only host whose message shows the blocked note
+ *  (the overwhelmingly common kind, and the badge treats all three alike). */
+function parseBlockedOn(
+  report: Record<string, unknown>,
+  text: string | null
+): BlockedKind | null {
+  const blocked = asObject(report.blocked_on)
+  if (blocked) {
+    const kind = blocked.kind
+    if (
+      typeof kind === "string" &&
+      (BLOCKED_KINDS as readonly string[]).includes(kind)
+    ) {
+      return kind as BlockedKind
+    }
+    // Present but unrecognized (a kind added by a newer backend): still blocked.
+    return "permission"
+  }
+  return textIsBlocked(text) ? "permission" : null
 }
 
 export type ResolvedBadge = { status: BadgeStatus; errorCode?: string }
@@ -534,14 +595,23 @@ export function parseStatusReport(
     text: null,
     errorCode: null,
     durationMs: null,
+    blockedOn: null,
   }
   const raw = (output ?? errorText ?? "").trim()
   if (!raw) return empty
 
   const { obj, hostError } = parseResultObject(raw)
   // Plain text (no recoverable JSON) — the historical content-only shape. The
-  // only structured hint left is the backend's running sentinel sentence.
-  if (!obj) return { ...empty, status: textRunningStatus(raw), text: raw }
+  // only structured hints left are the backend's running sentinel sentence and,
+  // on it, the blocked note.
+  if (!obj) {
+    return {
+      ...empty,
+      status: textRunningStatus(raw),
+      text: raw,
+      blockedOn: textIsBlocked(raw) ? "permission" : null,
+    }
+  }
 
   // Locate the structured report across the shapes it can hide in:
   // structuredContent (trusted) → top-level → inlined in content[0].text. The
@@ -570,13 +640,20 @@ export function parseStatusReport(
       obsRaw === "active" || obsRaw === "stalled" || obsRaw === "waiting_input"
         ? obsRaw
         : null
+    const text = displayText ?? str(report, "text") ?? str(report, "message")
     return {
       status: validStatus(report),
       taskId: str(report, "task_id"),
-      text: displayText ?? str(report, "text") ?? str(report, "message"),
+      text,
       errorCode: str(report, "error_code"),
       durationMs: num(report, "duration_ms"),
       observation,
+      // Structured `blocked_on` when the host kept it; otherwise recovered from
+      // the message text, which is all a content-only host leaves behind.
+      blockedOn: parseBlockedOn(
+        report,
+        text ?? str(report, "message") ?? contentText
+      ),
     }
   }
 
@@ -589,6 +666,7 @@ export function parseStatusReport(
     ...empty,
     status: textRunningStatus(fallbackText),
     text: fallbackText,
+    blockedOn: textIsBlocked(fallbackText) ? "permission" : null,
   }
 }
 
@@ -601,13 +679,15 @@ function reportFromObject(report: Record<string, unknown>): StatusReport {
     obsRaw === "active" || obsRaw === "stalled" || obsRaw === "waiting_input"
       ? obsRaw
       : null
+  const text = str(report, "text") ?? str(report, "message")
   return {
     status: validStatus(report),
     taskId: str(report, "task_id"),
-    text: str(report, "text") ?? str(report, "message"),
+    text,
     errorCode: str(report, "error_code"),
     durationMs: num(report, "duration_ms"),
     observation,
+    blockedOn: parseBlockedOn(report, text),
   }
 }
 
@@ -677,6 +757,9 @@ export function parseStatusReports(
  * a stale snapshot of "still running at the time of that check", not live
  * activity. The live spinner is only produced by the lifecycle fallback below
  * — i.e. a poll that is genuinely still in flight (`input-*`, no result yet).
+ * A running poll that came back BLOCKED is the exception: the sub-agent is
+ * parked on the user, which the same `waiting` badge already means everywhere
+ * else in the delegation UI (see `resolveDelegationStatus`).
  */
 export function deriveBadge(
   kind: "status" | "cancel",
@@ -701,7 +784,8 @@ export function deriveBadge(
       }
       // The poll RETURNED while the task was still running — a settled
       // snapshot, not live work. Show a neutral state, not an endless spinner.
-      return { status: "checked" }
+      // Unless it is blocked, which needs the user and says so.
+      return { status: report.blockedOn ? "waiting" : "checked" }
     case "unknown":
       // Terminal "task id not known" — surface as error, not an endless spinner.
       return { status: "err", errorCode: "unknown" }
@@ -757,6 +841,7 @@ const EMPTY_STATUS_REPORT: StatusReport = {
   text: null,
   errorCode: null,
   durationMs: null,
+  blockedOn: null,
 }
 
 /**

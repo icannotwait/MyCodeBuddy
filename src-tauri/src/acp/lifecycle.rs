@@ -80,6 +80,24 @@ fn is_lifecycle_relevant(event: &AcpEvent) -> bool {
         )
 }
 
+/// Whether this event starts or ends a prompt that BLOCKS the agent until a
+/// human answers. Deliberately not folded into [`is_lifecycle_relevant`]: these
+/// never reach a worker, they only wake the delegation broker's parked status
+/// long-polls (see the dispatcher loop). Both edges matter — the raise so a
+/// waiting parent learns it is blocked, the resolve so a subsequent poll finds
+/// the child working again.
+fn is_blocking_prompt_event(event: &AcpEvent) -> bool {
+    matches!(
+        event,
+        AcpEvent::PermissionRequest { .. }
+            | AcpEvent::PermissionResolved { .. }
+            | AcpEvent::QuestionRequest { .. }
+            | AcpEvent::QuestionResolved { .. }
+            | AcpEvent::PlanApprovalRequest { .. }
+            | AcpEvent::PlanApprovalResolved { .. }
+    )
+}
+
 /// Whether the dispatcher should tear down (drop the sender for) the per-
 /// connection worker after forwarding this event. Two cases:
 ///
@@ -2951,6 +2969,15 @@ pub fn lifecycle_subscriber_task(
                                         tool_tx,
                                         Arc::clone(&envelope_arc),
                                     );
+                                }
+                            }
+
+                            // Ahead of `is_lifecycle_relevant`, which drops all
+                            // six blocking-prompt edges. Wake parked status
+                            // long-polls so a parent can report "waiting on you".
+                            if is_blocking_prompt_event(&envelope_arc.payload) {
+                                if let Some(ref b) = broker {
+                                    b.note_blocking_changed();
                                 }
                             }
 

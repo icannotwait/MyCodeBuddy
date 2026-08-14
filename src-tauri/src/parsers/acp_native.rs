@@ -704,6 +704,7 @@ fn upsert_tool_call(
                 // falls back to for built-ins too.
                 tool_name: title.unwrap_or_else(|| "tool".to_string()),
                 input_preview,
+                status: None,
                 meta,
             });
         }
@@ -779,6 +780,7 @@ fn upsert_plan(pending: &mut PendingTurn, plan: &sacp::schema::Plan) {
                 tool_use_id: Some(PLAN_ID.to_string()),
                 tool_name: "TodoWrite".to_string(),
                 input_preview: Some(input),
+                status: None,
                 meta: None,
             });
         }

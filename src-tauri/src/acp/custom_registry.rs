@@ -228,6 +228,33 @@ pub struct CustomAgentDef {
     /// never used to launch the agent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version_probe: Option<String>,
+    /// User declaration that the agent accepts MCP servers over the ACP wire
+    /// (`session/new`'s `mcpServers`) — which, for a custom agent, means the
+    /// built-in codeg-mcp companion (delegation, live feedback, task tools).
+    ///
+    /// Not every ACP agent does: some reject any entry in that field and fail
+    /// session creation outright, so a custom agent that codeg cannot connect
+    /// to at all is turned off here (OpenClaw is the built-in precedent — see
+    /// [`AcpAgentMeta::supports_mcp`], the single gate both feed).
+    ///
+    /// Defaults ON, and is skipped when serializing at that default, so
+    /// definitions stored before this field existed keep both their behaviour
+    /// and their fingerprint.
+    #[serde(
+        default = "default_supports_mcp",
+        skip_serializing_if = "is_default_supports_mcp"
+    )]
+    pub supports_mcp: bool,
+}
+
+/// See [`CustomAgentDef::supports_mcp`] — the wire default is "forward MCP",
+/// which is what every agent but OpenClaw has accepted.
+fn default_supports_mcp() -> bool {
+    true
+}
+
+fn is_default_supports_mcp(supports_mcp: &bool) -> bool {
+    *supports_mcp
 }
 
 /// Version stamped on a definition that carries none. Used as a cache key and
@@ -491,7 +518,7 @@ pub fn build_meta(def: &CustomAgentDef) -> Result<AcpAgentMeta, CustomAgentError
                 // The user's own install of the CLI (pipx, `uv tool install`,
                 // …) is a legitimate launcher for a custom agent — same
                 // recipe as the uvx entry script, used when the uv runner is
-                // absent (mirrors the Hermes system fallback).
+                // absent.
                 system_cmd: Some((cmd, args)),
             }
         }
@@ -500,10 +527,11 @@ pub fn build_meta(def: &CustomAgentDef) -> Result<AcpAgentMeta, CustomAgentError
 
     Ok(AcpAgentMeta {
         agent_type,
-        // MCP is forwarded over the ACP wire (`session/new`'s `mcpServers`),
-        // which is protocol behaviour rather than per-agent configuration —
-        // custom agents get it, including the codeg-mcp companion.
-        supports_mcp: true,
+        // MCP is forwarded over the ACP wire (`session/new`'s `mcpServers`) —
+        // for a custom agent, the codeg-mcp companion is the whole of it. On
+        // by default; the user turns it off for an agent that rejects server
+        // entries and fails to connect (see `CustomAgentDef::supports_mcp`).
+        supports_mcp: def.supports_mcp,
         name: intern(def.name.trim()),
         description: intern(def.description.trim()),
         distribution,
@@ -894,6 +922,7 @@ mod tests {
             skills_dir: None,
             source: Default::default(),
             version_probe: None,
+            supports_mcp: true,
         }
     }
 
@@ -1010,6 +1039,7 @@ mod tests {
             skills_dir: None,
             source: Default::default(),
             version_probe: None,
+            supports_mcp: true,
         }
     }
 
@@ -1316,6 +1346,55 @@ mod tests {
     }
 
     #[test]
+    fn the_mcp_declaration_reaches_the_launch_metadata() {
+        let _guard = hydrate_guard();
+        let mut def = npx_def("mcp-flag-agent");
+        // On unless the user says otherwise: this is the gate
+        // `connection.rs` reads to decide whether codeg-mcp goes out on
+        // `session/new`.
+        assert!(build_meta(&def).expect("valid").supports_mcp);
+
+        def.supports_mcp = false;
+        assert!(!build_meta(&def).expect("valid").supports_mcp);
+
+        // And flipping it changes the fingerprint, so a save republishes the
+        // meta instead of reusing the leaked one with the stale flag.
+        def.supports_mcp = true;
+        assert!(hydrate(std::slice::from_ref(&def)).is_empty());
+        assert!(get("mcp-flag-agent").expect("registered").supports_mcp);
+        def.supports_mcp = false;
+        assert!(hydrate(std::slice::from_ref(&def)).is_empty());
+        assert!(!get("mcp-flag-agent").expect("registered").supports_mcp);
+
+        hydrate(&[]);
+    }
+
+    #[test]
+    fn a_definition_stored_before_the_mcp_flag_existed_still_forwards_mcp() {
+        // The field is skipped when serializing at its default, so an older
+        // stored definition has no `supports_mcp` key at all. It must read back
+        // as ON — and must fingerprint identically to the same definition
+        // written today, or every existing agent would re-leak a meta on the
+        // first hydrate after the upgrade.
+        let def = npx_def("legacy-shape-agent");
+        let json = serde_json::to_string(&def).expect("serializes");
+        assert!(
+            !json.contains("supports_mcp"),
+            "the default must not change the stored shape: {json}"
+        );
+        let back: CustomAgentDef = serde_json::from_str(&json).expect("parses");
+        assert!(back.supports_mcp);
+
+        // An explicit opt-out does round-trip.
+        let mut off = npx_def("legacy-shape-agent");
+        off.supports_mcp = false;
+        let off_json = serde_json::to_string(&off).expect("serializes");
+        assert!(off_json.contains("supports_mcp"));
+        let off_back: CustomAgentDef = serde_json::from_str(&off_json).expect("parses");
+        assert!(!off_back.supports_mcp);
+    }
+
+    #[test]
     fn a_custom_uvx_agent_advertises_its_own_cli_as_system_fallback() {
         // The uvx launch path falls back to `system_cmd` when the uv runner is
         // absent; for a custom agent the user's own install of the CLI is that
@@ -1340,6 +1419,7 @@ mod tests {
             skills_dir: None,
             source: Default::default(),
             version_probe: None,
+            supports_mcp: true,
         };
         let meta = build_meta(&def).expect("builds");
         match meta.distribution {

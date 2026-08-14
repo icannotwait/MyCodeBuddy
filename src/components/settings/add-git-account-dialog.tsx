@@ -3,6 +3,7 @@
 import { useCallback, useState } from "react"
 import { Eye, EyeOff } from "lucide-react"
 import { useTranslations } from "next-intl"
+import { useImeGuard } from "@/hooks/use-ime-guard"
 import { randomUUID } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -31,6 +32,7 @@ export function AddGitAccountDialog({
   isFirstAccount,
 }: AddGitAccountDialogProps) {
   const t = useTranslations("VersionControlSettings")
+  const ime = useImeGuard()
 
   const [serverUrl, setServerUrl] = useState("")
   const [username, setUsername] = useState("")
@@ -160,7 +162,9 @@ export function AddGitAccountDialog({
                 }}
                 placeholder={t("gitAccount.passwordPlaceholder")}
                 className="pr-9"
+                {...ime.props}
                 onKeyDown={(e) => {
+                  if (ime.isComposing(e)) return
                   if (e.key === "Enter" && canSubmit) handleSubmit()
                 }}
               />

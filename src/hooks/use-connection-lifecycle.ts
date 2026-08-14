@@ -20,6 +20,7 @@ import {
 } from "@/lib/types"
 import { getAgentLabel } from "@/lib/custom-agents"
 import { isDelegateViewerOnlyRejection } from "@/lib/delegate-access"
+import { isConnectionBusy } from "@/lib/connection-teardown"
 
 interface UseConnectionLifecycleOptions {
   contextKey: string
@@ -127,9 +128,7 @@ export function shouldDisconnectOnUnmount(args: {
 }): boolean {
   if (args.transientUnmount) return false
   if (args.isViewer) return true
-  const ownerBusy =
-    args.status === "prompting" || args.backgroundOutstanding > 0
-  return !ownerBusy
+  return !isConnectionBusy(args)
 }
 
 function normalizeErrorMessage(error: unknown): string {

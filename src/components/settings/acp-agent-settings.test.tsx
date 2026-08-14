@@ -8,18 +8,28 @@ import {
   buildGrokSaveOptions,
   buildGrokStructuredConfig,
   buildMergeConfigPayload,
+  buildAcpAdapterCheck,
   buildVersionCheck,
   codexCliRuntimeDefaultOn,
   configTextForClaudeSave,
   getAgentChecks,
+  hostToolsAgentModeEnabled,
   inferGrokMode,
   isCodexCliRuntimeEnabled,
   materializeClaudeHardeningFlags,
   patchCodexCliRuntimeEnv,
+  patchCodexConfigTomlText,
   patchImportantConfigText,
   setClaudeEnvFlagInConfigText,
+  setHostToolsAgentMode,
 } from "./acp-agent-settings"
-import type { AcpAgentInfo, AgentType, PreflightResult } from "@/lib/types"
+import { parse as parseTomlDocument } from "smol-toml"
+import type {
+  AcpAgentInfo,
+  AdapterInfo,
+  AgentType,
+  PreflightResult,
+} from "@/lib/types"
 
 function makeAgent(overrides: Partial<AcpAgentInfo>): AcpAgentInfo {
   return {
@@ -31,6 +41,7 @@ function makeAgent(overrides: Partial<AcpAgentInfo>): AcpAgentInfo {
     description: "",
     available: true,
     distribution_type: "uvx",
+    is_acp_adapter: false,
     custom_source: null,
     enabled: true,
     sort_order: 0,
@@ -566,6 +577,137 @@ describe("inferGrokMode — Grok auth-method recognition", () => {
   })
 })
 
+describe("buildAcpAdapterCheck", () => {
+  function makeAdapter(overrides: Partial<AdapterInfo> = {}): AdapterInfo {
+    return {
+      adapter_package: "@agentclientprotocol/claude-agent-acp@0.63.0",
+      adapter_cmd: "claude-agent-acp",
+      adapter_installed: false,
+      native_cmd: "claude",
+      native_label: "Claude Code CLI",
+      native_path: "/opt/homebrew/bin/claude",
+      shared_config_dir: "~/.claude",
+      docs_url: "https://docs.codeg.app/guide/supported-agents#acp-adapters",
+      ...overrides,
+    }
+  }
+
+  // Nothing for the ten agents whose registry command IS the vendor CLI, and
+  // nothing before preflight resolves — the card must never appear speculatively.
+  it("produces nothing for non-adapter agents or before preflight resolves", () => {
+    expect(buildAcpAdapterCheck(null)).toBeNull()
+    expect(buildAcpAdapterCheck(undefined)).toBeNull()
+  })
+
+  // The whole point of the card: the user has `claude`, we say so by path, and
+  // name the different thing we actually need.
+  it("names the detected CLI, the adapter package and the shared config dir", () => {
+    const check = buildAcpAdapterCheck(makeAdapter())
+    expect(check?.check_id).toBe("acp_adapter")
+    // warn, not fail: Version Status below already fails: this one explains.
+    expect(check?.status).toBe("warn")
+    expect(check?.message).toContain("/opt/homebrew/bin/claude")
+    expect(check?.message).toContain(
+      "@agentclientprotocol/claude-agent-acp@0.63.0"
+    )
+    expect(check?.message).toContain("~/.claude")
+  })
+
+  // Undetected vendor CLI is not a dead end — the explanation still stands, it
+  // just can't point at a path.
+  it("still explains the split when no vendor CLI was found", () => {
+    const check = buildAcpAdapterCheck(makeAdapter({ native_path: null }))
+    expect(check?.status).toBe("warn")
+    expect(check?.message).toContain(
+      "@agentclientprotocol/claude-agent-acp@0.63.0"
+    )
+    expect(check?.message).not.toContain("/opt/homebrew/bin/claude")
+  })
+
+  // Installed → pass, so renderCheck collapses it and a working setup isn't
+  // nagged by an explainer it no longer needs.
+  it("passes once the adapter is installed", () => {
+    const check = buildAcpAdapterCheck(makeAdapter({ adapter_installed: true }))
+    expect(check?.status).toBe("pass")
+    expect(check?.message).toContain("claude-agent-acp")
+  })
+
+  // Exactly one action, and it never duplicates the Install button that lives
+  // on the Version Status card directly below.
+  it("offers only a docs link, never a second install button", () => {
+    const check = buildAcpAdapterCheck(makeAdapter())
+    expect(check?.fixes).toHaveLength(1)
+    expect(check?.fixes[0].kind).toBe("open_url")
+    expect(check?.fixes[0].payload).toContain("#acp-adapters")
+  })
+})
+
+describe("getAgentChecks adapter ordering", () => {
+  // The explainer answers "why does this say not installed?" and must be read
+  // BEFORE the Version Status card that offers the fix.
+  it("puts the adapter card first, then version, then backend checks", () => {
+    const checks = getAgentChecks(
+      makeAgent({
+        agent_type: "claude_code" as AgentType,
+        distribution_type: "npx",
+        is_acp_adapter: true,
+        registry_version: "0.63.0",
+        installed_version: null,
+      }),
+      {
+        result: {
+          agent_type: "claude_code" as AgentType,
+          agent_name: "Claude Code",
+          passed: true,
+          checks: [
+            {
+              check_id: "node_available",
+              label: "Node.js",
+              status: "pass",
+              message: "Node.js v22.0.0 available",
+              fixes: [],
+            },
+          ],
+          adapter: {
+            adapter_package: "@agentclientprotocol/claude-agent-acp@0.63.0",
+            adapter_cmd: "claude-agent-acp",
+            adapter_installed: false,
+            native_cmd: "claude",
+            native_label: "Claude Code CLI",
+            native_path: "/usr/local/bin/claude",
+            shared_config_dir: "~/.claude",
+            docs_url:
+              "https://docs.codeg.app/guide/supported-agents#acp-adapters",
+          },
+        },
+      }
+    )
+
+    expect(checks.map((c) => c.check_id)).toEqual([
+      "acp_adapter",
+      "version_status",
+      "node_available",
+    ])
+  })
+
+  // A plain agent's list is byte-for-byte what it was before this feature.
+  it("adds nothing for an agent with no adapter relation", () => {
+    const checks = getAgentChecks(
+      makeAgent({ distribution_type: "npx", installed_version: "1.0.0" }),
+      {
+        result: {
+          agent_type: "gemini" as AgentType,
+          agent_name: "Gemini CLI",
+          passed: true,
+          checks: [],
+          adapter: null,
+        },
+      }
+    )
+    expect(checks.some((c) => c.check_id === "acp_adapter")).toBe(false)
+  })
+})
+
 describe("buildVersionCheck", () => {
   it("shows bundled Codex as built in without management actions", () => {
     const check = buildVersionCheck(
@@ -761,6 +903,7 @@ describe("getAgentChecks uv gating", () => {
           fixes: [{ label: "Install uv", kind: "install_uv", payload: "" }],
         },
       ],
+      adapter: null,
     },
   }
 
@@ -1135,5 +1278,254 @@ describe("materializeClaudeHardeningFlags — save-time toggle defaults", () => 
     )
     expect(configText).toBe(invalid)
     expect(envText).toBe("EXISTING=1")
+  })
+})
+
+describe("patchCodexConfigTomlText — codeg's requires_openai_auth default", () => {
+  /** Read `model_providers.codeg.requires_openai_auth` back out of a result. */
+  function authFlagOf(configTomlText: string): boolean | undefined {
+    const parsed = parseTomlDocument(configTomlText) as {
+      model_providers?: Record<string, { requires_openai_auth?: unknown }>
+    }
+    const value = parsed.model_providers?.codeg?.requires_openai_auth
+    return typeof value === "boolean" ? value : undefined
+  }
+
+  // The three structured controls that reach ensureCodexProviderDefaults. Each
+  // must behave identically — the bug in issue #406 fired through all of them.
+  const ENTRY_POINTS: Array<{
+    label: string
+    patch: Parameters<typeof patchCodexConfigTomlText>[1]
+  }> = [
+    { label: "API base URL", patch: { apiBaseUrl: "https://new.example/v1" } },
+    { label: "WebSocket toggle", patch: { supportsWebsockets: true } },
+    { label: "model provider", patch: { modelProvider: "codeg" } },
+  ]
+
+  const BOUND_PROVIDER = [
+    'model_provider = "codeg"',
+    "",
+    "[model_providers.codeg]",
+    'base_url = "https://old.example/v1"',
+    'name = "codeg"',
+    'wire_api = "responses"',
+  ].join("\n")
+
+  for (const { label, patch } of ENTRY_POINTS) {
+    describe(`via the ${label} control`, () => {
+      it("keeps an explicit false", () => {
+        const toml = `${BOUND_PROVIDER}\nrequires_openai_auth = false\n`
+        expect(authFlagOf(patchCodexConfigTomlText(toml, patch))).toBe(false)
+      })
+
+      it("keeps an explicit true", () => {
+        const toml = `${BOUND_PROVIDER}\nrequires_openai_auth = true\n`
+        expect(authFlagOf(patchCodexConfigTomlText(toml, patch))).toBe(true)
+      })
+
+      it("supplies the default when the field is absent", () => {
+        expect(
+          authFlagOf(patchCodexConfigTomlText(BOUND_PROVIDER, patch))
+        ).toBe(true)
+      })
+
+      it("seeds a brand-new provider from an empty config", () => {
+        expect(authFlagOf(patchCodexConfigTomlText("", patch))).toBe(true)
+      })
+
+      it("stands down for a provider using actor authorization", () => {
+        const toml = [
+          BOUND_PROVIDER,
+          "",
+          "[model_providers.codeg.http_headers]",
+          'x-openai-actor-authorization = "local-image-extension"',
+        ].join("\n")
+        expect(
+          authFlagOf(patchCodexConfigTomlText(toml, patch))
+        ).toBeUndefined()
+      })
+    })
+  }
+
+  const ENTRY = ENTRY_POINTS[0].patch
+
+  it("preserves user comments around the managed provider", () => {
+    const toml = [
+      "# my hand-written codex config",
+      'model_provider = "codeg"',
+      "",
+      "[model_providers.codeg]",
+      'base_url = "https://old.example/v1"',
+      "# keep the actor-authorization arrangement intact",
+      "requires_openai_auth = false",
+    ].join("\n")
+    const result = patchCodexConfigTomlText(toml, ENTRY)
+    expect(result).toContain("# my hand-written codex config")
+    expect(result).toContain(
+      "# keep the actor-authorization arrangement intact"
+    )
+    expect(authFlagOf(result)).toBe(false)
+  })
+
+  it("matches the actor-authorization header case-insensitively", () => {
+    const toml = [
+      BOUND_PROVIDER,
+      "",
+      "[model_providers.codeg.http_headers]",
+      'X-OpenAI-Actor-Authorization = "local-image-extension"',
+    ].join("\n")
+    expect(authFlagOf(patchCodexConfigTomlText(toml, ENTRY))).toBeUndefined()
+  })
+
+  it("reads the header out of an inline table too", () => {
+    const toml = [
+      'model_provider = "codeg"',
+      "",
+      "[model_providers.codeg]",
+      'base_url = "https://old.example/v1"',
+      'http_headers = { "x-openai-actor-authorization" = "local-image-extension" }',
+    ].join("\n")
+    expect(authFlagOf(patchCodexConfigTomlText(toml, ENTRY))).toBeUndefined()
+  })
+
+  // Asserted on the text, not the parse: the text writers predate this change
+  // and cannot patch a provider spelled with root-level dotted keys — they
+  // append a `[model_providers.codeg]` section that redefines the same table.
+  // That limitation is pre-existing and out of scope here; what matters is
+  // that the header is still recognized, so no auth default is added.
+  it("reads the header out of a root-level dotted key too", () => {
+    const toml = [
+      'model_provider = "codeg"',
+      'model_providers.codeg.base_url = "https://old.example/v1"',
+      'model_providers.codeg.http_headers."x-openai-actor-authorization" = "local-image-extension"',
+    ].join("\n")
+    expect(patchCodexConfigTomlText(toml, ENTRY)).not.toContain(
+      "requires_openai_auth"
+    )
+  })
+
+  // Upstream's predicate is `!value.trim().is_empty()`, so a blank header does
+  // NOT enable actor authorization and the default still applies.
+  it("ignores an actor-authorization header with a blank value", () => {
+    const toml = [
+      BOUND_PROVIDER,
+      "",
+      "[model_providers.codeg.http_headers]",
+      'x-openai-actor-authorization = "   "',
+    ].join("\n")
+    expect(authFlagOf(patchCodexConfigTomlText(toml, ENTRY))).toBe(true)
+  })
+
+  it("never rewrites an explicit true that sits beside the header", () => {
+    const toml = [
+      BOUND_PROVIDER,
+      "requires_openai_auth = true",
+      "",
+      "[model_providers.codeg.http_headers]",
+      'x-openai-actor-authorization = "local-image-extension"',
+    ].join("\n")
+    expect(authFlagOf(patchCodexConfigTomlText(toml, ENTRY))).toBe(true)
+  })
+
+  it("ignores another provider's actor-authorization header", () => {
+    const toml = [
+      BOUND_PROVIDER,
+      "",
+      "[model_providers.other.http_headers]",
+      'x-openai-actor-authorization = "local-image-extension"',
+    ].join("\n")
+    expect(authFlagOf(patchCodexConfigTomlText(toml, ENTRY))).toBe(true)
+  })
+
+  // Regression (review round 1): `"http_headers.x-..." = "v"` is ONE literal
+  // key, not an http_headers sub-table. Mistaking it for the nested path would
+  // suppress the default and break codeg's own auth.json-based auth.
+  it("does not mistake a quoted dotted key for the header table", () => {
+    const toml = [
+      BOUND_PROVIDER,
+      '"http_headers.x-openai-actor-authorization" = "local-image-extension"',
+    ].join("\n")
+    expect(authFlagOf(patchCodexConfigTomlText(toml, ENTRY))).toBe(true)
+  })
+
+  // Regression (review round 2): an escaped key still declares the field, so
+  // writing the default would produce a duplicate-key TOML the backend rejects.
+  it("recognizes a field declared through an escaped quoted key", () => {
+    const toml = [BOUND_PROVIDER, '"requires\\u005fopenai_auth" = false'].join(
+      "\n"
+    )
+    const result = patchCodexConfigTomlText(toml, ENTRY)
+    expect(authFlagOf(result)).toBe(false)
+    expect(() => parseTomlDocument(result)).not.toThrow()
+  })
+
+  // A draft can be mid-edit in the raw editor. We cannot tell what is declared,
+  // so we touch nothing — the backend refuses to persist invalid TOML anyway.
+  it("leaves an unparsable draft's auth field alone", () => {
+    const toml = [BOUND_PROVIDER, 'base_url = "unterminated'].join("\n")
+    const result = patchCodexConfigTomlText(toml, ENTRY)
+    expect(result).not.toContain("requires_openai_auth")
+  })
+})
+
+describe("host-tools toggle — hand the fs/terminal channels back to the agent", () => {
+  const KEY = "CODEG_ACP_HOST_TOOLS"
+
+  it("is off for an agent that has never touched the knob", () => {
+    expect(hostToolsAgentModeEnabled("")).toBe(false)
+    expect(hostToolsAgentModeEnabled("XAI_API_KEY=abc")).toBe(false)
+  })
+
+  it("round-trips on and back off", () => {
+    const on = setHostToolsAgentMode("XAI_API_KEY=abc", true)
+    expect(on).toContain(`${KEY}=agent`)
+    expect(hostToolsAgentModeEnabled(on)).toBe(true)
+
+    // Off writes an EXPLICIT `default` rather than deleting the key. Deleting
+    // would let a process-wide `CODEG_ACP_HOST_TOOLS=agent` keep winning, so
+    // the switch could not turn the mode off at all — it would read false
+    // while the next connection still withheld the channels.
+    const off = setHostToolsAgentMode(on, false)
+    expect(off).toContain(`${KEY}=default`)
+    expect(hostToolsAgentModeEnabled(off)).toBe(false)
+    expect(off).toContain("XAI_API_KEY=abc")
+  })
+
+  it("leaves the agent's other env vars alone", () => {
+    const before = "XAI_API_KEY=abc\nGROK_HOME=/tmp/grok"
+    const after = setHostToolsAgentMode(before, true)
+    expect(after).toContain("XAI_API_KEY=abc")
+    expect(after).toContain("GROK_HOME=/tmp/grok")
+  })
+
+  it("reads only the exact sentinel, matching the Rust resolver", () => {
+    // The backend fails OPEN on an unrecognized value (a typo must look like a
+    // typo, not like a silently disabled terminal), so the switch must render
+    // unchecked for anything that is not literally `agent`.
+    expect(hostToolsAgentModeEnabled(`${KEY}=default`)).toBe(false)
+    expect(hostToolsAgentModeEnabled(`${KEY}=Agent`)).toBe(false)
+    expect(hostToolsAgentModeEnabled(`${KEY}=off`)).toBe(false)
+    expect(hostToolsAgentModeEnabled(`${KEY}=`)).toBe(false)
+    // Trimmed, though — `parseEnvText` trims, and so does the backend.
+    expect(hostToolsAgentModeEnabled(`${KEY} = agent `)).toBe(true)
+  })
+
+  it("does not double up when toggled on twice", () => {
+    const once = setHostToolsAgentMode("", true)
+    const twice = setHostToolsAgentMode(once, true)
+    expect(twice).toBe(once)
+    expect(twice.match(new RegExp(KEY, "g"))).toHaveLength(1)
+  })
+
+  it("overrides an inherited value in both directions", () => {
+    // The backend resolves env_json first, then codeg's process env. Whatever
+    // the operator exported, one flip of the switch must decide the outcome —
+    // so both states write an explicit value and neither leaves the key absent.
+    const off = setHostToolsAgentMode("", false)
+    expect(off).toBe(`${KEY}=default`)
+    expect(hostToolsAgentModeEnabled(off)).toBe(false)
+    expect(hostToolsAgentModeEnabled(setHostToolsAgentMode(off, true))).toBe(
+      true
+    )
   })
 })

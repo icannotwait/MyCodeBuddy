@@ -4,11 +4,20 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { useTranslations } from "next-intl"
 import {
   AlertCircle,
+  Braces,
   Check,
+  FolderCog,
+  Hash,
   ImagePlus,
+  Layers,
   Loader2,
   Package,
+  Plug,
   Search,
+  Sparkles,
+  Tag,
+  Terminal,
+  Type,
   X,
 } from "lucide-react"
 import { toast } from "sonner"
@@ -25,9 +34,9 @@ import {
 } from "@/lib/api"
 import { MaskedMonoIcon } from "@/components/agent-icon"
 import { isMonochromeSvgDataUrl } from "@/lib/custom-agents"
+import { SettingCard, SettingRow } from "@/components/shared/setting-card"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
-import { Checkbox } from "@/components/ui/checkbox"
 import {
   Dialog,
   DialogContent,
@@ -37,7 +46,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
-import { Label } from "@/components/ui/label"
+import { Switch } from "@/components/ui/switch"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Textarea } from "@/components/ui/textarea"
 import { cn } from "@/lib/utils"
@@ -241,6 +250,10 @@ export function AddCustomAgentDialog({
   const [manualSkills, setManualSkills] = useState(false)
   const [manualSkillsDir, setManualSkillsDir] = useState("")
   const [manualVersionProbe, setManualVersionProbe] = useState("")
+  // Whether codeg may put MCP servers (its codeg-mcp companion) on the ACP
+  // wire for this agent. On by default — the value almost every agent works
+  // with, and the one a new definition should start from.
+  const [manualSupportsMcp, setManualSupportsMcp] = useState(true)
   // Provenance of the definition being edited ("registry" | "manual"),
   // carried through the save so an edit never rewrites where the definition
   // came from. Null until the edit prefill lands (and always in add mode).
@@ -298,6 +311,7 @@ export function AddCustomAgentDialog({
         setManualSkills(found.skillsSharedStore)
         setManualSkillsDir(found.skillsDir ?? "")
         setManualVersionProbe(found.versionProbe ?? "")
+        setManualSupportsMcp(found.supportsMcp)
         setEditSource(found.source)
       })
       .catch((err) => {
@@ -333,6 +347,7 @@ export function AddCustomAgentDialog({
     setManualSkills(false)
     setManualSkillsDir("")
     setManualVersionProbe("")
+    setManualSupportsMcp(true)
     setEditSource(null)
   }, [open])
 
@@ -439,6 +454,7 @@ export function AddCustomAgentDialog({
         // IS the manual provenance.
         source: editing ? (editSource ?? undefined) : "manual",
         versionProbe: manualVersionProbe.trim() || null,
+        supportsMcp: manualSupportsMcp,
       })
       toast.success(
         editing
@@ -462,6 +478,7 @@ export function AddCustomAgentDialog({
     manualSkills,
     manualSkillsDir,
     manualVersionProbe,
+    manualSupportsMcp,
     editing,
     editSource,
     onAdded,
@@ -609,222 +626,271 @@ export function AddCustomAgentDialog({
             )}
           </TabsContent>
 
-          <TabsContent value="manual" className="mt-3 space-y-3">
-            <div className="grid grid-cols-2 gap-3">
-              <div className="space-y-1">
-                <Label className="text-xs">{t("customAgentIdLabel")}</Label>
-                <Input
-                  value={effectiveId}
-                  onChange={(e) => setManualId(e.target.value)}
-                  placeholder="goose"
-                  disabled={editing}
-                  className="h-8 text-xs font-mono"
+          {/* Same card grammar as the task settings dialog: related fields
+              share one bordered surface with a hairline between rows, the label
+              carries the row's glyph, and the hint sits under it — instead of
+              the loose stack of bare labels this form used to be. The whole
+              form scrolls on its own so the title and the save button stay put
+              on a laptop screen. */}
+          <TabsContent value="manual" className="mt-3">
+            {/* The scroll box is a plain block child (mirroring the registry
+                tab's list), NOT the tab panel turned into a flex column: a card
+                is `overflow-hidden`, so as a flex item its automatic minimum
+                size collapses to zero and the column squeezes every card down
+                to fit — silently clipping rows instead of scrolling them. */}
+            <div className="max-h-[58vh] space-y-3 overflow-y-auto pr-1">
+              <SettingCard>
+                <SettingRow
+                  icon={Hash}
+                  title={t("customAgentIdLabel")}
+                  htmlFor="custom-agent-id"
+                  control={
+                    <Input
+                      id="custom-agent-id"
+                      value={effectiveId}
+                      onChange={(e) => setManualId(e.target.value)}
+                      placeholder="goose"
+                      disabled={editing}
+                      className="h-8 w-52 bg-background font-mono text-xs"
+                    />
+                  }
                 />
-              </div>
-              <div className="space-y-1">
-                <Label className="text-xs">{t("customAgentNameLabel")}</Label>
-                <Input
-                  value={effectiveName}
-                  onChange={(e) => setManualName(e.target.value)}
-                  placeholder="Goose"
-                  className="h-8 text-xs"
+                <SettingRow
+                  icon={Type}
+                  title={t("customAgentNameLabel")}
+                  htmlFor="custom-agent-name"
+                  control={
+                    <Input
+                      id="custom-agent-name"
+                      value={effectiveName}
+                      onChange={(e) => setManualName(e.target.value)}
+                      placeholder="Goose"
+                      className="h-8 w-52 bg-background text-xs"
+                    />
+                  }
                 />
-              </div>
-            </div>
-
-            <div className="grid grid-cols-2 gap-3">
-              <div className="space-y-1">
-                <Label className="text-xs">
-                  {t("customAgentVersionLabel")}
-                </Label>
-                <Input
-                  value={manualVersion || manualParsed?.version || ""}
-                  onChange={(e) => setManualVersion(e.target.value)}
-                  placeholder="1.44.0"
-                  className="h-8 text-xs font-mono"
+                <SettingRow
+                  icon={Tag}
+                  title={t("customAgentVersionLabel")}
+                  htmlFor="custom-agent-version"
+                  control={
+                    <Input
+                      id="custom-agent-version"
+                      value={manualVersion || manualParsed?.version || ""}
+                      onChange={(e) => setManualVersion(e.target.value)}
+                      placeholder="1.44.0"
+                      className="h-8 w-52 bg-background font-mono text-xs"
+                    />
+                  }
                 />
-              </div>
-              <div className="space-y-1">
-                <Label className="text-xs">{t("customAgentIconLabel")}</Label>
-                <div className="flex items-center gap-2">
-                  {manualIcon ? (
-                    <span className="relative inline-flex h-8 w-8 shrink-0 items-center justify-center rounded border bg-muted/30">
-                      {isMonochromeSvgDataUrl(manualIcon) ? (
-                        // A mono upload previews the way it will render: as a
-                        // theme-following mask, not a black-on-dark `<img>`.
-                        <MaskedMonoIcon
-                          iconUrl={manualIcon}
-                          className="h-5 w-5"
-                        />
-                      ) : (
-                        // eslint-disable-next-line @next/next/no-img-element
-                        <img
-                          src={manualIcon}
-                          alt=""
-                          className="h-5 w-5 object-contain"
-                        />
-                      )}
-                      <button
+                <SettingRow
+                  icon={ImagePlus}
+                  title={t("customAgentIconLabel")}
+                  description={t("customAgentIconHint")}
+                  control={
+                    <div className="flex items-center gap-2">
+                      {manualIcon ? (
+                        <span className="relative inline-flex h-8 w-8 shrink-0 items-center justify-center rounded border bg-background">
+                          {isMonochromeSvgDataUrl(manualIcon) ? (
+                            // A mono upload previews the way it will render: as a
+                            // theme-following mask, not a black-on-dark `<img>`.
+                            <MaskedMonoIcon
+                              iconUrl={manualIcon}
+                              className="h-5 w-5"
+                            />
+                          ) : (
+                            // eslint-disable-next-line @next/next/no-img-element
+                            <img
+                              src={manualIcon}
+                              alt=""
+                              className="h-5 w-5 object-contain"
+                            />
+                          )}
+                          <button
+                            type="button"
+                            aria-label={t("customAgentIconClear")}
+                            title={t("customAgentIconClear")}
+                            className="absolute -right-1.5 -top-1.5 inline-flex h-4 w-4 items-center justify-center rounded-full border bg-background text-muted-foreground hover:text-foreground"
+                            onClick={() => setManualIcon(null)}
+                          >
+                            <X className="h-2.5 w-2.5" />
+                          </button>
+                        </span>
+                      ) : null}
+                      <Button
                         type="button"
-                        aria-label={t("customAgentIconClear")}
-                        title={t("customAgentIconClear")}
-                        className="absolute -right-1.5 -top-1.5 inline-flex h-4 w-4 items-center justify-center rounded-full border bg-background text-muted-foreground hover:text-foreground"
-                        onClick={() => setManualIcon(null)}
+                        variant="outline"
+                        size="sm"
+                        className="h-8 bg-background text-xs"
+                        onClick={() => iconInputRef.current?.click()}
                       >
-                        <X className="h-2.5 w-2.5" />
-                      </button>
-                    </span>
-                  ) : null}
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    className="h-8 text-xs"
-                    onClick={() => iconInputRef.current?.click()}
-                  >
-                    <ImagePlus className="h-3.5 w-3.5" />
-                    {manualIcon
-                      ? t("customAgentIconReplace")
-                      : t("customAgentIconUpload")}
-                  </Button>
-                  <input
-                    ref={iconInputRef}
-                    type="file"
-                    accept="image/*"
-                    className="hidden"
-                    onChange={(e) => handlePickIcon(e.target.files?.[0])}
+                        <ImagePlus className="h-3.5 w-3.5" />
+                        {manualIcon
+                          ? t("customAgentIconReplace")
+                          : t("customAgentIconUpload")}
+                      </Button>
+                      <input
+                        ref={iconInputRef}
+                        type="file"
+                        accept="image/*"
+                        className="hidden"
+                        onChange={(e) => handlePickIcon(e.target.files?.[0])}
+                      />
+                    </div>
+                  }
+                />
+              </SettingCard>
+
+              <SettingCard>
+                <SettingRow
+                  icon={Braces}
+                  title={t("customAgentSpecLabel")}
+                  // The format hint is a paragraph, not a one-liner: as a row
+                  // `description` it would push the field it describes below the
+                  // fold, so it rides under the textarea instead.
+                  htmlFor="custom-agent-spec"
+                  control={
+                    <div className="flex items-center gap-1">
+                      <span className="text-[11px] text-muted-foreground">
+                        {t("customAgentTemplateLabel")}
+                      </span>
+                      {(["npx", "uvx", "binary"] as const).map((kind) => (
+                        <Button
+                          key={kind}
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          className="h-6 bg-background px-2 font-mono text-[11px]"
+                          // The binary template needs the real platform key;
+                          // until the backend has answered (ms after open,
+                          // barring a dropped connection) there is nothing
+                          // honest to insert.
+                          disabled={kind === "binary" && platform === null}
+                          onClick={() => {
+                            const template = buildSpecTemplate(kind, platform)
+                            if (template === null) return
+                            setManualJson(template)
+                            // A kind chosen for the previous content has no claim
+                            // on the template's single channel.
+                            setManualKind(null)
+                          }}
+                        >
+                          {kind}
+                        </Button>
+                      ))}
+                    </div>
+                  }
+                >
+                  <Textarea
+                    id="custom-agent-spec"
+                    value={manualJson}
+                    onChange={(e) => setManualJson(e.target.value)}
+                    rows={9}
+                    spellCheck={false}
+                    placeholder={
+                      '{\n  "npx": {\n    "package": "some-acp-agent@1.0.0",\n    "args": ["--acp"]\n  }\n}'
+                    }
+                    className="bg-background font-mono text-xs"
                   />
-                </div>
-                <p className="text-[11px] text-muted-foreground">
-                  {t("customAgentIconHint")}
-                </p>
-              </div>
-            </div>
+                  {manualParsed?.error && (
+                    <div className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+                      {manualParsed.error === "invalidJson"
+                        ? t("customAgentInvalidJson")
+                        : t("customAgentNoDistribution")}
+                    </div>
+                  )}
+                  <p className="text-xs leading-5 text-muted-foreground">
+                    {/* An ellipsis until the backend answers — never a guessed
+                      platform presented as this machine's. */}
+                    {t("customAgentSpecHint", { platform: platform ?? "…" })}
+                  </p>
+                </SettingRow>
 
-            <div className="space-y-1">
-              <div className="flex items-center justify-between gap-2">
-                <Label className="text-xs">{t("customAgentSpecLabel")}</Label>
-                <div className="flex items-center gap-1">
-                  <span className="text-[11px] text-muted-foreground">
-                    {t("customAgentTemplateLabel")}
-                  </span>
-                  {(["npx", "uvx", "binary"] as const).map((kind) => (
-                    <Button
-                      key={kind}
-                      type="button"
-                      size="sm"
-                      variant="outline"
-                      className="h-6 px-2 text-[11px] font-mono"
-                      // The binary template needs the real platform key; until
-                      // the backend has answered (ms after open, barring a
-                      // dropped connection) there is nothing honest to insert.
-                      disabled={kind === "binary" && platform === null}
-                      onClick={() => {
-                        const template = buildSpecTemplate(kind, platform)
-                        if (template === null) return
-                        setManualJson(template)
-                        // A kind chosen for the previous content has no claim
-                        // on the template's single channel.
-                        setManualKind(null)
-                      }}
-                    >
-                      {kind}
-                    </Button>
-                  ))}
-                </div>
-              </div>
-              <Textarea
-                value={manualJson}
-                onChange={(e) => setManualJson(e.target.value)}
-                rows={9}
-                spellCheck={false}
-                placeholder={
-                  '{\n  "npx": {\n    "package": "some-acp-agent@1.0.0",\n    "args": ["--acp"]\n  }\n}'
-                }
-                className="text-xs font-mono"
-              />
-              <p className="text-[11px] text-muted-foreground">
-                {/* An ellipsis until the backend answers — never a guessed
-                    platform presented as this machine's. */}
-                {t("customAgentSpecHint", { platform: platform ?? "…" })}
-              </p>
-            </div>
+                {manualKinds.length > 1 && (
+                  <SettingRow
+                    icon={Layers}
+                    title={t("customAgentKindLabel")}
+                    control={
+                      <div className="flex gap-1.5">
+                        {manualKinds.map((kind) => (
+                          <Button
+                            key={kind}
+                            type="button"
+                            size="sm"
+                            variant={
+                              effectiveKind === kind ? "secondary" : "outline"
+                            }
+                            className="h-7 text-xs"
+                            onClick={() => setManualKind(kind)}
+                          >
+                            {kind}
+                          </Button>
+                        ))}
+                      </div>
+                    }
+                  />
+                )}
+              </SettingCard>
 
-            {manualParsed?.error && (
-              <div className="rounded-md border border-red-500/30 bg-red-500/5 px-3 py-2 text-xs text-red-400">
-                {manualParsed.error === "invalidJson"
-                  ? t("customAgentInvalidJson")
-                  : t("customAgentNoDistribution")}
-              </div>
-            )}
-
-            {manualKinds.length > 1 && (
-              <div className="space-y-1">
-                <Label className="text-xs">{t("customAgentKindLabel")}</Label>
-                <div className="flex gap-1.5">
-                  {manualKinds.map((kind) => (
-                    <Button
-                      key={kind}
-                      type="button"
-                      size="sm"
-                      variant={effectiveKind === kind ? "secondary" : "outline"}
-                      className="h-7 text-xs"
-                      onClick={() => setManualKind(kind)}
-                    >
-                      {kind}
-                    </Button>
-                  ))}
-                </div>
-              </div>
-            )}
-
-            <div className="flex items-start gap-2">
-              <Checkbox
-                id="custom-agent-skills"
-                checked={manualSkills}
-                onCheckedChange={(v) => setManualSkills(v === true)}
-                className="mt-0.5"
-              />
-              <div className="space-y-0.5">
-                <Label htmlFor="custom-agent-skills" className="text-xs">
-                  {t("customAgentSkillsLabel")}
-                </Label>
-                <p className="text-[11px] text-muted-foreground">
-                  {t("customAgentSkillsHint")}
-                </p>
-              </div>
-            </div>
-
-            <div className="space-y-1">
-              <Label htmlFor="custom-agent-skills-dir" className="text-xs">
-                {t("customAgentSkillsDirLabel")}
-              </Label>
-              <Input
-                id="custom-agent-skills-dir"
-                value={manualSkillsDir}
-                onChange={(e) => setManualSkillsDir(e.target.value)}
-                placeholder="~/.my-agent/skills"
-                className="h-8 text-xs font-mono"
-              />
-              <p className="text-[11px] text-muted-foreground">
-                {t("customAgentSkillsDirHint")}
-              </p>
-            </div>
-
-            <div className="space-y-1">
-              <Label htmlFor="custom-agent-version-probe" className="text-xs">
-                {t("customAgentVersionProbeLabel")}
-              </Label>
-              <Input
-                id="custom-agent-version-probe"
-                value={manualVersionProbe}
-                onChange={(e) => setManualVersionProbe(e.target.value)}
-                placeholder="agent-cli --version"
-                className="h-8 text-xs font-mono"
-              />
-              <p className="text-[11px] text-muted-foreground">
-                {t("customAgentVersionProbeHint")}
-              </p>
+              {/* What codeg is allowed to hand this agent, and where it reads its
+                skills from — the same three declarations the agent's own panel
+                in Settings shows, in the same order. */}
+              <SettingCard>
+                <SettingRow
+                  icon={Plug}
+                  title={t("customAgentMcpLabel")}
+                  description={t("customAgentMcpHint")}
+                  htmlFor="custom-agent-mcp"
+                  control={
+                    <Switch
+                      id="custom-agent-mcp"
+                      checked={manualSupportsMcp}
+                      onCheckedChange={setManualSupportsMcp}
+                    />
+                  }
+                />
+                <SettingRow
+                  icon={Sparkles}
+                  title={t("customAgentSkillsLabel")}
+                  description={t("customAgentSkillsHint")}
+                  htmlFor="custom-agent-skills"
+                  control={
+                    <Switch
+                      id="custom-agent-skills"
+                      checked={manualSkills}
+                      onCheckedChange={setManualSkills}
+                    />
+                  }
+                />
+                <SettingRow
+                  icon={FolderCog}
+                  title={t("customAgentSkillsDirLabel")}
+                  description={t("customAgentSkillsDirHint")}
+                  htmlFor="custom-agent-skills-dir"
+                >
+                  <Input
+                    id="custom-agent-skills-dir"
+                    value={manualSkillsDir}
+                    onChange={(e) => setManualSkillsDir(e.target.value)}
+                    placeholder="~/.my-agent/skills"
+                    className="h-8 bg-background font-mono text-xs"
+                  />
+                </SettingRow>
+                <SettingRow
+                  icon={Terminal}
+                  title={t("customAgentVersionProbeLabel")}
+                  description={t("customAgentVersionProbeHint")}
+                  htmlFor="custom-agent-version-probe"
+                >
+                  <Input
+                    id="custom-agent-version-probe"
+                    value={manualVersionProbe}
+                    onChange={(e) => setManualVersionProbe(e.target.value)}
+                    placeholder="agent-cli --version"
+                    className="h-8 bg-background font-mono text-xs"
+                  />
+                </SettingRow>
+              </SettingCard>
             </div>
           </TabsContent>
         </Tabs>

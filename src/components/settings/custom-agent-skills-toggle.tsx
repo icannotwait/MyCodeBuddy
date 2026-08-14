@@ -17,18 +17,21 @@
 
 import { useCallback, useEffect, useRef, useState } from "react"
 import { useTranslations } from "next-intl"
-import { Loader2 } from "lucide-react"
+import { FolderCog, Loader2, Sparkles } from "lucide-react"
 import { toast } from "sonner"
 
+import { SettingCard, SettingRow } from "@/components/shared/setting-card"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Switch } from "@/components/ui/switch"
 import {
   acpListCustomAgents,
-  acpSaveCustomAgent,
+  acpPatchCustomAgent,
   type CustomAgentInfo,
-  type CustomDistributionKind,
 } from "@/lib/api"
+
+const SHARED_STORE_SWITCH_ID = "custom-agent-skills-shared-store"
+const SKILLS_DIR_INPUT_ID = "custom-agent-skills-dir"
 
 interface CustomAgentSkillsToggleProps {
   registryId: string
@@ -66,46 +69,22 @@ export function CustomAgentSkillsToggle({
     }
   }, [registryId])
 
-  // One save path for both declarations, always sending the full definition —
-  // a save that dropped either field would silently erase the other choice.
-  const saveDeclarations = useCallback(
-    async (
-      current: CustomAgentInfo,
-      next: { skillsSharedStore: boolean; skillsDir: string | null }
-    ) => {
-      await acpSaveCustomAgent({
-        registryId: current.registryId,
-        name: current.name,
-        description: current.description,
-        version: current.version,
-        distributionKind: current.distributionKind as CustomDistributionKind,
-        spec: current.spec,
-        iconUrl: current.iconUrl,
-        // Whole-definition re-save: every field must ride along, or this
-        // card would silently reset it (provenance and the version probe
-        // included).
-        source: current.source,
-        versionProbe: current.versionProbe,
-        ...next,
-      })
-    },
-    []
-  )
-
+  // Each handler patches ONLY the declaration it owns. `acpPatchCustomAgent`
+  // re-reads the definition and carries the rest across, so this card can
+  // neither reset a field it does not show (provenance, the version probe, the
+  // MCP declaration) nor revert one the MCP card changed after this one
+  // mounted. The switch and the directory are separate patches for the same
+  // reason: flipping the switch must not commit a path the user is mid-way
+  // through typing, and saving a path must not resend a stale switch.
   const handleToggle = useCallback(
     async (next: boolean) => {
       if (!info) return
       setSaving(true)
       // Optimistic: the switch reflects the target state while the save runs
-      // and snaps back on failure. The directory rides along unchanged, from
-      // its saved value — not the draft — so flipping the switch can never
-      // commit a path the user was still typing.
+      // and snaps back on failure.
       setInfo({ ...info, skillsSharedStore: next })
       try {
-        await saveDeclarations(info, {
-          skillsSharedStore: next,
-          skillsDir: info.skillsDir,
-        })
+        await acpPatchCustomAgent(info.registryId, { skillsSharedStore: next })
       } catch (err) {
         if (mountedRef.current) {
           setInfo({ ...info, skillsSharedStore: !next })
@@ -115,7 +94,7 @@ export function CustomAgentSkillsToggle({
         if (mountedRef.current) setSaving(false)
       }
     },
-    [info, saveDeclarations]
+    [info]
   )
 
   const handleSaveDir = useCallback(async () => {
@@ -123,10 +102,7 @@ export function CustomAgentSkillsToggle({
     const next = dirDraft.trim() || null
     setSaving(true)
     try {
-      await saveDeclarations(info, {
-        skillsSharedStore: info.skillsSharedStore,
-        skillsDir: next,
-      })
+      await acpPatchCustomAgent(info.registryId, { skillsDir: next })
       // The backend may have normalized the path (`~` expansion); re-read so
       // the card shows what was actually stored.
       const list = await acpListCustomAgents()
@@ -141,63 +117,60 @@ export function CustomAgentSkillsToggle({
     } finally {
       if (mountedRef.current) setSaving(false)
     }
-  }, [dirDraft, info, saveDeclarations])
+  }, [dirDraft, info])
 
   if (!info) return null
 
   const dirDirty = dirDraft.trim() !== (info.skillsDir ?? "")
 
+  // The two declarations are one decision ("where does this agent read skills
+  // from"), so they share a card and the hairline between them, rather than
+  // reading as two unrelated settings.
   return (
-    <div className="space-y-3 rounded-md border bg-muted/10 p-3">
-      <div className="flex items-start justify-between gap-3">
-        <div>
-          <label className="text-xs font-medium">
-            {t("customAgentSkillsLabel")}
-          </label>
-          <p className="mt-1 text-[11px] text-muted-foreground">
-            {t("customAgentSkillsHint")}
-          </p>
-        </div>
-        <Switch
-          checked={info.skillsSharedStore}
-          disabled={saving}
-          onCheckedChange={(v) => void handleToggle(v)}
-        />
-      </div>
-
-      <div className="space-y-1">
-        <label
-          className="text-xs font-medium"
-          htmlFor="custom-agent-skills-dir"
-        >
-          {t("customAgentSkillsDirLabel")}
-        </label>
+    <SettingCard>
+      <SettingRow
+        icon={Sparkles}
+        title={t("customAgentSkillsLabel")}
+        description={t("customAgentSkillsHint")}
+        htmlFor={SHARED_STORE_SWITCH_ID}
+        control={
+          <Switch
+            id={SHARED_STORE_SWITCH_ID}
+            checked={info.skillsSharedStore}
+            disabled={saving}
+            onCheckedChange={(v) => void handleToggle(v)}
+          />
+        }
+      />
+      <SettingRow
+        icon={FolderCog}
+        title={t("customAgentSkillsDirLabel")}
+        description={t("customAgentSkillsDirHint")}
+        htmlFor={SKILLS_DIR_INPUT_ID}
+      >
         <div className="flex items-center gap-2">
           <Input
-            id="custom-agent-skills-dir"
+            id={SKILLS_DIR_INPUT_ID}
             value={dirDraft}
             disabled={saving}
             onChange={(e) => setDirDraft(e.target.value)}
             placeholder="~/.my-agent/skills"
-            className="h-8 text-xs font-mono"
+            className="h-8 font-mono text-xs"
           />
           {dirDirty && (
             <Button
               size="sm"
               variant="secondary"
-              className="h-8 text-xs shrink-0"
+              className="h-8 shrink-0 text-xs"
               disabled={saving}
               onClick={() => void handleSaveDir()}
             >
-              {saving && <Loader2 className="h-3.5 w-3.5 mr-1 animate-spin" />}
+              {saving && <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" />}
               {t("customAgentSaveChanges")}
             </Button>
           )}
         </div>
-        <p className="text-[11px] text-muted-foreground">
-          {t("customAgentSkillsDirHint")}
-        </p>
-      </div>
-    </div>
+      </SettingRow>
+    </SettingCard>
   )
 }

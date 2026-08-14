@@ -71,6 +71,7 @@ expression: detail
         }
       ],
       "timestamp": "[ts]",
+      "duration_ms": 3000,
       "model": "gpt-5.5",
       "completed_at": "[ts]"
     },
@@ -84,6 +85,7 @@ expression: detail
         }
       ],
       "timestamp": "[ts]",
+      "duration_ms": 1000,
       "model": "gpt-5.5",
       "completed_at": "[ts]"
     }

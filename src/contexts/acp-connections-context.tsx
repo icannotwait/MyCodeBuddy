@@ -84,6 +84,7 @@ import {
   extractAppCommandError,
   toLocalizedErrorMessage,
 } from "@/lib/app-error"
+import { isConnectionBusy } from "@/lib/connection-teardown"
 import {
   completeLiveTranscriptTurn,
   enterOwnerPreserve,
@@ -137,6 +138,7 @@ import {
   IDLE_SWEEP_INTERVAL_MS,
 } from "@/lib/constants"
 import { sendSystemNotification } from "@/lib/notification"
+import { primeNotificationSoundOutput } from "@/lib/notification-sound"
 import {
   getSavedPrefsForConnect,
   saveModePreference,
@@ -184,6 +186,8 @@ export interface PendingPermission {
   request_id: string
   tool_call: unknown
   options: PermissionOptionInfo[]
+  /** Requests queued behind this card (only one shows at a time). */
+  queued?: number
 }
 
 /** In-flight user prompt carried on a connection (from a `user_message` event
@@ -739,6 +743,12 @@ type Action =
       fallback_title: string
       fallback_kind: string
       options: PermissionOptionInfo[]
+      queued?: number
+    }
+  | {
+      type: "PERMISSION_QUEUE_DEPTH"
+      contextKey: string
+      depth: number
     }
   | {
       type: "PERMISSION_CLEARED"
@@ -986,6 +996,22 @@ export function __resetStreamingConfigForProviderTests(): void {
 const MAX_LIVE_TOOL_RAW_OUTPUT_CHARS = 200_000
 const MAX_BUFFERED_UNMAPPED_EVENTS_PER_CONNECTION = 64
 const MAX_BUFFERED_UNMAPPED_CONNECTIONS = 128
+/**
+ * How many times a user-driven `reconnect` will wait for an in-flight
+ * `connect()` on the same key before giving up and rebuilding anyway. Small on
+ * purpose: this only absorbs a connect that was already running (or the one
+ * connect() itself re-dispatches for a superseded request), and a key that
+ * keeps reconnecting on its own must not hang the button forever.
+ */
+const MAX_RECONNECT_SETTLE_WAITS = 3
+/**
+ * How long each of those waits will hold. A connect settles by resolving its
+ * IPC, so one that never answers would otherwise park the reconnect FOREVER —
+ * and a wedged connect is the very state this button is clicked from. Generous
+ * enough to cover a real agent spawn (the wait exists to let that finish);
+ * expiring just returns the button to the user to try again.
+ */
+const CONNECT_SETTLE_WAIT_TIMEOUT_MS = 15_000
 
 // Per-agentType cache for selectors (modes / configOptions).
 // Populated when real data arrives from the backend.
@@ -2593,6 +2619,25 @@ function reduceSingleAction(
           request_id: action.request_id,
           tool_call: permissionToolCall,
           options: action.options,
+          queued: action.queued,
+        },
+      })
+      return next
+    }
+
+    case "PERMISSION_QUEUE_DEPTH": {
+      // Depth-only: a request queued up behind the visible card, which emits no
+      // PERMISSION_REQUEST of its own. No card up → nothing to annotate (a late
+      // depth event after a drain must not resurrect one).
+      const conn = state.get(action.contextKey)
+      if (!conn?.pendingPermission) return state
+      if (conn.pendingPermission.queued === action.depth) return state
+      const next = new Map(state)
+      next.set(action.contextKey, {
+        ...conn,
+        pendingPermission: {
+          ...conn.pendingPermission,
+          queued: action.depth,
         },
       })
       return next
@@ -4114,7 +4159,8 @@ export interface AcpActionsValue {
     intent?: ConnectionIntent,
     retryObserverDiscovery?: boolean
   ): Promise<void>
-  disconnect(contextKey: string, origin?: AcpDisconnectOrigin): Promise<void>
+  disconnect(contextKey: string, origin?: AcpDisconnectOrigin): Promise<boolean>
+  disconnectIfIdle(contextKey: string): Promise<void>
   disconnectAll(): Promise<void>
   sendPrompt(
     contextKey: string,
@@ -4188,6 +4234,18 @@ export interface AcpActionsValue {
     parentConnectionId: string
     parentToolUseId: string
     agentType: AgentType
+    /**
+     * Backfill the in-flight turn from a session snapshot before routing
+     * live events. Required when attaching MID-TURN, which the desktop
+     * firehose cannot serve on its own: `acp://event` only carries FUTURE
+     * events, so without a snapshot the viewer misses everything the turn
+     * already produced and its status stays `connected` instead of
+     * `prompting` (no streaming affordance, empty live message). Real
+     * delegation children attach at `delegation_started` — before the
+     * child's first event — and leave this off. No effect on web/remote:
+     * the attach protocol always opens with a snapshot.
+     */
+    hydrate?: boolean
   }): void
   /**
    * Tear down a previously-attached delegation child. Releases the
@@ -4207,6 +4265,33 @@ export interface AcpActionsValue {
    * own the backend process) — callers gate their "applied" confirmation on it.
    */
   reapplyConfig(contextKey: string): Promise<boolean>
+  /**
+   * User-driven reconnect for the composer's connection-status popover, usable
+   * in ANY state — unlike `reapplyConfig`, which only restarts a live owner.
+   *
+   *   * live owner  → disconnect + connect (a restart; a prompting turn dies
+   *     with the agent CLI, which is why the popover warns before offering it)
+   *   * viewer      → detach + re-run discovery, so it re-attaches (or spawns
+   *     its own agent if the previous owner is gone). Never `acpDisconnect`s.
+   *   * no entry    → connect with the params `connect()` last recorded for
+   *     this key, which is what makes the button work from `disconnected` /
+   *     `error`, where the store holds nothing at all.
+   *
+   * Returns `false` on a no-op: a delegation child (broker-owned) or a key we
+   * have no params for (never connected in this session).
+   */
+  reconnect(contextKey: string): Promise<boolean>
+  /**
+   * The params `reconnect(contextKey)` would use, or `null` when it would be a
+   * no-op. Lets the status popover name the agent and enable its button while
+   * NO connection exists. Non-reactive by design — the values only change when
+   * `connect()` runs, which also notifies the store.
+   */
+  getReconnectInfo(contextKey: string): {
+    agentType: AgentType
+    workingDir: string | null
+    sessionId: string | null
+  } | null
   /**
    * Dismiss the "restart to apply" banner for the current drift WITHOUT
    * restarting (client-local; the underlying `configStale` is untouched). A
@@ -4401,6 +4486,13 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     }
   }, [])
 
+  // Notification sounds: browsers only open audio output from inside a user
+  // gesture, so start watching for one now. The user's ordinary first click in
+  // the workspace unlocks it, well before an agent event needs it — otherwise
+  // the session's first cue is lost (the Settings preview cannot stand in for
+  // it: that is a different window with its own audio context). No-op while
+  // sounds are disabled.
+  useEffect(() => primeNotificationSoundOutput(), [])
   // Ref-based store — mutations don't trigger React state updates
   const storeRef = useRef<InternalStore>({
     connections: new Map(),
@@ -4414,6 +4506,12 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
   // bypass this entirely — their events are routed by the per-subscription
   // handlers registered in `attachSubscriptionsRef`.
   const reverseMapRef = useRef(new Map<string, string>())
+
+  // contextKey → diagnostic evidence already surfaced as an alert. The same
+  // error reaches us twice: live on the wire, and again in `last_error` on
+  // every re-attach snapshot. Without this a browser refresh would re-raise
+  // the alert each time.
+  const alertedErrorDetailsRef = useRef(new Map<string, string>())
 
   // contextKey → active EventStream subscription handle. Populated only for
   // connections established via the Subscribe-with-Snapshot attach
@@ -4430,8 +4528,24 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
   // Guard against concurrent connect() calls
   const connectingKeysRef = useRef(new Set<string>())
   const pendingConnectRequestsRef = useRef(new Map<string, ConnectRequest>())
+  // Last params `connect()` was called with, per contextKey — kept AFTER the
+  // connection is gone (teardown removes the store entry entirely, so a
+  // `disconnected` / `error` composer has nothing left to reconnect from).
+  // Recorded even for attempts that fail, which is exactly the `error` case the
+  // status popover's Reconnect button has to serve.
+  //
+  // Backend-RESOLVED identity is folded back in as it arrives (see
+  // `rememberResolvedIdentity`): a new conversation connects with no sessionId
+  // at all, so the request as issued would reconnect into a FRESH session and
+  // silently abandon the conversation's history.
+  const lastConnectParamsRef = useRef(new Map<string, ConnectRequest>())
   // Keys whose disconnect was requested while connect was still in flight
   const abandonedKeysRef = useRef(new Set<string>())
+  // Resolvers waiting for an in-flight connect() on a key to settle. Only a
+  // user-driven `reconnect` uses this: connect() parks a same-parameter request
+  // in `pendingConnectRequestsRef` and its `finally` then DROPS it as a
+  // duplicate, so a reconnect landing mid-connect would vanish silently.
+  const connectSettledWaitersRef = useRef(new Map<string, Array<() => void>>())
   const connectRef = useRef<AcpActionsValue["connect"] | null>(null)
 
   // Cancelable observer/handoff discovery delays (contextKey → cancel).
@@ -4600,6 +4714,52 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     })
   }
 
+  /**
+   * Fold backend-resolved identity into the remembered connect params.
+   *
+   * `connect()` records what the CALLER asked for, and for a new conversation
+   * that request carries no `sessionId` / `conversationId` — the backend mints
+   * them later and they only ever land on the store entry. But the entry is
+   * exactly what disappears when a connection is removed WITHOUT a user
+   * teardown (backend GC via `connection_gone`, the idle sweep, the unmount
+   * cleanup), which is the main way a composer ends up needing Reconnect. With
+   * only the original request left, that button would start a fresh ACP session
+   * instead of resuming the conversation.
+   *
+   * No-op when nothing was remembered for the key: `agentType` alone makes a
+   * request reconnectable, and it can only come from `connect()`.
+   */
+  const rememberResolvedIdentity = useCallback(
+    (
+      contextKey: string,
+      patch: { sessionId?: string; conversationId?: number }
+    ) => {
+      const remembered = lastConnectParamsRef.current.get(contextKey)
+      if (!remembered) return
+      lastConnectParamsRef.current.set(contextKey, { ...remembered, ...patch })
+    },
+    []
+  )
+
+  /**
+   * Snapshot the live entry's resolved identity into the remembered params
+   * immediately BEFORE that entry goes away.
+   *
+   * Identity reaches the entry by several routes — the `session_started` event,
+   * a snapshot hydrate on a cold attach (where the event was already consumed
+   * before this client attached, so it is never replayed), a replayed event —
+   * but it leaves by exactly one: the entry being removed. Capturing at the
+   * single exit covers every route in, including ones added later.
+   */
+  const captureIdentityBeforeRemoval = useCallback(
+    (contextKey: string) => {
+      const sessionId = storeRef.current.connections.get(contextKey)?.sessionId
+      if (!sessionId) return
+      rememberResolvedIdentity(contextKey, { sessionId })
+    },
+    [rememberResolvedIdentity]
+  )
+
   type ConnectBlockState =
     | { kind: "none"; reason: "" }
     | {
@@ -4652,7 +4812,13 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
 
       return {
         kind: "sdk_missing",
-        reason: t("blocked.sdkMissing", { agent: agentLabel }),
+        // Claude Code / Codex install a separate ACP adapter package, not the
+        // vendor CLI — saying "{agent} is not installed" to someone who has
+        // `claude` on their PATH reads as a bug in codeg. Name what's actually
+        // missing instead.
+        reason: agent.is_acp_adapter
+          ? t("blocked.adapterMissing", { agent: agentLabel })
+          : t("blocked.sdkMissing", { agent: agentLabel }),
       }
     },
     [t]
@@ -5455,6 +5621,45 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
   )
   seedDelegationsFromSnapshotRef.current = seedDelegationsFromSnapshot
 
+  // Surface diagnostic evidence carried by a snapshot's `last_error`.
+  //
+  // Alerts are live-only, so a client that attached AFTER the error fired
+  // (browser refresh, second tab, cold attach mid-session) would otherwise
+  // never learn why the turn came back empty — the snapshot is its only
+  // channel. Scoped to errors that actually carry evidence, i.e. the inferred
+  // `turn_failed_empty*` family, so attaching to a connection with any older
+  // error doesn't start raising alerts it never used to.
+  //
+  // Same routing rules as the live path: evidence goes to the alert only,
+  // never to `conn.error` (composer tooltip) and never to an OS notification.
+  // Held in a ref, following `pushAlertRef` above: the attach/hydrate
+  // callbacks below are deliberately identity-stable (an empty dep array keeps
+  // a re-render from tearing down and re-establishing live subscriptions), so
+  // they must not close over a `t`-dependent callback directly.
+  const surfaceSnapshotErrorDetails = useCallback(
+    (
+      contextKey: string,
+      patch: import("@/lib/snapshot-denormalize").SnapshotPatch
+    ) => {
+      const evidence = patch.lastErrorDetails?.trim()
+      if (!evidence) return
+      if (alertedErrorDetailsRef.current.get(contextKey) === evidence) return
+      alertedErrorDetailsRef.current.set(contextKey, evidence)
+      pushAlertRef.current(
+        "error",
+        t("eventErrorTitle"),
+        patch.lastError ?? undefined,
+        undefined,
+        evidence
+      )
+    },
+    [t]
+  )
+  const surfaceSnapshotErrorDetailsRef = useRef(surfaceSnapshotErrorDetails)
+  useEffect(() => {
+    surfaceSnapshotErrorDetailsRef.current = surfaceSnapshotErrorDetails
+  }, [surfaceSnapshotErrorDetails])
+
   // Open a Subscribe-with-Snapshot stream for `connectionId` and route its
   // frames into the store under `contextKey`. Returns the subscription
   // handle for cleanup, or `null` when the active transport doesn't
@@ -5482,6 +5687,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         onSnapshot: (snapshot) => {
           const patch = denormalizeSnapshot(snapshot)
           dispatch({ type: "HYDRATE_FROM_SNAPSHOT", contextKey, patch })
+          surfaceSnapshotErrorDetailsRef.current(contextKey, patch)
           lastActivityRef.current.set(contextKey, Date.now())
           seedDelegationsFromSnapshot(
             patch.connectionId,
@@ -6257,6 +6463,9 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         if (connectionId !== contextKey) {
           clearAliasesPointingTo(connectionId)
         }
+        // Reclaimed for idleness, not closed: the tab is still open and its
+        // Reconnect button must resume this session, not start a new one.
+        captureIdentityBeforeRemoval(contextKey)
         dispatch({ type: "CONNECTION_REMOVED", contextKey })
       }
     }, IDLE_SWEEP_INTERVAL_MS)
@@ -6505,6 +6714,10 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         intent,
         retryObserverDiscovery,
       }
+      // Remember BEFORE the in-flight early return and before the preflight can
+      // throw: a connect that never produced a store entry is precisely when
+      // `reconnect()` has nothing else to go on.
+      lastConnectParamsRef.current.set(contextKey, request)
       if (connectingKeysRef.current.has(contextKey)) {
         pendingConnectRequestsRef.current.set(contextKey, request)
         // Only cancel in-flight observer/handoff delays when the queued request
@@ -6593,6 +6806,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         })
       }
 
+      let configuredAgent: AcpAgentStatus | null = null
       try {
         // ── observe_existing: bounded discovery only; never preflight/spawn ──
         if (intent === "observe_existing") {
@@ -6765,7 +6979,6 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         // not installed. The session page must never trigger a download
         // or install — if the agent is not ready, prompt the user to
         // install it from Agent Settings instead.
-        let configuredAgent: AcpAgentStatus | null = null
         try {
           configuredAgent = await acpGetAgentStatus(agentType)
         } catch (error) {
@@ -7193,6 +7406,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
               contextKey,
               patch: snapshotPatch,
             })
+            surfaceSnapshotErrorDetailsRef.current(contextKey, snapshotPatch)
             // Recover delegation bindings from the snapshot here too. On
             // Tauri the firehose also delivers the events (so this is an
             // idempotent no-op), but it keeps RemoteDesktop and the legacy
@@ -7247,7 +7461,9 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           if (sdkMissing) {
             pushAlertRef.current(
               "error",
-              t("blocked.sdkMissing", { agent: agentLabel }),
+              configuredAgent?.is_acp_adapter
+                ? t("blocked.adapterMissing", { agent: agentLabel })
+                : t("blocked.sdkMissing", { agent: agentLabel }),
               t("agentsSetupHint"),
               [buildOpenAgentsSettingsAction(agentType)]
             )
@@ -7266,6 +7482,11 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         connectingKeysRef.current.delete(contextKey)
         inflightConnectRequestsRef.current.delete(contextKey)
         abandonedKeysRef.current.delete(contextKey)
+        const settledWaiters = connectSettledWaitersRef.current.get(contextKey)
+        if (settledWaiters) {
+          connectSettledWaitersRef.current.delete(contextKey)
+          for (const resolveWaiter of settledWaiters) resolveWaiter()
+        }
         const pendingRequest = pendingConnectRequestsRef.current.get(contextKey)
         if (pendingRequest) {
           pendingConnectRequestsRef.current.delete(contextKey)
@@ -7328,14 +7549,19 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       }
       if (observerAliasesRef.current.has(contextKey)) {
         releaseObserverAlias(contextKey)
-        return
+        return false
       }
       const conn = storeRef.current.connections.get(contextKey)
       if (!conn) {
         // connect() is still in flight with no store entry yet — abandoned
         // already set above when connectingKeys has the key.
-        return
+        return false
       }
+      // Before either branch drops the entry: an explicit teardown is also how
+      // a `reconnect` starts, and the session it resumes may only ever have
+      // been known to the entry (cold attach hydrates it from the snapshot,
+      // never from a replayed `session_started`).
+      captureIdentityBeforeRemoval(contextKey)
       if (conn.isViewer) {
         // Viewer teardown: drop our read-only attachment WITHOUT
         // `acpDisconnect` — the backend connection belongs to another client,
@@ -7349,7 +7575,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         // Drop any tab aliases that pointed at this canonical entry.
         clearAliasesPointingTo(contextKey)
         dispatch({ type: "CONNECTION_REMOVED", contextKey })
-        return
+        return true
       }
       // Pop-out transfer / detached suppress: release local UI ownership without
       // killing the agent (transfer fence or pre-commit-ack suppress).
@@ -7396,7 +7622,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           clearAliasesPointingTo(conn.connectionId)
         }
         dispatch({ type: "CONNECTION_REMOVED", contextKey })
-        return
+        return true
       }
       await acpDisconnect(
         conn.connectionId,
@@ -7415,6 +7641,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         clearAliasesPointingTo(conn.connectionId)
       }
       dispatch({ type: "CONNECTION_REMOVED", contextKey })
+      return true
     },
     [
       clearAliasesPointingTo,
@@ -7444,7 +7671,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         delegationRouteOverride: boundRouteOverride,
         ownerOperationId: boundOwnerOperationId,
       } = conn
-      await disconnect(contextKey, "config_reapply")
+      const tornDown = await disconnect(contextKey, "config_reapply")
       await connect(
         contextKey,
         agentType,
@@ -7454,9 +7681,139 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         boundRouteOverride,
         boundOwnerOperationId
       )
-      return true
+      // Reconnect regardless — the user is left with a working connection
+      // either way — but an unconfirmed teardown means the old process may
+      // still be alive and holding the OLD config, and `connect()` can land
+      // right back on it. Returning false keeps the caller from showing an
+      // "applied" confirmation it can't stand behind.
+      return tornDown
     },
     [connect, disconnect]
+  )
+
+  // Params a reconnect would use: the LIVE connection wins (it carries what the
+  // backend actually resolved — notably a sessionId minted after connect), with
+  // the remembered request filling in what the store doesn't hold
+  // (conversationId, and everything at all once the entry is gone).
+  const resolveReconnectRequest = useCallback(
+    (contextKey: string): ConnectRequest | null => {
+      const conn = storeRef.current.connections.get(contextKey)
+      // Broker-owned: its lifetime is the parent's delegation_started /
+      // _completed pair, and disconnecting would kill a child the user never
+      // spawned. Bail before falling back to any remembered params.
+      if (conn?.isDelegationChild) return null
+      const remembered = lastConnectParamsRef.current.get(contextKey)
+      const agentType = conn?.agentType ?? remembered?.agentType
+      if (!agentType) return null
+      return {
+        agentType,
+        workingDir: conn?.workingDir ?? remembered?.workingDir ?? undefined,
+        sessionId: conn?.sessionId ?? remembered?.sessionId ?? undefined,
+        conversationId: remembered?.conversationId,
+        delegationRouteOverride: remembered?.delegationRouteOverride,
+        ownerOperationId: remembered?.ownerOperationId,
+        intent: remembered?.intent ?? "own_or_observe",
+        retryObserverDiscovery: remembered?.retryObserverDiscovery ?? false,
+      }
+    },
+    []
+  )
+
+  const getReconnectInfo = useCallback(
+    (contextKey: string) => {
+      const request = resolveReconnectRequest(contextKey)
+      if (!request) return null
+      return {
+        agentType: request.agentType,
+        workingDir: request.workingDir ?? null,
+        sessionId: request.sessionId ?? null,
+      }
+    },
+    [resolveReconnectRequest]
+  )
+
+  // Settle-point for an in-flight connect() on a key. Resolves `true` once that
+  // connect finishes (immediately when nothing is connecting), `false` if it
+  // has not answered within the timeout — a connect whose IPC never settles
+  // must not hold the caller forever.
+  const waitForConnectSettled = useCallback(
+    (contextKey: string): Promise<boolean> => {
+      if (!connectingKeysRef.current.has(contextKey))
+        return Promise.resolve(true)
+      return new Promise<boolean>((resolve) => {
+        const onSettled = () => {
+          clearTimeout(timer)
+          resolve(true)
+        }
+        const timer = setTimeout(() => {
+          // Drop our resolver so the abandoned wait can't accumulate on a key
+          // that keeps failing to settle — including the key itself once the
+          // last waiter gives up, since a connect that never answers would
+          // otherwise leave the empty list behind for good.
+          const waiters = connectSettledWaitersRef.current.get(contextKey)
+          const at = waiters?.indexOf(onSettled) ?? -1
+          if (waiters && at >= 0) waiters.splice(at, 1)
+          if (waiters?.length === 0) {
+            connectSettledWaitersRef.current.delete(contextKey)
+          }
+          resolve(false)
+        }, CONNECT_SETTLE_WAIT_TIMEOUT_MS)
+        const waiters = connectSettledWaitersRef.current.get(contextKey)
+        if (waiters) waiters.push(onSettled)
+        else connectSettledWaitersRef.current.set(contextKey, [onSettled])
+      })
+    },
+    []
+  )
+
+  const reconnect = useCallback(
+    async (contextKey: string): Promise<boolean> => {
+      // A connect() already in flight would SWALLOW this one: connect() parks a
+      // same-parameter request as pending and its `finally` discards it as a
+      // duplicate, so the button would spin once and change nothing — with no
+      // store entry yet, the teardown below wouldn't run either. Wait for the
+      // attempt to settle and then rebuild: the user asked for a new
+      // connection, not to join whatever is already running (they typically
+      // click precisely BECAUSE the connecting state is stuck).
+      //
+      // Bounded rather than looped-to-clear: a key that keeps reconnecting on
+      // its own must not hang the button forever, and one more contending
+      // connect is what connectingKeysRef already exists to serialise.
+      //
+      // Each wait is also time-bounded, because the connect this one is stuck
+      // behind may never answer at all. Rebuilding anyway would be worse than
+      // useless — connect() would park it as a duplicate and drop it — so give
+      // up and hand the button back instead of spinning on a wedged IPC.
+      for (let i = 0; i < MAX_RECONNECT_SETTLE_WAITS; i++) {
+        if (!connectingKeysRef.current.has(contextKey)) break
+        if (!(await waitForConnectSettled(contextKey))) return false
+      }
+      // Resolved AFTER the wait: the connect we just waited on may have minted
+      // the sessionId that makes this a resume rather than a fresh session.
+      const request = resolveReconnectRequest(contextKey)
+      if (!request) return false
+      // Tear down first even though connect() would: its "same params, still
+      // alive → no-op" fast path would otherwise swallow the whole thing, and
+      // this button exists precisely to rebuild a connection whose params did
+      // NOT change. `disconnect` detaches viewers without killing the owner's
+      // agent, so this stays safe for them too.
+      //
+      // An unconfirmed teardown is deliberately NOT fatal here: the local entry
+      // is released either way, and refusing to reconnect would strand the user
+      // on the dead connection this button exists to replace.
+      if (storeRef.current.connections.has(contextKey)) {
+        await disconnect(contextKey)
+      }
+      await connect(
+        contextKey,
+        request.agentType,
+        request.workingDir,
+        request.sessionId,
+        request.conversationId
+      )
+      return true
+    },
+    [connect, disconnect, resolveReconnectRequest, waitForConnectSettled]
   )
 
   const dismissConfigStale = useCallback(
@@ -7506,6 +7863,12 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     }
     observerAliasesRef.current.clear()
     lastActivityRef.current.clear()
+    // Context keys are reused across backends, so a surviving entry here would
+    // suppress the first snapshot alert of an unrelated session.
+    alertedErrorDetailsRef.current.clear()
+    // Same reuse hazard: remembered connect params must not let a reconnect
+    // resurrect the previous backend's session under a recycled key.
+    lastConnectParamsRef.current.clear()
     await Promise.all(promises)
     dispatch({ type: "REMOVE_ALL" })
   }, [dispatch, teardownAttachSubscription])
@@ -7736,9 +8099,15 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       parentConnectionId: string
       parentToolUseId: string
       agentType: AgentType
+      hydrate?: boolean
     }) => {
-      const { connectionId, parentConnectionId, parentToolUseId, agentType } =
-        args
+      const {
+        connectionId,
+        parentConnectionId,
+        parentToolUseId,
+        agentType,
+        hydrate,
+      } = args
       const existing = storeRef.current.connections.get(connectionId)
       if (
         existing &&
@@ -7776,18 +8145,67 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       // Tauri desktop: the global acp://event listener routes by
       // reverseMap. Register the identity mapping and drain any
       // envelopes that arrived between the child's spawn and now.
-      if (!reverseMapRef.current.has(connectionId)) {
+      const route = () => {
         reverseMapRef.current.set(connectionId, connectionId)
-        const buffered = consumeBufferedEvents(connectionId)
-        for (const env of buffered) {
+        for (const env of consumeBufferedEvents(connectionId)) {
           applyMappedEnvelope(connectionId, env)
         }
       }
+      if (!hydrate) {
+        route()
+        return
+      }
+      // Mid-turn attach: the firehose carries only future events, so backfill
+      // the turn already in flight from a snapshot FIRST, then route (same
+      // order as `connectAsViewer` — anything that lands while the fetch is in
+      // flight stays in the unmapped buffer and is deduped by seq on drain).
+      void (async () => {
+        let patch: import("@/lib/snapshot-denormalize").SnapshotPatch | null =
+          null
+        try {
+          const snapshot = await acpGetSessionSnapshot(connectionId)
+          if (snapshot) patch = denormalizeSnapshot(snapshot)
+        } catch (e) {
+          console.warn(
+            "[acp-context] child snapshot fetch failed for",
+            connectionId,
+            e
+          )
+        }
+        // The viewer may have closed while the snapshot was in flight —
+        // never hydrate or install routing for a detached child.
+        const still = storeRef.current.connections.get(connectionId)
+        if (!still?.isDelegationChild || still.connectionId !== connectionId) {
+          return
+        }
+        if (patch) {
+          dispatch({
+            type: "HYDRATE_FROM_SNAPSHOT",
+            contextKey: connectionId,
+            patch,
+          })
+          // Same recovery the other three snapshot consumers do
+          // (`setupAttachSubscription.onSnapshot`, `connectAsViewer`,
+          // `connect()`'s legacy branch): `delegation_started` is transient and
+          // never replayed, so a viewer opening onto a turn that ALREADY
+          // delegated (the work-task transcript dialog is the case) would
+          // otherwise establish no binding — no agent icon/label, no child
+          // sub-stream, no "待批准" badge on the sub-agent card. Idempotent
+          // against any live event for the same `parent_tool_use_id`.
+          seedDelegationsFromSnapshot(
+            patch.connectionId,
+            patch.activeDelegations,
+            patch.eventSeq
+          )
+        }
+        route()
+      })()
     },
     [
       applyMappedEnvelope,
       consumeBufferedEvents,
       dispatch,
+      seedDelegationsFromSnapshot,
       setupAttachSubscription,
     ]
   )
@@ -7816,10 +8234,20 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     [aliasKeysFor, dispatch, teardownAttachSubscription]
   )
 
+  const disconnectIfIdle = useCallback(
+    async (contextKey: string) => {
+      const conn = storeRef.current.connections.get(contextKey)
+      if (conn && !conn.isViewer && isConnectionBusy(conn)) return
+      await disconnect(contextKey)
+    },
+    [disconnect]
+  )
+
   const actions = useMemo<AcpActionsValue>(
     () => ({
       connect,
       disconnect,
+      disconnectIfIdle,
       disconnectAll,
       sendPrompt,
       setMode,
@@ -7838,11 +8266,14 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       attachDelegationChild,
       detachDelegationChild,
       reapplyConfig,
+      reconnect,
+      getReconnectInfo,
       dismissConfigStale,
     }),
     [
       connect,
       disconnect,
+      disconnectIfIdle,
       disconnectAll,
       sendPrompt,
       setMode,
@@ -7861,6 +8292,8 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       attachDelegationChild,
       detachDelegationChild,
       reapplyConfig,
+      reconnect,
+      getReconnectInfo,
       dismissConfigStale,
     ]
   )

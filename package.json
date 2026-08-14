@@ -1,7 +1,7 @@
 {
   "name": "codeg",
   "private": true,
-  "version": "0.22.2-mycodebuddy.1",
+  "version": "0.25.0-mycodebuddy.1",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
@@ -87,6 +87,7 @@
     "qrcode.react": "^4.2.0",
     "radix-ui": "^1.4.3",
     "react": "^19.1.0",
+    "react-day-picker": "^9.14.0",
     "react-dom": "^19.1.0",
     "react-markdown": "^10.1.0",
     "react-resizable-panels": "^2.1.9",
@@ -94,6 +95,7 @@
     "remark-gfm": "^4.0.1",
     "shadcn": "^3.8.4",
     "shiki": "^3.22.0",
+    "smol-toml": "^1.7.1",
     "sonner": "^2.0.7",
     "streamdown": "^2.2.0",
     "tailwind-merge": "^3.4.0",

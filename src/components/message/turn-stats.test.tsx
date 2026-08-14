@@ -3,6 +3,12 @@ import { render, screen } from "@testing-library/react"
 import { NextIntlClientProvider } from "next-intl"
 import { describe, expect, it, vi } from "vitest"
 
+// The create-task action pulls workbench-route + tab-store contexts that this
+// unit test doesn't mount; stub it to a no-op handler.
+vi.mock("./use-create-task-from-message", () => ({
+  useCreateTaskFromMessage: () => () => {},
+}))
+
 import { TurnStats } from "./turn-stats"
 import { MessageScrollProvider } from "./message-scroll-context"
 import enMessages from "@/i18n/messages/en.json"

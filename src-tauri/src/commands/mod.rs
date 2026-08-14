@@ -4,6 +4,7 @@ pub mod app_update;
 pub mod automation;
 pub mod background;
 pub mod backup;
+pub mod chat_authoring;
 pub mod chat_channel;
 pub mod conversation_experience;
 #[cfg(feature = "tauri-runtime")]
@@ -19,6 +20,7 @@ pub mod feedback;
 #[cfg(feature = "tauri-runtime")]
 pub mod file_io;
 pub mod folder_commands;
+pub mod folder_links;
 pub mod folders;
 pub mod history_window;
 pub mod logging;
@@ -41,10 +43,13 @@ pub mod session_info;
 pub mod simple_workflow;
 pub mod system_settings;
 pub mod terminal;
+pub mod token_usage;
 pub mod tool_watchdog;
+pub mod turn_window;
 pub mod version_control;
 #[cfg(feature = "tauri-runtime")]
 pub mod windows;
+pub mod work_task;
 pub mod workflow_completion;
 pub mod workflow_graph;
 pub mod workspace_state;

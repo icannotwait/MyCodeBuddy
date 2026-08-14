@@ -19,7 +19,9 @@ import {
   selectPinnedWithReuse,
   sidebarRowKey,
   type SidebarBucketKey,
+  selectRecentConversationsWithReuse,
   worktreeChildrenByParent,
+  worktreeHeaderAlias,
   type SidebarRow,
 } from "./sidebar-conversation-grouping"
 
@@ -326,6 +328,30 @@ describe("worktreeChildrenByParent", () => {
   })
 })
 
+describe("worktreeHeaderAlias", () => {
+  it("prefers the alias — where the seeded branch name lands", () => {
+    expect(worktreeHeaderAlias("task/49", "task/49")).toBe("task/49")
+  })
+
+  it("lets a renamed worktree win over its branch", () => {
+    expect(worktreeHeaderAlias("Payment rewrite", "task/49")).toBe(
+      "Payment rewrite"
+    )
+  })
+
+  it("falls back to the branch", () => {
+    expect(worktreeHeaderAlias(null, "task/49")).toBe("task/49")
+  })
+
+  it("gives up rather than inventing one, leaving the bare directory name", () => {
+    expect(worktreeHeaderAlias(null, null)).toBeNull()
+    // Blank-but-present values (a cleared alias round-tripping as "") must not
+    // win the chain and render `[ … ]` against an empty label.
+    expect(worktreeHeaderAlias("  ", "  ")).toBeNull()
+    expect(worktreeHeaderAlias(undefined, undefined)).toBeNull()
+  })
+})
+
 describe("reuseSet", () => {
   it("returns the previous set when membership is unchanged", () => {
     const prev = new Set(["a:1", "b:2"])
@@ -365,6 +391,11 @@ describe("reuseSelected", () => {
     expect(reuseSelected(null, prev)).toBe(prev)
   })
 })
+
+/** The section headers a row list emits, top to bottom. */
+function sectionSequence(rows: readonly SidebarRow[]): string[] {
+  return rows.flatMap((r) => (r.kind === "section" ? [r.section] : []))
+}
 
 describe("buildRows", () => {
   const foldersHeader = (count: number) =>
@@ -597,7 +628,7 @@ describe("buildRows", () => {
     )
   })
 
-  it("places Chat above Folders when sectionOrder is chats-first, keeping Pinned on top", () => {
+  it("follows sectionOrder for Folders/Chat/Recent, keeping Pinned on top", () => {
     const p1 = conv(1, 10, { pinned_at: new Date(2000).toISOString() })
     const rows = buildRows({
       pinned: [p1],
@@ -609,24 +640,20 @@ describe("buildRows", () => {
       foldersExpanded: true,
       chatConversations: [conv(3, 99)],
       chatsExpanded: true,
-      sectionOrder: "chats-first",
+      recentConversations: [conv(2, 10)],
+      showRecent: true,
+      sectionOrder: ["recent", "chats", "folders"],
     })
-    const pinnedIdx = rows.findIndex(
-      (r) => r.kind === "section" && r.section === "pinned"
-    )
-    const chatsIdx = rows.findIndex(
-      (r) => r.kind === "section" && r.section === "chats"
-    )
-    const foldersIdx = rows.findIndex(
-      (r) => r.kind === "section" && r.section === "folders"
-    )
-    // Pinned stays at the very top; Folders and Chat are swapped.
-    expect(pinnedIdx).toBe(0)
-    expect(chatsIdx).toBeGreaterThan(pinnedIdx)
-    expect(foldersIdx).toBeGreaterThan(chatsIdx)
+    // Pinned stays at the very top; the other three follow the given order.
+    expect(sectionSequence(rows)).toEqual([
+      "pinned",
+      "recent",
+      "chats",
+      "folders",
+    ])
   })
 
-  it("places Folders above Chat when sectionOrder is folders-first (the default)", () => {
+  it("places Folders above Chat by default, with no Recent section at all", () => {
     const args = {
       pinned: [] as DbConversationSummary[],
       pinnedExpanded: true,
@@ -638,23 +665,34 @@ describe("buildRows", () => {
       chatConversations: [conv(2, 99)],
       chatsExpanded: true,
     }
-    const order = (rows: SidebarRow[]) => {
-      const f = rows.findIndex(
-        (r) => r.kind === "section" && r.section === "folders"
+    // The explicit default order and the omitted one agree — and neither emits
+    // a Recent section, since `showRecent` is off unless a caller opts in.
+    expect(sectionSequence(buildRows(args))).toEqual(["folders", "chats"])
+    expect(
+      sectionSequence(
+        buildRows({ ...args, sectionOrder: ["folders", "chats", "recent"] })
       )
-      const c = rows.findIndex(
-        (r) => r.kind === "section" && r.section === "chats"
-      )
-      return { f, c }
-    }
-    // Explicit folders-first and the omitted default agree: Folders before Chat.
-    const explicit = order(
-      buildRows({ ...args, sectionOrder: "folders-first" })
-    )
-    const omitted = order(buildRows(args))
-    expect(explicit.f).toBeGreaterThanOrEqual(0)
-    expect(explicit.c).toBeGreaterThan(explicit.f)
-    expect(omitted.c).toBeGreaterThan(omitted.f)
+    ).toEqual(["folders", "chats"])
+  })
+
+  it("normalizes a partial or repeated sectionOrder into a full permutation", () => {
+    const rows = buildRows({
+      pinned: [],
+      pinnedExpanded: true,
+      orderedFolderIds: [10],
+      byFolder: new Map([[10, [conv(1, 10)]]]),
+      folderExpanded: { 10: true },
+      folderTotalCounts: new Map([[10, 1]]),
+      foldersExpanded: true,
+      chatConversations: [],
+      chatsExpanded: true,
+      recentConversations: [conv(1, 10)],
+      showRecent: true,
+      // Repeated entry + a missing section: "recent" is emitted once, up front,
+      // and the omitted sections fall in behind it in default order.
+      sectionOrder: ["recent", "recent"],
+    })
+    expect(sectionSequence(rows)).toEqual(["recent", "folders", "chats"])
   })
 
   it("always emits the Chat section, with an empty hint when there are no chat conversations", () => {
@@ -1156,6 +1194,188 @@ describe("sidebarRowKey", () => {
   })
 })
 
+describe("buildRows — Recent section", () => {
+  const baseArgs = {
+    pinned: [] as DbConversationSummary[],
+    pinnedExpanded: true,
+    orderedFolderIds: [10],
+    byFolder: new Map([[10, [conv(1, 10)]]]),
+    folderExpanded: { 10: true },
+    folderTotalCounts: new Map([[10, 1]]),
+    foldersExpanded: true,
+    chatConversations: [] as DbConversationSummary[],
+    chatsExpanded: true,
+  }
+
+  it("emits no rows at all — not even a header — when showRecent is off", () => {
+    const rows = buildRows({
+      ...baseArgs,
+      recentConversations: [conv(1, 10)],
+      showRecent: false,
+    })
+    expect(sectionSequence(rows)).toEqual(["folders", "chats"])
+    expect(rows.some((r) => r.kind === "recent-empty")).toBe(false)
+  })
+
+  it("tags its conversation rows `recent` so they don't collide with their twins", () => {
+    const c1 = conv(1, 10)
+    const rows = buildRows({
+      ...baseArgs,
+      recentConversations: [c1],
+      showRecent: true,
+    })
+    const matches = rows.filter(
+      (r) => r.kind === "conversation" && r.conversation.id === 1
+    )
+    // The same conversation appears twice: once under its folder (untagged),
+    // once in Recent (tagged).
+    expect(matches).toEqual([
+      conversationRow(c1, 0, 1, "folder:10"),
+      { ...conversationRow(c1, 0, 1, "folder:10"), recent: true },
+    ])
+  })
+
+  it("tags a Recent parent's lazy-load placeholder and subtree too", () => {
+    const parent = conv(1, 10, { child_count: 1 })
+    const kid = conv(2, 10)
+    const rows = buildRows({
+      ...baseArgs,
+      byFolder: new Map([[10, [parent]]]),
+      recentConversations: [parent],
+      showRecent: true,
+      conversationExpanded: new Set([1]),
+      childrenByParent: new Map([[1, [kid]]]),
+    })
+    // Child rows inherit the flag, otherwise the folder copy and the Recent
+    // copy of the same child would share a React key.
+    expect(
+      rows.filter((r) => r.kind === "conversation" && r.conversation.id === 2)
+    ).toEqual([
+      conversationRow(kid, 1, 1, "folder:10"),
+      { ...conversationRow(kid, 1, 1, "folder:10"), recent: true },
+    ])
+
+    const loadingRows = buildRows({
+      ...baseArgs,
+      byFolder: new Map([[10, [parent]]]),
+      recentConversations: [parent],
+      showRecent: true,
+      conversationExpanded: new Set([1]),
+      childrenByParent: new Map([[1, []]]),
+      childrenLoading: new Set([1]),
+    }).filter((r) => r.kind === "subsession-loading")
+    expect(loadingRows).toEqual([
+      {
+        kind: "subsession-loading",
+        parentId: 1,
+        depth: 1,
+        rootId: 1,
+        bucketKey: "folder:10",
+      },
+      {
+        kind: "subsession-loading",
+        parentId: 1,
+        depth: 1,
+        rootId: 1,
+        bucketKey: "folder:10",
+        recent: true,
+      },
+    ])
+  })
+
+  it("emits an empty hint when shown with nothing in it", () => {
+    const rows = buildRows({
+      ...baseArgs,
+      recentConversations: [],
+      showRecent: true,
+    })
+    expect(rows).toContainEqual({ kind: "recent-empty" })
+  })
+
+  it("emits only its header while collapsed", () => {
+    const rows = buildRows({
+      ...baseArgs,
+      recentConversations: [conv(1, 10)],
+      recentExpanded: false,
+      showRecent: true,
+    })
+    expect(rows).toContainEqual({
+      kind: "section",
+      section: "recent",
+      expanded: false,
+      count: 1,
+    })
+    expect(rows.filter((r) => r.kind === "conversation" && r.recent)).toEqual(
+      []
+    )
+  })
+
+  describe("paging", () => {
+    const many = Array.from({ length: 5 }, (_, i) => conv(i + 1, 10))
+
+    it("stops at recentLimit and appends a show-more row with the remainder", () => {
+      const rows = buildRows({
+        ...baseArgs,
+        byFolder: new Map([[10, many]]),
+        folderTotalCounts: new Map([[10, many.length]]),
+        recentConversations: many,
+        showRecent: true,
+        recentLimit: 2,
+      })
+      expect(
+        rows.filter((r) => r.kind === "conversation" && r.recent).length
+      ).toBe(2)
+      expect(rows).toContainEqual({ kind: "recent-more", remaining: 3 })
+      // The header keeps reporting the TOTAL, not the visible slice.
+      expect(rows).toContainEqual({
+        kind: "section",
+        section: "recent",
+        expanded: true,
+        count: 5,
+      })
+    })
+
+    it("omits the show-more row once the limit covers everything", () => {
+      const rows = buildRows({
+        ...baseArgs,
+        byFolder: new Map([[10, many]]),
+        folderTotalCounts: new Map([[10, many.length]]),
+        recentConversations: many,
+        showRecent: true,
+        recentLimit: 5,
+      })
+      expect(rows.some((r) => r.kind === "recent-more")).toBe(false)
+    })
+
+    it("emits every conversation when no limit is given", () => {
+      const rows = buildRows({
+        ...baseArgs,
+        byFolder: new Map([[10, many]]),
+        folderTotalCounts: new Map([[10, many.length]]),
+        recentConversations: many,
+        showRecent: true,
+      })
+      expect(
+        rows.filter((r) => r.kind === "conversation" && r.recent).length
+      ).toBe(5)
+      expect(rows.some((r) => r.kind === "recent-more")).toBe(false)
+    })
+
+    it("does not page a collapsed section", () => {
+      const rows = buildRows({
+        ...baseArgs,
+        byFolder: new Map([[10, many]]),
+        folderTotalCounts: new Map([[10, many.length]]),
+        recentConversations: many,
+        recentExpanded: false,
+        showRecent: true,
+        recentLimit: 2,
+      })
+      expect(rows.some((r) => r.kind === "recent-more")).toBe(false)
+    })
+  })
+})
+
 describe("buildRows — Show worktrees container tree", () => {
   // Trim the trailing (always-present) Chat section for exact folder assertions.
   const trimChats = (rows: SidebarRow[]): SidebarRow[] => {
@@ -1441,6 +1661,108 @@ describe("selectChatConversationsWithReuse", () => {
   })
 })
 
+describe("selectRecentConversationsWithReuse", () => {
+  const open = new Set([10])
+
+  it("mixes folder and chat conversations, newest first, excluding pinned", () => {
+    const folderConv = conv(1, 10)
+    const chatConv = conv(2, 99, { kind: "chat" }) // higher id → later created_at
+    const pinned = conv(3, 10, { pinned_at: new Date(5000).toISOString() })
+    const out = selectRecentConversationsWithReuse(
+      [folderConv, chatConv, pinned],
+      true,
+      "created",
+      open,
+      []
+    )
+    // Pinned lives in its own section; the other two interleave by recency.
+    expect(out.map((c) => c.id)).toEqual([2, 1])
+  })
+
+  it("drops folder conversations whose folder is closed, but never chats", () => {
+    const inOpen = conv(1, 10)
+    const inClosed = conv(2, 77)
+    const chatConv = conv(3, 99, { kind: "chat" })
+    const out = selectRecentConversationsWithReuse(
+      [inOpen, inClosed, chatConv],
+      true,
+      "created",
+      open,
+      []
+    )
+    // `list_all_conversations` returns rows for closed folders too; Recent must
+    // apply the same reachability rule the Folders section does. Chat
+    // conversations live in a hidden folder that is never in the open set.
+    expect(out.map((c) => c.id)).toEqual([3, 1])
+  })
+
+  it("excludes completed conversations unless showCompleted", () => {
+    const done = conv(1, 10, { status: "completed" })
+    const active = conv(2, 10)
+    expect(
+      selectRecentConversationsWithReuse(
+        [done, active],
+        false,
+        "created",
+        open,
+        []
+      ).map((c) => c.id)
+    ).toEqual([2])
+    expect(
+      selectRecentConversationsWithReuse(
+        [done, active],
+        true,
+        "created",
+        open,
+        []
+      ).map((c) => c.id)
+    ).toEqual([2, 1])
+  })
+
+  it("sorts by the active sort mode so the order matches each card's label", () => {
+    const older = conv(1, 10, { updated_at: new Date(9_000_000).toISOString() })
+    const newer = conv(2, 10, { updated_at: new Date(1_000).toISOString() })
+    // Created-at descending puts the higher id first; updated-at flips them.
+    expect(
+      selectRecentConversationsWithReuse(
+        [older, newer],
+        true,
+        "created",
+        open,
+        []
+      ).map((c) => c.id)
+    ).toEqual([2, 1])
+    expect(
+      selectRecentConversationsWithReuse(
+        [older, newer],
+        true,
+        "updated",
+        open,
+        []
+      ).map((c) => c.id)
+    ).toEqual([1, 2])
+  })
+
+  it("returns the prev array when membership is referentially unchanged", () => {
+    const a = conv(1, 10)
+    const first = selectRecentConversationsWithReuse(
+      [a],
+      true,
+      "created",
+      open,
+      []
+    )
+    const second = selectRecentConversationsWithReuse(
+      [a],
+      true,
+      "created",
+      open,
+      first
+    )
+    expect(second).toBe(first)
+  })
+})
+
 describe("selectPinnedWithReuse", () => {
   it("omits unpinned conversations from pinned membership", () => {
     const pinnedOnly = conv(1, 10, {
@@ -1554,6 +1876,40 @@ describe("flatIndexOfConversation", () => {
     expect(flatIndexOfConversation(rows, 2, "claude_code")).toBe(-1)
     expect(flatIndexOfConversation(rows, 99, "claude_code")).toBe(-1)
   })
+
+  it("prefers the canonical row over a Recent duplicate above it", () => {
+    // Recent listed first, so the duplicate is the EARLIER match — "locate the
+    // active conversation" must still land on the folder row.
+    const withRecentFirst: SidebarRow[] = [
+      { kind: "section", section: "recent", expanded: true, count: 1 },
+      {
+        kind: "conversation",
+        conversation: conv(1, 10),
+        depth: 0,
+        recent: true,
+      },
+      { kind: "section", section: "folders", expanded: true, count: 1 },
+      { kind: "folder", folderId: 10 },
+      { kind: "conversation", conversation: conv(1, 10), depth: 0 },
+    ]
+    expect(flatIndexOfConversation(withRecentFirst, 1, "claude_code")).toBe(4)
+  })
+
+  it("falls back to the Recent row when it is the only occurrence", () => {
+    // The folder section is collapsed, so Recent is the one place the row
+    // exists — better to scroll there than to give up.
+    const recentOnly: SidebarRow[] = [
+      { kind: "section", section: "folders", expanded: false, count: 1 },
+      { kind: "section", section: "recent", expanded: true, count: 1 },
+      {
+        kind: "conversation",
+        conversation: conv(1, 10),
+        depth: 0,
+        recent: true,
+      },
+    ]
+    expect(flatIndexOfConversation(recentOnly, 1, "claude_code")).toBe(2)
+  })
 })
 
 describe("pointerYToTargetIndex", () => {
@@ -1613,6 +1969,27 @@ describe("sticky overlay helpers", () => {
       ]
       expect(Array.from(buildOwnerHeaderIndex(withSections))).toEqual([
         -1, -1, -1, 3, 3,
+      ])
+    })
+
+    it("ends a folder's span at the next section header", () => {
+      // The Chat / Recent rows below the Folders section belong to no folder:
+      // without the reset they would inherit folder 10 and keep its sticky
+      // header pinned over a list it has nothing to do with.
+      const acrossSections: SidebarRow[] = [
+        { kind: "section", section: "folders", expanded: true, count: 1 }, // 0
+        { kind: "folder", folderId: 10 }, // 1
+        { kind: "conversation", conversation: conv(1, 10), depth: 0 }, // 2
+        { kind: "section", section: "recent", expanded: true, count: 1 }, // 3
+        {
+          kind: "conversation",
+          conversation: conv(1, 10),
+          depth: 0,
+          recent: true,
+        }, // 4
+      ]
+      expect(Array.from(buildOwnerHeaderIndex(acrossSections))).toEqual([
+        -1, 1, 1, -1, -1,
       ])
     })
   })

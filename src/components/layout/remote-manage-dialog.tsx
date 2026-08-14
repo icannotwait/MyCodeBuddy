@@ -241,7 +241,15 @@ export function RemoteManageDialog({
             >
               {tCommon("cancel")}
             </Button>
-            <Button size="sm" onClick={handleSave} disabled={saving}>
+            {/* Also inert while the list loads: the rows are hidden behind the
+                loading placeholder then, so saving would apply drafts the user
+                can't currently see (a reopen re-reads `folderPath`, and until it
+                resolves `drafts` still holds the previous session's edits). */}
+            <Button
+              size="sm"
+              onClick={handleSave}
+              disabled={saving || loadingRemotes}
+            >
               {saving ? t("savingRemotes") : tCommon("save")}
             </Button>
           </div>

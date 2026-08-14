@@ -542,7 +542,11 @@ Ignored duplicate.
 "#;
         let parsed = parse_simple_plan(plan).expect("parse");
         assert_eq!(
-            parsed.tasks.iter().map(|task| task.index).collect::<Vec<_>>(),
+            parsed
+                .tasks
+                .iter()
+                .map(|task| task.index)
+                .collect::<Vec<_>>(),
             vec![1, 3]
         );
         assert_eq!(parsed.tasks[0].declared_files, vec!["src/parser.rs"]);
@@ -640,7 +644,10 @@ Run verification: `cargo test second`
 -->"#;
         let invalid = parse_simple_progress(schema_mismatch, "docs/plan.md")
             .expect("unsupported schema is recoverable");
-        assert!(invalid.snapshot.is_none(), "unsupported state must not complete work");
+        assert!(
+            invalid.snapshot.is_none(),
+            "unsupported state must not complete work"
+        );
         assert_eq!(invalid.warning_codes, vec![WARNING_PROGRESS_SCHEMA]);
 
         let duplicate = br#"<!-- codeg-simple-progress-v1
@@ -699,8 +706,7 @@ Run verification: `cargo test second`
             SimpleParseError::InvalidUtf8
         );
         assert_eq!(
-            parse_simple_progress(&[0xff], "docs/plan.md")
-                .expect_err("progress invalid UTF-8"),
+            parse_simple_progress(&[0xff], "docs/plan.md").expect_err("progress invalid UTF-8"),
             SimpleParseError::InvalidUtf8
         );
         assert_eq!(

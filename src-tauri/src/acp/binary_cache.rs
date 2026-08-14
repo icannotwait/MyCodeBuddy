@@ -21,7 +21,7 @@ pub(crate) fn cache_dir() -> Result<PathBuf, AcpError> {
 
 /// Directory where codeg caches a managed `uv` toolchain (`uv` + `uvx`),
 /// downloaded on demand when the user has no system `uv` (used to launch
-/// Python ACP agents such as Hermes). Layout:
+/// custom Python ACP agents). Layout:
 /// `<cache_dir>/uv-tool/<platform>/{uv,uvx}`.
 pub(crate) fn uv_tool_dir() -> Result<PathBuf, AcpError> {
     Ok(cache_dir()?
@@ -43,7 +43,7 @@ pub fn find_cached_uv_tool(tool: &str) -> Option<PathBuf> {
 }
 
 /// Pinned `uv` toolchain version codeg downloads on demand when the user has no
-/// system `uv` (used to launch Python ACP agents such as Hermes).
+/// system `uv` (used to launch custom Python ACP agents).
 const UV_TOOL_VERSION: &str = "0.8.10";
 
 /// Build the astral-sh/uv release archive URL for the current platform.

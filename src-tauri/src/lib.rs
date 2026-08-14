@@ -23,6 +23,7 @@ pub mod chat_channel;
 pub mod commands;
 pub mod db;
 pub mod document_translate;
+pub mod folder_links;
 pub mod git_credential;
 pub mod git_repo;
 pub mod intern;
@@ -47,6 +48,7 @@ pub mod update;
 pub mod web;
 #[cfg(feature = "tauri-runtime")]
 pub(crate) mod window_diagnostics;
+pub mod work_task;
 pub mod workspace_state;
 pub mod workspace_transfer;
 
@@ -66,18 +68,18 @@ mod tauri_app {
     use crate::chat_channel::manager::ChatChannelManager;
     use crate::commands::{
         acp as acp_commands, app_update as app_update_commands, automation as automation_commands,
-        background as background_commands, backup, chat_channel as chat_channel_commands,
-        conversation_popout, conversations, custom_skills as custom_skills_commands,
-        delegation as delegation_commands, experts as experts_commands,
-        feedback as feedback_commands, file_io, folder_commands, folders,
-        logging as logging_commands, mcp as mcp_commands,
+        background as background_commands, backup, chat_authoring as chat_authoring_commands,
+        chat_channel as chat_channel_commands, conversation_popout, conversations,
+        custom_skills as custom_skills_commands, delegation as delegation_commands,
+        experts as experts_commands, feedback as feedback_commands, file_io, folder_commands,
+        folder_links, folders, logging as logging_commands, mcp as mcp_commands,
         model_provider as model_provider_commands, notification,
         office_tools as office_tools_commands, pet as pet_commands, project_boot,
         question as question_commands, quick_messages as quick_messages_commands,
         remote_proxy as remote_proxy_commands, remote_workspace as remote_workspace_commands,
         science as science_commands, session_info as session_info_commands, system_settings,
-        terminal as terminal_commands, version_control, windows,
-        workspace_state as workspace_state_commands,
+        terminal as terminal_commands, token_usage as token_usage_commands, version_control,
+        windows, work_task as work_task_commands, workspace_state as workspace_state_commands,
     };
     use crate::terminal::manager::TerminalManager;
     use crate::{db, git_credential, network, paths, process, web};
@@ -454,6 +456,48 @@ mod tauri_app {
                 folder_commands::delete_folder_command,
                 folder_commands::reorder_folder_commands,
                 folder_commands::bootstrap_folder_commands_from_package_json,
+                folder_links::list_folder_links,
+                folder_links::preview_folder_links,
+                folder_links::create_folder_links,
+                folder_links::rename_folder_link,
+                folder_links::repair_folder_link,
+                folder_links::remove_folder_link,
+                chat_authoring_commands::get_chat_authoring_settings,
+                chat_authoring_commands::set_chat_authoring_settings,
+                token_usage_commands::token_usage_report,
+                token_usage_commands::token_usage_facets,
+                token_usage_commands::token_usage_status,
+                token_usage_commands::token_usage_sync,
+                work_task_commands::work_task_list,
+                work_task_commands::work_task_get,
+                work_task_commands::work_task_events,
+                work_task_commands::work_task_attention_count,
+                work_task_commands::work_task_create,
+                work_task_commands::work_task_update,
+                work_task_commands::work_task_reorder,
+                work_task_commands::work_task_delete,
+                work_task_commands::work_task_start,
+                work_task_commands::work_task_start_all,
+                work_task_commands::work_task_retry,
+                work_task_commands::work_task_requeue,
+                work_task_commands::work_task_schedule,
+                work_task_commands::work_task_return,
+                work_task_commands::work_task_cancel,
+                work_task_commands::work_task_merge,
+                work_task_commands::work_task_merge_unqueue,
+                work_task_commands::work_task_complete,
+                work_task_commands::work_task_archive,
+                work_task_commands::work_task_cleanup,
+                work_task_commands::work_task_diff,
+                work_task_commands::work_task_changed_files,
+                work_task_commands::work_task_settings_get,
+                work_task_commands::work_task_settings_get_own,
+                work_task_commands::work_task_settings_effective,
+                work_task_commands::work_task_settings_set,
+                work_task_commands::work_task_settings_delete,
+                work_task_commands::work_task_template_list,
+                work_task_commands::work_task_template_save,
+                work_task_commands::work_task_template_delete,
                 quick_messages_commands::quick_messages_list,
                 quick_messages_commands::quick_messages_create,
                 quick_messages_commands::quick_messages_update,
@@ -1042,6 +1086,7 @@ mod tauri_app {
                     app.manage(stack.feedback.clone());
                     app.manage(stack.ask.clone());
                     app.manage(stack.sessions.clone());
+                    app.manage(stack.authoring.clone());
                     app.manage(stack.runtime_settings.clone());
                     app.manage(stack.metrics.clone());
                     app.manage(stack.continuation_coordinator.clone());
@@ -1060,6 +1105,7 @@ mod tauri_app {
                     let feedback_for_init = stack.feedback.clone();
                     let question_for_init = stack.ask.clone();
                     let session_info_for_init = stack.sessions.clone();
+                    let chat_authoring_for_init = stack.authoring.clone();
                     let cm_for_watchdog = cm_state.clone_ref();
                     let reconcile_result = tauri::async_runtime::block_on(async move {
                         delegation_commands::apply_persisted_config(
@@ -1081,6 +1127,16 @@ mod tauri_app {
                         crate::commands::session_info::apply_persisted_session_info_config(
                             &db_for_init,
                             &session_info_for_init,
+                        )
+                        .await;
+                        crate::commands::chat_authoring::apply_persisted_chat_authoring_config(
+                            &db_for_init,
+                            &chat_authoring_for_init,
+                        )
+                        .await;
+                        crate::commands::system_settings::apply_persisted_terminal_shell_config(
+                            &db_for_init,
+                            &cm_for_watchdog.terminal_shell_config(),
                         )
                         .await;
                         // Clamp + apply tool-watchdog settings before the supervisor
@@ -1362,6 +1418,20 @@ mod tauri_app {
                         .clone(),
                 ) {
                     tauri::async_runtime::spawn(crate::automation::run_automation_engine(engine));
+                }
+
+                if let Some(engine) = crate::work_task::build_task_engine(
+                    crate::db::AppDatabase {
+                        conn: app.state::<crate::db::AppDatabase>().conn.clone(),
+                    },
+                    app.state::<ConnectionManager>().clone_ref(),
+                    crate::web::event_bridge::EventEmitter::Tauri(app.handle().clone()),
+                    app.state::<std::sync::Arc<crate::acp::InternalEventBus>>()
+                        .inner()
+                        .clone(),
+                    effective_data_dir.clone(),
+                ) {
+                    tauri::async_runtime::spawn(crate::work_task::run_task_engine(engine));
                 }
 
                 // Single-window workspace: ensure the main window exists.

@@ -16,6 +16,7 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Switch } from "@/components/ui/switch"
+import { useImeGuard } from "@/hooks/use-ime-guard"
 import { gitStashPush } from "@/lib/api"
 import { toErrorMessage } from "@/lib/app-error"
 
@@ -33,6 +34,7 @@ export function StashDialog({
   onStashed,
 }: StashDialogProps) {
   const t = useTranslations("Folder.branchDropdown.stashDialog")
+  const ime = useImeGuard()
   const [message, setMessage] = useState("")
   const [keepIndex, setKeepIndex] = useState(false)
   const [loading, setLoading] = useState(false)
@@ -76,7 +78,9 @@ export function StashDialog({
               placeholder={t("messagePlaceholder")}
               value={message}
               onChange={(e) => setMessage(e.target.value)}
+              {...ime.props}
               onKeyDown={(e) => {
+                if (ime.isComposing(e)) return
                 if (e.key === "Enter" && !loading) {
                   handleStash()
                 }

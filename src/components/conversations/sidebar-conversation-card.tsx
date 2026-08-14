@@ -11,12 +11,14 @@ import {
   Pin,
   PinOff,
   CheckCircle2,
+  FolderX,
   Info,
   ChevronRight,
   AppWindow,
 } from "lucide-react"
 import { useTranslations } from "next-intl"
 import { toast } from "sonner"
+import { useImeGuard } from "@/hooks/use-ime-guard"
 import type { DbConversationSummary, ConversationStatus } from "@/lib/types"
 import { STATUS_ORDER } from "@/lib/types"
 import { cn } from "@/lib/utils"
@@ -153,6 +155,7 @@ export const SidebarConversationCard = memo(function SidebarConversationCard({
   onToggleExpand,
 }: SidebarConversationCardProps) {
   const t = useTranslations("Folder.conversationCard")
+  const ime = useImeGuard()
   const tSidebar = useTranslations("Folder.sidebar")
   const tStatus = useTranslations("Folder.statusLabels")
   const tDetails = useTranslations("Folder.sessionDetails")
@@ -320,7 +323,6 @@ export const SidebarConversationCard = memo(function SidebarConversationCard({
               )}
             >
               <button
-                data-conversation-id={conversation.id}
                 onClick={handleClick}
                 onDoubleClick={handleDblClick}
                 className={cn(
@@ -397,6 +399,23 @@ export const SidebarConversationCard = memo(function SidebarConversationCard({
                   {formatConversationTitle(conversation.title) ||
                     t("untitledConversation")}
                 </span>
+                {/* Re-parented out of a removed worktree: history loads fine,
+                    but "continue" may need a fresh session (the agent's files
+                    were keyed to the old path). */}
+                {conversation.origin_cwd ? (
+                  <span
+                    className="inline-flex shrink-0 items-center"
+                    title={tSidebar("worktreeRemovedBadge")}
+                  >
+                    <FolderX
+                      className="h-3 w-3 text-muted-foreground/60"
+                      aria-hidden
+                    />
+                    <span className="sr-only">
+                      {tSidebar("worktreeRemovedBadge")}
+                    </span>
+                  </span>
+                ) : null}
               </button>
 
               {/* Expand/collapse affordance for delegation children. It overlays
@@ -670,8 +689,9 @@ export const SidebarConversationCard = memo(function SidebarConversationCard({
           <Input
             value={renameValue}
             onChange={(e) => setRenameValue(e.target.value)}
+            {...ime.props}
             onKeyDown={(e) => {
-              if (e.nativeEvent.isComposing || e.key === "Process") return
+              if (ime.isComposing(e)) return
               if (e.key === "Enter") handleRenameConfirm()
             }}
             autoFocus

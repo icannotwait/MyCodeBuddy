@@ -12,6 +12,11 @@ const CUSTOM_MIGRATIONS: [&str; 4] = [
     "m20260731_000004_custom_agent_source",
 ];
 
+/// Follow-on ALTERs that require `custom_agent` to already exist. A pre-sync
+/// fork DB does not have that table, so these must not run until the
+/// custom-agent migrations above have landed.
+const CUSTOM_AGENT_FOLLOW_ON: [&str; 1] = ["m20260808_000001_custom_agent_supports_mcp"];
+
 const UPSTREAM_CUSTOM_MIGRATIONS: [&str; 4] = [
     "m20260726_000001_custom_agent",
     "m20260727_000001_custom_agent_skills",
@@ -89,6 +94,7 @@ impl MigratorTrait for PreSyncForkMigrator {
             .filter(|migration| {
                 let name = migration.name().to_string();
                 !CUSTOM_MIGRATIONS.contains(&name.as_str())
+                    && !CUSTOM_AGENT_FOLLOW_ON.contains(&name.as_str())
             })
             .collect()
     }
@@ -147,11 +153,13 @@ async fn pre_sync_fork_db_adds_only_custom_agent_migrations() {
         .collect();
     let expected_new: BTreeSet<_> = CUSTOM_MIGRATIONS
         .iter()
+        .chain(CUSTOM_AGENT_FOLLOW_ON.iter())
         .map(|name| (*name).to_string())
         .collect();
 
     assert_eq!(newly_recorded, expected_new);
     assert_recorded_once(&after, &CUSTOM_MIGRATIONS);
+    assert_recorded_once(&after, &CUSTOM_AGENT_FOLLOW_ON);
     assert_recorded_once(&after, &FORK_WORKFLOW_MIGRATIONS);
     assert!(table_exists(&db, "custom_agent").await);
 }

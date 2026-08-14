@@ -372,6 +372,8 @@ pub(crate) async fn import_one(
         awaiting_reply_token: Set(None),
         delegation_run_generation: Set(None),
         last_termination_audit_json: Set(None),
+
+        origin_cwd: Set(None),
     };
     conv.insert(conn).await?;
     Ok(ImportOutcome::Imported)
@@ -676,6 +678,8 @@ mod tests {
             awaiting_reply_token: Set(None),
             delegation_run_generation: Set(None),
             last_termination_audit_json: Set(None),
+
+            origin_cwd: Set(None),
         }
         .insert(&db.conn)
         .await

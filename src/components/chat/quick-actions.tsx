@@ -10,7 +10,7 @@ import {
 } from "react"
 import { useLocale, useTranslations } from "next-intl"
 import { toast } from "sonner"
-import { Lock, type LucideIcon } from "lucide-react"
+import { ChevronLeft, ChevronRight, Lock, type LucideIcon } from "lucide-react"
 
 import { cn } from "@/lib/utils"
 import { openSettingsWindow, type SettingsSection } from "@/lib/api"
@@ -44,7 +44,7 @@ const OFFICE_FIXED: (OfficeAction & { accent: string })[] =
     (action) => ({ ...action, accent: OFFICE_FEATURED_ACCENTS[action.id] })
   )
 
-// Remaining office skills — de-colored bars in the scrolling row (icons kept).
+// Remaining office skills — de-colored bars in the skill rail (icons kept).
 const OFFICE_SCROLL: OfficeAction[] = OFFICE_ACTIONS.filter(
   (action) => !(action.id in OFFICE_FEATURED_ACCENTS)
 )
@@ -58,13 +58,13 @@ const RESEARCH_FIXED: (ResearchAction & { accent: string })[] =
     accent: RESEARCH_FEATURED_ACCENTS[action.id],
   }))
 
-// Remaining research skills — de-colored bars in the scrolling row.
+// Remaining research skills — de-colored bars in the skill rail.
 const RESEARCH_SCROLL: ResearchAction[] = RESEARCH_ACTIONS.filter(
   (action) => !(action.id in RESEARCH_FEATURED_ACCENTS)
 )
 
 // Three featured coding experts get prominent fixed cards (color + curated
-// short description); the rest fill the scrolling row. ids match the bundled
+// short description); the rest fill the skill rail. ids match the bundled
 // superpowers skills.
 const CODING_FEATURED: { id: string; accent: string; descKey: string }[] = [
   { id: "brainstorming", accent: "amber", descKey: "coding.brainstormingDesc" },
@@ -83,7 +83,7 @@ const CODING_FEATURED_IDS = new Set(CODING_FEATURED.map((f) => f.id))
 
 // Static accent class fragments — full literals so Tailwind's JIT keeps them
 // (never compose color classes from template strings, those get purged). Only
-// the prominent fixed cards are colored; scrolling bars are neutral.
+// the prominent fixed cards are colored; rail bars are neutral.
 const ACCENTS: Record<string, { icon: string; surface: string }> = {
   green: {
     icon: "text-green-600 dark:text-green-400",
@@ -166,13 +166,12 @@ function BigCard({
   )
 }
 
-/** A neutral (de-colored) skill bar in the scrolling row. */
+/** A neutral (de-colored) skill bar in the rail. */
 function SkillBar({
   icon: Icon,
   label,
   title,
   onClick,
-  clone,
   locked,
   lockHint,
 }: {
@@ -180,8 +179,6 @@ function SkillBar({
   label: string
   title?: string
   onClick: () => void
-  /** A marquee duplicate: hidden from a11y + keyboard, removed under reduced motion. */
-  clone?: boolean
   /** Skill not enabled for the current agent — appends a small lock glyph; the
    *  bar keeps its look and stays clickable (the click surfaces a hint). */
   locked?: boolean
@@ -192,10 +189,7 @@ function SkillBar({
       type="button"
       onClick={onClick}
       title={locked ? lockHint : title}
-      aria-hidden={clone || undefined}
-      tabIndex={clone ? -1 : undefined}
-      data-qa-clone={clone ? "" : undefined}
-      className="group mr-2 flex shrink-0 items-center gap-2 rounded-lg border border-border bg-card/50 px-3 py-2 transition-colors hover:border-foreground/20 hover:bg-accent/40"
+      className="group flex shrink-0 items-center gap-2 rounded-lg border border-border bg-card/50 px-3 py-2 transition-colors hover:border-foreground/20 hover:bg-accent/40"
     >
       <Icon
         aria-hidden
@@ -214,85 +208,156 @@ function SkillBar({
   )
 }
 
+const prefersReducedMotion = () =>
+  typeof window !== "undefined" &&
+  window.matchMedia("(prefers-reduced-motion: reduce)").matches
+
+// How far one rail-arrow press travels, as a share of the visible width. A
+// nudge, not a page: at 0.4 the bars glide by roughly a couple at a time and
+// the ones you were reading stay on screen, so the rail reads as one continuous
+// strip. A near-full-width step (the first cut used 0.8) swaps out the whole row
+// on every press, which turns browsing into paging.
+const RAIL_STEP_RATIO = 0.4
+
 /**
- * Single-row seamless marquee. Renders the items twice (real + an aria-hidden
- * clone) and a requestAnimationFrame loop translates the track left at a
- * constant speed, wrapping by exactly one copy width (`scrollWidth / 2`, exact
- * because each bar carries its own `mr-2` instead of a flex gap) so the loop
- * has no seam.
- *
- * Driving the transform from JS — rather than a CSS animation — is deliberate:
- * a composited CSS transform animation snaps backwards when paused on hover
- * (WebKit reverts to the lagging main-thread clock). Setting the transform
- * ourselves each frame means "pause" just stops updating, freezing it in place.
- * Pauses on pointer hover / keyboard focus; bails entirely under reduced motion
- * (CSS then makes the viewport a normal horizontal scroller).
+ * One rail arrow. A real flex item in its own gutter — never an overlay on top
+ * of the bars — so nothing a bar shows is ever covered. `mb-1` cancels the
+ * viewport's `pb-1` so the glyph centres on the bar row, not on the row plus its
+ * bottom slack. Always rendered (the user reads the pair as the rail's controls,
+ * and a control that vanishes is a control you stop looking for); it goes
+ * `disabled` once the rail is parked against that end — including when every bar
+ * already fits and neither arrow has anywhere to travel.
  */
-function Marquee({
+function RailArrow({
+  icon: Icon,
+  label,
+  onClick,
+  disabled,
+}: {
+  icon: LucideIcon
+  label: string
+  onClick: () => void
+  disabled: boolean
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      aria-label={label}
+      title={label}
+      className={cn(
+        "mb-1 flex h-6 w-6 shrink-0 items-center justify-center rounded-full",
+        "border border-border bg-card/50 text-muted-foreground transition-colors",
+        "hover:border-foreground/20 hover:bg-accent/40 hover:text-foreground",
+        "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+        "disabled:pointer-events-none disabled:opacity-35"
+      )}
+    >
+      <Icon aria-hidden className="h-4 w-4 rtl:-scale-x-100" />
+    </button>
+  )
+}
+
+/**
+ * Horizontal rail of skill bars, glided along by a left / right arrow.
+ *
+ * This replaces an auto-scrolling marquee: nothing moves unless the user asks
+ * it to. The viewport is a plain overflow scroller (its native scrollbar hidden
+ * in CSS), so trackpad swipes and "tab onto an off-screen bar" keep working.
+ *
+ * Bounded, and deliberately so. An earlier cut recycled bars that had left the
+ * viewport around to the far side, which made the strip scroll forever — but
+ * only where there were enough bars to push a whole one out of sight. That put
+ * the three tabs on different rules: Office and Research (7 bars each) stopped
+ * at the end and greyed their arrow, while Coding (every non-featured expert)
+ * never did. One rail, one behaviour: each arrow is live exactly while there is
+ * scroll runway left in its direction, which is the same measurement the edge
+ * fades already use.
+ */
+function SkillRail({
   itemCount,
   children,
 }: {
   itemCount: number
-  children: (clone: boolean) => ReactNode
+  children: ReactNode
 }) {
+  const t = useTranslations("Folder.chat.welcomePanel.quickActions")
+  const viewportRef = useRef<HTMLDivElement | null>(null)
   const trackRef = useRef<HTMLDivElement | null>(null)
-  const pausedRef = useRef(false)
+  // Content exists past that edge: drives both the edge fades and, since the
+  // rail is bounded, whether that arrow has anywhere left to go.
+  const [canScrollStart, setCanScrollStart] = useState(false)
+  const [canScrollEnd, setCanScrollEnd] = useState(false)
+
+  const measure = useCallback(() => {
+    const el = viewportRef.current
+    if (!el) return
+    // Under RTL (ar) every current engine runs `scrollLeft` from 0 down to
+    // -max, so take the magnitude: `travelled` is the distance from the start
+    // of the content in both directions.
+    const travelled = Math.abs(el.scrollLeft)
+    const max = el.scrollWidth - el.clientWidth
+    // 1px of slack absorbs sub-pixel layout, so a rail parked at either end
+    // isn't reported as still having somewhere to go.
+    setCanScrollStart(travelled > 1)
+    setCanScrollEnd(travelled < max - 1)
+  }, [])
 
   useEffect(() => {
+    measure()
+    const viewport = viewportRef.current
     const track = trackRef.current
-    if (!track || typeof window === "undefined") return
-    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return
-
-    const SPEED = 35 // px per second — constant feel regardless of item count
-    let offset = 0
-    let half = track.scrollWidth / 2
-    let last = 0
-    let raf = 0
-
-    const ro = new ResizeObserver(() => {
-      half = track.scrollWidth / 2
-    })
+    if (!viewport || !track || typeof ResizeObserver === "undefined") return
+    // Watch both boxes: the track changes when the item set does, the viewport
+    // when the window (or the sidebar / aux panel) resizes around it.
+    const ro = new ResizeObserver(measure)
+    ro.observe(viewport)
     ro.observe(track)
+    return () => ro.disconnect()
+  }, [measure, itemCount])
 
-    const step = (now: number) => {
-      raf = requestAnimationFrame(step)
-      // Clamp dt so returning from a backgrounded tab doesn't lurch forward.
-      const dt = last === 0 ? 0 : Math.min(0.05, (now - last) / 1000)
-      last = now
-      if (pausedRef.current || half <= 0) return
-      offset -= SPEED * dt
-      if (offset <= -half) offset += half
-      track.style.transform = `translate3d(${offset}px, 0, 0)`
-    }
-    raf = requestAnimationFrame(step)
-
-    return () => {
-      cancelAnimationFrame(raf)
-      ro.disconnect()
-    }
-  }, [itemCount])
+  // `direction` is logical: -1 travels toward the start of the content.
+  // `scrollBy` is physical, so mirror it under RTL. The engine clamps at both
+  // ends, so a press near the edge simply travels what is left.
+  const nudge = useCallback((direction: 1 | -1) => {
+    const el = viewportRef.current
+    if (!el) return
+    const sign = getComputedStyle(el).direction === "rtl" ? -1 : 1
+    el.scrollBy({
+      left: Math.max(120, el.clientWidth * RAIL_STEP_RATIO) * direction * sign,
+      behavior: prefersReducedMotion() ? "auto" : "smooth",
+    })
+  }, [])
 
   if (itemCount === 0) return null
 
-  const pause = () => {
-    pausedRef.current = true
-  }
-  const resume = () => {
-    pausedRef.current = false
-  }
-
   return (
-    <div
-      className="qa-marquee-viewport overflow-hidden pb-1"
-      onPointerEnter={pause}
-      onPointerLeave={resume}
-      onFocus={pause}
-      onBlur={resume}
-    >
-      <div ref={trackRef} className="qa-marquee-track flex w-max">
-        {children(false)}
-        {children(true)}
+    <div className="flex items-center gap-1.5">
+      <RailArrow
+        icon={ChevronLeft}
+        label={t("scrollPrev")}
+        onClick={() => nudge(-1)}
+        disabled={!canScrollStart}
+      />
+      <div
+        ref={viewportRef}
+        onScroll={measure}
+        // CSS reads these to fade only the edge that has content behind it.
+        data-fade-start={canScrollStart ? "" : undefined}
+        data-fade-end={canScrollEnd ? "" : undefined}
+        className="qa-rail-viewport min-w-0 flex-1 pb-1"
+      >
+        <div ref={trackRef} className="flex w-max gap-2">
+          {children}
+        </div>
       </div>
+      <RailArrow
+        icon={ChevronRight}
+        label={t("scrollNext")}
+        onClick={() => nudge(1)}
+        disabled={!canScrollEnd}
+      />
     </div>
   )
 }
@@ -504,27 +569,24 @@ export function QuickActions({ onSelect, agentType }: QuickActionsProps) {
             ))}
           </div>
         )}
-        <Marquee itemCount={codingRest.length}>
-          {(clone) =>
-            codingRest.map((item) => {
-              const label =
-                pickLocalized(item.metadata.display_name, locale) ||
-                item.metadata.id
-              return (
-                <SkillBar
-                  key={`${item.metadata.id}-${clone ? "c" : "r"}`}
-                  clone={clone}
-                  icon={getExpertIcon(item.metadata.icon)}
-                  label={label}
-                  title={pickLocalized(item.metadata.description, locale)}
-                  onClick={() => handleExpert(item)}
-                  locked={isLocked(item.metadata.id)}
-                  lockHint={lockHint}
-                />
-              )
-            })
-          }
-        </Marquee>
+        <SkillRail itemCount={codingRest.length}>
+          {codingRest.map((item) => {
+            const label =
+              pickLocalized(item.metadata.display_name, locale) ||
+              item.metadata.id
+            return (
+              <SkillBar
+                key={item.metadata.id}
+                icon={getExpertIcon(item.metadata.icon)}
+                label={label}
+                title={pickLocalized(item.metadata.description, locale)}
+                onClick={() => handleExpert(item)}
+                locked={isLocked(item.metadata.id)}
+                lockHint={lockHint}
+              />
+            )
+          })}
+        </SkillRail>
       </TabsContent>
 
       <TabsContent value="office" className="flex flex-col gap-2">
@@ -542,22 +604,19 @@ export function QuickActions({ onSelect, agentType }: QuickActionsProps) {
             />
           ))}
         </div>
-        <Marquee itemCount={OFFICE_SCROLL.length}>
-          {(clone) =>
-            OFFICE_SCROLL.map((action) => (
-              <SkillBar
-                key={`${action.id}-${clone ? "c" : "r"}`}
-                clone={clone}
-                icon={action.icon}
-                label={t(action.id as Parameters<typeof t>[0])}
-                title={t(`${action.id}Desc` as Parameters<typeof t>[0])}
-                onClick={() => handleOffice(action)}
-                locked={isLocked(action.skillId)}
-                lockHint={lockHint}
-              />
-            ))
-          }
-        </Marquee>
+        <SkillRail itemCount={OFFICE_SCROLL.length}>
+          {OFFICE_SCROLL.map((action) => (
+            <SkillBar
+              key={action.id}
+              icon={action.icon}
+              label={t(action.id as Parameters<typeof t>[0])}
+              title={t(`${action.id}Desc` as Parameters<typeof t>[0])}
+              onClick={() => handleOffice(action)}
+              locked={isLocked(action.skillId)}
+              lockHint={lockHint}
+            />
+          ))}
+        </SkillRail>
       </TabsContent>
 
       <TabsContent value="research" className="flex flex-col gap-2">
@@ -575,22 +634,19 @@ export function QuickActions({ onSelect, agentType }: QuickActionsProps) {
             />
           ))}
         </div>
-        <Marquee itemCount={RESEARCH_SCROLL.length}>
-          {(clone) =>
-            RESEARCH_SCROLL.map((action) => (
-              <SkillBar
-                key={`${action.id}-${clone ? "c" : "r"}`}
-                clone={clone}
-                icon={action.icon}
-                label={t(action.id as Parameters<typeof t>[0])}
-                title={t(`${action.id}Desc` as Parameters<typeof t>[0])}
-                onClick={() => handleResearch(action)}
-                locked={isLocked(action.skillId)}
-                lockHint={lockHint}
-              />
-            ))
-          }
-        </Marquee>
+        <SkillRail itemCount={RESEARCH_SCROLL.length}>
+          {RESEARCH_SCROLL.map((action) => (
+            <SkillBar
+              key={action.id}
+              icon={action.icon}
+              label={t(action.id as Parameters<typeof t>[0])}
+              title={t(`${action.id}Desc` as Parameters<typeof t>[0])}
+              onClick={() => handleResearch(action)}
+              locked={isLocked(action.skillId)}
+              lockHint={lockHint}
+            />
+          ))}
+        </SkillRail>
       </TabsContent>
     </Tabs>
   )

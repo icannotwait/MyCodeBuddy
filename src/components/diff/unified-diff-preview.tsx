@@ -553,11 +553,13 @@ function DiffFileSection({
   embedded,
   clickableFilePath,
   folderPath,
+  unbounded,
 }: {
   file: ParsedDiffFile
   embedded: boolean
   clickableFilePath: boolean
   folderPath: string | null
+  unbounded: boolean
 }) {
   const t = useTranslations("Folder.diffPreview")
   const [expanded, setExpanded] = useState(false)
@@ -594,7 +596,11 @@ function DiffFileSection({
   return (
     <section
       className={cn(
-        "flex max-h-[420px] flex-col",
+        "flex flex-col",
+        // Self-capped by default: the section owns a scroll box so a huge file
+        // can't stretch its host. `unbounded` hands both back to the host (it
+        // supplies its own cap + reveal), which keeps the two from nesting.
+        unbounded ? "min-h-0" : "max-h-[420px]",
         embedded
           ? "bg-transparent"
           : "rounded-lg border border-border bg-background"
@@ -634,7 +640,7 @@ function DiffFileSection({
         </header>
       )}
 
-      <ScrollArea x="scroll">
+      <ScrollArea x="scroll" y={unbounded ? "hidden" : "scroll"}>
         <div className="inline-block min-w-full">
           {newFile
             ? hunks.map((hunk) => (
@@ -670,6 +676,7 @@ export function UnifiedDiffPreview({
   className,
   clickableFilePath = false,
   embedded = false,
+  unbounded = false,
 }: {
   diffText: string
   /** @deprecated No longer used — kept for API compat */
@@ -684,6 +691,13 @@ export function UnifiedDiffPreview({
    * double border and a redundant path/mode header.
    */
   embedded?: boolean
+  /**
+   * Let each file's diff render at its natural height instead of inside its
+   * own 420px scroll box. For hosts that cap and reveal the whole preview
+   * themselves (the task diff dialog), which would otherwise nest a vertical
+   * scroll inside another one.
+   */
+  unbounded?: boolean
 }) {
   const t = useTranslations("Folder.diffPreview")
   const { activeFolder: folder } = useActiveFolder()
@@ -703,17 +717,26 @@ export function UnifiedDiffPreview({
   }
 
   if (files.length === 0) {
-    return (
+    const pre = (
+      <pre className="font-mono text-[11px] leading-5 whitespace-pre-wrap text-muted-foreground p-3">
+        {diffText}
+      </pre>
+    )
+    return unbounded ? (
+      <div className={className}>{pre}</div>
+    ) : (
       <ScrollArea className={cn("h-full", className)} x="scroll">
-        <pre className="font-mono text-[11px] leading-5 whitespace-pre-wrap text-muted-foreground p-3">
-          {diffText}
-        </pre>
+        {pre}
       </ScrollArea>
     )
   }
 
+  // Unbounded: the host sizes and scrolls the preview, so the outer viewport
+  // is a plain box (each file still scrolls horizontally on its own).
+  const Frame = unbounded ? UnboundedFrame : ScrollAreaFrame
+
   return (
-    <ScrollArea className={cn("h-full", className)} x="scroll">
+    <Frame className={className}>
       <div className={embedded ? "space-y-2" : "space-y-3"}>
         {files.map((file) => (
           <DiffFileSection
@@ -722,9 +745,34 @@ export function UnifiedDiffPreview({
             embedded={embedded}
             clickableFilePath={clickableFilePath}
             folderPath={folder?.path ?? null}
+            unbounded={unbounded}
           />
         ))}
       </div>
+    </Frame>
+  )
+}
+
+function ScrollAreaFrame({
+  className,
+  children,
+}: {
+  className?: string
+  children: React.ReactNode
+}) {
+  return (
+    <ScrollArea className={cn("h-full", className)} x="scroll">
+      {children}
     </ScrollArea>
   )
+}
+
+function UnboundedFrame({
+  className,
+  children,
+}: {
+  className?: string
+  children: React.ReactNode
+}) {
+  return <div className={className}>{children}</div>
 }

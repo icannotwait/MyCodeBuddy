@@ -385,6 +385,7 @@ function tree() {
 // flips the loading flags off and installs the stable action spies, and each
 // describe's own beforeEach seeds its folders/conversations fixture on top.
 beforeEach(() => {
+  localStorage.clear()
   resetAppWorkspaceStore()
   useAppWorkspaceStore.setState({
     conversationsLoading: false,
@@ -878,6 +879,13 @@ describe("SidebarConversationList — folder ⋯ opens the same menu as right-cl
 })
 
 describe("SidebarConversationList — activity order and optimistic labels", () => {
+  function activityTree() {
+    return (
+      <NextIntlClientProvider locale="en" messages={enMessages}>
+        <SidebarConversationList showCompleted sortMode="updated" />
+      </NextIntlClientProvider>
+    )
+  }
   beforeEach(() => {
     vi.useFakeTimers({ now: FIXED })
     probes.card = 0
@@ -908,7 +916,7 @@ describe("SidebarConversationList — activity order and optimistic labels", () 
   })
 
   it("orders by updated activity when created_at would reverse the order", () => {
-    render(tree())
+    render(activityTree())
     const text = document.body.textContent ?? ""
     // conv-12 has the more recent updated_at → must render above conv-11.
     expect(text.indexOf("conv-12")).toBeLessThan(text.indexOf("conv-11"))
@@ -932,7 +940,7 @@ describe("SidebarConversationList — activity order and optimistic labels", () 
       ],
     })
 
-    render(tree())
+    render(activityTree())
     const before = document.body.textContent ?? ""
     expect(before.indexOf("conv-12")).toBeGreaterThan(before.indexOf("conv-11"))
 
@@ -1304,6 +1312,47 @@ describe("SidebarConversationList — worktree grouping (Show worktrees)", () =>
     expect(text).toContain("conv-21")
   })
 
+  it("labels a worktree sub-group `branch [ directory ]`", () => {
+    // What a worktree registered through `open_worktree_folder_core` looks like:
+    // the alias was seeded with the branch it was created on. `git_branch` on the
+    // folder row is never written by the folder flow, so without the alias every
+    // worktree fell back to its (long, derived) directory name alone.
+    const cur = useAppWorkspaceStore.getState()
+    const aliased = cur.allFolders.map((f) =>
+      f.id === 2
+        ? ({
+            ...f,
+            git_branch: null,
+            alias: "feature-x",
+          } as unknown as FolderDetail)
+        : f
+    )
+    useAppWorkspaceStore.setState({ folders: aliased, allFolders: aliased })
+    render(wtTree(true))
+
+    // Same two-part label a repo header renders: what the worktree IS in front,
+    // where it lives on disk bracketed behind it.
+    expect(document.body.textContent ?? "").toContain(
+      "feature-x [ wt-feature ]"
+    )
+  })
+
+  it("leaves a worktree with no branch or alias on its bare directory name", () => {
+    const cur = useAppWorkspaceStore.getState()
+    const bare = cur.allFolders.map((f) =>
+      f.id === 2
+        ? ({ ...f, git_branch: null, alias: null } as unknown as FolderDetail)
+        : f
+    )
+    useAppWorkspaceStore.setState({ folders: bare, allFolders: bare })
+    render(wtTree(true))
+
+    const text = document.body.textContent ?? ""
+    expect(text).toContain("wt-feature")
+    // No alias to lead with, so no empty brackets trailing the name either.
+    expect(text).not.toContain("[ wt-feature ]")
+  })
+
   it("keeps the connector spine continuous through an empty worktree sub-group", () => {
     // Add a second worktree (folder 3) with NO conversations → it renders the
     // empty-folder hint. That empty row must still draw the container spine
@@ -1358,5 +1407,89 @@ describe("SidebarConversationList — worktree grouping (Show worktrees)", () =>
     expect(probes.card).toBe(1)
     expect(probes.folder).toBe(0)
     expect(probes.root).toBe(0)
+  })
+})
+
+describe("SidebarConversationList — Recent section", () => {
+  function recentTree(showRecent: boolean) {
+    return (
+      <NextIntlClientProvider locale="en" messages={enMessages}>
+        <SidebarConversationList
+          showCompleted
+          showRecent={showRecent}
+          sortMode="created"
+        />
+      </NextIntlClientProvider>
+    )
+  }
+
+  const RECENT = enMessages.Folder.sidebar.sectionRecent
+
+  beforeEach(() => {
+    probes.card = 0
+    const folders = [folder(1, "Repo")]
+    store.activeTabId = null
+    store.tabSpec = []
+    useAppWorkspaceStore.setState({
+      folders,
+      allFolders: folders,
+      conversations: [
+        conv(11, 1),
+        // A folderless chat-mode conversation and a conversation whose folder
+        // is NOT open — Recent must take the first and drop the second.
+        conv(12, 99, { kind: "chat" }),
+        conv(13, 42),
+      ],
+    })
+  })
+
+  it("renders nothing for the section when showRecent is off", () => {
+    render(recentTree(false))
+    expect(document.body.textContent).not.toContain(RECENT)
+    // Each conversation renders exactly one card (no Recent duplicates).
+    expect(probes.card).toBe(2)
+  })
+
+  it("lists folder and chat conversations together, without duplicate React keys", () => {
+    // A duplicated key would make React drop one of the two rows and log an
+    // error; assert on the console as well as the card count.
+    const errors: unknown[][] = []
+    const spy = vi
+      .spyOn(console, "error")
+      .mockImplementation((...args: unknown[]) => {
+        errors.push(args)
+      })
+    try {
+      render(recentTree(true))
+      // 2 reachable conversations × (canonical row + Recent row) = 4 cards.
+      expect(probes.card).toBe(4)
+      expect(errors).toEqual([])
+    } finally {
+      spy.mockRestore()
+    }
+
+    expect(document.body.textContent).toContain(RECENT)
+    // conv-13 lives in a folder that is not open, so it is unreachable in the
+    // Folders section and must stay out of Recent too.
+    expect(document.body.textContent).not.toContain("conv-13")
+  })
+
+  it("collapses independently of the other sections", () => {
+    render(recentTree(true))
+    const header = screen.getByRole("button", { name: RECENT })
+    expect(header).toHaveAttribute("aria-expanded", "true")
+    act(() => {
+      fireEvent.click(header)
+    })
+    expect(header).toHaveAttribute("aria-expanded", "false")
+    // Its rows are gone; the Folders section's copies remain.
+    expect(probes.card).toBe(4)
+    expect(document.body.textContent).toContain("conv-11")
+    expect(
+      Array.from(document.querySelectorAll("[data-conversation-id]"))
+    ).toHaveLength(2)
+    expect(
+      document.querySelectorAll('[data-sidebar-row-key^="recent-conv-"]')
+    ).toHaveLength(0)
   })
 })

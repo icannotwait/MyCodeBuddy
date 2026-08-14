@@ -11,7 +11,11 @@
 //!   handle, and the event emitter wired in once `AppState` exists).
 //! - [`layer`] is the custom `tracing` layer that converts events into
 //!   [`hub::LogRecord`]s.
+//! - [`budget`] caps how much the file sink may write per day, so no log
+//!   firehose can fill the user's disk before the next rotation.
+//! - [`throttle`] collapses bursts of a near-duplicate line to one per window.
 
+pub mod budget;
 pub mod hub;
 pub mod init;
 pub mod layer;

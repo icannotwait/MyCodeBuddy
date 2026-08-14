@@ -48,6 +48,11 @@ mod m20260731_000001_custom_agent;
 mod m20260731_000002_custom_agent_skills;
 mod m20260731_000003_custom_agent_skills_dir;
 mod m20260731_000004_custom_agent_source;
+mod m20260801_000001_work_task;
+mod m20260801_000002_work_task_p2;
+mod m20260801_000003_work_task_template;
+mod m20260803_000001_folder_link;
+mod m20260803_000001_token_usage;
 mod m20260804_000001_completion_protocol_and_run_evidence;
 mod m20260804_000002_completion_scope_and_gate_settlement;
 mod m20260804_000003_completion_tool_intents_and_restart_link;
@@ -56,6 +61,8 @@ mod m20260806_000001_platform_design_root_binding;
 mod m20260806_000002_final_reviewer_snapshots;
 mod m20260806_000003_plan_round_authorization;
 mod m20260806_000004_legacy_restart_context;
+mod m20260807_000001_work_task_scheduled_at;
+mod m20260808_000001_custom_agent_supports_mcp;
 mod m20260809_000001_completion_protocol_v2_only;
 mod m20260811_000001_simple_workflows;
 pub struct Migrator;
@@ -111,6 +118,11 @@ impl MigratorTrait for Migrator {
             Box::new(m20260731_000002_custom_agent_skills::Migration),
             Box::new(m20260731_000003_custom_agent_skills_dir::Migration),
             Box::new(m20260731_000004_custom_agent_source::Migration),
+            Box::new(m20260801_000001_work_task::Migration),
+            Box::new(m20260801_000002_work_task_p2::Migration),
+            Box::new(m20260801_000003_work_task_template::Migration),
+            Box::new(m20260803_000001_folder_link::Migration),
+            Box::new(m20260803_000001_token_usage::Migration),
             Box::new(m20260804_000001_completion_protocol_and_run_evidence::Migration),
             Box::new(m20260804_000002_completion_scope_and_gate_settlement::Migration),
             Box::new(m20260804_000003_completion_tool_intents_and_restart_link::Migration),
@@ -119,6 +131,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20260806_000002_final_reviewer_snapshots::Migration),
             Box::new(m20260806_000003_plan_round_authorization::Migration),
             Box::new(m20260806_000004_legacy_restart_context::Migration),
+            Box::new(m20260807_000001_work_task_scheduled_at::Migration),
+            Box::new(m20260808_000001_custom_agent_supports_mcp::Migration),
             Box::new(m20260809_000001_completion_protocol_v2_only::Migration),
             Box::new(m20260811_000001_simple_workflows::Migration),
         ]

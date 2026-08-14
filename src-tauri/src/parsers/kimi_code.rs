@@ -12,10 +12,10 @@ use crate::models::{
     ConversationSummary, MessageRole, MessageTurn, TurnRole, TurnUsage, UnifiedMessage,
 };
 use crate::parsers::{
-    compute_session_stats, folder_name_from_path, infer_context_window_max_tokens,
-    is_safe_subagent_id, merge_context_window_stats, relocate_orphaned_tool_results,
-    resolve_patch_line_numbers, structurize_read_tool_output, title_from_user_text, truncate_str,
-    visible_title, visible_user_text, AgentParser, ParseError,
+    backfill_turn_durations, compute_session_stats, folder_name_from_path,
+    infer_context_window_max_tokens, is_safe_subagent_id, merge_context_window_stats,
+    relocate_orphaned_tool_results, resolve_patch_line_numbers, structurize_read_tool_output,
+    title_from_user_text, truncate_str, visible_title, visible_user_text, AgentParser, ParseError,
 };
 
 /// Resolve Kimi Code's data home, honoring `KIMI_CODE_HOME`, else `~/.kimi-code`
@@ -184,6 +184,7 @@ impl KimiCodeParser {
         relocate_orphaned_tool_results(&mut turns);
         structurize_read_tool_output(&mut turns);
         resolve_patch_line_numbers(&mut turns, cwd.as_deref());
+        backfill_turn_durations(&mut turns, &[]);
 
         let model = read_session_log_model(session_dir).or_else(|| parsed.model_alias.clone());
         // Context-window occupancy is the LATEST step's snapshot, never the
@@ -450,6 +451,7 @@ fn parse_wire(path: &Path, agents_dir: Option<&Path>) -> WireParse {
                                     .unwrap_or("unknown")
                                     .to_string(),
                                 input_preview: tool_args_preview(event),
+                                status: None,
                                 meta: None,
                             },
                             ts,
@@ -761,6 +763,9 @@ fn agent_stats_from_subagent(
         lines_removed: None,
         other_tool_count: None,
         tool_calls,
+        // Kimi's sub-agent transcript is a file under the parent session, not a
+        // session of its own.
+        child_session_id: None,
     })
 }
 

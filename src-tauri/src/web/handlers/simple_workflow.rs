@@ -51,7 +51,9 @@ mod tests {
         });
         let client = reqwest::Client::new();
         let mut request = client
-            .post(format!("http://{addr}/api/continue_archived_workflow_in_simple"))
+            .post(format!(
+                "http://{addr}/api/continue_archived_workflow_in_simple"
+            ))
             .body(body.to_owned());
         if let Some(content_type) = content_type {
             request = request.header("Content-Type", content_type);
@@ -81,7 +83,10 @@ mod tests {
     async fn side_effect_snapshot(db: &AppDatabase) -> SideEffectSnapshot {
         SideEffectSnapshot {
             conversations: conversation::Entity::find().count(&db.conn).await.unwrap(),
-            simple_workflows: simple_workflow::Entity::find().count(&db.conn).await.unwrap(),
+            simple_workflows: simple_workflow::Entity::find()
+                .count(&db.conn)
+                .await
+                .unwrap(),
             delegation_workflows: delegation_workflow::Entity::find()
                 .count(&db.conn)
                 .await

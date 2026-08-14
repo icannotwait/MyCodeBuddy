@@ -91,6 +91,57 @@ export function useTerminalFont() {
   }
 }
 
+/**
+ * 自定义样式：主题 token 覆盖 + 自由 CSS + 逃生舱状态。
+ *
+ * `activeTokenOverrides` 是当前明暗模式下真正生效的那一组（已把「未启用 / 已停用」
+ * 折叠进去），供 Monaco 之类需要跟随实际取值的消费方直接使用，避免各处重复推导。
+ */
+export function useCustomStyle() {
+  const {
+    isDarkMode,
+    customTheme,
+    setCustomThemeToken,
+    replaceCustomTheme,
+    customThemeEnabled,
+    setCustomThemeEnabled,
+    customCss,
+    setCustomCss,
+    customCssEnabled,
+    setCustomCssEnabled,
+    customStyleSuspended,
+    setCustomStyleSuspended,
+    safeStyleRequested,
+  } = useAppearance()
+
+  const suppressed = safeStyleRequested || customStyleSuspended
+  const activeTokenOverrides =
+    suppressed || !customThemeEnabled
+      ? {}
+      : isDarkMode
+        ? customTheme.dark
+        : customTheme.light
+
+  return {
+    isDarkMode,
+    customTheme,
+    setCustomThemeToken,
+    replaceCustomTheme,
+    customThemeEnabled,
+    setCustomThemeEnabled,
+    customCss,
+    setCustomCss,
+    customCssEnabled,
+    setCustomCssEnabled,
+    customStyleSuspended,
+    setCustomStyleSuspended,
+    safeStyleRequested,
+    /** 自定义样式当前是否被整体停用（快捷键停用 或 ?safeStyle=1 打开）。 */
+    customStyleSuppressed: suppressed,
+    activeTokenOverrides,
+  }
+}
+
 /** Workspace 背景图片：启用开关、遮罩/模糊/填充/面板不透明度配置、以及已解析的
  * 图片 blob URL（异步从磁盘加载）。供外观设置面板与 workspace 布局共同消费。 */
 export function useWorkspaceBackground() {

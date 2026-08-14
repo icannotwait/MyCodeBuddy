@@ -1,5 +1,12 @@
 // src/lib/appearance-script.ts
 
+import {
+  CUSTOM_CSS_ELEMENT_ID,
+  CUSTOM_THEME_TOKENS,
+  SAFE_STYLE_QUERY_PARAM,
+  TOKEN_VALUE_PATTERN_SOURCE,
+} from "./custom-style"
+
 /**
  * Storage keys for appearance preferences.
  * 与 Provider 共享，确保 inline 脚本和 React 层读写同一份数据。
@@ -42,6 +49,21 @@ export const STORAGE_KEY_WORKSPACE_BG_PANEL_OPACITY =
 export const STORAGE_KEY_WORKSPACE_BG_IMAGE_VERSION =
   "codeg-workspace-bg-image-version"
 
+// 自定义样式（外观设置页）。全部需要预水合 —— 少一帧就会看到「基底预设 → 用户配色」
+// 的跳变，比没有这个功能更糟。
+//
+// - CUSTOM_THEME：`{ light: {...}, dark: {...} }`，键名不带 `--`（= shadcn
+//   registry:theme 的 cssVars 形状，可与 shadcn 生态直接互拷）。
+// - CUSTOM_THEME_ENABLED：缺省即开启（空覆盖本就无副作用）。
+// - CUSTOM_CSS：已剥离 `@import` 并经 CSSOM 复核的文本，inline 脚本原样注入。
+// - CUSTOM_CSS_ENABLED：缺省关闭 —— 自由 CSS 是能把界面改坏的高级功能，必须显式开启。
+// - CUSTOM_STYLE_SUSPENDED：逃生舱的持久开关（快捷键触发），置 1 时上面全部不生效。
+export const STORAGE_KEY_CUSTOM_THEME = "codeg-custom-theme"
+export const STORAGE_KEY_CUSTOM_THEME_ENABLED = "codeg-custom-theme-enabled"
+export const STORAGE_KEY_CUSTOM_CSS = "codeg-custom-css"
+export const STORAGE_KEY_CUSTOM_CSS_ENABLED = "codeg-custom-css-enabled"
+export const STORAGE_KEY_CUSTOM_STYLE_SUSPENDED = "codeg-custom-style-suspended"
+
 /**
  * 同步执行的 inline 脚本，由 layout.tsx 通过 dangerouslySetInnerHTML 注入。
  *
@@ -49,9 +71,12 @@ export const STORAGE_KEY_WORKSPACE_BG_IMAGE_VERSION =
  * 否则会出现 FOUC（先看到默认主题/字号，然后切换到用户偏好的闪烁）。
  *
  * 实现要点：
- * 1. 纯字符串，不依赖任何模块导入或外部符号 —— 避免 Next.js 把它当模块编译
+ * 1. 生成出来的是纯字符串，运行时不依赖任何模块导入或外部符号 —— 避免 Next.js
+ *    把它当模块编译。构建期的 `${...}` 插值（storage key、token 列表、校验正则）
+ *    只是把常量嵌进字符串，不引入运行时依赖，也免掉了两处手抄同一份清单。
  * 2. 白名单校验 —— localStorage 里的值若被篡改或残留旧版本，回退到默认
- * 3. try/catch 包裹 —— 隐私模式 / 嵌入 WebView 禁用 storage 时不抛错
+ * 3. try/catch 包裹 —— 隐私模式 / 嵌入 WebView 禁用 storage 时不抛错；自定义样式
+ *    两段各自再包一层，任一段损坏都不影响其余外观偏好
  * 4. 数字常量与 theme-presets.ts 保持一致 —— 任何修改必须两边同步
  */
 const SCRIPT = `
@@ -104,6 +129,58 @@ const SCRIPT = `
     } else {
       document.documentElement.style.colorScheme = "light";
       document.documentElement.style.backgroundColor = "";
+    }
+
+    // ── 自定义样式 ──────────────────────────────────────────────────────
+    // 必须排在 isDark 之后：token 覆盖分明暗两套，挑哪一套取决于它。
+    //
+    // 逃生舱其一："?safeStyle=1" 跳过全部自定义样式。用户把界面改坏时，在 web 模式
+    // 直接改地址栏即可自救（桌面模式走快捷键那条，见 AppearanceProvider）。
+    var safeStyle = false;
+    try {
+      safeStyle = new URLSearchParams(location.search).get("${SAFE_STYLE_QUERY_PARAM}") === "1";
+    } catch (e) {}
+    var styleOff = safeStyle ||
+      localStorage.getItem("${STORAGE_KEY_CUSTOM_STYLE_SUSPENDED}") === "1";
+
+    // token 覆盖：写 <html> 行内样式，优先级天然高于 [data-theme="x"] 规则，
+    // 所以「基底预设 + 覆盖」不需要任何新选择器。缺省开启（空覆盖无副作用）。
+    if (!styleOff && localStorage.getItem("${STORAGE_KEY_CUSTOM_THEME_ENABLED}") !== "0") {
+      try {
+        var rawTheme = localStorage.getItem("${STORAGE_KEY_CUSTOM_THEME}");
+        if (rawTheme) {
+          var themeCfg = JSON.parse(rawTheme) || {};
+          var overrides = (isDark ? themeCfg.dark : themeCfg.light) || {};
+          var TOKENS = ${JSON.stringify(CUSTOM_THEME_TOKENS)};
+          var VALUE_RE = new RegExp(${JSON.stringify(TOKEN_VALUE_PATTERN_SOURCE)});
+          for (var ti = 0; ti < TOKENS.length; ti++) {
+            var tv = overrides[TOKENS[ti]];
+            if (typeof tv === "string" && VALUE_RE.test(tv)) {
+              document.documentElement.style.setProperty("--" + TOKENS[ti], tv);
+            }
+          }
+        }
+      } catch (e) {
+        // 主题 JSON 损坏时静默走基底预设
+      }
+    }
+
+    // 自由 CSS：存的就是已剥离 @import 并经 CSSOM 复核的文本，这里原样注入。
+    // 追加到 <head> 末尾 —— 未分层（unlayered）的作者 CSS 在级联中本就胜过
+    // Tailwind 的全部分层产物，末尾位置只是为了与 globals.css 里同为未分层的
+    // 规则比较时靠文档顺序取胜。缺省关闭，必须显式开启。
+    if (!styleOff && localStorage.getItem("${STORAGE_KEY_CUSTOM_CSS_ENABLED}") === "1") {
+      try {
+        var userCss = localStorage.getItem("${STORAGE_KEY_CUSTOM_CSS}");
+        if (userCss) {
+          var styleEl = document.createElement("style");
+          styleEl.id = "${CUSTOM_CSS_ELEMENT_ID}";
+          styleEl.textContent = userCss;
+          document.head.appendChild(styleEl);
+        }
+      } catch (e) {
+        // 注入失败不影响其余外观偏好
+      }
     }
   } catch (e) {
     // localStorage 不可用时静默走默认

@@ -28,6 +28,18 @@ type TipKey =
   | "fusionMode"
   | "quickMessages"
   | "experts"
+  | "taskBoard"
+  | "automations"
+  | "tokenUsage"
+  | "mentionTargets"
+  | "splitGroups"
+  | "worktrees"
+  | "importSessions"
+  | "subSessions"
+  | "liveFeedback"
+  | "skillPacks"
+  | "modelProviders"
+  | "workspaceBackground"
 
 interface TipDef {
   key: TipKey
@@ -76,6 +88,18 @@ const TIPS: TipDef[] = [
   { key: "fusionMode" },
   { key: "quickMessages" },
   { key: "experts" },
+  { key: "taskBoard" },
+  { key: "automations" },
+  { key: "tokenUsage" },
+  { key: "mentionTargets" },
+  { key: "splitGroups" },
+  { key: "worktrees" },
+  { key: "importSessions" },
+  { key: "subSessions" },
+  { key: "liveFeedback" },
+  { key: "skillPacks" },
+  { key: "modelProviders" },
+  { key: "workspaceBackground" },
 ]
 
 const highlightTitle = (chunks: ReactNode) => (

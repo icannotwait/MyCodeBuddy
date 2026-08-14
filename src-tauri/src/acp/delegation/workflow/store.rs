@@ -53,9 +53,7 @@ use super::completion_projection::{
     load_completion_projection, load_workflow_completion_projection_batch,
     validated_design_self_review_outcome, DesignSelfReviewDecisionError,
 };
-use super::error::{
-    require_v2_mutation_for_connection, WorkflowStoreError,
-};
+use super::error::{require_v2_mutation_for_connection, WorkflowStoreError};
 use super::events::{
     emit_workflow_graph_changed, emit_workflow_recovery_event, WorkflowRecoveryEvent,
 };
@@ -92,17 +90,16 @@ use super::state_dto::{
     project_workflow_state_index, PlanRecoverySourceDto, WorkflowGateStateDto,
     WorkflowNodeStateDto, WorkflowStateDto, WorkflowStateIndexDto,
 };
-use super::types::{
-    DocumentGateKind, DocumentRef, ManifestDocument, ManifestNode, ManifestNodeKind,
-    ManifestNodeRole, ManifestRevisionKind, ManifestWorkflowState,
-    NormalizedGate, NormalizedManifest, NormalizedNode, PlanChangeClassification, ResolutionMode,
-    WorkflowBlockCause, MAX_ADJUDICATION_SUMMARY_BYTES,
-    WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY,
-};
-#[cfg(any(test, feature = "test-utils"))]
-use super::types::CURRENT_COMPLETION_PROTOCOL_VERSION;
 #[cfg(any(test, feature = "test-utils"))]
 use super::types::ManifestNodeOutcome;
+#[cfg(any(test, feature = "test-utils"))]
+use super::types::CURRENT_COMPLETION_PROTOCOL_VERSION;
+use super::types::{
+    DocumentGateKind, DocumentRef, ManifestDocument, ManifestNode, ManifestNodeKind,
+    ManifestNodeRole, ManifestRevisionKind, ManifestWorkflowState, NormalizedGate,
+    NormalizedManifest, NormalizedNode, PlanChangeClassification, ResolutionMode,
+    WorkflowBlockCause, MAX_ADJUDICATION_SUMMARY_BYTES, WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY,
+};
 use super::validate::validate_manifest_document;
 
 /// Capability version stamped on new headers (B9 / A15).
@@ -646,9 +643,7 @@ pub async fn publish_workflow_manifest_core(
     {
         Ok(error) => error,
         Err(error @ WorkflowStoreError::WorkflowIdentityCorrupt { .. }) => error,
-        Err(_) => {
-            WorkflowStoreError::workflow_v2_retired_with_navigation(parent_conversation_id)
-        },
+        Err(_) => WorkflowStoreError::workflow_v2_retired_with_navigation(parent_conversation_id),
     };
     Err(error)
 }
@@ -8787,12 +8782,7 @@ mod tests {
         request: SettleWorkflowV2Request,
     ) -> Result<SettleResult, WorkflowStoreError> {
         crate::acp::delegation::workflow::with_historical_workflow_fixture_mutations(
-            super::settle_workflow_gate_v2_core(
-                db,
-                emitter,
-                parent_conversation_id,
-                request,
-            ),
+            super::settle_workflow_gate_v2_core(db, emitter, parent_conversation_id, request),
         )
         .await
     }
@@ -9616,7 +9606,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(header.active_manifest_revision as u64, published.manifest_revision);
+        assert_eq!(
+            header.active_manifest_revision as u64,
+            published.manifest_revision
+        );
         assert_eq!(header.graph_revision as u64, published.graph_revision);
     }
 
@@ -9675,33 +9668,33 @@ mod tests {
             let runs = RunStore::new(Arc::new(AppDatabase {
                 conn: db.conn.clone(),
             }));
-            super::super::with_historical_workflow_fixture_mutations(
-                runs.admit_gen1_reserving(ReservingRunInsert {
-                task_id: task_id.into(),
-                root_task_id: task_id.into(),
-                previous_task_id: None,
-                generation: 1,
-                parent_conversation_id: parent,
-                parent_tool_use_id: Some(format!("tool-{task_id}")),
-                child_conversation_id: child,
-                agent_type: "codex".into(),
-                profile_id: None,
-                workspace_path: Some(workspace.to_string_lossy().into_owned()),
-                route_fingerprint: Some(format!("route-{task_id}")),
-                launch_snapshot_version: Some("v1".into()),
-                mode_id: None,
-                config_values_json: Some("{}".into()),
-                task_preview: Some(format!("Complete {node_id}")),
-                request_fingerprint: Some(format!("fingerprint-{task_id}")),
-                admission_class: AdmissionClass::NormalRevision,
-                lineage_root_task_id: task_id.into(),
-                work_unit_key: Some(node.work_unit_key),
-                history_only: false,
-                replaced_task_id: None,
-                replacement_reason: None,
-                started_at: Some(Utc::now()),
-                }),
-            )
+            super::super::with_historical_workflow_fixture_mutations(runs.admit_gen1_reserving(
+                ReservingRunInsert {
+                    task_id: task_id.into(),
+                    root_task_id: task_id.into(),
+                    previous_task_id: None,
+                    generation: 1,
+                    parent_conversation_id: parent,
+                    parent_tool_use_id: Some(format!("tool-{task_id}")),
+                    child_conversation_id: child,
+                    agent_type: "codex".into(),
+                    profile_id: None,
+                    workspace_path: Some(workspace.to_string_lossy().into_owned()),
+                    route_fingerprint: Some(format!("route-{task_id}")),
+                    launch_snapshot_version: Some("v1".into()),
+                    mode_id: None,
+                    config_values_json: Some("{}".into()),
+                    task_preview: Some(format!("Complete {node_id}")),
+                    request_fingerprint: Some(format!("fingerprint-{task_id}")),
+                    admission_class: AdmissionClass::NormalRevision,
+                    lineage_root_task_id: task_id.into(),
+                    work_unit_key: Some(node.work_unit_key),
+                    history_only: false,
+                    replaced_task_id: None,
+                    replacement_reason: None,
+                    started_at: Some(Utc::now()),
+                },
+            ))
             .await
             .unwrap();
             let run = delegation_task_run::Entity::find_by_id(task_id)
@@ -9716,13 +9709,13 @@ mod tests {
             run.update(&db.conn).await.unwrap();
             let completion = super::super::with_historical_workflow_fixture_mutations(
                 materialize_terminal_completion_txn(
-                &db.conn,
-                TerminalCompletionInput {
-                    task_id: task_id.into(),
-                    terminal_status: DelegationRunStatus::Completed,
-                    final_assistant_text: final_text.into(),
-                    pre_read_reports: Vec::new(),
-                    pre_read_artifact: None,
+                    &db.conn,
+                    TerminalCompletionInput {
+                        task_id: task_id.into(),
+                        terminal_status: DelegationRunStatus::Completed,
+                        final_assistant_text: final_text.into(),
+                        pre_read_reports: Vec::new(),
+                        pre_read_artifact: None,
                     },
                 ),
             )
@@ -10299,19 +10292,19 @@ mod tests {
 
         super::super::with_historical_workflow_fixture_mutations(
             super::super::admission::admit_workflow_run_txn(
-            &db.conn,
-            &super::super::admission::WorkflowAdmitInput {
-                parent_conversation_id: parent,
-                child_conversation_id: child,
-                task_id,
-                work_unit_key: Some(&node.work_unit_key),
-                agent_type: &node.agent_type,
-                profile_id: node.profile_id.as_deref(),
-                lineage_root_task_id: task_id,
-                generation: 1,
-                kind: super::super::admission::AdmissionDispatchKind::FirstDispatch,
-                admission_class: AdmissionClass::NormalRevision,
-                workspace_path: workspace.to_str(),
+                &db.conn,
+                &super::super::admission::WorkflowAdmitInput {
+                    parent_conversation_id: parent,
+                    child_conversation_id: child,
+                    task_id,
+                    work_unit_key: Some(&node.work_unit_key),
+                    agent_type: &node.agent_type,
+                    profile_id: node.profile_id.as_deref(),
+                    lineage_root_task_id: task_id,
+                    generation: 1,
+                    kind: super::super::admission::AdmissionDispatchKind::FirstDispatch,
+                    admission_class: AdmissionClass::NormalRevision,
+                    workspace_path: workspace.to_str(),
                 },
             ),
         )
@@ -10350,13 +10343,13 @@ mod tests {
         };
         let result = super::super::with_historical_workflow_fixture_mutations(
             super::super::completion_evidence::materialize_terminal_completion_txn(
-            &db.conn,
-            super::super::completion_evidence::TerminalCompletionInput {
-                task_id: task_id.to_string(),
-                terminal_status: DelegationRunStatus::Completed,
-                final_assistant_text: format!("Conclusion: {conclusion}"),
-                pre_read_reports: Vec::new(),
-                pre_read_artifact: None,
+                &db.conn,
+                super::super::completion_evidence::TerminalCompletionInput {
+                    task_id: task_id.to_string(),
+                    terminal_status: DelegationRunStatus::Completed,
+                    final_assistant_text: format!("Conclusion: {conclusion}"),
+                    pre_read_reports: Vec::new(),
+                    pre_read_artifact: None,
                 },
             ),
         )
@@ -12351,33 +12344,33 @@ mod tests {
             let runs = RunStore::new(Arc::new(AppDatabase {
                 conn: db.conn.clone(),
             }));
-            super::super::with_historical_workflow_fixture_mutations(
-                runs.admit_gen1_reserving(ReservingRunInsert {
-                task_id: task_id.clone(),
-                root_task_id: task_id.clone(),
-                previous_task_id: None,
-                generation: 1,
-                parent_conversation_id: parent,
-                parent_tool_use_id: Some(format!("tool-{task_id}")),
-                child_conversation_id: child,
-                agent_type: "codex".into(),
-                profile_id: None,
-                workspace_path: Some(workspace.path().to_string_lossy().into_owned()),
-                route_fingerprint: Some(format!("route-{task_id}")),
-                launch_snapshot_version: Some("v1".into()),
-                mode_id: None,
-                config_values_json: Some("{}".into()),
-                task_preview: Some("Review external Design".into()),
-                request_fingerprint: Some(format!("fingerprint-{task_id}")),
-                admission_class: AdmissionClass::NormalRevision,
-                lineage_root_task_id: task_id.clone(),
-                work_unit_key: Some(node.work_unit_key),
-                history_only: false,
-                replaced_task_id: None,
-                replacement_reason: None,
-                started_at: Some(Utc::now()),
-                }),
-            )
+            super::super::with_historical_workflow_fixture_mutations(runs.admit_gen1_reserving(
+                ReservingRunInsert {
+                    task_id: task_id.clone(),
+                    root_task_id: task_id.clone(),
+                    previous_task_id: None,
+                    generation: 1,
+                    parent_conversation_id: parent,
+                    parent_tool_use_id: Some(format!("tool-{task_id}")),
+                    child_conversation_id: child,
+                    agent_type: "codex".into(),
+                    profile_id: None,
+                    workspace_path: Some(workspace.path().to_string_lossy().into_owned()),
+                    route_fingerprint: Some(format!("route-{task_id}")),
+                    launch_snapshot_version: Some("v1".into()),
+                    mode_id: None,
+                    config_values_json: Some("{}".into()),
+                    task_preview: Some("Review external Design".into()),
+                    request_fingerprint: Some(format!("fingerprint-{task_id}")),
+                    admission_class: AdmissionClass::NormalRevision,
+                    lineage_root_task_id: task_id.clone(),
+                    work_unit_key: Some(node.work_unit_key),
+                    history_only: false,
+                    replaced_task_id: None,
+                    replacement_reason: None,
+                    started_at: Some(Utc::now()),
+                },
+            ))
             .await
             .unwrap();
             let run = delegation_task_run::Entity::find_by_id(&task_id)
@@ -12406,13 +12399,13 @@ mod tests {
             .unwrap();
             let completion = super::super::with_historical_workflow_fixture_mutations(
                 materialize_terminal_completion_txn(
-                &db.conn,
-                TerminalCompletionInput {
-                    task_id: task_id.clone(),
-                    terminal_status: DelegationRunStatus::Completed,
-                    final_assistant_text: "typed completion intent wins".into(),
-                    pre_read_reports: Vec::new(),
-                    pre_read_artifact: None,
+                    &db.conn,
+                    TerminalCompletionInput {
+                        task_id: task_id.clone(),
+                        terminal_status: DelegationRunStatus::Completed,
+                        final_assistant_text: "typed completion intent wins".into(),
+                        pre_read_reports: Vec::new(),
+                        pre_read_artifact: None,
                     },
                 ),
             )
@@ -13738,9 +13731,10 @@ mod tests {
         let update_request = PublishWorkflowRequest {
             document: estimated,
         };
-        let updated = publish_workflow_manifest_fixture(&db, &emitter, parent, update_request.clone())
-            .await
-            .expect("estimated publish after Author evidence");
+        let updated =
+            publish_workflow_manifest_fixture(&db, &emitter, parent, update_request.clone())
+                .await
+                .expect("estimated publish after Author evidence");
         assert_eq!(updated.manifest_revision, 2);
         assert_eq!(updated.workflow_state, ManifestWorkflowState::Estimated);
 
@@ -15506,8 +15500,13 @@ mod tests {
             parent: i32,
             document: ManifestDocument,
         ) -> Result<PublishResult, WorkflowStoreError> {
-            publish_workflow_manifest_fixture(db, emitter, parent, PublishWorkflowRequest { document })
-                .await
+            publish_workflow_manifest_fixture(
+                db,
+                emitter,
+                parent,
+                PublishWorkflowRequest { document },
+            )
+            .await
         }
 
         async fn observe(db: &AppDatabase, workflow_id: &str, node_id: &str) {
@@ -16138,8 +16137,13 @@ mod tests {
             parent: i32,
             document: ManifestDocument,
         ) -> Result<PublishResult, WorkflowStoreError> {
-            publish_workflow_manifest_fixture(db, emitter, parent, PublishWorkflowRequest { document })
-                .await
+            publish_workflow_manifest_fixture(
+                db,
+                emitter,
+                parent,
+                PublishWorkflowRequest { document },
+            )
+            .await
         }
 
         async fn seed_ready_plan_round(
@@ -16417,17 +16421,18 @@ mod tests {
             .await
             .expect("load active digest")
             .expect("active digest");
-            let reclassified = crate::acp::delegation::workflow::with_historical_workflow_fixture_mutations(
-                classify_existing_header(
-                    &db.conn,
-                    header,
-                    parent,
-                    &blocked.publication_token,
-                    &active_digest,
-                ),
-            )
-            .await
-            .expect("race reclassifies blocked publication");
+            let reclassified =
+                crate::acp::delegation::workflow::with_historical_workflow_fixture_mutations(
+                    classify_existing_header(
+                        &db.conn,
+                        header,
+                        parent,
+                        &blocked.publication_token,
+                        &active_digest,
+                    ),
+                )
+                .await
+                .expect("race reclassifies blocked publication");
             let reclassified_recovery = reclassified
                 .recovery
                 .expect("race result retains recovery provenance");
@@ -19305,19 +19310,19 @@ mod tests {
             let txn = db.conn.begin().await.expect("begin Task admission");
             crate::acp::delegation::workflow::with_historical_workflow_fixture_mutations(
                 admit_workflow_run_txn(
-                &txn,
-                &WorkflowAdmitInput {
-                    parent_conversation_id: parent,
-                    child_conversation_id: task_child,
-                    task_id,
-                    work_unit_key: Some(&task_binding.work_unit_key),
-                    agent_type: "grok",
-                    profile_id: None,
-                    lineage_root_task_id: task_id,
-                    generation: 1,
-                    kind: AdmissionDispatchKind::FirstDispatch,
-                    admission_class: AdmissionClass::NormalRevision,
-                    workspace_path: Some(workspace.as_str()),
+                    &txn,
+                    &WorkflowAdmitInput {
+                        parent_conversation_id: parent,
+                        child_conversation_id: task_child,
+                        task_id,
+                        work_unit_key: Some(&task_binding.work_unit_key),
+                        agent_type: "grok",
+                        profile_id: None,
+                        lineage_root_task_id: task_id,
+                        generation: 1,
+                        kind: AdmissionDispatchKind::FirstDispatch,
+                        admission_class: AdmissionClass::NormalRevision,
+                        workspace_path: Some(workspace.as_str()),
                     },
                 ),
             )

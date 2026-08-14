@@ -268,6 +268,8 @@ async fn create_inner(
         awaiting_reply_token: Set(None),
         delegation_run_generation: Set(None),
         last_termination_audit_json: Set(None),
+
+        origin_cwd: Set(None),
     }
     .insert(&txn)
     .await?;
@@ -625,11 +627,32 @@ pub async fn update_external_id(
     Ok(())
 }
 
+pub async fn reparent_folder_conversations(
+    conn: &DatabaseConnection,
+    from_folder_id: i32,
+    to_folder_id: i32,
+    origin_cwd: &str,
+) -> Result<u64, DbError> {
+    use sea_orm::sea_query::Expr;
+    let res = conversation::Entity::update_many()
+        .col_expr(conversation::Column::FolderId, Expr::value(to_folder_id))
+        .col_expr(
+            conversation::Column::OriginCwd,
+            Expr::value(Some(origin_cwd.to_string())),
+        )
+        .col_expr(conversation::Column::UpdatedAt, Expr::value(Utc::now()))
+        .filter(conversation::Column::FolderId.eq(from_folder_id))
+        .filter(conversation::Column::DeletedAt.is_null())
+        .exec(conn)
+        .await?;
+    Ok(res.rows_affected)
+}
+
 /// Soft-delete a conversation. Returns `true` when a pending auto-title job
 /// was removed and active work must be cancelled after commit.
 pub async fn soft_delete(conn: &DatabaseConnection, conversation_id: i32) -> Result<bool, DbError> {
-    use sea_orm::sea_query::Expr;
     use crate::db::entities::simple_workflow;
+    use sea_orm::sea_query::Expr;
 
     let txn = conn.begin().await?;
     let changed = conversation::Entity::update_many()
@@ -995,6 +1018,7 @@ fn conv_to_summary(r: conversation::Model) -> DbConversationSummary {
         // Pure mapper: open attention is bulk-filled by
         // `fill_open_delegation_attention` over the returned set.
         delegation_attention_request: None,
+        origin_cwd: r.origin_cwd,
     }
 }
 

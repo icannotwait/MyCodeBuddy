@@ -12,6 +12,7 @@ const branchList: GitBranchList = {
   local: ["main", "feature/x"],
   remote: ["origin/main"],
   worktree_branches: [],
+  main_worktree_branch: null,
 }
 
 describe("isHeadFilter", () => {

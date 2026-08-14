@@ -17,6 +17,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
+use chrono::{DateTime, Utc};
+
 /// A root of external agent-CLI transcript data, archived under
 /// `external/<agent>/` by the optional "include conversation content" toggle.
 /// These paths are owned by the respective CLIs — codeg only reads them.
@@ -160,7 +162,8 @@ pub fn external_transcript_sources() -> Vec<ExternalSource> {
 use regex::Regex;
 
 use crate::models::{
-    ContentBlock, ConversationDetail, ConversationSummary, MessageTurn, SessionStats, TurnUsage,
+    ContentBlock, ConversationDetail, ConversationSummary, MessageTurn, SessionStats, TurnRole,
+    TurnUsage,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -468,6 +471,38 @@ pub fn sanitize_user_blocks(blocks: &mut Vec<ContentBlock>) -> bool {
     }
     blocks.retain(|block| !matches!(block, ContentBlock::Text { text } if text.is_empty()));
     !blocks.is_empty()
+}
+
+/// Fill in `duration_ms` for assistant turns whose agent reports no timing of
+/// its own, by tiling the conversation timeline.
+pub fn backfill_turn_durations(turns: &mut [MessageTurn], turn_starts: &[DateTime<Utc>]) {
+    let mut cursor: Option<DateTime<Utc>> = None;
+    let mut next_start = 0usize;
+
+    for turn in turns.iter_mut() {
+        let end = turn.completed_at.unwrap_or(turn.timestamp);
+        while next_start < turn_starts.len() && turn_starts[next_start] <= end {
+            advance_duration_cursor(&mut cursor, turn_starts[next_start]);
+            next_start += 1;
+        }
+
+        if matches!(turn.role, TurnRole::Assistant) && turn.duration_ms.is_none() {
+            if let Some(start) = cursor {
+                let ms = (end - start).num_milliseconds();
+                if ms > 0 {
+                    turn.duration_ms = Some(ms as u64);
+                }
+            }
+        }
+
+        advance_duration_cursor(&mut cursor, end);
+    }
+}
+
+fn advance_duration_cursor(cursor: &mut Option<DateTime<Utc>>, candidate: DateTime<Utc>) {
+    if cursor.is_none_or(|current| candidate > current) {
+        *cursor = Some(candidate);
+    }
 }
 
 /// Aggregate turn-level usage and duration into a single `SessionStats`.

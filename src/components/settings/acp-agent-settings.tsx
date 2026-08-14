@@ -11,6 +11,7 @@ import {
 } from "react"
 import { Reorder, useDragControls } from "motion/react"
 import { useLocale, useTranslations } from "next-intl"
+import { useImeGuard } from "@/hooks/use-ime-guard"
 import { useSearchParams } from "next/navigation"
 import {
   AlertCircle,
@@ -34,6 +35,7 @@ import {
   Trash2,
   Wrench,
 } from "lucide-react"
+import { parse as parseTomlDocument } from "smol-toml"
 import { isDesktop, openUrl } from "@/lib/platform"
 
 import { getActiveRemoteConnectionId } from "@/lib/transport"
@@ -45,6 +47,8 @@ import {
 } from "@/lib/custom-agents"
 import { AgentIcon } from "@/components/agent-icon"
 import { AddCustomAgentDialog } from "@/components/settings/add-custom-agent-dialog"
+import { SettingCard, SettingRow } from "@/components/shared/setting-card"
+import { CustomAgentMcpToggle } from "@/components/settings/custom-agent-mcp-toggle"
 import { CustomAgentSkillsToggle } from "@/components/settings/custom-agent-skills-toggle"
 import {
   AlertDialog,
@@ -109,6 +113,7 @@ import {
 } from "@/lib/api"
 import type {
   AcpAgentInfo,
+  AdapterInfo,
   AgentType,
   CheckStatus,
   CodexGranularApproval,
@@ -132,6 +137,7 @@ import {
   OpenCodeConnectDialog,
   OpenCodeCustomProviderDialog,
 } from "@/components/settings/opencode-connect-dialog"
+import { OpenCodePermissionsSection } from "@/components/settings/opencode-permissions-section"
 import { AgentDiagnosticsDialog } from "@/components/settings/agent-diagnostics-dialog"
 import {
   buildConnectedModelOptions,
@@ -361,6 +367,19 @@ function summarizeChecks(checks: UiCheckItem[]): CheckStatus | "unchecked" {
   return "pass"
 }
 
+/**
+ * Per-agent `env_json` knob deciding WHICH SIDE of the ACP connection reads
+ * files and runs commands (`HostToolsPolicy`, Rust side). codeg advertises
+ * `fs.readTextFile` / `terminal` by default, and an agent that sees them stops
+ * using its own backends and delegates — so the work happens in CODEG's
+ * process, outside any OS sandbox the agent applies to itself. Set to
+ * {@link HOST_TOOLS_AGENT} and codeg advertises neither, so the agent does its
+ * own I/O and its own sandbox covers it again (#436). Absent ⇒ codeg hosts.
+ */
+const HOST_TOOLS_ENV = "CODEG_ACP_HOST_TOOLS"
+const HOST_TOOLS_AGENT = "agent"
+const HOST_TOOLS_DEFAULT = "default"
+
 function envMapToText(env: Record<string, string>): string {
   return Object.entries(env)
     .map(([key, value]) => `${key}=${value}`)
@@ -433,6 +452,45 @@ export function patchCodexCliRuntimeEnv(
 ): string {
   return patchEnvText(envText, {
     [CODEX_ACP_USE_CLI_ENV]: enabled ? "1" : "0",
+  })
+}
+
+/**
+ * Whether this agent's env draft hands the ACP fs/terminal channels back to the
+ * agent — see {@link HOST_TOOLS_ENV}. Anything other than the exact sentinel
+ * (including a hand-typed `default`) reads as off, matching the Rust resolver,
+ * which fails OPEN on an unrecognized value rather than silently withholding.
+ *
+ * Reads the per-agent layer ONLY. When the key is absent and an operator has
+ * exported `CODEG_ACP_HOST_TOOLS=agent` in codeg's own environment, the switch
+ * renders off while the next connection actually withholds the channels — the
+ * display understates how restricted the agent is. Showing that inherited state
+ * would need the backend to report its resolved process-env value; until then
+ * the error is in the safe direction, and {@link setHostToolsAgentMode} makes
+ * the per-agent value authoritative the moment the user touches the switch.
+ */
+export function hostToolsAgentModeEnabled(envText: string): boolean {
+  return parseEnvText(envText)[HOST_TOOLS_ENV] === HOST_TOOLS_AGENT
+}
+
+/**
+ * Flip the knob in an env draft, always writing an EXPLICIT value — including
+ * `default` for off, rather than deleting the key.
+ *
+ * Deleting would be tidier but wrong: the backend resolves this knob as
+ * `env_json` first, then codeg's own process env. An operator who exported
+ * `CODEG_ACP_HOST_TOOLS=agent` process-wide makes "absent" mean `agent`, so a
+ * toggle that cleared the key on OFF could not turn the mode off at all — the
+ * switch would read false while the next connection still withheld the
+ * channels. Writing the value the user actually chose makes the per-agent
+ * setting authoritative in both directions.
+ */
+export function setHostToolsAgentMode(
+  envText: string,
+  enabled: boolean
+): string {
+  return patchEnvText(envText, {
+    [HOST_TOOLS_ENV]: enabled ? HOST_TOOLS_AGENT : HOST_TOOLS_DEFAULT,
   })
 }
 
@@ -1602,6 +1660,13 @@ interface CodexImportantValues {
 
 const CODEX_DEFAULT_MODEL_PROVIDER = "codeg"
 
+/**
+ * Header codex reads to decide whether a provider authenticates through the
+ * "actor authorization" path. Mirrors `OPENAI_ACTOR_AUTHORIZATION_HEADER` in
+ * codex's `model-provider-info` crate.
+ */
+const CODEX_ACTOR_AUTHORIZATION_HEADER = "x-openai-actor-authorization"
+
 const CODEX_AUTH_MODES = [
   "api_key",
   "chatgpt_subscription",
@@ -2520,6 +2585,68 @@ function patchCodexProviderField(
   return `${appended}\n\n${sectionText}`.trim()
 }
 
+/**
+ * Result of reading `[model_providers.<provider>]` out of a config.toml draft.
+ * "table absent" and "document unparsable" are deliberately distinct: an absent
+ * table is a brand-new provider we should seed, a document we cannot parse is
+ * one we must not touch.
+ */
+type CodexProviderTableRead =
+  | { status: "ok"; table: Record<string, unknown> | null }
+  | { status: "unparsable" }
+
+/**
+ * Read-only view of one provider table. Every *write* in this file stays
+ * text-based so user comments and key order survive; only the "is this field
+ * already declared?" question goes through a real parser, because answering it
+ * from text needs full TOML semantics — quoted keys containing dots, escape
+ * decoding, dotted keys and inline tables — that a line scanner cannot supply.
+ */
+function readCodexProviderTable(
+  configTomlText: string,
+  provider: string
+): CodexProviderTableRead {
+  const name = provider.trim()
+  if (!name) return { status: "unparsable" }
+  let parsed: unknown
+  try {
+    parsed = parseTomlDocument(configTomlText)
+  } catch {
+    return { status: "unparsable" }
+  }
+  if (!parsed || typeof parsed !== "object") return { status: "unparsable" }
+  const providers = (parsed as Record<string, unknown>).model_providers
+  if (!providers || typeof providers !== "object" || Array.isArray(providers)) {
+    return { status: "ok", table: null }
+  }
+  const table = (providers as Record<string, unknown>)[name]
+  if (!table || typeof table !== "object" || Array.isArray(table)) {
+    return { status: "ok", table: null }
+  }
+  return { status: "ok", table: table as Record<string, unknown> }
+}
+
+/**
+ * Mirrors the header half of codex's
+ * `ModelProviderInfo::uses_openai_actor_authorization`. The ASCII-only fold
+ * matches its `eq_ignore_ascii_case`.
+ */
+function codexProviderUsesActorAuthorization(
+  table: Record<string, unknown> | null
+): boolean {
+  const headers = table?.http_headers
+  if (!headers || typeof headers !== "object" || Array.isArray(headers)) {
+    return false
+  }
+  return Object.entries(headers as Record<string, unknown>).some(
+    ([name, value]) =>
+      name.replace(/[A-Z]/g, (char) => char.toLowerCase()) ===
+        CODEX_ACTOR_AUTHORIZATION_HEADER &&
+      typeof value === "string" &&
+      value.trim() !== ""
+  )
+}
+
 function ensureCodexProviderDefaults(
   configTomlText: string,
   provider: string
@@ -2549,12 +2676,35 @@ function ensureCodexProviderDefaults(
     "wire_api",
     'wire_api = "responses"'
   )
-  next = patchCodexProviderField(
-    next,
-    CODEX_DEFAULT_MODEL_PROVIDER,
-    "requires_openai_auth",
-    "requires_openai_auth = true"
+  // `requires_openai_auth` is the one managed field a user legitimately owns:
+  // codex defaults it to false, and its `uses_openai_actor_authorization()`
+  // requires `!requires_openai_auth`, so forcing true silently disables the
+  // actor-authorization path. Supply codeg's default only when the provider
+  // does not already declare it — true is right for a provider *we* created
+  // (key in auth.json, no env_key), never for one the user configured.
+  // Read the original text: the three patches above never touch
+  // `requires_openai_auth` or `http_headers`, and the original is what the
+  // user actually authored.
+  const read = readCodexProviderTable(
+    configTomlText,
+    CODEX_DEFAULT_MODEL_PROVIDER
   )
+  const providerTable = read.status === "ok" ? read.table : null
+  const alreadyDeclared =
+    read.status !== "ok" ||
+    (providerTable !== null &&
+      Object.prototype.hasOwnProperty.call(
+        providerTable,
+        "requires_openai_auth"
+      ))
+  if (!alreadyDeclared && !codexProviderUsesActorAuthorization(providerTable)) {
+    next = patchCodexProviderField(
+      next,
+      CODEX_DEFAULT_MODEL_PROVIDER,
+      "requires_openai_auth",
+      "requires_openai_auth = true"
+    )
+  }
   return next
 }
 
@@ -2596,7 +2746,7 @@ function patchCodexAuthJsonText(
   }
 }
 
-function patchCodexConfigTomlText(
+export function patchCodexConfigTomlText(
   configTomlText: string,
   patch: {
     apiBaseUrl?: string
@@ -3325,11 +3475,88 @@ function isValidCustomVersion(value: string): boolean {
   return /^[0-9][0-9A-Za-z.\-+]*$/.test(normalized) && normalized.includes(".")
 }
 
+/**
+ * The explainer card for agents whose codeg entry is a third-party ACP
+ * *adapter* rather than the vendor's own CLI — Claude Code and Codex.
+ *
+ * Ten of the twelve built-ins install the vendor CLI itself, so a user's
+ * existing global install is simply detected. These two are the exception:
+ * neither `claude` nor `codex` speaks ACP, so codeg installs `claude-agent-acp`
+ * / `codex-acp` instead, and the launch gate looks for THAT command. Without
+ * this card the user only sees "Not installed" next to an agent they demonstrably
+ * have — by far the most-reported confusion.
+ *
+ * Returns `null` for every non-adapter agent (backend decides, via
+ * `PreflightResult.adapter`), and while preflight hasn't resolved yet.
+ *
+ * Deliberately carries NO install action: the Version Status card directly below
+ * already has one, and two install buttons on adjacent cards only breeds doubt
+ * about which is the right one.
+ */
+export function buildAcpAdapterCheck(
+  adapter: AdapterInfo | null | undefined
+): UiCheckItem | null {
+  if (!adapter) return null
+
+  const values = {
+    nativeLabel: adapter.native_label,
+    nativeCmd: adapter.native_cmd,
+    nativePath: adapter.native_path ?? "",
+    adapterPackage: adapter.adapter_package,
+    adapterCmd: adapter.adapter_cmd,
+    configDir: adapter.shared_config_dir,
+  }
+
+  // Installed → `pass`, so renderCheck collapses it: the relationship stays
+  // documented for anyone who wonders later, without nagging a working setup.
+  const installed = adapter.adapter_installed
+  const sawNative = Boolean(adapter.native_path)
+  // The English fallbacks mirror the four i18n messages one-for-one (they are
+  // what renders if no translator is mounted), so each state keeps the detail
+  // that state is about — above all, the path we found the vendor CLI at.
+  const split = `Codeg drives agents over ACP and the ${adapter.native_label} does not speak ACP, so Codeg needs a separate adapter package, ${adapter.adapter_package}.`
+  const coexist = `It ships its own runtime, never modifies or replaces your ${adapter.native_cmd} command, and reads the same ${adapter.shared_config_dir} — your existing sign-in and settings carry over.`
+  const [key, fallback] = installed
+    ? sawNative
+      ? [
+          "adapter.readyWithNative",
+          `Adapter ${adapter.adapter_cmd} is installed — that is what Codeg launches, not your own ${adapter.native_cmd} at ${adapter.native_path}. They are separate packages that coexist, and both read ${adapter.shared_config_dir}.`,
+        ]
+      : [
+          "adapter.ready",
+          `Adapter ${adapter.adapter_cmd} is installed — that is what Codeg launches. It ships its own runtime, so the ${adapter.native_label} is not required.`,
+        ]
+    : sawNative
+      ? [
+          "adapter.missingWithNative",
+          `Found your own ${adapter.native_label} at ${adapter.native_path}. ${split} ${coexist} Install it below.`,
+        ]
+      : [
+          "adapter.missing",
+          `${split} It ships its own runtime, so the ${adapter.native_cmd} CLI is not required first; if you do have it, the two coexist and share the same ${adapter.shared_config_dir} sign-in and settings. Install it below.`,
+        ]
+
+  return {
+    check_id: "acp_adapter",
+    label: acpText("adapter.label", "ACP adapter"),
+    status: installed ? "pass" : "warn",
+    message: acpText(key, fallback, values),
+    fixes: [
+      {
+        label: acpText("adapter.learnMore", "Learn more"),
+        kind: "open_url",
+        payload: adapter.docs_url,
+      },
+    ],
+  }
+}
+
 // `uvReady` reports whether the uv runtime (uvx) is installed — only meaningful
-// for uvx agents (Hermes). Derived from the uv preflight check by the caller.
-// uvx agents need uv installed before their package can be prepared, so when
-// uv isn't ready every managed install/upgrade action is surfaced disabled and
-// the user is pointed at the separate "Install uv" preflight action.
+// for uvx agents (custom Python-package agents; built-in Hermes moved to the
+// npm bridge). Derived from the uv preflight check by the caller. uvx agents
+// need uv installed before their package can be prepared, so when uv isn't
+// ready every managed install/upgrade action is surfaced disabled and the
+// user is pointed at the separate "Install uv" preflight action.
 export function buildVersionCheck(
   agent: AcpAgentInfo,
   uvReady: boolean = true
@@ -3382,11 +3609,11 @@ export function buildVersionCheck(
   const uninstallAction: RunningActionKind =
     agent.distribution_type === "binary" ? "uninstall_binary" : "uninstall_npx"
 
-  // uvx agents (Hermes) need the uv runtime before any managed install/upgrade
-  // can run. Surface a single blocked state pointing at the separate "Install
+  // uvx agents need the uv runtime before any managed install/upgrade can
+  // run. Surface a single blocked state pointing at the separate "Install
   // uv" preflight action below, with the agent-install action shown disabled.
   // This covers both the fresh case (available=false) and the rare system-CLI
-  // case (available=true via a global `hermes`, but uvx still missing).
+  // case (available=true via the agent's own PATH CLI, but uvx still missing).
   // Uninstall stays available even without uv — it only clears the prepared
   // marker — so a prepared package can still be removed when uv is gone.
   if (agent.distribution_type === "uvx" && !uvReady) {
@@ -3610,7 +3837,13 @@ export function getAgentChecks(
       fixes: [...check.fixes],
     })
   )
-  return versionCheck ? [versionCheck, ...remoteChecks] : remoteChecks
+  // The adapter explainer goes FIRST: it answers "why does this say not
+  // installed when I have the CLI?" before the Version Status card below it
+  // offers the Install that fixes it.
+  const adapterCheck = buildAcpAdapterCheck(current?.result?.adapter)
+  return [adapterCheck, versionCheck, ...remoteChecks].filter(
+    (check): check is UiCheckItem => check != null
+  )
 }
 
 interface AgentReorderItemProps {
@@ -3683,6 +3916,7 @@ function AgentReorderItem({
 }
 
 export function AcpAgentSettings() {
+  const ime = useImeGuard()
   const locale = useLocale()
   const t = useTranslations("AcpAgentSettings")
   const rawTranslator = t as unknown as AcpTranslator
@@ -3894,10 +4128,11 @@ export function AcpAgentSettings() {
         }
 
         // Re-sync `available` from the authoritative backend status. It is
-        // recomputed live (e.g. `uvx_agent_launchable` for Hermes), so an
-        // install that provisions the runtime flips it true here — otherwise
-        // the version-status panel would stay stuck on the unavailable /
-        // "runtime not ready" branch with the freshly installed version shown.
+        // recomputed live (e.g. `uvx_agent_launchable` for custom uvx
+        // agents), so an install that provisions the runtime flips it true
+        // here — otherwise the version-status panel would stay stuck on the
+        // unavailable / "runtime not ready" branch with the freshly installed
+        // version shown.
         if (statusState.status === "fulfilled") {
           setAgents((prev) => {
             let changed = false
@@ -7160,6 +7395,18 @@ export function AcpAgentSettings() {
                     <Badge variant="outline" className="shrink-0">
                       {selectedAgent.distribution_type}
                     </Badge>
+                    {/* Names the thing codeg actually installs, right next to
+                        the vendor's name — so the split is visible even before
+                        anyone reads the preflight card below. */}
+                    {selectedAgent.is_acp_adapter && (
+                      <Badge
+                        variant="secondary"
+                        className="shrink-0"
+                        title={t("adapter.badgeHint")}
+                      >
+                        {t("adapter.badge")}
+                      </Badge>
+                    )}
                     {isCustomAgentType(selectedAgent.agent_type) && (
                       <Badge variant="secondary" className="shrink-0">
                         {t("customAgentBadge")}
@@ -7317,6 +7564,36 @@ export function AcpAgentSettings() {
                       disabled={selectedGrokSaving}
                     />
                     <div className="pointer-events-none absolute inset-0 rounded-md bg-background/10 backdrop-blur-[3px] transition-opacity duration-200 group-focus-within:opacity-0" />
+                  </div>
+                  {/*
+                    Backed by the same `envText` draft as the textarea above,
+                    not self-persisting: saving on toggle would also commit
+                    whatever unsaved edits the textarea happens to hold. One
+                    Save button owns both.
+                  */}
+                  <div className="flex items-start justify-between gap-3 rounded-md border bg-muted/10 p-3">
+                    <div className="space-y-1">
+                      <label className="text-xs font-medium">
+                        {t("hostTools.label")}
+                      </label>
+                      <p className="text-[11px] text-muted-foreground">
+                        {t("hostTools.description")}
+                      </p>
+                    </div>
+                    <Switch
+                      checked={hostToolsAgentModeEnabled(selectedDraft.envText)}
+                      onCheckedChange={(checked) => {
+                        updateSelectedDraft((current) => ({
+                          ...current,
+                          envText: setHostToolsAgentMode(
+                            current.envText,
+                            checked
+                          ),
+                        }))
+                      }}
+                      disabled={selectedGrokSaving}
+                      aria-label={t("hostTools.label")}
+                    />
                   </div>
                   <div className="flex justify-end">
                     <Button
@@ -7774,6 +8051,15 @@ export function AcpAgentSettings() {
                             ))}
                           </SelectContent>
                         </Select>
+                        {/* `untrusted` has no equivalent in codex-acp's three
+                            approval presets, so an ACP session cannot honor it
+                            (#442). Say so where the user picks it, rather than
+                            letting it look effective. */}
+                        {selectedDraft.codexApprovalPolicy === "untrusted" ? (
+                          <p className="text-[10px] text-yellow-500">
+                            {t("codex.approvalPolicyUntrustedAcpWarning")}
+                          </p>
+                        ) : null}
                       </div>
 
                       {selectedDraft.codexApprovalPolicy === "granular" ? (
@@ -7843,6 +8129,13 @@ export function AcpAgentSettings() {
                         </Select>
                         <p className="text-[10px] text-muted-foreground">
                           {t("codex.sandboxModeHint")}
+                        </p>
+                        {/* Sandbox mode is what codeg maps onto the session's
+                            starting approval preset (#442), so it reaches
+                            ordinary prompts even though approval_policy does
+                            not. Worth stating next to the control that does it. */}
+                        <p className="text-[10px] text-muted-foreground">
+                          {t("codex.sandboxModeSeedsPresetHint")}
                         </p>
                       </div>
 
@@ -8956,7 +9249,14 @@ supports_websockets = true`}
                                                             modelId
                                                           )
                                                         }}
+                                                        {...ime.props}
                                                         onKeyDown={(event) => {
+                                                          if (
+                                                            ime.isComposing(
+                                                              event
+                                                            )
+                                                          )
+                                                            return
                                                           if (
                                                             event.key ===
                                                             "Enter"
@@ -9106,6 +9406,19 @@ supports_websockets = true`}
                         </div>
                       )}
                     </div>
+
+                    {/*
+                      The editor owns the `permission` key and hands back a
+                      whole rewritten document, so it goes through the same
+                      path as the raw JSON box below — draft-only, like the
+                      model fields above, with the card's Save button doing
+                      the write to opencode.json.
+                    */}
+                    <OpenCodePermissionsSection
+                      configText={selectedDraft.configText}
+                      onChange={handleConfigTextChange}
+                      disabled={selectedIsSavingConfig}
+                    />
 
                     <div className="space-y-1.5">
                       <label className="text-[11px] text-muted-foreground">
@@ -10280,56 +10593,67 @@ supports_websockets = true`}
                   // channel that works for every agent, so they are the whole
                   // surface — plus the skills declaration and removing the
                   // agent.
+                  // All four blocks share the settings-card vocabulary
+                  // (`SettingCard` / `SettingRow`, as in the task settings
+                  // dialog) so the panel reads as one stack of settings rather
+                  // than four differently-shaped boxes.
                   <>
-                    <div className="space-y-3 rounded-md border bg-muted/10 p-3">
-                      <div>
-                        <label className="text-xs font-medium">
-                          {t("customAgentEdit")}
-                        </label>
-                        <p className="mt-1 text-[11px] text-muted-foreground">
-                          {t("customAgentEditHint")}
-                        </p>
-                      </div>
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        onClick={() =>
-                          setEditCustomAgentId(
-                            customAgentId(selectedAgent.agent_type)
-                          )
+                    <SettingCard>
+                      <SettingRow
+                        icon={Pencil}
+                        title={t("customAgentEdit")}
+                        description={t("customAgentEditHint")}
+                        control={
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() =>
+                              setEditCustomAgentId(
+                                customAgentId(selectedAgent.agent_type)
+                              )
+                            }
+                          >
+                            <Pencil className="h-3.5 w-3.5" />
+                            {t("customAgentEdit")}
+                          </Button>
                         }
-                      >
-                        <Pencil className="h-3.5 w-3.5" />
-                        {t("customAgentEdit")}
-                      </Button>
-                    </div>
+                      />
+                    </SettingCard>
                     <CustomAgentSkillsToggle
                       registryId={customAgentId(selectedAgent.agent_type) ?? ""}
                     />
-                    <div className="space-y-3 rounded-md border border-destructive/30 bg-destructive/5 p-3">
-                      <div>
-                        <label className="text-xs font-medium text-destructive">
-                          {t("customAgentRemove")}
-                        </label>
-                        <p className="mt-1 text-[11px] text-muted-foreground">
-                          {t("customAgentRemoveHint")}
-                        </p>
-                      </div>
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        className="text-destructive hover:text-destructive"
-                        disabled={removingCustomAgent}
-                        onClick={() => setRemoveConfirmAgent(selectedAgent)}
-                      >
-                        {removingCustomAgent ? (
-                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                        ) : (
-                          <Trash2 className="h-3.5 w-3.5" />
-                        )}
-                        {t("customAgentRemove")}
-                      </Button>
-                    </div>
+                    <CustomAgentMcpToggle
+                      registryId={customAgentId(selectedAgent.agent_type) ?? ""}
+                    />
+                    {/* The one destructive action keeps its own tinting — the
+                        card shape is shared, the color is the warning. */}
+                    <SettingCard className="border-destructive/30 bg-destructive/5">
+                      <SettingRow
+                        icon={Trash2}
+                        title={
+                          <span className="text-destructive">
+                            {t("customAgentRemove")}
+                          </span>
+                        }
+                        description={t("customAgentRemoveHint")}
+                        control={
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            className="text-destructive hover:text-destructive"
+                            disabled={removingCustomAgent}
+                            onClick={() => setRemoveConfirmAgent(selectedAgent)}
+                          >
+                            {removingCustomAgent ? (
+                              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                            ) : (
+                              <Trash2 className="h-3.5 w-3.5" />
+                            )}
+                            {t("customAgentRemove")}
+                          </Button>
+                        }
+                      />
+                    </SettingCard>
                   </>
                 ) : (
                   <div className="space-y-3 rounded-md border bg-muted/10 p-3">
@@ -11095,7 +11419,9 @@ supports_websockets = true`}
               value={customVersionInput}
               placeholder={customInstallAgent?.registry_version ?? "1.0.0"}
               onChange={(e) => setCustomVersionInput(e.target.value)}
+              {...ime.props}
               onKeyDown={(e) => {
+                if (ime.isComposing(e)) return
                 if (
                   e.key === "Enter" &&
                   isValidCustomVersion(customVersionInput)

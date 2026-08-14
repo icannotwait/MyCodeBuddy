@@ -89,12 +89,8 @@ impl InternalAgentSessionRegistry {
         }))
     }
 
-    /// Empty registry for freshly migrated test fixtures (no pre-existing rows).
-    #[cfg(any(test, feature = "test-utils"))]
-    pub fn new_empty_for_test(
-        conn: DatabaseConnection,
-        data_dir: &Path,
-    ) -> Result<Arc<Self>, DbError> {
+    /// Empty registry for tests and non-interactive parsers (token-usage sync).
+    pub fn empty(conn: DatabaseConnection, data_dir: &Path) -> Result<Arc<Self>, DbError> {
         let reserved_root = ensure_reserved_root(data_dir)?;
         Ok(Arc::new(Self {
             conn,
@@ -102,6 +98,15 @@ impl InternalAgentSessionRegistry {
             ids: Arc::new(Mutex::new(Arc::new(HashSet::new()))),
             reserved_root,
         }))
+    }
+
+    /// Empty registry for freshly migrated test fixtures (no pre-existing rows).
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn new_empty_for_test(
+        conn: DatabaseConnection,
+        data_dir: &Path,
+    ) -> Result<Arc<Self>, DbError> {
+        Self::empty(conn, data_dir)
     }
 
     /// Absolute canonical reserved parent: `<data_dir>/internal/title-runs`.

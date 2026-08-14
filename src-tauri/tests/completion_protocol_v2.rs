@@ -3233,8 +3233,8 @@ async fn run_session_2889_fixture() -> Session2889Result {
         .count(&db.conn)
         .await
         .unwrap();
-    let continuation = with_historical_workflow_fixture_mutations(
-        broker.continue_delegation(ContinueDelegationRequest {
+    let continuation = with_historical_workflow_fixture_mutations(broker.continue_delegation(
+        ContinueDelegationRequest {
             parent_connection_id: "session-2889-parent".into(),
             parent_conversation_id: parent,
             parent_tool_use_id: "session-2889-card-reemit".into(),
@@ -3244,8 +3244,8 @@ async fn run_session_2889_fixture() -> Session2889Result {
             external_handle: None,
             correlation_id: None,
             recovery_authorization_id: None,
-        }),
-    )
+        },
+    ))
     .await;
     let persisted_runs = delegation_task_run::Entity::find()
         .filter(delegation_task_run::Column::ParentConversationId.eq(parent))
@@ -4420,8 +4420,8 @@ async fn aggregate_broker(
     let runs = Arc::new(RunStore::new(db));
     let mock = Arc::new(MockSpawner::new());
     let events = Arc::new(MockEventEmitter::new());
-    let task_store =
-        Arc::new(DbDelegationTaskStore::from_run_store(runs.clone())) as Arc<dyn DelegationTaskStore>;
+    let task_store = Arc::new(DbDelegationTaskStore::from_run_store(runs.clone()))
+        as Arc<dyn DelegationTaskStore>;
     let broker = Arc::new(
         DelegationBroker::with_writers(
             mock.clone() as Arc<dyn ConnectionSpawner>,
@@ -4513,7 +4513,10 @@ async fn v2_only_aggregate_acceptance() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(bound_run.work_unit_key.as_deref(), Some(work_unit_key.as_str()));
+    assert_eq!(
+        bound_run.work_unit_key.as_deref(),
+        Some(work_unit_key.as_str())
+    );
 
     materialize_v2_fixture_run(
         &db,
@@ -4572,10 +4575,7 @@ async fn v2_only_aggregate_acceptance() {
         },
     )
     .await;
-    assert_eq!(
-        legacy_mutation.unwrap_err().code(),
-        "workflow_v2_retired"
-    );
+    assert_eq!(legacy_mutation.unwrap_err().code(), "workflow_v2_retired");
 
     // Dangling terminal: bind against a live v2 workflow, delete the header,
     // then settle through broker so row/wait/event share one stable code.
@@ -4608,7 +4608,8 @@ async fn v2_only_aggregate_acceptance() {
     .await
     .unwrap();
     let (_runs, events, broker, mock) = aggregate_broker(dangling_db.clone()).await;
-    mock.queue_spawn(Ok("aggregate-dangling-child".into())).await;
+    mock.queue_spawn(Ok("aggregate-dangling-child".into()))
+        .await;
     mock.queue_send(Ok(accepted(0, Utc::now()))).await;
     let dangling_request = DelegationRequest {
         parent_connection_id: "aggregate-parent".into(),
@@ -4626,10 +4627,8 @@ async fn v2_only_aggregate_acceptance() {
         correlation_id: None,
         recovery_authorization_id: None,
     };
-    let dangling_report = with_historical_workflow_fixture_mutations(
-        broker.start_delegation(dangling_request),
-    )
-    .await;
+    let dangling_report =
+        with_historical_workflow_fixture_mutations(broker.start_delegation(dangling_request)).await;
     assert_eq!(
         dangling_report.status,
         TaskStatus::Running,
@@ -4728,8 +4727,11 @@ async fn v2_only_aggregate_acceptance() {
     // Standalone (no workflow binding) still materializes display Card JSON.
     let standalone_workspace = tempfile::tempdir().expect("standalone workspace");
     let standalone_db = Arc::new(fresh_in_memory_db().await);
-    let standalone_folder =
-        seed_folder(&standalone_db, standalone_workspace.path().to_str().unwrap()).await;
+    let standalone_folder = seed_folder(
+        &standalone_db,
+        standalone_workspace.path().to_str().unwrap(),
+    )
+    .await;
     let standalone_parent =
         seed_conversation(&standalone_db, standalone_folder, AgentType::Codex).await;
     let (_runs, _events, standalone_broker, standalone_mock) =
@@ -4748,12 +4750,7 @@ async fn v2_only_aggregate_acceptance() {
             agent_type: AgentType::Codex,
             profile_id: None,
             task: "standalone card aggregate".into(),
-            working_dir: Some(
-                standalone_workspace
-                    .path()
-                    .to_string_lossy()
-                    .into_owned(),
-            ),
+            working_dir: Some(standalone_workspace.path().to_string_lossy().into_owned()),
             requested_working_dir: None,
             external_handle: None,
             work_unit_key: None,

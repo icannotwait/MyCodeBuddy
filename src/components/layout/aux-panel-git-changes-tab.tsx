@@ -9,7 +9,22 @@ import {
   useRef,
   useState,
 } from "react"
-import { ChevronsDownUp, ChevronsUpDown, GitBranch } from "lucide-react"
+import {
+  Archive,
+  ArchiveRestore,
+  ChevronsDownUp,
+  ChevronsUpDown,
+  CloudDownload,
+  CloudSync,
+  CloudUpload,
+  GitBranch,
+  GitCommitHorizontal,
+  Loader2,
+  MoreHorizontal,
+  PlusCircle,
+  RefreshCw,
+  Undo2,
+} from "lucide-react"
 import { useTranslations } from "next-intl"
 import { toast } from "sonner"
 import {
@@ -27,6 +42,7 @@ import {
   FileTreeFolder,
 } from "@/components/ai-elements/file-tree"
 import { Button } from "@/components/ui/button"
+import { Input } from "@/components/ui/input"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import {
   ContextMenu,
@@ -34,16 +50,27 @@ import {
   ContextMenuItem,
   ContextMenuTrigger,
 } from "@/components/ui/context-menu"
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu"
 import { Skeleton } from "@/components/ui/skeleton"
 import { useActiveFolder } from "@/contexts/active-folder-context"
 import { useTabStore } from "@/contexts/tab-context"
 import { useWorkspaceActions } from "@/contexts/workspace-context"
 import { useWorkspaceStateStore } from "@/hooks/use-workspace-state-store"
+import { useGitQuickActions } from "@/hooks/use-git-quick-actions"
+import { useImeGuard } from "@/hooks/use-ime-guard"
 import { AuxPanelNoFolderEmpty } from "@/components/layout/aux-panel-no-folder-empty"
+import { GIT_TOOLBAR_ICON_BUTTON_CLASS } from "@/components/layout/git-toolbar-controls"
 import { WorkspaceDegradedBanner } from "@/components/layout/workspace-degraded-banner"
 import {
   deleteFileTreeEntry,
   gitAddFiles,
+  gitCommit,
   gitRollbackFile,
   gitStatus,
   openCommitWindow,
@@ -458,9 +485,13 @@ function canOpenFile(status: string): boolean {
 }
 
 export function GitChangesTab() {
+  const ime = useImeGuard()
   const t = useTranslations("Folder.gitChangesTab")
   const tCommon = useTranslations("Folder.common")
   const tFileTree = useTranslations("Folder.fileTreeTab")
+  // The toolbar's git operations reuse the branch selector's wording verbatim —
+  // same actions, so the same labels.
+  const tBranch = useTranslations("Folder.branchDropdown")
   // Defer the folder so a cross-folder conversation-tab switch commits first and
   // this tab's heavy rebuild (buildChangeFileTree + auto-expand + up to
   // MAX_VISIBLE_ROWS ContextMenu rows) runs in a non-blocking transition a frame
@@ -511,6 +542,8 @@ export function GitChangesTab() {
   const [directoryGitError, setDirectoryGitError] = useState<string | null>(
     null
   )
+  const [commitMessage, setCommitMessage] = useState("")
+  const [committing, setCommitting] = useState(false)
 
   const hasHydratedTrackedPaths = useRef(false)
   const hasHydratedUntrackedPaths = useRef(false)
@@ -731,6 +764,71 @@ export function GitChangesTab() {
       })
     })
   }, [folder, t])
+
+  // Pull / fetch / push / stash for the toolbar's "more" menu, sharing the
+  // branch selector's task tracking, credential retry and conflict dialog.
+  // A pull or stash rewrites the working tree, so resync the change list
+  // directly instead of waiting on the file watcher (and, in server mode, on a
+  // `folder://git-branch-changed` that is never delivered — it goes out over
+  // the Tauri bridge only).
+  const gitActions = useGitQuickActions({
+    folderId: folder?.id ?? null,
+    folderPath: folder?.path ?? null,
+    onCompleted: () => {
+      void workspaceState.requestResync("git_action:quick_action")
+    },
+  })
+
+  // Quick commit takes every TRACKED change — untracked files are never staged
+  // implicitly, so an unignored build directory can't ride along.
+  const trackedPaths = useMemo(
+    () => trackedChanges.map((change) => change.path),
+    [trackedChanges]
+  )
+  const canQuickCommit =
+    commitMessage.trim().length > 0 && trackedPaths.length > 0 && !committing
+
+  const handleQuickCommit = useCallback(async () => {
+    const message = commitMessage.trim()
+    if (!folder || !message || trackedPaths.length === 0 || committing) return
+
+    setCommitting(true)
+    try {
+      const result = await gitCommit(
+        folder.path,
+        message,
+        trackedPaths,
+        folder.id
+      )
+      setCommitMessage("")
+      // `git_commit_core` also broadcasts `folder://git-commit-succeeded`, and
+      // every mounted BranchDropdown (one per conversation tile) toasts on it.
+      // Keying all of them to the same folder-scoped id makes sonner UPDATE one
+      // toast instead of stacking N — while still guaranteeing feedback here
+      // when no tile is mounted at all (e.g. the Automations route).
+      toast.success(tBranch("toasts.commitCodeCompleted"), {
+        id: `git-commit-succeeded:${folder.id}`,
+        description: tBranch("toasts.committedFiles", {
+          count: result.committed_files,
+        }),
+      })
+      await workspaceState.requestResync("git_action:commit")
+    } catch (error) {
+      toast.error(t("toasts.commitFailed"), {
+        description: toErrorMessage(error),
+      })
+    } finally {
+      setCommitting(false)
+    }
+  }, [
+    commitMessage,
+    committing,
+    folder,
+    t,
+    tBranch,
+    trackedPaths,
+    workspaceState,
+  ])
   const handleAttachToSession = useCallback(
     (relativePath: string) => {
       if (!activeSessionTabId || !folder?.path) return
@@ -990,11 +1088,14 @@ export function GitChangesTab() {
   // Close in-panel dialogs the instant the ACTIVE folder changes (keyed on the
   // live id, not the deferred `folder?.path`) so a dialog opened under the
   // previous folder can't act (delete / rollback / batch) against the new one
-  // after the deferred render settles and the dialog re-mounts.
+  // after the deferred render settles and the dialog re-mounts. The draft commit
+  // message is dropped for the same reason: it describes the PREVIOUS folder's
+  // changes and must not be committable against the new one.
   useEffect(() => {
     loadGenRef.current++
     setRollbackTarget(null)
     setDeleteTarget(null)
+    setCommitMessage("")
     resetDirectoryGitActionDialog()
   }, [activeFolder?.id, resetDirectoryGitActionDialog])
 
@@ -1384,6 +1485,131 @@ export function GitChangesTab() {
 
   return (
     <div className="flex flex-col h-full min-h-0">
+      {/* Toolbar: type a message and commit right here with Enter, or reach the
+          same git operations the branch selector offers. Just a text field and
+          one round "more" circle — no commit button: Enter is the submit (the
+          placeholder says so) and the menu's "commit code" row opens the full
+          commit window, so a dedicated button would only repeat what both
+          already do. The circle matches the commits tab's header, so the two
+          tabs read as one panel. Hidden on a non-repo folder — there is nothing
+          to commit to (the body shows the "not a repo" hint). */}
+      {workspaceState.isGitRepo && (
+        <div className="flex h-10 shrink-0 items-center gap-1 border-b border-border/50 px-2">
+          <Input
+            value={commitMessage}
+            onChange={(event) => setCommitMessage(event.target.value)}
+            {...ime.props}
+            onKeyDown={(event) => {
+              // Never submit mid-IME-composition: a CJK candidate is confirmed
+              // with Enter, which must not also fire the commit.
+              if (ime.isComposing(event)) return
+              if (event.key === "Enter" && canQuickCommit) {
+                event.preventDefault()
+                void handleQuickCommit()
+              }
+            }}
+            disabled={committing}
+            placeholder={t("quickCommit.placeholder")}
+            aria-label={t("quickCommit.placeholder")}
+            className="h-8 min-w-0 flex-1 border-0 bg-transparent px-1.5 text-xs shadow-none focus-visible:ring-0"
+          />
+          {/* With no button to grey out, this is the only sign a commit is in
+              flight besides the disabled field — so it stays. */}
+          {committing && (
+            <Loader2 className="size-3.5 shrink-0 animate-spin text-muted-foreground" />
+          )}
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button
+                variant="ghost"
+                size="icon"
+                className={GIT_TOOLBAR_ICON_BUTTON_CLASS}
+                title={t("actions.moreActions")}
+                aria-label={t("actions.moreActions")}
+              >
+                <MoreHorizontal className="size-3.5" />
+              </Button>
+            </DropdownMenuTrigger>
+            {/* Blocked like the branch selector's operation list: incoming |
+                outgoing | stash | working tree | refresh. */}
+            <DropdownMenuContent align="end" className="w-56">
+              <DropdownMenuItem
+                disabled={gitActions.running}
+                onSelect={gitActions.pull}
+              >
+                <CloudDownload />
+                {tBranch("pullCode")}
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                disabled={gitActions.running}
+                onSelect={gitActions.fetchAll}
+              >
+                <CloudSync />
+                {tBranch("fetchRemoteBranches")}
+              </DropdownMenuItem>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem onSelect={handleOpenCommitWindow}>
+                <GitCommitHorizontal />
+                {tBranch("openCommitWindow")}
+              </DropdownMenuItem>
+              {/* Wrapped, not passed bare: onSelect hands the handler an Event,
+                  which openPushWindow would read as the branch to push. */}
+              <DropdownMenuItem onSelect={() => gitActions.openPushWindow()}>
+                <CloudUpload />
+                {tBranch("pushCode")}
+              </DropdownMenuItem>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem onSelect={gitActions.openStashDialog}>
+                <Archive />
+                {tBranch("stashChanges")}
+              </DropdownMenuItem>
+              <DropdownMenuItem onSelect={gitActions.openUnstashWindow}>
+                <ArchiveRestore />
+                {tBranch("stashPop")}
+              </DropdownMenuItem>
+              <DropdownMenuSeparator />
+              {/* Both fan out to the existing file-picker dialog, so neither is
+                  a blind bulk write. */}
+              <DropdownMenuItem
+                disabled={untrackedChanges.length === 0}
+                onSelect={() => {
+                  void handleAddToVcs({
+                    kind: "dir",
+                    path: "",
+                    name: folderName,
+                  })
+                }}
+              >
+                <PlusCircle />
+                {t("actions.addAllToVcs")}
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                variant="destructive"
+                disabled={trackedChanges.length === 0}
+                onSelect={() => {
+                  handleRequestRollback({
+                    kind: "dir",
+                    path: "",
+                    name: folderName,
+                  })
+                }}
+              >
+                <Undo2 />
+                {t("actions.rollbackAll")}
+              </DropdownMenuItem>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem
+                onSelect={() => {
+                  void workspaceState.requestResync("git_action:manual_refresh")
+                }}
+              >
+                <RefreshCw />
+                {t("actions.refresh")}
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        </div>
+      )}
       {workspaceState.degraded && (
         <WorkspaceDegradedBanner onRetry={workspaceState.restart} />
       )}
@@ -1411,7 +1637,14 @@ export function GitChangesTab() {
           <div className="space-y-2 pb-2">
             {trackedChanges.length > 0 && (
               <section className="space-y-1">
-                <div className="flex items-center justify-between px-2 py-1 text-[11px] text-muted-foreground">
+                {/* px-3.5 lines this row up with the toolbar above rather than
+                    with the panel edge: the label lands on the 14px guide the
+                    commit field's placeholder sits on (8px bar padding + the
+                    field's own 6px), and the 14px chevron — inset 3px inside its
+                    20px button — ends 17px from the right, exactly where the
+                    toolbar's "more" glyph ends (8px + the 9px inset of a 14px
+                    glyph in a 32px circle). */}
+                <div className="flex items-center justify-between px-3.5 py-1 text-[11px] text-muted-foreground">
                   <span>
                     {t("trackedChanges", { count: trackedChanges.length })}
                   </span>
@@ -1528,7 +1761,8 @@ export function GitChangesTab() {
 
             {untrackedChanges.length > 0 && (
               <section className="space-y-1">
-                <div className="flex items-center justify-between px-2 py-1 text-[11px] text-muted-foreground">
+                {/* px-3.5 for the same alignment as the tracked header above. */}
+                <div className="flex items-center justify-between px-3.5 py-1 text-[11px] text-muted-foreground">
                   <span>
                     {t("untrackedFiles", { count: untrackedChanges.length })}
                   </span>
@@ -1874,6 +2108,8 @@ export function GitChangesTab() {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+
+      {gitActions.dialogs}
     </div>
   )
 }

@@ -1,0 +1,1072 @@
+//! Work-task CRUD + engine-dispatched commands. The `*_core` fns are
+//! mode-agnostic and shared by the Tauri wrappers and the Axum handlers.
+//! Anything that launches, cancels, merges, or touches a worktree routes
+//! through the process-global task engine (per-folder git mutex + run_seq
+//! generations live there); a process that does not hold the engine lock gets
+//! a clean "engine not running" error.
+
+use crate::app_error::AppCommandError;
+use crate::commands::folders::{get_folder_core, git_diff_with_branch};
+use crate::db::entities::work_task::WorkTaskStatus;
+use crate::db::error::DbError;
+use crate::db::service::work_task_service;
+use crate::db::AppDatabase;
+use crate::models::{
+    FollowUpIntent, WorkTaskChangedFile, WorkTaskDraft, WorkTaskEventInfo, WorkTaskFolderSettings,
+    WorkTaskInfo, WorkTaskTemplateDraft, WorkTaskTemplateInfo,
+};
+use crate::web::event_bridge::{emit_event, EventEmitter, WorkTaskChange, WORK_TASK_CHANGED_EVENT};
+
+fn engine() -> Result<std::sync::Arc<crate::work_task::TaskEngine>, DbError> {
+    crate::work_task::engine()
+        .ok_or_else(|| DbError::Validation("task engine not running".to_string()))
+}
+
+/// Best-effort pump nudge so an auto_process folder reacts to creates, edits,
+/// requeues and settings changes without waiting for the reconcile tick. A
+/// process not holding the engine lock skips it — the owning process's tick
+/// picks the change up from the DB.
+fn nudge_pump(folder_id: i32) {
+    if let Some(engine) = crate::work_task::engine() {
+        tokio::spawn(async move { engine.pump_folder(folder_id).await });
+    }
+}
+
+/// Best-effort sweep of planned starts, for the one case the 15s tick handles
+/// visibly late: a time that is already in the past when it is set.
+fn nudge_schedule() {
+    if let Some(engine) = crate::work_task::engine() {
+        tokio::spawn(async move { engine.claim_due_scheduled().await });
+    }
+}
+
+/// Best-effort merge-pump nudge after a settings change: switching auto-merge
+/// on should drain the review backlog now, not at the next reconcile tick.
+/// Scope 0 is the global row, which any folder without its own row follows —
+/// that one pumps every folder holding reviewed tasks.
+fn nudge_merge_pump(folder_id: i32) {
+    if let Some(engine) = crate::work_task::engine() {
+        let scope = (folder_id != 0).then_some(folder_id);
+        tokio::spawn(async move { engine.sweep_merge_backlog(scope).await });
+    }
+}
+
+// ── shared business logic (both modes) ──────────────────────────────────────
+
+pub async fn work_task_list_core(
+    db: &AppDatabase,
+    folder_id: Option<i32>,
+) -> Result<Vec<WorkTaskInfo>, DbError> {
+    let mut infos = work_task_service::list(&db.conn, folder_id).await?;
+    annotate_worktree_missing(db, &mut infos).await?;
+    annotate_agent_type(db, &mut infos).await?;
+    Ok(infos)
+}
+
+pub async fn work_task_get_core(db: &AppDatabase, id: i32) -> Result<WorkTaskInfo, DbError> {
+    let mut infos = vec![work_task_service::get(&db.conn, id).await?];
+    annotate_worktree_missing(db, &mut infos).await?;
+    annotate_agent_type(db, &mut infos).await?;
+    Ok(infos.pop().expect("annotated the one row"))
+}
+
+/// Stamp `worktree_missing` on every row whose recorded worktree can no longer
+/// serve a merge: its folder row was removed, or its directory is gone from
+/// disk. One batched folder query plus a stat per distinct worktree — cheap
+/// enough for every list, and the board needs it live: a reviewed task whose
+/// worktree vanished must offer "complete" instead of a merge that can only
+/// fail.
+async fn annotate_worktree_missing(
+    db: &AppDatabase,
+    infos: &mut [WorkTaskInfo],
+) -> Result<(), DbError> {
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+
+    let ids: std::collections::BTreeSet<i32> =
+        infos.iter().filter_map(|t| t.worktree_folder_id).collect();
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let live_paths: std::collections::HashMap<i32, String> =
+        crate::db::entities::folder::Entity::find()
+            .filter(crate::db::entities::folder::Column::Id.is_in(ids.iter().copied()))
+            .filter(crate::db::entities::folder::Column::DeletedAt.is_null())
+            .all(&db.conn)
+            .await?
+            .into_iter()
+            .map(|f| (f.id, f.path))
+            .collect();
+    let on_disk: std::collections::HashMap<i32, bool> = ids
+        .iter()
+        .map(|id| {
+            let present = live_paths
+                .get(id)
+                .is_some_and(|path| std::path::Path::new(path).exists());
+            (*id, present)
+        })
+        .collect();
+    for info in infos.iter_mut() {
+        if let Some(wt_id) = info.worktree_folder_id {
+            info.worktree_missing = !on_disk.get(&wt_id).copied().unwrap_or(false);
+        }
+    }
+    Ok(())
+}
+
+/// Stamp `agent_type` on every row: the agent that runs — or ran — this task,
+/// which both task views draw beside the title. The client cannot resolve it
+/// itself, because an inheriting task's agent lives in the folder's settings
+/// rather than on the row, so the whole list is resolved here in three batched
+/// queries instead of a lookup per card.
+///
+/// The engine's own layering (`effective_agent_config`) with the conversation
+/// in front: a task that already ran is named by the agent that actually ran
+/// it, then by its own override, then by the folder's task settings (its own
+/// row wholesale, else the global one — `settings_get_effective`'s rule), then
+/// by the folder's default agent. All four empty leaves `None`, which is
+/// exactly the state the engine refuses to launch.
+async fn annotate_agent_type(db: &AppDatabase, infos: &mut [WorkTaskInfo]) -> Result<(), DbError> {
+    use crate::db::entities::{conversation, folder, work_task_settings};
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+    use std::collections::{BTreeSet, HashMap};
+    use work_task_service::GLOBAL_SETTINGS_FOLDER_ID;
+
+    if infos.is_empty() {
+        return Ok(());
+    }
+
+    // Every source read here already stores a wire name ("claude_code",
+    // "custom:<id>"), which is what the client keys its icon map on — so these
+    // strings pass through verbatim.
+    let conv_ids: BTreeSet<i32> = infos.iter().filter_map(|t| t.conversation_id).collect();
+    let conv_agents: HashMap<i32, String> = if conv_ids.is_empty() {
+        HashMap::new()
+    } else {
+        conversation::Entity::find()
+            .filter(conversation::Column::Id.is_in(conv_ids.iter().copied()))
+            .all(&db.conn)
+            .await?
+            .into_iter()
+            .map(|c| (c.id, c.agent_type))
+            .collect()
+    };
+
+    let folder_ids: BTreeSet<i32> = infos.iter().map(|t| t.folder_id).collect();
+    let folder_defaults: HashMap<i32, String> = folder::Entity::find()
+        .filter(folder::Column::Id.is_in(folder_ids.iter().copied()))
+        .all(&db.conn)
+        .await?
+        .into_iter()
+        .filter_map(|f| f.default_agent_type.map(|agent| (f.id, agent)))
+        .collect();
+
+    // Every settings row the list can consult, in one query: the folders it
+    // spans plus the global row they fall back to. An unparseable row is
+    // dropped rather than defaulted, so it falls through to the global one
+    // exactly as `settings_get_effective` would.
+    let settings_ids: BTreeSet<i32> = folder_ids
+        .iter()
+        .copied()
+        .chain(std::iter::once(GLOBAL_SETTINGS_FOLDER_ID))
+        .collect();
+    let settings_agents: HashMap<i32, Option<String>> = work_task_settings::Entity::find()
+        .filter(work_task_settings::Column::FolderId.is_in(settings_ids))
+        .all(&db.conn)
+        .await?
+        .into_iter()
+        .filter_map(|row| {
+            serde_json::from_str::<WorkTaskFolderSettings>(&row.config)
+                .ok()
+                .map(|settings| (row.folder_id, settings.default_agent_type))
+        })
+        .collect();
+
+    for info in infos.iter_mut() {
+        let from_conversation = info
+            .conversation_id
+            .and_then(|id| conv_agents.get(&id))
+            .cloned();
+        let own_override = info
+            .config
+            .get("agent_type")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        // A folder that saved settings of its own detaches from the global row
+        // wholesale — including when its agent field is the empty one.
+        let from_settings = settings_agents
+            .get(&info.folder_id)
+            .or_else(|| settings_agents.get(&GLOBAL_SETTINGS_FOLDER_ID))
+            .cloned()
+            .flatten();
+        info.agent_type = from_conversation
+            .or(own_override)
+            .or(from_settings)
+            .or_else(|| folder_defaults.get(&info.folder_id).cloned());
+    }
+    Ok(())
+}
+
+pub async fn work_task_events_core(
+    db: &AppDatabase,
+    task_id: i32,
+    limit: u64,
+) -> Result<Vec<WorkTaskEventInfo>, DbError> {
+    work_task_service::list_events(&db.conn, task_id, limit).await
+}
+
+pub async fn work_task_attention_count_core(db: &AppDatabase) -> Result<u64, DbError> {
+    work_task_service::attention_count(&db.conn).await
+}
+
+pub async fn work_task_create_core(
+    emitter: &EventEmitter,
+    db: &AppDatabase,
+    draft: WorkTaskDraft,
+) -> Result<WorkTaskInfo, DbError> {
+    let info = work_task_service::create(&db.conn, draft).await?;
+    emit_event(
+        emitter,
+        WORK_TASK_CHANGED_EVENT,
+        WorkTaskChange::Upsert { id: info.id },
+    );
+    nudge_pump(info.folder_id);
+    Ok(info)
+}
+
+pub async fn work_task_update_core(
+    emitter: &EventEmitter,
+    db: &AppDatabase,
+    id: i32,
+    draft: WorkTaskDraft,
+) -> Result<WorkTaskInfo, DbError> {
+    let info = work_task_service::update(&db.conn, id, draft).await?;
+    emit_event(
+        emitter,
+        WORK_TASK_CHANGED_EVENT,
+        WorkTaskChange::Upsert { id },
+    );
+    nudge_pump(info.folder_id);
+    Ok(info)
+}
+
+/// How many times a delete re-reads before giving up. A retry only happens when
+/// something claimed the task mid-delete; more than a couple in a row means the
+/// board is fighting the user, and an error is a better answer than a loop.
+const DELETE_ATTEMPTS: usize = 4;
+
+/// Delete a task. An active run is canceled first; `delete_worktree` also
+/// removes its worktree (best-effort — a cleanup failure does not block the
+/// delete, the worktree just stays on disk). Refused while merging.
+///
+/// The whole thing runs as converge-then-tombstone rather than
+/// decide-once-then-write: three arms can claim a `todo` task out from under
+/// this call (the user, the folder's auto-processor, a planned start coming
+/// due), and a tombstone written over a generation that just started would
+/// leave its freshly minted worktree — and possibly its agent process — behind,
+/// with the row that knows about them gone. So the final `soft_delete` is
+/// guarded on the status we validated, and losing that guard sends us round
+/// again to cancel whatever claimed it.
+pub async fn work_task_delete_core(
+    emitter: &EventEmitter,
+    db: &AppDatabase,
+    id: i32,
+    delete_worktree: bool,
+) -> Result<(), DbError> {
+    // Kept only to report the reason if we run out of attempts.
+    let mut last_conflict: Option<String> = None;
+    for _ in 0..DELETE_ATTEMPTS {
+        let task = work_task_service::get_model(&db.conn, id).await?;
+        if task.status == WorkTaskStatus::Merging {
+            return Err(DbError::Validation(
+                "task is merging — wait for it to finish".to_string(),
+            ));
+        }
+        if matches!(
+            task.status,
+            WorkTaskStatus::Queued
+                | WorkTaskStatus::Preparing
+                | WorkTaskStatus::Running
+                | WorkTaskStatus::AwaitingInput
+        ) {
+            // `cancel` waits on the engine's per-task lock, which a launch holds
+            // across its whole setup — so when it returns, that generation has
+            // stopped touching the worktree. A cancel that loses its own CAS
+            // just means the task settled by itself; re-read and decide again
+            // instead of failing the delete.
+            if let Err(e) = engine()?.cancel(id, None).await {
+                last_conflict = Some(e);
+            }
+            continue;
+        }
+        // Read from THIS pass, not from a stale first look: a run that started
+        // and was cancelled above has a worktree the first snapshot never saw.
+        if delete_worktree && task.worktree_folder_id.is_some() {
+            if let Err(e) = engine()?.cleanup_task(id).await {
+                tracing::warn!("[work_task] cleanup during delete of task {id}: {e}");
+            }
+        }
+        if work_task_service::soft_delete(&db.conn, id, task.status).await? {
+            emit_event(
+                emitter,
+                WORK_TASK_CHANGED_EVENT,
+                WorkTaskChange::Deleted { id },
+            );
+            return Ok(());
+        }
+        last_conflict = Some("task was claimed while being deleted".to_string());
+    }
+    Err(DbError::Validation(last_conflict.unwrap_or_else(|| {
+        "task kept changing while being deleted — try again".to_string()
+    })))
+}
+
+/// Persist the pending column's drag order. `sort_order` also drives the
+/// engine's claim/launch order, so reordering queued tasks re-prioritizes them.
+pub async fn work_task_reorder_core(
+    emitter: &EventEmitter,
+    db: &AppDatabase,
+    folder_id: i32,
+    ordered_ids: Vec<i32>,
+) -> Result<(), DbError> {
+    work_task_service::reorder(&db.conn, folder_id, &ordered_ids).await?;
+    emit_event(emitter, WORK_TASK_CHANGED_EVENT, WorkTaskChange::Refresh);
+    nudge_pump(folder_id);
+    Ok(())
+}
+
+pub async fn work_task_start_core(id: i32) -> Result<(), DbError> {
+    engine()?.start(id).await.map_err(DbError::Validation)
+}
+
+/// `folder_id: None` = the global sweep — every folder holding todos.
+pub async fn work_task_start_all_core(folder_id: Option<i32>) -> Result<u32, DbError> {
+    engine()?
+        .start_all(folder_id)
+        .await
+        .map_err(DbError::Validation)
+}
+
+/// failed → queued, optionally with a note explaining what to do differently.
+/// `blocks` carries whatever the note box attached out of band (images, pasted
+/// bytes) as raw prompt blocks.
+pub async fn work_task_retry_core(
+    id: i32,
+    note: Option<String>,
+    blocks: Vec<serde_json::Value>,
+) -> Result<(), DbError> {
+    engine()?
+        .retry(id, note, blocks)
+        .await
+        .map_err(DbError::Validation)
+}
+
+/// canceled → todo. Pure DB (no engine needed) — the user starts it again
+/// explicitly. A cancel usually had a reason; the optional note carries it into
+/// the next run's prompt.
+pub async fn work_task_requeue_core(
+    emitter: &EventEmitter,
+    db: &AppDatabase,
+    id: i32,
+    note: Option<String>,
+    blocks: Vec<serde_json::Value>,
+) -> Result<(), DbError> {
+    if !work_task_service::requeue_canceled(&db.conn, id, note.as_deref(), &blocks).await? {
+        return Err(DbError::Validation("task is not canceled".to_string()));
+    }
+    emit_event(
+        emitter,
+        WORK_TASK_CHANGED_EVENT,
+        WorkTaskChange::Upsert { id },
+    );
+    if let Ok(task) = work_task_service::get_model(&db.conn, id).await {
+        nudge_pump(task.folder_id);
+    }
+    Ok(())
+}
+
+/// Plan when a to-do task starts. `scheduled_at` is an RFC 3339 instant (the
+/// client sends the time the user picked, converted from its own zone);
+/// `None` clears the plan. Pure DB — the engine's schedule tick claims the task
+/// when its time comes, and the nudge below covers a time already in the past.
+pub async fn work_task_schedule_core(
+    emitter: &EventEmitter,
+    db: &AppDatabase,
+    id: i32,
+    scheduled_at: Option<String>,
+) -> Result<(), DbError> {
+    let at = match scheduled_at
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(raw) => Some(
+            chrono::DateTime::parse_from_rfc3339(raw)
+                .map_err(|e| DbError::Validation(format!("invalid scheduled_at: {e}")))?
+                .with_timezone(&chrono::Utc),
+        ),
+        None => None,
+    };
+    if !work_task_service::set_schedule(&db.conn, id, at).await? {
+        return Err(DbError::Validation(
+            "only to-do tasks can be scheduled".to_string(),
+        ));
+    }
+    emit_event(
+        emitter,
+        WORK_TASK_CHANGED_EVENT,
+        WorkTaskChange::Upsert { id },
+    );
+    if at.is_some() {
+        nudge_schedule();
+    }
+    Ok(())
+}
+
+/// Follow up on a reviewed task. `intent` picks the wording the agent receives;
+/// absent means `revise`, the historical "returned with feedback" behaviour.
+pub async fn work_task_return_core(
+    id: i32,
+    feedback: String,
+    intent: Option<String>,
+    blocks: Vec<serde_json::Value>,
+) -> Result<(), DbError> {
+    let intent = FollowUpIntent::from_wire(intent.as_deref()).map_err(DbError::Validation)?;
+    let feedback = feedback.trim().to_string();
+    // A self-check is a complete instruction on its own, and so is an attached
+    // screenshot; everything else is only as good as what the user typed.
+    if feedback.is_empty() && blocks.is_empty() && !intent.allows_empty() {
+        return Err(DbError::Validation("feedback is required".to_string()));
+    }
+    engine()?
+        .return_task(id, intent, feedback, blocks)
+        .await
+        .map_err(DbError::Validation)
+}
+
+/// Stop a task. `reason` is the user's optional note about WHY — it lands on
+/// the `canceled` entry of the progress timeline and nowhere else.
+pub async fn work_task_cancel_core(id: i32, reason: Option<String>) -> Result<(), DbError> {
+    engine()?
+        .cancel(id, reason)
+        .await
+        .map_err(DbError::Validation)
+}
+
+/// Dispatch the merge generation: the agent lands the task in its session and
+/// the outcome rides the `task://changed` events (merging → done, or back to
+/// review with a readable error). This awaits only the dispatch (validation +
+/// agent spawn), so refused merges surface directly in the dialog.
+/// `message: None` = the agent writes the commit message itself.
+///
+/// Returns `true` when the merge was QUEUED instead of started — the folder was
+/// already landing another task, and this one goes in as soon as that finishes.
+pub async fn work_task_merge_core(
+    id: i32,
+    message: Option<String>,
+    delete_worktree: bool,
+) -> Result<bool, DbError> {
+    engine()?
+        .merge_task(id, message, delete_worktree, false)
+        .await
+        .map(|dispatch| dispatch.is_queued())
+        .map_err(DbError::Validation)
+}
+
+/// Withdraw a merge that is waiting in the folder's queue (the task stays in
+/// review, untouched). Pure DB — no engine needed: the pump only ever reads
+/// intents that are still on the row.
+pub async fn work_task_merge_unqueue_core(
+    emitter: &EventEmitter,
+    db: &AppDatabase,
+    id: i32,
+) -> Result<(), DbError> {
+    if !work_task_service::unqueue_merge(&db.conn, id).await? {
+        return Err(DbError::Validation(
+            "this task is not waiting to merge".to_string(),
+        ));
+    }
+    emit_event(
+        emitter,
+        WORK_TASK_CHANGED_EVENT,
+        WorkTaskChange::Upsert { id },
+    );
+    Ok(())
+}
+
+/// Finish a reviewed task that has nothing to land (review → done, no merge),
+/// optionally removing its worktree. Refused when the worktree turns out to
+/// hold changes after all — that task belongs on the merge path.
+pub async fn work_task_complete_core(id: i32, delete_worktree: bool) -> Result<(), DbError> {
+    engine()?
+        .complete_task(id, delete_worktree)
+        .await
+        .map_err(DbError::Validation)
+}
+
+/// Archive / unarchive a terminal task (pure DB; no engine needed). Archived
+/// tasks leave the default board view and the attention badge.
+pub async fn work_task_archive_core(
+    emitter: &EventEmitter,
+    db: &AppDatabase,
+    id: i32,
+    archived: bool,
+) -> Result<(), DbError> {
+    if !work_task_service::set_archived(&db.conn, id, archived).await? {
+        return Err(DbError::Validation(if archived {
+            "only finished tasks can be archived".to_string()
+        } else {
+            "task is not archived".to_string()
+        }));
+    }
+    emit_event(
+        emitter,
+        WORK_TASK_CHANGED_EVENT,
+        WorkTaskChange::Upsert { id },
+    );
+    Ok(())
+}
+
+pub async fn work_task_cleanup_core(id: i32) -> Result<(), DbError> {
+    engine()?
+        .cleanup_task(id)
+        .await
+        .map_err(DbError::Validation)
+}
+
+/// Diff of the task worktree vs. its recorded base (`base_sha`, so the view is
+/// stable even when the base branch advances). `file = None` → full patch.
+pub async fn work_task_diff_core(
+    db: &AppDatabase,
+    id: i32,
+    file: Option<String>,
+) -> Result<String, AppCommandError> {
+    let task = work_task_service::get_model(&db.conn, id)
+        .await
+        .map_err(AppCommandError::from)?;
+    let wt_id = task
+        .worktree_folder_id
+        .ok_or_else(|| AppCommandError::not_found("task has no worktree"))?;
+    let base = task
+        .base_sha
+        .clone()
+        .or(task.base_branch.clone())
+        .ok_or_else(|| AppCommandError::not_found("task has no recorded base"))?;
+    let wt = get_folder_core(db, wt_id)
+        .await
+        .map_err(AppCommandError::from)?;
+    git_diff_with_branch(wt.path, base, file).await
+}
+
+pub async fn work_task_changed_files_core(
+    db: &AppDatabase,
+    id: i32,
+) -> Result<Vec<WorkTaskChangedFile>, AppCommandError> {
+    let task = work_task_service::get_model(&db.conn, id)
+        .await
+        .map_err(AppCommandError::from)?;
+    let Some(wt_id) = task.worktree_folder_id else {
+        return Ok(vec![]);
+    };
+    let Some(base) = task.base_sha.clone().or(task.base_branch.clone()) else {
+        return Ok(vec![]);
+    };
+    let wt = get_folder_core(db, wt_id)
+        .await
+        .map_err(AppCommandError::from)?;
+    crate::work_task::git::diff_numstat(&wt.path, &base).await
+}
+
+pub async fn work_task_settings_get_core(
+    db: &AppDatabase,
+    folder_id: i32,
+) -> Result<WorkTaskFolderSettings, DbError> {
+    work_task_service::settings_get(&db.conn, folder_id).await
+}
+
+/// Effective settings after the folder → global → built-in fallback — what
+/// the engine will actually use for this folder (editor prefill, merge dialog
+/// seeding).
+pub async fn work_task_settings_effective_core(
+    db: &AppDatabase,
+    folder_id: i32,
+) -> Result<WorkTaskFolderSettings, DbError> {
+    work_task_service::settings_get_effective(&db.conn, folder_id).await
+}
+
+/// The folder's own settings row, or `None` when it follows the global
+/// defaults — the settings dialog's source-of-truth probe.
+pub async fn work_task_settings_get_own_core(
+    db: &AppDatabase,
+    folder_id: i32,
+) -> Result<Option<WorkTaskFolderSettings>, DbError> {
+    work_task_service::settings_get_own(&db.conn, folder_id).await
+}
+
+pub async fn work_task_settings_set_core(
+    emitter: &EventEmitter,
+    db: &AppDatabase,
+    folder_id: i32,
+    settings: WorkTaskFolderSettings,
+) -> Result<(), DbError> {
+    work_task_service::settings_set(&db.conn, folder_id, &settings).await?;
+    emit_event(
+        emitter,
+        WORK_TASK_CHANGED_EVENT,
+        WorkTaskChange::Settings { folder_id },
+    );
+    nudge_pump(folder_id);
+    nudge_merge_pump(folder_id);
+    Ok(())
+}
+
+/// Remove the folder's own settings row — it reverts to the global defaults.
+/// Same nudges as a set: auto-process/concurrency may effectively change.
+pub async fn work_task_settings_delete_core(
+    emitter: &EventEmitter,
+    db: &AppDatabase,
+    folder_id: i32,
+) -> Result<(), DbError> {
+    work_task_service::settings_delete(&db.conn, folder_id).await?;
+    emit_event(
+        emitter,
+        WORK_TASK_CHANGED_EVENT,
+        WorkTaskChange::Settings { folder_id },
+    );
+    nudge_pump(folder_id);
+    // Reverting to the global row can also switch auto-merge ON for this
+    // folder (the global row may carry it) — same drain-now semantics.
+    nudge_merge_pump(folder_id);
+    Ok(())
+}
+
+pub async fn work_task_template_list_core(
+    db: &AppDatabase,
+) -> Result<Vec<WorkTaskTemplateInfo>, DbError> {
+    work_task_service::template_list(&db.conn).await
+}
+
+pub async fn work_task_template_save_core(
+    db: &AppDatabase,
+    draft: WorkTaskTemplateDraft,
+) -> Result<WorkTaskTemplateInfo, DbError> {
+    work_task_service::template_save(&db.conn, &draft).await
+}
+
+pub async fn work_task_template_delete_core(db: &AppDatabase, id: i32) -> Result<(), DbError> {
+    work_task_service::template_delete(&db.conn, id).await
+}
+
+// ── Tauri command wrappers (desktop only) ───────────────────────────────────
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn work_task_list(
+    db: tauri::State<'_, AppDatabase>,
+    folder_id: Option<i32>,
+) -> Result<Vec<WorkTaskInfo>, DbError> {
+    work_task_list_core(&db, folder_id).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn work_task_get(
+    db: tauri::State<'_, AppDatabase>,
+    id: i32,
+) -> Result<WorkTaskInfo, DbError> {
+    work_task_get_core(&db, id).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn work_task_events(
+    db: tauri::State<'_, AppDatabase>,
+    task_id: i32,
+    limit: Option<u64>,
+) -> Result<Vec<WorkTaskEventInfo>, DbError> {
+    work_task_events_core(&db, task_id, limit.unwrap_or(500)).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn work_task_attention_count(db: tauri::State<'_, AppDatabase>) -> Result<u64, DbError> {
+    work_task_attention_count_core(&db).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn work_task_create(
+    app: tauri::AppHandle,
+    db: tauri::State<'_, AppDatabase>,
+    draft: WorkTaskDraft,
+) -> Result<WorkTaskInfo, DbError> {
+    work_task_create_core(&EventEmitter::Tauri(app), &db, draft).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn work_task_update(
+    app: tauri::AppHandle,
+    db: tauri::State<'_, AppDatabase>,
+    id: i32,
+    draft: WorkTaskDraft,
+) -> Result<WorkTaskInfo, DbError> {
+    work_task_update_core(&EventEmitter::Tauri(app), &db, id, draft).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn work_task_reorder(
+    app: tauri::AppHandle,
+    db: tauri::State<'_, AppDatabase>,
+    folder_id: i32,
+    ordered_ids: Vec<i32>,
+) -> Result<(), DbError> {
+    work_task_reorder_core(&EventEmitter::Tauri(app), &db, folder_id, ordered_ids).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn work_task_delete(
+    app: tauri::AppHandle,
+    db: tauri::State<'_, AppDatabase>,
+    id: i32,
+    delete_worktree: Option<bool>,
+) -> Result<(), DbError> {
+    work_task_delete_core(
+        &EventEmitter::Tauri(app),
+        &db,
+        id,
+        delete_worktree.unwrap_or(false),
+    )
+    .await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn work_task_start(id: i32) -> Result<(), DbError> {
+    work_task_start_core(id).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn work_task_start_all(folder_id: Option<i32>) -> Result<u32, DbError> {
+    work_task_start_all_core(folder_id).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn work_task_retry(
+    id: i32,
+    note: Option<String>,
+    blocks: Option<Vec<serde_json::Value>>,
+) -> Result<(), DbError> {
+    work_task_retry_core(id, note, blocks.unwrap_or_default()).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn work_task_requeue(
+    app: tauri::AppHandle,
+    db: tauri::State<'_, AppDatabase>,
+    id: i32,
+    note: Option<String>,
+    blocks: Option<Vec<serde_json::Value>>,
+) -> Result<(), DbError> {
+    work_task_requeue_core(
+        &EventEmitter::Tauri(app),
+        &db,
+        id,
+        note,
+        blocks.unwrap_or_default(),
+    )
+    .await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn work_task_schedule(
+    app: tauri::AppHandle,
+    db: tauri::State<'_, AppDatabase>,
+    id: i32,
+    scheduled_at: Option<String>,
+) -> Result<(), DbError> {
+    work_task_schedule_core(&EventEmitter::Tauri(app), &db, id, scheduled_at).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn work_task_return(
+    id: i32,
+    feedback: String,
+    intent: Option<String>,
+    blocks: Option<Vec<serde_json::Value>>,
+) -> Result<(), DbError> {
+    work_task_return_core(id, feedback, intent, blocks.unwrap_or_default()).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn work_task_cancel(id: i32, reason: Option<String>) -> Result<(), DbError> {
+    work_task_cancel_core(id, reason).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn work_task_merge(
+    id: i32,
+    message: Option<String>,
+    delete_worktree: bool,
+) -> Result<bool, DbError> {
+    work_task_merge_core(id, message, delete_worktree).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn work_task_merge_unqueue(
+    app: tauri::AppHandle,
+    db: tauri::State<'_, AppDatabase>,
+    id: i32,
+) -> Result<(), DbError> {
+    work_task_merge_unqueue_core(&EventEmitter::Tauri(app), &db, id).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn work_task_complete(id: i32, delete_worktree: bool) -> Result<(), DbError> {
+    work_task_complete_core(id, delete_worktree).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn work_task_archive(
+    app: tauri::AppHandle,
+    db: tauri::State<'_, AppDatabase>,
+    id: i32,
+    archived: bool,
+) -> Result<(), DbError> {
+    work_task_archive_core(&EventEmitter::Tauri(app), &db, id, archived).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn work_task_cleanup(id: i32) -> Result<(), DbError> {
+    work_task_cleanup_core(id).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn work_task_diff(
+    db: tauri::State<'_, AppDatabase>,
+    id: i32,
+    file: Option<String>,
+) -> Result<String, AppCommandError> {
+    work_task_diff_core(&db, id, file).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn work_task_changed_files(
+    db: tauri::State<'_, AppDatabase>,
+    id: i32,
+) -> Result<Vec<WorkTaskChangedFile>, AppCommandError> {
+    work_task_changed_files_core(&db, id).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn work_task_settings_get(
+    db: tauri::State<'_, AppDatabase>,
+    folder_id: i32,
+) -> Result<WorkTaskFolderSettings, DbError> {
+    work_task_settings_get_core(&db, folder_id).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn work_task_settings_effective(
+    db: tauri::State<'_, AppDatabase>,
+    folder_id: i32,
+) -> Result<WorkTaskFolderSettings, DbError> {
+    work_task_settings_effective_core(&db, folder_id).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn work_task_settings_get_own(
+    db: tauri::State<'_, AppDatabase>,
+    folder_id: i32,
+) -> Result<Option<WorkTaskFolderSettings>, DbError> {
+    work_task_settings_get_own_core(&db, folder_id).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn work_task_settings_set(
+    app: tauri::AppHandle,
+    db: tauri::State<'_, AppDatabase>,
+    folder_id: i32,
+    settings: WorkTaskFolderSettings,
+) -> Result<(), DbError> {
+    work_task_settings_set_core(&EventEmitter::Tauri(app), &db, folder_id, settings).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn work_task_settings_delete(
+    app: tauri::AppHandle,
+    db: tauri::State<'_, AppDatabase>,
+    folder_id: i32,
+) -> Result<(), DbError> {
+    work_task_settings_delete_core(&EventEmitter::Tauri(app), &db, folder_id).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn work_task_template_list(
+    db: tauri::State<'_, AppDatabase>,
+) -> Result<Vec<WorkTaskTemplateInfo>, DbError> {
+    work_task_template_list_core(&db).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn work_task_template_save(
+    db: tauri::State<'_, AppDatabase>,
+    draft: WorkTaskTemplateDraft,
+) -> Result<WorkTaskTemplateInfo, DbError> {
+    work_task_template_save_core(&db, draft).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn work_task_template_delete(
+    db: tauri::State<'_, AppDatabase>,
+    id: i32,
+) -> Result<(), DbError> {
+    work_task_template_delete_core(&db, id).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::service::folder_service;
+    use crate::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
+    use crate::models::agent::AgentType;
+
+    fn draft(folder_id: i32, title: &str, agent: Option<&str>) -> WorkTaskDraft {
+        WorkTaskDraft {
+            folder_id,
+            title: title.to_string(),
+            config: serde_json::json!({
+                "display_text": "do the thing",
+                "prompt_blocks": [{ "type": "text", "text": "do the thing" }],
+                "agent_type": agent,
+            }),
+        }
+    }
+
+    async fn agent_of(db: &AppDatabase, task_id: i32) -> Option<String> {
+        work_task_get_core(db, task_id).await.unwrap().agent_type
+    }
+
+    /// The list must name each task's agent the way the ENGINE would pick it
+    /// (`effective_agent_config`), or the views draw a mark for an agent that
+    /// never runs. Walks the layering from the outside in.
+    #[tokio::test]
+    async fn agent_type_is_stamped_with_the_engines_own_layering() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/wt-agent").await;
+        folder_service::update_folder_default_agent(
+            &db.conn,
+            folder_id,
+            Some(AgentType::ClaudeCode),
+        )
+        .await
+        .unwrap();
+
+        let overridden = work_task_service::create(&db.conn, draft(folder_id, "a", Some("codex")))
+            .await
+            .unwrap();
+        let inheriting = work_task_service::create(&db.conn, draft(folder_id, "b", None))
+            .await
+            .unwrap();
+
+        // Nothing between the task and its folder yet.
+        assert_eq!(agent_of(&db, overridden.id).await.as_deref(), Some("codex"));
+        assert_eq!(
+            agent_of(&db, inheriting.id).await.as_deref(),
+            Some("claude_code")
+        );
+
+        // The folder's task settings sit between the two — and only the
+        // inheriting task feels them.
+        let settings = WorkTaskFolderSettings {
+            default_agent_type: Some("grok".to_string()),
+            ..Default::default()
+        };
+        work_task_service::settings_set(&db.conn, folder_id, &settings)
+            .await
+            .unwrap();
+        assert_eq!(agent_of(&db, overridden.id).await.as_deref(), Some("codex"));
+        assert_eq!(agent_of(&db, inheriting.id).await.as_deref(), Some("grok"));
+
+        // Once the task has actually run, the agent that ran it wins over
+        // every configured layer — including the task's own override.
+        let conversation_id = seed_conversation(&db, folder_id, AgentType::Gemini).await;
+        let run_seq =
+            work_task_service::claim_for_run(&db.conn, overridden.id, WorkTaskStatus::Todo, "user")
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(
+            work_task_service::begin_setup(&db.conn, overridden.id, run_seq)
+                .await
+                .unwrap()
+        );
+        assert!(work_task_service::mark_running(
+            &db.conn,
+            overridden.id,
+            run_seq,
+            conversation_id,
+            "c1"
+        )
+        .await
+        .unwrap());
+        assert_eq!(
+            agent_of(&db, overridden.id).await.as_deref(),
+            Some("gemini")
+        );
+
+        // A list stamps every row the same way a get does.
+        let listed = work_task_list_core(&db, Some(folder_id)).await.unwrap();
+        let stamped: Vec<Option<String>> = listed.into_iter().map(|t| t.agent_type).collect();
+        assert!(stamped.iter().all(|a| a.is_some()), "{stamped:?}");
+    }
+
+    /// A folder with no default and no settings anywhere leaves the field
+    /// empty rather than guessing — the same state the engine refuses to
+    /// launch, which both views draw as a placeholder.
+    #[tokio::test]
+    async fn agent_type_is_none_when_nothing_is_configured() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/wt-agent-none").await;
+        let task = work_task_service::create(&db.conn, draft(folder_id, "a", None))
+            .await
+            .unwrap();
+        assert_eq!(agent_of(&db, task.id).await, None);
+
+        // The global settings row is what a folder without its own follows.
+        let settings = WorkTaskFolderSettings {
+            default_agent_type: Some("cursor".to_string()),
+            ..Default::default()
+        };
+        work_task_service::settings_set(
+            &db.conn,
+            work_task_service::GLOBAL_SETTINGS_FOLDER_ID,
+            &settings,
+        )
+        .await
+        .unwrap();
+        assert_eq!(agent_of(&db, task.id).await.as_deref(), Some("cursor"));
+    }
+}

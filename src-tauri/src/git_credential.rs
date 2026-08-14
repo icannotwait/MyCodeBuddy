@@ -232,7 +232,12 @@ pub(crate) async fn lookup_credential(
         "sqlite:{}?mode=ro",
         urlencoding::encode(&db_path.to_string_lossy())
     );
-    let opts = sea_orm::ConnectOptions::new(db_url);
+    let mut opts = sea_orm::ConnectOptions::new(db_url);
+    // Match every other `ConnectOptions` in the tree: sqlx logs each statement,
+    // with its SQL text, at INFO. Here that lands on the helper's **stderr**,
+    // which git splices into the agent's / terminal's output — the one thing the
+    // contract above ("all miss paths are silent") exists to prevent.
+    opts.sqlx_logging(false);
     let conn = sea_orm::Database::connect(opts)
         .await
         .map_err(|e| format!("open db: {e}"))?;

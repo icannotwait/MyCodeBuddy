@@ -71,6 +71,11 @@ interface ConversationShellProps {
   attachmentTabId?: string | null
   draftStorageKey?: string | null
   hideInput?: boolean
+  /** Optional banner rendered in the composer dock, where the input sits.
+   *  Used with `hideInput` to explain WHY the composer is unavailable (e.g.
+   *  the agent failed to load this session) without hijacking the message
+   *  area above. Renders nothing when omitted. */
+  composerBanner?: ReactNode
   /** Optional read-only live-feedback notes list rendered just above the
    *  composer (see `FeedbackNotesDisplay`). Renders nothing when there are no
    *  notes for the current turn. */
@@ -100,6 +105,10 @@ interface ConversationShellProps {
   waitingForSubagents?: ContinuationWaitingProjection | null
   /** Restore a rejected direct-send draft into the composer. */
   draftRestore?: PromptDraftRestore | null
+  /** Inject the draft's text into the RUNNING turn (native live-feedback
+   *  steering). Present only for sessions on the native channel; threaded
+   *  straight through to the composer. */
+  onSteer?: (text: string) => Promise<void>
   /** Optional banner pinned to the top of the panel, above the message area
    *  (e.g. the "restart to apply" config-stale banner). Renders nothing when
    *  omitted. */
@@ -153,6 +162,7 @@ export function ConversationShell({
   attachmentTabId,
   draftStorageKey,
   hideInput = false,
+  composerBanner,
   feedbackList,
   onAddFeedback,
   feedbackAddDisabled,
@@ -172,6 +182,7 @@ export function ConversationShell({
   onForkSend,
   waitingForSubagents = null,
   draftRestore = null,
+  onSteer,
   topBanner,
   routeNotice,
   showReconnect = false,
@@ -279,6 +290,12 @@ export function ConversationShell({
           </div>
         )}
 
+        {composerBanner && (
+          <div className="mx-auto w-full max-w-3xl px-4 pb-2">
+            {composerBanner}
+          </div>
+        )}
+
         {!hideInput && feedbackList && (
           <div className="mx-auto w-full max-w-3xl px-4">{feedbackList}</div>
         )}
@@ -323,6 +340,7 @@ export function ConversationShell({
               onSaveQueueEdit={onSaveQueueEdit}
               onCancelQueueEdit={onCancelQueueEdit}
               onForkSend={onForkSend}
+              onSteer={onSteer}
               onAddFeedback={onAddFeedback}
               feedbackAddDisabled={feedbackAddDisabled}
               showReconnect={showReconnect}

@@ -317,10 +317,7 @@ mod tests {
                 AppErrorCode::LegacyCompletionProtocolReadOnly,
                 "legacy_completion_protocol_read_only",
             ),
-            (
-                AppErrorCode::WorkflowV2Retired,
-                "workflow_v2_retired",
-            ),
+            (AppErrorCode::WorkflowV2Retired, "workflow_v2_retired"),
             (
                 AppErrorCode::WorkflowIdentityCorrupt,
                 "workflow_identity_corrupt",

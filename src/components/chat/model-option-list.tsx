@@ -3,6 +3,7 @@
 import { useCallback, useId, useMemo, useRef, useState } from "react"
 import { Check, Search } from "lucide-react"
 import { Virtualizer, type VirtualizerHandle } from "virtua"
+import { useImeGuard } from "@/hooks/use-ime-guard"
 import { cn } from "@/lib/utils"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { DropdownRadioItemContent } from "@/components/chat/dropdown-radio-item-content"
@@ -49,6 +50,7 @@ export function ModelOptionList({
   emptyLabel,
   autoFocus = false,
 }: ModelOptionListProps) {
+  const ime = useImeGuard()
   const [query, setQuery] = useState("")
   const [activeIndex, setActiveIndex] = useState(0)
   const virtualizerRef = useRef<VirtualizerHandle>(null)
@@ -111,7 +113,7 @@ export function ModelOptionList({
     (event: React.KeyboardEvent<HTMLInputElement>) => {
       // Don't steal Enter/arrows while an IME composition is in flight (CJK
       // input): Enter there confirms the candidate, it must not pick a model.
-      if (event.nativeEvent.isComposing || event.key === "Process") return
+      if (ime.isComposing(event)) return
       switch (event.key) {
         case "ArrowDown":
           event.preventDefault()
@@ -144,6 +146,7 @@ export function ModelOptionList({
     },
     [
       activeIndexClamped,
+      ime,
       moveActiveTo,
       onSelect,
       optionCount,
@@ -183,6 +186,7 @@ export function ModelOptionList({
             setQuery(event.target.value)
             setActiveIndex(0)
           }}
+          {...ime.props}
           onKeyDown={handleKeyDown}
           className="w-full bg-transparent text-sm outline-none placeholder:text-muted-foreground"
         />

@@ -1140,23 +1140,27 @@ describe("TabProvider cross-client sync", () => {
     })
     expect(screen.getByTestId("tabs")).toHaveTextContent("conv-1-codex-3")
 
-    // The save is REJECTED carrying the server's older v2 snapshot.
+    // The save is REJECTED carrying the server's older v2 snapshot, which holds
+    // a tab (c8) that the applied v5 truth no longer has.
     await act(async () => {
       resolveSave({
         accepted: false,
         version: 2,
-        tabs: [tabItem(1, 1), tabItem(1, 2)],
+        tabs: [tabItem(1, 1), tabItem(1, 8)],
       })
       await Promise.resolve()
     })
 
     // The stale v2 reconciliation must NOT clobber the applied v5 state nor
-    // regress the version: c3 stays, c2 never appears, and a later remote at v3
+    // regress the version: c3 stays, c8 never appears, and a later remote at v3
     // is still dropped (version stayed at 5).
     expect(screen.getByTestId("tabs")).toHaveTextContent("conv-1-codex-3")
     expect(screen.getByTestId("tabs").textContent).not.toContain(
-      "conv-1-codex-2"
+      "conv-1-codex-8"
     )
+    // c2 was opened here and never acknowledged by any snapshot, so the v5 apply
+    // merged it rather than dropping it (see the bound-draft regression below).
+    expect(screen.getByTestId("tabs")).toHaveTextContent("conv-1-codex-2")
     act(() => {
       tabsChangedHandler?.({ version: 3, origin: "x", tabs: [tabItem(1, 9)] })
     })
@@ -1165,12 +1169,13 @@ describe("TabProvider cross-client sync", () => {
     )
   })
 
-  it("adopts the server snapshot when a save is rejected with no newer remote already applied", async () => {
+  it("merges the server snapshot when a save is rejected with no newer remote already applied", async () => {
     // Regression: the reject path must reconcile even at the SAME version it
     // just advanced to. A save based on v1 is rejected with the server's
-    // authoritative v2 set, and NO intervening remote has landed — so the local
-    // set must be replaced by the server's, not left stale (which would let the
-    // next local edit overwrite server truth).
+    // authoritative v2 set, and NO intervening remote has landed — so the
+    // server's side of the divergence must land (c9 opened elsewhere appears,
+    // c1 closed elsewhere disappears) rather than being left stale, while the
+    // tab this client opened since v1 survives the merge.
     listOpenedTabsMock.mockResolvedValue({
       items: [tabItem(1, 1, true)],
       version: 1,
@@ -1204,10 +1209,62 @@ describe("TabProvider cross-client sync", () => {
       await Promise.resolve()
     })
 
-    // The server truth is adopted: c9 present, the locally-added c2 gone.
+    // The server's side of the divergence is adopted — c9 lands, c1 (which the
+    // server had at v1 and has since dropped) goes — and the local addition c2
+    // rides through, since no snapshot has ever contained it.
     const tabsText = screen.getByTestId("tabs").textContent ?? ""
     expect(tabsText).toContain("conv-1-codex-9")
-    expect(tabsText).not.toContain("conv-1-codex-2")
+    expect(tabsText).toContain("conv-1-codex-2")
+    expect(tabsText).not.toContain("conv-1-codex-1")
+  })
+
+  it("keeps a locally-closed tab closed when the rejected snapshot still has it", async () => {
+    // Mirror image of the merge: the server's set is not newer truth about the
+    // tabs THIS client has already acted on. A close that hasn't been persisted
+    // yet must not be undone by the snapshot that races it, or the tab
+    // resurrects and the user has to close it twice.
+    listOpenedTabsMock.mockResolvedValue({
+      items: [tabItem(1, 1, true), tabItem(1, 2)],
+      version: 1,
+    })
+    let resolveSave: (r: SaveTabsOutcome) => void = () => {}
+    saveOpenedTabsMock.mockImplementation(
+      () =>
+        new Promise<SaveTabsOutcome>((res) => {
+          resolveSave = res
+        })
+    )
+    await renderHydrated()
+    expect(screen.getByTestId("tabs")).toHaveTextContent("conv-1-codex-2")
+
+    act(() => {
+      latestContext?.closeTab("conv-1-codex-2")
+    })
+    await waitFor(() => expect(saveOpenedTabsMock).toHaveBeenCalledTimes(1), {
+      timeout: 2000,
+    })
+
+    // Rejected: the server (bumped by an unrelated change) still lists c2.
+    await act(async () => {
+      resolveSave({
+        accepted: false,
+        version: 2,
+        tabs: [tabItem(1, 1, true), tabItem(1, 2)],
+      })
+      await Promise.resolve()
+    })
+
+    expect(screen.getByTestId("tabs").textContent).not.toContain(
+      "conv-1-codex-2"
+    )
+    // …and the close is re-pushed at the version we just learned.
+    await waitFor(() => expect(saveOpenedTabsMock).toHaveBeenCalledTimes(2), {
+      timeout: 2000,
+    })
+    expect(saveOpenedTabsMock.mock.calls[1][1]).toBe(2)
+    expect(saveOpenedTabsMock.mock.calls[1][0]).toEqual([
+      expect.objectContaining({ conversation_id: 1 }),
+    ])
   })
 
   it("preserves a bound draft's local id and runtime session across a remote apply", async () => {
@@ -1236,6 +1293,60 @@ describe("TabProvider cross-client sync", () => {
     expect(tabsText).not.toContain("conv-1-codex-1")
     const bound = latestContext?.tabs.find((tb) => tb.id === draftId)
     expect(bound?.runtimeConversationId).toBe(-7)
+  })
+
+  it("keeps a draft just bound to a live conversation when its save is rejected", async () => {
+    // Regression (reported): the ONLY tab is a draft; the user sends its first
+    // prompt, which creates the row and binds the tab. Meanwhile the server's
+    // tab version had silently advanced (a background invalidation bumps the
+    // barrier without broadcasting when it removes no row), so this client's
+    // save is rejected and handed a server set that has never seen the new
+    // conversation. Adopting that set wholesale dropped the running
+    // conversation's tab and — with nothing left — synthesized a blank draft:
+    // the user watched the workspace jump back to "new conversation" while
+    // their prompt kept streaming, visible only in the sidebar.
+    listOpenedTabsMock.mockResolvedValue({ items: [], version: 3 })
+    saveOpenedTabsMock.mockResolvedValue({
+      accepted: false,
+      version: 4,
+      tabs: [],
+    })
+    await renderHydrated()
+
+    act(() => {
+      latestContext?.openNewConversationTab(1, "/repo")
+    })
+    const draftId = latestContext?.activeTabId ?? ""
+    expect(draftId).toMatch(/^new-/)
+
+    act(() => {
+      latestContext?.bindConversationTab(draftId, 7, "codex", "Sent", -1)
+    })
+
+    // Let the debounced save fire and be rejected.
+    await waitFor(() => expect(saveOpenedTabsMock).toHaveBeenCalledTimes(1), {
+      timeout: 2000,
+    })
+    await act(async () => {
+      await Promise.resolve()
+    })
+
+    // The bound tab is a local addition the server has never acknowledged, so
+    // the rejection must merge (keep it), not clobber.
+    expect(screen.getByTestId("tabs")).toHaveTextContent(draftId)
+    expect(latestContext?.tabs).toHaveLength(1)
+    expect(screen.getByTestId("active")).toHaveTextContent(draftId)
+    expect(latestContext?.tabs[0]?.conversationId).toBe(7)
+
+    // …and it must be re-saved against the version we just learned, so the row
+    // actually lands on the server instead of living on only in this client.
+    await waitFor(() => expect(saveOpenedTabsMock).toHaveBeenCalledTimes(2), {
+      timeout: 2000,
+    })
+    expect(saveOpenedTabsMock.mock.calls[1][1]).toBe(4)
+    expect(saveOpenedTabsMock.mock.calls[1][0]).toEqual([
+      expect.objectContaining({ conversation_id: 7, folder_id: 1 }),
+    ])
   })
 
   it("reconciles a change missed before the subscription went live", async () => {

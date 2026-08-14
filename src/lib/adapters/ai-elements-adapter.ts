@@ -1894,13 +1894,22 @@ export function adaptMessageTurn(
         } else {
           // For live streaming, unmatched tools are still running.
           // For DB historical data, default to "completed" since the
-          // conversation has already ended.
+          // conversation has already ended — EXCEPT when the caller can prove
+          // otherwise. A persisted transcript of a conversation that is running
+          // right now (a work-task viewer whose attach missed, a cross-client
+          // reader) carries the in-flight round's calls with no result yet, and
+          // the caller marks them via `inProgressToolCallIds` off the backend's
+          // `in_flight_user_turn_id`. Without that arm a `get_delegation_status`
+          // blocking on its sub-agent shows a green ✓ for the entire wait.
           adaptedContent.push({
             type: "tool-call",
             toolCallId,
             toolName: block.tool_name,
             input: block.input_preview,
-            state: isStreaming ? "input-available" : "output-available",
+            state:
+              isStreaming || isToolStillRunning
+                ? "input-available"
+                : "output-available",
             // Forward status so a promoted arg-less orphan (unmatched, no
             // result) can be recognised after COMPLETE_TURN flips its state to
             // output-available. See dropEmptyInFlightToolCalls.

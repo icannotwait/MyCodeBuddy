@@ -14,6 +14,7 @@ import { type Editor, type JSONContent } from "@tiptap/core"
 import { EditorContent, useEditor } from "@tiptap/react"
 import { exitSuggestion } from "@tiptap/suggestion"
 
+import { isImeCompositionKey } from "@/lib/ime-composition"
 import { matchShortcutEvent } from "@/lib/keyboard-shortcuts"
 import { cn } from "@/lib/utils"
 
@@ -300,6 +301,14 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
       []
     )
 
+    // The placeholder is read through a ref rather than baked in, so a host
+    // that changes its hint (the task drawer swaps one per follow-up scenario)
+    // repaints instead of remounting the editor. A remount would take the
+    // document with it — including badges whose bytes live out of band and
+    // cannot be recovered from the serialized text.
+    const placeholderRef = useRef(placeholder)
+    const getPlaceholder = useCallback(() => placeholderRef.current ?? "", [])
+
     const editor = useEditor({
       // Static export / SSR safety: never render on the server.
       immediatelyRender: false,
@@ -310,7 +319,10 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
       // — the React Compiler lint can't prove that. Mirrors Tiptap's own React
       // suggestion pattern (render() → component.ref.onKeyDown).
       // eslint-disable-next-line react-hooks/refs
-      extensions: buildComposerExtensions({ placeholder, mentionController }),
+      extensions: buildComposerExtensions({
+        placeholder: getPlaceholder,
+        mentionController,
+      }),
       editable: !disabled,
       autofocus: autoFocus ? "end" : false,
       editorProps: {
@@ -326,6 +338,11 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
           if (event.isComposing || event.keyCode === 229 || view.composing) {
             return false
           }
+          // Mid-IME-composition every key belongs to the input method, so hand
+          // it straight back to the editor before any menu can claim it — the
+          // Enter that picks a CJK candidate must not select a slash command
+          // (`decideComposerKey` repeats this for the submit/newline path).
+          if (isImeCompositionKey(event) || view.composing) return false
           // The internal `@` panel's suggestion plugin owns its navigation keys;
           // never submit/break while it is open.
           if (mentionOpenRef.current) return false
@@ -432,6 +449,17 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
     useEffect(() => {
       editor?.setEditable(!disabled, false)
     }, [editor, disabled])
+
+    useEffect(() => {
+      placeholderRef.current = placeholder
+      // Tiptap resolves the placeholder while building decorations, which only
+      // happens on a transaction — so an empty one is what makes a changed hint
+      // appear. Nothing is inserted, and it is skipped entirely on the first
+      // pass (the editor already painted this value at creation).
+      const view = editor?.view
+      if (!view) return
+      view.dispatch(view.state.tr)
+    }, [editor, placeholder])
 
     useImperativeHandle(
       ref,

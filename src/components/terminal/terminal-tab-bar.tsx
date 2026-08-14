@@ -8,6 +8,7 @@ import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
 import { useTerminalContext } from "@/contexts/terminal-context"
 import { useShortcutSettings } from "@/hooks/use-shortcut-settings"
 import { useIsMac } from "@/hooks/use-is-mac"
+import { useImeGuard } from "@/hooks/use-ime-guard"
 import { formatShortcutLabel } from "@/lib/keyboard-shortcuts"
 import { handleMiddleClickClose } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
@@ -27,6 +28,7 @@ import {
 
 export function TerminalTabBar() {
   const t = useTranslations("Folder.terminal")
+  const ime = useImeGuard()
   const { shortcuts } = useShortcutSettings()
   const isMac = useIsMac()
   const {
@@ -92,8 +94,10 @@ export function TerminalTabBar() {
                   className="bg-transparent outline-none border border-primary/50 rounded px-0.5 w-20 text-xs"
                   value={editValue}
                   onChange={(e) => setEditValue(e.target.value)}
+                  {...ime.props}
                   onBlur={commitRename}
                   onKeyDown={(e) => {
+                    if (ime.isComposing(e)) return
                     if (e.key === "Enter") commitRename()
                     if (e.key === "Escape") setEditingId(null)
                   }}

@@ -52,4 +52,18 @@ describe("isAsyncLaunchAckText", () => {
     )
     expect(isAsyncLaunchAckText(null)).toBe(false)
   })
+
+  it("matches Grok's spawn_subagent background ack (leading position only)", () => {
+    expect(
+      isAsyncLaunchAckText(
+        'Subagent started in background.\nsubagent_id: 019f9432-e0d8-74c3-bd02-0772c4e04a65\ntype: explore\n\nUse get_command_or_subagent_output with task_ids=["019f9432…"] and timeout_ms to wait for results.'
+      )
+    ).toBe(true)
+    // Anchored at the start: a result that merely QUOTES the ack is not a launch.
+    expect(
+      isAsyncLaunchAckText(
+        "The tool said: Subagent started in background.\nsubagent_id: x"
+      )
+    ).toBe(false)
+  })
 })

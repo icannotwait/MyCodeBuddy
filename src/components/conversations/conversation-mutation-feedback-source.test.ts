@@ -27,12 +27,14 @@ describe("conversation mutation failure feedback", () => {
     expect(headerSource).toContain("deleteFailed")
   })
 
-  it("toasts open-folder failures in the sidebar and the shortcut entry", () => {
-    expect(listSource).toContain("toasts.openFolderFailed")
-    // Controller must toast BOTH native dialog and DirectoryBrowserDialog paths.
-    const toastHits =
-      controllerSource.split("toasts.openFolderFailed").length - 1
-    expect(toastHits).toBeGreaterThanOrEqual(2)
+  it("toasts open-folder failures in the workspace folder dialog", () => {
+    const dialogSource = read(
+      "src/components/layout/workspace-folder-dialog.tsx"
+    )
+    expect(dialogSource).toContain("openFailed")
+    expect(dialogSource).toContain("toast.error")
+    expect(listSource).toContain("WorkspaceFolderDialog")
+    expect(controllerSource).toContain("WorkspaceFolderDialog")
   })
 
   it("prevents Radix AlertDialogAction auto-close on delete confirm", () => {

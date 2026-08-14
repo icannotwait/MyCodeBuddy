@@ -1044,6 +1044,8 @@ impl ClaudeRecordAccumulator {
                         tool_name,
                         input_preview,
                         meta: None,
+
+                        status: None,
                     });
                 } else {
                     messages.push(UnifiedMessage {
@@ -1054,6 +1056,8 @@ impl ClaudeRecordAccumulator {
                             tool_name,
                             input_preview,
                             meta: None,
+
+                            status: None,
                         }],
                         timestamp,
                         usage: None,
@@ -1289,6 +1293,10 @@ impl ClaudeParser {
         super::relocate_orphaned_tool_results(&mut turns);
         super::structurize_read_tool_output(&mut turns);
         super::resolve_patch_line_numbers(&mut turns, cwd.as_deref());
+        // Reply lost its elapsed-time chip the moment the live timer stopped.
+        // Runs before the facts are derived, so the usage dashboard's elapsed
+        // time is backfilled too.
+        super::backfill_turn_durations(&mut turns, &[]);
         let context_window_used_tokens = latest_claude_context_window_used_tokens(&turns);
         let context_window_max_tokens =
             claude_context_window_max_tokens_for_model(model.as_deref());
@@ -1525,6 +1533,8 @@ fn extract_assistant_content(value: &serde_json::Value) -> Vec<ContentBlock> {
                         tool_name,
                         input_preview,
                         meta: None,
+
+                        status: None,
                     });
                 }
                 _ => {}
@@ -1603,6 +1613,7 @@ fn extract_agent_execution_stats(tur: &serde_json::Value) -> AgentExecutionStats
             .and_then(|v| v.as_u64())
             .map(|v| v as u32),
         tool_calls: Vec::new(),
+        child_session_id: None,
     }
 }
 
@@ -1907,6 +1918,7 @@ mod tests {
         crate::parsers::relocate_orphaned_tool_results(&mut turns);
         crate::parsers::structurize_read_tool_output(&mut turns);
         crate::parsers::resolve_patch_line_numbers(&mut turns, cwd.as_deref());
+        crate::parsers::backfill_turn_durations(&mut turns, &[]);
 
         assert_eq!(
             serde_json::to_string(&turns).unwrap(),

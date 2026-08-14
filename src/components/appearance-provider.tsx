@@ -1,6 +1,13 @@
 "use client"
 
-import { createContext, useCallback, useEffect, useRef, useState } from "react"
+import {
+  createContext,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react"
 import {
   THEME_COLORS,
   DEFAULT_THEME_COLOR,
@@ -42,7 +49,23 @@ import {
   STORAGE_KEY_WORKSPACE_BG_FILL,
   STORAGE_KEY_WORKSPACE_BG_PANEL_OPACITY,
   STORAGE_KEY_WORKSPACE_BG_IMAGE_VERSION,
+  STORAGE_KEY_CUSTOM_THEME,
+  STORAGE_KEY_CUSTOM_THEME_ENABLED,
+  STORAGE_KEY_CUSTOM_CSS,
+  STORAGE_KEY_CUSTOM_CSS_ENABLED,
+  STORAGE_KEY_CUSTOM_STYLE_SUSPENDED,
 } from "@/lib/appearance-script"
+import {
+  applyCustomCss,
+  applyTokenOverrides,
+  isSafeStyleRequested,
+  parseStoredCustomTheme,
+  sanitizeCustomTheme,
+  type CustomTheme,
+  type CustomThemeToken,
+} from "@/lib/custom-style"
+import { useShortcutSettings } from "@/hooks/use-shortcut-settings"
+import { matchShortcutEvent } from "@/lib/keyboard-shortcuts"
 import {
   DEFAULT_WORKSPACE_BG_ENABLED,
   DEFAULT_WORKSPACE_BG_MASK_OPACITY,
@@ -128,6 +151,26 @@ type AppearanceContextValue = {
   setWorkspaceBackgroundImage: (imageBase64: string) => Promise<void>
   /** 移除背景图片（删盘 + revoke blob URL）。 */
   removeWorkspaceBackground: () => Promise<void>
+  /** 当前解析出的明暗模式（读 <html> 的 dark 类，非 next-themes 的 resolvedTheme）。 */
+  isDarkMode: boolean
+  /** 主题 token 覆盖（明暗两套，键名不带 `--`，= shadcn cssVars 形状）。 */
+  customTheme: CustomTheme
+  /** 改写当前明暗模式下某个 token 的覆盖；value 传 null 表示清除该项覆盖。 */
+  setCustomThemeToken: (token: CustomThemeToken, value: string | null) => void
+  /** 整体替换主题覆盖（导入 / 清空用）。 */
+  replaceCustomTheme: (theme: CustomTheme) => void
+  customThemeEnabled: boolean
+  setCustomThemeEnabled: (on: boolean) => void
+  /** 已剥离 @import 并经 CSSOM 复核的用户 CSS。 */
+  customCss: string
+  setCustomCss: (css: string) => void
+  customCssEnabled: boolean
+  setCustomCssEnabled: (on: boolean) => void
+  /** 逃生舱：置真时 token 覆盖与自由 CSS 全部不生效（快捷键切换，持久化）。 */
+  customStyleSuspended: boolean
+  setCustomStyleSuspended: (on: boolean) => void
+  /** 本窗口是否由 `?safeStyle=1` 打开 —— 只影响本窗口，不写入偏好。 */
+  safeStyleRequested: boolean
 }
 
 export const AppearanceContext = createContext<AppearanceContextValue | null>(
@@ -209,6 +252,67 @@ function readWorkspaceBgFillMode(): WorkspaceBgFillMode {
   } catch {
     return DEFAULT_WORKSPACE_BG_FILL_MODE
   }
+}
+
+/**
+ * 状态立刻生效、写盘延后的持久化。
+ *
+ * localStorage 的 storage 事件会把**全量文本**广播到每一个打开的窗口，所以色板
+ * 拖拽、CSS 编辑这类高频变更必须防抖 —— 否则每秒几十次的跨窗口重渲染会把界面拖垮。
+ * 返回值是「重置基线」回调：跨窗口同步回填后必须调用它，否则本窗口会把别人的值
+ * 当成本地编辑再写回去，两个窗口互相回声。
+ */
+function useDebouncedPersist(key: string, value: string, delayMs: number) {
+  const baselineRef = useRef<string | null>(null)
+  const pendingRef = useRef<string | null>(null)
+
+  const resetBaseline = useCallback((next: string) => {
+    baselineRef.current = next
+    pendingRef.current = null
+  }, [])
+
+  useEffect(() => {
+    if (baselineRef.current === null) {
+      // 首次运行拿到的就是从 storage 读出来的初值，不回写。
+      baselineRef.current = value
+      return
+    }
+    if (baselineRef.current === value) {
+      // 值又回到了已落盘的那个（改了再改回来、或撤销）——必须把待写清掉。留着的话
+      // 下面的 flush 会在关窗时把那个已经被撤销的中间值写进去，重载后「撤销」凭空失效，
+      // 还会经 storage 事件传染给其它窗口。
+      pendingRef.current = null
+      return
+    }
+    pendingRef.current = value
+    const timer = setTimeout(() => {
+      baselineRef.current = value
+      pendingRef.current = null
+      persist(key, value)
+    }, delayMs)
+    return () => clearTimeout(timer)
+  }, [key, value, delayMs])
+
+  // 外观设置是独立窗口，用户改完随手关掉是常态 —— 把还没落盘的最后一次编辑补上，
+  // 否则防抖窗口内的修改会静默丢失。
+  useEffect(() => {
+    const flush = () => {
+      const pending = pendingRef.current
+      if (pending === null) return
+      baselineRef.current = pending
+      pendingRef.current = null
+      persist(key, pending)
+    }
+    window.addEventListener("pagehide", flush)
+    document.addEventListener("visibilitychange", flush)
+    return () => {
+      window.removeEventListener("pagehide", flush)
+      document.removeEventListener("visibilitychange", flush)
+      flush()
+    }
+  }, [key])
+
+  return resetBaseline
 }
 
 /**
@@ -326,6 +430,36 @@ export function AppearanceProvider({
     string | null
   >(null)
 
+  // 自定义样式。初值同样从 localStorage 读 —— 视觉已由 inline 脚本就位，这里只是
+  // 回填状态，不会造成闪烁（下方 apply effect 首次运行写的是同一份值，幂等）。
+  const [customTheme, setCustomThemeState] = useState<CustomTheme>(() =>
+    parseStoredCustomTheme(readStored(STORAGE_KEY_CUSTOM_THEME))
+  )
+  const [customThemeEnabled, setCustomThemeEnabledState] = useState<boolean>(
+    () => readBool(STORAGE_KEY_CUSTOM_THEME_ENABLED, true)
+  )
+  const [customCss, setCustomCssState] = useState<string>(
+    () => readStored(STORAGE_KEY_CUSTOM_CSS) ?? ""
+  )
+  const [customCssEnabled, setCustomCssEnabledState] = useState<boolean>(() =>
+    readBool(STORAGE_KEY_CUSTOM_CSS_ENABLED, false)
+  )
+  const [customStyleSuspended, setCustomStyleSuspendedState] =
+    useState<boolean>(() => readBool(STORAGE_KEY_CUSTOM_STYLE_SUSPENDED, false))
+
+  // 逃生舱其一：本窗口由 `?safeStyle=1` 打开时，本窗口内一切自定义样式不生效，
+  // 但不写入偏好 —— 用「安全外观」打开设置页去关自定义 CSS，不该顺手改掉别的窗口。
+  const [safeStyleRequested] = useState<boolean>(() => isSafeStyleRequested())
+
+  // 明暗模式取自 <html> 的 dark 类，而不是 next-themes 的 resolvedTheme：后者在
+  // 水合完成前是 undefined，按它挑 token 组会先套一帧浅色再跳到深色，正好毁掉
+  // inline 脚本辛苦换来的零 FOUC。DOM 上的类从第一帧起就是权威的。
+  const [isDarkMode, setIsDarkMode] = useState<boolean>(() =>
+    typeof document === "undefined"
+      ? false
+      : document.documentElement.classList.contains("dark")
+  )
+
   const setThemeColor = useCallback((color: ThemeColor) => {
     setThemeColorState(color)
     document.documentElement.setAttribute("data-theme", color)
@@ -424,6 +558,62 @@ export function AppearanceProvider({
     persist(STORAGE_KEY_WORKSPACE_BG_FILL, mode)
   }, [])
 
+  // ─── 自定义样式：setter ───
+
+  const setCustomThemeToken = useCallback(
+    (token: CustomThemeToken, value: string | null) => {
+      setCustomThemeState((prev) => {
+        const mode = isDarkMode ? "dark" : "light"
+        const next = { ...prev[mode] }
+        if (value === null) delete next[token]
+        else next[token] = value
+        return { ...prev, [mode]: next }
+      })
+    },
+    [isDarkMode]
+  )
+
+  const replaceCustomTheme = useCallback((theme: CustomTheme) => {
+    setCustomThemeState(sanitizeCustomTheme(theme))
+  }, [])
+
+  const setCustomThemeEnabled = useCallback((on: boolean) => {
+    setCustomThemeEnabledState(on)
+    persist(STORAGE_KEY_CUSTOM_THEME_ENABLED, on ? "1" : "0")
+  }, [])
+
+  // 传进来的必须是 sanitizeCustomCss 处理过的文本：存的即是注入的，预水合脚本
+  // 才能原样使用而不必在 inline 脚本里重跑一遍 CSSOM 校验。
+  const setCustomCss = useCallback((css: string) => {
+    setCustomCssState(css)
+  }, [])
+
+  const setCustomCssEnabled = useCallback((on: boolean) => {
+    setCustomCssEnabledState(on)
+    persist(STORAGE_KEY_CUSTOM_CSS_ENABLED, on ? "1" : "0")
+  }, [])
+
+  const setCustomStyleSuspended = useCallback((on: boolean) => {
+    setCustomStyleSuspendedState(on)
+    persist(STORAGE_KEY_CUSTOM_STYLE_SUSPENDED, on ? "1" : "0")
+  }, [])
+
+  // 高频变更（色板拖拽 / 编辑器应用）走防抖写盘；开关类是离散动作，在 setter 里直写。
+  const customThemeJson = useMemo(
+    () => JSON.stringify(customTheme),
+    [customTheme]
+  )
+  const resetCustomThemeBaseline = useDebouncedPersist(
+    STORAGE_KEY_CUSTOM_THEME,
+    customThemeJson,
+    400
+  )
+  const resetCustomCssBaseline = useDebouncedPersist(
+    STORAGE_KEY_CUSTOM_CSS,
+    customCss,
+    400
+  )
+
   // 并发 reload 的代次守卫：只有最新一次请求的读结果被应用。避免旧读在更晚的
   // 写/清空之后完成、把状态回退到过期图（re-enable 与 setImage/remove、或多次快速
   // 切换的竞态）。写入窗口收不到自己的 storage 事件，本地一致性全靠这个守卫。
@@ -516,6 +706,55 @@ export function AppearanceProvider({
     if (!workspaceBgEnabled) return
     void reloadWorkspaceBackgroundImage()
   }, [workspaceBgEnabled, reloadWorkspaceBackgroundImage])
+
+  // ─── 自定义样式：DOM 应用 ───
+
+  // 明暗模式的单一事实源，与 monaco-themes.ts 的 useMonacoThemeSync 用的是同一招。
+  useEffect(() => {
+    const root = document.documentElement
+    const sync = () => setIsDarkMode(root.classList.contains("dark"))
+    sync()
+    const observer = new MutationObserver(sync)
+    observer.observe(root, { attributes: true, attributeFilter: ["class"] })
+    return () => observer.disconnect()
+  }, [])
+
+  const customStyleSuppressed = safeStyleRequested || customStyleSuspended
+
+  // token 覆盖写 <html> 行内样式（优先级天然高于 [data-theme="x"] 规则）。
+  // applyTokenOverrides 会把不在本组里的 token 一并移除，所以明暗切换、关闭开关、
+  // 清空覆盖都自动回落到基底预设，无需额外清理路径。
+  useEffect(() => {
+    const active =
+      customStyleSuppressed || !customThemeEnabled
+        ? {}
+        : isDarkMode
+          ? customTheme.dark
+          : customTheme.light
+    applyTokenOverrides(document.documentElement, active)
+  }, [customStyleSuppressed, customThemeEnabled, customTheme, isDarkMode])
+
+  useEffect(() => {
+    applyCustomCss(
+      customStyleSuppressed || !customCssEnabled ? "" : (customCss ?? "")
+    )
+  }, [customStyleSuppressed, customCssEnabled, customCss])
+
+  // 逃生舱其二：全局快捷键。挂在捕获阶段，这样即便用户的 CSS 把界面改到全不可见、
+  // 或某个组件吞掉了冒泡，这一路依然能把自定义样式整体停用。
+  const { shortcuts } = useShortcutSettings()
+  const toggleCustomStyleShortcut = shortcuts.toggle_custom_style
+  useEffect(() => {
+    if (!toggleCustomStyleShortcut) return
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.repeat) return
+      if (!matchShortcutEvent(event, toggleCustomStyleShortcut)) return
+      event.preventDefault()
+      setCustomStyleSuspended(!customStyleSuspended)
+    }
+    window.addEventListener("keydown", onKeyDown, true)
+    return () => window.removeEventListener("keydown", onKeyDown, true)
+  }, [toggleCustomStyleShortcut, customStyleSuspended, setCustomStyleSuspended])
 
   // 跨标签页同步：用户在另一个窗口改了设置时，本窗口实时跟进
   useEffect(() => {
@@ -639,6 +878,33 @@ export function AppearanceProvider({
       if (e.key === STORAGE_KEY_WORKSPACE_BG_IMAGE_VERSION) {
         void reloadWorkspaceBackgroundImage()
       }
+      // 自定义样式跨窗口同步。主题与 CSS 都要顺手重置防抖基线，否则本窗口会把
+      // 刚收到的别人的值当成本地编辑再写回去，两个窗口互相回声。
+      if (e.key === STORAGE_KEY_CUSTOM_THEME) {
+        const next = parseStoredCustomTheme(e.newValue)
+        setCustomThemeState(next)
+        resetCustomThemeBaseline(JSON.stringify(next))
+      }
+      if (e.key === STORAGE_KEY_CUSTOM_THEME_ENABLED) {
+        setCustomThemeEnabledState(
+          readBool(STORAGE_KEY_CUSTOM_THEME_ENABLED, true)
+        )
+      }
+      if (e.key === STORAGE_KEY_CUSTOM_CSS) {
+        const next = e.newValue ?? ""
+        setCustomCssState(next)
+        resetCustomCssBaseline(next)
+      }
+      if (e.key === STORAGE_KEY_CUSTOM_CSS_ENABLED) {
+        setCustomCssEnabledState(
+          readBool(STORAGE_KEY_CUSTOM_CSS_ENABLED, false)
+        )
+      }
+      if (e.key === STORAGE_KEY_CUSTOM_STYLE_SUSPENDED) {
+        setCustomStyleSuspendedState(
+          readBool(STORAGE_KEY_CUSTOM_STYLE_SUSPENDED, false)
+        )
+      }
       // Sync appearance mode to Tauri DB when changed in another window
       if (e.key === "theme") {
         syncAppearanceMode(e.newValue ?? "system")
@@ -646,7 +912,11 @@ export function AppearanceProvider({
     }
     window.addEventListener("storage", onStorage)
     return () => window.removeEventListener("storage", onStorage)
-  }, [reloadWorkspaceBackgroundImage])
+  }, [
+    reloadWorkspaceBackgroundImage,
+    resetCustomThemeBaseline,
+    resetCustomCssBaseline,
+  ])
 
   return (
     <AppearanceContext.Provider
@@ -686,6 +956,19 @@ export function AppearanceProvider({
         workspaceBgImageUrl,
         setWorkspaceBackgroundImage,
         removeWorkspaceBackground,
+        isDarkMode,
+        customTheme,
+        setCustomThemeToken,
+        replaceCustomTheme,
+        customThemeEnabled,
+        setCustomThemeEnabled,
+        customCss,
+        setCustomCss,
+        customCssEnabled,
+        setCustomCssEnabled,
+        customStyleSuspended,
+        setCustomStyleSuspended,
+        safeStyleRequested,
       }}
     >
       {children}

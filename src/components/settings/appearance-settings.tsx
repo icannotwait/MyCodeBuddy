@@ -29,6 +29,7 @@ import {
 import { PetManagerSection } from "./pet-manager-section"
 import { FontSettingsSection } from "./font-settings-section"
 import { WorkspaceBackgroundSection } from "./workspace-background-section"
+import { CustomStyleSection } from "./custom-style-section"
 
 type ThemeMode = "system" | "light" | "dark"
 
@@ -163,6 +164,9 @@ export function AppearanceSettings() {
             })}
           </p>
         </section>
+
+        {/* ===== Custom style (token overrides + free-form CSS) ===== */}
+        <CustomStyleSection />
 
         {/* ===== Zoom Level ===== */}
         <section className="rounded-xl border bg-card p-4 space-y-4">

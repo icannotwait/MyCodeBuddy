@@ -15,6 +15,13 @@
 //! no lock, no alloc). Each subscriber holds one instance as a task-local and
 //! feeds every lag occurrence through [`LagLogThrottle::record`]; it returns
 //! `Some(LagSummary)` only when a line should actually be written.
+//!
+//! Nothing in the state machine is lag-specific, and broadcast lag is not the
+//! only place a near-duplicate line can arrive on a hot path — the ACP read loop
+//! can drop one undecodable `session/update` per streaming chunk, for instance.
+//! [`LeadingEdgeThrottle`] / [`ThrottleSummary`] are the neutral names for those
+//! call sites; they are the same type, so the two spellings share one
+//! implementation and one test suite.
 
 use std::time::{Duration, Instant};
 
@@ -42,6 +49,15 @@ pub struct LagSummary {
 /// [`LagSummary`] carrying everything coalesced since the last emitted line.
 /// Nothing is dropped silently — the suppressed tally always rides the next
 /// emitted line.
+/// Neutral alias for [`LagLogThrottle`] — same throttle, for call sites that
+/// aren't about broadcast lag. See the module docs.
+pub type LeadingEdgeThrottle = LagLogThrottle;
+
+/// Neutral alias for [`LagSummary`]. `occurrences` counts coalesced hits;
+/// `dropped` is whatever quantity the call site sums per hit (pass `1` when the
+/// hit itself is the unit).
+pub type ThrottleSummary = LagSummary;
+
 #[derive(Debug)]
 pub struct LagLogThrottle {
     window: Duration,

@@ -17,12 +17,13 @@
  * timers are the only side effects here — detach runs only when a completion
  * is accepted (matching `task_id` or synthesized when no binding exists).
  *
- * Scope intentionally minimal for Phase 8:
- *   * State stays in-memory; persistence across reloads relies on the
- *     parent_tool_use_id stored on the child's DB row (Phase 7).
- *   * Inline permission routing (child's `permission_request` surfaced on
- *     parent's ToolCallBlock) is deferred — the existing permission store
- *     is per-connection and would require a broader reducer change.
+ * State stays in-memory; persistence across reloads relies on the
+ * parent_tool_use_id stored on the child's DB row (Phase 7).
+ *
+ * On the child's blocking prompts: attaching the child (below) is what makes
+ * them visible at all. The permission store stays per-connection — a child's
+ * `permission_request` is never re-keyed onto the parent's ToolCallBlock — but
+ * because the child IS a connection in the store, `useDelegationCardModel`
  */
 
 import {

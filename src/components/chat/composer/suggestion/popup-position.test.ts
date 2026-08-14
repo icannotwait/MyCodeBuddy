@@ -1,14 +1,14 @@
 import { describe, expect, it } from "vitest"
 
-import { placeMentionPopup } from "./popup-position"
+import { placeAnchoredPopup } from "./popup-position"
 
 const SIZE = { width: 320, height: 288 }
 const VIEWPORT = { width: 1280, height: 800 }
 // Defaults the helper uses: margin=8, gap=4.
 
-describe("placeMentionPopup", () => {
+describe("placeAnchoredPopup", () => {
   it("anchors the left edge at the caret when there is room", () => {
-    const pos = placeMentionPopup(
+    const pos = placeAnchoredPopup(
       { left: 100, top: 600, bottom: 620 },
       SIZE,
       VIEWPORT
@@ -18,7 +18,7 @@ describe("placeMentionPopup", () => {
 
   it("clamps the left edge so the panel stays inside the right margin", () => {
     // caret far right: 1200 + 320 would overflow the 1280 viewport.
-    const pos = placeMentionPopup(
+    const pos = placeAnchoredPopup(
       { left: 1200, top: 600, bottom: 620 },
       SIZE,
       VIEWPORT
@@ -28,7 +28,7 @@ describe("placeMentionPopup", () => {
   })
 
   it("clamps the left edge to the left margin for a negative caret x", () => {
-    const pos = placeMentionPopup(
+    const pos = placeAnchoredPopup(
       { left: -50, top: 600, bottom: 620 },
       SIZE,
       VIEWPORT
@@ -37,7 +37,7 @@ describe("placeMentionPopup", () => {
   })
 
   it("pins to the left margin when the panel is wider than the viewport", () => {
-    const pos = placeMentionPopup(
+    const pos = placeAnchoredPopup(
       { left: 100, top: 300, bottom: 320 },
       { width: 600, height: 200 },
       { width: 400, height: 800 }
@@ -46,7 +46,7 @@ describe("placeMentionPopup", () => {
   })
 
   it("places the panel above the caret when there is room (composer at bottom)", () => {
-    const pos = placeMentionPopup(
+    const pos = placeAnchoredPopup(
       { left: 100, top: 600, bottom: 620 },
       SIZE,
       VIEWPORT
@@ -58,7 +58,7 @@ describe("placeMentionPopup", () => {
 
   it("flips below the caret when there is not enough room above", () => {
     // caret near the top: only 50px above, panel needs 288+4.
-    const pos = placeMentionPopup(
+    const pos = placeAnchoredPopup(
       { left: 100, top: 50, bottom: 70 },
       SIZE,
       VIEWPORT
@@ -71,7 +71,7 @@ describe("placeMentionPopup", () => {
   it("falls back to the side with more room when neither fully fits", () => {
     // Short viewport: nothing fits. caret.top=120 (roomAbove≈112),
     // caret.bottom=140 in a 300-tall viewport (roomBelow≈152) → below wins.
-    const pos = placeMentionPopup({ left: 100, top: 120, bottom: 140 }, SIZE, {
+    const pos = placeAnchoredPopup({ left: 100, top: 120, bottom: 140 }, SIZE, {
       width: 1280,
       height: 300,
     })
@@ -83,20 +83,50 @@ describe("placeMentionPopup", () => {
 
   it("prefers above when both sides are equally cramped", () => {
     // Symmetric: caret centered in a viewport too short for either side.
-    const pos = placeMentionPopup({ left: 100, top: 150, bottom: 150 }, SIZE, {
+    const pos = placeAnchoredPopup({ left: 100, top: 150, bottom: 150 }, SIZE, {
       width: 1280,
       height: 300,
     })
     expect(pos.placement).toBe("above")
   })
 
+  it("hangs below the anchor when asked to prefer that side", () => {
+    // The `/` command panel drops out of the composer box: below is the
+    // resting look, so it must not flip up just because above also fits.
+    const pos = placeAnchoredPopup(
+      { left: 100, top: 300, bottom: 340 },
+      SIZE,
+      VIEWPORT,
+      { prefer: "below" }
+    )
+    expect(pos.placement).toBe("below")
+    // top = anchor.bottom + gap = 340 + 4 = 344
+    expect(pos.top).toBe(344)
+  })
+
+  it("flips a below-preferring panel up when the anchor is near the bottom", () => {
+    // The case the dialogs hit: composer low in a short window, so the panel
+    // would spill off-screen underneath it.
+    const pos = placeAnchoredPopup(
+      { left: 100, top: 480, bottom: 520 },
+      SIZE,
+      VIEWPORT,
+      { prefer: "below" }
+    )
+    // roomBelow = 800 - 520 - 8 = 272, needed = 288 + 4 = 292 → doesn't fit.
+    // roomAbove = 480 - 8 = 472 → flips above.
+    expect(pos.placement).toBe("above")
+    // top = anchor.top - gap - height = 480 - 4 - 288 = 188
+    expect(pos.top).toBe(188)
+  })
+
   it("pins to the top-left corner when the caret rect is null", () => {
-    const pos = placeMentionPopup(null, SIZE, VIEWPORT)
+    const pos = placeAnchoredPopup(null, SIZE, VIEWPORT)
     expect(pos).toEqual({ left: 8, top: 8, placement: "below" })
   })
 
   it("respects custom margin and gap options", () => {
-    const pos = placeMentionPopup(
+    const pos = placeAnchoredPopup(
       { left: 100, top: 600, bottom: 620 },
       SIZE,
       VIEWPORT,

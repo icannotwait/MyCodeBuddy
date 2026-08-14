@@ -178,6 +178,12 @@ export interface AgentExecutionStats {
   lines_removed?: number | null
   other_tool_count?: number | null
   tool_calls?: AgentToolCall[]
+  /** The child's own session id, when the sub-agent ran as a standalone session
+   *  on disk instead of as chunks folded into the parent (Grok: every
+   *  `spawn_subagent` child). Drives the Agent card's "open the sub-agent's
+   *  session" action — `getConversation` resolves it even though the session is
+   *  hidden from the sidebar. Absent for every other agent. */
+  child_session_id?: string | null
 }
 
 /**
@@ -500,6 +506,9 @@ export interface DbConversationSummary {
   delegation_runtime_stats?: DelegationRuntimeStats | null
   /** Open parent-decision attention for this delegate task, if any. */
   delegation_attention_request?: AttentionRequestSummary | null
+  /** Working directory this conversation ran in when it differs from the
+   *  current folder path (set after a removed task worktree re-parent). */
+  origin_cwd?: string | null
 }
 
 export interface ConversationStatePatch {
@@ -507,6 +516,10 @@ export interface ConversationStatePatch {
   status: string
   awaiting_reply_token: string | null
   updated_at: string
+  /** Set when the conversation was re-parented out of a removed worktree: the
+   *  worktree path it originally ran in. Drives the "source worktree removed"
+   *  badge. */
+  origin_cwd?: string | null
 }
 
 /** Payload for the global `conversation://changed` side-channel that keeps
@@ -531,12 +544,24 @@ export type FolderCloseCause = "auto_empty" | "user_remove"
  *
  *  `close` drops open membership only (`is_open = false`); the history row may
  *  remain. `cause` distinguishes empty auto-close (may re-open for local draft)
- *  from explicit user remove (sticky; never re-open; dispose draft binding). */
+ *  from explicit user remove (sticky; never re-open; dispose draft binding).
+ *  `deleted` drops a gone-for-good row (a work-task worktree removed from disk). */
 export type FolderChange =
   | { kind: "upsert"; folder: FolderDetail }
   | { kind: "close"; folder_id: number; cause: FolderCloseCause }
+  | { kind: "deleted"; id: number }
 
 export const FOLDER_CHANGED_EVENT = "folder://changed"
+
+/** Payload for `folder://links-changed`: a workspace folder's set of linked
+ *  directories was created, renamed, repaired, or removed. Carries only the id
+ *  — listeners re-fetch, so a dropped event self-heals on the next change.
+ *  Mirrors the Rust `FolderLinksChanged`. */
+export interface FolderLinksChanged {
+  folder_id: number
+}
+
+export const FOLDER_LINKS_CHANGED_EVENT = "folder://links-changed"
 
 /** Global side-channel announcing a live-feedback enable/disable (payload is
  *  `FeedbackSettings`). The settings UI runs in a separate window, so the
@@ -755,6 +780,31 @@ export interface DbConversationDetail {
    * `has_more_before` to offer "load older".
    */
   history_window?: HistoryWindowInfo | null
+  /**
+   * Turn-window metadata, present only when the request asked for a window
+   * (`tailTurns`/`fromIndex`); their absence marks a legacy full response
+   * (old server) and disables windowed merging. `turns` then holds
+   * `full[turns_offset..]` while every other field still describes the full
+   * transcript. See `src/lib/turn-window.ts` for the derivation helpers.
+   */
+  turns_offset?: number | null
+  turns_total?: number | null
+  /** Assistant turns in `full[0..turns_offset)` (baseline globalization). */
+  assistant_turns_before_offset?: number | null
+  /**
+   * Structural fingerprint of `full[0..turns_offset)` as a fixed-width 16-hex
+   * string (a raw u64 JSON number would be rounded past 2^53-1). Compared on
+   * window refreshes to detect prefix rewrites (compaction), and used as the
+   * seed for client-side chain extension.
+   */
+  prefix_hash?: string | null
+  /**
+   * Max timestamp across `full[0..turns_offset)`; absent when the window
+   * covers the whole transcript. A background overlay turn may only be
+   * retired by the watermark rule when its timestamp is STRICTLY greater
+   * than this bound (its persisted twin is then provably inside the window).
+   */
+  uncovered_prefix_max_ts?: string | null
 }
 
 /** Mirrors Rust `WorkflowCompatibility`. */
@@ -999,6 +1049,21 @@ export interface ContinuationWaitingProjection {
 export interface ContinuationFailureProjection {
   code: ContinuationFailureCode
   finished_at: string
+}
+
+/** One page of older history for reverse infinite scroll:
+ *  `full[turns_offset .. turns_offset + turns.length)`. */
+export interface ConversationTurnsPage {
+  turns: MessageTurn[]
+  turns_offset: number
+  turns_total: number
+  assistant_turns_before_offset: number
+  /** H(0..turns_offset) — adopted as the window fingerprint after a prepend. */
+  prefix_hash: string
+  /** H(0..min(beforeIndex, total)) — must equal the client's current window
+   *  fingerprint for the page to legally join the loaded window. */
+  prefix_hash_before_index: string
+  uncovered_prefix_max_ts?: string | null
 }
 
 export type ConversationStatus =
@@ -1296,6 +1361,13 @@ export const HERMES_PROVIDERS: HermesProviderOption[] = [
     needsBaseUrl: false,
     kind: "apiKey",
   },
+  // New in Hermes 0.20.0.
+  {
+    id: "ai-gateway",
+    label: "Vercel AI Gateway",
+    needsBaseUrl: false,
+    kind: "apiKey",
+  },
   // OAuth / external providers — credentials set via the terminal `--setup` flow.
   {
     id: "nous",
@@ -1345,6 +1417,15 @@ export const HERMES_PROVIDERS: HermesProviderOption[] = [
     label: "AWS Bedrock",
     needsBaseUrl: false,
     kind: "aws",
+  },
+  // Google Vertex AI (Hermes 0.20.0) — service-account JSON / application-
+  // default credentials, configured via the terminal `--setup` flow like the
+  // other no-key providers, hence `oauth` (no API-key or base-URL field).
+  {
+    id: "vertex",
+    label: "Google Vertex AI",
+    needsBaseUrl: false,
+    kind: "oauth",
   },
 ]
 
@@ -1437,6 +1518,14 @@ export interface PermissionOptionInfo {
   option_id: string
   name: string
   kind: string
+  /**
+   * The option's ACP `_meta`, forwarded verbatim from the wire. codex-acp
+   * ≥1.1.8 and claude-agent-acp ≥0.64.1 hang
+   * `permission: {version: 1, changes: [...]}` here — see
+   * `parsePermissionOptionChanges` in `lib/permission-request.ts`. Absent for
+   * agents that send no option metadata.
+   */
+  meta?: Record<string, unknown> | null
 }
 
 // --- ask_user_question (mirror of Rust `crate::acp::question`) ---
@@ -1613,7 +1702,15 @@ export interface SessionConfigSelectInfo {
   groups: SessionConfigSelectGroupInfo[]
 }
 
-export type SessionConfigKindInfo = { type: "select" } & SessionConfigSelectInfo
+/** An on/off toggle config option (ACP's unstable boolean config kind). Cline
+ *  3.0.50+ ships one as `auto_approve` ("Auto-approve tools"). */
+export interface SessionConfigBooleanInfo {
+  current_value: boolean
+}
+
+export type SessionConfigKindInfo =
+  | ({ type: "select" } & SessionConfigSelectInfo)
+  | ({ type: "boolean" } & SessionConfigBooleanInfo)
 
 export interface SessionConfigOptionInfo {
   id: string
@@ -1629,6 +1726,10 @@ export interface AgentOptionsSnapshot {
   /** Slash commands captured during the same transient probe as modes/config
    *  (empty when the agent advertises none in the probe window). */
   available_commands: AvailableCommandInfo[]
+  /** What the agent accepts in a prompt, from the same probe. Lets a composer
+   *  with no live session (the to-do task boxes) encode an attached image the
+   *  way this agent takes it. Null when the agent advertised none. */
+  prompt_capabilities?: PromptCapabilitiesInfo | null
 }
 
 export interface AgentDelegationDefaults {
@@ -1687,10 +1788,15 @@ export interface AutomationLabelSnapshot {
   branch_label?: string
 }
 
+/** What firing the automation does. Optional in stored configs — absent means
+ *  the legacy `launch_session`. */
+export type AutomationAction = "launch_session" | "enqueue_task"
+
 /** The captured composer snapshot stored in `automation.config`. `mode_id` +
  *  `config_values` are exactly AgentDelegationDefaults; the model rides inside
  *  `config_values["model"]`, never as its own field. */
 export interface AutomationConfig {
+  action?: AutomationAction
   prompt_blocks: PromptInputBlock[]
   display_text: string
   mode_id?: string | null
@@ -1751,6 +1857,334 @@ export interface AutomationDraft {
   branch: string | null
   is_remote_branch: boolean
   config: AutomationConfig
+}
+
+// ─── Work tasks ────────────────────────────────────────────────────────────
+// Mirrors src-tauri/src/models/work_task.rs. Wire form is snake_case like
+// Automations. (Named WorkTask* because `Task` is taken by task-context.tsx.)
+
+export type WorkTaskStatus =
+  | "todo"
+  | "queued"
+  /** Out of the queue, setting up: worktree, init command, agent spawn. */
+  | "preparing"
+  | "running"
+  | "awaiting_input"
+  | "review"
+  | "merging"
+  | "done"
+  | "failed"
+  | "canceled"
+
+/** The captured composer snapshot stored in `work_task.config`. Optional
+ *  agent/mode/config fields are per-task overrides; empty = inherit the
+ *  folder's task settings at launch. */
+export interface WorkTaskConfig {
+  prompt_blocks: PromptInputBlock[]
+  display_text: string
+  agent_type?: AgentType | null
+  mode_id?: string | null
+  config_values: Record<string, string>
+  label_snapshot?: AutomationLabelSnapshot | null
+}
+
+export interface WorkTask {
+  id: number
+  folder_id: number
+  title: string
+  // Serialized from an opaque JSON column; guard against a null parse fallback.
+  config: WorkTaskConfig | null
+  status: WorkTaskStatus
+  /** agent_error | setup_error | verdict_blocked | interrupted */
+  failure_reason: string | null
+  last_error: string | null
+  run_seq: number
+  sort_order: number
+  worktree_folder_id: number | null
+  /** A worktree is recorded but unusable — its folder row was removed or its
+   *  directory is gone from disk. Merge cannot run; review offers "complete"
+   *  instead. Absent = false (stamped by the list/get commands). */
+  worktree_missing?: boolean
+  /** The agent that runs — or ran — this task, resolved by the list/get
+   *  commands the way the engine resolves it at launch (the conversation that
+   *  actually ran, else the task's override, else the folder's task settings,
+   *  else the folder default). Absent/null = nothing configured anywhere. */
+  agent_type?: AgentType | null
+  conversation_id: number | null
+  /** Live ACP connection of the current generation; stale after a settle —
+   *  gate on status before attaching. */
+  connection_id: string | null
+  base_branch: string | null
+  base_sha: string | null
+  work_branch: string | null
+  /** null = nothing pending; "failed" = worktree cleanup failed (retryable). */
+  cleanup_state: string | null
+  verdict: string | null
+  result_summary: string | null
+  files_changed: number | null
+  additions: number | null
+  deletions: number | null
+  merge_commit: string | null
+  /** Acceptance red/green light of the current review, if a preflight
+   *  command ran. */
+  preflight: WorkTaskPreflight | null
+  /** The merge this reviewed task is waiting to run — the user clicked merge
+   *  while another task of the same project was landing. Absent/null = not
+   *  queued; the rank comes from ordering the folder's queued tasks by
+   *  `queued_at`. */
+  merge_queued?: WorkTaskQueuedMerge | null
+  archived_at: string | null
+  /** Planned start of a to-do task (ISO); null = no plan. Consumed the moment
+   *  the task is claimed, by the scheduler or by hand. */
+  scheduled_at: string | null
+  /** Latest agent_progress milestone — present on live (running/awaiting/merging) rows only. */
+  latest_progress?: string | null
+  created_at: string
+  updated_at: string
+  started_at: string | null
+  settled_at: string | null
+  finished_at: string | null
+}
+
+/** A merge parked on a reviewed task while its project lands another one. */
+export interface WorkTaskQueuedMerge {
+  /** The commit message the user typed; null = the agent writes it. */
+  message: string | null
+  delete_worktree: boolean
+  /** Place in line (ISO instant) — the order the engine's pump dispatches in. */
+  queued_at: string
+}
+
+/** Result of the folder's preflight command for one review generation. */
+export interface WorkTaskPreflight {
+  status: "running" | "passed" | "failed"
+  /** Display name of the folder command that ran. */
+  command: string
+  exit_code?: number | null
+  /** Trailing combined output — present when the light is red. */
+  output_tail?: string | null
+}
+
+/** One append-only timeline entry ("how the task advanced"). */
+export interface WorkTaskEvent {
+  id: number
+  task_id: number
+  kind: string
+  actor: string
+  payload: Record<string, unknown> | null
+  created_at: string
+}
+
+export interface WorkTaskDraft {
+  folder_id: number
+  title: string
+  config: WorkTaskConfig
+}
+
+/** A saved task blueprint (global; the folder is picked at creation time).
+ *  Saving under an existing name replaces that template. */
+export interface WorkTaskTemplate {
+  id: number
+  name: string
+  title: string
+  // Serialized from an opaque JSON column; guard against a null parse fallback.
+  config: WorkTaskConfig | null
+  created_at: string
+  updated_at: string
+}
+
+/** Per-folder task defaults (work_task_settings.config). */
+export interface WorkTaskFolderSettings {
+  default_agent_type?: AgentType | null
+  mode_id?: string | null
+  config_values: Record<string, string>
+  label_snapshot?: AutomationLabelSnapshot | null
+  auto_process: boolean
+  /** 0 = unlimited. */
+  max_concurrent: number
+  merge_strategy: "squash" | "merge"
+  /** Land reviewed tasks automatically: when a task settles into review and is
+   *  actually mergeable, the engine dispatches the same merge the button would
+   *  (agent-written commit message, worktree per `delete_worktree_default`). */
+  auto_merge: boolean
+  delete_worktree_default: boolean
+  /** folder_command id run in the worktree when a task settles into review
+   *  (the acceptance red/green light); null = no preflight. */
+  preflight_command_id?: number | null
+  /** Free-form preflight shell line; wins over `preflight_command_id`. */
+  preflight_command?: string | null
+  /** Shell line run inside a freshly created worktree before the agent
+   *  starts (deps install, env seeding). */
+  init_command?: string | null
+  /** Extra instructions appended after the built-in prompt of a launch stage.
+   *  Keys are the engine's stage ids (`work` | `retry` | `return` | `merge`)
+   *  plus the reserved `all`, which applies to every stage. */
+  stage_prompts?: Record<string, string> | null
+}
+
+/** Changed file of a task worktree vs its recorded base. */
+export interface WorkTaskChangedFile {
+  file: string
+  additions: number
+  deletions: number
+}
+
+// --- Token usage dashboard (mirror of src-tauri/src/models/token_usage.rs) ---
+
+export type TokenUsageBucket = "day" | "week" | "month"
+
+export interface TokenUsageFilter {
+  /** Inclusive lower bound, ISO-8601. Omit for "since the first recorded turn". */
+  start?: string | null
+  /** Exclusive upper bound, ISO-8601. Omit for "up to now". */
+  end?: string | null
+  /** Selected folders; each is expanded server-side to its worktree children. */
+  folderIds?: number[] | null
+  /** `conversation.agent_type` wire names. */
+  agentTypes?: string[] | null
+  models?: string[] | null
+  bucket: TokenUsageBucket
+  /** `-new Date().getTimezoneOffset()` — all buckets are local-time buckets. */
+  tzOffsetMinutes: number
+  /** Also compute the equally-long window before `start`, for delta chips. */
+  comparePrevious?: boolean
+}
+
+export interface TokenUsageTotals {
+  input_tokens: number
+  output_tokens: number
+  cache_creation_tokens: number
+  cache_read_tokens: number
+  total_tokens: number
+  turn_count: number
+  conversation_count: number
+  /** Summed generation time of the counted turns, not time spent in the app. */
+  duration_ms: number
+  active_days: number
+}
+
+export interface TokenUsagePoint {
+  /** `YYYY-MM-DD` (day/week) or `YYYY-MM` (month), in the viewer's local time. */
+  bucket_key: string
+  start: string
+  end: string
+  input_tokens: number
+  output_tokens: number
+  cache_creation_tokens: number
+  cache_read_tokens: number
+  total_tokens: number
+  turn_count: number
+  conversation_count: number
+}
+
+export interface TokenUsageBreakdownItem {
+  /** Folder id as a string, agent wire name, or model name. */
+  key: string
+  label: string
+  input_tokens: number
+  output_tokens: number
+  cache_creation_tokens: number
+  cache_read_tokens: number
+  total_tokens: number
+  turn_count: number
+  conversation_count: number
+}
+
+export interface TokenUsageHeatCell {
+  /** 0 = Monday … 6 = Sunday, local time. */
+  weekday: number
+  /** 0–23, local time. */
+  hour: number
+  total_tokens: number
+  turn_count: number
+}
+
+export interface TokenUsageConversationItem {
+  conversation_id: number
+  title: string | null
+  agent_type: string
+  folder_label: string | null
+  total_tokens: number
+  turn_count: number
+  last_activity_at: string
+}
+
+export interface TokenUsageStreak {
+  longest_days: number
+  current_days: number
+  current_ends_on: string | null
+}
+
+export interface TokenUsageReport {
+  range_start: string | null
+  range_end: string | null
+  bucket: TokenUsageBucket
+  totals: TokenUsageTotals
+  previous_totals: TokenUsageTotals | null
+  series: TokenUsagePoint[]
+  by_folder: TokenUsageBreakdownItem[]
+  by_agent: TokenUsageBreakdownItem[]
+  by_model: TokenUsageBreakdownItem[]
+  heatmap: TokenUsageHeatCell[]
+  top_conversations: TokenUsageConversationItem[]
+  streak: TokenUsageStreak
+  first_activity_at: string | null
+  last_activity_at: string | null
+  /** The scan hit its row cap — the numbers cover only the most recent slice. */
+  truncated: boolean
+}
+
+export interface TokenUsageFolderFacet {
+  folder_id: number
+  /** Compact display name: the alias when set, else the folder name. The filter
+   *  list renders `alias [ name ]` from `name` + `alias` instead. */
+  label: string
+  /** The folder's real (on-disk) directory name, alias or not. */
+  name: string
+  /** User-set display alias, or null when unset. */
+  alias: string | null
+  path: string
+  parent_id: number | null
+}
+
+export interface TokenUsageFacets {
+  folders: TokenUsageFolderFacet[]
+  agents: string[]
+  models: string[]
+  data_start: string | null
+  data_end: string | null
+}
+
+export interface TokenUsageSyncStatus {
+  total_conversations: number
+  synced_conversations: number
+  stale_conversations: number
+  fact_rows: number
+  last_synced_at: string | null
+  running: boolean
+}
+
+export interface TokenUsageSyncResult {
+  scanned: number
+  synced: number
+  skipped: number
+  /** Real faults — retried next pass. The only counter that warrants a toast. */
+  failed: number
+  /** Transcripts that are gone for good: facts kept, stamp settled, never
+   *  retried. Deliberately silent — the reader cannot act on it. */
+  lost: number
+  turns_written: number
+  tokens_written: number
+  pruned_conversations: number
+}
+
+/** Payload of the `token-usage-sync://progress` event. */
+export interface TokenUsageSyncProgress {
+  done: number
+  total: number
+  current_title: string | null
+  /** Present only on the final tick. */
+  result: TokenUsageSyncResult | null
 }
 
 export interface PlanEntryInfo {
@@ -1865,10 +2299,26 @@ export type AcpEvent =
       request_id: string
       tool_call: unknown
       options: PermissionOptionInfo[]
+      /**
+       * How many FURTHER permission requests are queued behind this card. Only
+       * one card shows at a time, so this is what tells the user "the agent is
+       * waiting on me three more times" instead of leaving the rest looking
+       * like a hang. Optional: absent on pre-#442 persisted envelopes.
+       */
+      queued?: number
     }
   | {
       type: "permission_resolved"
       request_id: string
+    }
+  | {
+      /**
+       * Depth-only update: a new request queued up behind the visible card,
+       * which publishes no `permission_request` of its own. Without this the
+       * card's `queued` count would go stale.
+       */
+      type: "permission_queue_depth"
+      depth: number
     }
   | {
       type: "turn_complete"
@@ -1909,6 +2359,18 @@ export type AcpEvent =
       config_options: SessionConfigOptionInfo[]
     }
   | {
+      // The agent settled a `session/set_config_option` somewhere other than
+      // where the pick asked. Correlated backend-side (see the Rust
+      // `ConfigOptionRejected`) because only that side can tell a request's
+      // answer from an unsolicited option update. `requested` / `actual` are
+      // display labels, already resolved against the option's value list.
+      type: "config_option_rejected"
+      config_id: string
+      option_name: string
+      requested: string
+      actual: string
+    }
+  | {
       type: "selectors_ready"
     }
   | {
@@ -1943,6 +2405,17 @@ export type AcpEvent =
        * a durable cancelled state patch arrives.
        */
       terminal: boolean
+      /**
+       * Diagnostic evidence for errors the backend *inferred* rather than
+       * received — the `turn_failed_empty*` family, where the agent reported
+       * success and the wire carried no error. Agent stderr tail plus a
+       * summary of updates the backend could not parse.
+       *
+       * Already redacted and length-bounded by the backend. Render it in the
+       * alert detail only: it must not reach the OS notification or the
+       * connection-status tooltip.
+       */
+      details?: string | null
     }
   | {
       // codex-acp #289: a retryable turn error that keeps the turn alive (codex
@@ -2683,6 +3156,8 @@ export interface PendingPermissionState {
   tool_call: unknown
   options: PermissionOptionInfo[]
   created_at: string
+  /** Requests queued behind this card; kept live by `permission_queue_depth`. */
+  queued?: number
 }
 
 /**
@@ -2736,6 +3211,8 @@ export interface FeedbackItem {
 export interface SessionLastError {
   message: string
   code?: string | null
+  /** Mirrors `AcpEvent` error `details`; already redacted by the backend. */
+  details?: string | null
 }
 
 export interface LiveSessionSnapshot {
@@ -2792,6 +3269,11 @@ export interface LiveSessionSnapshot {
    *  The frontend gates the feedback bar on this — the agent's real capability —
    *  not the (possibly later-toggled) global setting. Absent → `false`. */
   feedback_tool_available?: boolean
+  /** Whether feedback notes ride the native `_session/steering` push channel
+   *  (synthesized backend-side from advertisement + registry policy + runtime
+   *  version proof — the frontend must NOT re-derive it from agent type).
+   *  Absent → `false`. */
+  native_steering_available?: boolean
   modes: SessionModeStateInfo | null
   current_mode: string | null
   config_options: SessionConfigOptionInfo[] | null
@@ -2854,6 +3336,14 @@ export interface AcpAgentInfo {
   available: boolean
   /** Backend distribution: npx, binary, uvx, or bundled. */
   distribution_type: string
+  /**
+   * Whether codeg's entry for this agent is a third-party ACP *adapter*
+   * wrapping a vendor CLI of a different name (Claude Code → claude-agent-acp,
+   * Codex → codex-acp). Surfaces without a preflight result use it to say "the
+   * ACP adapter isn't installed" rather than "the agent isn't" — the single
+   * most-reported confusion.
+   */
+  is_acp_adapter: boolean
   /**
    * For custom agents, where the definition came from ("registry" | "manual");
    * null for built-ins. A manual definition's registry_version is user-typed,
@@ -3070,6 +3560,8 @@ export interface AcpAgentStatus {
   available: boolean
   enabled: boolean
   installed_version: string | null
+  /** See AcpAgentInfo.is_acp_adapter. */
+  is_acp_adapter: boolean
 }
 
 // Environment diagnostics (returned by acp_env_diagnostics). Mirrors the Rust
@@ -3326,6 +3818,9 @@ export interface TerminalShellOption {
 export interface AvailableTerminalShells {
   options: TerminalShellOption[]
   effective_shell: string
+  /** Upstream v0.25 name for the resolved executable; same value as
+   *  `effective_shell` when both are present. */
+  resolved_shell?: string
 }
 
 export interface SystemRenderingSettings {
@@ -3550,7 +4045,14 @@ export type GitResetMode = "soft" | "mixed" | "hard" | "keep"
 export interface GitBranchList {
   local: string[]
   remote: string[]
+  /** Branches checked out in some *other* worktree than the queried path. */
   worktree_branches: string[]
+  /**
+   * The branch checked out in the repo's main working tree, when that is not the
+   * queried path itself. It appears in `worktree_branches` like any other — but
+   * its checkout is the repo, so it can neither be deleted nor removed.
+   */
+  main_worktree_branch: string | null
 }
 
 /**
@@ -3727,6 +4229,20 @@ export interface WorktreeResolution {
   folder_id: number | null
 }
 
+/**
+ * What removing a worktree actually did (mirrors Rust `GitWorktreeRemoval`).
+ * `worktree_path` is null when the branch had no worktree left to remove — what
+ * a retry after a partially applied removal sees. `folder_id` is the workspace
+ * folder dropped along with the directory (only the "…and branch" variant drops
+ * one), and `reparented` counts the conversations it moved to the repo folder.
+ */
+export interface GitWorktreeRemoval {
+  worktree_path: string | null
+  branch_deleted: boolean
+  folder_id: number | null
+  reparented: number
+}
+
 export interface GitConflictInfo {
   has_conflicts: boolean
   conflicted_files: string[]
@@ -3786,7 +4302,19 @@ export interface GitStashEntry {
 
 export type FileTreeNode =
   | { kind: "file"; name: string; path: string }
-  | { kind: "dir"; name: string; path: string; children: FileTreeNode[] }
+  | {
+      kind: "dir"
+      name: string
+      path: string
+      children: FileTreeNode[]
+      /**
+       * The directory is a symlink on disk. Omitted (rather than `false`) for
+       * ordinary directories to keep the broadcast tree snapshot small. The
+       * backend does not descend through links, so `children` arrives empty
+       * and the panel lazy-loads it on expand.
+       */
+      symlink?: boolean
+    }
 
 /** Flat gitignore-aware workspace entry returned by `list_workspace_files`. */
 export interface WorkspaceFileEntry {
@@ -3794,6 +4322,64 @@ export interface WorkspaceFileEntry {
   /** Path relative to the workspace root, always forward-slashed. */
   path: string
   kind: "file" | "dir"
+}
+
+/**
+ * A directory the user symlinked into a workspace folder, turning one root into
+ * a multi-folder workspace. `name` is the subdirectory the link occupies inside
+ * the root; `targetPath` is the real directory it points at.
+ */
+export interface FolderLinkDetail {
+  id: number
+  folderId: number
+  name: string
+  targetPath: string
+  status: FolderLinkStatus
+}
+
+/**
+ * Live state of a link, recomputed from disk on every list.
+ * - `ok` — the symlink is there and resolves to `targetPath`
+ * - `missing` — nothing at `<root>/<name>` any more
+ * - `conflicted` — a real directory (or a link elsewhere) took the name
+ * - `broken` — the link is there but its target no longer resolves
+ */
+export type FolderLinkStatus = "ok" | "missing" | "conflicted" | "broken"
+
+/** Why a picked directory cannot be linked. */
+export type FolderLinkRejection =
+  | "not_found"
+  | "not_a_directory"
+  | "same_as_root"
+  | "ancestor_of_root"
+  | "inside_root"
+  | "already_linked"
+  | "name_unavailable"
+
+/**
+ * Dry-run result for one picked directory: the name it would get and why it
+ * would be skipped. Computed server-side so the dialog reflects what is
+ * actually on disk rather than guessing.
+ */
+export interface FolderLinkPlan {
+  targetPath: string
+  /** Name derived from the directory, before disambiguation. */
+  baseName: string
+  /** Name that would be created; empty when `rejection` is set. */
+  name: string
+  /** True when `name` had to differ from `baseName`. */
+  renamed: boolean
+  /** The collision was with a real entry already in the root, not another link. */
+  collidesWithExistingEntry: boolean
+  rejection: FolderLinkRejection | null
+  /** Name of the existing link, when `rejection` is `already_linked`. */
+  existingLinkName: string | null
+}
+
+/** One directory to link, with an optional user-chosen name. */
+export interface FolderLinkRequestItem {
+  path: string
+  name?: string
 }
 
 export interface DirectoryEntry {
@@ -3954,11 +4540,36 @@ export interface CheckItem {
   fixes: FixAction[]
 }
 
+/**
+ * Structured explainer data for agents whose codeg entry is a third-party ACP
+ * adapter rather than the vendor's own CLI (Claude Code, Codex). The backend
+ * ships only facts — the wording lives in i18n, the same way buildVersionCheck
+ * owns the version card's copy.
+ */
+export interface AdapterInfo {
+  /** npm spec codeg installs, e.g. "@agentclientprotocol/codex-acp@1.1.9". */
+  adapter_package: string
+  /** Command the launch gate resolves, e.g. "codex-acp". */
+  adapter_cmd: string
+  adapter_installed: boolean
+  /** The vendor CLI, e.g. "codex". */
+  native_cmd: string
+  /** Display name for the vendor CLI, e.g. "Codex CLI". */
+  native_label: string
+  /** Where the user's own vendor CLI was found. codeg never launches it. */
+  native_path: string | null
+  /** Config dir both read, so installing the adapter needs no second login. */
+  shared_config_dir: string
+  docs_url: string
+}
+
 export interface PreflightResult {
   agent_type: AgentType
   agent_name: string
   passed: boolean
   checks: CheckItem[]
+  /** Null unless this agent is an ACP adapter. Never affects `passed`. */
+  adapter: AdapterInfo | null
 }
 
 // ─── OpenCode Plugins ───

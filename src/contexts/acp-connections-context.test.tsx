@@ -107,6 +107,10 @@ const h = vi.hoisted(() => {
       // use a lightweight wrapper registered in the describe block.
       void handler
     },
+    // Stable across renders so tests can assert on what the error handler
+    // routes to the status-bar alert vs. to the OS notification.
+    sendSystemNotification: vi.fn(async () => undefined),
+    toastWarning: vi.fn(),
   }
 })
 
@@ -127,7 +131,7 @@ vi.mock("next-intl", () => ({
 }))
 
 vi.mock("@/lib/platform", () => ({
-  subscribe: vi.fn(async () => () => {}),
+  subscribe: h.subscribe,
   getEventStream: () => h.eventStreamValue,
 }))
 
@@ -144,7 +148,11 @@ vi.mock("@/contexts/active-folder-context", () => ({
 }))
 
 vi.mock("@/lib/notification", () => ({
-  sendSystemNotification: vi.fn(async () => undefined),
+  sendSystemNotification: h.sendSystemNotification,
+}))
+
+vi.mock("sonner", () => ({
+  toast: { warning: h.toastWarning },
 }))
 
 vi.mock("@/lib/selector-prefs-storage", () => ({
@@ -351,6 +359,7 @@ beforeEach(() => {
     enabled: true,
     available: true,
     installed_version: "1.0.0",
+    is_acp_adapter: true,
   })
   h.acpConnect.mockResolvedValue("spawned-conn")
   h.acpDisconnect.mockResolvedValue(undefined)
@@ -629,115 +638,96 @@ describe("AcpConnectionsProvider cross-client viewer lifecycle", () => {
   })
 })
 
-describe("AcpConnectionsProvider permission request details", () => {
-  it("hydrates a permission request from an existing live tool call input", async () => {
+// Single-clicking a sidebar conversation opens a PREVIEW tab; the next
+// single-click replaces it. That release must never end a turn the user only
+// clicked in to watch — an owner's acpDisconnect kills the agent CLI mid-turn,
+// which the agent writes into its transcript as an interrupted request.
+describe("AcpConnectionsProvider preview-tab release (disconnectIfIdle)", () => {
+  async function connectOwner(): Promise<AttachHandlers> {
+    h.acpFindConnectionForConversation.mockResolvedValue(null)
     await mountProvider()
-
     await act(async () => {
-      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1")
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1", 42)
     })
+    return latestAttachHandlers()
+  }
 
-    const handlers = latestAttachHandlers()
-    const rawInput = JSON.stringify({ command: "pnpm test", cwd: "/tmp/x" })
-
+  it("keeps a PROMPTING owner alive when its preview tab is replaced", async () => {
+    const handlers = await connectOwner()
     emitAcpEvent(handlers, {
       seq: 1,
       connection_id: "spawned-conn",
-      type: "tool_call",
-      tool_call_id: "call_1",
-      title: "Bash",
-      kind: "execute",
-      status: "pending",
-      content: null,
-      raw_input: rawInput,
-      raw_output: null,
+      type: "status_changed",
+      status: "prompting",
     })
+
+    await act(async () => {
+      await h.actions!.disconnectIfIdle(TAB)
+    })
+
+    expect(h.acpDisconnect).not.toHaveBeenCalled()
+    // Left in the store, still streaming: the idle sweep reclaims it once the
+    // turn settles (the tab is gone, so nothing else keeps it alive).
+    expect(h.store!.getConnection(TAB)?.status).toBe("prompting")
+  })
+
+  it("keeps an owner with outstanding background work alive", async () => {
+    const handlers = await connectOwner()
+    emitAcpEvent(handlers, {
+      seq: 1,
+      connection_id: "spawned-conn",
+      type: "status_changed",
+      status: "connected",
+    })
+    // Turn is over, but launched sub-agents / background shells are not:
+    // disconnecting would kill the agent CLI and that work with it.
     emitAcpEvent(handlers, {
       seq: 2,
       connection_id: "spawned-conn",
-      type: "permission_request",
-      request_id: "req-1",
-      tool_call: {
-        kind: "execute",
-        status: "pending",
-        toolCallId: "call_1",
-      },
-      options: [],
+      type: "background_activity",
+      session_id: "sess-1",
+      turns: [],
+      outstanding: 1,
+      settled: [],
+      watermark: 0,
     })
-
-    const permission = h.store!.getConnection(TAB)!.pendingPermission
-    expect(parsePermissionToolCall(permission?.tool_call).title).toBe("Bash")
-    expect(parsePermissionToolCall(permission?.tool_call).command).toBe(
-      "pnpm test"
-    )
-    expect(parsePermissionToolCall(permission?.tool_call).cwd).toBe("/tmp/x")
-  })
-
-  it("backfills an already-open permission request when tool input arrives later", async () => {
-    const originalRaf = globalThis.requestAnimationFrame
-    const originalCancelRaf = globalThis.cancelAnimationFrame
-    vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => {
-      cb(0)
-      return 1
-    })
-    vi.stubGlobal("cancelAnimationFrame", () => {})
-
-    try {
-      await mountProvider()
-
-      await act(async () => {
-        await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1")
-      })
-
-      const handlers = latestAttachHandlers()
-
-      emitAcpEvent(handlers, {
-        seq: 1,
-        connection_id: "spawned-conn",
-        type: "permission_request",
-        request_id: "req-2",
-        tool_call: {
-          kind: "execute",
-          status: "pending",
-          toolCallId: "call_2",
-        },
-        options: [],
-      })
-
-      expect(
-        parsePermissionToolCall(
-          h.store!.getConnection(TAB)!.pendingPermission?.tool_call
-        ).command
-      ).toBeNull()
-
-      emitAcpEvent(handlers, {
-        seq: 2,
-        connection_id: "spawned-conn",
-        type: "tool_call_update",
-        tool_call_id: "call_2",
-        title: "Bash",
-        status: "pending",
-        content: null,
-        raw_input: JSON.stringify({ command: "pnpm build" }),
-        raw_output: null,
-      })
-
-      expect(
-        parsePermissionToolCall(
-          h.store!.getConnection(TAB)!.pendingPermission?.tool_call
-        ).command
-      ).toBe("pnpm build")
-    } finally {
-      vi.stubGlobal("requestAnimationFrame", originalRaf)
-      vi.stubGlobal("cancelAnimationFrame", originalCancelRaf)
-    }
-  })
-
-  it("hydrates snapshot permission details from active tool call input", async () => {
-    await mountProvider()
+    expect(h.store!.getConnection(TAB)?.backgroundOutstanding).toBe(1)
 
     await act(async () => {
-      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1")
+      await h.actions!.disconnectIfIdle(TAB)
+    })
+
+    expect(h.acpDisconnect).not.toHaveBeenCalled()
+  })
+
+  it("disconnects an IDLE owner right away (the reclaim this release exists for)", async () => {
+    const handlers = await connectOwner()
+    emitAcpEvent(handlers, {
+      seq: 1,
+      connection_id: "spawned-conn",
+      type: "status_changed",
+      status: "connected",
+    })
+
+    await act(async () => {
+      await h.actions!.disconnectIfIdle(TAB)
+    })
+
+    expect(h.acpDisconnect).toHaveBeenCalledWith(
+      "spawned-conn",
+      expect.objectContaining({ origin: "explicit_user" })
+    )
+    expect(h.store!.getConnection(TAB)).toBeUndefined()
+  })
+
+  it("detaches a mid-turn VIEWER without killing the owner's agent", async () => {
+    h.acpFindConnectionForConversation.mockResolvedValue({
+      connection_id: "owner-conn",
+      event_seq: 0,
+    })
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1", 42)
     })
 
     const handlers = latestAttachHandlers()
@@ -796,65 +786,15 @@ describe("AcpConnectionsProvider permission request details", () => {
       activeDelegations: [],
       toolWatchdogProjections: {},
     })
-    hydrateSnapshot(handlers, {
-      connection_id: "spawned-conn",
-      conversation_id: null,
-      folder_id: null,
-      status: "connected",
-      external_id: "sess-1",
-      live_message: {
-        id: "live-1",
-        role: "assistant",
-        started_at: new Date(0).toISOString(),
-        content: [{ kind: "tool_call_ref", tool_call_id: "call_snapshot" }],
-      },
-      active_tool_calls: [
-        {
-          id: "call_snapshot",
-          kind: "execute",
-          label: "Bash",
-          status: "pending",
-          input: { command: "pnpm test -- --runInBand", cwd: "/tmp/x" },
-          output: null,
-          content: null,
-          locations: null,
-          meta: null,
-        },
-      ],
-      pending_permission: {
-        request_id: "req-snapshot",
-        tool_call_id: "call_snapshot",
-        tool_call: {
-          kind: "execute",
-          status: "pending",
-          toolCallId: "call_snapshot",
-        },
-        options: [],
-        created_at: new Date(0).toISOString(),
-      },
-      pending_question: null,
-      pending_user_message: null,
-      active_delegations: [],
-      feedback: [],
-      feedback_tool_available: false,
-      modes: null,
-      current_mode: null,
-      config_options: null,
-      prompt_capabilities: null,
-      usage: null,
-      fork_supported: false,
-      available_commands: [],
-      selectors_ready: true,
-      config_stale: false,
-      config_stale_kind: null,
-      event_seq: 5,
+
+    await act(async () => {
+      await h.actions!.disconnectIfIdle(TAB)
     })
 
-    const permission = h.store!.getConnection(TAB)!.pendingPermission
-    const parsed = parsePermissionToolCall(permission?.tool_call)
-    expect(parsed.title).toBe("Bash")
-    expect(parsed.command).toBe("pnpm test -- --runInBand")
-    expect(parsed.cwd).toBe("/tmp/x")
+    // A viewer never owns the backend process, so busy or not it detaches —
+    // and the idle sweep skips viewers, so leaving one would leak its stream.
+    expect(h.acpDisconnect).not.toHaveBeenCalled()
+    expect(h.store!.getConnection(TAB)).toBeUndefined()
   })
 
   it("clears a pending permission when the turn completes", async () => {
@@ -1140,11 +1080,17 @@ describe("AcpConnectionsProvider structured shell connect errors", () => {
 
     await connectAndCatch()
 
-    const call = h.pushAlert.mock.calls.find(
-      (c) =>
-        typeof c[1] === "string" &&
-        (c[1] as string).includes("blocked.sdkMissing")
-    )
+    const call = h.pushAlert.mock.calls.find((c) => {
+      const title = typeof c[1] === "string" ? c[1] : ""
+      const detail = typeof c[2] === "string" ? c[2] : ""
+      return (
+        title.includes("blocked.sdkMissing") ||
+        title.includes("blocked.adapterMissing") ||
+        detail.includes("is not installed") ||
+        detail.includes("agentsSetupHint")
+      )
+    })
+    // Debug leftover if this still fails: dump calls.
     expect(call).toBeTruthy()
     expect(String(call![2])).toMatch(/agentsSetupHint/)
     // Open Agent Settings action is attached as 4th arg.
@@ -6210,6 +6156,52 @@ describe("AcpConnectionsProvider observe_existing intent", () => {
     vi.useRealTimers()
   })
 
+  function snapshotPatch(overrides: {
+    eventSeq: number
+    lastError: string | null
+    lastErrorDetails?: string | null
+    connectionId?: string
+  }) {
+    return {
+      connectionId: "spawned-conn",
+      status: "connected",
+      sessionId: null,
+      modes: null,
+      configOptions: null,
+      availableCommands: null,
+      usage: null,
+      liveMessage: null,
+      pendingPermission: null,
+      pendingAskQuestion: null,
+      pendingUserMessage: null,
+      promptCapabilities: null,
+      selectorsReady: false,
+      supportsFork: false,
+      configStale: false,
+      configStaleKind: null,
+      backgroundOutstanding: 0,
+      activeDelegations: [],
+      lastErrorDetails: null,
+      ...overrides,
+    }
+  }
+
+  async function connectOwner(): Promise<AttachHandlers> {
+    h.acpFindConnectionForConversation.mockResolvedValue(null)
+    h.acpGetAgentStatus.mockResolvedValue({
+      agent_type: "claude_code",
+      enabled: true,
+      available: true,
+      installed_version: "1.0.0",
+      is_acp_adapter: true,
+    })
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1", 42)
+    })
+    return latestAttachHandlers()
+  }
+
   it("observe_existing branches before SDK preflight and never spawns", async () => {
     h.acpFindConnectionForConversation.mockResolvedValue(null)
     await mountProvider()
@@ -7274,11 +7266,13 @@ describe("AcpConnectionsProvider observe_existing intent", () => {
   it("handoff re-entry microtask is cancelled by disconnect before it runs", async () => {
     // After re-attach, broker removal queues own_or_observe. Close before the
     // microtask runs must not start owner ACP (Task 5 r3 Important 1).
+    await mountProvider()
     h.acpFindConnectionForConversation.mockResolvedValue({
       connection_id: "broker-child",
       event_seq: 0,
     })
-    await mountProvider()
+
+    h.toastWarning.mockClear()
     await act(async () => {
       await h.actions!.connect(
         TAB,
@@ -7543,6 +7537,79 @@ describe("AcpConnectionsProvider observe_existing intent", () => {
     // Other observer alias may still reference the retained broker entry.
     expect(h.store!.getConnection(TAB_B)?.connectionId).toBe("broker-child")
   })
+
+  // Alerts are live-only, so a client that attached after the empty turn has
+  // the snapshot as its ONLY channel for the diagnosis.
+  it("raises an alert for snapshot-carried details without touching conn.error or notifications", async () => {
+    const handlers = await connectOwner()
+    h.pushAlert.mockClear()
+    h.sendSystemNotification.mockClear()
+
+    const details =
+      "stderr (this turn, last 1 lines):\n  Error: 401 Unauthorized"
+    h.denormalizeSnapshot.mockReturnValue(
+      snapshotPatch({
+        eventSeq: 5,
+        lastError: "agent ended the turn without producing any response.",
+        lastErrorDetails: details,
+      })
+    )
+    hydrateSnapshot(handlers, {
+      event_seq: 5,
+    } as unknown as LiveSessionSnapshot)
+
+    const alertCalls = h.pushAlert.mock.calls
+    const [, , alertDetail, , alertEvidence] =
+      alertCalls[alertCalls.length - 1]!
+    expect(alertDetail).toBe(
+      "agent ended the turn without producing any response."
+    )
+    expect(alertEvidence).toBe(details)
+    // The tooltip string stays the single-line message.
+    expect(h.store!.getConnection(TAB)!.error).toBe(
+      "agent ended the turn without producing any response."
+    )
+    expect(h.sendSystemNotification).not.toHaveBeenCalled()
+  })
+
+  it("does not re-alert the same details on every re-attach", async () => {
+    const handlers = await connectOwner()
+    h.pushAlert.mockClear()
+
+    const patch = snapshotPatch({
+      eventSeq: 5,
+      lastError: "boom",
+      lastErrorDetails: "stderr (this turn, last 1 lines):\n  same evidence",
+    })
+    h.denormalizeSnapshot.mockReturnValue(patch)
+    hydrateSnapshot(handlers, {
+      event_seq: 5,
+    } as unknown as LiveSessionSnapshot)
+    const afterFirst = h.pushAlert.mock.calls.length
+    expect(afterFirst).toBe(1)
+
+    // A reconnect replays the same snapshot.
+    hydrateSnapshot(handlers, {
+      event_seq: 6,
+    } as unknown as LiveSessionSnapshot)
+    expect(h.pushAlert.mock.calls.length).toBe(afterFirst)
+  })
+
+  it("stays silent for snapshot errors that carry no details", async () => {
+    const handlers = await connectOwner()
+    h.pushAlert.mockClear()
+
+    h.denormalizeSnapshot.mockReturnValue(
+      snapshotPatch({ eventSeq: 5, lastError: "some older error" })
+    )
+    hydrateSnapshot(handlers, {
+      event_seq: 5,
+    } as unknown as LiveSessionSnapshot)
+
+    // Attaching to a connection with an ordinary past error must not start
+    // raising alerts it never used to.
+    expect(h.pushAlert).not.toHaveBeenCalled()
+  })
 })
 
 describe("global acp://event listener is mount-once", () => {
@@ -7641,5 +7708,222 @@ describe("global acp://event listener is mount-once", () => {
     expect(vi.mocked(subscribeDesktopAcpEvents)).toHaveBeenCalledTimes(1)
     unmount()
     expect(h.desktopUnsubscribe).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe("delegation-child attach: mid-turn hydration", () => {
+  // A work-task session viewer attaches to a turn that is ALREADY running.
+  // On desktop the `acp://event` firehose carries only FUTURE events, so
+  // without a snapshot the child sits at DELEGATION_CHILD_ATTACH's synthetic
+  // "connected" with an empty live message — the viewer shows a stale
+  // persisted transcript and never streams. Real delegation children attach
+  // at spawn time and must NOT pay for a snapshot fetch.
+  const CHILD = "task-conn-1"
+
+  function attachChild(hydrate: boolean) {
+    h.actions!.attachDelegationChild({
+      connectionId: CHILD,
+      parentConnectionId: CHILD,
+      parentToolUseId: "work-task-9",
+      agentType: "claude_code",
+      hydrate,
+    })
+  }
+
+  beforeEach(() => {
+    // Desktop firehose path (the web attach protocol always opens with a
+    // snapshot, so the gap this covers is desktop-only).
+    h.eventStreamValue = null
+    h.subscribe.mockClear()
+    h.acpGetSessionSnapshot.mockResolvedValue({
+      connection_id: CHILD,
+      event_seq: 7,
+    })
+    h.denormalizeSnapshot.mockReturnValue({
+      connectionId: CHILD,
+      status: "prompting",
+      sessionId: "sess-child",
+      modes: null,
+      configOptions: null,
+      availableCommands: null,
+      usage: null,
+      liveMessage: null,
+      pendingPermission: null,
+      pendingAskQuestion: null,
+      pendingUserMessage: null,
+      pendingPlanApproval: null,
+      promptCapabilities: null,
+      selectorsReady: false,
+      supportsFork: false,
+      configStale: false,
+      configStaleKind: null,
+      lastError: null,
+      eventSeq: 7,
+      activeDelegations: [],
+    })
+  })
+
+  it("hydrates the in-flight turn, then routes later firehose events", async () => {
+    await mountProvider()
+
+    await act(async () => {
+      attachChild(true)
+    })
+    await act(async () => {})
+
+    expect(h.acpGetSessionSnapshot).toHaveBeenCalledWith(CHILD)
+    // The load-bearing bit: "prompting" is what makes the read-only viewer
+    // render the live stream instead of a settled transcript.
+    expect(h.store!.getConnection(CHILD)?.status).toBe("prompting")
+    expect(h.store!.getConnection(CHILD)?.lastAppliedSeq).toBe(7)
+
+    // Reverse-map routing is installed AFTER hydration, so post-snapshot
+    // events still land (and pre-snapshot ones are deduped by seq).
+    act(() => {
+      h.emitDesktopBatch({
+        batch_id: 1,
+        events: [
+          {
+            seq: 8,
+            connection_id: CHILD,
+            type: "content_delta",
+            text: "hi",
+          } as EventEnvelope,
+        ],
+      })
+      h.runAnimationFrame()
+    })
+    expect(h.store!.getConnection(CHILD)?.lastAppliedSeq).toBe(8)
+  })
+
+  it("re-seeds delegation bindings the hydrated snapshot carries", async () => {
+    // `delegation_started` is transient — never in the snapshot's event set and
+    // never replayed — so a viewer opening onto a turn that already delegated
+    // establishes no binding unless the snapshot's `active_delegations` is
+    // fanned out. Without this the work-task dialog's sub-agent cards lose
+    // their agent icon/label, the child's live sub-stream and the "待批准"
+    // badge. The other three snapshot consumers already did this; the desktop
+    // hydrate branch did not.
+    const active = [
+      {
+        parent_tool_use_id: "toolu_child",
+        child_connection_id: "child-conn",
+        child_conversation_id: 4242,
+        agent_type: "codex" as const,
+        task_preview: "review the diff",
+        task_id: "task-1",
+      },
+    ]
+    h.denormalizeSnapshot.mockReturnValue({
+      connectionId: CHILD,
+      status: "prompting",
+      sessionId: "sess-child",
+      modes: null,
+      configOptions: null,
+      availableCommands: null,
+      usage: null,
+      liveMessage: null,
+      pendingPermission: null,
+      pendingAskQuestion: null,
+      pendingUserMessage: null,
+      pendingPlanApproval: null,
+      promptCapabilities: null,
+      selectorsReady: false,
+      supportsFork: false,
+      configStale: false,
+      configStaleKind: null,
+      lastError: null,
+      eventSeq: 7,
+      activeDelegations: active,
+    })
+    await mountProvider()
+
+    await act(async () => {
+      attachChild(true)
+    })
+    await act(async () => {})
+
+    expect(h.buildDelegationSeedEnvelopes).toHaveBeenCalledWith(
+      CHILD,
+      active,
+      7
+    )
+  })
+
+  it("does not seed when the child detached while the snapshot was in flight", async () => {
+    let resolveSnapshot: (v: unknown) => void = () => {}
+    h.acpGetSessionSnapshot.mockImplementation(
+      () =>
+        new Promise((res) => {
+          resolveSnapshot = res
+        })
+    )
+    await mountProvider()
+
+    await act(async () => {
+      attachChild(true)
+    })
+    await act(async () => {
+      h.actions!.detachDelegationChild(CHILD)
+    })
+    await act(async () => {
+      resolveSnapshot({ connection_id: CHILD, event_seq: 7 })
+    })
+    await act(async () => {})
+
+    expect(h.buildDelegationSeedEnvelopes).not.toHaveBeenCalled()
+  })
+
+  it("skips the snapshot for a spawn-time child attach", async () => {
+    await mountProvider()
+
+    await act(async () => {
+      attachChild(false)
+    })
+    await act(async () => {})
+
+    expect(h.acpGetSessionSnapshot).not.toHaveBeenCalled()
+    expect(h.store!.getConnection(CHILD)?.status).toBe("connected")
+  })
+
+  it("does not hydrate or route a child detached while the snapshot is in flight", async () => {
+    let resolveSnapshot: (v: unknown) => void = () => {}
+    h.acpGetSessionSnapshot.mockImplementation(
+      () =>
+        new Promise((res) => {
+          resolveSnapshot = res
+        })
+    )
+    await mountProvider()
+
+    await act(async () => {
+      attachChild(true)
+    })
+    await act(async () => {
+      h.actions!.detachDelegationChild(CHILD)
+    })
+    await act(async () => {
+      resolveSnapshot({ connection_id: CHILD, event_seq: 7 })
+    })
+    await act(async () => {})
+
+    // The viewer is gone: no resurrected connection state, and the firehose
+    // must not be routing to a contextKey nobody is watching.
+    expect(h.store!.getConnection(CHILD)).toBeUndefined()
+    act(() => {
+      h.emitDesktopBatch({
+        batch_id: 1,
+        events: [
+          {
+            seq: 8,
+            connection_id: CHILD,
+            type: "content_delta",
+            text: "hi",
+          } as EventEnvelope,
+        ],
+      })
+      h.runAnimationFrame()
+    })
+    expect(h.store!.getConnection(CHILD)).toBeUndefined()
   })
 })

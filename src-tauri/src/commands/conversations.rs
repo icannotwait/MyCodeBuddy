@@ -2905,8 +2905,8 @@ mod tests {
     }
 
     use super::*;
-    use crate::acp::delegation::workflow::{load_simple_workflow, register_simple_workflow};
     use crate::acp::delegation::route::DelegationRoutePolicy;
+    use crate::acp::delegation::workflow::{load_simple_workflow, register_simple_workflow};
     use crate::app_error::AppErrorCode;
     use crate::auto_title::InternalSessionPurpose;
     use crate::db::service::import_service;
@@ -3145,6 +3145,7 @@ mod tests {
             delegation_finished_at: None,
             delegation_runtime_stats: None,
             delegation_attention_request: None,
+            origin_cwd: None,
         }
     }
 
@@ -3215,6 +3216,7 @@ mod tests {
                 tool_use_id: Some("tu-1".into()),
                 tool_name: "delegate_to_agent".into(),
                 input_preview: None,
+                status: None,
                 meta: Some(pre_existing),
             }],
             timestamp: chrono::Utc::now(),
@@ -3332,6 +3334,7 @@ mod tests {
                 tool_use_id: tool_use_id.map(String::from),
                 tool_name: tool_name.into(),
                 input_preview: None,
+                status: None,
                 meta: None,
             }],
             timestamp: chrono::Utc::now(),
@@ -4064,6 +4067,7 @@ Call get_delegation_status with the returned task_id to collect the result.";
                     tool_use_id: Some("call-live".into()),
                     tool_name: "delegate_to_agent".into(),
                     input_preview: None,
+                    status: None,
                     meta: None,
                 },
                 ContentBlock::ToolResult {
@@ -4160,6 +4164,7 @@ Call get_delegation_status with the returned task_id to collect the result.";
                 tool_use_id: Some("tu-1".into()),
                 tool_name: "delegate_to_agent".into(),
                 input_preview: None,
+                status: None,
                 meta: Some(pre_existing.clone()),
             }],
             timestamp: chrono::Utc::now(),

@@ -1088,8 +1088,14 @@ pub async fn open_stash_window(
     Ok(())
 }
 
+/// Open (or raise) the push window for a folder.
+///
+/// `branch` is the branch to push: `None` targets whatever is checked out (the
+/// toolbars' "push" entry), while the branch selector's per-branch push names
+/// one explicitly.
 #[cfg(feature = "tauri-runtime")]
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
+#[allow(clippy::too_many_arguments)]
 pub async fn open_push_window(
     app: AppHandle,
     window: tauri::WebviewWindow,
@@ -1097,12 +1103,14 @@ pub async fn open_push_window(
     folder_id: i32,
     locale: Option<crate::models::system::AppLocale>,
     remote_connection_id: Option<i32>,
+    branch: Option<String>,
 ) -> Result<(), AppCommandError> {
     let owner_label = window.label().to_string();
     let label = match remote_connection_id {
         Some(remote_id) => format!("remote-push-{remote_id}-{folder_id}"),
         None => format!("push-{folder_id}"),
     };
+    let branch = branch.filter(|value| !value.trim().is_empty());
 
     if let Some(existing) = app.get_webview_window(&label) {
         post_window_setup(&existing);
@@ -1110,6 +1118,28 @@ pub async fn open_push_window(
         existing
             .set_focus()
             .map_err(|e| AppCommandError::window("Failed to focus push window", e.to_string()))?;
+        // The window is reused as-is, so its URL still carries whatever branch it
+        // was opened for. Without this the user picks branch B, we raise the
+        // window still showing branch A, and the push button lies about its
+        // target — so tell the live window to retarget.
+        //
+        // Emitted UNCONDITIONALLY, `None` included: going the other way — a
+        // window opened for branch B, then raised by the plain "push" entry that
+        // means "whatever is checked out" — is the same lie, so a null branch has
+        // to reset the window rather than leave it on B.
+        //
+        // Addressed to THAT window rather than broadcast: folder ids are scoped
+        // per connection, so a remote workspace's folder 5 and the local folder 5
+        // both answer to the same `folder_id` and a broadcast would retarget the
+        // wrong window. The address only binds because the window listens
+        // against its own label — a listener on the default `Any` target would
+        // receive this regardless (Tauri's `match_any_or_filter`).
+        use tauri::Emitter;
+        let _ = app.emit_to(
+            &label,
+            "push://retarget-branch",
+            serde_json::json!({ "folder_id": folder_id, "branch": branch }),
+        );
         return Ok(());
     }
 
@@ -1126,8 +1156,16 @@ pub async fn open_push_window(
             })?;
         format!("{} - {}", titles.push, folder.name)
     };
-    let (url_str, remote_window_id) =
-        route_with_new_remote_window(format!("push?folderId={folder_id}"), remote_connection_id);
+    // Branch names carry `/` (and may carry `#`/`?`), so they have to be encoded
+    // before riding a query string.
+    let branch_param = branch
+        .as_deref()
+        .map(|value| format!("&branch={}", urlencoding::encode(value)))
+        .unwrap_or_default();
+    let (url_str, remote_window_id) = route_with_new_remote_window(
+        format!("push?folderId={folder_id}{branch_param}"),
+        remote_connection_id,
+    );
     let url = WebviewUrl::App(url_str.into());
     let builder = WebviewWindowBuilder::new(&app, &label, url)
         .title(window_title)

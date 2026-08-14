@@ -4,6 +4,7 @@
  * real ProseMirror view (jsdom can't emulate IME composition reliably).
  */
 
+import { isImeCompositionKey } from "@/lib/ime-composition"
 import { matchShortcutEvent } from "@/lib/keyboard-shortcuts"
 
 /** The subset of a keydown event the submit decision depends on. */
@@ -45,9 +46,7 @@ export function shouldSubmitOnEnter(
   }
   // IME guard: never submit while a composition is in flight. The Enter that
   // confirms a CJK candidate reports isComposing / keyCode 229 / view.composing.
-  if (event.isComposing || event.keyCode === 229 || context.composing) {
-    return false
-  }
+  if (isImeCompositionKey(event) || context.composing) return false
   // Structural Enter inside code blocks and lists (per the composer design).
   if (context.inCodeBlock || context.inList) return false
   return true
@@ -85,9 +84,7 @@ export function decideComposerKey(
   context: SubmitKeyContext,
   bindings: ComposerKeyBindings
 ): ComposerKeyAction {
-  if (event.isComposing || event.keyCode === 229 || context.composing) {
-    return null
-  }
+  if (isImeCompositionKey(event) || context.composing) return null
   const bareEnter =
     event.key === "Enter" &&
     !event.shiftKey &&

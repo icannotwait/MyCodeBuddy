@@ -51,16 +51,15 @@ use crate::acp::delegation::transport::{
     client_complete_work_round_trip, client_feedback_round_trip,
     client_get_workflow_state_round_trip, client_parent_decision_round_trip,
     client_publish_workflow_round_trip, client_recover_workflow_round_trip,
-    client_register_simple_workflow_round_trip,
-    client_recovery_authorization_round_trip, client_reply_delegation_round_trip,
-    client_round_trip, client_session_round_trip, client_settle_workflow_round_trip,
-    client_status_round_trip, BrokerAskRequest, BrokerCancelRequest, BrokerCancelTaskRequest,
-    BrokerCommitFeedbackRequest, BrokerCompleteWorkRequest, BrokerFeedbackRequest,
-    BrokerGetWorkflowStateRequest, BrokerParentDecisionRequest, BrokerPublishWorkflowRequest,
-    BrokerRegisterSimpleWorkflowRequest,
-    BrokerRecoverWorkflowRequest, BrokerRecoveryAuthorizationRequest, BrokerReplyDelegationRequest,
-    BrokerRequest, BrokerResponse, BrokerSessionRequest, BrokerSettleWorkflowRequest,
-    BrokerStatusRequest, CancelDelegationReason, CompanionRole,
+    client_recovery_authorization_round_trip, client_register_simple_workflow_round_trip,
+    client_reply_delegation_round_trip, client_round_trip, client_session_round_trip,
+    client_settle_workflow_round_trip, client_status_round_trip, BrokerAskRequest,
+    BrokerCancelRequest, BrokerCancelTaskRequest, BrokerCommitFeedbackRequest,
+    BrokerCompleteWorkRequest, BrokerFeedbackRequest, BrokerGetWorkflowStateRequest,
+    BrokerParentDecisionRequest, BrokerPublishWorkflowRequest, BrokerRecoverWorkflowRequest,
+    BrokerRecoveryAuthorizationRequest, BrokerRegisterSimpleWorkflowRequest,
+    BrokerReplyDelegationRequest, BrokerRequest, BrokerResponse, BrokerSessionRequest,
+    BrokerSettleWorkflowRequest, BrokerStatusRequest, CancelDelegationReason, CompanionRole,
 };
 use crate::acp::delegation::types::{validate_correlation_id, DelegationReturnWhen};
 use crate::acp::delegation::workflow::{
@@ -988,17 +987,17 @@ async fn build_tools_call_spawn(
             register_and_spawn(inflight, id, None, round_trip, render_workflow_result).await
         }
         "register_simple_workflow" => {
-            let arguments: RegisterSimpleWorkflowArguments =
-                match serde_json::from_value(arguments) {
-                    Ok(arguments) => arguments,
-                    Err(error) => {
-                        return LineAction::Respond(err(
-                            id,
-                            -32602,
-                            format!("invalid register_simple_workflow arguments: {error}"),
-                        ));
-                    }
-                };
+            let arguments: RegisterSimpleWorkflowArguments = match serde_json::from_value(arguments)
+            {
+                Ok(arguments) => arguments,
+                Err(error) => {
+                    return LineAction::Respond(err(
+                        id,
+                        -32602,
+                        format!("invalid register_simple_workflow arguments: {error}"),
+                    ));
+                }
+            };
             if arguments.plan_rel_path.trim().is_empty()
                 || arguments
                     .progress_rel_path
@@ -1016,9 +1015,10 @@ async fn build_tools_call_spawn(
                 plan_rel_path: arguments.plan_rel_path,
                 progress_rel_path: arguments.progress_rel_path,
             };
-            let round_trip = Box::pin(async move {
-                client_register_simple_workflow_round_trip(&socket, &req).await
-            });
+            let round_trip =
+                Box::pin(
+                    async move { client_register_simple_workflow_round_trip(&socket, &req).await },
+                );
             register_and_spawn(inflight, id, None, round_trip, render_workflow_result).await
         }
         "settle_workflow_gate" => {
@@ -4383,7 +4383,9 @@ mod tests {
     async fn register_simple_workflow_is_delegation_root_only_and_schema_has_no_parent_id() {
         let root = legacy_root();
         let root_names = list_tool_names(dispatch_with_context(root.clone(), tools_list()).await);
-        assert!(root_names.iter().any(|name| name == "register_simple_workflow"));
+        assert!(root_names
+            .iter()
+            .any(|name| name == "register_simple_workflow"));
 
         let mut child = root.clone();
         child.role = CompanionRole::DelegationChild;
@@ -4612,10 +4614,8 @@ mod tests {
             classify_workflow_tool_catalog(names.iter().map(String::as_str)),
             WorkflowCapabilityMode::WorkflowManifestV2
         );
-        let caps = local_workflow_capabilities(
-            &HISTORICAL_WORKFLOW_ROOT_FIXTURE,
-            CompanionRole::Root,
-        );
+        let caps =
+            local_workflow_capabilities(&HISTORICAL_WORKFLOW_ROOT_FIXTURE, CompanionRole::Root);
         assert_eq!(caps["workflow_manifest_v2"], true);
         assert_eq!(caps["versions"][WORKFLOW_CAPABILITY_VERSION], true);
         let ops: Vec<&str> = caps["operations"]
@@ -5242,12 +5242,11 @@ mod tests {
                 "summary": "platform evidence decides",
             });
             args[field] = value;
-            let action =
-                dispatch_with_features(
-                    HISTORICAL_WORKFLOW_ROOT_FIXTURE,
-                    &call(11, "settle_workflow_gate", args),
-                )
-                .await;
+            let action = dispatch_with_features(
+                HISTORICAL_WORKFLOW_ROOT_FIXTURE,
+                &call(11, "settle_workflow_gate", args),
+            )
+            .await;
             let resp = unwrap_respond(action);
             let err = resp
                 .error
@@ -6591,10 +6590,9 @@ mod tests {
                 .map(|tool| tool["name"].as_str().unwrap().to_string())
                 .collect::<Vec<_>>();
             assert!(names.contains(&"request_recovery_authorization".to_string()));
-            let workflow_names =
-                list_tool_names(
-                    dispatch_with_features(HISTORICAL_WORKFLOW_ROOT_FIXTURE, tools_list()).await,
-                );
+            let workflow_names = list_tool_names(
+                dispatch_with_features(HISTORICAL_WORKFLOW_ROOT_FIXTURE, tools_list()).await,
+            );
             assert!(workflow_names.contains(&"recover_workflow".to_string()));
 
             for bad in [
@@ -6684,9 +6682,8 @@ mod tests {
             }
 
             let historical_fixture = HISTORICAL_WORKFLOW_ROOT_FIXTURE;
-            let names = list_tool_names(
-                dispatch_with_features(historical_fixture, tools_list()).await,
-            );
+            let names =
+                list_tool_names(dispatch_with_features(historical_fixture, tools_list()).await);
             assert_eq!(
                 classify_workflow_tool_catalog(names.iter().map(String::as_str)),
                 WorkflowCapabilityMode::WorkflowManifestV2

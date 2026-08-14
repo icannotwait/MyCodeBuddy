@@ -228,6 +228,57 @@ function dispatchOsHandlerUrl(url: string): void {
   }
 }
 
+/**
+ * Open an external URL in a new tab. Callers MUST invoke this inside the
+ * click's own call stack — see `openLinkWithSafety`.
+ */
+export function openExternalTab(url: string): void {
+  // `noreferrer` (which implies `noopener`) matters for AI-authored links: the
+  // opened page gets no `window.opener` handle back into the app and no
+  // Referer. It also makes `window.open` return null even on success (HTML
+  // window open steps 12 and 17), so the return value carries no signal —
+  // don't test it for a "popup blocked" check, it would fire on every success.
+  window.open(url, "_blank", "noreferrer")
+}
+
+/**
+ * Route a link click through the link-safety config. `decline` runs whenever
+ * the config wants its modal hook instead (local files, mailto/tel, and every
+ * link on local desktop, which routes to the Tauri opener).
+ *
+ * A synchronous verdict — the only kind `useStreamdownLinkSafety` returns —
+ * opens the tab inside the CALLER'S OWN CALL STACK. That is the whole point of
+ * this helper: WebKit's popup blocker keys off the user-gesture stack rather
+ * than the spec's transient activation, so a single microtask hop (an `await`
+ * on a plain boolean) is enough for Safari and WKWebView-backed webviews to
+ * swallow the popup with no error at all. See issue #410.
+ */
+export function openLinkWithSafety(
+  url: string,
+  linkSafety: LinkSafetyConfig,
+  decline: () => void
+): void {
+  const verdict = linkSafety.onLinkCheck?.(url)
+  if (verdict === true) {
+    openExternalTab(url)
+    return
+  }
+  if (verdict === false || verdict === undefined) {
+    decline()
+    return
+  }
+  // Streamdown's contract also allows a promise. codeg's own config never
+  // returns one; if that ever changes, this branch must synchronously reserve
+  // a tab BEFORE awaiting and navigate it afterwards — by the time the promise
+  // settles the gesture is gone and this open will be blocked. A rejected check
+  // declines (second `then` argument, so it can't swallow errors thrown by the
+  // fulfilment path) rather than leaving the click with no outcome at all.
+  void verdict.then(
+    (allowed) => (allowed ? openExternalTab(url) : decline()),
+    decline
+  )
+}
+
 // True when the opener needs no folder context at all: absolute paths and
 // `~/` paths are self-locating (openFilePreview expands the home dir and
 // routes them by absolute path — inside a registered folder or not).

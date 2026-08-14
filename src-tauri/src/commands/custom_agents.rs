@@ -542,6 +542,7 @@ impl SaveCustomAgentParams {
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(str::to_string),
+            supports_mcp: true,
         })
     }
 }
@@ -714,6 +715,7 @@ mod tests {
             skills_dir: None,
             source: Default::default(),
             version_probe: None,
+            supports_mcp: true,
         };
         let info = info_from_def(&def);
         assert!(!info.launchable);
@@ -882,6 +884,7 @@ mod tests {
             skills_dir: None,
             source: Default::default(),
             version_probe: None,
+            supports_mcp: true,
         };
         let info = info_from_def(&def);
         assert!(info.launchable);

@@ -11,19 +11,22 @@ pub mod pet;
 pub mod quick_message;
 pub mod remote_workspace_connection;
 pub mod system;
+pub mod token_usage;
+pub mod work_task;
 
 pub use agent::AgentType;
 pub use automation::{
-    AutomationConfig, AutomationDraft, AutomationInfo, AutomationRunInfo, AutomationRunStatus,
-    IsolationMode, TriggerKind,
+    AutomationAction, AutomationConfig, AutomationDraft, AutomationInfo, AutomationRunInfo,
+    AutomationRunStatus, IsolationMode, TriggerKind,
 };
 #[allow(unused_imports)]
 pub use chat_channel::{ChannelStatusInfo, ChatChannelInfo, ChatChannelMessageLogInfo};
 pub use conversation::{
     AgentConversationCount, AgentStats, ConversationDetail, ConversationStatePatch,
-    ConversationSummary, DbConversationDetail, DbConversationSummary, FolderInfo,
-    HistoryWindowInfo, ImportFolderOutcome, ImportResult, ImportSelectedResult, ScanFolder,
-    ScanResult, ScanSession, ScanSessionStatus, SelectedSessionKey, SessionStats, SidebarData,
+    ConversationSummary, ConversationTurnsPage, DbConversationDetail, DbConversationSummary,
+    FolderInfo, HistoryWindowInfo, ImportFolderOutcome, ImportResult, ImportSelectedResult,
+    ScanFolder, ScanResult, ScanSession, ScanSessionStatus, SelectedSessionKey, SessionStats,
+    SidebarData,
 };
 pub use delegate_access::{DelegateAccessMode, DelegateAccessReason, DelegateAccessState};
 pub use folder::{
@@ -43,4 +46,16 @@ pub use system::{
     AvailableTerminalShells, GitCredentials, GitDetectResult, GitHubAccountsSettings,
     GitHubTokenValidation, GitSettings, SystemLanguageSettings, SystemProxySettings,
     SystemTerminalSettings, TerminalShellOption,
+};
+pub use token_usage::{
+    TokenUsageBreakdownItem, TokenUsageBucket, TokenUsageConversationItem, TokenUsageFacets,
+    TokenUsageFilter, TokenUsageFolderFacet, TokenUsageHeatCell, TokenUsagePoint, TokenUsageReport,
+    TokenUsageStreak, TokenUsageSyncProgress, TokenUsageSyncResult, TokenUsageSyncStatus,
+    TokenUsageTotals,
+};
+pub use work_task::{
+    FollowUpIntent, WorkTaskChangedFile, WorkTaskConfig, WorkTaskDraft, WorkTaskEventInfo,
+    WorkTaskFolderSettings, WorkTaskInfo, WorkTaskMergeState, WorkTaskPreflight,
+    WorkTaskQueuedMerge, WorkTaskStatus, WorkTaskTemplateDraft, WorkTaskTemplateInfo,
+    STAGE_PROMPT_ALL,
 };

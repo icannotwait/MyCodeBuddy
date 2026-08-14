@@ -1,9 +1,8 @@
 "use client"
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import { useCallback, useEffect, useMemo, useState } from "react"
 import {
   ChevronDown,
-  FolderOpen,
   GitBranch,
   GitCommitHorizontal,
   GitFork,
@@ -38,8 +37,6 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import {
   gitInit,
-  gitPull,
-  gitFetch,
   gitNewBranch,
   gitWorktreeAdd,
   gitListAllBranches,
@@ -47,17 +44,10 @@ import {
   gitRebase,
   gitDeleteBranch,
   gitDeleteRemoteBranch,
-  openCommitWindow,
-  openPushWindow,
-  openStashWindow,
+  gitRemoveWorktree,
 } from "@/lib/api"
-import { isDesktop, openFileDialog, subscribe } from "@/lib/platform"
-import { getActiveRemoteConnectionId } from "@/lib/transport"
-import { RemoteManageDialog } from "@/components/layout/remote-manage-dialog"
-import { ConflictDialog } from "@/components/layout/conflict-dialog"
-import { StashDialog } from "@/components/layout/stash-dialog"
-import { DirectoryBrowserDialog } from "@/components/shared/directory-browser-dialog"
-import { toErrorMessage } from "@/lib/app-error"
+import { subscribe } from "@/lib/platform"
+import { DirectoryPathInput } from "@/components/shared/directory-path-input"
 import { openWorktreeFolderWithDraft } from "@/lib/open-folder-with-draft"
 import { useSwitchToBranch } from "@/hooks/use-switch-to-branch"
 import {
@@ -71,26 +61,53 @@ import type {
   BranchOperationMeta,
 } from "@/lib/branch-selector-rows"
 import { useScrollbarSafeDismiss } from "@/hooks/use-scrollbar-safe-dismiss"
-import type { FolderDetail, GitBranchList, GitConflictInfo } from "@/lib/types"
+import { useGitQuickActions } from "@/hooks/use-git-quick-actions"
+import { useImeGuard } from "@/hooks/use-ime-guard"
+import type { FolderDetail, GitBranchList } from "@/lib/types"
 import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
 import { useWorkbenchRoute } from "@/contexts/workbench-route-context"
-import { useTaskContext } from "@/contexts/task-context"
-import { useAlertContext } from "@/contexts/alert-context"
 import { useGitCredential } from "@/contexts/git-credential-context"
 
-const emitEvent = async (event: string, payload?: unknown) => {
-  try {
-    const { emit } = await import("@tauri-apps/api/event")
-    await emit(event, payload)
-  } catch {
-    /* not in Tauri */
-  }
-}
-
 type ConfirmAction = {
-  type: "merge" | "rebase" | "delete" | "forceDelete" | "deleteRemote"
+  type:
+    | "merge"
+    | "rebase"
+    | "delete"
+    | "forceDelete"
+    | "deleteRemote"
+    | "deleteWorktree"
+    | "forceDeleteWorktree"
+    | "deleteWorktreeAndBranch"
+    | "forceDeleteWorktreeAndBranch"
   branchName: string
 }
+
+// Confirmations whose action can't be undone — their confirm button goes red.
+const DESTRUCTIVE_CONFIRMS: ReadonlySet<ConfirmAction["type"]> = new Set([
+  "delete",
+  "forceDelete",
+  "deleteRemote",
+  "deleteWorktree",
+  "forceDeleteWorktree",
+  "deleteWorktreeAndBranch",
+  "forceDeleteWorktreeAndBranch",
+])
+
+// Git's way of saying "this would throw work away — ask again with --force":
+// a worktree with uncommitted or untracked files, or a branch whose commits
+// aren't merged anywhere. Both escalate to the matching force confirm rather
+// than surfacing a raw git error the user can do nothing about.
+const FORCE_REQUIRED_RE = /--force|not fully merged/i
+
+// The four worktree-removal confirmations, decoded into the two flags the one
+// backend call takes: whether the branch (and the worktree's workspace folder)
+// goes with the directory, and whether to discard work standing in the way.
+const WORKTREE_REMOVALS = {
+  deleteWorktree: { withBranch: false, force: false },
+  deleteWorktreeAndBranch: { withBranch: true, force: false },
+  forceDeleteWorktree: { withBranch: false, force: true },
+  forceDeleteWorktreeAndBranch: { withBranch: true, force: true },
+} as const
 
 interface GitCommitSucceededEventPayload {
   folder_id: number
@@ -116,12 +133,11 @@ interface BranchDropdownProps {
 // machinery (git event subscriptions + dialogs).
 export function BranchDropdown({ folder, isChatMode }: BranchDropdownProps) {
   const t = useTranslations("Folder.branchDropdown")
+  const ime = useImeGuard()
   const tCommon = useTranslations("Folder.common")
   const activeFolder = folder
   const refreshFolder = useAppWorkspaceStore((s) => s.refreshFolder)
   const { openConversations } = useWorkbenchRoute()
-  const { addTask, updateTask, removeTask } = useTaskContext()
-  const { pushAlert } = useAlertContext()
   const { withCredentialRetry } = useGitCredential()
   const switchToBranch = useSwitchToBranch()
   // Grabbing the popover's inner scrollbar blurs focus, which WebKit bounces to
@@ -152,21 +168,31 @@ export function BranchDropdown({ folder, isChatMode }: BranchDropdownProps) {
     local: [],
     remote: [],
     worktree_branches: [],
+    main_worktree_branch: null,
   })
   const [newBranchOpen, setNewBranchOpen] = useState(false)
   const [newBranchName, setNewBranchName] = useState("")
-  const [loading, setLoading] = useState(false)
   const [dropdownOpen, setDropdownOpen] = useState(false)
   const [branchLoading, setBranchLoading] = useState(false)
   const [confirmAction, setConfirmAction] = useState<ConfirmAction | null>(null)
   const [worktreeOpen, setWorktreeOpen] = useState(false)
-  const [worktreeBrowserOpen, setWorktreeBrowserOpen] = useState(false)
   const [worktreeBranchName, setWorktreeBranchName] = useState("")
   const [worktreePath, setWorktreePath] = useState("")
-  const [manageRemotesOpen, setManageRemotesOpen] = useState(false)
-  const [stashDialogOpen, setStashDialogOpen] = useState(false)
-  const [conflictInfo, setConflictInfo] = useState<GitConflictInfo | null>(null)
-  const taskSeq = useRef(0)
+
+  // Task running, credential retry, pull/fetch/window openers and the
+  // conflict/stash dialogs all live in the shared hook, so the aux-panel git
+  // tabs drive the exact same machinery from their own toolbars.
+  const {
+    running: loading,
+    runGitTask,
+    pull: handlePull,
+    fetchAll,
+    updateBranch,
+    openCommitWindow: openCommit,
+    openPushWindow: openPush,
+    reportConflict,
+    dialogs: gitDialogs,
+  } = useGitQuickActions({ folderId, folderPath })
 
   const worktreeBranchSet = useMemo(
     () => new Set(branchList.worktree_branches),
@@ -183,7 +209,12 @@ export function BranchDropdown({ folder, isChatMode }: BranchDropdownProps) {
   // Operations shown as a searchable block at the top of the popup; the list
   // resolves each id to an icon and dispatches back through `runOperation`.
   // `groupEnd` inserts a separator after that op (non-search) to restore the old
-  // menu's pull/fetch | commit/push | new | stash | remotes blocking.
+  // menu's pull/fetch | commit/push | new blocking. Deliberately short: this chip
+  // sits under the composer and is first of all a BRANCH picker, so the
+  // long-tail operations (stash, unstash, manage remotes) live in the aux
+  // panel's git tabs — the changes tab owns the working-tree ones, the commits
+  // tab owns the remotes. The last entry carries no `groupEnd`: the row builder
+  // already separates the operation block from the branch tree.
   const operations = useMemo<BranchOperationMeta[]>(
     () => [
       { id: "pull", label: t("pullCode") },
@@ -191,10 +222,7 @@ export function BranchDropdown({ folder, isChatMode }: BranchDropdownProps) {
       { id: "commit", label: t("openCommitWindow") },
       { id: "push", label: t("pushCode"), groupEnd: true },
       { id: "newBranch", label: t("newBranch") },
-      { id: "newWorktree", label: t("newWorktree"), groupEnd: true },
-      { id: "stash", label: t("stashChanges") },
-      { id: "stashPop", label: t("stashPop"), groupEnd: true },
-      { id: "manageRemotes", label: t("manageRemotes") },
+      { id: "newWorktree", label: t("newWorktree") },
     ],
     [t]
   )
@@ -210,7 +238,12 @@ export function BranchDropdown({ folder, isChatMode }: BranchDropdownProps) {
       "folder://git-commit-succeeded",
       (payload) => {
         if (payload.folder_id !== folderId) return
+        // Folder-scoped toast id: this component is mounted once per
+        // conversation tile, and the changes tab raises the same toast locally
+        // after a quick commit. Sharing one id makes sonner update a single
+        // toast instead of stacking one per listener.
         toast.success(t("toasts.commitCodeCompleted"), {
+          id: `git-commit-succeeded:${folderId}`,
           description: t("toasts.committedFiles", {
             count: payload.committed_files,
           }),
@@ -263,42 +296,6 @@ export function BranchDropdown({ folder, isChatMode }: BranchDropdownProps) {
     }
   }, [folderId, refresh, t])
 
-  async function runGitTask<T>(
-    label: string,
-    action: () => Promise<T>,
-    getSuccessDescription?: (result: T) => string | false | undefined,
-    onError?: (errorMsg: string) => boolean
-  ) {
-    const taskId = `git-${++taskSeq.current}-${Date.now()}`
-    setLoading(true)
-    addTask(taskId, label)
-    updateTask(taskId, { status: "running" })
-    try {
-      const result = await action()
-      const successDescription = getSuccessDescription?.(result)
-      updateTask(taskId, { status: "completed" })
-      refresh()
-      void emitEvent("folder://git-branch-changed", { folder_id: folderId })
-      if (successDescription !== false) {
-        toast.success(
-          t("toasts.taskCompleted", { label }),
-          successDescription ? { description: successDescription } : undefined
-        )
-      }
-    } catch (err) {
-      removeTask(taskId)
-      const errorMsg = toErrorMessage(err)
-      if (onError?.(errorMsg)) {
-        return
-      }
-      const errorTitle = t("toasts.taskFailed", { label })
-      pushAlert("error", errorTitle, errorMsg)
-      toast.error(errorTitle, { description: errorMsg })
-    } finally {
-      setLoading(false)
-    }
-  }
-
   const loadAllBranches = useCallback(async () => {
     if (!folderPath) return
     setBranchLoading(true)
@@ -306,7 +303,12 @@ export function BranchDropdown({ folder, isChatMode }: BranchDropdownProps) {
       const list = await gitListAllBranches(folderPath)
       setBranchList(list)
     } catch {
-      setBranchList({ local: [], remote: [], worktree_branches: [] })
+      setBranchList({
+        local: [],
+        remote: [],
+        worktree_branches: [],
+        main_worktree_branch: null,
+      })
     } finally {
       setBranchLoading(false)
     }
@@ -337,28 +339,6 @@ export function BranchDropdown({ folder, isChatMode }: BranchDropdownProps) {
     })
   }
 
-  // Pull, invoked by the dropdown's "Pull Code" menu item.
-  function handlePull() {
-    setDropdownOpen(false)
-    void runGitTask(
-      t("tasks.pullCode"),
-      () =>
-        withCredentialRetry((creds) => gitPull(folderPath, creds), {
-          folderPath,
-        }),
-      (result) => {
-        if (result.conflict?.has_conflicts) {
-          setConflictInfo(result.conflict)
-          return false
-        }
-        if (result.updated_files === 0) {
-          return t("toasts.allFilesUpToDate")
-        }
-        return t("toasts.updatedFiles", { count: result.updated_files })
-      }
-    )
-  }
-
   async function handleNewBranch() {
     const name = newBranchName.trim()
     if (!name) return
@@ -382,24 +362,6 @@ export function BranchDropdown({ folder, isChatMode }: BranchDropdownProps) {
     setWorktreeBranchName(defaultBranch)
     setWorktreePath(`${parentDir}/${folderName}-${currentBranch}-${random}`)
     setWorktreeOpen(true)
-  }
-
-  async function handleBrowseWorktreePath() {
-    // The worktree is created on whatever host runs the git binary — local
-    // for the desktop, remote for a remote workspace. The picker must
-    // therefore browse the matching filesystem, otherwise the user
-    // ends up with a path the wrong side can't resolve.
-    if (isDesktop() && getActiveRemoteConnectionId() === null) {
-      const selected = await openFileDialog({
-        directory: true,
-        multiple: false,
-      })
-      if (selected) {
-        setWorktreePath(Array.isArray(selected) ? selected[0] : selected)
-      }
-    } else {
-      setWorktreeBrowserOpen(true)
-    }
   }
 
   async function handleNewWorktree() {
@@ -433,7 +395,7 @@ export function BranchDropdown({ folder, isChatMode }: BranchDropdownProps) {
           () => gitMerge(folderPath, branchName),
           (result) => {
             if (result.conflict?.has_conflicts) {
-              setConflictInfo(result.conflict)
+              reportConflict(result.conflict)
               return false
             }
             if (result.merged_commits === 0) {
@@ -449,7 +411,7 @@ export function BranchDropdown({ folder, isChatMode }: BranchDropdownProps) {
           () => gitRebase(folderPath, branchName),
           (result) => {
             if (result.conflict?.has_conflicts) {
-              setConflictInfo(result.conflict)
+              reportConflict(result.conflict)
               return false
             }
             return undefined
@@ -475,6 +437,40 @@ export function BranchDropdown({ folder, isChatMode }: BranchDropdownProps) {
           gitDeleteBranch(folderPath, branchName, true)
         )
         break
+      // All four worktree removals are the same backend call under different
+      // flags. Without --force it re-asks rather than failing, the same way
+      // `delete` escalates to `forceDelete`.
+      case "deleteWorktree":
+      case "deleteWorktreeAndBranch":
+      case "forceDeleteWorktree":
+      case "forceDeleteWorktreeAndBranch": {
+        const { withBranch, force } = WORKTREE_REMOVALS[type]
+        await runGitTask(
+          withBranch
+            ? t("tasks.removeWorktreeAndBranch", { branchName })
+            : t("tasks.removeWorktree", { branchName }),
+          () =>
+            gitRemoveWorktree(
+              folderPath,
+              branchName,
+              folderId,
+              withBranch,
+              force
+            ),
+          undefined,
+          (errorMsg) => {
+            if (force || !FORCE_REQUIRED_RE.test(errorMsg)) return false
+            setConfirmAction({
+              type: withBranch
+                ? "forceDeleteWorktreeAndBranch"
+                : "forceDeleteWorktree",
+              branchName,
+            })
+            return true
+          }
+        )
+        break
+      }
       case "deleteRemote": {
         const idx = branchName.indexOf("/")
         const remote = branchName.substring(0, idx)
@@ -503,6 +499,14 @@ export function BranchDropdown({ folder, isChatMode }: BranchDropdownProps) {
         return t("confirm.forceDeleteTitle")
       case "deleteRemote":
         return t("confirm.deleteRemoteTitle")
+      case "deleteWorktree":
+        return t("confirm.deleteWorktreeTitle")
+      case "forceDeleteWorktree":
+        return t("confirm.forceDeleteWorktreeTitle")
+      case "deleteWorktreeAndBranch":
+        return t("confirm.deleteWorktreeAndBranchTitle")
+      case "forceDeleteWorktreeAndBranch":
+        return t("confirm.forceDeleteWorktreeAndBranchTitle")
     }
   }
 
@@ -531,11 +535,27 @@ export function BranchDropdown({ folder, isChatMode }: BranchDropdownProps) {
         return t("confirm.deleteRemoteDescription", {
           branchName: confirmAction.branchName,
         })
+      case "deleteWorktree":
+        return t("confirm.deleteWorktreeDescription", {
+          branchName: confirmAction.branchName,
+        })
+      case "forceDeleteWorktree":
+        return t("confirm.forceDeleteWorktreeDescription", {
+          branchName: confirmAction.branchName,
+        })
+      case "deleteWorktreeAndBranch":
+        return t("confirm.deleteWorktreeAndBranchDescription", {
+          branchName: confirmAction.branchName,
+        })
+      case "forceDeleteWorktreeAndBranch":
+        return t("confirm.forceDeleteWorktreeAndBranchDescription", {
+          branchName: confirmAction.branchName,
+        })
     }
   }
 
   // Dispatch a top-of-list operation back to its handler. Every op closes the
-  // popover (some then open a dialog/window); `handlePull` closes it too.
+  // popover (some then open a dialog/window).
   function runOperation(opId: string) {
     setDropdownOpen(false)
     switch (opId) {
@@ -543,29 +563,13 @@ export function BranchDropdown({ folder, isChatMode }: BranchDropdownProps) {
         handlePull()
         break
       case "fetch":
-        void runGitTask(t("tasks.fetchInfo"), () =>
-          withCredentialRetry((creds) => gitFetch(folderPath, creds), {
-            folderPath,
-          })
-        )
+        fetchAll()
         break
       case "commit":
-        if (!folderId) return
-        openCommitWindow(folderId).catch((err) => {
-          const title = t("toasts.openCommitWindowFailed")
-          const msg = toErrorMessage(err)
-          pushAlert("error", title, msg)
-          toast.error(title, { description: msg })
-        })
+        openCommit()
         break
       case "push":
-        if (!folderId) return
-        openPushWindow(folderId).catch((err) => {
-          const title = t("toasts.openPushWindowFailed")
-          const msg = toErrorMessage(err)
-          pushAlert("error", title, msg)
-          toast.error(title, { description: msg })
-        })
+        openPush()
         break
       case "newBranch":
         setNewBranchName("")
@@ -574,24 +578,12 @@ export function BranchDropdown({ folder, isChatMode }: BranchDropdownProps) {
       case "newWorktree":
         handleOpenWorktreeDialog()
         break
-      case "stash":
-        setStashDialogOpen(true)
-        break
-      case "stashPop":
-        if (!folderId) return
-        openStashWindow(folderId).catch((err) => {
-          const msg = toErrorMessage(err)
-          pushAlert("error", t("stashPop"), msg)
-        })
-        break
-      case "manageRemotes":
-        setManageRemotesOpen(true)
-        break
     }
   }
 
   // Dispatch an inline branch action: switch checks out directly (that handler
-  // closes the popover itself), the rest open the shared confirm dialog.
+  // closes the popover itself), update runs straight away (it never touches the
+  // working tree), the rest open the shared confirm dialog.
   function runLeafAction(
     action: BranchLeafAction,
     fullName: string,
@@ -603,6 +595,16 @@ export function BranchDropdown({ folder, isChatMode }: BranchDropdownProps) {
       return
     }
     setDropdownOpen(false)
+    if (action === "pull") {
+      updateBranch(fullName, isRemote)
+      return
+    }
+    // Push opens the push window preselected for this branch, so the commits
+    // about to be published are reviewable before anything leaves the machine.
+    if (action === "push") {
+      openPush(fullName)
+      return
+    }
     setConfirmAction({ type: action, branchName: fullName })
   }
 
@@ -688,6 +690,7 @@ export function BranchDropdown({ folder, isChatMode }: BranchDropdownProps) {
             remoteCount={branchList.remote.length}
             branch={branch}
             worktreeBranchSet={worktreeBranchSet}
+            mainWorktreeBranch={branchList.main_worktree_branch}
             branchLoading={branchLoading}
             loading={loading}
             onRunOperation={runOperation}
@@ -713,9 +716,7 @@ export function BranchDropdown({ folder, isChatMode }: BranchDropdownProps) {
             <AlertDialogCancel>{tCommon("cancel")}</AlertDialogCancel>
             <AlertDialogAction
               variant={
-                confirmAction?.type === "delete" ||
-                confirmAction?.type === "forceDelete" ||
-                confirmAction?.type === "deleteRemote"
+                confirmAction && DESTRUCTIVE_CONFIRMS.has(confirmAction.type)
                   ? "destructive"
                   : "default"
               }
@@ -739,8 +740,9 @@ export function BranchDropdown({ folder, isChatMode }: BranchDropdownProps) {
             placeholder={t("dialogs.branchNamePlaceholder")}
             value={newBranchName}
             onChange={(e) => setNewBranchName(e.target.value)}
+            {...ime.props}
             onKeyDown={(e) => {
-              if (e.nativeEvent.isComposing || e.key === "Process") return
+              if (ime.isComposing(e)) return
               if (e.key === "Enter") handleNewBranch()
             }}
             autoFocus
@@ -775,8 +777,9 @@ export function BranchDropdown({ folder, isChatMode }: BranchDropdownProps) {
                 placeholder={t("dialogs.branchNamePlaceholder")}
                 value={worktreeBranchName}
                 onChange={(e) => setWorktreeBranchName(e.target.value)}
+                {...ime.props}
                 onKeyDown={(e) => {
-                  if (e.nativeEvent.isComposing || e.key === "Process") return
+                  if (ime.isComposing(e)) return
                   if (e.key === "Enter") handleNewWorktree()
                 }}
                 autoFocus
@@ -784,22 +787,12 @@ export function BranchDropdown({ folder, isChatMode }: BranchDropdownProps) {
             </div>
             <div className="space-y-2">
               <Label htmlFor="wt-path">{t("dialogs.worktreePathLabel")}</Label>
-              <div className="flex gap-2">
-                <Input
-                  id="wt-path"
-                  placeholder={t("dialogs.worktreePathPlaceholder")}
-                  value={worktreePath}
-                  onChange={(e) => setWorktreePath(e.target.value)}
-                  className="flex-1"
-                />
-                <Button
-                  variant="outline"
-                  size="icon"
-                  onClick={handleBrowseWorktreePath}
-                >
-                  <FolderOpen className="h-4 w-4" />
-                </Button>
-              </div>
+              <DirectoryPathInput
+                id="wt-path"
+                placeholder={t("dialogs.worktreePathPlaceholder")}
+                value={worktreePath}
+                onValueChange={setWorktreePath}
+              />
             </div>
           </div>
           <DialogFooter>
@@ -818,33 +811,7 @@ export function BranchDropdown({ folder, isChatMode }: BranchDropdownProps) {
         </DialogContent>
       </Dialog>
 
-      <DirectoryBrowserDialog
-        open={worktreeBrowserOpen}
-        onOpenChange={setWorktreeBrowserOpen}
-        onSelect={(path) => setWorktreePath(path)}
-      />
-
-      <RemoteManageDialog
-        open={manageRemotesOpen}
-        onOpenChange={setManageRemotesOpen}
-        folderPath={folderPath}
-        onSaved={() => loadAllBranches()}
-      />
-
-      <ConflictDialog
-        conflictInfo={conflictInfo}
-        folderId={folderId}
-        folderPath={folderPath}
-        onClose={() => setConflictInfo(null)}
-        onResolved={refresh}
-      />
-
-      <StashDialog
-        open={stashDialogOpen}
-        folderPath={folderPath}
-        onClose={() => setStashDialogOpen(false)}
-        onStashed={refresh}
-      />
+      {gitDialogs}
     </>
   )
 }

@@ -1,9 +1,15 @@
 "use client"
 
-import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react"
 import {
-  Archive,
-  ArchiveRestore,
+  Fragment,
+  useCallback,
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+} from "react"
+import {
   ChevronRight,
   CloudDownload,
   CloudSync,
@@ -11,12 +17,12 @@ import {
   Folder,
   FolderGit2,
   FolderOpen,
+  FolderX,
   GitBranch,
   GitBranchPlus,
   GitCommitHorizontal,
   GitMerge,
   GitPullRequestArrow,
-  Globe,
   Loader2,
   Search,
   Trash2,
@@ -24,10 +30,13 @@ import {
 } from "lucide-react"
 import { useTranslations } from "next-intl"
 import { Virtualizer, type VirtualizerHandle } from "virtua"
+import { useImeGuard } from "@/hooks/use-ime-guard"
+import { isImeCompositionKey } from "@/lib/ime-composition"
 import { cn } from "@/lib/utils"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { branchRowPaddingLeft } from "@/components/layout/branch-tree-collapsible"
 import {
+  branchLeafActions,
   buildBranchRows,
   isNavigableRow,
   type BranchLeafAction,
@@ -46,6 +55,8 @@ interface BranchSelectorListProps {
   remoteCount: number
   branch: string | null
   worktreeBranchSet: Set<string>
+  /** The repo's main working tree branch — see `branchLeafActions`. */
+  mainWorktreeBranch: string | null
   /** First-load fetch in flight and nothing cached yet — show a spinner. */
   branchLoading: boolean
   /** A git task is running — disable operation + branch-action rows. */
@@ -72,6 +83,9 @@ const BUBBLE_WIDTH_PX = 224
 // Slightly over-estimated on purpose so the whole bubble always fits.
 const BUBBLE_ITEM_PX = 34
 const BUBBLE_PAD_PX = 8
+// A group divider (`my-1 h-px`) between action groups — counted separately so a
+// bubble with dividers still clamps inside the list root.
+const BUBBLE_SEPARATOR_PX = 9
 
 const OP_ICONS: Record<string, LucideIcon> = {
   pull: CloudDownload,
@@ -80,9 +94,6 @@ const OP_ICONS: Record<string, LucideIcon> = {
   push: CloudUpload,
   newBranch: GitBranchPlus,
   newWorktree: FolderGit2,
-  stash: Archive,
-  stashPop: ArchiveRestore,
-  manageRemotes: Globe,
   init: GitBranch,
 }
 
@@ -90,20 +101,32 @@ const ACTION_ICONS: Record<BranchLeafAction, LucideIcon> = {
   switch: GitBranch,
   merge: GitMerge,
   rebase: GitPullRequestArrow,
+  pull: CloudDownload,
+  push: CloudUpload,
   delete: Trash2,
   deleteRemote: Trash2,
+  deleteWorktree: FolderX,
+  deleteWorktreeAndBranch: Trash2,
 }
 
-// The per-branch actions shown in the right-side bubble. Delete is hidden for the
-// remote branch the current local branch tracks (deleting it is nonsensical).
-function leafActions(
-  isRemote: boolean,
-  isTracking: boolean
-): BranchLeafAction[] {
-  const actions: BranchLeafAction[] = ["switch", "merge", "rebase"]
-  if (!isTracking) actions.push(isRemote ? "deleteRemote" : "delete")
-  return actions
-}
+// Which actions read as destructive (styled red, and confirmed by the caller).
+const DESTRUCTIVE_ACTIONS: ReadonlySet<BranchLeafAction> = new Set([
+  "delete",
+  "deleteRemote",
+  "deleteWorktree",
+  "deleteWorktreeAndBranch",
+])
+
+// First action of each group in `branchLeafActions`. A rule ("insert a divider
+// before any group starter that isn't the first row") rather than fixed indices,
+// so a group that drops out entirely — a remote leaf has no "push", a tracked
+// remote no "delete" — never leaves a dangling divider behind.
+const BUBBLE_GROUP_STARTS: ReadonlySet<BranchLeafAction> = new Set([
+  "pull",
+  "delete",
+  "deleteRemote",
+  "deleteWorktree",
+])
 
 interface ActionBubble {
   leafKey: string
@@ -134,11 +157,13 @@ export function BranchSelectorList({
   remoteCount,
   branch,
   worktreeBranchSet,
+  mainWorktreeBranch,
   branchLoading,
   loading,
   onRunOperation,
   onLeafAction,
 }: BranchSelectorListProps) {
+  const ime = useImeGuard()
   const t = useTranslations("Folder.branchDropdown")
 
   const [query, setQuery] = useState("")
@@ -199,7 +224,7 @@ export function BranchSelectorList({
           active.isContentEditable)
       )
         return
-      if (event.isComposing || event.key === "Process") return
+      if (isImeCompositionKey(event)) return
       const isPrintable =
         event.key.length === 1 &&
         !event.metaKey &&
@@ -359,9 +384,22 @@ export function BranchSelectorList({
             currentBranch: branch ?? "-",
             branchName: fullName,
           })
+        // Same wording as the top-of-list operation — this just scopes it to
+        // the branch under the cursor instead of the checked-out one.
+        case "pull":
+          return t("pullCode")
+        // NOT `pushCode` ("Push…"): that ellipsis belongs to the top-of-list
+        // entry, which pushes whatever is checked out. This one names its target
+        // by the row it hangs off.
+        case "push":
+          return t("pushBranch")
         case "delete":
         case "deleteRemote":
           return t("deleteBranch")
+        case "deleteWorktree":
+          return t("deleteWorktree")
+        case "deleteWorktreeAndBranch":
+          return t("deleteWorktreeAndBranch")
       }
     },
     [t, branch]
@@ -383,8 +421,17 @@ export function BranchSelectorList({
     if (!el || !root) return
     const rowRect = el.getBoundingClientRect()
     const rootRect = root.getBoundingClientRect()
-    const actions = leafActions(row.isRemote, row.isTracking)
-    const bubbleHeight = actions.length * BUBBLE_ITEM_PX + BUBBLE_PAD_PX
+    const actions = branchLeafActions({
+      ...row,
+      isMainWorktree: !row.isRemote && row.fullName === mainWorktreeBranch,
+    })
+    const separatorCount = actions.filter(
+      (action, index) => index > 0 && BUBBLE_GROUP_STARTS.has(action)
+    ).length
+    const bubbleHeight =
+      actions.length * BUBBLE_ITEM_PX +
+      separatorCount * BUBBLE_SEPARATOR_PX +
+      BUBBLE_PAD_PX
     const top = Math.min(
       rowRect.top - rootRect.top,
       Math.max(0, rootRect.height - bubbleHeight)
@@ -435,7 +482,7 @@ export function BranchSelectorList({
 
   function handleKeyDown(event: React.KeyboardEvent<HTMLInputElement>) {
     // Don't steal Enter/arrows while an IME composition is in flight (CJK).
-    if (event.nativeEvent.isComposing || event.key === "Process") return
+    if (ime.isComposing(event)) return
 
     // When the action bubble is open, arrows/Enter drive it; Escape/Left close
     // it; any other key closes it and falls through to normal list handling.
@@ -671,6 +718,7 @@ export function BranchSelectorList({
               setActiveIndex(0)
               closeBubble()
             }}
+            {...ime.props}
             onKeyDown={handleKeyDown}
             className="w-full bg-transparent text-sm outline-none placeholder:text-muted-foreground"
           />
@@ -728,28 +776,36 @@ export function BranchSelectorList({
         >
           {bubble.actions.map((action, index) => {
             const ActionIcon = ACTION_ICONS[action]
-            const destructive = action === "delete" || action === "deleteRemote"
+            const destructive = DESTRUCTIVE_ACTIONS.has(action)
             const bubbleActive = index === bubbleActiveIndex
+            const startsGroup = index > 0 && BUBBLE_GROUP_STARTS.has(action)
             return (
-              <button
-                key={action}
-                type="button"
-                role="menuitem"
-                disabled={loading}
-                onMouseMove={() => setBubbleActiveIndex(index)}
-                onClick={() => selectBubbleAction(index)}
-                className={cn(
-                  "flex w-full select-none items-center gap-2 rounded-md px-1.5 py-1.5 text-left text-sm outline-none transition-colors",
-                  "disabled:pointer-events-none disabled:opacity-50",
-                  bubbleActive && "bg-accent text-accent-foreground",
-                  destructive && "text-destructive"
+              <Fragment key={action}>
+                {startsGroup && (
+                  <div
+                    role="presentation"
+                    className="mx-1 my-1 h-px bg-border"
+                  />
                 )}
-              >
-                <ActionIcon className="size-3.5 shrink-0 opacity-70" />
-                <span className="min-w-0 flex-1 truncate">
-                  {leafActionLabel(action, bubble.fullName)}
-                </span>
-              </button>
+                <button
+                  type="button"
+                  role="menuitem"
+                  disabled={loading}
+                  onMouseMove={() => setBubbleActiveIndex(index)}
+                  onClick={() => selectBubbleAction(index)}
+                  className={cn(
+                    "flex w-full select-none items-center gap-2 rounded-md px-1.5 py-1.5 text-left text-sm outline-none transition-colors",
+                    "disabled:pointer-events-none disabled:opacity-50",
+                    bubbleActive && "bg-accent text-accent-foreground",
+                    destructive && "text-destructive"
+                  )}
+                >
+                  <ActionIcon className="size-3.5 shrink-0 opacity-70" />
+                  <span className="min-w-0 flex-1 truncate">
+                    {leafActionLabel(action, bubble.fullName)}
+                  </span>
+                </button>
+              </Fragment>
             )
           })}
         </div>

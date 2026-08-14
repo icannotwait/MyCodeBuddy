@@ -2,13 +2,7 @@
 
 import { useState, useEffect, useCallback } from "react"
 import { useTranslations } from "next-intl"
-import {
-  Loader2,
-  FolderOpen,
-  ChevronsUpDown,
-  CircleCheck,
-  CircleX,
-} from "lucide-react"
+import { Loader2, ChevronsUpDown, CircleCheck, CircleX } from "lucide-react"
 import { toast } from "sonner"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -34,15 +28,14 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
-import { isDesktop, openFileDialog, closeCurrentWindow } from "@/lib/platform"
-import { getActiveRemoteConnectionId } from "@/lib/transport"
+import { closeCurrentWindow } from "@/lib/platform"
 import {
   createShadcnProject,
   openFolderInWorkspace,
   detectPackageManager,
 } from "@/lib/api"
 import { extractAppCommandError, toErrorMessage } from "@/lib/app-error"
-import { DirectoryBrowserDialog } from "@/components/shared/directory-browser-dialog"
+import { DirectoryPathInput } from "@/components/shared/directory-path-input"
 import {
   BASE_OPTIONS,
   FRAMEWORK_OPTIONS,
@@ -69,7 +62,6 @@ export function CreateProjectDialog({
   const [rtl, setRtl] = useState(false)
   const [advancedOpen, setAdvancedOpen] = useState(false)
   const [creating, setCreating] = useState(false)
-  const [browserOpen, setBrowserOpen] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
   const [pmVersion, setPmVersion] = useState<string | null>(null)
@@ -97,21 +89,6 @@ export function CreateProjectDialog({
       checkPackageManager(packageManager)
     }
   }, [open, packageManager, checkPackageManager])
-
-  const handleBrowse = async () => {
-    // Project scaffolding runs on whichever host hosts the workspace —
-    // remote when bound to a remote workspace, local otherwise. The
-    // picker must match that host, so we only use the native Tauri
-    // dialog when we are truly on a local desktop workspace.
-    if (isDesktop() && getActiveRemoteConnectionId() === null) {
-      const result = await openFileDialog({ directory: true, multiple: false })
-      if (!result) return
-      const selected = Array.isArray(result) ? result[0] : result
-      setSaveDirectory(selected)
-    } else {
-      setBrowserOpen(true)
-    }
-  }
 
   const handleCreate = async () => {
     setError(null)
@@ -181,216 +158,197 @@ export function CreateProjectDialog({
     pmInstalled === true
 
   return (
-    <>
-      <Dialog
-        open={open}
-        onOpenChange={(v) => {
-          onOpenChange(v)
-          if (!v) resetForm()
-        }}
-      >
-        <DialogContent className="sm:max-w-md">
-          <DialogHeader>
-            <DialogTitle>{t("createDialog.title")}</DialogTitle>
-          </DialogHeader>
+    <Dialog
+      open={open}
+      onOpenChange={(v) => {
+        onOpenChange(v)
+        if (!v) resetForm()
+      }}
+    >
+      <DialogContent className="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle>{t("createDialog.title")}</DialogTitle>
+        </DialogHeader>
 
-          <div className="space-y-4 py-2">
-            <div className="space-y-1.5">
-              <Label>{t("createDialog.projectName")}</Label>
-              <Input
-                value={projectName}
-                onChange={(e) => setProjectName(e.target.value)}
-                placeholder={t("createDialog.projectNamePlaceholder")}
-                disabled={creating}
-              />
-            </div>
+        <div className="space-y-4 py-2">
+          <div className="space-y-1.5">
+            <Label>{t("createDialog.projectName")}</Label>
+            <Input
+              value={projectName}
+              onChange={(e) => setProjectName(e.target.value)}
+              placeholder={t("createDialog.projectNamePlaceholder")}
+              disabled={creating}
+            />
+          </div>
 
-            <div className="space-y-1.5">
-              <Label>{t("createDialog.saveDirectory")}</Label>
-              <div className="flex gap-2">
-                <Input
-                  value={saveDirectory}
-                  onChange={(e) => setSaveDirectory(e.target.value)}
-                  placeholder={t("createDialog.saveDirectoryPlaceholder")}
-                  disabled={creating}
-                  className="flex-1"
-                />
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={handleBrowse}
-                  disabled={creating}
-                  type="button"
-                >
-                  <FolderOpen className="h-4 w-4" />
-                </Button>
-              </div>
-              {saveDirectory && projectName.trim() && (
-                <p className="text-xs text-muted-foreground">
-                  {t("createDialog.projectPath", {
-                    path: `${saveDirectory}/${projectName.trim()}`,
-                  })}
-                </p>
-              )}
-            </div>
-
-            <div className="space-y-1.5">
-              <Label>{t("createDialog.packageManager")}</Label>
-              <Tabs
-                value={packageManager}
-                onValueChange={setPackageManager}
-                className="gap-0"
-              >
-                <TabsList className="w-full">
-                  {PACKAGE_MANAGER_OPTIONS.map((opt) => (
-                    <TabsTrigger
-                      key={opt.value}
-                      value={opt.value}
-                      className="flex-1"
-                      disabled={creating}
-                    >
-                      {opt.label}
-                    </TabsTrigger>
-                  ))}
-                </TabsList>
-                {PACKAGE_MANAGER_OPTIONS.map((opt) => (
-                  <TabsContent key={opt.value} value={opt.value}>
-                    <div className="flex h-8 items-center gap-1.5 text-sm">
-                      {pmChecking ? (
-                        <>
-                          <Loader2 className="size-3.5 animate-spin text-muted-foreground" />
-                          <span className="text-muted-foreground">
-                            {t("createDialog.pmChecking")}
-                          </span>
-                        </>
-                      ) : pmInstalled ? (
-                        <>
-                          <CircleCheck className="size-3.5 text-emerald-500" />
-                          <span className="text-muted-foreground">
-                            {opt.label} v{pmVersion}
-                          </span>
-                        </>
-                      ) : (
-                        <>
-                          <CircleX className="size-3.5 text-destructive" />
-                          <span className="text-muted-foreground">
-                            {t("createDialog.pmNotInstalled")}
-                          </span>
-                        </>
-                      )}
-                    </div>
-                  </TabsContent>
-                ))}
-              </Tabs>
-            </div>
-
-            <Collapsible open={advancedOpen} onOpenChange={setAdvancedOpen}>
-              <CollapsibleTrigger asChild>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  className="h-auto gap-1 px-0 text-xs text-muted-foreground"
-                  disabled={creating}
-                >
-                  <ChevronsUpDown className="size-3.5" />
-                  {t("createDialog.advancedOptions")}
-                </Button>
-              </CollapsibleTrigger>
-              <CollapsibleContent className="space-y-4 pt-2">
-                <div className="space-y-1.5">
-                  <Label>{t("createDialog.frameworkTemplate")}</Label>
-                  <RadioGroup
-                    value={framework}
-                    onValueChange={setFramework}
-                    disabled={creating}
-                    className="grid grid-cols-2 gap-2"
-                  >
-                    {FRAMEWORK_OPTIONS.map((opt) => (
-                      <FieldLabel key={opt.value} htmlFor={`fw-${opt.value}`}>
-                        <Field orientation="horizontal">
-                          <FieldContent>
-                            <FieldTitle>{opt.label}</FieldTitle>
-                          </FieldContent>
-                          <RadioGroupItem
-                            value={opt.value}
-                            id={`fw-${opt.value}`}
-                          />
-                        </Field>
-                      </FieldLabel>
-                    ))}
-                  </RadioGroup>
-                </div>
-
-                <div className="space-y-1.5">
-                  <Label>{t("createDialog.base")}</Label>
-                  <RadioGroup
-                    value={base}
-                    onValueChange={setBase}
-                    disabled={creating}
-                    className="grid grid-cols-2 gap-2"
-                  >
-                    {BASE_OPTIONS.map((opt) => (
-                      <FieldLabel key={opt.value} htmlFor={`base-${opt.value}`}>
-                        <Field orientation="horizontal">
-                          <FieldContent>
-                            <FieldTitle>{opt.label}</FieldTitle>
-                          </FieldContent>
-                          <RadioGroupItem
-                            value={opt.value}
-                            id={`base-${opt.value}`}
-                          />
-                        </Field>
-                      </FieldLabel>
-                    ))}
-                  </RadioGroup>
-                </div>
-
-                <label className="flex cursor-pointer items-center gap-3 rounded-lg border p-3">
-                  <Switch
-                    checked={rtl}
-                    onCheckedChange={setRtl}
-                    disabled={creating}
-                  />
-                  <div className="space-y-0.5">
-                    <div className="text-sm font-medium">
-                      {t("createDialog.enableRtl")}
-                    </div>
-                    <div className="text-xs text-muted-foreground">
-                      {t("createDialog.enableRtlDescription")}
-                    </div>
-                  </div>
-                </label>
-              </CollapsibleContent>
-            </Collapsible>
-
-            {error && (
-              <div className="rounded-lg border border-destructive/50 bg-destructive/10 px-3 py-2 text-sm text-destructive">
-                {error}
-              </div>
+          <div className="space-y-1.5">
+            <Label>{t("createDialog.saveDirectory")}</Label>
+            <DirectoryPathInput
+              value={saveDirectory}
+              onValueChange={setSaveDirectory}
+              placeholder={t("createDialog.saveDirectoryPlaceholder")}
+              disabled={creating}
+              browseLabel={t("createDialog.browseDirectory")}
+            />
+            {saveDirectory && projectName.trim() && (
+              <p className="text-xs text-muted-foreground">
+                {t("createDialog.projectPath", {
+                  path: `${saveDirectory}/${projectName.trim()}`,
+                })}
+              </p>
             )}
           </div>
 
-          <DialogFooter>
-            <Button
-              variant="outline"
-              onClick={() => onOpenChange(false)}
-              disabled={creating}
+          <div className="space-y-1.5">
+            <Label>{t("createDialog.packageManager")}</Label>
+            <Tabs
+              value={packageManager}
+              onValueChange={setPackageManager}
+              className="gap-0"
             >
-              {t("createDialog.cancel")}
-            </Button>
-            <Button onClick={handleCreate} disabled={!canCreate || creating}>
-              {creating && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-              {creating ? t("createDialog.creating") : t("createDialog.create")}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+              <TabsList className="w-full">
+                {PACKAGE_MANAGER_OPTIONS.map((opt) => (
+                  <TabsTrigger
+                    key={opt.value}
+                    value={opt.value}
+                    className="flex-1"
+                    disabled={creating}
+                  >
+                    {opt.label}
+                  </TabsTrigger>
+                ))}
+              </TabsList>
+              {PACKAGE_MANAGER_OPTIONS.map((opt) => (
+                <TabsContent key={opt.value} value={opt.value}>
+                  <div className="flex h-8 items-center gap-1.5 text-sm">
+                    {pmChecking ? (
+                      <>
+                        <Loader2 className="size-3.5 animate-spin text-muted-foreground" />
+                        <span className="text-muted-foreground">
+                          {t("createDialog.pmChecking")}
+                        </span>
+                      </>
+                    ) : pmInstalled ? (
+                      <>
+                        <CircleCheck className="size-3.5 text-emerald-500" />
+                        <span className="text-muted-foreground">
+                          {opt.label} v{pmVersion}
+                        </span>
+                      </>
+                    ) : (
+                      <>
+                        <CircleX className="size-3.5 text-destructive" />
+                        <span className="text-muted-foreground">
+                          {t("createDialog.pmNotInstalled")}
+                        </span>
+                      </>
+                    )}
+                  </div>
+                </TabsContent>
+              ))}
+            </Tabs>
+          </div>
 
-      <DirectoryBrowserDialog
-        open={browserOpen}
-        onOpenChange={setBrowserOpen}
-        onSelect={(path) => setSaveDirectory(path)}
-      />
-    </>
+          <Collapsible open={advancedOpen} onOpenChange={setAdvancedOpen}>
+            <CollapsibleTrigger asChild>
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-auto gap-1 px-0 text-xs text-muted-foreground"
+                disabled={creating}
+              >
+                <ChevronsUpDown className="size-3.5" />
+                {t("createDialog.advancedOptions")}
+              </Button>
+            </CollapsibleTrigger>
+            <CollapsibleContent className="space-y-4 pt-2">
+              <div className="space-y-1.5">
+                <Label>{t("createDialog.frameworkTemplate")}</Label>
+                <RadioGroup
+                  value={framework}
+                  onValueChange={setFramework}
+                  disabled={creating}
+                  className="grid grid-cols-2 gap-2"
+                >
+                  {FRAMEWORK_OPTIONS.map((opt) => (
+                    <FieldLabel key={opt.value} htmlFor={`fw-${opt.value}`}>
+                      <Field orientation="horizontal">
+                        <FieldContent>
+                          <FieldTitle>{opt.label}</FieldTitle>
+                        </FieldContent>
+                        <RadioGroupItem
+                          value={opt.value}
+                          id={`fw-${opt.value}`}
+                        />
+                      </Field>
+                    </FieldLabel>
+                  ))}
+                </RadioGroup>
+              </div>
+
+              <div className="space-y-1.5">
+                <Label>{t("createDialog.base")}</Label>
+                <RadioGroup
+                  value={base}
+                  onValueChange={setBase}
+                  disabled={creating}
+                  className="grid grid-cols-2 gap-2"
+                >
+                  {BASE_OPTIONS.map((opt) => (
+                    <FieldLabel key={opt.value} htmlFor={`base-${opt.value}`}>
+                      <Field orientation="horizontal">
+                        <FieldContent>
+                          <FieldTitle>{opt.label}</FieldTitle>
+                        </FieldContent>
+                        <RadioGroupItem
+                          value={opt.value}
+                          id={`base-${opt.value}`}
+                        />
+                      </Field>
+                    </FieldLabel>
+                  ))}
+                </RadioGroup>
+              </div>
+
+              <label className="flex cursor-pointer items-center gap-3 rounded-lg border p-3">
+                <Switch
+                  checked={rtl}
+                  onCheckedChange={setRtl}
+                  disabled={creating}
+                />
+                <div className="space-y-0.5">
+                  <div className="text-sm font-medium">
+                    {t("createDialog.enableRtl")}
+                  </div>
+                  <div className="text-xs text-muted-foreground">
+                    {t("createDialog.enableRtlDescription")}
+                  </div>
+                </div>
+              </label>
+            </CollapsibleContent>
+          </Collapsible>
+
+          {error && (
+            <div className="rounded-lg border border-destructive/50 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+              {error}
+            </div>
+          )}
+        </div>
+
+        <DialogFooter>
+          <Button
+            variant="outline"
+            onClick={() => onOpenChange(false)}
+            disabled={creating}
+          >
+            {t("createDialog.cancel")}
+          </Button>
+          <Button onClick={handleCreate} disabled={!canCreate || creating}>
+            {creating && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+            {creating ? t("createDialog.creating") : t("createDialog.create")}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   )
 }

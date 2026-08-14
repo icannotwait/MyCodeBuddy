@@ -776,6 +776,36 @@ describe("AppWorkspaceProvider folder://changed sync", () => {
     expect(screen.getByTestId("folder-ids")).toHaveTextContent("12,13")
   })
 
+  it("drops a folder from both lists on a folder delete event", async () => {
+    // A task worktree removed after its merge must leave the sidebar right
+    // away — otherwise it lingers until the next full `fetchFolders` (reload).
+    await mountProvider()
+    emitFolder({ kind: "upsert", folder: makeFolder({ id: 12, parent_id: 1 }) })
+    emitFolder({ kind: "upsert", folder: makeFolder({ id: 13 }) })
+    emitFolder({ kind: "deleted", id: 12 })
+    expect(screen.getByTestId("folder-ids")).toHaveTextContent("13")
+    expect(screen.getByTestId("folder-ids")).not.toHaveTextContent("12")
+    expect(screen.getByTestId("all-folder-ids")).not.toHaveTextContent("12")
+  })
+
+  it("ignores a delete for a folder it never knew about", async () => {
+    await mountProvider()
+    emitFolder({ kind: "upsert", folder: makeFolder({ id: 13 }) })
+    emitFolder({ kind: "deleted", id: 99 })
+    expect(screen.getByTestId("folder-ids")).toHaveTextContent("13")
+  })
+
+  it("closes the folder's tabs alongside the removal", async () => {
+    // The backend only deletes PERSISTED tabs; device-local drafts would
+    // otherwise stay open on a cwd that no longer exists.
+    const spy = vi.spyOn(useTabStore.getState(), "closeTabsByFolder")
+    await mountProvider()
+    emitFolder({ kind: "upsert", folder: makeFolder({ id: 12, parent_id: 1 }) })
+    emitFolder({ kind: "deleted", id: 12 })
+    expect(spy).toHaveBeenCalledWith(12)
+    spy.mockRestore()
+  })
+
   it("re-fetches folders on transport reconnect (disconnect backstop)", async () => {
     await mountProvider()
     // Mount already fetched folders once.

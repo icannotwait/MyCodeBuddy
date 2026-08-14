@@ -43,6 +43,7 @@ const EMPTY_LIST: GitBranchList = {
   local: [],
   remote: [],
   worktree_branches: [],
+  main_worktree_branch: null,
 }
 
 /** Strip the remote prefix (`origin/main` → `main`) so a remote pick stores a

@@ -27,11 +27,16 @@ import { selectIsSplit } from "@/stores/tab-store"
 import { SidebarProvider, useSidebarContext } from "@/contexts/sidebar-context"
 import { SearchDialogProvider } from "@/contexts/search-dialog-context"
 import { AutomationsViewProvider } from "@/contexts/automations-view-context"
+import { TasksViewProvider } from "@/contexts/tasks-view-context"
 import {
   WorkbenchRouteProvider,
   useWorkbenchRoute,
 } from "@/contexts/workbench-route-context"
-import { WorkbenchRoutePage } from "@/components/workbench/workbench-content"
+import {
+  WorkbenchRoutePage,
+  WorkbenchRouteStrip,
+  useHasWorkbenchRouteStrip,
+} from "@/components/workbench/workbench-content"
 import {
   AuxPanelProvider,
   useAuxPanelContext,
@@ -260,6 +265,7 @@ function WorkspaceContent({ children }: { children: React.ReactNode }) {
   )
 
   const { isConversations } = useWorkbenchRoute()
+  const hasRouteStrip = useHasWorkbenchRouteStrip()
   const { isOpen: sidebarOpen } = useSidebarContext()
   const { isOpen: auxOpen } = useAuxPanelContext()
   const { isMac, isWindows, isLinux } = usePlatform()
@@ -287,8 +293,22 @@ function WorkspaceContent({ children }: { children: React.ReactNode }) {
     <div className="relative h-full min-h-0 overflow-hidden">
       {/* Kept mounted (and only hidden) when a workbench route takes over, so
           background conversations keep streaming. `inert` drops it from the tab
-          order behind the opaque route overlay. */}
-      <div className="h-full min-h-0" inert={!isConversations || undefined}>
+          order; `invisible` (visibility, not display — keeps mount/layout/
+          scroll) stops it painting, because with a workspace background image
+          the route overlay's ws-surface is translucent and the conversation
+          would ghost through it. conversation-tab-hidden hardens that hidden
+          subtree (see globals.css): it kills the subtree's transitions so
+          visibility flips instantly (transition-all ghosts) and re-hides the
+          descendants that declare `visibility: visible` themselves — Monaco's
+          diff panes do, which is why an open git-diff file tab used to show
+          through the tasks / automations / token-usage pages. */}
+      <div
+        className={cn(
+          "h-full min-h-0",
+          !isConversations && "conversation-tab-hidden invisible"
+        )}
+        inert={!isConversations || undefined}
+      >
         <ResizablePanelGroup
           id={WORKSPACE_PANEL_GROUP_ID}
           ref={panelGroupRef}
@@ -309,8 +329,11 @@ function WorkspaceContent({ children }: { children: React.ReactNode }) {
                 // Covered by the files-maximized overlay: stop painting so it
                 // can't show through the now-translucent overlay. `invisible`
                 // (visibility:hidden), not display:none, keeps mount + box size
-                // intact so the stick-to-bottom scroll doesn't reset.
-                filesMaximized && "invisible"
+                // intact so the stick-to-bottom scroll doesn't reset;
+                // conversation-tab-hidden is the shared hardening for a hidden
+                // keep-alive subtree (kills its transitions, and re-hides the
+                // descendants that declare `visibility: visible` themselves).
+                filesMaximized && "conversation-tab-hidden invisible"
               )}
               inert={filesMaximized || undefined}
             >
@@ -421,8 +444,11 @@ function WorkspaceContent({ children }: { children: React.ReactNode }) {
                   "absolute inset-0 z-30 bg-background ws-transparent-bg",
                 // Covered by the conversation overlay in conversation mode: hide
                 // from paint (keep mount + layout) so it can't show through the
-                // translucent overlay.
-                mode === "conversation" && "invisible"
+                // translucent overlay. conversation-tab-hidden goes with it —
+                // an open git-diff tab lives in this column and Monaco's diff
+                // panes set their own inline `visibility: visible` (see
+                // globals.css), so `invisible` alone leaves them painting.
+                mode === "conversation" && "conversation-tab-hidden invisible"
               )}
               aria-hidden={mode === "conversation"}
             >
@@ -473,11 +499,32 @@ function WorkspaceContent({ children }: { children: React.ReactNode }) {
         </ResizablePanelGroup>
       </div>
       {!isConversations ? (
-        <div className="absolute inset-0 z-40 flex flex-col ws-surface">
-          {/* Reserve the fixed window-chrome overlays' h-10 corner strip so
-              route content (e.g. the Automations enable switch at the top-right)
-              never renders beneath them. The strip is a window-drag region. */}
-          <div data-tauri-drag-region className="h-10 shrink-0" />
+        // `bg-background ws-transparent-bg` matches the conversation surface
+        // exactly: opaque background normally, fully transparent (image shows
+        // through, no frost) with a workspace background image on — the
+        // conversation beneath is `invisible` so nothing else paints through.
+        <div className="absolute inset-0 z-40 flex flex-col bg-background ws-transparent-bg">
+          {/* Window-chrome strip: reserves the fixed corner overlays' h-10
+              band, hosts the active route's title on the left, and keeps the
+              empty middle as a window-drag region. With a title present it
+              closes with the sidebar-header hairline (ws-chrome-border keeps
+              it legible over a background image). */}
+          <div
+            className={cn(
+              "flex h-10 shrink-0 items-stretch",
+              hasRouteStrip && "border-b border-border/50 ws-chrome-border"
+            )}
+          >
+            {!sidebarOpen && (
+              <div
+                data-tauri-drag-region
+                className="h-full shrink-0"
+                style={{ width: leftReserve }}
+              />
+            )}
+            <WorkbenchRouteStrip />
+            <div data-tauri-drag-region className="h-full min-w-0 flex-1" />
+          </div>
           <div className="min-h-0 flex-1">
             <WorkbenchRoutePage />
           </div>
@@ -490,13 +537,22 @@ function WorkspaceContent({ children }: { children: React.ReactNode }) {
 function MobileWorkspaceContent({ children }: { children: React.ReactNode }) {
   const { mode, activePane } = useWorkspaceView()
   const { isConversations } = useWorkbenchRoute()
+  const hasRouteStrip = useHasWorkbenchRouteStrip()
 
   const showConversation =
     mode === "conversation" || activePane === "conversation"
 
   return (
     <div className="relative h-full min-h-0 overflow-hidden">
-      <div className="h-full min-h-0" inert={!isConversations || undefined}>
+      {/* Same keep-alive hiding as the desktop shell: stop painting under the
+          translucent route overlay without unmounting. */}
+      <div
+        className={cn(
+          "h-full min-h-0",
+          !isConversations && "conversation-tab-hidden invisible"
+        )}
+        inert={!isConversations || undefined}
+      >
         {showConversation ? (
           // Mobile mirrors the desktop chrome: no tab strip — the conversation
           // detail header (folder › title) renders inside {children}, and tabs
@@ -518,8 +574,18 @@ function MobileWorkspaceContent({ children }: { children: React.ReactNode }) {
         )}
       </div>
       {!isConversations ? (
-        <div className="absolute inset-0 z-40 ws-surface">
-          <WorkbenchRoutePage />
+        // Same canvas as the desktop overlay: conversation-identical background
+        // (opaque normally, transparent under a workspace background image).
+        <div className="absolute inset-0 z-40 flex flex-col bg-background ws-transparent-bg">
+          {hasRouteStrip ? (
+            <div className="flex h-10 shrink-0 items-stretch border-b border-border/50 ws-chrome-border">
+              <WorkbenchRouteStrip />
+              <div className="min-w-0 flex-1" />
+            </div>
+          ) : null}
+          <div className="min-h-0 flex-1">
+            <WorkbenchRoutePage />
+          </div>
         </div>
       ) : null}
     </div>
@@ -597,7 +663,7 @@ function FolderWorkspaceShell({ children }: { children: React.ReactNode }) {
     setWidth: setSidebarWidth,
   } = useSidebarContext()
   const {
-    isOpen: auxOpen,
+    isOpen: auxOpenRequested,
     restored: auxRestored,
     width: auxWidth,
     minWidth: auxMinWidth,
@@ -605,12 +671,22 @@ function FolderWorkspaceShell({ children }: { children: React.ReactNode }) {
     setWidth: setAuxWidth,
   } = useAuxPanelContext()
   const {
-    isOpen: terminalOpen,
+    isOpen: terminalOpenRequested,
     height: terminalHeight,
     minHeight: terminalMinHeight,
     maxHeight: terminalMaxHeight,
     setHeight: setTerminalHeight,
   } = useTerminalContext()
+  // A full-page workbench route (tasks / automations) replaces only the CENTER
+  // panel — the terminal sits below it and the aux panel beside it, both
+  // outside the overlay. Their toggles are hidden on those routes
+  // (RightEdgeChrome), so anything left open would be stranded on screen with
+  // no way to close it. Collapse both for the duration; the contexts keep the
+  // user's real open state (and the terminal keeps running), so switching back
+  // to conversations restores exactly what was there.
+  const { isConversations } = useWorkbenchRoute()
+  const auxOpen = auxOpenRequested && isConversations
+  const terminalOpen = terminalOpenRequested && isConversations
 
   // Animate the shell (horizontal) group while the sidebar/aux toggle and the
   // main (vertical) group while the terminal toggles, so the panes slide open
@@ -1172,17 +1248,19 @@ function WorkspaceLayoutInner({ children }: { children: React.ReactNode }) {
                           <TerminalProvider>
                             <SearchDialogProvider>
                               <AutomationsViewProvider>
-                                <WorkbenchRouteProvider>
-                                  <WorkbenchRouteConversationSync />
-                                  <ConversationAwaitingReplyClearer />
-                                  {/* Inside WorkbenchRouteProvider: the
+                                <TasksViewProvider>
+                                  <WorkbenchRouteProvider>
+                                    <WorkbenchRouteConversationSync />
+                                    <ConversationAwaitingReplyClearer />
+                                    {/* Inside WorkbenchRouteProvider: the
                                           listener calls openConversations() to
                                           surface a launcher-opened folder. */}
-                                  <WorkspaceOpenFolderListener />
-                                  <FolderLayoutShell>
-                                    {children}
-                                  </FolderLayoutShell>
-                                </WorkbenchRouteProvider>
+                                    <WorkspaceOpenFolderListener />
+                                    <FolderLayoutShell>
+                                      {children}
+                                    </FolderLayoutShell>
+                                  </WorkbenchRouteProvider>
+                                </TasksViewProvider>
                               </AutomationsViewProvider>
                             </SearchDialogProvider>
                           </TerminalProvider>

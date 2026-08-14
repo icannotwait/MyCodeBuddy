@@ -13,6 +13,7 @@ import {
   selectDelegationActivities,
   selectHistoricalTimelineTurns,
   selectTimelineTurns,
+  useConversationRuntimeActions,
   useConversationRuntimeStore,
 } from "@/stores/conversation-runtime-store"
 import { useStreamingPerformanceFlag } from "@/lib/acp/streaming-performance-config"
@@ -27,6 +28,7 @@ import type {
   LiveMessage,
 } from "@/contexts/acp-connections-context"
 import { useAgentThinkingVisibility } from "@/hooks/use-acp-agents"
+import { isWindowedDetail } from "@/lib/turn-window"
 import { ContentPartsRenderer } from "./content-parts-renderer"
 import { LiveTranscriptRow } from "./live-transcript-row"
 import { ContextCompactionCard } from "./context-compaction-card"
@@ -85,7 +87,9 @@ import {
   Loader2,
   Plus,
   RefreshCw,
+  ListTodo,
 } from "lucide-react"
+import { useCreateTaskFromMessage } from "./use-create-task-from-message"
 import { Button } from "@/components/ui/button"
 import { useTranslations } from "next-intl"
 import {
@@ -121,10 +125,11 @@ interface MessageListViewProps {
   detailError?: string | null
   /**
    * Set when the agent rejected `session/load` non-recoverably (e.g. the
-   * historical session_id was deleted). Takes precedence over `detailError`
-   * AND the renderable-content gate: even when the local DB has the full
-   * message history, the user must explicitly choose Reload or start a new
-   * conversation since the agent can't continue this thread.
+   * historical session_id was deleted, or the conversation's folder is gone).
+   * Replaces the message area only when nothing is renderable; when the local
+   * DB has the message history, the transcript stays visible and the owning
+   * panel surfaces this error as a banner in the composer area instead (with
+   * Reload / New session actions), since the agent can't continue the thread.
    */
   acpLoadError?: string | null
   /** Stable backend code for the ACP load failure. */
@@ -153,6 +158,13 @@ interface MessageListViewProps {
   waitingForSubagentsArmedAtMs?: number | null
   onResumeRoot?: () => void | Promise<void>
   onOpenRootConversation?: (conversationId: number) => void | Promise<void>
+  /**
+   * Optional phase label for a user turn (work-task transcripts label each
+   * engine-dispatched round: work / retry / return / merge). Called at render
+   * time per user-role turn; MUST be pure — the thread is virtualized, so
+   * items render in arbitrary order and multiplicity. `null` = no divider.
+   */
+  userTurnHeader?: ((group: ResolvedMessageGroup) => string | null) | null
 }
 
 export function canReloadSessionLoadError(
@@ -655,6 +667,29 @@ const UserMessageCopyButton = memo(function UserMessageCopyButton({
   )
 })
 
+const UserMessageTaskButton = memo(function UserMessageTaskButton({
+  parts,
+}: {
+  parts: AdaptedContentPart[]
+}) {
+  const t = useTranslations("Tasks")
+  const getText = useCallback(
+    () => unescapeComposerText(extractTextFromParts(parts)),
+    [parts]
+  )
+  const createTask = useCreateTaskFromMessage(getText)
+  return (
+    <MessageAction
+      tooltip={t("createFromMessage")}
+      className="opacity-0 group-hover/user-msg:opacity-100 transition-opacity self-end"
+      onClick={createTask}
+      size="icon-xs"
+    >
+      <ListTodo size={12} />
+    </MessageAction>
+  )
+})
+
 const HistoricalMessageGroup = memo(function HistoricalMessageGroup({
   group,
   parentConversationId,
@@ -701,6 +736,7 @@ const HistoricalMessageGroup = memo(function HistoricalMessageGroup({
           ) : null}
           {group.role === "user" ? (
             <div className="group/user-msg flex w-fit ml-auto max-w-full items-start gap-1">
+              <UserMessageTaskButton parts={group.parts} />
               <UserMessageCopyButton parts={group.parts} />
               <MessageContent>
                 <CollapsibleUserMessage
@@ -1136,6 +1172,7 @@ export function MessageListView({
   waitingForSubagentsArmedAtMs = null,
   onResumeRoot,
   onOpenRootConversation,
+  userTurnHeader = null,
 }: MessageListViewProps) {
   const isWaitingForSubagents =
     waitingForSubagentsArmedAtMs != null &&
@@ -1167,6 +1204,36 @@ export function MessageListView({
   const onLoadOlderHistory = useCallback(() => {
     loadOlderHistory(conversationId)
   }, [conversationId, loadOlderHistory])
+  const { loadOlderTurns } = useConversationRuntimeActions()
+  // Narrow selectors: the whole session object changes on live tokens, and
+  // subscribing to it would re-render the historical thread during streaming.
+  const olderTurnsPrependEpoch = useConversationRuntimeStore(
+    (s) => s.byConversationId.get(conversationId)?.olderTurnsPrependEpoch ?? 0
+  )
+  const sessionLoadingOlderTurns = useConversationRuntimeStore((s) =>
+    Boolean(s.byConversationId.get(conversationId)?.loadingOlderTurns)
+  )
+  const sessionTurnsOffset = useConversationRuntimeStore((s) => {
+    const detail = s.byConversationId.get(conversationId)?.detail ?? null
+    if (!isWindowedDetail(detail)) return 0
+    return detail.turns_offset ?? 0
+  })
+  const hasOlderTurns =
+    Boolean(historyWindow?.has_more_before) || sessionTurnsOffset > 0
+  const loadingOlderTurns =
+    detailHistoryLoadingOlder || sessionLoadingOlderTurns
+  const handleLoadOlder = useCallback(() => {
+    if (historyWindow?.has_more_before) {
+      onLoadOlderHistory()
+      return
+    }
+    loadOlderTurns(conversationId)
+  }, [
+    conversationId,
+    historyWindow?.has_more_before,
+    loadOlderTurns,
+    onLoadOlderHistory,
+  ])
 
   // One-shot latch: initialized once from mount-time eligibility; only the
   // controller clears it. Later prop changes never re-arm this state.
@@ -1300,11 +1367,13 @@ export function MessageListView({
     const streamingIndices = new Set<number>()
     const inProgressToolCallIdsByIndex = new Map<number, Set<string>>()
     timelineTurns.forEach((item, i) => {
-      if (item.phase === "streaming") {
-        streamingIndices.add(i)
-        if (item.inProgressToolCallIds && item.inProgressToolCallIds.size > 0) {
-          inProgressToolCallIdsByIndex.set(i, item.inProgressToolCallIds)
-        }
+      if (item.phase === "streaming") streamingIndices.add(i)
+      // Not gated on the streaming phase: a PERSISTED turn of a conversation
+      // that is still running (viewer without the live stream) also carries
+      // in-flight calls, marked by the store from the backend's
+      // `in_flight_user_turn_id`. Both phases feed the same adapter knob.
+      if (item.inProgressToolCallIds && item.inProgressToolCallIds.size > 0) {
+        inProgressToolCallIdsByIndex.set(i, item.inProgressToolCallIds)
       }
     })
     const allAdapted = turnAdapter.adapt(
@@ -1497,8 +1566,21 @@ export function MessageListView({
       switch (item.kind) {
         case "turn": {
           const pt = item.isRoleTransition ? 16 : 0
+          const phaseLabel =
+            item.group.role === "user" && userTurnHeader
+              ? userTurnHeader(item.group)
+              : null
           return (
             <div style={pt > 0 ? { paddingTop: pt } : undefined}>
+              {phaseLabel ? (
+                <div className="flex items-center gap-2 px-1 pb-3 pt-1">
+                  <span aria-hidden="true" className="h-px flex-1 bg-border" />
+                  <span className="shrink-0 rounded-full border border-border bg-muted/50 px-2 py-0.5 text-[0.625rem] font-medium leading-none text-muted-foreground">
+                    {phaseLabel}
+                  </span>
+                  <span aria-hidden="true" className="h-px flex-1 bg-border" />
+                </div>
+              ) : null}
               <HistoricalMessageGroup
                 group={item.group}
                 parentConversationId={conversationId}
@@ -1528,7 +1610,7 @@ export function MessageListView({
           return null
       }
     },
-    [showThinking, conversationId]
+    [showThinking, conversationId, userTurnHeader]
   )
 
   const emptyState = useMemo(
@@ -1675,6 +1757,11 @@ export function MessageListView({
   // Computed lazily: only while the panel is expanded, since
   // `extractSessionFilesGrouped` parses every turn's diffs. Collapsed (the
   // default) it stays EMPTY, keeping the streaming hot path free of diff parsing.
+  //
+  // Windowed loading caveat (accepted degradation): counts, ordinals and file
+  // summaries cover only the LOADED window — paging in older history extends
+  // them. Nav targets are recomputed with the items on every prepend, so the
+  // indices themselves never go stale.
   const navEntries = useMemo<MessageNavEntry[]>(() => {
     if (!showMessageNav || !navExpanded) return EMPTY_NAV_ENTRIES
     const turns = timelineTurns.map((item) => item.turn)
@@ -1756,11 +1843,13 @@ export function MessageListView({
     )
   }
 
-  // ACP load failures always replace content: even when the local DB has
-  // the conversation, the agent can't resume it, so silently rendering
-  // the history would mislead the user into thinking a follow-up message
-  // would extend the same thread.
-  const blockingLoadError = acpLoadError ?? null
+  // An ACP load failure replaces content only when there is nothing to show
+  // (e.g. the DB detail also failed). When the local DB has the conversation,
+  // keep the transcript visible — the failure is not silent: the detail panel
+  // renders the load error as a banner in the composer area (with Reload /
+  // New session actions), so the user still learns that a follow-up message
+  // can't extend this thread.
+  const blockingLoadError = hasRenderableContent ? null : (acpLoadError ?? null)
   const fallbackLoadError =
     detailError && !hasRenderableContent ? detailError : null
   const renderedLoadError = blockingLoadError ?? fallbackLoadError
@@ -1863,6 +1952,13 @@ export function MessageListView({
           }
           footer={liveFooter}
           scrollApiRef={scrollApiRef}
+          hasOlder={hasOlderTurns}
+          isLoadingOlder={loadingOlderTurns}
+          onLoadOlder={handleLoadOlder}
+          loadOlderLabel={t("loadEarlier")}
+          loadingOlderLabel={t("loadingEarlier")}
+          prependEpoch={olderTurnsPrependEpoch}
+          prependScopeKey={conversationId}
         />
         <MessageThreadScrollButton
           onBeforeScrollToBottom={() => {

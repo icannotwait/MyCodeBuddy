@@ -295,29 +295,31 @@ describe("VirtualizedMessageThread footer slot", () => {
     ).toBeInTheDocument()
   })
 
-  it("enables shift only when stable-keyed rows are prepended", () => {
-    const renderThread = (items: string[]) => (
+  it("enables shift only when prependEpoch advances in the same scope", () => {
+    const renderThread = (items: string[], epoch = 0) => (
       <VirtualizedMessageThread
         items={items}
         getItemKey={(item) => item}
         renderItem={(item) => <div>{item}</div>}
+        prependEpoch={epoch}
+        prependScopeKey="c1"
       />
     )
-    const { rerender } = render(renderThread(["current"]))
+    const { rerender } = render(renderThread(["current"], 0))
     expect(
       virtualizerPropsSpy.mock.calls[
         virtualizerPropsSpy.mock.calls.length - 1
       ]?.[0].shift
     ).toBe(false)
 
-    rerender(renderThread(["older", "current"]))
+    rerender(renderThread(["older", "current"], 1))
     expect(
       virtualizerPropsSpy.mock.calls[
         virtualizerPropsSpy.mock.calls.length - 1
       ]?.[0].shift
     ).toBe(true)
 
-    rerender(renderThread(["older", "current", "newer"]))
+    rerender(renderThread(["older", "current", "newer"], 1))
     expect(
       virtualizerPropsSpy.mock.calls[
         virtualizerPropsSpy.mock.calls.length - 1

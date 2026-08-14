@@ -67,11 +67,28 @@ pub struct AutomationDraft {
     pub config: serde_json::Value,
 }
 
+/// What firing the automation does. Lives inside the config blob (not a
+/// column) so every pre-existing row deserializes as the legacy default —
+/// nothing queries automations by action.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutomationAction {
+    /// Launch a headless agent session (the original behavior).
+    #[default]
+    LaunchSession,
+    /// Enqueue a work task (status todo) on the target folder's board; the
+    /// work-task engine owns the actual execution.
+    EnqueueTask,
+}
+
 /// The structured shape stored inside `automation.config`. Kept tolerant
 /// (`#[serde(default)]`) so an older/newer snapshot still deserializes; the fire
-/// path reads `prompt_blocks` + `mode_id` + `config_values`, the rest is display.
+/// path reads `action` + `prompt_blocks` + `mode_id` + `config_values`, the
+/// rest is display.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AutomationConfig {
+    #[serde(default)]
+    pub action: AutomationAction,
     #[serde(default)]
     pub prompt_blocks: Vec<serde_json::Value>,
     #[serde(default)]

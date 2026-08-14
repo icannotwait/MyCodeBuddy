@@ -13,10 +13,14 @@ import type {
   SessionConfigSelectOptionInfo,
 } from "@/lib/types"
 
+// Returns the option with its `kind` narrowed to the select arm, so tests can
+// keep poking at `kind.groups` / `kind.options` directly.
 function modelOption(
   options: SessionConfigSelectOptionInfo[],
-  overrides: Partial<SessionConfigOptionInfo> = {}
-): SessionConfigOptionInfo {
+  overrides: Partial<Omit<SessionConfigOptionInfo, "kind">> = {}
+): SessionConfigOptionInfo & {
+  kind: Extract<SessionConfigOptionInfo["kind"], { type: "select" }>
+} {
   return {
     id: "model",
     name: "Model",

@@ -97,4 +97,34 @@ describe("BackgroundTaskCard", () => {
     fireEvent.click(screen.getByRole("button"))
     expect(screen.getByText("INVALID DIRECTORY MARKER")).toBeInTheDocument()
   })
+
+  it("renders a Grok sub-agent report as prose, without the wire scaffolding", () => {
+    // A polled sub-agent returns a written report, not a shell stream, and the
+    // parent-model scaffolding at its end must not reach the user.
+    renderCard([
+      poll({
+        toolName: "get_command_or_subagent_output",
+        input: JSON.stringify({ task_ids: ["019fe6bf"], timeout_ms: 300000 }),
+        output: JSON.stringify({
+          type: "TaskOutput",
+          Result: {
+            task_id: "019fe6bf",
+            command: "[subagent:general-purpose] Run pnpm build",
+            status: "completed",
+            exit_code: 0,
+            output:
+              '## Build Result\n\nBUILD REPORT MARKER\n\n<subagent_meta>id=019fe6bf, tool_calls=1</subagent_meta>\n\n<subagent_result>\nresume_from="019fe6bf"\n</subagent_result>',
+          },
+        }),
+      }),
+    ])
+    fireEvent.click(screen.getByRole("button"))
+    expect(screen.getByText("BUILD REPORT MARKER")).toBeInTheDocument()
+    // Markdown, not a terminal dump: the heading became a real heading.
+    expect(
+      screen.getByRole("heading", { name: "Build Result" })
+    ).toBeInTheDocument()
+    expect(screen.queryByText(/subagent_meta/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/resume_from/)).not.toBeInTheDocument()
+  })
 })

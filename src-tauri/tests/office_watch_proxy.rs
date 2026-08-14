@@ -62,6 +62,11 @@ async fn spawn_fake_upstream() -> (u16, Arc<AtomicBool>, Arc<Mutex<String>>) {
                         "<html><head><title>doc</title></head><body>hi</body></html>",
                     ))
                     .unwrap()
+            } else if uri.path().ends_with("/events") {
+                axum::response::Response::builder()
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .body(axum::body::Body::from("data: refresh\n\n".repeat(16)))
+                    .unwrap()
             } else {
                 axum::response::Response::builder()
                     .body(axum::body::Body::from("upstream-body"))
@@ -133,6 +138,32 @@ async fn proxy_forwards_with_valid_cap_without_leaking_cap() {
     );
     // The non-cap param passes through verbatim.
     assert_eq!(&*last_query.lock().unwrap(), "x=1");
+}
+
+#[tokio::test]
+async fn sse_stream_is_never_compressed() {
+    // The router's CompressionLayer uses a custom allowlist predicate, which
+    // REPLACES tower-http's default (whose built-in exclusions covered SSE).
+    // This pins the explicit `text/event-stream` exclusion: a compressed SSE
+    // response would be buffered by the encoder and stall live previews.
+    let (server, _data, _static) = build_proxy_server().await;
+    let (port, _leaked, _q) = spawn_fake_upstream().await;
+    codeg_lib::office_watch::insert_known_port_for_test(port, TEST_CAP);
+
+    let resp = server
+        .get(&format!(
+            "/api/office-watch-proxy/{port}/events?cap={TEST_CAP}"
+        ))
+        .add_header("accept-encoding", "gzip, br")
+        .await;
+
+    codeg_lib::office_watch::remove_known_port_for_test(port);
+
+    assert_eq!(resp.status_code(), 200);
+    assert!(
+        resp.headers().get("content-encoding").is_none(),
+        "text/event-stream must never get a content-encoding"
+    );
 }
 
 #[tokio::test]

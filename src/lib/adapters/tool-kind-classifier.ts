@@ -1,4 +1,5 @@
 import { COLLAB_AGENT_TOOL_NAME } from "@/lib/collab-tool"
+import { isShellSessionToolName } from "@/lib/shell-session-tool"
 
 export type ToolKindLabel =
   | "search"
@@ -132,7 +133,11 @@ export function classifyToolKind(toolName: string): ToolKindLabel {
     name === "exec_command" ||
     name === "shell" ||
     name === "execute_command" ||
-    name === "run_command"
+    name === "run_command" ||
+    // codex's unified-exec session tools continue a background shell started by
+    // an `exec_command`, so they belong with the commands in the tool-group
+    // tally (see `shell-session-tool.ts`).
+    isShellSessionToolName(name)
   ) {
     return "command"
   }

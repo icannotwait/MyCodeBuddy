@@ -4,7 +4,6 @@ import { useState, useEffect, useCallback } from "react"
 import { useTranslations } from "next-intl"
 import {
   Loader2,
-  FolderOpen,
   CircleCheck,
   CircleX,
   Circle,
@@ -35,8 +34,7 @@ import {
   FieldTitle,
   FieldDescription,
 } from "@/components/ui/field"
-import { isDesktop, openFileDialog, closeCurrentWindow } from "@/lib/platform"
-import { getActiveRemoteConnectionId } from "@/lib/transport"
+import { closeCurrentWindow } from "@/lib/platform"
 import {
   createHyperframesProject,
   openFolderInWorkspace,
@@ -46,7 +44,7 @@ import {
 } from "@/lib/api"
 import type { HyperframesSkillAgent } from "@/lib/types"
 import { extractAppCommandError, toErrorMessage } from "@/lib/app-error"
-import { DirectoryBrowserDialog } from "@/components/shared/directory-browser-dialog"
+import { DirectoryPathInput } from "@/components/shared/directory-path-input"
 import { PACKAGE_MANAGER_OPTIONS } from "../shadcn/constants"
 import {
   HYPERFRAMES_RESOLUTION_OPTIONS,
@@ -69,7 +67,6 @@ export function HyperframesLauncher() {
   const [packageManager, setPackageManager] = useState("pnpm")
   const [resolution, setResolution] = useState("default")
   const [creating, setCreating] = useState(false)
-  const [browserOpen, setBrowserOpen] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
   const [pmVersion, setPmVersion] = useState<string | null>(null)
@@ -161,20 +158,6 @@ export function HyperframesLauncher() {
     }
   }
 
-  const handleBrowse = async () => {
-    // Mirror the shadcn dialog: only use the native Tauri picker when truly on
-    // a local desktop workspace; otherwise the scaffold host is remote and we
-    // must browse its filesystem instead.
-    if (isDesktop() && getActiveRemoteConnectionId() === null) {
-      const result = await openFileDialog({ directory: true, multiple: false })
-      if (!result) return
-      const selected = Array.isArray(result) ? result[0] : result
-      setSaveDirectory(selected)
-    } else {
-      setBrowserOpen(true)
-    }
-  }
-
   const handleCreate = async () => {
     setError(null)
     setCreating(true)
@@ -262,24 +245,13 @@ export function HyperframesLauncher() {
 
             <div className="space-y-1.5">
               <Label>{t("createDialog.saveDirectory")}</Label>
-              <div className="flex gap-2">
-                <Input
-                  value={saveDirectory}
-                  onChange={(e) => setSaveDirectory(e.target.value)}
-                  placeholder={t("createDialog.saveDirectoryPlaceholder")}
-                  disabled={creating}
-                  className="flex-1"
-                />
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={handleBrowse}
-                  disabled={creating}
-                  type="button"
-                >
-                  <FolderOpen className="h-4 w-4" />
-                </Button>
-              </div>
+              <DirectoryPathInput
+                value={saveDirectory}
+                onValueChange={setSaveDirectory}
+                placeholder={t("createDialog.saveDirectoryPlaceholder")}
+                disabled={creating}
+                browseLabel={t("createDialog.browseDirectory")}
+              />
               {saveDirectory && projectName.trim() && (
                 <p className="text-xs text-muted-foreground">
                   {t("createDialog.projectPath", {
@@ -469,12 +441,6 @@ export function HyperframesLauncher() {
           </Button>
         </div>
       </div>
-
-      <DirectoryBrowserDialog
-        open={browserOpen}
-        onOpenChange={setBrowserOpen}
-        onSelect={(path) => setSaveDirectory(path)}
-      />
     </div>
   )
 }

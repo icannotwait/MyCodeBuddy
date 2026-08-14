@@ -278,7 +278,9 @@ export function AppWorkspaceProvider({ children }: AppWorkspaceProviderProps) {
   // headlessly (e.g. an automation per-run worktree) lands in this client's
   // workspace list in real time — without it, a conversation produced in that
   // worktree has no known folder to group under and never renders in the sidebar.
-  // Only upserts the list (+ seeds its branch); unlike WorkspaceOpenFolderListener
+  // `deleted` closes the loop: a task worktree removed after its merge vanishes
+  // from the sidebar right away instead of lingering until the next reload.
+  // Only syncs the list (+ seeds branches); unlike WorkspaceOpenFolderListener
   // it never opens/focuses a tab, so a background emitter can't steal focus.
   useEffect(() => {
     let disposed = false
@@ -288,8 +290,8 @@ export function AppWorkspaceProvider({ children }: AppWorkspaceProviderProps) {
       const dispose = await subscribe<FolderChange>(
         FOLDER_CHANGED_EVENT,
         (change) => {
+          const store = useAppWorkspaceStore.getState()
           if (change.kind === "upsert") {
-            const store = useAppWorkspaceStore.getState()
             store.upsertFolder(change.folder)
             // Only seed the branch when the event actually carries one. A
             // freshly-minted worktree row stores `git_branch: null` (resolved
@@ -302,6 +304,18 @@ export function AppWorkspaceProvider({ children }: AppWorkspaceProviderProps) {
           }
           if (change.kind === "close") {
             handleFolderClose(change.folder_id, change.cause)
+          } else if (change.kind === "deleted") {
+            // A folder that stops existing takes its tabs with it — the same
+            // pairing the sidebar's own "remove folder" makes (it calls
+            // `closeTabsByFolder` before the API). The backend drops this
+            // folder's PERSISTED tabs and broadcasts that snapshot, but drafts
+            // are device-local and never reach it: without this, a draft opened
+            // in the worktree stays on screen pointing at a cwd that no longer
+            // exists (`pruneOrphanDraftsOnce` would only clean it up on the next
+            // launch). Closing retargets `activeTabId`, which TabProvider syncs
+            // back into `activeFolderId`.
+            useTabStore.getState().closeTabsByFolder(change.id)
+            store.applyFolderRemove(change.id)
           }
         }
       )

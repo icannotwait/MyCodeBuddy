@@ -103,6 +103,10 @@ const tabBarSource = readFileSync(
   resolve(process.cwd(), "src/components/tabs/tab-bar.tsx"),
   "utf8"
 )
+const messageListViewSource = readFileSync(
+  resolve(process.cwd(), "src/components/message/message-list-view.tsx"),
+  "utf8"
+)
 
 describe("ConversationDetailPanel inactive panel paint isolation", () => {
   it("uses native hidden outside tile mode instead of visibility-only hiding", () => {
@@ -187,6 +191,41 @@ describe("ConversationDetailPanel new conversation layout", () => {
     expect(rule).toContain("transition-property: none !important")
   })
 
+  // Regression: with a workspace background image on, every covering surface is
+  // TRANSPARENT rather than opaque, so a hidden-but-mounted subtree that still
+  // paints is visible straight through it. `visibility` inherits, but a
+  // descendant can opt back in — Monaco's DiffEditorWidget writes an inline
+  // `visibility: visible` on its two panes — so an open git-diff file tab showed
+  // through the full-page routes (task board / automations / token usage) and
+  // through the conversation overlay in conversation-only mode, while a plain
+  // file tab (no inline visibility) hid correctly.
+  it("re-hides Monaco's diff panes inside a hidden keep-alive subtree", () => {
+    const selector = ".conversation-tab-hidden .monaco-diff-editor > .editor"
+    expect(globalsCssSource).toContain(selector)
+    const rule = globalsCssSource.slice(
+      globalsCssSource.indexOf(selector),
+      globalsCssSource.indexOf(selector) + 120
+    )
+    // Only `!important` outranks Monaco's inline declaration.
+    expect(rule).toContain("visibility: hidden !important")
+  })
+
+  it("marks every hidden keep-alive subtree with the hardening class", () => {
+    // Under a full-page workbench route (desktop + mobile shells).
+    expect(workspaceLayoutSource).toContain(
+      '!isConversations && "conversation-tab-hidden invisible"'
+    )
+    // The FILE column under the conversation overlay — this is the one that
+    // hosts git-diff tabs.
+    expect(workspaceLayoutSource).toContain(
+      'mode === "conversation" && "conversation-tab-hidden invisible"'
+    )
+    // The conversation column under the files-maximized overlay.
+    expect(workspaceLayoutSource).toContain(
+      'filesMaximized && "conversation-tab-hidden invisible"'
+    )
+  })
+
   it("does not render a decorative welcome backdrop", () => {
     expect(welcomeHeroSource).not.toContain("export function WelcomeBackdrop")
     expect(welcomeHeroSource).not.toContain("bg-gradient-to-r")
@@ -206,8 +245,10 @@ describe("ConversationDetailPanel new conversation layout", () => {
     const pickerStart = messageInputSource.indexOf(
       "{hasFolderBranchPicker && ("
     )
+    // The picker row is the last thing inside the composer wrapper; the
+    // server-file dialog that follows it sits outside, so it anchors the slice.
     const pickerEnd = messageInputSource.indexOf(
-      "<ImagePreviewDialog",
+      "{!attach.showNativePaperclip && (",
       pickerStart
     )
     expect(pickerStart).toBeGreaterThan(-1)
@@ -613,5 +654,40 @@ describe("ConversationTabView initial history eligibility", () => {
     // historyLoadComplete tracks detail presence, so a failed load stays false
     // until a successful fetch retains detail on the session.
     expect(source).toContain("historyLoadComplete={detail != null}")
+  })
+})
+
+describe("ConversationDetailPanel session-load failure surface", () => {
+  // When session/load fails on a conversation whose transcript already
+  // rendered (e.g. its folder was deleted), the history must STAY readable;
+  // the failure surfaces as a banner docked at the composer, not as a
+  // full-page error over the message area.
+  it("escalates the ACP load error to full-page only when nothing is renderable", () => {
+    expect(messageListViewSource).toContain(
+      "const blockingLoadError = hasRenderableContent ? null : (acpLoadError ?? null)"
+    )
+  })
+
+  it("docks the load error at the composer with the recovery actions", () => {
+    // The composer input stays hidden (a send can't reach the dead session)…
+    expect(source).toContain(
+      "hideInput={isWelcomeMode || Boolean(acpLoadError)}"
+    )
+    // …and the banner takes its place, explaining why and offering recovery.
+    expect(source).toContain("composerBanner={acpLoadErrorBanner}")
+    const bannerStart = source.indexOf("const acpLoadErrorBanner")
+    expect(bannerStart).toBeGreaterThan(-1)
+    const bannerEnd = source.indexOf("const goalControlValue", bannerStart)
+    expect(bannerEnd).toBeGreaterThan(bannerStart)
+    const banner = source.slice(bannerStart, bannerEnd)
+    expect(banner).toContain("hasPersistedConversation && acpLoadError")
+    expect(banner).toContain("handleReloadDetail")
+    expect(banner).toContain("handleOpenNewSession")
+    // The shell renders the banner inside the composer dock, constrained to
+    // the same message-column width as the input it replaces.
+    const dockIdx = conversationShellSource.indexOf("{composerBanner && (")
+    expect(dockIdx).toBeGreaterThan(-1)
+    const dock = conversationShellSource.slice(dockIdx, dockIdx + 200)
+    expect(dock).toContain("mx-auto w-full max-w-3xl")
   })
 })

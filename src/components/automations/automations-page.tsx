@@ -28,6 +28,7 @@ import {
   RotateCw,
   SlidersHorizontal,
   SquareArrowOutUpRight,
+  SquareKanban,
   Trash2,
   X,
   Zap,
@@ -54,6 +55,11 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog"
 import { AgentIcon } from "@/components/agent-icon"
+import { WorkbenchPageTitle } from "@/components/workbench/workbench-page-title"
+import {
+  FolderSelect,
+  type FolderSelectOption,
+} from "@/components/shared/folder-select"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
 import { Switch } from "@/components/ui/switch"
@@ -200,6 +206,15 @@ type EditingState =
   | { kind: "create"; seed: AutomationDraft | null }
   | { kind: "edit"; automation: Automation }
 
+/** Page title rendered into the window-chrome strip above the page (the h-10
+ *  band shared with the fixed corner overlays) — the shared breadcrumb header,
+ *  so all three workbench routes open with an identical header rhythm and the
+ *  same way back to the conversation workspace. */
+export function AutomationsPageTitle() {
+  const t = useTranslations("Automations")
+  return <WorkbenchPageTitle title={t("title")} />
+}
+
 export function AutomationsPage() {
   const t = useTranslations("Automations")
   const { automations, unseenFailures, refetch } = useAutomationsView()
@@ -237,15 +252,56 @@ export function AutomationsPage() {
   const [statusFilter, setStatusFilter] = useState<
     "all" | "enabled" | "disabled"
   >("all")
+  // Folder options: the workspace's project folders (same set the Tasks board
+  // filters by), plus any other folder an automation actually targets — the
+  // editor lets a launch_session run point at a worktree subfolder, which is
+  // not a project folder but must still be filterable.
+  const folderOptions = useMemo(() => {
+    const options = new Map<number, FolderSelectOption>()
+    for (const f of folders) {
+      if (f.parent_id == null && f.kind === "regular")
+        options.set(f.id, {
+          id: f.id,
+          name: f.name,
+          alias: f.alias,
+          path: f.path,
+        })
+    }
+    const byId = new Map(folders.map((f) => [f.id, f]))
+    for (const a of automations) {
+      if (a.root_folder_id == null || options.has(a.root_folder_id)) continue
+      const known = byId.get(a.root_folder_id)
+      options.set(a.root_folder_id, {
+        id: a.root_folder_id,
+        // A folder the workspace no longer lists is still filterable — by the
+        // only handle left, its id.
+        name: known?.name ?? `#${a.root_folder_id}`,
+        alias: known?.alias ?? null,
+        path: known?.path ?? null,
+      })
+    }
+    // Sorted by what the row leads with, so the list reads in the order it looks.
+    return [...options.values()].sort((a, b) =>
+      (a.alias ?? a.name).localeCompare(b.alias ?? b.name)
+    )
+  }, [automations, folders])
+  // Deleting the last automation of a folder strands the filter on an option
+  // that no longer exists. Fall back to "all" by derivation (no effect) so the
+  // pill never renders blank over an empty list.
+  const activeFolderFilter =
+    folderFilter !== "all" && !folderOptions.some((f) => f.id === folderFilter)
+      ? "all"
+      : folderFilter
   const visibleAutomations = useMemo(
     () =>
       automations.filter(
         (a) =>
-          (folderFilter === "all" || a.root_folder_id === folderFilter) &&
+          (activeFolderFilter === "all" ||
+            a.root_folder_id === activeFolderFilter) &&
           (statusFilter === "all" ||
             (statusFilter === "enabled" ? a.enabled : !a.enabled))
       ),
-    [automations, folderFilter, statusFilter]
+    [automations, activeFolderFilter, statusFilter]
   )
 
   const openGallery = () => {
@@ -308,7 +364,10 @@ export function AutomationsPage() {
   const editorPane =
     editing != null ? (
       <ScrollArea className="h-full">
-        <div className="mx-auto w-full max-w-2xl p-4 sm:p-6">
+        {/* PANEL_PAD everywhere inside a panel — the pane used to jump from
+            p-4 to p-6 at the sm breakpoint while the panel's own margins
+            didn't, which read as inconsistent gutters. */}
+        <div className="mx-auto w-full max-w-2xl p-4">
           <AutomationEditor
             // Key by edit target so switching to a different automation (e.g.
             // ⋯ → Edit on another row while the editor is open) remounts with
@@ -333,109 +392,165 @@ export function AutomationsPage() {
 
   const picker = (onboarding: boolean) => (
     <ScrollArea className="h-full">
-      <div className="mx-auto flex w-full max-w-4xl flex-col gap-6 p-4 sm:p-6">
-        {onboarding ? (
-          <div className="flex flex-col items-center gap-2 pt-4 text-center">
-            <span className="flex size-12 items-center justify-center rounded-2xl bg-muted text-muted-foreground">
-              <Zap className="size-6" aria-hidden="true" />
-            </span>
-            <h2 className="text-base font-semibold">{t("onboardTitle")}</h2>
-            <p className="max-w-md text-sm text-muted-foreground">
-              {t("onboardHint")}
-            </p>
-          </div>
-        ) : (
-          <div className="flex items-center justify-between gap-2">
-            <h2 className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
-              {t("startFromTemplate")}
-            </h2>
-            <Button size="sm" variant="ghost" onClick={closeToDetail}>
-              {t("cancel")}
-            </Button>
-          </div>
-        )}
-        <TemplateGallery onPick={pickTemplate} />
+      {/* Onboarding is the whole page, so the gallery is centered in the shell
+          both ways. Vertical centering rides on `my-auto` inside a
+          `min-h-full` column rather than `justify-center`: when the gallery is
+          taller than the viewport the free space goes negative, auto margins
+          collapse to 0, and it scrolls from the top instead of having its head
+          clipped out of reach. */}
+      <div className="flex min-h-full flex-col">
+        <div
+          className={cn(
+            "mx-auto flex w-full max-w-4xl flex-col gap-6 p-4",
+            onboarding && "my-auto"
+          )}
+        >
+          {onboarding ? (
+            <div className="flex flex-col items-center gap-2 text-center">
+              <span className="flex size-12 items-center justify-center rounded-2xl bg-muted text-muted-foreground">
+                <Zap className="size-6" aria-hidden="true" />
+              </span>
+              <h2 className="text-base font-semibold">{t("onboardTitle")}</h2>
+              <p className="max-w-md text-sm text-muted-foreground">
+                {t("onboardHint")}
+              </p>
+            </div>
+          ) : (
+            <div className="flex items-center justify-between gap-2">
+              <h2 className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                {t("startFromTemplate")}
+              </h2>
+              <Button size="sm" variant="ghost" onClick={closeToDetail}>
+                {t("cancel")}
+              </Button>
+            </div>
+          )}
+          <TemplateGallery onPick={pickTemplate} />
+        </div>
       </div>
     </ScrollArea>
   )
 
   return (
-    <div className="flex h-full min-h-0 flex-col bg-background">
+    // No background of its own: the route overlay already paints
+    // `bg-background ws-transparent-bg` (workspace/layout.tsx), so an opaque
+    // layer here would hide the workspace background image behind the page.
+    <div className="flex h-full min-h-0 flex-col">
       {hasAutomations ? (
-        <ResizablePanelGroup direction="horizontal" className="min-h-0 flex-1">
-          <ResizablePanel
-            id="automations-list"
-            order={1}
-            defaultSize={32}
-            minSize={22}
-          >
-            <div className="@container flex h-full flex-col">
-              <PageHeader showNew={mode === "detail"} onNew={openGallery} />
-              {automations.length > 1 ? (
-                <ListFilters
-                  folders={folders}
-                  folderFilter={folderFilter}
-                  onFolderFilter={setFolderFilter}
-                  statusFilter={statusFilter}
-                  onStatusFilter={setStatusFilter}
-                />
-              ) : null}
-              <ScrollArea className="min-h-0 flex-1">
-                {visibleAutomations.length === 0 ? (
-                  <p className="px-3 py-6 text-center text-xs text-muted-foreground">
-                    {t("noMatches")}
-                  </p>
-                ) : (
-                  <ul className="flex flex-col gap-0.5 p-1.5">
-                    {visibleAutomations.map((a) => (
-                      <AutomationListItem
-                        key={a.id}
-                        automation={a}
-                        now={now}
-                        selected={mode === "detail" && current?.id === a.id}
-                        onSelect={() => selectAutomation(a)}
-                        onRunNow={() => runAction(() => automationRunNow(a.id))}
-                        onToggleEnabled={() =>
-                          runAction(() =>
-                            automationSetEnabled(a.id, !a.enabled)
-                          )
-                        }
-                        onEdit={() => startEdit(a)}
-                        onDelete={() => runAction(() => automationDelete(a.id))}
+        <>
+          <PageToolbar
+            folderOptions={folderOptions}
+            folderFilter={activeFolderFilter}
+            onFolderFilter={setFolderFilter}
+            statusFilter={statusFilter}
+            onStatusFilter={setStatusFilter}
+            showNew={mode === "detail"}
+            onNew={openGallery}
+          />
+          {/* 1rem of clearance on all four sides of the shell: left/right/bottom
+              from px-4 pb-4, top from pt-2 plus the toolbar's own pb-2. */}
+          <div className="min-h-0 flex-1 px-4 pb-4 pt-2">
+            <div className={SHELL_CLASS}>
+              <ResizablePanelGroup
+                direction="horizontal"
+                className="min-h-0 flex-1"
+              >
+                <ResizablePanel
+                  id="automations-list"
+                  order={1}
+                  defaultSize={32}
+                  minSize={22}
+                >
+                  <div className={LIST_SURFACE_CLASS}>
+                    <ScrollArea className="h-full">
+                      {visibleAutomations.length === 0 ? (
+                        <p className="px-3 py-6 text-center text-xs text-muted-foreground">
+                          {t("noMatches")}
+                        </p>
+                      ) : (
+                        <ul className="flex flex-col gap-0.5 p-2">
+                          {visibleAutomations.map((a) => (
+                            <AutomationListItem
+                              key={a.id}
+                              automation={a}
+                              now={now}
+                              selected={
+                                mode === "detail" && current?.id === a.id
+                              }
+                              onSelect={() => selectAutomation(a)}
+                              onRunNow={() =>
+                                runAction(() => automationRunNow(a.id))
+                              }
+                              onToggleEnabled={() =>
+                                runAction(() =>
+                                  automationSetEnabled(a.id, !a.enabled)
+                                )
+                              }
+                              onEdit={() => startEdit(a)}
+                              onDelete={() =>
+                                runAction(() => automationDelete(a.id))
+                              }
+                            />
+                          ))}
+                        </ul>
+                      )}
+                    </ScrollArea>
+                  </div>
+                </ResizablePanel>
+                {/* The handle's own 1px rule IS the column divider now, and
+                    inside a single shell that's the honest reading of it: one
+                    container split in two, not two boards with a line wedged
+                    between them. Tone alone can't carry the split — in the
+                    light theme `--muted` and `--card` are one step apart, which
+                    measures ~2% on screen; the fixes for that (frosting or an
+                    opaque fill) would block the workspace background image. */}
+                <ResizableHandle />
+                <ResizablePanel
+                  id="automations-detail"
+                  order={2}
+                  defaultSize={68}
+                >
+                  <div className={DETAIL_SURFACE_CLASS}>
+                    {mode === "editor" && editing ? (
+                      editorPane
+                    ) : mode === "gallery" ? (
+                      picker(false)
+                    ) : current ? (
+                      <AutomationDetail
+                        automation={current}
+                        refetch={refetch}
+                        onEdit={() => startEdit(current)}
                       />
-                    ))}
-                  </ul>
-                )}
-              </ScrollArea>
+                    ) : (
+                      // Defensive only: `current` falls back to automations[0],
+                      // which is always present inside this hasAutomations
+                      // branch, so this arm is not reached in practice.
+                      <div className="flex h-full items-center justify-center p-4 text-center text-xs text-muted-foreground">
+                        {t("selectHint")}
+                      </div>
+                    )}
+                  </div>
+                </ResizablePanel>
+              </ResizablePanelGroup>
             </div>
-          </ResizablePanel>
-          <ResizableHandle withHandle />
-          <ResizablePanel id="automations-detail" order={2} defaultSize={68}>
-            {mode === "editor" && editing ? (
-              editorPane
-            ) : mode === "gallery" ? (
-              picker(false)
-            ) : current ? (
-              <AutomationDetail
-                automation={current}
-                refetch={refetch}
-                onEdit={() => startEdit(current)}
-              />
-            ) : (
-              // Defensive only: `current` falls back to automations[0], which is
-              // always present inside this hasAutomations branch, so this arm is
-              // not reached in practice.
-              <div className="flex h-full items-center justify-center p-8 text-center text-xs text-muted-foreground">
-                {t("selectHint")}
-              </div>
-            )}
-          </ResizablePanel>
-        </ResizablePanelGroup>
+          </div>
+        </>
       ) : (
-        <div className="flex h-full min-h-0 flex-col">
-          <PageHeader showNew={false} onNew={openGallery} />
-          <div className="min-h-0 flex-1">
-            {mode === "editor" && editing ? editorPane : picker(true)}
+        // Nothing to filter or list yet — the onboarding gallery carries its own
+        // call to action, so no toolbar here. Same shell and the same 1rem of
+        // clearance on all four sides as the populated state (p-4 alone, since
+        // there is no toolbar padding to add to).
+        <div className="min-h-0 flex-1 p-4">
+          <div className={cn(SHELL_CLASS, DETAIL_SURFACE_CLASS)}>
+            {/* SHELL_CLASS is a flex row (it splits into two columns when the
+                list exists), so its lone child here must be told to fill it.
+                Without `flex-1` the scroller shrink-wraps the gallery's
+                intrinsic width, pinning the whole empty state to the left edge
+                with a dead gutter on the right — and `mx-auto` inside it has no
+                free space left to center in. */}
+            <div className="min-w-0 flex-1">
+              {mode === "editor" && editing ? editorPane : picker(true)}
+            </div>
           </div>
         </div>
       )}
@@ -443,31 +558,80 @@ export function AutomationsPage() {
   )
 }
 
-// Folder + enabled-state filters above the list. The folder select only appears
-// when the workspace has more than one folder; the status select is always shown.
-function ListFilters({
-  folders,
+/** ONE shell around both columns — a single rounded border for the whole
+ *  content area. Two separately-bordered panels put their facing edges a gutter
+ *  apart, which reads as a divider line down the middle even though nothing
+ *  draws one. `overflow-hidden` is what makes the rounded corners actually clip
+ *  the columns and their scrolling content. */
+const SHELL_CLASS =
+  "flex h-full overflow-hidden rounded-2xl border border-border ws-chrome-border"
+
+/** Inside the shell the list sits on muted and the detail on card — a quiet
+ *  tonal step that backs up the divider rather than replacing it. Both are
+ *  translucent so a workspace background image still reads through the shell. */
+const LIST_SURFACE_CLASS = "h-full bg-muted/50"
+const DETAIL_SURFACE_CLASS = "h-full bg-card/50"
+
+/** Filter-pill trigger, shared verbatim with the Tasks board toolbar
+ *  (tasks-page.tsx) so both workbench routes' controls read as one family:
+ *  borderless muted pill, `ws-msg-chip` keeping it legible over a workspace
+ *  background image (inert without one). */
+const FILTER_PILL_CLASS =
+  "h-8 w-auto min-w-0 gap-1.5 rounded-full border-transparent bg-muted/70 px-3 text-[0.8125rem] font-medium shadow-none ws-msg-chip hover:bg-muted"
+
+/**
+ * The page toolbar: filter pills left, the New primary right — the title itself
+ * lives in the chrome strip above (AutomationsPageTitle), so this is a single
+ * borderless row rather than the two stacked bordered bars it replaces. Metrics
+ * mirror the Tasks board toolbar.
+ */
+function PageToolbar({
+  folderOptions,
   folderFilter,
   onFolderFilter,
   statusFilter,
   onStatusFilter,
+  showNew,
+  onNew,
 }: {
-  folders: Array<{ id: number; name: string }>
+  folderOptions: readonly FolderSelectOption[]
   folderFilter: number | "all"
   onFolderFilter: (v: number | "all") => void
   statusFilter: "all" | "enabled" | "disabled"
   onStatusFilter: (v: "all" | "enabled" | "disabled") => void
+  showNew: boolean
+  onNew: () => void
 }) {
   const t = useTranslations("Automations")
   return (
-    <div className="flex flex-wrap items-center gap-2 border-b border-border px-2 py-1.5">
+    // pt-4 / px-4, not py-2: everything else on this page clears its neighbour
+    // by 1rem (the shell's four sides), so an 8px gap above the pills was the
+    // one odd measure — the row sat tight under the title bar while its left
+    // edge and the shell below it were both a full 1rem away. pb-2 stays,
+    // because the shell adds its own pt-2 underneath for the same 1rem.
+    <div className="flex shrink-0 flex-wrap items-center gap-2 px-4 pb-2 pt-4">
+      {/* Always rendered (like the Tasks board's folder pill) — a filter that
+          comes and goes with the data is more disorienting than one that is
+          briefly redundant. Searchable, and every row shows `alias [ name ]`
+          over the folder's path (the shared picker), so an aliased folder is
+          still identifiable — and findable by its real name. */}
+      <FolderSelect
+        folders={folderOptions}
+        value={folderFilter === "all" ? null : folderFilter}
+        onChange={onFolderFilter}
+        allLabel={t("allFolders")}
+        onSelectAll={() => onFolderFilter("all")}
+      />
+
       <Select
         value={statusFilter}
         onValueChange={(v) =>
           onStatusFilter(v as "all" | "enabled" | "disabled")
         }
       >
-        <SelectTrigger size="sm" className="h-7 w-auto gap-1.5 text-xs">
+        {/* Both pills lead with an icon: "All" alone doesn't say WHICH axis it
+            filters, and a lone icon on the folder pill would read as odd. */}
+        <SelectTrigger size="sm" className={FILTER_PILL_CLASS}>
           <ListFilter
             className="size-3.5 text-muted-foreground"
             aria-hidden="true"
@@ -480,66 +644,25 @@ function ListFilters({
           <SelectItem value="disabled">{t("statusDisabled")}</SelectItem>
         </SelectContent>
       </Select>
-      {folders.length > 1 ? (
-        <Select
-          value={folderFilter === "all" ? "all" : String(folderFilter)}
-          onValueChange={(v) => onFolderFilter(v === "all" ? "all" : Number(v))}
-        >
-          <SelectTrigger
-            size="sm"
-            className="h-7 w-auto max-w-[12rem] gap-1.5 text-xs"
-          >
-            <Folder
-              className="size-3.5 text-muted-foreground"
-              aria-hidden="true"
-            />
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="all">{t("allFolders")}</SelectItem>
-            {folders.map((f) => (
-              <SelectItem key={f.id} value={String(f.id)}>
-                {f.name}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-      ) : null}
-    </div>
-  )
-}
 
-function PageHeader({
-  showNew,
-  onNew,
-}: {
-  showNew: boolean
-  onNew: () => void
-}) {
-  const t = useTranslations("Automations")
-  return (
-    <header className="flex h-10 shrink-0 items-center justify-between gap-2 border-b border-border pl-3.5 pr-2.5">
-      <div className="flex min-w-0 items-center gap-2">
-        <Zap
-          className="size-4 shrink-0 text-muted-foreground"
-          aria-hidden="true"
-        />
-        <h1 className="truncate text-sm font-semibold">{t("title")}</h1>
-      </div>
+      <div className="flex-1" />
+
+      {/* Detail mode only: the gallery IS the new-automation flow, and the
+          editor has its own cancel / back-to-templates exits — offering "New"
+          there would silently discard a draft. Right-aligned, so its absence
+          never shifts the filters. */}
       {showNew ? (
         <Button
+          type="button"
           size="sm"
+          className="h-8 gap-1 rounded-full px-3.5 text-[0.8125rem]"
           onClick={onNew}
-          aria-label={t("new")}
-          title={t("new")}
         >
-          <Plus className="h-3.5 w-3.5" aria-hidden="true" />
-          {/* Collapses to a "+"-only button when the pane is too narrow for both
-              the title and the labeled button (the @container is the list pane). */}
-          <span className="hidden @[16rem]:inline">{t("new")}</span>
+          <Plus className="size-4" aria-hidden="true" />
+          {t("new")}
         </Button>
       ) : null}
-    </header>
+    </div>
   )
 }
 
@@ -685,8 +808,21 @@ function AutomationListItem({
         <ContextMenuTrigger asChild>
           <div
             className={cn(
-              "group flex h-8 w-full items-center rounded-full pr-1 transition-colors",
-              selected ? "bg-accent" : "hover:bg-accent/60"
+              // The border is always in the box (transparent when unselected)
+              // so selecting a row never shifts its height by 2px.
+              "group flex h-8 w-full items-center rounded-full border pr-1 transition-colors",
+              // Selection can't lean on fill alone: in the light theme
+              // `--accent` and `--muted` are the SAME token value
+              // (oklch(0.97)), so `bg-accent` on the muted list panel is a
+              // ~0.02 lightness difference — invisible. The outline carries the
+              // signal instead (boosted by ws-chrome-border over a background
+              // image), and ws-msg-chip keeps the fill translucent there so the
+              // row doesn't punch an opaque hole in the picture. Unselected
+              // rows stay off the chip so their layered hover:bg-* keeps
+              // working — the chip's unlayered background would swallow it.
+              selected
+                ? "border-border ws-chrome-border bg-accent ws-msg-chip"
+                : "border-transparent hover:bg-accent/60"
             )}
           >
             <button
@@ -794,10 +930,11 @@ function AutomationListItem({
   )
 }
 
-// One fact per card — icon + uppercase label on top, value below. Replaces the
-// old dense InfoRow grid so the detail's "Schedule & target" reads as a tidy set
-// of stat cards rather than a cramped two-column list.
-function StatCard({
+// One fact — icon + uppercase label on top, value below. Deliberately NOT a
+// card: these live inside the overview Section, and boxing each of six
+// facts inside an already-boxed section read as card-in-card confetti. Grid
+// spacing alone separates them.
+function StatItem({
   icon,
   label,
   children,
@@ -809,12 +946,7 @@ function StatCard({
   className?: string
 }) {
   return (
-    <div
-      className={cn(
-        "flex flex-col gap-1.5 rounded-xl border border-border bg-card p-3",
-        className
-      )}
-    >
+    <div className={cn("flex min-w-0 flex-col gap-1", className)}>
       <div className="flex items-center gap-1.5 text-muted-foreground [&>svg]:size-3.5">
         {icon}
         <span className="text-[0.6875rem] font-medium uppercase tracking-wide">
@@ -826,18 +958,30 @@ function StatCard({
   )
 }
 
-function SectionCard({
+/**
+ * A titled block inside the detail panel. Deliberately NOT a card: the panel
+ * already draws the outer boundary, so boxing each block again would stack
+ * three borders (panel → card → stat). A rule above the title carries the
+ * separation instead; the top rule doubles as the divider from the block above.
+ */
+function Section({
   title,
+  action,
   children,
 }: {
   title: string
+  /** Optional trailing control on the title row (e.g. run history's refresh). */
+  action?: React.ReactNode
   children: React.ReactNode
 }) {
   return (
-    <section className="rounded-xl border border-border bg-card p-4">
-      <h3 className="mb-3 text-[0.6875rem] font-medium uppercase tracking-wide text-muted-foreground">
-        {title}
-      </h3>
+    <section className="flex flex-col gap-3 border-t border-border ws-chrome-border pt-4">
+      <div className="flex items-center justify-between gap-2">
+        <h3 className="text-[0.6875rem] font-medium uppercase tracking-wide text-muted-foreground">
+          {title}
+        </h3>
+        {action}
+      </div>
       {children}
     </section>
   )
@@ -881,35 +1025,56 @@ function AutomationDetail({
 
   return (
     <ScrollArea className="h-full">
-      <div className="@container mx-auto flex w-full max-w-3xl flex-col gap-4 p-4 sm:p-6">
-        <div className="flex items-start justify-between gap-3">
-          <div className="flex min-w-0 flex-col gap-1">
+      <div className="@container flex w-full flex-col gap-4 p-4">
+        {/* Title block: name + last-run status on the left, the enable toggle
+            on the right, then the primary actions on their own row. The actions
+            used to sit between the prompt and the run-history cards, where they
+            read as belonging to neither. */}
+        <div className="flex flex-col gap-3">
+          <div className="flex items-start justify-between gap-3">
             <div className="flex min-w-0 items-center gap-2">
               <h2 className="truncate text-lg font-semibold">
                 {automation.name}
               </h2>
               <StatusChip status={automation.last_run_status} />
             </div>
+            <label className="flex shrink-0 items-center gap-2 text-xs text-muted-foreground">
+              {automation.enabled ? t("enabled") : t("statusDisabled")}
+              <Switch
+                checked={automation.enabled}
+                disabled={busy}
+                onCheckedChange={(v) =>
+                  run(() => automationSetEnabled(automation.id, v))
+                }
+                aria-label={t("enabled")}
+              />
+            </label>
           </div>
-          <label className="flex shrink-0 items-center gap-2 text-xs text-muted-foreground">
-            {automation.enabled ? t("enabled") : t("statusDisabled")}
-            <Switch
-              checked={automation.enabled}
+          <div className="flex gap-2">
+            <Button
+              size="sm"
+              className="h-8 gap-1.5 rounded-full px-3.5 text-[0.8125rem]"
+              onClick={() => run(() => automationRunNow(automation.id))}
               disabled={busy}
-              onCheckedChange={(v) =>
-                run(() => automationSetEnabled(automation.id, v))
-              }
-              aria-label={t("enabled")}
-            />
-          </label>
+            >
+              <Play className="size-3.5" aria-hidden="true" />
+              {t("runNow")}
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-8 gap-1.5 rounded-full px-3.5 text-[0.8125rem]"
+              onClick={onEdit}
+            >
+              <Pencil className="size-3.5" aria-hidden="true" />
+              {t("edit")}
+            </Button>
+          </div>
         </div>
 
-        <div className="flex flex-col gap-2">
-          <h3 className="text-[0.6875rem] font-medium uppercase tracking-wide text-muted-foreground">
-            {t("sectionSchedule")}
-          </h3>
-          <div className="grid grid-cols-1 gap-3 @sm:grid-cols-2 @xl:grid-cols-3">
-            <StatCard
+        <Section title={t("sectionSchedule")}>
+          <div className="grid grid-cols-1 gap-x-4 gap-y-4 @sm:grid-cols-2 @xl:grid-cols-3">
+            <StatItem
               icon={isSchedule ? <CalendarClock /> : <MousePointerClick />}
               label={t("trigger")}
             >
@@ -923,8 +1088,8 @@ function AutomationDetail({
               ) : (
                 t("manual")
               )}
-            </StatCard>
-            <StatCard
+            </StatItem>
+            <StatItem
               icon={
                 <AgentIcon
                   agentType={automation.agent_type}
@@ -936,34 +1101,42 @@ function AutomationDetail({
               <span className="block truncate">
                 {labels?.agent_label ?? automation.agent_type}
               </span>
-            </StatCard>
-            <StatCard icon={<Folder />} label={t("folder")}>
+            </StatItem>
+            <StatItem icon={<Folder />} label={t("folder")}>
               <span className="block truncate">
                 {labels?.folder_label ?? folderName}
               </span>
-            </StatCard>
-            <StatCard icon={<GitBranch />} label={t("isolation")}>
-              <span className="block">
-                {automation.isolation === "worktree_per_run"
-                  ? t("isolationWorktree")
-                  : t("isolationShared")}
-                {automation.isolation === "shared_in_root" &&
-                automation.branch ? (
-                  <span className="ml-1 font-mono text-xs text-muted-foreground">
-                    {automation.branch}
-                  </span>
-                ) : null}
-              </span>
-            </StatCard>
+            </StatItem>
+            {config?.action === "enqueue_task" ? (
+              // Isolation/branch never apply to enqueued tasks (the work-task
+              // engine mints the worktree); show what firing does instead.
+              <StatItem icon={<SquareKanban />} label={t("sectionAction")}>
+                {t("actionEnqueueTask")}
+              </StatItem>
+            ) : (
+              <StatItem icon={<GitBranch />} label={t("isolation")}>
+                <span className="block">
+                  {automation.isolation === "worktree_per_run"
+                    ? t("isolationWorktree")
+                    : t("isolationShared")}
+                  {automation.isolation === "shared_in_root" &&
+                  automation.branch ? (
+                    <span className="ml-1 font-mono text-xs text-muted-foreground">
+                      {automation.branch}
+                    </span>
+                  ) : null}
+                </span>
+              </StatItem>
+            )}
             {isSchedule ? (
-              <StatCard icon={<Clock />} label={t("nextRun")}>
+              <StatItem icon={<Clock />} label={t("nextRun")}>
                 {automation.next_run_at
                   ? new Date(automation.next_run_at).toLocaleString()
                   : "—"}
-              </StatCard>
+              </StatItem>
             ) : null}
             {config?.mode_id || configEntries.length > 0 ? (
-              <StatCard icon={<SlidersHorizontal />} label={t("config")}>
+              <StatItem icon={<SlidersHorizontal />} label={t("config")}>
                 <div className="flex flex-wrap gap-1">
                   {config?.mode_id ? (
                     <Badge variant="outline" className="text-[0.625rem]">
@@ -980,30 +1153,16 @@ function AutomationDetail({
                     </Badge>
                   ))}
                 </div>
-              </StatCard>
+              </StatItem>
             ) : null}
           </div>
-        </div>
+        </Section>
 
-        <SectionCard title={t("sectionPrompt")}>
+        <Section title={t("sectionPrompt")}>
           <p className="whitespace-pre-wrap text-sm text-foreground/90">
             {config?.display_text || "—"}
           </p>
-        </SectionCard>
-
-        <div className="flex gap-2">
-          <Button
-            onClick={() => run(() => automationRunNow(automation.id))}
-            disabled={busy}
-          >
-            <Play className="size-3.5" aria-hidden="true" />
-            {t("runNow")}
-          </Button>
-          <Button variant="outline" onClick={onEdit}>
-            <Pencil className="size-3.5" aria-hidden="true" />
-            {t("edit")}
-          </Button>
-        </div>
+        </Section>
 
         <RunHistory
           key={automation.id}
@@ -1092,29 +1251,30 @@ function RunHistory({
   }
 
   return (
-    <div className="flex flex-col gap-2">
-      <div className="flex items-center justify-between">
-        <span className="text-[0.6875rem] font-medium uppercase tracking-wide text-muted-foreground">
-          {t("runHistory")}
-        </span>
+    // A titled Section like the others: it used to be the one block on the page
+    // with no boundary at all, which over a background image read as loose text
+    // floating on the photo.
+    <Section
+      title={t("runHistory")}
+      action={
         <Button
           size="icon"
           variant="ghost"
-          className="h-6 w-6 text-muted-foreground"
+          className="-my-1 h-6 w-6 text-muted-foreground"
           onClick={() => void load()}
           title={t("refresh")}
           aria-label={t("refresh")}
         >
           <RotateCw className="h-3.5 w-3.5" aria-hidden="true" />
         </Button>
-      </div>
-
+      }
+    >
       {loading && runs.length === 0 ? (
-        <div className="flex items-center gap-2 py-4 text-xs text-muted-foreground">
+        <div className="flex items-center gap-2 text-xs text-muted-foreground">
           <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
         </div>
       ) : runs.length === 0 ? (
-        <p className="py-4 text-xs text-muted-foreground">{t("noRuns")}</p>
+        <p className="text-xs text-muted-foreground">{t("noRuns")}</p>
       ) : (
         <ol className="flex flex-col">
           {runs.map((r, i) => (
@@ -1207,6 +1367,6 @@ function RunHistory({
           ))}
         </ol>
       )}
-    </div>
+    </Section>
   )
 }

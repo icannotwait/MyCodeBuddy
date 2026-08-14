@@ -4,12 +4,15 @@ import {
   DEFAULT_SHORTCUTS,
   SHORTCUT_DEFINITIONS,
   matchShortcutEvent,
+  shortcutFromKeyboardEvent,
 } from "./keyboard-shortcuts"
 
 function keyEvent(
   key: string,
   modifiers: Partial<
-    Pick<KeyboardEvent, "metaKey" | "ctrlKey" | "altKey" | "shiftKey">
+    Pick<KeyboardEvent, "metaKey" | "ctrlKey" | "altKey" | "shiftKey"> & {
+      code: string
+    }
   > = {}
 ) {
   return {
@@ -56,5 +59,61 @@ describe("tab cycling shortcuts", () => {
         "mod+tab"
       )
     ).toBe(false)
+  })
+})
+
+describe("alt combinations use event.code", () => {
+  // macOS 上 ⌥S 报的 event.key 是 "ß"，不是 "s"。不看 event.code 的话，任何
+  // 含 alt 的组合在 macOS 上都按不出来 —— 自定义样式的逃生舱正是这样一条。
+  it("matches Cmd+Option+Shift+S even though the layout rewrote the key", () => {
+    expect(
+      matchShortcutEvent(
+        keyEvent("ß", {
+          metaKey: true,
+          altKey: true,
+          shiftKey: true,
+          code: "KeyS",
+        }),
+        "mod+alt+shift+s"
+      )
+    ).toBe(true)
+  })
+
+  it("records the physical key rather than the rewritten character", () => {
+    expect(
+      shortcutFromKeyboardEvent(
+        keyEvent("ß", {
+          metaKey: true,
+          altKey: true,
+          shiftKey: true,
+          code: "KeyS",
+        })
+      )
+    ).toBe("mod+alt+shift+s")
+  })
+
+  it("leaves non-alt shortcuts on event.key", () => {
+    // 没有 alt 时不改道：既有快捷键的行为必须逐字节不变。
+    expect(
+      matchShortcutEvent(
+        keyEvent("k", { metaKey: true, code: "KeyK" }),
+        "mod+k"
+      )
+    ).toBe(true)
+    expect(
+      matchShortcutEvent(
+        keyEvent("Dead", { metaKey: true, code: "KeyK" }),
+        "mod+k"
+      )
+    ).toBe(false)
+  })
+
+  it("still resolves the escape hatch when the runtime omits event.code", () => {
+    expect(
+      matchShortcutEvent(
+        keyEvent("s", { metaKey: true, altKey: true, shiftKey: true }),
+        "mod+alt+shift+s"
+      )
+    ).toBe(true)
   })
 })

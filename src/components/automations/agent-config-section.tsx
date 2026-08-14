@@ -60,13 +60,43 @@ export function AgentConfigSection({
 
   if (loading) {
     return (
-      <div className="flex items-center gap-2 text-xs text-muted-foreground">
+      <div
+        className={cn(
+          "flex items-center gap-2 text-xs text-muted-foreground",
+          // Inline shares the composer's bottom bar with the "+" button: hold
+          // the same 24px the chips will occupy so the bar neither jumps nor
+          // leaves this line sitting lower than the "+" while the probe runs.
+          inline && "h-6"
+        )}
+      >
         <Loader2 className="size-3.5 animate-spin" aria-hidden="true" />
         {t("probing")}
       </div>
     )
   }
   if (error) {
+    // Same 24px line in the composer bar — a stacked message plus a full-size
+    // button would double the bottom bar's height on a failed probe.
+    if (inline) {
+      return (
+        <div className="flex h-6 min-w-0 items-center gap-2">
+          <p
+            className="min-w-0 truncate text-xs text-destructive"
+            title={error}
+          >
+            {error}
+          </p>
+          <Button
+            size="xs"
+            variant="ghost"
+            className="shrink-0"
+            onClick={onReload}
+          >
+            {t("retry")}
+          </Button>
+        </div>
+      )
+    }
     return (
       <div className="flex flex-col items-start gap-2">
         <p className="text-xs text-destructive">{error}</p>
@@ -171,7 +201,7 @@ export function effectiveSelections(
 // Friendly name for a selected value within a select option — checks groups
 // first, then the flat list, mirroring how ConfigOptionRow renders them.
 function selectValueLabel(
-  kind: SessionConfigOptionInfo["kind"],
+  kind: Extract<SessionConfigOptionInfo["kind"], { type: "select" }>,
   value: string
 ): string | undefined {
   for (const group of kind.groups) {
@@ -266,9 +296,18 @@ function FieldRow({
           // The dropped label still rides along for hover/screen readers.
           aria-label={label}
           title={inline ? label : undefined}
+          // 24px (not the size="sm" default) is deliberate: inline chips share
+          // the task editor's composer bottom bar with the "+" add-menu button,
+          // which is a `size="icon-xs"` (h-6) Button, and the chat composer's
+          // own selectors are h-6 too (`size="xs"`, session-config-selector).
+          // It takes `data-[size=sm]:h-6` to get there: a bare `h-6` loses to
+          // the trigger's own `data-[size=sm]:h-8`, whose attribute selector is
+          // the more specific rule, and tailwind-merge only drops the base
+          // class when the override carries the same variant. `py-0` sheds the
+          // base padding that a 24px box has no room for.
           className={
             inline
-              ? "h-7 w-auto max-w-[12rem] gap-1 border-0 bg-transparent px-1.5 text-xs text-muted-foreground shadow-none hover:text-foreground"
+              ? "h-6 w-auto max-w-[12rem] gap-1 border-0 bg-transparent px-1.5 py-0 text-xs text-muted-foreground shadow-none hover:text-foreground data-[size=sm]:h-6"
               : "w-52"
           }
         >

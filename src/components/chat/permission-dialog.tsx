@@ -10,6 +10,7 @@ import {
   FileText,
   Globe,
   Search,
+  KeyRound,
 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
@@ -17,7 +18,12 @@ import { CodeBlock } from "@/components/ai-elements/code-block"
 import { UnifiedDiffPreview } from "@/components/diff/unified-diff-preview"
 import { MessageResponse } from "@/components/ai-elements/message"
 import type { PendingPermission } from "@/contexts/acp-connections-context"
-import { parsePermissionToolCall } from "@/lib/permission-request"
+import {
+  parsePermissionOptionChanges,
+  parsePermissionToolCall,
+  type PermissionChangeScope,
+  type PermissionOptionChange,
+} from "@/lib/permission-request"
 
 interface PermissionDialogProps {
   permission: PendingPermission | null
@@ -29,6 +35,20 @@ function formatKindLabel(kind: string, fallbackLabel: string): string {
   return normalized.length > 0 ? normalized : fallbackLabel
 }
 
+/**
+ * i18n key naming how long a change lasts (see `PermissionChangeScope`).
+ * `as const` keeps the literal key types `t()` requires; `satisfies` keeps the
+ * map exhaustive as scopes are added.
+ */
+const CHANGE_SCOPE_LABEL_KEYS = {
+  session: "changeScopeSession",
+  process: "changeScopeProcess",
+  user: "changeScopeUser",
+  project: "changeScopeProject",
+  project_local: "changeScopeProjectLocal",
+  persistent: "changeScopePersistent",
+} as const satisfies Record<PermissionChangeScope, string>
+
 export function PermissionDialog({
   permission,
   onRespond,
@@ -38,7 +58,23 @@ export function PermissionDialog({
     () => parsePermissionToolCall(permission?.tool_call),
     [permission?.tool_call]
   )
+  // What each option would actually grant, keyed by option id. Empty for every
+  // agent that ships no `_meta.permission` (i.e. everything but codex ≥1.1.8
+  // and claude ≥0.64.1).
+  const optionChanges = useMemo(() => {
+    const out: Record<string, PermissionOptionChange[]> = {}
+    for (const opt of permission?.options ?? []) {
+      const changes = parsePermissionOptionChanges(opt.meta)
+      if (changes.length > 0) out[opt.option_id] = changes
+    }
+    return out
+  }, [permission?.options])
   if (!permission) return null
+
+  // Approvals are surfaced one at a time (backend FIFO), so the count of the
+  // ones still behind this card has to be visible or they read as a hang.
+  const queued = permission.queued ?? 0
+  const hasOptionChanges = Object.keys(optionChanges).length > 0
 
   const hasFileChanges = parsed.fileChanges.length > 0
   const hasPlan =
@@ -76,9 +112,18 @@ export function PermissionDialog({
           </div>
           <p className="text-xs text-muted-foreground">{t("subtitle")}</p>
         </div>
-        <Badge variant="outline" className="shrink-0 text-[10px]">
-          {formatKindLabel(parsed.normalizedKind, t("kindFallbackTool"))}
-        </Badge>
+        <div className="flex shrink-0 items-center gap-1.5">
+          {/* Only one card shows at a time, so without this the remaining
+              approvals look like the agent has stopped responding. */}
+          {queued > 0 ? (
+            <Badge variant="secondary" className="text-[10px] tabular-nums">
+              {t("queuedCount", { count: queued })}
+            </Badge>
+          ) : null}
+          <Badge variant="outline" className="text-[10px]">
+            {formatKindLabel(parsed.normalizedKind, t("kindFallbackTool"))}
+          </Badge>
+        </div>
       </div>
 
       <div className="mt-3 max-h-[min(36vh,18rem)] space-y-2 overflow-y-auto pr-1">
@@ -197,6 +242,60 @@ export function PermissionDialog({
                 <MessageResponse>{parsed.prompt}</MessageResponse>
               </div>
             )}
+          </div>
+        )}
+
+        {/* What the buttons below would actually grant (codex-acp ≥1.1.8 /
+            claude-agent-acp ≥0.64.1 `_meta.permission.changes`). Kept OUT of the
+            buttons: a grant list inside a filled button turns every option into
+            a full-width block of small text on the accent colour, and claude
+            attaches one to every request. As the last body section it sits
+            directly above the options it describes, and a pathological list
+            scrolls with the rest instead of pushing the buttons off screen. */}
+        {hasOptionChanges && (
+          <div className="space-y-1.5 rounded-md border border-border/60 bg-muted/20 p-2">
+            <div className="flex items-center gap-1 text-xs text-muted-foreground">
+              <KeyRound className="h-3.5 w-3.5" />
+              <span>{t("optionGrants")}</span>
+            </div>
+            <div className="space-y-2 rounded-md bg-muted/40 p-2">
+              {permission.options.map((opt) => {
+                const changes = optionChanges[opt.option_id] ?? []
+                if (changes.length === 0) return null
+                return (
+                  <div key={opt.option_id} className="space-y-1">
+                    {/* Names the button, since only some options carry a list
+                        (claude tags the always-allow one alone). */}
+                    <div className="text-xs font-medium text-foreground/90">
+                      {opt.name}
+                    </div>
+                    {changes.map((change, index) => (
+                      <div
+                        key={index}
+                        className="flex items-start gap-2 text-xs"
+                      >
+                        {/* Duration first, so it reads as a scannable column —
+                            only codex states it in its own sentences, and
+                            "Always Allow" alone never says whether the rule
+                            dies with the session or lands in committed
+                            settings. */}
+                        {change.scope && (
+                          <Badge
+                            variant="outline"
+                            className="shrink-0 text-[10px]"
+                          >
+                            {t(CHANGE_SCOPE_LABEL_KEYS[change.scope])}
+                          </Badge>
+                        )}
+                        <span className="min-w-0 break-words text-foreground/90">
+                          {change.description}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                )
+              })}
+            </div>
           </div>
         )}
 

@@ -1602,6 +1602,54 @@ impl SessionState {
         None
     }
 
+    /// What, if anything, the session is currently blocked on waiting for the user.
+    pub fn blocking_prompt(
+        &self,
+        max_chars: usize,
+    ) -> Option<crate::acp::delegation::types::BlockedOn> {
+        use crate::acp::delegation::types::{BlockedKind, BlockedOn};
+        if let Some(p) = self.pending_permission.as_ref() {
+            let title = p
+                .tool_call
+                .get("title")
+                .and_then(|v| v.as_str())
+                .and_then(last_nonempty_line)
+                .map(|l| truncate_one_line(l, max_chars));
+            return Some(BlockedOn {
+                kind: BlockedKind::Permission,
+                request_id: p.request_id.clone(),
+                title,
+            });
+        }
+        if let Some(q) = self.pending_question.as_ref() {
+            let title = q
+                .questions
+                .first()
+                .map(|first| first.question.as_str())
+                .and_then(last_nonempty_line)
+                .map(|l| truncate_one_line(l, max_chars));
+            return Some(BlockedOn {
+                kind: BlockedKind::Question,
+                request_id: q.question_id.clone(),
+                title,
+            });
+        }
+        if let Some(a) = self.pending_plan_approval.as_ref() {
+            let title = a
+                .plan_markdown
+                .lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty())
+                .map(|l| truncate_one_line(l, max_chars));
+            return Some(BlockedOn {
+                kind: BlockedKind::PlanApproval,
+                request_id: a.approval_id.clone(),
+                title,
+            });
+        }
+        None
+    }
+
     /// Lazily initialize `self.live_message` and return a mutable reference
     /// to it. Centralizes the "create-if-absent" pattern shared by the
     /// text/thinking delta appenders, the tool-call ref pusher, and the

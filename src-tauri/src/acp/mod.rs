@@ -1,6 +1,7 @@
 pub mod background_watch;
 pub mod binary_cache;
 pub mod bundled_agent;
+pub mod chat_authoring;
 pub mod codex_catalog_source;
 pub mod codex_cli;
 pub mod codex_goal;
@@ -16,6 +17,7 @@ pub mod feedback;
 pub mod file_system_runtime;
 pub mod fork;
 pub mod grok_retry;
+pub mod host_tools_policy;
 pub mod idle_sweep;
 pub mod internal_bus;
 pub mod lifecycle;
@@ -35,6 +37,7 @@ pub mod remote_registry;
 pub mod session_attach;
 pub mod session_info;
 pub mod session_state;
+pub mod stderr_tail;
 pub mod streaming_performance;
 pub mod terminal_adapter;
 pub mod terminal_assoc;
@@ -43,6 +46,7 @@ pub mod terminal_runtime;
 pub mod termination;
 pub mod tool_watchdog;
 pub mod types;
+pub mod work_task_tools;
 pub mod xai_session_notification;
 
 #[cfg(feature = "tauri-runtime")]

@@ -322,6 +322,11 @@ pub fn catalog_entry_to_def(
         // No probe declared by the registry; the system-install version probe
         // falls back to running the command with `--version`.
         version_probe: None,
+        // The catalog says nothing about MCP either. Start forwarding it —
+        // almost every agent accepts it, and an agent that does not announces
+        // itself loudly by failing to connect, which is what the settings
+        // toggle is there to fix.
+        supports_mcp: true,
     })
 }
 

@@ -69,6 +69,12 @@ export interface UseSessionFeedback {
   featureEnabled: boolean
   /** Whether a note can be sent right now (entry is enabled vs. greyed out). */
   canSubmit: boolean
+  /** Which channel a note would ride: `native` = the ACP `_session/steering`
+   *  push (injected into the running turn immediately), `pull` = the
+   *  `check_user_feedback` MCP tool (read when the agent next checks). Drives
+   *  copy and the composer's "insert into current turn" entry. Backend-
+   *  synthesized — never derived from agent type here. */
+  channel: "native" | "pull"
   /** Whether to render the read-only notes list above the composer. */
   showList: boolean
   /** Whether a submit is in flight (disables the dialog send button). */
@@ -78,6 +84,12 @@ export interface UseSessionFeedback {
   closeDialog: () => void
   /** Send a note. Closes the dialog on success / turn-end reroute. */
   submit: (text: string) => Promise<void>
+  /** Composer-facing raw submit: same optimistic note append on success, but
+   *  every failure — including the turn-end `NoActiveTurn` race — is
+   *  RETHROWN untouched (no toast, no reroute). The composer owns its own
+   *  fallback (enqueue) and draft-preservation policy, which `submit`'s
+   *  dialog-shaped error handling would preempt. */
+  steer: (text: string) => Promise<FeedbackItem>
 }
 
 export function useSessionFeedback({
@@ -97,6 +109,26 @@ export function useSessionFeedback({
   // retrofit the tool onto an already-running agent. Starts false until the
   // snapshot confirms.
   const [toolAvailable, setToolAvailable] = useState(false)
+  // Whether notes ride the native `_session/steering` push channel for THIS
+  // session (backend-synthesized from advertisement + registry policy +
+  // runtime version proof — never re-derived from agent type here). Same
+  // monotonic-upgrade discipline as `toolAvailable` for SNAPSHOT reads
+  // (hydrate + self-heal only ever flip it true; the synchronous reset on
+  // connection change flips it back). The ONE downgrade signal is the submit
+  // RESULT (see `reconcileChannel`): a `pending` item on a supposedly-native
+  // session means the backend downgraded mid-session (startedNewTurn), and
+  // leaving this true would keep offering "insert into current turn" while
+  // notes actually land on the pull path.
+  const [nativeSteering, setNativeSteering] = useState(false)
+  // Latch for that downgrade: once set, a stale pre-downgrade snapshot that
+  // resolves late can never flip the channel back to native. Reset with the
+  // rest of the per-connection state.
+  const steeringDowngradedRef = useRef(false)
+  // Latest-connection guard for the post-submit channel verification below: a
+  // verify read that resolves after the user switched connections must not
+  // latch the NEW connection's state.
+  const connectionIdRef = useRef(connectionId)
+  connectionIdRef.current = connectionId
   // Tombstones for notes consumed via `feedback_consumed` whose
   // `feedback_submitted` we never held (a consume event that lands BEFORE the
   // matching submit — e.g. before snapshot hydration resolves, or out-of-order
@@ -120,6 +152,8 @@ export function useSessionFeedback({
   useEffect(() => {
     setNotes([])
     setToolAvailable(false)
+    setNativeSteering(false)
+    steeringDowngradedRef.current = false
     consumedRef.current = new Map()
     if (!enabled || !connectionId) return
     let cancelled = false
@@ -132,6 +166,9 @@ export function useSessionFeedback({
         // that raced the spawn — the synchronous reset above is the only place
         // it goes back to false (on connection / feature-flag change).
         if (snap.feedback_tool_available) setToolAvailable(true)
+        if (snap.native_steering_available && !steeringDowngradedRef.current) {
+          setNativeSteering(true)
+        }
         // A new turn started while the fetch was in flight — the snapshot holds
         // the previous turn's (already-cleared) notes; drop them.
         if (turnGenRef.current !== startGen) return
@@ -151,29 +188,31 @@ export function useSessionFeedback({
     }
   }, [connectionId, enabled])
 
-  // Self-heal tool availability. The hydrate above is keyed on `connectionId`,
+  // Self-heal capability flags. The hydrate above is keyed on `connectionId`,
   // which appears the moment a NEW conversation's connection is created — while
   // it's still "connecting", BEFORE the backend sets `feedback_tool_available`
-  // at spawn. That first read returns false and would never refresh, leaving the
-  // "+" entry permanently disabled. Once the connection is actually live, re-read
-  // it (only while still unknown — a `false` no-ops so this can't loop, and it
-  // stops the moment it flips true).
+  // / `native_steering_available` at spawn. That first read returns false and
+  // would never refresh, leaving the "+" entry permanently disabled. Once the
+  // connection is actually live, re-read (only while either is still unknown —
+  // a `false` no-ops so this can't loop, and it stops once both are known).
   useEffect(() => {
-    if (!enabled || !connectionId || toolAvailable) return
+    if (!enabled || !connectionId || (toolAvailable && nativeSteering)) return
     if (connStatus !== "connected" && connStatus !== "prompting") return
     let cancelled = false
     void acpGetSessionSnapshot(connectionId)
       .then((snap) => {
+        if (cancelled) return
         // Monotonic upgrade only (see hydrate effect) — no downgrade, no flicker.
-        if (!cancelled && snap?.feedback_tool_available) {
-          setToolAvailable(true)
+        if (snap?.feedback_tool_available) setToolAvailable(true)
+        if (snap?.native_steering_available && !steeringDowngradedRef.current) {
+          setNativeSteering(true)
         }
       })
       .catch(() => {})
     return () => {
       cancelled = true
     }
-  }, [enabled, connectionId, connStatus, toolAvailable])
+  }, [enabled, connectionId, connStatus, toolAvailable, nativeSteering])
 
   // Build the note list from the live event stream, scoped to this connection.
   useAcpEvent(
@@ -226,6 +265,58 @@ export function useSessionFeedback({
     if (interactionLocked) setDialogOpen(false)
   }, [interactionLocked])
 
+  // Converge the channel from a submit RESULT. Two signals:
+  //
+  // * A `pending` item on a supposedly-native session PROVES the backend
+  //   already downgraded (`startedNewTurn` earlier) and rerouted THIS note
+  //   to the pull path — flip immediately and tell the user the delivery
+  //   semantics changed (their "insert now" became a waiting note; the note
+  //   itself is safe, recorded and listed).
+  // * A `delivered` item is ambiguous: the downgrade round ITSELF returns
+  //   delivered (the detached turn consumed the content) while the backend
+  //   flag flips false before the reply — indistinguishable from a healthy
+  //   injection by status alone. So after every native-session submit,
+  //   re-read the authoritative snapshot once and converge SILENTLY when it
+  //   reports the flag off: the next render stops offering "insert into
+  //   current turn" and the dialog copy reverts to pull. (No toast — that
+  //   round's note WAS consumed by the agent.)
+  //
+  // Both paths set the latch so a stale pre-downgrade snapshot can never
+  // flip the channel back (see `steeringDowngradedRef`).
+  const reconcileChannel = useCallback(
+    (item: FeedbackItem) => {
+      // Stale-closure guard: a submit that resolves after the user switched
+      // connections captured the OLD connection's context, but the state and
+      // latch it would mutate now belong to the NEW one — bail out entirely
+      // (both branches), or connection B would lose its native entry over
+      // connection A's late result.
+      if (connectionIdRef.current !== connectionId) return
+      if (!nativeSteering) return
+      if (item.status === "pending") {
+        steeringDowngradedRef.current = true
+        setNativeSteering(false)
+        toast.info(t("channelDowngraded"))
+        return
+      }
+      const cid = connectionId
+      if (!cid) return
+      void acpGetSessionSnapshot(cid)
+        .then((snap) => {
+          // Explicit `false` only — an older server omits the field entirely
+          // (undefined), which must not read as a downgrade.
+          if (
+            connectionIdRef.current === cid &&
+            snap &&
+            snap.native_steering_available === false
+          ) {
+            steeringDowngradedRef.current = true
+            setNativeSteering(false)
+          }
+        })
+        .catch(() => {})
+    },
+    [nativeSteering, connectionId, t]
+  )
   const submit = useCallback(
     async (rawText: string) => {
       if (interactionLocked) return
@@ -236,13 +327,14 @@ export function useSessionFeedback({
       // session — close the dialog instead. NOTE: a merely-ended turn keeps
       // `enabled`/`toolAvailable` true, so it still flows to the submit below and
       // gets rerouted via the no-active-turn fallback (draft preserved).
-      if (!enabled || !toolAvailable) {
+      if (!enabled || (!toolAvailable && !nativeSteering)) {
         setDialogOpen(false)
         return
       }
       setSubmitting(true)
       try {
         const item = await submitSessionFeedback(connectionId, text)
+        reconcileChannel(item)
         // Optimistically add; the broadcast event dedups against this by id.
         setNotes((prev) =>
           prev.some((n) => n.id === item.id) ? prev : [...prev, item]
@@ -280,6 +372,32 @@ export function useSessionFeedback({
     ]
   )
 
+  // Composer-facing raw submit. Unlike `submit` (dialog-shaped: swallows
+  // errors into toasts and reroutes the turn-end race itself), this RETHROWS
+  // everything so the composer can run its own policy — fall back to the
+  // queue on `NoActiveTurn`, keep the draft on real failures. Shared with
+  // `submit`: the optimistic note append and the channel reconciliation.
+  const steer = useCallback(
+    async (rawText: string): Promise<FeedbackItem> => {
+      const text = rawText.trim()
+      if (!text || !connectionId) {
+        throw new Error("nothing to steer")
+      }
+      const item = await submitSessionFeedback(connectionId, text)
+      // A resolution that landed after a connection switch must not touch the
+      // new connection's channel state or note list (reconcileChannel guards
+      // itself too; the append needs the same protection).
+      if (connectionIdRef.current === connectionId) {
+        reconcileChannel(item)
+        setNotes((prev) =>
+          prev.some((n) => n.id === item.id) ? prev : [...prev, item]
+        )
+      }
+      return item
+    },
+    [connectionId, reconcileChannel]
+  )
+
   const openDialog = useCallback(() => {
     if (interactionLocked) return
     setDialogOpen(true)
@@ -290,8 +408,9 @@ export function useSessionFeedback({
     !interactionLocked &&
     enabled &&
     Boolean(connectionId) &&
-    toolAvailable &&
+    (toolAvailable || nativeSteering) &&
     isPrompting
+  const channel: "native" | "pull" = nativeSteering ? "native" : "pull"
   // Notes remain visible while locked so the user can still read them.
   const showList = notes.length > 0 && (isPrompting || interactionLocked)
 
@@ -300,23 +419,27 @@ export function useSessionFeedback({
       notes,
       featureEnabled: enabled,
       canSubmit,
+      channel,
       showList,
       submitting,
       dialogOpen,
       openDialog,
       closeDialog,
       submit,
+      steer,
     }),
     [
       notes,
       enabled,
       canSubmit,
+      channel,
       showList,
       submitting,
       dialogOpen,
       openDialog,
       closeDialog,
       submit,
+      steer,
     ]
   )
 }

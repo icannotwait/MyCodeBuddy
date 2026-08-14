@@ -86,6 +86,11 @@ pub struct DbConversationSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delegation_attention_request:
         Option<crate::acp::delegation::attention::AttentionRequestSummary>,
+    /// Mirror of `conversation.origin_cwd`: the working directory this
+    /// conversation actually ran in when it differs from its current folder's
+    /// path (set when a removed task worktree's conversations were re-parented).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin_cwd: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -171,6 +176,18 @@ pub struct DbConversationDetail {
     /// `has_more_before` to offer "load older" and keep scrollback expandable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history_window: Option<HistoryWindowInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationTurnsPage {
+    pub turns: Vec<MessageTurn>,
+    pub turns_offset: usize,
+    pub turns_total: usize,
+    pub assistant_turns_before_offset: usize,
+    pub prefix_hash: String,
+    pub prefix_hash_before_index: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uncovered_prefix_max_ts: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

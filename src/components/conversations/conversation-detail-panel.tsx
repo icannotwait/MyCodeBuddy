@@ -37,6 +37,8 @@ import { useWorkspaceView } from "@/contexts/workspace-context"
 import { useIsMobile } from "@/hooks/use-mobile"
 import { usePlatform } from "@/hooks/use-platform"
 import { useZoomLevel } from "@/hooks/use-appearance"
+import { getFolderConversation } from "@/lib/api"
+import { isWindowedDetail } from "@/lib/turn-window"
 import { isDesktop } from "@/lib/platform"
 import { leftChromeReserve, rightChromeReserve } from "@/lib/window-chrome"
 import {
@@ -171,19 +173,25 @@ export function ConversationDetailPanel() {
     if (!workingDir) return null
     return { workingDir, folderId: activeTab.folderId }
   }, [tabs, activeTabId, folder?.path])
-  const { disconnect: disconnectByKey } = useAcpActions()
+  const { disconnectIfIdle } = useAcpActions()
   const { addTask, updateTask } = useTaskContext()
   const [reloadByTabId, setReloadByTabId] = useState<Record<string, number>>({})
   const [detailsOpen, setDetailsOpen] = useState(false)
 
   const exportLabels = useExportLabels()
 
-  // Disconnect the old connection immediately when a preview tab is replaced
+  // Release the old connection as soon as a preview tab is replaced (the next
+  // single-click in the sidebar takes its slot) instead of waiting for a sweep.
+  // Idle-gated on purpose: the replaced tab may hold a session that is still
+  // working — often one the user only clicked in to watch — and disconnecting
+  // an owner mid-turn kills the agent CLI, which lands in the transcript as an
+  // interrupted request. Busy owners keep running; the idle sweep reclaims them
+  // once they settle.
   useEffect(() => {
     return onPreviewTabReplaced((replacedTabId) => {
-      disconnectByKey(replacedTabId).catch(() => {})
+      disconnectIfIdle(replacedTabId).catch(() => {})
     })
-  }, [onPreviewTabReplaced, disconnectByKey])
+  }, [onPreviewTabReplaced, disconnectIfIdle])
 
   // Background turn_complete handler: for conversations not open in tabs.
   // Subscribes via the context's primary `acp://event` listener (single
@@ -395,22 +403,31 @@ export function ConversationDetailPanel() {
   const activeLastToolWatchdogDiagnostic =
     activeWatchdogConnection?.lastToolWatchdogDiagnostic ?? null
 
-  const getExportData = useCallback(() => {
+  const getExportData = useCallback(async () => {
     if (!activeConversationTab?.conversationId) return null
     const session = getRuntimeSession(activeConversationTab.conversationId)
     if (!session?.detail) return null
+    let detail = session.detail
+    // The loaded detail may be a tail WINDOW (paginated loading); an export
+    // must cover the whole transcript, so fetch the legacy full response on
+    // demand. The window is full when it starts at offset 0.
+    if (isWindowedDetail(detail) && detail.turns_offset > 0) {
+      detail = await getFolderConversation(
+        session.dbConversationId ?? activeConversationTab.conversationId
+      )
+    }
     return {
-      summary: session.detail.summary,
-      turns: session.detail.turns,
-      sessionStats: session.detail.session_stats,
+      summary: detail.summary,
+      turns: detail.turns,
+      sessionStats: detail.session_stats,
       labels: exportLabels,
     }
   }, [activeConversationTab, exportLabels])
 
   const handleExportMarkdown = useCallback(async () => {
-    const data = getExportData()
-    if (!data) return
     try {
+      const data = await getExportData()
+      if (!data) return
       const result = await exportAsMarkdown(data)
       if (result === "saved") toast.success(t("exportSuccess"))
       // "cancelled": user dismissed the Save dialog — stay silent,
@@ -422,9 +439,9 @@ export function ConversationDetailPanel() {
   }, [getExportData, t])
 
   const handleExportHtml = useCallback(async () => {
-    const data = getExportData()
-    if (!data) return
     try {
+      const data = await getExportData()
+      if (!data) return
       const result = await exportAsHtml(data)
       if (result === "saved") toast.success(t("exportSuccess"))
     } catch (err) {
@@ -434,12 +451,15 @@ export function ConversationDetailPanel() {
   }, [getExportData, t])
 
   const handleExportImage = useCallback(async () => {
-    const data = getExportData()
-    if (!data) return
     const taskId = `export-image-${Date.now()}`
     addTask(taskId, t("exportImage"))
     updateTask(taskId, { status: "running" })
     try {
+      const data = await getExportData()
+      if (!data) {
+        updateTask(taskId, { status: "completed" })
+        return
+      }
       const result = await exportAsImage(data)
       updateTask(taskId, { status: "completed" })
       if (result === "saved") toast.success(t("exportSuccess"))

@@ -13,8 +13,14 @@ const MIGRATION_3: &str = "m20260804_000003_completion_tool_intents_and_restart_
 const MIGRATION_4: &str = "m20260804_000004_typed_completion_attention";
 const MIGRATION_V2_ONLY: &str = "m20260809_000001_completion_protocol_v2_only";
 const PRE_V2_ONLY_MIGRATION: &str = "m20260806_000004_legacy_restart_context";
-const PREVIOUS_MIGRATION: &str = "m20260731_000004_custom_agent_source";
+// Immediate predecessor in the merged (chronological) chain. Fork work-task /
+// token-usage migrations sit between custom_agent_source and completion protocol 1.
+const PREVIOUS_MIGRATION: &str = "m20260803_000001_token_usage";
 const PRE_MANIFEST_V2_MIGRATION: &str = "m20260727_000002_workflow_gate_fingerprints";
+const FORK_MIGRATIONS_BEFORE_V2_ONLY: &[&str] = &[
+    "m20260807_000001_work_task_scheduled_at",
+    "m20260808_000001_custom_agent_supports_mcp",
+];
 
 const V2_ONLY_TRIGGERS: &[&str] = &[
     "trg_delegation_workflows_legacy_source_frozen",
@@ -1674,7 +1680,11 @@ fn v2_only_trigger_migration_is_registered_after_legacy_restart_context() {
         .iter()
         .position(|name| name == MIGRATION_V2_ONLY)
         .expect("missing completion-protocol-v2-only migration");
-    assert_eq!(v2_only, predecessor + 1);
+    let between: Vec<&str> = names[predecessor + 1..v2_only]
+        .iter()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(between.as_slice(), FORK_MIGRATIONS_BEFORE_V2_ONLY);
 }
 
 #[tokio::test]

@@ -25,6 +25,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog"
 import { cn, copyTextToClipboard } from "@/lib/utils"
+import { getAgentLabel } from "@/lib/custom-agents"
 import { acpEnvDiagnostics } from "@/lib/api"
 import type { AgentDiagnosticsReport, AgentType, DiagLevel } from "@/lib/types"
 
@@ -77,6 +78,10 @@ const VERDICT_CODES = [
   "terminal_only_path",
   "npm_prefix_timeout",
   "node_too_old",
+  // Adapter agents (Claude Code, Codex): the vendor CLI is not what codeg
+  // launches, so "not installed" needs a different explanation.
+  "adapter_missing_native_present",
+  "adapter_missing",
 ] as const
 
 type VerdictCode = (typeof VERDICT_CODES)[number]
@@ -132,8 +137,15 @@ export function AgentDiagnosticsDialog({
     }
   }, [open, run])
 
+  // The adapter verdicts name the agent; every other message ignores the extra
+  // value. `agent` is empty only for the base environment report, which cannot
+  // produce an agent-specific code.
   const verdictLabel = (code: string, fallback: string): string =>
-    isKnownVerdict(code) ? t(`verdict.${code}`) : fallback
+    isKnownVerdict(code)
+      ? t(`verdict.${code}`, {
+          agent: agentType ? getAgentLabel(agentType) : "",
+        })
+      : fallback
 
   const onCopy = async () => {
     if (!report) return

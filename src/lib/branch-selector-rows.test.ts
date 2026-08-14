@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest"
 
 import {
+  branchLeafActions,
   buildBranchRows,
   isNavigableRow,
   type BranchOperationMeta,
@@ -365,6 +366,64 @@ describe("buildBranchRows — multiple remotes", () => {
       "group:upstream@1+",
       "leaf:upstream/main@2",
     ])
+  })
+})
+
+describe("branchLeafActions", () => {
+  const leaf = (
+    over: Partial<Extract<BranchRow, { kind: "leaf" }>> & {
+      isMainWorktree?: boolean
+    } = {}
+  ) => ({
+    isRemote: false,
+    isTracking: false,
+    isWorktree: false,
+    ...over,
+  })
+
+  it("offers plain delete for a local branch nothing has checked out", () => {
+    expect(branchLeafActions(leaf())).toEqual([
+      "switch",
+      "merge",
+      "rebase",
+      "pull",
+      "push",
+      "delete",
+    ])
+  })
+
+  // The bug this replaces: `git branch -d` refuses point blank while a worktree
+  // holds the ref, so plain delete could only ever fail on these branches.
+  it("replaces delete with the worktree removals for a worktree branch", () => {
+    const actions = branchLeafActions(leaf({ isWorktree: true }))
+    expect(actions).not.toContain("delete")
+    expect(actions.slice(-2)).toEqual([
+      "deleteWorktree",
+      "deleteWorktreeAndBranch",
+    ])
+  })
+
+  // `isWorktree` is set on a remote leaf too (its local counterpart drives the
+  // folder icon), but removing a worktree is not something a remote ref can do.
+  it("keeps a remote leaf on deleteRemote even when its local is a worktree", () => {
+    expect(
+      branchLeafActions(leaf({ isRemote: true, isWorktree: true }))
+    ).toEqual(["switch", "merge", "rebase", "pull", "deleteRemote"])
+  })
+
+  // Seen from a linked worktree, the repo's own checkout looks like just
+  // another worktree — but git refuses to remove it AND refuses to delete its
+  // branch, so offering either would be the same dead end in a new costume.
+  it("offers nothing destructive for the main working tree's branch", () => {
+    expect(
+      branchLeafActions(leaf({ isWorktree: true, isMainWorktree: true }))
+    ).toEqual(["switch", "merge", "rebase", "pull", "push"])
+  })
+
+  it("drops the destructive tail for the tracked remote branch", () => {
+    expect(
+      branchLeafActions(leaf({ isRemote: true, isTracking: true }))
+    ).toEqual(["switch", "merge", "rebase", "pull"])
   })
 })
 

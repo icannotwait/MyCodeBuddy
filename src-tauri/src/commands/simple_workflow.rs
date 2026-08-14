@@ -261,16 +261,17 @@ mod tests {
         let core = continue_archived_workflow_in_simple_core().unwrap_err();
         assert_eq!(wrapper.code, core.code);
         assert_eq!(wrapper.message, core.message);
-        assert_eq!(serde_json::to_value(wrapper).unwrap(), serde_json::to_value(core).unwrap());
+        assert_eq!(
+            serde_json::to_value(wrapper).unwrap(),
+            serde_json::to_value(core).unwrap()
+        );
     }
 
     #[cfg(all(feature = "tauri-runtime", feature = "test-utils"))]
     #[test]
     fn simple_successor_creation_retired_tauri_ipc_ignores_stale_arguments() {
         use tauri::ipc::{CallbackFn, InvokeBody};
-        use tauri::test::{
-            get_ipc_response, mock_builder, mock_context, noop_assets, INVOKE_KEY,
-        };
+        use tauri::test::{get_ipc_response, mock_builder, mock_context, noop_assets, INVOKE_KEY};
         use tauri::webview::InvokeRequest;
 
         let app = mock_builder()

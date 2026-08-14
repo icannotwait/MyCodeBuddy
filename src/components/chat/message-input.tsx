@@ -1,14 +1,12 @@
 "use client"
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
-import { getAgentLabel } from "@/lib/custom-agents"
-import { isDesktop } from "@/lib/platform"
+import { isImeCompositionKey } from "@/lib/ime-composition"
 import {
   probeInputToPaint,
   streamingPerfRecorder,
 } from "@/lib/perf/streaming-perf-recorder"
-import Image from "next/image"
-import { useLocale, useTranslations } from "next-intl"
+import { useTranslations } from "next-intl"
 import { Button } from "@/components/ui/button"
 import {
   BookOpenText,
@@ -17,33 +15,19 @@ import {
   ClipboardPaste,
   Cog,
   Copy,
-  FileStack,
-  FlaskConical,
-  FolderSearch,
   GitFork,
-  Loader2,
-  Lock,
-  MessageSquarePlus,
   MessageSquareText,
-  Paperclip,
-  Plus,
   Scissors,
-  Search,
   Send,
-  Command,
-  Sparkles,
   Square,
   TextSelect,
-  Upload,
   X,
+  Zap,
 } from "lucide-react"
 import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
-  DropdownMenuSub,
-  DropdownMenuSubContent,
-  DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
 import {
@@ -61,58 +45,21 @@ import {
   ContextMenuSubTrigger,
   ContextMenuTrigger,
 } from "@/components/ui/context-menu"
-import { ImagePreviewDialog } from "@/components/ui/image-preview-dialog"
 import { AgentIcon } from "@/components/agent-icon"
-import { cn, copyTextFromMenu, randomUUID } from "@/lib/utils"
-import {
-  buildFileUri,
-  buildFileUriWithRange,
-  formatFileRangeLabel,
-} from "@/lib/reference-link"
-import {
-  hasFileTreeDragType,
-  readFileTreeDragPayload,
-} from "@/lib/file-tree-dnd"
-import {
-  filesFromClipboard,
-  clipboardHasText,
-  imageFilesFromClipboardApi,
-} from "@/lib/clipboard-images"
+import { cn, copyTextFromMenu } from "@/lib/utils"
 import { useShortcutSettings } from "@/hooks/use-shortcut-settings"
-import {
-  readFileBase64,
-  quickMessagesList,
-  uploadAttachment,
-  uploadLocalPathToRemote,
-  isEmptyAttachmentError,
-  openSettingsWindow,
-  type SettingsSection,
-  UPLOAD_MAX_BYTES,
-  UPLOAD_I18N_KEY_TOO_LARGE,
-  UPLOAD_I18N_KEY_NOT_A_FILE,
-  UPLOAD_I18N_KEY_QUOTA_EXCEEDED,
-} from "@/lib/api"
-// Local-IPC file read (never proxied to a remote workspace). Used for the
-// thumbnail preview of a locally-dropped image whose BYTES were uploaded to
-// the remote server — `api.readFileBase64` would route through the remote
-// transport and try to read the local path on the wrong machine.
-import { readFileBase64 as readLocalFileBase64 } from "@/lib/tauri"
-import { extractAppCommandError } from "@/lib/app-error"
-import { openFileDialog } from "@/lib/platform"
-import { getActiveRemoteConnectionId } from "@/lib/transport"
+import { imageFilesFromClipboardApi } from "@/lib/clipboard-images"
+import { toErrorMessage } from "@/lib/app-error"
+import { isNoActiveTurnRejection } from "@/lib/turn-busy"
 import { ServerFileBrowserDialog } from "@/components/shared/server-file-browser-dialog"
 import { toast } from "sonner"
-import { disposeTauriListener } from "@/lib/tauri-listener"
 import type {
   AgentSkillItem,
   AgentType,
   AvailableCommandInfo,
-  ExpertListItem,
-  ScienceListItem,
   PromptCapabilitiesInfo,
   PromptDraft,
   PromptInputBlock,
-  QuickMessage,
   SessionConfigOptionInfo,
   SessionModeInfo,
 } from "@/lib/types"
@@ -130,7 +77,10 @@ import {
 import { ComposerContextUsage } from "@/components/chat/composer-context-usage"
 import { ComposerConnectionStatus } from "@/components/chat/composer-connection-status"
 import { InlineModeSelector } from "@/components/chat/mode-selector"
-import { InlineSessionConfigSelector } from "@/components/chat/session-config-selector"
+import {
+  InlineSessionConfigSelector,
+  InlineSessionConfigToggle,
+} from "@/components/chat/session-config-selector"
 import { ModelOptionPicker } from "@/components/chat/model-option-picker"
 import {
   SessionSelectorsPanel,
@@ -145,15 +95,8 @@ import {
   type ModelOptionGroup,
 } from "@/lib/model-config-groups"
 import { configOptionDisplayLabel } from "@/lib/session-config-display"
-import { DropdownRadioItemContent } from "@/components/chat/dropdown-radio-item-content"
 import { useAgentSkills } from "@/hooks/use-agent-skills"
-import { useBuiltInExperts } from "@/hooks/use-built-in-experts"
-import { useBuiltInScience } from "@/hooks/use-built-in-science"
-import { useEnabledSkillIds } from "@/hooks/use-enabled-skill-ids"
 import { useScrollbarSafeDismiss } from "@/hooks/use-scrollbar-safe-dismiss"
-import { getExpertIcon, pickLocalized } from "@/lib/expert-presentation"
-import { getScienceIcon } from "@/lib/science-presentation"
-import { OFFICE_ACTIONS, type OfficeAction } from "@/lib/office-actions"
 import {
   clearMessageInputDraftV2,
   loadMessageInputDraftV2,
@@ -171,16 +114,12 @@ import {
   docToPromptBlocks,
   serializeDocToDisplayText,
 } from "@/components/chat/composer/to-prompt-blocks"
-import {
-  buildEmbeddedReferenceUri,
-  isEmbeddedReferenceUri,
-} from "@/components/chat/composer/reference-uri"
+import { isEmbeddedReferenceUri } from "@/components/chat/composer/reference-uri"
 import {
   applyExpertReference,
   isComposerChromeClick,
   isComposerEmpty,
   restampSkillPrefixes,
-  restoreBlocksIntoEditor,
 } from "@/components/chat/composer/composer-commands"
 import {
   commandInvocationToken,
@@ -195,12 +134,10 @@ import {
   type ReferenceGroupLabels,
 } from "@/components/chat/composer/use-reference-search"
 import type { MentionUiLabels } from "@/components/chat/composer/suggestion/types"
-import {
-  imageAttachmentToPromptBlock,
-  type ImageInputAttachment,
-  type InputAttachment,
-  type ResourceInputAttachment,
-} from "./message-input-attachments"
+import { ComposerAddMenu } from "@/components/chat/composer/composer-add-menu"
+import { ComposerImageThumbnails } from "@/components/chat/composer/composer-image-thumbnails"
+import { useComposerAttachments } from "@/components/chat/composer/use-composer-attachments"
+import { useComposerShortcuts } from "@/components/chat/composer/use-composer-shortcuts"
 
 /**
  * Payload pushed into the composer from outside (e.g. a welcome-page quick
@@ -283,6 +220,13 @@ interface MessageInputProps {
    *  draft synchronously (clears on click); the parent re-queues it if the fork
    *  can't run, so it is never lost. */
   onForkSend?: (draft: PromptDraft, modeId?: string | null) => void
+  /** Inject the draft's TEXT into the RUNNING turn (native live-feedback
+   *  steering). Present only on sessions whose feedback channel is native —
+   *  when absent, the prompting branch renders its historical Stop-only form.
+   *  Awaited: resolve = injected + recorded (clear the draft); reject =
+   *  failure, where a turn-end `NoActiveTurn` race falls back to the queue
+   *  and anything else keeps the draft. */
+  onSteer?: (text: string) => Promise<void>
   /** Open the live-feedback dialog (from the "+" menu). When omitted the entry
    *  is hidden (feature off). */
   onAddFeedback?: () => void
@@ -291,151 +235,6 @@ interface MessageInputProps {
   feedbackAddDisabled?: boolean
   injectContent?: ComposerInjectContent | null
   onInjectConsumed?: () => void
-}
-
-const MIME_BY_EXT: Record<string, string> = {
-  txt: "text/plain",
-  md: "text/markdown",
-  json: "application/json",
-  yaml: "application/yaml",
-  yml: "application/yaml",
-  csv: "text/csv",
-  html: "text/html",
-  css: "text/css",
-  js: "text/javascript",
-  mjs: "text/javascript",
-  cjs: "text/javascript",
-  ts: "text/typescript",
-  tsx: "text/tsx",
-  jsx: "text/jsx",
-  py: "text/x-python",
-  rs: "text/rust",
-  go: "text/x-go",
-  java: "text/x-java-source",
-  xml: "application/xml",
-  toml: "application/toml",
-  pdf: "application/pdf",
-  png: "image/png",
-  jpg: "image/jpeg",
-  jpeg: "image/jpeg",
-  gif: "image/gif",
-  webp: "image/webp",
-  svg: "image/svg+xml",
-}
-
-function fileNameFromPath(path: string): string {
-  return path.split(/[/\\]/).pop() || path
-}
-
-function mimeTypeFromPath(path: string): string | null {
-  const ext = path.split(".").pop()?.toLowerCase() ?? ""
-  return MIME_BY_EXT[ext] ?? null
-}
-
-function hasDragFiles(dataTransfer: DataTransfer | null): boolean {
-  if (!dataTransfer?.types) return false
-  return Array.from(dataTransfer.types).includes("Files")
-}
-
-function pointWithinElement(
-  position: { x: number; y: number },
-  element: HTMLElement
-): boolean {
-  // Inactive conversation tabs are kept mounted at `absolute inset-0` with
-  // `visibility: hidden` (see ConversationDetailPanel), so their bounding rect
-  // overlaps the active tab's. Without this guard every tab's Tauri drag
-  // listener would treat the same OS drop as falling inside its own input,
-  // and dropped files would silently fan out across every open conversation.
-  const style = element.ownerDocument?.defaultView?.getComputedStyle(element)
-  if (style) {
-    if (
-      style.visibility === "hidden" ||
-      style.display === "none" ||
-      style.pointerEvents === "none"
-    ) {
-      return false
-    }
-  }
-  const rect = element.getBoundingClientRect()
-  if (rect.width === 0 || rect.height === 0) return false
-  const dpr = window.devicePixelRatio || 1
-  const candidates = [
-    { x: position.x, y: position.y },
-    { x: position.x / dpr, y: position.y / dpr },
-  ]
-  return candidates.some(
-    (point) =>
-      point.x >= rect.left &&
-      point.x <= rect.right &&
-      point.y >= rect.top &&
-      point.y <= rect.bottom
-  )
-}
-
-function blobToBase64(blob: Blob): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader()
-    reader.onerror = () => {
-      reject(reader.error ?? new Error("Failed to read blob"))
-    }
-    reader.onload = () => {
-      if (typeof reader.result !== "string") {
-        reject(new Error("Unexpected non-string blob reader result"))
-        return
-      }
-      const markerIndex = reader.result.indexOf(",")
-      resolve(
-        markerIndex >= 0 ? reader.result.slice(markerIndex + 1) : reader.result
-      )
-    }
-    reader.readAsDataURL(blob)
-  })
-}
-
-function getFilePath(file: File): string | null {
-  const withPath = file as File & { path?: string; webkitRelativePath?: string }
-  if (typeof withPath.path === "string" && withPath.path.trim().length > 0) {
-    return withPath.path
-  }
-  if (
-    typeof withPath.webkitRelativePath === "string" &&
-    withPath.webkitRelativePath.trim().length > 0
-  ) {
-    return withPath.webkitRelativePath
-  }
-  return null
-}
-
-const TEXT_LIKE_MIME_PREFIXES = [
-  "text/",
-  "application/json",
-  "application/xml",
-  "application/yaml",
-  "application/x-yaml",
-  "application/toml",
-  "application/javascript",
-  "application/typescript",
-]
-const DRAG_DROP_IMAGE_MAX_BYTES = 20_000_000
-
-function isTextLikeFile(file: File): boolean {
-  const mime = file.type.toLowerCase()
-  if (mime) {
-    if (TEXT_LIKE_MIME_PREFIXES.some((prefix) => mime.startsWith(prefix))) {
-      return true
-    }
-  }
-  const ext = file.name.split(".").pop()?.toLowerCase()
-  if (!ext) return false
-  return Boolean(
-    MIME_BY_EXT[ext]?.startsWith("text/") ||
-    ["json", "yaml", "yml", "xml", "toml", "md", "csv"].includes(ext)
-  )
-}
-
-function buildClipboardResourceUri(name: string): string {
-  const normalizedName = name.trim() || "clipboard-resource"
-  return `clipboard://${encodeURIComponent(normalizedName)}-${randomUUID()}`
 }
 
 // Non-image files attach as inline file badges in the editor (like `@`-file
@@ -451,25 +250,6 @@ function buildClipboardResourceUri(name: string): string {
 // path (no collision with a genuine attachment) and survives the transcript's
 // sanitize/harden pipeline, so it renders as an inert file badge, not a blocked
 // link — see {@link buildEmbeddedReferenceUri} / {@link isEmbeddedReferenceUri}.
-
-/** Whether the document already holds a file reference badge for `uri` (used to
- *  dedupe repeated drops/picks of the same path, mirroring the old seen-set). */
-function editorHasFileReference(editor: Editor, uri: string): boolean {
-  let found = false
-  editor.state.doc.descendants((node) => {
-    if (found) return false
-    if (
-      node.type.name === "reference" &&
-      node.attrs?.refType === "file" &&
-      node.attrs?.uri === uri
-    ) {
-      found = true
-      return false
-    }
-    return true
-  })
-  return found
-}
 
 /** Drop embedded-attachment reference badges from a draft document before it is
  *  persisted: their bytes live only in the in-memory `embeddedPayloadsRef` map
@@ -492,12 +272,6 @@ function stripEmbeddedReferences(doc: JSONContent): JSONContent {
     content.push(stripEmbeddedReferences(child))
   }
   return { ...doc, content }
-}
-
-function buildDataUri(base64Data: string, mimeType: string | null): string {
-  const safeMime =
-    mimeType && mimeType.trim() ? mimeType : "application/octet-stream"
-  return `data:${safeMime};base64,${base64Data}`
 }
 
 function SelectorLoadingChip({ label }: { label: string }) {
@@ -560,6 +334,7 @@ export function MessageInput({
   onSaveQueueEdit,
   onCancelQueueEdit,
   onForkSend,
+  onSteer,
   onAddFeedback,
   feedbackAddDisabled,
   injectContent,
@@ -571,17 +346,6 @@ export function MessageInput({
   // upload / attachment toasts — read as a single coherent group when
   // scanning the file. Same namespace, no extra runtime cost.
   const tAttach = useTranslations("Folder.chat.messageInput")
-  const desktopMode = isDesktop()
-  // Cached for the window's lifetime: `getActiveRemoteConnectionId()` is
-  // configured once when a remote-workspace window is created and never
-  // mutates afterwards. A desktop window bound to a remote codeg-server
-  // has to behave like the web client for attachments — local OS paths
-  // would be ENOENT on the remote agent. Only the truly local desktop
-  // shows the native Paperclip picker.
-  const showNativePaperclip = useMemo(
-    () => desktopMode && getActiveRemoteConnectionId() === null,
-    [desktopMode]
-  )
   // The `$` prefix autocomplete is Codex-only: Codex advertises very few
   // native slash commands, so we augment the dropdown with the agent's
   // skills read from disk. Other agents already surface their full command
@@ -596,34 +360,49 @@ export function MessageInput({
   const { shortcuts } = useShortcutSettings()
   const effectiveDraftStorageKey = draftStorageKey ?? null
   const resolvedPlaceholder = placeholder ?? t("askAnything")
-  // The "+" menu's expert / daily-office / research skill shortcuts mirror the
-  // welcome-page quick actions: localized labels, the bundled experts and
-  // science skills, and per-agent skill-enabled gating. Experts and science load
-  // their full lists from the backend (so every skill shows, not a curated
-  // subset); office is a fixed static set. `tQa` supplies office labels/prompts.
-  const locale = useLocale()
-  const tQa = useTranslations("Folder.chat.welcomePanel.quickActions")
-  const experts = useBuiltInExperts()
-  const science = useBuiltInScience()
-  const {
-    enabledIds,
-    ready: skillStatusReady,
-    supported: skillManagementSupported,
-  } = useEnabledSkillIds(agentType ?? null)
   const editorRef = useRef<RichComposerHandle>(null)
+  const containerRef = useRef<HTMLDivElement>(null)
+  const disabledRef = useRef(disabled)
   // The editor owns the content now; this mirror of its empty state drives the
   // send button and `hasSendableContent`.
   const [composerEmpty, setComposerEmpty] = useState(true)
   // Flips true once the RichComposer's async (immediatelyRender:false) editor has
   // mounted, so the hydration effect can use the imperative handle.
   const [composerReady, setComposerReady] = useState(false)
-  // `attachments` now holds only images; non-image files live inline as editor
-  // reference badges. This map carries the real bytes-bearing block for each
-  // embedded/data-uri badge, keyed by its synthetic `file://` sentinel uri, and
-  // is reconciled into the outgoing blocks by `buildDraft`.
-  const [attachments, setAttachments] = useState<InputAttachment[]>([])
-  const embeddedPayloadsRef = useRef<Map<string, PromptInputBlock>>(new Map())
-  const [isDragActive, setIsDragActive] = useState(false)
+
+  const syncComposerEmpty = useCallback(() => {
+    const ed = editorRef.current?.getEditor()
+    setComposerEmpty(ed ? isComposerEmpty(ed) : true)
+  }, [])
+
+  // Attachments (images → thumbnail strip, files → inline badges) and the "+"
+  // menu's insertable shortcuts. Both are shared with the to-do task composers,
+  // so paste/drop/pick and the skill/quick-message entries behave identically
+  // wherever a prompt is written.
+  const attach = useComposerAttachments({
+    editorRef,
+    containerRef,
+    disabled,
+    promptCapabilities,
+    attachmentTabId,
+    defaultPath,
+    logLabel: "MessageInput",
+  })
+  const {
+    attachments,
+    embeddedPayloadsRef,
+    clearAttachments,
+    hasUploadingImage,
+    hydrateFromBlocks,
+    imagePromptBlocks,
+  } = attach
+  const menuShortcuts = useComposerShortcuts({
+    editorRef,
+    agentType: agentType ?? null,
+    onAfterInsert: syncComposerEmpty,
+    logLabel: "MessageInput",
+  })
+
   // Collapsed (narrow) selectors live in a controlled Popover holding a
   // master–detail panel (`SessionSelectorsPanel`). It's controlled so a value
   // pick closes it explicitly — matching the prior cog menu, which also closed
@@ -637,8 +416,6 @@ export function MessageInput({
   useEffect(() => {
     if (interactionLocked) setCollapsedSelectorsOpen(false)
   }, [interactionLocked])
-  const [quickMessages, setQuickMessages] = useState<QuickMessage[]>([])
-  const [quickMessagesLoading, setQuickMessagesLoading] = useState(false)
   // Whether the async Clipboard read API is usable here. It's absent in
   // non-secure web deployments served over HTTP/LAN (see installClipboardFallback
   // in lib/utils, which only shims writeText), so the composer's custom
@@ -652,12 +429,6 @@ export function MessageInput({
   // ProseMirror state (not the DOM Selection) so it stays correct after the radix
   // menu takes focus.
   const [contextSelectionActive, setContextSelectionActive] = useState(false)
-  const [previewAttachmentId, setPreviewAttachmentId] = useState<string | null>(
-    null
-  )
-  const containerRef = useRef<HTMLDivElement>(null)
-  const lastDomDropAtRef = useRef(0)
-  const disabledRef = useRef(disabled)
   const isPromptingRef = useRef(isPrompting)
   const hydratedRef = useRef(false)
   // Tracks the last queue-item id hydrated, so a re-edit of the *same* item
@@ -666,7 +437,6 @@ export function MessageInput({
   const prevEditingItemIdRef = useRef<string | null>(null)
   // Last applied PromptDraftRestore revision — only strictly newer values rehydrate.
   const lastRestoreRevisionRef = useRef(0)
-  const dragActiveRef = useRef(false)
   // Bridge so the early `onChange` handler can call the editor-driven slash
   // detection that is defined further down (after the slash state).
   const detectSlashTriggerRef = useRef<(() => void) | null>(null)
@@ -678,8 +448,6 @@ export function MessageInput({
   // file-resource path and rendered as an inline badge instead of a thumbnail.
   // `buildDraft` still picks the wire encoding per-capability, so the sent
   // payload is unchanged for each agent — this only unifies the presentation.
-  const canAttachImages =
-    promptCapabilities.image || promptCapabilities.embedded_context
 
   // Non-mutating input-latency probe while a streaming-perf replay is active.
   // Uses MessageChannel → rAF; never synthesizes InputEvents against Tiptap.
@@ -787,56 +555,6 @@ export function MessageInput({
       }
     }
   }, [])
-
-  // Replay a sent `PromptInputBlock[]` (a queued message being re-edited) into
-  // the editor: prose + file badges inline, images into `attachments`, and any
-  // embedded/data-uri resources re-inlined as sentinel badges with their
-  // bytes-bearing blocks re-registered in the payload map.
-  const hydrateFromBlocks = useCallback(
-    (editor: Editor, blocks: PromptInputBlock[]) => {
-      embeddedPayloadsRef.current.clear()
-      const restored = restoreBlocksIntoEditor(editor, blocks)
-      setAttachments(
-        restored.filter((a): a is ImageInputAttachment => a.type === "image")
-      )
-      const resources = restored.filter(
-        (a): a is ResourceInputAttachment => a.type === "resource"
-      )
-      if (resources.length === 0) return
-      let chain = editor.chain().focus("end")
-      for (const att of resources) {
-        const refUri = buildEmbeddedReferenceUri()
-        const block: PromptInputBlock =
-          att.kind === "embedded"
-            ? {
-                type: "resource",
-                uri: att.uri,
-                mime_type: att.mimeType,
-                text: att.text ?? null,
-                blob: att.blob ?? null,
-              }
-            : {
-                type: "resource_link",
-                uri: att.uri,
-                name: att.name,
-                mime_type: att.mimeType,
-                description: null,
-              }
-        embeddedPayloadsRef.current.set(refUri, block)
-        chain = chain
-          .insertReference({
-            refType: "file",
-            id: refUri,
-            label: att.name,
-            uri: refUri,
-            meta: { fileKind: "file" },
-          })
-          .insertContent(" ")
-      }
-      chain.run()
-    },
-    []
-  )
 
   // One-time hydration once the editor is ready: a queue-edit payload, else a v2
   // draft document (or a legacy v1 Markdown draft migrated forward). Guarded so
@@ -1050,17 +768,6 @@ export function MessageInput({
     return () => cancelAnimationFrame(raf)
   }, [skillPrefix, composerReady])
 
-  const setDragActiveIfChanged = useCallback((next: boolean) => {
-    if (dragActiveRef.current === next) return
-    dragActiveRef.current = next
-    setIsDragActive(next)
-  }, [])
-
-  const syncComposerEmpty = useCallback(() => {
-    const ed = editorRef.current?.getEditor()
-    setComposerEmpty(ed ? isComposerEmpty(ed) : true)
-  }, [])
-
   const handleComposerChange = useCallback(() => {
     syncComposerEmpty()
     scheduleDraftSave()
@@ -1099,21 +806,7 @@ export function MessageInput({
   const hasFolderBranchPicker =
     useConversationFolderBranchPickerVisible(attachmentTabId)
   const folderBranchPickerAttached = hasFolderBranchPicker
-  const imageAttachments = useMemo(
-    () =>
-      attachments.filter(
-        (attachment): attachment is ImageInputAttachment =>
-          attachment.type === "image"
-      ),
-    [attachments]
-  )
-  const previewAttachment = useMemo(
-    () =>
-      previewAttachmentId
-        ? (imageAttachments.find((a) => a.id === previewAttachmentId) ?? null)
-        : null,
-    [previewAttachmentId, imageAttachments]
-  )
+  const imageAttachments = attach.imageAttachments
   const hasAttachments = attachments.length > 0
   const hasSendableContent = !composerEmpty || hasAttachments
 
@@ -1137,34 +830,6 @@ export function MessageInput({
     () => availableCommands ?? [],
     [availableCommands]
   )
-  const [slashDropdownOpen, setSlashDropdownOpen] = useState(false)
-  const [slashDropdownSearch, setSlashDropdownSearch] = useState("")
-  const slashDropdownInputRef = useRef<HTMLInputElement>(null)
-  const filteredSlashDropdownCommands = useMemo(
-    () =>
-      rankByTextMatch(
-        slashDropdownSearch,
-        slashCommands,
-        (cmd) => cmd.name,
-        (cmd) => cmd.description
-      ),
-    [slashCommands, slashDropdownSearch]
-  )
-  const handleSlashDropdownOpenChange = useCallback((open: boolean) => {
-    setSlashDropdownOpen(open)
-    if (!open) setSlashDropdownSearch("")
-  }, [])
-  // Radix's MenuSubContent hardcodes its own onOpenAutoFocus that overwrites
-  // any prop we pass in (see @radix-ui/react-menu MenuSubContent). To put the
-  // search input in focus when the slash submenu opens, defer focus to a
-  // microtask after Radix finishes its own focus dance.
-  useEffect(() => {
-    if (!slashDropdownOpen) return
-    const id = requestAnimationFrame(() => {
-      slashDropdownInputRef.current?.focus()
-    })
-    return () => cancelAnimationFrame(id)
-  }, [slashDropdownOpen])
   const filteredSlashCommands = useMemo(() => {
     if (!slashMenuOpen || slashCommands.length === 0) return []
     if (slashTriggerChar !== "/") return []
@@ -1258,796 +923,6 @@ export function MessageInput({
     detectSlashTriggerRef.current = detectSlashTrigger
   }, [detectSlashTrigger])
 
-  // Insert one inline file reference badge per item, matching `@`-file mentions.
-  // A genuine `file://` item uses its uri directly (deduped against the document);
-  // an item carrying a `realBlock` (embedded bytes / `data:` link) gets an inert
-  // `codeg://embedded/…` display uri and its block is stashed in
-  // `embeddedPayloadsRef` for send-time reconciliation. Badges append at the doc
-  // end by default; pass `atCaret` to drop them at the composer's current caret
-  // (`focus()` keeps the retained selection even while the input is blurred —
-  // e.g. focus sits in the file editor), so "add to chat" lands a reference
-  // where the user left off instead of always at the end.
-  const insertFileReferences = useCallback(
-    (
-      items: Array<{
-        name: string
-        uri?: string
-        realBlock?: PromptInputBlock
-      }>,
-      opts: { atCaret?: boolean } = {}
-    ) => {
-      if (items.length === 0) return
-      const editor = editorRef.current?.getEditor()
-      if (!editor) return
-      const seen = new Set<string>()
-      let chain = opts.atCaret
-        ? editor.chain().focus()
-        : editor.chain().focus("end")
-      let inserted = 0
-      for (const item of items) {
-        let refUri: string
-        if (item.realBlock) {
-          refUri = buildEmbeddedReferenceUri()
-          embeddedPayloadsRef.current.set(refUri, item.realBlock)
-        } else {
-          if (!item.uri) continue
-          refUri = item.uri
-          if (seen.has(refUri) || editorHasFileReference(editor, refUri))
-            continue
-          seen.add(refUri)
-        }
-        chain = chain
-          .insertReference({
-            refType: "file",
-            id: refUri,
-            label: item.name,
-            uri: refUri,
-            meta: { fileKind: "file" },
-          })
-          .insertContent(" ")
-        inserted++
-      }
-      if (inserted > 0) chain.run()
-    },
-    []
-  )
-
-  const appendResourceLinks = useCallback(
-    (
-      links: Array<{
-        uri: string
-        name: string
-        mimeType: string | null
-        dedupeKey: string
-      }>,
-      opts: { atCaret?: boolean } = {}
-    ) => {
-      // `file://` links the agent can read directly become inline file badges
-      // (uri used as-is); a non-fetchable `data:` link keeps its real block out
-      // of band behind a sentinel badge.
-      insertFileReferences(
-        links
-          .filter((link) => link.uri)
-          .map((link) =>
-            link.uri.toLowerCase().startsWith("file://")
-              ? { name: link.name, uri: link.uri }
-              : {
-                  name: link.name,
-                  realBlock: {
-                    type: "resource_link" as const,
-                    uri: link.uri,
-                    name: link.name,
-                    mime_type: link.mimeType,
-                    description: null,
-                  },
-                }
-          ),
-        opts
-      )
-    },
-    [insertFileReferences]
-  )
-
-  const appendResourceAttachments = useCallback(
-    (paths: string[], opts: { atCaret?: boolean } = {}) => {
-      const normalized = paths
-        .filter(
-          (path): path is string => typeof path === "string" && path.length > 0
-        )
-        .map((path) => {
-          const uri = buildFileUri(path)
-          return {
-            uri,
-            name: fileNameFromPath(path),
-            mimeType: mimeTypeFromPath(path),
-            dedupeKey: uri,
-          }
-        })
-      appendResourceLinks(normalized, opts)
-    },
-    [appendResourceLinks]
-  )
-
-  // Attach a single file as a ranged badge (`foo.ts:10-25`), used by the file
-  // editor's "add selection to chat". The line span is encoded into both the
-  // label and the uri fragment (`file://…#L10-25`), so distinct selections of
-  // the same file stay distinct (the uri is the dedupe key in
-  // `insertFileReferences`) and the range rides along to the agent in the
-  // serialized `[label](uri)` link.
-  const appendFileRangeAttachment = useCallback(
-    (
-      path: string,
-      range: { start: number; end: number },
-      opts: { atCaret?: boolean } = {}
-    ) => {
-      if (!path) return
-      insertFileReferences(
-        [
-          {
-            name: formatFileRangeLabel(fileNameFromPath(path), range),
-            uri: buildFileUriWithRange(path, range),
-          },
-        ],
-        opts
-      )
-    },
-    [insertFileReferences]
-  )
-
-  // Shared upload pool used by the menu's "Upload local file" button,
-  // browser drag-drop in web mode, paste in web mode, and the fallback
-  // path of `appendFilesAsResources` for remote-desktop. Splits oversize
-  // from acceptable, runs uploads with bounded concurrency, surfaces
-  // failures via toast, and finally appends the successful paths as
-  // ResourceLinks. Returns nothing — all state changes happen via the
-  // existing setters / toast.
-  const uploadAndAppendFiles = useCallback(
-    async (files: File[]) => {
-      if (files.length === 0) return
-      const oversized = files.filter((f) => f.size > UPLOAD_MAX_BYTES)
-      const accepted = files.filter((f) => f.size <= UPLOAD_MAX_BYTES)
-      const limitMb = Math.round(UPLOAD_MAX_BYTES / (1024 * 1024))
-      if (oversized.length > 0) {
-        toast.error(
-          tAttach("attachUploadTooLarge", {
-            limit: limitMb,
-            names: oversized.map((f) => f.name).join(", "),
-          })
-        )
-      }
-      if (accepted.length === 0) return
-
-      // Concurrent uploads — one failure doesn't block the rest. Cap at 3:
-      // small enough to keep server load predictable, large enough to feel
-      // responsive for a handful of files.
-      const uploaded: string[] = []
-      const failed: Array<{ name: string; reason: unknown }> = []
-      const quotaRejected: string[] = []
-      const CONCURRENCY = 3
-      let cursor = 0
-      const workers = Array.from(
-        { length: Math.min(CONCURRENCY, accepted.length) },
-        async () => {
-          while (cursor < accepted.length) {
-            const idx = cursor++
-            const file = accepted[idx]
-            try {
-              const r = await uploadAttachment(file, attachmentTabId ?? null)
-              uploaded.push(r.path)
-            } catch (error) {
-              if (isEmptyAttachmentError(error)) {
-                // Empty files are explicitly dropped on the floor — log
-                // and move on without a user-facing error toast.
-                console.warn(
-                  `[MessageInput] skipping empty attachment: ${file.name}`
-                )
-                continue
-              }
-              const appError = extractAppCommandError(error)
-              if (appError?.i18n_key === UPLOAD_I18N_KEY_QUOTA_EXCEEDED) {
-                quotaRejected.push(file.name)
-                continue
-              }
-              failed.push({ name: file.name, reason: error })
-            }
-          }
-        }
-      )
-      await Promise.all(workers)
-
-      if (quotaRejected.length > 0) {
-        toast.error(
-          tAttach("attachUploadQuotaExceeded", {
-            names: quotaRejected.join(", "),
-          })
-        )
-      }
-      if (failed.length > 0) {
-        for (const f of failed) {
-          console.error(
-            `[MessageInput] upload attachment failed (${f.name}):`,
-            f.reason
-          )
-        }
-        toast.error(
-          tAttach("attachUploadFailed", {
-            names: failed.map((r) => r.name).join(", "),
-          })
-        )
-      }
-      if (uploaded.length > 0) {
-        appendResourceAttachments(uploaded)
-      }
-    },
-    [appendResourceAttachments, attachmentTabId, tAttach]
-  )
-
-  const appendEmbeddedResources = useCallback(
-    (
-      resources: Array<{
-        uri: string
-        name: string
-        mimeType: string | null
-        text?: string | null
-        blob?: string | null
-      }>
-    ) => {
-      // Inline bytes (no real path): each becomes a sentinel file badge whose
-      // embedded `resource` block is reconciled back in at send time.
-      insertFileReferences(
-        resources.map((resource) => ({
-          name: resource.name,
-          realBlock: {
-            type: "resource" as const,
-            uri: resource.uri,
-            mime_type: resource.mimeType,
-            text: resource.text ?? null,
-            blob: resource.blob ?? null,
-          },
-        }))
-      )
-    },
-    [insertFileReferences]
-  )
-
-  // Path-less files (browser `File` objects: drag-drop in web mode, paste,
-  // or `<input type=file>` in any mode) need a real backing path before
-  // the agent can read them. Only the truly local desktop keeps the legacy
-  // base64/embedded fallback — web and remote-desktop both push through
-  // `uploadAndAppendFiles` so the resulting ResourceLink points at a real
-  // server-side file.
-  const appendFilesAsResources = useCallback(
-    async (files: File[]) => {
-      if (files.length === 0) return
-      const pathLinks: Array<{
-        uri: string
-        name: string
-        mimeType: string | null
-        dedupeKey: string
-      }> = []
-      const fallbackDataLinks: Array<{
-        uri: string
-        name: string
-        mimeType: string | null
-        dedupeKey: string
-      }> = []
-      const embeddedResources: Array<{
-        uri: string
-        name: string
-        mimeType: string | null
-        text?: string | null
-        blob?: string | null
-      }> = []
-      const uploadCandidates: File[] = []
-
-      for (const file of files) {
-        const path = getFilePath(file)
-        const name = file.name || `resource-${randomUUID()}`
-        const mimeType = file.type || mimeTypeFromPath(name)
-        if (path) {
-          const uri = buildFileUri(path)
-          pathLinks.push({
-            uri,
-            name: fileNameFromPath(path),
-            mimeType: mimeTypeFromPath(path) ?? mimeType ?? null,
-            dedupeKey: uri,
-          })
-          continue
-        }
-
-        if (!showNativePaperclip) {
-          uploadCandidates.push(file)
-          continue
-        }
-
-        if (!promptCapabilities.embedded_context) {
-          const base64 = await blobToBase64(file)
-          const dataUri = buildDataUri(base64, mimeType ?? null)
-          fallbackDataLinks.push({
-            uri: dataUri,
-            name,
-            mimeType: mimeType ?? null,
-            dedupeKey: `${name}:${file.size}:${file.lastModified}`,
-          })
-          continue
-        }
-
-        const uri = buildClipboardResourceUri(name)
-        if (isTextLikeFile(file)) {
-          const textContent = await file.text()
-          embeddedResources.push({
-            uri,
-            name,
-            mimeType: mimeType ?? null,
-            text: textContent,
-          })
-        } else {
-          const blobContent = await blobToBase64(file)
-          embeddedResources.push({
-            uri,
-            name,
-            mimeType: mimeType ?? null,
-            blob: blobContent,
-          })
-        }
-      }
-
-      appendResourceLinks(pathLinks)
-      appendResourceLinks(fallbackDataLinks)
-      appendEmbeddedResources(embeddedResources)
-      if (uploadCandidates.length > 0) {
-        await uploadAndAppendFiles(uploadCandidates)
-      }
-    },
-    [
-      appendEmbeddedResources,
-      appendResourceLinks,
-      promptCapabilities.embedded_context,
-      showNativePaperclip,
-      uploadAndAppendFiles,
-    ]
-  )
-
-  const appendImageAttachments = useCallback(
-    async (files: File[]) => {
-      if (files.length === 0) return
-      // Web / remote-workspace mode: the prompt request runs through the
-      // HTTP API, whose body must stay small (axum's 2 MiB default limit —
-      // a couple of inline base64 screenshots would 413 the send). Stream
-      // the bytes through the upload endpoint instead; the base64 stays
-      // local for the thumbnail and the transport strips it from the sent
-      // block (`stripUploadedImagePayloads`), leaving the server to
-      // re-inline the bytes from the uploaded file (`prompt_hydration`).
-      // Desktop-local mode keeps the inline path — Tauri IPC has no body
-      // limit and the workspace has no uploads dir.
-      const uploadImages = !showNativePaperclip
-
-      const oversized = uploadImages
-        ? files.filter((f) => f.size > UPLOAD_MAX_BYTES)
-        : []
-      if (oversized.length > 0) {
-        toast.error(
-          tAttach("attachUploadTooLarge", {
-            limit: Math.round(UPLOAD_MAX_BYTES / (1024 * 1024)),
-            names: oversized.map((f) => f.name).join(", "),
-          })
-        )
-      }
-      const accepted = files.filter((file) => {
-        if (uploadImages && file.size > UPLOAD_MAX_BYTES) return false
-        if (uploadImages && file.size === 0) {
-          // Matches `uploadAttachment`'s EmptyAttachmentError semantics:
-          // dropped silently, no toast, no broken thumbnail.
-          console.warn(
-            `[MessageInput] skipping empty image attachment: ${file.name}`
-          )
-          return false
-        }
-        return true
-      })
-      if (accepted.length === 0) return
-
-      const parsed = await Promise.all(
-        accepted.map(async (file, index) => {
-          const mimeType =
-            file.type && file.type.startsWith("image/")
-              ? file.type
-              : (mimeTypeFromPath(file.name) ?? "image/png")
-          const base64Data = await blobToBase64(file)
-          return {
-            attachment: {
-              id: `image:${Date.now()}:${index}:${randomUUID()}`,
-              type: "image" as const,
-              data: base64Data,
-              uri: null,
-              name: file.name || `image-${Date.now()}-${index + 1}`,
-              mimeType,
-              ...(uploadImages ? { uploading: true } : {}),
-            },
-            file,
-          }
-        })
-      )
-      // Thumbnails appear immediately; uploads settle in the background and
-      // flip `uploading` off (send is gated on that in `handleSend`).
-      setAttachments((prev) => [...prev, ...parsed.map((p) => p.attachment)])
-      if (!uploadImages) return
-
-      const failed: Array<{ name: string; reason: unknown }> = []
-      const quotaRejected: string[] = []
-      const CONCURRENCY = 3
-      let cursor = 0
-      const workers = Array.from(
-        { length: Math.min(CONCURRENCY, parsed.length) },
-        async () => {
-          while (cursor < parsed.length) {
-            const idx = cursor++
-            const { attachment, file } = parsed[idx]
-            try {
-              const r = await uploadAttachment(file, attachmentTabId ?? null)
-              const uri = buildFileUri(r.path)
-              setAttachments((prev) =>
-                prev.map((a) =>
-                  a.id === attachment.id ? { ...a, uri, uploading: false } : a
-                )
-              )
-            } catch (error) {
-              setAttachments((prev) =>
-                prev.filter((a) => a.id !== attachment.id)
-              )
-              if (isEmptyAttachmentError(error)) {
-                console.warn(
-                  `[MessageInput] skipping empty image attachment: ${attachment.name}`
-                )
-                continue
-              }
-              const appError = extractAppCommandError(error)
-              if (appError?.i18n_key === UPLOAD_I18N_KEY_QUOTA_EXCEEDED) {
-                quotaRejected.push(attachment.name)
-                continue
-              }
-              failed.push({ name: attachment.name, reason: error })
-            }
-          }
-        }
-      )
-      await Promise.all(workers)
-
-      if (quotaRejected.length > 0) {
-        toast.error(
-          tAttach("attachUploadQuotaExceeded", {
-            names: quotaRejected.join(", "),
-          })
-        )
-      }
-      if (failed.length > 0) {
-        for (const f of failed) {
-          console.error(
-            `[MessageInput] image upload failed (${f.name}):`,
-            f.reason
-          )
-        }
-        toast.error(
-          tAttach("attachUploadFailed", {
-            names: failed.map((r) => r.name).join(", "),
-          })
-        )
-      }
-    },
-    [showNativePaperclip, attachmentTabId, tAttach]
-  )
-
-  const appendImagePathAttachments = useCallback(
-    async (paths: string[]) => {
-      if (paths.length === 0 || !canAttachImages) return
-      const settled = await Promise.allSettled(
-        paths.map(async (path, index) => {
-          const data = await readFileBase64(path, DRAG_DROP_IMAGE_MAX_BYTES)
-          return {
-            id: `image:${Date.now()}:${index}:${randomUUID()}`,
-            type: "image" as const,
-            data,
-            uri: buildFileUri(path),
-            name: fileNameFromPath(path),
-            mimeType: mimeTypeFromPath(path) ?? "image/png",
-          }
-        })
-      )
-
-      const parsed: ImageInputAttachment[] = []
-      settled.forEach((result, index) => {
-        if (result.status === "fulfilled") {
-          parsed.push(result.value)
-          return
-        }
-        console.error(
-          `[MessageInput] drop image path failed (${paths[index]}):`,
-          result.reason
-        )
-      })
-      if (parsed.length === 0) return
-      setAttachments((prev) => [...prev, ...parsed])
-    },
-    [canAttachImages]
-  )
-
-  const appendPathsFromDrop = useCallback(
-    async (paths: string[]) => {
-      if (paths.length === 0) return
-      const normalized = paths.filter(
-        (path): path is string => typeof path === "string" && path.length > 0
-      )
-      if (normalized.length === 0) return
-
-      const imagePaths: string[] = []
-      const resourcePaths: string[] = []
-      for (const path of normalized) {
-        const mimeType = mimeTypeFromPath(path) ?? ""
-        if (canAttachImages && mimeType.startsWith("image/")) {
-          imagePaths.push(path)
-        } else {
-          resourcePaths.push(path)
-        }
-      }
-
-      if (imagePaths.length > 0) {
-        await appendImagePathAttachments(imagePaths)
-      }
-      if (resourcePaths.length > 0) {
-        appendResourceAttachments(resourcePaths)
-      }
-    },
-    [appendImagePathAttachments, appendResourceAttachments, canAttachImages]
-  )
-
-  const appendPathsFromDropRef = useRef(appendPathsFromDrop)
-  useEffect(() => {
-    appendPathsFromDropRef.current = appendPathsFromDrop
-  }, [appendPathsFromDrop])
-
-  // Remote-workspace counterpart of `appendPathsFromDrop`. Reads each
-  // local path through Rust, ships the bytes via the upload proxy, then
-  // appends the resulting server-side paths as ResourceLinks. Failures
-  // (oversize, ENOENT, network) are reported in a single aggregated toast
-  // matching `uploadAndAppendFiles`.
-  const uploadPathsToRemote = useCallback(
-    async (paths: string[]) => {
-      const normalized = paths.filter(
-        (p): p is string => typeof p === "string" && p.length > 0
-      )
-      if (normalized.length === 0) return
-
-      const limitMb = Math.round(UPLOAD_MAX_BYTES / (1024 * 1024))
-      const succeeded: string[] = []
-      const failed: Array<{ name: string; reason: unknown }> = []
-      const oversize: string[] = []
-      const directories: string[] = []
-      const quotaRejected: string[] = []
-      const imageAttachmentsToAdd: ImageInputAttachment[] = []
-
-      const CONCURRENCY = 3
-      let cursor = 0
-      const workers = Array.from(
-        { length: Math.min(CONCURRENCY, normalized.length) },
-        async () => {
-          while (cursor < normalized.length) {
-            const idx = cursor++
-            const path = normalized[idx]
-            const name = path.split(/[/\\]/).pop() || path
-            try {
-              const r = await uploadLocalPathToRemote(
-                path,
-                attachmentTabId ?? null
-              )
-              // A dropped image keeps its image-ness: attach it as a
-              // thumbnail whose uri is the uploaded server-side file, so the
-              // agent receives a real image block (hydrated server-side)
-              // instead of a ResourceLink it may never open. The local path
-              // is only readable on THIS desktop — the thumbnail preview
-              // reads it via local IPC; the remote agent reads the upload.
-              const mimeType = r.mimeType ?? mimeTypeFromPath(name) ?? ""
-              if (canAttachImages && mimeType.startsWith("image/")) {
-                const previewData = await readLocalFileBase64(
-                  path,
-                  UPLOAD_MAX_BYTES
-                )
-                imageAttachmentsToAdd.push({
-                  id: `image:${Date.now()}:${idx}:${randomUUID()}`,
-                  type: "image",
-                  data: previewData,
-                  uri: buildFileUri(r.path),
-                  name,
-                  mimeType,
-                })
-                continue
-              }
-              succeeded.push(r.path)
-            } catch (error) {
-              if (isEmptyAttachmentError(error)) {
-                console.warn(
-                  `[MessageInput] skipping empty remote-drop attachment: ${name}`
-                )
-                continue
-              }
-              // The Rust side tags structured upload errors with an
-              // `i18n_key` (see `app_error::UPLOAD_I18N_KEY_*`); branch
-              // on the key so each user-visible category lands in its own
-              // toast instead of the generic "upload failed" bucket.
-              // Falling back to the bare message would couple us to the
-              // exact English phrasing in `remote_proxy.rs`.
-              const appError = extractAppCommandError(error)
-              const i18nKey = appError?.i18n_key ?? null
-              if (i18nKey === UPLOAD_I18N_KEY_TOO_LARGE) {
-                oversize.push(name)
-              } else if (i18nKey === UPLOAD_I18N_KEY_NOT_A_FILE) {
-                // Dragging a directory or a special file (FIFO, device
-                // node) lands here. The Rust guard short-circuits before
-                // we even read bytes; surface a dedicated toast so the
-                // user understands why nothing was attached.
-                directories.push(name)
-              } else if (i18nKey === UPLOAD_I18N_KEY_QUOTA_EXCEEDED) {
-                quotaRejected.push(name)
-              } else {
-                failed.push({ name, reason: error })
-              }
-            }
-          }
-        }
-      )
-      await Promise.all(workers)
-
-      if (oversize.length > 0) {
-        toast.error(
-          tAttach("attachUploadTooLarge", {
-            limit: limitMb,
-            names: oversize.join(", "),
-          })
-        )
-      }
-      if (directories.length > 0) {
-        toast.error(
-          tAttach("attachUploadNotAFile", {
-            names: directories.join(", "),
-          })
-        )
-      }
-      if (quotaRejected.length > 0) {
-        toast.error(
-          tAttach("attachUploadQuotaExceeded", {
-            names: quotaRejected.join(", "),
-          })
-        )
-      }
-      if (failed.length > 0) {
-        for (const f of failed) {
-          console.error(
-            `[MessageInput] remote path upload failed (${f.name}):`,
-            f.reason
-          )
-        }
-        toast.error(
-          tAttach("attachUploadFailed", {
-            names: failed.map((f) => f.name).join(", "),
-          })
-        )
-      }
-      if (imageAttachmentsToAdd.length > 0) {
-        setAttachments((prev) => [...prev, ...imageAttachmentsToAdd])
-      }
-      if (succeeded.length > 0) {
-        appendResourceAttachments(succeeded)
-      }
-    },
-    [appendResourceAttachments, attachmentTabId, canAttachImages, tAttach]
-  )
-
-  const uploadPathsToRemoteRef = useRef(uploadPathsToRemote)
-  useEffect(() => {
-    uploadPathsToRemoteRef.current = uploadPathsToRemote
-  }, [uploadPathsToRemote])
-
-  const appendFilesFromInput = useCallback(
-    async (files: File[]) => {
-      if (files.length === 0) return
-      const imageFiles: File[] = []
-      const resourceFiles: File[] = []
-      for (const file of files) {
-        const mimeType = file.type || mimeTypeFromPath(file.name) || ""
-        if (canAttachImages && mimeType.startsWith("image/")) {
-          imageFiles.push(file)
-        } else {
-          resourceFiles.push(file)
-        }
-      }
-
-      if (imageFiles.length > 0) {
-        await appendImageAttachments(imageFiles)
-      }
-      if (resourceFiles.length > 0) {
-        await appendFilesAsResources(resourceFiles)
-      }
-    },
-    [appendFilesAsResources, appendImageAttachments, canAttachImages]
-  )
-
-  // Routed from RichComposer's `onPasteFiles`. Returns true when the paste was
-  // consumed as an attachment (so the editor doesn't also insert it as text).
-  const handlePasteFiles = useCallback(
-    (event: ClipboardEvent): boolean => {
-      if (disabled) return false
-      // The context-menu "Paste" drives text through `view.pasteText`, which
-      // runs this handler with a synthetic `new ClipboardEvent("paste")` whose
-      // `clipboardData` is null. There's nothing to attach from it (and the
-      // image fallback below would otherwise fire a stray async clipboard read),
-      // so let the editor's own text paste proceed. Real pastes always carry a
-      // (non-null) DataTransfer, so this never short-circuits a genuine paste.
-      if (!event.clipboardData) return false
-      const files = filesFromClipboard(event.clipboardData)
-      if (files.length > 0) {
-        void appendFilesFromInput(files).catch((error) => {
-          console.error("[MessageInput] paste files failed:", error)
-        })
-        return true
-      }
-
-      // Linux/Tauri (WebKitGTK) fallback: screenshot tools (e.g. WeChat) write
-      // the image to the clipboard in a form the synchronous DataTransfer API
-      // can't read, so retry through the async Clipboard API. Only for a pure-
-      // image clipboard — when text is present we let the default paste run
-      // (mirroring `filesFromClipboard`) so copying a spreadsheet cell or rich
-      // web content isn't hijacked into an image attachment. Kept synchronous
-      // so `imageFilesFromClipboardApi` runs inside the paste user gesture.
-      if (clipboardHasText(event.clipboardData)) return false
-      void imageFilesFromClipboardApi()
-        .then((imageFiles) => {
-          if (imageFiles.length === 0) return
-          return appendFilesFromInput(imageFiles)
-        })
-        .catch((error) => {
-          console.error("[MessageInput] clipboard image paste failed:", error)
-        })
-      // The default paste of a textless clipboard is a no-op, so don't claim it.
-      return false
-    },
-    [appendFilesFromInput, disabled]
-  )
-
-  // Insert an inline file reference for a file-tree entry dropped onto the
-  // composer, placing the caret at the drop point first so the badge lands where
-  // the user released (native-textarea feel). Shared by the editor-level drop
-  // (`onDropFiles`) and the container-chrome drop (`handleContainerDrop`).
-  const insertTreeDropAtPoint = useCallback(
-    (absPath: string, clientX: number, clientY: number) => {
-      editorRef.current?.focusAtCoords(clientX, clientY)
-      appendResourceAttachments([absPath], { atCaret: true })
-    },
-    [appendResourceAttachments]
-  )
-
-  // Routed from RichComposer's `onDropFiles` (ProseMirror's `handleDrop`).
-  // Consumes a file-tree drag so PM does not insert the drag's `text/plain`
-  // absolute-path fallback as literal text, and stops propagation so the
-  // container's own drop handler doesn't double-insert. Returns false for every
-  // other drop (OS files, editor text moves) so existing behavior is untouched.
-  const handleEditorDrop = useCallback(
-    (event: DragEvent): boolean => {
-      if (disabled) return false
-      if (!hasFileTreeDragType(event.dataTransfer)) return false
-      const payload = readFileTreeDragPayload(event.dataTransfer)
-      if (!payload) return false
-      event.preventDefault()
-      event.stopPropagation()
-      // `stopPropagation` keeps the container's `onDrop` from double-inserting,
-      // but that handler is also what clears the drag overlay — and a completed
-      // drop doesn't reliably emit `dragleave`. Clear it here so the overlay
-      // can't get stuck covering the composer.
-      setDragActiveIfChanged(false)
-      insertTreeDropAtPoint(payload.absPath, event.clientX, event.clientY)
-      return true
-    },
-    [disabled, insertTreeDropAtPoint, setDragActiveIfChanged]
-  )
-
   useEffect(() => {
     if (!showModeSelector) return
     if (!effectiveModeId || !onModeChange) return
@@ -2126,231 +1001,6 @@ export function MessageInput({
     [replaceTriggerWithReference, skillPrefix]
   )
 
-  // The "+" → Slash commands picker inserts a command badge at the current caret
-  // (no trigger token to replace), adding a leading space if the caret isn't at
-  // a boundary, and a trailing space after.
-  const handleSlashPopoverSelect = useCallback((cmd: AvailableCommandInfo) => {
-    const editor = editorRef.current?.getEditor()
-    if (!editor) return
-    const { $from } = editor.state.selection
-    const charBefore =
-      $from.parentOffset > 0
-        ? $from.parent.textBetween(
-            $from.parentOffset - 1,
-            $from.parentOffset,
-            undefined,
-            " "
-          )
-        : ""
-    const needsSpace = charBefore !== "" && !/\s/.test(charBefore)
-    let chain = editor.chain().focus()
-    if (needsSpace) chain = chain.insertContent(" ")
-    chain.insertReference(commandToReference(cmd)).insertContent(" ").run()
-  }, [])
-
-  // ── "+" menu skill shortcuts (experts / daily office / research) ──
-  //
-  // Surface the welcome-page skill families inside an active conversation. Each
-  // item drops that skill's leading invocation badge into the composer. A skill
-  // not linked to the current agent is "locked": clicking it surfaces a hint
-  // (and a jump to Settings) instead of injecting a badge the agent can't act on
-  // — the same gating QuickActions applies, to avoid a wasted send.
-  const expertsSorted = useMemo(
-    () =>
-      [...experts].sort(
-        (a, b) =>
-          (a.metadata.sort_order ?? 0) - (b.metadata.sort_order ?? 0) ||
-          a.metadata.id.localeCompare(b.metadata.id)
-      ),
-    [experts]
-  )
-
-  const scienceSorted = useMemo(
-    () =>
-      [...science].sort(
-        (a, b) =>
-          (a.metadata.sort_order ?? 0) - (b.metadata.sort_order ?? 0) ||
-          a.metadata.id.localeCompare(b.metadata.id)
-      ),
-    [science]
-  )
-
-  const isSkillLocked = useCallback(
-    (id: string) => !!agentType && skillStatusReady && !enabledIds.has(id),
-    [agentType, skillStatusReady, enabledIds]
-  )
-
-  const notifySkillNotEnabled = useCallback(
-    (skillLabel: string, section: SettingsSection) => {
-      const agentLabel = agentType ? getAgentLabel(agentType) : ""
-      toast.warning(
-        tQa("notEnabled.title", { skill: skillLabel, agent: agentLabel }),
-        {
-          description: tQa("notEnabled.description"),
-          action: {
-            label: tQa("notEnabled.action"),
-            onClick: () => {
-              void openSettingsWindow(section).catch((err) =>
-                console.error("[MessageInput] failed to open settings:", err)
-              )
-            },
-          },
-        }
-      )
-    },
-    [agentType, tQa]
-  )
-
-  // Insert a skill shortcut: seed the template only into an *empty* composer
-  // (never clobber an in-progress draft), then prepend the skill as the leading
-  // invocation badge. Deferred to the next frame — inserting the badge mounts a
-  // React NodeView rendered with a synchronous flushSync(), which warns if run
-  // during React's commit phase (same pattern as the inject/hydration effects).
-  const insertSkillShortcut = useCallback(
-    (skill: { id: string; label: string }, template: string) => {
-      requestAnimationFrame(() => {
-        const handle = editorRef.current
-        const editor = handle?.getEditor()
-        if (!handle || !editor) return
-        if (template && isComposerEmpty(editor)) {
-          handle.setText(template)
-        }
-        applyExpertReference(editor, {
-          refType: "skill",
-          id: skill.id,
-          label: skill.label,
-          uri: null,
-          meta: { invocationPrefix: skillPrefix, scope: "expert" },
-        })
-        syncComposerEmpty()
-        handle.focus()
-      })
-    },
-    [skillPrefix, syncComposerEmpty]
-  )
-
-  const handleExpertShortcut = useCallback(
-    (item: ExpertListItem) => {
-      const label =
-        pickLocalized(item.metadata.display_name, locale) || item.metadata.id
-      if (isSkillLocked(item.metadata.id)) {
-        notifySkillNotEnabled(label, "experts")
-        return
-      }
-      // Experts are open-ended: just the leading badge, no canned template.
-      insertSkillShortcut({ id: item.metadata.id, label }, "")
-    },
-    [locale, isSkillLocked, notifySkillNotEnabled, insertSkillShortcut]
-  )
-
-  const handleOfficeShortcut = useCallback(
-    (action: OfficeAction) => {
-      const label = tQa(action.id as Parameters<typeof tQa>[0])
-      if (isSkillLocked(action.skillId)) {
-        notifySkillNotEnabled(label, "office-tools")
-        return
-      }
-      insertSkillShortcut(
-        { id: action.skillId, label },
-        tQa(action.promptKey as Parameters<typeof tQa>[0])
-      )
-    },
-    [tQa, isSkillLocked, notifySkillNotEnabled, insertSkillShortcut]
-  )
-
-  const handleScienceShortcut = useCallback(
-    (item: ScienceListItem) => {
-      const label =
-        pickLocalized(item.metadata.display_name, locale) || item.metadata.id
-      if (isSkillLocked(item.metadata.id)) {
-        notifySkillNotEnabled(label, "science")
-        return
-      }
-      // Science skills are open-ended methodologies: just the leading badge,
-      // no canned template (mirrors experts).
-      insertSkillShortcut({ id: item.metadata.id, label }, "")
-    },
-    [locale, isSkillLocked, notifySkillNotEnabled, insertSkillShortcut]
-  )
-
-  const handlePickFiles = useCallback(async () => {
-    if (disabled) return
-    // Only wired up when `showNativePaperclip` is true (i.e. local desktop),
-    // so we can hand raw OS paths to the local agent without a round-trip.
-    try {
-      const selected = await openFileDialog({
-        multiple: true,
-        directory: false,
-        defaultPath,
-      })
-      if (!selected) return
-      const picked = Array.isArray(selected) ? selected : [selected]
-      appendResourceAttachments(picked.filter((item): item is string => !!item))
-    } catch (error) {
-      console.error("[MessageInput] pick files failed:", error)
-    }
-  }, [appendResourceAttachments, defaultPath, disabled])
-
-  const [serverFilePickerOpen, setServerFilePickerOpen] = useState(false)
-
-  const handleUploadLocalFiles = useCallback(async () => {
-    if (disabled) return
-    // Open a hidden <input type="file"> to grab File objects (browsers and
-    // Tauri webviews both produce blob-style File objects from this control,
-    // never raw OS paths), then upload each one — `uploadAttachment` picks
-    // the right transport (direct fetch in web mode, IPC-proxied multipart
-    // in remote-desktop mode).
-    const input = document.createElement("input")
-    input.type = "file"
-    input.multiple = true
-    input.onchange = async () => {
-      const all = input.files ? Array.from(input.files) : []
-      // Route through the shared classifier so images become thumbnail
-      // attachments (uploaded, then re-inlined server-side) instead of
-      // degrading to plain ResourceLinks; non-images keep the existing
-      // upload → ResourceLink path via `appendFilesAsResources`.
-      await appendFilesFromInput(all)
-    }
-    input.click()
-  }, [disabled, appendFilesFromInput])
-
-  const handleServerFilesSelected = useCallback(
-    (paths: string[]) => {
-      if (paths.length === 0) return
-      appendResourceAttachments(paths)
-    },
-    [appendResourceAttachments]
-  )
-
-  const loadQuickMessages = useCallback(async () => {
-    setQuickMessagesLoading(true)
-    try {
-      const list = await quickMessagesList()
-      setQuickMessages(list)
-    } catch (error) {
-      console.error("[MessageInput] load quick messages failed:", error)
-    } finally {
-      setQuickMessagesLoading(false)
-    }
-  }, [])
-
-  const handleAddMenuOpenChange = useCallback(
-    (open: boolean) => {
-      if (!open) return
-      // The editor keeps its selection while the menu is open, so a quick
-      // message inserts back at the same caret without tracking an offset.
-      loadQuickMessages().catch((error) => {
-        console.error("[MessageInput] quick messages refresh failed:", error)
-      })
-    },
-    [loadQuickMessages]
-  )
-
-  const handleQuickMessageSelect = useCallback((message: QuickMessage) => {
-    if (!message.content) return
-    editorRef.current?.insertTextAtCursor(message.content)
-  }, [])
-
   // Plain-text rendering of the editor's current selection, for the right-click
   // Cut/Copy. Read straight from ProseMirror state (stable while the radix menu
   // holds DOM focus). Uses the same leaf mapping as send serialization
@@ -2410,11 +1060,9 @@ export function MessageInput({
       if (!open) return
       const editor = editorRef.current?.getEditor()
       setContextSelectionActive(editor ? !editor.state.selection.empty : false)
-      loadQuickMessages().catch((error) => {
-        console.error("[MessageInput] quick messages refresh failed:", error)
-      })
+      menuShortcuts.refreshQuickMessages()
     },
-    [loadQuickMessages]
+    [menuShortcuts]
   )
 
   // Plain-text ("paste without formatting") paste, shared by the custom
@@ -2455,7 +1103,7 @@ export function MessageInput({
     try {
       const imageFiles = await imageFilesFromClipboardApi()
       if (imageFiles.length > 0) {
-        await appendFilesFromInput(imageFiles)
+        await attach.appendFilesFromInput(imageFiles)
         return
       }
     } catch (error) {
@@ -2468,7 +1116,7 @@ export function MessageInput({
     if (readBlocked) {
       toast.error(t("pasteUnavailable"))
     }
-  }, [disabled, appendFilesFromInput, t])
+  }, [disabled, attach, t])
 
   // Bridges the composer's Ctrl/⌘+Shift+V key to the plain-text paste above.
   // Returns whether the shortcut was consumed: when disabled or when the async
@@ -2495,9 +1143,9 @@ export function MessageInput({
       // Drop the badge at the composer's current caret rather than the end, so
       // "add to chat" / "add file to chat" land where the user left off.
       if (range) {
-        appendFileRangeAttachment(path, range, { atCaret: true })
+        attach.appendFileRangeAttachment(path, range, { atCaret: true })
       } else {
-        appendResourceAttachments([path], { atCaret: true })
+        attach.appendResourceAttachments([path], { atCaret: true })
       }
     }
 
@@ -2505,7 +1153,7 @@ export function MessageInput({
     return () => {
       window.removeEventListener(ATTACH_FILE_TO_SESSION_EVENT, handleAttachFile)
     }
-  }, [appendResourceAttachments, appendFileRangeAttachment, attachmentTabId])
+  }, [attach, attachmentTabId])
 
   useEffect(() => {
     if (!attachmentTabId) return
@@ -2533,132 +1181,6 @@ export function MessageInput({
       window.removeEventListener(APPEND_TEXT_TO_SESSION_EVENT, handleAppendText)
     }
   }, [attachmentTabId])
-
-  useEffect(() => {
-    let cancelled = false
-    const unlisteners: Array<() => void | Promise<void>> = []
-
-    const cleanupListeners = () => {
-      for (const fn of unlisteners.splice(0)) {
-        disposeTauriListener(fn, "MessageInput.dragDrop")
-      }
-    }
-
-    type DragDropPayload =
-      | {
-          type: "enter" | "drop"
-          paths: string[]
-          position: { x: number; y: number }
-        }
-      | {
-          type: "over"
-          position: { x: number; y: number }
-        }
-      | { type: "leave" }
-
-    const handlePayload = (payload: DragDropPayload) => {
-      const host = containerRef.current
-      if (!host) return
-      if (payload.type === "leave") {
-        setDragActiveIfChanged(false)
-        return
-      }
-      const inside = pointWithinElement(payload.position, host)
-      if (payload.type === "drop") {
-        setDragActiveIfChanged(false)
-        if (Date.now() - lastDomDropAtRef.current < 250) return
-        if (!inside || disabledRef.current) return
-        if (getActiveRemoteConnectionId() !== null) {
-          // Remote workspace: local OS paths are unreachable from the
-          // remote agent, so stream the bytes through the upload proxy and
-          // attach the resulting server-side paths instead.
-          void uploadPathsToRemoteRef.current(payload.paths).catch((error) => {
-            console.error(
-              "[MessageInput] remote drag-drop upload failed:",
-              error
-            )
-          })
-          return
-        }
-        void appendPathsFromDropRef.current(payload.paths).catch((error) => {
-          console.error("[MessageInput] drag drop paths failed:", error)
-        })
-        return
-      }
-      setDragActiveIfChanged(inside && !disabledRef.current)
-    }
-
-    const setup = async () => {
-      if (!isDesktop()) return
-      const { getCurrentWebview } = await import("@tauri-apps/api/webview")
-      const { TauriEvent } = await import("@tauri-apps/api/event")
-      const webview = getCurrentWebview()
-      try {
-        const unlistenEnter = await webview.listen<{
-          paths: string[]
-          position: { x: number; y: number }
-        }>(TauriEvent.DRAG_ENTER, (event) => {
-          if (cancelled) return
-          handlePayload({
-            type: "enter",
-            paths: event.payload.paths,
-            position: event.payload.position,
-          })
-        })
-        unlisteners.push(unlistenEnter)
-
-        const unlistenOver = await webview.listen<{
-          position: { x: number; y: number }
-        }>(TauriEvent.DRAG_OVER, (event) => {
-          if (cancelled) return
-          handlePayload({
-            type: "over",
-            position: event.payload.position,
-          })
-        })
-        unlisteners.push(unlistenOver)
-
-        const unlistenDrop = await webview.listen<{
-          paths: string[]
-          position: { x: number; y: number }
-        }>(TauriEvent.DRAG_DROP, (event) => {
-          if (cancelled) return
-          handlePayload({
-            type: "drop",
-            paths: event.payload.paths,
-            position: event.payload.position,
-          })
-        })
-        unlisteners.push(unlistenDrop)
-
-        const unlistenLeave = await webview.listen(
-          TauriEvent.DRAG_LEAVE,
-          () => {
-            if (cancelled) return
-            handlePayload({ type: "leave" })
-          }
-        )
-        unlisteners.push(unlistenLeave)
-      } catch {
-        // Ignore non-Tauri environments.
-      } finally {
-        if (cancelled) {
-          cleanupListeners()
-        }
-      }
-    }
-
-    void setup()
-
-    return () => {
-      cancelled = true
-      cleanupListeners()
-    }
-  }, [setDragActiveIfChanged])
-
-  const removeAttachment = useCallback((id: string) => {
-    setAttachments((prev) => prev.filter((item) => item.id !== id))
-  }, [])
 
   const buildDraft = useCallback((): PromptDraft | null => {
     const editor = editorRef.current?.getEditor()
@@ -2704,31 +1226,25 @@ export function MessageInput({
     if (blocks.length === 0 && attachments.length === 0) return null
 
     // `attachments` holds only images now — files live inline as badges above.
-    // The wire encoding is capability-driven (native `image` block vs embedded
-    // `resource` blob) so an agent that advertises `image: false` but
-    // `embedded_context: true` (e.g. Grok) still receives the bytes it accepts.
-    for (const attachment of attachments) {
-      if (attachment.type === "image") {
-        blocks.push(
-          imageAttachmentToPromptBlock(attachment, promptCapabilities)
-        )
-      }
-    }
+    // The wire encoding is capability-driven inside the hook (native `image`
+    // block vs embedded `resource` blob), so an agent that advertises
+    // `image: false` but `embedded_context: true` (e.g. Grok) still receives
+    // the bytes it accepts.
+    blocks.push(...imagePromptBlocks())
 
     const displayText =
       displayProse ||
       `Attached ${attachments.length} attachment${attachments.length > 1 ? "s" : ""}`
     return { blocks, displayText }
-  }, [attachments, skillPrefix, promptCapabilities])
+  }, [attachments, skillPrefix, imagePromptBlocks, embeddedPayloadsRef])
 
   // Clear the editor + attachments after a send / enqueue / save.
   const resetComposer = useCallback(() => {
     editorRef.current?.clear()
     setComposerEmpty(true)
-    setAttachments([])
-    embeddedPayloadsRef.current.clear()
+    clearAttachments()
     closeSlashMenu()
-  }, [closeSlashMenu])
+  }, [clearAttachments, closeSlashMenu])
 
   const handleSend = useCallback(() => {
     // Access lock first — blocks both send and the disabled+prompting enqueue
@@ -2743,7 +1259,7 @@ export function MessageInput({
     // nothing to hydrate. Block ALL three branches below (send / enqueue /
     // queue-edit save; a queued block is sent verbatim later) until uploads
     // finish. The draft stays intact, so this is a "wait a moment", not a loss.
-    if (attachments.some((a) => a.type === "image" && a.uploading)) {
+    if (hasUploadingImage) {
       toast.error(tAttach("attachUploadInProgress"))
       return
     }
@@ -2772,7 +1288,7 @@ export function MessageInput({
   }, [
     interactionLocked,
     disabled,
-    attachments,
+    hasUploadingImage,
     tAttach,
     buildDraft,
     isEditingQueueItem,
@@ -2792,7 +1308,7 @@ export function MessageInput({
     // Same uploading gate as `handleSend`: a fork-send consumes the draft
     // (and its blocks) immediately, so an unsettled upload would strip to
     // nothing on the wire.
-    if (attachments.some((a) => a.type === "image" && a.uploading)) {
+    if (hasUploadingImage) {
       toast.error(tAttach("attachUploadInProgress"))
       return
     }
@@ -2810,13 +1326,67 @@ export function MessageInput({
   }, [
     interactionLocked,
     onForkSend,
-    attachments,
+    hasUploadingImage,
     tAttach,
     buildDraft,
     effectiveModeId,
     showModeSelector,
     effectiveDraftStorageKey,
     resetComposer,
+  ])
+
+  // Mid-turn "insert into current turn" (native steering). Awaited, unlike
+  // the synchronous send/enqueue/fork paths: the draft clears ONLY once the
+  // backend confirms the injection was recorded — a turn-end race falls back
+  // to the queue (the note is never lost), any other failure keeps the draft
+  // for retry. Steering is text-only: a draft carrying non-text blocks (file
+  // badges) is queued whole instead of being silently stripped; image
+  // attachments disable the menu entry at render (which also keeps unsettled
+  // uploads out of this path — the enqueue fallback below bypasses
+  // `handleSend`'s uploading gate).
+  const [steering, setSteering] = useState(false)
+  const handleSteerClick = useCallback(async () => {
+    if (!onSteer || steering) return
+    const draft = buildDraft()
+    if (!draft) return
+    const enqueueInstead = () => {
+      if (!onEnqueue) return
+      onEnqueue(draft, showModeSelector ? effectiveModeId : null)
+      resetComposer()
+      toast.info(t("steerQueuedInstead"))
+    }
+    if (draft.blocks.some((b) => b.type !== "text")) {
+      enqueueInstead()
+      return
+    }
+    const text = draft.blocks
+      .map((b) => (b.type === "text" ? b.text : ""))
+      .join("\n")
+      .trim()
+    if (!text) return
+    setSteering(true)
+    try {
+      await onSteer(text)
+      resetComposer()
+    } catch (err) {
+      if (isNoActiveTurnRejection(err)) {
+        // The turn ended in the race window — reroute through the queue.
+        enqueueInstead()
+      } else {
+        toast.error(t("steerFailed"), { description: toErrorMessage(err) })
+      }
+    } finally {
+      setSteering(false)
+    }
+  }, [
+    onSteer,
+    steering,
+    buildDraft,
+    onEnqueue,
+    showModeSelector,
+    effectiveModeId,
+    resetComposer,
+    t,
   ])
 
   // Navigation/confirm/escape keys for the `/` (commands) and `$` (Codex skills)
@@ -2826,7 +1396,7 @@ export function MessageInput({
   // lets normal editing proceed.
   const handleExternalMenuKeyDown = useCallback(
     (event: KeyboardEvent): boolean => {
-      if (event.isComposing) return false
+      if (isImeCompositionKey(event)) return false
       if (!slashMenuOpen || slashAutocompleteCount === 0) return false
       if (event.key === "ArrowDown") {
         setSlashSelectedIndex((i) =>
@@ -2880,7 +1450,7 @@ export function MessageInput({
   // keeps the workspace Escape-to-close-tab binding from also firing.
   const handleContainerKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
-      if (e.nativeEvent.isComposing) return
+      if (isImeCompositionKey(e)) return
       if (
         isEditingQueueItem &&
         e.key === "Escape" &&
@@ -2916,74 +1486,28 @@ export function MessageInput({
     []
   )
 
-  const handleContainerDragOver = useCallback(
-    (event: React.DragEvent<HTMLDivElement>) => {
-      const isTreeDrag = hasFileTreeDragType(event.dataTransfer)
-      if (!hasDragFiles(event.dataTransfer) && !isTreeDrag) return
-      event.preventDefault()
-      if (!disabled) {
-        // A file-tree entry is copied in as a reference, not moved.
-        if (isTreeDrag) event.dataTransfer.dropEffect = "copy"
-        setDragActiveIfChanged(true)
-      }
-    },
-    [disabled, setDragActiveIfChanged]
-  )
-
-  const handleContainerDragLeave = useCallback(
-    (event: React.DragEvent<HTMLDivElement>) => {
-      const related = event.relatedTarget
-      if (
-        related &&
-        related instanceof Node &&
-        event.currentTarget.contains(related)
-      ) {
-        return
-      }
-      setDragActiveIfChanged(false)
-    },
-    [setDragActiveIfChanged]
-  )
-
-  const handleContainerDrop = useCallback(
-    (event: React.DragEvent<HTMLDivElement>) => {
-      const treePayload = hasFileTreeDragType(event.dataTransfer)
-        ? readFileTreeDragPayload(event.dataTransfer)
-        : null
-      if (!hasDragFiles(event.dataTransfer) && !treePayload) return
-      event.preventDefault()
-      lastDomDropAtRef.current = Date.now()
-      setDragActiveIfChanged(false)
-      if (disabled) return
-      // A file-tree entry dropped on the composer chrome (the editor's own drop
-      // surface is handled first by `handleEditorDrop`) becomes an inline file
-      // reference at the drop point.
-      if (treePayload) {
-        insertTreeDropAtPoint(treePayload.absPath, event.clientX, event.clientY)
-        return
-      }
-      const files = Array.from(event.dataTransfer.files ?? [])
-      if (files.length > 0) {
-        void appendFilesFromInput(files).catch((error) => {
-          console.error("[MessageInput] drop files failed:", error)
-        })
-      }
-    },
-    [
-      appendFilesFromInput,
-      disabled,
-      insertTreeDropAtPoint,
-      setDragActiveIfChanged,
-    ]
-  )
-
   const hasImageAttachments = imageAttachments.length > 0
-  const showDragActive = isDragActive && !disabled
+  const showDragActive = attach.isDragActive && !disabled
 
   const inlineSelectorItems = (
     <>
       {hasConfigOptions &&
         availableConfigOptions.map((option) => {
+          // On/off options flip in place — a dropdown for a binary choice is a
+          // wasted interaction.
+          if (option.kind.type === "boolean") {
+            return (
+              <InlineSessionConfigToggle
+                key={option.id}
+                option={option}
+                onLabel={t("toggleOn")}
+                offLabel={t("toggleOff")}
+                onSelect={(configId, value) =>
+                  onConfigOptionChange?.(configId, value)
+                }
+              />
+            )
+          }
           // Long model lists get the searchable + virtualized popover (a Radix
           // menu of hundreds of items is the scroll jank); every other option —
           // and short model lists — keep the lightweight inline dropdown.
@@ -3032,6 +1556,30 @@ export function MessageInput({
     const result: SessionSelectorSetting[] = []
     if (hasConfigOptions) {
       for (const option of availableConfigOptions) {
+        // An on/off option becomes a two-item headerless group — the same shape
+        // the mode picker below uses — so the panel needs no toggle affordance
+        // of its own.
+        if (option.kind.type === "boolean") {
+          const checked = option.kind.current_value
+          result.push({
+            key: `config:${option.id}`,
+            title: option.name,
+            currentValue: checked ? "true" : "false",
+            currentLabel: checked ? t("toggleOn") : t("toggleOff"),
+            groups: [
+              {
+                key: "__boolean__",
+                name: null,
+                options: [
+                  { value: "true", name: t("toggleOn"), description: null },
+                  { value: "false", name: t("toggleOff"), description: null },
+                ],
+              },
+            ],
+            onSelect: (value) => onConfigOptionChange?.(option.id, value),
+          })
+          continue
+        }
         if (option.kind.type !== "select") continue
         const kind = option.kind
         // Model values that carry a `provider/` prefix group by provider; every
@@ -3139,7 +1687,7 @@ export function MessageInput({
   ])
 
   const stopButton =
-    showCancel && onCancel ? (
+    (showCancel || isPrompting) && onCancel ? (
       <Button
         onClick={onCancel}
         variant="destructive"
@@ -3172,6 +1720,52 @@ export function MessageInput({
       >
         <Check className="size-4" />
       </Button>
+    </div>
+  ) : stopButton && onSteer && onEnqueue && hasSendableContent ? (
+    // Native-steering sessions surface the mid-turn actions that already
+    // exist but were keyboard-only/invisible: the primary half of the split
+    // queues the draft (what Enter has always done here), the dropdown
+    // injects it into the RUNNING turn. Without `onSteer` this branch stays
+    // pixel-identical to the historical Stop-only form below.
+    <div className="flex items-center gap-1">
+      {stopButton}
+      <div className="flex items-center">
+        <Button
+          onClick={handleSend}
+          disabled={steering}
+          size="icon"
+          className="h-8 w-8 rounded-r-none"
+          title={t("queueMessage")}
+        >
+          <Send className="size-4" />
+        </Button>
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <Button
+              disabled={steering}
+              size="icon"
+              className="h-8 w-5 rounded-l-none border-l border-primary-foreground/20"
+              aria-label={t("steerIntoTurn")}
+            >
+              <ChevronUp className="size-4" />
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end" side="top">
+            <DropdownMenuItem
+              onSelect={() => void handleSteerClick()}
+              disabled={steering || attachments.length > 0}
+              title={
+                attachments.length > 0
+                  ? t("steerAttachmentsUnsupported")
+                  : undefined
+              }
+            >
+              <Zap className="h-4 w-4" />
+              {t("steerIntoTurn")}
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
+      </div>
     </div>
   ) : stopButton ? (
     stopButton
@@ -3228,9 +1822,7 @@ export function MessageInput({
       // tab's desktop commit). Absent when there's no tab to attach to.
       data-tree-drop-composer={attachmentTabId ?? undefined}
       onKeyDown={handleContainerKeyDown}
-      onDragOver={handleContainerDragOver}
-      onDragLeave={handleContainerDragLeave}
-      onDrop={handleContainerDrop}
+      {...attach.containerDragProps}
     >
       {slashMenuOpen && slashAutocompleteCount > 0 && (
         <div className="absolute bottom-full left-0 right-0 mb-1 z-50 flex max-h-[min(16rem,40dvh)] flex-col overflow-hidden rounded-xl border border-border bg-popover shadow-lg">
@@ -3355,46 +1947,10 @@ export function MessageInput({
                 hasExtraContent={hasImageAttachments}
                 scrollEndTrigger={attachments.length}
                 extraContent={
-                  <>
-                    {imageAttachments.map((attachment) => (
-                      <div
-                        key={attachment.id}
-                        className="relative shrink-0 overflow-hidden rounded-md border border-border/70 bg-muted/30"
-                      >
-                        <button
-                          type="button"
-                          onClick={() => setPreviewAttachmentId(attachment.id)}
-                          className="cursor-pointer transition-opacity hover:opacity-80"
-                        >
-                          <Image
-                            src={`data:${attachment.mimeType};base64,${attachment.data}`}
-                            alt={attachment.name}
-                            width={56}
-                            height={56}
-                            unoptimized
-                            className="h-14 w-14 object-cover"
-                          />
-                        </button>
-                        {attachment.uploading ? (
-                          // Web/remote upload still in flight — sends are
-                          // gated on this settling (see `handleSend`).
-                          <div className="pointer-events-none absolute inset-0 flex items-center justify-center bg-background/50">
-                            <Loader2 className="h-4 w-4 animate-spin text-foreground/80" />
-                          </div>
-                        ) : null}
-                        <button
-                          type="button"
-                          onClick={() => removeAttachment(attachment.id)}
-                          className="absolute right-1 top-1 rounded-sm bg-background/70 p-0.5 hover:bg-background"
-                          aria-label={t("removeAttachmentAria", {
-                            name: attachment.name,
-                          })}
-                        >
-                          <X className="h-3 w-3" />
-                        </button>
-                      </div>
-                    ))}
-                  </>
+                  <ComposerImageThumbnails
+                    attachments={imageAttachments}
+                    onRemove={attach.removeAttachment}
+                  />
                 }
               />
               <RichComposer
@@ -3409,8 +1965,8 @@ export function MessageInput({
                 onReady={handleComposerReady}
                 onSubmit={handleSend}
                 onFocus={onFocus}
-                onPasteFiles={handlePasteFiles}
-                onDropFiles={handleEditorDrop}
+                onPasteFiles={attach.handlePasteFiles}
+                onDropFiles={attach.handleEditorDrop}
                 onPlainPaste={handlePlainPasteShortcut}
                 submitShortcut={shortcuts.send_message}
                 newlineShortcut={shortcuts.newline_in_message}
@@ -3420,334 +1976,14 @@ export function MessageInput({
               />
               <div className="flex shrink-0 items-end justify-between gap-1 px-2 pb-2">
                 <div className="flex min-w-0 items-end gap-1">
-                  <DropdownMenu onOpenChange={handleAddMenuOpenChange}>
-                    <DropdownMenuTrigger asChild>
-                      <Button
-                        disabled={disabled}
-                        variant="ghost"
-                        size="icon-xs"
-                        className="shrink-0 text-muted-foreground"
-                        title={t("addActions")}
-                        aria-label={t("addActions")}
-                      >
-                        <Plus className="size-4" />
-                      </Button>
-                    </DropdownMenuTrigger>
-                    <DropdownMenuContent
-                      side="top"
-                      align="start"
-                      className="min-w-56 w-auto"
-                    >
-                      {showNativePaperclip ? (
-                        <DropdownMenuItem
-                          onClick={() => {
-                            handlePickFiles().catch((error) => {
-                              console.error(
-                                "[MessageInput] pick files from menu failed:",
-                                error
-                              )
-                            })
-                          }}
-                        >
-                          <Paperclip className="size-4" />
-                          {t("attachFiles")}
-                        </DropdownMenuItem>
-                      ) : (
-                        <>
-                          <DropdownMenuItem
-                            onClick={() => {
-                              handleUploadLocalFiles().catch((error) => {
-                                console.error(
-                                  "[MessageInput] upload local files failed:",
-                                  error
-                                )
-                              })
-                            }}
-                          >
-                            <Upload className="size-4" />
-                            {t("attachLocalUpload")}
-                          </DropdownMenuItem>
-                          <DropdownMenuItem
-                            onClick={() => setServerFilePickerOpen(true)}
-                          >
-                            <FolderSearch className="size-4" />
-                            {t("attachServerFile")}
-                          </DropdownMenuItem>
-                        </>
-                      )}
-                      <DropdownMenuSub>
-                        <DropdownMenuSubTrigger>
-                          <MessageSquareText className="size-4" />
-                          {t("quickMessages")}
-                        </DropdownMenuSubTrigger>
-                        <DropdownMenuSubContent
-                          className="min-w-40 overflow-y-auto"
-                          style={{
-                            maxWidth: "min(20rem, calc(100vw - 1rem))",
-                            maxHeight:
-                              "min(32rem, var(--radix-dropdown-menu-content-available-height))",
-                          }}
-                        >
-                          {quickMessagesLoading &&
-                          quickMessages.length === 0 ? (
-                            <div className="px-3 py-4 text-center text-xs text-muted-foreground">
-                              {t("quickMessagesLoading")}
-                            </div>
-                          ) : quickMessages.length === 0 ? (
-                            <div className="px-3 py-4 text-center text-xs text-muted-foreground">
-                              {t("quickMessagesEmpty")}
-                            </div>
-                          ) : (
-                            quickMessages.map((message) => (
-                              <DropdownMenuItem
-                                key={message.id}
-                                onClick={() =>
-                                  handleQuickMessageSelect(message)
-                                }
-                              >
-                                <span className="truncate">
-                                  {message.title || (
-                                    <span className="italic text-muted-foreground">
-                                      {t("quickMessageUntitled")}
-                                    </span>
-                                  )}
-                                </span>
-                              </DropdownMenuItem>
-                            ))
-                          )}
-                        </DropdownMenuSubContent>
-                      </DropdownMenuSub>
-                      {onAddFeedback && (
-                        <DropdownMenuItem
-                          disabled={feedbackAddDisabled}
-                          onClick={onAddFeedback}
-                          title={
-                            feedbackAddDisabled
-                              ? t("liveFeedbackDisabledHint")
-                              : undefined
-                          }
-                        >
-                          <MessageSquarePlus className="size-4" />
-                          {t("liveFeedback")}
-                        </DropdownMenuItem>
-                      )}
-                      <DropdownMenuSub
-                        open={slashDropdownOpen}
-                        onOpenChange={handleSlashDropdownOpenChange}
-                      >
-                        <DropdownMenuSubTrigger
-                          disabled={slashCommands.length === 0}
-                        >
-                          <Command className="size-4" />
-                          {t("slashCommands")}
-                        </DropdownMenuSubTrigger>
-                        <DropdownMenuSubContent
-                          className="flex min-w-72 flex-col overflow-hidden p-0"
-                          style={{
-                            maxWidth: "min(20rem, calc(100vw - 1rem))",
-                            maxHeight:
-                              "min(32rem, var(--radix-dropdown-menu-content-available-height))",
-                          }}
-                        >
-                          <div className="flex shrink-0 items-center gap-2 border-b border-border/60 px-3 py-2">
-                            <Search className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-                            <input
-                              ref={slashDropdownInputRef}
-                              type="text"
-                              role="searchbox"
-                              aria-label={t("slashSearchPlaceholder")}
-                              value={slashDropdownSearch}
-                              onChange={(e) =>
-                                setSlashDropdownSearch(e.target.value)
-                              }
-                              onKeyDown={(e) => {
-                                if (e.key === "ArrowDown") {
-                                  e.preventDefault()
-                                  const container = e.currentTarget.closest(
-                                    '[data-slot="dropdown-menu-sub-content"]'
-                                  )
-                                  const firstItem =
-                                    container?.querySelector<HTMLElement>(
-                                      '[role="menuitem"]'
-                                    )
-                                  firstItem?.focus()
-                                  return
-                                }
-                                if (e.key === "Enter") {
-                                  e.preventDefault()
-                                  const first = filteredSlashDropdownCommands[0]
-                                  if (first) {
-                                    handleSlashPopoverSelect(first)
-                                    setSlashDropdownOpen(false)
-                                  }
-                                  return
-                                }
-                                if (e.key === "Escape" || e.key === "Tab")
-                                  return
-                                // Prevent radix DropdownMenu's built-in typeahead
-                                // from hijacking letter keys while the user is
-                                // typing.
-                                e.stopPropagation()
-                              }}
-                              placeholder={t("slashSearchPlaceholder")}
-                              className="flex-1 bg-transparent text-sm outline-none placeholder:text-muted-foreground"
-                              autoComplete="off"
-                              spellCheck={false}
-                            />
-                          </div>
-                          <div className="flex-1 overflow-y-auto p-1">
-                            {filteredSlashDropdownCommands.length === 0 ? (
-                              <div className="px-3 py-6 text-center text-xs text-muted-foreground">
-                                {t("slashSearchEmpty")}
-                              </div>
-                            ) : (
-                              filteredSlashDropdownCommands.map((cmd) => (
-                                <DropdownMenuItem
-                                  key={cmd.name}
-                                  onClick={() => handleSlashPopoverSelect(cmd)}
-                                  // Radix focuses the item on pointermove, which
-                                  // fires while scrolling (items slide under the
-                                  // cursor) and steals focus from the search input.
-                                  // Short-circuit that default with preventDefault
-                                  // so the search keeps focus until the user
-                                  // explicitly clicks.
-                                  onPointerMove={(e) => e.preventDefault()}
-                                  onPointerLeave={(e) => e.preventDefault()}
-                                  className="hover:bg-accent hover:text-accent-foreground"
-                                >
-                                  <DropdownRadioItemContent
-                                    label={commandInvocationToken(cmd.name)}
-                                    description={cmd.description}
-                                  />
-                                </DropdownMenuItem>
-                              ))
-                            )}
-                          </div>
-                        </DropdownMenuSubContent>
-                      </DropdownMenuSub>
-                      {/* A custom-dir pi can't have skills managed by codeg's
-                          default-dir store, so hide these shortcuts instead of
-                          offering ones that lock with a Settings path the
-                          Experts/Office matrices also hide for this agent. */}
-                      {skillManagementSupported && (
-                        <>
-                          <DropdownMenuSub>
-                            <DropdownMenuSubTrigger
-                              disabled={expertsSorted.length === 0}
-                            >
-                              <Sparkles className="size-4" />
-                              {t("experts")}
-                            </DropdownMenuSubTrigger>
-                            <DropdownMenuSubContent
-                              className="min-w-44 overflow-y-auto"
-                              style={{
-                                maxWidth: "min(20rem, calc(100vw - 1rem))",
-                                maxHeight:
-                                  "min(32rem, var(--radix-dropdown-menu-content-available-height))",
-                              }}
-                            >
-                              {expertsSorted.map((item) => {
-                                const Icon = getExpertIcon(item.metadata.icon)
-                                const label =
-                                  pickLocalized(
-                                    item.metadata.display_name,
-                                    locale
-                                  ) || item.metadata.id
-                                return (
-                                  <DropdownMenuItem
-                                    key={item.metadata.id}
-                                    onClick={() => handleExpertShortcut(item)}
-                                  >
-                                    <Icon className="size-4" />
-                                    <span className="flex-1 truncate">
-                                      {label}
-                                    </span>
-                                    {isSkillLocked(item.metadata.id) && (
-                                      <Lock className="ml-auto size-3.5 shrink-0 text-muted-foreground/70" />
-                                    )}
-                                  </DropdownMenuItem>
-                                )
-                              })}
-                            </DropdownMenuSubContent>
-                          </DropdownMenuSub>
-                          <DropdownMenuSub>
-                            <DropdownMenuSubTrigger>
-                              <FileStack className="size-4" />
-                              {t("office")}
-                            </DropdownMenuSubTrigger>
-                            <DropdownMenuSubContent
-                              className="min-w-44 overflow-y-auto"
-                              style={{
-                                maxWidth: "min(20rem, calc(100vw - 1rem))",
-                                maxHeight:
-                                  "min(32rem, var(--radix-dropdown-menu-content-available-height))",
-                              }}
-                            >
-                              {OFFICE_ACTIONS.map((action) => {
-                                const Icon = action.icon
-                                const label = tQa(
-                                  action.id as Parameters<typeof tQa>[0]
-                                )
-                                return (
-                                  <DropdownMenuItem
-                                    key={action.id}
-                                    onClick={() => handleOfficeShortcut(action)}
-                                  >
-                                    <Icon className="size-4" />
-                                    <span className="flex-1 truncate">
-                                      {label}
-                                    </span>
-                                    {isSkillLocked(action.skillId) && (
-                                      <Lock className="ml-auto size-3.5 shrink-0 text-muted-foreground/70" />
-                                    )}
-                                  </DropdownMenuItem>
-                                )
-                              })}
-                            </DropdownMenuSubContent>
-                          </DropdownMenuSub>
-                          <DropdownMenuSub>
-                            <DropdownMenuSubTrigger
-                              disabled={scienceSorted.length === 0}
-                            >
-                              <FlaskConical className="size-4" />
-                              {t("research")}
-                            </DropdownMenuSubTrigger>
-                            <DropdownMenuSubContent
-                              className="min-w-44 overflow-y-auto"
-                              style={{
-                                maxWidth: "min(20rem, calc(100vw - 1rem))",
-                                maxHeight:
-                                  "min(32rem, var(--radix-dropdown-menu-content-available-height))",
-                              }}
-                            >
-                              {scienceSorted.map((item) => {
-                                const Icon = getScienceIcon(item.metadata.icon)
-                                const label =
-                                  pickLocalized(
-                                    item.metadata.display_name,
-                                    locale
-                                  ) || item.metadata.id
-                                return (
-                                  <DropdownMenuItem
-                                    key={item.metadata.id}
-                                    onClick={() => handleScienceShortcut(item)}
-                                  >
-                                    <Icon className="size-4" />
-                                    <span className="flex-1 truncate">
-                                      {label}
-                                    </span>
-                                    {isSkillLocked(item.metadata.id) && (
-                                      <Lock className="ml-auto size-3.5 shrink-0 text-muted-foreground/70" />
-                                    )}
-                                  </DropdownMenuItem>
-                                )
-                              })}
-                            </DropdownMenuSubContent>
-                          </DropdownMenuSub>
-                        </>
-                      )}
-                    </DropdownMenuContent>
-                  </DropdownMenu>
+                  <ComposerAddMenu
+                    disabled={disabled}
+                    attachments={attach}
+                    shortcuts={menuShortcuts}
+                    slashCommands={slashCommands}
+                    onAddFeedback={onAddFeedback}
+                    feedbackAddDisabled={feedbackAddDisabled}
+                  />
                   {hasInlineSelectors && (
                     <div className="hidden min-w-0 items-end gap-1 @[30rem]:flex">
                       {inlineSelectorItems}
@@ -3876,19 +2112,20 @@ export function MessageInput({
                     "min(32rem, var(--radix-context-menu-content-available-height))",
                 }}
               >
-                {quickMessagesLoading && quickMessages.length === 0 ? (
+                {menuShortcuts.quickMessagesLoading &&
+                menuShortcuts.quickMessages.length === 0 ? (
                   <div className="px-3 py-4 text-center text-xs text-muted-foreground">
                     {t("quickMessagesLoading")}
                   </div>
-                ) : quickMessages.length === 0 ? (
+                ) : menuShortcuts.quickMessages.length === 0 ? (
                   <div className="px-3 py-4 text-center text-xs text-muted-foreground">
                     {t("quickMessagesEmpty")}
                   </div>
                 ) : (
-                  quickMessages.map((message) => (
+                  menuShortcuts.quickMessages.map((message) => (
                     <ContextMenuItem
                       key={message.id}
-                      onSelect={() => handleQuickMessageSelect(message)}
+                      onSelect={() => menuShortcuts.insertQuickMessage(message)}
                     >
                       <span className="truncate">
                         {message.title || (
@@ -3929,23 +2166,11 @@ export function MessageInput({
           </div>
         )}
       </div>
-      <ImagePreviewDialog
-        src={
-          previewAttachment
-            ? `data:${previewAttachment.mimeType};base64,${previewAttachment.data}`
-            : ""
-        }
-        alt={previewAttachment?.name ?? ""}
-        open={previewAttachment !== null}
-        onOpenChange={(open) => {
-          if (!open) setPreviewAttachmentId(null)
-        }}
-      />
-      {!showNativePaperclip && (
+      {!attach.showNativePaperclip && (
         <ServerFileBrowserDialog
-          open={serverFilePickerOpen}
-          onOpenChange={setServerFilePickerOpen}
-          onSelect={handleServerFilesSelected}
+          open={attach.serverFilePickerOpen}
+          onOpenChange={attach.setServerFilePickerOpen}
+          onSelect={attach.handleServerFilesSelected}
           initialPath={defaultPath ?? undefined}
         />
       )}

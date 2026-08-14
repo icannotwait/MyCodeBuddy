@@ -3,13 +3,19 @@
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
   type RefObject,
 } from "react"
+import { createPortal } from "react-dom"
 import { BookOpenText } from "lucide-react"
 import type { RichComposerHandle } from "@/components/chat/composer/rich-composer"
+import {
+  placeAnchoredPopup,
+  type PopupPosition,
+} from "@/components/chat/composer/suggestion/popup-position"
 import {
   commandInvocationToken,
   commandToReference,
@@ -18,12 +24,19 @@ import {
 import type { ReferenceAttrs } from "@/components/chat/composer/types"
 import { useAgentSkills } from "@/hooks/use-agent-skills"
 import { rankByTextMatch } from "@/lib/fuzzy-text-match"
+import { isImeCompositionKey } from "@/lib/ime-composition"
 import { cn } from "@/lib/utils"
 import type {
   AgentSkillItem,
   AgentType,
   AvailableCommandInfo,
 } from "@/lib/types"
+
+// Commit-synchronous in the browser so the panel is positioned before paint (no
+// flash at a stale spot); a passive effect during the static-export prerender,
+// where `useLayoutEffect` would warn. Mirrors the `@` suggestion popup.
+const useIsomorphicLayoutEffect =
+  typeof window !== "undefined" ? useLayoutEffect : useEffect
 
 interface UseComposerInvocationsArgs {
   editorRef: RefObject<RichComposerHandle | null>
@@ -174,7 +187,7 @@ export function useComposerInvocations({
 
   const onKeyDown = useCallback(
     (event: KeyboardEvent): boolean => {
-      if (event.isComposing) return false
+      if (isImeCompositionKey(event)) return false
       if (!open || count === 0) return false
       if (event.key === "ArrowDown") {
         setRawActiveIndex((i) => (i < count - 1 ? i + 1 : 0))
@@ -224,17 +237,77 @@ export function useComposerInvocations({
 
 /**
  * The floating list for {@link useComposerInvocations}. Render inside a
- * `relative` wrapper around the composer; it anchors below the box (the editor
- * sits near the top of the scrollable form, so opening upward gets clipped by the
- * ScrollArea). Navigation is routed from the editor's keydown, so this only
- * handles pointer selection.
+ * `relative` wrapper around the composer: a zero-size marker stays there to
+ * name the box the panel hangs off, and the panel itself is portalled to the
+ * body and positioned against the VIEWPORT.
+ *
+ * It used to be an ordinary absolutely-positioned child, which every host
+ * clipped: `DialogContent` is `max-h-[calc(100dvh-2rem)] overflow-y-auto` and
+ * the automation editor's form scrolls too, so a panel hanging below a composer
+ * low in the dialog was simply cut off at the dialog's edge. Escaping the
+ * clipping container is the only fix — z-index cannot beat `overflow`.
+ *
+ * Placement reuses the `@` panel's tested helper, asking for `below` first
+ * (dropping out of the box is this panel's resting look) and flipping up when
+ * the composer sits too low. Navigation is routed from the editor's keydown, so
+ * this only handles pointer selection.
  */
 export function ComposerInvocationsPopup({
   inv,
 }: {
   inv: ComposerInvocations
 }) {
+  const anchorRef = useRef<HTMLSpanElement>(null)
+  const panelRef = useRef<HTMLDivElement>(null)
   const listRef = useRef<HTMLDivElement>(null)
+  const [pos, setPos] = useState<PopupPosition | null>(null)
+  const [anchorWidth, setAnchorWidth] = useState(0)
+
+  const itemCount = inv.commands.length + inv.skills.length
+
+  // Anchor the portalled panel to the composer box. Measure the rendered panel
+  // (a `visibility:hidden` box still has layout), then clamp/flip via the pure
+  // helper — a layout effect runs before paint, so it never flashes at 0,0. The
+  // height tracks `itemCount` (async skills load, filter loosened), and resize +
+  // capture-phase scroll re-anchor while the panel is open: the composer moves
+  // whenever its dialog or form scrolls, and a fixed panel does not follow.
+  //
+  // Width is adopted BEFORE the height is measured, in two passes. A fixed panel
+  // with no width shrinks to its content, and a row that fits on one line there
+  // wraps once the (narrower) composer width lands — measuring first would place
+  // the panel using a height it is about to outgrow, which is precisely the
+  // overflow this whole change removes. The panel stays hidden through both.
+  useIsomorphicLayoutEffect(() => {
+    if (!inv.isOpen || typeof window === "undefined") return
+    const reposition = () => {
+      const box = anchorRef.current?.parentElement
+      const panel = panelRef.current
+      if (!box || !panel) return
+      const anchor = box.getBoundingClientRect()
+      if (Math.abs(anchor.width - anchorWidth) > 0.5) {
+        // Pass one: adopt the width. `anchorWidth` is a dep, so this effect
+        // re-runs against the laid-out panel and falls through below.
+        setAnchorWidth(anchor.width)
+        return
+      }
+      const rect = panel.getBoundingClientRect()
+      setPos(
+        placeAnchoredPopup(
+          { left: anchor.left, top: anchor.top, bottom: anchor.bottom },
+          { width: anchor.width, height: rect.height },
+          { width: window.innerWidth, height: window.innerHeight },
+          { prefer: "below" }
+        )
+      )
+    }
+    reposition()
+    window.addEventListener("resize", reposition)
+    window.addEventListener("scroll", reposition, true)
+    return () => {
+      window.removeEventListener("resize", reposition)
+      window.removeEventListener("scroll", reposition, true)
+    }
+  }, [inv.isOpen, itemCount, anchorWidth])
 
   // Keep the active row in view as the user arrows through (manual scrollTop,
   // mirroring the chat composer — no scrollIntoView, which jsdom lacks).
@@ -254,8 +327,31 @@ export function ComposerInvocationsPopup({
 
   if (!inv.isOpen) return null
 
-  return (
-    <div className="absolute left-0 right-0 top-full z-50 mt-1 flex max-h-[min(16rem,40dvh)] flex-col overflow-hidden rounded-xl border border-border bg-popover shadow-lg">
+  const panel = (
+    <div
+      ref={panelRef}
+      style={{
+        position: "fixed",
+        left: pos?.left ?? 0,
+        top: pos?.top ?? 0,
+        // The panel matches the composer's width; before the first measure it
+        // is hidden anyway, so the 0 never shows.
+        width: anchorWidth || undefined,
+        // Hidden until the first measure positions it (avoids a flash at 0,0).
+        visibility: pos ? "visible" : "hidden",
+        zIndex: 50,
+        // The panel portals to `body`, and a modal Radix layer (the Dialog or
+        // Sheet hosting the composer) sets `pointer-events: none` on `body` —
+        // only the layer itself is re-enabled. Without this the panel is
+        // click-dead there and the press lands on the document instead, which
+        // the layer reads as an outside press and closes itself. Radix's
+        // outside test walks the REACT tree, so a press that does reach the
+        // panel is still correctly seen as inside the host.
+        pointerEvents: "auto",
+      }}
+      data-placement={pos?.placement}
+      className="flex max-h-[min(16rem,40dvh)] flex-col overflow-hidden rounded-xl border border-border bg-popover shadow-lg"
+    >
       <div ref={listRef} className="flex-1 overflow-y-auto p-1">
         {inv.commands.map((cmd, i) => (
           <button
@@ -312,5 +408,17 @@ export function ComposerInvocationsPopup({
         })}
       </div>
     </div>
+  )
+
+  return (
+    <>
+      {/* Stays in the tree so the portalled panel knows which box to hang off
+          (and so Radix still counts a press inside the panel as inside the
+          host — the portal keeps it in the React tree either way). */}
+      <span ref={anchorRef} className="hidden" aria-hidden="true" />
+      {typeof document === "undefined"
+        ? null
+        : createPortal(panel, document.body)}
+    </>
   )
 }

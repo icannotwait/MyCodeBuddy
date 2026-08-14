@@ -3009,6 +3009,11 @@ Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/microsoft/windows-rs
 License text SHA-256: none
 
+cargo:windows-core@0.62.2
+Declared license: MIT OR Apache-2.0
+Homepage: https://github.com/microsoft/windows-rs
+License text SHA-256: none
+
 cargo:windows-future@0.2.1
 Declared license: MIT OR Apache-2.0
 Homepage: https://github.com/microsoft/windows-rs
@@ -3568,6 +3573,11 @@ Declared license: Apache-2.0
 Homepage: https://github.com/Chevrotain/chevrotain#readme
 License text SHA-256: 58d1e17ffe5109a7ae296caafcadfdbe6a7d176f0bc4ab01e12a689b0499d8bd
 
+npm:@date-fns/tz@1.5.0
+Declared license: MIT
+Homepage: https://github.com/date-fns/date-fns#readme
+License text SHA-256: fc4b4b7053f3e1304b6fc1a265065dacc2bfac5cce0627814d4a299138e23145
+
 npm:@dotenvx/dotenvx@1.52.0
 Declared license: BSD-3-Clause
 Homepage: https://github.com/dotenvx/dotenvx
@@ -3613,7 +3623,7 @@ Declared license: MIT
 Homepage: https://floating-ui.com
 License text SHA-256: 6c1117dc530c1ffcffb309e6bd53f333c2620453285327bde5ce91516eee1011
 
-npm:@fontsource-variable/fira-code@5.2.7
+npm:@fontsource-variable/fira-code@5.3.0
 Declared license: OFL-1.1
 Homepage: https://fontsource.org/fonts/fira-code
 License text SHA-256: ccb75fddaa304c9158a20a53e4cb62d84870f3a288bc60fb8e271fd780b21949
@@ -3628,12 +3638,12 @@ Declared license: OFL-1.1
 Homepage: https://fontsource.org/fonts/geist-mono
 License text SHA-256: a1ff58d2df642ffd3d12ce1e1e58c8d3a9034ae355b9db7cdfb619f0a2aaf80c
 
-npm:@fontsource-variable/inter@5.2.8
+npm:@fontsource-variable/inter@5.3.0
 Declared license: OFL-1.1
 Homepage: https://fontsource.org/fonts/inter
 License text SHA-256: bfe1e5d7dd50372dc9a580b1e31ce9bdaa5541a39b1ccf4874fdad2bfb92c89e
 
-npm:@fontsource-variable/jetbrains-mono@5.2.8
+npm:@fontsource-variable/jetbrains-mono@5.3.0
 Declared license: OFL-1.1
 Homepage: https://fontsource.org/fonts/jetbrains-mono
 License text SHA-256: 0eb004541463faa203872a992329730809dee1db124df55d6c5870c43438d321
@@ -3683,10 +3693,15 @@ Declared license: MIT
 Homepage: https://github.com/lovell/colour#readme
 License text SHA-256: da3044f63e02b6d689405434efdd9729918a1578b49101075442d1b394ff2284
 
-npm:@img/sharp-win32-x64@0.34.5
-Declared license: Apache-2.0 AND LGPL-3.0-or-later
+npm:@img/sharp-darwin-arm64@0.34.5
+Declared license: Apache-2.0
 Homepage: https://sharp.pixelplumbing.com
 License text SHA-256: 9ff562631a04b8cb1030c53fdf461bd749c9af0655d86e4f17eb270e935a7fe2
+
+npm:@img/sharp-libvips-darwin-arm64@1.2.4
+Declared license: LGPL-3.0-or-later
+Homepage: https://sharp.pixelplumbing.com
+License text SHA-256: none
 
 npm:@inquirer/ansi@1.0.2
 Declared license: MIT
@@ -3777,7 +3792,7 @@ Declared license: MIT
 Homepage: https://github.com/vercel/next.js#readme
 License text SHA-256: none
 
-npm:@next/swc-win32-x64-msvc@16.1.6
+npm:@next/swc-darwin-arm64@16.1.6
 Declared license: MIT
 Homepage: https://github.com/vercel/next.js#readme
 License text SHA-256: none
@@ -3869,7 +3884,7 @@ Declared license: MIT
 Homepage: https://github.com/parcel-bundler/watcher#readme
 License text SHA-256: f46060baf8276d8c6c987cd4b598780aa08068cb58d4e2545c1559a1b28af92f
 
-npm:@parcel/watcher-win32-x64@2.5.6
+npm:@parcel/watcher-darwin-arm64@2.5.6
 Declared license: MIT
 Homepage: https://github.com/parcel-bundler/watcher#readme
 License text SHA-256: f46060baf8276d8c6c987cd4b598780aa08068cb58d4e2545c1559a1b28af92f
@@ -4339,7 +4354,7 @@ Declared license: Apache-2.0
 Homepage: https://swc.rs
 License text SHA-256: none
 
-npm:@swc/core-win32-x64-msvc@1.15.18
+npm:@swc/core-darwin-arm64@1.15.18
 Declared license: Apache-2.0 AND MIT
 Homepage: https://swc.rs
 License text SHA-256: none
@@ -4358,6 +4373,10 @@ npm:@swc/types@0.1.25
 Declared license: Apache-2.0
 Homepage: https://swc.rs
 License text SHA-256: d96eba1f1881334d50ffc144276dfa98e147a415e7c591ecdfcb81680361dc91
+
+npm:@tabby_ai/hijri-converter@1.0.5
+Declared license: MIT
+License text SHA-256: d70e7930cb384ba6b0ffc6ed32d498f29dbadd07efdc4d08b260e1b88d31c505
 
 npm:@tauri-apps/api@2.11.1
 Declared license: Apache-2.0 OR MIT
@@ -4759,7 +4778,7 @@ Declared license: MIT
 Homepage: https://github.com/DefinitelyTyped/DefinitelyTyped/tree/master/types/react
 License text SHA-256: d9a1b1e30d633d5732ea18e3cba9538d293ebc53e1a9e4e96ab739e0c5c4f1cb
 
-npm:@types/react-dom@19.2.3
+npm:@types/react-dom@19.2.4
 Declared license: MIT
 Homepage: https://github.com/DefinitelyTyped/DefinitelyTyped/tree/master/types/react-dom
 License text SHA-256: d9a1b1e30d633d5732ea18e3cba9538d293ebc53e1a9e4e96ab739e0c5c4f1cb
@@ -5383,6 +5402,11 @@ Declared license: MIT
 Homepage: https://github.com/date-fns/date-fns#readme
 License text SHA-256: e09ccac2a81189df86a236db919e824b0e68dbb7082016a6b0cef4255c5f9908
 
+npm:date-fns-jalali@4.1.0-0
+Declared license: MIT
+Homepage: https://github.com/date-fns-jalali/date-fns-jalali#readme
+License text SHA-256: e09ccac2a81189df86a236db919e824b0e68dbb7082016a6b0cef4255c5f9908
+
 npm:dayjs@1.11.20
 Declared license: MIT
 Homepage: https://day.js.org
@@ -5959,7 +5983,7 @@ Declared license: MIT
 Homepage: https://github.com/kaelzhang/node-ignore#readme
 License text SHA-256: none
 
-npm:ignore@7.0.5
+npm:ignore@7.0.6
 Declared license: MIT
 Homepage: https://github.com/kaelzhang/node-ignore#readme
 License text SHA-256: none
@@ -7065,6 +7089,11 @@ Declared license: MIT
 Homepage: https://react.dev/
 License text SHA-256: cf9b17822d1fcd4ff32ccbe14183386fb3adf6f2ff92dc184130823f7fc28173
 
+npm:react-day-picker@9.14.0
+Declared license: MIT
+Homepage: https://daypicker.dev
+License text SHA-256: 24b69911aebda065837e653eef80bae83d2b957a5da94ca1e74457edd6ab8209
+
 npm:react-dom@19.2.4
 Declared license: MIT
 Homepage: https://react.dev/
@@ -7353,6 +7382,11 @@ npm:sisteransi@1.0.5
 Declared license: MIT
 Homepage: https://github.com/terkelg/sisteransi#readme
 License text SHA-256: 434b9e711d9c0e4c518672fe3ef3f40aafddf8a6fde80cceab7d821cfe7a7fa3
+
+npm:smol-toml@1.7.1
+Declared license: BSD-3-Clause
+Homepage: https://github.com/squirrelchat/smol-toml#readme
+License text SHA-256: 036546fdfb340233d3ec541d2a6defd6a7457b9e7db6a1618984c9e77af8a221
 
 npm:sonner@2.0.7
 Declared license: MIT
@@ -7978,6 +8012,35 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
+
+SHA-256: 036546fdfb340233d3ec541d2a6defd6a7457b9e7db6a1618984c9e77af8a221
+Packages:
+- npm:smol-toml@1.7.1
+
+Copyright (c) Squirrel Chat et al., All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the
+   documentation and/or other materials provided with the distribution.
+3. Neither the name of the copyright holder nor the names of its contributors
+   may be used to endorse or promote products derived from this software without
+   specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 SHA-256: 045ce74712fc613fdd74d1c55f5140a08d623836ff2aca44132b38d68fbc67ad
 Packages:
@@ -8640,7 +8703,7 @@ THE SOFTWARE.
 
 SHA-256: 0eb004541463faa203872a992329730809dee1db124df55d6c5870c43438d321
 Packages:
-- npm:@fontsource-variable/jetbrains-mono@5.2.8
+- npm:@fontsource-variable/jetbrains-mono@5.3.0
 
 Copyright 2020 The JetBrains Mono Project Authors (https://github.com/JetBrains/JetBrainsMono) JetBrainsMono-Italic[wght].ttf: Copyright 2020 The JetBrains Mono Project Authors (https://github.com/JetBrains/JetBrainsMono)
 
@@ -9989,6 +10052,32 @@ Packages:
 The MIT License (MIT)
 
 Copyright (c) Denis Malinochkin
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+SHA-256: 24b69911aebda065837e653eef80bae83d2b957a5da94ca1e74457edd6ab8209
+Packages:
+- npm:react-day-picker@9.14.0
+
+The MIT License (MIT)
+
+Copyright (c) 2014-2025 Giampaolo Bellavite <io@gpbl.dev> and contributors
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -19316,7 +19405,7 @@ THIS SOFTWARE.
 
 SHA-256: 9ff562631a04b8cb1030c53fdf461bd749c9af0655d86e4f17eb270e935a7fe2
 Packages:
-- npm:@img/sharp-win32-x64@0.34.5
+- npm:@img/sharp-darwin-arm64@0.34.5
 - npm:sharp@0.34.5
 
 Apache License
@@ -21156,7 +21245,7 @@ THE SOFTWARE.
 
 SHA-256: bfe1e5d7dd50372dc9a580b1e31ce9bdaa5541a39b1ccf4874fdad2bfb92c89e
 Packages:
-- npm:@fontsource-variable/inter@5.2.8
+- npm:@fontsource-variable/inter@5.3.0
 
 Copyright 2016 The Inter Project Authors (https://github.com/rsms/inter) Inter-Italic[opsz,wght].ttf: Copyright 2016 The Inter Project Authors (https://github.com/rsms/inter)
 
@@ -22247,7 +22336,7 @@ SOFTWARE.
 
 SHA-256: ccb75fddaa304c9158a20a53e4cb62d84870f3a288bc60fb8e271fd780b21949
 Packages:
-- npm:@fontsource-variable/fira-code@5.2.7
+- npm:@fontsource-variable/fira-code@5.3.0
 
 Copyright 2014-2020 The Fira Code Project Authors (https://github.com/tonsky/FiraCode)
 
@@ -23212,6 +23301,32 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
+SHA-256: d70e7930cb384ba6b0ffc6ed32d498f29dbadd07efdc4d08b260e1b88d31c505
+Packages:
+- npm:@tabby_ai/hijri-converter@1.0.5
+
+MIT License
+
+Copyright (c) 2023 Tabby FZ-LLC
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
 SHA-256: d785edfd5a8ff55734ddd8cf37c398a1e01b02dbb5069f1e01eba1a90523e6f4
 Packages:
 - npm:pathe@2.0.3
@@ -23648,7 +23763,7 @@ Packages:
 - npm:@types/ms@2.1.0
 - npm:@types/node@25.2.2
 - npm:@types/parse-json@4.0.2
-- npm:@types/react-dom@19.2.3
+- npm:@types/react-dom@19.2.4
 - npm:@types/react@19.2.13
 - npm:@types/statuses@2.0.6
 - npm:@types/trusted-types@2.0.7
@@ -24117,6 +24232,7 @@ SOFTWARE.
 
 SHA-256: e09ccac2a81189df86a236db919e824b0e68dbb7082016a6b0cef4255c5f9908
 Packages:
+- npm:date-fns-jalali@4.1.0-0
 - npm:date-fns@4.1.0
 
 MIT License
@@ -25184,7 +25300,7 @@ SOFTWARE.
 
 SHA-256: f46060baf8276d8c6c987cd4b598780aa08068cb58d4e2545c1559a1b28af92f
 Packages:
-- npm:@parcel/watcher-win32-x64@2.5.6
+- npm:@parcel/watcher-darwin-arm64@2.5.6
 - npm:@parcel/watcher@2.5.6
 
 MIT License
@@ -25962,6 +26078,20 @@ IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
 CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
 TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
 SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+SHA-256: fc4b4b7053f3e1304b6fc1a265065dacc2bfac5cce0627814d4a299138e23145
+Packages:
+- npm:@date-fns/tz@1.5.0
+
+MIT License
+
+Copyright © 2024 Sasha Koss
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the “Software”), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 SHA-256: fc5c72a172de77431df114615be9f47310fd93797dd741a1258552d116704e33
 Packages:

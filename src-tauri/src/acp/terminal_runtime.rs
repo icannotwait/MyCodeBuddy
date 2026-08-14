@@ -11,7 +11,7 @@ use sacp::schema::{
     TerminalOutputResponse, WaitForTerminalExitRequest, WaitForTerminalExitResponse,
 };
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::sync::{watch, Mutex, Notify};
+use tokio::sync::{watch, Mutex, Notify, RwLock};
 use tokio::task::JoinHandle;
 
 use crate::acp::terminal_adapter::{adapter_for, AcpTerminalAdapter};
@@ -19,6 +19,7 @@ use crate::models::agent::AgentType;
 use crate::terminal::shell::{
     build_command_line, ResolvedShellSpec, ShellCommandStrategy, ShellDialect, ShellSource,
 };
+use crate::terminal::shell_flavor::{classify_shell_family, ShellFamily};
 
 type TerminalMap = HashMap<String, Arc<TerminalInstance>>;
 const DEFAULT_OUTPUT_BYTE_LIMIT: u64 = 1_000_000;
@@ -470,6 +471,29 @@ pub struct TerminalRuntime {
     adapter: &'static dyn AcpTerminalAdapter,
 }
 
+/// Shared, hot-swappable default shell for ACP terminal requests.
+///
+/// Owned by [`crate::acp::manager::ConnectionManager`] and read when applying
+/// persisted General Settings.
+#[derive(Clone, Default)]
+pub struct TerminalShellRuntimeConfig {
+    inner: Arc<RwLock<Option<String>>>,
+}
+
+impl TerminalShellRuntimeConfig {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub async fn snapshot(&self) -> Option<String> {
+        self.inner.read().await.clone()
+    }
+
+    pub async fn set(&self, default_shell: Option<String>) {
+        *self.inner.write().await = default_shell;
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TerminalOutputDelta {
     pub output: String,
@@ -564,6 +588,10 @@ impl TerminalRuntime {
             return Ok(ExecutionMode::DirectProgram(path));
         }
 
+        // Unresolved names go through the snapshotted shell. PowerShell/cmd
+        // resolve builtins the OS cannot exec; POSIX still wraps via `-c`.
+        let family = classify_shell_family(&self.terminal_shell.executable.to_string_lossy());
+        let _via_shell = family.resolves_bare_builtins() || matches!(family, ShellFamily::Posix);
         Ok(ExecutionMode::ShellCommandLine)
     }
 

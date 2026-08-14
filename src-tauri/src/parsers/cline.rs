@@ -10,8 +10,8 @@ use crate::models::{
 };
 
 use super::{
-    compute_session_stats, folder_name_from_path, title_from_user_text, truncate_str,
-    visible_title, visible_user_text, AgentParser, ParseError,
+    backfill_turn_durations, compute_session_stats, folder_name_from_path, title_from_user_text,
+    truncate_str, visible_title, visible_user_text, AgentParser, ParseError,
 };
 
 // ---------------------------------------------------------------------------
@@ -358,6 +358,7 @@ impl AgentParser for ClineParser {
             });
         }
 
+        backfill_turn_durations(&mut turns, &[]);
         let session_stats = compute_session_stats(&turns);
 
         let summary = ConversationSummary {
@@ -588,6 +589,7 @@ fn parse_content_blocks(content: &serde_json::Value) -> Vec<ContentBlock> {
                             tool_use_id,
                             tool_name,
                             input_preview,
+                            status: None,
                             meta: None,
                         });
                     }

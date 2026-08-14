@@ -1094,6 +1094,8 @@ fn parse_codex_subagent_stats(
         lines_removed: None,
         other_tool_count: None,
         tool_calls,
+
+        child_session_id: None,
     })
 }
 
@@ -1453,6 +1455,8 @@ impl CodexParser {
                                                 tool_name: marker.tool_name.to_string(),
                                                 input_preview: Some(marker.input_json),
                                                 meta: None,
+
+                                                status: None,
                                             },
                                             ContentBlock::ToolResult {
                                                 tool_use_id: Some(id),
@@ -1845,6 +1849,8 @@ impl CodexParser {
                                         tool_name: tool_name.to_string(),
                                         input_preview,
                                         meta,
+
+                                        status: None,
                                     }],
                                     timestamp,
                                     usage: None,
@@ -1987,6 +1993,8 @@ impl CodexParser {
                                                 tool_name: "Agent".to_string(),
                                                 input_preview: Some(agent_input.to_string()),
                                                 meta: None,
+
+                                                status: None,
                                             }],
                                             timestamp,
                                             usage: None,
@@ -2093,6 +2101,8 @@ impl CodexParser {
                                                 tool_name: raw_tool_name.to_string(),
                                                 input_preview,
                                                 meta: None,
+
+                                                status: None,
                                             }],
                                             timestamp,
                                             usage: None,
@@ -2157,6 +2167,8 @@ impl CodexParser {
                                                 tool_name: buf.name,
                                                 input_preview: buf.input_preview,
                                                 meta: None,
+
+                                                status: None,
                                             }],
                                             timestamp: buf.timestamp,
                                             usage: None,
@@ -2237,6 +2249,8 @@ impl CodexParser {
                                                         tool_name: "collab_agent".to_string(),
                                                         input_preview: Some(collab_input),
                                                         meta: None,
+
+                                                        status: None,
                                                     }],
                                                     timestamp,
                                                     usage: None,
@@ -2458,6 +2472,8 @@ impl CodexParser {
                         tool_name: buf.name,
                         input_preview: buf.input_preview,
                         meta: None,
+
+                        status: None,
                     }],
                     timestamp: buf.timestamp,
                     usage: None,
@@ -2579,6 +2595,9 @@ impl CodexParser {
         super::relocate_orphaned_tool_results(&mut turns);
         super::structurize_read_tool_output(&mut turns);
         super::resolve_patch_line_numbers(&mut turns, cwd.as_deref());
+        // After relocation every turn's `completed_at` is final — tile the
+        // timeline into per-reply durations before stats aggregate them.
+        super::backfill_turn_durations(&mut turns, &[]);
         let mut session_stats = super::compute_session_stats(&turns);
         session_stats =
             merge_codex_total_usage_stats(session_stats, latest_total_usage, latest_total_tokens);

@@ -290,6 +290,7 @@ async fn async_main() -> ExitCode {
         db.conn.clone(),
         data_dir.clone(),
     );
+    let chat_authoring_config = stack.authoring.clone();
     let internal_sessions =
         match codeg_lib::auto_title::InternalAgentSessionRegistry::load(db.conn.clone(), &data_dir)
             .await
@@ -392,6 +393,7 @@ async fn async_main() -> ExitCode {
         feedback_config: stack.feedback.clone(),
         question_config: stack.ask.clone(),
         session_info_config: stack.sessions.clone(),
+        chat_authoring_config: chat_authoring_config.clone(),
         system_op_lock: codeg_lib::app_state::default_system_op_lock(),
         update_state: codeg_lib::app_state::default_update_state(),
     });
@@ -468,6 +470,21 @@ async fn async_main() -> ExitCode {
     )
     .await;
     codeg_lib::app_state::spawn_tool_watchdog_supervisor(state.connection_manager.clone_ref());
+    // Same for the chat-authoring flags, so the first companion launch knows
+    // whether to advertise `create_automation` / `create_work_task`.
+    codeg_lib::commands::chat_authoring::apply_persisted_chat_authoring_config(
+        &state.db.conn,
+        &chat_authoring_config,
+    )
+    .await;
+    // Keep ACP model terminal fallbacks aligned with the same default-shell
+    // preference used by the built-in terminal before accepting connections.
+    let terminal_shell_config = state.connection_manager.terminal_shell_config();
+    codeg_lib::commands::system_settings::apply_persisted_terminal_shell_config(
+        &state.db.conn,
+        &terminal_shell_config,
+    )
+    .await;
 
     // Spawn the delegation listener so companion processes can round-trip
     // through the broker. Path is PID-scoped, so the listener owns it for
@@ -620,6 +637,38 @@ async fn async_main() -> ExitCode {
         state.delegation_runtime_settings.clone(),
     ) {
         tokio::spawn(codeg_lib::automation::run_automation_engine(engine));
+    }
+
+    // Work-task engine (mirrors lib.rs setup): manual pipeline, event-bus
+    // settlement, merging git-truth recovery. One per process.
+    if let Some(engine) = codeg_lib::work_task::build_task_engine(
+        codeg_lib::db::AppDatabase {
+            conn: state.db.conn.clone(),
+        },
+        state.connection_manager.clone_ref(),
+        state.emitter.clone(),
+        state.acp_event_bus.clone(),
+        state.data_dir.clone(),
+    ) {
+        tokio::spawn(codeg_lib::work_task::run_task_engine(engine));
+    }
+
+    // Label worktree folders registered before aliases were seeded at creation
+    // with the branch they have checked out (mirrors lib.rs setup). Background;
+    // changed folders are broadcast, so a browser that already fetched its
+    // folder list still picks them up.
+    {
+        let db = codeg_lib::db::AppDatabase {
+            conn: state.db.conn.clone(),
+        };
+        let emitter = state.emitter.clone();
+        tokio::spawn(async move {
+            let n =
+                codeg_lib::commands::folders::backfill_worktree_folder_aliases(&emitter, &db).await;
+            if n > 0 {
+                tracing::info!("[folders] labeled {n} worktree folder(s) by branch");
+            }
+        });
     }
 
     // Sweep abandoned upload staging files from any prior run before

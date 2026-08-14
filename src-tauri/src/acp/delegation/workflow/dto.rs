@@ -705,7 +705,10 @@ mod tests {
         );
         let value = serde_json::to_value(&snap).expect("serialize snapshot value");
         assert_eq!(value["nodes"][0]["sync_state"], "in_sync");
-        assert_eq!(value["nodes"][0]["projection_warning_codes"], serde_json::json!([]));
+        assert_eq!(
+            value["nodes"][0]["projection_warning_codes"],
+            serde_json::json!([])
+        );
     }
 
     #[test]
@@ -792,7 +795,10 @@ mod tests {
                 "can_create_simple_successor": false,
             })
         );
-        assert_eq!(archived_json["projection_warning_codes"], serde_json::json!([]));
+        assert_eq!(
+            archived_json["projection_warning_codes"],
+            serde_json::json!([])
+        );
         assert!(archived_json.get("simple").is_none());
     }
 }

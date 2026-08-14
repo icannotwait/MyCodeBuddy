@@ -634,6 +634,8 @@ fn parse_updates(path: &Path) -> ParsedUpdates {
                     tool_name,
                     input_preview,
                     meta: None,
+
+                    status: None,
                 });
                 turn.blocks.push(ContentBlock::ToolResult {
                     tool_use_id: Some(id.clone()),
@@ -695,6 +697,8 @@ fn parse_updates(path: &Path) -> ParsedUpdates {
                     tool_name: "context_compaction".to_string(),
                     input_preview: None,
                     meta: Some(Value::Object(meta)),
+
+                    status: None,
                 });
                 turn.blocks.push(ContentBlock::ToolResult {
                     tool_use_id: Some(id),

@@ -84,7 +84,11 @@ export interface AgentOptionsState {
  */
 export function useAgentOptions(
   agentType: AgentType,
-  folderPath: string | null = null
+  folderPath: string | null = null,
+  /** When false, the automatic probe is suppressed (no transient CLI spawn) —
+   *  for editors whose agent-override section is collapsed. `ensure()` still
+   *  probes on demand at save time. */
+  enabled: boolean = true
 ): AgentOptionsState {
   const [snapshot, setSnapshot] = useState<AgentOptionsSnapshot | null>(null)
   const [loading, setLoading] = useState(false)
@@ -129,13 +133,14 @@ export function useAgentOptions(
   )
 
   useEffect(() => {
+    if (!enabled) return
     // Debounce so switching agents/folders quickly doesn't fire a probe (CLI
     // spawn) per click; the last (agent, folder) landed on wins.
     const handle = window.setTimeout(() => {
       void load(agentType, folderPath, false)
     }, 250)
     return () => window.clearTimeout(handle)
-  }, [agentType, folderPath, load])
+  }, [agentType, folderPath, load, enabled])
 
   const reload = useCallback(
     () => load(agentType, folderPath, true),

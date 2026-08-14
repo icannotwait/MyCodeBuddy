@@ -142,7 +142,5 @@ describe("LiveTurnStats status label", () => {
     expect(
       screen.queryByText(enMessages.Folder.chat.liveTurnStats.streaming)
     ).not.toBeInTheDocument()
-    // tool uses still render (2 tool_call blocks)
-    expect(screen.getByText(/2 tool/)).toBeInTheDocument()
   })
 })

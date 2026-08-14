@@ -1,6 +1,6 @@
 [package]
 name = "codeg"
-version = "0.22.2-mycodebuddy.1"
+version = "0.25.0-mycodebuddy.1"
 description = "Agent Code Generation App"
 authors = ["feitao"]
 edition = "2021"
@@ -78,6 +78,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
+# Host IANA zone name (e.g. `Asia/Shanghai`) — chrono only exposes the offset.
+# Already in the tree as a chrono/clock dependency; named here so the
+# chat-authoring default timezone can use it directly.
+iana-time-zone = "0.1"
 cron = "0.12"
 thiserror = "2"
 dirs = "6"
@@ -91,7 +95,9 @@ tokio = { version = "1", features = ["process", "io-util", "sync", "macros", "rt
 uuid = { version = "1", features = ["v4"] }
 futures = "0.3"
 futures-lite = "2"
-reqwest = { version = "0.12", features = ["stream", "json", "multipart"] }
+# gzip/brotli: send Accept-Encoding and transparently decompress on the
+# remote-workspace proxy path, matching the server's CompressionLayer.
+reqwest = { version = "0.12", features = ["stream", "json", "multipart", "gzip", "brotli"] }
 flate2 = "1"
 bzip2 = "0.5"
 tar = "0.4"
@@ -118,13 +124,17 @@ toml_edit = "0.19"
 serde_yaml = "0.9"
 notify = "6"
 base64 = "0.22"
-agent-client-protocol-schema = { version = "0.11", features = ["unstable_session_usage", "unstable_session_fork", "unstable_session_resume", "unstable_elicitation"] }
+agent-client-protocol-schema = { version = "0.11", features = ["unstable_session_usage", "unstable_session_fork", "unstable_session_resume", "unstable_elicitation", "unstable_boolean_config"] }
 kill_tree = { version = "=0.2.4", features = ["tokio"] }
 which = "7"
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"], optional = true }
 axum = { version = "0.8", features = ["ws", "multipart"] }
 async_zip = { version = "0.0.18", features = ["tokio", "deflate"] }
-tower-http = { version = "0.6", features = ["fs", "cors"] }
+tower-http = { version = "0.6", features = ["fs", "cors", "compression-gzip", "compression-br"] }
+# Direct deps (already in the graph via axum) so the compression predicate can
+# name the exact types tower-http's `Predicate` trait is defined over.
+http = "1"
+http-body = "1"
 tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
 futures-util = "0.3"
 tokio-util = { version = "0.7", features = ["io", "rt"] }

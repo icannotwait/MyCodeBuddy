@@ -22,7 +22,7 @@
 
 import { useCallback, useEffect, useState } from "react"
 import { useTranslations } from "next-intl"
-import { Bubbles, Loader2 } from "lucide-react"
+import { Bubbles, Gauge, HardDrive, Power } from "lucide-react"
 import { toast } from "sonner"
 
 import { Button } from "@/components/ui/button"
@@ -30,6 +30,12 @@ import { ButtonGroup } from "@/components/ui/button-group"
 import { Input } from "@/components/ui/input"
 import { Switch } from "@/components/ui/switch"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import { SettingCard, SettingRow } from "@/components/shared/setting-card"
+import {
+  SettingsError,
+  SettingsSaveBar,
+  SettingsSection,
+} from "@/components/shared/settings-section"
 import {
   type DelegationSettings,
   getDelegationSettings,
@@ -173,19 +179,13 @@ export function DelegationSettingsSection() {
   ])
 
   return (
-    <section className="rounded-xl border bg-card p-4 space-y-4">
-      <div className="flex items-center gap-2">
-        <Bubbles className="h-4 w-4 text-muted-foreground" aria-hidden />
-        <h2 className="text-sm font-semibold">{t("title")}</h2>
-      </div>
-      <p className="text-xs text-muted-foreground leading-5">
-        {t("description")}
-      </p>
-
+    <SettingsSection
+      icon={Bubbles}
+      title={t("title")}
+      description={t("description")}
+    >
       {loadError && (
-        <p className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
-          {t("loadFailed", { detail: loadError })}
-        </p>
+        <SettingsError>{t("loadFailed", { detail: loadError })}</SettingsError>
       )}
 
       <Tabs defaultValue="general">
@@ -197,76 +197,69 @@ export function DelegationSettingsSection() {
           <TabsTrigger value="profiles">{t("tabProfiles")}</TabsTrigger>
         </TabsList>
 
-        <TabsContent value="general" className="space-y-4 pt-2">
-          <div className="flex items-center justify-between gap-3">
-            <div className="space-y-1 min-w-0">
-              <label
-                htmlFor="delegation-enabled"
-                className="text-sm font-medium"
-              >
-                {t("enable")}
-              </label>
-              <p className="text-xs text-muted-foreground">{t("enableHint")}</p>
-            </div>
-            <Switch
-              id="delegation-enabled"
-              checked={enabled}
-              onCheckedChange={setEnabled}
-              disabled={loading}
-              className="shrink-0"
+        {/* The kill switch and the two valves it gates are one decision, so
+            they share a card — the greyed-out inputs then read as belonging to
+            the switch above them rather than as three unrelated lines. */}
+        <TabsContent value="general" className="pt-2">
+          <SettingCard>
+            <SettingRow
+              icon={Power}
+              title={t("enable")}
+              description={t("enableHint")}
+              htmlFor="delegation-enabled"
+              control={
+                <Switch
+                  id="delegation-enabled"
+                  checked={enabled}
+                  onCheckedChange={setEnabled}
+                  disabled={loading}
+                />
+              }
             />
-          </div>
-
-          <div className="flex items-center justify-between gap-3">
-            <div className="space-y-1 min-w-0">
-              <label htmlFor="delegation-depth" className="text-sm font-medium">
-                {t("depthLimit")}
-              </label>
-              <p className="text-xs text-muted-foreground">
-                {t("depthHint", { min: DEPTH_MIN, max: DEPTH_MAX })}
-              </p>
-            </div>
-            <Input
-              id="delegation-depth"
-              type="number"
-              min={DEPTH_MIN}
-              max={DEPTH_MAX}
-              value={depth}
-              onChange={(e) => setDepth(Number(e.target.value))}
-              disabled={loading || !enabled}
-              className="w-28 shrink-0"
+            <SettingRow
+              icon={Gauge}
+              title={t("depthLimit")}
+              description={t("depthHint", { min: DEPTH_MIN, max: DEPTH_MAX })}
+              htmlFor="delegation-depth"
+              control={
+                <Input
+                  id="delegation-depth"
+                  type="number"
+                  min={DEPTH_MIN}
+                  max={DEPTH_MAX}
+                  value={depth}
+                  onChange={(e) => setDepth(Number(e.target.value))}
+                  disabled={loading || !enabled}
+                  className="h-8 w-24 bg-background text-xs"
+                />
+              }
             />
-          </div>
-
-          <div className="flex items-center justify-between gap-3">
-            <div className="space-y-1 min-w-0">
-              <label
-                htmlFor="delegation-cache-mb"
-                className="text-sm font-medium"
-              >
-                {t("completedCacheLabel")}
-              </label>
-              <p className="text-xs text-muted-foreground">
-                {t("completedCacheHint")}
-              </p>
-            </div>
-            <Input
-              id="delegation-cache-mb"
-              type="number"
-              min={0}
-              step={1}
-              value={Number.isNaN(cacheMb) ? "" : cacheMb}
-              onChange={(e) => {
-                const raw = e.target.value
-                // Empty (cleared) → NaN so `clampCacheMb` restores the default
-                // on save, instead of `Number("") === 0` silently persisting
-                // 0 (= unlimited). Explicit "0" still means unlimited.
-                setCacheMb(raw === "" ? NaN : Number(raw))
-              }}
-              disabled={loading || !enabled}
-              className="w-28 shrink-0"
+            <SettingRow
+              icon={HardDrive}
+              title={t("completedCacheLabel")}
+              description={t("completedCacheHint")}
+              htmlFor="delegation-cache-mb"
+              control={
+                <Input
+                  id="delegation-cache-mb"
+                  type="number"
+                  min={0}
+                  step={1}
+                  value={Number.isNaN(cacheMb) ? "" : cacheMb}
+                  onChange={(e) => {
+                    const raw = e.target.value
+                    // Empty (cleared) → NaN so `clampCacheMb` restores the
+                    // default on save, instead of `Number("") === 0` silently
+                    // persisting 0 (= unlimited). Explicit "0" still means
+                    // unlimited.
+                    setCacheMb(raw === "" ? NaN : Number(raw))
+                  }}
+                  disabled={loading || !enabled}
+                  className="h-8 w-24 bg-background text-xs"
+                />
+              }
             />
-          </div>
+          </SettingCard>
 
           <div className="flex items-center justify-between gap-3">
             <div className="space-y-1 min-w-0">
@@ -329,18 +322,13 @@ export function DelegationSettingsSection() {
         </TabsContent>
       </Tabs>
 
-      <div className="flex justify-end pt-2">
-        <Button onClick={save} disabled={loading || saving} size="sm">
-          {saving ? (
-            <>
-              <Loader2 className="h-3.5 w-3.5 animate-spin" />
-              {t("saving")}
-            </>
-          ) : (
-            t("save")
-          )}
-        </Button>
-      </div>
-    </section>
+      <SettingsSaveBar
+        onSave={() => void save()}
+        saving={saving}
+        disabled={loading}
+        label={t("save")}
+        savingLabel={t("saving")}
+      />
+    </SettingsSection>
   )
 }

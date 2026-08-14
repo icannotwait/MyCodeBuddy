@@ -41,10 +41,9 @@ use crate::acp::delegation::transport::{
     BrokerCommitFeedbackRequest, BrokerCompleteWorkRequest, BrokerFeedbackRequest,
     BrokerGetWorkflowStateRequest, BrokerMessage, BrokerParentDecisionRequest,
     BrokerPublishWorkflowRequest, BrokerRecoverWorkflowRequest, BrokerRecoveryAuthorizationRequest,
-    BrokerRegisterSimpleWorkflowRequest,
-    BrokerReplyDelegationRequest, BrokerRequest, BrokerResponse, BrokerSessionRequest,
-    BrokerSettleWorkflowRequest, BrokerStatusRequest, CancelDelegationReason, CompanionReadyAck,
-    CompanionRole,
+    BrokerRegisterSimpleWorkflowRequest, BrokerReplyDelegationRequest, BrokerRequest,
+    BrokerResponse, BrokerSessionRequest, BrokerSettleWorkflowRequest, BrokerStatusRequest,
+    CancelDelegationReason, CompanionReadyAck, CompanionRole,
 };
 use crate::acp::delegation::types::{
     correlation_error_message, validate_correlation_id, CorrelationEntryPoint,
@@ -52,23 +51,22 @@ use crate::acp::delegation::types::{
     DelegationStatusBatch, DelegationTaskReport, DelegationWakeReason, ParentDecisionResult,
     TaskStatus,
 };
+#[cfg(test)]
+use crate::acp::delegation::workflow::{
+    accept_complete_work_txn, ManifestDocument, PublishWorkflowRequest,
+};
 use crate::acp::delegation::workflow::{
     decide_workflow_recovery, emit_workflow_compatibility_nudge, get_workflow_state_core,
     guard_current_final_delivery_core, guard_task_final_delivery_core,
     load_completion_protocol_header, recover_workflow_core, register_simple_workflow,
-    require_v2_mutation,
-    settle_workflow_gate_v2_core, workflow_v2_publication_retired_for_conversation,
-    workflow_v2_retired_for_conversation,
-    FinalDeliveryGuardResult, PlanReviewError, RecoverWorkflowRequest,
-    SettleWorkflowV2Request, WorkflowError, WorkflowRecoveryDisposition, WorkflowStoreError,
+    require_v2_mutation, settle_workflow_gate_v2_core,
+    workflow_v2_publication_retired_for_conversation, workflow_v2_retired_for_conversation,
+    FinalDeliveryGuardResult, PlanReviewError, RecoverWorkflowRequest, SettleWorkflowV2Request,
+    WorkflowError, WorkflowRecoveryDisposition, WorkflowStoreError,
 };
 #[cfg(any(test, feature = "test-utils"))]
 use crate::acp::delegation::workflow::{
     historical_workflow_fixture_mutations_enabled, with_historical_workflow_fixture_mutations,
-};
-#[cfg(test)]
-use crate::acp::delegation::workflow::{
-    accept_complete_work_txn, ManifestDocument, PublishWorkflowRequest,
 };
 use crate::acp::feedback::{PendingFeedback, SessionFeedbackAccess};
 use crate::acp::question::{
@@ -1653,10 +1651,7 @@ impl DelegationListener {
         workflow_store_error_value(error)
     }
 
-    async fn retired_workflow_error_for_entry(
-        &self,
-        entry: &TokenEntry,
-    ) -> WorkflowStoreError {
+    async fn retired_workflow_error_for_entry(&self, entry: &TokenEntry) -> WorkflowStoreError {
         let conversation_id = self
             .parent_lookup
             .current_conversation_id(&entry.parent_connection_id)
@@ -1668,7 +1663,7 @@ impl DelegationListener {
                     Err(error @ WorkflowStoreError::WorkflowIdentityCorrupt { .. }) => error,
                     Err(_) => {
                         WorkflowStoreError::workflow_v2_retired_with_navigation(conversation_id)
-                    },
+                    }
                 }
             }
             (None, Some(conversation_id)) => {
@@ -8769,7 +8764,10 @@ mod tests {
                         response["error"]["message"],
                         crate::acp::delegation::workflow::WORKFLOW_V2_RETIRED_MESSAGE
                     );
-                    assert_eq!(response["error"]["source_conversation_id"], fixture.parent_id);
+                    assert_eq!(
+                        response["error"]["source_conversation_id"],
+                        fixture.parent_id
+                    );
                     assert_eq!(response["error"]["successor_conversation_id"], Value::Null);
                     assert_eq!(response["error"]["can_create_simple_successor"], false);
                 }
@@ -9300,10 +9298,7 @@ mod tests {
         assert_eq!(updated["progress_rel_path"], "state/progress.md");
         events.try_recv().expect("refresh after committed update");
 
-        for (token, code) in [
-            ("missing", "invalid_token"),
-            ("simple-child", "root_only"),
-        ] {
+        for (token, code) in [("missing", "invalid_token"), ("simple-child", "root_only")] {
             let denied = listener
                 .process_register_simple_workflow(BrokerRegisterSimpleWorkflowRequest {
                     token: token.into(),
@@ -9321,15 +9316,16 @@ mod tests {
             })
             .await;
         assert_eq!(invalid["error"]["code"], "workflow_invalid_path");
-        assert!(events.try_recv().is_err(), "failed writes must not emit refresh");
+        assert!(
+            events.try_recv().is_err(),
+            "failed writes must not emit refresh"
+        );
     }
 
     #[tokio::test]
     async fn manifest_publication_is_retired_before_payload_parsing_with_header() {
         use crate::acp::delegation::run_store::RunStore;
-        use crate::db::entities::{
-            delegation_workflow_manifest_revision, simple_workflow,
-        };
+        use crate::db::entities::{delegation_workflow_manifest_revision, simple_workflow};
         use crate::db::test_helpers::{
             complete_historical_completion_protocol_migrations,
             historical_completion_protocol_db_before_v2_only, seed_conversation, seed_folder,
@@ -9566,9 +9562,7 @@ mod tests {
     #[tokio::test]
     async fn manifest_publication_is_retired_for_stale_features_without_writes() {
         use crate::acp::delegation::run_store::RunStore;
-        use crate::db::entities::{
-            delegation_workflow, delegation_workflow_manifest_revision,
-        };
+        use crate::db::entities::{delegation_workflow, delegation_workflow_manifest_revision};
         use crate::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
         use sea_orm::PaginatorTrait;
 

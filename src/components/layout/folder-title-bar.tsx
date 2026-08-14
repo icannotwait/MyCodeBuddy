@@ -20,6 +20,7 @@ import { useAuxPanelContext } from "@/contexts/aux-panel-context"
 import { useTerminalContext } from "@/contexts/terminal-context"
 import { useTabActions } from "@/contexts/tab-context"
 import { useWorkbenchRoute } from "@/contexts/workbench-route-context"
+import { WorkbenchRouteChromeActions } from "@/components/workbench/workbench-content"
 import { MAC_TRAFFIC_LIGHT_INSET } from "@/lib/window-chrome"
 import { cn } from "@/lib/utils"
 import { WindowControls } from "./window-controls"
@@ -50,7 +51,7 @@ export function FolderTitleBar() {
   const { activeFolder } = useActiveFolder()
   const isChatMode = useIsActiveChatMode()
   const { openNewConversationTab, openChatModeTab } = useTabActions()
-  const { openConversations } = useWorkbenchRoute()
+  const { isConversations, openConversations } = useWorkbenchRoute()
   const { isMac } = usePlatform()
   const showMacInset = isMac && isDesktop()
 
@@ -109,30 +110,47 @@ export function FolderTitleBar() {
       {/* Empty middle is a full-height window-drag region. */}
       <div data-tauri-drag-region className="h-full min-w-0 flex-1" />
       {/* Right cluster: terminal + aux + settings — the same controls the
-          desktop RightEdgeChrome shows, now as direct buttons (no ⋯ menu). */}
+          desktop RightEdgeChrome shows, now as direct buttons (no ⋯ menu),
+          plus the active full-page route's own page-level controls. The way OUT
+          of such a route is the breadcrumb at the head of its title (the route
+          overlay renders the same WorkbenchRouteStrip the desktop shell does),
+          so there is no back arrow here. */}
       <div className="flex shrink-0 items-center gap-1 pr-2">
-        <Button
-          variant="ghost"
-          size="icon"
-          className={cn("h-8 w-8 shrink-0", terminalOpen && "bg-accent")}
-          onClick={() => toggleTerminal()}
-          disabled={!activeFolder}
-          title={tTitleBar("toggleTerminal")}
-          aria-label={tTitleBar("toggleTerminal")}
-        >
-          <SquareTerminal className="h-4 w-4" />
-        </Button>
-        <Button
-          variant="ghost"
-          size="icon"
-          className={cn("h-8 w-8 shrink-0", auxPanelOpen && "bg-accent")}
-          onClick={toggleAuxPanel}
-          disabled={!activeFolder && !isChatMode}
-          title={tTitleBar("toggleAuxPanel")}
-          aria-label={tTitleBar("toggleAuxPanel")}
-        >
-          <PanelRight className="h-4 w-4" />
-        </Button>
+        {/* Conversations only, exactly as on desktop (see RightEdgeChrome): a
+            full-page route overlays the workspace the terminal and aux panel act
+            on, so toggling either there does nothing you can see. This bar sits
+            ABOVE that overlay, which is why the condition has to be repeated
+            here. */}
+        {isConversations && (
+          <>
+            <Button
+              variant="ghost"
+              size="icon"
+              className={cn("h-8 w-8 shrink-0", terminalOpen && "bg-accent")}
+              onClick={() => toggleTerminal()}
+              disabled={!activeFolder}
+              title={tTitleBar("toggleTerminal")}
+              aria-label={tTitleBar("toggleTerminal")}
+            >
+              <SquareTerminal className="h-4 w-4" />
+            </Button>
+            <Button
+              variant="ghost"
+              size="icon"
+              className={cn("h-8 w-8 shrink-0", auxPanelOpen && "bg-accent")}
+              onClick={toggleAuxPanel}
+              disabled={!activeFolder && !isChatMode}
+              title={tTitleBar("toggleAuxPanel")}
+              aria-label={tTitleBar("toggleAuxPanel")}
+            >
+              <PanelRight className="h-4 w-4" />
+            </Button>
+          </>
+        )}
+        <WorkbenchRouteChromeActions
+          buttonClassName="h-8 w-8 shrink-0"
+          iconClassName="h-4 w-4"
+        />
         <Button
           variant="ghost"
           size="icon"

@@ -107,10 +107,9 @@ use crate::acp::delegation::types::{
     cold_task_report_message, correlation_error_message, validate_correlation_id,
     AgentDelegationDefaults, CorrelationEntryPoint, CorrelationFailureKind, DelegationError,
     DelegationOutcome, DelegationProfile, DelegationRecoveryProjection, DelegationReplyResult,
-    DelegationRequest, DelegationStatusBatch, DelegationTaskReport,
-    DelegationTaskReportExtension, DelegationWakeReason, ObservationSnapshot,
-    ParentDecisionResult, ParentTurnEndReason, TaskObservation, TaskStatus,
-    WorkflowRetirementNavigation, DELEGATE_TO_AGENT_TOOL,
+    DelegationRequest, DelegationStatusBatch, DelegationTaskReport, DelegationTaskReportExtension,
+    DelegationWakeReason, ObservationSnapshot, ParentDecisionResult, ParentTurnEndReason,
+    TaskObservation, TaskStatus, WorkflowRetirementNavigation, DELEGATE_TO_AGENT_TOOL,
 };
 use crate::acp::delegation::workflow::admission::append_admitted_completion_instruction;
 #[cfg(test)]
@@ -6114,11 +6113,9 @@ impl DelegationBroker {
         // child allocation, budget, authorization, or task-run reservation.
         // The transaction fence in RunStore remains the race backstop.
         if let Some(runs) = self.run_store.as_ref() {
-            if let Err(error) = require_writable_conversation_workflow(
-                &runs.db().conn,
-                req.parent_conversation_id,
-            )
-            .await
+            if let Err(error) =
+                require_writable_conversation_workflow(&runs.db().conn, req.parent_conversation_id)
+                    .await
             {
                 self.drop_inflight(inflight_id).await;
                 return report_err(
@@ -9327,11 +9324,9 @@ impl DelegationBroker {
             );
         };
 
-        if let Err(error) = require_writable_conversation_workflow(
-            &runs.db().conn,
-            req.parent_conversation_id,
-        )
-        .await
+        if let Err(error) =
+            require_writable_conversation_workflow(&runs.db().conn, req.parent_conversation_id)
+                .await
         {
             self.drop_inflight(inflight_id).await;
             return report_err(
@@ -14869,6 +14864,14 @@ impl DelegationBroker {
     ) -> Vec<DelegationTaskReport> {
         self.get_tasks_status(parent_connection_id, None, &task_ids, wait)
             .await
+    }
+
+    /// Wake every parked status long-poll so it can re-probe its children.
+    ///
+    /// Called by the lifecycle dispatcher when any connection raises or resolves
+    /// a blocking prompt — permission, question, or plan approval.
+    pub fn note_blocking_changed(&self) {
+        self.result_notify.notify_waiters();
     }
 
     /// Event-driven Join: park until every requested task is non-Running, any
@@ -35421,10 +35424,8 @@ mod tests {
             &self,
             runs: &RunStore,
             task_id: &str,
-        ) -> Result<
-            Option<crate::acp::delegation::workflow::WorkflowChildMcpBinding>,
-            TaskStoreError,
-        > {
+        ) -> Result<Option<crate::acp::delegation::workflow::WorkflowChildMcpBinding>, TaskStoreError>
+        {
             crate::acp::delegation::workflow::with_historical_workflow_fixture_mutations(
                 runs.workflow_child_mcp_binding(task_id),
             )
@@ -35439,12 +35440,8 @@ mod tests {
             wait: StatusWait,
         ) -> DelegationTaskReport {
             crate::acp::delegation::workflow::with_historical_workflow_fixture_mutations(
-                self.0.get_task_status(
-                    parent_connection_id,
-                    parent_conversation_id,
-                    task_id,
-                    wait,
-                ),
+                self.0
+                    .get_task_status(parent_connection_id, parent_conversation_id, task_id, wait),
             )
             .await
         }
@@ -35661,11 +35658,11 @@ mod tests {
         broker
             .settle_terminal(
                 runs.as_ref(),
-            &run.task_id,
-            TerminalTaskWrite::legacy_without_audit(
-                TaskStatus::Canceled,
-                Some("parent_canceled".into()),
-            ),
+                &run.task_id,
+                TerminalTaskWrite::legacy_without_audit(
+                    TaskStatus::Canceled,
+                    Some("parent_canceled".into()),
+                ),
             )
             .await
             .unwrap();
@@ -36054,14 +36051,14 @@ mod tests {
     #[tokio::test]
     async fn workflow_v2_retired_launch_matrix_rejects_mutations_without_side_effects() {
         use crate::acp::delegation::types::ContinueDelegationRequest;
-        use crate::db::AppDatabase;
+        use crate::db::entities::delegation_workflow::CompletionProtocolMode;
         use crate::db::entities::{
             conversation, delegation_attention_request, delegation_lineage_budget,
-            delegation_plan_round_authorization, delegation_task_run,
-            delegation_work_unit_budget, delegation_workflow_manifest_revision,
-            delegation_workflow_outbox_event, recovery_authorization,
+            delegation_plan_round_authorization, delegation_task_run, delegation_work_unit_budget,
+            delegation_workflow_manifest_revision, delegation_workflow_outbox_event,
+            recovery_authorization,
         };
-        use crate::db::entities::delegation_workflow::CompletionProtocolMode;
+        use crate::db::AppDatabase;
         use sea_orm::{EntityTrait, PaginatorTrait};
 
         async fn side_effect_counts(db: &AppDatabase) -> [u64; 9] {
@@ -36129,11 +36126,7 @@ mod tests {
                     CompletionProtocolMode::V2Shadow,
                     "unsupported_completion_protocol",
                 ),
-                (
-                    2,
-                    CompletionProtocolMode::V2Enforce,
-                    "workflow_v2_retired",
-                ),
+                (2, CompletionProtocolMode::V2Enforce, "workflow_v2_retired"),
             ]
         }
 

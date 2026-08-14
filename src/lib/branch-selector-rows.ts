@@ -2,8 +2,8 @@
  * Flat, virtualization-ready row model for the branch selector popup.
  *
  * The rich branch selector (`BranchDropdown`) renders operations (pull / fetch /
- * commit / push / new branch / worktree / stash / manage remotes) AND the full
- * local+remote branch tree as ONE searchable, virtualized, flat list — mirroring
+ * commit / push / new branch / worktree) AND the full local+remote branch tree
+ * as ONE searchable, virtualized, flat list — mirroring
  * the model picker's `flattenModelGroups` + `ModelOptionList` split. This module
  * is the pure half: it flattens the prefix-grouped {@link BranchTreeNode} trees
  * (from `@/lib/branch-tree`) plus the operation metadata into a linear
@@ -36,8 +36,20 @@ export type BranchLeafAction =
   | "switch"
   | "merge"
   | "rebase"
+  /** Update the branch in place, without checking it out. */
+  | "pull"
+  /** Publish the branch, without checking it out. Local branches only. */
+  | "push"
   | "delete"
   | "deleteRemote"
+  /**
+   * Remove the worktree holding this branch, keeping the branch (and its
+   * workspace folder, for a worktree you mean to recreate). Worktree branches
+   * only — they are the ones `delete` can never touch.
+   */
+  | "deleteWorktree"
+  /** Remove the worktree, the branch, and the worktree's workspace folder. */
+  | "deleteWorktreeAndBranch"
 
 export type BranchRow =
   | {
@@ -399,4 +411,47 @@ export function buildBranchRows(input: BuildBranchRowsInput): BranchRow[] {
 /** Row kinds the keyboard cursor can land on (skips separators + empty rows). */
 export function isNavigableRow(row: BranchRow): boolean {
   return row.kind !== "separator" && row.kind !== "empty"
+}
+
+/**
+ * The per-branch actions offered for a leaf, in three groups: what this branch
+ * does to the CURRENT one (switch/merge/rebase), what it syncs with its remote
+ * (pull/push — both in place, no checkout), and the destructive tail. "push" is
+ * local-only: publishing `origin/x` is meaningless.
+ *
+ * The destructive tail depends on where the branch lives:
+ * - remote → "deleteRemote", except for the remote branch the current local
+ *   branch tracks (deleting that is nonsensical), which gets nothing;
+ * - local, checked out in another worktree → the two worktree removals, and NOT
+ *   "delete": git refuses to delete a branch a worktree holds, so plain delete
+ *   there is an error message with extra steps;
+ * - local, checked out in the repo's own main working tree → nothing, since
+ *   neither of those escapes applies to it (see `isMainWorktree`);
+ * - plain local → "delete".
+ */
+export function branchLeafActions({
+  isRemote,
+  isTracking,
+  isWorktree,
+  isMainWorktree = false,
+}: Pick<
+  Extract<BranchRow, { kind: "leaf" }>,
+  "isRemote" | "isTracking" | "isWorktree"
+> & {
+  /**
+   * This branch is the one the repo's *main* working tree has checked out (only
+   * ever true when viewing from a linked worktree). Its checkout is the repo
+   * itself, so neither removal applies and plain delete would still be refused —
+   * it gets no destructive action at all.
+   */
+  isMainWorktree?: boolean
+}): BranchLeafAction[] {
+  const actions: BranchLeafAction[] = ["switch", "merge", "rebase", "pull"]
+  if (!isRemote) actions.push("push")
+  if (isTracking) return actions
+  if (isRemote) actions.push("deleteRemote")
+  else if (isMainWorktree) return actions
+  else if (isWorktree) actions.push("deleteWorktree", "deleteWorktreeAndBranch")
+  else actions.push("delete")
+  return actions
 }

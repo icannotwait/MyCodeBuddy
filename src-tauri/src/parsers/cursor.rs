@@ -10,9 +10,9 @@ use crate::models::{
     AgentType, ContentBlock, ConversationDetail, ConversationSummary, MessageTurn, TurnRole,
 };
 use crate::parsers::{
-    compute_session_stats, folder_name_from_path, merge_context_window_stats,
-    relocate_orphaned_tool_results, structurize_read_tool_output, title_from_user_text,
-    truncate_str, visible_user_text, AgentParser, ParseError,
+    backfill_turn_durations, compute_session_stats, folder_name_from_path,
+    merge_context_window_stats, relocate_orphaned_tool_results, structurize_read_tool_output,
+    title_from_user_text, truncate_str, visible_user_text, AgentParser, ParseError,
 };
 
 /// Caps mirroring the Grok parser: bound a single tool output / input preview
@@ -185,6 +185,10 @@ impl CursorParser {
         );
         relocate_orphaned_tool_results(&mut turns);
         structurize_read_tool_output(&mut turns);
+        // Cursor's own `turn_timings` win; this only reaches turns the store
+        // never timed (and in a store with no clock at all it changes nothing —
+        // those turns share one synthetic timestamp, so every span is zero).
+        backfill_turn_durations(&mut turns, &[]);
 
         // Cursor records only a session-level context meter (token_details);
         // pair it with the turns' aggregate stats so the status bar shows the
@@ -1056,6 +1060,7 @@ fn build_turns(
                         input_preview: bounded_json_preview(
                             &serde_json::json!({ "command": command }),
                         ),
+                        status: None,
                         meta: None,
                     },
                     ContentBlock::ToolResult {
@@ -1422,6 +1427,7 @@ fn decode_tool_call(
         tool_use_id: Some(id.clone()),
         tool_name: tool.name,
         input_preview: tool.input.as_ref().and_then(bounded_json_preview_ref),
+        status: None,
         meta: None,
     });
     blocks.push(ContentBlock::ToolResult {

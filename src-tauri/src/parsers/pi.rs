@@ -12,10 +12,10 @@ use crate::models::{
     TurnRole, TurnUsage, UnifiedMessage,
 };
 use crate::parsers::{
-    compute_session_stats, folder_name_from_path, infer_context_window_max_tokens,
-    latest_turn_total_usage_tokens, merge_context_window_stats, relocate_orphaned_tool_results,
-    resolve_patch_line_numbers, structurize_read_tool_output, title_from_user_text, truncate_str,
-    visible_title, visible_user_text, AgentParser, ParseError,
+    backfill_turn_durations, compute_session_stats, folder_name_from_path,
+    infer_context_window_max_tokens, latest_turn_total_usage_tokens, merge_context_window_stats,
+    relocate_orphaned_tool_results, resolve_patch_line_numbers, structurize_read_tool_output,
+    title_from_user_text, truncate_str, visible_title, visible_user_text, AgentParser, ParseError,
 };
 
 /// Resolve the `pi` coding agent's sessions directory, honoring (highest
@@ -144,6 +144,7 @@ impl PiParser {
         relocate_orphaned_tool_results(&mut turns);
         structurize_read_tool_output(&mut turns);
         resolve_patch_line_numbers(&mut turns, parsed.cwd.as_deref());
+        backfill_turn_durations(&mut turns, &[]);
 
         let used_tokens = latest_turn_total_usage_tokens(&turns);
         let max_tokens = infer_context_window_max_tokens(parsed.model.as_deref());
@@ -441,6 +442,7 @@ fn parse_bash_execution(sp: &mut SessionParse, value: &Value, ts: DateTime<Utc>,
             tool_use_id: tool_use_id.clone(),
             tool_name: "bash".to_string(),
             input_preview: (!command.is_empty()).then_some(command),
+            status: None,
             meta: None,
         }],
         ts,
@@ -524,6 +526,7 @@ fn assistant_content_blocks(content: Option<&Value>) -> Vec<ContentBlock> {
                     tool_use_id,
                     tool_name,
                     input_preview: tool_arguments_preview(item.get("arguments")),
+                    status: None,
                     meta: None,
                 });
             }

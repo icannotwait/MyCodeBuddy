@@ -1,10 +1,21 @@
 "use client"
 
 import { useCallback, useEffect, useState } from "react"
-import { Loader2, MonitorCog, RefreshCw, SquareTerminal } from "lucide-react"
+import {
+  Cpu,
+  FolderCog,
+  Loader2,
+  RefreshCw,
+  SquareTerminal,
+} from "lucide-react"
 import { useTranslations } from "next-intl"
 import { toast } from "sonner"
 
+import { SettingCard, SettingRow } from "@/components/shared/setting-card"
+import {
+  SettingsError,
+  SettingsSection,
+} from "@/components/shared/settings-section"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { ScrollArea } from "@/components/ui/scroll-area"
@@ -15,6 +26,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
+import { Switch } from "@/components/ui/switch"
 import {
   getAvailableTerminalShells,
   getSystemRenderingSettings,
@@ -30,10 +42,9 @@ import { usePlatform } from "@/hooks/use-platform"
 import { relaunchApp } from "@/lib/updater"
 import { toErrorMessage } from "@/lib/app-error"
 import { ConversationExperienceSettingsSection } from "@/components/settings/conversation-experience-settings"
+import { NotificationSoundSettingsSection } from "@/components/settings/notification-sound-settings"
 import { DelegationSettingsSection } from "@/components/settings/delegation-settings"
-import { SessionFeedbackSettingsSection } from "@/components/settings/session-feedback-settings"
-import { AskQuestionSettingsSection } from "@/components/settings/ask-question-settings"
-import { SessionInfoSettingsSection } from "@/components/settings/session-info-settings"
+import { AgentToolsSettingsSection } from "@/components/settings/agent-tools-settings"
 
 const TERMINAL_SHELL_OPTION_SYSTEM = "system"
 const TERMINAL_SHELL_OPTION_CUSTOM = "custom"
@@ -258,34 +269,50 @@ export function GeneralSettings() {
         </section>
 
         {loadError && (
-          <div className="rounded-md border border-red-500/30 bg-red-500/5 px-3 py-2 text-xs text-red-400">
+          <SettingsError>
             {t("loadFailed", { message: loadError })}
-          </div>
+          </SettingsError>
         )}
 
-        <section className="rounded-xl border bg-card p-4 space-y-4">
-          <div className="flex items-center gap-2">
-            <SquareTerminal className="h-4 w-4 text-muted-foreground" />
-            <h2 className="text-sm font-semibold">{t("terminalTitle")}</h2>
-          </div>
-
-          <p className="text-xs text-muted-foreground leading-5">
-            {t("terminalDescription")}
-          </p>
-
-          <div className="space-y-2">
-            <label className="text-xs font-medium text-muted-foreground">
-              {t("defaultTerminalShell")}
-            </label>
+        {/* The section is the picker: heading, purpose and control on one line,
+            with what the shell currently resolves to under them. A card holding
+            a single row would only say the heading back one line lower. */}
+        <SettingsSection
+          icon={SquareTerminal}
+          title={t("terminalTitle")}
+          description={
+            <>
+              {t("terminalDescription")}
+              {availableShells ? (
+                <span className="mt-1 block">
+                  {t("terminalCurrentShell", {
+                    path:
+                      availableShells.resolved_shell ??
+                      availableShells.effective_shell,
+                  })}
+                </span>
+              ) : null}
+              <span className="mt-1 block">{t("terminalAgentShellHint")}</span>
+            </>
+          }
+          htmlFor="terminal-default-shell"
+          control={
             <Select
               value={selectedShellId}
               onValueChange={onShellSelectChange}
               disabled={savingTerminal || !availableShells}
             >
-              <SelectTrigger className="w-full sm:w-64">
+              {/* `size` rather than a bare `h-8`: the trigger's height is
+                  gated on `data-size`, which outranks an ungated utility
+                  in the class list. */}
+              <SelectTrigger
+                id="terminal-default-shell"
+                size="sm"
+                className="w-52 bg-background text-xs"
+              >
                 <SelectValue />
               </SelectTrigger>
-              <SelectContent align="start">
+              <SelectContent align="end">
                 {availableShells?.options.map((opt) => (
                   <SelectItem key={opt.id} value={opt.id}>
                     <span className="flex items-center gap-2">
@@ -300,21 +327,19 @@ export function GeneralSettings() {
                 ))}
               </SelectContent>
             </Select>
-            {availableShells && (
-              <p className="text-[11px] text-muted-foreground">
-                {t("terminalCurrentShell", {
-                  path: availableShells.effective_shell,
-                })}
-              </p>
-            )}
-
-            {selectedShellId === TERMINAL_SHELL_OPTION_CUSTOM && (
-              <div className="space-y-2 pt-2">
-                <label className="text-xs font-medium text-muted-foreground">
-                  {t("terminalShellCustomPath")}
-                </label>
+          }
+        >
+          {selectedShellId === TERMINAL_SHELL_OPTION_CUSTOM && (
+            <SettingCard>
+              <SettingRow
+                icon={FolderCog}
+                title={t("terminalShellCustomPath")}
+                description={t("terminalShellCustomHint")}
+                htmlFor="terminal-custom-shell"
+              >
                 <div className="flex gap-2">
                   <Input
+                    id="terminal-custom-shell"
                     value={customShellPath}
                     onChange={(event) => {
                       setCustomShellPath(event.target.value)
@@ -322,9 +347,10 @@ export function GeneralSettings() {
                     }}
                     placeholder={t("terminalShellCustomPlaceholder")}
                     disabled={savingTerminal}
-                    className="flex-1"
+                    className="h-8 flex-1 bg-background font-mono text-xs"
                   />
                   <Button
+                    type="button"
                     size="sm"
                     onClick={onCustomPathSave}
                     disabled={savingTerminal || !customShellPath.trim()}
@@ -337,48 +363,43 @@ export function GeneralSettings() {
                     {t("terminalShellNotFoundWarning")}
                   </p>
                 )}
-                <p className="text-[11px] text-muted-foreground">
-                  {t("terminalShellCustomHint")}
-                </p>
-              </div>
-            )}
-          </div>
-        </section>
+              </SettingRow>
+            </SettingCard>
+          )}
+        </SettingsSection>
 
         {renderingSectionVisible && (
-          <section className="rounded-xl border bg-card p-4 space-y-4">
-            <div className="flex items-center gap-2">
-              <MonitorCog className="h-4 w-4 text-muted-foreground" />
-              <h2 className="text-sm font-semibold">{t("renderingTitle")}</h2>
-            </div>
-
-            <p className="text-xs text-muted-foreground leading-5">
-              {t("renderingDescription")}
-            </p>
-
-            <label className="inline-flex items-center gap-2 text-sm">
-              <input
-                type="checkbox"
+          // Titled by the option, not by the category it belongs to: the switch
+          // turns acceleration *off*, so labelling it "Rendering" would read as
+          // the opposite of what it does.
+          <SettingsSection
+            icon={Cpu}
+            title={t("disableHardwareAcceleration")}
+            description={t("renderingDescription")}
+            htmlFor="disable-hardware-acceleration"
+            control={
+              <Switch
+                id="disable-hardware-acceleration"
                 checked={disableHwAccel}
                 disabled={savingRendering}
-                onChange={(event) => {
-                  const next = event.target.checked
+                onCheckedChange={(next) => {
                   const prev = disableHwAccel
                   setDisableHwAccel(next)
-                  saveRenderingSettings(next, prev)
+                  void saveRenderingSettings(next, prev)
                 }}
               />
-              {t("disableHardwareAcceleration")}
-            </label>
-
+            }
+          >
             {renderingDirty && (
-              <div className="flex items-center justify-between gap-3 rounded-md border bg-muted/20 px-3 py-2 text-xs">
-                <span className="text-muted-foreground">
+              <div className="flex items-center justify-between gap-3 rounded-lg border border-border/70 bg-muted/40 px-3 py-2 text-xs">
+                <span className="min-w-0 text-muted-foreground">
                   {t("restartRequired")}
                 </span>
                 <Button
+                  type="button"
                   size="sm"
-                  onClick={restartNow}
+                  className="shrink-0"
+                  onClick={() => void restartNow()}
                   disabled={savingRendering}
                 >
                   <RefreshCw className="h-3.5 w-3.5" />
@@ -386,18 +407,16 @@ export function GeneralSettings() {
                 </Button>
               </div>
             )}
-          </section>
+          </SettingsSection>
         )}
 
         <ConversationExperienceSettingsSection />
 
+        <NotificationSoundSettingsSection />
+
         <DelegationSettingsSection />
 
-        <SessionFeedbackSettingsSection />
-
-        <AskQuestionSettingsSection />
-
-        <SessionInfoSettingsSection />
+        <AgentToolsSettingsSection />
       </div>
     </ScrollArea>
   )

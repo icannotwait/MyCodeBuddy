@@ -1,7 +1,7 @@
 "use client"
 
 import type { ReactElement } from "react"
-import { useCallback, useEffect, useMemo, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import {
   ArrowRight,
   ChevronsDownUp,
@@ -279,6 +279,12 @@ interface PushWorkspaceProps {
   folderPath: string
   folderName: string
   folderId?: number | null
+  /**
+   * Branch to push, from the window's `?branch=` — set when the branch selector
+   * opened this window for one specific branch. `null` targets the checked-out
+   * branch, which is what every other entry point does.
+   */
+  initialBranch?: string | null
   onPushed?: () => void
 }
 
@@ -286,12 +292,25 @@ export function PushWorkspace({
   folderPath,
   folderName,
   folderId,
+  initialBranch = null,
   onPushed,
 }: PushWorkspaceProps) {
   const t = useTranslations("Folder.pushWindow")
   const tLog = useTranslations("Folder.gitLogTab")
   const { withCredentialRetry } = useGitCredential()
 
+  // The branch every query below is scoped to. Seeded from the URL, but the
+  // window is reused per folder — a second per-branch push raises this same
+  // window, so `push://retarget-branch` moves it (see the effect below).
+  const [targetBranch, setTargetBranch] = useState<string | null>(initialBranch)
+  // Bumped per commit-list load so a superseded response can't land (see
+  // `loadCommits`).
+  const commitsGenRef = useRef(0)
+  // Mirrors the live target so an in-flight load can tell whether the branch it
+  // describes is still the one on screen — the generation counter alone can't,
+  // since a retarget resets state without going through `loadCommits`.
+  const targetBranchRef = useRef(targetBranch)
+  targetBranchRef.current = targetBranch
   const [pushInfoData, setPushInfoData] = useState<GitPushInfo | null>(null)
   const [selectedRemote, setSelectedRemote] = useState<string | null>(null)
   const [commits, setCommits] = useState<GitLogEntry[]>([])
@@ -311,10 +330,40 @@ export function PushWorkspace({
     [commits]
   )
 
-  // Load push info (branch, remotes, tracking remote)
+  // Everything downstream — the remote picker, the commit list, the push button
+  // — describes ONE branch, so a retarget has to tear all of it down together.
+  //
+  // Done DURING RENDER, not in the effect below. A passive effect commits one
+  // render first, and in that render `targetBranch` is already B while
+  // `pushInfoData`/`selectedRemote` still describe A — the push button is live
+  // in that frame and `handlePush` would publish B to A's remote. It would also
+  // let the `[selectedRemote, loadCommits]` effect fire once with A's remote
+  // before the queued null lands. React's "adjust state during render" pattern
+  // (https://react.dev/reference/react/useState#storing-information-from-previous-renders)
+  // re-renders in place, so no such frame is ever committed. Same trick as the
+  // git-log tab's per-folder filter restore.
+  const [renderedBranch, setRenderedBranch] = useState(targetBranch)
+  if (renderedBranch !== targetBranch) {
+    setRenderedBranch(targetBranch)
+    setPushInfoData(null)
+    setSelectedRemote(null)
+    setCommits([])
+    // Back to the conservative default: paired with `commits: []` this keeps the
+    // push button disabled until the new branch's log actually lands.
+    setHasUpstream(true)
+    setOpenByCommit({})
+    setSelectedFile(null)
+    setSelectedCommit(null)
+  }
+
+  // Load push info (branch, remotes, tracking remote) for the target branch.
   useEffect(() => {
-    gitPushInfo(folderPath)
+    let cancelled = false
+    gitPushInfo(folderPath, targetBranch)
       .then((info) => {
+        // A retarget mid-flight supersedes this response — writing it would show
+        // the previous branch's remote against the new branch's commits.
+        if (cancelled) return
         setPushInfoData(info)
         // Default to tracking remote or first remote
         const defaultRemote =
@@ -323,9 +372,63 @@ export function PushWorkspace({
         setSelectedRemote(defaultRemote)
       })
       .catch((err) => {
+        if (cancelled) return
         toast.error(toErrorMessage(err))
       })
-  }, [folderPath])
+    return () => {
+      cancelled = true
+    }
+  }, [folderPath, targetBranch])
+
+  // A per-branch push raises the folder's existing push window instead of
+  // opening a second one, so the backend tells the live window which branch it
+  // should now be pointed at.
+  //
+  // Read off the Tauri channel directly, NOT through `subscribe()`: window
+  // management always runs in the LOCAL backend, while on a remote connection
+  // this window's transport is bound to the REMOTE server's event stream and
+  // would never see this event. Outside Tauri the import just fails and this
+  // no-ops — web mode reuses the window by name, which navigates it to the new
+  // URL and re-reads `?branch=` instead.
+  //
+  // Scoped to THIS window rather than the global `listen()`: the backend
+  // addresses the event with `emit_to(<label>)`, but Tauri delivers to any
+  // JS listener registered with the default `Any` target regardless of that
+  // address (see `match_any_or_filter`). Registering against this window's own
+  // label is what makes the address actually bind — otherwise a push window for
+  // the same folder id on a DIFFERENT connection (ids are scoped per
+  // connection) would retarget itself too. The folder_id check below stays as a
+  // second line of defence.
+  useEffect(() => {
+    if (folderId == null) return
+    let unlisten: (() => void) | null = null
+    let cancelled = false
+    import("@tauri-apps/api/webviewWindow")
+      .then(({ getCurrentWebviewWindow }) =>
+        getCurrentWebviewWindow().listen<{
+          folder_id: number
+          // null = the plain "push" entry, i.e. back to the checked-out branch.
+          branch: string | null
+        }>("push://retarget-branch", (event) => {
+          if (cancelled || event.payload.folder_id !== folderId) return
+          setTargetBranch(event.payload.branch ?? null)
+        })
+      )
+      .then((fn) => {
+        if (cancelled) {
+          fn()
+          return
+        }
+        unlisten = fn
+      })
+      .catch(() => {
+        // Not in Tauri — see above.
+      })
+    return () => {
+      cancelled = true
+      unlisten?.()
+    }
+  }, [folderId])
 
   // Deduplicate remotes (git remote -v returns fetch + push entries)
   const uniqueRemotes = useMemo(() => {
@@ -340,23 +443,49 @@ export function PushWorkspace({
 
   const loadCommits = useCallback(
     async (remote?: string) => {
+      // Two guards, because they catch different things:
+      //
+      // `gen` catches a NEWER LOAD (a remote switch) superseding this one.
+      //
+      // `branchAtRequest` catches a RETARGET, which `gen` cannot: the reset runs
+      // in the render body without going through this function, so a load
+      // already in flight for branch A keeps a matching generation and would
+      // happily repaint A's commits over the cleared B window — leaving the user
+      // reviewing A's commits under B's push button, which is the one thing this
+      // window exists to prevent.
+      const gen = ++commitsGenRef.current
+      const branchAtRequest = targetBranch
       setListLoading(true)
       try {
+        // `git_log` already scopes both the commit list AND the per-commit
+        // pushed flag to a named branch, so targeting one needs nothing new.
         const result = await gitLog(
           folderPath,
           100,
-          undefined,
+          targetBranch ?? undefined,
           remote ?? undefined
         )
+        if (
+          gen !== commitsGenRef.current ||
+          branchAtRequest !== targetBranchRef.current
+        )
+          return
         setCommits(result.entries)
         setHasUpstream(result.has_upstream)
       } catch (err) {
+        if (
+          gen !== commitsGenRef.current ||
+          branchAtRequest !== targetBranchRef.current
+        )
+          return
         toast.error(toErrorMessage(err))
       } finally {
-        setListLoading(false)
+        // Deliberately NOT branch-guarded: whoever owns the latest generation
+        // owns the flag, so it always clears and can't strand the spinner.
+        if (gen === commitsGenRef.current) setListLoading(false)
       }
     },
-    [folderPath]
+    [folderPath, targetBranch]
   )
 
   // Reload commits when selected remote changes
@@ -394,7 +523,8 @@ export function PushWorkspace({
       )?.url
       const hint: GitRemoteHint = remoteUrl ? { remoteUrl } : { folderPath }
       await withCredentialRetry(
-        (creds) => gitPush(folderPath, selectedRemote, creds, folderId),
+        (creds) =>
+          gitPush(folderPath, selectedRemote, creds, folderId, targetBranch),
         hint
       )
       onPushed?.()
@@ -540,8 +670,14 @@ export function PushWorkspace({
             <div className="border-t p-2">
               <Button
                 className="w-full"
+                // Also inert until the branch on screen is fully described:
+                // mid-retarget the remote and the commit list still belong to
+                // the previous branch, and pushing then would publish this
+                // branch to that branch's remote.
                 disabled={
                   pushing ||
+                  listLoading ||
+                  !pushInfoData ||
                   uniqueRemotes.length === 0 ||
                   (hasUpstream && unpushedCommits.length === 0)
                 }

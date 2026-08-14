@@ -6,6 +6,7 @@ import {
   parseBackgroundLaunch,
   parseBackgroundTaskEnvelope,
   parseBackgroundTaskEnvelopes,
+  stripGrokSubagentScaffolding,
 } from "@/lib/background-task"
 import type { AdaptedToolCallPart } from "@/lib/adapters/ai-elements-adapter"
 
@@ -254,8 +255,10 @@ describe("Grok TaskOutput envelopes", () => {
         grokPoll({ output: null, state: "input-available" })
       )
     ).toBe(true)
-    // Same tool polling a sub-agent: its result is a different payload, so the
-    // call leaves the lane as soon as it settles.
+    // Same tool polling a sub-agent whose payload is an UNKNOWN shape (fields
+    // nested under `Result` — not the flat 0.2.11x envelope): fail-safe out of
+    // the lane. The real flat envelope now parses — see the
+    // "SubagentCompleted" describe below.
     expect(
       isBackgroundTaskToolCall(
         grokPoll({
@@ -266,11 +269,10 @@ describe("Grok TaskOutput envelopes", () => {
         })
       )
     ).toBe(false)
-    // …and it leaves the lane even when the sub-agent payload never reaches
-    // `output` at all: no backend path serializes a `SubagentCompleted`
-    // rawOutput, so the settled poll arrives with an empty result. Keying the
-    // input-shape claim on "still in flight" (not on "has foreign output") is
-    // what stops it from rendering as a permanently running background row.
+    // …and it leaves the lane when a settled poll carries no output at all
+    // (an older backend that dropped the envelope). Keying the input-shape
+    // claim on "still in flight" (not on "has foreign output") is what stops
+    // it from rendering as a permanently running background row.
     expect(
       isBackgroundTaskToolCall(
         grokPoll({ output: null, state: "output-available" })
@@ -321,6 +323,122 @@ describe("Grok TaskOutput envelopes", () => {
       }),
     ])
     expect(rows[0].badge).toBe("failed")
+  })
+})
+
+describe("Grok SubagentCompleted envelopes (0.2.11x sub-agent polls)", () => {
+  // The flat shape the backend now passes through verbatim
+  // (`parsers/grok.rs::grok_task_output_envelope`): fields sit directly on the
+  // envelope, unlike `TaskOutput`'s nested `Result`. 0.2.9x instead folded
+  // sub-agents into `TaskOutput.Result` with a `[subagent:<type>]` command —
+  // parsing this restores that era's lane behavior.
+  const SUBAGENT_DONE = JSON.stringify({
+    type: "SubagentCompleted",
+    subagent_id: "019f9432-e0d8-74c3-bd02-0772c4e04a65",
+    subagent_type: "explore",
+    description: "Explore test pages",
+    status: "completed",
+    tool_calls: 35,
+    turns: 1,
+    duration_ms: 63775,
+    output: "## Codebase exploration summary",
+  })
+
+  it("parses the flat envelope into a sub-agent poll row", () => {
+    const env = parseBackgroundTaskEnvelope(SUBAGENT_DONE)
+    expect(env).not.toBeNull()
+    expect(env!.kind).toBe("poll")
+    expect(env!.taskId).toBe("019f9432-e0d8-74c3-bd02-0772c4e04a65")
+    expect(env!.taskType).toBe("subagent")
+    expect(env!.status).toBe("completed")
+    expect(env!.command).toBe("[subagent:explore] Explore test pages")
+    expect(env!.output).toBe("## Codebase exploration summary")
+  })
+
+  it("maps a cancelled sub-agent to the stopped kind", () => {
+    const env = parseBackgroundTaskEnvelope(
+      JSON.stringify({
+        type: "SubagentCompleted",
+        subagent_id: "s1",
+        status: "cancelled",
+      })
+    )
+    expect(env!.kind).toBe("stop")
+  })
+
+  it("rejects an empty envelope (nothing identifying)", () => {
+    expect(
+      parseBackgroundTaskEnvelope(JSON.stringify({ type: "SubagentCompleted" }))
+    ).toBeNull()
+  })
+
+  it("routes a settled flat sub-agent poll into the background lane", () => {
+    expect(isBackgroundTaskToolCall(grokPoll({ output: SUBAGENT_DONE }))).toBe(
+      true
+    )
+    const rows = buildBackgroundTaskRows([grokPoll({ output: SUBAGENT_DONE })])
+    expect(rows).toHaveLength(1)
+    expect(rows[0].badge).toBe("completed")
+    expect(rows[0].command).toBe("[subagent:explore] Explore test pages")
+    expect(rows[0].isSubagent).toBe(true)
+  })
+})
+
+describe("Grok sub-agent rows", () => {
+  // Verbatim tail of a real 0.2.9x `TaskOutput.Result.output` for a polled
+  // sub-agent (session 019fe6be…, `pnpm build`): the report ends with two
+  // machine-facing blocks addressed to the parent model.
+  const REPORT = [
+    "## Build Result: **Succeeded**",
+    "",
+    "Optimized production build completed successfully.",
+    "",
+    "<subagent_meta>id=019fe6bf-0bcb-70c2-a02d-e5c006dfc32a, type=general-purpose, tool_calls=1, turns=1, duration_ms=18651</subagent_meta>",
+    "",
+    "<subagent_result>",
+    "subagent_id: 019fe6bf-0bcb-70c2-a02d-e5c006dfc32a",
+    "subagent_type: general-purpose",
+    'To continue this subagent\'s conversation, use resume_from="019fe6bf-0bcb-70c2-a02d-e5c006dfc32a".',
+    "</subagent_result>",
+  ].join("\n")
+
+  const SUBAGENT_TASK_OUTPUT = JSON.stringify({
+    type: "TaskOutput",
+    Result: {
+      task_id: "019fe6bf-0bcb-70c2-a02d-e5c006dfc32a",
+      command: "[subagent:general-purpose] Run pnpm build",
+      status: "completed",
+      exit_code: 0,
+      output: REPORT,
+    },
+  })
+
+  it("strips the meta / result scaffolding from the displayed output", () => {
+    expect(stripGrokSubagentScaffolding(REPORT)).toBe(
+      "## Build Result: **Succeeded**\n\nOptimized production build completed successfully."
+    )
+  })
+
+  it("returns non-Grok output untouched (same reference)", () => {
+    const plain = "$ next build\n✓ Compiled successfully\n"
+    expect(stripGrokSubagentScaffolding(plain)).toBe(plain)
+    expect(stripGrokSubagentScaffolding(null)).toBeNull()
+  })
+
+  it("flags a 0.2.9x `[subagent:…]` TaskOutput row and cleans its output", () => {
+    const rows = buildBackgroundTaskRows([
+      grokPoll({ output: SUBAGENT_TASK_OUTPUT }),
+    ])
+    expect(rows).toHaveLength(1)
+    expect(rows[0].isSubagent).toBe(true)
+    expect(rows[0].output).not.toContain("<subagent_meta>")
+    expect(rows[0].output).not.toContain("resume_from")
+    expect(rows[0].output).toContain("## Build Result")
+  })
+
+  it("leaves an ordinary background shell row alone", () => {
+    const rows = buildBackgroundTaskRows([poll({ output: COMPLETED })])
+    expect(rows[0].isSubagent).toBe(false)
   })
 })
 

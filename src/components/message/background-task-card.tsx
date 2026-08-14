@@ -19,6 +19,7 @@
 import { useId, useMemo, useState } from "react"
 import {
   Ban,
+  Bot,
   CheckCircleIcon,
   ChevronDown,
   ChevronRight,
@@ -36,6 +37,7 @@ import {
   type BackgroundTaskRow,
 } from "@/lib/background-task"
 import { Badge } from "@/components/ui/badge"
+import { MessageResponse } from "@/components/ai-elements/message"
 import { Shimmer } from "@/components/ai-elements/shimmer"
 import { Terminal } from "@/components/ai-elements/terminal"
 
@@ -92,9 +94,13 @@ function BackgroundTaskRowView({ row }: { row: BackgroundTaskRow }) {
   const isError = row.badge === "failed"
   const isRunning = row.badge === "running"
 
+  // A Grok sub-agent row is not a shell: a terminal glyph over a prose report
+  // reads as "here comes a log". Mirrors the Agent capsule's own icon family.
+  const RowIcon = row.isSubagent ? Bot : TerminalIcon
+
   const header = (
     <>
-      <TerminalIcon
+      <RowIcon
         className={cn(
           "size-3.5 shrink-0",
           isError ? "text-destructive" : "text-muted-foreground"
@@ -150,15 +156,30 @@ function BackgroundTaskRowView({ row }: { row: BackgroundTaskRow }) {
       ) : (
         <div className="flex w-full items-center gap-2 px-3 py-2">{header}</div>
       )}
-      {hasOutput && expanded && (
-        <div id={panelId} className="border-t border-border">
-          <Terminal
-            output={row.output ?? ""}
-            isStreaming={row.isInFlight}
-            className="max-h-80 rounded-none border-0"
-          />
-        </div>
-      )}
+      {hasOutput &&
+        expanded &&
+        (row.isSubagent ? (
+          // A sub-agent's result is a written report (headings, tables, fenced
+          // code), not a shell stream — the ANSI terminal panel rendered it as
+          // a wall of monospace. Same prose treatment the delegation card gives
+          // a child agent's result (`delegation-status-row.tsx`).
+          <div
+            id={panelId}
+            className="max-h-80 overflow-auto border-t border-border px-3 py-2"
+          >
+            <div className='prose prose-sm max-w-none break-words text-xs dark:prose-invert [&_ol]:list-inside [&_ul]:list-inside [&_[data-streamdown="code-block-body"]]:max-h-96 [&_[data-streamdown="code-block-body"]]:overflow-auto'>
+              <MessageResponse>{row.output ?? ""}</MessageResponse>
+            </div>
+          </div>
+        ) : (
+          <div id={panelId} className="border-t border-border">
+            <Terminal
+              output={row.output ?? ""}
+              isStreaming={row.isInFlight}
+              className="max-h-80 rounded-none border-0"
+            />
+          </div>
+        ))}
     </>
   )
 }

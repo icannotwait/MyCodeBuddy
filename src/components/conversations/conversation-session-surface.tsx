@@ -3,6 +3,7 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { useTranslations } from "next-intl"
 import { toast } from "sonner"
+import { AlertCircle, Loader2, Plus, RefreshCw } from "lucide-react"
 import {
   getCachedSelectors,
   useAcpActions,
@@ -369,6 +370,7 @@ export const ConversationSessionSurface = memo(
     const tWelcome = useTranslations("Folder.chat.welcomeInputPanel")
     const tDiag = useTranslations("DiagnosticsSettings")
     const sharedT = useTranslations("Folder.chat.shared")
+    const tMessageList = useTranslations("Folder.chat.messageList")
     const refreshConversations = useAppWorkspaceStore(
       (s) => s.refreshConversations
     )
@@ -2169,6 +2171,51 @@ export const ConversationSessionSurface = memo(
       )
     }, [delegatedOpenIntent, effectiveConversationId, setLiveOwnsActiveTurn])
 
+    const acpLoadErrorBanner =
+      hasPersistedConversation && acpLoadError ? (
+        <div
+          role="alert"
+          className="flex w-full items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive"
+        >
+          <AlertCircle aria-hidden="true" className="h-4 w-4 shrink-0" />
+          <span
+            className="min-w-0 flex-1 overflow-hidden text-ellipsis whitespace-nowrap"
+            title={acpLoadError}
+          >
+            {acpLoadError}
+          </span>
+          {canShowDetailErrorActions && (
+            <>
+              <button
+                type="button"
+                onClick={handleReloadDetail}
+                disabled={detailLoading}
+                aria-busy={detailLoading}
+                className="flex shrink-0 items-center gap-1 rounded border border-destructive/40 px-2 py-0.5 font-medium transition-colors hover:bg-destructive/10 disabled:pointer-events-none disabled:opacity-50"
+              >
+                {detailLoading ? (
+                  <Loader2
+                    aria-hidden="true"
+                    className="h-3 w-3 animate-spin"
+                  />
+                ) : (
+                  <RefreshCw aria-hidden="true" className="h-3 w-3" />
+                )}
+                {tMessageList("errorActionReload")}
+              </button>
+              <button
+                type="button"
+                onClick={handleOpenNewSession}
+                className="flex shrink-0 items-center gap-1 rounded border border-destructive/40 px-2 py-0.5 font-medium transition-colors hover:bg-destructive/10"
+              >
+                <Plus aria-hidden="true" className="h-3 w-3" />
+                {tMessageList("errorActionNewSession")}
+              </button>
+            </>
+          )}
+        </div>
+      ) : null
+
     const goalControlValue = useMemo<GoalControlValue>(() => {
       const live =
         conn.connectionId !== null &&
@@ -2339,6 +2386,7 @@ export const ConversationSessionSurface = memo(
         attachmentTabId={tabId}
         draftStorageKey={draftStorageKey}
         hideInput={isWelcomeMode || Boolean(acpLoadError)}
+        composerBanner={acpLoadErrorBanner}
         feedbackList={
           feedback.showList ? (
             <FeedbackNotesDisplay notes={feedback.notes} />

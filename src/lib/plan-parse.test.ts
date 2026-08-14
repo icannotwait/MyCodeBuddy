@@ -62,6 +62,16 @@ describe("isPlanModeToolName", () => {
     expect(isPlanModeToolName("exit_plan_mode")).toBe(true)
     expect(isPlanModeToolName("switch_mode")).toBe(true)
     expect(isPlanModeToolName("switchMode")).toBe(true)
+    expect(isPlanModeToolName("plan_review")).toBe(true)
+    expect(isPlanModeToolName("planReview")).toBe(true)
+  })
+
+  it("plan_review is also plan-like, harmlessly (the seeded call has no input)", () => {
+    // codex-acp ≥1.1.8's review gate contains "plan", so it matches the broader
+    // predicate too. That is fine: codeg seeds the call WITHOUT rawInput, so
+    // agent-plan's extractor finds no entries and builds no PlanCard.
+    expect(isPlanLikeToolName("plan_review")).toBe(true)
+    expect(isPlanModeToolName("plan_review")).toBe(true)
   })
 
   it("is narrower than isPlanLikeToolName: update_plan is plan-like, not plan-mode", () => {
@@ -73,7 +83,9 @@ describe("isPlanModeToolName", () => {
 
   it("returns false for unrelated and plan-named-but-not-mode tools", () => {
     expect(isPlanModeToolName("TodoWrite")).toBe(false)
-    expect(isPlanModeToolName("plan_review")).toBe(false)
+    // `plan_review` moved to the positive set (codex-acp ≥1.1.8's review gate),
+    // so keep a different plan-named work tool as the negative example.
+    expect(isPlanModeToolName("plan_summary")).toBe(false)
     expect(isPlanModeToolName("Bash")).toBe(false)
   })
 })

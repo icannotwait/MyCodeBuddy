@@ -12,9 +12,9 @@ import {
   type KeyboardEvent as ReactKeyboardEvent,
   type ReactNode,
 } from "react"
-import { revealItemInDir } from "@/lib/platform"
+import { revealItemInDir, subscribe } from "@/lib/platform"
 import ignore from "ignore"
-import { Check, ChevronRight } from "lucide-react"
+import { Check, ChevronRight, Link2 } from "lucide-react"
 import { useTranslations } from "next-intl"
 import { toast } from "sonner"
 import { useActiveFolder } from "@/contexts/active-folder-context"
@@ -63,7 +63,13 @@ import {
   type FileTreeDragPayload,
 } from "@/lib/file-tree-dnd"
 import { ScrollArea } from "@/components/ui/scroll-area"
-import type { FileTreeNode, GitBranchList, GitStatusEntry } from "@/lib/types"
+import {
+  FOLDER_LINKS_CHANGED_EVENT,
+  type FileTreeNode,
+  type FolderLinksChanged,
+  type GitBranchList,
+  type GitStatusEntry,
+} from "@/lib/types"
 import {
   FileTree,
   FileTreeFolder,
@@ -682,6 +688,10 @@ function RenderNode({
   // Desktop native drags don't emit DOM dragover, so a directory also lights up
   // when it's the drop zone broadcast from the Tauri DRAG_OVER hit-test.
   const desktopDropDir = useContext(DesktopDropDirContext)
+  // The backend flags every directory that is a symlink on disk, so this badges
+  // links the user made with `ln -s` at any depth — not just the top-level ones
+  // registered through the "link folder" dialog.
+  const isLinkedDir = node.kind === "dir" && node.symlink === true
   const isGitignoreIgnored =
     ancestorGitignoreIgnored || gitignoreIgnoredPaths.has(node.path)
 
@@ -897,6 +907,14 @@ function RenderNode({
         <FileTreeFolder
           path={node.path}
           name={node.name}
+          suffix={
+            isLinkedDir ? (
+              <Link2
+                className="h-3 w-3 shrink-0 text-muted-foreground"
+                aria-label={t("linkedFolder")}
+              />
+            ) : undefined
+          }
           nameClassName={
             isGitignoreIgnored
               ? GITIGNORE_MUTED_CLASS
@@ -1218,6 +1236,7 @@ export function FileTreeTab() {
     local: [],
     remote: [],
     worktree_branches: [],
+    main_worktree_branch: null,
   })
   const [compareBranchLoading, setCompareBranchLoading] = useState(false)
   const [compareRecentOpen, setCompareRecentOpen] = useState(true)
@@ -1244,6 +1263,11 @@ export function FileTreeTab() {
   const lazyLoadingDirPathsRef = useRef<Map<string, number>>(new Map())
   const loadDirectoryChildrenRef = useRef<
     ((dirPath: string) => Promise<void>) | null
+  >(null)
+  // `fetchTree` is defined below; effects declared above it reach it through
+  // this ref (naming it directly in their deps would hit the TDZ).
+  const fetchTreeRef = useRef<
+    ((options?: { silent?: boolean }) => Promise<void>) | null
   >(null)
   const expandedPathsRef = useRef<Set<string>>(new Set([FILE_TREE_ROOT_PATH]))
   const workspaceTreeRef = useRef<FileTreeNode[]>(sourceTree)
@@ -1290,6 +1314,32 @@ export function FileTreeTab() {
       lazyLoadGenerationRef.current
     )
   }, [folder?.path])
+
+  const folderId = folder?.id ?? null
+
+  // Links can be added from the sidebar menu or another window, so converge on
+  // the backend broadcast rather than only on local mutations. The rows' link
+  // badges ride along on the refreshed tree — every directory node carries a
+  // `symlink` flag — so there is nothing else to refetch here.
+  useEffect(() => {
+    let disposed = false
+    let unlisten: (() => void) | undefined
+    void (async () => {
+      const dispose = await subscribe<FolderLinksChanged>(
+        FOLDER_LINKS_CHANGED_EVENT,
+        (payload) => {
+          if (payload.folder_id !== folderId) return
+          void fetchTreeRef.current?.({ silent: true })
+        }
+      )
+      if (disposed) dispose()
+      else unlisten = dispose
+    })()
+    return () => {
+      disposed = true
+      unlisten?.()
+    }
+  }, [folderId])
 
   // Derive the tree's focus from the externally-active file: opening a file from
   // another surface (search, a file tab) — or clicking one here, which opens it —
@@ -1495,6 +1545,10 @@ export function FileTreeTab() {
       void loader(path)
     }
   }, [folder?.path, sourceTree, treeGeneration])
+
+  useEffect(() => {
+    fetchTreeRef.current = fetchTree
+  }, [fetchTree])
 
   useEffect(() => {
     expandedPathsRef.current = expandedPaths
@@ -2279,7 +2333,12 @@ export function FileTreeTab() {
     // Also drop the loaded branch list so a compare dialog reopened under the
     // new folder starts empty (loading) rather than briefly showing — and
     // letting the user act on — the previous folder's branches.
-    setCompareBranchList({ local: [], remote: [], worktree_branches: [] })
+    setCompareBranchList({
+      local: [],
+      remote: [],
+      worktree_branches: [],
+      main_worktree_branch: null,
+    })
     setCompareCurrentBranch(null)
     setCompareBranchLoading(false)
     resetDirectoryGitActionDialog()
@@ -2373,7 +2432,12 @@ export function FileTreeTab() {
 
   const loadCompareBranches = useCallback(async () => {
     if (!folder?.path) {
-      setCompareBranchList({ local: [], remote: [], worktree_branches: [] })
+      setCompareBranchList({
+        local: [],
+        remote: [],
+        worktree_branches: [],
+        main_worktree_branch: null,
+      })
       setCompareCurrentBranch(null)
       return
     }
@@ -2392,7 +2456,12 @@ export function FileTreeTab() {
       if (branchesResult.status === "fulfilled") {
         setCompareBranchList(branchesResult.value)
       } else {
-        setCompareBranchList({ local: [], remote: [], worktree_branches: [] })
+        setCompareBranchList({
+          local: [],
+          remote: [],
+          worktree_branches: [],
+          main_worktree_branch: null,
+        })
         const message =
           branchesResult.reason instanceof Error
             ? branchesResult.reason.message
@@ -2410,7 +2479,12 @@ export function FileTreeTab() {
       // not clobber (nor toggle the loading of) a compare dialog reopened under
       // folder B.
       if (gen !== loadGenRef.current) return
-      setCompareBranchList({ local: [], remote: [], worktree_branches: [] })
+      setCompareBranchList({
+        local: [],
+        remote: [],
+        worktree_branches: [],
+        main_worktree_branch: null,
+      })
       setCompareCurrentBranch(null)
       const message = toErrorMessage(error)
       toast.error(t("toasts.loadBranchesFailed"), { description: message })

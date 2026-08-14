@@ -8,7 +8,6 @@ use crate::app_state::AppState;
 use crate::commands::system_settings as settings_commands;
 use crate::commands::system_settings::{
     LANGUAGE_SETTINGS_UPDATED_EVENT, SYSTEM_LANGUAGE_SETTINGS_KEY, SYSTEM_PROXY_SETTINGS_KEY,
-    SYSTEM_TERMINAL_SETTINGS_KEY, TERMINAL_SETTINGS_UPDATED_EVENT,
 };
 use crate::db::service::app_metadata_service;
 use crate::models::*;
@@ -139,29 +138,18 @@ pub async fn update_system_terminal_settings(
     Extension(state): Extension<Arc<AppState>>,
     Json(params): Json<UpdateTerminalSettingsParams>,
 ) -> Result<Json<SystemTerminalSettings>, AppCommandError> {
-    let settings = settings_commands::normalize_terminal_settings(params.settings);
-    let db = &state.db;
-
-    let serialized = serde_json::to_string(&settings).map_err(|e| {
-        AppCommandError::invalid_input("Failed to serialize terminal settings")
-            .with_detail(e.to_string())
-    })?;
-
-    app_metadata_service::upsert_value(&db.conn, SYSTEM_TERMINAL_SETTINGS_KEY, &serialized)
-        .await
-        .map_err(AppCommandError::from)?;
-
+    let config = state.connection_manager.terminal_shell_config();
+    let settings = settings_commands::set_system_terminal_settings_core(
+        &state.db.conn,
+        &config,
+        &state.emitter,
+        params.settings,
+    )
+    .await?;
     let selection_key = terminal_shell_selection_key(&settings);
     state
         .connection_manager
         .refresh_terminal_shell_staleness(&selection_key)
         .await;
-
-    crate::web::event_bridge::emit_event(
-        &state.emitter,
-        TERMINAL_SETTINGS_UPDATED_EVENT,
-        settings.clone(),
-    );
-
     Ok(Json(settings))
 }

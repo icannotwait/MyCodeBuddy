@@ -48,7 +48,7 @@ use crate::acp::terminal_context::{finalize_acp_launch_config, AcpLaunchConfig, 
 use crate::acp::termination::AcpDisconnectOrigin;
 use crate::acp::types::{
     AcpEvent, AgentOptionsSnapshot, ConfigStaleKind, ConnectionInfo, ConnectionStatus,
-    ForkResultInfo, PromptInputBlock,
+    ForkResultInfo, PromptCapabilitiesInfo, PromptInputBlock,
 };
 use crate::auto_title::{
     capture_prompt_context, ConnectionLaunchContext, ConnectionPurpose, PromptCaptureContext,
@@ -454,6 +454,8 @@ pub struct ConnectionManager {
     /// tests; in production initialized from env via
     /// `spawn_handshake_timeout_from_env`.
     spawn_handshake_timeout: Duration,
+    /// Shared General Settings shell used by ACP terminal fallbacks.
+    terminal_shell_config: crate::acp::terminal_runtime::TerminalShellRuntimeConfig,
     /// Host-owned tool-execution lease registry. Shared through every
     /// `clone_ref` and stamped onto each `AgentConnection` / `SessionState`.
     pub(crate) tool_lease_registry: Arc<crate::acp::tool_watchdog::ToolExecutionLeaseRegistry>,
@@ -562,6 +564,7 @@ impl ConnectionManager {
             connections: Arc::new(Mutex::new(HashMap::new())),
             spawn_locks: Arc::new(Mutex::new(HashMap::new())),
             spawn_handshake_timeout: spawn_handshake_timeout_from_env(),
+            terminal_shell_config: crate::acp::terminal_runtime::TerminalShellRuntimeConfig::new(),
             tool_lease_registry: Arc::new(
                 crate::acp::tool_watchdog::ToolExecutionLeaseRegistry::new(
                     crate::acp::tool_watchdog::ToolWatchdogSettings::default(),
@@ -592,6 +595,7 @@ impl ConnectionManager {
             connections: self.connections.clone(),
             spawn_locks: self.spawn_locks.clone(),
             spawn_handshake_timeout: self.spawn_handshake_timeout,
+            terminal_shell_config: self.terminal_shell_config.clone(),
             tool_lease_registry: self.tool_lease_registry.clone(),
             tool_watchdog_metrics: self.tool_watchdog_metrics.clone(),
             tool_watchdog_wake: self.tool_watchdog_wake.clone(),
@@ -607,6 +611,13 @@ impl ConnectionManager {
             #[cfg(test)]
             disconnect_final_cas_hook: self.disconnect_final_cas_hook.clone(),
         }
+    }
+
+    /// Shared terminal-shell setting consumed by ACP terminal runtimes.
+    pub fn terminal_shell_config(
+        &self,
+    ) -> crate::acp::terminal_runtime::TerminalShellRuntimeConfig {
+        self.terminal_shell_config.clone()
     }
 
     /// Process-scoped tool-execution lease registry.
@@ -3378,6 +3389,8 @@ impl ConnectionManager {
                         awaiting_reply_token: Set(None),
                         delegation_run_generation: Set(None),
                         last_termination_audit_json: Set(None),
+
+                        origin_cwd: Set(None),
                     };
                     let inserted = sibling.insert(txn).await?;
                     Ok(inserted.id)
@@ -5152,6 +5165,7 @@ impl ConnectionManager {
                 title: String::new(),
                 status: state.status.clone(),
                 pending,
+                parent: None,
             });
         }
         out
@@ -5207,6 +5221,40 @@ impl ConnectionManager {
         connections
             .get(conn_id)
             .map(|conn| (conn.state.clone(), conn.emitter.clone()))
+    }
+
+    /// Wait (bounded) for the connected agent to advertise prompt capabilities.
+    ///
+    /// `None` means the wait ran out or the connection went away; callers treat
+    /// that as "no information" rather than an error.
+    pub async fn wait_for_prompt_capabilities(
+        &self,
+        conn_id: &str,
+        timeout: Duration,
+    ) -> Option<PromptCapabilitiesInfo> {
+        let state = {
+            let connections = self.connections.lock().await;
+            connections.get(conn_id)?.state.clone()
+        };
+        let start = std::time::Instant::now();
+        loop {
+            {
+                let s = state.read().await;
+                if let Some(caps) = s.prompt_capabilities.clone() {
+                    return Some(caps);
+                }
+                if matches!(
+                    s.status,
+                    ConnectionStatus::Disconnected | ConnectionStatus::Error
+                ) {
+                    return None;
+                }
+            }
+            if start.elapsed() >= timeout {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     /// Append a live-feedback note to a connection's session and broadcast it.
@@ -6819,6 +6867,7 @@ mod disconnect_origin {
             feedback: crate::acp::feedback::FeedbackRuntimeConfig::new(),
             ask: crate::acp::question::QuestionRuntimeConfig::new(),
             sessions: crate::acp::session_info::SessionInfoRuntimeConfig::new(),
+            authoring: crate::acp::chat_authoring::ChatAuthoringRuntimeConfig::new(),
             questions: Arc::new(NoQuestions),
             supervisor_wake: crate::acp::delegation::supervisor::SupervisorWake::noop(),
             metrics: Arc::new(crate::acp::delegation::metrics::DelegationMetrics::default()),
@@ -11849,17 +11898,15 @@ mod tests {
         use chrono::Utc;
         use sea_orm::{ActiveModelTrait, PaginatorTrait, Set};
 
+        use crate::db::entities::delegation_task_run::{AdmissionClass, DelegationRunStatus};
         use crate::db::entities::delegation_workflow::{
             self, CompletionProtocolMode, WorkflowState,
         };
-        use crate::db::entities::delegation_task_run::{
-            AdmissionClass, DelegationRunStatus,
-        };
         use crate::db::entities::{
             conversation, delegation_attention_request, delegation_lineage_budget,
-            delegation_plan_round_authorization, delegation_task_run,
-            delegation_work_unit_budget, delegation_workflow_manifest_revision,
-            delegation_workflow_run_binding, recovery_authorization,
+            delegation_plan_round_authorization, delegation_task_run, delegation_work_unit_budget,
+            delegation_workflow_manifest_revision, delegation_workflow_run_binding,
+            recovery_authorization,
         };
         use crate::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
 
@@ -16295,6 +16342,7 @@ mod tests {
             feedback: crate::acp::feedback::FeedbackRuntimeConfig::new(),
             ask: crate::acp::question::QuestionRuntimeConfig::new(),
             sessions: crate::acp::session_info::SessionInfoRuntimeConfig::new(),
+            authoring: crate::acp::chat_authoring::ChatAuthoringRuntimeConfig::new(),
             questions: Arc::new(NoQuestions)
                 as Arc<dyn crate::acp::question::SessionQuestionAccess>,
             plan_approvals: no_plan_approvals(),
@@ -16498,6 +16546,7 @@ mod tests {
             feedback: crate::acp::feedback::FeedbackRuntimeConfig::new(),
             ask: crate::acp::question::QuestionRuntimeConfig::new(),
             sessions: crate::acp::session_info::SessionInfoRuntimeConfig::new(),
+            authoring: crate::acp::chat_authoring::ChatAuthoringRuntimeConfig::new(),
             questions: Arc::new(NoQuestions)
                 as Arc<dyn crate::acp::question::SessionQuestionAccess>,
             plan_approvals: no_plan_approvals(),
@@ -16921,6 +16970,7 @@ mod tests {
             feedback: crate::acp::feedback::FeedbackRuntimeConfig::new(),
             ask: crate::acp::question::QuestionRuntimeConfig::new(),
             sessions: crate::acp::session_info::SessionInfoRuntimeConfig::new(),
+            authoring: crate::acp::chat_authoring::ChatAuthoringRuntimeConfig::new(),
             questions: Arc::new(ConnectionManagerQuestionLookup {
                 manager: manager.clone(),
             }),
@@ -17216,6 +17266,7 @@ mod tests {
             feedback: crate::acp::feedback::FeedbackRuntimeConfig::new(),
             ask: crate::acp::question::QuestionRuntimeConfig::new(),
             sessions: crate::acp::session_info::SessionInfoRuntimeConfig::new(),
+            authoring: crate::acp::chat_authoring::ChatAuthoringRuntimeConfig::new(),
             questions: Arc::new(ConnectionManagerQuestionLookup {
                 manager: manager.clone(),
             }),
@@ -17669,6 +17720,7 @@ mod tests {
             feedback: crate::acp::feedback::FeedbackRuntimeConfig::new(),
             ask: crate::acp::question::QuestionRuntimeConfig::new(),
             sessions: crate::acp::session_info::SessionInfoRuntimeConfig::new(),
+            authoring: crate::acp::chat_authoring::ChatAuthoringRuntimeConfig::new(),
             questions: Arc::new(ConnectionManagerQuestionLookup {
                 manager: manager.clone(),
             }),

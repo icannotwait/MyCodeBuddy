@@ -253,6 +253,12 @@ vi.mock("./conversation-message-nav", () => ({
   ConversationMessageNav: () => null,
 }))
 
+// The create-task action pulls workbench-route + tab-store contexts that this
+// unit test doesn't mount; stub it to a no-op handler.
+vi.mock("./use-create-task-from-message", () => ({
+  useCreateTaskFromMessage: () => () => {},
+}))
+
 vi.mock("@/hooks/use-acp-agents", () => ({
   useAgentThinkingVisibility: () => false,
 }))

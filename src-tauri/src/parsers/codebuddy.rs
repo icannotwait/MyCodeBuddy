@@ -280,6 +280,8 @@ impl CodeBuddyParser {
                             tool_name,
                             input_preview: tool_input_preview(&value),
                             meta: None,
+
+                            status: None,
                         }],
                         timestamp: ts,
                         usage: None,
@@ -865,6 +867,8 @@ fn agent_stats_from_subagent(
         lines_removed: None,
         other_tool_count: None,
         tool_calls,
+
+        child_session_id: None,
     })
 }
 

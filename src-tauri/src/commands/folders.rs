@@ -331,14 +331,14 @@ fn parse_count_from_output(stdout: &[u8]) -> Option<usize> {
     String::from_utf8_lossy(stdout).trim().parse::<usize>().ok()
 }
 
-fn git_command_error(operation: &str, stderr: &[u8]) -> AppCommandError {
+pub(crate) fn git_command_error(operation: &str, stderr: &[u8]) -> AppCommandError {
     let stderr = String::from_utf8_lossy(stderr).trim().to_string();
     AppCommandError::external_command(format!("git {operation} failed"), stderr)
 }
 
 use crate::git_repo::ensure_git_repo;
 
-async fn detect_conflicts(path: &str) -> Result<Vec<String>, AppCommandError> {
+pub(crate) async fn detect_conflicts(path: &str) -> Result<Vec<String>, AppCommandError> {
     let output = crate::process::tokio_command("git")
         .args(["-c", "core.quotePath=false"])
         .args(["diff", "--name-only", "--diff-filter=U"])
@@ -508,6 +508,14 @@ pub(crate) fn emit_folder_upsert(emitter: &EventEmitter, detail: FolderDetail) {
     );
 }
 
+pub(crate) fn emit_folder_deleted(emitter: &EventEmitter, folder_id: i32) {
+    crate::web::event_bridge::emit_event(
+        emitter,
+        crate::web::event_bridge::FOLDER_CHANGED_EVENT,
+        crate::web::event_bridge::FolderChange::Deleted { id: folder_id },
+    );
+}
+
 /// Emit a `folder://changed` Close so every client drops open membership.
 /// `UserRemove` is sticky (no draft re-open); `AutoEmpty` may re-open when a
 /// local draft still targets the folder. Best-effort: dropped events reconcile
@@ -569,6 +577,17 @@ pub async fn reconcile_empty_open_folders_core(
     folder_service::close_open_folders_with_no_live_conversations(&db.conn)
         .await
         .map_err(AppCommandError::from)
+}
+
+/// Label worktree folders that were registered before aliases were seeded.
+/// Upstream 0.25.0 implements this against `list_worktree_folders_missing_alias`;
+/// the fork folder_service does not yet expose that helper, so this is a no-op
+/// until that query is ported.
+pub async fn backfill_worktree_folder_aliases(
+    _emitter: &crate::web::event_bridge::EventEmitter,
+    _db: &AppDatabase,
+) -> usize {
+    0
 }
 
 pub async fn load_folder_history_core(
@@ -1773,6 +1792,7 @@ pub async fn git_worktree_add(
     path: String,
     branch_name: String,
     worktree_path: String,
+    base: Option<String>,
 ) -> Result<(), AppCommandError> {
     // 校验分支是否已存在
     let check = crate::process::tokio_command("git")
@@ -1799,9 +1819,19 @@ pub async fn git_worktree_add(
         );
     }
 
-    // 执行 git worktree add -b <branch> <path>
+    // 执行 git worktree add -b <branch> <path> [<base>]
+    let mut args = vec![
+        "worktree".to_string(),
+        "add".to_string(),
+        "-b".to_string(),
+        branch_name,
+        worktree_path,
+    ];
+    if let Some(base) = base {
+        args.push(base);
+    }
     let output = crate::process::tokio_command("git")
-        .args(["worktree", "add", "-b", &branch_name, &worktree_path])
+        .args(&args)
         .current_dir(&path)
         .output()
         .await

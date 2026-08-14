@@ -576,6 +576,7 @@ impl GeminiParser {
                     tool_use_id: tool_use_id.clone(),
                     tool_name,
                     input_preview,
+                    status: None,
                     meta: None,
                 });
 
@@ -701,24 +702,16 @@ impl GeminiParser {
             }
         }
 
-        // Approximate duration for assistant messages from adjacent timestamps
-        for i in 0..messages.len() {
-            if matches!(messages[i].role, MessageRole::Assistant)
-                && messages[i].duration_ms.is_none()
-            {
-                if let Some(next) = messages.get(i + 1) {
-                    let dur = (next.timestamp - messages[i].timestamp).num_milliseconds();
-                    if dur > 0 && dur < 300_000 {
-                        messages[i].duration_ms = Some(dur as u64);
-                    }
-                }
-            }
-        }
-
         let mut turns = group_into_turns(messages);
         super::relocate_orphaned_tool_results(&mut turns);
         super::structurize_read_tool_output(&mut turns);
         super::resolve_patch_line_numbers(&mut turns, summary.folder_path.as_deref());
+        // Gemini logs no timings, so durations are inferred from the timeline.
+        // The span that belongs to a reply is the one BEFORE it: taking the gap
+        // to the *next* message charged the last reply of a turn with however
+        // long the user then took to type (which the old `< 300_000` guard only
+        // capped at five minutes rather than excluded).
+        super::backfill_turn_durations(&mut turns, &[]);
         summary.message_count = turns.len() as u32;
         summary.id = conversation_id.to_string();
         let context_window_used_tokens = super::latest_turn_total_usage_tokens(&turns);

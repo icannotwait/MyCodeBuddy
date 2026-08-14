@@ -2,7 +2,9 @@ import {
   parseCodexListFilesTitle,
   parseCodexSearchTitle,
 } from "@/lib/codex-command-action"
+import { CODEX_SCRIPT_TOOL_NAME } from "@/lib/codex-code-mode"
 import { COLLAB_AGENT_TOOL_NAME, isCodexCollabInput } from "@/lib/collab-tool"
+import { WAIT_TOOL_NAME, WRITE_STDIN_TOOL_NAME } from "@/lib/shell-session-tool"
 
 const EXACT_TOOL_NAME_ALIASES: Record<string, string> = {
   shell_command: "bash",
@@ -27,7 +29,6 @@ const EXACT_TOOL_NAME_ALIASES: Record<string, string> = {
   change: "edit",
   "functions.change": "edit",
   changes: "edit",
-  write_stdin: "bash",
   read_file: "read",
   read_text_file: "read",
   readfile: "read",
@@ -67,10 +68,28 @@ const EXACT_TOOL_NAME_ALIASES: Record<string, string> = {
   browser_action: "webfetch",
   use_mcp_tool: "tool",
   // Codex
+  // Code-mode script card (`parsers/codex_code_mode.rs`). MUST be an exact
+  // alias: the freeform `exec(ute)?` matcher below would otherwise collapse it
+  // to "bash" and render the JS source as a shell command.
+  [CODEX_SCRIPT_TOOL_NAME]: CODEX_SCRIPT_TOOL_NAME,
+  // Unified-exec session tools. They keep their own identity (see
+  // `shell-session-tool.ts`) instead of collapsing into "bash": their arguments
+  // carry a session id, not a command, so the Terminal card's title derivation
+  // came up empty and every one of them rendered as a bare "bash" / "wait".
+  // Listed explicitly so no future freeform rule can hijack them.
+  [WAIT_TOOL_NAME]: WAIT_TOOL_NAME,
+  [WRITE_STDIN_TOOL_NAME]: WRITE_STDIN_TOOL_NAME,
   spawn_agent: "agent",
   wait_agent: "task",
   close_agent: "task",
   update_plan: "task",
+  // Grok
+  // The native sub-agent launcher. The history parser rewrites it to "Agent"
+  // and the live path classifies it from `rawInput.subagent_type`; this alias
+  // is the belt-and-braces for any path where only the raw name survives
+  // (`x.ai/tool.name` fallback with no rawInput). The freeform `\bagent\b`
+  // matcher can NOT catch it — "subagent" has no word boundary before "agent".
+  spawn_subagent: "agent",
   create_goal: "create_goal",
   "functions.create_goal": "create_goal",
   update_goal: "update_goal",
@@ -223,6 +242,53 @@ function hasAnyKey(obj: Record<string, unknown>, keys: string[]): boolean {
   )
 }
 
+/**
+ * Wire spellings that mean the same argument as one of the canonical
+ * (snake_case) keys every tool card reads. OpenCode names its tool arguments in
+ * camelCase and its ACP adapter forwards them verbatim, so the LIVE stream
+ * carries `filePath` / `oldString` where the history parser has already
+ * rewritten them (`parsers/opencode.rs::normalize_tool_call`) — the renderers
+ * only ever learned the canonical names, so a live Write card lost its path and
+ * a live Edit card lost its diff. `include` → `glob` is the same one-sided
+ * rename the history parser applies to OpenCode's grep filter.
+ */
+const TOOL_INPUT_KEY_ALIASES: ReadonlyArray<readonly [string, string]> = [
+  ["filePath", "file_path"],
+  ["notebookPath", "notebook_path"],
+  ["oldString", "old_string"],
+  ["newString", "new_string"],
+  ["newSource", "new_source"],
+  ["replaceAll", "replace_all"],
+  ["editMode", "edit_mode"],
+  ["cellType", "cell_type"],
+  ["include", "glob"],
+]
+
+/**
+ * Fill in canonical argument names an agent spelled differently on the wire.
+ *
+ * Only writes a canonical key that is ABSENT (or null/undefined) on the input,
+ * so it can never override what an agent actually sent — which makes it a
+ * no-op on every payload that was already normalized in Rust (all history) and
+ * on every agent that speaks snake_case natively. Returns the SAME object when
+ * nothing had to be added, so `useMemo` consumers keep their reference.
+ */
+export function aliasToolInputKeys(
+  parsed: Record<string, unknown> | null
+): Record<string, unknown> | null {
+  if (!parsed) return parsed
+  let out: Record<string, unknown> | null = null
+  for (const [alias, canonical] of TOOL_INPUT_KEY_ALIASES) {
+    const value = parsed[alias]
+    if (value === undefined || value === null) continue
+    const existing = parsed[canonical]
+    if (existing !== undefined && existing !== null) continue
+    out ??= { ...parsed }
+    out[canonical] = value
+  }
+  return out ?? parsed
+}
+
 function inferFromInput(
   rawInput: string | null | undefined,
   kind: string | null | undefined,
@@ -282,7 +348,20 @@ function inferFromInput(
     ])
   )
     return "bash"
-  if (hasAnyKey(parsed, ["old_string", "new_string", "replace_all"]))
+  // OpenCode names these arguments in camelCase on the wire, and its ACP
+  // adapter forwards them verbatim, so the live stream sees `oldString` where
+  // the history parser has already rewritten them to snake_case
+  // (`parsers/opencode.rs::normalize_tool_call`).
+  if (
+    hasAnyKey(parsed, [
+      "old_string",
+      "new_string",
+      "replace_all",
+      "oldString",
+      "newString",
+      "replaceAll",
+    ])
+  )
     return "edit"
   if (hasAnyKey(parsed, ["changes"])) return "edit"
   if (hasAnyKey(parsed, ["todos"])) return "todowrite"
@@ -322,7 +401,15 @@ function inferFromInput(
     )
   }
 
-  const hasPath = hasAnyKey(parsed, ["file_path", "notebook_path", "path"])
+  // `filePath` is OpenCode's spelling; `session-files.ts` already counts it as
+  // a path key, so recognising it here keeps classification and file tallies
+  // agreeing on the same payload.
+  const hasPath = hasAnyKey(parsed, [
+    "file_path",
+    "notebook_path",
+    "path",
+    "filePath",
+  ])
   if (hasPath) {
     // Check write-specific input keys first — they take priority over
     // kind/title because ACP ToolKind::Edit ("edit") is a category that
@@ -570,6 +657,14 @@ export function inferLiveToolName(params: {
   const grokToolName = extractGrokToolName(params.meta)
   if (grokToolName) return normalizeToolName(grokToolName)
 
+  // codex-acp ≥1.1.8 Plan-mode review gate. The backend seeds this tool call
+  // from the `session/request_permission` (see `is_codex_plan_review`), so it
+  // carries no `rawInput` and its human title is a question ("Implement this
+  // plan?") that the title heuristic below would happily mangle into a tool
+  // name. Resolve the identity from the marker instead — MUST stay above
+  // `byTitle` for that reason.
+  if (codexMarksPlanReview(params.meta)) return "plan_review"
+
   const byTitle = normalizeToolName(params.title ?? "")
   if (byTitle !== "tool") return byTitle
 
@@ -604,6 +699,21 @@ export function claudeCodeMarksSubagent(
   const cc = (meta as Record<string, unknown>).claudeCode
   if (!cc || typeof cc !== "object") return false
   return (cc as Record<string, unknown>).subagent === true
+}
+
+/**
+ * codex-acp ≥1.1.8 (#351) marks the Plan-mode review gate with
+ * `_meta.codex = {kind: "plan_review", planItemId}`. The backend forwards that
+ * `_meta` onto the tool call it seeds from the permission request, which is the
+ * only identity signal the card has (no `rawInput`, and a question for a title).
+ */
+export function codexMarksPlanReview(
+  meta: Record<string, unknown> | null | undefined
+): boolean {
+  if (!meta || typeof meta !== "object") return false
+  const codex = (meta as Record<string, unknown>).codex
+  if (!codex || typeof codex !== "object") return false
+  return (codex as Record<string, unknown>).kind === "plan_review"
 }
 
 /**

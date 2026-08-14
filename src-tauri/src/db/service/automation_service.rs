@@ -185,6 +185,14 @@ fn validate_draft(draft: &AutomationDraft) -> Result<(), DbError> {
     if cfg.display_text.trim().is_empty() && cfg.prompt_blocks.is_empty() {
         return Err(DbError::Validation("prompt is required".into()));
     }
+    // Enqueue-task automations feed a folder-bound board; reject a folderless
+    // draft at save so the misconfiguration never becomes a failed run.
+    if cfg.action == crate::models::AutomationAction::EnqueueTask && draft.root_folder_id.is_none()
+    {
+        return Err(DbError::Validation(
+            "a target folder is required to enqueue tasks".into(),
+        ));
+    }
     // A remote branch is resolved by minting a per-run worktree that tracks it;
     // it can't be checked out in the shared root tree (the engine would refuse
     // at fire time). Reject the combination at save so the misconfiguration
@@ -713,6 +721,22 @@ mod tests {
         assert_eq!(listed.len(), 1);
         let fetched = get(&db.conn, created.id).await.expect("get");
         assert_eq!(fetched.id, created.id);
+    }
+
+    #[tokio::test]
+    async fn enqueue_action_requires_folder() {
+        let db = fresh_in_memory_db().await;
+        let mut d = draft("queue it", None);
+        d.config = serde_json::json!({
+            "action": "enqueue_task",
+            "display_text": "do the thing",
+            "prompt_blocks": [],
+        });
+        let err = create(&db.conn, d.clone()).await.expect_err("no folder");
+        assert!(err.to_string().contains("target folder"), "got: {err}");
+
+        // Legacy configs (no action field) stay valid without a folder.
+        assert!(create(&db.conn, draft("classic", None)).await.is_ok());
     }
 
     #[tokio::test]

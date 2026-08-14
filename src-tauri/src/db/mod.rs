@@ -96,6 +96,18 @@ pub async fn init_database(
         tracing::warn!("[custom-agent] failed to hydrate custom agent registry: {e}");
     }
 
+    // Load user-authorized workspace links before any file command can run, so
+    // the workspace path guard follows exactly the symlinks the user created
+    // and nothing else. A failure here fails *closed* (registry stays empty:
+    // linked subtrees look unreadable) rather than blocking startup.
+    match crate::folder_links::hydrate(&conn).await {
+        Ok(count) if count > 0 => {
+            tracing::info!("[folder-link] hydrated {count} workspace link(s)");
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!("[folder-link] failed to hydrate workspace links: {e}"),
+    }
+
     Ok(AppDatabase { conn })
 }
 

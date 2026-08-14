@@ -2,7 +2,10 @@ import { render, screen, cleanup, within } from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
 import { afterEach, describe, expect, it, vi } from "vitest"
 
-import { InlineSessionConfigSelector } from "./session-config-selector"
+import {
+  InlineSessionConfigSelector,
+  InlineSessionConfigToggle,
+} from "./session-config-selector"
 import { deriveModelGroups } from "@/lib/model-config-groups"
 import type { SessionConfigOptionInfo } from "@/lib/types"
 
@@ -226,5 +229,76 @@ describe("InlineSessionConfigSelector — model grouping", () => {
 
     await user.click(low)
     expect(onSelect).toHaveBeenCalledWith("model", compoundLow)
+  })
+})
+
+// Cline 3.0.50's `auto_approve` — the first boolean config option any pinned
+// agent ships.
+function autoApproveOption(current: boolean): SessionConfigOptionInfo {
+  return {
+    id: "auto_approve",
+    name: "Auto-approve tools",
+    description: "Automatically approve all tool calls without asking",
+    category: null,
+    kind: { type: "boolean", current_value: current },
+  }
+}
+
+describe("InlineSessionConfigToggle", () => {
+  afterEach(() => cleanup())
+
+  it("reports its state through aria-pressed and the accessible name", () => {
+    render(
+      <InlineSessionConfigToggle
+        option={autoApproveOption(true)}
+        onSelect={vi.fn()}
+        onLabel="On"
+        offLabel="Off"
+      />
+    )
+    const button = screen.getByRole("button", {
+      name: "Auto-approve tools: On",
+    })
+    expect(button).toHaveAttribute("aria-pressed", "true")
+  })
+
+  it("flips the value on click, in both directions", async () => {
+    const user = userEvent.setup()
+    const onSelect = vi.fn()
+
+    const { rerender } = render(
+      <InlineSessionConfigToggle
+        option={autoApproveOption(false)}
+        onSelect={onSelect}
+        onLabel="On"
+        offLabel="Off"
+      />
+    )
+    expect(screen.getByRole("button")).toHaveAttribute("aria-pressed", "false")
+    await user.click(screen.getByRole("button"))
+    expect(onSelect).toHaveBeenLastCalledWith("auto_approve", "true")
+
+    rerender(
+      <InlineSessionConfigToggle
+        option={autoApproveOption(true)}
+        onSelect={onSelect}
+        onLabel="On"
+        offLabel="Off"
+      />
+    )
+    await user.click(screen.getByRole("button"))
+    expect(onSelect).toHaveBeenLastCalledWith("auto_approve", "false")
+  })
+
+  it("renders nothing for a select option", () => {
+    const { container } = render(
+      <InlineSessionConfigToggle
+        option={modelOption([{ value: "opus", name: "Opus" }])}
+        onSelect={vi.fn()}
+        onLabel="On"
+        offLabel="Off"
+      />
+    )
+    expect(container).toBeEmptyDOMElement()
   })
 })

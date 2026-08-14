@@ -22,6 +22,7 @@ import { useTranslations } from "next-intl"
 import { isValidElement } from "react"
 
 import { CodeBlock } from "./code-block"
+import { JsonTreeView, parseJsonForTree } from "./json-tree"
 import { UnifiedDiffPreview } from "@/components/diff/unified-diff-preview"
 import { MessageResponse } from "./message"
 
@@ -368,14 +369,18 @@ export const ToolOutput = ({
   let Output = <div>{output as ReactNode}</div>
 
   if (typeof output === "object" && !isValidElement(output)) {
-    Output = (
-      <CodeBlock code={JSON.stringify(output, null, 2)} language="json" />
-    )
+    // Unadapted structured result: a collapsible tree instead of a wall of
+    // pretty-printed JSON (`JsonTreeView` falls back to the code block itself
+    // for scalars and oversized payloads).
+    Output = <JsonTreeView value={output} />
   } else if (typeof output === "string") {
     const lang = detectOutputLanguage(output)
+    const jsonValue = lang === "json" ? parseJsonForTree(output) : undefined
     const shouldRenderMd =
       renderAsMarkdown ?? (lang === "log" && looksLikeMarkdown(output))
-    if (shouldRenderMd) {
+    if (jsonValue !== undefined) {
+      Output = <JsonTreeView value={jsonValue} rawText={output} />
+    } else if (shouldRenderMd) {
       Output = (
         <div className="prose prose-sm dark:prose-invert max-w-none p-3 text-sm [&_ul]:list-inside [&_ol]:list-inside">
           <MessageResponse>{output}</MessageResponse>

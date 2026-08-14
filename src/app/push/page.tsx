@@ -43,6 +43,9 @@ function PushPageInner() {
 
   const folderId = Number(searchParams.get("folderId") ?? "0")
   const normalizedFolderId = Number.isFinite(folderId) ? folderId : 0
+  // Set when the window was opened for a specific branch (the branch selector's
+  // per-branch push); absent means "whatever is checked out".
+  const initialBranch = searchParams.get("branch") || null
   const hasValidFolderId = normalizedFolderId > 0
   const loading = hasValidFolderId && state.loadedId !== normalizedFolderId
   const folder = state.loadedId === normalizedFolderId ? state.folder : null
@@ -113,6 +116,7 @@ function PushPageInner() {
             folderPath={folder.path}
             folderName={folder.name}
             folderId={folder.id}
+            initialBranch={initialBranch}
             onPushed={closeWindow}
           />
         ) : null}

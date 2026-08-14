@@ -5679,6 +5679,13 @@ const HERMES_PROVIDERS: &[HermesProvider] = &[
         needs_base_url: false,
         base_url_env_var: "NOVITA_BASE_URL",
     },
+    // New in Hermes 0.20.0 (auth.py registry gained `ai-gateway` + `vertex`).
+    HermesProvider {
+        id: "ai-gateway",
+        key_env_var: "AI_GATEWAY_API_KEY",
+        needs_base_url: false,
+        base_url_env_var: "AI_GATEWAY_BASE_URL",
+    },
     // OAuth / external-process providers — credentials set via the terminal
     // `--setup` flow; no `.env` key var.
     HermesProvider {
@@ -5726,6 +5733,16 @@ const HERMES_PROVIDERS: &[HermesProvider] = &[
     // AWS Bedrock — credentials from the AWS SDK chain.
     HermesProvider {
         id: "bedrock",
+        key_env_var: "",
+        needs_base_url: false,
+        base_url_env_var: "",
+    },
+    // Google Vertex AI (Hermes 0.20.0, `auth_type="vertex"`) — OAuth2 via
+    // service-account JSON / application-default credentials, not an API key;
+    // its endpoint is computed per request from project + region, so no
+    // base-URL field either. Configured through the terminal `--setup` flow.
+    HermesProvider {
+        id: "vertex",
         key_env_var: "",
         needs_base_url: false,
         base_url_env_var: "",
@@ -14518,6 +14535,7 @@ wire_api = "chat"
             ("tencent-tokenhub", "TOKENHUB_API_KEY"),
             ("ollama-cloud", "OLLAMA_API_KEY"),
             ("novita", "NOVITA_API_KEY"),
+            ("ai-gateway", "AI_GATEWAY_API_KEY"),
             // BYO OpenAI-compatible endpoint — key rides inline in config.yaml,
             // so it has no `.env` key var.
             ("custom", ""),
@@ -14529,6 +14547,7 @@ wire_api = "chat"
             ("google-gemini-cli", ""),
             ("copilot-acp", ""),
             ("bedrock", ""),
+            ("vertex", ""),
         ];
         assert_eq!(
             expected.len(),

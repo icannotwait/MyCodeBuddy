@@ -50,6 +50,14 @@ pub struct AgentExecutionStats {
     /// Tool calls extracted from the subagent's own JSONL transcript.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub tool_calls: Vec<AgentToolCall>,
+    /// The child's own session id, when the sub-agent ran as a standalone
+    /// session on disk rather than as chunks folded into the parent's stream
+    /// (Grok: every `spawn_subagent` child is a full session directory). Lets
+    /// the Agent card offer to open that transcript — `get_conversation`
+    /// resolves it directly even though the session is hidden from the list.
+    /// Absent for agents whose sub-agents have no separate session.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub child_session_id: Option<String>,
 }
 
 /// Image payload shared by content blocks and ACP wire events.
@@ -103,6 +111,26 @@ pub enum ContentBlock {
         tool_use_id: Option<String>,
         tool_name: String,
         input_preview: Option<String>,
+        /// The agent's own tool-call status (`pending` / `in_progress` /
+        /// `completed` / `failed`) when the transcript records one.
+        ///
+        /// OPTIONAL, and `None` means UNKNOWN — never "settled". A reader may
+        /// only act on an affirmative value, so every parser that can't honestly
+        /// supply one (all of them but grok today) keeps its existing behavior.
+        /// This exists because absence of output is NOT evidence of liveness: an
+        /// empty result still writes a `ToolResult`, grok backfills
+        /// `output_preview` only for non-empty output, and a codex code-mode
+        /// script that never `text()`s a call settles with none. A viewer
+        /// polling a RUNNING session's transcript from disk (the grok
+        /// `spawn_subagent` dialog) has no other way to tell a call that is
+        /// still working from one that finished.
+        ///
+        /// Deliberately NOT derived for codex: its `ScriptStatus::Running` is
+        /// script-level — a script can still be running after its first inner
+        /// call already completed — so copying it onto recovered inner calls
+        /// would manufacture a permanent spinner.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
         /// ACP extensibility metadata associated with the tool call. The
         /// `delegate_to_agent` lifecycle writes
         /// `meta["codeg.delegation"] = { status, child_connection_id,
@@ -138,7 +166,7 @@ pub enum ContentBlock {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,

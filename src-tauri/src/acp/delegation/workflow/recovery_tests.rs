@@ -380,13 +380,9 @@ async fn legacy_parent_disconnect_authorize_continue_then_unresumable_replace() 
     spawner
         .queue_spawn(Err(SpawnerError::Spawn("resume transport lost".into())))
         .await;
-    let failed = with_historical_workflow_fixture_mutations(
-        broker.continue_delegation(continue_request(
-            &source_task_id,
-            parent,
-            Some(authorization_id.clone()),
-        )),
-    )
+    let failed = with_historical_workflow_fixture_mutations(broker.continue_delegation(
+        continue_request(&source_task_id, parent, Some(authorization_id.clone())),
+    ))
     .await;
     assert_eq!(failed.error_code.as_deref(), Some("unresumable"));
     let continued_task_id = failed.task_id.expect("continued task id");
@@ -463,16 +459,15 @@ async fn legacy_parent_disconnect_authorize_continue_then_unresumable_replace() 
     )
     .await
     .expect("replacement child");
-    let replacement = with_historical_workflow_fixture_mutations(
-        runs.admit_gen1_reserving(replacement_insert(
+    let replacement =
+        with_historical_workflow_fixture_mutations(runs.admit_gen1_reserving(replacement_insert(
             parent,
             replacement_child.id,
             &source_task_id,
             &continued_task_id,
-        )),
-    )
-    .await
-    .expect("replacement from new latest unresumable run");
+        )))
+        .await
+        .expect("replacement from new latest unresumable run");
     assert!(matches!(
         replacement,
         crate::acp::delegation::run_store::Gen1AdmitOutcome::Created(_)

@@ -31,6 +31,9 @@ pub struct Model {
     /// Optional command that prints the locally installed version. See
     /// `CustomAgentDef::version_probe`.
     pub version_probe: Option<String>,
+    /// Whether MCP servers may be forwarded to the agent over the ACP wire.
+    /// See `CustomAgentDef::supports_mcp`.
+    pub supports_mcp: bool,
     pub created_at: DateTimeUtc,
     pub updated_at: DateTimeUtc,
 }

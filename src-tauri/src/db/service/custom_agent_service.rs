@@ -41,6 +41,7 @@ pub fn def_from_model(model: &custom_agent::Model) -> Option<CustomAgentDef> {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string),
+        supports_mcp: model.supports_mcp,
     })
 }
 
@@ -117,6 +118,7 @@ pub async fn upsert(conn: &DatabaseConnection, def: &CustomAgentDef) -> Result<(
             active.skills_dir = Set(def.skills_dir.clone());
             active.source = Set(def.source.as_str().to_string());
             active.version_probe = Set(def.version_probe.clone());
+            active.supports_mcp = Set(def.supports_mcp);
             active.updated_at = Set(now);
             active.update(conn).await?;
         }
@@ -134,6 +136,7 @@ pub async fn upsert(conn: &DatabaseConnection, def: &CustomAgentDef) -> Result<(
                 skills_dir: Set(def.skills_dir.clone()),
                 source: Set(def.source.as_str().to_string()),
                 version_probe: Set(def.version_probe.clone()),
+                supports_mcp: Set(def.supports_mcp),
                 created_at: Set(now),
                 updated_at: Set(now),
             }
@@ -194,6 +197,7 @@ mod tests {
             skills_dir: None,
             source: Default::default(),
             version_probe: None,
+            supports_mcp: true,
         }
     }
 
@@ -287,6 +291,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_mcp_opt_out_persists_and_is_editable_in_place() {
+        let db = fresh_in_memory_db().await;
+        let mut def = npx_def("mcp-row");
+        def.supports_mcp = false;
+        upsert(&db.conn, &def).await.unwrap();
+        let row = get(&db.conn, "mcp-row").await.unwrap().unwrap();
+        assert!(!row.supports_mcp);
+        assert!(!def_from_model(&row).expect("readable").supports_mcp);
+
+        // The update arm has to write it too, or turning MCP back on would
+        // appear to save and silently do nothing.
+        def.supports_mcp = true;
+        upsert(&db.conn, &def).await.unwrap();
+        assert!(
+            get(&db.conn, "mcp-row")
+                .await
+                .unwrap()
+                .unwrap()
+                .supports_mcp
+        );
+    }
+
+    #[tokio::test]
     async fn delete_reports_whether_a_row_was_removed() {
         let db = fresh_in_memory_db().await;
         upsert(&db.conn, &npx_def("gone")).await.unwrap();
@@ -313,6 +340,7 @@ mod tests {
             skills_dir: Set(None),
             source: Set("registry".into()),
             version_probe: Set(None),
+            supports_mcp: Set(true),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
         };
@@ -364,6 +392,7 @@ mod tests {
         assert_eq!(back.skills_dir.as_deref(), Some("/opt/agent/skills"));
         assert_eq!(back.source, CustomAgentSource::Manual);
         assert_eq!(back.version_probe.as_deref(), Some("qwen --version"));
+        assert!(back.supports_mcp, "the default survives the row");
         let npx = back.spec.npx.expect("npx channel survives");
         assert_eq!(npx.package, "@qwen-code/qwen-code@0.21.0");
         assert_eq!(npx.cmd.as_deref(), Some("qwen"));

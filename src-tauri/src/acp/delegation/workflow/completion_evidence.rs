@@ -3890,8 +3890,8 @@ mod tests {
 
             let task_id = format!("task-10-{}", uuid::Uuid::new_v4());
             let runs = RunStore::new(db.clone());
-            super::super::with_historical_workflow_fixture_mutations(
-                runs.admit_gen1_reserving(ReservingRunInsert {
+            super::super::with_historical_workflow_fixture_mutations(runs.admit_gen1_reserving(
+                ReservingRunInsert {
                     task_id: task_id.clone(),
                     root_task_id: task_id.clone(),
                     previous_task_id: None,
@@ -3915,8 +3915,8 @@ mod tests {
                     replaced_task_id: None,
                     replacement_reason: None,
                     started_at: Some(Utc::now()),
-                }),
-            )
+                },
+            ))
             .await
             .expect("admit Plan Author");
 
@@ -4262,8 +4262,8 @@ mod tests {
                     work_unit_key: None,
                 }),
             )
-                .await
-                .unwrap_err();
+            .await
+            .unwrap_err();
             assert_eq!(error.workflow_admission_code(), Some(expected_code));
 
             let source_run = fixture.stored_run().await;
@@ -4295,8 +4295,8 @@ mod tests {
                     started_at: Some(Utc::now()),
                 }),
             )
-                .await
-                .unwrap_err();
+            .await
+            .unwrap_err();
             assert_eq!(
                 replacement_error.workflow_admission_code(),
                 Some(expected_code)
@@ -4804,9 +4804,7 @@ mod tests {
 
     async fn completion_decision_resolved_event_count(fixture: &TerminalFixture) -> u64 {
         delegation_workflow_outbox_event::Entity::find()
-            .filter(
-                delegation_workflow_outbox_event::Column::WorkflowId.eq(&fixture.workflow_id),
-            )
+            .filter(delegation_workflow_outbox_event::Column::WorkflowId.eq(&fixture.workflow_id))
             .filter(
                 delegation_workflow_outbox_event::Column::EventKind
                     .eq(super::COMPLETION_DECISION_RESOLVED_EVENT),
@@ -4832,8 +4830,7 @@ mod tests {
             let decision_cas = decision.materialize().await.attention.unwrap();
             set_fixture_protocol(&decision, version, mode.clone()).await;
             let before = completion_mutation_snapshot(&decision).await;
-            let before_root_wake_events =
-                completion_decision_resolved_event_count(&decision).await;
+            let before_root_wake_events = completion_decision_resolved_event_count(&decision).await;
             let error = super::resolve_completion_decision_txn(
                 &decision.db,
                 decision.parent_conversation_id,
@@ -5282,16 +5279,15 @@ mod tests {
         let last_path = fixture.input.pre_read_reports.last().unwrap().path.clone();
 
         let runs = RunStore::new(fixture.db.clone());
-        let (settlement, completion) =
-            super::super::with_historical_workflow_fixture_mutations(
-                runs.settle_terminal_with_completion(
-                    &fixture.task_id,
-                    TerminalTaskWrite::completed(Utc::now(), ConversationStatus::PendingReview),
-                    Some(fixture.input.clone()),
-                ),
-            )
-            .await
-            .expect("bounded ambiguity must not roll back terminal settlement");
+        let (settlement, completion) = super::super::with_historical_workflow_fixture_mutations(
+            runs.settle_terminal_with_completion(
+                &fixture.task_id,
+                TerminalTaskWrite::completed(Utc::now(), ConversationStatus::PendingReview),
+                Some(fixture.input.clone()),
+            ),
+        )
+        .await
+        .expect("bounded ambiguity must not roll back terminal settlement");
         assert!(matches!(settlement, Settlement::Won(_)));
         assert_eq!(completion.unwrap().state, CompletionState::NeedsDecision);
         assert_eq!(
@@ -5429,19 +5425,18 @@ mod tests {
         active.update(&fixture.db.conn).await.unwrap();
 
         let runs = RunStore::new(fixture.db.clone());
-        let (settlement, completion) =
-            super::super::with_historical_workflow_fixture_mutations(
-                runs.settle_terminal_with_completion(
-                    &fixture.task_id,
-                    TerminalTaskWrite::completed(Utc::now(), ConversationStatus::PendingReview)
-                        .with_card_summary_json(
-                            r#"{"kind":"author","status":"done","plan_digest":"model"}"#,
-                        ),
-                    Some(fixture.input.clone()),
-                ),
-            )
-            .await
-            .unwrap();
+        let (settlement, completion) = super::super::with_historical_workflow_fixture_mutations(
+            runs.settle_terminal_with_completion(
+                &fixture.task_id,
+                TerminalTaskWrite::completed(Utc::now(), ConversationStatus::PendingReview)
+                    .with_card_summary_json(
+                        r#"{"kind":"author","status":"done","plan_digest":"model"}"#,
+                    ),
+                Some(fixture.input.clone()),
+            ),
+        )
+        .await
+        .unwrap();
         assert!(matches!(settlement, Settlement::Won(_)));
         assert_eq!(completion.unwrap().state, CompletionState::Resolved);
         let run = fixture.stored_run().await;
@@ -5460,21 +5455,16 @@ mod tests {
         active.update(&fixture.db.conn).await.unwrap();
 
         let runs = RunStore::new(fixture.db.clone());
-        let (settlement, completion) =
-            super::super::with_historical_workflow_fixture_mutations(
-                runs.settle_terminal_with_completion(
-                    &fixture.task_id,
-                    TerminalTaskWrite::failed(
-                        "task_failed",
-                        Utc::now(),
-                        ConversationStatus::Cancelled,
-                    )
+        let (settlement, completion) = super::super::with_historical_workflow_fixture_mutations(
+            runs.settle_terminal_with_completion(
+                &fixture.task_id,
+                TerminalTaskWrite::failed("task_failed", Utc::now(), ConversationStatus::Cancelled)
                     .with_card_summary_json(r#"{"kind":"author","status":"done"}"#),
-                    None,
-                ),
-            )
-            .await
-            .unwrap();
+                None,
+            ),
+        )
+        .await
+        .unwrap();
 
         assert!(matches!(settlement, Settlement::Won(_)));
         assert_eq!(completion, None);

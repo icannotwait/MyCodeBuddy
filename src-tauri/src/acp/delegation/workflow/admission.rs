@@ -41,8 +41,8 @@ use super::artifact_resolver::{
 };
 use super::completion_evidence::load_validated_completion_evidence;
 use super::error::{
-    require_v2_mutation_for_connection, CompletionEvidenceError,
-    WorkflowAdmissionRecoveryError, WorkflowStoreError,
+    require_v2_mutation_for_connection, CompletionEvidenceError, WorkflowAdmissionRecoveryError,
+    WorkflowStoreError,
 };
 use super::events::{emit_workflow_compatibility_nudge, emit_workflow_graph_changed};
 use super::evidence_scope::{
@@ -3180,9 +3180,9 @@ mod tests {
         conn: &C,
         input: &WorkflowAdmitInput<'_>,
     ) -> Result<WorkflowTxnSideEffect, TaskStoreError> {
-        super::super::with_historical_workflow_fixture_mutations(
-            super::admit_workflow_run_txn(conn, input),
-        )
+        super::super::with_historical_workflow_fixture_mutations(super::admit_workflow_run_txn(
+            conn, input,
+        ))
         .await
     }
 
@@ -5105,9 +5105,14 @@ mod tests {
         document.expected_manifest_revision = Some(corrected.manifest_revision);
         document.publication_token.push_str("-replacement");
         document.plan.as_mut().unwrap().digest = task9_sha256(REPLACEMENT_PLAN_BYTES);
-        publish_workflow_manifest_fixture(&db, &emitter, parent, PublishWorkflowRequest { document })
-            .await
-            .unwrap();
+        publish_workflow_manifest_fixture(
+            &db,
+            &emitter,
+            parent,
+            PublishWorkflowRequest { document },
+        )
+        .await
+        .unwrap();
 
         let replaced_state = delegation_workflow_gate_state::Entity::find_by_id((
             published.workflow_id.clone(),

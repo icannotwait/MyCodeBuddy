@@ -1,0 +1,254 @@
+import { render, screen } from "@testing-library/react"
+import userEvent from "@testing-library/user-event"
+import { NextIntlClientProvider } from "next-intl"
+import { describe, expect, it, vi } from "vitest"
+import enMessages from "@/i18n/messages/en.json"
+import type { WorkTask } from "@/lib/types"
+import { TaskCard } from "./task-card"
+
+function task(overrides?: Partial<WorkTask>): WorkTask {
+  return {
+    id: 7,
+    folder_id: 1,
+    title: "Answer the question",
+    config: null,
+    status: "review",
+    failure_reason: null,
+    last_error: null,
+    run_seq: 1,
+    sort_order: 1,
+    worktree_folder_id: 9,
+    conversation_id: null,
+    connection_id: null,
+    base_branch: "main",
+    base_sha: "abc",
+    work_branch: "task/7",
+    cleanup_state: null,
+    verdict: null,
+    result_summary: null,
+    files_changed: 0,
+    additions: 0,
+    deletions: 0,
+    merge_commit: null,
+    preflight: null,
+    archived_at: null,
+    scheduled_at: null,
+    created_at: "2026-08-01T00:00:00Z",
+    updated_at: "2026-08-01T00:00:00Z",
+    started_at: null,
+    settled_at: null,
+    finished_at: null,
+    ...overrides,
+  }
+}
+
+function renderCard(
+  t: WorkTask,
+  handlers?: Partial<Record<string, () => void>>,
+  mergeQueueRank?: number
+) {
+  const noop = () => {}
+  const props = {
+    onOpen: noop,
+    onStart: noop,
+    onCancel: noop,
+    onRetry: noop,
+    onRequeue: noop,
+    onViewSession: noop,
+    onMerge: noop,
+    onUnqueueMerge: noop,
+    onComplete: noop,
+    onArchive: noop,
+    onEdit: noop,
+    onSchedule: noop,
+    ...handlers,
+  }
+  return render(
+    <NextIntlClientProvider locale="en" messages={enMessages}>
+      <TaskCard
+        task={t}
+        folderName="repo"
+        now={Date.parse("2026-08-01T01:00:00Z")}
+        mergeQueueRank={mergeQueueRank}
+        {...props}
+      />
+    </NextIntlClientProvider>
+  )
+}
+
+describe("TaskCard review primary", () => {
+  it("offers completion — not a merge — when the task changed nothing", async () => {
+    const onMerge = vi.fn()
+    const onComplete = vi.fn()
+    renderCard(task(), { onMerge, onComplete })
+
+    expect(screen.queryByRole("button", { name: "Merge" })).toBeNull()
+    await userEvent.click(screen.getByRole("button", { name: "Complete" }))
+    expect(onComplete).toHaveBeenCalledTimes(1)
+    expect(onMerge).not.toHaveBeenCalled()
+  })
+
+  it("keeps the merge button once the task changed something", () => {
+    const onMerge = vi.fn()
+    const onComplete = vi.fn()
+    renderCard(task({ files_changed: 3, additions: 20, deletions: 1 }), {
+      onMerge,
+      onComplete,
+    })
+
+    expect(screen.getByRole("button", { name: "Merge" })).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "Complete" })).toBeNull()
+  })
+
+  it("says a queued task is waiting, and offers only the way out of the queue", async () => {
+    // Already accepted: re-offering "Merge" would read as if the first click
+    // never landed.
+    const onUnqueueMerge = vi.fn()
+    renderCard(
+      task({
+        files_changed: 3,
+        merge_queued: {
+          message: null,
+          delete_worktree: true,
+          queued_at: "2026-08-01T00:30:00Z",
+        },
+      }),
+      { onUnqueueMerge }
+    )
+
+    expect(screen.getByText("Queued to merge")).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "Merge" })).toBeNull()
+    await userEvent.click(
+      screen.getByRole("button", { name: "Leave merge queue" })
+    )
+    expect(onUnqueueMerge).toHaveBeenCalledTimes(1)
+  })
+
+  it("spells out the place in line when others are ahead", () => {
+    const queued = task({
+      files_changed: 3,
+      merge_queued: {
+        message: null,
+        delete_worktree: true,
+        queued_at: "2026-08-01T00:30:00Z",
+      },
+    })
+    // Next in line reads plainly — a number there would be noise.
+    const first = renderCard(queued, undefined, 1)
+    expect(screen.getByText("Queued to merge")).toBeInTheDocument()
+    first.unmount()
+
+    renderCard(queued, undefined, 2)
+    expect(screen.getByText("Queued to merge · #2")).toBeInTheDocument()
+  })
+})
+
+describe("TaskCard secondaries", () => {
+  it("keeps the session viewer on an archived card", () => {
+    // Archiving is exactly when someone wants to reread the session: the
+    // "unarchive" primary must not displace the viewer.
+    const onViewSession = vi.fn()
+    renderCard(
+      task({
+        status: "done",
+        archived_at: "2026-08-01T02:00:00Z",
+        conversation_id: 42,
+      }),
+      { onViewSession }
+    )
+    expect(
+      screen.getByRole("button", { name: "View session" })
+    ).toBeInTheDocument()
+    expect(
+      screen.getByRole("button", { name: "Unarchive" })
+    ).toBeInTheDocument()
+  })
+
+  it("offers scheduling on a pending card, and only there", async () => {
+    const onSchedule = vi.fn()
+    renderCard(task({ status: "todo", files_changed: null }), { onSchedule })
+    await userEvent.click(screen.getByRole("button", { name: "Schedule" }))
+    expect(onSchedule).toHaveBeenCalledTimes(1)
+
+    // A task that already has a run of its own has no start left to plan.
+    renderCard(task({ status: "review" }))
+    expect(screen.queryAllByRole("button", { name: "Schedule" })).toHaveLength(
+      1
+    )
+  })
+
+  it("shows the planned start on a pending card", () => {
+    const planned = new Date(2026, 7, 8, 9, 30)
+    renderCard(
+      task({
+        status: "todo",
+        files_changed: null,
+        scheduled_at: planned.toISOString(),
+      })
+    )
+    expect(screen.getByTitle(/Scheduled to start at/)).toBeInTheDocument()
+  })
+
+  it("does not open the sheet when a footer button is activated by keyboard", async () => {
+    const onOpen = vi.fn()
+    const onMerge = vi.fn()
+    renderCard(task({ files_changed: 3 }), { onOpen, onMerge })
+
+    screen.getByRole("button", { name: "Merge" }).focus()
+    await userEvent.keyboard("{Enter}")
+    expect(onMerge).toHaveBeenCalledTimes(1)
+    // The keydown bubbles to the card — which must neither open the sheet nor
+    // cancel the button's own activation.
+    expect(onOpen).not.toHaveBeenCalled()
+  })
+})
+
+describe("TaskCard worktree-removed badge", () => {
+  it("flags a deleted worktree in any status — done and canceled included", () => {
+    // Detached after removal: the pointer is gone, the branch remains.
+    renderCard(task({ status: "done", worktree_folder_id: null }))
+    expect(screen.getByText("Worktree removed")).toBeInTheDocument()
+  })
+
+  it("flags a worktree whose directory vanished behind the app", () => {
+    renderCard(task({ status: "canceled", worktree_missing: true }))
+    expect(screen.getByText("Worktree removed")).toBeInTheDocument()
+    // "Worktree kept" claims the opposite — it must stay silent here.
+    expect(screen.queryByText("Worktree kept")).toBeNull()
+  })
+
+  it("keeps the kept-badge for a canceled task whose worktree is intact", () => {
+    renderCard(task({ status: "canceled" }))
+    expect(screen.getByText("Worktree kept")).toBeInTheDocument()
+    expect(screen.queryByText("Worktree removed")).toBeNull()
+  })
+
+  it("says nothing on a just-created task that never initialized", () => {
+    renderCard(
+      task({
+        status: "todo",
+        files_changed: null,
+        worktree_folder_id: null,
+        work_branch: null,
+        base_branch: null,
+        base_sha: null,
+      })
+    )
+    expect(screen.queryByText("Worktree removed")).toBeNull()
+  })
+})
+
+describe("TaskCard agent mark", () => {
+  it("names the agent the task runs under", () => {
+    renderCard(task({ agent_type: "claude_code" }))
+    expect(screen.getByTitle("Claude Code")).toBeInTheDocument()
+  })
+
+  it("draws a placeholder when no agent is configured anywhere", () => {
+    // The engine refuses to launch this state; the card still has to lay out
+    // its title the way every other card does.
+    renderCard(task({ agent_type: null }))
+    expect(screen.queryByTitle("Claude Code")).toBeNull()
+    expect(screen.getByText("Answer the question")).toBeInTheDocument()
+  })
+})

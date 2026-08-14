@@ -118,15 +118,18 @@ export function isPlanLikeToolName(toolName: string): boolean {
 }
 
 /**
- * Plan-*mode* transition tools — Claude Code's `EnterPlanMode`/`ExitPlanMode`
- * and Cline's `switch_mode`. These are mode signals (not work tools), so they
- * render through a dedicated `<PlanModeCard>` and must NOT fold into the
- * "思考 N 次" tool-group the way `classifyToolKind` would otherwise group them.
+ * Plan-*mode* transition tools — Claude Code's `EnterPlanMode`/`ExitPlanMode`,
+ * Cline's `switch_mode`, and codex-acp ≥1.1.8's Plan-mode review gate
+ * (`plan_review`). These are mode signals (not work tools), so they render
+ * through a dedicated `<PlanModeCard>` and must NOT fold into the "思考 N 次"
+ * tool-group the way `classifyToolKind` would otherwise group them.
  *
  * Distinct from `isPlanLikeToolName`: that matches anything containing "plan"
  * (e.g. Codex's `update_plan`, which legitimately converts to a `<PlanCard>`
  * checklist). `update_plan` normalizes to "updateplan" and is intentionally
- * NOT matched here, so its PlanCard path stays untouched.
+ * NOT matched here, so its PlanCard path stays untouched. `plan_review` DOES
+ * also match `isPlanLikeToolName`, but harmlessly: the seeded call carries no
+ * input, so `agent-plan.ts` extracts no entries from it.
  *
  * Uses the separator-stripping `normalizeToolName` above, so `switch_mode`
  * normalizes to "switchmode". (The renderer-side gate in `ToolCallPart` uses
@@ -138,7 +141,8 @@ export function isPlanModeToolName(toolName: string): boolean {
   return (
     normalized === "enterplanmode" ||
     normalized === "exitplanmode" ||
-    normalized === "switchmode"
+    normalized === "switchmode" ||
+    normalized === "planreview"
   )
 }
 

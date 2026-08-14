@@ -187,6 +187,24 @@ pub struct ContinueDelegationRequest {
 /// Max accepted length for a call `correlation_id` (inclusive).
 pub const CORRELATION_ID_MAX_LEN: usize = 128;
 
+/// What a still-running delegation child is blocked on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BlockedKind {
+    Permission,
+    Question,
+    PlanApproval,
+}
+
+/// The blocking prompt itself: kind plus a short label.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockedOn {
+    pub kind: BlockedKind,
+    pub request_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}
+
 /// Which delegation tool produced a correlation failure — drives entry-point
 /// specific retry text in parent-facing messages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

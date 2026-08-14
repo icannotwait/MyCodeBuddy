@@ -467,12 +467,14 @@ mod tests {
                     tool_use_id: None,
                     tool_name: "Read".into(),
                     input_preview: None,
+                    status: None,
                     meta: None,
                 },
                 ContentBlock::ToolUse {
                     tool_use_id: None,
                     tool_name: "Read".into(),
                     input_preview: None,
+                    status: None,
                     meta: None,
                 },
                 ContentBlock::Thinking { text: "hmm".into() },
@@ -513,6 +515,7 @@ mod tests {
                 tool_use_id: None,
                 tool_name: format!("{}_{i}", "x".repeat(500)),
                 input_preview: None,
+                status: None,
                 meta: None,
             })
             .collect();
@@ -534,6 +537,7 @@ mod tests {
                     tool_use_id: None,
                     tool_name: format!("{}_{i}", "t".repeat(MAX_TOOL_NAME_CHARS)),
                     input_preview: None,
+                    status: None,
                     meta: None,
                 })
                 .collect();

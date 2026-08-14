@@ -5,14 +5,30 @@
     "inputSchema": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["outcome"],
+      "required": [
+        "outcome"
+      ],
       "properties": {
         "outcome": {
           "type": "string",
-          "enum": ["approve", "approve_with_minors", "request_changes", "block", "done", "done_with_concerns", "blocked"]
+          "enum": [
+            "approve",
+            "approve_with_minors",
+            "request_changes",
+            "block",
+            "done",
+            "done_with_concerns",
+            "blocked"
+          ]
         },
-        "summary": {"type": "string", "maxLength": 4096},
-        "report_file": {"type": "string", "maxLength": 1024}
+        "summary": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "report_file": {
+          "type": "string",
+          "maxLength": 1024
+        }
       }
     }
   },
@@ -21,7 +37,11 @@
     "description": "Asynchronous cold child cannot see this conversation; returns task_id. Task must include all context. Fan out, then Join. For each distinct agent/profile mention, call once; pass profile_id for a profile.",
     "inputSchema": {
       "type": "object",
-      "required": ["agent_type", "task", "correlation_id"],
+      "required": [
+        "agent_type",
+        "task",
+        "correlation_id"
+      ],
       "properties": {
         "agent_type": {
           "type": "string",
@@ -39,9 +59,15 @@
             "cursor"
           ]
         },
-        "profile_id": { "type": "string" },
-        "profile_label": { "type": "string" },
-        "task": { "type": "string" },
+        "profile_id": {
+          "type": "string"
+        },
+        "profile_label": {
+          "type": "string"
+        },
+        "task": {
+          "type": "string"
+        },
         "correlation_id": {
           "type": "string",
           "description": "Fresh per call."
@@ -65,7 +91,13 @@
         },
         "replacement_reason": {
           "type": "string",
-          "enum": ["unresumable", "budget_exhausted_continue", "not_supported", "admission_failed", "admission_unknown"],
+          "enum": [
+            "unresumable",
+            "budget_exhausted_continue",
+            "not_supported",
+            "admission_failed",
+            "admission_unknown"
+          ],
           "description": "admission_failed/admission_unknown require explicit replacement; cancellation/stall does not; otherwise continue_delegation."
         }
       }
@@ -77,10 +109,18 @@
     "inputSchema": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["plan_rel_path"],
+      "required": [
+        "plan_rel_path"
+      ],
       "properties": {
-        "plan_rel_path": { "type": "string", "minLength": 1 },
-        "progress_rel_path": { "type": "string", "minLength": 1 }
+        "plan_rel_path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "progress_rel_path": {
+          "type": "string",
+          "minLength": 1
+        }
       }
     }
   },
@@ -89,10 +129,18 @@
     "description": "Continue terminal task_id asynchronously with full context; never creates a child. Join via get_delegation_status.",
     "inputSchema": {
       "type": "object",
-      "required": ["task_id", "task", "correlation_id"],
+      "required": [
+        "task_id",
+        "task",
+        "correlation_id"
+      ],
       "properties": {
-        "task_id": { "type": "string" },
-        "task": { "type": "string" },
+        "task_id": {
+          "type": "string"
+        },
+        "task": {
+          "type": "string"
+        },
         "correlation_id": {
           "type": "string",
           "description": "Fresh per invocation."
@@ -114,11 +162,15 @@
     "description": "Join task_ids in input order. Omit wait_ms for an immediate snapshot. return_when=all_terminal_or_attention; wait_ms=0; positive wait_ms is rejected. wake_reason/attention_requests report attention, unavailable, or all requested tasks are terminal. Re-Join only still-running required tasks.",
     "inputSchema": {
       "type": "object",
-      "required": ["task_ids"],
+      "required": [
+        "task_ids"
+      ],
       "properties": {
         "task_ids": {
           "type": "array",
-          "items": { "type": "string" },
+          "items": {
+            "type": "string"
+          },
           "minItems": 1
         },
         "wait_ms": {
@@ -128,7 +180,9 @@
         },
         "return_when": {
           "type": "string",
-          "enum": ["all_terminal_or_attention"]
+          "enum": [
+            "all_terminal_or_attention"
+          ]
         }
       }
     }
@@ -138,12 +192,22 @@
     "description": "Cancel only when its result is no longer wanted. timeout is non-canceling: keep waiting with wait_ms for slow work. Already finished returns final result. taskfail, usercancel, and others cancel.",
     "inputSchema": {
       "type": "object",
-      "required": ["task_id", "reason"],
+      "required": [
+        "task_id",
+        "reason"
+      ],
       "properties": {
-        "task_id": { "type": "string" },
+        "task_id": {
+          "type": "string"
+        },
         "reason": {
           "type": "string",
-          "enum": ["timeout", "taskfail", "usercancel", "others"]
+          "enum": [
+            "timeout",
+            "taskfail",
+            "usercancel",
+            "others"
+          ]
         }
       }
     }
@@ -161,7 +225,9 @@
     "description": "Render interactive cards for 1-4 related multiple-choice questions and BLOCK until submitted or dismissed. Use only for a genuinely user-owned discrete decision that cannot be resolved from the request, code, or sensible defaults. Do not ask merely whether to proceed, confirm an obvious default, or collect open-ended input. Other is added automatically. Put a recommended choice first and append ' (Recommended)' to its label. Prefer one call for related questions.",
     "inputSchema": {
       "type": "object",
-      "required": ["questions"],
+      "required": [
+        "questions"
+      ],
       "properties": {
         "questions": {
           "type": "array",
@@ -170,7 +236,12 @@
           "description": "Questions in this call.",
           "items": {
             "type": "object",
-            "required": ["question", "header", "multiSelect", "options"],
+            "required": [
+              "question",
+              "header",
+              "multiSelect",
+              "options"
+            ],
             "properties": {
               "question": {
                 "type": "string",
@@ -192,7 +263,10 @@
                 "description": "Selectable choices.",
                 "items": {
                   "type": "object",
-                  "required": ["label", "description"],
+                  "required": [
+                    "label",
+                    "description"
+                  ],
                   "properties": {
                     "label": {
                       "type": "string",
@@ -216,9 +290,13 @@
     "description": "Resolve codeg://session/ to read-only metadata and optional recent messages. Use internal conversation ID, not the agent session ID. Missing is found: false, not an error.",
     "inputSchema": {
       "type": "object",
-      "required": ["session_id"],
+      "required": [
+        "session_id"
+      ],
       "properties": {
-        "session_id": { "type": "integer" },
+        "session_id": {
+          "type": "integer"
+        },
         "max_messages": {
           "type": "integer",
           "minimum": 0
@@ -232,7 +310,9 @@
     "inputSchema": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["message"],
+      "required": [
+        "message"
+      ],
       "properties": {
         "message": {
           "type": "string",
@@ -248,9 +328,15 @@
     "inputSchema": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["request_id", "reply"],
+      "required": [
+        "request_id",
+        "reply"
+      ],
       "properties": {
-        "request_id": { "type": "string", "minLength": 1 },
+        "request_id": {
+          "type": "string",
+          "minLength": 1
+        },
         "reply": {
           "type": "string",
           "minLength": 1
@@ -264,13 +350,23 @@
     "inputSchema": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["subject_kind", "subject_id", "correlation_id"],
+      "required": [
+        "subject_kind",
+        "subject_id",
+        "correlation_id"
+      ],
       "properties": {
         "subject_kind": {
           "type": "string",
-          "enum": ["delegation_task", "workflow"]
+          "enum": [
+            "delegation_task",
+            "workflow"
+          ]
         },
-        "subject_id": { "type": "string", "minLength": 1 },
+        "subject_id": {
+          "type": "string",
+          "minLength": 1
+        },
         "correlation_id": {
           "type": "string",
           "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
@@ -286,7 +382,10 @@
   {
     "name": "get_workflow_capabilities",
     "description": "Discover workflow_manifest_v2.",
-    "inputSchema": { "type": "object", "properties": {} }
+    "inputSchema": {
+      "type": "object",
+      "properties": {}
+    }
   },
   {
     "name": "get_workflow_state",
@@ -294,8 +393,16 @@
     "inputSchema": {
       "type": "object",
       "properties": {
-        "workflow_id": { "type": "string" },
-        "detail": { "type": "string", "enum": ["index"], "default": "index" }
+        "workflow_id": {
+          "type": "string"
+        },
+        "detail": {
+          "type": "string",
+          "enum": [
+            "index"
+          ],
+          "default": "index"
+        }
       }
     }
   },
@@ -312,9 +419,18 @@
         "correlation_id"
       ],
       "properties": {
-        "workflow_id": { "type": "string", "minLength": 1 },
-        "recovery_authorization_id": { "type": "string", "minLength": 1 },
-        "expected_manifest_revision": { "type": "integer", "minimum": 1 },
+        "workflow_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "recovery_authorization_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expected_manifest_revision": {
+          "type": "integer",
+          "minimum": 1
+        },
         "correlation_id": {
           "type": "string",
           "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
@@ -341,12 +457,27 @@
         "gates"
       ],
       "properties": {
-        "schema_version": { "type": "integer", "const": 2 },
-        "workflow_id": { "type": "string" },
-        "expected_manifest_revision": { "type": "integer", "minimum": 0 },
-        "plan_target_rel_path": { "type": "string" },
-        "risk_policy_version": { "type": "string", "const": "b2d_task_risk_v1" },
-        "task_policies": { "type": "array" }
+        "schema_version": {
+          "type": "integer",
+          "const": 2
+        },
+        "workflow_id": {
+          "type": "string"
+        },
+        "expected_manifest_revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "plan_target_rel_path": {
+          "type": "string"
+        },
+        "risk_policy_version": {
+          "type": "string",
+          "const": "b2d_task_risk_v1"
+        },
+        "task_policies": {
+          "type": "array"
+        }
       }
     }
   },
@@ -363,17 +494,157 @@
         "summary"
       ],
       "properties": {
-        "workflow_id": { "type": "string" },
-        "gate_id": { "type": "string" },
-        "expected_graph_revision": { "type": "integer", "minimum": 0 },
-        "expected_review_round": { "type": "integer", "minimum": 1 },
-        "expected_gate_cycle": { "type": "integer", "minimum": 1 },
+        "workflow_id": {
+          "type": "string"
+        },
+        "gate_id": {
+          "type": "string"
+        },
+        "expected_graph_revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "expected_review_round": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "expected_gate_cycle": {
+          "type": "integer",
+          "minimum": 1
+        },
         "expected_outcome": {
           "type": "string",
-          "enum": ["approved", "changes_requested", "blocked"]
+          "enum": [
+            "approved",
+            "changes_requested",
+            "blocked"
+          ]
         },
-        "recovery_authorization_id": { "type": "string" },
-        "summary": { "type": "string" }
+        "recovery_authorization_id": {
+          "type": "string"
+        },
+        "summary": {
+          "type": "string"
+        }
+      }
+    }
+  },
+  {
+    "name": "create_automation",
+    "description": "Save a codeg Automation: a reusable job — a prompt plus a target project — that codeg runs on a cron schedule (or on demand) without anyone present. Use it when the user asks for work that should REPEAT or happen at a TIME rather than right now: 'every morning', 'each Monday', 'nightly', 'every 30 minutes', 'before standup', 'set up a recurring …'. Do NOT use it for work the user wants done in this conversation — just do that work. Each run starts a fresh headless session in its own worktree with no memory of this chat, so `prompt` must be completely self-contained: state the goal, the relevant paths, and what a finished run looks like. Creating an automation does not run it now; the tool returns the id and the next fire time so you can tell the user when it will first go off. The user can edit, disable, run, or delete it on the Automations page.",
+    "inputSchema": {
+      "type": "object",
+      "required": [
+        "name",
+        "prompt"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Short label shown in the automations list, e.g. 'Nightly dependency audit'."
+        },
+        "prompt": {
+          "type": "string",
+          "description": "The self-contained instruction each run executes. The run cannot see this conversation, so spell out the goal, the paths, and the definition of done."
+        },
+        "cron": {
+          "type": "string",
+          "description": "5-field cron, and only 5 fields: `min hour day-of-month month day-of-week`, e.g. `0 9 * * 1-5` for weekdays at 09:00. Day-of-week is POSIX (0 and 7 are both Sunday). A seconds field is NOT supported and is rejected. Interpreted in `timezone`. OMIT this to create a manual automation the user runs on demand from the Automations page."
+        },
+        "timezone": {
+          "type": "string",
+          "description": "IANA zone the cron is read in, e.g. 'Asia/Shanghai'. Defaults to the machine's own zone — omit it unless the user names a different one."
+        },
+        "action": {
+          "type": "string",
+          "enum": [
+            "launch_session",
+            "enqueue_task"
+          ],
+          "description": "What a fire does. 'launch_session' (default) runs the prompt immediately in a headless agent session. 'enqueue_task' instead drops a card on the user's to-dos for the board's queue to pick up — use it when the user wants scheduled work to land somewhere they review rather than run unattended."
+        },
+        "agent_type": {
+          "type": "string",
+          "description": "Which local agent runs it (e.g. 'claude_code', 'codex'). Defaults to the target project's configured agent — omit unless the user asks for a specific one."
+        },
+        "folder_path": {
+          "type": "string",
+          "description": "Absolute path of the target project. Defaults to the project this conversation is in; pass it only to target a different project already open in codeg."
+        },
+        "enabled": {
+          "type": "boolean",
+          "description": "Whether the schedule is live right away. Defaults to true; pass false to save it switched off."
+        }
+      }
+    }
+  },
+  {
+    "name": "create_work_task",
+    "description": "Queue a card on codeg's to-dos. A task is a unit of work an agent later executes on its own branch/worktree, then hands back for the user to review and merge. Use it when the user wants work PARKED rather than done now — 'add a task to…', 'put this on the board', 'we should also fix X later' — or when you are splitting a large request into reviewable pieces and the user asked for that. Do NOT use it to do the thing the user just asked you to do in this conversation, and do NOT queue a task per trivial step. The executing agent starts cold with no view of this chat, so `prompt` must carry the full briefing. The tool returns the task id; the user tracks it in their to-dos.",
+    "inputSchema": {
+      "type": "object",
+      "required": [
+        "title",
+        "prompt"
+      ],
+      "properties": {
+        "title": {
+          "type": "string",
+          "description": "Short card title, e.g. 'Migrate auth middleware to the new session API'."
+        },
+        "prompt": {
+          "type": "string",
+          "description": "The self-contained instruction the executing agent receives: the goal, the relevant files/paths, constraints, and what done looks like."
+        },
+        "agent_type": {
+          "type": "string",
+          "description": "Which local agent should run this task (e.g. 'claude_code', 'codex'). Omit to inherit the board's configured default."
+        },
+        "folder_path": {
+          "type": "string",
+          "description": "Absolute path of the target project. Defaults to the project this conversation is in; pass it only to target a different project already open in codeg."
+        }
+      }
+    }
+  },
+  {
+    "name": "task_progress",
+    "description": "Report a short progress milestone for the work task you are executing. It shows up on the task's board card and timeline in real time, so the user can follow along without opening the session. Call it at meaningful checkpoints — finished exploring, tests passing, starting the refactor — not for every small step. Fire-and-forget: it never blocks your work and returns immediately.",
+    "inputSchema": {
+      "type": "object",
+      "required": [
+        "message"
+      ],
+      "properties": {
+        "message": {
+          "type": "string",
+          "description": "One-line progress note, e.g. 'tests passing, starting cleanup'."
+        }
+      }
+    }
+  },
+  {
+    "name": "task_complete",
+    "description": "Report the final outcome of the work task you are executing. Call it once, just before you end your reply. Pass verdict 'success' when the change is done and ready to review, 'needs_review' when it works but a human should double-check something specific (say what in the summary), or 'blocked' when you could not complete the task (the summary must say why). The task settles when your turn ends: success and needs_review send it to review, blocked marks it failed. If you never call this tool the task still settles normally from your turn's end.",
+    "inputSchema": {
+      "type": "object",
+      "required": [
+        "verdict"
+      ],
+      "properties": {
+        "verdict": {
+          "type": "string",
+          "enum": [
+            "success",
+            "needs_review",
+            "blocked"
+          ],
+          "description": "How the task ended from your point of view."
+        },
+        "summary": {
+          "type": "string",
+          "description": "Short result summary shown on the task card: what changed, and anything the reviewer should look at."
+        }
       }
     }
   }

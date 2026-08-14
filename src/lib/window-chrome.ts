@@ -27,7 +27,11 @@ export const WINDOW_CAPTION_WIDTH = 138
 /** Left cluster: sidebar toggle + remote (two icon buttons + padding). */
 export const LEFT_CHROME_CLUSTER = 80
 
-/** Right cluster: terminal + aux + settings (three icon buttons + padding). */
+/**
+ * Right cluster: terminal + aux + settings (three icon buttons + padding).
+ * A full-page workbench route swaps the first two for its own controls (see
+ * `WorkbenchRouteChromeActions`), so the count — and this reservation — holds.
+ */
 export const RIGHT_CHROME_CLUSTER = 116
 
 /**

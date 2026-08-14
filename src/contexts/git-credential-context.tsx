@@ -20,6 +20,7 @@ import {
 } from "lucide-react"
 import { openUrl } from "@/lib/platform"
 import { useTranslations } from "next-intl"
+import { useImeGuard } from "@/hooks/use-ime-guard"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import {
@@ -172,6 +173,7 @@ async function saveGenericAccount(
 
 export function GitCredentialProvider({ children }: { children: ReactNode }) {
   const t = useTranslations("GitCredentialDialog")
+  const ime = useImeGuard()
 
   const [open, setOpen] = useState(false)
   const [mode, setMode] = useState<DialogMode>("generic")
@@ -457,7 +459,9 @@ export function GitCredentialProvider({ children }: { children: ReactNode }) {
                     disabled={submitting}
                     className="pr-9"
                     autoFocus
+                    {...ime.props}
                     onKeyDown={(e) => {
+                      if (ime.isComposing(e)) return
                       if (e.key === "Enter" && canSubmitGitHub) handleSubmit()
                     }}
                   />
@@ -513,7 +517,9 @@ export function GitCredentialProvider({ children }: { children: ReactNode }) {
                       placeholder={t("passwordPlaceholder")}
                       disabled={submitting}
                       className="pr-9"
+                      {...ime.props}
                       onKeyDown={(e) => {
+                        if (ime.isComposing(e)) return
                         if (e.key === "Enter" && canSubmitGeneric)
                           handleSubmit()
                       }}

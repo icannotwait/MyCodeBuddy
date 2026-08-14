@@ -16,16 +16,18 @@ import { useTheme } from "next-themes"
 import { toast } from "sonner"
 import { Virtualizer, type VirtualizerHandle } from "virtua"
 import {
-  FolderClosed,
   Bot,
   Check,
+  ChevronDown,
   ChevronRight,
   Download,
   ExternalLink,
+  FolderClosed,
   FolderGit2,
   FolderOpen,
   FolderOpenDot,
   FolderRoot,
+  Link2,
   ListChecks,
   Loader2,
   MoreHorizontal,
@@ -42,6 +44,7 @@ import { useWorkbenchRoute } from "@/contexts/workbench-route-context"
 import { useTerminalContext } from "@/contexts/terminal-context"
 import { useThemeColor, useZoomLevel } from "@/hooks/use-appearance"
 import { useSortedAvailableAgents } from "@/hooks/use-sorted-available-agents"
+import { useImeGuard } from "@/hooks/use-ime-guard"
 import {
   openImportSessionsWindow,
   openProjectBootWindow,
@@ -54,12 +57,12 @@ import {
   deleteConversation,
   listChildConversations,
 } from "@/lib/api"
-import { isDesktop, openFileDialog, revealItemInDir } from "@/lib/platform"
-import { getActiveRemoteConnectionId } from "@/lib/transport"
+import { isDesktop, revealItemInDir } from "@/lib/platform"
 import type {
   AgentType,
   ConversationStatus,
   DbConversationSummary,
+  FolderDetail,
 } from "@/lib/types"
 import { getAgentLabel } from "@/lib/custom-agents"
 import {
@@ -69,8 +72,11 @@ import {
   saveSectionCollapsed,
   loadConversationExpanded,
   saveConversationExpanded,
+  DEFAULT_SECTION_ORDER,
   type SidebarSectionCollapsed,
+  type SidebarSectionKey,
   type SidebarSectionOrder,
+  type SidebarSortMode,
 } from "@/lib/sidebar-view-mode-storage"
 import { getEffectiveConversationUpdatedAt } from "@/lib/conversation-activity"
 import {
@@ -104,7 +110,9 @@ import {
   selectChatConversationsWithReuse,
   selectPinnedWithReuse,
   sidebarRowKey,
+  selectRecentConversationsWithReuse,
   worktreeChildrenByParent,
+  worktreeHeaderAlias,
   type SidebarRow,
 } from "./sidebar-conversation-grouping"
 import { useSubsessionSync } from "@/hooks/use-subsession-sync"
@@ -112,7 +120,7 @@ import { useSidebarReorderAnimation } from "./use-sidebar-reorder-animation"
 import { SidebarSectionHeader } from "./sidebar-section-header"
 import { ConversationManageDialog } from "./conversation-manage-dialog"
 import { CloneDialog } from "@/components/layout/clone-dialog"
-import { DirectoryBrowserDialog } from "@/components/shared/directory-browser-dialog"
+import { WorkspaceFolderDialog } from "@/components/layout/workspace-folder-dialog"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import {
@@ -147,7 +155,6 @@ import {
 import { cn } from "@/lib/utils"
 import { FolderAliasLabel } from "./folder-alias-label"
 import { toErrorMessage } from "@/lib/app-error"
-import { openFolderWithDraft } from "@/lib/open-folder-with-draft"
 
 // Layout effect on the client (so the sticky overlay is positioned before
 // paint) but a no-op-safe passive effect during the static-export prerender.
@@ -166,12 +173,18 @@ const EMPTY_CHILD_TO_PARENT: ReadonlyMap<number, number> = new Map()
 const EMPTY_CONTAINER_CHILDREN: ReadonlyMap<number, readonly number[]> =
   new Map()
 
+// How many conversations the "Recent" section shows before its "show more" row,
+// and how many each click adds. Recent deliberately re-lists what the Folders /
+// Chat sections already show, so an unbounded one pushes every section below it
+// off the screen — a page keeps it a glance-able "where was I" list.
+const RECENT_PAGE_SIZE = 15
+
 const FolderHeader = memo(function FolderHeader({
   folderId,
   folderName,
   folderAlias,
   folderPath,
-  count,
+  runningCount,
   expanded,
   themeColor,
   appThemeColor,
@@ -183,6 +196,7 @@ const FolderHeader = memo(function FolderHeader({
   onNewConversation,
   onImport,
   onManageConversations,
+  onManageLinks,
   onChangeColor,
   onSetAlias,
   onSetDefaultAgent,
@@ -200,7 +214,13 @@ const FolderHeader = memo(function FolderHeader({
   /** User-set alias, or null. When present the header shows `alias [name]`. */
   folderAlias: string | null
   folderPath: string
-  count: number
+  /**
+   * How many of this group's sessions are currently RUNNING (`in_progress`) —
+   * not how many it holds. Zero renders no badge at all: the header's job is to
+   * flag live activity you'd otherwise have to expand the folder to notice, and
+   * a total-count chip on every row was noise (expanding shows the rows).
+   */
+  runningCount: number
   expanded: boolean
   themeColor: FolderThemeColor
   appThemeColor: ThemeColor
@@ -220,6 +240,7 @@ const FolderHeader = memo(function FolderHeader({
   onNewConversation: (folderId: number) => void
   onImport: (folderId: number) => void
   onManageConversations: (folderId: number) => void
+  onManageLinks: (folderId: number) => void
   onChangeColor: (folderId: number, color: FolderThemeColor) => void
   onSetAlias: (folderId: number, alias: string | null) => void
   onSetDefaultAgent: (folderId: number, agentType: AgentType | null) => void
@@ -251,20 +272,22 @@ const FolderHeader = memo(function FolderHeader({
    * Which glyph + label this header renders:
    * - `repo` (default): a top-level repo / plain folder / repo container — the
    *   FolderOpen/FolderClosed glyph and the repo-name alias label.
-   * - `worktree`: a git worktree sub-group — the FolderGit2 glyph and the branch
-   *   label (`worktreeBranch`).
+   * - `worktree`: a git worktree sub-group — the FolderGit2 glyph and the same
+   *   `alias [ name ]` label as a repo, with the branch standing in for the
+   *   alias (see {@link worktreeHeaderAlias}).
    * - `root`: a repo container's own-sessions sub-group — the FolderRoot glyph
    *   and a fixed, non-localized "root" label.
    */
   variant?: "repo" | "worktree" | "root"
-  /** The worktree's branch name (its own `git_branch`), shown as the label when
-   *  `variant === "worktree"`. Falls back to the folder name when absent. */
+  /** The worktree's branch name (its own `git_branch`), used as the alias when
+   *  none is set. Leaves the bare folder name when absent. */
   worktreeBranch?: string | null
 }) {
   // Own the translations here rather than receiving `t` as a prop: next-intl
   // returns a fresh `t` on every parent render, so passing it down would defeat
   // this component's memo and re-render every header on each status event.
   const t = useTranslations("Folder.sidebar")
+  const ime = useImeGuard()
   // Only flag a stale default once the live list is known; before fresh,
   // `availableAgents` is the localStorage seed and may legitimately omit a
   // newly-enabled agent.
@@ -374,7 +397,13 @@ const FolderHeader = memo(function FolderHeader({
                     )}
                   >
                     {variant === "worktree" ? (
-                      (worktreeBranch ?? folderName)
+                      // Branch as the alias, directory as the name — the same
+                      // two-part label a repo header renders.
+                      <FolderAliasLabel
+                        name={folderName}
+                        alias={worktreeHeaderAlias(folderAlias, worktreeBranch)}
+                        bracketClassName="text-sidebar-foreground"
+                      />
                     ) : variant === "root" ? (
                       // The container repo's own-sessions sub-group is labeled
                       // with a fixed, non-localized "root" (its glyph is
@@ -389,20 +418,37 @@ const FolderHeader = memo(function FolderHeader({
                       />
                     )}
                   </span>
-                  <span
-                    className={cn(
-                      "inline-flex shrink-0 items-center justify-center",
-                      "h-[0.9375rem] min-w-[1rem] rounded-[0.3125rem] px-[0.25rem]",
-                      "text-[0.625rem] font-semibold leading-none tabular-nums",
-                      "bg-primary/10 text-primary"
-                    )}
-                  >
-                    {count}
-                  </span>
+                  {/* Live-activity badge: the number of RUNNING sessions in this
+                      group, and nothing at all when none are. Amber (not the
+                      primary tint the old total-count chip used) is the same
+                      "running" semantic the conversation cards spin in amber, so
+                      the two read as one signal. amber-700 (not the card's
+                      amber-600) carries the light-mode fill: at 0.625rem this is
+                      small text, and amber-600 on the tinted surface lands near
+                      3:1 — under the AA floor amber-700 (~4.7:1) clears. */}
+                  {runningCount > 0 && (
+                    <span
+                      title={t("runningCountBadge", { count: runningCount })}
+                      className={cn(
+                        "inline-flex shrink-0 items-center justify-center",
+                        "h-[0.9375rem] min-w-[1rem] rounded-[0.3125rem] px-[0.25rem]",
+                        "text-[0.625rem] font-semibold leading-none tabular-nums",
+                        "bg-amber-500/12 text-amber-700",
+                        "dark:bg-amber-400/15 dark:text-amber-300"
+                      )}
+                    >
+                      <span aria-hidden>{runningCount}</span>
+                      <span className="sr-only">
+                        {t("runningCountBadge", { count: runningCount })}
+                      </span>
+                    </span>
+                  )}
                   {/* Disclosure chevron mirrors the section headers: hover-revealed,
                     rotates on expand. The persistent open/closed state still reads
-                    from the folder icon on the left; this is the matching affordance
-                    that makes folder + section headers feel like one family.
+                    from the folder icon on the left, which is why the chevron can
+                    stay hidden at rest in BOTH states (collapsed included) — it is
+                    a redundant affordance, not the only one. Touch keeps it pinned
+                    on, since there is no hover to reveal it there.
                     NOTE: `group-focus-within` (not `group-focus-visible` like the
                     section header) is intentional — here the `group` is the outer
                     row wrapper and focus lands on a child (the toggle button or the
@@ -414,12 +460,9 @@ const FolderHeader = memo(function FolderHeader({
                     className={cn(
                       "h-3 w-3 shrink-0 text-muted-foreground/60",
                       "transition-[transform,opacity] duration-200 ease-out",
-                      // Collapsed: always visible (mirrors the section headers, so a
-                      // folded folder shows the same reopen affordance). Expanded:
-                      // hover/focus-only.
-                      expanded
-                        ? "rotate-90 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 [@media(hover:none)]:opacity-100"
-                        : "opacity-100"
+                      "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100",
+                      "[@media(hover:none)]:opacity-100",
+                      expanded && "rotate-90"
                     )}
                   />
                 </div>
@@ -518,6 +561,10 @@ const FolderHeader = memo(function FolderHeader({
           <ContextMenuItem onSelect={() => onManageConversations(folderId)}>
             <ListChecks className="h-4 w-4" />
             {t("folderHeaderMenu.manageConversations")}
+          </ContextMenuItem>
+          <ContextMenuItem onSelect={() => onManageLinks(folderId)}>
+            <Link2 className="h-4 w-4" />
+            {t("folderHeaderMenu.manageLinks")}
           </ContextMenuItem>
           <ContextMenuSub>
             <ContextMenuSubTrigger>
@@ -651,8 +698,9 @@ const FolderHeader = memo(function FolderHeader({
           <Input
             value={aliasValue}
             onChange={(e) => setAliasValue(e.target.value)}
+            {...ime.props}
             onKeyDown={(e) => {
-              if (e.nativeEvent.isComposing || e.key === "Process") return
+              if (ime.isComposing(e)) return
               if (e.key === "Enter") confirmAlias()
             }}
             placeholder={t("folderHeaderMenu.setAliasPlaceholder")}
@@ -680,17 +728,24 @@ export interface SidebarConversationListHandle {
 
 export interface SidebarConversationListProps {
   showCompleted?: boolean
+  sortMode?: SidebarSortMode
   sectionOrder?: SidebarSectionOrder
   /** When on, each repo's worktree child folders render as indented sub-groups
    *  instead of being merged flat into the parent group. Defaults to off. */
   showWorktrees?: boolean
+  /** When on, the flat "Recent" section is rendered at its slot in
+   *  `sectionOrder`. Defaults to off here; the Sidebar passes the user's
+   *  preference, whose product default is ON. */
+  showRecent?: boolean
 }
 
 export function SidebarConversationList({
   ref,
   showCompleted = true,
-  sectionOrder = "folders-first",
+  sortMode = "created",
+  sectionOrder = DEFAULT_SECTION_ORDER,
   showWorktrees = false,
+  showRecent = false,
 }: SidebarConversationListProps & {
   ref?: Ref<SidebarConversationListHandle>
 }) {
@@ -829,6 +884,15 @@ export function SidebarConversationList({
   const pinnedExpanded = !sectionCollapsed.pinned
   const foldersExpanded = !sectionCollapsed.folders
   const chatsExpanded = !sectionCollapsed.chats
+  const recentExpanded = !sectionCollapsed.recent
+  // How many Recent rows are currently revealed. Session-only (not persisted):
+  // "show me more of this list right now" is a reading gesture, not a setting —
+  // and a fresh sidebar should open short again.
+  const [recentLimit, setRecentLimit] = useState(RECENT_PAGE_SIZE)
+  const revealMoreRecent = useCallback(
+    () => setRecentLimit((n) => n + RECENT_PAGE_SIZE),
+    []
+  )
   // ── Per-conversation delegation sub-session expansion ───────────────────
   // Default COLLAPSED (unlike folders): only ids the user opened are tracked
   // and persisted. Hydrated from localStorage after mount. `childrenByParent`
@@ -865,12 +929,13 @@ export function SidebarConversationList({
     folderId: number
     folderName: string
   } | null>(null)
-  const [manageState, setManageState] = useState<{
-    folderId: number
-    folderName: string
-  } | null>(null)
+  // Folder the "manage conversations" dialog opens on — its initial scope; the
+  // dialog itself can then widen to the workspace or point at another folder.
+  const [manageFolderId, setManageFolderId] = useState<number | null>(null)
   const [cloneOpen, setCloneOpen] = useState(false)
   const [browserOpen, setBrowserOpen] = useState(false)
+  // Folder whose links are being managed (context menu -> Linked folders).
+  const [linksFolder, setLinksFolder] = useState<FolderDetail | null>(null)
   const [dragging, setDragging] = useState<number | null>(null)
   const [reordering, setReordering] = useState(false)
   const [dragOrder, setDragOrder] = useState<number[] | null>(null)
@@ -915,16 +980,13 @@ export function SidebarConversationList({
     setConversationExpanded(new Set(loadConversationExpanded()))
   }, [])
 
-  const toggleSection = useCallback(
-    (section: "pinned" | "folders" | "chats") => {
-      setSectionCollapsed((prev) => {
-        const next = { ...prev, [section]: !prev[section] }
-        saveSectionCollapsed(next)
-        return next
-      })
-    },
-    []
-  )
+  const toggleSection = useCallback((section: SidebarSectionKey) => {
+    setSectionCollapsed((prev) => {
+      const next = { ...prev, [section]: !prev[section] }
+      saveSectionCollapsed(next)
+      return next
+    })
+  }, [])
 
   const handleChangeFolderColor = useCallback(
     async (folderId: number, color: FolderThemeColor) => {
@@ -1056,20 +1118,44 @@ export function SidebarConversationList({
     return next
   }, [conversations, optimisticActivityById])
 
+  // Every folder currently open in the workspace (repos and their worktree
+  // children alike). Depends only on `folders`, so status events never rebuild
+  // it — the Recent bucket below leans on that.
+  const openFolderIds = useMemo(
+    () => new Set(folders.map((f) => f.id)),
+    [folders]
+  )
+
+  // Flat "Recent" bucket: every reachable conversation — folder-bound and chat
+  // alike — newest first, gated on the folder still being open so closing a
+  // folder also removes its sessions here. Reference reuse keeps an unrelated
+  // status event from rebuilding it and defeating the section's card memos.
+  const recentConvsRef = useRef<DbConversationSummary[]>([])
+  const recentConversations = useMemo(() => {
+    const next = selectRecentConversationsWithReuse(
+      conversations,
+      showCompleted,
+      sortMode,
+      openFolderIds,
+      recentConvsRef.current
+    )
+    recentConvsRef.current = next
+    return next
+  }, [conversations, showCompleted, sortMode, openFolderIds])
+
   // Maps each open worktree child folder → its (open) root folder. A child is
   // only redirected when its parent is also open, so a worktree whose root was
   // closed/removed falls back to standing on its own (its conversations stay
   // reachable). The merge is display-only: it never rewrites `conversation.folder_id`.
   const childToParent = useMemo(() => {
-    const openIds = new Set(folders.map((f) => f.id))
     const map = new Map<number, number>()
     for (const f of folders) {
-      if (f.parent_id != null && openIds.has(f.parent_id)) {
+      if (f.parent_id != null && openFolderIds.has(f.parent_id)) {
         map.set(f.id, f.parent_id)
       }
     }
     return map
-  }, [folders])
+  }, [folders, openFolderIds])
 
   // The merge map used for DISPLAY (grouping, counts, theming). When "Show
   // worktrees" is on it is empty, so each worktree child keeps its own bucket /
@@ -1091,11 +1177,17 @@ export function SidebarConversationList({
       folderConversations,
       byFolderRef.current,
       displayChildToParent,
-      optimisticActivityById
+      optimisticActivityById,
+      sortMode
     )
     byFolderRef.current = grouped
     return grouped
-  }, [folderConversations, displayChildToParent, optimisticActivityById])
+  }, [
+    folderConversations,
+    displayChildToParent,
+    optimisticActivityById,
+    sortMode,
+  ])
 
   // Counts the unfiltered-but-non-pinned conversations per display group, so the
   // empty-hint renderer distinguishes a truly empty folder from one whose rows
@@ -1105,6 +1197,23 @@ export function SidebarConversationList({
     const map = new Map<number, number>()
     for (const conv of conversations) {
       if (conv.pinned_at != null) continue
+      const groupId = displayChildToParent.get(conv.folder_id) ?? conv.folder_id
+      map.set(groupId, (map.get(groupId) ?? 0) + 1)
+    }
+    return map
+  }, [conversations, displayChildToParent])
+
+  // Running (`in_progress`) sessions per display group — what the folder header
+  // badge shows. Counted off the FULL conversation list rather than `byFolder`
+  // on purpose: the badge answers "is there work running in here", so neither
+  // the "Show completed" filter nor a session being pinned into the Pinned
+  // section should be able to hide it. Deliberately NOT a `buildRows` input, so
+  // a status event never rebuilds the row model — it only changes one number on
+  // one memoized header.
+  const folderRunningCounts = useMemo(() => {
+    const map = new Map<number, number>()
+    for (const conv of conversations) {
+      if (conv.status !== "in_progress") continue
       const groupId = displayChildToParent.get(conv.folder_id) ?? conv.folder_id
       map.set(groupId, (map.get(groupId) ?? 0) + 1)
     }
@@ -1197,6 +1306,10 @@ export function SidebarConversationList({
         foldersExpanded,
         chatConversations,
         chatsExpanded,
+        recentConversations,
+        recentExpanded,
+        showRecent,
+        recentLimit,
         sectionOrder,
         conversationExpanded,
         childrenByParent,
@@ -1214,6 +1327,10 @@ export function SidebarConversationList({
       foldersExpanded,
       chatConversations,
       chatsExpanded,
+      recentConversations,
+      recentExpanded,
+      showRecent,
+      recentLimit,
       sectionOrder,
       conversationExpanded,
       childrenByParent,
@@ -1657,12 +1774,16 @@ export function SidebarConversationList({
     [folderIndex]
   )
 
-  const handleManageConversations = useCallback(
+  const handleManageConversations = useCallback((folderId: number) => {
+    setManageFolderId(folderId)
+  }, [])
+
+  const handleManageFolderLinks = useCallback(
     (folderId: number) => {
-      const name = folderIndex.get(folderId)?.name ?? String(folderId)
-      setManageState({ folderId, folderName: name })
+      const folder = allFolders.find((f) => f.id === folderId)
+      if (folder) setLinksFolder(folder)
     },
-    [folderIndex]
+    [allFolders]
   )
 
   const handleRemoveFolderConfirm = useCallback(async () => {
@@ -1787,12 +1908,19 @@ export function SidebarConversationList({
   )
 
   const handleNewConversation = useCallback(() => {
-    if (!activeFolder) return
     // Starting a conversation returns to the conversation workspace if a
     // workbench route (e.g. Automations) was taking over the content region.
     openConversations()
+    // With no active folder (all folders closed, or a cold start that recovered
+    // to nothing) fall back to folderless chat mode rather than no-op — the
+    // same defense the sidebar's own "New chat" row takes, so neither entry
+    // point is ever a dead end.
+    if (!activeFolder) {
+      openChatModeTab()
+      return
+    }
     openNewConversationTab(activeFolder.id, activeFolder.path)
-  }, [activeFolder, openNewConversationTab, openConversations])
+  }, [activeFolder, openChatModeTab, openNewConversationTab, openConversations])
 
   const handleNewConversationForFolder = useCallback(
     (folderId: number) => {
@@ -2059,44 +2187,12 @@ export function SidebarConversationList({
   // Safety net: drop listeners / stop autoscroll if the list unmounts mid-drag.
   useEffect(() => () => teardownDragListeners(), [teardownDragListeners])
 
-  const handleOpenFolderAction = useCallback(async () => {
-    // Native Tauri dialog only when running on local desktop (no active
-    // remote workspace). Inside a remote workspace window the path lives
-    // on the remote host, so we route to the in-app server-side browser
-    // instead — the native dialog would pick a local path the remote
-    // server can't open.
-    if (isDesktop() && getActiveRemoteConnectionId() === null) {
-      try {
-        const result = await openFileDialog({
-          directory: true,
-          multiple: false,
-        })
-        if (!result) return
-        const selected = Array.isArray(result) ? result[0] : result
-        await openFolderWithDraft(selected)
-      } catch (err) {
-        console.error("[SidebarConversationList] failed to open folder:", err)
-        toast.error(t("toasts.openFolderFailed"))
-      }
-    } else {
-      setBrowserOpen(true)
-    }
-  }, [t])
+  const handleOpenFolderAction = useCallback(() => setBrowserOpen(true), [])
 
   // Stable trigger for the Clone Repository dialog, passed to the memoized
   // Folders section header. Empty deps (setCloneOpen is a stable setter) so the
   // header doesn't re-render on every parent render.
   const handleOpenCloneDialog = useCallback(() => setCloneOpen(true), [])
-
-  const handleBrowserSelect = useCallback(
-    (path: string) => {
-      openFolderWithDraft(path).catch((err) => {
-        console.error("[SidebarConversationList] failed to open folder:", err)
-        toast.error(t("toasts.openFolderFailed"))
-      })
-    },
-    [t]
-  )
 
   const handleProjectBoot = useCallback(() => {
     openProjectBootWindow().catch((err) => {
@@ -2131,13 +2227,15 @@ export function SidebarConversationList({
     )
   }
 
-  // Total sessions across a container repo and all its worktrees — the count
+  // Running sessions across a container repo and all its worktrees — the count
   // shown on the container header (its own sessions live in the root sub-group,
-  // so the bare `byFolder` count would understate the repo family).
-  const containerTotalCount = (repoId: number): number => {
-    let total = byFolder.get(repoId)?.length ?? 0
+  // so the bare per-folder number would understate the repo family).
+  const containerRunningCount = (repoId: number): number => {
+    let total = folderRunningCounts.get(repoId) ?? 0
     const kids = containerChildren.get(repoId)
-    if (kids) for (const kid of kids) total += byFolder.get(kid)?.length ?? 0
+    if (kids) {
+      for (const kid of kids) total += folderRunningCounts.get(kid) ?? 0
+    }
     return total
   }
 
@@ -2163,15 +2261,15 @@ export function SidebarConversationList({
     // folder, consistent with its slot.
     const isWorktree =
       !isRootGroup && showWorktrees && childToParent.has(folderId)
-    // A container repo (has ≥1 open worktree): plain repo glyph but a total count
+    // A container repo (has ≥1 open worktree): plain repo glyph but a count
     // spanning the whole family. Its own sessions render in the root sub-group.
     const isContainer =
       !isRootGroup && showWorktrees && containerRepoIds.has(folderId)
     const variant = isRootGroup ? "root" : isWorktree ? "worktree" : "repo"
     const depth = isRootGroup || isWorktree ? 1 : 0
-    const count = isContainer
-      ? containerTotalCount(folderId)
-      : (byFolder.get(folderId)?.length ?? 0)
+    const runningCount = isContainer
+      ? containerRunningCount(folderId)
+      : (folderRunningCounts.get(folderId) ?? 0)
     const expanded = isRootGroup
       ? !rootGroupCollapsed.has(folderId)
       : opts.collapsed
@@ -2183,7 +2281,7 @@ export function SidebarConversationList({
         folderName={folderEntry?.name ?? String(folderId)}
         folderAlias={folderEntry?.alias ?? null}
         folderPath={folderEntry?.path ?? ""}
-        count={count}
+        runningCount={runningCount}
         expanded={expanded}
         themeColor={folderThemeColor(folderId)}
         appThemeColor={appThemeColor}
@@ -2197,6 +2295,7 @@ export function SidebarConversationList({
         onNewConversation={handleNewConversationForFolder}
         onImport={handleImportForFolder}
         onManageConversations={handleManageConversations}
+        onManageLinks={handleManageFolderLinks}
         onChangeColor={handleChangeFolderColor}
         onSetAlias={handleSetFolderAlias}
         onSetDefaultAgent={handleChangeFolderDefaultAgent}
@@ -2222,8 +2321,17 @@ export function SidebarConversationList({
           onToggle={toggleSection}
           // The chats section gets an always-visible New-chat button (its primary
           // entry point, reachable even when empty). `openChatModeTab` is a stable
-          // context callback, so the memo holds.
-          onNewChat={row.section === "chats" ? openChatModeTab : undefined}
+          // context callback, so the memo holds. Recent gets the same
+          // affordance, but starting a conversation in the ACTIVE FOLDER — the
+          // section spans folders and chats alike, and the folder is where a
+          // "continue where I left off" list lands you.
+          onNewChat={
+            row.section === "chats"
+              ? openChatModeTab
+              : row.section === "recent"
+                ? handleNewConversation
+                : undefined
+          }
           // The folders section gets two right-edge hover actions mirroring the
           // top-of-page NewFolderDropdown: Open Folder and Clone Repository.
           // Both handlers are stable, so the memo holds.
@@ -2323,6 +2431,53 @@ export function SidebarConversationList({
       return (
         <div className="px-[0.5rem] py-[0.375rem] text-[0.75rem] text-muted-foreground/70">
           {t("noFolders")}
+        </div>
+      )
+    }
+    if (row.kind === "recent-empty") {
+      // Empty "Recent" section hint — same folderless, rail-less treatment as
+      // the other two. Only reachable in a workspace with no conversations at
+      // all, since Recent spans every section.
+      return (
+        <div className="px-[0.5rem] py-[0.375rem] text-[0.75rem] text-muted-foreground/70">
+          {t("noRecent")}
+        </div>
+      )
+    }
+    if (row.kind === "recent-more") {
+      // Footer of the paged Recent section — a row, not a hint: each click
+      // reveals another page. Its geometry is the conversation card's, so the
+      // section reads as one column — the chevron sits ON the rail axis exactly
+      // where a card's agent icon does (same 0.75rem glyph in the same 0.875rem
+      // box, centred on the var), and the label starts at the card's title
+      // inset (`axis + 0.875rem`). Same row height and full rounding too, so
+      // its hover pill is the one the rows above it use.
+      return (
+        <div className="relative h-[2rem]">
+          <button
+            type="button"
+            onClick={revealMoreRecent}
+            className="relative flex h-[1.9375rem] w-full items-center rounded-full pr-[0.25rem] text-left text-[0.75rem] text-muted-foreground/80 outline-none transition-colors duration-[120ms] hover:bg-[color-mix(in_oklab,var(--sidebar-accent),var(--sidebar-foreground)_2%)] hover:text-sidebar-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
+            style={{
+              paddingLeft: "calc(var(--conv-rail-axis, 0.875rem) + 0.875rem)",
+            }}
+          >
+            <span
+              aria-hidden
+              className="pointer-events-none absolute top-1/2 flex items-center justify-center"
+              style={{
+                left: "var(--conv-rail-axis, 0.875rem)",
+                width: "0.875rem",
+                height: "0.875rem",
+                transform: "translate(-50%, -50%)",
+              }}
+            >
+              <ChevronDown className="h-[0.75rem] w-[0.75rem]" />
+            </span>
+            <span className="truncate">
+              {t("showMoreRecent", { count: row.remaining })}
+            </span>
+          </button>
         </div>
       )
     }
@@ -2608,21 +2763,23 @@ export function SidebarConversationList({
         </AlertDialogContent>
       </AlertDialog>
 
-      {manageState && (
+      {manageFolderId != null && (
         <ConversationManageDialog
           open
-          onOpenChange={(o) => !o && setManageState(null)}
-          folderId={manageState.folderId}
-          folderName={manageState.folderName}
+          onOpenChange={(o) => !o && setManageFolderId(null)}
+          folderId={manageFolderId}
         />
       )}
 
       <CloneDialog open={cloneOpen} onOpenChange={setCloneOpen} />
-      <DirectoryBrowserDialog
-        open={browserOpen}
-        onOpenChange={setBrowserOpen}
-        onSelect={handleBrowserSelect}
-      />
+      <WorkspaceFolderDialog open={browserOpen} onOpenChange={setBrowserOpen} />
+      {linksFolder && (
+        <WorkspaceFolderDialog
+          open
+          onOpenChange={(o) => !o && setLinksFolder(null)}
+          folder={linksFolder}
+        />
+      )}
     </div>
   )
 }

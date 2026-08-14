@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { useTranslations } from "next-intl"
+import { useImeGuard } from "@/hooks/use-ime-guard"
 import {
   AlertTriangle,
   CheckCircle2,
@@ -472,6 +473,7 @@ export function KimiCodeConfigPanel({
   onSaved: () => Promise<void>
 }) {
   const t = useTranslations("AcpAgentSettings")
+  const ime = useImeGuard()
   const config = useMemo(
     () => parseKimiManagedConfig(agent.config_json),
     [agent.config_json]
@@ -1210,8 +1212,10 @@ export function KimiCodeConfigPanel({
                     <Input
                       value={customEffort}
                       onChange={(event) => setCustomEffort(event.target.value)}
+                      {...ime.props}
                       onKeyDown={(event) => {
-                        if (event.key !== "Enter") return
+                        if (ime.isComposing(event) || event.key !== "Enter")
+                          return
                         event.preventDefault()
                         addCustomEffort()
                       }}

@@ -14,6 +14,7 @@ export type ShortcutActionId =
   | "prev_tab"
   | "send_message"
   | "newline_in_message"
+  | "toggle_custom_style"
 
 export interface ShortcutDefinition {
   id: ShortcutActionId
@@ -65,6 +66,9 @@ export const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
   {
     id: "newline_in_message",
   },
+  {
+    id: "toggle_custom_style",
+  },
 ]
 
 /** Actions that allow shortcuts without modifier keys (e.g. plain Enter). */
@@ -91,6 +95,9 @@ export const DEFAULT_SHORTCUTS: ShortcutSettings = {
   prev_tab: "mod+shift+tab",
   send_message: "enter",
   newline_in_message: "shift+enter",
+  // 自定义样式的逃生舱：用户把界面改到不可用时，这一路必须仍然按得动，所以选一个
+  // 三修饰键组合（不会与任何常用操作撞车），并在捕获阶段监听。
+  toggle_custom_style: "mod+alt+shift+s",
 }
 
 export const SHORTCUTS_STORAGE_KEY = "settings:shortcuts:v1"
@@ -223,6 +230,32 @@ export function normalizeShortcut(rawShortcut: string): string | null {
   return normalizedParts.join("+")
 }
 
+/**
+ * 键盘事件里我们真正读的那几个字段。`code` 是可选的，因为部分调用点（含测试）
+ * 构造的是精简对象。
+ */
+type ShortcutEventLike = Pick<
+  KeyboardEvent,
+  "key" | "metaKey" | "ctrlKey" | "altKey" | "shiftKey"
+> & { code?: string }
+
+/**
+ * Alt/Option 会改写 `event.key`：macOS 上 ⌥S 报的是 "ß" 而不是 "s"（其它布局同理）。
+ * 按住 Alt 时改用与键盘布局无关的 `event.code`，否则**任何含 alt 的组合在 macOS 上
+ * 都按不出来**，录制时记下的也会是那个变音字符。
+ *
+ * 只在 altKey 为真时改道，所以不含 alt 的既有快捷键行为完全不变。
+ */
+function eventKeyToken(event: ShortcutEventLike): string | null {
+  if (event.altKey && typeof event.code === "string") {
+    const letter = /^Key([A-Z])$/.exec(event.code)
+    if (letter) return letter[1].toLowerCase()
+    const digit = /^Digit([0-9])$/.exec(event.code)
+    if (digit) return digit[1]
+  }
+  return normalizeKeyToken(event.key)
+}
+
 export function readShortcutSettings(): ShortcutSettings {
   if (typeof window === "undefined") return { ...DEFAULT_SHORTCUTS }
 
@@ -253,14 +286,11 @@ export function writeShortcutSettings(settings: ShortcutSettings): void {
 }
 
 export function shortcutFromKeyboardEvent(
-  event: Pick<
-    KeyboardEvent,
-    "key" | "metaKey" | "ctrlKey" | "altKey" | "shiftKey"
-  >,
+  event: ShortcutEventLike,
   /** When true, allow shortcuts without modifier keys (e.g. plain Enter). */
   allowNoModifier = false
 ): string | null {
-  const keyToken = normalizeKeyToken(event.key)
+  const keyToken = eventKeyToken(event)
   if (!keyToken || MODIFIER_KEY_SET.has(keyToken)) return null
 
   if (!allowNoModifier && !event.metaKey && !event.ctrlKey && !event.altKey) {
@@ -277,10 +307,7 @@ export function shortcutFromKeyboardEvent(
 }
 
 export function matchShortcutEvent(
-  event: Pick<
-    KeyboardEvent,
-    "key" | "metaKey" | "ctrlKey" | "altKey" | "shiftKey"
-  >,
+  event: ShortcutEventLike,
   shortcut: string
 ): boolean {
   const normalized = normalizeShortcut(shortcut)
@@ -292,7 +319,7 @@ export function matchShortcutEvent(
   const needsAlt = parts.includes("alt")
   const needsShift = parts.includes("shift")
 
-  const actualKey = normalizeKeyToken(event.key)
+  const actualKey = eventKeyToken(event)
   if (!actualKey) return false
   if (actualKey !== keyToken) return false
 

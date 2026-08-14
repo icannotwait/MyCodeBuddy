@@ -21,6 +21,7 @@ import {
 import { Input } from "@/components/ui/input"
 import { Button } from "@/components/ui/button"
 import { ScrollArea } from "@/components/ui/scroll-area"
+import { useImeGuard } from "@/hooks/use-ime-guard"
 import { cn } from "@/lib/utils"
 import { getHomeDirectory, listDirectoryWithFiles } from "@/lib/api"
 import { parentFsPath } from "@/lib/path-utils"
@@ -44,6 +45,7 @@ export function ServerFileBrowserDialog({
   multiple = true,
 }: ServerFileBrowserDialogProps) {
   const t = useTranslations("ServerFileBrowser")
+  const ime = useImeGuard()
 
   const [rootPath, setRootPath] = useState("")
   const [pathInput, setPathInput] = useState("")
@@ -187,11 +189,12 @@ export function ServerFileBrowserDialog({
 
   const handlePathInputKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
+      if (ime.isComposing(e)) return
       if (e.key === "Enter" && pathInput.trim()) {
         navigateTo(pathInput.trim())
       }
     },
-    [pathInput, navigateTo]
+    [ime, pathInput, navigateTo]
   )
 
   const renderEntries = (parentPath: string, depth: number) => {
@@ -306,6 +309,7 @@ export function ServerFileBrowserDialog({
             <Input
               value={pathInput}
               onChange={(e) => setPathInput(e.target.value)}
+              {...ime.props}
               onKeyDown={handlePathInputKeyDown}
               placeholder={t("pathPlaceholder")}
               className="flex-1 h-8 text-sm font-mono"

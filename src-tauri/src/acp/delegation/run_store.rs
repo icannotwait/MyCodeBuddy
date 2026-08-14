@@ -45,11 +45,11 @@ use crate::acp::delegation::workflow::admission::{
 use crate::acp::delegation::workflow::completion_evidence::ensure_task_completion_recovery_not_fenced_txn;
 use crate::acp::delegation::workflow::{
     admit_workflow_run_txn, emit_workflow_side_effect, on_mapped_run_transition_txn,
-    on_provisional_abandon_txn, on_terminal_settle_txn, AdmissionDispatchKind, ArtifactFailure,
-    CompletionEvidenceError, CompletionIntentReason, CompletionOutcome,
-    CompletionRecoveryFenceError, CompletionRole, CompletionToolIntent, ResolvedArtifact,
-    require_writable_conversation_workflow, TerminalCompletionInput, TerminalCompletionResult,
-    WorkflowAdmitInput, WorkflowChildMcpBinding, WorkflowTxnSideEffect,
+    on_provisional_abandon_txn, on_terminal_settle_txn, require_writable_conversation_workflow,
+    AdmissionDispatchKind, ArtifactFailure, CompletionEvidenceError, CompletionIntentReason,
+    CompletionOutcome, CompletionRecoveryFenceError, CompletionRole, CompletionToolIntent,
+    ResolvedArtifact, TerminalCompletionInput, TerminalCompletionResult, WorkflowAdmitInput,
+    WorkflowChildMcpBinding, WorkflowTxnSideEffect,
 };
 use crate::acp::recovery_authorization::{
     consume_txn, validate_for_consumption_txn, AuthorizationConsumeExpectation,
@@ -2844,12 +2844,9 @@ impl RunStore {
                 let admission = admission.clone();
                 let authorization = authorization.clone();
                 Box::pin(async move {
-                    require_writable_conversation_workflow(
-                        txn,
-                        admission.parent_conversation_id,
-                    )
-                    .await
-                    .map_err(terminal_protocol_store_error)?;
+                    require_writable_conversation_workflow(txn, admission.parent_conversation_id)
+                        .await
+                        .map_err(terminal_protocol_store_error)?;
                     // SQLite read transactions cannot safely upgrade after a
                     // concurrent replacement writes. Take the writer reservation
                     // before every eligibility read so replacement and continue

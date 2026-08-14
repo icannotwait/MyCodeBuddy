@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod compression;
 pub mod event_bridge;
 pub mod handlers;
 pub mod port_probe;
@@ -879,6 +880,12 @@ pub(crate) async fn do_start_web_server_tauri(
         // reads, so HTTP-side session-info settings target the same flag.
         session_info_config: app
             .state::<crate::acp::session_info::SessionInfoRuntimeConfig>()
+            .inner()
+            .clone(),
+        // Reuse the same chat-authoring config handle desktop MCP injection and
+        // the authoring write path read, so HTTP-side saves target the same flags.
+        chat_authoring_config: app
+            .state::<crate::acp::chat_authoring::ChatAuthoringRuntimeConfig>()
             .inner()
             .clone(),
         system_op_lock: crate::app_state::default_system_op_lock(),

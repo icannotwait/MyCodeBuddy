@@ -72,6 +72,10 @@ function seedSession(
     sessionStats: null,
     delegationActivities: [],
     historyAssistantBaseline: null,
+    batchBoundaryIndex: null,
+    batchBoundaryPrefixHash: null,
+    loadingOlderTurns: false,
+    olderTurnsPrependEpoch: 0,
     pendingCleanup: false,
     delegateSyncError: null,
     pendingCancel: null,
@@ -204,13 +208,102 @@ describe("timeline prefix cache across streaming batches", () => {
     const detail = makeDetail([turn("u1", "user")])
     seedSession(CID, { detail })
     const timelineA = getTimelineTurns(CID)
-    expect(timelineA[0].key).toBe(`persisted-${CID}-u1-0`)
+    expect(timelineA[0].key).toBe(`persisted-${CID}-u1`)
 
     // Migration re-homes the same detail object under a new conversation id.
     const CID2 = CID + 1
     seedSession(CID2, { detail })
     const timelineB = getTimelineTurns(CID2)
-    expect(timelineB[0].key).toBe(`persisted-${CID2}-u1-0`)
+    expect(timelineB[0].key).toBe(`persisted-${CID2}-u1`)
     expect(timelineB[0]).not.toBe(timelineA[0])
+  })
+})
+
+describe("liveOwnsActiveTurn strips only the ACTIVE round", () => {
+  it("keeps earlier rounds of a multi-round session visible while streaming", () => {
+    // A work-task session runs work → rework → merge in ONE conversation and
+    // is watched through the read-only viewer. Stripping "from the first
+    // assistant turn" (the one-shot delegation-child rule) erased every
+    // completed round for as long as the task streamed — the viewer showed
+    // just the kickoff and the live reply.
+    const detail = makeDetail([
+      turn("u1", "user"),
+      turn("a1", "assistant"),
+      turn("u2", "user"),
+      turn("a2", "assistant"),
+      turn("u3", "user"),
+    ])
+    seedSession(CID, {
+      detail,
+      liveOwnsActiveTurn: true,
+      liveMessage: liveMsg("m1", "working…"),
+    })
+
+    expect(getTimelineTurns(CID).map((e) => e.turn.id)).toEqual([
+      "u1",
+      "a1",
+      "u2",
+      "a2",
+      "u3",
+      `live-${CID}-m1`,
+    ])
+  })
+
+  it("still drops the persisted copy of the reply being streamed", () => {
+    // The DB caught up mid-stream: a3 is the partial persisted copy of the
+    // very reply the live message is rendering — it must not double up.
+    const detail = makeDetail([
+      turn("u1", "user"),
+      turn("a1", "assistant"),
+      turn("u2", "user"),
+      turn("a2", "assistant"),
+    ])
+    seedSession(CID, {
+      detail,
+      liveOwnsActiveTurn: true,
+      liveMessage: liveMsg("m1", "half a rep"),
+    })
+
+    expect(getTimelineTurns(CID).map((e) => e.turn.id)).toEqual([
+      "u1",
+      "a1",
+      "u2",
+      `live-${CID}-m1`,
+    ])
+  })
+
+  it("drops a lone persisted reply when no user turn has landed yet", () => {
+    // Cold transcript (the agent CLI writes its JSONL asynchronously): there
+    // is no user turn to anchor on, and the only assistant content that can
+    // exist is the reply being streamed.
+    const detail = makeDetail([turn("a1", "assistant")])
+    seedSession(CID, {
+      detail,
+      liveOwnsActiveTurn: true,
+      delegationKickoffText: "do the thing",
+      liveMessage: liveMsg("m1", "on it"),
+    })
+
+    expect(getTimelineTurns(CID).map((e) => e.turn.id)).toEqual([
+      `kickoff-${CID}`,
+      `live-${CID}-m1`,
+    ])
+  })
+
+  it("leaves a settled session's full history alone", () => {
+    const detail = makeDetail([
+      turn("u1", "user"),
+      turn("a1", "assistant"),
+      turn("u2", "user"),
+      turn("a2", "assistant"),
+    ])
+    seedSession(CID, { detail, liveOwnsActiveTurn: true, liveMessage: null })
+
+    expect(getTimelineTurns(CID).map((e) => e.turn.id)).toEqual([
+      "u1",
+      "a1",
+      "u2",
+      "a2",
+    ])
   })
 })

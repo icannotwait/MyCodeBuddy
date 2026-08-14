@@ -6,6 +6,7 @@ import { MessageCircleQuestion, SendHorizonal } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { matchShortcutEvent } from "@/lib/keyboard-shortcuts"
 import { useShortcutSettings } from "@/hooks/use-shortcut-settings"
+import { useImeGuard } from "@/hooks/use-ime-guard"
 import type { PendingQuestion } from "@/contexts/acp-connections-context"
 
 interface QuestionDialogProps {
@@ -21,6 +22,7 @@ export function QuestionDialog({
   interactionLocked = false,
 }: QuestionDialogProps) {
   const t = useTranslations("Folder.chat.questionDialog")
+  const ime = useImeGuard()
   const { shortcuts } = useShortcutSettings()
   const [answer, setAnswer] = useState("")
   const textareaRef = useRef<HTMLTextAreaElement>(null)
@@ -50,12 +52,14 @@ export function QuestionDialog({
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+      // The Enter that confirms a CJK candidate must reach the IME, not send.
+      if (ime.isComposing(e)) return
       if (matchShortcutEvent(e, shortcuts.send_message)) {
         e.preventDefault()
         handleSubmit()
       }
     },
-    [handleSubmit, shortcuts]
+    [ime, handleSubmit, shortcuts]
   )
 
   if (!question) return null
@@ -76,6 +80,7 @@ export function QuestionDialog({
           ref={textareaRef}
           value={answer}
           onChange={(e) => setAnswer(e.target.value)}
+          {...ime.props}
           onKeyDown={handleKeyDown}
           placeholder={t("placeholder")}
           rows={2}

@@ -7,10 +7,12 @@ import {
   useLayoutEffect,
   useMemo,
   useRef,
+  useState,
 } from "react"
 import type { CSSProperties, ReactNode, RefObject } from "react"
 import { Virtualizer, type VirtualizerHandle } from "virtua"
 import { useStickToBottomContext } from "use-stick-to-bottom"
+import { Loader2 } from "lucide-react"
 import {
   MessageThreadContent,
   type MessageThreadContentProps,
@@ -23,6 +25,15 @@ import {
   type LiveFooterScrollCoordinator,
   type MessageScrollContextValue,
 } from "@/components/message/message-scroll-context"
+
+/**
+ * Scroll offset (px from the top) under which a reverse-infinite-scroll load
+ * is triggered. Fired on the downward CROSSING of this threshold (scrolling
+ * up), never on absolute position — so the initial instant stick-to-bottom
+ * (which starts at offset 0 before the first layout) and short lists that
+ * never scroll cannot auto-trigger a cascade of page loads.
+ */
+const LOAD_OLDER_THRESHOLD_PX = 240
 
 interface VirtualizedMessageThreadProps<T> {
   /** Data to virtualise — each entry becomes one virtual row. */
@@ -79,6 +90,43 @@ interface VirtualizedMessageThreadProps<T> {
    * message navigator) can drive `scrollToIndex`.
    */
   scrollApiRef?: RefObject<MessageScrollContextValue | null>
+  /**
+   * Reverse infinite scroll: older items exist above `items[0]`. Renders a
+   * loader row above the list and arms the near-top trigger. The row is also
+   * a button, so a window shorter than the viewport (nothing to scroll) can
+   * still page in history.
+   */
+  hasOlder?: boolean
+  /** An older-page request is in flight (spinner state on the loader row). */
+  isLoadingOlder?: boolean
+  /** Called on the near-top crossing / loader click to page in history. */
+  onLoadOlder?: () => void
+  /** Loader-row labels (i18n: idle button text / loading text). */
+  loadOlderLabel?: string
+  loadingOlderLabel?: string
+  /**
+   * Explicit prepend signal driving virtua's `shift`: bumped by the data
+   * layer on every render whose `items` gained prepended history, scoped by
+   * `prependScopeKey` (a conversation id) so a scope switch — a different
+   * conversation's list replacing this one wholesale — never reads as a
+   * prepend. An explicit signal, NOT a key heuristic: a window starting
+   * mid-way through a consecutive-assistant run merges with prepended turns
+   * into one render item whose key changes, so "did the old first key
+   * survive" is false on exactly the render that must shift.
+   */
+  prependEpoch?: number
+  prependScopeKey?: string | number
+}
+
+/**
+ * `shift` decision for one render: same scope, epoch advanced. Exported for
+ * unit tests.
+ */
+export function shouldShiftForPrepend(
+  prev: { scope: string | number | undefined; epoch: number },
+  next: { scope: string | number | undefined; epoch: number }
+): boolean {
+  return prev.scope === next.scope && next.epoch !== prev.epoch
 }
 
 function isAtBottomElement(el: HTMLElement): boolean {
@@ -102,43 +150,44 @@ function VirtualizedMessageThreadImpl<T>({
   contentClassName,
   contentProps,
   scrollApiRef,
+  hasOlder = false,
+  isLoadingOlder = false,
+  onLoadOlder,
+  loadOlderLabel,
+  loadingOlderLabel,
+  prependEpoch = 0,
+  prependScopeKey,
 }: VirtualizedMessageThreadProps<T>) {
   const { scrollRef, scrollToBottom, stopScroll, isAtBottom } =
     useStickToBottomContext()
   const virtualizerHandleRef = useRef<VirtualizerHandle>(null)
   const footerShellRef = useRef<HTMLDivElement | null>(null)
-  const committedItemKeysRef = useRef<readonly string[]>([])
   const scrollToBottomRef = useRef(scrollToBottom)
   const stopScrollRef = useRef(stopScroll)
   scrollToBottomRef.current = scrollToBottom
   stopScrollRef.current = stopScroll
   const hasFooter = footer != null
-  const itemKeys = useMemo(
-    () => items.map((item, index) => getItemKey(item, index)),
-    [items, getItemKey]
-  )
-  const shiftForPrepend = useMemo(() => {
-    const previous = committedItemKeysRef.current
-    const added = itemKeys.length - previous.length
-    return (
-      added > 0 &&
-      previous.length > 0 &&
-      previous.every((key, index) => key === itemKeys[index + added])
-    )
-  }, [itemKeys])
-  useLayoutEffect(() => {
-    committedItemKeysRef.current = itemKeys
-  }, [itemKeys])
   // Seed follow intent once when footer appears (not on every re-render).
   const initialFollowRef = useRef(true)
   if (!hasFooter) {
     initialFollowRef.current = true
   }
 
+  // The loader row occupies virtua index 0 when present, shifting every data
+  // item's virtual index by one — account for it in scrollToIndex so nav
+  // targets (computed over `items`) keep landing on the right row. Mirrored
+  // into a ref post-commit (see the sync effect below); scrollToIndex only
+  // runs from user interactions, so it always reads a committed value.
+  const rowOffset = hasOlder ? 1 : 0
+  const rowOffsetRef = useRef(rowOffset)
+
   const scrollToIndex = useCallback<MessageScrollContextValue["scrollToIndex"]>(
     (index, opts) => {
       // Indices refer only to historical Virtua items — never the live footer.
-      virtualizerHandleRef.current?.scrollToIndex(index, opts)
+      virtualizerHandleRef.current?.scrollToIndex(
+        index + rowOffsetRef.current,
+        opts
+      )
     },
     []
   )
@@ -258,6 +307,67 @@ function VirtualizedMessageThreadImpl<T>({
     }
   }, [scrollApiRef, scrollContextValue])
 
+  // virtua's `shift` for reverse infinite scroll, derived from the explicit
+  // prepend signal (see the prop doc — key heuristics fail under cross-page
+  // assistant-run merges). Derived-state-during-render pattern (not a ref —
+  // refs must not be read in render): when the signal moves, re-render
+  // immediately so the COMMITTED render of the prepended children carries
+  // `shift=true` and virtua anchors the viewport to the end instead of
+  // jumping. The stored flag persists only across renders with an identical
+  // signal (subsequent renders reuse the same children or replace them via a
+  // signal-less update, where shift must read false again once items move).
+  const [prependMark, setPrependMark] = useState<{
+    scope: string | number | undefined
+    epoch: number
+    items: T[]
+    shift: boolean
+  }>({ scope: prependScopeKey, epoch: prependEpoch, items, shift: false })
+  if (
+    prependMark.items !== items ||
+    prependMark.epoch !== prependEpoch ||
+    prependMark.scope !== prependScopeKey
+  ) {
+    setPrependMark({
+      scope: prependScopeKey,
+      epoch: prependEpoch,
+      items,
+      shift: shouldShiftForPrepend(
+        { scope: prependMark.scope, epoch: prependMark.epoch },
+        { scope: prependScopeKey, epoch: prependEpoch }
+      ),
+    })
+  }
+  const shift =
+    prependMark.items === items &&
+    prependMark.epoch === prependEpoch &&
+    prependMark.scope === prependScopeKey
+      ? prependMark.shift
+      : false
+
+  // Near-top trigger, armed only on the downward CROSSING of the threshold —
+  // see LOAD_OLDER_THRESHOLD_PX. Prop values are mirrored into a ref
+  // post-commit so the scroll handler stays referentially stable across
+  // streaming re-renders; scroll events only fire after commit.
+  const loadOlderStateRef = useRef({ hasOlder, isLoadingOlder, onLoadOlder })
+  useEffect(() => {
+    rowOffsetRef.current = rowOffset
+    loadOlderStateRef.current = { hasOlder, isLoadingOlder, onLoadOlder }
+  })
+  const prevScrollOffsetRef = useRef<number | null>(null)
+  const handleScroll = useCallback((offset: number) => {
+    const prev = prevScrollOffsetRef.current
+    prevScrollOffsetRef.current = offset
+    const s = loadOlderStateRef.current
+    if (!s.hasOlder || s.isLoadingOlder || !s.onLoadOlder) return
+    if (
+      offset < LOAD_OLDER_THRESHOLD_PX &&
+      prev !== null &&
+      prev >= LOAD_OLDER_THRESHOLD_PX
+    ) {
+      s.onLoadOlder()
+    }
+  }, [])
+
   // Make the scroll viewport focusable so the browser's native keyboard
   // scrolling (Arrow keys, PageUp/PageDown, Home/End, Space) works — matching
   // the sidebar conversation list, whose card <button>s are focusable and let
@@ -344,7 +454,7 @@ function VirtualizedMessageThreadImpl<T>({
                 {header}
               </div>
             ) : null}
-            {items.length > 0 ? (
+            {items.length > 0 || hasOlder ? (
               <Virtualizer
                 ref={virtualizerHandleRef}
                 scrollRef={
@@ -352,20 +462,48 @@ function VirtualizedMessageThreadImpl<T>({
                 }
                 itemSize={itemSize}
                 bufferSize={bufferSize}
-                shift={shiftForPrepend}
+                shift={shift}
+                onScroll={handleScroll}
                 startMargin={header ? 56 : 0}
               >
-                {items.map((item, index) => (
-                  <div
-                    key={getItemKey(item, index)}
-                    style={itemStyle(index, items.length)}
-                    data-message-history-row
-                  >
-                    <div className={cn("mx-auto max-w-3xl px-4", className)}>
-                      {renderItem(item, index)}
+                {[
+                  ...(hasOlder
+                    ? [
+                        <div key="load-older-row" style={styles.first}>
+                          <div
+                            className={cn("mx-auto max-w-3xl px-4", className)}
+                          >
+                            <button
+                              type="button"
+                              onClick={isLoadingOlder ? undefined : onLoadOlder}
+                              disabled={isLoadingOlder}
+                              className="mx-auto flex items-center gap-2 rounded-full border border-border bg-muted/40 px-3 py-1 text-xs text-muted-foreground transition-colors hover:bg-muted disabled:cursor-default disabled:hover:bg-muted/40"
+                            >
+                              {isLoadingOlder ? (
+                                <>
+                                  <Loader2 className="h-3 w-3 animate-spin" />
+                                  {loadingOlderLabel}
+                                </>
+                              ) : (
+                                loadOlderLabel
+                              )}
+                            </button>
+                          </div>
+                        </div>,
+                      ]
+                    : []),
+                  ...items.map((item, index) => (
+                    <div
+                      key={getItemKey(item, index)}
+                      style={itemStyle(index, items.length)}
+                      data-message-history-row
+                    >
+                      <div className={cn("mx-auto max-w-3xl px-4", className)}>
+                        {renderItem(item, index)}
+                      </div>
                     </div>
-                  </div>
-                ))}
+                  )),
+                ]}
               </Virtualizer>
             ) : null}
             {footer ? (

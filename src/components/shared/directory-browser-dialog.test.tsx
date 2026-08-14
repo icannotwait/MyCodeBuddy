@@ -137,7 +137,9 @@ describe("DirectoryBrowserDialog", () => {
     fireEvent.click(screen.getByText("work"))
     await screen.findByDisplayValue("/home/me/work")
 
-    fireEvent.click(screen.getByTitle("Go to parent directory"))
+    fireEvent.click(
+      screen.getByRole("button", { name: "Go to parent directory" })
+    )
 
     // Parent of the INPUT (/home/me/work) is /home/me. The old rootPath-based
     // logic would instead have jumped to /home (parent of the tree root).

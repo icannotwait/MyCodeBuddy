@@ -8,7 +8,8 @@ import {
   DEFAULT_THEME_COLOR,
   type ThemeColor,
 } from "./theme-presets"
-import { useWorkspaceBackground } from "@/hooks/use-appearance"
+import { useCustomStyle, useWorkspaceBackground } from "@/hooks/use-appearance"
+import { toHexColor } from "./custom-style"
 
 // Editor canvas background per theme color = that theme's `--card` token (see the
 // [data-theme="…"] blocks in globals.css). The file editor is a card surface, so it
@@ -530,9 +531,14 @@ function withCanvasBackground(
   // When set (a 2-hex-digit alpha like "b8"), the canvas backgrounds become
   // semi-transparent 8-digit hex so a workspace background image shows through
   // the editor. Empty (default) keeps them fully opaque — unchanged behaviour.
-  alphaHexSuffix = ""
+  alphaHexSuffix = "",
+  // 外观设置页的「自定义配色」改了 --card / --muted 时传进来（已转成 #rrggbb）。
+  // 不传即沿用预设的硬编码表 —— 零回归。
+  canvasOverride?: string,
+  lineHighlightOverride?: string
 ): Record<string, string> {
-  const opaqueBg = EDITOR_CANVAS_BG[color][dark ? "dark" : "light"]
+  const opaqueBg =
+    canvasOverride ?? EDITOR_CANVAS_BG[color][dark ? "dark" : "light"]
   const bg = opaqueBg + alphaHexSuffix
   return {
     ...base,
@@ -556,6 +562,7 @@ function withCanvasBackground(
     "editorStickyScroll.background": bg,
     "editorStickyScrollGutter.background": bg,
     "editor.lineHighlightBackground":
+      lineHighlightOverride ??
       EDITOR_LINE_HIGHLIGHT[color][dark ? "dark" : "light"],
   }
 }
@@ -695,6 +702,52 @@ export function defineWorkspaceBgTheme(
   return name
 }
 
+// 画布/当前行底色跟随用户自定义的 --card / --muted。名字里编进两个颜色（与可选的
+// wsbg alpha），所以取值一变就是一个新主题名，`defineTheme` 的幂等缓存照旧成立。
+function canvasColorKey(hex: string): string {
+  return hex.replace(/[^0-9a-f]/gi, "").toLowerCase()
+}
+
+export function defineCustomCanvasTheme(
+  monaco: Monaco,
+  baseTheme: string,
+  canvas: string,
+  lineHighlight: string,
+  alpha?: number
+): string {
+  const alphaSuffix =
+    alpha === undefined
+      ? ""
+      : `-wsbg${Math.round(Math.min(1, Math.max(0, alpha)) * 100)}`
+  const name = `${baseTheme}-c${canvasColorKey(canvas)}-l${canvasColorKey(
+    lineHighlight
+  )}${alphaSuffix}`
+
+  let defined = wsbgDefinedThemes.get(monaco)
+  if (!defined) {
+    defined = new Set()
+    wsbgDefinedThemes.set(monaco, defined)
+  }
+  if (defined.has(name)) return name
+
+  const { color, dark } = parseMonacoThemeName(baseTheme)
+  monaco.editor.defineTheme(name, {
+    base: dark ? "vs-dark" : "vs",
+    inherit: true,
+    rules: dark ? monacoTokenRules.dark : monacoTokenRules.light,
+    colors: withCanvasBackground(
+      dark ? monacoThemeColors.dark : monacoThemeColors.light,
+      color,
+      dark,
+      alpha === undefined ? "" : editorAlphaHex(alpha),
+      canvas,
+      lineHighlight
+    ),
+  })
+  defined.add(name)
+  return name
+}
+
 // The editor canvas is a fully transparent (alpha 0) surface, so the code area
 // matches the conversation canvas exactly — both let the masked background image
 // show straight through. Readability comes from the shared background mask (and
@@ -719,6 +772,25 @@ const WSBG_CANVAS_ALPHA = 0
 export function useMonacoWorkspaceTheme(monaco: Monaco | null): string {
   const baseTheme = useMonacoThemeSync()
   const { workspaceBgEnabled } = useWorkspaceBackground()
+  const { activeTokenOverrides } = useCustomStyle()
+
+  // 用户在「自定义配色」里改了 --card / --muted 时，编辑器画布与当前行高亮跟着走。
+  // 不做的话画布仍是 EDITOR_CANVAS_BG 里的硬编码预设色，与已经变色的界面明显割裂。
+  // Monaco 的 defineTheme 只认 hex，所以 oklch/hsl 先经 canvas 转换；转不出来的
+  // 罕见取值回落到预设值（局部退化，不会整块崩掉）。
+  const customCanvas = toHexColor(activeTokenOverrides.card ?? "")
+  const customLine = toHexColor(activeTokenOverrides.muted ?? "")
+
+  if (monaco && (customCanvas || customLine)) {
+    const { color, dark } = parseMonacoThemeName(baseTheme)
+    return defineCustomCanvasTheme(
+      monaco,
+      baseTheme,
+      customCanvas ?? EDITOR_CANVAS_BG[color][dark ? "dark" : "light"],
+      customLine ?? EDITOR_LINE_HIGHLIGHT[color][dark ? "dark" : "light"],
+      workspaceBgEnabled ? WSBG_CANVAS_ALPHA : undefined
+    )
+  }
 
   // Off, or monaco not available yet → the opaque base theme (zero regression).
   if (!workspaceBgEnabled || !monaco) return baseTheme

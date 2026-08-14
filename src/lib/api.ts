@@ -17,6 +17,7 @@ import {
 import { filterSessionConfigOptions } from "./session-config-filter"
 import { DEFAULT_HISTORY_USER_TURN_LIMIT } from "./history-window"
 import type { FolderThemeColor } from "./theme-presets"
+import type { FollowUpIntent } from "./task-follow-up"
 import type {
   AgentType,
   AcpPromptContext,
@@ -39,8 +40,16 @@ import type {
   Automation,
   AutomationRun,
   AutomationDraft,
+  WorkTask,
+  WorkTaskChangedFile,
+  WorkTaskConfig,
+  WorkTaskDraft,
+  WorkTaskEvent,
+  WorkTaskFolderSettings,
+  WorkTaskTemplate,
   ConversationSummary,
   ConversationDetail,
+  ConversationTurnsPage,
   DbConversationDetail,
   FolderInfo,
   AgentStats,
@@ -79,9 +88,13 @@ import type {
   CustomImportResult,
   FolderHistoryEntry,
   FolderDetail,
+  FolderLinkDetail,
+  FolderLinkPlan,
+  FolderLinkRequestItem,
   CreateChatConversationResult,
   CreateChatDirResult,
   WorktreeResolution,
+  GitWorktreeRemoval,
   DbConversationSummary,
   DelegateAccessState,
   ToolWatchdogSettings,
@@ -158,6 +171,11 @@ import type {
   CompletionOutcome,
   CompletionProjectionV2,
   WorkflowGraphSnapshot,
+  TokenUsageFacets,
+  TokenUsageFilter,
+  TokenUsageReport,
+  TokenUsageSyncResult,
+  TokenUsageSyncStatus,
 } from "./types"
 
 export async function listConversations(params?: {
@@ -854,6 +872,13 @@ export async function acpUpdatePiConfig(params: {
    * `models.json` (with `customApi` as the wire protocol). Omit for built-ins. */
   customBaseUrl?: string
   customApi?: string
+  /** Reasoning declaration for `model` inside the custom provider — pi refuses every
+   * thinking level for a model that doesn't declare one. Omit to leave whatever the
+   * entry already says untouched (built-in providers carry pi's own declaration). */
+  modelReasoning?: {
+    reasoning: boolean
+    thinkingLevelMap: Record<string, string | null>
+  }
 }): Promise<void> {
   return getTransport().call("acp_update_pi_config", {
     provider: params.provider,
@@ -862,6 +887,7 @@ export async function acpUpdatePiConfig(params: {
     apiKey: params.apiKey ?? null,
     customBaseUrl: params.customBaseUrl ?? null,
     customApi: params.customApi ?? null,
+    modelReasoning: params.modelReasoning ?? null,
   })
 }
 
@@ -877,7 +903,18 @@ export async function loadPiConfig(): Promise<{
   authProviders: string[]
   /** Custom/self-hosted providers defined in `models.json`, sorted by id. Used
    * to rehydrate the custom-provider form and detect a custom `defaultProvider`. */
-  customProviders: { id: string; baseUrl: string; api: string }[]
+  customProviders: {
+    id: string
+    baseUrl: string
+    api: string
+    /** Models the provider defines, sorted by id. `reasoning: null` means the
+     * entry never declared one — distinct from an explicit `false`. */
+    models: {
+      id: string
+      reasoning: boolean | null
+      thinkingLevelMap: Record<string, string | null>
+    }[]
+  }[]
 }> {
   return getTransport().call("acp_load_pi_config", {})
 }
@@ -893,6 +930,81 @@ export async function acpValidatePiCommand(command: string): Promise<{
   version: string | null
 }> {
   return getTransport().call("acp_validate_pi_command", { command })
+}
+
+/** One repo-shipped pi resource that only loads once the workspace is trusted. */
+export type PiProjectResource = {
+  path: string
+  /** Display kind, e.g. `.pi/extensions`, `.agents/skills`. */
+  kind: string
+  /**
+   * True when loading it means running repo-controlled code at pi startup
+   * (`.pi/extensions` modules, `.pi/settings.json` project packages) rather than
+   * just feeding pi repo-controlled text.
+   */
+  executesCode: boolean
+}
+
+export type PiProjectTrustState = {
+  workspace: string
+  resources: PiProjectResource[]
+  /** `null` ⇒ nobody has decided, so pi leaves the resources unloaded. */
+  decision: boolean | null
+  /** Deciding directory — may be an ancestor of `workspace`. */
+  decidedAt: string | null
+  trustFile: string
+  /**
+   * Whether the user has confirmed this folder's grant in codeg. A trusted but
+   * unacknowledged folder is one an older build auto-trusted without asking, so
+   * the backend refuses to launch pi there until it is answered.
+   */
+  acknowledged: boolean
+}
+
+/**
+ * Which repo-shipped pi resources a workspace ships, and whether any trust
+ * decision already covers it. Read-only.
+ */
+export async function acpPiProjectTrustState(
+  workspace: string
+): Promise<PiProjectTrustState> {
+  return getTransport().call("acp_pi_project_trust_state", { workspace })
+}
+
+/**
+ * Record (`true`/`false`) or clear (`null`) a project-trust decision in pi's
+ * `trust.json`. The only path that writes trust — call it from an explicit user
+ * action, never automatically: a `true` here lets the repo's `.pi/extensions`
+ * execute at pi startup, is inherited by every subdirectory, and also applies to
+ * the user's standalone `pi` CLI.
+ */
+export async function acpPiSetProjectTrust(
+  workspace: string,
+  trusted: boolean | null
+): Promise<void> {
+  return getTransport().call("acp_pi_set_project_trust", { workspace, trusted })
+}
+
+/** One decision recorded in pi's `trust.json`. */
+export type PiTrustEntry = {
+  path: string
+  trusted: boolean
+}
+
+/**
+ * Record that the user reviewed an existing grant and chose to keep it, which
+ * clears the launch gate for that folder. Leaves pi's `trust.json` alone — the
+ * grant itself isn't changing, only codeg's record that it was confirmed.
+ */
+export async function acpPiAcknowledgeProjectTrust(
+  workspace: string
+): Promise<void> {
+  return getTransport().call("acp_pi_acknowledge_project_trust", { workspace })
+}
+
+/** Every decision in pi's `trust.json`, for review and revocation. */
+export async function acpPiListTrustEntries(): Promise<PiTrustEntry[]> {
+  return getTransport().call("acp_pi_list_trust_entries", {})
 }
 
 /**
@@ -996,6 +1108,13 @@ export interface CustomAgentInfo {
   source: string
   /** Optional command that prints the locally installed version. */
   versionProbe: string | null
+  /**
+   * User declaration that the agent accepts MCP servers on the ACP wire —
+   * for a custom agent, codeg's built-in codeg-mcp companion. Off means the
+   * connection is made without it, for agents that fail `session/new` when
+   * any server is sent.
+   */
+  supportsMcp: boolean
   /** False when the definition cannot launch here (e.g. no build for this OS). */
   launchable: boolean
   problem: string | null
@@ -1041,8 +1160,64 @@ export async function acpSaveCustomAgent(params: {
   source?: string
   /** Optional version-probe command; full-replace like the skills fields. */
   versionProbe?: string | null
+  /**
+   * MCP declaration. Omitted = the backend keeps the stored row's value (or
+   * on, for a new row) — the safe default here is what is already stored.
+   */
+  supportsMcp?: boolean
 }): Promise<void> {
   return getTransport().call("acp_save_custom_agent", { params })
+}
+
+/**
+ * Change ONE declaration on a stored custom-agent definition.
+ *
+ * `acp_save_custom_agent` is a full replace: a declaration the payload leaves
+ * out is cleared, not kept — so a caller that edits one field has to send every
+ * other field back. That makes the payload only as fresh as whatever the caller
+ * is holding, and the settings page renders several independent cards over the
+ * SAME definition, each loaded once on mount. Sending a card's own snapshot
+ * therefore lets it revert a save another card made after it mounted (turn MCP
+ * off in one card, flip a skills switch in the other, and MCP comes back on).
+ *
+ * So the definition is re-read here, immediately before the write, and the
+ * patch is applied to THAT. Callers pass only what they are actually changing,
+ * and a stale card cannot resurrect a value it never showed. The remaining
+ * window is read-to-write, which is as narrow as this gets without a
+ * compare-and-swap on the backend.
+ */
+export async function acpPatchCustomAgent(
+  registryId: string,
+  patch: Partial<
+    Pick<
+      CustomAgentInfo,
+      "skillsSharedStore" | "skillsDir" | "supportsMcp" | "versionProbe"
+    >
+  >
+): Promise<void> {
+  const current = (await acpListCustomAgents()).find(
+    (a) => a.registryId === registryId
+  )
+  if (!current) {
+    // Deleted from another window while this card was open. Failing is right:
+    // saving would re-create the definition the user just removed.
+    throw new Error(`Custom agent ${registryId} no longer exists`)
+  }
+  return acpSaveCustomAgent({
+    registryId: current.registryId,
+    name: current.name,
+    description: current.description,
+    version: current.version,
+    distributionKind: current.distributionKind as CustomDistributionKind,
+    spec: current.spec,
+    iconUrl: current.iconUrl,
+    source: current.source,
+    skillsSharedStore: current.skillsSharedStore,
+    skillsDir: current.skillsDir,
+    supportsMcp: current.supportsMcp,
+    versionProbe: current.versionProbe,
+    ...patch,
+  })
 }
 
 export async function acpDeleteCustomAgent(
@@ -1907,17 +2082,50 @@ export interface GetFolderConversationOptions {
   historyUserTurnLimit?: number
   /** Exclusive upper-bound turn id for "load older" pages. */
   historyBeforeTurnId?: string
+  /** Last N turns, start aligned to a user-round boundary. */
+  tailTurns?: number
+  /** Exact slice `turns[fromIndex..]` (window refresh). */
+  fromIndex?: number
 }
 
+/**
+ * Fetch a conversation's detail, optionally windowed:
+ * - `{ tailTurns }` — last N turns, start aligned to a user-round boundary
+ * - `{ fromIndex }` — exact slice `turns[fromIndex..]` (window refresh)
+ * - `{ historyUserTurnLimit }` / `{ historyBeforeTurnId }` — fork user-turn window
+ * No window → legacy full response (also what an old server returns for any
+ * request; the windowed fields are then absent).
+ */
 export async function getFolderConversation(
   conversationId: number,
   options?: GetFolderConversationOptions
 ): Promise<DbConversationDetail> {
+  const windowedByIndex =
+    options?.tailTurns != null || options?.fromIndex != null
   return getTransport().call("get_folder_conversation", {
     conversationId,
-    historyUserTurnLimit:
-      options?.historyUserTurnLimit ?? DEFAULT_HISTORY_USER_TURN_LIMIT,
-    historyBeforeTurnId: options?.historyBeforeTurnId,
+    ...(options?.tailTurns != null ? { tailTurns: options.tailTurns } : {}),
+    ...(options?.fromIndex != null ? { fromIndex: options.fromIndex } : {}),
+    ...(windowedByIndex
+      ? {}
+      : {
+          historyUserTurnLimit:
+            options?.historyUserTurnLimit ?? DEFAULT_HISTORY_USER_TURN_LIMIT,
+          historyBeforeTurnId: options?.historyBeforeTurnId,
+        }),
+  })
+}
+
+/** Fetch one page of older history ending just before `beforeIndex`. */
+export async function getFolderConversationTurns(
+  conversationId: number,
+  beforeIndex: number,
+  limit: number
+): Promise<ConversationTurnsPage> {
+  return getTransport().call("get_folder_conversation_turns", {
+    conversationId,
+    beforeIndex,
+    limit,
   })
 }
 
@@ -2081,19 +2289,52 @@ export async function gitFetch(
   })
 }
 
-export async function gitPushInfo(path: string): Promise<GitPushInfo> {
-  return getTransport().call("git_push_info", { path })
+/**
+ * Update a branch WITHOUT checking it out. The checked-out branch falls back to
+ * a normal pull (so a conflict can still come back on `conflict`); any other
+ * local branch is fast-forwarded from its upstream, and a remote branch
+ * (`isRemote`, e.g. `origin/main`) only advances its remote-tracking ref.
+ */
+export async function gitUpdateBranch(
+  path: string,
+  branch: string,
+  isRemote: boolean,
+  credentials?: GitCredentials | null
+): Promise<GitPullResult> {
+  return getTransport().call("git_update_branch", {
+    path,
+    branch,
+    isRemote,
+    credentials: credentials ?? null,
+  })
 }
 
+/** `branch` omitted (or null) reports on the checked-out branch. */
+export async function gitPushInfo(
+  path: string,
+  branch?: string | null
+): Promise<GitPushInfo> {
+  return getTransport().call("git_push_info", {
+    path,
+    branch: branch ?? null,
+  })
+}
+
+/**
+ * Push a branch. `branch` omitted (or null) pushes the checked-out one; naming
+ * one pushes it without checking it out (`git push <remote> <branch>`).
+ */
 export async function gitPush(
   path: string,
   remote?: string | null,
   credentials?: GitCredentials | null,
-  folderId?: number | null
+  folderId?: number | null,
+  branch?: string | null
 ): Promise<GitPushResult> {
   return getTransport().call("git_push", {
     path,
     remote: remote ?? null,
+    branch: branch ?? null,
     credentials: credentials ?? null,
     folderId: folderId ?? null,
   })
@@ -2164,6 +2405,32 @@ export async function gitDeleteBranch(
   })
 }
 
+/**
+ * Remove the worktree that has `branchName` checked out — the only way such a
+ * branch can be deleted, since git refuses `branch -d` while a worktree holds
+ * the ref. `deleteBranch` also takes the branch and the worktree's workspace
+ * folder (its sessions move to the repo folder); `force` discards uncommitted
+ * work in the worktree and force-deletes an unmerged branch.
+ *
+ * `sourceFolderId` is the folder the caller acts from — it only supplies the
+ * re-parent target when the worktree folder has no recorded root.
+ */
+export async function gitRemoveWorktree(
+  path: string,
+  branchName: string,
+  sourceFolderId: number,
+  deleteBranch: boolean,
+  force: boolean = false
+): Promise<GitWorktreeRemoval> {
+  return getTransport().call("git_remove_worktree", {
+    path,
+    branchName,
+    sourceFolderId,
+    deleteBranch,
+    force,
+  })
+}
+
 export async function gitDeleteRemoteBranch(
   path: string,
   remote: string,
@@ -2211,6 +2478,84 @@ export async function gitContinueOperation(
   return getTransport().call("git_continue_operation", { path, operation })
 }
 
+/**
+ * How many `openAppWindow` calls are still waiting on each window name. Two
+ * clicks on the same action are handed the very same reserved window, so a
+ * failure may only tear it down once nothing else is still racing for it.
+ */
+const appWindowReservations = new Map<string, number>()
+
+function reserveAppWindow(name: string): void {
+  appWindowReservations.set(name, (appWindowReservations.get(name) ?? 0) + 1)
+}
+
+/** Drops one reservation and reports how many remain for that name. */
+function releaseAppWindow(name: string): number {
+  const remaining = Math.max(0, (appWindowReservations.get(name) ?? 1) - 1)
+  if (remaining > 0) appWindowReservations.set(name, remaining)
+  else appWindowReservations.delete(name)
+  return remaining
+}
+
+/**
+ * True while a window still shows the blank placeholder we reserved — i.e. it
+ * holds nothing worth keeping. Reading `location` on a cross-origin window
+ * throws; such a window is not one of ours, so treat it as occupied.
+ */
+function isBlankAppWindow(win: Window): boolean {
+  try {
+    return win.location.href === "about:blank"
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Open a same-origin app window (commit / push / settings / …) whose target
+ * path is only known after a backend round trip.
+ *
+ * The window must be RESERVED inside the click's own call stack: in web mode
+ * that round trip is a real HTTP request, far longer than any browser's
+ * user-activation window, so calling `window.open(path)` after the await is
+ * reliably swallowed by the popup blocker. (Issue #410 is the markdown-link
+ * variant of the same bug, where the gap was only a microtask.)
+ *
+ * Reserving with an EMPTY url is what makes this safe to retrofit: an empty
+ * url never navigates, so a name that already maps to an open window is simply
+ * handed back — preserving today's reuse-by-name behaviour, which
+ * `openPushWindow` relies on to retarget an already-open push window. And
+ * because no window features are passed, a `null` return really does mean
+ * "blocked" here, unlike the `noreferrer` popups in ai-elements/link-safety.tsx
+ * (those return null even on success).
+ */
+async function openAppWindow(
+  name: string,
+  resolvePath: () => Promise<{ path: string }>
+): Promise<void> {
+  const win = window.open("", name)
+  if (!win) {
+    throw new Error(
+      "Popup blocked by the browser. Allow popups for this site and try again."
+    )
+  }
+
+  reserveAppWindow(name)
+  try {
+    const { path } = await resolvePath()
+    win.location.href = path
+  } catch (error) {
+    // Tear the placeholder down only once nothing else is waiting on this name
+    // AND nobody has navigated it meanwhile: a concurrent request for the same
+    // window may still succeed, and it shares this exact window. Checking for
+    // the blank placeholder (rather than remembering "I created it") is also
+    // what keeps a window the user already had open — which always carries a
+    // real document — from being closed by an unrelated failure.
+    if (releaseAppWindow(name) === 0 && isBlankAppWindow(win)) win.close()
+    throw error
+  }
+  releaseAppWindow(name)
+}
+
 export async function openMergeWindow(
   folderId: number,
   operation: string,
@@ -2226,16 +2571,14 @@ export async function openMergeWindow(
       remoteConnectionId: getActiveRemoteConnectionId(),
     })
   }
-  const result = await getTransport().call<{ path: string }>(
-    "open_merge_window",
-    {
+  return openAppWindow(`merge-${folderId}`, () =>
+    getTransport().call<{ path: string }>("open_merge_window", {
       folderId,
       operation,
       upstreamCommit: upstreamCommit ?? null,
       locale,
-    }
+    })
   )
-  window.open(result.path, `merge-${folderId}`)
 }
 
 export async function openStashWindow(folderId: number): Promise<void> {
@@ -2247,27 +2590,38 @@ export async function openStashWindow(folderId: number): Promise<void> {
       remoteConnectionId: getActiveRemoteConnectionId(),
     })
   }
-  const result = await getTransport().call<{ path: string }>(
-    "open_stash_window",
-    { folderId, locale }
+  return openAppWindow(`stash-${folderId}`, () =>
+    getTransport().call<{ path: string }>("open_stash_window", {
+      folderId,
+      locale,
+    })
   )
-  window.open(result.path, `stash-${folderId}`)
 }
 
-export async function openPushWindow(folderId: number): Promise<void> {
+/** `branch` preselects the push target; omitted means the checked-out branch. */
+export async function openPushWindow(
+  folderId: number,
+  branch?: string | null
+): Promise<void> {
   const locale = getCurrentEffectiveAppLocale()
   if (isDesktop()) {
     return getShellTransport().call("open_push_window", {
       folderId,
       locale,
       remoteConnectionId: getActiveRemoteConnectionId(),
+      branch: branch ?? null,
     })
   }
-  const result = await getTransport().call<{ path: string }>(
-    "open_push_window",
-    { folderId, locale }
+  // Reusing the window NAME navigates an already-open push window to the new
+  // URL, so the preselected branch applies there too (the desktop path gets the
+  // same effect from the `push://retarget-branch` event).
+  return openAppWindow(`push-${folderId}`, () =>
+    getTransport().call<{ path: string }>("open_push_window", {
+      folderId,
+      locale,
+      branch: branch ?? null,
+    })
   )
-  window.open(result.path, `push-${folderId}`)
 }
 
 export async function gitStashPush(
@@ -2447,6 +2801,69 @@ export async function gitAddFiles(
 
 // Window management commands
 
+// ─── Workspace folder links (multi-folder workspace) ───
+
+/** Links currently registered for `folderId`, with their live on-disk status. */
+export async function listFolderLinks(
+  folderId: number
+): Promise<FolderLinkDetail[]> {
+  return getTransport().call("list_folder_links", { folderId })
+}
+
+/**
+ * Dry run: what names the picked directories would get and which ones would be
+ * skipped. Resolved server-side against the real filesystem, so the dialog can
+ * show the final names before anything is created.
+ */
+export async function previewFolderLinks(
+  folderId: number,
+  paths: string[]
+): Promise<FolderLinkPlan[]> {
+  return getTransport().call("preview_folder_links", { folderId, paths })
+}
+
+/**
+ * Create the links. Entries that can't be linked are skipped rather than
+ * failing the batch — the result is what actually landed.
+ */
+export async function createFolderLinks(
+  folderId: number,
+  items: FolderLinkRequestItem[],
+  gitExclude = true
+): Promise<FolderLinkDetail[]> {
+  return getTransport().call("create_folder_links", {
+    folderId,
+    items,
+    gitExclude,
+  })
+}
+
+/** Rename a link (moves the symlink; the target is untouched). */
+export async function renameFolderLink(
+  linkId: number,
+  newName: string
+): Promise<FolderLinkDetail> {
+  return getTransport().call("rename_folder_link", { linkId, newName })
+}
+
+/** Recreate the symlink for a link whose on-disk entry went missing. */
+export async function repairFolderLink(
+  linkId: number
+): Promise<FolderLinkDetail> {
+  return getTransport().call("repair_folder_link", { linkId })
+}
+
+/**
+ * Drop a link. With `deleteLink` the symlink is removed from the workspace
+ * root; the directory it pointed at is never touched.
+ */
+export async function removeFolderLink(
+  linkId: number,
+  deleteLink = true
+): Promise<void> {
+  return getTransport().call("remove_folder_link", { linkId, deleteLink })
+}
+
 export async function openFolder(path: string): Promise<FolderDetail> {
   return getTransport().call("open_folder", { path })
 }
@@ -2487,11 +2904,12 @@ export async function openCommitWindow(folderId: number): Promise<void> {
       remoteConnectionId: getActiveRemoteConnectionId(),
     })
   }
-  const result = await getTransport().call<{ path: string }>(
-    "open_commit_window",
-    { folderId, locale }
+  return openAppWindow(`commit-${folderId}`, () =>
+    getTransport().call<{ path: string }>("open_commit_window", {
+      folderId,
+      locale,
+    })
   )
-  window.open(result.path, `commit-${folderId}`)
 }
 
 export type SettingsSection =
@@ -2523,15 +2941,13 @@ export async function openSettingsWindow(
     })
   }
   // Web mode: open in new window
-  const result = await getTransport().call<{ path: string }>(
-    "open_settings_window",
-    {
+  return openAppWindow(`settings-${section ?? "general"}`, () =>
+    getTransport().call<{ path: string }>("open_settings_window", {
       section: section ?? null,
       agentType: options?.agentType ?? null,
       locale,
-    }
+    })
   )
-  window.open(result.path, `settings-${section ?? "general"}`)
 }
 
 export interface OpenImportSessionsWindowOptions {
@@ -2551,11 +2967,11 @@ export async function openImportSessionsWindow(
       remoteConnectionId: getActiveRemoteConnectionId(),
     })
   }
-  const result = await getTransport().call<{ path: string }>(
-    "open_import_sessions_window",
-    { focusPath }
+  return openAppWindow("import-sessions", () =>
+    getTransport().call<{ path: string }>("open_import_sessions_window", {
+      focusPath,
+    })
   )
-  window.open(result.path, "import-sessions")
 }
 
 export async function openProjectBootWindow(source?: string): Promise<void> {
@@ -2991,6 +3407,30 @@ export async function quickMessagesReorder(ids: number[]): Promise<void> {
   return getTransport().call("quick_messages_reorder", { ids })
 }
 
+// Token usage dashboard
+
+export async function tokenUsageReport(
+  filter: TokenUsageFilter
+): Promise<TokenUsageReport> {
+  return getTransport().call("token_usage_report", { filter })
+}
+
+export async function tokenUsageFacets(): Promise<TokenUsageFacets> {
+  return getTransport().call("token_usage_facets")
+}
+
+export async function tokenUsageStatus(): Promise<TokenUsageSyncStatus> {
+  return getTransport().call("token_usage_status")
+}
+
+/** `full` drops every stored fact and re-parses every transcript — the escape
+ *  hatch for a session file the agent's own CLI grew behind codeg's back. */
+export async function tokenUsageSync(
+  mode: "incremental" | "full" = "incremental"
+): Promise<TokenUsageSyncResult> {
+  return getTransport().call("token_usage_sync", { mode })
+}
+
 // Automations
 
 export async function automationList(): Promise<Automation[]> {
@@ -3053,6 +3493,270 @@ export async function automationRunNow(automationId: number): Promise<number> {
 /** Cancel an in-flight (or clear a wedged) run. */
 export async function automationCancelRun(runId: number): Promise<void> {
   return getTransport().call("automation_cancel_run", { runId })
+}
+
+// Work tasks
+
+export async function workTaskList(
+  folderId?: number | null
+): Promise<WorkTask[]> {
+  return getTransport().call("work_task_list", { folderId: folderId ?? null })
+}
+
+export async function workTaskGet(id: number): Promise<WorkTask> {
+  return getTransport().call("work_task_get", { id })
+}
+
+export async function workTaskEvents(
+  taskId: number,
+  limit = 500
+): Promise<WorkTaskEvent[]> {
+  return getTransport().call("work_task_events", { taskId, limit })
+}
+
+/**
+ * Drop an uploaded image's base64 from a task's blocks in every mode where the
+ * call leaves through an HTTP body, the same rule (and the same helper) a chat
+ * send follows: the bytes already live in the uploads dir, and the engine's
+ * dispatch re-inlines them from the uri (`acp::prompt_hydration`) when the task
+ * eventually runs.
+ */
+function stripUploadedTaskBlocks(
+  blocks: PromptInputBlock[] | null | undefined
+): PromptInputBlock[] {
+  if (!blocks || blocks.length === 0) return []
+  return stripUploadedImagePayloads(
+    blocks,
+    !isDesktop() || getActiveRemoteConnectionId() !== null
+  )
+}
+
+export async function workTaskCreate(draft: WorkTaskDraft): Promise<WorkTask> {
+  return getTransport().call("work_task_create", {
+    draft: { ...draft, config: stripUploadedTaskConfig(draft.config) },
+  })
+}
+
+/** {@link stripUploadedTaskBlocks} over a whole task config. */
+function stripUploadedTaskConfig(config: WorkTaskConfig): WorkTaskConfig {
+  return {
+    ...config,
+    prompt_blocks: stripUploadedTaskBlocks(config.prompt_blocks),
+  }
+}
+
+export async function workTaskUpdate(
+  id: number,
+  draft: WorkTaskDraft
+): Promise<WorkTask> {
+  return getTransport().call("work_task_update", {
+    id,
+    draft: { ...draft, config: stripUploadedTaskConfig(draft.config) },
+  })
+}
+
+/** Persist the pending column's drag order (index → sort_order). */
+export async function workTaskReorder(
+  folderId: number,
+  orderedIds: number[]
+): Promise<void> {
+  return getTransport().call("work_task_reorder", { folderId, orderedIds })
+}
+
+export async function workTaskDelete(
+  id: number,
+  deleteWorktree = false
+): Promise<void> {
+  return getTransport().call("work_task_delete", { id, deleteWorktree })
+}
+
+export async function workTaskStart(id: number): Promise<void> {
+  return getTransport().call("work_task_start", { id })
+}
+
+/**
+ * failed → queued. `note` (optional) reaches the retry prompt, and `blocks`
+ * carries whatever the note box attached out of band (images, pasted bytes) —
+ * stripped of uploaded payloads on the way out, exactly like a chat send.
+ */
+export async function workTaskRetry(
+  id: number,
+  note?: string | null,
+  blocks?: PromptInputBlock[] | null
+): Promise<void> {
+  return getTransport().call("work_task_retry", {
+    id,
+    note: note ?? null,
+    blocks: stripUploadedTaskBlocks(blocks),
+  })
+}
+
+/**
+ * canceled → todo (back onto the board; started again explicitly). `note`
+ * (optional) reaches the next run's prompt — a cancel usually had a reason.
+ */
+export async function workTaskRequeue(
+  id: number,
+  note?: string | null,
+  blocks?: PromptInputBlock[] | null
+): Promise<void> {
+  return getTransport().call("work_task_requeue", {
+    id,
+    note: note ?? null,
+    blocks: stripUploadedTaskBlocks(blocks),
+  })
+}
+
+/**
+ * Plan when a to-do task starts (`scheduledAt` is an ISO instant; `null`
+ * clears the plan). The engine claims it at that time exactly as if the start
+ * button had been pressed — the folder's concurrency limit still applies.
+ */
+export async function workTaskSchedule(
+  id: number,
+  scheduledAt: string | null
+): Promise<void> {
+  return getTransport().call("work_task_schedule", { id, scheduledAt })
+}
+
+/**
+ * Follow up on a reviewed task. `intent` picks the framing the agent receives
+ * (see `lib/task-follow-up`); omitted means `revise`.
+ */
+export async function workTaskReturn(
+  id: number,
+  feedback: string,
+  intent?: FollowUpIntent,
+  blocks?: PromptInputBlock[] | null
+): Promise<void> {
+  return getTransport().call("work_task_return", {
+    id,
+    feedback,
+    intent: intent ?? null,
+    blocks: stripUploadedTaskBlocks(blocks),
+  })
+}
+
+/**
+ * Stop a task. `reason` (optional) is the user's own note about why — it lands
+ * on the `canceled` entry of the progress timeline and is never replayed into
+ * a later run's prompt (a requeue carries its own note for that).
+ */
+export async function workTaskCancel(
+  id: number,
+  reason?: string | null
+): Promise<void> {
+  return getTransport().call("work_task_cancel", { id, reason: reason ?? null })
+}
+
+/** Dispatch the agent-driven merge (`message: null` = the agent writes the
+ *  commit message itself); the outcome rides `task://changed` events.
+ *  Resolves `true` when the merge was QUEUED behind another landing of the same
+ *  project instead of started — merges are serial per project, so a second
+ *  acceptance takes a place in line rather than failing. */
+export async function workTaskMerge(
+  id: number,
+  message: string | null,
+  deleteWorktree: boolean
+): Promise<boolean> {
+  return getTransport().call("work_task_merge", {
+    id,
+    message,
+    deleteWorktree,
+  })
+}
+
+/** Withdraw a merge waiting in the project's queue; the task stays in review. */
+export async function workTaskMergeUnqueue(id: number): Promise<void> {
+  return getTransport().call("work_task_merge_unqueue", { id })
+}
+
+/** Finish a reviewed task that has nothing to merge (review → done), taking
+ *  its worktree with it when asked. Refused if the worktree changed after all. */
+export async function workTaskComplete(
+  id: number,
+  deleteWorktree: boolean
+): Promise<void> {
+  return getTransport().call("work_task_complete", { id, deleteWorktree })
+}
+
+export async function workTaskArchive(
+  id: number,
+  archived: boolean
+): Promise<void> {
+  return getTransport().call("work_task_archive", { id, archived })
+}
+
+/** Remove the task's worktree + branch (also retries a failed cleanup). */
+export async function workTaskCleanup(id: number): Promise<void> {
+  return getTransport().call("work_task_cleanup", { id })
+}
+
+/** Unified diff of the worktree vs the task's recorded base. */
+export async function workTaskDiff(
+  id: number,
+  file?: string | null
+): Promise<string> {
+  return getTransport().call("work_task_diff", { id, file: file ?? null })
+}
+
+export async function workTaskChangedFiles(
+  id: number
+): Promise<WorkTaskChangedFile[]> {
+  return getTransport().call("work_task_changed_files", { id })
+}
+
+/** Effective settings after the folder → global → built-in fallback — what
+ *  the engine will actually use for this folder. */
+export async function workTaskSettingsEffective(
+  folderId: number
+): Promise<WorkTaskFolderSettings> {
+  return getTransport().call("work_task_settings_effective", { folderId })
+}
+
+export async function workTaskSettingsGet(
+  folderId: number
+): Promise<WorkTaskFolderSettings> {
+  return getTransport().call("work_task_settings_get", { folderId })
+}
+
+/** The folder's own settings row, or null when it follows the global
+ *  defaults — how the settings dialog tells the two apart. */
+export async function workTaskSettingsGetOwn(
+  folderId: number
+): Promise<WorkTaskFolderSettings | null> {
+  return getTransport().call("work_task_settings_get_own", { folderId })
+}
+
+export async function workTaskSettingsSet(
+  folderId: number,
+  settings: WorkTaskFolderSettings
+): Promise<void> {
+  return getTransport().call("work_task_settings_set", { folderId, settings })
+}
+
+/** Drop the folder's own settings row — it reverts to the global defaults. */
+export async function workTaskSettingsDelete(folderId: number): Promise<void> {
+  return getTransport().call("work_task_settings_delete", { folderId })
+}
+
+export async function workTaskTemplateList(): Promise<WorkTaskTemplate[]> {
+  return getTransport().call("work_task_template_list", {})
+}
+
+/** Upsert by exact name: an existing template of the same name is replaced. */
+export async function workTaskTemplateSave(draft: {
+  name: string
+  title: string
+  config: WorkTaskConfig
+}): Promise<WorkTaskTemplate> {
+  return getTransport().call("work_task_template_save", {
+    draft: { ...draft, config: stripUploadedTaskConfig(draft.config) },
+  })
+}
+
+export async function workTaskTemplateDelete(id: number): Promise<void> {
+  return getTransport().call("work_task_template_delete", { id })
 }
 
 // Directory browser (for web/server mode)
@@ -4493,6 +5197,26 @@ export async function setSessionInfoSettings(
   settings: SessionInfoSettings
 ): Promise<SessionInfoSettings> {
   return getTransport().call("set_session_info_settings", { settings })
+}
+
+// ─── Create-from-chat (chat authoring) settings ────────────────────────────
+
+/** Mirror of Rust `ChatAuthoringSettings`. Both default OFF — these tools write
+ * app state (and a scheduled automation goes on to spawn agents), so they are
+ * opt-in rather than on like the read-only lookups. */
+export interface ChatAuthoringSettings {
+  automations_enabled: boolean
+  work_tasks_enabled: boolean
+}
+
+export async function getChatAuthoringSettings(): Promise<ChatAuthoringSettings> {
+  return getTransport().call("get_chat_authoring_settings")
+}
+
+export async function setChatAuthoringSettings(
+  settings: ChatAuthoringSettings
+): Promise<ChatAuthoringSettings> {
+  return getTransport().call("set_chat_authoring_settings", { settings })
 }
 
 /** Live probe — opens a transient ACP connection to `agent_type`, reads what

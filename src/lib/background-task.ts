@@ -206,6 +206,44 @@ function grokResultObjects(
   return out
 }
 
+/**
+ * Map Grok's `SubagentCompleted` `rawOutput` — the sibling `ToolOutput`
+ * variant a `get_command_or_subagent_output` poll returns for a background
+ * SUB-AGENT (grok 0.2.11x; 0.2.9x instead folded subagents into a
+ * `TaskOutput.Result` whose `command` reads `[subagent:<type>] <description>`)
+ * — onto the shared envelope. Its fields sit flat on the envelope object
+ * (`subagent_id`, `subagent_type`, `tool_calls`, `turns`, `duration_ms`,
+ * `worktree_path`, …); the output text's exact field name isn't pinned by a
+ * capture, so read the plausible spellings tolerantly.
+ */
+function grokSubagentCompletedToEnvelope(
+  envelope: Record<string, unknown>
+): BackgroundTaskEnvelope | null {
+  const str = (v: unknown): string | null =>
+    typeof v === "string" && v.length > 0 ? v : null
+  const taskId = str(envelope.subagent_id)
+  const status = str(envelope.status)?.trim().toLowerCase() ?? null
+  const output = str(envelope.output) ?? str(envelope.result)
+  if (taskId == null && status == null && output == null) return null
+  const subagentType = str(envelope.subagent_type)
+  const description = str(envelope.description)
+  // Mirror 0.2.9x's command label so both wire eras render the same row title.
+  const label = subagentType ? `[subagent:${subagentType}]` : null
+  const command =
+    label && description ? `${label} ${description}` : (label ?? description)
+  return {
+    kind: status != null && GROK_STOPPED_STATUSES.has(status) ? "stop" : "poll",
+    retrievalStatus: null,
+    taskId,
+    taskType: "subagent",
+    status,
+    exitCode: null,
+    output,
+    command,
+    message: null,
+  }
+}
+
 /** Parse a Grok `get_command_or_subagent_output` result. Strict on the `type`
  *  discriminator so other JSON tool output is never hijacked. */
 function parseGrokTaskOutputEnvelopes(text: string): BackgroundTaskEnvelope[] {
@@ -220,6 +258,10 @@ function parseGrokTaskOutputEnvelopes(text: string): BackgroundTaskEnvelope[] {
   }
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return []
   const envelope = parsed as Record<string, unknown>
+  if (envelope.type === "SubagentCompleted") {
+    const single = grokSubagentCompletedToEnvelope(envelope)
+    return single ? [single] : []
+  }
   if (envelope.type !== "TaskOutput") return []
   return grokResultObjects(envelope)
     .map(grokResultToEnvelope)
@@ -317,9 +359,11 @@ function inputIsBackgroundPoll(input: string | null | undefined): boolean {
  *
  * Grok's `get_command_or_subagent_output` is intentionally absent from
  * `BACKGROUND_TASK_NAMES`: the same tool also polls sub-agents, whose result is
- * a completely different `SubagentCompleted` payload. Matching on the envelope
- * (plus the in-flight input shape) means a sub-agent poll leaves this lane the
- * moment its result lands, keeping its generic rendering.
+ * a different payload per era — `SubagentCompleted` (0.2.11x, parsed into this
+ * lane by `grokSubagentCompletedToEnvelope`) or a `TaskOutput.Result` labeled
+ * `[subagent:<type>]` (0.2.9x). Matching on the envelope (plus the in-flight
+ * input shape) means a settled poll is claimed by what it actually returned,
+ * and an unknown-shaped result falls back to generic rendering.
  */
 export function isBackgroundTaskToolCall(part: AdaptedToolCallPart): boolean {
   if (BACKGROUND_TASK_NAMES.has(part.toolName.trim().toLowerCase())) return true
@@ -333,11 +377,12 @@ export function isBackgroundTaskToolCall(part: AdaptedToolCallPart): boolean {
   // poll — Grok's `get_command_or_subagent_output` does both with identical
   // args. So the input shape only claims a call that is STILL IN FLIGHT (its
   // documented purpose: render the live card in the lane it will settle into).
-  // Once settled, the envelope check above is the sole authority, so a sub-agent
-  // result — `SubagentCompleted`, which no backend path serializes into
-  // `part.output` at all — falls back to generic rendering instead of showing a
-  // permanently "running" background row. Claude Code's own polls are unaffected:
-  // they are claimed by name.
+  // Once settled, the envelope check above is the sole authority: a recognized
+  // result (`TaskOutput`, flat `SubagentCompleted`) claims the row, while an
+  // unknown-shaped or absent result (an older backend that dropped the
+  // envelope) falls back to generic rendering instead of showing a permanently
+  // "running" background row. Claude Code's own polls are unaffected: they are
+  // claimed by name.
   return isUnsettledToolCall(part)
 }
 
@@ -357,6 +402,53 @@ export interface BackgroundTaskRow {
   command: string | null
   /** Number of polls collapsed into this row (the `×N` hint). */
   pollCount: number
+  /** This row is a Grok SUB-AGENT, not a background shell command. Its output is
+   *  a prose report (Markdown), so the card renders it as such instead of
+   *  routing it through the ANSI terminal panel. */
+  isSubagent: boolean
+}
+
+/** `[subagent:<type>] <description>` — the pseudo-command Grok 0.2.9x gives a
+ *  sub-agent's `TaskOutput.Result`, and the label 0.2.11x's flat
+ *  `SubagentCompleted` is mapped onto (`grokSubagentCompletedToEnvelope`). */
+const GROK_SUBAGENT_COMMAND_PREFIX = "[subagent:"
+
+/**
+ * Whether a row describes a sub-agent rather than a background shell command.
+ * `taskType` is the direct signal (set by the `SubagentCompleted` mapping); the
+ * command prefix covers the `TaskOutput.Result` era, which carries no type.
+ */
+function isSubagentRow(
+  taskType: string | null,
+  command: string | null
+): boolean {
+  if (taskType === "subagent") return true
+  return command?.trimStart().startsWith(GROK_SUBAGENT_COMMAND_PREFIX) === true
+}
+
+/**
+ * Drop the machine-facing scaffolding Grok appends to a POLLED sub-agent
+ * result: `<subagent_meta>id=…, tool_calls=1, …</subagent_meta>` and
+ * `<subagent_result>subagent_id: …\nTo continue this subagent's conversation,
+ * use resume_from="…"</subagent_result>`. Both are addressed to the parent
+ * model (the numbers are already on the Agent capsule, and `resume_from` is a
+ * tool argument), and neither appears in the `subagent_finished` notification's
+ * own `output` — so leaving them in only leaks prompt plumbing into the UI.
+ *
+ * Anything the tags don't cover is returned verbatim, so an output that never
+ * had them (every non-Grok background task) is untouched.
+ */
+export function stripGrokSubagentScaffolding(
+  output: string | null
+): string | null {
+  if (!output) return output
+  const stripped = output
+    .replace(/<subagent_meta>[\s\S]*?<\/subagent_meta>/gi, "")
+    .replace(/<subagent_result>[\s\S]*?<\/subagent_result>/gi, "")
+  if (stripped === output) return output
+  // Collapse the blank lines the removal leaves behind, then trim the trailing
+  // gap — the tags always sit at the end of the report.
+  return stripped.replace(/\n{3,}/g, "\n\n").trimEnd()
 }
 
 function inputTaskId(input: string | null | undefined): string | null {
@@ -482,6 +574,7 @@ export function buildBackgroundTaskRows(
       if (envelope?.command) command = envelope.command
       if (envelope?.taskType) taskType = envelope.taskType
     }
+    const isSubagent = isSubagentRow(taskType, command)
     return {
       key,
       taskId: entry.taskId,
@@ -490,9 +583,10 @@ export function buildBackgroundTaskRows(
       isInFlight:
         isInFlightState(latest.poll) && (env == null || env.output == null),
       exitCode: env?.exitCode ?? null,
-      output,
+      output: isSubagent ? stripGrokSubagentScaffolding(output) : output,
       command,
       pollCount: entry.entries.length,
+      isSubagent,
     }
   })
 }

@@ -67,6 +67,7 @@ pub(crate) struct RuntimeSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
 pub(crate) enum WebviewRuntimeDrift {
     Unchanged,
     Changed {
@@ -76,10 +77,12 @@ pub(crate) enum WebviewRuntimeDrift {
     Unknown,
 }
 
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
 fn normalized_runtime_version(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
 }
 
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
 pub(crate) fn project_webview_runtime_drift(
     startup: Option<&str>,
     available_now: Result<&str, &str>,

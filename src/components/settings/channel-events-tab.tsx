@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react"
 import { Loader2, Pencil, Plus, Trash2 } from "lucide-react"
 import { useTranslations } from "next-intl"
+import { useImeGuard } from "@/hooks/use-ime-guard"
 import { toast } from "sonner"
 
 import {
@@ -141,6 +142,7 @@ const PAYLOAD_EXAMPLES: Record<(typeof ALL_EVENT_TYPES)[number]["id"], string> =
 
 export function ChannelEventsTab() {
   const t = useTranslations("ChatChannelSettings.events")
+  const ime = useImeGuard()
   const [enabledEvents, setEnabledEvents] = useState<Set<string>>(
     new Set(DEFAULT_ON_IDS)
   )
@@ -467,7 +469,9 @@ export function ChannelEventsTab() {
             placeholder={t("webhookUrlPlaceholder")}
             disabled={webhooksSaving}
             onChange={(e) => setDraftUrl(e.target.value)}
+            {...ime.props}
             onKeyDown={(e) => {
+              if (ime.isComposing(e)) return
               if (e.key === "Enter") {
                 e.preventDefault()
                 void handleDialogSave()
