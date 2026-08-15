@@ -232,10 +232,17 @@ pub async fn git_has_merge_head(
     Ok(Json(result))
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitPushInfoParams {
+    pub path: String,
+    pub branch: Option<String>,
+}
+
 pub async fn git_push_info(
-    Json(params): Json<PathParams>,
+    Json(params): Json<GitPushInfoParams>,
 ) -> Result<Json<folder_commands::GitPushInfo>, AppCommandError> {
-    let result = folder_commands::git_push_info(params.path).await?;
+    let result = folder_commands::git_push_info(params.path, params.branch).await?;
     Ok(Json(result))
 }
 
@@ -474,6 +481,34 @@ pub async fn git_delete_branch(
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct GitRemoveWorktreeParams {
+    pub path: String,
+    pub branch_name: String,
+    pub source_folder_id: i32,
+    pub delete_branch: bool,
+    pub force: bool,
+}
+
+pub async fn git_remove_worktree(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<GitRemoveWorktreeParams>,
+) -> Result<Json<folder_commands::GitWorktreeRemoval>, AppCommandError> {
+    Ok(Json(
+        folder_commands::git_remove_worktree_core(
+            &state.emitter,
+            &state.db,
+            params.path,
+            params.branch_name,
+            params.source_folder_id,
+            params.delete_branch,
+            params.force,
+        )
+        .await?,
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GitDeleteRemoteBranchParams {
     pub path: String,
     pub remote: String,
@@ -583,10 +618,37 @@ pub async fn git_fetch(
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct GitUpdateBranchParams {
+    pub path: String,
+    pub branch: String,
+    pub is_remote: bool,
+    pub credentials: Option<GitCredentials>,
+}
+
+pub async fn git_update_branch(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<GitUpdateBranchParams>,
+) -> Result<Json<folder_commands::GitPullResult>, AppCommandError> {
+    Ok(Json(
+        folder_commands::git_update_branch_core(
+            &params.path,
+            &params.branch,
+            params.is_remote,
+            params.credentials.as_ref(),
+            &state.db,
+            &state.data_dir,
+        )
+        .await?,
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GitPushParams {
     pub folder_id: Option<i32>,
     pub path: String,
     pub remote: Option<String>,
+    pub branch: Option<String>,
     pub credentials: Option<GitCredentials>,
 }
 
@@ -602,6 +664,7 @@ pub async fn git_push(
         params.folder_id,
         &params.path,
         params.remote.as_deref(),
+        params.branch.as_deref(),
         params.credentials.as_ref(),
         db,
     )

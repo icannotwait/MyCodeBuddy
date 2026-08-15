@@ -143,7 +143,10 @@ pub struct GitStatusEntry {
 pub struct GitBranchList {
     pub local: Vec<String>,
     pub remote: Vec<String>,
+    /// Branches checked out in another worktree than the queried path.
     pub worktree_branches: Vec<String>,
+    /// The main working tree's branch when querying from a linked worktree.
+    pub main_worktree_branch: Option<String>,
 }
 
 /// Where a given branch is checked out, resolved against the registered folders.
@@ -156,6 +159,15 @@ pub struct GitBranchList {
 pub struct WorktreeResolution {
     pub path: Option<String>,
     pub folder_id: Option<i32>,
+}
+
+/// Result of removing a linked worktree and, optionally, its branch/folder.
+#[derive(Debug, Serialize)]
+pub struct GitWorktreeRemoval {
+    pub worktree_path: Option<String>,
+    pub branch_deleted: bool,
+    pub folder_id: Option<i32>,
+    pub reparented: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -416,9 +428,50 @@ async fn count_changed_files_between(
     )))
 }
 
-async fn estimate_push_commit_count(path: &str) -> usize {
+fn ensure_pushable_branch_name(branch: &str) -> Result<(), AppCommandError> {
+    let rejected = branch.is_empty()
+        || branch.starts_with('-')
+        || branch.starts_with('+')
+        || branch.contains(':')
+        || branch.chars().any(|c| c.is_whitespace() || c.is_control());
+    if rejected {
+        return Err(AppCommandError::invalid_input("Invalid branch name")
+            .with_detail(format!("branch={branch}")));
+    }
+    Ok(())
+}
+
+async fn ensure_local_branch_exists(path: &str, branch: &str) -> Result<(), AppCommandError> {
+    let output = crate::process::tokio_command("git")
+        .args([
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ])
+        .current_dir(path)
+        .output()
+        .await
+        .map_err(AppCommandError::io)?;
+    if !output.status.success() {
+        return Err(
+            AppCommandError::not_found("Branch not found").with_detail(format!("branch={branch}"))
+        );
+    }
+    Ok(())
+}
+
+async fn estimate_push_commit_count(path: &str, branch: Option<&str>) -> usize {
+    let rev = match branch {
+        Some(name) => format!("refs/heads/{name}"),
+        None => "HEAD".to_string(),
+    };
+    let push_range = match branch {
+        Some(name) => format!("{name}@{{push}}..refs/heads/{name}"),
+        None => "@{push}..HEAD".to_string(),
+    };
     let upstream_ahead = crate::process::tokio_command("git")
-        .args(["rev-list", "--count", "@{push}..HEAD"])
+        .args(["rev-list", "--count", &push_range])
         .current_dir(path)
         .output()
         .await;
@@ -430,21 +483,25 @@ async fn estimate_push_commit_count(path: &str) -> usize {
         }
     }
 
-    let branch_output = crate::process::tokio_command("git")
-        .args(["rev-parse", "--abbrev-ref", "HEAD"])
-        .current_dir(path)
-        .output()
-        .await;
-    let Ok(branch_output) = branch_output else {
-        return 0;
+    let branch = match branch {
+        Some(name) => name.to_string(),
+        None => {
+            let branch_output = crate::process::tokio_command("git")
+                .args(["rev-parse", "--abbrev-ref", "HEAD"])
+                .current_dir(path)
+                .output()
+                .await;
+            let Ok(branch_output) = branch_output else {
+                return 0;
+            };
+            if !branch_output.status.success() {
+                return 0;
+            }
+            String::from_utf8_lossy(&branch_output.stdout)
+                .trim()
+                .to_string()
+        }
     };
-    if !branch_output.status.success() {
-        return 0;
-    }
-
-    let branch = String::from_utf8_lossy(&branch_output.stdout)
-        .trim()
-        .to_string();
     if branch.is_empty() || branch == "HEAD" {
         return 0;
     }
@@ -464,7 +521,7 @@ async fn estimate_push_commit_count(path: &str) -> usize {
 
     let remote_arg = format!("--remotes={}", remote);
     let output = crate::process::tokio_command("git")
-        .args(["rev-list", "--count", "HEAD", "--not", &remote_arg])
+        .args(["rev-list", "--count", &rev, "--not", &remote_arg])
         .current_dir(path)
         .output()
         .await;
@@ -1587,20 +1644,197 @@ pub async fn git_fetch(
     git_fetch_core(&path, credentials.as_ref(), &db, &data_dir).await
 }
 
-#[cfg_attr(feature = "tauri-runtime", tauri::command)]
-pub async fn git_push_info(path: String) -> Result<GitPushInfo, AppCommandError> {
-    ensure_git_repo(&path)?;
-
-    // Get current branch name
-    let branch_output = crate::process::tokio_command("git")
-        .args(["rev-parse", "--abbrev-ref", "HEAD"])
-        .current_dir(&path)
+async fn git_config_value(path: &str, key: &str) -> Option<String> {
+    let output = crate::process::tokio_command("git")
+        .args(["config", "--get", key])
+        .current_dir(path)
         .output()
         .await
-        .map_err(AppCommandError::io)?;
-    let branch = String::from_utf8_lossy(&branch_output.stdout)
-        .trim()
-        .to_string();
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!value.is_empty()).then_some(value)
+}
+
+async fn rev_parse_ref(path: &str, reference: &str) -> Option<String> {
+    let output = crate::process::tokio_command("git")
+        .args(["rev-parse", "--verify", "--quiet", reference])
+        .current_dir(path)
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let hash = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!hash.is_empty()).then_some(hash)
+}
+
+async fn count_ref_advance(
+    path: &str,
+    before: Option<&str>,
+    after: Option<&str>,
+) -> Result<usize, AppCommandError> {
+    match (before, after) {
+        (Some(before), Some(after)) if before != after => {
+            count_changed_files_between(path, before, after).await
+        }
+        (None, Some(after)) => count_files_in_commit(path, after).await,
+        _ => Ok(0),
+    }
+}
+
+/// Update a branch ref without checking out another working tree.
+pub(crate) async fn git_update_branch_core(
+    path: &str,
+    branch: &str,
+    is_remote: bool,
+    credentials: Option<&GitCredentials>,
+    db: &AppDatabase,
+    data_dir: &std::path::Path,
+) -> Result<GitPullResult, AppCommandError> {
+    ensure_git_repo(path)?;
+
+    if is_remote {
+        let (remote, remote_branch) = branch
+            .split_once('/')
+            .filter(|(remote, remote_branch)| !remote.is_empty() && !remote_branch.is_empty())
+            .ok_or_else(|| {
+                AppCommandError::invalid_input(format!("Malformed remote branch ref: {branch}"))
+            })?;
+        let tracking_ref = format!("refs/remotes/{branch}");
+        let before = rev_parse_ref(path, &tracking_ref).await;
+        let refspec = format!("+refs/heads/{remote_branch}:{tracking_ref}");
+        let mut command = crate::process::tokio_command("git");
+        command.args(["fetch", remote, &refspec]).current_dir(path);
+        prepare_remote_git_cmd_with_remote(
+            &mut command,
+            path,
+            Some(remote),
+            credentials,
+            db,
+            data_dir,
+        )
+        .await;
+        let output = command.output().await.map_err(AppCommandError::io)?;
+        if !output.status.success() {
+            return Err(classify_remote_git_error("fetch", &output.stderr));
+        }
+        let after = rev_parse_ref(path, &tracking_ref).await;
+        return Ok(GitPullResult {
+            updated_files: count_ref_advance(path, before.as_deref(), after.as_deref()).await?,
+            conflict: None,
+        });
+    }
+
+    if resolve_git_head(path).await?.branch.as_deref() == Some(branch) {
+        return git_pull_core(path, credentials, db, data_dir).await;
+    }
+
+    let remote = git_config_value(path, &format!("branch.{branch}.remote"))
+        .await
+        .ok_or_else(|| {
+            AppCommandError::invalid_input(format!(
+                "Branch '{branch}' has no upstream remote configured"
+            ))
+        })?;
+    let upstream_ref = git_config_value(path, &format!("branch.{branch}.merge"))
+        .await
+        .ok_or_else(|| {
+            AppCommandError::invalid_input(format!(
+                "Branch '{branch}' has no upstream branch configured"
+            ))
+        })?;
+    let local_ref = format!("refs/heads/{branch}");
+    let before = rev_parse_ref(path, &local_ref).await;
+
+    let mut refspecs = vec![format!("{upstream_ref}:{local_ref}")];
+    if remote != "." {
+        if let Some(upstream_branch) = upstream_ref.strip_prefix("refs/heads/") {
+            refspecs.push(format!(
+                "+{upstream_ref}:refs/remotes/{remote}/{upstream_branch}"
+            ));
+        }
+    }
+
+    let mut command = crate::process::tokio_command("git");
+    command
+        .arg("fetch")
+        .arg(&remote)
+        .args(&refspecs)
+        .current_dir(path);
+    prepare_remote_git_cmd_with_remote(
+        &mut command,
+        path,
+        Some(&remote),
+        credentials,
+        db,
+        data_dir,
+    )
+    .await;
+    let output = command.output().await.map_err(AppCommandError::io)?;
+    if !output.status.success() {
+        return Err(classify_remote_git_error("fetch", &output.stderr));
+    }
+
+    let after = rev_parse_ref(path, &local_ref).await;
+    Ok(GitPullResult {
+        updated_files: count_ref_advance(path, before.as_deref(), after.as_deref()).await?,
+        conflict: None,
+    })
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn git_update_branch(
+    path: String,
+    branch: String,
+    is_remote: bool,
+    credentials: Option<GitCredentials>,
+    db: tauri::State<'_, AppDatabase>,
+    app_handle: tauri::AppHandle,
+) -> Result<GitPullResult, AppCommandError> {
+    let data_dir = app_handle.path().app_data_dir().map_err(|error| {
+        AppCommandError::external_command("Failed to resolve app data dir", error.to_string())
+    })?;
+    let data_dir = crate::paths::resolve_effective_data_dir(&data_dir);
+    git_update_branch_core(
+        &path,
+        &branch,
+        is_remote,
+        credentials.as_ref(),
+        &db,
+        &data_dir,
+    )
+    .await
+}
+
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn git_push_info(
+    path: String,
+    branch: Option<String>,
+) -> Result<GitPushInfo, AppCommandError> {
+    ensure_git_repo(&path)?;
+
+    let branch = match branch.filter(|branch| !branch.trim().is_empty()) {
+        Some(branch) => {
+            let branch = branch.trim().to_string();
+            ensure_pushable_branch_name(&branch)?;
+            ensure_local_branch_exists(&path, &branch).await?;
+            branch
+        }
+        None => {
+            let output = crate::process::tokio_command("git")
+                .args(["rev-parse", "--abbrev-ref", "HEAD"])
+                .current_dir(&path)
+                .output()
+                .await
+                .map_err(AppCommandError::io)?;
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        }
+    };
 
     // Get tracking remote for current branch
     let remote_key = format!("branch.{}.remote", branch);
@@ -1625,31 +1859,54 @@ pub async fn git_push_info(path: String) -> Result<GitPushInfo, AppCommandError>
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn git_push_core(
     data_dir: &std::path::Path,
     emitter: &EventEmitter,
     folder_id: Option<i32>,
     path: &str,
     remote: Option<&str>,
+    branch: Option<&str>,
     credentials: Option<&GitCredentials>,
     db: &AppDatabase,
 ) -> Result<GitPushResult, AppCommandError> {
-    let pushed_commits = estimate_push_commit_count(path).await;
+    let branch = branch.map(str::trim).filter(|branch| !branch.is_empty());
+    if let Some(branch) = branch {
+        ensure_pushable_branch_name(branch)?;
+        ensure_local_branch_exists(path, branch).await?;
+    }
+    let pushed_commits = estimate_push_commit_count(path, branch).await;
 
     let target_remote = remote.filter(|s| !s.is_empty()).unwrap_or("origin");
 
-    let branch_output = crate::process::tokio_command("git")
-        .args(["rev-parse", "--abbrev-ref", "HEAD"])
-        .current_dir(path)
-        .output()
-        .await
-        .map_err(AppCommandError::io)?;
-    let branch = String::from_utf8_lossy(&branch_output.stdout)
-        .trim()
-        .to_string();
+    let (push_ref, upstream_ref) = match branch {
+        Some(branch) => (
+            format!("refs/heads/{branch}:refs/heads/{branch}"),
+            format!("{branch}@{{u}}"),
+        ),
+        None => {
+            let branch_output = crate::process::tokio_command("git")
+                .args(["rev-parse", "--abbrev-ref", "HEAD"])
+                .current_dir(path)
+                .output()
+                .await
+                .map_err(AppCommandError::io)?;
+            (
+                String::from_utf8_lossy(&branch_output.stdout)
+                    .trim()
+                    .to_string(),
+                "@{u}".to_string(),
+            )
+        }
+    };
 
     let upstream_check = crate::process::tokio_command("git")
-        .args(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
+        .args([
+            "rev-parse",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            &upstream_ref,
+        ])
         .current_dir(path)
         .output()
         .await
@@ -1672,7 +1929,7 @@ pub(crate) async fn git_push_core(
 
     let output = if needs_set_upstream {
         let mut cmd = crate::process::tokio_command("git");
-        cmd.args(["push", "--set-upstream", target_remote, &branch])
+        cmd.args(["push", "--set-upstream", target_remote, &push_ref])
             .current_dir(path);
         prepare_remote_git_cmd_with_remote(
             &mut cmd,
@@ -1686,7 +1943,8 @@ pub(crate) async fn git_push_core(
         cmd.output().await.map_err(AppCommandError::io)?
     } else {
         let mut cmd = crate::process::tokio_command("git");
-        cmd.args(["push", target_remote, &branch]).current_dir(path);
+        cmd.args(["push", target_remote, &push_ref])
+            .current_dir(path);
         prepare_remote_git_cmd_with_remote(
             &mut cmd,
             path,
@@ -1725,11 +1983,13 @@ pub(crate) async fn git_push_core(
 
 #[cfg(feature = "tauri-runtime")]
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
+#[allow(clippy::too_many_arguments)]
 pub async fn git_push(
     app: tauri::AppHandle,
     window: tauri::WebviewWindow,
     path: String,
     remote: Option<String>,
+    branch: Option<String>,
     credentials: Option<GitCredentials>,
     folder_id: Option<i32>,
     db: tauri::State<'_, AppDatabase>,
@@ -1754,6 +2014,7 @@ pub async fn git_push(
         folder_id,
         &path,
         remote.as_deref(),
+        branch.as_deref(),
         credentials.as_ref(),
         &db,
     )
@@ -2557,38 +2818,38 @@ pub async fn git_list_all_branches(path: String) -> Result<GitBranchList, AppCom
         _ => vec![],
     };
 
-    // Parse worktree entries, excluding the current worktree (path itself)
-    let worktree_branches: Vec<String> = match wt_output {
+    // Git reports the main working tree first. Exclude the queried path while
+    // retaining which remaining row is the non-removable main checkout.
+    let (worktree_branches, main_worktree_branch) = match wt_output {
         Ok(output) if output.status.success() => {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let canonical_path =
                 std::fs::canonicalize(&path).unwrap_or_else(|_| PathBuf::from(&path));
             let mut branches = Vec::new();
-            let mut current_wt_path: Option<String> = None;
-            for line in stdout.lines() {
-                if let Some(wt) = line.strip_prefix("worktree ") {
-                    current_wt_path = Some(wt.trim().to_string());
-                } else if let Some(b) = line.strip_prefix("branch refs/heads/") {
-                    if let Some(ref wt) = current_wt_path {
-                        let wt_canonical =
-                            std::fs::canonicalize(wt).unwrap_or_else(|_| PathBuf::from(wt));
-                        if wt_canonical != canonical_path {
-                            branches.push(b.trim().to_string());
-                        }
-                    }
-                } else if line.is_empty() {
-                    current_wt_path = None;
+            let mut main_branch = None;
+            for (index, (worktree_path, branch)) in parse_worktrees(&stdout).into_iter().enumerate()
+            {
+                let Some(branch) = branch else { continue };
+                let canonical_worktree = std::fs::canonicalize(&worktree_path)
+                    .unwrap_or_else(|_| PathBuf::from(&worktree_path));
+                if canonical_worktree == canonical_path {
+                    continue;
                 }
+                if index == 0 {
+                    main_branch = Some(branch.clone());
+                }
+                branches.push(branch);
             }
-            branches
+            (branches, main_branch)
         }
-        _ => vec![],
+        _ => (vec![], None),
     };
 
     Ok(GitBranchList {
         local,
         remote,
         worktree_branches,
+        main_worktree_branch,
     })
 }
 
@@ -2623,6 +2884,20 @@ fn parse_worktrees(stdout: &str) -> Vec<(String, Option<String>)> {
         entries.push((path, current_branch.take()));
     }
     entries
+}
+
+async fn folder_at_path(
+    db: &AppDatabase,
+    path: &Path,
+) -> Result<Option<FolderDetail>, AppCommandError> {
+    let folders = folder_service::list_all_folder_details(&db.conn)
+        .await
+        .map_err(AppCommandError::from)?;
+    Ok(folders.into_iter().find(|folder| {
+        let canonical =
+            std::fs::canonicalize(&folder.path).unwrap_or_else(|_| PathBuf::from(&folder.path));
+        canonical == path
+    }))
 }
 
 /// Resolve where `branch` is checked out and which registered folder owns that
@@ -2663,16 +2938,9 @@ pub async fn resolve_worktree_folder_core(
 
     let canonical_wt = std::fs::canonicalize(&wt_path).unwrap_or_else(|_| PathBuf::from(&wt_path));
 
-    let folders = folder_service::list_all_folder_details(&db.conn)
-        .await
-        .map_err(AppCommandError::from)?;
-    let folder_id = folders
-        .into_iter()
-        .find(|f| {
-            let canon = std::fs::canonicalize(&f.path).unwrap_or_else(|_| PathBuf::from(&f.path));
-            canon == canonical_wt
-        })
-        .map(|f| f.id);
+    let folder_id = folder_at_path(db, &canonical_wt)
+        .await?
+        .map(|folder| folder.id);
 
     Ok(WorktreeResolution {
         path: Some(canonical_wt.to_string_lossy().to_string()),
@@ -2688,6 +2956,268 @@ pub async fn resolve_worktree_folder(
     branch: String,
 ) -> Result<WorktreeResolution, AppCommandError> {
     resolve_worktree_folder_core(&db, repo_path, branch).await
+}
+
+/// Remove the linked worktree holding `branch_name`, then optionally delete the
+/// branch and converge the registered workspace folder onto its project root.
+pub async fn git_remove_worktree_core(
+    emitter: &EventEmitter,
+    db: &AppDatabase,
+    repo_path: String,
+    branch_name: String,
+    source_folder_id: i32,
+    delete_branch: bool,
+    force: bool,
+) -> Result<GitWorktreeRemoval, AppCommandError> {
+    ensure_git_repo(&repo_path)?;
+
+    let listed = crate::process::tokio_command("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(&repo_path)
+        .output()
+        .await
+        .map_err(AppCommandError::io)?;
+    if !listed.status.success() {
+        return Err(git_command_error("worktree list", &listed.stderr));
+    }
+    let entries = parse_worktrees(&String::from_utf8_lossy(&listed.stdout));
+    let main_path = entries.first().map(|(path, _)| path.clone());
+    let hosting = entries
+        .into_iter()
+        .find(|(_, branch)| branch.as_deref() == Some(branch_name.as_str()))
+        .map(|(path, _)| path);
+
+    let mut removal = GitWorktreeRemoval {
+        worktree_path: None,
+        branch_deleted: false,
+        folder_id: None,
+        reparented: 0,
+    };
+
+    if let Some(worktree_path) = hosting {
+        let canonical_worktree =
+            std::fs::canonicalize(&worktree_path).unwrap_or_else(|_| PathBuf::from(&worktree_path));
+        if main_path.as_deref() == Some(worktree_path.as_str()) {
+            return Err(
+                AppCommandError::invalid_input("The main working tree cannot be removed")
+                    .with_detail(worktree_path),
+            );
+        }
+        let canonical_repo =
+            std::fs::canonicalize(&repo_path).unwrap_or_else(|_| PathBuf::from(&repo_path));
+        if canonical_worktree == canonical_repo {
+            return Err(AppCommandError::invalid_input(
+                "The worktree currently in use cannot be removed",
+            )
+            .with_detail(worktree_path));
+        }
+
+        let worktree_folder = folder_at_path(db, &canonical_worktree).await?;
+        if let Some(folder) = &worktree_folder {
+            let busy = crate::db::service::work_task_service::tasks_blocking_worktree_removal(
+                &db.conn, folder.id,
+            )
+            .await
+            .map_err(AppCommandError::from)?;
+            if !busy.is_empty() {
+                return Err(AppCommandError::invalid_input(
+                    "A to-do task is still working in this worktree - cancel or finish it first",
+                )
+                .with_detail(busy.join(", ")));
+            }
+        }
+
+        let mut args = vec!["worktree", "remove"];
+        if force {
+            args.push("--force");
+        }
+        args.push(&worktree_path);
+        let removed = crate::process::tokio_command("git")
+            .args(&args)
+            .current_dir(&repo_path)
+            .output()
+            .await
+            .map_err(AppCommandError::io)?;
+        if !removed.status.success() {
+            if Path::new(&worktree_path).exists() {
+                return Err(git_command_error("worktree remove", &removed.stderr));
+            }
+            let pruned = crate::process::tokio_command("git")
+                .args(["worktree", "prune"])
+                .current_dir(&repo_path)
+                .output()
+                .await
+                .map_err(AppCommandError::io)?;
+            if !pruned.status.success() {
+                return Err(git_command_error("worktree prune", &pruned.stderr));
+            }
+        }
+        removal.worktree_path = Some(worktree_path);
+
+        if delete_branch {
+            if let Some(worktree_folder) = worktree_folder {
+                if let Some(project_folder_id) =
+                    reparent_target(db, worktree_folder.id, source_folder_id).await
+                {
+                    removal.reparented = converge_removed_worktree_folder(
+                        db,
+                        emitter,
+                        worktree_folder.id,
+                        project_folder_id,
+                        &worktree_folder.path,
+                    )
+                    .await;
+                    removal.folder_id = Some(worktree_folder.id);
+                }
+            }
+        }
+    }
+
+    if delete_branch {
+        let flag = if force { "-D" } else { "-d" };
+        let deleted = crate::process::tokio_command("git")
+            .args(["branch", flag, &branch_name])
+            .current_dir(&repo_path)
+            .output()
+            .await
+            .map_err(AppCommandError::io)?;
+        if !deleted.status.success() {
+            let stderr = String::from_utf8_lossy(&deleted.stderr).to_lowercase();
+            if !stderr.contains("not found") {
+                return Err(git_command_error(
+                    &format!("branch {flag}"),
+                    &deleted.stderr,
+                ));
+            }
+        }
+        removal.branch_deleted = true;
+    }
+
+    Ok(removal)
+}
+
+async fn reparent_target(
+    db: &AppDatabase,
+    worktree_folder_id: i32,
+    source_folder_id: i32,
+) -> Option<i32> {
+    let recorded = folder_service::get_folder_by_id(&db.conn, worktree_folder_id)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|folder| folder.parent_id);
+    let target = match recorded {
+        Some(parent_id) => Some(parent_id),
+        None if source_folder_id > 0 => {
+            folder_service::get_folder_by_id(&db.conn, source_folder_id)
+                .await
+                .ok()
+                .flatten()
+                .map(|source| source.parent_id.unwrap_or(source.id))
+        }
+        None => None,
+    };
+    target.filter(|target| *target != worktree_folder_id)
+}
+
+async fn converge_removed_worktree_folder(
+    db: &AppDatabase,
+    emitter: &EventEmitter,
+    worktree_folder_id: i32,
+    project_folder_id: i32,
+    worktree_path: &str,
+) -> u32 {
+    use crate::db::service::{conversation_service, tab_service, work_task_service};
+
+    let moved = conversation_service::reparent_folder_conversations(
+        &db.conn,
+        worktree_folder_id,
+        project_folder_id,
+        worktree_path,
+    )
+    .await
+    .unwrap_or(0) as u32;
+
+    match tab_service::delete_folder_tabs_and_bump(&db.conn, worktree_folder_id).await {
+        Ok(invalidation) => {
+            if let Some(tabs) = invalidation.emit {
+                crate::web::event_bridge::emit_event(
+                    emitter,
+                    crate::web::event_bridge::TABS_CHANGED_EVENT,
+                    crate::web::event_bridge::TabsChanged {
+                        version: invalidation.version,
+                        origin: "server".to_string(),
+                        tabs,
+                    },
+                );
+            }
+        }
+        Err(error) => {
+            tracing::warn!("[folders] tab cleanup failed for folder {worktree_folder_id}: {error}")
+        }
+    }
+
+    let folder_gone = match folder_service::soft_delete_folder(&db.conn, worktree_folder_id).await {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(
+                "[folders] worktree folder {worktree_folder_id} soft-delete failed: {error}"
+            );
+            false
+        }
+    };
+
+    let detached = work_task_service::clear_worktree_by_folder(&db.conn, worktree_folder_id)
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!("[folders] task detach failed for folder {worktree_folder_id}: {error}");
+            Vec::new()
+        });
+
+    crate::web::event_bridge::emit_event(
+        emitter,
+        crate::web::event_bridge::CONVERSATIONS_BULK_CHANGED_EVENT,
+        crate::web::event_bridge::ConversationsBulkChanged {
+            imported: 0,
+            updated: moved,
+            folder_ids: vec![project_folder_id],
+        },
+    );
+    if folder_gone {
+        emit_folder_deleted(emitter, worktree_folder_id);
+    }
+    for task_id in detached {
+        crate::web::event_bridge::emit_event(
+            emitter,
+            crate::web::event_bridge::WORK_TASK_CHANGED_EVENT,
+            crate::web::event_bridge::WorkTaskChange::Upsert { id: task_id },
+        );
+    }
+    crate::office_watch::stop_office_watches_under_root(worktree_path);
+    moved
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn git_remove_worktree(
+    app: tauri::AppHandle,
+    db: tauri::State<'_, AppDatabase>,
+    path: String,
+    branch_name: String,
+    source_folder_id: i32,
+    delete_branch: bool,
+    force: bool,
+) -> Result<GitWorktreeRemoval, AppCommandError> {
+    git_remove_worktree_core(
+        &EventEmitter::Tauri(app),
+        &db,
+        path,
+        branch_name,
+        source_folder_id,
+        delete_branch,
+        force,
+    )
+    .await
 }
 
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
@@ -7113,6 +7643,337 @@ branch refs/heads/main";
             demoted.parent_id, None,
             "explicit worktree open with unknown source demotes to top-level"
         );
+    }
+
+    fn repo_with_remote_feature() -> (tempfile::TempDir, String, String) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let remote = dir.path().join("remote.git");
+        let repo = dir.path().join("repo");
+        let updater = dir.path().join("updater");
+        let remote_s = remote.to_str().expect("utf-8 remote").to_string();
+        let repo_s = repo.to_str().expect("utf-8 repo").to_string();
+        let updater_s = updater.to_str().expect("utf-8 updater").to_string();
+
+        git_run(dir.path(), &["init", "-q", "--bare", &remote_s]);
+        git_run(dir.path(), &["init", "-q", "-b", "main", &repo_s]);
+        git_run(&repo, &["commit", "-q", "--allow-empty", "-m", "base"]);
+        git_run(&repo, &["remote", "add", "origin", &remote_s]);
+        git_run(&repo, &["push", "-q", "-u", "origin", "main"]);
+        git_run(&repo, &["checkout", "-q", "-b", "feature"]);
+        std::fs::write(repo.join("feature.txt"), "one\n").expect("write feature");
+        git_run(&repo, &["add", "feature.txt"]);
+        git_run(&repo, &["commit", "-q", "-m", "feature one"]);
+        git_run(&repo, &["push", "-q", "-u", "origin", "feature"]);
+        git_run(&repo, &["checkout", "-q", "main"]);
+
+        git_run(
+            dir.path(),
+            &["clone", "-q", "--branch", "feature", &remote_s, &updater_s],
+        );
+        std::fs::write(updater.join("feature.txt"), "two\n").expect("advance feature");
+        git_run(&updater, &["add", "feature.txt"]);
+        git_run(&updater, &["commit", "-q", "-m", "feature two"]);
+        git_run(&updater, &["push", "-q", "origin", "feature"]);
+        let advanced = git_capture(&updater, &["rev-parse", "HEAD"]);
+
+        (dir, repo_s, advanced)
+    }
+
+    #[tokio::test]
+    async fn git_update_branch_fast_forwards_non_current_branch_without_checkout() {
+        let db = fresh_in_memory_db().await;
+        let (data_dir, repo, advanced) = repo_with_remote_feature();
+        let before_branch = git_capture(Path::new(&repo), &["branch", "--show-current"]);
+
+        let result = git_update_branch_core(&repo, "feature", false, None, &db, data_dir.path())
+            .await
+            .expect("update non-current branch");
+
+        assert!(result.updated_files > 0);
+        assert_eq!(
+            git_capture(Path::new(&repo), &["branch", "--show-current"]),
+            before_branch,
+            "updating another branch must not check it out"
+        );
+        assert_eq!(
+            git_capture(Path::new(&repo), &["rev-parse", "refs/heads/feature"]),
+            advanced
+        );
+    }
+
+    #[tokio::test]
+    async fn git_update_branch_rejects_malformed_remote_ref() {
+        let db = fresh_in_memory_db().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        git_run(dir.path(), &["init", "-q", "-b", "main"]);
+        git_run(dir.path(), &["commit", "-q", "--allow-empty", "-m", "base"]);
+        let path = dir.path().to_str().expect("utf-8 path");
+
+        let err = git_update_branch_core(path, "origin", true, None, &db, dir.path())
+            .await
+            .expect_err("remote branch must include remote and branch names");
+        assert_eq!(err.code, crate::app_error::AppErrorCode::InvalidInput);
+        assert!(err.message.contains("Malformed remote branch ref"));
+    }
+
+    fn repo_with_unpushed_feature() -> (tempfile::TempDir, String, String, String) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let remote = dir.path().join("push-remote.git");
+        let repo = dir.path().join("push-repo");
+        let remote_s = remote.to_str().expect("utf-8 remote").to_string();
+        let repo_s = repo.to_str().expect("utf-8 repo").to_string();
+
+        git_run(dir.path(), &["init", "-q", "--bare", &remote_s]);
+        git_run(dir.path(), &["init", "-q", "-b", "main", &repo_s]);
+        git_run(&repo, &["commit", "-q", "--allow-empty", "-m", "base"]);
+        git_run(&repo, &["remote", "add", "origin", &remote_s]);
+        git_run(&repo, &["push", "-q", "-u", "origin", "main"]);
+        git_run(&repo, &["checkout", "-q", "-b", "feature"]);
+        std::fs::write(repo.join("feature.txt"), "feature\n").expect("write feature");
+        git_run(&repo, &["add", "feature.txt"]);
+        git_run(&repo, &["commit", "-q", "-m", "feature"]);
+        let feature_head = git_capture(&repo, &["rev-parse", "HEAD"]);
+        git_run(&repo, &["checkout", "-q", "main"]);
+
+        (dir, repo_s, remote_s, feature_head)
+    }
+
+    #[tokio::test]
+    async fn git_push_info_reads_explicit_non_current_branch() {
+        let (_dir, repo, _advanced) = repo_with_remote_feature();
+        let info = git_push_info(repo, Some("feature".to_string()))
+            .await
+            .expect("push info for feature");
+        assert_eq!(info.branch, "feature");
+        assert_eq!(info.tracking_remote.as_deref(), Some("origin"));
+    }
+
+    #[tokio::test]
+    async fn git_push_explicit_branch_without_checkout() {
+        let db = fresh_in_memory_db().await;
+        let (data_dir, repo, remote, feature_head) = repo_with_unpushed_feature();
+        let before_branch = git_capture(Path::new(&repo), &["branch", "--show-current"]);
+
+        let result = git_push_core(
+            data_dir.path(),
+            &worktree_test_emitter(),
+            None,
+            &repo,
+            Some("origin"),
+            Some("feature"),
+            None,
+            &db,
+        )
+        .await
+        .expect("push explicit feature");
+
+        assert!(result.pushed_commits > 0);
+        assert_eq!(
+            git_capture(Path::new(&repo), &["branch", "--show-current"]),
+            before_branch
+        );
+        assert_eq!(
+            git_capture(Path::new(&remote), &["rev-parse", "refs/heads/feature"]),
+            feature_head
+        );
+    }
+
+    #[tokio::test]
+    async fn git_push_rejects_refspec_as_branch_name() {
+        let db = fresh_in_memory_db().await;
+        let (data_dir, repo, _remote, _feature_head) = repo_with_unpushed_feature();
+        let err = git_push_core(
+            data_dir.path(),
+            &worktree_test_emitter(),
+            None,
+            &repo,
+            Some("origin"),
+            Some(":main"),
+            None,
+            &db,
+        )
+        .await
+        .expect_err("a branch argument cannot be a destructive refspec");
+        assert_eq!(err.code, crate::app_error::AppErrorCode::InvalidInput);
+    }
+
+    fn repo_with_worktree() -> (tempfile::TempDir, String, String) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        git_run(dir.path(), &["init", "-q", "-b", "main"]);
+        git_run(dir.path(), &["commit", "-q", "--allow-empty", "-m", "base"]);
+        let wt_path = dir.path().join("wt");
+        let wt = wt_path.to_str().expect("utf-8 worktree").to_string();
+        git_run(dir.path(), &["worktree", "add", "-q", "-b", "wt", &wt]);
+        let repo = dir.path().to_str().expect("utf-8 repo").to_string();
+        (dir, repo, wt)
+    }
+
+    fn worktree_test_emitter() -> EventEmitter {
+        EventEmitter::test_web_only(std::sync::Arc::new(
+            crate::web::event_bridge::WebEventBroadcaster::new(),
+        ))
+    }
+
+    async fn seed_task_on_worktree(
+        db: &AppDatabase,
+        project_folder_id: i32,
+        worktree_folder_id: i32,
+    ) -> i32 {
+        use crate::db::service::work_task_service;
+
+        let task = work_task_service::create(
+            &db.conn,
+            crate::models::WorkTaskDraft {
+                folder_id: project_folder_id,
+                title: "busy worktree".to_string(),
+                config: serde_json::json!({
+                    "display_text": "busy worktree",
+                    "prompt_blocks": [{ "type": "text", "text": "busy worktree" }],
+                }),
+            },
+        )
+        .await
+        .expect("create work task");
+        work_task_service::attach_worktree(
+            &db.conn,
+            task.id,
+            worktree_folder_id,
+            "main",
+            "base",
+            "wt",
+        )
+        .await
+        .expect("attach worktree");
+        task.id
+    }
+
+    #[tokio::test]
+    async fn git_remove_worktree_refuses_main_working_tree() {
+        let db = fresh_in_memory_db().await;
+        let (_dir, repo, _worktree) = repo_with_worktree();
+
+        let err = git_remove_worktree_core(
+            &worktree_test_emitter(),
+            &db,
+            repo.clone(),
+            "main".to_string(),
+            0,
+            true,
+            false,
+        )
+        .await
+        .expect_err("main worktree removal must be refused");
+
+        assert!(err.message.contains("main working tree"));
+        assert!(Path::new(&repo).exists());
+    }
+
+    #[tokio::test]
+    async fn git_remove_worktree_refuses_busy_task_even_with_force() {
+        use crate::db::entities::work_task::WorkTaskStatus;
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+
+        let db = fresh_in_memory_db().await;
+        let (_dir, repo, worktree) = repo_with_worktree();
+        let root = open_folder_core(&db, repo.clone())
+            .await
+            .expect("open root");
+        let wt_folder = open_worktree_folder_core(&db, worktree.clone(), root.id)
+            .await
+            .expect("open worktree folder");
+        let task_id = seed_task_on_worktree(&db, root.id, wt_folder.id).await;
+        let row = crate::db::entities::work_task::Entity::find_by_id(task_id)
+            .one(&db.conn)
+            .await
+            .expect("query task")
+            .expect("task row");
+        let mut active = row.into_active_model();
+        active.status = Set(WorkTaskStatus::Running);
+        active.update(&db.conn).await.expect("mark task running");
+
+        let err = git_remove_worktree_core(
+            &worktree_test_emitter(),
+            &db,
+            repo,
+            "wt".to_string(),
+            root.id,
+            true,
+            true,
+        )
+        .await
+        .expect_err("busy task must block force removal");
+
+        assert!(err.message.contains("still working in this worktree"));
+        assert!(Path::new(&worktree).exists());
+    }
+
+    #[tokio::test]
+    async fn git_remove_worktree_force_reparents_conversations_and_deletes_branch() {
+        use crate::db::service::conversation_service;
+
+        let db = fresh_in_memory_db().await;
+        let (_dir, repo, worktree) = repo_with_worktree();
+        let root = open_folder_core(&db, repo.clone())
+            .await
+            .expect("open root");
+        let wt_folder = open_worktree_folder_core(&db, worktree.clone(), root.id)
+            .await
+            .expect("open worktree folder");
+        let canonical_worktree = std::fs::canonicalize(&worktree)
+            .expect("canonical worktree")
+            .to_string_lossy()
+            .to_string();
+        let conversation =
+            conversation_service::create(&db.conn, wt_folder.id, AgentType::ClaudeCode, None, None)
+                .await
+                .expect("create conversation");
+        std::fs::write(Path::new(&worktree).join("dirty.txt"), "uncommitted\n")
+            .expect("write dirty file");
+
+        let removal = git_remove_worktree_core(
+            &worktree_test_emitter(),
+            &db,
+            repo.clone(),
+            "wt".to_string(),
+            root.id,
+            true,
+            true,
+        )
+        .await
+        .expect("force remove worktree and branch");
+
+        assert_eq!(
+            removal.worktree_path.as_deref(),
+            Some(canonical_worktree.as_str())
+        );
+        assert!(removal.branch_deleted);
+        assert_eq!(removal.folder_id, Some(wt_folder.id));
+        assert_eq!(removal.reparented, 1);
+        assert!(!Path::new(&worktree).exists());
+        assert!(folder_service::get_folder_by_id(&db.conn, wt_folder.id)
+            .await
+            .expect("query removed worktree folder")
+            .is_none());
+        let moved = conversation_service::get_by_id(&db.conn, conversation.id)
+            .await
+            .expect("moved conversation");
+        assert_eq!(moved.folder_id, root.id);
+        assert_eq!(moved.origin_cwd.as_deref(), Some(worktree.as_str()));
+        assert!(!git_list_all_branches(repo)
+            .await
+            .expect("branches")
+            .local
+            .contains(&"wt".to_string()));
+    }
+
+    #[tokio::test]
+    async fn git_remove_worktree_branch_list_marks_main_working_tree() {
+        let (_dir, _repo, worktree) = repo_with_worktree();
+        let branches = git_list_all_branches(worktree)
+            .await
+            .expect("list from linked worktree");
+        assert_eq!(branches.worktree_branches, vec!["main".to_string()]);
+        assert_eq!(branches.main_worktree_branch.as_deref(), Some("main"));
     }
 
     #[tokio::test]

@@ -719,19 +719,26 @@ export async function gitFetch(
   return invoke("git_fetch", { path, credentials: credentials ?? null })
 }
 
-export async function gitPushInfo(path: string): Promise<GitPushInfo> {
-  return invoke("git_push_info", { path })
+export async function gitPushInfo(
+  path: string,
+  branch?: string | null
+): Promise<GitPushInfo> {
+  return invoke("git_push_info", { path, branch: branch ?? null })
 }
 
 export async function gitPush(
   path: string,
   remote?: string | null,
-  credentials?: GitCredentials | null
+  credentials?: GitCredentials | null,
+  folderId?: number | null,
+  branch?: string | null
 ): Promise<GitPushResult> {
   return invoke("git_push", {
     path,
     remote: remote ?? null,
+    branch: branch ?? null,
     credentials: credentials ?? null,
+    folderId: folderId ?? null,
   })
 }
 
