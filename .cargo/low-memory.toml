@@ -10,3 +10,6 @@ debug = 0
 
 [env]
 RUST_TEST_THREADS = { value = "1", force = true }
+# Same stack reservation as `.cargo/config.toml` so low-memory `cargo test`
+# does not overflow debug ACP/delegation futures.
+RUST_MIN_STACK = "33554432"

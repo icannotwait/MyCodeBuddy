@@ -11,6 +11,10 @@ env:
   # Refuse to silently regenerate snapshots in CI — any drift must be
   # accepted locally with `cargo insta review` and committed.
   INSTA_UPDATE: "no"
+  # libtest threads default to ~2 MiB. Debug-built ACP/delegation futures
+  # (especially `start_delegation`) overflow that on GitHub runners and abort
+  # the whole `cargo test` process. This is address-space reservation only.
+  RUST_MIN_STACK: "33554432"
 
 concurrency:
   group: test-${{ github.ref }}
