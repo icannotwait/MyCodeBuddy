@@ -578,11 +578,21 @@ git commit -m "feat: add shared ACP broker primitives"
 **Files:**
 - Modify: `src-tauri/src/acp/connection.rs`
 - Modify: `src-tauri/src/acp/manager.rs`
+- Modify: `src-tauri/src/acp/session_state.rs`
 - Modify: `src-tauri/src/acp/shared_session.rs`
+- Modify: `src-tauri/src/acp/shared_session/dto.rs`
+- Modify: `src-tauri/src/acp/shared_session/tests.rs`
 
 **Interfaces:**
 - Consumes: Task 1 `SharedSessionBroker::reserve_or_attach`, `SharedLaunchIdentity`, `SharedSessionPhase`, `SharedSessionError`, and existing `spawn_agent_connection -> SpawnHandshake`.
 - Produces: `SharedConnectLaunch`, `ConnectionManager::connect_or_attach_shared`, `ConnectionManager::shared_session_broker`, `ConnectionManager::start_registered_shared_root`, a per-record registration notification, and owned registration/bootstrap tasks that move `Reserved -> Bootstrapping | Failed` and then `Bootstrapping -> Ready | Failed` for the exact generation.
+
+Preserve Task 1's reviewed module boundary: public/redacted shared-session DTOs go
+in `shared_session/dto.rs`, broker record synchronization and lifecycle methods
+stay in `shared_session.rs`, and broker-focused tests go in
+`shared_session/tests.rs`. `SessionState::prepare_registered_replacement` and its
+state-preservation unit test belong in `session_state.rs`; do not hide that change
+inside `connection.rs`.
 
 - [ ] **Step 1: Write failing manager tests for fast registration, bootstrap single-flight, concurrent distinct roots, and required-companion failure policy**
 
@@ -826,7 +836,7 @@ Expected: PASS; fast-return test completes before the readiness sender fires, an
 - [ ] **Step 7: Commit Task 2**
 
 ```bash
-git add src-tauri/src/acp/connection.rs src-tauri/src/acp/manager.rs src-tauri/src/acp/shared_session.rs
+git add src-tauri/src/acp/connection.rs src-tauri/src/acp/manager.rs src-tauri/src/acp/session_state.rs src-tauri/src/acp/shared_session.rs src-tauri/src/acp/shared_session/dto.rs src-tauri/src/acp/shared_session/tests.rs
 git commit -m "feat: register shared ACP bootstrap asynchronously"
 ```
 
