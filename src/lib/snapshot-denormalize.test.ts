@@ -66,6 +66,44 @@ describe("denormalizeSnapshot — active_delegations", () => {
   })
 })
 
+describe("denormalizeSnapshot — shared session", () => {
+  it("denormalizes a complete shared-session projection", () => {
+    const patch = denormalizeSnapshot(
+      baseSnapshot({
+        shared_session: {
+          generation: 3,
+          phase: { phase: "ready" },
+          queue: [
+            {
+              queue_item_id: "q2",
+              enqueue_seq: 2,
+              client_message_id: "m2",
+              visible_text: "later",
+              visible_text_truncated: false,
+              attachment_count: 0,
+              submitted_at: "2026-08-16T00:00:00Z",
+              state: "queued",
+            },
+          ],
+          active_turn: {
+            turn_id: "turn-1",
+            queue_item_id: "q1",
+            enqueue_seq: 1,
+            client_message_id: "m1",
+            stop_requested: false,
+          },
+          lease_expires_at: "2026-08-16T00:01:30Z",
+        },
+      })
+    )
+    expect(patch.sharedSession?.generation).toBe(3)
+    expect(patch.sharedSession?.queue.map((item) => item.enqueueSeq)).toEqual([
+      2,
+    ])
+    expect(patch.sharedSession?.activeTurn?.turnId).toBe("turn-1")
+  })
+})
+
 describe("denormalizeSnapshot — session config filter", () => {
   it("strips host-hidden options such as Codex fast-mode", () => {
     const patch = denormalizeSnapshot(

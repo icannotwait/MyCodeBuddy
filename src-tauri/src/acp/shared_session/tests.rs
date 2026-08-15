@@ -567,7 +567,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(
+        assert!(matches!(
             broker
                 .mark_ready(
                     &reservation.attachment.connection_id,
@@ -576,7 +576,7 @@ mod tests {
                 )
                 .await,
             Err(SharedSessionError::GenerationStale)
-        );
+        ));
         state
             .write()
             .await
@@ -592,7 +592,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(
+        assert!(matches!(
             broker
                 .mark_ready(
                     &reservation.attachment.connection_id,
@@ -601,7 +601,7 @@ mod tests {
                 )
                 .await,
             Err(SharedSessionError::GenerationStale)
-        );
+        ));
         assert!(broker
             .is_current_bootstrapping_driver(
                 &reservation.attachment.connection_id,

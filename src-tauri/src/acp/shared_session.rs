@@ -185,23 +185,32 @@ impl SharedSessionBroker {
         generation: u64,
         error_code: impl Into<String>,
         cleanup_complete: bool,
-    ) -> Result<(), SharedSessionError> {
+    ) -> Result<Vec<crate::acp::types::AcpEvent>, SharedSessionError> {
         let error_code = error_code.into();
         validate_failure_code(&error_code)?;
-        self.with_authoritative_record(connection_id, |record| {
+        self.with_authoritative_record_and_state(connection_id, None, |record, state| {
             if record.connection_id != connection_id || record.generation != generation {
                 return Err(SharedSessionError::GenerationStale);
             }
-            record.cleanup_complete = cleanup_complete;
-            record.phase = SharedSessionPhase::Failed {
+            let phase = SharedSessionPhase::Failed {
                 error_code: error_code.clone(),
                 cleanup_complete,
             };
+            if let Some(state) = state {
+                update_public_shared_phase(state, generation, phase.clone());
+            }
+            record.cleanup_complete = cleanup_complete;
+            record.phase = phase;
             record.publish_registration();
             record
                 .lifecycle_tx
                 .send_replace(SharedLifecycleState::Failed);
-            Ok(())
+            Ok(vec![
+                crate::acp::types::AcpEvent::SharedSessionPhaseChanged {
+                    generation,
+                    phase: record.phase.clone(),
+                },
+            ])
         })
         .await?
         .ok_or(SharedSessionError::SessionUnavailable)
@@ -211,7 +220,7 @@ impl SharedSessionBroker {
         &self,
         connection_id: &str,
         generation: u64,
-    ) -> Result<(), SharedSessionError> {
+    ) -> Result<Vec<crate::acp::types::AcpEvent>, SharedSessionError> {
         self.with_authoritative_record_and_state(connection_id, None, |record, state| {
             if record.connection_id != connection_id || record.generation != generation {
                 return Err(SharedSessionError::GenerationStale);
@@ -230,7 +239,12 @@ impl SharedSessionBroker {
             record.cleanup_complete = true;
             record.phase = phase;
             record.publish_registration();
-            Ok(())
+            Ok(vec![
+                crate::acp::types::AcpEvent::SharedSessionPhaseChanged {
+                    generation,
+                    phase: record.phase.clone(),
+                },
+            ])
         })
         .await?
         .ok_or(SharedSessionError::SessionUnavailable)
@@ -301,7 +315,7 @@ impl SharedSessionBroker {
         state: Arc<RwLock<SessionState>>,
         emitter: EventEmitter,
         child_pid: Arc<std::sync::atomic::AtomicU32>,
-    ) -> Result<(), SharedSessionError> {
+    ) -> Result<Vec<crate::acp::types::AcpEvent>, SharedSessionError> {
         self.with_authoritative_record(connection_id, |record| {
             if record.generation != generation {
                 return Err(SharedSessionError::GenerationStale);
@@ -315,7 +329,12 @@ impl SharedSessionBroker {
             record.child_pid = Some(child_pid.clone());
             record.phase = SharedSessionPhase::Bootstrapping;
             record.publish_registration();
-            Ok(())
+            Ok(vec![
+                crate::acp::types::AcpEvent::SharedSessionPhaseChanged {
+                    generation,
+                    phase: record.phase.clone(),
+                },
+            ])
         })
         .await?
         .ok_or(SharedSessionError::SessionUnavailable)
@@ -402,7 +421,7 @@ impl SharedSessionBroker {
         connection_id: &str,
         generation: u64,
         driver_incarnation: &str,
-    ) -> Result<(), SharedSessionError> {
+    ) -> Result<Vec<crate::acp::types::AcpEvent>, SharedSessionError> {
         self.with_authoritative_record_and_state(connection_id, None, |record, state| {
             if record.generation != generation
                 || record.phase != SharedSessionPhase::Bootstrapping
@@ -415,7 +434,12 @@ impl SharedSessionBroker {
             update_public_shared_phase(state, generation, SharedSessionPhase::Ready);
             record.phase = SharedSessionPhase::Ready;
             record.publish_registration();
-            Ok(())
+            Ok(vec![
+                crate::acp::types::AcpEvent::SharedSessionPhaseChanged {
+                    generation,
+                    phase: record.phase.clone(),
+                },
+            ])
         })
         .await?
         .ok_or(SharedSessionError::SessionUnavailable)
@@ -475,7 +499,14 @@ impl SharedSessionBroker {
         cleanup_complete: bool,
         state: Arc<RwLock<SessionState>>,
         emitter: EventEmitter,
-    ) -> Result<(Arc<RwLock<SessionState>>, EventEmitter), SharedSessionError> {
+    ) -> Result<
+        (
+            Arc<RwLock<SessionState>>,
+            EventEmitter,
+            Vec<crate::acp::types::AcpEvent>,
+        ),
+        SharedSessionError,
+    > {
         let error_code = error.code().to_string();
         let fallback_state = state.clone();
         self.with_authoritative_record_and_state(
@@ -527,7 +558,14 @@ impl SharedSessionBroker {
                 record
                     .lifecycle_tx
                     .send_replace(SharedLifecycleState::Failed);
-                Ok((state, emitter))
+                Ok((
+                    state,
+                    emitter,
+                    vec![crate::acp::types::AcpEvent::SharedSessionPhaseChanged {
+                        generation,
+                        phase: record.phase.clone(),
+                    }],
+                ))
             },
         )
         .await?
@@ -542,7 +580,14 @@ impl SharedSessionBroker {
         cleanup_complete: bool,
         state: Arc<RwLock<SessionState>>,
         emitter: EventEmitter,
-    ) -> Result<(Arc<RwLock<SessionState>>, EventEmitter), SharedSessionError> {
+    ) -> Result<
+        (
+            Arc<RwLock<SessionState>>,
+            EventEmitter,
+            Vec<crate::acp::types::AcpEvent>,
+        ),
+        SharedSessionError,
+    > {
         let error_code = error.code().to_string();
         let fallback_state = state.clone();
         self.with_authoritative_record_and_state(
@@ -588,14 +633,21 @@ impl SharedSessionBroker {
                 record
                     .lifecycle_tx
                     .send_replace(SharedLifecycleState::Failed);
-                Ok((state, emitter))
+                Ok((
+                    state,
+                    emitter,
+                    vec![crate::acp::types::AcpEvent::SharedSessionPhaseChanged {
+                        generation: permit.generation,
+                        phase: record.phase.clone(),
+                    }],
+                ))
             },
         )
         .await?
         .ok_or(SharedSessionError::SessionUnavailable)
     }
 
-    pub(crate) async fn public_state(
+    pub(crate) async fn public_state_and_emitter(
         &self,
         connection_id: &str,
     ) -> Option<(Arc<RwLock<SessionState>>, EventEmitter)> {

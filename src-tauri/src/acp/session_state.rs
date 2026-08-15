@@ -895,6 +895,83 @@ impl SessionState {
                 }
                 self.status = status.clone();
             }
+            AcpEvent::SharedSessionPhaseChanged { generation, phase } => {
+                if let Some(shared) = self
+                    .shared_session
+                    .as_mut()
+                    .filter(|shared| shared.generation == *generation)
+                {
+                    shared.phase = phase.clone();
+                    self.status = phase.connection_status();
+                }
+            }
+            AcpEvent::PromptQueued { generation, item } => {
+                if let Some(shared) = self
+                    .shared_session
+                    .as_mut()
+                    .filter(|shared| shared.generation == *generation)
+                {
+                    shared
+                        .queue
+                        .retain(|queued| queued.queue_item_id != item.queue_item_id);
+                    shared.queue.push(item.clone());
+                    shared.queue.sort_by_key(|queued| queued.enqueue_seq);
+                }
+            }
+            AcpEvent::PromptQueueItemCancelled {
+                generation,
+                queue_item_id,
+            }
+            | AcpEvent::PromptQueueItemFailed {
+                generation,
+                queue_item_id,
+                ..
+            } => {
+                if let Some(shared) = self
+                    .shared_session
+                    .as_mut()
+                    .filter(|shared| shared.generation == *generation)
+                {
+                    shared
+                        .queue
+                        .retain(|queued| queued.queue_item_id != *queue_item_id);
+                }
+            }
+            AcpEvent::PromptDispatchStarted { generation, turn } => {
+                if let Some(shared) = self
+                    .shared_session
+                    .as_mut()
+                    .filter(|shared| shared.generation == *generation)
+                {
+                    shared
+                        .queue
+                        .retain(|queued| queued.queue_item_id != turn.queue_item_id);
+                    shared.active_turn = Some(turn.clone());
+                }
+            }
+            AcpEvent::PromptQueueDepthChanged { .. } => {
+                // Queue entries remain the authoritative replayable projection.
+                // The aggregate depth event is intentionally presentation-only.
+            }
+            AcpEvent::SharedTurnSettled {
+                generation,
+                turn_id,
+                ..
+            } => {
+                if let Some(shared) = self
+                    .shared_session
+                    .as_mut()
+                    .filter(|shared| shared.generation == *generation)
+                {
+                    if shared
+                        .active_turn
+                        .as_ref()
+                        .is_some_and(|turn| turn.turn_id == *turn_id)
+                    {
+                        shared.active_turn = None;
+                    }
+                }
+            }
             AcpEvent::SessionModes { modes } => {
                 self.current_mode = Some(modes.current_mode_id.clone());
                 self.modes = Some(modes.clone());
@@ -2142,6 +2219,151 @@ mod tests {
             "win-test".to_string(),
             None,
         )
+    }
+
+    #[test]
+    fn shared_session_projection_reconstructs_queue_and_active_turn() {
+        use crate::acp::shared_session::{
+            SharedActiveTurnProjection, SharedQueuedPromptState, SharedQueuedPromptSummary,
+            SharedSessionPhase, SharedSessionProjection,
+        };
+
+        let mut state = fresh_state();
+        assert!(serde_json::to_value(state.to_snapshot())
+            .unwrap()
+            .get("shared_session")
+            .is_none());
+        state.shared_session = Some(SharedSessionProjection {
+            generation: 3,
+            phase: SharedSessionPhase::Bootstrapping,
+            queue: Vec::new(),
+            active_turn: None,
+            lease_expires_at: None,
+        });
+        let submitted_at = chrono::DateTime::parse_from_rfc3339("2026-08-16T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        state.apply_event(&AcpEvent::SharedSessionPhaseChanged {
+            generation: 3,
+            phase: SharedSessionPhase::Ready,
+        });
+        state.apply_event(&AcpEvent::PromptQueued {
+            generation: 3,
+            item: SharedQueuedPromptSummary {
+                queue_item_id: "q2".into(),
+                enqueue_seq: 2,
+                client_message_id: "m2".into(),
+                visible_text: Some("later".into()),
+                visible_text_truncated: false,
+                attachment_count: 0,
+                submitted_at,
+                state: SharedQueuedPromptState::Queued,
+            },
+        });
+        state.apply_event(&AcpEvent::PromptQueued {
+            generation: 3,
+            item: SharedQueuedPromptSummary {
+                queue_item_id: "q1".into(),
+                enqueue_seq: 1,
+                client_message_id: "m1".into(),
+                visible_text: Some("first".into()),
+                visible_text_truncated: false,
+                attachment_count: 0,
+                submitted_at,
+                state: SharedQueuedPromptState::Queued,
+            },
+        });
+        state.apply_event(&AcpEvent::PromptQueueItemCancelled {
+            generation: 3,
+            queue_item_id: "q1".into(),
+        });
+        state.apply_event(&AcpEvent::PromptDispatchStarted {
+            generation: 3,
+            turn: SharedActiveTurnProjection {
+                turn_id: "turn-1".into(),
+                queue_item_id: "q1".into(),
+                enqueue_seq: 1,
+                client_message_id: "m1".into(),
+                stop_requested: false,
+            },
+        });
+
+        let snapshot = state.to_snapshot();
+        let shared = snapshot.shared_session.expect("shared projection");
+        assert_eq!(
+            shared
+                .queue
+                .iter()
+                .map(|item| item.enqueue_seq)
+                .collect::<Vec<_>>(),
+            [2]
+        );
+        assert_eq!(
+            shared
+                .active_turn
+                .as_ref()
+                .map(|turn| turn.turn_id.as_str()),
+            Some("turn-1")
+        );
+    }
+
+    #[test]
+    fn shared_session_projection_ignores_stale_events_and_settles_matching_turn() {
+        use crate::acp::shared_session::{
+            SharedActiveTurnProjection, SharedSessionPhase, SharedSessionProjection,
+            SharedTurnOutcome,
+        };
+
+        let mut state = fresh_state();
+        state.shared_session = Some(SharedSessionProjection {
+            generation: 3,
+            phase: SharedSessionPhase::Ready,
+            queue: Vec::new(),
+            active_turn: Some(SharedActiveTurnProjection {
+                turn_id: "turn-1".into(),
+                queue_item_id: "q1".into(),
+                enqueue_seq: 1,
+                client_message_id: "m1".into(),
+                stop_requested: false,
+            }),
+            lease_expires_at: None,
+        });
+
+        state.apply_event(&AcpEvent::SharedSessionPhaseChanged {
+            generation: 2,
+            phase: SharedSessionPhase::Failed {
+                error_code: "stale".into(),
+                cleanup_complete: false,
+            },
+        });
+        state.apply_event(&AcpEvent::SharedTurnSettled {
+            generation: 3,
+            turn_id: "other-turn".into(),
+            outcome: SharedTurnOutcome::Completed,
+        });
+        assert_eq!(
+            state.shared_session.as_ref().map(|shared| &shared.phase),
+            Some(&SharedSessionPhase::Ready)
+        );
+        assert_eq!(
+            state
+                .shared_session
+                .as_ref()
+                .and_then(|shared| shared.active_turn.as_ref())
+                .map(|turn| turn.turn_id.as_str()),
+            Some("turn-1")
+        );
+
+        state.apply_event(&AcpEvent::SharedTurnSettled {
+            generation: 3,
+            turn_id: "turn-1".into(),
+            outcome: SharedTurnOutcome::Completed,
+        });
+        assert!(state
+            .shared_session
+            .as_ref()
+            .is_some_and(|shared| shared.active_turn.is_none()));
     }
 
     fn codeg_plan(agent_type: AgentType) -> crate::acp::delegation::route::DelegationRoutePlan {

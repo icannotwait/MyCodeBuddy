@@ -2269,6 +2269,44 @@ export interface BackgroundSettledInfo {
   wire_visible?: boolean
 }
 
+export type SharedSessionPhase =
+  | { phase: "reserved" }
+  | { phase: "bootstrapping" }
+  | { phase: "ready" }
+  | { phase: "failed"; error_code: string; cleanup_complete: boolean }
+  | { phase: "closing" }
+
+export type SharedQueuedPromptState = "queued" | "dispatching"
+
+export interface SharedQueuedPromptSummary {
+  queue_item_id: string
+  enqueue_seq: number
+  client_message_id: string
+  visible_text: string | null
+  visible_text_truncated: boolean
+  attachment_count: number
+  submitted_at: string
+  state: SharedQueuedPromptState
+}
+
+export interface SharedActiveTurnProjection {
+  turn_id: string
+  queue_item_id: string
+  enqueue_seq: number
+  client_message_id: string
+  stop_requested: boolean
+}
+
+export interface SharedSessionProjection {
+  generation: number
+  phase: SharedSessionPhase
+  queue: SharedQueuedPromptSummary[]
+  active_turn: SharedActiveTurnProjection | null
+  lease_expires_at: string | null
+}
+
+export type SharedTurnOutcome = "completed" | "cancelled" | "failed"
+
 export type AcpEvent =
   /**
    * `parent_tool_use_id` attributes live Claude subagent chunks to the
@@ -2412,6 +2450,44 @@ export type AcpEvent =
   | {
       type: "status_changed"
       status: ConnectionStatus
+    }
+  | {
+      type: "shared_session_phase_changed"
+      generation: number
+      phase: SharedSessionPhase
+    }
+  | {
+      type: "prompt_queued"
+      generation: number
+      item: SharedQueuedPromptSummary
+    }
+  | {
+      type: "prompt_queue_item_cancelled"
+      generation: number
+      queue_item_id: string
+    }
+  | {
+      type: "prompt_dispatch_started"
+      generation: number
+      turn: SharedActiveTurnProjection
+    }
+  | {
+      type: "prompt_queue_item_failed"
+      generation: number
+      queue_item_id: string
+      error_code: string
+    }
+  | {
+      type: "prompt_queue_depth_changed"
+      generation: number
+      waiting_count: number
+      waiting_bytes: number
+    }
+  | {
+      type: "shared_turn_settled"
+      generation: number
+      turn_id: string
+      outcome: SharedTurnOutcome
     }
   | {
       type: "error"
@@ -3239,6 +3315,8 @@ export interface LiveSessionSnapshot {
   connection_id: string
   conversation_id: number | null
   folder_id: number | null
+  /** Shared broker projection. Omitted for legacy/non-shared sessions. */
+  shared_session?: SharedSessionProjection | null
   status: ConnectionStatus
   external_id: string | null
   live_message: LiveMessage | null

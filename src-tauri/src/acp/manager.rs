@@ -897,11 +897,11 @@ impl ConnectionManager {
                     state.shared_session = Some(shared_projection(
                         generation,
                         SharedSessionPhase::Bootstrapping,
-                        Some(attachment.lease_expires_at),
+                        None,
                     ));
                 }
                 let driver_incarnation = registered.connection_incarnation.clone();
-                if self
+                let events = match self
                     .shared_session_broker
                     .install_registered(
                         &connection_id,
@@ -912,10 +912,22 @@ impl ConnectionManager {
                         registered.child_pid.clone(),
                     )
                     .await
-                    .is_err()
                 {
-                    let _ = self.teardown_unexposed_attempt(&connection_id).await;
-                    return;
+                    Ok(events) => events,
+                    Err(_) => {
+                        let _ = self.teardown_unexposed_attempt(&connection_id).await;
+                        return;
+                    }
+                };
+                for event in events {
+                    if self
+                        .publish_shared_event(&connection_id, event)
+                        .await
+                        .is_err()
+                    {
+                        let _ = self.teardown_unexposed_attempt(&connection_id).await;
+                        return;
+                    }
                 }
                 self.spawn_shared_bootstrap_settler(
                     connection_id,
@@ -1181,12 +1193,20 @@ impl ConnectionManager {
 
         match action {
             SharedBootstrapAction::Ready => {
-                if self
+                if let Ok(events) = self
                     .shared_session_broker
                     .mark_ready(&connection_id, generation, &driver_incarnation)
                     .await
-                    .is_ok()
                 {
+                    for event in events {
+                        if self
+                            .publish_shared_event(&connection_id, event)
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
                     self.shared_launches
                         .lock()
                         .await
@@ -1254,7 +1274,7 @@ impl ConnectionManager {
                 launch.launch_inputs.route_plan = safe_native_fallback(&route_plan, reason);
                 let Some((public_state, _)) = self
                     .shared_session_broker
-                    .public_state(&connection_id)
+                    .public_state_and_emitter(&connection_id)
                     .await
                 else {
                     return;
@@ -1352,7 +1372,7 @@ impl ConnectionManager {
     ) {
         let (state, emitter) = match self
             .shared_session_broker
-            .public_state(&connection_id)
+            .public_state_and_emitter(&connection_id)
             .await
         {
             Some(public) => public,
@@ -1368,13 +1388,22 @@ impl ConnectionManager {
                 launch.emitter.clone(),
             ),
         };
-        if self
+        let events = match self
             .shared_session_broker
             .fail_registered_replacement(&permit, error, false, state, emitter)
             .await
-            .is_err()
         {
-            return;
+            Ok((_, _, events)) => events,
+            Err(_) => return,
+        };
+        for event in events {
+            if self
+                .publish_shared_event(&connection_id, event)
+                .await
+                .is_err()
+            {
+                return;
+            }
         }
 
         let cleanup_complete = self
@@ -1383,10 +1412,15 @@ impl ConnectionManager {
             .is_ok()
             && !self.connections.lock().await.contains_key(&connection_id);
         if cleanup_complete {
-            let _ = self
+            if let Ok(events) = self
                 .shared_session_broker
                 .mark_cleanup_complete(&connection_id, generation)
-                .await;
+                .await
+            {
+                for event in events {
+                    let _ = self.publish_shared_event(&connection_id, event).await;
+                }
+            }
         }
         self.shared_launches
             .lock()
@@ -1404,7 +1438,7 @@ impl ConnectionManager {
     ) {
         let (state, emitter) = match self
             .shared_session_broker
-            .public_state(&connection_id)
+            .public_state_and_emitter(&connection_id)
             .await
         {
             Some(public) => public,
@@ -1420,7 +1454,7 @@ impl ConnectionManager {
                 launch.emitter.clone(),
             ),
         };
-        if self
+        let events = match self
             .shared_session_broker
             .fail_registered(
                 &connection_id,
@@ -1432,9 +1466,18 @@ impl ConnectionManager {
                 emitter,
             )
             .await
-            .is_err()
         {
-            return;
+            Ok((_, _, events)) => events,
+            Err(_) => return,
+        };
+        for event in events {
+            if self
+                .publish_shared_event(&connection_id, event)
+                .await
+                .is_err()
+            {
+                return;
+            }
         }
 
         let cleanup_complete = self
@@ -1443,10 +1486,15 @@ impl ConnectionManager {
             .is_ok()
             && !self.connections.lock().await.contains_key(&connection_id);
         if cleanup_complete {
-            let _ = self
+            if let Ok(events) = self
                 .shared_session_broker
                 .mark_cleanup_complete(&connection_id, generation)
-                .await;
+                .await
+            {
+                for event in events {
+                    let _ = self.publish_shared_event(&connection_id, event).await;
+                }
+            }
         }
         self.shared_launches
             .lock()
@@ -6163,7 +6211,7 @@ impl ConnectionManager {
             Some(state) => Some(state),
             None => self
                 .shared_session_broker
-                .public_state(conn_id)
+                .public_state_and_emitter(conn_id)
                 .await
                 .map(|(state, _)| state),
         }
@@ -6189,8 +6237,32 @@ impl ConnectionManager {
         };
         match state {
             Some(state) => Some(state),
-            None => self.shared_session_broker.public_state(conn_id).await,
+            None => {
+                self.shared_session_broker
+                    .public_state_and_emitter(conn_id)
+                    .await
+            }
         }
+    }
+
+    pub async fn publish_shared_event(
+        &self,
+        connection_id: &str,
+        event: AcpEvent,
+    ) -> Result<(), AcpError> {
+        let handles = self
+            .shared_session_broker()
+            .public_state_and_emitter(connection_id)
+            .await;
+        let (state, emitter) = match handles {
+            Some(handles) => handles,
+            None => self
+                .get_state_and_emitter(connection_id)
+                .await
+                .ok_or_else(|| AcpError::ConnectionNotFound(connection_id.into()))?,
+        };
+        emit_with_state(&state, &emitter, event).await;
+        Ok(())
     }
 
     /// Wait (bounded) for the connected agent to advertise prompt capabilities.
