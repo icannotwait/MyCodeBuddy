@@ -599,6 +599,7 @@ mod permission_push_tests {
                     "rawInput": { "command": "npm test" }
                 }),
                 options: vec![],
+                queued: 0,
             },
         }
     }
@@ -808,6 +809,7 @@ mod permission_push_tests {
                 request_id: "req".into(),
                 tool_call: serde_json::json!({ "title": title, "rawInput": raw }),
                 options: vec![],
+                queued: 0,
             },
         };
 

@@ -168,6 +168,7 @@ pub(crate) fn is_flush_sensitive(event: &AcpEvent) -> bool {
     match event {
         AcpEvent::TurnAttemptRollback { .. }
         | AcpEvent::PermissionRequest { .. }
+        | AcpEvent::PermissionQueueDepth { .. }
         | AcpEvent::QuestionRequest { .. }
         | AcpEvent::TurnComplete { .. }
         | AcpEvent::Error { .. }
@@ -913,6 +914,7 @@ mod tests {
                 request_id: "permission-1".into(),
                 tool_call: serde_json::json!({}),
                 options: vec![],
+                queued: 0,
             },
             1,
         )
@@ -1281,6 +1283,13 @@ mod tests {
             },
             1,
         )
+    }
+
+    #[test]
+    fn permission_queue_depth_is_flush_sensitive() {
+        assert!(is_flush_sensitive(&AcpEvent::PermissionQueueDepth {
+            depth: 2,
+        }));
     }
 
     #[test]

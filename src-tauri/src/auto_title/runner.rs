@@ -1167,6 +1167,7 @@ mod tests {
                                     request_id: "p1".into(),
                                     tool_call: serde_json::json!({}),
                                     options: vec![],
+                                    queued: 0,
                                 })
                                 .await;
                         }

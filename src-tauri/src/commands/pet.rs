@@ -728,6 +728,7 @@ mod tests {
                 tool_call: serde_json::json!({ "title": "rm -rf /tmp/x" }),
                 options: vec![],
                 created_at: chrono::Utc::now(),
+                queued: 0,
             });
         }
 

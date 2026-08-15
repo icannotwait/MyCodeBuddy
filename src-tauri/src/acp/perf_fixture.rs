@@ -205,6 +205,7 @@ fn permission_request() -> AcpEvent {
             "title": "Synthetic permission",
         }),
         options: vec![],
+        queued: 0,
     }
 }
 

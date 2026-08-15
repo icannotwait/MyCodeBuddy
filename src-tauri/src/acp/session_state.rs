@@ -248,6 +248,8 @@ pub struct PendingPermissionState {
     pub tool_call: serde_json::Value,
     pub options: Vec<crate::acp::types::PermissionOptionInfo>,
     pub created_at: DateTime<Utc>,
+    #[serde(default)]
+    pub queued: u32,
 }
 
 /// 上下文 / 模型用量。
@@ -1016,6 +1018,7 @@ impl SessionState {
                 request_id,
                 tool_call,
                 options,
+                queued,
             } => {
                 let tc_id = extract_tool_call_id(tool_call);
                 self.pending_permission = Some(PendingPermissionState {
@@ -1024,9 +1027,15 @@ impl SessionState {
                     tool_call: tool_call.clone(),
                     options: options.clone(),
                     created_at: Utc::now(),
+                    queued: *queued,
                 });
                 // Waiting-input observation changes — wake soft supervisor.
                 self.supervisor_wake.notify();
+            }
+            AcpEvent::PermissionQueueDepth { depth } => {
+                if let Some(pending) = self.pending_permission.as_mut() {
+                    pending.queued = *depth;
+                }
             }
             AcpEvent::PermissionResolved { request_id } => {
                 // Drop the snapshot's pending_permission iff the resolved
@@ -3668,6 +3677,7 @@ mod tests {
             request_id: "p-1".into(),
             tool_call: serde_json::json!({"toolCallId": "tc-1", "title": "danger"}),
             options: vec![],
+            queued: 0,
         });
         assert!(s.live_message.is_some());
         assert!(s.pending_permission.is_some());
@@ -4268,6 +4278,7 @@ mod tests {
             request_id: "p-1".into(),
             tool_call: serde_json::json!({"toolCallId": "tc-1"}),
             options: vec![],
+            queued: 0,
         });
         assert!(s.pending_permission.is_some());
 
@@ -4277,6 +4288,33 @@ mod tests {
         assert!(
             s.pending_permission.is_none(),
             "matching PermissionResolved must clear the pending permission"
+        );
+    }
+
+    #[test]
+    fn permission_queue_depth_updates_only_the_visible_request() {
+        let mut s = fresh_state();
+        s.apply_event(&AcpEvent::PermissionRequest {
+            request_id: "p-visible".into(),
+            tool_call: serde_json::json!({"toolCallId": "tc-visible"}),
+            options: vec![],
+            queued: 0,
+        });
+        s.apply_event(&AcpEvent::PermissionQueueDepth { depth: 2 });
+
+        let pending = s.pending_permission.as_ref().expect("visible request");
+        assert_eq!(pending.request_id, "p-visible");
+        assert_eq!(pending.queued, 2);
+
+        s.apply_event(&AcpEvent::PermissionResolved {
+            request_id: "p-stale".into(),
+        });
+        assert_eq!(
+            s.pending_permission
+                .as_ref()
+                .expect("stale resolution is ignored")
+                .request_id,
+            "p-visible"
         );
     }
 
@@ -4291,6 +4329,7 @@ mod tests {
             request_id: "p-2".into(),
             tool_call: serde_json::json!({"toolCallId": "tc-2"}),
             options: vec![],
+            queued: 0,
         });
 
         s.apply_event(&AcpEvent::PermissionResolved {
@@ -4322,6 +4361,7 @@ mod tests {
             request_id: "p-1".into(),
             tool_call: raw_tool_call.clone(),
             options: vec![],
+            queued: 0,
         });
         let p = s.pending_permission.as_ref().expect("permission set");
         assert_eq!(p.request_id, "p-1");

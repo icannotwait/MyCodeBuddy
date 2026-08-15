@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -2039,8 +2039,12 @@ enum PendingPermission {
     },
 }
 
-impl PendingPermission {
-    /// Resolve with the user's chosen option id.
+trait PermissionResponder {
+    fn respond_selected(self, option_id: String);
+    fn respond_cancelled(self);
+}
+
+impl PermissionResponder for PendingPermission {
     fn respond_selected(self, option_id: String) {
         match self {
             PendingPermission::Acp(responder) => {
@@ -2060,8 +2064,6 @@ impl PendingPermission {
         }
     }
 
-    /// Resolve as cancelled — the turn ended / connection tore down before the
-    /// user chose.
     fn respond_cancelled(self) {
         match self {
             PendingPermission::Acp(responder) => {
@@ -2079,8 +2081,220 @@ impl PendingPermission {
     }
 }
 
-/// Shared state for pending permission responders.
-type PendingPermissions = Arc<tokio::sync::Mutex<HashMap<String, PendingPermission>>>;
+struct QueuedPermission {
+    request_id: String,
+    tool_call: serde_json::Value,
+    options: Vec<PermissionOptionInfo>,
+}
+
+struct ResolvedPermission {
+    answered: bool,
+    next: Option<QueuedPermission>,
+}
+
+/// Responder ownership and the single visible-card projection share one lock.
+/// Lock order is permission queue first, then `SessionState`; emit helpers below
+/// intentionally publish while holding this queue lock.
+struct PermissionQueue<R = PendingPermission> {
+    responders: HashMap<String, R>,
+    showing: Option<String>,
+    waiting: VecDeque<QueuedPermission>,
+}
+
+impl<R> Default for PermissionQueue<R> {
+    fn default() -> Self {
+        Self {
+            responders: HashMap::new(),
+            showing: None,
+            waiting: VecDeque::new(),
+        }
+    }
+}
+
+impl<R: PermissionResponder> PermissionQueue<R> {
+    fn admit(&mut self, responder: R, card: QueuedPermission) -> Option<QueuedPermission> {
+        self.responders.insert(card.request_id.clone(), responder);
+        if self.showing.is_none() {
+            self.showing = Some(card.request_id.clone());
+            Some(card)
+        } else {
+            self.waiting.push_back(card);
+            None
+        }
+    }
+
+    fn resolve(&mut self, request_id: &str, option_id: String) -> ResolvedPermission {
+        let Some(pending) = self.responders.remove(request_id) else {
+            return ResolvedPermission {
+                answered: false,
+                next: None,
+            };
+        };
+        pending.respond_selected(option_id);
+        if self.showing.as_deref() == Some(request_id) {
+            let next = self.waiting.pop_front();
+            self.showing = next.as_ref().map(|card| card.request_id.clone());
+            ResolvedPermission {
+                answered: true,
+                next,
+            }
+        } else {
+            self.waiting.retain(|card| card.request_id != request_id);
+            ResolvedPermission {
+                answered: true,
+                next: None,
+            }
+        }
+    }
+
+    fn drain(&mut self) -> Option<String> {
+        for (_, pending) in self.responders.drain() {
+            pending.respond_cancelled();
+        }
+        self.waiting.clear();
+        self.showing.take()
+    }
+
+    fn waiting_len(&self) -> usize {
+        self.waiting.len()
+    }
+}
+
+type PendingPermissions = Arc<tokio::sync::Mutex<PermissionQueue>>;
+
+async fn permission_log_scope(state: &Arc<RwLock<SessionState>>) -> String {
+    let state = state.read().await;
+    match state.conversation_id {
+        Some(conversation_id) => {
+            format!("conn={} conv={conversation_id}", state.connection_id)
+        }
+        None => format!("conn={} conv=-", state.connection_id),
+    }
+}
+
+async fn admit_permission(
+    perms: &PendingPermissions,
+    state: &Arc<RwLock<SessionState>>,
+    emitter: &EventEmitter,
+    responder: PendingPermission,
+    card: QueuedPermission,
+) {
+    // Keeping admission and publication in one critical section prevents a
+    // concurrent drain from leaving a visible card with no live responder.
+    let mut queue = perms.lock().await;
+    let scope = permission_log_scope(state).await;
+    let request_id = card.request_id.clone();
+    match queue.admit(responder, card) {
+        Some(card) => {
+            tracing::info!(
+                "[ACP] permission {} shown {scope} (waiting={})",
+                card.request_id,
+                queue.waiting_len()
+            );
+            emit_with_state(
+                state,
+                emitter,
+                AcpEvent::PermissionRequest {
+                    request_id: card.request_id,
+                    tool_call: card.tool_call,
+                    options: card.options,
+                    queued: 0,
+                },
+            )
+            .await;
+            tool_watchdog_pause_permission(state, emitter).await;
+        }
+        None => {
+            let depth = queue.waiting_len();
+            tracing::info!(
+                "[ACP] permission {request_id} queued {scope} behind {:?} (waiting={depth})",
+                queue.showing
+            );
+            emit_with_state(
+                state,
+                emitter,
+                AcpEvent::PermissionQueueDepth {
+                    depth: depth as u32,
+                },
+            )
+            .await;
+        }
+    }
+}
+
+async fn resolve_permission(
+    perms: &PendingPermissions,
+    state: &Arc<RwLock<SessionState>>,
+    emitter: &EventEmitter,
+    request_id: String,
+    option_id: String,
+) {
+    let mut queue = perms.lock().await;
+    let resolved = queue.resolve(&request_id, option_id);
+    if !resolved.answered {
+        return;
+    }
+    let scope = permission_log_scope(state).await;
+    tracing::info!("[ACP] permission {request_id} answered {scope}");
+    if let Some(card) = resolved.next {
+        let depth = queue.waiting_len();
+        tracing::info!(
+            "[ACP] permission {} promoted {scope} after {request_id} (waiting={depth})",
+            card.request_id
+        );
+        emit_with_state(
+            state,
+            emitter,
+            AcpEvent::PermissionRequest {
+                request_id: card.request_id,
+                tool_call: card.tool_call,
+                options: card.options,
+                queued: depth as u32,
+            },
+        )
+        .await;
+    }
+    // Promotion precedes resolution. Both reducers clear by request id, so the
+    // trailing old-id resolution cannot erase the newly promoted card.
+    emit_with_state(state, emitter, AcpEvent::PermissionResolved { request_id }).await;
+    if queue.showing.is_none() {
+        tool_watchdog_resume(state).await;
+    }
+}
+
+async fn drain_permissions(
+    perms: &PendingPermissions,
+    state: &Arc<RwLock<SessionState>>,
+    emitter: &EventEmitter,
+) {
+    let mut queue = perms.lock().await;
+    drain_permissions_locked(&mut queue, state, emitter).await;
+}
+
+async fn drain_permissions_then_emit(
+    perms: &PendingPermissions,
+    state: &Arc<RwLock<SessionState>>,
+    emitter: &EventEmitter,
+    follow_up: AcpEvent,
+) {
+    // `TurnComplete` clears the visible snapshot slot. Holding the queue lock
+    // through both events prevents an admission from landing in between.
+    let mut queue = perms.lock().await;
+    drain_permissions_locked(&mut queue, state, emitter).await;
+    emit_with_state(state, emitter, follow_up).await;
+}
+
+async fn drain_permissions_locked(
+    queue: &mut PermissionQueue,
+    state: &Arc<RwLock<SessionState>>,
+    emitter: &EventEmitter,
+) {
+    if let Some(request_id) = queue.drain() {
+        tracing::info!("[ACP] permission {request_id} cancelled by drain");
+        emit_with_state(state, emitter, AcpEvent::PermissionResolved { request_id }).await;
+    }
+    tool_watchdog_resume(state).await;
+}
 
 fn map_session_modes(mode_state: &SessionModeState) -> SessionModeStateInfo {
     SessionModeStateInfo {
@@ -4579,7 +4793,8 @@ async fn run_connection(
     let evidence_connection_id = connection_id.clone();
     // Shared so nested session paths can complete bootstrap exactly once.
     let route_bootstrap_tx = Arc::new(tokio::sync::Mutex::new(Some(route_bootstrap_tx)));
-    let pending_perms: PendingPermissions = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let pending_perms: PendingPermissions =
+        Arc::new(tokio::sync::Mutex::new(PermissionQueue::default()));
     // `terminal_base_env` already filtered to just the credential helper
     // keys upstream — see `spawn_agent_connection` for the rationale and
     // why we don't forward the full agent runtime_env here.
@@ -5989,6 +6204,9 @@ async fn run_connection(
             }
         }})
         .await;
+    // Connection teardown is the final backstop for prompt failures, process
+    // exits, and bootstrap paths that never reached the conversation loop.
+    drain_permissions(&pending_perms, &state, &emitter).await;
     match connect_with_result {
         Ok(()) => Ok(()),
         Err(e) => {
@@ -6385,17 +6603,15 @@ async fn handle_elicitation_request(
                     kind: o.kind.to_string(),
                 })
                 .collect();
-            perms.lock().await.insert(
-                request_id.clone(),
+            admit_permission(
+                perms,
+                state,
+                emitter,
                 PendingPermission::CodexElicitation {
                     responder,
                     approval,
                 },
-            );
-            emit_with_state(
-                state,
-                emitter,
-                AcpEvent::PermissionRequest {
+                QueuedPermission {
                     request_id,
                     tool_call,
                     options,
@@ -6532,6 +6748,7 @@ async fn handle_permission_request(
                 request_id,
                 tool_call: serde_json::to_value(&req.tool_call).unwrap_or_default(),
                 options: vec![],
+                queued: 0,
             },
         )
         .await;
@@ -6588,47 +6805,18 @@ async fn handle_permission_request(
         }
     }
 
-    perms
-        .lock()
-        .await
-        .insert(request_id.clone(), PendingPermission::Acp(responder));
-
-    emit_with_state(
+    admit_permission(
+        perms,
         state,
         emitter,
-        AcpEvent::PermissionRequest {
+        PendingPermission::Acp(responder),
+        QueuedPermission {
             request_id,
             tool_call: tool_call_value,
             options,
         },
     )
     .await;
-    tool_watchdog_pause_permission(state, emitter).await;
-}
-
-async fn emit_cancelled_permission_events(
-    state: &Arc<RwLock<SessionState>>,
-    emitter: &EventEmitter,
-    request_ids: impl IntoIterator<Item = String>,
-) {
-    for request_id in request_ids {
-        emit_with_state(state, emitter, AcpEvent::PermissionResolved { request_id }).await;
-    }
-    tool_watchdog_resume(state).await;
-}
-
-async fn cancel_pending_permissions(
-    state: &Arc<RwLock<SessionState>>,
-    emitter: &EventEmitter,
-    perms: &PendingPermissions,
-) {
-    let drained = perms.lock().await.drain().collect::<Vec<_>>();
-    let mut request_ids = Vec::with_capacity(drained.len());
-    for (request_id, responder) in drained {
-        responder.respond_cancelled();
-        request_ids.push(request_id);
-    }
-    emit_cancelled_permission_events(state, emitter, request_ids).await;
 }
 
 fn refuse_unadvertised_channel<T: sacp::JsonRpcResponse>(
@@ -7977,6 +8165,10 @@ async fn handle_fork_or_exit(
         Err(e) => return Err(e),
     };
 
+    // A fork switches the active session on this connection. No permission
+    // responder from the old session may survive into the forked one.
+    drain_permissions(perms, state, emitter).await;
+
     let cx = fork_info.connection;
     let fork_resp = fork_info.fork_response;
     let fork_models_raw = fork_info.fork_models_raw;
@@ -8435,6 +8627,37 @@ async fn finalize_turn_terminal(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn finalize_turn_terminal_with_permissions(
+    source: TurnTerminalSource<'_>,
+    suspension: &mut Option<SuspensionLease>,
+    state: &Arc<RwLock<SessionState>>,
+    emitter: &EventEmitter,
+    connection_id: &str,
+    session_id: &str,
+    agent_type: AgentType,
+    mark_awaiting_reply: bool,
+    broker: Option<&crate::acp::delegation::broker::DelegationBroker>,
+    perms: &PendingPermissions,
+) -> TurnFinalizationDisposition {
+    // All terminal paths funnel through this wrapper so queue drain and any
+    // `TurnComplete` emitted by finalization are atomic against admission.
+    let mut queue = perms.lock().await;
+    drain_permissions_locked(&mut queue, state, emitter).await;
+    finalize_turn_terminal(
+        source,
+        suspension,
+        state,
+        emitter,
+        connection_id,
+        session_id,
+        agent_type,
+        mark_awaiting_reply,
+        broker,
+    )
+    .await
+}
+
 type AncillaryCommandFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 
 enum ConversationInput {
@@ -8735,12 +8958,11 @@ async fn finalize_bound_prompt_response(
     );
     if reason_str == "cancelled" && suspension.is_some() {
         tracked_terminal_tool_calls.clear();
-        cancel_pending_permissions(state, emitter, perms).await;
         terminal_runtime
             .release_all_for_session(sid.0.as_ref())
             .await;
     }
-    let disposition = finalize_turn_terminal(
+    let disposition = finalize_turn_terminal_with_permissions(
         TurnTerminalSource::Upstream(reason_str),
         suspension,
         state,
@@ -8750,6 +8972,7 @@ async fn finalize_bound_prompt_response(
         agent_type,
         mark_awaiting_reply,
         broker,
+        perms,
     )
     .await;
     let status_restored_by_suspension = matches!(
@@ -8788,7 +9011,7 @@ async fn finalize_active_user_cancel(
     delegation_injection: Option<&DelegationInjection>,
 ) {
     let _ = cx.send_notification_to(Agent, CancelNotification::new(sid.clone()));
-    let _ = finalize_turn_terminal(
+    let _ = finalize_turn_terminal_with_permissions(
         TurnTerminalSource::UserCancel,
         suspension,
         state,
@@ -8798,10 +9021,10 @@ async fn finalize_active_user_cancel(
         agent_type,
         mark_awaiting_reply,
         None,
+        perms,
     )
     .await;
     tracked_terminal_tool_calls.clear();
-    cancel_pending_permissions(state, emitter, perms).await;
     terminal_runtime
         .release_all_for_session(sid.0.as_ref())
         .await;
@@ -8891,7 +9114,8 @@ async fn finalize_active_watchdog_cancel(
     // acknowledged background children survive multi-task wait timeout.
     // Watchdog is never user_stop — clear fence id and leave optional fields absent.
     state.write().await.active_provider_turn_id = None;
-    emit_with_state(
+    drain_permissions_then_emit(
+        perms,
         state,
         emitter,
         AcpEvent::TurnComplete {
@@ -8912,7 +9136,6 @@ async fn finalize_active_watchdog_cancel(
         "[ACP] watchdog turn cancel finalized (no parent-tree cascade)"
     );
     tracked_terminal_tool_calls.clear();
-    cancel_pending_permissions(state, emitter, perms).await;
     terminal_runtime
         .release_all_for_session(sid.0.as_ref())
         .await;
@@ -8934,7 +9157,7 @@ async fn finalize_active_disconnect(
         reject_suspension_lease(&mut lease, "suspend_parent_disconnected");
     }
     tracked_terminal_tool_calls.clear();
-    cancel_pending_permissions(state, emitter, perms).await;
+    drain_permissions(perms, state, emitter).await;
     terminal_runtime
         .release_all_for_session(sid.0.as_ref())
         .await;
@@ -9764,7 +9987,7 @@ async fn run_conversation_loop<'a>(
                                     .parent_connection_exit_causes
                                     .record_suspension_drain_timeout(conn_id);
                             }
-                            let _ = finalize_turn_terminal(
+                            let _ = finalize_turn_terminal_with_permissions(
                                 TurnTerminalSource::SuspensionDrainTimeout,
                                 &mut suspension,
                                 state,
@@ -9774,6 +9997,7 @@ async fn run_conversation_loop<'a>(
                                 agent_type,
                                 mark_awaiting_reply,
                                 delegation_injection.map(|injection| injection.broker.as_ref()),
+                                perms,
                             )
                             .await;
                             disconnect_requested = true;
@@ -9980,18 +10204,14 @@ async fn run_conversation_loop<'a>(
                                             request_id,
                                             option_id,
                                         }) => {
-                                            if let Some(responder) =
-                                                perms.lock().await.remove(&request_id)
-                                            {
-                                                responder.respond_selected(option_id);
-                                                emit_with_state(
-                                                    state,
-                                                    emitter,
-                                                    AcpEvent::PermissionResolved { request_id },
-                                                )
-                                                .await;
-                                                tool_watchdog_resume(state).await;
-                                            }
+                                            resolve_permission(
+                                                perms,
+                                                state,
+                                                emitter,
+                                                request_id,
+                                                option_id,
+                                            )
+                                            .await;
                                         }
                                         Err(ConnectionCommand::Fork { reply }) => {
                                             let _ = reply.send(Err(AcpError::TurnInProgress));
@@ -10178,7 +10398,7 @@ async fn run_conversation_loop<'a>(
                                             current_session_model_id(state).await,
                                         )
                                         .await;
-                                        let _ = finalize_turn_terminal(
+                                        let _ = finalize_turn_terminal_with_permissions(
                                             TurnTerminalSource::Upstream(&reason_str),
                                             &mut suspension,
                                             state,
@@ -10188,6 +10408,7 @@ async fn run_conversation_loop<'a>(
                                             agent_type,
                                             mark_awaiting_reply,
                                             delegation_injection.map(|injection| injection.broker.as_ref()),
+                                            perms,
                                         )
                                         .await;
                                         tracing::info!(
@@ -10402,7 +10623,7 @@ async fn run_conversation_loop<'a>(
                                         source = "stop_reason_message",
                                         "[ACP] completing turn from SessionMessage::StopReason"
                                     );
-                                    let _ = finalize_turn_terminal(
+                                    let _ = finalize_turn_terminal_with_permissions(
                                         TurnTerminalSource::Upstream(reason_str),
                                         &mut suspension,
                                         state,
@@ -10412,6 +10633,7 @@ async fn run_conversation_loop<'a>(
                                         agent_type,
                                         mark_awaiting_reply,
                                         delegation_injection.map(|injection| injection.broker.as_ref()),
+                                        perms,
                                     )
                                     .await;
                                     tracing::info!(
@@ -10503,12 +10725,7 @@ async fn run_conversation_loop<'a>(
                 request_id,
                 option_id,
             }) => {
-                if let Some(pending) = perms.lock().await.remove(&request_id) {
-                    pending.respond_selected(option_id);
-                    emit_with_state(state, emitter, AcpEvent::PermissionResolved { request_id })
-                        .await;
-                    tool_watchdog_resume(state).await;
-                }
+                resolve_permission(perms, state, emitter, request_id, option_id).await;
             }
             ConversationInput::Command(ConnectionCommand::SetMode { .. })
             | ConversationInput::Command(ConnectionCommand::SetConfigOption { .. }) => {
@@ -10553,7 +10770,7 @@ async fn run_conversation_loop<'a>(
                 let cx = session.connection();
                 let sid = session.session_id().clone();
                 let _ = cx.send_notification_to(Agent, CancelNotification::new(sid.clone()));
-                cancel_pending_permissions(state, emitter, perms).await;
+                drain_permissions(perms, state, emitter).await;
                 terminal_runtime
                     .release_all_for_session(sid.0.as_ref())
                     .await;
@@ -12983,6 +13200,136 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::sync::Arc;
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    enum StubPermissionOutcome {
+        Selected,
+        Cancelled,
+    }
+
+    struct StubPermissionResponder {
+        request_id: String,
+        log: Arc<std::sync::Mutex<Vec<(String, StubPermissionOutcome)>>>,
+    }
+
+    impl PermissionResponder for StubPermissionResponder {
+        fn respond_selected(self, _option_id: String) {
+            self.log
+                .lock()
+                .unwrap()
+                .push((self.request_id, StubPermissionOutcome::Selected));
+        }
+
+        fn respond_cancelled(self) {
+            self.log
+                .lock()
+                .unwrap()
+                .push((self.request_id, StubPermissionOutcome::Cancelled));
+        }
+    }
+
+    type StubPermissionLog = Arc<std::sync::Mutex<Vec<(String, StubPermissionOutcome)>>>;
+
+    fn admit_stub_permission(
+        queue: &mut PermissionQueue<StubPermissionResponder>,
+        log: &StubPermissionLog,
+        request_id: &str,
+    ) -> Option<QueuedPermission> {
+        queue.admit(
+            StubPermissionResponder {
+                request_id: request_id.to_string(),
+                log: Arc::clone(log),
+            },
+            QueuedPermission {
+                request_id: request_id.to_string(),
+                tool_call: serde_json::json!({"toolCallId": request_id}),
+                options: Vec::new(),
+            },
+        )
+    }
+
+    fn stub_permission_queue() -> (PermissionQueue<StubPermissionResponder>, StubPermissionLog) {
+        (
+            PermissionQueue::default(),
+            Arc::new(std::sync::Mutex::new(Vec::new())),
+        )
+    }
+
+    #[test]
+    fn permission_queue_promotes_three_requests_in_fifo_order() {
+        let (mut queue, log) = stub_permission_queue();
+        assert_eq!(
+            admit_stub_permission(&mut queue, &log, "a")
+                .expect("first request is visible")
+                .request_id,
+            "a"
+        );
+        assert!(admit_stub_permission(&mut queue, &log, "b").is_none());
+        assert!(admit_stub_permission(&mut queue, &log, "c").is_none());
+        assert_eq!(queue.waiting_len(), 2);
+
+        assert_eq!(
+            queue
+                .resolve("a", "allow".into())
+                .next
+                .expect("b promoted")
+                .request_id,
+            "b"
+        );
+        assert_eq!(
+            queue
+                .resolve("b", "allow".into())
+                .next
+                .expect("c promoted")
+                .request_id,
+            "c"
+        );
+        assert!(queue.resolve("c", "allow".into()).next.is_none());
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec![
+                ("a".into(), StubPermissionOutcome::Selected),
+                ("b".into(), StubPermissionOutcome::Selected),
+                ("c".into(), StubPermissionOutcome::Selected),
+            ]
+        );
+    }
+
+    #[test]
+    fn permission_queue_ignores_unknown_and_duplicate_resolution() {
+        let (mut queue, log) = stub_permission_queue();
+        admit_stub_permission(&mut queue, &log, "a");
+        admit_stub_permission(&mut queue, &log, "b");
+
+        assert!(!queue.resolve("unknown", "allow".into()).answered);
+        assert_eq!(queue.showing.as_deref(), Some("a"));
+        assert!(queue.resolve("a", "allow".into()).answered);
+        assert!(!queue.resolve("a", "reject".into()).answered);
+        assert_eq!(queue.showing.as_deref(), Some("b"));
+        assert_eq!(log.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn permission_queue_drain_cancels_all_and_reports_visible_request() {
+        let (mut queue, log) = stub_permission_queue();
+        admit_stub_permission(&mut queue, &log, "a");
+        admit_stub_permission(&mut queue, &log, "b");
+        admit_stub_permission(&mut queue, &log, "c");
+
+        assert_eq!(queue.drain().as_deref(), Some("a"));
+        assert_eq!(queue.showing, None);
+        assert_eq!(queue.waiting_len(), 0);
+        let mut outcomes = log.lock().unwrap().clone();
+        outcomes.sort();
+        assert_eq!(
+            outcomes,
+            vec![
+                ("a".into(), StubPermissionOutcome::Cancelled),
+                ("b".into(), StubPermissionOutcome::Cancelled),
+                ("c".into(), StubPermissionOutcome::Cancelled),
+            ]
+        );
+    }
+
     struct SuspensionLoopMockAgent {
         prompts: Arc<std::sync::Mutex<Vec<sacp::Responder<sacp::schema::PromptResponse>>>>,
         modes: Arc<std::sync::Mutex<Vec<sacp::Responder<sacp::schema::SetSessionModeResponse>>>>,
@@ -13214,7 +13561,7 @@ mod tests {
                 let prompt_ledger = background_watch::PromptLedger::shared();
                 let terminal_prompt_context = TerminalPromptContext::new(shell.spec.clone());
                 let pending_perms: PendingPermissions =
-                    Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+                    Arc::new(tokio::sync::Mutex::new(PermissionQueue::default()));
                 let route_plan = native_plan(AgentType::Codex);
 
                 let loop_result = run_conversation_loop(
@@ -16275,37 +16622,6 @@ mod tests {
         assert!(native_meta.contains_key("codeg.dev/terminal"));
     }
 
-    #[tokio::test]
-    async fn cancelled_permission_ids_emit_resolution_events() {
-        let state = Arc::new(RwLock::new(SessionState::new(
-            "conn-permissions".to_string(),
-            AgentType::ClaudeCode,
-            None,
-            "win".to_string(),
-            None,
-        )));
-        let emitter = EventEmitter::Noop;
-
-        emit_cancelled_permission_events(
-            &state,
-            &emitter,
-            vec!["p-1".to_string(), "p-2".to_string()],
-        )
-        .await;
-
-        let guard = state.read().await;
-        let resolved = guard
-            .recent_events_after(0)
-            .expect("events recorded")
-            .iter()
-            .filter_map(|event| match &event.payload {
-                AcpEvent::PermissionResolved { request_id } => Some(request_id.clone()),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(resolved, vec!["p-1", "p-2"]);
-    }
-
     /// Mirrors the connection-loop prompt path: ledger/UI use original user
     /// blocks; only the wire `ContentBlock` list receives `append_once`.
     #[test]
@@ -17934,7 +18250,8 @@ mod tests {
                 let sid = SessionId::new("session-1".to_string());
                 let mut suspension = None;
                 let mut tracked = HashMap::new();
-                let perms: PendingPermissions = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+                let perms: PendingPermissions =
+                    Arc::new(tokio::sync::Mutex::new(PermissionQueue::default()));
                 finalize_active_user_cancel(
                     &cx,
                     &sid,
@@ -18012,6 +18329,7 @@ mod tests {
                 request_id: "permission-1".into(),
                 tool_call: serde_json::json!({"toolCallId": "tool-1"}),
                 options: Vec::new(),
+                queued: 0,
             },
         )
         .await;
@@ -18051,7 +18369,8 @@ mod tests {
                 let mut suspension = None;
                 let mut tracked =
                     HashMap::from([("tool-1".to_string(), TrackedTerminalToolCall::default())]);
-                let perms: PendingPermissions = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+                let perms: PendingPermissions =
+                    Arc::new(tokio::sync::Mutex::new(PermissionQueue::default()));
                 finalize_active_user_cancel(
                     &cx,
                     &sid,
@@ -18143,7 +18462,8 @@ mod tests {
             .connect_with(mock_agent, async move |cx| {
                 let mut suspension = None;
                 let mut tracked = HashMap::new();
-                let perms: PendingPermissions = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+                let perms: PendingPermissions =
+                    Arc::new(tokio::sync::Mutex::new(PermissionQueue::default()));
                 finalize_active_user_cancel(
                     &cx,
                     &sid,
@@ -18248,7 +18568,8 @@ mod tests {
                 let sid = SessionId::new("session-1".to_string());
                 let mut suspension = None;
                 let mut tracked = HashMap::new();
-                let perms: PendingPermissions = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+                let perms: PendingPermissions =
+                    Arc::new(tokio::sync::Mutex::new(PermissionQueue::default()));
                 let terminal_runtime = Arc::new(TerminalRuntime::new(
                     BTreeMap::new(),
                     test_placeholder_terminal_shell().spec,

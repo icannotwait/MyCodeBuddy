@@ -5375,6 +5375,7 @@ mod tests {
                 request_id: request_id.into(),
                 tool_call: serde_json::json!({}),
                 options: vec![],
+                queued: 0,
             },
         )
     }
@@ -5506,6 +5507,7 @@ mod tests {
                 tool_call: serde_json::json!({}),
                 options: vec![],
                 created_at: chrono::Utc::now(),
+                queued: 0,
             });
         }
         engine

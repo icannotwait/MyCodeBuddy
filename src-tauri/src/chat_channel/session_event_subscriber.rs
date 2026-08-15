@@ -413,6 +413,7 @@ async fn handle_acp_envelope(
             request_id,
             tool_call,
             options,
+            ..
         } => {
             let mut guard = bridge.lock().await;
             if let Some(session) = guard.get_mut(connection_id) {

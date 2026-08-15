@@ -132,7 +132,11 @@ pub enum AcpEvent {
         request_id: String,
         tool_call: serde_json::Value,
         options: Vec<PermissionOptionInfo>,
+        #[serde(default)]
+        queued: u32,
     },
+    /// Queue depth changed while the currently visible permission stayed put.
+    PermissionQueueDepth { depth: u32 },
     /// User responded to (or the connection drained) a previously-pending
     /// permission request. The responder.respond() side of the SACP exchange
     /// is RPC-only, so without this event downstream consumers (pet snapshot,

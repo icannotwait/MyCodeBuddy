@@ -9763,6 +9763,7 @@ mod tests {
             tool_call: serde_json::json!({}),
             options: vec![],
             created_at: now,
+            queued: 0,
         });
         assert!(
             !is_idle_for_residual(&state, now),
@@ -9808,6 +9809,7 @@ mod tests {
                 tool_call: serde_json::json!({ "toolCallId": "tc-1" }),
                 options: vec![],
                 created_at: chrono::Utc::now(),
+                queued: 0,
             });
         }
         {
@@ -14350,6 +14352,7 @@ mod tests {
                 tool_call: serde_json::json!({ "toolCallId": "tc-1", "title": "test" }),
                 options: vec![],
                 created_at: chrono::Utc::now(),
+                queued: 0,
             });
         }
         let n = mgr.sweep_idle(Duration::from_secs(300)).await;
