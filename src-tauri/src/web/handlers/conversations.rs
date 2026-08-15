@@ -133,6 +133,12 @@ pub async fn get_conversation(
 #[serde(rename_all = "camelCase")]
 pub struct GetFolderConversationParams {
     pub conversation_id: i32,
+    /// Last N turns, aligned to a user-round boundary.
+    #[serde(default)]
+    pub tail_turns: Option<usize>,
+    /// Exact absolute turn offset for a refresh.
+    #[serde(default)]
+    pub from_index: Option<usize>,
     /// `None` / omitted → full history. `Some(0)` → full.
     /// `Some(n>0)` → last n user turns (+ intervening assistant turns).
     #[serde(default)]
@@ -147,6 +153,12 @@ pub async fn get_folder_conversation(
     Json(params): Json<GetFolderConversationParams>,
 ) -> Result<Json<DbConversationDetail>, AppCommandError> {
     let db = &state.db;
+    let window = conv_commands::resolve_conversation_window(
+        params.tail_turns,
+        params.from_index,
+        params.history_user_turn_limit,
+        params.history_before_turn_id,
+    )?;
     let result = conv_commands::get_folder_conversation_with_live_core(
         &db.conn,
         &state.connection_manager,
@@ -154,13 +166,34 @@ pub async fn get_folder_conversation(
         &state.emitter,
         state.internal_sessions.as_ref(),
         params.conversation_id,
-        crate::commands::history_window::HistoryLoadOpts {
-            user_turn_limit: params.history_user_turn_limit,
-            before_turn_id: params.history_before_turn_id,
-        },
+        window,
     )
     .await?;
     Ok(Json(result))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetFolderConversationTurnsParams {
+    pub conversation_id: i32,
+    pub before_index: usize,
+    pub limit: usize,
+}
+
+pub async fn get_folder_conversation_turns(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<GetFolderConversationTurnsParams>,
+) -> Result<Json<ConversationTurnsPage>, AppCommandError> {
+    Ok(Json(
+        conv_commands::get_folder_conversation_turns_core(
+            &state.db.conn,
+            state.internal_sessions.as_ref(),
+            params.conversation_id,
+            params.before_index,
+            params.limit,
+        )
+        .await?,
+    ))
 }
 
 pub async fn list_folders(

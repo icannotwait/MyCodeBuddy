@@ -176,6 +176,22 @@ pub struct DbConversationDetail {
     /// `has_more_before` to offer "load older" and keep scrollback expandable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history_window: Option<HistoryWindowInfo>,
+    /// Absolute-index window metadata. These fields are populated together
+    /// only for `tailTurns` / `fromIndex` requests; their absence identifies a
+    /// legacy full response or the separate user-turn window contract above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turns_offset: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turns_total: Option<usize>,
+    /// Assistant turns in `full[0..turns_offset)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assistant_turns_before_offset: Option<usize>,
+    /// Structural fingerprint of `full[0..turns_offset)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix_hash: Option<String>,
+    /// Maximum timestamp in the uncovered prefix, absent at offset zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uncovered_prefix_max_ts: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

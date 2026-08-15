@@ -1617,6 +1617,11 @@ pub async fn get_folder_conversation_core(
             continuation_failure,
             workflow_graph,
             history_window: None,
+            turns_offset: None,
+            turns_total: None,
+            assistant_turns_before_offset: None,
+            prefix_hash: None,
+            uncovered_prefix_max_ts: None,
         },
         parsed_title,
     ))
@@ -1772,6 +1777,71 @@ fn apply_in_flight_message_id(
     None
 }
 
+/// Validated union of the fork's user-turn window and upstream's absolute
+/// turn-index window. Only one coordinate family may be active per request.
+#[derive(Debug, Clone)]
+pub struct ConversationWindowRequest {
+    pub history: crate::commands::history_window::HistoryLoadOpts,
+    pub index: Option<crate::commands::turn_window::TurnWindowReq>,
+}
+
+/// Resolve both transport parameter families without silently preferring one.
+/// A mixed request is ambiguous and therefore rejected at the command boundary.
+pub fn resolve_conversation_window(
+    tail_turns: Option<usize>,
+    from_index: Option<usize>,
+    history_user_turn_limit: Option<u32>,
+    history_before_turn_id: Option<String>,
+) -> Result<ConversationWindowRequest, AppCommandError> {
+    use crate::commands::turn_window::TurnWindowReq;
+
+    if tail_turns.is_some() && from_index.is_some() {
+        return Err(AppCommandError::invalid_input(
+            "tailTurns and fromIndex are mutually exclusive",
+        ));
+    }
+
+    let has_index_window = tail_turns.is_some() || from_index.is_some();
+    let has_history_window = history_user_turn_limit.is_some() || history_before_turn_id.is_some();
+    if has_index_window && has_history_window {
+        return Err(AppCommandError::invalid_input(
+            "index and user-turn history windows are mutually exclusive",
+        ));
+    }
+
+    let index = match (tail_turns, from_index) {
+        (Some(turns), None) => Some(TurnWindowReq::Tail(turns)),
+        (None, Some(index)) => Some(TurnWindowReq::FromIndex(index)),
+        (None, None) => None,
+        (Some(_), Some(_)) => unreachable!("validated above"),
+    };
+
+    Ok(ConversationWindowRequest {
+        history: crate::commands::history_window::HistoryLoadOpts {
+            user_turn_limit: history_user_turn_limit,
+            before_turn_id: history_before_turn_id,
+        },
+        index,
+    })
+}
+
+/// Slice a fully post-processed detail and stamp absolute-index metadata.
+fn apply_turn_window(
+    detail: &mut DbConversationDetail,
+    req: crate::commands::turn_window::TurnWindowReq,
+) {
+    use crate::commands::turn_window;
+
+    let offset = turn_window::resolve_window_offset(&detail.turns, req);
+    let meta = turn_window::window_meta(&detail.turns, offset);
+    detail.turns.drain(..offset);
+    detail.turns_offset = Some(meta.offset);
+    detail.turns_total = Some(meta.total);
+    detail.assistant_turns_before_offset = Some(meta.assistant_before);
+    detail.prefix_hash = Some(meta.prefix_hash);
+    detail.uncovered_prefix_max_ts = meta.uncovered_prefix_max_ts;
+}
+
 /// `get_folder_conversation_core` plus live in-flight correlation: when a turn is
 /// currently running on the conversation's connection, stamp the persisted
 /// in-flight user turn with the broadcast `message_id` so a cross-client viewer
@@ -1780,10 +1850,8 @@ fn apply_in_flight_message_id(
 /// reply persisted after it mid-stream. A no-op (one cheap lock pass) when no turn
 /// is in flight. Shared by the Tauri command and the web handler.
 ///
-/// `history` optionally clips `detail.turns` to a user-turn window so long
-/// transcripts (multi‑MB JSONL → thousands of fine-grained turns) do not all
-/// ship over IPC / into the frontend store on cold open. See
-/// [`crate::commands::history_window`].
+/// Windowing runs only after delegation projection, auto-title convergence, and
+/// live in-flight correlation have all seen the complete transcript.
 pub async fn get_folder_conversation_with_live_core(
     conn: &sea_orm::DatabaseConnection,
     manager: &crate::acp::manager::ConnectionManager,
@@ -1791,7 +1859,7 @@ pub async fn get_folder_conversation_with_live_core(
     emitter: &EventEmitter,
     registry: &InternalAgentSessionRegistry,
     conversation_id: i32,
-    history: crate::commands::history_window::HistoryLoadOpts,
+    window: ConversationWindowRequest,
 ) -> Result<DbConversationDetail, AppCommandError> {
     let (mut detail, parsed_title) =
         get_folder_conversation_core(conn, registry, conversation_id).await?;
@@ -1836,25 +1904,52 @@ pub async fn get_folder_conversation_with_live_core(
             apply_in_flight_message_id(&mut detail.turns, &pending, started_at);
     }
 
-    // Keep summary.message_count as the full transcript size (set in core).
-    // Window only the turns payload when the client opts in.
-    let wants_window =
-        history.user_turn_limit.is_some_and(|n| n > 0) || history.before_turn_id.is_some();
-    if wants_window {
+    if let Some(index) = window.index {
+        apply_turn_window(&mut detail, index);
+    } else if window.history.user_turn_limit.is_some_and(|n| n > 0)
+        || window.history.before_turn_id.is_some()
+    {
+        // Keep summary.message_count as the full transcript size (set in core).
+        // Window only the turns payload when the client opts in.
         let full_count = detail.turns.len() as u32;
-        // Preserve full count even if core left message_count stale.
         if detail.summary.message_count < full_count {
             detail.summary.message_count = full_count;
         }
         let windowed =
-            crate::commands::history_window::window_message_turns(detail.turns, &history);
+            crate::commands::history_window::window_message_turns(detail.turns, &window.history);
         detail.turns = windowed.turns;
         detail.history_window = Some(windowed.window);
-    } else {
-        detail.history_window = None;
     }
 
     Ok(detail)
+}
+
+/// One page of older absolute-index history. This intentionally skips live
+/// correlation, auto-title writes, and event emission.
+pub async fn get_folder_conversation_turns_core(
+    conn: &sea_orm::DatabaseConnection,
+    registry: &InternalAgentSessionRegistry,
+    conversation_id: i32,
+    before_index: usize,
+    limit: usize,
+) -> Result<ConversationTurnsPage, AppCommandError> {
+    use crate::commands::turn_window;
+
+    let (detail, _parsed_title) =
+        get_folder_conversation_core(conn, registry, conversation_id).await?;
+    let turns = detail.turns;
+    let (start, end) = turn_window::resolve_page_bounds(&turns, before_index, limit);
+    let meta = turn_window::window_meta(&turns, start);
+    let seam = turn_window::window_meta(&turns, before_index.min(turns.len()));
+    Ok(ConversationTurnsPage {
+        turns: turns[start..end].to_vec(),
+        turns_offset: meta.offset,
+        turns_total: meta.total,
+        assistant_turns_before_offset: meta.assistant_before,
+        prefix_hash: meta.prefix_hash,
+        prefix_hash_before_index: seam.prefix_hash,
+        uncovered_prefix_max_ts: meta.uncovered_prefix_max_ts,
+    })
 }
 
 /// Load a folder conversation with optional history windowing.
@@ -1872,9 +1967,17 @@ pub async fn get_folder_conversation(
     registry: tauri::State<'_, std::sync::Arc<InternalAgentSessionRegistry>>,
     chat_channel_manager: tauri::State<'_, crate::chat_channel::manager::ChatChannelManager>,
     conversation_id: i32,
+    tail_turns: Option<usize>,
+    from_index: Option<usize>,
     history_user_turn_limit: Option<u32>,
     history_before_turn_id: Option<String>,
 ) -> Result<DbConversationDetail, AppCommandError> {
+    let window = resolve_conversation_window(
+        tail_turns,
+        from_index,
+        history_user_turn_limit,
+        history_before_turn_id,
+    )?;
     get_folder_conversation_with_live_core(
         &db.conn,
         &manager,
@@ -1882,10 +1985,26 @@ pub async fn get_folder_conversation(
         &EventEmitter::Tauri(app),
         registry.inner().as_ref(),
         conversation_id,
-        crate::commands::history_window::HistoryLoadOpts {
-            user_turn_limit: history_user_turn_limit,
-            before_turn_id: history_before_turn_id,
-        },
+        window,
+    )
+    .await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn get_folder_conversation_turns(
+    db: tauri::State<'_, AppDatabase>,
+    registry: tauri::State<'_, std::sync::Arc<InternalAgentSessionRegistry>>,
+    conversation_id: i32,
+    before_index: usize,
+    limit: usize,
+) -> Result<ConversationTurnsPage, AppCommandError> {
+    get_folder_conversation_turns_core(
+        &db.conn,
+        registry.inner().as_ref(),
+        conversation_id,
+        before_index,
+        limit,
     )
     .await
 }
@@ -6558,6 +6677,117 @@ Call get_delegation_status with the returned task_id to collect the result.";
                 .is_err(),
             "a row FK violation must propagate through the strict importer"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Conversation window compatibility: fork user-turn coordinates and
+    // upstream absolute-index coordinates share one command surface.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn conversation_window_rejects_mixed_coordinate_families() {
+        let cases = [
+            (Some(20), None, Some(40), None),
+            (None, Some(5), Some(40), None),
+            (Some(20), None, None, Some("turn-9".to_string())),
+            (None, Some(5), None, Some("turn-9".to_string())),
+        ];
+
+        for (tail_turns, from_index, history_limit, before_turn_id) in cases {
+            let err =
+                resolve_conversation_window(tail_turns, from_index, history_limit, before_turn_id)
+                    .expect_err("mixed coordinate families must be rejected");
+            assert_eq!(err.code, AppErrorCode::InvalidInput);
+        }
+    }
+
+    #[test]
+    fn conversation_window_rejects_both_index_selectors() {
+        let err = resolve_conversation_window(Some(20), Some(5), None, None)
+            .expect_err("tailTurns and fromIndex are mutually exclusive");
+        assert_eq!(err.code, AppErrorCode::InvalidInput);
+    }
+
+    #[test]
+    fn conversation_window_preserves_legacy_and_user_turn_requests() {
+        let legacy = resolve_conversation_window(None, None, None, None).expect("legacy request");
+        assert!(legacy.index.is_none());
+        assert!(legacy.history.user_turn_limit.is_none());
+        assert!(legacy.history.before_turn_id.is_none());
+
+        let history =
+            resolve_conversation_window(None, None, Some(20), Some("turn-40".to_string()))
+                .expect("user-turn window");
+        assert!(history.index.is_none());
+        assert_eq!(history.history.user_turn_limit, Some(20));
+        assert_eq!(history.history.before_turn_id.as_deref(), Some("turn-40"));
+    }
+
+    #[tokio::test]
+    async fn conversation_window_index_stamps_exact_metadata() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/codeg-conversation-window").await;
+        let conversation_id =
+            create_conversation_core(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
+                .await
+                .expect("create conversation");
+        let data_dir = TempDir::new().expect("tempdir");
+        let registry = inert_internal_session_registry(&db, data_dir.path()).await;
+        let (mut detail, _) =
+            get_folder_conversation_core(&db.conn, registry.as_ref(), conversation_id)
+                .await
+                .expect("load detail");
+        let full = vec![
+            user_text_turn("turn-0", "q1", at(-40)),
+            assistant_text_turn("turn-1", "a1", at(-39), true),
+            user_text_turn("turn-2", "q2", at(-20)),
+            assistant_text_turn("turn-3", "a2", at(-19), true),
+        ];
+        detail.summary.message_count = full.len() as u32;
+        detail.turns = full.clone();
+
+        apply_turn_window(
+            &mut detail,
+            crate::commands::turn_window::TurnWindowReq::FromIndex(3),
+        );
+
+        assert_eq!(detail.turns_offset, Some(3));
+        assert_eq!(detail.turns_total, Some(4));
+        assert_eq!(detail.assistant_turns_before_offset, Some(1));
+        assert_eq!(detail.turns.len(), 1);
+        assert_eq!(detail.turns[0].id, "turn-3");
+        assert_eq!(detail.summary.message_count, 4);
+        assert_eq!(
+            detail.prefix_hash.as_deref(),
+            Some(crate::commands::turn_window::prefix_fingerprint(&full[..3]).as_str())
+        );
+        assert_eq!(detail.uncovered_prefix_max_ts, Some(full[2].timestamp));
+        assert!(detail.history_window.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_folder_conversation_turns_returns_well_formed_empty_page() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/codeg-conversation-turns-page").await;
+        let conversation_id =
+            create_conversation_core(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
+                .await
+                .expect("create conversation");
+        let data_dir = TempDir::new().expect("tempdir");
+        let registry = inert_internal_session_registry(&db, data_dir.path()).await;
+
+        let page =
+            get_folder_conversation_turns_core(&db.conn, registry.as_ref(), conversation_id, 10, 5)
+                .await
+                .expect("page fetch");
+
+        assert_eq!(page.turns_offset, 0);
+        assert_eq!(page.turns_total, 0);
+        assert_eq!(page.assistant_turns_before_offset, 0);
+        assert!(page.turns.is_empty());
+        assert_eq!(page.prefix_hash, "cbf29ce484222325");
+        assert_eq!(page.prefix_hash_before_index, "cbf29ce484222325");
+        assert!(page.uncovered_prefix_max_ts.is_none());
     }
 
     #[tokio::test]

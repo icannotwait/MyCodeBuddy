@@ -179,6 +179,10 @@ pub fn build_router(
             post(handlers::conversations::get_folder_conversation),
         )
         .route(
+            "/get_folder_conversation_turns",
+            post(handlers::conversations::get_folder_conversation_turns),
+        )
+        .route(
             "/get_workflow_graph_snapshot",
             post(handlers::workflow_graph::get_workflow_graph_snapshot),
         )

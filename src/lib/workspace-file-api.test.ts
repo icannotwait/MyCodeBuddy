@@ -106,4 +106,18 @@ describe("workspace file API payloads", () => {
       identity
     )
   })
+
+  it("does not mix direct Tauri index and user-turn windows", async () => {
+    await getFolderConversationTauri(42, { tailTurns: 50 })
+    expect(mocks.invoke).toHaveBeenLastCalledWith("get_folder_conversation", {
+      conversationId: 42,
+      tailTurns: 50,
+    })
+
+    await getFolderConversationTauri(42, { fromIndex: 120 })
+    expect(mocks.invoke).toHaveBeenLastCalledWith("get_folder_conversation", {
+      conversationId: 42,
+      fromIndex: 120,
+    })
+  })
 })

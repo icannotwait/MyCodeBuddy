@@ -109,6 +109,7 @@ mod tauri_app {
                 conversations::scan_importable_sessions,
                 conversations::import_selected_sessions,
                 conversations::get_folder_conversation,
+                conversations::get_folder_conversation_turns,
                 crate::commands::workflow_graph::get_workflow_graph_snapshot,
                 crate::commands::simple_workflow::continue_archived_workflow_in_simple,
                 crate::commands::workflow_completion::resolve_completion_decision,

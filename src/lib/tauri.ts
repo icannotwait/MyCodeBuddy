@@ -650,9 +650,13 @@ export async function getFolderConversation(
   conversationId: number,
   window?: { tailTurns?: number; fromIndex?: number }
 ): Promise<DbConversationDetail> {
+  const windowedByIndex =
+    window?.tailTurns != null || window?.fromIndex != null
   return invoke("get_folder_conversation", {
     conversationId,
-    historyUserTurnLimit: DEFAULT_HISTORY_USER_TURN_LIMIT,
+    ...(windowedByIndex
+      ? {}
+      : { historyUserTurnLimit: DEFAULT_HISTORY_USER_TURN_LIMIT }),
     ...(window?.tailTurns != null ? { tailTurns: window.tailTurns } : {}),
     ...(window?.fromIndex != null ? { fromIndex: window.fromIndex } : {}),
   })
