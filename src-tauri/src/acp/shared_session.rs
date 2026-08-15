@@ -220,11 +220,28 @@ impl SharedSessionBroker {
         &self,
         connection_id: &str,
         generation: u64,
-    ) -> Result<Vec<crate::acp::types::AcpEvent>, SharedSessionError> {
+    ) -> Result<
+        (
+            Arc<RwLock<SessionState>>,
+            EventEmitter,
+            Vec<crate::acp::types::AcpEvent>,
+        ),
+        SharedSessionError,
+    > {
         self.with_authoritative_record_and_state(connection_id, None, |record, state| {
             if record.connection_id != connection_id || record.generation != generation {
                 return Err(SharedSessionError::GenerationStale);
             }
+            let state_handle = record
+                .state
+                .as_ref()
+                .cloned()
+                .ok_or(SharedSessionError::SessionUnavailable)?;
+            let emitter = record
+                .emitter
+                .as_ref()
+                .cloned()
+                .ok_or(SharedSessionError::SessionUnavailable)?;
             let error_code = match &record.phase {
                 SharedSessionPhase::Failed { error_code, .. } => error_code.clone(),
                 _ => return Err(SharedSessionError::SessionUnavailable),
@@ -233,18 +250,22 @@ impl SharedSessionBroker {
                 error_code,
                 cleanup_complete: true,
             };
-            if let Some(state) = state {
-                update_public_shared_phase(state, generation, phase.clone());
-            }
+            update_public_shared_phase(
+                state.ok_or(SharedSessionError::SessionUnavailable)?,
+                generation,
+                phase.clone(),
+            );
             record.cleanup_complete = true;
             record.phase = phase;
             record.publish_registration();
-            Ok(vec![
-                crate::acp::types::AcpEvent::SharedSessionPhaseChanged {
+            Ok((
+                state_handle,
+                emitter,
+                vec![crate::acp::types::AcpEvent::SharedSessionPhaseChanged {
                     generation,
                     phase: record.phase.clone(),
-                },
-            ])
+                }],
+            ))
         })
         .await?
         .ok_or(SharedSessionError::SessionUnavailable)

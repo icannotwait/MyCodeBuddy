@@ -1412,13 +1412,13 @@ impl ConnectionManager {
             .is_ok()
             && !self.connections.lock().await.contains_key(&connection_id);
         if cleanup_complete {
-            if let Ok(events) = self
+            if let Ok((state, emitter, events)) = self
                 .shared_session_broker
                 .mark_cleanup_complete(&connection_id, generation)
                 .await
             {
                 for event in events {
-                    let _ = self.publish_shared_event(&connection_id, event).await;
+                    emit_with_state(&state, &emitter, event).await;
                 }
             }
         }
@@ -1486,13 +1486,13 @@ impl ConnectionManager {
             .is_ok()
             && !self.connections.lock().await.contains_key(&connection_id);
         if cleanup_complete {
-            if let Ok(events) = self
+            if let Ok((state, emitter, events)) = self
                 .shared_session_broker
                 .mark_cleanup_complete(&connection_id, generation)
                 .await
             {
                 for event in events {
-                    let _ = self.publish_shared_event(&connection_id, event).await;
+                    emit_with_state(&state, &emitter, event).await;
                 }
             }
         }
