@@ -3699,6 +3699,34 @@ pub(crate) fn grok_launch_permission_mode() -> Option<String> {
     load_grok_config_toml_raw().and_then(|raw| grok_config_permission_mode(&raw))
 }
 
+/// Map Codex's effective sandbox settings to the closest codex-acp launch
+/// preset without widening access. Profile-backed settings are intentionally
+/// left alone because the root keys are not authoritative in that case.
+fn codex_initial_agent_mode(settings: &CodexSandboxSettings) -> Option<&'static str> {
+    if settings.shadowed_by_default_permissions {
+        return None;
+    }
+
+    match (
+        settings.sandbox_mode.as_deref(),
+        settings.approval_policy.as_deref(),
+    ) {
+        (Some("read-only"), _) => Some("read-only"),
+        (Some("workspace-write"), _) => Some("agent"),
+        (Some("danger-full-access"), Some("never")) => Some("agent-full-access"),
+        (Some("danger-full-access"), Some(_)) => Some("agent"),
+        _ => None,
+    }
+}
+
+/// Resolve the Codex launch preset from the global config. Missing, unreadable,
+/// malformed, or profile-shadowed settings produce no inference.
+pub(crate) fn codex_launch_initial_agent_mode() -> Option<String> {
+    let raw = load_codex_config_toml_raw()?;
+    let settings = parse_codex_sandbox_settings(&raw);
+    codex_initial_agent_mode(&settings).map(str::to_string)
+}
+
 /// Merge the Grok panel's structured control values into the raw config.toml
 /// text, format-preservingly (comments/layout of unmanaged keys are kept). Each
 /// `Some(value)` sets its documented key; each `None` removes it. Returns the
@@ -12170,6 +12198,32 @@ mod tests {
         assert_eq!(s.sandbox_mode.as_deref(), Some("danger-full-access"));
         assert!(s.granular.is_none());
         assert!(!s.shadowed_by_default_permissions);
+    }
+
+    #[test]
+    fn codex_initial_agent_mode_maps_effective_sandbox_without_widening_access() {
+        let cases = [
+            ("read-only", "on-request", Some("read-only")),
+            ("workspace-write", "never", Some("agent")),
+            ("danger-full-access", "never", Some("agent-full-access")),
+            ("danger-full-access", "on-request", Some("agent")),
+        ];
+        for (sandbox, approval, expected) in cases {
+            let settings = parse_codex_sandbox_settings(&format!(
+                "sandbox_mode = \"{sandbox}\"\napproval_policy = \"{approval}\"\n"
+            ));
+            assert_eq!(codex_initial_agent_mode(&settings), expected);
+        }
+
+        let shadowed = parse_codex_sandbox_settings(
+            "sandbox_mode = \"danger-full-access\"\napproval_policy = \"never\"\n\
+             default_permissions = \":read-only\"\n",
+        );
+        assert_eq!(codex_initial_agent_mode(&shadowed), None);
+
+        let missing_approval =
+            parse_codex_sandbox_settings("sandbox_mode = \"danger-full-access\"\n");
+        assert_eq!(codex_initial_agent_mode(&missing_approval), None);
     }
 
     #[test]

@@ -38,6 +38,7 @@ use crate::acp::file_system_runtime::{
     mode_allows_outside_workspace, FileSystemRuntime, FileSystemRuntimeError, FsAccessPolicy,
 };
 use crate::acp::grok_retry::{GrokRetryAction, GrokRetryReconciler};
+use crate::acp::host_tools_policy::{HostToolsPolicy, HOST_TOOLS_ENV};
 use crate::acp::registry::{self, AgentDistribution};
 use crate::acp::session_state::SessionState;
 use crate::acp::terminal_adapter::{adapter_for, AcpTerminalAdapter};
@@ -208,13 +209,29 @@ fn apply_npx_launch_env_policy(
 /// silently stripping codeg-mcp and with it ask_user_question / delegation /
 /// feedback / session_info. The late `retain` + `push` makes the override win
 /// over any user `runtime_env` twin, so the injection is guaranteed to survive.
-fn apply_codex_env_policy(agent_type: AgentType, merged: &mut Vec<(String, String)>) {
+fn apply_codex_env_policy(
+    agent_type: AgentType,
+    merged: &mut Vec<(String, String)>,
+    initial_agent_mode: Option<&str>,
+) {
     if agent_type != AgentType::Codex {
         return;
     }
     let key = "DISABLE_MCP_CONFIG_FILTERING";
     merged.retain(|(k, _)| k != key);
     merged.push((key.to_string(), "true".to_string()));
+
+    let mode_key = "INITIAL_AGENT_MODE";
+    if merged
+        .iter()
+        .any(|(key, value)| key == mode_key && !value.trim().is_empty())
+    {
+        return;
+    }
+    if let Some(mode) = initial_agent_mode {
+        merged.retain(|(key, _)| key != mode_key);
+        merged.push((mode_key.to_string(), mode.to_string()));
+    }
 }
 
 /// Prepend `dir` to the PATH entry of `env`, seeding from `fallback_path` when
@@ -1190,6 +1207,11 @@ async fn build_agent(
     }
     let meta = registry::get_agent_meta(agent_type);
     debug_assert_eq!(meta.agent_type, agent_type);
+    let codex_initial_agent_mode = if agent_type == AgentType::Codex {
+        crate::commands::acp::codex_launch_initial_agent_mode()
+    } else {
+        None
+    };
 
     let agent = match meta.distribution {
         AgentDistribution::Npx { cmd, args, env, .. } => {
@@ -1213,7 +1235,11 @@ async fn build_agent(
             }
             let mut merged_env = merge_agent_env(env, runtime_env);
             apply_npx_launch_env_policy(agent_type, &mut merged_env, runtime_env);
-            apply_codex_env_policy(agent_type, &mut merged_env);
+            apply_codex_env_policy(
+                agent_type,
+                &mut merged_env,
+                codex_initial_agent_mode.as_deref(),
+            );
             // codex-acp 1.0.0 honors APP_SERVER_LOGS as a directory for its
             // adapter-side logs. Surface it only under CODEG_ACP_DEBUG so
             // default runs are unchanged; a directory-creation failure silently
@@ -1762,6 +1788,7 @@ pub async fn spawn_agent_connection(
     // relocation like `GROK_HOME` must move the allowed root along with the
     // agent's state. Uses the same `launch_cwd` the process and ACP session get.
     let fs_policy = FsAccessPolicy::from_env(&launch_cwd, agent_type, &runtime_env);
+    let host_tools = HostToolsPolicy::from_env(&runtime_env);
 
     // Forward only the codeg git credential helper keys into the terminal
     // runtime — not the agent's API tokens or model provider credentials.
@@ -1912,6 +1939,7 @@ pub async fn spawn_agent_connection(
                     route_bootstrap_tx,
                     session_attach_mode,
                     fs_policy,
+                    host_tools,
                 )
                 .await;
 
@@ -3272,10 +3300,11 @@ fn build_initialize_request(
     agent_type: AgentType,
     spec: &ResolvedShellSpec,
     adapter: &dyn AcpTerminalAdapter,
+    host_tools: HostToolsPolicy,
 ) -> Result<InitializeRequest, AcpError> {
     let meta = terminal_metadata(Meta::default(), spec, adapter)?;
     Ok(InitializeRequest::new(ProtocolVersion::LATEST)
-        .client_capabilities(build_client_capabilities(agent_type))
+        .client_capabilities(build_client_capabilities(agent_type, host_tools))
         .meta(meta))
 }
 
@@ -3283,7 +3312,8 @@ fn build_initialize_request(
 /// gates. Extracted for testability — each gate is a documented product
 /// decision:
 ///
-/// - Everyone: filesystem read/write + terminal, for ACP tool execution.
+/// - Everyone in the default host-tools policy: filesystem read/write and,
+///   except for Grok, terminal execution. Agent policy withholds both channels.
 /// - Codex only: form elicitation, so codex's native Plan-mode
 ///   `request_user_input` is delivered as `elicitation/create` (handled by
 ///   `handle_elicitation_request`) instead of being silently answered `{}`.
@@ -3303,14 +3333,18 @@ fn build_initialize_request(
 ///   `claude_chunk_parent_tool_use_id`). The adapter checks strictly
 ///   `=== true`, and a pre-0.63 binary ignores the unknown key, so this is
 ///   inert everywhere it isn't understood.
-fn build_client_capabilities(agent_type: AgentType) -> ClientCapabilities {
+fn build_client_capabilities(
+    agent_type: AgentType,
+    host_tools: HostToolsPolicy,
+) -> ClientCapabilities {
+    let hosts_channels = host_tools.hosts_channels();
     let mut client_capabilities = ClientCapabilities::new()
         // Grok otherwise moves shell process ownership to its ACP client. Its
         // native backend keeps cancellation and process teardown on one side.
-        .terminal(agent_type != AgentType::Grok)
+        .terminal(hosts_channels && agent_type != AgentType::Grok)
         .fs(FileSystemCapabilities::new()
-            .read_text_file(true)
-            .write_text_file(true));
+            .read_text_file(hosts_channels)
+            .write_text_file(hosts_channels));
     if agent_type == AgentType::Codex {
         client_capabilities = client_capabilities
             .elicitation(ElicitationCapabilities::new().form(ElicitationFormCapabilities::new()));
@@ -4074,22 +4108,28 @@ fn companion_features_arg(
     Some(features.join(","))
 }
 
+fn delegation_enabled(configured: bool, host_tools: HostToolsPolicy) -> bool {
+    configured && host_tools.hosts_channels()
+}
+
 /// Apply agent-specific companion policy before building `--features`.
 /// Grok already exposes a native blocking question tool through
 /// `_x.ai/ask_user_question`, so advertising the companion duplicate wastes
 /// catalog bytes and gives the model two routes for the same interaction.
 fn companion_features_arg_for_agent(
     agent_type: AgentType,
-    delegation_enabled: bool,
+    host_tools: HostToolsPolicy,
+    configured_delegation: bool,
     coordination_v1: bool,
     feedback_enabled: bool,
     ask_enabled: bool,
     sessions_enabled: bool,
     workflow_v2: bool,
 ) -> Option<String> {
+    let delegation_enabled = delegation_enabled(configured_delegation, host_tools);
     companion_features_arg(
         delegation_enabled,
-        coordination_v1,
+        coordination_v1 && delegation_enabled,
         feedback_enabled,
         ask_enabled && agent_type != AgentType::Grok,
         sessions_enabled,
@@ -4134,6 +4174,7 @@ async fn inject_codeg_mcp(
     parent_connection_id: &str,
     working_dir: &Path,
     agent_type: AgentType,
+    host_tools: HostToolsPolicy,
     plan: &crate::acp::delegation::route::DelegationRoutePlan,
     connection_incarnation_id: &str,
     binding: Option<&crate::acp::delegation::workflow::WorkflowChildMcpBinding>,
@@ -4141,14 +4182,15 @@ async fn inject_codeg_mcp(
     // Feature list follows the immutable launch plan for Codeg delegation —
     // never the live Broker settings toggle. Feedback/ask/sessions remain
     // independent launch-time snapshots of their runtime configs.
-    let delegation_enabled = plan.expose_codeg_delegation;
+    let delegation_enabled = delegation_enabled(plan.expose_codeg_delegation, host_tools);
     // Join capability is connection-bound and follows Codeg delegation exposure.
-    let coordination_v1 = plan.expose_codeg_delegation;
-    let delegation_continuation_v1 = continuation_enabled_for_launch(
-        plan,
-        agent_type,
-        std::env::var_os("CODEG_DELEGATION_CONTINUATION_V1").as_deref(),
-    );
+    let coordination_v1 = delegation_enabled;
+    let delegation_continuation_v1 = delegation_enabled
+        && continuation_enabled_for_launch(
+            plan,
+            agent_type,
+            std::env::var_os("CODEG_DELEGATION_CONTINUATION_V1").as_deref(),
+        );
     let role = if plan.source == crate::acp::delegation::route::DelegationRouteSource::ForcedChild {
         crate::acp::delegation::transport::CompanionRole::DelegationChild
     } else {
@@ -4164,6 +4206,7 @@ async fn inject_codeg_mcp(
     // `None` (no feature enabled) short-circuits the whole injection.
     let mut features_arg = companion_features_arg_for_agent(
         agent_type,
+        host_tools,
         delegation_enabled,
         coordination_v1,
         feedback_enabled,
@@ -4201,7 +4244,7 @@ async fn inject_codeg_mcp(
         .await;
     // Register the ready lease BEFORE exposing the MCP entry so a fast
     // companion cannot race mark_ready against an unregistered token.
-    let delegation_lease = if plan.expose_codeg_delegation {
+    let delegation_lease = if delegation_enabled {
         Some(injection.leases.register(token.clone()).await)
     } else {
         None
@@ -4396,6 +4439,7 @@ async fn finish_route_ready(
     state: &Arc<RwLock<SessionState>>,
     emitter: &EventEmitter,
     route_plan: &crate::acp::delegation::route::DelegationRoutePlan,
+    host_tools: HostToolsPolicy,
     pending_lease: &mut Option<crate::acp::delegation::lease::CompanionLeaseWaiter>,
     route_bootstrap_tx: &Arc<
         tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<RouteBootstrapOutcome>>>,
@@ -4404,7 +4448,7 @@ async fn finish_route_ready(
     use crate::acp::delegation::lease::ready_lease_timeout;
     use crate::acp::delegation::route::RouteDegradedReason;
 
-    if route_plan.expose_codeg_delegation {
+    if delegation_enabled(route_plan.expose_codeg_delegation, host_tools) {
         let Some(mut waiter) = pending_lease.take() else {
             let mut guard = route_bootstrap_tx.lock().await;
             if let Some(tx) = guard.take() {
@@ -4527,6 +4571,7 @@ async fn run_connection(
     route_bootstrap_tx: tokio::sync::oneshot::Sender<RouteBootstrapOutcome>,
     session_attach_mode: crate::acp::session_attach::SessionAttachMode,
     fs_policy: FsAccessPolicy,
+    host_tools: HostToolsPolicy,
 ) -> Result<(), AcpError> {
     let parent_connection_exit_evidence = delegation_injection
         .as_ref()
@@ -4562,6 +4607,7 @@ async fn run_connection(
     )));
     let cwd_string = cwd.to_string_lossy().to_string();
     tracing::info!("[ACP] fs policy {}", fs_policy.describe());
+    tracing::info!("[ACP] host tools policy {}", host_tools.describe());
     let file_system_runtime = Arc::new(
         FileSystemRuntime::with_policy(fs_policy).with_allow_outside_workspace(
             initial_allow_outside_workspace(
@@ -4671,6 +4717,9 @@ async fn run_connection(
                 async move |req: ReadTextFileRequest,
                             responder: Responder<ReadTextFileResponse>,
                             _cx: ConnectionTo<Agent>| {
+                    if !host_tools.hosts_channels() {
+                        return refuse_unadvertised_channel(responder, "fs/read_text_file");
+                    }
                     respond_file_system_request(responder, runtime.read_text_file(req).await)?;
                     Ok(())
                 }
@@ -4683,6 +4732,9 @@ async fn run_connection(
                 async move |req: WriteTextFileRequest,
                             responder: Responder<WriteTextFileResponse>,
                             _cx: ConnectionTo<Agent>| {
+                    if !host_tools.hosts_channels() {
+                        return refuse_unadvertised_channel(responder, "fs/write_text_file");
+                    }
                     respond_file_system_request(responder, runtime.write_text_file(req).await)?;
                     Ok(())
                 }
@@ -4696,6 +4748,9 @@ async fn run_connection(
                 async move |req: CreateTerminalRequest,
                             responder: Responder<CreateTerminalResponse>,
                             _cx: ConnectionTo<Agent>| {
+                    if !host_tools.hosts_channels() {
+                        return refuse_unadvertised_channel(responder, "terminal/create");
+                    }
                     let session_id = req.session_id.to_string();
                     let result = runtime.create_terminal(req).await;
                     if let Ok(ref response) = result {
@@ -4725,6 +4780,9 @@ async fn run_connection(
                 async move |req: TerminalOutputRequest,
                             responder: Responder<TerminalOutputResponse>,
                             _cx: ConnectionTo<Agent>| {
+                    if !host_tools.hosts_channels() {
+                        return refuse_unadvertised_channel(responder, "terminal/output");
+                    }
                     respond_terminal_request(responder, runtime.terminal_output(req).await)?;
                     Ok(())
                 }
@@ -4737,6 +4795,9 @@ async fn run_connection(
                 async move |req: WaitForTerminalExitRequest,
                             responder: Responder<WaitForTerminalExitResponse>,
                             cx: ConnectionTo<Agent>| {
+                    if !host_tools.hosts_channels() {
+                        return refuse_unadvertised_channel(responder, "terminal/wait_for_exit");
+                    }
                     // `terminal/wait_for_exit` blocks until the command exits,
                     // and sacp awaits request handlers INSIDE its single
                     // dispatch loop ("the loop awaits the handler to completion
@@ -4774,6 +4835,9 @@ async fn run_connection(
                 async move |req: KillTerminalRequest,
                             responder: Responder<KillTerminalResponse>,
                             _cx: ConnectionTo<Agent>| {
+                    if !host_tools.hosts_channels() {
+                        return refuse_unadvertised_channel(responder, "terminal/kill");
+                    }
                     respond_terminal_request(responder, runtime.kill_terminal(req).await)?;
                     Ok(())
                 }
@@ -4786,6 +4850,9 @@ async fn run_connection(
                 async move |req: ReleaseTerminalRequest,
                             responder: Responder<ReleaseTerminalResponse>,
                             _cx: ConnectionTo<Agent>| {
+                    if !host_tools.hosts_channels() {
+                        return refuse_unadvertised_channel(responder, "terminal/release");
+                    }
                     respond_terminal_request(responder, runtime.release_terminal(req).await)?;
                     Ok(())
                 }
@@ -4871,6 +4938,7 @@ async fn run_connection(
                 agent_type,
                 &terminal_shell.spec,
                 adapter_for(agent_type),
+                host_tools,
             )
             .map_err(|e| sacp::util::internal_error(e.to_string()))?;
             // Bound the Initialize handshake so an outdated / incompatible
@@ -5003,6 +5071,7 @@ async fn run_connection(
                             &conn_id,
                             &cwd,
                             agent_type,
+                            host_tools,
                             &route_plan,
                             &connection_incarnation_id,
                             workflow_child_mcp_binding.as_ref(),
@@ -5193,6 +5262,7 @@ async fn run_connection(
                                 &state,
                                 &emitter_clone,
                                 &route_plan,
+                                host_tools,
                                 &mut pending_lease,
                                 &route_bootstrap_tx,
                             )
@@ -5488,6 +5558,7 @@ async fn run_connection(
                             &state,
                             &emitter_clone,
                             &route_plan,
+                            host_tools,
                             &mut pending_lease,
                             &route_bootstrap_tx,
                         )
@@ -5739,6 +5810,7 @@ async fn run_connection(
                             &state,
                             &emitter_clone,
                             &route_plan,
+                            host_tools,
                             &mut pending_lease,
                             &route_bootstrap_tx,
                         )
@@ -5857,6 +5929,7 @@ async fn run_connection(
                     &state,
                     &emitter_clone,
                     &route_plan,
+                    host_tools,
                     &mut pending_lease,
                     &route_bootstrap_tx,
                 )
@@ -6556,6 +6629,22 @@ async fn cancel_pending_permissions(
         request_ids.push(request_id);
     }
     emit_cancelled_permission_events(state, emitter, request_ids).await;
+}
+
+fn refuse_unadvertised_channel<T: sacp::JsonRpcResponse>(
+    responder: Responder<T>,
+    method: &str,
+) -> Result<(), sacp::Error> {
+    tracing::warn!(
+        "[ACP] refusing {method}: {HOST_TOOLS_ENV}=agent, so this channel was not advertised"
+    );
+    responder.respond_with_error(unadvertised_channel_error(method))
+}
+
+fn unadvertised_channel_error(method: &str) -> sacp::Error {
+    sacp::Error::method_not_found().data(format!(
+        "codeg does not host {method} for this agent ({HOST_TOOLS_ENV}=agent)"
+    ))
 }
 
 fn respond_terminal_request<T: sacp::JsonRpcResponse>(
@@ -16731,7 +16820,7 @@ mod tests {
         // Codex gets the flag injected so codex-acp never drops the injected
         // `codeg-mcp` server on a config.toml name collision.
         let mut env = vec![("PATH".to_string(), "/usr/bin".to_string())];
-        apply_codex_env_policy(AgentType::Codex, &mut env);
+        apply_codex_env_policy(AgentType::Codex, &mut env, None);
         assert!(env
             .iter()
             .any(|(k, v)| k == "DISABLE_MCP_CONFIG_FILTERING" && v == "true"));
@@ -16741,7 +16830,7 @@ mod tests {
             "DISABLE_MCP_CONFIG_FILTERING".to_string(),
             "false".to_string(),
         )];
-        apply_codex_env_policy(AgentType::Codex, &mut with_twin);
+        apply_codex_env_policy(AgentType::Codex, &mut with_twin, None);
         let hits: Vec<_> = with_twin
             .iter()
             .filter(|(k, _)| k == "DISABLE_MCP_CONFIG_FILTERING")
@@ -16754,12 +16843,43 @@ mod tests {
     fn codex_env_policy_is_noop_for_other_agents() {
         for agent in [AgentType::Grok, AgentType::ClaudeCode, AgentType::Gemini] {
             let mut env = vec![("PATH".to_string(), "/usr/bin".to_string())];
-            apply_codex_env_policy(agent, &mut env);
+            apply_codex_env_policy(agent, &mut env, Some("read-only"));
             assert!(
                 !env.iter().any(|(k, _)| k == "DISABLE_MCP_CONFIG_FILTERING"),
                 "{agent:?} must not receive the codex-only flag"
             );
+            assert!(!env.iter().any(|(k, _)| k == "INITIAL_AGENT_MODE"));
         }
+    }
+
+    #[test]
+    fn codex_initial_agent_mode_env_policy_preserves_explicit_precedence() {
+        let mut inferred = vec![("PATH".to_string(), "/usr/bin".to_string())];
+        apply_codex_env_policy(AgentType::Codex, &mut inferred, Some("read-only"));
+        assert!(inferred
+            .iter()
+            .any(|(key, value)| key == "INITIAL_AGENT_MODE" && value == "read-only"));
+
+        let mut explicit = vec![(
+            "INITIAL_AGENT_MODE".to_string(),
+            "agent-full-access".to_string(),
+        )];
+        apply_codex_env_policy(AgentType::Codex, &mut explicit, Some("read-only"));
+        let explicit_modes = explicit
+            .iter()
+            .filter(|(key, _)| key == "INITIAL_AGENT_MODE")
+            .collect::<Vec<_>>();
+        assert_eq!(explicit_modes.len(), 1);
+        assert_eq!(explicit_modes[0].1, "agent-full-access");
+
+        let mut blank = vec![("INITIAL_AGENT_MODE".to_string(), "  ".to_string())];
+        apply_codex_env_policy(AgentType::Codex, &mut blank, Some("agent"));
+        let blank_modes = blank
+            .iter()
+            .filter(|(key, _)| key == "INITIAL_AGENT_MODE")
+            .collect::<Vec<_>>();
+        assert_eq!(blank_modes.len(), 1);
+        assert_eq!(blank_modes[0].1, "agent");
     }
 
     #[test]
@@ -16957,7 +17077,8 @@ mod tests {
         // Serialize to inspect the wire shape — `_meta` is the serde rename
         // and the exact key path the adapters read.
         let caps_of = |agent: AgentType| {
-            serde_json::to_value(build_client_capabilities(agent)).expect("caps serialize")
+            serde_json::to_value(build_client_capabilities(agent, HostToolsPolicy::Default))
+                .expect("caps serialize")
         };
 
         // Claude Code: subagent-transcript opt-in (strict boolean true), and
@@ -16980,6 +17101,50 @@ mod tests {
         assert!(other.get("elicitation").is_none());
         assert_eq!(other["terminal"], serde_json::Value::Bool(true));
         assert_eq!(other["fs"]["readTextFile"], serde_json::Value::Bool(true));
+    }
+
+    #[test]
+    fn host_tools_agent_withholds_both_execution_channels() {
+        let withheld = serde_json::to_value(build_client_capabilities(
+            AgentType::Grok,
+            HostToolsPolicy::Agent,
+        ))
+        .expect("caps serialize");
+        assert_eq!(withheld["terminal"], serde_json::Value::Bool(false));
+        assert_eq!(
+            withheld["fs"]["readTextFile"],
+            serde_json::Value::Bool(false)
+        );
+        assert_eq!(
+            withheld["fs"]["writeTextFile"],
+            serde_json::Value::Bool(false)
+        );
+
+        let hosted = serde_json::to_value(build_client_capabilities(
+            AgentType::Grok,
+            HostToolsPolicy::Default,
+        ))
+        .expect("caps serialize");
+        assert_eq!(hosted["terminal"], serde_json::Value::Bool(false));
+        assert_eq!(hosted["fs"]["readTextFile"], serde_json::Value::Bool(true));
+    }
+
+    #[test]
+    fn host_tools_withheld_execution_channels_return_method_not_found() {
+        for method in [
+            "fs/read_text_file",
+            "fs/write_text_file",
+            "terminal/create",
+            "terminal/output",
+            "terminal/wait_for_exit",
+            "terminal/kill",
+            "terminal/release",
+        ] {
+            let error = unadvertised_channel_error(method);
+            assert_eq!(error.code, sacp::Error::method_not_found().code);
+            assert!(error.to_string().contains(method));
+            assert!(error.to_string().contains(HOST_TOOLS_ENV));
+        }
     }
 
     #[test]
@@ -19178,9 +19343,13 @@ mod tests {
     #[test]
     fn initialize_contains_terminal_metadata() {
         let spec = test_pwsh_spec();
-        let request =
-            build_initialize_request(AgentType::Codex, &spec, adapter_for(AgentType::Codex))
-                .unwrap();
+        let request = build_initialize_request(
+            AgentType::Codex,
+            &spec,
+            adapter_for(AgentType::Codex),
+            HostToolsPolicy::Default,
+        )
+        .unwrap();
         let value = serde_json::to_value(request).unwrap();
         assert_codeg_terminal_meta(&value, "powershell", &spec.executable.to_string_lossy());
     }
@@ -19188,14 +19357,23 @@ mod tests {
     #[test]
     fn initialize_disables_client_terminal_only_for_grok() {
         let spec = test_pwsh_spec();
-        let request =
-            build_initialize_request(AgentType::Grok, &spec, adapter_for(AgentType::Grok)).unwrap();
+        let request = build_initialize_request(
+            AgentType::Grok,
+            &spec,
+            adapter_for(AgentType::Grok),
+            HostToolsPolicy::Default,
+        )
+        .unwrap();
         let value = serde_json::to_value(request).unwrap();
         assert_eq!(value["clientCapabilities"]["terminal"], false);
 
-        let request =
-            build_initialize_request(AgentType::Codex, &spec, adapter_for(AgentType::Codex))
-                .unwrap();
+        let request = build_initialize_request(
+            AgentType::Codex,
+            &spec,
+            adapter_for(AgentType::Codex),
+            HostToolsPolicy::Default,
+        )
+        .unwrap();
         let value = serde_json::to_value(request).unwrap();
         assert_eq!(value["clientCapabilities"]["terminal"], true);
     }
@@ -21058,6 +21236,7 @@ mod tests {
             "parent-conn",
             std::path::Path::new("/tmp"),
             AgentType::Codex,
+            HostToolsPolicy::Default,
             &plan,
             "test-incarnation",
             None,
@@ -21094,6 +21273,7 @@ mod tests {
             "child-connection",
             std::path::Path::new("/tmp"),
             AgentType::Codex,
+            HostToolsPolicy::Default,
             &forced_child_plan,
             "child-incarnation",
             Some(&binding),
@@ -21296,12 +21476,49 @@ mod tests {
     #[test]
     fn companion_features_arg_uses_native_ask_for_grok_only() {
         assert_eq!(
-            companion_features_arg_for_agent(AgentType::Grok, true, true, true, true, true, true,),
+            companion_features_arg_for_agent(
+                AgentType::Grok,
+                HostToolsPolicy::Default,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+            ),
             Some("delegation,coordination_v1,feedback,sessions,workflow_v2".to_string())
         );
         assert_eq!(
-            companion_features_arg_for_agent(AgentType::Codex, true, true, true, true, true, true,),
+            companion_features_arg_for_agent(
+                AgentType::Codex,
+                HostToolsPolicy::Default,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+            ),
             Some("delegation,coordination_v1,feedback,ask,sessions,workflow_v2".to_string())
+        );
+    }
+
+    #[test]
+    fn agent_host_tools_omit_delegation_but_keep_non_executing_companion_features() {
+        assert!(!delegation_enabled(true, HostToolsPolicy::Agent));
+        assert!(delegation_enabled(true, HostToolsPolicy::Default));
+        assert_eq!(
+            companion_features_arg_for_agent(
+                AgentType::Codex,
+                HostToolsPolicy::Agent,
+                true,
+                true,
+                true,
+                true,
+                true,
+                false,
+            ),
+            Some("feedback,ask,sessions".to_string())
         );
     }
 
@@ -21762,6 +21979,7 @@ mod tests {
                     AgentType::Codex,
                     &shell.spec,
                     adapter_for(AgentType::Codex),
+                    HostToolsPolicy::Default,
                 )
                 .map_err(|e| sacp::util::internal_error(e.to_string()))?;
                 let init_resp = cx
