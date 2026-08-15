@@ -7,16 +7,23 @@
 
 use crate::models::AgentType;
 
-/// Whether this agent type is capability-enabled for durable child session
-/// reuse (same external id resume/load after disconnect).
+/// Whether this agent type is eligible to attempt durable child session reuse
+/// (same external id resume/load after disconnect).
 ///
-/// Initial rollout is conservative: only agent types with a managed route
-/// contract and known same-id resume/load support are enabled. All others
-/// return `false` so continue paths fail closed with `not_supported`.
+/// This is the coarse rollout gate. The spawned agent's initialize response is
+/// still authoritative: `ResumeExistingOnly` refuses `unresumable` when neither
+/// `session/resume` nor `loadSession` is advertised and never falls through to
+/// `session/new`. This keeps older cached or PATH-installed CLIs fail-closed.
+/// All agent types outside the rollout return `false`, so continue paths stop
+/// earlier with `not_supported`.
 pub fn agent_supports_session_reuse(agent_type: AgentType) -> bool {
     matches!(
         agent_type,
-        AgentType::Codex | AgentType::ClaudeCode | AgentType::CodeBuddy | AgentType::Grok
+        AgentType::Codex
+            | AgentType::ClaudeCode
+            | AgentType::CodeBuddy
+            | AgentType::Grok
+            | AgentType::Cursor
     )
 }
 
@@ -46,7 +53,6 @@ mod tests {
 
     #[test]
     fn capability_false_for_agents_without_reuse_rollout() {
-        assert!(!agent_supports_session_reuse(AgentType::Cursor));
         assert!(!agent_supports_session_reuse(AgentType::OpenCode));
         assert!(!agent_supports_session_reuse(AgentType::Gemini));
         assert!(!agent_supports_session_reuse(AgentType::Cline));
@@ -56,22 +62,23 @@ mod tests {
     }
 
     #[test]
-    fn capability_true_for_initial_reuse_rollout_agents() {
+    fn capability_true_for_reuse_rollout_agents() {
         assert!(agent_supports_session_reuse(AgentType::Codex));
         assert!(agent_supports_session_reuse(AgentType::ClaudeCode));
         assert!(agent_supports_session_reuse(AgentType::CodeBuddy));
         assert!(agent_supports_session_reuse(AgentType::Grok));
+        assert!(agent_supports_session_reuse(AgentType::Cursor));
     }
 
     #[test]
-    fn continue_gate_maps_false_to_not_supported_only() {
+    fn continue_gate_allows_cursor_and_rejects_unsupported_agents() {
         assert_eq!(
             gate_continue_session_reuse(AgentType::Cursor),
-            ContinueCapabilityDecision::NotSupported
+            ContinueCapabilityDecision::Allowed
         );
         assert_eq!(
-            gate_continue_session_reuse(AgentType::Codex),
-            ContinueCapabilityDecision::Allowed
+            gate_continue_session_reuse(AgentType::OpenCode),
+            ContinueCapabilityDecision::NotSupported
         );
     }
 }

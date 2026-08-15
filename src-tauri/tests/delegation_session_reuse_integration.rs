@@ -1475,6 +1475,84 @@ async fn resume_existing_only_reuses_session_and_records_resume_call() {
 }
 
 #[tokio::test]
+async fn cursor_resume_existing_only_reuses_session_and_records_resume_call() {
+    let db = Arc::new(fresh_in_memory_db().await);
+    let folder = seed_folder(&db, "/tmp/codeg-cursor-resume-only").await;
+    let parent = conversation_service::create(
+        &db.conn,
+        folder,
+        AgentType::ClaudeCode,
+        Some("cursor resume-only parent".into()),
+        None,
+    )
+    .await
+    .expect("parent");
+    let runs = Arc::new(RunStore::new(db.clone()));
+    let mock = Arc::new(MockSpawner::new());
+    let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+    let (root_id, child_id) = start_and_complete(
+        &broker,
+        &mock,
+        delegate_req(
+            parent.id,
+            "tu-cursor-resume-root",
+            AgentType::Cursor,
+            "root",
+            "/tmp/codeg-cursor-resume-only",
+            None,
+        ),
+        "cursor-resume-root",
+    )
+    .await;
+    set_child_external_id(&db, child_id, "cursor-session-abc").await;
+
+    let projection = runs
+        .recovery_projection_for_task(&root_id)
+        .await
+        .expect("cursor recovery projection")
+        .expect("cursor run must be recoverable");
+    assert_eq!(projection.disposition, "continue", "{projection:?}");
+    assert_eq!(projection.proposed_action.as_deref(), Some("continue"));
+
+    let before_children = conversation_service::list_children(&db.conn, parent.id)
+        .await
+        .unwrap()
+        .len();
+    mock.queue_spawn(Ok("cursor-resume-continue".into())).await;
+    mock.queue_send(Ok(accepted(child_id, Utc::now()))).await;
+
+    let cont = broker
+        .continue_delegation(continue_req(
+            parent.id,
+            "tu-cursor-resume-cont",
+            &root_id,
+            "continue Cursor session",
+            None,
+        ))
+        .await;
+    assert_eq!(cont.status, TaskStatus::Running, "{cont:?}");
+    assert_eq!(cont.agent_type, Some(AgentType::Cursor));
+    assert_eq!(cont.reused_session, Some(true));
+    assert_eq!(cont.child_conversation_id, Some(child_id));
+
+    let resumes = mock.resume_args.lock().await;
+    let last = resumes.last().expect("Cursor resume recorded");
+    assert_eq!(last.external_session_id, "cursor-session-abc");
+    assert!(last.preallocated_connection_id.is_some());
+    drop(resumes);
+
+    let after_children = conversation_service::list_children(&db.conn, parent.id)
+        .await
+        .unwrap()
+        .len();
+    assert_eq!(
+        after_children, before_children,
+        "Cursor continuation must not create a new child conversation"
+    );
+}
+
+#[tokio::test]
 async fn resume_existing_only_connection_id_mismatch_is_unresumable() {
     let db = Arc::new(fresh_in_memory_db().await);
     let folder = seed_folder(&db, "/tmp/codeg-resume-mismatch").await;

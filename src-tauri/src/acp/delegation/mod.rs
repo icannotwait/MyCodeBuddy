@@ -67,7 +67,8 @@ pub mod workflow;
 /// completion-time result sniff in `acp::connection`
 /// (`cursor_companion_title_from_content`). The `codeg-mcp__<tool>` shape is
 /// what the frontend's tool-name normalizer already resolves to the dedicated
-/// delegation / status cards.
+/// delegation / continuation / status cards.
 pub const DELEGATE_TOOL_REWRITE_TITLE: &str = "codeg-mcp__delegate_to_agent";
+pub const CONTINUE_TOOL_REWRITE_TITLE: &str = "codeg-mcp__continue_delegation";
 pub const STATUS_TOOL_REWRITE_TITLE: &str = "codeg-mcp__get_delegation_status";
 pub const CANCEL_TOOL_REWRITE_TITLE: &str = "codeg-mcp__cancel_delegation";

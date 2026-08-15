@@ -9759,14 +9759,14 @@ mod tests {
             .expect("load source child")
             .expect("source child");
         let mut child = child.into_active_model();
-        child.agent_type = Set("cursor".into());
-        child.external_id = Set(Some("cursor-session-race".into()));
+        child.agent_type = Set("open_code".into());
+        child.external_id = Set(Some("open-code-session-race".into()));
         child.update(&db.conn).await.expect("update source child");
 
         let store = Arc::new(RunStore::new(db.clone()));
         let source_task_id = "continue-replacement-race-source";
         let mut source = sample_insert(source_task_id, parent_id, source_child_id, 1, None);
-        source.agent_type = "cursor".into();
+        source.agent_type = "open_code".into();
         store
             .insert_reserving(source)
             .await
@@ -9782,7 +9782,7 @@ mod tests {
         let replacement_child = conversation_service::create_with_delegation(
             &db.conn,
             replacement_folder,
-            AgentType::Cursor,
+            AgentType::OpenCode,
             Some("replacement child".into()),
             None,
             Some(DelegationLink {
@@ -9800,7 +9800,7 @@ mod tests {
             source_task_id,
             REPLACEMENT_REASON_NOT_SUPPORTED,
         );
-        replacement.agent_type = "cursor".into();
+        replacement.agent_type = "open_code".into();
 
         let continuation = store
             .admit_continue_reserving(ContinueRunAdmission {
