@@ -13,13 +13,16 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
-use tokio::sync::Mutex;
+use tokio::sync::{watch, Mutex, RwLock};
+
+use crate::{acp::session_state::SessionState, web::event_bridge::EventEmitter};
 
 use error::validate_failure_code;
 
 #[derive(Clone)]
 pub struct SharedSessionBroker {
     index: Arc<Mutex<SharedSessionIndex>>,
+    index_epoch: Arc<watch::Sender<u64>>,
     metrics: Arc<SharedSessionMetrics>,
     lease_ttl: Duration,
     limits: BrokerLimits,
@@ -27,8 +30,10 @@ pub struct SharedSessionBroker {
 
 impl Default for SharedSessionBroker {
     fn default() -> Self {
+        let (index_epoch, _) = watch::channel(0);
         Self {
             index: Arc::new(Mutex::new(SharedSessionIndex::default())),
+            index_epoch: Arc::new(index_epoch),
             metrics: Arc::new(SharedSessionMetrics::default()),
             lease_ttl: DEFAULT_CLIENT_LEASE_TTL,
             limits: BrokerLimits::default(),
@@ -86,6 +91,8 @@ impl SharedSessionBroker {
                         .by_connection
                         .insert(request.connection_id.clone(), request.key.clone());
                     index.sessions.insert(request.key.clone(), record);
+                    self.index_epoch
+                        .send_modify(|epoch| *epoch = epoch.saturating_add(1));
                     self.metrics.add_active_leases(1);
                     self.metrics.add_live_session();
                     ReserveLookup::Created(attachment)
@@ -175,6 +182,10 @@ impl SharedSessionBroker {
                 error_code: error_code.clone(),
                 cleanup_complete,
             };
+            record.publish_registration();
+            record
+                .lifecycle_tx
+                .send_replace(SharedLifecycleState::Failed);
             Ok(())
         })
         .await?
@@ -186,23 +197,26 @@ impl SharedSessionBroker {
         connection_id: &str,
         generation: u64,
     ) -> Result<(), SharedSessionError> {
-        self.with_authoritative_record(connection_id, |record| {
-            if record.connection_id != connection_id || record.generation != generation {
-                return Err(SharedSessionError::GenerationStale);
-            }
-            let error_code = match &record.phase {
-                SharedSessionPhase::Failed { error_code, .. } => error_code.clone(),
-                _ => return Err(SharedSessionError::SessionUnavailable),
-            };
-            record.cleanup_complete = true;
-            record.phase = SharedSessionPhase::Failed {
-                error_code,
-                cleanup_complete: true,
-            };
-            Ok(())
-        })
-        .await?
-        .ok_or(SharedSessionError::SessionUnavailable)
+        let mut record = self.authoritative_record_guard(connection_id).await?;
+        if record.connection_id != connection_id || record.generation != generation {
+            return Err(SharedSessionError::GenerationStale);
+        }
+        let error_code = match &record.phase {
+            SharedSessionPhase::Failed { error_code, .. } => error_code.clone(),
+            _ => return Err(SharedSessionError::SessionUnavailable),
+        };
+        let phase = SharedSessionPhase::Failed {
+            error_code,
+            cleanup_complete: true,
+        };
+        if let Some(state) = record.state.as_ref() {
+            let mut state = state.write().await;
+            update_public_shared_phase(&mut state, generation, phase.clone());
+        }
+        record.cleanup_complete = true;
+        record.phase = phase;
+        record.publish_registration();
+        Ok(())
     }
 
     pub async fn diagnostic_for_connection(
@@ -226,6 +240,325 @@ impl SharedSessionBroker {
         .flatten()
     }
 
+    pub(crate) async fn launch_identity_for_connection(
+        &self,
+        connection_id: &str,
+    ) -> Result<SharedLaunchIdentity, SharedSessionError> {
+        self.with_authoritative_record(connection_id, |record| Ok(record.launch_identity.clone()))
+            .await?
+            .ok_or(SharedSessionError::SessionUnavailable)
+    }
+
+    pub(crate) async fn wait_until_registered(
+        &self,
+        connection_id: &str,
+        generation: u64,
+    ) -> Result<SharedRegistrationState, SharedSessionError> {
+        let mut receiver = self
+            .with_authoritative_record(connection_id, |record| {
+                if record.generation != generation {
+                    return Err(SharedSessionError::GenerationStale);
+                }
+                Ok(record.registration_tx.subscribe())
+            })
+            .await?
+            .ok_or(SharedSessionError::SessionUnavailable)?;
+
+        loop {
+            let current = receiver.borrow().clone();
+            if current.phase != SharedSessionPhase::Reserved && current.state.is_some() {
+                return Ok(current);
+            }
+            receiver
+                .changed()
+                .await
+                .map_err(|_| SharedSessionError::SessionUnavailable)?;
+        }
+    }
+
+    pub(crate) async fn install_registered(
+        &self,
+        connection_id: &str,
+        generation: u64,
+        driver_incarnation: String,
+        state: Arc<RwLock<SessionState>>,
+        emitter: EventEmitter,
+        child_pid: Arc<std::sync::atomic::AtomicU32>,
+    ) -> Result<(), SharedSessionError> {
+        self.with_authoritative_record(connection_id, |record| {
+            if record.generation != generation {
+                return Err(SharedSessionError::GenerationStale);
+            }
+            if record.phase != SharedSessionPhase::Reserved || record.driver_incarnation.is_some() {
+                return Err(SharedSessionError::GenerationStale);
+            }
+            record.driver_incarnation = Some(driver_incarnation.clone());
+            record.state = Some(state.clone());
+            record.emitter = Some(emitter.clone());
+            record.child_pid = Some(child_pid.clone());
+            record.phase = SharedSessionPhase::Bootstrapping;
+            record.publish_registration();
+            Ok(())
+        })
+        .await?
+        .ok_or(SharedSessionError::SessionUnavailable)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn replace_registered_driver(
+        &self,
+        connection_id: &str,
+        generation: u64,
+        previous_incarnation: &str,
+        next_incarnation: String,
+        state: Arc<RwLock<SessionState>>,
+        emitter: EventEmitter,
+        replacement: SessionState,
+        child_pid: Arc<std::sync::atomic::AtomicU32>,
+    ) -> Result<(), SharedSessionError> {
+        let mut record = self.authoritative_record_guard(connection_id).await?;
+        if record.generation != generation
+            || record.phase != SharedSessionPhase::Bootstrapping
+            || record.driver_incarnation.as_deref() != Some(previous_incarnation)
+        {
+            return Err(SharedSessionError::GenerationStale);
+        }
+        let public_state = record
+            .state
+            .as_ref()
+            .cloned()
+            .ok_or(SharedSessionError::SessionUnavailable)?;
+        if !Arc::ptr_eq(&public_state, &state)
+            || replacement.connection_incarnation != next_incarnation
+        {
+            return Err(SharedSessionError::GenerationStale);
+        }
+        public_state
+            .write()
+            .await
+            .prepare_registered_replacement(replacement);
+        record.driver_incarnation = Some(next_incarnation);
+        record.state = Some(public_state);
+        record.emitter = Some(emitter);
+        record.child_pid = Some(child_pid);
+        record.publish_registration();
+        Ok(())
+    }
+
+    pub(crate) async fn mark_ready(
+        &self,
+        connection_id: &str,
+        generation: u64,
+        driver_incarnation: &str,
+    ) -> Result<(), SharedSessionError> {
+        let mut record = self.authoritative_record_guard(connection_id).await?;
+        if record.generation != generation
+            || record.phase != SharedSessionPhase::Bootstrapping
+            || record.driver_incarnation.as_deref() != Some(driver_incarnation)
+        {
+            return Err(SharedSessionError::GenerationStale);
+        }
+        let state = record
+            .state
+            .as_ref()
+            .cloned()
+            .ok_or(SharedSessionError::SessionUnavailable)?;
+        {
+            let mut state = state.write().await;
+            update_public_shared_phase(&mut state, generation, SharedSessionPhase::Ready);
+        }
+        record.phase = SharedSessionPhase::Ready;
+        record.publish_registration();
+        Ok(())
+    }
+
+    pub(crate) async fn is_current_bootstrapping_driver(
+        &self,
+        connection_id: &str,
+        generation: u64,
+        driver_incarnation: &str,
+    ) -> bool {
+        self.with_authoritative_record(connection_id, |record| {
+            Ok(record.generation == generation
+                && record.phase == SharedSessionPhase::Bootstrapping
+                && record.driver_incarnation.as_deref() == Some(driver_incarnation))
+        })
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(false)
+    }
+
+    pub(crate) async fn driver_incarnation_for_generation(
+        &self,
+        connection_id: &str,
+        generation: u64,
+    ) -> Result<Option<String>, SharedSessionError> {
+        self.with_authoritative_record(connection_id, |record| {
+            if record.generation != generation {
+                return Err(SharedSessionError::GenerationStale);
+            }
+            Ok(record.driver_incarnation.clone())
+        })
+        .await?
+        .ok_or(SharedSessionError::SessionUnavailable)
+    }
+
+    pub(crate) async fn driver_child_pid_for_connection(
+        &self,
+        connection_id: &str,
+    ) -> Option<Arc<std::sync::atomic::AtomicU32>> {
+        self.with_authoritative_record(connection_id, |record| Ok(record.child_pid.clone()))
+            .await
+            .ok()
+            .flatten()
+            .flatten()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn fail_registered(
+        &self,
+        connection_id: &str,
+        generation: u64,
+        expected_driver_incarnation: Option<&str>,
+        error: SharedSessionError,
+        cleanup_complete: bool,
+        state: Arc<RwLock<SessionState>>,
+        emitter: EventEmitter,
+    ) -> Result<(Arc<RwLock<SessionState>>, EventEmitter), SharedSessionError> {
+        let error_code = error.code().to_string();
+        let mut record = self.authoritative_record_guard(connection_id).await?;
+        if record.generation != generation {
+            return Err(SharedSessionError::GenerationStale);
+        }
+        match expected_driver_incarnation {
+            Some(expected)
+                if record.driver_incarnation.as_deref() != Some(expected)
+                    || record.phase != SharedSessionPhase::Bootstrapping =>
+            {
+                return Err(SharedSessionError::GenerationStale);
+            }
+            None if record.driver_incarnation.is_some()
+                || record.phase != SharedSessionPhase::Reserved =>
+            {
+                return Err(SharedSessionError::GenerationStale);
+            }
+            _ => {}
+        }
+        let state = record.state.as_ref().cloned().unwrap_or(state);
+        let emitter = record.emitter.as_ref().cloned().unwrap_or(emitter);
+        let phase = SharedSessionPhase::Failed {
+            error_code,
+            cleanup_complete,
+        };
+        {
+            let mut state = state.write().await;
+            update_public_shared_phase(&mut state, generation, phase.clone());
+        }
+        record.state = Some(state.clone());
+        record.emitter = Some(emitter.clone());
+        record.cleanup_complete = cleanup_complete;
+        record.phase = phase;
+        record.publish_registration();
+        record
+            .lifecycle_tx
+            .send_replace(SharedLifecycleState::Failed);
+        Ok((state, emitter))
+    }
+
+    pub(crate) async fn public_state(
+        &self,
+        connection_id: &str,
+    ) -> Option<(Arc<RwLock<SessionState>>, EventEmitter)> {
+        self.with_authoritative_record(connection_id, |record| {
+            match (record.state.clone(), record.emitter.clone()) {
+                (Some(state), Some(emitter)) => Ok(Some((state, emitter))),
+                _ => Ok(None),
+            }
+        })
+        .await
+        .ok()
+        .flatten()
+        .flatten()
+    }
+
+    pub(crate) async fn wait_for_phase(
+        &self,
+        connection_id: &str,
+        generation: u64,
+        expected: SharedSessionPhase,
+    ) -> Result<(), SharedSessionError> {
+        let mut receiver = self
+            .with_authoritative_record(connection_id, |record| {
+                if record.generation != generation {
+                    return Err(SharedSessionError::GenerationStale);
+                }
+                Ok(record.registration_tx.subscribe())
+            })
+            .await?
+            .ok_or(SharedSessionError::SessionUnavailable)?;
+        loop {
+            let current = receiver.borrow().phase.clone();
+            if current == expected {
+                return Ok(());
+            }
+            match (&current, &expected) {
+                (
+                    SharedSessionPhase::Failed {
+                        error_code: current_code,
+                        cleanup_complete: false,
+                    },
+                    SharedSessionPhase::Failed {
+                        error_code: expected_code,
+                        cleanup_complete: true,
+                    },
+                ) if current_code == expected_code => {}
+                (SharedSessionPhase::Failed { .. }, _) => {
+                    return Err(SharedSessionError::SessionUnavailable);
+                }
+                (SharedSessionPhase::Closing, _) => {
+                    return Err(SharedSessionError::Closing);
+                }
+                _ => {}
+            }
+            receiver
+                .changed()
+                .await
+                .map_err(|_| SharedSessionError::SessionUnavailable)?;
+        }
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn wait_for_key_phase_for_test(
+        &self,
+        key: &SharedSessionKey,
+        expected: SharedSessionPhase,
+    ) -> Result<(), SharedSessionError> {
+        let mut epoch = self.index_epoch.subscribe();
+        loop {
+            let record = {
+                let index = self.index.lock().await;
+                index.sessions.get(key).cloned()
+            };
+            if let Some(record) = record {
+                let mut registration = record.lock().await.registration_tx.subscribe();
+                loop {
+                    if registration.borrow().phase == expected {
+                        return Ok(());
+                    }
+                    registration
+                        .changed()
+                        .await
+                        .map_err(|_| SharedSessionError::SessionUnavailable)?;
+                }
+            }
+            epoch
+                .changed()
+                .await
+                .map_err(|_| SharedSessionError::SessionUnavailable)?;
+        }
+    }
+
     async fn with_authoritative_record<T>(
         &self,
         connection_id: &str,
@@ -242,6 +575,28 @@ impl SharedSessionBroker {
                     Err(_) => true,
                 };
                 contended
+            };
+            if contended {
+                tokio::task::yield_now().await;
+            }
+        }
+    }
+
+    async fn authoritative_record_guard(
+        &self,
+        connection_id: &str,
+    ) -> Result<tokio::sync::OwnedMutexGuard<SharedSessionRecord>, SharedSessionError> {
+        loop {
+            let contended = {
+                let index = self.index.lock().await;
+                let record = index
+                    .record_for_connection(connection_id)
+                    .cloned()
+                    .ok_or(SharedSessionError::SessionUnavailable)?;
+                match record.try_lock_owned() {
+                    Ok(record) => return Ok(record),
+                    Err(_) => true,
+                }
             };
             if contended {
                 tokio::task::yield_now().await;
@@ -306,11 +661,16 @@ impl SharedSessionBroker {
         debug_assert!(added_lease);
         let replacement = Arc::new(Mutex::new(replacement));
 
+        current
+            .lifecycle_tx
+            .send_replace(SharedLifecycleState::Replaced);
         index.by_connection.remove(&old_connection_id);
         index
             .by_connection
             .insert(request.connection_id.clone(), request.key.clone());
         index.sessions.insert(request.key.clone(), replacement);
+        self.index_epoch
+            .send_modify(|epoch| *epoch = epoch.saturating_add(1));
         self.metrics.remove_active_leases(old_active_leases);
         self.metrics.add_active_leases(1);
 
@@ -318,6 +678,29 @@ impl SharedSessionBroker {
             attachment,
             created: true,
         }))
+    }
+}
+
+fn update_public_shared_phase(
+    state: &mut SessionState,
+    generation: u64,
+    phase: SharedSessionPhase,
+) {
+    state.status = phase.connection_status();
+    match state.shared_session.as_mut() {
+        Some(projection) => {
+            projection.generation = generation;
+            projection.phase = phase;
+        }
+        None => {
+            state.shared_session = Some(SharedSessionProjection {
+                generation,
+                phase,
+                queue: Vec::new(),
+                active_turn: None,
+                lease_expires_at: None,
+            });
+        }
     }
 }
 
@@ -358,6 +741,12 @@ struct SharedSessionRecord {
     launch_identity: SharedLaunchIdentity,
     phase: SharedSessionPhase,
     cleanup_complete: bool,
+    state: Option<Arc<RwLock<SessionState>>>,
+    emitter: Option<EventEmitter>,
+    driver_incarnation: Option<String>,
+    child_pid: Option<Arc<std::sync::atomic::AtomicU32>>,
+    registration_tx: watch::Sender<SharedRegistrationState>,
+    lifecycle_tx: watch::Sender<SharedLifecycleState>,
     active_leases: HashMap<ClientIdentity, ActiveLease>,
     connect_ledger: HashMap<ConnectIdentity, SharedSessionAttachment>,
     expired_leases: VecDeque<String>,
@@ -373,12 +762,20 @@ impl SharedSessionRecord {
         generation: u64,
         replaced_failed_generation: Option<u64>,
     ) -> Self {
+        let (registration_tx, _) = watch::channel(SharedRegistrationState::reserved());
+        let (lifecycle_tx, _) = watch::channel(SharedLifecycleState::Active);
         Self {
             generation,
             connection_id: request.connection_id.clone(),
             launch_identity: request.launch_identity.clone(),
             phase: SharedSessionPhase::Reserved,
             cleanup_complete: false,
+            state: None,
+            emitter: None,
+            driver_incarnation: None,
+            child_pid: None,
+            registration_tx,
+            lifecycle_tx,
             active_leases: HashMap::new(),
             connect_ledger: HashMap::new(),
             expired_leases: VecDeque::new(),
@@ -387,6 +784,15 @@ impl SharedSessionRecord {
             _created_at_utc: request.now_utc,
             connect_count: 0,
         }
+    }
+
+    fn publish_registration(&self) {
+        self.registration_tx.send_replace(SharedRegistrationState {
+            phase: self.phase.clone(),
+            state: self.state.clone(),
+            emitter: self.emitter.clone(),
+            driver_incarnation: self.driver_incarnation.clone(),
+        });
     }
 
     fn check_attach_identity(
@@ -535,6 +941,36 @@ impl SharedSessionRecord {
         self.connect_count = self.connect_count.saturating_add(1);
         Ok((attachment, is_new_client))
     }
+}
+
+#[allow(dead_code)]
+#[derive(Clone)]
+pub(crate) struct SharedRegistrationState {
+    pub phase: SharedSessionPhase,
+    pub state: Option<Arc<RwLock<SessionState>>>,
+    pub emitter: Option<EventEmitter>,
+    pub driver_incarnation: Option<String>,
+}
+
+impl SharedRegistrationState {
+    fn reserved() -> Self {
+        Self {
+            phase: SharedSessionPhase::Reserved,
+            state: None,
+            emitter: None,
+            driver_incarnation: None,
+        }
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SharedLifecycleState {
+    Active,
+    Failed,
+    Closing,
+    Removed,
+    Replaced,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]

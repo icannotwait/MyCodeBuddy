@@ -505,6 +505,7 @@ struct ConnectionCleanupGuard {
     connection_id: String,
     connection_incarnation: String,
     tool_lease_registry: Arc<crate::acp::tool_watchdog::ToolExecutionLeaseRegistry>,
+    runtime: tokio::runtime::Handle,
 }
 
 impl Drop for ConnectionCleanupGuard {
@@ -517,7 +518,7 @@ impl Drop for ConnectionCleanupGuard {
         // entry becomes invisible to routing/scan. Manager-controlled disconnect
         // paths also clear synchronously; this path covers natural task exit
         // and panic unwind (remove_connection is idempotent).
-        tokio::spawn(async move {
+        self.runtime.spawn(async move {
             let _ = registry
                 .remove_connection(&connection_id, &incarnation)
                 .await;
@@ -1708,7 +1709,8 @@ pub async fn spawn_agent_connection(
     session_attach_mode: crate::acp::session_attach::SessionAttachMode,
     tool_lease_registry: Arc<crate::acp::tool_watchdog::ToolExecutionLeaseRegistry>,
     mcp_cancel_registry: Arc<crate::acp::tool_watchdog::McpCancelRegistry>,
-) -> Result<SpawnHandshake, AcpError> {
+    existing_public_state: Option<Arc<RwLock<SessionState>>>,
+) -> Result<RegisteredSpawnAttempt, AcpError> {
     // Create the authoritative session state up front. Subsequent emit_with_state
     // calls write through this state and increment its seq counter so the first
     // event the frontend sees has seq=1, not the placeholder 0 from Phase 0.
@@ -1734,24 +1736,36 @@ pub async fn spawn_agent_connection(
     initial_state.purpose = launch_context.purpose;
     initial_state.effective_locale = launch_context.inherited_locale.unwrap_or(AppLocale::En);
 
-    // Install the SessionStarted dedup signal BEFORE wrapping into Arc so the
-    // first event (StatusChanged{Connecting} below) doesn't race with the
-    // installer. The receiver is returned to `spawn_agent`, which holds the
-    // per-session dedup lock until this rx fires (or times out / aborts).
-    let session_started_rx = initial_state.install_session_started_signal();
+    // Install the SessionStarted dedup signal before the first event. A
+    // same-generation fallback replaces driver-owned fields inside the exact
+    // public Arc so existing subscribers keep one event stream and sequence.
+    let (session_state, pending_replacement, session_started_rx) = match existing_public_state {
+        Some(session_state) => {
+            let session_started_rx = initial_state.install_session_started_signal();
+            (session_state, Some(initial_state), session_started_rx)
+        }
+        None => {
+            let session_started_rx = initial_state.install_session_started_signal();
+            (
+                Arc::new(RwLock::new(initial_state)),
+                None,
+                session_started_rx,
+            )
+        }
+    };
     let (route_bootstrap_tx, route_bootstrap_rx) =
         tokio::sync::oneshot::channel::<RouteBootstrapOutcome>();
 
-    let session_state = Arc::new(RwLock::new(initial_state));
-
-    emit_with_state(
-        &session_state,
-        &emitter,
-        AcpEvent::StatusChanged {
-            status: ConnectionStatus::Connecting,
-        },
-    )
-    .await;
+    if pending_replacement.is_none() {
+        emit_with_state(
+            &session_state,
+            &emitter,
+            AcpEvent::StatusChanged {
+                status: ConnectionStatus::Connecting,
+            },
+        )
+        .await;
+    }
 
     // Align ~/.hermes/.env's base-URL var with config.yaml's model.base_url so
     // Hermes' auxiliary tasks (title generation, compression, …) resolve the
@@ -1772,23 +1786,6 @@ pub async fn spawn_agent_connection(
     // backstop when the connection driver thread is torn down by process exit
     // before `ChildGuard::drop` can run. 0 = not spawned yet / unknown.
     let child_pid = Arc::new(std::sync::atomic::AtomicU32::new(0));
-    let agent = build_agent(agent_type, &runtime_env, &launch_cwd, &route_plan)
-        .await?
-        .on_spawn({
-            let child_pid = Arc::clone(&child_pid);
-            move |pid| child_pid.store(pid, std::sync::atomic::Ordering::SeqCst)
-        })
-        // Paired with `on_spawn`: publish 0 again once the process has been
-        // reaped, so the shutdown backstop can never `kill_tree` a pid the OS
-        // has already handed to someone else. Fires ONLY on a real reap — a
-        // connection that merely ended keeps its pid published, because the
-        // vendored `ChildGuard` signals the tree without waiting and the agent
-        // may still be running.
-        .on_exit({
-            let child_pid = Arc::clone(&child_pid);
-            move || child_pid.store(0, std::sync::atomic::Ordering::SeqCst)
-        });
-
     // Path policy for the ACP `fs/*` channel. Built HERE rather than inside
     // `run_connection` because it needs the full `runtime_env` (only the git
     // credential keys survive into `terminal_base_env` below), and a per-agent
@@ -1848,7 +1845,7 @@ pub async fn spawn_agent_connection(
             owner_window_label,
             owner_operation_id,
         );
-        {
+        if pending_replacement.is_none() {
             let mut st = session_state.write().await;
             st.owner_window_label = label.clone();
         }
@@ -1877,7 +1874,7 @@ pub async fn spawn_agent_connection(
                 origin,
                 route_preference,
                 route_capability,
-                child_pid,
+                child_pid: child_pid.clone(),
             },
         );
     }
@@ -1892,6 +1889,10 @@ pub async fn spawn_agent_connection(
     // process exit; no JoinHandle is awaited), so a thread is behaviorally
     // equivalent to the previous task.
     let connection_rt = tokio::runtime::Handle::current();
+    let driver_connection_incarnation = connection_incarnation.clone();
+    let driver_route_plan = route_plan.clone();
+    let registered_route_plan = route_plan.clone();
+    let registered_child_pid = child_pid.clone();
     // RAII guard built OUTSIDE the thread body and moved in: on a normal exit
     // or panic unwind its Drop removes the manager map entry, AND if the thread
     // fails to spawn the dropped closure runs the same Drop — so the entry is
@@ -1901,6 +1902,7 @@ pub async fn spawn_agent_connection(
         connection_id: cleanup_connection_id,
         connection_incarnation: connection_incarnation.clone(),
         tool_lease_registry,
+        runtime: connection_rt.clone(),
     };
 
     // Keep the manager's existing Tokio AbortHandle contract while the large
@@ -1913,6 +1915,7 @@ pub async fn spawn_agent_connection(
     });
     let driver_abort_handle = abort_signal_task.abort_handle();
     let spawn_failure_abort = driver_abort_handle.clone();
+    let (driver_start_tx, driver_start_rx) = tokio::sync::oneshot::channel::<()>();
 
     let connection_thread = std::thread::Builder::new()
         .name(format!("acp-conn-{conn_id}"))
@@ -1921,6 +1924,56 @@ pub async fn spawn_agent_connection(
             let _cleanup = cleanup_guard;
             let driver = async move {
                 let delegation_for_cleanup = delegation_injection.clone();
+                let agent =
+                    match build_agent(agent_type, &runtime_env, &launch_cwd, &driver_route_plan)
+                        .await
+                    {
+                        Ok(agent) => agent
+                            .on_spawn({
+                                let child_pid = Arc::clone(&child_pid);
+                                move |pid| child_pid.store(pid, std::sync::atomic::Ordering::SeqCst)
+                            })
+                            .on_exit({
+                                let child_pid = Arc::clone(&child_pid);
+                                move || child_pid.store(0, std::sync::atomic::Ordering::SeqCst)
+                            }),
+                        Err(error) => {
+                            let code = error.code().map(String::from);
+                            let message = error.to_string();
+                            let _ = route_bootstrap_tx.send(RouteBootstrapOutcome::Fatal(error));
+                            if let Some(injection) = delegation_for_cleanup {
+                                cleanup_delegation_parent(&injection, &conn_id, &state_clone).await;
+                            }
+                            emit_with_state(
+                                &state_clone,
+                                &emitter_clone,
+                                AcpEvent::Error {
+                                    message,
+                                    agent_type: agent_type.to_string(),
+                                    code,
+                                    terminal: true,
+                                },
+                            )
+                            .await;
+                            emit_with_state(
+                                &state_clone,
+                                &emitter_clone,
+                                AcpEvent::StatusChanged {
+                                    status: ConnectionStatus::Error,
+                                },
+                            )
+                            .await;
+                            emit_with_state(
+                                &state_clone,
+                                &emitter_clone,
+                                AcpEvent::StatusChanged {
+                                    status: ConnectionStatus::Disconnected,
+                                },
+                            )
+                            .await;
+                            return;
+                        }
+                    };
                 // run_connection reports bootstrap via oneshot; map AcpError paths to
                 // typed outcomes for the manager's single-attempt fallback policy.
                 let result = run_connection(
@@ -1941,8 +1994,8 @@ pub async fn spawn_agent_connection(
                     preferred_config_values,
                     delegation_injection,
                     workflow_child_mcp_binding,
-                    connection_incarnation,
-                    route_plan,
+                    driver_connection_incarnation,
+                    driver_route_plan,
                     route_bootstrap_tx,
                     session_attach_mode,
                     fs_policy,
@@ -1999,9 +2052,16 @@ pub async fn spawn_agent_connection(
                 .await;
             };
             connection_rt.block_on(async move {
+                let mut driver_abort_rx = driver_abort_rx;
+                if !wait_for_registered_driver_activation(driver_start_rx, &mut driver_abort_rx)
+                    .await
+                {
+                    abort_signal_task.abort();
+                    return;
+                }
                 tokio::select! {
                     _ = driver => {}
-                    _ = driver_abort_rx => {}
+                    _ = &mut driver_abort_rx => {}
                 }
                 abort_signal_task.abort();
             });
@@ -2025,11 +2085,30 @@ pub async fn spawn_agent_connection(
             conn.task_abort = Some(driver_abort_handle);
         }
     }
-
-    Ok(SpawnHandshake {
-        session_started_rx,
-        route_bootstrap_rx,
+    Ok(RegisteredSpawnAttempt {
+        connection_id,
+        connection_incarnation,
+        state: session_state,
+        emitter,
+        handshake: SpawnHandshake {
+            session_started_rx,
+            route_bootstrap_rx,
+        },
+        route_plan: registered_route_plan,
+        driver_start_tx: Some(driver_start_tx),
+        pending_replacement,
+        child_pid: registered_child_pid,
     })
+}
+
+async fn wait_for_registered_driver_activation(
+    driver_start_rx: tokio::sync::oneshot::Receiver<()>,
+    driver_abort_rx: &mut tokio::sync::oneshot::Receiver<()>,
+) -> bool {
+    tokio::select! {
+        start = driver_start_rx => start.is_ok(),
+        _ = driver_abort_rx => false,
+    }
 }
 
 /// A pending permission-card responder. `Acp` is a real ACP
@@ -4251,6 +4330,28 @@ impl RouteBootstrapOutcome {
 pub struct SpawnHandshake {
     pub session_started_rx: tokio::sync::oneshot::Receiver<()>,
     pub route_bootstrap_rx: tokio::sync::oneshot::Receiver<RouteBootstrapOutcome>,
+}
+
+/// A connection whose public state and cleanup fence are registered, while
+/// route readiness continues asynchronously in the owned driver.
+pub struct RegisteredSpawnAttempt {
+    pub connection_id: String,
+    pub connection_incarnation: String,
+    pub state: Arc<RwLock<SessionState>>,
+    pub emitter: EventEmitter,
+    pub handshake: SpawnHandshake,
+    pub route_plan: crate::acp::delegation::route::DelegationRoutePlan,
+    pub(crate) driver_start_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    pub(crate) pending_replacement: Option<SessionState>,
+    pub(crate) child_pid: Arc<std::sync::atomic::AtomicU32>,
+}
+
+impl RegisteredSpawnAttempt {
+    pub(crate) fn activate_driver(&mut self) {
+        if let Some(driver_start_tx) = self.driver_start_tx.take() {
+            let _ = driver_start_tx.send(());
+        }
+    }
 }
 
 /// Locate the `codeg-mcp` companion binary across the supported deployment
@@ -16469,6 +16570,23 @@ mod tests {
             merged["mcpConfig"]["codeg-mcp"],
             grok_codeg_mcp_timeout_config()
         );
+    }
+
+    #[tokio::test]
+    async fn registered_driver_abort_before_activation_does_not_wait_for_start_sender_drop() {
+        let (driver_start_tx, driver_start_rx) = tokio::sync::oneshot::channel();
+        let (driver_abort_tx, mut driver_abort_rx) = tokio::sync::oneshot::channel();
+        let waiter = tokio::spawn(async move {
+            wait_for_registered_driver_activation(driver_start_rx, &mut driver_abort_rx).await
+        });
+
+        driver_abort_tx.send(()).unwrap();
+        let activated = tokio::time::timeout(std::time::Duration::from_millis(100), waiter)
+            .await
+            .expect("abort must release an unactivated registered driver")
+            .unwrap();
+        assert!(!activated);
+        drop(driver_start_tx);
     }
 
     #[test]

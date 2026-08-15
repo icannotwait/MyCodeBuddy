@@ -366,6 +366,9 @@ pub struct SessionState {
     pub working_dir: Option<PathBuf>,
     pub owner_window_label: String,
     pub folder_id: Option<i32>,
+    /// Shared-session broker projection retained across same-generation route
+    /// fallback. Public snapshots expose only this redacted DTO.
+    pub shared_session: Option<crate::acp::shared_session::SharedSessionProjection>,
 
     // 状态
     pub status: ConnectionStatus,
@@ -675,6 +678,7 @@ impl SessionState {
             working_dir,
             owner_window_label,
             folder_id,
+            shared_session: None,
             status: ConnectionStatus::Connecting,
             live_message: None,
             active_tool_calls: BTreeMap::new(),
@@ -730,6 +734,24 @@ impl SessionState {
             effective_locale: AppLocale::En,
             active_turn: None,
         }
+    }
+
+    /// Install a fresh driver-owned connection state while retaining the one
+    /// public session identity and replay stream already held by attachers.
+    pub fn prepare_registered_replacement(&mut self, replacement: SessionState) {
+        assert_eq!(
+            self.connection_id, replacement.connection_id,
+            "registered replacement must retain the public connection id"
+        );
+
+        let previous = std::mem::replace(self, replacement);
+        self.conversation_id = previous.conversation_id;
+        self.folder_id = previous.folder_id;
+        self.shared_session = previous.shared_session;
+        self.event_seq = previous.event_seq;
+        self.event_stream = previous.event_stream;
+        self.recent_events = previous.recent_events;
+        self.status = ConnectionStatus::Connecting;
     }
 
     /// Clear only the active turn fenced by `generation`, retaining session
@@ -1856,6 +1878,7 @@ impl SessionState {
             connection_id: self.connection_id.clone(),
             conversation_id: self.conversation_id,
             folder_id: self.folder_id,
+            shared_session: self.shared_session.clone(),
             status: self.status.clone(),
             external_id: self.external_id.clone(),
             live_message: self.live_message.clone(),
@@ -1912,6 +1935,8 @@ pub struct LiveSessionSnapshot {
     pub connection_id: String,
     pub conversation_id: Option<i32>,
     pub folder_id: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_session: Option<crate::acp::shared_session::SharedSessionProjection>,
     pub status: ConnectionStatus,
     pub external_id: Option<String>,
     pub live_message: Option<LiveMessage>,
@@ -2156,6 +2181,50 @@ mod tests {
         assert_eq!(original.effective, changed.effective);
         assert_eq!(original.source, changed.source);
         assert!(!changed.delegation_available);
+    }
+
+    #[tokio::test]
+    async fn prepare_registered_replacement_preserves_public_state_and_event_sequence() {
+        let state = Arc::new(tokio::sync::RwLock::new(fresh_state()));
+        let original_arc = Arc::clone(&state);
+        let original_stream = state.read().await.event_stream();
+        {
+            let mut current = state.write().await;
+            current.connection_incarnation = "incarnation-old".into();
+            current.conversation_id = Some(57);
+            current.folder_id = Some(9);
+            current.event_seq = 41;
+            current.status = ConnectionStatus::Error;
+        }
+
+        let mut replacement = SessionState::new(
+            "conn-test".into(),
+            AgentType::Codex,
+            Some(PathBuf::from("/tmp/shared-replacement")),
+            "shared-server".into(),
+            None,
+        );
+        replacement.connection_incarnation = "incarnation-new".into();
+        replacement.set_route_plan_snapshot(&codeg_plan(AgentType::Codex));
+
+        state
+            .write()
+            .await
+            .prepare_registered_replacement(replacement);
+
+        assert!(Arc::ptr_eq(&state, &original_arc));
+        let current = state.read().await;
+        assert_eq!(current.connection_incarnation, "incarnation-new");
+        assert_eq!(current.conversation_id, Some(57));
+        assert_eq!(current.folder_id, Some(9));
+        assert_eq!(current.event_seq, 41);
+        assert!(Arc::ptr_eq(&current.event_stream(), &original_stream));
+        assert_eq!(current.status, ConnectionStatus::Connecting);
+        assert_eq!(current.agent_type, AgentType::Codex);
+        assert_eq!(
+            current.working_dir.as_deref(),
+            Some(std::path::Path::new("/tmp/shared-replacement"))
+        );
     }
 
     #[test]

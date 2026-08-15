@@ -351,6 +351,211 @@ mod tests {
         assert!(!retry.created);
     }
 
+    #[tokio::test]
+    async fn registration_watch_publishes_exact_public_state_arc() {
+        let broker = SharedSessionBroker::default();
+        let reservation = broker
+            .reserve_or_attach(request(
+                SharedSessionKey::Conversation(13),
+                "registered-connection",
+                "registered-client",
+                "registered-request",
+            ))
+            .await
+            .unwrap();
+        let state = Arc::new(tokio::sync::RwLock::new(SessionState::new(
+            reservation.attachment.connection_id.clone(),
+            crate::models::agent::AgentType::Codex,
+            None,
+            "shared-server".into(),
+            Some(9),
+        )));
+        broker
+            .install_registered(
+                &reservation.attachment.connection_id,
+                reservation.attachment.generation,
+                "driver-incarnation".into(),
+                state.clone(),
+                EventEmitter::Noop,
+                Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            )
+            .await
+            .unwrap();
+
+        let registered = broker
+            .wait_until_registered(
+                &reservation.attachment.connection_id,
+                reservation.attachment.generation,
+            )
+            .await
+            .unwrap();
+        assert_eq!(registered.phase, SharedSessionPhase::Bootstrapping);
+        assert!(Arc::ptr_eq(registered.state.as_ref().unwrap(), &state));
+        assert_eq!(
+            registered.driver_incarnation.as_deref(),
+            Some("driver-incarnation")
+        );
+    }
+
+    #[tokio::test]
+    async fn ready_watch_observes_coherent_public_state() {
+        let broker = SharedSessionBroker::default();
+        let reservation = broker
+            .reserve_or_attach(request(
+                SharedSessionKey::Conversation(131),
+                "ready-connection",
+                "ready-client",
+                "ready-request",
+            ))
+            .await
+            .unwrap();
+        let state = Arc::new(tokio::sync::RwLock::new(SessionState::new(
+            reservation.attachment.connection_id.clone(),
+            crate::models::agent::AgentType::Codex,
+            None,
+            "shared-server".into(),
+            Some(9),
+        )));
+        state.write().await.shared_session = Some(SharedSessionProjection {
+            generation: reservation.attachment.generation,
+            phase: SharedSessionPhase::Bootstrapping,
+            queue: Vec::new(),
+            active_turn: None,
+            lease_expires_at: Some(reservation.attachment.lease_expires_at),
+        });
+        broker
+            .install_registered(
+                &reservation.attachment.connection_id,
+                reservation.attachment.generation,
+                "driver-incarnation".into(),
+                state.clone(),
+                EventEmitter::Noop,
+                Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            )
+            .await
+            .unwrap();
+
+        let waiter = {
+            let broker = broker.clone();
+            let connection_id = reservation.attachment.connection_id.clone();
+            let generation = reservation.attachment.generation;
+            tokio::spawn(async move {
+                broker
+                    .wait_for_phase(&connection_id, generation, SharedSessionPhase::Ready)
+                    .await
+            })
+        };
+        broker
+            .mark_ready(
+                &reservation.attachment.connection_id,
+                reservation.attachment.generation,
+                "driver-incarnation",
+            )
+            .await
+            .unwrap();
+        waiter.await.unwrap().unwrap();
+
+        let state = state.read().await;
+        assert_eq!(state.status, crate::acp::types::ConnectionStatus::Connected);
+        assert_eq!(
+            state.shared_session.as_ref().map(|projection| &projection.phase),
+            Some(&SharedSessionPhase::Ready)
+        );
+    }
+
+    #[tokio::test]
+    async fn old_driver_incarnation_cannot_settle_replacement() {
+        let broker = SharedSessionBroker::default();
+        let reservation = broker
+            .reserve_or_attach(request(
+                SharedSessionKey::Conversation(14),
+                "fallback-connection",
+                "fallback-client",
+                "fallback-request",
+            ))
+            .await
+            .unwrap();
+        let state = Arc::new(tokio::sync::RwLock::new(SessionState::new(
+            reservation.attachment.connection_id.clone(),
+            crate::models::agent::AgentType::Codex,
+            None,
+            "shared-server".into(),
+            None,
+        )));
+        broker
+            .install_registered(
+                &reservation.attachment.connection_id,
+                reservation.attachment.generation,
+                "driver-old".into(),
+                state.clone(),
+                EventEmitter::Noop,
+                Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            )
+            .await
+            .unwrap();
+        let mut replacement = SessionState::new(
+            reservation.attachment.connection_id.clone(),
+            crate::models::agent::AgentType::Codex,
+            None,
+            "shared-server".into(),
+            None,
+        );
+        replacement.connection_incarnation = "driver-new".into();
+        broker
+            .replace_registered_driver(
+                &reservation.attachment.connection_id,
+                reservation.attachment.generation,
+                "driver-old",
+                "driver-new".into(),
+                state,
+                EventEmitter::Noop,
+                replacement,
+                Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            broker
+                .mark_ready(
+                    &reservation.attachment.connection_id,
+                    reservation.attachment.generation,
+                    "driver-old",
+                )
+                .await,
+            Err(SharedSessionError::GenerationStale)
+        );
+        assert!(broker
+            .is_current_bootstrapping_driver(
+                &reservation.attachment.connection_id,
+                reservation.attachment.generation,
+                "driver-new",
+            )
+            .await);
+    }
+
+    #[tokio::test]
+    async fn failed_generation_publishes_replaced_before_record_swap() {
+        let broker = failed_cleanup_complete_fixture(15).await;
+        let old_record = record_for_connection_for_test(&broker, "failed-connection").await;
+        let mut lifecycle = {
+            let record = old_record.lock().await;
+            record.lifecycle_tx.subscribe()
+        };
+        let mut retry = request(
+            SharedSessionKey::Conversation(15),
+            "replacement-connection",
+            "replacement-client",
+            "replacement-request",
+        );
+        retry.retry_failed_generation = Some(1);
+
+        let replacement = broker.reserve_or_attach(retry).await.unwrap();
+        assert_eq!(replacement.attachment.generation, 2);
+        lifecycle.changed().await.unwrap();
+        assert_eq!(*lifecycle.borrow(), SharedLifecycleState::Replaced);
+    }
+
     #[test]
     fn debug_output_redacts_visible_text_and_lease_ids() {
         let summary = SharedQueuedPromptSummary {
