@@ -392,7 +392,11 @@ fn extract_unfenced_comment<'a>(
             .iter()
             .take_while(|byte| **byte == b' ')
             .count();
-        if indentation <= 3 && line[indentation..].starts_with(marker) {
+        let marker_is_exact = line[indentation..]
+            .strip_prefix(marker)
+            // A marker ends with the line or ASCII whitespace before its body.
+            .is_some_and(|rest| rest.is_empty() || rest.as_bytes()[0].is_ascii_whitespace());
+        if indentation <= 3 && marker_is_exact {
             marker_offsets.push(line_start + indentation);
         }
         line_start += line_with_ending.len();
@@ -925,6 +929,20 @@ mod tests {
     }
 
     #[test]
+    fn simple_parse_routing_ignores_prefix_lookalikes_before_live_marker() {
+        let plan = format!(
+            "# Plan\n\n<!-- codeg-b2d-routing-v10\n{{not-v1}}\n-->\n\n<!-- codeg-b2d-routing-v1-extra\n{{also-not-v1}}\n-->\n\n<!-- codeg-b2d-routing-v1\n{VALID_ROUTING_JSON}\n-->\n\n## Task 1: Live routing\n"
+        );
+        let parsed = parse_simple_plan(plan.as_bytes()).expect("parse");
+
+        assert_eq!(
+            parsed.routing.expect("live routing").risk_policy_version,
+            "b2d_task_risk_v1"
+        );
+        assert!(parsed.warning_codes.is_empty());
+    }
+
+    #[test]
     fn simple_parse_routing_retains_plan_file_utf8_and_size_hard_bounds() {
         assert_eq!(
             parse_simple_plan(&[0xff]).expect_err("invalid UTF-8"),
@@ -1073,6 +1091,30 @@ Ignored duplicate.
                 "expected route key must use the canonical grammar"
             );
         }
+        assert!(parsed.warning_codes.is_empty());
+    }
+
+    #[test]
+    fn simple_parse_progress_ignores_prefix_lookalikes_before_live_marker() {
+        let progress = br#"<!-- codeg-simple-progress-v10
+{"schema_version":10}
+-->
+<!-- codeg-simple-progress-v1-extra
+{"schema_version":1,"plan_rel_path":"docs/wrong.md","tasks":[]}
+-->
+<!-- codeg-simple-progress-v1
+{
+  "schema_version": 1,
+  "plan_rel_path": "docs/plan.md",
+  "tasks": [{"index": 1, "status": "pending", "runs": []}],
+  "final_review_status": "pending"
+}
+-->"#;
+        let parsed = parse_simple_progress(progress, "docs/plan.md").expect("parse");
+
+        let snapshot = parsed.snapshot.expect("live progress");
+        assert_eq!(snapshot.plan_rel_path, "docs/plan.md");
+        assert_eq!(snapshot.tasks.len(), 1);
         assert!(parsed.warning_codes.is_empty());
     }
 
