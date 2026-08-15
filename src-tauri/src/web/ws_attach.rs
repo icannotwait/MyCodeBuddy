@@ -170,21 +170,19 @@ pub async fn handle_attach(
     since_seq: Option<u64>,
 ) -> Result<AttachOutcome, DetachReason> {
     let broker = manager.shared_session_broker();
-    let binding = match broker
-        .validate_and_bind_lease(&connection_id, generation, lease_id.as_deref())
+    let (binding, retained_state) = match broker
+        .validate_and_bind_lease_with_state(&connection_id, generation, lease_id.as_deref())
         .await
     {
-        Ok(binding) => Some(binding),
-        Err(DetachReason::ConnectionGone) if generation.is_none() && lease_id.is_none() => None,
+        Ok((binding, state)) => (Some(binding), Some(state)),
+        Err(DetachReason::ConnectionGone) if generation.is_none() && lease_id.is_none() => {
+            (None, None)
+        }
         Err(reason) => return Err(reason),
     };
-    let state_arc = match binding.is_some() {
-        true => broker
-            .public_state_and_emitter(&connection_id)
-            .await
-            .map(|(state, _)| state)
-            .ok_or(DetachReason::ConnectionGone)?,
-        false => manager
+    let state_arc = match retained_state {
+        Some(state) => state,
+        None => manager
             .get_state(&connection_id)
             .await
             .ok_or(DetachReason::ConnectionGone)?,

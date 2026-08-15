@@ -128,6 +128,35 @@ impl SharedSessionBroker {
         generation: Option<u64>,
         lease_id: Option<&str>,
     ) -> Result<LeaseSocketBinding, DetachReason> {
+        self.validate_and_bind_lease_inner(connection_id, generation, lease_id)
+            .await
+            .map(|(binding, _)| binding)
+    }
+
+    /// Validate a lease and return the broker-retained public state captured in
+    /// the same map -> record critical section. This prevents a generation
+    /// replacement between lease validation and state lookup from being
+    /// misclassified as a legacy `connection_gone` attach.
+    pub(crate) async fn validate_and_bind_lease_with_state(
+        &self,
+        connection_id: &str,
+        generation: Option<u64>,
+        lease_id: Option<&str>,
+    ) -> Result<(LeaseSocketBinding, Arc<RwLock<SessionState>>), DetachReason> {
+        let (binding, state) = self
+            .validate_and_bind_lease_inner(connection_id, generation, lease_id)
+            .await?;
+        state
+            .map(|state| (binding, state))
+            .ok_or(DetachReason::ConnectionGone)
+    }
+
+    async fn validate_and_bind_lease_inner(
+        &self,
+        connection_id: &str,
+        generation: Option<u64>,
+        lease_id: Option<&str>,
+    ) -> Result<(LeaseSocketBinding, Option<Arc<RwLock<SessionState>>>), DetachReason> {
         loop {
             let contended = {
                 let index = self.index.lock().await;
@@ -176,12 +205,15 @@ impl SharedSessionBroker {
                                 },
                             );
                         };
-                        return Ok(LeaseSocketBinding {
-                            connection_id: record.connection_id.clone(),
-                            generation: record.generation,
-                            lease_id: lease.lease_id.clone(),
-                            lease_expires_at: lease.expires_at_utc,
-                        });
+                        return Ok((
+                            LeaseSocketBinding {
+                                connection_id: record.connection_id.clone(),
+                                generation: record.generation,
+                                lease_id: lease.lease_id.clone(),
+                                lease_expires_at: lease.expires_at_utc,
+                            },
+                            record.state.clone(),
+                        ));
                     }
                     Err(_) => true,
                 };
@@ -1504,14 +1536,12 @@ enum SharedLifecycleState {
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct ClientIdentity {
     client_instance_id: String,
-    device_id: String,
 }
 
 impl ClientIdentity {
     fn from_request(request: &SharedReserveRequest) -> Self {
         Self {
             client_instance_id: request.client_instance_id.clone(),
-            device_id: request.device_id.clone(),
         }
     }
 }

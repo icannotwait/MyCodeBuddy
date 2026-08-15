@@ -353,6 +353,116 @@ mod tests {
         assert!(!retry.created);
     }
 
+    #[tokio::test]
+    async fn same_client_instance_renews_across_device_ids() {
+        let broker = SharedSessionBroker::default();
+        let first = broker
+            .reserve_or_attach(request(
+                SharedSessionKey::Conversation(12),
+                "conn-a",
+                "client-a",
+                "req-a",
+            ))
+            .await
+            .unwrap();
+        let mut second_request = request(
+            SharedSessionKey::Conversation(12),
+            "conn-b",
+            "client-a",
+            "req-b",
+        );
+        second_request.device_id = "device-b".into();
+
+        let second = broker.reserve_or_attach(second_request).await.unwrap();
+
+        assert_eq!(second.attachment.lease_id, first.attachment.lease_id);
+        assert_eq!(second.attachment.disposition, SharedDisposition::Attached);
+        assert!(!second.created);
+        assert_eq!(broker.metrics().snapshot().active_leases, 1);
+    }
+
+    #[tokio::test]
+    async fn validated_attach_retains_public_state_across_replacement_boundary() {
+        let broker = SharedSessionBroker::default();
+        let reservation = broker
+            .reserve_or_attach(request(
+                SharedSessionKey::Conversation(23),
+                "old-connection",
+                "client-a",
+                "request-a",
+            ))
+            .await
+            .unwrap();
+        let state = Arc::new(tokio::sync::RwLock::new(SessionState::new(
+            reservation.attachment.connection_id.clone(),
+            crate::models::agent::AgentType::Codex,
+            None,
+            "shared-server".into(),
+            Some(23),
+        )));
+        broker
+            .install_registered(
+                &reservation.attachment.connection_id,
+                reservation.attachment.generation,
+                "driver-old".into(),
+                state.clone(),
+                EventEmitter::Noop,
+                Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            )
+            .await
+            .unwrap();
+
+        let (binding, retained_state) = broker
+            .validate_and_bind_lease_with_state(
+                &reservation.attachment.connection_id,
+                Some(reservation.attachment.generation),
+                Some(&reservation.attachment.lease_id),
+            )
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&retained_state, &state));
+
+        broker
+            .mark_failed(
+                &reservation.attachment.connection_id,
+                reservation.attachment.generation,
+                "companion_initialization_failed",
+                false,
+            )
+            .await
+            .unwrap();
+        broker
+            .mark_cleanup_complete(
+                &reservation.attachment.connection_id,
+                reservation.attachment.generation,
+            )
+            .await
+            .unwrap();
+        let mut replacement_request = request(
+            SharedSessionKey::Conversation(23),
+            "new-connection",
+            "client-b",
+            "request-b",
+        );
+        replacement_request.retry_failed_generation = Some(reservation.attachment.generation);
+        broker
+            .reserve_or_attach(replacement_request)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            broker
+                .validate_and_bind_lease(
+                    &binding.connection_id,
+                    Some(binding.generation),
+                    Some(&binding.lease_id),
+                )
+                .await,
+            Err(crate::web::ws_attach::DetachReason::SessionReplaced)
+        ));
+        assert!(Arc::ptr_eq(&retained_state, &state));
+    }
+
     #[derive(Clone)]
     struct TestLease {
         attachment: SharedSessionAttachment,
