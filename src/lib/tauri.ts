@@ -650,8 +650,7 @@ export async function getFolderConversation(
   conversationId: number,
   window?: { tailTurns?: number; fromIndex?: number }
 ): Promise<DbConversationDetail> {
-  const windowedByIndex =
-    window?.tailTurns != null || window?.fromIndex != null
+  const windowedByIndex = window?.tailTurns != null || window?.fromIndex != null
   return invoke("get_folder_conversation", {
     conversationId,
     ...(windowedByIndex

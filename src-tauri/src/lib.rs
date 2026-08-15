@@ -1728,6 +1728,27 @@ mod tauri_app {
     #[cfg(test)]
     mod tests {
         #[test]
+        fn production_tauri_registry_contains_repaired_commands() {
+            const REPAIRED_COMMAND_PATHS: &[&str] = &[
+                "acp_commands :: acp_pi_project_trust_state",
+                "acp_commands :: acp_pi_set_project_trust",
+                "acp_commands :: acp_pi_acknowledge_project_trust",
+                "acp_commands :: acp_pi_list_trust_entries",
+                "conversations :: get_folder_conversation_turns",
+                "folders :: git_update_branch",
+                "folders :: git_remove_worktree",
+            ];
+
+            let registered = super::production_tauri_command_paths();
+            for command in REPAIRED_COMMAND_PATHS {
+                assert!(
+                    registered.contains(command),
+                    "missing Tauri command: {command}"
+                );
+            }
+        }
+
+        #[test]
         fn production_tauri_registry_contains_retired_simple_successor_command() {
             assert!(super::production_tauri_command_paths().contains(
                 &"crate :: commands :: simple_workflow :: continue_archived_workflow_in_simple"

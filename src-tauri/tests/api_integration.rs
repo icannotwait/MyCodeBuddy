@@ -77,6 +77,58 @@ async fn protected_endpoint_accepts_correct_token() {
     assert_eq!(resp.status_code(), 200);
 }
 
+#[tokio::test]
+async fn repaired_commands_are_registered_in_web_runtime() {
+    let (server, _data, _static) = build_test_server().await;
+    let workspace = tempfile::tempdir().expect("workspace");
+
+    let state_response = server
+        .post("/api/acp_pi_project_trust_state")
+        .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
+        .json(&json!({
+            "workspace": workspace.path().to_string_lossy(),
+        }))
+        .await;
+    assert_eq!(
+        state_response.status_code(),
+        200,
+        "acp_pi_project_trust_state: {}",
+        state_response.text()
+    );
+
+    let list_response = server
+        .post("/api/acp_pi_list_trust_entries")
+        .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
+        .json(&json!({}))
+        .await;
+    assert_eq!(
+        list_response.status_code(),
+        200,
+        "acp_pi_list_trust_entries: {}",
+        list_response.text()
+    );
+
+    for route in [
+        "acp_pi_set_project_trust",
+        "acp_pi_acknowledge_project_trust",
+        "get_folder_conversation_turns",
+        "git_update_branch",
+        "git_remove_worktree",
+    ] {
+        let response = server
+            .post(&format!("/api/{route}"))
+            .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
+            .json(&json!({}))
+            .await;
+        assert_ne!(response.status_code(), 404, "missing Web route: {route}");
+        assert_ne!(
+            response.status_code(),
+            501,
+            "Web route reached fallback: {route}"
+        );
+    }
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Public endpoint
 // ────────────────────────────────────────────────────────────────────────────

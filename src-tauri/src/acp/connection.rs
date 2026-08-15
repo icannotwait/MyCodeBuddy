@@ -4375,15 +4375,13 @@ fn delegation_enabled(configured: bool, host_tools: HostToolsPolicy) -> bool {
 /// catalog bytes and gives the model two routes for the same interaction.
 fn companion_features_arg_for_agent(
     agent_type: AgentType,
-    host_tools: HostToolsPolicy,
-    configured_delegation: bool,
+    delegation_enabled: bool,
     coordination_v1: bool,
     feedback_enabled: bool,
     ask_enabled: bool,
     sessions_enabled: bool,
     workflow_v2: bool,
 ) -> Option<String> {
-    let delegation_enabled = delegation_enabled(configured_delegation, host_tools);
     companion_features_arg(
         delegation_enabled,
         coordination_v1 && delegation_enabled,
@@ -4463,7 +4461,6 @@ async fn inject_codeg_mcp(
     // `None` (no feature enabled) short-circuits the whole injection.
     let mut features_arg = companion_features_arg_for_agent(
         agent_type,
-        host_tools,
         delegation_enabled,
         coordination_v1,
         feedback_enabled,
@@ -21901,29 +21898,11 @@ mod tests {
     #[test]
     fn companion_features_arg_uses_native_ask_for_grok_only() {
         assert_eq!(
-            companion_features_arg_for_agent(
-                AgentType::Grok,
-                HostToolsPolicy::Default,
-                true,
-                true,
-                true,
-                true,
-                true,
-                true,
-            ),
+            companion_features_arg_for_agent(AgentType::Grok, true, true, true, true, true, true,),
             Some("delegation,coordination_v1,feedback,sessions,workflow_v2".to_string())
         );
         assert_eq!(
-            companion_features_arg_for_agent(
-                AgentType::Codex,
-                HostToolsPolicy::Default,
-                true,
-                true,
-                true,
-                true,
-                true,
-                true,
-            ),
+            companion_features_arg_for_agent(AgentType::Codex, true, true, true, true, true, true,),
             Some("delegation,coordination_v1,feedback,ask,sessions,workflow_v2".to_string())
         );
     }
@@ -21935,8 +21914,7 @@ mod tests {
         assert_eq!(
             companion_features_arg_for_agent(
                 AgentType::Codex,
-                HostToolsPolicy::Agent,
-                true,
+                delegation_enabled(true, HostToolsPolicy::Agent),
                 true,
                 true,
                 true,
