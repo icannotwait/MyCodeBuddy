@@ -222,8 +222,7 @@ impl SharedSessionBroker {
         generation: u64,
     ) -> Result<
         (
-            Arc<RwLock<SessionState>>,
-            EventEmitter,
+            Option<(Arc<RwLock<SessionState>>, EventEmitter)>,
             Vec<crate::acp::types::AcpEvent>,
         ),
         SharedSessionError,
@@ -232,35 +231,26 @@ impl SharedSessionBroker {
             if record.connection_id != connection_id || record.generation != generation {
                 return Err(SharedSessionError::GenerationStale);
             }
-            let state_handle = record
-                .state
-                .as_ref()
-                .cloned()
-                .ok_or(SharedSessionError::SessionUnavailable)?;
-            let emitter = record
-                .emitter
-                .as_ref()
-                .cloned()
-                .ok_or(SharedSessionError::SessionUnavailable)?;
             let error_code = match &record.phase {
                 SharedSessionPhase::Failed { error_code, .. } => error_code.clone(),
                 _ => return Err(SharedSessionError::SessionUnavailable),
+            };
+            let publication_handles = match (record.state.as_ref(), record.emitter.as_ref()) {
+                (Some(state), Some(emitter)) => Some((state.clone(), emitter.clone())),
+                _ => None,
             };
             let phase = SharedSessionPhase::Failed {
                 error_code,
                 cleanup_complete: true,
             };
-            update_public_shared_phase(
-                state.ok_or(SharedSessionError::SessionUnavailable)?,
-                generation,
-                phase.clone(),
-            );
+            if let Some(state) = state {
+                update_public_shared_phase(state, generation, phase.clone());
+            }
             record.cleanup_complete = true;
             record.phase = phase;
             record.publish_registration();
             Ok((
-                state_handle,
-                emitter,
+                publication_handles,
                 vec![crate::acp::types::AcpEvent::SharedSessionPhaseChanged {
                     generation,
                     phase: record.phase.clone(),

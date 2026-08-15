@@ -99,7 +99,6 @@ mod tests {
             ))
             .await
             .unwrap();
-        install_test_registration(&broker, &first.attachment.connection_id, 1, Some(8)).await;
         broker
             .mark_failed(
                 &first.attachment.connection_id,
@@ -120,10 +119,12 @@ mod tests {
             broker.reserve_or_attach(retry.clone()).await,
             Err(SharedSessionError::CleanupInProgress)
         ));
-        broker
+        let (cleanup_handles, cleanup_events) = broker
             .mark_cleanup_complete(&first.attachment.connection_id, 1)
             .await
             .unwrap();
+        assert!(cleanup_handles.is_none());
+        assert_eq!(cleanup_events.len(), 1);
         let replacement = broker.reserve_or_attach(retry).await.unwrap();
         assert_eq!(replacement.attachment.generation, 2);
         assert_eq!(replacement.attachment.connection_id, "conn-b");
@@ -682,13 +683,14 @@ mod tests {
 
         let mut old_stream = state.read().await.event_stream().subscribe();
         let sequence_before_cleanup = state.read().await.event_seq;
-        let (cleanup_state, cleanup_emitter, cleanup_events) = broker
+        let (cleanup_handles, cleanup_events) = broker
             .mark_cleanup_complete(
                 &reservation.attachment.connection_id,
                 reservation.attachment.generation,
             )
             .await
             .unwrap();
+        let (cleanup_state, cleanup_emitter) = cleanup_handles.expect("registered handles");
         assert!(Arc::ptr_eq(&cleanup_state, &state));
 
         let mut retry = request(
@@ -913,13 +915,6 @@ mod tests {
             ))
             .await
             .unwrap();
-        install_test_registration(
-            &broker,
-            &first.attachment.connection_id,
-            1,
-            Some(id),
-        )
-        .await;
         broker
             .mark_failed(
                 &first.attachment.connection_id,
@@ -934,31 +929,6 @@ mod tests {
             .await
             .unwrap();
         broker
-    }
-
-    async fn install_test_registration(
-        broker: &SharedSessionBroker,
-        connection_id: &str,
-        generation: u64,
-        conversation_id: Option<i32>,
-    ) {
-        broker
-            .install_registered(
-                connection_id,
-                generation,
-                "test-driver-incarnation".into(),
-                Arc::new(tokio::sync::RwLock::new(SessionState::new(
-                    connection_id.into(),
-                    crate::models::agent::AgentType::Codex,
-                    None,
-                    "shared-server".into(),
-                    conversation_id,
-                ))),
-                EventEmitter::Noop,
-                Arc::new(std::sync::atomic::AtomicU32::new(0)),
-            )
-            .await
-            .unwrap();
     }
 
     async fn install_replacement_pointer(broker: &SharedSessionBroker, id: i32) {

@@ -1412,7 +1412,7 @@ impl ConnectionManager {
             .is_ok()
             && !self.connections.lock().await.contains_key(&connection_id);
         if cleanup_complete {
-            if let Ok((state, emitter, events)) = self
+            if let Ok((Some((state, emitter)), events)) = self
                 .shared_session_broker
                 .mark_cleanup_complete(&connection_id, generation)
                 .await
@@ -1486,7 +1486,7 @@ impl ConnectionManager {
             .is_ok()
             && !self.connections.lock().await.contains_key(&connection_id);
         if cleanup_complete {
-            if let Ok((state, emitter, events)) = self
+            if let Ok((Some((state, emitter)), events)) = self
                 .shared_session_broker
                 .mark_cleanup_complete(&connection_id, generation)
                 .await
