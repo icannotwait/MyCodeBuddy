@@ -8,11 +8,10 @@
 //! built-in web service is functional too.
 //!
 //! All three endpoints share the same path-safety contract: caller passes
-//! a `root_path` (the absolute path of an opened workspace) plus a
-//! relative path that must not contain `..` or absolute components. The
-//! handler joins them, then `canonicalize`s and confirms the resolved
-//! path starts with the canonical root, so a symlink inside the user's
-//! workspace cannot redirect reads or writes outside it.
+//! a `root_path` (the absolute path of an opened workspace) plus a relative
+//! path that must not contain `..` or absolute components. The resolved path
+//! must stay under the canonical root or a folder target the user explicitly
+//! linked into that root; arbitrary symlinks remain outside the boundary.
 
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -88,31 +87,43 @@ fn resolve_relative_path(root: &Path, rel: &str) -> Result<PathBuf, AppCommandEr
     Ok(root.join(rel_path))
 }
 
-fn ensure_inside_root(root: &Path, target: &Path) -> Result<(), AppCommandError> {
+fn canonicalize_allowed_target(root: &Path, target: &Path) -> Result<PathBuf, AppCommandError> {
     let canonical_root = std::fs::canonicalize(root).map_err(AppCommandError::io)?;
     let canonical_target = std::fs::canonicalize(target).map_err(AppCommandError::io)?;
-    if !canonical_target.starts_with(&canonical_root) {
+    if !canonical_target.starts_with(&canonical_root)
+        && !crate::folder_links::is_allowed(&canonical_root, &canonical_target)
+    {
         return Err(AppCommandError::invalid_input(
             "Resolved path escapes workspace root",
         ));
     }
-    Ok(())
+    Ok(canonical_target)
 }
 
-/// Walk from `root` toward `target` one segment at a time and reject if any
-/// already-existing component is a symlink. `target` must be a descendant of
-/// `root` (callers compose it via `resolve_relative_path`).
+fn ensure_inside_root(root: &Path, target: &Path) -> Result<(), AppCommandError> {
+    canonicalize_allowed_target(root, target).map(|_| ())
+}
+
+/// Walk from `root` toward `target` one segment at a time. `target` must be a
+/// descendant of `root` (callers compose it via `resolve_relative_path`).
 ///
 /// This runs *before* `create_dir_all`, which would otherwise follow a
 /// symlink mid-chain and silently create new directories outside the
 /// workspace. The earlier post-hoc `canonicalize` check caught the
 /// escape but the side-effect (empty dir at the symlink target) was
 /// already on disk.
-fn ensure_no_symlink_in_chain(root: &Path, target: &Path) -> Result<(), AppCommandError> {
+///
+/// A symlink is followed only when it resolves inside a folder target the user
+/// explicitly registered for this workspace. The returned path contains the
+/// resolved target instead of the authorized symlink, so filesystem mutations
+/// do not traverse the link again after validation.
+fn resolve_upload_chain(root: &Path, target: &Path) -> Result<PathBuf, AppCommandError> {
     let rel = target
         .strip_prefix(root)
         .map_err(|_| AppCommandError::invalid_input("Target path is not under workspace root"))?;
+    let canonical_root = std::fs::canonicalize(root).map_err(AppCommandError::io)?;
     let mut current = root.to_path_buf();
+    let mut reached_missing = false;
     for component in rel.components() {
         let segment = match component {
             Component::Normal(s) => s,
@@ -124,23 +135,28 @@ fn ensure_no_symlink_in_chain(root: &Path, target: &Path) -> Result<(), AppComma
             }
         };
         current.push(segment);
+        if reached_missing {
+            continue;
+        }
         match std::fs::symlink_metadata(&current) {
             Ok(md) => {
                 if md.file_type().is_symlink() {
-                    return Err(AppCommandError::invalid_input(
-                        "Upload path traverses a symlink; refuse to follow it",
-                    ));
+                    let resolved = std::fs::canonicalize(&current).map_err(AppCommandError::io)?;
+                    if !crate::folder_links::is_allowed(&canonical_root, &resolved) {
+                        return Err(AppCommandError::invalid_input(
+                            "Upload path traverses a symlink; refuse to follow it",
+                        ));
+                    }
+                    current = resolved;
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // The remainder of the path doesn't exist yet — nothing
-                // for create_dir_all to follow into, so we're safe.
-                return Ok(());
+                reached_missing = true;
             }
             Err(e) => return Err(AppCommandError::io(e)),
         }
     }
-    Ok(())
+    Ok(current)
 }
 
 /// Strip cross-platform-hostile characters from a single path segment.
@@ -282,8 +298,6 @@ pub async fn upload_workspace_file(
                         "Workspace folder does not exist",
                     ));
                 }
-                let canonical_root = std::fs::canonicalize(&root).map_err(AppCommandError::io)?;
-
                 let file_name_hint = field
                     .file_name()
                     .map(|s| s.to_string())
@@ -294,25 +308,21 @@ pub async fn upload_workspace_file(
                     relative_path.as_deref().unwrap_or(""),
                     &file_name_hint,
                 )?;
-                let final_abs = resolve_relative_path(&root, &final_rel)?;
+                let mut final_abs = resolve_relative_path(&root, &final_rel)?;
 
                 if let Some(parent) = final_abs.parent() {
-                    // Reject *before* touching the filesystem if any
-                    // existing component along the path is a symlink —
-                    // otherwise `create_dir_all` would follow the link
-                    // and create directories outside the workspace
-                    // before the canonical check below could fire.
-                    ensure_no_symlink_in_chain(&root, parent)?;
-                    tokio::fs::create_dir_all(parent).await.map_err(|e| {
-                        AppCommandError::io_error("Failed to create upload directory")
-                            .with_detail(e.to_string())
-                    })?;
+                    let resolved_parent = resolve_upload_chain(&root, parent)?;
+                    tokio::fs::create_dir_all(&resolved_parent)
+                        .await
+                        .map_err(|e| {
+                            AppCommandError::io_error("Failed to create upload directory")
+                                .with_detail(e.to_string())
+                        })?;
                     let canonical_parent =
-                        std::fs::canonicalize(parent).map_err(AppCommandError::io)?;
-                    if !canonical_parent.starts_with(&canonical_root) {
-                        return Err(AppCommandError::invalid_input(
-                            "Resolved path escapes workspace root",
-                        ));
+                        std::fs::canonicalize(&resolved_parent).map_err(AppCommandError::io)?;
+                    ensure_inside_root(&root, &canonical_parent)?;
+                    if let Some(file_name) = final_abs.file_name() {
+                        final_abs = canonical_parent.join(file_name);
                     }
                 }
 
@@ -609,8 +619,7 @@ fn resolve_download_file_target(
     if !target.is_file() {
         return Err(AppCommandError::invalid_input("Path is not a file"));
     }
-    ensure_inside_root(&root, &target)?;
-    Ok(target)
+    canonicalize_allowed_target(&root, &target)
 }
 
 fn resolve_download_dir_target(
@@ -625,7 +634,8 @@ fn resolve_download_dir_target(
             .and_then(|s| s.to_str())
             .unwrap_or("workspace")
             .to_string();
-        return Ok((root, name));
+        let canonical_root = canonicalize_allowed_target(&root, &root)?;
+        return Ok((canonical_root, name));
     }
 
     let resolved = resolve_relative_path(&root, rel_path)?;
@@ -635,13 +645,13 @@ fn resolve_download_dir_target(
     if !resolved.is_dir() {
         return Err(AppCommandError::invalid_input("Path is not a directory"));
     }
-    ensure_inside_root(&root, &resolved)?;
     let name = resolved
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("folder")
         .to_string();
-    Ok((resolved, name))
+    let canonical_target = canonicalize_allowed_target(&root, &resolved)?;
+    Ok((canonical_target, name))
 }
 
 // ---------------------------------------------------------------------------
@@ -1013,7 +1023,61 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn ensure_no_symlink_in_chain_rejects_intermediate_symlink() {
+    fn authorized_upload_returns_link_free_target_and_revocation_rejects_it() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("tempdir root");
+        let linked = tempfile::tempdir().expect("tempdir linked");
+        symlink(linked.path(), root.path().join("api")).expect("symlink");
+
+        let canonical_target = std::fs::canonicalize(linked.path()).expect("canonical target");
+        crate::folder_links::register(root.path(), &canonical_target);
+
+        let requested = root.path().join("api/sub/file.txt");
+        assert_eq!(
+            resolve_upload_chain(root.path(), &requested).expect("authorized link"),
+            canonical_target.join("sub/file.txt")
+        );
+
+        crate::folder_links::unregister(root.path(), &canonical_target);
+        assert!(
+            resolve_upload_chain(root.path(), &requested).is_err(),
+            "revoking the folder link must revoke upload access"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn upload_rejects_unregistered_and_nested_unauthorized_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("tempdir root");
+        let linked = tempfile::tempdir().expect("tempdir linked");
+        let outside = tempfile::tempdir().expect("tempdir outside");
+
+        symlink(outside.path(), root.path().join("stray")).expect("stray symlink");
+        assert!(
+            resolve_upload_chain(root.path(), &root.path().join("stray/sub/file.txt")).is_err(),
+            "an unregistered workspace symlink must be rejected"
+        );
+
+        symlink(linked.path(), root.path().join("api")).expect("registered symlink");
+        symlink(outside.path(), linked.path().join("escape")).expect("nested symlink");
+        let canonical_target = std::fs::canonicalize(linked.path()).expect("canonical target");
+        crate::folder_links::register(root.path(), &canonical_target);
+
+        assert!(
+            resolve_upload_chain(root.path(), &root.path().join("api/escape/sub/file.txt"))
+                .is_err(),
+            "a registered top-level link must not authorize a nested escape"
+        );
+
+        crate::folder_links::unregister(root.path(), &canonical_target);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_upload_chain_rejects_intermediate_symlink() {
         use std::fs;
         use std::os::unix::fs::symlink;
 
@@ -1027,17 +1091,195 @@ mod tests {
         // `link` component is a symlink that would carry create_dir_all
         // out of the root.
         let target = root.path().join("link").join("sub");
-        let err = ensure_no_symlink_in_chain(root.path(), &target)
-            .expect_err("should reject symlink in chain");
+        let err =
+            resolve_upload_chain(root.path(), &target).expect_err("should reject symlink in chain");
         assert!(
             err.message.contains("symlink"),
             "unexpected error: {}",
             err.message
         );
 
-        // Sanity: no symlink in chain → ok.
+        // Sanity: no symlink in chain returns the path used for the write.
         fs::create_dir(root.path().join("real")).expect("real dir");
         let ok_target = root.path().join("real").join("nested").join("file.txt");
-        assert!(ensure_no_symlink_in_chain(root.path(), &ok_target).is_ok());
+        assert_eq!(
+            resolve_upload_chain(root.path(), &ok_target).expect("no symlinks"),
+            ok_target
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn registered_file_download_and_ticket_are_revoked_immediately() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("tempdir root");
+        let linked = tempfile::tempdir().expect("tempdir linked");
+        std::fs::write(linked.path().join("note.txt"), b"linked data").expect("write file");
+        symlink(linked.path(), root.path().join("api")).expect("symlink");
+
+        let canonical_target = std::fs::canonicalize(linked.path()).expect("canonical target");
+        crate::folder_links::register(root.path(), &canonical_target);
+        let root_path = root.path().to_string_lossy().into_owned();
+        assert_eq!(
+            resolve_download_file_target(&root_path, "api/note.txt")
+                .expect("resolve registered file"),
+            canonical_target.join("note.txt"),
+            "downloads must use the already-validated real path"
+        );
+
+        let response = download_workspace_file(Json(DownloadWorkspaceParams {
+            root_path: root_path.clone(),
+            path: "api/note.txt".to_string(),
+        }))
+        .await
+        .expect("direct download through registered link");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read response body");
+        assert_eq!(body.as_ref(), b"linked data");
+
+        let manager = Arc::new(
+            crate::workspace_transfer::WorkspaceTransferManager::new_for_tests(
+                std::time::Duration::from_secs(60),
+            ),
+        );
+        let issued = create_download_ticket_core(
+            manager.clone(),
+            DownloadTicketRequest {
+                root_path: root_path.clone(),
+                path: "api/note.txt".to_string(),
+                kind: DownloadKind::File,
+            },
+            "/api/workspace_download".to_string(),
+        )
+        .await
+        .expect("ticket through registered link");
+
+        crate::folder_links::unregister(root.path(), &canonical_target);
+
+        assert!(
+            download_workspace_file(Json(DownloadWorkspaceParams {
+                root_path: root_path.clone(),
+                path: "api/note.txt".to_string(),
+            }))
+            .await
+            .is_err(),
+            "revocation must block direct downloads"
+        );
+        assert!(
+            create_download_ticket_core(
+                manager.clone(),
+                DownloadTicketRequest {
+                    root_path: root_path.clone(),
+                    path: "api/note.txt".to_string(),
+                    kind: DownloadKind::File,
+                },
+                "/api/workspace_download".to_string(),
+            )
+            .await
+            .is_err(),
+            "revocation must block new tickets"
+        );
+
+        let consumed = manager
+            .consume_download_ticket(&issued.ticket)
+            .await
+            .expect("issued ticket");
+        assert!(
+            resolve_download_file_target(
+                &consumed.root_path.to_string_lossy(),
+                &consumed.relative_path,
+            )
+            .is_err(),
+            "revocation must also invalidate an already-issued ticket"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn registered_directory_download_skips_nested_symlinks_and_revokes_tickets() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("tempdir root");
+        let linked = tempfile::tempdir().expect("tempdir linked");
+        let outside = tempfile::tempdir().expect("tempdir outside");
+        std::fs::write(linked.path().join("inside.txt"), b"inside").expect("write inside");
+        std::fs::write(outside.path().join("secret.txt"), b"secret").expect("write secret");
+        symlink(
+            outside.path().join("secret.txt"),
+            linked.path().join("nested-link"),
+        )
+        .expect("nested symlink");
+        symlink(linked.path(), root.path().join("api")).expect("workspace symlink");
+
+        let canonical_target = std::fs::canonicalize(linked.path()).expect("canonical target");
+        crate::folder_links::register(root.path(), &canonical_target);
+        let root_path = root.path().to_string_lossy().into_owned();
+
+        let (resolved, name) =
+            resolve_download_dir_target(&root_path, "api").expect("registered directory");
+        assert_eq!(
+            resolved, canonical_target,
+            "ZIP traversal must use the already-validated real directory"
+        );
+        assert_eq!(name, "api");
+        let bytes = build_zip_bytes_for_test(resolved).await.expect("build zip");
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("open zip");
+        assert!(archive.by_name("inside.txt").is_ok());
+        assert!(archive.by_name("nested-link").is_err());
+
+        let manager = Arc::new(
+            crate::workspace_transfer::WorkspaceTransferManager::new_for_tests(
+                std::time::Duration::from_secs(60),
+            ),
+        );
+        let issued = create_download_ticket_core(
+            manager.clone(),
+            DownloadTicketRequest {
+                root_path: root_path.clone(),
+                path: "api".to_string(),
+                kind: DownloadKind::Dir,
+            },
+            "/api/workspace_download".to_string(),
+        )
+        .await
+        .expect("directory ticket through registered link");
+
+        crate::folder_links::unregister(root.path(), &canonical_target);
+        assert!(resolve_download_dir_target(&root_path, "api").is_err());
+
+        let consumed = manager
+            .consume_download_ticket(&issued.ticket)
+            .await
+            .expect("issued directory ticket");
+        assert!(
+            resolve_download_dir_target(
+                &consumed.root_path.to_string_lossy(),
+                &consumed.relative_path,
+            )
+            .is_err(),
+            "revocation must invalidate an already-issued directory ticket"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unregistered_file_and_directory_download_symlinks_are_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("tempdir root");
+        let outside = tempfile::tempdir().expect("tempdir outside");
+        std::fs::write(outside.path().join("secret.txt"), b"secret").expect("write secret");
+        symlink(
+            outside.path().join("secret.txt"),
+            root.path().join("secret-link"),
+        )
+        .expect("file symlink");
+        symlink(outside.path(), root.path().join("dir-link")).expect("directory symlink");
+
+        let root_path = root.path().to_string_lossy();
+        assert!(resolve_download_file_target(&root_path, "secret-link").is_err());
+        assert!(resolve_download_dir_target(&root_path, "dir-link").is_err());
     }
 }
