@@ -1480,6 +1480,7 @@ fn validate_identity_match(
     // Role from key vs binding.
     let (expected_role, expected_phase) = match parsed {
         ParsedWorkUnitKey::Design { .. } => ("reviewer", "design"),
+        ParsedWorkUnitKey::DesignFixer { .. } => ("fixer", "design"),
         ParsedWorkUnitKey::PlanAuthor { .. } => ("author", "plan"),
         ParsedWorkUnitKey::PlanReviewer { .. } => ("reviewer", "plan"),
         ParsedWorkUnitKey::TaskImplementer { .. } => ("implementer", PHASE_TASKS),
@@ -1629,7 +1630,7 @@ async fn enforce_phase_readiness<C: ConnectionTrait>(
     admission_class: &AdmissionClass,
 ) -> Result<(), TaskStoreError> {
     match parsed {
-        ParsedWorkUnitKey::PlanAuthor { .. } => Ok(()),
+        ParsedWorkUnitKey::PlanAuthor { .. } | ParsedWorkUnitKey::DesignFixer { .. } => Ok(()),
         // Document reviewers: only published Design/Plan nodes (already bound).
         ParsedWorkUnitKey::Design { .. } | ParsedWorkUnitKey::PlanReviewer { .. } => Ok(()),
 
@@ -2296,7 +2297,9 @@ async fn stamp_admission_fields<C: ConnectionTrait>(
     TaskStoreError,
 > {
     match parsed {
-        ParsedWorkUnitKey::PlanAuthor { .. } => Ok((None, None, None, None, None, None)),
+        ParsedWorkUnitKey::PlanAuthor { .. } | ParsedWorkUnitKey::DesignFixer { .. } => {
+            Ok((None, None, None, None, None, None))
+        }
         ParsedWorkUnitKey::Design { .. } => {
             let (gate_id, cycle, digest) =
                 document_gate_stamp(conn, header, binding, parsed).await?;

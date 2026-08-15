@@ -2703,6 +2703,7 @@ async fn project_observed_only(
 fn parsed_meta(parsed: &ParsedWorkUnitKey) -> (String, String, Option<u32>) {
     match parsed {
         ParsedWorkUnitKey::Design { .. } => ("design".into(), "reviewer".into(), None),
+        ParsedWorkUnitKey::DesignFixer { .. } => ("design".into(), "fixer".into(), None),
         ParsedWorkUnitKey::PlanAuthor { .. } => ("plan".into(), "author".into(), None),
         ParsedWorkUnitKey::PlanReviewer { .. } => ("plan".into(), "reviewer".into(), None),
         ParsedWorkUnitKey::TaskImplementer { task_index, .. } => {
@@ -2721,13 +2722,16 @@ fn synthetic_node_id(parsed: &ParsedWorkUnitKey, work_unit_key: &str) -> String 
     let key_tag = short_key_tag(work_unit_key);
     match parsed {
         ParsedWorkUnitKey::Design { .. } => format!("observed-design-{key_tag}"),
+        ParsedWorkUnitKey::DesignFixer { .. } => format!("observed-design-fixer-{key_tag}"),
         ParsedWorkUnitKey::PlanAuthor { .. } => format!("observed-plan-author-{key_tag}"),
         ParsedWorkUnitKey::PlanReviewer { .. } => format!("observed-plan-reviewer-{key_tag}"),
         ParsedWorkUnitKey::TaskImplementer { task_index, .. } => {
             format!("observed-task-{task_index}-impl")
         }
-        ParsedWorkUnitKey::TaskReviewer { task_index, .. } => {
-            format!("observed-task-{task_index}-rev")
+        ParsedWorkUnitKey::TaskReviewer {
+            task_index, slot, ..
+        } => {
+            format!("observed-task-{task_index}-rev-{}-{key_tag}", slot.as_str())
         }
         ParsedWorkUnitKey::FinalReviewer { .. } => format!("observed-final-rev-{key_tag}"),
         ParsedWorkUnitKey::FinalFixer { .. } => format!("observed-final-fix-{key_tag}"),
@@ -6481,5 +6485,38 @@ mod tests {
         }
         assert_eq!(warnings.first().map(String::as_str), Some("duplicate"));
         assert_eq!(warnings.len(), 64);
+    }
+
+    #[test]
+    fn observed_projection_slotted_keys_have_distinct_synthetic_ids() {
+        let keys = [
+            "task|7|reviewer|primary|codex|none",
+            "task|7|reviewer|auxiliary|codex|none",
+            "design|docs/design.md|fixer|codex|none",
+        ];
+        let parsed = keys
+            .iter()
+            .map(|key| parse_recognized_work_unit_key(key).expect("recognized key"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            parsed_meta(&parsed[0]),
+            ("tasks".into(), "reviewer".into(), Some(7))
+        );
+        assert_eq!(
+            parsed_meta(&parsed[1]),
+            ("tasks".into(), "reviewer".into(), Some(7))
+        );
+        assert_eq!(
+            parsed_meta(&parsed[2]),
+            ("design".into(), "fixer".into(), None)
+        );
+
+        let ids = parsed
+            .iter()
+            .zip(keys)
+            .map(|(parsed, key)| synthetic_node_id(parsed, key))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(ids.len(), 3);
     }
 }
