@@ -38,12 +38,11 @@ pub enum AgentDistribution {
         override_env: &'static str,
         platforms: &'static [&'static str],
     },
-    /// Python agents launched through `uvx` (the `uv` tool runner), which
-    /// fetches + caches the pinned package on first use — analogous to npx.
-    /// Used for ACP agents distributed as Python packages (e.g. Hermes).
+    /// Custom Python agents launched through `uvx` (the `uv` tool runner),
+    /// which fetches and caches the pinned package on first use.
     Uvx {
         version: &'static str,
-        /// The `uvx --from` package spec, e.g. "hermes-agent[acp,mcp]==0.19.0".
+        /// The `uvx --from` package spec.
         package: &'static str,
         /// The console-script entry point to run, e.g. "hermes-acp".
         cmd: &'static str,
@@ -229,6 +228,37 @@ pub fn from_registry_id(id: &str) -> Option<AgentType> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct AcpAdapterRelation {
+    pub native_cmd: &'static str,
+    pub native_label: &'static str,
+    pub shared_config_dir: &'static str,
+    pub extra_dirs: &'static [&'static str],
+    pub docs_url: &'static str,
+}
+
+pub fn acp_adapter_relation(agent_type: AgentType) -> Option<AcpAdapterRelation> {
+    match agent_type {
+        AgentType::ClaudeCode => Some(AcpAdapterRelation {
+            native_cmd: "claude",
+            native_label: "Claude Code CLI",
+            shared_config_dir: "~/.claude",
+            extra_dirs: &[".local/bin", ".claude/local"],
+            docs_url: ACP_ADAPTER_DOCS_URL,
+        }),
+        AgentType::Codex => Some(AcpAdapterRelation {
+            native_cmd: "codex",
+            native_label: "Codex CLI",
+            shared_config_dir: "~/.codex",
+            extra_dirs: &[".local/bin"],
+            docs_url: ACP_ADAPTER_DOCS_URL,
+        }),
+        _ => None,
+    }
+}
+
+const ACP_ADAPTER_DOCS_URL: &str = "https://docs.codeg.app/guide/supported-agents#acp-adapters";
+
 /// All platforms default app-server (`CODEX_ACP_USE_CLI=0`); Agent Settings
 /// can pin `CODEX_ACP_USE_CLI=1` for CLI exec (`codex exec --json`).
 const CODEX_CLI_RUNTIME_DEFAULT_ENV: &[(&str, &str)] = &[("CODEX_ACP_USE_CLI", "0")];
@@ -241,8 +271,8 @@ const CODEX_CLI_RUNTIME_DEFAULT_ENV: &[(&str, &str)] = &[("CODEX_ACP_USE_CLI", "
 /// `CODEX_PATH` is only required when the user opts into CLI exec mode.
 fn codex_distribution() -> AgentDistribution {
     AgentDistribution::Npx {
-        version: "1.1.7",
-        package: "@agentclientprotocol/codex-acp@1.1.7",
+        version: "1.1.9",
+        package: "@agentclientprotocol/codex-acp@1.1.9",
         cmd: "codex-acp",
         args: &[],
         env: CODEX_CLI_RUNTIME_DEFAULT_ENV,
@@ -282,8 +312,8 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             // (#923). Fast mode's config option now folds the SDK's
             // `fast_mode_disabled_reason` into its description (#921).
             distribution: AgentDistribution::Npx {
-                version: "0.63.0",
-                package: "@agentclientprotocol/claude-agent-acp@0.63.0",
+                version: "0.65.0",
+                package: "@agentclientprotocol/claude-agent-acp@0.65.0",
                 cmd: "claude-agent-acp",
                 args: &[],
                 env: &[],
@@ -297,7 +327,7 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             description: "ACP adapter for OpenAI's coding assistant",
             // codex-acp moved from zed-industries (Rust binary) to the
             // agentclientprotocol org (TypeScript rewrite, npx-distributed).
-            // 1.1.7 depends on `@openai/codex` ^0.145.0 and can drive either
+            // codex-acp 1.1.x can drive either
             // `codex app-server` or (when `CODEX_ACP_USE_CLI=1`) `codex exec`.
             // All platforms (including Windows) use the same npm package —
             // no bundled sibling `codex-acp.exe`. Default app-server via
@@ -332,7 +362,7 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             // contents as a plain `agent_message_chunk`
             // (`_meta.codex.phase = "final_answer"`, no `<proposed_plan>` tags),
             // which the adapter's tag-splitter simply no-ops on — tagged output
-            // from older codex still renders as the proposed-plan card. 1.1.7
+            // from older codex still renders as the proposed-plan card. 1.1.9
             // declares no `engines.node`, so the 20.0.0 floor is retained.
             distribution: codex_distribution(),
         },
@@ -342,8 +372,8 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             name: "Gemini CLI",
             description: "Google's official CLI for Gemini",
             distribution: AgentDistribution::Npx {
-                version: "0.52.0",
-                package: "@google/gemini-cli@0.52.0",
+                version: "0.55.1",
+                package: "@google/gemini-cli@0.55.1",
                 cmd: "gemini",
                 args: &["--acp", "--skip-trust"],
                 env: &[],
@@ -356,8 +386,8 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             name: "Cline",
             description: "Autonomous coding agent CLI",
             distribution: AgentDistribution::Npx {
-                version: "3.0.47",
-                package: "cline@3.0.47",
+                version: "3.0.55",
+                package: "cline@3.0.55",
                 cmd: "cline",
                 args: &["--acp"],
                 env: &[],
@@ -370,39 +400,39 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             name: "OpenCode",
             description: "The open source coding agent",
             distribution: AgentDistribution::Binary {
-                version: "1.18.10",
+                version: "1.18.18",
                 cmd: "opencode",
                 args: &["acp"],
                 env: &[],
                 platforms: &[
                     PlatformBinary {
                         platform: "darwin-aarch64",
-                        url: "https://github.com/anomalyco/opencode/releases/download/v1.18.10/opencode-darwin-arm64.zip",
+                        url: "https://github.com/anomalyco/opencode/releases/download/v1.18.18/opencode-darwin-arm64.zip",
                         sha256: None,
                     },
                     PlatformBinary {
                         platform: "darwin-x86_64",
-                        url: "https://github.com/anomalyco/opencode/releases/download/v1.18.10/opencode-darwin-x64.zip",
+                        url: "https://github.com/anomalyco/opencode/releases/download/v1.18.18/opencode-darwin-x64.zip",
                         sha256: None,
                     },
                     PlatformBinary {
                         platform: "linux-aarch64",
-                        url: "https://github.com/anomalyco/opencode/releases/download/v1.18.10/opencode-linux-arm64.tar.gz",
+                        url: "https://github.com/anomalyco/opencode/releases/download/v1.18.18/opencode-linux-arm64.tar.gz",
                         sha256: None,
                     },
                     PlatformBinary {
                         platform: "linux-x86_64",
-                        url: "https://github.com/anomalyco/opencode/releases/download/v1.18.10/opencode-linux-x64.tar.gz",
+                        url: "https://github.com/anomalyco/opencode/releases/download/v1.18.18/opencode-linux-x64.tar.gz",
                         sha256: None,
                     },
                     PlatformBinary {
                         platform: "windows-aarch64",
-                        url: "https://github.com/anomalyco/opencode/releases/download/v1.18.10/opencode-windows-arm64.zip",
+                        url: "https://github.com/anomalyco/opencode/releases/download/v1.18.18/opencode-windows-arm64.zip",
                         sha256: None,
                     },
                     PlatformBinary {
                         platform: "windows-x86_64",
-                        url: "https://github.com/anomalyco/opencode/releases/download/v1.18.10/opencode-windows-x64.zip",
+                        url: "https://github.com/anomalyco/opencode/releases/download/v1.18.18/opencode-windows-x64.zip",
                         sha256: None,
                     },
                 ],
@@ -413,22 +443,14 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             agent_type,
             supports_mcp: true,
             name: "Hermes Agent",
-            description: "Nous Research's self-improving agent (ACP via uvx)",
-            distribution: AgentDistribution::Uvx {
-                version: "0.19.0",
-                package: "hermes-agent[acp,mcp]==0.19.0",
-                cmd: "hermes-acp",
-                args: &[],
+            description: "Nous Research's self-improving agent (ACP)",
+            distribution: AgentDistribution::Npx {
+                version: "0.20.1",
+                package: "hermes-agent@0.20.1",
+                cmd: "hermes",
+                args: &["acp"],
                 env: &[],
-                uv_required: Some("0.5.0"),
-                // hermes-agent 0.19.0 is `requires-python = ">=3.11,<3.14"`, and
-                // its win32 dep `pywinpty` (>=2.0.0,<3) has no Python 3.14 wheel
-                // (the 2.0.15 source build fails against PyO3's 3.13 ceiling).
-                // Without this pin uvx grabs the machine's default interpreter
-                // (e.g. 3.14) and the install breaks; 3.13 is the newest version
-                // Hermes supports.
-                python: Some("3.13"),
-                system_cmd: Some(("hermes", &["acp"])),
+                node_required: Some("20.0.0"),
             },
         },
         AgentType::CodeBuddy => AcpAgentMeta {
@@ -437,8 +459,8 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             name: "CodeBuddy",
             description: "Tencent Cloud's official AI coding assistant (ACP)",
             distribution: AgentDistribution::Npx {
-                version: "2.127.0",
-                package: "@tencent-ai/codebuddy-code@2.127.0",
+                version: "2.136.0",
+                package: "@tencent-ai/codebuddy-code@2.136.0",
                 cmd: "codebuddy",
                 args: &["--acp"],
                 env: &[],
@@ -451,8 +473,8 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             name: "Kimi Code",
             description: "Moonshot AI's official CLI coding assistant (ACP)",
             distribution: AgentDistribution::Npx {
-                version: "0.31.0",
-                package: "@moonshot-ai/kimi-code@0.31.0",
+                version: "0.36.1",
+                package: "@moonshot-ai/kimi-code@0.36.1",
                 cmd: "kimi",
                 args: &["acp"],
                 env: &[],
@@ -469,7 +491,7 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             supports_mcp: true,
             name: "Pi",
             description: "Self-extensible coding agent (ACP via pi-acp)",
-            // pi-acp 0.0.32 spawns `pi --mode rpc` as a child, so `pi` (npm
+            // pi-acp 0.0.33 spawns `pi --mode rpc` as a child, so `pi` (npm
             // `@earendil-works/pi-coding-agent`) must be resolvable on PATH —
             // or pointed at a custom build via the `PI_ACP_PI_COMMAND` env
             // (see BYO-pi). Args are empty: the ACP server is the default mode
@@ -477,8 +499,8 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             // 22+ requirement (pi-acp's own engines say >=20). The embedded
             // context env lets pi-acp advertise `promptCapabilities.embeddedContext`.
             distribution: AgentDistribution::Npx {
-                version: "0.0.32",
-                package: "pi-acp@0.0.32",
+                version: "0.0.33",
+                package: "pi-acp@0.0.33",
                 cmd: "pi-acp",
                 args: &[],
                 env: &[("PI_ACP_ENABLE_EMBEDDED_CONTEXT", "true")],
@@ -507,8 +529,8 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             // leading `KEY=value` argv and sacp's `parse_env_var` only accepts
             // `[A-Za-z0-9_]` env names, which npm's `@scope:registry` key is not.)
             distribution: AgentDistribution::Npx {
-                version: "0.2.112",
-                package: "@xai-official/grok@0.2.112",
+                version: "1.0.3",
+                package: "@xai-official/grok@1.0.3",
                 cmd: "grok",
                 // Only the ACP subcommand lives here. Grok's ROOT-level launch
                 // flags (`--no-auto-update` always, `--permission-mode <value>`
@@ -519,7 +541,7 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
                 // args rather than appending after.
                 args: &["agent", "stdio"],
                 env: &[],
-                // `@xai-official/grok@0.2.112` declares `engines.node: ">=20"`;
+                // `@xai-official/grok@1.0.3` declares `engines.node: ">=20"`;
                 // surface that in preflight so Node 18 isn't silently accepted.
                 node_required: Some("20.0.0"),
             },
@@ -541,39 +563,39 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             // (downloads.cursor.com/lab/<version>/<os>/<arch>/...); custom
             // versions substitute into the same pattern.
             distribution: AgentDistribution::Binary {
-                version: "2026.07.23-e383d2b",
+                version: "2026.08.11-e8db854",
                 cmd: "cursor-agent",
                 args: &["acp"],
                 env: &[],
                 platforms: &[
                     PlatformBinary {
                         platform: "darwin-aarch64",
-                        url: "https://downloads.cursor.com/lab/2026.07.23-e383d2b/darwin/arm64/agent-cli-package.tar.gz",
+                        url: "https://downloads.cursor.com/lab/2026.08.11-e8db854/darwin/arm64/agent-cli-package.tar.gz",
                         sha256: None,
                     },
                     PlatformBinary {
                         platform: "darwin-x86_64",
-                        url: "https://downloads.cursor.com/lab/2026.07.23-e383d2b/darwin/x64/agent-cli-package.tar.gz",
+                        url: "https://downloads.cursor.com/lab/2026.08.11-e8db854/darwin/x64/agent-cli-package.tar.gz",
                         sha256: None,
                     },
                     PlatformBinary {
                         platform: "linux-aarch64",
-                        url: "https://downloads.cursor.com/lab/2026.07.23-e383d2b/linux/arm64/agent-cli-package.tar.gz",
+                        url: "https://downloads.cursor.com/lab/2026.08.11-e8db854/linux/arm64/agent-cli-package.tar.gz",
                         sha256: None,
                     },
                     PlatformBinary {
                         platform: "linux-x86_64",
-                        url: "https://downloads.cursor.com/lab/2026.07.23-e383d2b/linux/x64/agent-cli-package.tar.gz",
+                        url: "https://downloads.cursor.com/lab/2026.08.11-e8db854/linux/x64/agent-cli-package.tar.gz",
                         sha256: None,
                     },
                     PlatformBinary {
                         platform: "windows-aarch64",
-                        url: "https://downloads.cursor.com/lab/2026.07.23-e383d2b/windows/arm64/agent-cli-package.zip",
+                        url: "https://downloads.cursor.com/lab/2026.08.11-e8db854/windows/arm64/agent-cli-package.zip",
                         sha256: None,
                     },
                     PlatformBinary {
                         platform: "windows-x86_64",
-                        url: "https://downloads.cursor.com/lab/2026.07.23-e383d2b/windows/x64/agent-cli-package.zip",
+                        url: "https://downloads.cursor.com/lab/2026.08.11-e8db854/windows/x64/agent-cli-package.zip",
                         sha256: None,
                     },
                 ],
@@ -618,34 +640,6 @@ mod tests {
         }
     }
 
-    fn assert_uvx_version(
-        agent_type: AgentType,
-        expected_version: &str,
-        expected_package: &str,
-        expected_uv_required: Option<&str>,
-        expected_python: Option<&str>,
-    ) {
-        let meta = get_agent_meta(agent_type);
-        match meta.distribution {
-            AgentDistribution::Uvx {
-                version,
-                package,
-                uv_required,
-                python,
-                ..
-            } => {
-                assert_eq!(version, expected_version);
-                assert_eq!(package, expected_package);
-                assert_eq!(uv_required, expected_uv_required);
-                assert_eq!(python, expected_python);
-                assert_eq!(meta.registry_version(), Some(expected_version));
-            }
-            other => {
-                panic!("expected uvx distribution for {agent_type:?}, got {other:?}");
-            }
-        }
-    }
-
     fn assert_binary_version(
         agent_type: AgentType,
         expected_version: &str,
@@ -681,8 +675,8 @@ mod tests {
         let meta = get_agent_meta(AgentType::Cursor);
         assert_binary_version(
             AgentType::Cursor,
-            "2026.07.23-e383d2b",
-            "/lab/2026.07.23-e383d2b/",
+            "2026.08.11-e8db854",
+            "/lab/2026.08.11-e8db854/",
         );
         match meta.distribution {
             AgentDistribution::Binary {
@@ -709,58 +703,60 @@ mod tests {
     }
 
     #[test]
-    fn registry_pins_current_acp_agent_versions() {
+    fn builtin_registry_versions_match_reviewed_v025_table() {
         assert_npx_version(
             AgentType::ClaudeCode,
-            "0.63.0",
-            "@agentclientprotocol/claude-agent-acp@0.63.0",
+            "0.65.0",
+            "@agentclientprotocol/claude-agent-acp@0.65.0",
             Some("22.0.0"),
         );
         assert_npx_version(
             AgentType::Gemini,
-            "0.52.0",
-            "@google/gemini-cli@0.52.0",
+            "0.55.1",
+            "@google/gemini-cli@0.55.1",
             Some("20.0.0"),
         );
-        assert_npx_version(AgentType::Cline, "3.0.47", "cline@3.0.47", Some("22.0.0"));
+        assert_npx_version(AgentType::Cline, "3.0.55", "cline@3.0.55", Some("22.0.0"));
         assert_npx_version(
             AgentType::CodeBuddy,
-            "2.127.0",
-            "@tencent-ai/codebuddy-code@2.127.0",
+            "2.136.0",
+            "@tencent-ai/codebuddy-code@2.136.0",
             Some("22.0.0"),
         );
         assert_npx_version(
             AgentType::KimiCode,
-            "0.31.0",
-            "@moonshot-ai/kimi-code@0.31.0",
+            "0.36.1",
+            "@moonshot-ai/kimi-code@0.36.1",
             Some("22.19.0"),
         );
         assert_npx_version(
             AgentType::Codex,
-            "1.1.7",
-            "@agentclientprotocol/codex-acp@1.1.7",
+            "1.1.9",
+            "@agentclientprotocol/codex-acp@1.1.9",
             Some("20.0.0"),
         );
-        assert_npx_version(AgentType::Pi, "0.0.32", "pi-acp@0.0.32", Some("22.0.0"));
+        assert_npx_version(AgentType::Pi, "0.0.33", "pi-acp@0.0.33", Some("22.0.0"));
         assert_npx_version(
             AgentType::Grok,
-            "0.2.112",
-            "@xai-official/grok@0.2.112",
+            "1.0.3",
+            "@xai-official/grok@1.0.3",
             Some("20.0.0"),
         );
         assert_binary_version(
             AgentType::OpenCode,
-            "1.18.10",
-            "/releases/download/v1.18.10/",
+            "1.18.18",
+            "/releases/download/v1.18.18/",
         );
-        assert_uvx_version(
+        assert_npx_version(
             AgentType::Hermes,
-            "0.19.0",
-            "hermes-agent[acp,mcp]==0.19.0",
-            Some("0.5.0"),
-            // hermes-agent 0.19.0 is requires-python `<3.14`; uvx must pin an
-            // interpreter it (and its win32 `pywinpty` dep) supports.
-            Some("3.13"),
+            "0.20.1",
+            "hermes-agent@0.20.1",
+            Some("20.0.0"),
+        );
+        assert_binary_version(
+            AgentType::Cursor,
+            "2026.08.11-e8db854",
+            "/lab/2026.08.11-e8db854/",
         );
     }
 
@@ -775,8 +771,8 @@ mod tests {
                 cmd,
                 ..
             } => {
-                assert_eq!(version, "1.1.7");
-                assert_eq!(package, "@agentclientprotocol/codex-acp@1.1.7");
+                assert_eq!(version, "1.1.9");
+                assert_eq!(package, "@agentclientprotocol/codex-acp@1.1.9");
                 assert_eq!(cmd, "codex-acp");
                 assert_eq!(node_required, Some("20.0.0"));
                 assert_eq!(
@@ -806,6 +802,18 @@ mod tests {
         }
         for wire in crate::models::agent::BUILTIN_AGENT_WIRE_NAMES {
             assert!(is_reserved_builtin_id(wire));
+        }
+    }
+
+    #[test]
+    fn adapter_relation_covers_only_wrapper_agents() {
+        for agent_type in builtin_acp_agents() {
+            let expected = matches!(agent_type, AgentType::ClaudeCode | AgentType::Codex);
+            assert_eq!(
+                acp_adapter_relation(agent_type).is_some(),
+                expected,
+                "unexpected adapter relation for {agent_type:?}"
+            );
         }
     }
 

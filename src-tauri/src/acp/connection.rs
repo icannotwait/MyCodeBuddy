@@ -10,8 +10,8 @@ use sacp::schema::{
     ElicitationFormCapabilities, EmbeddedResource, EmbeddedResourceResource,
     FileSystemCapabilities, ImageContent, InitializeRequest, KillTerminalRequest,
     KillTerminalResponse, LoadSessionRequest, LoadSessionResponse, Meta, NewSessionRequest,
-    NewSessionResponse, PermissionOptionKind, Plan, PlanEntryPriority, PlanEntryStatus,
-    PromptRequest, ProtocolVersion, ReadTextFileRequest, ReadTextFileResponse,
+    NewSessionResponse, PermissionOption, PermissionOptionKind, Plan, PlanEntryPriority,
+    PlanEntryStatus, PromptRequest, ProtocolVersion, ReadTextFileRequest, ReadTextFileResponse,
     ReleaseTerminalRequest, ReleaseTerminalResponse, RequestPermissionOutcome,
     RequestPermissionRequest, RequestPermissionResponse, ResourceLink, ResumeSessionRequest,
     ResumeSessionResponse, SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption,
@@ -48,9 +48,9 @@ use crate::acp::terminal_runtime::{TerminalRuntime, TerminalRuntimeError};
 use crate::acp::types::{
     AcpEvent, AvailableCommandInfo, ConfigStaleKind, ConnectionInfo, ConnectionStatus,
     GrokEffortSpec, PermissionOptionInfo, PlanEntryInfo, PromptCapabilitiesInfo, PromptInputBlock,
-    SessionConfigKindInfo, SessionConfigOptionInfo, SessionConfigSelectGroupInfo,
-    SessionConfigSelectInfo, SessionConfigSelectOptionInfo, SessionModeInfo, SessionModeStateInfo,
-    ToolCallImageInfo, UserMessageBlock,
+    SessionConfigBooleanInfo, SessionConfigKindInfo, SessionConfigOptionInfo,
+    SessionConfigSelectGroupInfo, SessionConfigSelectInfo, SessionConfigSelectOptionInfo,
+    SessionModeInfo, SessionModeStateInfo, ToolCallImageInfo, UserMessageBlock,
 };
 use crate::auto_title::{ConnectionLaunchContext, ConnectionPurpose};
 use crate::models::agent::AgentType;
@@ -1094,9 +1094,9 @@ async fn record_turn_end(
 fn current_model_id_from_opts(opts: &[SessionConfigOptionInfo]) -> Option<String> {
     opts.iter()
         .find(|o| o.category.as_deref() == Some("model"))
-        .map(|o| {
-            let SessionConfigKindInfo::Select(sel) = &o.kind;
-            sel.current_value.clone()
+        .and_then(|o| match &o.kind {
+            SessionConfigKindInfo::Select(select) => Some(select.current_value.clone()),
+            SessionConfigKindInfo::Boolean(_) => None,
         })
         .filter(|m| !m.is_empty())
 }
@@ -2400,8 +2400,47 @@ fn map_session_config_option(option: &SessionConfigOption) -> Option<SessionConf
                 }),
             })
         }
+        SessionConfigKind::Boolean(toggle) => Some(SessionConfigOptionInfo {
+            id: option.id.to_string(),
+            name: option.name.clone(),
+            description: option.description.clone(),
+            category: option.category.as_ref().map(map_session_config_category),
+            kind: SessionConfigKindInfo::Boolean(SessionConfigBooleanInfo {
+                current_value: toggle.current_value,
+            }),
+        }),
         _ => None,
     }
+}
+
+const KNOWN_CONFIG_OPTION_KINDS: &[&str] = &["select", "boolean"];
+
+/// Remove selectors newer than the schema pin before typed deserialization.
+/// A future selector must not make the entire session response unusable.
+fn strip_unknown_config_options(raw: &mut serde_json::Value, method: &str) {
+    let Some(options) = raw
+        .get_mut("configOptions")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+
+    options.retain(|option| {
+        let Some(kind) = option.get("type").and_then(serde_json::Value::as_str) else {
+            return true;
+        };
+        if KNOWN_CONFIG_OPTION_KINDS.contains(&kind) {
+            return true;
+        }
+        tracing::warn!(
+            "[ACP] {method}: dropping config option '{}' with unsupported kind '{kind}'",
+            option
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("<no id>")
+        );
+        false
+    });
 }
 
 fn map_session_config_options(
@@ -2898,7 +2937,9 @@ async fn apply_grok_preferred_options(
             .iter()
             .find(|o| o.id == GROK_MODEL_OPTION_ID)
             .is_some_and(|o| {
-                let SessionConfigKindInfo::Select(sel) = &o.kind;
+                let SessionConfigKindInfo::Select(sel) = &o.kind else {
+                    return false;
+                };
                 // Skip if already current, or the saved model is no longer offered.
                 sel.current_value != pref && sel.options.iter().any(|x| x.value == pref)
             });
@@ -2906,8 +2947,9 @@ async fn apply_grok_preferred_options(
             match set_grok_model(cx, session_id, pref.clone(), None).await {
                 Ok(()) => {
                     if let Some(o) = opts.iter_mut().find(|o| o.id == GROK_MODEL_OPTION_ID) {
-                        let SessionConfigKindInfo::Select(sel) = &mut o.kind;
-                        sel.current_value = pref.clone();
+                        if let SessionConfigKindInfo::Select(sel) = &mut o.kind {
+                            sel.current_value = pref.clone();
+                        }
                     }
                     if !specs.is_empty() {
                         set_grok_effort_selector_for_model(opts, &pref, specs);
@@ -2925,14 +2967,15 @@ async fn apply_grok_preferred_options(
     if let Some(pref) = preferred_config_values.get(GROK_EFFORT_OPTION_ID) {
         let model_id = current_grok_model_id_from_opts(opts);
         if let Some(effort_opt) = opts.iter_mut().find(|o| o.id == GROK_EFFORT_OPTION_ID) {
-            let SessionConfigKindInfo::Select(sel) = &mut effort_opt.kind;
-            if &sel.current_value != pref && sel.options.iter().any(|o| &o.value == pref) {
-                if let Some(model_id) = model_id {
-                    match set_grok_model(cx, session_id, model_id, Some(pref.clone())).await {
-                        Ok(()) => sel.current_value = pref.clone(),
-                        Err(e) => tracing::error!(
-                            "[ACP] failed to apply preferred grok effort '{pref}' on connect: {e}"
-                        ),
+            if let SessionConfigKindInfo::Select(sel) = &mut effort_opt.kind {
+                if &sel.current_value != pref && sel.options.iter().any(|o| &o.value == pref) {
+                    if let Some(model_id) = model_id {
+                        match set_grok_model(cx, session_id, model_id, Some(pref.clone())).await {
+                            Ok(()) => sel.current_value = pref.clone(),
+                            Err(e) => tracing::error!(
+                                "[ACP] failed to apply preferred grok effort '{pref}' on connect: {e}"
+                            ),
+                        }
                     }
                 }
             }
@@ -2942,10 +2985,12 @@ async fn apply_grok_preferred_options(
 
 /// The Grok model selector's current value, read from an in-memory options list.
 fn current_grok_model_id_from_opts(opts: &[SessionConfigOptionInfo]) -> Option<String> {
-    opts.iter().find(|o| o.id == GROK_MODEL_OPTION_ID).map(|o| {
-        let SessionConfigKindInfo::Select(sel) = &o.kind;
-        sel.current_value.clone()
-    })
+    opts.iter()
+        .find(|o| o.id == GROK_MODEL_OPTION_ID)
+        .and_then(|o| match &o.kind {
+            SessionConfigKindInfo::Select(select) => Some(select.current_value.clone()),
+            SessionConfigKindInfo::Boolean(_) => None,
+        })
 }
 
 /// The Grok model selector's current value, read from the authoritative
@@ -3002,8 +3047,9 @@ async fn set_grok_config_option(
             };
             if let Some(mut opts) = current {
                 if let Some(o) = opts.iter_mut().find(|o| o.id == config_id) {
-                    let SessionConfigKindInfo::Select(sel) = &mut o.kind;
-                    sel.current_value = value_id.clone();
+                    if let SessionConfigKindInfo::Select(sel) = &mut o.kind {
+                        sel.current_value = value_id.clone();
+                    }
                 }
                 // A MODEL switch must re-point the effort selector at the new
                 // model — grok never re-sends per-model effort data on
@@ -3662,13 +3708,14 @@ async fn send_resume_session(
     let untyped_req = UntypedMessage::new("session/resume", req)
         .map_err(|e| sacp::util::internal_error(format!("Failed to build resume request: {e}")))?;
 
-    let raw_response = cx.send_request_to(Agent, untyped_req).block_task().await?;
+    let mut raw_response = cx.send_request_to(Agent, untyped_req).block_task().await?;
     // Capture the raw top-level `models` (per-model reasoning-effort data) BEFORE
     // deserializing into the typed response, which drops it (Grok only — the
     // field survives serde as an ignored unknown for other agents).
     let models = raw_response.get("models").cloned();
     let returned_session_id =
         crate::acp::session_attach::extract_session_id_from_raw_response(&raw_response);
+    strip_unknown_config_options(&mut raw_response, "session/resume");
     let resp = serde_json::from_value(raw_response)
         .map_err(|e| sacp::util::internal_error(format!("Failed to parse resume response: {e}")))?;
     Ok((resp, models, returned_session_id))
@@ -3683,9 +3730,10 @@ async fn send_load_session_capturing_id(
 ) -> Result<(LoadSessionResponse, Option<String>), sacp::Error> {
     let untyped_req = UntypedMessage::new("session/load", req)
         .map_err(|e| sacp::util::internal_error(format!("Failed to build load request: {e}")))?;
-    let raw_response = cx.send_request_to(Agent, untyped_req).block_task().await?;
+    let mut raw_response = cx.send_request_to(Agent, untyped_req).block_task().await?;
     let returned_session_id =
         crate::acp::session_attach::extract_session_id_from_raw_response(&raw_response);
+    strip_unknown_config_options(&mut raw_response, "session/load");
     let resp = serde_json::from_value(raw_response)
         .map_err(|e| sacp::util::internal_error(format!("Failed to parse load response: {e}")))?;
     Ok((resp, returned_session_id))
@@ -3765,27 +3813,22 @@ pub(crate) async fn refuse_unresumable_bootstrap(
     .await;
 }
 
-/// Send `session/new`. For Grok, send it UNTYPED so the raw top-level `models`
-/// (per-model reasoning-effort data — dropped by the typed `NewSessionResponse`
-/// because the `unstable_session_model` feature is off) can be captured before
-/// deserialization. Every other agent keeps the exact typed send, byte-for-byte,
-/// and gets `None`.
+/// Send `session/new` untyped so unknown config kinds can be filtered before
+/// typed deserialization. Grok's raw model catalog is captured at the same
+/// boundary.
 async fn send_new_session_capturing_models(
     cx: &ConnectionTo<Agent>,
     agent_type: AgentType,
     req: NewSessionRequest,
 ) -> Result<(NewSessionResponse, Option<serde_json::Value>), sacp::Error> {
-    if agent_type != AgentType::Grok {
-        return Ok((cx.send_request_to(Agent, req).block_task().await?, None));
-    }
-    // Literal method string: the schema's `SESSION_NEW_METHOD_NAME` is
-    // `pub(crate)`, and sacp ships no `JsonRpcRequest` for a raw new-session, so
-    // this mirrors the `session/resume` / `session/fork` untyped sends.
     let untyped_req = UntypedMessage::new("session/new", req).map_err(|e| {
         sacp::util::internal_error(format!("Failed to build new_session request: {e}"))
     })?;
-    let raw_response = cx.send_request_to(Agent, untyped_req).block_task().await?;
-    let models = raw_response.get("models").cloned();
+    let mut raw_response = cx.send_request_to(Agent, untyped_req).block_task().await?;
+    let models = (agent_type == AgentType::Grok)
+        .then(|| raw_response.get("models").cloned())
+        .flatten();
+    strip_unknown_config_options(&mut raw_response, "session/new");
     let resp = serde_json::from_value(raw_response).map_err(|e| {
         sacp::util::internal_error(format!("Failed to parse new_session response: {e}"))
     })?;
@@ -6601,6 +6644,7 @@ async fn handle_elicitation_request(
                     option_id: o.option_id.clone(),
                     name: o.label.clone(),
                     kind: o.kind.to_string(),
+                    meta: None,
                 })
                 .collect();
             admit_permission(
@@ -6757,21 +6801,8 @@ async fn handle_permission_request(
 
     let request_id = uuid::Uuid::new_v4().to_string();
 
-    let options: Vec<PermissionOptionInfo> = req
-        .options
-        .iter()
-        .map(|opt| PermissionOptionInfo {
-            option_id: opt.option_id.to_string(),
-            name: opt.name.clone(),
-            kind: match opt.kind {
-                PermissionOptionKind::AllowOnce => "allow_once".into(),
-                PermissionOptionKind::AllowAlways => "allow_always".into(),
-                PermissionOptionKind::RejectOnce => "reject_once".into(),
-                PermissionOptionKind::RejectAlways => "reject_always".into(),
-                _ => "unknown".into(),
-            },
-        })
-        .collect();
+    let options: Vec<PermissionOptionInfo> =
+        req.options.iter().map(map_permission_option).collect();
 
     let mut tool_call_value = serde_json::to_value(&req.tool_call).unwrap_or_default();
 
@@ -6817,6 +6848,24 @@ async fn handle_permission_request(
         },
     )
     .await;
+}
+
+fn map_permission_option(option: &PermissionOption) -> PermissionOptionInfo {
+    PermissionOptionInfo {
+        option_id: option.option_id.to_string(),
+        name: option.name.clone(),
+        kind: match option.kind {
+            PermissionOptionKind::AllowOnce => "allow_once".into(),
+            PermissionOptionKind::AllowAlways => "allow_always".into(),
+            PermissionOptionKind::RejectOnce => "reject_once".into(),
+            PermissionOptionKind::RejectAlways => "reject_always".into(),
+            _ => "unknown".into(),
+        },
+        meta: option
+            .meta
+            .as_ref()
+            .map(|meta| serde_json::Value::Object(meta.clone())),
+    }
 }
 
 fn refuse_unadvertised_channel<T: sacp::JsonRpcResponse>(
@@ -6886,9 +6935,46 @@ async fn set_session_config_option(
     config_id: String,
     value_id: String,
 ) -> Result<(), sacp::Error> {
-    let updated = set_session_config_option_inner(cx, session_id, config_id, value_id).await?;
+    let is_boolean = state
+        .read()
+        .await
+        .config_options
+        .as_ref()
+        .and_then(|options| options.iter().find(|option| option.id == config_id))
+        .is_some_and(|option| matches!(&option.kind, SessionConfigKindInfo::Boolean(_)));
+    let value = encode_config_option_value(is_boolean, &value_id)?;
+    let updated = set_session_config_option_inner(cx, session_id, config_id, value).await?;
     emit_session_config_options_values(state, emitter, agent_type, updated).await;
     Ok(())
+}
+
+fn encode_config_option_value(
+    is_boolean: bool,
+    value: &str,
+) -> Result<SessionConfigOptionValue, sacp::Error> {
+    if !is_boolean {
+        return Ok(SessionConfigOptionValue::value_id(value.to_string()));
+    }
+
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" => Ok(SessionConfigOptionValue::boolean(true)),
+        "false" => Ok(SessionConfigOptionValue::boolean(false)),
+        _ => Err(sacp::Error::invalid_params().data(format!(
+            "boolean config option requires 'true' or 'false', got '{value}'"
+        ))),
+    }
+}
+
+fn config_option_already_holds(option: &SessionConfigOption, value: &str) -> bool {
+    match &option.kind {
+        SessionConfigKind::Select(select) => select.current_value.to_string() == value,
+        SessionConfigKind::Boolean(toggle) => match value.trim().to_ascii_lowercase().as_str() {
+            "true" => toggle.current_value,
+            "false" => !toggle.current_value,
+            _ => false,
+        },
+        _ => false,
+    }
 }
 
 /// Wire-level half of `set_session_config_option`: send the JSON-RPC request and
@@ -6900,18 +6986,15 @@ async fn set_session_config_option_inner(
     cx: &ConnectionTo<Agent>,
     session_id: &SessionId,
     config_id: String,
-    value_id: String,
+    value: SessionConfigOptionValue,
 ) -> Result<Vec<SessionConfigOption>, sacp::Error> {
-    let req = SetSessionConfigOptionRequest::new(
-        session_id.clone(),
-        config_id,
-        SessionConfigOptionValue::value_id(value_id),
-    );
+    let req = SetSessionConfigOptionRequest::new(session_id.clone(), config_id, value);
     let untyped_req = UntypedMessage::new("session/set_config_option", req).map_err(|e| {
         sacp::util::internal_error(format!("Failed to build config option request: {e}"))
     })?;
 
-    let raw_response = cx.send_request_to(Agent, untyped_req).block_task().await?;
+    let mut raw_response = cx.send_request_to(Agent, untyped_req).block_task().await?;
+    strip_unknown_config_options(&mut raw_response, "session/set_config_option");
     let response: SetSessionConfigOptionResponse =
         serde_json::from_value(raw_response).map_err(|e| {
             sacp::util::internal_error(format!("Failed to parse config option response: {e}"))
@@ -7025,13 +7108,11 @@ async fn apply_preferred_session_options(
         // requested config_id is absent from the advertised options — older or
         // edge-case builds accept `set_config_option` for an unadvertised "mode"
         // (see `ensure_codex_mode_option`), so let the agent decide.
-        let already_matches = options.iter().any(|o| {
-            o.id.to_string() == *config_id
-                && matches!(
-                    &o.kind,
-                    SessionConfigKind::Select(s) if s.current_value.to_string() == *value_id
-                )
-        });
+        let advertised = options
+            .iter()
+            .find(|option| option.id.to_string() == *config_id);
+        let already_matches =
+            advertised.is_some_and(|option| config_option_already_holds(option, value_id));
         if already_matches {
             if config_id == "mode" {
                 sync_file_system_outside_access(
@@ -7042,9 +7123,18 @@ async fn apply_preferred_session_options(
             }
             continue;
         }
-        match set_session_config_option_inner(cx, &session_id, config_id.clone(), value_id.clone())
-            .await
-        {
+        let is_boolean =
+            advertised.is_some_and(|option| matches!(&option.kind, SessionConfigKind::Boolean(_)));
+        let value = match encode_config_option_value(is_boolean, value_id) {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::error!(
+                    "[ACP] invalid preferred config '{config_id}'='{value_id}': {error}"
+                );
+                continue;
+            }
+        };
+        match set_session_config_option_inner(cx, &session_id, config_id.clone(), value).await {
             Ok(updated) => {
                 if config_id == "mode" {
                     sync_file_system_outside_access(
@@ -19793,7 +19883,9 @@ mod tests {
         let model = &opts[0];
         assert_eq!(model.id, GROK_MODEL_OPTION_ID);
         assert_eq!(model.category.as_deref(), Some("model"));
-        let SessionConfigKindInfo::Select(model_sel) = &model.kind;
+        let SessionConfigKindInfo::Select(model_sel) = &model.kind else {
+            panic!("expected model select")
+        };
         // Both models appear (agent-type filtering is deliberately NOT applied —
         // cross-type switches are handled gracefully at set time instead).
         assert_eq!(model_sel.options.len(), 2);
@@ -19809,7 +19901,9 @@ mod tests {
         let effort = &opts[1];
         assert_eq!(effort.id, GROK_EFFORT_OPTION_ID);
         assert_eq!(effort.category.as_deref(), Some("mode"));
-        let SessionConfigKindInfo::Select(effort_sel) = &effort.kind;
+        let SessionConfigKindInfo::Select(effort_sel) = &effort.kind else {
+            panic!("expected effort select")
+        };
         assert_eq!(effort_sel.options.len(), 2);
         assert_eq!(
             effort_sel.current_value, "high",
@@ -19925,7 +20019,9 @@ mod tests {
         // switchable list), current = xhigh, with canonical labels.
         let effort = build_grok_effort_option("grok-4.5", &specs).expect("has effort");
         assert_eq!(effort.id, GROK_EFFORT_OPTION_ID);
-        let SessionConfigKindInfo::Select(sel) = &effort.kind;
+        let SessionConfigKindInfo::Select(sel) = &effort.kind else {
+            panic!("expected effort select")
+        };
         assert_eq!(sel.current_value, "xhigh");
         assert_eq!(sel.options.len(), 4, "high/medium/low + injected xhigh");
         assert_eq!(sel.options[0].value, "xhigh");
@@ -19967,7 +20063,9 @@ mod tests {
             .iter()
             .find(|o| o.id == GROK_EFFORT_OPTION_ID)
             .expect("effort selector");
-        let SessionConfigKindInfo::Select(sel) = &effort.kind;
+        let SessionConfigKindInfo::Select(sel) = &effort.kind else {
+            panic!("expected effort select")
+        };
         assert_eq!(sel.current_value, "xhigh", "grok-4.5's real default");
         assert!(sel
             .options
@@ -20011,7 +20109,9 @@ mod tests {
             .iter()
             .find(|o| o.id == GROK_EFFORT_OPTION_ID)
             .expect("re-added");
-        let SessionConfigKindInfo::Select(sel) = &effort.kind;
+        let SessionConfigKindInfo::Select(sel) = &effort.kind else {
+            panic!("expected effort select")
+        };
         assert_eq!(sel.current_value, "xhigh");
     }
 
@@ -20071,7 +20171,9 @@ mod tests {
 
         // The optimistic pick is reverted: the authoritative model is unchanged.
         let opts = guard.config_options.as_ref().expect("options preserved");
-        let SessionConfigKindInfo::Select(sel) = &opts[0].kind;
+        let SessionConfigKindInfo::Select(sel) = &opts[0].kind else {
+            panic!("expected model select")
+        };
         assert_eq!(sel.current_value, "grok-4.5");
 
         // Event ordering: the authoritative options (revert) precede the coded
@@ -20089,7 +20191,9 @@ mod tests {
 
         // The reverted options carry the original model.
         if let AcpEvent::SessionConfigOptions { config_options } = &events[cfg_idx].payload {
-            let SessionConfigKindInfo::Select(sel) = &config_options[0].kind;
+            let SessionConfigKindInfo::Select(sel) = &config_options[0].kind else {
+                panic!("expected model select")
+            };
             assert_eq!(sel.current_value, "grok-4.5");
         }
 
@@ -22726,5 +22830,87 @@ mod tests {
             extract_session_id_from_raw_response(&codex_shaped_no_session_id_body()),
             None
         );
+    }
+
+    fn cline_boolean_config_json(current_value: bool) -> serde_json::Value {
+        serde_json::json!({
+            "type": "boolean",
+            "id": "auto_approve",
+            "name": "Auto-approve tools",
+            "description": "Automatically approve tool calls",
+            "currentValue": current_value
+        })
+    }
+
+    #[test]
+    fn boolean_config_maps_and_encodes_as_a_json_boolean() {
+        let option: SessionConfigOption =
+            serde_json::from_value(cline_boolean_config_json(true)).unwrap();
+        let mapped = map_session_config_option(&option).expect("boolean option is retained");
+
+        assert_eq!(
+            serde_json::to_value(&mapped).unwrap()["kind"],
+            serde_json::json!({"type": "boolean", "current_value": true})
+        );
+        assert_eq!(
+            encode_config_option_value(true, "FaLsE").unwrap().as_bool(),
+            Some(false)
+        );
+        assert!(encode_config_option_value(true, "not-a-boolean").is_err());
+    }
+
+    #[test]
+    fn permission_option_meta_is_forwarded_verbatim() {
+        let mut meta = Meta::new();
+        meta.insert(
+            "permission".into(),
+            serde_json::json!({
+                "version": 1,
+                "changes": [{"description": "Allow command execution"}]
+            }),
+        );
+        let option = PermissionOption::new(
+            "allow-session",
+            "Allow for session",
+            PermissionOptionKind::AllowAlways,
+        )
+        .meta(meta);
+
+        let mapped = map_permission_option(&option);
+
+        assert_eq!(
+            mapped.meta.unwrap()["permission"]["changes"][0]["description"],
+            "Allow command execution"
+        );
+    }
+
+    #[test]
+    fn unknown_config_kind_is_removed_without_dropping_the_session() {
+        let mut raw = serde_json::json!({
+            "sessionId": "session-1",
+            "configOptions": [
+                {
+                    "type": "select",
+                    "id": "known",
+                    "name": "Known",
+                    "currentValue": "a",
+                    "options": [{"value": "a", "name": "A"}]
+                },
+                cline_boolean_config_json(false),
+                {"type": "slider", "id": "future", "name": "Future"}
+            ]
+        });
+
+        strip_unknown_config_options(&mut raw, "session/new");
+
+        assert_eq!(raw["sessionId"], "session-1");
+        let ids = raw["configOptions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["known", "auto_approve"]);
+        serde_json::from_value::<NewSessionResponse>(raw).expect("sanitized response parses");
     }
 }

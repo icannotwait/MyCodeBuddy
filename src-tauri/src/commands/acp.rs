@@ -228,8 +228,29 @@ pub(crate) fn resolve_system_agent_binary(cmd: &str) -> Option<PathBuf> {
     cand.is_file().then_some(cand)
 }
 
-/// Resolve the `uvx` (uv tool runner) executable used to launch Python ACP
-/// agents (e.g. Hermes). Checks PATH first (respecting a user's own `uv`),
+/// Locate the vendor CLI wrapped by a separately distributed ACP adapter.
+/// This is diagnostic information only; Codeg still launches the adapter.
+pub(crate) async fn resolve_vendor_cli(cmd: &str, extra_dirs: &[&str]) -> Option<PathBuf> {
+    if let Some(path) = resolve_npx_command(cmd).await {
+        return Some(path);
+    }
+    if let Some(path) = resolve_system_agent_binary(cmd) {
+        return Some(path);
+    }
+    let executable = if cfg!(windows) {
+        format!("{cmd}.exe")
+    } else {
+        cmd.to_string()
+    };
+    let home = home_dir_or_default();
+    extra_dirs.iter().find_map(|dir| {
+        let candidate = home.join(dir).join(&executable);
+        candidate.is_file().then_some(candidate)
+    })
+}
+
+/// Resolve the `uvx` (uv tool runner) executable used to launch custom Python
+/// ACP agents. Checks PATH first (respecting a user's own `uv`),
 /// then codeg's managed uv cache, then the common install locations the
 /// official `uv` installer / cargo use (`~/.local/bin`, `~/.cargo/bin`).
 pub(crate) fn resolve_uvx_command() -> Option<PathBuf> {
@@ -655,8 +676,7 @@ async fn detect_local_version(agent_type: AgentType) -> Option<String> {
         } => {
             let mut version = binary_cache::uvx_prepared_version(agent_type);
             // No prepared marker: probe the package's console script on PATH,
-            // then the system-fallback command a launch would actually use
-            // (Hermes: `hermes-acp` from the uvx package vs a pipx `hermes`).
+            // then the custom distribution's system-fallback command.
             if version.is_none() {
                 let bin = resolve_command_on_path(cmd)
                     .or_else(|| system_cmd.and_then(|(c, _)| resolve_command_on_path(c)));
@@ -2038,6 +2058,31 @@ const NPM_OFFICIAL_REGISTRY: &str = "https://registry.npmjs.org";
 /// it unconditionally guarantees the native binary lands no matter how npm is
 /// configured. Harmless for agents without optional deps.
 const NPM_INCLUDE_OPTIONAL: &str = "--include=optional";
+const NPM_FOREGROUND_SCRIPTS: &str = "--foreground-scripts";
+const NPM_RUN_SCRIPTS_OVERRIDE: &str = "--ignore-scripts=false";
+const NODE_ENV_PROXY_VAR: &str = "NODE_USE_ENV_PROXY";
+
+fn npm_package_requires_scripts(package: &str) -> bool {
+    package_name_from_spec(package) == "hermes-agent"
+}
+
+fn annotate_npm_bootstrap_failure(package: &str, error: AcpError) -> AcpError {
+    if !npm_package_requires_scripts(package) {
+        return error;
+    }
+    let AcpError::Protocol(message) = &error else {
+        return error;
+    };
+    if !message.contains("fetch failed")
+        && !message.contains("Failed to download")
+        && !message.contains("aborted due to timeout")
+    {
+        return error;
+    }
+    AcpError::Protocol(format!(
+        "{message}\n\nThe Hermes bootstrap downloads its runtime from github.com with Node's own fetch. Behind a proxy on Node older than 24, upgrade Node or use the official installer; Codeg will use a `hermes` executable on PATH."
+    ))
+}
 
 /// Run an npm command with piped stdout/stderr, streaming each line as a log event.
 /// Returns (success: bool, collected_stderr: String) so callers can inspect errors.
@@ -2051,6 +2096,9 @@ async fn run_npm_streaming(
     let mut cmd = crate::process::tokio_command("npm");
     for arg in args {
         cmd.arg(arg);
+    }
+    if std::env::var_os(NODE_ENV_PROXY_VAR).is_none() {
+        cmd.env(NODE_ENV_PROXY_VAR, "1");
     }
     cmd.stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
@@ -2120,6 +2168,7 @@ async fn install_npm_global_package_streaming(
     emitter: &EventEmitter,
 ) -> Result<(), AcpError> {
     let registry_arg = format!("--registry={NPM_OFFICIAL_REGISTRY}");
+    let run_scripts = npm_package_requires_scripts(package);
 
     emit_agent_install_event(
         emitter,
@@ -2128,18 +2177,18 @@ async fn install_npm_global_package_streaming(
         format!("$ npm install -g {NPM_INCLUDE_OPTIONAL} {package}"),
     );
 
-    let (success, stderr) = run_npm_streaming(
-        &[
-            "install",
-            "-g",
-            NPM_INCLUDE_OPTIONAL,
-            &registry_arg,
-            package,
-        ],
-        task_id,
-        emitter,
-    )
-    .await?;
+    let mut args = vec![
+        "install",
+        "-g",
+        NPM_INCLUDE_OPTIONAL,
+        NPM_FOREGROUND_SCRIPTS,
+    ];
+    if run_scripts {
+        args.push(NPM_RUN_SCRIPTS_OVERRIDE);
+    }
+    args.push(&registry_arg);
+    args.push(package);
+    let (success, stderr) = run_npm_streaming(&args, task_id, emitter).await?;
 
     if !success {
         // EACCES: permission denied — retry with a user-local --prefix so
@@ -2163,19 +2212,20 @@ async fn install_npm_global_package_streaming(
                 AgentInstallEventKind::Log,
                 "File conflict, retrying with --force...",
             );
-            let (retry_success, retry_stderr) = run_npm_streaming(
-                &[
-                    "install",
-                    "-g",
-                    "--force",
-                    NPM_INCLUDE_OPTIONAL,
-                    &registry_arg,
-                    package,
-                ],
-                task_id,
-                emitter,
-            )
-            .await?;
+            let mut retry_args = vec![
+                "install",
+                "-g",
+                "--force",
+                NPM_INCLUDE_OPTIONAL,
+                NPM_FOREGROUND_SCRIPTS,
+            ];
+            if run_scripts {
+                retry_args.push(NPM_RUN_SCRIPTS_OVERRIDE);
+            }
+            retry_args.push(&registry_arg);
+            retry_args.push(package);
+            let (retry_success, retry_stderr) =
+                run_npm_streaming(&retry_args, task_id, emitter).await?;
             if !retry_success {
                 if retry_stderr.contains("EACCES") {
                     emit_agent_install_event(
@@ -2239,6 +2289,7 @@ async fn install_npm_to_user_prefix_streaming(
     })?;
 
     let prefix_arg = format!("--prefix={}", prefix.display());
+    let run_scripts = npm_package_requires_scripts(package);
 
     emit_agent_install_event(
         emitter,
@@ -2250,19 +2301,19 @@ async fn install_npm_to_user_prefix_streaming(
         ),
     );
 
-    let (success, stderr) = run_npm_streaming(
-        &[
-            "install",
-            "-g",
-            NPM_INCLUDE_OPTIONAL,
-            &prefix_arg,
-            registry_arg,
-            package,
-        ],
-        task_id,
-        emitter,
-    )
-    .await?;
+    let mut args = vec![
+        "install",
+        "-g",
+        NPM_INCLUDE_OPTIONAL,
+        NPM_FOREGROUND_SCRIPTS,
+    ];
+    if run_scripts {
+        args.push(NPM_RUN_SCRIPTS_OVERRIDE);
+    }
+    args.push(&prefix_arg);
+    args.push(registry_arg);
+    args.push(package);
+    let (success, stderr) = run_npm_streaming(&args, task_id, emitter).await?;
 
     if !success {
         // EEXIST in the user prefix: retry with --force to overwrite stale files
@@ -2274,20 +2325,21 @@ async fn install_npm_to_user_prefix_streaming(
                 AgentInstallEventKind::Log,
                 "File conflict in user prefix, retrying with --force...",
             );
-            let (force_success, force_stderr) = run_npm_streaming(
-                &[
-                    "install",
-                    "-g",
-                    "--force",
-                    NPM_INCLUDE_OPTIONAL,
-                    &prefix_arg,
-                    registry_arg,
-                    package,
-                ],
-                task_id,
-                emitter,
-            )
-            .await?;
+            let mut force_args = vec![
+                "install",
+                "-g",
+                "--force",
+                NPM_INCLUDE_OPTIONAL,
+                NPM_FOREGROUND_SCRIPTS,
+            ];
+            if run_scripts {
+                force_args.push(NPM_RUN_SCRIPTS_OVERRIDE);
+            }
+            force_args.push(&prefix_arg);
+            force_args.push(registry_arg);
+            force_args.push(package);
+            let (force_success, force_stderr) =
+                run_npm_streaming(&force_args, task_id, emitter).await?;
             if !force_success {
                 let err = force_stderr.trim().to_string();
                 let msg = if err.is_empty() {
@@ -6347,71 +6399,48 @@ fn shell_join(argv: &[String]) -> String {
         .join(" ")
 }
 
-/// The argv for Hermes's `--setup` and `model` flows: prefer a system `hermes`
-/// CLI, else the resolved uvx recipe (with the pinned package), else the
-/// documented uvx form. Returned as argv vectors so callers can shell-quote per
-/// platform for display or execute them.
-fn hermes_setup_argvs() -> (Vec<String>, Vec<String>) {
+/// The argv for Hermes's `--setup` and `model` flows. Prefer an installed
+/// `hermes` command, then use the pinned npm bridge explicitly via npx.
+async fn hermes_setup_argvs() -> (Vec<String>, Vec<String>) {
     let meta = registry::get_agent_meta(AgentType::Hermes);
-    if let registry::AgentDistribution::Uvx {
-        package,
-        cmd,
-        python,
-        system_cmd,
-        ..
-    } = meta.distribution
-    {
-        if let Some((sys, _)) = system_cmd {
-            if resolve_command_on_path(sys).is_some() {
+    let package = match meta.distribution {
+        registry::AgentDistribution::Npx { package, cmd, .. } => {
+            if resolve_command_on_path(cmd).is_some() {
                 return (
-                    vec![sys.to_string(), "acp".to_string(), "--setup".to_string()],
-                    vec![sys.to_string(), "model".to_string()],
+                    vec![cmd.to_string(), "acp".to_string(), "--setup".to_string()],
+                    vec![cmd.to_string(), "model".to_string()],
                 );
             }
+            if let Some(resolved) = resolve_npx_command(cmd).await {
+                let executable = resolved.display().to_string();
+                return (
+                    vec![executable.clone(), "acp".to_string(), "--setup".to_string()],
+                    vec![executable, "model".to_string()],
+                );
+            }
+            package
         }
-        let uvx = resolve_uvx_command()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "uvx".to_string());
-        let python_args = uvx_python_args(python);
-        // `uvx [--python <ver>] --from <package> <tail...>` — the pin must
-        // precede `--from`, matching the launch/prewarm invocations.
-        let build = |tail: &[&str]| -> Vec<String> {
-            let mut argv = vec![uvx.clone()];
-            argv.extend(python_args.iter().cloned());
-            argv.push("--from".to_string());
-            argv.push(package.to_string());
-            argv.extend(tail.iter().map(|s| s.to_string()));
-            argv
-        };
-        return (build(&[cmd, "--setup"]), build(&["hermes", "model"]));
-    }
-    // Unreachable: Hermes is always a Uvx distribution.
-    (
-        vec![
-            "uvx".to_string(),
-            "--python".to_string(),
-            "3.13".to_string(),
-            "--from".to_string(),
-            "hermes-agent[acp,mcp]==0.16.0".to_string(),
-            "hermes-acp".to_string(),
-            "--setup".to_string(),
-        ],
-        vec![
-            "uvx".to_string(),
-            "--python".to_string(),
-            "3.13".to_string(),
-            "--from".to_string(),
-            "hermes-agent[acp,mcp]==0.16.0".to_string(),
+        _ => "hermes-agent@0.20.1",
+    };
+    let build = |tail: &[&str]| {
+        let mut command = vec![
+            "npx".to_string(),
+            "-y".to_string(),
+            NPM_RUN_SCRIPTS_OVERRIDE.to_string(),
+            "--package".to_string(),
+            package.to_string(),
             "hermes".to_string(),
-            "model".to_string(),
-        ],
-    )
+        ];
+        command.extend(tail.iter().map(|arg| (*arg).to_string()));
+        command
+    };
+    (build(&["acp", "--setup"]), build(&["model"]))
 }
 
 /// Build the displayed/runnable `(setup, model)` shell commands for the Hermes
 /// setup guidance, shell-quoted for the current platform.
-fn hermes_setup_commands() -> (String, String) {
-    let (setup, model) = hermes_setup_argvs();
+async fn hermes_setup_commands() -> (String, String) {
+    let (setup, model) = hermes_setup_argvs().await;
     (shell_join(&setup), shell_join(&model))
 }
 
@@ -6455,7 +6484,7 @@ fn project_hermes_key_and_base(
     (api_key, base_url)
 }
 
-fn load_hermes_local_config_json() -> Option<String> {
+async fn load_hermes_local_config_json() -> Option<String> {
     let env_map = fs::read_to_string(hermes_env_path())
         .ok()
         .map(|raw| parse_env_file(&raw))
@@ -6486,7 +6515,7 @@ fn load_hermes_local_config_json() -> Option<String> {
         None => (None, yaml_base_url),
     };
 
-    let (setup_command, model_command) = hermes_setup_commands();
+    let (setup_command, model_command) = hermes_setup_commands().await;
 
     let mut merged = serde_json::Map::new();
     if let Some(value) = provider {
@@ -9498,6 +9527,7 @@ pub(crate) async fn acp_get_agent_status_core(
         available,
         enabled: setting.map(|m| m.enabled).unwrap_or(true),
         installed_version,
+        is_acp_adapter: registry::acp_adapter_relation(agent_type).is_some(),
     })
 }
 
@@ -9692,7 +9722,7 @@ pub(crate) async fn acp_list_agents_core(db: &AppDatabase) -> Result<Vec<AcpAgen
         // local config path), so no Hermes credential leaks into process env.
         let (config_json, hermes_config_yaml) = if agent_type == AgentType::Hermes {
             (
-                load_hermes_local_config_json(),
+                load_hermes_local_config_json().await,
                 fs::read_to_string(hermes_config_yaml_path()).ok(),
             )
         } else {
@@ -9731,6 +9761,7 @@ pub(crate) async fn acp_list_agents_core(db: &AppDatabase) -> Result<Vec<AcpAgen
             description: meta.description.to_string(),
             available,
             distribution_type: dist_type.to_string(),
+            is_acp_adapter: registry::acp_adapter_relation(agent_type).is_some(),
             custom_source: agent_type
                 .custom_id()
                 .and_then(crate::acp::custom_registry::source_of)
@@ -10660,7 +10691,7 @@ pub async fn acp_pi_list_trust_entries(
 #[cfg(feature = "tauri-runtime")]
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
 pub async fn acp_open_hermes_setup_terminal(kind: String) -> Result<(), AcpError> {
-    let (setup, model) = hermes_setup_commands();
+    let (setup, model) = hermes_setup_commands().await;
     let command = match kind.as_str() {
         "setup" => setup,
         "model" => model,
@@ -11030,7 +11061,7 @@ pub(crate) async fn acp_prepare_npx_agent_core(
 
     let meta = registry::get_agent_meta(agent_type);
     let result = match meta.distribution {
-        registry::AgentDistribution::Npx { package, .. } => {
+        registry::AgentDistribution::Npx { package, cmd, .. } => {
             // `version_override` of None/empty keeps the registry-pinned spec;
             // a custom version installs `<name>@<version>` instead.
             let install_spec = build_npm_install_spec(package, version_override.as_deref())?;
@@ -11080,7 +11111,30 @@ pub(crate) async fn acp_prepare_npx_agent_core(
                 AgentInstallEventKind::Log,
                 format!("Installing {} ({install_spec})", meta.name),
             );
-            install_npm_global_package_streaming(&install_spec, &task_id, emitter).await?;
+            install_npm_global_package_streaming(&install_spec, &task_id, emitter)
+                .await
+                .map_err(|error| annotate_npm_bootstrap_failure(&install_spec, error))?;
+
+            if npm_package_requires_scripts(&install_spec) {
+                emit_agent_install_event(
+                    emitter,
+                    &task_id,
+                    AgentInstallEventKind::Log,
+                    format!("Verifying the {} runtime...", meta.name),
+                );
+                let runtime_ok = match resolve_npx_command(cmd).await {
+                    Some(binary) => system_probed_version(agent_type, &binary, None)
+                        .await
+                        .is_some(),
+                    None => false,
+                };
+                if !runtime_ok {
+                    return Err(AcpError::protocol(format!(
+                        "{} installed, but its bootstrapped runtime is not executable",
+                        meta.name
+                    )));
+                }
+            }
 
             emit_agent_install_event(
                 emitter,
@@ -15272,24 +15326,52 @@ wire_api = "chat"
         }
     }
 
-    #[test]
-    fn hermes_setup_argvs_pin_python_before_from() {
-        // hermes-agent's requires-python `<3.14` (and its win32 `pywinpty` dep)
-        // means every uvx invocation must pin the interpreter, so a default
-        // Python 3.14 never gets selected. Guard the assertion on the `--from`
-        // branch: when a real `hermes` CLI is on PATH the recipe is the system
-        // form (`hermes acp --setup` / `hermes model`) with no `--from`.
-        let (setup, model) = hermes_setup_argvs();
+    #[tokio::test]
+    async fn hermes_npx_setup_argvs_address_the_hermes_bin() {
+        let (setup, model) = hermes_setup_argvs().await;
+        assert_eq!(setup.last().map(String::as_str), Some("--setup"));
+        assert_eq!(model.last().map(String::as_str), Some("model"));
         for argv in [&setup, &model] {
-            if let Some(from_idx) = argv.iter().position(|a| a == "--from") {
-                let py_idx = argv
+            if argv.first().map(String::as_str) == Some("npx") {
+                let package_index = argv
                     .iter()
-                    .position(|a| a == "--python")
-                    .expect("uvx recipe must pin --python before --from");
-                assert!(py_idx < from_idx, "--python must precede --from: {argv:?}");
-                assert_eq!(argv.get(py_idx + 1).map(String::as_str), Some("3.13"));
+                    .position(|arg| arg == "--package")
+                    .expect("npx recipe must select the hermes package");
+                assert_eq!(
+                    argv.get(package_index + 1).map(String::as_str),
+                    Some("hermes-agent@0.20.1")
+                );
+                assert_eq!(
+                    argv.get(package_index + 2).map(String::as_str),
+                    Some("hermes")
+                );
+            } else {
+                let executable = argv.first().expect("non-empty Hermes command");
+                assert!(
+                    executable == "hermes"
+                        || std::path::Path::new(executable)
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|name| {
+                                name.trim_end_matches(".cmd").trim_end_matches(".exe") == "hermes"
+                            }),
+                    "Hermes must use its native CLI or the reviewed npx bridge: {argv:?}"
+                );
             }
         }
+    }
+
+    #[test]
+    fn hermes_npm_bridge_keeps_bootstrap_scripts_enabled() {
+        assert!(npm_package_requires_scripts("hermes-agent@0.20.1"));
+        assert!(!npm_package_requires_scripts(
+            "@agentclientprotocol/codex-acp@1.1.9"
+        ));
+
+        let failure =
+            AcpError::Protocol("failed to install npm package globally: fetch failed".to_string());
+        let annotated = annotate_npm_bootstrap_failure("hermes-agent@0.20.1", failure);
+        assert!(annotated.to_string().contains("proxy"));
     }
 
     #[test]

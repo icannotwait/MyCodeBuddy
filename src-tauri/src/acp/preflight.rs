@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use crate::acp::binary_cache;
-use crate::acp::registry::{self, AgentDistribution};
+use crate::acp::registry::{self, AcpAdapterRelation, AcpAgentMeta, AgentDistribution};
 use crate::models::agent::AgentType;
 
 /// Cache for npm environment check results.
@@ -45,11 +45,24 @@ pub struct CheckItem {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct AdapterInfo {
+    pub adapter_package: String,
+    pub adapter_cmd: String,
+    pub adapter_installed: bool,
+    pub native_cmd: String,
+    pub native_label: String,
+    pub native_path: Option<String>,
+    pub shared_config_dir: String,
+    pub docs_url: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct PreflightResult {
     pub agent_type: AgentType,
     pub agent_name: String,
     pub passed: bool,
     pub checks: Vec<CheckItem>,
+    pub adapter: Option<AdapterInfo>,
 }
 
 pub fn clear_npm_env_cache() {
@@ -100,6 +113,48 @@ pub async fn run_preflight(
         agent_name: meta.name.to_string(),
         passed,
         checks,
+        adapter: probe_adapter(&meta).await,
+    }
+}
+
+async fn probe_adapter(meta: &AcpAgentMeta) -> Option<AdapterInfo> {
+    let relation = registry::acp_adapter_relation(meta.agent_type)?;
+    let adapter_cmd = match &meta.distribution {
+        AgentDistribution::Npx { cmd, .. } => *cmd,
+        _ => return None,
+    };
+    let (adapter_installed, native_path) = tokio::join!(
+        crate::commands::acp::is_cmd_available(adapter_cmd),
+        crate::commands::acp::resolve_vendor_cli(relation.native_cmd, relation.extra_dirs),
+    );
+
+    Some(build_adapter_info(
+        meta,
+        &relation,
+        adapter_installed,
+        native_path.map(|path| path.to_string_lossy().into_owned()),
+    ))
+}
+
+fn build_adapter_info(
+    meta: &AcpAgentMeta,
+    relation: &AcpAdapterRelation,
+    adapter_installed: bool,
+    native_path: Option<String>,
+) -> AdapterInfo {
+    let (adapter_package, adapter_cmd) = match &meta.distribution {
+        AgentDistribution::Npx { package, cmd, .. } => ((*package).to_string(), (*cmd).to_string()),
+        _ => (String::new(), String::new()),
+    };
+    AdapterInfo {
+        adapter_package,
+        adapter_cmd,
+        adapter_installed,
+        native_cmd: relation.native_cmd.to_string(),
+        native_label: relation.native_label.to_string(),
+        native_path,
+        shared_config_dir: relation.shared_config_dir.to_string(),
+        docs_url: relation.docs_url.to_string(),
     }
 }
 
@@ -754,6 +809,19 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fs;
     use std::path::PathBuf;
+
+    #[test]
+    fn adapter_info_names_adapter_and_native_cli() {
+        let meta = registry::get_agent_meta(AgentType::Codex);
+        let relation = registry::acp_adapter_relation(AgentType::Codex).unwrap();
+        let info = build_adapter_info(&meta, &relation, false, Some("/usr/local/bin/codex".into()));
+
+        assert_eq!(info.adapter_package, "@agentclientprotocol/codex-acp@1.1.9");
+        assert_eq!(info.adapter_cmd, "codex-acp");
+        assert_eq!(info.native_cmd, "codex");
+        assert_eq!(info.native_path.as_deref(), Some("/usr/local/bin/codex"));
+        assert_eq!(info.shared_config_dir, "~/.codex");
+    }
 
     #[test]
     fn valid_saved_codex_cli_path_wins_over_fallback() {

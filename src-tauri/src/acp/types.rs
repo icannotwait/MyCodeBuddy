@@ -608,6 +608,10 @@ pub struct PermissionOptionInfo {
     pub option_id: String,
     pub name: String,
     pub kind: String,
+    /// Opaque ACP option metadata. Newer adapters describe the exact permission
+    /// changes and lifetime here; consumers decide how to render it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -645,9 +649,15 @@ pub struct SessionConfigSelectInfo {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionConfigBooleanInfo {
+    pub current_value: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionConfigKindInfo {
     Select(SessionConfigSelectInfo),
+    Boolean(SessionConfigBooleanInfo),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -746,6 +756,9 @@ pub struct AcpAgentInfo {
     pub description: String,
     pub available: bool,
     pub distribution_type: String,
+    /// True when Codeg launches a separate ACP adapter rather than the vendor
+    /// CLI named by the integration.
+    pub is_acp_adapter: bool,
     /// For custom agents, where the definition came from (`registry` |
     /// `manual`); `None` for built-ins. A manual definition's
     /// `registry_version` is user-typed, so the version-status display shows
@@ -1087,6 +1100,7 @@ pub struct AcpAgentStatus {
     pub available: bool,
     pub enabled: bool,
     pub installed_version: Option<String>,
+    pub is_acp_adapter: bool,
 }
 
 /// Severity of a single diagnostics check / the overall verdict.
@@ -1227,6 +1241,46 @@ pub struct ForkResultInfo {
 #[cfg(test)]
 mod envelope_tests {
     use super::*;
+
+    #[test]
+    fn permission_option_meta_serializes_verbatim() {
+        let option = PermissionOptionInfo {
+            option_id: "allow".into(),
+            name: "Allow".into(),
+            kind: "allow_once".into(),
+            meta: Some(serde_json::json!({
+                "permission": {
+                    "version": 1,
+                    "changes": [{"description": "Run the command"}]
+                }
+            })),
+        };
+
+        let json = serde_json::to_value(option).unwrap();
+        assert_eq!(json["meta"]["permission"]["version"], 1);
+        assert_eq!(
+            json["meta"]["permission"]["changes"][0]["description"],
+            "Run the command"
+        );
+    }
+
+    #[test]
+    fn boolean_config_kind_serializes_with_boolean_discriminator() {
+        let option = SessionConfigOptionInfo {
+            id: "auto_approve".into(),
+            name: "Auto approve".into(),
+            description: None,
+            category: None,
+            kind: SessionConfigKindInfo::Boolean(SessionConfigBooleanInfo {
+                current_value: true,
+            }),
+        };
+
+        assert_eq!(
+            serde_json::to_value(option).unwrap()["kind"],
+            serde_json::json!({"type": "boolean", "current_value": true})
+        );
+    }
 
     #[test]
     fn event_envelope_serializes_with_flat_payload() {
