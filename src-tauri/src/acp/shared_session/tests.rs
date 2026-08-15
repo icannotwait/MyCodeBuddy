@@ -464,6 +464,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn contended_public_state_does_not_hold_the_broker_record_lock() {
+        let broker = SharedSessionBroker::default();
+        let reservation = broker
+            .reserve_or_attach(request(
+                SharedSessionKey::Conversation(132),
+                "contended-state-connection",
+                "contended-state-client",
+                "contended-state-request",
+            ))
+            .await
+            .unwrap();
+        let state = Arc::new(tokio::sync::RwLock::new(SessionState::new(
+            reservation.attachment.connection_id.clone(),
+            crate::models::agent::AgentType::Codex,
+            None,
+            "shared-server".into(),
+            Some(9),
+        )));
+        broker
+            .install_registered(
+                &reservation.attachment.connection_id,
+                reservation.attachment.generation,
+                "driver-incarnation".into(),
+                state.clone(),
+                EventEmitter::Noop,
+                Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            )
+            .await
+            .unwrap();
+
+        let state_guard = state.write().await;
+        let settlement = {
+            let broker = broker.clone();
+            let connection_id = reservation.attachment.connection_id.clone();
+            let generation = reservation.attachment.generation;
+            tokio::spawn(async move {
+                broker
+                    .mark_ready(&connection_id, generation, "driver-incarnation")
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+
+        let diagnostic = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            broker.diagnostic_for_connection(&reservation.attachment.connection_id),
+        )
+        .await;
+        drop(state_guard);
+        settlement.await.unwrap().unwrap();
+
+        assert!(
+            diagnostic.is_ok(),
+            "state-lock contention must release the broker record lock"
+        );
+    }
+
+    #[tokio::test]
     async fn old_driver_incarnation_cannot_settle_replacement() {
         let broker = SharedSessionBroker::default();
         let reservation = broker
@@ -501,15 +559,34 @@ mod tests {
             None,
         );
         replacement.connection_incarnation = "driver-new".into();
-        broker
-            .replace_registered_driver(
+        let permit = broker
+            .begin_registered_replacement(
                 &reservation.attachment.connection_id,
                 reservation.attachment.generation,
                 "driver-old",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            broker
+                .mark_ready(
+                    &reservation.attachment.connection_id,
+                    reservation.attachment.generation,
+                    "driver-old",
+                )
+                .await,
+            Err(SharedSessionError::GenerationStale)
+        );
+        state
+            .write()
+            .await
+            .prepare_registered_replacement(replacement);
+        broker
+            .commit_registered_replacement(
+                &permit,
                 "driver-new".into(),
                 state,
                 EventEmitter::Noop,
-                replacement,
                 Arc::new(std::sync::atomic::AtomicU32::new(0)),
             )
             .await

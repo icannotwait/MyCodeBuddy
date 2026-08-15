@@ -1711,6 +1711,7 @@ pub async fn spawn_agent_connection(
     mcp_cancel_registry: Arc<crate::acp::tool_watchdog::McpCancelRegistry>,
     existing_public_state: Option<Arc<RwLock<SessionState>>>,
 ) -> Result<RegisteredSpawnAttempt, AcpError> {
+    let redact_shared_diagnostics = owner_window_label == "shared-server";
     // Create the authoritative session state up front. Subsequent emit_with_state
     // calls write through this state and increment its seq counter so the first
     // event the frontend sees has seq=1, not the placeholder 0 from Phase 0.
@@ -1739,24 +1740,25 @@ pub async fn spawn_agent_connection(
     // Install the SessionStarted dedup signal before the first event. A
     // same-generation fallback replaces driver-owned fields inside the exact
     // public Arc so existing subscribers keep one event stream and sequence.
-    let (session_state, pending_replacement, session_started_rx) = match existing_public_state {
+    let is_registered_replacement = existing_public_state.is_some();
+    let (session_state, session_started_rx) = match existing_public_state {
         Some(session_state) => {
             let session_started_rx = initial_state.install_session_started_signal();
-            (session_state, Some(initial_state), session_started_rx)
+            session_state
+                .write()
+                .await
+                .prepare_registered_replacement(initial_state);
+            (session_state, session_started_rx)
         }
         None => {
             let session_started_rx = initial_state.install_session_started_signal();
-            (
-                Arc::new(RwLock::new(initial_state)),
-                None,
-                session_started_rx,
-            )
+            (Arc::new(RwLock::new(initial_state)), session_started_rx)
         }
     };
     let (route_bootstrap_tx, route_bootstrap_rx) =
         tokio::sync::oneshot::channel::<RouteBootstrapOutcome>();
 
-    if pending_replacement.is_none() {
+    if !is_registered_replacement {
         emit_with_state(
             &session_state,
             &emitter,
@@ -1845,7 +1847,7 @@ pub async fn spawn_agent_connection(
             owner_window_label,
             owner_operation_id,
         );
-        if pending_replacement.is_none() {
+        if !is_registered_replacement {
             let mut st = session_state.write().await;
             st.owner_window_label = label.clone();
         }
@@ -1938,23 +1940,16 @@ pub async fn spawn_agent_connection(
                                 move || child_pid.store(0, std::sync::atomic::Ordering::SeqCst)
                             }),
                         Err(error) => {
-                            let code = error.code().map(String::from);
-                            let message = error.to_string();
+                            let public_error = connection_driver_error_event(
+                                &error,
+                                agent_type,
+                                redact_shared_diagnostics,
+                            );
                             let _ = route_bootstrap_tx.send(RouteBootstrapOutcome::Fatal(error));
                             if let Some(injection) = delegation_for_cleanup {
                                 cleanup_delegation_parent(&injection, &conn_id, &state_clone).await;
                             }
-                            emit_with_state(
-                                &state_clone,
-                                &emitter_clone,
-                                AcpEvent::Error {
-                                    message,
-                                    agent_type: agent_type.to_string(),
-                                    code,
-                                    terminal: true,
-                                },
-                            )
-                            .await;
+                            emit_with_state(&state_clone, &emitter_clone, public_error).await;
                             emit_with_state(
                                 &state_clone,
                                 &emitter_clone,
@@ -2011,21 +2006,10 @@ pub async fn spawn_agent_connection(
                 }
 
                 if let Err(e) = result {
-                    let code = e.code().map(String::from);
                     emit_with_state(
                         &state_clone,
                         &emitter_clone,
-                        AcpEvent::Error {
-                            message: e.to_string(),
-                            agent_type: agent_type.to_string(),
-                            code,
-                            // The only genuinely terminal emit site: `run_connection`
-                            // is unwinding and the next event is `Disconnected`.
-                            // The lifecycle worker uses this flag to decide whether
-                            // to flip the conversation row to Cancelled and to
-                            // buffer the detail for the broker's cancel reason.
-                            terminal: true,
-                        },
+                        connection_driver_error_event(&e, agent_type, redact_shared_diagnostics),
                     )
                     .await;
                     // Drive the state machine through `Error` before `Disconnected`
@@ -2096,7 +2080,6 @@ pub async fn spawn_agent_connection(
         },
         route_plan: registered_route_plan,
         driver_start_tx: Some(driver_start_tx),
-        pending_replacement,
         child_pid: registered_child_pid,
     })
 }
@@ -4342,7 +4325,6 @@ pub struct RegisteredSpawnAttempt {
     pub handshake: SpawnHandshake,
     pub route_plan: crate::acp::delegation::route::DelegationRoutePlan,
     pub(crate) driver_start_tx: Option<tokio::sync::oneshot::Sender<()>>,
-    pub(crate) pending_replacement: Option<SessionState>,
     pub(crate) child_pid: Arc<std::sync::atomic::AtomicU32>,
 }
 
@@ -6405,6 +6387,25 @@ fn bootstrap_outcome_from_acp_error(err: &AcpError) -> RouteBootstrapOutcome {
             RouteBootstrapOutcome::Fatal(AcpError::RouteUnavailable { reason: *reason })
         }
         other => RouteBootstrapOutcome::Fatal(AcpError::protocol(other.to_string())),
+    }
+}
+
+fn connection_driver_error_event(
+    error: &AcpError,
+    agent_type: AgentType,
+    redact_shared_diagnostics: bool,
+) -> AcpEvent {
+    let (message, code) = if redact_shared_diagnostics {
+        let error = crate::acp::shared_session::SharedSessionError::SessionUnavailable;
+        (error.to_string(), Some(error.code().to_string()))
+    } else {
+        (error.to_string(), error.code().map(String::from))
+    };
+    AcpEvent::Error {
+        message,
+        agent_type: agent_type.to_string(),
+        code,
+        terminal: true,
     }
 }
 
@@ -16340,6 +16341,44 @@ mod tests {
             bootstrap_outcome_from_acp_error(&residual),
             RouteBootstrapOutcome::Fatal(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn shared_registered_build_failure_redacts_event_and_snapshot_detail() {
+        const SENTINEL_PATH: &str = "/private/tmp/SECRET-PATH";
+        const SENTINEL_TOKEN: &str = "TOKEN-SENTINEL";
+        let state = Arc::new(RwLock::new(SessionState::new(
+            "shared-redaction".into(),
+            AgentType::Codex,
+            None,
+            "shared-server".into(),
+            None,
+        )));
+        let error = AcpError::SpawnFailed(format!(
+            "spawn at {SENTINEL_PATH} failed with token {SENTINEL_TOKEN}"
+        ));
+
+        emit_with_state(
+            &state,
+            &EventEmitter::Noop,
+            connection_driver_error_event(&error, AgentType::Codex, true),
+        )
+        .await;
+
+        let state = state.read().await;
+        let events = serde_json::to_string(
+            &state
+                .recent_events_after(0)
+                .expect("shared error event is retained"),
+        )
+        .unwrap();
+        let snapshot = serde_json::to_string(&state.to_snapshot().last_error).unwrap();
+        for public_diagnostic in [&events, &snapshot] {
+            assert!(!public_diagnostic.contains(SENTINEL_PATH));
+            assert!(!public_diagnostic.contains(SENTINEL_TOKEN));
+        }
+        assert!(events.contains("session_unavailable"));
+        assert!(events.contains("shared session is unavailable"));
     }
 
     #[tokio::test]

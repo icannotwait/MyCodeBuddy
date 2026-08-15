@@ -45,9 +45,9 @@ use crate::acp::question::{
 };
 use crate::acp::session_state::{ActiveTurnContext, InternalPromptAdmission, SessionState};
 use crate::acp::shared_session::{
-    SharedConfigConflictKind, SharedLaunchIdentity, SharedReserveRequest, SharedSessionAttachment,
-    SharedSessionBroker, SharedSessionError, SharedSessionKey, SharedSessionPhase,
-    SharedSessionProjection,
+    RegisteredReplacementPermit, SharedConfigConflictKind, SharedLaunchIdentity,
+    SharedReserveRequest, SharedSessionAttachment, SharedSessionBroker, SharedSessionError,
+    SharedSessionKey, SharedSessionPhase, SharedSessionProjection,
 };
 use crate::acp::terminal_context::{finalize_acp_launch_config, AcpLaunchConfig, AcpLaunchInputs};
 use crate::acp::termination::AcpDisconnectOrigin;
@@ -620,7 +620,13 @@ pub struct ConnectionManager {
     #[cfg(any(test, feature = "test-utils"))]
     shared_spawn_count: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(any(test, feature = "test-utils"))]
+    shared_registered_root_count: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(any(test, feature = "test-utils"))]
     shared_fallback_trace: Arc<std::sync::Mutex<Vec<&'static str>>>,
+    #[cfg(test)]
+    shared_settler_panic_after_replacement: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    shared_settler_supervisor_completed: Arc<tokio::sync::Notify>,
     #[cfg(test)]
     disconnect_final_cas_hook: Arc<std::sync::Mutex<Option<DisconnectFinalCasHook>>>,
 }
@@ -706,7 +712,15 @@ impl ConnectionManager {
             #[cfg(any(test, feature = "test-utils"))]
             shared_spawn_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(any(test, feature = "test-utils"))]
+            shared_registered_root_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(any(test, feature = "test-utils"))]
             shared_fallback_trace: Arc::new(std::sync::Mutex::new(Vec::new())),
+            #[cfg(test)]
+            shared_settler_panic_after_replacement: Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            )),
+            #[cfg(test)]
+            shared_settler_supervisor_completed: Arc::new(tokio::sync::Notify::new()),
             #[cfg(test)]
             disconnect_final_cas_hook: Arc::new(std::sync::Mutex::new(None)),
         }
@@ -738,7 +752,15 @@ impl ConnectionManager {
             #[cfg(any(test, feature = "test-utils"))]
             shared_spawn_count: self.shared_spawn_count.clone(),
             #[cfg(any(test, feature = "test-utils"))]
+            shared_registered_root_count: self.shared_registered_root_count.clone(),
+            #[cfg(any(test, feature = "test-utils"))]
             shared_fallback_trace: self.shared_fallback_trace.clone(),
+            #[cfg(test)]
+            shared_settler_panic_after_replacement: self
+                .shared_settler_panic_after_replacement
+                .clone(),
+            #[cfg(test)]
+            shared_settler_supervisor_completed: self.shared_settler_supervisor_completed.clone(),
             #[cfg(test)]
             disconnect_final_cas_hook: self.disconnect_final_cas_hook.clone(),
         }
@@ -758,6 +780,12 @@ impl ConnectionManager {
     #[cfg(any(test, feature = "test-utils"))]
     pub fn shared_spawn_count_for_test(&self) -> usize {
         self.shared_spawn_count
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn shared_registered_root_count_for_test(&self) -> usize {
+        self.shared_registered_root_count
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
@@ -940,12 +968,6 @@ impl ConnectionManager {
         let supervisor = self.clone_ref();
         tokio::spawn(async move {
             if task.await.is_err() {
-                let expected_driver_incarnation = supervisor
-                    .shared_session_broker
-                    .driver_incarnation_for_generation(&connection_id, generation)
-                    .await
-                    .ok()
-                    .flatten();
                 let launch = supervisor
                     .shared_launches
                     .lock()
@@ -957,12 +979,14 @@ impl ConnectionManager {
                         .fail_shared_generation(
                             connection_id,
                             generation,
-                            expected_driver_incarnation,
+                            Some(driver_incarnation),
                             SharedSessionError::SessionUnavailable,
                             launch,
                         )
                         .await;
                 }
+                #[cfg(test)]
+                supervisor.shared_settler_supervisor_completed.notify_one();
             }
         });
         if let Some(driver_start_tx) = driver_start_tx {
@@ -979,13 +1003,6 @@ impl ConnectionManager {
         #[cfg(any(test, feature = "test-utils"))]
         self.shared_spawn_count
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-
-        #[cfg(any(test, feature = "test-utils"))]
-        if let Some(driver) = self.shared_spawn_override.as_ref() {
-            return driver
-                .start(connection_id, launch, existing_public_state)
-                .await;
-        }
 
         self.start_registered_shared_root(
             connection_id,
@@ -1018,6 +1035,9 @@ impl ConnectionManager {
         session_attach_mode: crate::acp::session_attach::SessionAttachMode,
         existing_public_state: Option<Arc<RwLock<SessionState>>>,
     ) -> Result<RegisteredSpawnAttempt, AcpError> {
+        #[cfg(any(test, feature = "test-utils"))]
+        self.shared_registered_root_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let is_registered_replacement = existing_public_state.is_some();
         let expected = self
             .shared_session_broker
@@ -1065,6 +1085,22 @@ impl ConnectionManager {
         route_plan
             .assert_exclusive()
             .map_err(|error| AcpError::protocol(error.to_string()))?;
+
+        #[cfg(any(test, feature = "test-utils"))]
+        if let Some(driver) = self.shared_spawn_override.as_ref() {
+            let launch = {
+                let launches = self.shared_launches.lock().await;
+                launches
+                    .iter()
+                    .find_map(|((registered_connection_id, _), launch)| {
+                        (registered_connection_id == &connection_id).then(|| launch.clone())
+                    })
+                    .ok_or(SharedSessionError::SessionUnavailable)?
+            };
+            return driver
+                .start(connection_id, launch, existing_public_state)
+                .await;
+        }
 
         let skip_delegation_injection = launch_context.purpose.is_hidden_generation();
         let injection = if skip_delegation_injection {
@@ -1223,6 +1259,18 @@ impl ConnectionManager {
                 else {
                     return;
                 };
+                let permit = match self
+                    .shared_session_broker
+                    .begin_registered_replacement(&connection_id, generation, &driver_incarnation)
+                    .await
+                {
+                    Ok(permit) => permit,
+                    Err(_) => return,
+                };
+                self.shared_launches
+                    .lock()
+                    .await
+                    .insert((connection_id.clone(), generation), launch.clone());
                 #[cfg(any(test, feature = "test-utils"))]
                 self.shared_fallback_trace
                     .lock()
@@ -1236,32 +1284,16 @@ impl ConnectionManager {
                     )
                     .await
                 {
-                    Ok(mut replacement) => {
+                    Ok(replacement) => {
                         debug_assert!(Arc::ptr_eq(&public_state, &replacement.state));
                         let next_incarnation = replacement.connection_incarnation.clone();
-                        let Some(pending_replacement) = replacement.pending_replacement.take()
-                        else {
-                            let _ = self.teardown_unexposed_attempt(&connection_id).await;
-                            self.fail_shared_generation(
-                                connection_id,
-                                generation,
-                                Some(driver_incarnation),
-                                SharedSessionError::SessionUnavailable,
-                                launch,
-                            )
-                            .await;
-                            return;
-                        };
                         if self
                             .shared_session_broker
-                            .replace_registered_driver(
-                                &connection_id,
-                                generation,
-                                &driver_incarnation,
+                            .commit_registered_replacement(
+                                &permit,
                                 next_incarnation.clone(),
                                 replacement.state.clone(),
                                 replacement.emitter.clone(),
-                                pending_replacement,
                                 replacement.child_pid.clone(),
                             )
                             .await
@@ -1277,15 +1309,29 @@ impl ConnectionManager {
                                 next_incarnation,
                                 replacement,
                             );
+                            #[cfg(test)]
+                            if self
+                                .shared_settler_panic_after_replacement
+                                .swap(false, std::sync::atomic::Ordering::SeqCst)
+                            {
+                                panic!("intentional old settler panic after replacement");
+                            }
                         } else {
-                            let _ = self.teardown_unexposed_attempt(&connection_id).await;
+                            self.fail_shared_replacement(
+                                connection_id,
+                                generation,
+                                permit,
+                                SharedSessionError::SessionUnavailable,
+                                launch,
+                            )
+                            .await;
                         }
                     }
                     Err(_) => {
-                        self.fail_shared_generation(
+                        self.fail_shared_replacement(
                             connection_id,
                             generation,
-                            Some(driver_incarnation),
+                            permit,
                             SharedSessionError::SessionUnavailable,
                             launch,
                         )
@@ -1294,6 +1340,58 @@ impl ConnectionManager {
                 }
             }
         }
+    }
+
+    async fn fail_shared_replacement(
+        &self,
+        connection_id: String,
+        generation: u64,
+        permit: RegisteredReplacementPermit,
+        error: SharedSessionError,
+        launch: SharedConnectLaunch,
+    ) {
+        let (state, emitter) = match self
+            .shared_session_broker
+            .public_state(&connection_id)
+            .await
+        {
+            Some(public) => public,
+            None => (
+                Arc::new(RwLock::new(self.minimal_failed_shared_state(
+                    &connection_id,
+                    generation,
+                    &launch,
+                    &error,
+                    false,
+                    None,
+                ))),
+                launch.emitter.clone(),
+            ),
+        };
+        if self
+            .shared_session_broker
+            .fail_registered_replacement(&permit, error, false, state, emitter)
+            .await
+            .is_err()
+        {
+            return;
+        }
+
+        let cleanup_complete = self
+            .teardown_unexposed_attempt(&connection_id)
+            .await
+            .is_ok()
+            && !self.connections.lock().await.contains_key(&connection_id);
+        if cleanup_complete {
+            let _ = self
+                .shared_session_broker
+                .mark_cleanup_complete(&connection_id, generation)
+                .await;
+        }
+        self.shared_launches
+            .lock()
+            .await
+            .remove(&(connection_id, generation));
     }
 
     async fn fail_shared_generation(
@@ -8516,6 +8614,24 @@ mod tests {
                 start_log,
             )
         }
+
+        fn fallback_with_gated_replacement() -> (
+            Self,
+            tokio::sync::oneshot::Sender<RouteBootstrapOutcome>,
+            tokio::sync::oneshot::Sender<RouteBootstrapOutcome>,
+        ) {
+            let (first_tx, first_rx) = tokio::sync::oneshot::channel();
+            let (second_tx, second_rx) = tokio::sync::oneshot::channel();
+            (
+                Self {
+                    outcomes: StdMutex::new(VecDeque::from([first_rx, second_rx])),
+                    starts: AtomicUsize::new(0),
+                    start_log: Arc::new(StdMutex::new(Vec::new())),
+                },
+                first_tx,
+                second_tx,
+            )
+        }
     }
 
     #[async_trait::async_trait]
@@ -8532,7 +8648,7 @@ mod tests {
                 .unwrap()
                 .push(format!("start-{attempt}"));
             let connection_incarnation = format!("fake-incarnation-{attempt}");
-            let (state, pending_replacement) = match existing_public_state {
+            let state = match existing_public_state {
                 Some(state) => {
                     let mut replacement = SessionState::new(
                         connection_id.clone(),
@@ -8543,7 +8659,11 @@ mod tests {
                     );
                     replacement.connection_incarnation = connection_incarnation.clone();
                     replacement.set_route_plan_snapshot(&launch.launch_inputs.route_plan);
-                    (state, Some(replacement))
+                    state
+                        .write()
+                        .await
+                        .prepare_registered_replacement(replacement);
+                    state
                 }
                 None => {
                     let mut state = SessionState::new(
@@ -8555,7 +8675,7 @@ mod tests {
                     );
                     state.connection_incarnation = connection_incarnation.clone();
                     state.set_route_plan_snapshot(&launch.launch_inputs.route_plan);
-                    (Arc::new(RwLock::new(state)), None)
+                    Arc::new(RwLock::new(state))
                 }
             };
             let (_session_started_tx, session_started_rx) = tokio::sync::oneshot::channel();
@@ -8576,7 +8696,6 @@ mod tests {
                 },
                 route_plan: launch.launch_inputs.route_plan,
                 driver_start_tx: None,
-                pending_replacement,
                 child_pid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             })
         }
@@ -8629,7 +8748,7 @@ mod tests {
         ) -> Result<RegisteredSpawnAttempt, AcpError> {
             let attempt = self.starts.fetch_add(1, Ordering::SeqCst) + 1;
             let connection_incarnation = format!("activation-incarnation-{attempt}");
-            let (state, pending_replacement) = match existing_public_state {
+            let state = match existing_public_state {
                 Some(state) => {
                     let mut replacement = SessionState::new(
                         connection_id.clone(),
@@ -8640,7 +8759,11 @@ mod tests {
                     );
                     replacement.connection_incarnation = connection_incarnation.clone();
                     replacement.set_route_plan_snapshot(&launch.launch_inputs.route_plan);
-                    (state, Some(replacement))
+                    state
+                        .write()
+                        .await
+                        .prepare_registered_replacement(replacement);
+                    state
                 }
                 None => {
                     let mut state = SessionState::new(
@@ -8652,7 +8775,7 @@ mod tests {
                     );
                     state.connection_incarnation = connection_incarnation.clone();
                     state.set_route_plan_snapshot(&launch.launch_inputs.route_plan);
-                    (Arc::new(RwLock::new(state)), None)
+                    Arc::new(RwLock::new(state))
                 }
             };
             let (_session_started_tx, session_started_rx) = tokio::sync::oneshot::channel();
@@ -8692,7 +8815,6 @@ mod tests {
                 },
                 route_plan: launch.launch_inputs.route_plan,
                 driver_start_tx: Some(driver_start_tx),
-                pending_replacement,
                 child_pid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             })
         }
@@ -9090,6 +9212,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shared_old_settler_panic_after_replacement_does_not_fail_new_driver() {
+        let (driver, first_gate, replacement_gate) =
+            FakeSharedSpawnDriver::fallback_with_gated_replacement();
+        let manager = ConnectionManager::new_with_shared_spawn_driver(Arc::new(driver));
+        manager
+            .shared_settler_panic_after_replacement
+            .store(true, Ordering::SeqCst);
+        let response = manager
+            .connect_or_attach_shared(shared_launch(580, "client").await)
+            .await
+            .unwrap();
+
+        first_gate
+            .send(RouteBootstrapOutcome::RouteSpecific(
+                RouteDegradedReason::CompanionInitializationFailed,
+            ))
+            .unwrap();
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            manager.shared_settler_supervisor_completed.notified(),
+        )
+        .await
+        .expect("old settler supervisor must complete its fenced failure attempt");
+
+        assert_eq!(
+            manager
+                .shared_session_broker
+                .diagnostic_for_connection(&response.connection_id)
+                .await
+                .unwrap()
+                .phase,
+            SharedSessionPhase::Bootstrapping
+        );
+        replacement_gate.send(RouteBootstrapOutcome::Ready).unwrap();
+        manager
+            .wait_for_shared_phase(
+                &response.connection_id,
+                response.generation,
+                SharedSessionPhase::Ready,
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn shared_stale_bootstrap_supervisor_cannot_mutate_replacement_state() {
         let (driver, _gate) = FakeSharedSpawnDriver::pending();
         let manager = ConnectionManager::new_with_shared_spawn_driver(Arc::new(driver));
@@ -9107,16 +9274,26 @@ mod tests {
             Some(9),
         );
         replacement.connection_incarnation = "fake-incarnation-2".into();
-        manager
+        let permit = manager
             .shared_session_broker
-            .replace_registered_driver(
+            .begin_registered_replacement(
                 &response.connection_id,
                 response.generation,
                 "fake-incarnation-1",
+            )
+            .await
+            .unwrap();
+        state
+            .write()
+            .await
+            .prepare_registered_replacement(replacement);
+        manager
+            .shared_session_broker
+            .commit_registered_replacement(
+                &permit,
                 "fake-incarnation-2".into(),
                 state.clone(),
                 EventEmitter::Noop,
-                replacement,
                 Arc::new(std::sync::atomic::AtomicU32::new(0)),
             )
             .await
@@ -9180,7 +9357,112 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shared_rejected_replacement_cas_leaves_public_state_unchanged() {
+    async fn shared_replacement_map_and_state_incarnations_match_on_first_exposure() {
+        let manager = ConnectionManager::new();
+        let agent_type =
+            AgentType::custom("missing-replacement-fence").expect("valid custom agent id");
+        let launch = shared_launch_for_agent(
+            583,
+            9,
+            "replacement-client",
+            agent_type,
+            crate::acp::delegation::route::test_empty_route_plan(),
+        )
+        .await;
+        let reservation = manager
+            .shared_session_broker
+            .reserve_or_attach(SharedReserveRequest {
+                key: launch.key.clone(),
+                connection_id: "replacement-map-state".into(),
+                launch_identity: launch.launch_identity.clone(),
+                client_instance_id: launch.client_instance_id.clone(),
+                device_id: launch.device_id.clone(),
+                request_id: launch.request_id.clone(),
+                retry_failed_generation: None,
+                now: tokio::time::Instant::now(),
+                now_utc: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+        let state = Arc::new(RwLock::new(SessionState::new(
+            reservation.attachment.connection_id.clone(),
+            agent_type,
+            None,
+            "shared-server".into(),
+            Some(9),
+        )));
+        state.write().await.connection_incarnation = "old-incarnation".into();
+        manager
+            .shared_session_broker
+            .install_registered(
+                &reservation.attachment.connection_id,
+                reservation.attachment.generation,
+                "old-incarnation".into(),
+                state.clone(),
+                EventEmitter::Noop,
+                Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            )
+            .await
+            .unwrap();
+        manager.shared_launches.lock().await.insert(
+            (
+                reservation.attachment.connection_id.clone(),
+                reservation.attachment.generation,
+            ),
+            launch.clone(),
+        );
+        let permit = manager
+            .shared_session_broker
+            .begin_registered_replacement(
+                &reservation.attachment.connection_id,
+                reservation.attachment.generation,
+                "old-incarnation",
+            )
+            .await
+            .unwrap();
+
+        let replacement = manager
+            .start_shared_attempt(
+                reservation.attachment.connection_id.clone(),
+                launch,
+                Some(state.clone()),
+            )
+            .await
+            .unwrap();
+        {
+            let map = manager.connections.lock().await;
+            let connection = map
+                .get(&reservation.attachment.connection_id)
+                .expect("registered replacement is exposed in the manager map");
+            let state_incarnation = connection
+                .state
+                .try_read()
+                .expect("replacement state is prepared before map exposure")
+                .connection_incarnation
+                .clone();
+            assert_eq!(connection.connection_incarnation, state_incarnation);
+            assert_eq!(replacement.connection_incarnation, state_incarnation);
+        }
+
+        manager
+            .shared_session_broker
+            .commit_registered_replacement(
+                &permit,
+                replacement.connection_incarnation.clone(),
+                replacement.state.clone(),
+                replacement.emitter.clone(),
+                replacement.child_pid.clone(),
+            )
+            .await
+            .unwrap();
+        manager
+            .teardown_unexposed_attempt(&reservation.attachment.connection_id)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn shared_rejected_replacement_permit_leaves_public_state_unchanged() {
         let broker = SharedSessionBroker::default();
         let launch = shared_launch(583, "client").await;
         let reservation = broker
@@ -9217,33 +9499,16 @@ mod tests {
             .await
             .unwrap();
 
-        let driver = FakeSharedSpawnDriver::immediate_ready();
-        let replacement = driver
-            .start(
-                reservation.attachment.connection_id.clone(),
-                launch,
-                Some(state.clone()),
-            )
-            .await
-            .unwrap();
-        let pending_replacement = replacement
-            .pending_replacement
-            .expect("fake replacement remains private until broker CAS");
-        assert_eq!(
+        assert!(matches!(
             broker
-                .replace_registered_driver(
+                .begin_registered_replacement(
                     &reservation.attachment.connection_id,
                     reservation.attachment.generation,
                     "driver-lost-race",
-                    replacement.connection_incarnation,
-                    replacement.state,
-                    replacement.emitter,
-                    pending_replacement,
-                    replacement.child_pid,
                 )
                 .await,
             Err(SharedSessionError::GenerationStale)
-        );
+        ));
 
         assert_eq!(
             state.read().await.connection_incarnation,
@@ -9311,15 +9576,18 @@ mod tests {
 
     #[tokio::test]
     async fn shared_registry_drives_every_agent_through_one_spawn_path() {
-        for (n, agent_type) in BUILTIN_AGENT_TYPES
+        let agent_types: Vec<_> = BUILTIN_AGENT_TYPES
             .iter()
             .copied()
             .chain([AgentType::custom("fixture").expect("valid fixture id")])
-            .enumerate()
-        {
-            let manager = ConnectionManager::new_with_shared_spawn_driver(Arc::new(
-                FakeSharedSpawnDriver::immediate_ready(),
-            ));
+            .collect();
+        let expected_roots = agent_types.len();
+        let manager = ConnectionManager::new_with_shared_spawn_driver(Arc::new(
+            FakeSharedSpawnDriver::immediate_ready_many(expected_roots),
+        ));
+        let mut connection_ids = std::collections::HashSet::new();
+
+        for (n, agent_type) in agent_types.into_iter().enumerate() {
             let plan = crate::acp::delegation::route::test_empty_route_plan();
             let response = manager
                 .connect_or_attach_shared(
@@ -9342,8 +9610,23 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert_eq!(manager.shared_spawn_count_for_test(), 1);
+            assert!(connection_ids.insert(response.connection_id.clone()));
+            assert_eq!(
+                manager
+                    .shared_session_broker
+                    .diagnostic_for_connection(&response.connection_id)
+                    .await
+                    .unwrap()
+                    .phase,
+                SharedSessionPhase::Ready
+            );
         }
+        assert_eq!(connection_ids.len(), expected_roots);
+        assert_eq!(manager.shared_spawn_count_for_test(), expected_roots);
+        assert_eq!(
+            manager.shared_registered_root_count_for_test(),
+            expected_roots
+        );
     }
 
     #[tokio::test]
