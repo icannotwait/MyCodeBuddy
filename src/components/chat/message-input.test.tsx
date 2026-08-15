@@ -787,7 +787,7 @@ describe("MessageInput PromptDraftRestore rehydration", () => {
       blocks: [{ type: "text" as const, text: "restored prompt body" }],
       displayText: "restored prompt body",
     }
-    const { rerender, container } = render(
+    const { rerender } = render(
       <NextIntlClientProvider locale="en" messages={enMessages}>
         <MessageInput
           onSend={vi.fn()}
@@ -797,28 +797,16 @@ describe("MessageInput PromptDraftRestore rehydration", () => {
       </NextIntlClientProvider>
     )
 
-    await waitFor(() =>
-      expect(container.querySelector('[role="textbox"]')).not.toBeNull()
+    await waitFor(
+      () => expect(composerHandle.current?.getEditor()).toBeTruthy(),
+      { timeout: 5000 }
     )
-
-    rerender(
-      <NextIntlClientProvider locale="en" messages={enMessages}>
-        <MessageInput
-          onSend={vi.fn()}
-          promptCapabilities={CAPS}
-          draftRestore={{ revision: 1, draft }}
-        />
-      </NextIntlClientProvider>
-    )
-
-    await waitFor(() => {
-      expect(composerHandle.current?.getText()).toContain(
-        "restored prompt body"
+    await act(async () => {
+      await new Promise<void>((resolve) =>
+        requestAnimationFrame(() => resolve())
       )
     })
 
-    // Same revision must not re-apply / clobber later user edits.
-    composerHandle.current?.setText("user kept typing")
     rerender(
       <NextIntlClientProvider locale="en" messages={enMessages}>
         <MessageInput
@@ -829,7 +817,29 @@ describe("MessageInput PromptDraftRestore rehydration", () => {
       </NextIntlClientProvider>
     )
     await act(async () => {
-      await new Promise((r) => requestAnimationFrame(r))
+      await new Promise<void>((resolve) =>
+        requestAnimationFrame(() => resolve())
+      )
+    })
+    expect(composerHandle.current?.getText()).toContain("restored prompt body")
+
+    // Same revision must not re-apply / clobber later user edits.
+    act(() => {
+      composerHandle.current?.setText("user kept typing")
+    })
+    rerender(
+      <NextIntlClientProvider locale="en" messages={enMessages}>
+        <MessageInput
+          onSend={vi.fn()}
+          promptCapabilities={CAPS}
+          draftRestore={{ revision: 1, draft }}
+        />
+      </NextIntlClientProvider>
+    )
+    await act(async () => {
+      await new Promise<void>((resolve) =>
+        requestAnimationFrame(() => resolve())
+      )
     })
     expect(composerHandle.current?.getText()).toContain("user kept typing")
   })
