@@ -1071,6 +1071,64 @@ pub async fn acp_validate_pi_command(
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct AcpPiProjectTrustStateParams {
+    pub workspace: String,
+}
+
+pub async fn acp_pi_project_trust_state(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<AcpPiProjectTrustStateParams>,
+) -> Result<Json<acp_commands::PiProjectTrustState>, AppCommandError> {
+    let result = acp_commands::acp_pi_project_trust_state_core(&state.db, params.workspace)
+        .await
+        .map_err(|e| AppCommandError::task_execution_failed(e.to_string()))?;
+    Ok(Json(result))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcpPiSetProjectTrustParams {
+    pub workspace: String,
+    #[serde(default)]
+    pub trusted: Option<bool>,
+}
+
+pub async fn acp_pi_set_project_trust(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<AcpPiSetProjectTrustParams>,
+) -> Result<Json<()>, AppCommandError> {
+    acp_commands::acp_pi_set_project_trust_core(&state.db, params.workspace, params.trusted)
+        .await
+        .map_err(|e| AppCommandError::task_execution_failed(e.to_string()))?;
+    Ok(Json(()))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcpPiAcknowledgeProjectTrustParams {
+    pub workspace: String,
+}
+
+pub async fn acp_pi_acknowledge_project_trust(
+    Json(params): Json<AcpPiAcknowledgeProjectTrustParams>,
+) -> Result<Json<()>, AppCommandError> {
+    acp_commands::acp_pi_acknowledge_project_trust_core(params.workspace)
+        .await
+        .map_err(|e| AppCommandError::task_execution_failed(e.to_string()))?;
+    Ok(Json(()))
+}
+
+pub async fn acp_pi_list_trust_entries(
+    Extension(state): Extension<Arc<AppState>>,
+) -> Result<Json<Vec<acp_commands::PiTrustEntry>>, AppCommandError> {
+    let result = acp_commands::acp_pi_list_trust_entries_core(&state.db)
+        .await
+        .map_err(|e| AppCommandError::task_execution_failed(e.to_string()))?;
+    Ok(Json(result))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AcpDownloadAgentBinaryParams {
     pub agent_type: AgentType,
     #[serde(default)]

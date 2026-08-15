@@ -4991,9 +4991,7 @@ fn pi_models_json_path() -> PathBuf {
 
 /// Like [`pi_agent_dir`], but resolves `PI_CODING_AGENT_DIR` from a per-agent
 /// `runtime_env` map first (the BYO-pi override path) before falling back to the
-/// process env / `~/.pi/agent`. Launch-time trust seeding only has the per-agent
-/// env (the override never lands in codeg's own process env), so it must consult
-/// `runtime_env` to target the same agent dir pi-acp will spawn pi against.
+/// process env / `~/.pi/agent`.
 fn pi_agent_dir_for_env(runtime_env: &BTreeMap<String, String>) -> PathBuf {
     match runtime_env
         .get("PI_CODING_AGENT_DIR")
@@ -5005,72 +5003,370 @@ fn pi_agent_dir_for_env(runtime_env: &BTreeMap<String, String>) -> PathBuf {
     }
 }
 
-/// Per-agent `env_json` key gating launch-time workspace-trust seeding for pi.
-/// Absent or any value other than `"0"` ⇒ enabled (default on); `"0"` disables.
-pub(crate) const PI_TRUST_WORKSPACE_ENV: &str = "PI_ACP_TRUST_WORKSPACE";
+// `PI_ACP_TRUST_WORKSPACE` remains reserved in the frontend for migration, but
+// no backend launch path reads it. Project trust is an explicit user decision.
 
-/// Seed pi's `trust.json` so the workspace codeg is launching pi into is trusted.
-///
-/// pi stores trust as a flat `{ "<canonical-dir>": true|false|null }` map and the
-/// nearest-ancestor entry decides whether it loads a project's local `.pi/*`
-/// config and `.agents/skills`. This gates ONLY config/skill loading, never tool
-/// execution — codeg has already authorized full execution in `cwd` by connecting
-/// an agent there, so trusting the same folder for config loading is consistent
-/// and removes a redundant, mid-connection trust prompt.
-///
-/// Guarantees: scoped (only `cwd`, never machine-wide), additive-only (never
-/// writes `false` or removes entries), idempotent (any existing entry for `cwd` —
-/// including a user's explicit `false`/`null` set in pi — is left untouched), and
-/// crash-safe for pi's file (a present-but-unparseable `trust.json` is never
-/// clobbered). Best-effort: every failure is logged at debug and swallowed so
-/// trust seeding can never block a connect. Honors `PI_CODING_AGENT_DIR` via
-/// `runtime_env`.
-pub(crate) fn seed_pi_workspace_trust(cwd: &Path, runtime_env: &BTreeMap<String, String>) {
-    // Default on: only an explicit "0" disables.
-    if runtime_env
-        .get(PI_TRUST_WORKSPACE_ENV)
-        .is_some_and(|v| v.trim() == "0")
-    {
-        return;
-    }
-    // pi keys trust by the realpath of the directory; mirror `realpathSync` with
-    // `fs::canonicalize`. A non-canonicalizable cwd can't be matched anyway.
-    let canonical = match fs::canonicalize(cwd) {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::debug!("[pi] trust seed skipped: canonicalize {cwd:?} failed: {e}");
-            return;
+const PI_TRUST_REQUIRING_CONFIG_RESOURCES: [&str; 7] = [
+    "settings.json",
+    "extensions",
+    "skills",
+    "prompts",
+    "themes",
+    "SYSTEM.md",
+    "APPEND_SYSTEM.md",
+];
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PiProjectResource {
+    pub path: String,
+    pub kind: String,
+    pub executes_code: bool,
+}
+
+fn pi_canonical_path(path: &Path) -> PathBuf {
+    crate::paths::simplify_verbatim_path(&fs::canonicalize(path).unwrap_or_else(|_| path.into()))
+}
+
+pub(crate) fn pi_project_trust_resources(cwd: &Path) -> Vec<PiProjectResource> {
+    pi_project_trust_resources_with_home(cwd, &home_dir_or_default())
+}
+
+fn pi_project_trust_resources_with_home(cwd: &Path, home: &Path) -> Vec<PiProjectResource> {
+    let mut found = Vec::new();
+    let start = pi_canonical_path(cwd);
+
+    let config_dir = start.join(".pi");
+    for entry in PI_TRUST_REQUIRING_CONFIG_RESOURCES {
+        let path = config_dir.join(entry);
+        if path.exists() {
+            found.push(PiProjectResource {
+                path: path.to_string_lossy().to_string(),
+                kind: format!(".pi/{entry}"),
+                executes_code: matches!(entry, "extensions" | "settings.json"),
+            });
         }
-    };
-    let key = canonical.to_string_lossy().to_string();
-    let path = pi_agent_dir_for_env(runtime_env).join("trust.json");
+    }
 
-    // Read pi's file strictly: a missing file is fine (we create one), but a file
-    // that exists yet doesn't parse to a JSON object must NOT be overwritten —
-    // that would destroy decisions codeg can't see.
-    let mut obj = match fs::read_to_string(&path) {
+    let user_agents_skills = pi_canonical_path(home).join(".agents").join("skills");
+    let mut current = start.as_path();
+    loop {
+        let candidate = current.join(".agents").join("skills");
+        if candidate != user_agents_skills && candidate.exists() {
+            found.push(PiProjectResource {
+                path: candidate.to_string_lossy().to_string(),
+                kind: ".agents/skills".to_string(),
+                executes_code: false,
+            });
+        }
+        match current.parent() {
+            Some(parent) if parent != current => current = parent,
+            _ => break,
+        }
+    }
+    found
+}
+
+fn pi_nearest_trust_decision(trust_file: &Path, cwd: &Path) -> Option<(String, bool)> {
+    let map = read_json_object_or_empty(trust_file);
+    pi_nearest_trust_decision_in_map(&map, cwd)
+}
+
+fn pi_nearest_trust_decision_in_map(
+    map: &serde_json::Map<String, serde_json::Value>,
+    cwd: &Path,
+) -> Option<(String, bool)> {
+    if map.is_empty() {
+        return None;
+    }
+    let mut current = pi_canonical_path(cwd);
+    loop {
+        let key = current.to_string_lossy().to_string();
+        if let Some(serde_json::Value::Bool(decision)) = map.get(&key) {
+            return Some((key, *decision));
+        }
+        match current.parent() {
+            Some(parent) if parent != current => current = parent.to_path_buf(),
+            _ => return None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PiProjectTrustState {
+    pub workspace: String,
+    pub resources: Vec<PiProjectResource>,
+    pub decision: Option<bool>,
+    pub decided_at: Option<String>,
+    pub trust_file: String,
+    pub acknowledged: bool,
+}
+
+fn pi_trust_ack_path() -> PathBuf {
+    crate::paths::codeg_home_dir().join("pi-project-trust-ack.json")
+}
+
+fn pi_trust_is_acknowledged_at(ack_file: &Path, workspace: &str) -> bool {
+    matches!(
+        read_json_object_or_empty(ack_file).get(workspace),
+        Some(serde_json::Value::Bool(true))
+    )
+}
+
+fn pi_set_trust_acknowledged_at(
+    ack_file: &Path,
+    cwd: &Path,
+    acknowledged: bool,
+) -> Result<(), AcpError> {
+    let key = pi_canonical_path(cwd).to_string_lossy().to_string();
+    let mut obj = read_json_object_or_empty(ack_file);
+    if acknowledged {
+        obj.insert(key, serde_json::Value::Bool(true));
+    } else if obj.remove(&key).is_none() {
+        return Ok(());
+    }
+    write_json_object_pretty(ack_file, &obj)
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PiTrustEntry {
+    pub path: String,
+    pub trusted: bool,
+}
+
+async fn pi_agent_dir_from_db(db: &AppDatabase) -> PathBuf {
+    let setting = agent_setting_service::get_by_agent_type(&db.conn, AgentType::Pi)
+        .await
+        .ok()
+        .flatten();
+    let local_config_json = load_agent_local_config_json(AgentType::Pi);
+    let runtime_env = build_runtime_env_from_setting(
+        AgentType::Pi,
+        setting.as_ref(),
+        local_config_json.as_deref(),
+    );
+    pi_agent_dir_for_env(&runtime_env)
+}
+
+fn pi_project_trust_state_at(
+    trust_file: &Path,
+    ack_file: &Path,
+    cwd: &Path,
+) -> PiProjectTrustState {
+    let decided = pi_nearest_trust_decision(trust_file, cwd);
+    let workspace = pi_canonical_path(cwd).to_string_lossy().to_string();
+    PiProjectTrustState {
+        acknowledged: pi_trust_is_acknowledged_at(ack_file, &workspace),
+        resources: pi_project_trust_resources(cwd),
+        decision: decided.as_ref().map(|(_, verdict)| *verdict),
+        decided_at: decided.map(|(path, _)| path),
+        trust_file: trust_file.to_string_lossy().to_string(),
+        workspace,
+    }
+}
+
+pub(crate) fn pi_project_trust_launch_block(
+    cwd: &Path,
+    runtime_env: &BTreeMap<String, String>,
+) -> Option<String> {
+    let trust_file = pi_agent_dir_for_env(runtime_env).join("trust.json");
+    let resources = pi_project_trust_resources(cwd);
+    if resources.is_empty() {
+        return None;
+    }
+    let trust_map = match fs::read_to_string(&trust_file) {
         Ok(text) => match serde_json::from_str::<serde_json::Value>(&text) {
             Ok(serde_json::Value::Object(map)) => map,
             _ => {
-                tracing::debug!("[pi] trust seed skipped: {path:?} is not a JSON object");
-                return;
+                return Some(format!(
+                    "codeg cannot verify pi project trust because {} is not a JSON object; fix or remove it before launching pi in a workspace with executable project resources",
+                    trust_file.display()
+                ));
+            }
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => {
+            return Some(format!(
+                "codeg cannot verify pi project trust because {} cannot be read: {error}",
+                trust_file.display()
+            ));
+        }
+    };
+    let decided = pi_nearest_trust_decision_in_map(&trust_map, cwd);
+    let workspace = pi_canonical_path(cwd).to_string_lossy().to_string();
+    let acknowledged = pi_trust_is_acknowledged_at(&pi_trust_ack_path(), &workspace);
+    if decided.as_ref().map(|(_, verdict)| *verdict) != Some(true) || acknowledged {
+        return None;
+    }
+    let decided_at = decided.as_ref().map(|(path, _)| path.as_str());
+    let inherited = decided_at.is_some_and(|at| at != workspace.as_str());
+    let via = if inherited {
+        format!(
+            " The grant comes from a parent folder ({}), so it covers this repository too.",
+            decided_at.unwrap_or_default()
+        )
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "pi is allowed to load this project's own files from {}, which lets the repository run its .pi/extensions at startup.{via} \
+         An earlier version of codeg granted this automatically when a folder was opened, so you may never have been asked. \
+         Review it in the project-trust notice above, or under Settings -> Agents -> Pi, then connect again.",
+        workspace
+    ))
+}
+
+pub(crate) async fn acp_pi_project_trust_state_core(
+    db: &AppDatabase,
+    workspace: String,
+) -> Result<PiProjectTrustState, AcpError> {
+    let trust_file = pi_agent_dir_from_db(db).await.join("trust.json");
+    Ok(pi_project_trust_state_at(
+        &trust_file,
+        &pi_trust_ack_path(),
+        Path::new(&workspace),
+    ))
+}
+
+pub(crate) async fn acp_pi_acknowledge_project_trust_core(
+    workspace: String,
+) -> Result<(), AcpError> {
+    tokio::task::spawn_blocking(move || {
+        pi_set_trust_acknowledged_at(&pi_trust_ack_path(), Path::new(&workspace), true)
+    })
+    .await
+    .map_err(|e| AcpError::protocol(format!("trust acknowledgement task failed: {e}")))?
+}
+
+pub(crate) async fn acp_pi_set_project_trust_core(
+    db: &AppDatabase,
+    workspace: String,
+    trusted: Option<bool>,
+) -> Result<(), AcpError> {
+    let path = pi_agent_dir_from_db(db).await.join("trust.json");
+    tokio::task::spawn_blocking(move || {
+        let cwd = Path::new(&workspace);
+        pi_write_trust_decision_at(&path, cwd, trusted)?;
+        pi_set_trust_acknowledged_at(&pi_trust_ack_path(), cwd, trusted == Some(true))
+    })
+    .await
+    .map_err(|e| AcpError::protocol(format!("trust write task failed: {e}")))?
+}
+
+static PI_TRUST_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+const PI_TRUST_LOCK_STALE: Duration = Duration::from_secs(10);
+
+struct PiTrustLock {
+    path: PathBuf,
+}
+
+impl Drop for PiTrustLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir(&self.path);
+    }
+}
+
+fn pi_trust_lock_is_stale(path: &Path) -> bool {
+    fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .map(|modified| modified.elapsed().unwrap_or_default() > PI_TRUST_LOCK_STALE)
+        .unwrap_or(true)
+}
+
+fn acquire_pi_trust_lock(trust_file: &Path) -> Result<PiTrustLock, AcpError> {
+    let mut name = trust_file.as_os_str().to_os_string();
+    name.push(".lock");
+    let path = PathBuf::from(name);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| AcpError::protocol(format!("create pi agent directory failed: {e}")))?;
+    }
+    for attempt in 1..=10 {
+        match fs::create_dir(&path) {
+            Ok(()) => return Ok(PiTrustLock { path }),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                if pi_trust_lock_is_stale(&path) {
+                    let _ = fs::remove_dir(&path);
+                    continue;
+                }
+                if attempt < 10 {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+            Err(e) => {
+                return Err(AcpError::protocol(format!(
+                    "lock {} failed: {e}",
+                    path.display()
+                )));
+            }
+        }
+    }
+    Err(AcpError::protocol(format!(
+        "pi's trust store at {} is locked by another process; try again in a moment",
+        trust_file.display()
+    )))
+}
+
+fn pi_write_trust_decision_at(
+    path: &Path,
+    cwd: &Path,
+    trusted: Option<bool>,
+) -> Result<(), AcpError> {
+    let key = pi_canonical_path(cwd).to_string_lossy().to_string();
+    let _serialized = PI_TRUST_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _lock = acquire_pi_trust_lock(path)?;
+    let mut obj = match fs::read_to_string(path) {
+        Ok(text) => match serde_json::from_str::<serde_json::Value>(&text) {
+            Ok(serde_json::Value::Object(map)) => map,
+            _ => {
+                return Err(AcpError::protocol(format!(
+                    "pi's trust file at {} is not a JSON object; fix or remove it before changing project trust",
+                    path.display()
+                )));
             }
         },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::Map::new(),
         Err(e) => {
-            tracing::debug!("[pi] trust seed skipped: read {path:?} failed: {e}");
-            return;
+            return Err(AcpError::protocol(format!(
+                "read {} failed: {e}",
+                path.display()
+            )));
         }
     };
+    match trusted {
+        Some(verdict) => {
+            obj.insert(key, serde_json::Value::Bool(verdict));
+        }
+        None => {
+            if obj.remove(&key).is_none() {
+                return Ok(());
+            }
+        }
+    }
+    write_json_object_pretty(path, &obj)
+}
 
-    // Idempotent + respect any decision the user already made for this folder.
-    if obj.contains_key(&key) {
-        return;
-    }
-    obj.insert(key, serde_json::Value::Bool(true));
-    if let Err(e) = write_json_object_pretty(&path, &obj) {
-        tracing::debug!("[pi] trust seed write failed for {path:?}: {e}");
-    }
+pub(crate) async fn acp_pi_list_trust_entries_core(
+    db: &AppDatabase,
+) -> Result<Vec<PiTrustEntry>, AcpError> {
+    let path = pi_agent_dir_from_db(db).await.join("trust.json");
+    Ok(pi_trust_entries_at(&path))
+}
+
+fn pi_trust_entries_at(path: &Path) -> Vec<PiTrustEntry> {
+    let mut entries = read_json_object_or_empty(path)
+        .into_iter()
+        .filter_map(|(path, value)| match value {
+            serde_json::Value::Bool(trusted) => Some(PiTrustEntry { path, trusted }),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    entries
 }
 
 /// Structured Pi config update from the settings UI. Writes pi's native files:
@@ -10294,6 +10590,39 @@ pub async fn acp_validate_pi_command(command: String) -> Result<PiCommandValidat
     Ok(acp_validate_pi_command_core(command))
 }
 
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn acp_pi_project_trust_state(
+    db: tauri::State<'_, AppDatabase>,
+    workspace: String,
+) -> Result<PiProjectTrustState, AcpError> {
+    acp_pi_project_trust_state_core(&db, workspace).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn acp_pi_set_project_trust(
+    db: tauri::State<'_, AppDatabase>,
+    workspace: String,
+    trusted: Option<bool>,
+) -> Result<(), AcpError> {
+    acp_pi_set_project_trust_core(&db, workspace, trusted).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn acp_pi_acknowledge_project_trust(workspace: String) -> Result<(), AcpError> {
+    acp_pi_acknowledge_project_trust_core(workspace).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn acp_pi_list_trust_entries(
+    db: tauri::State<'_, AppDatabase>,
+) -> Result<Vec<PiTrustEntry>, AcpError> {
+    acp_pi_list_trust_entries_core(&db).await
+}
+
 /// Launch Hermes's interactive setup in the OS terminal. `kind` selects the
 /// flow (`"setup"` → `hermes-acp --setup`, `"model"` → `hermes model`); the
 /// exact command is constructed by the backend from the registry recipe (the
@@ -12415,8 +12744,15 @@ mod tests {
         assert!(grok_config_permission_mode("[ui]\npermission_mode = \"bogus\"\n").is_none());
     }
 
+    fn touch(path: &Path) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, "x").unwrap();
+    }
+
     /// Build a `runtime_env` whose `PI_CODING_AGENT_DIR` points at `agent_dir`,
-    /// so trust seeding writes a tempdir's `trust.json` instead of `~/.pi/agent`.
+    /// so the launch guard reads a tempdir's trust store.
     fn pi_env_for(agent_dir: &Path) -> BTreeMap<String, String> {
         let mut env = BTreeMap::new();
         env.insert(
@@ -12427,128 +12763,161 @@ mod tests {
     }
 
     fn canonical_key(dir: &Path) -> String {
-        fs::canonicalize(dir)
-            .expect("canonicalize")
-            .to_string_lossy()
-            .to_string()
+        pi_canonical_path(dir).to_string_lossy().to_string()
     }
 
     #[test]
-    fn pi_trust_seed_creates_file_and_trusts_canonical_cwd() {
+    fn pi_project_trust_resources_detect_executable_project_entries() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let agent_dir = tmp.path().join("agent");
-        let workspace = tmp.path().join("workspace");
-        fs::create_dir_all(&workspace).unwrap();
+        let workspace = tmp.path().join("repo");
+        fs::create_dir_all(workspace.join(".pi/extensions")).unwrap();
+        touch(&workspace.join(".pi/settings.json"));
+        fs::create_dir_all(workspace.join(".pi/prompts")).unwrap();
 
-        seed_pi_workspace_trust(&workspace, &pi_env_for(&agent_dir));
-
-        let map = read_json_object_or_empty(&agent_dir.join("trust.json"));
+        let resources = pi_project_trust_resources(&workspace)
+            .into_iter()
+            .map(|resource| (resource.kind, resource.executes_code))
+            .collect::<BTreeMap<_, _>>();
         assert_eq!(
-            map.get(&canonical_key(&workspace)),
-            Some(&serde_json::Value::Bool(true)),
-            "the opened workspace must be marked trusted",
+            resources.get(".pi/extensions"),
+            Some(&true),
+            "extensions execute during Pi startup",
+        );
+        assert_eq!(resources.get(".pi/settings.json"), Some(&true));
+        assert_eq!(resources.get(".pi/prompts"), Some(&false));
+    }
+
+    #[test]
+    fn pi_project_trust_inherits_the_nearest_ancestor_decision() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let parent = tmp.path().join("projects");
+        let workspace = parent.join("repo");
+        fs::create_dir_all(&workspace).unwrap();
+        let trust = tmp.path().join("trust.json");
+        write_json_object_pretty(
+            &trust,
+            &serde_json::Map::from_iter([(canonical_key(&parent), serde_json::Value::Bool(true))]),
+        )
+        .unwrap();
+
+        assert_eq!(
+            pi_nearest_trust_decision(&trust, &workspace),
+            Some((canonical_key(&parent), true)),
         );
     }
 
     #[test]
-    fn pi_trust_seed_preserves_existing_entries() {
+    fn pi_project_trust_write_records_and_revokes_only_the_exact_entry() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let agent_dir = tmp.path().join("agent");
-        fs::create_dir_all(&agent_dir).unwrap();
-        let workspace = tmp.path().join("ws");
+        let workspace = tmp.path().join("repo");
         fs::create_dir_all(&workspace).unwrap();
+        let trust = tmp.path().join("agent/trust.json");
 
-        // Pre-existing decisions for unrelated folders must survive untouched.
-        let mut initial = serde_json::Map::new();
-        initial.insert("/some/other".to_string(), serde_json::Value::Bool(true));
-        initial.insert("/denied".to_string(), serde_json::Value::Bool(false));
-        write_json_object_pretty(&agent_dir.join("trust.json"), &initial).unwrap();
-
-        seed_pi_workspace_trust(&workspace, &pi_env_for(&agent_dir));
-
-        let map = read_json_object_or_empty(&agent_dir.join("trust.json"));
-        assert_eq!(map.get("/some/other"), Some(&serde_json::Value::Bool(true)));
-        assert_eq!(map.get("/denied"), Some(&serde_json::Value::Bool(false)));
+        pi_write_trust_decision_at(&trust, &workspace, Some(false)).unwrap();
         assert_eq!(
-            map.get(&canonical_key(&workspace)),
-            Some(&serde_json::Value::Bool(true)),
-        );
-    }
-
-    #[test]
-    fn pi_trust_seed_respects_existing_false_and_is_idempotent() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let agent_dir = tmp.path().join("agent");
-        fs::create_dir_all(&agent_dir).unwrap();
-        let workspace = tmp.path().join("ws");
-        fs::create_dir_all(&workspace).unwrap();
-        let key = canonical_key(&workspace);
-        let env = pi_env_for(&agent_dir);
-
-        // The user explicitly distrusted this exact folder in pi: never overwrite.
-        let mut initial = serde_json::Map::new();
-        initial.insert(key.clone(), serde_json::Value::Bool(false));
-        write_json_object_pretty(&agent_dir.join("trust.json"), &initial).unwrap();
-
-        seed_pi_workspace_trust(&workspace, &env);
-        let map = read_json_object_or_empty(&agent_dir.join("trust.json"));
-        assert_eq!(
-            map.get(&key),
+            read_json_object_or_empty(&trust).get(&canonical_key(&workspace)),
             Some(&serde_json::Value::Bool(false)),
-            "an explicit deny must be preserved (additive-only)",
         );
-
-        // Idempotent: seeding an already-trusted folder must not rewrite the file.
-        let mut trusted = serde_json::Map::new();
-        trusted.insert(key.clone(), serde_json::Value::Bool(true));
-        write_json_object_pretty(&agent_dir.join("trust.json"), &trusted).unwrap();
-        let mtime1 = fs::metadata(agent_dir.join("trust.json"))
-            .unwrap()
-            .modified()
-            .unwrap();
-        seed_pi_workspace_trust(&workspace, &env);
+        pi_write_trust_decision_at(&trust, &workspace, None).unwrap();
         assert_eq!(
-            fs::metadata(agent_dir.join("trust.json"))
-                .unwrap()
-                .modified()
-                .unwrap(),
-            mtime1,
-            "a no-op seed must not rewrite trust.json",
+            read_json_object_or_empty(&trust).get(&canonical_key(&workspace)),
+            None,
         );
     }
 
     #[test]
-    fn pi_trust_seed_disabled_writes_nothing() {
+    fn pi_project_trust_write_never_clobbers_malformed_json() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let workspace = tmp.path().join("repo");
+        fs::create_dir_all(&workspace).unwrap();
+        let trust = tmp.path().join("trust.json");
+        fs::write(&trust, "not json").unwrap();
+
+        let error = pi_write_trust_decision_at(&trust, &workspace, Some(true)).unwrap_err();
+
+        assert!(error.to_string().contains("not a JSON object"));
+        assert_eq!(fs::read_to_string(&trust).unwrap(), "not json");
+    }
+
+    #[test]
+    fn pi_project_trust_write_honors_pis_live_lock() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let workspace = tmp.path().join("repo");
+        fs::create_dir_all(&workspace).unwrap();
+        let agent_dir = tmp.path().join("agent");
+        fs::create_dir_all(&agent_dir).unwrap();
+        let trust = agent_dir.join("trust.json");
+        fs::write(&trust, "{}\n").unwrap();
+        fs::create_dir(agent_dir.join("trust.json.lock")).unwrap();
+
+        let error = pi_write_trust_decision_at(&trust, &workspace, Some(true)).unwrap_err();
+
+        assert!(error.to_string().contains("locked by another process"));
+        assert_eq!(fs::read_to_string(&trust).unwrap(), "{}\n");
+    }
+
+    #[test]
+    fn pi_project_trust_launch_blocks_only_unacknowledged_executable_grants() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let agent_dir = tmp.path().join("agent");
-        let workspace = tmp.path().join("ws");
-        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&agent_dir).unwrap();
+        let workspace = tmp.path().join("repo");
+        fs::create_dir_all(workspace.join(".pi/extensions")).unwrap();
+        write_json_object_pretty(
+            &agent_dir.join("trust.json"),
+            &serde_json::Map::from_iter([(
+                canonical_key(&workspace),
+                serde_json::Value::Bool(true),
+            )]),
+        )
+        .unwrap();
+        let codeg_home = tmp.path().join("codeg-home");
 
-        let mut env = pi_env_for(&agent_dir);
-        env.insert(PI_TRUST_WORKSPACE_ENV.to_string(), "0".to_string());
-        seed_pi_workspace_trust(&workspace, &env);
+        let blocked = temp_env::with_var(
+            "CODEG_HOME",
+            Some(codeg_home.to_string_lossy().to_string()),
+            || pi_project_trust_launch_block(&workspace, &pi_env_for(&agent_dir)),
+        );
+        assert!(blocked
+            .as_deref()
+            .is_some_and(|message| message.contains(".pi/extensions")));
+
+        pi_set_trust_acknowledged_at(
+            &codeg_home.join("pi-project-trust-ack.json"),
+            &workspace,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            temp_env::with_var(
+                "CODEG_HOME",
+                Some(codeg_home.to_string_lossy().to_string()),
+                || pi_project_trust_launch_block(&workspace, &pi_env_for(&agent_dir)),
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn pi_project_trust_launch_fails_closed_for_a_malformed_store() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let agent_dir = tmp.path().join("agent");
+        fs::create_dir_all(&agent_dir).unwrap();
+        fs::write(agent_dir.join("trust.json"), "not json").unwrap();
+        let workspace = tmp.path().join("repo");
+        fs::create_dir_all(workspace.join(".pi/extensions")).unwrap();
+
+        let blocked = temp_env::with_var(
+            "CODEG_HOME",
+            Some(tmp.path().join("codeg-home").to_string_lossy().to_string()),
+            || pi_project_trust_launch_block(&workspace, &pi_env_for(&agent_dir)),
+        );
 
         assert!(
-            !agent_dir.join("trust.json").exists(),
-            "a disabled toggle must not touch trust.json",
-        );
-    }
-
-    #[test]
-    fn pi_trust_seed_leaves_unparseable_file_untouched() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let agent_dir = tmp.path().join("agent");
-        fs::create_dir_all(&agent_dir).unwrap();
-        let workspace = tmp.path().join("ws");
-        fs::create_dir_all(&workspace).unwrap();
-        fs::write(agent_dir.join("trust.json"), "not json at all").unwrap();
-
-        seed_pi_workspace_trust(&workspace, &pi_env_for(&agent_dir));
-
-        assert_eq!(
-            fs::read_to_string(agent_dir.join("trust.json")).unwrap(),
-            "not json at all",
-            "a present-but-unparseable trust.json must never be clobbered",
+            blocked
+                .as_deref()
+                .is_some_and(|message| message.contains("cannot verify")),
+            "malformed trust must block executable project resources"
         );
     }
 
