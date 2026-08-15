@@ -1714,6 +1714,10 @@ pub fn build_router(
         .layer(cors)
         .layer(Extension(state))
         .layer(Extension(shutdown_signal))
+        // Applied last so compression wraps API, static fallback, and every
+        // other response-producing layer. The predicate excludes downloads
+        // and event streams; see `web::compression`.
+        .layer(crate::web::compression::compression_layer())
 }
 
 async fn health_check() -> impl IntoResponse {

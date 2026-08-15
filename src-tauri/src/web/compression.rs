@@ -66,6 +66,14 @@ pub fn compression_layer() -> CompressionLayer<impl Predicate> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use axum_test::TestServer;
+
+    use crate::app_state::AppState;
+    use crate::db::test_helpers::fresh_in_memory_db;
+    use crate::web::router::build_router;
+    use crate::web::shutdown::ShutdownSignal;
 
     fn response_with_content_type(ct: &str) -> http::Response<axum::body::Body> {
         http::Response::builder()
@@ -105,5 +113,60 @@ mod tests {
             assert!(!p.should_compress(&response_with_content_type(ct)), "{ct}");
         }
         assert!(!p.should_compress(&http::Response::new(axum::body::Body::empty())));
+    }
+
+    #[tokio::test]
+    async fn real_router_compresses_json_but_preserves_binary_download_length() {
+        let data_dir = tempfile::tempdir().expect("data dir");
+        let static_dir = tempfile::tempdir().expect("static dir");
+        let binary = vec![0x5a; 4 * 1024];
+        std::fs::write(static_dir.path().join("download.bin"), &binary).expect("binary fixture");
+
+        let state = Arc::new(AppState::new_for_test(
+            fresh_in_memory_db().await,
+            data_dir.path().to_path_buf(),
+        ));
+        let app = build_router(
+            state,
+            "secret".to_string(),
+            static_dir.path().to_path_buf(),
+            Arc::new(ShutdownSignal::new()),
+        );
+        let server = TestServer::new(app).expect("test server");
+
+        let json = server
+            .post("/api/health")
+            .add_header("authorization", "Bearer secret")
+            .add_header("accept-encoding", "gzip")
+            .json(&serde_json::json!({}))
+            .await;
+        assert_eq!(json.status_code(), 200);
+        assert_eq!(
+            json.headers()
+                .get(http::header::CONTENT_ENCODING)
+                .and_then(|value| value.to_str().ok()),
+            Some("gzip"),
+            "the completed production router must compress eligible API JSON"
+        );
+
+        let download = server
+            .get("/download.bin")
+            .add_header("accept-encoding", "gzip")
+            .await;
+        assert_eq!(download.status_code(), 200);
+        assert!(
+            download
+                .headers()
+                .get(http::header::CONTENT_ENCODING)
+                .is_none(),
+            "binary downloads must stay uncompressed"
+        );
+        assert_eq!(
+            download
+                .headers()
+                .get(http::header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok()),
+            Some("4096")
+        );
     }
 }

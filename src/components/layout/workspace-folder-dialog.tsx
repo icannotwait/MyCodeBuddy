@@ -69,7 +69,7 @@ import type {
   FolderLinkPlan,
   FolderLinkStatus,
 } from "@/lib/types"
-import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
+import { openFolderWithDraft } from "@/lib/open-folder-with-draft"
 
 type View = "pick-root" | "links" | "add-targets"
 
@@ -103,7 +103,6 @@ export function WorkspaceFolderDialog({
 }: WorkspaceFolderDialogProps) {
   const t = useTranslations("Folder.workspaceDialog")
   const tBrowser = useTranslations("DirectoryBrowser")
-  const openFolder = useAppWorkspaceStore((s) => s.openFolder)
 
   const manageMode = !!folder
   const [view, setView] = useState<View>(manageMode ? "links" : "pick-root")
@@ -180,7 +179,7 @@ export function WorkspaceFolderDialog({
     async (path: string) => {
       setOpeningRoot(true)
       try {
-        const detail = await openFolder(path)
+        const detail = await openFolderWithDraft(path)
         setRootFolder(detail)
         onFolderOpened?.(detail)
         setView("links")
@@ -190,7 +189,7 @@ export function WorkspaceFolderDialog({
         setOpeningRoot(false)
       }
     },
-    [openFolder, onFolderOpened, t]
+    [onFolderOpened, t]
   )
 
   const handleConfirmRoot = useCallback(async () => {

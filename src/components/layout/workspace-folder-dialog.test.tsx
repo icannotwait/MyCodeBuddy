@@ -38,11 +38,8 @@ vi.mock("@/lib/transport", () => ({
   getActiveRemoteConnectionId: () => null,
 }))
 
-const openFolder = vi.hoisted(() => vi.fn())
-vi.mock("@/stores/app-workspace-store", () => ({
-  useAppWorkspaceStore: (selector: (state: unknown) => unknown) =>
-    selector({ openFolder }),
-}))
+const openFolderWithDraft = vi.hoisted(() => vi.fn())
+vi.mock("@/lib/open-folder-with-draft", () => ({ openFolderWithDraft }))
 
 const toast = vi.hoisted(() => ({
   error: vi.fn(),
@@ -113,11 +110,11 @@ beforeEach(() => {
   api.listFolderLinks.mockResolvedValue([])
   api.previewFolderLinks.mockResolvedValue([])
   api.createFolderLinks.mockResolvedValue([])
-  openFolder.mockResolvedValue(folder())
+  openFolderWithDraft.mockResolvedValue(folder())
 })
 
 describe("WorkspaceFolderDialog — creation flow", () => {
-  it("opens the picked folder and advances to the linking step", async () => {
+  it("opens one draft for the picked folder and advances to linking", async () => {
     api.listDirectoryEntries.mockResolvedValue([
       dir("root", "/home/me/root"),
       dir("other", "/home/me/other"),
@@ -130,7 +127,8 @@ describe("WorkspaceFolderDialog — creation flow", () => {
       fireEvent.click(screen.getByRole("button", { name: "Next" }))
     })
 
-    expect(openFolder).toHaveBeenCalledWith("/home/me/root")
+    expect(openFolderWithDraft).toHaveBeenCalledOnce()
+    expect(openFolderWithDraft).toHaveBeenCalledWith("/home/me/root")
     // Step 2 is up: the root is echoed back and links can be added.
     expect(await screen.findByText("/home/me/root")).toBeInTheDocument()
     expect(
@@ -140,7 +138,7 @@ describe("WorkspaceFolderDialog — creation flow", () => {
 
   it("stays on step 1 and reports when the folder cannot be opened", async () => {
     api.listDirectoryEntries.mockResolvedValue([dir("root", "/home/me/root")])
-    openFolder.mockRejectedValue(new Error("nope"))
+    openFolderWithDraft.mockRejectedValue(new Error("nope"))
     render(<Harness />)
     await screen.findByDisplayValue("/home/me")
 
@@ -163,6 +161,7 @@ describe("WorkspaceFolderDialog — manage mode", () => {
     expect(screen.queryByRole("button", { name: "Next" })).toBeNull()
     // The root cannot be re-picked while managing an existing folder.
     expect(screen.queryByRole("button", { name: "Change" })).toBeNull()
+    expect(openFolderWithDraft).not.toHaveBeenCalled()
   })
 
   it("shows the empty state when nothing is linked", async () => {
@@ -523,12 +522,13 @@ describe("WorkspaceFolderDialog — native picker", () => {
     })
     // The box moved, but nothing has landed in the sidebar yet.
     expect(screen.getByDisplayValue("/home/me/picked")).toBeInTheDocument()
-    expect(openFolder).not.toHaveBeenCalled()
+    expect(openFolderWithDraft).not.toHaveBeenCalled()
 
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "Next" }))
     })
-    expect(openFolder).toHaveBeenCalledWith("/home/me/picked")
+    expect(openFolderWithDraft).toHaveBeenCalledOnce()
+    expect(openFolderWithDraft).toHaveBeenCalledWith("/home/me/picked")
   })
 
   it("stages a multi-select pick instead of linking it outright", async () => {
