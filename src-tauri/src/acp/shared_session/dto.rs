@@ -103,6 +103,17 @@ pub struct SharedMutationGuard {
     pub lease_id: String,
 }
 
+impl SharedMutationGuard {
+    pub fn lease_socket_binding(&self, lease_expires_at: DateTime<Utc>) -> LeaseSocketBinding {
+        LeaseSocketBinding {
+            connection_id: self.connection_id.clone(),
+            generation: self.generation,
+            lease_id: self.lease_id.clone(),
+            lease_expires_at,
+        }
+    }
+}
+
 impl fmt::Debug for SharedMutationGuard {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -256,6 +267,8 @@ pub struct SharedSessionProjection {
     pub queue: Vec<SharedQueuedPromptSummary>,
     pub active_turn: Option<SharedActiveTurnProjection>,
     pub lease_expires_at: Option<DateTime<Utc>>,
+    #[serde(skip)]
+    pub expired_lease_tombstone_count: usize,
 }
 
 impl fmt::Debug for SharedSessionProjection {
@@ -268,8 +281,38 @@ impl fmt::Debug for SharedSessionProjection {
             .field("queue", &self.queue)
             .field("active_turn", &self.active_turn)
             .field("lease_expires_at", &self.lease_expires_at)
+            .field(
+                "expired_lease_tombstone_count",
+                &self.expired_lease_tombstone_count,
+            )
             .finish()
     }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct LeaseSocketBinding {
+    pub connection_id: String,
+    pub generation: u64,
+    pub lease_id: String,
+    pub lease_expires_at: DateTime<Utc>,
+}
+
+impl fmt::Debug for LeaseSocketBinding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LeaseSocketBinding")
+            .field("connection_id", &self.connection_id)
+            .field("generation", &self.generation)
+            .field("lease_id", &"***")
+            .field("lease_expires_at", &self.lease_expires_at)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LeaseRenewalOutcome {
+    Renewed(LeaseSocketBinding),
+    Detached(crate::web::ws_attach::DetachReason),
 }
 
 #[derive(Clone)]

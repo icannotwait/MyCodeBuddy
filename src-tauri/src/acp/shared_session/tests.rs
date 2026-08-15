@@ -353,6 +353,166 @@ mod tests {
         assert!(!retry.created);
     }
 
+    #[derive(Clone)]
+    struct TestLease {
+        attachment: SharedSessionAttachment,
+        connection_id: String,
+        generation: u64,
+        lease_id: String,
+    }
+
+    impl TestLease {
+        fn from_attachment(attachment: SharedSessionAttachment) -> Self {
+            Self {
+                connection_id: attachment.connection_id.clone(),
+                generation: attachment.generation,
+                lease_id: attachment.lease_id.clone(),
+                attachment,
+            }
+        }
+
+        fn guard(&self) -> SharedMutationGuard {
+            SharedMutationGuard {
+                connection_id: self.connection_id.clone(),
+                generation: self.generation,
+                lease_id: self.lease_id.clone(),
+            }
+        }
+    }
+
+    impl From<&TestLease> for LeaseSocketBinding {
+        fn from(lease: &TestLease) -> Self {
+            Self {
+                connection_id: lease.connection_id.clone(),
+                generation: lease.generation,
+                lease_id: lease.lease_id.clone(),
+                lease_expires_at: lease.attachment.lease_expires_at,
+            }
+        }
+    }
+
+    fn broker_with_ttl(ttl: Duration) -> SharedSessionBroker {
+        SharedSessionBroker {
+            lease_ttl: ttl,
+            ..SharedSessionBroker::default()
+        }
+    }
+
+    async fn reserve_client(
+        broker: &SharedSessionBroker,
+        conversation_id: i32,
+        client: &str,
+    ) -> TestLease {
+        let outcome = broker
+            .reserve_or_attach(request(
+                SharedSessionKey::Conversation(conversation_id),
+                &format!("connection-{client}"),
+                client,
+                &format!("request-{client}"),
+            ))
+            .await
+            .unwrap();
+        let state = Arc::new(tokio::sync::RwLock::new(SessionState::new(
+            outcome.attachment.connection_id.clone(),
+            crate::models::agent::AgentType::Codex,
+            None,
+            "shared-server".into(),
+            Some(conversation_id),
+        )));
+        broker
+            .install_registered(
+                &outcome.attachment.connection_id,
+                outcome.attachment.generation,
+                format!("driver-{client}"),
+                state,
+                EventEmitter::Noop,
+                Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            )
+            .await
+            .unwrap();
+        TestLease::from_attachment(outcome.attachment)
+    }
+
+    async fn attach_client(
+        broker: &SharedSessionBroker,
+        conversation_id: i32,
+        client: &str,
+    ) -> TestLease {
+        let outcome = broker
+            .reserve_or_attach(request(
+                SharedSessionKey::Conversation(conversation_id),
+                &format!("connection-{client}"),
+                client,
+                &format!("request-{client}"),
+            ))
+            .await
+            .unwrap();
+        TestLease::from_attachment(outcome.attachment)
+    }
+
+    async fn fill_and_expire_lease_tombstones(
+        broker: &SharedSessionBroker,
+        count: usize,
+    ) -> TestLease {
+        let mut newest = None;
+        for n in 0..count {
+            let lease = attach_client(broker, 1, &format!("fill-{n}")).await;
+            tokio::time::advance(Duration::from_secs(2)).await;
+            broker.expire_leases(tokio::time::Instant::now()).await;
+            newest = Some(lease);
+        }
+        newest.expect("at least one expired lease")
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_renews_only_bound_leases_and_expiry_never_disconnects() {
+        let broker = broker_with_ttl(Duration::from_secs(90));
+        let a = reserve_client(&broker, 1, "a").await;
+        let b = attach_client(&broker, 1, "b").await;
+        tokio::time::advance(Duration::from_secs(60)).await;
+        broker.renew_leases(&[LeaseSocketBinding::from(&a)]).await;
+        tokio::time::advance(Duration::from_secs(31)).await;
+        let expired = broker.expire_leases(tokio::time::Instant::now()).await;
+        assert_eq!(expired, vec![b.lease_id.clone()]);
+        assert!(broker.validate_guard(&a.guard()).await.is_ok());
+        assert!(matches!(
+            broker.validate_guard(&b.guard()).await,
+            Err(SharedSessionError::LeaseExpired)
+        ));
+        assert_eq!(
+            broker
+                .diagnostic_for_connection(&a.connection_id)
+                .await
+                .unwrap()
+                .phase,
+            SharedSessionPhase::Bootstrapping
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expired_lease_tombstones_are_bounded_and_secret_safe() {
+        let broker = broker_with_ttl(Duration::from_secs(1));
+        let oldest = reserve_client(&broker, 1, "oldest").await;
+        let newest =
+            fill_and_expire_lease_tombstones(&broker, MAX_EXPIRED_LEASE_TOMBSTONES + 1).await;
+        assert!(matches!(
+            broker.validate_guard(&oldest.guard()).await,
+            Err(SharedSessionError::LeaseMissing)
+        ));
+        assert!(matches!(
+            broker.validate_guard(&newest.guard()).await,
+            Err(SharedSessionError::LeaseExpired)
+        ));
+        let diagnostic = broker
+            .diagnostic_for_connection(&newest.connection_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            diagnostic.expired_lease_tombstone_count,
+            MAX_EXPIRED_LEASE_TOMBSTONES
+        );
+    }
+
     #[tokio::test]
     async fn registration_watch_publishes_exact_public_state_arc() {
         let broker = SharedSessionBroker::default();
@@ -424,6 +584,7 @@ mod tests {
             queue: Vec::new(),
             active_turn: None,
             lease_expires_at: Some(reservation.attachment.lease_expires_at),
+            expired_lease_tombstone_count: 0,
         });
         broker
             .install_registered(
@@ -756,6 +917,7 @@ mod tests {
             queue: vec![summary],
             active_turn: None,
             lease_expires_at: None,
+            expired_lease_tombstone_count: 0,
         };
         let guard = SharedMutationGuard {
             connection_id: "conn-a".into(),

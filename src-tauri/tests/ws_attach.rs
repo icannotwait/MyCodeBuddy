@@ -11,8 +11,13 @@ use std::time::Duration;
 
 use axum_test::TestServer;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use codeg_lib::acp::session_attach::SessionAttachMode;
+use codeg_lib::acp::shared_session::{
+    SharedLaunchIdentity, SharedReserveRequest, SharedSessionAttachment, SharedSessionKey,
+};
 use codeg_lib::acp::types::{AcpEvent, EventEnvelope};
 use codeg_lib::app_state::AppState;
+use codeg_lib::auto_title::ConnectionPurpose;
 use codeg_lib::db::test_helpers::fresh_in_memory_db;
 use codeg_lib::models::agent::AgentType;
 use codeg_lib::web::event_bridge::emit_with_state;
@@ -57,6 +62,66 @@ async fn build_ws_server() -> (
 fn ws_auth_protocol(token: &str) -> String {
     let encoded = URL_SAFE_NO_PAD.encode(token);
     format!("codeg-events, codeg-token.{encoded}")
+}
+
+fn shared_launch_identity() -> SharedLaunchIdentity {
+    SharedLaunchIdentity {
+        agent_type: AgentType::Codex,
+        working_dir_fingerprint: "ws-test-cwd".into(),
+        external_session_id: None,
+        attach_mode: SessionAttachMode::Default,
+        route_fingerprint: "ws-test-route".into(),
+        terminal_shell_fingerprint: "ws-test-shell".into(),
+        purpose: ConnectionPurpose::User,
+    }
+}
+
+fn shared_request(
+    conversation_id: i32,
+    connection_id: &str,
+    client_instance_id: &str,
+    request_id: &str,
+    retry_failed_generation: Option<u64>,
+) -> SharedReserveRequest {
+    SharedReserveRequest {
+        key: SharedSessionKey::Conversation(conversation_id),
+        connection_id: connection_id.into(),
+        launch_identity: shared_launch_identity(),
+        client_instance_id: client_instance_id.into(),
+        device_id: "ws-test-device".into(),
+        request_id: request_id.into(),
+        retry_failed_generation,
+        now: tokio::time::Instant::now(),
+        now_utc: chrono::Utc::now(),
+    }
+}
+
+async fn seed_shared_root(
+    state: &Arc<AppState>,
+    conversation_id: i32,
+    connection_id: &str,
+    client_instance_id: &str,
+    request_id: &str,
+) -> SharedSessionAttachment {
+    let attachment = state
+        .connection_manager
+        .shared_session_broker()
+        .reserve_or_attach(shared_request(
+            conversation_id,
+            connection_id,
+            client_instance_id,
+            request_id,
+            None,
+        ))
+        .await
+        .expect("shared root reservation")
+        .attachment;
+    state
+        .connection_manager
+        .install_test_shared_connection(&attachment, Some(conversation_id))
+        .await
+        .expect("shared public state registration");
+    attachment
 }
 
 /// Receive the next text frame, with a hard timeout so a missing frame fails
@@ -137,6 +202,234 @@ async fn ws_attach_unknown_connection_detaches() {
     assert_eq!(resp["type"], "detached");
     assert_eq!(resp["subscription_id"], "sub-1");
     assert_eq!(resp["reason"], "connection_gone");
+}
+
+#[tokio::test]
+async fn ws_attach_shared_rejects_fenced_unknown_connection() {
+    let (server, _state, _d, _s) = build_ws_server().await;
+    let mut ws = server
+        .get_websocket("/ws/events")
+        .add_header(SEC_WEBSOCKET_PROTOCOL, ws_auth_protocol(TEST_TOKEN))
+        .await
+        .into_websocket()
+        .await;
+
+    let _ready = next_json(&mut ws).await;
+    ws.send_json(&json!({
+        "action": "attach",
+        "subscription_id": "sub-shared-fenced",
+        "connection_id": "unknown-shared",
+        "generation": 7,
+        "lease_id": "lease-fenced",
+        "since_seq": null
+    }))
+    .await;
+
+    let response = next_json(&mut ws).await;
+    assert_eq!(response["type"], "detached");
+    assert_eq!(response["subscription_id"], "sub-shared-fenced");
+    assert_eq!(response["reason"], "generation_stale");
+}
+
+#[tokio::test]
+async fn ws_attach_shared_tabs_renew_independently_and_overlay_lease_expiry() {
+    let (server, state, _d, _s) = build_ws_server().await;
+    let first = seed_shared_root(&state, 41, "shared-root", "client-a", "request-a").await;
+    let second = state
+        .connection_manager
+        .shared_session_broker()
+        .reserve_or_attach(shared_request(
+            41,
+            "ignored-by-shared-root",
+            "client-b",
+            "request-b",
+            None,
+        ))
+        .await
+        .expect("second shared lease")
+        .attachment;
+
+    let mut ws_a = server
+        .get_websocket("/ws/events")
+        .add_header(SEC_WEBSOCKET_PROTOCOL, ws_auth_protocol(TEST_TOKEN))
+        .await
+        .into_websocket()
+        .await;
+    let _ready_a = next_json(&mut ws_a).await;
+    ws_a.send_json(&json!({
+        "action": "attach",
+        "subscription_id": "tab-a",
+        "connection_id": first.connection_id,
+        "generation": first.generation,
+        "lease_id": first.lease_id,
+        "since_seq": null
+    }))
+    .await;
+    let snapshot_a = next_json(&mut ws_a).await;
+    assert_eq!(
+        snapshot_a["snapshot"]["shared_session"]["lease_expires_at"],
+        serde_json::to_value(first.lease_expires_at).unwrap()
+    );
+
+    let state_arc = state
+        .connection_manager
+        .get_state(&first.connection_id)
+        .await
+        .expect("retained shared state");
+    assert_eq!(
+        state_arc
+            .read()
+            .await
+            .to_snapshot()
+            .shared_session
+            .as_ref()
+            .and_then(|shared| shared.lease_expires_at),
+        None
+    );
+
+    let mut ws_b = server
+        .get_websocket("/ws/events")
+        .add_header(SEC_WEBSOCKET_PROTOCOL, ws_auth_protocol(TEST_TOKEN))
+        .await
+        .into_websocket()
+        .await;
+    let _ready_b = next_json(&mut ws_b).await;
+    ws_b.send_json(&json!({
+        "action": "attach",
+        "subscription_id": "tab-b",
+        "connection_id": second.connection_id,
+        "generation": second.generation,
+        "lease_id": second.lease_id,
+        "since_seq": null
+    }))
+    .await;
+    let snapshot_b = next_json(&mut ws_b).await;
+    assert_eq!(
+        snapshot_b["snapshot"]["shared_session"]["lease_expires_at"],
+        serde_json::to_value(second.lease_expires_at).unwrap()
+    );
+
+    ws_a.send_json(&json!({
+        "action": "attach",
+        "subscription_id": "wrong-generation",
+        "connection_id": first.connection_id,
+        "generation": first.generation + 1,
+        "lease_id": first.lease_id,
+        "since_seq": null
+    }))
+    .await;
+    let wrong_generation = next_json(&mut ws_a).await;
+    assert_eq!(wrong_generation["reason"], "generation_stale");
+
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(60)).await;
+    ws_a.send_json(&json!({"action": "ping"})).await;
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_millis(1)).await;
+    assert_eq!(next_json(&mut ws_a).await["type"], "pong");
+    tokio::time::advance(Duration::from_secs(31)).await;
+    let expired = state
+        .connection_manager
+        .shared_session_broker()
+        .expire_leases(tokio::time::Instant::now())
+        .await;
+    assert_eq!(expired, vec![second.lease_id]);
+}
+
+#[tokio::test]
+async fn ws_attach_shared_generation_retry_detaches_replaced_subscription() {
+    let (server, state, _d, _s) = build_ws_server().await;
+    let first = seed_shared_root(&state, 42, "shared-old", "client-a", "request-a").await;
+    let broker = state.connection_manager.shared_session_broker();
+
+    let mut ws = server
+        .get_websocket("/ws/events")
+        .add_header(SEC_WEBSOCKET_PROTOCOL, ws_auth_protocol(TEST_TOKEN))
+        .await
+        .into_websocket()
+        .await;
+    let _ready = next_json(&mut ws).await;
+    ws.send_json(&json!({
+        "action": "attach",
+        "subscription_id": "old-live",
+        "connection_id": first.connection_id,
+        "generation": first.generation,
+        "lease_id": first.lease_id,
+        "since_seq": null
+    }))
+    .await;
+    assert_eq!(next_json(&mut ws).await["type"], "snapshot");
+
+    broker
+        .mark_failed(
+            &first.connection_id,
+            first.generation,
+            "companion_initialization_failed",
+            false,
+        )
+        .await
+        .expect("failed generation");
+    broker
+        .mark_cleanup_complete(&first.connection_id, first.generation)
+        .await
+        .expect("failed generation cleanup");
+    let replacement = broker
+        .reserve_or_attach(shared_request(
+            42,
+            "shared-new",
+            "client-b",
+            "request-b",
+            Some(first.generation),
+        ))
+        .await
+        .expect("replacement generation")
+        .attachment;
+    state
+        .connection_manager
+        .install_test_shared_connection(&replacement, Some(42))
+        .await
+        .expect("replacement public state");
+
+    ws.send_json(&json!({"action": "ping"})).await;
+    let detached = next_json(&mut ws).await;
+    assert_eq!(detached["type"], "detached");
+    assert_eq!(detached["subscription_id"], "old-live");
+    assert_eq!(detached["reason"], "session_replaced");
+    assert_eq!(next_json(&mut ws).await["type"], "pong");
+
+    ws.send_json(&json!({
+        "action": "attach",
+        "subscription_id": "new-live",
+        "connection_id": replacement.connection_id,
+        "generation": replacement.generation,
+        "lease_id": replacement.lease_id,
+        "since_seq": null
+    }))
+    .await;
+    let new_snapshot = next_json(&mut ws).await;
+    assert_eq!(new_snapshot["type"], "snapshot");
+    assert_eq!(
+        new_snapshot["connection_id"],
+        replacement.connection_id.as_str()
+    );
+    assert_eq!(
+        new_snapshot["snapshot"]["shared_session"]["generation"],
+        replacement.generation
+    );
+
+    ws.send_json(&json!({
+        "action": "attach",
+        "subscription_id": "old-direct",
+        "connection_id": first.connection_id,
+        "generation": first.generation,
+        "lease_id": first.lease_id,
+        "since_seq": null
+    }))
+    .await;
+    let direct = next_json(&mut ws).await;
+    assert_eq!(direct["type"], "detached");
+    assert_eq!(direct["subscription_id"], "old-direct");
+    assert_eq!(direct["reason"], "session_replaced");
 }
 
 // ───────────────────────────────────────────────────────────────────────────

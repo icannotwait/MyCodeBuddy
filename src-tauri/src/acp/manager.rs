@@ -529,6 +529,7 @@ fn shared_projection(
         queue: Vec::new(),
         active_turn: None,
         lease_expires_at,
+        expired_lease_tombstone_count: 0,
     }
 }
 
@@ -1688,6 +1689,44 @@ impl ConnectionManager {
         };
         let mut map = self.connections.lock().await;
         map.insert(id.to_string(), conn);
+    }
+
+    /// Register a broker-owned public state without adding a manager-map
+    /// `AgentConnection`. Integration tests use this to exercise the same
+    /// retained-state path that failed shared generations use after cleanup.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn install_test_shared_connection(
+        &self,
+        attachment: &SharedSessionAttachment,
+        conversation_id: Option<i32>,
+    ) -> Result<Arc<RwLock<SessionState>>, SharedSessionError> {
+        let mut state = SessionState::new(
+            attachment.connection_id.clone(),
+            AgentType::Codex,
+            None,
+            "shared-server".into(),
+            conversation_id,
+        );
+        state.status = ConnectionStatus::Connecting;
+        state.tool_lease_registry = self.tool_lease_registry.clone();
+        state.mcp_cancel_registry = self.mcp_cancel_registry.clone();
+        state.shared_session = Some(shared_projection(
+            attachment.generation,
+            SharedSessionPhase::Bootstrapping,
+            None,
+        ));
+        let state = Arc::new(RwLock::new(state));
+        self.shared_session_broker
+            .install_registered(
+                &attachment.connection_id,
+                attachment.generation,
+                format!("test-driver-{}", attachment.generation),
+                state.clone(),
+                EventEmitter::Noop,
+                Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            )
+            .await?;
+        Ok(state)
     }
 
     /// Insert a synthetic delegated child that adopts the parent's live

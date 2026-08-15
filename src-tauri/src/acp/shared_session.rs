@@ -15,7 +15,10 @@ use std::{
 use chrono::{DateTime, Utc};
 use tokio::sync::{watch, Mutex, RwLock};
 
-use crate::{acp::session_state::SessionState, web::event_bridge::EventEmitter};
+use crate::{
+    acp::session_state::SessionState,
+    web::{event_bridge::EventEmitter, ws_attach::DetachReason},
+};
 
 use error::validate_failure_code;
 
@@ -59,6 +62,287 @@ impl Default for SharedSessionBroker {
 impl SharedSessionBroker {
     pub fn metrics(&self) -> &SharedSessionMetrics {
         &self.metrics
+    }
+
+    /// Validate a mutation guard against the current generation and lease.
+    ///
+    /// The broker index is authoritative even when the manager connection map
+    /// has already removed a failed connection. A replacement tombstone is
+    /// therefore surfaced as a generation fence rather than a generic lease
+    /// miss for mutation callers.
+    pub async fn validate_guard(
+        &self,
+        guard: &SharedMutationGuard,
+    ) -> Result<(), SharedSessionError> {
+        loop {
+            let contended = {
+                let index = self.index.lock().await;
+                let Some(record) = index.record_for_connection(&guard.connection_id) else {
+                    if index.is_replaced_connection(&guard.connection_id, guard.generation) {
+                        return Err(SharedSessionError::GenerationStale);
+                    }
+                    return Err(SharedSessionError::LeaseMissing);
+                };
+                let result = match record.try_lock() {
+                    Ok(mut record) => {
+                        if record.generation != guard.generation {
+                            return Err(SharedSessionError::GenerationStale);
+                        }
+                        let expired = record.prune_expired_leases(tokio::time::Instant::now());
+                        self.metrics.remove_active_leases(expired.len());
+                        self.metrics.record_lease_expired(expired.len());
+                        if record
+                            .active_leases
+                            .values()
+                            .any(|lease| lease.lease_id == guard.lease_id)
+                        {
+                            return Ok(());
+                        }
+                        return if record
+                            .expired_leases
+                            .iter()
+                            .any(|lease_id| lease_id == &guard.lease_id)
+                        {
+                            Err(SharedSessionError::LeaseExpired)
+                        } else {
+                            Err(SharedSessionError::LeaseMissing)
+                        };
+                    }
+                    Err(_) => true,
+                };
+                result
+            };
+            if contended {
+                tokio::task::yield_now().await;
+            }
+        }
+    }
+
+    /// Validate a WebSocket fence and return the binding used by its
+    /// subscription. The `(None, None)` result is deliberately represented by
+    /// `ConnectionGone`: callers may then attempt the legacy manager path,
+    /// while any fenced value for an unknown id is rejected fail-closed.
+    pub async fn validate_and_bind_lease(
+        &self,
+        connection_id: &str,
+        generation: Option<u64>,
+        lease_id: Option<&str>,
+    ) -> Result<LeaseSocketBinding, DetachReason> {
+        loop {
+            let contended = {
+                let index = self.index.lock().await;
+                let Some(record) = index.record_for_connection(connection_id) else {
+                    if index.is_replaced_connection(connection_id, generation.unwrap_or_default())
+                        || (generation.is_none()
+                            && lease_id.is_none()
+                            && index.has_replaced_connection(connection_id))
+                    {
+                        return Err(DetachReason::SessionReplaced);
+                    }
+                    return if generation.is_none() && lease_id.is_none() {
+                        Err(DetachReason::ConnectionGone)
+                    } else {
+                        Err(DetachReason::GenerationStale)
+                    };
+                };
+                let Some(generation) = generation else {
+                    return Err(DetachReason::GenerationStale);
+                };
+                let Some(lease_id) = lease_id else {
+                    return Err(DetachReason::GenerationStale);
+                };
+                let result = match record.try_lock() {
+                    Ok(mut record) => {
+                        if record.generation != generation {
+                            return Err(DetachReason::GenerationStale);
+                        }
+                        let expired = record.prune_expired_leases(tokio::time::Instant::now());
+                        self.metrics.remove_active_leases(expired.len());
+                        self.metrics.record_lease_expired(expired.len());
+                        let Some(lease) = record
+                            .active_leases
+                            .values()
+                            .find(|lease| lease.lease_id == lease_id)
+                        else {
+                            return Err(
+                                if record
+                                    .expired_leases
+                                    .iter()
+                                    .any(|expired_id| expired_id == lease_id)
+                                {
+                                    DetachReason::LeaseExpired
+                                } else {
+                                    DetachReason::LeaseMissing
+                                },
+                            );
+                        };
+                        return Ok(LeaseSocketBinding {
+                            connection_id: record.connection_id.clone(),
+                            generation: record.generation,
+                            lease_id: lease.lease_id.clone(),
+                            lease_expires_at: lease.expires_at_utc,
+                        });
+                    }
+                    Err(_) => true,
+                };
+                result
+            };
+            if contended {
+                tokio::task::yield_now().await;
+            }
+        }
+    }
+
+    /// Renew each distinct binding in input order. The caller owns any
+    /// subscription fan-out; this method intentionally returns one outcome for
+    /// every input item so transport retries remain deterministic.
+    pub async fn renew_leases(&self, bindings: &[LeaseSocketBinding]) -> Vec<LeaseRenewalOutcome> {
+        let mut outcomes = Vec::with_capacity(bindings.len());
+        for binding in bindings {
+            outcomes.push(self.renew_lease(binding).await);
+        }
+        outcomes
+    }
+
+    async fn renew_lease(&self, binding: &LeaseSocketBinding) -> LeaseRenewalOutcome {
+        loop {
+            let contended = {
+                let index = self.index.lock().await;
+                let Some(record) = index.record_for_connection(&binding.connection_id) else {
+                    return if index
+                        .is_replaced_connection(&binding.connection_id, binding.generation)
+                    {
+                        LeaseRenewalOutcome::Detached(DetachReason::SessionReplaced)
+                    } else {
+                        LeaseRenewalOutcome::Detached(DetachReason::LeaseMissing)
+                    };
+                };
+                let result = match record.try_lock() {
+                    Ok(mut record) => {
+                        if record.generation != binding.generation {
+                            return LeaseRenewalOutcome::Detached(DetachReason::GenerationStale);
+                        }
+                        let now = tokio::time::Instant::now();
+                        let now_utc = Utc::now();
+                        let expired = record.prune_expired_leases(now);
+                        self.metrics.remove_active_leases(expired.len());
+                        self.metrics.record_lease_expired(expired.len());
+                        let connection_id = record.connection_id.clone();
+                        let generation = record.generation;
+                        let Some(lease) = record
+                            .active_leases
+                            .values_mut()
+                            .find(|lease| lease.lease_id == binding.lease_id)
+                        else {
+                            return if record
+                                .expired_leases
+                                .iter()
+                                .any(|expired_id| expired_id == &binding.lease_id)
+                            {
+                                LeaseRenewalOutcome::Detached(DetachReason::LeaseExpired)
+                            } else {
+                                LeaseRenewalOutcome::Detached(DetachReason::LeaseMissing)
+                            };
+                        };
+                        let expires_at = now + self.lease_ttl;
+                        let expires_at_utc = now_utc
+                            + chrono::Duration::from_std(self.lease_ttl)
+                                .expect("shared session lease TTL must fit chrono::Duration");
+                        lease.expires_at = expires_at;
+                        lease.expires_at_utc = expires_at_utc;
+                        let lease_id = lease.lease_id.clone();
+                        let lease_expires_at = lease.expires_at_utc;
+                        return LeaseRenewalOutcome::Renewed(LeaseSocketBinding {
+                            connection_id,
+                            generation,
+                            lease_id,
+                            lease_expires_at,
+                        });
+                    }
+                    Err(_) => true,
+                };
+                result
+            };
+            if contended {
+                tokio::task::yield_now().await;
+            }
+        }
+    }
+
+    /// Release only the matching active lease on the current generation.
+    /// Releasing an already-expired or already-released id is an idempotent
+    /// `Ok(false)` and does not create another secret-bearing tombstone.
+    pub async fn release_lease(
+        &self,
+        guard: &SharedMutationGuard,
+    ) -> Result<bool, SharedSessionError> {
+        loop {
+            let contended = {
+                let index = self.index.lock().await;
+                let Some(record) = index.record_for_connection(&guard.connection_id) else {
+                    if index.is_replaced_connection(&guard.connection_id, guard.generation) {
+                        return Err(SharedSessionError::GenerationStale);
+                    }
+                    return Err(SharedSessionError::SessionUnavailable);
+                };
+                let result = match record.try_lock() {
+                    Ok(mut record) => {
+                        if record.generation != guard.generation {
+                            return Err(SharedSessionError::GenerationStale);
+                        }
+                        let expired = record.prune_expired_leases(tokio::time::Instant::now());
+                        self.metrics.remove_active_leases(expired.len());
+                        self.metrics.record_lease_expired(expired.len());
+                        let Some(client) = record
+                            .active_leases
+                            .iter()
+                            .find(|(_, lease)| lease.lease_id == guard.lease_id)
+                            .map(|(client, _)| client.clone())
+                        else {
+                            return Ok(false);
+                        };
+                        record.active_leases.remove(&client);
+                        self.metrics.remove_active_leases(1);
+                        self.metrics.record_lease_released();
+                        return Ok(true);
+                    }
+                    Err(_) => true,
+                };
+                result
+            };
+            if contended {
+                tokio::task::yield_now().await;
+            }
+        }
+    }
+
+    /// Expire leases across every authoritative record without touching the
+    /// manager connection map. Expiry is a lease lifecycle event only and
+    /// never disconnects the underlying ACP process.
+    pub async fn expire_leases(&self, now: tokio::time::Instant) -> Vec<String> {
+        let mut expired_ids = Vec::new();
+        loop {
+            let mut contended = false;
+            {
+                let index = self.index.lock().await;
+                for record in index.sessions.values() {
+                    match record.try_lock() {
+                        Ok(mut record) => {
+                            let expired = record.prune_expired_leases(now);
+                            self.metrics.remove_active_leases(expired.len());
+                            self.metrics.record_lease_expired(expired.len());
+                            expired_ids.extend(expired);
+                        }
+                        Err(_) => contended = true,
+                    }
+                }
+            }
+            if !contended {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        expired_ids
     }
 
     #[cfg(test)]
@@ -131,7 +415,8 @@ impl SharedSessionBroker {
                 match current.retry_decision(&request)? {
                     FailedRetryDecision::Attach => {
                         let expired = current.prune_expired_leases(request.now);
-                        self.metrics.remove_active_leases(expired);
+                        self.metrics.remove_active_leases(expired.len());
+                        self.metrics.record_lease_expired(expired.len());
                         match current.attach_or_renew_lease(
                             &request,
                             self.lease_ttl,
@@ -275,6 +560,7 @@ impl SharedSessionBroker {
                 queue: Vec::new(),
                 active_turn: None,
                 lease_expires_at: None,
+                expired_lease_tombstone_count: record.expired_leases.len(),
             })
         })
         .await
@@ -874,6 +1160,15 @@ impl SharedSessionBroker {
         current
             .lifecycle_tx
             .send_replace(SharedLifecycleState::Replaced);
+        index
+            .replaced_connections
+            .push_back(ReplacedConnectionTombstone {
+                connection_id: old_connection_id.clone(),
+                generation: failed_generation,
+            });
+        if index.replaced_connections.len() > MAX_REPLACED_CONNECTION_TOMBSTONES {
+            index.replaced_connections.pop_front();
+        }
         index.by_connection.remove(&old_connection_id);
         index
             .by_connection
@@ -909,6 +1204,7 @@ fn update_public_shared_phase(
                 queue: Vec::new(),
                 active_turn: None,
                 lease_expires_at: None,
+                expired_lease_tombstone_count: 0,
             });
         }
     }
@@ -933,6 +1229,7 @@ impl Default for BrokerLimits {
 struct SharedSessionIndex {
     sessions: HashMap<SharedSessionKey, Arc<Mutex<SharedSessionRecord>>>,
     by_connection: HashMap<String, SharedSessionKey>,
+    replaced_connections: VecDeque<ReplacedConnectionTombstone>,
 }
 
 impl SharedSessionIndex {
@@ -943,6 +1240,23 @@ impl SharedSessionIndex {
         let key = self.by_connection.get(connection_id)?;
         self.sessions.get(key)
     }
+
+    fn is_replaced_connection(&self, connection_id: &str, generation: u64) -> bool {
+        self.replaced_connections.iter().any(|tombstone| {
+            tombstone.connection_id == connection_id && tombstone.generation == generation
+        })
+    }
+
+    fn has_replaced_connection(&self, connection_id: &str) -> bool {
+        self.replaced_connections
+            .iter()
+            .any(|tombstone| tombstone.connection_id == connection_id)
+    }
+}
+
+struct ReplacedConnectionTombstone {
+    connection_id: String,
+    generation: u64,
 }
 
 struct SharedSessionRecord {
@@ -1076,22 +1390,24 @@ impl SharedSessionRecord {
         }
     }
 
-    fn prune_expired_leases(&mut self, now: tokio::time::Instant) -> usize {
+    fn prune_expired_leases(&mut self, now: tokio::time::Instant) -> Vec<String> {
         let expired_clients: Vec<_> = self
             .active_leases
             .iter()
             .filter(|(_, lease)| lease.expires_at <= now)
             .map(|(client, _)| client.clone())
             .collect();
+        let mut expired_ids = Vec::with_capacity(expired_clients.len());
         for client in &expired_clients {
             if let Some(lease) = self.active_leases.remove(client) {
+                expired_ids.push(lease.lease_id.clone());
                 self.expired_leases.push_back(lease.lease_id);
                 if self.expired_leases.len() > MAX_EXPIRED_LEASE_TOMBSTONES {
                     self.expired_leases.pop_front();
                 }
             }
         }
-        expired_clients.len()
+        expired_ids
     }
 
     fn attach_or_renew_lease(

@@ -132,6 +132,15 @@ impl SharedSessionMetrics {
             });
     }
 
+    pub(super) fn record_lease_expired(&self, count: usize) {
+        self.lease_expired_total
+            .fetch_add(count as u64, Ordering::Relaxed);
+    }
+
+    pub(super) fn record_lease_released(&self) {
+        self.lease_released_total.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(super) fn record_capacity_rejection(&self) {
         self.capacity_rejected_total.fetch_add(1, Ordering::Relaxed);
     }

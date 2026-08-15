@@ -2239,6 +2239,7 @@ mod tests {
             queue: Vec::new(),
             active_turn: None,
             lease_expires_at: None,
+            expired_lease_tombstone_count: 0,
         });
         let submitted_at = chrono::DateTime::parse_from_rfc3339("2026-08-16T00:00:00Z")
             .unwrap()
@@ -2328,6 +2329,7 @@ mod tests {
                 stop_requested: false,
             }),
             lease_expires_at: None,
+            expired_lease_tombstone_count: 0,
         });
 
         state.apply_event(&AcpEvent::SharedSessionPhaseChanged {
