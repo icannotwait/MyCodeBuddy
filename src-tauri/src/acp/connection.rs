@@ -11334,6 +11334,9 @@ fn grok_mcp_output_text(raw_output: &serde_json::Value) -> Option<String> {
 ///
 /// * a `delegate_to_agent` ack opens with
 ///   `"Delegation successful. task_id="` (`broker.rs::running_ack`);
+/// * a `continue_delegation` ack opens with `"Continuation running"` or
+///   `"Continuation is still admitting"` (`broker.rs::continue_running_ack` /
+///   `continue_idempotent_ack`);
 /// * `get_delegation_status` renders the compact `{"tasks":[..]}` JSON
 ///   (`companion.rs::render_batch_report`), whose items carry `task_id` +
 ///   a `status` from the fixed report vocabulary.
@@ -11353,6 +11356,11 @@ fn cursor_companion_title_from_content(content: Option<&str>) -> Option<&'static
     let text = content?.trim_start();
     if text.starts_with("Delegation successful. task_id=") {
         return Some(crate::acp::delegation::DELEGATE_TOOL_REWRITE_TITLE);
+    }
+    if text.starts_with("Continuation running in the existing child session. task_id=")
+        || text.starts_with("Continuation is still admitting the existing child session. task_id=")
+    {
+        return Some(crate::acp::delegation::CONTINUE_TOOL_REWRITE_TITLE);
     }
     // Cheap guards before the full JSON parse: the status report is a JSON
     // object whose first key is `tasks`.
@@ -20528,6 +20536,106 @@ mod tests {
     }
 
     #[test]
+    fn cursor_companion_title_resolves_continue_ack() {
+        let running = "Continuation running in the existing child session. \
+                       task_id=799467c7-0188-4e7a-b5ef-241d4b141a83. Call \
+                       get_delegation_status with this id in the task_ids array.";
+        assert_eq!(
+            cursor_companion_title_from_content(Some(running)),
+            Some("codeg-mcp__continue_delegation")
+        );
+
+        let admitting = "Continuation is still admitting the existing child session. \
+                         task_id=799467c7-0188-4e7a-b5ef-241d4b141a83. Call \
+                         get_delegation_status with this id in the task_ids array.";
+        assert_eq!(
+            cursor_companion_title_from_content(Some(admitting)),
+            Some("codeg-mcp__continue_delegation")
+        );
+    }
+
+    #[tokio::test]
+    async fn cursor_identityless_continue_ack_rewrites_emitted_update_title() {
+        let state = Arc::new(RwLock::new(SessionState::new(
+            "conn-cursor-continue".into(),
+            AgentType::Cursor,
+            None,
+            "win".into(),
+            None,
+        )));
+        let emitter = EventEmitter::Noop;
+        let mut cache = ToolCallOutputCache::default();
+        let mut cb = CodeBuddyLiveState::default();
+
+        let call: SessionUpdate = serde_json::from_value(serde_json::json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "cursor-continue-call",
+            "title": "MCP: tool",
+            "status": "pending",
+        }))
+        .expect("valid Cursor identity-less tool_call");
+        emit_conversation_update(
+            &state,
+            &emitter,
+            AgentType::Cursor,
+            call,
+            None,
+            &mut cache,
+            &mut cb,
+            None,
+        )
+        .await;
+        assert!(cb.cursor_generic_mcp_ids.contains("cursor-continue-call"));
+
+        let update: SessionUpdate = serde_json::from_value(serde_json::json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "cursor-continue-call",
+            "status": "completed",
+            "content": [{
+                "type": "content",
+                "content": {
+                    "type": "text",
+                    "text": "Continuation running in the existing child session. task_id=run-2. Call get_delegation_status with this id in the task_ids array."
+                }
+            }],
+        }))
+        .expect("valid Cursor completion update");
+        emit_conversation_update(
+            &state,
+            &emitter,
+            AgentType::Cursor,
+            update,
+            None,
+            &mut cache,
+            &mut cb,
+            None,
+        )
+        .await;
+
+        assert!(!cb.cursor_generic_mcp_ids.contains("cursor-continue-call"));
+        assert_eq!(
+            cb.title_overrides
+                .get("cursor-continue-call")
+                .map(String::as_str),
+            Some("codeg-mcp__continue_delegation")
+        );
+        let events = state
+            .read()
+            .await
+            .recent_events_after(0)
+            .expect("events recorded");
+        let emitted_title = events.iter().find_map(|event| match &event.payload {
+            AcpEvent::ToolCallUpdate {
+                tool_call_id,
+                title,
+                ..
+            } if tool_call_id == "cursor-continue-call" => title.as_deref(),
+            _ => None,
+        });
+        assert_eq!(emitted_title, Some("codeg-mcp__continue_delegation"));
+    }
+
+    #[test]
     fn cursor_companion_title_resolves_status_report() {
         // Real-device shape: companion.rs::render_batch_report's compact JSON.
         let report = r#"{"tasks":[{"agent_type":"claude_code","child_conversation_id":1576,"duration_ms":27288,"status":"completed","task_id":"799467c7-0188-4e7a-b5ef-241d4b141a83","text":"done"}]}"#;
@@ -22366,7 +22474,8 @@ mod tests {
 
     /// Client-side ResumeExistingOnly chain using production wire helpers + gate
     /// + production `refuse_unresumable_bootstrap` on refuse.
-    async fn run_resume_existing_contract(
+    async fn run_resume_existing_contract_for_agent(
+        agent_type: AgentType,
         mock: ResumeContractMockAgent,
         requested_session_id: &str,
         counters: ResumeContractCounters,
@@ -22393,7 +22502,7 @@ mod tests {
         let broker_for_refuse = settle.as_ref().map(|s| s.broker.clone());
         let state = Arc::new(RwLock::new(SessionState::new(
             connection_id.clone(),
-            AgentType::Codex,
+            agent_type,
             Some(PathBuf::from(".")),
             "main".into(),
             None,
@@ -22404,9 +22513,9 @@ mod tests {
             .connect_with(mock, async move |cx| {
                 let shell = test_placeholder_terminal_shell();
                 let init_req = build_initialize_request(
-                    AgentType::Codex,
+                    agent_type,
                     &shell.spec,
-                    adapter_for(AgentType::Codex),
+                    adapter_for(agent_type),
                     HostToolsPolicy::Default,
                 )
                 .map_err(|e| sacp::util::internal_error(e.to_string()))?;
@@ -22419,8 +22528,9 @@ mod tests {
                     .session_capabilities
                     .resume
                     .is_some();
+                let supports_load = init_resp.agent_capabilities.load_session;
 
-                let route_plan = native_plan(AgentType::Codex);
+                let route_plan = native_plan(agent_type);
                 let cwd = PathBuf::from(".");
                 let mut obs = ResumeContractObservation {
                     emit_session_id: None,
@@ -22438,12 +22548,12 @@ mod tests {
 
                 if supports_resume {
                     let resume_req = build_resume_session_request(
-                        AgentType::Codex,
+                        agent_type,
                         SessionId::new(requested.clone()),
                         &cwd,
                         Vec::new(),
                         &shell.spec,
-                        adapter_for(AgentType::Codex),
+                        adapter_for(agent_type),
                         &route_plan,
                         ConnectionPurpose::User,
                     )
@@ -22494,13 +22604,28 @@ mod tests {
                 }
 
                 // session/load (resume → load only; never session/new).
+                if !supports_load {
+                    apply_production_refuse(
+                        &state,
+                        &requested,
+                        "resume_existing_only: agent does not advertise the loadSession capability"
+                            .into(),
+                        broker_for_refuse.as_deref(),
+                        &connection_id,
+                        &mut event_rx,
+                        &mut obs,
+                    )
+                    .await;
+                    *outcome_slot.lock().unwrap() = Some(obs);
+                    return Ok(());
+                }
                 let load_req = build_load_session_request(
-                    AgentType::Codex,
+                    agent_type,
                     SessionId::new(requested.clone()),
                     &cwd,
                     Vec::new(),
                     &shell.spec,
-                    adapter_for(AgentType::Codex),
+                    adapter_for(agent_type),
                     &route_plan,
                     ConnectionPurpose::User,
                 )
@@ -22601,6 +22726,22 @@ mod tests {
         obs
     }
 
+    async fn run_resume_existing_contract(
+        mock: ResumeContractMockAgent,
+        requested_session_id: &str,
+        counters: ResumeContractCounters,
+        settle: Option<ResumeContractSettleFixture>,
+    ) -> ResumeContractObservation {
+        run_resume_existing_contract_for_agent(
+            AgentType::Codex,
+            mock,
+            requested_session_id,
+            counters,
+            settle,
+        )
+        .await
+    }
+
     #[tokio::test]
     async fn resume_existing_accepts_standard_no_id_resume_admits_prompt() {
         let body = empty_no_session_id_body();
@@ -22653,6 +22794,80 @@ mod tests {
         assert_eq!(obs.resume_count, 0);
         assert_eq!(obs.load_count, 1);
         assert_eq!(obs.session_new_count, 0);
+    }
+
+    #[tokio::test]
+    async fn cursor_load_only_capability_reuses_requested_session_and_admits_prompt() {
+        let (mock, counters) = ResumeContractMockAgent::with_counters(
+            false,
+            true,
+            ResumeContractRpcOutcome::Err {
+                code: -32601,
+                message: "Cursor does not advertise session/resume".into(),
+            },
+            ResumeContractRpcOutcome::Ok(empty_no_session_id_body()),
+        );
+        let obs = run_resume_existing_contract_for_agent(
+            AgentType::Cursor,
+            mock,
+            "cursor-session-load-only",
+            counters,
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            obs.emit_session_id.as_deref(),
+            Some("cursor-session-load-only")
+        );
+        assert!(obs.refused_reason.is_none(), "unexpected refuse: {obs:?}");
+        assert!(obs.prompt_admitted);
+        assert_eq!(obs.prompt_count, 1);
+        assert_eq!(obs.resume_count, 0);
+        assert_eq!(obs.load_count, 1);
+        assert_eq!(
+            obs.session_new_count, 0,
+            "Cursor ResumeExistingOnly must never create session/new"
+        );
+    }
+
+    #[tokio::test]
+    async fn cursor_without_load_capability_refuses_without_prompt_or_new_session() {
+        let (mock, counters) = ResumeContractMockAgent::with_counters(
+            false,
+            false,
+            ResumeContractRpcOutcome::Err {
+                code: -32601,
+                message: "Cursor does not advertise session/resume".into(),
+            },
+            ResumeContractRpcOutcome::Err {
+                code: -32601,
+                message: "session/load must not be called without capability".into(),
+            },
+        );
+        let obs = run_resume_existing_contract_for_agent(
+            AgentType::Cursor,
+            mock,
+            "cursor-session-unsupported",
+            counters,
+            None,
+        )
+        .await;
+
+        assert!(obs.emit_session_id.is_none());
+        assert!(!obs.prompt_admitted);
+        assert_eq!(obs.prompt_count, 0);
+        assert_eq!(obs.resume_count, 0);
+        assert_eq!(obs.load_count, 0);
+        assert_eq!(obs.session_new_count, 0);
+        assert!(obs.production_refuse_called);
+        assert_eq!(obs.session_load_failed_code.as_deref(), Some("unresumable"));
+        assert!(
+            obs.refused_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("loadSession capability")),
+            "unexpected refuse reason: {obs:?}"
+        );
     }
 
     #[tokio::test]
