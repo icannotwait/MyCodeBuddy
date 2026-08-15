@@ -535,6 +535,96 @@ mod tests {
     }
 
     #[test]
+    fn new_work_unit_branches_reuse_all_identity_validators_and_scalar_bounds() {
+        for parts in [
+            WorkUnitKeyParts::DesignFixer {
+                rel_doc_path: "../design.md",
+                agent_type: "codex",
+                profile_id: None,
+            },
+            WorkUnitKeyParts::DesignFixer {
+                rel_doc_path: "docs/design.md",
+                agent_type: "not_an_agent",
+                profile_id: None,
+            },
+            WorkUnitKeyParts::DesignFixer {
+                rel_doc_path: "docs/design.md",
+                agent_type: "codex",
+                profile_id: Some("bad\u{0007}profile"),
+            },
+        ] {
+            assert!(build_work_unit_key(&parts).is_err());
+        }
+
+        for parts in [
+            WorkUnitKeyParts::TaskReviewerSlotted {
+                task_index: 0,
+                slot: ReviewerSlot::Primary,
+                agent_type: "codex",
+                profile_id: None,
+            },
+            WorkUnitKeyParts::TaskReviewerSlotted {
+                task_index: 1,
+                slot: ReviewerSlot::Auxiliary,
+                agent_type: "not_an_agent",
+                profile_id: None,
+            },
+            WorkUnitKeyParts::TaskReviewerSlotted {
+                task_index: 1,
+                slot: ReviewerSlot::Auxiliary,
+                agent_type: "codex",
+                profile_id: Some("bad\u{0007}profile"),
+            },
+        ] {
+            assert!(build_work_unit_key(&parts).is_err());
+        }
+
+        for key in [
+            "design|docs/design.md|fixer|not_an_agent|none",
+            "design|docs/design.md|fixer|codex|bad\u{0007}profile",
+            "task|1|reviewer|auxiliary|not_an_agent|none",
+            "task|1|reviewer|auxiliary|codex|bad\u{0007}profile",
+            "task|01|reviewer|primary|codex|none",
+        ] {
+            assert_eq!(parse_recognized_work_unit_key(key), None, "{key:?}");
+        }
+
+        let design_profile_at_limit = "x".repeat(171);
+        let design_at_limit = build_work_unit_key(&WorkUnitKeyParts::DesignFixer {
+            rel_doc_path: "docs/d.md",
+            agent_type: "codex",
+            profile_id: Some(&design_profile_at_limit),
+        })
+        .expect("200-scalar Design Fixer key");
+        assert_eq!(design_at_limit.chars().count(), 200);
+        assert!(parse_recognized_work_unit_key(&design_at_limit).is_some());
+        assert!(build_work_unit_key(&WorkUnitKeyParts::DesignFixer {
+            rel_doc_path: "docs/d.md",
+            agent_type: "codex",
+            profile_id: Some(&"x".repeat(172)),
+        })
+        .is_err());
+
+        let reviewer_profile_at_limit = "x".repeat(170);
+        let reviewer_at_limit = build_work_unit_key(&WorkUnitKeyParts::TaskReviewerSlotted {
+            task_index: 1,
+            slot: ReviewerSlot::Primary,
+            agent_type: "codex",
+            profile_id: Some(&reviewer_profile_at_limit),
+        })
+        .expect("200-scalar slotted reviewer key");
+        assert_eq!(reviewer_at_limit.chars().count(), 200);
+        assert!(parse_recognized_work_unit_key(&reviewer_at_limit).is_some());
+        assert!(build_work_unit_key(&WorkUnitKeyParts::TaskReviewerSlotted {
+            task_index: 1,
+            slot: ReviewerSlot::Primary,
+            agent_type: "codex",
+            profile_id: Some(&"x".repeat(171)),
+        })
+        .is_err());
+    }
+
+    #[test]
     fn parse_round_trips_recognized_keys() {
         let key = "design|docs/superpowers/specs/x.md|reviewer|code_buddy|a1c14cde-f9c0-4fce-9d7f-66c3f8e85039";
         let parsed = parse_recognized_work_unit_key(key).expect("recognized");
