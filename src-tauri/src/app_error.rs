@@ -128,6 +128,28 @@ pub enum AppErrorCode {
     /// A removed completion-protocol environment variable is still present.
     CompletionProtocolConfigurationRemoved,
 
+    // ─── Shared ACP sessions ──────────────────────────────────────────
+    SharedSessionConfigConflict,
+    SharedSessionProtocolRequired,
+    SharedSessionGenerationStale,
+    SharedSessionClosing,
+    SharedSessionCleanupInProgress,
+    ClientLeaseMissing,
+    ClientLeaseExpired,
+    ClientLeaseCapacityExceeded,
+    ConnectIdempotencyCapacityExceeded,
+    PromptIdempotencyCapacityExceeded,
+    PromptQueueFull,
+    IdempotencyKeyConflict,
+    QueueItemNotFound,
+    QueueItemAlreadyDispatching,
+    InteractionAlreadyResolved,
+    StaleTurn,
+    SessionUnavailable,
+    CompanionInitializationFailed,
+    SharedSessionConversationKeyConflict,
+    InvalidSharedSessionField,
+
     // ─── Incremental reference search ─────────────────────────────────
     /// Search job was cancelled by a later cancel/start for the same source.
     /// Ordering/control result — HTTP 409.
@@ -337,6 +359,74 @@ mod tests {
             (
                 AppErrorCode::CompletionProtocolConfigurationRemoved,
                 "completion_protocol_configuration_removed",
+            ),
+        ] {
+            let serialized = serde_json::to_value(AppCommandError::new(code, "test")).unwrap();
+            assert_eq!(serialized["code"], expected);
+        }
+    }
+
+    #[test]
+    fn shared_session_codes_serialize_as_exact_snake_case_values() {
+        for (code, expected) in [
+            (
+                AppErrorCode::SharedSessionConfigConflict,
+                "shared_session_config_conflict",
+            ),
+            (
+                AppErrorCode::SharedSessionProtocolRequired,
+                "shared_session_protocol_required",
+            ),
+            (
+                AppErrorCode::SharedSessionGenerationStale,
+                "shared_session_generation_stale",
+            ),
+            (AppErrorCode::SharedSessionClosing, "shared_session_closing"),
+            (
+                AppErrorCode::SharedSessionCleanupInProgress,
+                "shared_session_cleanup_in_progress",
+            ),
+            (AppErrorCode::ClientLeaseMissing, "client_lease_missing"),
+            (AppErrorCode::ClientLeaseExpired, "client_lease_expired"),
+            (
+                AppErrorCode::ClientLeaseCapacityExceeded,
+                "client_lease_capacity_exceeded",
+            ),
+            (
+                AppErrorCode::ConnectIdempotencyCapacityExceeded,
+                "connect_idempotency_capacity_exceeded",
+            ),
+            (
+                AppErrorCode::PromptIdempotencyCapacityExceeded,
+                "prompt_idempotency_capacity_exceeded",
+            ),
+            (AppErrorCode::PromptQueueFull, "prompt_queue_full"),
+            (
+                AppErrorCode::IdempotencyKeyConflict,
+                "idempotency_key_conflict",
+            ),
+            (AppErrorCode::QueueItemNotFound, "queue_item_not_found"),
+            (
+                AppErrorCode::QueueItemAlreadyDispatching,
+                "queue_item_already_dispatching",
+            ),
+            (
+                AppErrorCode::InteractionAlreadyResolved,
+                "interaction_already_resolved",
+            ),
+            (AppErrorCode::StaleTurn, "stale_turn"),
+            (AppErrorCode::SessionUnavailable, "session_unavailable"),
+            (
+                AppErrorCode::CompanionInitializationFailed,
+                "companion_initialization_failed",
+            ),
+            (
+                AppErrorCode::SharedSessionConversationKeyConflict,
+                "shared_session_conversation_key_conflict",
+            ),
+            (
+                AppErrorCode::InvalidSharedSessionField,
+                "invalid_shared_session_field",
             ),
         ] {
             let serialized = serde_json::to_value(AppCommandError::new(code, "test")).unwrap();

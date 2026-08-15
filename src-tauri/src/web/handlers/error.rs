@@ -13,6 +13,7 @@ fn status_for_app_error_code(code: AppErrorCode) -> StatusCode {
         | AppErrorCode::TerminalShellUnavailable
         | AppErrorCode::TerminalShellUnsupported
         | AppErrorCode::RouteUnavailable
+        | AppErrorCode::InvalidSharedSessionField
         | AppErrorCode::InvalidPattern
         | AppErrorCode::InvalidRequest => StatusCode::BAD_REQUEST,
         AppErrorCode::NotFound => StatusCode::NOT_FOUND,
@@ -27,6 +28,20 @@ fn status_for_app_error_code(code: AppErrorCode) -> StatusCode {
         | AppErrorCode::UnsupportedCompletionProtocol
         | AppErrorCode::CompletionInstructionBindingFailed
         | AppErrorCode::SessionRouteConflict
+        | AppErrorCode::SharedSessionConfigConflict
+        | AppErrorCode::SharedSessionProtocolRequired
+        | AppErrorCode::SharedSessionGenerationStale
+        | AppErrorCode::SharedSessionClosing
+        | AppErrorCode::SharedSessionCleanupInProgress
+        | AppErrorCode::ClientLeaseMissing
+        | AppErrorCode::IdempotencyKeyConflict
+        | AppErrorCode::QueueItemNotFound
+        | AppErrorCode::QueueItemAlreadyDispatching
+        | AppErrorCode::InteractionAlreadyResolved
+        | AppErrorCode::StaleTurn
+        | AppErrorCode::SessionUnavailable
+        | AppErrorCode::CompanionInitializationFailed
+        | AppErrorCode::SharedSessionConversationKeyConflict
         | AppErrorCode::Cancelled
         | AppErrorCode::StaleStart
         | AppErrorCode::StalePage
@@ -38,9 +53,13 @@ fn status_for_app_error_code(code: AppErrorCode) -> StatusCode {
         | AppErrorCode::DependencyMissing
         | AppErrorCode::NotAGitRepository
         | AppErrorCode::AuthenticationFailed => StatusCode::UNPROCESSABLE_ENTITY,
-        AppErrorCode::JobExpired => StatusCode::GONE,
+        AppErrorCode::JobExpired | AppErrorCode::ClientLeaseExpired => StatusCode::GONE,
         AppErrorCode::SourceTimeout => StatusCode::REQUEST_TIMEOUT,
-        AppErrorCode::RegistryOverloaded => StatusCode::TOO_MANY_REQUESTS,
+        AppErrorCode::RegistryOverloaded
+        | AppErrorCode::ClientLeaseCapacityExceeded
+        | AppErrorCode::ConnectIdempotencyCapacityExceeded
+        | AppErrorCode::PromptIdempotencyCapacityExceeded
+        | AppErrorCode::PromptQueueFull => StatusCode::TOO_MANY_REQUESTS,
         AppErrorCode::NetworkError
         | AppErrorCode::DatabaseError
         | AppErrorCode::IoError
@@ -106,5 +125,49 @@ mod tests {
             status_for_app_error_code(AppErrorCode::CompletionProtocolConfigurationRemoved),
             StatusCode::BAD_REQUEST
         );
+    }
+
+    #[test]
+    fn shared_session_errors_map_to_stable_http_statuses() {
+        assert_eq!(
+            status_for_app_error_code(AppErrorCode::InvalidSharedSessionField),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            status_for_app_error_code(AppErrorCode::ClientLeaseMissing),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            status_for_app_error_code(AppErrorCode::ClientLeaseExpired),
+            StatusCode::GONE
+        );
+        for code in [
+            AppErrorCode::ClientLeaseCapacityExceeded,
+            AppErrorCode::ConnectIdempotencyCapacityExceeded,
+            AppErrorCode::PromptIdempotencyCapacityExceeded,
+            AppErrorCode::PromptQueueFull,
+        ] {
+            assert_eq!(
+                status_for_app_error_code(code),
+                StatusCode::TOO_MANY_REQUESTS
+            );
+        }
+        for code in [
+            AppErrorCode::SharedSessionConfigConflict,
+            AppErrorCode::SharedSessionProtocolRequired,
+            AppErrorCode::SharedSessionGenerationStale,
+            AppErrorCode::SharedSessionClosing,
+            AppErrorCode::SharedSessionCleanupInProgress,
+            AppErrorCode::IdempotencyKeyConflict,
+            AppErrorCode::QueueItemNotFound,
+            AppErrorCode::QueueItemAlreadyDispatching,
+            AppErrorCode::InteractionAlreadyResolved,
+            AppErrorCode::StaleTurn,
+            AppErrorCode::SessionUnavailable,
+            AppErrorCode::CompanionInitializationFailed,
+            AppErrorCode::SharedSessionConversationKeyConflict,
+        ] {
+            assert_eq!(status_for_app_error_code(code), StatusCode::CONFLICT);
+        }
     }
 }
