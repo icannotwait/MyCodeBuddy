@@ -21,9 +21,11 @@ import type { ImageInputAttachment } from "@/components/chat/message-input-attac
 export function ComposerImageThumbnails({
   attachments,
   onRemove,
+  removeDisabled = false,
 }: {
   attachments: ImageInputAttachment[]
   onRemove: (id: string) => void
+  removeDisabled?: boolean
 }) {
   const t = useTranslations("Folder.chat.messageInput")
   const [previewId, setPreviewId] = useState<string | null>(null)
@@ -62,6 +64,7 @@ export function ComposerImageThumbnails({
           <button
             type="button"
             onClick={() => onRemove(attachment.id)}
+            disabled={removeDisabled}
             className="absolute right-1 top-1 rounded-sm bg-background/70 p-0.5 hover:bg-background"
             aria-label={t("removeAttachmentAria", { name: attachment.name })}
           >

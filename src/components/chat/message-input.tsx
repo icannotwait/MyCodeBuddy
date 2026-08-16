@@ -157,7 +157,11 @@ export interface PromptDraftRestore {
 }
 
 interface MessageInputProps {
-  onSend: (draft: PromptDraft, modeId?: string | null) => void
+  onSend: (
+    draft: PromptDraft,
+    modeId?: string | null
+  ) => void | Promise<unknown>
+  sendClearMode?: "immediate" | "after-admission"
   placeholder?: string
   defaultPath?: string
   /**
@@ -300,6 +304,7 @@ function modelPickerGroups(
 
 export function MessageInput({
   onSend,
+  sendClearMode = "immediate",
   placeholder,
   defaultPath,
   folderId = null,
@@ -363,6 +368,9 @@ export function MessageInput({
   const editorRef = useRef<RichComposerHandle>(null)
   const containerRef = useRef<HTMLDivElement>(null)
   const disabledRef = useRef(disabled)
+  const sendAdmissionPendingRef = useRef(false)
+  const [sendAdmissionPending, setSendAdmissionPending] = useState(false)
+  const mutationLocked = interactionLocked || sendAdmissionPending
   // The editor owns the content now; this mirror of its empty state drives the
   // send button and `hasSendableContent`.
   const [composerEmpty, setComposerEmpty] = useState(true)
@@ -382,7 +390,7 @@ export function MessageInput({
   const attach = useComposerAttachments({
     editorRef,
     containerRef,
-    disabled,
+    disabled: disabled || sendAdmissionPending,
     promptCapabilities,
     attachmentTabId,
     defaultPath,
@@ -414,8 +422,8 @@ export function MessageInput({
   // Close the compact settings cog when viewer-only locks so a stale open panel
   // cannot fire mode/config mutations after relock.
   useEffect(() => {
-    if (interactionLocked) setCollapsedSelectorsOpen(false)
-  }, [interactionLocked])
+    if (mutationLocked) setCollapsedSelectorsOpen(false)
+  }, [mutationLocked])
   // Whether the async Clipboard read API is usable here. It's absent in
   // non-secure web deployments served over HTTP/LAN (see installClipboardFallback
   // in lib/utils, which only shims writeText), so the composer's custom
@@ -527,7 +535,9 @@ export function MessageInput({
   // Markdown) ~300ms after the last change so inline reference badges survive a
   // reload — a Markdown round-trip would downgrade them to plain links.
   const draftSaveTimerRef = useRef<number | null>(null)
+  const suppressDraftSaveRef = useRef(false)
   const scheduleDraftSave = useCallback(() => {
+    if (suppressDraftSaveRef.current) return
     if (typeof window === "undefined") return
     if (!effectiveDraftStorageKey || isEditingQueueItem) return
     if (draftSaveTimerRef.current != null) {
@@ -778,6 +788,10 @@ export function MessageInput({
     setComposerReady(true)
   }, [])
 
+  useEffect(() => {
+    editorRef.current?.getEditor()?.setEditable(!sendAdmissionPending)
+  }, [composerReady, sendAdmissionPending])
+
   const availableModes = useMemo(() => modes ?? [], [modes])
   const availableConfigOptions = useMemo(
     () => configOptions ?? [],
@@ -933,10 +947,10 @@ export function MessageInput({
 
   const handleModeSelect = useCallback(
     (modeId: string) => {
-      if (interactionLocked) return
+      if (mutationLocked) return
       onModeChange?.(modeId)
     },
-    [interactionLocked, onModeChange]
+    [mutationLocked, onModeChange]
   )
 
   // Close the runtime-command menu and clear the trigger.
@@ -1246,10 +1260,26 @@ export function MessageInput({
     closeSlashMenu()
   }, [clearAttachments, closeSlashMenu])
 
+  const clearSentComposer = useCallback(() => {
+    if (draftSaveTimerRef.current != null && typeof window !== "undefined") {
+      window.clearTimeout(draftSaveTimerRef.current)
+      draftSaveTimerRef.current = null
+    }
+    if (effectiveDraftStorageKey) {
+      clearMessageInputDraftV2(effectiveDraftStorageKey)
+    }
+    suppressDraftSaveRef.current = true
+    try {
+      resetComposer()
+    } finally {
+      suppressDraftSaveRef.current = false
+    }
+  }, [effectiveDraftStorageKey, resetComposer])
+
   const handleSend = useCallback(() => {
     // Access lock first — blocks both send and the disabled+prompting enqueue
     // bypass so a viewer-only delegate cannot park drafts while locked.
-    if (interactionLocked) return
+    if (interactionLocked || sendAdmissionPendingRef.current) return
     // The editor stays editable while `disabled` (the agent is busy) so the user
     // can keep typing, but a plain send is blocked — only enqueue / queue-edit
     // save go through. Mirrors the legacy textarea's keydown guard.
@@ -1280,11 +1310,33 @@ export function MessageInput({
       return
     }
 
-    onSend(draft, showModeSelector ? effectiveModeId : null)
-    if (effectiveDraftStorageKey) {
-      clearMessageInputDraftV2(effectiveDraftStorageKey)
+    const modeId = showModeSelector ? effectiveModeId : null
+    if (sendClearMode === "after-admission") {
+      sendAdmissionPendingRef.current = true
+      setSendAdmissionPending(true)
+      if (effectiveDraftStorageKey && editorRef.current) {
+        saveMessageInputDraftV2(
+          effectiveDraftStorageKey,
+          stripEmbeddedReferences(editorRef.current.getJSON())
+        )
+      }
+      void (async () => {
+        try {
+          await onSend(draft, modeId)
+          clearSentComposer()
+        } catch {
+          // Shared lifecycle reporting owns the error UI. Retain the original
+          // editor state and persisted draft so the user can retry unchanged.
+        } finally {
+          sendAdmissionPendingRef.current = false
+          setSendAdmissionPending(false)
+        }
+      })()
+      return
     }
-    resetComposer()
+
+    onSend(draft, modeId)
+    clearSentComposer()
   }, [
     interactionLocked,
     disabled,
@@ -1300,10 +1352,12 @@ export function MessageInput({
     showModeSelector,
     effectiveDraftStorageKey,
     resetComposer,
+    clearSentComposer,
+    sendClearMode,
   ])
 
   const handleForkSendClick = useCallback(() => {
-    if (interactionLocked) return
+    if (mutationLocked) return
     if (!onForkSend) return
     // Same uploading gate as `handleSend`: a fork-send consumes the draft
     // (and its blocks) immediately, so an unsettled upload would strip to
@@ -1319,20 +1373,16 @@ export function MessageInput({
     // editable window. If the fork can't run (queue non-empty / disconnected /
     // failure) the parent re-queues the draft, so it is never lost.
     onForkSend(draft, showModeSelector ? effectiveModeId : null)
-    if (effectiveDraftStorageKey) {
-      clearMessageInputDraftV2(effectiveDraftStorageKey)
-    }
-    resetComposer()
+    clearSentComposer()
   }, [
-    interactionLocked,
+    mutationLocked,
     onForkSend,
     hasUploadingImage,
     tAttach,
     buildDraft,
     effectiveModeId,
     showModeSelector,
-    effectiveDraftStorageKey,
-    resetComposer,
+    clearSentComposer,
   ])
 
   // Mid-turn "insert into current turn" (native steering). Awaited, unlike
@@ -1502,9 +1552,9 @@ export function MessageInput({
                 option={option}
                 onLabel={t("toggleOn")}
                 offLabel={t("toggleOff")}
-                onSelect={(configId, value) =>
-                  onConfigOptionChange?.(configId, value)
-                }
+                onSelect={(configId, value) => {
+                  if (!mutationLocked) onConfigOptionChange?.(configId, value)
+                }}
               />
             )
           }
@@ -1518,7 +1568,7 @@ export function MessageInput({
                 key={option.id}
                 option={option}
                 groups={listGroups}
-                disabled={interactionLocked}
+                disabled={mutationLocked}
                 onSelect={(configId, valueId) =>
                   onConfigOptionChange?.(configId, valueId)
                 }
@@ -1530,7 +1580,7 @@ export function MessageInput({
               key={option.id}
               option={option}
               derivedGroups={deriveModelGroups(option)}
-              disabled={interactionLocked}
+              disabled={mutationLocked}
               onSelect={(configId, valueId) =>
                 onConfigOptionChange?.(configId, valueId)
               }
@@ -1543,7 +1593,7 @@ export function MessageInput({
           selectedModeId={effectiveModeId!}
           onSelect={handleModeSelect}
           label={t("modeLabel")}
-          disabled={interactionLocked}
+          disabled={mutationLocked}
         />
       )}
     </>
@@ -1636,7 +1686,7 @@ export function MessageInput({
           currentLabel: current?.name ?? kind.current_value,
           groups,
           onSelect: (value) => {
-            if (interactionLocked) return
+            if (mutationLocked) return
             onConfigOptionChange?.(option.id, value)
           },
           ...(searchable && {
@@ -1680,7 +1730,7 @@ export function MessageInput({
     showModeSelector,
     availableModes,
     effectiveModeId,
-    interactionLocked,
+    mutationLocked,
     onConfigOptionChange,
     handleModeSelect,
     t,
@@ -1767,13 +1817,26 @@ export function MessageInput({
         </DropdownMenu>
       </div>
     </div>
+  ) : stopButton && sendClearMode === "after-admission" ? (
+    <div className="flex items-center gap-1">
+      {stopButton}
+      <Button
+        onClick={handleSend}
+        disabled={sendAdmissionPending || !hasSendableContent}
+        size="icon"
+        className="h-8 w-8"
+        title={t("send")}
+      >
+        <Send className="size-4" />
+      </Button>
+    </div>
   ) : stopButton ? (
     stopButton
   ) : onForkSend ? (
     <div className="flex items-center">
       <Button
         onClick={handleSend}
-        disabled={disabled || !hasSendableContent}
+        disabled={disabled || sendAdmissionPending || !hasSendableContent}
         size="icon"
         className="h-8 w-8 rounded-r-none"
         title={t("send")}
@@ -1802,7 +1865,7 @@ export function MessageInput({
   ) : (
     <Button
       onClick={handleSend}
-      disabled={disabled || !hasSendableContent}
+      disabled={disabled || sendAdmissionPending || !hasSendableContent}
       size="icon"
       className="h-8 w-8"
       title={t("send")}
@@ -1950,6 +2013,7 @@ export function MessageInput({
                   <ComposerImageThumbnails
                     attachments={imageAttachments}
                     onRemove={attach.removeAttachment}
+                    removeDisabled={sendAdmissionPending}
                   />
                 }
               />
@@ -1977,7 +2041,7 @@ export function MessageInput({
               <div className="flex shrink-0 items-end justify-between gap-1 px-2 pb-2">
                 <div className="flex min-w-0 items-end gap-1">
                   <ComposerAddMenu
-                    disabled={disabled}
+                    disabled={disabled || sendAdmissionPending}
                     attachments={attach}
                     shortcuts={menuShortcuts}
                     slashCommands={slashCommands}
@@ -1997,9 +2061,13 @@ export function MessageInput({
                       )}
                     >
                       <Popover
-                        open={collapsedSelectorsOpen && !interactionLocked}
+                        open={
+                          collapsedSelectorsOpen &&
+                          !interactionLocked &&
+                          !sendAdmissionPending
+                        }
                         onOpenChange={(open) => {
-                          if (interactionLocked) {
+                          if (interactionLocked || sendAdmissionPending) {
                             setCollapsedSelectorsOpen(false)
                             return
                           }
@@ -2013,7 +2081,7 @@ export function MessageInput({
                             className="shrink-0"
                             title={t("agentSettings")}
                             aria-label={t("agentSettings")}
-                            disabled={interactionLocked}
+                            disabled={interactionLocked || sendAdmissionPending}
                           >
                             {agentType ? (
                               <AgentIcon

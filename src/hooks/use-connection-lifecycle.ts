@@ -103,6 +103,8 @@ export interface UseConnectionLifecycleReturn {
       onDelegateViewerOnly?: () => void
       /** Settles caller-owned optimistic state after any other send failure. */
       onSendFailed?: (error: unknown) => void
+      /** Called only after broker queue admission is authoritative. */
+      onPromptAdmitted?: (result: PromptEnqueueResult | null) => void
     }
   ) => Promise<PromptEnqueueResult | null>
   handleSetConfigOption: (configId: string, valueId: string) => void

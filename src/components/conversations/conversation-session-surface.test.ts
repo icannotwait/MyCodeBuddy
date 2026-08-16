@@ -5,6 +5,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import type { EventEnvelope } from "@/lib/types"
 import {
+  __connectionsReducerForTests,
+  type ConnectionState,
+} from "@/contexts/acp-connections-context"
+import type {
+  SharedActiveTurn,
+  SharedQueuedPrompt,
+} from "@/lib/snapshot-denormalize"
+import {
   shouldClearTerminalDisconnectLatch,
   shouldLatchTerminalDisconnect,
   type TerminalDisconnectLatch,
@@ -475,7 +483,11 @@ type CapturedShellProps = {
       displayText: string
     },
     modeId?: string | null
-  ) => void
+  ) => void | Promise<unknown>
+  onEnqueue?: (draft: unknown, modeId: string | null) => void
+  sendClearMode?: "immediate" | "after-admission"
+  sharedQueue?: SharedQueuedPrompt[]
+  onSharedQueueCancel?: (queueItemId: string) => Promise<void>
   onForkSend?: (
     draft: {
       blocks: Array<{ type: "text"; text: string }>
@@ -525,6 +537,16 @@ const lifecycleCapture = vi.hoisted(() => ({
   handleCancel: vi.fn(),
   handleRespondPermission: vi.fn(),
 }))
+
+type HarnessSharedSession = {
+  generation: number
+  leaseId: string
+  leaseExpiresAt: string
+  connectRequestId: string
+  phase: { phase: "ready" }
+  queue: SharedQueuedPrompt[]
+  activeTurn: SharedActiveTurn | null
+}
 
 const surfaceH = vi.hoisted(() => ({
   conversations: [] as Array<{
@@ -586,6 +608,13 @@ const surfaceH = vi.hoisted(() => ({
   /** Lifecycle mock conn.error (owner shell error path). */
   connError: null as string | null,
   queueItems: [] as QueueItem[],
+  enqueue: vi.fn(),
+  cancelQueuedPrompt: vi.fn(async () => undefined),
+  sharedSession: null as HarnessSharedSession | null,
+  providerConnections: new Map<string, ConnectionState>(),
+  reloadSignal: 0,
+  runtimeOptimisticTurns: [] as Array<{ id: string; role: "user" }>,
+  runtimeUserTurns: [] as Array<{ id: string; role: "user" }>,
   dequeueCalls: 0,
   shellProps: null as CapturedShellProps | null,
   messageListProps: null as CapturedMessageListProps | null,
@@ -656,6 +685,7 @@ vi.mock("@/hooks/use-connection-lifecycle", () => ({
         supportsFork: surfaceH.supportsFork,
         isDelegationChild: surfaceH.isDelegationChild,
         backgroundOutstanding: 0,
+        sharedSession: surfaceH.sharedSession,
       },
       modeLoading: false,
       configOptionsLoading: false,
@@ -679,29 +709,35 @@ vi.mock("@/hooks/use-delegate-access", () => ({
   }),
 }))
 
-vi.mock("@/contexts/acp-connections-context", () => ({
-  getCachedSelectors: () => null,
-  useAcpActions: () => ({
-    registerLiveSinks: () => () => undefined,
-    setActiveKey: vi.fn(),
-    touchActivity: vi.fn(),
-  }),
-  useAcpEvent: (handler: (e: EventEnvelope) => void) => {
-    surfaceH.acpEventHandlers.push(handler)
-  },
-  // Stable API; getConnection reads mutable currentConnectionId at call time
-  // (models production: map updated before notifyRawSubscribers).
-  useConnectionStore: () => ({
-    getConnection: (key: string) => {
-      if (key !== "tab-1") return undefined
-      if (surfaceH.currentConnectionId == null) return undefined
-      return { connectionId: surfaceH.currentConnectionId }
+vi.mock("@/contexts/acp-connections-context", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("@/contexts/acp-connections-context")>()
+  return {
+    ...actual,
+    getCachedSelectors: () => null,
+    useAcpActions: () => ({
+      registerLiveSinks: () => () => undefined,
+      setActiveKey: vi.fn(),
+      touchActivity: vi.fn(),
+      cancelQueuedPrompt: surfaceH.cancelQueuedPrompt,
+    }),
+    useAcpEvent: (handler: (e: EventEnvelope) => void) => {
+      surfaceH.acpEventHandlers.push(handler)
     },
-    getActiveKey: () => null,
-    subscribeKey: () => () => undefined,
-    subscribeActiveKey: () => () => undefined,
-  }),
-}))
+    // Stable API; getConnection reads mutable currentConnectionId at call time
+    // (models production: map updated before notifyRawSubscribers).
+    useConnectionStore: () => ({
+      getConnection: (key: string) => {
+        if (key !== "tab-1") return undefined
+        if (surfaceH.currentConnectionId == null) return undefined
+        return { connectionId: surfaceH.currentConnectionId }
+      },
+      getActiveKey: () => null,
+      subscribeKey: () => () => undefined,
+      subscribeActiveKey: () => () => undefined,
+    }),
+  }
+})
 
 vi.mock("@/hooks/use-acp-agents", () => ({
   useAcpAgents: () => ({
@@ -789,7 +825,7 @@ vi.mock("@/hooks/use-message-queue", () => ({
     get queue() {
       return surfaceH.queueItems
     },
-    enqueue: vi.fn(
+    enqueue: surfaceH.enqueue.mockImplementation(
       (draft: QueueItem["draft"], modeId: string | null = null): QueueItem => {
         const item: QueueItem = {
           id: `q-${surfaceH.queueItems.length + 1}`,
@@ -839,9 +875,21 @@ vi.mock("@/hooks/use-conversation-detail", () => ({
 vi.mock("@/stores/conversation-runtime-store", () => ({
   completeLiveTranscriptTurn: vi.fn(),
   useConversationRuntimeActions: () => ({
-    appendOptimisticTurn: vi.fn(),
+    appendOptimisticTurn: (
+      _conversationId: number,
+      turn: { id: string; role: "user" }
+    ) => {
+      surfaceH.runtimeOptimisticTurns.push(turn)
+    },
     removeOptimisticTurn: surfaceH.removeOptimisticTurn,
-    appendViewerUserTurn: vi.fn(),
+    appendViewerUserTurn: (
+      _conversationId: number,
+      turn: { id: string; role: "user" }
+    ) => {
+      if (!surfaceH.runtimeUserTurns.some((item) => item.id === turn.id)) {
+        surfaceH.runtimeUserTurns.push(turn)
+      }
+    },
     refetchDetail: surfaceH.refetchDetail,
     reloadDetail: surfaceH.reloadDetail,
     syncTurnMetadata: vi.fn(() => () => undefined),
@@ -920,6 +968,10 @@ vi.mock("@/components/chat/conversation-shell", () => ({
       error: props.error ?? null,
       topBanner: props.topBanner,
       onSend: props.onSend,
+      onEnqueue: props.onEnqueue,
+      sendClearMode: props.sendClearMode,
+      sharedQueue: props.sharedQueue,
+      onSharedQueueCancel: props.onSharedQueueCancel,
       onForkSend: props.onForkSend,
       draftRestore: props.draftRestore,
       queue: props.queue,
@@ -1073,6 +1125,135 @@ function directDraft(text = "direct-now") {
   }
 }
 
+function sharedQueued(
+  queueItemId: string,
+  enqueueSeq: number,
+  clientMessageId: string,
+  visibleText: string
+): SharedQueuedPrompt {
+  return {
+    queueItemId,
+    enqueueSeq,
+    clientMessageId,
+    visibleText,
+    visibleTextTruncated: false,
+    attachmentCount: 0,
+    submittedAt: "2026-08-16T00:00:00.000Z",
+    state: "queued",
+  }
+}
+
+function sharedTurn(
+  queueItemId: string,
+  clientMessageId: string
+): SharedActiveTurn {
+  return {
+    turnId: `turn-${queueItemId}`,
+    queueItemId,
+    enqueueSeq: Number(queueItemId.replace(/\D/g, "")) || 1,
+    clientMessageId,
+    stopRequested: false,
+  }
+}
+
+function mountSharedSurface(
+  options: {
+    conversationId?: number | null
+    queue?: SharedQueuedPrompt[]
+    status?: "connected" | "prompting"
+  } = {}
+) {
+  surfaceH.conversations =
+    options.conversationId === null
+      ? []
+      : [fullSummary(options.conversationId ?? 42, "in_progress")]
+  surfaceH.connStatus = options.status ?? "connected"
+  surfaceH.sharedSession = {
+    generation: 1,
+    leaseId: "lease-1",
+    leaseExpiresAt: "2026-08-16T00:05:00.000Z",
+    connectRequestId: "connect-1",
+    phase: { phase: "ready" },
+    queue: options.queue ?? [],
+    activeTurn: null,
+  }
+  surfaceH.providerConnections = new Map([
+    [
+      "tab-1",
+      { sharedSession: surfaceH.sharedSession } as unknown as ConnectionState,
+    ],
+  ])
+  return renderSurface(options.conversationId === null ? null : 42)
+}
+
+function mountSharedSurfaceWithQueue(queue: SharedQueuedPrompt[]) {
+  return mountSharedSurface({ queue })
+}
+
+async function sendDraft(text: string) {
+  await act(async () => {
+    await surfaceH.shellProps?.onSend?.(directDraft(text))
+  })
+}
+
+function emitAcp(event: EventEnvelope) {
+  act(() => {
+    for (const handler of surfaceH.acpEventHandlers) handler(event)
+  })
+}
+
+function emitShared(
+  view: ReturnType<typeof renderSurface>,
+  event:
+    | { type: "prompt_dispatch_started"; turn: SharedActiveTurn }
+    | { type: "shared_turn_settled"; turnId: string }
+) {
+  const shared = surfaceH.sharedSession
+  if (!shared) throw new Error("shared surface not mounted")
+  const envelope: EventEnvelope =
+    event.type === "prompt_dispatch_started"
+      ? {
+          seq: ++surfaceH.reloadSignal,
+          connection_id: CONN,
+          type: "prompt_dispatch_started",
+          generation: 1,
+          turn: {
+            turn_id: event.turn.turnId,
+            queue_item_id: event.turn.queueItemId,
+            enqueue_seq: event.turn.enqueueSeq,
+            client_message_id: event.turn.clientMessageId,
+            stop_requested: event.turn.stopRequested,
+          },
+        }
+      : {
+          seq: ++surfaceH.reloadSignal,
+          connection_id: CONN,
+          type: "shared_turn_settled",
+          generation: 1,
+          turn_id: event.turnId,
+          outcome: "cancelled",
+        }
+  surfaceH.providerConnections = __connectionsReducerForTests(
+    surfaceH.providerConnections,
+    {
+      type: "SHARED_SESSION_EVENT",
+      contextKey: "tab-1",
+      event: envelope,
+    } as never
+  )
+  surfaceH.sharedSession = surfaceH.providerConnections.get("tab-1")!
+    .sharedSession as HarnessSharedSession
+  for (const handler of surfaceH.acpEventHandlers) handler(envelope)
+  act(() => {
+    view.rerender(
+      createElement(ConversationSessionSurface, {
+        ...surfaceProps(42),
+        reloadSignal: surfaceH.reloadSignal,
+      })
+    )
+  })
+}
+
 function armTerminalDisconnect() {
   for (const handler of surfaceH.acpEventHandlers) {
     handler(errorEvent(CONN, true))
@@ -1085,6 +1266,8 @@ function resetSurfaceHarness() {
   lifecycleCapture.handleSend.mockClear()
   lifecycleCapture.handleCancel.mockClear()
   lifecycleCapture.handleSetConfigOption.mockClear()
+  lifecycleCapture.handleSend.mockReset()
+  lifecycleCapture.handleSend.mockResolvedValue(null)
   surfaceH.conversations = []
   surfaceH.acpEventHandlers = []
   surfaceH.connStatus = null
@@ -1103,7 +1286,14 @@ function resetSurfaceHarness() {
   surfaceH.delegateSyncError = null
   surfaceH.connError = null
   surfaceH.refreshDelegateAccess.mockClear()
-  surfaceH.removeOptimisticTurn.mockClear()
+  surfaceH.removeOptimisticTurn.mockReset()
+  surfaceH.removeOptimisticTurn.mockImplementation(
+    (_conversationId: number, turnId: string) => {
+      surfaceH.runtimeOptimisticTurns = surfaceH.runtimeOptimisticTurns.filter(
+        (turn) => turn.id !== turnId
+      )
+    }
+  )
   surfaceH.setSyncState.mockClear()
   surfaceH.requeueFront.mockClear()
   surfaceH.syncDelegateTerminalDetail.mockClear()
@@ -1111,6 +1301,14 @@ function resetSurfaceHarness() {
   surfaceH.reloadDetail.mockClear()
   surfaceH.runtimeExternalId = null
   surfaceH.queueItems = []
+  surfaceH.enqueue.mockReset()
+  surfaceH.cancelQueuedPrompt.mockReset()
+  surfaceH.cancelQueuedPrompt.mockResolvedValue(undefined)
+  surfaceH.sharedSession = null
+  surfaceH.providerConnections = new Map()
+  surfaceH.reloadSignal = 0
+  surfaceH.runtimeOptimisticTurns = []
+  surfaceH.runtimeUserTurns = []
   surfaceH.dequeueCalls = 0
   surfaceH.shellProps = null
   surfaceH.messageListProps = null
@@ -1119,6 +1317,154 @@ function resetSurfaceHarness() {
   surfaceH.supportsFork = false
   surfaceH.isDelegationChild = false
 }
+
+describe("ConversationSessionSurface authoritative shared queue", () => {
+  beforeEach(resetSurfaceHarness)
+  afterEach(cleanup)
+
+  it("removes optimistic history when admission is queued and keeps the authoritative queue", async () => {
+    const queue = [sharedQueued("q2", 2, "m2", "later")]
+    lifecycleCapture.handleSend.mockImplementation(
+      async (_draft, _mode, opts) => {
+        const result = {
+          queueItemId: "q2",
+          enqueueSeq: 2,
+          state: "queued" as const,
+        }
+        opts?.onPromptAdmitted?.(result)
+        return result
+      }
+    )
+    mountSharedSurfaceWithQueue(queue)
+
+    await sendDraft("later")
+
+    expect(surfaceH.runtimeOptimisticTurns).toHaveLength(0)
+    expect(surfaceH.shellProps?.sharedQueue).toEqual(queue)
+    expect(surfaceH.shellProps?.sendClearMode).toBe("after-admission")
+  })
+
+  it("dispatch-start plus user-message restores the exact queued message once", () => {
+    const view = mountSharedSurfaceWithQueue([
+      sharedQueued("q2", 2, "m2", "later"),
+    ])
+
+    emitShared(view, {
+      type: "prompt_dispatch_started",
+      turn: sharedTurn("q2", "m2"),
+    })
+    const message: EventEnvelope = {
+      seq: 2,
+      connection_id: CONN,
+      type: "user_message",
+      message_id: "m2",
+      blocks: [{ type: "text", text: "later" }],
+    }
+    emitAcp({ ...message, message_id: "other-message" })
+    expect(surfaceH.runtimeUserTurns).toHaveLength(0)
+    emitAcp(message)
+    emitAcp(message)
+
+    expect(
+      surfaceH.runtimeUserTurns.filter((runtimeTurn) => runtimeTurn.id === "m2")
+    ).toHaveLength(1)
+    expect(surfaceH.shellProps?.sharedQueue).toEqual([])
+  })
+
+  it("bypasses the editable local queue while a shared turn is prompting", async () => {
+    lifecycleCapture.handleSend.mockImplementation(async () => ({
+      queueItemId: "q2",
+      enqueueSeq: 2,
+      state: "queued" as const,
+    }))
+    mountSharedSurface({ status: "prompting" })
+
+    await sendDraft("queue on server")
+
+    expect(surfaceH.enqueue).not.toHaveBeenCalled()
+    expect(surfaceH.shellProps?.onEnqueue).toBeUndefined()
+    expect(lifecycleCapture.handleSend).toHaveBeenCalledTimes(1)
+    expect(lifecycleCapture.handleSend.mock.calls[0]?.[2]).toMatchObject({
+      onTurnInProgress: undefined,
+      onContinuationWaiting: undefined,
+    })
+  })
+
+  it("awaits first-conversation creation and backend admission as one promise", async () => {
+    let resolveCreate!: (id: number) => void
+    let resolveAdmission!: () => void
+    vi.mocked(createConversation).mockImplementation(
+      () => new Promise<number>((resolve) => (resolveCreate = resolve))
+    )
+    lifecycleCapture.handleSend.mockImplementation(
+      () => new Promise((resolve) => (resolveAdmission = () => resolve(null)))
+    )
+    mountSharedSurface({ conversationId: null })
+
+    let settled = false
+    let send!: Promise<void>
+    act(() => {
+      send = Promise.resolve(
+        surfaceH.shellProps?.onSend?.(directDraft("first shared message"))
+      ).then(() => {
+        settled = true
+      })
+    })
+    await act(async () => resolveCreate(99))
+    expect(settled).toBe(false)
+    expect(lifecycleCapture.handleSend).toHaveBeenCalledTimes(1)
+    expect(surfaceH.enqueue).not.toHaveBeenCalled()
+
+    await act(async () => {
+      resolveAdmission()
+      await send
+    })
+    expect(settled).toBe(true)
+  })
+
+  it("rolls back a rejected shared admission without requesting draft restore", async () => {
+    lifecycleCapture.handleSend.mockImplementation(
+      async (_draft, _mode, opts) => {
+        const error = new Error("admission failed")
+        opts?.onSendFailed?.(error)
+        throw error
+      }
+    )
+    mountSharedSurface()
+
+    await expect(sendDraft("keep draft")).rejects.toThrow("admission failed")
+
+    expect(surfaceH.runtimeOptimisticTurns).toHaveLength(0)
+    expect(surfaceH.shellProps?.draftRestore).toBeNull()
+  })
+
+  it("keeps queued tail visible after stop and removes only the next dispatched item", () => {
+    const q2 = sharedQueued("q2", 2, "m2", "second")
+    const q3 = sharedQueued("q3", 3, "m3", "third")
+    const view = mountSharedSurfaceWithQueue([q2, q3])
+    emitShared(view, {
+      type: "prompt_dispatch_started",
+      turn: sharedTurn("q1", "m1"),
+    })
+
+    emitShared(view, { type: "shared_turn_settled", turnId: "turn-q1" })
+    expect(surfaceH.shellProps?.sharedQueue).toEqual([q2, q3])
+
+    emitShared(view, {
+      type: "prompt_dispatch_started",
+      turn: sharedTurn("q2", "m2"),
+    })
+    expect(surfaceH.shellProps?.sharedQueue).toEqual([q3])
+  })
+
+  it("wires shared queue cancellation through the provider action", async () => {
+    mountSharedSurfaceWithQueue([sharedQueued("q2", 2, "m2", "later")])
+
+    await surfaceH.shellProps?.onSharedQueueCancel?.("q2")
+
+    expect(surfaceH.cancelQueuedPrompt).toHaveBeenCalledWith("tab-1", "q2")
+  })
+})
 
 function turnCompleteEndTurn(connectionId: string): EventEnvelope {
   return {

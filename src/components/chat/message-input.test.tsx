@@ -17,6 +17,10 @@ import type { RichComposerHandle } from "./composer/rich-composer"
 import { serializeDocToText } from "./composer/to-prompt-blocks"
 import { emitAttachFileToSession } from "@/lib/session-attachment-events"
 import { streamingPerfRecorder } from "@/lib/perf/streaming-perf-recorder"
+import {
+  loadMessageInputDraftV2,
+  saveMessageInputDraftV2,
+} from "@/lib/message-input-draft"
 
 // MessageInput holds its RichComposer handle internally and does not forward a
 // ref, so capture that handle through a partial mock that still renders the real
@@ -164,6 +168,149 @@ function renderInput(
     </NextIntlClientProvider>
   )
 }
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (error: Error) => void
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res
+    reject = rej
+  })
+  return { promise, resolve, reject }
+}
+
+async function mountedEditor(): Promise<Editor> {
+  await waitFor(
+    () => expect(composerHandle.current?.getEditor()).toBeTruthy(),
+    { timeout: 5000 }
+  )
+  const editor = composerHandle.current?.getEditor()
+  if (!editor) throw new Error("composer editor not mounted")
+  return editor
+}
+
+function submitEditor(editor: Editor) {
+  editor.view.dom.dispatchEvent(
+    new KeyboardEvent("keydown", {
+      bubbles: true,
+      cancelable: true,
+      key: "Enter",
+    })
+  )
+}
+
+describe("MessageInput admission-aware clearing", () => {
+  afterEach(() => {
+    cleanup()
+    composerHandle.current = null
+    localStorage.clear()
+    vi.restoreAllMocks()
+  })
+
+  it("retains and locks the draft until backend admission resolves", async () => {
+    const draftStorage = await import("@/lib/message-input-draft")
+    const clearDraft = vi.spyOn(draftStorage, "clearMessageInputDraftV2")
+    const admission = deferred<void>()
+    const onSend = vi.fn(() => admission.promise)
+    const storageKey = "shared-admission-success"
+    const { container } = renderInput({
+      onSend,
+      sendClearMode: "after-admission",
+      draftStorageKey: storageKey,
+    })
+    const editor = await mountedEditor()
+
+    act(() => editor.commands.insertContent("wait for admission"))
+    await waitFor(() =>
+      expect(loadMessageInputDraftV2(storageKey)).not.toBeNull()
+    )
+    act(() => submitEditor(editor))
+
+    expect(onSend).toHaveBeenCalledTimes(1)
+    expect(serializeDocToText(editor.state.doc)).toContain("wait for admission")
+    expect(editor.isEditable).toBe(false)
+    expect(screen.getByRole("button", { name: "Add" })).toBeDisabled()
+    expect(
+      container.querySelector<HTMLButtonElement>(
+        `button[title="${enMessages.Folder.chat.messageInput.send}"]`
+      )
+    ).toBeDisabled()
+
+    act(() => submitEditor(editor))
+    fireEvent.click(
+      container.querySelector<HTMLButtonElement>(
+        `button[title="${enMessages.Folder.chat.messageInput.send}"]`
+      )!
+    )
+    expect(onSend).toHaveBeenCalledTimes(1)
+
+    await act(async () => admission.resolve())
+    await waitFor(() =>
+      expect(serializeDocToText(editor.state.doc)).not.toContain(
+        "wait for admission"
+      )
+    )
+    expect(loadMessageInputDraftV2(storageKey)).toBeNull()
+    expect(clearDraft).toHaveBeenCalledTimes(1)
+  })
+
+  it("retains the complete draft and re-enables editing when admission rejects", async () => {
+    const admission = deferred<void>()
+    const onSend = vi.fn(() => admission.promise)
+    const storageKey = "shared-admission-failure"
+    renderInput({
+      onSend,
+      sendClearMode: "after-admission",
+      draftStorageKey: storageKey,
+      attachmentTabId: "tab-shared",
+    })
+    const editor = await mountedEditor()
+
+    act(() => {
+      editor.commands.insertContent("retry this ")
+      emitAttachFileToSession({
+        tabId: "tab-shared",
+        path: "/repo/context.ts",
+      })
+    })
+    await waitFor(() =>
+      expect(serializeDocToText(editor.state.doc)).toContain(
+        "[context.ts](file:///repo/context.ts)"
+      )
+    )
+    act(() => submitEditor(editor))
+    await act(async () => admission.reject(new Error("admission failed")))
+
+    expect(editor.isEditable).toBe(true)
+    expect(serializeDocToText(editor.state.doc)).toContain("retry this")
+    expect(serializeDocToText(editor.state.doc)).toContain(
+      "[context.ts](file:///repo/context.ts)"
+    )
+    expect(loadMessageInputDraftV2(storageKey)).not.toBeNull()
+  })
+
+  it("keeps immediate mode synchronous for local Tauri sends", async () => {
+    const admission = deferred<void>()
+    const onSend = vi.fn(() => admission.promise)
+    const storageKey = "local-immediate"
+    saveMessageInputDraftV2(storageKey, {
+      type: "doc",
+      content: [
+        { type: "paragraph", content: [{ type: "text", text: "old" }] },
+      ],
+    })
+    renderInput({ onSend, draftStorageKey: storageKey })
+    const editor = await mountedEditor()
+
+    act(() => editor.commands.insertContent("send now"))
+    act(() => submitEditor(editor))
+
+    expect(onSend).toHaveBeenCalledTimes(1)
+    expect(serializeDocToText(editor.state.doc)).not.toContain("send now")
+    expect(loadMessageInputDraftV2(storageKey)).toBeNull()
+    await act(async () => admission.resolve())
+  })
+})
 
 describe("MessageInput (RichComposer integration)", () => {
   afterEach(() => {

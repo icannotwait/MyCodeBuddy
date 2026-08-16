@@ -15,12 +15,14 @@ import type {
   AvailableCommandInfo,
 } from "@/lib/types"
 import type { QueuedMessage } from "@/hooks/use-message-queue"
+import type { SharedQueuedPrompt } from "@/lib/snapshot-denormalize"
 import {
   MessageInput,
   type ComposerInjectContent,
   type PromptDraftRestore,
 } from "@/components/chat/message-input"
 import { MessageQueueDisplay } from "@/components/chat/message-queue-display"
+import { SharedMessageQueueDisplay } from "@/components/chat/shared-message-queue-display"
 import { cn } from "@/lib/utils"
 
 interface ChatInputProps {
@@ -31,7 +33,11 @@ interface ChatInputProps {
   folderId?: number | null
   agentName?: string
   onFocus?: () => void
-  onSend: (draft: PromptDraft, modeId?: string | null) => void
+  onSend: (
+    draft: PromptDraft,
+    modeId?: string | null
+  ) => void | Promise<unknown>
+  sendClearMode?: "immediate" | "after-admission"
   onCancel: () => void
   modes?: SessionModeInfo[]
   configOptions?: SessionConfigOptionInfo[]
@@ -50,6 +56,8 @@ interface ChatInputProps {
    *  tab when tiled across multiple sessions; passed through to MessageInput. */
   showActiveFlow?: boolean
   queue?: QueuedMessage[]
+  sharedQueue?: SharedQueuedPrompt[]
+  onSharedQueueCancel?: (queueItemId: string) => Promise<void>
   onEnqueue?: (draft: PromptDraft, modeId: string | null) => void
   onQueueReorder?: (items: QueuedMessage[]) => void
   onQueueEdit?: (id: string) => void
@@ -115,6 +123,7 @@ export const ChatInput = memo(function ChatInput({
   agentName,
   onFocus,
   onSend,
+  sendClearMode = "immediate",
   onCancel,
   modes,
   configOptions,
@@ -131,6 +140,8 @@ export const ChatInput = memo(function ChatInput({
   isActive,
   showActiveFlow,
   queue,
+  sharedQueue,
+  onSharedQueueCancel,
   onEnqueue,
   onQueueReorder,
   onQueueEdit,
@@ -199,6 +210,12 @@ export const ChatInput = memo(function ChatInput({
         if (event.pointerType !== "mouse") event.stopPropagation()
       }}
     >
+      {sharedQueue && onSharedQueueCancel ? (
+        <SharedMessageQueueDisplay
+          queue={sharedQueue}
+          onCancel={onSharedQueueCancel}
+        />
+      ) : null}
       {queue &&
         queue.length > 0 &&
         onQueueReorder &&
@@ -229,6 +246,7 @@ export const ChatInput = memo(function ChatInput({
       ) : null}
       <MessageInput
         onSend={onSend}
+        sendClearMode={sendClearMode}
         promptCapabilities={promptCapabilities}
         onFocus={onFocus}
         defaultPath={defaultPath}

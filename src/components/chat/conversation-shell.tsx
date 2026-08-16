@@ -21,6 +21,7 @@ import type {
   ClaudeApiRetryState,
 } from "@/contexts/acp-connections-context"
 import type { QueuedMessage } from "@/hooks/use-message-queue"
+import type { SharedQueuedPrompt } from "@/lib/snapshot-denormalize"
 import { Loader2 } from "lucide-react"
 import { ChatInput } from "@/components/chat/chat-input"
 import type { PromptDraftRestore } from "@/components/chat/message-input"
@@ -45,7 +46,11 @@ interface ConversationShellProps {
   /** Awaiting-decision Grok `exit_plan_mode` approval. */
   pendingPlanApproval: PendingPlanApprovalState | null
   onFocus: () => void
-  onSend: (draft: PromptDraft, modeId?: string | null) => void
+  onSend: (
+    draft: PromptDraft,
+    modeId?: string | null
+  ) => void | Promise<unknown>
+  sendClearMode?: "immediate" | "after-admission"
   onCancel: () => void
   onRespondPermission: (requestId: string, optionId: string) => void
   onAnswerQuestion: (answer: string) => void
@@ -90,6 +95,8 @@ interface ConversationShellProps {
    *  active tab only). Threaded straight through to the composer. */
   showActiveFlow?: boolean
   queue?: QueuedMessage[]
+  sharedQueue?: SharedQueuedPrompt[]
+  onSharedQueueCancel?: (queueItemId: string) => Promise<void>
   onEnqueue?: (draft: PromptDraft, modeId: string | null) => void
   onQueueReorder?: (items: QueuedMessage[]) => void
   onQueueEdit?: (id: string) => void
@@ -143,6 +150,7 @@ export function ConversationShell({
   pendingPlanApproval,
   onFocus,
   onSend,
+  sendClearMode = "immediate",
   onCancel,
   onRespondPermission,
   onAnswerQuestion,
@@ -169,6 +177,8 @@ export function ConversationShell({
   isActive,
   showActiveFlow,
   queue,
+  sharedQueue,
+  onSharedQueueCancel,
   onEnqueue,
   onQueueReorder,
   onQueueEdit,
@@ -310,6 +320,7 @@ export function ConversationShell({
               agentName={agentName}
               onFocus={onFocus}
               onSend={onSend}
+              sendClearMode={sendClearMode}
               onCancel={onCancel}
               waitingForSubagents={waitingForSubagents}
               draftRestore={draftRestore}
@@ -329,6 +340,8 @@ export function ConversationShell({
               isActive={isActive}
               showActiveFlow={showActiveFlow}
               queue={queue}
+              sharedQueue={sharedQueue}
+              onSharedQueueCancel={onSharedQueueCancel}
               onEnqueue={onEnqueue}
               onQueueReorder={onQueueReorder}
               onQueueEdit={onQueueEdit}

@@ -902,6 +902,13 @@ export const ConversationSessionSurface = memo(
         conn.connectedWorkingDir,
         workingDirForConnection
       )
+    const promptAdmissionReady =
+      connectionReady ||
+      (conn.sharedSession != null &&
+        !connIsForOtherAgent &&
+        connStatus === "prompting" &&
+        (conn.connectedWorkingDir ?? null) ===
+          (workingDirForConnection ?? null))
     // Present "connecting" to the composer while connected-but-not-ready, so it
     // disables its send affordance instead of inviting a submit handleSend rejects.
     // While the live connection still belongs to a different agent, present the
@@ -1058,6 +1065,7 @@ export const ConversationSessionSurface = memo(
     }, [conn.waitingForSubagents])
 
     useEffect(() => {
+      if (conn.sharedSession) return
       if (connStatus !== "connected") return
       // Do not dequeue / auto-flush while a durable continuation owns this
       // conversation — waiting is independent of status/turn_in_flight.
@@ -1111,6 +1119,7 @@ export const ConversationSessionSurface = memo(
       conn.waitingForSubagents,
       interactionLocked,
       queuePausedByTerminalDisconnect,
+      conn.sharedSession,
     ])
 
     // Mirror the connection's liveMessage into the runtime session OUTSIDE React,
@@ -1147,6 +1156,16 @@ export const ConversationSessionSurface = memo(
       setLiveMessage,
     ])
 
+    const expectedSharedUserMessageIdRef = useRef<string | null>(
+      conn.sharedSession?.activeTurn?.clientMessageId ?? null
+    )
+    useEffect(() => {
+      const activeMessageId =
+        conn.sharedSession?.activeTurn?.clientMessageId ?? null
+      if (activeMessageId)
+        expectedSharedUserMessageIdRef.current = activeMessageId
+    }, [conn.sharedSession?.activeTurn?.clientMessageId])
+
     // Cross-client VIEWER (Bug 2): mirror the connection's in-flight user prompt
     // (from a snapshot's `pending_user_message`, captured when we attach
     // mid-turn) into the runtime as a synthesized user turn. The reducer
@@ -1157,11 +1176,22 @@ export const ConversationSessionSurface = memo(
     useEffect(() => {
       const pending = conn.pendingUserMessage
       if (!pending) return
+      if (
+        conn.sharedSession &&
+        pending.messageId !== expectedSharedUserMessageIdRef.current
+      ) {
+        return
+      }
       appendViewerUserTurn(
         effectiveConversationId,
         buildUserTurnFromMessageBlocks(pending.messageId, pending.blocks)
       )
-    }, [conn.pendingUserMessage, effectiveConversationId, appendViewerUserTurn])
+    }, [
+      conn.pendingUserMessage,
+      conn.sharedSession,
+      effectiveConversationId,
+      appendViewerUserTurn,
+    ])
 
     // Cross-client VIEWER (Bug 2): a `user_message` event for THIS connection
     // that arrives while we're attached. The owner added its user turn
@@ -1171,14 +1201,35 @@ export const ConversationSessionSurface = memo(
     useAcpEvent(
       useCallback(
         (envelope: EventEnvelope) => {
+          if (
+            envelope.type === "prompt_dispatch_started" &&
+            envelope.connection_id === conn.connectionId &&
+            conn.sharedSession &&
+            envelope.generation === conn.sharedSession.generation
+          ) {
+            expectedSharedUserMessageIdRef.current =
+              envelope.turn.client_message_id
+            return
+          }
           if (envelope.type !== "user_message") return
           if (envelope.connection_id !== conn.connectionId) return
+          if (
+            conn.sharedSession &&
+            envelope.message_id !== expectedSharedUserMessageIdRef.current
+          ) {
+            return
+          }
           appendViewerUserTurn(
             effectiveConversationId,
             buildUserTurnFromMessageBlocks(envelope.message_id, envelope.blocks)
           )
         },
-        [conn.connectionId, effectiveConversationId, appendViewerUserTurn]
+        [
+          conn.connectionId,
+          conn.sharedSession,
+          effectiveConversationId,
+          appendViewerUserTurn,
+        ]
       )
     )
 
@@ -1359,7 +1410,7 @@ export const ConversationSessionSurface = memo(
         // a queue exists it tail-enqueues instead of sending, and on a bounce it
         // re-queues at the TAIL.
         opts?: { fromQueueFlush?: boolean }
-      ) => {
+      ): void | Promise<unknown> => {
         // Access lock first — do not queue, clear draft, or build optimistic turns.
         if (interactionLocked) return
 
@@ -1380,7 +1431,7 @@ export const ConversationSessionSurface = memo(
         // `connStatus === "connected"` is not enough: a chat draft mid-reconnect can
         // read a stale "connected" for the old cwd, and an inline send then would
         // deliver to the wrong workspace. Same predicate the flush effect uses.
-        if (!connectionReady) return
+        if (!promptAdmissionReady) return
         // Advisory UI lock can race the backend gate — still refuse optimistic
         // mutation when the current snapshot already says waiting.
         if (conn.waitingForSubagents) return
@@ -1392,6 +1443,7 @@ export const ConversationSessionSurface = memo(
         // During terminal pause, direct sends bypass historical head so the user
         // can continue without draining stale queued drafts first.
         if (
+          !conn.sharedSession &&
           shouldQueueDirectSend(
             fromQueueFlush,
             mqGetQueueLength(),
@@ -1470,6 +1522,18 @@ export const ConversationSessionSurface = memo(
 
         const onSendFailed = () => {
           removeOptimisticTurn(effectiveConversationId, optimisticTurn.id)
+          if (conn.sharedSession) {
+            setSyncState(effectiveConversationId, "idle")
+          }
+        }
+
+        const onPromptAdmitted = (
+          result: import("@/lib/types").PromptEnqueueResult | null
+        ) => {
+          if (conn.sharedSession && result?.state === "queued") {
+            removeOptimisticTurn(effectiveConversationId, optimisticTurn.id)
+            setSyncState(effectiveConversationId, "idle")
+          }
         }
 
         // Pin the tab if it was a temporary preview (single-click opened)
@@ -1482,25 +1546,29 @@ export const ConversationSessionSurface = memo(
           // Existing-tab path: row already exists, send immediately with the
           // conversation_id pinned so the backend reuses our row instead of
           // creating a duplicate.
-          lifecycleSend(draft, selectedModeIdArg, {
+          return lifecycleSend(draft, selectedModeIdArg, {
             folderId,
             conversationId: persistedId,
             // The backend echoes this as the broadcast UserMessage's message_id,
             // so viewers' synthesized user turn dedups against our own optimistic
             // turn by exact id (and never suppresses a different sender's prompt).
             clientMessageId: optimisticTurn.id,
-            onTurnInProgress,
-            onContinuationWaiting,
+            onTurnInProgress: conn.sharedSession ? undefined : onTurnInProgress,
+            onContinuationWaiting: conn.sharedSession
+              ? undefined
+              : onContinuationWaiting,
             onSendFailed,
+            onPromptAdmitted,
             onDelegateViewerOnly: () =>
-              handleDelegateViewerOnlyRejection({
-                optimisticTurnId: optimisticTurn.id,
-                fromQueueFlush,
-                draft,
-                selectedModeIdArg,
-              }),
+              conn.sharedSession
+                ? onSendFailed()
+                : handleDelegateViewerOnlyRejection({
+                    optimisticTurnId: optimisticTurn.id,
+                    fromQueueFlush,
+                    draft,
+                    selectedModeIdArg,
+                  }),
           })
-          return
         }
 
         // New-tab path: create the DB row first, then send with the new id
@@ -1521,7 +1589,7 @@ export const ConversationSessionSurface = memo(
         const chatSend = sendOwnTab?.isChat === true
         const chatExistingDir = sendOwnTab?.workingDir
 
-        void (async () => {
+        const createAndSend = async () => {
           try {
             let newConversationId: number
             // The send's folderId defaults to the active folder; a chat send
@@ -1599,28 +1667,38 @@ export const ConversationSessionSurface = memo(
                 effectiveConversationId
               )
             }
-            clearMessageInputDraft(draftStorageKey)
+            if (!conn.sharedSession) clearMessageInputDraft(draftStorageKey)
             refreshConversations()
 
             // Now that the row exists, kick off the actual prompt with the
             // conversation_id pinned so the backend adopts our row instead of
             // creating a duplicate one.
-            lifecycleSend(draft, selectedModeIdArg, {
+            await lifecycleSend(draft, selectedModeIdArg, {
               folderId: sendFolderId,
               conversationId: newConversationId,
               clientMessageId: optimisticTurn.id,
-              onTurnInProgress,
-              onContinuationWaiting,
+              onTurnInProgress: conn.sharedSession
+                ? undefined
+                : onTurnInProgress,
+              onContinuationWaiting: conn.sharedSession
+                ? undefined
+                : onContinuationWaiting,
               onSendFailed,
+              onPromptAdmitted,
               onDelegateViewerOnly: () =>
-                handleDelegateViewerOnlyRejection({
-                  optimisticTurnId: optimisticTurn.id,
-                  fromQueueFlush,
-                  draft,
-                  selectedModeIdArg,
-                }),
+                conn.sharedSession
+                  ? onSendFailed()
+                  : handleDelegateViewerOnlyRejection({
+                      optimisticTurnId: optimisticTurn.id,
+                      fromQueueFlush,
+                      draft,
+                      selectedModeIdArg,
+                    }),
             })
           } catch (e) {
+            if (conn.sharedSession && dbConvIdRef.current != null) {
+              throw e
+            }
             console.error(
               "[ConversationSessionSurface] create conversation:",
               e
@@ -1638,16 +1716,20 @@ export const ConversationSessionSurface = memo(
             setSyncState(effectiveConversationId, "idle")
             setHasSentMessage(false)
             const draftText = draft.displayText.trim()
-            if (draftText) {
+            if (!conn.sharedSession && draftText) {
               saveMessageInputDraft(draftStorageKey, draftText)
             }
             if (mountedRef.current) {
               setAgentConnectError(tWelcome("createConversationFailed"))
             }
+            if (conn.sharedSession) throw e
           } finally {
             createConversationPendingRef.current = false
           }
-        })()
+        }
+        const pendingCreate = createAndSend()
+        if (conn.sharedSession) return pendingCreate
+        void pendingCreate
       },
       [
         appendOptimisticTurn,
@@ -1657,7 +1739,8 @@ export const ConversationSessionSurface = memo(
         mqGetQueueLength,
         bindConversationTab,
         canAutoConnect,
-        connectionReady,
+        promptAdmissionReady,
+        conn.sharedSession,
         conn.waitingForSubagents,
         draftStorageKey,
         effectiveConversationId,
@@ -1905,6 +1988,12 @@ export const ConversationSessionSurface = memo(
       if (interactionLocked) return
       lifecycleCancel()
     }, [interactionLocked, lifecycleCancel])
+
+    const handleSharedQueueCancel = useCallback(
+      (queueItemId: string) =>
+        acpActions.cancelQueuedPrompt(tabId, queueItemId),
+      [acpActions, tabId]
+    )
 
     const handleSetConfigOption = useCallback(
       (configId: string, valueId: string) => {
@@ -2368,6 +2457,7 @@ export const ConversationSessionSurface = memo(
         pendingPlanApproval={conn.pendingPlanApproval}
         onFocus={handleFocus}
         onSend={handleSend}
+        sendClearMode={conn.sharedSession ? "after-admission" : "immediate"}
         onCancel={handleCancel}
         onRespondPermission={handleRespondPermission}
         onAnswerQuestion={handleAnswerQuestion}
@@ -2398,11 +2488,15 @@ export const ConversationSessionSurface = memo(
         feedbackAddDisabled={!feedback.canSubmit}
         isActive={isActive}
         showActiveFlow={showActiveFlow}
-        queue={msgQueue}
-        onEnqueue={mqEnqueue}
-        onQueueReorder={mqReorder}
-        onQueueEdit={handleQueueEdit}
-        onQueueDelete={mqRemove}
+        queue={conn.sharedSession ? undefined : msgQueue}
+        sharedQueue={conn.sharedSession?.queue}
+        onSharedQueueCancel={
+          conn.sharedSession ? handleSharedQueueCancel : undefined
+        }
+        onEnqueue={conn.sharedSession ? undefined : mqEnqueue}
+        onQueueReorder={conn.sharedSession ? undefined : mqReorder}
+        onQueueEdit={conn.sharedSession ? undefined : handleQueueEdit}
+        onQueueDelete={conn.sharedSession ? undefined : mqRemove}
         editingItemId={mqEditingItemId}
         editingDraftText={editingQueueDraftText}
         editingDraftBlocks={editingQueueDraftBlocks}

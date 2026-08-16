@@ -1882,10 +1882,8 @@ function reduceSingleAction(
           const turn = action.event.turn
           nextShared = {
             ...shared,
-            queue: shared.queue.map((item) =>
-              item.queueItemId === turn.queue_item_id
-                ? { ...item, state: "dispatching" }
-                : item
+            queue: shared.queue.filter(
+              (item) => item.queueItemId !== turn.queue_item_id
             ),
             activeTurn: sharedTurnFromWire(turn),
           }
@@ -1896,9 +1894,6 @@ function reduceSingleAction(
           nextShared = {
             ...shared,
             activeTurn: null,
-            queue: shared.queue.filter(
-              (item) => item.queueItemId !== shared.activeTurn?.queueItemId
-            ),
           }
           break
         case "prompt_queue_depth_changed":
