@@ -515,6 +515,97 @@ describe("Skill contract v2", () => {
     })
   }
 
+  for (const [name, prose] of [
+    [
+      "normal Task Agent implementation",
+      "The Task Agent implements every normal Task.",
+    ],
+    [
+      "high auxiliary review route",
+      "Route every high Task auxiliary review to the Task Agent.",
+    ],
+    [
+      "once-complete boundary",
+      "Switch the Task Agent once the current Task completes.",
+    ],
+    [
+      "following-completion boundary",
+      "Switch the Task Agent following completion of the current Task.",
+    ],
+    [
+      "mandatory primary review",
+      "Primary review is mandatory rather than optional.",
+    ],
+    [
+      "required non-omittable primary review",
+      "Primary review is required and cannot be omitted.",
+    ],
+    [
+      "semicolon-separated optional document review",
+      "Primary review is required; user-named Design reviewers are optional.",
+    ],
+    [
+      "completion-before-current-Task boundary",
+      "Switch the Task Agent after completion of the current Task.",
+    ],
+    [
+      "once-finished boundary",
+      "Switch the Task Agent once the current Task finishes.",
+    ],
+    [
+      "normal implementation and high auxiliary review",
+      "The Task Agent implements normal Tasks and reviews high Tasks implemented by Codex.",
+    ],
+  ]) {
+    it(`round-3 accepts ${name}`, () => {
+      assert.deepEqual(validateSkillMarkdown(`${skill}\n${prose}`).failures, [])
+    })
+  }
+
+  for (const [name, prose] of [
+    [
+      "parent and Plan Author co-ownership",
+      "The parent and the Plan Author revise the Plan.",
+    ],
+    [
+      "parent revision after delegation",
+      "The parent directs the Plan Author and then revises the Plan.",
+    ],
+    [
+      "Task Agent route after Codex exclusion",
+      "Route high Tasks not to Codex but to the Task Agent.",
+    ],
+    [
+      "Task Agent implementation after Codex exclusion",
+      "High Tasks are not implemented by Codex but by the Task Agent.",
+    ],
+    [
+      "active switch with later completion timing",
+      "Switch the Task Agent during the current Task and after the current Task completes.",
+    ],
+    [
+      "optional document reviewer replacement",
+      "Optional user-named Design reviewers replace the Codex reviewer.",
+    ],
+    [
+      "semicolon-separated auxiliary bypass",
+      "Never skip primary review; skip auxiliary review after a high Task fix.",
+    ],
+    [
+      "high implementation despite Codex review",
+      "The Task Agent implements work reviewed by Codex for high Tasks.",
+    ],
+    ["joint high route", "Route high Tasks to Codex and to the Task Agent."],
+    [
+      "high review and implementation co-ownership",
+      "The Task Agent reviews high Tasks and implements them.",
+    ],
+  ]) {
+    it(`round-3 rejects ${name}`, () => {
+      has(validateSkillMarkdown(`${skill}\n${prose}`).failures, "B2D-SKILL-005")
+    })
+  }
+
   it("contains the complete operational policy and document JSON shapes", () => {
     const policy = fencedJsonAfterHeading(
       realSkill,
