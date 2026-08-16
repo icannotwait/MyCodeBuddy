@@ -961,6 +961,10 @@ const TASK_STATE_CARRIED_ADJUNCT_STARTS = new Set([
   "upon",
   "when",
 ])
+const TASK_REACTIVATION_NEGATION_BOUNDARIES = new Set([
+  ...TASK_STATE_CLAUSE_BOUNDARIES,
+  ...TASK_STATE_CARRIED_ADJUNCT_STARTS,
+])
 const TASK_STATE_SUBJECT_DETERMINERS = new Set([
   "a",
   "an",
@@ -975,12 +979,18 @@ const TASK_DIRECT_OBJECT_QUALIFIERS = new Set([
   ...EXPLICIT_TASK_ACTIVITY_TERMS,
   "current",
   "its",
+  "our",
   "own",
+  "that",
+  "their",
+  "your",
 ])
 const TASK_ANTECEDENT_NON_OBJECT_LINKS = new Set([
   ...PEOPLE_ANTECEDENT_LINKS,
   "about",
+  "near",
   "of",
+  "on",
   "regarding",
 ])
 const TASK_STATE_ADJUNCT_NON_SUBJECT_TERMS = new Set([
@@ -1946,15 +1956,19 @@ function peopleRelationIntroduces(
   return behalfLink !== undefined && targetPrefixIsBounded(behalfLink + 3)
 }
 
-function actionIsNegated(tokens, actionIndex) {
-  const coordinator = tokenIndexes(
+function actionIsNegated(
+  tokens,
+  actionIndex,
+  scopeBoundaries = CLAUSE_COORDINATORS
+) {
+  const scopeBoundary = tokenIndexes(
     tokens,
-    CLAUSE_COORDINATORS,
+    scopeBoundaries,
     Math.max(0, actionIndex - 6),
     actionIndex
   ).at(-1)
   const prefix = tokens.slice(
-    Math.max(0, actionIndex - 6, (coordinator ?? -1) + 1),
+    Math.max(0, actionIndex - 6, (scopeBoundary ?? -1) + 1),
     actionIndex
   )
   return (
@@ -3896,14 +3910,6 @@ function taskMentionIsDirectAntecedentObject(
   subjectHeadIndex,
   segmentEnd
 ) {
-  const trailing = clause.tokens.slice(task.index + 1, segmentEnd)
-  if (
-    !trailing.every(
-      (token) => TASK_STATE_MODIFIERS.has(token) || token.endsWith("ly")
-    )
-  ) {
-    return false
-  }
   let objectStart = task.index
   while (objectStart > subjectHeadIndex + 1) {
     const qualifier = clause.tokens[objectStart - 1]
@@ -3915,7 +3921,16 @@ function taskMentionIsDirectAntecedentObject(
     }
     objectStart -= 1
   }
-  return !TASK_ANTECEDENT_NON_OBJECT_LINKS.has(clause.tokens[objectStart - 1])
+  if (TASK_ANTECEDENT_NON_OBJECT_LINKS.has(clause.tokens[objectStart - 1])) {
+    return false
+  }
+  const trailingHead = clause.tokens
+    .slice(task.index + 1, segmentEnd)
+    .find((token) => !TASK_STATE_MODIFIERS.has(token) && !token.endsWith("ly"))
+  return (
+    trailingHead === undefined ||
+    TASK_ANTECEDENT_NON_OBJECT_LINKS.has(trailingHead)
+  )
 }
 
 function previousSegmentHasExplicitNonTaskAntecedent(clause, start) {
@@ -4013,7 +4028,11 @@ function taskMentionIsAffirmativeDirectReactivationObject(
 ) {
   if (
     !TASK_REACTIVATION_PREDICATES.has(clause.tokens[predicate]) ||
-    actionIsNegated(clause.tokens, predicate)
+    actionIsNegated(
+      clause.tokens,
+      predicate,
+      TASK_REACTIVATION_NEGATION_BOUNDARIES
+    )
   ) {
     return false
   }

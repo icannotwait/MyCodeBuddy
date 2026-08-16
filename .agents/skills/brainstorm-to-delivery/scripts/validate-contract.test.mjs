@@ -5099,6 +5099,55 @@ describe("Skill contract v2", () => {
     ])
   })
 
+  it("round-21 preserves direct Task objects across trailing adjuncts", () => {
+    assertSkillClassifications([
+      {
+        prose:
+          "The Task is completed but a separate service monitors the Task for diagnostics and the server restarts it and it is still running. Then switch the Task Agent.",
+        reject: true,
+      },
+      ...[
+        "near the Task fails",
+        "reports on the Task",
+        "starts a Task worker",
+        "monitors the Task log",
+        "for the Task fails",
+      ].map((relation) => ({
+        prose: `The Task is completed but a separate service ${relation} and the server restarts it and it is still running. Then switch the Task Agent.`,
+        reject: false,
+      })),
+      ...["monitors the Task", "restarts the Task"].map((relation) => ({
+        prose: `The Task is completed but a separate service ${relation} and the server restarts it and it is still running. Then switch the Task Agent.`,
+        reject: true,
+      })),
+    ])
+  })
+
+  it("round-21 recognizes qualified direct parenthetical Task objects", () => {
+    assertSkillClassifications([
+      ...["their", "our", "your", "that", "the"].map((qualifier) => ({
+        prose: `The active Task is completed but the server, restarting ${qualifier} Task, restarts and it is still running. Then switch the Task Agent.`,
+        reject: true,
+      })),
+    ])
+  })
+
+  it("round-21 binds parenthetical negation to the reactivation predicate", () => {
+    assertSkillClassifications([
+      {
+        prose:
+          "The active Task is completed but the server, not idling before restarting the Task, restarts and it is still running. Then switch the Task Agent.",
+        reject: true,
+      },
+      ...["not restarting the Task", "without restarting the Task"].map(
+        (parenthetical) => ({
+          prose: `The active Task is completed but the server, ${parenthetical}, restarts and it is still running. Then switch the Task Agent.`,
+          reject: false,
+        })
+      ),
+    ])
+  })
+
   it("contains the complete operational policy and document JSON shapes", () => {
     const policy = fencedJsonAfterHeading(
       realSkill,
