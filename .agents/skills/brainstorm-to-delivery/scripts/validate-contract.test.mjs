@@ -2189,6 +2189,357 @@ describe("Skill contract v2", () => {
     ])
   })
 
+  it("round-13 primary 1 binds sequential passive implementers", () => {
+    assertSkillClassifications([
+      {
+        prose: "High Tasks are implemented by Codex, then by Grok.",
+        reject: true,
+      },
+      {
+        prose: "High Tasks are implemented by Codex, subsequently by Grok.",
+        reject: true,
+      },
+      {
+        prose:
+          "High Tasks are implemented first by Codex, then reviewed by the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "High Tasks are implemented first by Codex, then approved by Gemini.",
+        reject: false,
+      },
+    ])
+  })
+
+  it("round-13 primary 2 carries a Task subject across completion modifiers", () => {
+    assertSkillClassifications([
+      {
+        prose:
+          "The current Task is running. When finally complete, change the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The current Task is running. Once already complete, change the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The current Task is running. When review is finally complete, change the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The current Task is running. Once testing is already complete, change the Task Agent.",
+        reject: true,
+      },
+    ])
+  })
+
+  it("round-13 primary 3 keeps unrelated take-role objects local", () => {
+    assertSkillClassifications([
+      {
+        prose:
+          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of observers.",
+        reject: false,
+      },
+      {
+        prose:
+          "The Codex reviewer is mandatory. Optional Design reviewers take the role of note takers.",
+        reject: false,
+      },
+      {
+        prose:
+          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of that reviewer.",
+        reject: true,
+      },
+      {
+        prose:
+          "The Codex reviewer is mandatory. Optional Design reviewers take the role of this required reviewer.",
+        reject: true,
+      },
+    ])
+  })
+
+  it("round-13 primary 4 resets alternatives at positive subordinate clauses", () => {
+    assertSkillClassifications([
+      {
+        prose:
+          "High Tasks are implemented by Codex rather than by Grok, while Gemini also implements them.",
+        reject: true,
+      },
+      {
+        prose:
+          "High Tasks are implemented by Codex rather than by Grok, although Gemini also implements them.",
+        reject: true,
+      },
+      {
+        prose:
+          "High Tasks are implemented by Codex rather than by Grok, while Gemini does not implement them.",
+        reject: false,
+      },
+      {
+        prose:
+          "High Tasks are implemented by Codex rather than by Grok, although Gemini remains available.",
+        reject: false,
+      },
+      {
+        prose:
+          "High Tasks are implemented by Codex rather than by Grok, whereas Gemini also implements them.",
+        reject: true,
+      },
+      {
+        prose:
+          "High Tasks are implemented by Codex rather than by Grok, whereas Gemini remains available.",
+        reject: false,
+      },
+    ])
+  })
+
+  it("round-13 primary 5 prefers a predicate's plural document object", () => {
+    assertSkillClassifications([
+      {
+        prose:
+          "The developers list the Plan and Design. The parent updates them.",
+        reject: true,
+      },
+      {
+        prose:
+          "The reviewers list the Plan and Design. The parent revises them.",
+        reject: true,
+      },
+      {
+        prose:
+          "The developers list the Plan and Design. The parent updates the developers.",
+        reject: false,
+      },
+      {
+        prose:
+          "The reviewers list the Plan and Design. The parent revises the documents.",
+        reject: true,
+      },
+    ])
+  })
+
+  it("round-13 primary 6 binds exclusivity to its temporal complement", () => {
+    assertSkillClassifications([
+      {
+        prose:
+          "High Tasks are reviewed by Codex exclusively after implementation. The Task Agent provides the auxiliary review.",
+        reject: false,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex exclusively after testing. The Task Agent provides the auxiliary review.",
+        reject: false,
+      },
+      {
+        prose:
+          "High Tasks are reviewed exclusively by Codex after implementation. The Task Agent provides the auxiliary review.",
+        reject: true,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex only after testing. The Task Agent provides the auxiliary review.",
+        reject: false,
+      },
+    ])
+  })
+
+  it("round-13 primary 7 keeps embedded missing evidence off the reviewer", () => {
+    assertSkillClassifications([
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is aware input is missing.",
+        reject: false,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is told evidence is missing.",
+        reject: false,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is still missing.",
+        reject: true,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is definitely not missing.",
+        reject: false,
+      },
+    ])
+  })
+
+  it("round-13 auxiliary 1 follows sequential passive actor ellipsis", () => {
+    assertSkillClassifications([
+      {
+        prose: "High Tasks are implemented first by Codex, then by Gemini.",
+        reject: true,
+      },
+      {
+        prose:
+          "Normal Tasks are implemented first by Gemini, then reviewed by Codex.",
+        reject: false,
+      },
+      {
+        prose:
+          "High Tasks are implemented first by Codex, then checked by Gemini.",
+        reject: false,
+      },
+    ])
+  })
+
+  it("round-13 auxiliary 2 rejects completion of a Task review", () => {
+    assertSkillClassifications([
+      {
+        prose:
+          "The current Task is running. After completion of the active Task review, switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The current Task is running. After completion of the active Task, review it and switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The current Task is running. After completion of the review for the active Task, switch the Task Agent.",
+        reject: true,
+      },
+    ])
+  })
+
+  it("round-13 auxiliary 3 resolves mixed plural subject and object roles", () => {
+    assertSkillClassifications([
+      {
+        prose:
+          "The reviewers list the Plan and Design. The parent updates them.",
+        reject: true,
+      },
+      {
+        prose:
+          "The reviewers list the Plan and Design. The parent updates the reviewers.",
+        reject: false,
+      },
+      {
+        prose:
+          "The reviewers list the Plan and Design. The parent updates the documents.",
+        reject: true,
+      },
+    ])
+  })
+
+  it("round-13 review preserves take-role pronoun antecedents", () => {
+    assertSkillClassifications([
+      {
+        prose:
+          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the former.",
+        reject: true,
+      },
+      {
+        prose:
+          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of observers.",
+        reject: false,
+      },
+    ])
+  })
+
+  it("round-13 review distinguishes Task components from following actions", () => {
+    assertSkillClassifications([
+      {
+        prose:
+          "The current Task is running. After completion of the active Task, review the report and switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The current Task is running. After completion of the active Task review, switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The current Task is running. When supply is complete, switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The current Task is running. When finally complete, switch the Task Agent.",
+        reject: false,
+      },
+    ])
+  })
+
+  it("round-13 review accepts ordinary reviewer-absence modifiers", () => {
+    assertSkillClassifications([
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is now missing.",
+        reject: true,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is again missing.",
+        reject: true,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is aware evidence is now missing.",
+        reject: false,
+      },
+    ])
+  })
+
+  it("round-13 review carries sequential passive relation fillers", () => {
+    assertSkillClassifications([
+      {
+        prose: "High Tasks are implemented by Codex, then also by Gemini.",
+        reject: true,
+      },
+      {
+        prose:
+          "High Tasks are implemented by Codex, then also approved by Gemini.",
+        reject: false,
+      },
+    ])
+  })
+
+  it("round-13 review resolves transitive plural document objects", () => {
+    assertSkillClassifications([
+      {
+        prose:
+          "The reviewers revise the Plan and Design. The parent updates them.",
+        reject: true,
+      },
+      {
+        prose:
+          "The developers edit the Plan and Design. The parent revises them.",
+        reject: true,
+      },
+      {
+        prose:
+          "The reviewers discuss the Plan and Design. The parent updates them with assignments.",
+        reject: false,
+      },
+    ])
+  })
+
+  it("round-13 review carries modifiers into temporal exclusivity complements", () => {
+    assertSkillClassifications([
+      {
+        prose:
+          "High Tasks are reviewed by Codex exclusively immediately after implementation. The Task Agent provides the auxiliary review.",
+        reject: false,
+      },
+      {
+        prose:
+          "High Tasks are reviewed exclusively immediately by Codex after implementation. The Task Agent provides the auxiliary review.",
+        reject: true,
+      },
+    ])
+  })
+
   it("contains the complete operational policy and document JSON shapes", () => {
     const policy = fencedJsonAfterHeading(
       realSkill,

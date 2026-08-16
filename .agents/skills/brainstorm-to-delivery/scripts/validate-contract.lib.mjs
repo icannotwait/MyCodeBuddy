@@ -468,6 +468,13 @@ const ANTECEDENT_PREDICATES = new Set([
   "listing",
   "lists",
 ])
+const DOCUMENT_OBJECT_ANTECEDENT_PREDICATES = new Set([
+  ...PRODUCTION_ACTIONS,
+  "list",
+  "listed",
+  "listing",
+  "lists",
+])
 const NEGATION_TERMS = new Set([
   "avoid",
   "avoided",
@@ -512,6 +519,7 @@ const POSTPOSED_REVIEW_ABSENCE_TERMS = new Set([
   "missing",
   "omitted",
 ])
+const POSTPOSED_REVIEW_ABSENCE_MODIFIERS = new Set(["again", "now", "still"])
 const ACTOR_LINKS = new Set(["by", "to"])
 const NESTED_ACTOR_PREFIX_LINKS = new Set([
   "after",
@@ -524,6 +532,7 @@ const NESTED_ACTOR_PREFIX_LINKS = new Set([
 ])
 const ACTOR_RELATION_BOUNDARIES = new Set([
   "after",
+  "although",
   "before",
   "during",
   "if",
@@ -531,11 +540,23 @@ const ACTOR_RELATION_BOUNDARIES = new Set([
   "unless",
   "upon",
   "when",
+  "whereas",
   "while",
 ])
 const CLAUSE_COORDINATORS = new Set(["and", "but", "while", "yet"])
 const PREDICATE_COORDINATORS = new Set(["and", "but"])
-const ALTERNATIVE_RESET_COORDINATORS = new Set(["but", "yet"])
+const ALTERNATIVE_RESET_COORDINATORS = new Set([
+  "although",
+  "but",
+  "whereas",
+  "while",
+  "yet",
+])
+const SEQUENTIAL_PASSIVE_RELATION_FILLERS = new Set([
+  "also",
+  "subsequently",
+  "then",
+])
 const TASK_RELATION_BOUNDARIES = new Set([...CLAUSE_COORDINATORS, "or"])
 const HIGH_TASK_SCOPES = new Set(["high", "high-risk"])
 const NORMAL_TASK_SCOPES = new Set(["normal"])
@@ -568,6 +589,7 @@ const TASK_COMPLETION_BRIDGE_TERMS = new Set([
   "being",
   "can",
   "could",
+  "finally",
   "had",
   "has",
   "have",
@@ -580,6 +602,22 @@ const TASK_COMPLETION_BRIDGE_TERMS = new Set([
   "were",
   "will",
   "would",
+])
+const TASK_COMPONENT_SUFFIX_TERMS = new Set([
+  "review",
+  "reviews",
+  "test",
+  "testing",
+  "validation",
+])
+const TASK_COMPONENT_ACTION_OBJECT_PREFIXES = new Set([
+  "a",
+  "an",
+  "it",
+  "that",
+  "the",
+  "them",
+  "this",
 ])
 const ACTIVE_TIMING_MARKERS = new Set(["during", "inside", "while"])
 const BOUNDARY_TIMING_MARKERS = new Set([
@@ -673,7 +711,15 @@ const REVIEW_ACTOR_TAIL_TERMS = new Set([
   "slot",
   "the",
 ])
-const QUANTIFIER_COMPLEMENT_LINKS = new Set(["about", "for", "on", "regarding"])
+const QUANTIFIER_COMPLEMENT_LINKS = new Set([
+  "about",
+  "for",
+  "regarding",
+  ...ACTIVE_TIMING_MARKERS,
+  ...BOUNDARY_TIMING_MARKERS,
+  ...PRE_COMPLETION_TIMING_MARKERS,
+])
+const QUANTIFIER_COMPLEMENT_MODIFIERS = new Set(["directly", "immediately"])
 const REVIEW_SUBJECT_LINKS = new Set([
   "although",
   "am",
@@ -1292,10 +1338,16 @@ function directivePronounAntecedent(tokens) {
         )
 
   const pluralDocuments = mentionsPluralGroup(tokens, documentObjects)
-  const pluralPeople =
-    mentionsPluralGroup(tokens, peopleSubjects) ||
-    mentionsPluralGroup(tokens, peopleRecipients)
-  if (pluralPeople) return "people"
+  const pluralPeopleSubjects = mentionsPluralGroup(tokens, peopleSubjects)
+  const pluralPeopleRecipients = mentionsPluralGroup(tokens, peopleRecipients)
+  if (pluralPeopleRecipients) return "people"
+  if (
+    pluralDocuments &&
+    DOCUMENT_OBJECT_ANTECEDENT_PREDICATES.has(tokens[predicate])
+  ) {
+    return "document"
+  }
+  if (pluralPeopleSubjects) return "people"
   if (pluralDocuments) return "document"
   return null
 }
@@ -1621,6 +1673,7 @@ function directPassiveActorsForAction(clause, action) {
         .filter((actor) => actor.start > previousLink && actor.end <= link)
         .at(-1)
       const relationStart = previousActor?.end ?? previousLink + 1
+      const relationTokens = clause.tokens.slice(relationStart, link)
       const continuesRelation =
         tokenIndex(
           clause.tokens,
@@ -1630,7 +1683,12 @@ function directPassiveActorsForAction(clause, action) {
         ) >= 0 ||
         phraseIndex(clause.tokens, ["rather", "than"], relationStart, link) >=
           0 ||
-        phraseIndex(clause.tokens, ["instead", "of"], relationStart, link) >= 0
+        phraseIndex(clause.tokens, ["instead", "of"], relationStart, link) >=
+          0 ||
+        (relationTokens.length > 0 &&
+          relationTokens.every((token) =>
+            SEQUENTIAL_PASSIVE_RELATION_FILLERS.has(token)
+          ))
       if (!continuesRelation) continue
     }
     actors.push(
@@ -2235,6 +2293,17 @@ function reviewerRoleIsExplicitlyAbsent(clause, action, role) {
         )
         if (subjectLink < 0) return false
         if (
+          !clause.tokens
+            .slice(subjectLink + 1, absence)
+            .every(
+              (token) =>
+                token.endsWith("ly") ||
+                POSTPOSED_REVIEW_ABSENCE_MODIFIERS.has(token)
+            )
+        ) {
+          return false
+        }
+        if (
           tokenIndex(
             clause.tokens,
             REVIEW_SUBJECT_BOUNDARIES,
@@ -2431,7 +2500,21 @@ function reviewStatementIsExhaustive(clause, action) {
     ) {
       return true
     }
-    if (ACTOR_LINKS.has(clause.tokens[quantifier + 1])) return true
+    const followingRelation = tokenIndex(
+      clause.tokens,
+      new Set([...ACTOR_LINKS, ...QUANTIFIER_COMPLEMENT_LINKS]),
+      quantifier + 1,
+      Math.min(segment.end, quantifier + 4)
+    )
+    if (
+      followingRelation >= 0 &&
+      clause.tokens
+        .slice(quantifier + 1, followingRelation)
+        .every((token) => QUANTIFIER_COMPLEMENT_MODIFIERS.has(token))
+    ) {
+      if (ACTOR_LINKS.has(clause.tokens[followingRelation])) return true
+      continue
+    }
     const link = tokenIndexes(
       clause.tokens,
       ACTOR_LINKS,
@@ -2817,6 +2900,10 @@ function completionBelongsToTask(clause, task, completion) {
   )
   return (
     objectLink >= 0 &&
+    !(
+      TASK_COMPONENT_SUFFIX_TERMS.has(clause.tokens[task.index + 1]) &&
+      !TASK_COMPONENT_ACTION_OBJECT_PREFIXES.has(clause.tokens[task.index + 2])
+    ) &&
     tokenIndex(
       clause.tokens,
       TASK_REFERENCE_BOUNDARIES,
@@ -2914,7 +3001,9 @@ function timingReferencesCompletion(clause, marker) {
           marker + 1,
           Math.min(end, completion + 2)
         ) >= 0
-      const hasImplicitTaskSubject = completion === marker + 1
+      const hasImplicitTaskSubject = clause.tokens
+        .slice(marker + 1, completion)
+        .every((token) => TASK_COMPLETION_BRIDGE_TERMS.has(token))
       return (
         clause.priorTasks.length > 0 &&
         (hasTaskAnaphor || hasImplicitTaskSubject)
@@ -3095,12 +3184,27 @@ function substitutionReviewTarget(clause, bypass) {
     )
   }
   if (objectLink < 0) return null
-  return (
+  const objectReviewer =
     clause.reviewers.find(
       (reviewer) =>
         reviewer.index > objectLink && reviewer.index <= objectLink + 5
     ) ?? null
-  )
+  if (
+    objectReviewer &&
+    !reviewerIsRequiredByContract(objectReviewer) &&
+    tokenIndex(
+      clause.tokens,
+      new Set(["its", "same", "that", "their", "this"]),
+      objectLink + 1,
+      objectReviewer.index
+    ) >= 0
+  ) {
+    const replacementSubject = clause.reviewers
+      .filter((reviewer) => reviewer.index < bypass)
+      .at(-1)
+    return reviewAntecedentBefore(clause, replacementSubject?.index ?? bypass)
+  }
+  return objectReviewer
 }
 
 function reviewTargetForBypass(clause, bypass) {
@@ -3112,8 +3216,20 @@ function reviewTargetForBypass(clause, bypass) {
   const before = reviewers.filter((reviewer) => reviewer.index < bypass).at(-1)
   const after = reviewers.find((reviewer) => reviewer.index > bypass)
   const replacement = reviewActionIsReplacement(clause, bypass)
+  const takeRoleLink = REVIEW_TAKE_ACTIONS.has(clause.tokens[bypass])
+    ? takeRoleObjectLink(clause, bypass)
+    : -1
   const substitution = substitutionReviewTarget(clause, bypass)
   if (substitution) return substitution
+  const takeRolePronoun =
+    takeRoleLink >= 0 &&
+    tokenIndex(
+      clause.tokens,
+      new Set(["former", "it", "them"]),
+      takeRoleLink + 1,
+      Math.min(segment.end, takeRoleLink + 5)
+    ) >= 0
+  if (takeRoleLink >= 0 && !takeRolePronoun) return null
   const roleReference =
     replacement &&
     !after &&
