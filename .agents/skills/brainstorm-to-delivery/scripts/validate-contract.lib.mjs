@@ -940,6 +940,24 @@ const TASK_STATE_SUBJECT_DETERMINERS = new Set([
   "the",
   "this",
 ])
+const TASK_STATE_ADJUNCT_NON_SUBJECT_TERMS = new Set([
+  ...TASK_COMPONENT_STATE_LINKS,
+  ...TASK_STATE_MODIFIERS,
+  ...TASK_STATE_OBJECT_PRONOUN_MODIFIERS,
+  ...TASK_STATE_SUBJECT_DETERMINERS,
+  "according",
+  "after",
+  "before",
+  "fact",
+  "following",
+  "in",
+  "its",
+  "ongoing",
+  "own",
+  "telemetry",
+  "that",
+  "to",
+])
 const TASK_COMPLETION_SEQUENCE_TERMS = new Set([
   "afterward",
   "it",
@@ -1059,6 +1077,7 @@ const REVIEW_TARGET_ADJUNCT_LINKS = new Set([
   "if",
   "in",
   "once",
+  "on",
   "since",
   "that",
   "unless",
@@ -1070,6 +1089,7 @@ const REVIEW_TARGET_ADJUNCT_LINKS = new Set([
   "while",
   "which",
   "who",
+  "with",
 ])
 const REVIEW_TARGET_NON_ROLE_HEAD_TERMS = new Set([
   ...POSTPOSED_REVIEW_ABSENCE_MODIFIERS,
@@ -1804,6 +1824,24 @@ function peopleRelationIntroduces(
     predicate + 1,
     person
   ).at(-1)
+  const purposeAction =
+    directLink === undefined
+      ? -1
+      : tokenIndex(tokens, PEOPLE_PURPOSE_ACTIONS, directLink + 1, person)
+  const purposeActionTakesPeopleObject =
+    purposeAction >= 0 &&
+    ![...actionBoundaryAfter].some(
+      (boundary) => boundary >= purposeAction && boundary < person
+    ) &&
+    tokens
+      .slice(purposeAction + 1, person)
+      .every(
+        (token) =>
+          PEOPLE_CLAUSE_SUBJECT_STARTERS.has(token) ||
+          PEOPLE_PARTITIVE_TARGET_HEADS.has(token) ||
+          POSTPOSED_REVIEW_ABSENCE_TIME_COUNTS.has(token) ||
+          /^\d+$/.test(token)
+      )
   const directLinkStartsPurposeClause =
     directLink !== undefined &&
     (phraseIndex(
@@ -1815,7 +1853,7 @@ function peopleRelationIntroduces(
       directLink - 2 ||
       phraseIndex(tokens, ["in", "order", "that"], directLink + 1, person) >=
         0 ||
-      tokenIndex(tokens, PEOPLE_PURPOSE_ACTIONS, directLink + 1, person) >= 0 ||
+      (purposeAction >= 0 && !purposeActionTakesPeopleObject) ||
       (tokens[directLink] === "for" &&
         tokens[person + 1] === "to" &&
         tokens[person + 2] !== undefined))
@@ -2081,7 +2119,7 @@ function directiveDocumentTargets(tokens) {
   )
 }
 
-function peopleRoleModifiesDocument(tokens, index) {
+function peopleRoleModifiesDocument(tokens, actionBoundaryAfter, index) {
   const document = tokenIndex(
     tokens,
     DOCUMENT_OR_CODE_TARGETS,
@@ -2090,6 +2128,9 @@ function peopleRoleModifiesDocument(tokens, index) {
   )
   return (
     document >= 0 &&
+    ![...actionBoundaryAfter].some(
+      (boundary) => boundary >= index && boundary < document
+    ) &&
     tokens
       .slice(index + 1, document)
       .every(
@@ -2100,7 +2141,7 @@ function peopleRoleModifiesDocument(tokens, index) {
   )
 }
 
-function directivePeopleAntecedents(tokens) {
+function directivePeopleAntecedents(tokens, actionBoundaryAfter = new Set()) {
   const actors = directiveActors(tokens).map((actor) => ({
     start: actor.start,
     end: actor.end,
@@ -2109,7 +2150,7 @@ function directivePeopleAntecedents(tokens) {
   const people = tokens.flatMap((token, index) =>
     PEOPLE_ANTECEDENT_TERMS.has(token) &&
     !actors.some((actor) => actor.start <= index && index < actor.end) &&
-    !peopleRoleModifiesDocument(tokens, index)
+    !peopleRoleModifiesDocument(tokens, actionBoundaryAfter, index)
       ? [
           {
             start: index,
@@ -2141,7 +2182,7 @@ function directivePronounAntecedent(
   actionBoundaryAfter = new Set()
 ) {
   const documents = directiveDocumentTargets(tokens)
-  const people = directivePeopleAntecedents(tokens)
+  const people = directivePeopleAntecedents(tokens, actionBoundaryAfter)
   const actors = directiveActors(tokens)
   const predicate = tokenIndexes(tokens, ANTECEDENT_PREDICATES)
     .filter(
@@ -3731,18 +3772,70 @@ function taskComponentIndex(clause, task) {
   )
 }
 
+function taskComponentLocalStart(clause, segmentStart, component) {
+  const punctuationBoundary = [...clause.actionBoundaryAfter]
+    .filter((boundary) => boundary >= segmentStart && boundary < component)
+    .sort((left, right) => right - left)[0]
+  return punctuationBoundary === undefined
+    ? segmentStart
+    : punctuationBoundary + 1
+}
+
+function taskComponentOwner(clause, segmentStart, component) {
+  if (clause.tokens[component - 1] === "its") return "task"
+  const localStart = taskComponentLocalStart(clause, segmentStart, component)
+  const owners = [...(clause.possessiveIndexes ?? [])].filter(
+    (owner) => owner >= localStart && owner < component
+  )
+  if (owners.length === 0) return "implicit-task"
+  const attachmentIsModifierOnly = (owner, target) =>
+    clause.tokens
+      .slice(owner + 1, target)
+      .every(
+        (token) =>
+          GENERIC_REVIEW_TARGET_PREFIX_TERMS.has(token) ||
+          REVIEW_REQUIREMENT_ACTIONS.has(token) ||
+          new Set(["auxiliary", "primary", "s"]).has(token) ||
+          token.endsWith("ed") ||
+          token.endsWith("ly")
+      )
+  let ownerPosition = owners.length - 1
+  let owner = owners[ownerPosition]
+  if (!attachmentIsModifierOnly(owner, component)) return "implicit-task"
+  if (clause.tokens[owner] === "task") return "task"
+  while (ownerPosition > 0) {
+    const outerOwner = owners[ownerPosition - 1]
+    if (!attachmentIsModifierOnly(outerOwner, owner)) break
+    if (clause.tokens[outerOwner] === "task") return "task"
+    owner = outerOwner
+    ownerPosition -= 1
+  }
+  return "other"
+}
+
 function adjunctFinalItHasNonTaskOwner(subjectPrefix, prefix) {
   const beforeIt = subjectPrefix.slice(prefix.length, -1)
-  const objectPredicate = beforeIt.findLastIndex((token) =>
+  const ownerBefore = (predicate) =>
+    beforeIt
+      .slice(0, predicate)
+      .filter(
+        (token) =>
+          !TASK_STATE_ADJUNCT_NON_SUBJECT_TERMS.has(token) &&
+          !token.endsWith("ly")
+      )
+      .at(-1)
+  const hasNonTaskOwner = (predicate) => {
+    const owner = ownerBefore(predicate)
+    return owner !== undefined && !new Set(["it", "itself", "task"]).has(owner)
+  }
+  const reportingPredicate = beforeIt.findLastIndex((token) =>
+    TASK_STATE_REPORTING_PREDICATES.has(token)
+  )
+  if (reportingPredicate >= 0) return hasNonTaskOwner(reportingPredicate)
+  const participialPredicate = beforeIt.findLastIndex((token) =>
     token.endsWith("ing")
   )
-  return (
-    beforeIt.some((token) => TASK_STATE_REPORTING_PREDICATES.has(token)) ||
-    (objectPredicate > 0 &&
-      beforeIt
-        .slice(objectPredicate + 1)
-        .every((token) => TASK_STATE_OBJECT_PRONOUN_MODIFIERS.has(token)))
-  )
+  return participialPredicate >= 0 && hasNonTaskOwner(participialPredicate)
 }
 
 function stateSegmentHasExplicitNonTaskSubject(clause, start, end) {
@@ -3756,6 +3849,20 @@ function stateSegmentHasExplicitNonTaskSubject(clause, start, end) {
     end
   )
   if (predicate < 0) return false
+  const taskObject = tokenIndex(
+    clause.tokens,
+    new Set(["it"]),
+    predicate + 1,
+    end
+  )
+  if (
+    taskObject >= 0 &&
+    clause.tokens
+      .slice(predicate + 1, taskObject)
+      .every((token) => TASK_STATE_OBJECT_PRONOUN_MODIFIERS.has(token))
+  ) {
+    return false
+  }
   const subject = clause.tokens.slice(start, predicate)
   const subjectHead = subject.find(
     (token) =>
@@ -3788,7 +3895,10 @@ function taskMentionIsNestedInNonTaskSubject(clause, task, state) {
     0,
     task.index
   ).at(-1)
-  const prefixStart = (boundary ?? -1) + 1
+  const punctuationBoundary = [...(clause.actionBoundaryAfter ?? [])]
+    .filter((candidate) => candidate < task.index)
+    .sort((left, right) => right - left)[0]
+  const prefixStart = Math.max(boundary ?? -1, punctuationBoundary ?? -1) + 1
   const prefix = clause.tokens.slice(prefixStart, task.index)
   const objectLink = prefix.findLastIndex(
     (token) => PEOPLE_ANTECEDENT_LINKS.has(token) || token.endsWith("ing")
@@ -3900,13 +4010,9 @@ function stateHasTaskSubject(clause, task, state) {
     return previousLink === undefined || previousLink === previousStart
   }
   if (TASK_COMPONENT_SUFFIX_TERMS.has(subjectPrefix.at(-1))) {
-    const unrelatedPossessor = [...(clause.possessiveIndexes ?? [])].some(
-      (owner) =>
-        owner >= segmentStart &&
-        owner < subjectEnd - 1 &&
-        clause.tokens[owner] !== "task"
-    )
-    if (unrelatedPossessor) return false
+    if (taskComponentOwner(clause, segmentStart, subjectEnd - 1) === "other") {
+      return false
+    }
     return !taskComponentStateHasActionObject(clause, subjectEnd - 1, state)
   }
   const laterDeterminer = subjectPrefix
@@ -3983,7 +4089,9 @@ function taskComponentStateHasActionObject(clause, component, state) {
   const testRunningObject =
     previousBoundary !== undefined &&
     clause.tokens[component] === "test" &&
-    clause.tokens[state] === "running"
+    clause.tokens[state] === "running" &&
+    taskComponentOwner(clause, (previousBoundary ?? -1) + 1, component) !==
+      "task"
   const boundary = [...clause.actionBoundaryAfter]
     .filter((candidate) => candidate >= state)
     .sort((left, right) => left - right)[0]
@@ -4011,6 +4119,9 @@ function taskComponentStateHasActionObject(clause, component, state) {
 function taskComponentHasUnfinishedState(clause, task) {
   const component = taskComponentIndex(clause, task)
   if (component < 0) return false
+  if (taskComponentOwner(clause, task.index + 1, component) === "other") {
+    return false
+  }
   const end = Math.min(clause.tokens.length, component + 7)
   const ellipticalState = tokenIndex(
     clause.tokens,
@@ -4028,11 +4139,18 @@ function taskComponentHasUnfinishedState(clause, task) {
   const ellipticalStateHasActionObject =
     ellipticalState >= 0 &&
     taskComponentStateHasActionObject(clause, component, ellipticalState)
-  const componentHasActionModifier = clause.tokens
-    .slice(task.index + 1, component)
-    .some(
+  const actionPrefix = clause.tokens.slice(
+    taskComponentLocalStart(clause, task.index + 1, component),
+    component
+  )
+  const componentHasActionModifier =
+    actionPrefix.some((token) =>
+      TASK_COMPONENT_IMPERATIVE_PREFIX_TERMS.has(token)
+    ) &&
+    actionPrefix.every(
       (token) =>
         TASK_COMPONENT_IMPERATIVE_PREFIX_TERMS.has(token) ||
+        TASK_STATE_MODIFIERS.has(token) ||
         token.endsWith("ly")
     )
   if (
@@ -4208,8 +4326,56 @@ function taskCompletionIsPartial(clause, task, completion) {
   )
 }
 
+function completionHasDirectObject(clause, completion) {
+  const punctuationBoundary = [...clause.actionBoundaryAfter]
+    .filter((boundary) => boundary >= completion)
+    .sort((left, right) => left - right)[0]
+  const coordinator = tokenIndex(
+    clause.tokens,
+    CLAUSE_COORDINATORS,
+    completion + 1
+  )
+  const end = Math.min(
+    punctuationBoundary === undefined
+      ? clause.tokens.length
+      : punctuationBoundary + 1,
+    coordinator < 0 ? clause.tokens.length : coordinator
+  )
+  const tail = clause.tokens.slice(completion + 1, end)
+  const head = tail.findIndex(
+    (token) =>
+      !TASK_STATE_MODIFIERS.has(token) &&
+      !TASK_COMPLETION_SEQUENCE_TERMS.has(token) &&
+      !token.endsWith("ly")
+  )
+  if (head < 0) return false
+  if (
+    new Set([
+      ...ACTIVE_TIMING_MARKERS,
+      ...BOUNDARY_TIMING_MARKERS,
+      ...PRE_COMPLETION_TIMING_MARKERS,
+      "by",
+      "for",
+      "from",
+      "in",
+      "of",
+      "through",
+      "to",
+      "until",
+      "with",
+    ]).has(tail[head])
+  ) {
+    return false
+  }
+  if (new Set(["a", "an", "the", "this", "that"]).has(tail[head])) {
+    return tail.slice(head + 1).some((token) => !token.endsWith("ly"))
+  }
+  return true
+}
+
 function completionBelongsToTask(clause, task, completion) {
   if (taskCompletionIsPartial(clause, task, completion)) return false
+  if (completionHasDirectObject(clause, completion)) return false
   const actionBoundary = [...clause.actionBoundaryAfter]
     .filter((boundary) => boundary >= completion)
     .sort((left, right) => left - right)[0]
@@ -4445,6 +4611,43 @@ function hasPreCompletionTaskTiming(clause) {
   )
 }
 
+function changeHasExplicitNonAgentObject(clause, change) {
+  const segment = actionSegment(clause, change)
+  const tailActors = clause.actors.filter(
+    (actor) => actor.start > change && actor.end <= segment.end
+  )
+  if (
+    tailActors.length > 0 ||
+    tokenIndex(
+      clause.tokens,
+      new Set(["agent", "agents", ...REFLEXIVE_TARGETS]),
+      change + 1,
+      segment.end
+    ) >= 0
+  ) {
+    return false
+  }
+  const tail = clause.tokens.slice(change + 1, segment.end)
+  const object = tail.find(
+    (token) =>
+      !AGENT_CHANGE_SUBJECT_BRIDGE_TERMS.has(token) &&
+      !TASK_STATE_MODIFIERS.has(token) &&
+      !token.endsWith("ly")
+  )
+  return (
+    object !== undefined &&
+    !new Set([
+      ...ACTIVE_TIMING_MARKERS,
+      ...BOUNDARY_TIMING_MARKERS,
+      ...PRE_COMPLETION_TIMING_MARKERS,
+      "from",
+      "to",
+      "until",
+      "with",
+    ]).has(object)
+  )
+}
+
 function conflictsWithActiveTaskSwitch(clause) {
   const { tokens } = clause
   const changes = tokenIndexes(
@@ -4489,7 +4692,9 @@ function conflictsWithActiveTaskSwitch(clause) {
             )
       )
       .at(-1)
-    if (subjectAgent) return true
+    if (subjectAgent && !changeHasExplicitNonAgentObject(clause, change)) {
+      return true
+    }
     const segment = actionSegment(clause, change)
     const targetEnd = Math.min(
       segment.end,
@@ -4628,6 +4833,9 @@ function reviewerModifierHasTrailingRoleHead(clause, reviewer, objectLink) {
     reviewer.index + 1,
     adjunct < 0 ? limit : adjunct
   )
+  if (tail[0]?.endsWith("ed") || TASK_STATE_MODIFIERS.has(tail[0])) {
+    return false
+  }
   return tail.some(
     (token) =>
       !GENERIC_REVIEW_TARGET_PREFIX_TERMS.has(token) &&

@@ -4472,6 +4472,309 @@ describe("Skill contract v2", () => {
     ])
   })
 
+  it("round-17 preserves explicit unfinished Task status around imperatives", () => {
+    assertSkillClassifications([
+      {
+        prose:
+          "After completion of the active Task (please note its review pending), switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "After completion of the active Task: the Task's test running overnight, switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "After completion of the active Task: please review pending work, then switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "After completion of the active Task: test running software, then switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "After completion of the active Task: please note the server's review pending, then switch the Task Agent.",
+        reject: false,
+      },
+    ])
+  })
+
+  it("round-17 binds possessive Task component ownership locally", () => {
+    assertSkillClassifications([
+      {
+        prose:
+          "The active Task is completed but the Task's primary reviewer's mandatory review is still running. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The active Task is completed but, despite the server's warning, the review is still running. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The active Task is completed but, following the server's report, the validation is still running. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The active Task is completed but the server's review is still running. Then switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The active Task is completed but the Task's primary reviewer's server is still running. Then switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The active Task is completed but the Task's report says the server's review is still running. Then switch the Task Agent.",
+        reject: false,
+      },
+    ])
+  })
+
+  it("round-17 distinguishes purpose clauses from people objects", () => {
+    assertSkillClassifications([
+      {
+        prose:
+          "The developers revise the Plan, Design, and code to enable both reviewers. The parent updates both of them.",
+        reject: false,
+      },
+      {
+        prose:
+          "The developers revise the Plan, Design, and code by allowing both reviewers to participate. The parent updates both of them.",
+        reject: false,
+      },
+      {
+        prose:
+          "The developers revise the Plan, Design, and code in order that three reviewers can respond. The parent edits both of them.",
+        reject: true,
+      },
+      {
+        prose:
+          "The developers revise the Plan, Design, and code in order for three reviewers to respond. The parent edits both of them.",
+        reject: true,
+      },
+      {
+        prose:
+          "The developers revise the Plan, Design, and code, allowing three reviewers to respond. The parent edits both of them.",
+        reject: true,
+      },
+    ])
+  })
+
+  it("round-17 keeps reviewer postmodifiers on anaphoric role heads", () => {
+    assertSkillClassifications([
+      ...[
+        "on duty",
+        "with long tenure",
+        "assigned earlier",
+        "still responsible",
+      ].map((postmodifier) => ({
+        prose: `The Codex reviewer is mandatory. Optional Design reviewers take on the role of that previously assigned reviewer ${postmodifier}.`,
+        reject: true,
+      })),
+      {
+        prose:
+          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of that previously assigned reviewer contact person.",
+        reject: false,
+      },
+      {
+        prose:
+          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of that previously assigned reviewer note taker.",
+        reject: false,
+      },
+    ])
+  })
+
+  it("round-17 bounds role-document attachment at punctuation", () => {
+    assertSkillClassifications([
+      {
+        prose:
+          "The developers revise the Design after consulting both reviewer and producer (Plan work begins later). The parent updates both of them on progress.",
+        reject: false,
+      },
+      {
+        prose:
+          "The developers revise the Design after consulting both reviewer and producer Plans. The parent updates both of them on progress.",
+        reject: true,
+      },
+      {
+        prose:
+          "The developers revise the Design after consulting both reviewer and producer: Plan work begins later. The parent updates both of them on progress.",
+        reject: false,
+      },
+    ])
+  })
+
+  it("round-17 requires an Agent replacement object for subject-first changes", () => {
+    assertSkillClassifications([
+      ...[
+        "will switch branches immediately",
+        "can change directories",
+        "should replace a file",
+        "may switch the logging mode",
+      ].map((action) => ({
+        prose: `The active Task is running. The Task Agent ${action}.`,
+        reject: false,
+      })),
+      {
+        prose:
+          "The active Task is running. The Task Agent will switch immediately.",
+        reject: true,
+      },
+      {
+        prose:
+          "The active Task is running. The Task Agent itself switches immediately.",
+        reject: true,
+      },
+      {
+        prose:
+          "The active Task is running. The Task Agent later switches immediately.",
+        reject: true,
+      },
+    ])
+  })
+
+  it("round-17 rejects transitive completion as full Task completion", () => {
+    assertSkillClassifications([
+      {
+        prose:
+          "The active Task is partially complete and later completed documentation. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The active Task is partially complete and afterward completed the migration. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The active Task is partially complete and later completed. Then switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The active Task is partially complete and afterward fully completed. Then switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The active Task is partially complete and later only partly completed. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The active Task is completed and afterward resumes running. Then switch the Task Agent.",
+        reject: true,
+      },
+    ])
+  })
+
+  it("round-17 retains Task anaphors through reporting and participial adjuncts", () => {
+    assertSkillClassifications([
+      {
+        prose:
+          "The active Task is completed but, according to its own telemetry, it is reported that it is still running. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The active Task is completed but, according to its own telemetry, after restarting, it is still running. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The active Task is completed but according to ongoing monitoring it is still running. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The active Task is completed but, according to telemetry, a separate server says that it is still running. Then switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The active Task is completed but according to telemetry the server tracking it is still running. Then switch the Task Agent.",
+        reject: false,
+      },
+    ])
+  })
+
+  it("round-17 honors an explicit Task reporting subject", () => {
+    assertSkillClassifications([
+      {
+        prose:
+          "The active Task is completed but, according to telemetry, the Task says that it is still running. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The active Task is completed but, according to telemetry, the server says that it is still running. Then switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The active Task is completed but, according to telemetry, it says that it is still running. Then switch the Task Agent.",
+        reject: true,
+      },
+    ])
+  })
+
+  it("round-17 binds transitive restart objects to the Task", () => {
+    assertSkillClassifications([
+      {
+        prose:
+          "The Task is completed but the server restarts it and it is still running. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The Task is completed but the server restarts and it is still running. Then switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The Task is completed but the server restarts itself and it is still running. Then switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The Task is completed but the server restarts after it receives a signal and it is still running. Then switch the Task Agent.",
+        reject: false,
+      },
+    ])
+  })
+
+  it("round-17 binds explicit Task restarts after preposed gerund adjuncts", () => {
+    assertSkillClassifications([
+      {
+        prose:
+          "The active Task is completed but, with monitoring complete, the Task restarts. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The active Task is completed but, with testing complete, the Task restarts. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The active Task is completed but, with monitoring complete, the server restarts. Then switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The active Task is completed but, with testing complete, the server restarts and it is still running. Then switch the Task Agent.",
+        reject: false,
+      },
+    ])
+  })
+
   it("contains the complete operational policy and document JSON shapes", () => {
     const policy = fencedJsonAfterHeading(
       realSkill,
