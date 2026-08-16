@@ -916,9 +916,11 @@ const AGENT_IDENTITY_OBJECT_PREFIX_TERMS = new Set([
   "an",
   "current",
   "its",
+  "own",
   "selected",
   "that",
   "the",
+  "their",
   "this",
 ])
 const TASK_STATE_ANAPHOR_ADJUNCT_PREFIXES = [
@@ -966,6 +968,20 @@ const TASK_STATE_SUBJECT_DETERMINERS = new Set([
   "every",
   "the",
   "this",
+])
+const TASK_DIRECT_OBJECT_QUALIFIERS = new Set([
+  ...TASK_STATE_SUBJECT_DETERMINERS,
+  ...TASK_STATE_MODIFIERS,
+  ...EXPLICIT_TASK_ACTIVITY_TERMS,
+  "current",
+  "its",
+  "own",
+])
+const TASK_ANTECEDENT_NON_OBJECT_LINKS = new Set([
+  ...PEOPLE_ANTECEDENT_LINKS,
+  "about",
+  "of",
+  "regarding",
 ])
 const TASK_STATE_ADJUNCT_NON_SUBJECT_TERMS = new Set([
   ...TASK_COMPONENT_STATE_LINKS,
@@ -3874,6 +3890,34 @@ function adjunctFinalItHasNonTaskOwner(subjectPrefix, prefix) {
   return participialPredicate >= 0 && hasNonTaskOwner(participialPredicate)
 }
 
+function taskMentionIsDirectAntecedentObject(
+  clause,
+  task,
+  subjectHeadIndex,
+  segmentEnd
+) {
+  const trailing = clause.tokens.slice(task.index + 1, segmentEnd)
+  if (
+    !trailing.every(
+      (token) => TASK_STATE_MODIFIERS.has(token) || token.endsWith("ly")
+    )
+  ) {
+    return false
+  }
+  let objectStart = task.index
+  while (objectStart > subjectHeadIndex + 1) {
+    const qualifier = clause.tokens[objectStart - 1]
+    if (
+      !TASK_DIRECT_OBJECT_QUALIFIERS.has(qualifier) &&
+      !qualifier.endsWith("ly")
+    ) {
+      break
+    }
+    objectStart -= 1
+  }
+  return !TASK_ANTECEDENT_NON_OBJECT_LINKS.has(clause.tokens[objectStart - 1])
+}
+
 function previousSegmentHasExplicitNonTaskAntecedent(clause, start) {
   const boundary = tokenIndexes(
     clause.tokens,
@@ -3906,7 +3950,15 @@ function previousSegmentHasExplicitNonTaskAntecedent(clause, start) {
   const subjectHead = subjectTokens[subjectHeadOffset]
   const subjectHeadIndex = modifier + 1 + subjectHeadOffset
   const hasCloserTaskAntecedent = directiveTasks(clause.tokens).some(
-    (task) => task.index > subjectHeadIndex && task.index < boundary
+    (task) =>
+      task.index > subjectHeadIndex &&
+      task.index < boundary &&
+      taskMentionIsDirectAntecedentObject(
+        clause,
+        task,
+        subjectHeadIndex,
+        boundary
+      )
   )
   return (
     subjectHead !== undefined &&
@@ -3954,6 +4006,25 @@ function stateSegmentHasExplicitNonTaskSubject(clause, start, end) {
   )
 }
 
+function taskMentionIsAffirmativeDirectReactivationObject(
+  clause,
+  predicate,
+  taskIndex
+) {
+  if (
+    !TASK_REACTIVATION_PREDICATES.has(clause.tokens[predicate]) ||
+    actionIsNegated(clause.tokens, predicate)
+  ) {
+    return false
+  }
+  return clause.tokens
+    .slice(predicate + 1, taskIndex)
+    .every(
+      (token) =>
+        TASK_DIRECT_OBJECT_QUALIFIERS.has(token) || token.endsWith("ly")
+    )
+}
+
 function taskMentionIsNestedInNonTaskSubject(clause, task, state) {
   const predicate = TASK_REACTIVATION_PREDICATES.has(clause.tokens[state])
     ? state
@@ -3983,7 +4054,11 @@ function taskMentionIsNestedInNonTaskSubject(clause, task, state) {
   )
   if (objectLink < 0) return false
   if (
-    TASK_REACTIVATION_PREDICATES.has(clause.tokens[prefixStart + objectLink])
+    taskMentionIsAffirmativeDirectReactivationObject(
+      clause,
+      prefixStart + objectLink,
+      task.index
+    )
   ) {
     return false
   }

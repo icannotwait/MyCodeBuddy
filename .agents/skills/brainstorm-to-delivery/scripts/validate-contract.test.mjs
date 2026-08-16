@@ -5042,6 +5042,63 @@ describe("Skill contract v2", () => {
     ])
   })
 
+  it("round-20 binds possessive qualifiers to direct selected-profile changes", () => {
+    assertSkillClassifications([
+      ...[
+        "will change their selected profile immediately",
+        "will change their current profile immediately",
+        "will change its own profile immediately",
+        "will change its selected profile immediately",
+      ].map((action) => ({
+        prose: `The active Task is running. The Task Agent ${action}.`,
+        reject: true,
+      })),
+      ...[
+        "will change the compiler profile immediately",
+        "will change its logging profile immediately",
+      ].map((action) => ({
+        prose: `The active Task is running. The Task Agent ${action}.`,
+        reject: false,
+      })),
+    ])
+  })
+
+  it("round-20 binds restart antecedents by their Task relation", () => {
+    assertSkillClassifications([
+      ...[
+        "starts a Task worker",
+        "monitors the Task log",
+        "for the Task fails",
+      ].map((relation) => ({
+        prose: `The Task is completed but a separate service ${relation} and the server restarts it and it is still running. Then switch the Task Agent.`,
+        reject: false,
+      })),
+      ...["monitors the Task", "restarts the Task"].map((relation) => ({
+        prose: `The Task is completed but a separate service ${relation} and the server restarts it and it is still running. Then switch the Task Agent.`,
+        reject: true,
+      })),
+    ])
+  })
+
+  it("round-20 requires affirmative direct parenthetical Task reactivation", () => {
+    assertSkillClassifications([
+      ...[
+        "not restarting the Task",
+        "without restarting the Task",
+        "restarting a worker that monitors the Task",
+        "restarting a Task worker",
+      ].map((parenthetical) => ({
+        prose: `The active Task is completed but the server, ${parenthetical}, restarts and it is still running. Then switch the Task Agent.`,
+        reject: false,
+      })),
+      {
+        prose:
+          "The active Task is completed but the server, restarting the Task, restarts and it is still running. Then switch the Task Agent.",
+        reject: true,
+      },
+    ])
+  })
+
   it("contains the complete operational policy and document JSON shapes", () => {
     const policy = fencedJsonAfterHeading(
       realSkill,
