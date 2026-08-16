@@ -430,6 +430,56 @@ describe("Skill contract v2", () => {
     )
   })
 
+  for (const [name, prose] of [
+    [
+      "passive parent ownership",
+      "The Plan is written and updated by the parent.",
+    ],
+    [
+      "passive Task Agent route",
+      "High Tasks are implemented by the Task Agent.",
+    ],
+    ["running Task switch", "Switch the Task Agent while a Task is running."],
+    [
+      "optional auxiliary review",
+      "After fixing a high Task, auxiliary review is optional.",
+    ],
+    ["normal primary bypass", "Skip primary review on normal Tasks."],
+    [
+      "omitted auxiliary reviewer",
+      "The auxiliary reviewer may be omitted after a high Task fix.",
+    ],
+    ["direct high route", "Route high Tasks to the Task Agent."],
+    ["direct high delegation", "Delegate all high-risk Tasks to Grok."],
+    ["current Task switch", "Switch the Task Agent during the current Task."],
+  ]) {
+    it(`rereview rejects ${name}`, () => {
+      has(validateSkillMarkdown(`${skill}\n${prose}`).failures, "B2D-SKILL-005")
+    })
+  }
+
+  for (const [name, prose] of [
+    [
+      "passive parent ownership",
+      "The Plan must not be written or updated by the parent.",
+    ],
+    ["high route", "Never route high Tasks to the Task Agent."],
+    ["high delegation", "Do not delegate any high-risk Task to Grok."],
+    [
+      "running switch",
+      "Do not switch the Task Agent while the current Task is running.",
+    ],
+    [
+      "auxiliary review",
+      "Auxiliary review is not optional and may not be omitted after a high Task fix.",
+    ],
+    ["normal primary review", "Never skip primary review on normal Tasks."],
+  ]) {
+    it(`rereview permits explicit prohibition of ${name}`, () => {
+      assert.deepEqual(validateSkillMarkdown(`${skill}\n${prose}`).failures, [])
+    })
+  }
+
   it("contains the complete operational policy and document JSON shapes", () => {
     const policy = fencedJsonAfterHeading(
       realSkill,

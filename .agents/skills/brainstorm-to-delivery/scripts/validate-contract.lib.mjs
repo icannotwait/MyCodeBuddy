@@ -257,42 +257,70 @@ const DIRECTIVE_WINDOW_OVERLAP = 16
 // remains the authoritative workflow definition.
 const PRODUCTION_ACTIONS = new Set([
   "author",
+  "authored",
   "authors",
   "authoring",
   "change",
+  "changed",
   "changes",
   "changing",
   "create",
+  "created",
   "creates",
   "creating",
   "edit",
+  "edited",
   "edits",
   "editing",
   "fix",
+  "fixed",
   "fixes",
   "fixing",
   "implement",
+  "implemented",
   "implementation",
   "implementer",
   "implements",
   "implementing",
   "modify",
+  "modified",
   "modifies",
   "modifying",
   "own",
+  "owned",
   "owns",
   "patch",
+  "patched",
   "patches",
   "patching",
   "produce",
+  "produced",
   "produces",
   "producing",
   "revise",
+  "revised",
   "revises",
   "revising",
+  "update",
+  "updated",
+  "updates",
+  "updating",
   "write",
   "writes",
   "writing",
+  "written",
+  "wrote",
+])
+const TASK_ROUTE_ACTIONS = new Set([
+  ...PRODUCTION_ACTIONS,
+  "delegate",
+  "delegated",
+  "delegates",
+  "delegating",
+  "route",
+  "routed",
+  "routes",
+  "routing",
 ])
 const DOCUMENT_OR_CODE_TARGETS = new Set([
   "code",
@@ -319,6 +347,42 @@ const NEGATION_TERMS = new Set([
   "prohibited",
   "prohibits",
   "without",
+])
+const ACTOR_LINKS = new Set(["by", "to"])
+const HIGH_TASK_SCOPES = new Set(["high", "high-risk"])
+const UNIVERSAL_TASK_SCOPES = new Set([
+  "all",
+  "always",
+  "each",
+  "every",
+  "unconditionally",
+])
+const TASK_ACTIVITY_TERMS = new Set([
+  "active",
+  "current",
+  "in-progress",
+  "running",
+])
+const REVIEW_BYPASS_ACTIONS = new Set([
+  "instead",
+  "omit",
+  "omits",
+  "omitted",
+  "omitting",
+  "optional",
+  "optionally",
+  "replace",
+  "replaced",
+  "replaces",
+  "replacing",
+  "skip",
+  "skipped",
+  "skips",
+  "skipping",
+  "substitute",
+  "substituted",
+  "substitutes",
+  "substituting",
 ])
 const FORBIDDEN_PROGRESS_FIELDS = new Set([
   "workflow_id",
@@ -660,6 +724,15 @@ function tokenIndex(tokens, candidates, start = 0, end = tokens.length) {
   return -1
 }
 
+function tokenIndexes(tokens, candidates, start = 0, end = tokens.length) {
+  const indexes = []
+  const limit = Math.min(tokens.length, end)
+  for (let index = Math.max(0, start); index < limit; index += 1) {
+    if (candidates.has(tokens[index])) indexes.push(index)
+  }
+  return indexes
+}
+
 function phraseIndex(tokens, phrase) {
   for (let index = 0; index <= tokens.length - phrase.length; index += 1) {
     if (phrase.every((token, offset) => tokens[index + offset] === token)) {
@@ -677,38 +750,137 @@ function actionIsNegated(tokens, actionIndex) {
   )
 }
 
+function taskAgentActorIndexes(tokens) {
+  const indexes = []
+  for (const [index, token] of tokens.entries()) {
+    if (
+      token === "grok" ||
+      (token === "task" && tokens[index + 1] === "agent")
+    ) {
+      indexes.push(index)
+    }
+  }
+  return indexes
+}
+
+function hasScopedTask(tokens, start = 0, end = tokens.length) {
+  for (const taskIndex of tokenIndexes(
+    tokens,
+    new Set(["task", "tasks"]),
+    start,
+    end
+  )) {
+    const scopeStart = Math.max(start, taskIndex - 3)
+    const scopeEnd = Math.min(end, taskIndex + 2)
+    if (
+      tokenIndex(tokens, HIGH_TASK_SCOPES, scopeStart, scopeEnd) >= 0 ||
+      tokenIndex(tokens, UNIVERSAL_TASK_SCOPES, scopeStart, scopeEnd) >= 0
+    ) {
+      return true
+    }
+  }
+  return false
+}
+
+function hasTaskActivity(tokens) {
+  if (
+    tokens.some((token) =>
+      ["active-task", "current-task", "running-task"].includes(token)
+    )
+  ) {
+    return true
+  }
+  return tokenIndexes(tokens, new Set(["task", "tasks"])).some(
+    (taskIndex) =>
+      tokenIndex(
+        tokens,
+        TASK_ACTIVITY_TERMS,
+        Math.max(0, taskIndex - 2),
+        taskIndex + 4
+      ) >= 0
+  )
+}
+
 function conflictsWithParentOwnership(tokens) {
   const parent = tokenIndex(tokens, new Set(["parent"]))
   if (parent < 0) return false
-  const action = tokenIndex(tokens, PRODUCTION_ACTIONS, parent + 1, parent + 12)
-  if (action < 0 || actionIsNegated(tokens, action)) return false
-  return (
-    tokenIndex(tokens, DOCUMENT_OR_CODE_TARGETS, action + 1, action + 10) >= 0
+  const activeConflict = tokenIndexes(
+    tokens,
+    PRODUCTION_ACTIONS,
+    parent + 1,
+    parent + 12
+  ).some(
+    (action) =>
+      !actionIsNegated(tokens, action) &&
+      tokenIndex(tokens, DOCUMENT_OR_CODE_TARGETS, action + 1, action + 10) >= 0
+  )
+  if (activeConflict) return true
+
+  const by = tokens.lastIndexOf("by", parent - 1)
+  if (by < Math.max(0, parent - 3)) return false
+  return tokenIndexes(
+    tokens,
+    PRODUCTION_ACTIONS,
+    Math.max(0, by - 12),
+    by
+  ).some(
+    (action) =>
+      !actionIsNegated(tokens, action) &&
+      tokenIndex(
+        tokens,
+        DOCUMENT_OR_CODE_TARGETS,
+        Math.max(0, action - 10),
+        action
+      ) >= 0
   )
 }
 
 function conflictsWithTaskAgentRoute(tokens) {
-  const actor = Math.max(
-    tokenIndex(tokens, new Set(["grok"])),
-    phraseIndex(tokens, ["task", "agent"])
-  )
-  if (actor < 0) return false
-  let action = tokenIndex(tokens, PRODUCTION_ACTIONS, actor + 1, actor + 9)
-  while (action >= 0 && tokens[action - 1] === "codex") {
-    action = tokenIndex(tokens, PRODUCTION_ACTIONS, action + 1, actor + 9)
-  }
-  if (action < 0 || actionIsNegated(tokens, action)) return false
-  const hasTask = tokenIndex(tokens, new Set(["task", "tasks"])) >= 0
-  const hasHighScope = tokenIndex(tokens, new Set(["high", "high-risk"])) >= 0
-  const hasUniversalScope =
-    tokenIndex(
+  for (const actor of taskAgentActorIndexes(tokens)) {
+    for (const action of tokenIndexes(
       tokens,
-      new Set(["all", "always", "each", "every", "unconditionally"])
-    ) >= 0
-  return (
-    hasHighScope ||
-    (hasUniversalScope && (hasTask || tokens[action] === "implementer"))
-  )
+      TASK_ROUTE_ACTIONS,
+      actor + 1,
+      actor + 9
+    )) {
+      if (tokens[action - 1] === "codex" || actionIsNegated(tokens, action)) {
+        continue
+      }
+      const alwaysImplementer =
+        tokens[action] === "implementer" &&
+        tokenIndex(
+          tokens,
+          UNIVERSAL_TASK_SCOPES,
+          Math.max(0, actor - 4),
+          action + 1
+        ) >= 0
+      if (alwaysImplementer || hasScopedTask(tokens, action + 1, action + 12)) {
+        return true
+      }
+    }
+
+    const link = tokenIndexes(
+      tokens,
+      ACTOR_LINKS,
+      Math.max(0, actor - 3),
+      actor
+    ).at(-1)
+    if (link === undefined) continue
+    for (const action of tokenIndexes(
+      tokens,
+      TASK_ROUTE_ACTIONS,
+      Math.max(0, link - 12),
+      link
+    )) {
+      if (
+        !actionIsNegated(tokens, action) &&
+        hasScopedTask(tokens, Math.max(0, action - 5), link)
+      ) {
+        return true
+      }
+    }
+  }
+  return false
 }
 
 function conflictsWithConversationIdentity(tokens) {
@@ -743,10 +915,7 @@ function conflictsWithActiveTaskSwitch(tokens) {
   const hasAgent =
     tokenIndex(tokens, new Set(["agent", "agents"])) >= 0 ||
     phraseIndex(tokens, ["task", "agent"]) >= 0
-  const hasActiveTask =
-    tokenIndex(tokens, new Set(["active", "current"])) >= 0 &&
-    tokenIndex(tokens, new Set(["task", "tasks"])) >= 0
-  return hasAgent && hasActiveTask
+  return hasAgent && hasTaskActivity(tokens)
 }
 
 function conflictsWithRequiredReview(tokens) {
@@ -754,33 +923,15 @@ function conflictsWithRequiredReview(tokens) {
     tokenIndex(tokens, new Set(["review", "reviewer", "reviewers"])) >= 0
   if (!hasReview) return false
 
-  const bypass = tokenIndex(
-    tokens,
-    new Set([
-      "instead",
-      "omit",
-      "omits",
-      "omitting",
-      "replace",
-      "replaces",
-      "replacing",
-      "skip",
-      "skips",
-      "skipping",
-      "substitute",
-      "substitutes",
-      "substituting",
-    ])
-  )
+  const bypass = tokenIndex(tokens, REVIEW_BYPASS_ACTIONS)
   if (bypass < 0 || actionIsNegated(tokens, bypass)) return false
 
-  const skipsAuxiliaryRereview =
-    tokenIndex(tokens, new Set(["auxiliary"])) >= 0 &&
-    tokenIndex(tokens, new Set(["fix", "fixes", "fixed", "fixing"])) >= 0
+  const bypassesRequiredTaskReview =
+    tokenIndex(tokens, new Set(["auxiliary", "primary"])) >= 0
   const replacesCodexDesignReview =
     tokenIndex(tokens, new Set(["codex"])) >= 0 &&
     tokenIndex(tokens, new Set(["design"])) >= 0
-  return skipsAuxiliaryRereview || replacesCodexDesignReview
+  return bypassesRequiredTaskReview || replacesCodexDesignReview
 }
 
 function hasConflictingSkillDirective(prose) {
