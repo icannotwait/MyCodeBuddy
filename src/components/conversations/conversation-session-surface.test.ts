@@ -1,6 +1,12 @@
-import { createElement, useEffect, useReducer, useRef } from "react"
+import {
+  createElement,
+  useEffect,
+  useReducer,
+  useRef,
+  type ComponentProps,
+} from "react"
 import { flushSync } from "react-dom"
-import { act, cleanup, render } from "@testing-library/react"
+import { act, cleanup, render, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import type { EventEnvelope } from "@/lib/types"
@@ -19,6 +25,9 @@ import {
 } from "@/lib/terminal-reconnect"
 import { shouldQueueDirectSend } from "@/lib/queue-flush"
 import { createConversation } from "@/lib/api"
+import { emitAttachFileToSession } from "@/lib/session-attachment-events"
+import type { RichComposerHandle } from "@/components/chat/composer/rich-composer"
+import { serializeDocToText } from "@/components/chat/composer/to-prompt-blocks"
 
 // ---------------------------------------------------------------------------
 // Pure surface policy seam (imported from the surface module once exported)
@@ -627,14 +636,83 @@ const surfaceH = vi.hoisted(() => ({
   notifyWorkspace: null as null | (() => void),
   /** Render root for querying topBanner DOM (delegate status row). */
   renderRoot: null as HTMLElement | null,
+  renderRealComposer: false,
+  chatInputSendClearMode: null as
+    | "immediate"
+    | "after-admission"
+    | null
+    | undefined,
 }))
+
+const surfaceComposerHandle = vi.hoisted(() => ({
+  current: null as RichComposerHandle | null,
+}))
+
+vi.mock("@/components/chat/composer/rich-composer", async (importOriginal) => {
+  const actual =
+    await importOriginal<
+      typeof import("@/components/chat/composer/rich-composer")
+    >()
+  const React = await import("react")
+  const Captured = React.forwardRef<
+    RichComposerHandle,
+    ComponentProps<typeof actual.RichComposer>
+  >((props, ref) => {
+    const assign = (handle: RichComposerHandle | null) => {
+      surfaceComposerHandle.current = handle
+      if (typeof ref === "function") ref(handle)
+      else if (ref) ref.current = handle
+    }
+    return React.createElement(actual.RichComposer, { ...props, ref: assign })
+  })
+  Captured.displayName = "SurfaceCapturedRichComposer"
+  return { ...actual, RichComposer: Captured }
+})
 
 vi.mock("next-intl", () => ({
   useTranslations: () => (key: string) => key,
+  useLocale: () => "en",
 }))
 
 vi.mock("sonner", () => ({
-  toast: { error: vi.fn(), success: vi.fn() },
+  toast: {
+    error: vi.fn(),
+    success: vi.fn(),
+    info: vi.fn(),
+    warning: vi.fn(),
+  },
+}))
+
+vi.mock("@/hooks/use-shortcut-settings", () => ({
+  useShortcutSettings: () => ({
+    shortcuts: { send_message: "enter", newline_in_message: "shift+enter" },
+  }),
+}))
+vi.mock("@/hooks/use-agent-skills", () => ({ useAgentSkills: () => [] }))
+vi.mock("@/hooks/use-built-in-experts", () => ({ useBuiltInExperts: () => [] }))
+vi.mock("@/hooks/use-built-in-science", () => ({ useBuiltInScience: () => [] }))
+vi.mock("@/hooks/use-enabled-skill-ids", () => ({
+  useEnabledSkillIds: () => ({
+    enabledIds: new Set(),
+    ready: false,
+    supported: true,
+  }),
+}))
+vi.mock("@/components/chat/composer/use-reference-search", () => ({
+  useReferenceSearchController: () => null,
+}))
+vi.mock("@/components/chat/conversation-context-bar", () => ({
+  ConversationContextBar: ({ extraContent }: { extraContent?: unknown }) =>
+    createElement("div", null, extraContent as never),
+  ConversationFolderBranchPicker: () => null,
+  useConversationFolderBranchPickerVisible: () => false,
+}))
+vi.mock("@/lib/platform", () => ({
+  isDesktop: () => false,
+  openFileDialog: vi.fn(),
+}))
+vi.mock("@/lib/transport", () => ({
+  getActiveRemoteConnectionId: () => null,
 }))
 
 vi.mock("@/hooks/use-connection-lifecycle", () => ({
@@ -678,7 +756,7 @@ vi.mock("@/hooks/use-connection-lifecycle", () => ({
         pendingQuestion: null,
         pendingAskQuestion: null,
         pendingUserMessage: null,
-        waitingForSubagents: false,
+        waitingForSubagents: null,
         claudeApiRetry: null,
         agentType: "claude",
         connectedWorkingDir: "/tmp/project",
@@ -957,41 +1035,50 @@ vi.mock("@/components/message/initial-history-scroll-controller", () => ({
   useInitialHistoryScrollEligibility: () => false,
 }))
 
-vi.mock("@/components/chat/conversation-shell", () => ({
-  ConversationShell: (props: CapturedShellProps) => {
-    surfaceH.shellProps = {
-      queuePaused: props.queuePaused,
-      onResumeQueue: props.onResumeQueue,
-      showReconnect: props.showReconnect,
-      onReconnect: props.onReconnect,
-      interactionLocked: props.interactionLocked,
-      error: props.error ?? null,
-      topBanner: props.topBanner,
-      onSend: props.onSend,
-      onEnqueue: props.onEnqueue,
-      sendClearMode: props.sendClearMode,
-      sharedQueue: props.sharedQueue,
-      onSharedQueueCancel: props.onSharedQueueCancel,
-      onForkSend: props.onForkSend,
-      draftRestore: props.draftRestore,
-      queue: props.queue,
-      children: props.children,
-    }
-    // Render topBanner so DelegateAccessStatus is in the document for
-    // data-state queries; keep children for existing message-list checks.
-    return createElement(
-      "div",
-      {
-        ref: (el: HTMLElement | null) => {
-          surfaceH.renderRoot = el
+vi.mock("@/components/chat/conversation-shell", async () => {
+  const { ChatInput } = await import("@/components/chat/chat-input")
+  return {
+    ConversationShell: (
+      props: CapturedShellProps & {
+        hideInput?: boolean
+        [key: string]: unknown
+      }
+    ) => {
+      surfaceH.shellProps = {
+        queuePaused: props.queuePaused,
+        onResumeQueue: props.onResumeQueue,
+        showReconnect: props.showReconnect,
+        onReconnect: props.onReconnect,
+        interactionLocked: props.interactionLocked,
+        error: props.error ?? null,
+        topBanner: props.topBanner,
+        onSend: props.onSend,
+        onEnqueue: props.onEnqueue,
+        sendClearMode: props.sendClearMode,
+        sharedQueue: props.sharedQueue,
+        onSharedQueueCancel: props.onSharedQueueCancel,
+        onForkSend: props.onForkSend,
+        draftRestore: props.draftRestore,
+        queue: props.queue,
+        children: props.children,
+      }
+      // Render topBanner so DelegateAccessStatus is in the document for
+      // data-state queries; keep children for existing message-list checks.
+      return createElement(
+        "div",
+        {
+          ref: (el: HTMLElement | null) => {
+            surfaceH.renderRoot = el
+          },
+          "data-testid": "shell-root",
         },
-        "data-testid": "shell-root",
-      },
-      props.topBanner as never,
-      props.children as never
-    )
-  },
-}))
+        props.topBanner as never,
+        props.children as never,
+        !props.hideInput ? createElement(ChatInput, props as never) : null
+      )
+    },
+  }
+})
 
 vi.mock("@/components/chat/session-config-stale-banner", () => ({
   SessionConfigStaleBanner: () => null,
@@ -1030,9 +1117,19 @@ vi.mock("@/components/chat/agent-selector", () => ({
     return null
   },
 }))
-vi.mock("@/components/chat/chat-input", () => ({
-  ChatInput: () => null,
-}))
+vi.mock("@/components/chat/chat-input", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("@/components/chat/chat-input")>()
+  return {
+    ...actual,
+    ChatInput: (props: ComponentProps<typeof actual.ChatInput>) => {
+      surfaceH.chatInputSendClearMode = props.sendClearMode
+      return surfaceH.renderRealComposer
+        ? createElement(actual.ChatInput, props)
+        : null
+    },
+  }
+})
 vi.mock("@/components/chat/welcome-hero", () => ({
   WelcomeHero: () => null,
   WelcomeTip: () => null,
@@ -1072,12 +1169,17 @@ vi.mock("@/lib/selector-prefs-storage", () => ({
   saveModePreference: vi.fn(),
 }))
 
-vi.mock("@/lib/message-input-draft", () => ({
-  buildConversationDraftStorageKey: (id: number) => `draft:${id}`,
-  buildNewConversationDraftStorageKey: () => "draft:new",
-  clearMessageInputDraft: vi.fn(),
-  saveMessageInputDraft: vi.fn(),
-}))
+vi.mock("@/lib/message-input-draft", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("@/lib/message-input-draft")>()
+  return {
+    ...actual,
+    buildConversationDraftStorageKey: (id: number) => `draft:${id}`,
+    buildNewConversationDraftStorageKey: () => "draft:new",
+    clearMessageInputDraft: vi.fn(),
+    saveMessageInputDraft: vi.fn(),
+  }
+})
 
 function fullSummary(id: number, status: string, updatedAt: string = BASELINE) {
   return {
@@ -1163,6 +1265,7 @@ function mountSharedSurface(
     status?: "connected" | "prompting"
   } = {}
 ) {
+  surfaceH.renderRealComposer = true
   surfaceH.conversations =
     options.conversationId === null
       ? []
@@ -1190,10 +1293,41 @@ function mountSharedSurfaceWithQueue(queue: SharedQueuedPrompt[]) {
   return mountSharedSurface({ queue })
 }
 
-async function sendDraft(text: string) {
-  await act(async () => {
-    await surfaceH.shellProps?.onSend?.(directDraft(text))
+async function mountedSurfaceEditor() {
+  await waitFor(
+    () => expect(surfaceComposerHandle.current?.getEditor()).toBeTruthy(),
+    { timeout: 5000 }
+  )
+  const editor = surfaceComposerHandle.current?.getEditor()
+  if (!editor) throw new Error("surface composer editor not mounted")
+  return editor
+}
+
+async function sendDraft(text: string, attachmentPath?: string) {
+  const editor = await mountedSurfaceEditor()
+  act(() => {
+    editor.commands.insertContent(text)
+    if (attachmentPath) {
+      emitAttachFileToSession({ tabId: "tab-1", path: attachmentPath })
+    }
   })
+  if (attachmentPath) {
+    await waitFor(() =>
+      expect(serializeDocToText(editor.state.doc)).toContain(attachmentPath)
+    )
+  }
+  await act(async () => {
+    editor.view.dom.dispatchEvent(
+      new KeyboardEvent("keydown", {
+        bubbles: true,
+        cancelable: true,
+        key: "Enter",
+      })
+    )
+    await Promise.resolve()
+    await Promise.resolve()
+  })
+  return editor
 }
 
 function emitAcp(event: EventEnvelope) {
@@ -1268,6 +1402,8 @@ function resetSurfaceHarness() {
   lifecycleCapture.handleSetConfigOption.mockClear()
   lifecycleCapture.handleSend.mockReset()
   lifecycleCapture.handleSend.mockResolvedValue(null)
+  vi.mocked(createConversation).mockReset()
+  vi.mocked(createConversation).mockResolvedValue(99)
   surfaceH.conversations = []
   surfaceH.acpEventHandlers = []
   surfaceH.connStatus = null
@@ -1314,6 +1450,10 @@ function resetSurfaceHarness() {
   surfaceH.messageListProps = null
   surfaceH.openTab.mockClear()
   surfaceH.renderRoot = null
+  surfaceH.renderRealComposer = false
+  surfaceH.chatInputSendClearMode = null
+  surfaceComposerHandle.current = null
+  localStorage.clear()
   surfaceH.supportsFork = false
   surfaceH.isDelegationChild = false
 }
@@ -1337,9 +1477,12 @@ describe("ConversationSessionSurface authoritative shared queue", () => {
     )
     mountSharedSurfaceWithQueue(queue)
 
-    await sendDraft("later")
+    const editor = await sendDraft("later")
 
-    expect(surfaceH.runtimeOptimisticTurns).toHaveLength(0)
+    await waitFor(() => expect(surfaceH.runtimeOptimisticTurns).toHaveLength(0))
+    await waitFor(() =>
+      expect(serializeDocToText(editor.state.doc)).not.toContain("later")
+    )
     expect(surfaceH.shellProps?.sharedQueue).toEqual(queue)
     expect(surfaceH.shellProps?.sendClearMode).toBe("after-admission")
   })
@@ -1381,6 +1524,9 @@ describe("ConversationSessionSurface authoritative shared queue", () => {
 
     await sendDraft("queue on server")
 
+    await waitFor(() =>
+      expect(lifecycleCapture.handleSend).toHaveBeenCalledTimes(1)
+    )
     expect(surfaceH.enqueue).not.toHaveBeenCalled()
     expect(surfaceH.shellProps?.onEnqueue).toBeUndefined()
     expect(lifecycleCapture.handleSend).toHaveBeenCalledTimes(1)
@@ -1390,7 +1536,7 @@ describe("ConversationSessionSurface authoritative shared queue", () => {
     })
   })
 
-  it("awaits first-conversation creation and backend admission as one promise", async () => {
+  it("retains and locks the first-conversation composer until creation and admission succeed", async () => {
     let resolveCreate!: (id: number) => void
     let resolveAdmission!: () => void
     vi.mocked(createConversation).mockImplementation(
@@ -1401,28 +1547,40 @@ describe("ConversationSessionSurface authoritative shared queue", () => {
     )
     mountSharedSurface({ conversationId: null })
 
-    let settled = false
-    let send!: Promise<void>
-    act(() => {
-      send = Promise.resolve(
-        surfaceH.shellProps?.onSend?.(directDraft("first shared message"))
-      ).then(() => {
-        settled = true
-      })
-    })
+    const editor = await sendDraft(
+      "first shared message ",
+      "/repo/first-context.ts"
+    )
+    expect(surfaceH.chatInputSendClearMode).toBe("after-admission")
+    await waitFor(() => expect(createConversation).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(editor.isEditable).toBe(false))
+    expect(serializeDocToText(editor.state.doc)).toContain(
+      "first shared message"
+    )
+    expect(serializeDocToText(editor.state.doc)).toContain("first-context.ts")
+    expect(lifecycleCapture.handleSend).not.toHaveBeenCalled()
+
     await act(async () => resolveCreate(99))
-    expect(settled).toBe(false)
     expect(lifecycleCapture.handleSend).toHaveBeenCalledTimes(1)
+    expect(editor.isEditable).toBe(false)
+    expect(serializeDocToText(editor.state.doc)).toContain("first-context.ts")
     expect(surfaceH.enqueue).not.toHaveBeenCalled()
 
     await act(async () => {
       resolveAdmission()
-      await send
     })
-    expect(settled).toBe(true)
+    await waitFor(() => expect(surfaceComposerHandle.current).not.toBe(editor))
+    const settledEditor = surfaceComposerHandle.current?.getEditor()
+    expect(settledEditor?.isEditable).toBe(true)
+    expect(serializeDocToText(settledEditor!.state.doc)).not.toContain(
+      "first shared message"
+    )
+    expect(serializeDocToText(settledEditor!.state.doc)).not.toContain(
+      "first-context.ts"
+    )
   })
 
-  it("rolls back a rejected shared admission without requesting draft restore", async () => {
+  it("retains the welcome editor and attachment when first admission rejects", async () => {
     lifecycleCapture.handleSend.mockImplementation(
       async (_draft, _mode, opts) => {
         const error = new Error("admission failed")
@@ -1430,11 +1588,14 @@ describe("ConversationSessionSurface authoritative shared queue", () => {
         throw error
       }
     )
-    mountSharedSurface()
+    mountSharedSurface({ conversationId: null })
 
-    await expect(sendDraft("keep draft")).rejects.toThrow("admission failed")
+    const editor = await sendDraft("keep draft ", "/repo/retry-context.ts")
 
-    expect(surfaceH.runtimeOptimisticTurns).toHaveLength(0)
+    await waitFor(() => expect(editor.isEditable).toBe(true))
+    expect(serializeDocToText(editor.state.doc)).toContain("keep draft")
+    expect(serializeDocToText(editor.state.doc)).toContain("retry-context.ts")
+    await waitFor(() => expect(surfaceH.runtimeOptimisticTurns).toHaveLength(0))
     expect(surfaceH.shellProps?.draftRestore).toBeNull()
   })
 

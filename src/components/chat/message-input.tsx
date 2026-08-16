@@ -371,6 +371,10 @@ export function MessageInput({
   const sendAdmissionPendingRef = useRef(false)
   const [sendAdmissionPending, setSendAdmissionPending] = useState(false)
   const mutationLocked = interactionLocked || sendAdmissionPending
+  const mutationLockedNow = useCallback(
+    () => interactionLocked || sendAdmissionPendingRef.current,
+    [interactionLocked]
+  )
   // The editor owns the content now; this mirror of its empty state drives the
   // send button and `hasSendableContent`.
   const [composerEmpty, setComposerEmpty] = useState(true)
@@ -390,7 +394,7 @@ export function MessageInput({
   const attach = useComposerAttachments({
     editorRef,
     containerRef,
-    disabled: disabled || sendAdmissionPending,
+    disabled: disabled || mutationLocked,
     promptCapabilities,
     attachmentTabId,
     defaultPath,
@@ -723,7 +727,7 @@ export function MessageInput({
   }, [draftRestore, composerReady, hydrateFromBlocks, effectiveDraftStorageKey])
 
   useEffect(() => {
-    if (!injectContent || !composerReady) return
+    if (!injectContent || !composerReady || mutationLocked) return
     const payload = injectContent
     // Defer the editor mutation to the next frame. Inserting the skill badge
     // creates a React NodeView, which @tiptap/react renders with a synchronous
@@ -734,6 +738,7 @@ export function MessageInput({
     // inside the frame so the synchronous body never flips injectContent → null
     // and lets the cleanup cancel our own rAF before it runs.
     const raf = requestAnimationFrame(() => {
+      if (mutationLockedNow()) return
       const handle = editorRef.current
       if (handle) {
         handle.setText(payload.text)
@@ -757,7 +762,14 @@ export function MessageInput({
       onInjectConsumed?.()
     })
     return () => cancelAnimationFrame(raf)
-  }, [injectContent, composerReady, skillPrefix, onInjectConsumed])
+  }, [
+    injectContent,
+    composerReady,
+    mutationLocked,
+    mutationLockedNow,
+    skillPrefix,
+    onInjectConsumed,
+  ])
 
   // A skill / expert badge freezes its invocation prefix (`$` for Codex, `/`
   // elsewhere) at insert time. On the welcome page users routinely click a
@@ -966,6 +978,7 @@ export function MessageInput({
   // token on send (see invocation-reference / referenceToMarkdown).
   const replaceTriggerWithReference = useCallback(
     (ref: ReferenceAttrs) => {
+      if (mutationLockedNow()) return
       const editor = editorRef.current?.getEditor()
       if (!editor) return
       const { $from } = editor.state.selection
@@ -997,7 +1010,7 @@ export function MessageInput({
       chain.run()
       closeSlashMenu()
     },
-    [closeSlashMenu]
+    [closeSlashMenu, mutationLockedNow]
   )
 
   const handleSlashSelect = useCallback(
@@ -1042,7 +1055,7 @@ export function MessageInput({
   }, [selectionPlainText, t])
 
   const handleContextCut = useCallback(async () => {
-    if (disabled) return
+    if (disabled || mutationLockedNow()) return
     const editor = editorRef.current?.getEditor()
     if (!editor) return
     // Capture the range up front so the post-write delete targets exactly what
@@ -1053,17 +1066,20 @@ export function MessageInput({
     await cutSelectionToClipboard({
       text: selectionPlainText(editor),
       copy: copyTextFromMenu,
-      remove: () => editor.chain().focus().deleteRange({ from, to }).run(),
+      remove: () => {
+        if (mutationLockedNow()) return
+        editor.chain().focus().deleteRange({ from, to }).run()
+      },
       onWriteFailed: () => toast.error(t("clipboardWriteFailed")),
     })
-  }, [disabled, selectionPlainText, t])
+  }, [disabled, mutationLockedNow, selectionPlainText, t])
 
   const handleContextSelectAll = useCallback(() => {
-    if (disabled) return
+    if (disabled || mutationLockedNow()) return
     const editor = editorRef.current?.getEditor()
     if (!editor) return
     editor.chain().focus().selectAll().run()
-  }, [disabled])
+  }, [disabled, mutationLockedNow])
 
   // Opening the custom right-click menu: snapshot whether there's a selection
   // (gates Cut/Copy) and refresh the quick-messages list. The editor keeps its
@@ -1089,7 +1105,7 @@ export function MessageInput({
   // inside the menu-click / keydown user gesture, so the async Clipboard API has
   // the activation it needs.
   const handleContextPaste = useCallback(async () => {
-    if (disabled) return
+    if (disabled || mutationLockedNow()) return
     const editor = editorRef.current?.getEditor()
     if (!editor) return
     let text = ""
@@ -1106,6 +1122,7 @@ export function MessageInput({
       readBlocked = true
       text = ""
     }
+    if (mutationLockedNow()) return
     if (text) {
       // Route through ProseMirror's own text paste so newlines, marks and the
       // editor's paste pipeline behave exactly like a keyboard paste.
@@ -1116,6 +1133,7 @@ export function MessageInput({
     // No text — try a pasted image (screenshot), mirroring `handlePasteFiles`.
     try {
       const imageFiles = await imageFilesFromClipboardApi()
+      if (mutationLockedNow()) return
       if (imageFiles.length > 0) {
         await attach.appendFilesFromInput(imageFiles)
         return
@@ -1130,7 +1148,7 @@ export function MessageInput({
     if (readBlocked) {
       toast.error(t("pasteUnavailable"))
     }
-  }, [disabled, attach, t])
+  }, [disabled, mutationLockedNow, attach, t])
 
   // Bridges the composer's Ctrl/⌘+Shift+V key to the plain-text paste above.
   // Returns whether the shortcut was consumed: when disabled or when the async
@@ -1140,16 +1158,17 @@ export function MessageInput({
   // still works. The read runs inside this keydown gesture, so its activation
   // is preserved.
   const handlePlainPasteShortcut = useCallback((): boolean => {
-    if (disabled) return true
+    if (disabled || mutationLockedNow()) return true
     if (!clipboardReadSupported) return false
     void handleContextPaste()
     return true
-  }, [disabled, clipboardReadSupported, handleContextPaste])
+  }, [disabled, mutationLockedNow, clipboardReadSupported, handleContextPaste])
 
   useEffect(() => {
     if (!attachmentTabId) return
 
     const handleAttachFile = (event: Event) => {
+      if (mutationLockedNow()) return
       const customEvent = event as CustomEvent<AttachFileToSessionDetail>
       if (!customEvent.detail) return
       if (customEvent.detail.tabId !== attachmentTabId) return
@@ -1167,12 +1186,13 @@ export function MessageInput({
     return () => {
       window.removeEventListener(ATTACH_FILE_TO_SESSION_EVENT, handleAttachFile)
     }
-  }, [attach, attachmentTabId])
+  }, [attach, attachmentTabId, mutationLockedNow])
 
   useEffect(() => {
     if (!attachmentTabId) return
 
     const handleAppendText = (event: Event) => {
+      if (mutationLockedNow()) return
       const customEvent = event as CustomEvent<AppendTextToSessionDetail>
       if (!customEvent.detail) return
       if (customEvent.detail.tabId !== attachmentTabId) return
@@ -1194,7 +1214,7 @@ export function MessageInput({
     return () => {
       window.removeEventListener(APPEND_TEXT_TO_SESSION_EVENT, handleAppendText)
     }
-  }, [attachmentTabId])
+  }, [attachmentTabId, mutationLockedNow])
 
   const buildDraft = useCallback((): PromptDraft | null => {
     const editor = editorRef.current?.getEditor()
@@ -1396,7 +1416,7 @@ export function MessageInput({
   // `handleSend`'s uploading gate).
   const [steering, setSteering] = useState(false)
   const handleSteerClick = useCallback(async () => {
-    if (!onSteer || steering) return
+    if (mutationLockedNow() || !onSteer || steering) return
     const draft = buildDraft()
     if (!draft) return
     const enqueueInstead = () => {
@@ -1430,6 +1450,7 @@ export function MessageInput({
     }
   }, [
     onSteer,
+    mutationLockedNow,
     steering,
     buildDraft,
     onEnqueue,
@@ -1537,7 +1558,7 @@ export function MessageInput({
   )
 
   const hasImageAttachments = imageAttachments.length > 0
-  const showDragActive = attach.isDragActive && !disabled
+  const showDragActive = attach.isDragActive && !disabled && !mutationLocked
 
   const inlineSelectorItems = (
     <>
@@ -2012,8 +2033,10 @@ export function MessageInput({
                 extraContent={
                   <ComposerImageThumbnails
                     attachments={imageAttachments}
-                    onRemove={attach.removeAttachment}
-                    removeDisabled={sendAdmissionPending}
+                    onRemove={(id) => {
+                      if (!mutationLockedNow()) attach.removeAttachment(id)
+                    }}
+                    removeDisabled={mutationLocked}
                   />
                 }
               />
@@ -2029,8 +2052,12 @@ export function MessageInput({
                 onReady={handleComposerReady}
                 onSubmit={handleSend}
                 onFocus={onFocus}
-                onPasteFiles={attach.handlePasteFiles}
-                onDropFiles={attach.handleEditorDrop}
+                onPasteFiles={(event) =>
+                  mutationLockedNow() || attach.handlePasteFiles(event)
+                }
+                onDropFiles={(event) =>
+                  mutationLockedNow() || attach.handleEditorDrop(event)
+                }
                 onPlainPaste={handlePlainPasteShortcut}
                 submitShortcut={shortcuts.send_message}
                 newlineShortcut={shortcuts.newline_in_message}
@@ -2041,7 +2068,7 @@ export function MessageInput({
               <div className="flex shrink-0 items-end justify-between gap-1 px-2 pb-2">
                 <div className="flex min-w-0 items-end gap-1">
                   <ComposerAddMenu
-                    disabled={disabled || sendAdmissionPending}
+                    disabled={disabled || mutationLocked}
                     attachments={attach}
                     shortcuts={menuShortcuts}
                     slashCommands={slashCommands}
@@ -2137,7 +2164,7 @@ export function MessageInput({
           </ContextMenuTrigger>
           <ContextMenuContent>
             <ContextMenuItem
-              disabled={disabled || !contextSelectionActive}
+              disabled={disabled || mutationLocked || !contextSelectionActive}
               onSelect={() => void handleContextCut()}
             >
               <Scissors className="size-4" />
@@ -2151,7 +2178,7 @@ export function MessageInput({
               {t("copy")}
             </ContextMenuItem>
             <ContextMenuItem
-              disabled={disabled}
+              disabled={disabled || mutationLocked}
               onSelect={() => {
                 void handleContextPaste()
               }}
@@ -2160,7 +2187,7 @@ export function MessageInput({
               {t("pasteAsPlainText")}
             </ContextMenuItem>
             <ContextMenuItem
-              disabled={disabled}
+              disabled={disabled || mutationLocked}
               onSelect={() => handleContextSelectAll()}
             >
               <TextSelect className="size-4" />
@@ -2168,7 +2195,7 @@ export function MessageInput({
             </ContextMenuItem>
             <ContextMenuSeparator />
             <ContextMenuSub>
-              <ContextMenuSubTrigger disabled={disabled}>
+              <ContextMenuSubTrigger disabled={disabled || mutationLocked}>
                 <MessageSquareText className="size-4" />
                 {t("quickMessages")}
               </ContextMenuSubTrigger>
@@ -2193,7 +2220,12 @@ export function MessageInput({
                   menuShortcuts.quickMessages.map((message) => (
                     <ContextMenuItem
                       key={message.id}
-                      onSelect={() => menuShortcuts.insertQuickMessage(message)}
+                      disabled={mutationLocked}
+                      onSelect={() => {
+                        if (!mutationLockedNow()) {
+                          menuShortcuts.insertQuickMessage(message)
+                        }
+                      }}
                     >
                       <span className="truncate">
                         {message.title || (

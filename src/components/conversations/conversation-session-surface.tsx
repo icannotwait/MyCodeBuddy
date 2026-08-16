@@ -466,6 +466,10 @@ export const ConversationSessionSurface = memo(
     const lastContinuationFailureKeyRef = useRef<string | null>(null)
     const tAcpConnections = useTranslations("Folder.chat.acpConnections")
     const [hasSentMessage, setHasSentMessage] = useState(false)
+    const [
+      retainWelcomeComposerForAdmission,
+      setRetainWelcomeComposerForAdmission,
+    ] = useState(false)
     const [quickActionInject, setQuickActionInject] =
       useState<ComposerInjectContent | null>(null)
 
@@ -1482,7 +1486,22 @@ export const ConversationSessionSurface = memo(
         )
         setSendSignal((prev) => prev + 1)
         setSyncState(effectiveConversationId, "awaiting_persist")
-        setHasSentMessage(true)
+        const preservesSharedWelcomeComposer =
+          conn.sharedSession != null &&
+          (!hasPersistedConversation || retainWelcomeComposerForAdmission)
+        if (preservesSharedWelcomeComposer) {
+          setRetainWelcomeComposerForAdmission(true)
+        } else {
+          setHasSentMessage(true)
+        }
+
+        const completeSharedWelcomeAdmission = <T,>(result: T): T => {
+          if (preservesSharedWelcomeComposer) {
+            setHasSentMessage(true)
+            setRetainWelcomeComposerForAdmission(false)
+          }
+          return result
+        }
 
         // Backend rejected the send because a turn was already in flight (another
         // co-controlling client, or a "prompting" status this client hadn't
@@ -1546,7 +1565,7 @@ export const ConversationSessionSurface = memo(
           // Existing-tab path: row already exists, send immediately with the
           // conversation_id pinned so the backend reuses our row instead of
           // creating a duplicate.
-          return lifecycleSend(draft, selectedModeIdArg, {
+          const sendResult = lifecycleSend(draft, selectedModeIdArg, {
             folderId,
             conversationId: persistedId,
             // The backend echoes this as the broadcast UserMessage's message_id,
@@ -1569,6 +1588,9 @@ export const ConversationSessionSurface = memo(
                     selectedModeIdArg,
                   }),
           })
+          return preservesSharedWelcomeComposer
+            ? Promise.resolve(sendResult).then(completeSharedWelcomeAdmission)
+            : sendResult
         }
 
         // New-tab path: create the DB row first, then send with the new id
@@ -1728,7 +1750,11 @@ export const ConversationSessionSurface = memo(
           }
         }
         const pendingCreate = createAndSend()
-        if (conn.sharedSession) return pendingCreate
+        if (conn.sharedSession) {
+          return preservesSharedWelcomeComposer
+            ? pendingCreate.then(completeSharedWelcomeAdmission)
+            : pendingCreate
+        }
         void pendingCreate
       },
       [
@@ -1741,6 +1767,7 @@ export const ConversationSessionSurface = memo(
         canAutoConnect,
         promptAdmissionReady,
         conn.sharedSession,
+        retainWelcomeComposerForAdmission,
         conn.waitingForSubagents,
         draftStorageKey,
         effectiveConversationId,
@@ -2191,7 +2218,7 @@ export const ConversationSessionSurface = memo(
     )
 
     const showDraftHeader = !hasPersistedConversation && !hasSentMessage
-    const isWelcomeMode = showDraftHeader
+    const isWelcomeMode = showDraftHeader || retainWelcomeComposerForAdmission
 
     const handleQuickAction = useCallback((payload: ComposerInjectContent) => {
       setQuickActionInject(payload)
@@ -2586,6 +2613,9 @@ export const ConversationSessionSurface = memo(
                   agentName={getAgentLabel(selectedAgent)}
                   onFocus={handleFocus}
                   onSend={handleSend}
+                  sendClearMode={
+                    conn.sharedSession ? "after-admission" : "immediate"
+                  }
                   onCancel={handleCancel}
                   waitingForSubagents={conn.waitingForSubagents}
                   draftRestore={promptDraftRestore}
