@@ -1701,17 +1701,19 @@ export function validateProgressRouting(snapshot, routing, failures) {
         boundary?.expected_work_unit_keys,
         boundaryRoute?.expected_work_unit_keys
       )
-    const allowed = expectedKeySet(boundaryRoute?.expected_work_unit_keys)
-    const hasAdmittedRun = boundaryRuns.some(
+    const implementerKey = boundaryRoute?.expected_work_unit_keys?.implementer
+    const hasAdmittedImplementerRun = boundaryRuns.some(
       (run) =>
         isObject(run) &&
-        allowed.has(run.work_unit_key) &&
+        run.work_unit_key === implementerKey &&
         nonEmptyString(run.task_id) &&
         positiveInteger(run.child_conversation_id) &&
         run.child_conversation_id <= MAX_I32
     )
     const historicalAdoptedBoundary =
-      boundary?.status !== "pending" && frozenRouteMatches && hasAdmittedRun
+      boundary?.status !== "pending" &&
+      frozenRouteMatches &&
+      hasAdmittedImplementerRun
     if (
       !boundary ||
       !priorCompleted ||

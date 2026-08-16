@@ -909,6 +909,37 @@ describe("progress agreement and per-key lineage", () => {
     assert.deepEqual(validate(route, state, routedPlan), [], "following Task")
   })
 
+  it("rejects historical generation adoption by admitted reviewer-only runs", () => {
+    const route = routing()
+    const selected = identity("gemini", "careful")
+    route.task_agent_generations.push({
+      generation: 2,
+      ...selected,
+      effective_from_task_index: 2,
+    })
+    route.tasks[1] = task(2, "high", selected, 2)
+
+    for (const reviewerSlots of [
+      ["primary"],
+      ["auxiliary"],
+      ["primary", "auxiliary"],
+    ]) {
+      const state = progress(route)
+      state.tasks[1].status = "in_progress"
+      state.active_task_index = 2
+      state.tasks[1].runs = reviewerSlots.map((slot, index) =>
+        run(
+          state.tasks[1].expected_work_unit_keys.reviewers[slot],
+          "running",
+          `t2-${slot}`,
+          20 + index
+        )
+      )
+
+      has(validate(route, state), "B2D-ROUTING-007")
+    }
+  })
+
   it("adopts a later generation only at an empty pending boundary", () => {
     const route = routing()
     const selected = identity("gemini", "careful")
