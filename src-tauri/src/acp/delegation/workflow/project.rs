@@ -49,7 +49,7 @@ use super::types::{
     ManifestDocument, ManifestNodeKind, ManifestNodeRole, ManifestTaskPolicy,
     ManifestWorkflowState, NormalizedGate, ParsedWorkUnitKey, ResolutionMode, ReviewerSlot,
     TaskHardTriggerKind, TaskRiskLevel, TaskSoftSignalKind, WorkUnitKeyParts,
-    WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY,
+    MAX_ADJUDICATION_SUMMARY_BYTES, WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY,
 };
 use super::validate::validate_manifest_document;
 
@@ -2153,6 +2153,80 @@ struct SimpleExpectedRoute {
     auxiliary_reviewer_key: Option<String>,
 }
 
+fn simple_soft_signal_weight(kind: &str) -> Option<u32> {
+    match kind {
+        "cross_runtime_or_process" => Some(2),
+        "broad_production_surface"
+        | "multiple_ownership_modules"
+        | "shared_interface"
+        | "dependency_or_build"
+        | "multi_layer_without_test_seam" => Some(1),
+        _ => None,
+    }
+}
+
+fn simple_risk_evidence_is_valid(evidence: &[String]) -> bool {
+    !evidence.is_empty()
+        && evidence.iter().all(|item| {
+            let item = item.trim();
+            !item.is_empty() && item.len() <= MAX_ADJUDICATION_SUMMARY_BYTES
+        })
+}
+
+fn validate_simple_task_risk(
+    risk: &super::simple_parse::SimpleTaskRisk,
+) -> Result<(), &'static str> {
+    let mut hard_kinds = HashSet::new();
+    for trigger in &risk.hard_triggers {
+        if !matches!(
+            trigger.kind.as_str(),
+            "concurrency_lifecycle"
+                | "security_trust_boundary"
+                | "migration_destructive_persistence"
+                | "public_compatibility"
+                | "unsafe_ffi"
+                | "update_rollback"
+        ) || trigger.score.is_some()
+            || !hard_kinds.insert(trigger.kind.as_str())
+            || !simple_risk_evidence_is_valid(&trigger.evidence)
+        {
+            return Err("hard trigger invalid");
+        }
+    }
+
+    let mut soft_kinds = HashSet::new();
+    let mut derived_score = 0u32;
+    for signal in &risk.soft_signals {
+        let weight = simple_soft_signal_weight(&signal.kind).ok_or("soft signal invalid")?;
+        if signal.score != Some(weight)
+            || !soft_kinds.insert(signal.kind.as_str())
+            || !simple_risk_evidence_is_valid(&signal.evidence)
+        {
+            return Err("soft signal invalid");
+        }
+        derived_score = derived_score
+            .checked_add(weight)
+            .ok_or("soft score overflow")?;
+    }
+    if risk.score != derived_score {
+        return Err("soft score inconsistent");
+    }
+
+    let expected_level = if !risk.hard_triggers.is_empty() || derived_score >= 3 {
+        "high"
+    } else {
+        "normal"
+    };
+    if risk.level != expected_level {
+        return Err("risk level inconsistent");
+    }
+    let reason = risk.reason.trim();
+    if reason.is_empty() || reason.len() > MAX_ADJUDICATION_SUMMARY_BYTES {
+        return Err("risk reason invalid");
+    }
+    Ok(())
+}
+
 fn derive_simple_expected_route(
     routing: &SimpleRoutingSnapshot,
     task_index: u32,
@@ -2166,6 +2240,7 @@ fn derive_simple_expected_route(
     if matching_tasks.next().is_some() {
         return Err("routing task duplicated");
     }
+    validate_simple_task_risk(&task.risk)?;
     if task.task_agent_generation == 0 {
         return Err("task Agent generation missing");
     }
@@ -2315,13 +2390,7 @@ fn reconcile_simple_progress_route(
         push_projection_warning(warnings, "simple_progress_expected_route_missing");
     }
 
-    let mut expected_keys = BTreeSet::from([
-        expected.implementer_key.as_str(),
-        expected.primary_reviewer_key.as_str(),
-    ]);
-    if let Some(auxiliary) = expected.auxiliary_reviewer_key.as_deref() {
-        expected_keys.insert(auxiliary);
-    }
+    let expected_keys = simple_expected_route_keys(expected);
     let mut key_by_child = HashMap::<i32, &str>::new();
     let mut run_outside_expected_route = false;
     let mut route_child_not_independent = false;
@@ -2337,10 +2406,7 @@ fn reconcile_simple_progress_route(
         let Some(child_id) = run.child_conversation_id else {
             continue;
         };
-        if key_by_child
-            .insert(child_id, key)
-            .is_some_and(|prior_key| prior_key != key)
-        {
+        if simple_route_child_conflicts(&mut key_by_child, child_id, key) {
             route_child_not_independent = true;
         }
     }
@@ -2350,6 +2416,29 @@ fn reconcile_simple_progress_route(
     if route_child_not_independent {
         push_projection_warning(warnings, "simple_progress_route_child_not_independent");
     }
+}
+
+fn simple_expected_route_keys(expected: &SimpleExpectedRoute) -> BTreeSet<&str> {
+    let mut keys = BTreeSet::from([
+        expected.implementer_key.as_str(),
+        expected.primary_reviewer_key.as_str(),
+    ]);
+    if let Some(auxiliary) = expected.auxiliary_reviewer_key.as_deref() {
+        keys.insert(auxiliary);
+    }
+    keys
+}
+
+fn simple_route_child_conflicts<'a>(
+    key_by_child: &mut HashMap<i32, &'a str>,
+    child_id: i32,
+    key: &'a str,
+) -> bool {
+    if let Some(prior_key) = key_by_child.get(&child_id) {
+        return *prior_key != key;
+    }
+    key_by_child.insert(child_id, key);
+    false
 }
 
 fn run_matches_work_unit_key(run: &delegation_task_run::Model, expected_key: &str) -> bool {
@@ -2493,21 +2582,32 @@ async fn project_simple_mode(
             .filter(|run| run_matches_task_index(run, task.index))
             .collect::<Vec<_>>();
         if let Some(expected) = expected_route.as_ref() {
-            let route_keys = [
-                Some(expected.implementer_key.as_str()),
-                Some(expected.primary_reviewer_key.as_str()),
-                expected.auxiliary_reviewer_key.as_deref(),
-            ];
+            let route_keys = simple_expected_route_keys(expected);
             if task_runs.iter().any(|run| {
                 !route_keys
                     .iter()
-                    .flatten()
                     .any(|key| run_matches_work_unit_key(run, key))
             }) {
                 push_projection_warning(
                     &mut node_warning_codes,
                     "simple_progress_run_outside_expected_route",
                 );
+            }
+            let mut key_by_child = HashMap::<i32, &str>::new();
+            for run in &task_runs {
+                let Some(key) = run
+                    .work_unit_key
+                    .as_deref()
+                    .filter(|key| route_keys.contains(key))
+                else {
+                    continue;
+                };
+                if simple_route_child_conflicts(&mut key_by_child, run.child_conversation_id, key) {
+                    push_projection_warning(
+                        &mut node_warning_codes,
+                        "simple_progress_route_child_not_independent",
+                    );
+                }
             }
         }
         if let Some(declared) = declared {
@@ -3315,6 +3415,15 @@ mod tests {
                 profile_id: task_agent_profile.map(str::to_string),
             }
         };
+        let hard_triggers = if risk_level == "high" {
+            vec![SimpleRiskEvidence {
+                kind: "public_compatibility".into(),
+                score: None,
+                evidence: vec!["public routing contract".into()],
+            }]
+        } else {
+            vec![]
+        };
         SimpleRoutingSnapshot {
             schema_version: 1,
             risk_policy_version: "b2d_task_risk_v1".into(),
@@ -3329,7 +3438,7 @@ mod tests {
                 task_agent_generation: 7,
                 risk: SimpleTaskRisk {
                     level: risk_level.into(),
-                    hard_triggers: Vec::<SimpleRiskEvidence>::new(),
+                    hard_triggers,
                     soft_signals: Vec::<SimpleRiskEvidence>::new(),
                     score: 0,
                     reason: "fixture".into(),
@@ -3459,6 +3568,100 @@ mod tests {
                 "invalid route must not produce trusted keys: {routing:?}"
             );
         }
+    }
+
+    #[test]
+    fn simple_projection_route_validates_risk_policy_boundaries_and_hard_triggers() {
+        use super::super::simple_parse::SimpleRiskEvidence;
+
+        let soft_signal = |kind: &str, score| SimpleRiskEvidence {
+            kind: kind.into(),
+            score: Some(score),
+            evidence: vec![format!("evidence for {kind}")],
+        };
+        let cases = [
+            ("normal", vec![], 0),
+            ("normal", vec![soft_signal("shared_interface", 1)], 1),
+            (
+                "normal",
+                vec![soft_signal("cross_runtime_or_process", 2)],
+                2,
+            ),
+            (
+                "high",
+                vec![
+                    soft_signal("cross_runtime_or_process", 2),
+                    soft_signal("shared_interface", 1),
+                ],
+                3,
+            ),
+        ];
+        for (level, soft_signals, score) in cases {
+            let mut routing = simple_routing_fixture(1, level, "grok", None);
+            routing.tasks[0].risk.hard_triggers.clear();
+            routing.tasks[0].risk.soft_signals = soft_signals;
+            routing.tasks[0].risk.score = score;
+            assert!(
+                derive_simple_expected_route(&routing, 1).is_ok(),
+                "score {score} must produce {level}"
+            );
+        }
+
+        for kind in [
+            "concurrency_lifecycle",
+            "security_trust_boundary",
+            "migration_destructive_persistence",
+            "public_compatibility",
+            "unsafe_ffi",
+            "update_rollback",
+        ] {
+            let mut routing = simple_routing_fixture(1, "normal", "grok", None);
+            routing.tasks[0].risk.hard_triggers = vec![SimpleRiskEvidence {
+                kind: kind.into(),
+                score: None,
+                evidence: vec![format!("evidence for {kind}")],
+            }];
+            assert!(
+                derive_simple_expected_route(&routing, 1).is_err(),
+                "hard trigger {kind} must reject a normal route"
+            );
+        }
+    }
+
+    #[test]
+    fn simple_projection_route_rejects_inconsistent_and_duplicate_soft_evidence() {
+        use super::super::simple_parse::SimpleRiskEvidence;
+
+        let shared_interface = SimpleRiskEvidence {
+            kind: "shared_interface".into(),
+            score: Some(1),
+            evidence: vec!["shared projection contract".into()],
+        };
+
+        let mut wrong_total = simple_routing_fixture(1, "normal", "grok", None);
+        wrong_total.tasks[0].risk.soft_signals = vec![shared_interface.clone()];
+        assert!(derive_simple_expected_route(&wrong_total, 1).is_err());
+
+        let mut duplicate = simple_routing_fixture(1, "normal", "grok", None);
+        duplicate.tasks[0].risk.soft_signals = vec![shared_interface.clone(), shared_interface];
+        duplicate.tasks[0].risk.score = 2;
+        assert!(derive_simple_expected_route(&duplicate, 1).is_err());
+
+        let mut contradictory = simple_routing_fixture(1, "normal", "grok", None);
+        contradictory.tasks[0].risk.soft_signals = vec![
+            SimpleRiskEvidence {
+                kind: "cross_runtime_or_process".into(),
+                score: Some(2),
+                evidence: vec!["process boundary".into()],
+            },
+            SimpleRiskEvidence {
+                kind: "dependency_or_build".into(),
+                score: Some(1),
+                evidence: vec!["build contract".into()],
+            },
+        ];
+        contradictory.tasks[0].risk.score = 3;
+        assert!(derive_simple_expected_route(&contradictory, 1).is_err());
     }
 
     #[test]
@@ -3592,6 +3795,82 @@ mod tests {
             &run,
             "task|4|implementer|codex|none"
         ));
+    }
+
+    #[tokio::test]
+    async fn simple_projection_warns_when_durable_route_keys_share_a_child() {
+        use sea_orm::{ActiveModelTrait, Set};
+
+        let (db, parent) = seed_parent().await;
+        let workspace = parent_workspace(&db, parent).await;
+        let routing = simple_routing_fixture(1, "normal", "grok", None);
+        let routing_json = serde_json::to_string(&routing).expect("serialize routing");
+        std::fs::write(
+            std::path::Path::new(&workspace).join("docs/simple-plan.md"),
+            format!(
+                "# Plan\n\n<!-- codeg-b2d-routing-v1\n{routing_json}\n-->\n\n## Task 1: Durable route\n\nBody.\n"
+            ),
+        )
+        .expect("write routed Simple plan");
+        super::super::simple::register_simple_workflow(
+            &db.conn,
+            parent,
+            "docs/simple-plan.md",
+            None,
+        )
+        .await
+        .expect("register Simple descriptor");
+
+        let child = insert_run(
+            &db,
+            parent,
+            "durable-implementer",
+            Some("task|1|implementer|grok|none"),
+            DelegationRunStatus::Completed,
+            1,
+            None,
+            None,
+            "grok",
+        )
+        .await;
+        insert_run(
+            &db,
+            parent,
+            "durable-primary",
+            Some("task|1|reviewer|primary|codex|none"),
+            DelegationRunStatus::Completed,
+            2,
+            None,
+            None,
+            "codex",
+        )
+        .await;
+        let primary = delegation_task_run::Entity::find_by_id("durable-primary")
+            .one(&db.conn)
+            .await
+            .expect("query primary")
+            .expect("primary run");
+        let mut primary: delegation_task_run::ActiveModel = primary.into();
+        primary.child_conversation_id = Set(child);
+        primary.update(&db.conn).await.expect("reuse durable child");
+
+        let snapshot = project_workflow_graph_core(&db, parent)
+            .await
+            .expect("project routed Simple workflow");
+        let node = snapshot
+            .nodes
+            .iter()
+            .find(|node| node.task_index == Some(1))
+            .expect("projected Task 1");
+        assert_eq!(
+            node.projection_warning_codes
+                .iter()
+                .filter(|code| *code == "simple_progress_route_child_not_independent")
+                .count(),
+            1,
+            "durable route keys sharing child {child} must warn: {:?}",
+            node.projection_warning_codes
+        );
     }
 
     #[test]
