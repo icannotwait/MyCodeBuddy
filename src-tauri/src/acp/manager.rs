@@ -52,7 +52,8 @@ use crate::acp::shared_session::{
     SharedLaunchIdentity, SharedLifecycleState, SharedMutationGuard, SharedPromptAdmission,
     SharedPromptRequest, SharedReserveRequest, SharedRuntimeWorkSnapshot, SharedSessionAttachment,
     SharedSessionBroker, SharedSessionError, SharedSessionKey, SharedSessionPhase,
-    SharedSessionProjection, SharedStopClaimDecision, SharedStopRequest, StopAdmissionResolution,
+    SharedSessionProjection, SharedStopClaimDecision, SharedStopRequest, SharedSweepCandidateKind,
+    SharedSweepReport, StopAdmissionResolution,
 };
 use crate::acp::terminal_context::{finalize_acp_launch_config, AcpLaunchConfig, AcpLaunchInputs};
 use crate::acp::termination::AcpDisconnectOrigin;
@@ -781,6 +782,8 @@ pub struct ConnectionManager {
     #[cfg(any(test, feature = "test-utils"))]
     shared_registered_root_count: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(any(test, feature = "test-utils"))]
+    shared_teardown_count: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(any(test, feature = "test-utils"))]
     shared_fallback_trace: Arc<std::sync::Mutex<Vec<&'static str>>>,
     #[cfg(test)]
     shared_settler_panic_after_replacement: Arc<std::sync::atomic::AtomicBool>,
@@ -878,6 +881,8 @@ impl ConnectionManager {
             #[cfg(any(test, feature = "test-utils"))]
             shared_registered_root_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(any(test, feature = "test-utils"))]
+            shared_teardown_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(any(test, feature = "test-utils"))]
             shared_fallback_trace: Arc::new(std::sync::Mutex::new(Vec::new())),
             #[cfg(test)]
             shared_settler_panic_after_replacement: Arc::new(std::sync::atomic::AtomicBool::new(
@@ -922,6 +927,8 @@ impl ConnectionManager {
             shared_spawn_count: self.shared_spawn_count.clone(),
             #[cfg(any(test, feature = "test-utils"))]
             shared_registered_root_count: self.shared_registered_root_count.clone(),
+            #[cfg(any(test, feature = "test-utils"))]
+            shared_teardown_count: self.shared_teardown_count.clone(),
             #[cfg(any(test, feature = "test-utils"))]
             shared_fallback_trace: self.shared_fallback_trace.clone(),
             #[cfg(test)]
@@ -1547,6 +1554,12 @@ impl ConnectionManager {
     #[cfg(any(test, feature = "test-utils"))]
     pub fn shared_registered_root_count_for_test(&self) -> usize {
         self.shared_registered_root_count
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn shared_teardown_count_for_test(&self) -> usize {
+        self.shared_teardown_count
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
@@ -3515,6 +3528,176 @@ impl ConnectionManager {
             .await
     }
 
+    pub fn configure_shared_client_lease_ttl(&self, lease_ttl: Duration) {
+        self.shared_session_broker
+            .configure_client_lease_ttl(lease_ttl);
+    }
+
+    pub async fn sweep_shared_sessions(
+        &self,
+        idle_timeout: Duration,
+        client_lease_ttl: Duration,
+    ) -> SharedSweepReport {
+        let candidates = self
+            .shared_session_broker
+            .evaluate_idle(idle_timeout, client_lease_ttl)
+            .await;
+        let mut report = SharedSweepReport::default();
+        for candidate in candidates {
+            match candidate.kind {
+                SharedSweepCandidateKind::Failed => {
+                    if self
+                        .shared_session_broker
+                        .remove_sweep_candidate(&candidate)
+                        .await
+                    {
+                        report.removed = true;
+                        report.removed_count += 1;
+                    }
+                }
+                SharedSweepCandidateKind::Ready => {
+                    let Some(transition) = self
+                        .shared_session_broker
+                        .begin_idle_reclaim(candidate, idle_timeout)
+                        .await
+                    else {
+                        continue;
+                    };
+                    let connection_id = transition.candidate.connection_id.clone();
+                    let generation = transition.candidate.generation;
+                    let _ = self
+                        .publish_shared_events(&connection_id, transition.events)
+                        .await;
+                    let started = tokio::time::Instant::now();
+                    let cleanup_complete = self
+                        .teardown_shared_driver(
+                            &connection_id,
+                            transition.force_abort,
+                            AcpDisconnectOrigin::IdleTimeout,
+                        )
+                        .await;
+                    self.shared_session_broker
+                        .record_cleanup_duration(started.elapsed());
+                    if cleanup_complete {
+                        if self
+                            .shared_session_broker
+                            .remove_sweep_candidate(&transition.candidate)
+                            .await
+                        {
+                            self.shared_launches
+                                .lock()
+                                .await
+                                .remove(&(connection_id, generation));
+                            report.removed = true;
+                            report.removed_count += 1;
+                        }
+                    } else {
+                        self.shared_session_broker.record_cleanup_incomplete();
+                        report.cleanup_incomplete += 1;
+                    }
+                }
+            }
+        }
+        report
+    }
+
+    pub async fn terminate_shared_session(
+        &self,
+        connection_id: &str,
+        generation: u64,
+    ) -> Result<(), AcpError> {
+        let transition = self
+            .shared_session_broker
+            .begin_termination(connection_id, generation)
+            .await?;
+        if let Err(error) = self
+            .publish_shared_events(connection_id, transition.events)
+            .await
+        {
+            tracing::warn!(
+                "[ACP] shared termination event publication failed connection={} generation={} code={:?}",
+                connection_id,
+                generation,
+                error.code()
+            );
+        }
+        let started = tokio::time::Instant::now();
+        let cleanup_complete = self
+            .teardown_shared_driver(
+                connection_id,
+                transition.force_abort,
+                AcpDisconnectOrigin::ExplicitUser,
+            )
+            .await;
+        self.shared_session_broker
+            .record_cleanup_duration(started.elapsed());
+        if !cleanup_complete {
+            self.shared_session_broker.record_cleanup_incomplete();
+            return Err(AcpError::ProcessExited);
+        }
+        if !self
+            .shared_session_broker
+            .remove_sweep_candidate(&transition.candidate)
+            .await
+        {
+            return Err(SharedSessionError::GenerationStale.into());
+        }
+        self.shared_launches
+            .lock()
+            .await
+            .remove(&(connection_id.to_string(), generation));
+        Ok(())
+    }
+
+    async fn teardown_shared_driver(
+        &self,
+        connection_id: &str,
+        force_abort: bool,
+        origin: AcpDisconnectOrigin,
+    ) -> bool {
+        #[cfg(any(test, feature = "test-utils"))]
+        self.shared_teardown_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if force_abort {
+            return self.teardown_unexposed_attempt(connection_id).await.is_ok()
+                && !self.connections.lock().await.contains_key(connection_id);
+        }
+
+        let child_pid = self
+            .shared_session_broker
+            .driver_child_pid_for_connection(connection_id)
+            .await;
+        if self.connections.lock().await.contains_key(connection_id)
+            && self
+                .disconnect_with_origin(connection_id, origin)
+                .await
+                .is_err()
+        {
+            return false;
+        }
+        let deadline =
+            tokio::time::Instant::now() + TEARDOWN_MAP_WAIT_PRIMARY + TEARDOWN_MAP_WAIT_EXTENDED;
+        loop {
+            let absent = !self.connections.lock().await.contains_key(connection_id);
+            let process_absent = child_pid
+                .as_ref()
+                .is_none_or(|pid| pid.load(std::sync::atomic::Ordering::SeqCst) == 0);
+            if absent && process_absent {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                tracing::error!(
+                    "[ACP] shared teardown incomplete connection={} map_absent={} process_absent={}",
+                    connection_id,
+                    absent,
+                    process_absent
+                );
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     /// Bump `last_activity_at` for a live connection so the idle sweep
     /// won't reap it. Used by the frontend keepalive loop to protect
     /// connections backing currently-open conversation tabs (the
@@ -3523,6 +3706,13 @@ impl ConnectionManager {
     /// in a terminal state — touch must never resurrect a dead
     /// connection or contend with the spawn/disconnect paths.
     pub async fn touch(&self, conn_id: &str) -> bool {
+        if self
+            .shared_session_broker
+            .is_managed_connection(conn_id)
+            .await
+        {
+            return false;
+        }
         let state_arc = {
             let connections = self.connections.lock().await;
             match connections.get(conn_id) {
@@ -3557,10 +3747,14 @@ impl ConnectionManager {
         // Snapshot lease (id, owner_label, operation_id, generation, incarnation) then
         // re-validate under the same lock before remove so a concurrent rebind
         // cannot be killed by a stale idle selection.
+        let shared_connections = self.shared_session_broker.managed_connection_ids().await;
         let candidates: Vec<(String, String, Option<String>, u64, String)> = {
             let connections = self.connections.lock().await;
             let mut victims = Vec::new();
             for (id, conn) in connections.iter() {
+                if shared_connections.contains(id) {
+                    continue;
+                }
                 let Ok(state) = conn.state.try_read() else {
                     // Per-state writer holds the lock; a future tick will
                     // re-evaluate this entry. Don't block the connections
@@ -6436,6 +6630,14 @@ impl ConnectionManager {
         expected_generation: Option<u64>,
         origin: AcpDisconnectOrigin,
     ) -> Result<(), AcpError> {
+        if origin != AcpDisconnectOrigin::ApplicationShutdown
+            && self
+                .shared_session_broker
+                .is_managed_connection(conn_id)
+                .await
+        {
+            return Err(SharedSessionError::ProtocolRequired.into());
+        }
         let expect_window = expected_owner_window
             .map(str::trim)
             .filter(|s| !s.is_empty());

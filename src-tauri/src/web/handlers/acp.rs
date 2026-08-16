@@ -174,6 +174,14 @@ pub async fn acp_disconnect(
     Json(params): Json<AcpDisconnectParams>,
 ) -> Result<Json<()>, AppCommandError> {
     let manager = &state.connection_manager;
+    if manager
+        .is_broker_managed_connection(&params.connection_id)
+        .await
+    {
+        return Err(map_acp_error(crate::acp::error::AcpError::Shared(
+            SharedSessionError::ProtocolRequired,
+        )));
+    }
     manager
         .disconnect_if_owner(
             &params.connection_id,

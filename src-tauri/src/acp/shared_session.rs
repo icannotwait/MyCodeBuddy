@@ -7,10 +7,10 @@ pub use error::{validate_client_label, SharedSessionError};
 pub use metrics::{SharedSessionMetrics, SharedSessionMetricsSnapshot};
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Weak,
     },
     time::Duration,
 };
@@ -108,8 +108,91 @@ pub struct SharedSessionBroker {
     index: Arc<Mutex<SharedSessionIndex>>,
     index_epoch: Arc<watch::Sender<u64>>,
     metrics: Arc<SharedSessionMetrics>,
-    lease_ttl: Duration,
+    lease_ttl_secs: Arc<AtomicU64>,
     limits: BrokerLimits,
+    #[cfg(test)]
+    idle_final_cas_barrier: Arc<std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>>,
+}
+
+/// Exact authoritative facts that prevent a shared root from becoming idle.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SharedIdleBlockers {
+    pub lease: bool,
+    pub non_ready_phase: bool,
+    pub non_connected_status: bool,
+    pub runtime_turn: bool,
+    pub active_turn: bool,
+    pub permission: bool,
+    pub question: bool,
+    pub plan_approval: bool,
+    pub queued_prompt: bool,
+    pub continuation_wait: bool,
+    pub active_delegation: bool,
+    pub background_work: bool,
+    pub host_work: bool,
+}
+
+impl SharedIdleBlockers {
+    fn from_record(record: &SharedSessionRecord, snapshot: &SharedRuntimeWorkSnapshot) -> Self {
+        Self {
+            lease: !record.active_leases.is_empty(),
+            non_ready_phase: record.phase != SharedSessionPhase::Ready,
+            non_connected_status: snapshot.status != crate::acp::types::ConnectionStatus::Connected,
+            runtime_turn: snapshot.turn_in_flight,
+            active_turn: record.active_turn.is_some(),
+            permission: record.interactions.permission.is_some()
+                || snapshot.pending_permission_id.is_some(),
+            question: record.interactions.question.is_some()
+                || snapshot.pending_question_id.is_some(),
+            plan_approval: record.interactions.plan_approval.is_some()
+                || snapshot.pending_plan_approval_id.is_some(),
+            queued_prompt: !record.waiting_prompts.is_empty(),
+            continuation_wait: snapshot.continuation_wait,
+            active_delegation: snapshot.active_delegations != 0,
+            background_work: snapshot.background_outstanding != 0,
+            host_work: !record.host_owned_work.is_empty(),
+        }
+    }
+
+    fn is_empty(self) -> bool {
+        self == Self::default()
+    }
+}
+
+/// Owning token for host-side work not represented in `SessionState`.
+///
+/// The permit deliberately cannot be cloned. Explicit completion and `Drop`
+/// both execute the same generation-fenced removal.
+pub struct SharedHostWorkPermit {
+    broker_index: Weak<Mutex<SharedSessionIndex>>,
+    identity: Option<(String, u64, uuid::Uuid)>,
+}
+
+pub(crate) struct SharedSweepCandidate {
+    record: Arc<Mutex<SharedSessionRecord>>,
+    pub connection_id: String,
+    pub generation: u64,
+    pub kind: SharedSweepCandidateKind,
+    failed_zero_since: Option<tokio::time::Instant>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SharedSweepCandidateKind {
+    Ready,
+    Failed,
+}
+
+pub(crate) struct SharedClosingTransition {
+    pub candidate: SharedSweepCandidate,
+    pub events: Vec<crate::acp::types::AcpEvent>,
+    pub force_abort: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SharedSweepReport {
+    pub removed: bool,
+    pub removed_count: usize,
+    pub cleanup_incomplete: usize,
 }
 
 /// Authorizes one same-generation state preparation and driver replacement.
@@ -134,8 +217,10 @@ impl Default for SharedSessionBroker {
             index: Arc::new(Mutex::new(SharedSessionIndex::default())),
             index_epoch: Arc::new(index_epoch),
             metrics: Arc::new(SharedSessionMetrics::default()),
-            lease_ttl: DEFAULT_CLIENT_LEASE_TTL,
+            lease_ttl_secs: Arc::new(AtomicU64::new(DEFAULT_CLIENT_LEASE_TTL.as_secs())),
             limits: BrokerLimits::default(),
+            #[cfg(test)]
+            idle_final_cas_barrier: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 }
@@ -143,6 +228,347 @@ impl Default for SharedSessionBroker {
 impl SharedSessionBroker {
     pub fn metrics(&self) -> &SharedSessionMetrics {
         &self.metrics
+    }
+
+    fn lease_ttl(&self) -> Duration {
+        Duration::from_secs(self.lease_ttl_secs.load(Ordering::Relaxed))
+    }
+
+    pub(crate) fn configure_client_lease_ttl(&self, lease_ttl: Duration) {
+        self.lease_ttl_secs
+            .store(lease_ttl.as_secs(), Ordering::Relaxed);
+    }
+
+    pub async fn begin_host_work(
+        &self,
+        connection_id: &str,
+        generation: u64,
+    ) -> Result<SharedHostWorkPermit, SharedSessionError> {
+        let permit_id = uuid::Uuid::new_v4();
+        let notify = self
+            .with_authoritative_record(connection_id, |record| {
+                if record.generation != generation {
+                    return Err(SharedSessionError::GenerationStale);
+                }
+                if !matches!(
+                    record.phase,
+                    SharedSessionPhase::Bootstrapping | SharedSessionPhase::Ready
+                ) {
+                    return Err(SharedSessionError::SessionUnavailable);
+                }
+                record.host_owned_work.insert(permit_id);
+                record.idle_zero_since = None;
+                Ok(record.notify.clone())
+            })
+            .await?
+            .ok_or(SharedSessionError::SessionUnavailable)?;
+        notify.notify_one();
+        Ok(SharedHostWorkPermit {
+            broker_index: Arc::downgrade(&self.index),
+            identity: Some((connection_id.to_string(), generation, permit_id)),
+        })
+    }
+
+    pub async fn end_host_work(&self, mut permit: SharedHostWorkPermit) -> bool {
+        let Some(identity) = permit.identity.take() else {
+            return false;
+        };
+        release_host_work(self.index.clone(), identity).await
+    }
+
+    pub(crate) async fn managed_connection_ids(&self) -> HashSet<String> {
+        self.index
+            .lock()
+            .await
+            .by_connection
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    pub(crate) async fn evaluate_idle(
+        &self,
+        idle_grace: Duration,
+        failed_grace: Duration,
+    ) -> Vec<SharedSweepCandidate> {
+        let records: Vec<_> = self.index.lock().await.sessions.values().cloned().collect();
+        let now = tokio::time::Instant::now();
+        let mut candidates = Vec::new();
+
+        for record in records {
+            let mut current = record.lock().await;
+            match current.phase {
+                SharedSessionPhase::Ready => {
+                    current.failed_zero_since = None;
+                    let Some(state) = current.state.clone() else {
+                        current.idle_zero_since = None;
+                        continue;
+                    };
+                    let state = state.read().await;
+                    let snapshot = state.shared_runtime_work_snapshot(None);
+                    if !SharedIdleBlockers::from_record(&current, &snapshot).is_empty() {
+                        current.idle_zero_since = None;
+                        continue;
+                    }
+                    let zero_since = current.idle_zero_since.get_or_insert(now);
+                    if now.duration_since(*zero_since) >= idle_grace {
+                        self.metrics.record_idle_candidate();
+                        candidates.push(SharedSweepCandidate {
+                            record: record.clone(),
+                            connection_id: current.connection_id.clone(),
+                            generation: current.generation,
+                            kind: SharedSweepCandidateKind::Ready,
+                            failed_zero_since: None,
+                        });
+                    }
+                }
+                SharedSessionPhase::Failed { .. }
+                    if current.cleanup_complete && current.active_leases.is_empty() =>
+                {
+                    current.idle_zero_since = None;
+                    let zero_since = *current.failed_zero_since.get_or_insert(now);
+                    if now.duration_since(zero_since) >= failed_grace {
+                        candidates.push(SharedSweepCandidate {
+                            record: record.clone(),
+                            connection_id: current.connection_id.clone(),
+                            generation: current.generation,
+                            kind: SharedSweepCandidateKind::Failed,
+                            failed_zero_since: Some(zero_since),
+                        });
+                    }
+                }
+                _ => {
+                    current.idle_zero_since = None;
+                    current.failed_zero_since = None;
+                }
+            }
+        }
+        candidates
+    }
+
+    pub(crate) async fn begin_idle_reclaim(
+        &self,
+        candidate: SharedSweepCandidate,
+        idle_grace: Duration,
+    ) -> Option<SharedClosingTransition> {
+        #[cfg(test)]
+        self.wait_idle_final_cas_barrier_for_test().await;
+
+        let mut record = candidate.record.lock().await;
+        if record.connection_id != candidate.connection_id
+            || record.generation != candidate.generation
+            || record.phase != SharedSessionPhase::Ready
+        {
+            self.metrics.record_idle_cas_lost();
+            return None;
+        }
+        let Some(state) = record.state.clone() else {
+            record.idle_zero_since = None;
+            self.metrics.record_idle_cas_lost();
+            return None;
+        };
+        let mut state = state.write().await;
+        let snapshot = state.shared_runtime_work_snapshot(None);
+        let old_enough = record.idle_zero_since.is_some_and(|zero_since| {
+            tokio::time::Instant::now().duration_since(zero_since) >= idle_grace
+        });
+        if !old_enough || !SharedIdleBlockers::from_record(&record, &snapshot).is_empty() {
+            record.idle_zero_since = None;
+            self.metrics.record_idle_cas_lost();
+            return None;
+        }
+
+        record.phase = SharedSessionPhase::Closing;
+        record.cleanup_complete = false;
+        record.idle_zero_since = None;
+        update_public_shared_phase(
+            &mut state,
+            candidate.generation,
+            SharedSessionPhase::Closing,
+        );
+        let registration = SharedRegistrationState {
+            phase: SharedSessionPhase::Closing,
+            state: record.state.clone(),
+            emitter: record.emitter.clone(),
+            driver_incarnation: record.driver_incarnation.clone(),
+        };
+        let registration_tx = record.registration_tx.clone();
+        let lifecycle_tx = record.lifecycle_tx.clone();
+        let notify = record.notify.clone();
+        drop(state);
+        drop(record);
+
+        registration_tx.send_replace(registration);
+        lifecycle_tx.send_replace(SharedLifecycleState::Closing);
+        notify.notify_waiters();
+        let generation = candidate.generation;
+        Some(SharedClosingTransition {
+            candidate,
+            events: vec![crate::acp::types::AcpEvent::SharedSessionPhaseChanged {
+                generation,
+                phase: SharedSessionPhase::Closing,
+            }],
+            force_abort: false,
+        })
+    }
+
+    pub(crate) async fn begin_termination(
+        &self,
+        connection_id: &str,
+        generation: u64,
+    ) -> Result<SharedClosingTransition, SharedSessionError> {
+        let record = {
+            let index = self.index.lock().await;
+            match index.record_for_connection(connection_id).cloned() {
+                Some(record) => record,
+                None if index.is_replaced_connection(connection_id, generation) => {
+                    return Err(SharedSessionError::GenerationStale)
+                }
+                None => return Err(SharedSessionError::SessionUnavailable),
+            }
+        };
+        let mut current = record.lock().await;
+        if current.generation != generation {
+            return Err(SharedSessionError::GenerationStale);
+        }
+        let force_abort = match current.phase {
+            SharedSessionPhase::Reserved => return Err(SharedSessionError::SessionUnavailable),
+            SharedSessionPhase::Closing => return Err(SharedSessionError::Closing),
+            SharedSessionPhase::Ready => false,
+            SharedSessionPhase::Bootstrapping | SharedSessionPhase::Failed { .. } => true,
+        };
+
+        let public_state = current.state.clone();
+        let mut state = match public_state.as_ref() {
+            Some(state) => Some(state.write().await),
+            None => None,
+        };
+        let mut events = fail_all_prompt_work(&mut current, "session_unavailable");
+        current.phase = SharedSessionPhase::Closing;
+        current.cleanup_complete = false;
+        current.idle_zero_since = None;
+        current.failed_zero_since = None;
+        current.host_owned_work.clear();
+        if let Some(state) = state.as_mut() {
+            update_public_shared_phase(state, generation, SharedSessionPhase::Closing);
+        }
+        let registration = SharedRegistrationState {
+            phase: SharedSessionPhase::Closing,
+            state: current.state.clone(),
+            emitter: current.emitter.clone(),
+            driver_incarnation: current.driver_incarnation.clone(),
+        };
+        let registration_tx = current.registration_tx.clone();
+        let lifecycle_tx = current.lifecycle_tx.clone();
+        let notify = current.notify.clone();
+        drop(state);
+        drop(current);
+
+        registration_tx.send_replace(registration);
+        lifecycle_tx.send_replace(SharedLifecycleState::Closing);
+        notify.notify_waiters();
+        events.push(crate::acp::types::AcpEvent::SharedSessionPhaseChanged {
+            generation,
+            phase: SharedSessionPhase::Closing,
+        });
+        Ok(SharedClosingTransition {
+            candidate: SharedSweepCandidate {
+                record,
+                connection_id: connection_id.to_string(),
+                generation,
+                kind: SharedSweepCandidateKind::Ready,
+                failed_zero_since: None,
+            },
+            events,
+            force_abort,
+        })
+    }
+
+    pub(crate) async fn remove_sweep_candidate(&self, candidate: &SharedSweepCandidate) -> bool {
+        loop {
+            let mut index = self.index.lock().await;
+            let Some(key) = index.by_connection.get(&candidate.connection_id).cloned() else {
+                return false;
+            };
+            let authoritative = index
+                .sessions
+                .get(&key)
+                .is_some_and(|record| Arc::ptr_eq(record, &candidate.record));
+            if !authoritative {
+                return false;
+            }
+            let current = match candidate.record.try_lock() {
+                Ok(current) => current,
+                Err(_) => {
+                    drop(index);
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+            };
+            let removable = current.generation == candidate.generation
+                && match candidate.kind {
+                    SharedSweepCandidateKind::Ready => current.phase == SharedSessionPhase::Closing,
+                    SharedSweepCandidateKind::Failed => {
+                        matches!(
+                            current.phase,
+                            SharedSessionPhase::Failed {
+                                cleanup_complete: true,
+                                ..
+                            }
+                        ) && current.active_leases.is_empty()
+                            && current.failed_zero_since == candidate.failed_zero_since
+                    }
+                };
+            if !removable {
+                return false;
+            }
+            let lifecycle_tx = current.lifecycle_tx.clone();
+            let notify = current.notify.clone();
+            let active_leases = current.active_leases.len();
+            drop(current);
+            index.sessions.remove(&key);
+            index.by_connection.remove(&candidate.connection_id);
+            drop(index);
+            self.index_epoch
+                .send_modify(|epoch| *epoch = epoch.saturating_add(1));
+            lifecycle_tx.send_replace(SharedLifecycleState::Removed);
+            notify.notify_waiters();
+            self.metrics.remove_active_leases(active_leases);
+            self.metrics.remove_live_session();
+            if candidate.kind == SharedSweepCandidateKind::Ready {
+                self.metrics.record_idle_reclaimed();
+            }
+            return true;
+        }
+    }
+
+    pub(crate) fn record_cleanup_incomplete(&self) {
+        self.metrics.record_cleanup_incomplete();
+    }
+
+    pub(crate) fn record_cleanup_duration(&self, elapsed: Duration) {
+        self.metrics.record_cleanup_duration(elapsed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_idle_final_cas_barrier_for_test(&self, parties: usize) {
+        *self
+            .idle_final_cas_barrier
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) =
+            Some(Arc::new(tokio::sync::Barrier::new(parties)));
+    }
+
+    #[cfg(test)]
+    async fn wait_idle_final_cas_barrier_for_test(&self) {
+        let barrier = self
+            .idle_final_cas_barrier
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        if let Some(barrier) = barrier {
+            barrier.wait().await;
+        }
     }
 
     pub(crate) async fn enqueue_prompt(
@@ -431,6 +857,7 @@ impl SharedSessionBroker {
                 || snapshot.continuation_wait
                 || snapshot.active_delegations != 0
                 || snapshot.background_outstanding != 0
+                || !record.host_owned_work.is_empty()
                 || record.waiting_prompts.is_empty()
             {
                 return Ok(DispatchHeadDecision::Blocked);
@@ -1221,9 +1648,10 @@ impl SharedSessionBroker {
                                 LeaseRenewalOutcome::Detached(DetachReason::LeaseMissing)
                             };
                         };
-                        let expires_at = now + self.lease_ttl;
+                        let lease_ttl = self.lease_ttl();
+                        let expires_at = now + lease_ttl;
                         let expires_at_utc = now_utc
-                            + chrono::Duration::from_std(self.lease_ttl)
+                            + chrono::Duration::from_std(lease_ttl)
                                 .expect("shared session lease TTL must fit chrono::Duration");
                         lease.expires_at = expires_at;
                         lease.expires_at_utc = expires_at_utc;
@@ -1368,7 +1796,7 @@ impl SharedSessionBroker {
                     let mut initial = SharedSessionRecord::reserved(&request, 1, None);
                     let attachment = match initial.attach_or_renew_lease(
                         &request,
-                        self.lease_ttl,
+                        self.lease_ttl(),
                         SharedDisposition::Created,
                         self.limits,
                     ) {
@@ -1404,6 +1832,9 @@ impl SharedSessionBroker {
                 ReserveLookup::Existing(record) => record,
             };
 
+            #[cfg(test)]
+            self.wait_idle_final_cas_barrier_for_test().await;
+
             let decision = {
                 let mut current = record.lock().await;
                 current.check_attach_identity(&request.launch_identity)?;
@@ -1414,7 +1845,7 @@ impl SharedSessionBroker {
                         self.metrics.record_lease_expired(expired.len());
                         match current.attach_or_renew_lease(
                             &request,
-                            self.lease_ttl,
+                            self.lease_ttl(),
                             SharedDisposition::Attached,
                             self.limits,
                         ) {
@@ -1482,6 +1913,9 @@ impl SharedSessionBroker {
             let mut events = fail_all_prompt_work(record, &error_code);
             record.cleanup_complete = cleanup_complete;
             record.phase = phase;
+            record.idle_zero_since = None;
+            record.failed_zero_since = None;
+            record.host_owned_work.clear();
             record.publish_registration();
             record
                 .lifecycle_tx
@@ -1529,6 +1963,7 @@ impl SharedSessionBroker {
             }
             record.cleanup_complete = true;
             record.phase = phase;
+            record.failed_zero_since = None;
             record.publish_registration();
             Ok((
                 publication_handles,
@@ -1739,6 +2174,8 @@ impl SharedSessionBroker {
             let state = state.ok_or(SharedSessionError::SessionUnavailable)?;
             update_public_shared_phase(state, generation, SharedSessionPhase::Ready);
             record.phase = SharedSessionPhase::Ready;
+            record.idle_zero_since = None;
+            record.failed_zero_since = None;
             record.publish_registration();
             Ok(vec![
                 crate::acp::types::AcpEvent::SharedSessionPhaseChanged {
@@ -1859,6 +2296,9 @@ impl SharedSessionBroker {
                 record.emitter = Some(emitter.clone());
                 record.cleanup_complete = cleanup_complete;
                 record.phase = phase;
+                record.idle_zero_since = None;
+                record.failed_zero_since = None;
+                record.host_owned_work.clear();
                 record.replacement_permit = None;
                 record.publish_registration();
                 record
@@ -1933,6 +2373,9 @@ impl SharedSessionBroker {
                 record.emitter = Some(emitter.clone());
                 record.cleanup_complete = cleanup_complete;
                 record.phase = phase;
+                record.idle_zero_since = None;
+                record.failed_zero_since = None;
+                record.host_owned_work.clear();
                 record.replacement_permit = None;
                 record.publish_registration();
                 record
@@ -2231,7 +2674,7 @@ impl SharedSessionBroker {
             SharedSessionRecord::reserved(request, next_generation, Some(failed_generation));
         let (attachment, added_lease) = match replacement.attach_or_renew_lease(
             request,
-            self.lease_ttl,
+            self.lease_ttl(),
             SharedDisposition::Created,
             self.limits,
         ) {
@@ -2273,6 +2716,65 @@ impl SharedSessionBroker {
             attachment,
             created: true,
         }))
+    }
+}
+
+impl Drop for SharedHostWorkPermit {
+    fn drop(&mut self) {
+        let Some((connection_id, generation, permit_id)) = self.identity.take() else {
+            return;
+        };
+        let Some(index) = self.broker_index.upgrade() else {
+            tracing::debug!(
+                "[ACP] shared host-work drop after broker shutdown connection={} generation={}",
+                connection_id,
+                generation
+            );
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            tracing::debug!(
+                "[ACP] shared host-work drop without runtime connection={} generation={}",
+                connection_id,
+                generation
+            );
+            return;
+        };
+        runtime.spawn(async move {
+            release_host_work(index, (connection_id, generation, permit_id)).await;
+        });
+    }
+}
+
+async fn release_host_work(
+    index: Arc<Mutex<SharedSessionIndex>>,
+    (connection_id, generation, permit_id): (String, u64, uuid::Uuid),
+) -> bool {
+    loop {
+        let index_guard = index.lock().await;
+        let Some(record) = index_guard.record_for_connection(&connection_id).cloned() else {
+            return false;
+        };
+        let result = match record.try_lock() {
+            Ok(mut record) => {
+                if record.generation != generation {
+                    return false;
+                }
+                let removed = record.host_owned_work.remove(&permit_id);
+                let notify = removed.then(|| record.notify.clone());
+                drop(record);
+                drop(index_guard);
+                if let Some(notify) = notify {
+                    notify.notify_one();
+                }
+                return removed;
+            }
+            Err(_) => true,
+        };
+        drop(index_guard);
+        if result {
+            tokio::task::yield_now().await;
+        }
     }
 }
 
@@ -2395,6 +2897,9 @@ fn fail_live_session_record(
         cleanup_complete: false,
     };
     record.cleanup_complete = false;
+    record.idle_zero_since = None;
+    record.failed_zero_since = None;
+    record.host_owned_work.clear();
     record.publish_registration();
     record
         .lifecycle_tx
@@ -2697,6 +3202,9 @@ struct SharedSessionRecord {
     next_enqueue_seq: u64,
     active_turn: Option<BrokerActiveTurn>,
     interactions: SharedInteractions,
+    host_owned_work: HashSet<uuid::Uuid>,
+    idle_zero_since: Option<tokio::time::Instant>,
+    failed_zero_since: Option<tokio::time::Instant>,
     notify: Arc<Notify>,
     expired_leases: VecDeque<String>,
     replaced_failed_generation: Option<u64>,
@@ -2734,6 +3242,9 @@ impl SharedSessionRecord {
             next_enqueue_seq: 1,
             active_turn: None,
             interactions: SharedInteractions::default(),
+            host_owned_work: HashSet::new(),
+            idle_zero_since: None,
+            failed_zero_since: None,
             notify: Arc::new(Notify::new()),
             expired_leases: VecDeque::new(),
             replaced_failed_generation,
@@ -2793,9 +3304,9 @@ impl SharedSessionRecord {
         match &self.phase {
             SharedSessionPhase::Closing => Err(SharedSessionError::Closing),
             SharedSessionPhase::Failed { .. } => {
-                let retry_generation = request
-                    .retry_failed_generation
-                    .ok_or(SharedSessionError::SessionUnavailable)?;
+                let Some(retry_generation) = request.retry_failed_generation else {
+                    return Ok(FailedRetryDecision::Attach);
+                };
                 if retry_generation != self.generation {
                     return Err(SharedSessionError::GenerationStale);
                 }
@@ -2857,6 +3368,8 @@ impl SharedSessionRecord {
                 .get(&client_identity)
                 .is_some_and(|lease| lease.lease_id == previous.lease_id);
             if is_active {
+                self.idle_zero_since = None;
+                self.failed_zero_since = None;
                 self.connect_count = self.connect_count.saturating_add(1);
                 return Ok((previous.clone(), false));
             }
@@ -2897,6 +3410,8 @@ impl SharedSessionRecord {
         };
         self.connect_ledger
             .insert(connect_identity, attachment.clone());
+        self.idle_zero_since = None;
+        self.failed_zero_since = None;
         self.connect_count = self.connect_count.saturating_add(1);
         Ok((attachment, is_new_client))
     }

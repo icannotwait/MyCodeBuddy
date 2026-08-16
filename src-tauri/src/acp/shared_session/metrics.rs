@@ -118,6 +118,14 @@ impl SharedSessionMetrics {
         self.live_sessions.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(super) fn remove_live_session(&self) {
+        let _ = self
+            .live_sessions
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_sub(1))
+            });
+    }
+
     pub(super) fn add_active_leases(&self, count: usize) {
         self.active_leases
             .fetch_add(count as u64, Ordering::Relaxed);
@@ -143,5 +151,30 @@ impl SharedSessionMetrics {
 
     pub(super) fn record_capacity_rejection(&self) {
         self.capacity_rejected_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn record_idle_candidate(&self) {
+        self.idle_candidate_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn record_idle_cas_lost(&self) {
+        self.idle_cas_lost_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn record_idle_reclaimed(&self) {
+        self.idle_reclaimed_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn record_cleanup_duration(&self, elapsed: std::time::Duration) {
+        let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+        self.cleanup_duration_ms_total
+            .fetch_add(elapsed_ms, Ordering::Relaxed);
+        self.cleanup_duration_samples
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn record_cleanup_incomplete(&self) {
+        self.cleanup_incomplete_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 }

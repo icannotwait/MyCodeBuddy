@@ -508,10 +508,9 @@ mod tests {
     }
 
     fn broker_with_ttl(ttl: Duration) -> SharedSessionBroker {
-        SharedSessionBroker {
-            lease_ttl: ttl,
-            ..SharedSessionBroker::default()
-        }
+        let broker = SharedSessionBroker::default();
+        broker.configure_client_lease_ttl(ttl);
+        broker
     }
 
     async fn reserve_client(
@@ -2848,5 +2847,991 @@ mod tests {
         assert!(is_interaction_loser(&fixture.claim("permission-old").await));
         fixture.claim("permission-next").await.unwrap();
         assert_eq!(fixture.interaction_call_count(), 1);
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum IdleBlockerCase {
+        Lease,
+        ActiveTurn { stop_requested: bool },
+        Permission,
+        Question,
+        PlanApproval,
+        QueuedPrompt,
+        ContinuationWait,
+        ActiveDelegation,
+        BackgroundWork,
+        HostWork,
+        NonReadyPhase,
+        NonConnectedStatus,
+    }
+
+    struct IdleBlockerHandle {
+        lease: Option<SharedMutationGuard>,
+        queue_item_id: Option<String>,
+        host_work: Option<SharedHostWorkPermit>,
+    }
+
+    impl IdleBlockerHandle {
+        fn empty() -> Self {
+            Self {
+                lease: None,
+                queue_item_id: None,
+                host_work: None,
+            }
+        }
+    }
+
+    struct IdleReadyFixture {
+        manager: ConnectionManager,
+        broker: SharedSessionBroker,
+        attachment: SharedSessionAttachment,
+        state: Arc<RwLock<SessionState>>,
+        key: SharedSessionKey,
+        conversation_id: i32,
+        next_client: AtomicUsize,
+    }
+
+    impl IdleReadyFixture {
+        async fn new(conversation_id: i32, ready: bool) -> Self {
+            let manager = ConnectionManager::new();
+            manager.configure_shared_client_lease_ttl(Duration::from_secs(3_600));
+            let broker = manager.shared_session_broker();
+            let key = SharedSessionKey::Conversation(conversation_id);
+            let attachment = broker
+                .reserve_or_attach(request(
+                    key.clone(),
+                    &format!("idle-connection-{conversation_id}"),
+                    "idle-client-0",
+                    "idle-connect-0",
+                ))
+                .await
+                .unwrap()
+                .attachment;
+            manager
+                .insert_test_connection(
+                    &attachment.connection_id,
+                    crate::models::agent::AgentType::Codex,
+                    None,
+                    EventEmitter::Noop,
+                )
+                .await;
+            let (state, emitter, child_pid, driver_incarnation) = {
+                let connections = manager.connections.lock().await;
+                let connection = connections
+                    .get(&attachment.connection_id)
+                    .expect("synthetic manager connection is registered");
+                (
+                    connection.state.clone(),
+                    connection.emitter.clone(),
+                    connection.child_pid.clone(),
+                    connection.connection_incarnation.clone(),
+                )
+            };
+            {
+                let mut state = state.write().await;
+                state.conversation_id = Some(conversation_id);
+                state.status = crate::acp::types::ConnectionStatus::Connecting;
+                state.shared_session = Some(SharedSessionProjection {
+                    generation: attachment.generation,
+                    phase: SharedSessionPhase::Bootstrapping,
+                    queue: Vec::new(),
+                    active_turn: None,
+                    lease_expires_at: Some(attachment.lease_expires_at),
+                    expired_lease_tombstone_count: 0,
+                });
+            }
+            broker
+                .install_registered(
+                    &attachment.connection_id,
+                    attachment.generation,
+                    driver_incarnation.clone(),
+                    state.clone(),
+                    emitter,
+                    child_pid,
+                )
+                .await
+                .unwrap();
+            if ready {
+                broker
+                    .mark_ready(
+                        &attachment.connection_id,
+                        attachment.generation,
+                        &driver_incarnation,
+                    )
+                    .await
+                    .unwrap();
+            } else {
+                state
+                    .write()
+                    .await
+                    .apply_event(&crate::acp::types::AcpEvent::StatusChanged {
+                        status: crate::acp::types::ConnectionStatus::Connected,
+                    });
+            }
+            broker
+                .release_lease(&SharedMutationGuard {
+                    connection_id: attachment.connection_id.clone(),
+                    generation: attachment.generation,
+                    lease_id: attachment.lease_id.clone(),
+                })
+                .await
+                .unwrap();
+            Self {
+                manager,
+                broker,
+                attachment,
+                state,
+                key,
+                conversation_id,
+                next_client: AtomicUsize::new(1),
+            }
+        }
+
+        async fn driver_incarnation(&self) -> String {
+            self.manager
+                .connections
+                .lock()
+                .await
+                .get(&self.attachment.connection_id)
+                .expect("manager connection remains registered")
+                .connection_incarnation
+                .clone()
+        }
+
+        async fn attach_new_lease(
+            &self,
+        ) -> Result<SharedReserveOutcome, SharedSessionError> {
+            let client = self.next_client.fetch_add(1, Ordering::SeqCst);
+            self.broker
+                .reserve_or_attach(request(
+                    self.key.clone(),
+                    "ignored-idle-candidate",
+                    &format!("idle-client-{client}"),
+                    &format!("idle-connect-{client}"),
+                ))
+                .await
+        }
+
+        async fn mutation_guard(&self) -> SharedMutationGuard {
+            let attachment = self.attach_new_lease().await.unwrap().attachment;
+            SharedMutationGuard {
+                connection_id: attachment.connection_id,
+                generation: attachment.generation,
+                lease_id: attachment.lease_id,
+            }
+        }
+
+        async fn reap_now(&self) -> SharedSweepReport {
+            self.broker
+                .expire_leases(tokio::time::Instant::now())
+                .await;
+            let shared = self
+                .manager
+                .sweep_shared_sessions(Duration::from_secs(900), Duration::from_secs(90))
+                .await;
+            if self
+                .manager
+                .get_state(&self.attachment.connection_id)
+                .await
+                .is_some()
+            {
+                self.state.write().await.last_activity_at =
+                    chrono::Utc::now() - chrono::Duration::seconds(901);
+            }
+            assert_eq!(self.manager.sweep_idle(Duration::from_secs(900)).await, 0);
+            shared
+        }
+
+        async fn connection_still_registered(&self) -> bool {
+            self.broker
+                .diagnostic_for_connection(&self.attachment.connection_id)
+                .await
+                .is_some()
+                && self
+                    .manager
+                    .get_state(&self.attachment.connection_id)
+                    .await
+                    .is_some()
+        }
+
+        async fn apply_event(&self, event: crate::acp::types::AcpEvent) {
+            self.state.write().await.apply_event(&event);
+        }
+
+        async fn enqueue_blocker(&self, dispatch: bool) -> (SharedMutationGuard, String) {
+            let guard = self.mutation_guard().await;
+            let client = self.next_client.fetch_add(1, Ordering::SeqCst);
+            let admission = self
+                .broker
+                .enqueue_prompt(SharedPromptRequest {
+                    guard: guard.clone(),
+                    client_instance_id: format!("idle-prompt-client-{client}"),
+                    client_request_id: format!("idle-prompt-request-{client}"),
+                    blocks: vec![crate::acp::types::PromptInputBlock::Text {
+                        text: "idle blocker".into(),
+                    }],
+                    folder_id: Some(1),
+                    conversation_id: Some(self.conversation_id),
+                    client_message_id: format!("idle-message-{client}"),
+                    capture: None,
+                    submitted_at: chrono::Utc::now(),
+                })
+                .await
+                .unwrap();
+            assert!(self
+                .broker
+                .mark_prompt_admission_published(
+                    &self.attachment.connection_id,
+                    self.attachment.generation,
+                    &admission.queue_item_id,
+                )
+                .await
+                .unwrap());
+            if dispatch {
+                assert!(matches!(
+                    self.broker
+                        .claim_dispatchable_head(
+                            &self.attachment.connection_id,
+                            self.attachment.generation,
+                            "idle-turn",
+                            &dispatchable_runtime_snapshot(),
+                        )
+                        .await
+                        .unwrap(),
+                    DispatchHeadDecision::Claimed(_)
+                ));
+            }
+            (guard, admission.queue_item_id)
+        }
+    }
+
+    impl IdleReadyFixture {
+        async fn enable(&self, blocker: IdleBlockerCase) -> IdleBlockerHandle {
+            let mut handle = IdleBlockerHandle::empty();
+            match blocker {
+                IdleBlockerCase::Lease => handle.lease = Some(self.mutation_guard().await),
+                IdleBlockerCase::ActiveTurn { stop_requested } => {
+                    let (guard, _) = self.enqueue_blocker(true).await;
+                    if stop_requested {
+                        let claim = match self
+                            .broker
+                            .claim_stop_request(&SharedStopRequest {
+                                guard: guard.clone(),
+                                turn_id: "idle-turn".into(),
+                            })
+                            .await
+                            .unwrap()
+                        {
+                            SharedStopClaimDecision::Claimed(claim) => claim,
+                            _ => panic!("fresh idle stop request must be claimed"),
+                        };
+                        self.broker.complete_stop_request(&claim).await.unwrap();
+                    }
+                    self.broker.release_lease(&guard).await.unwrap();
+                }
+                IdleBlockerCase::Permission
+                | IdleBlockerCase::Question
+                | IdleBlockerCase::PlanApproval => {
+                    let kind = match blocker {
+                        IdleBlockerCase::Permission => SharedInteractionKind::Permission,
+                        IdleBlockerCase::Question => SharedInteractionKind::Question,
+                        IdleBlockerCase::PlanApproval => SharedInteractionKind::PlanApproval,
+                        _ => unreachable!(),
+                    };
+                    self.broker
+                        .observe_interaction(
+                            &self.attachment.connection_id,
+                            self.attachment.generation,
+                            &self.driver_incarnation().await,
+                            kind,
+                            "idle-interaction",
+                        )
+                        .await
+                        .unwrap();
+                }
+                IdleBlockerCase::QueuedPrompt => {
+                    let (guard, queue_item_id) = self.enqueue_blocker(false).await;
+                    self.broker.release_lease(&guard).await.unwrap();
+                    handle.queue_item_id = Some(queue_item_id);
+                }
+                IdleBlockerCase::ContinuationWait => {
+                    use crate::acp::delegation::continuation::types::{
+                        ContinuationState, ContinuationWaitingProjection,
+                    };
+                    let now = chrono::Utc::now();
+                    self.apply_event(crate::acp::types::AcpEvent::ContinuationWaitingChanged {
+                        conversation_id: self.conversation_id,
+                        waiting: Some(ContinuationWaitingProjection {
+                            conversation_id: self.conversation_id,
+                            state: ContinuationState::Waiting,
+                            generation: 1,
+                            armed_at: now,
+                            wake_at: now + chrono::Duration::minutes(10),
+                        }),
+                    })
+                    .await;
+                }
+                IdleBlockerCase::ActiveDelegation => {
+                    let now = chrono::Utc::now();
+                    self.apply_event(crate::acp::types::AcpEvent::DelegationStarted {
+                        parent_connection_id: self.attachment.connection_id.clone(),
+                        parent_tool_use_id: "idle-parent-tool".into(),
+                        child_connection_id: "idle-child".into(),
+                        child_conversation_id: self.conversation_id + 10_000,
+                        agent_type: crate::models::agent::AgentType::Codex,
+                        task_preview: "idle task".into(),
+                        task_id: "idle-task".into(),
+                        started_at: now,
+                        runtime_stats:
+                            crate::acp::delegation::runtime_stats::DelegationRuntimeStats::empty(
+                                now,
+                            ),
+                        attention_request: None,
+                    })
+                    .await;
+                }
+                IdleBlockerCase::BackgroundWork => {
+                    self.apply_event(crate::acp::types::AcpEvent::BackgroundActivity {
+                        session_id: "idle-session".into(),
+                        turns: Vec::new(),
+                        outstanding: 1,
+                        settled: Vec::new(),
+                        watermark: 0,
+                    })
+                    .await;
+                }
+                IdleBlockerCase::HostWork => {
+                    handle.host_work = Some(
+                        self.broker
+                            .begin_host_work(
+                                &self.attachment.connection_id,
+                                self.attachment.generation,
+                            )
+                            .await
+                            .unwrap(),
+                    );
+                }
+                IdleBlockerCase::NonReadyPhase => {}
+                IdleBlockerCase::NonConnectedStatus => {
+                    self.apply_event(crate::acp::types::AcpEvent::StatusChanged {
+                        status: crate::acp::types::ConnectionStatus::Prompting,
+                    })
+                    .await;
+                }
+            }
+            handle
+        }
+
+        async fn clear(&self, blocker: IdleBlockerCase, mut handle: IdleBlockerHandle) {
+            match blocker {
+                IdleBlockerCase::Lease => {
+                    self.broker
+                        .release_lease(handle.lease.as_ref().unwrap())
+                        .await
+                        .unwrap();
+                }
+                IdleBlockerCase::ActiveTurn { .. } => {
+                    self.broker
+                        .settle_active_turn(
+                            &self.attachment.connection_id,
+                            self.attachment.generation,
+                            &self.driver_incarnation().await,
+                            "end_turn",
+                        )
+                        .await
+                        .unwrap();
+                }
+                IdleBlockerCase::Permission
+                | IdleBlockerCase::Question
+                | IdleBlockerCase::PlanApproval => {
+                    self.broker
+                        .reconcile_runtime_snapshot(
+                            &self.attachment.connection_id,
+                            self.attachment.generation,
+                            &self.driver_incarnation().await,
+                            &dispatchable_runtime_snapshot(),
+                        )
+                        .await
+                        .unwrap();
+                }
+                IdleBlockerCase::QueuedPrompt => {
+                    let guard = self.mutation_guard().await;
+                    self.broker
+                        .cancel_queued_prompt(&guard, handle.queue_item_id.as_deref().unwrap())
+                        .await
+                        .unwrap();
+                    self.broker.release_lease(&guard).await.unwrap();
+                }
+                IdleBlockerCase::ContinuationWait => {
+                    self.apply_event(crate::acp::types::AcpEvent::ContinuationWaitingChanged {
+                        conversation_id: self.conversation_id,
+                        waiting: None,
+                    })
+                    .await;
+                }
+                IdleBlockerCase::ActiveDelegation => {
+                    let now = chrono::Utc::now();
+                    self.apply_event(crate::acp::types::AcpEvent::DelegationCompleted {
+                        parent_connection_id: self.attachment.connection_id.clone(),
+                        parent_tool_use_id: "idle-parent-tool".into(),
+                        child_connection_id: "idle-child".into(),
+                        child_conversation_id: self.conversation_id + 10_000,
+                        agent_type: crate::models::agent::AgentType::Codex,
+                        task_id: "idle-task".into(),
+                        runtime_stats:
+                            crate::acp::delegation::runtime_stats::DelegationRuntimeStats::empty(
+                                now,
+                            ),
+                        result: crate::acp::types::DelegationResultSummary::Ok {
+                            duration_ms: 1,
+                            text_preview: None,
+                        },
+                        card_summary: None,
+                    })
+                    .await;
+                }
+                IdleBlockerCase::BackgroundWork => {
+                    self.apply_event(crate::acp::types::AcpEvent::BackgroundActivity {
+                        session_id: "idle-session".into(),
+                        turns: Vec::new(),
+                        outstanding: 0,
+                        settled: Vec::new(),
+                        watermark: 1,
+                    })
+                    .await;
+                }
+                IdleBlockerCase::HostWork => {
+                    self.broker
+                        .end_host_work(handle.host_work.take().unwrap())
+                        .await;
+                }
+                IdleBlockerCase::NonReadyPhase => {
+                    self.broker
+                        .mark_ready(
+                            &self.attachment.connection_id,
+                            self.attachment.generation,
+                            &self.driver_incarnation().await,
+                        )
+                        .await
+                        .unwrap();
+                }
+                IdleBlockerCase::NonConnectedStatus => {
+                    self.apply_event(crate::acp::types::AcpEvent::StatusChanged {
+                        status: crate::acp::types::ConnectionStatus::Connected,
+                    })
+                    .await;
+                }
+            }
+        }
+    }
+
+    async fn idle_ready_fixture() -> IdleReadyFixture {
+        IdleReadyFixture::new(2_001, true).await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_blocker_matrix_resets_the_full_grace() {
+        let cases = [
+            IdleBlockerCase::Lease,
+            IdleBlockerCase::ActiveTurn {
+                stop_requested: false,
+            },
+            IdleBlockerCase::ActiveTurn {
+                stop_requested: true,
+            },
+            IdleBlockerCase::Permission,
+            IdleBlockerCase::Question,
+            IdleBlockerCase::PlanApproval,
+            IdleBlockerCase::QueuedPrompt,
+            IdleBlockerCase::ContinuationWait,
+            IdleBlockerCase::ActiveDelegation,
+            IdleBlockerCase::BackgroundWork,
+            IdleBlockerCase::HostWork,
+            IdleBlockerCase::NonReadyPhase,
+            IdleBlockerCase::NonConnectedStatus,
+        ];
+
+        for (offset, blocker) in cases.into_iter().enumerate() {
+            let fixture = IdleReadyFixture::new(
+                2_100 + i32::try_from(offset).unwrap(),
+                !matches!(blocker, IdleBlockerCase::NonReadyPhase),
+            )
+            .await;
+            assert!(!fixture.reap_now().await.removed, "{blocker:?}");
+            let handle = fixture.enable(blocker).await;
+            tokio::time::advance(Duration::from_secs(901)).await;
+            assert!(!fixture.reap_now().await.removed, "{blocker:?}");
+
+            fixture.clear(blocker, handle).await;
+            assert!(!fixture.reap_now().await.removed, "{blocker:?}");
+            tokio::time::advance(Duration::from_secs(899)).await;
+            assert!(!fixture.reap_now().await.removed, "{blocker:?}");
+            tokio::time::advance(Duration::from_secs(1)).await;
+            assert!(fixture.reap_now().await.removed, "{blocker:?}");
+            assert!(!fixture.connection_still_registered().await, "{blocker:?}");
+            assert_eq!(fixture.manager.shared_teardown_count_for_test(), 1);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn attach_racing_final_reclaim_has_one_winner() {
+        let fixture = idle_ready_fixture().await;
+        assert!(!fixture.reap_now().await.removed);
+        tokio::time::advance(Duration::from_secs(900)).await;
+        fixture.broker.install_idle_final_cas_barrier_for_test(2);
+        let (attach, reap) = tokio::join!(fixture.attach_new_lease(), fixture.reap_now());
+        assert_ne!(attach.is_ok(), reap.removed);
+        if attach.is_ok() {
+            assert!(fixture.connection_still_registered().await);
+            assert_eq!(fixture.broker.metrics().snapshot().idle_cas_lost_total, 1);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_host_work_end_drop_stale_generation_and_dispatcher_wake() {
+        let fixture = idle_ready_fixture().await;
+        let subscription = fixture
+            .broker
+            .runtime_subscription(
+                &fixture.attachment.connection_id,
+                fixture.attachment.generation,
+            )
+            .await
+            .unwrap();
+
+        let permit = fixture
+            .broker
+            .begin_host_work(
+                &fixture.attachment.connection_id,
+                fixture.attachment.generation,
+            )
+            .await
+            .unwrap();
+        let duplicate_identity = permit.identity.clone().unwrap();
+        tokio::time::timeout(Duration::from_millis(50), subscription.notify.notified())
+            .await
+            .expect("begin host work wakes dispatcher");
+        assert!(fixture.broker.end_host_work(permit).await);
+        assert!(!release_host_work(fixture.broker.index.clone(), duplicate_identity).await);
+        tokio::time::timeout(Duration::from_millis(50), subscription.notify.notified())
+            .await
+            .expect("end host work wakes dispatcher");
+
+        let dropped = fixture
+            .broker
+            .begin_host_work(
+                &fixture.attachment.connection_id,
+                fixture.attachment.generation,
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_millis(50), subscription.notify.notified())
+            .await
+            .expect("second begin host work wakes dispatcher");
+        drop(dropped);
+        tokio::task::yield_now().await;
+        tokio::time::timeout(Duration::from_millis(50), subscription.notify.notified())
+            .await
+            .expect("dropped host work wakes dispatcher");
+
+        let stale = fixture
+            .broker
+            .begin_host_work(
+                &fixture.attachment.connection_id,
+                fixture.attachment.generation,
+            )
+            .await
+            .unwrap();
+        fixture
+            .broker
+            .mark_failed(
+                &fixture.attachment.connection_id,
+                fixture.attachment.generation,
+                "session_unavailable",
+                true,
+            )
+            .await
+            .unwrap();
+        let mut retry = request(
+            fixture.key.clone(),
+            "idle-replacement",
+            "idle-replacement-client",
+            "idle-replacement-request",
+        );
+        retry.retry_failed_generation = Some(fixture.attachment.generation);
+        let replacement = fixture.broker.reserve_or_attach(retry).await.unwrap();
+        assert_eq!(replacement.attachment.generation, 2);
+        assert!(!fixture.broker.end_host_work(stale).await);
+        assert_eq!(
+            fixture
+                .broker
+                .diagnostic_for_connection(&replacement.attachment.connection_id)
+                .await
+                .unwrap()
+                .generation,
+            2
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_tombstone_reaps_only_after_cleanup_clients_and_grace() {
+        let manager = ConnectionManager::new();
+        manager.configure_shared_client_lease_ttl(Duration::from_secs(90));
+        let broker = manager.shared_session_broker();
+        let key = SharedSessionKey::Conversation(2_500);
+        let attachment = broker
+            .reserve_or_attach(request(
+                key.clone(),
+                "failed-idle-connection",
+                "failed-idle-client",
+                "failed-idle-connect",
+            ))
+            .await
+            .unwrap()
+            .attachment;
+        broker
+            .mark_failed(
+                &attachment.connection_id,
+                attachment.generation,
+                "session_unavailable",
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(broker
+            .release_lease(&SharedMutationGuard {
+                connection_id: attachment.connection_id.clone(),
+                generation: attachment.generation,
+                lease_id: attachment.lease_id.clone(),
+            })
+            .await
+            .unwrap());
+        let observer = broker
+            .reserve_or_attach(request(
+                key.clone(),
+                "failed-idle-observer-ignored",
+                "failed-idle-observer",
+                "failed-idle-observe",
+            ))
+            .await
+            .unwrap()
+            .attachment;
+        assert!(matches!(
+            observer.phase,
+            SharedSessionPhase::Failed {
+                cleanup_complete: false,
+                ..
+            }
+        ));
+        assert!(!manager
+            .sweep_shared_sessions(Duration::from_secs(900), Duration::from_secs(90))
+            .await
+            .removed);
+
+        broker
+            .mark_cleanup_complete(&attachment.connection_id, attachment.generation)
+            .await
+            .unwrap();
+        assert!(broker
+            .validate_and_bind_lease(
+                &observer.connection_id,
+                Some(observer.generation),
+                Some(&observer.lease_id),
+            )
+            .await
+            .is_ok());
+        assert!(!manager
+            .sweep_shared_sessions(Duration::from_secs(900), Duration::from_secs(90))
+            .await
+            .removed);
+        let guard = SharedMutationGuard {
+            connection_id: observer.connection_id,
+            generation: observer.generation,
+            lease_id: observer.lease_id,
+        };
+        assert!(broker.release_lease(&guard).await.unwrap());
+        assert!(!manager
+            .sweep_shared_sessions(Duration::from_secs(900), Duration::from_secs(90))
+            .await
+            .removed);
+        tokio::time::advance(Duration::from_secs(89)).await;
+        assert!(!manager
+            .sweep_shared_sessions(Duration::from_secs(900), Duration::from_secs(90))
+            .await
+            .removed);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(manager
+            .sweep_shared_sessions(Duration::from_secs(900), Duration::from_secs(90))
+            .await
+            .removed);
+        assert!(broker
+            .diagnostic_for_connection(&attachment.connection_id)
+            .await
+            .is_none());
+
+        let recreated = broker
+            .reserve_or_attach(request(
+                key,
+                "failed-idle-new-incarnation",
+                "failed-idle-new-client",
+                "failed-idle-new-connect",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(recreated.attachment.generation, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_tombstone_pointer_cas_never_removes_replacement_generation() {
+        let broker = broker_with_ttl(Duration::from_secs(90));
+        let key = SharedSessionKey::Conversation(2_501);
+        let attachment = broker
+            .reserve_or_attach(request(
+                key.clone(),
+                "failed-cas-old",
+                "failed-cas-client",
+                "failed-cas-connect",
+            ))
+            .await
+            .unwrap()
+            .attachment;
+        broker
+            .mark_failed(
+                &attachment.connection_id,
+                attachment.generation,
+                "session_unavailable",
+                true,
+            )
+            .await
+            .unwrap();
+        broker
+            .release_lease(&SharedMutationGuard {
+                connection_id: attachment.connection_id.clone(),
+                generation: attachment.generation,
+                lease_id: attachment.lease_id,
+            })
+            .await
+            .unwrap();
+        assert!(broker
+            .evaluate_idle(Duration::from_secs(900), Duration::from_secs(90))
+            .await
+            .is_empty());
+        tokio::time::advance(Duration::from_secs(90)).await;
+        let candidate = broker
+            .evaluate_idle(Duration::from_secs(900), Duration::from_secs(90))
+            .await
+            .pop()
+            .expect("failed tombstone reached its grace");
+
+        let mut retry = request(
+            key,
+            "failed-cas-replacement",
+            "failed-cas-replacement-client",
+            "failed-cas-replacement-connect",
+        );
+        retry.retry_failed_generation = Some(attachment.generation);
+        let replacement = broker.reserve_or_attach(retry).await.unwrap();
+        assert!(!broker.remove_sweep_candidate(&candidate).await);
+        assert_eq!(
+            broker
+                .diagnostic_for_connection(&replacement.attachment.connection_id)
+                .await
+                .unwrap()
+                .generation,
+            2
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_tombstone_candidate_loses_after_attach_and_release() {
+        let broker = broker_with_ttl(Duration::from_secs(90));
+        let key = SharedSessionKey::Conversation(2_502);
+        let attachment = broker
+            .reserve_or_attach(request(
+                key.clone(),
+                "failed-grace-old",
+                "failed-grace-client",
+                "failed-grace-connect",
+            ))
+            .await
+            .unwrap()
+            .attachment;
+        broker
+            .mark_failed(
+                &attachment.connection_id,
+                attachment.generation,
+                "session_unavailable",
+                true,
+            )
+            .await
+            .unwrap();
+        broker
+            .release_lease(&SharedMutationGuard {
+                connection_id: attachment.connection_id.clone(),
+                generation: attachment.generation,
+                lease_id: attachment.lease_id,
+            })
+            .await
+            .unwrap();
+        assert!(broker
+            .evaluate_idle(Duration::from_secs(900), Duration::from_secs(90))
+            .await
+            .is_empty());
+        tokio::time::advance(Duration::from_secs(90)).await;
+        let stale_candidate = broker
+            .evaluate_idle(Duration::from_secs(900), Duration::from_secs(90))
+            .await
+            .pop()
+            .expect("failed tombstone reached its first grace");
+
+        let attached = tokio::time::timeout(
+            Duration::from_secs(1),
+            broker.reserve_or_attach(request(
+                key,
+                "failed-grace-ignored",
+                "failed-grace-new-client",
+                "failed-grace-new-connect",
+            )),
+        )
+        .await
+        .expect("failed tombstone attach must make bounded progress")
+        .unwrap();
+        let attached = attached.attachment;
+        let released = tokio::time::timeout(
+            Duration::from_secs(1),
+            broker.release_lease(&SharedMutationGuard {
+                connection_id: attached.connection_id,
+                generation: attached.generation,
+                lease_id: attached.lease_id,
+            }),
+        )
+        .await
+        .expect("failed tombstone lease release must make bounded progress")
+        .unwrap();
+        assert!(released);
+
+        assert!(
+            !tokio::time::timeout(
+                Duration::from_secs(1),
+                broker.remove_sweep_candidate(&stale_candidate),
+            )
+            .await
+            .expect("failed tombstone removal CAS must make bounded progress")
+        );
+        assert!(broker
+            .evaluate_idle(Duration::from_secs(900), Duration::from_secs(90))
+            .await
+            .is_empty());
+        tokio::time::advance(Duration::from_secs(89)).await;
+        assert!(broker
+            .evaluate_idle(Duration::from_secs(900), Duration::from_secs(90))
+            .await
+            .is_empty());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(
+            broker
+                .evaluate_idle(Duration::from_secs(900), Duration::from_secs(90))
+                .await
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_legacy_disconnect_touch_and_explicit_termination_are_fenced() {
+        let fixture = idle_ready_fixture().await;
+        assert!(!fixture.manager.touch(&fixture.attachment.connection_id).await);
+        assert!(matches!(
+            fixture
+                .manager
+                .disconnect_if_owner(
+                    &fixture.attachment.connection_id,
+                    None,
+                    None,
+                    None,
+                    crate::acp::termination::AcpDisconnectOrigin::ProviderUnmount,
+                )
+                .await,
+            Err(AcpError::Shared(SharedSessionError::ProtocolRequired))
+        ));
+        assert!(fixture.connection_still_registered().await);
+
+        fixture
+            .manager
+            .terminate_shared_session(
+                &fixture.attachment.connection_id,
+                fixture.attachment.generation,
+            )
+            .await
+            .unwrap();
+        assert!(!fixture.connection_still_registered().await);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_cleanup_timeout_retains_closing_and_blocks_new_incarnation() {
+        let fixture = idle_ready_fixture().await;
+        {
+            let connections = fixture.manager.connections.lock().await;
+            connections
+                .get(&fixture.attachment.connection_id)
+                .unwrap()
+                .child_pid
+                .store(42, Ordering::SeqCst);
+        }
+        assert!(!fixture.reap_now().await.removed);
+        tokio::time::advance(Duration::from_secs(900)).await;
+        let report = fixture.reap_now().await;
+        assert!(!report.removed);
+        assert_eq!(report.cleanup_incomplete, 1);
+        assert_eq!(
+            fixture
+                .broker
+                .diagnostic_for_connection(&fixture.attachment.connection_id)
+                .await
+                .unwrap()
+                .phase,
+            SharedSessionPhase::Closing
+        );
+        assert!(matches!(
+            fixture.attach_new_lease().await,
+            Err(SharedSessionError::Closing)
+        ));
+        assert_eq!(
+            fixture.broker.metrics().snapshot().cleanup_incomplete_total,
+            1
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_explicit_termination_removes_failed_tombstone_without_public_state() {
+        let manager = ConnectionManager::new();
+        let broker = manager.shared_session_broker();
+        let attachment = broker
+            .reserve_or_attach(request(
+                SharedSessionKey::Conversation(2_700),
+                "failed-explicit-termination",
+                "failed-explicit-client",
+                "failed-explicit-connect",
+            ))
+            .await
+            .unwrap()
+            .attachment;
+        broker
+            .mark_failed(
+                &attachment.connection_id,
+                attachment.generation,
+                "session_unavailable",
+                true,
+            )
+            .await
+            .unwrap();
+        manager
+            .terminate_shared_session(&attachment.connection_id, attachment.generation)
+            .await
+            .unwrap();
+        assert!(broker
+            .diagnostic_for_connection(&attachment.connection_id)
+            .await
+            .is_none());
     }
 }
