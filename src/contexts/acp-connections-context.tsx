@@ -11,7 +11,7 @@ import {
 } from "react"
 import { useTranslations } from "next-intl"
 import { getEventStream } from "@/lib/platform"
-import { getTransport } from "@/lib/transport"
+import { getTransport, isRemoteDesktopMode } from "@/lib/transport"
 import { subscribeDesktopAcpEvents } from "@/lib/transport/desktop-acp-events"
 import { EventIngestor } from "@/lib/acp/event-ingestor"
 import {
@@ -32,6 +32,7 @@ import {
 } from "@/lib/continuation-waiting"
 import {
   acpConnect,
+  acpConnectOrAttach,
   acpGetAgentStatus,
   acpPrompt,
   acpSetMode,
@@ -42,6 +43,8 @@ import {
   acpAnswerQuestion,
   acpAnswerPlanApproval,
   acpDisconnect,
+  acpReleaseLease,
+  acpTerminateSharedSession,
   acpTouchConnection,
   acpGetSessionSnapshot,
   acpFindConnectionForConversation,
@@ -52,6 +55,10 @@ import {
   type AcpDisconnectLease,
   type AcpDisconnectOrigin,
 } from "@/lib/api"
+import {
+  getSharedClientIdentity,
+  newSharedRequestId,
+} from "@/lib/acp/shared-session-client"
 import {
   getTransferFence,
   isFrontendDisconnectSuppressed,
@@ -130,7 +137,15 @@ import type {
   ToolCallImageWire,
   TurnOutcome,
   UserMessageBlock,
+  PromptEnqueueResult,
+  AcpConnectOrAttachResponse,
+  SharedSessionPhase,
 } from "@/lib/types"
+import type {
+  SharedActiveTurn,
+  SharedQueuedPrompt,
+  SharedSessionPhaseView,
+} from "@/lib/snapshot-denormalize"
 import { getAgentLabel } from "@/lib/custom-agents"
 import {
   CONNECTION_IDLE_TIMEOUT_MS,
@@ -425,6 +440,19 @@ export interface ConnectionState {
   ownershipGeneration?: number | null
   ownerOperationId?: string | null
   ownerWindowLabel?: string | null
+  /** Server-broker lease and authoritative queue projection. */
+  sharedSession: SharedConnectionState | null
+}
+
+export interface SharedConnectionState {
+  generation: number
+  leaseId: string
+  leaseExpiresAt: string
+  /** Client-local idempotency key; never serialized into snapshots or events. */
+  connectRequestId: string
+  phase: SharedSessionPhaseView
+  queue: SharedQueuedPrompt[]
+  activeTurn: SharedActiveTurn | null
 }
 
 /** Owner spawn path vs attach-only observation of an existing broker ACP. */
@@ -441,6 +469,10 @@ type ConnectRequest = {
   delegationRouteOverride?: DelegationRoutePolicy | null
   /** Detached cold-connect incarnation (pop-out operation id). */
   ownerOperationId?: string | null
+  /** Stable for an attach/reconnect incarnation; broker idempotency key. */
+  sharedRequestId?: string
+  /** Explicit retry fence for a cleanup-complete failed shared generation. */
+  retryFailedGeneration?: number
   intent: ConnectionIntent
   /** When true, poll discovery on the full delay schedule (task_running). */
   retryObserverDiscovery: boolean
@@ -455,6 +487,8 @@ function sameConnectRequest(a: ConnectRequest, b: ConnectRequest) {
     (a.delegationRouteOverride ?? null) ===
       (b.delegationRouteOverride ?? null) &&
     (a.ownerOperationId ?? null) === (b.ownerOperationId ?? null) &&
+    (a.sharedRequestId ?? null) === (b.sharedRequestId ?? null) &&
+    (a.retryFailedGeneration ?? null) === (b.retryFailedGeneration ?? null) &&
     a.intent === b.intent &&
     a.retryObserverDiscovery === b.retryObserverDiscovery
   )
@@ -625,6 +659,7 @@ type Action =
       ownershipGeneration?: number | null
       ownerOperationId?: string | null
       ownerWindowLabel?: string | null
+      sharedSession?: SharedConnectionState | null
     }
   | {
       /** In-place lease refresh after reverse while main still holds the conn. */
@@ -653,6 +688,31 @@ type Action =
       type: "HYDRATE_FROM_SNAPSHOT"
       contextKey: string
       patch: import("@/lib/snapshot-denormalize").SnapshotPatch
+    }
+  | {
+      type: "SHARED_SESSION_UPDATED"
+      contextKey: string
+      generation: number
+      update: Partial<
+        Pick<
+          SharedConnectionState,
+          "phase" | "queue" | "activeTurn" | "leaseExpiresAt"
+        >
+      >
+    }
+  | {
+      type: "SHARED_SESSION_EVENT"
+      contextKey: string
+      event: Extract<
+        AcpEvent,
+        | { type: "shared_session_phase_changed" }
+        | { type: "prompt_queued" }
+        | { type: "prompt_queue_item_cancelled" }
+        | { type: "prompt_dispatch_started" }
+        | { type: "prompt_queue_item_failed" }
+        | { type: "prompt_queue_depth_changed" }
+        | { type: "shared_turn_settled" }
+      >
     }
   | { type: "CONNECTION_REMOVED"; contextKey: string }
   | { type: "REMOVE_ALL" }
@@ -1718,6 +1778,7 @@ function reduceSingleAction(
         ownershipGeneration: action.ownershipGeneration ?? null,
         ownerOperationId: action.ownerOperationId ?? null,
         ownerWindowLabel: action.ownerWindowLabel ?? null,
+        sharedSession: action.sharedSession ?? null,
       })
       return next
     }
@@ -1741,6 +1802,104 @@ function reduceSingleAction(
             ? action.ownerWindowLabel
             : current.ownerWindowLabel,
       })
+      return next
+    }
+
+    case "SHARED_SESSION_UPDATED": {
+      const current = state.get(action.contextKey)
+      const shared = current?.sharedSession
+      if (!current || !shared || shared.generation !== action.generation) {
+        return state
+      }
+      const next = writableConnections(state, mutateUnpublished)
+      next.set(action.contextKey, {
+        ...current,
+        sharedSession: { ...shared, ...action.update },
+      })
+      return next
+    }
+
+    case "SHARED_SESSION_EVENT": {
+      const current = state.get(action.contextKey)
+      const shared = current?.sharedSession
+      if (
+        !current ||
+        !shared ||
+        shared.generation !== action.event.generation
+      ) {
+        return state
+      }
+      let nextShared = shared
+      switch (action.event.type) {
+        case "shared_session_phase_changed":
+          nextShared = {
+            ...shared,
+            phase: sharedPhaseFromWire(action.event.phase),
+          }
+          break
+        case "prompt_queued": {
+          const item = sharedQueueItemFromWire(action.event.item)
+          const without = shared.queue.filter(
+            (queued) => queued.queueItemId !== item.queueItemId
+          )
+          nextShared = { ...shared, queue: [...without, item] }
+          break
+        }
+        case "prompt_queue_item_cancelled": {
+          const event = action.event as Extract<
+            AcpEvent,
+            { type: "prompt_queue_item_cancelled" }
+          >
+          nextShared = {
+            ...shared,
+            queue: shared.queue.filter(
+              (item) => item.queueItemId !== event.queue_item_id
+            ),
+          }
+          break
+        }
+        case "prompt_queue_item_failed": {
+          const event = action.event as Extract<
+            AcpEvent,
+            { type: "prompt_queue_item_failed" }
+          >
+          nextShared = {
+            ...shared,
+            queue: shared.queue.filter(
+              (item) => item.queueItemId !== event.queue_item_id
+            ),
+          }
+          break
+        }
+        case "prompt_dispatch_started": {
+          const turn = action.event.turn
+          nextShared = {
+            ...shared,
+            queue: shared.queue.map((item) =>
+              item.queueItemId === turn.queue_item_id
+                ? { ...item, state: "dispatching" }
+                : item
+            ),
+            activeTurn: sharedTurnFromWire(turn),
+          }
+          break
+        }
+        case "shared_turn_settled":
+          if (shared.activeTurn?.turnId !== action.event.turn_id) return state
+          nextShared = {
+            ...shared,
+            activeTurn: null,
+            queue: shared.queue.filter(
+              (item) => item.queueItemId !== shared.activeTurn?.queueItemId
+            ),
+          }
+          break
+        case "prompt_queue_depth_changed":
+          return state
+      }
+      if (nextShared === shared) return state
+      const next = writableConnections(state, mutateUnpublished)
+      next.set(action.contextKey, { ...current, sharedSession: nextShared })
       return next
     }
 
@@ -1817,6 +1976,7 @@ function reduceSingleAction(
         toolWatchdogProjections: {},
         toolWatchdogMaxVersions: {},
         lastToolWatchdogDiagnostic: null,
+        sharedSession: null,
       })
       return next
     }
@@ -1899,6 +2059,21 @@ function reduceSingleAction(
       // row (draft tab). Never clear an already-bound id with a null patch.
       const mergedConversationId =
         current.conversationId ?? action.patch.conversationId ?? null
+      const mergedSharedSession =
+        current.sharedSession &&
+        action.patch.sharedSession &&
+        current.sharedSession.generation ===
+          action.patch.sharedSession.generation
+          ? {
+              ...current.sharedSession,
+              phase: action.patch.sharedSession.phase,
+              queue: action.patch.sharedSession.queue,
+              activeTurn: action.patch.sharedSession.activeTurn,
+              leaseExpiresAt:
+                action.patch.sharedSession.leaseExpiresAt ??
+                current.sharedSession.leaseExpiresAt,
+            }
+          : current.sharedSession
 
       // Race guard: the snapshot may have been generated BEFORE events
       // that have since arrived and been applied to in-memory state.
@@ -1932,6 +2107,7 @@ function reduceSingleAction(
           selectorsReady: mergedSelectorsReady,
           supportsFork: mergedSupportsFork,
           conversationId: mergedConversationId,
+          sharedSession: mergedSharedSession,
         })
         return next
       }
@@ -2015,6 +2191,7 @@ function reduceSingleAction(
         // stale path above deliberately preserves the current cleared value.
         error: action.patch.lastError,
         lastAppliedSeq: action.patch.eventSeq,
+        sharedSession: mergedSharedSession,
       })
       return next
     }
@@ -3226,6 +3403,67 @@ interface PrepareEnv {
   ) => void
 }
 
+function sharedPhaseFromWire(
+  phase: SharedSessionPhase
+): SharedSessionPhaseView {
+  switch (phase.phase) {
+    case "reserved":
+      return { phase: "reserved" }
+    case "bootstrapping":
+      return { phase: "bootstrapping" }
+    case "ready":
+      return { phase: "ready" }
+    case "failed":
+      return {
+        phase: "failed",
+        errorCode: phase.error_code,
+        cleanupComplete: phase.cleanup_complete,
+      }
+    case "closing":
+      return { phase: "closing" }
+  }
+}
+
+function sharedPhaseFromResponse(
+  response: AcpConnectOrAttachResponse
+): SharedSessionPhaseView {
+  if (response.phase === "failed") {
+    return {
+      phase: "failed",
+      errorCode: response.error?.code ?? "shared_session_failed",
+      cleanupComplete: response.error?.cleanupComplete ?? false,
+    }
+  }
+  return { phase: response.phase }
+}
+
+function sharedQueueItemFromWire(
+  item: import("@/lib/types").SharedQueuedPromptSummary
+): SharedQueuedPrompt {
+  return {
+    queueItemId: item.queue_item_id,
+    enqueueSeq: item.enqueue_seq,
+    clientMessageId: item.client_message_id,
+    visibleText: item.visible_text,
+    visibleTextTruncated: item.visible_text_truncated,
+    attachmentCount: item.attachment_count,
+    submittedAt: item.submitted_at,
+    state: item.state,
+  }
+}
+
+function sharedTurnFromWire(
+  turn: import("@/lib/types").SharedActiveTurnProjection
+): SharedActiveTurn {
+  return {
+    turnId: turn.turn_id,
+    queueItemId: turn.queue_item_id,
+    enqueueSeq: turn.enqueue_seq,
+    clientMessageId: turn.client_message_id,
+    stopRequested: turn.stop_requested,
+  }
+}
+
 function prepareMappedEnvelope(
   contextKey: string,
   envelope: EventEnvelope,
@@ -3237,6 +3475,15 @@ function prepareMappedEnvelope(
   const e = envelope
 
   switch (e.type) {
+    case "shared_session_phase_changed":
+    case "prompt_queued":
+    case "prompt_queue_item_cancelled":
+    case "prompt_dispatch_started":
+    case "prompt_queue_item_failed":
+    case "prompt_queue_depth_changed":
+    case "shared_turn_settled":
+      actions.push({ type: "SHARED_SESSION_EVENT", contextKey, event: e })
+      break
     case "status_changed":
       actions.push({ type: "STATUS_CHANGED", contextKey, status: e.status })
       break
@@ -4171,7 +4418,7 @@ export interface AcpActionsValue {
       clientMessageId?: string | null
       promptContext?: AcpPromptContext
     }
-  ): Promise<void>
+  ): Promise<PromptEnqueueResult | null>
   setMode(contextKey: string, modeId: string): Promise<void>
   setConfigOption(
     contextKey: string,
@@ -5677,7 +5924,8 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       contextKey: string,
       connectionId: string,
       sinceSeq: number | undefined,
-      reconnectMode: "resume" | "cold" = "resume"
+      reconnectMode: "resume" | "cold" = "resume",
+      shared?: { generation: number; leaseId: string }
     ): EventStreamSubscription | null => {
       const stream = getEventStream()
       if (!stream) return null
@@ -5713,12 +5961,57 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             const newSub = stream.attach(
               connectionId,
               reconnectMode === "cold"
-                ? { sinceSeq: newSinceSeq, reconnectMode: "cold" }
-                : { sinceSeq: newSinceSeq },
+                ? {
+                    sinceSeq: newSinceSeq,
+                    reconnectMode: "cold",
+                    ...(shared ? { shared } : {}),
+                  }
+                : {
+                    sinceSeq: newSinceSeq,
+                    ...(shared ? { shared } : {}),
+                  },
               handlers
             )
             activeSub = newSub
             attachSubscriptionsRef.current.set(contextKey, newSub)
+            return
+          }
+          if (
+            shared &&
+            (reason === "lease_expired" ||
+              reason === "generation_stale" ||
+              reason === "session_replaced")
+          ) {
+            const request = lastConnectParamsRef.current.get(contextKey)
+            const cursor =
+              storeRef.current.connections.get(contextKey)?.lastAppliedSeq
+            attachSubscriptionsRef.current.delete(contextKey)
+            acpReleaseLease(
+              connectionId,
+              shared.generation,
+              shared.leaseId
+            ).catch(() => {})
+            dispatch({ type: "CONNECTION_REMOVED", contextKey })
+            if (request) {
+              queueMicrotask(() => {
+                connectRef
+                  .current?.(
+                    contextKey,
+                    request.agentType,
+                    request.workingDir,
+                    request.sessionId,
+                    request.conversationId,
+                    request.delegationRouteOverride,
+                    request.ownerOperationId,
+                    request.intent,
+                    request.retryObserverDiscovery
+                  )
+                  .catch(() => {})
+              })
+            }
+            // Cursor is retained in the request only by the live store. A new
+            // generation cold-attaches; a same-generation response restores it.
+            void cursor
             return
           }
           // Terminal detach (connection_gone): remove canonical state and every
@@ -5738,8 +6031,8 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       activeSub = stream.attach(
         connectionId,
         reconnectMode === "cold"
-          ? { sinceSeq, reconnectMode: "cold" }
-          : { sinceSeq },
+          ? { sinceSeq, reconnectMode: "cold", ...(shared ? { shared } : {}) }
+          : { sinceSeq, ...(shared ? { shared } : {}) },
         handlers
       )
       attachSubscriptionsRef.current.set(contextKey, activeSub)
@@ -6009,6 +6302,8 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         // is harmless but redundant. Connecting hasn't reached the
         // sweep-eligible state yet. Only Connected matters.
         if (conn.status !== "connected") return
+        // Shared roots are kept alive by the EventStream's 30s lease ping.
+        if (conn.sharedSession) return
         toTouch.push(conn.connectionId)
       }
       if (currentActiveKey) consider(currentActiveKey)
@@ -6448,13 +6743,21 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
 
       for (const { contextKey, connectionId } of toDisconnect) {
         const leaseConn = storeRef.current.connections.get(contextKey)
-        acpDisconnect(
-          connectionId,
-          disconnectLeaseWithOrigin(
-            leaseConn ? leaseArgsForDisconnect(leaseConn) : null,
-            "idle_timeout"
-          )
-        ).catch(() => {})
+        if (leaseConn?.sharedSession) {
+          acpReleaseLease(
+            connectionId,
+            leaseConn.sharedSession.generation,
+            leaseConn.sharedSession.leaseId
+          ).catch(() => {})
+        } else {
+          acpDisconnect(
+            connectionId,
+            disconnectLeaseWithOrigin(
+              leaseConn ? leaseArgsForDisconnect(leaseConn) : null,
+              "idle_timeout"
+            )
+          ).catch(() => {})
+        }
         reverseMapRef.current.delete(connectionId)
         teardownAttachSubscription(contextKey)
         lastActivityRef.current.delete(contextKey)
@@ -6704,6 +7007,10 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       intent: ConnectionIntent = "own_or_observe",
       retryObserverDiscovery = false
     ) => {
+      const rememberedSharedRequestId =
+        lastConnectParamsRef.current.get(contextKey)?.sharedRequestId
+      const rememberedRetryGeneration =
+        lastConnectParamsRef.current.get(contextKey)?.retryFailedGeneration
       const request: ConnectRequest = {
         agentType,
         workingDir,
@@ -6713,6 +7020,8 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         ownerOperationId: ownerOperationId ?? null,
         intent,
         retryObserverDiscovery,
+        sharedRequestId: rememberedSharedRequestId ?? newSharedRequestId(),
+        retryFailedGeneration: rememberedRetryGeneration,
       }
       // Remember BEFORE the in-flight early return and before the preflight can
       // throw: a connect that never produced a store entry is precisely when
@@ -6808,6 +7117,96 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
 
       let configuredAgent: AcpAgentStatus | null = null
       try {
+        // Web and remote-desktop roots are broker-owned. A non-null event
+        // stream is the transport capability boundary; pure Tauri continues
+        // through the legacy owner/viewer path below.
+        if (
+          intent === "own_or_observe" &&
+          getEventStream() !== null &&
+          (!getTransport().isDesktop() || isRemoteDesktopMode())
+        ) {
+          const nextWorkingDir = workingDir ?? null
+          const existing = storeRef.current.connections.get(contextKey)
+          if (
+            existing &&
+            existing.sharedSession &&
+            existing.agentType === agentType &&
+            existing.workingDir === nextWorkingDir &&
+            existing.status !== "disconnected" &&
+            existing.status !== "error"
+          ) {
+            return
+          }
+          if (existing) {
+            teardownAttachSubscription(contextKey)
+            if (existing.sharedSession) {
+              acpReleaseLease(
+                existing.connectionId,
+                existing.sharedSession.generation,
+                existing.sharedSession.leaseId
+              ).catch(() => {})
+            }
+            dispatch({ type: "CONNECTION_REMOVED", contextKey })
+          }
+          const prefs = getSavedPrefsForConnect(agentType)
+          const identity = getSharedClientIdentity()
+          const response = await acpConnectOrAttach({
+            conversationId: conversationId ?? null,
+            agentType,
+            workingDir: nextWorkingDir,
+            externalSessionId: sessionId ?? null,
+            delegationRouteOverride: delegationRouteOverride ?? null,
+            preferredModeId: prefs.modeId,
+            preferredConfigValues: prefs.configValues,
+            deviceId: identity.deviceId,
+            clientInstanceId: identity.clientInstanceId,
+            requestId: request.sharedRequestId ?? newSharedRequestId(),
+            retryFailedGeneration: request.retryFailedGeneration ?? null,
+          })
+          if (isConnectAbandonedOrSuperseded(contextKey, request)) {
+            acpReleaseLease(
+              response.connectionId,
+              response.generation,
+              response.leaseId
+            ).catch(() => {})
+            return
+          }
+          lastActivityRef.current.set(contextKey, Date.now())
+          dispatch({
+            type: "CONNECTION_CREATED",
+            contextKey,
+            connectionId: response.connectionId,
+            agentType,
+            workingDir: nextWorkingDir,
+            conversationId: conversationId ?? null,
+            delegationRouteOverride: delegationRouteOverride ?? null,
+            isViewer: false,
+            sharedSession: {
+              generation: response.generation,
+              leaseId: response.leaseId,
+              leaseExpiresAt: response.leaseExpiresAt,
+              connectRequestId: request.sharedRequestId ?? newSharedRequestId(),
+              phase: sharedPhaseFromResponse(response),
+              queue: [],
+              activeTurn: null,
+            },
+          })
+          setupAttachSubscription(
+            contextKey,
+            response.connectionId,
+            undefined,
+            "cold",
+            { generation: response.generation, leaseId: response.leaseId }
+          )
+          if (request.retryFailedGeneration != null) {
+            lastConnectParamsRef.current.set(contextKey, {
+              ...request,
+              retryFailedGeneration: undefined,
+            })
+          }
+          return
+        }
+
         // ── observe_existing: bounded discovery only; never preflight/spawn ──
         if (intent === "observe_existing") {
           const direct = storeRef.current.connections.get(contextKey)
@@ -7562,6 +7961,29 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       // been known to the entry (cold attach hydrates it from the snapshot,
       // never from a replayed `session_started`).
       captureIdentityBeforeRemoval(contextKey)
+      if (conn.sharedSession) {
+        teardownAttachSubscription(contextKey)
+        reverseMapRef.current.delete(conn.connectionId)
+        pendingUnmappedEventsRef.current.delete(conn.connectionId)
+        lastActivityRef.current.delete(contextKey)
+        clearAliasesPointingTo(contextKey)
+        if (conn.connectionId !== contextKey) {
+          clearAliasesPointingTo(conn.connectionId)
+        }
+        await acpReleaseLease(
+          conn.connectionId,
+          conn.sharedSession.generation,
+          conn.sharedSession.leaseId
+        ).catch(() => {})
+        if (origin === "explicit_user") {
+          await acpTerminateSharedSession(
+            conn.connectionId,
+            conn.sharedSession.generation
+          )
+        }
+        dispatch({ type: "CONNECTION_REMOVED", contextKey })
+        return true
+      }
       if (conn.isViewer) {
         // Viewer teardown: drop our read-only attachment WITHOUT
         // `acpDisconnect` — the backend connection belongs to another client,
@@ -7790,8 +8212,18 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       }
       // Resolved AFTER the wait: the connect we just waited on may have minted
       // the sessionId that makes this a resume rather than a fresh session.
-      const request = resolveReconnectRequest(contextKey)
+      let request = resolveReconnectRequest(contextKey)
       if (!request) return false
+      const shared = storeRef.current.connections.get(contextKey)?.sharedSession
+      if (shared?.phase.phase === "failed") {
+        if (!shared.phase.cleanupComplete) return false
+        request = {
+          ...request,
+          sharedRequestId: newSharedRequestId(),
+          retryFailedGeneration: shared.generation,
+        }
+        lastConnectParamsRef.current.set(contextKey, request)
+      }
       // Tear down first even though connect() would: its "same params, still
       // alive → no-op" fast path would otherwise swallow the whole thing, and
       // this button exists precisely to rebuild a connection whose params did
@@ -7802,7 +8234,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       // is released either way, and refusing to reconnect would strand the user
       // on the dead connection this button exists to replace.
       if (storeRef.current.connections.has(contextKey)) {
-        await disconnect(contextKey)
+        await disconnect(contextKey, "connection_superseded")
       }
       await connect(
         contextKey,
@@ -7840,7 +8272,15 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       // owner's agent). Owners are torn down normally unless pop-out suppress
       // / transfer fence is active (detached keepalive). Delegation children
       // also attach without owning the process — detach only.
-      if (!conn.isViewer && !conn.isDelegationChild) {
+      if (conn.sharedSession) {
+        promises.push(
+          acpReleaseLease(
+            conn.connectionId,
+            conn.sharedSession.generation,
+            conn.sharedSession.leaseId
+          ).catch(() => {})
+        )
+      } else if (!conn.isViewer && !conn.isDelegationChild) {
         const suppressBare =
           conn.conversationId != null &&
           (isTransferringOut(conn.conversationId) ||
@@ -7900,7 +8340,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       }
       const key = canonicalKey(contextKey)
       const conn = storeRef.current.connections.get(key)
-      if (!conn) return
+      if (!conn) return null
       lastActivityRef.current.set(key, Date.now())
       const promptContext = opts?.promptContext ?? {
         visibleText: null,
@@ -7911,14 +8351,32 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       // wins over the connection-bound id; rollback the exact token on reject.
       const activity = beginRootConversationActivity(conn, opts?.conversationId)
       try {
-        await acpPrompt(
-          conn.connectionId,
-          blocks,
-          opts?.folderId ?? null,
-          opts?.conversationId ?? null,
-          opts?.clientMessageId ?? null,
-          promptContext
-        )
+        const shared = conn.sharedSession
+        const identity = shared ? getSharedClientIdentity() : null
+        const result = shared
+          ? await acpPrompt(
+              conn.connectionId,
+              blocks,
+              opts?.folderId ?? null,
+              opts?.conversationId ?? null,
+              opts?.clientMessageId ?? null,
+              promptContext,
+              {
+                generation: shared.generation,
+                leaseId: shared.leaseId,
+                clientInstanceId: identity!.clientInstanceId,
+                clientRequestId: shared.connectRequestId,
+              }
+            )
+          : await acpPrompt(
+              conn.connectionId,
+              blocks,
+              opts?.folderId ?? null,
+              opts?.conversationId ?? null,
+              opts?.clientMessageId ?? null,
+              promptContext
+            )
+        return result
       } catch (e) {
         rollbackRootConversationActivity(activity)
         throw e
@@ -7987,6 +8445,17 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       if (conversationId != null) {
         noteUserStopTurnOwnership(conversationId)
       }
+      const shared = conn.sharedSession
+      if (shared) {
+        const turnId = shared.activeTurn?.turnId
+        if (!turnId) return
+        await acpCancel(conn.connectionId, {
+          generation: shared.generation,
+          leaseId: shared.leaseId,
+          turnId,
+        })
+        return
+      }
       await acpCancel(conn.connectionId)
     },
     [canonicalKey]
@@ -8023,7 +8492,15 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       }
       try {
         lastActivityRef.current.set(key, Date.now())
-        await acpRespondPermission(conn.connectionId, requestId, optionId)
+        const shared = conn.sharedSession
+        if (shared) {
+          await acpRespondPermission(conn.connectionId, requestId, optionId, {
+            generation: shared.generation,
+            leaseId: shared.leaseId,
+          })
+        } else {
+          await acpRespondPermission(conn.connectionId, requestId, optionId)
+        }
         dispatch({ type: "PERMISSION_CLEARED", contextKey: key, requestId })
       } catch (e) {
         console.error("[AcpConnections] respondPermission failed:", e)
@@ -8051,7 +8528,15 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       const activity = beginRootConversationActivity(conn)
       try {
         lastActivityRef.current.set(key, Date.now())
-        await acpAnswerQuestion(conn.connectionId, questionId, answer)
+        const shared = conn.sharedSession
+        if (shared) {
+          await acpAnswerQuestion(conn.connectionId, questionId, answer, {
+            generation: shared.generation,
+            leaseId: shared.leaseId,
+          })
+        } else {
+          await acpAnswerQuestion(conn.connectionId, questionId, answer)
+        }
         // Optimistically clear; the backend also broadcasts question_resolved
         // (idempotent on the matched id).
         dispatch({ type: "CLEAR_ASK_QUESTION", contextKey: key, questionId })
@@ -8081,7 +8566,15 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       }
       try {
         lastActivityRef.current.set(contextKey, Date.now())
-        await acpAnswerPlanApproval(conn.connectionId, approvalId, answer)
+        const shared = conn.sharedSession
+        if (shared) {
+          await acpAnswerPlanApproval(conn.connectionId, approvalId, answer, {
+            generation: shared.generation,
+            leaseId: shared.leaseId,
+          })
+        } else {
+          await acpAnswerPlanApproval(conn.connectionId, approvalId, answer)
+        }
         // Optimistically clear; the backend also broadcasts
         // plan_approval_resolved (idempotent on the matched id).
         dispatch({ type: "CLEAR_PLAN_APPROVAL", contextKey, approvalId })
@@ -8238,7 +8731,10 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     async (contextKey: string) => {
       const conn = storeRef.current.connections.get(contextKey)
       if (conn && !conn.isViewer && isConnectionBusy(conn)) return
-      await disconnect(contextKey)
+      await disconnect(
+        contextKey,
+        conn?.sharedSession ? "idle_timeout" : "explicit_user"
+      )
     },
     [disconnect]
   )

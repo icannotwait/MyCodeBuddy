@@ -60,7 +60,10 @@ const h = vi.hoisted(() => {
     acpGetAgentStatus: vi.fn(),
     acpFindConnectionForConversation: vi.fn(),
     acpConnect: vi.fn(),
+    acpConnectOrAttach: vi.fn(),
     acpDisconnect: vi.fn(),
+    acpReleaseLease: vi.fn(),
+    acpTerminateSharedSession: vi.fn(),
     acpCancel: vi.fn(),
     acpGetSessionSnapshot: vi.fn(),
     acpGetDesktopDeliveryCapabilities: vi.fn(),
@@ -176,7 +179,10 @@ vi.mock("@/lib/api", () => ({
   acpGetAgentStatus: h.acpGetAgentStatus,
   acpFindConnectionForConversation: h.acpFindConnectionForConversation,
   acpConnect: h.acpConnect,
+  acpConnectOrAttach: h.acpConnectOrAttach,
   acpDisconnect: h.acpDisconnect,
+  acpReleaseLease: h.acpReleaseLease,
+  acpTerminateSharedSession: h.acpTerminateSharedSession,
   acpGetSessionSnapshot: h.acpGetSessionSnapshot,
   acpGetDesktopDeliveryCapabilities: h.acpGetDesktopDeliveryCapabilities,
   acpPrompt: acpPromptMock,
@@ -201,6 +207,7 @@ vi.mock("@/lib/transport", () => ({
     subscribe: h.subscribe,
     call: vi.fn(),
   }),
+  isRemoteDesktopMode: () => false,
 }))
 
 vi.mock("@/lib/transport/desktop-acp-events", () => ({
@@ -249,6 +256,70 @@ async function mountProvider() {
 
 const TAB = "conv-1-claude_code-42"
 
+function sharedResponse(
+  overrides: Partial<import("@/lib/types").AcpConnectOrAttachResponse> = {}
+) {
+  return {
+    connectionId: "conn",
+    generation: 1,
+    leaseId: "lease-1",
+    leaseExpiresAt: "2026-01-01T00:01:00.000Z",
+    disposition: "created" as const,
+    phase: "ready" as const,
+    eventSeq: 0,
+    ...overrides,
+  }
+}
+
+describe("AcpConnectionsProvider shared server roots", () => {
+  it("connects server roots directly and installs shared state", async () => {
+    h.isDesktop = false
+    h.acpConnectOrAttach.mockResolvedValue(
+      sharedResponse({ disposition: "attached" })
+    )
+    await mountProvider()
+
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/work", "sess", 42)
+    })
+
+    expect(h.acpFindConnectionForConversation).not.toHaveBeenCalled()
+    expect(h.acpConnect).not.toHaveBeenCalled()
+    expect(h.acpConnectOrAttach).toHaveBeenCalledTimes(1)
+    expect(h.store!.getConnection(TAB)?.sharedSession).toMatchObject({
+      generation: 1,
+      leaseId: "lease-1",
+    })
+  })
+
+  it("releases a shared lease on provider teardown without disconnecting", async () => {
+    h.isDesktop = false
+    h.acpConnectOrAttach.mockResolvedValue(sharedResponse())
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/work", "sess", 42)
+      await h.actions!.disconnect(TAB, "provider_unmount")
+    })
+
+    expect(h.acpReleaseLease).toHaveBeenCalledWith("conn", 1, "lease-1")
+    expect(h.acpDisconnect).not.toHaveBeenCalled()
+    expect(h.acpTerminateSharedSession).not.toHaveBeenCalled()
+  })
+
+  it("terminates only on an explicit shared disconnect", async () => {
+    h.isDesktop = false
+    h.acpConnectOrAttach.mockResolvedValue(sharedResponse())
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/work", "sess", 42)
+      await h.actions!.disconnect(TAB, "explicit_user")
+    })
+
+    expect(h.acpTerminateSharedSession).toHaveBeenCalledWith("conn", 1)
+    expect(h.acpDisconnect).not.toHaveBeenCalled()
+  })
+})
+
 function makeSummary(
   overrides: Partial<DbConversationSummary> & { id: number }
 ): DbConversationSummary {
@@ -288,7 +359,10 @@ beforeEach(() => {
   h.acpGetAgentStatus.mockReset()
   h.acpFindConnectionForConversation.mockReset()
   h.acpConnect.mockReset()
+  h.acpConnectOrAttach.mockReset()
   h.acpDisconnect.mockReset()
+  h.acpReleaseLease.mockReset()
+  h.acpTerminateSharedSession.mockReset()
   h.acpCancel.mockReset()
   h.acpCancel.mockResolvedValue(undefined)
   h.acpGetSessionSnapshot.mockReset()
@@ -362,6 +436,9 @@ beforeEach(() => {
     is_acp_adapter: true,
   })
   h.acpConnect.mockResolvedValue("spawned-conn")
+  h.acpConnectOrAttach.mockResolvedValue(sharedResponse())
+  h.acpReleaseLease.mockResolvedValue(undefined)
+  h.acpTerminateSharedSession.mockResolvedValue(undefined)
   h.acpDisconnect.mockResolvedValue(undefined)
   h.acpGetSessionSnapshot.mockResolvedValue(null)
   h.acpGetDesktopDeliveryCapabilities.mockResolvedValue({
