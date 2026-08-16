@@ -258,6 +258,7 @@ const CONTRADICTORY_SKILL_PROSE = [
   /\breuse one codex conversation for implementation and review\b/i,
   /\bswitch agent immediately inside the active task\b/i,
   /\bskip the auxiliary review after a high-task fix\b/i,
+  /\buse that reviewer instead of the codex design reviewer\b/i,
 ]
 const FORBIDDEN_PROGRESS_FIELDS = new Set([
   "workflow_id",
@@ -971,19 +972,33 @@ export function deriveExpectedRoute(task, generation, failures) {
         implementer: taskAgent,
         reviewers: [{ slot: "primary", agent_type: "codex", profile_id: null }],
       }
+  const expectedWorkUnitKeys = {
+    implementer: high
+      ? `task|${task.index}|implementer|codex|none`
+      : `task|${task.index}|implementer|${taskAgent.agent_type}|${profile}`,
+    reviewers: {
+      primary: `task|${task.index}|reviewer|primary|codex|none`,
+      auxiliary: high
+        ? `task|${task.index}|reviewer|auxiliary|${taskAgent.agent_type}|${profile}`
+        : null,
+    },
+  }
+  const derivedKeys = [
+    expectedWorkUnitKeys.implementer,
+    expectedWorkUnitKeys.reviewers.primary,
+    expectedWorkUnitKeys.reviewers.auxiliary,
+  ].filter(nonEmptyString)
+  if (derivedKeys.some((key) => !parseRecognizedWorkUnitKey(key))) {
+    fail(
+      failures,
+      "B2D-ROUTING-009",
+      `Task ${task.index} derives a non-canonical work-unit key`
+    )
+    return null
+  }
   return {
     route: expectedRoute,
-    expected_work_unit_keys: {
-      implementer: high
-        ? `task|${task.index}|implementer|codex|none`
-        : `task|${task.index}|implementer|${taskAgent.agent_type}|${profile}`,
-      reviewers: {
-        primary: `task|${task.index}|reviewer|primary|codex|none`,
-        auxiliary: high
-          ? `task|${task.index}|reviewer|auxiliary|${taskAgent.agent_type}|${profile}`
-          : null,
-      },
-    },
+    expected_work_unit_keys: expectedWorkUnitKeys,
   }
 }
 
@@ -1005,22 +1020,12 @@ export function validateRoutingSnapshot(snapshot, plan, failures) {
     )
   }
 
-  const rawGenerations =
-    snapshot.task_agent_generations === undefined
-      ? [
-          {
-            generation: 1,
-            agent_type: "grok",
-            profile_id: null,
-            effective_from_task_index: 1,
-          },
-        ]
-      : snapshot.task_agent_generations
+  const rawGenerations = snapshot.task_agent_generations
   if (!Array.isArray(rawGenerations) || rawGenerations.length === 0) {
     fail(
       failures,
       "B2D-ROUTING-006",
-      "Task Agent generations must start at generation 1"
+      "routing must serialize a non-empty Task Agent generation array"
     )
   } else {
     for (const [offset, generation] of rawGenerations.entries()) {
@@ -1657,11 +1662,17 @@ export function validateProgressRouting(snapshot, routing, failures) {
       for (const key of allowed) {
         const lineage = groups.get(key) ?? []
         const latest = lineage.at(-1)
-        if (!latest || latest.state !== "completed") {
+        if (
+          !latest ||
+          latest.state !== "completed" ||
+          !nonEmptyString(latest.task_id) ||
+          !positiveInteger(latest.child_conversation_id) ||
+          latest.child_conversation_id > MAX_I32
+        ) {
           fail(
             failures,
             "B2D-PROGRESS-010",
-            `completed Task ${routeTask.index} lacks completed lineage ${key}`
+            `completed Task ${routeTask.index} lacks an admitted completed lineage ${key}`
           )
         }
       }
@@ -1670,21 +1681,46 @@ export function validateProgressRouting(snapshot, routing, failures) {
 
   for (const generation of routing.generations.slice(1)) {
     const boundary = progressByIndex.get(generation.effective_from_task_index)
+    const boundaryRoute = routing.tasks.find(
+      (task) => task.index === generation.effective_from_task_index
+    )
     const prior = snapshot.tasks.filter(
       (task) => task.index < generation.effective_from_task_index
     )
+    const priorCompleted = prior.every((task) => task.status === "completed")
+    const boundaryRuns = Array.isArray(boundary?.runs) ? boundary.runs : []
+    const emptyPendingBoundary =
+      boundary?.status === "pending" &&
+      boundaryRuns.length === 0 &&
+      snapshot.active_task_index === null
+    const frozenRouteMatches =
+      boundary?.risk_level === boundaryRoute?.risk?.level &&
+      boundary?.task_agent_generation ===
+        boundaryRoute?.task_agent_generation &&
+      skillContractsEqual(
+        boundary?.expected_work_unit_keys,
+        boundaryRoute?.expected_work_unit_keys
+      )
+    const allowed = expectedKeySet(boundaryRoute?.expected_work_unit_keys)
+    const hasAdmittedRun = boundaryRuns.some(
+      (run) =>
+        isObject(run) &&
+        allowed.has(run.work_unit_key) &&
+        nonEmptyString(run.task_id) &&
+        positiveInteger(run.child_conversation_id) &&
+        run.child_conversation_id <= MAX_I32
+    )
+    const historicalAdoptedBoundary =
+      boundary?.status !== "pending" && frozenRouteMatches && hasAdmittedRun
     if (
       !boundary ||
-      boundary.status !== "pending" ||
-      !Array.isArray(boundary.runs) ||
-      boundary.runs.length !== 0 ||
-      prior.some((task) => task.status !== "completed") ||
-      snapshot.active_task_index !== null
+      !priorCompleted ||
+      (!emptyPendingBoundary && !historicalAdoptedBoundary)
     ) {
       fail(
         failures,
         "B2D-ROUTING-007",
-        `generation ${generation.generation} does not start at an empty pending boundary after the completed prefix`
+        `generation ${generation.generation} is neither awaiting adoption at an empty pending boundary nor frozen on its admitted route`
       )
     }
   }

@@ -313,10 +313,14 @@ function progress(snapshot = routing()) {
   }
 }
 
-function validate(snapshot = routing(), state = progress(snapshot)) {
+function validate(
+  snapshot = routing(),
+  state = progress(snapshot),
+  planMarkdown = plan(snapshot)
+) {
   return validateSimpleDocuments({
     skillMarkdown: skill,
-    planMarkdown: plan(snapshot),
+    planMarkdown,
     progressMarkdown: `# Progress\n\n${block(
       "codeg-simple-progress-v1",
       state
@@ -391,6 +395,7 @@ describe("Skill contract v2", () => {
       "Reuse one Codex conversation for implementation and review.",
       "Switch Agent immediately inside the active Task.",
       "Skip the auxiliary review after a high-Task fix.",
+      "When the user names a Design Reviewer, use that reviewer instead of the Codex Design Reviewer.",
     ]) {
       has(validateSkillMarkdown(`${skill}\n${prose}`).failures, "B2D-SKILL-005")
     }
@@ -439,19 +444,14 @@ describe("bounded routing extraction", () => {
 })
 
 describe("risk, generation, and exact routes", () => {
-  it("defaults omitted initial selection to generation 1 Grok", () => {
+  it("requires a non-empty serialized Task Agent generation array", () => {
     const snapshot = routing()
     delete snapshot.task_agent_generations
-    const parsed = parseSimplePlan(plan(snapshot))
-    const failures = []
-    const normalized = validateRoutingSnapshot(parsed.routing, parsed, failures)
-    assert.deepEqual(failures, [])
-    assert.deepEqual(normalized.generations[0], {
-      generation: 1,
-      agent_type: "grok",
-      profile_id: null,
-      effective_from_task_index: 1,
-    })
+    has(validate(snapshot), "B2D-ROUTING-006")
+
+    const empty = routing()
+    empty.task_agent_generations = []
+    has(validate(empty), "B2D-ROUTING-006")
   })
 
   it("accepts every built-in and valid custom identity/profile", () => {
@@ -703,6 +703,30 @@ describe("risk, generation, and exact routes", () => {
       expectedWorkUnitKeys(2, "high", identity())
     )
   })
+
+  it("rejects maximum Agent/profile selections whose implementer key exceeds the canonical limit", () => {
+    const selected = identity(`custom:${"a".repeat(64)}`, "p".repeat(128))
+    const failures = []
+    const derived = deriveExpectedRoute(
+      task(0xffffffff, "normal", selected),
+      { generation: 1, ...selected, effective_from_task_index: 1 },
+      failures
+    )
+    assert.equal(derived, null)
+    has(failures, "B2D-ROUTING-009")
+  })
+
+  it("rejects maximum Agent/profile selections whose slotted reviewer key exceeds the canonical limit", () => {
+    const selected = identity(`custom:${"a".repeat(64)}`, "p".repeat(128))
+    const failures = []
+    const derived = deriveExpectedRoute(
+      task(0xffffffff, "high", selected),
+      { generation: 1, ...selected, effective_from_task_index: 1 },
+      failures
+    )
+    assert.equal(derived, null)
+    has(failures, "B2D-ROUTING-009")
+  })
 })
 
 describe("progress agreement and per-key lineage", () => {
@@ -749,6 +773,18 @@ describe("progress agreement and per-key lineage", () => {
       run("task|1|reviewer|auxiliary|grok|none", "completed", "extra", 99)
     )
     has(validate(routing(), extra), "B2D-PROGRESS-009")
+  })
+
+  it("requires admission identity on every terminal completed lineage", () => {
+    for (const mutate of [
+      (entry) => (entry.task_id = ""),
+      (entry) => (entry.child_conversation_id = null),
+      (entry) => (entry.child_conversation_id = 0),
+    ]) {
+      const state = progress()
+      mutate(state.tasks[0].runs[0])
+      has(validate(routing(), state), "B2D-PROGRESS-010")
+    }
   })
 
   it("enforces stable identity and one replacement per exact key", () => {
@@ -817,7 +853,7 @@ describe("progress agreement and per-key lineage", () => {
     has(validate(routing(), routed), "B2D-PROGRESS-009")
   })
 
-  it("allows generation change only at first empty pending Task after completed prefix", () => {
+  it("accepts an adopted generation throughout its Task lifecycle and the following Task", () => {
     const route = routing()
     const selected = identity("gemini", "careful")
     route.task_agent_generations.push({
@@ -826,7 +862,62 @@ describe("progress agreement and per-key lineage", () => {
       effective_from_task_index: 2,
     })
     route.tasks[1] = task(2, "normal", selected, 2)
-    assert.deepEqual(validate(route, progress(route)), [])
+    route.tasks.push(task(3, "high", selected, 2))
+    const routedPlan = `${plan(route)}\n## Task 3: Continue generation\n`
+    const state = progress(route)
+    state.tasks.push(progressTask(route.tasks[2], "pending", 30))
+
+    assert.deepEqual(validate(route, state, routedPlan), [], "pre-admission")
+
+    const implementer = state.tasks[1].expected_work_unit_keys.implementer
+    state.tasks[1].status = "in_progress"
+    state.active_task_index = 2
+    state.tasks[1].runs.push(run(implementer, "running", "t2-i", 20))
+    assert.deepEqual(validate(route, state, routedPlan), [], "admitted/active")
+
+    state.tasks[1].runs[0].state = "completed"
+    state.tasks[1].runs.push(
+      run(
+        state.tasks[1].expected_work_unit_keys.reviewers.primary,
+        "running",
+        "t2-p",
+        21
+      )
+    )
+    assert.deepEqual(
+      validate(route, state, routedPlan),
+      [],
+      "reviewer dispatch"
+    )
+
+    state.tasks[1].runs[1].state = "completed"
+    state.tasks[1].status = "completed"
+    state.tasks[1].commit = "commit-2"
+    state.active_task_index = null
+    assert.deepEqual(validate(route, state, routedPlan), [], "completed")
+
+    state.tasks[2].status = "in_progress"
+    state.active_task_index = 3
+    state.tasks[2].runs.push(
+      run(
+        state.tasks[2].expected_work_unit_keys.implementer,
+        "running",
+        "t3-i",
+        30
+      )
+    )
+    assert.deepEqual(validate(route, state, routedPlan), [], "following Task")
+  })
+
+  it("adopts a later generation only at an empty pending boundary", () => {
+    const route = routing()
+    const selected = identity("gemini", "careful")
+    route.task_agent_generations.push({
+      generation: 2,
+      ...selected,
+      effective_from_task_index: 2,
+    })
+    route.tasks[1] = task(2, "normal", selected, 2)
     for (const mutate of [
       (p) => {
         p.tasks[1].status = "in_progress"
@@ -843,6 +934,16 @@ describe("progress agreement and per-key lineage", () => {
             "reserving",
             "reserved",
             null
+          ),
+        ]
+      },
+      (p) => {
+        p.tasks[1].runs = [
+          run(
+            p.tasks[1].expected_work_unit_keys.implementer,
+            "running",
+            "admitted",
+            20
           ),
         ]
       },

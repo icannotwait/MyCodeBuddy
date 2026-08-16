@@ -641,7 +641,7 @@ async fn shape_835_replacement_supersedes_original_child() {
 }
 
 // ---------------------------------------------------------------------------
-// 4. Skill-forward routing invariants (nine design scenarios)
+// 4. Skill-forward routing invariants (approved v2 scenarios)
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -667,125 +667,6 @@ struct SkillScenario {
     must_differ_from: &'static [&'static str],
     max_unexpected_continues: i64,
     max_replacements: i64,
-}
-
-fn legacy_skill_forward_scenarios() -> Vec<SkillScenario> {
-    vec![
-        SkillScenario {
-            name: "design_plan_rereview_continue_same_reviewer",
-            routes: &[
-                SkillRoute {
-                    work_unit_key: "design|docs/design.md|reviewer|codex|none",
-                    agent: AgentType::Codex,
-                },
-                SkillRoute {
-                    work_unit_key: "plan|docs/plan.md|reviewer|codex|none",
-                    agent: AgentType::Codex,
-                },
-            ],
-            expected_actions: &[SkillAction::Continue],
-            must_differ_from: &[],
-            max_unexpected_continues: UNEXPECTED_CONTINUE_LIMIT,
-            max_replacements: REPLACEMENT_LIMIT,
-        },
-        SkillScenario {
-            name: "task_fix_continues_grok",
-            routes: &[SkillRoute {
-                work_unit_key: "task|3|implementer|grok|none",
-                agent: AgentType::Grok,
-            }],
-            expected_actions: &[SkillAction::Continue],
-            must_differ_from: &[],
-            max_unexpected_continues: UNEXPECTED_CONTINUE_LIMIT,
-            max_replacements: REPLACEMENT_LIMIT,
-        },
-        SkillScenario {
-            name: "task_rereview_continues_codex",
-            routes: &[SkillRoute {
-                work_unit_key: "task|3|reviewer|primary|codex|none",
-                agent: AgentType::Codex,
-            }],
-            expected_actions: &[SkillAction::Continue],
-            must_differ_from: &["task|3|implementer|grok|none"],
-            max_unexpected_continues: UNEXPECTED_CONTINUE_LIMIT,
-            max_replacements: REPLACEMENT_LIMIT,
-        },
-        SkillScenario {
-            name: "next_task_fresh_grok_and_codex",
-            routes: &[
-                SkillRoute {
-                    work_unit_key: "task|4|implementer|grok|none",
-                    agent: AgentType::Grok,
-                },
-                SkillRoute {
-                    work_unit_key: "task|4|reviewer|primary|codex|none",
-                    agent: AgentType::Codex,
-                },
-            ],
-            expected_actions: &[SkillAction::FreshDelegate],
-            must_differ_from: &[
-                "task|3|implementer|grok|none",
-                "task|3|reviewer|primary|codex|none",
-            ],
-            max_unexpected_continues: UNEXPECTED_CONTINUE_LIMIT,
-            max_replacements: REPLACEMENT_LIMIT,
-        },
-        SkillScenario {
-            name: "final_whole_branch_fresh_codex_never_task_reviewer",
-            routes: &[SkillRoute {
-                work_unit_key: "final_review|reviewer|codex|none",
-                agent: AgentType::Codex,
-            }],
-            expected_actions: &[SkillAction::FreshDelegate],
-            must_differ_from: &["task|3|reviewer|primary|codex|none"],
-            max_unexpected_continues: UNEXPECTED_CONTINUE_LIMIT,
-            max_replacements: REPLACEMENT_LIMIT,
-        },
-        SkillScenario {
-            name: "resumability_failure_replacement",
-            routes: &[SkillRoute {
-                work_unit_key: "task|5|implementer|grok|none",
-                agent: AgentType::Grok,
-            }],
-            expected_actions: &[SkillAction::Replacement],
-            must_differ_from: &[],
-            max_unexpected_continues: UNEXPECTED_CONTINUE_LIMIT,
-            max_replacements: REPLACEMENT_LIMIT,
-        },
-        SkillScenario {
-            name: "interrupted_final_continues_own_session",
-            routes: &[SkillRoute {
-                work_unit_key: "final_review|reviewer|codex|none",
-                agent: AgentType::Codex,
-            }],
-            expected_actions: &[SkillAction::Continue],
-            must_differ_from: &["task|3|reviewer|primary|codex|none"],
-            max_unexpected_continues: UNEXPECTED_CONTINUE_LIMIT,
-            max_replacements: REPLACEMENT_LIMIT,
-        },
-        SkillScenario {
-            name: "business_error_no_substitution",
-            routes: &[SkillRoute {
-                work_unit_key: "task|6|reviewer|primary|codex|none",
-                agent: AgentType::Codex,
-            }],
-            expected_actions: &[SkillAction::BlockNoSubstitute],
-            must_differ_from: &[],
-            max_unexpected_continues: UNEXPECTED_CONTINUE_LIMIT,
-            max_replacements: REPLACEMENT_LIMIT,
-        },
-        SkillScenario {
-            name: "skill_budget_caps",
-            routes: &[SkillRoute {
-                work_unit_key: "task|7|implementer|grok|none",
-                agent: AgentType::Grok,
-            }],
-            expected_actions: &[SkillAction::Continue, SkillAction::Replacement],
-            must_differ_from: &[],
-            max_unexpected_continues: 2,
-            max_replacements: 1,
-        },
-    ]
 }
 
 fn skill_forward_v2_scenarios() -> Vec<SkillScenario> {
@@ -1021,6 +902,7 @@ fn skill_forward_routing_invariants_eleven_v2_scenarios() {
     );
 
     for scenario in scenarios {
+        assert!(!scenario.routes.is_empty(), "{}", scenario.name);
         assert!(scenario.max_unexpected_continues <= UNEXPECTED_CONTINUE_LIMIT);
         assert!(scenario.max_replacements <= REPLACEMENT_LIMIT);
         let keys = scenario
@@ -1038,6 +920,21 @@ fn skill_forward_routing_invariants_eleven_v2_scenarios() {
             .collect::<HashMap<_, _>>();
         assert_eq!(child_by_key.len(), keys.len(), "{}", scenario.name);
         for left in scenario.routes {
+            assert!(
+                left.work_unit_key.chars().count() <= 200,
+                "{} key too long",
+                scenario.name
+            );
+            assert!(
+                left.work_unit_key
+                    .split('|')
+                    .any(|part| part == left.agent.as_wire().as_ref()),
+                "{} key must encode its Agent",
+                scenario.name
+            );
+            for prior_key in scenario.must_differ_from {
+                assert_ne!(left.work_unit_key, *prior_key, "{}", scenario.name);
+            }
             for right in scenario.routes {
                 if left.work_unit_key != right.work_unit_key {
                     assert_ne!(
@@ -1047,11 +944,48 @@ fn skill_forward_routing_invariants_eleven_v2_scenarios() {
                 }
             }
         }
+        for action in scenario.expected_actions {
+            match action {
+                SkillAction::Continue => assert!(!request_fingerprint(
+                    CONTINUE_DELEGATION_TOOL,
+                    "follow-up",
+                    Some(scenario.routes[0].work_unit_key),
+                    None,
+                    None,
+                    Some("prior-task"),
+                    "deadbeef",
+                )
+                .is_empty()),
+                SkillAction::FreshDelegate => assert!(!request_fingerprint(
+                    DELEGATE_TO_AGENT_TOOL,
+                    "fresh task",
+                    Some(scenario.routes[0].work_unit_key),
+                    None,
+                    None,
+                    None,
+                    "deadbeef",
+                )
+                .is_empty()),
+                SkillAction::Replacement => assert!(!request_fingerprint(
+                    DELEGATE_TO_AGENT_TOOL,
+                    "replacement",
+                    Some(scenario.routes[0].work_unit_key),
+                    Some("failed-task"),
+                    Some(REPLACEMENT_REASON_UNRESUMABLE),
+                    None,
+                    "deadbeef",
+                )
+                .is_empty()),
+                SkillAction::BlockNoSubstitute => {
+                    assert_ne!("route_policy", REPLACEMENT_REASON_UNRESUMABLE)
+                }
+            }
+        }
     }
 }
 
 #[test]
-fn skill_forward_routing_invariants_nine_scenarios() {
+fn skill_forward_contract_v2_matches_skill() {
     let skill_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join(".agents")
@@ -1154,198 +1088,6 @@ fn skill_forward_routing_invariants_nine_scenarios() {
         }),
         "structured contract final review"
     );
-
-    let scenarios = legacy_skill_forward_scenarios();
-    assert_eq!(scenarios.len(), 9, "design skill-forward matrix size");
-
-    // Keep all nine Skill Forward outcomes explicit.
-    let expected_matrix: [(&str, &[SkillAction]); 9] = [
-        (
-            "design_plan_rereview_continue_same_reviewer",
-            &[SkillAction::Continue],
-        ),
-        ("task_fix_continues_grok", &[SkillAction::Continue]),
-        ("task_rereview_continues_codex", &[SkillAction::Continue]),
-        (
-            "next_task_fresh_grok_and_codex",
-            &[SkillAction::FreshDelegate],
-        ),
-        (
-            "final_whole_branch_fresh_codex_never_task_reviewer",
-            &[SkillAction::FreshDelegate],
-        ),
-        (
-            "resumability_failure_replacement",
-            &[SkillAction::Replacement],
-        ),
-        (
-            "interrupted_final_continues_own_session",
-            &[SkillAction::Continue],
-        ),
-        (
-            "business_error_no_substitution",
-            &[SkillAction::BlockNoSubstitute],
-        ),
-        (
-            "skill_budget_caps",
-            &[SkillAction::Continue, SkillAction::Replacement],
-        ),
-    ];
-    let actual_matrix: Vec<(&str, &[SkillAction])> = scenarios
-        .iter()
-        .map(|scenario| (scenario.name, scenario.expected_actions))
-        .collect();
-    assert_eq!(actual_matrix, expected_matrix);
-
-    let mut keys = BTreeSet::new();
-    for s in &scenarios {
-        assert!(
-            !s.routes.is_empty(),
-            "{} must have at least one route",
-            s.name
-        );
-        assert!(
-            s.max_unexpected_continues <= UNEXPECTED_CONTINUE_LIMIT,
-            "{} must not exceed platform unexpected-continue rail",
-            s.name
-        );
-        assert!(
-            s.max_replacements <= REPLACEMENT_LIMIT,
-            "{} must not exceed platform replacement rail",
-            s.name
-        );
-
-        // Agent type hard rules for implementer / reviewer / final.
-        match s.name {
-            "design_plan_rereview_continue_same_reviewer" => {
-                assert_eq!(s.routes.len(), 2);
-                assert!(
-                    s.routes.iter().all(|route| route.agent == AgentType::Codex),
-                    "{} routes must remain Codex reviewer routes",
-                    s.name
-                );
-            }
-            "next_task_fresh_grok_and_codex" => {
-                assert_eq!(s.routes.len(), 2);
-                assert!(
-                    s.routes.iter().any(|route| {
-                        route.work_unit_key == "task|4|implementer|grok|none"
-                            && route.agent == AgentType::Grok
-                    }),
-                    "{} must start a fresh Grok implementer",
-                    s.name
-                );
-                assert!(
-                    s.routes.iter().any(|route| {
-                        route.work_unit_key == "task|4|reviewer|primary|codex|none"
-                            && route.agent == AgentType::Codex
-                    }),
-                    "{} must start a fresh Codex reviewer",
-                    s.name
-                );
-            }
-            "task_fix_continues_grok"
-            | "resumability_failure_replacement"
-            | "skill_budget_caps" => {
-                assert_eq!(s.routes.len(), 1);
-                assert_eq!(s.routes[0].agent, AgentType::Grok, "{}", s.name);
-            }
-            "task_rereview_continues_codex"
-            | "final_whole_branch_fresh_codex_never_task_reviewer"
-            | "interrupted_final_continues_own_session"
-            | "business_error_no_substitution" => {
-                assert_eq!(s.routes.len(), 1);
-                assert_eq!(s.routes[0].agent, AgentType::Codex, "{}", s.name);
-            }
-            _ => unreachable!("unexpected Skill-forward scenario: {}", s.name),
-        }
-
-        for route in s.routes {
-            assert!(route.work_unit_key.len() <= 200, "{} key too long", s.name);
-            for other in s.must_differ_from {
-                assert_ne!(
-                    route.work_unit_key, *other,
-                    "{} must use a distinct work_unit_key from {other}",
-                    s.name
-                );
-            }
-
-            for action in s.expected_actions {
-                match action {
-                    SkillAction::Continue => {
-                        // Prefer continue_delegation tool identity for fingerprint field 0.
-                        let fp = request_fingerprint(
-                            CONTINUE_DELEGATION_TOOL,
-                            "follow-up",
-                            Some(route.work_unit_key),
-                            None,
-                            None,
-                            Some("prior-task"),
-                            "deadbeef",
-                        );
-                        assert!(!fp.is_empty());
-                    }
-                    SkillAction::FreshDelegate => {
-                        let fp = request_fingerprint(
-                            DELEGATE_TO_AGENT_TOOL,
-                            "fresh task",
-                            Some(route.work_unit_key),
-                            None,
-                            None,
-                            None,
-                            "deadbeef",
-                        );
-                        assert!(!fp.is_empty());
-                    }
-                    SkillAction::Replacement => {
-                        let fp = request_fingerprint(
-                            DELEGATE_TO_AGENT_TOOL,
-                            "replacement",
-                            Some(route.work_unit_key),
-                            Some("failed-task"),
-                            Some(REPLACEMENT_REASON_UNRESUMABLE),
-                            None,
-                            "deadbeef",
-                        );
-                        assert!(!fp.is_empty());
-                    }
-                    SkillAction::BlockNoSubstitute => {
-                        // Business errors must not open replacement fingerprints.
-                        let bad_reasons =
-                            ["busy_thread", "stale_task_id", "not_found", "route_policy"];
-                        for reason in bad_reasons {
-                            assert_ne!(reason, REPLACEMENT_REASON_UNRESUMABLE);
-                        }
-                    }
-                }
-            }
-
-            keys.insert(route.work_unit_key);
-        }
-    }
-
-    // Design and Plan never reuse one review thread. Task implementer vs
-    // reviewer keys stay isolated even for the same task index.
-    assert!(keys.contains("design|docs/design.md|reviewer|codex|none"));
-    assert!(keys.contains("plan|docs/plan.md|reviewer|codex|none"));
-    assert_ne!(
-        "design|docs/design.md|reviewer|codex|none",
-        "plan|docs/plan.md|reviewer|codex|none"
-    );
-    assert!(keys.contains("task|3|implementer|grok|none"));
-    assert!(keys.contains("task|3|reviewer|primary|codex|none"));
-    assert_ne!(
-        "task|3|implementer|grok|none",
-        "task|3|reviewer|primary|codex|none"
-    );
-    assert!(keys.contains("task|4|implementer|grok|none"));
-    assert!(keys.contains("task|4|reviewer|primary|codex|none"));
-    // Final review key is never the Task reviewer key.
-    assert!(scenarios
-        .iter()
-        .filter(|scenario| scenario.name.contains("final"))
-        .flat_map(|scenario| scenario.routes.iter())
-        .all(|route| route.work_unit_key != "task|3|reviewer|primary|codex|none"));
 }
 
 #[tokio::test]

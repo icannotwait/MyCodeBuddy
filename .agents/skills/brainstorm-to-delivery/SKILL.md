@@ -132,10 +132,12 @@ request a user decision while preserving its admitted route.
 
 ## 3. Review and revise Design
 
-Dispatch a user-named Design Reviewer when requested; otherwise dispatch a
-conditional independent Codex Design Reviewer when the Design needs review.
-Use design|DESIGN_PATH|reviewer|AGENT|PROFILE for each reviewer. Dispatch an
-independent Codex Design Fixer on design|DESIGN_PATH|fixer|codex|none.
+When the Design needs review, always dispatch an independent Codex Design
+Reviewer. Dispatch every user-named Design Reviewer as an additional separate
+document-only work unit. Never let a user-named reviewer replace the Codex
+Design Reviewer. Use design|DESIGN_PATH|reviewer|AGENT|PROFILE for each
+reviewer. Dispatch an independent Codex Design Fixer on
+design|DESIGN_PATH|fixer|codex|none.
 
 Adjudicate findings against current artifacts. Continue the same Design Fixer
 for revisions and continue each separate reviewer for re-review. Request a
