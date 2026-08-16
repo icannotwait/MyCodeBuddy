@@ -363,6 +363,15 @@ const TASK_ACTIVITY_TERMS = new Set([
   "in-progress",
   "running",
 ])
+const TASK_COMPLETION_TERMS = new Set([
+  "complete",
+  "completed",
+  "completes",
+  "completion",
+  "finish",
+  "finished",
+  "finishes",
+])
 const REVIEW_BYPASS_ACTIONS = new Set([
   "instead",
   "omit",
@@ -707,7 +716,7 @@ function directiveWindows(prose) {
   for (const clause of withoutKeys
     .normalize("NFKC")
     .toLowerCase()
-    .split(/[.!?]+|\n\s*\n+/)) {
+    .split(/[.!?;]+|\n\s*\n+/)) {
     const tokens = clause.match(/[a-z0-9]+(?:-[a-z0-9]+)*/g) ?? []
     for (let start = 0; start < tokens.length; start += step) {
       windows.push(tokens.slice(start, start + DIRECTIVE_WINDOW_TOKENS))
@@ -733,8 +742,9 @@ function tokenIndexes(tokens, candidates, start = 0, end = tokens.length) {
   return indexes
 }
 
-function phraseIndex(tokens, phrase) {
-  for (let index = 0; index <= tokens.length - phrase.length; index += 1) {
+function phraseIndex(tokens, phrase, start = 0, end = tokens.length) {
+  const limit = Math.min(tokens.length, end) - phrase.length
+  for (let index = Math.max(0, start); index <= limit; index += 1) {
     if (phrase.every((token, offset) => tokens[index + offset] === token)) {
       return index
     }
@@ -801,6 +811,81 @@ function hasTaskActivity(tokens) {
   )
 }
 
+function hasDocumentProducerBetween(tokens, start, end) {
+  return (
+    phraseIndex(tokens, ["plan", "author"], start, end) >= 0 ||
+    phraseIndex(tokens, ["design", "fixer"], start, end) >= 0
+  )
+}
+
+function actionHasCodexPassiveActor(tokens, action) {
+  const by = tokenIndex(tokens, new Set(["by"]), action + 1, action + 5)
+  return by >= 0 && tokenIndex(tokens, new Set(["codex"]), by + 1, by + 4) >= 0
+}
+
+function actorLinkIsNegated(tokens, link, actor) {
+  return tokenIndex(tokens, NEGATION_TERMS, Math.max(0, link - 3), actor) >= 0
+}
+
+function hasCompletedTaskBoundary(tokens, change) {
+  const after = tokenIndex(tokens, new Set(["after"]), change + 1)
+  if (after < 0) return false
+  const task = tokenIndex(tokens, new Set(["task", "tasks"]), after + 1)
+  if (task < 0) return false
+  return tokenIndexes(tokens, TASK_COMPLETION_TERMS, task + 1, task + 5).some(
+    (completion) => !actionIsNegated(tokens, completion)
+  )
+}
+
+function hasReviewRoleNear(tokens, bypass, roles) {
+  return tokenIndexes(tokens, roles, Math.max(0, bypass - 8), bypass + 9).some(
+    (role) =>
+      tokenIndex(
+        tokens,
+        new Set(["review", "reviewer", "reviewers"]),
+        Math.max(0, role - 1),
+        role + 3
+      ) >= 0
+  )
+}
+
+function isOptionalDocumentReviewer(tokens, bypass) {
+  if (!["optional", "optionally"].includes(tokens[bypass])) return false
+  const start = Math.max(0, bypass - 2)
+  const end = Math.min(tokens.length, bypass + 8)
+  const hasUserNamed =
+    tokenIndex(tokens, new Set(["user-named"]), start, end) >= 0 ||
+    phraseIndex(tokens, ["user", "named"], start, end) >= 0
+  return (
+    hasUserNamed &&
+    tokenIndex(tokens, new Set(["design", "plan"]), start, end) >= 0 &&
+    tokenIndex(
+      tokens,
+      new Set(["review", "reviewer", "reviewers"]),
+      start,
+      end
+    ) >= 0
+  )
+}
+
+function hasCodexDesignReviewNear(tokens, bypass) {
+  return tokenIndexes(
+    tokens,
+    new Set(["codex"]),
+    Math.max(0, bypass - 8),
+    bypass + 9
+  ).some(
+    (codex) =>
+      tokenIndex(tokens, new Set(["design"]), codex, codex + 3) >= 0 &&
+      tokenIndex(
+        tokens,
+        new Set(["review", "reviewer", "reviewers"]),
+        codex,
+        codex + 4
+      ) >= 0
+  )
+}
+
 function conflictsWithParentOwnership(tokens) {
   const parent = tokenIndex(tokens, new Set(["parent"]))
   if (parent < 0) return false
@@ -812,6 +897,7 @@ function conflictsWithParentOwnership(tokens) {
   ).some(
     (action) =>
       !actionIsNegated(tokens, action) &&
+      !hasDocumentProducerBetween(tokens, parent + 1, action + 1) &&
       tokenIndex(tokens, DOCUMENT_OR_CODE_TARGETS, action + 1, action + 10) >= 0
   )
   if (activeConflict) return true
@@ -846,6 +932,7 @@ function conflictsWithTaskAgentRoute(tokens) {
       if (tokens[action - 1] === "codex" || actionIsNegated(tokens, action)) {
         continue
       }
+      if (actionHasCodexPassiveActor(tokens, action)) continue
       const alwaysImplementer =
         tokens[action] === "implementer" &&
         tokenIndex(
@@ -865,7 +952,7 @@ function conflictsWithTaskAgentRoute(tokens) {
       Math.max(0, actor - 3),
       actor
     ).at(-1)
-    if (link === undefined) continue
+    if (link === undefined || actorLinkIsNegated(tokens, link, actor)) continue
     for (const action of tokenIndexes(
       tokens,
       TASK_ROUTE_ACTIONS,
@@ -874,6 +961,7 @@ function conflictsWithTaskAgentRoute(tokens) {
     )) {
       if (
         !actionIsNegated(tokens, action) &&
+        tokenIndex(tokens, ACTOR_LINKS, action + 1, link) < 0 &&
         hasScopedTask(tokens, Math.max(0, action - 5), link)
       ) {
         return true
@@ -915,23 +1003,26 @@ function conflictsWithActiveTaskSwitch(tokens) {
   const hasAgent =
     tokenIndex(tokens, new Set(["agent", "agents"])) >= 0 ||
     phraseIndex(tokens, ["task", "agent"]) >= 0
-  return hasAgent && hasTaskActivity(tokens)
+  return (
+    hasAgent &&
+    hasTaskActivity(tokens) &&
+    !hasCompletedTaskBoundary(tokens, change)
+  )
 }
 
 function conflictsWithRequiredReview(tokens) {
-  const hasReview =
-    tokenIndex(tokens, new Set(["review", "reviewer", "reviewers"])) >= 0
-  if (!hasReview) return false
-
-  const bypass = tokenIndex(tokens, REVIEW_BYPASS_ACTIONS)
-  if (bypass < 0 || actionIsNegated(tokens, bypass)) return false
-
-  const bypassesRequiredTaskReview =
-    tokenIndex(tokens, new Set(["auxiliary", "primary"])) >= 0
-  const replacesCodexDesignReview =
-    tokenIndex(tokens, new Set(["codex"])) >= 0 &&
-    tokenIndex(tokens, new Set(["design"])) >= 0
-  return bypassesRequiredTaskReview || replacesCodexDesignReview
+  return tokenIndexes(tokens, REVIEW_BYPASS_ACTIONS).some((bypass) => {
+    if (
+      actionIsNegated(tokens, bypass) ||
+      isOptionalDocumentReviewer(tokens, bypass)
+    ) {
+      return false
+    }
+    return (
+      hasReviewRoleNear(tokens, bypass, new Set(["auxiliary", "primary"])) ||
+      hasCodexDesignReviewNear(tokens, bypass)
+    )
+  })
 }
 
 function hasConflictingSkillDirective(prose) {

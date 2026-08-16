@@ -480,6 +480,41 @@ describe("Skill contract v2", () => {
     })
   }
 
+  for (const [name, prose] of [
+    [
+      "parent orchestration",
+      "The parent directs the Plan Author to update the Plan.",
+    ],
+    [
+      "Codex implementation before Task Agent review",
+      "High Tasks are implemented by Codex and reviewed by the Task Agent.",
+    ],
+    [
+      "Task Agent review of Codex implementation",
+      "The Task Agent reviews work implemented by Codex for high Tasks.",
+    ],
+    [
+      "explicit Task Agent route exclusion",
+      "Route high Tasks to Codex, not to the Task Agent.",
+    ],
+    [
+      "completed Task boundary switch",
+      "Switch the Task Agent after the current Task completes.",
+    ],
+    [
+      "optional user reviewer cannot replace Codex",
+      "Optional user-named Design reviewers do not replace the Codex Design Reviewer.",
+    ],
+    [
+      "required primary review with optional document reviewers",
+      "Primary review remains required; optional user-named Design reviewers are document-only.",
+    ],
+  ]) {
+    it(`round-2 accepts compliant ${name}`, () => {
+      assert.deepEqual(validateSkillMarkdown(`${skill}\n${prose}`).failures, [])
+    })
+  }
+
   it("contains the complete operational policy and document JSON shapes", () => {
     const policy = fencedJsonAfterHeading(
       realSkill,
