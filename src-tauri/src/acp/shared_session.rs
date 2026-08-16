@@ -21,7 +21,10 @@ use tokio::sync::{watch, Mutex, Notify, RwLock};
 
 use crate::{
     acp::session_state::SessionState,
-    web::{event_bridge::EventEmitter, ws_attach::DetachReason},
+    web::{
+        event_bridge::{emit_with_state, EventEmitter},
+        ws_attach::DetachReason,
+    },
 };
 
 use error::validate_failure_code;
@@ -108,6 +111,7 @@ pub struct SharedSessionBroker {
     index: Arc<Mutex<SharedSessionIndex>>,
     index_epoch: Arc<watch::Sender<u64>>,
     metrics: Arc<SharedSessionMetrics>,
+    accepting: Arc<AtomicBool>,
     lease_ttl_secs: Arc<AtomicU64>,
     limits: BrokerLimits,
     #[cfg(test)]
@@ -143,6 +147,22 @@ pub struct SharedIdleBlockers {
     pub host_work: bool,
 }
 
+#[derive(Clone, serde::Serialize)]
+pub struct SharedSessionDiagnostic {
+    pub connection_id: String,
+    pub conversation_id: Option<i32>,
+    pub generation: u64,
+    pub phase: SharedSessionPhase,
+    pub agent_category: String,
+    pub lease_count: usize,
+    pub queue_depth: usize,
+    pub queue_bytes: usize,
+    pub idle_blockers: Vec<&'static str>,
+    pub cleanup_state: &'static str,
+    pub bootstrap_duration_ms: u64,
+    pub cleanup_duration_ms: u64,
+}
+
 impl SharedIdleBlockers {
     fn from_record(record: &SharedSessionRecord, snapshot: &SharedRuntimeWorkSnapshot) -> Self {
         Self {
@@ -167,6 +187,30 @@ impl SharedIdleBlockers {
 
     fn is_empty(self) -> bool {
         self == Self::default()
+    }
+
+    fn stable_names(self) -> Vec<&'static str> {
+        let mut names = Vec::new();
+        for (blocked, name) in [
+            (self.lease, "lease"),
+            (self.non_ready_phase, "non_ready_phase"),
+            (self.non_connected_status, "non_connected_status"),
+            (self.runtime_turn, "runtime_turn"),
+            (self.active_turn, "active_turn"),
+            (self.permission, "permission"),
+            (self.question, "question"),
+            (self.plan_approval, "plan_approval"),
+            (self.queued_prompt, "queued_prompt"),
+            (self.continuation_wait, "continuation_wait"),
+            (self.active_delegation, "active_delegation"),
+            (self.background_work, "background_work"),
+            (self.host_work, "host_work"),
+        ] {
+            if blocked {
+                names.push(name);
+            }
+        }
+        names
     }
 }
 
@@ -229,6 +273,7 @@ impl Default for SharedSessionBroker {
             index: Arc::new(Mutex::new(SharedSessionIndex::default())),
             index_epoch: Arc::new(index_epoch),
             metrics: Arc::new(SharedSessionMetrics::default()),
+            accepting: Arc::new(AtomicBool::new(true)),
             lease_ttl_secs: Arc::new(AtomicU64::new(DEFAULT_CLIENT_LEASE_TTL.as_secs())),
             limits: BrokerLimits::default(),
             #[cfg(test)]
@@ -244,6 +289,74 @@ impl SharedSessionBroker {
 
     fn lease_ttl(&self) -> Duration {
         Duration::from_secs(self.lease_ttl_secs.load(Ordering::Relaxed))
+    }
+
+    fn ensure_accepting(&self) -> Result<(), SharedSessionError> {
+        if self.accepting.load(Ordering::Acquire) {
+            Ok(())
+        } else {
+            Err(SharedSessionError::Closing)
+        }
+    }
+
+    pub async fn begin_shutdown(&self) {
+        self.accepting.swap(false, Ordering::AcqRel);
+        let records: Vec<_> = self.index.lock().await.sessions.values().cloned().collect();
+        let mut publications = Vec::new();
+
+        for record in records {
+            let mut current = record.lock().await;
+            if current.phase == SharedSessionPhase::Closing {
+                continue;
+            }
+            let generation = current.generation;
+            let public_state = current.state.clone();
+            let mut state = match public_state.as_ref() {
+                Some(state) => Some(state.write().await),
+                None => None,
+            };
+            let mut events = fail_all_prompt_work(&mut current, "session_unavailable");
+            current.phase = SharedSessionPhase::Closing;
+            current.cleanup_complete = false;
+            current.idle_zero_since = None;
+            current.failed_zero_since = None;
+            current.host_owned_work.clear();
+            if let Some(state) = state.as_mut() {
+                update_public_shared_phase(state, generation, SharedSessionPhase::Closing);
+            }
+            let handles = match (current.state.as_ref(), current.emitter.as_ref()) {
+                (Some(state), Some(emitter)) => Some((state.clone(), emitter.clone())),
+                _ => None,
+            };
+            let registration = SharedRegistrationState {
+                phase: SharedSessionPhase::Closing,
+                state: current.state.clone(),
+                emitter: current.emitter.clone(),
+                driver_incarnation: current.driver_incarnation.clone(),
+            };
+            let registration_tx = current.registration_tx.clone();
+            let lifecycle_tx = current.lifecycle_tx.clone();
+            let notify = current.notify.clone();
+            events.push(crate::acp::types::AcpEvent::SharedSessionPhaseChanged {
+                generation,
+                phase: SharedSessionPhase::Closing,
+            });
+            drop(state);
+            drop(current);
+
+            registration_tx.send_replace(registration);
+            lifecycle_tx.send_replace(SharedLifecycleState::Closing);
+            notify.notify_waiters();
+            if let Some((state, emitter)) = handles {
+                publications.push((state, emitter, events));
+            }
+        }
+
+        for (state, emitter, events) in publications {
+            for event in events {
+                emit_with_state(&state, &emitter, event).await;
+            }
+        }
     }
 
     pub(crate) fn configure_client_lease_ttl(&self, lease_ttl: Duration) {
@@ -297,6 +410,119 @@ impl SharedSessionBroker {
             .keys()
             .cloned()
             .collect()
+    }
+
+    pub async fn diagnostics(&self) -> Vec<SharedSessionDiagnostic> {
+        let records: Vec<_> = {
+            let index = self.index.lock().await;
+            index
+                .sessions
+                .iter()
+                .map(|(key, record)| {
+                    let conversation_id = match key {
+                        SharedSessionKey::Conversation(id) => Some(*id),
+                        SharedSessionKey::ExternalSession { .. }
+                        | SharedSessionKey::Ephemeral(_) => None,
+                    };
+                    (conversation_id, record.clone())
+                })
+                .collect()
+        };
+        let mut diagnostics = Vec::with_capacity(records.len());
+        for (conversation_id, record) in records {
+            let current = record.lock().await;
+            let runtime_snapshot = match current.state.as_ref() {
+                Some(state) => state.read().await.shared_runtime_work_snapshot(None),
+                None => SharedRuntimeWorkSnapshot {
+                    status: crate::acp::types::ConnectionStatus::Disconnected,
+                    turn_in_flight: false,
+                    pending_permission_id: None,
+                    pending_question_id: None,
+                    pending_plan_approval_id: None,
+                    continuation_wait: false,
+                    active_delegations: 0,
+                    background_outstanding: 0,
+                    conversation_write_error: None,
+                },
+            };
+            let elapsed_ms = duration_millis(current._created_at.elapsed());
+            let cleanup_state = match current.phase {
+                SharedSessionPhase::Closing
+                | SharedSessionPhase::Failed {
+                    cleanup_complete: false,
+                    ..
+                } => "in_progress",
+                SharedSessionPhase::Failed {
+                    cleanup_complete: true,
+                    ..
+                } => "complete",
+                SharedSessionPhase::Reserved
+                | SharedSessionPhase::Bootstrapping
+                | SharedSessionPhase::Ready => "not_started",
+            };
+            diagnostics.push(SharedSessionDiagnostic {
+                connection_id: current.connection_id.clone(),
+                conversation_id,
+                generation: current.generation,
+                phase: current.phase.clone(),
+                agent_category: bounded_agent_category(current.launch_identity.agent_type),
+                lease_count: current.active_leases.len(),
+                queue_depth: current.waiting_prompts.len(),
+                queue_bytes: current.waiting_bytes,
+                idle_blockers: SharedIdleBlockers::from_record(&current, &runtime_snapshot)
+                    .stable_names(),
+                cleanup_state,
+                bootstrap_duration_ms: elapsed_ms,
+                cleanup_duration_ms: if cleanup_state == "not_started" {
+                    0
+                } else {
+                    elapsed_ms
+                },
+            });
+        }
+        diagnostics.sort_by(|left, right| left.connection_id.cmp(&right.connection_id));
+        diagnostics
+    }
+
+    pub(crate) async fn remove_shutdown_session(
+        &self,
+        connection_id: &str,
+        generation: u64,
+    ) -> bool {
+        loop {
+            let mut index = self.index.lock().await;
+            let Some(key) = index.by_connection.get(connection_id).cloned() else {
+                return false;
+            };
+            let Some(record) = index.sessions.get(&key).cloned() else {
+                return false;
+            };
+            let current = match record.try_lock() {
+                Ok(current) => current,
+                Err(_) => {
+                    drop(index);
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+            };
+            if current.generation != generation || current.phase != SharedSessionPhase::Closing {
+                return false;
+            }
+            let lifecycle_tx = current.lifecycle_tx.clone();
+            let notify = current.notify.clone();
+            let active_leases = current.active_leases.len();
+            drop(current);
+            index.sessions.remove(&key);
+            index.by_connection.remove(connection_id);
+            drop(index);
+            self.index_epoch
+                .send_modify(|epoch| *epoch = epoch.saturating_add(1));
+            lifecycle_tx.send_replace(SharedLifecycleState::Removed);
+            notify.notify_waiters();
+            self.metrics.remove_active_leases(active_leases);
+            self.metrics.remove_live_session();
+            return true;
+        }
     }
 
     pub(crate) async fn evaluate_idle(
@@ -592,6 +818,7 @@ impl SharedSessionBroker {
         &self,
         request: SharedPromptRequest,
     ) -> Result<SharedPromptAdmission, SharedSessionError> {
+        self.ensure_accepting()?;
         validate_prompt_request(&request)?;
         let canonical =
             canonical_prompt_bytes(&request).map_err(|_| SharedSessionError::SessionUnavailable)?;
@@ -612,6 +839,7 @@ impl SharedSessionBroker {
 
         let result = self
             .with_authoritative_record(&connection_id, |record| {
+                self.ensure_accepting()?;
                 let request_ref = request.as_ref().expect("request available");
                 self.validate_prompt_guard(record, &request_ref.guard)?;
                 if !matches!(
@@ -1061,7 +1289,10 @@ impl SharedSessionBroker {
             {
                 return Ok(Vec::new());
             }
-            if record.phase != SharedSessionPhase::Ready {
+            if !matches!(
+                record.phase,
+                SharedSessionPhase::Bootstrapping | SharedSessionPhase::Ready
+            ) {
                 return Ok(Vec::new());
             }
             Ok(fail_live_session_record(record, error_code))
@@ -1120,8 +1351,10 @@ impl SharedSessionBroker {
         kind: SharedInteractionKind,
         interaction_id: &str,
     ) -> Result<SharedInteractionClaim, SharedSessionError> {
+        self.ensure_accepting()?;
         let result = self
             .with_authoritative_record(&guard.connection_id, |record| {
+                self.ensure_accepting()?;
                 self.validate_prompt_guard(record, guard)?;
                 let interaction = record
                     .interactions
@@ -1195,8 +1428,10 @@ impl SharedSessionBroker {
         &self,
         request: &SharedStopRequest,
     ) -> Result<SharedStopClaimDecision, SharedSessionError> {
+        self.ensure_accepting()?;
         let result = self
             .with_authoritative_record(&request.guard.connection_id, |record| {
+                self.ensure_accepting()?;
                 self.validate_prompt_guard(record, &request.guard)?;
                 let active = record
                     .active_turn
@@ -1918,13 +2153,16 @@ impl SharedSessionBroker {
         &self,
         request: SharedReserveRequest,
     ) -> Result<SharedReserveOutcome, SharedSessionError> {
+        self.ensure_accepting()?;
         validate_client_label("device_id", &request.device_id)?;
         validate_client_label("client_instance_id", &request.client_instance_id)?;
         validate_client_label("request_id", &request.request_id)?;
 
         loop {
+            self.ensure_accepting()?;
             let lookup = {
                 let mut index = self.index.lock().await;
+                self.ensure_accepting()?;
                 if let Some(record) = index.sessions.get(&request.key) {
                     ReserveLookup::Existing(record.clone())
                 } else {
@@ -1972,6 +2210,7 @@ impl SharedSessionBroker {
 
             let decision = {
                 let mut current = record.lock().await;
+                self.ensure_accepting()?;
                 current.check_attach_identity(&request.launch_identity)?;
                 match current.retry_decision(&request)? {
                     FailedRetryDecision::Attach => {
@@ -3067,6 +3306,18 @@ fn validate_prompt_request(request: &SharedPromptRequest) -> Result<(), SharedSe
         });
     }
     Ok(())
+}
+
+fn bounded_agent_category(agent_type: crate::models::AgentType) -> String {
+    if agent_type.is_custom() {
+        "custom".to_string()
+    } else {
+        agent_type.as_wire().into_owned()
+    }
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn queue_depth_event(record: &SharedSessionRecord) -> crate::acp::types::AcpEvent {

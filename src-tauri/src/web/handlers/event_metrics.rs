@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use axum::{extract::Extension, Json};
 
-use crate::acp::EventBusMetricsSnapshot;
+use crate::acp::internal_bus::AcpEventMetricsSnapshot;
 use crate::app_error::AppCommandError;
 use crate::app_state::AppState;
 use crate::commands::acp::acp_get_event_metrics_core;
@@ -19,8 +19,9 @@ use crate::commands::acp::acp_get_event_metrics_core;
 /// Snapshot the current ACP event bus metrics.
 pub async fn get_event_metrics(
     Extension(state): Extension<Arc<AppState>>,
-) -> Result<Json<EventBusMetricsSnapshot>, AppCommandError> {
+) -> Result<Json<AcpEventMetricsSnapshot>, AppCommandError> {
     Ok(Json(acp_get_event_metrics_core(
         state.acp_event_bus.metrics().as_ref(),
+        &state.connection_manager.shared_session_broker(),
     )))
 }

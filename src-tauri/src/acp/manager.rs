@@ -51,9 +51,9 @@ use crate::acp::shared_session::{
     SharedConfigConflictKind, SharedInteractionKind, SharedInteractionRequest,
     SharedLaunchIdentity, SharedLifecycleState, SharedMutationGuard, SharedPromptAdmission,
     SharedPromptRequest, SharedReserveRequest, SharedRuntimeWorkSnapshot, SharedSessionAttachment,
-    SharedSessionBroker, SharedSessionError, SharedSessionKey, SharedSessionPhase,
-    SharedSessionProjection, SharedStopClaimDecision, SharedStopRequest, SharedSweepCandidateKind,
-    SharedSweepReport, StopAdmissionResolution,
+    SharedSessionBroker, SharedSessionDiagnostic, SharedSessionError, SharedSessionKey,
+    SharedSessionPhase, SharedSessionProjection, SharedStopClaimDecision, SharedStopRequest,
+    SharedSweepCandidateKind, SharedSweepReport, StopAdmissionResolution,
 };
 use crate::acp::terminal_context::{finalize_acp_launch_config, AcpLaunchConfig, AcpLaunchInputs};
 use crate::acp::termination::AcpDisconnectOrigin;
@@ -975,6 +975,10 @@ impl ConnectionManager {
         self.shared_session_broker.clone()
     }
 
+    pub async fn shared_session_diagnostics(&self) -> Vec<SharedSessionDiagnostic> {
+        self.shared_session_broker.diagnostics().await
+    }
+
     pub async fn is_broker_managed_connection(&self, connection_id: &str) -> bool {
         self.shared_session_broker
             .is_managed_connection(connection_id)
@@ -1870,7 +1874,16 @@ impl ConnectionManager {
                     received = event_rx.recv() => {
                         match received {
                             Ok(envelope) => envelope,
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                manager
+                                    .handle_unexpected_shared_driver_exit(
+                                        &connection_id,
+                                        generation,
+                                        &driver_incarnation,
+                                    )
+                                    .await;
+                                return;
+                            }
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                                 let snapshot = state
                                     .read()
@@ -1903,6 +1916,22 @@ impl ConnectionManager {
                     }
                 };
 
+                if matches!(
+                    envelope.payload,
+                    AcpEvent::StatusChanged {
+                        status: ConnectionStatus::Disconnected | ConnectionStatus::Error,
+                    }
+                ) {
+                    manager
+                        .handle_unexpected_shared_driver_exit(
+                            &connection_id,
+                            generation,
+                            &driver_incarnation,
+                        )
+                        .await;
+                    return;
+                }
+
                 let broker_events = match &envelope.payload {
                     AcpEvent::TurnComplete { stop_reason, .. } => {
                         manager
@@ -1912,19 +1941,6 @@ impl ConnectionManager {
                                 generation,
                                 &driver_incarnation,
                                 stop_reason,
-                            )
-                            .await
-                    }
-                    AcpEvent::StatusChanged {
-                        status: ConnectionStatus::Disconnected | ConnectionStatus::Error,
-                    } => {
-                        manager
-                            .shared_session_broker
-                            .fail_live_session(
-                                &connection_id,
-                                generation,
-                                &driver_incarnation,
-                                "session_unavailable",
                             )
                             .await
                     }
@@ -2052,6 +2068,61 @@ impl ConnectionManager {
                 }
             }
         });
+    }
+
+    async fn handle_unexpected_shared_driver_exit(
+        &self,
+        connection_id: &str,
+        generation: u64,
+        driver_incarnation: &str,
+    ) {
+        let events = match self
+            .shared_session_broker
+            .fail_live_session(
+                connection_id,
+                generation,
+                driver_incarnation,
+                "session_unavailable",
+            )
+            .await
+        {
+            Ok(events) if !events.is_empty() => events,
+            Ok(_) | Err(SharedSessionError::GenerationStale) => return,
+            Err(error) => {
+                tracing::warn!(
+                    connection_id,
+                    generation,
+                    error_code = error.code(),
+                    "[ACP] shared driver exit settlement failed"
+                );
+                return;
+            }
+        };
+        let _ = self.publish_shared_events(connection_id, events).await;
+
+        let started = tokio::time::Instant::now();
+        let cleanup_complete = self
+            .teardown_shared_driver(connection_id, true, AcpDisconnectOrigin::AbandonedConnect)
+            .await;
+        self.shared_session_broker
+            .record_cleanup_duration(started.elapsed());
+        if cleanup_complete {
+            if let Ok((Some((state, emitter)), events)) = self
+                .shared_session_broker
+                .mark_cleanup_complete(connection_id, generation)
+                .await
+            {
+                for event in events {
+                    emit_with_state(&state, &emitter, event).await;
+                }
+            }
+        } else {
+            self.shared_session_broker.record_cleanup_incomplete();
+        }
+        self.shared_launches
+            .lock()
+            .await
+            .remove(&(connection_id.to_string(), generation));
     }
 
     async fn start_shared_attempt(
@@ -7401,6 +7472,22 @@ impl ConnectionManager {
     /// shared with the process callbacks so a late spawn is still reached and
     /// a process reaped during the grace window is skipped.
     pub async fn disconnect_all(&self, origin: AcpDisconnectOrigin) -> usize {
+        let shutdown_diagnostics = if origin == AcpDisconnectOrigin::ApplicationShutdown {
+            self.shared_session_broker.begin_shutdown().await;
+            self.shared_session_diagnostics().await
+        } else {
+            Vec::new()
+        };
+        let mut shutdown_shared_pid_cells = Vec::new();
+        for diagnostic in &shutdown_diagnostics {
+            if let Some(pid) = self
+                .shared_session_broker
+                .driver_child_pid_for_connection(&diagnostic.connection_id)
+                .await
+            {
+                shutdown_shared_pid_cells.push(pid);
+            }
+        }
         let planned: Vec<DisconnectSelection> = {
             let connections = self.connections.lock().await;
             connections
@@ -7427,33 +7514,65 @@ impl ConnectionManager {
         }
         tracing::info!("[ACP] disconnect_all count={}", disconnected);
 
-        if disconnected == 0 {
-            return 0;
+        let mut pid_cells: Vec<Arc<std::sync::atomic::AtomicU32>> =
+            handles.into_iter().map(|(_, pid)| pid).collect();
+        for shared_pid in shutdown_shared_pid_cells {
+            if !pid_cells.iter().any(|pid| Arc::ptr_eq(pid, &shared_pid)) {
+                pid_cells.push(shared_pid);
+            }
+        }
+        let retained_process = pid_cells
+            .iter()
+            .any(|pid| pid.load(std::sync::atomic::Ordering::SeqCst) != 0);
+        if disconnected != 0 || retained_process {
+            tokio::time::sleep(DISCONNECT_ALL_GRACE).await;
+
+            let _ = tokio::task::spawn_blocking(move || {
+                for cell in pid_cells {
+                    // Load only after the grace window. The process may have
+                    // spawned late or its reaper may have cleared this cell.
+                    let pid = cell.load(std::sync::atomic::Ordering::SeqCst);
+                    if pid == 0 {
+                        continue;
+                    }
+                    match kill_tree::blocking::kill_tree(pid) {
+                        Ok(_) => tracing::info!(
+                            "[ACP] disconnect_all backstop killed process tree pid={pid}"
+                        ),
+                        Err(error) => tracing::debug!(
+                            "[ACP] disconnect_all backstop kill_tree pid={pid}: {error}"
+                        ),
+                    }
+                }
+            })
+            .await;
         }
 
-        tokio::time::sleep(DISCONNECT_ALL_GRACE).await;
-
-        let pid_cells: Vec<Arc<std::sync::atomic::AtomicU32>> =
-            handles.into_iter().map(|(_, pid)| pid).collect();
-        let _ = tokio::task::spawn_blocking(move || {
-            for cell in pid_cells {
-                // Load only after the grace window. The process may have
-                // spawned late or its reaper may have cleared this cell.
-                let pid = cell.load(std::sync::atomic::Ordering::SeqCst);
-                if pid == 0 {
-                    continue;
-                }
-                match kill_tree::blocking::kill_tree(pid) {
-                    Ok(_) => tracing::info!(
-                        "[ACP] disconnect_all backstop killed process tree pid={pid}"
-                    ),
-                    Err(error) => tracing::debug!(
-                        "[ACP] disconnect_all backstop kill_tree pid={pid}: {error}"
-                    ),
-                }
+        for diagnostic in shutdown_diagnostics {
+            let absent = !self
+                .connections
+                .lock()
+                .await
+                .contains_key(&diagnostic.connection_id);
+            if absent
+                && self
+                    .shared_session_broker
+                    .remove_shutdown_session(&diagnostic.connection_id, diagnostic.generation)
+                    .await
+            {
+                self.shared_launches
+                    .lock()
+                    .await
+                    .remove(&(diagnostic.connection_id, diagnostic.generation));
+            } else if !absent {
+                self.shared_session_broker.record_cleanup_incomplete();
+                tracing::warn!(
+                    connection_id = diagnostic.connection_id,
+                    generation = diagnostic.generation,
+                    "[ACP] shared shutdown cleanup left a live manager entry"
+                );
             }
-        })
-        .await;
+        }
 
         disconnected
     }
@@ -10004,9 +10123,8 @@ mod tests {
     use super::*;
     use crate::acp::connection::{AgentConnection, RegisteredSpawnAttempt, SpawnHandshake};
     use crate::acp::delegation::route::{
-        resolve_route, DelegationRoutePolicy, DelegationRouteSource, RouteCapabilitySnapshot,
-        RouteDegradedReason, RouteResolutionInput, SuppressionCapability,
-        ROUTE_ADAPTER_CONTRACT_VERSION,
+        resolve_route, DelegationRoutePolicy, DelegationRouteSource, RouteDegradedReason,
+        RouteResolutionInput, SuppressionCapability, ROUTE_ADAPTER_CONTRACT_VERSION,
     };
     use crate::acp::plan_approval::PlanApprovalDecision;
     use crate::acp::session_attach::SessionAttachMode;
@@ -10391,14 +10509,11 @@ mod tests {
             .expect("persist exact conversation key");
 
         let terminal_settings = SystemTerminalSettings::default();
-        let launch_inputs = AcpLaunchInputs {
-            runtime_env: BTreeMap::new(),
-            terminal_settings: terminal_settings.clone(),
-            route_plan: route_plan.clone(),
-            origin: DelegationConnectionOrigin::Root,
-            route_preference: None,
-            route_capability: RouteCapabilitySnapshot::test_supported(),
-        };
+        let mut launch_inputs =
+            AcpLaunchInputs::with_placeholder_route(BTreeMap::new(), terminal_settings.clone());
+        launch_inputs.route_plan = route_plan.clone();
+        launch_inputs.route_capability.agent_mcp_supported =
+            crate::acp::registry::get_agent_meta(agent_type).supports_mcp;
         SharedConnectLaunch {
             database: db.conn,
             key: SharedSessionKey::Conversation(conversation_id),
@@ -11046,12 +11161,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn application_shutdown_backstops_a_broker_retained_process_without_a_map_entry() {
+        let manager = ConnectionManager::new();
+        let launch = shared_launch(585, "client").await;
+        let reservation = manager
+            .shared_session_broker
+            .reserve_or_attach(SharedReserveRequest {
+                key: launch.key,
+                connection_id: "shutdown-retained-process".into(),
+                launch_identity: launch.launch_identity,
+                client_instance_id: launch.client_instance_id,
+                device_id: launch.device_id,
+                request_id: launch.request_id,
+                retry_failed_generation: None,
+                now: tokio::time::Instant::now(),
+                now_utc: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+        let state = Arc::new(RwLock::new(SessionState::new(
+            reservation.attachment.connection_id.clone(),
+            AgentType::Codex,
+            None,
+            "shared-server".into(),
+            Some(585),
+        )));
+        let child_pid = Arc::new(std::sync::atomic::AtomicU32::new(u32::MAX));
+        manager
+            .shared_session_broker
+            .install_registered(
+                &reservation.attachment.connection_id,
+                reservation.attachment.generation,
+                "shutdown-driver".into(),
+                state,
+                EventEmitter::Noop,
+                child_pid,
+            )
+            .await
+            .unwrap();
+        assert!(!manager
+            .connections
+            .lock()
+            .await
+            .contains_key(&reservation.attachment.connection_id));
+
+        tokio::time::pause();
+        let mut shutdown =
+            Box::pin(manager.disconnect_all(AcpDisconnectOrigin::ApplicationShutdown));
+        assert!(
+            matches!(futures::poll!(shutdown.as_mut()), std::task::Poll::Pending),
+            "a retained child PID must receive the same bounded shutdown grace/backstop"
+        );
+        tokio::time::advance(DISCONNECT_ALL_GRACE).await;
+        assert_eq!(shutdown.await, 0);
+        assert!(manager.shared_session_diagnostics().await.is_empty());
+    }
+
+    #[tokio::test]
+    // The guard intentionally spans the async launch loop: custom-agent hydration
+    // replaces process-global state, so another registry test must not interleave.
+    #[allow(clippy::await_holding_lock)]
     async fn shared_registry_drives_every_agent_through_one_spawn_path() {
-        let agent_types: Vec<_> = BUILTIN_AGENT_TYPES
-            .iter()
-            .copied()
-            .chain([AgentType::custom("fixture").expect("valid fixture id")])
-            .collect();
+        use crate::acp::custom_registry::{
+            CustomAgentDef, CustomAgentSpec, CustomDistributionKind, NpxSpec,
+        };
+
+        let _registry_guard = crate::acp::custom_registry::hydrate_test_guard();
+        let custom = AgentType::custom("shared-conformance").expect("valid fixture id");
+        let definition = CustomAgentDef {
+            registry_id: "shared-conformance".into(),
+            name: "Shared Conformance".into(),
+            description: "Task 12 shared-session route fixture".into(),
+            version: "1.0.0".into(),
+            distribution_kind: CustomDistributionKind::Npx,
+            spec: CustomAgentSpec {
+                npx: Some(NpxSpec {
+                    package: "shared-conformance@1.0.0".into(),
+                    cmd: Some("shared-conformance".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            icon_url: None,
+            skills_shared_store: false,
+            skills_dir: None,
+            source: Default::default(),
+            version_probe: None,
+            supports_mcp: true,
+        };
+        assert!(crate::acp::custom_registry::hydrate(&[definition]).is_empty());
+        let agent_types = crate::acp::registry::all_acp_agents();
+        assert_eq!(agent_types.len(), BUILTIN_AGENT_TYPES.len() + 1);
+        assert_eq!(agent_types.last(), Some(&custom));
         let expected_roots = agent_types.len();
         let manager = ConnectionManager::new_with_shared_spawn_driver(Arc::new(
             FakeSharedSpawnDriver::immediate_ready_many(expected_roots),
@@ -11091,6 +11292,22 @@ mod tests {
                     .phase,
                 SharedSessionPhase::Ready
             );
+            let diagnostic = manager
+                .shared_session_diagnostics()
+                .await
+                .into_iter()
+                .find(|diagnostic| diagnostic.connection_id == response.connection_id)
+                .expect("shared broker diagnostic");
+            assert_eq!(diagnostic.lease_count, 1);
+            assert_eq!(diagnostic.queue_depth, 0);
+            assert_eq!(
+                diagnostic.agent_category,
+                if agent_type.is_custom() {
+                    "custom".to_string()
+                } else {
+                    agent_type.as_wire().into_owned()
+                }
+            );
         }
         assert_eq!(connection_ids.len(), expected_roots);
         assert_eq!(manager.shared_spawn_count_for_test(), expected_roots);
@@ -11098,6 +11315,7 @@ mod tests {
             manager.shared_registered_root_count_for_test(),
             expected_roots
         );
+        crate::acp::custom_registry::hydrate(&[]);
     }
 
     #[tokio::test]
@@ -22114,6 +22332,66 @@ mod tests {
                     .unwrap(),
                 DispatchHeadDecision::Blocked
             ));
+        }
+
+        #[tokio::test]
+        async fn unexpected_driver_exit_fails_all_work_and_completes_cleanup_once() {
+            let (manager, attachment) = ready_manager().await;
+            let state = manager.get_state(&attachment.connection_id).await.unwrap();
+            state.write().await.turn_in_flight = true;
+            manager
+                .enqueue_shared_prompt(queued_prompt(&attachment, "exit-first", "alpha"))
+                .await
+                .unwrap();
+            manager
+                .enqueue_shared_prompt(queued_prompt(&attachment, "exit-second", "beta"))
+                .await
+                .unwrap();
+
+            emit_with_state(
+                &state,
+                &EventEmitter::Noop,
+                AcpEvent::StatusChanged {
+                    status: ConnectionStatus::Disconnected,
+                },
+            )
+            .await;
+
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let phase = manager
+                        .shared_session_broker()
+                        .diagnostic_for_connection(&attachment.connection_id)
+                        .await
+                        .map(|diagnostic| diagnostic.phase);
+                    if matches!(
+                        phase,
+                        Some(SharedSessionPhase::Failed {
+                            cleanup_complete: true,
+                            ..
+                        })
+                    ) {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("unexpected exit cleanup must settle within the bound");
+
+            let projection = manager
+                .shared_session_broker()
+                .diagnostic_for_connection(&attachment.connection_id)
+                .await
+                .unwrap();
+            assert!(projection.queue.is_empty());
+            assert!(projection.active_turn.is_none());
+            assert!(
+                !manager
+                    .has_connection_map_entry_for_test(&attachment.connection_id)
+                    .await
+            );
+            assert_eq!(manager.shared_teardown_count_for_test(), 1);
         }
 
         #[tokio::test]

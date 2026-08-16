@@ -3133,6 +3133,41 @@ export interface EventBusMetricsSnapshot {
   desktop_queue_full_count: number
   desktop_startup_fallback_count: number
   desktop_runtime_failure_count: number
+  /** Optional so clients can still read metrics from older desktop runtimes. */
+  shared_session_broker?: SharedSessionMetricsSnapshot
+}
+
+export interface SharedSessionMetricsSnapshot {
+  created_total: number
+  attached_total: number
+  live_sessions: number
+  active_leases: number
+  bootstrap_ready_total: number
+  bootstrap_failed_total: Record<string, number>
+  bootstrap_duration_ms_total: number
+  bootstrap_duration_samples: number
+  waiting_prompts: number
+  waiting_bytes: number
+  enqueue_total: number
+  cancel_total: number
+  dispatch_total: number
+  capacity_rejected_total: number
+  queue_item_failed_total: number
+  interaction_winner_total: number
+  interaction_stale_total: number
+  stale_stop_total: number
+  lease_expired_total: number
+  lease_released_total: number
+  idle_candidate_total: number
+  idle_cas_lost_total: number
+  idle_reclaimed_total: number
+  cleanup_duration_ms_total: number
+  cleanup_duration_samples: number
+  cleanup_incomplete_total: number
+}
+
+export type AcpEventMetricsSnapshot = EventBusMetricsSnapshot & {
+  shared_session_broker: SharedSessionMetricsSnapshot
 }
 
 /**

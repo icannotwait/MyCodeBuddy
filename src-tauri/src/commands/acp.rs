@@ -12,10 +12,12 @@ use tauri::{Manager, State};
 use crate::acp::binary_cache;
 use crate::acp::custom_registry;
 use crate::acp::error::AcpError;
+use crate::acp::internal_bus::AcpEventMetricsSnapshot;
 use crate::acp::manager::ConnectionManager;
 use crate::acp::opencode_plugins::{self, PluginCheckSummary};
 use crate::acp::preflight::{self, PreflightResult};
 use crate::acp::registry;
+use crate::acp::shared_session::{SharedSessionBroker, SharedSessionDiagnostic};
 #[cfg(feature = "tauri-runtime")]
 use crate::acp::termination::AcpDisconnectOrigin;
 use crate::acp::types::{
@@ -27,9 +29,9 @@ use crate::acp::types::{
 };
 #[cfg(feature = "tauri-runtime")]
 use crate::acp::types::{ConnectionInfo, ForkResultInfo, PromptInputBlock};
+use crate::acp::EventBusMetrics;
 #[cfg(feature = "tauri-runtime")]
 use crate::acp::InternalEventBus;
-use crate::acp::{EventBusMetrics, EventBusMetricsSnapshot};
 use crate::db::service::agent_setting_service;
 use crate::db::service::model_provider_service;
 use crate::db::AppDatabase;
@@ -9271,16 +9273,29 @@ pub async fn acp_list_connections(
     Ok(manager.list_connections().await)
 }
 
-pub(crate) fn acp_get_event_metrics_core(metrics: &EventBusMetrics) -> EventBusMetricsSnapshot {
-    metrics.snapshot()
+pub(crate) fn acp_get_event_metrics_core(
+    metrics: &EventBusMetrics,
+    broker: &SharedSessionBroker,
+) -> AcpEventMetricsSnapshot {
+    AcpEventMetricsSnapshot {
+        event_bus: metrics.snapshot(),
+        shared_session_broker: broker.metrics().snapshot(),
+    }
+}
+
+pub(crate) async fn acp_get_shared_session_diagnostics_core(
+    manager: &ConnectionManager,
+) -> Vec<SharedSessionDiagnostic> {
+    manager.shared_session_diagnostics().await
 }
 
 #[cfg(feature = "tauri-runtime")]
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
 pub fn acp_get_event_metrics(
     bus: tauri::State<'_, Arc<InternalEventBus>>,
-) -> EventBusMetricsSnapshot {
-    acp_get_event_metrics_core(bus.metrics())
+    manager: State<'_, ConnectionManager>,
+) -> AcpEventMetricsSnapshot {
+    acp_get_event_metrics_core(bus.metrics(), &manager.shared_session_broker())
 }
 
 /// Startup-selected desktop ACP delivery mode and performance flags.

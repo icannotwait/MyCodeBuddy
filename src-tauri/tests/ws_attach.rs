@@ -13,7 +13,8 @@ use axum_test::TestServer;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use codeg_lib::acp::session_attach::SessionAttachMode;
 use codeg_lib::acp::shared_session::{
-    SharedLaunchIdentity, SharedReserveRequest, SharedSessionAttachment, SharedSessionKey,
+    SharedActiveTurnProjection, SharedLaunchIdentity, SharedQueuedPromptState,
+    SharedQueuedPromptSummary, SharedReserveRequest, SharedSessionAttachment, SharedSessionKey,
 };
 use codeg_lib::acp::types::{AcpEvent, EventEnvelope};
 use codeg_lib::app_state::AppState;
@@ -23,7 +24,9 @@ use codeg_lib::models::agent::AgentType;
 use codeg_lib::web::event_bridge::emit_with_state;
 use codeg_lib::web::router::build_router;
 use codeg_lib::web::shutdown::ShutdownSignal;
+use codeg_lib::web::ws_attach::{spawn_forwarder, DetachReason, ServerMsg};
 use serde_json::{json, Value};
+use tokio::sync::mpsc;
 
 const SEC_WEBSOCKET_PROTOCOL: &str = "sec-websocket-protocol";
 
@@ -430,6 +433,197 @@ async fn ws_attach_shared_generation_retry_detaches_replaced_subscription() {
     assert_eq!(direct["type"], "detached");
     assert_eq!(direct["subscription_id"], "old-direct");
     assert_eq!(direct["reason"], "session_replaced");
+}
+
+#[tokio::test]
+async fn ws_lag_reconnect_snapshot_restores_shared_state_and_lease_expiry() {
+    let (server, state, _d, _s) = build_ws_server().await;
+    let attached = seed_shared_root(
+        &state,
+        43,
+        "shared-reconnect",
+        "client-reconnect",
+        "request-reconnect",
+    )
+    .await;
+    let state_arc = state
+        .connection_manager
+        .get_state(&attached.connection_id)
+        .await
+        .expect("retained shared state");
+    let receiver = state_arc.read().await.event_stream().subscribe();
+    let (outbound_tx, mut outbound_rx) = mpsc::channel(1);
+    let (cleanup_tx, _cleanup_rx) = mpsc::channel(1);
+    let forwarder = spawn_forwarder(
+        "lagged-shared".into(),
+        1,
+        state.acp_event_bus.metrics().clone(),
+        receiver,
+        outbound_tx,
+        cleanup_tx,
+        state.connection_manager.shared_session_broker(),
+        None,
+    );
+
+    let submitted_at = chrono::DateTime::parse_from_rfc3339("2026-08-16T00:00:00Z")
+        .expect("valid fixture timestamp")
+        .with_timezone(&chrono::Utc);
+    let queued = |queue_item_id: &str, enqueue_seq: u64, client_message_id: &str| {
+        SharedQueuedPromptSummary {
+            queue_item_id: queue_item_id.into(),
+            enqueue_seq,
+            client_message_id: client_message_id.into(),
+            visible_text: Some(format!("prompt-{enqueue_seq}")),
+            visible_text_truncated: false,
+            attachment_count: 0,
+            submitted_at,
+            state: SharedQueuedPromptState::Queued,
+        }
+    };
+    emit_with_state(
+        &state_arc,
+        &state.emitter,
+        AcpEvent::PromptQueued {
+            generation: attached.generation,
+            item: queued("queue-active", 1, "message-active"),
+        },
+    )
+    .await;
+    emit_with_state(
+        &state_arc,
+        &state.emitter,
+        AcpEvent::PromptDispatchStarted {
+            generation: attached.generation,
+            turn: SharedActiveTurnProjection {
+                turn_id: "turn-active".into(),
+                queue_item_id: "queue-active".into(),
+                enqueue_seq: 1,
+                client_message_id: "message-active".into(),
+                stop_requested: false,
+            },
+        },
+    )
+    .await;
+    emit_with_state(
+        &state_arc,
+        &state.emitter,
+        AcpEvent::PromptQueued {
+            generation: attached.generation,
+            item: queued("queue-waiting", 2, "message-waiting"),
+        },
+    )
+    .await;
+    emit_with_state(
+        &state_arc,
+        &state.emitter,
+        AcpEvent::PermissionRequest {
+            request_id: "permission-current".into(),
+            tool_call: json!({"toolCallId": "tool-current", "title": "Inspect"}),
+            options: Vec::new(),
+            queued: 0,
+        },
+    )
+    .await;
+    emit_with_state(
+        &state_arc,
+        &state.emitter,
+        AcpEvent::QuestionRequest {
+            question_id: "question-current".into(),
+            questions: Vec::new(),
+        },
+    )
+    .await;
+    emit_with_state(
+        &state_arc,
+        &state.emitter,
+        AcpEvent::PlanApprovalRequest {
+            approval_id: "plan-current".into(),
+            tool_call_id: "plan-tool-current".into(),
+            plan_markdown: "# Current plan".into(),
+        },
+    )
+    .await;
+
+    // The bounded outbound queue stalls the forwarder after two events. A
+    // larger-than-broadcast-capacity burst then produces a real Lagged detach.
+    for index in 0..4_097 {
+        emit_with_state(
+            &state_arc,
+            &state.emitter,
+            AcpEvent::ContentDelta {
+                text: format!("{index}"),
+                parent_tool_use_id: None,
+            },
+        )
+        .await;
+    }
+    let first = tokio::time::timeout(Duration::from_secs(3), outbound_rx.recv())
+        .await
+        .expect("first forwarded frame within 3s");
+    let second = tokio::time::timeout(Duration::from_secs(3), outbound_rx.recv())
+        .await
+        .expect("second forwarded frame within 3s");
+    let detached = tokio::time::timeout(Duration::from_secs(3), outbound_rx.recv())
+        .await
+        .expect("lagged detach within 3s");
+    assert!(matches!(first, Some(ServerMsg::Event { .. })));
+    assert!(matches!(second, Some(ServerMsg::Event { .. })));
+    assert!(matches!(
+        detached,
+        Some(ServerMsg::Detached {
+            reason: DetachReason::Lagged,
+            ..
+        })
+    ));
+    forwarder.await.expect("lagged forwarder exits cleanly");
+
+    let mut ws = server
+        .get_websocket("/ws/events")
+        .add_header(SEC_WEBSOCKET_PROTOCOL, ws_auth_protocol(TEST_TOKEN))
+        .await
+        .into_websocket()
+        .await;
+    let _ready = next_json(&mut ws).await;
+    ws.send_json(&json!({
+        "action": "attach",
+        "subscription_id": "shared-reconnected",
+        "connection_id": attached.connection_id,
+        "generation": attached.generation,
+        "lease_id": attached.lease_id,
+        "since_seq": 0
+    }))
+    .await;
+
+    let recovered = next_json(&mut ws).await;
+    assert_eq!(recovered["type"], "snapshot");
+    assert_eq!(
+        recovered["snapshot"]["shared_session"]["phase"],
+        json!({"phase": "bootstrapping"})
+    );
+    assert_eq!(
+        recovered["snapshot"]["shared_session"]["queue"][0]["queue_item_id"],
+        "queue-waiting"
+    );
+    assert_eq!(
+        recovered["snapshot"]["shared_session"]["active_turn"]["turn_id"],
+        "turn-active"
+    );
+    assert_eq!(
+        recovered["snapshot"]["pending_permission"]["request_id"],
+        "permission-current"
+    );
+    assert_eq!(
+        recovered["snapshot"]["pending_question"]["question_id"],
+        "question-current"
+    );
+    assert_eq!(
+        recovered["snapshot"]["pending_plan_approval"]["approval_id"],
+        "plan-current"
+    );
+    assert_eq!(
+        recovered["snapshot"]["shared_session"]["lease_expires_at"],
+        serde_json::to_value(attached.lease_expires_at).unwrap()
+    );
 }
 
 // ───────────────────────────────────────────────────────────────────────────

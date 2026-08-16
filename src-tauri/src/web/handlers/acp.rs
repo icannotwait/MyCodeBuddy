@@ -23,6 +23,14 @@ use crate::commands::acp as acp_commands;
 use crate::commands::custom_agents as custom_agent_commands;
 use crate::models::agent::AgentType;
 
+pub async fn acp_get_shared_session_diagnostics(
+    Extension(state): Extension<Arc<AppState>>,
+) -> Result<Json<Vec<crate::acp::shared_session::SharedSessionDiagnostic>>, AppCommandError> {
+    Ok(Json(
+        acp_commands::acp_get_shared_session_diagnostics_core(&state.connection_manager).await,
+    ))
+}
+
 /// Constructs a process-free registered shared root for HTTP integration
 /// tests. The feature gate keeps the fake driver surface out of production
 /// builds while allowing `tests/shared_session_http.rs` to exercise the real

@@ -28,7 +28,9 @@ import {
 } from "@/stores/app-workspace-store"
 import type { AttachHandlers } from "@/lib/transport/types"
 import type {
+  AcpEventMetricsSnapshot,
   EventEnvelope,
+  EventBusMetricsSnapshot,
   LiveSessionSnapshot,
   SessionConfigOptionInfo,
 } from "@/lib/types"
@@ -6548,6 +6550,76 @@ describe("isRetryableObserverDiscoveryError", () => {
     expect(
       isRetryableObserverDiscoveryError({ response: { status: 401 } })
     ).toBe(false)
+  })
+})
+
+describe("ACP event metrics compatibility", () => {
+  it("keeps legacy counters flat while accepting the additive broker snapshot", () => {
+    const legacy: EventBusMetricsSnapshot = {
+      emitted_count: 1,
+      lagged_count: 2,
+      ring_buffer_evict_count: 3,
+      replay_count: 4,
+      replay_event_total: 5,
+      snapshot_fallback_count: 6,
+      snapshot_cold_count: 7,
+      forwarder_lagged_count: 8,
+      worker_queue_full_count: 9,
+      critical_lane_emit_count: 10,
+      critical_lane_full_count: 11,
+      desktop_raw_envelope_count: 12,
+      desktop_raw_bytes: 13,
+      desktop_emit_attempt_count: 14,
+      desktop_serialization_failure_count: 15,
+      desktop_emit_failure_count: 16,
+      desktop_legacy_emit_count: 17,
+      desktop_batch_count: 18,
+      desktop_batch_event_count: 19,
+      desktop_batch_bytes: 20,
+      desktop_batch_max_events: 21,
+      desktop_batch_max_bytes: 22,
+      desktop_batch_latency_total_us: 23,
+      desktop_batch_latency_max_us: 24,
+      desktop_queue_full_count: 25,
+      desktop_startup_fallback_count: 26,
+      desktop_runtime_failure_count: 27,
+    }
+    const current: AcpEventMetricsSnapshot = {
+      ...legacy,
+      shared_session_broker: {
+        created_total: 1,
+        attached_total: 0,
+        live_sessions: 1,
+        active_leases: 1,
+        bootstrap_ready_total: 0,
+        bootstrap_failed_total: {},
+        bootstrap_duration_ms_total: 0,
+        bootstrap_duration_samples: 0,
+        waiting_prompts: 0,
+        waiting_bytes: 0,
+        enqueue_total: 0,
+        cancel_total: 0,
+        dispatch_total: 0,
+        capacity_rejected_total: 0,
+        queue_item_failed_total: 0,
+        interaction_winner_total: 0,
+        interaction_stale_total: 0,
+        stale_stop_total: 0,
+        lease_expired_total: 0,
+        lease_released_total: 0,
+        idle_candidate_total: 0,
+        idle_cas_lost_total: 0,
+        idle_reclaimed_total: 0,
+        cleanup_duration_ms_total: 0,
+        cleanup_duration_samples: 0,
+        cleanup_incomplete_total: 0,
+      },
+    }
+
+    expect(legacy.emitted_count).toBe(1)
+    expect(legacy.shared_session_broker).toBeUndefined()
+    expect(current.emitted_count).toBe(1)
+    expect(current.shared_session_broker.live_sessions).toBe(1)
   })
 })
 

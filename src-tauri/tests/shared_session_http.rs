@@ -18,6 +18,7 @@ use codeg_lib::acp::shared_session::{
     MAX_PROMPT_LEDGER_ENTRIES, MAX_REPLACED_CONNECTION_TOMBSTONES, MAX_WAITING_BYTES,
     MAX_WAITING_PROMPTS,
 };
+use codeg_lib::acp::termination::AcpDisconnectOrigin;
 use codeg_lib::app_state::AppState;
 use codeg_lib::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
 use codeg_lib::models::AgentType;
@@ -241,6 +242,18 @@ impl SharedHttpFixture {
         HttpResponse { status, body }
     }
 
+    async fn get_json_with_token(&self, route: &str, token: Option<&str>) -> HttpResponse {
+        let mut request = self.server.get(&format!("/api{route}"));
+        if let Some(token) = token {
+            request = request.add_header("authorization", format!("Bearer {token}"));
+        }
+        let response = request.await;
+        let status = response.status_code();
+        let text = response.text();
+        let body = serde_json::from_str(&text).unwrap_or(Value::String(text));
+        HttpResponse { status, body }
+    }
+
     fn spawn_count(&self) -> usize {
         self.driver.starts.load(Ordering::SeqCst)
     }
@@ -332,25 +345,80 @@ async fn ready_shared_http_fixture() -> SharedHttpFixture {
     shared_http_fixture(BootstrapOutcome::Ready).await
 }
 
+fn assert_json_omits_secrets(value: &Value, forbidden_keys: &[&str], sentinels: &[&str]) {
+    match value {
+        Value::Object(fields) => {
+            for (key, value) in fields {
+                assert!(
+                    !forbidden_keys.contains(&key.as_str()),
+                    "forbidden diagnostic key {key:?} in {fields:?}"
+                );
+                assert_json_omits_secrets(value, forbidden_keys, sentinels);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                assert_json_omits_secrets(item, forbidden_keys, sentinels);
+            }
+        }
+        Value::String(text) => {
+            for sentinel in sentinels {
+                assert!(
+                    !text.contains(sentinel),
+                    "diagnostic string reflected sentinel {sentinel:?}: {text:?}"
+                );
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
 #[tokio::test]
 async fn concurrent_connect_or_attach_returns_one_connection_and_distinct_leases() {
-    let fixture = shared_http_fixture_with_pending_bootstrap().await;
-    let (a, b) = tokio::join!(
-        fixture.post_connect("device-a", "client-a", "request-a"),
-        fixture.post_connect("device-b", "client-b", "request-b"),
-    );
-    let a = a.assert_status_ok().json::<AcpConnectOrAttachResponse>();
-    let b = b.assert_status_ok().json::<AcpConnectOrAttachResponse>();
-    assert_eq!(a.connection_id, b.connection_id);
-    assert_eq!(a.generation, b.generation);
-    assert_ne!(a.lease_id, b.lease_id);
-    assert_eq!(fixture.spawn_count(), 1);
-    assert_eq!(a.phase, SharedPublicPhase::Bootstrapping);
-    assert_eq!(b.phase, SharedPublicPhase::Bootstrapping);
-    assert_eq!(a.disposition, SharedDisposition::Created);
-    assert_eq!(b.disposition, SharedDisposition::Attached);
-    assert!(!a.lease_expires_at.is_empty());
-    assert_eq!(a.error, None);
+    for client_count in [2_usize, 10, 100] {
+        let fixture = shared_http_fixture_with_pending_bootstrap().await;
+        let fixture_ref = &fixture;
+        let responses = futures::future::join_all((0..client_count).map(move |index| async move {
+            let device_id = format!("device-{client_count}-{index}");
+            let client_id = format!("client-{client_count}-{index}");
+            let request_id = format!("request-{client_count}-{index}");
+            fixture_ref
+                .post_connect(&device_id, &client_id, &request_id)
+                .await
+        }))
+        .await
+        .into_iter()
+        .map(|response| {
+            response
+                .assert_status_ok()
+                .json::<AcpConnectOrAttachResponse>()
+        })
+        .collect::<Vec<_>>();
+        let first = &responses[0];
+        assert!(responses.iter().all(|response| {
+            response.connection_id == first.connection_id
+                && response.generation == first.generation
+                && response.phase == SharedPublicPhase::Bootstrapping
+                && response.error.is_none()
+                && !response.lease_expires_at.is_empty()
+        }));
+        assert_eq!(
+            responses
+                .iter()
+                .map(|response| response.lease_id.as_str())
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            client_count
+        );
+        assert_eq!(
+            responses
+                .iter()
+                .filter(|response| response.disposition == SharedDisposition::Created)
+                .count(),
+            1
+        );
+        assert_eq!(fixture.spawn_count(), 1);
+    }
 }
 
 #[tokio::test]
@@ -462,6 +530,176 @@ async fn protected_shared_routes_require_the_bearer_token() {
         .await
         .assert_status_unauthorized();
     assert_eq!(fixture.spawn_count(), 0);
+}
+
+#[tokio::test]
+async fn debug_metrics_and_diagnostics_are_authenticated_complete_and_secret_safe() {
+    const DEVICE_SENTINEL: &str = "task12-device-secret-sentinel";
+    const CLIENT_SENTINEL: &str = "task12-client-secret-sentinel";
+    const REQUEST_SENTINEL: &str = "task12-request-secret-sentinel";
+    const PROMPT_SENTINEL: &str = "task12-prompt-secret-sentinel";
+    const ANSWER_SENTINEL: &str = "task12-answer-secret-sentinel";
+    const ENV_SENTINEL: &str = "task12-environment-secret-sentinel";
+    const STDERR_SENTINEL: &str = "task12-stderr-secret-sentinel";
+
+    let fixture = shared_http_fixture_with_pending_bootstrap().await;
+    let mut connect = fixture.connect_json(DEVICE_SENTINEL, CLIENT_SENTINEL, REQUEST_SENTINEL);
+    connect["preferredConfigValues"] = json!({"TASK12_ENV": ENV_SENTINEL});
+    connect["agentStderr"] = json!(STDERR_SENTINEL);
+    let attached = fixture
+        .post_json("/acp_connect_or_attach", connect)
+        .await
+        .assert_status_ok()
+        .json::<AcpConnectOrAttachResponse>();
+    fixture
+        .post_json(
+            "/acp_prompt",
+            json!({
+                "connectionId": attached.connection_id,
+                "generation": attached.generation,
+                "leaseId": attached.lease_id,
+                "clientInstanceId": CLIENT_SENTINEL,
+                "clientRequestId": "task12-prompt-request",
+                "clientMessageId": "task12-prompt-message",
+                "blocks": [{"type": "text", "text": PROMPT_SENTINEL}],
+                "folderId": fixture.folder_id,
+                "conversationId": fixture.conversation_id,
+            }),
+        )
+        .await
+        .assert_status_ok();
+    fixture
+        .post_json(
+            "/acp_answer_question",
+            json!({
+                "connectionId": attached.connection_id,
+                "generation": attached.generation,
+                "leaseId": attached.lease_id,
+                "questionId": "task12-missing-question",
+                "answer": {
+                    "answers": [{
+                        "questionId": "task12-answer-question",
+                        "labels": [ANSWER_SENTINEL],
+                    }],
+                    "declined": false,
+                },
+            }),
+        )
+        .await
+        .assert_status_conflict();
+
+    for route in ["/debug/event_metrics", "/debug/shared_sessions"] {
+        fixture
+            .get_json_with_token(route, None)
+            .await
+            .assert_status_unauthorized();
+    }
+
+    let metrics = fixture
+        .get_json_with_token("/debug/event_metrics", Some(TEST_TOKEN))
+        .await
+        .assert_status_ok()
+        .body;
+    assert!(metrics.get("emitted_count").is_some());
+    let broker_metrics = metrics
+        .get("shared_session_broker")
+        .and_then(Value::as_object)
+        .expect("event metrics include nested shared-session broker snapshot");
+    for field in [
+        "created_total",
+        "attached_total",
+        "live_sessions",
+        "active_leases",
+        "bootstrap_ready_total",
+        "bootstrap_failed_total",
+        "bootstrap_duration_ms_total",
+        "bootstrap_duration_samples",
+        "waiting_prompts",
+        "waiting_bytes",
+        "enqueue_total",
+        "cancel_total",
+        "dispatch_total",
+        "capacity_rejected_total",
+        "queue_item_failed_total",
+        "interaction_winner_total",
+        "interaction_stale_total",
+        "stale_stop_total",
+        "lease_expired_total",
+        "lease_released_total",
+        "idle_candidate_total",
+        "idle_cas_lost_total",
+        "idle_reclaimed_total",
+        "cleanup_duration_ms_total",
+        "cleanup_duration_samples",
+        "cleanup_incomplete_total",
+    ] {
+        assert!(broker_metrics.contains_key(field), "missing metric {field}");
+    }
+
+    let diagnostics = fixture
+        .get_json_with_token("/debug/shared_sessions", Some(TEST_TOKEN))
+        .await
+        .assert_status_ok()
+        .body;
+    let sessions = diagnostics.as_array().expect("diagnostic list");
+    assert_eq!(sessions.len(), 1);
+    let item = sessions[0].as_object().expect("diagnostic item");
+    assert_eq!(
+        item.get("connection_id"),
+        Some(&json!(attached.connection_id))
+    );
+    assert_eq!(
+        item.get("conversation_id"),
+        Some(&json!(fixture.conversation_id))
+    );
+    assert_eq!(item.get("generation"), Some(&json!(attached.generation)));
+    assert_eq!(item.get("agent_category"), Some(&json!("codex")));
+    assert_eq!(item.get("lease_count"), Some(&json!(1)));
+    assert_eq!(item.get("queue_depth"), Some(&json!(1)));
+    assert!(item.get("queue_bytes").and_then(Value::as_u64).unwrap() > 0);
+    assert!(item.get("idle_blockers").is_some());
+    assert!(item.get("cleanup_state").is_some());
+    assert!(item.get("bootstrap_duration_ms").is_some());
+    assert!(item.get("cleanup_duration_ms").is_some());
+
+    assert_json_omits_secrets(
+        &diagnostics,
+        &[
+            "lease_id",
+            "leaseId",
+            "device_id",
+            "deviceId",
+            "client_instance_id",
+            "clientInstanceId",
+            "request_id",
+            "requestId",
+            "client_request_id",
+            "clientRequestId",
+            "prompt",
+            "answer",
+            "working_dir",
+            "workingDir",
+            "path",
+            "token",
+            "environment",
+            "stderr",
+            "raw_output",
+            "launch_identity",
+        ],
+        &[
+            &attached.lease_id,
+            DEVICE_SENTINEL,
+            CLIENT_SENTINEL,
+            REQUEST_SENTINEL,
+            PROMPT_SENTINEL,
+            ANSWER_SENTINEL,
+            &fixture.working_dir,
+            TEST_TOKEN,
+            ENV_SENTINEL,
+            STDERR_SENTINEL,
+        ],
+    );
+    assert_json_omits_secrets(&metrics, &[], &[TEST_TOKEN]);
 }
 
 #[tokio::test]
@@ -916,17 +1154,32 @@ async fn prompt_queue_capacity_rejects_only_new_prompt_identities() {
         })
     };
     let first_request = prompt("request-0");
-    let first = fixture
-        .post_json("/acp_prompt", first_request.clone())
-        .await
-        .assert_status_ok()
-        .body;
-    for index in 1..MAX_WAITING_PROMPTS {
-        fixture
-            .post_json("/acp_prompt", prompt(&format!("request-{index}")))
-            .await
-            .assert_status_ok();
-    }
+    let accepted = futures::future::join_all((0..MAX_WAITING_PROMPTS).map(|index| {
+        let body = prompt(&format!("request-{index}"));
+        fixture.post_json("/acp_prompt", body)
+    }))
+    .await;
+    let first_seq = accepted[0]
+        .body
+        .get("enqueueSeq")
+        .and_then(Value::as_u64)
+        .expect("first request has enqueue sequence");
+    let mut enqueue_seqs = accepted
+        .into_iter()
+        .map(|response| {
+            response
+                .assert_status_ok()
+                .body
+                .get("enqueueSeq")
+                .and_then(Value::as_u64)
+                .expect("accepted prompt has enqueue sequence")
+        })
+        .collect::<Vec<_>>();
+    enqueue_seqs.sort_unstable();
+    assert_eq!(
+        enqueue_seqs,
+        (1..=MAX_WAITING_PROMPTS as u64).collect::<Vec<_>>()
+    );
     fixture
         .post_json("/acp_prompt", prompt("request-over-capacity"))
         .await
@@ -937,7 +1190,10 @@ async fn prompt_queue_capacity_rejects_only_new_prompt_identities() {
         .await
         .assert_status_ok()
         .body;
-    assert_eq!(retry, first);
+    assert_eq!(
+        retry.get("enqueueSeq").and_then(Value::as_u64),
+        Some(first_seq)
+    );
 }
 
 #[tokio::test]
@@ -1186,6 +1442,119 @@ async fn explicit_termination_requires_auth_and_the_current_generation() {
         .await
         .is_none());
     assert_eq!(fixture.manager().shared_teardown_count_for_test(), 1);
+}
+
+#[tokio::test]
+async fn shutdown_fences_admission_keeps_release_available_and_restart_is_empty() {
+    let fixture = shared_http_fixture_with_pending_bootstrap().await;
+    let attached = fixture
+        .post_connect("shutdown-device", "shutdown-client", "shutdown-connect")
+        .await
+        .assert_status_ok()
+        .json::<AcpConnectOrAttachResponse>();
+    let prompt = json!({
+        "connectionId": attached.connection_id,
+        "generation": attached.generation,
+        "leaseId": attached.lease_id,
+        "clientInstanceId": "shutdown-client",
+        "clientRequestId": "shutdown-prompt",
+        "clientMessageId": "shutdown-message",
+        "blocks": [{"type": "text", "text": "queued before shutdown"}],
+        "folderId": fixture.folder_id,
+        "conversationId": fixture.conversation_id,
+    });
+    fixture
+        .post_json("/acp_prompt", prompt.clone())
+        .await
+        .assert_status_ok();
+
+    fixture
+        .manager()
+        .shared_session_broker()
+        .begin_shutdown()
+        .await;
+    assert_eq!(
+        fixture
+            .manager()
+            .shared_session_broker()
+            .diagnostic_for_connection(&attached.connection_id)
+            .await
+            .expect("closing record retained until cleanup")
+            .phase,
+        SharedSessionPhase::Closing
+    );
+
+    fixture
+        .post_connect(
+            "shutdown-device-2",
+            "shutdown-client-2",
+            "shutdown-connect-2",
+        )
+        .await
+        .assert_status_conflict()
+        .assert_code("shared_session_closing");
+    fixture
+        .post_json("/acp_prompt", prompt)
+        .await
+        .assert_status_conflict()
+        .assert_code("shared_session_closing");
+    fixture
+        .post_json(
+            "/acp_answer_question",
+            json!({
+                "connectionId": attached.connection_id,
+                "generation": attached.generation,
+                "leaseId": attached.lease_id,
+                "questionId": "shutdown-question",
+                "answer": {"answers": [], "declined": true},
+            }),
+        )
+        .await
+        .assert_status_conflict()
+        .assert_code("shared_session_closing");
+    fixture
+        .post_json(
+            "/acp_cancel",
+            json!({
+                "connectionId": attached.connection_id,
+                "generation": attached.generation,
+                "leaseId": attached.lease_id,
+                "turnId": "shutdown-turn",
+            }),
+        )
+        .await
+        .assert_status_conflict()
+        .assert_code("shared_session_closing");
+    fixture
+        .post_json(
+            "/acp_release_lease",
+            json!({
+                "connectionId": attached.connection_id,
+                "generation": attached.generation,
+                "leaseId": attached.lease_id,
+            }),
+        )
+        .await
+        .assert_status_ok();
+
+    fixture
+        .manager()
+        .disconnect_all(AcpDisconnectOrigin::ApplicationShutdown)
+        .await;
+    assert!(fixture
+        .manager()
+        .shared_session_diagnostics()
+        .await
+        .is_empty());
+
+    let restarted = ConnectionManager::new();
+    assert!(restarted.shared_session_diagnostics().await.is_empty());
+    assert_eq!(restarted.shared_spawn_count_for_test(), 0);
+    let metrics = restarted.shared_session_broker().metrics().snapshot();
+    assert_eq!(metrics.live_sessions, 0);
+    assert_eq!(metrics.active_leases, 0);
+    assert_eq!(metrics.waiting_prompts, 0);
+    assert_eq!(metrics.dispatch_total, 0);
 }
 
 #[tokio::test]

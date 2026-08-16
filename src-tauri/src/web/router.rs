@@ -44,6 +44,10 @@ pub fn build_router(
             get(handlers::event_metrics::get_event_metrics),
         )
         .route(
+            "/debug/shared_sessions",
+            get(handlers::acp::acp_get_shared_session_diagnostics),
+        )
+        .route(
             "/debug/delegation_metrics",
             get(handlers::delegation_metrics::get_delegation_metrics),
         )
