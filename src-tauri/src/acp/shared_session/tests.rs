@@ -3027,7 +3027,7 @@ mod tests {
                 .await;
             let shared = self
                 .manager
-                .sweep_shared_sessions(Duration::from_secs(900), Duration::from_secs(90))
+                .sweep_shared_sessions(Some(Duration::from_secs(900)), Duration::from_secs(90))
                 .await;
             if self
                 .manager
@@ -3474,6 +3474,40 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn idle_host_work_cross_thread_drop_releases_and_wakes_dispatcher() {
+        let fixture = idle_ready_fixture().await;
+        assert!(!fixture.reap_now().await.removed);
+        let subscription = fixture
+            .broker
+            .runtime_subscription(
+                &fixture.attachment.connection_id,
+                fixture.attachment.generation,
+            )
+            .await
+            .unwrap();
+        let permit = fixture
+            .broker
+            .begin_host_work(
+                &fixture.attachment.connection_id,
+                fixture.attachment.generation,
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), subscription.notify.notified())
+            .await
+            .expect("begin host work wakes dispatcher");
+
+        std::thread::spawn(move || drop(permit)).join().unwrap();
+        tokio::time::timeout(Duration::from_secs(1), subscription.notify.notified())
+            .await
+            .expect("cross-thread permit drop wakes dispatcher");
+
+        assert!(!fixture.reap_now().await.removed);
+        tokio::time::advance(Duration::from_secs(900)).await;
+        assert!(fixture.reap_now().await.removed);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn failed_tombstone_reaps_only_after_cleanup_clients_and_grace() {
         let manager = ConnectionManager::new();
         manager.configure_shared_client_lease_ttl(Duration::from_secs(90));
@@ -3524,7 +3558,7 @@ mod tests {
             }
         ));
         assert!(!manager
-            .sweep_shared_sessions(Duration::from_secs(900), Duration::from_secs(90))
+            .sweep_shared_sessions(Some(Duration::from_secs(900)), Duration::from_secs(90))
             .await
             .removed);
 
@@ -3541,7 +3575,7 @@ mod tests {
             .await
             .is_ok());
         assert!(!manager
-            .sweep_shared_sessions(Duration::from_secs(900), Duration::from_secs(90))
+            .sweep_shared_sessions(Some(Duration::from_secs(900)), Duration::from_secs(90))
             .await
             .removed);
         let guard = SharedMutationGuard {
@@ -3551,17 +3585,17 @@ mod tests {
         };
         assert!(broker.release_lease(&guard).await.unwrap());
         assert!(!manager
-            .sweep_shared_sessions(Duration::from_secs(900), Duration::from_secs(90))
+            .sweep_shared_sessions(Some(Duration::from_secs(900)), Duration::from_secs(90))
             .await
             .removed);
         tokio::time::advance(Duration::from_secs(89)).await;
         assert!(!manager
-            .sweep_shared_sessions(Duration::from_secs(900), Duration::from_secs(90))
+            .sweep_shared_sessions(Some(Duration::from_secs(900)), Duration::from_secs(90))
             .await
             .removed);
         tokio::time::advance(Duration::from_secs(1)).await;
         assert!(manager
-            .sweep_shared_sessions(Duration::from_secs(900), Duration::from_secs(90))
+            .sweep_shared_sessions(Some(Duration::from_secs(900)), Duration::from_secs(90))
             .await
             .removed);
         assert!(broker
@@ -3613,12 +3647,12 @@ mod tests {
             .await
             .unwrap();
         assert!(broker
-            .evaluate_idle(Duration::from_secs(900), Duration::from_secs(90))
+            .evaluate_idle(Some(Duration::from_secs(900)), Duration::from_secs(90))
             .await
             .is_empty());
         tokio::time::advance(Duration::from_secs(90)).await;
         let candidate = broker
-            .evaluate_idle(Duration::from_secs(900), Duration::from_secs(90))
+            .evaluate_idle(Some(Duration::from_secs(900)), Duration::from_secs(90))
             .await
             .pop()
             .expect("failed tombstone reached its grace");
@@ -3674,12 +3708,12 @@ mod tests {
             .await
             .unwrap();
         assert!(broker
-            .evaluate_idle(Duration::from_secs(900), Duration::from_secs(90))
+            .evaluate_idle(Some(Duration::from_secs(900)), Duration::from_secs(90))
             .await
             .is_empty());
         tokio::time::advance(Duration::from_secs(90)).await;
         let stale_candidate = broker
-            .evaluate_idle(Duration::from_secs(900), Duration::from_secs(90))
+            .evaluate_idle(Some(Duration::from_secs(900)), Duration::from_secs(90))
             .await
             .pop()
             .expect("failed tombstone reached its first grace");
@@ -3719,18 +3753,18 @@ mod tests {
             .expect("failed tombstone removal CAS must make bounded progress")
         );
         assert!(broker
-            .evaluate_idle(Duration::from_secs(900), Duration::from_secs(90))
+            .evaluate_idle(Some(Duration::from_secs(900)), Duration::from_secs(90))
             .await
             .is_empty());
         tokio::time::advance(Duration::from_secs(89)).await;
         assert!(broker
-            .evaluate_idle(Duration::from_secs(900), Duration::from_secs(90))
+            .evaluate_idle(Some(Duration::from_secs(900)), Duration::from_secs(90))
             .await
             .is_empty());
         tokio::time::advance(Duration::from_secs(1)).await;
         assert_eq!(
             broker
-                .evaluate_idle(Duration::from_secs(900), Duration::from_secs(90))
+                .evaluate_idle(Some(Duration::from_secs(900)), Duration::from_secs(90))
                 .await
                 .len(),
             1

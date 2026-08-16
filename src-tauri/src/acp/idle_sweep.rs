@@ -24,8 +24,9 @@ pub const DEFAULT_CLIENT_LEASE_TTL_SECS: u64 = 90;
 pub const SWEEP_INTERVAL_SECS: u64 = 60;
 
 /// Read the idle timeout from `CODEG_ACP_IDLE_TIMEOUT_SECS`, falling back
-/// to `DEFAULT_IDLE_TIMEOUT_SECS`. A `0` value disables the sweep
-/// (returns `None`); any unparseable value is treated as "use default".
+/// to `DEFAULT_IDLE_TIMEOUT_SECS`. A `0` value disables Ready-session and
+/// legacy idle reclamation while periodic lease/tombstone maintenance keeps
+/// running. Any unparseable value is treated as "use default".
 pub fn idle_timeout_from_env() -> Option<Duration> {
     let secs = match std::env::var("CODEG_ACP_IDLE_TIMEOUT_SECS") {
         Ok(raw) => raw.parse::<u64>().unwrap_or(DEFAULT_IDLE_TIMEOUT_SECS),
@@ -56,8 +57,30 @@ pub fn client_lease_ttl_from_env(idle_timeout: Option<Duration>) -> Duration {
     }
 }
 
-/// Long-running task that calls `ConnectionManager::sweep_idle` on a
-/// fixed interval. The caller spawns the returned future onto whichever
+/// Run one maintenance pass. Lease expiry and failed-tombstone reclamation are
+/// unconditional; Ready-session and legacy idle reclamation require an enabled
+/// idle grace.
+async fn run_idle_sweep_pass(
+    manager: &ConnectionManager,
+    idle_timeout: Option<Duration>,
+    client_lease_ttl: Duration,
+) -> (usize, usize) {
+    manager
+        .shared_session_broker()
+        .expire_leases(tokio::time::Instant::now())
+        .await;
+    let shared = manager
+        .sweep_shared_sessions(idle_timeout, client_lease_ttl)
+        .await;
+    let legacy = match idle_timeout {
+        Some(idle_timeout) => manager.sweep_idle(idle_timeout).await,
+        None => 0,
+    };
+    (shared.removed_count, legacy)
+}
+
+/// Long-running task that runs shared and legacy maintenance on a fixed
+/// interval. The caller spawns the returned future onto whichever
 /// runtime they manage (`tokio::spawn` from inside an async context,
 /// `tauri::async_runtime::spawn` from a Tauri `setup` callback that runs
 /// outside the runtime).
@@ -66,10 +89,10 @@ pub fn client_lease_ttl_from_env(idle_timeout: Option<Duration>) -> Duration {
 /// shutting down (process exit cleans up everything).
 pub async fn idle_sweep_task(
     manager: ConnectionManager,
-    idle_timeout: Duration,
+    idle_timeout: Option<Duration>,
     interval: Duration,
 ) {
-    let client_lease_ttl = client_lease_ttl_from_env(Some(idle_timeout));
+    let client_lease_ttl = client_lease_ttl_from_env(idle_timeout);
     manager.configure_shared_client_lease_ttl(client_lease_ttl);
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -78,18 +101,11 @@ pub async fn idle_sweep_task(
     ticker.tick().await;
     loop {
         ticker.tick().await;
-        manager
-            .shared_session_broker()
-            .expire_leases(tokio::time::Instant::now())
-            .await;
-        let shared = manager
-            .sweep_shared_sessions(idle_timeout, client_lease_ttl)
-            .await;
-        let legacy = manager.sweep_idle(idle_timeout).await;
-        if shared.removed_count > 0 || legacy > 0 {
+        let (shared, legacy) = run_idle_sweep_pass(&manager, idle_timeout, client_lease_ttl).await;
+        if shared > 0 || legacy > 0 {
             tracing::info!(
                 "[ACP] idle sweep reclaimed {} shared and {} legacy connection(s)",
-                shared.removed_count,
+                shared,
                 legacy
             );
         }
@@ -99,6 +115,38 @@ pub async fn idle_sweep_task(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        acp::{
+            session_attach::SessionAttachMode,
+            shared_session::{
+                SharedLaunchIdentity, SharedMutationGuard, SharedReserveRequest, SharedSessionKey,
+            },
+        },
+        auto_title::ConnectionPurpose,
+        models::agent::AgentType,
+    };
+
+    fn shared_request(conversation_id: i32, connection_id: &str) -> SharedReserveRequest {
+        SharedReserveRequest {
+            key: SharedSessionKey::Conversation(conversation_id),
+            connection_id: connection_id.into(),
+            launch_identity: SharedLaunchIdentity {
+                agent_type: AgentType::Codex,
+                working_dir_fingerprint: "idle-sweep-cwd".into(),
+                external_session_id: None,
+                attach_mode: SessionAttachMode::Default,
+                route_fingerprint: "idle-sweep-route".into(),
+                terminal_shell_fingerprint: "idle-sweep-shell".into(),
+                purpose: ConnectionPurpose::User,
+            },
+            client_instance_id: format!("idle-sweep-client-{conversation_id}"),
+            device_id: "idle-sweep-device".into(),
+            request_id: format!("idle-sweep-request-{conversation_id}"),
+            retry_failed_generation: None,
+            now: tokio::time::Instant::now(),
+            now_utc: chrono::Utc::now(),
+        }
+    }
 
     /// Single test sequences all env-var assertions to avoid the
     /// notorious parallel-test race on shared environment state. Cargo runs
@@ -150,5 +198,77 @@ mod tests {
             DEFAULT_CLIENT_LEASE_TTL_SECS
         );
         std::env::remove_var("CODEG_ACP_CLIENT_LEASE_TTL_SECS");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn disabled_idle_grace_still_expires_leases_and_reaps_failed_tombstones() {
+        let manager = ConnectionManager::new();
+        let broker = manager.shared_session_broker();
+
+        let failed = broker
+            .reserve_or_attach(shared_request(9_001, "disabled-idle-failed"))
+            .await
+            .unwrap()
+            .attachment;
+        broker
+            .mark_failed(
+                &failed.connection_id,
+                failed.generation,
+                "session_unavailable",
+                true,
+            )
+            .await
+            .unwrap();
+
+        let ready = broker
+            .reserve_or_attach(shared_request(9_002, "disabled-idle-ready"))
+            .await
+            .unwrap()
+            .attachment;
+        manager
+            .install_test_shared_connection(&ready, Some(9_002))
+            .await
+            .unwrap();
+        broker
+            .mark_ready(&ready.connection_id, ready.generation, "test-driver-1")
+            .await
+            .unwrap();
+        broker
+            .release_lease(&SharedMutationGuard {
+                connection_id: ready.connection_id.clone(),
+                generation: ready.generation,
+                lease_id: ready.lease_id,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            run_idle_sweep_pass(&manager, None, Duration::from_secs(90)).await,
+            (0, 0)
+        );
+        tokio::time::advance(Duration::from_secs(90)).await;
+        assert_eq!(
+            run_idle_sweep_pass(&manager, None, Duration::from_secs(90)).await,
+            (0, 0)
+        );
+        tokio::time::advance(Duration::from_secs(90)).await;
+        assert_eq!(
+            run_idle_sweep_pass(&manager, None, Duration::from_secs(90)).await,
+            (1, 0)
+        );
+        assert!(broker
+            .diagnostic_for_connection(&failed.connection_id)
+            .await
+            .is_none());
+
+        tokio::time::advance(Duration::from_secs(900)).await;
+        assert_eq!(
+            run_idle_sweep_pass(&manager, None, Duration::from_secs(90)).await,
+            (0, 0)
+        );
+        assert!(broker
+            .diagnostic_for_connection(&ready.connection_id)
+            .await
+            .is_some());
     }
 }

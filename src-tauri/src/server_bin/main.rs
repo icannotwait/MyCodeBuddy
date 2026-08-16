@@ -606,15 +606,14 @@ async fn async_main() -> ExitCode {
 
     // Spawn the idle sweep so connections abandoned without an explicit
     // disconnect (e.g. browser tab closed, panic survivors) are reaped.
-    // Override the 60-second default via `CODEG_ACP_IDLE_TIMEOUT_SECS`
-    // (set to `0` to disable).
-    if let Some(idle_timeout) = codeg_lib::idle_timeout_from_env() {
-        tokio::spawn(codeg_lib::idle_sweep_task(
-            state.connection_manager.clone_ref(),
-            idle_timeout,
-            std::time::Duration::from_secs(codeg_lib::SWEEP_INTERVAL_SECS),
-        ));
-    }
+    // Override the 15-minute default via `CODEG_ACP_IDLE_TIMEOUT_SECS`.
+    // Zero disables Ready/legacy idle reclaim while lease and failed-record
+    // maintenance continue.
+    tokio::spawn(codeg_lib::idle_sweep_task(
+        state.connection_manager.clone_ref(),
+        codeg_lib::idle_timeout_from_env(),
+        std::time::Duration::from_secs(codeg_lib::SWEEP_INTERVAL_SECS),
+    ));
 
     // Office watch preview servers: reap dead children + ref0 stragglers.
     if let Some(idle_timeout) = codeg_lib::office_watch::idle_timeout_from_env() {

@@ -165,6 +165,7 @@ impl SharedIdleBlockers {
 /// both execute the same generation-fenced removal.
 pub struct SharedHostWorkPermit {
     broker_index: Weak<Mutex<SharedSessionIndex>>,
+    runtime: tokio::runtime::Handle,
     identity: Option<(String, u64, uuid::Uuid)>,
 }
 
@@ -265,6 +266,7 @@ impl SharedSessionBroker {
         notify.notify_one();
         Ok(SharedHostWorkPermit {
             broker_index: Arc::downgrade(&self.index),
+            runtime: tokio::runtime::Handle::current(),
             identity: Some((connection_id.to_string(), generation, permit_id)),
         })
     }
@@ -288,7 +290,7 @@ impl SharedSessionBroker {
 
     pub(crate) async fn evaluate_idle(
         &self,
-        idle_grace: Duration,
+        idle_grace: Option<Duration>,
         failed_grace: Duration,
     ) -> Vec<SharedSweepCandidate> {
         let records: Vec<_> = self.index.lock().await.sessions.values().cloned().collect();
@@ -300,6 +302,10 @@ impl SharedSessionBroker {
             match current.phase {
                 SharedSessionPhase::Ready => {
                     current.failed_zero_since = None;
+                    let Some(idle_grace) = idle_grace else {
+                        current.idle_zero_since = None;
+                        continue;
+                    };
                     let Some(state) = current.state.clone() else {
                         current.idle_zero_since = None;
                         continue;
@@ -2732,17 +2738,39 @@ impl Drop for SharedHostWorkPermit {
             );
             return;
         };
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            tracing::debug!(
-                "[ACP] shared host-work drop without runtime connection={} generation={}",
-                connection_id,
-                generation
-            );
-            return;
+        let shutdown_fallback = HostWorkShutdownFallback {
+            connection_id: connection_id.clone(),
+            generation,
+            completed: false,
         };
-        runtime.spawn(async move {
+        self.runtime.spawn(async move {
             release_host_work(index, (connection_id, generation, permit_id)).await;
+            shutdown_fallback.complete();
         });
+    }
+}
+
+struct HostWorkShutdownFallback {
+    connection_id: String,
+    generation: u64,
+    completed: bool,
+}
+
+impl HostWorkShutdownFallback {
+    fn complete(mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for HostWorkShutdownFallback {
+    fn drop(&mut self) {
+        if !self.completed {
+            tracing::debug!(
+                "[ACP] shared host-work release dropped during runtime shutdown connection={} generation={}",
+                self.connection_id,
+                self.generation
+            );
+        }
     }
 }
 

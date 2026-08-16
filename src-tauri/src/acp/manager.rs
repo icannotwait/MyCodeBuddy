@@ -3535,7 +3535,7 @@ impl ConnectionManager {
 
     pub async fn sweep_shared_sessions(
         &self,
-        idle_timeout: Duration,
+        idle_timeout: Option<Duration>,
         client_lease_ttl: Duration,
     ) -> SharedSweepReport {
         let candidates = self
@@ -3556,6 +3556,9 @@ impl ConnectionManager {
                     }
                 }
                 SharedSweepCandidateKind::Ready => {
+                    let Some(idle_timeout) = idle_timeout else {
+                        continue;
+                    };
                     let Some(transition) = self
                         .shared_session_broker
                         .begin_idle_reclaim(candidate, idle_timeout)
