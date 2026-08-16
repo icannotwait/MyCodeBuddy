@@ -20,6 +20,8 @@ import type { FolderThemeColor } from "./theme-presets"
 import type { FollowUpIntent } from "./task-follow-up"
 import type {
   AgentType,
+  AcpConnectOrAttachRequest,
+  AcpConnectOrAttachResponse,
   AcpPromptContext,
   AgentDelegationDefaults,
   CancelReferenceSearchRequest,
@@ -176,6 +178,9 @@ import type {
   TokenUsageReport,
   TokenUsageSyncResult,
   TokenUsageSyncStatus,
+  PromptEnqueueResult,
+  SharedMutationContext,
+  SharedPromptAdmission,
 } from "./types"
 
 export async function listConversations(params?: {
@@ -243,6 +248,24 @@ export async function acpConnect(
   })
 }
 
+export async function acpConnectOrAttach(
+  request: AcpConnectOrAttachRequest
+): Promise<AcpConnectOrAttachResponse> {
+  return getTransport().call("acp_connect_or_attach", {
+    conversationId: request.conversationId ?? null,
+    agentType: request.agentType,
+    workingDir: request.workingDir ?? null,
+    externalSessionId: request.externalSessionId ?? null,
+    delegationRouteOverride: request.delegationRouteOverride ?? null,
+    preferredModeId: request.preferredModeId ?? null,
+    preferredConfigValues: request.preferredConfigValues ?? {},
+    deviceId: request.deviceId,
+    clientInstanceId: request.clientInstanceId,
+    requestId: request.requestId,
+    retryFailedGeneration: request.retryFailedGeneration ?? null,
+  })
+}
+
 /**
  * Drop inline image bytes from blocks whose bytes already live server-side.
  *
@@ -295,28 +318,78 @@ export async function acpPrompt(
   folderId: number | null = null,
   conversationId: number | null = null,
   clientMessageId: string | null = null,
-  context: AcpPromptContext = { visibleText: null, locale: null }
-): Promise<void> {
+  context: AcpPromptContext = { visibleText: null, locale: null },
+  shared?: SharedPromptAdmission
+): Promise<PromptEnqueueResult | null> {
   try {
-    await getTransport().call("acp_prompt", {
-      connectionId,
-      // Strip in every mode where the prompt leaves through an HTTP body:
-      // pure web (`!isDesktop`) and desktop-attached-to-remote-workspace.
-      blocks: stripUploadedImagePayloads(
-        blocks,
-        !isDesktop() || getActiveRemoteConnectionId() !== null
-      ),
-      folderId,
-      conversationId,
-      clientMessageId,
-      visibleText: context.visibleText,
-      locale: context.locale,
-    })
+    const result = await getTransport().call<PromptEnqueueResult | null>(
+      "acp_prompt",
+      {
+        connectionId,
+        // Strip in every mode where the prompt leaves through an HTTP body:
+        // pure web (`!isDesktop`) and desktop-attached-to-remote-workspace.
+        blocks: stripUploadedImagePayloads(
+          blocks,
+          !isDesktop() || getActiveRemoteConnectionId() !== null
+        ),
+        folderId,
+        conversationId,
+        clientMessageId,
+        visibleText: context.visibleText,
+        locale: context.locale,
+        ...(shared
+          ? {
+              generation: shared.generation,
+              leaseId: shared.leaseId,
+              clientInstanceId: shared.clientInstanceId,
+              clientRequestId: shared.clientRequestId,
+            }
+          : {}),
+      }
+    )
+    return result ?? null
   } catch (e) {
-    if (isContinuationWaitingRejection(e)) throw continuationWaitingError(e)
-    if (isTurnInProgressRejection(e)) throw new TurnBusyError()
+    if (!shared) {
+      if (isContinuationWaitingRejection(e)) throw continuationWaitingError(e)
+      if (isTurnInProgressRejection(e)) throw new TurnBusyError()
+    }
     throw e
   }
+}
+
+export async function acpReleaseLease(
+  connectionId: string,
+  generation: number,
+  leaseId: string
+): Promise<void> {
+  return getTransport().call("acp_release_lease", {
+    connectionId,
+    generation,
+    leaseId,
+  })
+}
+
+export async function acpCancelQueuedPrompt(
+  connectionId: string,
+  queueItemId: string,
+  shared: SharedMutationContext
+): Promise<void> {
+  return getTransport().call("acp_cancel_queued_prompt", {
+    connectionId,
+    queueItemId,
+    generation: shared.generation,
+    leaseId: shared.leaseId,
+  })
+}
+
+export async function acpTerminateSharedSession(
+  connectionId: string,
+  generation: number
+): Promise<void> {
+  return getTransport().call("acp_terminate_shared_session", {
+    connectionId,
+    generation,
+  })
 }
 
 export async function acpSetMode(
@@ -348,8 +421,20 @@ export async function acpGoalControl(
   return getTransport().call("acp_goal_control", { connectionId, action })
 }
 
-export async function acpCancel(connectionId: string): Promise<void> {
-  return getTransport().call("acp_cancel", { connectionId })
+export async function acpCancel(
+  connectionId: string,
+  shared?: SharedMutationContext & { turnId: string }
+): Promise<void> {
+  return getTransport().call("acp_cancel", {
+    connectionId,
+    ...(shared
+      ? {
+          generation: shared.generation,
+          leaseId: shared.leaseId,
+          turnId: shared.turnId,
+        }
+      : {}),
+  })
 }
 
 // ─── Tool-execution watchdog settings + lease controls ─────────────────
@@ -448,12 +533,16 @@ export async function acpFork(
 export async function acpRespondPermission(
   connectionId: string,
   requestId: string,
-  optionId: string
+  optionId: string,
+  shared?: SharedMutationContext
 ): Promise<void> {
   return getTransport().call("acp_respond_permission", {
     connectionId,
     requestId,
     optionId,
+    ...(shared
+      ? { generation: shared.generation, leaseId: shared.leaseId }
+      : {}),
   })
 }
 
@@ -466,12 +555,16 @@ export async function acpRespondPermission(
 export async function acpAnswerQuestion(
   connectionId: string,
   questionId: string,
-  answer: QuestionAnswer
+  answer: QuestionAnswer,
+  shared?: SharedMutationContext
 ): Promise<void> {
   return getTransport().call("acp_answer_question", {
     connectionId,
     questionId,
     answer,
+    ...(shared
+      ? { generation: shared.generation, leaseId: shared.leaseId }
+      : {}),
   })
 }
 
@@ -505,12 +598,16 @@ export type AcpDisconnectLease = {
 export async function acpAnswerPlanApproval(
   connectionId: string,
   approvalId: string,
-  answer: PlanApprovalAnswer
+  answer: PlanApprovalAnswer,
+  shared?: SharedMutationContext
 ): Promise<void> {
   return getTransport().call("acp_answer_plan_approval", {
     connectionId,
     approvalId,
     answer,
+    ...(shared
+      ? { generation: shared.generation, leaseId: shared.leaseId }
+      : {}),
   })
 }
 

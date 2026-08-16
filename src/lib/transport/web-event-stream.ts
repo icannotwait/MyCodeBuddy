@@ -71,12 +71,15 @@ interface ActiveSub {
   lastAppliedSeq: number | undefined
   /** `cold` always omits the wire cursor after WS reconnect. */
   reconnectMode: "resume" | "cold"
+  shared: { generation: number; leaseId: string } | undefined
   handlers: AttachHandlers
 }
 
 export class WebEventStream implements EventStream {
   private subs = new Map<string, ActiveSub>()
   private unbindWsReady: (() => void) | null
+  private sharedHeartbeat: ReturnType<typeof setInterval> | null = null
+  private destroyed = false
 
   constructor(private host: AttachTransportHost) {
     // Re-attach all live subscriptions on every WS-ready transition. On
@@ -96,6 +99,7 @@ export class WebEventStream implements EventStream {
       connectionId,
       lastAppliedSeq: options.sinceSeq,
       reconnectMode: options.reconnectMode ?? "resume",
+      shared: options.shared ? { ...options.shared } : undefined,
       handlers,
     })
     // If the WS is already open, send the attach frame immediately;
@@ -103,6 +107,7 @@ export class WebEventStream implements EventStream {
     if (this.host.isWsOpen()) {
       this.sendAttach(subscriptionId)
     }
+    this.syncSharedHeartbeat()
     return {
       subscriptionId,
       detach: () => this.detach(subscriptionId),
@@ -149,15 +154,18 @@ export class WebEventStream implements EventStream {
         // calling the user handler so any synchronous re-attach inside the
         // handler observes a clean slate (new subId, no leftover entry).
         this.subs.delete(frame.subscription_id)
+        this.syncSharedHeartbeat()
         safeInvoke("onDetached", () => sub.handlers.onDetached(frame.reason))
         break
     }
   }
 
   destroy(): void {
+    this.destroyed = true
     this.unbindWsReady?.()
     this.unbindWsReady = null
     this.subs.clear()
+    this.syncSharedHeartbeat()
     // Do NOT send detach frames here — destroy() is called when the
     // transport is going away (logout, remote-workspace switch), so the
     // WS will close anyway and the server cleans up subscribers on close.
@@ -175,6 +183,7 @@ export class WebEventStream implements EventStream {
         subscription_id: subscriptionId,
       })
     }
+    this.syncSharedHeartbeat()
   }
 
   private sendAttach(subscriptionId: string): void {
@@ -185,12 +194,33 @@ export class WebEventStream implements EventStream {
       subscription_id: subscriptionId,
       connection_id: sub.connectionId,
       since_seq: sub.reconnectMode === "cold" ? undefined : sub.lastAppliedSeq,
+      ...(sub.shared
+        ? {
+            generation: sub.shared.generation,
+            lease_id: sub.shared.leaseId,
+          }
+        : {}),
     })
   }
 
   private reattachAll(): void {
     for (const subscriptionId of this.subs.keys()) {
       this.sendAttach(subscriptionId)
+    }
+  }
+
+  private syncSharedHeartbeat(): void {
+    const needsHeartbeat =
+      !this.destroyed && [...this.subs.values()].some((sub) => sub.shared)
+    if (needsHeartbeat && this.sharedHeartbeat === null) {
+      this.sharedHeartbeat = setInterval(() => {
+        if (this.host.isWsOpen()) {
+          this.host.sendFrame({ action: "ping" })
+        }
+      }, 30_000)
+    } else if (!needsHeartbeat && this.sharedHeartbeat !== null) {
+      clearInterval(this.sharedHeartbeat)
+      this.sharedHeartbeat = null
     }
   }
 }

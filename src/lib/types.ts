@@ -2276,6 +2276,53 @@ export type SharedSessionPhase =
   | { phase: "failed"; error_code: string; cleanup_complete: boolean }
   | { phase: "closing" }
 
+export interface SharedMutationContext {
+  generation: number
+  leaseId: string
+}
+
+export interface SharedPromptAdmission extends SharedMutationContext {
+  clientInstanceId: string
+  clientRequestId: string
+}
+
+export type SharedPublicPhase = "bootstrapping" | "ready" | "failed" | "closing"
+
+export type PromptEnqueueResult = {
+  queueItemId: string
+  enqueueSeq: number
+  state: "queued" | "dispatching"
+}
+
+export interface AcpConnectOrAttachRequest {
+  conversationId?: number | null
+  agentType: AgentType
+  workingDir?: string | null
+  externalSessionId?: string | null
+  delegationRouteOverride?: DelegationRoutePolicy | null
+  preferredModeId?: string | null
+  preferredConfigValues?: Record<string, string> | null
+  deviceId: string
+  clientInstanceId: string
+  requestId: string
+  retryFailedGeneration?: number | null
+}
+
+export interface AcpConnectOrAttachResponse {
+  connectionId: string
+  generation: number
+  leaseId: string
+  leaseExpiresAt: string
+  disposition: "created" | "attached"
+  phase: SharedPublicPhase
+  eventSeq: number
+  error?: {
+    code: string
+    retryable: boolean
+    cleanupComplete: boolean
+  } | null
+}
+
 export type SharedQueuedPromptState = "queued" | "dispatching"
 
 export interface SharedQueuedPromptSummary {

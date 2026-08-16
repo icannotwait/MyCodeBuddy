@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import type { LiveSessionSnapshot } from "@/lib/types"
 import { WebEventStream, type AttachTransportHost } from "./web-event-stream"
 
@@ -26,9 +26,10 @@ function snapshot(eventSeq: number): LiveSessionSnapshot {
 
 function hostFixture() {
   let ready: (() => void) | null = null
+  let wsOpen = true
   const sendFrame = vi.fn(() => true)
   const host: AttachTransportHost = {
-    isWsOpen: () => true,
+    isWsOpen: () => wsOpen,
     sendFrame,
     onWsReady: (callback) => {
       ready = callback
@@ -37,7 +38,14 @@ function hostFixture() {
       }
     },
   }
-  return { host, sendFrame, reconnect: () => ready?.() }
+  return {
+    host,
+    sendFrame,
+    reconnect: () => ready?.(),
+    setOpen: (open: boolean) => {
+      wsOpen = open
+    },
+  }
 }
 
 const handlers = {
@@ -49,6 +57,7 @@ const handlers = {
 
 describe("WebEventStream reconnect mode", () => {
   beforeEach(() => vi.clearAllMocks())
+  afterEach(() => vi.useRealTimers())
 
   it("resumes an ordinary subscription from its last applied seq", () => {
     const f = hostFixture()
@@ -82,5 +91,141 @@ describe("WebEventStream reconnect mode", () => {
     expect(f.sendFrame).toHaveBeenCalledWith(
       expect.objectContaining({ action: "attach", since_seq: undefined })
     )
+  })
+
+  it("reattaches with the same generation and lease", () => {
+    const f = hostFixture()
+    const stream = new WebEventStream(f.host)
+    stream.attach(
+      "conn",
+      { shared: { generation: 4, leaseId: "lease-4" } },
+      handlers
+    )
+
+    expect(f.sendFrame).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        action: "attach",
+        connection_id: "conn",
+        generation: 4,
+        lease_id: "lease-4",
+      })
+    )
+
+    f.sendFrame.mockClear()
+    f.reconnect()
+
+    expect(f.sendFrame).toHaveBeenCalledWith(
+      expect.objectContaining({ generation: 4, lease_id: "lease-4" })
+    )
+  })
+
+  it("pings every 30 seconds only while a shared subscription exists", () => {
+    vi.useFakeTimers()
+    const f = hostFixture()
+    const stream = new WebEventStream(f.host)
+    const first = stream.attach(
+      "conn",
+      { shared: { generation: 4, leaseId: "lease-4" } },
+      handlers
+    )
+    f.sendFrame.mockClear()
+
+    vi.advanceTimersByTime(29_999)
+    expect(f.sendFrame).not.toHaveBeenCalledWith({ action: "ping" })
+    vi.advanceTimersByTime(1)
+    expect(f.sendFrame).toHaveBeenCalledWith({ action: "ping" })
+
+    f.sendFrame.mockClear()
+    first.detach()
+    f.sendFrame.mockClear()
+    vi.advanceTimersByTime(60_000)
+    expect(f.sendFrame).not.toHaveBeenCalledWith({ action: "ping" })
+
+    stream.destroy()
+  })
+
+  it("keeps exactly one heartbeat across shared subscription lifecycle", () => {
+    vi.useFakeTimers()
+    const f = hostFixture()
+    const stream = new WebEventStream(f.host)
+    const first = stream.attach(
+      "first",
+      { shared: { generation: 4, leaseId: "lease-4" } },
+      handlers
+    )
+    const second = stream.attach(
+      "second",
+      { shared: { generation: 5, leaseId: "lease-5" } },
+      handlers
+    )
+    f.sendFrame.mockClear()
+
+    vi.advanceTimersByTime(30_000)
+    expect(f.sendFrame).toHaveBeenCalledTimes(1)
+    expect(f.sendFrame).toHaveBeenCalledWith({ action: "ping" })
+
+    first.detach()
+    f.sendFrame.mockClear()
+    f.reconnect()
+    f.sendFrame.mockClear()
+    vi.advanceTimersByTime(30_000)
+    expect(f.sendFrame).toHaveBeenCalledTimes(1)
+    expect(f.sendFrame).toHaveBeenCalledWith({ action: "ping" })
+
+    f.setOpen(false)
+    f.sendFrame.mockClear()
+    vi.advanceTimersByTime(30_000)
+    expect(f.sendFrame).not.toHaveBeenCalled()
+    f.setOpen(true)
+
+    second.detach()
+    f.sendFrame.mockClear()
+    vi.advanceTimersByTime(60_000)
+    expect(f.sendFrame).not.toHaveBeenCalledWith({ action: "ping" })
+
+    const destroyFixture = hostFixture()
+    const destroyStream = new WebEventStream(destroyFixture.host)
+    destroyStream.attach(
+      "destroyed",
+      { shared: { generation: 6, leaseId: "lease-6" } },
+      handlers
+    )
+    destroyFixture.sendFrame.mockClear()
+    destroyStream.destroy()
+    vi.advanceTimersByTime(60_000)
+    expect(destroyFixture.sendFrame).not.toHaveBeenCalled()
+
+    const legacyFixture = hostFixture()
+    const legacyStream = new WebEventStream(legacyFixture.host)
+    legacyStream.attach("legacy", {}, handlers)
+    legacyFixture.sendFrame.mockClear()
+    vi.advanceTimersByTime(60_000)
+    expect(legacyFixture.sendFrame).not.toHaveBeenCalled()
+    legacyStream.destroy()
+    stream.destroy()
+  })
+
+  it("treats a lease-expired server detach as terminal", () => {
+    vi.useFakeTimers()
+    const f = hostFixture()
+    const stream = new WebEventStream(f.host)
+    const sub = stream.attach(
+      "conn",
+      { shared: { generation: 4, leaseId: "lease-4" } },
+      handlers
+    )
+    f.sendFrame.mockClear()
+
+    stream.handleServerFrame({
+      type: "detached",
+      subscription_id: sub.subscriptionId,
+      reason: "lease_expired",
+    })
+    f.reconnect()
+    vi.advanceTimersByTime(60_000)
+
+    expect(handlers.onDetached).toHaveBeenCalledWith("lease_expired")
+    expect(f.sendFrame).not.toHaveBeenCalled()
+    stream.destroy()
   })
 })
