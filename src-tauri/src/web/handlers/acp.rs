@@ -9,8 +9,8 @@ use crate::acp::opencode_plugins::PluginCheckSummary;
 use crate::acp::preflight::PreflightResult;
 use crate::acp::shared_session::{
     PromptEnqueueResult, SharedDisposition, SharedInteractionRequest, SharedLaunchIdentity,
-    SharedMutationGuard, SharedPromptRequest, SharedSessionBroker, SharedSessionError,
-    SharedSessionKey, SharedSessionPhase, SharedStopRequest,
+    SharedMutationGuard, SharedPromptRequest, SharedRouteCapability, SharedSessionBroker,
+    SharedSessionError, SharedSessionKey, SharedSessionPhase, SharedStopRequest,
 };
 use crate::acp::termination::AcpDisconnectOrigin;
 use crate::acp::types::{
@@ -281,7 +281,11 @@ async fn resolve_shared_connect_target(
             .map_err(|error| map_acp_error(error.into()))?;
     }
 
-    if let Some(conversation_id) = params.conversation_id.filter(|id| *id > 0) {
+    if params.conversation_id.is_some_and(|id| id <= 0) {
+        return Err(invalid_shared_field("conversation_id"));
+    }
+
+    if let Some(conversation_id) = params.conversation_id {
         let conversation =
             crate::db::service::conversation_service::get_by_id(&state.db.conn, conversation_id)
                 .await
@@ -432,6 +436,7 @@ pub async fn acp_connect_or_attach(
         external_session_id: target.external_session_id.clone(),
         attach_mode: crate::acp::session_attach::SessionAttachMode::Default,
         route_fingerprint: launch_inputs.route_plan.fingerprint.clone(),
+        route_capability: SharedRouteCapability::from_route_plan(&launch_inputs.route_plan),
         terminal_shell_fingerprint: crate::terminal::shell::terminal_shell_selection_key(
             &launch_inputs.terminal_settings,
         ),
@@ -1003,6 +1008,23 @@ fn shared_mutation_guard(
     })
 }
 
+async fn validate_shared_mutation_if_managed(
+    manager: &crate::acp::manager::ConnectionManager,
+    connection_id: &str,
+    generation: Option<u64>,
+    lease_id: Option<String>,
+) -> Result<(), AppCommandError> {
+    if !manager.is_broker_managed_connection(connection_id).await {
+        return Ok(());
+    }
+    let guard = shared_mutation_guard(connection_id, generation, lease_id)?;
+    manager
+        .shared_session_broker()
+        .validate_guard(&guard)
+        .await
+        .map_err(|error| map_acp_error(error.into()))
+}
+
 fn map_acp_error(error: crate::acp::error::AcpError) -> AppCommandError {
     error
         .app_command_error()
@@ -1047,6 +1069,10 @@ pub struct AcpForkParams {
 pub struct AcpSetModeParams {
     pub connection_id: String,
     pub mode_id: String,
+    #[serde(default)]
+    pub generation: Option<u64>,
+    #[serde(default)]
+    pub lease_id: Option<String>,
 }
 
 pub async fn acp_set_mode(
@@ -1065,6 +1091,13 @@ pub async fn acp_set_mode(
             .unwrap_or_else(|| AppCommandError::task_execution_failed(error.to_string()))
     })?;
     let manager = &state.connection_manager;
+    validate_shared_mutation_if_managed(
+        manager,
+        &params.connection_id,
+        params.generation,
+        params.lease_id,
+    )
+    .await?;
     manager
         .set_mode(&params.connection_id, params.mode_id)
         .await
@@ -1082,6 +1115,10 @@ pub struct AcpSetConfigOptionParams {
     pub connection_id: String,
     pub config_id: String,
     pub value_id: String,
+    #[serde(default)]
+    pub generation: Option<u64>,
+    #[serde(default)]
+    pub lease_id: Option<String>,
 }
 
 pub async fn acp_set_config_option(
@@ -1100,6 +1137,13 @@ pub async fn acp_set_config_option(
             .unwrap_or_else(|| AppCommandError::task_execution_failed(error.to_string()))
     })?;
     let manager = &state.connection_manager;
+    validate_shared_mutation_if_managed(
+        manager,
+        &params.connection_id,
+        params.generation,
+        params.lease_id,
+    )
+    .await?;
     manager
         .set_config_option(&params.connection_id, params.config_id, params.value_id)
         .await
@@ -1116,6 +1160,10 @@ pub async fn acp_set_config_option(
 pub struct AcpGoalControlParams {
     pub connection_id: String,
     pub action: crate::acp::connection::GoalControlAction,
+    #[serde(default)]
+    pub generation: Option<u64>,
+    #[serde(default)]
+    pub lease_id: Option<String>,
 }
 
 pub async fn acp_goal_control(
@@ -1123,6 +1171,13 @@ pub async fn acp_goal_control(
     Json(params): Json<AcpGoalControlParams>,
 ) -> Result<Json<()>, AppCommandError> {
     let manager = &state.connection_manager;
+    validate_shared_mutation_if_managed(
+        manager,
+        &params.connection_id,
+        params.generation,
+        params.lease_id,
+    )
+    .await?;
     manager
         .goal_control(&params.connection_id, params.action)
         .await
@@ -1214,6 +1269,14 @@ pub async fn acp_fork(
             .unwrap_or_else(|| AppCommandError::task_execution_failed(error.to_string()))
     })?;
     let manager = &state.connection_manager;
+    if manager
+        .is_broker_managed_connection(&params.connection_id)
+        .await
+    {
+        return Err(map_acp_error(crate::acp::error::AcpError::Shared(
+            SharedSessionError::ProtocolRequired,
+        )));
+    }
     let result = manager
         .fork_session(
             &state.db,
@@ -2209,6 +2272,7 @@ mod tests {
                     external_session_id: None,
                     attach_mode: SessionAttachMode::Default,
                     route_fingerprint: "handler-owner-route".into(),
+                    route_capability: SharedRouteCapability::Standard,
                     terminal_shell_fingerprint: "handler-owner-shell".into(),
                     purpose,
                 },

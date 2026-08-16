@@ -21,9 +21,12 @@ import {
   acpCancel,
   acpCancelQueuedPrompt,
   acpConnectOrAttach,
+  acpGoalControl,
   acpPrompt,
   acpReleaseLease,
   acpRespondPermission,
+  acpSetConfigOption,
+  acpSetMode,
   acpTerminateSharedSession,
   cancelReferenceSearch,
   cancelToolWatchdogLease,
@@ -475,6 +478,60 @@ describe("shared ACP transport payloads", () => {
         leaseId: "lease-7",
       }
     )
+  })
+
+  it("adds optional fencing to mode, configuration, and goal mutations", async () => {
+    await acpSetMode("connection-7", "plan", shared)
+    await acpSetConfigOption("connection-7", "model", "gpt-5", shared)
+    await acpGoalControl("connection-7", "pause", shared)
+
+    expect(mockTransport.call).toHaveBeenNthCalledWith(1, "acp_set_mode", {
+      connectionId: "connection-7",
+      modeId: "plan",
+      generation: 7,
+      leaseId: "lease-7",
+    })
+    expect(mockTransport.call).toHaveBeenNthCalledWith(
+      2,
+      "acp_set_config_option",
+      {
+        connectionId: "connection-7",
+        configId: "model",
+        valueId: "gpt-5",
+        generation: 7,
+        leaseId: "lease-7",
+      }
+    )
+    expect(mockTransport.call).toHaveBeenNthCalledWith(3, "acp_goal_control", {
+      connectionId: "connection-7",
+      action: "pause",
+      generation: 7,
+      leaseId: "lease-7",
+    })
+  })
+
+  it("preserves unfenced legacy mode, configuration, and goal payloads", async () => {
+    await acpSetMode("legacy", "plan")
+    await acpSetConfigOption("legacy", "model", "gpt-5")
+    await acpGoalControl("legacy", "clear")
+
+    expect(mockTransport.call).toHaveBeenNthCalledWith(1, "acp_set_mode", {
+      connectionId: "legacy",
+      modeId: "plan",
+    })
+    expect(mockTransport.call).toHaveBeenNthCalledWith(
+      2,
+      "acp_set_config_option",
+      {
+        connectionId: "legacy",
+        configId: "model",
+        valueId: "gpt-5",
+      }
+    )
+    expect(mockTransport.call).toHaveBeenNthCalledWith(3, "acp_goal_control", {
+      connectionId: "legacy",
+      action: "clear",
+    })
   })
 
   it("preserves legacy stop and interaction payloads", async () => {

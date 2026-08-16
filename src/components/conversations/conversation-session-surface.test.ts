@@ -1462,6 +1462,22 @@ describe("ConversationSessionSurface authoritative shared queue", () => {
   beforeEach(resetSurfaceHarness)
   afterEach(cleanup)
 
+  it("never exposes the legacy fork action for a shared root", () => {
+    surfaceH.supportsFork = true
+    mountSharedSurface()
+
+    expect(surfaceH.shellProps?.onForkSend).toBeUndefined()
+  })
+
+  it("preserves the legacy fork action for a non-shared connected root", () => {
+    surfaceH.supportsFork = true
+    surfaceH.connStatus = "connected"
+    surfaceH.conversations = [fullSummary(42, "completed", BASELINE)]
+    renderSurface(42)
+
+    expect(surfaceH.shellProps?.onForkSend).toEqual(expect.any(Function))
+  })
+
   it("removes optimistic history when admission is queued and keeps the authoritative queue", async () => {
     const queue = [sharedQueued("q2", 2, "m2", "later")]
     lifecycleCapture.handleSend.mockImplementation(

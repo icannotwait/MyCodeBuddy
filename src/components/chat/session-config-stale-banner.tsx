@@ -47,6 +47,7 @@ export function SessionConfigStaleBanner({
     configStaleDismissed,
     isViewer,
     isDelegationChild,
+    sharedSession,
     status,
     reapplyConfig,
     dismissConfigStale,
@@ -107,33 +108,35 @@ export function SessionConfigStaleBanner({
           </div>
         </div>
         <div className="flex shrink-0 items-center gap-1 self-end @lg:self-auto">
-          <TooltipProvider>
-            <Tooltip>
-              <TooltipTrigger asChild>
-                {/* Wrapper span so the tooltip still fires while the button is
-                    disabled (disabled elements don't emit pointer events). */}
-                <span>
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    className="h-7 gap-1.5 border-amber-500/40 bg-transparent text-amber-700 hover:bg-amber-500/20 hover:text-amber-800 dark:text-amber-300 dark:hover:text-amber-200"
-                    disabled={actionDisabled}
-                    onClick={handleReconnect}
-                  >
-                    <RefreshCw
-                      className={cn("h-3.5 w-3.5", busy && "animate-spin")}
-                    />
-                    {busy ? t("reconnecting") : t("reconnect")}
-                  </Button>
-                </span>
-              </TooltipTrigger>
-              {turnInFlight && (
-                <TooltipContent>
-                  {t("reconnectDisabledDuringTurn")}
-                </TooltipContent>
-              )}
-            </Tooltip>
-          </TooltipProvider>
+          {!sharedSession && (
+            <TooltipProvider>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  {/* Wrapper span so the tooltip still fires while the button is
+                      disabled (disabled elements don't emit pointer events). */}
+                  <span>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="h-7 gap-1.5 border-amber-500/40 bg-transparent text-amber-700 hover:bg-amber-500/20 hover:text-amber-800 dark:text-amber-300 dark:hover:text-amber-200"
+                      disabled={actionDisabled}
+                      onClick={handleReconnect}
+                    >
+                      <RefreshCw
+                        className={cn("h-3.5 w-3.5", busy && "animate-spin")}
+                      />
+                      {busy ? t("reconnecting") : t("reconnect")}
+                    </Button>
+                  </span>
+                </TooltipTrigger>
+                {turnInFlight && (
+                  <TooltipContent>
+                    {t("reconnectDisabledDuringTurn")}
+                  </TooltipContent>
+                )}
+              </Tooltip>
+            </TooltipProvider>
+          )}
           <Button
             size="icon"
             variant="ghost"

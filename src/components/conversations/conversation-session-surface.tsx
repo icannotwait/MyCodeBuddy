@@ -2532,6 +2532,7 @@ export const ConversationSessionSurface = memo(
         onCancelQueueEdit={handleQueueCancelEdit}
         onForkSend={
           !interactionLocked &&
+          !conn.sharedSession &&
           connStatus === "connected" &&
           hasPersistedConversation &&
           conn.supportsFork &&

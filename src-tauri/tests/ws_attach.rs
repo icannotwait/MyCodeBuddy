@@ -14,7 +14,8 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use codeg_lib::acp::session_attach::SessionAttachMode;
 use codeg_lib::acp::shared_session::{
     SharedActiveTurnProjection, SharedLaunchIdentity, SharedQueuedPromptState,
-    SharedQueuedPromptSummary, SharedReserveRequest, SharedSessionAttachment, SharedSessionKey,
+    SharedQueuedPromptSummary, SharedReserveRequest, SharedRouteCapability,
+    SharedSessionAttachment, SharedSessionKey,
 };
 use codeg_lib::acp::types::{AcpEvent, EventEnvelope};
 use codeg_lib::app_state::AppState;
@@ -74,6 +75,7 @@ fn shared_launch_identity() -> SharedLaunchIdentity {
         external_session_id: None,
         attach_mode: SessionAttachMode::Default,
         route_fingerprint: "ws-test-route".into(),
+        route_capability: SharedRouteCapability::Standard,
         terminal_shell_fingerprint: "ws-test-shell".into(),
         purpose: ConnectionPurpose::User,
     }

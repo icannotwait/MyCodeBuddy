@@ -14,9 +14,12 @@ const h = vi.hoisted(() => ({
   configStaleDismissed: false,
   isViewer: false,
   isDelegationChild: false,
+  sharedSession: null as { generation: number; leaseId: string } | null,
   status: "connected" as string | null,
   reapplyConfig: vi.fn(async () => true),
   dismissConfigStale: vi.fn(),
+  toastSuccess: vi.fn(),
+  toastError: vi.fn(),
 }))
 
 vi.mock("next-intl", () => ({
@@ -30,6 +33,7 @@ vi.mock("@/hooks/use-connection", () => ({
     configStaleDismissed: h.configStaleDismissed,
     isViewer: h.isViewer,
     isDelegationChild: h.isDelegationChild,
+    sharedSession: h.sharedSession,
     status: h.status,
     reapplyConfig: h.reapplyConfig,
     dismissConfigStale: h.dismissConfigStale,
@@ -38,8 +42,8 @@ vi.mock("@/hooks/use-connection", () => ({
 
 vi.mock("sonner", () => ({
   toast: {
-    success: vi.fn(),
-    error: vi.fn(),
+    success: h.toastSuccess,
+    error: h.toastError,
   },
 }))
 
@@ -50,10 +54,13 @@ describe("SessionConfigStaleBanner", () => {
     h.configStaleDismissed = false
     h.isViewer = false
     h.isDelegationChild = false
+    h.sharedSession = null
     h.status = "connected"
     h.reapplyConfig.mockClear()
     h.reapplyConfig.mockResolvedValue(true)
     h.dismissConfigStale.mockClear()
+    h.toastSuccess.mockClear()
+    h.toastError.mockClear()
   })
 
   it("renders nothing when config is not stale", () => {
@@ -93,5 +100,18 @@ describe("SessionConfigStaleBanner", () => {
     h.configStaleKind = "agent_config"
     render(<SessionConfigStaleBanner contextKey="tab-1" />)
     expect(screen.getByText("agentConfigTitle")).toBeInTheDocument()
+  })
+
+  it("keeps the shared stale banner dismissible without offering false reapply success", () => {
+    h.sharedSession = { generation: 1, leaseId: "lease-1" }
+    render(<SessionConfigStaleBanner contextKey="tab-1" />)
+
+    expect(screen.getByText("terminalShellTitle")).toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "dismiss" })).toBeInTheDocument()
+    expect(
+      screen.queryByRole("button", { name: /reconnect/i })
+    ).not.toBeInTheDocument()
+    expect(h.reapplyConfig).not.toHaveBeenCalled()
+    expect(h.toastSuccess).not.toHaveBeenCalled()
   })
 })

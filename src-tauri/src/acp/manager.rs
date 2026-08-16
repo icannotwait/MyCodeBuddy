@@ -10661,6 +10661,8 @@ mod tests {
                 external_session_id: None,
                 attach_mode: crate::acp::session_attach::SessionAttachMode::Default,
                 route_fingerprint: route_plan.fingerprint.clone(),
+                route_capability:
+                    crate::acp::shared_session::SharedRouteCapability::from_route_plan(&route_plan),
                 terminal_shell_fingerprint: crate::terminal::shell::terminal_shell_selection_key(
                     &terminal_settings,
                 ),
@@ -10751,6 +10753,8 @@ mod tests {
                 external_session_id: None,
                 attach_mode: crate::acp::session_attach::SessionAttachMode::Default,
                 route_fingerprint: route_plan.fingerprint.clone(),
+                route_capability:
+                    crate::acp::shared_session::SharedRouteCapability::from_route_plan(&route_plan),
                 terminal_shell_fingerprint: crate::terminal::shell::terminal_shell_selection_key(
                     &terminal_settings,
                 ),
@@ -10978,6 +10982,143 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(manager.shared_spawn_count_for_test(), 1);
+        assert_eq!(
+            manager
+                .shared_session_broker()
+                .diagnostic_for_connection(&response.connection_id)
+                .await
+                .unwrap()
+                .phase,
+            failed
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_required_companion_outcome_wins_a_simultaneous_terminal_status() {
+        let (driver, gate) = FakeSharedSpawnDriver::pending();
+        let manager = ConnectionManager::new_with_shared_spawn_driver(Arc::new(driver));
+        let launch = shared_launch_for_agent(
+            590,
+            9,
+            "client",
+            AgentType::Codex,
+            codeg_route_plan(DelegationRouteSource::SessionOverride),
+        )
+        .await;
+        let response = manager.connect_or_attach_shared(launch).await.unwrap();
+
+        assert!(
+            manager
+                .emit_test_shared_driver_event(
+                    &response.connection_id,
+                    AcpEvent::StatusChanged {
+                        status: ConnectionStatus::Error,
+                    },
+                )
+                .await
+        );
+        gate.send(RouteBootstrapOutcome::RouteSpecific(
+            RouteDegradedReason::CompanionInitializationFailed,
+        ))
+        .unwrap();
+
+        let expected = SharedSessionPhase::Failed {
+            error_code: "companion_initialization_failed".into(),
+            cleanup_complete: true,
+        };
+        manager
+            .wait_for_shared_phase(
+                &response.connection_id,
+                response.generation,
+                expected.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            manager
+                .shared_session_broker()
+                .diagnostic_for_connection(&response.connection_id)
+                .await
+                .unwrap()
+                .phase,
+            expected
+        );
+        assert_eq!(manager.shared_spawn_count_for_test(), 1);
+    }
+
+    #[tokio::test]
+    async fn typed_permitted_fallback_wins_a_simultaneous_terminal_status() {
+        let (driver, first_gate, start_log) = FakeSharedSpawnDriver::fallback_sequence();
+        let manager = ConnectionManager::new_with_shared_spawn_driver(Arc::new(driver));
+        let response = manager
+            .connect_or_attach_shared(shared_launch(591, "client").await)
+            .await
+            .unwrap();
+
+        assert!(
+            manager
+                .emit_test_shared_driver_event(
+                    &response.connection_id,
+                    AcpEvent::StatusChanged {
+                        status: ConnectionStatus::Disconnected,
+                    },
+                )
+                .await
+        );
+        first_gate
+            .send(RouteBootstrapOutcome::RouteSpecific(
+                RouteDegradedReason::CompanionInitializationFailed,
+            ))
+            .unwrap();
+
+        manager
+            .wait_for_shared_phase(
+                &response.connection_id,
+                response.generation,
+                SharedSessionPhase::Ready,
+            )
+            .await
+            .unwrap();
+        assert_eq!(manager.shared_spawn_count_for_test(), 2);
+        assert_eq!(start_log.lock().unwrap().as_slice(), ["start-1", "start-2"]);
+    }
+
+    #[tokio::test]
+    async fn terminal_status_after_bootstrap_is_still_classified_by_the_runtime_monitor() {
+        let (driver, gate) = FakeSharedSpawnDriver::pending();
+        let manager = ConnectionManager::new_with_shared_spawn_driver(Arc::new(driver));
+        let response = manager
+            .connect_or_attach_shared(shared_launch(592, "client").await)
+            .await
+            .unwrap();
+        gate.send(RouteBootstrapOutcome::Ready).unwrap();
+        manager
+            .wait_for_shared_phase(
+                &response.connection_id,
+                response.generation,
+                SharedSessionPhase::Ready,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            manager
+                .emit_test_shared_driver_event(
+                    &response.connection_id,
+                    AcpEvent::StatusChanged {
+                        status: ConnectionStatus::Error,
+                    },
+                )
+                .await
+        );
+        let failed = SharedSessionPhase::Failed {
+            error_code: "session_unavailable".into(),
+            cleanup_complete: true,
+        };
+        manager
+            .wait_for_shared_phase(&response.connection_id, response.generation, failed.clone())
+            .await
+            .unwrap();
         assert_eq!(
             manager
                 .shared_session_broker()
@@ -19936,6 +20077,7 @@ mod tests {
                 external_session_id: None,
                 attach_mode: SessionAttachMode::Default,
                 route_fingerprint: "shared-control-route".into(),
+                route_capability: crate::acp::shared_session::SharedRouteCapability::Standard,
                 terminal_shell_fingerprint: "shared-control-shell".into(),
                 purpose: ConnectionPurpose::User,
             },

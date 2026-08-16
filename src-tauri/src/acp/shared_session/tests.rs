@@ -8,7 +8,10 @@ mod tests {
         question::QuestionAnswer,
     };
     use sea_orm::Database;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::{
+        collections::BTreeMap,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
 
     fn request(
         key: SharedSessionKey,
@@ -142,6 +145,111 @@ mod tests {
         assert_eq!(metrics.attached_total, 0);
         assert_eq!(metrics.live_sessions, 1);
         assert_eq!(metrics.active_leases, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bootstrap_metrics_record_ready_and_secret_safe_failure_once() {
+        let ready_broker = SharedSessionBroker::default();
+        let ready = ready_broker
+            .reserve_or_attach(request(
+                SharedSessionKey::Conversation(80),
+                "bootstrap-ready",
+                "ready-client",
+                "ready-request",
+            ))
+            .await
+            .unwrap()
+            .attachment;
+        tokio::time::advance(Duration::from_millis(25)).await;
+        let ready_state = Arc::new(RwLock::new(SessionState::new(
+            ready.connection_id.clone(),
+            crate::models::agent::AgentType::Codex,
+            None,
+            "shared-server".into(),
+            Some(80),
+        )));
+        ready_broker
+            .install_registered(
+                &ready.connection_id,
+                ready.generation,
+                "ready-driver".into(),
+                ready_state,
+                EventEmitter::Noop,
+                Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            )
+            .await
+            .unwrap();
+        ready_broker
+            .mark_ready(&ready.connection_id, ready.generation, "ready-driver")
+            .await
+            .unwrap();
+        let ready_metrics = ready_broker.metrics().snapshot();
+        assert_eq!(ready_metrics.bootstrap_ready_total, 1);
+        assert_eq!(ready_metrics.bootstrap_failed_total, BTreeMap::new());
+        assert_eq!(ready_metrics.bootstrap_duration_ms_total, 25);
+        assert_eq!(ready_metrics.bootstrap_duration_samples, 1);
+
+        let failed_broker = SharedSessionBroker::default();
+        let mut failed_request = request(
+            SharedSessionKey::Conversation(81),
+            "bootstrap-failed",
+            "failed-client",
+            "failed-request",
+        );
+        failed_request.launch_identity.agent_type =
+            crate::models::agent::AgentType::custom("private-custom-agent").unwrap();
+        failed_request.launch_identity.route_capability =
+            SharedRouteCapability::RequiredCompanion;
+        failed_request.launch_identity.working_dir_fingerprint = "private-working-dir".into();
+        failed_request.launch_identity.route_fingerprint = "private-route-fingerprint".into();
+        failed_request.launch_identity.terminal_shell_fingerprint = "private-shell".into();
+        let failed = failed_broker
+            .reserve_or_attach(failed_request)
+            .await
+            .unwrap()
+            .attachment;
+        tokio::time::advance(Duration::from_millis(37)).await;
+        failed_broker
+            .mark_failed(
+                &failed.connection_id,
+                failed.generation,
+                "companion_initialization_failed",
+                true,
+            )
+            .await
+            .unwrap();
+        // A repeated terminal settlement must not create another outcome or
+        // duration sample.
+        failed_broker
+            .mark_failed(
+                &failed.connection_id,
+                failed.generation,
+                "companion_initialization_failed",
+                true,
+            )
+            .await
+            .unwrap();
+
+        let failed_metrics = failed_broker.metrics().snapshot();
+        assert_eq!(failed_metrics.bootstrap_ready_total, 0);
+        assert_eq!(
+            failed_metrics.bootstrap_failed_total,
+            BTreeMap::from([(
+                "custom|required_companion|companion_initialization_failed".to_string(),
+                1,
+            )])
+        );
+        assert_eq!(failed_metrics.bootstrap_duration_ms_total, 37);
+        assert_eq!(failed_metrics.bootstrap_duration_samples, 1);
+        let encoded = serde_json::to_string(&failed_metrics).unwrap();
+        for secret in [
+            "private-custom-agent",
+            "private-working-dir",
+            "private-route-fingerprint",
+            "private-shell",
+        ] {
+            assert!(!encoded.contains(secret));
+        }
     }
 
     #[tokio::test]
@@ -1782,6 +1890,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn broker_metrics_balance_queue_lifecycle_and_idempotent_retries() {
+        let fixture = ready_prompt_broker_fixture().await;
+        let initial = fixture.broker.metrics().snapshot();
+        assert_eq!(initial.bootstrap_ready_total, 1);
+        assert_eq!(initial.bootstrap_duration_samples, 1);
+        assert_eq!(initial.waiting_prompts, 0);
+        assert_eq!(initial.waiting_bytes, 0);
+
+        let first_request = with_fixture_guard(&fixture, prompt_request(101));
+        let first = fixture.enqueue(first_request.clone()).await.unwrap();
+        let after_first = fixture.broker.metrics().snapshot();
+        assert_eq!(after_first.enqueue_total, 1);
+        assert_eq!(after_first.waiting_prompts, 1);
+        assert!(after_first.waiting_bytes > 0);
+
+        let retried = fixture.enqueue(first_request).await.unwrap();
+        assert_eq!(retried, first);
+        let after_retry = fixture.broker.metrics().snapshot();
+        assert_eq!(after_retry.enqueue_total, after_first.enqueue_total);
+        assert_eq!(after_retry.waiting_prompts, after_first.waiting_prompts);
+        assert_eq!(after_retry.waiting_bytes, after_first.waiting_bytes);
+
+        let second = fixture
+            .enqueue(with_fixture_guard(&fixture, prompt_request(102)))
+            .await
+            .unwrap();
+        let after_second = fixture.broker.metrics().snapshot();
+        assert_eq!(after_second.enqueue_total, 2);
+        assert_eq!(after_second.waiting_prompts, 2);
+        assert!(after_second.waiting_bytes > after_first.waiting_bytes);
+
+        fixture.cancel(&second.queue_item_id).await.unwrap();
+        let after_cancel = fixture.broker.metrics().snapshot();
+        assert_eq!(after_cancel.cancel_total, 1);
+        assert_eq!(after_cancel.waiting_prompts, 1);
+        assert_eq!(after_cancel.waiting_bytes, after_first.waiting_bytes);
+
+        fixture.claim_head().await.unwrap();
+        let after_dispatch = fixture.broker.metrics().snapshot();
+        assert_eq!(after_dispatch.dispatch_total, 1);
+        assert_eq!(after_dispatch.waiting_prompts, 0);
+        assert_eq!(after_dispatch.waiting_bytes, 0);
+
+        fixture
+            .broker
+            .fail_claimed_item(
+                &fixture.attachment.connection_id,
+                fixture.attachment.generation,
+                "test-turn",
+                "session_unavailable",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture.broker.metrics().snapshot().queue_item_failed_total,
+            1
+        );
+
+        fixture
+            .enqueue(with_fixture_guard(&fixture, prompt_request(103)))
+            .await
+            .unwrap();
+        fixture
+            .enqueue(with_fixture_guard(&fixture, prompt_request(104)))
+            .await
+            .unwrap();
+        assert_eq!(fixture.broker.metrics().snapshot().waiting_prompts, 2);
+        fixture
+            .broker
+            .mark_failed(
+                &fixture.attachment.connection_id,
+                fixture.attachment.generation,
+                "session_unavailable",
+                true,
+            )
+            .await
+            .unwrap();
+        let after_fail_all = fixture.broker.metrics().snapshot();
+        assert_eq!(after_fail_all.enqueue_total, 4);
+        assert_eq!(after_fail_all.queue_item_failed_total, 3);
+        assert_eq!(after_fail_all.waiting_prompts, 0);
+        assert_eq!(after_fail_all.waiting_bytes, 0);
+        assert_eq!(after_fail_all.bootstrap_ready_total, 1);
+        assert!(after_fail_all.bootstrap_failed_total.is_empty());
+        assert_eq!(after_fail_all.bootstrap_duration_samples, 1);
+
+        let mut replacement = request(
+            SharedSessionKey::Conversation(701),
+            "prompt-replacement",
+            "replacement-client",
+            "replacement-request",
+        );
+        replacement.retry_failed_generation = Some(fixture.attachment.generation);
+        fixture.broker.reserve_or_attach(replacement).await.unwrap();
+        let after_replacement = fixture.broker.metrics().snapshot();
+        assert_eq!(after_replacement.waiting_prompts, 0);
+        assert_eq!(after_replacement.waiting_bytes, 0);
+        assert_eq!(after_replacement.live_sessions, 1);
+        assert_eq!(after_replacement.active_leases, 1);
+    }
+
+    #[tokio::test]
     async fn unpublished_admission_blocks_claim_and_remains_recoverable_by_retry() {
         let fixture = ready_prompt_broker_fixture().await;
         let request = with_fixture_guard(
@@ -2043,6 +2253,214 @@ mod tests {
                 .await,
             Some(SharedSessionKey::Ephemeral(key)) if key == "ephemeral-b"
         ));
+    }
+
+    async fn conversation_rekey_fixture(
+        conversation_id: i32,
+    ) -> (
+        SharedSessionBroker,
+        SharedSessionAttachment,
+        SharedSessionAttachment,
+    ) {
+        let broker = SharedSessionBroker::default();
+        let source = broker
+            .reserve_or_attach(request(
+                SharedSessionKey::Ephemeral("rekey-source".into()),
+                "rekey-source",
+                "source-client",
+                "source-request",
+            ))
+            .await
+            .unwrap()
+            .attachment;
+        let destination = broker
+            .reserve_or_attach(request(
+                SharedSessionKey::Conversation(conversation_id),
+                "rekey-destination",
+                "destination-client",
+                "destination-request",
+            ))
+            .await
+            .unwrap()
+            .attachment;
+
+        for (attachment, bound_conversation_id, driver) in [
+            (&source, None, "source-driver"),
+            (
+                &destination,
+                Some(conversation_id),
+                "destination-driver",
+            ),
+        ] {
+            let state = Arc::new(tokio::sync::RwLock::new(SessionState::new(
+                attachment.connection_id.clone(),
+                crate::models::agent::AgentType::Codex,
+                None,
+                "shared-server".into(),
+                Some(9),
+            )));
+            state.write().await.conversation_id = bound_conversation_id;
+            broker
+                .install_registered(
+                    &attachment.connection_id,
+                    attachment.generation,
+                    driver.into(),
+                    state,
+                    EventEmitter::Noop,
+                    Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                )
+                .await
+                .unwrap();
+        }
+
+        (broker, source, destination)
+    }
+
+    async fn bind_rekey_source(
+        broker: &SharedSessionBroker,
+        source: &SharedSessionAttachment,
+        conversation_id: i32,
+        guarded: bool,
+    ) -> Result<(), SharedSessionError> {
+        if guarded {
+            broker
+                .bind_conversation_key_guarded(
+                    &SharedMutationGuard {
+                        connection_id: source.connection_id.clone(),
+                        generation: source.generation,
+                        lease_id: source.lease_id.clone(),
+                    },
+                    conversation_id,
+                    9,
+                )
+                .await
+        } else {
+            broker
+                .bind_conversation_key(
+                    &source.connection_id,
+                    source.generation,
+                    conversation_id,
+                )
+                .await
+        }
+    }
+
+    #[tokio::test]
+    async fn conversation_rekey_rejects_a_closing_destination() {
+        for guarded in [false, true] {
+            let (broker, source, destination) = conversation_rekey_fixture(188).await;
+            broker
+                .begin_termination(&destination.connection_id, destination.generation)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                bind_rekey_source(&broker, &source, 188, guarded)
+                    .await
+                    .unwrap_err(),
+                SharedSessionError::ConversationKeyConflict
+            );
+            assert!(broker
+                .is_managed_connection(&destination.connection_id)
+                .await);
+        }
+    }
+
+    #[tokio::test]
+    async fn conversation_rekey_rejects_a_cleanup_pending_failed_destination() {
+        for guarded in [false, true] {
+            let (broker, source, destination) = conversation_rekey_fixture(189).await;
+            broker
+                .mark_failed(
+                    &destination.connection_id,
+                    destination.generation,
+                    "session_unavailable",
+                    false,
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(
+                bind_rekey_source(&broker, &source, 189, guarded)
+                    .await
+                    .unwrap_err(),
+                SharedSessionError::ConversationKeyConflict
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn conversation_rekey_rejects_a_cleaned_failed_destination_with_a_lease() {
+        for guarded in [false, true] {
+            let (broker, source, destination) = conversation_rekey_fixture(190).await;
+            broker
+                .mark_failed(
+                    &destination.connection_id,
+                    destination.generation,
+                    "session_unavailable",
+                    true,
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(
+                bind_rekey_source(&broker, &source, 190, guarded)
+                    .await
+                    .unwrap_err(),
+                SharedSessionError::ConversationKeyConflict
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn conversation_rekey_replaces_only_a_cleaned_zero_lease_failed_tombstone() {
+        for guarded in [false, true] {
+            let (broker, source, destination) = conversation_rekey_fixture(191).await;
+            broker
+                .mark_failed(
+                    &destination.connection_id,
+                    destination.generation,
+                    "session_unavailable",
+                    true,
+                )
+                .await
+                .unwrap();
+            broker
+                .release_lease(&SharedMutationGuard {
+                    connection_id: destination.connection_id.clone(),
+                    generation: destination.generation,
+                    lease_id: destination.lease_id.clone(),
+                })
+                .await
+                .unwrap();
+
+            let before = broker.metrics().snapshot();
+            assert_eq!(before.live_sessions, 2);
+            assert_eq!(before.active_leases, 1);
+            bind_rekey_source(&broker, &source, 191, guarded)
+                .await
+                .unwrap();
+
+            assert!(matches!(
+                broker
+                    .key_for_connection_for_test(&source.connection_id)
+                    .await,
+                Some(SharedSessionKey::Conversation(191))
+            ));
+            assert!(broker
+                .key_for_connection_for_test(&destination.connection_id)
+                .await
+                .is_none());
+            let index = broker.index.lock().await;
+            assert!(index.is_replaced_connection(
+                &destination.connection_id,
+                destination.generation
+            ));
+            drop(index);
+            let after = broker.metrics().snapshot();
+            assert_eq!(after.live_sessions, 1);
+            assert_eq!(after.active_leases, 1);
+        }
     }
 
     #[tokio::test]
@@ -2752,6 +3170,13 @@ mod tests {
         );
         assert!(is_interaction_loser(&a) || is_interaction_loser(&b));
         assert_eq!(fixture.interaction_call_count(), 1);
+        let metrics = fixture
+            .manager
+            .shared_session_broker()
+            .metrics()
+            .snapshot();
+        assert_eq!(metrics.interaction_winner_total, 1);
+        assert_eq!(metrics.interaction_stale_total, 1);
     }
 
     #[tokio::test]
@@ -2935,6 +3360,15 @@ mod tests {
         let (a, b) = tokio::join!(fixture.stop("turn-new"), fixture.stop("turn-new"));
         assert!(a.is_ok() && b.is_ok());
         assert_eq!(fixture.cancel_call_count(), 1);
+        assert_eq!(
+            fixture
+                .manager
+                .shared_session_broker()
+                .metrics()
+                .snapshot()
+                .stale_stop_total,
+            1
+        );
     }
 
     #[tokio::test]

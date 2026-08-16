@@ -140,6 +140,71 @@ impl SharedSessionMetrics {
             });
     }
 
+    pub(super) fn record_bootstrap_ready(&self, elapsed: std::time::Duration) {
+        self.bootstrap_ready_total.fetch_add(1, Ordering::Relaxed);
+        self.record_bootstrap_duration(elapsed);
+    }
+
+    pub(super) fn record_bootstrap_failed(
+        &self,
+        agent_category: &str,
+        route_capability: &str,
+        error_code: &str,
+        elapsed: std::time::Duration,
+    ) {
+        let key = format!("{agent_category}|{route_capability}|{error_code}");
+        let mut failures = self
+            .bootstrap_failed_total
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *failures.entry(key).or_default() += 1;
+        drop(failures);
+        self.record_bootstrap_duration(elapsed);
+    }
+
+    fn record_bootstrap_duration(&self, elapsed: std::time::Duration) {
+        let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+        self.bootstrap_duration_ms_total
+            .fetch_add(elapsed_ms, Ordering::Relaxed);
+        self.bootstrap_duration_samples
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn record_enqueue(&self, waiting_bytes: usize) {
+        self.enqueue_total.fetch_add(1, Ordering::Relaxed);
+        self.waiting_prompts.fetch_add(1, Ordering::Relaxed);
+        self.waiting_bytes
+            .fetch_add(waiting_bytes as u64, Ordering::Relaxed);
+    }
+
+    pub(super) fn record_cancel(&self, waiting_bytes: usize) {
+        self.cancel_total.fetch_add(1, Ordering::Relaxed);
+        self.remove_waiting(1, waiting_bytes);
+    }
+
+    pub(super) fn remove_waiting(&self, count: usize, waiting_bytes: usize) {
+        saturating_sub(&self.waiting_prompts, count as u64);
+        saturating_sub(&self.waiting_bytes, waiting_bytes as u64);
+    }
+
+    pub(super) fn record_queue_items_failed(&self, count: usize) {
+        self.queue_item_failed_total
+            .fetch_add(count as u64, Ordering::Relaxed);
+    }
+
+    pub(super) fn record_interaction_winner(&self) {
+        self.interaction_winner_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn record_interaction_stale(&self) {
+        self.interaction_stale_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn record_stale_stop(&self) {
+        self.stale_stop_total.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(super) fn record_lease_expired(&self, count: usize) {
         self.lease_expired_total
             .fetch_add(count as u64, Ordering::Relaxed);
@@ -181,4 +246,10 @@ impl SharedSessionMetrics {
         self.cleanup_incomplete_total
             .fetch_add(1, Ordering::Relaxed);
     }
+}
+
+fn saturating_sub(counter: &AtomicU64, amount: u64) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_sub(amount))
+    });
 }

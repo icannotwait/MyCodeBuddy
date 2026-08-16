@@ -2061,7 +2061,13 @@ function reduceSingleAction(
       // row (draft tab). Never clear an already-bound id with a null patch.
       const mergedConversationId =
         current.conversationId ?? action.patch.conversationId ?? null
+      // Shared queue/phase state is authoritative at an equal sequence (the
+      // snapshot can carry a projection not represented by a later event), but
+      // an older snapshot must never overwrite a newer live projection.
+      const mayMergeSharedSession =
+        action.patch.eventSeq >= current.lastAppliedSeq
       const mergedSharedSession =
+        mayMergeSharedSession &&
         current.sharedSession &&
         action.patch.sharedSession &&
         current.sharedSession.generation ===
@@ -2095,7 +2101,8 @@ function reduceSingleAction(
           mergedConfigOptions === current.configOptions &&
           mergedAvailableCommands === current.availableCommands &&
           mergedPromptCapabilities === current.promptCapabilities &&
-          mergedConversationId === current.conversationId
+          mergedConversationId === current.conversationId &&
+          mergedSharedSession === current.sharedSession
         ) {
           return state
         }
@@ -6827,13 +6834,21 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         ) {
           continue
         }
-        acpDisconnect(
-          conn.connectionId,
-          disconnectLeaseWithOrigin(
-            leaseArgsForDisconnect(conn),
-            "provider_unmount"
-          )
-        ).catch(() => {})
+        if (conn.sharedSession) {
+          acpReleaseLease(
+            conn.connectionId,
+            conn.sharedSession.generation,
+            conn.sharedSession.leaseId
+          ).catch(() => {})
+        } else {
+          acpDisconnect(
+            conn.connectionId,
+            disconnectLeaseWithOrigin(
+              leaseArgsForDisconnect(conn),
+              "provider_unmount"
+            )
+          ).catch(() => {})
+        }
       }
       for (const [, sub] of attachSubs) {
         try {
@@ -8109,11 +8124,17 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
   const reapplyConfig = useCallback(
     async (contextKey: string): Promise<boolean> => {
       const conn = storeRef.current.connections.get(contextKey)
-      // Viewers / delegation children don't own the backend process — restarting
-      // would kill another client's (or the broker's) agent. The banner hides
-      // its restart button for them, but guard here too. Return false so the
-      // caller doesn't show a false "applied" confirmation on this no-op.
-      if (!conn || conn.isViewer || conn.isDelegationChild) return false
+      // Viewers / delegation children don't own the process, and shared roots
+      // need a coordinated broker recreate transition rather than reattach.
+      // The banner hides restart for all three, but guard here too so callers
+      // cannot report a false "applied" confirmation for a no-op.
+      if (
+        !conn ||
+        conn.isViewer ||
+        conn.isDelegationChild ||
+        conn.sharedSession
+      )
+        return false
       // Capture identity BEFORE teardown. `sessionId` is what makes the new
       // process resume this conversation (session/load) rather than start fresh.
       // conversationId + route override are also reused so reconnect keeps the
@@ -8440,7 +8461,15 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         })
       }
       lastActivityRef.current.set(key, Date.now())
-      await acpSetMode(conn.connectionId, modeId)
+      const shared = conn.sharedSession
+      if (shared) {
+        await acpSetMode(conn.connectionId, modeId, {
+          generation: shared.generation,
+          leaseId: shared.leaseId,
+        })
+      } else {
+        await acpSetMode(conn.connectionId, modeId)
+      }
     },
     [canonicalKey]
   )
@@ -8463,7 +8492,15 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       // can ship it back to the backend as a preferred config value.
       saveConfigPreference(conn.agentType, configId, valueId)
       lastActivityRef.current.set(key, Date.now())
-      await acpSetConfigOption(conn.connectionId, configId, valueId)
+      const shared = conn.sharedSession
+      if (shared) {
+        await acpSetConfigOption(conn.connectionId, configId, valueId, {
+          generation: shared.generation,
+          leaseId: shared.leaseId,
+        })
+      } else {
+        await acpSetConfigOption(conn.connectionId, configId, valueId)
+      }
     },
     [canonicalKey, dispatch]
   )
@@ -8549,20 +8586,29 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
 
   const goalControl = useCallback(
     async (contextKey: string, action: "pause" | "clear") => {
-      const conn = storeRef.current.connections.get(contextKey)
+      const key = canonicalKey(contextKey)
+      const conn = storeRef.current.connections.get(key)
       if (!conn) return
       // Fire-and-forget: there is no in-flight card UI to settle (unlike
       // answerQuestion). The resulting goal snapshot arrives as a normal
       // session_info_update, and a wire failure is surfaced by the backend's
       // recoverable Error event — so log here and don't rethrow.
       try {
-        lastActivityRef.current.set(contextKey, Date.now())
-        await acpGoalControl(conn.connectionId, action)
+        lastActivityRef.current.set(key, Date.now())
+        const shared = conn.sharedSession
+        if (shared) {
+          await acpGoalControl(conn.connectionId, action, {
+            generation: shared.generation,
+            leaseId: shared.leaseId,
+          })
+        } else {
+          await acpGoalControl(conn.connectionId, action)
+        }
       } catch (e) {
         console.error("[AcpConnections] goalControl failed:", e)
       }
     },
-    []
+    [canonicalKey]
   )
 
   const respondPermission = useCallback(

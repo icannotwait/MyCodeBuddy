@@ -5,12 +5,45 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     acp::{
+        delegation::route::{DelegationRoutePlan, DelegationRoutePolicy, DelegationRouteSource},
         session_attach::SessionAttachMode,
         types::{ConnectionStatus, PromptInputBlock},
     },
     auto_title::{ConnectionPurpose, PromptCaptureContext},
     models::agent::AgentType,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SharedRouteCapability {
+    Standard,
+    RequiredCompanion,
+    Fallback,
+}
+
+impl SharedRouteCapability {
+    pub(crate) fn from_route_plan(plan: &DelegationRoutePlan) -> Self {
+        if plan.managed
+            && plan.effective == DelegationRoutePolicy::Codeg
+            && plan.source == DelegationRouteSource::GlobalDefault
+        {
+            Self::Fallback
+        } else if plan.requested == DelegationRoutePolicy::Codeg
+            && plan.source == DelegationRouteSource::SessionOverride
+        {
+            Self::RequiredCompanion
+        } else {
+            Self::Standard
+        }
+    }
+
+    pub(super) const fn metric_label(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::RequiredCompanion => "required_companion",
+            Self::Fallback => "fallback",
+        }
+    }
+}
 
 pub const MAX_WAITING_PROMPTS: usize = 64;
 pub const MAX_WAITING_BYTES: usize = 32 * 1024 * 1024;
@@ -53,6 +86,7 @@ pub struct SharedLaunchIdentity {
     pub external_session_id: Option<String>,
     pub attach_mode: SessionAttachMode,
     pub route_fingerprint: String,
+    pub route_capability: SharedRouteCapability,
     pub terminal_shell_fingerprint: String,
     pub purpose: ConnectionPurpose,
 }
@@ -66,6 +100,7 @@ impl SharedLaunchIdentity {
             external_session_id: None,
             attach_mode: SessionAttachMode::Default,
             route_fingerprint: "route-fixture".into(),
+            route_capability: SharedRouteCapability::Standard,
             terminal_shell_fingerprint: "shell-fixture".into(),
             purpose: ConnectionPurpose::User,
         }

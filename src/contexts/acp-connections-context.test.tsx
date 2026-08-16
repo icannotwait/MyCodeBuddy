@@ -176,6 +176,7 @@ const acpAnswerQuestionMock = vi.hoisted(() => vi.fn())
 const acpAnswerPlanApprovalMock = vi.hoisted(() => vi.fn())
 const acpSetModeMock = vi.hoisted(() => vi.fn())
 const acpSetConfigOptionMock = vi.hoisted(() => vi.fn())
+const acpGoalControlMock = vi.hoisted(() => vi.fn())
 const acpRespondPermissionMock = vi.hoisted(() => vi.fn())
 const acpTouchConnectionMock = vi.hoisted(() => vi.fn())
 
@@ -194,6 +195,7 @@ vi.mock("@/lib/api", () => ({
   acpAnswerPlanApproval: acpAnswerPlanApprovalMock,
   acpSetMode: acpSetModeMock,
   acpSetConfigOption: acpSetConfigOptionMock,
+  acpGoalControl: acpGoalControlMock,
   acpCancel: h.acpCancel,
   acpCancelQueuedPrompt: h.acpCancelQueuedPrompt,
   acpRespondPermission: acpRespondPermissionMock,
@@ -330,10 +332,31 @@ describe("AcpConnectionsProvider shared server roots", () => {
   it("releases a shared lease on provider teardown without disconnecting", async () => {
     h.isDesktop = false
     h.acpConnectOrAttach.mockResolvedValue(sharedResponse())
-    await mountProvider()
+    const provider = await mountProvider()
     await act(async () => {
       await h.actions!.connect(TAB, "claude_code", "/work", "sess", 42)
-      await h.actions!.disconnect(TAB, "provider_unmount")
+    })
+    provider.unmount()
+
+    await waitFor(() =>
+      expect(h.acpReleaseLease).toHaveBeenCalledWith("conn", 1, "lease-1")
+    )
+    expect(h.acpDisconnect).not.toHaveBeenCalled()
+    expect(h.acpTerminateSharedSession).not.toHaveBeenCalled()
+  })
+
+  it("does not fall through to process disconnect when unmount lease release fails", async () => {
+    h.isDesktop = false
+    h.acpConnectOrAttach.mockResolvedValue(sharedResponse())
+    h.acpReleaseLease.mockRejectedValueOnce(new Error("release failed"))
+    const provider = await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/work", "sess", 42)
+    })
+
+    provider.unmount()
+    await act(async () => {
+      await Promise.resolve()
     })
 
     expect(h.acpReleaseLease).toHaveBeenCalledWith("conn", 1, "lease-1")
@@ -352,6 +375,50 @@ describe("AcpConnectionsProvider shared server roots", () => {
 
     expect(h.acpTerminateSharedSession).toHaveBeenCalledWith("conn", 1)
     expect(h.acpDisconnect).not.toHaveBeenCalled()
+  })
+
+  it("threads the current shared guard through mode, configuration, and goal actions", async () => {
+    h.isDesktop = false
+    h.acpConnectOrAttach.mockResolvedValue(sharedResponse())
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/work", "sess", 42)
+      await h.actions!.setMode(TAB, "plan")
+      await h.actions!.setConfigOption(TAB, "model", "gpt-5")
+      await h.actions!.goalControl(TAB, "pause")
+    })
+
+    const guard = { generation: 1, leaseId: "lease-1" }
+    expect(acpSetModeMock).toHaveBeenCalledWith("conn", "plan", guard)
+    expect(acpSetConfigOptionMock).toHaveBeenCalledWith(
+      "conn",
+      "model",
+      "gpt-5",
+      guard
+    )
+    expect(acpGoalControlMock).toHaveBeenCalledWith("conn", "pause", guard)
+  })
+
+  it("refuses shared configuration reapply without releasing or reconnecting", async () => {
+    h.isDesktop = false
+    h.acpConnectOrAttach.mockResolvedValue(sharedResponse())
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/work", "sess", 42)
+    })
+    h.acpConnectOrAttach.mockClear()
+    h.acpReleaseLease.mockClear()
+    h.acpDisconnect.mockClear()
+
+    let reapplied = true
+    await act(async () => {
+      reapplied = await h.actions!.reapplyConfig(TAB)
+    })
+
+    expect(reapplied).toBe(false)
+    expect(h.acpReleaseLease).not.toHaveBeenCalled()
+    expect(h.acpDisconnect).not.toHaveBeenCalled()
+    expect(h.acpConnectOrAttach).not.toHaveBeenCalled()
   })
 
   it("retains the event cursor when a shared detach reattaches to the same generation", async () => {
@@ -381,6 +448,103 @@ describe("AcpConnectionsProvider shared server roots", () => {
     expect(h.acpConnectOrAttach.mock.calls[1]?.[0].requestId).toBe(
       h.acpConnectOrAttach.mock.calls[0]?.[0].requestId
     )
+  })
+
+  it("hydrates equal-sequence authoritative shared phase, queue, and active turn", async () => {
+    h.isDesktop = false
+    h.acpConnectOrAttach.mockResolvedValue(
+      sharedResponse({ phase: "bootstrapping" })
+    )
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/work", "sess", 42)
+    })
+    h.denormalizeSnapshot.mockReturnValueOnce({
+      ...h.denormalizeSnapshot(),
+      connectionId: "conn",
+      eventSeq: 0,
+      sharedSession: {
+        generation: 1,
+        leaseExpiresAt: "2026-01-01T00:02:00.000Z",
+        phase: { phase: "ready" },
+        queue: [
+          {
+            queueItemId: "queue-2",
+            enqueueSeq: 2,
+            clientMessageId: "message-2",
+            visibleText: "next",
+            visibleTextTruncated: false,
+            attachmentCount: 0,
+            submittedAt: "2026-01-01T00:00:02.000Z",
+            state: "queued",
+          },
+        ],
+        activeTurn: {
+          turnId: "turn-1",
+          queueItemId: "queue-1",
+          enqueueSeq: 1,
+          clientMessageId: "message-1",
+          stopRequested: false,
+        },
+      },
+    })
+
+    hydrateSnapshot(latestAttachHandlers(), {
+      event_seq: 0,
+    } as LiveSessionSnapshot)
+
+    expect(h.store!.getConnection(TAB)?.sharedSession).toMatchObject({
+      phase: { phase: "ready" },
+      queue: [{ queueItemId: "queue-2" }],
+      activeTurn: { turnId: "turn-1" },
+      leaseExpiresAt: "2026-01-01T00:02:00.000Z",
+    })
+  })
+
+  it("keeps newer shared state when an older snapshot merges a latched field", async () => {
+    h.isDesktop = false
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/work", "sess", 42)
+    })
+    const newerSharedSession = {
+      generation: 1,
+      leaseExpiresAt: "2026-01-01T00:03:00.000Z",
+      phase: { phase: "closing" as const },
+      queue: [],
+      activeTurn: null,
+    }
+    h.denormalizeSnapshot.mockReturnValueOnce({
+      ...h.denormalizeSnapshot(),
+      connectionId: "conn",
+      eventSeq: 2,
+      sharedSession: newerSharedSession,
+    })
+    hydrateSnapshot(latestAttachHandlers(), {
+      event_seq: 2,
+    } as LiveSessionSnapshot)
+
+    h.denormalizeSnapshot.mockReturnValueOnce({
+      ...h.denormalizeSnapshot(),
+      connectionId: "conn",
+      eventSeq: 1,
+      selectorsReady: true,
+      sharedSession: {
+        generation: 1,
+        leaseExpiresAt: "2026-01-01T00:01:00.000Z",
+        phase: { phase: "ready" },
+        queue: [],
+        activeTurn: null,
+      },
+    })
+    hydrateSnapshot(latestAttachHandlers(), {
+      event_seq: 1,
+    } as LiveSessionSnapshot)
+
+    const connection = h.store!.getConnection(TAB)
+    expect(connection?.selectorsReady).toBe(true)
+    expect(connection?.lastAppliedSeq).toBe(2)
+    expect(connection?.sharedSession).toMatchObject(newerSharedSession)
   })
 
   it("cold-attaches when a shared detach reconnects to a new generation", async () => {
@@ -729,6 +893,8 @@ beforeEach(() => {
   acpSetModeMock.mockResolvedValue(undefined)
   acpSetConfigOptionMock.mockReset()
   acpSetConfigOptionMock.mockResolvedValue(undefined)
+  acpGoalControlMock.mockReset()
+  acpGoalControlMock.mockResolvedValue(undefined)
   acpRespondPermissionMock.mockReset()
   acpRespondPermissionMock.mockResolvedValue(undefined)
   acpTouchConnectionMock.mockReset()

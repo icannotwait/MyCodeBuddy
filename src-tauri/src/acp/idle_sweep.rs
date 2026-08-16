@@ -119,7 +119,8 @@ mod tests {
         acp::{
             session_attach::SessionAttachMode,
             shared_session::{
-                SharedLaunchIdentity, SharedMutationGuard, SharedReserveRequest, SharedSessionKey,
+                SharedLaunchIdentity, SharedMutationGuard, SharedReserveRequest,
+                SharedRouteCapability, SharedSessionKey,
             },
         },
         auto_title::ConnectionPurpose,
@@ -136,6 +137,7 @@ mod tests {
                 external_session_id: None,
                 attach_mode: SessionAttachMode::Default,
                 route_fingerprint: "idle-sweep-route".into(),
+                route_capability: SharedRouteCapability::Standard,
                 terminal_shell_fingerprint: "idle-sweep-shell".into(),
                 purpose: ConnectionPurpose::User,
             },

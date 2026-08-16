@@ -394,20 +394,31 @@ export async function acpTerminateSharedSession(
 
 export async function acpSetMode(
   connectionId: string,
-  modeId: string
+  modeId: string,
+  shared?: SharedMutationContext
 ): Promise<void> {
-  return getTransport().call("acp_set_mode", { connectionId, modeId })
+  return getTransport().call("acp_set_mode", {
+    connectionId,
+    modeId,
+    ...(shared
+      ? { generation: shared.generation, leaseId: shared.leaseId }
+      : {}),
+  })
 }
 
 export async function acpSetConfigOption(
   connectionId: string,
   configId: string,
-  valueId: string
+  valueId: string,
+  shared?: SharedMutationContext
 ): Promise<void> {
   return getTransport().call("acp_set_config_option", {
     connectionId,
     configId,
     valueId,
+    ...(shared
+      ? { generation: shared.generation, leaseId: shared.leaseId }
+      : {}),
   })
 }
 
@@ -416,9 +427,16 @@ export async function acpSetConfigOption(
  *  are needed here. */
 export async function acpGoalControl(
   connectionId: string,
-  action: "pause" | "clear"
+  action: "pause" | "clear",
+  shared?: SharedMutationContext
 ): Promise<void> {
-  return getTransport().call("acp_goal_control", { connectionId, action })
+  return getTransport().call("acp_goal_control", {
+    connectionId,
+    action,
+    ...(shared
+      ? { generation: shared.generation, leaseId: shared.leaseId }
+      : {}),
+  })
 }
 
 export async function acpCancel(

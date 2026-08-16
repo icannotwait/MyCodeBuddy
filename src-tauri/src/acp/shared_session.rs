@@ -361,7 +361,8 @@ impl SharedSessionBroker {
                         None => None,
                     };
                     let generation = current.generation;
-                    let mut events = fail_all_prompt_work(&mut current, "session_unavailable");
+                    let mut events =
+                        fail_all_prompt_work(&mut current, "session_unavailable", &self.metrics);
                     current.begin_cleanup(tokio::time::Instant::now());
                     current.phase = SharedSessionPhase::Closing;
                     current.cleanup_complete = false;
@@ -607,6 +608,8 @@ impl SharedSessionBroker {
             let lifecycle_tx = current.lifecycle_tx.clone();
             let notify = current.notify.clone();
             let active_leases = current.active_leases.len();
+            let waiting_prompts = current.waiting_prompts.len();
+            let waiting_bytes = current.waiting_bytes;
             drop(current);
             index.sessions.remove(&key);
             index.by_connection.remove(connection_id);
@@ -616,6 +619,7 @@ impl SharedSessionBroker {
             lifecycle_tx.send_replace(SharedLifecycleState::Removed);
             notify.notify_waiters();
             self.metrics.remove_active_leases(active_leases);
+            self.metrics.remove_waiting(waiting_prompts, waiting_bytes);
             self.metrics.remove_live_session();
             return true;
         }
@@ -783,7 +787,7 @@ impl SharedSessionBroker {
             Some(state) => Some(state.write().await),
             None => None,
         };
-        let mut events = fail_all_prompt_work(&mut current, "session_unavailable");
+        let mut events = fail_all_prompt_work(&mut current, "session_unavailable", &self.metrics);
         current.begin_cleanup(tokio::time::Instant::now());
         current.phase = SharedSessionPhase::Closing;
         current.cleanup_complete = false;
@@ -866,6 +870,8 @@ impl SharedSessionBroker {
             let lifecycle_tx = current.lifecycle_tx.clone();
             let notify = current.notify.clone();
             let active_leases = current.active_leases.len();
+            let waiting_prompts = current.waiting_prompts.len();
+            let waiting_bytes = current.waiting_bytes;
             drop(current);
             index.sessions.remove(&key);
             index.by_connection.remove(&candidate.connection_id);
@@ -875,6 +881,7 @@ impl SharedSessionBroker {
             lifecycle_tx.send_replace(SharedLifecycleState::Removed);
             notify.notify_waiters();
             self.metrics.remove_active_leases(active_leases);
+            self.metrics.remove_waiting(waiting_prompts, waiting_bytes);
             self.metrics.remove_live_session();
             if candidate.kind == SharedSweepCandidateKind::Ready {
                 self.metrics.record_idle_reclaimed();
@@ -1021,6 +1028,7 @@ impl SharedSessionBroker {
                         admission_published: false,
                     },
                 );
+                self.metrics.record_enqueue(waiting_bytes);
                 Ok(SharedPromptAdmission {
                     queue_item_id,
                     events,
@@ -1163,6 +1171,7 @@ impl SharedSessionBroker {
                 .get_mut(&identity)
                 .expect("queued item has ledger entry")
                 .invalidate_admission(InternalPromptState::Cancelled);
+            self.metrics.record_cancel(queued.waiting_bytes);
             Ok(SharedPromptMutation {
                 events: vec![
                     crate::acp::types::AcpEvent::PromptQueueItemCancelled {
@@ -1223,12 +1232,14 @@ impl SharedSessionBroker {
                 .waiting_bytes
                 .checked_sub(queued.waiting_bytes)
                 .expect("FIFO head bytes are included in waiting total");
+            self.metrics.remove_waiting(1, queued.waiting_bytes);
             if let Some(error_code) = snapshot.conversation_write_error {
                 record
                     .prompt_ledger
                     .get_mut(&queued.identity)
                     .expect("queued item has ledger entry")
                     .state = InternalPromptState::Failed;
+                self.metrics.record_queue_items_failed(1);
                 return Ok(DispatchHeadDecision::Failed(FailedSharedPrompt {
                     events: vec![
                         crate::acp::types::AcpEvent::PromptQueueItemFailed {
@@ -1308,6 +1319,7 @@ impl SharedSessionBroker {
                 .expect("active turn remains present");
             active.resolve_stop_waiters_as_requested();
             record.interactions.clear();
+            self.metrics.record_queue_items_failed(1);
             Ok(FailedSharedPrompt {
                 events: vec![
                     crate::acp::types::AcpEvent::PromptQueueItemFailed {
@@ -1383,6 +1395,9 @@ impl SharedSessionBroker {
                 .get_mut(&active.identity)
                 .expect("active turn has ledger entry")
                 .state = state;
+            if outcome == SharedTurnOutcome::Failed {
+                self.metrics.record_queue_items_failed(1);
+            }
             record.notify.notify_one();
             Ok(vec![crate::acp::types::AcpEvent::SharedTurnSettled {
                 generation,
@@ -1407,13 +1422,14 @@ impl SharedSessionBroker {
             {
                 return Ok(Vec::new());
             }
-            if !matches!(
-                record.phase,
-                SharedSessionPhase::Bootstrapping | SharedSessionPhase::Ready
-            ) {
+            // While bootstrapping, only the typed route-bootstrap settler may
+            // classify a terminal driver outcome. The runtime monitor can race
+            // that outcome, but must not collapse a companion failure or an
+            // allowed fallback into the generic session-unavailable state.
+            if record.phase != SharedSessionPhase::Ready {
                 return Ok(Vec::new());
             }
-            Ok(fail_live_session_record(record, error_code))
+            Ok(fail_live_session_record(record, error_code, &self.metrics))
         })
         .await?
         .ok_or(SharedSessionError::SessionUnavailable)
@@ -1537,9 +1553,18 @@ impl SharedSessionBroker {
                     interaction_id: interaction_id.to_string(),
                 })
             })
-            .await?;
-        self.require_authoritative_result(&guard.connection_id, guard.generation, result)
-            .await
+            .await;
+        let result = match result {
+            Ok(result) => {
+                self.require_authoritative_result(&guard.connection_id, guard.generation, result)
+                    .await
+            }
+            Err(error) => Err(error),
+        };
+        if matches!(result, Err(SharedSessionError::InteractionAlreadyResolved)) {
+            self.metrics.record_interaction_stale();
+        }
+        result
     }
 
     pub(crate) async fn complete_interaction(
@@ -1551,18 +1576,29 @@ impl SharedSessionBroker {
                 if record.generation != claim.generation {
                     return Err(SharedSessionError::GenerationStale);
                 }
-                if let Some(interaction) = record.interactions.get_mut(claim.kind).as_mut() {
-                    if interaction.id == claim.interaction_id
-                        && interaction.admission == InteractionAdmissionState::Resolving
-                    {
-                        interaction.admission = InteractionAdmissionState::Resolved;
-                    }
-                }
-                Ok(())
+                let completed =
+                    if let Some(interaction) = record.interactions.get_mut(claim.kind).as_mut() {
+                        if interaction.id == claim.interaction_id
+                            && interaction.admission == InteractionAdmissionState::Resolving
+                        {
+                            interaction.admission = InteractionAdmissionState::Resolved;
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                Ok(completed)
             })
             .await?;
-        self.require_authoritative_result(&claim.connection_id, claim.generation, result)
-            .await
+        let completed = self
+            .require_authoritative_result(&claim.connection_id, claim.generation, result)
+            .await?;
+        if completed {
+            self.metrics.record_interaction_winner();
+        }
+        Ok(())
     }
 
     pub(crate) async fn release_interaction_claim(
@@ -1619,13 +1655,22 @@ impl SharedSessionBroker {
                     StopAdmissionState::Requested => Ok(SharedStopClaimDecision::Requested),
                 }
             })
-            .await?;
-        self.require_authoritative_result(
-            &request.guard.connection_id,
-            request.guard.generation,
-            result,
-        )
-        .await
+            .await;
+        let result = match result {
+            Ok(result) => {
+                self.require_authoritative_result(
+                    &request.guard.connection_id,
+                    request.guard.generation,
+                    result,
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        };
+        if matches!(result, Err(SharedSessionError::StaleTurn)) {
+            self.metrics.record_stale_stop();
+        }
+        result
     }
 
     pub(crate) async fn complete_stop_request(
@@ -1671,9 +1716,18 @@ impl SharedSessionBroker {
                 }
                 Ok(())
             })
-            .await?;
-        self.require_authoritative_result(&claim.connection_id, claim.generation, result)
-            .await
+            .await;
+        let result = match result {
+            Ok(result) => {
+                self.require_authoritative_result(&claim.connection_id, claim.generation, result)
+                    .await
+            }
+            Err(error) => Err(error),
+        };
+        if matches!(result, Err(SharedSessionError::StaleTurn)) {
+            self.metrics.record_stale_stop();
+        }
+        result
     }
 
     pub(crate) async fn release_stop_request(
@@ -1720,7 +1774,11 @@ impl SharedSessionBroker {
                     | crate::acp::types::ConnectionStatus::Error
             ) && record.phase == SharedSessionPhase::Ready
             {
-                return Ok(fail_live_session_record(record, "session_unavailable"));
+                return Ok(fail_live_session_record(
+                    record,
+                    "session_unavailable",
+                    &self.metrics,
+                ));
             }
             Ok(Vec::new())
         })
@@ -1809,21 +1867,10 @@ impl SharedSessionBroker {
                         tokio::task::yield_now().await;
                         continue;
                     };
-                    if matches!(
-                        destination_record.phase,
-                        SharedSessionPhase::Reserved
-                            | SharedSessionPhase::Bootstrapping
-                            | SharedSessionPhase::Ready
-                    ) {
+                    if !Self::is_replaceable_conversation_destination(&destination_record) {
                         return Err(SharedSessionError::ConversationKeyConflict);
                     }
-                    destination_record
-                        .lifecycle_tx
-                        .send_replace(SharedLifecycleState::Replaced);
-                    destination_record.notify.notify_waiters();
-                    index
-                        .by_connection
-                        .remove(&destination_record.connection_id);
+                    self.account_replaced_conversation_destination(&mut index, &destination_record);
                 }
             }
 
@@ -1888,12 +1935,7 @@ impl SharedSessionBroker {
                         tokio::task::yield_now().await;
                         continue;
                     };
-                    if matches!(
-                        destination_record.phase,
-                        SharedSessionPhase::Reserved
-                            | SharedSessionPhase::Bootstrapping
-                            | SharedSessionPhase::Ready
-                    ) {
+                    if !Self::is_replaceable_conversation_destination(&destination_record) {
                         return Err(SharedSessionError::ConversationKeyConflict);
                     }
                     Some(destination_record)
@@ -1924,13 +1966,7 @@ impl SharedSessionBroker {
             }
 
             if let Some(destination_record) = destination_record {
-                destination_record
-                    .lifecycle_tx
-                    .send_replace(SharedLifecycleState::Replaced);
-                destination_record.notify.notify_waiters();
-                index
-                    .by_connection
-                    .remove(&destination_record.connection_id);
+                self.account_replaced_conversation_destination(&mut index, &destination_record);
             }
             index.sessions.remove(&source_key);
             index
@@ -2430,6 +2466,11 @@ impl SharedSessionBroker {
             if record.connection_id != connection_id || record.generation != generation {
                 return Err(SharedSessionError::GenerationStale);
             }
+            let is_bootstrap_failure = matches!(
+                record.phase,
+                SharedSessionPhase::Reserved | SharedSessionPhase::Bootstrapping
+            );
+            let now = tokio::time::Instant::now();
             let phase = SharedSessionPhase::Failed {
                 error_code: error_code.clone(),
                 cleanup_complete,
@@ -2437,8 +2478,8 @@ impl SharedSessionBroker {
             if let Some(state) = state {
                 update_public_shared_phase(state, generation, phase.clone());
             }
-            let mut events = fail_all_prompt_work(record, &error_code);
-            record.finish_bootstrap(tokio::time::Instant::now());
+            let mut events = fail_all_prompt_work(record, &error_code, &self.metrics);
+            record.finish_bootstrap(now);
             if cleanup_complete {
                 record.finish_cleanup(tokio::time::Instant::now());
             } else {
@@ -2454,6 +2495,14 @@ impl SharedSessionBroker {
                 .lifecycle_tx
                 .send_replace(SharedLifecycleState::Failed);
             record.notify.notify_waiters();
+            if is_bootstrap_failure {
+                self.metrics.record_bootstrap_failed(
+                    &bounded_agent_category(record.launch_identity.agent_type),
+                    record.launch_identity.route_capability.metric_label(),
+                    &error_code,
+                    record.bootstrap_duration(now),
+                );
+            }
             events.push(crate::acp::types::AcpEvent::SharedSessionPhaseChanged {
                 generation,
                 phase: record.phase.clone(),
@@ -2784,11 +2833,14 @@ impl SharedSessionBroker {
             }
             let state = state.ok_or(SharedSessionError::SessionUnavailable)?;
             update_public_shared_phase(state, generation, SharedSessionPhase::Ready);
-            record.finish_bootstrap(tokio::time::Instant::now());
+            let now = tokio::time::Instant::now();
+            record.finish_bootstrap(now);
             record.phase = SharedSessionPhase::Ready;
             record.idle_zero_since = None;
             record.failed_zero_since = None;
             record.publish_registration();
+            self.metrics
+                .record_bootstrap_ready(record.bootstrap_duration(now));
             Ok(vec![
                 crate::acp::types::AcpEvent::SharedSessionPhaseChanged {
                     generation,
@@ -2906,7 +2958,8 @@ impl SharedSessionBroker {
                 );
                 record.state = Some(state.clone());
                 record.emitter = Some(emitter.clone());
-                record.finish_bootstrap(tokio::time::Instant::now());
+                let now = tokio::time::Instant::now();
+                record.finish_bootstrap(now);
                 if cleanup_complete {
                     record.finish_cleanup(tokio::time::Instant::now());
                 } else {
@@ -2923,7 +2976,13 @@ impl SharedSessionBroker {
                     .lifecycle_tx
                     .send_replace(SharedLifecycleState::Failed);
                 record.notify.notify_waiters();
-                let mut events = fail_all_prompt_work(record, &error_code);
+                self.metrics.record_bootstrap_failed(
+                    &bounded_agent_category(record.launch_identity.agent_type),
+                    record.launch_identity.route_capability.metric_label(),
+                    &error_code,
+                    record.bootstrap_duration(now),
+                );
+                let mut events = fail_all_prompt_work(record, &error_code, &self.metrics);
                 events.push(crate::acp::types::AcpEvent::SharedSessionPhaseChanged {
                     generation,
                     phase: record.phase.clone(),
@@ -2989,7 +3048,8 @@ impl SharedSessionBroker {
                 );
                 record.state = Some(state.clone());
                 record.emitter = Some(emitter.clone());
-                record.finish_bootstrap(tokio::time::Instant::now());
+                let now = tokio::time::Instant::now();
+                record.finish_bootstrap(now);
                 if cleanup_complete {
                     record.finish_cleanup(tokio::time::Instant::now());
                 } else {
@@ -3006,7 +3066,13 @@ impl SharedSessionBroker {
                     .lifecycle_tx
                     .send_replace(SharedLifecycleState::Failed);
                 record.notify.notify_waiters();
-                let mut events = fail_all_prompt_work(record, &error_code);
+                self.metrics.record_bootstrap_failed(
+                    &bounded_agent_category(record.launch_identity.agent_type),
+                    record.launch_identity.route_capability.metric_label(),
+                    &error_code,
+                    record.bootstrap_duration(now),
+                );
+                let mut events = fail_all_prompt_work(record, &error_code, &self.metrics);
                 events.push(crate::acp::types::AcpEvent::SharedSessionPhaseChanged {
                     generation: permit.generation,
                     phase: record.phase.clone(),
@@ -3291,6 +3357,8 @@ impl SharedSessionBroker {
 
         let old_connection_id = current.connection_id.clone();
         let old_active_leases = current.active_leases.len();
+        let old_waiting_prompts = current.waiting_prompts.len();
+        let old_waiting_bytes = current.waiting_bytes;
         let next_generation = failed_generation
             .checked_add(1)
             .ok_or(SharedSessionError::GenerationStale)?;
@@ -3317,15 +3385,7 @@ impl SharedSessionBroker {
             .lifecycle_tx
             .send_replace(SharedLifecycleState::Replaced);
         current.notify.notify_waiters();
-        index
-            .replaced_connections
-            .push_back(ReplacedConnectionTombstone {
-                connection_id: old_connection_id.clone(),
-                generation: failed_generation,
-            });
-        if index.replaced_connections.len() > MAX_REPLACED_CONNECTION_TOMBSTONES {
-            index.replaced_connections.pop_front();
-        }
+        index.record_replaced_connection(old_connection_id.clone(), failed_generation);
         index.by_connection.remove(&old_connection_id);
         index
             .by_connection
@@ -3334,12 +3394,42 @@ impl SharedSessionBroker {
         self.index_epoch
             .send_modify(|epoch| *epoch = epoch.saturating_add(1));
         self.metrics.remove_active_leases(old_active_leases);
+        self.metrics
+            .remove_waiting(old_waiting_prompts, old_waiting_bytes);
         self.metrics.add_active_leases(1);
 
         Ok(Some(SharedReserveOutcome {
             attachment,
             created: true,
         }))
+    }
+
+    fn is_replaceable_conversation_destination(record: &SharedSessionRecord) -> bool {
+        matches!(
+            record.phase,
+            SharedSessionPhase::Failed {
+                cleanup_complete: true,
+                ..
+            }
+        ) && record.cleanup_complete
+            && record.active_leases.is_empty()
+    }
+
+    fn account_replaced_conversation_destination(
+        &self,
+        index: &mut SharedSessionIndex,
+        destination: &SharedSessionRecord,
+    ) {
+        debug_assert!(Self::is_replaceable_conversation_destination(destination));
+        destination
+            .lifecycle_tx
+            .send_replace(SharedLifecycleState::Replaced);
+        destination.notify.notify_waiters();
+        index.by_connection.remove(&destination.connection_id);
+        index.record_replaced_connection(destination.connection_id.clone(), destination.generation);
+        self.metrics
+            .remove_waiting(destination.waiting_prompts.len(), destination.waiting_bytes);
+        self.metrics.remove_live_session();
     }
 }
 
@@ -3519,9 +3609,13 @@ fn queue_depth_event(record: &SharedSessionRecord) -> crate::acp::types::AcpEven
 fn fail_live_session_record(
     record: &mut SharedSessionRecord,
     error_code: &str,
+    metrics: &SharedSessionMetrics,
 ) -> Vec<crate::acp::types::AcpEvent> {
     let generation = record.generation;
     let mut events = Vec::new();
+    let active_failed = usize::from(record.active_turn.is_some());
+    let waiting_failed = record.waiting_prompts.len();
+    let waiting_bytes = record.waiting_bytes;
     if let Some(mut active) = record.active_turn.take() {
         active.resolve_stop_waiters_as_requested();
         record
@@ -3549,6 +3643,8 @@ fn fail_live_session_record(
         });
     }
     record.waiting_bytes = 0;
+    metrics.remove_waiting(waiting_failed, waiting_bytes);
+    metrics.record_queue_items_failed(active_failed.saturating_add(waiting_failed));
     events.push(queue_depth_event(record));
     record.finish_bootstrap(tokio::time::Instant::now());
     record.begin_cleanup(tokio::time::Instant::now());
@@ -3575,8 +3671,12 @@ fn fail_live_session_record(
 fn fail_all_prompt_work(
     record: &mut SharedSessionRecord,
     error_code: &str,
+    metrics: &SharedSessionMetrics,
 ) -> Vec<crate::acp::types::AcpEvent> {
     let mut events = Vec::new();
+    let active_failed = usize::from(record.active_turn.is_some());
+    let waiting_failed = record.waiting_prompts.len();
+    let waiting_bytes = record.waiting_bytes;
     if let Some(mut active) = record.active_turn.take() {
         active.resolve_stop_waiters_as_requested();
         record
@@ -3608,6 +3708,8 @@ fn fail_all_prompt_work(
         record.waiting_bytes = 0;
         events.push(queue_depth_event(record));
     }
+    metrics.remove_waiting(waiting_failed, waiting_bytes);
+    metrics.record_queue_items_failed(active_failed.saturating_add(waiting_failed));
     events
 }
 
@@ -3658,6 +3760,17 @@ impl SharedSessionIndex {
         self.replaced_connections
             .iter()
             .any(|tombstone| tombstone.connection_id == connection_id)
+    }
+
+    fn record_replaced_connection(&mut self, connection_id: String, generation: u64) {
+        self.replaced_connections
+            .push_back(ReplacedConnectionTombstone {
+                connection_id,
+                generation,
+            });
+        if self.replaced_connections.len() > MAX_REPLACED_CONNECTION_TOMBSTONES {
+            self.replaced_connections.pop_front();
+        }
     }
 }
 

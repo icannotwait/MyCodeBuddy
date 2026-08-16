@@ -558,6 +558,16 @@ async fn invalid_identity_fields_reject_before_reservation_or_spawn() {
         .await
         .assert_status_bad_request();
 
+    for (conversation_id, request_id) in [(0, "zero-row"), (-1, "negative-row")] {
+        let mut invalid = fixture.connect_json("device", "client", request_id);
+        invalid["conversationId"] = json!(conversation_id);
+        fixture
+            .post_json("/acp_connect_or_attach", invalid)
+            .await
+            .assert_status_bad_request()
+            .assert_code("invalid_shared_session_field");
+    }
+
     for (field, value) in [
         ("deviceId", "bad label"),
         ("clientInstanceId", "bad/label"),
@@ -1645,6 +1655,132 @@ async fn legacy_prompt_and_disconnect_cannot_mutate_shared_root() {
 }
 
 #[tokio::test]
+async fn queued_and_active_shared_roots_never_enter_the_legacy_fork_path() {
+    let queued_fixture = shared_http_fixture_with_pending_bootstrap().await;
+    let queued = queued_fixture
+        .post_connect(
+            "fork-queued-device",
+            "fork-queued-client",
+            "fork-queued-connect",
+        )
+        .await
+        .assert_status_ok()
+        .json::<AcpConnectOrAttachResponse>();
+    queued_fixture
+        .post_json(
+            "/acp_prompt",
+            json!({
+                "connectionId": queued.connection_id,
+                "generation": queued.generation,
+                "leaseId": queued.lease_id,
+                "clientInstanceId": "fork-queued-client",
+                "clientRequestId": "fork-queued-prompt",
+                "clientMessageId": "fork-queued-message",
+                "blocks": [{"type": "text", "text": "queued before fork"}],
+                "folderId": queued_fixture.folder_id,
+                "conversationId": queued_fixture.conversation_id,
+            }),
+        )
+        .await
+        .assert_status_ok();
+    let queued_fork = tokio::time::timeout(
+        Duration::from_millis(250),
+        queued_fixture.post_json(
+            "/acp_fork",
+            json!({
+                "connectionId": queued.connection_id,
+                "conversationId": queued_fixture.conversation_id,
+                "folderId": queued_fixture.folder_id,
+            }),
+        ),
+    )
+    .await
+    .expect("shared fork rejection must not wait on the legacy driver");
+    queued_fork
+        .assert_status_conflict()
+        .assert_code("shared_session_protocol_required");
+    assert_eq!(
+        queued_fixture
+            .manager()
+            .shared_session_broker()
+            .diagnostic_for_connection(&queued.connection_id)
+            .await
+            .unwrap()
+            .queue
+            .len(),
+        1
+    );
+
+    let active_fixture = ready_shared_http_fixture().await;
+    let active = active_fixture
+        .post_connect(
+            "fork-active-device",
+            "fork-active-client",
+            "fork-active-connect",
+        )
+        .await
+        .assert_status_ok()
+        .json::<AcpConnectOrAttachResponse>();
+    active_fixture
+        .manager()
+        .wait_for_shared_phase(
+            &active.connection_id,
+            active.generation,
+            SharedSessionPhase::Ready,
+        )
+        .await
+        .unwrap();
+    let (mut commands, _controls) = active_fixture
+        .manager()
+        .install_test_shared_connection_lanes(&active.connection_id)
+        .await
+        .unwrap();
+    active_fixture
+        .post_json(
+            "/acp_prompt",
+            json!({
+                "connectionId": active.connection_id,
+                "generation": active.generation,
+                "leaseId": active.lease_id,
+                "clientInstanceId": "fork-active-client",
+                "clientRequestId": "fork-active-prompt",
+                "clientMessageId": "fork-active-message",
+                "blocks": [{"type": "text", "text": "active before fork"}],
+                "folderId": active_fixture.folder_id,
+                "conversationId": active_fixture.conversation_id,
+            }),
+        )
+        .await
+        .assert_status_ok();
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(2), commands.recv())
+            .await
+            .unwrap(),
+        Some(ConnectionCommand::Prompt { .. })
+    ));
+    active_fixture
+        .post_json(
+            "/acp_fork",
+            json!({
+                "connectionId": active.connection_id,
+                "conversationId": active_fixture.conversation_id,
+                "folderId": active_fixture.folder_id,
+            }),
+        )
+        .await
+        .assert_status_conflict()
+        .assert_code("shared_session_protocol_required");
+    assert!(active_fixture
+        .manager()
+        .shared_session_broker()
+        .diagnostic_for_connection(&active.connection_id)
+        .await
+        .unwrap()
+        .active_turn
+        .is_some());
+}
+
+#[tokio::test]
 async fn shared_stop_and_interaction_mutations_require_generation_and_lease() {
     let fixture = shared_http_fixture_with_pending_bootstrap().await;
     let attached = fixture
@@ -1687,6 +1823,140 @@ async fn shared_stop_and_interaction_mutations_require_generation_and_lease() {
             .await
             .assert_status_conflict()
             .assert_code("shared_session_protocol_required");
+    }
+}
+
+#[tokio::test]
+async fn mode_configuration_and_goal_mutations_require_the_current_shared_guard() {
+    let fixture = ready_shared_http_fixture().await;
+    let attached = fixture
+        .post_connect("settings-device", "settings-client", "settings-connect")
+        .await
+        .assert_status_ok()
+        .json::<AcpConnectOrAttachResponse>();
+    fixture
+        .manager()
+        .wait_for_shared_phase(
+            &attached.connection_id,
+            attached.generation,
+            SharedSessionPhase::Ready,
+        )
+        .await
+        .unwrap();
+    let (_commands, _controls) = fixture
+        .manager()
+        .install_test_shared_connection_lanes(&attached.connection_id)
+        .await
+        .unwrap();
+
+    let families = [
+        (
+            "/acp_set_mode",
+            json!({"connectionId": attached.connection_id, "modeId": "plan"}),
+        ),
+        (
+            "/acp_set_config_option",
+            json!({
+                "connectionId": attached.connection_id,
+                "configId": "model",
+                "valueId": "gpt-5",
+            }),
+        ),
+        (
+            "/acp_goal_control",
+            json!({"connectionId": attached.connection_id, "action": "pause"}),
+        ),
+    ];
+
+    for (route, body) in &families {
+        fixture
+            .post_json(route, body.clone())
+            .await
+            .assert_status_conflict()
+            .assert_code("shared_session_protocol_required");
+
+        let mut stale_generation = body.clone();
+        stale_generation["generation"] = json!(attached.generation + 1);
+        stale_generation["leaseId"] = json!(attached.lease_id);
+        fixture
+            .post_json(route, stale_generation)
+            .await
+            .assert_status_conflict()
+            .assert_code("shared_session_generation_stale");
+
+        let mut wrong_lease = body.clone();
+        wrong_lease["generation"] = json!(attached.generation);
+        wrong_lease["leaseId"] = json!("wrong-lease");
+        fixture
+            .post_json(route, wrong_lease)
+            .await
+            .assert_status_conflict()
+            .assert_code("client_lease_missing");
+
+        let mut valid = body.clone();
+        valid["generation"] = json!(attached.generation);
+        valid["leaseId"] = json!(attached.lease_id);
+        fixture.post_json(route, valid).await.assert_status_ok();
+    }
+
+    let released = fixture
+        .post_connect(
+            "settings-release-device",
+            "settings-release-client",
+            "settings-release-connect",
+        )
+        .await
+        .assert_status_ok()
+        .json::<AcpConnectOrAttachResponse>();
+    fixture
+        .post_json(
+            "/acp_release_lease",
+            json!({
+                "connectionId": released.connection_id,
+                "generation": released.generation,
+                "leaseId": released.lease_id,
+            }),
+        )
+        .await
+        .assert_status_ok();
+    for (route, body) in &families {
+        let mut released_guard = body.clone();
+        released_guard["generation"] = json!(released.generation);
+        released_guard["leaseId"] = json!(released.lease_id);
+        fixture
+            .post_json(route, released_guard)
+            .await
+            .assert_status_conflict()
+            .assert_code("client_lease_missing");
+    }
+
+    fixture
+        .manager()
+        .configure_shared_client_lease_ttl(Duration::from_millis(1));
+    let expiring = fixture
+        .post_connect(
+            "settings-device",
+            "settings-client",
+            "settings-renew-connect",
+        )
+        .await
+        .assert_status_ok()
+        .json::<AcpConnectOrAttachResponse>();
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    fixture
+        .manager()
+        .shared_session_broker()
+        .expire_leases(tokio::time::Instant::now())
+        .await;
+    for (route, body) in &families {
+        let mut expired = body.clone();
+        expired["generation"] = json!(expiring.generation);
+        expired["leaseId"] = json!(expiring.lease_id);
+        fixture
+            .post_json(route, expired)
+            .await
+            .assert_status_gone()
+            .assert_code("client_lease_expired");
     }
 }
 
