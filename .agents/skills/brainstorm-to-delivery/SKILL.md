@@ -132,18 +132,87 @@ request a user decision while preserving its admitted route.
 
 ## 3. Review and revise Design
 
-When the Design needs review, always dispatch an independent Codex Design
-Reviewer. Dispatch every user-named Design Reviewer as an additional separate
-document-only work unit. Never let a user-named reviewer replace the Codex
-Design Reviewer. Use design|DESIGN_PATH|reviewer|AGENT|PROFILE for each
-reviewer. Dispatch an independent Codex Design Fixer on
-design|DESIGN_PATH|fixer|codex|none.
+Trigger Design review when the Brainstorm spans modules, migration,
+concurrency, security, persistence, externally visible compatibility, or
+material ambiguity. Always dispatch an independent Codex Design Reviewer when
+any trigger is present. Dispatch every user-named Design Reviewer as an
+additional separate document-only work unit. Never let a user-named reviewer
+replace the Codex Design Reviewer. Use
+design|DESIGN_PATH|reviewer|AGENT|PROFILE for each reviewer. Dispatch an
+independent Codex Design Fixer on design|DESIGN_PATH|fixer|codex|none.
 
 Adjudicate findings against current artifacts. Continue the same Design Fixer
 for revisions and continue each separate reviewer for re-review. Request a
 user decision for requirement, scope, architecture, or user-data changes.
 Require covering Design reviews to approve the same latest Design. Keep
 user-named Design and Plan reviewers within document review roles.
+
+### Operational policy JSON
+
+Apply this exact inline policy. Treat each hard or soft array entry as an
+evidence object, count each distinct active soft signal once, and reject every
+condition named by `invalid`.
+
+Emit an active hard trigger as `{"kind":"...","evidence":["..."]}`. Emit an
+active soft signal as
+`{"kind":"...","score":N,"evidence":["..."]}` with its fixed score. Use an
+empty signal array when that class is inactive; reject bare names and empty
+evidence arrays.
+
+```json
+{
+  "design_review_triggers": [
+    "spans_modules",
+    "migration",
+    "concurrency",
+    "security",
+    "persistence",
+    "externally_visible_compatibility",
+    "material_ambiguity"
+  ],
+  "risk_policy": {
+    "version": "b2d_task_risk_v1",
+    "hard_triggers": [
+      { "kind": "concurrency_lifecycle", "trigger": "Threading, async coordination, cancellation, ordering, ownership lifetime, or process lifecycle behavior changes" },
+      { "kind": "security_trust_boundary", "trigger": "Authentication, authorization, secrets, sandboxing, trust-boundary validation, or privilege changes" },
+      { "kind": "migration_destructive_persistence", "trigger": "Schema/data migration, deletion, irreversible persistence, or destructive state transitions" },
+      { "kind": "public_compatibility", "trigger": "Public API, protocol, schema, serialized format, or externally consumed behavior changes" },
+      { "kind": "unsafe_ffi", "trigger": "Rust unsafe, native FFI, ABI, memory ownership, or equivalent low-level boundaries" },
+      { "kind": "update_rollback", "trigger": "Installer, updater, rollback, recovery, or version-transition behavior changes" }
+    ],
+    "soft_signals": [
+      { "kind": "cross_runtime_or_process", "score": 2, "trigger": "Changes code or a contract across runtime or process boundaries" },
+      { "kind": "broad_production_surface", "score": 1, "trigger": "Touches at least five production files, excluding tests, docs, snapshots, and generated output" },
+      { "kind": "multiple_ownership_modules", "score": 1, "trigger": "Touches at least two independently owned modules or subsystems" },
+      { "kind": "shared_interface", "score": 1, "trigger": "Changes an interface or contract consumed outside the owning module" },
+      { "kind": "dependency_or_build", "score": 1, "trigger": "Changes dependencies, lockfiles, build configuration, packaging, or deployment" },
+      { "kind": "multi_layer_without_test_seam", "score": 1, "trigger": "Spans at least two architectural layers without an isolated boundary test seam" }
+    ],
+    "evidence_fields": {
+      "hard_trigger": ["kind", "evidence"],
+      "soft_signal": ["kind", "score", "evidence"],
+      "evidence": "non-empty file, module, or interface facts"
+    },
+    "arithmetic": {
+      "distinct_active_signal_count": 1,
+      "any_hard_trigger_level": "high",
+      "normal_soft_score_range": [0, 2],
+      "high_soft_score_minimum": 3,
+      "invalid": "unknown, duplicate, contradictory, incorrect, or evidence-free"
+    }
+  },
+  "byte_limits": {
+    "plan_document": 2097152,
+    "routing_block": 262144,
+    "progress_document": 524288,
+    "progress_block": 65536
+  }
+}
+```
+
+Keep the Plan document at or below 2 MiB and its routing block at or below 256
+KiB. Keep the progress document at or below 512 KiB and its structured block
+at or below 64 KiB.
 
 ## 4. Author and review Plan
 
@@ -166,6 +235,50 @@ Preserve an archived legacy Simple run on its recorded route. Before the next
 pending Task adopts adaptive routing, route a complete routing block through
 Plan Author revision, deterministic validation, and full Plan re-review.
 
+### Plan routing JSON
+
+Emit this complete JSON shape inside the single routing marker. Repeat the
+generation and Task entries as needed, and keep Task order identical to Plan
+headings.
+
+```json
+{
+  "schema_version": 1,
+  "risk_policy_version": "b2d_task_risk_v1",
+  "task_agent_generations": [
+    {
+      "generation": 1,
+      "agent_type": "grok",
+      "profile_id": null,
+      "effective_from_task_index": 1
+    }
+  ],
+  "tasks": [
+    {
+      "index": 1,
+      "task_agent_generation": 1,
+      "risk": {
+        "level": "high",
+        "hard_triggers": [],
+        "soft_signals": [
+          { "kind": "cross_runtime_or_process", "score": 2, "evidence": ["src/lib/transport", "src-tauri/src/web"] },
+          { "kind": "shared_interface", "score": 1, "evidence": ["transport request contract"] }
+        ],
+        "score": 3,
+        "reason": "Changes a shared desktop/server transport boundary."
+      },
+      "route": {
+        "implementer": { "agent_type": "codex", "profile_id": null },
+        "reviewers": [
+          { "slot": "primary", "agent_type": "codex", "profile_id": null },
+          { "slot": "auxiliary", "agent_type": "grok", "profile_id": null }
+        ]
+      }
+    }
+  ]
+}
+```
+
 ## 5. Maintain progress
 
 Keep Plan Task indices, risk level, Task Agent generation, expected work-unit
@@ -185,6 +298,51 @@ and key. Call generic delegation. After admission, record task and child
 conversation IDs. After each observation, record the latest state. Keep
 task_id globally unique and attach one non-null child conversation to only one
 complete work-unit key.
+
+### Progress JSON
+
+Maintain this complete JSON shape inside the single progress marker. Repeat
+Task and run entries without dropping route or lineage fields.
+
+```json
+{
+  "schema_version": 1,
+  "plan_rel_path": "docs/superpowers/plans/example.md",
+  "active_task_index": 1,
+  "tasks": [
+    {
+      "index": 1,
+      "status": "in_progress",
+      "commit": null,
+      "risk_level": "high",
+      "task_agent_generation": 1,
+      "expected_work_unit_keys": {
+        "implementer": "task|1|implementer|codex|none",
+        "reviewers": {
+          "primary": "task|1|reviewer|primary|codex|none",
+          "auxiliary": "task|1|reviewer|auxiliary|grok|none"
+        }
+      },
+      "runs": [
+        {
+          "role": "implementer",
+          "agent_type": "codex",
+          "profile_id": null,
+          "task_id": null,
+          "child_conversation_id": null,
+          "state": "reserving",
+          "work_unit_key": "task|1|implementer|codex|none",
+          "recovery_count": 0,
+          "replaced_task_id": null,
+          "replacement_reason": null
+        }
+      ]
+    }
+  ],
+  "final_review_status": "pending",
+  "updated_at": "2026-08-16T00:00:00Z"
+}
+```
 
 ## 6. Apply the workspace gate
 

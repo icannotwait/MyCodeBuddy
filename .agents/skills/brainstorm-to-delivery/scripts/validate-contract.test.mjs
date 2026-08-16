@@ -7,6 +7,7 @@ import {
   MAX_ROUTING_BLOCK_BYTES,
   deriveExpectedRoute,
   parseSimplePlan,
+  parseSimpleProgress,
   parseSimpleRouting,
   validateProgressRouting,
   validateRoutingSnapshot,
@@ -336,6 +337,16 @@ function has(failures, rule) {
   )
 }
 
+function fencedJsonAfterHeading(markdown, heading) {
+  const headingIndex = markdown.indexOf(heading)
+  assert.notEqual(headingIndex, -1, `missing Skill heading: ${heading}`)
+  const match = markdown
+    .slice(headingIndex + heading.length)
+    .match(/\n```json\n([\s\S]*?)\n```/)
+  assert.ok(match, `missing JSON contract after: ${heading}`)
+  return JSON.parse(match[1])
+}
+
 describe("Skill contract v2", () => {
   it("accepts the exact nine-phase ownership contract and production Skill", () => {
     assert.deepEqual(validateSkillMarkdown(skill).failures, [])
@@ -399,6 +410,142 @@ describe("Skill contract v2", () => {
     ]) {
       has(validateSkillMarkdown(`${skill}\n${prose}`).failures, "B2D-SKILL-005")
     }
+  })
+
+  it("rejects bounded ownership and route directive paraphrases", () => {
+    for (const prose of [
+      "The parent writes and revises every Plan.",
+      "Grok implements every Task, including high Tasks.",
+      "The parent authors all Design documents and Plans.",
+      "The Task Agent owns implementation for each high-risk Task.",
+    ]) {
+      has(validateSkillMarkdown(`${skill}\n${prose}`).failures, "B2D-SKILL-005")
+    }
+
+    assert.deepEqual(
+      validateSkillMarkdown(
+        `${skill}\nKeep the parent from writing the Plan. Route a selected Grok Agent only to normal Tasks.`
+      ).failures,
+      []
+    )
+  })
+
+  it("contains the complete operational policy and document JSON shapes", () => {
+    const policy = fencedJsonAfterHeading(
+      realSkill,
+      "### Operational policy JSON"
+    )
+    assert.deepEqual(policy.design_review_triggers, [
+      "spans_modules",
+      "migration",
+      "concurrency",
+      "security",
+      "persistence",
+      "externally_visible_compatibility",
+      "material_ambiguity",
+    ])
+    assert.deepEqual(
+      policy.risk_policy.hard_triggers.map(({ kind }) => kind),
+      [
+        "concurrency_lifecycle",
+        "security_trust_boundary",
+        "migration_destructive_persistence",
+        "public_compatibility",
+        "unsafe_ffi",
+        "update_rollback",
+      ]
+    )
+    assert.deepEqual(
+      policy.risk_policy.soft_signals.map(({ kind, score }) => [kind, score]),
+      [
+        ["cross_runtime_or_process", 2],
+        ["broad_production_surface", 1],
+        ["multiple_ownership_modules", 1],
+        ["shared_interface", 1],
+        ["dependency_or_build", 1],
+        ["multi_layer_without_test_seam", 1],
+      ]
+    )
+    assert.deepEqual(policy.risk_policy.evidence_fields, {
+      hard_trigger: ["kind", "evidence"],
+      soft_signal: ["kind", "score", "evidence"],
+      evidence: "non-empty file, module, or interface facts",
+    })
+    assert.deepEqual(policy.risk_policy.arithmetic, {
+      distinct_active_signal_count: 1,
+      any_hard_trigger_level: "high",
+      normal_soft_score_range: [0, 2],
+      high_soft_score_minimum: 3,
+      invalid: "unknown, duplicate, contradictory, incorrect, or evidence-free",
+    })
+    assert.deepEqual(policy.byte_limits, {
+      plan_document: 2 * 1024 * 1024,
+      routing_block: 256 * 1024,
+      progress_document: 512 * 1024,
+      progress_block: 64 * 1024,
+    })
+
+    const planShape = fencedJsonAfterHeading(realSkill, "### Plan routing JSON")
+    assert.deepEqual(Object.keys(planShape), [
+      "schema_version",
+      "risk_policy_version",
+      "task_agent_generations",
+      "tasks",
+    ])
+    assert.deepEqual(Object.keys(planShape.task_agent_generations[0]), [
+      "generation",
+      "agent_type",
+      "profile_id",
+      "effective_from_task_index",
+    ])
+    assert.deepEqual(Object.keys(planShape.tasks[0]), [
+      "index",
+      "task_agent_generation",
+      "risk",
+      "route",
+    ])
+    assert.deepEqual(Object.keys(planShape.tasks[0].risk), [
+      "level",
+      "hard_triggers",
+      "soft_signals",
+      "score",
+      "reason",
+    ])
+    assert.deepEqual(Object.keys(planShape.tasks[0].route), [
+      "implementer",
+      "reviewers",
+    ])
+
+    const progressShape = fencedJsonAfterHeading(realSkill, "### Progress JSON")
+    assert.deepEqual(Object.keys(progressShape), [
+      "schema_version",
+      "plan_rel_path",
+      "active_task_index",
+      "tasks",
+      "final_review_status",
+      "updated_at",
+    ])
+    assert.deepEqual(Object.keys(progressShape.tasks[0]), [
+      "index",
+      "status",
+      "commit",
+      "risk_level",
+      "task_agent_generation",
+      "expected_work_unit_keys",
+      "runs",
+    ])
+    assert.deepEqual(Object.keys(progressShape.tasks[0].runs[0]), [
+      "role",
+      "agent_type",
+      "profile_id",
+      "task_id",
+      "child_conversation_id",
+      "state",
+      "work_unit_key",
+      "recovery_count",
+      "replaced_task_id",
+      "replacement_reason",
+    ])
   })
 })
 
@@ -817,7 +964,7 @@ describe("progress agreement and per-key lineage", () => {
     has(validate(routing(), children), "B2D-PROGRESS-006")
   })
 
-  it("reads legacy reviewer as primary but requires explicit routed primary", () => {
+  it("requires routing authoritatively while preserving markerless parser compatibility", () => {
     const legacyProgress = {
       schema_version: 1,
       plan_rel_path: planRelPath,
@@ -836,18 +983,30 @@ describe("progress agreement and per-key lineage", () => {
       final_review_status: "pending",
       updated_at: null,
     }
+    const legacyPlanMarkdown = "# Plan\n\n## Task 1: Legacy\n"
+    const legacyProgressMarkdown = `# Progress\n${block(
+      "codeg-simple-progress-v1",
+      legacyProgress
+    )}`
+    const parsedPlan = parseSimplePlan(legacyPlanMarkdown)
+    assert.deepEqual(parsedPlan.failures, [])
+    assert.equal(parsedPlan.routing, null)
     assert.deepEqual(
-      validateSimpleDocuments({
-        skillMarkdown: skill,
-        planMarkdown: "# Plan\n\n## Task 1: Legacy\n",
-        progressMarkdown: `# Progress\n${block(
-          "codeg-simple-progress-v1",
-          legacyProgress
-        )}`,
-        planRelPath,
-      }).failures,
+      parseSimpleProgress(legacyProgressMarkdown, planRelPath, parsedPlan)
+        .failures,
       []
     )
+
+    has(
+      validateSimpleDocuments({
+        skillMarkdown: skill,
+        planMarkdown: legacyPlanMarkdown,
+        progressMarkdown: legacyProgressMarkdown,
+        planRelPath,
+      }).failures,
+      "B2D-ROUTING-001"
+    )
+
     const routed = progress()
     routed.tasks[0].runs[1].work_unit_key = "task|1|reviewer|codex|none"
     has(validate(routing(), routed), "B2D-PROGRESS-009")
@@ -987,6 +1146,46 @@ describe("progress agreement and per-key lineage", () => {
       mutate(state)
       has(validate(route, state), "B2D-ROUTING-007")
     }
+  })
+
+  it("requires the entire pending suffix to have empty runs at a new generation boundary", () => {
+    const route = routing()
+    const selected = identity("gemini", "careful")
+    route.task_agent_generations.push({
+      generation: 2,
+      ...selected,
+      effective_from_task_index: 2,
+    })
+    route.tasks[1] = task(2, "normal", selected, 2)
+    route.tasks.push(task(3, "normal", selected, 2))
+    const routedPlan = `${plan(route)}\n## Task 3: Dirty later Task\n`
+    const state = progress(route)
+    state.tasks.push(progressTask(route.tasks[2], "pending", 30))
+    state.tasks[2].runs.push(
+      run(
+        state.tasks[2].expected_work_unit_keys.implementer,
+        "reserving",
+        "reserved-later",
+        null
+      )
+    )
+
+    has(validate(route, state, routedPlan), "B2D-ROUTING-007")
+  })
+
+  it("returns deterministic failures for null Tasks during generation validation", () => {
+    const route = routing()
+    route.task_agent_generations.push({
+      generation: 2,
+      ...identity("gemini"),
+      effective_from_task_index: 2,
+    })
+    route.tasks[1] = task(2, "normal", identity("gemini"), 2)
+    const state = progress(route)
+    state.tasks = [null]
+
+    assert.doesNotThrow(() => validate(route, state))
+    has(validate(route, state), "B2D-PROGRESS-005")
   })
 
   it("exposes pure routing/progress agreement functions", () => {

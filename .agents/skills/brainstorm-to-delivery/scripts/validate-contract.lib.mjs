@@ -251,15 +251,75 @@ const RETIRED_WORKFLOW_IDENTIFIERS = [
   "artifact_digest",
   "reviewed_task_id",
 ]
-const CONTRADICTORY_SKILL_PROSE = [
-  /\bthe parent revises the plan directly\b/i,
-  /\balways use grok as the implementer\b/i,
-  /\buse the task agent to implement high tasks\b/i,
-  /\breuse one codex conversation for implementation and review\b/i,
-  /\bswitch agent immediately inside the active task\b/i,
-  /\bskip the auxiliary review after a high-task fix\b/i,
-  /\buse that reviewer instead of the codex design reviewer\b/i,
-]
+const DIRECTIVE_WINDOW_TOKENS = 64
+const DIRECTIVE_WINDOW_OVERLAP = 16
+// Match bounded directive structures only; the embedded positive contract
+// remains the authoritative workflow definition.
+const PRODUCTION_ACTIONS = new Set([
+  "author",
+  "authors",
+  "authoring",
+  "change",
+  "changes",
+  "changing",
+  "create",
+  "creates",
+  "creating",
+  "edit",
+  "edits",
+  "editing",
+  "fix",
+  "fixes",
+  "fixing",
+  "implement",
+  "implementation",
+  "implementer",
+  "implements",
+  "implementing",
+  "modify",
+  "modifies",
+  "modifying",
+  "own",
+  "owns",
+  "patch",
+  "patches",
+  "patching",
+  "produce",
+  "produces",
+  "producing",
+  "revise",
+  "revises",
+  "revising",
+  "write",
+  "writes",
+  "writing",
+])
+const DOCUMENT_OR_CODE_TARGETS = new Set([
+  "code",
+  "design",
+  "designs",
+  "implementation",
+  "plan",
+  "plans",
+  "task",
+  "tasks",
+])
+const NEGATION_TERMS = new Set([
+  "forbid",
+  "forbidden",
+  "forbids",
+  "never",
+  "no",
+  "not",
+  "prevent",
+  "prevented",
+  "preventing",
+  "prevents",
+  "prohibit",
+  "prohibited",
+  "prohibits",
+  "without",
+])
 const FORBIDDEN_PROGRESS_FIELDS = new Set([
   "workflow_id",
   "workflow_kind",
@@ -573,6 +633,167 @@ function unfencedVisibleSkillProse(skill) {
   return visibleSkillProse(lines.join("\n"))
 }
 
+function directiveWindows(prose) {
+  const windows = []
+  const step = DIRECTIVE_WINDOW_TOKENS - DIRECTIVE_WINDOW_OVERLAP
+  const withoutKeys = prose.replace(
+    /\b(?:design|final_review|plan|task)\|[^\s.,;:]+/gi,
+    " "
+  )
+  for (const clause of withoutKeys
+    .normalize("NFKC")
+    .toLowerCase()
+    .split(/[.!?]+|\n\s*\n+/)) {
+    const tokens = clause.match(/[a-z0-9]+(?:-[a-z0-9]+)*/g) ?? []
+    for (let start = 0; start < tokens.length; start += step) {
+      windows.push(tokens.slice(start, start + DIRECTIVE_WINDOW_TOKENS))
+    }
+  }
+  return windows
+}
+
+function tokenIndex(tokens, candidates, start = 0, end = tokens.length) {
+  const limit = Math.min(tokens.length, end)
+  for (let index = Math.max(0, start); index < limit; index += 1) {
+    if (candidates.has(tokens[index])) return index
+  }
+  return -1
+}
+
+function phraseIndex(tokens, phrase) {
+  for (let index = 0; index <= tokens.length - phrase.length; index += 1) {
+    if (phrase.every((token, offset) => tokens[index + offset] === token)) {
+      return index
+    }
+  }
+  return -1
+}
+
+function actionIsNegated(tokens, actionIndex) {
+  const prefix = tokens.slice(Math.max(0, actionIndex - 6), actionIndex)
+  return (
+    prefix.some((token) => NEGATION_TERMS.has(token)) ||
+    prefix.at(-1) === "from"
+  )
+}
+
+function conflictsWithParentOwnership(tokens) {
+  const parent = tokenIndex(tokens, new Set(["parent"]))
+  if (parent < 0) return false
+  const action = tokenIndex(tokens, PRODUCTION_ACTIONS, parent + 1, parent + 12)
+  if (action < 0 || actionIsNegated(tokens, action)) return false
+  return (
+    tokenIndex(tokens, DOCUMENT_OR_CODE_TARGETS, action + 1, action + 10) >= 0
+  )
+}
+
+function conflictsWithTaskAgentRoute(tokens) {
+  const actor = Math.max(
+    tokenIndex(tokens, new Set(["grok"])),
+    phraseIndex(tokens, ["task", "agent"])
+  )
+  if (actor < 0) return false
+  let action = tokenIndex(tokens, PRODUCTION_ACTIONS, actor + 1, actor + 9)
+  while (action >= 0 && tokens[action - 1] === "codex") {
+    action = tokenIndex(tokens, PRODUCTION_ACTIONS, action + 1, actor + 9)
+  }
+  if (action < 0 || actionIsNegated(tokens, action)) return false
+  const hasTask = tokenIndex(tokens, new Set(["task", "tasks"])) >= 0
+  const hasHighScope = tokenIndex(tokens, new Set(["high", "high-risk"])) >= 0
+  const hasUniversalScope =
+    tokenIndex(
+      tokens,
+      new Set(["all", "always", "each", "every", "unconditionally"])
+    ) >= 0
+  return (
+    hasHighScope ||
+    (hasUniversalScope && (hasTask || tokens[action] === "implementer"))
+  )
+}
+
+function conflictsWithConversationIdentity(tokens) {
+  const reuse = tokenIndex(
+    tokens,
+    new Set(["reuse", "reuses", "reusing", "share", "shares", "sharing"])
+  )
+  if (reuse < 0 || actionIsNegated(tokens, reuse)) return false
+  return (
+    tokenIndex(tokens, new Set(["conversation", "conversations"])) >= 0 &&
+    tokenIndex(tokens, new Set(["implementation", "implementer"])) >= 0 &&
+    tokenIndex(tokens, new Set(["review", "reviewer", "reviewers"])) >= 0
+  )
+}
+
+function conflictsWithActiveTaskSwitch(tokens) {
+  const change = tokenIndex(
+    tokens,
+    new Set([
+      "change",
+      "changes",
+      "changing",
+      "replace",
+      "replaces",
+      "replacing",
+      "switch",
+      "switches",
+      "switching",
+    ])
+  )
+  if (change < 0 || actionIsNegated(tokens, change)) return false
+  const hasAgent =
+    tokenIndex(tokens, new Set(["agent", "agents"])) >= 0 ||
+    phraseIndex(tokens, ["task", "agent"]) >= 0
+  const hasActiveTask =
+    tokenIndex(tokens, new Set(["active", "current"])) >= 0 &&
+    tokenIndex(tokens, new Set(["task", "tasks"])) >= 0
+  return hasAgent && hasActiveTask
+}
+
+function conflictsWithRequiredReview(tokens) {
+  const hasReview =
+    tokenIndex(tokens, new Set(["review", "reviewer", "reviewers"])) >= 0
+  if (!hasReview) return false
+
+  const bypass = tokenIndex(
+    tokens,
+    new Set([
+      "instead",
+      "omit",
+      "omits",
+      "omitting",
+      "replace",
+      "replaces",
+      "replacing",
+      "skip",
+      "skips",
+      "skipping",
+      "substitute",
+      "substitutes",
+      "substituting",
+    ])
+  )
+  if (bypass < 0 || actionIsNegated(tokens, bypass)) return false
+
+  const skipsAuxiliaryRereview =
+    tokenIndex(tokens, new Set(["auxiliary"])) >= 0 &&
+    tokenIndex(tokens, new Set(["fix", "fixes", "fixed", "fixing"])) >= 0
+  const replacesCodexDesignReview =
+    tokenIndex(tokens, new Set(["codex"])) >= 0 &&
+    tokenIndex(tokens, new Set(["design"])) >= 0
+  return skipsAuxiliaryRereview || replacesCodexDesignReview
+}
+
+function hasConflictingSkillDirective(prose) {
+  return directiveWindows(prose).some(
+    (tokens) =>
+      conflictsWithParentOwnership(tokens) ||
+      conflictsWithTaskAgentRoute(tokens) ||
+      conflictsWithConversationIdentity(tokens) ||
+      conflictsWithActiveTaskSwitch(tokens) ||
+      conflictsWithRequiredReview(tokens)
+  )
+}
+
 function hasSubstantiveSkillProse(body) {
   const prose = visibleSkillProse(body)
     .replace(/`[^`\r\n]*`/g, " ")
@@ -733,7 +954,7 @@ export function validateSkillMarkdown(skillMarkdown) {
 
   validateOrderedSkillContract(skill, failures)
   const prose = unfencedVisibleSkillProse(skill)
-  if (CONTRADICTORY_SKILL_PROSE.some((pattern) => pattern.test(prose))) {
+  if (hasConflictingSkillDirective(prose)) {
     fail(
       failures,
       "B2D-SKILL-005",
@@ -1684,14 +1905,25 @@ export function validateProgressRouting(snapshot, routing, failures) {
     const boundaryRoute = routing.tasks.find(
       (task) => task.index === generation.effective_from_task_index
     )
-    const prior = snapshot.tasks.filter(
-      (task) => task.index < generation.effective_from_task_index
+    const prior = routing.tasks
+      .filter((task) => task.index < generation.effective_from_task_index)
+      .map((task) => progressByIndex.get(task.index))
+    const suffix = routing.tasks
+      .filter((task) => task.index >= generation.effective_from_task_index)
+      .map((task) => progressByIndex.get(task.index))
+    const pendingSuffixIsClean = suffix.every(
+      (task) =>
+        task?.status === "pending" &&
+        Array.isArray(task.runs) &&
+        task.runs.length === 0
     )
-    const priorCompleted = prior.every((task) => task.status === "completed")
+    const priorCompleted = prior.every((task) => task?.status === "completed")
     const boundaryRuns = Array.isArray(boundary?.runs) ? boundary.runs : []
     const emptyPendingBoundary =
       boundary?.status === "pending" &&
+      Array.isArray(boundary.runs) &&
       boundaryRuns.length === 0 &&
+      pendingSuffixIsClean &&
       snapshot.active_task_index === null
     const frozenRouteMatches =
       boundary?.risk_level === boundaryRoute?.risk?.level &&
@@ -1722,7 +1954,7 @@ export function validateProgressRouting(snapshot, routing, failures) {
       fail(
         failures,
         "B2D-ROUTING-007",
-        `generation ${generation.generation} is neither awaiting adoption at an empty pending boundary nor frozen on its admitted route`
+        `generation ${generation.generation} is neither awaiting adoption across a clean pending suffix nor frozen on its admitted route`
       )
     }
   }
@@ -1826,6 +2058,16 @@ export function validateSimpleDocuments({
   const skill = validateSkillMarkdown(skillMarkdown)
   const plan = parseSimplePlan(planMarkdown)
   const routingFailures = []
+  if (
+    !plan.routing &&
+    !plan.failures.some((failure) => failure.startsWith("[B2D-ROUTING-"))
+  ) {
+    fail(
+      routingFailures,
+      "B2D-ROUTING-001",
+      "authoritative document validation requires exactly one routing block"
+    )
+  }
   const routing = plan.routing
     ? validateRoutingSnapshot(plan.routing, plan, routingFailures)
     : null
