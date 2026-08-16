@@ -4163,6 +4163,315 @@ describe("Skill contract v2", () => {
     ])
   })
 
+  it("round-16 binds imperative objects and possessive Task components", () => {
+    assertSkillClassifications([
+      {
+        prose:
+          "After completion of the active Task: test running software, then switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "After completion of the active Task: please review pending work, then switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "After completion of the active Task: please test running code, then switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "After completion of the active Task: please review pending issue, then switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "After completion of the active Task: review pending issue, then switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The active Task is completed but the server's review is still running. Then switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "After completion of the active Task: please review the pending issue, then switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The active Task is completed but the Task's review is still running. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The active Task is completed but its review is still running. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "After completion of the active Task (review pending final approval), switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "After completion of the active Task (test running software), switch the Task Agent.",
+        reject: false,
+      },
+    ])
+  })
+
+  it("round-16 preserves explicit role heads after reviewer modifiers", () => {
+    assertSkillClassifications([
+      {
+        prose:
+          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of that previously assigned reviewer contact person.",
+        reject: false,
+      },
+      {
+        prose:
+          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of that previously assigned reviewer note taker.",
+        reject: false,
+      },
+      {
+        prose:
+          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of that previously assigned reviewer.",
+        reject: true,
+      },
+      {
+        prose:
+          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required primary reviewer.",
+        reject: true,
+      },
+      {
+        prose:
+          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of that previously assigned reviewer from before.",
+        reject: true,
+      },
+      {
+        prose:
+          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of that previously assigned reviewer who served earlier.",
+        reject: true,
+      },
+      {
+        prose:
+          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of that previously assigned reviewer that was assigned earlier.",
+        reject: true,
+      },
+    ])
+  })
+
+  it("round-16 bounds people relations at document heads and purpose clauses", () => {
+    assertSkillClassifications([
+      {
+        prose:
+          "The developers revise the Plan and Design after consulting both reviewer and producer Plans. The parent edits both of them.",
+        reject: true,
+      },
+      {
+        prose:
+          "The developers revise the Plan and Design after consulting both reviewer and producer. The parent updates both of them.",
+        reject: false,
+      },
+      {
+        prose:
+          "The developers revise the Plan and Design for clarity in order that three reviewers can respond. The parent edits both of them.",
+        reject: true,
+      },
+      {
+        prose:
+          "The developers revise the Plan and Design for clarity in order for three reviewers to respond. The parent edits both of them.",
+        reject: true,
+      },
+      {
+        prose:
+          "The developers revise the Plan and Design for clarity so that three reviewers can respond. The parent edits both of them.",
+        reject: true,
+      },
+      {
+        prose:
+          "The developers revise the Plan and Design for clarity, allowing three reviewers to respond. The parent edits both of them.",
+        reject: true,
+      },
+      {
+        prose:
+          "The developers revise the Plan and Design for three reviewers to use. The parent edits both of them.",
+        reject: true,
+      },
+      {
+        prose:
+          "The developers revise the Plan and Design with both reviewers to advise. The parent edits both of them.",
+        reject: false,
+      },
+    ])
+  })
+
+  it("round-16 keeps modified lacking-in predicates transitive", () => {
+    assertSkillClassifications([
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is lacking completely in experience.",
+        reject: false,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is lacking completely in critical context.",
+        reject: false,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is lacking entirely in experience.",
+        reject: false,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is lacking entirely in critical context.",
+        reject: false,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is lacking severely in experience.",
+        reject: false,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is lacking completely.",
+        reject: true,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is lacking in experience.",
+        reject: false,
+      },
+    ])
+  })
+
+  it("round-16 recognizes subject-first Agent change bridges", () => {
+    assertSkillClassifications([
+      ...["will", "must", "should", "can", "may"].map((modal) => ({
+        prose: `The active Task is running. The Task Agent ${modal} switch immediately.`,
+        reject: true,
+      })),
+      {
+        prose:
+          "The active Task is running. The Task Agent then switches immediately.",
+        reject: true,
+      },
+      {
+        prose:
+          "The active Task is running. The Task Agent itself switches immediately.",
+        reject: true,
+      },
+      {
+        prose:
+          "The active Task is running. The Task Agent later switches immediately.",
+        reject: true,
+      },
+      {
+        prose:
+          "The active Task is running. The Task Agent will not switch immediately.",
+        reject: false,
+      },
+      {
+        prose:
+          "The active Task is completed. The Task Agent will switch immediately.",
+        reject: false,
+      },
+      {
+        prose:
+          "The active Task is running. The build server will switch immediately.",
+        reject: false,
+      },
+    ])
+  })
+
+  it("round-16 lets later full completion supersede partial completion", () => {
+    assertSkillClassifications([
+      {
+        prose:
+          "The active Task is partially completed and later fully completed. Then switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The active Task is partially completed and afterward fully completed. Then switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The active Task is partially completed and later only partly completed. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The active Task is completed and afterward resumes running. Then switch the Task Agent.",
+        reject: true,
+      },
+    ])
+  })
+
+  it("round-16 keeps explicit non-Task subjects from claiming Task state", () => {
+    assertSkillClassifications([
+      {
+        prose:
+          "The active Task is completed but, according to telemetry, a separate server says that it is still running. Then switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The Task is completed but the server restarts and it is still running. Then switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The active Task is completed but in fact the integration service monitoring it remains active. Then switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The active Task is completed but according to telemetry the server tracking it is still running. Then switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The active Task is completed but in fact the integration service monitoring only it remains active. Then switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The active Task is completed but according to telemetry it is still running. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The active Task is completed but in fact it remains active. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The Task is completed but it restarts and it is still running. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The Task is completed but the server restarts and the Task is still running. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The Task is completed but the server for the Task restarts and it is still running. Then switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The Task is completed but the server monitoring the Task restarts and it is still running. Then switch the Task Agent.",
+        reject: false,
+      },
+    ])
+  })
+
   it("contains the complete operational policy and document JSON shapes", () => {
     const policy = fencedJsonAfterHeading(
       realSkill,
