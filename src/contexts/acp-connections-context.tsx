@@ -39,6 +39,7 @@ import {
   acpSetConfigOption,
   acpGoalControl,
   acpCancel,
+  acpCancelQueuedPrompt,
   acpRespondPermission,
   acpAnswerQuestion,
   acpAnswerPlanApproval,
@@ -473,6 +474,8 @@ type ConnectRequest = {
   sharedRequestId?: string
   /** Explicit retry fence for a cleanup-complete failed shared generation. */
   retryFailedGeneration?: number
+  /** Cursor carried from a terminal shared detach into broker reattachment. */
+  sharedReconnect?: { generation: number; sinceSeq: number }
   intent: ConnectionIntent
   /** When true, poll discovery on the full delay schedule (task_running). */
   retryObserverDiscovery: boolean
@@ -489,6 +492,10 @@ function sameConnectRequest(a: ConnectRequest, b: ConnectRequest) {
     (a.ownerOperationId ?? null) === (b.ownerOperationId ?? null) &&
     (a.sharedRequestId ?? null) === (b.sharedRequestId ?? null) &&
     (a.retryFailedGeneration ?? null) === (b.retryFailedGeneration ?? null) &&
+    (a.sharedReconnect?.generation ?? null) ===
+      (b.sharedReconnect?.generation ?? null) &&
+    (a.sharedReconnect?.sinceSeq ?? null) ===
+      (b.sharedReconnect?.sinceSeq ?? null) &&
     a.intent === b.intent &&
     a.retryObserverDiscovery === b.retryObserverDiscovery
   )
@@ -3437,6 +3444,11 @@ function sharedPhaseFromResponse(
   return { phase: response.phase }
 }
 
+function isSharedInteractionConvergenceError(error: unknown): boolean {
+  const code = extractAppCommandError(error)?.code
+  return code === "interaction_already_resolved" || code === "stale_turn"
+}
+
 function sharedQueueItemFromWire(
   item: import("@/lib/types").SharedQueuedPromptSummary
 ): SharedQueuedPrompt {
@@ -4426,6 +4438,7 @@ export interface AcpActionsValue {
     valueId: string
   ): Promise<void>
   cancel(contextKey: string): Promise<void>
+  cancelQueuedPrompt(contextKey: string, queueItemId: string): Promise<void>
   respondPermission(
     contextKey: string,
     requestId: string,
@@ -5958,16 +5971,18 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           if (reason === "lagged" || reason === "server_shutdown") {
             const conn = storeRef.current.connections.get(contextKey)
             const newSinceSeq = conn?.lastAppliedSeq
+            const cursorOption =
+              newSinceSeq !== undefined ? { sinceSeq: newSinceSeq } : {}
             const newSub = stream.attach(
               connectionId,
               reconnectMode === "cold"
                 ? {
-                    sinceSeq: newSinceSeq,
+                    ...cursorOption,
                     reconnectMode: "cold",
                     ...(shared ? { shared } : {}),
                   }
                 : {
-                    sinceSeq: newSinceSeq,
+                    ...cursorOption,
                     ...(shared ? { shared } : {}),
                   },
               handlers
@@ -5985,6 +6000,15 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             const request = lastConnectParamsRef.current.get(contextKey)
             const cursor =
               storeRef.current.connections.get(contextKey)?.lastAppliedSeq
+            if (request && cursor != null) {
+              lastConnectParamsRef.current.set(contextKey, {
+                ...request,
+                sharedReconnect: {
+                  generation: shared.generation,
+                  sinceSeq: cursor,
+                },
+              })
+            }
             attachSubscriptionsRef.current.delete(contextKey)
             acpReleaseLease(
               connectionId,
@@ -6009,9 +6033,6 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
                   .catch(() => {})
               })
             }
-            // Cursor is retained in the request only by the live store. A new
-            // generation cold-attaches; a same-generation response restores it.
-            void cursor
             return
           }
           // Terminal detach (connection_gone): remove canonical state and every
@@ -6028,11 +6049,16 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
 
       // Only pass reconnectMode when cold so ordinary resume subscriptions keep
       // the historical attach options shape (`{ sinceSeq }` only).
+      const cursorOption = sinceSeq !== undefined ? { sinceSeq } : {}
       activeSub = stream.attach(
         connectionId,
         reconnectMode === "cold"
-          ? { sinceSeq, reconnectMode: "cold", ...(shared ? { shared } : {}) }
-          : { sinceSeq, ...(shared ? { shared } : {}) },
+          ? {
+              ...cursorOption,
+              reconnectMode: "cold",
+              ...(shared ? { shared } : {}),
+            }
+          : { ...cursorOption, ...(shared ? { shared } : {}) },
         handlers
       )
       attachSubscriptionsRef.current.set(contextKey, activeSub)
@@ -7011,6 +7037,8 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         lastConnectParamsRef.current.get(contextKey)?.sharedRequestId
       const rememberedRetryGeneration =
         lastConnectParamsRef.current.get(contextKey)?.retryFailedGeneration
+      const rememberedSharedReconnect =
+        lastConnectParamsRef.current.get(contextKey)?.sharedReconnect
       const request: ConnectRequest = {
         agentType,
         workingDir,
@@ -7022,6 +7050,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         retryObserverDiscovery,
         sharedRequestId: rememberedSharedRequestId ?? newSharedRequestId(),
         retryFailedGeneration: rememberedRetryGeneration,
+        sharedReconnect: rememberedSharedReconnect,
       }
       // Remember BEFORE the in-flight early return and before the preflight can
       // throw: a connect that never produced a store entry is precisely when
@@ -7191,17 +7220,26 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
               activeTurn: null,
             },
           })
+          const sameGeneration =
+            response.generation === request.sharedReconnect?.generation
+          const attachSinceSeq = sameGeneration
+            ? request.sharedReconnect?.sinceSeq
+            : undefined
           setupAttachSubscription(
             contextKey,
             response.connectionId,
-            undefined,
-            "cold",
+            attachSinceSeq,
+            sameGeneration ? "resume" : "cold",
             { generation: response.generation, leaseId: response.leaseId }
           )
-          if (request.retryFailedGeneration != null) {
+          if (
+            request.retryFailedGeneration != null ||
+            request.sharedReconnect != null
+          ) {
             lastConnectParamsRef.current.set(contextKey, {
               ...request,
               retryFailedGeneration: undefined,
+              sharedReconnect: undefined,
             })
           }
           return
@@ -8134,6 +8172,9 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         conversationId: remembered?.conversationId,
         delegationRouteOverride: remembered?.delegationRouteOverride,
         ownerOperationId: remembered?.ownerOperationId,
+        sharedRequestId: remembered?.sharedRequestId,
+        retryFailedGeneration: remembered?.retryFailedGeneration,
+        sharedReconnect: remembered?.sharedReconnect,
         intent: remembered?.intent ?? "own_or_observe",
         retryObserverDiscovery: remembered?.retryObserverDiscovery ?? false,
       }
@@ -8428,6 +8469,30 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     [canonicalKey, dispatch]
   )
 
+  const convergeSharedMutation = useCallback(
+    (contextKey: string, conn: ConnectionState, error: unknown): boolean => {
+      const shared = conn.sharedSession
+      if (!shared || !isSharedInteractionConvergenceError(error)) return false
+      const current = storeRef.current.connections.get(contextKey)
+      if (
+        current?.connectionId !== conn.connectionId ||
+        current.sharedSession?.generation !== shared.generation
+      ) {
+        return true
+      }
+      teardownAttachSubscription(contextKey)
+      setupAttachSubscription(
+        contextKey,
+        conn.connectionId,
+        undefined,
+        "cold",
+        { generation: shared.generation, leaseId: shared.leaseId }
+      )
+      return true
+    },
+    [setupAttachSubscription, teardownAttachSubscription]
+  )
+
   const cancel = useCallback(
     async (contextKey: string) => {
       const key = canonicalKey(contextKey)
@@ -8449,16 +8514,38 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       if (shared) {
         const turnId = shared.activeTurn?.turnId
         if (!turnId) return
-        await acpCancel(conn.connectionId, {
-          generation: shared.generation,
-          leaseId: shared.leaseId,
-          turnId,
-        })
+        try {
+          await acpCancel(conn.connectionId, {
+            generation: shared.generation,
+            leaseId: shared.leaseId,
+            turnId,
+          })
+        } catch (error) {
+          if (!convergeSharedMutation(key, conn, error)) throw error
+        }
         return
       }
       await acpCancel(conn.connectionId)
     },
-    [canonicalKey]
+    [canonicalKey, convergeSharedMutation]
+  )
+
+  const cancelQueuedPrompt = useCallback(
+    async (contextKey: string, queueItemId: string) => {
+      const key = canonicalKey(contextKey)
+      const conn = storeRef.current.connections.get(key)
+      const shared = conn?.sharedSession
+      if (!conn || !shared) return
+      try {
+        await acpCancelQueuedPrompt(conn.connectionId, queueItemId, {
+          generation: shared.generation,
+          leaseId: shared.leaseId,
+        })
+      } catch (error) {
+        if (!convergeSharedMutation(key, conn, error)) throw error
+      }
+    },
+    [canonicalKey, convergeSharedMutation]
   )
 
   const goalControl = useCallback(
@@ -8503,11 +8590,12 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         }
         dispatch({ type: "PERMISSION_CLEARED", contextKey: key, requestId })
       } catch (e) {
+        if (convergeSharedMutation(key, conn, e)) return
         console.error("[AcpConnections] respondPermission failed:", e)
         throw e
       }
     },
-    [canonicalKey, dispatch]
+    [canonicalKey, convergeSharedMutation, dispatch]
   )
 
   const answerQuestion = useCallback(
@@ -8541,12 +8629,13 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         // (idempotent on the matched id).
         dispatch({ type: "CLEAR_ASK_QUESTION", contextKey: key, questionId })
       } catch (e) {
+        if (convergeSharedMutation(key, conn, e)) return
         rollbackRootConversationActivity(activity)
         console.error("[AcpConnections] answerQuestion failed:", e)
         throw e
       }
     },
-    [canonicalKey, dispatch]
+    [canonicalKey, convergeSharedMutation, dispatch]
   )
 
   const answerPlanApproval = useCallback(
@@ -8579,11 +8668,12 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         // plan_approval_resolved (idempotent on the matched id).
         dispatch({ type: "CLEAR_PLAN_APPROVAL", contextKey, approvalId })
       } catch (e) {
+        if (convergeSharedMutation(contextKey, conn, e)) return
         console.error("[AcpConnections] answerPlanApproval failed:", e)
         throw e
       }
     },
-    [dispatch]
+    [convergeSharedMutation, dispatch]
   )
 
   const attachDelegationChild = useCallback(
@@ -8749,6 +8839,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       setMode,
       setConfigOption,
       cancel,
+      cancelQueuedPrompt,
       goalControl,
       respondPermission,
       answerQuestion,
@@ -8775,6 +8866,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       setMode,
       setConfigOption,
       cancel,
+      cancelQueuedPrompt,
       goalControl,
       respondPermission,
       answerQuestion,
