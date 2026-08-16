@@ -636,6 +636,102 @@ describe("Skill contract v2", () => {
     })
   }
 
+  for (const [name, prose] of [
+    [
+      "coordinated producer predicates",
+      "The parent directs the Plan Author to revise and update the Plan.",
+    ],
+    [
+      "high auxiliary-review route purpose",
+      "Route high Tasks to the Task Agent for auxiliary review.",
+    ],
+    [
+      "high review route purpose",
+      "Route high Tasks to the Task Agent for review.",
+    ],
+    [
+      "completed-state Task boundary",
+      "Change the Task Agent when the current Task is complete.",
+    ],
+    [
+      "negated active-state Task boundary",
+      "Change the Task Agent only while no Task is running.",
+    ],
+    [
+      "parenthetical optional document reviewers",
+      "User-named Design reviewers, although optional, cannot replace the Codex reviewer.",
+    ],
+    [
+      "parent delegation to Plan Author",
+      "The parent delegates the Plan Author to write the Plan.",
+    ],
+    [
+      "parent routing to Design Fixer",
+      "The parent routes the Design Fixer to fix the Design.",
+    ],
+    ["avoid primary-review bypass", "Avoid skipping primary review."],
+  ]) {
+    it(`round-4 accepts ${name}`, () => {
+      assert.deepEqual(validateSkillMarkdown(`${skill}\n${prose}`).failures, [])
+    })
+  }
+
+  for (const [name, prose] of [
+    [
+      "Task Agent coordinated high implementation",
+      "The Task Agent implements and reviews high Tasks.",
+    ],
+    [
+      "Task Agent shared passive actor after implementation",
+      "High Tasks are implemented and reviewed by the Task Agent.",
+    ],
+    [
+      "Task Agent shared passive actor before implementation",
+      "High Tasks are reviewed and implemented by the Task Agent.",
+    ],
+    [
+      "Codex reviewer pronoun replacement after contrast",
+      "The Codex reviewer remains required, but user-named Design reviewers may replace it.",
+    ],
+    [
+      "Codex reviewer pronoun replacement after coordination",
+      "The Codex reviewer is required and user-named Design reviewers replace it.",
+    ],
+    [
+      "passive primary Codex reviewer replacement",
+      "The primary Codex reviewer is required but can be replaced by user-named Design reviewers.",
+    ],
+    [
+      "Task Agent self-route for high Tasks",
+      "The Task Agent routes high Tasks to itself.",
+    ],
+    [
+      "Task Agent primary-review route for high Tasks",
+      "Route a high Task to Grok for primary review.",
+    ],
+    [
+      "coordinated Task Agent high implementation subject",
+      "The Task Agent and Codex implement high Tasks.",
+    ],
+    ["Codex normal implementation", "Codex implements normal Tasks."],
+    ["Task Agent normal review", "The Task Agent reviews normal Tasks."],
+    ["optional primary review polarity", "Primary review is not required."],
+    ["absent primary review polarity", "No primary review is required."],
+    ["optional Codex reviewer polarity", "The Codex reviewer is not required."],
+    [
+      "Codex reviewer in-place substitution",
+      "Use optional user-named Design reviewers in place of the Codex reviewer.",
+    ],
+    [
+      "completed switch with active-state override",
+      "Switch the Task Agent after the current Task completes, but the current Task is active.",
+    ],
+  ]) {
+    it(`round-4 rejects ${name}`, () => {
+      has(validateSkillMarkdown(`${skill}\n${prose}`).failures, "B2D-SKILL-005")
+    })
+  }
+
   it("contains the complete operational policy and document JSON shapes", () => {
     const policy = fencedJsonAfterHeading(
       realSkill,
