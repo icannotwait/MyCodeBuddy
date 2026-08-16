@@ -104,6 +104,10 @@ export interface ComposerAttachmentsOptions {
   containerRef?: RefObject<HTMLElement | null>
   /** While true, drops/pastes/picks are ignored (the editor stays editable). */
   disabled?: boolean
+  /** Aborting the signal permanently cancels attachment work that started with
+   *  it. Async decoders/uploads re-check immediately before mutating the editor
+   *  or attachment state. */
+  mutationSignal?: AbortSignal
   /** Decides whether images may be attached at all, and how they are encoded. */
   promptCapabilities: Pick<PromptCapabilitiesInfo, "image" | "embedded_context">
   /** Groups uploads with the session/tab that owns them (quota + cleanup). */
@@ -177,6 +181,7 @@ export function useComposerAttachments({
   editorRef,
   containerRef,
   disabled = false,
+  mutationSignal,
   promptCapabilities,
   attachmentTabId = null,
   defaultPath = null,
@@ -242,6 +247,7 @@ export function useComposerAttachments({
       opts: { atCaret?: boolean } = {}
     ) => {
       if (items.length === 0) return
+      if (mutationSignal?.aborted) return
       const editor = editorRef.current?.getEditor()
       if (!editor) return
       const seen = new Set<string>()
@@ -274,7 +280,7 @@ export function useComposerAttachments({
       }
       if (inserted > 0) chain.run()
     },
-    [editorRef]
+    [editorRef, mutationSignal]
   )
 
   const appendResourceLinks = useCallback(
@@ -420,6 +426,8 @@ export function useComposerAttachments({
       )
       await Promise.all(workers)
 
+      if (mutationSignal?.aborted) return
+
       if (quotaRejected.length > 0) {
         toast.error(
           tAttach("attachUploadQuotaExceeded", {
@@ -444,7 +452,13 @@ export function useComposerAttachments({
         appendResourceAttachments(uploaded)
       }
     },
-    [appendResourceAttachments, attachmentTabId, logLabel, tAttach]
+    [
+      appendResourceAttachments,
+      attachmentTabId,
+      logLabel,
+      mutationSignal,
+      tAttach,
+    ]
   )
 
   const appendEmbeddedResources = useCallback(
@@ -506,6 +520,7 @@ export function useComposerAttachments({
       const uploadCandidates: File[] = []
 
       for (const file of files) {
+        if (mutationSignal?.aborted) return
         const path = getFilePath(file)
         const name = file.name || `resource-${randomUUID()}`
         const mimeType = file.type || mimeTypeFromPath(name)
@@ -557,6 +572,7 @@ export function useComposerAttachments({
         }
       }
 
+      if (mutationSignal?.aborted) return
       appendResourceLinks(pathLinks)
       appendResourceLinks(fallbackDataLinks)
       appendEmbeddedResources(embeddedResources)
@@ -567,6 +583,7 @@ export function useComposerAttachments({
     [
       appendEmbeddedResources,
       appendResourceLinks,
+      mutationSignal,
       promptCapabilities.embedded_context,
       showNativePaperclip,
       uploadAndAppendFiles,
@@ -635,6 +652,7 @@ export function useComposerAttachments({
       )
       // Thumbnails appear immediately; uploads settle in the background and
       // flip `uploading` off (send is gated on that by the host).
+      if (mutationSignal?.aborted) return
       setAttachments((prev) => [...prev, ...parsed.map((p) => p.attachment)])
       if (!uploadImages) return
 
@@ -651,12 +669,14 @@ export function useComposerAttachments({
             try {
               const r = await uploadAttachment(file, attachmentTabId ?? null)
               const uri = buildFileUri(r.path)
+              if (mutationSignal?.aborted) return
               setAttachments((prev) =>
                 prev.map((a) =>
                   a.id === attachment.id ? { ...a, uri, uploading: false } : a
                 )
               )
             } catch (error) {
+              if (mutationSignal?.aborted) return
               setAttachments((prev) =>
                 prev.filter((a) => a.id !== attachment.id)
               )
@@ -699,7 +719,7 @@ export function useComposerAttachments({
         )
       }
     },
-    [attachmentTabId, logLabel, showNativePaperclip, tAttach]
+    [attachmentTabId, logLabel, mutationSignal, showNativePaperclip, tAttach]
   )
 
   const appendImagePathAttachments = useCallback(
@@ -731,9 +751,10 @@ export function useComposerAttachments({
         )
       })
       if (parsed.length === 0) return
+      if (mutationSignal?.aborted) return
       setAttachments((prev) => [...prev, ...parsed])
     },
-    [canAttachImages, logLabel]
+    [canAttachImages, logLabel, mutationSignal]
   )
 
   const appendPathsFromDrop = useCallback(
@@ -758,11 +779,17 @@ export function useComposerAttachments({
       if (imagePaths.length > 0) {
         await appendImagePathAttachments(imagePaths)
       }
+      if (mutationSignal?.aborted) return
       if (resourcePaths.length > 0) {
         appendResourceAttachments(resourcePaths)
       }
     },
-    [appendImagePathAttachments, appendResourceAttachments, canAttachImages]
+    [
+      appendImagePathAttachments,
+      appendResourceAttachments,
+      canAttachImages,
+      mutationSignal,
+    ]
   )
 
   const appendPathsFromDropRef = useRef(appendPathsFromDrop)
@@ -861,6 +888,8 @@ export function useComposerAttachments({
       )
       await Promise.all(workers)
 
+      if (mutationSignal?.aborted) return
+
       if (oversize.length > 0) {
         toast.error(
           tAttach("attachUploadTooLarge", {
@@ -908,6 +937,7 @@ export function useComposerAttachments({
       attachmentTabId,
       canAttachImages,
       logLabel,
+      mutationSignal,
       tAttach,
     ]
   )
@@ -919,7 +949,7 @@ export function useComposerAttachments({
 
   const appendFilesFromInput = useCallback(
     async (files: File[]) => {
-      if (files.length === 0) return
+      if (files.length === 0 || mutationSignal?.aborted) return
       const imageFiles: File[] = []
       const resourceFiles: File[] = []
       for (const file of files) {
@@ -934,11 +964,17 @@ export function useComposerAttachments({
       if (imageFiles.length > 0) {
         await appendImageAttachments(imageFiles)
       }
+      if (mutationSignal?.aborted) return
       if (resourceFiles.length > 0) {
         await appendFilesAsResources(resourceFiles)
       }
     },
-    [appendFilesAsResources, appendImageAttachments, canAttachImages]
+    [
+      appendFilesAsResources,
+      appendImageAttachments,
+      canAttachImages,
+      mutationSignal,
+    ]
   )
 
   // Routed from RichComposer's `onPasteFiles`. Returns true when the paste was

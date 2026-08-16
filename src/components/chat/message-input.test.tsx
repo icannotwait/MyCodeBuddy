@@ -117,10 +117,15 @@ const apiMocks = vi.hoisted(() => ({
   quickMessagesList: vi.fn(async () => [
     { id: 1, title: "Saved reply", content: "saved reply body" },
   ]),
+  uploadAttachment: vi.fn(),
 }))
 vi.mock("@/lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/api")>()
-  return { ...actual, quickMessagesList: apiMocks.quickMessagesList }
+  return {
+    ...actual,
+    quickMessagesList: apiMocks.quickMessagesList,
+    uploadAttachment: apiMocks.uploadAttachment,
+  }
 })
 // virtua renders 0 rows under jsdom — render children directly so the large
 // (searchable + virtualized) model list is exercisable here too.
@@ -432,6 +437,70 @@ describe("MessageInput admission-aware clearing", () => {
     expect(serializeDocToText(editor.state.doc)).not.toContain(
       "must not be appended"
     )
+
+    await act(async () => admission.reject(new Error("admission failed")))
+  })
+
+  it("drops an image whose decoding finishes after admission starts", async () => {
+    const upload = deferred<{
+      path: string
+      name: string
+      mimeType: string | null
+      size: number
+    }>()
+    apiMocks.uploadAttachment.mockReturnValue(upload.promise)
+    let finishImageRead: (() => void) | null = null
+    class DeferredFileReader {
+      result: string | null = null
+      error: DOMException | null = null
+      onerror: (() => void) | null = null
+      onload: (() => void) | null = null
+
+      readAsDataURL() {
+        finishImageRead = () => {
+          this.result = "data:image/png;base64,bGF0ZQ=="
+          this.onload?.()
+        }
+      }
+    }
+    vi.stubGlobal("FileReader", DeferredFileReader)
+
+    const admission = deferred<void>()
+    const onSend = vi.fn(() => admission.promise)
+    renderInput({ onSend, sendClearMode: "after-admission" })
+    const editor = await mountedEditor()
+    act(() => editor.commands.insertContent("send without late image"))
+
+    const image = new File(["late image"], "late-image.png", {
+      type: "image/png",
+    })
+    const paste = new Event("paste", { bubbles: true, cancelable: true })
+    Object.defineProperty(paste, "clipboardData", {
+      value: {
+        files: [image],
+        items: [],
+        getData: () => "",
+      },
+    })
+    act(() => editor.view.dom.dispatchEvent(paste))
+    await waitFor(() => expect(finishImageRead).not.toBeNull())
+
+    act(() => submitEditor(editor))
+    expect(onSend).toHaveBeenCalledTimes(1)
+    expect(onSend.mock.calls[0]?.[0].blocks).toEqual([
+      { type: "text", text: "send without late image" },
+    ])
+
+    await act(async () => {
+      finishImageRead?.()
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    expect(editor.isEditable).toBe(false)
+    expect(
+      screen.queryByRole("img", { name: "late-image.png" })
+    ).not.toBeInTheDocument()
 
     await act(async () => admission.reject(new Error("admission failed")))
   })

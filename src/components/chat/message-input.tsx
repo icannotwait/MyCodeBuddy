@@ -368,6 +368,8 @@ export function MessageInput({
   const editorRef = useRef<RichComposerHandle>(null)
   const containerRef = useRef<HTMLDivElement>(null)
   const disabledRef = useRef(disabled)
+  const [attachmentMutationController, setAttachmentMutationController] =
+    useState(() => new AbortController())
   const sendAdmissionPendingRef = useRef(false)
   const [sendAdmissionPending, setSendAdmissionPending] = useState(false)
   const mutationLocked = interactionLocked || sendAdmissionPending
@@ -395,6 +397,7 @@ export function MessageInput({
     editorRef,
     containerRef,
     disabled: disabled || mutationLocked,
+    mutationSignal: attachmentMutationController.signal,
     promptCapabilities,
     attachmentTabId,
     defaultPath,
@@ -1333,6 +1336,8 @@ export function MessageInput({
     const modeId = showModeSelector ? effectiveModeId : null
     if (sendClearMode === "after-admission") {
       sendAdmissionPendingRef.current = true
+      attachmentMutationController.abort()
+      setAttachmentMutationController(new AbortController())
       setSendAdmissionPending(true)
       if (effectiveDraftStorageKey && editorRef.current) {
         saveMessageInputDraftV2(
@@ -1374,6 +1379,7 @@ export function MessageInput({
     resetComposer,
     clearSentComposer,
     sendClearMode,
+    attachmentMutationController,
   ])
 
   const handleForkSendClick = useCallback(() => {
