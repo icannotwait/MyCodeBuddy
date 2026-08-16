@@ -32,7 +32,7 @@
 - Consumes: Cargo's repository-local configuration discovery and the existing `pnpm test:release` glob for `scripts/*.test.mjs`.
 - Produces: ordinary dev/test builds with no debug information or incremental cache, plus a repository policy test that protects those settings and the narrow-test guidance.
 
-- [ ] **Step 1: Write the failing policy test**
+- [x] **Step 1: Write the failing policy test**
 
 Create `scripts/rust-build-policy.test.mjs`:
 
@@ -94,7 +94,7 @@ test("repository Cargo config keeps dev and test artifacts lean", () => {
 })
 ```
 
-- [ ] **Step 2: Run the policy test and verify it fails**
+- [x] **Step 2: Run the policy test and verify it fails**
 
 Run:
 
@@ -105,7 +105,7 @@ node --test scripts/rust-build-policy.test.mjs
 Expected: FAIL because Cargo's verbose rustc commands contain positive
 `-C debuginfo` and `-C incremental` arguments under the current defaults.
 
-- [ ] **Step 3: Add the default Cargo profile settings**
+- [x] **Step 3: Add the default Cargo profile settings**
 
 Prepend this content to `.cargo/config.toml`, leaving the target and environment
 sections unchanged:
@@ -121,7 +121,7 @@ debug = 0
 debug = 0
 ```
 
-- [ ] **Step 4: Document narrow verification and cleanup commands**
+- [x] **Step 4: Document narrow verification and cleanup commands**
 
 Extend the Rust test guidance in `AGENTS.md` with these exact commands and
 rules:
@@ -142,7 +142,7 @@ still compiles all selected test targets, so it is not a narrow-build command.
 Reserve `cargo test --features test-utils` for final regression, CI, or an
 explicit request.
 
-- [ ] **Step 5: Run the policy test and repository release-policy suite**
+- [x] **Step 5: Run the policy test and repository release-policy suite**
 
 Run:
 
@@ -153,7 +153,7 @@ pnpm test:release
 
 Expected: both commands PASS with zero failed tests.
 
-- [ ] **Step 6: Verify both Cargo configuration layers parse**
+- [x] **Step 6: Verify both Cargo configuration layers parse**
 
 Run:
 
@@ -166,7 +166,7 @@ cargo --config ../.cargo/low-memory.toml metadata --no-deps --format-version 1
 Expected: both commands exit zero and emit Cargo metadata JSON. No release
 profile configuration is introduced.
 
-- [ ] **Step 7: Commit the policy implementation**
+- [x] **Step 7: Commit the policy implementation**
 
 ```bash
 git add .cargo/config.toml AGENTS.md scripts/rust-build-policy.test.mjs
@@ -182,7 +182,7 @@ git commit -m "build: reduce Rust worktree artifacts"
 - Consumes: the Cargo defaults and narrow commands from Task 1.
 - Produces: fresh evidence that ordinary Cargo commands omit debug information and incremental output, plus reclaimed disk space from the legacy worktree target.
 
-- [ ] **Step 1: Confirm no process uses the legacy target**
+- [x] **Step 1: Confirm no process uses the legacy target**
 
 Run:
 
@@ -193,7 +193,7 @@ ps aux | rg '/Users/pengchao/Documents/Codeg_Fork/codeg/.worktrees/shared-acp-se
 Expected: no matching Cargo or rustc process. Stop before cleanup if a process
 is present.
 
-- [ ] **Step 2: Remove the legacy full-debug target**
+- [x] **Step 2: Remove the legacy full-debug target**
 
 Run:
 
@@ -206,7 +206,7 @@ cargo clean \
 Expected: Cargo reports removed artifacts and the target no longer consumes
 the prior 91.7 GiB.
 
-- [ ] **Step 3: Run a narrow library test with verbose compiler evidence**
+- [x] **Step 3: Run a narrow library test with verbose compiler evidence**
 
 Run from the main worktree:
 
@@ -220,7 +220,7 @@ Expected: the exact test passes. Compiler commands generated after Task 1 use
 `-C strip=debuginfo` or omit positive `-C debuginfo` settings, and do not use
 `-C incremental`.
 
-- [ ] **Step 4: Verify the resulting artifact layout and disk state**
+- [x] **Step 4: Verify the resulting artifact layout and disk state**
 
 Run from the repository root:
 
@@ -236,7 +236,7 @@ Expected: the new target is materially below the previous 91.7 GiB sample,
 incremental directories are absent or empty, disk free space reflects legacy
 cleanup, and Git status contains only the user's pre-existing icon changes.
 
-- [ ] **Step 5: Run final policy verification and inspect the implementation commit**
+- [x] **Step 5: Run final policy verification and inspect the implementation commit**
 
 Run:
 
