@@ -446,6 +446,21 @@ const PLURAL_PEOPLE_ANTECEDENT_TERMS = new Set([
   "producers",
   "reviewers",
 ])
+const PEOPLE_ANTECEDENT_LINKS = new Set(["by", "for", "to", "with"])
+const PEOPLE_ANTECEDENT_TARGET_PREFIX_TERMS = new Set([
+  "a",
+  "additional",
+  "an",
+  "another",
+  "design",
+  "independent",
+  "optional",
+  "plan",
+  "required",
+  "selected",
+  "the",
+  "user-named",
+])
 const DOCUMENT_PERSON_ROLE_TERMS = new Set([
   "author",
   "authors",
@@ -519,7 +534,37 @@ const POSTPOSED_REVIEW_ABSENCE_TERMS = new Set([
   "missing",
   "omitted",
 ])
-const POSTPOSED_REVIEW_ABSENCE_MODIFIERS = new Set(["again", "now", "still"])
+const POSTPOSED_REVIEW_ABSENCE_MODIFIERS = new Set([
+  "again",
+  "now",
+  "often",
+  "still",
+  "today",
+  "tonight",
+])
+const POSTPOSED_REVIEW_ABSENCE_MODIFIER_PHRASES = [
+  ["for", "now"],
+  ["often", "found"],
+  ["once", "again"],
+]
+const POSTPOSED_REVIEW_ABSENCE_TRANSITIVE_TERMS = new Set([
+  "lacking",
+  "missing",
+])
+const POSTPOSED_REVIEW_ABSENCE_COMPLEMENT_LINKS = new Set([
+  "after",
+  "before",
+  "during",
+  "for",
+  "from",
+  "in",
+  "on",
+  "since",
+  "through",
+  "until",
+  "when",
+  "while",
+])
 const ACTOR_LINKS = new Set(["by", "to"])
 const NESTED_ACTOR_PREFIX_LINKS = new Set([
   "after",
@@ -610,15 +655,6 @@ const TASK_COMPONENT_SUFFIX_TERMS = new Set([
   "testing",
   "validation",
 ])
-const TASK_COMPONENT_ACTION_OBJECT_PREFIXES = new Set([
-  "a",
-  "an",
-  "it",
-  "that",
-  "the",
-  "them",
-  "this",
-])
 const ACTIVE_TIMING_MARKERS = new Set(["during", "inside", "while"])
 const BOUNDARY_TIMING_MARKERS = new Set([
   "after",
@@ -692,6 +728,15 @@ const REVIEW_REPLACEMENT_ACTIONS = new Set([
 ])
 const REVIEW_TAKE_ACTIONS = new Set(["take", "takes", "taking", "took"])
 const REVIEW_REQUIREMENT_ACTIONS = new Set(["mandatory", "required"])
+const REVIEW_TARGET_DEMONSTRATIVES = new Set(["same", "that", "this"])
+const GENERIC_REVIEW_TARGET_PREFIX_TERMS = new Set([
+  "a",
+  "an",
+  "same",
+  "that",
+  "the",
+  "this",
+])
 const REVIEW_EXHAUSTIVE_QUANTIFIERS = new Set([
   "alone",
   "exclusively",
@@ -1060,19 +1105,43 @@ function directiveWindows(prose) {
     .toLowerCase()
     .split(/\n\s*\n+/)) {
     let priorTokens = []
+    let priorActionBoundaryAfter = new Set()
     for (const source of paragraph.split(/[.!?;]+/)) {
-      const tokens = source.match(/[a-z0-9]+(?:-[a-z0-9]+)*/g) ?? []
+      const matches = [...source.matchAll(/[a-z0-9]+(?:-[a-z0-9]+)*/g)]
+      const tokens = matches.map((match) => match[0])
+      const actionBoundaryAfter = matches.flatMap((match, index) => {
+        const gapStart = match.index + match[0].length
+        const gapEnd = matches[index + 1]?.index ?? source.length
+        return /[,:]/.test(source.slice(gapStart, gapEnd)) ? [index] : []
+      })
       for (let start = 0; start < tokens.length; start += step) {
         windows.push({
           tokens: tokens.slice(start, start + DIRECTIVE_WINDOW_TOKENS),
+          actionBoundaryAfter: new Set(
+            actionBoundaryAfter
+              .filter(
+                (index) =>
+                  index >= start && index < start + DIRECTIVE_WINDOW_TOKENS
+              )
+              .map((index) => index - start)
+          ),
           priorReviewers: directiveReviewers(priorTokens),
-          priorTasks: directiveTaskAntecedents(priorTokens),
+          priorTasks: directiveTaskAntecedents(
+            priorTokens,
+            priorActionBoundaryAfter
+          ),
           priorDocumentTargets: directiveDocumentTargets(priorTokens),
           priorPronounAntecedent: directivePronounAntecedent(priorTokens),
         })
       }
       if (tokens.length > 0) {
-        priorTokens = tokens.slice(-DIRECTIVE_WINDOW_TOKENS)
+        const priorStart = Math.max(0, tokens.length - DIRECTIVE_WINDOW_TOKENS)
+        priorTokens = tokens.slice(priorStart)
+        priorActionBoundaryAfter = new Set(
+          actionBoundaryAfter
+            .filter((index) => index >= priorStart)
+            .map((index) => index - priorStart)
+        )
       }
     }
   }
@@ -1104,6 +1173,76 @@ function phraseIndex(tokens, phrase, start = 0, end = tokens.length) {
     }
   }
   return -1
+}
+
+function tokensArePostposedReviewAbsenceModifiers(tokens) {
+  let index = 0
+  while (index < tokens.length) {
+    const token = tokens[index]
+    const phrase = POSTPOSED_REVIEW_ABSENCE_MODIFIER_PHRASES.find((candidate) =>
+      candidate.every(
+        (phraseToken, offset) => tokens[index + offset] === phraseToken
+      )
+    )
+    if (phrase) {
+      index += phrase.length
+      continue
+    }
+    if (token.endsWith("ly") || POSTPOSED_REVIEW_ABSENCE_MODIFIERS.has(token)) {
+      index += 1
+      continue
+    }
+    return false
+  }
+  return true
+}
+
+function postposedReviewAbsenceHasDirectObject(clause, absence, relationEnd) {
+  if (
+    !POSTPOSED_REVIEW_ABSENCE_TRANSITIVE_TERMS.has(clause.tokens[absence]) ||
+    clause.actionBoundaryAfter.has(absence)
+  ) {
+    return false
+  }
+  const tail = clause.tokens.slice(absence + 1, relationEnd)
+  if (tail.length === 0) return false
+  if (tokensArePostposedReviewAbsenceModifiers(tail)) return false
+  return !(
+    CLAUSE_COORDINATORS.has(tail[0]) ||
+    POSTPOSED_REVIEW_ABSENCE_COMPLEMENT_LINKS.has(tail[0])
+  )
+}
+
+function peopleRelationIntroduces(tokens, predicate, person) {
+  const targetPrefixIsBounded = (start) =>
+    tokens
+      .slice(start, person)
+      .every(
+        (token) =>
+          token.endsWith("ly") ||
+          PEOPLE_ANTECEDENT_TARGET_PREFIX_TERMS.has(token)
+      )
+  const directLink = tokenIndexes(
+    tokens,
+    PEOPLE_ANTECEDENT_LINKS,
+    predicate + 1,
+    person
+  ).at(-1)
+  if (directLink !== undefined && targetPrefixIsBounded(directLink + 1)) {
+    return true
+  }
+  const behalfLink = tokenIndexes(
+    tokens,
+    new Set(["on"]),
+    predicate + 1,
+    person
+  )
+    .filter(
+      (index) =>
+        phraseIndex(tokens, ["on", "behalf", "of"], index, index + 3) === index
+    )
+    .at(-1)
+  return behalfLink !== undefined && targetPrefixIsBounded(behalfLink + 3)
 }
 
 function actionIsNegated(tokens, actionIndex) {
@@ -1246,13 +1385,25 @@ function directiveTasks(tokens) {
   return tasks
 }
 
-function directiveTaskAntecedents(tokens) {
-  const clause = { tokens }
-  return directiveTasks(tokens).map((task) => ({
-    ...task,
-    active: taskHasAffirmativeActivity(clause, task),
-    completed: taskHasCompletedState(clause, task),
-  }))
+function directiveTaskAntecedents(tokens, actionBoundaryAfter = new Set()) {
+  const clause = { tokens, actionBoundaryAfter }
+  return directiveTasks(tokens).map((task) => {
+    const completed = taskHasCompletedState(clause, task)
+    const postposedActivity = taskStateIndexes(
+      clause,
+      task,
+      EXPLICIT_TASK_ACTIVITY_TERMS
+    ).some(
+      (state) => state > task.index && !actionIsNegated(clause.tokens, state)
+    )
+    return {
+      ...task,
+      active:
+        taskHasAffirmativeActivity(clause, task) &&
+        (!completed || postposedActivity),
+      completed,
+    }
+  })
 }
 
 function directiveDocumentTargets(tokens) {
@@ -1329,12 +1480,7 @@ function directivePronounAntecedent(tokens) {
       : people.filter(
           (person) =>
             person.start > predicate &&
-            tokenIndex(
-              tokens,
-              new Set(["by", "to"]),
-              predicate + 1,
-              person.start
-            ) >= 0
+            peopleRelationIntroduces(tokens, predicate, person.start)
         )
 
   const pluralDocuments = mentionsPluralGroup(tokens, documentObjects)
@@ -1376,6 +1522,7 @@ function directiveReviewers(tokens) {
 function parseDirectiveClause(window) {
   const {
     tokens,
+    actionBoundaryAfter = new Set(),
     priorReviewers = [],
     priorTasks = [],
     priorDocumentTargets = [],
@@ -1384,6 +1531,7 @@ function parseDirectiveClause(window) {
   const actors = directiveActors(tokens)
   return {
     tokens,
+    actionBoundaryAfter,
     actors,
     actions: directiveActions(tokens, actors),
     tasks: directiveTasks(tokens),
@@ -2285,6 +2433,11 @@ function reviewerRoleIsExplicitlyAbsent(clause, action, role) {
         Math.min(relationEnd, actor.end + 6)
       ).some((absence) => {
         if (actionIsNegated(clause.tokens, absence)) return false
+        if (
+          postposedReviewAbsenceHasDirectObject(clause, absence, relationEnd)
+        ) {
+          return false
+        }
         const subjectLink = tokenIndex(
           clause.tokens,
           REVIEW_SUBJECT_LINKS,
@@ -2293,13 +2446,9 @@ function reviewerRoleIsExplicitlyAbsent(clause, action, role) {
         )
         if (subjectLink < 0) return false
         if (
-          !clause.tokens
-            .slice(subjectLink + 1, absence)
-            .every(
-              (token) =>
-                token.endsWith("ly") ||
-                POSTPOSED_REVIEW_ABSENCE_MODIFIERS.has(token)
-            )
+          !tokensArePostposedReviewAbsenceModifiers(
+            clause.tokens.slice(subjectLink + 1, absence)
+          )
         ) {
           return false
         }
@@ -2902,7 +3051,7 @@ function completionBelongsToTask(clause, task, completion) {
     objectLink >= 0 &&
     !(
       TASK_COMPONENT_SUFFIX_TERMS.has(clause.tokens[task.index + 1]) &&
-      !TASK_COMPONENT_ACTION_OBJECT_PREFIXES.has(clause.tokens[task.index + 2])
+      !clause.actionBoundaryAfter.has(task.index)
     ) &&
     tokenIndex(
       clause.tokens,
@@ -3192,17 +3341,26 @@ function substitutionReviewTarget(clause, bypass) {
   if (
     objectReviewer &&
     !reviewerIsRequiredByContract(objectReviewer) &&
-    tokenIndex(
-      clause.tokens,
-      new Set(["its", "same", "that", "their", "this"]),
-      objectLink + 1,
-      objectReviewer.index
-    ) >= 0
+    clause.tokens
+      .slice(objectLink + 1, objectReviewer.index)
+      .some((token) => REVIEW_TARGET_DEMONSTRATIVES.has(token)) &&
+    clause.tokens
+      .slice(objectLink + 1, objectReviewer.index)
+      .every((token) => GENERIC_REVIEW_TARGET_PREFIX_TERMS.has(token))
   ) {
     const replacementSubject = clause.reviewers
       .filter((reviewer) => reviewer.index < bypass)
       .at(-1)
     return reviewAntecedentBefore(clause, replacementSubject?.index ?? bypass)
+  }
+  const requiredPrimary = phraseIndex(
+    clause.tokens,
+    ["required", "primary"],
+    objectLink + 1,
+    objectLink + 6
+  )
+  if (!objectReviewer && requiredPrimary >= 0) {
+    return { index: requiredPrimary + 1, primary: true }
   }
   return objectReviewer
 }

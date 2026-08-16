@@ -2540,6 +2540,286 @@ describe("Skill contract v2", () => {
     ])
   })
 
+  it("round-14 uses Task punctuation before bare review and test objects", () => {
+    assertSkillClassifications([
+      {
+        prose:
+          "The current Task is running. After completion of the active Task, review findings and switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The current Task is running. After completion of the active Task, test results and switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The current Task is running. After completion of the active Task, review evidence and switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The current Task is running. After completion of the active Task, test outputs and switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The current Task is running. After completion of the active Task: review findings and switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The current Task is running. After completion of the active Task: test results and switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The current Task is running. After completion of the active Task, review findings. Then switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The current Task is running. After completion of the active Task review, record findings. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The current Task is completed and running. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The current Task is complete and active. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The Task is completed while active. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The current Task is running. After completion of the active Task review, switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The current Task is running. After completion of the active Task testing, switch the Task Agent.",
+        reject: true,
+      },
+    ])
+  })
+
+  it("round-14 resolves qualified take-role targets in both directions", () => {
+    assertSkillClassifications([
+      {
+        prose:
+          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of their advisory reviewer.",
+        reject: false,
+      },
+      {
+        prose:
+          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of their optional advisory reviewer.",
+        reject: false,
+      },
+      {
+        prose:
+          "The Codex reviewer is mandatory. Another reviewer takes on the role of that optional Design reviewer.",
+        reject: false,
+      },
+      {
+        prose:
+          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of their Design reviewer.",
+        reject: false,
+      },
+      {
+        prose:
+          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required primary.",
+        reject: true,
+      },
+      {
+        prose:
+          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of that reviewer.",
+        reject: true,
+      },
+      {
+        prose:
+          "The Codex reviewer is mandatory. Optional Design reviewers take the role of this required reviewer.",
+        reject: true,
+      },
+      {
+        prose:
+          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required primary reviewer.",
+        reject: true,
+      },
+    ])
+  })
+
+  it("round-14 prefers people beneficiaries and participants over document objects", () => {
+    assertSkillClassifications([
+      {
+        prose:
+          "The developers revise the Plan and Design for the reviewers. The parent updates them on progress.",
+        reject: false,
+      },
+      {
+        prose:
+          "The developers revise the Plan and Design on behalf of the reviewers. The parent updates them.",
+        reject: false,
+      },
+      {
+        prose:
+          "The developers edit the Plan and Design with the reviewers. The parent updates them.",
+        reject: false,
+      },
+      {
+        prose:
+          "The developers edit the Plan and Design together with the reviewers. The parent updates them.",
+        reject: false,
+      },
+      {
+        prose:
+          "The developers revise the Plan and Design for clarity while the reviewers observe. The parent edits them.",
+        reject: true,
+      },
+      {
+        prose:
+          "The developers revise the Plan and Design with annotations while the reviewers observe. The parent edits them.",
+        reject: true,
+      },
+      {
+        prose:
+          "The developers revise the Plan and Design for clarity as the reviewers observe. The parent edits them.",
+        reject: true,
+      },
+      {
+        prose:
+          "The developers revise the Plan and Design with annotations because the reviewers observe. The parent edits them.",
+        reject: true,
+      },
+      {
+        prose:
+          "The developers revise the Plan and Design for clarity though the reviewers observe. The parent edits them.",
+        reject: true,
+      },
+      {
+        prose:
+          "The reviewers revise the Plan and Design. The parent updates them.",
+        reject: true,
+      },
+      {
+        prose:
+          "The developers revise the Plan and Design for clarity. The parent updates them.",
+        reject: true,
+      },
+      {
+        prose:
+          "The developers edit the Plan and Design with annotations. The parent updates them.",
+        reject: true,
+      },
+    ])
+  })
+
+  it("round-14 binds ordinary multiword complements to reviewer absence", () => {
+    assertSkillClassifications([
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is once again missing.",
+        reject: true,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is for now missing.",
+        reject: true,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is often found missing.",
+        reject: true,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is now missing.",
+        reject: true,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is again missing.",
+        reject: true,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is once again missing evidence.",
+        reject: false,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is for now missing input.",
+        reject: false,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is often found missing results.",
+        reject: false,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is once again missing context.",
+        reject: false,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is once again missing feedback.",
+        reject: false,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is once again missing approval.",
+        reject: false,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is once again missing documentation.",
+        reject: false,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is once again missing the context.",
+        reject: false,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is once again missing from the route.",
+        reject: true,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is once again missing today.",
+        reject: true,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is once again aware input is missing.",
+        reject: false,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is for now told evidence is missing.",
+        reject: false,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is often found where evidence is missing.",
+        reject: false,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is often found not missing.",
+        reject: false,
+      },
+    ])
+  })
+
   it("contains the complete operational policy and document JSON shapes", () => {
     const policy = fencedJsonAfterHeading(
       realSkill,
