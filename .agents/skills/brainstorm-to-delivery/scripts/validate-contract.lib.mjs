@@ -446,20 +446,61 @@ const PLURAL_PEOPLE_ANTECEDENT_TERMS = new Set([
   "producers",
   "reviewers",
 ])
-const PEOPLE_ANTECEDENT_LINKS = new Set(["by", "for", "to", "with"])
-const PEOPLE_ANTECEDENT_TARGET_PREFIX_TERMS = new Set([
+const PEOPLE_ANTECEDENT_LINKS = new Set([
+  "alongside",
+  "by",
+  "for",
+  "from",
+  "to",
+  "with",
+])
+const PEOPLE_ANTECEDENT_RELATION_BOUNDARIES = new Set([
+  "after",
+  "although",
+  "as",
+  "before",
+  "because",
+  "but",
+  "if",
+  "once",
+  "or",
+  "since",
+  "so",
+  "then",
+  "though",
+  "unless",
+  "until",
+  "when",
+  "whereas",
+  "while",
+  "yet",
+])
+const PEOPLE_CLAUSE_SUBJECT_STARTERS = new Set([
   "a",
-  "additional",
   "an",
-  "another",
-  "design",
-  "independent",
-  "optional",
-  "plan",
-  "required",
-  "selected",
+  "both",
+  "each",
+  "every",
   "the",
-  "user-named",
+  "these",
+  "this",
+  "those",
+])
+const PEOPLE_PARTITIVE_TARGET_HEADS = new Set([
+  "all",
+  "both",
+  "each",
+  "either",
+  "many",
+  "most",
+  "neither",
+  "none",
+  "some",
+])
+const PEOPLE_PARTICIPANT_ACTIONS = new Set([
+  "consult",
+  "consulted",
+  "consulting",
 ])
 const DOCUMENT_PERSON_ROLE_TERMS = new Set([
   "author",
@@ -536,34 +577,143 @@ const POSTPOSED_REVIEW_ABSENCE_TERMS = new Set([
 ])
 const POSTPOSED_REVIEW_ABSENCE_MODIFIERS = new Set([
   "again",
+  "altogether",
+  "completely",
+  "entirely",
+  "later",
   "now",
   "often",
+  "overnight",
+  "soon",
   "still",
   "today",
+  "tomorrow",
   "tonight",
+  "twice",
+  "yesterday",
 ])
 const POSTPOSED_REVIEW_ABSENCE_MODIFIER_PHRASES = [
+  ["as", "usual"],
+  ["at", "present"],
   ["for", "now"],
   ["often", "found"],
   ["once", "again"],
+  ["once", "more"],
+  ["right", "now"],
 ]
+const POSTPOSED_REVIEW_ABSENCE_TIME_TERMS = new Set([
+  "afternoon",
+  "day",
+  "days",
+  "evening",
+  "friday",
+  "fridays",
+  "monday",
+  "mondays",
+  "morning",
+  "month",
+  "months",
+  "night",
+  "nights",
+  "quarter",
+  "quarters",
+  "saturday",
+  "saturdays",
+  "sunday",
+  "sundays",
+  "thursday",
+  "thursdays",
+  "tuesday",
+  "tuesdays",
+  "wednesday",
+  "wednesdays",
+  "week",
+  "weeks",
+  "weekend",
+  "weekends",
+  "year",
+  "years",
+])
 const POSTPOSED_REVIEW_ABSENCE_TRANSITIVE_TERMS = new Set([
   "lacking",
   "missing",
 ])
 const POSTPOSED_REVIEW_ABSENCE_COMPLEMENT_LINKS = new Set([
   "after",
+  "as",
+  "at",
   "before",
+  "because",
   "during",
   "for",
   "from",
   "in",
   "on",
+  "over",
+  "across",
   "since",
   "through",
+  "throughout",
   "until",
   "when",
   "while",
+  "with",
+  "without",
+])
+const POSTPOSED_REVIEW_ABSENCE_COMPLEMENT_PHRASES = [
+  ["due", "to"],
+  ["owing", "to"],
+]
+const POSTPOSED_REVIEW_ABSENCE_TIME_DETERMINERS = new Set([
+  "a",
+  "all",
+  "each",
+  "every",
+  "last",
+  "next",
+  "that",
+  "the",
+  "these",
+  "this",
+  "those",
+])
+const POSTPOSED_REVIEW_ABSENCE_TIME_QUALIFIERS = new Set([
+  "coming",
+  "few",
+  "entire",
+  "half",
+  "last",
+  "most",
+  "next",
+  "other",
+  "past",
+  "several",
+  "whole",
+])
+const POSTPOSED_REVIEW_ABSENCE_TIME_COUNTS = new Set([
+  "eight",
+  "five",
+  "four",
+  "nine",
+  "one",
+  "seven",
+  "six",
+  "ten",
+  "three",
+  "two",
+])
+const POSTPOSED_REVIEW_ABSENCE_TIME_DESCRIPTOR_TERMS = new Set([
+  ...POSTPOSED_REVIEW_ABSENCE_MODIFIERS,
+  ...POSTPOSED_REVIEW_ABSENCE_TIME_COUNTS,
+  ...POSTPOSED_REVIEW_ABSENCE_TIME_DETERMINERS,
+  ...POSTPOSED_REVIEW_ABSENCE_TIME_QUALIFIERS,
+  "and",
+  "couple",
+  "first",
+  "of",
+  "second",
+  "single",
+  "third",
 ])
 const ACTOR_LINKS = new Set(["by", "to"])
 const NESTED_ACTOR_PREFIX_LINKS = new Set([
@@ -652,8 +802,113 @@ const TASK_COMPONENT_SUFFIX_TERMS = new Set([
   "review",
   "reviews",
   "test",
+  "tests",
   "testing",
   "validation",
+])
+const TASK_COMPONENT_ACTION_FORMS = new Set(["review", "test"])
+const TASK_COMPONENT_CONTINUATION_PREDICATES = new Set([
+  "continue",
+  "continues",
+  "continuing",
+])
+const TASK_REACTIVATION_PREDICATES = new Set([
+  "begin",
+  "begins",
+  "beginning",
+  "resume",
+  "resumes",
+  "resuming",
+  "restart",
+  "restarts",
+  "restarting",
+  "start",
+  "starts",
+  "starting",
+])
+const TASK_REACTIVATION_STATE_LINKS = new Set(["become", "becomes", "becoming"])
+const TASK_COMPONENT_STATE_LINKS = new Set([
+  "are",
+  "had",
+  "has",
+  "have",
+  "is",
+  "remain",
+  "remains",
+  "stays",
+  "was",
+  "were",
+])
+const TASK_UNFINISHED_STATE_TERMS = new Set([
+  "active",
+  "incomplete",
+  "ongoing",
+  "open",
+  "pending",
+  "running",
+  "underway",
+  "unfinished",
+])
+const PARTIAL_TASK_COMPLETION_TERMS = new Set([
+  "almost",
+  "barely",
+  "largely",
+  "mostly",
+  "nearly",
+  "partially",
+  "partly",
+  "provisionally",
+  "scarcely",
+  "substantially",
+])
+const TASK_STATE_CLAUSE_BOUNDARIES = new Set([
+  "although",
+  "and",
+  "because",
+  "but",
+  "if",
+  "though",
+  "unless",
+  "when",
+  "whereas",
+  "while",
+  "yet",
+])
+const TASK_STATE_MODIFIERS = new Set([
+  "actively",
+  "afterward",
+  "currently",
+  "still",
+  "then",
+  "yet",
+])
+const TASK_STATE_ANAPHOR_ADJUNCT_PREFIXES = [
+  ["according", "to"],
+  ["in", "fact"],
+]
+const TASK_STATE_CARRIED_ADJUNCT_STARTS = new Set([
+  "after",
+  "before",
+  "following",
+  "once",
+  "upon",
+  "when",
+])
+const TASK_STATE_SUBJECT_DETERMINERS = new Set([
+  "a",
+  "an",
+  "each",
+  "every",
+  "the",
+  "this",
+])
+const TASK_COMPLETION_SEQUENCE_TERMS = new Set([
+  "it",
+  "itself",
+  "longer",
+  "no",
+  "not",
+  "only",
 ])
 const ACTIVE_TIMING_MARKERS = new Set(["during", "inside", "while"])
 const BOUNDARY_TIMING_MARKERS = new Set([
@@ -728,14 +983,60 @@ const REVIEW_REPLACEMENT_ACTIONS = new Set([
 ])
 const REVIEW_TAKE_ACTIONS = new Set(["take", "takes", "taking", "took"])
 const REVIEW_REQUIREMENT_ACTIONS = new Set(["mandatory", "required"])
-const REVIEW_TARGET_DEMONSTRATIVES = new Set(["same", "that", "this"])
+const REVIEW_TARGET_ANAPHORIC_TERMS = new Set([
+  "aforementioned",
+  "former",
+  "original",
+  "previous",
+  "same",
+  "that",
+  "this",
+])
 const GENERIC_REVIEW_TARGET_PREFIX_TERMS = new Set([
   "a",
+  "aforementioned",
   "an",
+  "assigned",
+  "former",
+  "original",
+  "previous",
+  "previously",
   "same",
   "that",
   "the",
   "this",
+  "very",
+])
+const REVIEW_TARGET_ADJUNCT_LINKS = new Set([
+  "after",
+  "as",
+  "before",
+  "because",
+  "by",
+  "during",
+  "for",
+  "if",
+  "in",
+  "once",
+  "since",
+  "unless",
+  "until",
+  "to",
+  "upon",
+  "when",
+  "whenever",
+  "while",
+])
+const REVIEW_TARGET_NON_ROLE_HEAD_TERMS = new Set([
+  ...POSTPOSED_REVIEW_ABSENCE_MODIFIERS,
+  "role",
+  "slot",
+])
+const REVIEW_TARGET_GENERIC_PERSON_TERMS = new Set([
+  "individual",
+  "one",
+  "party",
+  "person",
 ])
 const REVIEW_EXHAUSTIVE_QUANTIFIERS = new Set([
   "alone",
@@ -1106,14 +1407,29 @@ function directiveWindows(prose) {
     .split(/\n\s*\n+/)) {
     let priorTokens = []
     let priorActionBoundaryAfter = new Set()
+    let priorPossessiveIndexes = new Set()
+    let carriedTasks = []
     for (const source of paragraph.split(/[.!?;]+/)) {
       const matches = [...source.matchAll(/[a-z0-9]+(?:-[a-z0-9]+)*/g)]
       const tokens = matches.map((match) => match[0])
       const actionBoundaryAfter = matches.flatMap((match, index) => {
         const gapStart = match.index + match[0].length
         const gapEnd = matches[index + 1]?.index ?? source.length
-        return /[,:]/.test(source.slice(gapStart, gapEnd)) ? [index] : []
+        return /[-,:\/()[\]\u2013\u2014]/.test(source.slice(gapStart, gapEnd))
+          ? [index]
+          : []
       })
+      const possessiveIndexes = matches.flatMap((match, index) => {
+        const gapStart = match.index + match[0].length
+        const gapEnd = matches[index + 1]?.index ?? source.length
+        return /['\u2019]/.test(source.slice(gapStart, gapEnd)) ? [index] : []
+      })
+      const immediatePriorTasks = directiveTaskAntecedents(
+        priorTokens,
+        priorActionBoundaryAfter
+      )
+      const priorTasks =
+        immediatePriorTasks.length > 0 ? immediatePriorTasks : carriedTasks
       for (let start = 0; start < tokens.length; start += step) {
         windows.push({
           tokens: tokens.slice(start, start + DIRECTIVE_WINDOW_TOKENS),
@@ -1126,19 +1442,30 @@ function directiveWindows(prose) {
               .map((index) => index - start)
           ),
           priorReviewers: directiveReviewers(priorTokens),
-          priorTasks: directiveTaskAntecedents(
+          priorTasks,
+          priorDocumentTargets: directiveDocumentTargets(priorTokens),
+          priorPronounAntecedent: directivePronounAntecedent(
             priorTokens,
+            priorPossessiveIndexes,
             priorActionBoundaryAfter
           ),
-          priorDocumentTargets: directiveDocumentTargets(priorTokens),
-          priorPronounAntecedent: directivePronounAntecedent(priorTokens),
         })
       }
       if (tokens.length > 0) {
+        carriedTasks = carriedTaskAntecedentsAfterClause(
+          tokens,
+          new Set(actionBoundaryAfter),
+          carriedTasks
+        )
         const priorStart = Math.max(0, tokens.length - DIRECTIVE_WINDOW_TOKENS)
         priorTokens = tokens.slice(priorStart)
         priorActionBoundaryAfter = new Set(
           actionBoundaryAfter
+            .filter((index) => index >= priorStart)
+            .map((index) => index - priorStart)
+        )
+        priorPossessiveIndexes = new Set(
+          possessiveIndexes
             .filter((index) => index >= priorStart)
             .map((index) => index - priorStart)
         )
@@ -1179,6 +1506,96 @@ function tokensArePostposedReviewAbsenceModifiers(tokens) {
   let index = 0
   while (index < tokens.length) {
     const token = tokens[index]
+    const fractionalDuration = tokenIndexes(
+      tokens,
+      POSTPOSED_REVIEW_ABSENCE_TIME_TERMS,
+      index,
+      Math.min(tokens.length, index + 5)
+    ).find(
+      (time) =>
+        tokens
+          .slice(index, time)
+          .every(
+            (descriptor) =>
+              /^\d+$/.test(descriptor) ||
+              POSTPOSED_REVIEW_ABSENCE_TIME_DESCRIPTOR_TERMS.has(descriptor)
+          ) &&
+        phraseIndex(tokens, ["and", "a", "half"], time + 1, time + 4) ===
+          time + 1
+    )
+    if (fractionalDuration !== undefined) {
+      index = fractionalDuration + 4
+      continue
+    }
+    const duration = tokenIndexes(
+      tokens,
+      POSTPOSED_REVIEW_ABSENCE_TIME_TERMS,
+      index,
+      Math.min(tokens.length, index + 8)
+    ).find((time) =>
+      tokens
+        .slice(index, time)
+        .every(
+          (descriptor) =>
+            /^\d+$/.test(descriptor) ||
+            POSTPOSED_REVIEW_ABSENCE_TIME_DESCRIPTOR_TERMS.has(descriptor)
+        )
+    )
+    if (duration !== undefined) {
+      index = duration + 1
+      continue
+    }
+    if (
+      (/^\d+$/.test(token) ||
+        POSTPOSED_REVIEW_ABSENCE_TIME_COUNTS.has(token) ||
+        POSTPOSED_REVIEW_ABSENCE_MODIFIERS.has(token)) &&
+      POSTPOSED_REVIEW_ABSENCE_TIME_TERMS.has(tokens[index + 1])
+    ) {
+      index += 2
+      continue
+    }
+    if (token === "and" && index > 0 && index + 1 < tokens.length) {
+      index += 1
+      continue
+    }
+    if (POSTPOSED_REVIEW_ABSENCE_TIME_DETERMINERS.has(token)) {
+      let time = index + 1
+      while (
+        POSTPOSED_REVIEW_ABSENCE_TIME_QUALIFIERS.has(tokens[time]) ||
+        POSTPOSED_REVIEW_ABSENCE_TIME_COUNTS.has(tokens[time]) ||
+        /^\d+$/.test(tokens[time])
+      ) {
+        time += 1
+      }
+      if (POSTPOSED_REVIEW_ABSENCE_TIME_TERMS.has(tokens[time])) {
+        index = time + 1
+        continue
+      }
+    }
+    if (
+      POSTPOSED_REVIEW_ABSENCE_TIME_QUALIFIERS.has(token) &&
+      POSTPOSED_REVIEW_ABSENCE_TIME_TERMS.has(tokens[index + 1])
+    ) {
+      index += 2
+      continue
+    }
+    if (
+      token === "half" &&
+      POSTPOSED_REVIEW_ABSENCE_TIME_DETERMINERS.has(tokens[index + 1]) &&
+      POSTPOSED_REVIEW_ABSENCE_TIME_TERMS.has(tokens[index + 2])
+    ) {
+      index += 3
+      continue
+    }
+    if (
+      new Set(["half", "most"]).has(token) &&
+      tokens[index + 1] === "of" &&
+      POSTPOSED_REVIEW_ABSENCE_TIME_DETERMINERS.has(tokens[index + 2]) &&
+      POSTPOSED_REVIEW_ABSENCE_TIME_TERMS.has(tokens[index + 3])
+    ) {
+      index += 4
+      continue
+    }
     const phrase = POSTPOSED_REVIEW_ABSENCE_MODIFIER_PHRASES.find((candidate) =>
       candidate.every(
         (phraseToken, offset) => tokens[index + offset] === phraseToken
@@ -1197,31 +1614,105 @@ function tokensArePostposedReviewAbsenceModifiers(tokens) {
   return true
 }
 
+function reviewAbsenceTailStartsComplement(tail) {
+  const startsWithComplementPhrase =
+    POSTPOSED_REVIEW_ABSENCE_COMPLEMENT_PHRASES.some(
+      (phrase) => phraseIndex(tail, phrase, 0, phrase.length) === 0
+    )
+  const complementLinkIndicatesAbsence =
+    POSTPOSED_REVIEW_ABSENCE_COMPLEMENT_LINKS.has(tail[0]) &&
+    !(
+      (tail[0] === "at" && tail[1] === "least") ||
+      (tail[0] === "over" &&
+        !tokensArePostposedReviewAbsenceModifiers(tail.slice(1)))
+    )
+  return startsWithComplementPhrase || complementLinkIndicatesAbsence
+}
+
 function postposedReviewAbsenceHasDirectObject(clause, absence, relationEnd) {
-  if (
-    !POSTPOSED_REVIEW_ABSENCE_TRANSITIVE_TERMS.has(clause.tokens[absence]) ||
-    clause.actionBoundaryAfter.has(absence)
-  ) {
+  const predicate = clause.tokens[absence]
+  if (!POSTPOSED_REVIEW_ABSENCE_TRANSITIVE_TERMS.has(predicate)) {
     return false
   }
   const tail = clause.tokens.slice(absence + 1, relationEnd)
   if (tail.length === 0) return false
-  if (tokensArePostposedReviewAbsenceModifiers(tail)) return false
+  if (tokensArePostposedReviewAbsenceModifiers(tail)) {
+    return (
+      predicate === "lacking" &&
+      tail.some(
+        (token) =>
+          token.endsWith("ly") && !POSTPOSED_REVIEW_ABSENCE_MODIFIERS.has(token)
+      )
+    )
+  }
+  if (predicate === "lacking" && tail[0] === "in") return true
+  const modifierThenComplement = tail
+    .slice(1)
+    .some(
+      (_token, index) =>
+        tokensArePostposedReviewAbsenceModifiers(tail.slice(0, index + 1)) &&
+        reviewAbsenceTailStartsComplement(tail.slice(index + 1))
+    )
   return !(
     CLAUSE_COORDINATORS.has(tail[0]) ||
-    POSTPOSED_REVIEW_ABSENCE_COMPLEMENT_LINKS.has(tail[0])
+    modifierThenComplement ||
+    reviewAbsenceTailStartsComplement(tail)
   )
 }
 
-function peopleRelationIntroduces(tokens, predicate, person) {
-  const targetPrefixIsBounded = (start) =>
-    tokens
-      .slice(start, person)
-      .every(
-        (token) =>
-          token.endsWith("ly") ||
-          PEOPLE_ANTECEDENT_TARGET_PREFIX_TERMS.has(token)
-      )
+function peopleRelationIntroduces(
+  tokens,
+  predicate,
+  person,
+  possessiveIndexes,
+  actionBoundaryAfter
+) {
+  if (possessiveIndexes.has(person)) return false
+  const targetPrefixIsBounded = (start) => {
+    const prefix = tokens.slice(start, person)
+    const nestedObjectLink = prefix.lastIndexOf("of")
+    const nestedObjectHead = prefix
+      .slice(0, nestedObjectLink)
+      .findLast((token) => !new Set(["a", "an", "the"]).has(token))
+    if (
+      nestedObjectLink >= 0 &&
+      nestedObjectHead !== undefined &&
+      !PEOPLE_PARTITIVE_TARGET_HEADS.has(nestedObjectHead)
+    ) {
+      return false
+    }
+    const coordination = prefix.lastIndexOf("and")
+    const beforeCoordination = prefix.slice(0, coordination)
+    const afterCoordination = prefix.slice(coordination + 1)
+    const relationEndsAtPerson =
+      person === tokens.length - 1 ||
+      PEOPLE_ANTECEDENT_RELATION_BOUNDARIES.has(tokens[person + 1]) ||
+      PEOPLE_ANTECEDENT_LINKS.has(tokens[person + 1]) ||
+      tokens
+        .slice(person + 1)
+        .every(
+          (token) =>
+            token.endsWith("ly") ||
+            POSTPOSED_REVIEW_ABSENCE_MODIFIERS.has(token)
+        )
+    const relationCrossesPunctuation = [...actionBoundaryAfter].some(
+      (boundary) => boundary >= start && boundary < person
+    )
+    const coordinationStaysInTarget =
+      coordination < 0 ||
+      beforeCoordination.includes("both") ||
+      (afterCoordination.length > 0 &&
+        !PEOPLE_CLAUSE_SUBJECT_STARTERS.has(afterCoordination[0]) &&
+        relationEndsAtPerson)
+    return (
+      !prefix.some((token) =>
+        PEOPLE_ANTECEDENT_RELATION_BOUNDARIES.has(token)
+      ) &&
+      (!relationCrossesPunctuation ||
+        (coordination >= 0 && relationEndsAtPerson)) &&
+      coordinationStaysInTarget
+    )
+  }
   const directLink = tokenIndexes(
     tokens,
     PEOPLE_ANTECEDENT_LINKS,
@@ -1229,6 +1720,23 @@ function peopleRelationIntroduces(tokens, predicate, person) {
     person
   ).at(-1)
   if (directLink !== undefined && targetPrefixIsBounded(directLink + 1)) {
+    return true
+  }
+  const participantLink = tokenIndexes(
+    tokens,
+    new Set(["after"]),
+    predicate + 1,
+    person
+  )
+    .filter(
+      (index) =>
+        tokenIndex(tokens, PEOPLE_PARTICIPANT_ACTIONS, index + 1, person) >= 0
+    )
+    .at(-1)
+  if (
+    participantLink !== undefined &&
+    targetPrefixIsBounded(participantLink + 1)
+  ) {
     return true
   }
   const behalfLink = tokenIndexes(
@@ -1388,22 +1896,57 @@ function directiveTasks(tokens) {
 function directiveTaskAntecedents(tokens, actionBoundaryAfter = new Set()) {
   const clause = { tokens, actionBoundaryAfter }
   return directiveTasks(tokens).map((task) => {
-    const completed = taskHasCompletedState(clause, task)
-    const postposedActivity = taskStateIndexes(
-      clause,
-      task,
-      EXPLICIT_TASK_ACTIVITY_TERMS
-    ).some(
-      (state) => state > task.index && !actionIsNegated(clause.tokens, state)
-    )
+    const completed = taskCompletedStateIndexes(clause, task).length > 0
     return {
       ...task,
-      active:
-        taskHasAffirmativeActivity(clause, task) &&
-        (!completed || postposedActivity),
+      active: taskIsEffectivelyActive(clause, task),
       completed,
     }
   })
+}
+
+function carriedTaskAntecedentsAfterClause(
+  tokens,
+  actionBoundaryAfter,
+  priorTasks
+) {
+  const explicitTasks = directiveTaskAntecedents(tokens, actionBoundaryAfter)
+  if (explicitTasks.length > 0) return explicitTasks
+  if (priorTasks.length === 0) return []
+
+  const anaphors = tokenIndexes(tokens, new Set(["it", "itself"]))
+  const clause = { tokens, actionBoundaryAfter, tasks: [], priorTasks }
+  const completion = tokenIndexes(tokens, TASK_COMPLETION_TERMS).find(
+    (state) => {
+      const anaphor = anaphors.filter((index) => index < state).at(-1)
+      if (anaphor === undefined || state - anaphor > 5) return false
+      const prefix = tokens.slice(0, anaphor)
+      const plainPrefix = prefix.every(
+        (token) =>
+          TASK_STATE_MODIFIERS.has(token) ||
+          TASK_COMPLETION_BRIDGE_TERMS.has(token)
+      )
+      const leadingAdjunct =
+        prefix.length <= 4 &&
+        TASK_STATE_CARRIED_ADJUNCT_STARTS.has(prefix[0]) &&
+        actionBoundaryAfter.has(anaphor - 1) &&
+        tokenIndex(tokens, TASK_COMPLETION_TERMS, 0, anaphor) < 0
+      if (!plainPrefix && !leadingAdjunct) {
+        return false
+      }
+      const task = { ...priorTasks.at(-1), index: anaphor }
+      return (
+        completionBelongsToTask(clause, task, state) &&
+        !actionIsNegated(tokens, state)
+      )
+    }
+  )
+  if (completion === undefined) return priorTasks
+  return priorTasks.map((task, index) =>
+    index === priorTasks.length - 1
+      ? { ...task, active: false, completed: true }
+      : task
+  )
 }
 
 function directiveDocumentTargets(tokens) {
@@ -1451,7 +1994,11 @@ function mentionsPluralGroup(tokens, mentions) {
   )
 }
 
-function directivePronounAntecedent(tokens) {
+function directivePronounAntecedent(
+  tokens,
+  possessiveIndexes = new Set(),
+  actionBoundaryAfter = new Set()
+) {
   const documents = directiveDocumentTargets(tokens)
   const people = directivePeopleAntecedents(tokens)
   const actors = directiveActors(tokens)
@@ -1480,7 +2027,13 @@ function directivePronounAntecedent(tokens) {
       : people.filter(
           (person) =>
             person.start > predicate &&
-            peopleRelationIntroduces(tokens, predicate, person.start)
+            peopleRelationIntroduces(
+              tokens,
+              predicate,
+              person.start,
+              possessiveIndexes,
+              actionBoundaryAfter
+            )
         )
 
   const pluralDocuments = mentionsPluralGroup(tokens, documentObjects)
@@ -3024,13 +3577,423 @@ function taskStateIndexes(clause, task, states) {
   )
 }
 
+function taskComponentIndex(clause, task) {
+  return tokenIndex(
+    clause.tokens,
+    TASK_COMPONENT_SUFFIX_TERMS,
+    task.index + 1,
+    task.index + 8
+  )
+}
+
+function stateHasTaskSubject(clause, task, state) {
+  const boundary = tokenIndexes(
+    clause.tokens,
+    TASK_STATE_CLAUSE_BOUNDARIES,
+    task.index + 1,
+    state
+  ).at(-1)
+  const segmentStart = boundary === undefined ? task.index + 1 : boundary + 1
+  const stateLink = tokenIndexes(
+    clause.tokens,
+    new Set([
+      ...TASK_COMPONENT_STATE_LINKS,
+      ...TASK_COMPONENT_CONTINUATION_PREDICATES,
+      ...TASK_REACTIVATION_PREDICATES,
+      ...TASK_REACTIVATION_STATE_LINKS,
+    ]),
+    segmentStart,
+    state
+  ).at(-1)
+  const subjectEnd = stateLink ?? state
+  const subjectPrefix = clause.tokens.slice(segmentStart, subjectEnd)
+  const subjectHead = subjectPrefix.findIndex(
+    (token) => !TASK_STATE_MODIFIERS.has(token) && !token.endsWith("ly")
+  )
+  const normalizedSubjectPrefix = subjectPrefix.slice(
+    subjectHead < 0 ? subjectPrefix.length : subjectHead
+  )
+  const adjunctTaskAnaphor = TASK_STATE_ANAPHOR_ADJUNCT_PREFIXES.some(
+    (prefix) =>
+      phraseIndex(
+        normalizedSubjectPrefix,
+        prefix,
+        0,
+        normalizedSubjectPrefix.length
+      ) === 0 &&
+      normalizedSubjectPrefix.at(-1) === "it" &&
+      !normalizedSubjectPrefix.slice(0, -1).includes("itself")
+  )
+  if (adjunctTaskAnaphor) return true
+  if (subjectPrefix.length === 0) return true
+  if (
+    subjectPrefix.every(
+      (token) => TASK_STATE_MODIFIERS.has(token) || token.endsWith("ly")
+    )
+  ) {
+    return true
+  }
+  if (
+    normalizedSubjectPrefix[0] === "its" &&
+    TASK_COMPONENT_SUFFIX_TERMS.has(normalizedSubjectPrefix.at(-1))
+  ) {
+    return true
+  }
+  if (new Set(["it", "itself"]).has(normalizedSubjectPrefix[0])) {
+    if (
+      normalizedSubjectPrefix.length > 1 &&
+      !(
+        normalizedSubjectPrefix.length === 2 &&
+        normalizedSubjectPrefix[1] === "itself"
+      )
+    ) {
+      return false
+    }
+    const previousBoundary = tokenIndexes(
+      clause.tokens,
+      TASK_STATE_CLAUSE_BOUNDARIES,
+      task.index + 1,
+      boundary
+    ).at(-1)
+    const previousStart =
+      previousBoundary === undefined ? task.index + 1 : previousBoundary + 1
+    const previousLink = tokenIndexes(
+      clause.tokens,
+      TASK_COMPONENT_STATE_LINKS,
+      previousStart,
+      boundary
+    ).at(-1)
+    return previousLink === undefined || previousLink === previousStart
+  }
+  if (TASK_COMPONENT_SUFFIX_TERMS.has(subjectPrefix.at(-1))) {
+    return !taskComponentStateHasActionObject(clause, subjectEnd - 1, state)
+  }
+  const laterDeterminer = subjectPrefix
+    .slice(2)
+    .some((token) => TASK_STATE_SUBJECT_DETERMINERS.has(token))
+  return (
+    new Set(["after", "before", "following"]).has(subjectPrefix[0]) &&
+    TASK_STATE_SUBJECT_DETERMINERS.has(subjectPrefix[1]) &&
+    subjectPrefix.length <= 4 &&
+    !laterDeterminer
+  )
+}
+
+function postposedTaskStateIndexes(clause, task, states) {
+  const nextTask = clause.tasks?.find(
+    (candidate) => candidate.index > task.index
+  )
+  const end = nextTask?.index ?? clause.tokens.length
+  return tokenIndexes(clause.tokens, states, task.index + 1, end).filter(
+    (state) => stateHasTaskSubject(clause, task, state)
+  )
+}
+
+function taskActivityStateIndexes(clause, task) {
+  const preposed = tokenIndexes(
+    clause.tokens,
+    EXPLICIT_TASK_ACTIVITY_TERMS,
+    Math.max(0, task.index - 2),
+    task.index + 1
+  )
+  const reactivations = postposedTaskStateIndexes(
+    clause,
+    task,
+    TASK_REACTIVATION_PREDICATES
+  ).filter((state) =>
+    taskCompletedStateIndexes(clause, task).some(
+      (completion) => completion < state
+    )
+  )
+  return [
+    ...new Set([
+      ...preposed,
+      ...postposedTaskStateIndexes(clause, task, EXPLICIT_TASK_ACTIVITY_TERMS),
+      ...reactivations,
+    ]),
+  ].sort((left, right) => left - right)
+}
+
+function taskComponentStateHasActionObject(clause, component, state) {
+  const boundary = [...clause.actionBoundaryAfter]
+    .filter((candidate) => candidate >= state)
+    .sort((left, right) => left - right)[0]
+  const object = clause.tokens.slice(state + 1, (boundary ?? state) + 1)
+  const head = object.findLast(
+    (token) =>
+      !TASK_STATE_MODIFIERS.has(token) &&
+      !TASK_UNFINISHED_STATE_TERMS.has(token) &&
+      !CLAUSE_COORDINATORS.has(token)
+  )
+  const headIndex = object.lastIndexOf(head)
+  return (
+    TASK_COMPONENT_ACTION_FORMS.has(clause.tokens[component]) &&
+    head !== undefined &&
+    (head.endsWith("s") ||
+      object
+        .slice(0, headIndex)
+        .some((token) => TASK_STATE_SUBJECT_DETERMINERS.has(token)))
+  )
+}
+
+function taskComponentHasUnfinishedState(clause, task) {
+  const component = taskComponentIndex(clause, task)
+  if (component < 0) return false
+  const end = Math.min(clause.tokens.length, component + 7)
+  const ellipticalState = tokenIndex(
+    clause.tokens,
+    TASK_UNFINISHED_STATE_TERMS,
+    component + 1,
+    end
+  )
+  const stateBoundaryAfter = (state) =>
+    [...clause.actionBoundaryAfter]
+      .filter((boundary) => boundary >= state && boundary < end)
+      .sort((left, right) => left - right)[0]
+  const stateEndsAtBoundary = (state) =>
+    stateBoundaryAfter(state) !== undefined ||
+    CLAUSE_COORDINATORS.has(clause.tokens[state + 1])
+  const ellipticalStateHasActionObject =
+    ellipticalState >= 0 &&
+    taskComponentStateHasActionObject(clause, component, ellipticalState)
+  const componentHasActionModifier = clause.tokens
+    .slice(task.index + 1, component)
+    .some((token) => token.endsWith("ly"))
+  if (
+    ellipticalState >= 0 &&
+    !actionIsNegated(clause.tokens, ellipticalState) &&
+    !componentHasActionModifier &&
+    !ellipticalStateHasActionObject &&
+    clause.tokens
+      .slice(component + 1, ellipticalState)
+      .every(
+        (token) => TASK_STATE_MODIFIERS.has(token) || token.endsWith("ly")
+      ) &&
+    (clause.tokens[ellipticalState + 1] === undefined ||
+      stateEndsAtBoundary(ellipticalState))
+  ) {
+    return true
+  }
+  const ellipticalCompletion = tokenIndex(
+    clause.tokens,
+    TASK_COMPLETION_TERMS,
+    component + 1,
+    end
+  )
+  if (
+    ellipticalCompletion >= 0 &&
+    tokenIndex(
+      clause.tokens,
+      NEGATION_TERMS,
+      component + 1,
+      ellipticalCompletion
+    ) >= 0 &&
+    clause.tokens
+      .slice(component + 1, ellipticalCompletion)
+      .every(
+        (token) =>
+          NEGATION_TERMS.has(token) ||
+          TASK_STATE_MODIFIERS.has(token) ||
+          token.endsWith("ly")
+      ) &&
+    (clause.tokens[ellipticalCompletion + 1] === undefined ||
+      stateEndsAtBoundary(ellipticalCompletion))
+  ) {
+    return true
+  }
+  const continuation = tokenIndex(
+    clause.tokens,
+    TASK_COMPONENT_CONTINUATION_PREDICATES,
+    component + 1,
+    end
+  )
+  const continuationAgrees =
+    clause.tokens[continuation] === "continues" ||
+    (clause.tokens[component] === "reviews" &&
+      clause.tokens[continuation] === "continue")
+  if (
+    continuation >= 0 &&
+    continuationAgrees &&
+    clause.tokens
+      .slice(component + 1, continuation)
+      .every((token) => TASK_STATE_MODIFIERS.has(token) || token.endsWith("ly"))
+  ) {
+    return true
+  }
+  const stateLink = tokenIndex(
+    clause.tokens,
+    TASK_COMPONENT_STATE_LINKS,
+    component + 1,
+    end
+  )
+  if (stateLink < 0) return false
+  if (
+    !clause.tokens
+      .slice(component + 1, stateLink)
+      .every(
+        (token) =>
+          TASK_COMPONENT_SUFFIX_TERMS.has(token) ||
+          TASK_STATE_MODIFIERS.has(token) ||
+          CLAUSE_COORDINATORS.has(token) ||
+          token.endsWith("ly")
+      )
+  ) {
+    return false
+  }
+  if (
+    tokenIndexes(
+      clause.tokens,
+      TASK_UNFINISHED_STATE_TERMS,
+      stateLink + 1,
+      end
+    ).some((state) => !actionIsNegated(clause.tokens, state))
+  ) {
+    return true
+  }
+  return tokenIndexes(
+    clause.tokens,
+    TASK_COMPLETION_TERMS,
+    stateLink + 1,
+    end
+  ).some((state) => {
+    if (actionIsNegated(clause.tokens, state)) return true
+    const predicateTail = clause.tokens.slice(stateLink + 1, state)
+    return (
+      predicateTail.some((token) => PARTIAL_TASK_COMPLETION_TERMS.has(token)) ||
+      phraseIndex(predicateTail, ["anything", "but"]) >= 0 ||
+      phraseIndex(predicateTail, ["nowhere", "near"]) >= 0 ||
+      phraseIndex(predicateTail, ["yet", "to"]) >= 0 ||
+      (["remain", "remains"].includes(clause.tokens[stateLink]) &&
+        phraseIndex(predicateTail, ["to", "be"]) >= 0)
+    )
+  })
+}
+
+function taskCompletionIsPartial(clause, task, completion) {
+  let start =
+    completion < task.index
+      ? Math.max(0, completion - 2)
+      : Math.min(task.index + 1, completion)
+  if (completion > task.index) {
+    const previousCompletion = tokenIndexes(
+      clause.tokens,
+      TASK_COMPLETION_TERMS,
+      task.index + 1,
+      completion
+    ).at(-1)
+    if (previousCompletion !== undefined) start = previousCompletion + 1
+  }
+  const end = Math.max(task.index, completion)
+  if (
+    tokenIndex(clause.tokens, PARTIAL_TASK_COMPLETION_TERMS, start, end) >= 0
+  ) {
+    return true
+  }
+  const tail = clause.tokens.slice(completion + 1, completion + 5)
+  const qualifierEnds = (index) =>
+    tail[index] === undefined ||
+    tail[index] === "then" ||
+    CLAUSE_COORDINATORS.has(tail[index])
+  let cursor = 0
+  if (new Set(["and", "but", "though", "yet"]).has(tail[cursor])) {
+    cursor += 1
+  }
+  if (new Set(["merely", "only"]).has(tail[cursor])) cursor += 1
+  let part = cursor + 1
+  if (new Set(["large", "significant", "substantial"]).has(tail[part])) {
+    part += 1
+  }
+  if (
+    tail[cursor] === "in" &&
+    tail[part] === "part" &&
+    qualifierEnds(part + 1)
+  ) {
+    return true
+  }
+  if (
+    tail[cursor] === "to" &&
+    new Set(["a", "an", "some"]).has(tail[cursor + 1]) &&
+    tail[cursor + 2] === "extent" &&
+    qualifierEnds(cursor + 3)
+  ) {
+    return true
+  }
+  const most = tail[cursor + 1] === "the" ? cursor + 2 : cursor + 1
+  if (
+    tail[cursor] === "for" &&
+    tail[most] === "most" &&
+    tail[most + 1] === "part" &&
+    qualifierEnds(most + 2)
+  ) {
+    return true
+  }
+  return (
+    PARTIAL_TASK_COMPLETION_TERMS.has(tail[cursor]) && qualifierEnds(cursor + 1)
+  )
+}
+
 function completionBelongsToTask(clause, task, completion) {
-  if (completion >= task.index && completion - task.index <= 4) {
+  if (taskCompletionIsPartial(clause, task, completion)) return false
+  const actionBoundary = [...clause.actionBoundaryAfter]
+    .filter((boundary) => boundary >= completion)
+    .sort((left, right) => left - right)[0]
+  const componentObject = tokenIndex(
+    clause.tokens,
+    TASK_COMPONENT_SUFFIX_TERMS,
+    completion + 1,
+    Math.min(
+      clause.tokens.length,
+      completion + 5,
+      actionBoundary === undefined ? clause.tokens.length : actionBoundary + 1
+    )
+  )
+  const componentObjectPrefix = clause.tokens.slice(
+    completion + 1,
+    componentObject < 0 ? completion + 1 : componentObject
+  )
+  if (
+    componentObject >= 0 &&
+    !componentObjectPrefix.some(
+      (token) =>
+        CLAUSE_COORDINATORS.has(token) ||
+        PEOPLE_ANTECEDENT_LINKS.has(token) ||
+        TASK_COMPONENT_STATE_LINKS.has(token) ||
+        TASK_STATE_CLAUSE_BOUNDARIES.has(token)
+    )
+  ) {
+    return false
+  }
+  const followingStateLink = tokenIndex(
+    clause.tokens,
+    TASK_COMPONENT_STATE_LINKS,
+    completion + 2,
+    completion + 12
+  )
+  const followingSubject = clause.tokens.slice(
+    completion + 1,
+    followingStateLink < 0 ? completion + 1 : followingStateLink
+  )
+  if (
+    completion > task.index &&
+    followingSubject.length > 0 &&
+    followingSubject.length <= 10 &&
+    followingSubject.some((token) => TASK_COMPONENT_SUFFIX_TERMS.has(token)) &&
+    !CLAUSE_COORDINATORS.has(followingSubject[0])
+  ) {
+    return false
+  }
+  if (completion >= task.index && completion - task.index <= 10) {
     return clause.tokens
       .slice(task.index + 1, completion)
       .every(
         (token) =>
-          TASK_COMPLETION_BRIDGE_TERMS.has(token) || token.endsWith("ly")
+          TASK_COMPLETION_BRIDGE_TERMS.has(token) ||
+          TASK_COMPLETION_TERMS.has(token) ||
+          EXPLICIT_TASK_ACTIVITY_TERMS.has(token) ||
+          CLAUSE_COORDINATORS.has(token) ||
+          SEQUENTIAL_PASSIVE_RELATION_FILLERS.has(token) ||
+          TASK_COMPLETION_SEQUENCE_TERMS.has(token) ||
+          token.endsWith("ly")
       )
   }
   if (
@@ -3050,8 +4013,9 @@ function completionBelongsToTask(clause, task, completion) {
   return (
     objectLink >= 0 &&
     !(
-      TASK_COMPONENT_SUFFIX_TERMS.has(clause.tokens[task.index + 1]) &&
-      !clause.actionBoundaryAfter.has(task.index)
+      taskComponentIndex(clause, task) >= 0 &&
+      (!clause.actionBoundaryAfter.has(task.index) ||
+        taskComponentHasUnfinishedState(clause, task))
     ) &&
     tokenIndex(
       clause.tokens,
@@ -3072,16 +4036,49 @@ function completionBelongsToTask(clause, task, completion) {
   )
 }
 
-function taskHasCompletedState(clause, task) {
-  return tokenIndexes(clause.tokens, TASK_COMPLETION_TERMS).some(
+function taskCompletedStateIndexes(clause, task) {
+  return tokenIndexes(clause.tokens, TASK_COMPLETION_TERMS).filter(
     (state) =>
       completionBelongsToTask(clause, task, state) &&
       !actionIsNegated(clause.tokens, state)
   )
 }
 
+function taskHasCompletedState(clause, task) {
+  return taskCompletedStateIndexes(clause, task).length > 0
+}
+
+function affirmativeTaskActivityIndexes(clause, task) {
+  return taskActivityStateIndexes(clause, task).filter(
+    (state) => !actionIsNegated(clause.tokens, state)
+  )
+}
+
+function taskHasEffectiveExplicitActivity(clause, task) {
+  const activities = affirmativeTaskActivityIndexes(clause, task)
+  const completions = taskCompletedStateIndexes(clause, task)
+  if (activities.length > 0) {
+    if (completions.length === 0) return true
+    const lastCompletion = completions.at(-1)
+    if (lastCompletion < task.index) {
+      return activities.some((activity) => activity > task.index)
+    }
+    return activities.at(-1) > lastCompletion
+  }
+  return false
+}
+
+function taskIsEffectivelyActive(clause, task) {
+  if (taskHasEffectiveExplicitActivity(clause, task)) return true
+  const completions = taskCompletedStateIndexes(clause, task)
+  return (
+    taskStateIndexes(clause, task, new Set(["current"])).length > 0 &&
+    completions.length === 0
+  )
+}
+
 function taskHasAffirmativeActivity(clause, task) {
-  const explicit = taskStateIndexes(clause, task, EXPLICIT_TASK_ACTIVITY_TERMS)
+  const explicit = taskActivityStateIndexes(clause, task)
   if (explicit.some((state) => !actionIsNegated(clause.tokens, state))) {
     return true
   }
@@ -3093,8 +4090,8 @@ function taskHasAffirmativeActivity(clause, task) {
 }
 
 function taskHasNegatedActivity(clause, task) {
-  return taskStateIndexes(clause, task, EXPLICIT_TASK_ACTIVITY_TERMS).some(
-    (state) => actionIsNegated(clause.tokens, state)
+  return taskActivityStateIndexes(clause, task).some((state) =>
+    actionIsNegated(clause.tokens, state)
   )
 }
 
@@ -3174,7 +4171,7 @@ function hasPreCompletionTaskTiming(clause) {
 
 function conflictsWithActiveTaskSwitch(clause) {
   const { tokens } = clause
-  const change = tokenIndex(
+  const changes = tokenIndexes(
     tokens,
     new Set([
       "change",
@@ -3188,27 +4185,82 @@ function conflictsWithActiveTaskSwitch(clause) {
       "switching",
     ])
   )
-  if (change < 0 || actionIsNegated(tokens, change)) return false
-  const hasAgent =
-    tokenIndex(tokens, new Set(["agent", "agents"])) >= 0 ||
-    clause.actors.some((actor) => ["codex", "task_agent"].includes(actor.role))
-  if (!hasAgent) return false
+  const hasAffirmativeAgentChange = changes.some((change, index) => {
+    const actionBoundary = [...clause.actionBoundaryAfter]
+      .filter((boundary) => boundary < change)
+      .at(-1)
+    const changeSegmentStart =
+      Math.max(actionBoundary ?? -1, changes[index - 1] ?? -1) + 1
+    if (
+      actionIsNegated(
+        tokens.slice(changeSegmentStart, change + 1),
+        change - changeSegmentStart
+      )
+    ) {
+      return false
+    }
+    const subjectAgent = clause.actors
+      .filter(
+        (actor) =>
+          ["codex", "task_agent"].includes(actor.role) &&
+          actor.end <= change &&
+          tokens.slice(actor.end, change).every((token) => token.endsWith("ly"))
+      )
+      .at(-1)
+    if (subjectAgent) return true
+    const segment = actionSegment(clause, change)
+    const targetEnd = Math.min(
+      segment.end,
+      changes[index + 1] ?? clause.tokens.length
+    )
+    const agentToken = tokenIndex(
+      tokens,
+      new Set(["agent", "agents"]),
+      change + 1,
+      targetEnd
+    )
+    const agentActor = clause.actors.find(
+      (actor) =>
+        ["codex", "task_agent"].includes(actor.role) &&
+        actor.start > change &&
+        actor.end <= targetEnd
+    )
+    const target = [agentToken, agentActor?.start]
+      .filter((candidate) => candidate !== undefined && candidate >= 0)
+      .sort((left, right) => left - right)[0]
+    if (target === undefined) return false
+    const targetBoundary = [...clause.actionBoundaryAfter]
+      .filter((boundary) => boundary >= change && boundary < target)
+      .at(-1)
+    const excludedAlternative = positionIsExcludedAlternative(
+      clause,
+      alternativeExclusionStart(clause, { index: change }, targetEnd),
+      target
+    )
+    return (
+      !excludedAlternative &&
+      tokenIndex(
+        tokens,
+        NEGATION_TERMS,
+        (targetBoundary ?? change) + 1,
+        target
+      ) < 0
+    )
+  })
+  if (!hasAffirmativeAgentChange) return false
   if (hasActiveTaskTiming(clause)) return true
   if (hasPreCompletionTaskTiming(clause)) return true
   if (hasCompletedTaskTiming(clause)) {
-    const laterActiveState = clause.tasks.some(
-      (task) =>
-        taskStateIndexes(clause, task, EXPLICIT_TASK_ACTIVITY_TERMS).some(
-          (state) => !actionIsNegated(clause.tokens, state)
-        ) && !taskHasCompletedState(clause, task)
+    const laterActiveState = clause.tasks.some((task) =>
+      taskHasEffectiveExplicitActivity(clause, task)
     )
     return laterActiveState
   }
   if (
     clause.tasks.some(
       (task) =>
-        taskHasAffirmativeActivity(clause, task) &&
-        taskStateIndexes(clause, task, EXPLICIT_TASK_ACTIVITY_TERMS).length > 0
+        taskIsEffectivelyActive(clause, task) &&
+        taskActivityStateIndexes(clause, task).length > 0
     )
   ) {
     return true
@@ -3219,7 +4271,7 @@ function conflictsWithActiveTaskSwitch(clause) {
   if (clause.priorTasks.some((task) => task.active)) return true
   if (clause.priorTasks.some((task) => task.completed)) return false
   if (hasNegatedTaskActivityTiming(clause)) return false
-  return clause.tasks.some((task) => taskHasAffirmativeActivity(clause, task))
+  return clause.tasks.some((task) => taskIsEffectivelyActive(clause, task))
 }
 
 function reviewerIsRequiredByContract(reviewer) {
@@ -3343,24 +4395,112 @@ function substitutionReviewTarget(clause, bypass) {
     !reviewerIsRequiredByContract(objectReviewer) &&
     clause.tokens
       .slice(objectLink + 1, objectReviewer.index)
-      .some((token) => REVIEW_TARGET_DEMONSTRATIVES.has(token)) &&
+      .some((token) => REVIEW_TARGET_ANAPHORIC_TERMS.has(token)) &&
     clause.tokens
       .slice(objectLink + 1, objectReviewer.index)
-      .every((token) => GENERIC_REVIEW_TARGET_PREFIX_TERMS.has(token))
+      .every(
+        (token) =>
+          GENERIC_REVIEW_TARGET_PREFIX_TERMS.has(token) ||
+          token.endsWith("ed") ||
+          token.endsWith("ly")
+      )
   ) {
     const replacementSubject = clause.reviewers
       .filter((reviewer) => reviewer.index < bypass)
       .at(-1)
     return reviewAntecedentBefore(clause, replacementSubject?.index ?? bypass)
   }
-  const requiredPrimary = phraseIndex(
+  const objectTail = clause.tokens.slice(
+    objectLink + 1,
+    Math.min(clause.tokens.length, objectLink + 7)
+  )
+  const anaphoricOne = objectTail.findIndex(
+    (token, index) =>
+      token === "one" &&
+      objectTail
+        .slice(0, index)
+        .some((prefix) =>
+          new Set([
+            ...REVIEW_TARGET_ANAPHORIC_TERMS,
+            "mandatory",
+            "required",
+          ]).has(prefix)
+        )
+  )
+  if (!objectReviewer && anaphoricOne >= 0) {
+    const replacementSubject = clause.reviewers
+      .filter((reviewer) => reviewer.index < bypass)
+      .at(-1)
+    return reviewAntecedentBefore(clause, replacementSubject?.index ?? bypass)
+  }
+  const requiredPersonReference =
+    objectTail.some((token) => REVIEW_REQUIREMENT_ACTIONS.has(token)) &&
+    objectTail.some((token) => REVIEW_TARGET_GENERIC_PERSON_TERMS.has(token))
+  const requiredSlot = tokenIndexes(
     clause.tokens,
-    ["required", "primary"],
+    new Set(["auxiliary", "primary"]),
     objectLink + 1,
     objectLink + 6
+  ).find(
+    (slot) =>
+      tokenIndex(
+        clause.tokens,
+        REVIEW_REQUIREMENT_ACTIONS,
+        objectLink + 1,
+        slot
+      ) >= 0
   )
-  if (!objectReviewer && requiredPrimary >= 0) {
-    return { index: requiredPrimary + 1, primary: true }
+  const requiredSlotObjectEnd = tokenIndex(
+    clause.tokens,
+    REVIEW_TARGET_ADJUNCT_LINKS,
+    (requiredSlot ?? objectLink) + 1,
+    (requiredSlot ?? objectLink) + 6
+  )
+  const explicitRoleTail = clause.tokens.slice(
+    (requiredSlot ?? objectLink) + 1,
+    requiredSlotObjectEnd < 0
+      ? (requiredSlot ?? objectLink) + 6
+      : requiredSlotObjectEnd
+  )
+  const explicitRoleHead = explicitRoleTail.findLast(
+    (token) => !token.endsWith("ed") && !token.endsWith("ly")
+  )
+  const genericPerson = objectTail.findIndex((token) =>
+    REVIEW_TARGET_GENERIC_PERSON_TERMS.has(token)
+  )
+  const requirement = objectTail.findIndex((token) =>
+    REVIEW_REQUIREMENT_ACTIONS.has(token)
+  )
+  const genericPersonHasRoleQualifier =
+    genericPerson >= 0 &&
+    objectTail
+      .slice(Math.max(0, requirement + 1), genericPerson)
+      .some(
+        (token) =>
+          !new Set(["a", "an", "auxiliary", "primary", "the"]).has(token)
+      )
+  const hasExplicitUnrelatedRole =
+    genericPerson >= 0
+      ? genericPersonHasRoleQualifier
+      : explicitRoleHead !== undefined &&
+        !REVIEW_TARGET_NON_ROLE_HEAD_TERMS.has(explicitRoleHead)
+  if (!objectReviewer && requiredPersonReference && !hasExplicitUnrelatedRole) {
+    const replacementSubject = clause.reviewers
+      .filter((reviewer) => reviewer.index < bypass)
+      .at(-1)
+    return reviewAntecedentBefore(clause, replacementSubject?.index ?? bypass)
+  }
+  if (
+    !objectReviewer &&
+    requiredSlot !== undefined &&
+    !hasExplicitUnrelatedRole
+  ) {
+    return {
+      index: requiredSlot,
+      auxiliary: clause.tokens[requiredSlot] === "auxiliary",
+      primary: clause.tokens[requiredSlot] === "primary",
+      required: true,
+    }
   }
   return objectReviewer
 }

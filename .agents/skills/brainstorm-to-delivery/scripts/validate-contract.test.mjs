@@ -2820,6 +2820,1349 @@ describe("Skill contract v2", () => {
     ])
   })
 
+  it("round-15 distinguishes Task component states from separated actions", () => {
+    assertSkillClassifications([
+      {
+        prose:
+          "The current Task is running. After completion of the active Task: review remains incomplete. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The current Task is running. After completion of the active Task, testing remains unfinished. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The current Task is running. After completion of the active Task: validation is still ongoing. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The current Task is running. After completion of the active Task: the review remains incomplete. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The current Task is running. After completion of the active Task: its review remains incomplete. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The current Task is running. After completion of the active Task: its final independent security review remains incomplete. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The current Task is running. After completion of the active Task: the final review remains incomplete. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The current Task is running. After completion of the active Task: review has not finished. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The current Task is running. After completion of the active Task: review has yet to finish. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The current Task is running. After completion of the active Task: review remains to be finished. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The current Task is running. After completion of the active Task (review pending), switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The current Task is running. After completion of the active Task (validation underway), switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The current Task is running. After completion of the active Task (review not complete), switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The current Task is running. After completion of the active Task (review pending final approval), switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The current Task is running. After completion of the active Task: review pending findings, then switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The current Task is running. After completion of the active Task (review not yet complete), switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The current Task is running. After completion of the active Task: review and testing remain incomplete. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The current Task is running. After completion of the active Task: review is not pending. Then switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The current Task is running. After completion of the active Task: review is not incomplete. Then switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The current Task is running. After completion of the active Task: carefully review pending issues, then switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The current Task is running. After completion of the active Task: review remains anything but complete. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The current Task is running. After completion of the active Task: review is scarcely complete. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The current Task is running. After completion of the active Task: review is almost complete. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The current Task is running. After completion of the active Task: review is barely complete. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The current Task is running. After completion of the active Task: review remains nowhere near complete. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The current Task is running. After completion of the active Task: review is fully complete. Then switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The current Task is running. After completion of the active Task: review is no longer incomplete. Then switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The current Task is running. After completion of the active Task: review is still pending. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The current Task is running. After completion of the active Task: review is complete. Then switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The current Task is running. After completion of the active Task: review still continues. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The current Task is running. After completion of the active Task - review the report and switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The current Task is running. After completion of the active Task -- test the results and switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The current Task is running. After completion of the active Task \u2014 validate the results and switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The current Task is running. After completion of the active Task (review the report) and switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The current Task is running. After completion of the active Task / review the report and switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The current Task is running. After completion of the active Task, review findings and switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The current Task is running. After completion of the active Task: test results and switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The current Task is running. After completion of the active Task: test whether the server is still running, then switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "After completion of the active Task: review open issues, then switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "After completion of the active Task: test running services, then switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The current Task is running. After completion of the active Task: review carefully, then continue by switching the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The current Task is running. After completion of the active Task review, switch the Task Agent.",
+        reject: true,
+      },
+    ])
+  })
+
+  it("round-15 resolves qualified anaphoric and explicit take-role targets", () => {
+    assertSkillClassifications([
+      {
+        prose:
+          "The Codex reviewer is mandatory. Another reviewer takes on the role of that very reviewer.",
+        reject: true,
+      },
+      {
+        prose:
+          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of that former reviewer.",
+        reject: true,
+      },
+      {
+        prose:
+          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of this original reviewer.",
+        reject: true,
+      },
+      {
+        prose:
+          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the former reviewer.",
+        reject: true,
+      },
+      {
+        prose:
+          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of that previous reviewer.",
+        reject: true,
+      },
+      {
+        prose:
+          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the aforementioned reviewer.",
+        reject: true,
+      },
+      {
+        prose:
+          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of that previously assigned reviewer.",
+        reject: true,
+      },
+      {
+        prose:
+          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of that previously designated reviewer.",
+        reject: true,
+      },
+      {
+        prose:
+          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required primary note taker.",
+        reject: false,
+      },
+      {
+        prose:
+          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required primary meeting note taker.",
+        reject: false,
+      },
+      {
+        prose:
+          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required primary note-taker.",
+        reject: false,
+      },
+      {
+        prose:
+          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required primary for this Task.",
+        reject: true,
+      },
+      {
+        prose:
+          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required primary for the producer.",
+        reject: true,
+      },
+      {
+        prose:
+          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required primary during final review.",
+        reject: true,
+      },
+      {
+        prose:
+          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required primary temporarily.",
+        reject: true,
+      },
+      {
+        prose:
+          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required primary whenever needed.",
+        reject: true,
+      },
+      {
+        prose:
+          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required primary after the implementer leaves.",
+        reject: true,
+      },
+      {
+        prose:
+          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required primary once the implementer leaves.",
+        reject: true,
+      },
+      {
+        prose:
+          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required primary if the implementer leaves.",
+        reject: true,
+      },
+      {
+        prose:
+          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required primary until the implementer returns.",
+        reject: true,
+      },
+      {
+        prose:
+          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required primary because the implementer left.",
+        reject: true,
+      },
+      {
+        prose:
+          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required primary unless the implementer returns.",
+        reject: true,
+      },
+      {
+        prose:
+          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required primary upon the implementer's departure.",
+        reject: true,
+      },
+      {
+        prose:
+          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required primary note taker once the implementer leaves.",
+        reject: false,
+      },
+      {
+        prose:
+          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required primary in case the producer leaves.",
+        reject: true,
+      },
+      {
+        prose:
+          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required primary as soon as the implementer leaves.",
+        reject: true,
+      },
+      {
+        prose:
+          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required primary meeting facilitator.",
+        reject: false,
+      },
+      {
+        prose:
+          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required primary contact person.",
+        reject: false,
+      },
+      {
+        prose:
+          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required contact person.",
+        reject: false,
+      },
+      {
+        prose:
+          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required primary now.",
+        reject: true,
+      },
+      {
+        prose:
+          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required primary selected for this Task.",
+        reject: true,
+      },
+      {
+        prose:
+          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required primary slot.",
+        reject: true,
+      },
+      {
+        prose:
+          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required auxiliary slot.",
+        reject: true,
+      },
+      {
+        prose:
+          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required primary today.",
+        reject: true,
+      },
+      {
+        prose:
+          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required individual.",
+        reject: true,
+      },
+      {
+        prose:
+          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required party.",
+        reject: true,
+      },
+      {
+        prose:
+          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required primary assigned to this Task.",
+        reject: true,
+      },
+      {
+        prose:
+          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required primary designated by the Plan.",
+        reject: true,
+      },
+      {
+        prose:
+          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the same one.",
+        reject: true,
+      },
+      {
+        prose:
+          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the mandatory one.",
+        reject: true,
+      },
+      {
+        prose:
+          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required primary meeting note taker temporarily.",
+        reject: false,
+      },
+      {
+        prose:
+          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of their advisory reviewer.",
+        reject: false,
+      },
+      {
+        prose:
+          "The Codex reviewer is mandatory. Another reviewer takes on the role of that optional Design reviewer.",
+        reject: false,
+      },
+      {
+        prose:
+          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required primary.",
+        reject: true,
+      },
+      {
+        prose:
+          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required primary reviewer.",
+        reject: true,
+      },
+    ])
+  })
+
+  it("round-15 binds people antecedents to their actual relations", () => {
+    assertSkillClassifications([
+      {
+        prose:
+          "The developers revise the Plan and Design for the reviewers' archive. The parent edits both of them.",
+        reject: true,
+      },
+      {
+        prose:
+          "The developers revise the Plan and Design for the archive of the reviewers. The parent edits both of them.",
+        reject: true,
+      },
+      {
+        prose:
+          "The developers revise the Plan and Design with the reviewers' annotations. The parent edits both of them.",
+        reject: true,
+      },
+      {
+        prose:
+          "The developers revise the Plan and Design on behalf of the reviewers' organization. The parent edits both of them.",
+        reject: true,
+      },
+      {
+        prose:
+          "The developers revise the Plan and Design by consulting both reviewers. The parent updates them on progress.",
+        reject: false,
+      },
+      {
+        prose:
+          "The developers revise the Plan and Design after consulting both reviewers. The parent updates them on progress.",
+        reject: false,
+      },
+      {
+        prose:
+          "The developers revise the Plan and Design reviewed by the senior reviewers. The parent updates them on progress.",
+        reject: false,
+      },
+      {
+        prose:
+          "The developers revise the Plan and Design reviewed by the external reviewers. The parent updates them on progress.",
+        reject: false,
+      },
+      {
+        prose:
+          "The developers revise the Plan and Design reviewed by 3 reviewers. The parent updates them on progress.",
+        reject: false,
+      },
+      {
+        prose:
+          "The developers revise the Plan and Design reviewed by the currently available reviewers. The parent updates them on progress.",
+        reject: false,
+      },
+      {
+        prose:
+          "The developers revise the Plan and Design by consulting both senior and external reviewers. The parent updates them on progress.",
+        reject: false,
+      },
+      {
+        prose:
+          "The developers revise the Plan and Design by consulting senior and external reviewers. The parent updates them on progress.",
+        reject: false,
+      },
+      {
+        prose:
+          "The developers revise the Plan and Design by consulting all of the currently available external reviewers. The parent updates them on progress.",
+        reject: false,
+      },
+      {
+        prose:
+          "The Plan Author revises the Plan and Design by carefully consulting all of the currently available external security reviewers. The parent updates them on progress.",
+        reject: false,
+      },
+      {
+        prose:
+          "The Plan Author revises the Plan and Design using feedback from the reviewers. The parent updates them on progress.",
+        reject: false,
+      },
+      {
+        prose:
+          "The Plan Author revises the Plan and Design alongside the reviewers. The parent updates them on progress.",
+        reject: false,
+      },
+      {
+        prose:
+          "The developers revise the Plan and Design for clarity: reviewers observe. The parent edits both of them.",
+        reject: true,
+      },
+      {
+        prose:
+          "The developers revise the Plan and Design for clarity so that three reviewers can respond. The parent edits both of them.",
+        reject: true,
+      },
+      {
+        prose:
+          "The developers revise the Plan and Design reviewed by locally and internationally recognized reviewers yesterday. The parent updates them on progress.",
+        reject: false,
+      },
+      {
+        prose:
+          "The Plan Author revises the Plan and Design for the reviewers who requested changes. The parent updates them on progress.",
+        reject: false,
+      },
+      {
+        prose:
+          "The developers revise the Plan and Design reviewed by senior and external reviewers. The parent updates them on progress.",
+        reject: false,
+      },
+      {
+        prose:
+          "The developers send the Plan and Design to the assigned reviewers. The parent updates them on progress.",
+        reject: false,
+      },
+      {
+        prose:
+          "The developers revise the Plan and Design for clarity while the reviewers observe. The parent edits them.",
+        reject: true,
+      },
+      {
+        prose:
+          "The developers revise the Plan and Design for clarity after the reviewers leave. The parent edits both of them.",
+        reject: true,
+      },
+      {
+        prose:
+          "The developers revise the Plan and Design for clarity since the reviewers left. The parent edits both of them.",
+        reject: true,
+      },
+      {
+        prose:
+          "The developers revise the Plan and Design for clarity and both reviewers observe. The parent edits both of them.",
+        reject: true,
+      },
+      {
+        prose:
+          "The developers revise the Plan and Design by working carefully and the reviewers observe. The parent edits both of them.",
+        reject: true,
+      },
+      {
+        prose:
+          "The developers revise the Plan and Design by working independently, then the reviewers observe. The parent edits both of them.",
+        reject: true,
+      },
+      {
+        prose:
+          "The developers revise the Plan and Design by working independently, and reviewers observe. The parent edits both of them.",
+        reject: true,
+      },
+      {
+        prose:
+          "The developers revise the Plan and Design by working independently, and senior reviewers observe. The parent edits both of them.",
+        reject: true,
+      },
+      {
+        prose:
+          "The developers revise the Plan and Design by working independently and reviewers observe. The parent edits both of them.",
+        reject: true,
+      },
+      {
+        prose:
+          "The developers revise the Plan and Design reviewed by senior, external, and security reviewers. The parent updates them on progress.",
+        reject: false,
+      },
+      {
+        prose:
+          "The developers revise the Plan and Design by working hard, and senior reviewers observe. The parent edits both of them.",
+        reject: true,
+      },
+      {
+        prose:
+          "The developers revise the Plan and Design reviewed by locally and internationally recognized reviewers. The parent updates them on progress.",
+        reject: false,
+      },
+    ])
+  })
+
+  it("round-15 distinguishes reviewer absence from transitive predicates", () => {
+    assertSkillClassifications([
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing right now.",
+        reject: true,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing this morning.",
+        reject: true,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing altogether.",
+        reject: true,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing at present.",
+        reject: true,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing as usual.",
+        reject: true,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing once more.",
+        reject: true,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing every Friday.",
+        reject: true,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing twice today.",
+        reject: true,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing because their assignment ended.",
+        reject: true,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing this afternoon.",
+        reject: true,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing tomorrow.",
+        reject: true,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing due to illness.",
+        reject: true,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing all day.",
+        reject: true,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing over the weekend.",
+        reject: true,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing without explanation.",
+        reject: true,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing throughout the day.",
+        reject: true,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing with no explanation.",
+        reject: true,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing all weekend.",
+        reject: true,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing across the weekend.",
+        reject: true,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing the entire day.",
+        reject: true,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing every other day.",
+        reject: true,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing all quarter.",
+        reject: true,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing three days.",
+        reject: true,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing the next three days.",
+        reject: true,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing these three days.",
+        reject: true,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing several days.",
+        reject: true,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing a few days.",
+        reject: true,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing most of the week.",
+        reject: true,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing the coming week.",
+        reject: true,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing half the week.",
+        reject: true,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing a couple of days.",
+        reject: true,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing every single day.",
+        reject: true,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing one and a half days.",
+        reject: true,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing the first three days.",
+        reject: true,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing a couple of findings.",
+        reject: false,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing the first three deadlines.",
+        reject: false,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing a day and a half.",
+        reject: true,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing the past week.",
+        reject: true,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing a dozen findings.",
+        reject: false,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing the next three deadlines.",
+        reject: false,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing yesterday morning.",
+        reject: true,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing - critical context.",
+        reject: false,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing (critical) context.",
+        reject: false,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing over half the required findings.",
+        reject: false,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing at least one deadline.",
+        reject: false,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing context.",
+        reject: false,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing evidence.",
+        reject: false,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing input.",
+        reject: false,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing the deadline.",
+        reject: false,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is lacking context.",
+        reject: false,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is lacking in experience.",
+        reject: false,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is lacking in critical context.",
+        reject: false,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is lacking technically.",
+        reject: false,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is lacking entirely.",
+        reject: true,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is lacking completely.",
+        reject: true,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing today because their assignment ended.",
+        reject: true,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is lacking all week due to illness.",
+        reject: true,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing today and tomorrow because their assignment ended.",
+        reject: true,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is lacking today and tomorrow.",
+        reject: true,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing all morning and afternoon.",
+        reject: true,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing all context and evidence.",
+        reject: false,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing Friday's deadline.",
+        reject: false,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing from the route.",
+        reject: true,
+      },
+    ])
+  })
+
+  it("round-15 preserves carried Task activity and completion order", () => {
+    assertSkillClassifications([
+      {
+        prose:
+          "The active Task is partially completed. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The active Task is only partly completed. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The active Task is provisionally completed. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The active Task is running. The Task Agent switches immediately.",
+        reject: true,
+      },
+      {
+        prose:
+          "The active Task is partially completed, but is now fully completed. Then switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The currently active Task is completed but is still running. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The active Task is completed and still running. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The active Task is completed but after the final checks is still actively running. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The active Task is completed but, according to telemetry, it is still running. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The active Task is completed but according to telemetry, it is still running. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The active Task is completed but according to the integration service itself, it is still running. Then switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The active Task is completed but in fact it remains active. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The active Task is fully completed while the integration service is still running. Then switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The active Task is completed but its validation is still running. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The active Task is completed but the review is still running. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose: "The Task continues running. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The active Task is completed but it is still running. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The active Task is completed but after final checks the integration service is still running. Then switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The active Task is completed but after release the server is still running. Then switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The active Task is completed but after checks service is still running. Then switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The active Task is completed but the service is restarted and it is still running. Then switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The active Task is completed, but only provisionally. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The active Task is completed, but only partly. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The active Task is completed, but only partially. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The active Task is completed in part. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The active Task is completed, though only partially. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The active Task is completed, yet only partly. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The active Task is completed only in part. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The active Task is completed merely in part. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The active Task is completed to some extent. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The active Task is completed to the full extent required. Then switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The active Task is nearly completed. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The active Task is completed in large part. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The active Task is fully completed but only partially celebrated. Then switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The Task is running and then completed. Then switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The Task is running and then it completed. Then switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The Task is running, but it has now completed. Then switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The Task is running and then it completed validation. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The Task is running and then it finished its review. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The Task is running and then it completed, then review findings and switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The Task is running. It completed validation. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The active Task is running. The separate build server reports that it completed. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose: "The Task is running. It completed. Then switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The Task is running. After final checks, it was fully completed. Then switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The Task is running. Then it completed. Then switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The active Task is running and completed reviews are archived. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The active Task is running and completed code reviews are archived. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The active Task is running and completed integration tests are archived. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The active Task is running and completed reviews of the implementation are archived. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The active Task is running and completed final independent external security reviews are archived. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The active Task is running and completed reviews and tests are archived. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The active Task is running and completed reviews and validation are archived. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The Task is completed and then running. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The Task is completed and then it starts running again. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The Task is completed, but afterward it resumes running. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The Task is completed, but it resumes. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The Task is completed, but it starts again. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The Task is completed, but it restarts. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The Task is completed, but it begins again. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The Task is completed, but it becomes active again. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The Task is completed, but the server restarts. Then switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The Task is completed, but the server becomes active again. Then switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The Task is completed, but it appears the server is still running. Then switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The active Task is running. Do not switch the build server, but switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The active Task is running. Switch the build server, but do not switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The active Task is running. Switch the build server, not the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The active Task is running. Switch the build server rather than the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The active Task is running. Switch the Task Agent rather than the build server.",
+        reject: true,
+      },
+      {
+        prose:
+          "The active Task is running. Do not change the build server. Switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The active Task is completed. Do not change the build server. Switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The active Task is running. Do not change the build server before switching the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The active Task is running. Do not switch the Task Agent while it runs; switch the Task Agent after it completes.",
+        reject: false,
+      },
+      {
+        prose:
+          "The active Task is fully completed. Then switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The active Task is completed and is no longer running. Then switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The active Task is mostly completed. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The active Task is completed for the most part. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The active Task is largely completed. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The active Task is substantially completed. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The active Task is almost completed. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The active Task is barely completed. Then switch the Task Agent.",
+        reject: true,
+      },
+    ])
+  })
+
   it("contains the complete operational policy and document JSON shapes", () => {
     const policy = fencedJsonAfterHeading(
       realSkill,
