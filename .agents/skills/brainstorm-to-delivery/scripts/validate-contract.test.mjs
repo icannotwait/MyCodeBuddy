@@ -1156,6 +1156,174 @@ describe("Skill contract v2", () => {
     })
   }
 
+  it("round-9 keeps coordinated producer infinitives separate from finite parent actions", () => {
+    for (const prose of [
+      "The parent directs the Plan Author to revise, update, and edit the Plan.",
+      "The parent asks the Plan Author to revise or update the Plan.",
+      "The parent asks the Plan Author to revise, update, or edit the Plan.",
+    ]) {
+      assert.deepEqual(validateSkillMarkdown(`${skill}\n${prose}`).failures, [])
+    }
+
+    for (const prose of [
+      "The parent asks the Plan Author to revise the Plan and afterward will edit the Design.",
+      "The parent asks the Plan Author to revise the Plan and will itself edit the Design.",
+    ]) {
+      has(validateSkillMarkdown(`${skill}\n${prose}`).failures, "B2D-SKILL-005")
+    }
+  })
+
+  it("round-9 accepts the post-current pre-next Task boundary", () => {
+    for (const prose of [
+      "Switch the Task Agent after the current Task completes but before the next Task starts.",
+      "After the current Task completes, switch the Task Agent before the next Task begins.",
+    ]) {
+      assert.deepEqual(validateSkillMarkdown(`${skill}\n${prose}`).failures, [])
+    }
+
+    for (const prose of [
+      "Switch the Task Agent before the current Task completes.",
+      "Switch the Task Agent while the current Task is running.",
+    ]) {
+      has(validateSkillMarkdown(`${skill}\n${prose}`).failures, "B2D-SKILL-005")
+    }
+  })
+
+  it("round-9 resolves reviewer demonstrative, role, and possessive antecedents", () => {
+    for (const prose of [
+      "The Codex reviewer remains required; optional user-named Design reviewers may replace the former.",
+      "The Codex reviewer remains required; optional user-named Design reviewers may replace this reviewer.",
+      "The Codex reviewer is required. User-named Design reviewers can take its place.",
+      "The Codex reviewer is mandatory. User-named Design reviewers replace this role.",
+    ]) {
+      has(validateSkillMarkdown(`${skill}\n${prose}`).failures, "B2D-SKILL-005")
+    }
+
+    for (const prose of [
+      "The Codex reviewer remains required; optional user-named Design reviewers may not replace the former.",
+      "The Codex reviewer is required. User-named Design reviewers cannot take its place.",
+      "The Codex reviewer is mandatory. User-named Design reviewers must not replace this role.",
+    ]) {
+      assert.deepEqual(validateSkillMarkdown(`${skill}\n${prose}`).failures, [])
+    }
+  })
+
+  it("round-9 binds actor-local negation, omitted links, and qualified actors", () => {
+    for (const prose of [
+      "High Tasks are implemented by Codex, not Grok.",
+      "Normal Tasks are reviewed by Codex, not the Task Agent.",
+      "Route high Tasks to Codex, not Grok.",
+      "High Tasks are implemented by the independent Codex implementer, not Grok.",
+      "High Tasks are reviewed by the independent primary Codex reviewer and the selected auxiliary Task Agent reviewer.",
+    ]) {
+      assert.deepEqual(validateSkillMarkdown(`${skill}\n${prose}`).failures, [])
+    }
+
+    for (const prose of [
+      "High Tasks are implemented not by Codex but Grok.",
+      "Route high Tasks not to Codex but Grok.",
+      "Route high Tasks to the selected auxiliary Task Agent and Codex.",
+      "High Tasks are reviewed by the independent primary Codex reviewer and Grok.",
+    ]) {
+      has(validateSkillMarkdown(`${skill}\n${prose}`).failures, "B2D-SKILL-005")
+    }
+  })
+
+  it("round-9 accepts a complete direct high route with role-distinct Codex bindings", () => {
+    assert.deepEqual(
+      validateSkillMarkdown(
+        `${skill}\nRoute high Tasks to Codex for implementation and to Codex for primary review and to Grok for auxiliary review.`
+      ).failures,
+      []
+    )
+
+    for (const prose of [
+      "Route high Tasks to Codex for implementation and to Grok for primary review and to Codex for auxiliary review.",
+      "Route high Tasks to Codex for implementation and only to Codex for primary review.",
+    ]) {
+      has(validateSkillMarkdown(`${skill}\n${prose}`).failures, "B2D-SKILL-005")
+    }
+  })
+
+  it("round-9 enforces qualified, synonym, ordinal, missing, and extra reviewer cardinality", () => {
+    for (const prose of [
+      "Route high Tasks only to Codex for review.",
+      "Route high Tasks to Codex and no other Agent for review.",
+      "High Tasks have two primary reviewers.",
+      "High Tasks have two Codex reviewers.",
+      "High Tasks have two auxiliary reviewers.",
+      "Normal Tasks have two primary reviewers.",
+      "High Tasks have a single reviewer.",
+      "High Tasks have only a primary reviewer.",
+      "High Tasks are missing an auxiliary reviewer.",
+      "Normal Tasks have a second reviewer.",
+      "Normal Tasks have an extra reviewer.",
+    ]) {
+      has(validateSkillMarkdown(`${skill}\n${prose}`).failures, "B2D-SKILL-005")
+    }
+
+    for (const prose of [
+      "Normal Tasks have a single primary Codex reviewer.",
+      "High Tasks have one primary Codex reviewer and one auxiliary Task Agent reviewer.",
+      "High Tasks are not missing an auxiliary reviewer.",
+    ]) {
+      assert.deepEqual(validateSkillMarkdown(`${skill}\n${prose}`).failures, [])
+    }
+  })
+
+  it("round-9 preserves prohibitions against incomplete review", () => {
+    for (const prose of [
+      "Normal Tasks cannot complete without a reviewer.",
+      "High Tasks cannot complete without both reviewers.",
+      "High Tasks must not proceed with no auxiliary reviewer.",
+    ]) {
+      assert.deepEqual(validateSkillMarkdown(`${skill}\n${prose}`).failures, [])
+    }
+
+    for (const prose of [
+      "Normal Tasks complete without a reviewer.",
+      "High Tasks proceed with no auxiliary reviewer.",
+    ]) {
+      has(validateSkillMarkdown(`${skill}\n${prose}`).failures, "B2D-SKILL-005")
+    }
+  })
+
+  it("round-9 carries Task, document, and active-state antecedents across clauses", () => {
+    for (const prose of [
+      "High Tasks are reviewed by Codex; they are implemented by Grok.",
+      "High Tasks are reviewed by Codex. Implementation is by Grok.",
+      "The Plan Author writes the Plan; the parent revises it.",
+      "The current Task is running. Change the Task Agent now.",
+    ]) {
+      has(validateSkillMarkdown(`${skill}\n${prose}`).failures, "B2D-SKILL-005")
+    }
+
+    for (const prose of [
+      "High Tasks are reviewed by Codex; they are implemented by Codex.",
+      "High Tasks are reviewed by Codex. Implementation is by Codex.",
+      "The Plan Author writes the Plan; the Plan Author revises it.",
+      "The current Task is completed. Change the Task Agent now.",
+    ]) {
+      assert.deepEqual(validateSkillMarkdown(`${skill}\n${prose}`).failures, [])
+    }
+  })
+
+  it("round-9 recognizes named-Agent active switches", () => {
+    for (const prose of [
+      "Switch from Grok to Gemini during the current Task.",
+      "Replace Grok while the current Task is active.",
+    ]) {
+      has(validateSkillMarkdown(`${skill}\n${prose}`).failures, "B2D-SKILL-005")
+    }
+
+    for (const prose of [
+      "Switch from Grok to Gemini after the current Task completes.",
+      "Replace Grok once the current Task is done.",
+    ]) {
+      assert.deepEqual(validateSkillMarkdown(`${skill}\n${prose}`).failures, [])
+    }
+  })
+
   it("contains the complete operational policy and document JSON shapes", () => {
     const policy = fencedJsonAfterHeading(
       realSkill,
@@ -1897,6 +2065,43 @@ describe("progress agreement and per-key lineage", () => {
     )
 
     has(validate(route, state, routedPlan), "B2D-ROUTING-007")
+  })
+
+  it("round-9 keeps the future pending suffix clean after generation admission", () => {
+    const route = routing()
+    const selected = identity("gemini", "careful")
+    route.task_agent_generations.push({
+      generation: 2,
+      ...selected,
+      effective_from_task_index: 2,
+    })
+    route.tasks[1] = task(2, "normal", selected, 2)
+    route.tasks.push(task(3, "normal", selected, 2))
+    const routedPlan = `${plan(route)}\n## Task 3: Preserve serial suffix\n`
+    const state = progress(route)
+    state.tasks.push(progressTask(route.tasks[2], "pending", 30))
+    state.tasks[1].status = "in_progress"
+    state.active_task_index = 2
+    state.tasks[1].runs.push(
+      run(
+        state.tasks[1].expected_work_unit_keys.implementer,
+        "running",
+        "t2-i",
+        20
+      )
+    )
+    state.tasks[2].runs.push(
+      run(
+        state.tasks[2].expected_work_unit_keys.implementer,
+        "reserving",
+        "reserved-later",
+        null
+      )
+    )
+
+    has(validate(route, state, routedPlan), "B2D-ROUTING-007")
+    state.tasks[2].runs = []
+    assert.deepEqual(validate(route, state, routedPlan), [])
   })
 
   it("returns deterministic failures for null Tasks during generation validation", () => {

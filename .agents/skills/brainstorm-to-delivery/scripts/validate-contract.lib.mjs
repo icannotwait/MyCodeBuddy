@@ -226,6 +226,21 @@ const BUILTIN_AGENT_TYPES = new Set([
   "grok",
   "cursor",
 ])
+const NAMED_AGENT_TERMS = new Set([
+  "claude",
+  "cline",
+  "code-buddy",
+  "codebuddy",
+  "codex",
+  "cursor",
+  "gemini",
+  "grok",
+  "hermes",
+  "kimi",
+  "open-code",
+  "opencode",
+  "pi",
+])
 const RESERVED_CUSTOM_AGENT_IDS = new Set([
   ...BUILTIN_AGENT_TYPES,
   "claude-acp",
@@ -374,6 +389,21 @@ const PRODUCER_DELEGATION_ACTIONS = new Set([
   ...ORCHESTRATION_ACTIONS,
   ...DIRECT_ROUTE_ACTIONS,
 ])
+const FINITE_PARENT_PREDICATE_MARKERS = new Set([
+  "afterward",
+  "can",
+  "could",
+  "did",
+  "does",
+  "itself",
+  "may",
+  "might",
+  "must",
+  "shall",
+  "should",
+  "will",
+  "would",
+])
 const DOCUMENT_OR_CODE_TARGETS = new Set([
   "code",
   "design",
@@ -409,7 +439,30 @@ const NEGATION_TERMS = new Set([
   "refusing",
   "without",
 ])
+const REVIEW_ABSENCE_TERMS = new Set([
+  "absent",
+  "lack",
+  "lacking",
+  "lacks",
+  "missing",
+  "no",
+  "without",
+])
 const ACTOR_LINKS = new Set(["by", "to"])
+const ACTOR_RELATION_MODIFIERS = new Set([
+  "a",
+  "an",
+  "both",
+  "independent",
+  "mandatory",
+  "optional",
+  "primary",
+  "auxiliary",
+  "required",
+  "selected",
+  "separate",
+  "the",
+])
 const CLAUSE_COORDINATORS = new Set(["and", "but", "while", "yet"])
 const PREDICATE_COORDINATORS = new Set(["and", "but"])
 const TASK_RELATION_BOUNDARIES = new Set([...CLAUSE_COORDINATORS, "or"])
@@ -835,6 +888,8 @@ function directiveWindows(prose) {
         windows.push({
           tokens: tokens.slice(start, start + DIRECTIVE_WINDOW_TOKENS),
           priorReviewers: directiveReviewers(priorTokens),
+          priorTasks: directiveTaskAntecedents(priorTokens),
+          priorDocumentTargets: directiveDocumentTargets(priorTokens),
         })
       }
       if (tokens.length > 0) {
@@ -962,6 +1017,19 @@ function directiveTasks(tokens) {
   return tasks
 }
 
+function directiveTaskAntecedents(tokens) {
+  const clause = { tokens }
+  return directiveTasks(tokens).map((task) => ({
+    ...task,
+    active: taskHasAffirmativeActivity(clause, task),
+    completed: taskHasCompletedState(clause, task),
+  }))
+}
+
+function directiveDocumentTargets(tokens) {
+  return tokens.filter((token) => DOCUMENT_OR_CODE_TARGETS.has(token))
+}
+
 function directiveReviewers(tokens) {
   const reviewers = []
   for (const index of tokenIndexes(tokens, REVIEW_TERMS)) {
@@ -983,7 +1051,12 @@ function directiveReviewers(tokens) {
 }
 
 function parseDirectiveClause(window) {
-  const { tokens, priorReviewers = [] } = window
+  const {
+    tokens,
+    priorReviewers = [],
+    priorTasks = [],
+    priorDocumentTargets = [],
+  } = window
   const actors = directiveActors(tokens)
   return {
     tokens,
@@ -992,6 +1065,8 @@ function parseDirectiveClause(window) {
     tasks: directiveTasks(tokens),
     reviewers: directiveReviewers(tokens),
     priorReviewers,
+    priorTasks,
+    priorDocumentTargets,
   }
 }
 
@@ -1118,6 +1193,19 @@ function actionTaskScopes(clause, action) {
       .at(-1)
     if (previous) tasks = [previous]
   }
+  if (
+    tasks.length === 0 &&
+    clause.priorTasks.length > 0 &&
+    (action.token === "implementation" ||
+      tokenIndex(
+        clause.tokens,
+        new Set(["they", "them"]),
+        segment.start,
+        segment.end
+      ) >= 0)
+  ) {
+    tasks = clause.priorTasks
+  }
   if (tasks.length === 0) {
     tasks = taskScopeActionGroup(clause, action).flatMap((candidate) =>
       localTasksForAction(clause, candidate)
@@ -1144,8 +1232,43 @@ function actorsAfterLink(clause, link, end = clause.tokens.length) {
   const actors = clause.actors.filter(
     (actor) => actor.start > link && actor.end <= relationEnd
   )
-  if (actors.length === 0 || actors[0].start > link + 3) return []
+  if (actors.length === 0) return []
+  const prefix = clause.tokens.slice(link + 1, actors[0].start)
+  if (
+    prefix.length > 6 ||
+    prefix.some(
+      (token) =>
+        !ACTOR_RELATION_MODIFIERS.has(token) && !NEGATION_TERMS.has(token)
+    )
+  ) {
+    return []
+  }
   return actors
+}
+
+function actorBindingsAfterLink(clause, action, link, end) {
+  const actors = actorsAfterLink(clause, link, end)
+  const relationNegated = relationTargetIsNegated(clause, action, link)
+  return actors.map((actor, index) => {
+    const localStart = index === 0 ? link + 1 : actors[index - 1].end
+    const coordinator = tokenIndexes(
+      clause.tokens,
+      CLAUSE_COORDINATORS,
+      localStart,
+      actor.start
+    ).at(-1)
+    const negationStart = (coordinator ?? localStart - 1) + 1
+    const explicitlyNegated =
+      tokenIndex(clause.tokens, NEGATION_TERMS, negationStart, actor.start) >= 0
+    return {
+      actor,
+      negated:
+        explicitlyNegated ||
+        (coordinator !== undefined && clause.tokens[coordinator] === "but"
+          ? false
+          : relationNegated),
+    }
+  })
 }
 
 function directPassiveActorsForAction(clause, action) {
@@ -1159,15 +1282,16 @@ function directPassiveActorsForAction(clause, action) {
     action.index + 1,
     nextAction?.index ?? clause.tokens.length
   )) {
-    if (!relationTargetIsNegated(clause, action, link)) {
-      actors.push(
-        ...actorsAfterLink(
-          clause,
-          link,
-          nextAction?.index ?? clause.tokens.length
-        )
+    actors.push(
+      ...actorBindingsAfterLink(
+        clause,
+        action,
+        link,
+        nextAction?.index ?? clause.tokens.length
       )
-    }
+        .filter((binding) => !binding.negated)
+        .map((binding) => binding.actor)
+    )
   }
   return actors
 }
@@ -1268,42 +1392,44 @@ function relationTargetIsNegated(clause, action, link) {
 }
 
 function actionHasDocumentTarget(clause, action) {
-  return (
+  if (
     tokenIndex(
       clause.tokens,
       DOCUMENT_OR_CODE_TARGETS,
       Math.max(0, action.index - 10),
       action.index + 10
     ) >= 0
+  ) {
+    return true
+  }
+  const segment = actionSegment(clause, action.index)
+  return (
+    clause.priorDocumentTargets.length > 0 &&
+    tokenIndex(
+      clause.tokens,
+      new Set(["it", "them"]),
+      segment.start,
+      segment.end
+    ) >= 0
   )
+}
+
+function reviewPurposeInRange(clause, start, end) {
+  if (tokenIndex(clause.tokens, REVIEW_TERMS, start, end) < 0) {
+    return null
+  }
+  if (tokenIndex(clause.tokens, new Set(["primary"]), start, end) >= 0) {
+    return "primary"
+  }
+  if (tokenIndex(clause.tokens, new Set(["auxiliary"]), start, end) >= 0) {
+    return "auxiliary"
+  }
+  return "review"
 }
 
 function routeReviewPurpose(clause, action) {
   const segment = actionSegment(clause, action.index)
-  if (tokenIndex(clause.tokens, REVIEW_TERMS, segment.start, segment.end) < 0) {
-    return null
-  }
-  if (
-    tokenIndex(
-      clause.tokens,
-      new Set(["primary"]),
-      segment.start,
-      segment.end
-    ) >= 0
-  ) {
-    return "primary"
-  }
-  if (
-    tokenIndex(
-      clause.tokens,
-      new Set(["auxiliary"]),
-      segment.start,
-      segment.end
-    ) >= 0
-  ) {
-    return "auxiliary"
-  }
-  return "review"
+  return reviewPurposeInRange(clause, segment.start, segment.end)
 }
 
 function singleReviewSlot(clause, start, end) {
@@ -1316,7 +1442,10 @@ function singleReviewSlot(clause, start, end) {
 function relationBindingsAfterLink(clause, action, link, end) {
   const nextLink = tokenIndex(clause.tokens, ACTOR_LINKS, link + 1, end)
   const relationEnd = nextLink >= 0 ? nextLink : end
-  const actors = actorsAfterLink(clause, link, end)
+  const allActors = actorsAfterLink(clause, link, end)
+  const actors = actorBindingsAfterLink(clause, action, link, end)
+    .filter((binding) => !binding.negated)
+    .map((binding) => binding.actor)
   const coordinator = tokenIndexes(
     clause.tokens,
     CLAUSE_COORDINATORS,
@@ -1328,16 +1457,43 @@ function relationBindingsAfterLink(clause, action, link, end) {
     (coordinator ?? action.index) + 1,
     link
   )
-  return actors.map((actor, index) => ({
-    actor,
-    slot:
-      prefixSlot ??
-      singleReviewSlot(
-        clause,
-        actor.end,
-        actors[index + 1]?.start ?? relationEnd
-      ),
-  }))
+  const purpose = reviewPurposeInRange(
+    clause,
+    (coordinator ?? action.index) + 1,
+    relationEnd
+  )
+  return actors.map((actor) => {
+    const actorIndex = allActors.findIndex(
+      (candidate) => candidate.start === actor.start
+    )
+    const previousActor = allActors[actorIndex - 1]
+    const actorCoordinator = previousActor
+      ? tokenIndexes(
+          clause.tokens,
+          CLAUSE_COORDINATORS,
+          previousActor.end,
+          actor.start
+        ).at(-1)
+      : undefined
+    return {
+      actor,
+      purpose,
+      slot:
+        prefixSlot ??
+        singleReviewSlot(
+          clause,
+          actorIndex === 0
+            ? link + 1
+            : (actorCoordinator ?? previousActor.end - 1) + 1,
+          actor.start
+        ) ??
+        singleReviewSlot(
+          clause,
+          actor.end,
+          allActors[actorIndex + 1]?.start ?? relationEnd
+        ),
+    }
+  })
 }
 
 function routeTargetBindingsForAction(clause, action) {
@@ -1350,9 +1506,7 @@ function routeTargetBindingsForAction(clause, action) {
     new Set(["to"]),
     action.index + 1,
     end
-  )
-    .filter((link) => !relationTargetIsNegated(clause, action, link))
-    .flatMap((link) => relationBindingsAfterLink(clause, action, link, end))
+  ).flatMap((link) => relationBindingsAfterLink(clause, action, link, end))
   const reflexive = tokenIndexes(
     clause.tokens,
     REFLEXIVE_TARGETS,
@@ -1363,6 +1517,7 @@ function routeTargetBindingsForAction(clause, action) {
     bindings.push(
       ...subjectActorsForAction(clause, action).map((actor) => ({
         actor,
+        purpose: routeReviewPurpose(clause, action),
         slot: null,
       }))
     )
@@ -1415,20 +1570,20 @@ function actionDelegatesToProducer(clause, parent, action) {
 
     return delegatedActions.slice(1).every((candidate, index) => {
       const previous = delegatedActions[index]
+      const relationTokens = clause.tokens.slice(
+        previous.index + 1,
+        candidate.index
+      )
+      const hasCoordination =
+        relationTokens.length === 0 ||
+        relationTokens.some((token) => ["and", "or"].includes(token))
       return (
         BARE_PRODUCTION_ACTIONS.has(candidate.token) &&
-        tokenIndex(
-          clause.tokens,
-          new Set(["and"]),
-          previous.index + 1,
-          candidate.index
-        ) >= 0 &&
-        tokenIndex(
-          clause.tokens,
-          new Set(["but", "then"]),
-          previous.index + 1,
-          candidate.index
-        ) < 0 &&
+        hasCoordination &&
+        !relationTokens.some((token) =>
+          FINITE_PARENT_PREDICATE_MARKERS.has(token)
+        ) &&
+        !relationTokens.some((token) => ["but", "then"].includes(token)) &&
         !clause.actors.some(
           (actor) =>
             actor.start > previous.index && actor.end <= candidate.index
@@ -1462,7 +1617,12 @@ function repeatedProducerSubjectForAction(clause, action) {
 
 function reviewActorBindingsForAction(clause, action) {
   const nextAction = clause.actions.find(
-    (candidate) => candidate.index > action.index
+    (candidate) =>
+      candidate.index > action.index &&
+      !(
+        candidate.kind === "review" &&
+        ["reviewer", "reviewers"].includes(candidate.token)
+      )
   )
   const end = nextAction?.index ?? clause.tokens.length
   const passive = tokenIndexes(
@@ -1499,13 +1659,29 @@ function reviewSlotForAction(clause, action) {
 function relationIsExplicitlyAbsent(clause, start, segmentStart) {
   const absence = tokenIndexes(
     clause.tokens,
-    new Set(["no", "without"]),
-    Math.max(segmentStart, start - 3),
+    REVIEW_ABSENCE_TERMS,
+    Math.max(segmentStart, start - 5),
     start
   ).at(-1)
+  if (
+    absence === undefined ||
+    tokenIndex(clause.tokens, new Set(["other"]), absence + 1, start) >= 0
+  ) {
+    return false
+  }
+  const coordinator = tokenIndexes(
+    clause.tokens,
+    CLAUSE_COORDINATORS,
+    segmentStart,
+    absence
+  ).at(-1)
   return (
-    absence !== undefined &&
-    tokenIndex(clause.tokens, new Set(["other"]), absence + 1, start) < 0
+    tokenIndex(
+      clause.tokens,
+      NEGATION_TERMS,
+      (coordinator ?? segmentStart - 1) + 1,
+      absence
+    ) < 0
   )
 }
 
@@ -1537,8 +1713,8 @@ function reviewerSetIsExplicitlyEmpty(clause, action) {
   const segment = actionSegment(clause, action.index)
   const absence = tokenIndexes(
     clause.tokens,
-    new Set(["no", "without"]),
-    Math.max(segment.start, action.index - 3),
+    REVIEW_ABSENCE_TERMS,
+    Math.max(segment.start, action.index - 5),
     action.index
   ).at(-1)
   if (absence === undefined) return false
@@ -1549,37 +1725,98 @@ function reviewerSetIsExplicitlyEmpty(clause, action) {
       absence + 1,
       action.index
     ) >= 0
-  return !qualified
+  return (
+    !qualified &&
+    relationIsExplicitlyAbsent(clause, action.index, segment.start)
+  )
 }
 
-function explicitReviewerCount(clause, action) {
+function explicitReviewerCardinality(clause, action) {
   const counts = new Map([
+    ["single", 1],
+    ["sole", 1],
     ["one", 1],
     ["1", 1],
+    ["first", 1],
     ["two", 2],
     ["2", 2],
+    ["second", 2],
     ["three", 3],
     ["3", 3],
+    ["third", 3],
   ])
   const start = Math.max(
     actionSegment(clause, action.index).start,
-    action.index - 4
+    action.index - 6
   )
+  if (
+    tokenIndex(
+      clause.tokens,
+      new Set(["additional", "extra", "surplus"]),
+      start,
+      action.index
+    ) >= 0
+  ) {
+    return { extra: true, count: null, qualifiers: new Set() }
+  }
   for (let index = action.index - 1; index >= start; index -= 1) {
     const count = counts.get(clause.tokens[index])
     if (count === undefined) continue
+    const qualifiers = new Set()
     if (
       tokenIndex(
         clause.tokens,
-        new Set(["auxiliary", "codex", "primary", "task", "agent"]),
+        new Set(["primary"]),
         index + 1,
         action.index
-      ) < 0
+      ) >= 0
     ) {
-      return count
+      qualifiers.add("primary")
     }
+    if (
+      tokenIndex(
+        clause.tokens,
+        new Set(["auxiliary"]),
+        index + 1,
+        action.index
+      ) >= 0
+    ) {
+      qualifiers.add("auxiliary")
+    }
+    if (
+      tokenIndex(clause.tokens, new Set(["codex"]), index + 1, action.index) >=
+      0
+    ) {
+      qualifiers.add("codex")
+    }
+    if (
+      phraseIndex(clause.tokens, ["task", "agent"], index + 1, action.index) >=
+      0
+    ) {
+      qualifiers.add("task_agent")
+    }
+    return { extra: false, count, qualifiers }
   }
   return null
+}
+
+function reviewerCardinalityContradictsRoute(cardinality, normal, high) {
+  if (!cardinality) return false
+  if (cardinality.extra) return normal || high
+  const expected = new Map([
+    ["primary", 1],
+    ["auxiliary", high ? 1 : 0],
+    ["codex", 1],
+    ["task_agent", high ? 1 : 0],
+  ])
+  if (cardinality.qualifiers.size === 0) {
+    return (
+      (normal && cardinality.count !== 1) || (high && cardinality.count !== 2)
+    )
+  }
+  return [...cardinality.qualifiers].some(
+    (qualifier) => cardinality.count !== expected.get(qualifier)
+  )
 }
 
 function reviewStatementIsExhaustive(clause, action) {
@@ -1590,9 +1827,11 @@ function reviewStatementIsExhaustive(clause, action) {
   ) {
     return true
   }
-  return ["reviewer", "reviewers"].some(
-    (reviewer) =>
-      phraseIndex(clause.tokens, ["no", "other", reviewer], action.index) >= 0
+  return (
+    ["reviewer", "reviewers"].some(
+      (reviewer) =>
+        phraseIndex(clause.tokens, ["no", "other", reviewer], action.index) >= 0
+    ) || phraseIndex(clause.tokens, ["no", "other", "agent"], action.index) >= 0
   )
 }
 
@@ -1629,11 +1868,8 @@ function conflictsWithReviewRoute(clause, action, scopes) {
   }
   if (negated) return false
 
-  const explicitCount = explicitReviewerCount(clause, action)
-  if (
-    (normal && explicitCount !== null && explicitCount !== 1) ||
-    (high && explicitCount !== null && explicitCount !== 2)
-  ) {
+  const cardinality = explicitReviewerCardinality(clause, action)
+  if (reviewerCardinalityContradictsRoute(cardinality, normal, high)) {
     return true
   }
 
@@ -1647,6 +1883,14 @@ function conflictsWithReviewRoute(clause, action, scopes) {
     return true
   }
   if (high && actors.length > 2) return true
+  if (
+    high &&
+    reviewStatementIsExhaustive(clause, action) &&
+    actors.length === 0 &&
+    actionSlot !== null
+  ) {
+    return true
+  }
 
   for (const { actor, slot } of bindings) {
     if (
@@ -1656,6 +1900,19 @@ function conflictsWithReviewRoute(clause, action, scopes) {
     ) {
       return true
     }
+  }
+  if (
+    high &&
+    actors.length === 2 &&
+    bindings.some((binding) => binding.slot !== null) &&
+    (!bindings.some(
+      ({ actor, slot }) => actor.role === "codex" && slot === "primary"
+    ) ||
+      !bindings.some(
+        ({ actor, slot }) => actor.role === "task_agent" && slot === "auxiliary"
+      ))
+  ) {
+    return true
   }
 
   if (!reviewStatementIsExhaustive(clause, action) || actors.length === 0) {
@@ -1670,17 +1927,18 @@ function conflictsWithReviewRoute(clause, action, scopes) {
 
 function conflictsWithDirectRoute(clause, action, scopes) {
   const bindings = routeTargetBindingsForAction(clause, action)
-  const targets = bindings.map((binding) => binding.actor)
-  const purpose = routeReviewPurpose(clause, action)
   const normal = ["normal", "universal"].some((scope) => scopes.has(scope))
   const high = ["high", "universal"].some((scope) => scopes.has(scope))
+  const reviewBindings = bindings.filter((binding) => binding.purpose)
+  const implementationBindings = bindings.filter((binding) => !binding.purpose)
 
-  if (purpose) {
+  if (reviewBindings.length > 0) {
+    const targets = reviewBindings.map((binding) => binding.actor)
     if (
       normal &&
       (targets.length > 1 ||
         targets.some((target) => target.role !== "codex") ||
-        bindings.some((binding) => binding.slot === "auxiliary"))
+        reviewBindings.some((binding) => binding.slot === "auxiliary"))
     ) {
       return true
     }
@@ -1693,11 +1951,25 @@ function conflictsWithDirectRoute(clause, action, scopes) {
     }
     if (
       high &&
-      bindings.some(
+      reviewBindings.some(
         ({ actor, slot }) =>
           (slot === "primary" && actor.role === "task_agent") ||
           (slot === "auxiliary" && actor.role === "codex")
       )
+    ) {
+      return true
+    }
+    if (
+      high &&
+      targets.length === 2 &&
+      reviewBindings.some((binding) => binding.slot !== null) &&
+      (!reviewBindings.some(
+        ({ actor, slot }) => actor.role === "codex" && slot === "primary"
+      ) ||
+        !reviewBindings.some(
+          ({ actor, slot }) =>
+            actor.role === "task_agent" && slot === "auxiliary"
+        ))
     ) {
       return true
     }
@@ -1711,11 +1983,17 @@ function conflictsWithDirectRoute(clause, action, scopes) {
     ) {
       return true
     }
-    return false
+    if (reviewStatementIsExhaustive(clause, action)) {
+      if (normal && !actorsMatchReviewerSet(targets, ["codex"])) return true
+      if (high && !actorsMatchReviewerSet(targets, ["codex", "task_agent"])) {
+        return true
+      }
+    }
   }
 
-  if (targets.length > 1) return true
-  return targets.some(
+  const implementers = implementationBindings.map((binding) => binding.actor)
+  if (implementers.length > 1) return true
+  return implementers.some(
     (target) =>
       (high && target.role === "task_agent") ||
       (normal && target.role === "codex")
@@ -1919,7 +2197,7 @@ function hasPreCompletionTaskTiming(clause, change) {
       const completions = tokenIndexes(
         clause.tokens,
         TASK_COMPLETION_TERMS,
-        Math.max(0, marker - 10),
+        marker + 1,
         marker + 11
       ).filter((completion) => !actionIsNegated(clause.tokens, completion))
       if (
@@ -1960,8 +2238,13 @@ function conflictsWithActiveTaskSwitch(clause) {
   if (change < 0 || actionIsNegated(tokens, change)) return false
   const hasAgent =
     tokenIndex(tokens, new Set(["agent", "agents"])) >= 0 ||
-    phraseIndex(tokens, ["task", "agent"]) >= 0
+    phraseIndex(tokens, ["task", "agent"]) >= 0 ||
+    tokenIndex(tokens, NAMED_AGENT_TERMS) >= 0
   if (!hasAgent) return false
+  if (clause.tasks.length === 0) {
+    if (clause.priorTasks.some((task) => task.active)) return true
+    if (clause.priorTasks.some((task) => task.completed)) return false
+  }
   if (hasActiveTaskTiming(clause)) return true
   if (
     clause.tasks.some(
@@ -2022,6 +2305,18 @@ function substitutionReviewTarget(clause, bypass) {
         bypass + 1,
         bypass + 3
       )
+      if (
+        objectLink < 0 &&
+        ["its", "their"].includes(clause.tokens[bypass - 1])
+      ) {
+        const replacementSubject = clause.reviewers
+          .filter((reviewer) => reviewer.index < bypass)
+          .at(-1)
+        return reviewAntecedentBefore(
+          clause,
+          replacementSubject?.index ?? bypass
+        )
+      }
     }
   } else if (REVIEW_REPLACEMENT_ACTIONS.has(token)) {
     objectLink = tokenIndex(
@@ -2055,13 +2350,25 @@ function reviewTargetForBypass(clause, bypass) {
     replacement &&
     (tokenIndex(
       clause.tokens,
-      new Set(["it", "them"]),
+      new Set(["former", "it", "them"]),
       bypass + 1,
       Math.min(segment.end, bypass + 6)
     ) >= 0 ||
       phraseIndex(
         clause.tokens,
         ["that", "reviewer"],
+        bypass + 1,
+        Math.min(segment.end, bypass + 6)
+      ) >= 0 ||
+      phraseIndex(
+        clause.tokens,
+        ["this", "reviewer"],
+        bypass + 1,
+        Math.min(segment.end, bypass + 6)
+      ) >= 0 ||
+      phraseIndex(
+        clause.tokens,
+        ["this", "role"],
         bypass + 1,
         Math.min(segment.end, bypass + 6)
       ) >= 0)
@@ -3260,6 +3567,12 @@ export function validateProgressRouting(snapshot, routing, failures) {
         Array.isArray(task.runs) &&
         task.runs.length === 0
     )
+    const pendingTasksRemainClean = suffix.every(
+      (task) =>
+        isObject(task) &&
+        (task.status !== "pending" ||
+          (Array.isArray(task.runs) && task.runs.length === 0))
+    )
     const priorCompleted = prior.every((task) => task?.status === "completed")
     const boundaryRuns = Array.isArray(boundary?.runs) ? boundary.runs : []
     const emptyPendingBoundary =
@@ -3288,7 +3601,8 @@ export function validateProgressRouting(snapshot, routing, failures) {
     const historicalAdoptedBoundary =
       boundary?.status !== "pending" &&
       frozenRouteMatches &&
-      hasAdmittedImplementerRun
+      hasAdmittedImplementerRun &&
+      pendingTasksRemainClean
     if (
       !boundary ||
       !priorCompleted ||
