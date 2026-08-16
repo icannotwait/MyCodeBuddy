@@ -35,7 +35,9 @@ pnpm build                     # 静态导出构建
 cargo check
 # 日常快测：只运行库单元测试，跳过二进制与集成测试链接
 cargo test --lib --features test-utils
-# 完整回归：运行库、二进制与集成测试
+# 单个集成测试目标：只替换相关 tests/*.rs 的文件名
+cargo test --test delegation_session_reuse_integration --features test-utils
+# 最终回归、CI 或明确要求时：运行库、二进制与全部集成测试
 cargo test --features test-utils
 cargo clippy --all-targets --features test-utils -- -D warnings
 
@@ -51,6 +53,17 @@ cargo clippy --no-default-features --bin codeg-mcp -- -D warnings
 # 解析器快照评审（输出变化时）
 cargo insta review
 INSTA_UPDATE=auto cargo test --features test-utils     # 自动写新 .snap
+```
+
+`cargo test some_test_name` 只过滤最终执行的测试函数，仍会预先编译所有选中的
+测试目标，不能替代 `--lib` 或 `--test` 来缩小构建范围。日常开发必须选择能证明
+改动的最窄目标，完整回归留到分支完成阶段。
+
+普通 dev/test 构建默认关闭 Rust 调试信息和增量编译，以限制每个 worktree 的
+`target` 体积。确认 Cargo/rustc 已退出后，可在仓库根目录显式清理当前 worktree：
+
+```bash
+cargo clean --manifest-path src-tauri/Cargo.toml --target-dir src-tauri/target
 ```
 
 ### 低内存 Rust 开发（在仓库根目录执行）
