@@ -124,10 +124,13 @@ export interface UseConnectionLifecycleReturn {
 export function shouldDisconnectOnUnmount(args: {
   status: string | null
   isViewer: boolean
+  /** Shared roots only release a lease; they never terminate the process. */
+  isSharedSession?: boolean
   backgroundOutstanding: number
   transientUnmount?: boolean
 }): boolean {
   if (args.transientUnmount) return false
+  if (args.isSharedSession) return true
   if (args.isViewer) return true
   return !isConnectionBusy(args)
 }
@@ -177,6 +180,7 @@ export function useConnectionLifecycle({
     modes,
     configOptions,
     hasCachedSelectors,
+    sharedSession,
   } = conn
   const isInteractiveStatus = status === "connected" || status === "prompting"
   const hasSelectorsData = modes !== null || configOptions !== null
@@ -405,6 +409,10 @@ export function useConnectionLifecycle({
   useEffect(() => {
     isTransientUnmountRef.current = isTransientUnmount
   }, [isTransientUnmount])
+  const sharedSessionRef = useRef(sharedSession)
+  useEffect(() => {
+    sharedSessionRef.current = sharedSession
+  }, [sharedSession])
 
   // Clean up on unmount (e.g. tab closed): disconnect the ACP connection
   // so it doesn't leak, and remove lingering tasks.
@@ -429,6 +437,7 @@ export function useConnectionLifecycle({
         shouldDisconnectOnUnmount({
           status: statusRef.current,
           isViewer: isViewerRef.current,
+          isSharedSession: sharedSessionRef.current !== null,
           backgroundOutstanding: backgroundOutstandingRef.current,
           transientUnmount: isTransientUnmountRef.current?.() === true,
         })

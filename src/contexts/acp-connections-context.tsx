@@ -8406,7 +8406,11 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
                 generation: shared.generation,
                 leaseId: shared.leaseId,
                 clientInstanceId: identity!.clientInstanceId,
-                clientRequestId: shared.connectRequestId,
+                // Prompt admission has an idempotency domain separate from
+                // connect-or-attach. The optimistic message id is stable for
+                // a retry of one logical prompt, while a new message gets a
+                // distinct request id.
+                clientRequestId: opts?.clientMessageId ?? newSharedRequestId(),
               }
             )
           : await acpPrompt(
@@ -8820,7 +8824,13 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
   const disconnectIfIdle = useCallback(
     async (contextKey: string) => {
       const conn = storeRef.current.connections.get(contextKey)
-      if (conn && !conn.isViewer && isConnectionBusy(conn)) return
+      if (
+        conn &&
+        !conn.isViewer &&
+        !conn.sharedSession &&
+        isConnectionBusy(conn)
+      )
+        return
       await disconnect(
         contextKey,
         conn?.sharedSession ? "idle_timeout" : "explicit_user"

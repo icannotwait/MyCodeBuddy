@@ -19,6 +19,7 @@ const h = vi.hoisted(() => ({
   status: "prompting" as string | null,
   isViewer: false,
   backgroundOutstanding: 0,
+  sharedSession: null as { generation: number } | null,
   locale: "zh_cn" as string,
 }))
 
@@ -47,6 +48,7 @@ vi.mock("@/hooks/use-connection", () => ({
     // Focus-retry tests override `h.status` to disconnected/error/null.
     status: h.status,
     isViewer: h.isViewer,
+    sharedSession: h.sharedSession,
     backgroundOutstanding: h.backgroundOutstanding,
     selectorsReady: true,
     connect: h.connect,
@@ -96,6 +98,17 @@ describe("shouldDisconnectOnUnmount", () => {
         backgroundOutstanding: 0,
       })
     ).toBe(false)
+  })
+
+  it("tears down a busy shared root because release does not kill its process", () => {
+    expect(
+      shouldDisconnectOnUnmount({
+        status: "prompting",
+        isViewer: false,
+        backgroundOutstanding: 2,
+        isSharedSession: true,
+      })
+    ).toBe(true)
   })
 
   it("disconnects an idle owner once outstanding has settled to zero", () => {
@@ -441,6 +454,28 @@ describe("autoConnectAllowed_policy", () => {
     )
     unmount()
     expect(h.disconnect).toHaveBeenCalled()
+  })
+
+  it("unmount releases a busy shared root", () => {
+    h.status = "prompting"
+    h.isViewer = false
+    h.backgroundOutstanding = 2
+    h.sharedSession = { generation: 1 }
+    h.disconnect.mockClear()
+    const { unmount } = renderHook(() =>
+      useConnectionLifecycle({
+        contextKey: "shared-unmount",
+        agentType: "claude_code",
+        isActive: true,
+        autoConnectAllowed: false,
+      })
+    )
+
+    unmount()
+
+    expect(h.disconnect).toHaveBeenCalledWith("provider_unmount")
+    h.sharedSession = null
+    h.backgroundOutstanding = 0
   })
 })
 

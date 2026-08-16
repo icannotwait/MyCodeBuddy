@@ -581,6 +581,53 @@ describe("AcpConnectionsProvider shared server roots", () => {
     )
   })
 
+  it("uses one prompt request id per logical client message", async () => {
+    h.isDesktop = false
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/work", "sess", 42)
+      await h.actions!.sendPrompt(TAB, [{ type: "text", text: "first" }], {
+        clientMessageId: "message-first",
+      })
+      await h.actions!.sendPrompt(TAB, [{ type: "text", text: "first" }], {
+        clientMessageId: "message-first",
+      })
+      await h.actions!.sendPrompt(TAB, [{ type: "text", text: "second" }], {
+        clientMessageId: "message-second",
+      })
+    })
+
+    const requestId = (call: number) =>
+      acpPromptMock.mock.calls[call]?.[6]?.clientRequestId
+    expect(requestId(1)).toBe(requestId(0))
+    expect(requestId(2)).not.toBe(requestId(0))
+    expect(requestId(0)).not.toBe(
+      h.acpConnectOrAttach.mock.calls[0]?.[0].requestId
+    )
+  })
+
+  it("releases a busy shared preview tab instead of retaining its lease", async () => {
+    h.isDesktop = false
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/work", "sess", 42)
+    })
+    emitAcpEvent(latestAttachHandlers(), {
+      seq: 1,
+      connection_id: "conn",
+      type: "status_changed",
+      status: "prompting",
+    })
+
+    await act(async () => {
+      await h.actions!.disconnectIfIdle(TAB)
+    })
+
+    expect(h.acpReleaseLease).toHaveBeenCalledWith("conn", 1, "lease-1")
+    expect(h.acpDisconnect).not.toHaveBeenCalled()
+    expect(h.store!.getConnection(TAB)).toBeUndefined()
+  })
+
   it("cold-reattaches instead of surfacing a stale shared turn error", async () => {
     h.isDesktop = false
     await mountProvider()
