@@ -782,7 +782,12 @@ pub fn build_router(
             "/acp_touch_connection",
             post(handlers::acp::acp_touch_connection),
         )
-        .route("/acp_prompt", post(handlers::acp::acp_prompt))
+        .route(
+            "/acp_prompt",
+            post(handlers::acp::acp_prompt).layer(DefaultBodyLimit::max(
+                crate::acp::shared_session::MAX_WAITING_BYTES + 1024 * 1024,
+            )),
+        )
         .route("/acp_preflight", post(handlers::acp::acp_preflight))
         .route("/acp_set_mode", post(handlers::acp::acp_set_mode))
         .route(

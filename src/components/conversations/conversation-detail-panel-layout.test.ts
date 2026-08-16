@@ -447,12 +447,14 @@ describe("ConversationDetailPanel send-path hardening", () => {
   // chat-mode work. The behavioral cores (readiness predicate, duplicate-create
   // rejection) are unit-tested in src/lib/queue-flush.test.ts; these assert they
   // are actually wired into the send path here.
-  it("gates the direct send on a cwd-matched connection, not bare connected", () => {
+  it("gates direct send on cwd-matched legacy or shared prompt admission", () => {
     // A chat draft mid-reconnect can read a stale "connected" for the previous
     // cwd; sending then would hit the wrong workspace. handleSend must gate on
     // the readiness predicate (connected AND cwd matches), like the flush effect.
     expect(source).toContain("isConnectionReady(")
-    expect(source).toContain("if (!connectionReady) return")
+    expect(source).toContain("const promptAdmissionReady =")
+    expect(source).toContain("connectionReady ||")
+    expect(source).toContain("if (!promptAdmissionReady) return")
   })
 
   it("disables the welcome composer while connected-but-not-ready", () => {

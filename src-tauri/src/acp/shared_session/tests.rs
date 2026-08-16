@@ -803,6 +803,190 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shutdown_does_not_hold_the_broker_record_lock_while_state_is_contended() {
+        let broker = SharedSessionBroker::default();
+        let reservation = broker
+            .reserve_or_attach(request(
+                SharedSessionKey::Conversation(133),
+                "shutdown-lock-connection",
+                "shutdown-lock-client",
+                "shutdown-lock-request",
+            ))
+            .await
+            .unwrap();
+        let state = Arc::new(tokio::sync::RwLock::new(SessionState::new(
+            reservation.attachment.connection_id.clone(),
+            crate::models::agent::AgentType::Codex,
+            None,
+            "shared-server".into(),
+            Some(9),
+        )));
+        broker
+            .install_registered(
+                &reservation.attachment.connection_id,
+                reservation.attachment.generation,
+                "shutdown-lock-driver".into(),
+                state.clone(),
+                EventEmitter::Noop,
+                Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            )
+            .await
+            .unwrap();
+
+        let state_guard = state.write().await;
+        let mut shutdown = Box::pin(broker.begin_shutdown());
+        assert!(matches!(
+            futures::poll!(shutdown.as_mut()),
+            std::task::Poll::Pending
+        ));
+        let released = tokio::time::timeout(
+            Duration::from_millis(100),
+            broker.release_lease(&SharedMutationGuard {
+                connection_id: reservation.attachment.connection_id.clone(),
+                generation: reservation.attachment.generation,
+                lease_id: reservation.attachment.lease_id.clone(),
+            }),
+        )
+        .await
+        .expect("shutdown state contention must not block broker mutations")
+        .unwrap();
+        assert!(released);
+
+        drop(state_guard);
+        shutdown.await;
+    }
+
+    #[tokio::test]
+    async fn diagnostics_do_not_hold_the_broker_record_lock_while_state_is_contended() {
+        let broker = SharedSessionBroker::default();
+        let reservation = broker
+            .reserve_or_attach(request(
+                SharedSessionKey::Conversation(134),
+                "diagnostics-lock-connection",
+                "diagnostics-lock-client",
+                "diagnostics-lock-request",
+            ))
+            .await
+            .unwrap();
+        let state = Arc::new(tokio::sync::RwLock::new(SessionState::new(
+            reservation.attachment.connection_id.clone(),
+            crate::models::agent::AgentType::Codex,
+            None,
+            "shared-server".into(),
+            Some(9),
+        )));
+        broker
+            .install_registered(
+                &reservation.attachment.connection_id,
+                reservation.attachment.generation,
+                "diagnostics-lock-driver".into(),
+                state.clone(),
+                EventEmitter::Noop,
+                Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            )
+            .await
+            .unwrap();
+
+        let state_guard = state.write().await;
+        let mut diagnostics = Box::pin(broker.diagnostics());
+        assert!(matches!(
+            futures::poll!(diagnostics.as_mut()),
+            std::task::Poll::Pending
+        ));
+        let released = tokio::time::timeout(
+            Duration::from_millis(100),
+            broker.release_lease(&SharedMutationGuard {
+                connection_id: reservation.attachment.connection_id.clone(),
+                generation: reservation.attachment.generation,
+                lease_id: reservation.attachment.lease_id.clone(),
+            }),
+        )
+        .await
+        .expect("diagnostic state contention must not block broker mutations")
+        .unwrap();
+        assert!(released);
+
+        drop(state_guard);
+        assert_eq!(diagnostics.await.len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn diagnostic_phase_durations_are_independent_and_freeze_on_completion() {
+        let broker = SharedSessionBroker::default();
+        let reservation = broker
+            .reserve_or_attach(request(
+                SharedSessionKey::Conversation(135),
+                "duration-connection",
+                "duration-client",
+                "duration-request",
+            ))
+            .await
+            .unwrap();
+        let state = Arc::new(tokio::sync::RwLock::new(SessionState::new(
+            reservation.attachment.connection_id.clone(),
+            crate::models::agent::AgentType::Codex,
+            None,
+            "shared-server".into(),
+            Some(9),
+        )));
+        tokio::time::advance(Duration::from_secs(5)).await;
+        broker
+            .install_registered(
+                &reservation.attachment.connection_id,
+                reservation.attachment.generation,
+                "duration-driver".into(),
+                state,
+                EventEmitter::Noop,
+                Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            )
+            .await
+            .unwrap();
+        tokio::time::advance(Duration::from_secs(7)).await;
+        broker
+            .mark_ready(
+                &reservation.attachment.connection_id,
+                reservation.attachment.generation,
+                "duration-driver",
+            )
+            .await
+            .unwrap();
+        tokio::time::advance(Duration::from_secs(30)).await;
+
+        let ready = broker.diagnostics().await.pop().unwrap();
+        assert_eq!(ready.bootstrap_duration_ms, 12_000);
+        assert_eq!(ready.cleanup_duration_ms, 0);
+        assert_eq!(ready.cleanup_state, "not_started");
+
+        broker
+            .mark_failed(
+                &reservation.attachment.connection_id,
+                reservation.attachment.generation,
+                "session_unavailable",
+                false,
+            )
+            .await
+            .unwrap();
+        tokio::time::advance(Duration::from_secs(3)).await;
+        let cleaning = broker.diagnostics().await.pop().unwrap();
+        assert_eq!(cleaning.bootstrap_duration_ms, 12_000);
+        assert_eq!(cleaning.cleanup_duration_ms, 3_000);
+        assert_eq!(cleaning.cleanup_state, "in_progress");
+
+        broker
+            .mark_cleanup_complete(
+                &reservation.attachment.connection_id,
+                reservation.attachment.generation,
+            )
+            .await
+            .unwrap();
+        tokio::time::advance(Duration::from_secs(10)).await;
+        let cleaned = broker.diagnostics().await.pop().unwrap();
+        assert_eq!(cleaned.bootstrap_duration_ms, 12_000);
+        assert_eq!(cleaned.cleanup_duration_ms, 3_000);
+        assert_eq!(cleaned.cleanup_state, "complete");
+    }
+
+    #[tokio::test]
     async fn old_driver_incarnation_cannot_settle_replacement() {
         let broker = SharedSessionBroker::default();
         let reservation = broker
@@ -1428,6 +1612,7 @@ mod tests {
 
     fn dispatchable_runtime_snapshot() -> SharedRuntimeWorkSnapshot {
         SharedRuntimeWorkSnapshot {
+            event_seq: 0,
             status: crate::acp::types::ConnectionStatus::Connected,
             turn_in_flight: false,
             pending_permission_id: None,
@@ -2623,6 +2808,66 @@ mod tests {
             Err(SharedSessionError::InteractionAlreadyResolved)
         ));
         broker.complete_interaction(&claim).await.unwrap();
+    }
+
+    #[test]
+    fn event_sequence_fence_rejects_older_interaction_observations_after_snapshot() {
+        let mut interactions = SharedInteractions::default();
+        let mut snapshot = dispatchable_runtime_snapshot();
+        snapshot.event_seq = 42;
+        snapshot.pending_question_id = Some("question-current".into());
+        interactions.reconcile_snapshot(&snapshot);
+
+        interactions.set_pending(SharedInteractionKind::Question, "question-stale", 40);
+        interactions.resolve_matching(SharedInteractionKind::Question, "question-current", 41);
+
+        let current = interactions
+            .question
+            .as_ref()
+            .expect("newer snapshot interaction remains present");
+        assert_eq!(current.id, "question-current");
+        assert!(current.admission == InteractionAdmissionState::Pending);
+        assert_eq!(interactions.last_observed_event_seq, 42);
+    }
+
+    #[tokio::test]
+    async fn turn_settlement_sequence_fence_rejects_older_interaction_snapshot() {
+        let fixture = ready_fixture_with_turn("sequence-fenced-turn").await;
+        let broker = fixture.manager.shared_session_broker();
+        broker
+            .settle_active_turn_at_seq(
+                &fixture.attachment.connection_id,
+                fixture.attachment.generation,
+                "test-driver-1",
+                "end_turn",
+                51,
+            )
+            .await
+            .unwrap();
+
+        let mut stale_snapshot = dispatchable_runtime_snapshot();
+        stale_snapshot.event_seq = 50;
+        stale_snapshot.pending_question_id = Some("question-from-completed-turn".into());
+        broker
+            .reconcile_runtime_snapshot(
+                &fixture.attachment.connection_id,
+                fixture.attachment.generation,
+                "test-driver-1",
+                &stale_snapshot,
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            broker
+                .claim_interaction(
+                    &fixture.guard,
+                    SharedInteractionKind::Question,
+                    "question-from-completed-turn",
+                )
+                .await,
+            Err(SharedSessionError::InteractionAlreadyResolved)
+        ));
     }
 
     #[tokio::test]

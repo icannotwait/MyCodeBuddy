@@ -46,6 +46,7 @@ pub async fn registered_shared_spawn_attempt_for_http_test(
     route_bootstrap_rx: tokio::sync::oneshot::Receiver<
         crate::acp::connection::RouteBootstrapOutcome,
     >,
+    agent_stderr: Option<String>,
 ) -> crate::acp::connection::RegisteredSpawnAttempt {
     let state = match existing_public_state {
         Some(state) => {
@@ -77,6 +78,17 @@ pub async fn registered_shared_spawn_attempt_for_http_test(
             Arc::new(tokio::sync::RwLock::new(state))
         }
     };
+    if let Some(agent_stderr) = agent_stderr {
+        state
+            .write()
+            .await
+            .apply_event(&crate::acp::types::AcpEvent::Error {
+                message: agent_stderr,
+                agent_type: launch.agent_type.as_wire().into_owned(),
+                code: Some("agent_stderr".into()),
+                terminal: false,
+            });
+    }
     let (_session_started_tx, session_started_rx) = tokio::sync::oneshot::channel();
     crate::acp::connection::RegisteredSpawnAttempt {
         connection_id,

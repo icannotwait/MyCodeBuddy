@@ -126,6 +126,7 @@ pub struct PromptEnqueueResult {
 
 #[derive(Clone)]
 pub struct SharedRuntimeWorkSnapshot {
+    pub event_seq: u64,
     pub status: ConnectionStatus,
     pub turn_in_flight: bool,
     pub pending_permission_id: Option<String>,

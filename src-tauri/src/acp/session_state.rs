@@ -854,6 +854,7 @@ impl SessionState {
         conversation_write_error: Option<&'static str>,
     ) -> crate::acp::shared_session::SharedRuntimeWorkSnapshot {
         crate::acp::shared_session::SharedRuntimeWorkSnapshot {
+            event_seq: self.event_seq,
             status: self.status.clone(),
             turn_in_flight: self.turn_in_flight,
             pending_permission_id: self

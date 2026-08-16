@@ -327,9 +327,11 @@ async fn ws_attach_shared_tabs_renew_independently_and_overlay_lease_expiry() {
     tokio::time::pause();
     tokio::time::advance(Duration::from_secs(60)).await;
     ws_a.send_json(&json!({"action": "ping"})).await;
-    tokio::task::yield_now().await;
-    tokio::time::advance(Duration::from_millis(1)).await;
+    // The WebSocket server may run on another scheduler thread. Use live time
+    // while waiting for its pong so the timeout cannot auto-advance first.
+    tokio::time::resume();
     assert_eq!(next_json(&mut ws_a).await["type"], "pong");
+    tokio::time::pause();
     tokio::time::advance(Duration::from_secs(31)).await;
     let expired = state
         .connection_manager

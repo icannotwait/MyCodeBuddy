@@ -7,10 +7,13 @@ use std::time::Duration;
 
 use axum::http::StatusCode;
 use axum_test::TestServer;
-use codeg_lib::acp::connection::{RegisteredSpawnAttempt, RouteBootstrapOutcome};
+use codeg_lib::acp::connection::{
+    ConnectionCommand, ConnectionControl, RegisteredSpawnAttempt, RouteBootstrapOutcome,
+};
 use codeg_lib::acp::delegation::route::RouteDegradedReason;
 use codeg_lib::acp::error::AcpError;
 use codeg_lib::acp::manager::{ConnectionManager, SharedConnectLaunch, SharedSpawnDriver};
+use codeg_lib::acp::question::QuestionSpec;
 use codeg_lib::acp::session_state::SessionState;
 use codeg_lib::acp::shared_session::{
     SharedDisposition, SharedSessionKey, SharedSessionPhase, MAX_ACTIVE_LEASES,
@@ -19,6 +22,8 @@ use codeg_lib::acp::shared_session::{
     MAX_WAITING_PROMPTS,
 };
 use codeg_lib::acp::termination::AcpDisconnectOrigin;
+use codeg_lib::acp::types::AcpEvent;
+use codeg_lib::acp::types::PermissionOptionInfo;
 use codeg_lib::app_state::AppState;
 use codeg_lib::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
 use codeg_lib::models::AgentType;
@@ -107,14 +112,37 @@ impl HttpResponse {
     }
 }
 
+fn assert_one_shared_control_winner(interaction: &str, left: HttpResponse, right: HttpResponse) {
+    let responses = [left, right];
+    assert_eq!(
+        responses
+            .iter()
+            .filter(|response| response.status == StatusCode::OK)
+            .count(),
+        1,
+        "exactly one {interaction} request must win: {responses:?}"
+    );
+    let loser = responses
+        .iter()
+        .find(|response| response.status != StatusCode::OK)
+        .expect("one losing response");
+    assert_eq!(loser.status, StatusCode::CONFLICT, "loser: {loser:?}");
+    assert_eq!(
+        loser.body.get("code").and_then(Value::as_str),
+        Some("interaction_already_resolved")
+    );
+}
+
 struct ControlledSpawnDriver {
     outcomes: Mutex<VecDeque<oneshot::Receiver<RouteBootstrapOutcome>>>,
     starts: AtomicUsize,
+    agent_stderr: Option<String>,
 }
 
 impl ControlledSpawnDriver {
-    fn new(
+    fn new_with_stderr(
         outcome: BootstrapOutcome,
+        agent_stderr: Option<String>,
     ) -> (Arc<Self>, Option<oneshot::Sender<RouteBootstrapOutcome>>) {
         let (tx, rx) = oneshot::channel();
         let pending = match outcome {
@@ -136,6 +164,7 @@ impl ControlledSpawnDriver {
             Arc::new(Self {
                 outcomes: Mutex::new(VecDeque::from([rx])),
                 starts: AtomicUsize::new(0),
+                agent_stderr,
             }),
             pending,
         )
@@ -164,6 +193,7 @@ impl SharedSpawnDriver for ControlledSpawnDriver {
                 launch,
                 existing_public_state,
                 outcome,
+                self.agent_stderr.clone(),
             )
             .await,
         )
@@ -184,7 +214,7 @@ struct SharedHttpFixture {
     conversation_id: i32,
     folder_id: i32,
     working_dir: String,
-    _bootstrap: Option<oneshot::Sender<RouteBootstrapOutcome>>,
+    bootstrap: Mutex<Option<oneshot::Sender<RouteBootstrapOutcome>>>,
     _data_dir: tempfile::TempDir,
     _static_dir: tempfile::TempDir,
     _workspace: tempfile::TempDir,
@@ -262,6 +292,16 @@ impl SharedHttpFixture {
         &self.state.connection_manager
     }
 
+    fn release_bootstrap_ready(&self) {
+        self.bootstrap
+            .lock()
+            .expect("bootstrap gate lock")
+            .take()
+            .expect("pending bootstrap gate")
+            .send(RouteBootstrapOutcome::Ready)
+            .expect("bootstrap receiver retained");
+    }
+
     async fn wait_for_failed_cleanup(&self, connection_id: &str) {
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
@@ -286,11 +326,36 @@ impl SharedHttpFixture {
         .await
         .expect("failed shared root should complete cleanup");
     }
+
+    async fn wait_for_pending_interaction(&self, connection_id: &str, interaction_id: &str) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if self
+                    .manager()
+                    .has_pending_test_shared_interaction(connection_id, interaction_id)
+                    .await
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("shared runtime monitor observes pending interaction");
+    }
 }
 
 async fn shared_http_fixture_with_prompt_ledger_limit(
     outcome: BootstrapOutcome,
     prompt_ledger_limit: Option<usize>,
+) -> SharedHttpFixture {
+    shared_http_fixture_with_options(outcome, prompt_ledger_limit, None).await
+}
+
+async fn shared_http_fixture_with_options(
+    outcome: BootstrapOutcome,
+    prompt_ledger_limit: Option<usize>,
+    agent_stderr: Option<String>,
 ) -> SharedHttpFixture {
     let data_dir = tempfile::tempdir().expect("data dir");
     let static_dir = tempfile::tempdir().expect("static dir");
@@ -299,7 +364,7 @@ async fn shared_http_fixture_with_prompt_ledger_limit(
     let db = fresh_in_memory_db().await;
     let folder_id = seed_folder(&db, &working_dir).await;
     let conversation_id = seed_conversation(&db, folder_id, AgentType::Codex).await;
-    let (driver, bootstrap) = ControlledSpawnDriver::new(outcome);
+    let (driver, bootstrap) = ControlledSpawnDriver::new_with_stderr(outcome, agent_stderr);
     let manager = match prompt_ledger_limit {
         Some(limit) => {
             ConnectionManager::new_with_shared_spawn_driver_and_prompt_ledger_limit_for_test(
@@ -326,7 +391,7 @@ async fn shared_http_fixture_with_prompt_ledger_limit(
         conversation_id,
         folder_id,
         working_dir,
-        _bootstrap: bootstrap,
+        bootstrap: Mutex::new(bootstrap),
         _data_dir: data_dir,
         _static_dir: static_dir,
         _workspace: workspace,
@@ -542,15 +607,38 @@ async fn debug_metrics_and_diagnostics_are_authenticated_complete_and_secret_saf
     const ENV_SENTINEL: &str = "task12-environment-secret-sentinel";
     const STDERR_SENTINEL: &str = "task12-stderr-secret-sentinel";
 
-    let fixture = shared_http_fixture_with_pending_bootstrap().await;
+    let fixture = shared_http_fixture_with_options(
+        BootstrapOutcome::Pending,
+        None,
+        Some(STDERR_SENTINEL.into()),
+    )
+    .await;
     let mut connect = fixture.connect_json(DEVICE_SENTINEL, CLIENT_SENTINEL, REQUEST_SENTINEL);
     connect["preferredConfigValues"] = json!({"TASK12_ENV": ENV_SENTINEL});
-    connect["agentStderr"] = json!(STDERR_SENTINEL);
     let attached = fixture
         .post_json("/acp_connect_or_attach", connect)
         .await
         .assert_status_ok()
         .json::<AcpConnectOrAttachResponse>();
+    let _lanes = fixture
+        .manager()
+        .install_test_shared_connection_lanes(&attached.connection_id)
+        .await
+        .expect("controllable shared connection lanes");
+    assert_eq!(
+        fixture
+            .manager()
+            .get_state(&attached.connection_id)
+            .await
+            .expect("driver state")
+            .read()
+            .await
+            .last_error
+            .as_ref()
+            .map(|error| error.message.as_str()),
+        Some(STDERR_SENTINEL),
+        "fake driver must seed the stderr sentinel into retained driver state"
+    );
     fixture
         .post_json(
             "/acp_prompt",
@@ -568,6 +656,25 @@ async fn debug_metrics_and_diagnostics_are_authenticated_complete_and_secret_saf
         )
         .await
         .assert_status_ok();
+    let registered_question = fixture
+        .manager()
+        .register_question(
+            &attached.connection_id,
+            vec![QuestionSpec {
+                id: "task12-answer-question".into(),
+                question: "Provide the diagnostic exclusion sentinel".into(),
+                header: "Secret".into(),
+                multi_select: false,
+                options: Vec::new(),
+                is_secret: true,
+                recovery: None,
+            }],
+        )
+        .await
+        .expect("real pending question");
+    fixture
+        .wait_for_pending_interaction(&attached.connection_id, &registered_question.question_id)
+        .await;
     fixture
         .post_json(
             "/acp_answer_question",
@@ -575,7 +682,7 @@ async fn debug_metrics_and_diagnostics_are_authenticated_complete_and_secret_saf
                 "connectionId": attached.connection_id,
                 "generation": attached.generation,
                 "leaseId": attached.lease_id,
-                "questionId": "task12-missing-question",
+                "questionId": registered_question.question_id,
                 "answer": {
                     "answers": [{
                         "questionId": "task12-answer-question",
@@ -586,7 +693,14 @@ async fn debug_metrics_and_diagnostics_are_authenticated_complete_and_secret_saf
             }),
         )
         .await
-        .assert_status_conflict();
+        .assert_status_ok();
+    let answer_outcome = registered_question
+        .answer_rx
+        .await
+        .expect("real pending question receives the HTTP answer");
+    assert!(serde_json::to_string(&answer_outcome)
+        .unwrap()
+        .contains(ANSWER_SENTINEL));
 
     for route in ["/debug/event_metrics", "/debug/shared_sessions"] {
         fixture
@@ -1197,6 +1311,173 @@ async fn prompt_queue_capacity_rejects_only_new_prompt_identities() {
 }
 
 #[tokio::test]
+async fn concurrent_prompts_dispatch_once_in_exact_enqueue_sequence_order() {
+    let fixture = ready_shared_http_fixture().await;
+    let attached = fixture
+        .post_connect("dispatch-device", "dispatch-client", "dispatch-connect")
+        .await
+        .assert_status_ok()
+        .json::<AcpConnectOrAttachResponse>();
+    fixture
+        .manager()
+        .wait_for_shared_phase(
+            &attached.connection_id,
+            attached.generation,
+            SharedSessionPhase::Ready,
+        )
+        .await
+        .unwrap();
+    let (mut commands, _controls) = fixture
+        .manager()
+        .install_test_shared_connection_lanes(&attached.connection_id)
+        .await
+        .expect("controllable ready driver lanes");
+
+    let responses = futures::future::join_all((0..MAX_WAITING_PROMPTS).map(|index| {
+        let request_id = format!("dispatch-{index:02}");
+        let text = format!("dispatch-text-{index:02}");
+        fixture.post_json(
+            "/acp_prompt",
+            json!({
+                "connectionId": attached.connection_id,
+                "generation": attached.generation,
+                "leaseId": attached.lease_id,
+                "clientInstanceId": "dispatch-client",
+                "clientRequestId": request_id,
+                "clientMessageId": format!("message-{index:02}"),
+                "blocks": [{"type": "text", "text": text}],
+                "folderId": fixture.folder_id,
+                "conversationId": fixture.conversation_id,
+            }),
+        )
+    }))
+    .await;
+    let expected_by_sequence = responses
+        .into_iter()
+        .enumerate()
+        .map(|(index, response)| {
+            let sequence = response
+                .assert_status_ok()
+                .body
+                .get("enqueueSeq")
+                .and_then(Value::as_u64)
+                .expect("accepted prompt sequence");
+            (sequence, format!("dispatch-text-{index:02}"))
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert_eq!(expected_by_sequence.len(), MAX_WAITING_PROMPTS);
+
+    let mut dispatched = Vec::new();
+    for _ in 0..MAX_WAITING_PROMPTS {
+        let command = tokio::time::timeout(Duration::from_secs(2), commands.recv())
+            .await
+            .expect("dispatcher must make progress")
+            .expect("driver command lane remains open");
+        let text = match command {
+            ConnectionCommand::Prompt { blocks, .. } => match blocks.as_slice() {
+                [codeg_lib::acp::types::PromptInputBlock::Text { text }] => text.clone(),
+                other => panic!("unexpected dispatched blocks: {other:?}"),
+            },
+            _ => panic!("unexpected command on prompt lane"),
+        };
+        dispatched.push(text);
+        assert!(
+            fixture
+                .manager()
+                .emit_test_shared_driver_event(
+                    &attached.connection_id,
+                    AcpEvent::TurnComplete {
+                        session_id: "dispatch-session".into(),
+                        stop_reason: "end_turn".into(),
+                        agent_type: "codex".into(),
+                        mark_awaiting_reply: true,
+                        termination_source: None,
+                        provider_turn_id: None,
+                    },
+                )
+                .await
+        );
+    }
+    let expected = expected_by_sequence.into_values().collect::<Vec<_>>();
+    assert_eq!(dispatched, expected);
+    tokio::task::yield_now().await;
+    assert!(matches!(
+        commands.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+    let metrics = fixture
+        .manager()
+        .shared_session_broker()
+        .metrics()
+        .snapshot();
+    assert_eq!(metrics.dispatch_total, MAX_WAITING_PROMPTS as u64);
+}
+
+#[tokio::test]
+async fn prompt_queue_enforces_the_actual_serialized_32_mib_boundary() {
+    let fixture = shared_http_fixture_with_pending_bootstrap().await;
+    let attached = fixture
+        .post_connect("byte-cap-device", "byte-cap-client", "byte-cap-connect")
+        .await
+        .assert_status_ok()
+        .json::<AcpConnectOrAttachResponse>();
+    let prompt = |request_id: &str, text: String| {
+        json!({
+            "connectionId": attached.connection_id,
+            "generation": attached.generation,
+            "leaseId": attached.lease_id,
+            "clientInstanceId": "byte-cap-client",
+            "clientRequestId": request_id,
+            "clientMessageId": format!("message-{request_id}"),
+            "blocks": [{"type": "text", "text": text}],
+            "folderId": fixture.folder_id,
+            "conversationId": fixture.conversation_id,
+        })
+    };
+
+    fixture
+        .post_json("/acp_prompt", prompt("bytes-a", String::new()))
+        .await
+        .assert_status_ok();
+    let first_bytes = fixture
+        .manager()
+        .shared_session_diagnostics()
+        .await
+        .pop()
+        .expect("queued diagnostic")
+        .queue_bytes;
+    assert!(first_bytes < MAX_WAITING_BYTES / 2);
+
+    let exact_fill = "x".repeat(MAX_WAITING_BYTES - 2 * first_bytes);
+    fixture
+        .post_json("/acp_prompt", prompt("bytes-b", exact_fill))
+        .await
+        .assert_status_ok();
+    let at_limit = fixture
+        .manager()
+        .shared_session_diagnostics()
+        .await
+        .pop()
+        .expect("full queue diagnostic");
+    assert_eq!(at_limit.queue_depth, 2);
+    assert_eq!(at_limit.queue_bytes, MAX_WAITING_BYTES);
+
+    fixture
+        .post_json("/acp_prompt", prompt("bytes-c", String::new()))
+        .await
+        .assert_status_too_many_requests()
+        .assert_code("prompt_queue_full");
+    let unchanged = fixture
+        .manager()
+        .shared_session_diagnostics()
+        .await
+        .pop()
+        .expect("rejected item leaves queue intact");
+    assert_eq!(unchanged.queue_depth, 2);
+    assert_eq!(unchanged.queue_bytes, MAX_WAITING_BYTES);
+}
+
+#[tokio::test]
 async fn prompt_ledger_capacity_rejects_only_new_identities_over_http() {
     let fixture =
         shared_http_fixture_with_prompt_ledger_limit(BootstrapOutcome::Pending, Some(2)).await;
@@ -1407,6 +1688,464 @@ async fn shared_stop_and_interaction_mutations_require_generation_and_lease() {
             .assert_status_conflict()
             .assert_code("shared_session_protocol_required");
     }
+}
+
+#[tokio::test]
+async fn two_clients_have_one_permission_question_and_plan_responder_winner() {
+    let fixture = ready_shared_http_fixture().await;
+    let first = fixture
+        .post_connect("control-device-a", "control-client-a", "control-connect-a")
+        .await
+        .assert_status_ok()
+        .json::<AcpConnectOrAttachResponse>();
+    fixture
+        .manager()
+        .wait_for_shared_phase(
+            &first.connection_id,
+            first.generation,
+            SharedSessionPhase::Ready,
+        )
+        .await
+        .unwrap();
+    let second = fixture
+        .post_connect("control-device-b", "control-client-b", "control-connect-b")
+        .await
+        .assert_status_ok()
+        .json::<AcpConnectOrAttachResponse>();
+    let (mut commands, _controls) = fixture
+        .manager()
+        .install_test_shared_connection_lanes(&first.connection_id)
+        .await
+        .expect("controllable responder lanes");
+
+    assert!(
+        fixture
+            .manager()
+            .emit_test_shared_driver_event(
+                &first.connection_id,
+                AcpEvent::PermissionRequest {
+                    request_id: "permission-race".into(),
+                    tool_call: json!({"title": "Permission race"}),
+                    options: vec![PermissionOptionInfo {
+                        option_id: "allow".into(),
+                        name: "Allow".into(),
+                        kind: "allow_once".into(),
+                        meta: None,
+                    }],
+                    queued: 0,
+                },
+            )
+            .await
+    );
+    fixture
+        .wait_for_pending_interaction(&first.connection_id, "permission-race")
+        .await;
+    let permission_body = |lease_id: &str| {
+        json!({
+            "connectionId": first.connection_id,
+            "generation": first.generation,
+            "leaseId": lease_id,
+            "requestId": "permission-race",
+            "optionId": "allow",
+        })
+    };
+    let (permission_a, permission_b) = tokio::join!(
+        fixture.post_json("/acp_respond_permission", permission_body(&first.lease_id)),
+        fixture.post_json("/acp_respond_permission", permission_body(&second.lease_id))
+    );
+    assert_one_shared_control_winner("permission", permission_a, permission_b);
+    match tokio::time::timeout(Duration::from_secs(2), commands.recv())
+        .await
+        .expect("permission responder called")
+        .expect("command lane open")
+    {
+        ConnectionCommand::RespondPermission {
+            request_id,
+            option_id,
+        } => {
+            assert_eq!(request_id, "permission-race");
+            assert_eq!(option_id, "allow");
+        }
+        _ => panic!("unexpected permission responder command"),
+    }
+    assert!(
+        fixture
+            .manager()
+            .emit_test_shared_driver_event(
+                &first.connection_id,
+                AcpEvent::PermissionResolved {
+                    request_id: "permission-race".into(),
+                },
+            )
+            .await
+    );
+
+    let registered_question = fixture
+        .manager()
+        .register_question(
+            &first.connection_id,
+            vec![QuestionSpec {
+                id: "question-race-item".into(),
+                question: "Which client wins?".into(),
+                header: "Race".into(),
+                multi_select: false,
+                options: Vec::new(),
+                is_secret: false,
+                recovery: None,
+            }],
+        )
+        .await
+        .expect("real pending question");
+    fixture
+        .wait_for_pending_interaction(&first.connection_id, &registered_question.question_id)
+        .await;
+    let question_body = |lease_id: &str, label: &str| {
+        json!({
+            "connectionId": first.connection_id,
+            "generation": first.generation,
+            "leaseId": lease_id,
+            "questionId": registered_question.question_id,
+            "answer": {
+                "answers": [{
+                    "questionId": "question-race-item",
+                    "labels": [label],
+                }],
+                "declined": false,
+            },
+        })
+    };
+    let (question_a, question_b) = tokio::join!(
+        fixture.post_json(
+            "/acp_answer_question",
+            question_body(&first.lease_id, "client-a")
+        ),
+        fixture.post_json(
+            "/acp_answer_question",
+            question_body(&second.lease_id, "client-b")
+        )
+    );
+    assert_one_shared_control_winner("question", question_a, question_b);
+    let question_outcome = registered_question
+        .answer_rx
+        .await
+        .expect("question responder called once");
+    assert_eq!(question_outcome.answers.len(), 1);
+    assert!(matches!(
+        question_outcome.answers[0].selected.as_slice(),
+        [winner] if winner == "client-a" || winner == "client-b"
+    ));
+
+    let registered_plan = fixture
+        .manager()
+        .register_plan_approval(
+            &first.connection_id,
+            "plan-tool-race".into(),
+            "# Concurrent plan".into(),
+        )
+        .await
+        .expect("real pending plan approval");
+    fixture
+        .wait_for_pending_interaction(&first.connection_id, &registered_plan.approval_id)
+        .await;
+    assert_eq!(
+        fixture
+            .manager()
+            .pending_plan_approval_parent_connection_id(&registered_plan.approval_id)
+            .await
+            .as_deref(),
+        Some(first.connection_id.as_str()),
+        "plan approval registry entry remains live before the race"
+    );
+    let plan_body = |lease_id: &str, decision: &str| {
+        json!({
+            "connectionId": first.connection_id,
+            "generation": first.generation,
+            "leaseId": lease_id,
+            "approvalId": registered_plan.approval_id,
+            "answer": {"decision": decision, "feedback": null},
+        })
+    };
+    let (plan_a, plan_b) = tokio::join!(
+        fixture.post_json(
+            "/acp_answer_plan_approval",
+            plan_body(&first.lease_id, "approve")
+        ),
+        fixture.post_json(
+            "/acp_answer_plan_approval",
+            plan_body(&second.lease_id, "abandon")
+        )
+    );
+    assert_one_shared_control_winner("plan approval", plan_a, plan_b);
+    let plan_outcome = registered_plan
+        .answer_rx
+        .await
+        .expect("plan responder called once");
+    assert!(matches!(
+        plan_outcome.decision,
+        codeg_lib::acp::plan_approval::PlanApprovalDecision::Approve
+            | codeg_lib::acp::plan_approval::PlanApprovalDecision::Abandon
+    ));
+    tokio::task::yield_now().await;
+    assert!(matches!(
+        commands.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+}
+
+#[tokio::test]
+async fn exact_turn_concurrent_stops_call_cancel_once_and_preserve_the_queue_tail() {
+    let fixture = ready_shared_http_fixture().await;
+    let first = fixture
+        .post_connect("stop-device-a", "stop-client-a", "stop-connect-a")
+        .await
+        .assert_status_ok()
+        .json::<AcpConnectOrAttachResponse>();
+    fixture
+        .manager()
+        .wait_for_shared_phase(
+            &first.connection_id,
+            first.generation,
+            SharedSessionPhase::Ready,
+        )
+        .await
+        .unwrap();
+    let second = fixture
+        .post_connect("stop-device-b", "stop-client-b", "stop-connect-b")
+        .await
+        .assert_status_ok()
+        .json::<AcpConnectOrAttachResponse>();
+    let (mut commands, mut controls) = fixture
+        .manager()
+        .install_test_shared_connection_lanes(&first.connection_id)
+        .await
+        .expect("controllable stop lanes");
+    let prompt = |request_id: &str, text: &str| {
+        json!({
+            "connectionId": first.connection_id,
+            "generation": first.generation,
+            "leaseId": first.lease_id,
+            "clientInstanceId": "stop-client-a",
+            "clientRequestId": request_id,
+            "clientMessageId": format!("message-{request_id}"),
+            "blocks": [{"type": "text", "text": text}],
+            "folderId": fixture.folder_id,
+            "conversationId": fixture.conversation_id,
+        })
+    };
+    fixture
+        .post_json("/acp_prompt", prompt("stop-head", "stop-head"))
+        .await
+        .assert_status_ok();
+    fixture
+        .post_json("/acp_prompt", prompt("stop-tail", "stop-tail"))
+        .await
+        .assert_status_ok();
+    match tokio::time::timeout(Duration::from_secs(2), commands.recv())
+        .await
+        .expect("head dispatched")
+        .expect("command lane open")
+    {
+        ConnectionCommand::Prompt { blocks, .. } => assert!(matches!(
+            blocks.as_slice(),
+            [codeg_lib::acp::types::PromptInputBlock::Text { text }] if text == "stop-head"
+        )),
+        _ => panic!("unexpected head command"),
+    }
+    let active = fixture
+        .manager()
+        .shared_session_broker()
+        .diagnostic_for_connection(&first.connection_id)
+        .await
+        .expect("active turn projection")
+        .active_turn
+        .expect("head is active");
+    let stop_body = |lease_id: &str| {
+        json!({
+            "connectionId": first.connection_id,
+            "generation": first.generation,
+            "leaseId": lease_id,
+            "turnId": active.turn_id,
+        })
+    };
+    let mut stop_responses = Box::pin(async {
+        tokio::join!(
+            fixture.post_json("/acp_cancel", stop_body(&first.lease_id)),
+            fixture.post_json("/acp_cancel", stop_body(&second.lease_id))
+        )
+    });
+    let control = tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::select! {
+            biased;
+            control = controls.recv() => control,
+            _ = &mut stop_responses => panic!("stop responses completed before cancel admission was observed"),
+        }
+    })
+    .await
+    .expect("exact-turn cancel admitted")
+    .expect("control lane open");
+    assert!(matches!(control, ConnectionControl::Cancel));
+    assert!(
+        fixture
+            .manager()
+            .emit_test_shared_driver_event(
+                &first.connection_id,
+                AcpEvent::TurnComplete {
+                    session_id: "stop-session".into(),
+                    stop_reason: "user_stop".into(),
+                    agent_type: "codex".into(),
+                    mark_awaiting_reply: true,
+                    termination_source: Some(codeg_lib::models::TurnTerminationSource::UserStop),
+                    provider_turn_id: None,
+                },
+            )
+            .await
+    );
+    let (stop_a, stop_b) = stop_responses.await;
+    let stop_responses = [stop_a, stop_b];
+    assert!(
+        stop_responses
+            .iter()
+            .any(|response| response.status == StatusCode::OK),
+        "the request that delivered cancel must succeed: {stop_responses:?}"
+    );
+    for response in &stop_responses {
+        assert!(
+            response.status == StatusCode::OK
+                || (response.status == StatusCode::CONFLICT
+                    && response.body.get("code").and_then(Value::as_str) == Some("stale_turn")),
+            "only the exact-turn finalizer may fence the concurrent loser: {response:?}"
+        );
+    }
+    tokio::task::yield_now().await;
+    assert!(matches!(
+        controls.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+
+    match tokio::time::timeout(Duration::from_secs(2), commands.recv())
+        .await
+        .expect("queue tail dispatched after finalizer")
+        .expect("command lane open")
+    {
+        ConnectionCommand::Prompt { blocks, .. } => assert!(matches!(
+            blocks.as_slice(),
+            [codeg_lib::acp::types::PromptInputBlock::Text { text }] if text == "stop-tail"
+        )),
+        _ => panic!("unexpected tail command"),
+    }
+    fixture
+        .post_json("/acp_cancel", stop_body(&first.lease_id))
+        .await
+        .assert_status_conflict()
+        .assert_code("stale_turn");
+}
+
+#[tokio::test]
+async fn dispatch_racing_queue_cancel_has_exactly_one_terminal_owner() {
+    let fixture = shared_http_fixture_with_pending_bootstrap().await;
+    let attached = fixture
+        .post_connect(
+            "dispatch-cancel-device",
+            "dispatch-cancel-client",
+            "dispatch-cancel-connect",
+        )
+        .await
+        .assert_status_ok()
+        .json::<AcpConnectOrAttachResponse>();
+    let (mut commands, _controls) = fixture
+        .manager()
+        .install_test_shared_connection_lanes(&attached.connection_id)
+        .await
+        .expect("controllable dispatch/cancel lanes");
+    let admitted = fixture
+        .post_json(
+            "/acp_prompt",
+            json!({
+                "connectionId": attached.connection_id,
+                "generation": attached.generation,
+                "leaseId": attached.lease_id,
+                "clientInstanceId": "dispatch-cancel-client",
+                "clientRequestId": "dispatch-cancel-request",
+                "clientMessageId": "dispatch-cancel-message",
+                "blocks": [{"type": "text", "text": "dispatch or cancel"}],
+                "folderId": fixture.folder_id,
+                "conversationId": fixture.conversation_id,
+            }),
+        )
+        .await
+        .assert_status_ok()
+        .body;
+    let queue_item_id = admitted
+        .get("queueItemId")
+        .and_then(Value::as_str)
+        .expect("queue item id")
+        .to_string();
+    let cancel = fixture.post_json(
+        "/acp_cancel_queued_prompt",
+        json!({
+            "connectionId": attached.connection_id,
+            "generation": attached.generation,
+            "leaseId": attached.lease_id,
+            "queueItemId": queue_item_id,
+        }),
+    );
+    let (_, cancel_response) = tokio::join!(
+        async {
+            tokio::task::yield_now().await;
+            fixture.release_bootstrap_ready();
+            fixture
+                .manager()
+                .wait_for_shared_phase(
+                    &attached.connection_id,
+                    attached.generation,
+                    SharedSessionPhase::Ready,
+                )
+                .await
+                .unwrap();
+        },
+        cancel
+    );
+    tokio::task::yield_now().await;
+    let dispatched = match commands.try_recv() {
+        Ok(ConnectionCommand::Prompt { .. }) => true,
+        Ok(_) => panic!("unexpected command in dispatch/cancel race"),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => false,
+        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+            panic!("command lane disconnected")
+        }
+    };
+    assert_eq!(cancel_response.status == StatusCode::OK, !dispatched);
+    if dispatched {
+        cancel_response
+            .assert_status_conflict()
+            .assert_code("queue_item_already_dispatching");
+        assert!(
+            fixture
+                .manager()
+                .emit_test_shared_driver_event(
+                    &attached.connection_id,
+                    AcpEvent::TurnComplete {
+                        session_id: "dispatch-cancel-session".into(),
+                        stop_reason: "end_turn".into(),
+                        agent_type: "codex".into(),
+                        mark_awaiting_reply: true,
+                        termination_source: None,
+                        provider_turn_id: None,
+                    },
+                )
+                .await
+        );
+    } else {
+        cancel_response.assert_status_ok();
+    }
+    let projection = fixture
+        .manager()
+        .shared_session_broker()
+        .diagnostic_for_connection(&attached.connection_id)
+        .await
+        .expect("race projection");
+    assert!(projection.queue.is_empty());
+    assert_eq!(projection.active_turn.is_some(), dispatched);
 }
 
 #[tokio::test]

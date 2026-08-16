@@ -153,6 +153,10 @@ impl SharedSessionMetrics {
         self.capacity_rejected_total.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(super) fn record_dispatch(&self) {
+        self.dispatch_total.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(super) fn record_idle_candidate(&self) {
         self.idle_candidate_total.fetch_add(1, Ordering::Relaxed);
     }

@@ -1936,83 +1936,90 @@ impl ConnectionManager {
                     AcpEvent::TurnComplete { stop_reason, .. } => {
                         manager
                             .shared_session_broker
-                            .settle_active_turn(
+                            .settle_active_turn_at_seq(
                                 &connection_id,
                                 generation,
                                 &driver_incarnation,
                                 stop_reason,
+                                envelope.seq,
                             )
                             .await
                     }
                     AcpEvent::PermissionRequest { request_id, .. } => {
                         manager
                             .shared_session_broker
-                            .observe_interaction(
+                            .observe_interaction_at_seq(
                                 &connection_id,
                                 generation,
                                 &driver_incarnation,
                                 SharedInteractionKind::Permission,
                                 request_id,
+                                envelope.seq,
                             )
                             .await
                     }
                     AcpEvent::PermissionResolved { request_id } => {
                         manager
                             .shared_session_broker
-                            .observe_interaction_resolved(
+                            .observe_interaction_resolved_at_seq(
                                 &connection_id,
                                 generation,
                                 &driver_incarnation,
                                 SharedInteractionKind::Permission,
                                 request_id,
+                                envelope.seq,
                             )
                             .await
                     }
                     AcpEvent::QuestionRequest { question_id, .. } => {
                         manager
                             .shared_session_broker
-                            .observe_interaction(
+                            .observe_interaction_at_seq(
                                 &connection_id,
                                 generation,
                                 &driver_incarnation,
                                 SharedInteractionKind::Question,
                                 question_id,
+                                envelope.seq,
                             )
                             .await
                     }
                     AcpEvent::QuestionResolved { question_id } => {
                         manager
                             .shared_session_broker
-                            .observe_interaction_resolved(
+                            .observe_interaction_resolved_at_seq(
                                 &connection_id,
                                 generation,
                                 &driver_incarnation,
                                 SharedInteractionKind::Question,
                                 question_id,
+                                envelope.seq,
                             )
                             .await
                     }
                     AcpEvent::PlanApprovalRequest { approval_id, .. } => {
                         manager
                             .shared_session_broker
-                            .observe_interaction(
+                            .observe_interaction_at_seq(
                                 &connection_id,
                                 generation,
                                 &driver_incarnation,
                                 SharedInteractionKind::PlanApproval,
                                 approval_id,
+                                envelope.seq,
                             )
                             .await
                     }
                     AcpEvent::PlanApprovalResolved { approval_id } => {
                         manager
                             .shared_session_broker
-                            .observe_interaction_resolved(
+                            .observe_interaction_resolved_at_seq(
                                 &connection_id,
                                 generation,
                                 &driver_incarnation,
                                 SharedInteractionKind::PlanApproval,
                                 approval_id,
+                                envelope.seq,
                             )
                             .await
                     }
@@ -3002,6 +3009,91 @@ impl ConnectionManager {
         };
         self.connections.lock().await.insert(id.to_string(), conn);
         rx
+    }
+
+    /// Bind controllable command/control lanes to the exact public state owned
+    /// by a process-free shared spawn fixture. This keeps integration tests on
+    /// the production dispatcher and control admission paths without launching
+    /// an external ACP process.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn install_test_shared_connection_lanes(
+        &self,
+        id: &str,
+    ) -> Option<(
+        tokio::sync::mpsc::Receiver<crate::acp::connection::ConnectionCommand>,
+        tokio::sync::mpsc::Receiver<crate::acp::connection::ConnectionControl>,
+    )> {
+        let (state, emitter) = self
+            .shared_session_broker
+            .public_state_and_emitter(id)
+            .await?;
+        let (agent_type, connection_incarnation) = {
+            let state = state.read().await;
+            (state.agent_type, state.connection_incarnation.clone())
+        };
+        let (cmd_tx, cmd_rx, _cmd_liveness_rx) = connection_channel(128);
+        let (control_tx, control_rx, _control_liveness_rx) = connection_channel(32);
+        let terminal_shell = crate::acp::connection::test_placeholder_terminal_shell();
+        let route_plan = crate::acp::delegation::route::test_empty_route_plan();
+        let (spawn_config, observed_config) = matching_config_pair(
+            String::new(),
+            terminal_shell.selection_key.clone(),
+            route_plan.fingerprint.clone(),
+        );
+        self.connections.lock().await.insert(
+            id.to_string(),
+            AgentConnection {
+                id: id.to_string(),
+                agent_type,
+                status: ConnectionStatus::Connected,
+                owner_window_label: "shared-http-test".into(),
+                owner_operation_id: None,
+                ownership_generation: 0,
+                connection_incarnation,
+                tool_lease_registry: self.tool_lease_registry.clone(),
+                parent_connection_id: None,
+                cmd_tx,
+                control_tx,
+                task_abort: None,
+                state,
+                emitter,
+                prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
+                spawn_config,
+                observed_config,
+                terminal_shell,
+                route_plan,
+                origin: crate::acp::delegation::route::DelegationConnectionOrigin::Root,
+                route_preference: None,
+                route_capability:
+                    crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
+                child_pid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            },
+        );
+        Some((cmd_rx, control_rx))
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn emit_test_shared_driver_event(&self, id: &str, event: AcpEvent) -> bool {
+        let Some((state, emitter)) = self
+            .shared_session_broker
+            .public_state_and_emitter(id)
+            .await
+        else {
+            return false;
+        };
+        emit_with_state(&state, &emitter, event).await;
+        true
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn has_pending_test_shared_interaction(
+        &self,
+        id: &str,
+        interaction_id: &str,
+    ) -> bool {
+        self.shared_session_broker
+            .has_pending_interaction_for_test(id, interaction_id)
+            .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -10123,8 +10215,9 @@ mod tests {
     use super::*;
     use crate::acp::connection::{AgentConnection, RegisteredSpawnAttempt, SpawnHandshake};
     use crate::acp::delegation::route::{
-        resolve_route, DelegationRoutePolicy, DelegationRouteSource, RouteDegradedReason,
-        RouteResolutionInput, SuppressionCapability, ROUTE_ADAPTER_CONTRACT_VERSION,
+        resolve_route, DelegationRoutePlan, DelegationRoutePolicy, DelegationRouteSource,
+        RouteDegradedReason, RouteResolutionInput, SuppressionCapability,
+        ROUTE_ADAPTER_CONTRACT_VERSION,
     };
     use crate::acp::plan_approval::PlanApprovalDecision;
     use crate::acp::session_attach::SessionAttachMode;
@@ -10133,7 +10226,7 @@ mod tests {
         SharedInteractionRequest, SharedLaunchIdentity, SharedMutationGuard, SharedReserveRequest,
         SharedSessionKey, SharedSessionPhase,
     };
-    use crate::acp::terminal_context::AcpLaunchInputs;
+    use crate::acp::terminal_context::{AcpLaunchInputs, AcpRouteRequest};
     use crate::acp::types::ConnectionStatus;
     use crate::auto_title::{ConnectionLaunchContext, ConnectionPurpose};
     use crate::models::agent::BUILTIN_AGENT_TYPES;
@@ -10151,6 +10244,15 @@ mod tests {
         outcomes: StdMutex<VecDeque<tokio::sync::oneshot::Receiver<RouteBootstrapOutcome>>>,
         starts: AtomicUsize,
         start_log: Arc<StdMutex<Vec<String>>>,
+        route_log: Arc<StdMutex<Vec<RouteAttemptTrace>>>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct RouteAttemptTrace {
+        connection_id: String,
+        agent_type: AgentType,
+        effective: DelegationRoutePolicy,
+        source: DelegationRouteSource,
     }
 
     impl FakeSharedSpawnDriver {
@@ -10161,6 +10263,7 @@ mod tests {
                     outcomes: StdMutex::new(VecDeque::from([rx])),
                     starts: AtomicUsize::new(0),
                     start_log: Arc::new(StdMutex::new(Vec::new())),
+                    route_log: Arc::new(StdMutex::new(Vec::new())),
                 },
                 tx,
             )
@@ -10181,7 +10284,32 @@ mod tests {
                 outcomes: StdMutex::new(outcomes),
                 starts: AtomicUsize::new(0),
                 start_log: Arc::new(StdMutex::new(Vec::new())),
+                route_log: Arc::new(StdMutex::new(Vec::new())),
             }
+        }
+
+        fn gated_many(
+            count: usize,
+        ) -> (
+            Self,
+            Vec<tokio::sync::oneshot::Sender<RouteBootstrapOutcome>>,
+        ) {
+            let mut outcomes = VecDeque::new();
+            let mut gates = Vec::new();
+            for _ in 0..count {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                gates.push(tx);
+                outcomes.push_back(rx);
+            }
+            (
+                Self {
+                    outcomes: StdMutex::new(outcomes),
+                    starts: AtomicUsize::new(0),
+                    start_log: Arc::new(StdMutex::new(Vec::new())),
+                    route_log: Arc::new(StdMutex::new(Vec::new())),
+                },
+                gates,
+            )
         }
 
         fn fallback_sequence() -> (
@@ -10198,6 +10326,7 @@ mod tests {
                     outcomes: StdMutex::new(VecDeque::from([first_rx, second_rx])),
                     starts: AtomicUsize::new(0),
                     start_log: start_log.clone(),
+                    route_log: Arc::new(StdMutex::new(Vec::new())),
                 },
                 first_tx,
                 start_log,
@@ -10216,6 +10345,7 @@ mod tests {
                     outcomes: StdMutex::new(VecDeque::from([first_rx, second_rx])),
                     starts: AtomicUsize::new(0),
                     start_log: Arc::new(StdMutex::new(Vec::new())),
+                    route_log: Arc::new(StdMutex::new(Vec::new())),
                 },
                 first_tx,
                 second_tx,
@@ -10236,6 +10366,12 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(format!("start-{attempt}"));
+            self.route_log.lock().unwrap().push(RouteAttemptTrace {
+                connection_id: connection_id.clone(),
+                agent_type: launch.agent_type,
+                effective: launch.launch_inputs.route_plan.effective,
+                source: launch.launch_inputs.route_plan.source,
+            });
             let connection_incarnation = format!("fake-incarnation-{attempt}");
             let state = match existing_public_state {
                 Some(state) => {
@@ -10532,6 +10668,96 @@ mod tests {
             },
             agent_type,
             working_dir: None,
+            external_session_id: None,
+            launch_inputs,
+            emitter: EventEmitter::Noop,
+            preferred_mode_id: None,
+            preferred_config_values: BTreeMap::new(),
+            launch_context: ConnectionLaunchContext::default(),
+            session_attach_mode: crate::acp::session_attach::SessionAttachMode::Default,
+            device_id: "device-a".into(),
+            client_instance_id: client.into(),
+            request_id: format!("request-{client}"),
+            retry_failed_generation: None,
+        }
+    }
+
+    async fn registry_route_launch_for_agent(
+        conversation_id: i32,
+        client: &str,
+        agent_type: AgentType,
+        route_policy: DelegationRoutePolicy,
+        session_override: Option<DelegationRoutePolicy>,
+    ) -> SharedConnectLaunch {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let working_dir = format!("/tmp/shared-registry-{conversation_id}-{client}");
+        let folder_id = crate::db::test_helpers::seed_folder(&db, &working_dir).await;
+        let seeded_conversation = crate::commands::conversations::create_conversation_core(
+            &db.conn,
+            folder_id,
+            agent_type,
+            None,
+            session_override,
+        )
+        .await
+        .expect("seed route-aware conversation");
+        db.conn
+            .execute(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "UPDATE conversation SET id = ? WHERE id = ?",
+                [conversation_id.into(), seeded_conversation.into()],
+            ))
+            .await
+            .expect("persist exact route fixture conversation key");
+
+        let runtime_env = BTreeMap::new();
+        let mut route_capability = crate::acp::terminal_context::build_route_capability_snapshot(
+            agent_type,
+            None,
+            &runtime_env,
+        );
+        route_capability.companion_binary_available = true;
+        let runtime = crate::commands::delegation::DelegationRuntimeSnapshot {
+            enabled: true,
+            route_policy,
+            stalled_after_seconds: 300,
+        };
+        let route_plan = crate::acp::terminal_context::resolve_connect_route_with_capability(
+            &db.conn,
+            agent_type,
+            AcpRouteRequest::root(Some(conversation_id), None),
+            &runtime,
+            &route_capability,
+        )
+        .await
+        .expect("registry route fixture resolves");
+        let terminal_settings = SystemTerminalSettings::default();
+        let launch_inputs = AcpLaunchInputs {
+            runtime_env,
+            terminal_settings: terminal_settings.clone(),
+            route_plan: route_plan.clone(),
+            origin: crate::acp::delegation::route::DelegationConnectionOrigin::Root,
+            route_preference: session_override,
+            route_capability,
+        };
+        SharedConnectLaunch {
+            database: db.conn,
+            key: SharedSessionKey::Conversation(conversation_id),
+            conversation_id: Some(conversation_id),
+            folder_id: Some(folder_id),
+            launch_identity: SharedLaunchIdentity {
+                agent_type,
+                working_dir_fingerprint: crate::parsers::normalize_path_for_matching(&working_dir),
+                external_session_id: None,
+                attach_mode: crate::acp::session_attach::SessionAttachMode::Default,
+                route_fingerprint: route_plan.fingerprint.clone(),
+                terminal_shell_fingerprint: crate::terminal::shell::terminal_shell_selection_key(
+                    &terminal_settings,
+                ),
+                purpose: ConnectionPurpose::User,
+            },
+            agent_type,
+            working_dir: Some(working_dir),
             external_session_id: None,
             launch_inputs,
             emitter: EventEmitter::Noop,
@@ -11254,26 +11480,60 @@ mod tests {
         assert_eq!(agent_types.len(), BUILTIN_AGENT_TYPES.len() + 1);
         assert_eq!(agent_types.last(), Some(&custom));
         let expected_roots = agent_types.len();
-        let manager = ConnectionManager::new_with_shared_spawn_driver(Arc::new(
-            FakeSharedSpawnDriver::immediate_ready_many(expected_roots),
-        ));
+        let (driver, readiness_gates) = FakeSharedSpawnDriver::gated_many(expected_roots);
+        let driver = Arc::new(driver);
+        let manager = ConnectionManager::new_with_shared_spawn_driver(driver.clone());
         let mut connection_ids = std::collections::HashSet::new();
+        let mut required_companion_agents = Vec::new();
+        let mut standard_agents = Vec::new();
 
-        for (n, agent_type) in agent_types.into_iter().enumerate() {
-            let plan = crate::acp::delegation::route::test_empty_route_plan();
-            let response = manager
-                .connect_or_attach_shared(
-                    shared_launch_for_agent(
-                        1_000 + n as i32,
-                        9,
-                        &format!("agent-{n}"),
-                        agent_type,
-                        plan,
-                    )
-                    .await,
-                )
-                .await
-                .unwrap();
+        for (n, (agent_type, readiness_gate)) in
+            agent_types.iter().copied().zip(readiness_gates).enumerate()
+        {
+            let launch = registry_route_launch_for_agent(
+                1_000 + n as i32,
+                &format!("agent-{n}"),
+                agent_type,
+                DelegationRoutePolicy::Codeg,
+                None,
+            )
+            .await;
+            let plan = launch.launch_inputs.route_plan.clone();
+            if crate::acp::delegation::route::is_managed_agent(agent_type) {
+                assert_eq!(
+                    plan.effective,
+                    DelegationRoutePolicy::Codeg,
+                    "managed registry entries must exercise required-companion readiness"
+                );
+                assert_eq!(plan.source, DelegationRouteSource::GlobalDefault);
+                required_companion_agents.push(agent_type);
+            } else {
+                assert_eq!(plan.effective, DelegationRoutePolicy::Native);
+                assert_eq!(plan.source, DelegationRouteSource::GlobalDefault);
+                standard_agents.push(agent_type);
+            }
+            let response = manager.connect_or_attach_shared(launch).await.unwrap();
+            assert_eq!(response.phase, SharedSessionPhase::Bootstrapping);
+            assert_eq!(
+                manager
+                    .shared_session_broker
+                    .diagnostic_for_connection(&response.connection_id)
+                    .await
+                    .unwrap()
+                    .phase,
+                SharedSessionPhase::Bootstrapping,
+                "agent {agent_type:?} must not publish Ready before its route readiness"
+            );
+            assert_eq!(
+                driver.route_log.lock().unwrap().last(),
+                Some(&RouteAttemptTrace {
+                    connection_id: response.connection_id.clone(),
+                    agent_type,
+                    effective: plan.effective,
+                    source: plan.source,
+                })
+            );
+            readiness_gate.send(RouteBootstrapOutcome::Ready).unwrap();
             manager
                 .wait_for_shared_phase(
                     &response.connection_id,
@@ -11309,11 +11569,130 @@ mod tests {
                 }
             );
         }
+        assert_eq!(required_companion_agents.len(), 4);
+        assert_eq!(standard_agents.len(), expected_roots - 4);
         assert_eq!(connection_ids.len(), expected_roots);
         assert_eq!(manager.shared_spawn_count_for_test(), expected_roots);
         assert_eq!(
             manager.shared_registered_root_count_for_test(),
             expected_roots
+        );
+        assert_eq!(driver.route_log.lock().unwrap().len(), expected_roots);
+
+        let (fallback_driver, first_gate, _) = FakeSharedSpawnDriver::fallback_sequence();
+        let fallback_driver = Arc::new(fallback_driver);
+        let fallback_manager =
+            ConnectionManager::new_with_shared_spawn_driver(fallback_driver.clone());
+        let fallback_response = fallback_manager
+            .connect_or_attach_shared(
+                registry_route_launch_for_agent(
+                    2_000,
+                    "global-fallback",
+                    AgentType::Codex,
+                    DelegationRoutePolicy::Codeg,
+                    None,
+                )
+                .await,
+            )
+            .await
+            .unwrap();
+        first_gate
+            .send(RouteBootstrapOutcome::RouteSpecific(
+                RouteDegradedReason::CompanionInitializationFailed,
+            ))
+            .unwrap();
+        fallback_manager
+            .wait_for_shared_phase(
+                &fallback_response.connection_id,
+                fallback_response.generation,
+                SharedSessionPhase::Ready,
+            )
+            .await
+            .unwrap();
+        assert_eq!(fallback_manager.shared_spawn_count_for_test(), 2);
+        assert_eq!(
+            fallback_driver.route_log.lock().unwrap().as_slice(),
+            [
+                RouteAttemptTrace {
+                    connection_id: fallback_response.connection_id.clone(),
+                    agent_type: AgentType::Codex,
+                    effective: DelegationRoutePolicy::Codeg,
+                    source: DelegationRouteSource::GlobalDefault,
+                },
+                RouteAttemptTrace {
+                    connection_id: fallback_response.connection_id.clone(),
+                    agent_type: AgentType::Codex,
+                    effective: DelegationRoutePolicy::Native,
+                    source: DelegationRouteSource::SafeFallback,
+                },
+            ]
+        );
+        assert_eq!(
+            fallback_manager
+                .shared_fallback_trace
+                .lock()
+                .unwrap()
+                .as_slice(),
+            ["old_driver_absent", "replacement_start"]
+        );
+
+        let (override_driver, override_gate) = FakeSharedSpawnDriver::pending();
+        let override_driver = Arc::new(override_driver);
+        let override_manager =
+            ConnectionManager::new_with_shared_spawn_driver(override_driver.clone());
+        let override_response = override_manager
+            .connect_or_attach_shared(
+                registry_route_launch_for_agent(
+                    2_001,
+                    "session-override",
+                    AgentType::Codex,
+                    DelegationRoutePolicy::Native,
+                    Some(DelegationRoutePolicy::Codeg),
+                )
+                .await,
+            )
+            .await
+            .unwrap();
+        override_gate
+            .send(RouteBootstrapOutcome::RouteSpecific(
+                RouteDegradedReason::CompanionInitializationFailed,
+            ))
+            .unwrap();
+        let failed = SharedSessionPhase::Failed {
+            error_code: "companion_initialization_failed".into(),
+            cleanup_complete: true,
+        };
+        override_manager
+            .wait_for_shared_phase(
+                &override_response.connection_id,
+                override_response.generation,
+                failed.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(override_manager.shared_spawn_count_for_test(), 1);
+        assert_eq!(
+            override_driver.route_log.lock().unwrap().as_slice(),
+            [RouteAttemptTrace {
+                connection_id: override_response.connection_id.clone(),
+                agent_type: AgentType::Codex,
+                effective: DelegationRoutePolicy::Codeg,
+                source: DelegationRouteSource::SessionOverride,
+            }]
+        );
+        assert!(override_manager
+            .shared_fallback_trace
+            .lock()
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            override_manager
+                .shared_session_broker
+                .diagnostic_for_connection(&override_response.connection_id)
+                .await
+                .unwrap()
+                .phase,
+            failed
         );
         crate::acp::custom_registry::hydrate(&[]);
     }
@@ -21049,6 +21428,7 @@ mod tests {
                     attachment.generation,
                     turn_id,
                     &SharedRuntimeWorkSnapshot {
+                        event_seq: 0,
                         status: ConnectionStatus::Connected,
                         turn_in_flight: false,
                         pending_permission_id: None,
