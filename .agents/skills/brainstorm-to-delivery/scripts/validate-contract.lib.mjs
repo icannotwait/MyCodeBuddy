@@ -817,6 +817,11 @@ const TASK_COMPONENT_SUFFIX_TERMS = new Set([
   "testing",
   "validation",
 ])
+const TASK_COMPONENT_COMPOUND_MODIFIERS = new Set([
+  "code",
+  "integration",
+  "security",
+])
 const TASK_COMPONENT_ACTION_FORMS = new Set(["review", "test"])
 const TASK_COMPONENT_IMPERATIVE_PREFIX_TERMS = new Set(["please"])
 const TASK_COMPONENT_CONTINUATION_PREDICATES = new Set([
@@ -900,6 +905,12 @@ const AGENT_CHANGE_SUBJECT_BRIDGE_TERMS = new Set([
   "later",
   "now",
 ])
+const AGENT_IDENTITY_OBJECT_TERMS = new Set([
+  "identities",
+  "identity",
+  "profile",
+  "profiles",
+])
 const TASK_STATE_ANAPHOR_ADJUNCT_PREFIXES = [
   ["according", "to"],
   ["in", "fact"],
@@ -923,6 +934,12 @@ const TASK_STATE_OBJECT_PRONOUN_MODIFIERS = new Set([
   "even",
   "just",
   "only",
+])
+const EXPLICIT_NON_TASK_ANTECEDENT_MODIFIERS = new Set([
+  "different",
+  "distinct",
+  "separate",
+  "unrelated",
 ])
 const TASK_STATE_CARRIED_ADJUNCT_STARTS = new Set([
   "after",
@@ -967,6 +984,14 @@ const TASK_COMPLETION_SEQUENCE_TERMS = new Set([
   "no",
   "not",
   "only",
+])
+const TASK_COMPLETION_ADJUNCT_HEADS = new Set([
+  "ahead",
+  "today",
+  "tomorrow",
+  "under",
+  "without",
+  "yesterday",
 ])
 const ACTIVE_TIMING_MARKERS = new Set(["during", "inside", "while"])
 const BOUNDARY_TIMING_MARKERS = new Set([
@@ -3795,6 +3820,7 @@ function taskComponentOwner(clause, segmentStart, component) {
         (token) =>
           GENERIC_REVIEW_TARGET_PREFIX_TERMS.has(token) ||
           REVIEW_REQUIREMENT_ACTIONS.has(token) ||
+          TASK_COMPONENT_COMPOUND_MODIFIERS.has(token) ||
           new Set(["auxiliary", "primary", "s"]).has(token) ||
           token.endsWith("ed") ||
           token.endsWith("ly")
@@ -3838,6 +3864,42 @@ function adjunctFinalItHasNonTaskOwner(subjectPrefix, prefix) {
   return participialPredicate >= 0 && hasNonTaskOwner(participialPredicate)
 }
 
+function previousSegmentHasExplicitNonTaskAntecedent(clause, start) {
+  const boundary = tokenIndexes(
+    clause.tokens,
+    TASK_STATE_CLAUSE_BOUNDARIES,
+    0,
+    start
+  ).at(-1)
+  if (boundary === undefined) return false
+  const previousBoundary = tokenIndexes(
+    clause.tokens,
+    TASK_STATE_CLAUSE_BOUNDARIES,
+    0,
+    boundary
+  ).at(-1)
+  const segmentStart = (previousBoundary ?? -1) + 1
+  const modifier = tokenIndexes(
+    clause.tokens,
+    EXPLICIT_NON_TASK_ANTECEDENT_MODIFIERS,
+    segmentStart,
+    boundary
+  ).at(-1)
+  if (modifier === undefined) return false
+  const subjectHead = clause.tokens
+    .slice(modifier + 1, boundary)
+    .find(
+      (token) =>
+        !TASK_STATE_SUBJECT_DETERMINERS.has(token) &&
+        !TASK_STATE_MODIFIERS.has(token) &&
+        !token.endsWith("ly")
+    )
+  return (
+    subjectHead !== undefined &&
+    !new Set(["it", "itself", "task"]).has(subjectHead)
+  )
+}
+
 function stateSegmentHasExplicitNonTaskSubject(clause, start, end) {
   const predicate = tokenIndex(
     clause.tokens,
@@ -3859,7 +3921,8 @@ function stateSegmentHasExplicitNonTaskSubject(clause, start, end) {
     taskObject >= 0 &&
     clause.tokens
       .slice(predicate + 1, taskObject)
-      .every((token) => TASK_STATE_OBJECT_PRONOUN_MODIFIERS.has(token))
+      .every((token) => TASK_STATE_OBJECT_PRONOUN_MODIFIERS.has(token)) &&
+    !previousSegmentHasExplicitNonTaskAntecedent(clause, start)
   ) {
     return false
   }
@@ -3912,6 +3975,31 @@ function taskMentionIsNestedInNonTaskSubject(clause, task, state) {
         !TASK_STATE_MODIFIERS.has(token) &&
         !token.endsWith("ly")
     )
+  if (subjectHead === undefined && punctuationBoundary !== undefined) {
+    const parentheticalEnd = [...(clause.actionBoundaryAfter ?? [])].some(
+      (candidate) => candidate >= task.index && candidate < predicate
+    )
+    if (parentheticalEnd) {
+      const outerBoundary = tokenIndexes(
+        clause.tokens,
+        TASK_STATE_CLAUSE_BOUNDARIES,
+        0,
+        punctuationBoundary + 1
+      ).at(-1)
+      const outerSubject = clause.tokens
+        .slice((outerBoundary ?? -1) + 1, punctuationBoundary + 1)
+        .find(
+          (token) =>
+            !TASK_STATE_SUBJECT_DETERMINERS.has(token) &&
+            !TASK_STATE_MODIFIERS.has(token) &&
+            !token.endsWith("ly")
+        )
+      return (
+        outerSubject !== undefined &&
+        !new Set(["it", "itself", "task"]).has(outerSubject)
+      )
+    }
+  }
   return (
     subjectHead !== undefined &&
     !new Set(["it", "itself", "task"]).has(subjectHead)
@@ -4363,6 +4451,7 @@ function completionHasDirectObject(clause, completion) {
       "to",
       "until",
       "with",
+      ...TASK_COMPLETION_ADJUNCT_HEADS,
     ]).has(tail[head])
   ) {
     return false
@@ -4613,6 +4702,16 @@ function hasPreCompletionTaskTiming(clause) {
 
 function changeHasExplicitNonAgentObject(clause, change) {
   const segment = actionSegment(clause, change)
+  if (
+    tokenIndex(
+      clause.tokens,
+      AGENT_IDENTITY_OBJECT_TERMS,
+      change + 1,
+      segment.end
+    ) >= 0
+  ) {
+    return false
+  }
   const tailActors = clause.actors.filter(
     (actor) => actor.start > change && actor.end <= segment.end
   )

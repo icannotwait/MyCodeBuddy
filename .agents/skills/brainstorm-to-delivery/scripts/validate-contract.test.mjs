@@ -4775,6 +4775,138 @@ describe("Skill contract v2", () => {
     ])
   })
 
+  it("round-18 keeps qualified possessive components with their direct owner", () => {
+    assertSkillClassifications([
+      ...["security review", "code review", "integration test"].map(
+        (component) => ({
+          prose: `The active Task is completed but the server's ${component} is still running. Then switch the Task Agent.`,
+          reject: false,
+        })
+      ),
+      ...["security review", "code review", "integration test"].map(
+        (component) => ({
+          prose: `The active Task is completed but the Task's ${component} is still running. Then switch the Task Agent.`,
+          reject: true,
+        })
+      ),
+    ])
+  })
+
+  it("round-18 distinguishes completion adjuncts from direct objects", () => {
+    assertSkillClassifications([
+      ...[
+        "without issues",
+        "without errors",
+        "yesterday",
+        "ahead of schedule",
+        "under budget",
+      ].map((adjunct) => ({
+        prose: `The active Task is partially complete and later completed ${adjunct}. Then switch the Task Agent.`,
+        reject: false,
+      })),
+      {
+        prose:
+          "The active Task is partially complete and later completed documentation. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The active Task is partially complete and afterward completed the migration. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The active Task is completed and afterward resumes running. Then switch the Task Agent.",
+        reject: true,
+      },
+    ])
+  })
+
+  it("round-18 keeps Agent identity and profile changes inside the active boundary", () => {
+    assertSkillClassifications([
+      ...[
+        "will switch identities immediately",
+        "will switch profiles immediately",
+        "will change its selected profile immediately",
+      ].map((action) => ({
+        prose: `The active Task is running. The Task Agent ${action}.`,
+        reject: true,
+      })),
+      ...[
+        "will switch branches immediately",
+        "can change directories",
+        "should replace a file",
+        "may switch the logging mode",
+      ].map((action) => ({
+        prose: `The active Task is running. The Task Agent ${action}.`,
+        reject: false,
+      })),
+      {
+        prose: "The active Task is running. Switch the Task Agent immediately.",
+        reject: true,
+      },
+      {
+        prose:
+          "The active Task is running. The Task Agent will switch immediately.",
+        reject: true,
+      },
+    ])
+  })
+
+  it("round-18 resolves a restart object to an explicit non-Task antecedent", () => {
+    assertSkillClassifications([
+      {
+        prose:
+          "The Task is completed but a separate service fails and the server restarts it and it is still running. Then switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The Task is completed but the server restarts it and it is still running. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The Task is completed but the server restarts and it is still running. Then switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The Task is completed but the server restarts itself and it is still running. Then switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The Task is completed but the server restarts after it receives a signal and it is still running. Then switch the Task Agent.",
+        reject: false,
+      },
+    ])
+  })
+
+  it("round-18 retains the outer subject of a parenthetical Task object", () => {
+    assertSkillClassifications([
+      {
+        prose:
+          "The active Task is completed but the server, monitoring the Task, restarts and it is still running. Then switch the Task Agent.",
+        reject: false,
+      },
+      ...["monitoring", "testing"].map((activity) => ({
+        prose: `The active Task is completed but, with ${activity} complete, the Task restarts. Then switch the Task Agent.`,
+        reject: true,
+      })),
+      {
+        prose:
+          "The active Task is completed but, with monitoring complete, the server restarts. Then switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The active Task is completed but, with testing complete, the server restarts and it is still running. Then switch the Task Agent.",
+        reject: false,
+      },
+    ])
+  })
+
   it("contains the complete operational policy and document JSON shapes", () => {
     const policy = fencedJsonAfterHeading(
       realSkill,
