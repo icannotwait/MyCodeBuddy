@@ -13,7 +13,8 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
-use tokio::sync::{watch, Mutex, RwLock};
+use sha2::{Digest, Sha256};
+use tokio::sync::{watch, Mutex, Notify, RwLock};
 
 use crate::{
     acp::session_state::SessionState,
@@ -21,6 +22,43 @@ use crate::{
 };
 
 use error::validate_failure_code;
+
+pub(crate) struct SharedPromptAdmission {
+    pub queue_item_id: String,
+    pub events: Vec<crate::acp::types::AcpEvent>,
+    pub notify: Arc<Notify>,
+}
+
+pub(crate) struct SharedPromptMutation {
+    pub events: Vec<crate::acp::types::AcpEvent>,
+    pub notify: Arc<Notify>,
+}
+
+pub(crate) enum DispatchHeadDecision {
+    Blocked,
+    Failed(FailedSharedPrompt),
+    Claimed(ClaimedSharedPrompt),
+}
+
+pub(crate) struct FailedSharedPrompt {
+    pub events: Vec<crate::acp::types::AcpEvent>,
+    pub notify: Arc<Notify>,
+}
+
+pub(crate) struct ClaimedSharedPrompt {
+    pub blocks: Vec<crate::acp::types::PromptInputBlock>,
+    pub folder_id: Option<i32>,
+    pub conversation_id: Option<i32>,
+    pub client_message_id: String,
+    pub capture: Option<crate::auto_title::PromptCaptureContext>,
+    pub events: Vec<crate::acp::types::AcpEvent>,
+}
+
+pub(crate) struct SharedRuntimeSubscription {
+    pub notify: Arc<Notify>,
+    pub lifecycle: watch::Receiver<SharedLifecycleState>,
+    pub registration: watch::Receiver<SharedRegistrationState>,
+}
 
 #[derive(Clone)]
 pub struct SharedSessionBroker {
@@ -62,6 +100,652 @@ impl Default for SharedSessionBroker {
 impl SharedSessionBroker {
     pub fn metrics(&self) -> &SharedSessionMetrics {
         &self.metrics
+    }
+
+    pub(crate) async fn enqueue_prompt(
+        &self,
+        request: SharedPromptRequest,
+    ) -> Result<SharedPromptAdmission, SharedSessionError> {
+        validate_prompt_request(&request)?;
+        let canonical =
+            canonical_prompt_bytes(&request).map_err(|_| SharedSessionError::SessionUnavailable)?;
+        let payload_hash: [u8; 32] = Sha256::digest(&canonical).into();
+        let identity = PromptIdentity {
+            generation: request.guard.generation,
+            client_instance_id: request.client_instance_id.clone(),
+            client_request_id: request.client_request_id.clone(),
+        };
+        let waiting_bytes = canonical.len();
+        let mut request = Some(request);
+        let connection_id = request
+            .as_ref()
+            .expect("request available")
+            .guard
+            .connection_id
+            .clone();
+
+        let result = self
+            .with_authoritative_record(&connection_id, |record| {
+                let request_ref = request.as_ref().expect("request available");
+                self.validate_prompt_guard(record, &request_ref.guard)?;
+                if !matches!(
+                    record.phase,
+                    SharedSessionPhase::Bootstrapping | SharedSessionPhase::Ready
+                ) {
+                    return Err(SharedSessionError::SessionUnavailable);
+                }
+
+                if let Some(entry) = record.prompt_ledger.get(&identity) {
+                    if entry.payload_hash != payload_hash {
+                        return Err(SharedSessionError::IdempotencyKeyConflict);
+                    }
+                    return Ok(SharedPromptAdmission {
+                        queue_item_id: entry.queue_item_id.clone(),
+                        events: Vec::new(),
+                        notify: record.notify.clone(),
+                    });
+                }
+                if record.prompt_ledger.len() >= self.limits.max_prompt_ledger_entries {
+                    return Err(SharedSessionError::PromptLedgerCapacityExceeded);
+                }
+                if record.waiting_prompts.len() >= self.limits.max_waiting_prompts
+                    || record
+                        .waiting_bytes
+                        .checked_add(waiting_bytes)
+                        .is_none_or(|bytes| bytes > self.limits.max_waiting_bytes)
+                {
+                    return Err(SharedSessionError::PromptQueueFull);
+                }
+
+                let request = request.take().expect("new admission consumes request");
+                let queue_item_id = uuid::Uuid::new_v4().to_string();
+                let enqueue_seq = record.next_enqueue_seq;
+                record.next_enqueue_seq = record
+                    .next_enqueue_seq
+                    .checked_add(1)
+                    .ok_or(SharedSessionError::SessionUnavailable)?;
+                let summary = SharedQueuedPromptSummary::from_prompt(
+                    queue_item_id.clone(),
+                    enqueue_seq,
+                    request.client_message_id.clone(),
+                    &request.blocks,
+                    request.capture.as_ref(),
+                    request.submitted_at,
+                    SharedQueuedPromptState::Queued,
+                );
+                record.prompt_ledger.insert(
+                    identity.clone(),
+                    PromptLedgerEntry {
+                        payload_hash,
+                        queue_item_id: queue_item_id.clone(),
+                        enqueue_seq,
+                        state: InternalPromptState::Queued,
+                        frozen_result: None,
+                    },
+                );
+                record.waiting_bytes += waiting_bytes;
+                record.waiting_prompts.push_back(QueuedPromptRecord {
+                    identity: identity.clone(),
+                    summary: summary.clone(),
+                    blocks: request.blocks,
+                    folder_id: request.folder_id,
+                    conversation_id: request.conversation_id,
+                    client_message_id: request.client_message_id,
+                    capture: request.capture,
+                    waiting_bytes,
+                });
+                let events = vec![
+                    crate::acp::types::AcpEvent::PromptQueued {
+                        generation: record.generation,
+                        item: summary,
+                    },
+                    queue_depth_event(record),
+                ];
+                Ok(SharedPromptAdmission {
+                    queue_item_id,
+                    events,
+                    notify: record.notify.clone(),
+                })
+            })
+            .await?
+            .ok_or(SharedSessionError::SessionUnavailable);
+        if result
+            .as_ref()
+            .is_err_and(SharedSessionError::is_capacity_error)
+        {
+            self.metrics.record_capacity_rejection();
+        }
+        result
+    }
+
+    pub(crate) async fn finalize_enqueue_response(
+        &self,
+        connection_id: &str,
+        generation: u64,
+        queue_item_id: &str,
+    ) -> Result<PromptEnqueueResult, SharedSessionError> {
+        self.with_authoritative_record(connection_id, |record| {
+            if record.generation != generation {
+                return Err(SharedSessionError::GenerationStale);
+            }
+            let entry = record
+                .prompt_ledger
+                .values_mut()
+                .find(|entry| entry.queue_item_id == queue_item_id)
+                .ok_or(SharedSessionError::QueueItemNotFound)?;
+            if let Some(result) = entry.frozen_result.as_ref() {
+                return Ok(result.clone());
+            }
+            let state = if entry.state == InternalPromptState::Queued {
+                SharedQueuedPromptState::Queued
+            } else {
+                SharedQueuedPromptState::Dispatching
+            };
+            let result = PromptEnqueueResult {
+                queue_item_id: entry.queue_item_id.clone(),
+                enqueue_seq: entry.enqueue_seq,
+                state,
+            };
+            entry.frozen_result = Some(result.clone());
+            Ok(result)
+        })
+        .await?
+        .ok_or(SharedSessionError::SessionUnavailable)
+    }
+
+    pub(crate) async fn cancel_queued_prompt(
+        &self,
+        guard: &SharedMutationGuard,
+        queue_item_id: &str,
+    ) -> Result<SharedPromptMutation, SharedSessionError> {
+        self.with_authoritative_record(&guard.connection_id, |record| {
+            self.validate_prompt_guard(record, guard)?;
+            let identity = record
+                .prompt_ledger
+                .iter()
+                .find_map(|(identity, entry)| {
+                    (entry.queue_item_id == queue_item_id).then(|| identity.clone())
+                })
+                .ok_or(SharedSessionError::QueueItemNotFound)?;
+            let (state, response_froze_as_dispatching) = record
+                .prompt_ledger
+                .get(&identity)
+                .map(|entry| {
+                    (
+                        entry.state,
+                        entry.frozen_result.as_ref().is_some_and(|result| {
+                            result.state == SharedQueuedPromptState::Dispatching
+                        }),
+                    )
+                })
+                .ok_or(SharedSessionError::QueueItemNotFound)?;
+            if state == InternalPromptState::Dispatching
+                || response_froze_as_dispatching
+                || record
+                    .active_turn
+                    .as_ref()
+                    .is_some_and(|active| active.projection.queue_item_id == queue_item_id)
+            {
+                return Err(SharedSessionError::QueueItemAlreadyDispatching);
+            }
+            if state != InternalPromptState::Queued {
+                return Err(SharedSessionError::QueueItemNotFound);
+            }
+            let position = record
+                .waiting_prompts
+                .iter()
+                .position(|queued| queued.summary.queue_item_id == queue_item_id)
+                .ok_or(SharedSessionError::QueueItemNotFound)?;
+            let queued = record
+                .waiting_prompts
+                .remove(position)
+                .ok_or(SharedSessionError::QueueItemNotFound)?;
+            record.waiting_bytes = record
+                .waiting_bytes
+                .checked_sub(queued.waiting_bytes)
+                .expect("queued prompt bytes are included in waiting total");
+            record
+                .prompt_ledger
+                .get_mut(&identity)
+                .expect("queued item has ledger entry")
+                .state = InternalPromptState::Cancelled;
+            Ok(SharedPromptMutation {
+                events: vec![
+                    crate::acp::types::AcpEvent::PromptQueueItemCancelled {
+                        generation: record.generation,
+                        queue_item_id: queue_item_id.to_string(),
+                    },
+                    queue_depth_event(record),
+                ],
+                notify: record.notify.clone(),
+            })
+        })
+        .await?
+        .ok_or(SharedSessionError::SessionUnavailable)
+    }
+
+    pub(crate) async fn claim_dispatchable_head(
+        &self,
+        connection_id: &str,
+        generation: u64,
+        turn_id: &str,
+        snapshot: &SharedRuntimeWorkSnapshot,
+    ) -> Result<DispatchHeadDecision, SharedSessionError> {
+        self.with_authoritative_record(connection_id, |record| {
+            if record.generation != generation {
+                return Err(SharedSessionError::GenerationStale);
+            }
+            if record.phase != SharedSessionPhase::Ready
+                || snapshot.status != crate::acp::types::ConnectionStatus::Connected
+                || snapshot.turn_in_flight
+                || record.active_turn.is_some()
+                || record.pending_interaction.is_some()
+                || snapshot.pending_permission_id.is_some()
+                || snapshot.pending_question_id.is_some()
+                || snapshot.pending_plan_approval_id.is_some()
+                || snapshot.continuation_wait
+                || snapshot.active_delegations != 0
+                || snapshot.background_outstanding != 0
+                || record.waiting_prompts.is_empty()
+            {
+                return Ok(DispatchHeadDecision::Blocked);
+            }
+
+            let queued = record
+                .waiting_prompts
+                .pop_front()
+                .expect("non-empty queue has head");
+            record.waiting_bytes = record
+                .waiting_bytes
+                .checked_sub(queued.waiting_bytes)
+                .expect("FIFO head bytes are included in waiting total");
+            if !snapshot.conversation_writable {
+                record
+                    .prompt_ledger
+                    .get_mut(&queued.identity)
+                    .expect("queued item has ledger entry")
+                    .state = InternalPromptState::Failed;
+                return Ok(DispatchHeadDecision::Failed(FailedSharedPrompt {
+                    events: vec![
+                        crate::acp::types::AcpEvent::PromptQueueItemFailed {
+                            generation,
+                            queue_item_id: queued.summary.queue_item_id,
+                            error_code: "workflow_v2_retired".into(),
+                        },
+                        queue_depth_event(record),
+                    ],
+                    notify: record.notify.clone(),
+                }));
+            }
+
+            record
+                .prompt_ledger
+                .get_mut(&queued.identity)
+                .expect("queued item has ledger entry")
+                .state = InternalPromptState::Dispatching;
+            let projection = SharedActiveTurnProjection {
+                turn_id: turn_id.to_string(),
+                queue_item_id: queued.summary.queue_item_id.clone(),
+                enqueue_seq: queued.summary.enqueue_seq,
+                client_message_id: queued.client_message_id.clone(),
+                stop_requested: false,
+            };
+            record.active_turn = Some(BrokerActiveTurn {
+                identity: queued.identity,
+                projection: projection.clone(),
+            });
+            Ok(DispatchHeadDecision::Claimed(ClaimedSharedPrompt {
+                blocks: queued.blocks,
+                folder_id: queued.folder_id,
+                conversation_id: queued.conversation_id,
+                client_message_id: queued.client_message_id,
+                capture: queued.capture,
+                events: vec![
+                    crate::acp::types::AcpEvent::PromptDispatchStarted {
+                        generation,
+                        turn: projection,
+                    },
+                    queue_depth_event(record),
+                ],
+            }))
+        })
+        .await?
+        .ok_or(SharedSessionError::SessionUnavailable)
+    }
+
+    pub(crate) async fn fail_claimed_item(
+        &self,
+        connection_id: &str,
+        generation: u64,
+        turn_id: &str,
+        error_code: &'static str,
+    ) -> Result<FailedSharedPrompt, SharedSessionError> {
+        self.with_authoritative_record(connection_id, |record| {
+            if record.generation != generation {
+                return Err(SharedSessionError::GenerationStale);
+            }
+            let active = record
+                .active_turn
+                .as_ref()
+                .filter(|active| active.projection.turn_id == turn_id)
+                .ok_or(SharedSessionError::StaleTurn)?;
+            let identity = active.identity.clone();
+            let queue_item_id = active.projection.queue_item_id.clone();
+            record
+                .prompt_ledger
+                .get_mut(&identity)
+                .expect("active turn has ledger entry")
+                .state = InternalPromptState::Failed;
+            record.active_turn = None;
+            Ok(FailedSharedPrompt {
+                events: vec![
+                    crate::acp::types::AcpEvent::PromptQueueItemFailed {
+                        generation,
+                        queue_item_id,
+                        error_code: error_code.to_string(),
+                    },
+                    crate::acp::types::AcpEvent::SharedTurnSettled {
+                        generation,
+                        turn_id: turn_id.to_string(),
+                        outcome: SharedTurnOutcome::Failed,
+                    },
+                ],
+                notify: record.notify.clone(),
+            })
+        })
+        .await?
+        .ok_or(SharedSessionError::SessionUnavailable)
+    }
+
+    pub(crate) async fn settle_active_turn(
+        &self,
+        connection_id: &str,
+        generation: u64,
+        driver_incarnation: &str,
+        stop_reason: &str,
+    ) -> Result<Vec<crate::acp::types::AcpEvent>, SharedSessionError> {
+        self.with_authoritative_record(connection_id, |record| {
+            if record.generation != generation
+                || record.driver_incarnation.as_deref() != Some(driver_incarnation)
+            {
+                return Ok(Vec::new());
+            }
+            let Some(active) = record.active_turn.take() else {
+                return Ok(Vec::new());
+            };
+            let outcome = if active.projection.stop_requested {
+                SharedTurnOutcome::Cancelled
+            } else if stop_reason == "end_turn" {
+                SharedTurnOutcome::Completed
+            } else {
+                SharedTurnOutcome::Failed
+            };
+            let state = match outcome {
+                SharedTurnOutcome::Completed => InternalPromptState::Completed,
+                SharedTurnOutcome::Cancelled => InternalPromptState::Cancelled,
+                SharedTurnOutcome::Failed => InternalPromptState::Failed,
+            };
+            record
+                .prompt_ledger
+                .get_mut(&active.identity)
+                .expect("active turn has ledger entry")
+                .state = state;
+            record.notify.notify_one();
+            Ok(vec![crate::acp::types::AcpEvent::SharedTurnSettled {
+                generation,
+                turn_id: active.projection.turn_id,
+                outcome,
+            }])
+        })
+        .await?
+        .ok_or(SharedSessionError::SessionUnavailable)
+    }
+
+    pub(crate) async fn fail_live_session(
+        &self,
+        connection_id: &str,
+        generation: u64,
+        driver_incarnation: &str,
+        error_code: &'static str,
+    ) -> Result<Vec<crate::acp::types::AcpEvent>, SharedSessionError> {
+        self.with_authoritative_record(connection_id, |record| {
+            if record.generation != generation
+                || record.driver_incarnation.as_deref() != Some(driver_incarnation)
+            {
+                return Ok(Vec::new());
+            }
+            if record.phase != SharedSessionPhase::Ready {
+                return Ok(Vec::new());
+            }
+            Ok(fail_live_session_record(record, error_code))
+        })
+        .await?
+        .ok_or(SharedSessionError::SessionUnavailable)
+    }
+
+    pub(crate) async fn observe_interaction(
+        &self,
+        connection_id: &str,
+        generation: u64,
+        driver_incarnation: &str,
+        kind: SharedInteractionKind,
+        interaction_id: &str,
+    ) -> Result<Vec<crate::acp::types::AcpEvent>, SharedSessionError> {
+        self.with_authoritative_record(connection_id, |record| {
+            if record.generation != generation
+                || record.driver_incarnation.as_deref() != Some(driver_incarnation)
+            {
+                return Err(SharedSessionError::GenerationStale);
+            }
+            record.pending_interaction = Some(SharedInteraction {
+                kind,
+                id: interaction_id.to_string(),
+            });
+            record.notify.notify_one();
+            Ok(Vec::new())
+        })
+        .await?
+        .ok_or(SharedSessionError::SessionUnavailable)
+    }
+
+    pub(crate) async fn observe_interaction_resolved(
+        &self,
+        connection_id: &str,
+        generation: u64,
+        driver_incarnation: &str,
+        interaction_id: &str,
+    ) -> Result<Vec<crate::acp::types::AcpEvent>, SharedSessionError> {
+        self.with_authoritative_record(connection_id, |record| {
+            if record.generation != generation
+                || record.driver_incarnation.as_deref() != Some(driver_incarnation)
+            {
+                return Err(SharedSessionError::GenerationStale);
+            }
+            if record
+                .pending_interaction
+                .as_ref()
+                .is_some_and(|interaction| interaction.id == interaction_id)
+            {
+                record.pending_interaction = None;
+            }
+            record.notify.notify_one();
+            Ok(Vec::new())
+        })
+        .await?
+        .ok_or(SharedSessionError::SessionUnavailable)
+    }
+
+    pub(crate) async fn reconcile_runtime_snapshot(
+        &self,
+        connection_id: &str,
+        generation: u64,
+        driver_incarnation: &str,
+        snapshot: &SharedRuntimeWorkSnapshot,
+    ) -> Result<Vec<crate::acp::types::AcpEvent>, SharedSessionError> {
+        self.with_authoritative_record(connection_id, |record| {
+            if record.generation != generation
+                || record.driver_incarnation.as_deref() != Some(driver_incarnation)
+            {
+                return Err(SharedSessionError::GenerationStale);
+            }
+            let reconciled = snapshot
+                .pending_permission_id
+                .as_ref()
+                .map(|id| SharedInteraction {
+                    kind: SharedInteractionKind::Permission,
+                    id: id.clone(),
+                })
+                .or_else(|| {
+                    snapshot
+                        .pending_question_id
+                        .as_ref()
+                        .map(|id| SharedInteraction {
+                            kind: SharedInteractionKind::Question,
+                            id: id.clone(),
+                        })
+                })
+                .or_else(|| {
+                    snapshot
+                        .pending_plan_approval_id
+                        .as_ref()
+                        .map(|id| SharedInteraction {
+                            kind: SharedInteractionKind::PlanApproval,
+                            id: id.clone(),
+                        })
+                });
+            let unchanged = match (&record.pending_interaction, &reconciled) {
+                (Some(current), Some(next)) => current.kind == next.kind && current.id == next.id,
+                (None, None) => true,
+                _ => false,
+            };
+            if !unchanged {
+                record.pending_interaction = reconciled;
+            }
+            if matches!(
+                snapshot.status,
+                crate::acp::types::ConnectionStatus::Disconnected
+                    | crate::acp::types::ConnectionStatus::Error
+            ) && record.phase == SharedSessionPhase::Ready
+            {
+                return Ok(fail_live_session_record(record, "session_unavailable"));
+            }
+            Ok(Vec::new())
+        })
+        .await?
+        .ok_or(SharedSessionError::SessionUnavailable)
+    }
+
+    pub(crate) async fn runtime_subscription(
+        &self,
+        connection_id: &str,
+        generation: u64,
+    ) -> Result<SharedRuntimeSubscription, SharedSessionError> {
+        self.with_authoritative_record(connection_id, |record| {
+            if record.generation != generation {
+                return Err(SharedSessionError::GenerationStale);
+            }
+            Ok(SharedRuntimeSubscription {
+                notify: record.notify.clone(),
+                lifecycle: record.lifecycle_tx.subscribe(),
+                registration: record.registration_tx.subscribe(),
+            })
+        })
+        .await?
+        .ok_or(SharedSessionError::SessionUnavailable)
+    }
+
+    pub(crate) async fn generation_for_connection(&self, connection_id: &str) -> Option<u64> {
+        self.with_authoritative_record(connection_id, |record| Ok(record.generation))
+            .await
+            .ok()
+            .flatten()
+    }
+
+    pub(crate) async fn notify_dispatcher(
+        &self,
+        connection_id: &str,
+        generation: u64,
+    ) -> Result<(), SharedSessionError> {
+        let notify = self
+            .with_authoritative_record(connection_id, |record| {
+                if record.generation != generation {
+                    return Err(SharedSessionError::GenerationStale);
+                }
+                Ok(record.notify.clone())
+            })
+            .await?
+            .ok_or(SharedSessionError::SessionUnavailable)?;
+        notify.notify_one();
+        Ok(())
+    }
+
+    pub async fn bind_conversation_key(
+        &self,
+        connection_id: &str,
+        generation: u64,
+        conversation_id: i32,
+    ) -> Result<(), SharedSessionError> {
+        let destination_key = SharedSessionKey::Conversation(conversation_id);
+        loop {
+            let mut index = self.index.lock().await;
+            let Some(source_key) = index.by_connection.get(connection_id).cloned() else {
+                return Err(SharedSessionError::SessionUnavailable);
+            };
+            let Some(source) = index.sessions.get(&source_key).cloned() else {
+                return Err(SharedSessionError::SessionUnavailable);
+            };
+            let Ok(source_record) = source.try_lock() else {
+                drop(index);
+                tokio::task::yield_now().await;
+                continue;
+            };
+            if source_record.generation != generation
+                || source_record.connection_id != connection_id
+            {
+                return Err(SharedSessionError::GenerationStale);
+            }
+            if source_key == destination_key {
+                return Ok(());
+            }
+
+            if let Some(destination) = index.sessions.get(&destination_key).cloned() {
+                if !Arc::ptr_eq(&source, &destination) {
+                    let Ok(destination_record) = destination.try_lock() else {
+                        drop(source_record);
+                        drop(index);
+                        tokio::task::yield_now().await;
+                        continue;
+                    };
+                    if matches!(
+                        destination_record.phase,
+                        SharedSessionPhase::Reserved
+                            | SharedSessionPhase::Bootstrapping
+                            | SharedSessionPhase::Ready
+                    ) {
+                        return Err(SharedSessionError::ConversationKeyConflict);
+                    }
+                    destination_record
+                        .lifecycle_tx
+                        .send_replace(SharedLifecycleState::Replaced);
+                    destination_record.notify.notify_waiters();
+                    index
+                        .by_connection
+                        .remove(&destination_record.connection_id);
+                }
+            }
+
+            index.sessions.remove(&source_key);
+            index
+                .sessions
+                .insert(destination_key.clone(), source.clone());
+            index
+                .by_connection
+                .insert(connection_id.to_string(), destination_key);
+            source_record.notify.notify_waiters();
+            self.index_epoch
+                .send_modify(|epoch| *epoch = epoch.saturating_add(1));
+            return Ok(());
+        }
     }
 
     /// Validate a mutation guard against the current generation and lease.
@@ -383,6 +1067,24 @@ impl SharedSessionBroker {
             limits: BrokerLimits {
                 max_active_leases,
                 max_connect_ledger_entries,
+                ..BrokerLimits::default()
+            },
+            ..Self::default()
+        }
+    }
+
+    #[cfg(test)]
+    fn with_prompt_limits_for_test(
+        max_prompt_ledger_entries: usize,
+        max_waiting_prompts: usize,
+        max_waiting_bytes: usize,
+    ) -> Self {
+        Self {
+            limits: BrokerLimits {
+                max_prompt_ledger_entries,
+                max_waiting_prompts,
+                max_waiting_bytes,
+                ..BrokerLimits::default()
             },
             ..Self::default()
         }
@@ -516,18 +1218,19 @@ impl SharedSessionBroker {
             if let Some(state) = state {
                 update_public_shared_phase(state, generation, phase.clone());
             }
+            let mut events = fail_all_prompt_work(record, &error_code);
             record.cleanup_complete = cleanup_complete;
             record.phase = phase;
             record.publish_registration();
             record
                 .lifecycle_tx
                 .send_replace(SharedLifecycleState::Failed);
-            Ok(vec![
-                crate::acp::types::AcpEvent::SharedSessionPhaseChanged {
-                    generation,
-                    phase: record.phase.clone(),
-                },
-            ])
+            record.notify.notify_waiters();
+            events.push(crate::acp::types::AcpEvent::SharedSessionPhaseChanged {
+                generation,
+                phase: record.phase.clone(),
+            });
+            Ok(events)
         })
         .await?
         .ok_or(SharedSessionError::SessionUnavailable)
@@ -589,8 +1292,15 @@ impl SharedSessionBroker {
             Ok(SharedSessionProjection {
                 generation: record.generation,
                 phase: record.phase.clone(),
-                queue: Vec::new(),
-                active_turn: None,
+                queue: record
+                    .waiting_prompts
+                    .iter()
+                    .map(|queued| queued.summary.clone())
+                    .collect(),
+                active_turn: record
+                    .active_turn
+                    .as_ref()
+                    .map(|active| active.projection.clone()),
                 lease_expires_at: None,
                 expired_lease_tombstone_count: record.expired_leases.len(),
             })
@@ -887,14 +1597,13 @@ impl SharedSessionBroker {
                 record
                     .lifecycle_tx
                     .send_replace(SharedLifecycleState::Failed);
-                Ok((
-                    state,
-                    emitter,
-                    vec![crate::acp::types::AcpEvent::SharedSessionPhaseChanged {
-                        generation,
-                        phase: record.phase.clone(),
-                    }],
-                ))
+                record.notify.notify_waiters();
+                let mut events = fail_all_prompt_work(record, &error_code);
+                events.push(crate::acp::types::AcpEvent::SharedSessionPhaseChanged {
+                    generation,
+                    phase: record.phase.clone(),
+                });
+                Ok((state, emitter, events))
             },
         )
         .await?
@@ -962,14 +1671,13 @@ impl SharedSessionBroker {
                 record
                     .lifecycle_tx
                     .send_replace(SharedLifecycleState::Failed);
-                Ok((
-                    state,
-                    emitter,
-                    vec![crate::acp::types::AcpEvent::SharedSessionPhaseChanged {
-                        generation: permit.generation,
-                        phase: record.phase.clone(),
-                    }],
-                ))
+                record.notify.notify_waiters();
+                let mut events = fail_all_prompt_work(record, &error_code);
+                events.push(crate::acp::types::AcpEvent::SharedSessionPhaseChanged {
+                    generation: permit.generation,
+                    phase: record.phase.clone(),
+                });
+                Ok((state, emitter, events))
             },
         )
         .await?
@@ -1092,6 +1800,67 @@ impl SharedSessionBroker {
         }
     }
 
+    fn validate_prompt_guard(
+        &self,
+        record: &mut SharedSessionRecord,
+        guard: &SharedMutationGuard,
+    ) -> Result<(), SharedSessionError> {
+        if record.connection_id != guard.connection_id || record.generation != guard.generation {
+            return Err(SharedSessionError::GenerationStale);
+        }
+        let expired = record.prune_expired_leases(tokio::time::Instant::now());
+        self.metrics.remove_active_leases(expired.len());
+        self.metrics.record_lease_expired(expired.len());
+        if record
+            .active_leases
+            .values()
+            .any(|lease| lease.lease_id == guard.lease_id)
+        {
+            return Ok(());
+        }
+        if record
+            .expired_leases
+            .iter()
+            .any(|expired_id| expired_id == &guard.lease_id)
+        {
+            Err(SharedSessionError::LeaseExpired)
+        } else {
+            Err(SharedSessionError::LeaseMissing)
+        }
+    }
+
+    #[cfg(test)]
+    async fn prompt_state_for_test(
+        &self,
+        connection_id: &str,
+        queue_item_id: &str,
+    ) -> Option<InternalPromptState> {
+        self.with_authoritative_record(connection_id, |record| {
+            Ok(record
+                .prompt_ledger
+                .values()
+                .find(|entry| entry.queue_item_id == queue_item_id)
+                .map(|entry| entry.state))
+        })
+        .await
+        .ok()
+        .flatten()
+        .flatten()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn key_for_connection_for_test(
+        &self,
+        connection_id: &str,
+    ) -> Option<SharedSessionKey> {
+        self.index
+            .lock()
+            .await
+            .by_connection
+            .get(connection_id)
+            .cloned()
+    }
+
     async fn with_authoritative_record_and_state<T>(
         &self,
         connection_id: &str,
@@ -1192,6 +1961,7 @@ impl SharedSessionBroker {
         current
             .lifecycle_tx
             .send_replace(SharedLifecycleState::Replaced);
+        current.notify.notify_waiters();
         index
             .replaced_connections
             .push_back(ReplacedConnectionTombstone {
@@ -1242,10 +2012,155 @@ fn update_public_shared_phase(
     }
 }
 
+#[derive(serde::Serialize)]
+struct CanonicalPromptPayload<'a> {
+    blocks: &'a [crate::acp::types::PromptInputBlock],
+    folder_id: Option<i32>,
+    conversation_id: Option<i32>,
+    client_message_id: &'a str,
+    capture: Option<CanonicalPromptCapture<'a>>,
+}
+
+#[derive(serde::Serialize)]
+struct CanonicalPromptCapture<'a> {
+    visible_text: &'a Option<String>,
+    locale: &'a Option<crate::models::system::AppLocale>,
+}
+
+fn canonical_prompt_bytes(request: &SharedPromptRequest) -> Result<Vec<u8>, serde_json::Error> {
+    serde_json::to_vec(&CanonicalPromptPayload {
+        blocks: &request.blocks,
+        folder_id: request.folder_id,
+        conversation_id: request.conversation_id,
+        client_message_id: &request.client_message_id,
+        capture: request
+            .capture
+            .as_ref()
+            .map(|capture| CanonicalPromptCapture {
+                visible_text: &capture.visible_text,
+                locale: &capture.locale,
+            }),
+    })
+}
+
+fn validate_prompt_request(request: &SharedPromptRequest) -> Result<(), SharedSessionError> {
+    validate_client_label("client_instance_id", &request.client_instance_id)?;
+    validate_client_label("client_request_id", &request.client_request_id)?;
+    if request.blocks.is_empty() {
+        return Err(SharedSessionError::InvalidField { field: "blocks" });
+    }
+    if request.conversation_id.is_some() && request.folder_id.is_none() {
+        return Err(SharedSessionError::InvalidField { field: "folder_id" });
+    }
+    if request.client_message_id.is_empty() {
+        return Err(SharedSessionError::InvalidField {
+            field: "client_message_id",
+        });
+    }
+    Ok(())
+}
+
+fn queue_depth_event(record: &SharedSessionRecord) -> crate::acp::types::AcpEvent {
+    crate::acp::types::AcpEvent::PromptQueueDepthChanged {
+        generation: record.generation,
+        waiting_count: u32::try_from(record.waiting_prompts.len()).unwrap_or(u32::MAX),
+        waiting_bytes: u64::try_from(record.waiting_bytes).unwrap_or(u64::MAX),
+    }
+}
+
+fn fail_live_session_record(
+    record: &mut SharedSessionRecord,
+    error_code: &str,
+) -> Vec<crate::acp::types::AcpEvent> {
+    let generation = record.generation;
+    let mut events = Vec::new();
+    if let Some(active) = record.active_turn.take() {
+        record
+            .prompt_ledger
+            .get_mut(&active.identity)
+            .expect("active turn has ledger entry")
+            .state = InternalPromptState::Failed;
+        events.push(crate::acp::types::AcpEvent::SharedTurnSettled {
+            generation,
+            turn_id: active.projection.turn_id,
+            outcome: SharedTurnOutcome::Failed,
+        });
+    }
+    while let Some(queued) = record.waiting_prompts.pop_front() {
+        record
+            .prompt_ledger
+            .get_mut(&queued.identity)
+            .expect("queued item has ledger entry")
+            .state = InternalPromptState::Failed;
+        events.push(crate::acp::types::AcpEvent::PromptQueueItemFailed {
+            generation,
+            queue_item_id: queued.summary.queue_item_id,
+            error_code: error_code.to_string(),
+        });
+    }
+    record.waiting_bytes = 0;
+    events.push(queue_depth_event(record));
+    record.phase = SharedSessionPhase::Failed {
+        error_code: error_code.to_string(),
+        cleanup_complete: false,
+    };
+    record.cleanup_complete = false;
+    record.publish_registration();
+    record
+        .lifecycle_tx
+        .send_replace(SharedLifecycleState::Failed);
+    record.notify.notify_waiters();
+    events.push(crate::acp::types::AcpEvent::SharedSessionPhaseChanged {
+        generation,
+        phase: record.phase.clone(),
+    });
+    events
+}
+
+fn fail_all_prompt_work(
+    record: &mut SharedSessionRecord,
+    error_code: &str,
+) -> Vec<crate::acp::types::AcpEvent> {
+    let mut events = Vec::new();
+    if let Some(active) = record.active_turn.take() {
+        record
+            .prompt_ledger
+            .get_mut(&active.identity)
+            .expect("active turn has ledger entry")
+            .state = InternalPromptState::Failed;
+        events.push(crate::acp::types::AcpEvent::SharedTurnSettled {
+            generation: record.generation,
+            turn_id: active.projection.turn_id,
+            outcome: SharedTurnOutcome::Failed,
+        });
+    }
+    let had_waiting = !record.waiting_prompts.is_empty();
+    while let Some(queued) = record.waiting_prompts.pop_front() {
+        record
+            .prompt_ledger
+            .get_mut(&queued.identity)
+            .expect("queued item has ledger entry")
+            .state = InternalPromptState::Failed;
+        events.push(crate::acp::types::AcpEvent::PromptQueueItemFailed {
+            generation: record.generation,
+            queue_item_id: queued.summary.queue_item_id,
+            error_code: error_code.to_string(),
+        });
+    }
+    if had_waiting {
+        record.waiting_bytes = 0;
+        events.push(queue_depth_event(record));
+    }
+    events
+}
+
 #[derive(Clone, Copy)]
 struct BrokerLimits {
     max_active_leases: usize,
     max_connect_ledger_entries: usize,
+    max_prompt_ledger_entries: usize,
+    max_waiting_prompts: usize,
+    max_waiting_bytes: usize,
 }
 
 impl Default for BrokerLimits {
@@ -1253,6 +2168,9 @@ impl Default for BrokerLimits {
         Self {
             max_active_leases: MAX_ACTIVE_LEASES,
             max_connect_ledger_entries: MAX_CONNECT_LEDGER_ENTRIES,
+            max_prompt_ledger_entries: MAX_PROMPT_LEDGER_ENTRIES,
+            max_waiting_prompts: MAX_WAITING_PROMPTS,
+            max_waiting_bytes: MAX_WAITING_BYTES,
         }
     }
 }
@@ -1291,6 +2209,51 @@ struct ReplacedConnectionTombstone {
     generation: u64,
 }
 
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct PromptIdentity {
+    generation: u64,
+    client_instance_id: String,
+    client_request_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InternalPromptState {
+    Queued,
+    Dispatching,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+struct PromptLedgerEntry {
+    payload_hash: [u8; 32],
+    queue_item_id: String,
+    enqueue_seq: u64,
+    state: InternalPromptState,
+    frozen_result: Option<PromptEnqueueResult>,
+}
+
+struct QueuedPromptRecord {
+    identity: PromptIdentity,
+    summary: SharedQueuedPromptSummary,
+    blocks: Vec<crate::acp::types::PromptInputBlock>,
+    folder_id: Option<i32>,
+    conversation_id: Option<i32>,
+    client_message_id: String,
+    capture: Option<crate::auto_title::PromptCaptureContext>,
+    waiting_bytes: usize,
+}
+
+struct BrokerActiveTurn {
+    identity: PromptIdentity,
+    projection: SharedActiveTurnProjection,
+}
+
+struct SharedInteraction {
+    kind: SharedInteractionKind,
+    id: String,
+}
+
 struct SharedSessionRecord {
     generation: u64,
     connection_id: String,
@@ -1306,6 +2269,13 @@ struct SharedSessionRecord {
     lifecycle_tx: watch::Sender<SharedLifecycleState>,
     active_leases: HashMap<ClientIdentity, ActiveLease>,
     connect_ledger: HashMap<ConnectIdentity, SharedSessionAttachment>,
+    prompt_ledger: HashMap<PromptIdentity, PromptLedgerEntry>,
+    waiting_prompts: VecDeque<QueuedPromptRecord>,
+    waiting_bytes: usize,
+    next_enqueue_seq: u64,
+    active_turn: Option<BrokerActiveTurn>,
+    pending_interaction: Option<SharedInteraction>,
+    notify: Arc<Notify>,
     expired_leases: VecDeque<String>,
     replaced_failed_generation: Option<u64>,
     _created_at: tokio::time::Instant,
@@ -1336,6 +2306,13 @@ impl SharedSessionRecord {
             lifecycle_tx,
             active_leases: HashMap::new(),
             connect_ledger: HashMap::new(),
+            prompt_ledger: HashMap::new(),
+            waiting_prompts: VecDeque::new(),
+            waiting_bytes: 0,
+            next_enqueue_seq: 1,
+            active_turn: None,
+            pending_interaction: None,
+            notify: Arc::new(Notify::new()),
             expired_leases: VecDeque::new(),
             replaced_failed_generation,
             _created_at: request.now,
@@ -1525,7 +2502,7 @@ impl SharedRegistrationState {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SharedLifecycleState {
+pub(crate) enum SharedLifecycleState {
     Active,
     Failed,
     Closing,

@@ -1310,4 +1310,801 @@ mod tests {
 
         BrokerAtIdentityLimits { broker, retry }
     }
+
+    #[derive(Clone)]
+    struct ReadyPromptBrokerFixture {
+        broker: SharedSessionBroker,
+        attachment: SharedSessionAttachment,
+        guard: SharedMutationGuard,
+    }
+
+    impl ReadyPromptBrokerFixture {
+        async fn enqueue(
+            &self,
+            request: SharedPromptRequest,
+        ) -> Result<PromptEnqueueResult, SharedSessionError> {
+            let admission = self.broker.enqueue_prompt(request).await?;
+            self.publish(admission.events).await;
+            admission.notify.notify_one();
+            self.broker
+                .finalize_enqueue_response(
+                    &self.attachment.connection_id,
+                    self.attachment.generation,
+                    &admission.queue_item_id,
+                )
+                .await
+        }
+
+        async fn cancel(&self, queue_item_id: &str) -> Result<(), SharedSessionError> {
+            let cancelled = self
+                .broker
+                .cancel_queued_prompt(&self.guard, queue_item_id)
+                .await?;
+            self.publish(cancelled.events).await;
+            cancelled.notify.notify_one();
+            Ok(())
+        }
+
+        async fn claim_head(&self) -> Result<(), SharedSessionError> {
+            match self
+                .broker
+                .claim_dispatchable_head(
+                    &self.attachment.connection_id,
+                    self.attachment.generation,
+                    "test-turn",
+                    &dispatchable_runtime_snapshot(),
+                )
+                .await?
+            {
+                DispatchHeadDecision::Claimed(claimed) => {
+                    self.publish(claimed.events).await;
+                    Ok(())
+                }
+                DispatchHeadDecision::Blocked | DispatchHeadDecision::Failed(_) => {
+                    Err(SharedSessionError::QueueItemNotFound)
+                }
+            }
+        }
+
+        async fn snapshot(&self) -> SharedSessionProjection {
+            self.broker
+                .diagnostic_for_connection(&self.attachment.connection_id)
+                .await
+                .expect("fixture record remains authoritative")
+        }
+
+        async fn item_state(&self, queue_item_id: &str) -> Option<InternalPromptState> {
+            self.broker
+                .prompt_state_for_test(&self.attachment.connection_id, queue_item_id)
+                .await
+        }
+
+        async fn publish(&self, events: Vec<crate::acp::types::AcpEvent>) {
+            let (state, emitter) = self
+                .broker
+                .public_state_and_emitter(&self.attachment.connection_id)
+                .await
+                .expect("ready fixture has publication handles");
+            for event in events {
+                crate::web::event_bridge::emit_with_state(&state, &emitter, event).await;
+            }
+        }
+    }
+
+    fn dispatchable_runtime_snapshot() -> SharedRuntimeWorkSnapshot {
+        SharedRuntimeWorkSnapshot {
+            status: crate::acp::types::ConnectionStatus::Connected,
+            turn_in_flight: false,
+            pending_permission_id: None,
+            pending_question_id: None,
+            pending_plan_approval_id: None,
+            continuation_wait: false,
+            active_delegations: 0,
+            background_outstanding: 0,
+            conversation_writable: true,
+        }
+    }
+
+    async fn ready_prompt_broker_fixture() -> ReadyPromptBrokerFixture {
+        ready_prompt_broker_fixture_with_limits(
+            MAX_PROMPT_LEDGER_ENTRIES,
+            MAX_WAITING_PROMPTS,
+            MAX_WAITING_BYTES,
+        )
+        .await
+    }
+
+    async fn ready_prompt_broker_fixture_with_limits(
+        max_prompt_ledger_entries: usize,
+        max_waiting_prompts: usize,
+        max_waiting_bytes: usize,
+    ) -> ReadyPromptBrokerFixture {
+        let broker = SharedSessionBroker::with_prompt_limits_for_test(
+            max_prompt_ledger_entries,
+            max_waiting_prompts,
+            max_waiting_bytes,
+        );
+        ready_prompt_broker_fixture_from_broker(broker).await
+    }
+
+    async fn ready_prompt_broker_fixture_from_broker(
+        broker: SharedSessionBroker,
+    ) -> ReadyPromptBrokerFixture {
+        let reservation = broker
+            .reserve_or_attach(request(
+                SharedSessionKey::Conversation(701),
+                "prompt-connection",
+                "prompt-client",
+                "prompt-connect",
+            ))
+            .await
+            .unwrap();
+        let attachment = reservation.attachment;
+        let mut state = SessionState::new(
+            attachment.connection_id.clone(),
+            crate::models::agent::AgentType::Codex,
+            None,
+            "shared-server".into(),
+            Some(701),
+        );
+        state.connection_incarnation = "prompt-driver".into();
+        state.status = crate::acp::types::ConnectionStatus::Connected;
+        state.shared_session = Some(SharedSessionProjection {
+            generation: attachment.generation,
+            phase: SharedSessionPhase::Bootstrapping,
+            queue: Vec::new(),
+            active_turn: None,
+            lease_expires_at: Some(attachment.lease_expires_at),
+            expired_lease_tombstone_count: 0,
+        });
+        let state = Arc::new(RwLock::new(state));
+        broker
+            .install_registered(
+                &attachment.connection_id,
+                attachment.generation,
+                "prompt-driver".into(),
+                state,
+                EventEmitter::Noop,
+                Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            )
+            .await
+            .unwrap();
+        broker
+            .mark_ready(
+                &attachment.connection_id,
+                attachment.generation,
+                "prompt-driver",
+            )
+            .await
+            .unwrap();
+        let guard = SharedMutationGuard {
+            connection_id: attachment.connection_id.clone(),
+            generation: attachment.generation,
+            lease_id: attachment.lease_id.clone(),
+        };
+        ReadyPromptBrokerFixture {
+            broker,
+            attachment,
+            guard,
+        }
+    }
+
+    fn prompt_request(n: usize) -> SharedPromptRequest {
+        prompt_with_ids("prompt-client", &format!("prompt-{n}"), &format!("text-{n}"))
+    }
+
+    fn prompt_with_ids(client: &str, request_id: &str, text: &str) -> SharedPromptRequest {
+        SharedPromptRequest {
+            guard: SharedMutationGuard {
+                connection_id: "prompt-connection".into(),
+                generation: 1,
+                lease_id: String::new(),
+            },
+            client_instance_id: client.into(),
+            client_request_id: request_id.into(),
+            blocks: vec![crate::acp::types::PromptInputBlock::Text { text: text.into() }],
+            folder_id: Some(9),
+            conversation_id: Some(701),
+            client_message_id: format!("message-{request_id}"),
+            capture: None,
+            submitted_at: chrono::Utc::now(),
+        }
+    }
+
+    fn with_fixture_guard(
+        fixture: &ReadyPromptBrokerFixture,
+        mut request: SharedPromptRequest,
+    ) -> SharedPromptRequest {
+        request.guard = fixture.guard.clone();
+        request
+    }
+
+    #[tokio::test]
+    async fn concurrent_enqueues_assign_contiguous_fifo_sequence() {
+        let fixture = ready_prompt_broker_fixture().await;
+        let results = futures::future::join_all((0..64).map(|n| {
+            let fixture = fixture.clone();
+            async move {
+                let request = with_fixture_guard(&fixture, prompt_request(n));
+                fixture.enqueue(request).await.unwrap()
+            }
+        }))
+        .await;
+        let mut seqs: Vec<_> = results.into_iter().map(|result| result.enqueue_seq).collect();
+        seqs.sort_unstable();
+        assert_eq!(seqs, (1..=64).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn identical_retry_returns_original_and_changed_payload_conflicts() {
+        let fixture = ready_prompt_broker_fixture().await;
+        let first_request = with_fixture_guard(
+            &fixture,
+            prompt_with_ids("prompt-client", "retry", "alpha"),
+        );
+        let first = fixture.enqueue(first_request.clone()).await.unwrap();
+        let same = fixture.enqueue(first_request).await.unwrap();
+        assert_eq!(first, same);
+        assert!(matches!(
+            fixture
+                .enqueue(with_fixture_guard(
+                    &fixture,
+                    prompt_with_ids("prompt-client", "retry", "beta"),
+                ))
+                .await,
+            Err(SharedSessionError::IdempotencyKeyConflict)
+        ));
+    }
+
+    #[tokio::test]
+    async fn limits_reject_new_item_without_dropping_existing_items() {
+        let fixture = ready_prompt_broker_fixture().await;
+        for n in 0..MAX_WAITING_PROMPTS {
+            let request = with_fixture_guard(&fixture, prompt_request(n));
+            fixture.enqueue(request).await.unwrap();
+        }
+        assert!(matches!(
+            fixture
+                .enqueue(with_fixture_guard(&fixture, prompt_request(65)))
+                .await,
+            Err(SharedSessionError::PromptQueueFull)
+        ));
+        assert_eq!(fixture.snapshot().await.queue.len(), MAX_WAITING_PROMPTS);
+    }
+
+    #[tokio::test]
+    async fn waiting_byte_limit_rejects_only_the_new_item() {
+        let first_request = prompt_with_ids("prompt-client", "bytes-a", "alpha");
+        let first_bytes = canonical_prompt_bytes(&first_request).unwrap().len();
+        let fixture = ready_prompt_broker_fixture_with_limits(
+            MAX_PROMPT_LEDGER_ENTRIES,
+            MAX_WAITING_PROMPTS,
+            first_bytes,
+        )
+        .await;
+        let first = fixture
+            .enqueue(with_fixture_guard(&fixture, first_request))
+            .await
+            .unwrap();
+        assert!(matches!(
+            fixture
+                .enqueue(with_fixture_guard(
+                    &fixture,
+                    prompt_with_ids("prompt-client", "bytes-b", "beta"),
+                ))
+                .await,
+            Err(SharedSessionError::PromptQueueFull)
+        ));
+        assert_eq!(fixture.snapshot().await.queue[0].queue_item_id, first.queue_item_id);
+    }
+
+    #[tokio::test]
+    async fn prompt_ledger_capacity_keeps_existing_retry_available() {
+        let fixture = ready_prompt_broker_fixture_with_limits(
+            2,
+            MAX_WAITING_PROMPTS,
+            MAX_WAITING_BYTES,
+        )
+        .await;
+        let first_request = with_fixture_guard(
+            &fixture,
+            prompt_with_ids("prompt-client", "retry-a", "alpha"),
+        );
+        let first = fixture.enqueue(first_request.clone()).await.unwrap();
+        fixture
+            .enqueue(with_fixture_guard(
+                &fixture,
+                prompt_with_ids("prompt-client", "retry-b", "beta"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(fixture.enqueue(first_request).await.unwrap(), first);
+        assert!(matches!(
+            fixture
+                .enqueue(with_fixture_guard(
+                    &fixture,
+                    prompt_with_ids("prompt-client", "retry-c", "gamma"),
+                ))
+                .await,
+            Err(SharedSessionError::PromptLedgerCapacityExceeded)
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancel_and_dispatch_have_one_linearizable_winner() {
+        let fixture = ready_prompt_broker_fixture().await;
+        let item = fixture
+            .enqueue(with_fixture_guard(&fixture, prompt_request(1)))
+            .await
+            .unwrap();
+        let (cancel, claim) = tokio::join!(
+            fixture.cancel(&item.queue_item_id),
+            fixture.claim_head()
+        );
+        assert_ne!(cancel.is_ok(), claim.is_ok());
+        assert!(matches!(
+            fixture.item_state(&item.queue_item_id).await,
+            Some(InternalPromptState::Cancelled | InternalPromptState::Dispatching)
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancel_rejects_terminal_item_whose_response_froze_as_dispatching() {
+        let fixture = ready_prompt_broker_fixture().await;
+        let admission = fixture
+            .broker
+            .enqueue_prompt(with_fixture_guard(&fixture, prompt_request(1)))
+            .await
+            .unwrap();
+        assert!(matches!(
+            fixture
+                .broker
+                .claim_dispatchable_head(
+                    &fixture.attachment.connection_id,
+                    fixture.attachment.generation,
+                    "frozen-dispatching-turn",
+                    &dispatchable_runtime_snapshot(),
+                )
+                .await
+                .unwrap(),
+            DispatchHeadDecision::Claimed(_)
+        ));
+        assert_eq!(
+            fixture
+                .broker
+                .finalize_enqueue_response(
+                    &fixture.attachment.connection_id,
+                    fixture.attachment.generation,
+                    &admission.queue_item_id,
+                )
+                .await
+                .unwrap()
+                .state,
+            SharedQueuedPromptState::Dispatching
+        );
+        fixture
+            .broker
+            .settle_active_turn(
+                &fixture.attachment.connection_id,
+                fixture.attachment.generation,
+                "prompt-driver",
+                "end_turn",
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            fixture.cancel(&admission.queue_item_id).await,
+            Err(SharedSessionError::QueueItemAlreadyDispatching)
+        ));
+    }
+
+    #[tokio::test]
+    async fn conversation_rekey_collision_fails_closed() {
+        let broker = SharedSessionBroker::default();
+        let first = broker
+            .reserve_or_attach(request(
+                SharedSessionKey::Ephemeral("ephemeral-a".into()),
+                "ephemeral-a",
+                "client-a",
+                "request-a",
+            ))
+            .await
+            .unwrap();
+        let second = broker
+            .reserve_or_attach(request(
+                SharedSessionKey::Ephemeral("ephemeral-b".into()),
+                "ephemeral-b",
+                "client-b",
+                "request-b",
+            ))
+            .await
+            .unwrap();
+        broker
+            .bind_conversation_key(
+                &first.attachment.connection_id,
+                first.attachment.generation,
+                88,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            broker
+                .bind_conversation_key(
+                    &second.attachment.connection_id,
+                    second.attachment.generation,
+                    88,
+                )
+                .await
+                .unwrap_err(),
+            SharedSessionError::ConversationKeyConflict
+        );
+        assert!(matches!(
+            broker
+                .key_for_connection_for_test(&first.attachment.connection_id)
+                .await,
+            Some(SharedSessionKey::Conversation(88))
+        ));
+        assert!(matches!(
+            broker
+                .key_for_connection_for_test(&second.attachment.connection_id)
+                .await,
+            Some(SharedSessionKey::Ephemeral(key)) if key == "ephemeral-b"
+        ));
+    }
+
+    #[tokio::test]
+    async fn enqueue_response_reflects_dispatch_claim_that_won_before_response() {
+        let fixture = ready_prompt_broker_fixture().await;
+        let admission = fixture
+            .broker
+            .enqueue_prompt(with_fixture_guard(&fixture, prompt_request(1)))
+            .await
+            .unwrap();
+        assert!(matches!(
+            fixture
+                .broker
+                .claim_dispatchable_head(
+                    &fixture.attachment.connection_id,
+                    fixture.attachment.generation,
+                    "turn-before-response",
+                    &dispatchable_runtime_snapshot(),
+                )
+                .await
+                .unwrap(),
+            DispatchHeadDecision::Claimed(_)
+        ));
+        let result = fixture
+            .broker
+            .finalize_enqueue_response(
+                &fixture.attachment.connection_id,
+                fixture.attachment.generation,
+                &admission.queue_item_id,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.state, SharedQueuedPromptState::Dispatching);
+    }
+
+    #[tokio::test]
+    async fn runtime_blockers_leave_fifo_head_queued() {
+        let fixture = ready_prompt_broker_fixture().await;
+        let item = fixture
+            .enqueue(with_fixture_guard(&fixture, prompt_request(1)))
+            .await
+            .unwrap();
+        let mut snapshots = Vec::new();
+        let mut turn = dispatchable_runtime_snapshot();
+        turn.turn_in_flight = true;
+        snapshots.push(turn);
+        let mut permission = dispatchable_runtime_snapshot();
+        permission.pending_permission_id = Some("permission-a".into());
+        snapshots.push(permission);
+        let mut question = dispatchable_runtime_snapshot();
+        question.pending_question_id = Some("question-a".into());
+        snapshots.push(question);
+        let mut approval = dispatchable_runtime_snapshot();
+        approval.pending_plan_approval_id = Some("approval-a".into());
+        snapshots.push(approval);
+        let mut continuation = dispatchable_runtime_snapshot();
+        continuation.continuation_wait = true;
+        snapshots.push(continuation);
+        let mut delegation = dispatchable_runtime_snapshot();
+        delegation.active_delegations = 1;
+        snapshots.push(delegation);
+        let mut background = dispatchable_runtime_snapshot();
+        background.background_outstanding = 1;
+        snapshots.push(background);
+
+        for (n, snapshot) in snapshots.iter().enumerate() {
+            assert!(matches!(
+                fixture
+                    .broker
+                    .claim_dispatchable_head(
+                        &fixture.attachment.connection_id,
+                        fixture.attachment.generation,
+                        &format!("blocked-turn-{n}"),
+                        snapshot,
+                    )
+                    .await
+                    .unwrap(),
+                DispatchHeadDecision::Blocked
+            ));
+            assert_eq!(fixture.snapshot().await.queue[0].queue_item_id, item.queue_item_id);
+        }
+    }
+
+    #[tokio::test]
+    async fn active_turn_blocks_tail_until_matching_terminal_settlement() {
+        let fixture = ready_prompt_broker_fixture().await;
+        let first = fixture
+            .enqueue(with_fixture_guard(&fixture, prompt_request(1)))
+            .await
+            .unwrap();
+        let second = fixture
+            .enqueue(with_fixture_guard(&fixture, prompt_request(2)))
+            .await
+            .unwrap();
+        assert!(matches!(
+            fixture
+                .broker
+                .claim_dispatchable_head(
+                    &fixture.attachment.connection_id,
+                    fixture.attachment.generation,
+                    "first-turn",
+                    &dispatchable_runtime_snapshot(),
+                )
+                .await
+                .unwrap(),
+            DispatchHeadDecision::Claimed(_)
+        ));
+        assert!(matches!(
+            fixture
+                .broker
+                .claim_dispatchable_head(
+                    &fixture.attachment.connection_id,
+                    fixture.attachment.generation,
+                    "tail-too-early",
+                    &dispatchable_runtime_snapshot(),
+                )
+                .await
+                .unwrap(),
+            DispatchHeadDecision::Blocked
+        ));
+        fixture
+            .broker
+            .settle_active_turn(
+                &fixture.attachment.connection_id,
+                fixture.attachment.generation,
+                "prompt-driver",
+                "end_turn",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture.item_state(&first.queue_item_id).await,
+            Some(InternalPromptState::Completed)
+        );
+        assert!(matches!(
+            fixture
+                .broker
+                .claim_dispatchable_head(
+                    &fixture.attachment.connection_id,
+                    fixture.attachment.generation,
+                    "second-turn",
+                    &dispatchable_runtime_snapshot(),
+                )
+                .await
+                .unwrap(),
+            DispatchHeadDecision::Claimed(_)
+        ));
+        assert_eq!(
+            fixture.item_state(&second.queue_item_id).await,
+            Some(InternalPromptState::Dispatching)
+        );
+    }
+
+    #[tokio::test]
+    async fn non_writable_conversation_fails_only_fifo_head() {
+        let fixture = ready_prompt_broker_fixture().await;
+        let first = fixture
+            .enqueue(with_fixture_guard(&fixture, prompt_request(1)))
+            .await
+            .unwrap();
+        let second = fixture
+            .enqueue(with_fixture_guard(&fixture, prompt_request(2)))
+            .await
+            .unwrap();
+        let mut snapshot = dispatchable_runtime_snapshot();
+        snapshot.conversation_writable = false;
+        assert!(matches!(
+            fixture
+                .broker
+                .claim_dispatchable_head(
+                    &fixture.attachment.connection_id,
+                    fixture.attachment.generation,
+                    "unwritable",
+                    &snapshot,
+                )
+                .await
+                .unwrap(),
+            DispatchHeadDecision::Failed(_)
+        ));
+        assert_eq!(
+            fixture.item_state(&first.queue_item_id).await,
+            Some(InternalPromptState::Failed)
+        );
+        assert_eq!(fixture.snapshot().await.queue[0].queue_item_id, second.queue_item_id);
+    }
+
+    #[tokio::test]
+    async fn runtime_reconcile_fails_ready_session_after_missed_disconnect() {
+        let fixture = ready_prompt_broker_fixture().await;
+        let first = fixture
+            .enqueue(with_fixture_guard(&fixture, prompt_request(1)))
+            .await
+            .unwrap();
+        let second = fixture
+            .enqueue(with_fixture_guard(&fixture, prompt_request(2)))
+            .await
+            .unwrap();
+        let mut snapshot = dispatchable_runtime_snapshot();
+        snapshot.status = crate::acp::types::ConnectionStatus::Disconnected;
+
+        let events = fixture
+            .broker
+            .reconcile_runtime_snapshot(
+                &fixture.attachment.connection_id,
+                fixture.attachment.generation,
+                "prompt-driver",
+                &snapshot,
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            fixture.snapshot().await.phase,
+            SharedSessionPhase::Failed { .. }
+        ));
+        assert_eq!(
+            fixture.item_state(&first.queue_item_id).await,
+            Some(InternalPromptState::Failed)
+        );
+        assert_eq!(
+            fixture.item_state(&second.queue_item_id).await,
+            Some(InternalPromptState::Failed)
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            crate::acp::types::AcpEvent::SharedSessionPhaseChanged {
+                phase: SharedSessionPhase::Failed { .. },
+                ..
+            }
+        )));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sender_lease_expiry_preserves_waiting_fifo() {
+        let fixture = ready_prompt_broker_fixture_from_broker(broker_with_ttl(
+            Duration::from_secs(90),
+        ))
+        .await;
+        let first = fixture
+            .enqueue(with_fixture_guard(&fixture, prompt_request(1)))
+            .await
+            .unwrap();
+        let second = fixture
+            .enqueue(with_fixture_guard(&fixture, prompt_request(2)))
+            .await
+            .unwrap();
+
+        tokio::time::advance(Duration::from_secs(91)).await;
+        assert_eq!(
+            fixture
+                .broker
+                .expire_leases(tokio::time::Instant::now())
+                .await,
+            vec![fixture.attachment.lease_id.clone()]
+        );
+        assert_eq!(
+            fixture
+                .snapshot()
+                .await
+                .queue
+                .iter()
+                .map(|item| item.queue_item_id.as_str())
+                .collect::<Vec<_>>(),
+            [first.queue_item_id.as_str(), second.queue_item_id.as_str()]
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_requested_active_turn_quarantines_fifo_tail_until_terminal() {
+        let fixture = ready_prompt_broker_fixture().await;
+        let first = fixture
+            .enqueue(with_fixture_guard(&fixture, prompt_request(1)))
+            .await
+            .unwrap();
+        let second = fixture
+            .enqueue(with_fixture_guard(&fixture, prompt_request(2)))
+            .await
+            .unwrap();
+        assert!(matches!(
+            fixture
+                .broker
+                .claim_dispatchable_head(
+                    &fixture.attachment.connection_id,
+                    fixture.attachment.generation,
+                    "stopping-turn",
+                    &dispatchable_runtime_snapshot(),
+                )
+                .await
+                .unwrap(),
+            DispatchHeadDecision::Claimed(_)
+        ));
+        fixture
+            .broker
+            .with_authoritative_record(&fixture.attachment.connection_id, |record| {
+                record
+                    .active_turn
+                    .as_mut()
+                    .expect("claimed head remains active")
+                    .projection
+                    .stop_requested = true;
+                Ok(())
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(matches!(
+            fixture
+                .broker
+                .claim_dispatchable_head(
+                    &fixture.attachment.connection_id,
+                    fixture.attachment.generation,
+                    "tail-before-terminal",
+                    &dispatchable_runtime_snapshot(),
+                )
+                .await
+                .unwrap(),
+            DispatchHeadDecision::Blocked
+        ));
+        assert_eq!(fixture.snapshot().await.queue[0].queue_item_id, second.queue_item_id);
+
+        let settled = fixture
+            .broker
+            .settle_active_turn(
+                &fixture.attachment.connection_id,
+                fixture.attachment.generation,
+                "prompt-driver",
+                "end_turn",
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            settled.as_slice(),
+            [crate::acp::types::AcpEvent::SharedTurnSettled {
+                outcome: SharedTurnOutcome::Cancelled,
+                ..
+            }]
+        ));
+        assert_eq!(
+            fixture.item_state(&first.queue_item_id).await,
+            Some(InternalPromptState::Cancelled)
+        );
+        assert!(matches!(
+            fixture
+                .broker
+                .claim_dispatchable_head(
+                    &fixture.attachment.connection_id,
+                    fixture.attachment.generation,
+                    "tail-after-terminal",
+                    &dispatchable_runtime_snapshot(),
+                )
+                .await
+                .unwrap(),
+            DispatchHeadDecision::Claimed(_)
+        ));
+    }
 }

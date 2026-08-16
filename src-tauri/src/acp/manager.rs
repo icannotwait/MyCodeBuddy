@@ -45,9 +45,11 @@ use crate::acp::question::{
 };
 use crate::acp::session_state::{ActiveTurnContext, InternalPromptAdmission, SessionState};
 use crate::acp::shared_session::{
-    RegisteredReplacementPermit, SharedConfigConflictKind, SharedLaunchIdentity,
-    SharedReserveRequest, SharedSessionAttachment, SharedSessionBroker, SharedSessionError,
-    SharedSessionKey, SharedSessionPhase, SharedSessionProjection,
+    DispatchHeadDecision, PromptEnqueueResult, RegisteredReplacementPermit,
+    SharedConfigConflictKind, SharedInteractionKind, SharedLaunchIdentity, SharedLifecycleState,
+    SharedMutationGuard, SharedPromptRequest, SharedReserveRequest, SharedRuntimeWorkSnapshot,
+    SharedSessionAttachment, SharedSessionBroker, SharedSessionError, SharedSessionKey,
+    SharedSessionPhase, SharedSessionProjection,
 };
 use crate::acp::terminal_context::{finalize_acp_launch_config, AcpLaunchConfig, AcpLaunchInputs};
 use crate::acp::termination::AcpDisconnectOrigin;
@@ -541,11 +543,31 @@ fn shared_registration_error(error: AcpError) -> SharedSessionError {
     }
 }
 
+fn stable_dispatch_error(error: &AcpError) -> &'static str {
+    match error.code() {
+        Some(
+            code @ ("workflow_v2_retired"
+            | "legacy_completion_protocol_read_only"
+            | "unsupported_completion_protocol"
+            | "workflow_identity_corrupt"
+            | "delegate_viewer_only"),
+        ) => code,
+        _ => "session_unavailable",
+    }
+}
+
 #[cfg(test)]
 #[derive(Clone)]
 struct DisconnectFinalCasHook {
     reached: Arc<tokio::sync::Notify>,
     resume: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct SharedEnqueueFinalizeHook {
+    reached: Arc<tokio::sync::Barrier>,
+    resume: Arc<tokio::sync::Barrier>,
 }
 
 pub struct ConnectionManager {
@@ -630,6 +652,8 @@ pub struct ConnectionManager {
     shared_settler_supervisor_completed: Arc<tokio::sync::Notify>,
     #[cfg(test)]
     disconnect_final_cas_hook: Arc<std::sync::Mutex<Option<DisconnectFinalCasHook>>>,
+    #[cfg(test)]
+    shared_enqueue_finalize_hook: Arc<std::sync::Mutex<Option<SharedEnqueueFinalizeHook>>>,
 }
 
 /// A parked `ask_user_question` awaiting its answer. The `sender` resolves the
@@ -724,6 +748,8 @@ impl ConnectionManager {
             shared_settler_supervisor_completed: Arc::new(tokio::sync::Notify::new()),
             #[cfg(test)]
             disconnect_final_cas_hook: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            shared_enqueue_finalize_hook: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -764,6 +790,8 @@ impl ConnectionManager {
             shared_settler_supervisor_completed: self.shared_settler_supervisor_completed.clone(),
             #[cfg(test)]
             disconnect_final_cas_hook: self.disconnect_final_cas_hook.clone(),
+            #[cfg(test)]
+            shared_enqueue_finalize_hook: self.shared_enqueue_finalize_hook.clone(),
         }
     }
 
@@ -776,6 +804,265 @@ impl ConnectionManager {
 
     pub fn shared_session_broker(&self) -> SharedSessionBroker {
         self.shared_session_broker.clone()
+    }
+
+    pub async fn enqueue_shared_prompt(
+        &self,
+        request: SharedPromptRequest,
+    ) -> Result<PromptEnqueueResult, AcpError> {
+        let connection_id = request.guard.connection_id.clone();
+        let generation = request.guard.generation;
+        let admission = self.shared_session_broker.enqueue_prompt(request).await?;
+        let queue_item_id = admission.queue_item_id.clone();
+        self.publish_shared_events(&connection_id, admission.events)
+            .await?;
+        admission.notify.notify_one();
+        #[cfg(test)]
+        let finalize_hook = self
+            .shared_enqueue_finalize_hook
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        #[cfg(test)]
+        if let Some(hook) = finalize_hook {
+            hook.reached.wait().await;
+            hook.resume.wait().await;
+        }
+        self.shared_session_broker
+            .finalize_enqueue_response(&connection_id, generation, &queue_item_id)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn cancel_shared_queued_prompt(
+        &self,
+        guard: SharedMutationGuard,
+        queue_item_id: &str,
+    ) -> Result<(), AcpError> {
+        let connection_id = guard.connection_id.clone();
+        let cancelled = self
+            .shared_session_broker
+            .cancel_queued_prompt(&guard, queue_item_id)
+            .await?;
+        self.publish_shared_events(&connection_id, cancelled.events)
+            .await?;
+        cancelled.notify.notify_one();
+        Ok(())
+    }
+
+    async fn publish_shared_events(
+        &self,
+        connection_id: &str,
+        events: Vec<AcpEvent>,
+    ) -> Result<(), AcpError> {
+        for event in events {
+            self.publish_shared_event(connection_id, event).await?;
+        }
+        Ok(())
+    }
+
+    async fn bind_shared_conversation_if_present(
+        &self,
+        connection_id: &str,
+        conversation_id: i32,
+    ) -> Result<(), AcpError> {
+        if let Some(generation) = self
+            .shared_session_broker
+            .generation_for_connection(connection_id)
+            .await
+        {
+            self.shared_session_broker
+                .bind_conversation_key(connection_id, generation, conversation_id)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn shared_runtime_work_snapshot(
+        &self,
+        db: &AppDatabase,
+        connection_id: &str,
+    ) -> Option<SharedRuntimeWorkSnapshot> {
+        let state = self.get_state(connection_id).await?;
+        let (mut snapshot, conversation_id) = {
+            let state = state.read().await;
+            (
+                state.shared_runtime_work_snapshot(true),
+                state.conversation_id,
+            )
+        };
+        if let Some(conversation_id) = conversation_id {
+            snapshot.conversation_writable =
+                require_writable_conversation_workflow(&db.conn, conversation_id)
+                    .await
+                    .is_ok();
+        }
+        Some(snapshot)
+    }
+
+    fn spawn_shared_dispatcher(
+        &self,
+        connection_id: String,
+        generation: u64,
+        db: Arc<AppDatabase>,
+    ) {
+        let manager = self.clone_ref();
+        tokio::spawn(async move {
+            let Ok(mut subscription) = manager
+                .shared_session_broker
+                .runtime_subscription(&connection_id, generation)
+                .await
+            else {
+                return;
+            };
+
+            loop {
+                tokio::select! {
+                    _ = subscription.notify.notified() => {}
+                    changed = subscription.lifecycle.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                    }
+                    changed = subscription.registration.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                    }
+                }
+                if *subscription.lifecycle.borrow() != SharedLifecycleState::Active {
+                    return;
+                }
+
+                let Some(snapshot) = manager
+                    .shared_runtime_work_snapshot(&db, &connection_id)
+                    .await
+                else {
+                    // A same-generation fallback temporarily removes the old
+                    // driver from the manager map before publishing the new
+                    // registration. Keep the creator-owned dispatcher alive;
+                    // the registration watch wakes it after replacement.
+                    continue;
+                };
+                let driver_incarnation = match manager
+                    .shared_session_broker
+                    .driver_incarnation_for_generation(&connection_id, generation)
+                    .await
+                {
+                    Ok(Some(driver_incarnation)) => driver_incarnation,
+                    _ => continue,
+                };
+                let reconcile_events = match manager
+                    .shared_session_broker
+                    .reconcile_runtime_snapshot(
+                        &connection_id,
+                        generation,
+                        &driver_incarnation,
+                        &snapshot,
+                    )
+                    .await
+                {
+                    Ok(events) => events,
+                    Err(_) => continue,
+                };
+                if manager
+                    .publish_shared_events(&connection_id, reconcile_events)
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                if *subscription.lifecycle.borrow() != SharedLifecycleState::Active {
+                    return;
+                }
+
+                let turn_id = uuid::Uuid::new_v4().to_string();
+                let decision = match manager
+                    .shared_session_broker
+                    .claim_dispatchable_head(&connection_id, generation, &turn_id, &snapshot)
+                    .await
+                {
+                    Ok(decision) => decision,
+                    Err(_) => return,
+                };
+                match decision {
+                    DispatchHeadDecision::Blocked => {}
+                    DispatchHeadDecision::Failed(failed) => {
+                        if manager
+                            .publish_shared_events(&connection_id, failed.events)
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                        failed.notify.notify_one();
+                    }
+                    DispatchHeadDecision::Claimed(claimed) => {
+                        if manager
+                            .publish_shared_events(&connection_id, claimed.events)
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                        let result = manager
+                            .send_prompt_linked_with_message_id(
+                                &db,
+                                &connection_id,
+                                claimed.blocks,
+                                claimed.folder_id,
+                                claimed.conversation_id,
+                                None,
+                                Some(claimed.client_message_id),
+                                claimed.capture,
+                            )
+                            .await;
+                        if let Err(error) = result {
+                            let failed = match manager
+                                .shared_session_broker
+                                .fail_claimed_item(
+                                    &connection_id,
+                                    generation,
+                                    &turn_id,
+                                    stable_dispatch_error(&error),
+                                )
+                                .await
+                            {
+                                Ok(failed) => failed,
+                                Err(_) => return,
+                            };
+                            if manager
+                                .publish_shared_events(&connection_id, failed.events)
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            let connected = manager
+                                .shared_runtime_work_snapshot(&db, &connection_id)
+                                .await
+                                .is_some_and(|snapshot| {
+                                    snapshot.status == ConnectionStatus::Connected
+                                });
+                            if connected {
+                                failed.notify.notify_one();
+                            } else if let Ok(events) = manager
+                                .shared_session_broker
+                                .fail_live_session(
+                                    &connection_id,
+                                    generation,
+                                    &driver_incarnation,
+                                    "session_unavailable",
+                                )
+                                .await
+                            {
+                                let _ = manager.publish_shared_events(&connection_id, events).await;
+                            }
+                        }
+                    }
+                }
+            }
+        });
     }
 
     #[cfg(any(test, feature = "test-utils"))]
@@ -820,10 +1107,14 @@ impl ConnectionManager {
             .await?;
 
         if reserve.created {
-            // Task 5 hands this cheap clone to the single dispatcher. Attachers
-            // never reach this branch and cannot replace the creator's DB.
-            let _dispatcher_database = launch.database.clone();
+            let database = launch.database.clone();
+            let dispatcher_database = Arc::new(crate::db::AppDatabase { conn: database });
             self.spawn_shared_registration(reserve.attachment.clone(), launch);
+            self.spawn_shared_dispatcher(
+                reserve.attachment.connection_id.clone(),
+                reserve.attachment.generation,
+                dispatcher_database,
+            );
         }
 
         let registration = self
@@ -930,6 +1221,18 @@ impl ConnectionManager {
                         return;
                     }
                 }
+                let event_rx = {
+                    let state = registered.state.read().await;
+                    state.event_stream().subscribe()
+                };
+                self.spawn_shared_runtime_monitor(
+                    connection_id.clone(),
+                    generation,
+                    driver_incarnation.clone(),
+                    registered.state.clone(),
+                    event_rx,
+                )
+                .await;
                 self.spawn_shared_bootstrap_settler(
                     connection_id,
                     generation,
@@ -1005,6 +1308,245 @@ impl ConnectionManager {
         if let Some(driver_start_tx) = driver_start_tx {
             let _ = driver_start_tx.send(());
         }
+    }
+
+    async fn spawn_shared_runtime_monitor(
+        &self,
+        connection_id: String,
+        generation: u64,
+        driver_incarnation: String,
+        state: Arc<RwLock<SessionState>>,
+        mut event_rx: tokio::sync::broadcast::Receiver<Arc<crate::acp::types::EventEnvelope>>,
+    ) {
+        let manager = self.clone_ref();
+        let Ok(mut subscription) = manager
+            .shared_session_broker
+            .runtime_subscription(&connection_id, generation)
+            .await
+        else {
+            return;
+        };
+
+        let initial = state.read().await.shared_runtime_work_snapshot(true);
+        let initial_events = match manager
+            .shared_session_broker
+            .reconcile_runtime_snapshot(&connection_id, generation, &driver_incarnation, &initial)
+            .await
+        {
+            Ok(events) => events,
+            Err(_) => return,
+        };
+        if manager
+            .publish_shared_events(&connection_id, initial_events)
+            .await
+            .is_err()
+        {
+            return;
+        }
+        subscription.notify.notify_one();
+
+        tokio::spawn(async move {
+            loop {
+                let envelope = tokio::select! {
+                    changed = subscription.lifecycle.changed() => {
+                        if changed.is_err()
+                            || *subscription.lifecycle.borrow() != SharedLifecycleState::Active
+                        {
+                            return;
+                        }
+                        continue;
+                    }
+                    changed = subscription.registration.changed() => {
+                        if changed.is_err()
+                            || subscription.registration.borrow().driver_incarnation.as_deref()
+                                != Some(driver_incarnation.as_str())
+                        {
+                            return;
+                        }
+                        continue;
+                    }
+                    received = event_rx.recv() => {
+                        match received {
+                            Ok(envelope) => envelope,
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                                let snapshot = state
+                                    .read()
+                                    .await
+                                    .shared_runtime_work_snapshot(true);
+                                let reconcile_events = match manager
+                                    .shared_session_broker
+                                    .reconcile_runtime_snapshot(
+                                        &connection_id,
+                                        generation,
+                                        &driver_incarnation,
+                                        &snapshot,
+                                    )
+                                    .await
+                                {
+                                    Ok(events) => events,
+                                    Err(_) => return,
+                                };
+                                if manager
+                                    .publish_shared_events(&connection_id, reconcile_events)
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                                subscription.notify.notify_one();
+                                continue;
+                            }
+                        }
+                    }
+                };
+
+                let broker_events = match &envelope.payload {
+                    AcpEvent::TurnComplete { stop_reason, .. } => {
+                        manager
+                            .shared_session_broker
+                            .settle_active_turn(
+                                &connection_id,
+                                generation,
+                                &driver_incarnation,
+                                stop_reason,
+                            )
+                            .await
+                    }
+                    AcpEvent::StatusChanged {
+                        status: ConnectionStatus::Disconnected | ConnectionStatus::Error,
+                    } => {
+                        manager
+                            .shared_session_broker
+                            .fail_live_session(
+                                &connection_id,
+                                generation,
+                                &driver_incarnation,
+                                "session_unavailable",
+                            )
+                            .await
+                    }
+                    AcpEvent::PermissionRequest { request_id, .. } => {
+                        manager
+                            .shared_session_broker
+                            .observe_interaction(
+                                &connection_id,
+                                generation,
+                                &driver_incarnation,
+                                SharedInteractionKind::Permission,
+                                request_id,
+                            )
+                            .await
+                    }
+                    AcpEvent::PermissionResolved { request_id } => {
+                        manager
+                            .shared_session_broker
+                            .observe_interaction_resolved(
+                                &connection_id,
+                                generation,
+                                &driver_incarnation,
+                                request_id,
+                            )
+                            .await
+                    }
+                    AcpEvent::QuestionRequest { question_id, .. } => {
+                        manager
+                            .shared_session_broker
+                            .observe_interaction(
+                                &connection_id,
+                                generation,
+                                &driver_incarnation,
+                                SharedInteractionKind::Question,
+                                question_id,
+                            )
+                            .await
+                    }
+                    AcpEvent::QuestionResolved { question_id } => {
+                        manager
+                            .shared_session_broker
+                            .observe_interaction_resolved(
+                                &connection_id,
+                                generation,
+                                &driver_incarnation,
+                                question_id,
+                            )
+                            .await
+                    }
+                    AcpEvent::PlanApprovalRequest { approval_id, .. } => {
+                        manager
+                            .shared_session_broker
+                            .observe_interaction(
+                                &connection_id,
+                                generation,
+                                &driver_incarnation,
+                                SharedInteractionKind::PlanApproval,
+                                approval_id,
+                            )
+                            .await
+                    }
+                    AcpEvent::PlanApprovalResolved { approval_id } => {
+                        manager
+                            .shared_session_broker
+                            .observe_interaction_resolved(
+                                &connection_id,
+                                generation,
+                                &driver_incarnation,
+                                approval_id,
+                            )
+                            .await
+                    }
+                    _ => Ok(Vec::new()),
+                };
+                let broker_events = match broker_events {
+                    Ok(events) => events,
+                    Err(SharedSessionError::GenerationStale) => return,
+                    Err(_) => continue,
+                };
+                if manager
+                    .publish_shared_events(&connection_id, broker_events)
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+
+                if matches!(
+                    &envelope.payload,
+                    AcpEvent::ContinuationWaitingChanged { .. }
+                        | AcpEvent::DelegationStarted { .. }
+                        | AcpEvent::DelegationCompleted { .. }
+                        | AcpEvent::BackgroundActivity { .. }
+                        | AcpEvent::PermissionResolved { .. }
+                        | AcpEvent::QuestionResolved { .. }
+                        | AcpEvent::PlanApprovalResolved { .. }
+                        | AcpEvent::StatusChanged { .. }
+                        | AcpEvent::TurnComplete { .. }
+                ) {
+                    let snapshot = state.read().await.shared_runtime_work_snapshot(true);
+                    let reconcile_events = match manager
+                        .shared_session_broker
+                        .reconcile_runtime_snapshot(
+                            &connection_id,
+                            generation,
+                            &driver_incarnation,
+                            &snapshot,
+                        )
+                        .await
+                    {
+                        Ok(events) => events,
+                        Err(_) => return,
+                    };
+                    if manager
+                        .publish_shared_events(&connection_id, reconcile_events)
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    subscription.notify.notify_one();
+                }
+            }
+        });
     }
 
     async fn start_shared_attempt(
@@ -1199,6 +1741,9 @@ impl ConnectionManager {
                     .mark_ready(&connection_id, generation, &driver_incarnation)
                     .await
                 {
+                    // Phase waiters consume the authoritative broker watch;
+                    // event publication follows as a separate unlocked step.
+                    tokio::task::yield_now().await;
                     for event in events {
                         if self
                             .publish_shared_event(&connection_id, event)
@@ -1208,6 +1753,10 @@ impl ConnectionManager {
                             return;
                         }
                     }
+                    let _ = self
+                        .shared_session_broker
+                        .notify_dispatcher(&connection_id, generation)
+                        .await;
                     self.shared_launches
                         .lock()
                         .await
@@ -1320,6 +1869,18 @@ impl ConnectionManager {
                             .await
                             .is_ok()
                         {
+                            let event_rx = {
+                                let state = replacement.state.read().await;
+                                state.event_stream().subscribe()
+                            };
+                            self.spawn_shared_runtime_monitor(
+                                connection_id.clone(),
+                                generation,
+                                next_incarnation.clone(),
+                                replacement.state.clone(),
+                                event_rx,
+                            )
+                            .await;
                             self.shared_launches
                                 .lock()
                                 .await
@@ -3642,6 +4203,8 @@ impl ConnectionManager {
                 // Prebound delegation children still carry the link for event
                 // parent ids + child prompt policy (`delegation.is_some()`).
                 (Some(caller_conv_id), Some(caller_folder_id)) => {
+                    self.bind_shared_conversation_if_present(conn_id, caller_conv_id)
+                        .await?;
                     emit_with_state(
                         &state_arc,
                         &emitter,
@@ -3695,6 +4258,8 @@ impl ConnectionManager {
                     )
                     .await
                     .map_err(|e| AcpError::protocol(e.to_string()))?;
+                    self.bind_shared_conversation_if_present(conn_id, row.id)
+                        .await?;
                     emit_with_state(
                         &state_arc,
                         &emitter,
@@ -20027,5 +20592,335 @@ mod tests {
             .write()
             .await
             .apply_event(&AcpEvent::DelegationAvailabilityChanged { available: false });
+    }
+
+    mod shared_dispatch {
+        use super::*;
+        use crate::acp::shared_session::{
+            SharedMutationGuard, SharedPromptRequest, SharedQueuedPromptState,
+        };
+
+        fn queued_prompt(
+            attachment: &SharedSessionAttachment,
+            request_id: &str,
+            text: &str,
+        ) -> SharedPromptRequest {
+            SharedPromptRequest {
+                guard: SharedMutationGuard {
+                    connection_id: attachment.connection_id.clone(),
+                    generation: attachment.generation,
+                    lease_id: attachment.lease_id.clone(),
+                },
+                client_instance_id: "dispatch-client".into(),
+                client_request_id: request_id.into(),
+                blocks: vec![PromptInputBlock::Text { text: text.into() }],
+                folder_id: Some(9),
+                conversation_id: Some(771),
+                client_message_id: format!("message-{request_id}"),
+                capture: None,
+                submitted_at: chrono::Utc::now(),
+            }
+        }
+
+        async fn ready_manager() -> (ConnectionManager, SharedSessionAttachment) {
+            let manager = ConnectionManager::new_with_shared_spawn_driver(Arc::new(
+                FakeSharedSpawnDriver::immediate_ready(),
+            ));
+            let attachment = manager
+                .connect_or_attach_shared(shared_launch(771, "dispatch-client").await)
+                .await
+                .unwrap();
+            manager
+                .wait_for_shared_phase(
+                    &attachment.connection_id,
+                    attachment.generation,
+                    SharedSessionPhase::Ready,
+                )
+                .await
+                .unwrap();
+            (manager, attachment)
+        }
+
+        #[tokio::test]
+        async fn sender_lease_release_preserves_waiting_fifo() {
+            let (manager, attachment) = ready_manager().await;
+            let state = manager.get_state(&attachment.connection_id).await.unwrap();
+            state.write().await.turn_in_flight = true;
+
+            let first = manager
+                .enqueue_shared_prompt(queued_prompt(&attachment, "first", "alpha"))
+                .await
+                .unwrap();
+            let second = manager
+                .enqueue_shared_prompt(queued_prompt(&attachment, "second", "beta"))
+                .await
+                .unwrap();
+            assert_eq!(first.state, SharedQueuedPromptState::Queued);
+            assert_eq!(second.state, SharedQueuedPromptState::Queued);
+
+            manager
+                .shared_session_broker()
+                .release_lease(&SharedMutationGuard {
+                    connection_id: attachment.connection_id.clone(),
+                    generation: attachment.generation,
+                    lease_id: attachment.lease_id.clone(),
+                })
+                .await
+                .unwrap();
+            let snapshot = manager
+                .shared_session_broker()
+                .diagnostic_for_connection(&attachment.connection_id)
+                .await
+                .unwrap();
+            assert_eq!(
+                snapshot
+                    .queue
+                    .iter()
+                    .map(|item| item.enqueue_seq)
+                    .collect::<Vec<_>>(),
+                [first.enqueue_seq, second.enqueue_seq]
+            );
+        }
+
+        #[tokio::test]
+        async fn dispatch_failure_emits_terminal_settlement_and_preserves_tail() {
+            let (manager, attachment) = ready_manager().await;
+            let state = manager.get_state(&attachment.connection_id).await.unwrap();
+            let mut events = state.read().await.event_stream().subscribe();
+
+            manager
+                .enqueue_shared_prompt(queued_prompt(&attachment, "head", "alpha"))
+                .await
+                .unwrap();
+            manager
+                .enqueue_shared_prompt(queued_prompt(&attachment, "tail", "beta"))
+                .await
+                .unwrap();
+
+            let settled = tokio::time::timeout(Duration::from_millis(500), async {
+                loop {
+                    let envelope = events.recv().await.unwrap();
+                    if matches!(
+                        envelope.payload,
+                        AcpEvent::SharedTurnSettled {
+                            outcome: crate::acp::shared_session::SharedTurnOutcome::Failed,
+                            ..
+                        }
+                    ) {
+                        break;
+                    }
+                }
+            })
+            .await;
+            assert!(
+                settled.is_ok(),
+                "claimed send failure must settle terminally"
+            );
+            let snapshot = manager
+                .shared_session_broker()
+                .diagnostic_for_connection(&attachment.connection_id)
+                .await
+                .unwrap();
+            assert!(snapshot.active_turn.is_none());
+            assert!(snapshot.queue.len() <= 1);
+        }
+
+        #[tokio::test]
+        async fn enqueue_response_reflects_claim_that_wins_before_finalization() {
+            let (manager, attachment) = ready_manager().await;
+            let state = manager.get_state(&attachment.connection_id).await.unwrap();
+            state.write().await.turn_in_flight = true;
+            let mut events = state.read().await.event_stream().subscribe();
+            let reached = Arc::new(tokio::sync::Barrier::new(2));
+            let resume = Arc::new(tokio::sync::Barrier::new(2));
+            *manager
+                .shared_enqueue_finalize_hook
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = Some(SharedEnqueueFinalizeHook {
+                reached: reached.clone(),
+                resume: resume.clone(),
+            });
+
+            let enqueue_manager = manager.clone_ref();
+            let enqueue_attachment = attachment.clone();
+            let enqueue = tokio::spawn(async move {
+                enqueue_manager
+                    .enqueue_shared_prompt(queued_prompt(
+                        &enqueue_attachment,
+                        "claim-before-response",
+                        "alpha",
+                    ))
+                    .await
+            });
+            reached.wait().await;
+
+            state.write().await.turn_in_flight = false;
+            manager
+                .shared_session_broker()
+                .notify_dispatcher(&attachment.connection_id, attachment.generation)
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_millis(500), async {
+                loop {
+                    if matches!(
+                        events.recv().await.unwrap().payload,
+                        AcpEvent::PromptDispatchStarted { .. }
+                    ) {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("dispatcher must claim while the enqueue response is paused");
+            resume.wait().await;
+
+            let result = enqueue.await.unwrap().unwrap();
+            assert_eq!(result.state, SharedQueuedPromptState::Dispatching);
+        }
+
+        #[tokio::test]
+        async fn ephemeral_record_rekeys_before_conversation_linked_is_observable() {
+            let manager = ConnectionManager::new_with_shared_spawn_driver(Arc::new(
+                FakeSharedSpawnDriver::immediate_ready(),
+            ));
+            let mut launch = shared_launch(772, "ephemeral-client").await;
+            launch.key = SharedSessionKey::Ephemeral("ephemeral-772".into());
+            let attachment = manager.connect_or_attach_shared(launch).await.unwrap();
+            manager
+                .wait_for_shared_phase(
+                    &attachment.connection_id,
+                    attachment.generation,
+                    SharedSessionPhase::Ready,
+                )
+                .await
+                .unwrap();
+            manager
+                .insert_test_connection(
+                    &attachment.connection_id,
+                    AgentType::Codex,
+                    None,
+                    EventEmitter::Noop,
+                )
+                .await;
+            let state = manager.get_state(&attachment.connection_id).await.unwrap();
+            let mut events = state.read().await.event_stream().subscribe();
+
+            let mut request = queued_prompt(&attachment, "ephemeral", "link me");
+            request.client_instance_id = "ephemeral-client".into();
+            request.conversation_id = Some(772);
+            manager.enqueue_shared_prompt(request).await.unwrap();
+
+            let linked = tokio::time::timeout(Duration::from_millis(500), async {
+                loop {
+                    let envelope = events.recv().await.unwrap();
+                    if matches!(
+                        envelope.payload,
+                        AcpEvent::ConversationLinked {
+                            conversation_id: 772,
+                            ..
+                        }
+                    ) {
+                        break;
+                    }
+                }
+            })
+            .await;
+            assert!(linked.is_ok(), "conversation link must be observable");
+            assert!(matches!(
+                manager
+                    .shared_session_broker()
+                    .key_for_connection_for_test(&attachment.connection_id)
+                    .await,
+                Some(SharedSessionKey::Conversation(772))
+            ));
+        }
+
+        #[tokio::test]
+        async fn shared_monitor_lock_order_does_not_deadlock() {
+            let (manager, attachment) = ready_manager().await;
+            let state = manager.get_state(&attachment.connection_id).await.unwrap();
+            let driver_incarnation = manager
+                .shared_session_broker()
+                .driver_incarnation_for_generation(&attachment.connection_id, attachment.generation)
+                .await
+                .unwrap()
+                .unwrap();
+            let broker_snapshot = state.read().await.shared_runtime_work_snapshot(true);
+            let map_guard = manager.connections.lock().await;
+            let state_guard = state.write().await;
+            let callback = tokio::time::timeout(
+                Duration::from_millis(500),
+                manager.shared_session_broker().reconcile_runtime_snapshot(
+                    &attachment.connection_id,
+                    attachment.generation,
+                    &driver_incarnation,
+                    &broker_snapshot,
+                ),
+            )
+            .await;
+            assert!(
+                callback.is_ok(),
+                "broker callbacks must not acquire SessionState or the manager map"
+            );
+            drop(state_guard);
+            drop(map_guard);
+            state.write().await.turn_in_flight = true;
+            let mut attach_launch = shared_launch(771, "lock-order-client").await;
+            attach_launch.request_id = "lock-order-attach".into();
+
+            let raced = tokio::time::timeout(Duration::from_millis(500), async {
+                let start = Arc::new(tokio::sync::Barrier::new(5));
+                let enqueue_start = start.clone();
+                let enqueue = async {
+                    enqueue_start.wait().await;
+                    manager
+                        .enqueue_shared_prompt(queued_prompt(
+                            &attachment,
+                            "lock-order-prompt",
+                            "alpha",
+                        ))
+                        .await
+                };
+                let attach_start = start.clone();
+                let attach = async {
+                    attach_start.wait().await;
+                    manager.connect_or_attach_shared(attach_launch).await
+                };
+                let snapshot_start = start.clone();
+                let snapshot = async {
+                    snapshot_start.wait().await;
+                    manager.get_state(&attachment.connection_id).await
+                };
+                let reconcile_start = start.clone();
+                let reconcile = async {
+                    reconcile_start.wait().await;
+                    emit_with_state(
+                        &state,
+                        &EventEmitter::Noop,
+                        AcpEvent::BackgroundActivity {
+                            session_id: "lock-order-session".into(),
+                            outstanding: 0,
+                            turns: Vec::new(),
+                            settled: Vec::new(),
+                            watermark: 0,
+                        },
+                    )
+                    .await
+                };
+                let release = async {
+                    start.wait().await;
+                };
+                let (enqueue, attach, snapshot, (), ()) =
+                    tokio::join!(enqueue, attach, snapshot, reconcile, release);
+                enqueue.unwrap();
+                attach.unwrap();
+                assert!(snapshot.is_some());
+            })
+            .await;
+            assert!(
+                raced.is_ok(),
+                "shared callback adapters must not reverse locks"
+            );
+        }
     }
 }

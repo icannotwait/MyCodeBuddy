@@ -849,6 +849,32 @@ impl SessionState {
         rx
     }
 
+    pub(crate) fn shared_runtime_work_snapshot(
+        &self,
+        conversation_writable: bool,
+    ) -> crate::acp::shared_session::SharedRuntimeWorkSnapshot {
+        crate::acp::shared_session::SharedRuntimeWorkSnapshot {
+            status: self.status.clone(),
+            turn_in_flight: self.turn_in_flight,
+            pending_permission_id: self
+                .pending_permission
+                .as_ref()
+                .map(|pending| pending.request_id.clone()),
+            pending_question_id: self
+                .pending_question
+                .as_ref()
+                .map(|pending| pending.question_id.clone()),
+            pending_plan_approval_id: self
+                .pending_plan_approval
+                .as_ref()
+                .map(|pending| pending.approval_id.clone()),
+            continuation_wait: self.waiting_for_subagents.is_some(),
+            active_delegations: self.active_delegations.len(),
+            background_outstanding: self.background_outstanding,
+            conversation_writable,
+        }
+    }
+
     /// 单一分发器：把一个 AcpEvent 应用到 self。注意此方法**不**自增 event_seq——
     /// seq 由 emit_with_state 在外层管理（这样 apply_event 可独立单元测试）。
     ///

@@ -103,6 +103,47 @@ pub struct SharedMutationGuard {
     pub lease_id: String,
 }
 
+#[derive(Clone)]
+pub struct SharedPromptRequest {
+    pub guard: SharedMutationGuard,
+    pub client_instance_id: String,
+    pub client_request_id: String,
+    pub blocks: Vec<PromptInputBlock>,
+    pub folder_id: Option<i32>,
+    pub conversation_id: Option<i32>,
+    pub client_message_id: String,
+    pub capture: Option<PromptCaptureContext>,
+    pub submitted_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptEnqueueResult {
+    pub queue_item_id: String,
+    pub enqueue_seq: u64,
+    pub state: SharedQueuedPromptState,
+}
+
+#[derive(Clone)]
+pub struct SharedRuntimeWorkSnapshot {
+    pub status: ConnectionStatus,
+    pub turn_in_flight: bool,
+    pub pending_permission_id: Option<String>,
+    pub pending_question_id: Option<String>,
+    pub pending_plan_approval_id: Option<String>,
+    pub continuation_wait: bool,
+    pub active_delegations: usize,
+    pub background_outstanding: u32,
+    pub conversation_writable: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SharedInteractionKind {
+    Permission,
+    Question,
+    PlanApproval,
+}
+
 impl SharedMutationGuard {
     pub fn lease_socket_binding(&self, lease_expires_at: DateTime<Utc>) -> LeaseSocketBinding {
         LeaseSocketBinding {
