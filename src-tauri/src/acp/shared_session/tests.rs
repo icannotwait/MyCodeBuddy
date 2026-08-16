@@ -1343,14 +1343,17 @@ mod tests {
                 .publication
                 .get_or_try_init(|| async {
                     self.publish(events).await;
-                    self.broker
+                    let published = self
+                        .broker
                         .mark_prompt_admission_published(
                             &self.attachment.connection_id,
                             self.attachment.generation,
                             &admission.queue_item_id,
                         )
                         .await?;
-                    admission.notify.notify_one();
+                    if published {
+                        admission.notify.notify_one();
+                    }
                     Ok::<(), SharedSessionError>(())
                 })
                 .await?;

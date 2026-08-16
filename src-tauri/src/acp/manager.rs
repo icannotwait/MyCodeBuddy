@@ -585,8 +585,8 @@ struct SharedEnqueueFinalizeHook {
 #[cfg(test)]
 #[derive(Clone)]
 struct SharedEnqueuePublicationHook {
-    reached: Arc<tokio::sync::Notify>,
-    resume: Arc<tokio::sync::Notify>,
+    reached: Arc<tokio::sync::Barrier>,
+    resume: Arc<tokio::sync::Barrier>,
 }
 
 pub struct ConnectionManager {
@@ -869,6 +869,7 @@ impl ConnectionManager {
         let queue_item_id = admission.queue_item_id;
         let events = admission.events;
         let publication = admission.publication;
+        let publication_invalidated = admission.publication_invalidated;
         let notify = admission.notify;
         let publication_task = tokio::spawn(async move {
             publication
@@ -881,17 +882,26 @@ impl ConnectionManager {
                         .clone();
                     #[cfg(test)]
                     if let Some(hook) = publication_hook {
-                        hook.reached.notify_one();
-                        hook.resume.notified().await;
+                        hook.reached.wait().await;
+                        hook.resume.wait().await;
                     }
-                    manager
-                        .publish_shared_events(&connection_id, events)
-                        .await?;
-                    manager
+                    if !manager
+                        .publish_shared_prompt_admission_events(
+                            &connection_id,
+                            events,
+                            publication_invalidated,
+                        )
+                        .await?
+                    {
+                        return Ok::<(), AcpError>(());
+                    }
+                    let published = manager
                         .shared_session_broker
                         .mark_prompt_admission_published(&connection_id, generation, &queue_item_id)
                         .await?;
-                    notify.notify_one();
+                    if published {
+                        notify.notify_one();
+                    }
                     Ok::<(), AcpError>(())
                 })
                 .await
@@ -927,6 +937,39 @@ impl ConnectionManager {
             self.publish_shared_event(connection_id, event).await?;
         }
         Ok(())
+    }
+
+    async fn publish_shared_prompt_admission_events(
+        &self,
+        connection_id: &str,
+        events: Vec<AcpEvent>,
+        publication_invalidated: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<bool, AcpError> {
+        if publication_invalidated.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(false);
+        }
+        let handles = self
+            .shared_session_broker()
+            .public_state_and_emitter(connection_id)
+            .await;
+        let (state, emitter) = match handles {
+            Some(handles) => handles,
+            None => self
+                .get_state_and_emitter(connection_id)
+                .await
+                .ok_or_else(|| AcpError::ConnectionNotFound(connection_id.into()))?,
+        };
+        for event in events {
+            let publication_invalidated = publication_invalidated.clone();
+            let applied = emit_with_state_gated(&state, &emitter, event, move |_| {
+                !publication_invalidated.load(std::sync::atomic::Ordering::Acquire)
+            })
+            .await;
+            if !applied {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     async fn bind_shared_conversation_if_present(
@@ -20757,8 +20800,8 @@ mod tests {
             let (manager, attachment) = ready_manager().await;
             let state = manager.get_state(&attachment.connection_id).await.unwrap();
             let mut events = state.read().await.event_stream().subscribe();
-            let publication_reached = Arc::new(tokio::sync::Notify::new());
-            let publication_resume = Arc::new(tokio::sync::Notify::new());
+            let publication_reached = Arc::new(tokio::sync::Barrier::new(2));
+            let publication_resume = Arc::new(tokio::sync::Barrier::new(2));
             *manager
                 .shared_enqueue_publication_hook
                 .lock()
@@ -20775,7 +20818,7 @@ mod tests {
                     .enqueue_shared_prompt(original_request)
                     .await
             });
-            publication_reached.notified().await;
+            publication_reached.wait().await;
 
             let snapshot = state.read().await.shared_runtime_work_snapshot(None);
             assert!(matches!(
@@ -20808,7 +20851,7 @@ mod tests {
             tokio::task::yield_now().await;
             assert!(!retry.is_finished());
 
-            publication_resume.notify_one();
+            publication_resume.wait().await;
             retry.await.unwrap().unwrap();
 
             let mut admission_kinds = Vec::new();
@@ -20835,6 +20878,112 @@ mod tests {
                 .queue
                 .iter()
                 .all(|item| { item.client_message_id != "message-cancelled-publication" }));
+        }
+
+        #[tokio::test]
+        async fn terminal_failure_invalidates_paused_admission_publication() {
+            use crate::acp::shared_session::InternalPromptState;
+
+            let (manager, attachment) = ready_manager().await;
+            let state = manager.get_state(&attachment.connection_id).await.unwrap();
+            let mut events = state.read().await.event_stream().subscribe();
+            let publication_reached = Arc::new(tokio::sync::Barrier::new(2));
+            let publication_resume = Arc::new(tokio::sync::Barrier::new(2));
+            *manager
+                .shared_enqueue_publication_hook
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = Some(SharedEnqueuePublicationHook {
+                reached: publication_reached.clone(),
+                resume: publication_resume.clone(),
+            });
+
+            let request = queued_prompt(&attachment, "terminal-publication", "alpha");
+            let retry_request = request.clone();
+            let enqueue_manager = manager.clone_ref();
+            let enqueue =
+                tokio::spawn(async move { enqueue_manager.enqueue_shared_prompt(request).await });
+            publication_reached.wait().await;
+
+            let broker = manager.shared_session_broker();
+            let before_failure = broker
+                .diagnostic_for_connection(&attachment.connection_id)
+                .await
+                .unwrap();
+            let queue_item_id = before_failure.queue[0].queue_item_id.clone();
+            let driver_incarnation = broker
+                .driver_incarnation_for_generation(&attachment.connection_id, attachment.generation)
+                .await
+                .unwrap()
+                .unwrap();
+            let failure_events = broker
+                .fail_live_session(
+                    &attachment.connection_id,
+                    attachment.generation,
+                    &driver_incarnation,
+                    "session_unavailable",
+                )
+                .await
+                .unwrap();
+            manager
+                .publish_shared_events(&attachment.connection_id, failure_events)
+                .await
+                .unwrap();
+            while events.try_recv().is_ok() {}
+
+            assert_eq!(
+                broker
+                    .prompt_state_for_test(&attachment.connection_id, &queue_item_id)
+                    .await,
+                Some(InternalPromptState::Failed)
+            );
+            publication_resume.wait().await;
+            let _ = enqueue.await.unwrap();
+
+            let mut late_admission_event = false;
+            let mut dispatch_started = false;
+            while let Ok(envelope) = events.try_recv() {
+                late_admission_event |= matches!(
+                    envelope.payload,
+                    AcpEvent::PromptQueued { .. } | AcpEvent::PromptQueueDepthChanged { .. }
+                );
+                dispatch_started |=
+                    matches!(envelope.payload, AcpEvent::PromptDispatchStarted { .. });
+            }
+            assert!(!late_admission_event);
+            assert!(!dispatch_started);
+
+            let projection = state.read().await.shared_session.clone().unwrap();
+            assert!(projection.queue.is_empty());
+            assert!(projection.active_turn.is_none());
+            assert!(matches!(
+                projection.phase,
+                SharedSessionPhase::Failed { .. }
+            ));
+            assert_eq!(
+                broker
+                    .prompt_state_for_test(&attachment.connection_id, &queue_item_id)
+                    .await,
+                Some(InternalPromptState::Failed)
+            );
+
+            assert!(matches!(
+                manager.enqueue_shared_prompt(retry_request).await,
+                Err(AcpError::Shared(SharedSessionError::SessionUnavailable))
+            ));
+            assert!(events.try_recv().is_err());
+            let snapshot = state.read().await.shared_runtime_work_snapshot(None);
+            assert!(matches!(
+                broker
+                    .claim_dispatchable_head(
+                        &attachment.connection_id,
+                        attachment.generation,
+                        "invalid-terminal-claim",
+                        &snapshot,
+                    )
+                    .await
+                    .unwrap(),
+                DispatchHeadDecision::Blocked
+            ));
         }
 
         #[tokio::test]

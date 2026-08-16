@@ -8,7 +8,10 @@ pub use metrics::{SharedSessionMetrics, SharedSessionMetricsSnapshot};
 
 use std::{
     collections::{HashMap, VecDeque},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 
@@ -27,6 +30,7 @@ pub(crate) struct SharedPromptAdmission {
     pub queue_item_id: String,
     pub events: Vec<crate::acp::types::AcpEvent>,
     pub publication: Arc<tokio::sync::OnceCell<()>>,
+    pub publication_invalidated: Arc<AtomicBool>,
     pub notify: Arc<Notify>,
 }
 
@@ -144,6 +148,7 @@ impl SharedSessionBroker {
                         queue_item_id: entry.queue_item_id.clone(),
                         events: entry.admission_events.clone(),
                         publication: entry.admission_publication.clone(),
+                        publication_invalidated: entry.admission_invalidated.clone(),
                         notify: record.notify.clone(),
                     });
                 }
@@ -194,6 +199,7 @@ impl SharedSessionBroker {
                     queue_depth_event(record),
                 ];
                 let publication = Arc::new(tokio::sync::OnceCell::new());
+                let publication_invalidated = Arc::new(AtomicBool::new(false));
                 record.prompt_ledger.insert(
                     identity.clone(),
                     PromptLedgerEntry {
@@ -204,6 +210,7 @@ impl SharedSessionBroker {
                         frozen_result: None,
                         admission_events: events.clone(),
                         admission_publication: publication.clone(),
+                        admission_invalidated: publication_invalidated.clone(),
                         admission_published: false,
                     },
                 );
@@ -211,6 +218,7 @@ impl SharedSessionBroker {
                     queue_item_id,
                     events,
                     publication,
+                    publication_invalidated,
                     notify: record.notify.clone(),
                 })
             })
@@ -230,18 +238,28 @@ impl SharedSessionBroker {
         connection_id: &str,
         generation: u64,
         queue_item_id: &str,
-    ) -> Result<(), SharedSessionError> {
+    ) -> Result<bool, SharedSessionError> {
         self.with_authoritative_record(connection_id, |record| {
             if record.generation != generation {
                 return Err(SharedSessionError::GenerationStale);
             }
+            let live_phase = matches!(
+                record.phase,
+                SharedSessionPhase::Bootstrapping | SharedSessionPhase::Ready
+            );
             let entry = record
                 .prompt_ledger
                 .values_mut()
                 .find(|entry| entry.queue_item_id == queue_item_id)
                 .ok_or(SharedSessionError::QueueItemNotFound)?;
+            if !live_phase
+                || entry.state != InternalPromptState::Queued
+                || entry.admission_invalidated.load(Ordering::Acquire)
+            {
+                return Ok(false);
+            }
             entry.admission_published = true;
-            Ok(())
+            Ok(true)
         })
         .await?
         .ok_or(SharedSessionError::SessionUnavailable)
@@ -337,7 +355,7 @@ impl SharedSessionBroker {
                 .prompt_ledger
                 .get_mut(&identity)
                 .expect("queued item has ledger entry")
-                .state = InternalPromptState::Cancelled;
+                .invalidate_admission(InternalPromptState::Cancelled);
             Ok(SharedPromptMutation {
                 events: vec![
                     crate::acp::types::AcpEvent::PromptQueueItemCancelled {
@@ -1868,7 +1886,7 @@ impl SharedSessionBroker {
     }
 
     #[cfg(test)]
-    async fn prompt_state_for_test(
+    pub(crate) async fn prompt_state_for_test(
         &self,
         connection_id: &str,
         queue_item_id: &str,
@@ -2117,7 +2135,7 @@ fn fail_live_session_record(
             .prompt_ledger
             .get_mut(&active.identity)
             .expect("active turn has ledger entry")
-            .state = InternalPromptState::Failed;
+            .invalidate_admission(InternalPromptState::Failed);
         events.push(crate::acp::types::AcpEvent::SharedTurnSettled {
             generation,
             turn_id: active.projection.turn_id,
@@ -2129,7 +2147,7 @@ fn fail_live_session_record(
             .prompt_ledger
             .get_mut(&queued.identity)
             .expect("queued item has ledger entry")
-            .state = InternalPromptState::Failed;
+            .invalidate_admission(InternalPromptState::Failed);
         events.push(crate::acp::types::AcpEvent::PromptQueueItemFailed {
             generation,
             queue_item_id: queued.summary.queue_item_id,
@@ -2165,7 +2183,7 @@ fn fail_all_prompt_work(
             .prompt_ledger
             .get_mut(&active.identity)
             .expect("active turn has ledger entry")
-            .state = InternalPromptState::Failed;
+            .invalidate_admission(InternalPromptState::Failed);
         events.push(crate::acp::types::AcpEvent::SharedTurnSettled {
             generation: record.generation,
             turn_id: active.projection.turn_id,
@@ -2178,7 +2196,7 @@ fn fail_all_prompt_work(
             .prompt_ledger
             .get_mut(&queued.identity)
             .expect("queued item has ledger entry")
-            .state = InternalPromptState::Failed;
+            .invalidate_admission(InternalPromptState::Failed);
         events.push(crate::acp::types::AcpEvent::PromptQueueItemFailed {
             generation: record.generation,
             queue_item_id: queued.summary.queue_item_id,
@@ -2255,7 +2273,7 @@ struct PromptIdentity {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InternalPromptState {
+pub(crate) enum InternalPromptState {
     Queued,
     Dispatching,
     Completed,
@@ -2271,7 +2289,15 @@ struct PromptLedgerEntry {
     frozen_result: Option<PromptEnqueueResult>,
     admission_events: Vec<crate::acp::types::AcpEvent>,
     admission_publication: Arc<tokio::sync::OnceCell<()>>,
+    admission_invalidated: Arc<AtomicBool>,
     admission_published: bool,
+}
+
+impl PromptLedgerEntry {
+    fn invalidate_admission(&mut self, state: InternalPromptState) {
+        self.admission_invalidated.store(true, Ordering::Release);
+        self.state = state;
+    }
 }
 
 struct QueuedPromptRecord {
