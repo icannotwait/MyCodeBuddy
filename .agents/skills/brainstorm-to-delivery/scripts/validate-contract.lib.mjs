@@ -911,6 +911,16 @@ const AGENT_IDENTITY_OBJECT_TERMS = new Set([
   "profile",
   "profiles",
 ])
+const AGENT_IDENTITY_OBJECT_PREFIX_TERMS = new Set([
+  "a",
+  "an",
+  "current",
+  "its",
+  "selected",
+  "that",
+  "the",
+  "this",
+])
 const TASK_STATE_ANAPHOR_ADJUNCT_PREFIXES = [
   ["according", "to"],
   ["in", "fact"],
@@ -3886,16 +3896,21 @@ function previousSegmentHasExplicitNonTaskAntecedent(clause, start) {
     boundary
   ).at(-1)
   if (modifier === undefined) return false
-  const subjectHead = clause.tokens
-    .slice(modifier + 1, boundary)
-    .find(
-      (token) =>
-        !TASK_STATE_SUBJECT_DETERMINERS.has(token) &&
-        !TASK_STATE_MODIFIERS.has(token) &&
-        !token.endsWith("ly")
-    )
+  const subjectTokens = clause.tokens.slice(modifier + 1, boundary)
+  const subjectHeadOffset = subjectTokens.findIndex(
+    (token) =>
+      !TASK_STATE_SUBJECT_DETERMINERS.has(token) &&
+      !TASK_STATE_MODIFIERS.has(token) &&
+      !token.endsWith("ly")
+  )
+  const subjectHead = subjectTokens[subjectHeadOffset]
+  const subjectHeadIndex = modifier + 1 + subjectHeadOffset
+  const hasCloserTaskAntecedent = directiveTasks(clause.tokens).some(
+    (task) => task.index > subjectHeadIndex && task.index < boundary
+  )
   return (
     subjectHead !== undefined &&
+    !hasCloserTaskAntecedent &&
     !new Set(["it", "itself", "task"]).has(subjectHead)
   )
 }
@@ -3967,6 +3982,11 @@ function taskMentionIsNestedInNonTaskSubject(clause, task, state) {
     (token) => PEOPLE_ANTECEDENT_LINKS.has(token) || token.endsWith("ing")
   )
   if (objectLink < 0) return false
+  if (
+    TASK_REACTIVATION_PREDICATES.has(clause.tokens[prefixStart + objectLink])
+  ) {
+    return false
+  }
   const subjectHead = prefix
     .slice(0, objectLink)
     .find(
@@ -4437,6 +4457,7 @@ function completionHasDirectObject(clause, completion) {
       !token.endsWith("ly")
   )
   if (head < 0) return false
+  if (clause.possessiveIndexes?.has(completion + 1 + head)) return true
   if (
     new Set([
       ...ACTIVE_TIMING_MARKERS,
@@ -4702,15 +4723,28 @@ function hasPreCompletionTaskTiming(clause) {
 
 function changeHasExplicitNonAgentObject(clause, change) {
   const segment = actionSegment(clause, change)
-  if (
-    tokenIndex(
-      clause.tokens,
-      AGENT_IDENTITY_OBJECT_TERMS,
-      change + 1,
-      segment.end
-    ) >= 0
-  ) {
-    return false
+  const identityObject = tokenIndex(
+    clause.tokens,
+    AGENT_IDENTITY_OBJECT_TERMS,
+    change + 1,
+    segment.end
+  )
+  if (identityObject >= 0) {
+    const identityPrefix = clause.tokens
+      .slice(change + 1, identityObject)
+      .filter(
+        (token) =>
+          !AGENT_CHANGE_SUBJECT_BRIDGE_TERMS.has(token) &&
+          !TASK_STATE_MODIFIERS.has(token) &&
+          !token.endsWith("ly")
+      )
+    if (
+      identityPrefix.every((token) =>
+        AGENT_IDENTITY_OBJECT_PREFIX_TERMS.has(token)
+      )
+    ) {
+      return false
+    }
   }
   const tailActors = clause.actors.filter(
     (actor) => actor.start > change && actor.end <= segment.end
