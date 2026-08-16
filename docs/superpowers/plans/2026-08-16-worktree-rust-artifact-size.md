@@ -47,10 +47,9 @@ import { fileURLToPath } from "node:url"
 
 const repositoryRoot = dirname(fileURLToPath(import.meta.url)) + "/.."
 
-test("repository Cargo config omits debug and incremental artifacts", () => {
+test("repository Cargo config keeps dev and test artifacts lean", () => {
   const fixtureRoot = mkdtempSync(join(tmpdir(), "codeg-cargo-policy-"))
   const manifestPath = join(fixtureRoot, "Cargo.toml")
-  const targetPath = join(fixtureRoot, "target")
 
   try {
     mkdirSync(join(fixtureRoot, "src"))
@@ -60,31 +59,35 @@ test("repository Cargo config omits debug and incremental artifacts", () => {
     )
     writeFileSync(join(fixtureRoot, "src", "lib.rs"), "pub fn value() -> u8 { 1 }\n")
 
-    const result = spawnSync(
-      "cargo",
-      [
-        "--config",
-        join(repositoryRoot, ".cargo", "config.toml"),
-        "test",
-        "--no-run",
-        "-v",
-        "--manifest-path",
-        manifestPath,
-        "--target-dir",
-        targetPath,
-      ],
-      {
-        encoding: "utf8",
-        env: { ...process.env, CARGO_TERM_COLOR: "never" },
-        maxBuffer: 10 * 1024 * 1024,
-      }
-    )
-    const output = `${result.stdout}\n${result.stderr}`
+    for (const [profile, cargoArgs] of [
+      ["dev", ["check"]],
+      ["test", ["test", "--no-run"]],
+    ]) {
+      const result = spawnSync(
+        "cargo",
+        [
+          "--config",
+          join(repositoryRoot, ".cargo", "config.toml"),
+          ...cargoArgs,
+          "-v",
+          "--manifest-path",
+          manifestPath,
+          "--target-dir",
+          join(fixtureRoot, `target-${profile}`),
+        ],
+        {
+          encoding: "utf8",
+          env: { ...process.env, CARGO_TERM_COLOR: "never" },
+          maxBuffer: 10 * 1024 * 1024,
+        }
+      )
+      const output = `${result.stdout}\n${result.stderr}`
 
-    assert.equal(result.status, 0, output)
-    assert.match(output, /rustc.*cargo_policy_fixture/)
-    assert.doesNotMatch(output, /-C debuginfo=[1-9]/)
-    assert.doesNotMatch(output, /-C incremental=/)
+      assert.equal(result.status, 0, output)
+      assert.match(output, /rustc.*cargo_policy_fixture/)
+      assert.doesNotMatch(output, /-C debuginfo=[1-9]/)
+      assert.doesNotMatch(output, /-C incremental=/)
+    }
   } finally {
     rmSync(fixtureRoot, { recursive: true, force: true })
   }
