@@ -342,6 +342,9 @@ fn markdown_fence_start(line: &str) -> Option<MarkdownFence> {
         .iter()
         .take_while(|byte| **byte == character)
         .count();
+    if character == b'`' && bytes[indentation + length..].contains(&b'`') {
+        return None;
+    }
     (length >= 3).then_some(MarkdownFence { character, length })
 }
 
@@ -926,6 +929,31 @@ mod tests {
 
         assert!(parsed.routing.is_some());
         assert!(parsed.warning_codes.is_empty());
+    }
+
+    #[test]
+    fn simple_parse_routing_applies_commonmark_backtick_info_rule() {
+        let visible = format!(
+            "# Plan\n\n```info`bad\n<!-- codeg-b2d-routing-v1\n{VALID_ROUTING_JSON}\n-->\n```\n"
+        );
+        let parsed =
+            parse_simple_plan(visible.as_bytes()).expect("parse visible marker");
+        assert!(parsed.routing.is_some());
+        assert!(parsed.warning_codes.is_empty());
+
+        for fenced in [
+            format!(
+                "# Plan\n\n```info\n<!-- codeg-b2d-routing-v1\n{VALID_ROUTING_JSON}\n-->\n```\n"
+            ),
+            format!(
+                "# Plan\n\n~~~info`allowed\n<!-- codeg-b2d-routing-v1\n{VALID_ROUTING_JSON}\n-->\n~~~\n"
+            ),
+        ] {
+            let parsed =
+                parse_simple_plan(fenced.as_bytes()).expect("parse fenced marker");
+            assert!(parsed.routing.is_none());
+            assert!(parsed.warning_codes.is_empty());
+        }
     }
 
     #[test]

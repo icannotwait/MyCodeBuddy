@@ -3993,6 +3993,14 @@ function stateSegmentHasExplicitNonTaskSubject(clause, start, end) {
     end
   )
   if (predicate < 0) return false
+  const causativeObject = predicate - 1
+  if (
+    clause.tokens[causativeObject] === "it" &&
+    PEOPLE_PURPOSE_ACTIONS.has(clause.tokens[causativeObject - 1]) &&
+    !previousSegmentHasExplicitNonTaskAntecedent(clause, start)
+  ) {
+    return false
+  }
   const taskObject = tokenIndex(
     clause.tokens,
     new Set(["it"]),
@@ -5577,6 +5585,9 @@ export function validateSkillMarkdown(skillMarkdown) {
 
 function fenceStart(line) {
   const match = line.match(/^\s{0,3}(`{3,}|~{3,})/)
+  if (match?.[1][0] === "`" && line.slice(match[0].length).includes("`")) {
+    return null
+  }
   return match ? { character: match[1][0], length: match[1].length } : null
 }
 
@@ -6145,6 +6156,17 @@ function validateRun(run, taskIndex, runIndex, failures) {
       `${label} recovery_count permits at most 2 unexpected continuations`
     )
   }
+  if (
+    run.task_agent_generation !== undefined &&
+    (!positiveInteger(run.task_agent_generation) ||
+      run.task_agent_generation > MAX_U32)
+  ) {
+    fail(
+      failures,
+      "B2D-PROGRESS-006",
+      `${label} task_agent_generation must be an unsigned positive 32-bit integer`
+    )
+  }
 
   const replaced = nonEmptyString(run.replaced_task_id)
   const reason = nonEmptyString(run.replacement_reason)
@@ -6218,12 +6240,13 @@ function validateTaskRunLineages(task, failures, taskIds, childOwners) {
       if (
         run.work_unit_key !== first.work_unit_key ||
         run.agent_type !== first.agent_type ||
-        runProfileIdentity(run) !== firstProfile
+        runProfileIdentity(run) !== firstProfile ||
+        run.task_agent_generation !== first.task_agent_generation
       ) {
         fail(
           failures,
           "B2D-PROGRESS-006",
-          `${label} changes key, agent, or profile within one lineage`
+          `${label} changes key, agent, profile, or Task Agent generation within one lineage`
         )
       }
 
@@ -6477,6 +6500,13 @@ export function validateProgressRouting(snapshot, routing, failures) {
     if (Array.isArray(task.runs)) {
       for (const run of task.runs) {
         if (!isObject(run) || !nonEmptyString(run.work_unit_key)) continue
+        if (run.task_agent_generation !== routeTask.task_agent_generation) {
+          fail(
+            failures,
+            "B2D-PROGRESS-009",
+            `Task ${routeTask.index} run is not bound to its routed Task Agent generation`
+          )
+        }
         if (!allowed.has(run.work_unit_key)) {
           fail(
             failures,
@@ -6554,6 +6584,7 @@ export function validateProgressRouting(snapshot, routing, failures) {
       (run) =>
         isObject(run) &&
         run.work_unit_key === implementerKey &&
+        run.task_agent_generation === boundaryRoute?.task_agent_generation &&
         nonEmptyString(run.task_id) &&
         positiveInteger(run.child_conversation_id) &&
         run.child_conversation_id <= MAX_I32

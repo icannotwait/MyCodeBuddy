@@ -294,10 +294,11 @@ and auxiliary reviewer keys for routed Tasks. Read a legacy five-part Task
 reviewer key only as a legacy primary lineage.
 
 Before each call, record reserving intent with the exact Agent, profile, role,
-and key. Call generic delegation. After admission, record task and child
-conversation IDs. After each observation, record the latest state. Keep
-task_id globally unique and attach one non-null child conversation to only one
-complete work-unit key.
+key, and Task Agent generation. Never rewrite a run's generation after
+admission. Call generic delegation. After admission, record task and child
+conversation IDs. After each observation, record the latest state. Keep task_id
+globally unique and attach one non-null child conversation to only one complete
+work-unit key.
 
 ### Progress JSON
 
@@ -332,6 +333,7 @@ Task and run entries without dropping route or lineage fields.
           "child_conversation_id": null,
           "state": "reserving",
           "work_unit_key": "task|1|implementer|codex|none",
+          "task_agent_generation": 1,
           "recovery_count": 0,
           "replaced_task_id": null,
           "replacement_reason": null

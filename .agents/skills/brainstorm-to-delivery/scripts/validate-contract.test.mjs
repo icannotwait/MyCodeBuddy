@@ -237,7 +237,13 @@ ${block("codeg-b2d-routing-v1", snapshot)}
 `
 }
 
-function run(key, state, task_id, child_conversation_id) {
+function run(
+  key,
+  state,
+  task_id,
+  child_conversation_id,
+  task_agent_generation = 1
+) {
   const parts = key.split("|")
   const slotted = parts.length === 6
   const profile = parts[slotted ? 5 : 4]
@@ -249,6 +255,7 @@ function run(key, state, task_id, child_conversation_id) {
     child_conversation_id,
     state,
     work_unit_key: key,
+    task_agent_generation,
     recovery_count: 0,
     replaced_task_id: null,
     replacement_reason: null,
@@ -268,14 +275,21 @@ function progressTask(routeTask, status, child = 10) {
   const runs = []
   if (status === "completed") {
     runs.push(
-      run(keys.implementer, "completed", `t${routeTask.index}-i`, child)
+      run(
+        keys.implementer,
+        "completed",
+        `t${routeTask.index}-i`,
+        child,
+        routeTask.task_agent_generation
+      )
     )
     runs.push(
       run(
         keys.reviewers.primary,
         "completed",
         `t${routeTask.index}-p`,
-        child + 1
+        child + 1,
+        routeTask.task_agent_generation
       )
     )
     if (keys.reviewers.auxiliary) {
@@ -284,7 +298,8 @@ function progressTask(routeTask, status, child = 10) {
           keys.reviewers.auxiliary,
           "completed",
           `t${routeTask.index}-a`,
-          child + 2
+          child + 2,
+          routeTask.task_agent_generation
         )
       )
     }
@@ -426,6 +441,26 @@ describe("Skill contract v2", () => {
     ]) {
       has(validateSkillMarkdown(`${skill}\n${prose}`).failures, "B2D-SKILL-005")
     }
+  })
+
+  it("round-22 treats a backtick-bearing backtick info string as visible prose", () => {
+    const contradiction = "The Task Agent implements high Tasks."
+    has(
+      validateSkillMarkdown(
+        `${skill}\n\`\`\`info\`bad\n${contradiction}\n\`\`\``
+      ).failures,
+      "B2D-SKILL-005"
+    )
+    assert.deepEqual(
+      validateSkillMarkdown(`${skill}\n\`\`\`info\n${contradiction}\n\`\`\``)
+        .failures,
+      []
+    )
+    assert.deepEqual(
+      validateSkillMarkdown(`${skill}\n~~~info\`allowed\n${contradiction}\n~~~`)
+        .failures,
+      []
+    )
   })
 
   it("rejects bounded ownership and route directive paraphrases", () => {
@@ -5148,6 +5183,21 @@ describe("Skill contract v2", () => {
     ])
   })
 
+  it("round-22 binds causative restart objects to the active Task", () => {
+    assertSkillClassifications([
+      {
+        prose:
+          "The active Task is completed but the server, monitoring the Task, lets it restart and it is still running. Then switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "The active Task is completed but the server, monitoring the Task, lets itself restart and it is still running. Then switch the Task Agent.",
+        reject: false,
+      },
+    ])
+  })
+
   it("contains the complete operational policy and document JSON shapes", () => {
     const policy = fencedJsonAfterHeading(
       realSkill,
@@ -5260,6 +5310,7 @@ describe("Skill contract v2", () => {
       "child_conversation_id",
       "state",
       "work_unit_key",
+      "task_agent_generation",
       "recovery_count",
       "replaced_task_id",
       "replacement_reason",
@@ -5749,7 +5800,7 @@ describe("progress agreement and per-key lineage", () => {
     const implementer = state.tasks[1].expected_work_unit_keys.implementer
     state.tasks[1].status = "in_progress"
     state.active_task_index = 2
-    state.tasks[1].runs.push(run(implementer, "running", "t2-i", 20))
+    state.tasks[1].runs.push(run(implementer, "running", "t2-i", 20, 2))
     assert.deepEqual(validate(route, state, routedPlan), [], "admitted/active")
 
     state.tasks[1].runs[0].state = "completed"
@@ -5758,7 +5809,8 @@ describe("progress agreement and per-key lineage", () => {
         state.tasks[1].expected_work_unit_keys.reviewers.primary,
         "running",
         "t2-p",
-        21
+        21,
+        2
       )
     )
     assert.deepEqual(
@@ -5780,7 +5832,8 @@ describe("progress agreement and per-key lineage", () => {
         state.tasks[2].expected_work_unit_keys.implementer,
         "running",
         "t3-i",
-        30
+        30,
+        2
       )
     )
     assert.deepEqual(validate(route, state, routedPlan), [], "following Task")
@@ -5809,12 +5862,42 @@ describe("progress agreement and per-key lineage", () => {
           state.tasks[1].expected_work_unit_keys.reviewers[slot],
           "running",
           `t2-${slot}`,
-          20 + index
+          20 + index,
+          2
         )
       )
 
       has(validate(route, state), "B2D-ROUTING-007")
     }
+  })
+
+  it("round-22 rejects rewriting an admitted high Task to a new Task Agent generation", () => {
+    const route = routing()
+    const state = progress(route)
+    state.tasks[1].status = "in_progress"
+    state.active_task_index = 2
+    state.tasks[1].runs.push(
+      run(
+        state.tasks[1].expected_work_unit_keys.implementer,
+        "running",
+        "t2-i",
+        20,
+        1
+      )
+    )
+
+    const selected = identity("gemini", "careful")
+    route.task_agent_generations.push({
+      generation: 2,
+      ...selected,
+      effective_from_task_index: 2,
+    })
+    route.tasks[1] = task(2, "high", selected, 2)
+    const rewritten = progressTask(route.tasks[1], "pending", 20)
+    state.tasks[1].task_agent_generation = rewritten.task_agent_generation
+    state.tasks[1].expected_work_unit_keys = rewritten.expected_work_unit_keys
+
+    has(validate(route, state), "B2D-ROUTING-007")
   })
 
   it("adopts a later generation only at an empty pending boundary", () => {
@@ -5841,7 +5924,8 @@ describe("progress agreement and per-key lineage", () => {
             p.tasks[1].expected_work_unit_keys.implementer,
             "reserving",
             "reserved",
-            null
+            null,
+            2
           ),
         ]
       },
@@ -5851,7 +5935,8 @@ describe("progress agreement and per-key lineage", () => {
             p.tasks[1].expected_work_unit_keys.implementer,
             "running",
             "admitted",
-            20
+            20,
+            2
           ),
         ]
       },
@@ -5884,7 +5969,8 @@ describe("progress agreement and per-key lineage", () => {
         state.tasks[2].expected_work_unit_keys.implementer,
         "reserving",
         "reserved-later",
-        null
+        null,
+        2
       )
     )
 
@@ -5911,7 +5997,8 @@ describe("progress agreement and per-key lineage", () => {
         state.tasks[1].expected_work_unit_keys.implementer,
         "running",
         "t2-i",
-        20
+        20,
+        2
       )
     )
     state.tasks[2].runs.push(
@@ -5919,7 +6006,8 @@ describe("progress agreement and per-key lineage", () => {
         state.tasks[2].expected_work_unit_keys.implementer,
         "reserving",
         "reserved-later",
-        null
+        null,
+        2
       )
     )
 
