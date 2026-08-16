@@ -2019,7 +2019,7 @@ git commit -m "feat: migrate server ACP roots to shared ownership"
 - Modify: `src/components/chat/message-input.tsx`
 - Modify: `src/components/chat/message-input.test.tsx`
 - Modify: `src/components/conversations/conversation-session-surface.tsx`
-- Modify: `src/components/conversations/conversation-session-surface.test.tsx`
+- Modify: `src/components/conversations/conversation-session-surface.test.ts`
 - Modify: `src/contexts/acp-connections-context.tsx`
 
 **Interfaces:**
@@ -2053,7 +2053,7 @@ Extend the existing conversation-surface harness rather than inventing a second 
 
 - [ ] **Step 2: Run component/surface tests to verify RED**
 
-Run: `pnpm test -- src/components/chat/shared-message-queue-display.test.tsx src/components/chat/message-input.test.tsx src/components/conversations/conversation-session-surface.test.tsx`
+Run: `pnpm test -- src/components/chat/shared-message-queue-display.test.tsx src/components/chat/message-input.test.tsx src/components/conversations/conversation-session-surface.test.ts`
 
 Expected: FAIL because the authoritative queue component/reconciliation do not exist.
 
@@ -2099,7 +2099,7 @@ On `SharedTurnSettled(cancelled)`, clear only the matching active turn. Do not c
 
 - [ ] **Step 7: Run UI, provider, and queue regressions**
 
-Run: `pnpm test -- src/components/chat/shared-message-queue-display.test.tsx src/components/chat/message-input.test.tsx src/components/chat/message-queue-display.test.tsx src/components/conversations/conversation-session-surface.test.tsx src/contexts/acp-connections-context.test.tsx src/hooks/use-message-queue.test.ts`
+Run: `pnpm test -- src/components/chat/shared-message-queue-display.test.tsx src/components/chat/message-input.test.tsx src/components/chat/message-queue-display.test.tsx src/components/conversations/conversation-session-surface.test.ts src/contexts/acp-connections-context.test.tsx src/hooks/use-message-queue.test.ts`
 
 Expected: PASS for shared authoritative FIFO and unchanged local editable/reorder queue.
 
@@ -2110,7 +2110,7 @@ Expected: PASS with no layout overflow or unused legacy queue symbols.
 - [ ] **Step 8: Commit Task 11**
 
 ```bash
-git add src/components/chat/shared-message-queue-display.tsx src/components/chat/shared-message-queue-display.test.tsx src/components/chat/chat-input.tsx src/components/chat/message-input.tsx src/components/chat/message-input.test.tsx src/components/conversations/conversation-session-surface.tsx src/components/conversations/conversation-session-surface.test.tsx src/contexts/acp-connections-context.tsx
+git add src/components/chat/shared-message-queue-display.tsx src/components/chat/shared-message-queue-display.test.tsx src/components/chat/chat-input.tsx src/components/chat/message-input.tsx src/components/chat/message-input.test.tsx src/components/conversations/conversation-session-surface.tsx src/components/conversations/conversation-session-surface.test.ts src/contexts/acp-connections-context.tsx
 git commit -m "feat: render authoritative shared ACP prompt queue"
 ```
 
