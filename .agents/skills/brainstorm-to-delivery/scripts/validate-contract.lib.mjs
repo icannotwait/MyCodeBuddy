@@ -458,6 +458,7 @@ const DOCUMENT_PERSON_ROLE_TERMS = new Set([
 ])
 const ANTECEDENT_PREDICATES = new Set([
   ...PRODUCTION_ACTIONS,
+  ...ORCHESTRATION_ACTIONS,
   "discuss",
   "discussed",
   "discusses",
@@ -511,32 +512,30 @@ const POSTPOSED_REVIEW_ABSENCE_TERMS = new Set([
   "missing",
   "omitted",
 ])
-const POSTPOSED_REVIEW_SUBJECT_MODIFIERS = new Set([
-  "a",
-  "an",
-  "agent",
-  "are",
-  "auxiliary",
-  "be",
-  "been",
-  "being",
-  "is",
-  "primary",
-  "remain",
-  "remains",
-  "review",
-  "reviewer",
-  "reviewers",
-  "role",
-  "slot",
-  "the",
-  "was",
-  "were",
-  "when",
-])
 const ACTOR_LINKS = new Set(["by", "to"])
+const NESTED_ACTOR_PREFIX_LINKS = new Set([
+  "after",
+  "before",
+  "for",
+  "from",
+  "of",
+  "through",
+  "with",
+])
+const ACTOR_RELATION_BOUNDARIES = new Set([
+  "after",
+  "before",
+  "during",
+  "if",
+  "once",
+  "unless",
+  "upon",
+  "when",
+  "while",
+])
 const CLAUSE_COORDINATORS = new Set(["and", "but", "while", "yet"])
 const PREDICATE_COORDINATORS = new Set(["and", "but"])
+const ALTERNATIVE_RESET_COORDINATORS = new Set(["but", "yet"])
 const TASK_RELATION_BOUNDARIES = new Set([...CLAUSE_COORDINATORS, "or"])
 const HIGH_TASK_SCOPES = new Set(["high", "high-risk"])
 const NORMAL_TASK_SCOPES = new Set(["normal"])
@@ -562,6 +561,26 @@ const TASK_COMPLETION_TERMS = new Set([
   "finished",
   "finishes",
 ])
+const TASK_COMPLETION_BRIDGE_TERMS = new Set([
+  "already",
+  "be",
+  "been",
+  "being",
+  "can",
+  "could",
+  "had",
+  "has",
+  "have",
+  "is",
+  "may",
+  "might",
+  "must",
+  "now",
+  "was",
+  "were",
+  "will",
+  "would",
+])
 const ACTIVE_TIMING_MARKERS = new Set(["during", "inside", "while"])
 const BOUNDARY_TIMING_MARKERS = new Set([
   "after",
@@ -572,6 +591,26 @@ const BOUNDARY_TIMING_MARKERS = new Set([
   "when",
 ])
 const PRE_COMPLETION_TIMING_MARKERS = new Set(["before", "prior"])
+const TASK_REFERENCE_BOUNDARIES = new Set([
+  ...CLAUSE_COORDINATORS,
+  ...ACTIVE_TIMING_MARKERS,
+  ...BOUNDARY_TIMING_MARKERS,
+  ...PRE_COMPLETION_TIMING_MARKERS,
+  "for",
+  "from",
+  "of",
+  "through",
+  "to",
+  "until",
+  "with",
+])
+const REVIEW_SUBJECT_BOUNDARIES = new Set([
+  ...CLAUSE_COORDINATORS,
+  ...BOUNDARY_TIMING_MARKERS,
+  ...PRE_COMPLETION_TIMING_MARKERS,
+  "if",
+  "unless",
+])
 const REVIEW_BYPASS_ACTIONS = new Set([
   "instead",
   "omit",
@@ -615,6 +654,26 @@ const REVIEW_REPLACEMENT_ACTIONS = new Set([
 ])
 const REVIEW_TAKE_ACTIONS = new Set(["take", "takes", "taking", "took"])
 const REVIEW_REQUIREMENT_ACTIONS = new Set(["mandatory", "required"])
+const REVIEW_EXHAUSTIVE_QUANTIFIERS = new Set([
+  "alone",
+  "exclusively",
+  "only",
+  "solely",
+])
+const REVIEW_ACTOR_TAIL_TERMS = new Set([
+  "a",
+  "agent",
+  "an",
+  "auxiliary",
+  "primary",
+  "review",
+  "reviewer",
+  "reviewers",
+  "role",
+  "slot",
+  "the",
+])
+const QUANTIFIER_COMPLEMENT_LINKS = new Set(["about", "for", "on", "regarding"])
 const REVIEW_SUBJECT_LINKS = new Set([
   "although",
   "am",
@@ -1198,7 +1257,13 @@ function mentionsPluralGroup(tokens, mentions) {
 function directivePronounAntecedent(tokens) {
   const documents = directiveDocumentTargets(tokens)
   const people = directivePeopleAntecedents(tokens)
-  const predicate = tokenIndexes(tokens, ANTECEDENT_PREDICATES).at(-1)
+  const actors = directiveActors(tokens)
+  const predicate = tokenIndexes(tokens, ANTECEDENT_PREDICATES)
+    .filter(
+      (index) =>
+        !actors.some((actor) => actor.start <= index && index < actor.end)
+    )
+    .at(-1)
   const documentMentions = documents.map((target) => ({
     start: target.index,
     end: target.index + 1,
@@ -1212,11 +1277,26 @@ function directivePronounAntecedent(tokens) {
     predicate === undefined
       ? people
       : people.filter((person) => person.end <= predicate)
+  const peopleRecipients =
+    predicate === undefined
+      ? []
+      : people.filter(
+          (person) =>
+            person.start > predicate &&
+            tokenIndex(
+              tokens,
+              new Set(["by", "to"]),
+              predicate + 1,
+              person.start
+            ) >= 0
+        )
 
   const pluralDocuments = mentionsPluralGroup(tokens, documentObjects)
-  const pluralPeople = mentionsPluralGroup(tokens, peopleSubjects)
-  if (pluralDocuments) return "document"
+  const pluralPeople =
+    mentionsPluralGroup(tokens, peopleSubjects) ||
+    mentionsPluralGroup(tokens, peopleRecipients)
   if (pluralPeople) return "people"
+  if (pluralDocuments) return "document"
   return null
 }
 
@@ -1429,6 +1509,7 @@ function actorRelationPrefixIsValid(prefix) {
         PRODUCTION_ACTIONS.has(token) ||
         DIRECT_ROUTE_ACTIONS.has(token) ||
         REVIEW_TERMS.has(token) ||
+        NESTED_ACTOR_PREFIX_LINKS.has(token) ||
         ["task", "tasks"].includes(token)
     )
   )
@@ -1436,7 +1517,14 @@ function actorRelationPrefixIsValid(prefix) {
 
 function actorsAfterLink(clause, link, end = clause.tokens.length) {
   const nextLink = tokenIndex(clause.tokens, ACTOR_LINKS, link + 1, end)
-  const relationEnd = nextLink >= 0 ? nextLink : end
+  let relationEnd = nextLink >= 0 ? nextLink : end
+  const boundary = tokenIndex(
+    clause.tokens,
+    ACTOR_RELATION_BOUNDARIES,
+    link + 1,
+    relationEnd
+  )
+  if (boundary >= 0) relationEnd = boundary
   const actors = clause.actors.filter(
     (actor) => actor.start > link && actor.end <= relationEnd
   )
@@ -1454,6 +1542,35 @@ function alternativeExclusionStart(clause, action, end) {
   return starts.length > 0 ? Math.min(...starts) : -1
 }
 
+function positionIsExcludedAlternative(clause, alternativeStart, position) {
+  if (alternativeStart < 0 || position <= alternativeStart) return false
+  return (
+    tokenIndex(
+      clause.tokens,
+      ALTERNATIVE_RESET_COORDINATORS,
+      alternativeStart + 2,
+      position
+    ) < 0
+  )
+}
+
+function actionIsExcludedAlternative(clause, action) {
+  const previous = clause.actions
+    .filter((candidate) => candidate.index < action.index)
+    .at(-1)
+  const start = (previous?.index ?? -1) + 1
+  const starts = [
+    phraseIndex(clause.tokens, ["rather", "than"], start, action.index + 1),
+    phraseIndex(clause.tokens, ["instead", "of"], start, action.index + 1),
+  ].filter((index) => index >= 0)
+  if (starts.length === 0) return false
+  return positionIsExcludedAlternative(
+    clause,
+    Math.max(...starts),
+    action.index
+  )
+}
+
 function actorBindingsAfterLink(clause, action, link, end) {
   const actors = actorsAfterLink(clause, link, end)
   const relationNegated = relationTargetIsNegated(clause, action, link)
@@ -1469,8 +1586,11 @@ function actorBindingsAfterLink(clause, action, link, end) {
     const negationStart = (coordinator ?? localStart - 1) + 1
     const explicitlyNegated =
       tokenIndex(clause.tokens, NEGATION_TERMS, negationStart, actor.start) >= 0
-    const excludedAlternative =
-      alternativeStart >= 0 && actor.start > alternativeStart
+    const excludedAlternative = positionIsExcludedAlternative(
+      clause,
+      alternativeStart,
+      actor.start
+    )
     return {
       actor,
       negated:
@@ -1488,12 +1608,31 @@ function directPassiveActorsForAction(clause, action) {
     (candidate) => candidate.index > action.index
   )
   const actors = []
-  for (const link of tokenIndexes(
+  const links = tokenIndexes(
     clause.tokens,
     new Set(["by"]),
     action.index + 1,
     nextAction?.index ?? clause.tokens.length
-  )) {
+  )
+  for (const [linkIndex, link] of links.entries()) {
+    if (linkIndex > 0) {
+      const previousLink = links[linkIndex - 1]
+      const previousActor = clause.actors
+        .filter((actor) => actor.start > previousLink && actor.end <= link)
+        .at(-1)
+      const relationStart = previousActor?.end ?? previousLink + 1
+      const continuesRelation =
+        tokenIndex(
+          clause.tokens,
+          new Set(["and", "but", "or", "yet"]),
+          relationStart,
+          link
+        ) >= 0 ||
+        phraseIndex(clause.tokens, ["rather", "than"], relationStart, link) >=
+          0 ||
+        phraseIndex(clause.tokens, ["instead", "of"], relationStart, link) >= 0
+      if (!continuesRelation) continue
+    }
     actors.push(
       ...actorBindingsAfterLink(
         clause,
@@ -2088,9 +2227,33 @@ function reviewerRoleIsExplicitlyAbsent(clause, action, role) {
         Math.min(relationEnd, actor.end + 6)
       ).some((absence) => {
         if (actionIsNegated(clause.tokens, absence)) return false
-        return clause.tokens
-          .slice(actor.end, absence)
-          .every((token) => POSTPOSED_REVIEW_SUBJECT_MODIFIERS.has(token))
+        const subjectLink = tokenIndex(
+          clause.tokens,
+          REVIEW_SUBJECT_LINKS,
+          actor.end,
+          absence
+        )
+        if (subjectLink < 0) return false
+        if (
+          tokenIndex(
+            clause.tokens,
+            REVIEW_SUBJECT_BOUNDARIES,
+            actor.end,
+            subjectLink
+          ) >= 0
+        ) {
+          return false
+        }
+        if (
+          tokenIndex(clause.tokens, CLAUSE_COORDINATORS, actor.end, absence) >=
+          0
+        ) {
+          return false
+        }
+        return !clause.actors.some(
+          (candidate) =>
+            candidate.start >= actor.end && candidate.end <= absence
+        )
       })
     })
 }
@@ -2150,16 +2313,28 @@ function explicitReviewerCardinality(clause, action) {
     start,
     action.index
   )
-  const markerQualifiesExpectedRole = (marker) =>
-    tokenIndex(
-      clause.tokens,
-      new Set(["primary", "auxiliary"]),
-      marker + 1,
-      action.index
-    ) >= 0 &&
-    clause.actors.some(
-      (actor) => actor.start > marker && actor.end <= action.index
+  const markerIntroducesComplementarySlot = (marker) => {
+    const slots = ["primary", "auxiliary"].filter(
+      (slot) =>
+        tokenIndex(clause.tokens, new Set([slot]), marker + 1, action.index) >=
+        0
     )
+    if (
+      slots.length !== 1 ||
+      !clause.actors.some(
+        (actor) => actor.start > marker && actor.end <= action.index
+      )
+    ) {
+      return false
+    }
+    const slot = slots[0]
+    return clause.reviewers.some(
+      (reviewer) =>
+        reviewer.index !== action.index &&
+        ((slot === "primary" && reviewer.auxiliary) ||
+          (slot === "auxiliary" && reviewer.primary))
+    )
+  }
   const countBeforeMore = tokenIndexes(
     clause.tokens,
     new Set([...counts.keys()]),
@@ -2175,7 +2350,7 @@ function explicitReviewerCardinality(clause, action) {
       ) >= 0
   )
   if (
-    extraMarkers.some((marker) => !markerQualifiesExpectedRole(marker)) ||
+    extraMarkers.some((marker) => !markerIntroducesComplementarySlot(marker)) ||
     countBeforeMore
   ) {
     return { extra: true, count: null, qualifiers: new Set() }
@@ -2242,15 +2417,50 @@ function reviewerCardinalityContradictsRoute(cardinality, normal, high) {
 
 function reviewStatementIsExhaustive(clause, action) {
   const segment = actionSegment(clause, action.index)
-  if (
-    tokenIndex(
+  for (const quantifier of tokenIndexes(
+    clause.tokens,
+    REVIEW_EXHAUSTIVE_QUANTIFIERS,
+    segment.start,
+    segment.end
+  )) {
+    if (
+      quantifier < action.index &&
+      clause.tokens
+        .slice(quantifier + 1, action.index)
+        .every((token) => REVIEW_ACTOR_TAIL_TERMS.has(token))
+    ) {
+      return true
+    }
+    if (ACTOR_LINKS.has(clause.tokens[quantifier + 1])) return true
+    const link = tokenIndexes(
       clause.tokens,
-      new Set(["alone", "only", "solely"]),
-      segment.start,
-      segment.end
-    ) >= 0
-  ) {
-    return true
+      ACTOR_LINKS,
+      action.index + 1,
+      quantifier + 1
+    ).at(-1)
+    if (link === undefined) continue
+    const actors = actorsAfterLink(clause, link, segment.end)
+    if (
+      actors.some(
+        (actor) => actor.start > quantifier && actor.end <= segment.end
+      )
+    ) {
+      return true
+    }
+    if (QUANTIFIER_COMPLEMENT_LINKS.has(clause.tokens[quantifier + 1])) {
+      continue
+    }
+    if (
+      actors.some(
+        (actor) =>
+          actor.end <= quantifier &&
+          clause.tokens
+            .slice(actor.end, quantifier)
+            .every((token) => REVIEW_ACTOR_TAIL_TERMS.has(token))
+      )
+    ) {
+      return true
+    }
   }
   return (
     ["reviewer", "reviewers"].some(
@@ -2501,6 +2711,7 @@ function conflictsWithParentOwnership(clause) {
 
 function conflictsWithTaskAgentRoute(clause) {
   for (const action of clause.actions) {
+    if (actionIsExcludedAlternative(clause, action)) continue
     const passiveSubjects = passiveActorsForAction(clause, action)
     const scopes = actionTaskScopes(clause, action)
     if (
@@ -2581,9 +2792,55 @@ function taskStateIndexes(clause, task, states) {
   )
 }
 
+function completionBelongsToTask(clause, task, completion) {
+  if (completion >= task.index && completion - task.index <= 4) {
+    return clause.tokens
+      .slice(task.index + 1, completion)
+      .every(
+        (token) =>
+          TASK_COMPLETION_BRIDGE_TERMS.has(token) || token.endsWith("ly")
+      )
+  }
+  if (
+    completion < task.index &&
+    task.index - completion <= 2 &&
+    clause.tokens[completion] !== "completion"
+  ) {
+    return true
+  }
+  if (clause.tokens[completion] !== "completion") return false
+  const objectLink = tokenIndex(
+    clause.tokens,
+    new Set(["of"]),
+    completion + 1,
+    task.index
+  )
+  return (
+    objectLink >= 0 &&
+    tokenIndex(
+      clause.tokens,
+      TASK_REFERENCE_BOUNDARIES,
+      objectLink + 1,
+      task.index
+    ) < 0 &&
+    tokenIndex(
+      clause.tokens,
+      new Set([
+        ...PRODUCTION_ACTIONS,
+        ...DIRECT_ROUTE_ACTIONS,
+        ...REVIEW_TERMS,
+      ]),
+      objectLink + 1,
+      task.index
+    ) < 0
+  )
+}
+
 function taskHasCompletedState(clause, task) {
-  return taskStateIndexes(clause, task, TASK_COMPLETION_TERMS).some(
-    (state) => !actionIsNegated(clause.tokens, state)
+  return tokenIndexes(clause.tokens, TASK_COMPLETION_TERMS).some(
+    (state) =>
+      completionBelongsToTask(clause, task, state) &&
+      !actionIsNegated(clause.tokens, state)
   )
 }
 
@@ -2645,7 +2902,7 @@ function timingReferencesCompletion(clause, marker) {
           (task) =>
             task.index > marker &&
             task.index < end &&
-            Math.abs(completion - task.index) <= 5
+            completionBelongsToTask(clause, task, completion)
         )
       ) {
         return true
@@ -2657,7 +2914,7 @@ function timingReferencesCompletion(clause, marker) {
           marker + 1,
           Math.min(end, completion + 2)
         ) >= 0
-      const hasImplicitTaskSubject = completion - marker <= 2
+      const hasImplicitTaskSubject = completion === marker + 1
       return (
         clause.priorTasks.length > 0 &&
         (hasTaskAnaphor || hasImplicitTaskSubject)
@@ -2747,16 +3004,25 @@ function reviewAntecedentBefore(clause, index) {
   return prior.at(-1) ?? null
 }
 
+function takeRoleObjectLink(clause, index) {
+  let cursor = index + 1
+  if (clause.tokens[cursor] === "on") cursor += 1
+  if (new Set(["a", "an", "the"]).has(clause.tokens[cursor])) cursor += 1
+  if (clause.tokens[cursor] !== "role") return -1
+  return tokenIndex(
+    clause.tokens,
+    new Set(["of"]),
+    cursor + 1,
+    Math.min(clause.tokens.length, cursor + 3)
+  )
+}
+
 function reviewActionIsReplacement(clause, index) {
   if (REVIEW_REPLACEMENT_ACTIONS.has(clause.tokens[index])) return true
+  if (!REVIEW_TAKE_ACTIONS.has(clause.tokens[index])) return false
   return (
-    REVIEW_TAKE_ACTIONS.has(clause.tokens[index]) &&
-    tokenIndex(
-      clause.tokens,
-      new Set(["over"]),
-      index + 1,
-      Math.min(clause.tokens.length, index + 3)
-    ) >= 0
+    clause.tokens[index + 1] === "over" ||
+    takeRoleObjectLink(clause, index) >= 0
   )
 }
 
@@ -2814,6 +3080,12 @@ function substitutionReviewTarget(clause, bypass) {
         )
       }
     }
+  } else if (REVIEW_TAKE_ACTIONS.has(token)) {
+    const roleObjectLink = takeRoleObjectLink(clause, bypass)
+    objectLink =
+      roleObjectLink >= 0
+        ? roleObjectLink
+        : tokenIndex(clause.tokens, new Set(["for"]), bypass + 1, bypass + 4)
   } else if (reviewActionIsReplacement(clause, bypass)) {
     objectLink = tokenIndex(
       clause.tokens,
@@ -2855,6 +3127,11 @@ function reviewTargetForBypass(clause, bypass) {
         Math.max(bypass + 1, target - 2),
         target
       )
+      if (clause.tokens[target] === "role") {
+        return new Set(["same", "that", "the", "their", "this", "its"]).has(
+          clause.tokens[target - 1]
+        )
+      }
       return prefix.some((token) =>
         new Set(["same", "that", "the", "their", "this", "its"]).has(token)
       )
