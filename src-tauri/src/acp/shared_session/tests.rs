@@ -1324,8 +1324,7 @@ mod tests {
             request: SharedPromptRequest,
         ) -> Result<PromptEnqueueResult, SharedSessionError> {
             let admission = self.broker.enqueue_prompt(request).await?;
-            self.publish(admission.events).await;
-            admission.notify.notify_one();
+            self.publish_admission(&admission).await?;
             self.broker
                 .finalize_enqueue_response(
                     &self.attachment.connection_id,
@@ -1333,6 +1332,29 @@ mod tests {
                     &admission.queue_item_id,
                 )
                 .await
+        }
+
+        async fn publish_admission(
+            &self,
+            admission: &SharedPromptAdmission,
+        ) -> Result<(), SharedSessionError> {
+            let events = admission.events.clone();
+            admission
+                .publication
+                .get_or_try_init(|| async {
+                    self.publish(events).await;
+                    self.broker
+                        .mark_prompt_admission_published(
+                            &self.attachment.connection_id,
+                            self.attachment.generation,
+                            &admission.queue_item_id,
+                        )
+                        .await?;
+                    admission.notify.notify_one();
+                    Ok::<(), SharedSessionError>(())
+                })
+                .await?;
+            Ok(())
         }
 
         async fn cancel(&self, queue_item_id: &str) -> Result<(), SharedSessionError> {
@@ -1401,7 +1423,7 @@ mod tests {
             continuation_wait: false,
             active_delegations: 0,
             background_outstanding: 0,
-            conversation_writable: true,
+            conversation_write_error: None,
         }
     }
 
@@ -1557,6 +1579,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unpublished_admission_blocks_claim_and_remains_recoverable_by_retry() {
+        let fixture = ready_prompt_broker_fixture().await;
+        let request = with_fixture_guard(
+            &fixture,
+            prompt_with_ids("prompt-client", "publish-retry", "alpha"),
+        );
+        let first = fixture.broker.enqueue_prompt(request.clone()).await.unwrap();
+
+        assert!(matches!(
+            fixture
+                .broker
+                .claim_dispatchable_head(
+                    &fixture.attachment.connection_id,
+                    fixture.attachment.generation,
+                    "must-not-claim-before-publication",
+                    &dispatchable_runtime_snapshot(),
+                )
+                .await
+                .unwrap(),
+            DispatchHeadDecision::Blocked
+        ));
+
+        let retry = fixture.broker.enqueue_prompt(request).await.unwrap();
+        assert_eq!(retry.queue_item_id, first.queue_item_id);
+        assert_eq!(retry.events.len(), 2);
+
+        fixture.publish_admission(&retry).await.unwrap();
+        fixture.publish_admission(&first).await.unwrap();
+        let claimed = fixture
+            .broker
+            .claim_dispatchable_head(
+                &fixture.attachment.connection_id,
+                fixture.attachment.generation,
+                "claim-after-publication",
+                &dispatchable_runtime_snapshot(),
+            )
+            .await
+            .unwrap();
+        let DispatchHeadDecision::Claimed(claimed) = claimed else {
+            panic!("published admission must become dispatchable");
+        };
+        fixture.publish(claimed.events).await;
+
+        let (state, _) = fixture
+            .broker
+            .public_state_and_emitter(&fixture.attachment.connection_id)
+            .await
+            .unwrap();
+        let state = state.read().await;
+        let projection = state.shared_session.as_ref().unwrap();
+        assert!(projection
+            .queue
+            .iter()
+            .all(|item| item.queue_item_id != retry.queue_item_id));
+        assert_eq!(
+            projection
+                .active_turn
+                .as_ref()
+                .map(|turn| turn.queue_item_id.as_str()),
+            Some(retry.queue_item_id.as_str())
+        );
+    }
+
+    #[tokio::test]
     async fn limits_reject_new_item_without_dropping_existing_items() {
         let fixture = ready_prompt_broker_fixture().await;
         for n in 0..MAX_WAITING_PROMPTS {
@@ -1656,6 +1742,7 @@ mod tests {
             .enqueue_prompt(with_fixture_guard(&fixture, prompt_request(1)))
             .await
             .unwrap();
+        fixture.publish_admission(&admission).await.unwrap();
         assert!(matches!(
             fixture
                 .broker
@@ -1761,6 +1848,7 @@ mod tests {
             .enqueue_prompt(with_fixture_guard(&fixture, prompt_request(1)))
             .await
             .unwrap();
+        fixture.publish_admission(&admission).await.unwrap();
         assert!(matches!(
             fixture
                 .broker
@@ -1916,25 +2004,69 @@ mod tests {
             .await
             .unwrap();
         let mut snapshot = dispatchable_runtime_snapshot();
-        snapshot.conversation_writable = false;
-        assert!(matches!(
-            fixture
-                .broker
-                .claim_dispatchable_head(
-                    &fixture.attachment.connection_id,
-                    fixture.attachment.generation,
-                    "unwritable",
-                    &snapshot,
-                )
-                .await
-                .unwrap(),
-            DispatchHeadDecision::Failed(_)
-        ));
+        snapshot.conversation_write_error = Some("workflow_identity_corrupt");
+        let failed = fixture
+            .broker
+            .claim_dispatchable_head(
+                &fixture.attachment.connection_id,
+                fixture.attachment.generation,
+                "unwritable",
+                &snapshot,
+            )
+            .await
+            .unwrap();
+        let DispatchHeadDecision::Failed(failed) = failed else {
+            panic!("non-writable conversation must fail the FIFO head");
+        };
+        assert!(failed.events.iter().any(|event| matches!(
+            event,
+            crate::acp::types::AcpEvent::PromptQueueItemFailed { error_code, .. }
+                if error_code == "workflow_identity_corrupt"
+        )));
         assert_eq!(
             fixture.item_state(&first.queue_item_id).await,
             Some(InternalPromptState::Failed)
         );
         assert_eq!(fixture.snapshot().await.queue[0].queue_item_id, second.queue_item_id);
+    }
+
+    #[tokio::test]
+    async fn non_writable_head_preserves_each_stable_failure_code() {
+        for error_code in [
+            "workflow_v2_retired",
+            "workflow_identity_corrupt",
+            "legacy_completion_protocol_read_only",
+            "unsupported_completion_protocol",
+            "session_unavailable",
+        ] {
+            let fixture = ready_prompt_broker_fixture().await;
+            fixture
+                .enqueue(with_fixture_guard(&fixture, prompt_request(1)))
+                .await
+                .unwrap();
+            let mut snapshot = dispatchable_runtime_snapshot();
+            snapshot.conversation_write_error = Some(error_code);
+            let decision = fixture
+                .broker
+                .claim_dispatchable_head(
+                    &fixture.attachment.connection_id,
+                    fixture.attachment.generation,
+                    "non-writable",
+                    &snapshot,
+                )
+                .await
+                .unwrap();
+            let DispatchHeadDecision::Failed(failed) = decision else {
+                panic!("non-writable conversation must fail the FIFO head");
+            };
+            assert!(failed.events.iter().any(|event| matches!(
+                event,
+                crate::acp::types::AcpEvent::PromptQueueItemFailed {
+                    error_code: actual,
+                    ..
+                } if actual == error_code
+            )));
+        }
     }
 
     #[tokio::test]

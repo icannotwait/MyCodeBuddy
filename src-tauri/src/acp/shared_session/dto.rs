@@ -134,7 +134,7 @@ pub struct SharedRuntimeWorkSnapshot {
     pub continuation_wait: bool,
     pub active_delegations: usize,
     pub background_outstanding: u32,
-    pub conversation_writable: bool,
+    pub conversation_write_error: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

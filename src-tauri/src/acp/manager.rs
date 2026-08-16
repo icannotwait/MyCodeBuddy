@@ -30,7 +30,9 @@ use crate::acp::delegation::route::{
     safe_native_fallback, DelegationConnectionOrigin, DelegationRoutePlan, DelegationRoutePolicy,
     DelegationRouteSource, RouteDegradedReason,
 };
-use crate::acp::delegation::workflow::require_writable_conversation_workflow;
+use crate::acp::delegation::workflow::{
+    require_writable_conversation_workflow, WorkflowStoreError,
+};
 use crate::acp::error::AcpError;
 use crate::acp::feedback::{
     bounded_feedback_batch, FeedbackItem, FeedbackStatus, PendingFeedback, SessionFeedbackAccess,
@@ -47,9 +49,9 @@ use crate::acp::session_state::{ActiveTurnContext, InternalPromptAdmission, Sess
 use crate::acp::shared_session::{
     DispatchHeadDecision, PromptEnqueueResult, RegisteredReplacementPermit,
     SharedConfigConflictKind, SharedInteractionKind, SharedLaunchIdentity, SharedLifecycleState,
-    SharedMutationGuard, SharedPromptRequest, SharedReserveRequest, SharedRuntimeWorkSnapshot,
-    SharedSessionAttachment, SharedSessionBroker, SharedSessionError, SharedSessionKey,
-    SharedSessionPhase, SharedSessionProjection,
+    SharedMutationGuard, SharedPromptAdmission, SharedPromptRequest, SharedReserveRequest,
+    SharedRuntimeWorkSnapshot, SharedSessionAttachment, SharedSessionBroker, SharedSessionError,
+    SharedSessionKey, SharedSessionPhase, SharedSessionProjection,
 };
 use crate::acp::terminal_context::{finalize_acp_launch_config, AcpLaunchConfig, AcpLaunchInputs};
 use crate::acp::termination::AcpDisconnectOrigin;
@@ -556,6 +558,16 @@ fn stable_dispatch_error(error: &AcpError) -> &'static str {
     }
 }
 
+fn stable_conversation_write_error(error: &WorkflowStoreError) -> &'static str {
+    match error.code() {
+        code @ ("workflow_v2_retired"
+        | "workflow_identity_corrupt"
+        | "legacy_completion_protocol_read_only"
+        | "unsupported_completion_protocol") => code,
+        _ => "session_unavailable",
+    }
+}
+
 #[cfg(test)]
 #[derive(Clone)]
 struct DisconnectFinalCasHook {
@@ -568,6 +580,13 @@ struct DisconnectFinalCasHook {
 struct SharedEnqueueFinalizeHook {
     reached: Arc<tokio::sync::Barrier>,
     resume: Arc<tokio::sync::Barrier>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct SharedEnqueuePublicationHook {
+    reached: Arc<tokio::sync::Notify>,
+    resume: Arc<tokio::sync::Notify>,
 }
 
 pub struct ConnectionManager {
@@ -654,6 +673,8 @@ pub struct ConnectionManager {
     disconnect_final_cas_hook: Arc<std::sync::Mutex<Option<DisconnectFinalCasHook>>>,
     #[cfg(test)]
     shared_enqueue_finalize_hook: Arc<std::sync::Mutex<Option<SharedEnqueueFinalizeHook>>>,
+    #[cfg(test)]
+    shared_enqueue_publication_hook: Arc<std::sync::Mutex<Option<SharedEnqueuePublicationHook>>>,
 }
 
 /// A parked `ask_user_question` awaiting its answer. The `sender` resolves the
@@ -750,6 +771,8 @@ impl ConnectionManager {
             disconnect_final_cas_hook: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
             shared_enqueue_finalize_hook: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            shared_enqueue_publication_hook: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -792,6 +815,8 @@ impl ConnectionManager {
             disconnect_final_cas_hook: self.disconnect_final_cas_hook.clone(),
             #[cfg(test)]
             shared_enqueue_finalize_hook: self.shared_enqueue_finalize_hook.clone(),
+            #[cfg(test)]
+            shared_enqueue_publication_hook: self.shared_enqueue_publication_hook.clone(),
         }
     }
 
@@ -814,9 +839,8 @@ impl ConnectionManager {
         let generation = request.guard.generation;
         let admission = self.shared_session_broker.enqueue_prompt(request).await?;
         let queue_item_id = admission.queue_item_id.clone();
-        self.publish_shared_events(&connection_id, admission.events)
+        self.publish_shared_prompt_admission(&connection_id, generation, admission)
             .await?;
-        admission.notify.notify_one();
         #[cfg(test)]
         let finalize_hook = self
             .shared_enqueue_finalize_hook
@@ -832,6 +856,50 @@ impl ConnectionManager {
             .finalize_enqueue_response(&connection_id, generation, &queue_item_id)
             .await
             .map_err(Into::into)
+    }
+
+    async fn publish_shared_prompt_admission(
+        &self,
+        connection_id: &str,
+        generation: u64,
+        admission: SharedPromptAdmission,
+    ) -> Result<(), AcpError> {
+        let manager = self.clone_ref();
+        let connection_id = connection_id.to_string();
+        let queue_item_id = admission.queue_item_id;
+        let events = admission.events;
+        let publication = admission.publication;
+        let notify = admission.notify;
+        let publication_task = tokio::spawn(async move {
+            publication
+                .get_or_try_init(|| async move {
+                    #[cfg(test)]
+                    let publication_hook = manager
+                        .shared_enqueue_publication_hook
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .clone();
+                    #[cfg(test)]
+                    if let Some(hook) = publication_hook {
+                        hook.reached.notify_one();
+                        hook.resume.notified().await;
+                    }
+                    manager
+                        .publish_shared_events(&connection_id, events)
+                        .await?;
+                    manager
+                        .shared_session_broker
+                        .mark_prompt_admission_published(&connection_id, generation, &queue_item_id)
+                        .await?;
+                    notify.notify_one();
+                    Ok::<(), AcpError>(())
+                })
+                .await
+                .map(|_| ())
+        });
+        publication_task
+            .await
+            .map_err(|_| AcpError::from(SharedSessionError::SessionUnavailable))?
     }
 
     pub async fn cancel_shared_queued_prompt(
@@ -887,15 +955,16 @@ impl ConnectionManager {
         let (mut snapshot, conversation_id) = {
             let state = state.read().await;
             (
-                state.shared_runtime_work_snapshot(true),
+                state.shared_runtime_work_snapshot(None),
                 state.conversation_id,
             )
         };
         if let Some(conversation_id) = conversation_id {
-            snapshot.conversation_writable =
+            snapshot.conversation_write_error =
                 require_writable_conversation_workflow(&db.conn, conversation_id)
                     .await
-                    .is_ok();
+                    .err()
+                    .map(|error| stable_conversation_write_error(&error));
         }
         Some(snapshot)
     }
@@ -1327,7 +1396,7 @@ impl ConnectionManager {
             return;
         };
 
-        let initial = state.read().await.shared_runtime_work_snapshot(true);
+        let initial = state.read().await.shared_runtime_work_snapshot(None);
         let initial_events = match manager
             .shared_session_broker
             .reconcile_runtime_snapshot(&connection_id, generation, &driver_incarnation, &initial)
@@ -1373,7 +1442,7 @@ impl ConnectionManager {
                                 let snapshot = state
                                     .read()
                                     .await
-                                    .shared_runtime_work_snapshot(true);
+                                    .shared_runtime_work_snapshot(None);
                                 let reconcile_events = match manager
                                     .shared_session_broker
                                     .reconcile_runtime_snapshot(
@@ -1522,7 +1591,7 @@ impl ConnectionManager {
                         | AcpEvent::StatusChanged { .. }
                         | AcpEvent::TurnComplete { .. }
                 ) {
-                    let snapshot = state.read().await.shared_runtime_work_snapshot(true);
+                    let snapshot = state.read().await.shared_runtime_work_snapshot(None);
                     let reconcile_events = match manager
                         .shared_session_broker
                         .reconcile_runtime_snapshot(
@@ -20641,6 +20710,133 @@ mod tests {
             (manager, attachment)
         }
 
+        #[test]
+        fn conversation_write_guard_preserves_recognized_codes_and_falls_back() {
+            use crate::db::entities::delegation_workflow::CompletionProtocolMode;
+
+            let recognized = [
+                (
+                    WorkflowStoreError::workflow_v2_retired(),
+                    "workflow_v2_retired",
+                ),
+                (
+                    WorkflowStoreError::WorkflowIdentityCorrupt {
+                        source_conversation_id: 771,
+                    },
+                    "workflow_identity_corrupt",
+                ),
+                (
+                    WorkflowStoreError::LegacyCompletionProtocolReadOnly,
+                    "legacy_completion_protocol_read_only",
+                ),
+                (
+                    WorkflowStoreError::UnsupportedCompletionProtocol {
+                        version: 3,
+                        mode: CompletionProtocolMode::V2Enforce,
+                    },
+                    "unsupported_completion_protocol",
+                ),
+            ];
+            for (error, expected) in recognized {
+                assert_eq!(stable_conversation_write_error(&error), expected);
+            }
+
+            for error in [
+                WorkflowStoreError::Persistence("database unavailable".into()),
+                WorkflowStoreError::NotFound("unknown workflow".into()),
+            ] {
+                assert_eq!(
+                    stable_conversation_write_error(&error),
+                    "session_unavailable"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn cancelled_enqueue_publication_is_recovered_once_before_dispatch() {
+            let (manager, attachment) = ready_manager().await;
+            let state = manager.get_state(&attachment.connection_id).await.unwrap();
+            let mut events = state.read().await.event_stream().subscribe();
+            let publication_reached = Arc::new(tokio::sync::Notify::new());
+            let publication_resume = Arc::new(tokio::sync::Notify::new());
+            *manager
+                .shared_enqueue_publication_hook
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = Some(SharedEnqueuePublicationHook {
+                reached: publication_reached.clone(),
+                resume: publication_resume.clone(),
+            });
+
+            let request = queued_prompt(&attachment, "cancelled-publication", "alpha");
+            let original_manager = manager.clone_ref();
+            let original_request = request.clone();
+            let original = tokio::spawn(async move {
+                original_manager
+                    .enqueue_shared_prompt(original_request)
+                    .await
+            });
+            publication_reached.notified().await;
+
+            let snapshot = state.read().await.shared_runtime_work_snapshot(None);
+            assert!(matches!(
+                manager
+                    .shared_session_broker()
+                    .claim_dispatchable_head(
+                        &attachment.connection_id,
+                        attachment.generation,
+                        "claim-before-admission-events",
+                        &snapshot,
+                    )
+                    .await
+                    .unwrap(),
+                DispatchHeadDecision::Blocked
+            ));
+            while let Ok(envelope) = events.try_recv() {
+                assert!(!matches!(
+                    envelope.payload,
+                    AcpEvent::PromptQueued { .. }
+                        | AcpEvent::PromptQueueDepthChanged { .. }
+                        | AcpEvent::PromptDispatchStarted { .. }
+                ));
+            }
+
+            original.abort();
+            assert!(original.await.unwrap_err().is_cancelled());
+            let retry_manager = manager.clone_ref();
+            let retry =
+                tokio::spawn(async move { retry_manager.enqueue_shared_prompt(request).await });
+            tokio::task::yield_now().await;
+            assert!(!retry.is_finished());
+
+            publication_resume.notify_one();
+            retry.await.unwrap().unwrap();
+
+            let mut admission_kinds = Vec::new();
+            tokio::time::timeout(Duration::from_millis(500), async {
+                loop {
+                    match events.recv().await.unwrap().payload {
+                        AcpEvent::PromptQueued { .. } => admission_kinds.push("queued"),
+                        AcpEvent::PromptQueueDepthChanged { .. } => admission_kinds.push("depth"),
+                        AcpEvent::PromptDispatchStarted { .. } => {
+                            admission_kinds.push("dispatch");
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .expect("published admission must wake the dispatcher");
+            assert_eq!(admission_kinds, ["queued", "depth", "dispatch"]);
+
+            let state = state.read().await;
+            let projection = state.shared_session.as_ref().unwrap();
+            assert!(projection
+                .queue
+                .iter()
+                .all(|item| { item.client_message_id != "message-cancelled-publication" }));
+        }
+
         #[tokio::test]
         async fn sender_lease_release_preserves_waiting_fifo() {
             let (manager, attachment) = ready_manager().await;
@@ -20845,7 +21041,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            let broker_snapshot = state.read().await.shared_runtime_work_snapshot(true);
+            let broker_snapshot = state.read().await.shared_runtime_work_snapshot(None);
             let map_guard = manager.connections.lock().await;
             let state_guard = state.write().await;
             let callback = tokio::time::timeout(

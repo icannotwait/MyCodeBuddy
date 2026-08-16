@@ -26,6 +26,7 @@ use error::validate_failure_code;
 pub(crate) struct SharedPromptAdmission {
     pub queue_item_id: String,
     pub events: Vec<crate::acp::types::AcpEvent>,
+    pub publication: Arc<tokio::sync::OnceCell<()>>,
     pub notify: Arc<Notify>,
 }
 
@@ -141,7 +142,8 @@ impl SharedSessionBroker {
                     }
                     return Ok(SharedPromptAdmission {
                         queue_item_id: entry.queue_item_id.clone(),
-                        events: Vec::new(),
+                        events: entry.admission_events.clone(),
+                        publication: entry.admission_publication.clone(),
                         notify: record.notify.clone(),
                     });
                 }
@@ -173,16 +175,6 @@ impl SharedSessionBroker {
                     request.submitted_at,
                     SharedQueuedPromptState::Queued,
                 );
-                record.prompt_ledger.insert(
-                    identity.clone(),
-                    PromptLedgerEntry {
-                        payload_hash,
-                        queue_item_id: queue_item_id.clone(),
-                        enqueue_seq,
-                        state: InternalPromptState::Queued,
-                        frozen_result: None,
-                    },
-                );
                 record.waiting_bytes += waiting_bytes;
                 record.waiting_prompts.push_back(QueuedPromptRecord {
                     identity: identity.clone(),
@@ -201,9 +193,24 @@ impl SharedSessionBroker {
                     },
                     queue_depth_event(record),
                 ];
+                let publication = Arc::new(tokio::sync::OnceCell::new());
+                record.prompt_ledger.insert(
+                    identity.clone(),
+                    PromptLedgerEntry {
+                        payload_hash,
+                        queue_item_id: queue_item_id.clone(),
+                        enqueue_seq,
+                        state: InternalPromptState::Queued,
+                        frozen_result: None,
+                        admission_events: events.clone(),
+                        admission_publication: publication.clone(),
+                        admission_published: false,
+                    },
+                );
                 Ok(SharedPromptAdmission {
                     queue_item_id,
                     events,
+                    publication,
                     notify: record.notify.clone(),
                 })
             })
@@ -216,6 +223,28 @@ impl SharedSessionBroker {
             self.metrics.record_capacity_rejection();
         }
         result
+    }
+
+    pub(crate) async fn mark_prompt_admission_published(
+        &self,
+        connection_id: &str,
+        generation: u64,
+        queue_item_id: &str,
+    ) -> Result<(), SharedSessionError> {
+        self.with_authoritative_record(connection_id, |record| {
+            if record.generation != generation {
+                return Err(SharedSessionError::GenerationStale);
+            }
+            let entry = record
+                .prompt_ledger
+                .values_mut()
+                .find(|entry| entry.queue_item_id == queue_item_id)
+                .ok_or(SharedSessionError::QueueItemNotFound)?;
+            entry.admission_published = true;
+            Ok(())
+        })
+        .await?
+        .ok_or(SharedSessionError::SessionUnavailable)
     }
 
     pub(crate) async fn finalize_enqueue_response(
@@ -351,6 +380,15 @@ impl SharedSessionBroker {
                 return Ok(DispatchHeadDecision::Blocked);
             }
 
+            let head_is_published = record
+                .waiting_prompts
+                .front()
+                .and_then(|queued| record.prompt_ledger.get(&queued.identity))
+                .is_some_and(|entry| entry.admission_published);
+            if !head_is_published {
+                return Ok(DispatchHeadDecision::Blocked);
+            }
+
             let queued = record
                 .waiting_prompts
                 .pop_front()
@@ -359,7 +397,7 @@ impl SharedSessionBroker {
                 .waiting_bytes
                 .checked_sub(queued.waiting_bytes)
                 .expect("FIFO head bytes are included in waiting total");
-            if !snapshot.conversation_writable {
+            if let Some(error_code) = snapshot.conversation_write_error {
                 record
                     .prompt_ledger
                     .get_mut(&queued.identity)
@@ -370,7 +408,7 @@ impl SharedSessionBroker {
                         crate::acp::types::AcpEvent::PromptQueueItemFailed {
                             generation,
                             queue_item_id: queued.summary.queue_item_id,
-                            error_code: "workflow_v2_retired".into(),
+                            error_code: error_code.into(),
                         },
                         queue_depth_event(record),
                     ],
@@ -2231,6 +2269,9 @@ struct PromptLedgerEntry {
     enqueue_seq: u64,
     state: InternalPromptState,
     frozen_result: Option<PromptEnqueueResult>,
+    admission_events: Vec<crate::acp::types::AcpEvent>,
+    admission_publication: Arc<tokio::sync::OnceCell<()>>,
+    admission_published: bool,
 }
 
 struct QueuedPromptRecord {

@@ -851,7 +851,7 @@ impl SessionState {
 
     pub(crate) fn shared_runtime_work_snapshot(
         &self,
-        conversation_writable: bool,
+        conversation_write_error: Option<&'static str>,
     ) -> crate::acp::shared_session::SharedRuntimeWorkSnapshot {
         crate::acp::shared_session::SharedRuntimeWorkSnapshot {
             status: self.status.clone(),
@@ -871,7 +871,7 @@ impl SessionState {
             continuation_wait: self.waiting_for_subagents.is_some(),
             active_delegations: self.active_delegations.len(),
             background_outstanding: self.background_outstanding,
-            conversation_writable,
+            conversation_write_error,
         }
     }
 
