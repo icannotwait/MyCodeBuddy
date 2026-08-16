@@ -1,40 +1,31 @@
 import assert from "node:assert/strict"
-import { spawnSync } from "node:child_process"
-import {
-  mkdtempSync,
-  readFileSync,
-  rmSync,
-  symlinkSync,
-  writeFileSync,
-} from "node:fs"
-import { tmpdir } from "node:os"
+import { readFileSync } from "node:fs"
 import { dirname, join } from "node:path"
 import { describe, it } from "node:test"
-import { fileURLToPath, pathToFileURL } from "node:url"
+import { fileURLToPath } from "node:url"
 import {
-  MAX_PLAN_DOCUMENT_BYTES,
-  MAX_PROGRESS_BLOCK_BYTES,
-  MAX_PROGRESS_DOCUMENT_BYTES,
+  MAX_ROUTING_BLOCK_BYTES,
+  deriveExpectedRoute,
   parseSimplePlan,
+  parseSimpleRouting,
+  validateProgressRouting,
+  validateRoutingSnapshot,
   validateSimpleDocuments,
   validateSkillMarkdown,
 } from "./validate-contract.lib.mjs"
-import {
-  canonicalPathsEqual,
-  isDirectInvocation,
-  readUtf8FileBounded,
-} from "./validate-contract.mjs"
 
-const __dirname = dirname(fileURLToPath(import.meta.url))
-const realSkill = readFileSync(join(__dirname, "..", "SKILL.md"), "utf8")
-const validatorScript = join(__dirname, "validate-contract.mjs")
+const here = dirname(fileURLToPath(import.meta.url))
+const realSkill = readFileSync(join(here, "..", "SKILL.md"), "utf8")
 const planRelPath = "docs/superpowers/plans/example.md"
+const copy = structuredClone
 
 const SKILL_CONTRACT = {
-  schema_version: 1,
+  schema_version: 2,
   phase_order: [
     "establish-current-truth",
-    "produce-plan-and-register",
+    "resolve-task-agent",
+    "review-and-revise-design",
+    "author-and-review-plan",
     "maintain-progress",
     "apply-workspace-gate",
     "execute-tasks-serially",
@@ -43,6 +34,7 @@ const SKILL_CONTRACT = {
   ],
   interfaces: {
     plan_authoring: "writing-plans",
+    task_execution: "subagent-driven-development",
     registration: "register_simple_workflow",
     first_run: "delegate_to_agent",
     later_run: "continue_delegation",
@@ -51,12 +43,46 @@ const SKILL_CONTRACT = {
   },
   plan_setup_order: [
     "create-progress",
-    "write-plan",
+    "dispatch-plan-author",
     "confirm-plan-on-disk",
+    "validate-routing",
+    "review-plan",
     "register-simple-workflow",
     "sync-plan-tasks",
-    "review-plan",
   ],
+  document_work: {
+    parent_edits: false,
+    design_review: "conditional",
+    design_reviewer: "independent_codex",
+    design_fixer: "independent_codex",
+    plan_author: "independent_codex",
+    plan_reviewer: "independent_codex",
+    producer_reviewer_independence: true,
+    plan_rereview: "full_latest_plan",
+    user_named_reviewers: "design_and_plan_only",
+  },
+  conversation_identity: {
+    distinct_work_units: "distinct_child_conversations",
+    continuation: "same_work_unit_only",
+  },
+  task_agent: {
+    default_agent_type: "grok",
+    selection_source: "invocation",
+    explicit_substitution: "forbidden",
+    change_boundary: "completed_tasks_after_plan_revision_and_full_rereview",
+  },
+  routing: {
+    marker: "codeg-b2d-routing-v1",
+    risk_policy_version: "b2d_task_risk_v1",
+    normal: { implementer: "task_agent", reviewers: ["codex_primary"] },
+    high: {
+      implementer: "codex",
+      reviewers: ["codex_primary", "task_agent_auxiliary"],
+    },
+    reviewer_slots: ["primary", "auxiliary"],
+    task_order: "serial",
+    high_review_fan_out: "parallel_after_implementation",
+  },
   progress: {
     marker: "codeg-simple-progress-v1",
     mutation_order: [
@@ -65,14 +91,9 @@ const SKILL_CONTRACT = {
       "record-admission",
       "record-observed-state",
     ],
+    route_metadata: "additive",
   },
   workspace_policy: "preserve-user-changes",
-  task_execution: {
-    order: "serial",
-    implementer: "grok",
-    reviewer: "codex",
-    review: "independent",
-  },
   recovery: {
     unexpected_continuations: 2,
     logical_replacements: 1,
@@ -82,245 +103,269 @@ const SKILL_CONTRACT = {
     required: true,
     independent: true,
     reviewer: "codex",
+    fix_owner: "task_producer",
   },
 }
 
-function skillContractBlock(contract = SKILL_CONTRACT) {
-  return `<!-- codeg-b2d-skill-contract-v1
-${JSON.stringify(contract, null, 2)}
--->`
+function block(marker, value) {
+  return `<!-- ${marker}\n${JSON.stringify(value, null, 2)}\n-->`
 }
 
-const METADATA_ONLY_SKILL = `---
-name: brainstorm-to-delivery
-description: Use when a Codeg conversation provides a completed Brainstorm file and asks for a high-quality locally deliverable implementation.
----
-
-# Brainstorm to Delivery
-
-Use Simple documents and generic delegation to deliver the approved work.
-`
-
-const CONTRACT_SKILL = `---
+const skill = `---
 name: brainstorm-to-delivery
 description: Use when a completed Brainstorm must become a local delivery.
 ---
 
 # Brainstorm to Delivery
 
-${skillContractBlock()}
+${block("codeg-b2d-skill-contract-v2", SKILL_CONTRACT)}
 
-## 1. Discover current truth
+## 1. Establish current truth
+Inspect current files and live delegation schemas. Preserve user decisions.
 
-After compaction, inspect live schemas for \`register_simple_workflow\`,
-\`delegate_to_agent\`, \`continue_delegation\`, \`get_delegation_status\`, and
-\`request_recovery_authorization\`. Refresh discovery before resuming.
+## 2. Resolve the Task Agent
+Inspect discovery and choose the invocation selection. Record an omitted selection as Grok and block invalid identities.
 
-## 2. Plan then register
+## 3. Review and revise Design
+Dispatch a conditional independent Codex Design Reviewer. Continue a separate Codex Design Fixer for every revision.
 
-Before any reviewer dispatch, create progress. Use \`writing-plans\` to write
-the Plan. After the Plan exists, call \`register_simple_workflow\`, refresh every
-Task as pending, then request Plan review.
+## 4. Author and review Plan
+Create progress first. Dispatch an independent Codex Plan Author with writing-plans, validate routing, and use a separate Codex Plan Reviewer for full latest Plan review before registration.
 
-## 3. Mutate progress around delegation
+## 5. Maintain progress
+Record reserving intent, delegation, admission, and observed state in order. Keep route metadata.
 
-Use one \`codeg-simple-progress-v1\` block. Before delegation, write reserving
-intent. After every observed state change, refresh the block.
+## 6. Apply the workspace gate
+Inspect status and diffs. Preserve user changes and request user-owned decisions.
 
-## 4. Protect the workspace
+## 7. Execute Tasks serially
+Use subagent-driven-development. Run normal Tasks through the Task Agent and Codex primary reviewer. Run high Tasks through a Codex implementer, then fan out Codex primary and Task Agent auxiliary reviews. Return fixes to the owning producer and rerun every required review.
 
-Inspect \`git status\`, staged diff, and unstaged diff. Preserve user changes.
+## 8. Recover generic runs
+Continue only the same work unit and preserve its identity. Permit two unexpected continuations and request one logical replacement.
 
-## 5. Execute Tasks serially
-
-Execute Tasks serially. Use \`delegate_to_agent\` for a first run and
-\`continue_delegation\` for later work with one stable \`work_unit_key\`.
-Use Grok to implement, Codex to review, and join \`task_ids\`.
-
-## 6. Recover generic runs
-
-For \`recovery_confirmation_required\`, request authorization and replay with
-\`recovery_authorization_id\`. Handle \`fresh_dispatch\`, \`unresumable\`,
-\`budget_exhausted_continue\`, \`not_supported\`, \`admission_failed\`, and
-\`admission_unknown\` without changing identity.
-
-| Recovery rail | Limit |
-| --- | --- |
-| Unexpected continuations | 2 |
-| Logical replacement | 1 |
-
-## 7. Review and deliver
-
-Set \`final_review_status\` to in_progress, request an independent Codex final
-review, then set it to completed and commit only owned changes locally.
+## 9. Complete final review
+Dispatch an independent Codex final reviewer. Route findings to Task producers, run checks, and continue Task and final reviews.
 `
 
-const PLAN = `# Example Implementation Plan
-
-### Task 1: Parse documents
-
-**Files:**
-- Modify: \`src/parser.ts\`
-
-Run: \`node --test parser.test.mjs\`
-
-## Task 2: Project progress
-
-**Files:**
-- Modify: \`src/projector.ts\`
-
-Run: \`node --test projector.test.mjs\`
-`
-
-function progressBlock(snapshot, notes = "") {
-  return `# Delivery progress
-
-<!-- codeg-simple-progress-v1
-${JSON.stringify(snapshot, null, 2)}
--->
-
-${notes}`
+function identity(agent_type = "grok", profile_id = null) {
+  return { agent_type, profile_id }
 }
 
-function validSnapshot(overrides = {}) {
+function expectedWorkUnitKeys(index, level, taskAgent) {
+  const profile = taskAgent.profile_id ?? "none"
   return {
-    schema_version: 1,
-    plan_rel_path: planRelPath,
-    active_task_index: 2,
-    tasks: [
-      {
-        index: 1,
-        status: "completed",
-        commit: "0123456789abcdef",
-        runs: [
-          {
-            role: "implementer",
-            agent_type: "grok",
-            profile_id: null,
-            task_id: "task-1-impl",
-            child_conversation_id: 41,
-            state: "completed",
-            work_unit_key: "task|1|implementer|grok|none",
-            recovery_count: 0,
-            replaced_task_id: null,
-            replacement_reason: null,
-          },
-          {
-            role: "reviewer",
-            agent_type: "codex",
-            task_id: "task-1-review",
-            child_conversation_id: 42,
-            state: "completed",
-            work_unit_key: "task|1|reviewer|codex|none",
-            recovery_count: 0,
-          },
-        ],
-      },
-      {
-        index: 2,
-        status: "in_progress",
-        runs: [
-          {
-            role: "implementer",
-            agent_type: "codex",
-            profile_id: "release",
-            task_id: "task-2-a",
-            child_conversation_id: 50,
-            state: "failed",
-            work_unit_key: "task|2|implementer|codex|release",
-            recovery_count: 1,
-            replaced_task_id: null,
-            replacement_reason: null,
-          },
-          {
-            role: "implementer",
-            agent_type: "codex",
-            profile_id: "release",
-            task_id: "task-2-b",
-            child_conversation_id: 51,
-            state: "running",
-            work_unit_key: "task|2|implementer|codex|release",
-            recovery_count: 1,
-            replaced_task_id: "task-2-a",
-            replacement_reason: "unresumable",
-          },
-        ],
-      },
-    ],
-    final_review_status: "pending",
-    updated_at: "2026-08-11T00:00:00Z",
-    ...overrides,
+    implementer:
+      level === "normal"
+        ? `task|${index}|implementer|${taskAgent.agent_type}|${profile}`
+        : `task|${index}|implementer|codex|none`,
+    reviewers: {
+      primary: `task|${index}|reviewer|primary|codex|none`,
+      auxiliary:
+        level === "high"
+          ? `task|${index}|reviewer|auxiliary|${taskAgent.agent_type}|${profile}`
+          : null,
+    },
   }
 }
 
-function validate(overrides = {}) {
+function risk(level = "normal") {
+  const value = {
+    level,
+    hard_triggers: [],
+    soft_signals: [],
+    score: 0,
+    reason: "Concrete deterministic risk evidence.",
+  }
+  if (level === "high") {
+    value.hard_triggers.push({
+      kind: "public_compatibility",
+      evidence: ["public contract"],
+    })
+  }
+  return value
+}
+
+function task(index, level, taskAgent = identity(), generation = 1) {
+  return {
+    index,
+    task_agent_generation: generation,
+    risk: risk(level),
+    route:
+      level === "normal"
+        ? {
+            implementer: copy(taskAgent),
+            reviewers: [
+              { slot: "primary", agent_type: "codex", profile_id: null },
+            ],
+          }
+        : {
+            implementer: identity("codex"),
+            reviewers: [
+              { slot: "primary", agent_type: "codex", profile_id: null },
+              { slot: "auxiliary", ...copy(taskAgent) },
+            ],
+          },
+  }
+}
+
+function routing() {
+  return {
+    schema_version: 1,
+    risk_policy_version: "b2d_task_risk_v1",
+    task_agent_generations: [
+      {
+        generation: 1,
+        agent_type: "grok",
+        profile_id: null,
+        effective_from_task_index: 1,
+      },
+    ],
+    tasks: [task(1, "normal"), task(2, "high")],
+  }
+}
+
+function plan(snapshot = routing()) {
+  return `# Plan
+
+${block("codeg-b2d-routing-v1", snapshot)}
+
+## Task 1: Parse documents
+
+### Task 2: Project progress
+`
+}
+
+function run(key, state, task_id, child_conversation_id) {
+  const parts = key.split("|")
+  const slotted = parts.length === 6
+  const profile = parts[slotted ? 5 : 4]
+  return {
+    role: parts[2],
+    agent_type: parts[slotted ? 4 : 3],
+    profile_id: profile === "none" ? null : profile,
+    task_id,
+    child_conversation_id,
+    state,
+    work_unit_key: key,
+    recovery_count: 0,
+    replaced_task_id: null,
+    replacement_reason: null,
+  }
+}
+
+function progressTask(routeTask, status, child = 10) {
+  const taskAgent =
+    routeTask.risk.level === "normal"
+      ? (routeTask.route?.implementer ?? identity())
+      : (routeTask.route?.reviewers?.[1] ?? identity())
+  const keys = expectedWorkUnitKeys(
+    routeTask.index,
+    routeTask.risk.level,
+    taskAgent
+  )
+  const runs = []
+  if (status === "completed") {
+    runs.push(
+      run(keys.implementer, "completed", `t${routeTask.index}-i`, child)
+    )
+    runs.push(
+      run(
+        keys.reviewers.primary,
+        "completed",
+        `t${routeTask.index}-p`,
+        child + 1
+      )
+    )
+    if (keys.reviewers.auxiliary) {
+      runs.push(
+        run(
+          keys.reviewers.auxiliary,
+          "completed",
+          `t${routeTask.index}-a`,
+          child + 2
+        )
+      )
+    }
+  }
+  return {
+    index: routeTask.index,
+    status,
+    commit: status === "completed" ? `commit-${routeTask.index}` : null,
+    risk_level: routeTask.risk.level,
+    task_agent_generation: routeTask.task_agent_generation,
+    expected_work_unit_keys: keys,
+    runs,
+  }
+}
+
+function progress(snapshot = routing()) {
+  return {
+    schema_version: 1,
+    plan_rel_path: planRelPath,
+    active_task_index: null,
+    tasks: [
+      progressTask(snapshot.tasks[0], "completed"),
+      progressTask(snapshot.tasks[1], "pending", 20),
+    ],
+    final_review_status: "pending",
+    updated_at: "2026-08-16T00:00:00Z",
+  }
+}
+
+function validate(snapshot = routing(), state = progress(snapshot)) {
   return validateSimpleDocuments({
-    skillMarkdown: CONTRACT_SKILL,
-    planMarkdown: PLAN,
-    progressMarkdown: progressBlock(validSnapshot()),
+    skillMarkdown: skill,
+    planMarkdown: plan(snapshot),
+    progressMarkdown: `# Progress\n\n${block(
+      "codeg-simple-progress-v1",
+      state
+    )}\n`,
     planRelPath,
-    ...overrides,
+  }).failures
+}
+
+function has(failures, rule) {
+  assert.ok(
+    failures.some((failure) => failure.startsWith(`[${rule}]`)),
+    `expected ${rule}; got ${failures.join("; ")}`
+  )
+}
+
+describe("Skill contract v2", () => {
+  it("accepts the exact nine-phase ownership contract and production Skill", () => {
+    assert.deepEqual(validateSkillMarkdown(skill).failures, [])
+    assert.deepEqual(validateSkillMarkdown(realSkill).failures, [])
   })
-}
 
-function assertHasRule(failures, ruleId) {
-  assert.ok(
-    failures.some((failure) => failure.startsWith(`[${ruleId}]`)),
-    `expected ${ruleId}; got ${failures.join("; ")}`
-  )
-}
-
-function assertHasText(failures, text) {
-  assert.ok(
-    failures.some((failure) => failure.includes(text)),
-    `expected ${JSON.stringify(text)}; got ${failures.join("; ")}`
-  )
-}
-
-function removeNumberedSection(skill, index) {
-  const start = skill.indexOf(`## ${index}.`)
-  const end =
-    index === 7 ? skill.length : skill.indexOf(`## ${index + 1}.`, start)
-  assert.ok(start >= 0 && end > start)
-  return skill.slice(0, start) + skill.slice(end)
-}
-
-function swapPlanAndProgressSections(skill) {
-  const second = skill.indexOf("## 2.")
-  const third = skill.indexOf("## 3.")
-  const fourth = skill.indexOf("## 4.")
-  assert.ok(second >= 0 && third > second && fourth > third)
-  return (
-    skill.slice(0, second) +
-    skill.slice(third, fourth) +
-    skill.slice(second, third) +
-    skill.slice(fourth)
-  )
-}
-
-function replaceNumberedSectionBody(skill, index, body) {
-  const heading = skill.indexOf(`## ${index}.`)
-  const bodyStart = skill.indexOf("\n", heading) + 1
-  const end =
-    index === 7 ? skill.length : skill.indexOf(`## ${index + 1}.`, bodyStart)
-  assert.ok(heading >= 0 && bodyStart > heading && end > bodyStart)
-  return skill.slice(0, bodyStart) + `\n${body.trim()}\n\n` + skill.slice(end)
-}
-
-function replaceSkillContract(skill, contract) {
-  return skill.replace(skillContractBlock(), skillContractBlock(contract))
-}
-
-describe("Skill metadata contract", () => {
-  it("rejects metadata-only guidance without the ordered contract", () => {
-    assertHasRule(
-      validateSkillMarkdown(METADATA_ONLY_SKILL).failures,
+  it("requires exactly one unfenced v2 contract and nine phases", () => {
+    has(
+      validateSkillMarkdown(skill.replace("v2", "v1")).failures,
+      "B2D-SKILL-004"
+    )
+    has(
+      validateSkillMarkdown(
+        `${skill}\n${block("codeg-b2d-skill-contract-v2", SKILL_CONTRACT)}`
+      ).failures,
+      "B2D-SKILL-004"
+    )
+    assert.deepEqual(
+      validateSkillMarkdown(
+        skill.replace(
+          "# Brainstorm to Delivery",
+          `# Brainstorm to Delivery\n\n\`\`\`md\n${block("codeg-b2d-skill-contract-v2", SKILL_CONTRACT)}\n\`\`\``
+        )
+      ).failures,
+      []
+    )
+    has(
+      validateSkillMarkdown(skill.replace("## 5.", "## 10.")).failures,
       "B2D-SKILL-004"
     )
   })
 
-  it("rejects v2-only tool and output identifiers wherever they appear", () => {
-    for (const identifier of [
+  it("bans retired mutation identifiers", () => {
+    for (const name of [
       "get_workflow_capabilities",
       "get_workflow_state",
       "publish_workflow_manifest",
@@ -334,172 +379,28 @@ describe("Skill metadata contract", () => {
       "artifact_digest",
       "reviewed_task_id",
     ]) {
-      assertHasRule(
-        validateSkillMarkdown(`${CONTRACT_SKILL}\n${identifier}\n`).failures,
-        "B2D-SKILL-003"
-      )
+      has(validateSkillMarkdown(`${skill}\n${name}`).failures, "B2D-SKILL-003")
     }
   })
 
-  it("requires only name and a trigger-only Use when description", () => {
-    assertHasRule(
-      validateSkillMarkdown(
-        CONTRACT_SKILL.replace("name:", "title:")
-      ).failures,
-      "B2D-SKILL-001"
-    )
-    assertHasRule(
-      validateSkillMarkdown(
-        CONTRACT_SKILL.replace(
-          "description: Use when",
-          "description: This runs"
-        )
-      ).failures,
-      "B2D-SKILL-001"
-    )
-    assertHasRule(
-      validateSkillMarkdown(
-        CONTRACT_SKILL.replace(
-          /description:.*$/m,
-          "description: Use when work needs a Plan, registration, and serial delegation."
-        )
-      ).failures,
-      "B2D-SKILL-001"
-    )
-  })
-
-  it("accepts the rewritten production Skill", () => {
-    assert.deepEqual(validateSkillMarkdown(realSkill).failures, [])
-  })
-
-  it("requires all seven ordered workflow phases", () => {
-    for (let index = 1; index <= 7; index += 1) {
-      assertHasRule(
-        validateSkillMarkdown(removeNumberedSection(CONTRACT_SKILL, index))
-          .failures,
-        "B2D-SKILL-004"
-      )
-    }
-    assertHasRule(
-      validateSkillMarkdown(swapPlanAndProgressSections(CONTRACT_SKILL))
-        .failures,
-      "B2D-SKILL-004"
-    )
-  })
-
-  it("requires one unfenced machine-readable positive contract", () => {
-    const parallel = structuredClone(SKILL_CONTRACT)
-    parallel.task_execution.order = "parallel"
-    const unlimitedRecovery = structuredClone(SKILL_CONTRACT)
-    unlimitedRecovery.recovery.unexpected_continuations = 99
-    const disabledRegistration = structuredClone(SKILL_CONTRACT)
-    disabledRegistration.interfaces.registration = "none"
-    const optionalFinal = structuredClone(SKILL_CONTRACT)
-    optionalFinal.final_review.required = false
-    const reordered = structuredClone(SKILL_CONTRACT)
-    const secondPhase = reordered.phase_order[1]
-    reordered.phase_order[1] = reordered.phase_order[2]
-    reordered.phase_order[2] = secondPhase
-
-    for (const mutation of [
-      CONTRACT_SKILL.replace(skillContractBlock(), ""),
-      CONTRACT_SKILL.replace(
-        skillContractBlock(),
-        `\`\`\`json\n${skillContractBlock()}\n\`\`\``
-      ),
-      `${CONTRACT_SKILL}\n${skillContractBlock()}\n`,
-      replaceSkillContract(CONTRACT_SKILL, parallel),
-      replaceSkillContract(CONTRACT_SKILL, unlimitedRecovery),
-      replaceSkillContract(CONTRACT_SKILL, disabledRegistration),
-      replaceSkillContract(CONTRACT_SKILL, optionalFinal),
-      replaceSkillContract(CONTRACT_SKILL, reordered),
+  it("rejects contradictory ownership and route prose", () => {
+    for (const prose of [
+      "The parent revises the Plan directly.",
+      "Always use Grok as the implementer.",
+      "Use the Task Agent to implement high Tasks.",
+      "Reuse one Codex conversation for implementation and review.",
+      "Switch Agent immediately inside the active Task.",
+      "Skip the auxiliary review after a high-Task fix.",
     ]) {
-      assertHasRule(
-        validateSkillMarkdown(mutation).failures,
-        "B2D-SKILL-004"
-      )
-    }
-  })
-
-  it("rejects negative instructions for every ordered behavior", () => {
-    const preambleNegative = CONTRACT_SKILL.replace(
-      skillContractBlock(),
-      skillContractBlock() +
-        "\n\nNever use writing-plans; once the Plan exists, do not call " +
-        "register_simple_workflow."
-    )
-    assertHasRule(
-      validateSkillMarkdown(preambleNegative).failures,
-      "B2D-SKILL-004"
-    )
-
-    const mutations = [
-      [
-        2,
-        "Never use writing-plans. Once the Plan exists, do not call " +
-          "register_simple_workflow; leave Tasks pending and skip Plan review.",
-      ],
-      [
-        3,
-        "Never write codeg-simple-progress-v1 before delegation. Do not " +
-          "record reserving intent; ignore every observed update after " +
-          "state changes.",
-      ],
-      [
-        5,
-        "Do not execute Tasks serially. Never use delegate_to_agent, " +
-          "continue_delegation, or stable work_unit_key; Grok, Codex, and " +
-          "task_ids are prohibited.",
-      ],
-      [
-        6,
-        "Treat recovery_confirmation_required and recovery_authorization_id " +
-          "as forbidden. Avoid fresh_dispatch for unresumable, " +
-          "budget_exhausted_continue, not_supported, admission_failed, and " +
-          "admission_unknown. Never enforce | Unexpected continuations | 2 | " +
-          "or | Logical replacement | 1 |.",
-      ],
-      [
-        7,
-        "Do not set final_review_status to in_progress or completed. Never " +
-          "request an independent Codex final review or commit owned changes.",
-      ],
-    ]
-
-    for (const [index, body] of mutations) {
-      assertHasRule(
-        validateSkillMarkdown(
-          replaceNumberedSectionBody(CONTRACT_SKILL, index, body)
-        ).failures,
-        "B2D-SKILL-004"
-      )
-    }
-  })
-
-  it("rejects keyword-only and fenced workflow placeholders", () => {
-    const keywordOnly = replaceNumberedSectionBody(
-      CONTRACT_SKILL,
-      2,
-      "writing-plans plan exists register_simple_workflow pending review."
-    )
-    const fenced = replaceNumberedSectionBody(
-      CONTRACT_SKILL,
-      2,
-      "```text\nwriting-plans plan exists register_simple_workflow " +
-        "pending review.\n```"
-    )
-    for (const mutation of [keywordOnly, fenced]) {
-      assertHasRule(
-        validateSkillMarkdown(mutation).failures,
-        "B2D-SKILL-004"
-      )
+      has(validateSkillMarkdown(`${skill}\n${prose}`).failures, "B2D-SKILL-005")
     }
   })
 })
 
-describe("Simple Plan parsing", () => {
-  it("parses level-2 and level-3 Task headings in display order", () => {
-    const parsed = parseSimplePlan(PLAN)
+describe("bounded routing extraction", () => {
+  it("parses one exact unfenced block with ordered headings", () => {
+    const parsed = parseSimplePlan(plan())
+    assert.deepEqual(parsed.failures, [])
     assert.deepEqual(
       parsed.tasks.map(({ index, title }) => ({ index, title })),
       [
@@ -507,546 +408,460 @@ describe("Simple Plan parsing", () => {
         { index: 2, title: "Project progress" },
       ]
     )
-    assert.deepEqual(parsed.failures, [])
+    assert.equal(parsed.routing.schema_version, 1)
   })
 
-  it("ignores Task-looking headings inside fenced code", () => {
-    const parsed = parseSimplePlan(`## Task 1: Real
-
-\`\`\`markdown
-### Task 2: Example only
-\`\`\`
-
-### Task 2: Real second
-`)
-    assert.deepEqual(
-      parsed.tasks.map((task) => task.title),
-      ["Real", "Real second"]
+  it("rejects missing, duplicate, truncated, oversized, invalid, and fenced-only blocks", () => {
+    has(parseSimpleRouting("# none").failures, "B2D-ROUTING-001")
+    has(parseSimpleRouting(`${plan()}\n${plan()}`).failures, "B2D-ROUTING-001")
+    has(
+      parseSimpleRouting("<!-- codeg-b2d-routing-v1\n{").failures,
+      "B2D-ROUTING-001"
     )
-    assert.deepEqual(parsed.failures, [])
-  })
-
-  it("rejects duplicate, non-contiguous, and malformed Task headings", () => {
-    const parsed = parseSimplePlan(`## Task 1: One
-## Task 3: Three
-### Task 3: Duplicate
-### Task x: Malformed
-`)
-    assertHasRule(parsed.failures, "B2D-PLAN-002")
-    assertHasRule(parsed.failures, "B2D-PLAN-003")
-  })
-
-  it("bounds the Plan document", () => {
-    assertHasRule(
-      parseSimplePlan("x".repeat(MAX_PLAN_DOCUMENT_BYTES + 1)).failures,
-      "B2D-PLAN-001"
+    has(
+      parseSimpleRouting(
+        `<!-- codeg-b2d-routing-v1\n${"x".repeat(
+          MAX_ROUTING_BLOCK_BYTES + 1
+        )}\n-->`
+      ).failures,
+      "B2D-ROUTING-002"
+    )
+    has(
+      parseSimpleRouting("<!-- codeg-b2d-routing-v1\nnope\n-->").failures,
+      "B2D-ROUTING-003"
+    )
+    has(
+      parseSimpleRouting("~~~md\n<!-- codeg-b2d-routing-v1\n{}\n-->\n~~~")
+        .failures,
+      "B2D-ROUTING-001"
     )
   })
 })
 
-describe("Simple progress parsing and validation", () => {
-  it("accepts the exact bounded block plus human-readable notes", () => {
-    const result = validate({
-      progressMarkdown: progressBlock(
-        validSnapshot(),
-        "Task 1 evidence and recovery notes remain ordinary Markdown."
-      ),
+describe("risk, generation, and exact routes", () => {
+  it("defaults omitted initial selection to generation 1 Grok", () => {
+    const snapshot = routing()
+    delete snapshot.task_agent_generations
+    const parsed = parseSimplePlan(plan(snapshot))
+    const failures = []
+    const normalized = validateRoutingSnapshot(parsed.routing, parsed, failures)
+    assert.deepEqual(failures, [])
+    assert.deepEqual(normalized.generations[0], {
+      generation: 1,
+      agent_type: "grok",
+      profile_id: null,
+      effective_from_task_index: 1,
     })
-    assert.deepEqual(result.failures, [])
-    assert.equal(result.plan.tasks.length, 2)
-    assert.equal(result.progress.snapshot.tasks.length, 2)
   })
 
-  it("requires exactly one complete progress marker", () => {
-    assertHasRule(
-      validate({ progressMarkdown: "# no structured block" }).failures,
-      "B2D-PROGRESS-001"
-    )
-    const block = progressBlock(validSnapshot())
-    assertHasRule(
-      validate({ progressMarkdown: `${block}\n${block}` }).failures,
-      "B2D-PROGRESS-001"
-    )
-    assertHasRule(
-      validate({
-        progressMarkdown:
-          "<!-- codeg-simple-progress-v1 {\"schema_version\":1}",
-      }).failures,
-      "B2D-PROGRESS-001"
-    )
-  })
-
-  it("bounds the full ledger and structured block", () => {
-    assertHasRule(
-      validate({
-        progressMarkdown: "x".repeat(MAX_PROGRESS_DOCUMENT_BYTES + 1),
-      }).failures,
-      "B2D-PROGRESS-002"
-    )
-    assertHasRule(
-      validate({
-        progressMarkdown: `<!-- codeg-simple-progress-v1\n${"x".repeat(
-          MAX_PROGRESS_BLOCK_BYTES + 1
-        )}\n-->`,
-      }).failures,
-      "B2D-PROGRESS-002"
-    )
-  })
-
-  it("requires schema version 1 and the registered Plan path", () => {
-    assertHasRule(
-      validate({
-        progressMarkdown:
-          "<!-- codeg-simple-progress-v1\n{not-json}\n-->",
-      }).failures,
-      "B2D-PROGRESS-003"
-    )
-    assertHasRule(
-      validate({
-        progressMarkdown: progressBlock(validSnapshot({ schema_version: 2 })),
-      }).failures,
-      "B2D-PROGRESS-003"
-    )
-    assertHasRule(
-      validate({
-        progressMarkdown: progressBlock(
-          validSnapshot({ plan_rel_path: "docs/other.md" })
-        ),
-      }).failures,
-      "B2D-PROGRESS-004"
-    )
-  })
-
-  it("matches backend relative-path normalization", () => {
-    const nfcSnapshot = validSnapshot({
-      plan_rel_path: "docs/superpowers/plans/caf\u00e9.md",
-    })
-    const normalized = validate({
-      planRelPath: "docs/superpowers/plans/cafe\u0301.md",
-      progressMarkdown: progressBlock(nfcSnapshot),
-    })
-    assert.ok(
-      !normalized.failures.some((failure) =>
-        failure.startsWith("[B2D-PROGRESS-004]")
-      )
-    )
-
-    if (process.platform === "win32") {
-      const windowsSnapshot = validSnapshot({
-        plan_rel_path: "docs/superpowers/plans/example.md",
-      })
-      const windowsCase = validate({
-        planRelPath: "DOCS\\SUPERPOWERS\\PLANS\\EXAMPLE.MD",
-        progressMarkdown: progressBlock(windowsSnapshot),
-      })
-      assert.ok(
-        !windowsCase.failures.some((failure) =>
-          failure.startsWith("[B2D-PROGRESS-004]")
-        )
-      )
-    }
-
-    for (const invalidPath of [
-      "C:relative.md",
-      "docs/./plans/example.md",
-      "docs/plans/a|b.md",
-      "docs/plans/a\u0001.md",
+  it("accepts every built-in and valid custom identity/profile", () => {
+    for (const selected of [
+      identity("claude_code"),
+      identity("codex"),
+      identity("open_code"),
+      identity("gemini"),
+      identity("cline"),
+      identity("hermes"),
+      identity("code_buddy"),
+      identity("kimi_code"),
+      identity("pi"),
+      identity("grok"),
+      identity("cursor"),
+      identity("custom:reviewer-x", "deep"),
     ]) {
-      assertHasRule(
-        validate({
-          planRelPath: invalidPath,
-          progressMarkdown: progressBlock(
-            validSnapshot({ plan_rel_path: invalidPath })
-          ),
-        }).failures,
-        "B2D-PROGRESS-004"
-      )
-    }
-  })
-
-  it("requires unique Plan-backed Task indices and known statuses", () => {
-    const badTasks = [
-      { index: 1, status: "completed", runs: [] },
-      { index: 1, status: "pending", runs: [] },
-      { index: 9, status: "mystery", runs: [] },
-    ]
-    assertHasRule(
-      validate({
-        progressMarkdown: progressBlock(validSnapshot({ tasks: badTasks })),
-      }).failures,
-      "B2D-PROGRESS-005"
-    )
-  })
-
-  it("requires progress Tasks to exactly match ordered Plan Tasks", () => {
-    for (const tasks of [
-      [],
-      [validSnapshot().tasks[1]],
-      [validSnapshot().tasks[0]],
-      [...validSnapshot().tasks].reverse(),
-    ]) {
-      assertHasRule(
-        validate({
-          progressMarkdown: progressBlock(
-            validSnapshot({ active_task_index: null, tasks })
-          ),
-        }).failures,
-        "B2D-PROGRESS-005"
-      )
-    }
-  })
-
-  it("validates generic run identity and replacement metadata", () => {
-    const missingPair = validSnapshot()
-    missingPair.tasks[1].runs[1].replacement_reason = null
-    assertHasRule(
-      validate({ progressMarkdown: progressBlock(missingPair) }).failures,
-      "B2D-PROGRESS-006"
-    )
-
-    const wrongReason = validSnapshot()
-    wrongReason.tasks[1].runs[1].replacement_reason = "workflow_recovery"
-    assertHasRule(
-      validate({ progressMarkdown: progressBlock(wrongReason) }).failures,
-      "B2D-PROGRESS-006"
-    )
-
-    const unstableKey = validSnapshot()
-    unstableKey.tasks[1].runs[0].work_unit_key = ""
-    assertHasRule(
-      validate({ progressMarkdown: progressBlock(unstableKey) }).failures,
-      "B2D-PROGRESS-006"
-    )
-
-    for (const mutate of [
-      (run) => {
-        run.work_unit_key = "task|1|implementer|codex|release"
-      },
-      (run) => {
-        run.work_unit_key = "task|2|reviewer|codex|release"
-      },
-      (run) => {
-        run.work_unit_key = "task|2|implementer|grok|release"
-      },
-      (run) => {
-        run.work_unit_key = "task|2|implementer|codex|other"
-      },
-      (run) => {
-        run.work_unit_key = "task|02|implementer|codex|release"
-      },
-      (run) => {
-        run.agent_type = "not_an_agent"
-        run.work_unit_key = "task|2|implementer|not_an_agent|release"
-      },
-    ]) {
-      const mismatchedIdentity = validSnapshot()
-      mutate(mismatchedIdentity.tasks[1].runs[0])
-      assertHasRule(
-        validate({
-          progressMarkdown: progressBlock(mismatchedIdentity),
-        }).failures,
-        "B2D-PROGRESS-006"
-      )
-    }
-
-    const scalarSnapshot = validSnapshot()
-    const scalarPrefix = "task|2|implementer|codex|"
-    const scalarProfile = "\ud83d\ude00".repeat(200 - [...scalarPrefix].length)
-    for (const run of scalarSnapshot.tasks[1].runs) {
-      run.profile_id = scalarProfile
-      run.work_unit_key = scalarPrefix + scalarProfile
-    }
-    assert.deepEqual(
-      validate({ progressMarkdown: progressBlock(scalarSnapshot) }).failures,
-      []
-    )
-  })
-
-  it("keeps one stable identity for every Task-role lineage", () => {
-    const changedAgent = validSnapshot()
-    changedAgent.tasks[1].runs[1].agent_type = "grok"
-    changedAgent.tasks[1].runs[1].work_unit_key =
-      "task|2|implementer|grok|release"
-    assertHasRule(
-      validate({ progressMarkdown: progressBlock(changedAgent) }).failures,
-      "B2D-PROGRESS-006"
-    )
-
-    const changedProfile = validSnapshot()
-    changedProfile.tasks[1].runs[1].profile_id = "other"
-    changedProfile.tasks[1].runs[1].work_unit_key =
-      "task|2|implementer|codex|other"
-    assertHasRule(
-      validate({ progressMarkdown: progressBlock(changedProfile) }).failures,
-      "B2D-PROGRESS-006"
-    )
-
-    const literalNone = validSnapshot()
-    literalNone.tasks[0].runs[0].profile_id = "none"
-    assertHasRule(
-      validate({ progressMarkdown: progressBlock(literalNone) }).failures,
-      "B2D-PROGRESS-006"
-    )
-  })
-
-  it("enforces unique task IDs and same-lineage replacement sources", () => {
-    const duplicateTaskId = validSnapshot()
-    duplicateTaskId.tasks[0].runs[1].task_id = "task-1-impl"
-    assertHasRule(
-      validate({ progressMarkdown: progressBlock(duplicateTaskId) }).failures,
-      "B2D-PROGRESS-006"
-    )
-
-    const missingSource = validSnapshot()
-    missingSource.tasks[1].runs[1].replaced_task_id = "not-in-lineage"
-    assertHasRule(
-      validate({ progressMarkdown: progressBlock(missingSource) }).failures,
-      "B2D-PROGRESS-006"
-    )
-  })
-
-  it("allows one logical replacement and identical admission retries", () => {
-    const secondReplacement = validSnapshot()
-    secondReplacement.tasks[1].runs.push({
-      ...secondReplacement.tasks[1].runs[1],
-      task_id: "task-2-c",
-      child_conversation_id: 52,
-      replaced_task_id: "task-2-b",
-    })
-    assertHasRule(
-      validate({ progressMarkdown: progressBlock(secondReplacement) }).failures,
-      "B2D-PROGRESS-006"
-    )
-
-    const admittedDuplicate = validSnapshot()
-    admittedDuplicate.tasks[1].runs.push({
-      ...admittedDuplicate.tasks[1].runs[1],
-      task_id: "task-2-c",
-      child_conversation_id: 52,
-    })
-    assertHasText(
-      validate({ progressMarkdown: progressBlock(admittedDuplicate) }).failures,
-      "prior attempt was admitted"
-    )
-
-    const admissionRetry = validSnapshot()
-    admissionRetry.tasks[1].runs[1].child_conversation_id = null
-    admissionRetry.tasks[1].runs[1].state = "failed"
-    admissionRetry.tasks[1].runs.push({
-      ...admissionRetry.tasks[1].runs[1],
-      task_id: "task-2-c",
-      child_conversation_id: null,
-      state: "reserving",
-    })
-    assert.deepEqual(
-      validate({ progressMarkdown: progressBlock(admissionRetry) }).failures,
-      []
-    )
-  })
-
-  it("enforces recovery rails and backend integer ranges", () => {
-    const exactBoundaries = validSnapshot()
-    exactBoundaries.tasks[0].runs[0].child_conversation_id = 0x7fffffff
-    exactBoundaries.tasks[1].runs[1].recovery_count = 2
-    assert.deepEqual(
-      validate({ progressMarkdown: progressBlock(exactBoundaries) }).failures,
-      []
-    )
-
-    const childOverflow = validSnapshot()
-    childOverflow.tasks[0].runs[0].child_conversation_id = 0x80000000
-    assertHasText(
-      validate({ progressMarkdown: progressBlock(childOverflow) }).failures,
-      "signed 32-bit"
-    )
-
-    const railOverflow = validSnapshot()
-    railOverflow.tasks[1].runs[1].recovery_count = 3
-    assertHasText(
-      validate({ progressMarkdown: progressBlock(railOverflow) }).failures,
-      "at most 2"
-    )
-
-    const u32Boundary = validSnapshot()
-    u32Boundary.tasks[1].runs[1].recovery_count = 0xffffffff
-    const u32BoundaryFailures = validate({
-      progressMarkdown: progressBlock(u32Boundary),
-    }).failures
-    assertHasText(u32BoundaryFailures, "at most 2")
-    assert.ok(
-      !u32BoundaryFailures.some((failure) =>
-        failure.includes("unsigned 32-bit")
-      ),
-      "expected the u32 boundary to remain in range; got " +
-        u32BoundaryFailures.join("; ")
-    )
-
-    const u32Overflow = validSnapshot()
-    u32Overflow.tasks[1].runs[1].recovery_count = 0x100000000
-    assertHasText(
-      validate({ progressMarkdown: progressBlock(u32Overflow) }).failures,
-      "unsigned 32-bit"
-    )
-  })
-
-  it("rejects v2 and transport-only output fields recursively", () => {
-    for (const [location, field] of [
-      ["root", "workflow_id"],
-      ["root", "manifest_revision"],
-      ["root", "gate_id"],
-      ["task", "artifact_digest"],
-      ["run", "reviewed_task_id"],
-      ["run", "recovery_authorization_id"],
-      ["run", "completion_card"],
-    ]) {
-      const snapshot = validSnapshot()
-      const target =
-        location === "root"
-          ? snapshot
-          : location === "task"
-            ? snapshot.tasks[0]
-            : snapshot.tasks[0].runs[0]
-      target[field] = "stale-v2-value"
-      assertHasRule(
-        validate({ progressMarkdown: progressBlock(snapshot) }).failures,
-        "B2D-PROGRESS-007"
-      )
-    }
-  })
-
-  it("enforces serial Task and final-review state", () => {
-    const twoActive = validSnapshot()
-    twoActive.tasks[0].status = "in_progress"
-    delete twoActive.tasks[0].commit
-    assertHasRule(
-      validate({ progressMarkdown: progressBlock(twoActive) }).failures,
-      "B2D-PROGRESS-008"
-    )
-
-    const prematureFinal = validSnapshot({
-      active_task_index: null,
-      final_review_status: "completed",
-    })
-    prematureFinal.tasks[1].status = "pending"
-    prematureFinal.tasks[1].runs = []
-    assertHasRule(
-      validate({ progressMarkdown: progressBlock(prematureFinal) }).failures,
-      "B2D-PROGRESS-008"
-    )
-
-    const wrongActive = validSnapshot({ active_task_index: 1 })
-    assertHasRule(
-      validate({ progressMarkdown: progressBlock(wrongActive) }).failures,
-      "B2D-PROGRESS-008"
-    )
-
-    const skippedEarlier = validSnapshot()
-    skippedEarlier.tasks[0].status = "pending"
-    skippedEarlier.tasks[0].runs = []
-    delete skippedEarlier.tasks[0].commit
-    assertHasRule(
-      validate({ progressMarkdown: progressBlock(skippedEarlier) }).failures,
-      "B2D-PROGRESS-008"
-    )
-
-    const skippedBlocked = validSnapshot({ active_task_index: 1 })
-    skippedBlocked.tasks[0].status = "blocked"
-    delete skippedBlocked.tasks[0].commit
-    assertHasRule(
-      validate({ progressMarkdown: progressBlock(skippedBlocked) }).failures,
-      "B2D-PROGRESS-008"
-    )
-
-    const twoBlocked = validSnapshot({ active_task_index: 1 })
-    twoBlocked.tasks[0].status = "blocked"
-    twoBlocked.tasks[1].status = "blocked"
-    delete twoBlocked.tasks[0].commit
-    assertHasRule(
-      validate({ progressMarkdown: progressBlock(twoBlocked) }).failures,
-      "B2D-PROGRESS-008"
-    )
-
-    const untrackedBlocked = validSnapshot({ active_task_index: null })
-    untrackedBlocked.tasks[1].status = "blocked"
-    assertHasRule(
-      validate({ progressMarkdown: progressBlock(untrackedBlocked) }).failures,
-      "B2D-PROGRESS-008"
-    )
-  })
-})
-
-describe("CLI file reads and direct invocation", () => {
-  it("accepts an exact UTF-8 byte boundary and rejects overflow", () => {
-    const directory = mkdtempSync(join(tmpdir(), "b2d-validator-"))
-    const fixture = join(directory, "fixture.md")
-    try {
-      writeFileSync(fixture, "\u00e9")
-      assert.equal(readUtf8FileBounded(fixture, 2, "fixture"), "\u00e9")
-      assert.throws(
-        () => readUtf8FileBounded(fixture, 1, "fixture"),
-        /fixture exceeds 1 bytes/
-      )
-
-      writeFileSync(fixture, Buffer.from([0xc3]))
-      assert.throws(
-        () => readUtf8FileBounded(fixture, 1, "fixture"),
-        /fixture is not valid UTF-8/
-      )
-    } finally {
-      rmSync(directory, { recursive: true, force: true })
-    }
-  })
-
-  it("compares canonical paths with platform-appropriate casing", () => {
-    assert.equal(
-      canonicalPathsEqual(
-        "C:\\Repo\\Skill\\validate-contract.mjs",
-        "c:\\repo\\skill\\VALIDATE-CONTRACT.MJS",
-        "win32"
-      ),
-      true
-    )
-    assert.equal(
-      canonicalPathsEqual("/Repo/Skill", "/repo/skill", "linux"),
-      false
-    )
-  })
-
-  it("runs when invoked through a symlink or junction", () => {
-    const directory = mkdtempSync(join(tmpdir(), "b2d-validator-entry-"))
-    const aliasDirectory = join(directory, "skill-scripts")
-    try {
-      symlinkSync(
-        dirname(validatorScript),
-        aliasDirectory,
-        process.platform === "win32" ? "junction" : "dir"
-      )
-      const aliasScript = join(aliasDirectory, "validate-contract.mjs")
-      assert.equal(
-        isDirectInvocation(aliasScript, pathToFileURL(validatorScript).href),
-        true
-      )
-      const result = spawnSync(process.execPath, [aliasScript], {
-        encoding: "utf8",
-      })
-      assert.equal(result.status, 0, result.stderr)
-      assert.match(
-        result.stdout,
-        /PASS: brainstorm-to-delivery Simple contract/
-      )
-
-      if (process.platform === "win32") {
-        const alternateCase = validatorScript.toUpperCase()
-        assert.equal(
-          isDirectInvocation(
-            alternateCase,
-            pathToFileURL(validatorScript).href
-          ),
-          true
-        )
+      const snapshot = routing()
+      snapshot.task_agent_generations[0] = {
+        generation: 1,
+        ...selected,
+        effective_from_task_index: 1,
       }
-    } finally {
-      rmSync(directory, { recursive: true, force: true })
+      snapshot.tasks = [task(1, "normal", selected), task(2, "high", selected)]
+      assert.deepEqual(validate(snapshot), [], selected.agent_type)
     }
+  })
+
+  it("rejects malformed, reserved, unavailable, ambiguous, and literal-none identities", () => {
+    for (const selected of [
+      identity("custom:codex"),
+      identity("custom:Bad"),
+      identity("auto"),
+      identity("unavailable"),
+      identity("ambiguous"),
+      identity("grok", "none"),
+      identity("grok", ""),
+      identity("grok|bad"),
+      identity("grok", "x".repeat(201)),
+    ]) {
+      const snapshot = routing()
+      snapshot.task_agent_generations[0] = {
+        generation: 1,
+        ...selected,
+        effective_from_task_index: 1,
+      }
+      has(validate(snapshot), "B2D-ROUTING-005")
+    }
+  })
+
+  it("reports multiple malformed generation entries without throwing", () => {
+    const snapshot = routing()
+    snapshot.task_agent_generations = [
+      null,
+      {
+        generation: 2,
+        ...identity("gemini"),
+        effective_from_task_index: 2,
+      },
+    ]
+    assert.doesNotThrow(() => validate(snapshot))
+    has(validate(snapshot), "B2D-ROUTING-005")
+  })
+
+  it("requires contiguous generations and exact effective boundaries", () => {
+    for (const mutate of [
+      (s) => {
+        s.task_agent_generations[0].generation = 2
+      },
+      (s) => {
+        s.task_agent_generations.push({
+          generation: 3,
+          ...identity("gemini"),
+          effective_from_task_index: 2,
+        })
+      },
+      (s) => {
+        s.task_agent_generations.push({
+          generation: 2,
+          ...identity("gemini"),
+          effective_from_task_index: 1,
+        })
+      },
+      (s) => {
+        s.task_agent_generations.push({
+          generation: 2,
+          ...identity("gemini"),
+          effective_from_task_index: 2,
+        })
+        s.tasks[1].task_agent_generation = 1
+      },
+    ]) {
+      const snapshot = routing()
+      mutate(snapshot)
+      has(validate(snapshot), "B2D-ROUTING-006")
+    }
+  })
+
+  it("rejects a Task that routes back to an earlier generation", () => {
+    const snapshot = routing()
+    snapshot.task_agent_generations.push({
+      generation: 2,
+      ...identity("gemini"),
+      effective_from_task_index: 2,
+    })
+    snapshot.tasks[1] = task(2, "normal", identity("gemini"), 2)
+    snapshot.tasks.push(task(3, "normal", identity(), 1))
+    const routedPlan = `${plan(snapshot)}\n## Task 3: Revert generation\n`
+    const parsed = parseSimplePlan(routedPlan)
+    const failures = []
+    validateRoutingSnapshot(parsed.routing, parsed, failures)
+    has(failures, "B2D-ROUTING-006")
+  })
+
+  it("forces high for all six hard triggers with evidence", () => {
+    for (const kind of [
+      "concurrency_lifecycle",
+      "security_trust_boundary",
+      "migration_destructive_persistence",
+      "public_compatibility",
+      "unsafe_ffi",
+      "update_rollback",
+    ]) {
+      const snapshot = routing()
+      snapshot.tasks[0].risk.hard_triggers = [{ kind, evidence: ["specific"] }]
+      has(validate(snapshot), "B2D-RISK-004")
+      snapshot.tasks[0] = task(1, "high")
+      snapshot.tasks[0].risk.hard_triggers = [{ kind, evidence: ["specific"] }]
+      assert.deepEqual(validate(snapshot), [], kind)
+      snapshot.tasks[0].risk.hard_triggers[0].evidence = []
+      has(validate(snapshot), "B2D-RISK-002")
+    }
+  })
+
+  it("classifies soft totals 0..2 normal and 3+ high", () => {
+    for (const [kinds, level] of [
+      [[], "normal"],
+      [["shared_interface"], "normal"],
+      [["cross_runtime_or_process"], "normal"],
+      [["cross_runtime_or_process", "shared_interface"], "high"],
+    ]) {
+      const snapshot = routing()
+      snapshot.tasks[0] = task(1, level)
+      snapshot.tasks[0].risk.hard_triggers = []
+      snapshot.tasks[0].risk.soft_signals = kinds.map((kind) => ({
+        kind,
+        score: kind === "cross_runtime_or_process" ? 2 : 1,
+        evidence: [kind],
+      }))
+      snapshot.tasks[0].risk.score = snapshot.tasks[0].risk.soft_signals.reduce(
+        (sum, signal) => sum + signal.score,
+        0
+      )
+      assert.deepEqual(
+        validate(snapshot),
+        [],
+        String(snapshot.tasks[0].risk.score)
+      )
+    }
+  })
+
+  it("rejects unknown, duplicate, evidence-free, wrong-score, wrong-total, contradictory, and empty risk", () => {
+    for (const [rule, mutate] of [
+      [
+        "B2D-RISK-001",
+        (r) =>
+          (r.soft_signals = [{ kind: "unknown", score: 1, evidence: ["x"] }]),
+      ],
+      [
+        "B2D-RISK-001",
+        (r) =>
+          (r.soft_signals = [
+            { kind: "shared_interface", score: 1, evidence: ["x"] },
+            { kind: "shared_interface", score: 1, evidence: ["y"] },
+          ]),
+      ],
+      [
+        "B2D-RISK-002",
+        (r) =>
+          (r.soft_signals = [
+            { kind: "shared_interface", score: 1, evidence: [] },
+          ]),
+      ],
+      [
+        "B2D-RISK-003",
+        (r) => {
+          r.soft_signals = [
+            { kind: "shared_interface", score: 2, evidence: ["x"] },
+          ]
+          r.score = 2
+        },
+      ],
+      [
+        "B2D-RISK-003",
+        (r) => {
+          r.soft_signals = [
+            { kind: "shared_interface", score: 1, evidence: ["x"] },
+          ]
+          r.score = 2
+        },
+      ],
+      ["B2D-RISK-004", (r) => (r.level = "high")],
+      ["B2D-RISK-005", (r) => (r.reason = "")],
+    ]) {
+      const snapshot = routing()
+      mutate(snapshot.tasks[0].risk)
+      has(validate(snapshot), rule)
+    }
+  })
+
+  it("rejects one evidence string counted by multiple soft signals", () => {
+    const snapshot = routing()
+    snapshot.tasks[0].risk.soft_signals = [
+      { kind: "shared_interface", score: 1, evidence: ["same fact"] },
+      { kind: "dependency_or_build", score: 1, evidence: ["same fact"] },
+    ]
+    snapshot.tasks[0].risk.score = 2
+    has(validate(snapshot), "B2D-RISK-001")
+  })
+
+  it("requires exact profile, order, slots, count, identities, and structured route", () => {
+    for (const mutate of [
+      (t) => (t.route.implementer.profile_id = "wrong"),
+      (t) => (t.route.reviewers[0].slot = "auxiliary"),
+      (t) => t.route.reviewers.push(copy(t.route.reviewers[0])),
+      (t) => (t.route.reviewers = []),
+      (t) => (t.route = "free-form"),
+      (t) => t.route.reviewers.reverse(),
+    ]) {
+      const snapshot = routing()
+      mutate(snapshot.tasks[1])
+      has(validate(snapshot), "B2D-ROUTING-009")
+    }
+  })
+
+  it("matches routing indices to headings and derives explicit keys", () => {
+    const bad = routing()
+    bad.tasks[1].index = 3
+    has(validate(bad), "B2D-ROUTING-004")
+    const failures = []
+    const expected = deriveExpectedRoute(
+      routing().tasks[1],
+      routing().task_agent_generations[0],
+      failures
+    )
+    assert.deepEqual(failures, [])
+    assert.deepEqual(
+      expected.expected_work_unit_keys,
+      expectedWorkUnitKeys(2, "high", identity())
+    )
+  })
+})
+
+describe("progress agreement and per-key lineage", () => {
+  it("validates the complete routed fixture", () => {
+    assert.deepEqual(validate(), [])
+  })
+
+  it("keeps generic primary and auxiliary reviewer lineages separate", () => {
+    const route = routing()
+    const state = progress(route)
+    state.tasks[1] = progressTask(route.tasks[1], "completed", 20)
+    assert.ok(
+      state.tasks[1].runs
+        .filter((entry) => entry.role === "reviewer")
+        .every((entry) => entry.role === "reviewer")
+    )
+    assert.deepEqual(validate(route, state), [])
+  })
+
+  it("rejects risk, generation, implementer, primary, and auxiliary mismatches", () => {
+    for (const mutate of [
+      (p) => (p.tasks[0].risk_level = "high"),
+      (p) => (p.tasks[0].task_agent_generation = 2),
+      (p) =>
+        (p.tasks[0].expected_work_unit_keys.implementer =
+          "task|1|implementer|codex|none"),
+      (p) =>
+        (p.tasks[0].expected_work_unit_keys.reviewers.primary =
+          "task|1|reviewer|codex|none"),
+      (p) => (p.tasks[1].expected_work_unit_keys.reviewers.auxiliary = null),
+    ]) {
+      const state = progress()
+      mutate(state)
+      has(validate(routing(), state), "B2D-PROGRESS-009")
+    }
+  })
+
+  it("requires every expected completed key and rejects outside keys", () => {
+    const missing = progress()
+    missing.tasks[0].runs.pop()
+    has(validate(routing(), missing), "B2D-PROGRESS-010")
+    const extra = progress()
+    extra.tasks[0].runs.push(
+      run("task|1|reviewer|auxiliary|grok|none", "completed", "extra", 99)
+    )
+    has(validate(routing(), extra), "B2D-PROGRESS-009")
+  })
+
+  it("enforces stable identity and one replacement per exact key", () => {
+    const state = progress()
+    const key = state.tasks[0].expected_work_unit_keys.implementer
+    const source = state.tasks[0].runs[0]
+    source.state = "failed"
+    state.tasks[0].runs.push({
+      ...run(key, "failed", "replacement-1", null),
+      replaced_task_id: source.task_id,
+      replacement_reason: "unresumable",
+    })
+    state.tasks[0].runs.push({
+      ...run(key, "completed", "replacement-2", 90),
+      replaced_task_id: "replacement-1",
+      replacement_reason: "unresumable",
+    })
+    has(validate(routing(), state), "B2D-PROGRESS-006")
+    state.tasks[0].runs[1].agent_type = "codex"
+    has(validate(routing(), state), "B2D-PROGRESS-006")
+  })
+
+  it("requires globally unique task IDs and child IDs across distinct keys", () => {
+    const taskIds = progress()
+    taskIds.tasks[0].runs[1].task_id = taskIds.tasks[0].runs[0].task_id
+    has(validate(routing(), taskIds), "B2D-PROGRESS-006")
+    const children = progress()
+    children.tasks[0].runs[1].child_conversation_id =
+      children.tasks[0].runs[0].child_conversation_id
+    has(validate(routing(), children), "B2D-PROGRESS-006")
+  })
+
+  it("reads legacy reviewer as primary but requires explicit routed primary", () => {
+    const legacyProgress = {
+      schema_version: 1,
+      plan_rel_path: planRelPath,
+      active_task_index: null,
+      tasks: [
+        {
+          index: 1,
+          status: "completed",
+          commit: "c",
+          runs: [
+            run("task|1|implementer|grok|none", "completed", "li", 1),
+            run("task|1|reviewer|codex|none", "completed", "lr", 2),
+          ],
+        },
+      ],
+      final_review_status: "pending",
+      updated_at: null,
+    }
+    assert.deepEqual(
+      validateSimpleDocuments({
+        skillMarkdown: skill,
+        planMarkdown: "# Plan\n\n## Task 1: Legacy\n",
+        progressMarkdown: `# Progress\n${block(
+          "codeg-simple-progress-v1",
+          legacyProgress
+        )}`,
+        planRelPath,
+      }).failures,
+      []
+    )
+    const routed = progress()
+    routed.tasks[0].runs[1].work_unit_key = "task|1|reviewer|codex|none"
+    has(validate(routing(), routed), "B2D-PROGRESS-009")
+  })
+
+  it("allows generation change only at first empty pending Task after completed prefix", () => {
+    const route = routing()
+    const selected = identity("gemini", "careful")
+    route.task_agent_generations.push({
+      generation: 2,
+      ...selected,
+      effective_from_task_index: 2,
+    })
+    route.tasks[1] = task(2, "normal", selected, 2)
+    assert.deepEqual(validate(route, progress(route)), [])
+    for (const mutate of [
+      (p) => {
+        p.tasks[1].status = "in_progress"
+        p.active_task_index = 2
+      },
+      (p) => {
+        p.tasks[1].status = "blocked"
+        p.active_task_index = 2
+      },
+      (p) => {
+        p.tasks[1].runs = [
+          run(
+            p.tasks[1].expected_work_unit_keys.implementer,
+            "reserving",
+            "reserved",
+            null
+          ),
+        ]
+      },
+      (p) => {
+        p.tasks[0].status = "pending"
+        p.tasks[0].runs = []
+      },
+    ]) {
+      const state = progress(route)
+      mutate(state)
+      has(validate(route, state), "B2D-ROUTING-007")
+    }
+  })
+
+  it("exposes pure routing/progress agreement functions", () => {
+    const parsed = parseSimplePlan(plan())
+    const failures = []
+    const normalized = validateRoutingSnapshot(parsed.routing, parsed, failures)
+    validateProgressRouting(progress(), normalized, failures)
+    assert.deepEqual(failures, [])
   })
 })

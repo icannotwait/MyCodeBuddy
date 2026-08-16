@@ -6,19 +6,40 @@
 export const MAX_PLAN_DOCUMENT_BYTES = 2 * 1024 * 1024
 export const MAX_PROGRESS_DOCUMENT_BYTES = 512 * 1024
 export const MAX_PROGRESS_BLOCK_BYTES = 64 * 1024
+export const MAX_ROUTING_BLOCK_BYTES = 256 * 1024
 
 const MAX_I32 = 0x7fffffff
 const MAX_U32 = 0xffffffff
 const MAX_UNEXPECTED_CONTINUATIONS = 2
 
-const SKILL_CONTRACT_MARKER = "<!-- codeg-b2d-skill-contract-v1"
+const SKILL_CONTRACT_MARKER = "<!-- codeg-b2d-skill-contract-v2"
+const ROUTING_MARKER = "<!-- codeg-b2d-routing-v1"
 const PROGRESS_MARKER = "<!-- codeg-simple-progress-v1"
+const RISK_POLICY_VERSION = "b2d_task_risk_v1"
 const COMMENT_END = "-->"
+const SOFT_SIGNAL_SCORES = new Map([
+  ["cross_runtime_or_process", 2],
+  ["broad_production_surface", 1],
+  ["multiple_ownership_modules", 1],
+  ["shared_interface", 1],
+  ["dependency_or_build", 1],
+  ["multi_layer_without_test_seam", 1],
+])
+const HARD_TRIGGER_KINDS = new Set([
+  "concurrency_lifecycle",
+  "security_trust_boundary",
+  "migration_destructive_persistence",
+  "public_compatibility",
+  "unsafe_ffi",
+  "update_rollback",
+])
 const REQUIRED_SKILL_CONTRACT = {
-  schema_version: 1,
+  schema_version: 2,
   phase_order: [
     "establish-current-truth",
-    "produce-plan-and-register",
+    "resolve-task-agent",
+    "review-and-revise-design",
+    "author-and-review-plan",
     "maintain-progress",
     "apply-workspace-gate",
     "execute-tasks-serially",
@@ -27,6 +48,7 @@ const REQUIRED_SKILL_CONTRACT = {
   ],
   interfaces: {
     plan_authoring: "writing-plans",
+    task_execution: "subagent-driven-development",
     registration: "register_simple_workflow",
     first_run: "delegate_to_agent",
     later_run: "continue_delegation",
@@ -35,12 +57,49 @@ const REQUIRED_SKILL_CONTRACT = {
   },
   plan_setup_order: [
     "create-progress",
-    "write-plan",
+    "dispatch-plan-author",
     "confirm-plan-on-disk",
+    "validate-routing",
+    "review-plan",
     "register-simple-workflow",
     "sync-plan-tasks",
-    "review-plan",
   ],
+  document_work: {
+    parent_edits: false,
+    design_review: "conditional",
+    design_reviewer: "independent_codex",
+    design_fixer: "independent_codex",
+    plan_author: "independent_codex",
+    plan_reviewer: "independent_codex",
+    producer_reviewer_independence: true,
+    plan_rereview: "full_latest_plan",
+    user_named_reviewers: "design_and_plan_only",
+  },
+  conversation_identity: {
+    distinct_work_units: "distinct_child_conversations",
+    continuation: "same_work_unit_only",
+  },
+  task_agent: {
+    default_agent_type: "grok",
+    selection_source: "invocation",
+    explicit_substitution: "forbidden",
+    change_boundary: "completed_tasks_after_plan_revision_and_full_rereview",
+  },
+  routing: {
+    marker: "codeg-b2d-routing-v1",
+    risk_policy_version: "b2d_task_risk_v1",
+    normal: {
+      implementer: "task_agent",
+      reviewers: ["codex_primary"],
+    },
+    high: {
+      implementer: "codex",
+      reviewers: ["codex_primary", "task_agent_auxiliary"],
+    },
+    reviewer_slots: ["primary", "auxiliary"],
+    task_order: "serial",
+    high_review_fan_out: "parallel_after_implementation",
+  },
   progress: {
     marker: "codeg-simple-progress-v1",
     mutation_order: [
@@ -49,14 +108,9 @@ const REQUIRED_SKILL_CONTRACT = {
       "record-admission",
       "record-observed-state",
     ],
+    route_metadata: "additive",
   },
   workspace_policy: "preserve-user-changes",
-  task_execution: {
-    order: "serial",
-    implementer: "grok",
-    reviewer: "codex",
-    review: "independent",
-  },
   recovery: {
     unexpected_continuations: 2,
     logical_replacements: 1,
@@ -66,6 +120,7 @@ const REQUIRED_SKILL_CONTRACT = {
     required: true,
     independent: true,
     reviewer: "codex",
+    fix_owner: "task_producer",
   },
 }
 const CONTRACT_ACTIONS = [
@@ -182,7 +237,7 @@ const RESERVED_CUSTOM_AGENT_IDS = new Set([
   "grok-build",
   "kimi",
 ])
-const V2_SKILL_IDENTIFIERS = [
+const RETIRED_WORKFLOW_IDENTIFIERS = [
   "get_workflow_capabilities",
   "get_workflow_state",
   "publish_workflow_manifest",
@@ -195,6 +250,14 @@ const V2_SKILL_IDENTIFIERS = [
   "gate_id",
   "artifact_digest",
   "reviewed_task_id",
+]
+const CONTRADICTORY_SKILL_PROSE = [
+  /\bthe parent revises the plan directly\b/i,
+  /\balways use grok as the implementer\b/i,
+  /\buse the task agent to implement high tasks\b/i,
+  /\breuse one codex conversation for implementation and review\b/i,
+  /\bswitch agent immediately inside the active task\b/i,
+  /\bskip the auxiliary review after a high-task fix\b/i,
 ]
 const FORBIDDEN_PROGRESS_FIELDS = new Set([
   "workflow_id",
@@ -255,11 +318,7 @@ function normalizeRelPath(value) {
   if (value.includes("|") || hasControl(value)) return null
 
   const nfc = value.normalize("NFC")
-  if (
-    nfc.startsWith("/") ||
-    nfc.startsWith("\\\\") ||
-    /^[A-Za-z]:/.test(nfc)
-  ) {
+  if (nfc.startsWith("/") || nfc.startsWith("\\\\") || /^[A-Za-z]:/.test(nfc)) {
     return null
   }
 
@@ -338,14 +397,52 @@ function parseRecognizedWorkUnitKey(value) {
     ) {
       return null
     }
-    return { kind: "task", taskIndex, role, agentType, profileId }
+    return {
+      kind: "task",
+      taskIndex,
+      role,
+      slot: role === "reviewer" ? "primary" : null,
+      agentType,
+      profileId,
+      legacy: role === "reviewer",
+    }
+  }
+
+  if (parts[0] === "task" && parts.length === 6) {
+    const [, indexToken, role, slot, agentType, profileToken] = parts
+    if (
+      !/^[1-9][0-9]*$/.test(indexToken) ||
+      role !== "reviewer" ||
+      !["primary", "auxiliary"].includes(slot) ||
+      !validAgentType(agentType)
+    ) {
+      return null
+    }
+    const taskIndex = Number(indexToken)
+    const profileId = parseProfileToken(profileToken)
+    if (
+      !Number.isInteger(taskIndex) ||
+      taskIndex > MAX_U32 ||
+      profileId === undefined
+    ) {
+      return null
+    }
+    return {
+      kind: "task",
+      taskIndex,
+      role,
+      slot,
+      agentType,
+      profileId,
+      legacy: false,
+    }
   }
 
   if (["design", "plan"].includes(parts[0]) && parts.length === 5) {
     const [kind, path, role, agentType, profileToken] = parts
     const normalizedPath = normalizeRelPath(path)
     const allowedRole =
-      (kind === "design" && role === "reviewer") ||
+      (kind === "design" && ["reviewer", "fixer"].includes(role)) ||
       (kind === "plan" && ["author", "reviewer"].includes(role))
     const profileId = parseProfileToken(profileToken)
     if (
@@ -356,20 +453,26 @@ function parseRecognizedWorkUnitKey(value) {
     ) {
       return null
     }
-    return { kind, path, role, agentType, profileId }
+    return { kind, path, role, agentType, profileId, legacy: false }
   }
 
   if (parts[0] === "final_review" && parts.length === 4) {
     const [, role, agentType, profileToken] = parts
     const profileId = parseProfileToken(profileToken)
     if (
-      !["reviewer", "fixer"].includes(role) ||
+      role !== "reviewer" ||
       !validAgentType(agentType) ||
       profileId === undefined
     ) {
       return null
     }
-    return { kind: "final_review", role, agentType, profileId }
+    return {
+      kind: "final_review",
+      role,
+      agentType,
+      profileId,
+      legacy: false,
+    }
   }
   return null
 }
@@ -419,33 +522,19 @@ function numberedSkillSections(skill) {
 }
 
 function embeddedSkillContracts(skill) {
-  const contracts = []
-  let contract = null
-  let fence = null
-  for (const [lineIndex, line] of skill.split(/\r?\n/).entries()) {
-    if (contract) {
-      if (line.trim() === COMMENT_END) {
-        contracts.push({
-          line: contract.line,
-          source: contract.lines.join("\n"),
-        })
-        contract = null
-      } else {
-        contract.lines.push(line)
-      }
-      continue
-    }
-    if (fence) {
-      if (fenceEnd(line, fence)) fence = null
-      continue
-    }
-    fence = fenceStart(line)
-    if (fence) continue
-    if (line.trim() === SKILL_CONTRACT_MARKER) {
-      contract = { line: lineIndex + 1, lines: [] }
-    }
+  const extracted = extractUnfencedComment(
+    skill,
+    SKILL_CONTRACT_MARKER,
+    512 * 1024
+  )
+  return {
+    contracts:
+      extracted.body === null
+        ? []
+        : [{ line: extracted.line, source: extracted.body }],
+    markerCount: extracted.markerCount,
+    unterminated: extracted.problem === "truncated",
   }
-  return { contracts, unterminated: contract !== null }
 }
 
 function canonicalJson(value) {
@@ -492,15 +581,13 @@ function hasSubstantiveSkillProse(body) {
     POSITIVE_SKILL_DIRECTIVES.has(word.toLowerCase())
   )
   return (
-    words.length >= 6 &&
-    directives.length >= 2 &&
-    /[.!:](?:\s|$)/m.test(prose)
+    words.length >= 6 && directives.length >= 2 && /[.!:](?:\s|$)/m.test(prose)
   )
 }
 
 function validateEmbeddedSkillContract(skill, firstSectionLine, failures) {
-  const { contracts, unterminated } = embeddedSkillContracts(skill)
-  if (unterminated || contracts.length !== 1) {
+  const { contracts, markerCount, unterminated } = embeddedSkillContracts(skill)
+  if (unterminated || markerCount !== 1 || contracts.length !== 1) {
     fail(
       failures,
       "B2D-SKILL-004",
@@ -541,11 +628,13 @@ function validateEmbeddedSkillContract(skill, firstSectionLine, failures) {
 
 function validateOrderedSkillContract(skill, failures) {
   const sections = numberedSkillSections(skill)
-  if (sections.map((section) => section.index).join(",") !== "1,2,3,4,5,6,7") {
+  if (
+    sections.map((section) => section.index).join(",") !== "1,2,3,4,5,6,7,8,9"
+  ) {
     fail(
       failures,
       "B2D-SKILL-004",
-      "Skill must contain exactly seven numbered workflow sections in order"
+      "Skill must contain exactly nine numbered workflow sections in order"
     )
     return
   }
@@ -604,15 +693,12 @@ export function validateSkillMarkdown(skillMarkdown) {
     }
     const description = metadata.get("description") ?? ""
     if (!/^Use when\b/.test(description)) {
-      fail(
-        failures,
-        "B2D-SKILL-001",
-        'description must start with "Use when"'
-      )
+      fail(failures, "B2D-SKILL-001", 'description must start with "Use when"')
     }
     if (
-      /\b(?:Plan|progress|registration|register|serial|delegate|review|workflow tool)\b/i
-        .test(description)
+      /\b(?:Plan|progress|registration|register|serial|delegate|review|workflow tool)\b/i.test(
+        description
+      )
     ) {
       fail(
         failures,
@@ -634,17 +720,25 @@ export function validateSkillMarkdown(skillMarkdown) {
   }
 
   const lower = skill.toLowerCase()
-  for (const identifier of V2_SKILL_IDENTIFIERS) {
+  for (const identifier of RETIRED_WORKFLOW_IDENTIFIERS) {
     if (lower.includes(identifier.toLowerCase())) {
       fail(
         failures,
         "B2D-SKILL-003",
-        `v2-only identifier remains in Skill: ${identifier}`
+        `retired workflow identifier remains in Skill: ${identifier}`
       )
     }
   }
 
   validateOrderedSkillContract(skill, failures)
+  const prose = unfencedVisibleSkillProse(skill)
+  if (CONTRADICTORY_SKILL_PROSE.some((pattern) => pattern.test(prose))) {
+    fail(
+      failures,
+      "B2D-SKILL-005",
+      "Skill prose contradicts required v2 ownership or routing"
+    )
+  }
 
   return { failures, notes }
 }
@@ -660,6 +754,389 @@ function fenceEnd(line, fence) {
   return new RegExp(`^\\s{0,3}${escaped}{${fence.length},}\\s*$`).test(line)
 }
 
+function extractUnfencedComment(source, marker, maxBlockBytes) {
+  const lines = String(source ?? "").split(/\r?\n/)
+  let fence = null
+  let active = null
+  let markerCount = 0
+  let body = null
+  let firstLine = 0
+  let problem = null
+
+  for (const [lineIndex, line] of lines.entries()) {
+    if (active) {
+      const end = line.indexOf(COMMENT_END)
+      active.push(end < 0 ? line : line.slice(0, end))
+      if (byteLength(active.join("\n")) > maxBlockBytes && !problem) {
+        problem = "too_large"
+      }
+      if (end >= 0) {
+        if (body === null && problem !== "too_large") body = active.join("\n")
+        active = null
+      }
+      continue
+    }
+    if (fence) {
+      if (fenceEnd(line, fence)) fence = null
+      continue
+    }
+    fence = fenceStart(line)
+    if (fence) continue
+    if (line.trim() === marker) {
+      markerCount += 1
+      if (firstLine === 0) firstLine = lineIndex + 1
+      if (body === null) active = []
+    }
+  }
+  if (active && !problem) problem = "truncated"
+  return { body, markerCount, problem, line: firstLine }
+}
+
+/** Parse the bounded authoritative routing block from a Plan. */
+export function parseSimpleRouting(planMarkdown) {
+  const failures = []
+  const extracted = extractUnfencedComment(
+    planMarkdown,
+    ROUTING_MARKER,
+    MAX_ROUTING_BLOCK_BYTES
+  )
+  if (extracted.markerCount !== 1 || extracted.problem === "truncated") {
+    fail(
+      failures,
+      "B2D-ROUTING-001",
+      "Plan must contain exactly one complete unfenced routing block"
+    )
+    return { snapshot: null, failures }
+  }
+  if (extracted.problem === "too_large") {
+    fail(failures, "B2D-ROUTING-002", "routing block exceeds 256 KiB")
+    return { snapshot: null, failures }
+  }
+  let snapshot
+  try {
+    snapshot = JSON.parse(extracted.body.trim())
+  } catch {
+    fail(failures, "B2D-ROUTING-003", "routing block is not valid JSON")
+    return { snapshot: null, failures }
+  }
+  if (!isObject(snapshot)) {
+    fail(failures, "B2D-ROUTING-003", "routing snapshot must be an object")
+    return { snapshot: null, failures }
+  }
+  return { snapshot, failures }
+}
+
+function validProfileId(value) {
+  return (
+    value === null ||
+    (nonEmptyString(value) &&
+      [...value].length <= 128 &&
+      value !== "none" &&
+      !value.includes("|") &&
+      !hasControl(value))
+  )
+}
+
+function validAgentSelection(value) {
+  return (
+    isObject(value) &&
+    validAgentType(value.agent_type) &&
+    validProfileId(value.profile_id)
+  )
+}
+
+function validateEvidenceList(evidence, label, failures) {
+  if (
+    !Array.isArray(evidence) ||
+    evidence.length === 0 ||
+    evidence.some((entry) => !nonEmptyString(entry)) ||
+    new Set(evidence).size !== evidence.length
+  ) {
+    fail(
+      failures,
+      "B2D-RISK-002",
+      `${label} requires unique non-empty evidence strings`
+    )
+  }
+}
+
+function validateTaskRisk(value, taskIndex, failures) {
+  const label = `Task ${taskIndex} risk`
+  if (!isObject(value)) {
+    fail(failures, "B2D-RISK-001", `${label} must be an object`)
+    return null
+  }
+  if (
+    !Array.isArray(value.hard_triggers) ||
+    !Array.isArray(value.soft_signals)
+  ) {
+    fail(failures, "B2D-RISK-001", `${label} requires evidence arrays`)
+    return null
+  }
+  const hardKinds = new Set()
+  for (const trigger of value.hard_triggers) {
+    if (
+      !isObject(trigger) ||
+      !HARD_TRIGGER_KINDS.has(trigger.kind) ||
+      hardKinds.has(trigger.kind)
+    ) {
+      fail(
+        failures,
+        "B2D-RISK-001",
+        `${label} has unknown or duplicate hard trigger`
+      )
+      continue
+    }
+    hardKinds.add(trigger.kind)
+    validateEvidenceList(trigger.evidence, `${label} ${trigger.kind}`, failures)
+  }
+  const softKinds = new Set()
+  const softEvidence = new Set()
+  let softTotal = 0
+  for (const signal of value.soft_signals) {
+    if (
+      !isObject(signal) ||
+      !SOFT_SIGNAL_SCORES.has(signal.kind) ||
+      softKinds.has(signal.kind)
+    ) {
+      fail(
+        failures,
+        "B2D-RISK-001",
+        `${label} has unknown or duplicate soft signal`
+      )
+      continue
+    }
+    softKinds.add(signal.kind)
+    const expectedScore = SOFT_SIGNAL_SCORES.get(signal.kind)
+    if (signal.score !== expectedScore) {
+      fail(failures, "B2D-RISK-003", `${label} has a wrong soft-signal score`)
+    }
+    softTotal += expectedScore
+    validateEvidenceList(signal.evidence, `${label} ${signal.kind}`, failures)
+    if (Array.isArray(signal.evidence)) {
+      for (const evidence of signal.evidence) {
+        if (softEvidence.has(evidence)) {
+          fail(
+            failures,
+            "B2D-RISK-001",
+            `${label} counts one evidence string in multiple soft signals`
+          )
+        }
+        softEvidence.add(evidence)
+      }
+    }
+  }
+  if (value.score !== softTotal) {
+    fail(
+      failures,
+      "B2D-RISK-003",
+      `${label} score must equal the soft-signal total`
+    )
+  }
+  const expectedLevel = hardKinds.size > 0 || softTotal >= 3 ? "high" : "normal"
+  if (value.level !== expectedLevel) {
+    fail(failures, "B2D-RISK-004", `${label} level contradicts the risk policy`)
+  }
+  if (!nonEmptyString(value.reason)) {
+    fail(failures, "B2D-RISK-005", `${label} requires a non-empty reason`)
+  }
+  return expectedLevel
+}
+
+/** Derive the only accepted route and canonical work-unit keys. */
+export function deriveExpectedRoute(task, generation, failures) {
+  const taskAgent = {
+    agent_type: generation?.agent_type,
+    profile_id: generation?.profile_id,
+  }
+  if (!validAgentSelection(taskAgent)) {
+    fail(
+      failures,
+      "B2D-ROUTING-005",
+      `Task ${task?.index} has no valid Task Agent`
+    )
+    return null
+  }
+  const high = task?.risk?.level === "high"
+  const profile = taskAgent.profile_id ?? "none"
+  const expectedRoute = high
+    ? {
+        implementer: { agent_type: "codex", profile_id: null },
+        reviewers: [
+          { slot: "primary", agent_type: "codex", profile_id: null },
+          { slot: "auxiliary", ...taskAgent },
+        ],
+      }
+    : {
+        implementer: taskAgent,
+        reviewers: [{ slot: "primary", agent_type: "codex", profile_id: null }],
+      }
+  return {
+    route: expectedRoute,
+    expected_work_unit_keys: {
+      implementer: high
+        ? `task|${task.index}|implementer|codex|none`
+        : `task|${task.index}|implementer|${taskAgent.agent_type}|${profile}`,
+      reviewers: {
+        primary: `task|${task.index}|reviewer|primary|codex|none`,
+        auxiliary: high
+          ? `task|${task.index}|reviewer|auxiliary|${taskAgent.agent_type}|${profile}`
+          : null,
+      },
+    },
+  }
+}
+
+/** Validate routing semantics and return normalized generations and Tasks. */
+export function validateRoutingSnapshot(snapshot, plan, failures) {
+  const normalized = { generations: [], tasks: [] }
+  if (!isObject(snapshot)) {
+    fail(failures, "B2D-ROUTING-003", "routing snapshot must be an object")
+    return normalized
+  }
+  if (
+    snapshot.schema_version !== 1 ||
+    snapshot.risk_policy_version !== RISK_POLICY_VERSION
+  ) {
+    fail(
+      failures,
+      "B2D-ROUTING-003",
+      "routing schema or risk policy is unsupported"
+    )
+  }
+
+  const rawGenerations =
+    snapshot.task_agent_generations === undefined
+      ? [
+          {
+            generation: 1,
+            agent_type: "grok",
+            profile_id: null,
+            effective_from_task_index: 1,
+          },
+        ]
+      : snapshot.task_agent_generations
+  if (!Array.isArray(rawGenerations) || rawGenerations.length === 0) {
+    fail(
+      failures,
+      "B2D-ROUTING-006",
+      "Task Agent generations must start at generation 1"
+    )
+  } else {
+    for (const [offset, generation] of rawGenerations.entries()) {
+      if (!isObject(generation) || !validAgentSelection(generation)) {
+        fail(
+          failures,
+          "B2D-ROUTING-005",
+          `generation ${offset + 1} has an invalid Agent/profile`
+        )
+        continue
+      }
+      if (
+        generation.generation !== offset + 1 ||
+        !positiveInteger(generation.effective_from_task_index) ||
+        (offset === 0 && generation.effective_from_task_index !== 1) ||
+        (offset > 0 &&
+          (!isObject(rawGenerations[offset - 1]) ||
+            generation.effective_from_task_index <=
+              rawGenerations[offset - 1].effective_from_task_index))
+      ) {
+        fail(
+          failures,
+          "B2D-ROUTING-006",
+          "generations must be contiguous with increasing boundaries"
+        )
+      }
+      normalized.generations.push({
+        generation: generation.generation,
+        agent_type: generation.agent_type,
+        profile_id: generation.profile_id,
+        effective_from_task_index: generation.effective_from_task_index,
+      })
+    }
+  }
+
+  if (!Array.isArray(snapshot.tasks)) {
+    fail(failures, "B2D-ROUTING-004", "routing tasks must be an array")
+    return normalized
+  }
+  const planIndexes = plan.tasks.map((task) => task.index)
+  if (
+    snapshot.tasks.map((task) => task?.index).join(",") !==
+    planIndexes.join(",")
+  ) {
+    fail(
+      failures,
+      "B2D-ROUTING-004",
+      "routing Task indices must exactly match Plan headings"
+    )
+  }
+  for (const routeTask of snapshot.tasks) {
+    if (!isObject(routeTask) || !positiveInteger(routeTask.index)) continue
+    const generation = normalized.generations.find(
+      (candidate) => candidate.generation === routeTask.task_agent_generation
+    )
+    if (!generation) {
+      fail(
+        failures,
+        "B2D-ROUTING-006",
+        `Task ${routeTask.index} references an unknown generation`
+      )
+      continue
+    }
+    const applicableGeneration = normalized.generations
+      .filter(
+        (candidate) => candidate.effective_from_task_index <= routeTask.index
+      )
+      .at(-1)
+    if (applicableGeneration?.generation !== routeTask.task_agent_generation) {
+      fail(
+        failures,
+        "B2D-ROUTING-006",
+        `Task ${routeTask.index} does not use the generation active at its boundary`
+      )
+    }
+    const expectedLevel = validateTaskRisk(
+      routeTask.risk,
+      routeTask.index,
+      failures
+    )
+    const derived = deriveExpectedRoute(routeTask, generation, failures)
+    if (
+      !derived ||
+      !isObject(routeTask.route) ||
+      !skillContractsEqual(routeTask.route, derived.route)
+    ) {
+      fail(
+        failures,
+        "B2D-ROUTING-009",
+        `Task ${routeTask.index} route is not the exact deterministic route`
+      )
+    }
+    normalized.tasks.push({
+      ...routeTask,
+      risk: {
+        ...routeTask.risk,
+        level: expectedLevel ?? routeTask.risk?.level,
+      },
+      expected_work_unit_keys: derived?.expected_work_unit_keys ?? null,
+    })
+  }
+  for (const generation of normalized.generations) {
+    const first = normalized.tasks.find(
+      (routeTask) => routeTask.task_agent_generation === generation.generation
+    )
+    if (!first || first.index !== generation.effective_from_task_index) {
+      fail(
+        failures,
+        "B2D-ROUTING-006",
+        `generation ${generation.generation} boundary must equal its first Task`
+      )
+    }
+  }
+  return normalized
+}
+
 /** Parse the Plan Task headings used by the backend Simple projector. */
 export function parseSimplePlan(planMarkdown) {
   const source = String(planMarkdown ?? "")
@@ -668,7 +1145,7 @@ export function parseSimplePlan(planMarkdown) {
 
   if (byteLength(source) > MAX_PLAN_DOCUMENT_BYTES) {
     fail(failures, "B2D-PLAN-001", "Plan exceeds the 2 MiB limit")
-    return { tasks, failures }
+    return { tasks, routing: null, failures }
   }
 
   let fence = null
@@ -712,19 +1189,18 @@ export function parseSimplePlan(planMarkdown) {
     )
   }
 
-  return { tasks, failures }
-}
-
-function markerOffsets(source) {
-  const offsets = []
-  let offset = 0
-  while (offset < source.length) {
-    const found = source.indexOf(PROGRESS_MARKER, offset)
-    if (found < 0) break
-    offsets.push(found)
-    offset = found + PROGRESS_MARKER.length
+  const extracted = extractUnfencedComment(
+    source,
+    ROUTING_MARKER,
+    MAX_ROUTING_BLOCK_BYTES
+  )
+  let routing = null
+  if (extracted.markerCount > 0) {
+    const parsedRouting = parseSimpleRouting(source)
+    failures.push(...parsedRouting.failures)
+    routing = parsedRouting.snapshot
   }
-  return offsets
+  return { tasks, routing, failures }
 }
 
 function findForbiddenProgressFields(value, path = "$", found = []) {
@@ -751,11 +1227,7 @@ function validateRun(run, taskIndex, runIndex, failures) {
   }
   for (const field of ["role", "agent_type", "state", "work_unit_key"]) {
     if (!nonEmptyString(run[field])) {
-      fail(
-        failures,
-        "B2D-PROGRESS-006",
-        `${label} requires non-empty ${field}`
-      )
+      fail(failures, "B2D-PROGRESS-006", `${label} requires non-empty ${field}`)
     }
   }
   const parsedKey = parseRecognizedWorkUnitKey(run.work_unit_key)
@@ -863,7 +1335,7 @@ function runProfileIdentity(run) {
     : run.profile_id
 }
 
-function validateTaskRunLineages(task, failures, taskIds) {
+function validateTaskRunLineages(task, failures, taskIds, childOwners) {
   const groups = new Map()
   for (const [runIndex, run] of task.runs.entries()) {
     if (!isObject(run)) continue
@@ -879,19 +1351,34 @@ function validateTaskRunLineages(task, failures, taskIds) {
         taskIds.add(run.task_id)
       }
     }
-    if (!nonEmptyString(run.role)) continue
-    const group = groups.get(run.role) ?? []
+    if (
+      positiveInteger(run.child_conversation_id) &&
+      nonEmptyString(run.work_unit_key)
+    ) {
+      const owner = childOwners.get(run.child_conversation_id)
+      if (owner && owner !== run.work_unit_key) {
+        fail(
+          failures,
+          "B2D-PROGRESS-006",
+          `child conversation ${run.child_conversation_id} is shared by distinct work-unit keys`
+        )
+      } else {
+        childOwners.set(run.child_conversation_id, run.work_unit_key)
+      }
+    }
+    if (!nonEmptyString(run.work_unit_key)) continue
+    const group = groups.get(run.work_unit_key) ?? []
     group.push({ run, runIndex })
-    groups.set(run.role, group)
+    groups.set(run.work_unit_key, group)
   }
 
-  for (const [role, entries] of groups) {
+  for (const [workUnitKey, entries] of groups) {
     const first = entries[0].run
     const firstProfile = runProfileIdentity(first)
     const priorTaskIds = new Set()
     const replacementAttempts = new Map()
     for (const { run, runIndex } of entries) {
-      const label = `Task ${task.index} ${role} run ${runIndex + 1}`
+      const label = `Task ${task.index} ${workUnitKey} run ${runIndex + 1}`
       if (
         run.work_unit_key !== first.work_unit_key ||
         run.agent_type !== first.agent_type ||
@@ -940,7 +1427,7 @@ function validateTaskRunLineages(task, failures, taskIds) {
       fail(
         failures,
         "B2D-PROGRESS-006",
-        `Task ${task.index} ${role} exceeds one logical replacement`
+        `Task ${task.index} ${workUnitKey} exceeds one logical replacement`
       )
     }
   }
@@ -956,6 +1443,7 @@ function validateProgressTasks(snapshot, plan, failures) {
   const seen = new Set()
   const tasks = []
   const taskIds = new Set()
+  const childOwners = new Map()
 
   for (const task of snapshot.tasks) {
     if (!isObject(task) || !positiveInteger(task.index)) {
@@ -1006,7 +1494,7 @@ function validateProgressTasks(snapshot, plan, failures) {
       task.runs.forEach((run, index) =>
         validateRun(run, task.index, index, failures)
       )
-      validateTaskRunLineages(task, failures, taskIds)
+      validateTaskRunLineages(task, failures, taskIds, childOwners)
     }
     tasks.push(task)
   }
@@ -1104,6 +1592,104 @@ function validateSerialState(snapshot, tasks, failures) {
   }
 }
 
+function expectedKeySet(expected) {
+  return new Set(
+    [
+      expected?.implementer,
+      expected?.reviewers?.primary,
+      expected?.reviewers?.auxiliary,
+    ].filter(nonEmptyString)
+  )
+}
+
+/** Enforce routed Plan/progress agreement and Task Agent change boundaries. */
+export function validateProgressRouting(snapshot, routing, failures) {
+  if (!isObject(snapshot) || !routing || routing.tasks.length === 0) return
+  if (!Array.isArray(snapshot.tasks)) {
+    fail(failures, "B2D-PROGRESS-009", "routed progress requires Tasks")
+    return
+  }
+  const progressByIndex = new Map(
+    snapshot.tasks
+      .filter((task) => isObject(task) && positiveInteger(task.index))
+      .map((task) => [task.index, task])
+  )
+  for (const routeTask of routing.tasks) {
+    const task = progressByIndex.get(routeTask.index)
+    const expected = routeTask.expected_work_unit_keys
+    if (!task) {
+      fail(
+        failures,
+        "B2D-PROGRESS-009",
+        `Task ${routeTask.index} is missing from routed progress`
+      )
+      continue
+    }
+    if (
+      task.risk_level !== routeTask.risk.level ||
+      task.task_agent_generation !== routeTask.task_agent_generation ||
+      !skillContractsEqual(task.expected_work_unit_keys, expected)
+    ) {
+      fail(
+        failures,
+        "B2D-PROGRESS-009",
+        `Task ${routeTask.index} route metadata disagrees with the Plan`
+      )
+    }
+    const allowed = expectedKeySet(expected)
+    const groups = new Map()
+    if (Array.isArray(task.runs)) {
+      for (const run of task.runs) {
+        if (!isObject(run) || !nonEmptyString(run.work_unit_key)) continue
+        if (!allowed.has(run.work_unit_key)) {
+          fail(
+            failures,
+            "B2D-PROGRESS-009",
+            `Task ${routeTask.index} run is outside its expected route`
+          )
+        }
+        const entries = groups.get(run.work_unit_key) ?? []
+        entries.push(run)
+        groups.set(run.work_unit_key, entries)
+      }
+    }
+    if (task.status === "completed") {
+      for (const key of allowed) {
+        const lineage = groups.get(key) ?? []
+        const latest = lineage.at(-1)
+        if (!latest || latest.state !== "completed") {
+          fail(
+            failures,
+            "B2D-PROGRESS-010",
+            `completed Task ${routeTask.index} lacks completed lineage ${key}`
+          )
+        }
+      }
+    }
+  }
+
+  for (const generation of routing.generations.slice(1)) {
+    const boundary = progressByIndex.get(generation.effective_from_task_index)
+    const prior = snapshot.tasks.filter(
+      (task) => task.index < generation.effective_from_task_index
+    )
+    if (
+      !boundary ||
+      boundary.status !== "pending" ||
+      !Array.isArray(boundary.runs) ||
+      boundary.runs.length !== 0 ||
+      prior.some((task) => task.status !== "completed") ||
+      snapshot.active_task_index !== null
+    ) {
+      fail(
+        failures,
+        "B2D-ROUTING-007",
+        `generation ${generation.generation} does not start at an empty pending boundary after the completed prefix`
+      )
+    }
+  }
+}
+
 /** Parse and validate the exact Simple progress block. */
 export function parseSimpleProgress(
   progressMarkdown,
@@ -1123,28 +1709,21 @@ export function parseSimpleProgress(
     return { ...progress, failures }
   }
 
-  const starts = markerOffsets(source)
-  if (starts.length !== 1) {
+  const extracted = extractUnfencedComment(
+    source,
+    PROGRESS_MARKER,
+    MAX_PROGRESS_BLOCK_BYTES
+  )
+  if (extracted.markerCount !== 1 || extracted.problem === "truncated") {
     fail(
       failures,
       "B2D-PROGRESS-001",
       "progress document must contain exactly one marker; " +
-        `found ${starts.length}`
-    )
-    if (starts.length === 0) return { ...progress, failures }
-  }
-  const jsonStart = starts[0] + PROGRESS_MARKER.length
-  const relativeEnd = source.slice(jsonStart).indexOf(COMMENT_END)
-  if (relativeEnd < 0) {
-    fail(
-      failures,
-      "B2D-PROGRESS-001",
-      "progress block is missing its closing comment marker"
+        `found ${extracted.markerCount}`
     )
     return { ...progress, failures }
   }
-  const json = source.slice(jsonStart, jsonStart + relativeEnd).trim()
-  if (byteLength(json) > MAX_PROGRESS_BLOCK_BYTES) {
+  if (extracted.problem === "too_large") {
     fail(
       failures,
       "B2D-PROGRESS-002",
@@ -1152,6 +1731,7 @@ export function parseSimpleProgress(
     )
     return { ...progress, failures }
   }
+  const json = extracted.body.trim()
 
   let snapshot
   try {
@@ -1177,11 +1757,7 @@ export function parseSimpleProgress(
     )
   }
   if (snapshot.schema_version !== 1) {
-    fail(
-      failures,
-      "B2D-PROGRESS-003",
-      "progress schema_version must equal 1"
-    )
+    fail(failures, "B2D-PROGRESS-003", "progress schema_version must equal 1")
   }
 
   const expected = normalizeRelPath(expectedPlanRelPath)
@@ -1194,11 +1770,7 @@ export function parseSimpleProgress(
     )
   }
   if (!optionalString(snapshot.updated_at)) {
-    fail(
-      failures,
-      "B2D-PROGRESS-003",
-      "updated_at must be a string or null"
-    )
+    fail(failures, "B2D-PROGRESS-003", "updated_at must be a string or null")
   }
 
   const tasks = validateProgressTasks(snapshot, plan, failures)
@@ -1215,15 +1787,30 @@ export function validateSimpleDocuments({
 }) {
   const skill = validateSkillMarkdown(skillMarkdown)
   const plan = parseSimplePlan(planMarkdown)
+  const routingFailures = []
+  const routing = plan.routing
+    ? validateRoutingSnapshot(plan.routing, plan, routingFailures)
+    : null
   const progress = parseSimpleProgress(progressMarkdown, planRelPath, plan)
+  const agreementFailures = []
+  if (routing && progress.snapshot) {
+    validateProgressRouting(progress.snapshot, routing, agreementFailures)
+  }
   return {
-    failures: [...skill.failures, ...plan.failures, ...progress.failures],
+    failures: [
+      ...skill.failures,
+      ...plan.failures,
+      ...routingFailures,
+      ...progress.failures,
+      ...agreementFailures,
+    ],
     notes: [
       ...skill.notes,
       `Plan Tasks parsed: ${plan.tasks.length}`,
       `Progress Tasks parsed: ${progress.snapshot?.tasks?.length ?? 0}`,
     ],
     plan,
+    routing,
     progress,
   }
 }
