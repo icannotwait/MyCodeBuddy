@@ -1324,6 +1324,280 @@ describe("Skill contract v2", () => {
     }
   })
 
+  it("round-10 rejects concrete and qualified Task Agents on invalid routes", () => {
+    for (const prose of [
+      "High Tasks are implemented by Gemini.",
+      "High Tasks are implemented by Cline.",
+      "High Tasks are implemented by Claude.",
+      "High Tasks are implemented by custom Acme Agent.",
+      "High Tasks are implemented by Hermes, Cursor, OpenCode, Kimi, or Pi.",
+      "Always use Gemini as the implementer.",
+      "Use Gemini as the implementer for all Tasks.",
+      "Route high Tasks to the currently selected Task Agent and Codex.",
+      "High Tasks are implemented by the user-selected Task Agent and Codex.",
+    ]) {
+      has(validateSkillMarkdown(`${skill}\n${prose}`).failures, "B2D-SKILL-005")
+    }
+
+    for (const prose of [
+      "Normal Tasks are implemented by Gemini.",
+      "High Tasks are implemented by Codex and reviewed by Gemini.",
+      "Route high Tasks to Codex for implementation and to Gemini for auxiliary review.",
+      "Normal Tasks are implemented by the currently selected Task Agent.",
+      "Normal Tasks are implemented by the Claude Code Task Agent.",
+      "Normal Tasks are implemented by the Gemini Task Agent.",
+      "The parent updates the Claude Code Task Agent with adjudicated findings.",
+      "The parent updates the Kimi Code Task Agent with adjudicated findings.",
+    ]) {
+      assert.deepEqual(validateSkillMarkdown(`${skill}\n${prose}`).failures, [])
+    }
+  })
+
+  it("round-10 resolves carried active Tasks against pronoun completion", () => {
+    for (const prose of [
+      "The current Task is running. Change the Task Agent after it completes.",
+      "The current Task is active. Switch the Task Agent once it is finished.",
+      "Before the next Task starts, after the current Task completes, switch the Task Agent.",
+      "The current Task is completed. Switch the Task Agent before the next Task starts.",
+    ]) {
+      assert.deepEqual(validateSkillMarkdown(`${skill}\n${prose}`).failures, [])
+    }
+
+    for (const prose of [
+      "The current Task is running. Change the Task Agent now.",
+      "The current Task is running. Change the Task Agent before it completes.",
+      "The current Task is running; switch the Task Agent before the next Task starts.",
+      "The current Task is active. Switch the Task Agent now, before the next Task begins.",
+    ]) {
+      has(validateSkillMarkdown(`${skill}\n${prose}`).failures, "B2D-SKILL-005")
+    }
+  })
+
+  it("round-10 resolves that-role reviewer replacement antecedents", () => {
+    for (const prose of [
+      "The Codex reviewer is mandatory. User-named Design reviewers replace that role.",
+      "The primary reviewer remains required; optional Plan reviewers substitute for that role.",
+    ]) {
+      has(validateSkillMarkdown(`${skill}\n${prose}`).failures, "B2D-SKILL-005")
+    }
+
+    for (const prose of [
+      "The Codex reviewer is mandatory. User-named Design reviewers must not replace that role.",
+      "The primary reviewer remains required; optional Plan reviewers do not substitute for that role.",
+    ]) {
+      assert.deepEqual(validateSkillMarkdown(`${skill}\n${prose}`).failures, [])
+    }
+  })
+
+  it("round-10 treats another and one-more reviewers as surplus", () => {
+    for (const prose of [
+      "Normal Tasks have another reviewer.",
+      "Normal Tasks have one more reviewer.",
+      "High Tasks have another reviewer.",
+      "High Tasks have one more reviewer.",
+      "Every normal Task gets yet another reviewer.",
+    ]) {
+      has(validateSkillMarkdown(`${skill}\n${prose}`).failures, "B2D-SKILL-005")
+    }
+
+    for (const prose of [
+      "Normal Tasks have no other reviewer.",
+      "Normal Tasks must not have another reviewer.",
+      "High Tasks have one primary reviewer and one auxiliary reviewer.",
+      "High Tasks must not add one more reviewer.",
+    ]) {
+      assert.deepEqual(validateSkillMarkdown(`${skill}\n${prose}`).failures, [])
+    }
+  })
+
+  it("round-10 binds rather-than and instead-of actor polarity", () => {
+    for (const prose of [
+      "High Tasks are implemented by Codex rather than Grok.",
+      "Route high Tasks to Codex instead of Grok.",
+      "Normal Tasks are implemented by the Task Agent rather than Codex.",
+      "High Tasks are implemented by Codex instead of Gemini.",
+      "Route normal Tasks to Gemini rather than Codex.",
+    ]) {
+      assert.deepEqual(validateSkillMarkdown(`${skill}\n${prose}`).failures, [])
+    }
+
+    for (const prose of [
+      "High Tasks are implemented by Gemini rather than Codex.",
+      "Route high Tasks to Grok instead of Codex.",
+      "Normal Tasks are implemented by Codex instead of Gemini.",
+    ]) {
+      has(validateSkillMarkdown(`${skill}\n${prose}`).failures, "B2D-SKILL-005")
+    }
+  })
+
+  it("round-10 preserves delegated producer ownership across afterward", () => {
+    for (const prose of [
+      "The parent asks the Plan Author to revise the Plan and afterward update the Design.",
+      "The parent asks the Plan Author to revise the Plan and afterward update it.",
+      "The parent directs the Design Fixer to fix and afterward update the Design.",
+    ]) {
+      assert.deepEqual(validateSkillMarkdown(`${skill}\n${prose}`).failures, [])
+    }
+
+    for (const prose of [
+      "The parent asks the Plan Author to revise the Plan and afterward the parent updates the Design.",
+      "The parent asks the Plan Author to revise the Plan and afterward will update the Design.",
+      "The parent directs the Design Fixer to fix the Design and afterward itself updates the Plan.",
+    ]) {
+      has(validateSkillMarkdown(`${skill}\n${prose}`).failures, "B2D-SKILL-005")
+    }
+  })
+
+  it("round-10 distinguishes document recipients and people pronouns from artifacts", () => {
+    for (const prose of [
+      "The parent updates the Plan Author with review findings.",
+      "The Plan Author and Codex reviewer discuss the Plan. The parent updates them with review findings.",
+      "The parent updates the Design Fixer with adjudicated findings.",
+      "The Design Fixer and Plan Author discuss the Design. The parent updates them with findings.",
+    ]) {
+      assert.deepEqual(validateSkillMarkdown(`${skill}\n${prose}`).failures, [])
+    }
+
+    for (const prose of [
+      "The parent updates the Plan directly with review findings.",
+      "The Plan Author discusses the Plan. The parent updates it with review findings.",
+      "The parent updates that Plan with review findings.",
+    ]) {
+      has(validateSkillMarkdown(`${skill}\n${prose}`).failures, "B2D-SKILL-005")
+    }
+  })
+
+  it("round-10 rejects incomplete and duplicate passive reviewer sets", () => {
+    for (const prose of [
+      "High Tasks are reviewed by Codex, not the Task Agent.",
+      "High Tasks are reviewed by Codex and Codex.",
+      "High Tasks are reviewed by Codex and the Task Agent is omitted.",
+      "High Tasks are reviewed by the Task Agent, not Codex.",
+      "Normal Tasks have another reviewer.",
+    ]) {
+      has(validateSkillMarkdown(`${skill}\n${prose}`).failures, "B2D-SKILL-005")
+    }
+
+    for (const prose of [
+      "High Tasks are reviewed by Codex and the Task Agent.",
+      "High Tasks are reviewed by the primary Codex reviewer and the auxiliary Codex Task Agent reviewer.",
+      "Normal Tasks are reviewed by Codex, not the Task Agent.",
+      "High Tasks must not omit the Task Agent auxiliary reviewer.",
+    ]) {
+      assert.deepEqual(validateSkillMarkdown(`${skill}\n${prose}`).failures, [])
+    }
+  })
+
+  it("round-10 resolves possessive-role and takeover reviewer replacements", () => {
+    for (const prose of [
+      "The Codex reviewer remains required; optional user-named Design reviewers may replace its role.",
+      "The Codex reviewer remains required; optional user-named Design reviewers may take over for it.",
+      "The Codex reviewer remains required; optional user-named Design reviewers may replace the mandatory reviewer.",
+      "The primary reviewer remains required; optional Plan reviewers take over its role.",
+    ]) {
+      has(validateSkillMarkdown(`${skill}\n${prose}`).failures, "B2D-SKILL-005")
+    }
+
+    for (const prose of [
+      "The Codex reviewer remains required; optional user-named Design reviewers may not replace its role.",
+      "The Codex reviewer remains required; optional user-named Design reviewers must not take over for it.",
+      "The Codex reviewer remains required; optional user-named Design reviewers do not replace the mandatory reviewer.",
+    ]) {
+      assert.deepEqual(validateSkillMarkdown(`${skill}\n${prose}`).failures, [])
+    }
+  })
+
+  it("round-10 keeps active-switch timing directional across clauses", () => {
+    for (const prose of [
+      "Before the next Task starts, after the current Task completes, switch the Task Agent.",
+      "The current Task is running. Change the Task Agent after it completes.",
+      "The current Task is completed; switch the Task Agent before the next Task starts.",
+    ]) {
+      assert.deepEqual(validateSkillMarkdown(`${skill}\n${prose}`).failures, [])
+    }
+
+    for (const prose of [
+      "The current Task is running; switch the Task Agent before the next Task starts.",
+      "The current Task is active. Before the next Task begins, change the Task Agent now.",
+      "Before the current Task completes, switch the Task Agent after the next Task is planned.",
+    ]) {
+      has(validateSkillMarkdown(`${skill}\n${prose}`).failures, "B2D-SKILL-005")
+    }
+  })
+
+  it("round-10 carries typed document antecedents into parent edit predicates", () => {
+    for (const prose of [
+      "The Plan Author writes the Plan; the parent revises that document.",
+      "The Plan Author writes the Plan. The parent revises.",
+      "The Design Fixer edits the Design. The parent updates that artifact.",
+      "The Plan Author authors the Plan; afterward the parent modifies it.",
+      "The parent revises that document.",
+      "The parent updates the artifact directly.",
+    ]) {
+      has(validateSkillMarkdown(`${skill}\n${prose}`).failures, "B2D-SKILL-005")
+    }
+
+    for (const prose of [
+      "The Plan Author writes the Plan. The parent discusses review findings.",
+      "The Plan Author writes the Plan. The parent updates the Plan Author.",
+      "The Design Fixer edits the Design. The parent revises the finding summary.",
+    ]) {
+      assert.deepEqual(validateSkillMarkdown(`${skill}\n${prose}`).failures, [])
+    }
+  })
+
+  it("round-10 recognizes custom identities in active Task switches", () => {
+    for (const prose of [
+      "Switch from custom:foo to custom:bar while the current Task is active.",
+      "Replace custom Acme Agent during the current Task.",
+      "Change from custom alpha to Gemini while a Task is running.",
+    ]) {
+      has(validateSkillMarkdown(`${skill}\n${prose}`).failures, "B2D-SKILL-005")
+    }
+
+    for (const prose of [
+      "Switch from custom:foo to custom:bar after the current Task completes.",
+      "Replace custom Acme Agent once the current Task is done.",
+    ]) {
+      assert.deepEqual(validateSkillMarkdown(`${skill}\n${prose}`).failures, [])
+    }
+  })
+
+  it("round-10 binds implementation and reviewer purpose within one route relation", () => {
+    for (const prose of [
+      "Route high Tasks to Codex for implementation and the primary Codex reviewer and the auxiliary Grok reviewer.",
+      "Route high Tasks to the Codex implementer, the primary Codex reviewer, and the auxiliary Gemini reviewer.",
+    ]) {
+      assert.deepEqual(validateSkillMarkdown(`${skill}\n${prose}`).failures, [])
+    }
+
+    for (const prose of [
+      "Route high Tasks to Grok for implementation and the primary Codex reviewer and the auxiliary Grok reviewer.",
+      "Route high Tasks to Codex for implementation and the primary Grok reviewer and the auxiliary Codex reviewer.",
+      "Route normal Tasks to the Codex implementer and the primary Codex reviewer.",
+    ]) {
+      has(validateSkillMarkdown(`${skill}\n${prose}`).failures, "B2D-SKILL-005")
+    }
+  })
+
+  it("round-10 recognizes passive parent delegation to document producers", () => {
+    for (const prose of [
+      "The Plan Author is asked by the parent to revise the Plan.",
+      "The Design Fixer is directed by the parent to fix the Design.",
+      "The Plan Author is instructed by the parent to update the Plan.",
+    ]) {
+      assert.deepEqual(validateSkillMarkdown(`${skill}\n${prose}`).failures, [])
+    }
+
+    for (const prose of [
+      "The Plan is revised by the parent.",
+      "The Design is fixed by the parent.",
+      "The Plan Author is asked by the parent to revise the Plan, and afterward the parent updates it.",
+    ]) {
+      has(validateSkillMarkdown(`${skill}\n${prose}`).failures, "B2D-SKILL-005")
+    }
+  })
+
   it("contains the complete operational policy and document JSON shapes", () => {
     const policy = fencedJsonAfterHeading(
       realSkill,
