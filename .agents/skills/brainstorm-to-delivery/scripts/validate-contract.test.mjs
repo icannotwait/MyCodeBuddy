@@ -870,6 +870,49 @@ describe("Skill contract v2", () => {
     })
   }
 
+  it("rejects high Task Agent implementation with explicit passive actors", () => {
+    has(
+      validateSkillMarkdown(
+        `${skill}\nHigh Tasks are reviewed by Codex but implemented by Grok.`
+      ).failures,
+      "B2D-SKILL-005"
+    )
+  })
+
+  for (const [name, prose] of [
+    [
+      "high Task Agent implementation after conjunction",
+      "High Tasks are reviewed by Codex and implemented by Grok.",
+    ],
+    [
+      "normal Codex implementation after contrast",
+      "Normal Tasks are reviewed by Grok but implemented by Codex.",
+    ],
+  ]) {
+    it(`passive actor relation pressure rejects ${name}`, () => {
+      has(validateSkillMarkdown(`${skill}\n${prose}`).failures, "B2D-SKILL-005")
+    })
+  }
+
+  for (const [name, prose] of [
+    [
+      "high Codex implementation after Task Agent review",
+      "High Tasks are reviewed by the Task Agent but implemented by Codex.",
+    ],
+    [
+      "high Codex implementation after Codex review",
+      "High Tasks are reviewed by Codex and implemented by Codex.",
+    ],
+    [
+      "normal Task Agent implementation after Codex review",
+      "Normal Tasks are reviewed by Codex but implemented by Grok.",
+    ],
+  ]) {
+    it(`passive actor relation pressure accepts ${name}`, () => {
+      assert.deepEqual(validateSkillMarkdown(`${skill}\n${prose}`).failures, [])
+    })
+  }
+
   it("nearby relation pressure accepts a coordinated auxiliary-review dispatch", () => {
     assert.deepEqual(
       validateSkillMarkdown(

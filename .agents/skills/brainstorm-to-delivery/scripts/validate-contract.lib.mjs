@@ -1019,6 +1019,17 @@ function actionsSharePredicateRelations(clause, left, right) {
   )
 }
 
+function actionsShareTaskScope(clause, left, right) {
+  return (
+    tokenIndex(
+      clause.tokens,
+      PREDICATE_COORDINATORS,
+      left.index + 1,
+      right.index
+    ) >= 0
+  )
+}
+
 function relatedActionGroup(clause, action, sharesRelations) {
   const position = clause.actions.findIndex(
     (candidate) => candidate.index === action.index
@@ -1043,6 +1054,10 @@ function relatedActionGroup(clause, action, sharesRelations) {
 
 function predicateActionGroup(clause, action) {
   return relatedActionGroup(clause, action, actionsSharePredicateRelations)
+}
+
+function taskScopeActionGroup(clause, action) {
+  return relatedActionGroup(clause, action, actionsShareTaskScope)
 }
 
 function localTasksForAction(clause, action) {
@@ -1104,7 +1119,7 @@ function actionTaskScopes(clause, action) {
     if (previous) tasks = [previous]
   }
   if (tasks.length === 0) {
-    tasks = predicateActionGroup(clause, action).flatMap((candidate) =>
+    tasks = taskScopeActionGroup(clause, action).flatMap((candidate) =>
       localTasksForAction(clause, candidate)
     )
   }
