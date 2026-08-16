@@ -593,12 +593,26 @@ struct SharedEnqueuePublicationHook {
 pub(crate) enum SharedControlAdmissionError {
     DefinitelyNotAdmitted(AcpError),
     MayHaveBeenAdmitted(AcpError),
+    InteractionAlreadyResolved { local_error: Option<AcpError> },
 }
 
 impl SharedControlAdmissionError {
     fn into_error(self) -> AcpError {
         match self {
             Self::DefinitelyNotAdmitted(error) | Self::MayHaveBeenAdmitted(error) => error,
+            Self::InteractionAlreadyResolved { local_error } => local_error.unwrap_or(
+                AcpError::Shared(SharedSessionError::InteractionAlreadyResolved),
+            ),
+        }
+    }
+
+    fn into_local_result(self) -> Result<(), AcpError> {
+        match self {
+            Self::DefinitelyNotAdmitted(error) | Self::MayHaveBeenAdmitted(error) => Err(error),
+            Self::InteractionAlreadyResolved { local_error } => match local_error {
+                Some(error) => Err(error),
+                None => Ok(()),
+            },
         }
     }
 }
@@ -978,12 +992,13 @@ impl ConnectionManager {
                     let db = db.clone();
                     let connection_id = request.guard.connection_id.clone();
                     let recovery_claim = claim.clone();
-                    let admission_task = tokio::spawn(async move {
-                        let admission = manager
-                            .shared_control_adapter
-                            .cancel(&manager, &db, &connection_id, &claim)
-                            .await;
-                        match admission {
+                    let admission_task =
+                        tokio::spawn(async move {
+                            let admission = manager
+                                .shared_control_adapter
+                                .cancel(&manager, &db, &connection_id, &claim)
+                                .await;
+                            match admission {
                             Ok(()) => {
                                 manager
                                     .shared_session_broker
@@ -1005,8 +1020,17 @@ impl ConnectionManager {
                                     .await?;
                                 Err(error)
                             }
+                            Err(error @ SharedControlAdmissionError::InteractionAlreadyResolved {
+                                ..
+                            }) => {
+                                manager
+                                    .shared_session_broker
+                                    .release_stop_request(&claim)
+                                    .await?;
+                                Err(error.into_error())
+                            }
                         }
-                    });
+                        });
                     return match admission_task.await {
                         Ok(result) => result,
                         Err(error) => {
@@ -1156,6 +1180,14 @@ impl ConnectionManager {
                     .complete_interaction(claim)
                     .await?;
                 Err(error)
+            }
+            Err(SharedControlAdmissionError::InteractionAlreadyResolved { .. }) => {
+                self.shared_session_broker
+                    .complete_interaction(claim)
+                    .await?;
+                Err(AcpError::Shared(
+                    SharedSessionError::InteractionAlreadyResolved,
+                ))
             }
         }
     }
@@ -1886,6 +1918,7 @@ impl ConnectionManager {
                                 &connection_id,
                                 generation,
                                 &driver_incarnation,
+                                SharedInteractionKind::Permission,
                                 request_id,
                             )
                             .await
@@ -1909,6 +1942,7 @@ impl ConnectionManager {
                                 &connection_id,
                                 generation,
                                 &driver_incarnation,
+                                SharedInteractionKind::Question,
                                 question_id,
                             )
                             .await
@@ -1932,6 +1966,7 @@ impl ConnectionManager {
                                 &connection_id,
                                 generation,
                                 &driver_incarnation,
+                                SharedInteractionKind::PlanApproval,
                                 approval_id,
                             )
                             .await
@@ -5017,14 +5052,9 @@ impl ConnectionManager {
             )
         };
         let _prompt_guard = prompt_lock.lock_owned().await;
-        if let Some(claim) = shared_claim {
-            self.shared_session_broker
-                .validate_stop_claim(claim)
-                .await
-                .map_err(|error| {
-                    SharedControlAdmissionError::DefinitelyNotAdmitted(AcpError::Shared(error))
-                })?;
-        }
+        let cancel_permit = control_tx.reserve().await.map_err(|_| {
+            SharedControlAdmissionError::DefinitelyNotAdmitted(AcpError::ProcessExited)
+        })?;
         let conversation_id = state_arc.read().await.conversation_id;
         let cleanup_error = match (
             conversation_id,
@@ -5037,12 +5067,17 @@ impl ConnectionManager {
                 .err(),
             _ => None,
         };
-        let cancel_result = control_tx
-            .send(ConnectionControl::Cancel)
-            .await
-            .map_err(|_| {
-                SharedControlAdmissionError::DefinitelyNotAdmitted(AcpError::ProcessExited)
-            });
+        if let Some(claim) = shared_claim {
+            self.shared_session_broker
+                .validate_stop_claim(claim)
+                .await
+                .map_err(|error| {
+                    SharedControlAdmissionError::DefinitelyNotAdmitted(AcpError::Shared(error))
+                })?;
+        }
+        // The reserved permit makes admission synchronous after the final
+        // exact-turn validation, leaving no await where the claim can go stale.
+        cancel_permit.send(ConnectionControl::Cancel);
 
         // Eagerly flip the row to `Cancelled` so the sidebar/tabs leave the
         // "running" state immediately. The agent typically replies with
@@ -5082,7 +5117,6 @@ impl ConnectionManager {
             }
         }
 
-        cancel_result?;
         if let Some(error) = cleanup_error {
             return Err(SharedControlAdmissionError::MayHaveBeenAdmitted(
                 AcpError::protocol(format!("continuation stop persistence failed: {error}")),
@@ -7730,9 +7764,13 @@ impl ConnectionManager {
         question_id: &str,
         answer: QuestionAnswer,
     ) -> Result<(), AcpError> {
-        self.answer_question_with_admission(conn_id, question_id, answer)
+        match self
+            .answer_question_with_admission(conn_id, question_id, answer)
             .await
-            .map_err(SharedControlAdmissionError::into_error)
+        {
+            Ok(()) => Ok(()),
+            Err(error) => error.into_local_result(),
+        }
     }
 
     async fn answer_question_with_admission(
@@ -7744,11 +7782,17 @@ impl ConnectionManager {
         let _ = conn_id;
         let (questions, authorization_id) = match self.claim_question_settlement(question_id).await
         {
-            QuestionSettlementClaim::Missing => return Ok(()),
+            QuestionSettlementClaim::Missing => {
+                return Err(SharedControlAdmissionError::InteractionAlreadyResolved {
+                    local_error: None,
+                })
+            }
             QuestionSettlementClaim::InFlight => {
-                return Err(SharedControlAdmissionError::DefinitelyNotAdmitted(
-                    AcpError::protocol("question settlement is already in progress"),
-                ))
+                return Err(SharedControlAdmissionError::InteractionAlreadyResolved {
+                    local_error: Some(AcpError::protocol(
+                        "question settlement is already in progress",
+                    )),
+                })
             }
             QuestionSettlementClaim::Claimed {
                 questions,
@@ -8052,6 +8096,17 @@ impl ConnectionManager {
         })
     }
 
+    pub async fn pending_plan_approval_parent_connection_id(
+        &self,
+        approval_id: &str,
+    ) -> Option<String> {
+        self.pending_plan_approvals
+            .lock()
+            .await
+            .get(approval_id)
+            .map(|entry| entry.parent_connection_id.clone())
+    }
+
     /// Returns `true` — after emitting a clearing `PlanApprovalResolved` — when
     /// `approval_id` is no longer pending, i.e. a teardown sweep drained it in the
     /// window after its `PlanApprovalRequest` was broadcast. Mirrors
@@ -8094,9 +8149,13 @@ impl ConnectionManager {
         approval_id: &str,
         answer: PlanApprovalAnswer,
     ) -> Result<(), AcpError> {
-        self.answer_plan_approval_with_admission(conn_id, approval_id, answer)
+        match self
+            .answer_plan_approval_with_admission(conn_id, approval_id, answer)
             .await
-            .map_err(SharedControlAdmissionError::into_error)
+        {
+            Ok(()) => Ok(()),
+            Err(error) => error.into_local_result(),
+        }
     }
 
     async fn answer_plan_approval_with_admission(
@@ -8109,7 +8168,9 @@ impl ConnectionManager {
         let entry = self.pending_plan_approvals.lock().await.remove(approval_id);
         let Some(entry) = entry else {
             // Already answered / canceled / gone elsewhere — idempotent success.
-            return Ok(());
+            return Err(SharedControlAdmissionError::InteractionAlreadyResolved {
+                local_error: None,
+            });
         };
         // Ignore a dropped receiver: the handler may have abandoned the wait
         // (teardown) at the same instant; the resolved event below still clears
@@ -9725,8 +9786,13 @@ mod tests {
         RouteDegradedReason, RouteResolutionInput, SuppressionCapability,
         ROUTE_ADAPTER_CONTRACT_VERSION,
     };
+    use crate::acp::plan_approval::PlanApprovalDecision;
+    use crate::acp::session_attach::SessionAttachMode;
     use crate::acp::session_state::SessionState;
-    use crate::acp::shared_session::{SharedLaunchIdentity, SharedSessionKey, SharedSessionPhase};
+    use crate::acp::shared_session::{
+        SharedInteractionRequest, SharedLaunchIdentity, SharedMutationGuard, SharedReserveRequest,
+        SharedSessionKey, SharedSessionPhase,
+    };
     use crate::acp::terminal_context::AcpLaunchInputs;
     use crate::acp::types::ConnectionStatus;
     use crate::auto_title::{ConnectionLaunchContext, ConnectionPurpose};
@@ -19038,6 +19104,215 @@ mod tests {
         }]
     }
 
+    fn shared_control_reserve_request(
+        connection_id: &str,
+        conversation_id: i32,
+    ) -> SharedReserveRequest {
+        SharedReserveRequest {
+            key: SharedSessionKey::Conversation(conversation_id),
+            connection_id: connection_id.to_string(),
+            launch_identity: SharedLaunchIdentity {
+                agent_type: AgentType::Codex,
+                working_dir_fingerprint: "shared-control-cwd".into(),
+                external_session_id: None,
+                attach_mode: SessionAttachMode::Default,
+                route_fingerprint: "shared-control-route".into(),
+                terminal_shell_fingerprint: "shared-control-shell".into(),
+                purpose: ConnectionPurpose::User,
+            },
+            client_instance_id: "shared-control-client".into(),
+            device_id: "shared-control-device".into(),
+            request_id: "shared-control-connect".into(),
+            retry_failed_generation: None,
+            now: tokio::time::Instant::now(),
+            now_utc: chrono::Utc::now(),
+        }
+    }
+
+    async fn ready_shared_control_manager(
+        connection_id: &str,
+        conversation_id: i32,
+    ) -> (
+        Arc<ConnectionManager>,
+        SharedSessionAttachment,
+        SharedMutationGuard,
+    ) {
+        let manager = Arc::new(ConnectionManager::new());
+        manager
+            .insert_test_connection(connection_id, AgentType::Codex, None, EventEmitter::Noop)
+            .await;
+        let broker = manager.shared_session_broker();
+        let attachment = broker
+            .reserve_or_attach(shared_control_reserve_request(
+                connection_id,
+                conversation_id,
+            ))
+            .await
+            .unwrap()
+            .attachment;
+        let (state, emitter) = manager
+            .get_state_and_emitter(connection_id)
+            .await
+            .expect("test connection state");
+        broker
+            .install_registered(
+                connection_id,
+                attachment.generation,
+                "shared-control-driver".into(),
+                state,
+                emitter,
+                Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            )
+            .await
+            .unwrap();
+        broker
+            .mark_ready(
+                connection_id,
+                attachment.generation,
+                "shared-control-driver",
+            )
+            .await
+            .unwrap();
+        let guard = SharedMutationGuard {
+            connection_id: connection_id.to_string(),
+            generation: attachment.generation,
+            lease_id: attachment.lease_id.clone(),
+        };
+        (manager, attachment, guard)
+    }
+
+    fn assert_shared_interaction_already_resolved(result: Result<(), AcpError>) {
+        assert!(matches!(
+            result,
+            Err(AcpError::Shared(
+                SharedSessionError::InteractionAlreadyResolved
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn shared_missing_question_and_plan_responders_return_stable_loser() {
+        let (manager, attachment, guard) =
+            ready_shared_control_manager("shared-missing", 1901).await;
+        let broker = manager.shared_session_broker();
+
+        broker
+            .observe_interaction(
+                &attachment.connection_id,
+                attachment.generation,
+                "shared-control-driver",
+                SharedInteractionKind::Question,
+                "missing-question",
+            )
+            .await
+            .unwrap();
+        assert_shared_interaction_already_resolved(
+            manager
+                .answer_shared_question(SharedInteractionRequest {
+                    guard: guard.clone(),
+                    interaction_id: "missing-question".into(),
+                    answer: QuestionAnswer::default(),
+                })
+                .await,
+        );
+        assert_shared_interaction_already_resolved(
+            manager
+                .answer_shared_question(SharedInteractionRequest {
+                    guard: guard.clone(),
+                    interaction_id: "missing-question".into(),
+                    answer: QuestionAnswer::default(),
+                })
+                .await,
+        );
+
+        broker
+            .observe_interaction(
+                &attachment.connection_id,
+                attachment.generation,
+                "shared-control-driver",
+                SharedInteractionKind::PlanApproval,
+                "missing-plan",
+            )
+            .await
+            .unwrap();
+        let plan_answer = PlanApprovalAnswer {
+            decision: PlanApprovalDecision::Approve,
+            feedback: None,
+        };
+        assert_shared_interaction_already_resolved(
+            manager
+                .answer_shared_plan_approval(SharedInteractionRequest {
+                    guard: guard.clone(),
+                    interaction_id: "missing-plan".into(),
+                    answer: plan_answer.clone(),
+                })
+                .await,
+        );
+        assert_shared_interaction_already_resolved(
+            manager
+                .answer_shared_plan_approval(SharedInteractionRequest {
+                    guard,
+                    interaction_id: "missing-plan".into(),
+                    answer: plan_answer,
+                })
+                .await,
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_in_flight_question_loser_is_stable_and_never_reopens() {
+        let (manager, attachment, guard) =
+            ready_shared_control_manager("shared-in-flight", 1902).await;
+        let registered = manager
+            .register_question(&attachment.connection_id, q_spec())
+            .await
+            .expect("question registered");
+        manager
+            .claim_question_settlement(&registered.question_id)
+            .await;
+        manager
+            .shared_session_broker()
+            .observe_interaction(
+                &attachment.connection_id,
+                attachment.generation,
+                "shared-control-driver",
+                SharedInteractionKind::Question,
+                &registered.question_id,
+            )
+            .await
+            .unwrap();
+
+        assert_shared_interaction_already_resolved(
+            manager
+                .answer_shared_question(SharedInteractionRequest {
+                    guard: guard.clone(),
+                    interaction_id: registered.question_id.clone(),
+                    answer: QuestionAnswer::default(),
+                })
+                .await,
+        );
+        manager
+            .release_question_settlement(&registered.question_id)
+            .await;
+        assert_shared_interaction_already_resolved(
+            manager
+                .answer_shared_question(SharedInteractionRequest {
+                    guard,
+                    interaction_id: registered.question_id.clone(),
+                    answer: QuestionAnswer::default(),
+                })
+                .await,
+        );
+        assert!(manager
+            .pending_questions
+            .lock()
+            .await
+            .contains_key(&registered.question_id));
+        manager
+            .finish_question_settlement(&registered.question_id, None)
+            .await;
+    }
+
     #[tokio::test]
     async fn pending_question_parent_connection_id_peeks_without_consuming() {
         let mgr = ConnectionManager::new();
@@ -20330,6 +20605,143 @@ mod tests {
             inner.load("gated").await.unwrap().unwrap().state,
             crate::acp::delegation::continuation::types::ContinuationState::Cancelled
         );
+    }
+
+    #[tokio::test]
+    async fn shared_stop_settled_during_continuation_cleanup_never_sends_cancel() {
+        let db = Arc::new(crate::db::test_helpers::fresh_in_memory_db().await);
+        let folder_id = crate::db::test_helpers::seed_folder(&db, "C:/shared-cleanup-stop").await;
+        crate::db::test_helpers::seed_conversation(&db, folder_id, AgentType::Codex).await;
+        let inner = Arc::new(
+            crate::acp::delegation::continuation::store::InMemoryContinuationStore::default(),
+        );
+        let (entered_tx, mut entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let store = Arc::new(CleanupGateStore {
+            inner,
+            gate: tokio::sync::Mutex::new(Some((entered_tx, release_rx))),
+            fail_active_load: false,
+        });
+        let manager = Arc::new(ConnectionManager::new());
+        let (_cmd_rx, mut control_rx, _coordinator) =
+            install_cleanup_connection(&manager, store).await;
+        let broker = manager.shared_session_broker();
+        let attachment = broker
+            .reserve_or_attach(shared_control_reserve_request("cleanup-parent", 1))
+            .await
+            .unwrap()
+            .attachment;
+        let (state, emitter) = manager
+            .get_state_and_emitter("cleanup-parent")
+            .await
+            .unwrap();
+        broker
+            .install_registered(
+                "cleanup-parent",
+                attachment.generation,
+                "shared-cleanup-driver".into(),
+                state,
+                emitter,
+                Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            )
+            .await
+            .unwrap();
+        broker
+            .mark_ready(
+                "cleanup-parent",
+                attachment.generation,
+                "shared-cleanup-driver",
+            )
+            .await
+            .unwrap();
+        let guard = SharedMutationGuard {
+            connection_id: "cleanup-parent".into(),
+            generation: attachment.generation,
+            lease_id: attachment.lease_id.clone(),
+        };
+        let admission = broker
+            .enqueue_prompt(SharedPromptRequest {
+                guard: guard.clone(),
+                client_instance_id: "shared-control-client".into(),
+                client_request_id: "shared-stop-prompt".into(),
+                blocks: vec![PromptInputBlock::Text {
+                    text: "shared stop".into(),
+                }],
+                folder_id: Some(folder_id),
+                conversation_id: Some(1),
+                client_message_id: "shared-stop-message".into(),
+                capture: None,
+                submitted_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+        broker
+            .mark_prompt_admission_published(
+                "cleanup-parent",
+                attachment.generation,
+                &admission.queue_item_id,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            broker
+                .claim_dispatchable_head(
+                    "cleanup-parent",
+                    attachment.generation,
+                    "shared-cleanup-turn",
+                    &SharedRuntimeWorkSnapshot {
+                        status: ConnectionStatus::Connected,
+                        turn_in_flight: false,
+                        pending_permission_id: None,
+                        pending_question_id: None,
+                        pending_plan_approval_id: None,
+                        continuation_wait: false,
+                        active_delegations: 0,
+                        background_outstanding: 0,
+                        conversation_write_error: None,
+                    },
+                )
+                .await
+                .unwrap(),
+            DispatchHeadDecision::Claimed(_)
+        ));
+
+        let stop_db = db.conn.clone();
+        let stop_manager = manager.clone();
+        let mut stop = tokio::spawn(async move {
+            stop_manager
+                .stop_shared_turn(
+                    &stop_db,
+                    SharedStopRequest {
+                        guard,
+                        turn_id: "shared-cleanup-turn".into(),
+                    },
+                )
+                .await
+        });
+        tokio::select! {
+            entered = &mut entered_rx => entered.expect("stop entered continuation cleanup"),
+            result = &mut stop => panic!("stop completed before cleanup gate: {result:?}"),
+        }
+        broker
+            .settle_active_turn(
+                "cleanup-parent",
+                attachment.generation,
+                "shared-cleanup-driver",
+                "end_turn",
+            )
+            .await
+            .unwrap();
+        release_tx.send(()).unwrap();
+
+        assert!(matches!(
+            stop.await.unwrap(),
+            Err(AcpError::Shared(SharedSessionError::StaleTurn))
+        ));
+        assert!(matches!(
+            control_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
     }
 
     #[tokio::test]

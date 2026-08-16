@@ -653,6 +653,7 @@ impl SharedSessionBroker {
         connection_id: &str,
         generation: u64,
         driver_incarnation: &str,
+        kind: SharedInteractionKind,
         interaction_id: &str,
     ) -> Result<Vec<crate::acp::types::AcpEvent>, SharedSessionError> {
         self.with_authoritative_record(connection_id, |record| {
@@ -661,7 +662,7 @@ impl SharedSessionBroker {
             {
                 return Err(SharedSessionError::GenerationStale);
             }
-            record.interactions.resolve_matching(interaction_id);
+            record.interactions.resolve_matching(kind, interaction_id);
             record.notify.notify_one();
             Ok(Vec::new())
         })
@@ -2642,18 +2643,10 @@ impl SharedInteractions {
         });
     }
 
-    fn resolve_matching(&mut self, interaction_id: &str) {
-        for interaction in [
-            &mut self.permission,
-            &mut self.question,
-            &mut self.plan_approval,
-        ]
-        .into_iter()
-        .flatten()
-        {
+    fn resolve_matching(&mut self, kind: SharedInteractionKind, interaction_id: &str) {
+        if let Some(interaction) = self.get_mut(kind).as_mut() {
             if interaction.id == interaction_id {
                 interaction.admission = InteractionAdmissionState::Resolved;
-                return;
             }
         }
     }

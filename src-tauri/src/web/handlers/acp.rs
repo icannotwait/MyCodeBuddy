@@ -414,6 +414,25 @@ fn map_acp_error(error: crate::acp::error::AcpError) -> AppCommandError {
         .unwrap_or_else(|| AppCommandError::task_execution_failed(error.to_string()))
 }
 
+async fn interaction_is_broker_managed(
+    manager: &crate::acp::manager::ConnectionManager,
+    supplied_connection_id: &str,
+    authoritative_owner: Option<String>,
+) -> Result<bool, AppCommandError> {
+    let routing_connection_id = match authoritative_owner {
+        Some(owner) if owner != supplied_connection_id => {
+            return Err(map_acp_error(crate::acp::error::AcpError::Shared(
+                SharedSessionError::InteractionAlreadyResolved,
+            )))
+        }
+        Some(owner) => owner,
+        None => supplied_connection_id.to_string(),
+    };
+    Ok(manager
+        .is_broker_managed_connection(&routing_connection_id)
+        .await)
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AcpForkParams {
@@ -678,10 +697,10 @@ pub async fn acp_answer_question(
     Json(params): Json<AcpAnswerQuestionParams>,
 ) -> Result<Json<()>, AppCommandError> {
     let manager = &state.connection_manager;
-    if manager
-        .is_broker_managed_connection(&params.connection_id)
-        .await
-    {
+    let authoritative_owner = manager
+        .pending_question_parent_connection_id(&params.question_id)
+        .await;
+    if interaction_is_broker_managed(manager, &params.connection_id, authoritative_owner).await? {
         let guard =
             shared_mutation_guard(&params.connection_id, params.generation, params.lease_id)?;
         manager
@@ -735,10 +754,10 @@ pub async fn acp_answer_plan_approval(
     Json(params): Json<AcpAnswerPlanApprovalParams>,
 ) -> Result<Json<()>, AppCommandError> {
     let manager = &state.connection_manager;
-    if manager
-        .is_broker_managed_connection(&params.connection_id)
-        .await
-    {
+    let authoritative_owner = manager
+        .pending_plan_approval_parent_connection_id(&params.approval_id)
+        .await;
+    if interaction_is_broker_managed(manager, &params.connection_id, authoritative_owner).await? {
         let guard =
             shared_mutation_guard(&params.connection_id, params.generation, params.lease_id)?;
         manager
@@ -1494,8 +1513,51 @@ pub async fn codex_poll_device_code(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::acp::session_attach::SessionAttachMode;
+    use crate::acp::shared_session::{
+        SharedLaunchIdentity, SharedReserveRequest, SharedSessionKey,
+    };
     use crate::app_error::AppErrorCode;
     use crate::auto_title::{parse_supported_app_locale, prompt_capture_from_wire};
+    use crate::web::event_bridge::EventEmitter;
+
+    async fn broker_owned_interaction_state(
+        connection_id: &str,
+        conversation_id: i32,
+    ) -> (Arc<AppState>, tempfile::TempDir) {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(AppState::new_for_test(db, dir.path().to_path_buf()));
+        state
+            .connection_manager
+            .insert_test_connection(connection_id, AgentType::Codex, None, EventEmitter::Noop)
+            .await;
+        state
+            .connection_manager
+            .shared_session_broker()
+            .reserve_or_attach(SharedReserveRequest {
+                key: SharedSessionKey::Conversation(conversation_id),
+                connection_id: connection_id.into(),
+                launch_identity: SharedLaunchIdentity {
+                    agent_type: AgentType::Codex,
+                    working_dir_fingerprint: "handler-owner-cwd".into(),
+                    external_session_id: None,
+                    attach_mode: SessionAttachMode::Default,
+                    route_fingerprint: "handler-owner-route".into(),
+                    terminal_shell_fingerprint: "handler-owner-shell".into(),
+                    purpose: crate::auto_title::ConnectionPurpose::User,
+                },
+                client_instance_id: "handler-owner-client".into(),
+                device_id: "handler-owner-device".into(),
+                request_id: "handler-owner-connect".into(),
+                retry_failed_generation: None,
+                now: tokio::time::Instant::now(),
+                now_utc: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+        (state, dir)
+    }
 
     #[test]
     fn acp_prompt_params_accept_optional_visible_text_and_lossy_locale() {
@@ -1565,6 +1627,118 @@ mod tests {
         .unwrap();
         assert_eq!(guard.connection_id, "shared");
         assert_eq!(guard.generation, 7);
+    }
+
+    #[tokio::test]
+    async fn spoofed_local_connection_cannot_answer_broker_owned_question() {
+        let (state, _dir) = broker_owned_interaction_state("question-owner", 1961).await;
+        let registered = state
+            .connection_manager
+            .register_question(
+                "question-owner",
+                vec![crate::acp::question::QuestionSpec {
+                    id: "choice".into(),
+                    question: "Choose".into(),
+                    header: "Choice".into(),
+                    multi_select: false,
+                    options: vec![],
+                    is_secret: false,
+                    recovery: None,
+                }],
+            )
+            .await
+            .expect("question registered");
+
+        let spoofed = acp_answer_question(
+            Extension(state.clone()),
+            Json(AcpAnswerQuestionParams {
+                connection_id: "local-spoof".into(),
+                question_id: registered.question_id.clone(),
+                answer: Default::default(),
+                generation: None,
+                lease_id: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(spoofed.code, AppErrorCode::InteractionAlreadyResolved);
+        assert!(state
+            .connection_manager
+            .pending_question_parent_connection_id(&registered.question_id)
+            .await
+            .is_some());
+
+        let unfenced_owner = acp_answer_question(
+            Extension(state),
+            Json(AcpAnswerQuestionParams {
+                connection_id: "question-owner".into(),
+                question_id: registered.question_id,
+                answer: Default::default(),
+                generation: None,
+                lease_id: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            unfenced_owner.code,
+            AppErrorCode::SharedSessionProtocolRequired
+        );
+    }
+
+    #[tokio::test]
+    async fn spoofed_local_connection_cannot_answer_broker_owned_plan_approval() {
+        let (state, _dir) = broker_owned_interaction_state("plan-owner", 1962).await;
+        let registered = state
+            .connection_manager
+            .register_plan_approval("plan-owner", "tool-call".into(), "plan".into())
+            .await
+            .expect("plan approval registered");
+
+        let spoofed = acp_answer_plan_approval(
+            Extension(state.clone()),
+            Json(AcpAnswerPlanApprovalParams {
+                connection_id: "local-spoof".into(),
+                approval_id: registered.approval_id.clone(),
+                answer: crate::acp::plan_approval::PlanApprovalAnswer {
+                    decision: crate::acp::plan_approval::PlanApprovalDecision::Approve,
+                    feedback: None,
+                },
+                generation: None,
+                lease_id: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(spoofed.code, AppErrorCode::InteractionAlreadyResolved);
+        assert_eq!(
+            state
+                .connection_manager
+                .pending_plan_approval_parent_connection_id(&registered.approval_id)
+                .await
+                .as_deref(),
+            Some("plan-owner")
+        );
+
+        let unfenced_owner = acp_answer_plan_approval(
+            Extension(state),
+            Json(AcpAnswerPlanApprovalParams {
+                connection_id: "plan-owner".into(),
+                approval_id: registered.approval_id,
+                answer: crate::acp::plan_approval::PlanApprovalAnswer {
+                    decision: crate::acp::plan_approval::PlanApprovalDecision::Approve,
+                    feedback: None,
+                },
+                generation: None,
+                lease_id: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            unfenced_owner.code,
+            AppErrorCode::SharedSessionProtocolRequired
+        );
     }
 }
 

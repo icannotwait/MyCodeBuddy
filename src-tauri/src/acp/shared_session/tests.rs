@@ -2627,6 +2627,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolved_event_only_resolves_the_matching_interaction_kind() {
+        let fixture = ready_fixture_with_turn("interaction-kind-turn").await;
+        let broker = fixture.manager.shared_session_broker();
+        for kind in [
+            SharedInteractionKind::Permission,
+            SharedInteractionKind::Question,
+        ] {
+            broker
+                .observe_interaction(
+                    &fixture.attachment.connection_id,
+                    fixture.attachment.generation,
+                    "test-driver-1",
+                    kind,
+                    "same-interaction-id",
+                )
+                .await
+                .unwrap();
+        }
+
+        broker
+            .observe_interaction_resolved(
+                &fixture.attachment.connection_id,
+                fixture.attachment.generation,
+                "test-driver-1",
+                SharedInteractionKind::Question,
+                "same-interaction-id",
+            )
+            .await
+            .unwrap();
+
+        let permission_claim = broker
+            .claim_interaction(
+                &fixture.guard,
+                SharedInteractionKind::Permission,
+                "same-interaction-id",
+            )
+            .await
+            .expect("permission with the same id remains pending");
+        assert!(matches!(
+            broker
+                .claim_interaction(
+                    &fixture.guard,
+                    SharedInteractionKind::Question,
+                    "same-interaction-id",
+                )
+                .await,
+            Err(SharedSessionError::InteractionAlreadyResolved)
+        ));
+        broker
+            .complete_interaction(&permission_claim)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn stale_turn_never_cancels_newer_turn_and_exact_stop_is_idempotent() {
         let fixture = ready_fixture_with_turn("turn-new").await;
         assert!(matches!(
