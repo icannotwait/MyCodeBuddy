@@ -10,7 +10,11 @@ describe("shared ACP client identity", () => {
   beforeEach(() => {
     localStorage.clear()
     nextUuid = 0
-    randomUUID.mockReset().mockImplementation(() => `uuid-${++nextUuid}`)
+    randomUUID
+      .mockReset()
+      .mockImplementation(
+        () => `00000000-0000-4000-8000-${String(++nextUuid).padStart(12, "0")}`
+      )
   })
 
   afterEach(() => {
@@ -22,6 +26,29 @@ describe("shared ACP client identity", () => {
     const firstModule = await import("./shared-session-client")
     const first = firstModule.getSharedClientIdentity()
 
+    expect(localStorage.getItem("codeg.sharedSession.deviceId.v1")).toBe(
+      first.deviceId
+    )
+
+    vi.resetModules()
+    const secondModule = await import("./shared-session-client")
+    const second = secondModule.getSharedClientIdentity()
+
+    expect(second.deviceId).toBe(first.deviceId)
+    expect(second.clientInstanceId).not.toBe(first.clientInstanceId)
+  })
+
+  it("replaces an invalid persisted device id across document reloads", async () => {
+    const invalidDeviceId = "not-a-uuid".repeat(64)
+    localStorage.setItem("codeg.sharedSession.deviceId.v1", invalidDeviceId)
+
+    const firstModule = await import("./shared-session-client")
+    const first = firstModule.getSharedClientIdentity()
+
+    expect(first.deviceId).not.toBe(invalidDeviceId)
+    expect(first.deviceId).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+    )
     expect(localStorage.getItem("codeg.sharedSession.deviceId.v1")).toBe(
       first.deviceId
     )
@@ -63,7 +90,9 @@ describe("shared ACP client identity", () => {
       const second = sharedClient.getSharedClientIdentity()
 
       expect(second).toEqual(first)
-      expect(first.deviceId).toMatch(/^uuid-/)
+      expect(first.deviceId).toMatch(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+      )
     }
   )
 })

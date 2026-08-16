@@ -1,6 +1,8 @@
 import { randomUUID } from "@/lib/utils"
 
 const DEVICE_ID_STORAGE_KEY = "codeg.sharedSession.deviceId.v1"
+const UUID_V4_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 
 const clientInstanceId = randomUUID()
 let deviceId: string | null = null
@@ -26,7 +28,7 @@ export function newSharedRequestId(): string {
 function readOrCreateDeviceId(): string {
   try {
     const stored = globalThis.localStorage?.getItem(DEVICE_ID_STORAGE_KEY)
-    if (stored) return stored
+    if (stored && UUID_V4_PATTERN.test(stored)) return stored
   } catch {
     return randomUUID()
   }
