@@ -1,13 +1,16 @@
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use axum::{extract::Extension, Json};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::acp::opencode_plugins::PluginCheckSummary;
 use crate::acp::preflight::PreflightResult;
 use crate::acp::shared_session::{
-    SharedInteractionRequest, SharedMutationGuard, SharedSessionError, SharedStopRequest,
+    PromptEnqueueResult, SharedDisposition, SharedInteractionRequest, SharedLaunchIdentity,
+    SharedMutationGuard, SharedPromptRequest, SharedSessionBroker, SharedSessionError,
+    SharedSessionKey, SharedSessionPhase, SharedStopRequest,
 };
 use crate::acp::termination::AcpDisconnectOrigin;
 use crate::acp::types::{
@@ -19,6 +22,68 @@ use crate::app_state::AppState;
 use crate::commands::acp as acp_commands;
 use crate::commands::custom_agents as custom_agent_commands;
 use crate::models::agent::AgentType;
+
+/// Constructs a process-free registered shared root for HTTP integration
+/// tests. The feature gate keeps the fake driver surface out of production
+/// builds while allowing `tests/shared_session_http.rs` to exercise the real
+/// router and manager registration path.
+#[cfg(any(test, feature = "test-utils"))]
+pub async fn registered_shared_spawn_attempt_for_http_test(
+    connection_id: String,
+    connection_incarnation: String,
+    launch: crate::acp::manager::SharedConnectLaunch,
+    existing_public_state: Option<
+        Arc<tokio::sync::RwLock<crate::acp::session_state::SessionState>>,
+    >,
+    route_bootstrap_rx: tokio::sync::oneshot::Receiver<
+        crate::acp::connection::RouteBootstrapOutcome,
+    >,
+) -> crate::acp::connection::RegisteredSpawnAttempt {
+    let state = match existing_public_state {
+        Some(state) => {
+            let mut replacement = crate::acp::session_state::SessionState::new(
+                connection_id.clone(),
+                launch.agent_type,
+                launch.working_dir.clone().map(std::path::PathBuf::from),
+                "shared-server".into(),
+                launch.folder_id,
+            );
+            replacement.connection_incarnation = connection_incarnation.clone();
+            replacement.set_route_plan_snapshot(&launch.launch_inputs.route_plan);
+            state
+                .write()
+                .await
+                .prepare_registered_replacement(replacement);
+            state
+        }
+        None => {
+            let mut state = crate::acp::session_state::SessionState::new(
+                connection_id.clone(),
+                launch.agent_type,
+                launch.working_dir.clone().map(std::path::PathBuf::from),
+                "shared-server".into(),
+                launch.folder_id,
+            );
+            state.connection_incarnation = connection_incarnation.clone();
+            state.set_route_plan_snapshot(&launch.launch_inputs.route_plan);
+            Arc::new(tokio::sync::RwLock::new(state))
+        }
+    };
+    let (_session_started_tx, session_started_rx) = tokio::sync::oneshot::channel();
+    crate::acp::connection::RegisteredSpawnAttempt {
+        connection_id,
+        connection_incarnation,
+        state,
+        emitter: crate::web::event_bridge::EventEmitter::Noop,
+        handshake: crate::acp::connection::SpawnHandshake {
+            session_started_rx,
+            route_bootstrap_rx,
+        },
+        route_plan: launch.launch_inputs.route_plan,
+        driver_start_tx: None,
+        child_pid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+    }
+}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -85,75 +150,334 @@ pub struct AcpConnectParams {
 }
 
 pub async fn acp_connect(
-    Extension(state): Extension<Arc<AppState>>,
-    Json(params): Json<AcpConnectParams>,
+    Extension(_state): Extension<Arc<AppState>>,
+    Json(_params): Json<AcpConnectParams>,
 ) -> Result<Json<String>, AppCommandError> {
-    let db = &state.db;
-    let manager = &state.connection_manager;
+    Err(map_acp_error(crate::acp::error::AcpError::Shared(
+        SharedSessionError::ProtocolRequired,
+    )))
+}
 
-    crate::commands::delegate_access::ensure_connect_delegate_interactive(
-        db,
-        manager,
-        params.agent_type,
-        params.session_id.as_deref(),
-        params.conversation_id,
-    )
-    .await
-    .map_err(|error| {
-        error
-            .app_command_error()
-            .unwrap_or_else(|| AppCommandError::task_execution_failed(error.to_string()))
-    })?;
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcpConnectOrAttachRequest {
+    pub conversation_id: Option<i32>,
+    pub agent_type: AgentType,
+    pub working_dir: Option<String>,
+    pub external_session_id: Option<String>,
+    pub delegation_route_override: Option<crate::acp::delegation::route::DelegationRoutePolicy>,
+    pub preferred_mode_id: Option<String>,
+    #[serde(default)]
+    pub preferred_config_values: BTreeMap<String, String>,
+    pub device_id: String,
+    pub client_instance_id: String,
+    pub request_id: String,
+    pub retry_failed_generation: Option<u64>,
+}
 
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SharedPublicPhase {
+    Bootstrapping,
+    Ready,
+    Failed,
+    Closing,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AcpConnectOrAttachFailure {
+    pub code: String,
+    pub retryable: bool,
+    pub cleanup_complete: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcpConnectOrAttachResponse {
+    pub connection_id: String,
+    pub generation: u64,
+    pub lease_id: String,
+    pub lease_expires_at: chrono::DateTime<chrono::Utc>,
+    pub disposition: SharedDisposition,
+    pub phase: SharedPublicPhase,
+    pub event_seq: u64,
+    pub error: Option<AcpConnectOrAttachFailure>,
+}
+
+struct SharedConnectTarget {
+    key: SharedSessionKey,
+    conversation_id: Option<i32>,
+    folder_id: Option<i32>,
+    working_dir: Option<String>,
+    external_session_id: Option<String>,
+}
+
+impl SharedSessionBroker {
+    pub fn ephemeral_key(
+        device_id: &str,
+        client_instance_id: &str,
+        request_id: &str,
+    ) -> Result<SharedSessionKey, SharedSessionError> {
+        crate::acp::shared_session::validate_client_label("device_id", device_id)?;
+        crate::acp::shared_session::validate_client_label(
+            "client_instance_id",
+            client_instance_id,
+        )?;
+        crate::acp::shared_session::validate_client_label("request_id", request_id)?;
+
+        static STARTUP_NONCE: OnceLock<[u8; 16]> = OnceLock::new();
+        let startup_nonce = STARTUP_NONCE.get_or_init(|| *uuid::Uuid::new_v4().as_bytes());
+        let mut digest = Sha256::new();
+        digest.update(startup_nonce);
+        for label in [device_id, client_instance_id, request_id] {
+            let bytes = label.as_bytes();
+            digest.update((bytes.len() as u64).to_be_bytes());
+            digest.update(bytes);
+        }
+        Ok(SharedSessionKey::Ephemeral(format!(
+            "{:x}",
+            digest.finalize()
+        )))
+    }
+}
+
+fn invalid_shared_field(field: &'static str) -> AppCommandError {
+    map_acp_error(crate::acp::error::AcpError::Shared(
+        SharedSessionError::InvalidField { field },
+    ))
+}
+
+async fn resolve_shared_connect_target(
+    state: &AppState,
+    params: &AcpConnectOrAttachRequest,
+) -> Result<SharedConnectTarget, AppCommandError> {
+    for (field, value) in [
+        ("device_id", params.device_id.as_str()),
+        ("client_instance_id", params.client_instance_id.as_str()),
+        ("request_id", params.request_id.as_str()),
+    ] {
+        crate::acp::shared_session::validate_client_label(field, value)
+            .map_err(|error| map_acp_error(error.into()))?;
+    }
+
+    if let Some(conversation_id) = params.conversation_id.filter(|id| *id > 0) {
+        let conversation =
+            crate::db::service::conversation_service::get_by_id(&state.db.conn, conversation_id)
+                .await
+                .map_err(|_| invalid_shared_field("conversation_id"))?;
+        if conversation.agent_type != params.agent_type {
+            return Err(invalid_shared_field("agent_type"));
+        }
+        let folder = crate::db::service::folder_service::get_folder_by_id(
+            &state.db.conn,
+            conversation.folder_id,
+        )
+        .await
+        .map_err(|_| invalid_shared_field("folder_id"))?
+        .ok_or_else(|| invalid_shared_field("folder_id"))?;
+        if params.working_dir.as_deref().is_some_and(|working_dir| {
+            crate::parsers::normalize_path_for_matching(working_dir)
+                != crate::parsers::normalize_path_for_matching(&folder.path)
+        }) {
+            return Err(invalid_shared_field("working_dir"));
+        }
+        if let (Some(persisted), Some(requested)) = (
+            conversation.external_id.as_deref(),
+            params.external_session_id.as_deref(),
+        ) {
+            if persisted != requested {
+                return Err(invalid_shared_field("external_session_id"));
+            }
+        }
+        crate::commands::delegate_access::ensure_delegate_interactive(
+            &state.db,
+            &state.connection_manager,
+            conversation_id,
+        )
+        .await
+        .map_err(map_acp_error)?;
+        return Ok(SharedConnectTarget {
+            key: SharedSessionKey::Conversation(conversation_id),
+            conversation_id: Some(conversation_id),
+            folder_id: Some(conversation.folder_id),
+            working_dir: Some(folder.path),
+            external_session_id: params
+                .external_session_id
+                .clone()
+                .or(conversation.external_id),
+        });
+    }
+
+    let normalized_working_dir = params
+        .working_dir
+        .as_deref()
+        .map(crate::parsers::normalize_path_for_matching)
+        .filter(|value| !value.is_empty());
+    let external_session_id = params
+        .external_session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    let key = match (&normalized_working_dir, &external_session_id) {
+        (Some(normalized_working_dir), Some(external_session_id)) => {
+            SharedSessionKey::ExternalSession {
+                agent_type: params.agent_type,
+                normalized_working_dir: normalized_working_dir.clone(),
+                external_session_id: external_session_id.clone(),
+            }
+        }
+        _ => SharedSessionBroker::ephemeral_key(
+            &params.device_id,
+            &params.client_instance_id,
+            &params.request_id,
+        )
+        .map_err(|error| map_acp_error(error.into()))?,
+    };
+    Ok(SharedConnectTarget {
+        key,
+        conversation_id: None,
+        folder_id: None,
+        working_dir: params.working_dir.clone(),
+        external_session_id,
+    })
+}
+
+fn public_shared_phase(
+    phase: &SharedSessionPhase,
+) -> Result<(SharedPublicPhase, Option<AcpConnectOrAttachFailure>), AppCommandError> {
+    match phase {
+        SharedSessionPhase::Reserved => {
+            Err(map_acp_error(SharedSessionError::SessionUnavailable.into()))
+        }
+        SharedSessionPhase::Bootstrapping => Ok((SharedPublicPhase::Bootstrapping, None)),
+        SharedSessionPhase::Ready => Ok((SharedPublicPhase::Ready, None)),
+        SharedSessionPhase::Closing => Ok((SharedPublicPhase::Closing, None)),
+        SharedSessionPhase::Failed {
+            error_code,
+            cleanup_complete,
+        } => Ok((
+            SharedPublicPhase::Failed,
+            Some(AcpConnectOrAttachFailure {
+                code: error_code.clone(),
+                retryable: *cleanup_complete
+                    && matches!(
+                        error_code.as_str(),
+                        "companion_initialization_failed" | "session_unavailable"
+                    ),
+                cleanup_complete: *cleanup_complete,
+            }),
+        )),
+    }
+}
+
+fn select_shared_connect_response_state(
+    attachment_generation: u64,
+    attachment_phase: &SharedSessionPhase,
+    public_snapshot: Option<(&crate::acp::shared_session::SharedSessionProjection, u64)>,
+) -> (SharedSessionPhase, u64) {
+    match public_snapshot {
+        Some((shared, event_seq)) if shared.generation == attachment_generation => {
+            (shared.phase.clone(), event_seq)
+        }
+        _ => (attachment_phase.clone(), 0),
+    }
+}
+
+pub async fn acp_connect_or_attach(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<AcpConnectOrAttachRequest>,
+) -> Result<Json<AcpConnectOrAttachResponse>, AppCommandError> {
+    let target = resolve_shared_connect_target(&state, &params).await?;
     let runtime = state.delegation_runtime_settings.snapshot();
     let launch_inputs = crate::acp::terminal_context::build_acp_launch_inputs(
-        db,
+        &state.db,
         params.agent_type,
-        params.session_id.as_deref(),
+        target.external_session_id.as_deref(),
         &state.data_dir,
         crate::acp::terminal_context::AcpRouteRequest::root(
-            params.conversation_id,
+            target.conversation_id,
             params.delegation_route_override,
         ),
         &runtime,
     )
     .await
-    .map_err(|e| {
-        e.app_command_error()
-            .unwrap_or_else(|| AppCommandError::task_execution_failed(e.to_string()))
-    })?;
-
-    // Guard: the session page must never trigger a download or install.
-    // If the agent isn't ready, return SdkNotInstalled here so the frontend
-    // can prompt the user to install it from Agent Settings.
-    acp_commands::verify_agent_installed(params.agent_type)
-        .await
-        .map_err(|e| AppCommandError::task_execution_failed(e.to_string()))?;
-
-    let emitter = state.emitter.clone();
-    let launch_context = crate::auto_title::user_launch_context_from_db(&db.conn).await;
-    let connection_id = manager
-        .spawn_agent(
-            params.agent_type,
-            params.working_dir,
-            params.session_id,
+    .map_err(map_acp_error)?;
+    let launch_identity = SharedLaunchIdentity {
+        agent_type: params.agent_type,
+        working_dir_fingerprint: crate::parsers::normalize_path_for_matching(
+            target.working_dir.as_deref().unwrap_or_default(),
+        ),
+        external_session_id: target.external_session_id.clone(),
+        attach_mode: crate::acp::session_attach::SessionAttachMode::Default,
+        route_fingerprint: launch_inputs.route_plan.fingerprint.clone(),
+        terminal_shell_fingerprint: crate::terminal::shell::terminal_shell_selection_key(
+            &launch_inputs.terminal_settings,
+        ),
+        purpose: crate::auto_title::ConnectionPurpose::User,
+    };
+    let launch_context = crate::auto_title::user_launch_context_from_db(&state.db.conn).await;
+    let attachment = state
+        .connection_manager
+        .connect_or_attach_shared(crate::acp::manager::SharedConnectLaunch {
+            database: state.db.conn.clone(),
+            key: target.key,
+            conversation_id: target.conversation_id,
+            folder_id: target.folder_id,
+            launch_identity,
+            agent_type: params.agent_type,
+            working_dir: target.working_dir,
+            external_session_id: target.external_session_id,
             launch_inputs,
-            "web".to_string(),
-            emitter,
-            params.preferred_mode_id,
-            params.preferred_config_values.unwrap_or_default(),
+            emitter: state.emitter.clone(),
+            preferred_mode_id: params.preferred_mode_id,
+            preferred_config_values: params.preferred_config_values,
             launch_context,
-            params.owner_operation_id,
-            None,
-        )
+            session_attach_mode: crate::acp::session_attach::SessionAttachMode::Default,
+            device_id: params.device_id,
+            client_instance_id: params.client_instance_id,
+            request_id: params.request_id,
+            retry_failed_generation: params.retry_failed_generation,
+        })
         .await
-        .map_err(|error| {
-            error
-                .app_command_error()
-                .unwrap_or_else(|| AppCommandError::task_execution_failed(error.to_string()))
-        })?;
+        .map_err(map_acp_error)?;
 
-    Ok(Json(connection_id))
+    // Registration is the response latency boundary. One cooperative yield
+    // lets already-resolved bootstrap failures settle without delaying a live
+    // bootstrap that is still waiting on its companion handshake.
+    tokio::task::yield_now().await;
+    let (phase, event_seq) = match state
+        .connection_manager
+        .get_state(&attachment.connection_id)
+        .await
+    {
+        Some(public_state) => {
+            let public_state = public_state.read().await;
+            select_shared_connect_response_state(
+                attachment.generation,
+                &attachment.phase,
+                public_state
+                    .shared_session
+                    .as_ref()
+                    .map(|shared| (shared, public_state.event_seq)),
+            )
+        }
+        None => {
+            select_shared_connect_response_state(attachment.generation, &attachment.phase, None)
+        }
+    };
+    let (phase, error) = public_shared_phase(&phase)?;
+    Ok(Json(AcpConnectOrAttachResponse {
+        connection_id: attachment.connection_id,
+        generation: attachment.generation,
+        lease_id: attachment.lease_id,
+        lease_expires_at: attachment.lease_expires_at,
+        disposition: attachment.disposition,
+        phase,
+        event_seq,
+        error,
+    }))
 }
 
 #[derive(Deserialize)]
@@ -217,6 +541,14 @@ pub struct AcpPromptParams {
     pub folder_id: Option<i32>,
     pub conversation_id: Option<i32>,
     #[serde(default)]
+    pub generation: Option<u64>,
+    #[serde(default)]
+    pub lease_id: Option<String>,
+    #[serde(default)]
+    pub client_instance_id: Option<String>,
+    #[serde(default)]
+    pub client_request_id: Option<String>,
+    #[serde(default)]
     pub client_message_id: Option<String>,
     /// Optional composer-visible text for title capture. `Some("")` is
     /// authoritative; absent falls back to ACP block projection.
@@ -228,11 +560,110 @@ pub struct AcpPromptParams {
     pub locale: Option<String>,
 }
 
+#[derive(Serialize)]
+#[serde(untagged)]
+pub enum AcpPromptResponse {
+    Shared(PromptEnqueueResult),
+    Legacy(()),
+}
+
+async fn validate_and_bind_shared_prompt_target(
+    state: &AppState,
+    connection_id: &str,
+    generation: u64,
+    conversation_id: Option<i32>,
+    folder_id: Option<i32>,
+) -> Result<(), AppCommandError> {
+    if conversation_id.is_some() && folder_id.is_none() {
+        return Err(invalid_shared_field("folder_id"));
+    }
+    let public_state = state
+        .connection_manager
+        .get_state(connection_id)
+        .await
+        .ok_or_else(|| {
+            map_acp_error(crate::acp::error::AcpError::Shared(
+                SharedSessionError::SessionUnavailable,
+            ))
+        })?;
+    let (current_conversation, current_folder, agent_type) = {
+        let public_state = public_state.read().await;
+        (
+            public_state.conversation_id,
+            public_state.folder_id,
+            public_state.agent_type,
+        )
+    };
+    if let Some(current) = current_conversation {
+        if conversation_id != Some(current) {
+            return Err(map_acp_error(
+                SharedSessionError::ConversationKeyConflict.into(),
+            ));
+        }
+    }
+    if let Some(current) = current_folder {
+        if folder_id != Some(current) {
+            return Err(invalid_shared_field("folder_id"));
+        }
+    }
+
+    let Some(conversation_id) = conversation_id else {
+        let folder_id = folder_id.ok_or_else(|| invalid_shared_field("folder_id"))?;
+        crate::db::service::folder_service::get_folder_by_id(&state.db.conn, folder_id)
+            .await
+            .map_err(|_| invalid_shared_field("folder_id"))?
+            .ok_or_else(|| invalid_shared_field("folder_id"))?;
+        return Ok(());
+    };
+    let conversation =
+        crate::db::service::conversation_service::get_by_id(&state.db.conn, conversation_id)
+            .await
+            .map_err(|_| invalid_shared_field("conversation_id"))?;
+    if conversation.agent_type != agent_type || Some(conversation.folder_id) != folder_id {
+        return Err(invalid_shared_field("conversation_id"));
+    }
+    crate::acp::delegation::workflow::require_writable_conversation_workflow(
+        &state.db.conn,
+        conversation_id,
+    )
+    .await
+    .map_err(|error| map_acp_error(error.into()))?;
+
+    if current_conversation.is_none() {
+        static BIND_GATE: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+        let _gate = BIND_GATE
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let current = public_state.read().await.conversation_id;
+        match current {
+            Some(current) if current != conversation_id => {
+                return Err(map_acp_error(
+                    SharedSessionError::ConversationKeyConflict.into(),
+                ));
+            }
+            Some(_) => {}
+            None => {
+                state
+                    .connection_manager
+                    .shared_session_broker()
+                    .bind_conversation_key(connection_id, generation, conversation_id)
+                    .await
+                    .map_err(|error| map_acp_error(error.into()))?;
+                let mut public_state = public_state.write().await;
+                public_state.conversation_id = Some(conversation_id);
+                public_state.folder_id = folder_id;
+            }
+        }
+    }
+    Ok(())
+}
+
 pub async fn acp_prompt(
     Extension(state): Extension<Arc<AppState>>,
-    Json(params): Json<AcpPromptParams>,
-) -> Result<Json<()>, AppCommandError> {
-    crate::commands::delegate_access::ensure_effective_delegate_interactive(
+    Json(mut params): Json<AcpPromptParams>,
+) -> Result<Json<AcpPromptResponse>, AppCommandError> {
+    crate::commands::delegate_access::ensure_web_shared_or_delegate_interactive(
         &state.db,
         &state.connection_manager,
         &params.connection_id,
@@ -244,6 +675,64 @@ pub async fn acp_prompt(
             .app_command_error()
             .unwrap_or_else(|| AppCommandError::task_execution_failed(error.to_string()))
     })?;
+    if state
+        .connection_manager
+        .is_broker_managed_connection(&params.connection_id)
+        .await
+    {
+        let guard = shared_mutation_guard(
+            &params.connection_id,
+            params.generation,
+            params.lease_id.take(),
+        )?;
+        let client_instance_id = params
+            .client_instance_id
+            .take()
+            .ok_or_else(|| map_acp_error(SharedSessionError::ProtocolRequired.into()))?;
+        let client_request_id = params
+            .client_request_id
+            .take()
+            .ok_or_else(|| map_acp_error(SharedSessionError::ProtocolRequired.into()))?;
+        let client_message_id = params
+            .client_message_id
+            .take()
+            .ok_or_else(|| map_acp_error(SharedSessionError::ProtocolRequired.into()))?;
+        if params.blocks.is_empty() {
+            return Err(invalid_shared_field("blocks"));
+        }
+        crate::acp::prompt_hydration::hydrate_prompt_blocks(
+            &mut params.blocks,
+            &crate::paths::codeg_uploads_root(),
+        )
+        .await
+        .map_err(map_acp_error)?;
+        validate_and_bind_shared_prompt_target(
+            &state,
+            &params.connection_id,
+            guard.generation,
+            params.conversation_id,
+            params.folder_id,
+        )
+        .await?;
+        let capture =
+            crate::auto_title::prompt_capture_from_wire(params.visible_text, params.locale);
+        let result = state
+            .connection_manager
+            .enqueue_shared_prompt(SharedPromptRequest {
+                guard,
+                client_instance_id,
+                client_request_id,
+                blocks: params.blocks,
+                folder_id: params.folder_id,
+                conversation_id: params.conversation_id,
+                client_message_id,
+                capture,
+                submitted_at: chrono::Utc::now(),
+            })
+            .await
+            .map_err(map_acp_error)?;
+        return Ok(Json(AcpPromptResponse::Shared(result)));
+    }
     let capture = crate::auto_title::prompt_capture_from_wire(params.visible_text, params.locale);
     state
         .connection_manager
@@ -263,6 +752,102 @@ pub async fn acp_prompt(
                 .app_command_error()
                 .unwrap_or_else(|| AppCommandError::task_execution_failed(error.to_string()))
         })?;
+    Ok(Json(AcpPromptResponse::Legacy(())))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcpSharedLeaseParams {
+    pub connection_id: String,
+    pub generation: u64,
+    pub lease_id: String,
+}
+
+pub async fn acp_release_lease(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<AcpSharedLeaseParams>,
+) -> Result<Json<()>, AppCommandError> {
+    crate::commands::delegate_access::ensure_web_shared_or_delegate_interactive(
+        &state.db,
+        &state.connection_manager,
+        &params.connection_id,
+        None,
+    )
+    .await
+    .map_err(map_acp_error)?;
+    state
+        .connection_manager
+        .shared_session_broker()
+        .release_lease(&SharedMutationGuard {
+            connection_id: params.connection_id,
+            generation: params.generation,
+            lease_id: params.lease_id,
+        })
+        .await
+        .map_err(|error| map_acp_error(error.into()))?;
+    Ok(Json(()))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcpCancelQueuedPromptParams {
+    pub connection_id: String,
+    pub generation: u64,
+    pub lease_id: String,
+    pub queue_item_id: String,
+}
+
+pub async fn acp_cancel_queued_prompt(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<AcpCancelQueuedPromptParams>,
+) -> Result<Json<()>, AppCommandError> {
+    crate::commands::delegate_access::ensure_web_shared_or_delegate_interactive(
+        &state.db,
+        &state.connection_manager,
+        &params.connection_id,
+        None,
+    )
+    .await
+    .map_err(map_acp_error)?;
+    state
+        .connection_manager
+        .cancel_shared_queued_prompt(
+            SharedMutationGuard {
+                connection_id: params.connection_id,
+                generation: params.generation,
+                lease_id: params.lease_id,
+            },
+            &params.queue_item_id,
+        )
+        .await
+        .map_err(map_acp_error)?;
+    Ok(Json(()))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcpTerminateSharedSessionParams {
+    pub connection_id: String,
+    pub generation: u64,
+}
+
+pub async fn acp_terminate_shared_session(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<AcpTerminateSharedSessionParams>,
+) -> Result<Json<()>, AppCommandError> {
+    crate::commands::delegate_access::ensure_web_shared_or_delegate_interactive(
+        &state.db,
+        &state.connection_manager,
+        &params.connection_id,
+        None,
+    )
+    .await
+    .map_err(map_acp_error)?;
+    state
+        .connection_manager
+        .terminate_shared_session(&params.connection_id, params.generation)
+        .await
+        .map_err(map_acp_error)?;
     Ok(Json(()))
 }
 
@@ -574,6 +1159,14 @@ pub async fn acp_cancel(
     Json(params): Json<AcpConnectionIdParams>,
 ) -> Result<Json<()>, AppCommandError> {
     let manager = &state.connection_manager;
+    crate::commands::delegate_access::ensure_web_shared_or_delegate_interactive(
+        &state.db,
+        manager,
+        &params.connection_id,
+        None,
+    )
+    .await
+    .map_err(map_acp_error)?;
     if manager
         .is_broker_managed_connection(&params.connection_id)
         .await
@@ -591,17 +1184,6 @@ pub async fn acp_cancel(
             .map_err(map_acp_error)?;
         return Ok(Json(()));
     }
-    crate::commands::delegate_access::ensure_connection_delegate_interactive(
-        &state.db,
-        &state.connection_manager,
-        &params.connection_id,
-    )
-    .await
-    .map_err(|error| {
-        error
-            .app_command_error()
-            .unwrap_or_else(|| AppCommandError::task_execution_failed(error.to_string()))
-    })?;
     manager
         .cancel(&state.db.conn, &params.connection_id)
         .await
@@ -665,6 +1247,14 @@ pub async fn acp_respond_permission(
     Json(params): Json<AcpRespondPermissionParams>,
 ) -> Result<Json<()>, AppCommandError> {
     let manager = &state.connection_manager;
+    crate::commands::delegate_access::ensure_web_shared_or_delegate_interactive(
+        &state.db,
+        manager,
+        &params.connection_id,
+        None,
+    )
+    .await
+    .map_err(map_acp_error)?;
     if manager
         .is_broker_managed_connection(&params.connection_id)
         .await
@@ -709,6 +1299,14 @@ pub async fn acp_answer_question(
         .pending_question_parent_connection_id(&params.question_id)
         .await;
     if interaction_is_broker_managed(manager, &params.connection_id, authoritative_owner).await? {
+        crate::commands::delegate_access::ensure_web_shared_or_delegate_interactive(
+            &state.db,
+            manager,
+            &params.connection_id,
+            None,
+        )
+        .await
+        .map_err(map_acp_error)?;
         let guard =
             shared_mutation_guard(&params.connection_id, params.generation, params.lease_id)?;
         manager
@@ -766,6 +1364,14 @@ pub async fn acp_answer_plan_approval(
         .pending_plan_approval_parent_connection_id(&params.approval_id)
         .await;
     if interaction_is_broker_managed(manager, &params.connection_id, authoritative_owner).await? {
+        crate::commands::delegate_access::ensure_web_shared_or_delegate_interactive(
+            &state.db,
+            manager,
+            &params.connection_id,
+            None,
+        )
+        .await
+        .map_err(map_acp_error)?;
         let guard =
             shared_mutation_guard(&params.connection_id, params.generation, params.lease_id)?;
         manager
@@ -778,6 +1384,14 @@ pub async fn acp_answer_plan_approval(
             .map_err(map_acp_error)?;
         return Ok(Json(()));
     }
+    crate::commands::delegate_access::ensure_web_shared_or_delegate_interactive(
+        &state.db,
+        manager,
+        &params.connection_id,
+        None,
+    )
+    .await
+    .map_err(map_acp_error)?;
     manager
         .answer_plan_approval(&params.connection_id, &params.approval_id, params.answer)
         .await
@@ -1529,10 +2143,60 @@ mod tests {
     use crate::auto_title::{parse_supported_app_locale, prompt_capture_from_wire};
     use crate::web::event_bridge::EventEmitter;
 
+    #[test]
+    fn connect_response_does_not_mix_a_replacement_generation_snapshot() {
+        let replacement = crate::acp::shared_session::SharedSessionProjection {
+            generation: 2,
+            phase: SharedSessionPhase::Ready,
+            queue: Vec::new(),
+            active_turn: None,
+            lease_expires_at: None,
+            expired_lease_tombstone_count: 0,
+        };
+
+        let selected = select_shared_connect_response_state(
+            1,
+            &SharedSessionPhase::Failed {
+                error_code: "session_unavailable".into(),
+                cleanup_complete: true,
+            },
+            Some((&replacement, 42)),
+        );
+
+        assert_eq!(
+            selected,
+            (
+                SharedSessionPhase::Failed {
+                    error_code: "session_unavailable".into(),
+                    cleanup_complete: true,
+                },
+                0,
+            )
+        );
+    }
+
     async fn broker_owned_interaction_state(
         connection_id: &str,
         conversation_id: i32,
     ) -> (Arc<AppState>, tempfile::TempDir) {
+        let (state, dir, _) = broker_owned_mutation_state(
+            connection_id,
+            conversation_id,
+            crate::auto_title::ConnectionPurpose::User,
+        )
+        .await;
+        (state, dir)
+    }
+
+    async fn broker_owned_mutation_state(
+        connection_id: &str,
+        conversation_id: i32,
+        purpose: crate::auto_title::ConnectionPurpose,
+    ) -> (
+        Arc<AppState>,
+        tempfile::TempDir,
+        crate::acp::shared_session::SharedSessionAttachment,
+    ) {
         let db = crate::db::test_helpers::fresh_in_memory_db().await;
         let dir = tempfile::tempdir().unwrap();
         let state = Arc::new(AppState::new_for_test(db, dir.path().to_path_buf()));
@@ -1540,7 +2204,7 @@ mod tests {
             .connection_manager
             .insert_test_connection(connection_id, AgentType::Codex, None, EventEmitter::Noop)
             .await;
-        state
+        let attachment = state
             .connection_manager
             .shared_session_broker()
             .reserve_or_attach(SharedReserveRequest {
@@ -1553,7 +2217,7 @@ mod tests {
                     attach_mode: SessionAttachMode::Default,
                     route_fingerprint: "handler-owner-route".into(),
                     terminal_shell_fingerprint: "handler-owner-shell".into(),
-                    purpose: crate::auto_title::ConnectionPurpose::User,
+                    purpose,
                 },
                 client_instance_id: "handler-owner-client".into(),
                 device_id: "handler-owner-device".into(),
@@ -1563,8 +2227,71 @@ mod tests {
                 now_utc: chrono::Utc::now(),
             })
             .await
-            .unwrap();
-        (state, dir)
+            .unwrap()
+            .attachment;
+        (state, dir, attachment)
+    }
+
+    #[tokio::test]
+    async fn public_release_rejects_a_non_user_broker_root() {
+        let (state, _dir, attachment) = broker_owned_mutation_state(
+            "delegation-release",
+            1963,
+            crate::auto_title::ConnectionPurpose::Delegation,
+        )
+        .await;
+
+        let error = acp_release_lease(
+            Extension(state.clone()),
+            Json(AcpSharedLeaseParams {
+                connection_id: attachment.connection_id.clone(),
+                generation: attachment.generation,
+                lease_id: attachment.lease_id.clone(),
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.code, AppErrorCode::SharedSessionProtocolRequired);
+        state
+            .connection_manager
+            .shared_session_broker()
+            .release_lease(&SharedMutationGuard {
+                connection_id: attachment.connection_id,
+                generation: attachment.generation,
+                lease_id: attachment.lease_id,
+            })
+            .await
+            .expect("rejected public release leaves the lease active");
+    }
+
+    #[tokio::test]
+    async fn public_termination_rejects_a_non_user_broker_root() {
+        let (state, _dir, attachment) = broker_owned_mutation_state(
+            "delegation-terminate",
+            1964,
+            crate::auto_title::ConnectionPurpose::Delegation,
+        )
+        .await;
+
+        let error = acp_terminate_shared_session(
+            Extension(state.clone()),
+            Json(AcpTerminateSharedSessionParams {
+                connection_id: attachment.connection_id.clone(),
+                generation: attachment.generation,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.code, AppErrorCode::SharedSessionProtocolRequired);
+        assert!(
+            state
+                .connection_manager
+                .shared_session_broker()
+                .is_managed_connection(&attachment.connection_id)
+                .await
+        );
     }
 
     #[test]

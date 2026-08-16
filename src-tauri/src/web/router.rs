@@ -760,6 +760,19 @@ pub fn build_router(
             post(handlers::acp::acp_env_diagnostics),
         )
         .route("/acp_connect", post(handlers::acp::acp_connect))
+        .route(
+            "/acp_connect_or_attach",
+            post(handlers::acp::acp_connect_or_attach),
+        )
+        .route("/acp_release_lease", post(handlers::acp::acp_release_lease))
+        .route(
+            "/acp_cancel_queued_prompt",
+            post(handlers::acp::acp_cancel_queued_prompt),
+        )
+        .route(
+            "/acp_terminate_shared_session",
+            post(handlers::acp::acp_terminate_shared_session),
+        )
         .route("/acp_disconnect", post(handlers::acp::acp_disconnect))
         .route(
             "/acp_touch_connection",

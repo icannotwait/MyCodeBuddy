@@ -252,6 +252,53 @@ pub async fn ensure_effective_delegate_interactive(
     }
 }
 
+/// Axum-only admission for mutations that may target a broker-owned shared
+/// root. Shared roots must retain their user purpose and cannot be retargeted
+/// to another durable conversation; legacy/delegated connections keep the
+/// established effective-delegate admission path.
+pub async fn ensure_web_shared_or_delegate_interactive(
+    db: &AppDatabase,
+    manager: &ConnectionManager,
+    connection_id: &str,
+    request_conversation_id: Option<i32>,
+) -> Result<(), crate::acp::error::AcpError> {
+    if !manager.is_broker_managed_connection(connection_id).await {
+        return ensure_effective_delegate_interactive(
+            db,
+            manager,
+            connection_id,
+            request_conversation_id,
+        )
+        .await;
+    }
+
+    let launch_identity = manager
+        .shared_session_broker()
+        .launch_identity_for_connection(connection_id)
+        .await?;
+    if launch_identity.purpose != ConnectionPurpose::User {
+        return Err(crate::acp::shared_session::SharedSessionError::ProtocolRequired.into());
+    }
+    let state = manager.get_state(connection_id).await.ok_or({
+        crate::acp::error::AcpError::Shared(
+            crate::acp::shared_session::SharedSessionError::SessionUnavailable,
+        )
+    })?;
+    let canonical_conversation_id = state.read().await.conversation_id;
+    if let (Some(canonical), Some(requested)) = (canonical_conversation_id, request_conversation_id)
+    {
+        if canonical != requested {
+            return Err(
+                crate::acp::shared_session::SharedSessionError::ConversationKeyConflict.into(),
+            );
+        }
+    }
+    if let Some(conversation_id) = canonical_conversation_id.or(request_conversation_id) {
+        ensure_delegate_interactive(db, manager, conversation_id).await?;
+    }
+    Ok(())
+}
+
 pub async fn ensure_connection_delegate_interactive(
     db: &AppDatabase,
     manager: &ConnectionManager,
