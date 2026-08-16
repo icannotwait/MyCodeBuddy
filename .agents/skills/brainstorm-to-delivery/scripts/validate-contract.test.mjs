@@ -337,6 +337,22 @@ function has(failures, rule) {
   )
 }
 
+function assertSkillClassifications(cases) {
+  const mismatches = []
+  for (const { prose, reject } of cases) {
+    const failures = validateSkillMarkdown(`${skill}\n${prose}`).failures
+    const rejected = failures.some((failure) =>
+      failure.startsWith("[B2D-SKILL-005]")
+    )
+    if (rejected !== reject) {
+      mismatches.push(
+        `${reject ? "expected rejection" : "expected acceptance"}: ${prose}`
+      )
+    }
+  }
+  assert.deepEqual(mismatches, [])
+}
+
 function fencedJsonAfterHeading(markdown, heading) {
   const headingIndex = markdown.indexOf(heading)
   assert.notEqual(headingIndex, -1, `missing Skill heading: ${heading}`)
@@ -1596,6 +1612,327 @@ describe("Skill contract v2", () => {
     ]) {
       has(validateSkillMarkdown(`${skill}\n${prose}`).failures, "B2D-SKILL-005")
     }
+  })
+
+  it("round-11 binds qualified generic Task Agent actors", () => {
+    assertSkillClassifications([
+      {
+        prose: "High Tasks are implemented by the chosen Task Agent.",
+        reject: true,
+      },
+      {
+        prose: "High Tasks are implemented by the resolved Task Agent.",
+        reject: true,
+      },
+      {
+        prose:
+          "High Tasks are implemented by the invocation-selected Task Agent.",
+        reject: true,
+      },
+      {
+        prose: "Normal Tasks are implemented by the chosen Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by the primary Codex reviewer and the auxiliary chosen Task Agent reviewer.",
+        reject: false,
+      },
+    ])
+  })
+
+  it("round-11 carries typed completion timing across clauses", () => {
+    assertSkillClassifications([
+      {
+        prose:
+          "The current Task is running. Change the Task Agent after this completes.",
+        reject: false,
+      },
+      {
+        prose:
+          "The current Task is running. When complete, change the Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "The current Task is running. Change the Task Agent before this completes.",
+        reject: true,
+      },
+      {
+        prose:
+          "The current Task is running. While it remains active, change the Task Agent.",
+        reject: true,
+      },
+    ])
+  })
+
+  it("round-11 resolves noun-phrase reviewer replacement antecedents", () => {
+    assertSkillClassifications([
+      {
+        prose:
+          "The Codex reviewer is mandatory. User-named Design reviewers replace the role.",
+        reject: true,
+      },
+      {
+        prose:
+          "The Codex reviewer is mandatory. User-named Design reviewers replace the same role.",
+        reject: true,
+      },
+      {
+        prose:
+          "The Codex reviewer is mandatory. User-named Design reviewers must not replace the role.",
+        reject: false,
+      },
+      {
+        prose:
+          "The Codex reviewer is mandatory. User-named Design reviewers do not replace the same role.",
+        reject: false,
+      },
+    ])
+  })
+
+  it("round-11 distinguishes surplus reviewer cardinality", () => {
+    assertSkillClassifications([
+      { prose: "High Tasks have two more reviewers.", reject: true },
+      { prose: "High Tasks have a further reviewer.", reject: true },
+      {
+        prose: "High Tasks must not have two more reviewers.",
+        reject: false,
+      },
+      {
+        prose: "High Tasks must not have a further reviewer.",
+        reject: false,
+      },
+      { prose: "High Tasks have two additional reviewers.", reject: true },
+      { prose: "High Tasks have two reviewers.", reject: false },
+    ])
+  })
+
+  it("round-11 propagates actor alternatives across lists and repeated links", () => {
+    assertSkillClassifications([
+      {
+        prose:
+          "High Tasks are implemented by Codex rather than Grok or Gemini.",
+        reject: false,
+      },
+      {
+        prose: "High Tasks are implemented by Codex rather than by Grok.",
+        reject: false,
+      },
+      {
+        prose:
+          "High Tasks are implemented by Codex rather than by Grok or by Gemini.",
+        reject: false,
+      },
+      {
+        prose: "High Tasks are implemented by Grok rather than by Codex.",
+        reject: true,
+      },
+      {
+        prose:
+          "High Tasks are implemented by Gemini rather than by Codex or by Grok.",
+        reject: true,
+      },
+    ])
+  })
+
+  it("round-11 keeps typed document and people antecedents distinct", () => {
+    assertSkillClassifications([
+      {
+        prose:
+          "The developers discuss the Plan. The parent updates them with review findings.",
+        reject: false,
+      },
+      {
+        prose:
+          "The Plan Author lists the Plan and Design. The parent updates them.",
+        reject: true,
+      },
+      {
+        prose: "The Plan Author writes the Plans. The parent revises them.",
+        reject: true,
+      },
+      {
+        prose:
+          "The parent updates the document reviewer with adjudicated findings.",
+        reject: false,
+      },
+      {
+        prose:
+          "The parent updates the document producer with adjudicated findings.",
+        reject: false,
+      },
+      {
+        prose:
+          "The document reviewers discuss the Plan. The parent updates them with findings.",
+        reject: false,
+      },
+      {
+        prose: "The parent updates the documents with review findings.",
+        reject: true,
+      },
+    ])
+  })
+
+  it("round-11 applies explicit active-completion order", () => {
+    assertSkillClassifications([
+      {
+        prose: "After the active Task completes, switch the Task Agent.",
+        reject: false,
+      },
+      {
+        prose: "Switch the Task Agent after the running Task completes.",
+        reject: false,
+      },
+      {
+        prose: "While the active Task runs, switch the Task Agent.",
+        reject: true,
+      },
+      {
+        prose: "Switch the Task Agent before the running Task completes.",
+        reject: true,
+      },
+    ])
+  })
+
+  it("round-11 recognizes exhaustive high-review assertions", () => {
+    assertSkillClassifications([
+      {
+        prose: "High Tasks are reviewed by Codex alone.",
+        reject: true,
+      },
+      {
+        prose: "High Tasks are reviewed only by Codex.",
+        reject: true,
+      },
+      {
+        prose: "High Tasks are reviewed by Codex and the Task Agent alone.",
+        reject: false,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by the primary Codex reviewer and the auxiliary Task Agent reviewer.",
+        reject: false,
+      },
+    ])
+  })
+
+  it("round-11 distinguishes plain Codex Agent from Codex Task Agent", () => {
+    assertSkillClassifications([
+      {
+        prose: "High Tasks are implemented by the Codex Agent.",
+        reject: false,
+      },
+      {
+        prose: "High Tasks are implemented by the Codex agent.",
+        reject: false,
+      },
+      {
+        prose: "Normal Tasks are reviewed by the Codex Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by the primary Codex Agent and the auxiliary Grok Agent.",
+        reject: false,
+      },
+      {
+        prose: "High Tasks are implemented by the Codex Task Agent.",
+        reject: true,
+      },
+      {
+        prose: "Normal Tasks are reviewed by the Codex Task Agent.",
+        reject: true,
+      },
+      {
+        prose: "Normal Tasks are implemented by the Codex Task Agent.",
+        reject: false,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by the primary Codex Agent and the auxiliary Codex Task Agent reviewer.",
+        reject: false,
+      },
+    ])
+  })
+
+  it("round-11 binds take-over replacements without treating take as replacement", () => {
+    assertSkillClassifications([
+      {
+        prose: "The primary Codex reviewer takes notes.",
+        reject: false,
+      },
+      {
+        prose:
+          "The Codex reviewer is mandatory. It takes notes for the Plan Author.",
+        reject: false,
+      },
+      {
+        prose: "The required Codex reviewer takes notes.",
+        reject: false,
+      },
+      {
+        prose:
+          "Optional Design reviewers take over for the required Codex reviewer.",
+        reject: true,
+      },
+      {
+        prose:
+          "Optional Design reviewers take the place of the required Codex reviewer.",
+        reject: true,
+      },
+      {
+        prose:
+          "Optional Design reviewers must not take over for the required Codex reviewer.",
+        reject: false,
+      },
+    ])
+  })
+
+  it("round-11 binds another to the reviewer it qualifies", () => {
+    assertSkillClassifications([
+      {
+        prose:
+          "High Tasks are reviewed by the primary Codex reviewer and another auxiliary Task Agent reviewer.",
+        reject: false,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by the primary Codex reviewer and yet another auxiliary Task Agent reviewer.",
+        reject: false,
+      },
+      { prose: "High Tasks have another reviewer.", reject: true },
+      {
+        prose:
+          "High Tasks are reviewed by the primary Codex reviewer, the auxiliary Task Agent reviewer, and another reviewer.",
+        reject: true,
+      },
+    ])
+  })
+
+  it("round-11 binds postposed absence to its missing subject", () => {
+    assertSkillClassifications([
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent when evidence is missing.",
+        reject: false,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent when evidence is absent.",
+        reject: false,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the Task Agent is missing.",
+        reject: true,
+      },
+      {
+        prose:
+          "High Tasks are reviewed by Codex and the auxiliary review is missing.",
+        reject: true,
+      },
+    ])
   })
 
   it("contains the complete operational policy and document JSON shapes", () => {
