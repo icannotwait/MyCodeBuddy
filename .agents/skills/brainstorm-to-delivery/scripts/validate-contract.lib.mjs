@@ -431,6 +431,18 @@ const REVIEW_BYPASS_ACTIONS = new Set([
   "substitutes",
   "substituting",
 ])
+const REVIEW_PREDICATE_LINKS = new Set([
+  "am",
+  "are",
+  "be",
+  "been",
+  "being",
+  "is",
+  "remain",
+  "remains",
+  "was",
+  "were",
+])
 const FORBIDDEN_PROGRESS_FIELDS = new Set([
   "workflow_id",
   "workflow_kind",
@@ -1203,9 +1215,27 @@ function conflictsWithActiveTaskSwitch(clause) {
   return clause.tasks.some((task) => taskHasActivity(clause, task))
 }
 
-function nearestReviewTarget(clause, bypass) {
-  const after = clause.reviewers.find((reviewer) => reviewer.index > bypass)
+function reviewTargetForBypass(clause, bypass) {
+  const segment = actionSegment(clause, bypass)
+  const reviewers = clause.reviewers.filter(
+    (reviewer) =>
+      reviewer.index >= segment.start && reviewer.index < segment.end
+  )
+  const before = reviewers.filter((reviewer) => reviewer.index < bypass).at(-1)
+  const after = reviewers.find((reviewer) => reviewer.index > bypass)
+  if (
+    before &&
+    tokenIndex(
+      clause.tokens,
+      REVIEW_PREDICATE_LINKS,
+      before.index + 1,
+      bypass
+    ) >= 0
+  ) {
+    return before
+  }
   if (after) return after
+  if (before) return before
   return clause.reviewers.filter((reviewer) => reviewer.index < bypass).at(-1)
 }
 
@@ -1220,7 +1250,7 @@ function reviewBypassIsNegated(clause, bypass) {
 function conflictsWithRequiredReview(clause) {
   return tokenIndexes(clause.tokens, REVIEW_BYPASS_ACTIONS).some((bypass) => {
     if (reviewBypassIsNegated(clause, bypass)) return false
-    const target = nearestReviewTarget(clause, bypass)
+    const target = reviewTargetForBypass(clause, bypass)
     return Boolean(
       target &&
       (target.primary || target.auxiliary || target.codex) &&

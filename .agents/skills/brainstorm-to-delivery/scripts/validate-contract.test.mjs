@@ -606,6 +606,36 @@ describe("Skill contract v2", () => {
     })
   }
 
+  for (const [name, prose] of [
+    [
+      "optional user-named reviewers with irreplaceable Codex reviewer",
+      "User-named Design reviewers are optional and do not replace the Codex reviewer.",
+    ],
+    [
+      "optional user-named reviewers with required Codex reviewer",
+      "User-named Design reviewers are optional and the Codex reviewer is required.",
+    ],
+  ]) {
+    it(`round-3 reviewer attachment accepts ${name}`, () => {
+      assert.deepEqual(validateSkillMarkdown(`${skill}\n${prose}`).failures, [])
+    })
+  }
+
+  for (const [name, prose] of [
+    [
+      "optional Codex reviewer with irreplaceable user-named reviewers",
+      "The Codex reviewer is optional and user-named Design reviewers cannot replace it.",
+    ],
+    [
+      "optional primary Codex reviewer with optional user-named reviewers",
+      "The primary Codex reviewer is optional and user-named Design reviewers remain optional.",
+    ],
+  ]) {
+    it(`round-3 reviewer attachment rejects ${name}`, () => {
+      has(validateSkillMarkdown(`${skill}\n${prose}`).failures, "B2D-SKILL-005")
+    })
+  }
+
   it("contains the complete operational policy and document JSON shapes", () => {
     const policy = fencedJsonAfterHeading(
       realSkill,
