@@ -5052,9 +5052,6 @@ impl ConnectionManager {
             )
         };
         let _prompt_guard = prompt_lock.lock_owned().await;
-        let cancel_permit = control_tx.reserve().await.map_err(|_| {
-            SharedControlAdmissionError::DefinitelyNotAdmitted(AcpError::ProcessExited)
-        })?;
         let conversation_id = state_arc.read().await.conversation_id;
         let cleanup_error = match (
             conversation_id,
@@ -5067,6 +5064,9 @@ impl ConnectionManager {
                 .err(),
             _ => None,
         };
+        let cancel_permit = control_tx.reserve().await.map_err(|_| {
+            SharedControlAdmissionError::DefinitelyNotAdmitted(AcpError::ProcessExited)
+        })?;
         if let Some(claim) = shared_claim {
             self.shared_session_broker
                 .validate_stop_claim(claim)
@@ -5075,8 +5075,9 @@ impl ConnectionManager {
                     SharedControlAdmissionError::DefinitelyNotAdmitted(AcpError::Shared(error))
                 })?;
         }
-        // The reserved permit makes admission synchronous after the final
-        // exact-turn validation, leaving no await where the claim can go stale.
+        // Reserve only after cleanup so receiver closure during that await is a
+        // definite failure. Final exact-turn validation then immediately
+        // precedes the synchronous admission, with no await in between.
         cancel_permit.send(ConnectionControl::Cancel);
 
         // Eagerly flip the row to `Cancelled` so the sidebar/tabs leave the
@@ -20535,6 +20536,98 @@ mod tests {
         (cmd_rx, control_rx, coordinator)
     }
 
+    async fn install_shared_cleanup_turn(
+        manager: &Arc<ConnectionManager>,
+        conversation_id: i32,
+        folder_id: i32,
+        turn_id: &str,
+    ) -> (SharedSessionAttachment, SharedMutationGuard) {
+        let broker = manager.shared_session_broker();
+        let attachment = broker
+            .reserve_or_attach(shared_control_reserve_request(
+                "cleanup-parent",
+                conversation_id,
+            ))
+            .await
+            .unwrap()
+            .attachment;
+        let (state, emitter) = manager
+            .get_state_and_emitter("cleanup-parent")
+            .await
+            .unwrap();
+        broker
+            .install_registered(
+                "cleanup-parent",
+                attachment.generation,
+                "shared-cleanup-driver".into(),
+                state,
+                emitter,
+                Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            )
+            .await
+            .unwrap();
+        broker
+            .mark_ready(
+                "cleanup-parent",
+                attachment.generation,
+                "shared-cleanup-driver",
+            )
+            .await
+            .unwrap();
+        let guard = SharedMutationGuard {
+            connection_id: "cleanup-parent".into(),
+            generation: attachment.generation,
+            lease_id: attachment.lease_id.clone(),
+        };
+        let admission = broker
+            .enqueue_prompt(SharedPromptRequest {
+                guard: guard.clone(),
+                client_instance_id: "shared-control-client".into(),
+                client_request_id: format!("shared-stop-prompt-{turn_id}"),
+                blocks: vec![PromptInputBlock::Text {
+                    text: "shared stop".into(),
+                }],
+                folder_id: Some(folder_id),
+                conversation_id: Some(conversation_id),
+                client_message_id: format!("shared-stop-message-{turn_id}"),
+                capture: None,
+                submitted_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+        broker
+            .mark_prompt_admission_published(
+                "cleanup-parent",
+                attachment.generation,
+                &admission.queue_item_id,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            broker
+                .claim_dispatchable_head(
+                    "cleanup-parent",
+                    attachment.generation,
+                    turn_id,
+                    &SharedRuntimeWorkSnapshot {
+                        status: ConnectionStatus::Connected,
+                        turn_in_flight: false,
+                        pending_permission_id: None,
+                        pending_question_id: None,
+                        pending_plan_approval_id: None,
+                        continuation_wait: false,
+                        active_delegations: 0,
+                        background_outstanding: 0,
+                        conversation_write_error: None,
+                    },
+                )
+                .await
+                .unwrap(),
+            DispatchHeadDecision::Claimed(_)
+        ));
+        (attachment, guard)
+    }
+
     #[tokio::test]
     async fn continuation_cleanup_stop_holds_prompt_lock_until_durable_cleanup_finishes() {
         use crate::acp::delegation::continuation::store::ContinuationStore;
@@ -20625,86 +20718,9 @@ mod tests {
         let manager = Arc::new(ConnectionManager::new());
         let (_cmd_rx, mut control_rx, _coordinator) =
             install_cleanup_connection(&manager, store).await;
+        let (attachment, guard) =
+            install_shared_cleanup_turn(&manager, 1, folder_id, "shared-cleanup-turn").await;
         let broker = manager.shared_session_broker();
-        let attachment = broker
-            .reserve_or_attach(shared_control_reserve_request("cleanup-parent", 1))
-            .await
-            .unwrap()
-            .attachment;
-        let (state, emitter) = manager
-            .get_state_and_emitter("cleanup-parent")
-            .await
-            .unwrap();
-        broker
-            .install_registered(
-                "cleanup-parent",
-                attachment.generation,
-                "shared-cleanup-driver".into(),
-                state,
-                emitter,
-                Arc::new(std::sync::atomic::AtomicU32::new(0)),
-            )
-            .await
-            .unwrap();
-        broker
-            .mark_ready(
-                "cleanup-parent",
-                attachment.generation,
-                "shared-cleanup-driver",
-            )
-            .await
-            .unwrap();
-        let guard = SharedMutationGuard {
-            connection_id: "cleanup-parent".into(),
-            generation: attachment.generation,
-            lease_id: attachment.lease_id.clone(),
-        };
-        let admission = broker
-            .enqueue_prompt(SharedPromptRequest {
-                guard: guard.clone(),
-                client_instance_id: "shared-control-client".into(),
-                client_request_id: "shared-stop-prompt".into(),
-                blocks: vec![PromptInputBlock::Text {
-                    text: "shared stop".into(),
-                }],
-                folder_id: Some(folder_id),
-                conversation_id: Some(1),
-                client_message_id: "shared-stop-message".into(),
-                capture: None,
-                submitted_at: chrono::Utc::now(),
-            })
-            .await
-            .unwrap();
-        broker
-            .mark_prompt_admission_published(
-                "cleanup-parent",
-                attachment.generation,
-                &admission.queue_item_id,
-            )
-            .await
-            .unwrap();
-        assert!(matches!(
-            broker
-                .claim_dispatchable_head(
-                    "cleanup-parent",
-                    attachment.generation,
-                    "shared-cleanup-turn",
-                    &SharedRuntimeWorkSnapshot {
-                        status: ConnectionStatus::Connected,
-                        turn_in_flight: false,
-                        pending_permission_id: None,
-                        pending_question_id: None,
-                        pending_plan_approval_id: None,
-                        continuation_wait: false,
-                        active_delegations: 0,
-                        background_outstanding: 0,
-                        conversation_write_error: None,
-                    },
-                )
-                .await
-                .unwrap(),
-            DispatchHeadDecision::Claimed(_)
-        ));
 
         let stop_db = db.conn.clone();
         let stop_manager = manager.clone();
@@ -20742,6 +20758,92 @@ mod tests {
             control_rx.try_recv(),
             Err(tokio::sync::mpsc::error::TryRecvError::Empty)
         ));
+    }
+
+    #[tokio::test]
+    async fn shared_stop_receiver_closes_during_cleanup_releases_claim_for_retry() {
+        let db = Arc::new(crate::db::test_helpers::fresh_in_memory_db().await);
+        let folder_id = crate::db::test_helpers::seed_folder(&db, "C:/shared-closed-stop").await;
+        crate::db::test_helpers::seed_conversation(&db, folder_id, AgentType::Codex).await;
+        let inner = Arc::new(
+            crate::acp::delegation::continuation::store::InMemoryContinuationStore::default(),
+        );
+        let (entered_tx, mut entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let store = Arc::new(CleanupGateStore {
+            inner,
+            gate: tokio::sync::Mutex::new(Some((entered_tx, release_rx))),
+            fail_active_load: false,
+        });
+        let manager = Arc::new(ConnectionManager::new());
+        let (_cmd_rx, control_rx, _coordinator) = install_cleanup_connection(&manager, store).await;
+        let (attachment, guard) =
+            install_shared_cleanup_turn(&manager, 1, folder_id, "shared-closed-turn").await;
+        let broker = manager.shared_session_broker();
+
+        let stop_db = db.conn.clone();
+        let stop_manager = manager.clone();
+        let stop_guard = guard.clone();
+        let mut stop = tokio::spawn(async move {
+            stop_manager
+                .stop_shared_turn(
+                    &stop_db,
+                    SharedStopRequest {
+                        guard: stop_guard,
+                        turn_id: "shared-closed-turn".into(),
+                    },
+                )
+                .await
+        });
+        tokio::select! {
+            entered = &mut entered_rx => entered.expect("stop entered continuation cleanup"),
+            result = &mut stop => panic!("stop completed before cleanup gate: {result:?}"),
+        }
+        drop(control_rx);
+        release_tx.send(()).unwrap();
+
+        assert!(matches!(stop.await.unwrap(), Err(AcpError::ProcessExited)));
+        let active = broker
+            .diagnostic_for_connection(&attachment.connection_id)
+            .await
+            .unwrap()
+            .active_turn
+            .unwrap();
+        assert_eq!(active.turn_id, "shared-closed-turn");
+        assert!(!active.stop_requested, "definite failure must reopen stop");
+
+        let (retry_tx, mut retry_rx, _) = connection_channel(4);
+        manager
+            .connections
+            .lock()
+            .await
+            .get_mut("cleanup-parent")
+            .unwrap()
+            .control_tx = retry_tx;
+        manager
+            .stop_shared_turn(
+                &db.conn,
+                SharedStopRequest {
+                    guard,
+                    turn_id: "shared-closed-turn".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(retry_rx.try_recv(), Ok(ConnectionControl::Cancel)));
+        assert!(matches!(
+            retry_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(
+            broker
+                .diagnostic_for_connection(&attachment.connection_id)
+                .await
+                .unwrap()
+                .active_turn
+                .unwrap()
+                .stop_requested
+        );
     }
 
     #[tokio::test]
