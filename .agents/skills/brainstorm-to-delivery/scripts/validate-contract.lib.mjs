@@ -311,6 +311,21 @@ const PRODUCTION_ACTIONS = new Set([
   "written",
   "wrote",
 ])
+const BARE_PRODUCTION_ACTIONS = new Set([
+  "author",
+  "change",
+  "create",
+  "edit",
+  "fix",
+  "implement",
+  "modify",
+  "own",
+  "patch",
+  "produce",
+  "revise",
+  "update",
+  "write",
+])
 const DIRECT_ROUTE_ACTIONS = new Set([
   "delegate",
   "delegated",
@@ -395,7 +410,9 @@ const NEGATION_TERMS = new Set([
   "without",
 ])
 const ACTOR_LINKS = new Set(["by", "to"])
-const CLAUSE_COORDINATORS = new Set(["and", "but"])
+const CLAUSE_COORDINATORS = new Set(["and", "but", "while", "yet"])
+const PREDICATE_COORDINATORS = new Set(["and", "but"])
+const TASK_RELATION_BOUNDARIES = new Set([...CLAUSE_COORDINATORS, "or"])
 const HIGH_TASK_SCOPES = new Set(["high", "high-risk"])
 const NORMAL_TASK_SCOPES = new Set(["normal"])
 const UNIVERSAL_TASK_SCOPES = new Set([
@@ -415,12 +432,21 @@ const TASK_COMPLETION_TERMS = new Set([
   "completed",
   "completes",
   "completion",
+  "done",
   "finish",
   "finished",
   "finishes",
 ])
 const ACTIVE_TIMING_MARKERS = new Set(["during", "inside", "while"])
-const BOUNDARY_TIMING_MARKERS = new Set(["after", "following", "once"])
+const BOUNDARY_TIMING_MARKERS = new Set([
+  "after",
+  "following",
+  "on",
+  "once",
+  "upon",
+  "when",
+])
+const PRE_COMPLETION_TIMING_MARKERS = new Set(["before", "prior"])
 const REVIEW_BYPASS_ACTIONS = new Set([
   "instead",
   "omit",
@@ -438,6 +464,10 @@ const REVIEW_BYPASS_ACTIONS = new Set([
   "skipped",
   "skips",
   "skipping",
+  "stand",
+  "standing",
+  "stands",
+  "stood",
   "substitute",
   "substituted",
   "substitutes",
@@ -449,6 +479,10 @@ const REVIEW_REPLACEMENT_ACTIONS = new Set([
   "replaced",
   "replaces",
   "replacing",
+  "stand",
+  "standing",
+  "stands",
+  "stood",
   "substitute",
   "substituted",
   "substitutes",
@@ -465,6 +499,7 @@ const REVIEW_SUBJECT_LINKS = new Set([
   "is",
   "remain",
   "remains",
+  "though",
   "was",
   "were",
 ])
@@ -789,13 +824,22 @@ function directiveWindows(prose) {
     /\b(?:design|final_review|plan|task)\|[^\s.,;:]+/gi,
     " "
   )
-  for (const clause of withoutKeys
+  for (const paragraph of withoutKeys
     .normalize("NFKC")
     .toLowerCase()
-    .split(/[.!?;]+|\n\s*\n+/)) {
-    const tokens = clause.match(/[a-z0-9]+(?:-[a-z0-9]+)*/g) ?? []
-    for (let start = 0; start < tokens.length; start += step) {
-      windows.push(tokens.slice(start, start + DIRECTIVE_WINDOW_TOKENS))
+    .split(/\n\s*\n+/)) {
+    let priorTokens = []
+    for (const source of paragraph.split(/[.!?;]+/)) {
+      const tokens = source.match(/[a-z0-9]+(?:-[a-z0-9]+)*/g) ?? []
+      for (let start = 0; start < tokens.length; start += step) {
+        windows.push({
+          tokens: tokens.slice(start, start + DIRECTIVE_WINDOW_TOKENS),
+          priorReviewers: directiveReviewers(priorTokens),
+        })
+      }
+      if (tokens.length > 0) {
+        priorTokens = tokens.slice(-DIRECTIVE_WINDOW_TOKENS)
+      }
     }
   }
   return windows
@@ -886,15 +930,22 @@ function directiveActions(tokens, actors) {
   return actions
 }
 
-function taskScope(tokens, taskIndex) {
+function taskScopes(tokens, taskIndex) {
   const start = Math.max(0, taskIndex - 3)
   const end = Math.min(tokens.length, taskIndex + 2)
-  if (tokenIndex(tokens, HIGH_TASK_SCOPES, start, end) >= 0) return "high"
-  if (tokenIndex(tokens, NORMAL_TASK_SCOPES, start, end) >= 0) return "normal"
-  if (tokenIndex(tokens, UNIVERSAL_TASK_SCOPES, start, end) >= 0) {
-    return "universal"
+  const scopes = new Set()
+  if (tokenIndex(tokens, HIGH_TASK_SCOPES, start, end) >= 0) scopes.add("high")
+  if (tokenIndex(tokens, NORMAL_TASK_SCOPES, start, end) >= 0) {
+    scopes.add("normal")
   }
-  return "unspecified"
+  if (
+    scopes.size === 0 &&
+    tokenIndex(tokens, UNIVERSAL_TASK_SCOPES, start, end) >= 0
+  ) {
+    scopes.add("universal")
+  }
+  if (scopes.size === 0) scopes.add("unspecified")
+  return scopes
 }
 
 function directiveTasks(tokens) {
@@ -906,7 +957,7 @@ function directiveTasks(tokens) {
     ) {
       continue
     }
-    tasks.push({ index, scope: taskScope(tokens, index) })
+    tasks.push({ index, scopes: taskScopes(tokens, index) })
   }
   return tasks
 }
@@ -931,7 +982,8 @@ function directiveReviewers(tokens) {
   return reviewers
 }
 
-function parseDirectiveClause(tokens) {
+function parseDirectiveClause(window) {
+  const { tokens, priorReviewers = [] } = window
   const actors = directiveActors(tokens)
   return {
     tokens,
@@ -939,6 +991,7 @@ function parseDirectiveClause(tokens) {
     actions: directiveActions(tokens, actors),
     tasks: directiveTasks(tokens),
     reviewers: directiveReviewers(tokens),
+    priorReviewers,
   }
 }
 
@@ -952,19 +1005,21 @@ function actionSegment(clause, actionIndex) {
   }
 }
 
-function actionsShareRelations(clause, left, right) {
+function actionsSharePredicateRelations(clause, left, right) {
   return (
-    tokenIndex(clause.tokens, new Set(["and"]), left.index + 1, right.index) >=
-      0 &&
-    tokenIndex(clause.tokens, new Set(["but"]), left.index + 1, right.index) <
-      0 &&
+    tokenIndex(
+      clause.tokens,
+      PREDICATE_COORDINATORS,
+      left.index + 1,
+      right.index
+    ) >= 0 &&
     !clause.actors.some(
       (actor) => actor.start > left.index && actor.end <= right.index
     )
   )
 }
 
-function coordinatedActionGroup(clause, action) {
+function relatedActionGroup(clause, action, sharesRelations) {
   const position = clause.actions.findIndex(
     (candidate) => candidate.index === action.index
   )
@@ -973,38 +1028,70 @@ function coordinatedActionGroup(clause, action) {
   let end = position
   while (
     start > 0 &&
-    actionsShareRelations(
-      clause,
-      clause.actions[start - 1],
-      clause.actions[start]
-    )
+    sharesRelations(clause, clause.actions[start - 1], clause.actions[start])
   ) {
     start -= 1
   }
   while (
     end + 1 < clause.actions.length &&
-    actionsShareRelations(clause, clause.actions[end], clause.actions[end + 1])
+    sharesRelations(clause, clause.actions[end], clause.actions[end + 1])
   ) {
     end += 1
   }
   return clause.actions.slice(start, end + 1)
 }
 
+function predicateActionGroup(clause, action) {
+  return relatedActionGroup(clause, action, actionsSharePredicateRelations)
+}
+
 function localTasksForAction(clause, action) {
-  const segment = actionSegment(clause, action.index)
-  return clause.tasks.filter(
-    (task) => task.index >= segment.start && task.index < segment.end
+  const position = clause.actions.findIndex(
+    (candidate) => candidate.index === action.index
   )
+  const previous = position > 0 ? clause.actions[position - 1] : null
+  const next =
+    position + 1 < clause.actions.length ? clause.actions[position + 1] : null
+  const before = tokenIndexes(
+    clause.tokens,
+    TASK_RELATION_BOUNDARIES,
+    previous?.index ?? 0,
+    action.index
+  )
+    .filter(
+      (boundary) =>
+        Boolean(previous && previous.index < boundary) ||
+        clause.actors.some(
+          (actor) => actor.start > boundary && actor.end <= action.index
+        )
+    )
+    .at(-1)
+  const after = next
+    ? tokenIndex(
+        clause.tokens,
+        TASK_RELATION_BOUNDARIES,
+        action.index + 1,
+        next.index
+      )
+    : -1
+  const tasks = clause.tasks.filter(
+    (task) =>
+      task.index >= (before ?? -1) + 1 &&
+      task.index < (after >= 0 ? after : clause.tokens.length)
+  )
+  const followingPrevious = previous
+    ? tasks.filter((task) => task.index > previous.index)
+    : []
+  return followingPrevious.length > 0 ? followingPrevious : tasks
 }
 
-function scopeForTasks(tasks) {
-  if (tasks.some((task) => task.scope === "high")) return "high"
-  if (tasks.some((task) => task.scope === "universal")) return "universal"
-  if (tasks.some((task) => task.scope === "normal")) return "normal"
-  return "unspecified"
+function scopesForTasks(tasks) {
+  const scopes = new Set(tasks.flatMap((task) => [...task.scopes]))
+  if (scopes.size === 0) scopes.add("unspecified")
+  return scopes
 }
 
-function actionTaskScope(clause, action) {
+function actionTaskScopes(clause, action) {
   const segment = actionSegment(clause, action.index)
   let tasks = localTasksForAction(clause, action)
   if (
@@ -1017,19 +1104,19 @@ function actionTaskScope(clause, action) {
     if (previous) tasks = [previous]
   }
   if (tasks.length === 0) {
-    tasks = coordinatedActionGroup(clause, action).flatMap((candidate) =>
+    tasks = predicateActionGroup(clause, action).flatMap((candidate) =>
       localTasksForAction(clause, candidate)
     )
   }
-  const scope = scopeForTasks(tasks)
-  if (scope !== "unspecified") return scope
+  const scopes = scopesForTasks(tasks)
+  if (!scopes.has("unspecified")) return scopes
   if (
     action.token === "implementer" &&
     tokenIndex(clause.tokens, UNIVERSAL_TASK_SCOPES) >= 0
   ) {
-    return "universal"
+    return new Set(["universal"])
   }
-  return "unspecified"
+  return scopes
 }
 
 function nearestActionBefore(clause, index) {
@@ -1061,12 +1148,36 @@ function directPassiveActorsForAction(clause, action) {
   return actors
 }
 
+function uniqueActors(actors) {
+  return actors.filter(
+    (actor, index) =>
+      actors.findIndex(
+        (candidate) =>
+          candidate.role === actor.role && candidate.start === actor.start
+      ) === index
+  )
+}
+
 function passiveActorsForAction(clause, action) {
   const direct = directPassiveActorsForAction(clause, action)
   if (direct.length > 0) return direct
-  return coordinatedActionGroup(clause, action)
-    .filter((candidate) => candidate.index !== action.index)
-    .flatMap((candidate) => directPassiveActorsForAction(clause, candidate))
+  if (actionIsNegated(clause.tokens, action.index)) return []
+  const group = predicateActionGroup(clause, action)
+  if (group.length === 1) return []
+  const last = group.at(-1)
+  const nextAction = clause.actions.find(
+    (candidate) => candidate.index > last.index
+  )
+  return uniqueActors(
+    tokenIndexes(
+      clause.tokens,
+      new Set(["by"]),
+      last.index + 1,
+      nextAction?.index ?? clause.tokens.length
+    )
+      .map((link) => actorAfterLink(clause, link))
+      .filter(Boolean)
+  )
 }
 
 function subjectActorsForAction(clause, action) {
@@ -1143,63 +1254,66 @@ function actionHasDocumentTarget(clause, action) {
   )
 }
 
-function linkedActorsForAction(clause, action, linkTokens = ACTOR_LINKS) {
-  return clause.actors.filter((actor) => {
-    const link = linkBeforeActor(clause, actor)
-    return (
-      link !== undefined &&
-      linkTokens.has(clause.tokens[link]) &&
-      nearestActionBefore(clause, link)?.index === action.index &&
-      !relationTargetIsNegated(clause, action, link)
-    )
-  })
-}
-
-function routeHasReviewPurpose(clause, action) {
+function routeReviewPurpose(clause, action) {
   const segment = actionSegment(clause, action.index)
-  return tokenIndexes(
-    clause.tokens,
-    new Set(["for"]),
-    action.index + 1,
-    segment.end
-  ).some((purpose) => {
-    const review = tokenIndex(
+  if (tokenIndex(clause.tokens, REVIEW_TERMS, segment.start, segment.end) < 0) {
+    return null
+  }
+  if (
+    tokenIndex(
       clause.tokens,
-      REVIEW_TERMS,
-      purpose + 1,
-      Math.min(segment.end, purpose + 4)
-    )
-    return (
-      review >= 0 &&
-      tokenIndex(clause.tokens, new Set(["primary"]), purpose + 1, review + 1) <
-        0
-    )
-  })
+      new Set(["primary"]),
+      segment.start,
+      segment.end
+    ) >= 0
+  ) {
+    return "primary"
+  }
+  if (
+    tokenIndex(
+      clause.tokens,
+      new Set(["auxiliary"]),
+      segment.start,
+      segment.end
+    ) >= 0
+  ) {
+    return "auxiliary"
+  }
+  return "review"
 }
 
 function routeTargetsForAction(clause, action) {
-  const targets = linkedActorsForAction(clause, action, new Set(["to"]))
+  const nextRoute = clause.actions.find(
+    (candidate) => candidate.kind === "route" && candidate.index > action.index
+  )
+  const end = nextRoute?.index ?? clause.tokens.length
+  const targets = tokenIndexes(
+    clause.tokens,
+    new Set(["to"]),
+    action.index + 1,
+    end
+  )
+    .filter((link) => !relationTargetIsNegated(clause, action, link))
+    .map((link) => actorAfterLink(clause, link))
+    .filter(Boolean)
   const reflexive = tokenIndexes(
     clause.tokens,
     REFLEXIVE_TARGETS,
     action.index + 1,
-    actionSegment(clause, action.index).end
+    end
   )
   if (reflexive.length > 0 && !actionIsNegated(clause.tokens, action.index)) {
     targets.push(...subjectActorsForAction(clause, action))
   }
-  return targets
+  return uniqueActors(targets)
 }
 
 function actionDelegatesToProducer(clause, parent, action) {
-  const firstAction = coordinatedActionGroup(clause, action)[0]
-  const subjects = subjectActorsForAction(clause, action)
   return clause.actors.some((producer) => {
     if (
       !["design_fixer", "plan_author"].includes(producer.role) ||
       producer.start <= parent.end ||
-      producer.end > firstAction.index ||
-      !subjects.some((subject) => subject.start === producer.start)
+      producer.end > action.index
     ) {
       return false
     }
@@ -1207,18 +1321,74 @@ function actionDelegatesToProducer(clause, parent, action) {
       clause.tokens,
       new Set(["to"]),
       producer.end,
-      firstAction.index
+      action.index + 1
     )
     if (infinitive < 0) return false
-    return (
+    if (
       tokenIndex(
         clause.tokens,
         PRODUCER_DELEGATION_ACTIONS,
         parent.end,
         producer.start
-      ) >= 0
+      ) < 0
+    ) {
+      return false
+    }
+
+    const delegatedActions = clause.actions.filter(
+      (candidate) =>
+        candidate.kind === "production" &&
+        candidate.index > infinitive &&
+        candidate.index <= action.index
     )
+    if (delegatedActions.length === 0) return false
+    if (delegatedActions[0].index === action.index) return true
+
+    return delegatedActions.slice(1).every((candidate, index) => {
+      const previous = delegatedActions[index]
+      return (
+        BARE_PRODUCTION_ACTIONS.has(candidate.token) &&
+        tokenIndex(
+          clause.tokens,
+          new Set(["and"]),
+          previous.index + 1,
+          candidate.index
+        ) >= 0 &&
+        tokenIndex(
+          clause.tokens,
+          new Set(["but", "then"]),
+          previous.index + 1,
+          candidate.index
+        ) < 0 &&
+        !clause.actors.some(
+          (actor) =>
+            actor.start > previous.index && actor.end <= candidate.index
+        )
+      )
+    })
   })
+}
+
+function repeatedProducerSubjectForAction(clause, action) {
+  const previous = clause.actions
+    .filter(
+      (candidate) =>
+        candidate.kind === "production" && candidate.index < action.index
+    )
+    .at(-1)
+  if (!previous) return null
+  return clause.actors.find(
+    (actor) =>
+      ["design_fixer", "plan_author"].includes(actor.role) &&
+      actor.start > previous.index &&
+      actor.end <= action.index &&
+      tokenIndex(
+        clause.tokens,
+        ACTOR_LINKS,
+        Math.max(previous.index + 1, actor.start - 2),
+        actor.start
+      ) < 0
+  )
 }
 
 function conflictsWithParentOwnership(clause) {
@@ -1253,6 +1423,7 @@ function conflictsWithParentOwnership(clause) {
         continue
       }
       if (actionDelegatesToProducer(clause, parent, action)) continue
+      if (repeatedProducerSubjectForAction(clause, action)) continue
       return true
     }
   }
@@ -1269,44 +1440,58 @@ function conflictsWithTaskAgentRoute(clause) {
     ) {
       continue
     }
-    const scope = actionTaskScope(clause, action)
+    const scopes = actionTaskScopes(clause, action)
     const subjects =
       passiveSubjects.length > 0
         ? passiveSubjects
         : subjectActorsForAction(clause, action)
     if (
       action.kind === "production" &&
-      ["high", "universal"].includes(scope) &&
+      ["high", "universal"].some((scope) => scopes.has(scope)) &&
       subjects.some((actor) => actor.role === "task_agent")
     ) {
       return true
     }
     if (
       action.kind === "production" &&
-      scope === "normal" &&
+      ["normal", "universal"].some((scope) => scopes.has(scope)) &&
       subjects.some((actor) => actor.role === "codex")
     ) {
       return true
     }
     if (
       action.kind === "review" &&
-      scope === "normal" &&
+      ["normal", "universal"].some((scope) => scopes.has(scope)) &&
       subjects.some((actor) => actor.role === "task_agent")
     ) {
       return true
     }
-    if (action.kind !== "route" || routeHasReviewPurpose(clause, action)) {
+    if (action.kind !== "route") {
       continue
     }
+    if (subjects.some((actor) => actor.role === "task_agent")) return true
+
     const targets = routeTargetsForAction(clause, action)
-    if (
-      ["high", "universal"].includes(scope) &&
-      targets.some((actor) => actor.role === "task_agent")
-    ) {
-      return true
-    }
-    if (scope === "normal" && targets.some((actor) => actor.role === "codex")) {
-      return true
+    const purpose = routeReviewPurpose(clause, action)
+    for (const target of targets) {
+      if (purpose) {
+        if (
+          (["normal", "universal"].some((scope) => scopes.has(scope)) &&
+            target.role === "task_agent") ||
+          (["high", "universal"].some((scope) => scopes.has(scope)) &&
+            ((purpose === "primary" && target.role === "task_agent") ||
+              (purpose === "auxiliary" && target.role === "codex")))
+        ) {
+          return true
+        }
+      } else if (
+        (["high", "universal"].some((scope) => scopes.has(scope)) &&
+          target.role === "task_agent") ||
+        (["normal", "universal"].some((scope) => scopes.has(scope)) &&
+          target.role === "codex")
+      ) {
+        return true
+      }
     }
   }
   return false
@@ -1359,46 +1544,65 @@ function taskHasNegatedActivity(clause, task) {
   )
 }
 
-function hasActiveTaskTiming(clause, change) {
-  return tokenIndexes(clause.tokens, ACTIVE_TIMING_MARKERS, change + 1).some(
-    (marker) =>
-      clause.tasks.some(
-        (task) =>
-          task.index > marker &&
-          task.index <= marker + 8 &&
-          taskHasAffirmativeActivity(clause, task)
-      )
+function hasActiveTaskTiming(clause) {
+  return tokenIndexes(clause.tokens, ACTIVE_TIMING_MARKERS).some((marker) =>
+    clause.tasks.some(
+      (task) =>
+        Math.abs(task.index - marker) <= 8 &&
+        taskHasAffirmativeActivity(clause, task)
+    )
   )
 }
 
-function hasNegatedTaskActivityTiming(clause, change) {
-  return tokenIndexes(clause.tokens, ACTIVE_TIMING_MARKERS, change + 1).some(
-    (marker) =>
-      clause.tasks.some(
-        (task) =>
-          task.index > marker &&
-          task.index <= marker + 8 &&
-          taskHasNegatedActivity(clause, task)
-      )
+function hasNegatedTaskActivityTiming(clause) {
+  return tokenIndexes(clause.tokens, ACTIVE_TIMING_MARKERS).some((marker) =>
+    clause.tasks.some(
+      (task) =>
+        Math.abs(task.index - marker) <= 8 &&
+        taskHasNegatedActivity(clause, task)
+    )
   )
 }
 
-function hasCompletedTaskTiming(clause, change) {
-  return tokenIndexes(clause.tokens, BOUNDARY_TIMING_MARKERS, change + 1).some(
+function hasCompletedTaskTiming(clause) {
+  return tokenIndexes(clause.tokens, BOUNDARY_TIMING_MARKERS).some((marker) => {
+    const completions = tokenIndexes(
+      clause.tokens,
+      TASK_COMPLETION_TERMS,
+      Math.max(0, marker - 10),
+      marker + 11
+    ).filter((completion) => !actionIsNegated(clause.tokens, completion))
+    return clause.tasks.some(
+      (task) =>
+        Math.abs(task.index - marker) <= 10 &&
+        completions.some((completion) => Math.abs(completion - task.index) <= 5)
+    )
+  })
+}
+
+function hasPreCompletionTaskTiming(clause, change) {
+  return tokenIndexes(clause.tokens, PRE_COMPLETION_TIMING_MARKERS).some(
     (marker) => {
       const completions = tokenIndexes(
         clause.tokens,
         TASK_COMPLETION_TERMS,
-        marker + 1,
-        marker + 10
+        Math.max(0, marker - 10),
+        marker + 11
       ).filter((completion) => !actionIsNegated(clause.tokens, completion))
-      return clause.tasks.some(
-        (task) =>
-          task.index > marker &&
-          task.index <= marker + 10 &&
+      if (
+        !clause.tasks.some((task) =>
           completions.some(
             (completion) => Math.abs(completion - task.index) <= 5
           )
+        )
+      ) {
+        return false
+      }
+      return (
+        change < marker ||
+        completions.some(
+          (completion) => marker < completion && completion < change
+        )
       )
     }
   )
@@ -1425,28 +1629,81 @@ function conflictsWithActiveTaskSwitch(clause) {
     tokenIndex(tokens, new Set(["agent", "agents"])) >= 0 ||
     phraseIndex(tokens, ["task", "agent"]) >= 0
   if (!hasAgent) return false
-  if (hasActiveTaskTiming(clause, change)) return true
+  if (hasActiveTaskTiming(clause)) return true
   if (
     clause.tasks.some(
       (task) =>
-        task.index > change &&
         taskHasAffirmativeActivity(clause, task) &&
         taskStateIndexes(clause, task, EXPLICIT_TASK_ACTIVITY_TERMS).length > 0
     )
   ) {
     return true
   }
-  if (hasCompletedTaskTiming(clause, change)) return false
-  if (
-    clause.tasks.some(
-      (task) => task.index > change && taskHasCompletedState(clause, task)
-    )
-  ) {
+  if (hasPreCompletionTaskTiming(clause, change)) return true
+  if (hasCompletedTaskTiming(clause)) return false
+  if (clause.tasks.some((task) => taskHasCompletedState(clause, task))) {
     return false
   }
-  if (hasNegatedTaskActivityTiming(clause, change)) return false
-  return clause.tasks.some(
-    (task) => task.index > change && taskHasAffirmativeActivity(clause, task)
+  if (hasNegatedTaskActivityTiming(clause)) return false
+  return clause.tasks.some((task) => taskHasAffirmativeActivity(clause, task))
+}
+
+function reviewerIsRequiredByContract(reviewer) {
+  return (
+    (reviewer.primary || reviewer.auxiliary || reviewer.codex) &&
+    !reviewer.optionalDocument
+  )
+}
+
+function reviewAntecedentBefore(clause, index) {
+  const current = clause.reviewers.filter(
+    (reviewer) =>
+      reviewer.index < index && reviewerIsRequiredByContract(reviewer)
+  )
+  if (current.length > 0) return current.at(-1)
+  const prior = clause.priorReviewers.filter(reviewerIsRequiredByContract)
+  return prior.at(-1) ?? null
+}
+
+function substitutionReviewTarget(clause, bypass) {
+  const token = clause.tokens[bypass]
+  let objectLink = -1
+  if (token === "instead") {
+    objectLink = tokenIndex(
+      clause.tokens,
+      new Set(["of"]),
+      bypass + 1,
+      bypass + 3
+    )
+  } else if (token === "place") {
+    const substitutionPrefix = tokenIndex(
+      clause.tokens,
+      new Set(["in", "take", "takes", "taking", "took"]),
+      Math.max(0, bypass - 3),
+      bypass
+    )
+    if (substitutionPrefix >= 0) {
+      objectLink = tokenIndex(
+        clause.tokens,
+        new Set(["of"]),
+        bypass + 1,
+        bypass + 3
+      )
+    }
+  } else if (REVIEW_REPLACEMENT_ACTIONS.has(token)) {
+    objectLink = tokenIndex(
+      clause.tokens,
+      new Set(["for"]),
+      bypass + 1,
+      bypass + 4
+    )
+  }
+  if (objectLink < 0) return null
+  return (
+    clause.reviewers.find(
+      (reviewer) =>
+        reviewer.index > objectLink && reviewer.index <= objectLink + 5
+    ) ?? null
   )
 }
 
@@ -1459,23 +1716,28 @@ function reviewTargetForBypass(clause, bypass) {
   const before = reviewers.filter((reviewer) => reviewer.index < bypass).at(-1)
   const after = reviewers.find((reviewer) => reviewer.index > bypass)
   const replacement = REVIEW_REPLACEMENT_ACTIONS.has(clause.tokens[bypass])
+  const substitution = substitutionReviewTarget(clause, bypass)
+  if (substitution) return substitution
   const pronounTarget =
     replacement &&
-    tokenIndex(
+    (tokenIndex(
       clause.tokens,
-      new Set(["it"]),
+      new Set(["it", "them"]),
       bypass + 1,
-      Math.min(segment.end, bypass + 4)
-    ) >= 0
+      Math.min(segment.end, bypass + 6)
+    ) >= 0 ||
+      phraseIndex(
+        clause.tokens,
+        ["that", "reviewer"],
+        bypass + 1,
+        Math.min(segment.end, bypass + 6)
+      ) >= 0)
   const passiveTarget =
     replacement &&
     tokenIndex(clause.tokens, new Set(["by"]), bypass + 1, segment.end) >= 0
   if (pronounTarget || passiveTarget) {
-    return (
-      clause.reviewers
-        .filter((reviewer) => reviewer.index < segment.start)
-        .at(-1) ?? before
-    )
+    const replacementSubject = before
+    return reviewAntecedentBefore(clause, replacementSubject?.index ?? bypass)
   }
   if (
     before &&
@@ -1486,7 +1748,7 @@ function reviewTargetForBypass(clause, bypass) {
   }
   if (after) return after
   if (before) return before
-  return clause.reviewers.filter((reviewer) => reviewer.index < bypass).at(-1)
+  return reviewAntecedentBefore(clause, bypass)
 }
 
 function reviewBypassIsNegated(clause, bypass) {
@@ -1515,9 +1777,7 @@ function conflictsWithRequiredReview(clause) {
   return tokenIndexes(clause.tokens, REVIEW_BYPASS_ACTIONS).some((bypass) => {
     if (
       clause.tokens[bypass] === "place" &&
-      !(
-        clause.tokens[bypass - 1] === "in" && clause.tokens[bypass + 1] === "of"
-      )
+      !substitutionReviewTarget(clause, bypass)
     ) {
       return false
     }
@@ -1532,8 +1792,8 @@ function conflictsWithRequiredReview(clause) {
 }
 
 function hasConflictingSkillDirective(prose) {
-  return directiveWindows(prose).some((tokens) => {
-    const clause = parseDirectiveClause(tokens)
+  return directiveWindows(prose).some((window) => {
+    const clause = parseDirectiveClause(window)
     return (
       conflictsWithParentOwnership(clause) ||
       conflictsWithTaskAgentRoute(clause) ||

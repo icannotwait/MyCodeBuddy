@@ -732,6 +732,162 @@ describe("Skill contract v2", () => {
     })
   }
 
+  for (const [name, prose] of [
+    [
+      "explicit repeated Plan Author subject",
+      "The parent delegates the Plan Author to write the Plan and the Plan Author updates the Plan.",
+    ],
+    [
+      "done Task boundary",
+      "Switch the Task Agent after the current Task is done.",
+    ],
+    [
+      "on-completion Task boundary",
+      "Switch the Task Agent on completion of the current Task.",
+    ],
+    [
+      "upon-completion Task boundary",
+      "Switch the Task Agent upon completion of the current Task.",
+    ],
+    [
+      "though-optional reviewer prohibition",
+      "User-named Design reviewers, though optional, cannot replace the Codex reviewer.",
+    ],
+  ]) {
+    it(`round-6 accepts ${name}`, () => {
+      assert.deepEqual(validateSkillMarkdown(`${skill}\n${prose}`).failures, [])
+    })
+  }
+
+  for (const [name, prose] of [
+    [
+      "finite parent revision after delegated infinitive",
+      "The parent asks the Plan Author to revise the Plan and revises it too.",
+    ],
+    [
+      "finite parent update after delegated infinitive",
+      "The parent directs the Plan Author to revise the Plan, then updates the Design.",
+    ],
+    [
+      "finite parent edit after and-then delegated infinitive",
+      "The parent tells the Plan Author to update the Plan and then edits the Design itself.",
+    ],
+    [
+      "finite parent edit after delegated Plan write",
+      "The parent delegates the Plan Author to write the Plan and then edits the Plan.",
+    ],
+    [
+      "Task Agent high implementation before contrast",
+      "The Task Agent implements but does not review high Tasks.",
+    ],
+    [
+      "Task Agent shared passive high implementation before contrast",
+      "High Tasks are implemented but not reviewed by the Task Agent.",
+    ],
+    [
+      "Codex mixed normal and high implementation",
+      "Codex implements normal and high Tasks.",
+    ],
+    [
+      "Task Agent mixed normal and high review",
+      "The Task Agent reviews normal and high Tasks.",
+    ],
+    [
+      "Task Agent primary-slot high review route",
+      "Route a high Task to Grok for review in the primary slot.",
+    ],
+    [
+      "Task Agent primary-reviewer high review route",
+      "Route a high Task to Grok for review as the primary reviewer.",
+    ],
+    [
+      "Task Agent orchestration of high Task",
+      "The Task Agent routes high Tasks to Codex.",
+    ],
+    [
+      "Codex high auxiliary-review route",
+      "Route high Tasks to Codex for auxiliary review.",
+    ],
+    [
+      "Task Agent normal auxiliary-review route",
+      "Route every normal Task auxiliary review to the Task Agent.",
+    ],
+    [
+      "Codex leading high auxiliary-review route",
+      "Route auxiliary review of high Tasks to Codex.",
+    ],
+    [
+      "preposed running Task switch",
+      "While the current Task is running, change the Task Agent.",
+    ],
+    [
+      "preposed active Task switch",
+      "During an active Task, switch the Task Agent.",
+    ],
+    [
+      "preposed current active Task switch",
+      "The current Task is active when you switch the Task Agent.",
+    ],
+    [
+      "switch before Task completion",
+      "Switch the Task Agent before the current Task completes.",
+    ],
+    [
+      "switch immediately before Task finish",
+      "Switch the Task Agent immediately before the current Task finishes.",
+    ],
+    [
+      "Codex reviewer replacement after yet",
+      "The Codex reviewer is required, yet user-named Design reviewers may replace it.",
+    ],
+    [
+      "plural Codex reviewer replacement",
+      "The primary Codex reviewers are required, but user-named Design reviewers may replace them.",
+    ],
+    [
+      "demonstrative Codex reviewer replacement",
+      "The Codex reviewer is required, but user-named Design reviewers may replace that reviewer.",
+    ],
+    [
+      "Codex reviewer replacement in the place of",
+      "Use optional user-named Design reviewers in the place of the Codex reviewer.",
+    ],
+    [
+      "Codex reviewer replacement after while",
+      "The Codex reviewer is required, while user-named Design reviewers may replace it.",
+    ],
+    [
+      "Codex reviewer replacement after semicolon",
+      "The Codex reviewer remains required; user-named Design reviewers may replace it.",
+    ],
+    [
+      "Codex reviewer used-instead-of replacement",
+      "Optional user-named Design reviewers are used instead of the Codex reviewer.",
+    ],
+  ]) {
+    it(`round-6 rejects ${name}`, () => {
+      has(validateSkillMarkdown(`${skill}\n${prose}`).failures, "B2D-SKILL-005")
+    })
+  }
+
+  it("nearby relation pressure accepts a coordinated auxiliary-review dispatch", () => {
+    assert.deepEqual(
+      validateSkillMarkdown(
+        `${skill}\nRoute high Tasks to Codex and delegate their auxiliary review to the Task Agent.`
+      ).failures,
+      []
+    )
+  })
+
+  it("nearby relation pressure rejects a parent edit after producer advice", () => {
+    has(
+      validateSkillMarkdown(
+        `${skill}\nThe parent revises the Plan, asks the Plan Author for advice, and then updates the Design.`
+      ).failures,
+      "B2D-SKILL-005"
+    )
+  })
+
   it("contains the complete operational policy and document JSON shapes", () => {
     const policy = fencedJsonAfterHeading(
       realSkill,
