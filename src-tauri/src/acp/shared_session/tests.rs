@@ -1,6 +1,15 @@
 mod tests {
     use super::*;
 
+    use crate::acp::{
+        error::AcpError,
+        manager::{ConnectionManager, SharedControlAdapter, SharedControlAdmissionError},
+        plan_approval::{PlanApprovalAnswer, PlanApprovalDecision},
+        question::QuestionAnswer,
+    };
+    use sea_orm::Database;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     fn request(
         key: SharedSessionKey,
         connection_id: &str,
@@ -445,10 +454,7 @@ mod tests {
             "request-b",
         );
         replacement_request.retry_failed_generation = Some(reservation.attachment.generation);
-        broker
-            .reserve_or_attach(replacement_request)
-            .await
-            .unwrap();
+        broker.reserve_or_attach(replacement_request).await.unwrap();
 
         assert!(matches!(
             broker
@@ -731,7 +737,10 @@ mod tests {
         let state = state.read().await;
         assert_eq!(state.status, crate::acp::types::ConnectionStatus::Connected);
         assert_eq!(
-            state.shared_session.as_ref().map(|projection| &projection.phase),
+            state
+                .shared_session
+                .as_ref()
+                .map(|projection| &projection.phase),
             Some(&SharedSessionPhase::Ready)
         );
     }
@@ -875,13 +884,15 @@ mod tests {
                 .await,
             Err(SharedSessionError::GenerationStale)
         ));
-        assert!(broker
-            .is_current_bootstrapping_driver(
-                &reservation.attachment.connection_id,
-                reservation.attachment.generation,
-                "driver-new",
-            )
-            .await);
+        assert!(
+            broker
+                .is_current_bootstrapping_driver(
+                    &reservation.attachment.connection_id,
+                    reservation.attachment.generation,
+                    "driver-new",
+                )
+                .await
+        );
     }
 
     #[tokio::test]
@@ -1515,7 +1526,11 @@ mod tests {
     }
 
     fn prompt_request(n: usize) -> SharedPromptRequest {
-        prompt_with_ids("prompt-client", &format!("prompt-{n}"), &format!("text-{n}"))
+        prompt_with_ids(
+            "prompt-client",
+            &format!("prompt-{n}"),
+            &format!("text-{n}"),
+        )
     }
 
     fn prompt_with_ids(client: &str, request_id: &str, text: &str) -> SharedPromptRequest {
@@ -1555,7 +1570,10 @@ mod tests {
             }
         }))
         .await;
-        let mut seqs: Vec<_> = results.into_iter().map(|result| result.enqueue_seq).collect();
+        let mut seqs: Vec<_> = results
+            .into_iter()
+            .map(|result| result.enqueue_seq)
+            .collect();
         seqs.sort_unstable();
         assert_eq!(seqs, (1..=64).collect::<Vec<_>>());
     }
@@ -1563,10 +1581,8 @@ mod tests {
     #[tokio::test]
     async fn identical_retry_returns_original_and_changed_payload_conflicts() {
         let fixture = ready_prompt_broker_fixture().await;
-        let first_request = with_fixture_guard(
-            &fixture,
-            prompt_with_ids("prompt-client", "retry", "alpha"),
-        );
+        let first_request =
+            with_fixture_guard(&fixture, prompt_with_ids("prompt-client", "retry", "alpha"));
         let first = fixture.enqueue(first_request.clone()).await.unwrap();
         let same = fixture.enqueue(first_request).await.unwrap();
         assert_eq!(first, same);
@@ -1588,7 +1604,11 @@ mod tests {
             &fixture,
             prompt_with_ids("prompt-client", "publish-retry", "alpha"),
         );
-        let first = fixture.broker.enqueue_prompt(request.clone()).await.unwrap();
+        let first = fixture
+            .broker
+            .enqueue_prompt(request.clone())
+            .await
+            .unwrap();
 
         assert!(matches!(
             fixture
@@ -1684,17 +1704,17 @@ mod tests {
                 .await,
             Err(SharedSessionError::PromptQueueFull)
         ));
-        assert_eq!(fixture.snapshot().await.queue[0].queue_item_id, first.queue_item_id);
+        assert_eq!(
+            fixture.snapshot().await.queue[0].queue_item_id,
+            first.queue_item_id
+        );
     }
 
     #[tokio::test]
     async fn prompt_ledger_capacity_keeps_existing_retry_available() {
-        let fixture = ready_prompt_broker_fixture_with_limits(
-            2,
-            MAX_WAITING_PROMPTS,
-            MAX_WAITING_BYTES,
-        )
-        .await;
+        let fixture =
+            ready_prompt_broker_fixture_with_limits(2, MAX_WAITING_PROMPTS, MAX_WAITING_BYTES)
+                .await;
         let first_request = with_fixture_guard(
             &fixture,
             prompt_with_ids("prompt-client", "retry-a", "alpha"),
@@ -1726,10 +1746,8 @@ mod tests {
             .enqueue(with_fixture_guard(&fixture, prompt_request(1)))
             .await
             .unwrap();
-        let (cancel, claim) = tokio::join!(
-            fixture.cancel(&item.queue_item_id),
-            fixture.claim_head()
-        );
+        let (cancel, claim) =
+            tokio::join!(fixture.cancel(&item.queue_item_id), fixture.claim_head());
         assert_ne!(cancel.is_ok(), claim.is_ok());
         assert!(matches!(
             fixture.item_state(&item.queue_item_id).await,
@@ -1921,7 +1939,10 @@ mod tests {
                     .unwrap(),
                 DispatchHeadDecision::Blocked
             ));
-            assert_eq!(fixture.snapshot().await.queue[0].queue_item_id, item.queue_item_id);
+            assert_eq!(
+                fixture.snapshot().await.queue[0].queue_item_id,
+                item.queue_item_id
+            );
         }
     }
 
@@ -2030,7 +2051,10 @@ mod tests {
             fixture.item_state(&first.queue_item_id).await,
             Some(InternalPromptState::Failed)
         );
-        assert_eq!(fixture.snapshot().await.queue[0].queue_item_id, second.queue_item_id);
+        assert_eq!(
+            fixture.snapshot().await.queue[0].queue_item_id,
+            second.queue_item_id
+        );
     }
 
     #[tokio::test]
@@ -2120,10 +2144,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn sender_lease_expiry_preserves_waiting_fifo() {
-        let fixture = ready_prompt_broker_fixture_from_broker(broker_with_ttl(
-            Duration::from_secs(90),
-        ))
-        .await;
+        let fixture =
+            ready_prompt_broker_fixture_from_broker(broker_with_ttl(Duration::from_secs(90))).await;
         let first = fixture
             .enqueue(with_fixture_guard(&fixture, prompt_request(1)))
             .await
@@ -2205,7 +2227,10 @@ mod tests {
                 .unwrap(),
             DispatchHeadDecision::Blocked
         ));
-        assert_eq!(fixture.snapshot().await.queue[0].queue_item_id, second.queue_item_id);
+        assert_eq!(
+            fixture.snapshot().await.queue[0].queue_item_id,
+            second.queue_item_id
+        );
 
         let settled = fixture
             .broker
@@ -2241,5 +2266,532 @@ mod tests {
                 .unwrap(),
             DispatchHeadDecision::Claimed(_)
         ));
+    }
+
+    #[derive(Default)]
+    struct FakeSharedControlAdapter {
+        cancel_calls: AtomicUsize,
+        permission_calls: AtomicUsize,
+        question_calls: AtomicUsize,
+        plan_approval_calls: AtomicUsize,
+        cancel_failures: Mutex<VecDeque<SharedControlAdmissionError>>,
+        interaction_failures: Mutex<VecDeque<SharedControlAdmissionError>>,
+    }
+
+    #[async_trait::async_trait]
+    impl SharedControlAdapter for FakeSharedControlAdapter {
+        async fn cancel(
+            &self,
+            _manager: &ConnectionManager,
+            _db: &sea_orm::DatabaseConnection,
+            _connection_id: &str,
+            _claim: &SharedStopClaim,
+        ) -> Result<(), SharedControlAdmissionError> {
+            self.cancel_calls.fetch_add(1, Ordering::SeqCst);
+            self.cancel_failures
+                .lock()
+                .await
+                .pop_front()
+                .map_or(Ok(()), Err)
+        }
+
+        async fn respond_permission(
+            &self,
+            _manager: &ConnectionManager,
+            _connection_id: &str,
+            _request_id: &str,
+            _option_id: &str,
+        ) -> Result<(), SharedControlAdmissionError> {
+            self.permission_calls.fetch_add(1, Ordering::SeqCst);
+            self.interaction_failures
+                .lock()
+                .await
+                .pop_front()
+                .map_or(Ok(()), Err)
+        }
+
+        async fn answer_question(
+            &self,
+            _manager: &ConnectionManager,
+            _connection_id: &str,
+            _question_id: &str,
+            _answer: QuestionAnswer,
+        ) -> Result<(), SharedControlAdmissionError> {
+            self.question_calls.fetch_add(1, Ordering::SeqCst);
+            self.interaction_failures
+                .lock()
+                .await
+                .pop_front()
+                .map_or(Ok(()), Err)
+        }
+
+        async fn answer_plan_approval(
+            &self,
+            _manager: &ConnectionManager,
+            _connection_id: &str,
+            _approval_id: &str,
+            _answer: PlanApprovalAnswer,
+        ) -> Result<(), SharedControlAdmissionError> {
+            self.plan_approval_calls.fetch_add(1, Ordering::SeqCst);
+            self.interaction_failures
+                .lock()
+                .await
+                .pop_front()
+                .map_or(Ok(()), Err)
+        }
+    }
+
+    struct SharedControlFixture {
+        manager: ConnectionManager,
+        adapter: Arc<FakeSharedControlAdapter>,
+        attachment: SharedSessionAttachment,
+        guard: SharedMutationGuard,
+        db: sea_orm::DatabaseConnection,
+        interaction_kind: Option<SharedInteractionKind>,
+    }
+
+    impl SharedControlFixture {
+        async fn claim(&self, interaction_id: &str) -> Result<(), AcpError> {
+            match self.interaction_kind.expect("fixture has an interaction") {
+                SharedInteractionKind::Permission => {
+                    self.manager
+                        .respond_shared_permission(SharedInteractionRequest {
+                            guard: self.guard.clone(),
+                            interaction_id: interaction_id.to_string(),
+                            answer: "allow".to_string(),
+                        })
+                        .await
+                }
+                SharedInteractionKind::Question => {
+                    self.manager
+                        .answer_shared_question(SharedInteractionRequest {
+                            guard: self.guard.clone(),
+                            interaction_id: interaction_id.to_string(),
+                            answer: QuestionAnswer::default(),
+                        })
+                        .await
+                }
+                SharedInteractionKind::PlanApproval => {
+                    self.manager
+                        .answer_shared_plan_approval(SharedInteractionRequest {
+                            guard: self.guard.clone(),
+                            interaction_id: interaction_id.to_string(),
+                            answer: PlanApprovalAnswer {
+                                decision: PlanApprovalDecision::Approve,
+                                feedback: None,
+                            },
+                        })
+                        .await
+                }
+            }
+        }
+
+        async fn stop(&self, turn_id: &str) -> Result<(), AcpError> {
+            self.manager
+                .stop_shared_turn(
+                    &self.db,
+                    SharedStopRequest {
+                        guard: self.guard.clone(),
+                        turn_id: turn_id.to_string(),
+                    },
+                )
+                .await
+        }
+
+        async fn active_turn(&self) -> Option<SharedActiveTurnProjection> {
+            self.manager
+                .shared_session_broker()
+                .diagnostic_for_connection(&self.attachment.connection_id)
+                .await
+                .and_then(|snapshot| snapshot.active_turn)
+        }
+
+        fn cancel_call_count(&self) -> usize {
+            self.adapter.cancel_calls.load(Ordering::SeqCst)
+        }
+
+        fn interaction_call_count(&self) -> usize {
+            match self.interaction_kind.expect("fixture has an interaction") {
+                SharedInteractionKind::Permission => {
+                    self.adapter.permission_calls.load(Ordering::SeqCst)
+                }
+                SharedInteractionKind::Question => {
+                    self.adapter.question_calls.load(Ordering::SeqCst)
+                }
+                SharedInteractionKind::PlanApproval => {
+                    self.adapter.plan_approval_calls.load(Ordering::SeqCst)
+                }
+            }
+        }
+
+        async fn fail_next_cancel_before_channel_send(&self) {
+            self.adapter.cancel_failures.lock().await.push_back(
+                SharedControlAdmissionError::DefinitelyNotAdmitted(AcpError::ProcessExited),
+            );
+        }
+
+        async fn fail_next_cancel_after_possible_admission(&self) {
+            self.adapter.cancel_failures.lock().await.push_back(
+                SharedControlAdmissionError::MayHaveBeenAdmitted(AcpError::ProcessExited),
+            );
+        }
+
+        async fn fail_next_interaction_before_admission(&self) {
+            self.adapter.interaction_failures.lock().await.push_back(
+                SharedControlAdmissionError::DefinitelyNotAdmitted(AcpError::ProcessExited),
+            );
+        }
+
+        async fn fail_next_interaction_after_possible_admission(&self) {
+            self.adapter.interaction_failures.lock().await.push_back(
+                SharedControlAdmissionError::MayHaveBeenAdmitted(AcpError::ProcessExited),
+            );
+        }
+    }
+
+    async fn ready_fixture_with_turn(turn_id: &str) -> SharedControlFixture {
+        let adapter = Arc::new(FakeSharedControlAdapter::default());
+        let manager = ConnectionManager::new_with_shared_control_adapter(adapter.clone());
+        let broker = manager.shared_session_broker();
+        let reservation = broker
+            .reserve_or_attach(request(
+                SharedSessionKey::Conversation(1701),
+                "control-connection",
+                "control-client",
+                "control-connect",
+            ))
+            .await
+            .unwrap();
+        let attachment = reservation.attachment;
+        manager
+            .install_test_shared_connection(&attachment, Some(1701))
+            .await
+            .unwrap();
+        broker
+            .mark_ready(
+                &attachment.connection_id,
+                attachment.generation,
+                "test-driver-1",
+            )
+            .await
+            .unwrap();
+        let guard = SharedMutationGuard {
+            connection_id: attachment.connection_id.clone(),
+            generation: attachment.generation,
+            lease_id: attachment.lease_id.clone(),
+        };
+        let admission = broker
+            .enqueue_prompt(SharedPromptRequest {
+                guard: guard.clone(),
+                client_instance_id: "control-client".into(),
+                client_request_id: "control-prompt".into(),
+                blocks: vec![crate::acp::types::PromptInputBlock::Text {
+                    text: "control prompt".into(),
+                }],
+                folder_id: Some(1),
+                conversation_id: Some(1701),
+                client_message_id: "control-message".into(),
+                capture: None,
+                submitted_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+        assert!(broker
+            .mark_prompt_admission_published(
+                &attachment.connection_id,
+                attachment.generation,
+                &admission.queue_item_id,
+            )
+            .await
+            .unwrap());
+        assert!(matches!(
+            broker
+                .claim_dispatchable_head(
+                    &attachment.connection_id,
+                    attachment.generation,
+                    turn_id,
+                    &dispatchable_runtime_snapshot(),
+                )
+                .await
+                .unwrap(),
+            DispatchHeadDecision::Claimed(_)
+        ));
+        SharedControlFixture {
+            manager,
+            adapter,
+            attachment,
+            guard,
+            db: Database::connect("sqlite::memory:").await.unwrap(),
+            interaction_kind: None,
+        }
+    }
+
+    async fn ready_fixture_with_interaction(
+        kind: SharedInteractionKind,
+        interaction_id: &str,
+    ) -> SharedControlFixture {
+        let mut fixture = ready_fixture_with_turn("interaction-turn").await;
+        fixture
+            .manager
+            .shared_session_broker()
+            .observe_interaction(
+                &fixture.attachment.connection_id,
+                fixture.attachment.generation,
+                "test-driver-1",
+                kind,
+                interaction_id,
+            )
+            .await
+            .unwrap();
+        fixture.interaction_kind = Some(kind);
+        fixture
+    }
+
+    fn is_interaction_loser(result: &Result<(), AcpError>) -> bool {
+        matches!(
+            result,
+            Err(AcpError::Shared(
+                SharedSessionError::InteractionAlreadyResolved
+            ))
+        )
+    }
+
+    async fn assert_two_answers_have_one_winner(kind: SharedInteractionKind, id: &str) {
+        let fixture = ready_fixture_with_interaction(kind, id).await;
+        let (a, b) = tokio::join!(fixture.claim(id), fixture.claim(id));
+        assert_eq!(
+            [a.is_ok(), b.is_ok()]
+                .into_iter()
+                .filter(|won| *won)
+                .count(),
+            1
+        );
+        assert!(is_interaction_loser(&a) || is_interaction_loser(&b));
+        assert_eq!(fixture.interaction_call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn two_permission_answers_have_one_winner() {
+        assert_two_answers_have_one_winner(SharedInteractionKind::Permission, "perm-1").await;
+    }
+
+    #[tokio::test]
+    async fn two_question_answers_have_one_winner() {
+        assert_two_answers_have_one_winner(SharedInteractionKind::Question, "question-1").await;
+    }
+
+    #[tokio::test]
+    async fn two_plan_approval_answers_have_one_winner() {
+        assert_two_answers_have_one_winner(SharedInteractionKind::PlanApproval, "plan-approval-1")
+            .await;
+    }
+
+    #[tokio::test]
+    async fn duplicate_interaction_observation_cannot_reopen_a_resolving_claim() {
+        let fixture = ready_fixture_with_interaction(
+            SharedInteractionKind::Permission,
+            "permission-duplicate",
+        )
+        .await;
+        let broker = fixture.manager.shared_session_broker();
+        let claim = broker
+            .claim_interaction(
+                &fixture.guard,
+                SharedInteractionKind::Permission,
+                "permission-duplicate",
+            )
+            .await
+            .unwrap();
+        broker
+            .observe_interaction(
+                &fixture.attachment.connection_id,
+                fixture.attachment.generation,
+                "test-driver-1",
+                SharedInteractionKind::Permission,
+                "permission-duplicate",
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            broker
+                .claim_interaction(
+                    &fixture.guard,
+                    SharedInteractionKind::Permission,
+                    "permission-duplicate",
+                )
+                .await,
+            Err(SharedSessionError::InteractionAlreadyResolved)
+        ));
+        broker.complete_interaction(&claim).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_turn_never_cancels_newer_turn_and_exact_stop_is_idempotent() {
+        let fixture = ready_fixture_with_turn("turn-new").await;
+        assert!(matches!(
+            fixture.stop("turn-old").await,
+            Err(AcpError::Shared(SharedSessionError::StaleTurn))
+        ));
+        let (a, b) = tokio::join!(fixture.stop("turn-new"), fixture.stop("turn-new"));
+        assert!(a.is_ok() && b.is_ok());
+        assert_eq!(fixture.cancel_call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn stop_claim_is_revalidated_immediately_before_cancel_admission() {
+        let fixture = ready_fixture_with_turn("turn-old").await;
+        let request = SharedStopRequest {
+            guard: fixture.guard.clone(),
+            turn_id: "turn-old".into(),
+        };
+        let SharedStopClaimDecision::Claimed(claim) = fixture
+            .manager
+            .shared_session_broker()
+            .claim_stop_request(&request)
+            .await
+            .unwrap()
+        else {
+            panic!("first exact stop must own the admission claim");
+        };
+        fixture
+            .manager
+            .shared_session_broker()
+            .settle_active_turn(
+                &fixture.attachment.connection_id,
+                fixture.attachment.generation,
+                "test-driver-1",
+                "end_turn",
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            fixture
+                .manager
+                .shared_session_broker()
+                .validate_stop_claim(&claim)
+                .await,
+            Err(SharedSessionError::StaleTurn)
+        ));
+    }
+
+    #[tokio::test]
+    async fn definite_cancel_admission_failure_releases_stop_claim_for_retry() {
+        let fixture = ready_fixture_with_turn("turn-new").await;
+        fixture.fail_next_cancel_before_channel_send().await;
+        assert!(fixture.stop("turn-new").await.is_err());
+        assert!(!fixture.active_turn().await.unwrap().stop_requested);
+        fixture.stop("turn-new").await.unwrap();
+        assert_eq!(fixture.cancel_call_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn ambiguous_cancel_failure_keeps_stop_quarantined_without_retry() {
+        let fixture = ready_fixture_with_turn("turn-new").await;
+        fixture.fail_next_cancel_after_possible_admission().await;
+        assert!(fixture.stop("turn-new").await.is_err());
+        assert!(fixture.active_turn().await.unwrap().stop_requested);
+        fixture.stop("turn-new").await.unwrap();
+        assert_eq!(fixture.cancel_call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn definite_interaction_admission_failure_releases_claim_for_retry() {
+        let fixture =
+            ready_fixture_with_interaction(SharedInteractionKind::Permission, "permission-retry")
+                .await;
+        fixture.fail_next_interaction_before_admission().await;
+        assert!(fixture.claim("permission-retry").await.is_err());
+        fixture.claim("permission-retry").await.unwrap();
+        assert_eq!(fixture.interaction_call_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn ambiguous_interaction_failure_keeps_claim_resolved() {
+        let fixture = ready_fixture_with_interaction(
+            SharedInteractionKind::Permission,
+            "permission-ambiguous",
+        )
+        .await;
+        fixture
+            .fail_next_interaction_after_possible_admission()
+            .await;
+        assert!(fixture.claim("permission-ambiguous").await.is_err());
+        assert!(is_interaction_loser(
+            &fixture.claim("permission-ambiguous").await
+        ));
+        assert_eq!(fixture.interaction_call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn stopped_turn_interaction_cannot_claim_the_next_turn_interaction() {
+        let fixture =
+            ready_fixture_with_interaction(SharedInteractionKind::Permission, "permission-old")
+                .await;
+        fixture.stop("interaction-turn").await.unwrap();
+        fixture
+            .manager
+            .shared_session_broker()
+            .settle_active_turn(
+                &fixture.attachment.connection_id,
+                fixture.attachment.generation,
+                "test-driver-1",
+                "cancelled",
+            )
+            .await
+            .unwrap();
+
+        let broker = fixture.manager.shared_session_broker();
+        let admission = broker
+            .enqueue_prompt(SharedPromptRequest {
+                guard: fixture.guard.clone(),
+                client_instance_id: "control-client".into(),
+                client_request_id: "next-prompt".into(),
+                blocks: vec![crate::acp::types::PromptInputBlock::Text {
+                    text: "next prompt".into(),
+                }],
+                folder_id: Some(1),
+                conversation_id: Some(1701),
+                client_message_id: "next-message".into(),
+                capture: None,
+                submitted_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+        broker
+            .mark_prompt_admission_published(
+                &fixture.attachment.connection_id,
+                fixture.attachment.generation,
+                &admission.queue_item_id,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            broker
+                .claim_dispatchable_head(
+                    &fixture.attachment.connection_id,
+                    fixture.attachment.generation,
+                    "next-turn",
+                    &dispatchable_runtime_snapshot(),
+                )
+                .await
+                .unwrap(),
+            DispatchHeadDecision::Claimed(_)
+        ));
+        broker
+            .observe_interaction(
+                &fixture.attachment.connection_id,
+                fixture.attachment.generation,
+                "test-driver-1",
+                SharedInteractionKind::Permission,
+                "permission-next",
+            )
+            .await
+            .unwrap();
+
+        assert!(is_interaction_loser(&fixture.claim("permission-old").await));
+        fixture.claim("permission-next").await.unwrap();
+        assert_eq!(fixture.interaction_call_count(), 1);
     }
 }

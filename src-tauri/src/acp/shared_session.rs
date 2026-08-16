@@ -39,6 +39,44 @@ pub(crate) struct SharedPromptMutation {
     pub notify: Arc<Notify>,
 }
 
+pub struct SharedStopRequest {
+    pub guard: SharedMutationGuard,
+    pub turn_id: String,
+}
+
+pub struct SharedInteractionRequest<T> {
+    pub guard: SharedMutationGuard,
+    pub interaction_id: String,
+    pub answer: T,
+}
+
+#[derive(Clone)]
+pub(crate) struct SharedInteractionClaim {
+    connection_id: String,
+    generation: u64,
+    kind: SharedInteractionKind,
+    interaction_id: String,
+}
+
+#[derive(Clone)]
+pub(crate) struct SharedStopClaim {
+    connection_id: String,
+    generation: u64,
+    turn_id: String,
+}
+
+pub(crate) enum SharedStopClaimDecision {
+    Claimed(SharedStopClaim),
+    Resolving(watch::Receiver<Option<StopAdmissionResolution>>),
+    Requested,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StopAdmissionResolution {
+    DefinitelyNotAdmitted,
+    Requested,
+}
+
 pub(crate) enum DispatchHeadDecision {
     Blocked,
     Failed(FailedSharedPrompt),
@@ -386,7 +424,7 @@ impl SharedSessionBroker {
                 || snapshot.status != crate::acp::types::ConnectionStatus::Connected
                 || snapshot.turn_in_flight
                 || record.active_turn.is_some()
-                || record.pending_interaction.is_some()
+                || record.interactions.has_any()
                 || snapshot.pending_permission_id.is_some()
                 || snapshot.pending_question_id.is_some()
                 || snapshot.pending_plan_approval_id.is_some()
@@ -449,6 +487,7 @@ impl SharedSessionBroker {
             record.active_turn = Some(BrokerActiveTurn {
                 identity: queued.identity,
                 projection: projection.clone(),
+                stop_admission: StopAdmissionState::Open,
             });
             Ok(DispatchHeadDecision::Claimed(ClaimedSharedPrompt {
                 blocks: queued.blocks,
@@ -492,7 +531,12 @@ impl SharedSessionBroker {
                 .get_mut(&identity)
                 .expect("active turn has ledger entry")
                 .state = InternalPromptState::Failed;
-            record.active_turn = None;
+            let mut active = record
+                .active_turn
+                .take()
+                .expect("active turn remains present");
+            active.resolve_stop_waiters_as_requested();
+            record.interactions.clear();
             Ok(FailedSharedPrompt {
                 events: vec![
                     crate::acp::types::AcpEvent::PromptQueueItemFailed {
@@ -529,6 +573,9 @@ impl SharedSessionBroker {
             let Some(active) = record.active_turn.take() else {
                 return Ok(Vec::new());
             };
+            let mut active = active;
+            active.resolve_stop_waiters_as_requested();
+            record.interactions.clear();
             let outcome = if active.projection.stop_requested {
                 SharedTurnOutcome::Cancelled
             } else if stop_reason == "end_turn" {
@@ -593,10 +640,7 @@ impl SharedSessionBroker {
             {
                 return Err(SharedSessionError::GenerationStale);
             }
-            record.pending_interaction = Some(SharedInteraction {
-                kind,
-                id: interaction_id.to_string(),
-            });
+            record.interactions.set_pending(kind, interaction_id);
             record.notify.notify_one();
             Ok(Vec::new())
         })
@@ -617,18 +661,199 @@ impl SharedSessionBroker {
             {
                 return Err(SharedSessionError::GenerationStale);
             }
-            if record
-                .pending_interaction
-                .as_ref()
-                .is_some_and(|interaction| interaction.id == interaction_id)
-            {
-                record.pending_interaction = None;
-            }
+            record.interactions.resolve_matching(interaction_id);
             record.notify.notify_one();
             Ok(Vec::new())
         })
         .await?
         .ok_or(SharedSessionError::SessionUnavailable)
+    }
+
+    pub(crate) async fn claim_interaction(
+        &self,
+        guard: &SharedMutationGuard,
+        kind: SharedInteractionKind,
+        interaction_id: &str,
+    ) -> Result<SharedInteractionClaim, SharedSessionError> {
+        let result = self
+            .with_authoritative_record(&guard.connection_id, |record| {
+                self.validate_prompt_guard(record, guard)?;
+                let interaction = record
+                    .interactions
+                    .get_mut(kind)
+                    .as_mut()
+                    .filter(|interaction| interaction.id == interaction_id)
+                    .ok_or(SharedSessionError::InteractionAlreadyResolved)?;
+                if interaction.admission != InteractionAdmissionState::Pending {
+                    return Err(SharedSessionError::InteractionAlreadyResolved);
+                }
+                interaction.admission = InteractionAdmissionState::Resolving;
+                Ok(SharedInteractionClaim {
+                    connection_id: guard.connection_id.clone(),
+                    generation: guard.generation,
+                    kind,
+                    interaction_id: interaction_id.to_string(),
+                })
+            })
+            .await?;
+        self.require_authoritative_result(&guard.connection_id, guard.generation, result)
+            .await
+    }
+
+    pub(crate) async fn complete_interaction(
+        &self,
+        claim: &SharedInteractionClaim,
+    ) -> Result<(), SharedSessionError> {
+        let result = self
+            .with_authoritative_record(&claim.connection_id, |record| {
+                if record.generation != claim.generation {
+                    return Err(SharedSessionError::GenerationStale);
+                }
+                if let Some(interaction) = record.interactions.get_mut(claim.kind).as_mut() {
+                    if interaction.id == claim.interaction_id
+                        && interaction.admission == InteractionAdmissionState::Resolving
+                    {
+                        interaction.admission = InteractionAdmissionState::Resolved;
+                    }
+                }
+                Ok(())
+            })
+            .await?;
+        self.require_authoritative_result(&claim.connection_id, claim.generation, result)
+            .await
+    }
+
+    pub(crate) async fn release_interaction_claim(
+        &self,
+        claim: &SharedInteractionClaim,
+    ) -> Result<(), SharedSessionError> {
+        let result = self
+            .with_authoritative_record(&claim.connection_id, |record| {
+                if record.generation != claim.generation {
+                    return Err(SharedSessionError::GenerationStale);
+                }
+                if let Some(interaction) = record.interactions.get_mut(claim.kind).as_mut() {
+                    if interaction.id == claim.interaction_id
+                        && interaction.admission == InteractionAdmissionState::Resolving
+                    {
+                        interaction.admission = InteractionAdmissionState::Pending;
+                    }
+                }
+                Ok(())
+            })
+            .await?;
+        self.require_authoritative_result(&claim.connection_id, claim.generation, result)
+            .await
+    }
+
+    pub(crate) async fn claim_stop_request(
+        &self,
+        request: &SharedStopRequest,
+    ) -> Result<SharedStopClaimDecision, SharedSessionError> {
+        let result = self
+            .with_authoritative_record(&request.guard.connection_id, |record| {
+                self.validate_prompt_guard(record, &request.guard)?;
+                let active = record
+                    .active_turn
+                    .as_mut()
+                    .filter(|active| active.projection.turn_id == request.turn_id)
+                    .ok_or(SharedSessionError::StaleTurn)?;
+                match &active.stop_admission {
+                    StopAdmissionState::Open => {
+                        let (result_tx, _) = watch::channel(None);
+                        active.stop_admission = StopAdmissionState::Resolving { result_tx };
+                        active.projection.stop_requested = true;
+                        Ok(SharedStopClaimDecision::Claimed(SharedStopClaim {
+                            connection_id: request.guard.connection_id.clone(),
+                            generation: request.guard.generation,
+                            turn_id: request.turn_id.clone(),
+                        }))
+                    }
+                    StopAdmissionState::Resolving { result_tx } => {
+                        Ok(SharedStopClaimDecision::Resolving(result_tx.subscribe()))
+                    }
+                    StopAdmissionState::Requested => Ok(SharedStopClaimDecision::Requested),
+                }
+            })
+            .await?;
+        self.require_authoritative_result(
+            &request.guard.connection_id,
+            request.guard.generation,
+            result,
+        )
+        .await
+    }
+
+    pub(crate) async fn complete_stop_request(
+        &self,
+        claim: &SharedStopClaim,
+    ) -> Result<(), SharedSessionError> {
+        let result = self
+            .with_authoritative_record(&claim.connection_id, |record| {
+                if record.generation != claim.generation {
+                    return Err(SharedSessionError::GenerationStale);
+                }
+                let Some(active) = record
+                    .active_turn
+                    .as_mut()
+                    .filter(|active| active.projection.turn_id == claim.turn_id)
+                else {
+                    return Ok(());
+                };
+                active.complete_stop_request();
+                Ok(())
+            })
+            .await?;
+        self.require_authoritative_result(&claim.connection_id, claim.generation, result)
+            .await
+    }
+
+    pub(crate) async fn validate_stop_claim(
+        &self,
+        claim: &SharedStopClaim,
+    ) -> Result<(), SharedSessionError> {
+        let result = self
+            .with_authoritative_record(&claim.connection_id, |record| {
+                if record.generation != claim.generation {
+                    return Err(SharedSessionError::GenerationStale);
+                }
+                let active = record
+                    .active_turn
+                    .as_ref()
+                    .filter(|active| active.projection.turn_id == claim.turn_id)
+                    .ok_or(SharedSessionError::StaleTurn)?;
+                if !matches!(active.stop_admission, StopAdmissionState::Resolving { .. }) {
+                    return Err(SharedSessionError::StaleTurn);
+                }
+                Ok(())
+            })
+            .await?;
+        self.require_authoritative_result(&claim.connection_id, claim.generation, result)
+            .await
+    }
+
+    pub(crate) async fn release_stop_request(
+        &self,
+        claim: &SharedStopClaim,
+    ) -> Result<(), SharedSessionError> {
+        let result = self
+            .with_authoritative_record(&claim.connection_id, |record| {
+                if record.generation != claim.generation {
+                    return Err(SharedSessionError::GenerationStale);
+                }
+                let Some(active) = record
+                    .active_turn
+                    .as_mut()
+                    .filter(|active| active.projection.turn_id == claim.turn_id)
+                else {
+                    return Ok(());
+                };
+                active.release_stop_request();
+                Ok(())
+            })
+            .await?;
+        self.require_authoritative_result(&claim.connection_id, claim.generation, result)
+            .await
     }
 
     pub(crate) async fn reconcile_runtime_snapshot(
@@ -644,39 +869,18 @@ impl SharedSessionBroker {
             {
                 return Err(SharedSessionError::GenerationStale);
             }
-            let reconciled = snapshot
-                .pending_permission_id
-                .as_ref()
-                .map(|id| SharedInteraction {
-                    kind: SharedInteractionKind::Permission,
-                    id: id.clone(),
-                })
-                .or_else(|| {
-                    snapshot
-                        .pending_question_id
-                        .as_ref()
-                        .map(|id| SharedInteraction {
-                            kind: SharedInteractionKind::Question,
-                            id: id.clone(),
-                        })
-                })
-                .or_else(|| {
-                    snapshot
-                        .pending_plan_approval_id
-                        .as_ref()
-                        .map(|id| SharedInteraction {
-                            kind: SharedInteractionKind::PlanApproval,
-                            id: id.clone(),
-                        })
-                });
-            let unchanged = match (&record.pending_interaction, &reconciled) {
-                (Some(current), Some(next)) => current.kind == next.kind && current.id == next.id,
-                (None, None) => true,
-                _ => false,
-            };
-            if !unchanged {
-                record.pending_interaction = reconciled;
-            }
+            record.interactions.reconcile(
+                SharedInteractionKind::Permission,
+                snapshot.pending_permission_id.as_deref(),
+            );
+            record.interactions.reconcile(
+                SharedInteractionKind::Question,
+                snapshot.pending_question_id.as_deref(),
+            );
+            record.interactions.reconcile(
+                SharedInteractionKind::PlanApproval,
+                snapshot.pending_plan_approval_id.as_deref(),
+            );
             if matches!(
                 snapshot.status,
                 crate::acp::types::ConnectionStatus::Disconnected
@@ -1402,6 +1606,12 @@ impl SharedSessionBroker {
         }
     }
 
+    pub async fn is_managed_connection(&self, connection_id: &str) -> bool {
+        let index = self.index.lock().await;
+        index.by_connection.contains_key(connection_id)
+            || index.has_replaced_connection(connection_id)
+    }
+
     pub(crate) async fn install_registered(
         &self,
         connection_id: &str,
@@ -1856,6 +2066,27 @@ impl SharedSessionBroker {
         }
     }
 
+    async fn require_authoritative_result<T>(
+        &self,
+        connection_id: &str,
+        _generation: u64,
+        result: Option<T>,
+    ) -> Result<T, SharedSessionError> {
+        if let Some(result) = result {
+            return Ok(result);
+        }
+        if self
+            .index
+            .lock()
+            .await
+            .has_replaced_connection(connection_id)
+        {
+            Err(SharedSessionError::GenerationStale)
+        } else {
+            Err(SharedSessionError::SessionUnavailable)
+        }
+    }
+
     fn validate_prompt_guard(
         &self,
         record: &mut SharedSessionRecord,
@@ -2130,7 +2361,8 @@ fn fail_live_session_record(
 ) -> Vec<crate::acp::types::AcpEvent> {
     let generation = record.generation;
     let mut events = Vec::new();
-    if let Some(active) = record.active_turn.take() {
+    if let Some(mut active) = record.active_turn.take() {
+        active.resolve_stop_waiters_as_requested();
         record
             .prompt_ledger
             .get_mut(&active.identity)
@@ -2142,6 +2374,7 @@ fn fail_live_session_record(
             outcome: SharedTurnOutcome::Failed,
         });
     }
+    record.interactions.clear();
     while let Some(queued) = record.waiting_prompts.pop_front() {
         record
             .prompt_ledger
@@ -2178,7 +2411,8 @@ fn fail_all_prompt_work(
     error_code: &str,
 ) -> Vec<crate::acp::types::AcpEvent> {
     let mut events = Vec::new();
-    if let Some(active) = record.active_turn.take() {
+    if let Some(mut active) = record.active_turn.take() {
+        active.resolve_stop_waiters_as_requested();
         record
             .prompt_ledger
             .get_mut(&active.identity)
@@ -2190,6 +2424,7 @@ fn fail_all_prompt_work(
             outcome: SharedTurnOutcome::Failed,
         });
     }
+    record.interactions.clear();
     let had_waiting = !record.waiting_prompts.is_empty();
     while let Some(queued) = record.waiting_prompts.pop_front() {
         record
@@ -2314,11 +2549,138 @@ struct QueuedPromptRecord {
 struct BrokerActiveTurn {
     identity: PromptIdentity,
     projection: SharedActiveTurnProjection,
+    stop_admission: StopAdmissionState,
+}
+
+enum StopAdmissionState {
+    Open,
+    Resolving {
+        result_tx: watch::Sender<Option<StopAdmissionResolution>>,
+    },
+    Requested,
+}
+
+impl BrokerActiveTurn {
+    fn complete_stop_request(&mut self) {
+        let previous = std::mem::replace(&mut self.stop_admission, StopAdmissionState::Requested);
+        match previous {
+            StopAdmissionState::Resolving { result_tx } => {
+                result_tx.send_replace(Some(StopAdmissionResolution::Requested));
+            }
+            StopAdmissionState::Open | StopAdmissionState::Requested => {}
+        }
+        self.projection.stop_requested = true;
+    }
+
+    fn release_stop_request(&mut self) {
+        let previous = std::mem::replace(&mut self.stop_admission, StopAdmissionState::Open);
+        match previous {
+            StopAdmissionState::Resolving { result_tx } => {
+                self.projection.stop_requested = false;
+                result_tx.send_replace(Some(StopAdmissionResolution::DefinitelyNotAdmitted));
+            }
+            StopAdmissionState::Open => {
+                self.projection.stop_requested = false;
+            }
+            StopAdmissionState::Requested => {
+                self.stop_admission = StopAdmissionState::Requested;
+                self.projection.stop_requested = true;
+            }
+        }
+    }
+
+    fn resolve_stop_waiters_as_requested(&mut self) {
+        if matches!(self.stop_admission, StopAdmissionState::Resolving { .. }) {
+            self.complete_stop_request();
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InteractionAdmissionState {
+    Pending,
+    Resolving,
+    Resolved,
 }
 
 struct SharedInteraction {
-    kind: SharedInteractionKind,
     id: String,
+    admission: InteractionAdmissionState,
+}
+
+#[derive(Default)]
+struct SharedInteractions {
+    permission: Option<SharedInteraction>,
+    question: Option<SharedInteraction>,
+    plan_approval: Option<SharedInteraction>,
+}
+
+impl SharedInteractions {
+    fn get_mut(&mut self, kind: SharedInteractionKind) -> &mut Option<SharedInteraction> {
+        match kind {
+            SharedInteractionKind::Permission => &mut self.permission,
+            SharedInteractionKind::Question => &mut self.question,
+            SharedInteractionKind::PlanApproval => &mut self.plan_approval,
+        }
+    }
+
+    fn has_any(&self) -> bool {
+        self.permission.is_some() || self.question.is_some() || self.plan_approval.is_some()
+    }
+
+    fn set_pending(&mut self, kind: SharedInteractionKind, interaction_id: &str) {
+        let slot = self.get_mut(kind);
+        if slot
+            .as_ref()
+            .is_some_and(|interaction| interaction.id == interaction_id)
+        {
+            return;
+        }
+        *slot = Some(SharedInteraction {
+            id: interaction_id.to_string(),
+            admission: InteractionAdmissionState::Pending,
+        });
+    }
+
+    fn resolve_matching(&mut self, interaction_id: &str) {
+        for interaction in [
+            &mut self.permission,
+            &mut self.question,
+            &mut self.plan_approval,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if interaction.id == interaction_id {
+                interaction.admission = InteractionAdmissionState::Resolved;
+                return;
+            }
+        }
+    }
+
+    fn reconcile(&mut self, kind: SharedInteractionKind, interaction_id: Option<&str>) {
+        let slot = self.get_mut(kind);
+        match interaction_id {
+            Some(interaction_id)
+                if slot
+                    .as_ref()
+                    .is_some_and(|interaction| interaction.id == interaction_id) => {}
+            Some(interaction_id) => {
+                *slot = Some(SharedInteraction {
+                    id: interaction_id.to_string(),
+                    admission: InteractionAdmissionState::Pending,
+                });
+            }
+            None if slot.as_ref().is_some_and(|interaction| {
+                interaction.admission == InteractionAdmissionState::Resolving
+            }) => {}
+            None => *slot = None,
+        }
+    }
+
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
 }
 
 struct SharedSessionRecord {
@@ -2341,7 +2703,7 @@ struct SharedSessionRecord {
     waiting_bytes: usize,
     next_enqueue_seq: u64,
     active_turn: Option<BrokerActiveTurn>,
-    pending_interaction: Option<SharedInteraction>,
+    interactions: SharedInteractions,
     notify: Arc<Notify>,
     expired_leases: VecDeque<String>,
     replaced_failed_generation: Option<u64>,
@@ -2378,7 +2740,7 @@ impl SharedSessionRecord {
             waiting_bytes: 0,
             next_enqueue_seq: 1,
             active_turn: None,
-            pending_interaction: None,
+            interactions: SharedInteractions::default(),
             notify: Arc::new(Notify::new()),
             expired_leases: VecDeque::new(),
             replaced_failed_generation,

@@ -6,6 +6,9 @@ use serde::Deserialize;
 
 use crate::acp::opencode_plugins::PluginCheckSummary;
 use crate::acp::preflight::PreflightResult;
+use crate::acp::shared_session::{
+    SharedInteractionRequest, SharedMutationGuard, SharedSessionError, SharedStopRequest,
+};
 use crate::acp::termination::AcpDisconnectOrigin;
 use crate::acp::types::{
     AcpAgentInfo, AcpAgentStatus, AgentDiagnosticsReport, AgentSkillContent, AgentSkillLayout,
@@ -379,6 +382,36 @@ pub async fn acp_delete_agent_skill(
 #[serde(rename_all = "camelCase")]
 pub struct AcpConnectionIdParams {
     pub connection_id: String,
+    #[serde(default)]
+    pub generation: Option<u64>,
+    #[serde(default)]
+    pub lease_id: Option<String>,
+    #[serde(default)]
+    pub turn_id: Option<String>,
+}
+
+fn shared_mutation_guard(
+    connection_id: &str,
+    generation: Option<u64>,
+    lease_id: Option<String>,
+) -> Result<SharedMutationGuard, AppCommandError> {
+    let (Some(generation), Some(lease_id)) = (generation, lease_id) else {
+        let error = crate::acp::error::AcpError::Shared(SharedSessionError::ProtocolRequired);
+        return Err(error
+            .app_command_error()
+            .expect("shared protocol errors have structured mappings"));
+    };
+    Ok(SharedMutationGuard {
+        connection_id: connection_id.to_string(),
+        generation,
+        lease_id,
+    })
+}
+
+fn map_acp_error(error: crate::acp::error::AcpError) -> AppCommandError {
+    error
+        .app_command_error()
+        .unwrap_or_else(|| AppCommandError::task_execution_failed(error.to_string()))
 }
 
 #[derive(Deserialize)]
@@ -513,6 +546,24 @@ pub async fn acp_cancel(
     Extension(state): Extension<Arc<AppState>>,
     Json(params): Json<AcpConnectionIdParams>,
 ) -> Result<Json<()>, AppCommandError> {
+    let manager = &state.connection_manager;
+    if manager
+        .is_broker_managed_connection(&params.connection_id)
+        .await
+    {
+        let guard =
+            shared_mutation_guard(&params.connection_id, params.generation, params.lease_id)?;
+        let turn_id = params.turn_id.ok_or_else(|| {
+            map_acp_error(crate::acp::error::AcpError::Shared(
+                SharedSessionError::ProtocolRequired,
+            ))
+        })?;
+        manager
+            .stop_shared_turn(&state.db.conn, SharedStopRequest { guard, turn_id })
+            .await
+            .map_err(map_acp_error)?;
+        return Ok(Json(()));
+    }
     crate::commands::delegate_access::ensure_connection_delegate_interactive(
         &state.db,
         &state.connection_manager,
@@ -524,7 +575,6 @@ pub async fn acp_cancel(
             .app_command_error()
             .unwrap_or_else(|| AppCommandError::task_execution_failed(error.to_string()))
     })?;
-    let manager = &state.connection_manager;
     manager
         .cancel(&state.db.conn, &params.connection_id)
         .await
@@ -577,6 +627,10 @@ pub struct AcpRespondPermissionParams {
     pub connection_id: String,
     pub request_id: String,
     pub option_id: String,
+    #[serde(default)]
+    pub generation: Option<u64>,
+    #[serde(default)]
+    pub lease_id: Option<String>,
 }
 
 pub async fn acp_respond_permission(
@@ -584,6 +638,22 @@ pub async fn acp_respond_permission(
     Json(params): Json<AcpRespondPermissionParams>,
 ) -> Result<Json<()>, AppCommandError> {
     let manager = &state.connection_manager;
+    if manager
+        .is_broker_managed_connection(&params.connection_id)
+        .await
+    {
+        let guard =
+            shared_mutation_guard(&params.connection_id, params.generation, params.lease_id)?;
+        manager
+            .respond_shared_permission(SharedInteractionRequest {
+                guard,
+                interaction_id: params.request_id,
+                answer: params.option_id,
+            })
+            .await
+            .map_err(map_acp_error)?;
+        return Ok(Json(()));
+    }
     manager
         .respond_permission(&params.connection_id, &params.request_id, &params.option_id)
         .await
@@ -597,12 +667,33 @@ pub struct AcpAnswerQuestionParams {
     pub connection_id: String,
     pub question_id: String,
     pub answer: crate::acp::question::QuestionAnswer,
+    #[serde(default)]
+    pub generation: Option<u64>,
+    #[serde(default)]
+    pub lease_id: Option<String>,
 }
 
 pub async fn acp_answer_question(
     Extension(state): Extension<Arc<AppState>>,
     Json(params): Json<AcpAnswerQuestionParams>,
 ) -> Result<Json<()>, AppCommandError> {
+    let manager = &state.connection_manager;
+    if manager
+        .is_broker_managed_connection(&params.connection_id)
+        .await
+    {
+        let guard =
+            shared_mutation_guard(&params.connection_id, params.generation, params.lease_id)?;
+        manager
+            .answer_shared_question(SharedInteractionRequest {
+                guard,
+                interaction_id: params.question_id,
+                answer: params.answer,
+            })
+            .await
+            .map_err(map_acp_error)?;
+        return Ok(Json(()));
+    }
     // Guard the connection that owns question_id, not the caller-supplied id —
     // answer_question routes by question_id and ignores connection_id.
     crate::commands::delegate_access::ensure_pending_question_delegate_interactive(
@@ -616,7 +707,6 @@ pub async fn acp_answer_question(
             .app_command_error()
             .unwrap_or_else(|| AppCommandError::task_execution_failed(error.to_string()))
     })?;
-    let manager = &state.connection_manager;
     manager
         .answer_question(&params.connection_id, &params.question_id, params.answer)
         .await
@@ -634,6 +724,10 @@ pub struct AcpAnswerPlanApprovalParams {
     pub connection_id: String,
     pub approval_id: String,
     pub answer: crate::acp::plan_approval::PlanApprovalAnswer,
+    #[serde(default)]
+    pub generation: Option<u64>,
+    #[serde(default)]
+    pub lease_id: Option<String>,
 }
 
 pub async fn acp_answer_plan_approval(
@@ -641,6 +735,22 @@ pub async fn acp_answer_plan_approval(
     Json(params): Json<AcpAnswerPlanApprovalParams>,
 ) -> Result<Json<()>, AppCommandError> {
     let manager = &state.connection_manager;
+    if manager
+        .is_broker_managed_connection(&params.connection_id)
+        .await
+    {
+        let guard =
+            shared_mutation_guard(&params.connection_id, params.generation, params.lease_id)?;
+        manager
+            .answer_shared_plan_approval(SharedInteractionRequest {
+                guard,
+                interaction_id: params.approval_id,
+                answer: params.answer,
+            })
+            .await
+            .map_err(map_acp_error)?;
+        return Ok(Json(()));
+    }
     manager
         .answer_plan_approval(&params.connection_id, &params.approval_id, params.answer)
         .await
@@ -1384,6 +1494,7 @@ pub async fn codex_poll_device_code(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app_error::AppErrorCode;
     use crate::auto_title::{parse_supported_app_locale, prompt_capture_from_wire};
 
     #[test]
@@ -1423,6 +1534,37 @@ mod tests {
         assert_eq!(unknown_params.locale.as_deref(), Some("Klingon"));
         let capture = prompt_capture_from_wire(None, unknown_params.locale).unwrap();
         assert_eq!(capture.locale, None);
+    }
+
+    #[test]
+    fn shared_mutation_fields_are_optional_for_legacy_payloads_but_fence_shared_calls() {
+        let legacy: AcpConnectionIdParams =
+            serde_json::from_str(r#"{"connectionId":"local"}"#).unwrap();
+        assert!(legacy.generation.is_none());
+        assert!(legacy.lease_id.is_none());
+        assert!(legacy.turn_id.is_none());
+
+        let error = shared_mutation_guard("shared", None, None).unwrap_err();
+        assert_eq!(error.code, AppErrorCode::SharedSessionProtocolRequired);
+
+        let permission: AcpRespondPermissionParams = serde_json::from_str(
+            r#"{
+                "connectionId":"shared",
+                "requestId":"permission-1",
+                "optionId":"allow",
+                "generation":7,
+                "leaseId":"lease-7"
+            }"#,
+        )
+        .unwrap();
+        let guard = shared_mutation_guard(
+            &permission.connection_id,
+            permission.generation,
+            permission.lease_id,
+        )
+        .unwrap();
+        assert_eq!(guard.connection_id, "shared");
+        assert_eq!(guard.generation, 7);
     }
 }
 

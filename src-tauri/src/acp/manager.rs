@@ -48,10 +48,11 @@ use crate::acp::question::{
 use crate::acp::session_state::{ActiveTurnContext, InternalPromptAdmission, SessionState};
 use crate::acp::shared_session::{
     DispatchHeadDecision, PromptEnqueueResult, RegisteredReplacementPermit,
-    SharedConfigConflictKind, SharedInteractionKind, SharedLaunchIdentity, SharedLifecycleState,
-    SharedMutationGuard, SharedPromptAdmission, SharedPromptRequest, SharedReserveRequest,
-    SharedRuntimeWorkSnapshot, SharedSessionAttachment, SharedSessionBroker, SharedSessionError,
-    SharedSessionKey, SharedSessionPhase, SharedSessionProjection,
+    SharedConfigConflictKind, SharedInteractionKind, SharedInteractionRequest,
+    SharedLaunchIdentity, SharedLifecycleState, SharedMutationGuard, SharedPromptAdmission,
+    SharedPromptRequest, SharedReserveRequest, SharedRuntimeWorkSnapshot, SharedSessionAttachment,
+    SharedSessionBroker, SharedSessionError, SharedSessionKey, SharedSessionPhase,
+    SharedSessionProjection, SharedStopClaimDecision, SharedStopRequest, StopAdmissionResolution,
 };
 use crate::acp::terminal_context::{finalize_acp_launch_config, AcpLaunchConfig, AcpLaunchInputs};
 use crate::acp::termination::AcpDisconnectOrigin;
@@ -589,6 +590,107 @@ struct SharedEnqueuePublicationHook {
     resume: Arc<tokio::sync::Barrier>,
 }
 
+pub(crate) enum SharedControlAdmissionError {
+    DefinitelyNotAdmitted(AcpError),
+    MayHaveBeenAdmitted(AcpError),
+}
+
+impl SharedControlAdmissionError {
+    fn into_error(self) -> AcpError {
+        match self {
+            Self::DefinitelyNotAdmitted(error) | Self::MayHaveBeenAdmitted(error) => error,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+pub(crate) trait SharedControlAdapter: Send + Sync {
+    async fn cancel(
+        &self,
+        manager: &ConnectionManager,
+        db: &DatabaseConnection,
+        connection_id: &str,
+        claim: &crate::acp::shared_session::SharedStopClaim,
+    ) -> Result<(), SharedControlAdmissionError>;
+
+    async fn respond_permission(
+        &self,
+        manager: &ConnectionManager,
+        connection_id: &str,
+        request_id: &str,
+        option_id: &str,
+    ) -> Result<(), SharedControlAdmissionError>;
+
+    async fn answer_question(
+        &self,
+        manager: &ConnectionManager,
+        connection_id: &str,
+        question_id: &str,
+        answer: QuestionAnswer,
+    ) -> Result<(), SharedControlAdmissionError>;
+
+    async fn answer_plan_approval(
+        &self,
+        manager: &ConnectionManager,
+        connection_id: &str,
+        approval_id: &str,
+        answer: PlanApprovalAnswer,
+    ) -> Result<(), SharedControlAdmissionError>;
+}
+
+struct ManagerSharedControlAdapter;
+
+#[async_trait::async_trait]
+impl SharedControlAdapter for ManagerSharedControlAdapter {
+    async fn cancel(
+        &self,
+        manager: &ConnectionManager,
+        db: &DatabaseConnection,
+        connection_id: &str,
+        claim: &crate::acp::shared_session::SharedStopClaim,
+    ) -> Result<(), SharedControlAdmissionError> {
+        manager
+            .cancel_with_admission(db, connection_id, Some(claim))
+            .await
+    }
+
+    async fn respond_permission(
+        &self,
+        manager: &ConnectionManager,
+        connection_id: &str,
+        request_id: &str,
+        option_id: &str,
+    ) -> Result<(), SharedControlAdmissionError> {
+        manager
+            .respond_permission_with_admission(connection_id, request_id, option_id)
+            .await
+    }
+
+    async fn answer_question(
+        &self,
+        manager: &ConnectionManager,
+        connection_id: &str,
+        question_id: &str,
+        answer: QuestionAnswer,
+    ) -> Result<(), SharedControlAdmissionError> {
+        manager
+            .answer_question_with_admission(connection_id, question_id, answer)
+            .await
+    }
+
+    async fn answer_plan_approval(
+        &self,
+        manager: &ConnectionManager,
+        connection_id: &str,
+        approval_id: &str,
+        answer: PlanApprovalAnswer,
+    ) -> Result<(), SharedControlAdmissionError> {
+        manager
+            .answer_plan_approval_with_admission(connection_id, approval_id, answer)
+            .await
+    }
+}
+
 pub struct ConnectionManager {
     pub(crate) connections: Arc<Mutex<HashMap<String, AgentConnection>>>,
     /// Per-(agent, working_dir, session_id) async mutex. Held across the
@@ -656,6 +758,7 @@ pub struct ConnectionManager {
         std::sync::OnceLock<Arc<crate::acp::recovery_authorization::RecoveryAuthorizationService>>,
     >,
     shared_session_broker: SharedSessionBroker,
+    shared_control_adapter: Arc<dyn SharedControlAdapter>,
     shared_launches: Arc<Mutex<HashMap<(String, u64), SharedConnectLaunch>>>,
     #[cfg(any(test, feature = "test-utils"))]
     shared_spawn_override: Option<Arc<dyn SharedSpawnDriver>>,
@@ -752,6 +855,7 @@ impl ConnectionManager {
             pending_plan_approvals: Arc::new(Mutex::new(HashMap::new())),
             recovery_authorization_service: Arc::new(std::sync::OnceLock::new()),
             shared_session_broker: SharedSessionBroker::default(),
+            shared_control_adapter: Arc::new(ManagerSharedControlAdapter),
             shared_launches: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(any(test, feature = "test-utils"))]
             shared_spawn_override: None,
@@ -796,6 +900,7 @@ impl ConnectionManager {
             pending_plan_approvals: self.pending_plan_approvals.clone(),
             recovery_authorization_service: self.recovery_authorization_service.clone(),
             shared_session_broker: self.shared_session_broker.clone(),
+            shared_control_adapter: self.shared_control_adapter.clone(),
             shared_launches: self.shared_launches.clone(),
             #[cfg(any(test, feature = "test-utils"))]
             shared_spawn_override: self.shared_spawn_override.clone(),
@@ -827,8 +932,232 @@ impl ConnectionManager {
         manager
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_with_shared_control_adapter(adapter: Arc<dyn SharedControlAdapter>) -> Self {
+        let mut manager = Self::new();
+        manager.shared_control_adapter = adapter;
+        manager
+    }
+
     pub fn shared_session_broker(&self) -> SharedSessionBroker {
         self.shared_session_broker.clone()
+    }
+
+    pub async fn is_broker_managed_connection(&self, connection_id: &str) -> bool {
+        self.shared_session_broker
+            .is_managed_connection(connection_id)
+            .await
+    }
+
+    pub async fn stop_shared_turn(
+        &self,
+        db: &DatabaseConnection,
+        request: SharedStopRequest,
+    ) -> Result<(), AcpError> {
+        loop {
+            match self
+                .shared_session_broker
+                .claim_stop_request(&request)
+                .await?
+            {
+                SharedStopClaimDecision::Requested => return Ok(()),
+                SharedStopClaimDecision::Resolving(mut resolution) => loop {
+                    let current = *resolution.borrow();
+                    match current {
+                        Some(StopAdmissionResolution::Requested) => return Ok(()),
+                        Some(StopAdmissionResolution::DefinitelyNotAdmitted) => break,
+                        None => {
+                            resolution.changed().await.map_err(|_| {
+                                AcpError::Shared(SharedSessionError::SessionUnavailable)
+                            })?;
+                        }
+                    }
+                },
+                SharedStopClaimDecision::Claimed(claim) => {
+                    let manager = self.clone_ref();
+                    let db = db.clone();
+                    let connection_id = request.guard.connection_id.clone();
+                    let recovery_claim = claim.clone();
+                    let admission_task = tokio::spawn(async move {
+                        let admission = manager
+                            .shared_control_adapter
+                            .cancel(&manager, &db, &connection_id, &claim)
+                            .await;
+                        match admission {
+                            Ok(()) => {
+                                manager
+                                    .shared_session_broker
+                                    .complete_stop_request(&claim)
+                                    .await?;
+                                Ok(())
+                            }
+                            Err(SharedControlAdmissionError::DefinitelyNotAdmitted(error)) => {
+                                manager
+                                    .shared_session_broker
+                                    .release_stop_request(&claim)
+                                    .await?;
+                                Err(error)
+                            }
+                            Err(SharedControlAdmissionError::MayHaveBeenAdmitted(error)) => {
+                                manager
+                                    .shared_session_broker
+                                    .complete_stop_request(&claim)
+                                    .await?;
+                                Err(error)
+                            }
+                        }
+                    });
+                    return match admission_task.await {
+                        Ok(result) => result,
+                        Err(error) => {
+                            self.shared_session_broker
+                                .complete_stop_request(&recovery_claim)
+                                .await?;
+                            Err(AcpError::protocol(error.to_string()))
+                        }
+                    };
+                }
+            }
+        }
+    }
+
+    pub async fn respond_shared_permission(
+        &self,
+        request: SharedInteractionRequest<String>,
+    ) -> Result<(), AcpError> {
+        let claim = self
+            .shared_session_broker
+            .claim_interaction(
+                &request.guard,
+                SharedInteractionKind::Permission,
+                &request.interaction_id,
+            )
+            .await?;
+        let manager = self.clone_ref();
+        let recovery_claim = claim.clone();
+        let admission_task = tokio::spawn(async move {
+            let admission = manager
+                .shared_control_adapter
+                .respond_permission(
+                    &manager,
+                    &request.guard.connection_id,
+                    &request.interaction_id,
+                    &request.answer,
+                )
+                .await;
+            manager
+                .finish_shared_interaction_admission(&claim, admission)
+                .await
+        });
+        self.finish_shared_interaction_task(recovery_claim, admission_task)
+            .await
+    }
+
+    pub async fn answer_shared_question(
+        &self,
+        request: SharedInteractionRequest<QuestionAnswer>,
+    ) -> Result<(), AcpError> {
+        let claim = self
+            .shared_session_broker
+            .claim_interaction(
+                &request.guard,
+                SharedInteractionKind::Question,
+                &request.interaction_id,
+            )
+            .await?;
+        let manager = self.clone_ref();
+        let recovery_claim = claim.clone();
+        let admission_task = tokio::spawn(async move {
+            let admission = manager
+                .shared_control_adapter
+                .answer_question(
+                    &manager,
+                    &request.guard.connection_id,
+                    &request.interaction_id,
+                    request.answer,
+                )
+                .await;
+            manager
+                .finish_shared_interaction_admission(&claim, admission)
+                .await
+        });
+        self.finish_shared_interaction_task(recovery_claim, admission_task)
+            .await
+    }
+
+    pub async fn answer_shared_plan_approval(
+        &self,
+        request: SharedInteractionRequest<PlanApprovalAnswer>,
+    ) -> Result<(), AcpError> {
+        let claim = self
+            .shared_session_broker
+            .claim_interaction(
+                &request.guard,
+                SharedInteractionKind::PlanApproval,
+                &request.interaction_id,
+            )
+            .await?;
+        let manager = self.clone_ref();
+        let recovery_claim = claim.clone();
+        let admission_task = tokio::spawn(async move {
+            let admission = manager
+                .shared_control_adapter
+                .answer_plan_approval(
+                    &manager,
+                    &request.guard.connection_id,
+                    &request.interaction_id,
+                    request.answer,
+                )
+                .await;
+            manager
+                .finish_shared_interaction_admission(&claim, admission)
+                .await
+        });
+        self.finish_shared_interaction_task(recovery_claim, admission_task)
+            .await
+    }
+
+    async fn finish_shared_interaction_task(
+        &self,
+        recovery_claim: crate::acp::shared_session::SharedInteractionClaim,
+        task: tokio::task::JoinHandle<Result<(), AcpError>>,
+    ) -> Result<(), AcpError> {
+        match task.await {
+            Ok(result) => result,
+            Err(error) => {
+                self.shared_session_broker
+                    .complete_interaction(&recovery_claim)
+                    .await?;
+                Err(AcpError::protocol(error.to_string()))
+            }
+        }
+    }
+
+    async fn finish_shared_interaction_admission(
+        &self,
+        claim: &crate::acp::shared_session::SharedInteractionClaim,
+        admission: Result<(), SharedControlAdmissionError>,
+    ) -> Result<(), AcpError> {
+        match admission {
+            Ok(()) => {
+                self.shared_session_broker
+                    .complete_interaction(claim)
+                    .await?;
+                Ok(())
+            }
+            Err(SharedControlAdmissionError::DefinitelyNotAdmitted(error)) => {
+                self.shared_session_broker
+                    .release_interaction_claim(claim)
+                    .await?;
+                Err(error)
+            }
+            Err(SharedControlAdmissionError::MayHaveBeenAdmitted(error)) => {
+                self.shared_session_broker
+                    .complete_interaction(claim)
+                    .await?;
+                Err(error)
+            }
+        }
     }
 
     pub async fn enqueue_shared_prompt(
@@ -4662,11 +4991,24 @@ impl ConnectionManager {
     }
 
     pub async fn cancel(&self, db: &DatabaseConnection, conn_id: &str) -> Result<(), AcpError> {
+        self.cancel_with_admission(db, conn_id, None)
+            .await
+            .map_err(SharedControlAdmissionError::into_error)
+    }
+
+    async fn cancel_with_admission(
+        &self,
+        db: &DatabaseConnection,
+        conn_id: &str,
+        shared_claim: Option<&crate::acp::shared_session::SharedStopClaim>,
+    ) -> Result<(), SharedControlAdmissionError> {
         let (prompt_lock, control_tx, state_arc, emitter) = {
             let connections = self.connections.lock().await;
-            let conn = connections
-                .get(conn_id)
-                .ok_or_else(|| AcpError::ConnectionNotFound(conn_id.into()))?;
+            let conn = connections.get(conn_id).ok_or_else(|| {
+                SharedControlAdmissionError::DefinitelyNotAdmitted(AcpError::ConnectionNotFound(
+                    conn_id.into(),
+                ))
+            })?;
             (
                 conn.prompt_lock.clone(),
                 conn.control_tx.clone(),
@@ -4675,6 +5017,14 @@ impl ConnectionManager {
             )
         };
         let _prompt_guard = prompt_lock.lock_owned().await;
+        if let Some(claim) = shared_claim {
+            self.shared_session_broker
+                .validate_stop_claim(claim)
+                .await
+                .map_err(|error| {
+                    SharedControlAdmissionError::DefinitelyNotAdmitted(AcpError::Shared(error))
+                })?;
+        }
         let conversation_id = state_arc.read().await.conversation_id;
         let cleanup_error = match (
             conversation_id,
@@ -4690,7 +5040,9 @@ impl ConnectionManager {
         let cancel_result = control_tx
             .send(ConnectionControl::Cancel)
             .await
-            .map_err(|_| AcpError::ProcessExited);
+            .map_err(|_| {
+                SharedControlAdmissionError::DefinitelyNotAdmitted(AcpError::ProcessExited)
+            });
 
         // Eagerly flip the row to `Cancelled` so the sidebar/tabs leave the
         // "running" state immediately. The agent typically replies with
@@ -4732,9 +5084,9 @@ impl ConnectionManager {
 
         cancel_result?;
         if let Some(error) = cleanup_error {
-            return Err(AcpError::protocol(format!(
-                "continuation stop persistence failed: {error}"
-            )));
+            return Err(SharedControlAdmissionError::MayHaveBeenAdmitted(
+                AcpError::protocol(format!("continuation stop persistence failed: {error}")),
+            ));
         }
         Ok(())
     }
@@ -4745,11 +5097,24 @@ impl ConnectionManager {
         request_id: &str,
         option_id: &str,
     ) -> Result<(), AcpError> {
+        self.respond_permission_with_admission(conn_id, request_id, option_id)
+            .await
+            .map_err(SharedControlAdmissionError::into_error)
+    }
+
+    async fn respond_permission_with_admission(
+        &self,
+        conn_id: &str,
+        request_id: &str,
+        option_id: &str,
+    ) -> Result<(), SharedControlAdmissionError> {
         let cmd_tx = {
             let connections = self.connections.lock().await;
-            let conn = connections
-                .get(conn_id)
-                .ok_or_else(|| AcpError::ConnectionNotFound(conn_id.into()))?;
+            let conn = connections.get(conn_id).ok_or_else(|| {
+                SharedControlAdmissionError::DefinitelyNotAdmitted(AcpError::ConnectionNotFound(
+                    conn_id.into(),
+                ))
+            })?;
             conn.cmd_tx.clone()
         };
         cmd_tx
@@ -4758,7 +5123,9 @@ impl ConnectionManager {
                 option_id: option_id.into(),
             })
             .await
-            .map_err(|_| AcpError::ProcessExited)
+            .map_err(|_| {
+                SharedControlAdmissionError::DefinitelyNotAdmitted(AcpError::ProcessExited)
+            })
     }
 
     /// Fork the agent's session and persist the resulting two-row layout in
@@ -7363,13 +7730,24 @@ impl ConnectionManager {
         question_id: &str,
         answer: QuestionAnswer,
     ) -> Result<(), AcpError> {
+        self.answer_question_with_admission(conn_id, question_id, answer)
+            .await
+            .map_err(SharedControlAdmissionError::into_error)
+    }
+
+    async fn answer_question_with_admission(
+        &self,
+        conn_id: &str,
+        question_id: &str,
+        answer: QuestionAnswer,
+    ) -> Result<(), SharedControlAdmissionError> {
         let _ = conn_id;
         let (questions, authorization_id) = match self.claim_question_settlement(question_id).await
         {
             QuestionSettlementClaim::Missing => return Ok(()),
             QuestionSettlementClaim::InFlight => {
-                return Err(AcpError::protocol(
-                    "question settlement is already in progress",
+                return Err(SharedControlAdmissionError::DefinitelyNotAdmitted(
+                    AcpError::protocol("question settlement is already in progress"),
                 ))
             }
             QuestionSettlementClaim::Claimed {
@@ -7385,13 +7763,13 @@ impl ConnectionManager {
         };
         let Some(service) = self.recovery_authorization_service() else {
             self.release_question_settlement(question_id).await;
-            return Err(AcpError::protocol(
-                "recovery authorization service is unavailable",
+            return Err(SharedControlAdmissionError::DefinitelyNotAdmitted(
+                AcpError::protocol("recovery authorization service is unavailable"),
             ));
         };
         let manager = self.clone_ref();
         let question_id = question_id.to_string();
-        tokio::spawn(async move {
+        let admission = tokio::spawn(async move {
             if let Err(error) = service
                 .resolve_question(&authorization_id, outcome.clone())
                 .await
@@ -7404,8 +7782,14 @@ impl ConnectionManager {
                 .await;
             Ok(())
         })
-        .await
-        .map_err(|error| AcpError::protocol(error.to_string()))?
+        .await;
+        match admission {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(SharedControlAdmissionError::DefinitelyNotAdmitted(error)),
+            Err(error) => Err(SharedControlAdmissionError::MayHaveBeenAdmitted(
+                AcpError::protocol(error.to_string()),
+            )),
+        }
     }
 
     /// Cancel a pending `ask_user_question` — the companion's tool call was
@@ -7710,6 +8094,17 @@ impl ConnectionManager {
         approval_id: &str,
         answer: PlanApprovalAnswer,
     ) -> Result<(), AcpError> {
+        self.answer_plan_approval_with_admission(conn_id, approval_id, answer)
+            .await
+            .map_err(SharedControlAdmissionError::into_error)
+    }
+
+    async fn answer_plan_approval_with_admission(
+        &self,
+        conn_id: &str,
+        approval_id: &str,
+        answer: PlanApprovalAnswer,
+    ) -> Result<(), SharedControlAdmissionError> {
         let _ = conn_id;
         let entry = self.pending_plan_approvals.lock().await.remove(approval_id);
         let Some(entry) = entry else {
