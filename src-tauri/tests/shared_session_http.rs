@@ -13,9 +13,10 @@ use codeg_lib::acp::error::AcpError;
 use codeg_lib::acp::manager::{ConnectionManager, SharedConnectLaunch, SharedSpawnDriver};
 use codeg_lib::acp::session_state::SessionState;
 use codeg_lib::acp::shared_session::{
-    SharedDisposition, SharedSessionPhase, MAX_ACTIVE_LEASES, MAX_CLIENT_LABEL_LEN,
-    MAX_CONNECT_LEDGER_ENTRIES, MAX_EXPIRED_LEASE_TOMBSTONES, MAX_PROMPT_LEDGER_ENTRIES,
-    MAX_REPLACED_CONNECTION_TOMBSTONES, MAX_WAITING_BYTES, MAX_WAITING_PROMPTS,
+    SharedDisposition, SharedSessionKey, SharedSessionPhase, MAX_ACTIVE_LEASES,
+    MAX_CLIENT_LABEL_LEN, MAX_CONNECT_LEDGER_ENTRIES, MAX_EXPIRED_LEASE_TOMBSTONES,
+    MAX_PROMPT_LEDGER_ENTRIES, MAX_REPLACED_CONNECTION_TOMBSTONES, MAX_WAITING_BYTES,
+    MAX_WAITING_PROMPTS,
 };
 use codeg_lib::app_state::AppState;
 use codeg_lib::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
@@ -247,9 +248,37 @@ impl SharedHttpFixture {
     fn manager(&self) -> &ConnectionManager {
         &self.state.connection_manager
     }
+
+    async fn wait_for_failed_cleanup(&self, connection_id: &str) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let phase = self
+                    .manager()
+                    .shared_session_broker()
+                    .diagnostic_for_connection(connection_id)
+                    .await
+                    .map(|snapshot| snapshot.phase);
+                if matches!(
+                    phase,
+                    Some(SharedSessionPhase::Failed {
+                        cleanup_complete: true,
+                        ..
+                    })
+                ) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("failed shared root should complete cleanup");
+    }
 }
 
-async fn shared_http_fixture(outcome: BootstrapOutcome) -> SharedHttpFixture {
+async fn shared_http_fixture_with_prompt_ledger_limit(
+    outcome: BootstrapOutcome,
+    prompt_ledger_limit: Option<usize>,
+) -> SharedHttpFixture {
     let data_dir = tempfile::tempdir().expect("data dir");
     let static_dir = tempfile::tempdir().expect("static dir");
     let workspace = tempfile::tempdir().expect("workspace");
@@ -258,7 +287,15 @@ async fn shared_http_fixture(outcome: BootstrapOutcome) -> SharedHttpFixture {
     let folder_id = seed_folder(&db, &working_dir).await;
     let conversation_id = seed_conversation(&db, folder_id, AgentType::Codex).await;
     let (driver, bootstrap) = ControlledSpawnDriver::new(outcome);
-    let manager = ConnectionManager::new_with_shared_spawn_driver(driver.clone());
+    let manager = match prompt_ledger_limit {
+        Some(limit) => {
+            ConnectionManager::new_with_shared_spawn_driver_and_prompt_ledger_limit_for_test(
+                driver.clone(),
+                limit,
+            )
+        }
+        None => ConnectionManager::new_with_shared_spawn_driver(driver.clone()),
+    };
     let mut app_state = AppState::new_for_test(db, data_dir.path().to_path_buf());
     app_state.connection_manager = manager;
     let state = Arc::new(app_state);
@@ -281,6 +318,10 @@ async fn shared_http_fixture(outcome: BootstrapOutcome) -> SharedHttpFixture {
         _static_dir: static_dir,
         _workspace: workspace,
     }
+}
+
+async fn shared_http_fixture(outcome: BootstrapOutcome) -> SharedHttpFixture {
+    shared_http_fixture_with_prompt_ledger_limit(outcome, None).await
 }
 
 async fn shared_http_fixture_with_pending_bootstrap() -> SharedHttpFixture {
@@ -511,6 +552,101 @@ async fn shared_mutations_distinguish_missing_and_recently_expired_leases() {
         .await
         .assert_status_gone()
         .assert_code("client_lease_expired");
+}
+
+#[tokio::test]
+async fn rejected_prompt_guards_and_identities_leave_unbound_roots_unbound() {
+    for case in [
+        "missing-lease",
+        "expired-lease",
+        "invalid-client-instance",
+        "invalid-client-request",
+        "empty-client-message",
+    ] {
+        let fixture = shared_http_fixture_with_pending_bootstrap().await;
+        let mut connect = fixture.connect_json("guard-device", "guard-client", case);
+        connect["conversationId"] = Value::Null;
+        connect["workingDir"] = Value::Null;
+        if case == "expired-lease" {
+            fixture
+                .manager()
+                .configure_shared_client_lease_ttl(Duration::from_millis(1));
+        }
+        let attached = fixture
+            .post_json("/acp_connect_or_attach", connect)
+            .await
+            .assert_status_ok()
+            .json::<AcpConnectOrAttachResponse>();
+
+        if case == "expired-lease" {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            fixture
+                .manager()
+                .shared_session_broker()
+                .expire_leases(tokio::time::Instant::now())
+                .await;
+        }
+        let mut prompt = json!({
+            "connectionId": attached.connection_id,
+            "generation": attached.generation,
+            "leaseId": attached.lease_id,
+            "clientInstanceId": "guard-client",
+            "clientRequestId": "guard-prompt",
+            "clientMessageId": "guard-message",
+            "blocks": [{"type": "text", "text": "must not bind"}],
+            "folderId": fixture.folder_id,
+            "conversationId": fixture.conversation_id,
+        });
+        let (status, code) = match case {
+            "missing-lease" => {
+                prompt["leaseId"] = json!("unknown-lease");
+                (StatusCode::CONFLICT, "client_lease_missing")
+            }
+            "expired-lease" => (StatusCode::GONE, "client_lease_expired"),
+            "invalid-client-instance" => {
+                prompt["clientInstanceId"] = json!("bad client");
+                (StatusCode::BAD_REQUEST, "invalid_shared_session_field")
+            }
+            "invalid-client-request" => {
+                prompt["clientRequestId"] = json!("bad/request");
+                (StatusCode::BAD_REQUEST, "invalid_shared_session_field")
+            }
+            "empty-client-message" => {
+                prompt["clientMessageId"] = json!("");
+                (StatusCode::BAD_REQUEST, "invalid_shared_session_field")
+            }
+            _ => unreachable!(),
+        };
+        fixture
+            .post_json("/acp_prompt", prompt)
+            .await
+            .assert_status(status)
+            .assert_code(code);
+
+        assert_eq!(
+            fixture
+                .manager()
+                .get_state(&attached.connection_id)
+                .await
+                .expect("unbound root remains registered")
+                .read()
+                .await
+                .conversation_id,
+            None,
+            "public state was bound for case={case}"
+        );
+        assert!(
+            !matches!(
+                fixture
+                    .manager()
+                    .shared_session_broker()
+                    .key_for_connection_for_test(&attached.connection_id)
+                    .await,
+                Some(SharedSessionKey::Conversation(_))
+            ),
+            "broker key was bound for case={case}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -805,6 +941,55 @@ async fn prompt_queue_capacity_rejects_only_new_prompt_identities() {
 }
 
 #[tokio::test]
+async fn prompt_ledger_capacity_rejects_only_new_identities_over_http() {
+    let fixture =
+        shared_http_fixture_with_prompt_ledger_limit(BootstrapOutcome::Pending, Some(2)).await;
+    let attached = fixture
+        .post_connect(
+            "ledger-cap-device",
+            "ledger-cap-client",
+            "ledger-cap-connect",
+        )
+        .await
+        .assert_status_ok()
+        .json::<AcpConnectOrAttachResponse>();
+    let prompt = |request_id: &str| {
+        json!({
+            "connectionId": attached.connection_id,
+            "generation": attached.generation,
+            "leaseId": attached.lease_id,
+            "clientInstanceId": "ledger-cap-client",
+            "clientRequestId": request_id,
+            "clientMessageId": format!("message-{request_id}"),
+            "blocks": [{"type": "text", "text": request_id}],
+            "folderId": fixture.folder_id,
+            "conversationId": fixture.conversation_id,
+        })
+    };
+    let first_request = prompt("ledger-request-0");
+    let first = fixture
+        .post_json("/acp_prompt", first_request.clone())
+        .await
+        .assert_status_ok()
+        .body;
+    fixture
+        .post_json("/acp_prompt", prompt("ledger-request-1"))
+        .await
+        .assert_status_ok();
+    fixture
+        .post_json("/acp_prompt", prompt("ledger-request-over"))
+        .await
+        .assert_status_too_many_requests()
+        .assert_code("prompt_idempotency_capacity_exceeded");
+    let retry = fixture
+        .post_json("/acp_prompt", first_request)
+        .await
+        .assert_status_ok()
+        .body;
+    assert_eq!(retry, first);
+}
+
+#[tokio::test]
 async fn lease_capacity_rejects_only_new_client_identities() {
     let fixture = shared_http_fixture_with_pending_bootstrap().await;
     let first_request = fixture.connect_json(
@@ -1020,6 +1205,60 @@ async fn required_companion_failure_is_typed_and_secret_safe() {
             cleanup_complete: true,
         })
     );
+}
+
+#[tokio::test]
+async fn failed_tombstone_uses_retained_state_for_retry_release_and_termination() {
+    let fixture = shared_http_fixture(BootstrapOutcome::CompanionFailure).await;
+    let request = fixture.connect_json("failed-device", "failed-client", "failed-retry");
+    let first = fixture
+        .post_json("/acp_connect_or_attach", request.clone())
+        .await
+        .assert_status_ok()
+        .json::<AcpConnectOrAttachResponse>();
+    fixture.wait_for_failed_cleanup(&first.connection_id).await;
+    assert!(
+        !fixture
+            .manager()
+            .has_connection_map_entry_for_test(&first.connection_id)
+            .await
+    );
+
+    let retry = fixture
+        .post_json("/acp_connect_or_attach", request)
+        .await
+        .assert_status_ok()
+        .json::<AcpConnectOrAttachResponse>();
+    assert_eq!(retry.connection_id, first.connection_id);
+    assert_eq!(retry.generation, first.generation);
+    assert_eq!(retry.lease_id, first.lease_id);
+    assert_eq!(retry.phase, SharedPublicPhase::Failed);
+    assert!(
+        retry.event_seq > 0,
+        "retained failed projection must supply its current event sequence"
+    );
+
+    fixture
+        .post_json(
+            "/acp_release_lease",
+            json!({
+                "connectionId": retry.connection_id,
+                "generation": retry.generation,
+                "leaseId": retry.lease_id,
+            }),
+        )
+        .await
+        .assert_status_ok();
+    fixture
+        .post_json(
+            "/acp_terminate_shared_session",
+            json!({
+                "connectionId": retry.connection_id,
+                "generation": retry.generation,
+            }),
+        )
+        .await
+        .assert_status_ok();
 }
 
 #[test]

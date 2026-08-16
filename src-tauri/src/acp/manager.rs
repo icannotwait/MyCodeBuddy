@@ -953,6 +953,17 @@ impl ConnectionManager {
         manager
     }
 
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn new_with_shared_spawn_driver_and_prompt_ledger_limit_for_test(
+        driver: Arc<dyn SharedSpawnDriver>,
+        max_prompt_ledger_entries: usize,
+    ) -> Self {
+        let mut manager = Self::new_with_shared_spawn_driver(driver);
+        manager.shared_session_broker =
+            SharedSessionBroker::with_prompt_ledger_limit_for_test(max_prompt_ledger_entries);
+        manager
+    }
+
     #[cfg(test)]
     pub(crate) fn new_with_shared_control_adapter(adapter: Arc<dyn SharedControlAdapter>) -> Self {
         let mut manager = Self::new();
@@ -1561,6 +1572,11 @@ impl ConnectionManager {
     pub fn shared_teardown_count_for_test(&self) -> usize {
         self.shared_teardown_count
             .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn has_connection_map_entry_for_test(&self, connection_id: &str) -> bool {
+        self.connections.lock().await.contains_key(connection_id)
     }
 
     pub async fn connect_or_attach_shared(

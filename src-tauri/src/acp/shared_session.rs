@@ -114,6 +114,17 @@ pub struct SharedSessionBroker {
     idle_final_cas_barrier: Arc<std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SharedAuthoritativeSnapshot {
+    pub purpose: crate::auto_title::ConnectionPurpose,
+    pub canonical_conversation_id: Option<i32>,
+    pub generation: u64,
+    pub phase: SharedSessionPhase,
+    pub event_seq: u64,
+    pub folder_id: Option<i32>,
+    pub agent_type: crate::models::AgentType,
+}
+
 /// Exact authoritative facts that prevent a shared root from becoming idle.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SharedIdleBlockers {
@@ -1442,6 +1453,113 @@ impl SharedSessionBroker {
         }
     }
 
+    pub(crate) async fn bind_conversation_key_guarded(
+        &self,
+        guard: &SharedMutationGuard,
+        conversation_id: i32,
+        folder_id: i32,
+    ) -> Result<(), SharedSessionError> {
+        let destination_key = SharedSessionKey::Conversation(conversation_id);
+        loop {
+            let mut index = self.index.lock().await;
+            let Some(source_key) = index.by_connection.get(&guard.connection_id).cloned() else {
+                if index.is_replaced_connection(&guard.connection_id, guard.generation) {
+                    return Err(SharedSessionError::GenerationStale);
+                }
+                return Err(SharedSessionError::SessionUnavailable);
+            };
+            let Some(source) = index.sessions.get(&source_key).cloned() else {
+                return Err(SharedSessionError::SessionUnavailable);
+            };
+            let Ok(mut source_record) = source.try_lock() else {
+                drop(index);
+                tokio::task::yield_now().await;
+                continue;
+            };
+            self.validate_prompt_guard(&mut source_record, guard)?;
+            if !matches!(
+                source_record.phase,
+                SharedSessionPhase::Bootstrapping | SharedSessionPhase::Ready
+            ) {
+                return Err(SharedSessionError::SessionUnavailable);
+            }
+            if let SharedSessionKey::Conversation(current) = source_key {
+                return if current == conversation_id {
+                    Ok(())
+                } else {
+                    Err(SharedSessionError::ConversationKeyConflict)
+                };
+            }
+
+            let destination = index.sessions.get(&destination_key).cloned();
+            let destination_record = match destination.as_ref() {
+                Some(destination) if !Arc::ptr_eq(&source, destination) => {
+                    let Ok(destination_record) = destination.try_lock() else {
+                        drop(source_record);
+                        drop(index);
+                        tokio::task::yield_now().await;
+                        continue;
+                    };
+                    if matches!(
+                        destination_record.phase,
+                        SharedSessionPhase::Reserved
+                            | SharedSessionPhase::Bootstrapping
+                            | SharedSessionPhase::Ready
+                    ) {
+                        return Err(SharedSessionError::ConversationKeyConflict);
+                    }
+                    Some(destination_record)
+                }
+                _ => None,
+            };
+            let Some(public_state) = source_record.state.clone() else {
+                return Err(SharedSessionError::SessionUnavailable);
+            };
+            let Ok(mut public_state) = public_state.try_write() else {
+                drop(destination_record);
+                drop(source_record);
+                drop(index);
+                tokio::task::yield_now().await;
+                continue;
+            };
+            if public_state
+                .conversation_id
+                .is_some_and(|current| current != conversation_id)
+            {
+                return Err(SharedSessionError::ConversationKeyConflict);
+            }
+            if public_state
+                .folder_id
+                .is_some_and(|current| current != folder_id)
+            {
+                return Err(SharedSessionError::InvalidField { field: "folder_id" });
+            }
+
+            if let Some(destination_record) = destination_record {
+                destination_record
+                    .lifecycle_tx
+                    .send_replace(SharedLifecycleState::Replaced);
+                destination_record.notify.notify_waiters();
+                index
+                    .by_connection
+                    .remove(&destination_record.connection_id);
+            }
+            index.sessions.remove(&source_key);
+            index
+                .sessions
+                .insert(destination_key.clone(), source.clone());
+            index
+                .by_connection
+                .insert(guard.connection_id.clone(), destination_key);
+            public_state.conversation_id = Some(conversation_id);
+            public_state.folder_id = Some(folder_id);
+            source_record.notify.notify_waiters();
+            self.index_epoch
+                .send_modify(|epoch| *epoch = epoch.saturating_add(1));
+            return Ok(());
+        }
+    }
+
     /// Validate a mutation guard against the current generation and lease.
     ///
     /// The broker index is authoritative even when the manager connection map
@@ -1785,6 +1903,17 @@ impl SharedSessionBroker {
         }
     }
 
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) fn with_prompt_ledger_limit_for_test(max_prompt_ledger_entries: usize) -> Self {
+        Self {
+            limits: BrokerLimits {
+                max_prompt_ledger_entries,
+                ..BrokerLimits::default()
+            },
+            ..Self::default()
+        }
+    }
+
     pub async fn reserve_or_attach(
         &self,
         request: SharedReserveRequest,
@@ -2010,6 +2139,68 @@ impl SharedSessionBroker {
         .await
         .ok()
         .flatten()
+    }
+
+    pub(crate) async fn authoritative_snapshot(
+        &self,
+        connection_id: &str,
+    ) -> Result<SharedAuthoritativeSnapshot, SharedSessionError> {
+        loop {
+            let contended = {
+                let index = self.index.lock().await;
+                let Some(key) = index.by_connection.get(connection_id).cloned() else {
+                    return Err(SharedSessionError::SessionUnavailable);
+                };
+                let Some(record) = index.sessions.get(&key).cloned() else {
+                    return Err(SharedSessionError::SessionUnavailable);
+                };
+                let record = match record.try_lock() {
+                    Ok(record) => record,
+                    Err(_) => {
+                        drop(index);
+                        tokio::task::yield_now().await;
+                        continue;
+                    }
+                };
+                let state = record.state.clone();
+                match state.as_ref() {
+                    Some(state) => match state.try_read() {
+                        Ok(state) => {
+                            return Ok(SharedAuthoritativeSnapshot {
+                                purpose: record.launch_identity.purpose,
+                                canonical_conversation_id: match &key {
+                                    SharedSessionKey::Conversation(id) => Some(*id),
+                                    _ => None,
+                                },
+                                generation: record.generation,
+                                phase: record.phase.clone(),
+                                event_seq: state.event_seq,
+                                folder_id: state.folder_id,
+                                agent_type: record.launch_identity.agent_type,
+                            })
+                        }
+                        Err(_) => true,
+                    },
+                    None => {
+                        return Ok(SharedAuthoritativeSnapshot {
+                            purpose: record.launch_identity.purpose,
+                            canonical_conversation_id: match &key {
+                                SharedSessionKey::Conversation(id) => Some(*id),
+                                _ => None,
+                            },
+                            generation: record.generation,
+                            phase: record.phase.clone(),
+                            event_seq: 0,
+                            folder_id: None,
+                            agent_type: record.launch_identity.agent_type,
+                        })
+                    }
+                }
+            };
+            if contended {
+                tokio::task::yield_now().await;
+            }
+        }
     }
 
     pub(crate) async fn launch_identity_for_connection(
@@ -2585,8 +2776,8 @@ impl SharedSessionBroker {
         .flatten()
     }
 
-    #[cfg(test)]
-    pub(crate) async fn key_for_connection_for_test(
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn key_for_connection_for_test(
         &self,
         connection_id: &str,
     ) -> Option<SharedSessionKey> {

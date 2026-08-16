@@ -375,11 +375,11 @@ fn public_shared_phase(
 fn select_shared_connect_response_state(
     attachment_generation: u64,
     attachment_phase: &SharedSessionPhase,
-    public_snapshot: Option<(&crate::acp::shared_session::SharedSessionProjection, u64)>,
+    authoritative_snapshot: Option<(u64, &SharedSessionPhase, u64)>,
 ) -> (SharedSessionPhase, u64) {
-    match public_snapshot {
-        Some((shared, event_seq)) if shared.generation == attachment_generation => {
-            (shared.phase.clone(), event_seq)
+    match authoritative_snapshot {
+        Some((generation, phase, event_seq)) if generation == attachment_generation => {
+            (phase.clone(), event_seq)
         }
         _ => (attachment_phase.clone(), 0),
     }
@@ -447,26 +447,19 @@ pub async fn acp_connect_or_attach(
     // lets already-resolved bootstrap failures settle without delaying a live
     // bootstrap that is still waiting on its companion handshake.
     tokio::task::yield_now().await;
-    let (phase, event_seq) = match state
+    let snapshot = state
         .connection_manager
-        .get_state(&attachment.connection_id)
+        .shared_session_broker()
+        .authoritative_snapshot(&attachment.connection_id)
         .await
-    {
-        Some(public_state) => {
-            let public_state = public_state.read().await;
-            select_shared_connect_response_state(
-                attachment.generation,
-                &attachment.phase,
-                public_state
-                    .shared_session
-                    .as_ref()
-                    .map(|shared| (shared, public_state.event_seq)),
-            )
-        }
-        None => {
-            select_shared_connect_response_state(attachment.generation, &attachment.phase, None)
-        }
-    };
+        .ok();
+    let (phase, event_seq) = select_shared_connect_response_state(
+        attachment.generation,
+        &attachment.phase,
+        snapshot
+            .as_ref()
+            .map(|snapshot| (snapshot.generation, &snapshot.phase, snapshot.event_seq)),
+    );
     let (phase, error) = public_shared_phase(&phase)?;
     Ok(Json(AcpConnectOrAttachResponse {
         connection_id: attachment.connection_id,
@@ -569,31 +562,28 @@ pub enum AcpPromptResponse {
 
 async fn validate_and_bind_shared_prompt_target(
     state: &AppState,
-    connection_id: &str,
-    generation: u64,
+    guard: &SharedMutationGuard,
     conversation_id: Option<i32>,
     folder_id: Option<i32>,
 ) -> Result<(), AppCommandError> {
     if conversation_id.is_some() && folder_id.is_none() {
         return Err(invalid_shared_field("folder_id"));
     }
-    let public_state = state
-        .connection_manager
-        .get_state(connection_id)
+    let broker = state.connection_manager.shared_session_broker();
+    broker
+        .validate_guard(guard)
         .await
-        .ok_or_else(|| {
-            map_acp_error(crate::acp::error::AcpError::Shared(
-                SharedSessionError::SessionUnavailable,
-            ))
-        })?;
-    let (current_conversation, current_folder, agent_type) = {
-        let public_state = public_state.read().await;
-        (
-            public_state.conversation_id,
-            public_state.folder_id,
-            public_state.agent_type,
-        )
-    };
+        .map_err(|error| map_acp_error(error.into()))?;
+    let snapshot = broker
+        .authoritative_snapshot(&guard.connection_id)
+        .await
+        .map_err(|error| map_acp_error(error.into()))?;
+    if snapshot.generation != guard.generation {
+        return Err(map_acp_error(SharedSessionError::GenerationStale.into()));
+    }
+    let current_conversation = snapshot.canonical_conversation_id;
+    let current_folder = snapshot.folder_id;
+    let agent_type = snapshot.agent_type;
     if let Some(current) = current_conversation {
         if conversation_id != Some(current) {
             return Err(map_acp_error(
@@ -630,31 +620,14 @@ async fn validate_and_bind_shared_prompt_target(
     .map_err(|error| map_acp_error(error.into()))?;
 
     if current_conversation.is_none() {
-        static BIND_GATE: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-        let _gate = BIND_GATE
-            .get_or_init(|| tokio::sync::Mutex::new(()))
-            .lock()
-            .await;
-        let current = public_state.read().await.conversation_id;
-        match current {
-            Some(current) if current != conversation_id => {
-                return Err(map_acp_error(
-                    SharedSessionError::ConversationKeyConflict.into(),
-                ));
-            }
-            Some(_) => {}
-            None => {
-                state
-                    .connection_manager
-                    .shared_session_broker()
-                    .bind_conversation_key(connection_id, generation, conversation_id)
-                    .await
-                    .map_err(|error| map_acp_error(error.into()))?;
-                let mut public_state = public_state.write().await;
-                public_state.conversation_id = Some(conversation_id);
-                public_state.folder_id = folder_id;
-            }
-        }
+        broker
+            .bind_conversation_key_guarded(
+                guard,
+                conversation_id,
+                folder_id.expect("conversation target requires a folder"),
+            )
+            .await
+            .map_err(|error| map_acp_error(error.into()))?;
     }
     Ok(())
 }
@@ -697,6 +670,16 @@ pub async fn acp_prompt(
             .client_message_id
             .take()
             .ok_or_else(|| map_acp_error(SharedSessionError::ProtocolRequired.into()))?;
+        for (field, value) in [
+            ("client_instance_id", client_instance_id.as_str()),
+            ("client_request_id", client_request_id.as_str()),
+        ] {
+            crate::acp::shared_session::validate_client_label(field, value)
+                .map_err(|error| map_acp_error(error.into()))?;
+        }
+        if client_message_id.is_empty() {
+            return Err(invalid_shared_field("client_message_id"));
+        }
         if params.blocks.is_empty() {
             return Err(invalid_shared_field("blocks"));
         }
@@ -708,8 +691,7 @@ pub async fn acp_prompt(
         .map_err(map_acp_error)?;
         validate_and_bind_shared_prompt_target(
             &state,
-            &params.connection_id,
-            guard.generation,
+            &guard,
             params.conversation_id,
             params.folder_id,
         )
@@ -2145,22 +2127,13 @@ mod tests {
 
     #[test]
     fn connect_response_does_not_mix_a_replacement_generation_snapshot() {
-        let replacement = crate::acp::shared_session::SharedSessionProjection {
-            generation: 2,
-            phase: SharedSessionPhase::Ready,
-            queue: Vec::new(),
-            active_turn: None,
-            lease_expires_at: None,
-            expired_lease_tombstone_count: 0,
-        };
-
         let selected = select_shared_connect_response_state(
             1,
             &SharedSessionPhase::Failed {
                 error_code: "session_unavailable".into(),
                 cleanup_complete: true,
             },
-            Some((&replacement, 42)),
+            Some((2, &SharedSessionPhase::Ready, 42)),
         );
 
         assert_eq!(
@@ -2208,7 +2181,7 @@ mod tests {
             .connection_manager
             .shared_session_broker()
             .reserve_or_attach(SharedReserveRequest {
-                key: SharedSessionKey::Conversation(conversation_id),
+                key: SharedSessionKey::Ephemeral(format!("handler-owner-{conversation_id}")),
                 connection_id: connection_id.into(),
                 launch_identity: SharedLaunchIdentity {
                     agent_type: AgentType::Codex,
@@ -2230,6 +2203,52 @@ mod tests {
             .unwrap()
             .attachment;
         (state, dir, attachment)
+    }
+
+    #[tokio::test]
+    async fn broker_snapshot_retains_authoritative_identity_and_public_sequence() {
+        let (state, _dir, attachment) = broker_owned_mutation_state(
+            "retained-snapshot",
+            1965,
+            crate::auto_title::ConnectionPurpose::User,
+        )
+        .await;
+        let public_state = state
+            .connection_manager
+            .get_state(&attachment.connection_id)
+            .await
+            .expect("registered test state");
+        {
+            let mut public_state = public_state.write().await;
+            public_state.conversation_id = None;
+            public_state.event_seq = 41;
+        }
+        let broker = state.connection_manager.shared_session_broker();
+        broker
+            .bind_conversation_key(&attachment.connection_id, attachment.generation, 1965)
+            .await
+            .expect("bind authoritative conversation key");
+        broker
+            .install_registered(
+                &attachment.connection_id,
+                attachment.generation,
+                "retained-snapshot-driver".into(),
+                public_state,
+                EventEmitter::Noop,
+                Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            )
+            .await
+            .expect("install broker-retained state");
+
+        let snapshot = broker
+            .authoritative_snapshot(&attachment.connection_id)
+            .await
+            .expect("authoritative snapshot");
+        assert_eq!(snapshot.purpose, crate::auto_title::ConnectionPurpose::User);
+        assert_eq!(snapshot.canonical_conversation_id, Some(1965));
+        assert_eq!(snapshot.generation, attachment.generation);
+        assert_eq!(snapshot.phase, SharedSessionPhase::Bootstrapping);
+        assert_eq!(snapshot.event_seq, 41);
     }
 
     #[tokio::test]

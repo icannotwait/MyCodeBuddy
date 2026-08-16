@@ -272,19 +272,14 @@ pub async fn ensure_web_shared_or_delegate_interactive(
         .await;
     }
 
-    let launch_identity = manager
+    let snapshot = manager
         .shared_session_broker()
-        .launch_identity_for_connection(connection_id)
+        .authoritative_snapshot(connection_id)
         .await?;
-    if launch_identity.purpose != ConnectionPurpose::User {
+    if snapshot.purpose != ConnectionPurpose::User {
         return Err(crate::acp::shared_session::SharedSessionError::ProtocolRequired.into());
     }
-    let state = manager.get_state(connection_id).await.ok_or({
-        crate::acp::error::AcpError::Shared(
-            crate::acp::shared_session::SharedSessionError::SessionUnavailable,
-        )
-    })?;
-    let canonical_conversation_id = state.read().await.conversation_id;
+    let canonical_conversation_id = snapshot.canonical_conversation_id;
     if let (Some(canonical), Some(requested)) = (canonical_conversation_id, request_conversation_id)
     {
         if canonical != requested {
