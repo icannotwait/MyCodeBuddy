@@ -931,6 +931,231 @@ describe("Skill contract v2", () => {
     )
   })
 
+  for (const [name, prose] of [
+    [
+      "normal review with a second Grok actor",
+      "Normal Tasks are reviewed by Codex and Grok.",
+    ],
+    [
+      "normal review with a second Task Agent actor",
+      "Normal Tasks are reviewed by Codex and the Task Agent.",
+    ],
+    [
+      "normal implementation with a second Codex actor",
+      "Normal Tasks are implemented by Grok and Codex.",
+    ],
+    [
+      "high implementation with a second Grok actor",
+      "High Tasks are implemented by Codex and Grok.",
+    ],
+    [
+      "high implementation with a second Task Agent actor",
+      "High Tasks are implemented by Codex and the Task Agent.",
+    ],
+    [
+      "high route with a second Grok target",
+      "Route high Tasks to Codex and Grok.",
+    ],
+    [
+      "high route with a second Task Agent target",
+      "Route high Tasks to Codex and the Task Agent.",
+    ],
+    [
+      "high delegation with a second Grok target",
+      "Delegate high Tasks to Codex and Grok.",
+    ],
+    [
+      "normal delegation with a second Codex target",
+      "Delegate normal Tasks to Grok and Codex.",
+    ],
+    [
+      "comma-coordinated normal review actors",
+      "Normal Tasks are reviewed by Codex, Grok, and the Task Agent.",
+    ],
+    [
+      "comma-coordinated high route targets",
+      "Route high Tasks to Codex, Grok, and the Task Agent.",
+    ],
+  ]) {
+    it(`round-8 coordinated actor binding rejects ${name}`, () => {
+      has(validateSkillMarkdown(`${skill}\n${prose}`).failures, "B2D-SKILL-005")
+    })
+  }
+
+  for (const [name, prose] of [
+    [
+      "Codex then Grok high review actors",
+      "High Tasks are reviewed by Codex and Grok.",
+    ],
+    [
+      "Task Agent then Codex high review actors",
+      "High Tasks are reviewed by the Task Agent and Codex.",
+    ],
+    [
+      "Codex then Task Agent high review actors",
+      "High Tasks are reviewed by Codex and the Task Agent.",
+    ],
+    ["single Codex high implementer", "High Tasks are implemented by Codex."],
+    ["single Grok normal implementer", "Normal Tasks are implemented by Grok."],
+    ["single Codex high target", "Route high Tasks to Codex."],
+    ["single Grok normal target", "Delegate normal Tasks to Grok."],
+    [
+      "separate high implementation and auxiliary routes",
+      "Route high Tasks to Codex and delegate their auxiliary review to the Task Agent.",
+    ],
+  ]) {
+    it(`round-8 coordinated actor binding accepts ${name}`, () => {
+      assert.deepEqual(validateSkillMarkdown(`${skill}\n${prose}`).failures, [])
+    })
+  }
+
+  for (const [name, prose] of [
+    [
+      "normal Codex auxiliary route",
+      "Route normal Tasks to Codex for auxiliary review.",
+    ],
+    [
+      "normal passive Codex auxiliary slot",
+      "Normal Tasks are reviewed by Codex in the auxiliary slot.",
+    ],
+    [
+      "normal preposed auxiliary route",
+      "Normal Tasks route auxiliary review to Codex.",
+    ],
+    ["normal auxiliary reviewer", "Normal Tasks have an auxiliary reviewer."],
+    [
+      "normal primary and auxiliary reviewers",
+      "Normal Tasks have primary and auxiliary reviewers.",
+    ],
+    [
+      "high Codex-only passive review",
+      "High Tasks are reviewed only by Codex.",
+    ],
+    [
+      "high Codex review with no other reviewer",
+      "High Tasks are reviewed by Codex and no other reviewer.",
+    ],
+    [
+      "high missing auxiliary reviewer",
+      "High Tasks have no auxiliary reviewer.",
+    ],
+    [
+      "high Codex primary with no auxiliary reviewer",
+      "High Tasks have Codex primary and no auxiliary reviewer.",
+    ],
+    ["high sole Codex reviewer", "High Tasks use Codex as the only reviewer."],
+  ]) {
+    it(`round-8 reviewer slot and cardinality rejects ${name}`, () => {
+      has(validateSkillMarkdown(`${skill}\n${prose}`).failures, "B2D-SKILL-005")
+    })
+  }
+
+  for (const [name, prose] of [
+    [
+      "normal Codex primary route",
+      "Route normal Tasks to Codex for primary review.",
+    ],
+    [
+      "normal passive Codex primary slot",
+      "Normal Tasks are reviewed by Codex in the primary slot.",
+    ],
+    [
+      "normal sole Codex reviewer",
+      "Normal Tasks use Codex as the only reviewer.",
+    ],
+    [
+      "high primary then auxiliary passive roles",
+      "High Tasks are reviewed by Codex as primary and Grok as auxiliary reviewers.",
+    ],
+    [
+      "high auxiliary then primary passive roles",
+      "High Tasks are reviewed by the Task Agent as auxiliary and Codex as primary reviewers.",
+    ],
+    [
+      "high primary then auxiliary direct routes",
+      "Route high Tasks to Codex for primary review and to Grok for auxiliary review.",
+    ],
+    [
+      "high auxiliary then primary direct routes",
+      "Route high Tasks auxiliary review to the Task Agent and primary review to Codex.",
+    ],
+    [
+      "high exact reviewer set",
+      "High Tasks use Codex and the Task Agent as the only reviewers.",
+    ],
+  ]) {
+    it(`round-8 reviewer slot and cardinality accepts ${name}`, () => {
+      assert.deepEqual(validateSkillMarkdown(`${skill}\n${prose}`).failures, [])
+    })
+  }
+
+  for (const [name, prose] of [
+    [
+      "normal auxiliary reviewer prohibition",
+      "Normal Tasks must not have an auxiliary reviewer.",
+    ],
+    [
+      "normal auxiliary route prohibition",
+      "Never route normal Tasks to Codex for auxiliary review.",
+    ],
+    [
+      "high auxiliary skip prohibition",
+      "Never skip the auxiliary reviewer for high Tasks.",
+    ],
+    [
+      "high auxiliary omission prohibition",
+      "Do not omit Task Agent auxiliary review from high Tasks.",
+    ],
+    [
+      "high Codex-only prohibition",
+      "High Tasks must not use Codex as the only reviewer.",
+    ],
+  ]) {
+    it(`round-8 reviewer prohibition accepts ${name}`, () => {
+      assert.deepEqual(validateSkillMarkdown(`${skill}\n${prose}`).failures, [])
+    })
+  }
+
+  for (const [name, prose] of [
+    ["high missing primary reviewer", "High Tasks have no primary reviewer."],
+    [
+      "normal missing primary reviewer",
+      "Normal Tasks have no primary reviewer.",
+    ],
+    ["normal zero reviewers", "Normal Tasks have no reviewer."],
+    ["high zero reviewers", "High Tasks have no reviewers."],
+    ["high one-reviewer cardinality", "High Tasks have only one reviewer."],
+    ["normal two-reviewer cardinality", "Normal Tasks have two reviewers."],
+    ["high three-reviewer cardinality", "High Tasks have three reviewers."],
+    ["high missing Codex reviewer", "High Tasks have no Codex reviewer."],
+    ["normal missing Codex reviewer", "Normal Tasks have no Codex reviewer."],
+    [
+      "high missing Task Agent reviewer",
+      "High Tasks have no Task Agent reviewer.",
+    ],
+  ]) {
+    it(`round-8 exact reviewer set rejects ${name}`, () => {
+      has(validateSkillMarkdown(`${skill}\n${prose}`).failures, "B2D-SKILL-005")
+    })
+  }
+
+  for (const [name, prose] of [
+    ["normal one-reviewer cardinality", "Normal Tasks have only one reviewer."],
+    ["high two-reviewer cardinality", "High Tasks have exactly two reviewers."],
+    [
+      "normal Task Agent reviewer exclusion",
+      "Normal Tasks have no Task Agent reviewer.",
+    ],
+    [
+      "required high reviewer omission prohibition",
+      "Do not omit the primary or auxiliary reviewer from high Tasks.",
+    ],
+  ]) {
+    it(`round-8 exact reviewer set accepts ${name}`, () => {
+      assert.deepEqual(validateSkillMarkdown(`${skill}\n${prose}`).failures, [])
+    })
+  }
+
   it("contains the complete operational policy and document JSON shapes", () => {
     const policy = fencedJsonAfterHeading(
       realSkill,

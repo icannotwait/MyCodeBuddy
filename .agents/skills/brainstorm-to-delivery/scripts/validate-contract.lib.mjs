@@ -1138,10 +1138,14 @@ function nearestActionBefore(clause, index) {
   return clause.actions.filter((action) => action.index < index).at(-1)
 }
 
-function actorAfterLink(clause, link) {
-  return clause.actors.find(
-    (actor) => actor.start > link && actor.start <= link + 3
+function actorsAfterLink(clause, link, end = clause.tokens.length) {
+  const nextLink = tokenIndex(clause.tokens, ACTOR_LINKS, link + 1, end)
+  const relationEnd = nextLink >= 0 ? nextLink : end
+  const actors = clause.actors.filter(
+    (actor) => actor.start > link && actor.end <= relationEnd
   )
+  if (actors.length === 0 || actors[0].start > link + 3) return []
+  return actors
 }
 
 function directPassiveActorsForAction(clause, action) {
@@ -1155,9 +1159,14 @@ function directPassiveActorsForAction(clause, action) {
     action.index + 1,
     nextAction?.index ?? clause.tokens.length
   )) {
-    const actor = actorAfterLink(clause, link)
-    if (actor && !relationTargetIsNegated(clause, action, link)) {
-      actors.push(actor)
+    if (!relationTargetIsNegated(clause, action, link)) {
+      actors.push(
+        ...actorsAfterLink(
+          clause,
+          link,
+          nextAction?.index ?? clause.tokens.length
+        )
+      )
     }
   }
   return actors
@@ -1189,9 +1198,9 @@ function passiveActorsForAction(clause, action) {
       new Set(["by"]),
       last.index + 1,
       nextAction?.index ?? clause.tokens.length
+    ).flatMap((link) =>
+      actorsAfterLink(clause, link, nextAction?.index ?? clause.tokens.length)
     )
-      .map((link) => actorAfterLink(clause, link))
-      .filter(Boolean)
   )
 }
 
@@ -1297,20 +1306,53 @@ function routeReviewPurpose(clause, action) {
   return "review"
 }
 
-function routeTargetsForAction(clause, action) {
+function singleReviewSlot(clause, start, end) {
+  const slots = ["primary", "auxiliary"].filter(
+    (slot) => tokenIndex(clause.tokens, new Set([slot]), start, end) >= 0
+  )
+  return slots.length === 1 ? slots[0] : null
+}
+
+function relationBindingsAfterLink(clause, action, link, end) {
+  const nextLink = tokenIndex(clause.tokens, ACTOR_LINKS, link + 1, end)
+  const relationEnd = nextLink >= 0 ? nextLink : end
+  const actors = actorsAfterLink(clause, link, end)
+  const coordinator = tokenIndexes(
+    clause.tokens,
+    CLAUSE_COORDINATORS,
+    action.index + 1,
+    link
+  ).at(-1)
+  const prefixSlot = singleReviewSlot(
+    clause,
+    (coordinator ?? action.index) + 1,
+    link
+  )
+  return actors.map((actor, index) => ({
+    actor,
+    slot:
+      prefixSlot ??
+      singleReviewSlot(
+        clause,
+        actor.end,
+        actors[index + 1]?.start ?? relationEnd
+      ),
+  }))
+}
+
+function routeTargetBindingsForAction(clause, action) {
   const nextRoute = clause.actions.find(
     (candidate) => candidate.kind === "route" && candidate.index > action.index
   )
   const end = nextRoute?.index ?? clause.tokens.length
-  const targets = tokenIndexes(
+  const bindings = tokenIndexes(
     clause.tokens,
     new Set(["to"]),
     action.index + 1,
     end
   )
     .filter((link) => !relationTargetIsNegated(clause, action, link))
-    .map((link) => actorAfterLink(clause, link))
-    .filter(Boolean)
+    .flatMap((link) => relationBindingsAfterLink(clause, action, link, end))
   const reflexive = tokenIndexes(
     clause.tokens,
     REFLEXIVE_TARGETS,
@@ -1318,9 +1360,21 @@ function routeTargetsForAction(clause, action) {
     end
   )
   if (reflexive.length > 0 && !actionIsNegated(clause.tokens, action.index)) {
-    targets.push(...subjectActorsForAction(clause, action))
+    bindings.push(
+      ...subjectActorsForAction(clause, action).map((actor) => ({
+        actor,
+        slot: null,
+      }))
+    )
   }
-  return uniqueActors(targets)
+  return bindings.filter(
+    (binding, index) =>
+      bindings.findIndex(
+        (candidate) =>
+          candidate.actor.role === binding.actor.role &&
+          candidate.actor.start === binding.actor.start
+      ) === index
+  )
 }
 
 function actionDelegatesToProducer(clause, parent, action) {
@@ -1406,6 +1460,278 @@ function repeatedProducerSubjectForAction(clause, action) {
   )
 }
 
+function reviewActorBindingsForAction(clause, action) {
+  const nextAction = clause.actions.find(
+    (candidate) => candidate.index > action.index
+  )
+  const end = nextAction?.index ?? clause.tokens.length
+  const passive = tokenIndexes(
+    clause.tokens,
+    new Set(["by"]),
+    action.index + 1,
+    end
+  ).flatMap((link) => relationBindingsAfterLink(clause, action, link, end))
+  if (passive.length > 0) return passive
+
+  const actors = subjectActorsForAction(clause, action)
+  return actors.map((actor, index) => ({
+    actor,
+    slot: singleReviewSlot(
+      clause,
+      actor.end,
+      actors[index + 1]?.start ?? action.index
+    ),
+  }))
+}
+
+function statementIsNegatedBeforeAction(clause, action) {
+  const segment = actionSegment(clause, action.index)
+  return (
+    tokenIndex(clause.tokens, NEGATION_TERMS, segment.start, action.index) >= 0
+  )
+}
+
+function reviewSlotForAction(clause, action) {
+  const segment = actionSegment(clause, action.index)
+  return singleReviewSlot(clause, segment.start, segment.end)
+}
+
+function relationIsExplicitlyAbsent(clause, start, segmentStart) {
+  const absence = tokenIndexes(
+    clause.tokens,
+    new Set(["no", "without"]),
+    Math.max(segmentStart, start - 3),
+    start
+  ).at(-1)
+  return (
+    absence !== undefined &&
+    tokenIndex(clause.tokens, new Set(["other"]), absence + 1, start) < 0
+  )
+}
+
+function reviewerSlotIsExplicitlyAbsent(clause, action, slotName) {
+  const segment = actionSegment(clause, action.index)
+  return tokenIndexes(
+    clause.tokens,
+    new Set([slotName]),
+    segment.start,
+    segment.end
+  ).some((slot) => relationIsExplicitlyAbsent(clause, slot, segment.start))
+}
+
+function reviewerRoleIsExplicitlyAbsent(clause, action, role) {
+  const segment = actionSegment(clause, action.index)
+  return clause.actors
+    .filter(
+      (actor) =>
+        actor.role === role &&
+        actor.start >= segment.start &&
+        actor.end <= segment.end
+    )
+    .some((actor) =>
+      relationIsExplicitlyAbsent(clause, actor.start, segment.start)
+    )
+}
+
+function reviewerSetIsExplicitlyEmpty(clause, action) {
+  const segment = actionSegment(clause, action.index)
+  const absence = tokenIndexes(
+    clause.tokens,
+    new Set(["no", "without"]),
+    Math.max(segment.start, action.index - 3),
+    action.index
+  ).at(-1)
+  if (absence === undefined) return false
+  const qualified =
+    tokenIndex(
+      clause.tokens,
+      new Set(["auxiliary", "codex", "other", "primary", "task", "agent"]),
+      absence + 1,
+      action.index
+    ) >= 0
+  return !qualified
+}
+
+function explicitReviewerCount(clause, action) {
+  const counts = new Map([
+    ["one", 1],
+    ["1", 1],
+    ["two", 2],
+    ["2", 2],
+    ["three", 3],
+    ["3", 3],
+  ])
+  const start = Math.max(
+    actionSegment(clause, action.index).start,
+    action.index - 4
+  )
+  for (let index = action.index - 1; index >= start; index -= 1) {
+    const count = counts.get(clause.tokens[index])
+    if (count === undefined) continue
+    if (
+      tokenIndex(
+        clause.tokens,
+        new Set(["auxiliary", "codex", "primary", "task", "agent"]),
+        index + 1,
+        action.index
+      ) < 0
+    ) {
+      return count
+    }
+  }
+  return null
+}
+
+function reviewStatementIsExhaustive(clause, action) {
+  const segment = actionSegment(clause, action.index)
+  if (
+    tokenIndex(clause.tokens, new Set(["only"]), segment.start, segment.end) >=
+    0
+  ) {
+    return true
+  }
+  return ["reviewer", "reviewers"].some(
+    (reviewer) =>
+      phraseIndex(clause.tokens, ["no", "other", reviewer], action.index) >= 0
+  )
+}
+
+function actorsMatchReviewerSet(actors, expected) {
+  if (actors.length !== expected.length) return false
+  const actualRoles = actors.map((actor) => actor.role).sort()
+  const expectedRoles = [...expected].sort()
+  return actualRoles.every((role, index) => role === expectedRoles[index])
+}
+
+function conflictsWithReviewRoute(clause, action, scopes) {
+  const bindings = reviewActorBindingsForAction(clause, action)
+  const actors = bindings.map((binding) => binding.actor)
+  const normal = ["normal", "universal"].some((scope) => scopes.has(scope))
+  const high = ["high", "universal"].some((scope) => scopes.has(scope))
+  const negated = statementIsNegatedBeforeAction(clause, action)
+
+  if ((normal || high) && reviewerSetIsExplicitlyEmpty(clause, action)) {
+    return true
+  }
+  if (
+    (normal || high) &&
+    (reviewerSlotIsExplicitlyAbsent(clause, action, "primary") ||
+      reviewerRoleIsExplicitlyAbsent(clause, action, "codex"))
+  ) {
+    return true
+  }
+  if (
+    high &&
+    (reviewerSlotIsExplicitlyAbsent(clause, action, "auxiliary") ||
+      reviewerRoleIsExplicitlyAbsent(clause, action, "task_agent"))
+  ) {
+    return true
+  }
+  if (negated) return false
+
+  const explicitCount = explicitReviewerCount(clause, action)
+  if (
+    (normal && explicitCount !== null && explicitCount !== 1) ||
+    (high && explicitCount !== null && explicitCount !== 2)
+  ) {
+    return true
+  }
+
+  const actionSlot = reviewSlotForAction(clause, action)
+  if (
+    normal &&
+    (actionSlot === "auxiliary" ||
+      bindings.some((binding) => binding.slot === "auxiliary") ||
+      actors.length > 1)
+  ) {
+    return true
+  }
+  if (high && actors.length > 2) return true
+
+  for (const { actor, slot } of bindings) {
+    if (
+      high &&
+      ((slot === "primary" && actor.role === "task_agent") ||
+        (slot === "auxiliary" && actor.role === "codex"))
+    ) {
+      return true
+    }
+  }
+
+  if (!reviewStatementIsExhaustive(clause, action) || actors.length === 0) {
+    return false
+  }
+  if (normal && !actorsMatchReviewerSet(actors, ["codex"])) return true
+  if (high && !actorsMatchReviewerSet(actors, ["codex", "task_agent"])) {
+    return true
+  }
+  return false
+}
+
+function conflictsWithDirectRoute(clause, action, scopes) {
+  const bindings = routeTargetBindingsForAction(clause, action)
+  const targets = bindings.map((binding) => binding.actor)
+  const purpose = routeReviewPurpose(clause, action)
+  const normal = ["normal", "universal"].some((scope) => scopes.has(scope))
+  const high = ["high", "universal"].some((scope) => scopes.has(scope))
+
+  if (purpose) {
+    if (
+      normal &&
+      (targets.length > 1 ||
+        targets.some((target) => target.role !== "codex") ||
+        bindings.some((binding) => binding.slot === "auxiliary"))
+    ) {
+      return true
+    }
+    if (high && targets.length > 2) return true
+    if (
+      high &&
+      targets.some((target) => !["codex", "task_agent"].includes(target.role))
+    ) {
+      return true
+    }
+    if (
+      high &&
+      bindings.some(
+        ({ actor, slot }) =>
+          (slot === "primary" && actor.role === "task_agent") ||
+          (slot === "auxiliary" && actor.role === "codex")
+      )
+    ) {
+      return true
+    }
+    if (
+      high &&
+      targets.some(
+        (target, index) =>
+          targets.findIndex((candidate) => candidate.role === target.role) !==
+          index
+      )
+    ) {
+      return true
+    }
+    return false
+  }
+
+  if (targets.length > 1) return true
+  return targets.some(
+    (target) =>
+      (high && target.role === "task_agent") ||
+      (normal && target.role === "codex")
+  )
+}
+
+function reviewActionIsRoutePurpose(clause, action) {
+  const route = clause.actions
+    .filter(
+      (candidate) =>
+        candidate.kind === "route" && candidate.index < action.index
+    )
+    .at(-1)
+  return Boolean(route && routeReviewPurpose(clause, route))
+}
+
 function conflictsWithParentOwnership(clause) {
   const parents = clause.actors.filter((actor) => actor.role === "parent")
   for (const parent of parents) {
@@ -1448,6 +1774,14 @@ function conflictsWithParentOwnership(clause) {
 function conflictsWithTaskAgentRoute(clause) {
   for (const action of clause.actions) {
     const passiveSubjects = passiveActorsForAction(clause, action)
+    const scopes = actionTaskScopes(clause, action)
+    if (
+      action.kind === "review" &&
+      !reviewActionIsRoutePurpose(clause, action) &&
+      conflictsWithReviewRoute(clause, action, scopes)
+    ) {
+      return true
+    }
     if (
       action.kind !== "route" &&
       actionIsNegated(clause.tokens, action.index) &&
@@ -1455,11 +1789,17 @@ function conflictsWithTaskAgentRoute(clause) {
     ) {
       continue
     }
-    const scopes = actionTaskScopes(clause, action)
     const subjects =
       passiveSubjects.length > 0
         ? passiveSubjects
         : subjectActorsForAction(clause, action)
+    if (
+      action.kind === "production" &&
+      !scopes.has("unspecified") &&
+      subjects.length > 1
+    ) {
+      return true
+    }
     if (
       action.kind === "production" &&
       ["high", "universal"].some((scope) => scopes.has(scope)) &&
@@ -1485,29 +1825,7 @@ function conflictsWithTaskAgentRoute(clause) {
       continue
     }
     if (subjects.some((actor) => actor.role === "task_agent")) return true
-
-    const targets = routeTargetsForAction(clause, action)
-    const purpose = routeReviewPurpose(clause, action)
-    for (const target of targets) {
-      if (purpose) {
-        if (
-          (["normal", "universal"].some((scope) => scopes.has(scope)) &&
-            target.role === "task_agent") ||
-          (["high", "universal"].some((scope) => scopes.has(scope)) &&
-            ((purpose === "primary" && target.role === "task_agent") ||
-              (purpose === "auxiliary" && target.role === "codex")))
-        ) {
-          return true
-        }
-      } else if (
-        (["high", "universal"].some((scope) => scopes.has(scope)) &&
-          target.role === "task_agent") ||
-        (["normal", "universal"].some((scope) => scopes.has(scope)) &&
-          target.role === "codex")
-      ) {
-        return true
-      }
-    }
+    if (conflictsWithDirectRoute(clause, action, scopes)) return true
   }
   return false
 }
