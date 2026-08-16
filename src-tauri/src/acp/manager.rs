@@ -1205,7 +1205,7 @@ impl ConnectionManager {
             }
             Err(SharedControlAdmissionError::InteractionAlreadyResolved { .. }) => {
                 self.shared_session_broker
-                    .complete_interaction(claim)
+                    .complete_interaction_as_stale(claim)
                     .await?;
                 Err(AcpError::Shared(
                     SharedSessionError::InteractionAlreadyResolved,
@@ -2319,31 +2319,52 @@ impl ConnectionManager {
 
         match action {
             SharedBootstrapAction::Ready => {
-                if let Ok(events) = self
+                match self
                     .shared_session_broker
                     .mark_ready(&connection_id, generation, &driver_incarnation)
                     .await
                 {
-                    // Phase waiters consume the authoritative broker watch;
-                    // event publication follows as a separate unlocked step.
-                    tokio::task::yield_now().await;
-                    for event in events {
-                        if self
-                            .publish_shared_event(&connection_id, event)
+                    Ok(events) => {
+                        // Phase waiters consume the authoritative broker watch;
+                        // event publication follows as a separate unlocked step.
+                        tokio::task::yield_now().await;
+                        for event in events {
+                            if self
+                                .publish_shared_event(&connection_id, event)
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        let _ = self
+                            .shared_session_broker
+                            .notify_dispatcher(&connection_id, generation)
+                            .await;
+                        self.shared_launches
+                            .lock()
                             .await
-                            .is_err()
-                        {
-                            return;
+                            .remove(&(connection_id, generation));
+                    }
+                    Err(SharedSessionError::SessionUnavailable) => {
+                        let launch = self
+                            .shared_launches
+                            .lock()
+                            .await
+                            .get(&(connection_id.clone(), generation))
+                            .cloned();
+                        if let Some(launch) = launch {
+                            self.fail_shared_generation(
+                                connection_id,
+                                generation,
+                                Some(driver_incarnation),
+                                SharedSessionError::SessionUnavailable,
+                                launch,
+                            )
+                            .await;
                         }
                     }
-                    let _ = self
-                        .shared_session_broker
-                        .notify_dispatcher(&connection_id, generation)
-                        .await;
-                    self.shared_launches
-                        .lock()
-                        .await
-                        .remove(&(connection_id, generation));
+                    Err(_) => {}
                 }
             }
             SharedBootstrapAction::Fail(error) => {
@@ -11081,6 +11102,47 @@ mod tests {
             .unwrap();
         assert_eq!(manager.shared_spawn_count_for_test(), 2);
         assert_eq!(start_log.lock().unwrap().as_slice(), ["start-1", "start-2"]);
+    }
+
+    #[tokio::test]
+    async fn ready_bootstrap_outcome_cannot_revive_a_terminal_driver_state() {
+        let (driver, gate) = FakeSharedSpawnDriver::pending();
+        let manager = ConnectionManager::new_with_shared_spawn_driver(Arc::new(driver));
+        let response = manager
+            .connect_or_attach_shared(shared_launch(593, "client").await)
+            .await
+            .unwrap();
+        let (state, _) = manager
+            .get_state_and_emitter(&response.connection_id)
+            .await
+            .expect("registered shared state");
+        state.write().await.status = ConnectionStatus::Error;
+        gate.send(RouteBootstrapOutcome::Ready).unwrap();
+
+        let expected = SharedSessionPhase::Failed {
+            error_code: "session_unavailable".into(),
+            cleanup_complete: true,
+        };
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            manager.wait_for_shared_phase(
+                &response.connection_id,
+                response.generation,
+                expected.clone(),
+            ),
+        )
+        .await
+        .expect("terminal bootstrap must settle instead of remaining bootstrapping")
+        .unwrap();
+        assert_eq!(
+            manager
+                .shared_session_broker()
+                .diagnostic_for_connection(&response.connection_id)
+                .await
+                .unwrap()
+                .phase,
+            expected
+        );
     }
 
     #[tokio::test]

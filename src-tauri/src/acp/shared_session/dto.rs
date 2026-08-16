@@ -173,7 +173,7 @@ pub struct SharedRuntimeWorkSnapshot {
     pub conversation_write_error: Option<&'static str>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SharedInteractionKind {
     Permission,
     Question,

@@ -59,6 +59,12 @@ pub(crate) struct SharedInteractionClaim {
     generation: u64,
     kind: SharedInteractionKind,
     interaction_id: String,
+    claim_id: uuid::Uuid,
+}
+
+struct ActiveInteractionClaim {
+    interaction_id: String,
+    claim_id: uuid::Uuid,
 }
 
 #[derive(Clone)]
@@ -1536,21 +1542,35 @@ impl SharedSessionBroker {
             .with_authoritative_record(&guard.connection_id, |record| {
                 self.ensure_accepting()?;
                 self.validate_prompt_guard(record, guard)?;
-                let interaction = record
-                    .interactions
-                    .get_mut(kind)
-                    .as_mut()
-                    .filter(|interaction| interaction.id == interaction_id)
-                    .ok_or(SharedSessionError::InteractionAlreadyResolved)?;
-                if interaction.admission != InteractionAdmissionState::Pending {
+                if record.interaction_claims.contains_key(&kind) {
                     return Err(SharedSessionError::InteractionAlreadyResolved);
                 }
-                interaction.admission = InteractionAdmissionState::Resolving;
+                {
+                    let interaction = record
+                        .interactions
+                        .get_mut(kind)
+                        .as_mut()
+                        .filter(|interaction| interaction.id == interaction_id)
+                        .ok_or(SharedSessionError::InteractionAlreadyResolved)?;
+                    if interaction.admission != InteractionAdmissionState::Pending {
+                        return Err(SharedSessionError::InteractionAlreadyResolved);
+                    }
+                    interaction.admission = InteractionAdmissionState::Resolving;
+                }
+                let claim_id = uuid::Uuid::new_v4();
+                record.interaction_claims.insert(
+                    kind,
+                    ActiveInteractionClaim {
+                        interaction_id: interaction_id.to_string(),
+                        claim_id,
+                    },
+                );
                 Ok(SharedInteractionClaim {
                     connection_id: guard.connection_id.clone(),
                     generation: guard.generation,
                     kind,
                     interaction_id: interaction_id.to_string(),
+                    claim_id,
                 })
             })
             .await;
@@ -1576,19 +1596,21 @@ impl SharedSessionBroker {
                 if record.generation != claim.generation {
                     return Err(SharedSessionError::GenerationStale);
                 }
-                let completed =
+                let completed = record
+                    .interaction_claims
+                    .get(&claim.kind)
+                    .is_some_and(|active| {
+                        active.interaction_id == claim.interaction_id
+                            && active.claim_id == claim.claim_id
+                    });
+                if completed {
+                    record.interaction_claims.remove(&claim.kind);
                     if let Some(interaction) = record.interactions.get_mut(claim.kind).as_mut() {
-                        if interaction.id == claim.interaction_id
-                            && interaction.admission == InteractionAdmissionState::Resolving
-                        {
+                        if interaction.id == claim.interaction_id {
                             interaction.admission = InteractionAdmissionState::Resolved;
-                            true
-                        } else {
-                            false
                         }
-                    } else {
-                        false
-                    };
+                    }
+                }
                 Ok(completed)
             })
             .await?;
@@ -1597,6 +1619,42 @@ impl SharedSessionBroker {
             .await?;
         if completed {
             self.metrics.record_interaction_winner();
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn complete_interaction_as_stale(
+        &self,
+        claim: &SharedInteractionClaim,
+    ) -> Result<(), SharedSessionError> {
+        let result = self
+            .with_authoritative_record(&claim.connection_id, |record| {
+                if record.generation != claim.generation {
+                    return Err(SharedSessionError::GenerationStale);
+                }
+                let completed = record
+                    .interaction_claims
+                    .get(&claim.kind)
+                    .is_some_and(|active| {
+                        active.interaction_id == claim.interaction_id
+                            && active.claim_id == claim.claim_id
+                    });
+                if completed {
+                    record.interaction_claims.remove(&claim.kind);
+                    if let Some(interaction) = record.interactions.get_mut(claim.kind).as_mut() {
+                        if interaction.id == claim.interaction_id {
+                            interaction.admission = InteractionAdmissionState::Resolved;
+                        }
+                    }
+                }
+                Ok(completed)
+            })
+            .await?;
+        let completed = self
+            .require_authoritative_result(&claim.connection_id, claim.generation, result)
+            .await?;
+        if completed {
+            self.metrics.record_interaction_stale();
         }
         Ok(())
     }
@@ -1610,11 +1668,21 @@ impl SharedSessionBroker {
                 if record.generation != claim.generation {
                     return Err(SharedSessionError::GenerationStale);
                 }
-                if let Some(interaction) = record.interactions.get_mut(claim.kind).as_mut() {
-                    if interaction.id == claim.interaction_id
-                        && interaction.admission == InteractionAdmissionState::Resolving
-                    {
-                        interaction.admission = InteractionAdmissionState::Pending;
+                let owns_claim = record
+                    .interaction_claims
+                    .get(&claim.kind)
+                    .is_some_and(|active| {
+                        active.interaction_id == claim.interaction_id
+                            && active.claim_id == claim.claim_id
+                    });
+                if owns_claim {
+                    record.interaction_claims.remove(&claim.kind);
+                    if let Some(interaction) = record.interactions.get_mut(claim.kind).as_mut() {
+                        if interaction.id == claim.interaction_id
+                            && interaction.admission == InteractionAdmissionState::Resolving
+                        {
+                            interaction.admission = InteractionAdmissionState::Pending;
+                        }
                     }
                 }
                 Ok(())
@@ -2832,6 +2900,13 @@ impl SharedSessionBroker {
                 return Err(SharedSessionError::GenerationStale);
             }
             let state = state.ok_or(SharedSessionError::SessionUnavailable)?;
+            if matches!(
+                state.status,
+                crate::acp::types::ConnectionStatus::Disconnected
+                    | crate::acp::types::ConnectionStatus::Error
+            ) {
+                return Err(SharedSessionError::SessionUnavailable);
+            }
             update_public_shared_phase(state, generation, SharedSessionPhase::Ready);
             let now = tokio::time::Instant::now();
             record.finish_bootstrap(now);
@@ -4033,6 +4108,7 @@ struct SharedSessionRecord {
     next_enqueue_seq: u64,
     active_turn: Option<BrokerActiveTurn>,
     interactions: SharedInteractions,
+    interaction_claims: HashMap<SharedInteractionKind, ActiveInteractionClaim>,
     host_owned_work: HashSet<uuid::Uuid>,
     idle_zero_since: Option<tokio::time::Instant>,
     failed_zero_since: Option<tokio::time::Instant>,
@@ -4077,6 +4153,7 @@ impl SharedSessionRecord {
             next_enqueue_seq: 1,
             active_turn: None,
             interactions: SharedInteractions::default(),
+            interaction_claims: HashMap::new(),
             host_owned_work: HashSet::new(),
             idle_zero_since: None,
             failed_zero_since: None,

@@ -2160,6 +2160,13 @@ async fn two_clients_have_one_permission_question_and_plan_responder_winner() {
         commands.try_recv(),
         Err(tokio::sync::mpsc::error::TryRecvError::Empty)
     ));
+    let metrics = fixture
+        .manager()
+        .shared_session_broker()
+        .metrics()
+        .snapshot();
+    assert_eq!(metrics.interaction_winner_total, 3);
+    assert_eq!(metrics.interaction_stale_total, 3);
 }
 
 #[tokio::test]

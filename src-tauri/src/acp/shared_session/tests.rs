@@ -853,6 +853,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_public_status_cannot_settle_bootstrap_as_ready() {
+        let broker = SharedSessionBroker::default();
+        let reservation = broker
+            .reserve_or_attach(request(
+                SharedSessionKey::Conversation(133),
+                "terminal-bootstrap-connection",
+                "terminal-bootstrap-client",
+                "terminal-bootstrap-request",
+            ))
+            .await
+            .unwrap();
+        let mut public_state = SessionState::new(
+            reservation.attachment.connection_id.clone(),
+            crate::models::agent::AgentType::Codex,
+            None,
+            "shared-server".into(),
+            Some(9),
+        );
+        public_state.status = crate::acp::types::ConnectionStatus::Error;
+        public_state.shared_session = Some(SharedSessionProjection {
+            generation: reservation.attachment.generation,
+            phase: SharedSessionPhase::Bootstrapping,
+            queue: Vec::new(),
+            active_turn: None,
+            lease_expires_at: Some(reservation.attachment.lease_expires_at),
+            expired_lease_tombstone_count: 0,
+        });
+        let state = Arc::new(tokio::sync::RwLock::new(public_state));
+        broker
+            .install_registered(
+                &reservation.attachment.connection_id,
+                reservation.attachment.generation,
+                "terminal-bootstrap-driver".into(),
+                state.clone(),
+                EventEmitter::Noop,
+                Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            broker
+                .mark_ready(
+                    &reservation.attachment.connection_id,
+                    reservation.attachment.generation,
+                    "terminal-bootstrap-driver",
+                )
+                .await,
+            Err(SharedSessionError::SessionUnavailable)
+        ));
+        assert_eq!(
+            broker
+                .diagnostic_for_connection(&reservation.attachment.connection_id)
+                .await
+                .unwrap()
+                .phase,
+            SharedSessionPhase::Bootstrapping
+        );
+        assert_eq!(
+            state.read().await.status,
+            crate::acp::types::ConnectionStatus::Error
+        );
+    }
+
+    #[tokio::test]
     async fn contended_public_state_does_not_hold_the_broker_record_lock() {
         let broker = SharedSessionBroker::default();
         let reservation = broker
@@ -3049,6 +3114,12 @@ mod tests {
                 SharedControlAdmissionError::MayHaveBeenAdmitted(AcpError::ProcessExited),
             );
         }
+
+        async fn fail_next_interaction_as_already_resolved(&self) {
+            self.adapter.interaction_failures.lock().await.push_back(
+                SharedControlAdmissionError::InteractionAlreadyResolved { local_error: None },
+            );
+        }
     }
 
     async fn ready_fixture_with_turn(turn_id: &str) -> SharedControlFixture {
@@ -3193,6 +3264,62 @@ mod tests {
     async fn two_plan_approval_answers_have_one_winner() {
         assert_two_answers_have_one_winner(SharedInteractionKind::PlanApproval, "plan-approval-1")
             .await;
+    }
+
+    #[tokio::test]
+    async fn resolved_event_does_not_erase_the_admitted_interaction_winner_metric() {
+        let fixture = ready_fixture_with_interaction(
+            SharedInteractionKind::Question,
+            "question-resolved-race",
+        )
+        .await;
+        let broker = fixture.manager.shared_session_broker();
+        let claim = broker
+            .claim_interaction(
+                &fixture.guard,
+                SharedInteractionKind::Question,
+                "question-resolved-race",
+            )
+            .await
+            .unwrap();
+        broker
+            .observe_interaction_resolved(
+                &fixture.attachment.connection_id,
+                fixture.attachment.generation,
+                "test-driver-1",
+                SharedInteractionKind::Question,
+                "question-resolved-race",
+            )
+            .await
+            .unwrap();
+
+        broker.complete_interaction(&claim).await.unwrap();
+
+        let metrics = broker.metrics().snapshot();
+        assert_eq!(metrics.interaction_winner_total, 1);
+        assert_eq!(metrics.interaction_stale_total, 0);
+    }
+
+    #[tokio::test]
+    async fn downstream_already_resolved_interaction_counts_stale_not_winner() {
+        let fixture = ready_fixture_with_interaction(
+            SharedInteractionKind::PlanApproval,
+            "plan-downstream-stale",
+        )
+        .await;
+        fixture.fail_next_interaction_as_already_resolved().await;
+
+        assert!(is_interaction_loser(
+            &fixture.claim("plan-downstream-stale").await
+        ));
+
+        let metrics = fixture
+            .manager
+            .shared_session_broker()
+            .metrics()
+            .snapshot();
+        assert_eq!(metrics.interaction_winner_total, 0);
+        assert_eq!(metrics.interaction_stale_total, 1);
     }
 
     #[tokio::test]
