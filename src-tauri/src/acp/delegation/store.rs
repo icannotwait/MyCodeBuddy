@@ -334,6 +334,10 @@ pub enum TaskStoreError {
     /// `invalid_replacement`.
     #[error("invalid replacement: {0}")]
     InvalidReplacement(String),
+    /// Explicit continuation/replacement binding disagrees with its source.
+    /// Wire code: `orchestration_binding_lineage_mismatch`.
+    #[error("orchestration binding lineage mismatch")]
+    OrchestrationBindingLineageMismatch,
     /// Continue target is not the latest terminal run. Wire: `stale_task_id`.
     #[error("stale task id: {0}")]
     StaleTaskId(String),
@@ -381,6 +385,9 @@ impl TaskStoreError {
             Self::BusyThread(_) => Some("busy_thread"),
             Self::DuplicateParentTool(_) => Some("duplicate_parent_tool"),
             Self::InvalidReplacement(_) => Some("invalid_replacement"),
+            Self::OrchestrationBindingLineageMismatch => {
+                Some("orchestration_binding_lineage_mismatch")
+            }
             Self::StaleTaskId(_) => Some("stale_task_id"),
             Self::NotContinuable(_) => Some("not_continuable"),
             Self::RecoveryConfirmationRequired(_) => Some("recovery_confirmation_required"),

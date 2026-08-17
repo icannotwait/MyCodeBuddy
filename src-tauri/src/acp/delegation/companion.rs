@@ -2794,6 +2794,7 @@ mod tests {
     use std::collections::{BTreeMap, HashSet};
 
     use super::*;
+    use crate::acp::delegation::types::OrchestrationBindingV1;
     use crate::acp::delegation::workflow::{
         project_workflow_state_index, WorkflowIndexOmissionStep, WorkflowStateDto,
         WorkflowStateIndexDto,
@@ -4122,6 +4123,168 @@ mod tests {
 
     fn tool_names(action: LineAction) -> Vec<String> {
         list_tool_names(action)
+    }
+
+    fn schema_accepts(root: &Value, schema: &Value, candidate: &Value) -> bool {
+        if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+            let Some(pointer) = reference.strip_prefix('#') else {
+                return false;
+            };
+            let Some(resolved) = root.pointer(pointer) else {
+                return false;
+            };
+            return schema_accepts(root, resolved, candidate);
+        }
+        if let Some(expected) = schema.get("const") {
+            if candidate != expected {
+                return false;
+            }
+        }
+        if let Some(values) = schema.get("enum").and_then(Value::as_array) {
+            if !values.contains(candidate) {
+                return false;
+            }
+        }
+        match schema.get("type").and_then(Value::as_str) {
+            Some("object") => {
+                let Some(object) = candidate.as_object() else {
+                    return false;
+                };
+                let properties = schema
+                    .get("properties")
+                    .and_then(Value::as_object)
+                    .cloned()
+                    .unwrap_or_default();
+                if schema.get("additionalProperties") == Some(&Value::Bool(false))
+                    && object.keys().any(|key| !properties.contains_key(key))
+                {
+                    return false;
+                }
+                if schema
+                    .get("required")
+                    .and_then(Value::as_array)
+                    .is_some_and(|required| {
+                        required
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .any(|key| !object.contains_key(key))
+                    })
+                {
+                    return false;
+                }
+                object.iter().all(|(key, value)| {
+                    properties
+                        .get(key)
+                        .is_none_or(|property| schema_accepts(root, property, value))
+                })
+            }
+            Some("string") => {
+                let Some(value) = candidate.as_str() else {
+                    return false;
+                };
+                let len = value.chars().count() as u64;
+                if schema
+                    .get("minLength")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|minimum| len < minimum)
+                    || schema
+                        .get("maxLength")
+                        .and_then(Value::as_u64)
+                        .is_some_and(|maximum| len > maximum)
+                {
+                    return false;
+                }
+                schema
+                    .get("pattern")
+                    .and_then(Value::as_str)
+                    .is_none_or(|pattern| regex::Regex::new(pattern).unwrap().is_match(value))
+            }
+            Some("integer") => {
+                let Some(value) = candidate.as_u64() else {
+                    return false;
+                };
+                !schema
+                    .get("minimum")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|minimum| value < minimum)
+                    && !schema
+                        .get("maximum")
+                        .and_then(Value::as_u64)
+                        .is_some_and(|maximum| value > maximum)
+            }
+            Some("boolean") => candidate.is_boolean(),
+            Some(_) => false,
+            None => true,
+        }
+    }
+
+    #[test]
+    fn orchestration_binding_transport_schemas_match_shared_corpus() {
+        let corpus: Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/orchestration_binding_v1.json"
+        )))
+        .expect("valid orchestration binding corpus");
+        let catalog: Value = serde_json::from_str(TOOL_SCHEMA_JSON).expect("valid tool schema");
+
+        for tool_name in ["delegate_to_agent", "continue_delegation"] {
+            let tool = catalog
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool["name"] == tool_name)
+                .unwrap();
+            let schema = &tool["inputSchema"];
+            assert!(
+                schema["properties"]["orchestration_binding"].is_object(),
+                "{tool_name} must publish orchestration_binding"
+            );
+            assert!(
+                !schema["required"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|required| required == "orchestration_binding"),
+                "{tool_name} binding must remain optional"
+            );
+
+            let omitted = if tool_name == "delegate_to_agent" {
+                json!({
+                    "agent_type": "grok",
+                    "task": "unbound first dispatch",
+                    "correlation_id": "binding-schema-omitted"
+                })
+            } else {
+                json!({
+                    "task_id": "source-task",
+                    "task": "unbound continuation",
+                    "correlation_id": "binding-schema-omitted"
+                })
+            };
+            assert!(schema_accepts(schema, schema, &omitted));
+
+            for case in corpus["cases"].as_array().unwrap() {
+                let mut input = omitted.clone();
+                input.as_object_mut().unwrap().insert(
+                    "orchestration_binding".into(),
+                    case["value"].clone(),
+                );
+                let expected = case["valid"].as_bool().unwrap();
+                assert_eq!(
+                    schema_accepts(schema, schema, &input),
+                    expected,
+                    "{tool_name} schema disagrees for {}",
+                    case["name"]
+                );
+                assert_eq!(
+                    serde_json::from_value::<OrchestrationBindingV1>(case["value"].clone())
+                        .is_ok_and(|binding| binding.validate().is_ok()),
+                    expected,
+                    "semantic validation disagrees for {}",
+                    case["name"]
+                );
+            }
+        }
     }
 
     fn assert_no_generic_coordination_side_channel_tools(names: &[String]) {

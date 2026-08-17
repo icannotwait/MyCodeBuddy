@@ -3249,6 +3249,7 @@ async fn run_session_2889_fixture() -> Session2889Result {
             external_handle: None,
             correlation_id: None,
             recovery_authorization_id: None,
+            orchestration_binding: None,
         },
     ))
     .await;
@@ -4631,6 +4632,7 @@ async fn v2_only_aggregate_acceptance() {
         replacement_reason: None,
         correlation_id: None,
         recovery_authorization_id: None,
+        orchestration_binding: None,
     };
     let dangling_report =
         with_historical_workflow_fixture_mutations(broker.start_delegation(dangling_request)).await;
@@ -4763,6 +4765,7 @@ async fn v2_only_aggregate_acceptance() {
             replacement_reason: None,
             correlation_id: None,
             recovery_authorization_id: None,
+            orchestration_binding: None,
         })
         .await;
     assert_eq!(

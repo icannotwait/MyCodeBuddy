@@ -91,10 +91,10 @@ use crate::acp::delegation::run_identity::{
     cold_resolve_allows, fence_allows_settlement, LiveRunRegistration, SettlementFenceDecision,
 };
 use crate::acp::delegation::run_store::{
-    derive_task_preview, launch_snapshot_from_run, request_fingerprint, Gen1AdmitOutcome,
-    PersistedRun, PromoteAttemptMeta, PromoteConflictClass, PromoteRetryClass, PromoteRunningKind,
-    PromoteRunningOutcome, RecoveryAdmissionAuthorization, ReservingRunInsert, RunStore,
-    TerminalCompletionAttentionMetric,
+    derive_task_preview, inherited_binding, launch_snapshot_from_run, request_fingerprint,
+    Gen1AdmitOutcome, PersistedRun, PromoteAttemptMeta, PromoteConflictClass, PromoteRetryClass,
+    PromoteRunningKind, PromoteRunningOutcome, RecoveryAdmissionAuthorization, ReservingRunInsert,
+    RunStore, TerminalCompletionAttentionMetric,
 };
 use crate::acp::delegation::runtime_stats::{DelegationRuntimeStats, RuntimeStatsProjector};
 use crate::acp::delegation::spawner::{ConnectionSpawner, DelegationLink};
@@ -2472,6 +2472,9 @@ fn store_err_to_delegation_error(err: TaskStoreError) -> DelegationError {
         TaskStoreError::BusyThread(m) => DelegationError::BusyThread(m),
         TaskStoreError::DuplicateParentTool(m) => DelegationError::DuplicateParentTool(m),
         TaskStoreError::InvalidReplacement(m) => DelegationError::InvalidReplacement(m),
+        TaskStoreError::OrchestrationBindingLineageMismatch => {
+            DelegationError::OrchestrationBindingLineageMismatch
+        }
         TaskStoreError::BudgetExhausted(m) => DelegationError::BudgetExhausted(m),
         TaskStoreError::RecoveryConfirmationRequired(projection) => {
             DelegationError::RecoveryConfirmationRequired(projection)
@@ -5924,6 +5927,15 @@ impl DelegationBroker {
         )
     )]
     pub async fn start_delegation(&self, mut req: DelegationRequest) -> DelegationTaskReport {
+        if let Some(binding) = req.orchestration_binding.as_ref() {
+            if let Err(message) = binding.validate() {
+                return report_err(
+                    req.agent_type,
+                    DelegationError::OrchestrationBindingInvalid(message.into()),
+                    None,
+                );
+            }
+        }
         // Whitespace-only host tool ids are treated as absent so exact
         // correlation (argument `correlation_id`) is used rather than the
         // explicit-id path. Nonblank host ids are opaque and must not be
@@ -6125,6 +6137,54 @@ impl DelegationBroker {
                 );
             }
         }
+
+        let replacement_source = match (
+            req.replaces_task_id.as_deref(),
+            self.run_store.as_ref(),
+        ) {
+            (Some(source_task_id), Some(runs)) => match runs.load_by_task_id(source_task_id).await {
+                Ok(Some(source))
+                    if source.parent_conversation_id == req.parent_conversation_id =>
+                {
+                    Some(source)
+                }
+                Ok(Some(_)) | Ok(None) => {
+                    self.drop_inflight(inflight_id).await;
+                    return report_err(
+                        req.agent_type,
+                        DelegationError::NotFound(source_task_id.into()),
+                        None,
+                    );
+                }
+                Err(error) => {
+                    self.drop_inflight(inflight_id).await;
+                    return report_err(
+                        req.agent_type,
+                        store_err_to_delegation_error(error),
+                        None,
+                    );
+                }
+            },
+            _ => None,
+        };
+        let effective_orchestration_binding = if let Some(source) = replacement_source.as_ref() {
+            match inherited_binding(
+                source.orchestration_binding.as_ref(),
+                req.orchestration_binding.as_ref(),
+            ) {
+                Ok(binding) => binding,
+                Err(error) => {
+                    self.drop_inflight(inflight_id).await;
+                    return report_err(
+                        req.agent_type,
+                        store_err_to_delegation_error(error),
+                        None,
+                    );
+                }
+            }
+        } else {
+            req.orchestration_binding.clone()
+        };
 
         if let (Some(source_task_id), Some(runs)) =
             (req.replaces_task_id.as_deref(), self.run_store.as_ref())
@@ -6356,7 +6416,7 @@ impl DelegationBroker {
             req.replacement_reason.as_deref(),
             None,
             &route_fp,
-            None,
+            effective_orchestration_binding.as_ref(),
         );
 
         // Parent-tool exact-duplicate handling BEFORE reserve/spawn (design
@@ -6533,55 +6593,16 @@ impl DelegationBroker {
             }
             // Replacement: inherit lineage root from replaced run; admission_class
             // is Replacement. Otherwise normal gen-1 root.
-            let (admission_class, lineage_root_task_id, root_task_id) = if let Some(replaces) =
-                req.replaces_task_id.as_deref()
+            let (admission_class, lineage_root_task_id, root_task_id) = if let Some(source) =
+                replacement_source.as_ref()
             {
-                match runs.load_by_task_id(replaces).await {
-                    Ok(Some(src)) => (
-                        AdmissionClass::Replacement,
-                        src.lineage_root_task_id.clone(),
-                        // Replacement is a fresh generation-1 child
-                        // thread; only the lineage root is inherited.
-                        call_id.clone(),
-                    ),
-                    Ok(None) => {
-                        // Post-create / pre-admission: compensate the unused shell.
-                        if let Err(cleanup_err) = self
-                            .compensate_provisional_orphan(
-                                &runs.db().conn,
-                                child_row.id,
-                                "replacement source missing",
-                            )
-                            .await
-                        {
-                            self.drop_inflight(inflight_id).await;
-                            return report_err(req.agent_type, cleanup_err, Some(child_row.id));
-                        }
-                        self.drop_inflight(inflight_id).await;
-                        return report_err(
-                            req.agent_type,
-                            DelegationError::NotFound(replaces.to_string()),
-                            None,
-                        );
-                    }
-                    Err(e) => {
-                        // Store error after create: still compensate the orphan
-                        // child so it never remains a visible running shell.
-                        if let Err(cleanup_err) = self
-                            .compensate_provisional_orphan(
-                                &runs.db().conn,
-                                child_row.id,
-                                "replacement source load error",
-                            )
-                            .await
-                        {
-                            self.drop_inflight(inflight_id).await;
-                            return report_err(req.agent_type, cleanup_err, Some(child_row.id));
-                        }
-                        self.drop_inflight(inflight_id).await;
-                        return report_err(req.agent_type, store_err_to_delegation_error(e), None);
-                    }
-                }
+                (
+                    AdmissionClass::Replacement,
+                    source.lineage_root_task_id.clone(),
+                    // Replacement is a fresh generation-1 child
+                    // thread; only the lineage root is inherited.
+                    call_id.clone(),
+                )
             } else {
                 (
                     AdmissionClass::NormalRevision,
@@ -6590,7 +6611,11 @@ impl DelegationBroker {
                 )
             };
             let insert = ReservingRunInsert {
-                orchestration_binding: None,
+                orchestration_binding: if replacement_source.is_some() {
+                    req.orchestration_binding.clone()
+                } else {
+                    effective_orchestration_binding.clone()
+                },
                 task_id: call_id.clone(),
                 root_task_id,
                 previous_task_id: None,
@@ -9154,6 +9179,16 @@ impl DelegationBroker {
         use crate::db::entities::conversation;
         use sea_orm::EntityTrait;
 
+        if let Some(binding) = req.orchestration_binding.as_ref() {
+            if let Err(message) = binding.validate() {
+                return report_err(
+                    AgentType::ClaudeCode,
+                    DelegationError::OrchestrationBindingInvalid(message.into()),
+                    None,
+                );
+            }
+        }
+
         // Whitespace-only host tool ids are treated as absent; preserve every
         // nonblank opaque id exactly (see start_delegation).
         if req.parent_tool_use_id.trim().is_empty() {
@@ -9358,6 +9393,20 @@ impl DelegationBroker {
                 );
             }
         };
+        let effective_orchestration_binding = match inherited_binding(
+            target.orchestration_binding.as_ref(),
+            req.orchestration_binding.as_ref(),
+        ) {
+            Ok(binding) => binding,
+            Err(error) => {
+                self.drop_inflight(inflight_id).await;
+                return report_err(
+                    target.agent_type,
+                    store_err_to_delegation_error(error),
+                    Some(target.child_conversation_id),
+                );
+            }
+        };
 
         if is_completion_format_repair_prompt(&req.task) {
             match runs.terminal_completion_protocol(&target.task_id).await {
@@ -9398,7 +9447,7 @@ impl DelegationBroker {
             None,
             Some(&req.target_task_id),
             &route_fp,
-            None,
+            effective_orchestration_binding.as_ref(),
         );
 
         // Exact parent-tool replays are resolved before capability or
@@ -9453,6 +9502,8 @@ impl DelegationBroker {
             task_preview: derive_task_preview(&req.task),
             request_fingerprint: request_fp,
             work_unit_key: req.work_unit_key.clone(),
+            supplied_orchestration_binding: req.orchestration_binding.clone(),
+            effective_orchestration_binding,
         };
 
         // Record durable ownership under the same lock as the already-registered
@@ -16249,6 +16300,7 @@ mod tests {
                     external_handle: None,
                     correlation_id: Some("resume-correlation".into()),
                     recovery_authorization_id: Some(approved.authorization_id.clone()),
+                    orchestration_binding: None,
                 })
                 .await;
             assert_eq!(report.error_code.as_deref(), Some("unresumable"));
@@ -16595,7 +16647,252 @@ mod tests {
             replacement_reason: None,
             correlation_id: None,
             recovery_authorization_id: None,
+            orchestration_binding: None,
         }
+    }
+
+    fn orchestration_binding_fixture() ->
+        crate::acp::delegation::types::OrchestrationBindingV1
+    {
+        crate::acp::delegation::types::OrchestrationBindingV1 {
+            schema_version: 1,
+            namespace: "brainstorm-to-delivery".into(),
+            generation: 1,
+            route_fingerprint:
+                "sha256:b498416d87bf6ba928bd7ddb5f1a451daf82300584f3d40b606c3c56f169ba7a"
+                    .into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn orchestration_binding_lineage_first_dispatch_validates_and_persists_before_spawn() {
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+
+        let invalid_mock = Arc::new(MockSpawner::new());
+        let invalid_broker = DelegationBroker::new(
+            invalid_mock.clone() as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        );
+        enable_delegation(&invalid_broker).await;
+        let mut invalid = request(1, "binding-invalid-direct");
+        let mut invalid_binding = orchestration_binding_fixture();
+        invalid_binding.namespace = "Invalid".into();
+        invalid.orchestration_binding = Some(invalid_binding);
+        let rejected = invalid_broker.start_delegation(invalid).await;
+        assert_eq!(
+            rejected.error_code.as_deref(),
+            Some("orchestration_binding_invalid")
+        );
+        assert!(invalid_mock.spawn_args.lock().await.is_empty());
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-binding-first").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("binding first parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db));
+        let mock = Arc::new(MockSpawner::new());
+        for child in ["binding-first-bound", "binding-first-unbound"] {
+            mock.queue_spawn(Ok(child.into())).await;
+            mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        }
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        let mut bound = request(parent.id, "binding-first-bound-tool");
+        bound.working_dir = Some(test_working_dir());
+        bound.orchestration_binding = Some(orchestration_binding_fixture());
+        let bound_report = broker.start_delegation(bound).await;
+        assert_eq!(bound_report.status, TaskStatus::Running, "{bound_report:?}");
+        let bound_run = runs
+            .load_by_task_id(bound_report.task_id.as_deref().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            bound_run.orchestration_binding,
+            Some(orchestration_binding_fixture())
+        );
+
+        let spawns_before_alias = mock.spawn_args.lock().await.len();
+        let mut alias = request(parent.id, "binding-first-bound-tool");
+        alias.working_dir = Some(test_working_dir());
+        let mut different_binding = orchestration_binding_fixture();
+        different_binding.namespace = "brainstorm-to-delivery-alt".into();
+        alias.orchestration_binding = Some(different_binding);
+        let alias_report = broker.start_delegation(alias).await;
+        assert_eq!(
+            alias_report.error_code.as_deref(),
+            Some("duplicate_parent_tool")
+        );
+        assert_eq!(mock.spawn_args.lock().await.len(), spawns_before_alias);
+
+        let mut unbound = request(parent.id, "binding-first-unbound-tool");
+        unbound.working_dir = Some(test_working_dir());
+        let unbound_report = broker.start_delegation(unbound).await;
+        assert_eq!(unbound_report.status, TaskStatus::Running, "{unbound_report:?}");
+        let unbound_run = runs
+            .load_by_task_id(unbound_report.task_id.as_deref().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(unbound_run.orchestration_binding, None);
+    }
+
+    #[tokio::test]
+    async fn orchestration_binding_lineage_replacement_mismatch_precedes_child_and_spawn() {
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-binding-replacement").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("binding replacement parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        let source_task_id = "binding-replacement-source".to_string();
+        let workspace = test_working_dir();
+        let launch = build_live_launch_config(
+            AgentType::ClaudeCode,
+            None,
+            &workspace,
+            None,
+            BTreeMap::new(),
+        );
+        let source_child = conversation_service::create_with_delegation(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("binding replacement source".into()),
+            None,
+            Some(DelegationLink {
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: "binding-replacement-source-tool".into(),
+                delegation_call_id: source_task_id.clone(),
+            }),
+        )
+        .await
+        .expect("source child");
+        runs
+            .insert_reserving(ReservingRunInsert {
+                orchestration_binding: Some(orchestration_binding_fixture()),
+                task_id: source_task_id.clone(),
+                root_task_id: source_task_id.clone(),
+                previous_task_id: None,
+                generation: 1,
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: Some("binding-replacement-source-tool".into()),
+                child_conversation_id: source_child.id,
+                agent_type: "claude_code".into(),
+                profile_id: None,
+                workspace_path: Some(launch.snapshot.workspace_path),
+                route_fingerprint: Some(launch.snapshot.route_fingerprint),
+                launch_snapshot_version: Some(launch.snapshot.launch_snapshot_version),
+                mode_id: launch.snapshot.mode_id,
+                config_values_json: Some(launch.snapshot.config_values_json),
+                task_preview: Some("binding replacement source".into()),
+                request_fingerprint: Some("binding-replacement-source-fingerprint".into()),
+                admission_class: AdmissionClass::NormalRevision,
+                lineage_root_task_id: source_task_id.clone(),
+                work_unit_key: Some("binding-replacement-unit".into()),
+                history_only: false,
+                replaced_task_id: None,
+                replacement_reason: None,
+                started_at: Some(Utc::now()),
+            })
+            .await
+            .expect("source reserve");
+        let finished_at = Utc::now();
+        runs
+            .settle_terminal(
+                &source_task_id,
+                TerminalTaskWrite::failed_with_evidence(
+                    "admission_unknown",
+                    finished_at,
+                    DelegationTerminationAuditV1::for_terminal_code(
+                        "admission_unknown",
+                        DelegationRunStatus::Reserving,
+                        true,
+                        finished_at,
+                    ),
+                ),
+            )
+            .await
+            .expect("terminal replacement source");
+        let authorization_id = approve_replacement_recovery(
+            &db,
+            &runs,
+            &source_task_id,
+            crate::acp::delegation::recovery_policy::ReplacementReason::AdmissionUnknown,
+        )
+        .await;
+        let children_before = conversation_service::list_children(&db.conn, parent.id)
+            .await
+            .unwrap()
+            .len();
+        let spawns_before = mock.spawn_args.lock().await.len();
+
+        let mut replacement = request(parent.id, "binding-replacement-mismatch-tool");
+        replacement.working_dir = Some(test_working_dir());
+        replacement.work_unit_key = Some("binding-replacement-unit".into());
+        replacement.replaces_task_id = Some(source_task_id.clone());
+        replacement.replacement_reason = Some("admission_unknown".into());
+        replacement.recovery_authorization_id = Some(authorization_id.clone());
+        let mut changed = orchestration_binding_fixture();
+        changed.namespace = "brainstorm-to-delivery-alt".into();
+        replacement.orchestration_binding = Some(changed);
+        let rejected = broker.start_delegation(replacement).await;
+        assert_eq!(
+            rejected.error_code.as_deref(),
+            Some("orchestration_binding_lineage_mismatch")
+        );
+        assert_eq!(mock.spawn_args.lock().await.len(), spawns_before);
+        assert_eq!(
+            conversation_service::list_children(&db.conn, parent.id)
+                .await
+                .unwrap()
+                .len(),
+            children_before,
+            "lineage rejection must precede provisional child allocation"
+        );
+
+        mock.queue_spawn(Ok("binding-replacement-exact".into()))
+            .await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let mut exact = request(parent.id, "binding-replacement-exact-tool");
+        exact.working_dir = Some(test_working_dir());
+        exact.work_unit_key = Some("binding-replacement-unit".into());
+        exact.replaces_task_id = Some(source_task_id);
+        exact.replacement_reason = Some("admission_unknown".into());
+        exact.recovery_authorization_id = Some(authorization_id);
+        exact.orchestration_binding = Some(orchestration_binding_fixture());
+        let accepted = broker.start_delegation(exact).await;
+        assert_eq!(accepted.status, TaskStatus::Running, "{accepted:?}");
+        let accepted_run = runs
+            .load_by_task_id(accepted.task_id.as_deref().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            accepted_run.orchestration_binding,
+            Some(orchestration_binding_fixture()),
+            "mismatch must not consume the authorization used by the exact call"
+        );
     }
 
     fn test_working_dir() -> String {
@@ -24838,6 +25135,7 @@ mod tests {
                     external_handle: None,
                     correlation_id: None,
                     recovery_authorization_id: None,
+                    orchestration_binding: None,
                 })
                 .await
         });
@@ -24991,6 +25289,7 @@ mod tests {
                     external_handle: None,
                     correlation_id: None,
                     recovery_authorization_id: None,
+                    orchestration_binding: None,
                 })
                 .await
         });
@@ -25277,6 +25576,7 @@ mod tests {
                 external_handle: None,
                 correlation_id: None,
                 recovery_authorization_id: None,
+                orchestration_binding: None,
             })
             .await;
         assert_eq!(report.status, TaskStatus::Running, "{report:?}");
@@ -25680,6 +25980,7 @@ mod tests {
                         external_handle: None,
                         correlation_id: None,
                         recovery_authorization_id: None,
+                        orchestration_binding: None,
                     })
                     .await
             })
@@ -26218,6 +26519,7 @@ mod tests {
                         external_handle: None,
                         correlation_id: None,
                         recovery_authorization_id: None,
+                        orchestration_binding: None,
                     })
                     .await
             })
@@ -26723,6 +27025,7 @@ mod tests {
                         external_handle: None,
                         correlation_id: None,
                         recovery_authorization_id: None,
+                        orchestration_binding: None,
                     })
                     .await
             })
@@ -27125,6 +27428,7 @@ mod tests {
                 external_handle: None,
                 correlation_id: None,
                 recovery_authorization_id: None,
+                orchestration_binding: None,
             })
             .await;
         assert_eq!(cont.status, TaskStatus::Running, "{cont:?}");
@@ -27298,6 +27602,7 @@ mod tests {
                 external_handle: None,
                 correlation_id: None,
                 recovery_authorization_id: None,
+                orchestration_binding: None,
             })
             .await;
         assert_eq!(cont.status, TaskStatus::Running, "{cont:?}");
@@ -29018,6 +29323,7 @@ mod tests {
                     external_handle: None,
                     correlation_id: None,
                     recovery_authorization_id: None,
+                    orchestration_binding: None,
                 })
                 .await
         });
@@ -29110,6 +29416,7 @@ mod tests {
                 external_handle: None,
                 correlation_id: None,
                 recovery_authorization_id: None,
+                orchestration_binding: None,
             })
             .await;
         assert_eq!(report.error_code.as_deref(), Some("unresumable"));
@@ -35753,6 +36060,7 @@ mod tests {
                 external_handle: None,
                 correlation_id: None,
                 recovery_authorization_id: None,
+                orchestration_binding: None,
             })
             .await;
 
@@ -35808,6 +36116,7 @@ mod tests {
                 external_handle: None,
                 correlation_id: None,
                 recovery_authorization_id: None,
+                orchestration_binding: None,
             })
             .await;
 
@@ -35962,6 +36271,7 @@ mod tests {
                         external_handle: None,
                         correlation_id: None,
                         recovery_authorization_id: None,
+                        orchestration_binding: None,
                     })
                     .await
             })
@@ -36223,6 +36533,7 @@ mod tests {
                     external_handle: None,
                     correlation_id: None,
                     recovery_authorization_id: None,
+                    orchestration_binding: None,
                 })
                 .await;
             assert_eq!(report.status, TaskStatus::Failed, "{report:?}");
@@ -36328,6 +36639,7 @@ mod tests {
                 external_handle: None,
                 correlation_id: None,
                 recovery_authorization_id: None,
+                orchestration_binding: None,
             })
             .await;
         assert_eq!(continued.status, TaskStatus::Failed, "{continued:?}");
@@ -36430,6 +36742,7 @@ mod tests {
                 external_handle: None,
                 correlation_id: None,
                 recovery_authorization_id: None,
+                orchestration_binding: None,
             })
             .await;
         assert_eq!(continued.status, TaskStatus::Failed, "{continued:?}");
@@ -37918,6 +38231,7 @@ mod tests {
                 external_handle: None,
                 correlation_id: None,
                 recovery_authorization_id: None,
+                orchestration_binding: None,
             })
             .await;
         assert_eq!(
@@ -37962,6 +38276,7 @@ mod tests {
                 external_handle: None,
                 correlation_id: None,
                 recovery_authorization_id: None,
+                orchestration_binding: None,
             })
             .await;
         assert_eq!(
@@ -37996,6 +38311,7 @@ mod tests {
                 external_handle: None,
                 correlation_id: Some("cont-corr-1".into()),
                 recovery_authorization_id: None,
+                orchestration_binding: None,
             })
             .await;
         assert_eq!(
@@ -38033,6 +38349,7 @@ mod tests {
                 external_handle: Some("h-cont-claim-cancel".into()),
                 correlation_id: Some("cont-ext-cancel".into()),
                 recovery_authorization_id: None,
+                orchestration_binding: None,
             })
             .await;
         assert_eq!(report.error_code.as_deref(), Some("canceled"));
@@ -38072,6 +38389,7 @@ mod tests {
                 external_handle: None,
                 correlation_id: Some("cont-join-abandon".into()),
                 recovery_authorization_id: None,
+                orchestration_binding: None,
             })
             .await;
         assert_eq!(
@@ -38151,6 +38469,7 @@ mod tests {
                 external_handle: None,
                 correlation_id: Some("cont-bind".into()),
                 recovery_authorization_id: None,
+                orchestration_binding: None,
             })
             .await;
         assert!(
@@ -38249,6 +38568,7 @@ mod tests {
             external_handle: None,
             correlation_id: Some("cont-mcp-first".into()),
             recovery_authorization_id: None,
+            orchestration_binding: None,
         };
         let b2 = broker.clone();
         let cont_handle = tokio::spawn(async move { b2.continue_delegation(cont_req).await });
@@ -38426,6 +38746,7 @@ mod tests {
                 external_handle: None,
                 correlation_id: Some("corr-t2".into()),
                 recovery_authorization_id: None,
+                orchestration_binding: None,
             })
             .await;
         assert!(
@@ -38664,6 +38985,7 @@ mod tests {
                 external_handle: None,
                 correlation_id: None,
                 recovery_authorization_id: None,
+                orchestration_binding: None,
             })
             .await;
         assert_eq!(
@@ -38685,6 +39007,7 @@ mod tests {
                 external_handle: None,
                 correlation_id: Some("corr-timeout-nf".into()),
                 recovery_authorization_id: None,
+                orchestration_binding: None,
             })
             .await;
         assert_eq!(
@@ -38707,6 +39030,7 @@ mod tests {
                 external_handle: None,
                 correlation_id: Some(".leading-dot-invalid".into()),
                 recovery_authorization_id: None,
+                orchestration_binding: None,
             })
             .await;
         assert_eq!(
@@ -38745,6 +39069,7 @@ mod tests {
                 external_handle: None,
                 correlation_id: None,
                 recovery_authorization_id: None,
+                orchestration_binding: None,
             })
             .await;
         assert_eq!(
@@ -39023,6 +39348,7 @@ mod tests {
                 external_handle: None,
                 correlation_id: Some(cont_secret.into()),
                 recovery_authorization_id: None,
+                orchestration_binding: None,
             })
             .await;
         assert!(cont.error_code.is_none(), "continue: {cont:?}");
@@ -39137,6 +39463,7 @@ mod tests {
                 external_handle: None,
                 correlation_id: Some(corr.into()),
                 recovery_authorization_id: None,
+                orchestration_binding: None,
             })
             .await;
         drop(_guard);
@@ -39241,6 +39568,7 @@ mod tests {
                 external_handle: None,
                 correlation_id: None,
                 recovery_authorization_id: None,
+                orchestration_binding: None,
             })
             .await;
 
@@ -39327,6 +39655,7 @@ mod tests {
             external_handle: None,
             correlation_id: None,
             recovery_authorization_id: None,
+            orchestration_binding: None,
         };
 
         let first = broker.continue_delegation(request.clone()).await;
@@ -39410,6 +39739,7 @@ mod tests {
             external_handle: None,
             correlation_id: None,
             recovery_authorization_id: None,
+            orchestration_binding: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -39566,6 +39896,7 @@ mod tests {
                         external_handle: None,
                         correlation_id: None,
                         recovery_authorization_id: None,
+                        orchestration_binding: None,
                     })
                     .await
             })
@@ -39689,6 +40020,7 @@ mod tests {
                 external_handle: None,
                 correlation_id: None,
                 recovery_authorization_id: None,
+                orchestration_binding: None,
             })
             .await;
         assert_eq!(report.error_code.as_deref(), Some("unresumable"));
@@ -40094,6 +40426,7 @@ mod tests {
             external_handle: None,
             correlation_id: None,
             recovery_authorization_id: None,
+            orchestration_binding: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -40240,6 +40573,7 @@ mod tests {
             external_handle: None,
             correlation_id: None,
             recovery_authorization_id: None,
+            orchestration_binding: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -40381,6 +40715,7 @@ mod tests {
             external_handle: None,
             correlation_id: None,
             recovery_authorization_id: None,
+            orchestration_binding: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -40489,6 +40824,7 @@ mod tests {
             external_handle: None,
             correlation_id: None,
             recovery_authorization_id: None,
+            orchestration_binding: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -40591,6 +40927,7 @@ mod tests {
             external_handle: None,
             correlation_id: None,
             recovery_authorization_id: None,
+            orchestration_binding: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -40718,6 +41055,7 @@ mod tests {
             external_handle: None,
             correlation_id: None,
             recovery_authorization_id: None,
+            orchestration_binding: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -40833,6 +41171,7 @@ mod tests {
             external_handle: None,
             correlation_id: None,
             recovery_authorization_id: None,
+            orchestration_binding: None,
         };
         let first = broker.continue_delegation(cont_req.clone()).await;
         assert_eq!(first.status, TaskStatus::Running);
@@ -40928,6 +41267,7 @@ mod tests {
                 external_handle: Some("precancel-handle-1".into()),
                 correlation_id: None,
                 recovery_authorization_id: None,
+                orchestration_binding: None,
             })
             .await;
         assert_eq!(report.error_code.as_deref(), Some("canceled"));
@@ -40994,6 +41334,7 @@ mod tests {
             external_handle: None,
             correlation_id: None,
             recovery_authorization_id: None,
+            orchestration_binding: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -41507,6 +41848,7 @@ mod tests {
             external_handle: None,
             correlation_id: None,
             recovery_authorization_id: None,
+            orchestration_binding: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -41733,6 +42075,7 @@ mod tests {
             external_handle: None,
             correlation_id: None,
             recovery_authorization_id: None,
+            orchestration_binding: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -41843,6 +42186,7 @@ mod tests {
             external_handle: None,
             correlation_id: None,
             recovery_authorization_id: None,
+            orchestration_binding: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -41990,6 +42334,7 @@ mod tests {
             external_handle: None,
             correlation_id: None,
             recovery_authorization_id: None,
+            orchestration_binding: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -42153,6 +42498,7 @@ mod tests {
             external_handle: None,
             correlation_id: None,
             recovery_authorization_id: None,
+            orchestration_binding: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -42338,6 +42684,7 @@ mod tests {
                 external_handle: None,
                 correlation_id: Some("corr-1485-acp".into()),
                 recovery_authorization_id: None,
+                orchestration_binding: None,
             })
             .await;
 
@@ -42461,6 +42808,7 @@ mod tests {
             external_handle: None,
             correlation_id: Some("corr-1485-mcp".into()),
             recovery_authorization_id: None,
+            orchestration_binding: None,
         };
         let b2 = broker.clone();
         let cont_handle = tokio::spawn(async move { b2.continue_delegation(cont_req).await });
@@ -42564,6 +42912,7 @@ mod tests {
                 external_handle: None,
                 correlation_id: None,
                 recovery_authorization_id: None,
+                orchestration_binding: None,
             })
             .await;
         assert_eq!(
@@ -42655,6 +43004,7 @@ mod tests {
                 external_handle: None,
                 correlation_id: Some("corr-1485-dup".into()),
                 recovery_authorization_id: None,
+                orchestration_binding: None,
             })
             .await;
         assert_eq!(

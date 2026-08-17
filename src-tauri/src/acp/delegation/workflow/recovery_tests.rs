@@ -1044,6 +1044,7 @@ fn continue_request(
         external_handle: None,
         correlation_id: Some("legacy-continue-correlation".into()),
         recovery_authorization_id: authorization_id,
+        orchestration_binding: None,
     }
 }
 

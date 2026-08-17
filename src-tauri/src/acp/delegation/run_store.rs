@@ -649,6 +649,20 @@ pub struct ContinueRunAdmission {
     pub task_preview: String,
     pub request_fingerprint: String,
     pub work_unit_key: Option<String>,
+    pub supplied_orchestration_binding: Option<OrchestrationBindingV1>,
+    pub effective_orchestration_binding: Option<OrchestrationBindingV1>,
+}
+
+pub(crate) fn inherited_binding(
+    source: Option<&OrchestrationBindingV1>,
+    supplied: Option<&OrchestrationBindingV1>,
+) -> Result<Option<OrchestrationBindingV1>, TaskStoreError> {
+    match (source, supplied) {
+        (Some(source), None) => Ok(Some(source.clone())),
+        (Some(source), Some(value)) if source == value => Ok(Some(source.clone())),
+        (None, None) => Ok(None),
+        _ => Err(TaskStoreError::OrchestrationBindingLineageMismatch),
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1798,7 +1812,7 @@ async fn work_unit_replacement_at_limit_txn(
 /// checks cannot race a concurrently admitted replacement into a new lineage.
 async fn validate_replacement_insert_txn(
     txn: &DatabaseTransaction,
-    insert: &ReservingRunInsert,
+    insert: &mut ReservingRunInsert,
 ) -> Result<
     (
         crate::acp::delegation::recovery_policy::RecoveryDecision,
@@ -1851,6 +1865,10 @@ async fn validate_replacement_insert_txn(
     let source = model_to_persisted_run(source_row).ok_or_else(|| {
         TaskStoreError::InvalidReplacement("replacement source is unreadable".into())
     })?;
+    insert.orchestration_binding = inherited_binding(
+        source.orchestration_binding.as_ref(),
+        insert.orchestration_binding.as_ref(),
+    )?;
     let source_recovery_authorization_id =
         validated_recovery_provenance(txn, &source, source.recovery_authorization_id.as_deref())
             .await?;
@@ -2637,7 +2655,7 @@ impl RunStore {
             .db
             .conn
             .transaction::<_, Gen1Txn, TaskStoreError>(|txn| {
-                let insert = insert.clone();
+                let mut insert = insert.clone();
                 let authorization = authorization.clone();
                 Box::pin(async move {
                     require_writable_conversation_workflow(
@@ -2684,7 +2702,7 @@ impl RunStore {
                     ) {
                         (true, true) => {
                             let (initial_decision, inherited_authorization_id) =
-                                validate_replacement_insert_txn(txn, &insert).await?;
+                                validate_replacement_insert_txn(txn, &mut insert).await?;
                             preflight_replacement(
                                 txn,
                                 &insert.lineage_root_task_id,
@@ -2956,6 +2974,27 @@ impl RunStore {
                         .await
                         .map_err(completion_recovery_fence_error)?;
 
+                    let target = DelegationTaskRun::find_by_id(&admission.target_task_id)
+                        .one(txn)
+                        .await
+                        .map_err(map_db_err)?
+                        .and_then(model_to_persisted_run)
+                        .ok_or_else(|| {
+                            TaskStoreError::NotFound(admission.target_task_id.clone())
+                        })?;
+                    if target.parent_conversation_id != admission.parent_conversation_id {
+                        return Err(TaskStoreError::NotFound(admission.target_task_id.clone()));
+                    }
+                    let effective_orchestration_binding = inherited_binding(
+                        target.orchestration_binding.as_ref(),
+                        admission.supplied_orchestration_binding.as_ref(),
+                    )?;
+                    if effective_orchestration_binding
+                        != admission.effective_orchestration_binding
+                    {
+                        return Err(TaskStoreError::OrchestrationBindingLineageMismatch);
+                    }
+
                     // Parent-tool exact-duplicate precedes busy/stale.
                     if !admission.parent_tool_use_id.is_empty() {
                         let existing = DelegationTaskRun::find()
@@ -2982,19 +3021,6 @@ impl RunStore {
                                 ))),
                             };
                         }
-                    }
-
-                    let target = DelegationTaskRun::find_by_id(&admission.target_task_id)
-                        .one(txn)
-                        .await
-                        .map_err(map_db_err)?
-                        .and_then(model_to_persisted_run)
-                        .ok_or_else(|| {
-                            TaskStoreError::NotFound(admission.target_task_id.clone())
-                        })?;
-                    if target.parent_conversation_id != admission.parent_conversation_id {
-                        // Cross-parent: do not reveal existence.
-                        return Err(TaskStoreError::NotFound(admission.target_task_id.clone()));
                     }
 
                     // Precedence: not_found → fingerprint → (capability outside
@@ -3111,7 +3137,7 @@ impl RunStore {
                     }
 
                     let insert = ReservingRunInsert {
-                        orchestration_binding: None,
+                        orchestration_binding: effective_orchestration_binding,
                         task_id: admission.task_id.clone(),
                         root_task_id: target.root_task_id.clone(),
                         previous_task_id: Some(target.task_id.clone()),
@@ -6013,7 +6039,7 @@ mod tests {
     }
 
     #[test]
-    fn durable_binding_unbound_seven_string_fingerprints_retain_exact_digests() {
+    fn request_fingerprint_unbound_seven_string_inputs_retain_exact_digests() {
         assert_eq!(
             request_fingerprint(
                 "delegate_to_agent",
@@ -6043,7 +6069,7 @@ mod tests {
     }
 
     #[test]
-    fn durable_binding_bound_fingerprint_uses_exact_twelve_string_v2_array() {
+    fn request_fingerprint_bound_uses_exact_twelve_string_v2_array() {
         let binding = crate::acp::delegation::types::OrchestrationBindingV1 {
             schema_version: 1,
             namespace: "brainstorm-to-delivery".into(),
@@ -6188,6 +6214,285 @@ mod tests {
             route_fingerprint:
                 "sha256:b498416d87bf6ba928bd7ddb5f1a451daf82300584f3d40b606c3c56f169ba7a"
                     .into(),
+        }
+    }
+
+    fn continue_binding_admission(
+        parent_id: i32,
+        source_task_id: &str,
+        suffix: &str,
+        supplied: Option<OrchestrationBindingV1>,
+        effective: Option<OrchestrationBindingV1>,
+    ) -> ContinueRunAdmission {
+        ContinueRunAdmission {
+            task_id: format!("binding-continue-{suffix}"),
+            parent_conversation_id: parent_id,
+            parent_tool_use_id: format!("tu-binding-continue-{suffix}"),
+            target_task_id: source_task_id.into(),
+            task_preview: derive_task_preview("continue bound work"),
+            request_fingerprint: request_fingerprint(
+                "continue_delegation",
+                "continue bound work",
+                Some("unit-a"),
+                None,
+                None,
+                Some(source_task_id),
+                "aabbccdd",
+                effective.as_ref(),
+            ),
+            work_unit_key: Some("unit-a".into()),
+            supplied_orchestration_binding: supplied,
+            effective_orchestration_binding: effective,
+        }
+    }
+
+    async fn seed_binding_continue_source(
+        suffix: &str,
+        binding: Option<OrchestrationBindingV1>,
+    ) -> (Arc<AppDatabase>, RunStore, i32, String) {
+        use crate::db::entities::conversation;
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let source_task_id = format!("binding-continue-source-{suffix}");
+        let (parent_id, child_id) = seed_parent_child(&db, &source_task_id).await;
+        let child = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut child = child.into_active_model();
+        child.external_id = Set(Some(format!("binding-session-{suffix}")));
+        child.update(&db.conn).await.unwrap();
+        let store = RunStore::new(db.clone());
+        let mut source = sample_insert(&source_task_id, parent_id, child_id, 1, None);
+        source.orchestration_binding = binding;
+        store.insert_reserving(source).await.unwrap();
+        ensure_bound(&store, &source_task_id, format!("binding-conn-{suffix}")).await;
+        store
+            .promote_running(
+                &source_task_id,
+                format!("binding-conn-{suffix}"),
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        settle_completed(&store, &source_task_id).await;
+        (db, store, parent_id, source_task_id)
+    }
+
+    #[tokio::test]
+    async fn orchestration_binding_lineage_continue_inherits_rejects_conversion_and_is_idempotent()
+    {
+        for (suffix, source_binding, supplied) in [
+            (
+                "bound-omitted",
+                Some(binding_fixture()),
+                None,
+            ),
+            (
+                "bound-exact",
+                Some(binding_fixture()),
+                Some(binding_fixture()),
+            ),
+            ("unbound-omitted", None, None),
+        ] {
+            let (_db, store, parent_id, source_task_id) =
+                seed_binding_continue_source(suffix, source_binding.clone()).await;
+            let admission = continue_binding_admission(
+                parent_id,
+                &source_task_id,
+                suffix,
+                supplied,
+                source_binding.clone(),
+            );
+            let created = store
+                .admit_continue_reserving(admission.clone())
+                .await
+                .expect("matching lineage must reserve");
+            let run = match created {
+                ContinueAdmitOutcome::Created(run) => run,
+                other => panic!("expected created continuation, got {other:?}"),
+            };
+            assert_eq!(run.orchestration_binding, source_binding);
+
+            let mut replay = admission;
+            replay.task_id.push_str("-replay");
+            let replayed = store
+                .admit_continue_reserving(replay)
+                .await
+                .expect("omitted inherited binding must be idempotent");
+            assert!(matches!(replayed, ContinueAdmitOutcome::Idempotent(_)));
+        }
+
+        let mut mismatches = Vec::new();
+        let mut schema_version = binding_fixture();
+        schema_version.schema_version = 2;
+        mismatches.push(("schema-version", schema_version));
+        let mut namespace = binding_fixture();
+        namespace.namespace = "brainstorm-to-delivery-alt".into();
+        mismatches.push(("namespace", namespace));
+        let mut generation = binding_fixture();
+        generation.generation = 2;
+        mismatches.push(("generation", generation));
+        let mut fingerprint = binding_fixture();
+        fingerprint.route_fingerprint = format!("sha256:{}", "a".repeat(64));
+        mismatches.push(("fingerprint", fingerprint));
+
+        for (suffix, supplied) in mismatches {
+            let (_db, store, parent_id, source_task_id) =
+                seed_binding_continue_source(suffix, Some(binding_fixture())).await;
+            let admission = continue_binding_admission(
+                parent_id,
+                &source_task_id,
+                suffix,
+                Some(supplied.clone()),
+                Some(supplied),
+            );
+            let task_id = admission.task_id.clone();
+            let error = store
+                .admit_continue_reserving(admission)
+                .await
+                .expect_err("changed source identity must reject");
+            assert!(matches!(
+                error,
+                TaskStoreError::OrchestrationBindingLineageMismatch
+            ));
+            assert!(store.load_by_task_id(&task_id).await.unwrap().is_none());
+        }
+
+        let (_db, store, parent_id, source_task_id) =
+            seed_binding_continue_source("unbound-conversion", None).await;
+        let admission = continue_binding_admission(
+            parent_id,
+            &source_task_id,
+            "unbound-conversion",
+            Some(binding_fixture()),
+            Some(binding_fixture()),
+        );
+        let error = store
+            .admit_continue_reserving(admission)
+            .await
+            .expect_err("unbound source cannot become bound");
+        assert!(matches!(
+            error,
+            TaskStoreError::OrchestrationBindingLineageMismatch
+        ));
+    }
+
+    async fn seed_binding_replacement_source(
+        suffix: &str,
+        binding: Option<OrchestrationBindingV1>,
+    ) -> (Arc<AppDatabase>, RunStore, i32, String) {
+        let db = Arc::new(fresh_in_memory_db().await);
+        let source_task_id = format!("binding-replacement-source-{suffix}");
+        let (parent_id, child_id) = seed_parent_child(&db, &source_task_id).await;
+        let store = RunStore::new(db.clone());
+        let mut source = sample_insert(&source_task_id, parent_id, child_id, 1, None);
+        source.orchestration_binding = binding;
+        store.insert_reserving(source).await.unwrap();
+        ensure_bound(&store, &source_task_id, format!("binding-repl-conn-{suffix}")).await;
+        store
+            .promote_running(
+                &source_task_id,
+                format!("binding-repl-conn-{suffix}"),
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        store
+            .settle_terminal(
+                &source_task_id,
+                TerminalTaskWrite::failed(
+                    "unresumable",
+                    Utc::now(),
+                    ConversationStatus::Cancelled,
+                ),
+            )
+            .await
+            .unwrap();
+        (db, store, parent_id, source_task_id)
+    }
+
+    #[tokio::test]
+    async fn orchestration_binding_lineage_replacement_inherits_and_rejects_conversion() {
+        for (suffix, source_binding, supplied) in [
+            ("bound-omitted", Some(binding_fixture()), None),
+            (
+                "bound-exact",
+                Some(binding_fixture()),
+                Some(binding_fixture()),
+            ),
+            ("unbound-omitted", None, None),
+        ] {
+            let (db, store, parent_id, source_task_id) =
+                seed_binding_replacement_source(suffix, source_binding.clone()).await;
+            let task_id = format!("binding-replacement-{suffix}");
+            let child_id = new_replacement_child(
+                &db,
+                parent_id,
+                &format!("tu-{task_id}"),
+                &task_id,
+            )
+            .await;
+            let mut insert = base_replacement_insert(
+                &task_id,
+                parent_id,
+                child_id,
+                &source_task_id,
+                "unresumable",
+            );
+            insert.orchestration_binding = supplied;
+            let outcome = store
+                .admit_gen1_reserving(insert)
+                .await
+                .expect("matching replacement lineage must reserve");
+            let run = match outcome {
+                Gen1AdmitOutcome::Created(run) => run,
+                other => panic!("expected created replacement, got {other:?}"),
+            };
+            assert_eq!(run.orchestration_binding, source_binding);
+        }
+
+        for (suffix, source_binding, supplied) in [
+            (
+                "bound-mismatch",
+                Some(binding_fixture()),
+                Some({
+                    let mut changed = binding_fixture();
+                    changed.generation = 2;
+                    changed
+                }),
+            ),
+            ("unbound-conversion", None, Some(binding_fixture())),
+        ] {
+            let (db, store, parent_id, source_task_id) =
+                seed_binding_replacement_source(suffix, source_binding).await;
+            let task_id = format!("binding-replacement-{suffix}");
+            let child_id = new_replacement_child(
+                &db,
+                parent_id,
+                &format!("tu-{task_id}"),
+                &task_id,
+            )
+            .await;
+            let mut insert = base_replacement_insert(
+                &task_id,
+                parent_id,
+                child_id,
+                &source_task_id,
+                "unresumable",
+            );
+            insert.orchestration_binding = supplied;
+            let error = store
+                .admit_gen1_reserving(insert)
+                .await
+                .expect_err("replacement conversion must reject");
+            assert!(matches!(
+                error,
+                TaskStoreError::OrchestrationBindingLineageMismatch
+            ));
+            assert!(store.load_by_task_id(&task_id).await.unwrap().is_none());
         }
     }
 
@@ -10121,6 +10426,8 @@ mod tests {
             task_preview: derive_task_preview("review the revision"),
             request_fingerprint: fingerprint.clone(),
             work_unit_key: Some("unit-a".into()),
+            supplied_orchestration_binding: None,
+            effective_orchestration_binding: None,
         };
         let first = store
             .admit_continue_reserving(admission.clone())
@@ -10153,6 +10460,8 @@ mod tests {
             task_preview: derive_task_preview("review with wrong unit"),
             request_fingerprint: "wrong-unit-fingerprint".into(),
             work_unit_key: Some("unit-b".into()),
+            supplied_orchestration_binding: None,
+            effective_orchestration_binding: None,
         };
         let err = store
             .admit_continue_reserving(mismatched_work_unit)
@@ -10198,6 +10507,8 @@ mod tests {
             task_preview: derive_task_preview("x"),
             request_fingerprint: "fp-busy".into(),
             work_unit_key: Some("unit-wrong".into()),
+            supplied_orchestration_binding: None,
+            effective_orchestration_binding: None,
         };
         let err = store
             .admit_continue_reserving(busy_wrong_key)
@@ -10235,6 +10546,8 @@ mod tests {
             task_preview: derive_task_preview("x"),
             request_fingerprint: "fp-stale".into(),
             work_unit_key: Some("unit-wrong".into()),
+            supplied_orchestration_binding: None,
+            effective_orchestration_binding: None,
         };
         let err = store
             .admit_continue_reserving(stale_wrong_key)
@@ -10285,6 +10598,8 @@ mod tests {
                 task_preview: derive_task_preview("continue after parent deletion"),
                 request_fingerprint: "deleted-parent-fingerprint".into(),
                 work_unit_key: Some("unit-a".into()),
+                supplied_orchestration_binding: None,
+                effective_orchestration_binding: None,
             })
             .await
             .unwrap_err();
@@ -10350,6 +10665,8 @@ mod tests {
                 task_preview: derive_task_preview("continue unknown agent"),
                 request_fingerprint: "unknown-agent-fingerprint".into(),
                 work_unit_key: Some("unit-a".into()),
+                supplied_orchestration_binding: None,
+                effective_orchestration_binding: None,
             })
             .await
             .unwrap_err();
@@ -10427,6 +10744,8 @@ mod tests {
                 task_preview: derive_task_preview("continue source child"),
                 request_fingerprint: "continue-replacement-race-fingerprint".into(),
                 work_unit_key: Some("unit-a".into()),
+                supplied_orchestration_binding: None,
+                effective_orchestration_binding: None,
             })
             .await
             .expect_err("unsupported reuse must reject continue before creating a run");
@@ -12592,6 +12911,8 @@ mod tests {
                         task_preview: derive_task_preview("continue under unreleased gate"),
                         request_fingerprint: "continue-gate-timeout-fp".into(),
                         work_unit_key: Some("unit-a".into()),
+                        supplied_orchestration_binding: None,
+                        effective_orchestration_binding: None,
                     })
                     .await
             })
@@ -12673,6 +12994,8 @@ mod tests {
                         task_preview: derive_task_preview("continue under dropped gate"),
                         request_fingerprint: "continue-gate-drop-fp".into(),
                         work_unit_key: Some("unit-a".into()),
+                        supplied_orchestration_binding: None,
+                        effective_orchestration_binding: None,
                     })
                     .await
             })
@@ -14882,6 +15205,8 @@ mod termination_audit {
                 task_preview: derive_task_preview("continue authorized recovery"),
                 request_fingerprint: format!("recovery-fingerprint-{suffix}"),
                 work_unit_key: Some(format!("unit-{suffix}")),
+                supplied_orchestration_binding: None,
+                effective_orchestration_binding: None,
             }
         }
 
@@ -14935,6 +15260,7 @@ mod termination_audit {
                 external_handle: None,
                 correlation_id: Some(format!("recovery-correlation-{suffix}")),
                 recovery_authorization_id: authorization_id,
+                orchestration_binding: None,
             }
         }
 

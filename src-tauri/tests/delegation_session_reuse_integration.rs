@@ -118,6 +118,7 @@ fn delegate_req(
         // Explicit parent_tool_use_id fixtures do not need correlation_id.
         correlation_id: None,
         recovery_authorization_id: None,
+        orchestration_binding: None,
     }
 }
 
@@ -139,6 +140,7 @@ fn continue_req(
         // Explicit parent_tool_use_id fixtures do not need correlation_id.
         correlation_id: None,
         recovery_authorization_id: None,
+        orchestration_binding: None,
     }
 }
 

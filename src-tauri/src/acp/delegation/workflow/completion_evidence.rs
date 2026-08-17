@@ -4267,6 +4267,8 @@ mod tests {
                     task_preview: "must be fenced".into(),
                     request_fingerprint: format!("continue-fp-{}", fixture.task_id),
                     work_unit_key: None,
+                    supplied_orchestration_binding: None,
+                    effective_orchestration_binding: None,
                 }),
             )
             .await

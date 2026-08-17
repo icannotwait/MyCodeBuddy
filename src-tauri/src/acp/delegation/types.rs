@@ -275,6 +275,8 @@ pub struct DelegationRequest {
     pub correlation_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery_authorization_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orchestration_binding: Option<OrchestrationBindingV1>,
 }
 
 /// Everything the broker needs to dispatch a `continue_delegation` call.
@@ -295,6 +297,8 @@ pub struct ContinueDelegationRequest {
     pub correlation_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery_authorization_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orchestration_binding: Option<OrchestrationBindingV1>,
 }
 
 /// Max accepted length for a call `correlation_id` (inclusive).
@@ -640,6 +644,10 @@ pub enum DelegationError {
     /// Replacement inputs failed server eligibility.
     #[error("invalid replacement: {0}")]
     InvalidReplacement(String),
+    #[error("orchestration binding invalid: {0}")]
+    OrchestrationBindingInvalid(String),
+    #[error("orchestration binding lineage mismatch")]
+    OrchestrationBindingLineageMismatch,
     /// Platform recovery rail refused the operation.
     #[error("budget exhausted: {0}")]
     BudgetExhausted(String),
@@ -1282,6 +1290,10 @@ impl DelegationOutcome {
             DelegationError::NotSupported => "not_supported",
             DelegationError::Unresumable(_) => "unresumable",
             DelegationError::InvalidReplacement(_) => "invalid_replacement",
+            DelegationError::OrchestrationBindingInvalid(_) => "orchestration_binding_invalid",
+            DelegationError::OrchestrationBindingLineageMismatch => {
+                "orchestration_binding_lineage_mismatch"
+            }
             DelegationError::BudgetExhausted(_) => "budget_exhausted",
             DelegationError::RecoveryConfirmationRequired(_) => "recovery_confirmation_required",
             // Handled above so the validated Task 8 rejection code is retained.
