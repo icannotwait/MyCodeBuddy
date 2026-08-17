@@ -265,6 +265,7 @@ fn unexpected_continue_insert(
     work_unit_key: &str,
 ) -> ReservingRunInsert {
     ReservingRunInsert {
+        orchestration_binding: None,
         task_id: task_id.into(),
         root_task_id: lineage_root_task_id.into(),
         previous_task_id: previous_task_id.map(str::to_string),
@@ -288,6 +289,7 @@ fn unexpected_continue_insert(
             None,
             previous_task_id,
             "aabbccdd",
+            None,
         )),
         admission_class: AdmissionClass::UnexpectedContinue,
         lineage_root_task_id: lineage_root_task_id.into(),
@@ -954,6 +956,7 @@ fn skill_forward_routing_invariants_eleven_v2_scenarios() {
                     None,
                     Some("prior-task"),
                     "deadbeef",
+                    None,
                 )
                 .is_empty()),
                 SkillAction::FreshDelegate => assert!(!request_fingerprint(
@@ -964,6 +967,7 @@ fn skill_forward_routing_invariants_eleven_v2_scenarios() {
                     None,
                     None,
                     "deadbeef",
+                    None,
                 )
                 .is_empty()),
                 SkillAction::Replacement => assert!(!request_fingerprint(
@@ -974,6 +978,7 @@ fn skill_forward_routing_invariants_eleven_v2_scenarios() {
                     Some(REPLACEMENT_REASON_UNRESUMABLE),
                     None,
                     "deadbeef",
+                    None,
                 )
                 .is_empty()),
                 SkillAction::BlockNoSubstitute => {
@@ -1996,6 +2001,7 @@ async fn pre_admission_host_restart_allows_fresh_gen1_redispatch() {
     let runs = Arc::new(RunStore::new(db.clone()));
     let work_unit_key = "task|8|implementer|none";
     runs.insert_reserving(ReservingRunInsert {
+        orchestration_binding: None,
         task_id: source_task_id.into(),
         root_task_id: source_task_id.into(),
         previous_task_id: None,
@@ -2019,6 +2025,7 @@ async fn pre_admission_host_restart_allows_fresh_gen1_redispatch() {
             None,
             None,
             "aabbccdd",
+            None,
         )),
         admission_class: AdmissionClass::NormalRevision,
         lineage_root_task_id: source_task_id.into(),

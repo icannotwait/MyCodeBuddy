@@ -1205,6 +1205,7 @@ mod tests {
             let store = RunStore::new(db.clone());
             store
                 .insert_reserving(ReservingRunInsert {
+                    orchestration_binding: None,
                     task_id: task_id.into(),
                     root_task_id: task_id.into(),
                     previous_task_id: None,

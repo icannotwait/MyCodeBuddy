@@ -8457,6 +8457,7 @@ mod tests {
             let child = seed_conversation(&db, folder, AgentType::Codex).await;
             let runs = Arc::new(RunStore::new(Arc::clone(&db)));
             runs.insert_reserving(ReservingRunInsert {
+                orchestration_binding: None,
                 task_id: TASK_ID.into(),
                 root_task_id: TASK_ID.into(),
                 previous_task_id: None,
@@ -8634,10 +8635,12 @@ mod tests {
         }
 
         async fn completion_tool_fixture_before_v2_only() -> CompletionToolFixture {
-            completion_tool_fixture_with_db(Arc::new(
-                crate::db::test_helpers::historical_completion_protocol_db_before_v2_only().await,
-            ))
-            .await
+            let db =
+                crate::db::test_helpers::historical_completion_protocol_db_before_v2_only().await;
+            crate::db::migration::install_for_historical_completion_fixture(&db)
+                .await
+                .expect("install orchestration binding migration for historical fixture");
+            completion_tool_fixture_with_db(Arc::new(db)).await
         }
 
         #[tokio::test]
@@ -10784,10 +10787,12 @@ mod tests {
         }
 
         async fn recovery_fixture_before_v2_only() -> RecoveryFixture {
-            recovery_fixture_with_db(Arc::new(
-                crate::db::test_helpers::historical_completion_protocol_db_before_v2_only().await,
-            ))
-            .await
+            let db =
+                crate::db::test_helpers::historical_completion_protocol_db_before_v2_only().await;
+            crate::db::migration::install_for_historical_completion_fixture(&db)
+                .await
+                .expect("install orchestration binding migration for historical fixture");
+            recovery_fixture_with_db(Arc::new(db)).await
         }
 
         async fn seed_confirmable_task(
@@ -10820,6 +10825,7 @@ mod tests {
             fixture
                 .runs
                 .insert_reserving(ReservingRunInsert {
+                    orchestration_binding: None,
                     task_id: task_id.clone(),
                     root_task_id: task_id.clone(),
                     previous_task_id: None,

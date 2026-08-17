@@ -2691,6 +2691,7 @@ mod tests {
 
         let runs = RunStore::new(db.clone());
         runs.insert_reserving(ReservingRunInsert {
+            orchestration_binding: None,
             task_id: task_id.into(),
             root_task_id: task_id.into(),
             previous_task_id: None,
@@ -2714,6 +2715,7 @@ mod tests {
                 None,
                 None,
                 "aabbccdd",
+                None,
             )),
             admission_class: AdmissionClass::NormalRevision,
             lineage_root_task_id: task_id.into(),

@@ -774,6 +774,7 @@ async fn seed_final_guard_binding(
         conn: db.conn.clone(),
     }));
     runs.insert_reserving(ReservingRunInsert {
+        orchestration_binding: None,
         task_id: task_id.into(),
         root_task_id: task_id.into(),
         previous_task_id: None,
@@ -845,6 +846,7 @@ async fn seed_conversation_workflow_association(
         conn: db.conn.clone(),
     }));
     runs.insert_reserving(ReservingRunInsert {
+        orchestration_binding: None,
         task_id: task_id.into(),
         root_task_id: format!("root-{child}"),
         previous_task_id: None,
@@ -1068,6 +1070,7 @@ async fn workflow_admission_requires_v2() {
         }));
         let error = runs
             .admit_gen1_reserving(ReservingRunInsert {
+                orchestration_binding: None,
                 task_id: task_id.clone(),
                 root_task_id: task_id.clone(),
                 previous_task_id: None,
@@ -2514,6 +2517,7 @@ async fn admit_v2_fixture_run(
         conn: db.conn.clone(),
     })));
     with_historical_workflow_fixture_mutations(runs.admit_gen1_reserving(ReservingRunInsert {
+        orchestration_binding: None,
         task_id: task_id.into(),
         root_task_id: task_id.into(),
         previous_task_id: None,
@@ -2626,6 +2630,7 @@ async fn run_capability_case(case: CapabilityCase) -> CapabilityResult {
         conn: db.conn.clone(),
     })));
     with_historical_workflow_fixture_mutations(runs.admit_gen1_reserving(ReservingRunInsert {
+        orchestration_binding: None,
         task_id: task_id.clone(),
         root_task_id: task_id.clone(),
         previous_task_id: None,

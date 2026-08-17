@@ -27,6 +27,119 @@ pub const DELEGATE_TO_AGENT_TOOL: &str = "delegate_to_agent";
 /// MCP tool name for session reuse — field 0 of `request_fingerprint`.
 pub const CONTINUE_DELEGATION_TOOL: &str = "continue_delegation";
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OrchestrationBindingV1 {
+    pub schema_version: u32,
+    pub namespace: String,
+    pub generation: u32,
+    pub route_fingerprint: String,
+}
+
+impl OrchestrationBindingV1 {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.schema_version != 1 {
+            return Err("schema_version must be 1");
+        }
+        let namespace = self.namespace.as_bytes();
+        if namespace.is_empty()
+            || namespace.len() > 64
+            || !namespace[0].is_ascii_lowercase()
+            || !namespace[1..]
+                .iter()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+        {
+            return Err("namespace is invalid");
+        }
+        if self.generation == 0 {
+            return Err("generation must be positive");
+        }
+        let fingerprint = self.route_fingerprint.as_bytes();
+        if fingerprint.len() != 71
+            || !fingerprint.starts_with(b"sha256:")
+            || !fingerprint[7..]
+                .iter()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+        {
+            return Err("route_fingerprint is invalid");
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod orchestration_binding_tests {
+    use std::collections::BTreeSet;
+
+    use serde_json::Value;
+
+    use super::OrchestrationBindingV1;
+
+    #[test]
+    fn delegation_orchestration_bindings_shared_corpus_is_exact_and_strict() {
+        let corpus: Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/orchestration_binding_v1.json"
+        )))
+        .expect("binding grammar corpus is JSON");
+        let top = corpus.as_object().expect("corpus top level is an object");
+        assert_eq!(
+            top.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+            BTreeSet::from(["cases", "schema_version"])
+        );
+        assert_eq!(top["schema_version"], 1);
+
+        let cases = top["cases"].as_array().expect("cases is an array");
+        assert_eq!(cases.len(), 24);
+        let expected_names = BTreeSet::from([
+            "minimum",
+            "maximum",
+            "brainstorm_to_delivery",
+            "null",
+            "non_object",
+            "missing_schema_version",
+            "missing_namespace",
+            "missing_generation",
+            "missing_route_fingerprint",
+            "extra_field",
+            "wrong_schema_version",
+            "schema_version_string",
+            "namespace_number",
+            "generation_string",
+            "fingerprint_number",
+            "generation_zero",
+            "generation_overflow",
+            "namespace_empty",
+            "namespace_65_bytes",
+            "namespace_uppercase",
+            "namespace_underscore",
+            "fingerprint_uppercase_hex",
+            "fingerprint_wrong_length",
+            "fingerprint_wrong_prefix",
+        ]);
+        let mut names = BTreeSet::new();
+
+        for case in cases {
+            let case = case.as_object().expect("case is an object");
+            assert_eq!(
+                case.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+                BTreeSet::from(["name", "valid", "value"])
+            );
+            let name = case["name"].as_str().expect("case name is a string");
+            assert!(names.insert(name), "duplicate corpus case name {name}");
+            let expected_valid = case["valid"].as_bool().expect("valid is a boolean");
+            let accepted = serde_json::from_value::<OrchestrationBindingV1>(case["value"].clone())
+                .ok()
+                .is_some_and(|binding| binding.validate().is_ok());
+            assert_eq!(
+                accepted, expected_valid,
+                "binding grammar case {name} had unexpected result"
+            );
+        }
+        assert_eq!(names, expected_names);
+    }
+}
+
 /// Soft-watchdog health for a **running** Broker task only. Terminal tasks
 /// have no observation. Observe-only — never a lifecycle / terminal state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
