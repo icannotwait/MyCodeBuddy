@@ -39,11 +39,12 @@ use crate::acp::delegation::run_store::{
 use crate::acp::delegation::transport::{
     read_frame, write_frame, BrokerAskRequest, BrokerCancelRequest, BrokerCancelTaskRequest,
     BrokerCommitFeedbackRequest, BrokerCompleteWorkRequest, BrokerFeedbackRequest,
-    BrokerGetWorkflowStateRequest, BrokerMessage, BrokerParentDecisionRequest,
-    BrokerPublishWorkflowRequest, BrokerRecoverWorkflowRequest, BrokerRecoveryAuthorizationRequest,
-    BrokerRegisterSimpleWorkflowRequest, BrokerReplyDelegationRequest, BrokerRequest,
-    BrokerResponse, BrokerSessionRequest, BrokerSettleWorkflowRequest, BrokerStatusRequest,
-    CancelDelegationReason, CompanionReadyAck, CompanionRole,
+    BrokerGetWorkflowStateRequest, BrokerMessage, BrokerOrchestrationBindingsRequest,
+    BrokerParentDecisionRequest, BrokerPublishWorkflowRequest, BrokerRecoverWorkflowRequest,
+    BrokerRecoveryAuthorizationRequest, BrokerRegisterSimpleWorkflowRequest,
+    BrokerReplyDelegationRequest, BrokerRequest, BrokerResponse, BrokerSessionRequest,
+    BrokerSettleWorkflowRequest, BrokerStatusRequest, CancelDelegationReason, CompanionReadyAck,
+    CompanionRole,
 };
 use crate::acp::delegation::types::{
     correlation_error_message, validate_correlation_id, CorrelationEntryPoint,
@@ -325,6 +326,43 @@ impl StatusErrorEnvelope {
 struct ProcessedStatus {
     batch: DelegationStatusBatch,
     release_owner: Option<ForegroundMcpReleaseOwner>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OrchestrationBindingQueryAuthError {
+    InvalidToken,
+    RootOnly,
+    CoordinationUnavailable,
+    NoActiveConversation,
+}
+
+impl OrchestrationBindingQueryAuthError {
+    fn code(self) -> &'static str {
+        match self {
+            Self::InvalidToken => "invalid_token",
+            Self::RootOnly => "root_only",
+            Self::CoordinationUnavailable => "coordination_unavailable",
+            Self::NoActiveConversation => "no_active_conversation",
+        }
+    }
+
+    fn message(self) -> &'static str {
+        match self {
+            Self::InvalidToken => "invalid companion token",
+            Self::RootOnly => "orchestration binding queries are root-only",
+            Self::CoordinationUnavailable => "coordination is unavailable",
+            Self::NoActiveConversation => "no active parent conversation",
+        }
+    }
+
+    fn to_value(self) -> Value {
+        serde_json::json!({
+            "error": {
+                "code": self.code(),
+                "message": self.message(),
+            }
+        })
+    }
 }
 
 impl ProcessedStatus {
@@ -609,6 +647,9 @@ impl DelegationListener {
                     }
                     Err(_) => value_response(&StatusErrorEnvelope::continuation_arm_failed())?,
                 }
+            }
+            BrokerMessage::OrchestrationBindings(req) => {
+                value_response(&self.process_orchestration_bindings(req).await)?
             }
             BrokerMessage::CancelTask(req) => {
                 self.report_response(self.process_cancel_task(req).await)
@@ -1594,6 +1635,56 @@ impl DelegationListener {
         self.session_info
             .resolve(req.session_id, req.max_messages.unwrap_or(0))
             .await
+    }
+
+    async fn orchestration_binding_query_auth_context(
+        &self,
+        token: &str,
+    ) -> Result<i32, OrchestrationBindingQueryAuthError> {
+        let entry = self
+            .tokens
+            .lookup(token)
+            .await
+            .ok_or(OrchestrationBindingQueryAuthError::InvalidToken)?;
+        if entry.role != CompanionRole::Root {
+            return Err(OrchestrationBindingQueryAuthError::RootOnly);
+        }
+        if !entry.coordination_v1 {
+            return Err(OrchestrationBindingQueryAuthError::CoordinationUnavailable);
+        }
+        self.parent_lookup
+            .current_conversation_id(&entry.parent_connection_id)
+            .await
+            .ok_or(OrchestrationBindingQueryAuthError::NoActiveConversation)
+    }
+
+    async fn process_orchestration_bindings(
+        &self,
+        req: BrokerOrchestrationBindingsRequest,
+    ) -> Value {
+        let parent_id = match self
+            .orchestration_binding_query_auth_context(&req.token)
+            .await
+        {
+            Ok(parent_id) => parent_id,
+            Err(error) => return error.to_value(),
+        };
+        let Some(runs) = self.broker.run_store() else {
+            return orchestration_binding_query_error_value(
+                crate::acp::delegation::types::OrchestrationBindingQueryError::Failed,
+            );
+        };
+        match runs
+            .get_orchestration_binding_page(parent_id, req.query())
+            .await
+        {
+            Ok(page) => serde_json::to_value(page).unwrap_or_else(|_| {
+                orchestration_binding_query_error_value(
+                    crate::acp::delegation::types::OrchestrationBindingQueryError::Failed,
+                )
+            }),
+            Err(error) => orchestration_binding_query_error_value(error),
+        }
     }
 
     /// Auth + Root/`workflow_v2` gate for workflow mutation/recovery tools.
@@ -2826,6 +2917,17 @@ fn parse_gate_settlement_outcome(raw: &str) -> Result<GateSettlementOutcome, Str
             "outcome must be approved|changes_requested|blocked, got {other}"
         )),
     }
+}
+
+fn orchestration_binding_query_error_value(
+    error: crate::acp::delegation::types::OrchestrationBindingQueryError,
+) -> Value {
+    serde_json::json!({
+        "error": {
+            "code": error.code(),
+            "message": error.to_string(),
+        }
+    })
 }
 
 fn workflow_store_error_value(err: WorkflowStoreError) -> Value {
@@ -4639,6 +4741,81 @@ mod tests {
             Arc::new(StubQuestion::default()),
             Arc::new(StubSessionInfo::default()),
         )
+    }
+
+    #[tokio::test]
+    async fn orchestration_binding_query_auth_is_root_coordination_and_token_scoped() {
+        let tokens = Arc::new(TokenRegistry::default());
+        let entry = |role, coordination_v1| TokenEntry {
+            parent_connection_id: "parent-conn".into(),
+            working_dir: test_working_dir(),
+            coordination_v1,
+            delegation_continuation_v1: true,
+            role,
+            workflow_v2: false,
+            completion_v2: false,
+            bound_task_id: None,
+        };
+        tokens
+            .register("root".into(), entry(CompanionRole::Root, true))
+            .await;
+        tokens
+            .register("child".into(), entry(CompanionRole::DelegationChild, true))
+            .await;
+        tokens
+            .register("no-coordination".into(), entry(CompanionRole::Root, false))
+            .await;
+        let listener = make_listener(
+            make_broker(Arc::new(MockSpawner::new())).await,
+            tokens.clone(),
+            Some(77),
+        );
+
+        assert_eq!(
+            listener
+                .orchestration_binding_query_auth_context("root")
+                .await,
+            Ok(77),
+            "workflow_v2=false must not block the read-only query"
+        );
+        for (token, expected) in [
+            ("invalid", OrchestrationBindingQueryAuthError::InvalidToken),
+            ("child", OrchestrationBindingQueryAuthError::RootOnly),
+            (
+                "no-coordination",
+                OrchestrationBindingQueryAuthError::CoordinationUnavailable,
+            ),
+        ] {
+            assert_eq!(
+                listener
+                    .orchestration_binding_query_auth_context(token)
+                    .await,
+                Err(expected)
+            );
+            let outcome = listener
+                .process_orchestration_bindings(BrokerOrchestrationBindingsRequest {
+                    token: token.into(),
+                    namespace: "brainstorm-to-delivery".into(),
+                    limit: 100,
+                    snapshot_id: None,
+                    cursor: None,
+                })
+                .await;
+            assert_eq!(outcome["error"]["code"], expected.code());
+            assert!(outcome.get("runs").is_none());
+        }
+
+        let no_parent = make_listener(
+            make_broker(Arc::new(MockSpawner::new())).await,
+            tokens,
+            None,
+        );
+        assert_eq!(
+            no_parent
+                .orchestration_binding_query_auth_context("root")
+                .await,
+            Err(OrchestrationBindingQueryAuthError::NoActiveConversation)
+        );
     }
 
     fn make_listener_with_wait_cancel(

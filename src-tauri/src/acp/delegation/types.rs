@@ -67,6 +67,120 @@ impl OrchestrationBindingV1 {
     }
 }
 
+pub const ORCHESTRATION_BINDING_DEFAULT_LIMIT: u16 = 100;
+pub const ORCHESTRATION_BINDING_MAX_LIMIT: u16 = 200;
+
+fn default_orchestration_binding_limit() -> u16 {
+    ORCHESTRATION_BINDING_DEFAULT_LIMIT
+}
+
+/// Strict MCP input for a first page or continuation of one binding snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OrchestrationBindingQueryRequest {
+    pub namespace: String,
+    #[serde(default = "default_orchestration_binding_limit")]
+    pub limit: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+}
+
+impl OrchestrationBindingQueryRequest {
+    pub fn validate(&self) -> Result<(), OrchestrationBindingQueryError> {
+        let namespace = self.namespace.as_bytes();
+        if namespace.is_empty()
+            || namespace.len() > 64
+            || !namespace[0].is_ascii_lowercase()
+            || !namespace[1..]
+                .iter()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+        {
+            return Err(OrchestrationBindingQueryError::Invalid);
+        }
+        if !(1..=ORCHESTRATION_BINDING_MAX_LIMIT).contains(&self.limit) {
+            return Err(OrchestrationBindingQueryError::Invalid);
+        }
+        match (&self.snapshot_id, &self.cursor) {
+            (None, None) => {}
+            (Some(snapshot_id), Some(cursor)) => {
+                let parsed = uuid::Uuid::parse_str(snapshot_id)
+                    .map_err(|_| OrchestrationBindingQueryError::Invalid)?;
+                if parsed.to_string() != *snapshot_id
+                    || cursor.is_empty()
+                    || cursor.len() > 128
+                    || !cursor
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+                {
+                    return Err(OrchestrationBindingQueryError::Invalid);
+                }
+            }
+            _ => return Err(OrchestrationBindingQueryError::Invalid),
+        }
+        Ok(())
+    }
+}
+
+/// Approved durable identity for one selected delegation run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegationOrchestrationBindingRun {
+    pub task_id: String,
+    pub root_task_id: String,
+    pub previous_task_id: Option<String>,
+    pub lineage_root_task_id: String,
+    pub replaced_task_id: Option<String>,
+    pub replacement_reason: Option<String>,
+    pub generic_generation: u64,
+    pub work_unit_key: Option<String>,
+    pub child_conversation_id: i32,
+    pub agent_type: String,
+    pub profile_id: Option<String>,
+    pub status: String,
+    pub orchestration_binding: Option<OrchestrationBindingV1>,
+}
+
+/// One raw, replayable page from a process-local parent-scoped snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegationOrchestrationBindingPage {
+    pub schema_version: u32,
+    pub namespace: String,
+    pub snapshot_id: String,
+    pub snapshot_revision: String,
+    pub snapshot_created_at: DateTime<Utc>,
+    pub snapshot_expires_at: DateTime<Utc>,
+    pub total_rows: u64,
+    pub page_start: u64,
+    pub request_cursor: Option<String>,
+    pub runs: Vec<DelegationOrchestrationBindingRun>,
+    pub next_cursor: Option<String>,
+    pub complete: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum OrchestrationBindingQueryError {
+    #[error("invalid orchestration binding query")]
+    Invalid,
+    #[error("orchestration binding query exceeds the row limit")]
+    TooLarge,
+    #[error("orchestration binding query failed")]
+    Failed,
+    #[error("orchestration binding snapshot is stale")]
+    SnapshotStale,
+}
+
+impl OrchestrationBindingQueryError {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Invalid => "orchestration_binding_query_invalid",
+            Self::TooLarge => "orchestration_binding_query_too_large",
+            Self::Failed => "orchestration_binding_query_failed",
+            Self::SnapshotStale => "orchestration_binding_snapshot_stale",
+        }
+    }
+}
+
 #[cfg(test)]
 mod orchestration_binding_tests {
     use std::collections::BTreeSet;

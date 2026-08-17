@@ -23,6 +23,9 @@ use sha2::{Digest, Sha256};
 use unicode_normalization::UnicodeNormalization;
 
 use crate::acp::delegation::launch_snapshot::{snapshot_is_complete, LaunchSnapshot};
+use crate::acp::delegation::orchestration_binding_query::{
+    materialize_binding_rows, OrchestrationBindingSnapshotCache,
+};
 use crate::acp::delegation::recovery_policy::{
     decide_delegation_recovery, hash_external_session_identity, RecoveryConfirmation,
     RecoveryDecision, RecoveryDisposition, RecoveryRailSnapshot, RecoverySourceSnapshot,
@@ -37,8 +40,9 @@ use crate::acp::delegation::store::{
     TerminalCompletionProtocol, TerminalTaskWrite,
 };
 use crate::acp::delegation::types::{
-    DelegationRecoveryProjection, OrchestrationBindingV1, TaskStatus,
-    WorkflowRetirementNavigation,
+    DelegationOrchestrationBindingPage, DelegationRecoveryProjection,
+    OrchestrationBindingQueryError, OrchestrationBindingQueryRequest, OrchestrationBindingV1,
+    TaskStatus, WorkflowRetirementNavigation,
 };
 use crate::acp::delegation::workflow::admission::{
     ensure_workflow_child_conversation_independent, resolve_and_stamp_terminal_artifact_txn,
@@ -2025,6 +2029,7 @@ async fn validate_replacement_insert_txn(
 /// SQLite-backed store for `delegation_task_runs` + conversation projection fence.
 pub struct RunStore {
     db: Arc<AppDatabase>,
+    orchestration_binding_snapshots: OrchestrationBindingSnapshotCache,
     /// Workflow graph live events (Task 6). Defaults to [`EventEmitter::Noop`];
     /// production wires the shared emitter via [`Self::with_workflow_emitter`]
     /// / [`Self::set_workflow_emitter`].
@@ -2091,6 +2096,7 @@ impl RunStore {
     pub fn new(db: Arc<AppDatabase>) -> Self {
         Self {
             db,
+            orchestration_binding_snapshots: OrchestrationBindingSnapshotCache::new(),
             workflow_emitter: std::sync::RwLock::new(EventEmitter::Noop),
             #[cfg(any(test, feature = "test-utils"))]
             settle_gate: tokio::sync::Mutex::new(None),
@@ -2172,6 +2178,19 @@ impl RunStore {
 
     pub fn db(&self) -> &Arc<AppDatabase> {
         &self.db
+    }
+
+    pub async fn get_orchestration_binding_page(
+        &self,
+        parent_id: i32,
+        request: OrchestrationBindingQueryRequest,
+    ) -> Result<DelegationOrchestrationBindingPage, OrchestrationBindingQueryError> {
+        let namespace = request.namespace.clone();
+        self.orchestration_binding_snapshots
+            .page_with_loader(parent_id, request, Utc::now(), || async {
+                materialize_binding_rows(&self.db.conn, parent_id, &namespace).await
+            })
+            .await
     }
 
     pub async fn terminal_completion_protocol(
@@ -2470,6 +2489,8 @@ impl RunStore {
     /// [`TaskStoreError::DuplicateParentTool`]; non-terminal work-unit / child
     /// fences → [`TaskStoreError::BusyThread`].
     pub async fn insert_reserving(&self, insert: ReservingRunInsert) -> Result<(), TaskStoreError> {
+        let parent_id = insert.parent_conversation_id;
+        let _mutation_guard = self.orchestration_binding_snapshots.mutation_guard().await;
         let outcome = self
             .db
             .conn
@@ -2480,7 +2501,12 @@ impl RunStore {
             .await;
 
         match outcome {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.orchestration_binding_snapshots
+                    .record_parent_mutation(parent_id)
+                    .await;
+                Ok(())
+            }
             Err(sea_orm::TransactionError::Connection(e)) => Err(map_gen1_insert_err(e)),
             Err(sea_orm::TransactionError::Transaction(e)) => Err(e),
         }
@@ -2534,10 +2560,11 @@ impl RunStore {
         // Prefer a single transaction so run delete + run_binding cleanup +
         // graph_revision bump stay atomic (A10/B5 provisional abandon clock).
         let task_id_owned = task_id.to_string();
+        let _mutation_guard = self.orchestration_binding_snapshots.mutation_guard().await;
         let outcome = self
             .db
             .conn
-            .transaction::<_, (bool, WorkflowTxnSideEffect), TaskStoreError>(|txn| {
+            .transaction::<_, (bool, WorkflowTxnSideEffect, Option<i32>), TaskStoreError>(|txn| {
                 let task_id = task_id_owned.clone();
                 Box::pin(async move {
                     let row = DelegationTaskRun::find_by_id(&task_id)
@@ -2545,7 +2572,7 @@ impl RunStore {
                         .await
                         .map_err(map_db_err)?;
                     let Some(row) = row else {
-                        return Ok((false, WorkflowTxnSideEffect::None));
+                        return Ok((false, WorkflowTxnSideEffect::None, None));
                     };
                     let parent_id = row.parent_conversation_id;
 
@@ -2559,7 +2586,7 @@ impl RunStore {
                         && row.child_connection_id.is_none();
 
                     if !pure_reserving && !pure_canceled {
-                        return Ok((false, WorkflowTxnSideEffect::None));
+                        return Ok((false, WorkflowTxnSideEffect::None, None));
                     }
 
                     if pure_canceled {
@@ -2568,14 +2595,14 @@ impl RunStore {
                             .await
                             .map_err(map_db_err)?;
                         let Some(child) = child else {
-                            return Ok((false, WorkflowTxnSideEffect::None));
+                            return Ok((false, WorkflowTxnSideEffect::None, None));
                         };
                         if child
                             .external_id
                             .as_deref()
                             .is_some_and(|s| !s.trim().is_empty())
                         {
-                            return Ok((false, WorkflowTxnSideEffect::None));
+                            return Ok((false, WorkflowTxnSideEffect::None, None));
                         }
                     }
 
@@ -2595,19 +2622,22 @@ impl RunStore {
                     };
                     let deleted = delete.exec(txn).await.map_err(map_db_err)?;
                     if deleted.rows_affected == 0 {
-                        return Ok((false, WorkflowTxnSideEffect::None));
+                        return Ok((false, WorkflowTxnSideEffect::None, None));
                     }
 
                     let effect = on_provisional_abandon_txn(txn, &task_id, parent_id).await?;
-                    Ok((true, effect))
+                    Ok((true, effect, Some(parent_id)))
                 })
             })
             .await;
 
         match outcome {
-            Ok((reclaimed, effect)) => {
+            Ok((reclaimed, effect, parent_id)) => {
                 if reclaimed {
                     self.emit_workflow_effect(&effect);
+                    self.orchestration_binding_snapshots
+                        .record_parent_mutation(parent_id.expect("deleted run has parent"))
+                        .await;
                 }
                 Ok(reclaimed)
             }
@@ -2645,6 +2675,8 @@ impl RunStore {
         insert: ReservingRunInsert,
         authorization: RecoveryAdmissionAuthorization,
     ) -> Result<Gen1AdmitOutcome, TaskStoreError> {
+        let parent_id = insert.parent_conversation_id;
+        let _mutation_guard = self.orchestration_binding_snapshots.mutation_guard().await;
         // (idempotent_existing, post-commit workflow side effect)
         type Gen1Txn = (
             Option<PersistedRun>,
@@ -2864,6 +2896,9 @@ impl RunStore {
             Ok((Some(existing), _, _)) => Ok(Gen1AdmitOutcome::Idempotent(existing)),
             Ok((None, effect, recovery_decision)) => {
                 self.emit_workflow_effect(&effect);
+                self.orchestration_binding_snapshots
+                    .record_parent_mutation(parent_id)
+                    .await;
                 let run = self
                     .load_by_task_id(&insert.task_id)
                     .await?
@@ -2947,6 +2982,8 @@ impl RunStore {
         admission: ContinueRunAdmission,
         authorization: RecoveryAdmissionAuthorization,
     ) -> Result<ContinueAdmitOutcome, TaskStoreError> {
+        let parent_id = admission.parent_conversation_id;
+        let _mutation_guard = self.orchestration_binding_snapshots.mutation_guard().await;
         #[cfg(any(test, feature = "test-utils"))]
         let mut continue_admission_gate = self.continue_admission_gate.lock().await.take();
 
@@ -3210,6 +3247,9 @@ impl RunStore {
             Ok((Some(existing), _, _)) => Ok(ContinueAdmitOutcome::Idempotent(existing)),
             Ok((None, effect, recovery_decision)) => {
                 self.emit_workflow_effect(&effect);
+                self.orchestration_binding_snapshots
+                    .record_parent_mutation(parent_id)
+                    .await;
                 let run = self
                     .load_by_task_id(&admission.task_id)
                     .await?
@@ -3583,6 +3623,7 @@ impl RunStore {
                 return Ok(None);
             }
         }
+        let parent_id = snapshot.parent_conversation_id;
 
         // Phase 2 (test-only): after observing still-Reserving own/unbound
         // ("would settle"), before the ownership-fenced write. Concurrent
@@ -3634,6 +3675,7 @@ impl RunStore {
         #[cfg(not(any(test, feature = "test-utils")))]
         let inject_identity_failure = false;
 
+        let _mutation_guard = self.orchestration_binding_snapshots.mutation_guard().await;
         let outcome = self
             .db
             .conn
@@ -3790,6 +3832,11 @@ impl RunStore {
         match outcome {
             Ok((settlement, effect)) => {
                 self.emit_workflow_effect(&effect);
+                if matches!(&settlement, Some(Settlement::Won(_))) {
+                    self.orchestration_binding_snapshots
+                        .record_parent_mutation(parent_id)
+                        .await;
+                }
                 Ok(settlement)
             }
             Err(sea_orm::TransactionError::Connection(e)) => Err(map_db_err(e)),
@@ -3863,6 +3910,13 @@ impl RunStore {
         child_connection_id: &str,
         prompt_accepted_at: DateTime<Utc>,
     ) -> Result<PromoteRunningOutcome, TaskStoreError> {
+        let pre_mutation = self.load_by_task_id(task_id).await.ok().flatten().map(|run| {
+            (
+                run.parent_conversation_id,
+                run.run_status == DelegationRunStatus::Reserving,
+            )
+        });
+        let _mutation_guard = self.orchestration_binding_snapshots.mutation_guard().await;
         let policy = PromoteRetryPolicy::production();
         let mut meta = PromoteAttemptMeta::default();
         let mut last_retry: Option<(PromoteRetryClass, String)> = None;
@@ -3880,6 +3934,17 @@ impl RunStore {
                 .await
             {
                 Ok(kind) => {
+                    if let Some((parent_id, true)) = pre_mutation {
+                        if matches!(
+                            &kind,
+                            PromoteRunningKind::Promoted { .. }
+                                | PromoteRunningKind::AlreadyRunning { .. }
+                        ) {
+                            self.orchestration_binding_snapshots
+                                .record_parent_mutation(parent_id)
+                                .await;
+                        }
+                    }
                     return Ok(PromoteRunningOutcome { kind, meta });
                 }
                 Err(PromoteOnceError::Retry {
@@ -4433,6 +4498,12 @@ impl RunStore {
         #[cfg(not(any(test, feature = "test-utils")))]
         let inject_terminal_transaction_failure = false;
 
+        let _mutation_guard = self.orchestration_binding_snapshots.mutation_guard().await;
+        let mutation_parent_id = DelegationTaskRun::find_by_id(task_id)
+            .one(&self.db.conn)
+            .await
+            .map_err(map_db_err)?
+            .map(|row| row.parent_conversation_id);
         let outcome = self
             .db
             .conn
@@ -4762,6 +4833,13 @@ impl RunStore {
         match outcome {
             Ok((settlement, effect, completion)) => {
                 self.emit_workflow_effect(&effect);
+                if matches!(&settlement, Settlement::Won(_)) {
+                    self.orchestration_binding_snapshots
+                        .record_parent_mutation(
+                            mutation_parent_id.expect("settled run had a parent"),
+                        )
+                        .await;
+                }
                 Ok((settlement, completion))
             }
             Err(sea_orm::TransactionError::Connection(e)) => Err(map_db_err(e)),
