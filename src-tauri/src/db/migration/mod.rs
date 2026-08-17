@@ -65,6 +65,7 @@ mod m20260807_000001_work_task_scheduled_at;
 mod m20260808_000001_custom_agent_supports_mcp;
 mod m20260809_000001_completion_protocol_v2_only;
 mod m20260811_000001_simple_workflows;
+mod m20260817_000001_work_task_conversation_title;
 pub struct Migrator;
 
 #[async_trait::async_trait]
@@ -135,6 +136,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260808_000001_custom_agent_supports_mcp::Migration),
             Box::new(m20260809_000001_completion_protocol_v2_only::Migration),
             Box::new(m20260811_000001_simple_workflows::Migration),
+            Box::new(m20260817_000001_work_task_conversation_title::Migration),
         ]
     }
 }

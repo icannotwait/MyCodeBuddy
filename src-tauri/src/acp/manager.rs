@@ -2922,25 +2922,95 @@ impl ConnectionManager {
             .map_err(|_| AcpError::ProcessExited)
     }
 
-    /// Pause or clear the session's active Codex goal via the connection loop
-    /// (codex-acp #293). Looked up by connectionId; the loop sources the
-    /// sessionId from the live session, so callers only supply the action.
+    /// Pause or clear the session's active goal via the connection loop
+    /// (codex-acp #293; the provider-neutral `_session/goal` since codex 1.2 /
+    /// claude 0.66). Looked up by connectionId; the loop sources the sessionId
+    /// from the live session, so callers only supply the action.
+    ///
+    /// STOPS THE RUNNING TURN TOO, for adapters whose control request travels
+    /// out of band (see `registry::goal_control_is_out_of_band`). Without that,
+    /// the button is a lie: codex's pause/clear are pure app-server metadata
+    /// that only take hold at the next idle point, so the user clicks 暂停 and
+    /// watches the agent keep working — the whole reason the goal card's
+    /// controls were once ripped out.
+    ///
+    /// Two conditions guard it, and neither is "is a turn running?":
+    /// * the goal must have been ACTIVE when the user clicked
+    ///   (`SessionState.goal_active`, read before the request goes out). An
+    ///   active goal is the thing driving the work, so stopping the work is
+    ///   what the click means. A PAUSED goal drives nothing — clearing one is
+    ///   housekeeping, and must never abort a turn the user started themselves
+    ///   in the meantime.
+    /// * the control must have LANDED. The loop reports that back over a
+    ///   oneshot; a rejected request (or a closed channel) leaves the turn
+    ///   alone, so a goal that is still `active` never gets its work killed
+    ///   only to have codex resume it at the next idle point. The round-trip
+    ///   also makes the interrupt strictly second: the goal is already
+    ///   non-active when the abort lands, so nothing auto-continues on the way
+    ///   out.
+    ///
+    /// Liveness deliberately does NOT gate it. `ConnectionStatus::Prompting`
+    /// (and `turn_in_flight` with it) tracks turns CODEG started, and a goal
+    /// loop's continuations are started by codex itself — detached turns no host
+    /// request owns — so gating on them would skip the interrupt in exactly the
+    /// case that motivated this. Any post-hoc read is unsound anyway: by the
+    /// time the manager acts on it the turn it described may have ended. With
+    /// the goal known active, the interrupt means precisely "press Stop on the
+    /// user's behalf": `cancel()`'s row write is CAS'd from `InProgress`, a
+    /// `session/cancel` with nothing running is a no-op, and its permission
+    /// drain / delegation cascade are the semantics the Stop button already has
+    /// (including its own turn-boundary race, which is not made worse here).
+    ///
+    /// Awaiting the round-trip is deliberate and cheap — an out-of-band control
+    /// is a plain RPC that returns without waiting for the turn. It is NOT
+    /// cancellation-shielded (unlike `submit_feedback_native`): a caller that
+    /// disappears mid-await simply doesn't get the follow-up interrupt, which is
+    /// the pre-existing behavior, never worse. The control itself is owned by
+    /// the loop from the moment it is enqueued.
     pub async fn goal_control(
         &self,
+        db: &DatabaseConnection,
         conn_id: &str,
         action: GoalControlAction,
     ) -> Result<(), AcpError> {
-        let cmd_tx = {
+        let (cmd_tx, agent_type, state_arc) = {
             let connections = self.connections.lock().await;
             let conn = connections
                 .get(conn_id)
                 .ok_or_else(|| AcpError::ConnectionNotFound(conn_id.into()))?;
-            conn.cmd_tx.clone()
+            (conn.cmd_tx.clone(), conn.agent_type, conn.state.clone())
+        };
+        // Read the goal state as it was when the user clicked — reading it after
+        // the round-trip would see the transition we just asked for.
+        let interrupts = crate::acp::registry::goal_control_is_out_of_band(agent_type)
+            && state_arc.read().await.goal_active;
+        // Only ask for an answer when it would change what we do next.
+        let (reply_tx, reply_rx) = if interrupts {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
         };
         cmd_tx
-            .send(ConnectionCommand::GoalControl { action })
+            .send(ConnectionCommand::GoalControl {
+                action,
+                reply: reply_tx,
+            })
             .await
-            .map_err(|_| AcpError::ProcessExited)
+            .map_err(|_| AcpError::ProcessExited)?;
+
+        let Some(reply_rx) = reply_rx else {
+            return Ok(());
+        };
+        if !matches!(reply_rx.await, Ok(true)) {
+            return Ok(());
+        }
+        tracing::info!(
+            "[ACP] goal {:?} landed; interrupting so the work stops now connection={}",
+            action,
+            conn_id
+        );
+        self.cancel(db, conn_id).await
     }
 
     pub async fn cancel(&self, db: &DatabaseConnection, conn_id: &str) -> Result<(), AcpError> {
@@ -12185,6 +12255,174 @@ mod tests {
         rx
     }
 
+    /// Put a turn in flight on a connection inserted by
+    /// [`insert_live_connection`] (which starts them `Connected`).
+    async fn mark_prompting(mgr: &ConnectionManager, conn_id: &str) {
+        let state = mgr.get_state(conn_id).await.expect("connection");
+        state.write().await.status = ConnectionStatus::Prompting;
+    }
+
+    /// Mirror what a live `active` goal snapshot leaves on the state.
+    async fn mark_goal_active(mgr: &ConnectionManager, conn_id: &str) {
+        let state = mgr.get_state(conn_id).await.expect("connection");
+        state.write().await.goal_active = true;
+    }
+
+    /// Stand in for the connection loop's `GoalControl` arm: take the command,
+    /// assert the action, answer `landed`, and hand the receiver back so the
+    /// test can see what (if anything) the manager enqueues next. Returns a
+    /// JoinHandle because `goal_control` blocks on that answer.
+    fn answer_goal_control(
+        mut rx: tokio::sync::mpsc::Receiver<crate::acp::connection::ConnectionCommand>,
+        expected: GoalControlAction,
+        landed: bool,
+    ) -> tokio::task::JoinHandle<tokio::sync::mpsc::Receiver<crate::acp::connection::ConnectionCommand>>
+    {
+        tokio::spawn(async move {
+            match rx.recv().await.expect("goal control enqueued") {
+                ConnectionCommand::GoalControl { action, reply } => {
+                    assert_eq!(action, expected);
+                    reply
+                        .expect("an interrupting caller attaches a reply")
+                        .send(landed)
+                        .expect("manager is listening");
+                }
+                _ => panic!("expected a GoalControl command"),
+            }
+            rx
+        })
+    }
+
+    #[tokio::test]
+    async fn a_codex_goal_pause_mid_turn_interrupts_the_turn_after_the_goal_rpc() {
+        // codex's pause is app-server metadata: it stops the goal from starting
+        // ANOTHER turn but never touches the one that is running, so without
+        // the interrupt the user clicks Pause and watches the agent keep
+        // working. Order matters — the goal RPC has to LAND first, so the goal
+        // is already non-active when the turn aborts and nothing auto-continues
+        // on the way out.
+        use crate::db::test_helpers;
+        let db = test_helpers::fresh_in_memory_db().await;
+        let mgr = ConnectionManager::new();
+        let rx = insert_live_connection(&mgr, "c-goal-codex", AgentType::Codex, None).await;
+        mark_prompting(&mgr, "c-goal-codex").await;
+        mark_goal_active(&mgr, "c-goal-codex").await;
+        let loop_stub = answer_goal_control(rx, GoalControlAction::Pause, true);
+
+        mgr.goal_control(&db.conn, "c-goal-codex", GoalControlAction::Pause)
+            .await
+            .unwrap();
+
+        let mut rx = loop_stub.await.unwrap();
+        assert!(matches!(rx.try_recv(), Ok(ConnectionCommand::Cancel)));
+        assert!(rx.try_recv().is_err(), "nothing else is enqueued");
+    }
+
+    #[tokio::test]
+    async fn a_rejected_goal_control_leaves_the_turn_alone() {
+        // The agent refused the pause (bad params, unknown session, dead
+        // process). The goal is still active, so killing the turn would destroy
+        // in-flight work AND let codex resume the goal at the next idle point —
+        // strictly worse than the error banner the loop already emitted.
+        use crate::db::test_helpers;
+        let db = test_helpers::fresh_in_memory_db().await;
+        let mgr = ConnectionManager::new();
+        let rx = insert_live_connection(&mgr, "c-goal-refused", AgentType::Codex, None).await;
+        mark_prompting(&mgr, "c-goal-refused").await;
+        mark_goal_active(&mgr, "c-goal-refused").await;
+        let loop_stub = answer_goal_control(rx, GoalControlAction::Pause, false);
+
+        mgr.goal_control(&db.conn, "c-goal-refused", GoalControlAction::Pause)
+            .await
+            .unwrap();
+
+        let mut rx = loop_stub.await.unwrap();
+        assert!(rx.try_recv().is_err(), "a failed control cancels nothing");
+    }
+
+    #[tokio::test]
+    async fn a_codex_goal_clear_interrupts_even_when_codeg_thinks_it_is_idle() {
+        // Codeg's `Prompting` only covers turns IT started. A goal loop's
+        // continuations are started by codex — detached turns no host request
+        // owns — so the session reads "connected" while the agent is very much
+        // working, which is precisely when the user hits Clear. Gating on our
+        // own turn bookkeeping would skip the interrupt exactly there, so the
+        // interrupt is not gated on liveness: with an ACTIVE goal, whatever is
+        // running is the goal's work, and with nothing running the interrupt is
+        // the same harmless no-op the Stop button is.
+        use crate::db::test_helpers;
+        let db = test_helpers::fresh_in_memory_db().await;
+        let mgr = ConnectionManager::new();
+        let rx = insert_live_connection(&mgr, "c-goal-idle", AgentType::Codex, None).await;
+        mark_goal_active(&mgr, "c-goal-idle").await;
+        let loop_stub = answer_goal_control(rx, GoalControlAction::Clear, true);
+
+        mgr.goal_control(&db.conn, "c-goal-idle", GoalControlAction::Clear)
+            .await
+            .unwrap();
+
+        let mut rx = loop_stub.await.unwrap();
+        assert!(matches!(rx.try_recv(), Ok(ConnectionCommand::Cancel)));
+        assert!(rx.try_recv().is_err(), "nothing else is enqueued");
+    }
+
+    #[tokio::test]
+    async fn clearing_a_paused_goal_never_touches_the_users_own_turn() {
+        // A paused goal drives nothing, so a turn running alongside it is
+        // something the user started themselves. Dismissing the stale card is
+        // housekeeping — killing that prompt (and draining its permissions, and
+        // cascading to its delegations) would be destroying unrelated work.
+        use crate::db::test_helpers;
+        let db = test_helpers::fresh_in_memory_db().await;
+        let mgr = ConnectionManager::new();
+        let mut rx = insert_live_connection(&mgr, "c-goal-paused", AgentType::Codex, None).await;
+        mark_prompting(&mgr, "c-goal-paused").await; // the user's own prompt
+        // `goal_active` stays false: the last snapshot was `paused`.
+
+        mgr.goal_control(&db.conn, "c-goal-paused", GoalControlAction::Clear)
+            .await
+            .unwrap();
+
+        match rx.try_recv() {
+            Ok(ConnectionCommand::GoalControl { action, reply }) => {
+                assert_eq!(action, GoalControlAction::Clear);
+                assert!(reply.is_none(), "no interrupt is intended, so none waits");
+            }
+            _ => panic!("expected a GoalControl command"),
+        }
+        assert!(rx.try_recv().is_err(), "the user's turn survives");
+    }
+
+    #[tokio::test]
+    async fn a_claude_goal_clear_never_interrupts_the_turn_carrying_it() {
+        // claude-agent-acp implements `_session/goal` by STEERING the text
+        // "/goal clear" into the running turn (or prompting when idle).
+        // Cancelling would kill the message that carries the clear and leave
+        // the goal armed — worse than doing nothing. Same for every adapter
+        // whose control channel we haven't verified. No interrupt is intended,
+        // so no reply is even asked for and the call doesn't wait.
+        use crate::db::test_helpers;
+        let db = test_helpers::fresh_in_memory_db().await;
+        let mgr = ConnectionManager::new();
+        let mut rx =
+            insert_live_connection(&mgr, "c-goal-claude", AgentType::ClaudeCode, None).await;
+        mark_prompting(&mgr, "c-goal-claude").await;
+        mark_goal_active(&mgr, "c-goal-claude").await;
+
+        mgr.goal_control(&db.conn, "c-goal-claude", GoalControlAction::Clear)
+            .await
+            .unwrap();
+
+        match rx.try_recv() {
+            Ok(ConnectionCommand::GoalControl { action, reply }) => {
+                assert_eq!(action, GoalControlAction::Clear);
+                assert!(reply.is_none(), "nobody waits on an in-band control");
+            }
+            _ => panic!("expected a GoalControl command"),
+        }
+        assert!(rx.try_recv().is_err(), "the carrying turn survives");
+    }
+
     #[tokio::test]
     async fn send_prompt_linked_attaches_user_message_to_prompt_for_root() {
         // A root send attaches the projected user-message payload to the
@@ -15630,6 +15868,7 @@ mod tests {
             message: "agent exploded".into(),
             agent_type: "claude_code".into(),
             code: Some("sdk_not_installed".into()),
+            details: None,
             terminal: true,
         });
         let captured = s.last_error.as_ref().expect("error must be captured");
@@ -15643,6 +15882,7 @@ mod tests {
             message: "second failure".into(),
             agent_type: "claude_code".into(),
             code: None,
+            details: None,
             terminal: true,
         });
         let captured = s.last_error.as_ref().unwrap();

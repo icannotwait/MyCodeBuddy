@@ -19,7 +19,7 @@
   <a href="./docs/readme/README.ar.md">العربية</a>
 </p>
 
-Codeg (Code Generation) is a multi-agent coding workspace. It brings multiple agents (Claude Code, Codex CLI, OpenCode, Gemini CLI, Cline, Hermes Agent, CodeBuddy, Kimi Code, Pi, Grok Build, Cursor, etc.) into one workspace, supporting conversation aggregation and multi-agent collaboration, with desktop installation plus server/Docker deployment.
+Codeg (Code Generation) is a multi-agent coding workspace. It brings multiple agents (Claude Code, Codex CLI, OpenCode, Gemini CLI, Cline, Hermes Agent, CodeBuddy, Kimi Code, Pi, Grok Build, Cursor, DeepSeek Harness, etc.) into one workspace, supporting conversation aggregation and multi-agent collaboration, with desktop installation plus server/Docker deployment.
 
 ![gallery](./docs/images/workspace-light.png#gh-light-mode-only)
 ![gallery](./docs/images/workspace-dark.png#gh-dark-mode-only)
@@ -77,6 +77,7 @@ Codeg (Code Generation) is a multi-agent coding workspace. It brings multiple ag
 ## Highlights
 
 - **Conversation Aggregation** — import sessions from all supported agents into one unified workspace
+- **DeepSeek Harness** — install and launch it from the agent list, with skills, MCP, delegation, experts, Office tools, and session history. Needs Node 22.
 - **Multi-Agent Collaboration** — within a single session, the main agent delegates to sub-agents of different types (e.g. Claude Code calling Codex, Gemini) to jointly complete a task, each running as an independent session
 - Parallel development with built-in `git worktree` flows
 - **Project Boot** — visually scaffold new projects with live preview
@@ -108,6 +109,7 @@ Codeg (Code Generation) is a multi-agent coding workspace. It brings multiple ag
 | Pi           | `$PI_CODING_AGENT_SESSION_DIR`        | `~/.pi/agent/sessions`                | `%USERPROFILE%\\.pi\\agent\\sessions`                 |
 | Grok Build   | `$GROK_HOME/sessions`                 | `~/.grok/sessions`                    | `%USERPROFILE%\\.grok\\sessions`                      |
 | Cursor       | `$CURSOR_CONFIG_DIR/chats`            | `~/.cursor/chats`                     | `%USERPROFILE%\\.cursor\\chats`                       |
+| DeepSeek Harness | `$DSH_HOME/sessions`                  | `~/.dsh/sessions`                     | `%USERPROFILE%\.dsh\sessions`                     |
 
 > Note: environment variables take precedence over fallback paths.
 
@@ -343,7 +345,7 @@ irm https://raw.githubusercontent.com/icannotwait/MyCodeBuddy/main/uninstall-ser
 Windows operators can install from the release zip:
 
 ```powershell
-.\install.ps1 -Version v0.25.0-mycodebuddy.1
+.\install.ps1 -Version v0.26.1-mycodebuddy.1
 ```
 
 #### Option 1: Docker

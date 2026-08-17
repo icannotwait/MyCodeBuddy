@@ -153,6 +153,7 @@ mod tests {
                 message: "x".into(),
                 agent_type: "claude_code".into(),
                 code: None,
+                details: None,
                 terminal: true,
             },
             AcpEvent::PermissionRequest {

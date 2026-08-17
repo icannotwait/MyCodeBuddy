@@ -18,6 +18,7 @@ use crate::parsers::cline::ClineParser;
 use crate::parsers::codebuddy::CodeBuddyParser;
 use crate::parsers::codex::CodexParser;
 use crate::parsers::cursor::CursorParser;
+use crate::parsers::deepseek::DeepSeekParser;
 use crate::parsers::gemini::GeminiParser;
 use crate::parsers::grok::GrokParser;
 use crate::parsers::hermes::HermesParser;
@@ -248,6 +249,7 @@ fn list_conversations_sync(
         (AgentType::Pi, Box::new(PiParser::new())),
         (AgentType::Grok, Box::new(GrokParser::new())),
         (AgentType::Cursor, Box::new(CursorParser::new())),
+        (AgentType::DeepSeek, Box::new(DeepSeekParser::new())),
     ];
     // Registered custom agents read back from codeg's own ACP transcripts, so
     // their sessions participate in folder grouping and stats like any other.
@@ -399,6 +401,7 @@ pub async fn get_conversation_core(
             AgentType::Pi => Box::new(PiParser::new()),
             AgentType::Grok => Box::new(GrokParser::new()),
             AgentType::Cursor => Box::new(CursorParser::new()),
+            AgentType::DeepSeek => Box::new(DeepSeekParser::new()),
             // Custom ACP agents have no native store to reverse-engineer;
             // their history is codeg's own ACP transcript.
             AgentType::Custom(_) => Box::new(AcpNativeParser::new(agent_type)),
@@ -1461,12 +1464,19 @@ pub async fn get_folder_conversation_core(
             let at = summary.agent_type;
             let eid = ext_id.clone();
             let db_created_at = summary.created_at;
-            let folder_path_for_fallback = {
-                let folder = folder_service::get_folder_by_id(conn, summary.folder_id)
+            // Prefer the recorded origin cwd (set when a removed task worktree's
+            // conversations were re-parented) over the current folder's path — the
+            // session file still carries the ORIGINAL cwd, so matching on the new
+            // parent folder would never find it.
+            let folder_path_for_fallback = match summary.origin_cwd.clone() {
+                Some(cwd) => Some(cwd),
+                None => folder_service::get_folder_by_id(conn, summary.folder_id)
                     .await
                     .ok()
-                    .flatten();
-                folder.map(|f| f.path)
+                    .flatten()
+                    .map(|f| f.path),
+            };
+
             };
             // Hold the shared discovery lease across the entire direct/fallback
             // parser boundary so a concurrent register cannot race mid-recovery.
@@ -1488,6 +1498,7 @@ pub async fn get_folder_conversation_core(
                     AgentType::Pi => Box::new(PiParser::new()),
                     AgentType::Grok => Box::new(GrokParser::new()),
                     AgentType::Cursor => Box::new(CursorParser::new()),
+                    AgentType::DeepSeek => Box::new(DeepSeekParser::new()),
                     AgentType::Custom(_) => Box::new(AcpNativeParser::new(at)),
                 };
                 match parser.get_conversation(&eid) {

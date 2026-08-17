@@ -19,7 +19,7 @@
   <a href="./README.ar.md">العربية</a>
 </p>
 
-Codeg（Code Generation）是一个多智能体编码工作台，它将多个智能体（Claude Code、Codex CLI、OpenCode、Gemini CLI、Cline、Hermes Agent、CodeBuddy、Kimi Code、Pi、Grok Build、Cursor 等）统一到一个工作区中，支持会话聚合和多智能体协作，支持桌面安装，服务器/Docker 部署。
+Codeg（Code Generation）是一个多智能体编码工作台，它将多个智能体（Claude Code、Codex CLI、OpenCode、Gemini CLI、Cline、Hermes Agent、CodeBuddy、Kimi Code、Pi、Grok Build、Cursor、DeepSeek Harness 等）统一到一个工作区中，支持会话聚合和多智能体协作，支持桌面安装，服务器/Docker 部署。
 
 ![gallery](../images/workspace-light.png#gh-light-mode-only)
 ![gallery](../images/workspace-dark.png#gh-dark-mode-only)
@@ -302,7 +302,7 @@ Self-host with the release archive, Docker, or a source build (`--features serve
 Windows install:
 
 ```powershell
-.\install.ps1 -Version v0.25.0-mycodebuddy.1
+.\install.ps1 -Version v0.26.1-mycodebuddy.1
 ```
 
 #### 方式三：Docker

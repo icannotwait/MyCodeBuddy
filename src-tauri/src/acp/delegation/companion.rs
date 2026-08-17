@@ -3098,6 +3098,7 @@ mod tests {
         assert!(names.contains(&"get_delegation_status"));
         assert!(names.contains(&"cancel_delegation"));
         // delegate_to_agent schema still enumerates all supported agent types.
+
         let delegate = tools
             .iter()
             .find(|t| t["name"] == "delegate_to_agent")
@@ -3120,6 +3121,7 @@ mod tests {
                 "pi",
                 "grok",
                 "cursor",
+                "deepseek",
             ]
         );
         assert!(delegate["inputSchema"]["properties"]["profile_id"].is_object());
@@ -3285,15 +3287,37 @@ mod tests {
             .as_array()
             .unwrap();
 
-        assert_eq!(agents.len(), 9);
+        assert_eq!(agents.len(), 10);
         assert!(!agents.iter().any(|agent| agent == "codex"));
         assert!(!agents.iter().any(|agent| agent == "grok"));
         assert!(agents.iter().any(|agent| agent == "code_buddy"));
+        assert!(agents.iter().any(|agent| agent == "deepseek"));
         assert!(!agents.iter().any(|agent| {
             agent
                 .as_str()
                 .is_some_and(|slug| slug.starts_with("custom:"))
         }));
+    }
+
+    #[tokio::test]
+    async fn empty_disabled_list_serves_the_embedded_builtin_enum_unchanged() {
+        let line = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#;
+        let resp = unwrap_respond(dispatch_for_test(line).await);
+        let tools = resp.result.unwrap()["tools"].clone();
+        let delegate = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "delegate_to_agent")
+            .cloned()
+            .unwrap();
+        let agents = delegate["inputSchema"]["properties"]["agent_type"]["enum"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(agents.len(), 12);
+        assert_eq!(agents[0], "claude_code");
+        assert_eq!(agents[11], "deepseek");
     }
 
     #[tokio::test]

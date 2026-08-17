@@ -1040,7 +1040,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "codeg"
-version = "0.25.0-mycodebuddy.1"
+version = "0.26.1-mycodebuddy.1"
 dependencies = [
  "aes-gcm",
  "agent-client-protocol-schema",
@@ -1124,6 +1124,7 @@ dependencies = [
  "which 7.0.3",
  "windows-sys 0.59.0",
  "zip 2.4.2",
+ "zstd",
 ]
 
 [[package]]

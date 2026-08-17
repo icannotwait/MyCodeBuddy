@@ -487,7 +487,8 @@
     "templates": {
       "gemini": "---\nname: example-skill\ndescription: Describe when this skill should be used.\n---\n\n# Skill Name\n\nInstructions for the agent when this skill is active.\n\n## Workflow\n\n1. Add actionable step one.\n2. Add actionable step two.\n",
       "openCode": "---\nname: example-skill\ndescription: Describe when this skill should be used.\n---\n\n# Purpose\n\nDescribe what this skill helps with.\n\n# Steps\n\n1. Add actionable step one.\n2. Add actionable step two.\n",
-      "default": "---\nname: example-skill\ndescription: Describe when this skill should be used.\n---\n\n# Skill: example-skill\n\n## When to use\n\n- Describe trigger conditions.\n\n## Instructions\n\n1. Add actionable instruction one.\n2. Add actionable instruction two.\n"
+      "default": "---\nname: example-skill\ndescription: Describe when this skill should be used.\n---\n\n# Skill: example-skill\n\n## When to use\n\n- Describe trigger conditions.\n\n## Instructions\n\n1. Add actionable instruction one.\n2. Add actionable instruction two.\n",
+      "openClaw": "---\nname: example-skill\ndescription: Describe when this skill should be used.\nuser-invocable: true\ndisable-model-invocation: false\n---\n\n# Purpose\n\nDescribe what this skill helps with.\n\n# Instructions\n\n1. Add actionable instruction one.\n2. Add actionable instruction two.\n"
     }
   },
   "McpSettings": {
@@ -662,7 +663,8 @@
         "native": "Native"
       },
       "softWatchdog": "軟看門狗（秒）",
-      "softWatchdogHint": "僅觀察的停滯閾值（{min}–{max}）。0 表示關閉停滯標記。不會取消或切換路由。"
+      "softWatchdogHint": "僅觀察的停滯閾值（{min}–{max}）。0 表示關閉停滯標記。不會取消或切換路由。",
+      "withheldByHostTools": "{agents} 不會拿到委派工具：它們單獨開啟了「由 Agent 自行處理檔案與命令」。"
     },
     "actions": {
       "dragSort": "拖拽排序",
@@ -700,7 +702,9 @@
       "saveKimiCodeConfig": "儲存 Kimi Code 設定",
       "customInstall": "自訂安裝",
       "saveKimiCodeRawConfig": "儲存 config.toml",
-      "diagnose": "診斷"
+      "diagnose": "診斷",
+      "saveOpenClawConfig": "儲存 OpenClaw 配置",
+      "saveDeepSeekConfig": "儲存 DeepSeek 設定"
     },
     "status": {
       "enabled": "啟用",
@@ -1193,7 +1197,11 @@
       "piBinaryUninstallFailed": "pi 解除安裝失敗",
       "savePiTrustFailed": "儲存工作區信任失敗",
       "cursorSaved": "Cursor 設定已儲存",
-      "saveCursorConfigFailed": "儲存 Cursor 設定失敗"
+      "saveCursorConfigFailed": "儲存 Cursor 設定失敗",
+      "openClawSaved": "OpenClaw 配置已儲存",
+      "saveOpenClawFailed": "儲存 OpenClaw 配置失敗",
+      "deepseekSaved": "DeepSeek 設定已儲存",
+      "saveDeepSeekFailed": "儲存 DeepSeek 設定失敗"
     },
     "version": {
       "statusLabel": "版本狀態",
@@ -1405,7 +1413,24 @@
       "ready": "轉接器 {adapterCmd} 已安裝 —— Codeg 啟動的就是它。它自帶執行環境，所以不需要另外安裝 {nativeLabel}；即使日後你安裝了，兩者也能並存並共用 {configDir}。"
     },
     "customAgentMcpLabel": "MCP 支援",
-    "customAgentMcpHint": "工作階段建立時向該智慧體注入 codeg 內建的 codeg-mcp 伴生行程 —— 委派、即時回饋與任務工具都依賴它。若該智慧體不支援 MCP、連線時報錯，請關閉此項；設定會在下次連線時生效。"
+    "customAgentMcpHint": "工作階段建立時向該智慧體注入 codeg 內建的 codeg-mcp 伴生行程 —— 委派、即時回饋與任務工具都依賴它。若該智慧體不支援 MCP、連線時報錯，請關閉此項；設定會在下次連線時生效。",
+    "deepseek": {
+      "configManagement": "DeepSeek Harness 設定",
+      "configDescription": "端點與金鑰是 deepseek-acp 啟動時讀取的環境變數。模型與推理等級是工作階段層級的選擇器，在輸入框裡切換。",
+      "baseUrlLabel": "API 端點",
+      "baseUrlHint": "留空則使用官方端點。儲存後對新建的工作階段生效——正在進行的工作階段需要重新連線才會切換。",
+      "baseUrlInvalid": "請填寫完整的 http(s) 網址且不帶查詢參數，例如 https://api.deepseek.com",
+      "apiKeyLabel": "API 金鑰",
+      "apiKeyHint": "以 DEEPSEEK_API_KEY 傳給智慧體。環境變數的優先權高於憑證檔，因此若用終端機登入，這裡留空即可。"
+    },
+    "openClaw": {
+      "gatewayConfig": "Gateway 配置",
+      "gatewayDescription": "配置 OpenClaw Gateway 連線資訊。支援本地或遠端 Gateway。",
+      "gatewayUrlHint": "留空則使用 openclaw 本地配置的 gateway.remote.url。",
+      "gatewayTokenPlaceholder": "Gateway 認證 Token",
+      "gatewayTokenHint": "建議使用 token-file 取代明文 Token，可透過 openclaw 命令列配置。",
+      "sessionKeyHint": "可選。指定 Gateway Session Key，留空則自動分配隔離會話。"
+    }
   },
   "SettingsPages": {
     "agentsLoading": "載入 Agent 設定中...",
@@ -2877,7 +2902,8 @@
       "agentSelector": {
         "noEnabledAgents": "暫無已啟用的 Agent",
         "openAgentsSettings": "開啟 Agents 設定",
-        "notInstalled": "未安裝"
+        "notInstalled": "未安裝",
+        "moreAgents": "更多 Agent（{count}）"
       },
       "subAgentOverlay": {
         "title": "Sub-agents",
@@ -3294,7 +3320,8 @@
             "blocked": "受阻",
             "usageLimited": "用量受限",
             "budgetLimited": "預算受限",
-            "complete": "已完成"
+            "complete": "已完成",
+            "limited": "已達上限"
           }
         },
         "field": {
@@ -3414,7 +3441,8 @@
           "outputMissing": "codex 截斷指令碼輸出時捨棄了這個命令的分隔行，因此沒有輸出可歸屬給它。",
           "sharedWith": "本段還包含 {commands} 的輸出——它們的分隔行已被 codex 截斷捨棄。",
           "truncated": "已截斷"
-        }
+        },
+        "agentCodexLaunchOnly": "已啟動。Codex 不會再回報這個子智能體的進度——它的結果會以一則訊息出現在本工作階段中。"
       },
       "messageNav": {
         "title": "訊息導覽",
@@ -3586,7 +3614,8 @@
       "contextCompaction": {
         "compacting": "正在壓縮上下文…",
         "compacted": "上下文已壓縮",
-        "compactedTokens": "上下文已壓縮 · {before} → {after} tokens"
+        "compactedTokens": "上下文已壓縮 · {before} → {after} tokens",
+        "failed": "上下文壓縮失敗"
       },
       "backgroundTasks": {
         "running": "{count} 個背景任務執行中",
@@ -3678,6 +3707,26 @@
         "revokedToast": "已撤銷信任——已重新連線，pi 不再載入此專案的資源",
         "trustedNoReconnect": "已信任專案——將在 pi 下次啟動時生效",
         "revokedNoReconnect": "已撤銷信任——將在 pi 下次啟動時生效"
+      },
+      "sessionFailure": {
+        "category": {
+          "connection": "連線異常",
+          "access": "存取受限",
+          "limit": "已達限制",
+          "request": "請求被拒絕",
+          "service": "服務異常",
+          "unknown": "會話異常"
+        },
+        "action": {
+          "retry": "重試",
+          "login": "去登入",
+          "newSession": "新增會話"
+        },
+        "recovered": "已恢復",
+        "retryUnavailable": "沒有可重發的訊息。",
+        "toggleDetails": "展開/收合詳情",
+        "dismiss": "忽略",
+        "moreIncidents": "另 {count} 條"
       }
     },
     "diffPreview": {
@@ -5254,7 +5303,13 @@
     "eventCleanupFailed": "worktree 清理失敗",
     "eventResumeFallback": "會話恢復失敗，已改用新會話",
     "eventUserAction": "使用者操作",
-    "eventDiffStat": "變更快照"
+    "eventDiffStat": "變更快照",
+    "settingsWorktreeRoot": "Worktree 位置",
+    "settingsWorktreeRootHint": "新任務的 worktree 會建立在該目錄下，每個任務一個。留空則建立在專案資料夾的同層目錄；「~」表示家目錄，相對路徑相對於專案資料夾。",
+    "settingsWorktreeRootPlaceholder": "~/codeg-worktrees",
+    "settingsWorktreeRootBrowse": "選擇 worktree 目錄",
+    "settingsTabMerge": "合併",
+    "settingsTabWorktree": "Worktree"
   },
   "TokenUsage": {
     "title": "Token 用量",

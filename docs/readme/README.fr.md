@@ -302,7 +302,7 @@ Self-host with the release archive, Docker, or a source build (`--features serve
 Windows install:
 
 ```powershell
-.\install.ps1 -Version v0.25.0-mycodebuddy.1
+.\install.ps1 -Version v0.26.1-mycodebuddy.1
 ```
 
 #### Option 3 : Docker

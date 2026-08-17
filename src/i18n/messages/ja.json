@@ -487,7 +487,8 @@
     "templates": {
       "gemini": "---\nname: example-skill\ndescription: Describe when this skill should be used.\n---\n\n# Skill Name\n\nInstructions for the agent when this skill is active.\n\n## Workflow\n\n1. Add actionable step one.\n2. Add actionable step two.\n",
       "openCode": "---\nname: example-skill\ndescription: Describe when this skill should be used.\n---\n\n# Purpose\n\nDescribe what this skill helps with.\n\n# Steps\n\n1. Add actionable step one.\n2. Add actionable step two.\n",
-      "default": "---\nname: example-skill\ndescription: Describe when this skill should be used.\n---\n\n# Skill: example-skill\n\n## When to use\n\n- Describe trigger conditions.\n\n## Instructions\n\n1. Add actionable instruction one.\n2. Add actionable instruction two.\n"
+      "default": "---\nname: example-skill\ndescription: Describe when this skill should be used.\n---\n\n# Skill: example-skill\n\n## When to use\n\n- Describe trigger conditions.\n\n## Instructions\n\n1. Add actionable instruction one.\n2. Add actionable instruction two.\n",
+      "openClaw": "---\nname: example-skill\ndescription: Describe when this skill should be used.\nuser-invocable: true\ndisable-model-invocation: false\n---\n\n# Purpose\n\nDescribe what this skill helps with.\n\n# Instructions\n\n1. Add actionable instruction one.\n2. Add actionable instruction two.\n"
     }
   },
   "McpSettings": {
@@ -662,7 +663,8 @@
         "native": "Native"
       },
       "softWatchdog": "ソフトウォッチドッグ（秒）",
-      "softWatchdogHint": "監視のみの停滞しきい値（{min}–{max}）。0 で停滞表示を無効化。キャンセルやルート変更はしません。"
+      "softWatchdogHint": "監視のみの停滞しきい値（{min}–{max}）。0 で停滞表示を無効化。キャンセルやルート変更はしません。",
+      "withheldByHostTools": "{agents} には委任ツールが渡りません。エージェントごとの「ファイルとコマンドをエージェント自身に任せる」スイッチがオンになっています。"
     },
     "actions": {
       "dragSort": "ドラッグして並べ替え",
@@ -700,7 +702,9 @@
       "saveKimiCodeConfig": "Kimi Code の設定を保存",
       "customInstall": "カスタムインストール",
       "saveKimiCodeRawConfig": "Save config.toml",
-      "diagnose": "診断"
+      "diagnose": "診断",
+      "saveOpenClawConfig": "OpenClaw設定を保存",
+      "saveDeepSeekConfig": "DeepSeek 設定を保存"
     },
     "status": {
       "enabled": "有効",
@@ -1193,7 +1197,11 @@
       "piBinaryUninstallFailed": "pi のアンインストールに失敗しました",
       "savePiTrustFailed": "ワークスペースの信頼設定の保存に失敗しました",
       "cursorSaved": "Cursor の設定を保存しました",
-      "saveCursorConfigFailed": "Cursor の設定の保存に失敗しました"
+      "saveCursorConfigFailed": "Cursor の設定の保存に失敗しました",
+      "openClawSaved": "OpenClaw設定を保存しました",
+      "saveOpenClawFailed": "OpenClaw設定の保存に失敗しました",
+      "deepseekSaved": "DeepSeek の設定を保存しました",
+      "saveDeepSeekFailed": "DeepSeek の設定の保存に失敗しました"
     },
     "version": {
       "statusLabel": "バージョン状態",
@@ -1405,7 +1413,24 @@
       "ready": "アダプター {adapterCmd} はインストール済みで、Codeg が起動するのはこれです。独自のランタイムを同梱しているため {nativeLabel} は不要です。後から入れても両者は共存し、{configDir} を共有します。"
     },
     "customAgentMcpLabel": "MCP サポート",
-    "customAgentMcpHint": "セッション開始時に codeg 内蔵の codeg-mcp コンパニオンをこのエージェントへ渡します。委任・リアルタイムフィードバック・タスクツールはこの経路を使います。MCP サーバーを受け付けず接続に失敗するエージェントではオフにしてください。設定は次回の接続から有効になります。"
+    "customAgentMcpHint": "セッション開始時に codeg 内蔵の codeg-mcp コンパニオンをこのエージェントへ渡します。委任・リアルタイムフィードバック・タスクツールはこの経路を使います。MCP サーバーを受け付けず接続に失敗するエージェントではオフにしてください。設定は次回の接続から有効になります。",
+    "deepseek": {
+      "configManagement": "DeepSeek Harness の設定",
+      "configDescription": "エンドポイントと API キーは deepseek-acp が起動時に読み込む環境変数です。モデルと推論レベルはセッションごとのセレクターなので、入力欄で切り替えます。",
+      "baseUrlLabel": "API エンドポイント",
+      "baseUrlHint": "空欄なら公式エンドポイントを使います。保存後に開始したセッションから有効になります。実行中のセッションは再接続してください。",
+      "baseUrlInvalid": "クエリ文字列を含まない完全な http(s) URL を入力してください（例：https://api.deepseek.com）",
+      "apiKeyLabel": "API キー",
+      "apiKeyHint": "DEEPSEEK_API_KEY としてエージェントに渡されます。環境変数は認証情報ファイルより優先されるため、ターミナルでログインする場合は空のままにしてください。"
+    },
+    "openClaw": {
+      "gatewayConfig": "Gateway 設定",
+      "gatewayDescription": "OpenClaw Gateway 接続を設定します。ローカルまたはリモートの gateway をサポートします。",
+      "gatewayUrlHint": "空欄の場合はローカル openclaw 設定の gateway.remote.url を使用します。",
+      "gatewayTokenPlaceholder": "Gateway 認証トークン",
+      "gatewayTokenHint": "可能な場合は平文トークンではなく token-file の使用を推奨します。openclaw CLI で設定してください。",
+      "sessionKeyHint": "任意。gateway の session key を指定します。空欄の場合は分離されたセッションが自動割り当てされます。"
+    }
   },
   "SettingsPages": {
     "agentsLoading": "エージェント設定を読み込み中...",
@@ -2877,7 +2902,8 @@
       "agentSelector": {
         "noEnabledAgents": "有効なエージェントがありません",
         "openAgentsSettings": "エージェント設定を開く",
-        "notInstalled": "未インストール"
+        "notInstalled": "未インストール",
+        "moreAgents": "他のエージェント（{count}）"
       },
       "subAgentOverlay": {
         "title": "サブエージェント",
@@ -3294,7 +3320,8 @@
             "blocked": "ブロック中",
             "usageLimited": "使用量制限",
             "budgetLimited": "予算制限",
-            "complete": "完了"
+            "complete": "完了",
+            "limited": "上限到達"
           }
         },
         "field": {
@@ -3414,7 +3441,8 @@
           "outputMissing": "codex がスクリプト出力を切り詰めた際にこのコマンドの区切り行が失われたため、出力を割り当てられませんでした。",
           "sharedWith": "この範囲には {commands} の出力も含まれます — 区切り行が codex により切り捨てられました。",
           "truncated": "切り詰め済み"
-        }
+        },
+        "agentCodexLaunchOnly": "起動しました。Codex はこのサブエージェントの進捗をこれ以上通知しません。結果はこの会話のメッセージとして届きます。"
       },
       "messageNav": {
         "title": "メッセージナビ",
@@ -3586,7 +3614,8 @@
       "contextCompaction": {
         "compacting": "コンテキストを圧縮しています…",
         "compacted": "コンテキストを圧縮しました",
-        "compactedTokens": "コンテキストを圧縮 · {before} → {after} トークン"
+        "compactedTokens": "コンテキストを圧縮 · {before} → {after} トークン",
+        "failed": "コンテキストの圧縮に失敗しました"
       },
       "backgroundTasks": {
         "running": "{count} 件のバックグラウンドタスクを実行中",
@@ -3678,6 +3707,26 @@
         "revokedToast": "信頼を取り消しました — 再接続したため pi はプロジェクトのリソースを読み込みません",
         "trustedNoReconnect": "プロジェクトを信頼しました — pi の次回起動時に適用されます",
         "revokedNoReconnect": "信頼を取り消しました — pi の次回起動時に適用されます"
+      },
+      "sessionFailure": {
+        "category": {
+          "connection": "接続の問題",
+          "access": "アクセスの問題",
+          "limit": "上限に到達",
+          "request": "リクエスト拒否",
+          "service": "サービスの問題",
+          "unknown": "セッションの問題"
+        },
+        "action": {
+          "retry": "再試行",
+          "login": "サインイン",
+          "newSession": "新しいセッション"
+        },
+        "recovered": "回復済み",
+        "retryUnavailable": "再送信できるメッセージがありません。",
+        "toggleDetails": "詳細の切り替え",
+        "dismiss": "閉じる",
+        "moreIncidents": "他 {count} 件"
       }
     },
     "diffPreview": {
@@ -5254,7 +5303,13 @@
     "eventCleanupFailed": "worktree のクリーンアップに失敗",
     "eventResumeFallback": "セッション再開に失敗し新規セッションへ",
     "eventUserAction": "ユーザー操作",
-    "eventDiffStat": "変更スナップショット"
+    "eventDiffStat": "変更スナップショット",
+    "settingsWorktreeRoot": "Worktree の作成先",
+    "settingsWorktreeRootHint": "新しいタスクの worktree をこのディレクトリ配下にタスクごとに作成します。空欄ならプロジェクトフォルダーと同じ階層に作成されます。「~」はホームディレクトリ、相対パスはプロジェクトフォルダー基準です。",
+    "settingsWorktreeRootPlaceholder": "~/codeg-worktrees",
+    "settingsWorktreeRootBrowse": "worktree のディレクトリを選択",
+    "settingsTabMerge": "マージ",
+    "settingsTabWorktree": "Worktree"
   },
   "TokenUsage": {
     "title": "トークン使用量",

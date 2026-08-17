@@ -487,7 +487,8 @@
     "templates": {
       "gemini": "---\nname: example-skill\ndescription: Describe when this skill should be used.\n---\n\n# Skill Name\n\nInstructions for the agent when this skill is active.\n\n## Workflow\n\n1. Add actionable step one.\n2. Add actionable step two.\n",
       "openCode": "---\nname: example-skill\ndescription: Describe when this skill should be used.\n---\n\n# Purpose\n\nDescribe what this skill helps with.\n\n# Steps\n\n1. Add actionable step one.\n2. Add actionable step two.\n",
-      "default": "---\nname: example-skill\ndescription: Describe when this skill should be used.\n---\n\n# Skill: example-skill\n\n## When to use\n\n- Describe trigger conditions.\n\n## Instructions\n\n1. Add actionable instruction one.\n2. Add actionable instruction two.\n"
+      "default": "---\nname: example-skill\ndescription: Describe when this skill should be used.\n---\n\n# Skill: example-skill\n\n## When to use\n\n- Describe trigger conditions.\n\n## Instructions\n\n1. Add actionable instruction one.\n2. Add actionable instruction two.\n",
+      "openClaw": "---\nname: example-skill\ndescription: Describe when this skill should be used.\nuser-invocable: true\ndisable-model-invocation: false\n---\n\n# Purpose\n\nDescribe what this skill helps with.\n\n# Instructions\n\n1. Add actionable instruction one.\n2. Add actionable instruction two.\n"
     }
   },
   "McpSettings": {
@@ -662,7 +663,8 @@
         "native": "Native"
       },
       "softWatchdog": "Soft watchdog (seconds)",
-      "softWatchdogHint": "Observe-only stall threshold ({min}–{max}). 0 disables stall marking. Does not cancel or change route."
+      "softWatchdogHint": "Observe-only stall threshold ({min}–{max}). 0 disables stall marking. Does not cancel or change route.",
+      "withheldByHostTools": "{agents} will not get the delegation tools: their per-agent “Let the agent handle files and commands” switch is on."
     },
     "actions": {
       "dragSort": "Drag to reorder",
@@ -700,7 +702,9 @@
       "saveKimiCodeConfig": "Save Kimi Code Config",
       "customInstall": "Custom install",
       "saveKimiCodeRawConfig": "Save config.toml",
-      "diagnose": "Diagnose"
+      "diagnose": "Diagnose",
+      "saveOpenClawConfig": "Save OpenClaw Config",
+      "saveDeepSeekConfig": "Save DeepSeek Config"
     },
     "status": {
       "enabled": "Enabled",
@@ -1193,7 +1197,11 @@
       "piBinaryUninstallFailed": "Failed to uninstall pi",
       "savePiTrustFailed": "Failed to save workspace trust",
       "cursorSaved": "Cursor config saved",
-      "saveCursorConfigFailed": "Failed to save Cursor config"
+      "saveCursorConfigFailed": "Failed to save Cursor config",
+      "openClawSaved": "OpenClaw config saved",
+      "saveOpenClawFailed": "Failed to save OpenClaw config",
+      "deepseekSaved": "DeepSeek config saved",
+      "saveDeepSeekFailed": "Failed to save DeepSeek config"
     },
     "version": {
       "statusLabel": "Version Status",
@@ -1405,7 +1413,24 @@
       "ready": "Adapter {adapterCmd} is installed — that is what Codeg launches. It ships its own runtime, so the {nativeLabel} is not required; install it later and the two coexist, sharing {configDir}."
     },
     "customAgentMcpLabel": "MCP support",
-    "customAgentMcpHint": "Sends codeg's built-in MCP companion to this agent when a session starts — the channel behind delegation, live feedback and task tools. Turn it off for an agent that rejects MCP servers and fails to connect; the change applies to the next connection."
+    "customAgentMcpHint": "Sends codeg's built-in MCP companion to this agent when a session starts — the channel behind delegation, live feedback and task tools. Turn it off for an agent that rejects MCP servers and fails to connect; the change applies to the next connection.",
+    "deepseek": {
+      "configManagement": "DeepSeek Harness Configuration",
+      "configDescription": "The endpoint and key are environment variables deepseek-acp reads at launch. Model and reasoning effort are per-session selectors — pick them in the composer.",
+      "baseUrlLabel": "API endpoint",
+      "baseUrlHint": "Leave empty for the official endpoint. Applies to sessions started after the save — reconnect a running session to pick it up.",
+      "baseUrlInvalid": "Enter a full http(s) URL with no query string, for example https://api.deepseek.com",
+      "apiKeyLabel": "API key",
+      "apiKeyHint": "Passed to the agent as DEEPSEEK_API_KEY. An environment variable outranks the credentials file, so leave this empty if you sign in through the terminal."
+    },
+    "openClaw": {
+      "gatewayConfig": "Gateway Config",
+      "gatewayDescription": "Configure OpenClaw Gateway connection. Supports local or remote gateway.",
+      "gatewayUrlHint": "Leave empty to use gateway.remote.url from local openclaw config.",
+      "gatewayTokenPlaceholder": "Gateway auth token",
+      "gatewayTokenHint": "Use token-file instead of plain token when possible; configure via openclaw CLI.",
+      "sessionKeyHint": "Optional. Specify gateway session key; leave empty to auto-assign isolated session."
+    }
   },
   "SettingsPages": {
     "agentsLoading": "Loading agent settings...",
@@ -2877,7 +2902,8 @@
       "agentSelector": {
         "noEnabledAgents": "No enabled agents",
         "openAgentsSettings": "Open Agents settings",
-        "notInstalled": "Not installed"
+        "notInstalled": "Not installed",
+        "moreAgents": "More agents ({count})"
       },
       "subAgentOverlay": {
         "title": "Sub-agents",
@@ -3294,7 +3320,8 @@
             "blocked": "blocked",
             "usageLimited": "usage limited",
             "budgetLimited": "budget limited",
-            "complete": "complete"
+            "complete": "complete",
+            "limited": "limit reached"
           }
         },
         "field": {
@@ -3414,7 +3441,8 @@
           "outputMissing": "Codex truncated the script output and dropped this command's separator, so none of the output could be attributed to it.",
           "sharedWith": "Also contains the output of {commands} — codex truncated their separators away.",
           "truncated": "truncated"
-        }
+        },
+        "agentCodexLaunchOnly": "Launched. Codex reports no further progress for this sub-agent — its result arrives as a message in this conversation."
       },
       "messageNav": {
         "title": "Message navigation",
@@ -3586,7 +3614,8 @@
       "contextCompaction": {
         "compacting": "Compacting context…",
         "compacted": "Context compacted",
-        "compactedTokens": "Context compacted · {before} → {after} tokens"
+        "compactedTokens": "Context compacted · {before} → {after} tokens",
+        "failed": "Context compaction failed"
       },
       "backgroundTasks": {
         "running": "{count, plural, one {# background task running} other {# background tasks running}}",
@@ -3678,6 +3707,26 @@
         "revokedToast": "Trust revoked — reconnected so pi stops loading the project's resources",
         "trustedNoReconnect": "Project trusted — it applies the next time pi starts",
         "revokedNoReconnect": "Trust revoked — it applies the next time pi starts"
+      },
+      "sessionFailure": {
+        "category": {
+          "connection": "Connection issue",
+          "access": "Access issue",
+          "limit": "Limit reached",
+          "request": "Request rejected",
+          "service": "Service issue",
+          "unknown": "Session issue"
+        },
+        "action": {
+          "retry": "Retry",
+          "login": "Sign in",
+          "newSession": "New session"
+        },
+        "recovered": "Recovered",
+        "retryUnavailable": "No previous message to resend.",
+        "toggleDetails": "Toggle details",
+        "dismiss": "Dismiss",
+        "moreIncidents": "+{count} more"
       }
     },
     "diffPreview": {
@@ -5254,7 +5303,13 @@
     "eventCleanupFailed": "Worktree cleanup failed",
     "eventResumeFallback": "Session resume fell back to a new session",
     "eventUserAction": "User action",
-    "eventDiffStat": "Change snapshot"
+    "eventDiffStat": "Change snapshot",
+    "settingsWorktreeRoot": "Worktree location",
+    "settingsWorktreeRootHint": "Directory new task worktrees are created in — one per task. Leave it empty to keep them next to the project folder; \"~\" is your home directory, and a relative path resolves against the project folder.",
+    "settingsWorktreeRootPlaceholder": "~/codeg-worktrees",
+    "settingsWorktreeRootBrowse": "Choose the worktree directory",
+    "settingsTabMerge": "Merge",
+    "settingsTabWorktree": "Worktree"
   },
   "TokenUsage": {
     "title": "Token Usage",

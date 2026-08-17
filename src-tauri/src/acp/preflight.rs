@@ -1,6 +1,4 @@
 use serde::Serialize;
-use std::collections::BTreeMap;
-use std::path::PathBuf;
 use std::sync::Mutex;
 
 use crate::acp::binary_cache;
@@ -44,14 +42,29 @@ pub struct CheckItem {
     pub fixes: Vec<FixAction>,
 }
 
+/// Everything the UI needs to explain that codeg's entry for this agent is an
+/// ACP *adapter*, not the vendor CLI the user already has — see
+/// [`registry::acp_adapter_relation`]. Deliberately STRUCTURED (no prose): the
+/// frontend owns the wording so it is localized, the same way
+/// `buildVersionCheck` already builds the version card.
+///
+/// `None` on [`PreflightResult`] for every non-adapter agent.
 #[derive(Debug, Clone, Serialize)]
 pub struct AdapterInfo {
+    /// npm spec codeg installs, e.g. "@agentclientprotocol/claude-agent-acp@0.69.0".
     pub adapter_package: String,
+    /// Command the launch gate resolves, e.g. "claude-agent-acp".
     pub adapter_cmd: String,
+    /// Whether that command currently resolves.
     pub adapter_installed: bool,
+    /// The vendor CLI, e.g. "claude".
     pub native_cmd: String,
+    /// Display name for the vendor CLI, e.g. "Claude Code CLI".
     pub native_label: String,
+    /// Where the user's own vendor CLI was found, if at all. codeg never
+    /// launches it — it is named so the user sees we did look.
     pub native_path: Option<String>,
+    /// Config dir both read, so no second login is needed.
     pub shared_config_dir: String,
     pub docs_url: String,
 }
@@ -62,6 +75,8 @@ pub struct PreflightResult {
     pub agent_name: String,
     pub passed: bool,
     pub checks: Vec<CheckItem>,
+    /// Adapter-vs-vendor-CLI explainer data; `None` unless this agent is an
+    /// ACP adapter. Never affects `passed` — it explains, it does not gate.
     pub adapter: Option<AdapterInfo>,
 }
 
@@ -69,13 +84,10 @@ pub fn clear_npm_env_cache() {
     *NPM_ENV_CACHE.lock().unwrap() = None;
 }
 
-pub async fn run_preflight(
-    agent_type: AgentType,
-    runtime_env: &BTreeMap<String, String>,
-) -> PreflightResult {
+pub async fn run_preflight(agent_type: AgentType) -> PreflightResult {
     let meta = registry::get_agent_meta(agent_type);
     debug_assert_eq!(meta.agent_type, agent_type);
-    let mut checks = match &meta.distribution {
+    let checks = match &meta.distribution {
         AgentDistribution::Npx { node_required, .. } => check_npm_environment(*node_required).await,
         AgentDistribution::Binary {
             version,
@@ -83,26 +95,12 @@ pub async fn run_preflight(
             platforms,
             ..
         } => check_binary_environment(agent_type, version, cmd, platforms).await,
-        AgentDistribution::Bundled {
-            cmd,
-            override_env,
-            platforms,
-            ..
-        } => check_bundled_environment(cmd, override_env, platforms),
         AgentDistribution::Uvx {
             uv_required,
             system_cmd,
             ..
         } => check_uv_environment(*uv_required, *system_cmd).await,
     };
-
-    // Host Codex CLI is required only when the effective launch env enables
-    // CLI mode (distribution defaults to CODEX_ACP_USE_CLI=0; user env can
-    // set 1). The npm codex-acp package embeds Codex for app-server.
-    let effective_env = merge_distribution_env(meta.distribution.env(), runtime_env);
-    if agent_type == AgentType::Codex && codex_host_preflight_required(&effective_env) {
-        checks.push(check_codex_cli_host(&effective_env));
-    }
 
     let passed = checks
         .iter()
@@ -117,10 +115,26 @@ pub async fn run_preflight(
     }
 }
 
+/// Probe the adapter/vendor-CLI split for an adapter agent (`None` otherwise).
+///
+/// Path resolution ONLY — no `--version` spawns. The Settings page runs a full
+/// preflight for every agent each time it opens, so this stays off the process
+/// spawner in the common case; the heavier version probe lives in the on-demand
+/// diagnostics report, which bounds every command with `DIAG_PROBE_TIMEOUT`.
+///
+/// The two lookups run concurrently because either can fall through to
+/// `resolve_npx_command`'s `npm prefix -g` probe (only when `which` misses), and
+/// a FAILED prefix resolution is never cached — `cached_npm_global_prefix_with`
+/// short-circuits on `None` before it reaches `OnceCell::set`. On a machine
+/// where that probe stalls, running these in sequence would pay
+/// `NPM_PREFIX_TIMEOUT` twice per adapter agent; overlapping them costs the same
+/// two spawns but bounds the added Settings latency to one timeout.
 async fn probe_adapter(meta: &AcpAgentMeta) -> Option<AdapterInfo> {
     let relation = registry::acp_adapter_relation(meta.agent_type)?;
     let adapter_cmd = match &meta.distribution {
         AgentDistribution::Npx { cmd, .. } => *cmd,
+        // Both adapters are npx-distributed; a future non-npx one would need a
+        // launchability probe of its own rather than a silently wrong answer.
         _ => return None,
     };
     let (adapter_installed, native_path) = tokio::join!(
@@ -132,10 +146,12 @@ async fn probe_adapter(meta: &AcpAgentMeta) -> Option<AdapterInfo> {
         meta,
         &relation,
         adapter_installed,
-        native_path.map(|path| path.to_string_lossy().into_owned()),
+        native_path.map(|p| p.to_string_lossy().to_string()),
     ))
 }
 
+/// Pure assembly half of [`probe_adapter`], split out so the mapping is
+/// unit-testable without touching PATH or the filesystem.
 fn build_adapter_info(
     meta: &AcpAgentMeta,
     relation: &AcpAdapterRelation,
@@ -143,7 +159,7 @@ fn build_adapter_info(
     native_path: Option<String>,
 ) -> AdapterInfo {
     let (adapter_package, adapter_cmd) = match &meta.distribution {
-        AgentDistribution::Npx { package, cmd, .. } => ((*package).to_string(), (*cmd).to_string()),
+        AgentDistribution::Npx { package, cmd, .. } => (package.to_string(), cmd.to_string()),
         _ => (String::new(), String::new()),
     };
     AdapterInfo {
@@ -156,124 +172,6 @@ fn build_adapter_info(
         shared_config_dir: relation.shared_config_dir.to_string(),
         docs_url: relation.docs_url.to_string(),
     }
-}
-
-/// Merge distribution default env with user/runtime env (runtime wins).
-fn merge_distribution_env(
-    defaults: &[(&str, &str)],
-    runtime_env: &BTreeMap<String, String>,
-) -> BTreeMap<String, String> {
-    let mut effective = defaults
-        .iter()
-        .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
-        .collect::<BTreeMap<_, _>>();
-    effective.extend(runtime_env.clone());
-    effective
-}
-
-/// Whether preflight must verify a host Codex CLI binary is available.
-fn codex_host_preflight_required(effective_env: &BTreeMap<String, String>) -> bool {
-    crate::acp::codex_cli::cli_mode_enabled(effective_env)
-}
-
-/// Prefer a non-empty saved `CODEX_PATH`. An invalid saved path is an explicit
-/// failure because launch preserves that same value instead of auto-detecting.
-fn select_codex_cli_host_path<F>(
-    runtime_env: &BTreeMap<String, String>,
-    fallback: F,
-) -> Option<PathBuf>
-where
-    F: FnOnce() -> Option<PathBuf>,
-{
-    if let Some(saved) = runtime_env
-        .get(crate::acp::codex_cli::CODEX_PATH_ENV)
-        .filter(|value| !value.trim().is_empty())
-    {
-        let path = PathBuf::from(saved);
-        return path.is_file().then_some(path);
-    }
-
-    fallback()
-}
-
-/// Resolve host Codex CLI from saved settings, then process/PATH/npm fallback.
-fn check_codex_cli_host(runtime_env: &BTreeMap<String, String>) -> CheckItem {
-    let path = select_codex_cli_host_path(runtime_env, || {
-        crate::acp::codex_cli::resolve_codex_cli_path()
-    });
-    codex_cli_host_check_item(path)
-}
-
-/// Pure mapping from resolved path → preflight `CheckItem` (unit-testable).
-fn codex_cli_host_check_item(path: Option<PathBuf>) -> CheckItem {
-    match path {
-        Some(path) => CheckItem {
-            check_id: "codex_cli".into(),
-            label: "Codex CLI".into(),
-            status: CheckStatus::Pass,
-            message: format!("Codex CLI available at {}", path.display()),
-            fixes: vec![],
-        },
-        None => CheckItem {
-            check_id: "codex_cli".into(),
-            label: "Codex CLI".into(),
-            status: CheckStatus::Fail,
-            message: "Host Codex CLI not found. CLI runtime mode needs a local Codex CLI to run `codex exec` (install @openai/codex or set CODEX_PATH).".into(),
-            fixes: vec![FixAction {
-                label: "Install Codex CLI".into(),
-                kind: FixActionKind::OpenUrl,
-                payload: "https://www.npmjs.com/package/@openai/codex".into(),
-            }],
-        },
-    }
-}
-
-fn check_bundled_environment(cmd: &str, override_env: &str, platforms: &[&str]) -> Vec<CheckItem> {
-    let platform = registry::current_platform();
-    let supported = platforms.contains(&platform);
-    let mut checks = vec![CheckItem {
-        check_id: "platform_supported".into(),
-        label: "Platform".into(),
-        status: if supported {
-            CheckStatus::Pass
-        } else {
-            CheckStatus::Fail
-        },
-        message: if supported {
-            format!("Platform {platform} is supported")
-        } else {
-            format!("Platform {platform} is not supported")
-        },
-        fixes: vec![],
-    }];
-    if supported {
-        checks.push(
-            match crate::acp::bundled_agent::locate_bundled_executable(cmd, override_env) {
-                Ok(Some(path)) => CheckItem {
-                    check_id: "bundled_executable".into(),
-                    label: "Built-in adapter".into(),
-                    status: CheckStatus::Pass,
-                    message: format!("Built-in adapter available at {}", path.display()),
-                    fixes: vec![],
-                },
-                Ok(None) => CheckItem {
-                    check_id: "bundled_executable".into(),
-                    label: "Built-in adapter".into(),
-                    status: CheckStatus::Fail,
-                    message: "Built-in adapter is missing; reinstall or update DrawCode.".into(),
-                    fixes: vec![],
-                },
-                Err(error) => CheckItem {
-                    check_id: "bundled_executable".into(),
-                    label: "Built-in adapter".into(),
-                    status: CheckStatus::Fail,
-                    message: error.to_string(),
-                    fixes: vec![],
-                },
-            },
-        );
-    }
-    checks
 }
 
 async fn check_npm_environment(node_required: Option<&str>) -> Vec<CheckItem> {
@@ -483,9 +381,10 @@ fn build_node_version_check(current_version: Option<&str>, required: &str) -> Ch
     }
 }
 
-/// Preflight for `Uvx` agents (Python ACP agents launched via `uvx`, e.g.
-/// Hermes). Passes when either the `uv` tool runner is resolvable, or — as a
-/// fallback — the agent's own CLI is already installed on PATH.
+/// Preflight for `Uvx` agents (custom ACP agents distributed as Python
+/// packages and launched via `uvx`). Passes when either the `uv` tool runner
+/// is resolvable, or — as a fallback — the agent's own CLI is already
+/// installed on PATH.
 async fn check_uv_environment(
     uv_required: Option<&str>,
     system_cmd: Option<(&str, &[&str])>,
@@ -566,18 +465,12 @@ async fn run_uv_version(uvx_path: &std::path::Path) -> Option<String> {
 /// `Warn` (not `Fail`): recent uv releases are backward compatible for the
 /// `uvx --from <pkg>==<ver>` invocation, so an old uv should not hard-block.
 fn build_uv_version_check(current: Option<&str>, required: &str) -> CheckItem {
-    match (
-        current.and_then(parse_node_version),
-        parse_node_version(required),
-    ) {
+    match (current.and_then(parse_node_version), parse_node_version(required)) {
         (Some(cur), Some(req)) if cur >= req => CheckItem {
             check_id: "uv_version".into(),
             label: "uv version".into(),
             status: CheckStatus::Pass,
-            message: format!(
-                "uv {} meets the minimum requirement (>={required})",
-                current.unwrap_or("")
-            ),
+            message: format!("uv {} meets the minimum requirement (>={required})", current.unwrap_or("")),
             fixes: vec![],
         },
         (Some(_), Some(_)) => CheckItem {
@@ -804,124 +697,71 @@ async fn check_binary_environment(
 }
 
 #[cfg(test)]
-mod tests {
+mod adapter_tests {
     use super::*;
-    use std::collections::BTreeMap;
-    use std::fs;
-    use std::path::PathBuf;
+
+    fn info_for(agent_type: AgentType, native_path: Option<&str>, installed: bool) -> AdapterInfo {
+        let meta = registry::get_agent_meta(agent_type);
+        let relation = registry::acp_adapter_relation(agent_type)
+            .expect("agent under test must be an adapter agent");
+        build_adapter_info(
+            &meta,
+            &relation,
+            installed,
+            native_path.map(str::to_string),
+        )
+    }
+
+    // The card's whole argument rests on these four fields being concrete: the
+    // package we install, the command we look for, the vendor CLI we did NOT
+    // find under that name, and the config dir both share.
+    #[test]
+    fn claude_adapter_info_names_package_command_and_shared_config() {
+        let info = info_for(
+            AgentType::ClaudeCode,
+            Some("/opt/homebrew/bin/claude"),
+            false,
+        );
+        assert_eq!(
+            info.adapter_package,
+            "@agentclientprotocol/claude-agent-acp@0.69.0"
+        );
+        assert_eq!(info.adapter_cmd, "claude-agent-acp");
+        assert!(!info.adapter_installed);
+        assert_eq!(info.native_cmd, "claude");
+        assert_eq!(info.native_label, "Claude Code CLI");
+        assert_eq!(info.native_path.as_deref(), Some("/opt/homebrew/bin/claude"));
+        assert_eq!(info.shared_config_dir, "~/.claude");
+        assert!(info.docs_url.ends_with("#acp-adapters"));
+    }
 
     #[test]
-    fn adapter_info_names_adapter_and_native_cli() {
-        let meta = registry::get_agent_meta(AgentType::Codex);
-        let relation = registry::acp_adapter_relation(AgentType::Codex).unwrap();
-        let info = build_adapter_info(&meta, &relation, false, Some("/usr/local/bin/codex".into()));
-
-        assert_eq!(info.adapter_package, "@agentclientprotocol/codex-acp@1.1.9");
+    fn codex_adapter_info_uses_codex_home() {
+        let info = info_for(AgentType::Codex, None, true);
+        assert_eq!(info.adapter_package, "@agentclientprotocol/codex-acp@1.4.0");
         assert_eq!(info.adapter_cmd, "codex-acp");
+        assert!(info.adapter_installed);
         assert_eq!(info.native_cmd, "codex");
-        assert_eq!(info.native_path.as_deref(), Some("/usr/local/bin/codex"));
+        assert!(info.native_path.is_none());
         assert_eq!(info.shared_config_dir, "~/.codex");
     }
 
-    #[test]
-    fn valid_saved_codex_cli_path_wins_over_fallback() {
-        let temp = tempfile::tempdir().unwrap();
-        let saved = temp.path().join("saved-codex.cmd");
-        let fallback = temp.path().join("fallback-codex.cmd");
-        fs::write(&saved, b"saved").unwrap();
-        fs::write(&fallback, b"fallback").unwrap();
-        let runtime_env = BTreeMap::from([(
-            crate::acp::codex_cli::CODEX_PATH_ENV.to_string(),
-            saved.to_string_lossy().into_owned(),
-        )]);
-
-        let selected = select_codex_cli_host_path(&runtime_env, || Some(fallback));
-
-        assert_eq!(selected.as_deref(), Some(saved.as_path()));
-    }
-
-    #[test]
-    fn invalid_saved_codex_cli_path_is_not_masked_by_fallback() {
-        let temp = tempfile::tempdir().unwrap();
-        let missing = temp.path().join("missing-codex.cmd");
-        let fallback = temp.path().join("fallback-codex.cmd");
-        fs::write(&fallback, b"fallback").unwrap();
-        let runtime_env = BTreeMap::from([(
-            crate::acp::codex_cli::CODEX_PATH_ENV.to_string(),
-            missing.to_string_lossy().into_owned(),
-        )]);
-
-        let selected = select_codex_cli_host_path(&runtime_env, || Some(fallback));
-
-        assert!(selected.is_none());
-    }
-
-    #[test]
-    fn codex_cli_host_pass_when_path_present() {
-        let path = PathBuf::from(r"C:\tools\codex.cmd");
-        let item = codex_cli_host_check_item(Some(path.clone()));
-        assert_eq!(item.check_id, "codex_cli");
-        assert_eq!(item.label, "Codex CLI");
-        assert!(matches!(item.status, CheckStatus::Pass));
-        assert!(item.message.contains(path.to_string_lossy().as_ref()));
-        assert!(item.fixes.is_empty());
-    }
-
-    #[test]
-    fn codex_cli_host_fail_when_path_missing() {
-        let item = codex_cli_host_check_item(None);
-        assert_eq!(item.check_id, "codex_cli");
-        assert_eq!(item.label, "Codex CLI");
-        assert!(matches!(item.status, CheckStatus::Fail));
-        assert!(item.message.contains("Host Codex CLI not found"));
-        assert_eq!(item.fixes.len(), 1);
-        assert!(matches!(item.fixes[0].kind, FixActionKind::OpenUrl));
-        assert_eq!(
-            item.fixes[0].payload,
-            "https://www.npmjs.com/package/@openai/codex"
-        );
-        assert_eq!(item.fixes[0].label, "Install Codex CLI");
-    }
-
-    #[test]
-    fn codex_cli_host_fail_blocks_preflight_passed() {
-        let fail = codex_cli_host_check_item(None);
-        let checks = [
-            CheckItem {
-                check_id: "platform_supported".into(),
-                label: "Platform".into(),
-                status: CheckStatus::Pass,
-                message: "ok".into(),
-                fixes: vec![],
-            },
-            fail,
-        ];
-        let passed = checks
-            .iter()
-            .all(|c| !matches!(c.status, CheckStatus::Fail));
-        assert!(!passed);
-    }
-
-    #[test]
-    fn codex_cli_mode_requires_host() {
-        let runtime_env = BTreeMap::new();
-        let effective = merge_distribution_env(&[("CODEX_ACP_USE_CLI", "1")], &runtime_env);
-
-        assert!(codex_host_preflight_required(&effective));
-    }
-
-    #[test]
-    fn codex_user_opt_out_overrides_distribution_cli_default() {
-        let runtime_env = BTreeMap::from([("CODEX_ACP_USE_CLI".to_string(), "0".to_string())]);
-        let effective = merge_distribution_env(&[("CODEX_ACP_USE_CLI", "1")], &runtime_env);
-
-        assert!(!codex_host_preflight_required(&effective));
-    }
-
-    #[test]
-    fn codex_app_server_does_not_require_host() {
-        let effective = BTreeMap::from([("CODEX_ACP_USE_CLI".to_string(), "0".to_string())]);
-
-        assert!(!codex_host_preflight_required(&effective));
+    // Non-adapter agents must produce nothing: `probe_adapter` short-circuits
+    // on the registry relation, so an agent whose `cmd` IS the vendor CLI never
+    // gets an explainer claiming otherwise.
+    #[tokio::test]
+    async fn non_adapter_agents_have_no_adapter_info() {
+        for agent_type in [
+            AgentType::Gemini,
+            AgentType::Cline,
+            AgentType::OpenCode,
+            AgentType::Hermes,
+        ] {
+            let meta = registry::get_agent_meta(agent_type);
+            assert!(
+                probe_adapter(&meta).await.is_none(),
+                "unexpected adapter info for {agent_type:?}"
+            );
+        }
     }
 }
