@@ -100,7 +100,13 @@ vi.mock("./_components/detached-shell", () => ({
   seedDetachedSessionTab: (...args: unknown[]) => h.seedSessionTab(...args),
 }))
 
-import { ConversationPageInner } from "./page"
+import * as conversationPage from "./page"
+
+const { default: ConversationPage } = conversationPage
+
+it("keeps the Next route module limited to its default export", () => {
+  expect(conversationPage).not.toHaveProperty("ConversationPageInner")
+})
 
 describe("ConversationPageInner route bootstrap", () => {
   beforeEach(() => {
@@ -145,7 +151,7 @@ describe("ConversationPageInner route bootstrap", () => {
   })
 
   it("seeds and activates web without any desktop handoff call", async () => {
-    render(<ConversationPageInner />)
+    render(<ConversationPage />)
 
     await screen.findByTestId("conversation-surface")
     expect(h.getFolderConversation).toHaveBeenCalledTimes(1)
@@ -208,7 +214,7 @@ describe("ConversationPageInner route bootstrap", () => {
     h.isDesktop.mockReturnValue(runtime.desktop)
     h.isLocalDesktop.mockReturnValue(runtime.localDesktop)
 
-    render(<ConversationPageInner />)
+    render(<ConversationPage />)
 
     expect(
       await screen.findByText(
@@ -235,7 +241,7 @@ describe("ConversationPageInner route bootstrap", () => {
       }
     )
 
-    render(<ConversationPageInner />)
+    render(<ConversationPage />)
 
     await waitFor(() => expect(h.emit).toHaveBeenCalledTimes(1))
     expect(h.getFolderConversation).toHaveBeenCalledTimes(1)
