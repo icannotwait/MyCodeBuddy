@@ -2055,6 +2055,10 @@ pub struct RunStore {
     /// BUSY). Observability only — does **not** gate promote admission.
     #[cfg(any(test, feature = "test-utils"))]
     identity_load_fail: std::sync::atomic::AtomicBool,
+    /// Test-only: fail the next public run load so callers cannot silently
+    /// depend on a best-effort pre-read for post-commit correctness.
+    #[cfg(any(test, feature = "test-utils"))]
+    load_by_task_id_fail: std::sync::atomic::AtomicBool,
     /// Test-only: fail the next committed workflow-binding read before spawn.
     #[cfg(any(test, feature = "test-utils"))]
     workflow_binding_load_fail: std::sync::atomic::AtomicBool,
@@ -2108,6 +2112,8 @@ impl RunStore {
             promote_claim_gate: tokio::sync::Mutex::new(None),
             #[cfg(any(test, feature = "test-utils"))]
             identity_load_fail: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(any(test, feature = "test-utils"))]
+            load_by_task_id_fail: std::sync::atomic::AtomicBool::new(false),
             #[cfg(any(test, feature = "test-utils"))]
             workflow_binding_load_fail: std::sync::atomic::AtomicBool::new(false),
             #[cfg(any(test, feature = "test-utils"))]
@@ -2467,6 +2473,12 @@ impl RunStore {
     #[cfg(any(test, feature = "test-utils"))]
     pub fn fail_next_promote_identity_load(&self) {
         self.identity_load_fail
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn fail_next_load_by_task_id(&self) {
+        self.load_by_task_id_fail
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
@@ -3910,12 +3922,6 @@ impl RunStore {
         child_connection_id: &str,
         prompt_accepted_at: DateTime<Utc>,
     ) -> Result<PromoteRunningOutcome, TaskStoreError> {
-        let pre_mutation = self.load_by_task_id(task_id).await.ok().flatten().map(|run| {
-            (
-                run.parent_conversation_id,
-                run.run_status == DelegationRunStatus::Reserving,
-            )
-        });
         let _mutation_guard = self.orchestration_binding_snapshots.mutation_guard().await;
         let policy = PromoteRetryPolicy::production();
         let mut meta = PromoteAttemptMeta::default();
@@ -3934,16 +3940,10 @@ impl RunStore {
                 .await
             {
                 Ok(kind) => {
-                    if let Some((parent_id, true)) = pre_mutation {
-                        if matches!(
-                            &kind,
-                            PromoteRunningKind::Promoted { .. }
-                                | PromoteRunningKind::AlreadyRunning { .. }
-                        ) {
-                            self.orchestration_binding_snapshots
-                                .record_parent_mutation(parent_id)
-                                .await;
-                        }
+                    if let PromoteRunningKind::Promoted { run } = &kind {
+                        self.orchestration_binding_snapshots
+                            .record_parent_mutation(run.parent_conversation_id)
+                            .await;
                     }
                     return Ok(PromoteRunningOutcome { kind, meta });
                 }
@@ -4851,6 +4851,15 @@ impl RunStore {
         &self,
         task_id: &str,
     ) -> Result<Option<PersistedRun>, TaskStoreError> {
+        #[cfg(any(test, feature = "test-utils"))]
+        if self
+            .load_by_task_id_fail
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(TaskStoreError::Transient(
+                "injected run load failure".into(),
+            ));
+        }
         let row = DelegationTaskRun::find_by_id(task_id)
             .one(&self.db.conn)
             .await

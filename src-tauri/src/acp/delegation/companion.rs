@@ -63,7 +63,8 @@ use crate::acp::delegation::transport::{
     CancelDelegationReason, CompanionRole,
 };
 use crate::acp::delegation::types::{
-    validate_correlation_id, DelegationReturnWhen, OrchestrationBindingQueryRequest,
+    validate_correlation_id, DelegationReturnWhen, OrchestrationBindingQueryError,
+    OrchestrationBindingQueryRequest,
 };
 use crate::acp::delegation::workflow::{
     CompleteWorkRequest, WorkflowIndexOmissionStep, WorkflowStateIndexDto,
@@ -755,18 +756,18 @@ async fn build_tools_call_spawn(
             register_and_spawn(inflight, id, None, round_trip, render_status_result).await
         }
         "get_delegation_orchestration_bindings" => {
+            if arguments.as_object().is_some_and(|object| {
+                object.get("snapshot_id").is_some_and(Value::is_null)
+                    || object.get("cursor").is_some_and(Value::is_null)
+            }) {
+                return orchestration_binding_query_invalid_response(id);
+            }
             let query: OrchestrationBindingQueryRequest = match serde_json::from_value(arguments) {
                 Ok(query) => query,
-                Err(error) => {
-                    return LineAction::Respond(err(
-                        id,
-                        -32602,
-                        format!("invalid orchestration binding query: {error}"),
-                    ));
-                }
+                Err(_) => return orchestration_binding_query_invalid_response(id),
             };
-            if let Err(error) = query.validate() {
-                return LineAction::Respond(err(id, -32602, error.to_string()));
+            if query.validate().is_err() {
+                return orchestration_binding_query_invalid_response(id);
             }
             let req = BrokerOrchestrationBindingsRequest {
                 token: ctx.token.clone(),
@@ -1401,6 +1402,17 @@ fn render_orchestration_binding_page(outcome: &Value) -> Value {
         "isError": is_error,
         "structuredContent": outcome.clone(),
     })
+}
+
+fn orchestration_binding_query_invalid_response(id: Value) -> LineAction {
+    let error = OrchestrationBindingQueryError::Invalid;
+    let outcome = json!({
+        "error": {
+            "code": error.code(),
+            "message": error.to_string(),
+        }
+    });
+    LineAction::Respond(ok(id, render_orchestration_binding_page(&outcome)))
 }
 
 fn render_recovery_authorization_result(outcome: &Value) -> Value {
@@ -5811,9 +5823,11 @@ mod tests {
             )
             .await,
         );
-        let schema = catalog.result.unwrap()["tools"]
+        let tools = catalog.result.unwrap()["tools"]
             .as_array()
             .unwrap()
+            .clone();
+        let schema = tools
             .iter()
             .find(|tool| tool["name"] == "get_delegation_orchestration_bindings")
             .unwrap()["inputSchema"]
@@ -5821,22 +5835,47 @@ mod tests {
         assert_eq!(schema["additionalProperties"], false);
         assert_eq!(schema["required"], json!(["namespace"]));
         assert_eq!(schema["properties"]["limit"]["default"], 100);
+        assert_eq!(
+            schema["dependentRequired"],
+            json!({
+                "snapshot_id": ["cursor"],
+                "cursor": ["snapshot_id"]
+            })
+        );
 
-        let invalid = json!({
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "tools/call",
-            "params": {
-                "name": "get_delegation_orchestration_bindings",
-                "arguments": {
-                    "namespace": "brainstorm-to-delivery",
-                    "parent_conversation_id": 42
-                }
+        let descriptions = [
+            (
+                "register_simple_workflow",
+                ["register", "plan/progress"].as_slice(),
+            ),
+            (
+                "get_delegation_orchestration_bindings",
+                ["read-only", "parent-scoped", "snapshot"].as_slice(),
+            ),
+            (
+                "continue_delegation",
+                ["continue terminal task_id", "reuse child"].as_slice(),
+            ),
+        ];
+        for (name, phrases) in descriptions {
+            let description = tools
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .and_then(|tool| tool["description"].as_str())
+                .unwrap()
+                .to_ascii_lowercase();
+            for phrase in phrases {
+                assert!(description.contains(phrase), "{name} lost {phrase}");
             }
-        })
-        .to_string();
-        let response = unwrap_respond(dispatch_with_features(production, &invalid).await);
-        assert_eq!(response.error.unwrap().code, -32602);
+        }
+        let recovery = tools
+            .iter()
+            .find(|tool| tool["name"] == "request_recovery_authorization")
+            .unwrap();
+        assert!(recovery["inputSchema"]["properties"]["proposed_user_reason"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("reset_plan_lineage only"));
 
         let page = json!({
             "schema_version": 1,
@@ -5876,6 +5915,75 @@ mod tests {
         assert_eq!(result["structuredContent"], page);
         assert_eq!(result["content"], json!([]));
         assert_eq!(result["isError"], false);
+    }
+
+    #[tokio::test]
+    async fn orchestration_binding_query_invalid_public_calls_are_structured() {
+        let production = CompanionFeatures {
+            delegation: true,
+            coordination_v1: true,
+            feedback: false,
+            ask: false,
+            sessions: false,
+            workflow_v2: false,
+            completion_v2: false,
+        };
+        let snapshot_id = "1a641e16-36f4-4ec5-aa4f-18d18e6ab107";
+
+        for arguments in [
+            Value::Null,
+            json!({}),
+            json!({ "namespace": 7 }),
+            json!({
+                "namespace": "brainstorm-to-delivery",
+                "parent_conversation_id": 42
+            }),
+            json!({ "namespace": "Upper" }),
+            json!({ "namespace": "brainstorm-to-delivery", "limit": 0 }),
+            json!({ "namespace": "brainstorm-to-delivery", "limit": "100" }),
+            json!({ "namespace": "brainstorm-to-delivery", "snapshot_id": snapshot_id }),
+            json!({ "namespace": "brainstorm-to-delivery", "cursor": "abc" }),
+            json!({
+                "namespace": "brainstorm-to-delivery",
+                "snapshot_id": "not-a-uuid",
+                "cursor": "abc"
+            }),
+            json!({
+                "namespace": "brainstorm-to-delivery",
+                "snapshot_id": snapshot_id,
+                "cursor": "not+base64url"
+            }),
+            json!({
+                "namespace": "brainstorm-to-delivery",
+                "snapshot_id": snapshot_id,
+                "cursor": 7
+            }),
+            json!({
+                "namespace": "brainstorm-to-delivery",
+                "snapshot_id": null,
+                "cursor": null
+            }),
+        ] {
+            let invalid = json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "get_delegation_orchestration_bindings",
+                    "arguments": arguments
+                }
+            })
+            .to_string();
+            let response = unwrap_respond(dispatch_with_features(production, &invalid).await);
+            assert!(response.error.is_none());
+            let result = response.result.unwrap();
+            assert_eq!(result["isError"], true);
+            assert_eq!(
+                result["structuredContent"]["error"]["code"],
+                "orchestration_binding_query_invalid"
+            );
+            assert!(result["structuredContent"].get("runs").is_none());
+        }
     }
 
     #[tokio::test]

@@ -278,7 +278,9 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::*;
-    use crate::acp::delegation::run_store::{ReservingRunInsert, RunStore};
+    use crate::acp::delegation::run_store::{
+        PromoteRunningKind, ReservingRunInsert, RunStore,
+    };
     use crate::acp::delegation::spawner::DelegationLink;
     use crate::acp::delegation::store::TerminalTaskWrite;
     use crate::acp::delegation::types::OrchestrationBindingQueryRequest;
@@ -756,6 +758,48 @@ mod tests {
         let before_delete = continuation_request(&store, parent_id).await;
         assert!(store.abandon_reserving_claim("deleted").await.unwrap());
         assert_stale(&store, parent_id, before_delete).await;
+    }
+
+    #[tokio::test]
+    async fn orchestration_binding_query_promote_invalidates_when_unlocked_pre_read_fails() {
+        let (db, parent_id, child_id) = parent_child().await;
+        insert_row(
+            &db,
+            parent_id,
+            child_id,
+            "seed",
+            1,
+            Utc.with_ymd_and_hms(2026, 8, 17, 8, 0, 0).unwrap(),
+            Some("task|seed"),
+            Some(binding("brainstorm-to-delivery", 1)),
+            "codex",
+            None,
+        )
+        .await;
+        let store = RunStore::new(db.clone());
+        store
+            .insert_reserving(reserving_insert("promote", parent_id, child_id, 2))
+            .await
+            .unwrap();
+        let before_promote = continuation_request(&store, parent_id).await;
+        store
+            .bind_child_connection_while_reserving("promote", "connection-promote")
+            .await
+            .unwrap();
+        store.fail_next_load_by_task_id();
+
+        let outcome = store
+            .promote_running_detailed("promote", "connection-promote", Utc::now())
+            .await
+            .unwrap();
+        assert!(matches!(outcome.kind, PromoteRunningKind::Promoted { .. }));
+        let durable = DelegationTaskRun::find_by_id("promote")
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(durable.status, DelegationRunStatus::Running);
+        assert_stale(&store, parent_id, before_promote).await;
     }
 
     #[tokio::test]

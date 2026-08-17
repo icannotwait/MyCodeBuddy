@@ -54,8 +54,6 @@
             },
             "namespace": {
               "type": "string",
-              "minLength": 1,
-              "maxLength": 64,
               "pattern": "^[a-z][a-z0-9-]{0,63}$"
             },
             "generation": {
@@ -65,8 +63,6 @@
             },
             "route_fingerprint": {
               "type": "string",
-              "minLength": 71,
-              "maxLength": 71,
               "pattern": "^sha256:[0-9a-f]{64}$"
             }
           }
@@ -140,7 +136,7 @@
   },
   {
     "name": "register_simple_workflow",
-    "description": "",
+    "description": "Register Plan/progress",
     "inputSchema": {
       "type": "object",
       "additionalProperties": false,
@@ -161,7 +157,7 @@
   },
   {
     "name": "get_delegation_orchestration_bindings",
-    "description": "",
+    "description": "Read-only parent-scoped snapshot",
     "inputSchema": {
       "type": "object",
       "additionalProperties": false,
@@ -185,16 +181,23 @@
         },
         "cursor": {
           "type": "string",
-          "minLength": 1,
           "maxLength": 128,
           "pattern": "^[A-Za-z0-9_-]+$"
         }
+      },
+      "dependentRequired": {
+        "snapshot_id": [
+          "cursor"
+        ],
+        "cursor": [
+          "snapshot_id"
+        ]
       }
     }
   },
   {
     "name": "continue_delegation",
-    "description": "Join task_id.",
+    "description": "Continue terminal task_id;reuse child",
     "inputSchema": {
       "type": "object",
       "$defs": {
@@ -214,8 +217,6 @@
             },
             "namespace": {
               "type": "string",
-              "minLength": 1,
-              "maxLength": 64,
               "pattern": "^[a-z][a-z0-9-]{0,63}$"
             },
             "generation": {
@@ -225,8 +226,6 @@
             },
             "route_fingerprint": {
               "type": "string",
-              "minLength": 71,
-              "maxLength": 71,
               "pattern": "^sha256:[0-9a-f]{64}$"
             }
           }
@@ -321,8 +320,7 @@
     "name": "check_user_feedback",
     "description": "Messages are available only through this tool;non-blocking;before starting implementation;significant decision;after a meaningful sub-task;HIGH-PRIORITY;empty result means continue.",
     "inputSchema": {
-      "type": "object",
-      "properties": {}
+      "type": "object"
     }
   },
   {
@@ -451,7 +449,7 @@
   },
   {
     "name": "request_recovery_authorization",
-    "description": "recovery_confirmation_required; exact rejected call; subject_kind,allowed_action,cause_code,expires_at,target_state,replacement_reason",
+    "description": "recovery_confirmation_required;exact rejected call;subject_kind,allowed_action,cause_code,expires_at,target_state,replacement_reason",
     "inputSchema": {
       "type": "object",
       "additionalProperties": false,
@@ -479,7 +477,7 @@
         "proposed_user_reason": {
           "type": "string",
           "maxLength": 4096,
-          "description": "Workflow only."
+          "description": "reset_plan_lineage only"
         }
       }
     }
@@ -488,8 +486,7 @@
     "name": "get_workflow_capabilities",
     "description": "workflow_manifest_v2",
     "inputSchema": {
-      "type": "object",
-      "properties": {}
+      "type": "object"
     }
   },
   {
