@@ -348,6 +348,10 @@ mod tests {
             500_000
         );
         assert_eq!(
+            resolve_context_window_size_from_parts(None, Some("grok-4.6"), None),
+            500_000
+        );
+        assert_eq!(
             resolve_context_window_size_from_parts(None, Some("grok-4.3"), None),
             1_000_000
         );
