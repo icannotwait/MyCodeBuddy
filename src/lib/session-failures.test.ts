@@ -173,6 +173,13 @@ describe("hasSettleableRetryIncident", () => {
       hasSettleableRetryIncident([record("c", 1, { category: "connection" })])
     ).toBe(true)
   })
+
+  it("treats a missing table as empty so stream apply cannot throw", () => {
+    expect(hasSettleableRetryIncident(undefined)).toBe(false)
+    expect(settleSessionFailures(undefined, "retry_incidents")).toEqual([])
+    expect(settleSessionFailures(undefined, "warnings")).toEqual([])
+    expect(settleSessionFailures(undefined, "all")).toEqual([])
+  })
 })
 
 describe("dismissSessionFailures", () => {

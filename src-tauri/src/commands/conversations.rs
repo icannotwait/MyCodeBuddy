@@ -1476,8 +1476,6 @@ pub async fn get_folder_conversation_core(
                     .flatten()
                     .map(|f| f.path),
             };
-
-            };
             // Hold the shared discovery lease across the entire direct/fallback
             // parser boundary so a concurrent register cannot race mid-recovery.
             let (guard, filter) = registry.shared_filter().await.map_err(|e| {

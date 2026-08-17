@@ -926,7 +926,7 @@ describe("AcpConnectionsProvider AIR session-failure lifecycle", () => {
     })
 
     emitAcpEvent(handlers, {
-      seq: 10,
+      seq: 6,
       connection_id: "spawned-conn",
       type: "content_delta",
       text: "back online",
@@ -941,13 +941,13 @@ describe("AcpConnectionsProvider AIR session-failure lifecycle", () => {
     // A local tool call ADVANCING proves nothing about the upstream, so
     // `tool_call_update` deliberately does not settle.
     emitAcpEvent(handlers, {
-      seq: 11,
+      seq: 7,
       connection_id: "spawned-conn",
       type: "session_failure",
       record: categorized("i3", "limit", "warning"),
     })
     emitAcpEvent(handlers, {
-      seq: 12,
+      seq: 8,
       connection_id: "spawned-conn",
       type: "tool_call_update",
       tool_call_id: "call_1",
@@ -961,7 +961,7 @@ describe("AcpConnectionsProvider AIR session-failure lifecycle", () => {
 
     // A NEW tool call is model output, so it does.
     emitAcpEvent(handlers, {
-      seq: 13,
+      seq: 9,
       connection_id: "spawned-conn",
       type: "tool_call",
       tool_call_id: "call_2",
@@ -976,7 +976,7 @@ describe("AcpConnectionsProvider AIR session-failure lifecycle", () => {
 
     // The notice still waits for the clean boundary; the error outlives it.
     emitAcpEvent(handlers, {
-      seq: 14,
+      seq: 10,
       connection_id: "spawned-conn",
       type: "turn_complete",
       session_id: "sess-1",
@@ -1342,7 +1342,10 @@ describe("AcpConnectionsProvider reconnect (status-icon button)", () => {
       "/tmp/x",
       "snapshot-session",
       undefined,
-      {}
+      {},
+      42,
+      undefined,
+      null
     )
   })
 
@@ -1382,7 +1385,10 @@ describe("AcpConnectionsProvider reconnect (status-icon button)", () => {
       "/tmp/x",
       "minted-1",
       undefined,
-      {}
+      {},
+      42,
+      undefined,
+      null
     )
   })
 })
@@ -1712,15 +1718,65 @@ describe("AcpConnectionsProvider permission request details", () => {
       activeDelegations: [],
       toolWatchdogProjections: {},
     })
-
-    await act(async () => {
-      await h.actions!.disconnectIfIdle(TAB)
+    hydrateSnapshot(handlers, {
+      connection_id: "spawned-conn",
+      conversation_id: null,
+      folder_id: null,
+      status: "connected",
+      external_id: "sess-1",
+      live_message: {
+        id: "live-1",
+        role: "assistant",
+        started_at: new Date(0).toISOString(),
+        content: [{ kind: "tool_call_ref", tool_call_id: "call_snapshot" }],
+      },
+      active_tool_calls: [
+        {
+          id: "call_snapshot",
+          kind: "execute",
+          label: "Bash",
+          status: "pending",
+          input: { command: "pnpm test -- --runInBand", cwd: "/tmp/x" },
+          output: null,
+          content: null,
+          locations: null,
+          meta: null,
+        },
+      ],
+      pending_permission: {
+        request_id: "req-snapshot",
+        tool_call_id: "call_snapshot",
+        tool_call: {
+          kind: "execute",
+          status: "pending",
+          toolCallId: "call_snapshot",
+        },
+        options: [],
+        created_at: new Date(0).toISOString(),
+      },
+      pending_question: null,
+      pending_user_message: null,
+      active_delegations: [],
+      feedback: [],
+      feedback_tool_available: false,
+      modes: null,
+      current_mode: null,
+      config_options: null,
+      prompt_capabilities: null,
+      usage: null,
+      fork_supported: false,
+      available_commands: [],
+      selectors_ready: true,
+      config_stale: false,
+      config_stale_kind: null,
+      event_seq: 5,
     })
 
-    // A viewer never owns the backend process, so busy or not it detaches —
-    // and the idle sweep skips viewers, so leaving one would leak its stream.
-    expect(h.acpDisconnect).not.toHaveBeenCalled()
-    expect(h.store!.getConnection(TAB)).toBeUndefined()
+    const permission = h.store!.getConnection(TAB)!.pendingPermission
+    const parsed = parsePermissionToolCall(permission?.tool_call)
+    expect(parsed.title).toBe("Bash")
+    expect(parsed.command).toBe("pnpm test -- --runInBand")
+    expect(parsed.cwd).toBe("/tmp/x")
   })
 
   it("clears a pending permission when the turn completes", async () => {
@@ -4257,6 +4313,7 @@ describe("APPLY_EVENT_FRAME reducer parity", () => {
       backgroundSettleSyncingSince: null,
       outOfTurnToolCalls: null,
       waitingForSubagents: null,
+      sessionFailures: [],
       ...overrides,
     }
   }

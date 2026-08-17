@@ -84,7 +84,10 @@ import {
   extractAppCommandError,
   toLocalizedErrorMessage,
 } from "@/lib/app-error"
-import { isConnectionBusy } from "@/lib/connection-teardown"
+import {
+  isConnectionBusy,
+  isConnectionGoneError,
+} from "@/lib/connection-teardown"
 import {
   completeLiveTranscriptTurn,
   enterOwnerPreserve,
@@ -3398,6 +3401,15 @@ function prepareMappedEnvelope(
         meta: (e.meta as ToolCallMeta) ?? null,
         images: e.images ?? null,
       })
+      // A new tool call is model output — the same recovery evidence as a
+      // content delta. Status-only `tool_call_update` is not.
+      if (hasSettleableRetryIncident(snapshot.sessionFailures)) {
+        actions.push({
+          type: "SETTLE_SESSION_FAILURES",
+          contextKey,
+          scope: "retry_incidents",
+        })
+      }
       break
     case "tool_call_update":
       actions.push({
@@ -6845,6 +6857,14 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     ]
   )
 
+  const isConnectionOwnedLocally = useCallback((connectionId: string) => {
+    if (reverseMapRef.current.has(connectionId)) return true
+    for (const conn of storeRef.current.connections.values()) {
+      if (conn.connectionId === connectionId) return true
+    }
+    return false
+  }, [])
+
   const connect = useCallback(
     async (
       contextKey: string,
@@ -7485,7 +7505,11 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           (isTransferringOut(conversationId) ||
             isFrontendDisconnectSuppressed(conversationId))
         if (abandonedKeysRef.current.delete(contextKey)) {
-          if (!suppressBareSpawn) {
+          // The backend dedups by (agent, cwd, session), so `acpConnect` may
+          // have handed back a connection this client already holds under
+          // another contextKey. Killing that one would end a turn nobody
+          // asked to stop.
+          if (!suppressBareSpawn && !isConnectionOwnedLocally(connectionId)) {
             acpDisconnect(
               connectionId,
               disconnectLeaseWithOrigin(coldLease, "abandoned_connect")
@@ -7495,7 +7519,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         }
         const pendingRequest = pendingConnectRequestsRef.current.get(contextKey)
         if (pendingRequest && !sameConnectRequest(pendingRequest, request)) {
-          if (!suppressBareSpawn) {
+          if (!suppressBareSpawn && !isConnectionOwnedLocally(connectionId)) {
             acpDisconnect(
               connectionId,
               disconnectLeaseWithOrigin(coldLease, "abandoned_connect")
@@ -7672,6 +7696,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       connectAsViewer,
       consumeBufferedEvents,
       dispatch,
+      isConnectionOwnedLocally,
       releaseObserverAlias,
       resolveConnectBlockState,
       seedDelegationsFromSnapshot,
@@ -7777,10 +7802,25 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         dispatch({ type: "CONNECTION_REMOVED", contextKey })
         return true
       }
-      await acpDisconnect(
-        conn.connectionId,
-        disconnectLeaseWithOrigin(leaseArgsForDisconnect(conn), origin)
-      )
+      // A failed backend teardown must not strand the local entry: propagating
+      // would leak the attach subscription and leave an entry that makes the
+      // next `connect()` take its "already connected" fast path. Release
+      // locally either way, and report whether the backend is actually gone.
+      let tornDown = true
+      try {
+        await acpDisconnect(
+          conn.connectionId,
+          disconnectLeaseWithOrigin(leaseArgsForDisconnect(conn), origin)
+        )
+      } catch (error: unknown) {
+        if (!isConnectionGoneError(error)) {
+          console.warn(
+            "[Acp] backend teardown failed, releasing locally:",
+            error
+          )
+          tornDown = false
+        }
+      }
       reverseMapRef.current.delete(conn.connectionId)
       teardownAttachSubscription(contextKey)
       lastActivityRef.current.delete(contextKey)
@@ -7794,7 +7834,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         clearAliasesPointingTo(conn.connectionId)
       }
       dispatch({ type: "CONNECTION_REMOVED", contextKey })
-      return true
+      return tornDown
     },
     [
       clearAliasesPointingTo,
@@ -7831,7 +7871,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         workingDir ?? undefined,
         sessionId ?? undefined,
         boundConversationId ?? undefined,
-        boundRouteOverride,
+        boundRouteOverride ?? undefined,
         boundOwnerOperationId
       )
       // Reconnect regardless — the user is left with a working connection
@@ -7954,7 +7994,14 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       // An unconfirmed teardown is deliberately NOT fatal here: the local entry
       // is released either way, and refusing to reconnect would strand the user
       // on the dead connection this button exists to replace.
-      if (storeRef.current.connections.has(contextKey)) {
+      // Viewers live under the backend connectionId with the tab as an
+      // alias, so `connections.has(tabKey)` is false. Still detach first:
+      // otherwise `connect()` treats the leftover alias as a broker handoff
+      // and waits out the discovery delay ladder for the owner to die.
+      if (
+        storeRef.current.connections.has(contextKey) ||
+        observerAliasesRef.current.has(contextKey)
+      ) {
         await disconnect(contextKey)
       }
       await connect(

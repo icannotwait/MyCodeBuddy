@@ -118,9 +118,9 @@ function isRetryIncident(f: SessionFailureRecord): boolean {
 
 /** Whether a progress settle would change anything — cheap per-chunk guard. */
 export function hasSettleableRetryIncident(
-  failures: SessionFailureRecord[]
+  failures: SessionFailureRecord[] | undefined
 ): boolean {
-  return failures.some((f) => !f.resolved && isRetryIncident(f))
+  return (failures ?? []).some((f) => !f.resolved && isRetryIncident(f))
 }
 
 /**
@@ -130,17 +130,18 @@ export function hasSettleableRetryIncident(
  * reference when nothing needed settling.
  */
 export function settleSessionFailures(
-  failures: SessionFailureRecord[],
+  failures: SessionFailureRecord[] | undefined,
   scope: SessionFailureSettleScope
 ): SessionFailureRecord[] {
+  const table = failures ?? []
   const settles = (f: SessionFailureRecord) => {
     if (f.resolved) return false
     if (scope === "all") return true
     if (scope === "warnings") return f.severity === "warning"
     return isRetryIncident(f)
   }
-  if (!failures.some(settles)) return failures
-  return failures.map((f) => (settles(f) ? { ...f, resolved: true } : f))
+  if (!table.some(settles)) return table
+  return table.map((f) => (settles(f) ? { ...f, resolved: true } : f))
 }
 
 /**

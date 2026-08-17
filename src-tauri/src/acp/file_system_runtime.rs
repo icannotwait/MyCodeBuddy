@@ -546,10 +546,7 @@ fn agent_root_slots(agent_type: AgentType) -> &'static [RootSlot] {
                 default_rel: &[".dsh"],
             },
             RootSlot {
-                candidates: &[
-                    ("DEEPSEEK_ACP_SESSIONS_ROOT", ""),
-                    ("DSH_HOME", "sessions"),
-                ],
+                candidates: &[("DEEPSEEK_ACP_SESSIONS_ROOT", ""), ("DSH_HOME", "sessions")],
                 trims: false,
                 default_rel: &[".dsh", "sessions"],
             },

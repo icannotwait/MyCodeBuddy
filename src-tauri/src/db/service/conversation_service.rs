@@ -2063,9 +2063,15 @@ mod tests {
     async fn retitle_if_unchanged_follows_the_owner_rename() {
         let db = fresh_in_memory_db().await;
         let folder = seed_folder(&db, "/tmp/codeg-retitle-follow").await;
-        let row = create(&db.conn, folder, AgentType::ClaudeCode, Some("old".into()), None)
-            .await
-            .expect("create");
+        let row = create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("old".into()),
+            None,
+        )
+        .await
+        .expect("create");
         let before = row.updated_at;
         lock_title(&db.conn, row.id).await.expect("lock");
 
@@ -2090,9 +2096,15 @@ mod tests {
     async fn retitle_if_unchanged_refuses_after_a_manual_rename() {
         let db = fresh_in_memory_db().await;
         let folder = seed_folder(&db, "/tmp/codeg-retitle-refuse").await;
-        let row = create(&db.conn, folder, AgentType::ClaudeCode, Some("old".into()), None)
-            .await
-            .expect("create");
+        let row = create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("old".into()),
+            None,
+        )
+        .await
+        .expect("create");
         update_title(&db.conn, row.id, "User pick".into())
             .await
             .expect("rename");
@@ -2109,9 +2121,15 @@ mod tests {
     async fn retitle_if_unchanged_skips_empty_and_identical() {
         let db = fresh_in_memory_db().await;
         let folder = seed_folder(&db, "/tmp/codeg-retitle-skip").await;
-        let row = create(&db.conn, folder, AgentType::ClaudeCode, Some("same".into()), None)
-            .await
-            .expect("create");
+        let row = create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("same".into()),
+            None,
+        )
+        .await
+        .expect("create");
 
         assert!(
             !retitle_if_unchanged(&db.conn, row.id, "same", "same")

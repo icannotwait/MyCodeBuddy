@@ -1266,7 +1266,10 @@ impl TaskEngine {
         // commits sit stranded on a branch nothing points to. Only when the
         // branch cannot be re-checked-out does the fresh mint below take over
         // (re-recording base + branch).
-        if let Some(wt) = self.recreate_worktree_from_branch(task, root, settings).await {
+        if let Some(wt) = self
+            .recreate_worktree_from_branch(task, root, settings)
+            .await
+        {
             return Ok(wt);
         }
 
@@ -4292,10 +4295,7 @@ fn expand_home(path: &str, home: Option<&Path>) -> PathBuf {
     if path == "~" {
         return home.to_path_buf();
     }
-    match path
-        .strip_prefix("~/")
-        .or_else(|| path.strip_prefix("~\\"))
-    {
+    match path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\")) {
         Some(rest) => home.join(rest),
         None => PathBuf::from(path),
     }

@@ -9170,9 +9170,7 @@ pub async fn acp_goal_control(
     db: State<'_, AppDatabase>,
     manager: State<'_, ConnectionManager>,
 ) -> Result<(), AcpError> {
-    manager
-        .goal_control(&db.conn, &connection_id, action)
-        .await
+    manager.goal_control(&db.conn, &connection_id, action).await
 }
 
 /// Spawn a transient ACP connection for `agent_type` with a silent emitter,

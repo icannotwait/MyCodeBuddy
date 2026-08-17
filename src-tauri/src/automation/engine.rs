@@ -718,7 +718,6 @@ impl AutomationEngine {
             );
         }
 
-
         // Surface the produced conversation in every client's sidebar the instant
         // it exists (InProgress) — independent of the implicit upsert inside
         // send_prompt_linked. Its folder was announced just above, so it can be

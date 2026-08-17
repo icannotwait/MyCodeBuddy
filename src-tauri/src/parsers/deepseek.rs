@@ -26,7 +26,10 @@ fn expand_home_prefix(value: &str, home_dir: Option<&PathBuf>) -> PathBuf {
     if value == "~" {
         return home.clone();
     }
-    if let Some(rest) = value.strip_prefix("~/").or_else(|| value.strip_prefix("~\\")) {
+    if let Some(rest) = value
+        .strip_prefix("~/")
+        .or_else(|| value.strip_prefix("~\\"))
+    {
         return home.join(rest);
     }
     PathBuf::from(value)
@@ -806,7 +809,10 @@ mod tests {
         // Upstream `resolveDshHome` treats a WHITESPACE-only override as unset
         // too ("a blank override never resolves the home to the cwd").
         assert_eq!(
-            resolve_dsh_home_from(Some(OsString::from("   ")), Some(PathBuf::from("/home/demo"))),
+            resolve_dsh_home_from(
+                Some(OsString::from("   ")),
+                Some(PathBuf::from("/home/demo"))
+            ),
             PathBuf::from("/home/demo/.dsh")
         );
         // ... and expands a leading `~` (`expandHomePath`) before use, so a
@@ -825,7 +831,10 @@ mod tests {
         );
         // `~user` is NOT a prefix upstream expands — kept verbatim.
         assert_eq!(
-            resolve_dsh_home_from(Some(OsString::from("~root/x")), Some(PathBuf::from("/home/demo"))),
+            resolve_dsh_home_from(
+                Some(OsString::from("~root/x")),
+                Some(PathBuf::from("/home/demo"))
+            ),
             PathBuf::from("~root/x")
         );
     }

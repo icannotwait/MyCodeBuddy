@@ -5573,11 +5573,11 @@ mod tests {
             Some("http")
         );
         // The type IS persisted here (no foreign schema to strip it for).
-        let root: Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).expect("read file"))
-                .expect("parse json");
+        let root: Value = serde_json::from_str(&std::fs::read_to_string(&path).expect("read file"))
+            .expect("parse json");
         assert_eq!(
-            root.pointer("/mcpServers/ctx7/type").and_then(Value::as_str),
+            root.pointer("/mcpServers/ctx7/type")
+                .and_then(Value::as_str),
             Some("stdio")
         );
 
@@ -5616,7 +5616,11 @@ mod tests {
         .expect("upsert");
 
         let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
-        assert_eq!(mode & 0o077, 0, "fresh store must be owner-only, got {mode:o}");
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "fresh store must be owner-only, got {mode:o}"
+        );
         let parent_mode = std::fs::metadata(path.parent().expect("parent"))
             .expect("stat parent")
             .permissions()
@@ -5638,7 +5642,8 @@ mod tests {
         );
 
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).expect("chmod 640");
-        upsert_deepseek_server_at(&path, "ctx7", &json!({ "command": "npx" })).expect("re-upsert 2");
+        upsert_deepseek_server_at(&path, "ctx7", &json!({ "command": "npx" }))
+            .expect("re-upsert 2");
         assert_eq!(
             std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777,
             0o640,
