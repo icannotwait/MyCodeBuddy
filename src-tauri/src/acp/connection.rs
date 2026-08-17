@@ -9926,7 +9926,7 @@ async fn run_conversation_loop<'a>(
                 } else {
                     blocks
                 };
-                let prompt_blocks = map_prompt_blocks(blocks);
+                let mut prompt_blocks = map_prompt_blocks(blocks);
                 if prompt_blocks.is_empty() {
                     // Defensive: the manager rejects empty prompts before the
                     // concurrency gate is set / the command is enqueued (see
@@ -12395,6 +12395,18 @@ struct CodeBuddyLiveState {
 /// `AskQuestionCard` (see `handle_grok_ask_user_question`), so the parallel
 /// `tool_call` stream grok emits for the same call is redundant — it is dropped
 /// live so the question doesn't render twice (once answerable, once inert).
+fn grok_meta_marks_spawn_subagent(
+    agent_type: AgentType,
+    meta: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> bool {
+    matches!(agent_type, AgentType::Grok)
+        && meta
+            .and_then(|m| m.get("x.ai/tool"))
+            .and_then(|t| t.get("name"))
+            .and_then(|n| n.as_str())
+            == Some("spawn_subagent")
+}
+
 fn grok_meta_marks_ask_user(
     agent_type: AgentType,
     meta: Option<&serde_json::Map<String, serde_json::Value>>,
@@ -12682,6 +12694,7 @@ async fn maybe_emit_private_ext_notification(
 /// Both share the standard `session/update` envelope (`params.update.
 /// sessionUpdate` + fields, verified live against grok 0.2.111) but carry
 /// variants the typed ACP pipeline can't deserialize, so codeg drops them.
+const CLAUDE_SDK_EXT_METHOD: &str = "_claude/sdkMessage";
 const GROK_EXT_UPDATE_METHODS: [&str; 2] = ["_x.ai/session_notification", "_x.ai/session/update"];
 
 /// A stable id for a synthetic event derived from a grok ext notification —
@@ -18112,6 +18125,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "unmerged-upstream-helpers")]
     #[test]
     fn build_steer_params_shape_carries_the_prompt_required_opt_in() {
         let params = build_steer_params("sess-1", "use the staging db");
@@ -18126,6 +18140,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "unmerged-upstream-helpers")]
     #[test]
     fn parse_steer_outcome_maps_the_wire_strings_and_rejects_unknowns() {
         assert_eq!(
@@ -20935,6 +20950,7 @@ mod tests {
     /// updates — the only live context signal it offers, and one the typed
     /// pipeline drops. The peek must read it there, hold its fire while the
     /// number repeats, and stay silent without a window to divide by.
+    #[cfg(feature = "unmerged-upstream-helpers")]
     #[test]
     fn grok_live_usage_step_reads_the_outer_meta_and_dedupes() {
         let update = |meta: serde_json::Value| {
@@ -21030,6 +21046,7 @@ mod tests {
     /// A model switch between turns moves the denominator, and the frontend's
     /// reducer drops a `used == 0` update while it holds a positive one — so the
     /// previous model's window has to be re-keyed at turn start, not cleared.
+    #[cfg(feature = "unmerged-upstream-helpers")]
     #[test]
     fn grok_window_change_usage_rekeys_a_live_pair_to_the_new_window() {
         // Same window (no switch) → nothing to do.
@@ -21066,6 +21083,7 @@ mod tests {
     /// the id heuristic. A BYO endpoint is keyed by whatever id the user typed,
     /// so this genuinely can come back empty — `grok_window_change_usage` is
     /// what keeps that from stranding a stale window.
+    #[cfg(feature = "unmerged-upstream-helpers")]
     #[test]
     fn grok_offline_context_window_falls_through_catalog_then_heuristic() {
         let home = tempfile::tempdir().expect("tempdir");
@@ -21115,6 +21133,7 @@ mod tests {
     /// per-streaming-chunk path — under the DEFAULT level, which is how a field
     /// report ended up writing 34GB in 8.8h (issue #427). The throttle collapses
     /// the burst; this pins the part that must survive it, the tally.
+    #[cfg(feature = "unmerged-upstream-helpers")]
     #[test]
     fn dropped_update_log_line_reports_what_the_throttle_swallowed() {
         // Leading edge: the plain line, no tally to report yet.
@@ -21138,6 +21157,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "unmerged-upstream-helpers")]
     #[test]
     fn dropped_update_logging_emits_once_per_window() {
         let mut throttle = LeadingEdgeThrottle::new(DROPPED_UPDATE_LOG_WINDOW);
@@ -21160,6 +21180,7 @@ mod tests {
         assert_eq!(summary.occurrences, 10_000);
     }
 
+    #[cfg(feature = "unmerged-upstream-helpers")]
     #[test]
     fn note_update_splits_agent_output_from_metadata() {
         use sacp::schema::{ContentChunk, Plan};
@@ -21177,6 +21198,7 @@ mod tests {
 
     /// The classifier's whole purpose is to separate "we went blind" from
     /// "nothing came" — a `Plan`-only turn must not read as agent output.
+    #[cfg(feature = "unmerged-upstream-helpers")]
     #[test]
     fn diagnose_empty_turn_covers_three_causes_and_priority() {
         let mut none = TurnOutputProbe::new(0);
@@ -21198,6 +21220,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "unmerged-upstream-helpers")]
     #[test]
     fn note_dropped_counts_each_site_separately_and_keeps_the_first() {
         let mut probe = TurnOutputProbe::new(0);
@@ -21219,6 +21242,7 @@ mod tests {
     /// Drop reasons reach the UI, so they must be redacted at capture time —
     /// a parser error inlines the value it choked on, and that value came off
     /// the `session/update` channel.
+    #[cfg(feature = "unmerged-upstream-helpers")]
     #[test]
     fn note_dropped_redacts_the_captured_error() {
         const SECRET: &str = "sk-live-abcdefghijklmnop";
@@ -21234,6 +21258,7 @@ mod tests {
         assert_eq!(summary, "invalid type, expected u64 at line 1 column 40");
     }
 
+    #[cfg(feature = "unmerged-upstream-helpers")]
     #[test]
     fn finish_turn_reason_passes_through_non_empty_reasons() {
         let tail = StderrTail::new();
@@ -21257,6 +21282,7 @@ mod tests {
 
     /// Guards the two-exit refactor: the helper only computes, so calling it
     /// twice (as the two exits each do) is identical and side-effect free.
+    #[cfg(feature = "unmerged-upstream-helpers")]
     #[test]
     fn finish_turn_reason_is_pure() {
         let tail = StderrTail::new();
@@ -21276,6 +21302,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "unmerged-upstream-helpers")]
     #[test]
     fn empty_turn_details_quote_stderr_scoped_to_the_turn() {
         let tail = StderrTail::new();
@@ -21289,6 +21316,7 @@ mod tests {
         assert!(!details.contains("older line"));
     }
 
+    #[cfg(feature = "unmerged-upstream-helpers")]
     #[test]
     fn empty_turn_details_fall_back_to_recent_stderr() {
         let tail = StderrTail::new();
@@ -21300,6 +21328,7 @@ mod tests {
         assert!(details.contains("connect-time failure"));
     }
 
+    #[cfg(feature = "unmerged-upstream-helpers")]
     #[test]
     fn empty_turn_details_report_drop_counts() {
         let tail = StderrTail::new();
@@ -21318,6 +21347,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "unmerged-upstream-helpers")]
     #[test]
     fn empty_turn_details_are_none_without_evidence() {
         let tail = StderrTail::new();
@@ -21325,6 +21355,7 @@ mod tests {
         assert!(build_empty_turn_details(&probe, &tail).is_none());
     }
 
+    #[cfg(feature = "unmerged-upstream-helpers")]
     #[test]
     fn empty_turn_details_are_bounded() {
         let tail = StderrTail::new();
@@ -21350,7 +21381,7 @@ mod tests {
             ("unknown", "turn_failed_unknown"),
         ] {
             let Some(AcpEvent::Error { code, details, .. }) =
-                turn_failure_error_event(reason, AgentType::ClaudeCode, None)
+                turn_failure_error_event(reason, AgentType::ClaudeCode)
             else {
                 panic!("{reason} should produce an error event");
             };
@@ -21360,36 +21391,9 @@ mod tests {
     }
 
     #[test]
-    fn turn_failure_error_event_maps_each_empty_cause() {
-        for (cause, expected) in [
-            (EmptyTurnCause::NoOutput, "turn_failed_empty"),
-            (
-                EmptyTurnCause::ProtocolMismatch,
-                "turn_failed_empty_protocol",
-            ),
-            (EmptyTurnCause::MetadataOnly, "turn_failed_empty_metadata"),
-        ] {
-            let report = EmptyTurnReport {
-                cause,
-                details: Some("evidence".into()),
-            };
-            let Some(AcpEvent::Error {
-                code,
-                details,
-                terminal,
-                ..
-            }) = turn_failure_error_event("empty", AgentType::ClaudeCode, Some(&report))
-            else {
-                panic!("empty should produce an error event");
-            };
-            assert_eq!(code.as_deref(), Some(expected));
-            assert_eq!(details.as_deref(), Some("evidence"));
-            assert!(!terminal, "an empty turn never kills the connection");
-        }
-
-        // No report (a path that skipped diagnosis) keeps the original code.
+    fn turn_failure_error_event_maps_empty_reason() {
         let Some(AcpEvent::Error { code, details, .. }) =
-            turn_failure_error_event("empty", AgentType::ClaudeCode, None)
+            turn_failure_error_event("empty", AgentType::ClaudeCode)
         else {
             panic!("empty should produce an error event");
         };

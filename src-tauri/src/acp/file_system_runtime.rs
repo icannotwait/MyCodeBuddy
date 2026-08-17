@@ -3,6 +3,7 @@ use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -38,6 +39,15 @@ impl FileSystemRuntimeError {
 /// Per-agent `env_json` / process-env key selecting the path-containment policy
 /// for the ACP `fs/*` channel. `default` | `strict` | `unrestricted`; anything
 /// else warns and falls back to `default`.
+/// Codex `agent-full-access` / Claude `bypassPermissions` (and the two
+/// legacy full-access aliases) skip the workspace-root containment check.
+pub fn mode_allows_outside_workspace(mode_id: &str) -> bool {
+    matches!(
+        mode_id,
+        "agent-full-access" | "full-access" | "danger-full-access" | "bypassPermissions"
+    )
+}
+
 pub(crate) const FS_POLICY_ENV: &str = "CODEG_ACP_FS_POLICY";
 /// Additional **writable** roots, joined with the platform `PATH` separator
 /// (`:` on unix, `;` on Windows — parsed with `std::env::split_paths`, so a
@@ -593,6 +603,8 @@ fn canonical_root(root: &Path) -> PathBuf {
 pub struct FileSystemRuntime {
     policy: Arc<FsAccessPolicy>,
     io_semaphore: Arc<Semaphore>,
+    /// When true, skip the workspace-root containment check (full-access mode).
+    allow_outside_workspace: Arc<AtomicBool>,
 }
 
 impl FileSystemRuntime {
@@ -607,7 +619,21 @@ impl FileSystemRuntime {
         Self {
             policy: Arc::new(policy),
             io_semaphore: Arc::new(Semaphore::new(FS_MAX_CONCURRENT_OPS)),
+            allow_outside_workspace: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    pub fn with_allow_outside_workspace(self, allow: bool) -> Self {
+        self.allow_outside_workspace.store(allow, Ordering::Relaxed);
+        self
+    }
+
+    pub fn set_allow_outside_workspace(&self, allow: bool) {
+        self.allow_outside_workspace.store(allow, Ordering::Relaxed);
+    }
+
+    pub fn allow_outside_workspace(&self) -> bool {
+        self.allow_outside_workspace.load(Ordering::Relaxed)
     }
 
     pub async fn read_text_file(
@@ -635,6 +661,7 @@ impl FileSystemRuntime {
             })?;
 
         let policy = self.policy.clone();
+        let allow_outside = self.allow_outside_workspace();
         let path = request.path;
         let line = request.line;
         let limit = request.limit;
@@ -642,8 +669,12 @@ impl FileSystemRuntime {
         let path_for_log = path.clone();
 
         let response = run_blocking_with_timeout("fs/read_text_file", move || {
-            read_text_file_impl(&path, line, limit, &policy.read_roots)
-                .map(ReadTextFileResponse::new)
+            let roots = if allow_outside {
+                Vec::new()
+            } else {
+                policy.read_roots.clone()
+            };
+            read_text_file_impl(&path, line, limit, &roots).map(ReadTextFileResponse::new)
         })
         .await;
 
@@ -678,13 +709,19 @@ impl FileSystemRuntime {
             })?;
 
         let policy = self.policy.clone();
+        let allow_outside = self.allow_outside_workspace();
         let path = request.path;
         let content = request.content;
         let started_at = Instant::now();
         let path_for_log = path.clone();
 
         let response = run_blocking_with_timeout("fs/write_text_file", move || {
-            ensure_path_allowed(&path, &policy.write_roots, true)?;
+            let roots = if allow_outside {
+                Vec::new()
+            } else {
+                policy.write_roots.clone()
+            };
+            ensure_path_allowed(&path, &roots, true)?;
             atomic_write_text(&path, content.as_bytes())?;
             Ok(WriteTextFileResponse::new())
         })

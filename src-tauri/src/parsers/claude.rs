@@ -520,6 +520,7 @@ fn push_goal_marker(messages: &mut Vec<UnifiedMessage>, goal: &PendingGoal) -> O
         duration_ms: None,
         model: None,
         completed_at: Some(goal.timestamp),
+        reasoning_effort: None,
     });
     Some(marker.objective)
 }
@@ -604,6 +605,36 @@ fn is_context_continuation(content: &[ContentBlock]) -> bool {
             false
         }
     })
+}
+
+pub(crate) fn is_interrupt_marker(value: &serde_json::Value) -> bool {
+    const MARKERS: [&str; 2] = [
+        "[Request interrupted by user]",
+        "[Request interrupted by user for tool use]",
+    ];
+    if value.get("type").and_then(|t| t.as_str()) != Some("user") {
+        return false;
+    }
+    let Some(content) = value.pointer("/message/content") else {
+        return false;
+    };
+    let text = match content {
+        serde_json::Value::String(s) => s.as_str(),
+        serde_json::Value::Array(blocks) => {
+            let [block] = blocks.as_slice() else {
+                return false;
+            };
+            if block.get("type").and_then(|t| t.as_str()) != Some("text") {
+                return false;
+            }
+            match block.get("text").and_then(|t| t.as_str()) {
+                Some(t) => t,
+                None => return false,
+            }
+        }
+        _ => return false,
+    };
+    MARKERS.contains(&text)
 }
 
 fn is_synthetic_assistant(value: &serde_json::Value) -> bool {

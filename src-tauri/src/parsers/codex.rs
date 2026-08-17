@@ -2306,6 +2306,8 @@ impl CodexParser {
                                     duration_ms: None,
                                     model: None,
                                     completed_at: Some(timestamp),
+
+                                    reasoning_effort: None,
                                 });
                             }
                             "agent_message" => {
@@ -2335,6 +2337,8 @@ impl CodexParser {
                                     duration_ms: None,
                                     model: None,
                                     completed_at: Some(timestamp),
+
+                                    reasoning_effort: None,
                                 });
                             }
                             "thread_goal_updated" => {
@@ -2410,6 +2414,8 @@ impl CodexParser {
                                         duration_ms: None,
                                         model: None,
                                         completed_at: Some(timestamp),
+
+                                        reasoning_effort: None,
                                     });
                                 }
                             }
@@ -2497,6 +2503,8 @@ impl CodexParser {
                                     duration_ms: None,
                                     model: None,
                                     completed_at: Some(timestamp),
+
+                                    reasoning_effort: None,
                                 });
                                 if !call_id.is_empty() {
                                     emitted_image_ids.insert(call_id);
@@ -2689,6 +2697,8 @@ impl CodexParser {
                                         duration_ms: None,
                                         model: None,
                                         completed_at: Some(timestamp),
+
+                                        reasoning_effort: None,
                                     });
                                 } else {
                                     flush_pending_reasoning(
@@ -2804,6 +2814,8 @@ impl CodexParser {
                                             duration_ms: None,
                                             model: None,
                                             completed_at: Some(timestamp),
+
+                                            reasoning_effort: None,
                                         });
                                     }
                                     "wait_agent" => {
@@ -2866,6 +2878,8 @@ impl CodexParser {
                                             duration_ms: None,
                                             model: None,
                                             completed_at: Some(timestamp),
+
+                                            reasoning_effort: None,
                                         });
                                     }
                                     _ => {
@@ -2939,6 +2953,8 @@ impl CodexParser {
                                             duration_ms: None,
                                             model: None,
                                             completed_at: Some(timestamp),
+
+                                            reasoning_effort: None,
                                         });
                                     }
                                 }
@@ -3048,6 +3064,8 @@ impl CodexParser {
                                         duration_ms: None,
                                         model: None,
                                         completed_at: Some(timestamp),
+
+                                        reasoning_effort: None,
                                     });
                                 } else if is_spawn {
                                     if let Some(output_obj) = parse_codex_json_output(payload) {
@@ -3074,6 +3092,8 @@ impl CodexParser {
                                         duration_ms: None,
                                         model: None,
                                         completed_at: Some(timestamp),
+
+                                        reasoning_effort: None,
                                     });
                                 } else if is_wait {
                                     // Emit one `collab_agent` capsule per wait,
@@ -3122,6 +3142,8 @@ impl CodexParser {
                                             duration_ms: None,
                                             model: None,
                                             completed_at: Some(timestamp),
+
+                                            reasoning_effort: None,
                                         });
                                         messages.push(UnifiedMessage {
                                             id: format!("tool-result-{}", messages.len()),
@@ -3138,6 +3160,8 @@ impl CodexParser {
                                             duration_ms: None,
                                             model: None,
                                             completed_at: Some(timestamp),
+
+                                            reasoning_effort: None,
                                         });
                                     }
                                 } else if is_close {
@@ -3256,6 +3280,8 @@ impl CodexParser {
                                         duration_ms: None,
                                         model: None,
                                         completed_at: Some(timestamp),
+
+                                        reasoning_effort: None,
                                     });
                                 }
                             }
@@ -3291,6 +3317,8 @@ impl CodexParser {
                                             duration_ms: None,
                                             model: None,
                                             completed_at: Some(timestamp),
+
+                                            reasoning_effort: None,
                                         });
                                     }
                                 }
@@ -3347,6 +3375,8 @@ impl CodexParser {
                                     duration_ms: None,
                                     model: None,
                                     completed_at: Some(timestamp),
+
+                                    reasoning_effort: None,
                                 });
                                 if !id.is_empty() {
                                     emitted_image_ids.insert(id);
@@ -3461,6 +3491,8 @@ impl CodexParser {
                         duration_ms: None,
                         model: None,
                         completed_at: first_timestamp,
+
+                        reasoning_effort: None,
                     },
                 );
             }
@@ -3836,6 +3868,8 @@ fn flush_pending_reasoning(
         duration_ms: None,
         model: None,
         completed_at: Some(timestamp),
+
+        reasoning_effort: None,
     });
 }
 
@@ -4090,6 +4124,9 @@ fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn> {
                 duration_ms: None,
                 model: None,
                 completed_at: msg.completed_at,
+
+                reasoning_effort: None,
+                outcome: None,
             });
             i += 1;
         } else if matches!(msg.role, MessageRole::System) {
@@ -4102,6 +4139,9 @@ fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn> {
                 duration_ms: None,
                 model: None,
                 completed_at: msg.completed_at,
+
+                reasoning_effort: None,
+                outcome: None,
             });
             i += 1;
         } else {
@@ -4142,6 +4182,9 @@ fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn> {
                 duration_ms,
                 model: turn_model,
                 completed_at,
+
+                reasoning_effort: None,
+                outcome: None,
             });
         }
     }
@@ -4258,6 +4301,8 @@ mod tests {
             duration_ms: None,
             model: None,
             completed_at: Some(now),
+
+            reasoning_effort: None,
         }];
 
         assert!(should_skip_duplicate_user_message(

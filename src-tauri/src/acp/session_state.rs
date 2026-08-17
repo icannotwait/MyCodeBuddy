@@ -2473,6 +2473,9 @@ mod tests {
             session_id: "sid".into(),
             stop_reason: "end_turn".into(),
             agent_type: "codex".into(),
+            mark_awaiting_reply: false,
+            termination_source: None,
+            provider_turn_id: None,
         });
         assert!(s.session_failures["t1:error"].resolved);
         assert!(!s.session_failures["s:notice"].resolved);
@@ -2535,6 +2538,9 @@ mod tests {
                 session_id: "sid".into(),
                 stop_reason: stop_reason.into(),
                 agent_type: "claude_code".into(),
+                mark_awaiting_reply: false,
+                termination_source: None,
+                provider_turn_id: None,
             }
         }
         let mut s = fresh_state();
@@ -2649,6 +2655,9 @@ mod tests {
             session_id: "sid".into(),
             stop_reason: "end_turn".into(),
             agent_type: "codex".into(),
+            mark_awaiting_reply: false,
+            termination_source: None,
+            provider_turn_id: None,
         });
         assert!(s.session_failures["notice"].resolved);
         assert!(!s.session_failures["err"].resolved);

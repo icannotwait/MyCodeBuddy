@@ -45,7 +45,6 @@ import {
   completeLiveTranscriptTurn,
   getConversationIdByExternalIdFromStore,
   getRuntimeSession,
-  getTimelineTurns,
   useConversationRuntimeActions,
   useConversationRuntimeStore,
 } from "@/stores/conversation-runtime-store"

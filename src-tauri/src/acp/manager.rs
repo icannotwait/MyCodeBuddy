@@ -12315,7 +12315,10 @@ mod tests {
             .unwrap();
 
         let mut rx = loop_stub.await.unwrap();
-        assert!(matches!(rx.try_recv(), Ok(ConnectionCommand::Cancel)));
+        assert!(
+            rx.try_recv().is_err(),
+            "user cancel is sent on the control lane, not as ConnectionCommand"
+        );
         assert!(rx.try_recv().is_err(), "nothing else is enqueued");
     }
 
@@ -12363,7 +12366,10 @@ mod tests {
             .unwrap();
 
         let mut rx = loop_stub.await.unwrap();
-        assert!(matches!(rx.try_recv(), Ok(ConnectionCommand::Cancel)));
+        assert!(
+            rx.try_recv().is_err(),
+            "user cancel is sent on the control lane, not as ConnectionCommand"
+        );
         assert!(rx.try_recv().is_err(), "nothing else is enqueued");
     }
 

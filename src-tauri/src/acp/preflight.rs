@@ -1,4 +1,6 @@
 use serde::Serialize;
+use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 use crate::acp::binary_cache;
@@ -84,10 +86,13 @@ pub fn clear_npm_env_cache() {
     *NPM_ENV_CACHE.lock().unwrap() = None;
 }
 
-pub async fn run_preflight(agent_type: AgentType) -> PreflightResult {
+pub async fn run_preflight(
+    agent_type: AgentType,
+    runtime_env: &BTreeMap<String, String>,
+) -> PreflightResult {
     let meta = registry::get_agent_meta(agent_type);
     debug_assert_eq!(meta.agent_type, agent_type);
-    let checks = match &meta.distribution {
+    let mut checks = match &meta.distribution {
         AgentDistribution::Npx { node_required, .. } => check_npm_environment(*node_required).await,
         AgentDistribution::Binary {
             version,
@@ -95,12 +100,23 @@ pub async fn run_preflight(agent_type: AgentType) -> PreflightResult {
             platforms,
             ..
         } => check_binary_environment(agent_type, version, cmd, platforms).await,
+        AgentDistribution::Bundled {
+            cmd,
+            override_env,
+            platforms,
+            ..
+        } => check_bundled_environment(cmd, override_env, platforms),
         AgentDistribution::Uvx {
             uv_required,
             system_cmd,
             ..
         } => check_uv_environment(*uv_required, *system_cmd).await,
     };
+
+    let effective_env = merge_distribution_env(meta.distribution.env(), runtime_env);
+    if agent_type == AgentType::Codex && crate::acp::codex_cli::cli_mode_enabled(&effective_env) {
+        checks.push(check_codex_cli_host(&effective_env));
+    }
 
     let passed = checks
         .iter()
@@ -172,6 +188,98 @@ fn build_adapter_info(
         shared_config_dir: relation.shared_config_dir.to_string(),
         docs_url: relation.docs_url.to_string(),
     }
+}
+
+fn merge_distribution_env(
+    defaults: &[(&str, &str)],
+    runtime_env: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let mut effective = defaults
+        .iter()
+        .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+        .collect::<BTreeMap<_, _>>();
+    effective.extend(runtime_env.clone());
+    effective
+}
+
+fn check_codex_cli_host(runtime_env: &BTreeMap<String, String>) -> CheckItem {
+    let path = if let Some(saved) = runtime_env
+        .get(crate::acp::codex_cli::CODEX_PATH_ENV)
+        .filter(|value| !value.trim().is_empty())
+    {
+        let path = PathBuf::from(saved);
+        path.is_file().then_some(path)
+    } else {
+        crate::acp::codex_cli::resolve_codex_cli_path()
+    };
+    match path {
+        Some(path) => CheckItem {
+            check_id: "codex_cli".into(),
+            label: "Codex CLI".into(),
+            status: CheckStatus::Pass,
+            message: format!("Codex CLI available at {}", path.display()),
+            fixes: vec![],
+        },
+        None => CheckItem {
+            check_id: "codex_cli".into(),
+            label: "Codex CLI".into(),
+            status: CheckStatus::Fail,
+            message: "Host Codex CLI not found. CLI runtime mode needs a local Codex CLI to run `codex exec` (install @openai/codex or set CODEX_PATH).".into(),
+            fixes: vec![FixAction {
+                label: "Install Codex CLI".into(),
+                kind: FixActionKind::OpenUrl,
+                payload: "https://www.npmjs.com/package/@openai/codex".into(),
+            }],
+        },
+    }
+}
+
+fn check_bundled_environment(cmd: &str, override_env: &str, platforms: &[&str]) -> Vec<CheckItem> {
+    let platform = registry::current_platform();
+    let supported = platforms.contains(&platform);
+    let mut checks = vec![CheckItem {
+        check_id: "platform_supported".into(),
+        label: "Platform".into(),
+        status: if supported {
+            CheckStatus::Pass
+        } else {
+            CheckStatus::Fail
+        },
+        message: if supported {
+            format!("Platform {platform} is supported")
+        } else {
+            format!("Platform {platform} is not supported")
+        },
+        fixes: vec![],
+    }];
+    if supported {
+        checks.push(
+            match crate::acp::bundled_agent::locate_bundled_executable(cmd, override_env) {
+                Ok(Some(path)) => CheckItem {
+                    check_id: "bundled_executable".into(),
+                    label: "Built-in adapter".into(),
+                    status: CheckStatus::Pass,
+                    message: format!("Built-in adapter available at {}", path.display()),
+                    fixes: vec![],
+                },
+                Ok(None) => CheckItem {
+                    check_id: "bundled_executable".into(),
+                    label: "Built-in adapter".into(),
+                    status: CheckStatus::Fail,
+                    message: "Built-in adapter is missing; reinstall or update DrawCode.".into(),
+                    fixes: vec![],
+                },
+                Err(error) => CheckItem {
+                    check_id: "bundled_executable".into(),
+                    label: "Built-in adapter".into(),
+                    status: CheckStatus::Fail,
+                    message: error.to_string(),
+                    fixes: vec![],
+                },
+            },
+        );
+    }
+    checks
 }
 
 async fn check_npm_environment(node_required: Option<&str>) -> Vec<CheckItem> {

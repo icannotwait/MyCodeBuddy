@@ -3,6 +3,7 @@ pub mod claude;
 pub mod cline;
 pub mod codebuddy;
 pub mod codex;
+pub mod codex_code_mode;
 pub mod cursor;
 pub mod deepseek;
 pub mod gemini;
