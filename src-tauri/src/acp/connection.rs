@@ -772,8 +772,8 @@ pub(crate) fn suppression_application_for_plan(
 
 /// Process env for Codeg native-suppression plans.
 ///
-/// - Codex: merge `features.multi_agent=false` into the official `CODEX_CONFIG`
-///   JSON contract
+/// - Codex: merge `features.multi_agent=false` and `agents.enabled=false`
+///   into the official `CODEX_CONFIG` JSON contract (v1/v2 native tools)
 /// - Grok: set/override `GROK_SUBAGENTS=0` (documented host kill-switch; pairs
 ///   with argv `--no-subagents` and session `_meta.agentProfile` denylist)
 ///
@@ -832,6 +832,13 @@ where
         .as_object_mut()
         .ok_or_else(native_suppression_invalid)?;
     features.insert("multi_agent".into(), serde_json::Value::Bool(false));
+    let agents = root
+        .entry("agents")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    let agents = agents
+        .as_object_mut()
+        .ok_or_else(native_suppression_invalid)?;
+    agents.insert("enabled".into(), serde_json::Value::Bool(false));
     let serialized = serde_json::to_string(&config).map_err(|_| native_suppression_invalid())?;
 
     // Commit only after every fallible step succeeds. Remove case-equivalent
@@ -15790,6 +15797,7 @@ mod tests {
         let config: serde_json::Value =
             serde_json::from_str(env.get("CODEX_CONFIG").unwrap()).unwrap();
         assert_eq!(config["features"]["multi_agent"], false);
+        assert_eq!(config["agents"]["enabled"], false);
         assert_eq!(env.get("KEEP").map(String::as_str), Some("yes"));
         assert!(!env.contains_key("CODEX_ACP_MULTI_AGENT"));
     }
@@ -15799,6 +15807,11 @@ mod tests {
         let original = serde_json::json!({
             "model": "gpt-5.4",
             "features": { "fast_mode": true, "multi_agent": true },
+            "agents": {
+                "enabled": true,
+                "max_threads": 4,
+                "web_researcher": { "description": "keep" }
+            },
             "nested": { "keep": [1, 2, 3] }
         });
         let mut env = BTreeMap::from([
@@ -15815,6 +15828,12 @@ mod tests {
         assert_eq!(merged["model"], "gpt-5.4");
         assert_eq!(merged["features"]["fast_mode"], true);
         assert_eq!(merged["features"]["multi_agent"], false);
+        assert_eq!(merged["agents"]["enabled"], false);
+        assert_eq!(merged["agents"]["max_threads"], 4);
+        assert_eq!(
+            merged["agents"]["web_researcher"],
+            original["agents"]["web_researcher"]
+        );
         assert_eq!(merged["nested"], original["nested"]);
         assert_eq!(
             env.get("CODEX_ACP_MULTI_AGENT").map(String::as_str),
@@ -15824,7 +15843,7 @@ mod tests {
 
     #[test]
     fn codex_codeg_route_rejects_malformed_official_config() {
-        for raw in ["not-json", "[]", r#"{"features":[]}"#] {
+        for raw in ["not-json", "[]", r#"{"features":[]}"#, r#"{"agents":[]}"#] {
             let mut env = BTreeMap::from([("CODEX_CONFIG".into(), raw.into())]);
             let err =
                 apply_route_environment(AgentType::Codex, &codeg_plan(AgentType::Codex), &mut env)
@@ -15853,6 +15872,7 @@ mod tests {
         let inherited = serde_json::json!({
             "model": "gpt-5.4",
             "features": { "fast_mode": true, "multi_agent": true },
+            "agents": { "enabled": true, "max_threads": 2 },
             "nested": { "keep": [1, 2, 3] }
         });
         let inherited = serde_json::to_string(&inherited).unwrap();
@@ -15872,13 +15892,15 @@ mod tests {
         assert_eq!(merged["model"], "gpt-5.4");
         assert_eq!(merged["features"]["fast_mode"], true);
         assert_eq!(merged["features"]["multi_agent"], false);
+        assert_eq!(merged["agents"]["enabled"], false);
+        assert_eq!(merged["agents"]["max_threads"], 2);
         assert_eq!(merged["nested"], serde_json::json!({ "keep": [1, 2, 3] }));
         assert_eq!(env.get("KEEP").map(String::as_str), Some("yes"));
     }
 
     #[test]
     fn codex_inherited_config_rejects_malformed_parent_value_atomically() {
-        for raw in ["not-json", "[]", r#"{"features":[]}"#] {
+        for raw in ["not-json", "[]", r#"{"features":[]}"#, r#"{"agents":[]}"#] {
             let mut env = BTreeMap::from([("KEEP".into(), "yes".into())]);
             let original = env.clone();
 
@@ -15925,6 +15947,7 @@ mod tests {
             serde_json::from_str(env.get("CODEX_CONFIG").unwrap()).unwrap();
         assert_eq!(merged["model"], "explicit");
         assert_eq!(merged["features"]["multi_agent"], false);
+        assert_eq!(merged["agents"]["enabled"], false);
     }
 
     #[test]
@@ -15959,6 +15982,7 @@ mod tests {
         let merged: serde_json::Value = serde_json::from_str(matching[0].1).unwrap();
         assert_eq!(merged["model"], "effective-explicit");
         assert_eq!(merged["features"]["multi_agent"], false);
+        assert_eq!(merged["agents"]["enabled"], false);
     }
 
     #[test]
@@ -15981,6 +16005,7 @@ mod tests {
             serde_json::from_str(env.get("CODEX_CONFIG").unwrap()).unwrap();
         assert_eq!(merged["model"], "inherited");
         assert_eq!(merged["features"]["multi_agent"], false);
+        assert_eq!(merged["agents"]["enabled"], false);
     }
 
     #[test]
