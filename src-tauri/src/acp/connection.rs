@@ -21371,8 +21371,8 @@ mod tests {
     /// `details`-free; only the empty family gained anything.
     #[test]
     fn turn_failure_error_event_preserves_existing_reasons() {
-        assert!(turn_failure_error_event("end_turn", AgentType::ClaudeCode, None).is_none());
-        assert!(turn_failure_error_event("cancelled", AgentType::ClaudeCode, None).is_none());
+        assert!(turn_failure_error_event("end_turn", AgentType::ClaudeCode).is_none());
+        assert!(turn_failure_error_event("cancelled", AgentType::ClaudeCode).is_none());
 
         for (reason, expected) in [
             ("refusal", "turn_failed_refusal"),
