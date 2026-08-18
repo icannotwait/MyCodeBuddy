@@ -882,6 +882,9 @@ impl ClaudeParser {
                 if msg_type == "assistant" && is_synthetic_assistant(&value) {
                     continue;
                 }
+                if is_meta_message(&value) || is_interrupt_marker(&value) {
+                    continue;
+                }
 
                 message_count += 1;
 
@@ -1166,8 +1169,10 @@ impl ClaudeRecordAccumulator {
             Some(PendingCommandVerdict::Wait) | None => {}
         }
 
-        // Skip system meta messages
-        if is_meta_message(&value) {
+        // Skip system meta messages and interrupt bookkeeping. The interrupt
+        // marker already resolved a pending command above; it must not also
+        // render as a user turn.
+        if is_meta_message(&value) || is_interrupt_marker(&value) {
             return;
         }
 

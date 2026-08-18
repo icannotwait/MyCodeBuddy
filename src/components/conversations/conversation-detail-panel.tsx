@@ -54,7 +54,6 @@ import {
   type ConversationStatus,
   type EventEnvelope,
 } from "@/lib/types"
-import { useRouter } from "next/navigation"
 import { getAgentLabel } from "@/lib/custom-agents"
 import {
   getSavedModeId,
