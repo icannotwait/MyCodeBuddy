@@ -139,8 +139,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20260808_000001_custom_agent_supports_mcp::Migration),
             Box::new(m20260809_000001_completion_protocol_v2_only::Migration),
             Box::new(m20260811_000001_simple_workflows::Migration),
-            Box::new(m20260817_000001_work_task_conversation_title::Migration),
             Box::new(m20260817_000001_delegation_orchestration_bindings::Migration),
+            Box::new(m20260817_000001_work_task_conversation_title::Migration),
         ]
     }
 }
