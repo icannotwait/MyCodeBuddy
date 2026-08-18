@@ -1674,8 +1674,9 @@ impl DelegationListener {
                 crate::acp::delegation::types::OrchestrationBindingQueryError::Failed,
             );
         };
+        let page_limit = req.page_limit;
         match runs
-            .get_orchestration_binding_page(parent_id, req.query())
+            .get_orchestration_binding_page_with_limit(parent_id, req.query(), page_limit)
             .await
         {
             Ok(page) => serde_json::to_value(page).unwrap_or_else(|_| {
@@ -4797,6 +4798,7 @@ mod tests {
                     token: token.into(),
                     namespace: "brainstorm-to-delivery".into(),
                     limit: 100,
+                    page_limit: None,
                     snapshot_id: None,
                     cursor: None,
                 })
@@ -4815,6 +4817,110 @@ mod tests {
                 .orchestration_binding_query_auth_context("root")
                 .await,
             Err(OrchestrationBindingQueryAuthError::NoActiveConversation)
+        );
+    }
+
+    #[tokio::test]
+    async fn orchestration_binding_private_page_limit_preserves_opaque_continuation_rows() {
+        use crate::acp::delegation::run_store::RunStore;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
+        use sea_orm::ConnectionTrait;
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/binding-private-page-limit").await;
+        let parent_id = seed_conversation(&db, folder, AgentType::Codex).await;
+        let child_id = seed_conversation(&db, folder, AgentType::Codex).await;
+        db.conn
+            .execute_unprepared(&format!(
+                "INSERT INTO delegation_task_runs (task_id, root_task_id, generation, \
+                 parent_conversation_id, child_conversation_id, agent_type, admission_class, \
+                 lineage_root_task_id, work_unit_key, history_only, status, created_at, updated_at) \
+                 VALUES \
+                 ('page-a', 'page-a', 1, {parent_id}, {child_id}, 'codex', 'normal_revision', \
+                  'page-a', 'unit-a', 0, 'completed', '2026-08-17T08:00:00Z', '2026-08-17T08:00:00Z'), \
+                 ('page-b', 'page-b', 2, {parent_id}, {child_id}, 'codex', 'normal_revision', \
+                  'page-b', 'unit-b', 0, 'completed', '2026-08-17T08:00:01Z', '2026-08-17T08:00:01Z'), \
+                 ('page-c', 'page-c', 3, {parent_id}, {child_id}, 'codex', 'normal_revision', \
+                  'page-c', 'unit-c', 0, 'completed', '2026-08-17T08:00:02Z', '2026-08-17T08:00:02Z')"
+            ))
+            .await
+            .unwrap();
+
+        let runs = Arc::new(RunStore::new(Arc::clone(&db)));
+        let broker = Arc::new(
+            DelegationBroker::new(
+                Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+                Arc::new(AlwaysRootLookup) as Arc<dyn ConversationDepthLookup>,
+            )
+            .with_run_store(runs),
+        );
+        let tokens = Arc::new(TokenRegistry::default());
+        tokens
+            .register(
+                "root".into(),
+                TokenEntry {
+                    parent_connection_id: "parent-conn".into(),
+                    working_dir: test_working_dir(),
+                    coordination_v1: true,
+                    delegation_continuation_v1: true,
+                    role: CompanionRole::Root,
+                    workflow_v2: false,
+                    completion_v2: false,
+                    bound_task_id: None,
+                },
+            )
+            .await;
+        let listener = make_listener(broker, tokens, Some(parent_id));
+
+        let first = listener
+            .process_orchestration_bindings(BrokerOrchestrationBindingsRequest {
+                token: "root".into(),
+                namespace: "brainstorm-to-delivery".into(),
+                limit: 3,
+                page_limit: Some(1),
+                snapshot_id: None,
+                cursor: None,
+            })
+            .await;
+        assert_eq!(first["page_start"], 0);
+        assert_eq!(first["runs"].as_array().unwrap().len(), 1);
+        assert_eq!(first["runs"][0]["task_id"], "page-a");
+        assert_eq!(first["complete"], false);
+        let snapshot_id = first["snapshot_id"].as_str().unwrap().to_string();
+        let cursor = first["next_cursor"]
+            .as_str()
+            .expect("private page boundary must receive an opaque cursor")
+            .to_string();
+        assert!((1..=128).contains(&cursor.len()));
+
+        let continuation = BrokerOrchestrationBindingsRequest {
+            token: "root".into(),
+            namespace: "brainstorm-to-delivery".into(),
+            limit: 3,
+            page_limit: Some(2),
+            snapshot_id: Some(snapshot_id),
+            cursor: Some(cursor.clone()),
+        };
+        let second = listener
+            .process_orchestration_bindings(continuation.clone())
+            .await;
+        assert_eq!(second["page_start"], 1);
+        assert_eq!(second["request_cursor"], cursor);
+        assert_eq!(second["next_cursor"], Value::Null);
+        assert_eq!(second["complete"], true);
+        assert_eq!(
+            second["runs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["task_id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["page-b", "page-c"]
+        );
+        assert_eq!(
+            listener.process_orchestration_bindings(continuation).await,
+            second,
+            "the same private page request must replay exactly"
         );
     }
 

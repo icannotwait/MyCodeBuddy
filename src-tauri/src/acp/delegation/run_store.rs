@@ -2193,9 +2193,19 @@ impl RunStore {
         parent_id: i32,
         request: OrchestrationBindingQueryRequest,
     ) -> Result<DelegationOrchestrationBindingPage, OrchestrationBindingQueryError> {
+        self.get_orchestration_binding_page_with_limit(parent_id, request, None)
+            .await
+    }
+
+    pub async fn get_orchestration_binding_page_with_limit(
+        &self,
+        parent_id: i32,
+        request: OrchestrationBindingQueryRequest,
+        page_limit: Option<u16>,
+    ) -> Result<DelegationOrchestrationBindingPage, OrchestrationBindingQueryError> {
         let namespace = request.namespace.clone();
         self.orchestration_binding_snapshots
-            .page_with_loader(parent_id, request, Utc::now(), || async {
+            .page_with_loader_limit(parent_id, request, page_limit, Utc::now(), || async {
                 materialize_binding_rows(&self.db.conn, parent_id, &namespace).await
             })
             .await

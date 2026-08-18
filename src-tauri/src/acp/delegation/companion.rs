@@ -63,8 +63,8 @@ use crate::acp::delegation::transport::{
     CancelDelegationReason, CompanionRole,
 };
 use crate::acp::delegation::types::{
-    validate_correlation_id, DelegationReturnWhen, OrchestrationBindingQueryError,
-    OrchestrationBindingQueryRequest,
+    validate_correlation_id, DelegationOrchestrationBindingPage, DelegationReturnWhen,
+    OrchestrationBindingQueryError, OrchestrationBindingQueryRequest,
 };
 use crate::acp::delegation::workflow::{
     CompleteWorkRequest, WorkflowIndexOmissionStep, WorkflowStateIndexDto,
@@ -102,6 +102,9 @@ pub const TOOL_SCHEMA_JSON: &str = include_str!("tool_schema.json");
 
 pub const GET_WORKFLOW_STATE_MAX_RESULT_BYTES: usize = 7_680;
 pub const GET_WORKFLOW_STATE_MAX_REQUEST_ID_BYTES: usize = 256;
+
+pub const GET_ORCHESTRATION_BINDINGS_MAX_RESULT_BYTES: usize = 7_680;
+pub const GET_ORCHESTRATION_BINDINGS_MAX_REQUEST_ID_BYTES: usize = 256;
 
 /// Grok stdio host splits JSONL at 8,192 bytes without reassembly. Keep the
 /// same 512-byte headroom used by `tools/list` / `get_workflow_state`.
@@ -650,17 +653,21 @@ async fn build_tools_call_spawn(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    if matches!(name.as_str(), "get_workflow_state" | "get_session_info")
-        && serde_json::to_vec(&id)
-            .map(|serialized| {
-                serialized.len()
-                    > if name == "get_session_info" {
-                        GET_SESSION_INFO_MAX_REQUEST_ID_BYTES
-                    } else {
-                        GET_WORKFLOW_STATE_MAX_REQUEST_ID_BYTES
-                    }
-            })
-            .unwrap_or(true)
+    if matches!(
+        name.as_str(),
+        "get_workflow_state" | "get_session_info" | "get_delegation_orchestration_bindings"
+    ) && serde_json::to_vec(&id)
+        .map(|serialized| {
+            serialized.len()
+                > if name == "get_session_info" {
+                    GET_SESSION_INFO_MAX_REQUEST_ID_BYTES
+                } else if name == "get_delegation_orchestration_bindings" {
+                    GET_ORCHESTRATION_BINDINGS_MAX_REQUEST_ID_BYTES
+                } else {
+                    GET_WORKFLOW_STATE_MAX_REQUEST_ID_BYTES
+                }
+        })
+        .unwrap_or(true)
     {
         return LineAction::Respond(err(
             Value::Null,
@@ -773,21 +780,11 @@ async fn build_tools_call_spawn(
                 token: ctx.token.clone(),
                 namespace: query.namespace,
                 limit: query.limit,
+                page_limit: None,
                 snapshot_id: query.snapshot_id,
                 cursor: query.cursor,
             };
-            let round_trip =
-                Box::pin(
-                    async move { client_orchestration_bindings_round_trip(&socket, &req).await },
-                );
-            register_and_spawn(
-                inflight,
-                id,
-                None,
-                round_trip,
-                render_orchestration_binding_page,
-            )
-            .await
+            register_and_spawn_orchestration_bindings(inflight, id, socket, req).await
         }
         "cancel_delegation" => {
             let task_id = match arguments.get("task_id").and_then(|v| v.as_str()) {
@@ -1386,22 +1383,175 @@ fn render_workflow_result(outcome: &Value) -> Value {
 
 fn render_orchestration_binding_page(outcome: &Value) -> Value {
     let is_error = outcome.get("error").is_some();
-    let content = if is_error {
-        vec![json!({
-            "type": "text",
-            "text": outcome
-                .pointer("/error/message")
-                .and_then(Value::as_str)
-                .unwrap_or("orchestration binding query failed"),
-        })]
+    let text = if is_error {
+        outcome
+            .pointer("/error/message")
+            .and_then(Value::as_str)
+            .unwrap_or("orchestration binding query failed")
+            .to_string()
     } else {
-        Vec::new()
+        serde_json::to_string(outcome).unwrap_or_else(|_| outcome.to_string())
     };
     json!({
-        "content": content,
+        "content": [{ "type": "text", "text": text }],
         "isError": is_error,
         "structuredContent": outcome.clone(),
     })
+}
+
+const ORCHESTRATION_BINDING_CURSOR_BUDGET_PLACEHOLDER: &str = "AAAAAAAAAAAAAAAAAAAAAA";
+
+enum OrchestrationBindingBudgetDecision {
+    Response(JsonRpcResponse),
+    RetryWithPageLimit(u16),
+}
+
+fn bounded_orchestration_binding_error(id: Value, code: &str) -> JsonRpcResponse {
+    let message = match code {
+        "orchestration_binding_query_invalid" => "invalid orchestration binding query",
+        "orchestration_binding_query_too_large" => {
+            "orchestration binding query exceeds the row limit"
+        }
+        "orchestration_binding_snapshot_stale" => "orchestration binding snapshot is stale",
+        "payload_too_large" => {
+            "orchestration binding row exceeds the 7680-byte stdio transport budget"
+        }
+        _ => "orchestration binding query failed",
+    };
+    ok(
+        id,
+        render_orchestration_binding_page(&json!({
+            "error": { "code": code, "message": message }
+        })),
+    )
+}
+
+fn bounded_orchestration_binding_jsonrpc_error(id: Value) -> JsonRpcResponse {
+    err(
+        id,
+        -32603,
+        "get_delegation_orchestration_bindings response failed",
+    )
+}
+
+fn stable_orchestration_binding_error_code(outcome: &Value) -> &'static str {
+    match outcome.pointer("/error/code").and_then(Value::as_str) {
+        Some("orchestration_binding_query_invalid") => "orchestration_binding_query_invalid",
+        Some("orchestration_binding_query_too_large") => "orchestration_binding_query_too_large",
+        Some("orchestration_binding_snapshot_stale") => "orchestration_binding_snapshot_stale",
+        _ => "orchestration_binding_query_failed",
+    }
+}
+
+fn orchestration_binding_page_candidate(
+    id: &Value,
+    page: &DelegationOrchestrationBindingPage,
+    included: usize,
+) -> Result<JsonRpcResponse, serde_json::Error> {
+    let mut candidate = page.clone();
+    candidate.runs.truncate(included);
+    candidate.next_cursor = Some(ORCHESTRATION_BINDING_CURSOR_BUDGET_PLACEHOLDER.into());
+    candidate.complete = false;
+    let outcome = serde_json::to_value(candidate)?;
+    Ok(ok(id.clone(), render_orchestration_binding_page(&outcome)))
+}
+
+fn largest_fitting_orchestration_binding_page_limit(
+    id: &Value,
+    page: &DelegationOrchestrationBindingPage,
+    max_bytes: usize,
+) -> Result<Option<u16>, serde_json::Error> {
+    if page.runs.is_empty() {
+        return Ok(None);
+    }
+
+    let mut low = 1usize;
+    let mut high = page.runs.len();
+    let mut best = None;
+    while low <= high {
+        let mid = low + (high - low) / 2;
+        let candidate = orchestration_binding_page_candidate(id, page, mid)?;
+        if serialize_jsonrpc_line(&candidate)?.len() <= max_bytes {
+            best = Some(mid);
+            low = mid.saturating_add(1);
+        } else if mid == 1 {
+            break;
+        } else {
+            high = mid - 1;
+        }
+    }
+
+    best.map(u16::try_from).transpose().map_err(|_| {
+        serde_json::Error::io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "orchestration binding page limit exceeds u16",
+        ))
+    })
+}
+
+fn orchestration_binding_budget_decision(
+    id: &Value,
+    outcome: Value,
+    max_bytes: usize,
+) -> Result<OrchestrationBindingBudgetDecision, serde_json::Error> {
+    let preferred = ok(id.clone(), render_orchestration_binding_page(&outcome));
+    if serialize_jsonrpc_line(&preferred)?.len() <= max_bytes {
+        return Ok(OrchestrationBindingBudgetDecision::Response(preferred));
+    }
+
+    if outcome.get("error").is_some() {
+        return Ok(OrchestrationBindingBudgetDecision::Response(
+            bounded_orchestration_binding_error(
+                id.clone(),
+                stable_orchestration_binding_error_code(&outcome),
+            ),
+        ));
+    }
+
+    let page = serde_json::from_value::<DelegationOrchestrationBindingPage>(outcome)?;
+    Ok(
+        match largest_fitting_orchestration_binding_page_limit(id, &page, max_bytes)? {
+            Some(page_limit) => OrchestrationBindingBudgetDecision::RetryWithPageLimit(page_limit),
+            None => OrchestrationBindingBudgetDecision::Response(
+                bounded_orchestration_binding_error(id.clone(), "payload_too_large"),
+            ),
+        },
+    )
+}
+
+async fn orchestration_binding_response_with_budget(
+    socket: &str,
+    mut request: BrokerOrchestrationBindingsRequest,
+    id: Value,
+    max_bytes: usize,
+) -> JsonRpcResponse {
+    loop {
+        let response = match client_orchestration_bindings_round_trip(socket, &request).await {
+            Ok(response) => response,
+            Err(_) => return bounded_orchestration_binding_jsonrpc_error(id),
+        };
+        let decision = match orchestration_binding_budget_decision(&id, response.outcome, max_bytes)
+        {
+            Ok(decision) => decision,
+            Err(_) => return bounded_orchestration_binding_jsonrpc_error(id),
+        };
+        match decision {
+            OrchestrationBindingBudgetDecision::Response(response) => {
+                debug_assert!(
+                    serialize_jsonrpc_line(&response).is_ok_and(|line| line.len() <= max_bytes),
+                    "bounded orchestration response must fit the line budget"
+                );
+                return response;
+            }
+            OrchestrationBindingBudgetDecision::RetryWithPageLimit(page_limit) => {
+                let current_limit = request.page_limit.unwrap_or(request.limit);
+                if page_limit == 0 || page_limit >= current_limit {
+                    return bounded_orchestration_binding_error(id, "payload_too_large");
+                }
+                request.page_limit = Some(page_limit);
+            }
+        }
+    }
 }
 
 fn orchestration_binding_query_invalid_response(id: Value) -> LineAction {
@@ -1759,6 +1909,57 @@ async fn register_and_spawn_workflow_state(
                         "get_workflow_state broker round-trip failed",
                     )),
                 }
+            }
+        };
+        SpawnResult {
+            response,
+            after_relay: None,
+        }
+    });
+
+    LineAction::Spawn(SpawnedCall {
+        request_id: id,
+        request_id_key: id_key,
+        future,
+    })
+}
+
+async fn register_and_spawn_orchestration_bindings(
+    inflight: Arc<InflightCalls>,
+    id: Value,
+    socket: String,
+    request: BrokerOrchestrationBindingsRequest,
+) -> LineAction {
+    let (cancel_tx, cancel_rx) = oneshot::channel();
+    let id_key = request_id_key(&id);
+    inflight
+        .register(
+            id_key.clone(),
+            InflightEntry {
+                external_handle: None,
+                cancel_tx,
+            },
+        )
+        .await;
+
+    let id_for_response = id.clone();
+    let id_key_for_task = id_key.clone();
+    let inflight_for_task = inflight.clone();
+    let future = Box::pin(async move {
+        let response = tokio::select! {
+            biased;
+            _ = cancel_rx => {
+                let _ = inflight_for_task.take(&id_key_for_task).await;
+                None
+            }
+            response = orchestration_binding_response_with_budget(
+                &socket,
+                request,
+                id_for_response,
+                GET_ORCHESTRATION_BINDINGS_MAX_RESULT_BYTES,
+            ) => {
+                let _ = inflight_for_task.take(&id_key_for_task).await;
+                Some(response)
             }
         };
         SpawnResult {
@@ -3202,6 +3403,156 @@ mod tests {
             assert_eq!(request.token, "tok");
             assert_eq!(request.namespace, "brainstorm-to-delivery");
             write_frame(&mut stream, &BrokerResponse { outcome })
+                .await
+                .unwrap();
+        });
+        (socket, task)
+    }
+
+    fn large_orchestration_binding_page() -> Value {
+        let runs = (0..20)
+            .map(|index| {
+                let task_id = format!("task-{index:03}-{}", "t".repeat(32));
+                json!({
+                    "task_id": task_id,
+                    "root_task_id": format!("root-{index:03}-{}", "r".repeat(32)),
+                    "previous_task_id": Value::Null,
+                    "lineage_root_task_id": format!("lineage-{index:03}-{}", "l".repeat(32)),
+                    "replaced_task_id": Value::Null,
+                    "replacement_reason": Value::Null,
+                    "generic_generation": index + 1,
+                    "work_unit_key": format!("work-unit-{index:03}-{}", "w".repeat(80)),
+                    "child_conversation_id": 1000 + index,
+                    "agent_type": "grok",
+                    "profile_id": format!("profile-{index:03}-{}", "p".repeat(32)),
+                    "status": "completed",
+                    "orchestration_binding": {
+                        "schema_version": 1,
+                        "namespace": "brainstorm-to-delivery",
+                        "generation": index + 1,
+                        "route_fingerprint": format!("sha256:{}", "a".repeat(64))
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        json!({
+            "schema_version": 1,
+            "namespace": "brainstorm-to-delivery",
+            "snapshot_id": "1a641e16-36f4-4ec5-aa4f-18d18e6ab107",
+            "snapshot_revision": "17",
+            "snapshot_created_at": "2026-08-17T08:00:00Z",
+            "snapshot_expires_at": "2026-08-17T08:01:00Z",
+            "total_rows": 25,
+            "page_start": 5,
+            "request_cursor": "request-cursor-opaque",
+            "runs": runs,
+            "next_cursor": Value::Null,
+            "complete": true
+        })
+    }
+
+    fn transport_sized_orchestration_page(page: &Value, page_limit: usize) -> Value {
+        let mut bounded = page.clone();
+        let runs = bounded["runs"].as_array_mut().unwrap();
+        assert!((1..runs.len()).contains(&page_limit));
+        runs.truncate(page_limit);
+        bounded["next_cursor"] = json!("transport-page-cursorx");
+        bounded["complete"] = json!(false);
+        bounded
+    }
+
+    #[cfg(windows)]
+    fn orchestration_broker_with_adaptive_page(
+        page: Value,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use crate::acp::delegation::transport::{
+            read_frame, write_frame, BrokerMessage, BrokerResponse,
+        };
+        use tokio::net::windows::named_pipe::ServerOptions;
+
+        let pipe_name = format!(
+            r"\\.\pipe\codeg-binding-budget-test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        );
+        let mut first_server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&pipe_name)
+            .unwrap();
+        let pipe_name_for_task = pipe_name.clone();
+        let task = tokio::spawn(async move {
+            first_server.connect().await.unwrap();
+            let mut second_server = ServerOptions::new().create(&pipe_name_for_task).unwrap();
+            let first: BrokerMessage = read_frame(&mut first_server).await.unwrap();
+            let first_wire = serde_json::to_value(&first).unwrap();
+            assert!(first_wire.get("page_limit").is_none());
+            write_frame(
+                &mut first_server,
+                &BrokerResponse {
+                    outcome: page.clone(),
+                },
+            )
+            .await
+            .unwrap();
+
+            second_server.connect().await.unwrap();
+            let second: BrokerMessage = read_frame(&mut second_server).await.unwrap();
+            let second_wire = serde_json::to_value(&second).unwrap();
+            let page_limit = second_wire["page_limit"]
+                .as_u64()
+                .expect("oversized page must be retried with a private page limit")
+                as usize;
+            assert_eq!(second_wire["limit"], 100);
+            assert_eq!(second_wire["snapshot_id"], first_wire["snapshot_id"]);
+            assert_eq!(second_wire["cursor"], first_wire["cursor"]);
+            let outcome = transport_sized_orchestration_page(&page, page_limit);
+            write_frame(&mut second_server, &BrokerResponse { outcome })
+                .await
+                .unwrap();
+        });
+        (pipe_name, task)
+    }
+
+    #[cfg(unix)]
+    fn orchestration_broker_with_adaptive_page(
+        page: Value,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use crate::acp::delegation::transport::{
+            read_frame, write_frame, BrokerMessage, BrokerResponse,
+        };
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("binding-budget.sock");
+        let socket = socket_path.to_string_lossy().to_string();
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let task = tokio::spawn(async move {
+            let _dir = dir;
+            let (mut first_stream, _) = listener.accept().await.unwrap();
+            let first: BrokerMessage = read_frame(&mut first_stream).await.unwrap();
+            let first_wire = serde_json::to_value(&first).unwrap();
+            assert!(first_wire.get("page_limit").is_none());
+            write_frame(
+                &mut first_stream,
+                &BrokerResponse {
+                    outcome: page.clone(),
+                },
+            )
+            .await
+            .unwrap();
+
+            let (mut second_stream, _) = listener.accept().await.unwrap();
+            let second: BrokerMessage = read_frame(&mut second_stream).await.unwrap();
+            let second_wire = serde_json::to_value(&second).unwrap();
+            let page_limit = second_wire["page_limit"]
+                .as_u64()
+                .expect("oversized page must be retried with a private page limit")
+                as usize;
+            assert_eq!(second_wire["limit"], 100);
+            assert_eq!(second_wire["snapshot_id"], first_wire["snapshot_id"]);
+            assert_eq!(second_wire["cursor"], first_wire["cursor"]);
+            let outcome = transport_sized_orchestration_page(&page, page_limit);
+            write_frame(&mut second_stream, &BrokerResponse { outcome })
                 .await
                 .unwrap();
         });
@@ -5830,7 +6181,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn orchestration_binding_query_raw_call_is_strict_and_structured_only() {
+    async fn orchestration_binding_query_raw_call_is_strict_and_text_compatible() {
         let production = CompanionFeatures {
             delegation: true,
             coordination_v1: true,
@@ -5936,8 +6287,216 @@ mod tests {
         server.await.unwrap();
         let result = response.result.unwrap();
         assert_eq!(result["structuredContent"], page);
-        assert_eq!(result["content"], json!([]));
+        let text = result["content"][0]["text"]
+            .as_str()
+            .expect("successful binding page must be available to text-only MCP hosts");
+        assert_eq!(serde_json::from_str::<Value>(text).unwrap(), page);
         assert_eq!(result["isError"], false);
+    }
+
+    #[tokio::test]
+    async fn orchestration_binding_query_large_page_is_text_compatible_and_grok_safe() {
+        let production = CompanionFeatures {
+            delegation: true,
+            coordination_v1: true,
+            feedback: false,
+            ask: false,
+            sessions: false,
+            workflow_v2: false,
+            completion_v2: false,
+        };
+        let page = large_orchestration_binding_page();
+        let id = json!("binding-budget");
+        let preferred = ok(id.clone(), render_orchestration_binding_page(&page));
+        let preferred_bytes = serialize_jsonrpc_line(&preferred).unwrap().len();
+        assert!(
+            preferred_bytes > 8_192,
+            "fixture must cross Grok's split boundary, got {preferred_bytes} bytes"
+        );
+
+        let (socket_path, server) = orchestration_broker_with_adaptive_page(page.clone());
+        let mut context = ctx_with(production);
+        context.socket_path = socket_path;
+        let call = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {
+                "name": "get_delegation_orchestration_bindings",
+                "arguments": {
+                    "namespace": "brainstorm-to-delivery",
+                    "limit": 100,
+                    "snapshot_id": page["snapshot_id"],
+                    "cursor": page["request_cursor"]
+                }
+            }
+        })
+        .to_string();
+        let LineAction::Spawn(spawned) =
+            dispatch_line(&context, Arc::new(InflightCalls::new()), &call).await
+        else {
+            panic!("valid query must reach the broker")
+        };
+        let response = spawned.future.await.response.unwrap();
+        let line = serialize_jsonrpc_line(&response).unwrap();
+        assert!(
+            line.len() <= 7_680,
+            "binding page JSONL is {} bytes; Grok-safe limit is 7680 bytes",
+            line.len()
+        );
+        server.await.unwrap();
+
+        let result = response.result.unwrap();
+        let structured = &result["structuredContent"];
+        let returned_runs = structured["runs"].as_array().unwrap();
+        let original_runs = page["runs"].as_array().unwrap();
+        assert!((1..original_runs.len()).contains(&returned_runs.len()));
+        assert_eq!(returned_runs, &original_runs[..returned_runs.len()]);
+        assert_eq!(structured["total_rows"], 25);
+        assert_eq!(structured["page_start"], 5);
+        assert_eq!(structured["complete"], false);
+        assert!(structured["next_cursor"].as_str().is_some());
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert_eq!(serde_json::from_str::<Value>(text).unwrap(), *structured);
+        assert_eq!(result["isError"], false);
+
+        let mut one_more = structured.clone();
+        one_more["runs"]
+            .as_array_mut()
+            .unwrap()
+            .push(original_runs[returned_runs.len()].clone());
+        let one_more_response = ok(
+            json!("binding-budget"),
+            render_orchestration_binding_page(&one_more),
+        );
+        assert!(serialize_jsonrpc_line(&one_more_response).unwrap().len() > 7_680);
+    }
+
+    #[tokio::test]
+    async fn orchestration_binding_query_single_oversized_row_returns_bounded_typed_error() {
+        let mut page = large_orchestration_binding_page();
+        let pathological = "quote\"slash\\line\n\u{754c}".repeat(1_000);
+        let mut row = page["runs"][0].clone();
+        row["work_unit_key"] = json!(pathological);
+        page["runs"] = json!([row]);
+        page["total_rows"] = json!(1);
+        page["page_start"] = json!(0);
+        page["request_cursor"] = Value::Null;
+        page["complete"] = json!(true);
+
+        let (socket_path, server) = orchestration_broker_with_outcome(page);
+        let mut context = ctx_with(CompanionFeatures {
+            delegation: true,
+            coordination_v1: true,
+            feedback: false,
+            ask: false,
+            sessions: false,
+            workflow_v2: false,
+            completion_v2: false,
+        });
+        context.socket_path = socket_path;
+        let id =
+            ascii_string_id_with_serialized_len(GET_ORCHESTRATION_BINDINGS_MAX_REQUEST_ID_BYTES);
+        let call = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {
+                "name": "get_delegation_orchestration_bindings",
+                "arguments": { "namespace": "brainstorm-to-delivery" }
+            }
+        })
+        .to_string();
+        let LineAction::Spawn(spawned) =
+            dispatch_line(&context, Arc::new(InflightCalls::new()), &call).await
+        else {
+            panic!("valid query must reach the broker")
+        };
+        let response = spawned.future.await.response.unwrap();
+        server.await.unwrap();
+        let line = serialize_jsonrpc_line(&response).unwrap();
+        assert!(line.len() <= GET_ORCHESTRATION_BINDINGS_MAX_RESULT_BYTES);
+        let result = response.result.unwrap();
+        assert_eq!(result["isError"], true);
+        assert_eq!(
+            result["structuredContent"]["error"]["code"],
+            "payload_too_large"
+        );
+    }
+
+    #[tokio::test]
+    async fn orchestration_binding_query_oversized_broker_error_keeps_stable_code_and_budget() {
+        let source_message = "stale-snapshot-quote\"slash\\\u{754c}".repeat(1_000);
+        let outcome = json!({
+            "error": {
+                "code": "orchestration_binding_snapshot_stale",
+                "message": source_message
+            }
+        });
+        let (socket_path, server) = orchestration_broker_with_outcome(outcome);
+        let mut context = ctx_with(CompanionFeatures {
+            delegation: true,
+            coordination_v1: true,
+            feedback: false,
+            ask: false,
+            sessions: false,
+            workflow_v2: false,
+            completion_v2: false,
+        });
+        context.socket_path = socket_path;
+        let id =
+            ascii_string_id_with_serialized_len(GET_ORCHESTRATION_BINDINGS_MAX_REQUEST_ID_BYTES);
+        let call = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {
+                "name": "get_delegation_orchestration_bindings",
+                "arguments": { "namespace": "brainstorm-to-delivery" }
+            }
+        })
+        .to_string();
+        let LineAction::Spawn(spawned) =
+            dispatch_line(&context, Arc::new(InflightCalls::new()), &call).await
+        else {
+            panic!("valid query must reach the broker")
+        };
+        let response = spawned.future.await.response.unwrap();
+        server.await.unwrap();
+        let line = serialize_jsonrpc_line(&response).unwrap();
+        assert!(line.len() <= GET_ORCHESTRATION_BINDINGS_MAX_RESULT_BYTES);
+        assert!(!String::from_utf8(line).unwrap().contains(&source_message));
+        let result = response.result.unwrap();
+        assert_eq!(result["isError"], true);
+        assert_eq!(
+            result["structuredContent"]["error"]["code"],
+            "orchestration_binding_snapshot_stale"
+        );
+        assert_eq!(
+            result["content"][0]["text"],
+            "orchestration binding snapshot is stale"
+        );
+    }
+
+    #[tokio::test]
+    async fn orchestration_binding_query_rejects_oversized_request_id_before_broker_work() {
+        let id = ascii_string_id_with_serialized_len(
+            GET_ORCHESTRATION_BINDINGS_MAX_REQUEST_ID_BYTES + 1,
+        );
+        let call = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {
+                "name": "get_delegation_orchestration_bindings",
+                "arguments": { "namespace": "brainstorm-to-delivery" }
+            }
+        })
+        .to_string();
+        let response =
+            unwrap_respond(dispatch_with_features(HISTORICAL_WORKFLOW_ROOT_FIXTURE, &call).await);
+        assert_eq!(response.id, Value::Null);
+        assert_eq!(response.error.unwrap().code, -32600);
     }
 
     #[tokio::test]

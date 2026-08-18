@@ -161,6 +161,9 @@ pub struct BrokerOrchestrationBindingsRequest {
     pub token: String,
     pub namespace: String,
     pub limit: u16,
+    /// Internal response row ceiling selected after measuring the complete MCP frame.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_limit: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -890,6 +893,7 @@ mod tests {
             token: "secret".into(),
             namespace: "brainstorm-to-delivery".into(),
             limit: 100,
+            page_limit: None,
             snapshot_id: None,
             cursor: None,
         };
@@ -909,6 +913,26 @@ mod tests {
         let mut forged = encoded;
         forged["parent_conversation_id"] = json!(91);
         assert!(serde_json::from_value::<BrokerMessage>(forged).is_err());
+    }
+
+    #[test]
+    fn orchestration_binding_transport_round_trips_private_page_limit() {
+        let wire = json!({
+            "kind": "orchestration_bindings",
+            "token": "secret",
+            "namespace": "brainstorm-to-delivery",
+            "limit": 100,
+            "snapshot_id": "1a641e16-36f4-4ec5-aa4f-18d18e6ab107",
+            "cursor": "opaque-cursor",
+            "page_limit": 7
+        });
+
+        let decoded = serde_json::from_value::<BrokerMessage>(wire)
+            .expect("the companion can privately request a transport-sized page");
+        let encoded = serde_json::to_value(decoded).unwrap();
+        assert_eq!(encoded["page_limit"], 7);
+        assert_eq!(encoded["limit"], 100);
+        assert!(encoded.get("parent_conversation_id").is_none());
     }
 
     #[test]

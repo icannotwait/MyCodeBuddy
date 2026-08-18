@@ -74,6 +74,7 @@ impl OrchestrationBindingSnapshotCache {
             .retain(|_, snapshot| snapshot.parent_id != parent_id);
     }
 
+    #[cfg(test)]
     pub(crate) async fn page_with_loader<F, Fut>(
         &self,
         parent_id: i32,
@@ -87,7 +88,29 @@ impl OrchestrationBindingSnapshotCache {
             Output = Result<Vec<DelegationOrchestrationBindingRun>, OrchestrationBindingQueryError>,
         >,
     {
+        self.page_with_loader_limit(parent_id, request, None, now, loader)
+            .await
+    }
+
+    pub(crate) async fn page_with_loader_limit<F, Fut>(
+        &self,
+        parent_id: i32,
+        request: OrchestrationBindingQueryRequest,
+        page_limit: Option<u16>,
+        now: DateTime<Utc>,
+        loader: F,
+    ) -> Result<DelegationOrchestrationBindingPage, OrchestrationBindingQueryError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<
+            Output = Result<Vec<DelegationOrchestrationBindingRun>, OrchestrationBindingQueryError>,
+        >,
+    {
         request.validate()?;
+        let effective_limit = page_limit.unwrap_or(request.limit);
+        if effective_limit == 0 || effective_limit > request.limit {
+            return Err(OrchestrationBindingQueryError::Invalid);
+        }
         let _read_guard = self.mutation_gate.read().await;
 
         if let (Some(snapshot_id), Some(cursor)) =
@@ -100,7 +123,7 @@ impl OrchestrationBindingSnapshotCache {
             let current_revision = state.revisions.get(&parent_id).copied().unwrap_or(0);
             let snapshot = state
                 .snapshots
-                .get(snapshot_id)
+                .get_mut(snapshot_id)
                 .ok_or(OrchestrationBindingQueryError::SnapshotStale)?;
             if snapshot.parent_id != parent_id || snapshot.revision != current_revision {
                 return Err(OrchestrationBindingQueryError::SnapshotStale);
@@ -117,6 +140,7 @@ impl OrchestrationBindingSnapshotCache {
                 snapshot,
                 start,
                 Some(cursor.to_string()),
+                effective_limit,
             ));
         }
 
@@ -139,14 +163,7 @@ impl OrchestrationBindingSnapshotCache {
         let expires_at = now
             + chrono::Duration::from_std(ORCHESTRATION_BINDING_SNAPSHOT_TTL)
                 .expect("60-second TTL fits chrono");
-        let mut cursors = HashMap::new();
-        let mut cursor_by_start = HashMap::new();
-        for start in (usize::from(request.limit)..rows.len()).step_by(usize::from(request.limit)) {
-            let cursor = URL_SAFE_NO_PAD.encode(uuid::Uuid::new_v4().as_bytes());
-            cursors.insert(cursor.clone(), start);
-            cursor_by_start.insert(start, cursor);
-        }
-        let snapshot = SnapshotEntry {
+        let mut snapshot = SnapshotEntry {
             snapshot_id: snapshot_id.clone(),
             parent_id,
             namespace: request.namespace,
@@ -155,10 +172,10 @@ impl OrchestrationBindingSnapshotCache {
             created_at: now,
             expires_at,
             rows,
-            cursors,
-            cursor_by_start,
+            cursors: HashMap::new(),
+            cursor_by_start: HashMap::new(),
         };
-        let page = page_from_snapshot(&snapshot, 0, None);
+        let page = page_from_snapshot(&mut snapshot, 0, None, effective_limit);
         let mut state = self.state.lock().await;
         state.snapshots.retain(|_, entry| entry.expires_at > now);
         state.snapshots.insert(snapshot_id.clone(), snapshot);
@@ -168,14 +185,25 @@ impl OrchestrationBindingSnapshotCache {
 }
 
 fn page_from_snapshot(
-    snapshot: &SnapshotEntry,
+    snapshot: &mut SnapshotEntry,
     start: usize,
     request_cursor: Option<String>,
+    page_limit: u16,
 ) -> DelegationOrchestrationBindingPage {
     let end = start
-        .saturating_add(usize::from(snapshot.limit))
+        .saturating_add(usize::from(page_limit))
         .min(snapshot.rows.len());
     let complete = end == snapshot.rows.len();
+    let next_cursor = if complete {
+        None
+    } else if let Some(cursor) = snapshot.cursor_by_start.get(&end) {
+        Some(cursor.clone())
+    } else {
+        let cursor = URL_SAFE_NO_PAD.encode(uuid::Uuid::new_v4().as_bytes());
+        snapshot.cursors.insert(cursor.clone(), end);
+        snapshot.cursor_by_start.insert(end, cursor.clone());
+        Some(cursor)
+    };
     DelegationOrchestrationBindingPage {
         schema_version: 1,
         namespace: snapshot.namespace.clone(),
@@ -187,9 +215,7 @@ fn page_from_snapshot(
         page_start: start as u64,
         request_cursor,
         runs: snapshot.rows[start..end].to_vec(),
-        next_cursor: (!complete)
-            .then(|| snapshot.cursor_by_start.get(&end).cloned())
-            .flatten(),
+        next_cursor,
         complete,
     }
 }
@@ -368,6 +394,24 @@ mod tests {
                 request.validate(),
                 Err(OrchestrationBindingQueryError::Invalid)
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn orchestration_binding_private_page_limit_cannot_be_zero_or_exceed_public_limit() {
+        let now = Utc.with_ymd_and_hms(2026, 8, 17, 8, 0, 0).unwrap();
+        for page_limit in [0, 4] {
+            let cache = OrchestrationBindingSnapshotCache::new();
+            let result = cache
+                .page_with_loader_limit(
+                    10,
+                    query("brainstorm-to-delivery", 3),
+                    Some(page_limit),
+                    now,
+                    || async { Ok(vec![sample_row("a"), sample_row("b"), sample_row("c")]) },
+                )
+                .await;
+            assert_eq!(result, Err(OrchestrationBindingQueryError::Invalid));
         }
     }
 
