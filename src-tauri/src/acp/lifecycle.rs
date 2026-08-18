@@ -1211,15 +1211,10 @@ fn is_delegation_invocation(title: &str, raw_input: Option<&str>) -> bool {
 /// Returns `None` when `raw_input` is absent, not JSON, has no locatable
 /// complete key (missing/invalid `correlation_id`, missing task, etc.) — the
 /// broker then treats the entry as unkeyed until a later complete backfill.
-fn extract_delegation_match_key(raw_input: Option<&str>) -> Option<DelegationMatchKey> {
-    let raw = raw_input?;
-    let parsed: serde_json::Value = serde_json::from_str(raw).ok()?;
-    let args = find_delegation_args(&parsed, 0)?;
-    // Match MCP listener: reject blank/whitespace-only `task` for both
-    // Continue and Delegate, but store the original nonblank bytes (listener
-    // gates with `!s.trim().is_empty()` then keeps `s.to_string()` untrimmed).
-    // Admitting `""` / `"   "` as a complete key freezes K_blank and conflict-
-    // tombstones a later valid re-emit, so the real MCP call can never bind.
+pub(crate) fn extract_delegation_match_key_from_value(
+    value: &serde_json::Value,
+) -> Option<DelegationMatchKey> {
+    let args = find_delegation_args(value, 0)?;
     let task = args.get("task").and_then(|v| v.as_str())?;
     if task.trim().is_empty() {
         return None;
@@ -1229,9 +1224,6 @@ fn extract_delegation_match_key(raw_input: Option<&str>) -> Option<DelegationMat
     validate_correlation_id(correlation_id).ok()?;
     let correlation_id = correlation_id.to_string();
 
-    // Continue first: `task_id` discriminates continue_delegation.
-    // Normalize like the MCP listener (`s.trim()`) so ACP/MCP exact-match
-    // keys agree for accepted inputs such as `"task_id":" run-42 "`.
     if let Some(raw_task_id) = args.get("task_id").and_then(|v| v.as_str()) {
         let target_task_id = raw_task_id.trim();
         if target_task_id.is_empty() {
@@ -1244,8 +1236,6 @@ fn extract_delegation_match_key(raw_input: Option<&str>) -> Option<DelegationMat
         });
     }
 
-    // Delegate: parse `agent_type` through the same serde path the MCP listener
-    // uses so the stored enum equals `DelegationRequest::agent_type`.
     let at = args.get("agent_type")?;
     let agent_type: AgentType = serde_json::from_value(at.clone()).ok()?;
     let working_dir = args
@@ -1258,6 +1248,12 @@ fn extract_delegation_match_key(raw_input: Option<&str>) -> Option<DelegationMat
         task,
         working_dir,
     })
+}
+
+fn extract_delegation_match_key(raw_input: Option<&str>) -> Option<DelegationMatchKey> {
+    let raw = raw_input?;
+    let parsed: serde_json::Value = serde_json::from_str(raw).ok()?;
+    extract_delegation_match_key_from_value(&parsed)
 }
 
 /// True when an ACP `ToolCallUpdate.status` string is terminal for delegation
@@ -1432,7 +1428,10 @@ async fn register_delegation_tool_call_from_event(
 
 #[cfg(test)]
 mod delegation_title_tests {
-    use super::{extract_delegation_match_key, is_delegation_invocation};
+    use super::{
+        extract_delegation_match_key, extract_delegation_match_key_from_value,
+        is_delegation_invocation,
+    };
     use crate::acp::delegation::broker::DelegationMatchKey;
     use crate::models::AgentType;
 
@@ -1830,6 +1829,58 @@ mod delegation_title_tests {
             Some(raw)
         ));
         assert!(extract_delegation_match_key(Some(raw)).is_some());
+    }
+
+    #[test]
+    fn value_helper_matches_string_helper_for_wrapped_delegate_args() {
+        let raw = r#"{"providerIdentifier":"codeg-mcp","toolName":"delegate_to_agent","args":{"agent_type":"codex","task":"build it","correlation_id":"test-corr"}}"#;
+        let value: serde_json::Value = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            extract_delegation_match_key(Some(raw)),
+            extract_delegation_match_key_from_value(&value)
+        );
+        assert_eq!(
+            extract_delegation_match_key_from_value(&value),
+            Some(DelegationMatchKey::Delegate {
+                correlation_id: "test-corr".into(),
+                agent_type: AgentType::Codex,
+                task: "build it".into(),
+                working_dir: None,
+            })
+        );
+    }
+
+    #[test]
+    fn value_helper_accepts_inner_args_object_without_reserializing() {
+        let args = serde_json::json!({
+            "task_id": " run-42 ",
+            "task": "review the revision",
+            "correlation_id": "cont-1"
+        });
+        assert_eq!(
+            extract_delegation_match_key_from_value(&args),
+            Some(DelegationMatchKey::Continue {
+                correlation_id: "cont-1".into(),
+                target_task_id: "run-42".into(),
+                task: "review the revision".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn value_helper_rejects_blank_task_and_invalid_correlation_id() {
+        assert!(extract_delegation_match_key_from_value(&serde_json::json!({
+            "agent_type": "codex",
+            "task": "   ",
+            "correlation_id": "corr-1"
+        }))
+        .is_none());
+        assert!(extract_delegation_match_key_from_value(&serde_json::json!({
+            "agent_type": "codex",
+            "task": "ok",
+            "correlation_id": ".bad"
+        }))
+        .is_none());
     }
 
     #[test]
