@@ -7812,7 +7812,7 @@ branch refs/heads/main";
     fn same_worktree_path(left: &str, right: &str) -> bool {
         let norm = |s: &str| {
             crate::db::service::folder_service::normalize_folder_storage_path(s)
-                .replace('\\', '/')
+                .replace('\\', "/")
                 .trim_end_matches('/')
                 .to_string()
         };
