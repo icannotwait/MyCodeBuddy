@@ -1262,4 +1262,280 @@ mod tests {
             "0 only when Goal is non-active and no episode is open"
         );
     }
+
+    const CODEX_TWO_CYCLE: &str = include_str!("fixtures/codex_goal_autonomous_two_cycles.jsonl");
+
+    fn codex_fixture_lines() -> Vec<&'static str> {
+        CODEX_TWO_CYCLE
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .collect()
+    }
+
+    fn fixture_session_id(lines: &[&str]) -> String {
+        for line in lines {
+            let Ok(value) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            if value.get("type").and_then(Value::as_str) != Some("session_meta") {
+                continue;
+            }
+            if let Some(id) = value
+                .pointer("/payload/id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+            {
+                return id.to_string();
+            }
+        }
+        panic!("fixture must start with session_meta.payload.id");
+    }
+
+    fn payload_turn_id(line: &str) -> Option<String> {
+        serde_json::from_str::<Value>(line)
+            .ok()?
+            .pointer("/payload/turn_id")?
+            .as_str()
+            .map(str::to_string)
+    }
+
+    fn is_event_type(line: &str, payload_type: &str) -> bool {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            return false;
+        };
+        value.get("type").and_then(Value::as_str) == Some("event_msg")
+            && value.pointer("/payload/type").and_then(Value::as_str) == Some(payload_type)
+    }
+
+    fn assistant_output_text(line: &str) -> Option<String> {
+        let value = serde_json::from_str::<Value>(line).ok()?;
+        if value.get("type").and_then(Value::as_str) != Some("response_item") {
+            return None;
+        }
+        let payload = value.get("payload")?;
+        if payload.get("type").and_then(Value::as_str) != Some("message")
+            || payload.get("role").and_then(Value::as_str) != Some("assistant")
+        {
+            return None;
+        }
+        extract_codex_output_text_for_fixture(payload)
+    }
+
+    fn extract_codex_output_text_for_fixture(payload: &Value) -> Option<String> {
+        let content = payload.get("content")?.as_array()?;
+        let mut parts = Vec::new();
+        for item in content {
+            if item.get("type").and_then(Value::as_str) != Some("output_text") {
+                continue;
+            }
+            if let Some(text) = item.get("text").and_then(Value::as_str) {
+                if !text.is_empty() {
+                    parts.push(text);
+                }
+            }
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join(""))
+        }
+    }
+
+    fn split_codex_two_cycle_fixture(
+        lines: &[&str],
+    ) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
+        let mut preamble = Vec::new();
+        let mut cycle1 = Vec::new();
+        let mut cycle2_head = Vec::new();
+        let mut cycle2_tail = Vec::new();
+        let mut stage: u8 = 0;
+        for line in lines {
+            if is_event_type(line, "task_started") {
+                match payload_turn_id(line).as_deref() {
+                    Some("turn_goal_1") => stage = 1,
+                    Some("turn_goal_2") => stage = 2,
+                    _ => {}
+                }
+            }
+            if stage == 2
+                && assistant_output_text(line)
+                    .is_some_and(|text| text.contains("after goal complete"))
+            {
+                stage = 3;
+            }
+            let owned = (*line).to_string();
+            match stage {
+                0 => preamble.push(owned),
+                1 => cycle1.push(owned),
+                2 => cycle2_head.push(owned),
+                _ => cycle2_tail.push(owned),
+            }
+        }
+        (preamble, cycle1, cycle2_head, cycle2_tail)
+    }
+
+    fn write_lines(path: &Path, lines: &[String]) {
+        for line in lines {
+            append_line(path, line);
+        }
+    }
+
+    fn blocks_contain_internal_context(blocks: &[crate::models::message::ContentBlock]) -> bool {
+        use crate::models::message::ContentBlock;
+        blocks.iter().any(|block| match block {
+            ContentBlock::Text { text } | ContentBlock::Thinking { text } => {
+                text.contains("codex_internal_context") || text.contains("Continue working toward")
+            }
+            ContentBlock::ToolUse { input_preview, .. } => input_preview
+                .as_deref()
+                .is_some_and(|text| text.contains("codex_internal_context")),
+            ContentBlock::ToolResult { output_preview, .. } => output_preview
+                .as_deref()
+                .is_some_and(|text| text.contains("codex_internal_context")),
+            _ => false,
+        })
+    }
+
+    fn take_autonomous_turn(adapter: &mut CodexAutonomousAdapter) -> (MessageTurn, u64) {
+        let emitted = adapter.take_emitted();
+        assert!(emitted.settled.is_empty());
+        assert_eq!(emitted.turns.len(), 1);
+        assert_eq!(
+            emitted.turns[0].autonomous_origin,
+            Some(AutonomousTurnOrigin::AgentAutonomous)
+        );
+        assert!(
+            !emitted.turns[0].id.starts_with("item-"),
+            "item-N ids are not canonical"
+        );
+        assert!(
+            !blocks_contain_internal_context(&emitted.turns[0].blocks),
+            "internal context never renders"
+        );
+        assert!(emitted.watermark > 0, "do not emit an unwatermarked turn");
+        let watermark = emitted.watermark;
+        (emitted.turns.into_iter().next().unwrap(), watermark)
+    }
+
+    fn idle_content_hint(adapter: &mut CodexAutonomousAdapter) {
+        adapter.on_raw_dispatch(
+            "session/update",
+            &json!({"update":{
+                "sessionUpdate":"agent_message_chunk",
+                "content":{"type":"text","text":"redacted live hint"}
+            }}),
+            Ownership::Idle,
+        );
+    }
+
+    #[test]
+    fn codex_two_cycle_fixture_keeps_native_ids_after_replay() {
+        let lines = codex_fixture_lines();
+        assert!(
+            !lines.is_empty(),
+            "codex_goal_autonomous_two_cycles.jsonl must contain the two-cycle rollout"
+        );
+        let (preamble, cycle1, cycle2_head, cycle2_tail) = split_codex_two_cycle_fixture(&lines);
+        assert!(
+            !preamble.is_empty() && !cycle1.is_empty() && !cycle2_head.is_empty(),
+            "fixture must include a foreground terminal plus two Goal cycles"
+        );
+
+        let session_id = fixture_session_id(&lines);
+        let (_dir, root) = tmp_sessions();
+        let path = write_rollout(&root, &session_id, &format!("{}\n", preamble.join("\n")));
+        assert_eq!(
+            rollout_session_id(&path).as_deref(),
+            Some(session_id.as_str())
+        );
+
+        let mut adapter = CodexAutonomousAdapter::new_for_test(&session_id, root);
+        adapter.on_session_ready(&session_id);
+
+        feed_goal(&mut adapter, "active", Ownership::Idle);
+        assert!(
+            !adapter.autonomous_busy(),
+            "Goal active alone must not open an episode"
+        );
+        feed_thread(&mut adapter, "active", Ownership::Idle);
+        assert!(adapter.autonomous_busy());
+
+        write_lines(&path, &cycle1);
+        idle_content_hint(&mut adapter);
+        adapter.tail_once();
+        let (first, first_watermark) = take_autonomous_turn(&mut adapter);
+        assert_eq!(first.id, codex_goal_turn_id("turn_goal_1"));
+        let mut last_overlay_watermark = first_watermark;
+
+        feed_thread(&mut adapter, "idle", Ownership::Idle);
+        adapter.tail_once();
+        assert!(
+            !adapter.autonomous_busy(),
+            "first cycle closes on idle + task_complete"
+        );
+
+        feed_thread(&mut adapter, "active", Ownership::Idle);
+        feed_goal(&mut adapter, "complete", Ownership::Idle);
+        assert!(
+            adapter.autonomous_busy(),
+            "Goal complete must not truncate/close the second cycle"
+        );
+
+        write_lines(&path, &cycle2_head);
+        idle_content_hint(&mut adapter);
+        adapter.tail_once();
+        let (second_head, head_watermark) = take_autonomous_turn(&mut adapter);
+        assert_eq!(second_head.id, codex_goal_turn_id("turn_goal_2"));
+        assert_ne!(first.id, second_head.id);
+        last_overlay_watermark = last_overlay_watermark.max(head_watermark);
+
+        write_lines(&path, &cycle2_tail);
+        idle_content_hint(&mut adapter);
+        adapter.tail_once();
+        let (second, second_watermark) = take_autonomous_turn(&mut adapter);
+        assert_eq!(second.id, second_head.id);
+        let second_text = format!("{:?}", second.blocks);
+        assert!(
+            second_text.contains("after goal complete"),
+            "Goal complete must not truncate the second turn: {second_text}"
+        );
+        last_overlay_watermark = last_overlay_watermark.max(second_watermark);
+
+        feed_thread(&mut adapter, "idle", Ownership::Idle);
+        adapter.tail_once();
+        adapter.on_session_load_replay(&json!({
+            "sessionId": session_id,
+            "items": [
+                {"id": "item-1", "type": "message"},
+                {"id": "item-2", "type": "message"},
+                {"id": "item-3", "type": "message"}
+            ]
+        }));
+        adapter.tail_once();
+        let after_replay = adapter.take_emitted();
+        if let Some(turn) = after_replay.turns.first() {
+            assert_eq!(turn.id, second.id);
+            assert!(!turn.id.starts_with("item-"));
+        }
+        last_overlay_watermark = last_overlay_watermark.max(after_replay.watermark);
+
+        let (turns, parser_watermark) =
+            parse_codex_rollout(&path, &session_id).expect("cold parse rollout");
+        assert!(
+            parser_watermark >= last_overlay_watermark,
+            "parser watermark {parser_watermark} must cover last overlay watermark {last_overlay_watermark}"
+        );
+        let autos: Vec<&MessageTurn> = turns
+            .iter()
+            .filter(|turn| turn.autonomous_origin == Some(AutonomousTurnOrigin::AgentAutonomous))
+            .collect();
+        assert_eq!(autos.len(), 2, "two independent agent_autonomous turns");
+        assert_eq!(autos[0].id, first.id);
+        assert_eq!(autos[1].id, second.id);
+        assert!(autos.iter().all(|turn| !turn.id.starts_with("item-")));
+        assert!(turns
+            .iter()
+            .all(|turn| !blocks_contain_internal_context(&turn.blocks)));
+    }
 }

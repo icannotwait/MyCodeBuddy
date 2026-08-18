@@ -1,0 +1,16 @@
+{"timestamp":"2026-08-18T17:00:00Z","type":"session_meta","payload":{"id":"01a014c9-04d4-7b93-9c4a-fixture000001","cwd":"/tmp/redacted"}}
+{"timestamp":"2026-08-18T17:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn_fg_1"}}
+{"timestamp":"2026-08-18T17:00:02Z","type":"event_msg","payload":{"type":"user_message","message":"redacted foreground prompt"}}
+{"timestamp":"2026-08-18T17:00:03Z","type":"event_msg","payload":{"type":"agent_message","message":"redacted foreground reply"}}
+{"timestamp":"2026-08-18T17:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn_fg_1"}}
+{"timestamp":"2026-08-18T17:01:00Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn_goal_1"}}
+{"timestamp":"2026-08-18T17:01:01Z","type":"response_item","payload":{"type":"message","role":"user","id":"msg_goal_ctx_1","content":[{"type":"input_text","text":"<codex_internal_context source=\"goal\">\nContinue working toward the active thread goal.\n</codex_internal_context>"}]}}
+{"timestamp":"2026-08-18T17:01:02Z","type":"response_item","payload":{"type":"reasoning","id":"rs_cycle1","summary":[{"type":"summary_text","text":"redacted cycle-one thought"}]}}
+{"timestamp":"2026-08-18T17:01:03Z","type":"response_item","payload":{"type":"message","role":"assistant","id":"msg_cycle1","content":[{"type":"output_text","text":"redacted cycle-one progress"}]}}
+{"timestamp":"2026-08-18T17:01:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn_goal_1"}}
+{"timestamp":"2026-08-18T17:02:00Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn_goal_2"}}
+{"timestamp":"2026-08-18T17:02:01Z","type":"response_item","payload":{"type":"message","role":"user","id":"msg_goal_ctx_2","content":[{"type":"input_text","text":"<codex_internal_context source=\"goal\">\nContinue working toward the active thread goal.\n</codex_internal_context>"}]}}
+{"timestamp":"2026-08-18T17:02:02Z","type":"response_item","payload":{"type":"reasoning","id":"rs_cycle2","summary":[{"type":"summary_text","text":"redacted cycle-two thought"}]}}
+{"timestamp":"2026-08-18T17:02:03Z","type":"response_item","payload":{"type":"message","role":"assistant","id":"msg_cycle2a","content":[{"type":"output_text","text":"redacted cycle-two start"}]}}
+{"timestamp":"2026-08-18T17:02:04Z","type":"response_item","payload":{"type":"message","role":"assistant","id":"msg_cycle2b","content":[{"type":"output_text","text":"redacted cycle-two after goal complete"}]}}
+{"timestamp":"2026-08-18T17:02:05Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn_goal_2"}}

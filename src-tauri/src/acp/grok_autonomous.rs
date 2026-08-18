@@ -1286,6 +1286,154 @@ mod tests {
         });
     }
 
+    const GROK_SESSION_3806: &str = include_str!("fixtures/grok_autonomous_session_3806.jsonl");
+
+    fn grok_fixture_lines() -> Vec<&'static str> {
+        GROK_SESSION_3806
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .collect()
+    }
+
+    fn is_grok_task_completed_line(line: &str) -> bool {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            return false;
+        };
+        value
+            .pointer("/params/update/sessionUpdate")
+            .and_then(Value::as_str)
+            == Some("task_completed")
+    }
+
+    fn blocks_contain_system_reminder(blocks: &[ContentBlock]) -> bool {
+        blocks.iter().any(|block| match block {
+            ContentBlock::Text { text } | ContentBlock::Thinking { text } => {
+                text.contains("system-reminder")
+            }
+            ContentBlock::ToolUse { input_preview, .. } => input_preview
+                .as_deref()
+                .is_some_and(|text| text.contains("system-reminder")),
+            ContentBlock::ToolResult { output_preview, .. } => output_preview
+                .as_deref()
+                .is_some_and(|text| text.contains("system-reminder")),
+            _ => false,
+        })
+    }
+
+    #[test]
+    fn grok_session_3806_fixture_emits_one_marked_turn_and_covering_watermark() {
+        let lines = grok_fixture_lines();
+        assert!(
+            !lines.is_empty(),
+            "grok_autonomous_session_3806.jsonl must contain the redacted session-3806 sequence"
+        );
+
+        let split = lines
+            .iter()
+            .position(|line| is_grok_task_completed_line(line))
+            .expect("fixture must start the idle sequence at task_completed");
+        let preamble = &lines[..split];
+        let idle = &lines[split..];
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("updates.jsonl");
+        std::fs::write(&path, "").unwrap();
+        for line in preamble {
+            append_line(&path, line);
+        }
+
+        let mut adapter = GrokAutonomousAdapter::new_for_test(path.clone());
+        adapter.on_session_ready("session-3806", &path);
+
+        let mut stable_id: Option<String> = None;
+        let mut last_overlay_watermark = 0u64;
+        let mut upserts = 0usize;
+        let mut terminal_claim: Option<GrokDispatchClaim> = None;
+
+        for line in idle {
+            append_line(&path, line);
+            let value: Value = serde_json::from_str(line).expect("fixture line is JSON");
+            let method = value
+                .get("method")
+                .and_then(Value::as_str)
+                .expect("fixture line has method");
+            let params = value.get("params").cloned().unwrap_or_else(|| json!({}));
+            let kind = params
+                .pointer("/update/sessionUpdate")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let claim = adapter.on_raw_dispatch(method, &params, Ownership::Idle);
+            if kind == "turn_completed" {
+                assert!(
+                    claim.is_idle_terminal(),
+                    "idle turn_completed must not emit a foreground TurnComplete"
+                );
+                assert!(
+                    claim.skip_streaming_reducer(),
+                    "idle terminal must skip the foreground finalize path"
+                );
+                terminal_claim = Some(claim);
+            }
+
+            let emitted = adapter.take_emitted();
+            assert!(emitted.settled.is_empty(), "Grok settled stays empty");
+            for turn in emitted.turns {
+                assert_eq!(
+                    turn.autonomous_origin,
+                    Some(AutonomousTurnOrigin::BackgroundTask)
+                );
+                assert!(
+                    !blocks_contain_system_reminder(&turn.blocks),
+                    "hidden system-reminder must not appear in emitted blocks"
+                );
+                match &stable_id {
+                    None => stable_id = Some(turn.id.clone()),
+                    Some(id) => assert_eq!(
+                        turn.id, *id,
+                        "incremental upserts must keep one stable turn id"
+                    ),
+                }
+                upserts += 1;
+                last_overlay_watermark = emitted.watermark;
+            }
+        }
+
+        let id = stable_id.expect("one marked assistant incrementally upserted");
+        assert!(id.starts_with("grok-autonomous:"));
+        assert!(
+            upserts >= 2,
+            "thought/message/tool updates must upsert the same turn more than once"
+        );
+        assert!(
+            terminal_claim.is_some_and(GrokDispatchClaim::is_idle_terminal),
+            "no foreground TurnComplete signal from the adapter"
+        );
+        assert!(
+            adapter.take_detail_refetch(),
+            "final refetch requested after idle terminal"
+        );
+        assert!(!adapter.autonomous_busy());
+
+        let bytes = std::fs::read(&path).unwrap();
+        let (turns, parser_watermark) = grok_turns_from_bytes(&bytes, "session-3806");
+        assert!(
+            parser_watermark >= last_overlay_watermark,
+            "parser watermark {parser_watermark} must cover last overlay watermark {last_overlay_watermark}"
+        );
+        let autos: Vec<&MessageTurn> = turns
+            .iter()
+            .filter(|turn| turn.autonomous_origin == Some(AutonomousTurnOrigin::BackgroundTask))
+            .collect();
+        assert_eq!(autos.len(), 1);
+        assert_eq!(autos[0].id, id);
+        assert!(
+            turns
+                .iter()
+                .all(|turn| !blocks_contain_system_reminder(&turn.blocks)),
+            "cold parse must also omit system-reminder"
+        );
+    }
+
     fn with_temp_grok_home<T>(home: &std::path::Path, f: impl FnOnce() -> T) -> T {
         use std::ffi::OsString;
         use std::sync::{Mutex, OnceLock};
