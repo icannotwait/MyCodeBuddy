@@ -286,17 +286,9 @@ async fn resolve_shared_connect_target(
         return Err(invalid_shared_field("conversation_id"));
     }
 
-    crate::commands::delegate_access::ensure_connect_delegate_interactive(
-        &state.db,
-        &state.connection_manager,
-        params.agent_type,
-        params.external_session_id.as_deref(),
-        params.conversation_id,
-    )
-    .await
-    .map_err(map_acp_error)?;
-
-    if let Some(conversation_id) = params.conversation_id {
+    // Identity fields must 400 before viewer-lock. A missing conversation
+    // fails closed as delegate_viewer_only/state_unknown inside the lock.
+    let conversation_target = if let Some(conversation_id) = params.conversation_id {
         let conversation =
             crate::db::service::conversation_service::get_by_id(&state.db.conn, conversation_id)
                 .await
@@ -325,6 +317,23 @@ async fn resolve_shared_connect_target(
                 return Err(invalid_shared_field("external_session_id"));
             }
         }
+        Some((conversation, folder))
+    } else {
+        None
+    };
+
+    crate::commands::delegate_access::ensure_connect_delegate_interactive(
+        &state.db,
+        &state.connection_manager,
+        params.agent_type,
+        params.external_session_id.as_deref(),
+        params.conversation_id,
+    )
+    .await
+    .map_err(map_acp_error)?;
+
+    if let Some((conversation, folder)) = conversation_target {
+        let conversation_id = conversation.id;
         crate::commands::delegate_access::ensure_delegate_interactive(
             &state.db,
             &state.connection_manager,

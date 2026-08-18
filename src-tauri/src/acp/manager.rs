@@ -1471,6 +1471,16 @@ impl ConnectionManager {
                     return;
                 }
 
+                // Re-sample immediately before claim. The snapshot used for
+                // reconcile can go stale while that await runs; a queued
+                // prompt plus an old turn_in_flight=false would dispatch
+                // over an in-flight turn.
+                let Some(snapshot) = manager
+                    .shared_runtime_work_snapshot(&db, &connection_id)
+                    .await
+                else {
+                    continue;
+                };
                 let turn_id = uuid::Uuid::new_v4().to_string();
                 let decision = match manager
                     .shared_session_broker
@@ -23230,6 +23240,11 @@ mod tests {
             let (manager, attachment) = ready_manager().await;
             let state = manager.get_state(&attachment.connection_id).await.unwrap();
             state.write().await.turn_in_flight = true;
+            // Let any dispatcher iteration that sampled the old snapshot
+            // finish against the still-empty queue before we publish work.
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
 
             let first = manager
                 .enqueue_shared_prompt(queued_prompt(&attachment, "first", "alpha"))
