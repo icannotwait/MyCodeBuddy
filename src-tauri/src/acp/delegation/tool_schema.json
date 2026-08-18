@@ -40,6 +40,7 @@
       "$defs": {
         "b": {
           "type": "object",
+          "additionalProperties": false,
           "required": [
             "schema_version",
             "namespace",
@@ -89,7 +90,7 @@
             "cursor",
             "deepseek"
           ],
-          "description": "Local agent slug; honor named codeg://agent/<agent_type>."
+          "description": "Honor codeg://agent/<agent_type> slug."
         },
         "profile_id": {
           "type": "string"
@@ -130,7 +131,7 @@
             "admission_failed",
             "admission_unknown"
           ],
-          "description": "admission_failed/admission_unknown: replace, not continue."
+          "description": "admission_failed/admission_unknown: explicit replace, not continue."
         }
       }
     }
@@ -172,12 +173,10 @@
         "limit": {
           "type": "integer",
           "minimum": 1,
-          "maximum": 200,
           "default": 100
         },
         "snapshot_id": {
-          "type": "string",
-          "format": "uuid"
+          "type": "string"
         },
         "cursor": {
           "type": "string",
@@ -203,6 +202,7 @@
       "$defs": {
         "b": {
           "type": "object",
+          "additionalProperties": false,
           "required": [
             "schema_version",
             "namespace",
@@ -273,8 +273,7 @@
           "type": "array",
           "items": {
             "type": "string"
-          },
-          "minItems": 1
+          }
         },
         "wait_ms": {
           "type": "integer",
