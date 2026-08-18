@@ -7978,6 +7978,98 @@ describe("document and full admission CLI", () => {
     assert.deepEqual(blocked.task_bindings, [])
   })
 
+  it("authorizes unbound Design/Plan/final-review rows and still blocks recognized Task keys", () => {
+    const documentRows = [
+      durableRun({
+        task_id: "design-fixer",
+        work_unit_key: "design|docs/foo.md|fixer|codex|none",
+        child_conversation_id: 501,
+        agent_type: "codex",
+        status: "running",
+        orchestration_binding: null,
+      }),
+      durableRun({
+        task_id: "plan-author",
+        work_unit_key:
+          "plan|docs/superpowers/plans/example.md|author|codex|none",
+        child_conversation_id: 502,
+        agent_type: "codex",
+        status: "completed",
+        orchestration_binding: null,
+      }),
+      durableRun({
+        task_id: "final-reviewer",
+        work_unit_key: "final_review|reviewer|codex|none",
+        child_conversation_id: 503,
+        agent_type: "codex",
+        status: "reserving",
+        orchestration_binding: null,
+      }),
+    ]
+    const empty = documentAdmission(emptyEvidence().pages)
+    assert.equal(empty.admission_authorized, true)
+
+    const documentOnly = documentAdmission([
+      evidencePage({ snapshot_revision: "8" }, documentRows),
+    ])
+    assert.equal(documentOnly.admission_authorized, true)
+    assert.deepEqual(documentOnly.failures, [])
+    assert.deepEqual(documentOnly.task_bindings, [])
+    assert.deepEqual(documentOnly.durable_snapshot, {
+      snapshot_id: SNAPSHOT_ID,
+      snapshot_revision: "8",
+    })
+
+    const unboundTask = documentAdmission([
+      evidencePage({}, [
+        durableRun({
+          task_id: "unbound-task",
+          work_unit_key: "task|1|implementer|grok|none",
+          child_conversation_id: 504,
+          agent_type: "grok",
+          status: "running",
+          orchestration_binding: null,
+        }),
+      ]),
+    ])
+    assert.equal(unboundTask.admission_authorized, false)
+    hasRule(unboundTask.failures, "B2D-DURABLE-004")
+
+    const { planMarkdown, state, bindings } = twoTaskBoundState()
+    const withDocuments = [
+      ...matchedDurablePages(state)[0].runs,
+      ...documentRows,
+    ]
+    const full = fullAdmission(planMarkdown, state, [
+      evidencePage(
+        { snapshot_revision: "9", total_rows: withDocuments.length },
+        withDocuments
+      ),
+    ])
+    assert.deepEqual(full.failures, [])
+    assert.equal(full.admission_authorized, true)
+    assert.equal(full.task_bindings.length, 2)
+
+    const recognizedOnly = fullAdmission(planMarkdown, state, [
+      evidencePage(
+        { total_rows: matchedDurablePages(state)[0].runs.length + 1 },
+        [
+          ...matchedDurablePages(state)[0].runs,
+          durableRun({
+            task_id: "extra-task",
+            work_unit_key: "task|1|implementer|grok|none",
+            child_conversation_id: 505,
+            agent_type: "grok",
+            status: "running",
+            orchestration_binding: bindings[0].orchestration_binding,
+          }),
+        ]
+      ),
+    ])
+    assert.equal(recognizedOnly.admission_authorized, false)
+    hasRule(recognizedOnly.failures, "B2D-DURABLE-004")
+  })
+
   it("bootstraps Plan/progress without a circular dependency", () => {
     const snapshot = routing()
     const planMarkdown = plan(snapshot)

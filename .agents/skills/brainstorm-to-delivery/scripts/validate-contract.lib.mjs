@@ -7184,10 +7184,7 @@ function parseCursor(value) {
 }
 
 function requestedNamespaceRow(run) {
-  return (
-    run.orchestration_binding === null ||
-    run.orchestration_binding?.namespace === ROUTE_BINDING_NAMESPACE
-  )
+  return run.orchestration_binding?.namespace === ROUTE_BINDING_NAMESPACE
 }
 
 function recognizedTaskKey(value) {
