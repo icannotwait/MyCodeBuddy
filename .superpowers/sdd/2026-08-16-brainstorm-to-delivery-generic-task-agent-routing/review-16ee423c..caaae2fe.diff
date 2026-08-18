@@ -1,0 +1,109 @@
+# Review package: 16ee423c..caaae2fe
+
+## Commits
+caaae2fe fix(skill): require implementer generation adoption
+
+## Files changed
+ .../scripts/validate-contract.lib.mjs              | 10 ++++---
+ .../scripts/validate-contract.test.mjs             | 31 ++++++++++++++++++++++
+ 2 files changed, 37 insertions(+), 4 deletions(-)
+
+## Diff
+diff --git a/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.lib.mjs b/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.lib.mjs
+index ad8d9a69..9e1bf238 100644
+--- a/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.lib.mjs
++++ b/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.lib.mjs
+@@ -1694,31 +1694,33 @@ export function validateProgressRouting(snapshot, routing, failures) {
+       boundaryRuns.length === 0 &&
+       snapshot.active_task_index === null
+     const frozenRouteMatches =
+       boundary?.risk_level === boundaryRoute?.risk?.level &&
+       boundary?.task_agent_generation ===
+         boundaryRoute?.task_agent_generation &&
+       skillContractsEqual(
+         boundary?.expected_work_unit_keys,
+         boundaryRoute?.expected_work_unit_keys
+       )
+-    const allowed = expectedKeySet(boundaryRoute?.expected_work_unit_keys)
+-    const hasAdmittedRun = boundaryRuns.some(
++    const implementerKey = boundaryRoute?.expected_work_unit_keys?.implementer
++    const hasAdmittedImplementerRun = boundaryRuns.some(
+       (run) =>
+         isObject(run) &&
+-        allowed.has(run.work_unit_key) &&
++        run.work_unit_key === implementerKey &&
+         nonEmptyString(run.task_id) &&
+         positiveInteger(run.child_conversation_id) &&
+         run.child_conversation_id <= MAX_I32
+     )
+     const historicalAdoptedBoundary =
+-      boundary?.status !== "pending" && frozenRouteMatches && hasAdmittedRun
++      boundary?.status !== "pending" &&
++      frozenRouteMatches &&
++      hasAdmittedImplementerRun
+     if (
+       !boundary ||
+       !priorCompleted ||
+       (!emptyPendingBoundary && !historicalAdoptedBoundary)
+     ) {
+       fail(
+         failures,
+         "B2D-ROUTING-007",
+         `generation ${generation.generation} is neither awaiting adoption at an empty pending boundary nor frozen on its admitted route`
+       )
+diff --git a/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.test.mjs b/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.test.mjs
+index 2b3a97c7..b172c18e 100644
+--- a/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.test.mjs
++++ b/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.test.mjs
+@@ -902,20 +902,51 @@ describe("progress agreement and per-key lineage", () => {
+       run(
+         state.tasks[2].expected_work_unit_keys.implementer,
+         "running",
+         "t3-i",
+         30
+       )
+     )
+     assert.deepEqual(validate(route, state, routedPlan), [], "following Task")
+   })
+ 
++  it("rejects historical generation adoption by admitted reviewer-only runs", () => {
++    const route = routing()
++    const selected = identity("gemini", "careful")
++    route.task_agent_generations.push({
++      generation: 2,
++      ...selected,
++      effective_from_task_index: 2,
++    })
++    route.tasks[1] = task(2, "high", selected, 2)
++
++    for (const reviewerSlots of [
++      ["primary"],
++      ["auxiliary"],
++      ["primary", "auxiliary"],
++    ]) {
++      const state = progress(route)
++      state.tasks[1].status = "in_progress"
++      state.active_task_index = 2
++      state.tasks[1].runs = reviewerSlots.map((slot, index) =>
++        run(
++          state.tasks[1].expected_work_unit_keys.reviewers[slot],
++          "running",
++          `t2-${slot}`,
++          20 + index
++        )
++      )
++
++      has(validate(route, state), "B2D-ROUTING-007")
++    }
++  })
++
+   it("adopts a later generation only at an empty pending boundary", () => {
+     const route = routing()
+     const selected = identity("gemini", "careful")
+     route.task_agent_generations.push({
+       generation: 2,
+       ...selected,
+       effective_from_task_index: 2,
+     })
+     route.tasks[1] = task(2, "normal", selected, 2)
+     for (const mutate of [

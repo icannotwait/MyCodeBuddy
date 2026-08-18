@@ -942,6 +942,7 @@ async fn seed_legacy_parent_disconnect(
     let store = Arc::new(RunStore::new(db.clone()));
     store
         .insert_reserving(ReservingRunInsert {
+            orchestration_binding: None,
             task_id: source_task_id.clone(),
             root_task_id: source_task_id.clone(),
             previous_task_id: None,
@@ -1043,6 +1044,7 @@ fn continue_request(
         external_handle: None,
         correlation_id: Some("legacy-continue-correlation".into()),
         recovery_authorization_id: authorization_id,
+        orchestration_binding: None,
     }
 }
 
@@ -1096,6 +1098,7 @@ fn replacement_insert(
     continued_task_id: &str,
 ) -> ReservingRunInsert {
     ReservingRunInsert {
+        orchestration_binding: None,
         task_id: "legacy-replacement".into(),
         root_task_id: "legacy-replacement".into(),
         previous_task_id: Some(continued_task_id.into()),

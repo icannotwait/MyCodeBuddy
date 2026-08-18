@@ -19,6 +19,10 @@ export type AttachDetachReason =
   | "connection_gone"
   | "lagged"
   | "server_shutdown"
+  | "generation_stale"
+  | "lease_missing"
+  | "lease_expired"
+  | "session_replaced"
 
 /**
  * Per-subscription callbacks delivered by `EventStream.attach`. Exactly one
@@ -50,6 +54,8 @@ export interface AttachOptions {
    * running cursor so the server can replay from `lastAppliedSeq`.
    */
   reconnectMode?: "resume" | "cold"
+  /** Lease/generation fence for a broker-managed shared root session. */
+  shared?: { generation: number; leaseId: string }
 }
 
 export interface EventStreamSubscription {

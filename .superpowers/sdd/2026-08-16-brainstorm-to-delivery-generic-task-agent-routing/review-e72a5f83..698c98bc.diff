@@ -1,0 +1,822 @@
+# Review package: e72a5f8345d238ad30ed4f7d966c18a9c868bc17..698c98bc916e40b3891c17a1515b1e7ac375f3e1
+
+## Commits
+698c98bc fix(skill): bind round 13 routing relations
+
+## Files changed
+ .../scripts/validate-contract.lib.mjs              | 138 +++++++-
+ .../scripts/validate-contract.test.mjs             | 351 +++++++++++++++++++++
+ 2 files changed, 478 insertions(+), 11 deletions(-)
+
+## Diff
+diff --git a/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.lib.mjs b/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.lib.mjs
+index 30dec55d..72bf15db 100644
+--- a/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.lib.mjs
++++ b/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.lib.mjs
+@@ -461,20 +461,27 @@ const ANTECEDENT_PREDICATES = new Set([
+   ...ORCHESTRATION_ACTIONS,
+   "discuss",
+   "discussed",
+   "discusses",
+   "discussing",
+   "list",
+   "listed",
+   "listing",
+   "lists",
+ ])
++const DOCUMENT_OBJECT_ANTECEDENT_PREDICATES = new Set([
++  ...PRODUCTION_ACTIONS,
++  "list",
++  "listed",
++  "listing",
++  "lists",
++])
+ const NEGATION_TERMS = new Set([
+   "avoid",
+   "avoided",
+   "avoiding",
+   "avoids",
+   "cannot",
+   "forbid",
+   "forbidden",
+   "forbids",
+   "never",
+@@ -505,44 +512,58 @@ const REVIEW_ABSENCE_TERMS = new Set([
+   "omitted",
+   "omitting",
+   "without",
+ ])
+ const POSTPOSED_REVIEW_ABSENCE_TERMS = new Set([
+   "absent",
+   "lacking",
+   "missing",
+   "omitted",
+ ])
++const POSTPOSED_REVIEW_ABSENCE_MODIFIERS = new Set(["again", "now", "still"])
+ const ACTOR_LINKS = new Set(["by", "to"])
+ const NESTED_ACTOR_PREFIX_LINKS = new Set([
+   "after",
+   "before",
+   "for",
+   "from",
+   "of",
+   "through",
+   "with",
+ ])
+ const ACTOR_RELATION_BOUNDARIES = new Set([
+   "after",
++  "although",
+   "before",
+   "during",
+   "if",
+   "once",
+   "unless",
+   "upon",
+   "when",
++  "whereas",
+   "while",
+ ])
+ const CLAUSE_COORDINATORS = new Set(["and", "but", "while", "yet"])
+ const PREDICATE_COORDINATORS = new Set(["and", "but"])
+-const ALTERNATIVE_RESET_COORDINATORS = new Set(["but", "yet"])
++const ALTERNATIVE_RESET_COORDINATORS = new Set([
++  "although",
++  "but",
++  "whereas",
++  "while",
++  "yet",
++])
++const SEQUENTIAL_PASSIVE_RELATION_FILLERS = new Set([
++  "also",
++  "subsequently",
++  "then",
++])
+ const TASK_RELATION_BOUNDARIES = new Set([...CLAUSE_COORDINATORS, "or"])
+ const HIGH_TASK_SCOPES = new Set(["high", "high-risk"])
+ const NORMAL_TASK_SCOPES = new Set(["normal"])
+ const UNIVERSAL_TASK_SCOPES = new Set([
+   "all",
+   "always",
+   "each",
+   "every",
+   "unconditionally",
+ ])
+@@ -561,33 +582,50 @@ const TASK_COMPLETION_TERMS = new Set([
+   "finished",
+   "finishes",
+ ])
+ const TASK_COMPLETION_BRIDGE_TERMS = new Set([
+   "already",
+   "be",
+   "been",
+   "being",
+   "can",
+   "could",
++  "finally",
+   "had",
+   "has",
+   "have",
+   "is",
+   "may",
+   "might",
+   "must",
+   "now",
+   "was",
+   "were",
+   "will",
+   "would",
+ ])
++const TASK_COMPONENT_SUFFIX_TERMS = new Set([
++  "review",
++  "reviews",
++  "test",
++  "testing",
++  "validation",
++])
++const TASK_COMPONENT_ACTION_OBJECT_PREFIXES = new Set([
++  "a",
++  "an",
++  "it",
++  "that",
++  "the",
++  "them",
++  "this",
++])
+ const ACTIVE_TIMING_MARKERS = new Set(["during", "inside", "while"])
+ const BOUNDARY_TIMING_MARKERS = new Set([
+   "after",
+   "following",
+   "on",
+   "once",
+   "upon",
+   "when",
+ ])
+ const PRE_COMPLETION_TIMING_MARKERS = new Set(["before", "prior"])
+@@ -666,21 +704,29 @@ const REVIEW_ACTOR_TAIL_TERMS = new Set([
+   "an",
+   "auxiliary",
+   "primary",
+   "review",
+   "reviewer",
+   "reviewers",
+   "role",
+   "slot",
+   "the",
+ ])
+-const QUANTIFIER_COMPLEMENT_LINKS = new Set(["about", "for", "on", "regarding"])
++const QUANTIFIER_COMPLEMENT_LINKS = new Set([
++  "about",
++  "for",
++  "regarding",
++  ...ACTIVE_TIMING_MARKERS,
++  ...BOUNDARY_TIMING_MARKERS,
++  ...PRE_COMPLETION_TIMING_MARKERS,
++])
++const QUANTIFIER_COMPLEMENT_MODIFIERS = new Set(["directly", "immediately"])
+ const REVIEW_SUBJECT_LINKS = new Set([
+   "although",
+   "am",
+   "are",
+   "be",
+   "been",
+   "being",
+   "is",
+   "remain",
+   "remains",
+@@ -1285,24 +1331,30 @@ function directivePronounAntecedent(tokens) {
+             person.start > predicate &&
+             tokenIndex(
+               tokens,
+               new Set(["by", "to"]),
+               predicate + 1,
+               person.start
+             ) >= 0
+         )
+ 
+   const pluralDocuments = mentionsPluralGroup(tokens, documentObjects)
+-  const pluralPeople =
+-    mentionsPluralGroup(tokens, peopleSubjects) ||
+-    mentionsPluralGroup(tokens, peopleRecipients)
+-  if (pluralPeople) return "people"
++  const pluralPeopleSubjects = mentionsPluralGroup(tokens, peopleSubjects)
++  const pluralPeopleRecipients = mentionsPluralGroup(tokens, peopleRecipients)
++  if (pluralPeopleRecipients) return "people"
++  if (
++    pluralDocuments &&
++    DOCUMENT_OBJECT_ANTECEDENT_PREDICATES.has(tokens[predicate])
++  ) {
++    return "document"
++  }
++  if (pluralPeopleSubjects) return "people"
+   if (pluralDocuments) return "document"
+   return null
+ }
+ 
+ function directiveReviewers(tokens) {
+   const reviewers = []
+   for (const index of tokenIndexes(tokens, REVIEW_TERMS)) {
+     const start = Math.max(0, index - 4)
+     const prefix = tokens.slice(start, index + 1)
+     const userNamed =
+@@ -1614,30 +1666,36 @@ function directPassiveActorsForAction(clause, action) {
+     action.index + 1,
+     nextAction?.index ?? clause.tokens.length
+   )
+   for (const [linkIndex, link] of links.entries()) {
+     if (linkIndex > 0) {
+       const previousLink = links[linkIndex - 1]
+       const previousActor = clause.actors
+         .filter((actor) => actor.start > previousLink && actor.end <= link)
+         .at(-1)
+       const relationStart = previousActor?.end ?? previousLink + 1
++      const relationTokens = clause.tokens.slice(relationStart, link)
+       const continuesRelation =
+         tokenIndex(
+           clause.tokens,
+           new Set(["and", "but", "or", "yet"]),
+           relationStart,
+           link
+         ) >= 0 ||
+         phraseIndex(clause.tokens, ["rather", "than"], relationStart, link) >=
+           0 ||
+-        phraseIndex(clause.tokens, ["instead", "of"], relationStart, link) >= 0
++        phraseIndex(clause.tokens, ["instead", "of"], relationStart, link) >=
++          0 ||
++        (relationTokens.length > 0 &&
++          relationTokens.every((token) =>
++            SEQUENTIAL_PASSIVE_RELATION_FILLERS.has(token)
++          ))
+       if (!continuesRelation) continue
+     }
+     actors.push(
+       ...actorBindingsAfterLink(
+         clause,
+         action,
+         link,
+         nextAction?.index ?? clause.tokens.length
+       )
+         .filter((binding) => !binding.negated)
+@@ -2227,20 +2285,31 @@ function reviewerRoleIsExplicitlyAbsent(clause, action, role) {
+         Math.min(relationEnd, actor.end + 6)
+       ).some((absence) => {
+         if (actionIsNegated(clause.tokens, absence)) return false
+         const subjectLink = tokenIndex(
+           clause.tokens,
+           REVIEW_SUBJECT_LINKS,
+           actor.end,
+           absence
+         )
+         if (subjectLink < 0) return false
++        if (
++          !clause.tokens
++            .slice(subjectLink + 1, absence)
++            .every(
++              (token) =>
++                token.endsWith("ly") ||
++                POSTPOSED_REVIEW_ABSENCE_MODIFIERS.has(token)
++            )
++        ) {
++          return false
++        }
+         if (
+           tokenIndex(
+             clause.tokens,
+             REVIEW_SUBJECT_BOUNDARIES,
+             actor.end,
+             subjectLink
+           ) >= 0
+         ) {
+           return false
+         }
+@@ -2424,21 +2493,35 @@ function reviewStatementIsExhaustive(clause, action) {
+     segment.end
+   )) {
+     if (
+       quantifier < action.index &&
+       clause.tokens
+         .slice(quantifier + 1, action.index)
+         .every((token) => REVIEW_ACTOR_TAIL_TERMS.has(token))
+     ) {
+       return true
+     }
+-    if (ACTOR_LINKS.has(clause.tokens[quantifier + 1])) return true
++    const followingRelation = tokenIndex(
++      clause.tokens,
++      new Set([...ACTOR_LINKS, ...QUANTIFIER_COMPLEMENT_LINKS]),
++      quantifier + 1,
++      Math.min(segment.end, quantifier + 4)
++    )
++    if (
++      followingRelation >= 0 &&
++      clause.tokens
++        .slice(quantifier + 1, followingRelation)
++        .every((token) => QUANTIFIER_COMPLEMENT_MODIFIERS.has(token))
++    ) {
++      if (ACTOR_LINKS.has(clause.tokens[followingRelation])) return true
++      continue
++    }
+     const link = tokenIndexes(
+       clause.tokens,
+       ACTOR_LINKS,
+       action.index + 1,
+       quantifier + 1
+     ).at(-1)
+     if (link === undefined) continue
+     const actors = actorsAfterLink(clause, link, segment.end)
+     if (
+       actors.some(
+@@ -2810,20 +2893,24 @@ function completionBelongsToTask(clause, task, completion) {
+   }
+   if (clause.tokens[completion] !== "completion") return false
+   const objectLink = tokenIndex(
+     clause.tokens,
+     new Set(["of"]),
+     completion + 1,
+     task.index
+   )
+   return (
+     objectLink >= 0 &&
++    !(
++      TASK_COMPONENT_SUFFIX_TERMS.has(clause.tokens[task.index + 1]) &&
++      !TASK_COMPONENT_ACTION_OBJECT_PREFIXES.has(clause.tokens[task.index + 2])
++    ) &&
+     tokenIndex(
+       clause.tokens,
+       TASK_REFERENCE_BOUNDARIES,
+       objectLink + 1,
+       task.index
+     ) < 0 &&
+     tokenIndex(
+       clause.tokens,
+       new Set([
+         ...PRODUCTION_ACTIONS,
+@@ -2907,21 +2994,23 @@ function timingReferencesCompletion(clause, marker) {
+       ) {
+         return true
+       }
+       const hasTaskAnaphor =
+         tokenIndex(
+           clause.tokens,
+           new Set(["it", "its", "that", "this"]),
+           marker + 1,
+           Math.min(end, completion + 2)
+         ) >= 0
+-      const hasImplicitTaskSubject = completion === marker + 1
++      const hasImplicitTaskSubject = clause.tokens
++        .slice(marker + 1, completion)
++        .every((token) => TASK_COMPLETION_BRIDGE_TERMS.has(token))
+       return (
+         clause.priorTasks.length > 0 &&
+         (hasTaskAnaphor || hasImplicitTaskSubject)
+       )
+     })
+ }
+ 
+ function hasCompletedTaskTiming(clause) {
+   return tokenIndexes(clause.tokens, BOUNDARY_TIMING_MARKERS).some((marker) =>
+     timingReferencesCompletion(clause, marker)
+@@ -3088,39 +3177,66 @@ function substitutionReviewTarget(clause, bypass) {
+         : tokenIndex(clause.tokens, new Set(["for"]), bypass + 1, bypass + 4)
+   } else if (reviewActionIsReplacement(clause, bypass)) {
+     objectLink = tokenIndex(
+       clause.tokens,
+       new Set(["for"]),
+       bypass + 1,
+       bypass + 4
+     )
+   }
+   if (objectLink < 0) return null
+-  return (
++  const objectReviewer =
+     clause.reviewers.find(
+       (reviewer) =>
+         reviewer.index > objectLink && reviewer.index <= objectLink + 5
+     ) ?? null
+-  )
++  if (
++    objectReviewer &&
++    !reviewerIsRequiredByContract(objectReviewer) &&
++    tokenIndex(
++      clause.tokens,
++      new Set(["its", "same", "that", "their", "this"]),
++      objectLink + 1,
++      objectReviewer.index
++    ) >= 0
++  ) {
++    const replacementSubject = clause.reviewers
++      .filter((reviewer) => reviewer.index < bypass)
++      .at(-1)
++    return reviewAntecedentBefore(clause, replacementSubject?.index ?? bypass)
++  }
++  return objectReviewer
+ }
+ 
+ function reviewTargetForBypass(clause, bypass) {
+   const segment = actionSegment(clause, bypass)
+   const reviewers = clause.reviewers.filter(
+     (reviewer) =>
+       reviewer.index >= segment.start && reviewer.index < segment.end
+   )
+   const before = reviewers.filter((reviewer) => reviewer.index < bypass).at(-1)
+   const after = reviewers.find((reviewer) => reviewer.index > bypass)
+   const replacement = reviewActionIsReplacement(clause, bypass)
++  const takeRoleLink = REVIEW_TAKE_ACTIONS.has(clause.tokens[bypass])
++    ? takeRoleObjectLink(clause, bypass)
++    : -1
+   const substitution = substitutionReviewTarget(clause, bypass)
+   if (substitution) return substitution
++  const takeRolePronoun =
++    takeRoleLink >= 0 &&
++    tokenIndex(
++      clause.tokens,
++      new Set(["former", "it", "them"]),
++      takeRoleLink + 1,
++      Math.min(segment.end, takeRoleLink + 5)
++    ) >= 0
++  if (takeRoleLink >= 0 && !takeRolePronoun) return null
+   const roleReference =
+     replacement &&
+     !after &&
+     tokenIndexes(
+       clause.tokens,
+       new Set(["reviewer", "role"]),
+       bypass + 1,
+       Math.min(segment.end, bypass + 6)
+     ).some((target) => {
+       const prefix = clause.tokens.slice(
+diff --git a/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.test.mjs b/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.test.mjs
+index 5aeaa473..bbef1fd0 100644
+--- a/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.test.mjs
++++ b/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.test.mjs
+@@ -2182,20 +2182,371 @@ describe("Skill contract v2", () => {
+         reject: false,
+       },
+       {
+         prose:
+           "High Tasks are reviewed by Codex and the Task Agent reviewer is definitely not omitted.",
+         reject: false,
+       },
+     ])
+   })
+ 
++  it("round-13 primary 1 binds sequential passive implementers", () => {
++    assertSkillClassifications([
++      {
++        prose: "High Tasks are implemented by Codex, then by Grok.",
++        reject: true,
++      },
++      {
++        prose: "High Tasks are implemented by Codex, subsequently by Grok.",
++        reject: true,
++      },
++      {
++        prose:
++          "High Tasks are implemented first by Codex, then reviewed by the Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "High Tasks are implemented first by Codex, then approved by Gemini.",
++        reject: false,
++      },
++    ])
++  })
++
++  it("round-13 primary 2 carries a Task subject across completion modifiers", () => {
++    assertSkillClassifications([
++      {
++        prose:
++          "The current Task is running. When finally complete, change the Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "The current Task is running. Once already complete, change the Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "The current Task is running. When review is finally complete, change the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The current Task is running. Once testing is already complete, change the Task Agent.",
++        reject: true,
++      },
++    ])
++  })
++
++  it("round-13 primary 3 keeps unrelated take-role objects local", () => {
++    assertSkillClassifications([
++      {
++        prose:
++          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of observers.",
++        reject: false,
++      },
++      {
++        prose:
++          "The Codex reviewer is mandatory. Optional Design reviewers take the role of note takers.",
++        reject: false,
++      },
++      {
++        prose:
++          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of that reviewer.",
++        reject: true,
++      },
++      {
++        prose:
++          "The Codex reviewer is mandatory. Optional Design reviewers take the role of this required reviewer.",
++        reject: true,
++      },
++    ])
++  })
++
++  it("round-13 primary 4 resets alternatives at positive subordinate clauses", () => {
++    assertSkillClassifications([
++      {
++        prose:
++          "High Tasks are implemented by Codex rather than by Grok, while Gemini also implements them.",
++        reject: true,
++      },
++      {
++        prose:
++          "High Tasks are implemented by Codex rather than by Grok, although Gemini also implements them.",
++        reject: true,
++      },
++      {
++        prose:
++          "High Tasks are implemented by Codex rather than by Grok, while Gemini does not implement them.",
++        reject: false,
++      },
++      {
++        prose:
++          "High Tasks are implemented by Codex rather than by Grok, although Gemini remains available.",
++        reject: false,
++      },
++      {
++        prose:
++          "High Tasks are implemented by Codex rather than by Grok, whereas Gemini also implements them.",
++        reject: true,
++      },
++      {
++        prose:
++          "High Tasks are implemented by Codex rather than by Grok, whereas Gemini remains available.",
++        reject: false,
++      },
++    ])
++  })
++
++  it("round-13 primary 5 prefers a predicate's plural document object", () => {
++    assertSkillClassifications([
++      {
++        prose:
++          "The developers list the Plan and Design. The parent updates them.",
++        reject: true,
++      },
++      {
++        prose:
++          "The reviewers list the Plan and Design. The parent revises them.",
++        reject: true,
++      },
++      {
++        prose:
++          "The developers list the Plan and Design. The parent updates the developers.",
++        reject: false,
++      },
++      {
++        prose:
++          "The reviewers list the Plan and Design. The parent revises the documents.",
++        reject: true,
++      },
++    ])
++  })
++
++  it("round-13 primary 6 binds exclusivity to its temporal complement", () => {
++    assertSkillClassifications([
++      {
++        prose:
++          "High Tasks are reviewed by Codex exclusively after implementation. The Task Agent provides the auxiliary review.",
++        reject: false,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex exclusively after testing. The Task Agent provides the auxiliary review.",
++        reject: false,
++      },
++      {
++        prose:
++          "High Tasks are reviewed exclusively by Codex after implementation. The Task Agent provides the auxiliary review.",
++        reject: true,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex only after testing. The Task Agent provides the auxiliary review.",
++        reject: false,
++      },
++    ])
++  })
++
++  it("round-13 primary 7 keeps embedded missing evidence off the reviewer", () => {
++    assertSkillClassifications([
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is aware input is missing.",
++        reject: false,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is told evidence is missing.",
++        reject: false,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is still missing.",
++        reject: true,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is definitely not missing.",
++        reject: false,
++      },
++    ])
++  })
++
++  it("round-13 auxiliary 1 follows sequential passive actor ellipsis", () => {
++    assertSkillClassifications([
++      {
++        prose: "High Tasks are implemented first by Codex, then by Gemini.",
++        reject: true,
++      },
++      {
++        prose:
++          "Normal Tasks are implemented first by Gemini, then reviewed by Codex.",
++        reject: false,
++      },
++      {
++        prose:
++          "High Tasks are implemented first by Codex, then checked by Gemini.",
++        reject: false,
++      },
++    ])
++  })
++
++  it("round-13 auxiliary 2 rejects completion of a Task review", () => {
++    assertSkillClassifications([
++      {
++        prose:
++          "The current Task is running. After completion of the active Task review, switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The current Task is running. After completion of the active Task, review it and switch the Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "The current Task is running. After completion of the review for the active Task, switch the Task Agent.",
++        reject: true,
++      },
++    ])
++  })
++
++  it("round-13 auxiliary 3 resolves mixed plural subject and object roles", () => {
++    assertSkillClassifications([
++      {
++        prose:
++          "The reviewers list the Plan and Design. The parent updates them.",
++        reject: true,
++      },
++      {
++        prose:
++          "The reviewers list the Plan and Design. The parent updates the reviewers.",
++        reject: false,
++      },
++      {
++        prose:
++          "The reviewers list the Plan and Design. The parent updates the documents.",
++        reject: true,
++      },
++    ])
++  })
++
++  it("round-13 review preserves take-role pronoun antecedents", () => {
++    assertSkillClassifications([
++      {
++        prose:
++          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the former.",
++        reject: true,
++      },
++      {
++        prose:
++          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of observers.",
++        reject: false,
++      },
++    ])
++  })
++
++  it("round-13 review distinguishes Task components from following actions", () => {
++    assertSkillClassifications([
++      {
++        prose:
++          "The current Task is running. After completion of the active Task, review the report and switch the Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "The current Task is running. After completion of the active Task review, switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The current Task is running. When supply is complete, switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The current Task is running. When finally complete, switch the Task Agent.",
++        reject: false,
++      },
++    ])
++  })
++
++  it("round-13 review accepts ordinary reviewer-absence modifiers", () => {
++    assertSkillClassifications([
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is now missing.",
++        reject: true,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is again missing.",
++        reject: true,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is aware evidence is now missing.",
++        reject: false,
++      },
++    ])
++  })
++
++  it("round-13 review carries sequential passive relation fillers", () => {
++    assertSkillClassifications([
++      {
++        prose: "High Tasks are implemented by Codex, then also by Gemini.",
++        reject: true,
++      },
++      {
++        prose:
++          "High Tasks are implemented by Codex, then also approved by Gemini.",
++        reject: false,
++      },
++    ])
++  })
++
++  it("round-13 review resolves transitive plural document objects", () => {
++    assertSkillClassifications([
++      {
++        prose:
++          "The reviewers revise the Plan and Design. The parent updates them.",
++        reject: true,
++      },
++      {
++        prose:
++          "The developers edit the Plan and Design. The parent revises them.",
++        reject: true,
++      },
++      {
++        prose:
++          "The reviewers discuss the Plan and Design. The parent updates them with assignments.",
++        reject: false,
++      },
++    ])
++  })
++
++  it("round-13 review carries modifiers into temporal exclusivity complements", () => {
++    assertSkillClassifications([
++      {
++        prose:
++          "High Tasks are reviewed by Codex exclusively immediately after implementation. The Task Agent provides the auxiliary review.",
++        reject: false,
++      },
++      {
++        prose:
++          "High Tasks are reviewed exclusively immediately by Codex after implementation. The Task Agent provides the auxiliary review.",
++        reject: true,
++      },
++    ])
++  })
++
+   it("contains the complete operational policy and document JSON shapes", () => {
+     const policy = fencedJsonAfterHeading(
+       realSkill,
+       "### Operational policy JSON"
+     )
+     assert.deepEqual(policy.design_review_triggers, [
+       "spans_modules",
+       "migration",
+       "concurrency",
+       "security",

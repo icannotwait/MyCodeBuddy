@@ -36,6 +36,7 @@ vi.mock("next-intl", () => ({
 }))
 
 const sendPrompt = vi.fn()
+let sharedSession: { generation: number } | null = null
 
 vi.mock("@/contexts/acp-connections-context", () => ({
   useAcpActions: () => ({ setActiveKey: vi.fn(), touchActivity: vi.fn() }),
@@ -65,6 +66,7 @@ vi.mock("@/hooks/use-connection", () => ({
     hasCachedSelectors: true,
     isViewer: false,
     backgroundOutstanding: 0,
+    sharedSession,
   }),
 }))
 
@@ -95,6 +97,7 @@ async function flush() {
 describe("useConnectionLifecycle send-failure surfacing", () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    sharedSession = null
   })
 
   it("toasts a structured backend error with its message", async () => {
@@ -188,5 +191,28 @@ describe("useConnectionLifecycle send-failure surfacing", () => {
 
     expect(sendPrompt).toHaveBeenCalledTimes(1)
     expect(toastError).not.toHaveBeenCalled()
+  })
+
+  it("returns broker admission only after it resolves and rethrows shared failures", async () => {
+    sharedSession = { generation: 1 }
+    const admitted = {
+      queueItemId: "queue-1",
+      enqueueSeq: 3,
+      state: "queued" as const,
+    }
+    sendPrompt.mockResolvedValue(admitted)
+    const onPromptAdmitted = vi.fn()
+    const { result } = renderLifecycle()
+
+    await expect(
+      result.current.handleSend(draft(), null, { onPromptAdmitted })
+    ).resolves.toEqual(admitted)
+    expect(onPromptAdmitted).toHaveBeenCalledWith(admitted)
+
+    const failure = { code: "lease_expired", message: "lease expired" }
+    sendPrompt.mockRejectedValue(failure)
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {})
+    await expect(result.current.handleSend(draft())).rejects.toBe(failure)
+    consoleError.mockRestore()
   })
 })

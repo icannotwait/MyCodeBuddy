@@ -100,6 +100,26 @@ export type AppErrorCode =
   | "window_operation_failed"
   | "task_execution_failed"
   | "delegate_viewer_only"
+  | "shared_session_config_conflict"
+  | "shared_session_protocol_required"
+  | "shared_session_generation_stale"
+  | "shared_session_closing"
+  | "shared_session_cleanup_in_progress"
+  | "client_lease_missing"
+  | "client_lease_expired"
+  | "client_lease_capacity_exceeded"
+  | "connect_idempotency_capacity_exceeded"
+  | "prompt_idempotency_capacity_exceeded"
+  | "prompt_queue_full"
+  | "idempotency_key_conflict"
+  | "queue_item_not_found"
+  | "queue_item_already_dispatching"
+  | "interaction_already_resolved"
+  | "stale_turn"
+  | "session_unavailable"
+  | "companion_initialization_failed"
+  | "shared_session_conversation_key_conflict"
+  | "invalid_shared_session_field"
   | (string & {})
 
 /** Mirrors Rust `DelegateAccessMode` (serde snake_case). */
@@ -2260,6 +2280,91 @@ export interface BackgroundSettledInfo {
   wire_visible?: boolean
 }
 
+export type SharedSessionPhase =
+  | { phase: "reserved" }
+  | { phase: "bootstrapping" }
+  | { phase: "ready" }
+  | { phase: "failed"; error_code: string; cleanup_complete: boolean }
+  | { phase: "closing" }
+
+export interface SharedMutationContext {
+  generation: number
+  leaseId: string
+}
+
+export interface SharedPromptAdmission extends SharedMutationContext {
+  clientInstanceId: string
+  clientRequestId: string
+}
+
+export type SharedPublicPhase = "bootstrapping" | "ready" | "failed" | "closing"
+
+export type PromptEnqueueResult = {
+  queueItemId: string
+  enqueueSeq: number
+  state: "queued" | "dispatching"
+}
+
+export interface AcpConnectOrAttachRequest {
+  conversationId?: number | null
+  agentType: AgentType
+  workingDir?: string | null
+  externalSessionId?: string | null
+  delegationRouteOverride?: DelegationRoutePolicy | null
+  preferredModeId?: string | null
+  preferredConfigValues?: Record<string, string> | null
+  deviceId: string
+  clientInstanceId: string
+  requestId: string
+  retryFailedGeneration?: number | null
+}
+
+export interface AcpConnectOrAttachResponse {
+  connectionId: string
+  generation: number
+  leaseId: string
+  leaseExpiresAt: string
+  disposition: "created" | "attached"
+  phase: SharedPublicPhase
+  eventSeq: number
+  error?: {
+    code: string
+    retryable: boolean
+    cleanupComplete: boolean
+  } | null
+}
+
+export type SharedQueuedPromptState = "queued" | "dispatching"
+
+export interface SharedQueuedPromptSummary {
+  queue_item_id: string
+  enqueue_seq: number
+  client_message_id: string
+  visible_text: string | null
+  visible_text_truncated: boolean
+  attachment_count: number
+  submitted_at: string
+  state: SharedQueuedPromptState
+}
+
+export interface SharedActiveTurnProjection {
+  turn_id: string
+  queue_item_id: string
+  enqueue_seq: number
+  client_message_id: string
+  stop_requested: boolean
+}
+
+export interface SharedSessionProjection {
+  generation: number
+  phase: SharedSessionPhase
+  queue: SharedQueuedPromptSummary[]
+  active_turn: SharedActiveTurnProjection | null
+  lease_expires_at: string | null
+}
+
+export type SharedTurnOutcome = "completed" | "cancelled" | "failed"
+
 export type AcpEvent =
   /**
    * `parent_tool_use_id` attributes live Claude subagent chunks to the
@@ -2403,6 +2508,44 @@ export type AcpEvent =
   | {
       type: "status_changed"
       status: ConnectionStatus
+    }
+  | {
+      type: "shared_session_phase_changed"
+      generation: number
+      phase: SharedSessionPhase
+    }
+  | {
+      type: "prompt_queued"
+      generation: number
+      item: SharedQueuedPromptSummary
+    }
+  | {
+      type: "prompt_queue_item_cancelled"
+      generation: number
+      queue_item_id: string
+    }
+  | {
+      type: "prompt_dispatch_started"
+      generation: number
+      turn: SharedActiveTurnProjection
+    }
+  | {
+      type: "prompt_queue_item_failed"
+      generation: number
+      queue_item_id: string
+      error_code: string
+    }
+  | {
+      type: "prompt_queue_depth_changed"
+      generation: number
+      waiting_count: number
+      waiting_bytes: number
+    }
+  | {
+      type: "shared_turn_settled"
+      generation: number
+      turn_id: string
+      outcome: SharedTurnOutcome
     }
   | {
       type: "error"
@@ -3013,6 +3156,41 @@ export interface EventBusMetricsSnapshot {
   desktop_queue_full_count: number
   desktop_startup_fallback_count: number
   desktop_runtime_failure_count: number
+  /** Optional so clients can still read metrics from older desktop runtimes. */
+  shared_session_broker?: SharedSessionMetricsSnapshot
+}
+
+export interface SharedSessionMetricsSnapshot {
+  created_total: number
+  attached_total: number
+  live_sessions: number
+  active_leases: number
+  bootstrap_ready_total: number
+  bootstrap_failed_total: Record<string, number>
+  bootstrap_duration_ms_total: number
+  bootstrap_duration_samples: number
+  waiting_prompts: number
+  waiting_bytes: number
+  enqueue_total: number
+  cancel_total: number
+  dispatch_total: number
+  capacity_rejected_total: number
+  queue_item_failed_total: number
+  interaction_winner_total: number
+  interaction_stale_total: number
+  stale_stop_total: number
+  lease_expired_total: number
+  lease_released_total: number
+  idle_candidate_total: number
+  idle_cas_lost_total: number
+  idle_reclaimed_total: number
+  cleanup_duration_ms_total: number
+  cleanup_duration_samples: number
+  cleanup_incomplete_total: number
+}
+
+export type AcpEventMetricsSnapshot = EventBusMetricsSnapshot & {
+  shared_session_broker: SharedSessionMetricsSnapshot
 }
 
 /**
@@ -3285,6 +3463,8 @@ export interface LiveSessionSnapshot {
   connection_id: string
   conversation_id: number | null
   folder_id: number | null
+  /** Shared broker projection. Omitted for legacy/non-shared sessions. */
+  shared_session?: SharedSessionProjection | null
   status: ConnectionStatus
   external_id: string | null
   live_message: LiveMessage | null

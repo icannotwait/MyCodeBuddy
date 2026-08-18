@@ -7,6 +7,7 @@ use crate::acp::delegation::route::RouteDegradedReason;
 use crate::acp::delegation::workflow::{
     CompletionProtocolConfigurationRemoved, WorkflowStoreError,
 };
+use crate::acp::shared_session::SharedSessionError;
 use crate::app_error::{AppCommandError, AppErrorCode};
 use crate::terminal::shell::ShellResolveError;
 
@@ -120,6 +121,8 @@ pub enum AcpError {
     /// message and the frontend renders the suggestion alongside it.
     #[error("{0}")]
     McpRejectedByAgent(String),
+    #[error(transparent)]
+    Shared(#[from] SharedSessionError),
 }
 
 impl AcpError {
@@ -182,6 +185,7 @@ impl AcpError {
                 Some("completion_protocol_configuration_removed")
             }
             Self::McpRejectedByAgent(_) => Some("mcp_rejected_by_agent"),
+            Self::Shared(error) => Some(error.code()),
             Self::Protocol(_) => None,
         }
     }
@@ -332,8 +336,49 @@ impl AcpError {
                 )
                 .with_detail(*variable),
             ),
+            AcpError::Shared(error) => Some(AppCommandError::new(
+                app_error_code_for_shared_session(error),
+                error.to_string(),
+            )),
             _ => None,
         }
+    }
+}
+
+fn app_error_code_for_shared_session(error: &SharedSessionError) -> AppErrorCode {
+    match error {
+        SharedSessionError::ConfigConflict { .. } => AppErrorCode::SharedSessionConfigConflict,
+        SharedSessionError::ProtocolRequired => AppErrorCode::SharedSessionProtocolRequired,
+        SharedSessionError::GenerationStale => AppErrorCode::SharedSessionGenerationStale,
+        SharedSessionError::Closing => AppErrorCode::SharedSessionClosing,
+        SharedSessionError::CleanupInProgress => AppErrorCode::SharedSessionCleanupInProgress,
+        SharedSessionError::LeaseMissing => AppErrorCode::ClientLeaseMissing,
+        SharedSessionError::LeaseExpired => AppErrorCode::ClientLeaseExpired,
+        SharedSessionError::ClientLeaseCapacityExceeded => {
+            AppErrorCode::ClientLeaseCapacityExceeded
+        }
+        SharedSessionError::ConnectLedgerCapacityExceeded => {
+            AppErrorCode::ConnectIdempotencyCapacityExceeded
+        }
+        SharedSessionError::PromptLedgerCapacityExceeded => {
+            AppErrorCode::PromptIdempotencyCapacityExceeded
+        }
+        SharedSessionError::PromptQueueFull => AppErrorCode::PromptQueueFull,
+        SharedSessionError::IdempotencyKeyConflict => AppErrorCode::IdempotencyKeyConflict,
+        SharedSessionError::QueueItemNotFound => AppErrorCode::QueueItemNotFound,
+        SharedSessionError::QueueItemAlreadyDispatching => {
+            AppErrorCode::QueueItemAlreadyDispatching
+        }
+        SharedSessionError::InteractionAlreadyResolved => AppErrorCode::InteractionAlreadyResolved,
+        SharedSessionError::StaleTurn => AppErrorCode::StaleTurn,
+        SharedSessionError::SessionUnavailable => AppErrorCode::SessionUnavailable,
+        SharedSessionError::CompanionInitializationFailed => {
+            AppErrorCode::CompanionInitializationFailed
+        }
+        SharedSessionError::ConversationKeyConflict => {
+            AppErrorCode::SharedSessionConversationKeyConflict
+        }
+        SharedSessionError::InvalidField { .. } => AppErrorCode::InvalidSharedSessionField,
     }
 }
 
@@ -562,6 +607,21 @@ mod tests {
                 "detail": "parent_turn_active",
                 "i18n_key": "backendErrors.delegateViewerOnly",
                 "i18n_params": { "reason": "parent_turn_active" },
+            })
+        );
+    }
+
+    #[test]
+    fn shared_session_error_serializes_as_structured_app_error() {
+        let error = AcpError::from(
+            crate::acp::shared_session::SharedSessionError::ClientLeaseCapacityExceeded,
+        );
+        assert_eq!(error.code(), Some("client_lease_capacity_exceeded"));
+        assert_eq!(
+            serde_json::to_value(error).unwrap(),
+            json!({
+                "code": "client_lease_capacity_exceeded",
+                "message": "client lease capacity is exhausted",
             })
         );
     }

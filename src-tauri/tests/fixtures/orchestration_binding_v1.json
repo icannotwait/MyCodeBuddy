@@ -1,0 +1,232 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "name": "minimum",
+      "valid": true,
+      "value": {
+        "schema_version": 1,
+        "namespace": "a",
+        "generation": 1,
+        "route_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      }
+    },
+    {
+      "name": "maximum",
+      "valid": true,
+      "value": {
+        "schema_version": 1,
+        "namespace": "a123456789012345678901234567890123456789012345678901234567890123",
+        "generation": 4294967295,
+        "route_fingerprint": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+      }
+    },
+    {
+      "name": "brainstorm_to_delivery",
+      "valid": true,
+      "value": {
+        "schema_version": 1,
+        "namespace": "brainstorm-to-delivery",
+        "generation": 2,
+        "route_fingerprint": "sha256:b498416d87bf6ba928bd7ddb5f1a451daf82300584f3d40b606c3c56f169ba7a"
+      }
+    },
+    {
+      "name": "null",
+      "valid": false,
+      "value": null
+    },
+    {
+      "name": "non_object",
+      "valid": false,
+      "value": []
+    },
+    {
+      "name": "missing_schema_version",
+      "valid": false,
+      "value": {
+        "namespace": "a",
+        "generation": 1,
+        "route_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      }
+    },
+    {
+      "name": "missing_namespace",
+      "valid": false,
+      "value": {
+        "schema_version": 1,
+        "generation": 1,
+        "route_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      }
+    },
+    {
+      "name": "missing_generation",
+      "valid": false,
+      "value": {
+        "schema_version": 1,
+        "namespace": "a",
+        "route_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      }
+    },
+    {
+      "name": "missing_route_fingerprint",
+      "valid": false,
+      "value": {
+        "schema_version": 1,
+        "namespace": "a",
+        "generation": 1
+      }
+    },
+    {
+      "name": "extra_field",
+      "valid": false,
+      "value": {
+        "schema_version": 1,
+        "namespace": "a",
+        "generation": 1,
+        "route_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "extra": true
+      }
+    },
+    {
+      "name": "wrong_schema_version",
+      "valid": false,
+      "value": {
+        "schema_version": 2,
+        "namespace": "a",
+        "generation": 1,
+        "route_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      }
+    },
+    {
+      "name": "schema_version_string",
+      "valid": false,
+      "value": {
+        "schema_version": "1",
+        "namespace": "a",
+        "generation": 1,
+        "route_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      }
+    },
+    {
+      "name": "namespace_number",
+      "valid": false,
+      "value": {
+        "schema_version": 1,
+        "namespace": 1,
+        "generation": 1,
+        "route_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      }
+    },
+    {
+      "name": "generation_string",
+      "valid": false,
+      "value": {
+        "schema_version": 1,
+        "namespace": "a",
+        "generation": "1",
+        "route_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      }
+    },
+    {
+      "name": "fingerprint_number",
+      "valid": false,
+      "value": {
+        "schema_version": 1,
+        "namespace": "a",
+        "generation": 1,
+        "route_fingerprint": 0
+      }
+    },
+    {
+      "name": "generation_zero",
+      "valid": false,
+      "value": {
+        "schema_version": 1,
+        "namespace": "a",
+        "generation": 0,
+        "route_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      }
+    },
+    {
+      "name": "generation_overflow",
+      "valid": false,
+      "value": {
+        "schema_version": 1,
+        "namespace": "a",
+        "generation": 4294967296,
+        "route_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      }
+    },
+    {
+      "name": "namespace_empty",
+      "valid": false,
+      "value": {
+        "schema_version": 1,
+        "namespace": "",
+        "generation": 1,
+        "route_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      }
+    },
+    {
+      "name": "namespace_65_bytes",
+      "valid": false,
+      "value": {
+        "schema_version": 1,
+        "namespace": "a1111111111111111111111111111111111111111111111111111111111111111",
+        "generation": 1,
+        "route_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      }
+    },
+    {
+      "name": "namespace_uppercase",
+      "valid": false,
+      "value": {
+        "schema_version": 1,
+        "namespace": "A",
+        "generation": 1,
+        "route_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      }
+    },
+    {
+      "name": "namespace_underscore",
+      "valid": false,
+      "value": {
+        "schema_version": 1,
+        "namespace": "a_b",
+        "generation": 1,
+        "route_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      }
+    },
+    {
+      "name": "fingerprint_uppercase_hex",
+      "valid": false,
+      "value": {
+        "schema_version": 1,
+        "namespace": "a",
+        "generation": 1,
+        "route_fingerprint": "sha256:A000000000000000000000000000000000000000000000000000000000000000"
+      }
+    },
+    {
+      "name": "fingerprint_wrong_length",
+      "valid": false,
+      "value": {
+        "schema_version": 1,
+        "namespace": "a",
+        "generation": 1,
+        "route_fingerprint": "sha256:000000000000000000000000000000000000000000000000000000000000000"
+      }
+    },
+    {
+      "name": "fingerprint_wrong_prefix",
+      "valid": false,
+      "value": {
+        "schema_version": 1,
+        "namespace": "a",
+        "generation": 1,
+        "route_fingerprint": "sha257:0000000000000000000000000000000000000000000000000000000000000000"
+      }
+    }
+  ]
+}

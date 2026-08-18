@@ -420,10 +420,32 @@ pub enum WorkflowError {
     TaskRouteMismatch(Box<WorkflowError>),
 }
 
+/// Stable identity for one Task reviewer in a multi-reviewer route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewerSlot {
+    Primary,
+    Auxiliary,
+}
+
+impl ReviewerSlot {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Primary => "primary",
+            Self::Auxiliary => "auxiliary",
+        }
+    }
+}
+
 /// Materials used to build a canonical A1 `work_unit_key`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkUnitKeyParts<'a> {
     Design {
+        rel_doc_path: &'a str,
+        agent_type: &'a str,
+        profile_id: Option<&'a str>,
+    },
+    DesignFixer {
         rel_doc_path: &'a str,
         agent_type: &'a str,
         profile_id: Option<&'a str>,
@@ -448,6 +470,12 @@ pub enum WorkUnitKeyParts<'a> {
         agent_type: &'a str,
         profile_id: Option<&'a str>,
     },
+    TaskReviewerSlotted {
+        task_index: u32,
+        slot: ReviewerSlot,
+        agent_type: &'a str,
+        profile_id: Option<&'a str>,
+    },
     FinalReviewer {
         agent_type: &'a str,
         profile_id: Option<&'a str>,
@@ -462,6 +490,11 @@ pub enum WorkUnitKeyParts<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParsedWorkUnitKey {
     Design {
+        rel_doc_path: String,
+        agent_type: String,
+        profile_id: Option<String>,
+    },
+    DesignFixer {
         rel_doc_path: String,
         agent_type: String,
         profile_id: Option<String>,
@@ -483,6 +516,7 @@ pub enum ParsedWorkUnitKey {
     },
     TaskReviewer {
         task_index: u32,
+        slot: ReviewerSlot,
         agent_type: String,
         profile_id: Option<String>,
     },

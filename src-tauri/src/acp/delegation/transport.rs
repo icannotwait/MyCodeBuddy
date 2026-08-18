@@ -67,6 +67,7 @@ use super::workflow::CompleteWorkRequest;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::acp::delegation::types::DelegationReturnWhen;
+use crate::acp::delegation::types::OrchestrationBindingQueryRequest;
 use crate::acp::question::QuestionSpec;
 use crate::acp::recovery_authorization::RecoverySubjectKind;
 
@@ -151,6 +152,30 @@ pub struct BrokerStatusRequest {
     /// Matches [`BrokerRequest::parent_tool_use_id`] style (empty = missing).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub parent_tool_use_id: String,
+}
+
+/// Token-only parent-scoped request for one durable orchestration binding page.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrokerOrchestrationBindingsRequest {
+    pub token: String,
+    pub namespace: String,
+    pub limit: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+}
+
+impl BrokerOrchestrationBindingsRequest {
+    pub fn query(&self) -> OrchestrationBindingQueryRequest {
+        OrchestrationBindingQueryRequest {
+            namespace: self.namespace.clone(),
+            limit: self.limit,
+            snapshot_id: self.snapshot_id.clone(),
+            cursor: self.cursor.clone(),
+        }
+    }
 }
 
 /// Cancel a previously-issued delegation task by its broker `task_id`. Backs
@@ -423,6 +448,7 @@ pub enum BrokerMessage {
     Call(BrokerRequest),
     Cancel(BrokerCancelRequest),
     Status(BrokerStatusRequest),
+    OrchestrationBindings(BrokerOrchestrationBindingsRequest),
     CancelTask(BrokerCancelTaskRequest),
     Feedback(BrokerFeedbackRequest),
     CommitFeedback(BrokerCommitFeedbackRequest),
@@ -607,6 +633,18 @@ pub async fn client_status_round_trip(
     req: &BrokerStatusRequest,
 ) -> io::Result<BrokerResponse> {
     message_round_trip(socket_path, &BrokerMessage::Status(req.clone())).await
+}
+
+/// Dispatch a read-only parent-scoped durable binding snapshot page request.
+pub async fn client_orchestration_bindings_round_trip(
+    socket_path: &str,
+    req: &BrokerOrchestrationBindingsRequest,
+) -> io::Result<BrokerResponse> {
+    message_round_trip(
+        socket_path,
+        &BrokerMessage::OrchestrationBindings(req.clone()),
+    )
+    .await
 }
 
 /// Dispatch a `cancel_delegation` request and read back the task report.
@@ -844,6 +882,33 @@ mod tests {
             }
             other => panic!("expected Call variant, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn orchestration_binding_query_transport_is_token_only_and_strict() {
+        let request = BrokerOrchestrationBindingsRequest {
+            token: "secret".into(),
+            namespace: "brainstorm-to-delivery".into(),
+            limit: 100,
+            snapshot_id: None,
+            cursor: None,
+        };
+        let encoded = serde_json::to_value(BrokerMessage::OrchestrationBindings(request))
+            .expect("serialize query transport");
+        assert_eq!(encoded["kind"], "orchestration_bindings");
+        assert_eq!(encoded["token"], "secret");
+        assert_eq!(encoded["namespace"], "brainstorm-to-delivery");
+        for forbidden in [
+            "parent_id",
+            "parent_conversation_id",
+            "conversation_id",
+            "parent_connection_id",
+        ] {
+            assert!(encoded.get(forbidden).is_none(), "forged field {forbidden}");
+        }
+        let mut forged = encoded;
+        forged["parent_conversation_id"] = json!(91);
+        assert!(serde_json::from_value::<BrokerMessage>(forged).is_err());
     }
 
     #[test]

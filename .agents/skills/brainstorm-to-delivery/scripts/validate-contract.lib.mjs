@@ -3,22 +3,108 @@
  * and its Plan/progress documents.
  */
 
+import { createHash } from "node:crypto"
+
 export const MAX_PLAN_DOCUMENT_BYTES = 2 * 1024 * 1024
 export const MAX_PROGRESS_DOCUMENT_BYTES = 512 * 1024
 export const MAX_PROGRESS_BLOCK_BYTES = 64 * 1024
+export const MAX_ROUTING_BLOCK_BYTES = 256 * 1024
+export const MAX_DURABLE_EVIDENCE_BYTES = 4 * 1024 * 1024
+const MAX_DURABLE_SNAPSHOT_ROWS = 4096
+const DURABLE_STATUSES = new Set([
+  "reserving",
+  "running",
+  "completed",
+  "failed",
+  "canceled",
+])
+const DURABLE_PAGE_KEYS = [
+  "complete",
+  "namespace",
+  "next_cursor",
+  "page_start",
+  "request_cursor",
+  "runs",
+  "schema_version",
+  "snapshot_created_at",
+  "snapshot_expires_at",
+  "snapshot_id",
+  "snapshot_revision",
+  "total_rows",
+]
+const DURABLE_RUN_KEYS = [
+  "agent_type",
+  "child_conversation_id",
+  "generic_generation",
+  "lineage_root_task_id",
+  "orchestration_binding",
+  "previous_task_id",
+  "profile_id",
+  "replaced_task_id",
+  "replacement_reason",
+  "root_task_id",
+  "status",
+  "task_id",
+  "work_unit_key",
+]
+const DISPATCH_INTENT_KEYS = [
+  "adopted_after_lost_acknowledgement",
+  "continuation_target_task_id",
+  "expected_child_conversation_id",
+  "expected_generic_generation",
+  "expected_lineage_root_task_id",
+  "expected_root_task_id",
+  "kind",
+  "replacement_reason",
+  "replacement_target_task_id",
+]
+const PENDING_ROUTE_CHANGE_KEYS = [
+  "affected_task_indices",
+  "effective_from_task_index",
+  "next_generation",
+  "requested_agent_type",
+  "requested_profile_id",
+]
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
+const CURSOR_RE = /^[A-Za-z0-9_-]{1,128}$/
+const UTC_INSTANT_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/
+const MAX_U64 = 18446744073709551615n
 
 const MAX_I32 = 0x7fffffff
 const MAX_U32 = 0xffffffff
 const MAX_UNEXPECTED_CONTINUATIONS = 2
+const ROUTE_BINDING_SCHEMA_VERSION = 1
+const ROUTE_BINDING_NAMESPACE = "brainstorm-to-delivery"
+const ROUTE_BINDING_INPUT_MARKER = "codeg-b2d-route-binding-v1"
 
-const SKILL_CONTRACT_MARKER = "<!-- codeg-b2d-skill-contract-v1"
+const SKILL_CONTRACT_MARKER = "<!-- codeg-b2d-skill-contract-v2"
+const ROUTING_MARKER = "<!-- codeg-b2d-routing-v1"
 const PROGRESS_MARKER = "<!-- codeg-simple-progress-v1"
+const RISK_POLICY_VERSION = "b2d_task_risk_v1"
 const COMMENT_END = "-->"
+const SOFT_SIGNAL_SCORES = new Map([
+  ["cross_runtime_or_process", 2],
+  ["broad_production_surface", 1],
+  ["multiple_ownership_modules", 1],
+  ["shared_interface", 1],
+  ["dependency_or_build", 1],
+  ["multi_layer_without_test_seam", 1],
+])
+const HARD_TRIGGER_KINDS = new Set([
+  "concurrency_lifecycle",
+  "security_trust_boundary",
+  "migration_destructive_persistence",
+  "public_compatibility",
+  "unsafe_ffi",
+  "update_rollback",
+])
 const REQUIRED_SKILL_CONTRACT = {
-  schema_version: 1,
+  schema_version: 2,
   phase_order: [
     "establish-current-truth",
-    "produce-plan-and-register",
+    "resolve-task-agent",
+    "review-and-revise-design",
+    "author-and-review-plan",
     "maintain-progress",
     "apply-workspace-gate",
     "execute-tasks-serially",
@@ -27,20 +113,65 @@ const REQUIRED_SKILL_CONTRACT = {
   ],
   interfaces: {
     plan_authoring: "writing-plans",
+    task_execution: "subagent-driven-development",
     registration: "register_simple_workflow",
     first_run: "delegate_to_agent",
     later_run: "continue_delegation",
     join: "get_delegation_status",
     recovery_authorization: "request_recovery_authorization",
+    binding_query: "get_delegation_orchestration_bindings",
   },
   plan_setup_order: [
-    "create-progress",
-    "write-plan",
-    "confirm-plan-on-disk",
-    "register-simple-workflow",
-    "sync-plan-tasks",
+    "create-progress-shell",
+    "dispatch-plan-author",
+    "derive-plan-routing",
+    "initialize-progress-from-validator",
+    "validate-static-documents",
+    "validate-durable-admission",
     "review-plan",
+    "register-simple-workflow",
   ],
+  document_work: {
+    parent_edits: false,
+    design_review: "conditional",
+    design_reviewer: "independent_codex",
+    design_fixer: "independent_codex",
+    plan_author: "independent_codex",
+    plan_reviewer: "independent_codex",
+    producer_reviewer_independence: true,
+    plan_rereview: "full_latest_plan",
+    user_named_reviewers: "design_and_plan_only",
+    admission_cadence:
+      "fresh_applicable_mode_before_every_dispatch_or_continuation",
+  },
+  conversation_identity: {
+    distinct_work_units: "distinct_child_conversations",
+    continuation: "same_work_unit_only",
+  },
+  task_agent: {
+    default_agent_type: "grok",
+    selection_source: "invocation",
+    explicit_substitution: "forbidden",
+    change_boundary: "completed_tasks_after_plan_revision_and_full_rereview",
+  },
+  routing: {
+    marker: "codeg-b2d-routing-v1",
+    risk_policy_version: "b2d_task_risk_v1",
+    normal: {
+      implementer: "task_agent",
+      reviewers: ["codex_primary"],
+    },
+    high: {
+      implementer: "codex",
+      reviewers: ["codex_primary", "task_agent_auxiliary"],
+    },
+    reviewer_slots: ["primary", "auxiliary"],
+    task_order: "serial",
+    high_review_fan_out: "parallel_after_implementation",
+    binding_schema_version: 1,
+    binding_namespace: "brainstorm-to-delivery",
+    binding_source: "validator_output",
+  },
   progress: {
     marker: "codeg-simple-progress-v1",
     mutation_order: [
@@ -49,23 +180,24 @@ const REQUIRED_SKILL_CONTRACT = {
       "record-admission",
       "record-observed-state",
     ],
+    route_metadata: "additive",
+    dispatch_intent: "operation_specific_before_call",
+    pending_route_change: "record_before_plan_revision_clear_after_approval",
   },
   workspace_policy: "preserve-user-changes",
-  task_execution: {
-    order: "serial",
-    implementer: "grok",
-    reviewer: "codex",
-    review: "independent",
-  },
   recovery: {
     unexpected_continuations: 2,
     logical_replacements: 1,
     replacement_retry: "pre-admission-only",
+    durable_reconciliation: "fresh_complete_parent_scoped_snapshot",
+    lost_acknowledgement: "one_exact_unresolved_intent",
+    status_refresh: "state_only_then_fresh_full_admission",
   },
   final_review: {
     required: true,
     independent: true,
     reviewer: "codex",
+    fix_owner: "task_producer",
   },
 }
 const CONTRACT_ACTIONS = [
@@ -76,6 +208,7 @@ const CONTRACT_ACTIONS = [
   "delegate_to_agent",
   "continue_delegation",
   "get_delegation_status",
+  "get_delegation_orchestration_bindings",
   "request_recovery_authorization",
   "recovery_confirmation_required",
   "recovery_authorization_id",
@@ -103,21 +236,33 @@ const NEGATED_CONTRACT_ACTION = new RegExp(
 )
 const POSITIVE_SKILL_DIRECTIVES = new Set([
   "adjudicate",
+  "adopt",
+  "append",
+  "block",
   "call",
   "choose",
+  "clear",
   "commit",
   "complete",
+  "confirm",
   "continue",
+  "copy",
   "create",
+  "discard",
   "dispatch",
   "execute",
+  "exhaust",
+  "fetch",
   "handle",
   "inspect",
   "join",
   "keep",
   "mark",
+  "pass",
+  "persist",
   "prefer",
   "preserve",
+  "prove",
   "read",
   "re-read",
   "record",
@@ -125,7 +270,9 @@ const POSITIVE_SKILL_DIRECTIVES = new Set([
   "replace",
   "replay",
   "report",
+  "requery",
   "request",
+  "require",
   "route",
   "run",
   "set",
@@ -171,6 +318,24 @@ const BUILTIN_AGENT_TYPES = new Set([
   "grok",
   "cursor",
 ])
+const NAMED_AGENT_TERMS = new Set([
+  "claude",
+  "cline",
+  "code-buddy",
+  "codebuddy",
+  "codex",
+  "cursor",
+  "gemini",
+  "grok",
+  "hermes",
+  "kimi",
+  "open-code",
+  "opencode",
+  "pi",
+])
+const TASK_AGENT_NAME_TERMS = new Set(
+  [...NAMED_AGENT_TERMS].filter((name) => name !== "codex")
+)
 const RESERVED_CUSTOM_AGENT_IDS = new Set([
   ...BUILTIN_AGENT_TYPES,
   "claude-acp",
@@ -182,7 +347,7 @@ const RESERVED_CUSTOM_AGENT_IDS = new Set([
   "grok-build",
   "kimi",
 ])
-const V2_SKILL_IDENTIFIERS = [
+const RETIRED_WORKFLOW_IDENTIFIERS = [
   "get_workflow_capabilities",
   "get_workflow_state",
   "publish_workflow_manifest",
@@ -196,6 +361,943 @@ const V2_SKILL_IDENTIFIERS = [
   "artifact_digest",
   "reviewed_task_id",
 ]
+const DIRECTIVE_WINDOW_TOKENS = 64
+const DIRECTIVE_WINDOW_OVERLAP = 16
+// Match bounded directive structures only; the embedded positive contract
+// remains the authoritative workflow definition.
+const PRODUCTION_ACTIONS = new Set([
+  "author",
+  "authored",
+  "authors",
+  "authoring",
+  "change",
+  "changed",
+  "changes",
+  "changing",
+  "create",
+  "created",
+  "creates",
+  "creating",
+  "edit",
+  "edited",
+  "edits",
+  "editing",
+  "fix",
+  "fixed",
+  "fixes",
+  "fixing",
+  "implement",
+  "implemented",
+  "implementation",
+  "implementer",
+  "implements",
+  "implementing",
+  "modify",
+  "modified",
+  "modifies",
+  "modifying",
+  "own",
+  "owned",
+  "owns",
+  "patch",
+  "patched",
+  "patches",
+  "patching",
+  "produce",
+  "produced",
+  "produces",
+  "producing",
+  "revise",
+  "revised",
+  "revises",
+  "revising",
+  "update",
+  "updated",
+  "updates",
+  "updating",
+  "write",
+  "writes",
+  "writing",
+  "written",
+  "wrote",
+])
+const BARE_PRODUCTION_ACTIONS = new Set([
+  "author",
+  "change",
+  "create",
+  "edit",
+  "fix",
+  "implement",
+  "modify",
+  "own",
+  "patch",
+  "produce",
+  "revise",
+  "update",
+  "write",
+])
+const DIRECT_ROUTE_ACTIONS = new Set([
+  "delegate",
+  "delegated",
+  "delegates",
+  "delegating",
+  "route",
+  "routed",
+  "routes",
+  "routing",
+])
+const REVIEW_TERMS = new Set([
+  "review",
+  "reviewed",
+  "reviewer",
+  "reviewers",
+  "reviewing",
+  "reviews",
+])
+const ORCHESTRATION_ACTIONS = new Set([
+  "ask",
+  "asked",
+  "asks",
+  "asking",
+  "direct",
+  "directed",
+  "directing",
+  "directs",
+  "dispatch",
+  "dispatched",
+  "dispatches",
+  "dispatching",
+  "instruct",
+  "instructed",
+  "instructing",
+  "instructs",
+  "send",
+  "sending",
+  "sends",
+  "sent",
+  "tell",
+  "telling",
+  "tells",
+  "told",
+])
+const PRODUCER_DELEGATION_ACTIONS = new Set([
+  ...ORCHESTRATION_ACTIONS,
+  ...DIRECT_ROUTE_ACTIONS,
+])
+const FINITE_PARENT_PREDICATE_MARKERS = new Set([
+  "can",
+  "could",
+  "did",
+  "does",
+  "itself",
+  "may",
+  "might",
+  "must",
+  "shall",
+  "should",
+  "will",
+  "would",
+])
+const DOCUMENT_OR_CODE_TARGETS = new Set([
+  "artifact",
+  "artifacts",
+  "code",
+  "design",
+  "designs",
+  "document",
+  "documents",
+  "implementation",
+  "plan",
+  "plans",
+  "task",
+  "tasks",
+])
+const PLURAL_DOCUMENT_TARGETS = new Set([
+  "artifacts",
+  "designs",
+  "documents",
+  "plans",
+  "tasks",
+])
+const PEOPLE_ANTECEDENT_TERMS = new Set([
+  "authors",
+  "developer",
+  "developers",
+  "fixers",
+  "people",
+  "producer",
+  "producers",
+  "reviewer",
+  "reviewers",
+])
+const PLURAL_PEOPLE_ANTECEDENT_TERMS = new Set([
+  "authors",
+  "developers",
+  "fixers",
+  "people",
+  "producers",
+  "reviewers",
+])
+const PEOPLE_ANTECEDENT_LINKS = new Set([
+  "alongside",
+  "by",
+  "for",
+  "from",
+  "to",
+  "with",
+])
+const PEOPLE_ANTECEDENT_RELATION_BOUNDARIES = new Set([
+  "after",
+  "although",
+  "as",
+  "before",
+  "because",
+  "but",
+  "if",
+  "once",
+  "or",
+  "since",
+  "so",
+  "then",
+  "though",
+  "unless",
+  "until",
+  "when",
+  "whereas",
+  "while",
+  "yet",
+])
+const PEOPLE_CLAUSE_SUBJECT_STARTERS = new Set([
+  "a",
+  "an",
+  "both",
+  "each",
+  "every",
+  "the",
+  "these",
+  "this",
+  "those",
+])
+const PEOPLE_PARTITIVE_TARGET_HEADS = new Set([
+  "all",
+  "both",
+  "each",
+  "either",
+  "many",
+  "most",
+  "neither",
+  "none",
+  "some",
+])
+const PEOPLE_PARTICIPANT_ACTIONS = new Set([
+  "consult",
+  "consulted",
+  "consulting",
+])
+const PEOPLE_PURPOSE_ACTIONS = new Set([
+  "allow",
+  "allows",
+  "allowing",
+  "enable",
+  "enables",
+  "enabling",
+  "let",
+  "lets",
+  "letting",
+])
+const DOCUMENT_PERSON_ROLE_TERMS = new Set([
+  "author",
+  "authors",
+  "fixer",
+  "fixers",
+  "producer",
+  "producers",
+  "reviewer",
+  "reviewers",
+])
+const ANTECEDENT_PREDICATES = new Set([
+  ...PRODUCTION_ACTIONS,
+  ...ORCHESTRATION_ACTIONS,
+  "discuss",
+  "discussed",
+  "discusses",
+  "discussing",
+  "list",
+  "listed",
+  "listing",
+  "lists",
+])
+const DOCUMENT_OBJECT_ANTECEDENT_PREDICATES = new Set([
+  ...PRODUCTION_ACTIONS,
+  "list",
+  "listed",
+  "listing",
+  "lists",
+])
+const NEGATION_TERMS = new Set([
+  "avoid",
+  "avoided",
+  "avoiding",
+  "avoids",
+  "cannot",
+  "forbid",
+  "forbidden",
+  "forbids",
+  "never",
+  "no",
+  "not",
+  "prevent",
+  "prevented",
+  "preventing",
+  "prevents",
+  "prohibit",
+  "prohibited",
+  "prohibits",
+  "refuse",
+  "refused",
+  "refuses",
+  "refusing",
+  "without",
+])
+const REVIEW_ABSENCE_TERMS = new Set([
+  "absent",
+  "lack",
+  "lacking",
+  "lacks",
+  "missing",
+  "no",
+  "omit",
+  "omits",
+  "omitted",
+  "omitting",
+  "without",
+])
+const POSTPOSED_REVIEW_ABSENCE_TERMS = new Set([
+  "absent",
+  "lacking",
+  "missing",
+  "omitted",
+])
+const POSTPOSED_REVIEW_ABSENCE_MODIFIERS = new Set([
+  "again",
+  "altogether",
+  "completely",
+  "entirely",
+  "later",
+  "now",
+  "often",
+  "overnight",
+  "soon",
+  "still",
+  "today",
+  "tomorrow",
+  "tonight",
+  "twice",
+  "yesterday",
+])
+const POSTPOSED_REVIEW_ABSENCE_MODIFIER_PHRASES = [
+  ["as", "usual"],
+  ["at", "present"],
+  ["for", "now"],
+  ["often", "found"],
+  ["once", "again"],
+  ["once", "more"],
+  ["right", "now"],
+]
+const POSTPOSED_REVIEW_ABSENCE_TIME_TERMS = new Set([
+  "afternoon",
+  "day",
+  "days",
+  "evening",
+  "friday",
+  "fridays",
+  "monday",
+  "mondays",
+  "morning",
+  "month",
+  "months",
+  "night",
+  "nights",
+  "quarter",
+  "quarters",
+  "saturday",
+  "saturdays",
+  "sunday",
+  "sundays",
+  "thursday",
+  "thursdays",
+  "tuesday",
+  "tuesdays",
+  "wednesday",
+  "wednesdays",
+  "week",
+  "weeks",
+  "weekend",
+  "weekends",
+  "year",
+  "years",
+])
+const POSTPOSED_REVIEW_ABSENCE_TRANSITIVE_TERMS = new Set([
+  "lacking",
+  "missing",
+])
+const POSTPOSED_REVIEW_ABSENCE_COMPLEMENT_LINKS = new Set([
+  "after",
+  "as",
+  "at",
+  "before",
+  "because",
+  "during",
+  "for",
+  "from",
+  "in",
+  "on",
+  "over",
+  "across",
+  "since",
+  "through",
+  "throughout",
+  "until",
+  "when",
+  "while",
+  "with",
+  "without",
+])
+const POSTPOSED_REVIEW_ABSENCE_COMPLEMENT_PHRASES = [
+  ["due", "to"],
+  ["owing", "to"],
+]
+const POSTPOSED_REVIEW_ABSENCE_TIME_DETERMINERS = new Set([
+  "a",
+  "all",
+  "each",
+  "every",
+  "last",
+  "next",
+  "that",
+  "the",
+  "these",
+  "this",
+  "those",
+])
+const POSTPOSED_REVIEW_ABSENCE_TIME_QUALIFIERS = new Set([
+  "coming",
+  "few",
+  "entire",
+  "half",
+  "last",
+  "most",
+  "next",
+  "other",
+  "past",
+  "several",
+  "whole",
+])
+const POSTPOSED_REVIEW_ABSENCE_TIME_COUNTS = new Set([
+  "eight",
+  "five",
+  "four",
+  "nine",
+  "one",
+  "seven",
+  "six",
+  "ten",
+  "three",
+  "two",
+])
+const POSTPOSED_REVIEW_ABSENCE_TIME_DESCRIPTOR_TERMS = new Set([
+  ...POSTPOSED_REVIEW_ABSENCE_MODIFIERS,
+  ...POSTPOSED_REVIEW_ABSENCE_TIME_COUNTS,
+  ...POSTPOSED_REVIEW_ABSENCE_TIME_DETERMINERS,
+  ...POSTPOSED_REVIEW_ABSENCE_TIME_QUALIFIERS,
+  "and",
+  "couple",
+  "first",
+  "of",
+  "second",
+  "single",
+  "third",
+])
+const ACTOR_LINKS = new Set(["by", "to"])
+const NESTED_ACTOR_PREFIX_LINKS = new Set([
+  "after",
+  "before",
+  "for",
+  "from",
+  "of",
+  "through",
+  "with",
+])
+const ACTOR_RELATION_BOUNDARIES = new Set([
+  "after",
+  "although",
+  "before",
+  "during",
+  "if",
+  "once",
+  "unless",
+  "upon",
+  "when",
+  "whereas",
+  "while",
+])
+const CLAUSE_COORDINATORS = new Set(["and", "but", "while", "yet"])
+const PREDICATE_COORDINATORS = new Set(["and", "but"])
+const ALTERNATIVE_RESET_COORDINATORS = new Set([
+  "although",
+  "but",
+  "whereas",
+  "while",
+  "yet",
+])
+const SEQUENTIAL_PASSIVE_RELATION_FILLERS = new Set([
+  "also",
+  "subsequently",
+  "then",
+])
+const TASK_RELATION_BOUNDARIES = new Set([...CLAUSE_COORDINATORS, "or"])
+const HIGH_TASK_SCOPES = new Set(["high", "high-risk"])
+const NORMAL_TASK_SCOPES = new Set(["normal"])
+const UNIVERSAL_TASK_SCOPES = new Set([
+  "all",
+  "always",
+  "each",
+  "every",
+  "unconditionally",
+])
+const EXPLICIT_TASK_ACTIVITY_TERMS = new Set([
+  "active",
+  "in-progress",
+  "running",
+])
+const TASK_COMPLETION_TERMS = new Set([
+  "complete",
+  "completed",
+  "completes",
+  "completion",
+  "done",
+  "finish",
+  "finished",
+  "finishes",
+])
+const TASK_COMPLETION_BRIDGE_TERMS = new Set([
+  "already",
+  "be",
+  "been",
+  "being",
+  "can",
+  "could",
+  "finally",
+  "had",
+  "has",
+  "have",
+  "is",
+  "may",
+  "might",
+  "must",
+  "now",
+  "was",
+  "were",
+  "will",
+  "would",
+])
+const TASK_COMPONENT_SUFFIX_TERMS = new Set([
+  "review",
+  "reviews",
+  "test",
+  "tests",
+  "testing",
+  "validation",
+])
+const TASK_COMPONENT_COMPOUND_MODIFIERS = new Set([
+  "code",
+  "integration",
+  "security",
+])
+const TASK_COMPONENT_ACTION_FORMS = new Set(["review", "test"])
+const TASK_COMPONENT_IMPERATIVE_PREFIX_TERMS = new Set(["please"])
+const TASK_COMPONENT_CONTINUATION_PREDICATES = new Set([
+  "continue",
+  "continues",
+  "continuing",
+])
+const TASK_REACTIVATION_PREDICATES = new Set([
+  "begin",
+  "begins",
+  "beginning",
+  "resume",
+  "resumes",
+  "resuming",
+  "restart",
+  "restarts",
+  "restarting",
+  "start",
+  "starts",
+  "starting",
+])
+const TASK_REACTIVATION_STATE_LINKS = new Set(["become", "becomes", "becoming"])
+const TASK_COMPONENT_STATE_LINKS = new Set([
+  "are",
+  "had",
+  "has",
+  "have",
+  "is",
+  "remain",
+  "remains",
+  "stays",
+  "was",
+  "were",
+])
+const TASK_UNFINISHED_STATE_TERMS = new Set([
+  "active",
+  "incomplete",
+  "ongoing",
+  "open",
+  "pending",
+  "running",
+  "underway",
+  "unfinished",
+])
+const PARTIAL_TASK_COMPLETION_TERMS = new Set([
+  "almost",
+  "barely",
+  "largely",
+  "mostly",
+  "nearly",
+  "partially",
+  "partly",
+  "provisionally",
+  "scarcely",
+  "substantially",
+])
+const TASK_STATE_CLAUSE_BOUNDARIES = new Set([
+  "although",
+  "and",
+  "because",
+  "but",
+  "if",
+  "though",
+  "unless",
+  "when",
+  "whereas",
+  "while",
+  "yet",
+])
+const TASK_STATE_MODIFIERS = new Set([
+  "actively",
+  "afterward",
+  "currently",
+  "still",
+  "then",
+  "yet",
+])
+const AGENT_CHANGE_SUBJECT_BRIDGE_TERMS = new Set([
+  ...FINITE_PARENT_PREDICATE_MARKERS,
+  ...TASK_STATE_MODIFIERS,
+  "later",
+  "now",
+])
+const AGENT_IDENTITY_OBJECT_TERMS = new Set([
+  "identities",
+  "identity",
+  "profile",
+  "profiles",
+])
+const AGENT_IDENTITY_OBJECT_PREFIX_TERMS = new Set([
+  "a",
+  "an",
+  "current",
+  "its",
+  "own",
+  "selected",
+  "that",
+  "the",
+  "their",
+  "this",
+])
+const TASK_STATE_ANAPHOR_ADJUNCT_PREFIXES = [
+  ["according", "to"],
+  ["in", "fact"],
+]
+const TASK_STATE_REPORTING_PREDICATES = new Set([
+  "claim",
+  "claimed",
+  "claims",
+  "indicate",
+  "indicated",
+  "indicates",
+  "report",
+  "reported",
+  "reports",
+  "say",
+  "says",
+  "said",
+])
+const TASK_STATE_OBJECT_PRONOUN_MODIFIERS = new Set([
+  "also",
+  "even",
+  "just",
+  "only",
+])
+const EXPLICIT_NON_TASK_ANTECEDENT_MODIFIERS = new Set([
+  "different",
+  "distinct",
+  "separate",
+  "unrelated",
+])
+const TASK_STATE_CARRIED_ADJUNCT_STARTS = new Set([
+  "after",
+  "before",
+  "following",
+  "once",
+  "upon",
+  "when",
+])
+const TASK_REACTIVATION_NEGATION_BOUNDARIES = new Set([
+  ...TASK_STATE_CLAUSE_BOUNDARIES,
+  ...TASK_STATE_CARRIED_ADJUNCT_STARTS,
+])
+const TASK_STATE_SUBJECT_DETERMINERS = new Set([
+  "a",
+  "an",
+  "each",
+  "every",
+  "the",
+  "this",
+])
+const TASK_DIRECT_OBJECT_QUALIFIERS = new Set([
+  ...TASK_STATE_SUBJECT_DETERMINERS,
+  ...TASK_STATE_MODIFIERS,
+  ...EXPLICIT_TASK_ACTIVITY_TERMS,
+  "current",
+  "its",
+  "our",
+  "own",
+  "that",
+  "their",
+  "your",
+])
+const TASK_ANTECEDENT_NON_OBJECT_LINKS = new Set([
+  ...PEOPLE_ANTECEDENT_LINKS,
+  "about",
+  "near",
+  "of",
+  "on",
+  "regarding",
+])
+const TASK_STATE_ADJUNCT_NON_SUBJECT_TERMS = new Set([
+  ...TASK_COMPONENT_STATE_LINKS,
+  ...TASK_STATE_MODIFIERS,
+  ...TASK_STATE_OBJECT_PRONOUN_MODIFIERS,
+  ...TASK_STATE_SUBJECT_DETERMINERS,
+  "according",
+  "after",
+  "before",
+  "fact",
+  "following",
+  "in",
+  "its",
+  "ongoing",
+  "own",
+  "telemetry",
+  "that",
+  "to",
+])
+const TASK_COMPLETION_SEQUENCE_TERMS = new Set([
+  "afterward",
+  "it",
+  "itself",
+  "later",
+  "longer",
+  "no",
+  "not",
+  "only",
+])
+const TASK_COMPLETION_ADJUNCT_HEADS = new Set([
+  "ahead",
+  "today",
+  "tomorrow",
+  "under",
+  "without",
+  "yesterday",
+])
+const ACTIVE_TIMING_MARKERS = new Set(["during", "inside", "while"])
+const BOUNDARY_TIMING_MARKERS = new Set([
+  "after",
+  "following",
+  "on",
+  "once",
+  "upon",
+  "when",
+])
+const PRE_COMPLETION_TIMING_MARKERS = new Set(["before", "prior"])
+const TASK_REFERENCE_BOUNDARIES = new Set([
+  ...CLAUSE_COORDINATORS,
+  ...ACTIVE_TIMING_MARKERS,
+  ...BOUNDARY_TIMING_MARKERS,
+  ...PRE_COMPLETION_TIMING_MARKERS,
+  "for",
+  "from",
+  "of",
+  "through",
+  "to",
+  "until",
+  "with",
+])
+const REVIEW_SUBJECT_BOUNDARIES = new Set([
+  ...CLAUSE_COORDINATORS,
+  ...BOUNDARY_TIMING_MARKERS,
+  ...PRE_COMPLETION_TIMING_MARKERS,
+  "if",
+  "unless",
+])
+const REVIEW_BYPASS_ACTIONS = new Set([
+  "instead",
+  "omit",
+  "omits",
+  "omitted",
+  "omitting",
+  "optional",
+  "optionally",
+  "place",
+  "replace",
+  "replaced",
+  "replaces",
+  "replacing",
+  "skip",
+  "skipped",
+  "skips",
+  "skipping",
+  "stand",
+  "standing",
+  "stands",
+  "stood",
+  "substitute",
+  "substituted",
+  "substitutes",
+  "substituting",
+])
+const REVIEW_REPLACEMENT_ACTIONS = new Set([
+  "place",
+  "replace",
+  "replaced",
+  "replaces",
+  "replacing",
+  "stand",
+  "standing",
+  "stands",
+  "stood",
+  "substitute",
+  "substituted",
+  "substitutes",
+  "substituting",
+])
+const REVIEW_TAKE_ACTIONS = new Set(["take", "takes", "taking", "took"])
+const REVIEW_REQUIREMENT_ACTIONS = new Set(["mandatory", "required"])
+const REVIEW_TARGET_ANAPHORIC_TERMS = new Set([
+  "aforementioned",
+  "former",
+  "original",
+  "previous",
+  "same",
+  "that",
+  "this",
+])
+const GENERIC_REVIEW_TARGET_PREFIX_TERMS = new Set([
+  "a",
+  "aforementioned",
+  "an",
+  "assigned",
+  "former",
+  "original",
+  "previous",
+  "previously",
+  "same",
+  "that",
+  "the",
+  "this",
+  "very",
+])
+const REVIEW_TARGET_ADJUNCT_LINKS = new Set([
+  "after",
+  "as",
+  "before",
+  "because",
+  "by",
+  "during",
+  "for",
+  "from",
+  "if",
+  "in",
+  "once",
+  "on",
+  "since",
+  "that",
+  "unless",
+  "until",
+  "to",
+  "upon",
+  "when",
+  "whenever",
+  "while",
+  "which",
+  "who",
+  "with",
+])
+const REVIEW_TARGET_NON_ROLE_HEAD_TERMS = new Set([
+  ...POSTPOSED_REVIEW_ABSENCE_MODIFIERS,
+  "role",
+  "slot",
+])
+const REVIEW_TARGET_GENERIC_PERSON_TERMS = new Set([
+  "individual",
+  "one",
+  "party",
+  "person",
+])
+const REVIEW_EXHAUSTIVE_QUANTIFIERS = new Set([
+  "alone",
+  "exclusively",
+  "only",
+  "solely",
+])
+const REVIEW_ACTOR_TAIL_TERMS = new Set([
+  "a",
+  "agent",
+  "an",
+  "auxiliary",
+  "primary",
+  "review",
+  "reviewer",
+  "reviewers",
+  "role",
+  "slot",
+  "the",
+])
+const QUANTIFIER_COMPLEMENT_LINKS = new Set([
+  "about",
+  "for",
+  "regarding",
+  ...ACTIVE_TIMING_MARKERS,
+  ...BOUNDARY_TIMING_MARKERS,
+  ...PRE_COMPLETION_TIMING_MARKERS,
+])
+const QUANTIFIER_COMPLEMENT_MODIFIERS = new Set(["directly", "immediately"])
+const REVIEW_SUBJECT_LINKS = new Set([
+  "although",
+  "am",
+  "are",
+  "be",
+  "been",
+  "being",
+  "is",
+  "remain",
+  "remains",
+  "though",
+  "was",
+  "were",
+])
+const REFLEXIVE_TARGETS = new Set(["itself", "themselves"])
 const FORBIDDEN_PROGRESS_FIELDS = new Set([
   "workflow_id",
   "workflow_kind",
@@ -255,11 +1357,7 @@ function normalizeRelPath(value) {
   if (value.includes("|") || hasControl(value)) return null
 
   const nfc = value.normalize("NFC")
-  if (
-    nfc.startsWith("/") ||
-    nfc.startsWith("\\\\") ||
-    /^[A-Za-z]:/.test(nfc)
-  ) {
+  if (nfc.startsWith("/") || nfc.startsWith("\\\\") || /^[A-Za-z]:/.test(nfc)) {
     return null
   }
 
@@ -338,14 +1436,52 @@ function parseRecognizedWorkUnitKey(value) {
     ) {
       return null
     }
-    return { kind: "task", taskIndex, role, agentType, profileId }
+    return {
+      kind: "task",
+      taskIndex,
+      role,
+      slot: role === "reviewer" ? "primary" : null,
+      agentType,
+      profileId,
+      legacy: role === "reviewer",
+    }
+  }
+
+  if (parts[0] === "task" && parts.length === 6) {
+    const [, indexToken, role, slot, agentType, profileToken] = parts
+    if (
+      !/^[1-9][0-9]*$/.test(indexToken) ||
+      role !== "reviewer" ||
+      !["primary", "auxiliary"].includes(slot) ||
+      !validAgentType(agentType)
+    ) {
+      return null
+    }
+    const taskIndex = Number(indexToken)
+    const profileId = parseProfileToken(profileToken)
+    if (
+      !Number.isInteger(taskIndex) ||
+      taskIndex > MAX_U32 ||
+      profileId === undefined
+    ) {
+      return null
+    }
+    return {
+      kind: "task",
+      taskIndex,
+      role,
+      slot,
+      agentType,
+      profileId,
+      legacy: false,
+    }
   }
 
   if (["design", "plan"].includes(parts[0]) && parts.length === 5) {
     const [kind, path, role, agentType, profileToken] = parts
     const normalizedPath = normalizeRelPath(path)
     const allowedRole =
-      (kind === "design" && role === "reviewer") ||
+      (kind === "design" && ["reviewer", "fixer"].includes(role)) ||
       (kind === "plan" && ["author", "reviewer"].includes(role))
     const profileId = parseProfileToken(profileToken)
     if (
@@ -356,20 +1492,26 @@ function parseRecognizedWorkUnitKey(value) {
     ) {
       return null
     }
-    return { kind, path, role, agentType, profileId }
+    return { kind, path, role, agentType, profileId, legacy: false }
   }
 
   if (parts[0] === "final_review" && parts.length === 4) {
     const [, role, agentType, profileToken] = parts
     const profileId = parseProfileToken(profileToken)
     if (
-      !["reviewer", "fixer"].includes(role) ||
+      role !== "reviewer" ||
       !validAgentType(agentType) ||
       profileId === undefined
     ) {
       return null
     }
-    return { kind: "final_review", role, agentType, profileId }
+    return {
+      kind: "final_review",
+      role,
+      agentType,
+      profileId,
+      legacy: false,
+    }
   }
   return null
 }
@@ -419,33 +1561,19 @@ function numberedSkillSections(skill) {
 }
 
 function embeddedSkillContracts(skill) {
-  const contracts = []
-  let contract = null
-  let fence = null
-  for (const [lineIndex, line] of skill.split(/\r?\n/).entries()) {
-    if (contract) {
-      if (line.trim() === COMMENT_END) {
-        contracts.push({
-          line: contract.line,
-          source: contract.lines.join("\n"),
-        })
-        contract = null
-      } else {
-        contract.lines.push(line)
-      }
-      continue
-    }
-    if (fence) {
-      if (fenceEnd(line, fence)) fence = null
-      continue
-    }
-    fence = fenceStart(line)
-    if (fence) continue
-    if (line.trim() === SKILL_CONTRACT_MARKER) {
-      contract = { line: lineIndex + 1, lines: [] }
-    }
+  const extracted = extractUnfencedComment(
+    skill,
+    SKILL_CONTRACT_MARKER,
+    512 * 1024
+  )
+  return {
+    contracts:
+      extracted.body === null
+        ? []
+        : [{ line: extracted.line, source: extracted.body }],
+    markerCount: extracted.markerCount,
+    unterminated: extracted.problem === "truncated",
   }
-  return { contracts, unterminated: contract !== null }
 }
 
 function canonicalJson(value) {
@@ -483,6 +1611,3927 @@ function unfencedVisibleSkillProse(skill) {
   return visibleSkillProse(lines.join("\n"))
 }
 
+function directiveWindows(prose) {
+  const windows = []
+  const step = DIRECTIVE_WINDOW_TOKENS - DIRECTIVE_WINDOW_OVERLAP
+  const withoutKeys = prose.replace(
+    /\b(?:design|final_review|plan|task)\|[^\s.,;:]+/gi,
+    " "
+  )
+  for (const paragraph of withoutKeys
+    .normalize("NFKC")
+    .toLowerCase()
+    .split(/\n\s*\n+/)) {
+    let priorTokens = []
+    let priorActionBoundaryAfter = new Set()
+    let priorImperativeBoundaryAfter = new Set()
+    let priorPossessiveIndexes = new Set()
+    let carriedTasks = []
+    for (const source of paragraph.split(/[.!?;]+/)) {
+      const matches = [...source.matchAll(/[a-z0-9]+(?:-[a-z0-9]+)*/g)]
+      const tokens = matches.map((match) => match[0])
+      const actionBoundaryAfter = matches.flatMap((match, index) => {
+        const gapStart = match.index + match[0].length
+        const gapEnd = matches[index + 1]?.index ?? source.length
+        return /[-,:\/()[\]\u2013\u2014]/.test(source.slice(gapStart, gapEnd))
+          ? [index]
+          : []
+      })
+      const imperativeBoundaryAfter = matches.flatMap((match, index) => {
+        const gapStart = match.index + match[0].length
+        const gapEnd = matches[index + 1]?.index ?? source.length
+        return /[-,:\/\u2013\u2014]/.test(source.slice(gapStart, gapEnd))
+          ? [index]
+          : []
+      })
+      const possessiveIndexes = matches.flatMap((match, index) => {
+        const gapStart = match.index + match[0].length
+        const gapEnd = matches[index + 1]?.index ?? source.length
+        return /['\u2019]/.test(source.slice(gapStart, gapEnd)) ? [index] : []
+      })
+      const immediatePriorTasks = directiveTaskAntecedents(
+        priorTokens,
+        priorActionBoundaryAfter,
+        priorPossessiveIndexes,
+        priorImperativeBoundaryAfter
+      )
+      const priorTasks =
+        immediatePriorTasks.length > 0 ? immediatePriorTasks : carriedTasks
+      for (let start = 0; start < tokens.length; start += step) {
+        windows.push({
+          tokens: tokens.slice(start, start + DIRECTIVE_WINDOW_TOKENS),
+          actionBoundaryAfter: new Set(
+            actionBoundaryAfter
+              .filter(
+                (index) =>
+                  index >= start && index < start + DIRECTIVE_WINDOW_TOKENS
+              )
+              .map((index) => index - start)
+          ),
+          imperativeBoundaryAfter: new Set(
+            imperativeBoundaryAfter
+              .filter(
+                (index) =>
+                  index >= start && index < start + DIRECTIVE_WINDOW_TOKENS
+              )
+              .map((index) => index - start)
+          ),
+          possessiveIndexes: new Set(
+            possessiveIndexes
+              .filter(
+                (index) =>
+                  index >= start && index < start + DIRECTIVE_WINDOW_TOKENS
+              )
+              .map((index) => index - start)
+          ),
+          priorReviewers: directiveReviewers(priorTokens),
+          priorTasks,
+          priorDocumentTargets: directiveDocumentTargets(priorTokens),
+          priorPronounAntecedent: directivePronounAntecedent(
+            priorTokens,
+            priorPossessiveIndexes,
+            priorActionBoundaryAfter
+          ),
+        })
+      }
+      if (tokens.length > 0) {
+        carriedTasks = carriedTaskAntecedentsAfterClause(
+          tokens,
+          new Set(actionBoundaryAfter),
+          new Set(possessiveIndexes),
+          new Set(imperativeBoundaryAfter),
+          carriedTasks
+        )
+        const priorStart = Math.max(0, tokens.length - DIRECTIVE_WINDOW_TOKENS)
+        priorTokens = tokens.slice(priorStart)
+        priorActionBoundaryAfter = new Set(
+          actionBoundaryAfter
+            .filter((index) => index >= priorStart)
+            .map((index) => index - priorStart)
+        )
+        priorImperativeBoundaryAfter = new Set(
+          imperativeBoundaryAfter
+            .filter((index) => index >= priorStart)
+            .map((index) => index - priorStart)
+        )
+        priorPossessiveIndexes = new Set(
+          possessiveIndexes
+            .filter((index) => index >= priorStart)
+            .map((index) => index - priorStart)
+        )
+      }
+    }
+  }
+  return windows
+}
+
+function tokenIndex(tokens, candidates, start = 0, end = tokens.length) {
+  const limit = Math.min(tokens.length, end)
+  for (let index = Math.max(0, start); index < limit; index += 1) {
+    if (candidates.has(tokens[index])) return index
+  }
+  return -1
+}
+
+function tokenIndexes(tokens, candidates, start = 0, end = tokens.length) {
+  const indexes = []
+  const limit = Math.min(tokens.length, end)
+  for (let index = Math.max(0, start); index < limit; index += 1) {
+    if (candidates.has(tokens[index])) indexes.push(index)
+  }
+  return indexes
+}
+
+function phraseIndex(tokens, phrase, start = 0, end = tokens.length) {
+  const limit = Math.min(tokens.length, end) - phrase.length
+  for (let index = Math.max(0, start); index <= limit; index += 1) {
+    if (phrase.every((token, offset) => tokens[index + offset] === token)) {
+      return index
+    }
+  }
+  return -1
+}
+
+function tokensArePostposedReviewAbsenceModifiers(tokens) {
+  let index = 0
+  while (index < tokens.length) {
+    const token = tokens[index]
+    const fractionalDuration = tokenIndexes(
+      tokens,
+      POSTPOSED_REVIEW_ABSENCE_TIME_TERMS,
+      index,
+      Math.min(tokens.length, index + 5)
+    ).find(
+      (time) =>
+        tokens
+          .slice(index, time)
+          .every(
+            (descriptor) =>
+              /^\d+$/.test(descriptor) ||
+              POSTPOSED_REVIEW_ABSENCE_TIME_DESCRIPTOR_TERMS.has(descriptor)
+          ) &&
+        phraseIndex(tokens, ["and", "a", "half"], time + 1, time + 4) ===
+          time + 1
+    )
+    if (fractionalDuration !== undefined) {
+      index = fractionalDuration + 4
+      continue
+    }
+    const duration = tokenIndexes(
+      tokens,
+      POSTPOSED_REVIEW_ABSENCE_TIME_TERMS,
+      index,
+      Math.min(tokens.length, index + 8)
+    ).find((time) =>
+      tokens
+        .slice(index, time)
+        .every(
+          (descriptor) =>
+            /^\d+$/.test(descriptor) ||
+            POSTPOSED_REVIEW_ABSENCE_TIME_DESCRIPTOR_TERMS.has(descriptor)
+        )
+    )
+    if (duration !== undefined) {
+      index = duration + 1
+      continue
+    }
+    if (
+      (/^\d+$/.test(token) ||
+        POSTPOSED_REVIEW_ABSENCE_TIME_COUNTS.has(token) ||
+        POSTPOSED_REVIEW_ABSENCE_MODIFIERS.has(token)) &&
+      POSTPOSED_REVIEW_ABSENCE_TIME_TERMS.has(tokens[index + 1])
+    ) {
+      index += 2
+      continue
+    }
+    if (token === "and" && index > 0 && index + 1 < tokens.length) {
+      index += 1
+      continue
+    }
+    if (POSTPOSED_REVIEW_ABSENCE_TIME_DETERMINERS.has(token)) {
+      let time = index + 1
+      while (
+        POSTPOSED_REVIEW_ABSENCE_TIME_QUALIFIERS.has(tokens[time]) ||
+        POSTPOSED_REVIEW_ABSENCE_TIME_COUNTS.has(tokens[time]) ||
+        /^\d+$/.test(tokens[time])
+      ) {
+        time += 1
+      }
+      if (POSTPOSED_REVIEW_ABSENCE_TIME_TERMS.has(tokens[time])) {
+        index = time + 1
+        continue
+      }
+    }
+    if (
+      POSTPOSED_REVIEW_ABSENCE_TIME_QUALIFIERS.has(token) &&
+      POSTPOSED_REVIEW_ABSENCE_TIME_TERMS.has(tokens[index + 1])
+    ) {
+      index += 2
+      continue
+    }
+    if (
+      token === "half" &&
+      POSTPOSED_REVIEW_ABSENCE_TIME_DETERMINERS.has(tokens[index + 1]) &&
+      POSTPOSED_REVIEW_ABSENCE_TIME_TERMS.has(tokens[index + 2])
+    ) {
+      index += 3
+      continue
+    }
+    if (
+      new Set(["half", "most"]).has(token) &&
+      tokens[index + 1] === "of" &&
+      POSTPOSED_REVIEW_ABSENCE_TIME_DETERMINERS.has(tokens[index + 2]) &&
+      POSTPOSED_REVIEW_ABSENCE_TIME_TERMS.has(tokens[index + 3])
+    ) {
+      index += 4
+      continue
+    }
+    const phrase = POSTPOSED_REVIEW_ABSENCE_MODIFIER_PHRASES.find((candidate) =>
+      candidate.every(
+        (phraseToken, offset) => tokens[index + offset] === phraseToken
+      )
+    )
+    if (phrase) {
+      index += phrase.length
+      continue
+    }
+    if (token.endsWith("ly") || POSTPOSED_REVIEW_ABSENCE_MODIFIERS.has(token)) {
+      index += 1
+      continue
+    }
+    return false
+  }
+  return true
+}
+
+function reviewAbsenceTailStartsComplement(tail) {
+  const startsWithComplementPhrase =
+    POSTPOSED_REVIEW_ABSENCE_COMPLEMENT_PHRASES.some(
+      (phrase) => phraseIndex(tail, phrase, 0, phrase.length) === 0
+    )
+  const complementLinkIndicatesAbsence =
+    POSTPOSED_REVIEW_ABSENCE_COMPLEMENT_LINKS.has(tail[0]) &&
+    !(
+      (tail[0] === "at" && tail[1] === "least") ||
+      (tail[0] === "over" &&
+        !tokensArePostposedReviewAbsenceModifiers(tail.slice(1)))
+    )
+  return startsWithComplementPhrase || complementLinkIndicatesAbsence
+}
+
+function postposedReviewAbsenceHasDirectObject(clause, absence, relationEnd) {
+  const predicate = clause.tokens[absence]
+  if (!POSTPOSED_REVIEW_ABSENCE_TRANSITIVE_TERMS.has(predicate)) {
+    return false
+  }
+  const tail = clause.tokens.slice(absence + 1, relationEnd)
+  if (tail.length === 0) return false
+  if (tokensArePostposedReviewAbsenceModifiers(tail)) {
+    return (
+      predicate === "lacking" &&
+      tail.some(
+        (token) =>
+          token.endsWith("ly") && !POSTPOSED_REVIEW_ABSENCE_MODIFIERS.has(token)
+      )
+    )
+  }
+  if (predicate === "lacking" && tail[0] === "in") return true
+  const modifierThenComplement = tail
+    .slice(1)
+    .findIndex(
+      (_token, index) =>
+        tokensArePostposedReviewAbsenceModifiers(tail.slice(0, index + 1)) &&
+        reviewAbsenceTailStartsComplement(tail.slice(index + 1))
+    )
+  if (
+    predicate === "lacking" &&
+    modifierThenComplement >= 0 &&
+    tail[modifierThenComplement + 1] === "in" &&
+    tail[modifierThenComplement + 2] !== undefined
+  ) {
+    return true
+  }
+  return !(
+    CLAUSE_COORDINATORS.has(tail[0]) ||
+    modifierThenComplement >= 0 ||
+    reviewAbsenceTailStartsComplement(tail)
+  )
+}
+
+function peopleRelationIntroduces(
+  tokens,
+  predicate,
+  person,
+  possessiveIndexes,
+  actionBoundaryAfter
+) {
+  if (possessiveIndexes.has(person)) return false
+  const targetPrefixIsBounded = (start) => {
+    const prefix = tokens.slice(start, person)
+    const nestedObjectLink = prefix.lastIndexOf("of")
+    const nestedObjectHead = prefix
+      .slice(0, nestedObjectLink)
+      .findLast((token) => !new Set(["a", "an", "the"]).has(token))
+    if (
+      nestedObjectLink >= 0 &&
+      nestedObjectHead !== undefined &&
+      !PEOPLE_PARTITIVE_TARGET_HEADS.has(nestedObjectHead)
+    ) {
+      return false
+    }
+    const coordination = prefix.lastIndexOf("and")
+    const beforeCoordination = prefix.slice(0, coordination)
+    const afterCoordination = prefix.slice(coordination + 1)
+    const relationEndsAtPerson =
+      person === tokens.length - 1 ||
+      PEOPLE_ANTECEDENT_RELATION_BOUNDARIES.has(tokens[person + 1]) ||
+      PEOPLE_ANTECEDENT_LINKS.has(tokens[person + 1]) ||
+      tokens
+        .slice(person + 1)
+        .every(
+          (token) =>
+            token.endsWith("ly") ||
+            POSTPOSED_REVIEW_ABSENCE_MODIFIERS.has(token)
+        )
+    const relationCrossesPunctuation = [...actionBoundaryAfter].some(
+      (boundary) => boundary >= start && boundary < person
+    )
+    const coordinationStaysInTarget =
+      coordination < 0 ||
+      beforeCoordination.includes("both") ||
+      (afterCoordination.length > 0 &&
+        !PEOPLE_CLAUSE_SUBJECT_STARTERS.has(afterCoordination[0]) &&
+        relationEndsAtPerson)
+    return (
+      !prefix.some((token) =>
+        PEOPLE_ANTECEDENT_RELATION_BOUNDARIES.has(token)
+      ) &&
+      (!relationCrossesPunctuation ||
+        (coordination >= 0 && relationEndsAtPerson)) &&
+      coordinationStaysInTarget
+    )
+  }
+  const directLink = tokenIndexes(
+    tokens,
+    PEOPLE_ANTECEDENT_LINKS,
+    predicate + 1,
+    person
+  ).at(-1)
+  const purposeAction =
+    directLink === undefined
+      ? -1
+      : tokenIndex(tokens, PEOPLE_PURPOSE_ACTIONS, directLink + 1, person)
+  const purposeActionTakesPeopleObject =
+    purposeAction >= 0 &&
+    ![...actionBoundaryAfter].some(
+      (boundary) => boundary >= purposeAction && boundary < person
+    ) &&
+    tokens
+      .slice(purposeAction + 1, person)
+      .every(
+        (token) =>
+          PEOPLE_CLAUSE_SUBJECT_STARTERS.has(token) ||
+          PEOPLE_PARTITIVE_TARGET_HEADS.has(token) ||
+          POSTPOSED_REVIEW_ABSENCE_TIME_COUNTS.has(token) ||
+          /^\d+$/.test(token)
+      )
+  const directLinkStartsPurposeClause =
+    directLink !== undefined &&
+    (phraseIndex(
+      tokens,
+      ["in", "order", "for"],
+      Math.max(predicate + 1, directLink - 2),
+      directLink + 1
+    ) ===
+      directLink - 2 ||
+      phraseIndex(tokens, ["in", "order", "that"], directLink + 1, person) >=
+        0 ||
+      (purposeAction >= 0 && !purposeActionTakesPeopleObject) ||
+      (tokens[directLink] === "for" &&
+        tokens[person + 1] === "to" &&
+        tokens[person + 2] !== undefined))
+  if (
+    directLink !== undefined &&
+    !directLinkStartsPurposeClause &&
+    targetPrefixIsBounded(directLink + 1)
+  ) {
+    return true
+  }
+  const participantLink = tokenIndexes(
+    tokens,
+    new Set(["after"]),
+    predicate + 1,
+    person
+  )
+    .filter(
+      (index) =>
+        tokenIndex(tokens, PEOPLE_PARTICIPANT_ACTIONS, index + 1, person) >= 0
+    )
+    .at(-1)
+  if (
+    participantLink !== undefined &&
+    targetPrefixIsBounded(participantLink + 1)
+  ) {
+    return true
+  }
+  const behalfLink = tokenIndexes(
+    tokens,
+    new Set(["on"]),
+    predicate + 1,
+    person
+  )
+    .filter(
+      (index) =>
+        phraseIndex(tokens, ["on", "behalf", "of"], index, index + 3) === index
+    )
+    .at(-1)
+  return behalfLink !== undefined && targetPrefixIsBounded(behalfLink + 3)
+}
+
+function actionIsNegated(
+  tokens,
+  actionIndex,
+  scopeBoundaries = CLAUSE_COORDINATORS
+) {
+  const scopeBoundary = tokenIndexes(
+    tokens,
+    scopeBoundaries,
+    Math.max(0, actionIndex - 6),
+    actionIndex
+  ).at(-1)
+  const prefix = tokens.slice(
+    Math.max(0, actionIndex - 6, (scopeBoundary ?? -1) + 1),
+    actionIndex
+  )
+  return (
+    prefix.some((token) => NEGATION_TERMS.has(token)) ||
+    prefix.at(-1) === "from"
+  )
+}
+
+function agentActorEnd(tokens, baseEnd) {
+  if (tokens[baseEnd] === "task" && tokens[baseEnd + 1] === "agent") {
+    return baseEnd + 2
+  }
+  return tokens[baseEnd] === "agent" ? baseEnd + 1 : baseEnd
+}
+
+function directiveActors(tokens) {
+  const actors = []
+  for (const [index, token] of tokens.entries()) {
+    if (actors.some((actor) => actor.start <= index && index < actor.end)) {
+      continue
+    }
+    if (token === "parent") {
+      actors.push({ role: "parent", start: index, end: index + 1 })
+    } else if (token === "codex") {
+      const isTaskAgent =
+        tokens[index + 1] === "task" && tokens[index + 2] === "agent"
+      const end = isTaskAgent
+        ? index + 3
+        : tokens[index + 1] === "agent"
+          ? index + 2
+          : index + 1
+      actors.push({
+        role: isTaskAgent ? "task_agent" : "codex",
+        start: index,
+        end,
+      })
+    } else if (token === "task" && tokens[index + 1] === "agent") {
+      actors.push({ role: "task_agent", start: index, end: index + 2 })
+    } else if (token === "plan" && tokens[index + 1] === "author") {
+      actors.push({ role: "plan_author", start: index, end: index + 2 })
+    } else if (token === "design" && tokens[index + 1] === "fixer") {
+      actors.push({ role: "design_fixer", start: index, end: index + 2 })
+    } else if (token === "custom") {
+      const hasNamedId =
+        tokens[index + 1] !== undefined && tokens[index + 1] !== "agent"
+      const baseEnd = index + (hasNamedId ? 2 : 1)
+      actors.push({
+        role: "task_agent",
+        start: index,
+        end: agentActorEnd(tokens, baseEnd),
+      })
+    } else if (
+      TASK_AGENT_NAME_TERMS.has(token) &&
+      tokens[index - 1] !== "custom"
+    ) {
+      const baseEnd =
+        ["claude", "kimi"].includes(token) && tokens[index + 1] === "code"
+          ? index + 2
+          : index + 1
+      actors.push({
+        role: "task_agent",
+        start: index,
+        end: agentActorEnd(tokens, baseEnd),
+      })
+    } else if (
+      (token === "code" && tokens[index + 1] === "buddy") ||
+      (token === "open" && tokens[index + 1] === "code")
+    ) {
+      actors.push({
+        role: "task_agent",
+        start: index,
+        end: agentActorEnd(tokens, index + 2),
+      })
+    }
+  }
+  return actors
+}
+
+function directiveActions(tokens, actors) {
+  const roleTokens = new Set()
+  for (const actor of actors) {
+    if (actor.role !== "plan_author") continue
+    for (let index = actor.start; index < actor.end; index += 1) {
+      roleTokens.add(index)
+    }
+  }
+  const actions = []
+  for (const [index, token] of tokens.entries()) {
+    if (REVIEW_TERMS.has(token)) {
+      actions.push({ index, kind: "review", token })
+    } else if (DIRECT_ROUTE_ACTIONS.has(token)) {
+      actions.push({ index, kind: "route", token })
+    } else if (PRODUCTION_ACTIONS.has(token) && !roleTokens.has(index)) {
+      actions.push({ index, kind: "production", token })
+    }
+  }
+  return actions
+}
+
+function taskScopes(tokens, taskIndex) {
+  const start = Math.max(0, taskIndex - 3)
+  const end = Math.min(tokens.length, taskIndex + 2)
+  const scopes = new Set()
+  if (tokenIndex(tokens, HIGH_TASK_SCOPES, start, end) >= 0) scopes.add("high")
+  if (tokenIndex(tokens, NORMAL_TASK_SCOPES, start, end) >= 0) {
+    scopes.add("normal")
+  }
+  if (
+    scopes.size === 0 &&
+    tokenIndex(tokens, UNIVERSAL_TASK_SCOPES, start, end) >= 0
+  ) {
+    scopes.add("universal")
+  }
+  if (scopes.size === 0) scopes.add("unspecified")
+  return scopes
+}
+
+function directiveTasks(tokens) {
+  const tasks = []
+  for (const [index, token] of tokens.entries()) {
+    if (
+      !["task", "tasks"].includes(token) ||
+      (token === "task" && tokens[index + 1] === "agent")
+    ) {
+      continue
+    }
+    tasks.push({ index, scopes: taskScopes(tokens, index) })
+  }
+  return tasks
+}
+
+function directiveTaskAntecedents(
+  tokens,
+  actionBoundaryAfter = new Set(),
+  possessiveIndexes = new Set(),
+  imperativeBoundaryAfter = new Set()
+) {
+  const clause = {
+    tokens,
+    actionBoundaryAfter,
+    possessiveIndexes,
+    imperativeBoundaryAfter,
+  }
+  return directiveTasks(tokens).map((task) => {
+    const completed = taskCompletedStateIndexes(clause, task).length > 0
+    return {
+      ...task,
+      active: taskIsEffectivelyActive(clause, task),
+      completed,
+    }
+  })
+}
+
+function carriedTaskAntecedentsAfterClause(
+  tokens,
+  actionBoundaryAfter,
+  possessiveIndexes,
+  imperativeBoundaryAfter,
+  priorTasks
+) {
+  const explicitTasks = directiveTaskAntecedents(
+    tokens,
+    actionBoundaryAfter,
+    possessiveIndexes,
+    imperativeBoundaryAfter
+  )
+  if (explicitTasks.length > 0) return explicitTasks
+  if (priorTasks.length === 0) return []
+
+  const anaphors = tokenIndexes(tokens, new Set(["it", "itself"]))
+  const clause = { tokens, actionBoundaryAfter, tasks: [], priorTasks }
+  const completion = tokenIndexes(tokens, TASK_COMPLETION_TERMS).find(
+    (state) => {
+      const anaphor = anaphors.filter((index) => index < state).at(-1)
+      if (anaphor === undefined || state - anaphor > 5) return false
+      const prefix = tokens.slice(0, anaphor)
+      const plainPrefix = prefix.every(
+        (token) =>
+          TASK_STATE_MODIFIERS.has(token) ||
+          TASK_COMPLETION_BRIDGE_TERMS.has(token)
+      )
+      const leadingAdjunct =
+        prefix.length <= 4 &&
+        TASK_STATE_CARRIED_ADJUNCT_STARTS.has(prefix[0]) &&
+        actionBoundaryAfter.has(anaphor - 1) &&
+        tokenIndex(tokens, TASK_COMPLETION_TERMS, 0, anaphor) < 0
+      if (!plainPrefix && !leadingAdjunct) {
+        return false
+      }
+      const task = { ...priorTasks.at(-1), index: anaphor }
+      return (
+        completionBelongsToTask(clause, task, state) &&
+        !actionIsNegated(tokens, state)
+      )
+    }
+  )
+  if (completion === undefined) return priorTasks
+  return priorTasks.map((task, index) =>
+    index === priorTasks.length - 1
+      ? { ...task, active: false, completed: true }
+      : task
+  )
+}
+
+function directiveDocumentTargets(tokens) {
+  const actors = directiveActors(tokens)
+  return tokens.flatMap((token, index) =>
+    DOCUMENT_OR_CODE_TARGETS.has(token) &&
+    !actors.some((actor) => actor.start <= index && index < actor.end) &&
+    !DOCUMENT_PERSON_ROLE_TERMS.has(tokens[index + 1])
+      ? [{ index, token }]
+      : []
+  )
+}
+
+function peopleRoleModifiesDocument(tokens, actionBoundaryAfter, index) {
+  const document = tokenIndex(
+    tokens,
+    DOCUMENT_OR_CODE_TARGETS,
+    index + 1,
+    Math.min(tokens.length, index + 5)
+  )
+  return (
+    document >= 0 &&
+    ![...actionBoundaryAfter].some(
+      (boundary) => boundary >= index && boundary < document
+    ) &&
+    tokens
+      .slice(index + 1, document)
+      .every(
+        (token) =>
+          new Set(["and", "or"]).has(token) ||
+          PEOPLE_ANTECEDENT_TERMS.has(token)
+      )
+  )
+}
+
+function directivePeopleAntecedents(tokens, actionBoundaryAfter = new Set()) {
+  const actors = directiveActors(tokens).map((actor) => ({
+    start: actor.start,
+    end: actor.end,
+    plural: false,
+  }))
+  const people = tokens.flatMap((token, index) =>
+    PEOPLE_ANTECEDENT_TERMS.has(token) &&
+    !actors.some((actor) => actor.start <= index && index < actor.end) &&
+    !peopleRoleModifiesDocument(tokens, actionBoundaryAfter, index)
+      ? [
+          {
+            start: index,
+            end: index + 1,
+            plural: PLURAL_PEOPLE_ANTECEDENT_TERMS.has(token),
+          },
+        ]
+      : []
+  )
+  return [...actors, ...people].sort((left, right) => left.start - right.start)
+}
+
+function mentionsPluralGroup(tokens, mentions) {
+  if (mentions.some((mention) => mention.plural)) return true
+  if (mentions.length < 2) return false
+  return (
+    tokenIndex(
+      tokens,
+      new Set(["and", "or"]),
+      mentions[0].end,
+      mentions.at(-1).start
+    ) >= 0
+  )
+}
+
+function directivePronounAntecedent(
+  tokens,
+  possessiveIndexes = new Set(),
+  actionBoundaryAfter = new Set()
+) {
+  const documents = directiveDocumentTargets(tokens)
+  const people = directivePeopleAntecedents(tokens, actionBoundaryAfter)
+  const actors = directiveActors(tokens)
+  const predicate = tokenIndexes(tokens, ANTECEDENT_PREDICATES)
+    .filter(
+      (index) =>
+        !actors.some((actor) => actor.start <= index && index < actor.end)
+    )
+    .at(-1)
+  const documentMentions = documents.map((target) => ({
+    start: target.index,
+    end: target.index + 1,
+    plural: PLURAL_DOCUMENT_TARGETS.has(target.token),
+  }))
+  const documentObjects =
+    predicate === undefined
+      ? documentMentions
+      : documentMentions.filter((target) => target.start > predicate)
+  const peopleSubjects =
+    predicate === undefined
+      ? people
+      : people.filter((person) => person.end <= predicate)
+  const peopleRecipients =
+    predicate === undefined
+      ? []
+      : people.filter(
+          (person) =>
+            person.start > predicate &&
+            peopleRelationIntroduces(
+              tokens,
+              predicate,
+              person.start,
+              possessiveIndexes,
+              actionBoundaryAfter
+            )
+        )
+
+  const pluralDocuments = mentionsPluralGroup(tokens, documentObjects)
+  const pluralPeopleSubjects = mentionsPluralGroup(tokens, peopleSubjects)
+  const pluralPeopleRecipients = mentionsPluralGroup(tokens, peopleRecipients)
+  if (pluralPeopleRecipients) return "people"
+  if (
+    pluralDocuments &&
+    DOCUMENT_OBJECT_ANTECEDENT_PREDICATES.has(tokens[predicate])
+  ) {
+    return "document"
+  }
+  if (pluralPeopleSubjects) return "people"
+  if (pluralDocuments) return "document"
+  return null
+}
+
+function directiveReviewers(tokens) {
+  const reviewers = []
+  for (const index of tokenIndexes(tokens, REVIEW_TERMS)) {
+    const start = Math.max(0, index - 4)
+    const prefix = tokens.slice(start, index + 1)
+    const userNamed =
+      prefix.includes("user-named") ||
+      phraseIndex(tokens, ["user", "named"], start, index + 1) >= 0
+    reviewers.push({
+      index,
+      primary: prefix.includes("primary"),
+      auxiliary: prefix.includes("auxiliary"),
+      codex: prefix.includes("codex"),
+      required: prefix.includes("mandatory") || prefix.includes("required"),
+      optionalDocument:
+        userNamed && (prefix.includes("design") || prefix.includes("plan")),
+    })
+  }
+  return reviewers
+}
+
+function parseDirectiveClause(window) {
+  const {
+    tokens,
+    actionBoundaryAfter = new Set(),
+    imperativeBoundaryAfter = new Set(),
+    possessiveIndexes = new Set(),
+    priorReviewers = [],
+    priorTasks = [],
+    priorDocumentTargets = [],
+    priorPronounAntecedent = null,
+  } = window
+  const actors = directiveActors(tokens)
+  return {
+    tokens,
+    actionBoundaryAfter,
+    imperativeBoundaryAfter,
+    possessiveIndexes,
+    actors,
+    actions: directiveActions(tokens, actors),
+    tasks: directiveTasks(tokens),
+    reviewers: directiveReviewers(tokens),
+    priorReviewers,
+    priorTasks,
+    priorDocumentTargets,
+    priorPronounAntecedent,
+  }
+}
+
+function actionSegment(clause, actionIndex) {
+  const coordinators = tokenIndexes(clause.tokens, CLAUSE_COORDINATORS)
+  const before = coordinators.filter((index) => index < actionIndex).at(-1)
+  const after = coordinators.find((index) => index > actionIndex)
+  return {
+    start: (before ?? -1) + 1,
+    end: after ?? clause.tokens.length,
+  }
+}
+
+function actionsSharePredicateRelations(clause, left, right) {
+  return (
+    tokenIndex(
+      clause.tokens,
+      PREDICATE_COORDINATORS,
+      left.index + 1,
+      right.index
+    ) >= 0 &&
+    !clause.actors.some(
+      (actor) => actor.start > left.index && actor.end <= right.index
+    )
+  )
+}
+
+function actionsShareTaskScope(clause, left, right) {
+  return (
+    tokenIndex(
+      clause.tokens,
+      PREDICATE_COORDINATORS,
+      left.index + 1,
+      right.index
+    ) >= 0
+  )
+}
+
+function relatedActionGroup(clause, action, sharesRelations) {
+  const position = clause.actions.findIndex(
+    (candidate) => candidate.index === action.index
+  )
+  if (position < 0) return [action]
+  let start = position
+  let end = position
+  while (
+    start > 0 &&
+    sharesRelations(clause, clause.actions[start - 1], clause.actions[start])
+  ) {
+    start -= 1
+  }
+  while (
+    end + 1 < clause.actions.length &&
+    sharesRelations(clause, clause.actions[end], clause.actions[end + 1])
+  ) {
+    end += 1
+  }
+  return clause.actions.slice(start, end + 1)
+}
+
+function predicateActionGroup(clause, action) {
+  return relatedActionGroup(clause, action, actionsSharePredicateRelations)
+}
+
+function taskScopeActionGroup(clause, action) {
+  return relatedActionGroup(clause, action, actionsShareTaskScope)
+}
+
+function localTasksForAction(clause, action) {
+  const position = clause.actions.findIndex(
+    (candidate) => candidate.index === action.index
+  )
+  const previous = position > 0 ? clause.actions[position - 1] : null
+  const next =
+    position + 1 < clause.actions.length ? clause.actions[position + 1] : null
+  const before = tokenIndexes(
+    clause.tokens,
+    TASK_RELATION_BOUNDARIES,
+    previous?.index ?? 0,
+    action.index
+  )
+    .filter(
+      (boundary) =>
+        Boolean(previous && previous.index < boundary) ||
+        clause.actors.some(
+          (actor) => actor.start > boundary && actor.end <= action.index
+        )
+    )
+    .at(-1)
+  const after = next
+    ? tokenIndex(
+        clause.tokens,
+        TASK_RELATION_BOUNDARIES,
+        action.index + 1,
+        next.index
+      )
+    : -1
+  const tasks = clause.tasks.filter(
+    (task) =>
+      task.index >= (before ?? -1) + 1 &&
+      task.index < (after >= 0 ? after : clause.tokens.length)
+  )
+  const followingPrevious = previous
+    ? tasks.filter((task) => task.index > previous.index)
+    : []
+  return followingPrevious.length > 0 ? followingPrevious : tasks
+}
+
+function scopesForTasks(tasks) {
+  const scopes = new Set(tasks.flatMap((task) => [...task.scopes]))
+  if (scopes.size === 0) scopes.add("unspecified")
+  return scopes
+}
+
+function actionTaskScopes(clause, action) {
+  const segment = actionSegment(clause, action.index)
+  let tasks = localTasksForAction(clause, action)
+  if (
+    tasks.length === 0 &&
+    clause.tokens.slice(action.index + 1, segment.end).includes("them")
+  ) {
+    const previous = clause.tasks
+      .filter((task) => task.index < segment.start)
+      .at(-1)
+    if (previous) tasks = [previous]
+  }
+  if (
+    tasks.length === 0 &&
+    clause.priorTasks.length > 0 &&
+    (action.token === "implementation" ||
+      tokenIndex(
+        clause.tokens,
+        new Set(["they", "them"]),
+        segment.start,
+        segment.end
+      ) >= 0)
+  ) {
+    tasks = clause.priorTasks
+  }
+  if (tasks.length === 0) {
+    tasks = taskScopeActionGroup(clause, action).flatMap((candidate) =>
+      localTasksForAction(clause, candidate)
+    )
+  }
+  const scopes = scopesForTasks(tasks)
+  if (!scopes.has("unspecified")) return scopes
+  if (
+    action.token === "implementer" &&
+    tokenIndex(clause.tokens, UNIVERSAL_TASK_SCOPES) >= 0
+  ) {
+    return new Set(["universal"])
+  }
+  return scopes
+}
+
+function nearestActionBefore(clause, index) {
+  return clause.actions.filter((action) => action.index < index).at(-1)
+}
+
+function actorRelationPrefixIsValid(prefix) {
+  return (
+    prefix.length <= 6 &&
+    !prefix.some(
+      (token) =>
+        CLAUSE_COORDINATORS.has(token) ||
+        ACTOR_LINKS.has(token) ||
+        PRODUCTION_ACTIONS.has(token) ||
+        DIRECT_ROUTE_ACTIONS.has(token) ||
+        REVIEW_TERMS.has(token) ||
+        NESTED_ACTOR_PREFIX_LINKS.has(token) ||
+        ["task", "tasks"].includes(token)
+    )
+  )
+}
+
+function actorsAfterLink(clause, link, end = clause.tokens.length) {
+  const nextLink = tokenIndex(clause.tokens, ACTOR_LINKS, link + 1, end)
+  let relationEnd = nextLink >= 0 ? nextLink : end
+  const boundary = tokenIndex(
+    clause.tokens,
+    ACTOR_RELATION_BOUNDARIES,
+    link + 1,
+    relationEnd
+  )
+  if (boundary >= 0) relationEnd = boundary
+  const actors = clause.actors.filter(
+    (actor) => actor.start > link && actor.end <= relationEnd
+  )
+  if (actors.length === 0) return []
+  const prefix = clause.tokens.slice(link + 1, actors[0].start)
+  if (!actorRelationPrefixIsValid(prefix)) return []
+  return actors
+}
+
+function alternativeExclusionStart(clause, action, end) {
+  const starts = [
+    phraseIndex(clause.tokens, ["rather", "than"], action.index + 1, end),
+    phraseIndex(clause.tokens, ["instead", "of"], action.index + 1, end),
+  ].filter((index) => index >= 0)
+  return starts.length > 0 ? Math.min(...starts) : -1
+}
+
+function positionIsExcludedAlternative(clause, alternativeStart, position) {
+  if (alternativeStart < 0 || position <= alternativeStart) return false
+  return (
+    tokenIndex(
+      clause.tokens,
+      ALTERNATIVE_RESET_COORDINATORS,
+      alternativeStart + 2,
+      position
+    ) < 0
+  )
+}
+
+function actionIsExcludedAlternative(clause, action) {
+  const previous = clause.actions
+    .filter((candidate) => candidate.index < action.index)
+    .at(-1)
+  const start = (previous?.index ?? -1) + 1
+  const starts = [
+    phraseIndex(clause.tokens, ["rather", "than"], start, action.index + 1),
+    phraseIndex(clause.tokens, ["instead", "of"], start, action.index + 1),
+  ].filter((index) => index >= 0)
+  if (starts.length === 0) return false
+  return positionIsExcludedAlternative(
+    clause,
+    Math.max(...starts),
+    action.index
+  )
+}
+
+function actorBindingsAfterLink(clause, action, link, end) {
+  const actors = actorsAfterLink(clause, link, end)
+  const relationNegated = relationTargetIsNegated(clause, action, link)
+  const alternativeStart = alternativeExclusionStart(clause, action, end)
+  return actors.map((actor, index) => {
+    const localStart = index === 0 ? link + 1 : actors[index - 1].end
+    const coordinator = tokenIndexes(
+      clause.tokens,
+      CLAUSE_COORDINATORS,
+      localStart,
+      actor.start
+    ).at(-1)
+    const negationStart = (coordinator ?? localStart - 1) + 1
+    const explicitlyNegated =
+      tokenIndex(clause.tokens, NEGATION_TERMS, negationStart, actor.start) >= 0
+    const excludedAlternative = positionIsExcludedAlternative(
+      clause,
+      alternativeStart,
+      actor.start
+    )
+    return {
+      actor,
+      negated:
+        explicitlyNegated ||
+        excludedAlternative ||
+        (coordinator !== undefined && clause.tokens[coordinator] === "but"
+          ? false
+          : relationNegated),
+    }
+  })
+}
+
+function directPassiveActorsForAction(clause, action) {
+  const nextAction = clause.actions.find(
+    (candidate) => candidate.index > action.index
+  )
+  const actors = []
+  const links = tokenIndexes(
+    clause.tokens,
+    new Set(["by"]),
+    action.index + 1,
+    nextAction?.index ?? clause.tokens.length
+  )
+  for (const [linkIndex, link] of links.entries()) {
+    if (linkIndex > 0) {
+      const previousLink = links[linkIndex - 1]
+      const previousActor = clause.actors
+        .filter((actor) => actor.start > previousLink && actor.end <= link)
+        .at(-1)
+      const relationStart = previousActor?.end ?? previousLink + 1
+      const relationTokens = clause.tokens.slice(relationStart, link)
+      const continuesRelation =
+        tokenIndex(
+          clause.tokens,
+          new Set(["and", "but", "or", "yet"]),
+          relationStart,
+          link
+        ) >= 0 ||
+        phraseIndex(clause.tokens, ["rather", "than"], relationStart, link) >=
+          0 ||
+        phraseIndex(clause.tokens, ["instead", "of"], relationStart, link) >=
+          0 ||
+        (relationTokens.length > 0 &&
+          relationTokens.every((token) =>
+            SEQUENTIAL_PASSIVE_RELATION_FILLERS.has(token)
+          ))
+      if (!continuesRelation) continue
+    }
+    actors.push(
+      ...actorBindingsAfterLink(
+        clause,
+        action,
+        link,
+        nextAction?.index ?? clause.tokens.length
+      )
+        .filter((binding) => !binding.negated)
+        .map((binding) => binding.actor)
+    )
+  }
+  return actors
+}
+
+function uniqueActors(actors) {
+  return actors.filter(
+    (actor, index) =>
+      actors.findIndex(
+        (candidate) =>
+          candidate.role === actor.role && candidate.start === actor.start
+      ) === index
+  )
+}
+
+function passiveActorsForAction(clause, action) {
+  const direct = directPassiveActorsForAction(clause, action)
+  if (direct.length > 0) return direct
+  if (actionIsNegated(clause.tokens, action.index)) return []
+  const group = predicateActionGroup(clause, action)
+  if (group.length === 1) return []
+  const last = group.at(-1)
+  const nextAction = clause.actions.find(
+    (candidate) => candidate.index > last.index
+  )
+  return uniqueActors(
+    tokenIndexes(
+      clause.tokens,
+      new Set(["by"]),
+      last.index + 1,
+      nextAction?.index ?? clause.tokens.length
+    ).flatMap((link) =>
+      actorsAfterLink(clause, link, nextAction?.index ?? clause.tokens.length)
+    )
+  )
+}
+
+function subjectActorsForAction(clause, action) {
+  const passive = passiveActorsForAction(clause, action)
+  if (passive.length > 0) return passive
+
+  const preceding = clause.actors.filter((actor) => actor.end <= action.index)
+  if (preceding.length === 0) return []
+  const subjects = [preceding.at(-1)]
+  for (let index = preceding.length - 2; index >= 0; index -= 1) {
+    const previous = preceding[index]
+    const current = subjects[0]
+    const coordinated =
+      tokenIndex(
+        clause.tokens,
+        new Set(["and"]),
+        previous.end,
+        current.start
+      ) >= 0
+    const linked =
+      tokenIndex(clause.tokens, ACTOR_LINKS, previous.end, current.start) >= 0
+    const interveningAction = clause.actions.some(
+      (candidate) =>
+        candidate.index >= previous.end && candidate.index < current.start
+    )
+    if (!coordinated || linked || interveningAction) break
+    subjects.unshift(previous)
+  }
+  return subjects
+}
+
+function linkBeforeActor(clause, actor) {
+  return tokenIndexes(
+    clause.tokens,
+    ACTOR_LINKS,
+    Math.max(0, actor.start - 4),
+    actor.start
+  ).at(-1)
+}
+
+function relationTargetIsNegated(clause, action, link) {
+  const coordinators = tokenIndexes(
+    clause.tokens,
+    CLAUSE_COORDINATORS,
+    action.index + 1,
+    link
+  )
+  const coordinator = coordinators.at(-1)
+  const localStart = (coordinator ?? action.index) + 1
+  if (
+    tokenIndex(
+      clause.tokens,
+      NEGATION_TERMS,
+      Math.max(localStart, link - 4),
+      link
+    ) >= 0
+  ) {
+    return true
+  }
+  if (coordinator !== undefined && clause.tokens[coordinator] === "but") {
+    return false
+  }
+  return actionIsNegated(clause.tokens, action.index)
+}
+
+function actionHasDocumentTarget(clause, action) {
+  const segment = actionSegment(clause, action.index)
+  const documentTargets = directiveDocumentTargets(clause.tokens)
+  if (
+    documentTargets.some(
+      (target) => target.index >= segment.start && target.index < segment.end
+    )
+  ) {
+    return true
+  }
+  const hasDocumentAntecedent =
+    clause.priorDocumentTargets.length > 0 ||
+    documentTargets.some((target) => target.index < segment.start)
+  if (!hasDocumentAntecedent) return false
+  if (
+    tokenIndex(clause.tokens, new Set(["it"]), segment.start, segment.end) >=
+      0 ||
+    phraseIndex(
+      clause.tokens,
+      ["that", "document"],
+      segment.start,
+      segment.end
+    ) >= 0 ||
+    phraseIndex(
+      clause.tokens,
+      ["that", "artifact"],
+      segment.start,
+      segment.end
+    ) >= 0 ||
+    phraseIndex(
+      clause.tokens,
+      ["the", "document"],
+      segment.start,
+      segment.end
+    ) >= 0 ||
+    phraseIndex(
+      clause.tokens,
+      ["the", "artifact"],
+      segment.start,
+      segment.end
+    ) >= 0
+  ) {
+    return true
+  }
+  if (
+    clause.priorPronounAntecedent === "document" &&
+    tokenIndex(clause.tokens, new Set(["them"]), segment.start, segment.end) >=
+      0
+  ) {
+    return true
+  }
+
+  const trailing = clause.tokens.slice(action.index + 1, segment.end)
+  return trailing.every((token) =>
+    new Set(["again", "afterward", "directly", "too"]).has(token)
+  )
+}
+
+function reviewPurposeInRange(clause, start, end) {
+  if (tokenIndex(clause.tokens, REVIEW_TERMS, start, end) < 0) {
+    return null
+  }
+  if (tokenIndex(clause.tokens, new Set(["primary"]), start, end) >= 0) {
+    return "primary"
+  }
+  if (tokenIndex(clause.tokens, new Set(["auxiliary"]), start, end) >= 0) {
+    return "auxiliary"
+  }
+  return "review"
+}
+
+function routeReviewPurpose(clause, action) {
+  const segment = actionSegment(clause, action.index)
+  return reviewPurposeInRange(clause, segment.start, segment.end)
+}
+
+function singleReviewSlot(clause, start, end) {
+  const slots = ["primary", "auxiliary"].filter(
+    (slot) => tokenIndex(clause.tokens, new Set([slot]), start, end) >= 0
+  )
+  return slots.length === 1 ? slots[0] : null
+}
+
+function relationBindingsAfterLink(clause, action, link, end) {
+  const nextLink = tokenIndex(clause.tokens, ACTOR_LINKS, link + 1, end)
+  const relationEnd = nextLink >= 0 ? nextLink : end
+  const allActors = actorsAfterLink(clause, link, end)
+  const actors = actorBindingsAfterLink(clause, action, link, end)
+    .filter((binding) => !binding.negated)
+    .map((binding) => binding.actor)
+  const coordinator = tokenIndexes(
+    clause.tokens,
+    CLAUSE_COORDINATORS,
+    action.index + 1,
+    link
+  ).at(-1)
+  const prefixSlot = singleReviewSlot(
+    clause,
+    (coordinator ?? action.index) + 1,
+    link
+  )
+  const relationPurpose = reviewPurposeInRange(
+    clause,
+    (coordinator ?? action.index) + 1,
+    relationEnd
+  )
+  return actors.map((actor) => {
+    const actorIndex = allActors.findIndex(
+      (candidate) => candidate.start === actor.start
+    )
+    const previousActor = allActors[actorIndex - 1]
+    const nextActor = allActors[actorIndex + 1]
+    const actorCoordinator = previousActor
+      ? tokenIndexes(
+          clause.tokens,
+          CLAUSE_COORDINATORS,
+          previousActor.end,
+          actor.start
+        ).at(-1)
+      : undefined
+    const nextActorCoordinator = nextActor
+      ? tokenIndexes(
+          clause.tokens,
+          CLAUSE_COORDINATORS,
+          actor.end,
+          nextActor.start
+        ).at(-1)
+      : undefined
+    let preStart =
+      actorIndex === 0
+        ? link + 1
+        : (actorCoordinator ?? previousActor.end - 1) + 1
+    if (previousActor && actorCoordinator === undefined) {
+      const previousRoleDescriptor = tokenIndex(
+        clause.tokens,
+        new Set([
+          "implementation",
+          "implementer",
+          "review",
+          "reviewer",
+          "reviewers",
+        ]),
+        previousActor.end,
+        actor.start
+      )
+      if (previousRoleDescriptor >= 0) preStart = previousRoleDescriptor + 1
+    }
+    const postEnd = nextActorCoordinator ?? nextActor?.start ?? relationEnd
+    const slot =
+      prefixSlot ??
+      singleReviewSlot(clause, preStart, actor.start) ??
+      singleReviewSlot(clause, actor.end, postEnd)
+    const localPurpose =
+      reviewPurposeInRange(clause, preStart, actor.start) ??
+      reviewPurposeInRange(clause, actor.end, postEnd)
+    const explicitImplementation =
+      tokenIndex(
+        clause.tokens,
+        new Set(["implementation", "implementer"]),
+        preStart,
+        actor.start
+      ) >= 0 ||
+      tokenIndex(
+        clause.tokens,
+        new Set(["implementation", "implementer"]),
+        actor.end,
+        postEnd
+      ) >= 0
+    return {
+      actor,
+      implementationExplicit: explicitImplementation,
+      purpose: explicitImplementation
+        ? null
+        : (slot ?? localPurpose ?? relationPurpose),
+      slot: explicitImplementation ? null : slot,
+    }
+  })
+}
+
+function routeTargetBindingsForAction(clause, action) {
+  const nextRoute = clause.actions.find(
+    (candidate) => candidate.kind === "route" && candidate.index > action.index
+  )
+  const end = nextRoute?.index ?? clause.tokens.length
+  const bindings = tokenIndexes(
+    clause.tokens,
+    new Set(["to"]),
+    action.index + 1,
+    end
+  ).flatMap((link) => relationBindingsAfterLink(clause, action, link, end))
+  const reflexive = tokenIndexes(
+    clause.tokens,
+    REFLEXIVE_TARGETS,
+    action.index + 1,
+    end
+  )
+  if (reflexive.length > 0 && !actionIsNegated(clause.tokens, action.index)) {
+    bindings.push(
+      ...subjectActorsForAction(clause, action).map((actor) => ({
+        actor,
+        implementationExplicit: false,
+        purpose: routeReviewPurpose(clause, action),
+        slot: null,
+      }))
+    )
+  }
+  return bindings.filter(
+    (binding, index) =>
+      bindings.findIndex(
+        (candidate) =>
+          candidate.actor.role === binding.actor.role &&
+          candidate.actor.start === binding.actor.start
+      ) === index
+  )
+}
+
+function actionDelegatesToProducer(clause, parent, action) {
+  return clause.actors.some((producer) => {
+    if (
+      !["design_fixer", "plan_author"].includes(producer.role) ||
+      producer.start <= parent.end ||
+      producer.end > action.index
+    ) {
+      return false
+    }
+    const infinitive = tokenIndex(
+      clause.tokens,
+      new Set(["to"]),
+      producer.end,
+      action.index + 1
+    )
+    if (infinitive < 0) return false
+    if (
+      tokenIndex(
+        clause.tokens,
+        PRODUCER_DELEGATION_ACTIONS,
+        parent.end,
+        producer.start
+      ) < 0
+    ) {
+      return false
+    }
+
+    const delegatedActions = clause.actions.filter(
+      (candidate) =>
+        candidate.kind === "production" &&
+        candidate.index > infinitive &&
+        candidate.index <= action.index
+    )
+    if (delegatedActions.length === 0) return false
+    if (delegatedActions[0].index === action.index) return true
+
+    return delegatedActions.slice(1).every((candidate, index) => {
+      const previous = delegatedActions[index]
+      const relationTokens = clause.tokens.slice(
+        previous.index + 1,
+        candidate.index
+      )
+      const hasCoordination =
+        relationTokens.length === 0 ||
+        relationTokens.some((token) => ["and", "or"].includes(token))
+      return (
+        BARE_PRODUCTION_ACTIONS.has(candidate.token) &&
+        hasCoordination &&
+        !relationTokens.some((token) =>
+          FINITE_PARENT_PREDICATE_MARKERS.has(token)
+        ) &&
+        !relationTokens.some((token) => ["but", "then"].includes(token)) &&
+        !clause.actors.some(
+          (actor) =>
+            actor.start > previous.index && actor.end <= candidate.index
+        )
+      )
+    })
+  })
+}
+
+function actionIsPassivelyDelegatedToProducer(clause, parent, action) {
+  return clause.actors.some((producer) => {
+    if (
+      !["design_fixer", "plan_author"].includes(producer.role) ||
+      producer.end > parent.start ||
+      parent.end > action.index
+    ) {
+      return false
+    }
+    const passiveLink = tokenIndex(
+      clause.tokens,
+      new Set(["by"]),
+      producer.end,
+      parent.start
+    )
+    const orchestration = tokenIndex(
+      clause.tokens,
+      ORCHESTRATION_ACTIONS,
+      producer.end,
+      parent.start
+    )
+    const infinitive = tokenIndex(
+      clause.tokens,
+      new Set(["to"]),
+      parent.end,
+      action.index
+    )
+    const repeatedParent = clause.actors.some(
+      (actor) =>
+        actor.role === "parent" &&
+        actor.start > parent.end &&
+        actor.end <= action.index
+    )
+    return (
+      passiveLink >= 0 &&
+      orchestration >= 0 &&
+      infinitive >= 0 &&
+      !repeatedParent
+    )
+  })
+}
+
+function repeatedProducerSubjectForAction(clause, action) {
+  const previous = clause.actions
+    .filter(
+      (candidate) =>
+        candidate.kind === "production" && candidate.index < action.index
+    )
+    .at(-1)
+  if (!previous) return null
+  return clause.actors.find(
+    (actor) =>
+      ["design_fixer", "plan_author"].includes(actor.role) &&
+      actor.start > previous.index &&
+      actor.end <= action.index &&
+      tokenIndex(
+        clause.tokens,
+        ACTOR_LINKS,
+        Math.max(previous.index + 1, actor.start - 2),
+        actor.start
+      ) < 0
+  )
+}
+
+function reviewActorBindingsForAction(clause, action) {
+  if (["reviewer", "reviewers"].includes(action.token)) {
+    const describedActor = clause.actors
+      .filter((actor) => actor.end === action.index)
+      .at(-1)
+    if (describedActor) {
+      return [
+        {
+          actor: describedActor,
+          slot: singleReviewSlot(
+            clause,
+            Math.max(0, describedActor.start - 4),
+            action.index
+          ),
+        },
+      ]
+    }
+  }
+  const nextAction = clause.actions.find(
+    (candidate) =>
+      candidate.index > action.index &&
+      !(
+        candidate.kind === "review" &&
+        ["reviewer", "reviewers"].includes(candidate.token)
+      )
+  )
+  const end = nextAction?.index ?? clause.tokens.length
+  const passive = tokenIndexes(
+    clause.tokens,
+    new Set(["by"]),
+    action.index + 1,
+    end
+  ).flatMap((link) => relationBindingsAfterLink(clause, action, link, end))
+  if (passive.length > 0) return passive
+
+  const actors = subjectActorsForAction(clause, action)
+  return actors.map((actor, index) => ({
+    actor,
+    slot: singleReviewSlot(
+      clause,
+      actor.end,
+      actors[index + 1]?.start ?? action.index
+    ),
+  }))
+}
+
+function statementIsNegatedBeforeAction(clause, action) {
+  const segment = actionSegment(clause, action.index)
+  return (
+    tokenIndex(clause.tokens, NEGATION_TERMS, segment.start, action.index) >= 0
+  )
+}
+
+function reviewSlotForAction(clause, action) {
+  const segment = actionSegment(clause, action.index)
+  return singleReviewSlot(clause, segment.start, segment.end)
+}
+
+function relationIsExplicitlyAbsent(clause, start, segmentStart) {
+  const absence = tokenIndexes(
+    clause.tokens,
+    REVIEW_ABSENCE_TERMS,
+    Math.max(segmentStart, start - 5),
+    start
+  ).at(-1)
+  if (
+    absence === undefined ||
+    tokenIndex(clause.tokens, new Set(["other"]), absence + 1, start) >= 0
+  ) {
+    return false
+  }
+  const coordinator = tokenIndexes(
+    clause.tokens,
+    CLAUSE_COORDINATORS,
+    segmentStart,
+    absence
+  ).at(-1)
+  return (
+    tokenIndex(
+      clause.tokens,
+      NEGATION_TERMS,
+      (coordinator ?? segmentStart - 1) + 1,
+      absence
+    ) < 0
+  )
+}
+
+function reviewerSlotIsExplicitlyAbsent(clause, action, slotName) {
+  const segment = actionSegment(clause, action.index)
+  return tokenIndexes(
+    clause.tokens,
+    new Set([slotName]),
+    segment.start,
+    segment.end
+  ).some((slot) => relationIsExplicitlyAbsent(clause, slot, segment.start))
+}
+
+function reviewerRoleIsExplicitlyAbsent(clause, action, role) {
+  const segment = actionSegment(clause, action.index)
+  const nextAction = clause.actions.find(
+    (candidate) => candidate.index > action.index
+  )
+  const relationEnd = nextAction?.index ?? clause.tokens.length
+  return clause.actors
+    .filter(
+      (actor) =>
+        actor.role === role &&
+        actor.start >= segment.start &&
+        actor.end <= relationEnd
+    )
+    .some((actor) => {
+      if (relationIsExplicitlyAbsent(clause, actor.start, segment.start)) {
+        return true
+      }
+      const negation = tokenIndexes(
+        clause.tokens,
+        NEGATION_TERMS,
+        Math.max(segment.start, actor.start - 5),
+        actor.start
+      ).at(-1)
+      if (
+        negation !== undefined &&
+        tokenIndex(
+          clause.tokens,
+          new Set(["alone", "only"]),
+          negation + 1,
+          relationEnd
+        ) < 0 &&
+        tokenIndex(
+          clause.tokens,
+          REVIEW_ABSENCE_TERMS,
+          negation + 1,
+          actor.start
+        ) < 0
+      ) {
+        return true
+      }
+      return tokenIndexes(
+        clause.tokens,
+        POSTPOSED_REVIEW_ABSENCE_TERMS,
+        actor.end,
+        Math.min(relationEnd, actor.end + 6)
+      ).some((absence) => {
+        if (actionIsNegated(clause.tokens, absence)) return false
+        if (
+          postposedReviewAbsenceHasDirectObject(clause, absence, relationEnd)
+        ) {
+          return false
+        }
+        const subjectLink = tokenIndex(
+          clause.tokens,
+          REVIEW_SUBJECT_LINKS,
+          actor.end,
+          absence
+        )
+        if (subjectLink < 0) return false
+        if (
+          !tokensArePostposedReviewAbsenceModifiers(
+            clause.tokens.slice(subjectLink + 1, absence)
+          )
+        ) {
+          return false
+        }
+        if (
+          tokenIndex(
+            clause.tokens,
+            REVIEW_SUBJECT_BOUNDARIES,
+            actor.end,
+            subjectLink
+          ) >= 0
+        ) {
+          return false
+        }
+        if (
+          tokenIndex(clause.tokens, CLAUSE_COORDINATORS, actor.end, absence) >=
+          0
+        ) {
+          return false
+        }
+        return !clause.actors.some(
+          (candidate) =>
+            candidate.start >= actor.end && candidate.end <= absence
+        )
+      })
+    })
+}
+
+function reviewerSetIsExplicitlyEmpty(clause, action) {
+  const segment = actionSegment(clause, action.index)
+  const absence = tokenIndexes(
+    clause.tokens,
+    REVIEW_ABSENCE_TERMS,
+    Math.max(segment.start, action.index - 5),
+    action.index
+  ).at(-1)
+  if (absence === undefined) return false
+  const qualified =
+    tokenIndex(
+      clause.tokens,
+      new Set([
+        "agent",
+        "another",
+        "auxiliary",
+        "codex",
+        "more",
+        "other",
+        "primary",
+        "task",
+      ]),
+      absence + 1,
+      action.index
+    ) >= 0
+  return (
+    !qualified &&
+    relationIsExplicitlyAbsent(clause, action.index, segment.start)
+  )
+}
+
+function explicitReviewerCardinality(clause, action) {
+  const counts = new Map([
+    ["single", 1],
+    ["sole", 1],
+    ["one", 1],
+    ["1", 1],
+    ["first", 1],
+    ["two", 2],
+    ["2", 2],
+    ["second", 2],
+    ["three", 3],
+    ["3", 3],
+    ["third", 3],
+  ])
+  const start = Math.max(
+    actionSegment(clause, action.index).start,
+    action.index - 6
+  )
+  const extraMarkers = tokenIndexes(
+    clause.tokens,
+    new Set(["additional", "another", "extra", "further", "surplus"]),
+    start,
+    action.index
+  )
+  const markerIntroducesComplementarySlot = (marker) => {
+    const slots = ["primary", "auxiliary"].filter(
+      (slot) =>
+        tokenIndex(clause.tokens, new Set([slot]), marker + 1, action.index) >=
+        0
+    )
+    if (
+      slots.length !== 1 ||
+      !clause.actors.some(
+        (actor) => actor.start > marker && actor.end <= action.index
+      )
+    ) {
+      return false
+    }
+    const slot = slots[0]
+    return clause.reviewers.some(
+      (reviewer) =>
+        reviewer.index !== action.index &&
+        ((slot === "primary" && reviewer.auxiliary) ||
+          (slot === "auxiliary" && reviewer.primary))
+    )
+  }
+  const countBeforeMore = tokenIndexes(
+    clause.tokens,
+    new Set([...counts.keys()]),
+    start,
+    action.index
+  ).some(
+    (count) =>
+      tokenIndex(
+        clause.tokens,
+        new Set(["more"]),
+        count + 1,
+        Math.min(action.index, count + 3)
+      ) >= 0
+  )
+  if (
+    extraMarkers.some((marker) => !markerIntroducesComplementarySlot(marker)) ||
+    countBeforeMore
+  ) {
+    return { extra: true, count: null, qualifiers: new Set() }
+  }
+  for (let index = action.index - 1; index >= start; index -= 1) {
+    const count = counts.get(clause.tokens[index])
+    if (count === undefined) continue
+    const qualifiers = new Set()
+    if (
+      tokenIndex(
+        clause.tokens,
+        new Set(["primary"]),
+        index + 1,
+        action.index
+      ) >= 0
+    ) {
+      qualifiers.add("primary")
+    }
+    if (
+      tokenIndex(
+        clause.tokens,
+        new Set(["auxiliary"]),
+        index + 1,
+        action.index
+      ) >= 0
+    ) {
+      qualifiers.add("auxiliary")
+    }
+    if (
+      tokenIndex(clause.tokens, new Set(["codex"]), index + 1, action.index) >=
+      0
+    ) {
+      qualifiers.add("codex")
+    }
+    if (
+      phraseIndex(clause.tokens, ["task", "agent"], index + 1, action.index) >=
+      0
+    ) {
+      qualifiers.add("task_agent")
+    }
+    return { extra: false, count, qualifiers }
+  }
+  return null
+}
+
+function reviewerCardinalityContradictsRoute(cardinality, normal, high) {
+  if (!cardinality) return false
+  if (cardinality.extra) return normal || high
+  const expected = new Map([
+    ["primary", 1],
+    ["auxiliary", high ? 1 : 0],
+    ["codex", 1],
+    ["task_agent", high ? 1 : 0],
+  ])
+  if (cardinality.qualifiers.size === 0) {
+    return (
+      (normal && cardinality.count !== 1) || (high && cardinality.count !== 2)
+    )
+  }
+  return [...cardinality.qualifiers].some(
+    (qualifier) => cardinality.count !== expected.get(qualifier)
+  )
+}
+
+function reviewStatementIsExhaustive(clause, action) {
+  const segment = actionSegment(clause, action.index)
+  for (const quantifier of tokenIndexes(
+    clause.tokens,
+    REVIEW_EXHAUSTIVE_QUANTIFIERS,
+    segment.start,
+    segment.end
+  )) {
+    if (
+      quantifier < action.index &&
+      clause.tokens
+        .slice(quantifier + 1, action.index)
+        .every((token) => REVIEW_ACTOR_TAIL_TERMS.has(token))
+    ) {
+      return true
+    }
+    const followingRelation = tokenIndex(
+      clause.tokens,
+      new Set([...ACTOR_LINKS, ...QUANTIFIER_COMPLEMENT_LINKS]),
+      quantifier + 1,
+      Math.min(segment.end, quantifier + 4)
+    )
+    if (
+      followingRelation >= 0 &&
+      clause.tokens
+        .slice(quantifier + 1, followingRelation)
+        .every((token) => QUANTIFIER_COMPLEMENT_MODIFIERS.has(token))
+    ) {
+      if (ACTOR_LINKS.has(clause.tokens[followingRelation])) return true
+      continue
+    }
+    const link = tokenIndexes(
+      clause.tokens,
+      ACTOR_LINKS,
+      action.index + 1,
+      quantifier + 1
+    ).at(-1)
+    if (link === undefined) continue
+    const actors = actorsAfterLink(clause, link, segment.end)
+    if (
+      actors.some(
+        (actor) => actor.start > quantifier && actor.end <= segment.end
+      )
+    ) {
+      return true
+    }
+    if (QUANTIFIER_COMPLEMENT_LINKS.has(clause.tokens[quantifier + 1])) {
+      continue
+    }
+    if (
+      actors.some(
+        (actor) =>
+          actor.end <= quantifier &&
+          clause.tokens
+            .slice(actor.end, quantifier)
+            .every((token) => REVIEW_ACTOR_TAIL_TERMS.has(token))
+      )
+    ) {
+      return true
+    }
+  }
+  return (
+    ["reviewer", "reviewers"].some(
+      (reviewer) =>
+        phraseIndex(clause.tokens, ["no", "other", reviewer], action.index) >= 0
+    ) || phraseIndex(clause.tokens, ["no", "other", "agent"], action.index) >= 0
+  )
+}
+
+function actorsMatchReviewerSet(actors, expected) {
+  if (actors.length !== expected.length) return false
+  const actualRoles = actors.map((actor) => actor.role).sort()
+  const expectedRoles = [...expected].sort()
+  return actualRoles.every((role, index) => role === expectedRoles[index])
+}
+
+function conflictsWithReviewRoute(clause, action, scopes) {
+  const bindings = reviewActorBindingsForAction(clause, action)
+  const actors = bindings.map((binding) => binding.actor)
+  const normal = ["normal", "universal"].some((scope) => scopes.has(scope))
+  const high = ["high", "universal"].some((scope) => scopes.has(scope))
+  const negated = statementIsNegatedBeforeAction(clause, action)
+
+  if ((normal || high) && reviewerSetIsExplicitlyEmpty(clause, action)) {
+    return true
+  }
+  if (
+    (normal || high) &&
+    (reviewerSlotIsExplicitlyAbsent(clause, action, "primary") ||
+      reviewerRoleIsExplicitlyAbsent(clause, action, "codex"))
+  ) {
+    return true
+  }
+  if (
+    high &&
+    (reviewerSlotIsExplicitlyAbsent(clause, action, "auxiliary") ||
+      reviewerRoleIsExplicitlyAbsent(clause, action, "task_agent"))
+  ) {
+    return true
+  }
+  if (negated) return false
+
+  const cardinality = explicitReviewerCardinality(clause, action)
+  if (reviewerCardinalityContradictsRoute(cardinality, normal, high)) {
+    return true
+  }
+
+  const actionSlot = reviewSlotForAction(clause, action)
+  if (
+    normal &&
+    (actionSlot === "auxiliary" ||
+      bindings.some((binding) => binding.slot === "auxiliary") ||
+      actors.length > 1)
+  ) {
+    return true
+  }
+  if (high && actors.length > 2) return true
+  if (
+    high &&
+    actors.length > 1 &&
+    actors.some(
+      (actor, index) =>
+        actors.findIndex((candidate) => candidate.role === actor.role) !== index
+    )
+  ) {
+    return true
+  }
+  if (
+    high &&
+    reviewStatementIsExhaustive(clause, action) &&
+    actors.length === 0 &&
+    actionSlot !== null
+  ) {
+    return true
+  }
+
+  for (const { actor, slot } of bindings) {
+    if (
+      high &&
+      ((slot === "primary" && actor.role === "task_agent") ||
+        (slot === "auxiliary" && actor.role === "codex"))
+    ) {
+      return true
+    }
+  }
+  if (
+    high &&
+    actors.length === 2 &&
+    bindings.some((binding) => binding.slot !== null) &&
+    (!bindings.some(
+      ({ actor, slot }) => actor.role === "codex" && slot === "primary"
+    ) ||
+      !bindings.some(
+        ({ actor, slot }) => actor.role === "task_agent" && slot === "auxiliary"
+      ))
+  ) {
+    return true
+  }
+
+  if (!reviewStatementIsExhaustive(clause, action) || actors.length === 0) {
+    return false
+  }
+  if (normal && !actorsMatchReviewerSet(actors, ["codex"])) return true
+  if (high && !actorsMatchReviewerSet(actors, ["codex", "task_agent"])) {
+    return true
+  }
+  return false
+}
+
+function conflictsWithDirectRoute(clause, action, scopes) {
+  const bindings = routeTargetBindingsForAction(clause, action)
+  const normal = ["normal", "universal"].some((scope) => scopes.has(scope))
+  const high = ["high", "universal"].some((scope) => scopes.has(scope))
+  const reviewBindings = bindings.filter((binding) => binding.purpose)
+  const implementationBindings = bindings.filter((binding) => !binding.purpose)
+
+  if (
+    reviewBindings.length > 0 &&
+    implementationBindings.some((binding) => !binding.implementationExplicit)
+  ) {
+    return true
+  }
+
+  if (reviewBindings.length > 0) {
+    const targets = reviewBindings.map((binding) => binding.actor)
+    if (
+      normal &&
+      (targets.length > 1 ||
+        targets.some((target) => target.role !== "codex") ||
+        reviewBindings.some((binding) => binding.slot === "auxiliary"))
+    ) {
+      return true
+    }
+    if (high && targets.length > 2) return true
+    if (
+      high &&
+      targets.some((target) => !["codex", "task_agent"].includes(target.role))
+    ) {
+      return true
+    }
+    if (
+      high &&
+      reviewBindings.some(
+        ({ actor, slot }) =>
+          (slot === "primary" && actor.role === "task_agent") ||
+          (slot === "auxiliary" && actor.role === "codex")
+      )
+    ) {
+      return true
+    }
+    if (
+      high &&
+      targets.length === 2 &&
+      reviewBindings.some((binding) => binding.slot !== null) &&
+      (!reviewBindings.some(
+        ({ actor, slot }) => actor.role === "codex" && slot === "primary"
+      ) ||
+        !reviewBindings.some(
+          ({ actor, slot }) =>
+            actor.role === "task_agent" && slot === "auxiliary"
+        ))
+    ) {
+      return true
+    }
+    if (
+      high &&
+      targets.some(
+        (target, index) =>
+          targets.findIndex((candidate) => candidate.role === target.role) !==
+          index
+      )
+    ) {
+      return true
+    }
+    if (reviewStatementIsExhaustive(clause, action)) {
+      if (normal && !actorsMatchReviewerSet(targets, ["codex"])) return true
+      if (high && !actorsMatchReviewerSet(targets, ["codex", "task_agent"])) {
+        return true
+      }
+    }
+  }
+
+  const implementers = implementationBindings.map((binding) => binding.actor)
+  if (implementers.length > 1) return true
+  return implementers.some(
+    (target) =>
+      (high && target.role === "task_agent") ||
+      (normal && target.role === "codex")
+  )
+}
+
+function reviewActionIsRoutePurpose(clause, action) {
+  const route = clause.actions
+    .filter(
+      (candidate) =>
+        candidate.kind === "route" && candidate.index < action.index
+    )
+    .at(-1)
+  return Boolean(route && routeReviewPurpose(clause, route))
+}
+
+function conflictsWithParentOwnership(clause) {
+  const parents = clause.actors.filter((actor) => actor.role === "parent")
+  for (const parent of parents) {
+    const link = linkBeforeActor(clause, parent)
+    if (link !== undefined && clause.tokens[link] === "by") {
+      const action = nearestActionBefore(clause, link)
+      if (
+        action?.kind === "production" &&
+        (actionHasDocumentTarget(clause, action) ||
+          predicateActionGroup(clause, action).some((candidate) =>
+            actionHasDocumentTarget(clause, candidate)
+          )) &&
+        !relationTargetIsNegated(clause, action, link)
+      ) {
+        return true
+      }
+    }
+
+    for (const action of clause.actions) {
+      if (
+        action.kind !== "production" ||
+        action.index <= parent.start ||
+        actionIsNegated(clause.tokens, action.index) ||
+        !actionHasDocumentTarget(clause, action)
+      ) {
+        continue
+      }
+      const passiveActors = passiveActorsForAction(clause, action)
+      if (
+        passiveActors.length > 0 &&
+        passiveActors.every((actor) => actor.role !== "parent")
+      ) {
+        continue
+      }
+      if (
+        actionDelegatesToProducer(clause, parent, action) ||
+        actionIsPassivelyDelegatedToProducer(clause, parent, action)
+      ) {
+        continue
+      }
+      if (repeatedProducerSubjectForAction(clause, action)) continue
+      return true
+    }
+  }
+  return false
+}
+
+function conflictsWithTaskAgentRoute(clause) {
+  for (const action of clause.actions) {
+    if (actionIsExcludedAlternative(clause, action)) continue
+    const passiveSubjects = passiveActorsForAction(clause, action)
+    const scopes = actionTaskScopes(clause, action)
+    if (
+      action.kind === "review" &&
+      !reviewActionIsRoutePurpose(clause, action) &&
+      conflictsWithReviewRoute(clause, action, scopes)
+    ) {
+      return true
+    }
+    if (
+      action.kind !== "route" &&
+      actionIsNegated(clause.tokens, action.index) &&
+      passiveSubjects.length === 0
+    ) {
+      continue
+    }
+    const subjects =
+      passiveSubjects.length > 0
+        ? passiveSubjects
+        : subjectActorsForAction(clause, action)
+    if (
+      action.kind === "production" &&
+      !scopes.has("unspecified") &&
+      subjects.length > 1
+    ) {
+      return true
+    }
+    if (
+      action.kind === "production" &&
+      ["high", "universal"].some((scope) => scopes.has(scope)) &&
+      subjects.some((actor) => actor.role === "task_agent")
+    ) {
+      return true
+    }
+    if (
+      action.kind === "production" &&
+      ["normal", "universal"].some((scope) => scopes.has(scope)) &&
+      subjects.some((actor) => actor.role === "codex")
+    ) {
+      return true
+    }
+    if (
+      action.kind === "review" &&
+      ["normal", "universal"].some((scope) => scopes.has(scope)) &&
+      subjects.some((actor) => actor.role === "task_agent")
+    ) {
+      return true
+    }
+    if (action.kind !== "route") {
+      continue
+    }
+    if (subjects.some((actor) => actor.role === "task_agent")) return true
+    if (conflictsWithDirectRoute(clause, action, scopes)) return true
+  }
+  return false
+}
+
+function conflictsWithConversationIdentity(clause) {
+  const { tokens } = clause
+  const reuse = tokenIndex(
+    tokens,
+    new Set(["reuse", "reuses", "reusing", "share", "shares", "sharing"])
+  )
+  if (reuse < 0 || actionIsNegated(tokens, reuse)) return false
+  return (
+    tokenIndex(tokens, new Set(["conversation", "conversations"])) >= 0 &&
+    tokenIndex(tokens, new Set(["implementation", "implementer"])) >= 0 &&
+    tokenIndex(tokens, new Set(["review", "reviewer", "reviewers"])) >= 0
+  )
+}
+
+function taskStateIndexes(clause, task, states) {
+  return tokenIndexes(
+    clause.tokens,
+    states,
+    Math.max(0, task.index - 2),
+    task.index + 5
+  )
+}
+
+function taskComponentIndex(clause, task) {
+  return tokenIndex(
+    clause.tokens,
+    TASK_COMPONENT_SUFFIX_TERMS,
+    task.index + 1,
+    task.index + 8
+  )
+}
+
+function taskComponentLocalStart(clause, segmentStart, component) {
+  const punctuationBoundary = [...clause.actionBoundaryAfter]
+    .filter((boundary) => boundary >= segmentStart && boundary < component)
+    .sort((left, right) => right - left)[0]
+  return punctuationBoundary === undefined
+    ? segmentStart
+    : punctuationBoundary + 1
+}
+
+function taskComponentOwner(clause, segmentStart, component) {
+  if (clause.tokens[component - 1] === "its") return "task"
+  const localStart = taskComponentLocalStart(clause, segmentStart, component)
+  const owners = [...(clause.possessiveIndexes ?? [])].filter(
+    (owner) => owner >= localStart && owner < component
+  )
+  if (owners.length === 0) return "implicit-task"
+  const attachmentIsModifierOnly = (owner, target) =>
+    clause.tokens
+      .slice(owner + 1, target)
+      .every(
+        (token) =>
+          GENERIC_REVIEW_TARGET_PREFIX_TERMS.has(token) ||
+          REVIEW_REQUIREMENT_ACTIONS.has(token) ||
+          TASK_COMPONENT_COMPOUND_MODIFIERS.has(token) ||
+          new Set(["auxiliary", "primary", "s"]).has(token) ||
+          token.endsWith("ed") ||
+          token.endsWith("ly")
+      )
+  let ownerPosition = owners.length - 1
+  let owner = owners[ownerPosition]
+  if (!attachmentIsModifierOnly(owner, component)) return "implicit-task"
+  if (clause.tokens[owner] === "task") return "task"
+  while (ownerPosition > 0) {
+    const outerOwner = owners[ownerPosition - 1]
+    if (!attachmentIsModifierOnly(outerOwner, owner)) break
+    if (clause.tokens[outerOwner] === "task") return "task"
+    owner = outerOwner
+    ownerPosition -= 1
+  }
+  return "other"
+}
+
+function adjunctFinalItHasNonTaskOwner(subjectPrefix, prefix) {
+  const beforeIt = subjectPrefix.slice(prefix.length, -1)
+  const ownerBefore = (predicate) =>
+    beforeIt
+      .slice(0, predicate)
+      .filter(
+        (token) =>
+          !TASK_STATE_ADJUNCT_NON_SUBJECT_TERMS.has(token) &&
+          !token.endsWith("ly")
+      )
+      .at(-1)
+  const hasNonTaskOwner = (predicate) => {
+    const owner = ownerBefore(predicate)
+    return owner !== undefined && !new Set(["it", "itself", "task"]).has(owner)
+  }
+  const reportingPredicate = beforeIt.findLastIndex((token) =>
+    TASK_STATE_REPORTING_PREDICATES.has(token)
+  )
+  if (reportingPredicate >= 0) return hasNonTaskOwner(reportingPredicate)
+  const participialPredicate = beforeIt.findLastIndex((token) =>
+    token.endsWith("ing")
+  )
+  return participialPredicate >= 0 && hasNonTaskOwner(participialPredicate)
+}
+
+function taskMentionIsDirectAntecedentObject(
+  clause,
+  task,
+  subjectHeadIndex,
+  segmentEnd
+) {
+  let objectStart = task.index
+  while (objectStart > subjectHeadIndex + 1) {
+    const qualifier = clause.tokens[objectStart - 1]
+    if (
+      !TASK_DIRECT_OBJECT_QUALIFIERS.has(qualifier) &&
+      !qualifier.endsWith("ly")
+    ) {
+      break
+    }
+    objectStart -= 1
+  }
+  if (TASK_ANTECEDENT_NON_OBJECT_LINKS.has(clause.tokens[objectStart - 1])) {
+    return false
+  }
+  const trailingHead = clause.tokens
+    .slice(task.index + 1, segmentEnd)
+    .find((token) => !TASK_STATE_MODIFIERS.has(token) && !token.endsWith("ly"))
+  return (
+    trailingHead === undefined ||
+    TASK_ANTECEDENT_NON_OBJECT_LINKS.has(trailingHead)
+  )
+}
+
+function previousSegmentHasExplicitNonTaskAntecedent(clause, start) {
+  const boundary = tokenIndexes(
+    clause.tokens,
+    TASK_STATE_CLAUSE_BOUNDARIES,
+    0,
+    start
+  ).at(-1)
+  if (boundary === undefined) return false
+  const previousBoundary = tokenIndexes(
+    clause.tokens,
+    TASK_STATE_CLAUSE_BOUNDARIES,
+    0,
+    boundary
+  ).at(-1)
+  const segmentStart = (previousBoundary ?? -1) + 1
+  const modifier = tokenIndexes(
+    clause.tokens,
+    EXPLICIT_NON_TASK_ANTECEDENT_MODIFIERS,
+    segmentStart,
+    boundary
+  ).at(-1)
+  if (modifier === undefined) return false
+  const subjectTokens = clause.tokens.slice(modifier + 1, boundary)
+  const subjectHeadOffset = subjectTokens.findIndex(
+    (token) =>
+      !TASK_STATE_SUBJECT_DETERMINERS.has(token) &&
+      !TASK_STATE_MODIFIERS.has(token) &&
+      !token.endsWith("ly")
+  )
+  const subjectHead = subjectTokens[subjectHeadOffset]
+  const subjectHeadIndex = modifier + 1 + subjectHeadOffset
+  const hasCloserTaskAntecedent = directiveTasks(clause.tokens).some(
+    (task) =>
+      task.index > subjectHeadIndex &&
+      task.index < boundary &&
+      taskMentionIsDirectAntecedentObject(
+        clause,
+        task,
+        subjectHeadIndex,
+        boundary
+      )
+  )
+  return (
+    subjectHead !== undefined &&
+    !hasCloserTaskAntecedent &&
+    !new Set(["it", "itself", "task"]).has(subjectHead)
+  )
+}
+
+function stateSegmentHasExplicitNonTaskSubject(clause, start, end) {
+  const predicate = tokenIndex(
+    clause.tokens,
+    new Set([
+      ...TASK_REACTIVATION_PREDICATES,
+      ...TASK_REACTIVATION_STATE_LINKS,
+    ]),
+    start,
+    end
+  )
+  if (predicate < 0) return false
+  const causativeObject = predicate - 1
+  if (
+    clause.tokens[causativeObject] === "it" &&
+    PEOPLE_PURPOSE_ACTIONS.has(clause.tokens[causativeObject - 1]) &&
+    !previousSegmentHasExplicitNonTaskAntecedent(clause, start)
+  ) {
+    return false
+  }
+  const taskObject = tokenIndex(
+    clause.tokens,
+    new Set(["it"]),
+    predicate + 1,
+    end
+  )
+  if (
+    taskObject >= 0 &&
+    clause.tokens
+      .slice(predicate + 1, taskObject)
+      .every((token) => TASK_STATE_OBJECT_PRONOUN_MODIFIERS.has(token)) &&
+    !previousSegmentHasExplicitNonTaskAntecedent(clause, start)
+  ) {
+    return false
+  }
+  const subject = clause.tokens.slice(start, predicate)
+  const subjectHead = subject.find(
+    (token) =>
+      !TASK_STATE_SUBJECT_DETERMINERS.has(token) &&
+      !TASK_STATE_MODIFIERS.has(token) &&
+      !token.endsWith("ly")
+  )
+  return (
+    subjectHead !== undefined &&
+    !new Set(["it", "itself", "task"]).has(subjectHead)
+  )
+}
+
+function taskMentionIsAffirmativeDirectReactivationObject(
+  clause,
+  predicate,
+  taskIndex
+) {
+  if (
+    !TASK_REACTIVATION_PREDICATES.has(clause.tokens[predicate]) ||
+    actionIsNegated(
+      clause.tokens,
+      predicate,
+      TASK_REACTIVATION_NEGATION_BOUNDARIES
+    )
+  ) {
+    return false
+  }
+  return clause.tokens
+    .slice(predicate + 1, taskIndex)
+    .every(
+      (token) =>
+        TASK_DIRECT_OBJECT_QUALIFIERS.has(token) || token.endsWith("ly")
+    )
+}
+
+function taskMentionIsNestedInNonTaskSubject(clause, task, state) {
+  const predicate = TASK_REACTIVATION_PREDICATES.has(clause.tokens[state])
+    ? state
+    : tokenIndex(
+        clause.tokens,
+        new Set([
+          ...TASK_REACTIVATION_PREDICATES,
+          ...TASK_REACTIVATION_STATE_LINKS,
+        ]),
+        task.index + 1,
+        state
+      )
+  if (predicate < 0) return false
+  const boundary = tokenIndexes(
+    clause.tokens,
+    TASK_STATE_CLAUSE_BOUNDARIES,
+    0,
+    task.index
+  ).at(-1)
+  const punctuationBoundary = [...(clause.actionBoundaryAfter ?? [])]
+    .filter((candidate) => candidate < task.index)
+    .sort((left, right) => right - left)[0]
+  const prefixStart = Math.max(boundary ?? -1, punctuationBoundary ?? -1) + 1
+  const prefix = clause.tokens.slice(prefixStart, task.index)
+  const objectLink = prefix.findLastIndex(
+    (token) => PEOPLE_ANTECEDENT_LINKS.has(token) || token.endsWith("ing")
+  )
+  if (objectLink < 0) return false
+  if (
+    taskMentionIsAffirmativeDirectReactivationObject(
+      clause,
+      prefixStart + objectLink,
+      task.index
+    )
+  ) {
+    return false
+  }
+  const subjectHead = prefix
+    .slice(0, objectLink)
+    .find(
+      (token) =>
+        !TASK_STATE_SUBJECT_DETERMINERS.has(token) &&
+        !TASK_STATE_MODIFIERS.has(token) &&
+        !token.endsWith("ly")
+    )
+  if (subjectHead === undefined && punctuationBoundary !== undefined) {
+    const parentheticalEnd = [...(clause.actionBoundaryAfter ?? [])].some(
+      (candidate) => candidate >= task.index && candidate < predicate
+    )
+    if (parentheticalEnd) {
+      const outerBoundary = tokenIndexes(
+        clause.tokens,
+        TASK_STATE_CLAUSE_BOUNDARIES,
+        0,
+        punctuationBoundary + 1
+      ).at(-1)
+      const outerSubject = clause.tokens
+        .slice((outerBoundary ?? -1) + 1, punctuationBoundary + 1)
+        .find(
+          (token) =>
+            !TASK_STATE_SUBJECT_DETERMINERS.has(token) &&
+            !TASK_STATE_MODIFIERS.has(token) &&
+            !token.endsWith("ly")
+        )
+      return (
+        outerSubject !== undefined &&
+        !new Set(["it", "itself", "task"]).has(outerSubject)
+      )
+    }
+  }
+  return (
+    subjectHead !== undefined &&
+    !new Set(["it", "itself", "task"]).has(subjectHead)
+  )
+}
+
+function stateHasTaskSubject(clause, task, state) {
+  if (taskMentionIsNestedInNonTaskSubject(clause, task, state)) return false
+  const boundary = tokenIndexes(
+    clause.tokens,
+    TASK_STATE_CLAUSE_BOUNDARIES,
+    task.index + 1,
+    state
+  ).at(-1)
+  const segmentStart = boundary === undefined ? task.index + 1 : boundary + 1
+  const stateLink = tokenIndexes(
+    clause.tokens,
+    new Set([
+      ...TASK_COMPONENT_STATE_LINKS,
+      ...TASK_COMPONENT_CONTINUATION_PREDICATES,
+      ...TASK_REACTIVATION_PREDICATES,
+      ...TASK_REACTIVATION_STATE_LINKS,
+    ]),
+    segmentStart,
+    state
+  ).at(-1)
+  const subjectEnd = stateLink ?? state
+  const subjectPrefix = clause.tokens.slice(segmentStart, subjectEnd)
+  const subjectHead = subjectPrefix.findIndex(
+    (token) => !TASK_STATE_MODIFIERS.has(token) && !token.endsWith("ly")
+  )
+  const normalizedSubjectPrefix = subjectPrefix.slice(
+    subjectHead < 0 ? subjectPrefix.length : subjectHead
+  )
+  const adjunctTaskAnaphor = TASK_STATE_ANAPHOR_ADJUNCT_PREFIXES.some(
+    (prefix) =>
+      phraseIndex(
+        normalizedSubjectPrefix,
+        prefix,
+        0,
+        normalizedSubjectPrefix.length
+      ) === 0 &&
+      normalizedSubjectPrefix.at(-1) === "it" &&
+      !normalizedSubjectPrefix.slice(0, -1).includes("itself") &&
+      !adjunctFinalItHasNonTaskOwner(normalizedSubjectPrefix, prefix)
+  )
+  if (adjunctTaskAnaphor) return true
+  if (subjectPrefix.length === 0) return true
+  if (
+    subjectPrefix.every(
+      (token) => TASK_STATE_MODIFIERS.has(token) || token.endsWith("ly")
+    )
+  ) {
+    return true
+  }
+  if (
+    normalizedSubjectPrefix[0] === "its" &&
+    TASK_COMPONENT_SUFFIX_TERMS.has(normalizedSubjectPrefix.at(-1))
+  ) {
+    return true
+  }
+  if (new Set(["it", "itself"]).has(normalizedSubjectPrefix[0])) {
+    if (
+      normalizedSubjectPrefix.length > 1 &&
+      !(
+        normalizedSubjectPrefix.length === 2 &&
+        normalizedSubjectPrefix[1] === "itself"
+      )
+    ) {
+      return false
+    }
+    const previousBoundary = tokenIndexes(
+      clause.tokens,
+      TASK_STATE_CLAUSE_BOUNDARIES,
+      task.index + 1,
+      boundary
+    ).at(-1)
+    const previousStart =
+      previousBoundary === undefined ? task.index + 1 : previousBoundary + 1
+    const previousLink = tokenIndexes(
+      clause.tokens,
+      TASK_COMPONENT_STATE_LINKS,
+      previousStart,
+      boundary
+    ).at(-1)
+    if (
+      previousLink === undefined &&
+      stateSegmentHasExplicitNonTaskSubject(
+        clause,
+        previousStart,
+        boundary ?? state
+      )
+    ) {
+      return false
+    }
+    return previousLink === undefined || previousLink === previousStart
+  }
+  if (TASK_COMPONENT_SUFFIX_TERMS.has(subjectPrefix.at(-1))) {
+    if (taskComponentOwner(clause, segmentStart, subjectEnd - 1) === "other") {
+      return false
+    }
+    return !taskComponentStateHasActionObject(clause, subjectEnd - 1, state)
+  }
+  const laterDeterminer = subjectPrefix
+    .slice(2)
+    .some((token) => TASK_STATE_SUBJECT_DETERMINERS.has(token))
+  return (
+    new Set(["after", "before", "following"]).has(subjectPrefix[0]) &&
+    TASK_STATE_SUBJECT_DETERMINERS.has(subjectPrefix[1]) &&
+    subjectPrefix.length <= 4 &&
+    !laterDeterminer
+  )
+}
+
+function postposedTaskStateIndexes(clause, task, states) {
+  const nextTask = clause.tasks?.find(
+    (candidate) => candidate.index > task.index
+  )
+  const end = nextTask?.index ?? clause.tokens.length
+  return tokenIndexes(clause.tokens, states, task.index + 1, end).filter(
+    (state) => stateHasTaskSubject(clause, task, state)
+  )
+}
+
+function taskActivityStateIndexes(clause, task) {
+  const preposed = tokenIndexes(
+    clause.tokens,
+    EXPLICIT_TASK_ACTIVITY_TERMS,
+    Math.max(0, task.index - 2),
+    task.index + 1
+  )
+  const reactivations = postposedTaskStateIndexes(
+    clause,
+    task,
+    TASK_REACTIVATION_PREDICATES
+  ).filter((state) =>
+    taskCompletedStateIndexes(clause, task).some(
+      (completion) => completion < state
+    )
+  )
+  return [
+    ...new Set([
+      ...preposed,
+      ...postposedTaskStateIndexes(clause, task, EXPLICIT_TASK_ACTIVITY_TERMS),
+      ...reactivations,
+    ]),
+  ].sort((left, right) => left - right)
+}
+
+function taskComponentStateHasActionObject(clause, component, state) {
+  const previousBoundary = [...clause.actionBoundaryAfter]
+    .filter((candidate) => candidate < component)
+    .sort((left, right) => right - left)[0]
+  const previousImperativeBoundary = [...(clause.imperativeBoundaryAfter ?? [])]
+    .filter((candidate) => candidate < component)
+    .sort((left, right) => right - left)[0]
+  const imperativePrefix = clause.tokens.slice(
+    (previousBoundary ?? -1) + 1,
+    component
+  )
+  const separatedImperative =
+    previousBoundary !== undefined &&
+    previousBoundary === previousImperativeBoundary &&
+    imperativePrefix.every(
+      (token) =>
+        TASK_COMPONENT_IMPERATIVE_PREFIX_TERMS.has(token) ||
+        TASK_STATE_MODIFIERS.has(token) ||
+        token.endsWith("ly")
+    )
+  const explicitlyMarkedImperative =
+    previousBoundary !== undefined &&
+    imperativePrefix.some((token) =>
+      TASK_COMPONENT_IMPERATIVE_PREFIX_TERMS.has(token)
+    )
+  const testRunningObject =
+    previousBoundary !== undefined &&
+    clause.tokens[component] === "test" &&
+    clause.tokens[state] === "running" &&
+    taskComponentOwner(clause, (previousBoundary ?? -1) + 1, component) !==
+      "task"
+  const boundary = [...clause.actionBoundaryAfter]
+    .filter((candidate) => candidate >= state)
+    .sort((left, right) => left - right)[0]
+  const object = clause.tokens.slice(state + 1, (boundary ?? state) + 1)
+  const head = object.findLast(
+    (token) =>
+      !TASK_STATE_MODIFIERS.has(token) &&
+      !TASK_UNFINISHED_STATE_TERMS.has(token) &&
+      !CLAUSE_COORDINATORS.has(token)
+  )
+  const headIndex = object.lastIndexOf(head)
+  return (
+    TASK_COMPONENT_ACTION_FORMS.has(clause.tokens[component]) &&
+    head !== undefined &&
+    (separatedImperative ||
+      explicitlyMarkedImperative ||
+      testRunningObject ||
+      head.endsWith("s") ||
+      object
+        .slice(0, headIndex)
+        .some((token) => TASK_STATE_SUBJECT_DETERMINERS.has(token)))
+  )
+}
+
+function taskComponentHasUnfinishedState(clause, task) {
+  const component = taskComponentIndex(clause, task)
+  if (component < 0) return false
+  if (taskComponentOwner(clause, task.index + 1, component) === "other") {
+    return false
+  }
+  const end = Math.min(clause.tokens.length, component + 7)
+  const ellipticalState = tokenIndex(
+    clause.tokens,
+    TASK_UNFINISHED_STATE_TERMS,
+    component + 1,
+    end
+  )
+  const stateBoundaryAfter = (state) =>
+    [...clause.actionBoundaryAfter]
+      .filter((boundary) => boundary >= state && boundary < end)
+      .sort((left, right) => left - right)[0]
+  const stateEndsAtBoundary = (state) =>
+    stateBoundaryAfter(state) !== undefined ||
+    CLAUSE_COORDINATORS.has(clause.tokens[state + 1])
+  const ellipticalStateHasActionObject =
+    ellipticalState >= 0 &&
+    taskComponentStateHasActionObject(clause, component, ellipticalState)
+  const actionPrefix = clause.tokens.slice(
+    taskComponentLocalStart(clause, task.index + 1, component),
+    component
+  )
+  const componentHasActionModifier =
+    actionPrefix.some((token) =>
+      TASK_COMPONENT_IMPERATIVE_PREFIX_TERMS.has(token)
+    ) &&
+    actionPrefix.every(
+      (token) =>
+        TASK_COMPONENT_IMPERATIVE_PREFIX_TERMS.has(token) ||
+        TASK_STATE_MODIFIERS.has(token) ||
+        token.endsWith("ly")
+    )
+  if (
+    ellipticalState >= 0 &&
+    !actionIsNegated(clause.tokens, ellipticalState) &&
+    !componentHasActionModifier &&
+    !ellipticalStateHasActionObject &&
+    clause.tokens
+      .slice(component + 1, ellipticalState)
+      .every(
+        (token) => TASK_STATE_MODIFIERS.has(token) || token.endsWith("ly")
+      ) &&
+    (clause.tokens[ellipticalState + 1] === undefined ||
+      stateEndsAtBoundary(ellipticalState))
+  ) {
+    return true
+  }
+  const ellipticalCompletion = tokenIndex(
+    clause.tokens,
+    TASK_COMPLETION_TERMS,
+    component + 1,
+    end
+  )
+  if (
+    ellipticalCompletion >= 0 &&
+    tokenIndex(
+      clause.tokens,
+      NEGATION_TERMS,
+      component + 1,
+      ellipticalCompletion
+    ) >= 0 &&
+    clause.tokens
+      .slice(component + 1, ellipticalCompletion)
+      .every(
+        (token) =>
+          NEGATION_TERMS.has(token) ||
+          TASK_STATE_MODIFIERS.has(token) ||
+          token.endsWith("ly")
+      ) &&
+    (clause.tokens[ellipticalCompletion + 1] === undefined ||
+      stateEndsAtBoundary(ellipticalCompletion))
+  ) {
+    return true
+  }
+  const continuation = tokenIndex(
+    clause.tokens,
+    TASK_COMPONENT_CONTINUATION_PREDICATES,
+    component + 1,
+    end
+  )
+  const continuationAgrees =
+    clause.tokens[continuation] === "continues" ||
+    (clause.tokens[component] === "reviews" &&
+      clause.tokens[continuation] === "continue")
+  if (
+    continuation >= 0 &&
+    continuationAgrees &&
+    clause.tokens
+      .slice(component + 1, continuation)
+      .every((token) => TASK_STATE_MODIFIERS.has(token) || token.endsWith("ly"))
+  ) {
+    return true
+  }
+  const stateLink = tokenIndex(
+    clause.tokens,
+    TASK_COMPONENT_STATE_LINKS,
+    component + 1,
+    end
+  )
+  if (stateLink < 0) return false
+  if (
+    !clause.tokens
+      .slice(component + 1, stateLink)
+      .every(
+        (token) =>
+          TASK_COMPONENT_SUFFIX_TERMS.has(token) ||
+          TASK_STATE_MODIFIERS.has(token) ||
+          CLAUSE_COORDINATORS.has(token) ||
+          token.endsWith("ly")
+      )
+  ) {
+    return false
+  }
+  if (
+    tokenIndexes(
+      clause.tokens,
+      TASK_UNFINISHED_STATE_TERMS,
+      stateLink + 1,
+      end
+    ).some((state) => !actionIsNegated(clause.tokens, state))
+  ) {
+    return true
+  }
+  return tokenIndexes(
+    clause.tokens,
+    TASK_COMPLETION_TERMS,
+    stateLink + 1,
+    end
+  ).some((state) => {
+    if (actionIsNegated(clause.tokens, state)) return true
+    const predicateTail = clause.tokens.slice(stateLink + 1, state)
+    return (
+      predicateTail.some((token) => PARTIAL_TASK_COMPLETION_TERMS.has(token)) ||
+      phraseIndex(predicateTail, ["anything", "but"]) >= 0 ||
+      phraseIndex(predicateTail, ["nowhere", "near"]) >= 0 ||
+      phraseIndex(predicateTail, ["yet", "to"]) >= 0 ||
+      (["remain", "remains"].includes(clause.tokens[stateLink]) &&
+        phraseIndex(predicateTail, ["to", "be"]) >= 0)
+    )
+  })
+}
+
+function taskCompletionIsPartial(clause, task, completion) {
+  let start =
+    completion < task.index
+      ? Math.max(0, completion - 2)
+      : Math.min(task.index + 1, completion)
+  if (completion > task.index) {
+    const previousCompletion = tokenIndexes(
+      clause.tokens,
+      TASK_COMPLETION_TERMS,
+      task.index + 1,
+      completion
+    ).at(-1)
+    if (previousCompletion !== undefined) start = previousCompletion + 1
+  }
+  const end = Math.max(task.index, completion)
+  if (
+    tokenIndex(clause.tokens, PARTIAL_TASK_COMPLETION_TERMS, start, end) >= 0
+  ) {
+    return true
+  }
+  const tail = clause.tokens.slice(completion + 1, completion + 5)
+  const qualifierEnds = (index) =>
+    tail[index] === undefined ||
+    tail[index] === "then" ||
+    CLAUSE_COORDINATORS.has(tail[index])
+  let cursor = 0
+  if (new Set(["and", "but", "though", "yet"]).has(tail[cursor])) {
+    cursor += 1
+  }
+  if (new Set(["merely", "only"]).has(tail[cursor])) cursor += 1
+  let part = cursor + 1
+  if (new Set(["large", "significant", "substantial"]).has(tail[part])) {
+    part += 1
+  }
+  if (
+    tail[cursor] === "in" &&
+    tail[part] === "part" &&
+    qualifierEnds(part + 1)
+  ) {
+    return true
+  }
+  if (
+    tail[cursor] === "to" &&
+    new Set(["a", "an", "some"]).has(tail[cursor + 1]) &&
+    tail[cursor + 2] === "extent" &&
+    qualifierEnds(cursor + 3)
+  ) {
+    return true
+  }
+  const most = tail[cursor + 1] === "the" ? cursor + 2 : cursor + 1
+  if (
+    tail[cursor] === "for" &&
+    tail[most] === "most" &&
+    tail[most + 1] === "part" &&
+    qualifierEnds(most + 2)
+  ) {
+    return true
+  }
+  return (
+    PARTIAL_TASK_COMPLETION_TERMS.has(tail[cursor]) && qualifierEnds(cursor + 1)
+  )
+}
+
+function completionHasDirectObject(clause, completion) {
+  const punctuationBoundary = [...clause.actionBoundaryAfter]
+    .filter((boundary) => boundary >= completion)
+    .sort((left, right) => left - right)[0]
+  const coordinator = tokenIndex(
+    clause.tokens,
+    CLAUSE_COORDINATORS,
+    completion + 1
+  )
+  const end = Math.min(
+    punctuationBoundary === undefined
+      ? clause.tokens.length
+      : punctuationBoundary + 1,
+    coordinator < 0 ? clause.tokens.length : coordinator
+  )
+  const tail = clause.tokens.slice(completion + 1, end)
+  const head = tail.findIndex(
+    (token) =>
+      !TASK_STATE_MODIFIERS.has(token) &&
+      !TASK_COMPLETION_SEQUENCE_TERMS.has(token) &&
+      !token.endsWith("ly")
+  )
+  if (head < 0) return false
+  if (clause.possessiveIndexes?.has(completion + 1 + head)) return true
+  if (
+    new Set([
+      ...ACTIVE_TIMING_MARKERS,
+      ...BOUNDARY_TIMING_MARKERS,
+      ...PRE_COMPLETION_TIMING_MARKERS,
+      "by",
+      "for",
+      "from",
+      "in",
+      "of",
+      "through",
+      "to",
+      "until",
+      "with",
+      ...TASK_COMPLETION_ADJUNCT_HEADS,
+    ]).has(tail[head])
+  ) {
+    return false
+  }
+  if (new Set(["a", "an", "the", "this", "that"]).has(tail[head])) {
+    return tail.slice(head + 1).some((token) => !token.endsWith("ly"))
+  }
+  return true
+}
+
+function completionBelongsToTask(clause, task, completion) {
+  if (taskCompletionIsPartial(clause, task, completion)) return false
+  if (completionHasDirectObject(clause, completion)) return false
+  const actionBoundary = [...clause.actionBoundaryAfter]
+    .filter((boundary) => boundary >= completion)
+    .sort((left, right) => left - right)[0]
+  const componentObject = tokenIndex(
+    clause.tokens,
+    TASK_COMPONENT_SUFFIX_TERMS,
+    completion + 1,
+    Math.min(
+      clause.tokens.length,
+      completion + 5,
+      actionBoundary === undefined ? clause.tokens.length : actionBoundary + 1
+    )
+  )
+  const componentObjectPrefix = clause.tokens.slice(
+    completion + 1,
+    componentObject < 0 ? completion + 1 : componentObject
+  )
+  if (
+    componentObject >= 0 &&
+    !componentObjectPrefix.some(
+      (token) =>
+        CLAUSE_COORDINATORS.has(token) ||
+        PEOPLE_ANTECEDENT_LINKS.has(token) ||
+        TASK_COMPONENT_STATE_LINKS.has(token) ||
+        TASK_STATE_CLAUSE_BOUNDARIES.has(token)
+    )
+  ) {
+    return false
+  }
+  const followingStateLink = tokenIndex(
+    clause.tokens,
+    TASK_COMPONENT_STATE_LINKS,
+    completion + 2,
+    completion + 12
+  )
+  const followingSubject = clause.tokens.slice(
+    completion + 1,
+    followingStateLink < 0 ? completion + 1 : followingStateLink
+  )
+  if (
+    completion > task.index &&
+    followingSubject.length > 0 &&
+    followingSubject.length <= 10 &&
+    followingSubject.some((token) => TASK_COMPONENT_SUFFIX_TERMS.has(token)) &&
+    !CLAUSE_COORDINATORS.has(followingSubject[0])
+  ) {
+    return false
+  }
+  if (completion >= task.index && completion - task.index <= 10) {
+    return clause.tokens
+      .slice(task.index + 1, completion)
+      .every(
+        (token) =>
+          TASK_COMPLETION_BRIDGE_TERMS.has(token) ||
+          TASK_COMPLETION_TERMS.has(token) ||
+          EXPLICIT_TASK_ACTIVITY_TERMS.has(token) ||
+          CLAUSE_COORDINATORS.has(token) ||
+          SEQUENTIAL_PASSIVE_RELATION_FILLERS.has(token) ||
+          TASK_COMPLETION_SEQUENCE_TERMS.has(token) ||
+          token.endsWith("ly")
+      )
+  }
+  if (
+    completion < task.index &&
+    task.index - completion <= 2 &&
+    clause.tokens[completion] !== "completion"
+  ) {
+    return true
+  }
+  if (clause.tokens[completion] !== "completion") return false
+  const objectLink = tokenIndex(
+    clause.tokens,
+    new Set(["of"]),
+    completion + 1,
+    task.index
+  )
+  return (
+    objectLink >= 0 &&
+    !(
+      taskComponentIndex(clause, task) >= 0 &&
+      (!clause.actionBoundaryAfter.has(task.index) ||
+        taskComponentHasUnfinishedState(clause, task))
+    ) &&
+    tokenIndex(
+      clause.tokens,
+      TASK_REFERENCE_BOUNDARIES,
+      objectLink + 1,
+      task.index
+    ) < 0 &&
+    tokenIndex(
+      clause.tokens,
+      new Set([
+        ...PRODUCTION_ACTIONS,
+        ...DIRECT_ROUTE_ACTIONS,
+        ...REVIEW_TERMS,
+      ]),
+      objectLink + 1,
+      task.index
+    ) < 0
+  )
+}
+
+function taskCompletedStateIndexes(clause, task) {
+  return tokenIndexes(clause.tokens, TASK_COMPLETION_TERMS).filter(
+    (state) =>
+      completionBelongsToTask(clause, task, state) &&
+      !actionIsNegated(clause.tokens, state)
+  )
+}
+
+function taskHasCompletedState(clause, task) {
+  return taskCompletedStateIndexes(clause, task).length > 0
+}
+
+function affirmativeTaskActivityIndexes(clause, task) {
+  return taskActivityStateIndexes(clause, task).filter(
+    (state) => !actionIsNegated(clause.tokens, state)
+  )
+}
+
+function taskHasEffectiveExplicitActivity(clause, task) {
+  const activities = affirmativeTaskActivityIndexes(clause, task)
+  const completions = taskCompletedStateIndexes(clause, task)
+  if (activities.length > 0) {
+    if (completions.length === 0) return true
+    const lastCompletion = completions.at(-1)
+    if (lastCompletion < task.index) {
+      return activities.some((activity) => activity > task.index)
+    }
+    return activities.at(-1) > lastCompletion
+  }
+  return false
+}
+
+function taskIsEffectivelyActive(clause, task) {
+  if (taskHasEffectiveExplicitActivity(clause, task)) return true
+  const completions = taskCompletedStateIndexes(clause, task)
+  return (
+    taskStateIndexes(clause, task, new Set(["current"])).length > 0 &&
+    completions.length === 0
+  )
+}
+
+function taskHasAffirmativeActivity(clause, task) {
+  const explicit = taskActivityStateIndexes(clause, task)
+  if (explicit.some((state) => !actionIsNegated(clause.tokens, state))) {
+    return true
+  }
+  return (
+    taskStateIndexes(clause, task, new Set(["current"])).length > 0 &&
+    !taskHasCompletedState(clause, task) &&
+    explicit.length === 0
+  )
+}
+
+function taskHasNegatedActivity(clause, task) {
+  return taskActivityStateIndexes(clause, task).some((state) =>
+    actionIsNegated(clause.tokens, state)
+  )
+}
+
+function hasActiveTaskTiming(clause) {
+  return tokenIndexes(clause.tokens, ACTIVE_TIMING_MARKERS).some((marker) =>
+    clause.tasks.some(
+      (task) =>
+        Math.abs(task.index - marker) <= 8 &&
+        taskHasAffirmativeActivity(clause, task)
+    )
+  )
+}
+
+function hasNegatedTaskActivityTiming(clause) {
+  return tokenIndexes(clause.tokens, ACTIVE_TIMING_MARKERS).some((marker) =>
+    clause.tasks.some(
+      (task) =>
+        Math.abs(task.index - marker) <= 8 &&
+        taskHasNegatedActivity(clause, task)
+    )
+  )
+}
+
+function timingSegmentEnd(clause, marker) {
+  return (
+    tokenIndexes(
+      clause.tokens,
+      new Set([...BOUNDARY_TIMING_MARKERS, ...PRE_COMPLETION_TIMING_MARKERS]),
+      marker + 1
+    )[0] ?? clause.tokens.length
+  )
+}
+
+function timingReferencesCompletion(clause, marker) {
+  const end = timingSegmentEnd(clause, marker)
+  return tokenIndexes(clause.tokens, TASK_COMPLETION_TERMS, marker + 1, end)
+    .filter((completion) => !actionIsNegated(clause.tokens, completion))
+    .some((completion) => {
+      if (
+        clause.tasks.some(
+          (task) =>
+            task.index > marker &&
+            task.index < end &&
+            completionBelongsToTask(clause, task, completion)
+        )
+      ) {
+        return true
+      }
+      const hasTaskAnaphor =
+        tokenIndex(
+          clause.tokens,
+          new Set(["it", "its", "that", "this"]),
+          marker + 1,
+          Math.min(end, completion + 2)
+        ) >= 0
+      const hasImplicitTaskSubject = clause.tokens
+        .slice(marker + 1, completion)
+        .every((token) => TASK_COMPLETION_BRIDGE_TERMS.has(token))
+      return (
+        clause.priorTasks.length > 0 &&
+        (hasTaskAnaphor || hasImplicitTaskSubject)
+      )
+    })
+}
+
+function hasCompletedTaskTiming(clause) {
+  return tokenIndexes(clause.tokens, BOUNDARY_TIMING_MARKERS).some((marker) =>
+    timingReferencesCompletion(clause, marker)
+  )
+}
+
+function hasPreCompletionTaskTiming(clause) {
+  return tokenIndexes(clause.tokens, PRE_COMPLETION_TIMING_MARKERS).some(
+    (marker) => timingReferencesCompletion(clause, marker)
+  )
+}
+
+function changeHasExplicitNonAgentObject(clause, change) {
+  const segment = actionSegment(clause, change)
+  const identityObject = tokenIndex(
+    clause.tokens,
+    AGENT_IDENTITY_OBJECT_TERMS,
+    change + 1,
+    segment.end
+  )
+  if (identityObject >= 0) {
+    const identityPrefix = clause.tokens
+      .slice(change + 1, identityObject)
+      .filter(
+        (token) =>
+          !AGENT_CHANGE_SUBJECT_BRIDGE_TERMS.has(token) &&
+          !TASK_STATE_MODIFIERS.has(token) &&
+          !token.endsWith("ly")
+      )
+    if (
+      identityPrefix.every((token) =>
+        AGENT_IDENTITY_OBJECT_PREFIX_TERMS.has(token)
+      )
+    ) {
+      return false
+    }
+  }
+  const tailActors = clause.actors.filter(
+    (actor) => actor.start > change && actor.end <= segment.end
+  )
+  if (
+    tailActors.length > 0 ||
+    tokenIndex(
+      clause.tokens,
+      new Set(["agent", "agents", ...REFLEXIVE_TARGETS]),
+      change + 1,
+      segment.end
+    ) >= 0
+  ) {
+    return false
+  }
+  const tail = clause.tokens.slice(change + 1, segment.end)
+  const object = tail.find(
+    (token) =>
+      !AGENT_CHANGE_SUBJECT_BRIDGE_TERMS.has(token) &&
+      !TASK_STATE_MODIFIERS.has(token) &&
+      !token.endsWith("ly")
+  )
+  return (
+    object !== undefined &&
+    !new Set([
+      ...ACTIVE_TIMING_MARKERS,
+      ...BOUNDARY_TIMING_MARKERS,
+      ...PRE_COMPLETION_TIMING_MARKERS,
+      "from",
+      "to",
+      "until",
+      "with",
+    ]).has(object)
+  )
+}
+
+function conflictsWithActiveTaskSwitch(clause) {
+  const { tokens } = clause
+  const changes = tokenIndexes(
+    tokens,
+    new Set([
+      "change",
+      "changes",
+      "changing",
+      "replace",
+      "replaces",
+      "replacing",
+      "switch",
+      "switches",
+      "switching",
+    ])
+  )
+  const hasAffirmativeAgentChange = changes.some((change, index) => {
+    const actionBoundary = [...clause.actionBoundaryAfter]
+      .filter((boundary) => boundary < change)
+      .at(-1)
+    const changeSegmentStart =
+      Math.max(actionBoundary ?? -1, changes[index - 1] ?? -1) + 1
+    if (
+      actionIsNegated(
+        tokens.slice(changeSegmentStart, change + 1),
+        change - changeSegmentStart
+      )
+    ) {
+      return false
+    }
+    const subjectAgent = clause.actors
+      .filter(
+        (actor) =>
+          ["codex", "task_agent"].includes(actor.role) &&
+          actor.end <= change &&
+          tokens
+            .slice(actor.end, change)
+            .every(
+              (token) =>
+                AGENT_CHANGE_SUBJECT_BRIDGE_TERMS.has(token) ||
+                token.endsWith("ly")
+            )
+      )
+      .at(-1)
+    if (subjectAgent && !changeHasExplicitNonAgentObject(clause, change)) {
+      return true
+    }
+    const segment = actionSegment(clause, change)
+    const targetEnd = Math.min(
+      segment.end,
+      changes[index + 1] ?? clause.tokens.length
+    )
+    const agentToken = tokenIndex(
+      tokens,
+      new Set(["agent", "agents"]),
+      change + 1,
+      targetEnd
+    )
+    const agentActor = clause.actors.find(
+      (actor) =>
+        ["codex", "task_agent"].includes(actor.role) &&
+        actor.start > change &&
+        actor.end <= targetEnd
+    )
+    const target = [agentToken, agentActor?.start]
+      .filter((candidate) => candidate !== undefined && candidate >= 0)
+      .sort((left, right) => left - right)[0]
+    if (target === undefined) return false
+    const targetBoundary = [...clause.actionBoundaryAfter]
+      .filter((boundary) => boundary >= change && boundary < target)
+      .at(-1)
+    const excludedAlternative = positionIsExcludedAlternative(
+      clause,
+      alternativeExclusionStart(clause, { index: change }, targetEnd),
+      target
+    )
+    return (
+      !excludedAlternative &&
+      tokenIndex(
+        tokens,
+        NEGATION_TERMS,
+        (targetBoundary ?? change) + 1,
+        target
+      ) < 0
+    )
+  })
+  if (!hasAffirmativeAgentChange) return false
+  if (hasActiveTaskTiming(clause)) return true
+  if (hasPreCompletionTaskTiming(clause)) return true
+  if (hasCompletedTaskTiming(clause)) {
+    const laterActiveState = clause.tasks.some((task) =>
+      taskHasEffectiveExplicitActivity(clause, task)
+    )
+    return laterActiveState
+  }
+  if (
+    clause.tasks.some(
+      (task) =>
+        taskIsEffectivelyActive(clause, task) &&
+        taskActivityStateIndexes(clause, task).length > 0
+    )
+  ) {
+    return true
+  }
+  if (clause.tasks.some((task) => taskHasCompletedState(clause, task))) {
+    return false
+  }
+  if (clause.priorTasks.some((task) => task.active)) return true
+  if (clause.priorTasks.some((task) => task.completed)) return false
+  if (hasNegatedTaskActivityTiming(clause)) return false
+  return clause.tasks.some((task) => taskIsEffectivelyActive(clause, task))
+}
+
+function reviewerIsRequiredByContract(reviewer) {
+  return (
+    (reviewer.primary ||
+      reviewer.auxiliary ||
+      reviewer.codex ||
+      reviewer.required) &&
+    !reviewer.optionalDocument
+  )
+}
+
+function reviewAntecedentBefore(clause, index) {
+  const current = clause.reviewers.filter(
+    (reviewer) =>
+      reviewer.index < index && reviewerIsRequiredByContract(reviewer)
+  )
+  if (current.length > 0) return current.at(-1)
+  const prior = clause.priorReviewers.filter(reviewerIsRequiredByContract)
+  return prior.at(-1) ?? null
+}
+
+function takeRoleObjectLink(clause, index) {
+  let cursor = index + 1
+  if (clause.tokens[cursor] === "on") cursor += 1
+  if (new Set(["a", "an", "the"]).has(clause.tokens[cursor])) cursor += 1
+  if (clause.tokens[cursor] !== "role") return -1
+  return tokenIndex(
+    clause.tokens,
+    new Set(["of"]),
+    cursor + 1,
+    Math.min(clause.tokens.length, cursor + 3)
+  )
+}
+
+function reviewActionIsReplacement(clause, index) {
+  if (REVIEW_REPLACEMENT_ACTIONS.has(clause.tokens[index])) return true
+  if (!REVIEW_TAKE_ACTIONS.has(clause.tokens[index])) return false
+  return (
+    clause.tokens[index + 1] === "over" ||
+    takeRoleObjectLink(clause, index) >= 0
+  )
+}
+
+function reviewBypassActionIndexes(
+  clause,
+  start = 0,
+  end = clause.tokens.length
+) {
+  const direct = tokenIndexes(clause.tokens, REVIEW_BYPASS_ACTIONS, start, end)
+  const takeOvers = tokenIndexes(
+    clause.tokens,
+    REVIEW_TAKE_ACTIONS,
+    start,
+    end
+  ).filter((index) => reviewActionIsReplacement(clause, index))
+  return [...new Set([...direct, ...takeOvers])].sort(
+    (left, right) => left - right
+  )
+}
+
+function reviewerModifierHasTrailingRoleHead(clause, reviewer, objectLink) {
+  if (!reviewer) return false
+  const limit = Math.min(clause.tokens.length, objectLink + 7)
+  const adjunct = tokenIndex(
+    clause.tokens,
+    REVIEW_TARGET_ADJUNCT_LINKS,
+    reviewer.index + 1,
+    limit
+  )
+  const tail = clause.tokens.slice(
+    reviewer.index + 1,
+    adjunct < 0 ? limit : adjunct
+  )
+  if (tail[0]?.endsWith("ed") || TASK_STATE_MODIFIERS.has(tail[0])) {
+    return false
+  }
+  return tail.some(
+    (token) =>
+      !GENERIC_REVIEW_TARGET_PREFIX_TERMS.has(token) &&
+      !REVIEW_REQUIREMENT_ACTIONS.has(token) &&
+      !REVIEW_TARGET_NON_ROLE_HEAD_TERMS.has(token) &&
+      !REFLEXIVE_TARGETS.has(token) &&
+      !new Set(["a", "an", "auxiliary", "primary", "the"]).has(token) &&
+      !token.endsWith("ed") &&
+      !token.endsWith("ly")
+  )
+}
+
+function substitutionReviewTarget(clause, bypass) {
+  const token = clause.tokens[bypass]
+  let objectLink = -1
+  if (token === "instead") {
+    objectLink = tokenIndex(
+      clause.tokens,
+      new Set(["of"]),
+      bypass + 1,
+      bypass + 3
+    )
+  } else if (token === "place") {
+    const substitutionPrefix = tokenIndex(
+      clause.tokens,
+      new Set(["in", "take", "takes", "taking", "took"]),
+      Math.max(0, bypass - 3),
+      bypass
+    )
+    if (substitutionPrefix >= 0) {
+      objectLink = tokenIndex(
+        clause.tokens,
+        new Set(["of"]),
+        bypass + 1,
+        bypass + 3
+      )
+      if (
+        objectLink < 0 &&
+        ["its", "their"].includes(clause.tokens[bypass - 1])
+      ) {
+        const replacementSubject = clause.reviewers
+          .filter((reviewer) => reviewer.index < bypass)
+          .at(-1)
+        return reviewAntecedentBefore(
+          clause,
+          replacementSubject?.index ?? bypass
+        )
+      }
+    }
+  } else if (REVIEW_TAKE_ACTIONS.has(token)) {
+    const roleObjectLink = takeRoleObjectLink(clause, bypass)
+    objectLink =
+      roleObjectLink >= 0
+        ? roleObjectLink
+        : tokenIndex(clause.tokens, new Set(["for"]), bypass + 1, bypass + 4)
+  } else if (reviewActionIsReplacement(clause, bypass)) {
+    objectLink = tokenIndex(
+      clause.tokens,
+      new Set(["for"]),
+      bypass + 1,
+      bypass + 4
+    )
+  }
+  if (objectLink < 0) return null
+  const objectReviewer =
+    clause.reviewers.find(
+      (reviewer) =>
+        reviewer.index > objectLink && reviewer.index <= objectLink + 5
+    ) ?? null
+  if (
+    objectReviewer &&
+    !reviewerModifierHasTrailingRoleHead(clause, objectReviewer, objectLink) &&
+    !reviewerIsRequiredByContract(objectReviewer) &&
+    clause.tokens
+      .slice(objectLink + 1, objectReviewer.index)
+      .some((token) => REVIEW_TARGET_ANAPHORIC_TERMS.has(token)) &&
+    clause.tokens
+      .slice(objectLink + 1, objectReviewer.index)
+      .every(
+        (token) =>
+          GENERIC_REVIEW_TARGET_PREFIX_TERMS.has(token) ||
+          token.endsWith("ed") ||
+          token.endsWith("ly")
+      )
+  ) {
+    const replacementSubject = clause.reviewers
+      .filter((reviewer) => reviewer.index < bypass)
+      .at(-1)
+    return reviewAntecedentBefore(clause, replacementSubject?.index ?? bypass)
+  }
+  const objectTail = clause.tokens.slice(
+    objectLink + 1,
+    Math.min(clause.tokens.length, objectLink + 7)
+  )
+  const anaphoricOne = objectTail.findIndex(
+    (token, index) =>
+      token === "one" &&
+      objectTail
+        .slice(0, index)
+        .some((prefix) =>
+          new Set([
+            ...REVIEW_TARGET_ANAPHORIC_TERMS,
+            "mandatory",
+            "required",
+          ]).has(prefix)
+        )
+  )
+  if (!objectReviewer && anaphoricOne >= 0) {
+    const replacementSubject = clause.reviewers
+      .filter((reviewer) => reviewer.index < bypass)
+      .at(-1)
+    return reviewAntecedentBefore(clause, replacementSubject?.index ?? bypass)
+  }
+  const requiredPersonReference =
+    objectTail.some((token) => REVIEW_REQUIREMENT_ACTIONS.has(token)) &&
+    objectTail.some((token) => REVIEW_TARGET_GENERIC_PERSON_TERMS.has(token))
+  const requiredSlot = tokenIndexes(
+    clause.tokens,
+    new Set(["auxiliary", "primary"]),
+    objectLink + 1,
+    objectLink + 6
+  ).find(
+    (slot) =>
+      tokenIndex(
+        clause.tokens,
+        REVIEW_REQUIREMENT_ACTIONS,
+        objectLink + 1,
+        slot
+      ) >= 0
+  )
+  const requiredSlotObjectEnd = tokenIndex(
+    clause.tokens,
+    REVIEW_TARGET_ADJUNCT_LINKS,
+    (requiredSlot ?? objectLink) + 1,
+    (requiredSlot ?? objectLink) + 6
+  )
+  const explicitRoleTail = clause.tokens.slice(
+    (requiredSlot ?? objectLink) + 1,
+    requiredSlotObjectEnd < 0
+      ? (requiredSlot ?? objectLink) + 6
+      : requiredSlotObjectEnd
+  )
+  const explicitRoleHead = explicitRoleTail.findLast(
+    (token) => !token.endsWith("ed") && !token.endsWith("ly")
+  )
+  const genericPerson = objectTail.findIndex((token) =>
+    REVIEW_TARGET_GENERIC_PERSON_TERMS.has(token)
+  )
+  const requirement = objectTail.findIndex((token) =>
+    REVIEW_REQUIREMENT_ACTIONS.has(token)
+  )
+  const genericPersonHasRoleQualifier =
+    genericPerson >= 0 &&
+    objectTail
+      .slice(Math.max(0, requirement + 1), genericPerson)
+      .some(
+        (token) =>
+          !new Set(["a", "an", "auxiliary", "primary", "the"]).has(token)
+      )
+  const hasExplicitUnrelatedRole =
+    genericPerson >= 0
+      ? genericPersonHasRoleQualifier
+      : explicitRoleHead !== undefined &&
+        !REVIEW_TARGET_NON_ROLE_HEAD_TERMS.has(explicitRoleHead)
+  if (!objectReviewer && requiredPersonReference && !hasExplicitUnrelatedRole) {
+    const replacementSubject = clause.reviewers
+      .filter((reviewer) => reviewer.index < bypass)
+      .at(-1)
+    return reviewAntecedentBefore(clause, replacementSubject?.index ?? bypass)
+  }
+  if (
+    !objectReviewer &&
+    requiredSlot !== undefined &&
+    !hasExplicitUnrelatedRole
+  ) {
+    return {
+      index: requiredSlot,
+      auxiliary: clause.tokens[requiredSlot] === "auxiliary",
+      primary: clause.tokens[requiredSlot] === "primary",
+      required: true,
+    }
+  }
+  return objectReviewer
+}
+
+function reviewTargetForBypass(clause, bypass) {
+  const segment = actionSegment(clause, bypass)
+  const reviewers = clause.reviewers.filter(
+    (reviewer) =>
+      reviewer.index >= segment.start && reviewer.index < segment.end
+  )
+  const before = reviewers.filter((reviewer) => reviewer.index < bypass).at(-1)
+  const after = reviewers.find((reviewer) => reviewer.index > bypass)
+  const replacement = reviewActionIsReplacement(clause, bypass)
+  const takeRoleLink = REVIEW_TAKE_ACTIONS.has(clause.tokens[bypass])
+    ? takeRoleObjectLink(clause, bypass)
+    : -1
+  const substitution = substitutionReviewTarget(clause, bypass)
+  if (substitution) return substitution
+  const takeRolePronoun =
+    takeRoleLink >= 0 &&
+    tokenIndex(
+      clause.tokens,
+      new Set(["former", "it", "them"]),
+      takeRoleLink + 1,
+      Math.min(segment.end, takeRoleLink + 5)
+    ) >= 0
+  if (takeRoleLink >= 0 && !takeRolePronoun) return null
+  const roleReference =
+    replacement &&
+    !after &&
+    tokenIndexes(
+      clause.tokens,
+      new Set(["reviewer", "role"]),
+      bypass + 1,
+      Math.min(segment.end, bypass + 6)
+    ).some((target) => {
+      const prefix = clause.tokens.slice(
+        Math.max(bypass + 1, target - 2),
+        target
+      )
+      if (clause.tokens[target] === "role") {
+        return new Set(["same", "that", "the", "their", "this", "its"]).has(
+          clause.tokens[target - 1]
+        )
+      }
+      return prefix.some((token) =>
+        new Set(["same", "that", "the", "their", "this", "its"]).has(token)
+      )
+    })
+  const pronounTarget =
+    replacement &&
+    (tokenIndex(
+      clause.tokens,
+      new Set(["former", "it", "them"]),
+      bypass + 1,
+      Math.min(segment.end, bypass + 6)
+    ) >= 0 ||
+      phraseIndex(
+        clause.tokens,
+        ["that", "reviewer"],
+        bypass + 1,
+        Math.min(segment.end, bypass + 6)
+      ) >= 0 ||
+      phraseIndex(
+        clause.tokens,
+        ["this", "reviewer"],
+        bypass + 1,
+        Math.min(segment.end, bypass + 6)
+      ) >= 0 ||
+      phraseIndex(
+        clause.tokens,
+        ["this", "role"],
+        bypass + 1,
+        Math.min(segment.end, bypass + 6)
+      ) >= 0 ||
+      phraseIndex(
+        clause.tokens,
+        ["that", "role"],
+        bypass + 1,
+        Math.min(segment.end, bypass + 6)
+      ) >= 0 ||
+      phraseIndex(
+        clause.tokens,
+        ["its", "role"],
+        bypass + 1,
+        Math.min(segment.end, bypass + 6)
+      ) >= 0)
+  const passiveTarget =
+    replacement &&
+    tokenIndex(clause.tokens, new Set(["by"]), bypass + 1, segment.end) >= 0
+  if (roleReference || pronounTarget || passiveTarget) {
+    const replacementSubject = before
+    return reviewAntecedentBefore(clause, replacementSubject?.index ?? bypass)
+  }
+  if (
+    before &&
+    tokenIndex(clause.tokens, REVIEW_SUBJECT_LINKS, before.index + 1, bypass) >=
+      0
+  ) {
+    return before
+  }
+  if (after) return after
+  if (before) return before
+  return reviewAntecedentBefore(clause, bypass)
+}
+
+function reviewBypassIsNegated(clause, bypass) {
+  return (
+    actionIsNegated(clause.tokens, bypass) ||
+    (clause.tokens[bypass - 2] === "rather" &&
+      clause.tokens[bypass - 1] === "than")
+  )
+}
+
+function conflictsWithRequiredReview(clause) {
+  for (const requirement of tokenIndexes(
+    clause.tokens,
+    REVIEW_REQUIREMENT_ACTIONS
+  )) {
+    if (!actionIsNegated(clause.tokens, requirement)) continue
+    const segment = actionSegment(clause, requirement)
+    const negatedBypass = reviewBypassActionIndexes(
+      clause,
+      segment.start,
+      requirement
+    )
+      .reverse()
+      .find((bypass) => reviewBypassIsNegated(clause, bypass))
+    if (negatedBypass !== undefined) continue
+    const target = reviewTargetForBypass(clause, requirement)
+    if (target && reviewerIsRequiredByContract(target)) {
+      return true
+    }
+  }
+  return reviewBypassActionIndexes(clause).some((bypass) => {
+    if (
+      clause.tokens[bypass] === "place" &&
+      !substitutionReviewTarget(clause, bypass)
+    ) {
+      return false
+    }
+    if (reviewBypassIsNegated(clause, bypass)) return false
+    const target = reviewTargetForBypass(clause, bypass)
+    return Boolean(target && reviewerIsRequiredByContract(target))
+  })
+}
+
+const DURABLE_ORCHESTRATION_CONTRADICTIONS = [
+  /fall\s+back\s+to\s+get_delegation_status/,
+  /parent\s+hashes\s+the\s+route\s+fingerprint/,
+  /plan\s+author\s+hashes\s+the\s+orchestration\s+binding/,
+  /record\s+the\s+dispatch\s+intent\s+after\s+the\s+delegation\s+call/,
+  /adopt\s+a\s+durable\s+row\s+without\s+an\s+unresolved/,
+  /reuse\s+stale\s+or\s+mixed\s+snapshot\s+pages/,
+  /authorize\s+task\s+execution\s+from\s+static\s+validation/,
+  /bind\s+the\s+design\s+reviewer\s+run\s+with\s+an\s+orchestration\s+binding/,
+  /bind\s+the\s+final-review\s+run\s+with\s+an\s+orchestration\s+binding/,
+  /change\s+the\s+generation\s+of\s+an\s+admitted\s+task/,
+  /omit\s+the\s+pending_route_change/,
+  /clear\s+pending_route_change\s+before\s+plan\s+approval/,
+  /dispatch\s+a\s+task\s+while\s+pending_route_change/,
+  /treat\s+a\s+status-only\s+refresh\s+as\s+a\s+permanent\s+blocker/,
+  /rewrite\s+the\s+identity\s+and\s+binding\s+during\s+a\s+status-only/,
+  /reuse\s+one\s+admission\s+across\s+design\s+and\s+final-review/,
+  /treat\s+rust\s+projection\s+warnings\s+as\s+a\s+gate/,
+]
+
+function conflictsWithDurableOrchestration(prose) {
+  const text = String(prose ?? "").toLowerCase()
+  return DURABLE_ORCHESTRATION_CONTRADICTIONS.some((pattern) =>
+    pattern.test(text)
+  )
+}
+
+function hasConflictingSkillDirective(prose) {
+  if (conflictsWithDurableOrchestration(prose)) return true
+  return directiveWindows(prose).some((window) => {
+    const clause = parseDirectiveClause(window)
+    return (
+      conflictsWithParentOwnership(clause) ||
+      conflictsWithTaskAgentRoute(clause) ||
+      conflictsWithConversationIdentity(clause) ||
+      conflictsWithActiveTaskSwitch(clause) ||
+      conflictsWithRequiredReview(clause)
+    )
+  })
+}
+
 function hasSubstantiveSkillProse(body) {
   const prose = visibleSkillProse(body)
     .replace(/`[^`\r\n]*`/g, " ")
@@ -492,15 +5541,13 @@ function hasSubstantiveSkillProse(body) {
     POSITIVE_SKILL_DIRECTIVES.has(word.toLowerCase())
   )
   return (
-    words.length >= 6 &&
-    directives.length >= 2 &&
-    /[.!:](?:\s|$)/m.test(prose)
+    words.length >= 6 && directives.length >= 2 && /[.!:](?:\s|$)/m.test(prose)
   )
 }
 
 function validateEmbeddedSkillContract(skill, firstSectionLine, failures) {
-  const { contracts, unterminated } = embeddedSkillContracts(skill)
-  if (unterminated || contracts.length !== 1) {
+  const { contracts, markerCount, unterminated } = embeddedSkillContracts(skill)
+  if (unterminated || markerCount !== 1 || contracts.length !== 1) {
     fail(
       failures,
       "B2D-SKILL-004",
@@ -541,11 +5588,13 @@ function validateEmbeddedSkillContract(skill, firstSectionLine, failures) {
 
 function validateOrderedSkillContract(skill, failures) {
   const sections = numberedSkillSections(skill)
-  if (sections.map((section) => section.index).join(",") !== "1,2,3,4,5,6,7") {
+  if (
+    sections.map((section) => section.index).join(",") !== "1,2,3,4,5,6,7,8,9"
+  ) {
     fail(
       failures,
       "B2D-SKILL-004",
-      "Skill must contain exactly seven numbered workflow sections in order"
+      "Skill must contain exactly nine numbered workflow sections in order"
     )
     return
   }
@@ -604,15 +5653,12 @@ export function validateSkillMarkdown(skillMarkdown) {
     }
     const description = metadata.get("description") ?? ""
     if (!/^Use when\b/.test(description)) {
-      fail(
-        failures,
-        "B2D-SKILL-001",
-        'description must start with "Use when"'
-      )
+      fail(failures, "B2D-SKILL-001", 'description must start with "Use when"')
     }
     if (
-      /\b(?:Plan|progress|registration|register|serial|delegate|review|workflow tool)\b/i
-        .test(description)
+      /\b(?:Plan|progress|registration|register|serial|delegate|review|workflow tool)\b/i.test(
+        description
+      )
     ) {
       fail(
         failures,
@@ -634,23 +5680,34 @@ export function validateSkillMarkdown(skillMarkdown) {
   }
 
   const lower = skill.toLowerCase()
-  for (const identifier of V2_SKILL_IDENTIFIERS) {
+  for (const identifier of RETIRED_WORKFLOW_IDENTIFIERS) {
     if (lower.includes(identifier.toLowerCase())) {
       fail(
         failures,
         "B2D-SKILL-003",
-        `v2-only identifier remains in Skill: ${identifier}`
+        `retired workflow identifier remains in Skill: ${identifier}`
       )
     }
   }
 
   validateOrderedSkillContract(skill, failures)
+  const prose = unfencedVisibleSkillProse(skill)
+  if (hasConflictingSkillDirective(prose)) {
+    fail(
+      failures,
+      "B2D-SKILL-005",
+      "Skill prose contradicts required v2 ownership or routing"
+    )
+  }
 
   return { failures, notes }
 }
 
 function fenceStart(line) {
   const match = line.match(/^\s{0,3}(`{3,}|~{3,})/)
+  if (match?.[1][0] === "`" && line.slice(match[0].length).includes("`")) {
+    return null
+  }
   return match ? { character: match[1][0], length: match[1].length } : null
 }
 
@@ -658,6 +5715,609 @@ function fenceEnd(line, fence) {
   if (!fence) return false
   const escaped = fence.character === "`" ? "`" : "~"
   return new RegExp(`^\\s{0,3}${escaped}{${fence.length},}\\s*$`).test(line)
+}
+
+function extractUnfencedComment(source, marker, maxBlockBytes) {
+  const lines = String(source ?? "").split(/\r?\n/)
+  let fence = null
+  let active = null
+  let markerCount = 0
+  let body = null
+  let firstLine = 0
+  let problem = null
+
+  for (const [lineIndex, line] of lines.entries()) {
+    if (active) {
+      const end = line.indexOf(COMMENT_END)
+      active.push(end < 0 ? line : line.slice(0, end))
+      if (byteLength(active.join("\n")) > maxBlockBytes && !problem) {
+        problem = "too_large"
+      }
+      if (end >= 0) {
+        if (body === null && problem !== "too_large") body = active.join("\n")
+        active = null
+      }
+      continue
+    }
+    if (fence) {
+      if (fenceEnd(line, fence)) fence = null
+      continue
+    }
+    fence = fenceStart(line)
+    if (fence) continue
+    if (line.trim() === marker) {
+      markerCount += 1
+      if (firstLine === 0) firstLine = lineIndex + 1
+      if (body === null) active = []
+    }
+  }
+  if (active && !problem) problem = "truncated"
+  return { body, markerCount, problem, line: firstLine }
+}
+
+/** Parse the bounded authoritative routing block from a Plan. */
+export function parseSimpleRouting(planMarkdown) {
+  const failures = []
+  const extracted = extractUnfencedComment(
+    planMarkdown,
+    ROUTING_MARKER,
+    MAX_ROUTING_BLOCK_BYTES
+  )
+  if (extracted.markerCount !== 1 || extracted.problem === "truncated") {
+    fail(
+      failures,
+      "B2D-ROUTING-001",
+      "Plan must contain exactly one complete unfenced routing block"
+    )
+    return { snapshot: null, failures }
+  }
+  if (extracted.problem === "too_large") {
+    fail(failures, "B2D-ROUTING-002", "routing block exceeds 256 KiB")
+    return { snapshot: null, failures }
+  }
+  let snapshot
+  try {
+    snapshot = JSON.parse(extracted.body.trim())
+  } catch {
+    fail(failures, "B2D-ROUTING-003", "routing block is not valid JSON")
+    return { snapshot: null, failures }
+  }
+  if (!isObject(snapshot)) {
+    fail(failures, "B2D-ROUTING-003", "routing snapshot must be an object")
+    return { snapshot: null, failures }
+  }
+  return { snapshot, failures }
+}
+
+function validProfileId(value) {
+  return (
+    value === null ||
+    (nonEmptyString(value) &&
+      [...value].length <= 128 &&
+      value !== "none" &&
+      !value.includes("|") &&
+      !hasControl(value))
+  )
+}
+
+function validAgentSelection(value) {
+  return (
+    isObject(value) &&
+    validAgentType(value.agent_type) &&
+    validProfileId(value.profile_id)
+  )
+}
+
+function validateEvidenceList(evidence, label, failures) {
+  if (
+    !Array.isArray(evidence) ||
+    evidence.length === 0 ||
+    evidence.some((entry) => !nonEmptyString(entry)) ||
+    new Set(evidence).size !== evidence.length
+  ) {
+    fail(
+      failures,
+      "B2D-RISK-002",
+      `${label} requires unique non-empty evidence strings`
+    )
+  }
+}
+
+function validateTaskRisk(value, taskIndex, failures) {
+  const label = `Task ${taskIndex} risk`
+  if (!isObject(value)) {
+    fail(failures, "B2D-RISK-001", `${label} must be an object`)
+    return null
+  }
+  if (
+    !Array.isArray(value.hard_triggers) ||
+    !Array.isArray(value.soft_signals)
+  ) {
+    fail(failures, "B2D-RISK-001", `${label} requires evidence arrays`)
+    return null
+  }
+  const hardKinds = new Set()
+  for (const trigger of value.hard_triggers) {
+    if (
+      !isObject(trigger) ||
+      !HARD_TRIGGER_KINDS.has(trigger.kind) ||
+      hardKinds.has(trigger.kind)
+    ) {
+      fail(
+        failures,
+        "B2D-RISK-001",
+        `${label} has unknown or duplicate hard trigger`
+      )
+      continue
+    }
+    hardKinds.add(trigger.kind)
+    validateEvidenceList(trigger.evidence, `${label} ${trigger.kind}`, failures)
+  }
+  const softKinds = new Set()
+  const softEvidence = new Set()
+  let softTotal = 0
+  for (const signal of value.soft_signals) {
+    if (
+      !isObject(signal) ||
+      !SOFT_SIGNAL_SCORES.has(signal.kind) ||
+      softKinds.has(signal.kind)
+    ) {
+      fail(
+        failures,
+        "B2D-RISK-001",
+        `${label} has unknown or duplicate soft signal`
+      )
+      continue
+    }
+    softKinds.add(signal.kind)
+    const expectedScore = SOFT_SIGNAL_SCORES.get(signal.kind)
+    if (signal.score !== expectedScore) {
+      fail(failures, "B2D-RISK-003", `${label} has a wrong soft-signal score`)
+    }
+    softTotal += expectedScore
+    validateEvidenceList(signal.evidence, `${label} ${signal.kind}`, failures)
+    if (Array.isArray(signal.evidence)) {
+      for (const evidence of signal.evidence) {
+        if (softEvidence.has(evidence)) {
+          fail(
+            failures,
+            "B2D-RISK-001",
+            `${label} counts one evidence string in multiple soft signals`
+          )
+        }
+        softEvidence.add(evidence)
+      }
+    }
+  }
+  if (value.score !== softTotal) {
+    fail(
+      failures,
+      "B2D-RISK-003",
+      `${label} score must equal the soft-signal total`
+    )
+  }
+  const expectedLevel = hardKinds.size > 0 || softTotal >= 3 ? "high" : "normal"
+  if (value.level !== expectedLevel) {
+    fail(failures, "B2D-RISK-004", `${label} level contradicts the risk policy`)
+  }
+  if (!nonEmptyString(value.reason)) {
+    fail(failures, "B2D-RISK-005", `${label} requires a non-empty reason`)
+  }
+  return expectedLevel
+}
+
+/** Derive the only accepted route and canonical work-unit keys. */
+export function deriveExpectedRoute(task, generation, failures) {
+  const taskAgent = {
+    agent_type: generation?.agent_type,
+    profile_id: generation?.profile_id,
+  }
+  if (!validAgentSelection(taskAgent)) {
+    fail(
+      failures,
+      "B2D-ROUTING-005",
+      `Task ${task?.index} has no valid Task Agent`
+    )
+    return null
+  }
+  const high = task?.risk?.level === "high"
+  const profile = taskAgent.profile_id ?? "none"
+  const expectedRoute = high
+    ? {
+        implementer: { agent_type: "codex", profile_id: null },
+        reviewers: [
+          { slot: "primary", agent_type: "codex", profile_id: null },
+          { slot: "auxiliary", ...taskAgent },
+        ],
+      }
+    : {
+        implementer: taskAgent,
+        reviewers: [{ slot: "primary", agent_type: "codex", profile_id: null }],
+      }
+  const expectedWorkUnitKeys = {
+    implementer: high
+      ? `task|${task.index}|implementer|codex|none`
+      : `task|${task.index}|implementer|${taskAgent.agent_type}|${profile}`,
+    reviewers: {
+      primary: `task|${task.index}|reviewer|primary|codex|none`,
+      auxiliary: high
+        ? `task|${task.index}|reviewer|auxiliary|${taskAgent.agent_type}|${profile}`
+        : null,
+    },
+  }
+  const derivedKeys = [
+    expectedWorkUnitKeys.implementer,
+    expectedWorkUnitKeys.reviewers.primary,
+    expectedWorkUnitKeys.reviewers.auxiliary,
+  ].filter(nonEmptyString)
+  if (derivedKeys.some((key) => !parseRecognizedWorkUnitKey(key))) {
+    fail(
+      failures,
+      "B2D-ROUTING-009",
+      `Task ${task.index} derives a non-canonical work-unit key`
+    )
+    return null
+  }
+  return {
+    route: expectedRoute,
+    expected_work_unit_keys: expectedWorkUnitKeys,
+  }
+}
+
+function isUnicodeScalarString(value) {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index)
+    if (code >= 0xd800 && code <= 0xdbff) {
+      if (index + 1 >= value.length) return false
+      const next = value.charCodeAt(index + 1)
+      if (next < 0xdc00 || next > 0xdfff) return false
+      index += 1
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      return false
+    }
+  }
+  return true
+}
+
+/** Assert the restricted I-JSON domain used by the route positional array. */
+export function assertRouteInputIsIJson(value, path = "$") {
+  if (value === null) return
+  if (typeof value === "string") {
+    if (!isUnicodeScalarString(value)) {
+      throw new TypeError(
+        `${path} contains a non-Unicode-scalar string (lone surrogate)`
+      )
+    }
+    return
+  }
+  if (typeof value === "number") {
+    if (!Number.isSafeInteger(value)) {
+      throw new TypeError(`${path} contains a non-safe integer`)
+    }
+    return
+  }
+  if (Array.isArray(value)) {
+    value.forEach((entry, index) =>
+      assertRouteInputIsIJson(entry, `${path}[${index}]`)
+    )
+    return
+  }
+  throw new TypeError(`${path} is outside the restricted I-JSON route domain`)
+}
+
+function routeAndKeys(expectedRoute) {
+  const route = expectedRoute?.route ?? expectedRoute
+  const expectedWorkUnitKeys = expectedRoute?.expected_work_unit_keys
+  if (!isObject(route) || !isObject(expectedWorkUnitKeys)) {
+    throw new TypeError(
+      "expectedRoute must contain a normalized route and keys"
+    )
+  }
+  if (!isObject(route.implementer) || !Array.isArray(route.reviewers)) {
+    throw new TypeError("expectedRoute has an invalid normalized route")
+  }
+  if (!isObject(expectedWorkUnitKeys.reviewers)) {
+    throw new TypeError("expectedRoute has invalid expected work-unit keys")
+  }
+  return { route, expectedWorkUnitKeys }
+}
+
+/** Build the closed positional value used for the RFC 8785 route identity. */
+export function deriveRouteBindingInput(task, generation, expectedRoute) {
+  const { route, expectedWorkUnitKeys } = routeAndKeys(expectedRoute)
+  const reviewers = route.reviewers.map((reviewer) => [
+    reviewer.slot,
+    reviewer.agent_type,
+    reviewer.profile_id,
+  ])
+  const keys = [
+    expectedWorkUnitKeys.implementer,
+    expectedWorkUnitKeys.reviewers.primary,
+  ]
+  if (expectedWorkUnitKeys.reviewers.auxiliary !== null) {
+    keys.push(expectedWorkUnitKeys.reviewers.auxiliary)
+  }
+  return [
+    ROUTE_BINDING_INPUT_MARKER,
+    ROUTE_BINDING_SCHEMA_VERSION,
+    ROUTE_BINDING_NAMESPACE,
+    task?.index,
+    task?.task_agent_generation,
+    task?.risk?.level,
+    [route.implementer.agent_type, route.implementer.profile_id],
+    reviewers,
+    keys,
+  ]
+}
+
+/** Derive the immutable v1 binding from already-normalized routing data. */
+export function deriveOrchestrationBinding(task, generation, expectedRoute) {
+  const input = deriveRouteBindingInput(task, generation, expectedRoute)
+  assertRouteInputIsIJson(input)
+  const bytes = Buffer.from(JSON.stringify(input), "utf8")
+  return {
+    schema_version: ROUTE_BINDING_SCHEMA_VERSION,
+    namespace: ROUTE_BINDING_NAMESPACE,
+    generation: task?.task_agent_generation,
+    route_fingerprint: `sha256:${createHash("sha256")
+      .update(bytes)
+      .digest("hex")}`,
+  }
+}
+
+/** Derive ordered bindings for a normalized routing snapshot. */
+export function deriveTaskBindings(routing, failures = []) {
+  if (
+    !routing ||
+    !Array.isArray(routing.tasks) ||
+    !Array.isArray(routing.generations)
+  ) {
+    return []
+  }
+  const start = failures.length
+  const bindings = []
+  for (const task of routing.tasks) {
+    const generation = routing.generations.find(
+      (candidate) => candidate.generation === task?.task_agent_generation
+    )
+    const expected = deriveExpectedRoute(task, generation, failures)
+    if (!expected) continue
+    let binding
+    try {
+      binding = deriveOrchestrationBinding(task, generation, expected)
+    } catch (error) {
+      fail(
+        failures,
+        "B2D-ROUTING-010",
+        `Task ${task?.index} route binding is not canonical: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      )
+      continue
+    }
+    bindings.push({
+      task_index: task.index,
+      risk_level: task.risk.level,
+      task_agent_generation: task.task_agent_generation,
+      expected_work_unit_keys: expected.expected_work_unit_keys,
+      orchestration_binding: binding,
+    })
+  }
+  return failures.length === start ? bindings : []
+}
+
+/** Parse the strict v1 binding shape shared with Rust and MCP. */
+export function parseOrchestrationBinding(value) {
+  const failures = []
+  if (!isObject(value)) {
+    failures.push("binding must be an object")
+    return { valid: false, binding: null, value: null, failures }
+  }
+  const keys = Object.keys(value).sort()
+  if (
+    keys.join(",") !==
+    ["generation", "namespace", "route_fingerprint", "schema_version"].join(",")
+  ) {
+    failures.push("binding fields are not exact")
+  }
+  if (value.schema_version !== ROUTE_BINDING_SCHEMA_VERSION) {
+    failures.push("schema_version must be 1")
+  }
+  if (
+    typeof value.namespace !== "string" ||
+    Buffer.byteLength(value.namespace, "utf8") === 0 ||
+    Buffer.byteLength(value.namespace, "utf8") > 64 ||
+    !/^[a-z][a-z0-9-]*$/.test(value.namespace)
+  ) {
+    failures.push("namespace is invalid")
+  }
+  if (
+    !Number.isInteger(value.generation) ||
+    value.generation < 1 ||
+    value.generation > MAX_U32
+  ) {
+    failures.push("generation must be an unsigned positive 32-bit integer")
+  }
+  if (
+    typeof value.route_fingerprint !== "string" ||
+    !/^sha256:[0-9a-f]{64}$/.test(value.route_fingerprint)
+  ) {
+    failures.push("route_fingerprint is invalid")
+  }
+  const binding =
+    failures.length === 0
+      ? {
+          schema_version: value.schema_version,
+          namespace: value.namespace,
+          generation: value.generation,
+          route_fingerprint: value.route_fingerprint,
+        }
+      : null
+  return { valid: failures.length === 0, binding, value: binding, failures }
+}
+
+export function validateOrchestrationBinding(value) {
+  return parseOrchestrationBinding(value).valid
+}
+
+/** Validate routing semantics and return normalized generations and Tasks. */
+export function validateRoutingSnapshot(snapshot, plan, failures) {
+  const normalized = { generations: [], tasks: [] }
+  if (!isObject(snapshot)) {
+    fail(failures, "B2D-ROUTING-003", "routing snapshot must be an object")
+    return normalized
+  }
+  if (
+    snapshot.schema_version !== 1 ||
+    snapshot.risk_policy_version !== RISK_POLICY_VERSION
+  ) {
+    fail(
+      failures,
+      "B2D-ROUTING-003",
+      "routing schema or risk policy is unsupported"
+    )
+  }
+
+  const rawGenerations = snapshot.task_agent_generations
+  if (!Array.isArray(rawGenerations) || rawGenerations.length === 0) {
+    fail(
+      failures,
+      "B2D-ROUTING-006",
+      "routing must serialize a non-empty Task Agent generation array"
+    )
+  } else {
+    for (const [offset, generation] of rawGenerations.entries()) {
+      if (!isObject(generation) || !validAgentSelection(generation)) {
+        fail(
+          failures,
+          "B2D-ROUTING-005",
+          `generation ${offset + 1} has an invalid Agent/profile`
+        )
+        continue
+      }
+      if (
+        generation.generation !== offset + 1 ||
+        !positiveInteger(generation.effective_from_task_index) ||
+        (offset === 0 && generation.effective_from_task_index !== 1) ||
+        (offset > 0 &&
+          (!isObject(rawGenerations[offset - 1]) ||
+            generation.effective_from_task_index <=
+              rawGenerations[offset - 1].effective_from_task_index))
+      ) {
+        fail(
+          failures,
+          "B2D-ROUTING-006",
+          "generations must be contiguous with increasing boundaries"
+        )
+      }
+      normalized.generations.push({
+        generation: generation.generation,
+        agent_type: generation.agent_type,
+        profile_id: generation.profile_id,
+        effective_from_task_index: generation.effective_from_task_index,
+      })
+    }
+  }
+
+  if (!Array.isArray(snapshot.tasks)) {
+    fail(failures, "B2D-ROUTING-004", "routing tasks must be an array")
+    return normalized
+  }
+  const planIndexes = plan.tasks.map((task) => task.index)
+  if (
+    snapshot.tasks.map((task) => task?.index).join(",") !==
+    planIndexes.join(",")
+  ) {
+    fail(
+      failures,
+      "B2D-ROUTING-004",
+      "routing Task indices must exactly match Plan headings"
+    )
+  }
+  for (const routeTask of snapshot.tasks) {
+    if (!isObject(routeTask) || !positiveInteger(routeTask.index)) continue
+    const generation = normalized.generations.find(
+      (candidate) => candidate.generation === routeTask.task_agent_generation
+    )
+    if (!generation) {
+      fail(
+        failures,
+        "B2D-ROUTING-006",
+        `Task ${routeTask.index} references an unknown generation`
+      )
+      continue
+    }
+    const applicableGeneration = normalized.generations
+      .filter(
+        (candidate) => candidate.effective_from_task_index <= routeTask.index
+      )
+      .at(-1)
+    if (applicableGeneration?.generation !== routeTask.task_agent_generation) {
+      fail(
+        failures,
+        "B2D-ROUTING-006",
+        `Task ${routeTask.index} does not use the generation active at its boundary`
+      )
+    }
+    const expectedLevel = validateTaskRisk(
+      routeTask.risk,
+      routeTask.index,
+      failures
+    )
+    const derived = deriveExpectedRoute(routeTask, generation, failures)
+    if (
+      !derived ||
+      !isObject(routeTask.route) ||
+      !skillContractsEqual(routeTask.route, derived.route)
+    ) {
+      fail(
+        failures,
+        "B2D-ROUTING-009",
+        `Task ${routeTask.index} route is not the exact deterministic route`
+      )
+    }
+    const normalizedTask = {
+      ...routeTask,
+      risk: {
+        ...routeTask.risk,
+        level: expectedLevel ?? routeTask.risk?.level,
+      },
+      expected_work_unit_keys: derived?.expected_work_unit_keys ?? null,
+    }
+    if (derived && expectedLevel) {
+      try {
+        const binding = deriveOrchestrationBinding(
+          normalizedTask,
+          generation,
+          derived
+        )
+        normalizedTask.route_fingerprint = binding.route_fingerprint
+        normalizedTask.orchestration_binding = binding
+      } catch (error) {
+        fail(
+          failures,
+          "B2D-ROUTING-010",
+          `Task ${routeTask.index} route binding is not canonical: ${
+            error instanceof Error ? error.message : String(error)
+          }`
+        )
+      }
+    }
+    normalized.tasks.push(normalizedTask)
+  }
+  for (const generation of normalized.generations) {
+    const first = normalized.tasks.find(
+      (routeTask) => routeTask.task_agent_generation === generation.generation
+    )
+    if (!first || first.index !== generation.effective_from_task_index) {
+      fail(
+        failures,
+        "B2D-ROUTING-006",
+        `generation ${generation.generation} boundary must equal its first Task`
+      )
+    }
+  }
+  return normalized
 }
 
 /** Parse the Plan Task headings used by the backend Simple projector. */
@@ -668,7 +6328,7 @@ export function parseSimplePlan(planMarkdown) {
 
   if (byteLength(source) > MAX_PLAN_DOCUMENT_BYTES) {
     fail(failures, "B2D-PLAN-001", "Plan exceeds the 2 MiB limit")
-    return { tasks, failures }
+    return { tasks, routing: null, failures }
   }
 
   let fence = null
@@ -712,19 +6372,18 @@ export function parseSimplePlan(planMarkdown) {
     )
   }
 
-  return { tasks, failures }
-}
-
-function markerOffsets(source) {
-  const offsets = []
-  let offset = 0
-  while (offset < source.length) {
-    const found = source.indexOf(PROGRESS_MARKER, offset)
-    if (found < 0) break
-    offsets.push(found)
-    offset = found + PROGRESS_MARKER.length
+  const extracted = extractUnfencedComment(
+    source,
+    ROUTING_MARKER,
+    MAX_ROUTING_BLOCK_BYTES
+  )
+  let routing = null
+  if (extracted.markerCount > 0) {
+    const parsedRouting = parseSimpleRouting(source)
+    failures.push(...parsedRouting.failures)
+    routing = parsedRouting.snapshot
   }
-  return offsets
+  return { tasks, routing, failures }
 }
 
 function findForbiddenProgressFields(value, path = "$", found = []) {
@@ -751,11 +6410,7 @@ function validateRun(run, taskIndex, runIndex, failures) {
   }
   for (const field of ["role", "agent_type", "state", "work_unit_key"]) {
     if (!nonEmptyString(run[field])) {
-      fail(
-        failures,
-        "B2D-PROGRESS-006",
-        `${label} requires non-empty ${field}`
-      )
+      fail(failures, "B2D-PROGRESS-006", `${label} requires non-empty ${field}`)
     }
   }
   const parsedKey = parseRecognizedWorkUnitKey(run.work_unit_key)
@@ -837,6 +6492,17 @@ function validateRun(run, taskIndex, runIndex, failures) {
       `${label} recovery_count permits at most 2 unexpected continuations`
     )
   }
+  if (
+    run.task_agent_generation !== undefined &&
+    (!positiveInteger(run.task_agent_generation) ||
+      run.task_agent_generation > MAX_U32)
+  ) {
+    fail(
+      failures,
+      "B2D-PROGRESS-006",
+      `${label} task_agent_generation must be an unsigned positive 32-bit integer`
+    )
+  }
 
   const replaced = nonEmptyString(run.replaced_task_id)
   const reason = nonEmptyString(run.replacement_reason)
@@ -855,6 +6521,106 @@ function validateRun(run, taskIndex, runIndex, failures) {
       `${label} has unsupported replacement_reason: ${run.replacement_reason}`
     )
   }
+
+  for (const field of [
+    "root_task_id",
+    "previous_task_id",
+    "lineage_root_task_id",
+  ]) {
+    if (field in run && !optionalString(run[field])) {
+      fail(
+        failures,
+        "B2D-PROGRESS-006",
+        `${label} ${field} must be a string or null`
+      )
+    }
+  }
+  if (
+    "generic_generation" in run &&
+    run.generic_generation !== null &&
+    run.generic_generation !== undefined &&
+    (!Number.isInteger(run.generic_generation) || run.generic_generation < 1)
+  ) {
+    fail(
+      failures,
+      "B2D-PROGRESS-006",
+      `${label} generic_generation must be a positive integer or null`
+    )
+  }
+  if ("dispatch_intent" in run && run.dispatch_intent !== undefined) {
+    validateDispatchIntent(run.dispatch_intent, label, failures)
+  }
+}
+
+function objectKeysExact(value, expected) {
+  if (!isObject(value)) return false
+  const actual = Object.keys(value).sort()
+  return (
+    actual.length === expected.length &&
+    actual.every((key, index) => key === expected[index])
+  )
+}
+
+function validateDispatchIntent(intent, label, failures) {
+  if (!objectKeysExact(intent, DISPATCH_INTENT_KEYS)) {
+    fail(
+      failures,
+      "B2D-PROGRESS-006",
+      `${label} dispatch_intent fields are not exact`
+    )
+    return
+  }
+  if (!["first", "continue", "replacement"].includes(intent.kind)) {
+    fail(
+      failures,
+      "B2D-PROGRESS-006",
+      `${label} dispatch_intent.kind is unsupported`
+    )
+  }
+  if (typeof intent.adopted_after_lost_acknowledgement !== "boolean") {
+    fail(
+      failures,
+      "B2D-PROGRESS-006",
+      `${label} adopted_after_lost_acknowledgement must be a boolean`
+    )
+  }
+  for (const field of [
+    "continuation_target_task_id",
+    "replacement_target_task_id",
+    "replacement_reason",
+    "expected_root_task_id",
+    "expected_lineage_root_task_id",
+  ]) {
+    if (!optionalString(intent[field])) {
+      fail(
+        failures,
+        "B2D-PROGRESS-006",
+        `${label} dispatch_intent.${field} must be a string or null`
+      )
+    }
+  }
+  if (
+    intent.expected_generic_generation !== null &&
+    (!Number.isInteger(intent.expected_generic_generation) ||
+      intent.expected_generic_generation < 1)
+  ) {
+    fail(
+      failures,
+      "B2D-PROGRESS-006",
+      `${label} expected_generic_generation must be a positive integer`
+    )
+  }
+  if (
+    intent.expected_child_conversation_id !== null &&
+    (!positiveInteger(intent.expected_child_conversation_id) ||
+      intent.expected_child_conversation_id > MAX_I32)
+  ) {
+    fail(
+      failures,
+      "B2D-PROGRESS-006",
+      `${label} expected_child_conversation_id must be a signed 32-bit integer or null`
+    )
+  }
 }
 
 function runProfileIdentity(run) {
@@ -863,7 +6629,7 @@ function runProfileIdentity(run) {
     : run.profile_id
 }
 
-function validateTaskRunLineages(task, failures, taskIds) {
+function validateTaskRunLineages(task, failures, taskIds, childOwners) {
   const groups = new Map()
   for (const [runIndex, run] of task.runs.entries()) {
     if (!isObject(run)) continue
@@ -879,28 +6645,44 @@ function validateTaskRunLineages(task, failures, taskIds) {
         taskIds.add(run.task_id)
       }
     }
-    if (!nonEmptyString(run.role)) continue
-    const group = groups.get(run.role) ?? []
+    if (
+      positiveInteger(run.child_conversation_id) &&
+      nonEmptyString(run.work_unit_key)
+    ) {
+      const owner = childOwners.get(run.child_conversation_id)
+      if (owner && owner !== run.work_unit_key) {
+        fail(
+          failures,
+          "B2D-PROGRESS-006",
+          `child conversation ${run.child_conversation_id} is shared by distinct work-unit keys`
+        )
+      } else {
+        childOwners.set(run.child_conversation_id, run.work_unit_key)
+      }
+    }
+    if (!nonEmptyString(run.work_unit_key)) continue
+    const group = groups.get(run.work_unit_key) ?? []
     group.push({ run, runIndex })
-    groups.set(run.role, group)
+    groups.set(run.work_unit_key, group)
   }
 
-  for (const [role, entries] of groups) {
+  for (const [workUnitKey, entries] of groups) {
     const first = entries[0].run
     const firstProfile = runProfileIdentity(first)
     const priorTaskIds = new Set()
     const replacementAttempts = new Map()
     for (const { run, runIndex } of entries) {
-      const label = `Task ${task.index} ${role} run ${runIndex + 1}`
+      const label = `Task ${task.index} ${workUnitKey} run ${runIndex + 1}`
       if (
         run.work_unit_key !== first.work_unit_key ||
         run.agent_type !== first.agent_type ||
-        runProfileIdentity(run) !== firstProfile
+        runProfileIdentity(run) !== firstProfile ||
+        run.task_agent_generation !== first.task_agent_generation
       ) {
         fail(
           failures,
           "B2D-PROGRESS-006",
-          `${label} changes key, agent, or profile within one lineage`
+          `${label} changes key, agent, profile, or Task Agent generation within one lineage`
         )
       }
 
@@ -940,7 +6722,7 @@ function validateTaskRunLineages(task, failures, taskIds) {
       fail(
         failures,
         "B2D-PROGRESS-006",
-        `Task ${task.index} ${role} exceeds one logical replacement`
+        `Task ${task.index} ${workUnitKey} exceeds one logical replacement`
       )
     }
   }
@@ -956,6 +6738,7 @@ function validateProgressTasks(snapshot, plan, failures) {
   const seen = new Set()
   const tasks = []
   const taskIds = new Set()
+  const childOwners = new Map()
 
   for (const task of snapshot.tasks) {
     if (!isObject(task) || !positiveInteger(task.index)) {
@@ -1006,7 +6789,7 @@ function validateProgressTasks(snapshot, plan, failures) {
       task.runs.forEach((run, index) =>
         validateRun(run, task.index, index, failures)
       )
-      validateTaskRunLineages(task, failures, taskIds)
+      validateTaskRunLineages(task, failures, taskIds, childOwners)
     }
     tasks.push(task)
   }
@@ -1104,6 +6887,163 @@ function validateSerialState(snapshot, tasks, failures) {
   }
 }
 
+function expectedKeySet(expected) {
+  return new Set(
+    [
+      expected?.implementer,
+      expected?.reviewers?.primary,
+      expected?.reviewers?.auxiliary,
+    ].filter(nonEmptyString)
+  )
+}
+
+/** Enforce routed Plan/progress agreement and Task Agent change boundaries. */
+export function validateProgressRouting(snapshot, routing, failures) {
+  if (!isObject(snapshot) || !routing || routing.tasks.length === 0) return
+  if (!Array.isArray(snapshot.tasks)) {
+    fail(failures, "B2D-PROGRESS-009", "routed progress requires Tasks")
+    return
+  }
+  const progressByIndex = new Map(
+    snapshot.tasks
+      .filter((task) => isObject(task) && positiveInteger(task.index))
+      .map((task) => [task.index, task])
+  )
+  for (const routeTask of routing.tasks) {
+    const task = progressByIndex.get(routeTask.index)
+    const expected = routeTask.expected_work_unit_keys
+    if (!task) {
+      fail(
+        failures,
+        "B2D-PROGRESS-009",
+        `Task ${routeTask.index} is missing from routed progress`
+      )
+      continue
+    }
+    if (
+      task.risk_level !== routeTask.risk.level ||
+      task.task_agent_generation !== routeTask.task_agent_generation ||
+      !skillContractsEqual(task.expected_work_unit_keys, expected)
+    ) {
+      fail(
+        failures,
+        "B2D-PROGRESS-009",
+        `Task ${routeTask.index} route metadata disagrees with the Plan`
+      )
+    }
+    const allowed = expectedKeySet(expected)
+    const groups = new Map()
+    if (Array.isArray(task.runs)) {
+      for (const run of task.runs) {
+        if (!isObject(run) || !nonEmptyString(run.work_unit_key)) continue
+        if (run.task_agent_generation !== routeTask.task_agent_generation) {
+          fail(
+            failures,
+            "B2D-PROGRESS-009",
+            `Task ${routeTask.index} run is not bound to its routed Task Agent generation`
+          )
+        }
+        if (!allowed.has(run.work_unit_key)) {
+          fail(
+            failures,
+            "B2D-PROGRESS-009",
+            `Task ${routeTask.index} run is outside its expected route`
+          )
+        }
+        const entries = groups.get(run.work_unit_key) ?? []
+        entries.push(run)
+        groups.set(run.work_unit_key, entries)
+      }
+    }
+    if (task.status === "completed") {
+      for (const key of allowed) {
+        const lineage = groups.get(key) ?? []
+        const latest = lineage.at(-1)
+        if (
+          !latest ||
+          latest.state !== "completed" ||
+          !nonEmptyString(latest.task_id) ||
+          !positiveInteger(latest.child_conversation_id) ||
+          latest.child_conversation_id > MAX_I32
+        ) {
+          fail(
+            failures,
+            "B2D-PROGRESS-010",
+            `completed Task ${routeTask.index} lacks an admitted completed lineage ${key}`
+          )
+        }
+      }
+    }
+  }
+
+  for (const generation of routing.generations.slice(1)) {
+    const boundary = progressByIndex.get(generation.effective_from_task_index)
+    const boundaryRoute = routing.tasks.find(
+      (task) => task.index === generation.effective_from_task_index
+    )
+    const prior = routing.tasks
+      .filter((task) => task.index < generation.effective_from_task_index)
+      .map((task) => progressByIndex.get(task.index))
+    const suffix = routing.tasks
+      .filter((task) => task.index >= generation.effective_from_task_index)
+      .map((task) => progressByIndex.get(task.index))
+    const pendingSuffixIsClean = suffix.every(
+      (task) =>
+        task?.status === "pending" &&
+        Array.isArray(task.runs) &&
+        task.runs.length === 0
+    )
+    const pendingTasksRemainClean = suffix.every(
+      (task) =>
+        isObject(task) &&
+        (task.status !== "pending" ||
+          (Array.isArray(task.runs) && task.runs.length === 0))
+    )
+    const priorCompleted = prior.every((task) => task?.status === "completed")
+    const boundaryRuns = Array.isArray(boundary?.runs) ? boundary.runs : []
+    const emptyPendingBoundary =
+      boundary?.status === "pending" &&
+      Array.isArray(boundary.runs) &&
+      boundaryRuns.length === 0 &&
+      pendingSuffixIsClean &&
+      snapshot.active_task_index === null
+    const frozenRouteMatches =
+      boundary?.risk_level === boundaryRoute?.risk?.level &&
+      boundary?.task_agent_generation ===
+        boundaryRoute?.task_agent_generation &&
+      skillContractsEqual(
+        boundary?.expected_work_unit_keys,
+        boundaryRoute?.expected_work_unit_keys
+      )
+    const implementerKey = boundaryRoute?.expected_work_unit_keys?.implementer
+    const hasAdmittedImplementerRun = boundaryRuns.some(
+      (run) =>
+        isObject(run) &&
+        run.work_unit_key === implementerKey &&
+        run.task_agent_generation === boundaryRoute?.task_agent_generation &&
+        nonEmptyString(run.task_id) &&
+        positiveInteger(run.child_conversation_id) &&
+        run.child_conversation_id <= MAX_I32
+    )
+    const historicalAdoptedBoundary =
+      boundary?.status !== "pending" &&
+      frozenRouteMatches &&
+      hasAdmittedImplementerRun &&
+      pendingTasksRemainClean
+    if (
+      !boundary ||
+      !priorCompleted ||
+      (!emptyPendingBoundary && !historicalAdoptedBoundary)
+    ) {
+      fail(
+        failures,
+        "B2D-ROUTING-007",
+        `generation ${generation.generation} is neither awaiting adoption across a clean pending suffix nor frozen on its admitted route`
+      )
+    }
+  }
+}
+
 /** Parse and validate the exact Simple progress block. */
 export function parseSimpleProgress(
   progressMarkdown,
@@ -1123,28 +7063,21 @@ export function parseSimpleProgress(
     return { ...progress, failures }
   }
 
-  const starts = markerOffsets(source)
-  if (starts.length !== 1) {
+  const extracted = extractUnfencedComment(
+    source,
+    PROGRESS_MARKER,
+    MAX_PROGRESS_BLOCK_BYTES
+  )
+  if (extracted.markerCount !== 1 || extracted.problem === "truncated") {
     fail(
       failures,
       "B2D-PROGRESS-001",
       "progress document must contain exactly one marker; " +
-        `found ${starts.length}`
-    )
-    if (starts.length === 0) return { ...progress, failures }
-  }
-  const jsonStart = starts[0] + PROGRESS_MARKER.length
-  const relativeEnd = source.slice(jsonStart).indexOf(COMMENT_END)
-  if (relativeEnd < 0) {
-    fail(
-      failures,
-      "B2D-PROGRESS-001",
-      "progress block is missing its closing comment marker"
+        `found ${extracted.markerCount}`
     )
     return { ...progress, failures }
   }
-  const json = source.slice(jsonStart, jsonStart + relativeEnd).trim()
-  if (byteLength(json) > MAX_PROGRESS_BLOCK_BYTES) {
+  if (extracted.problem === "too_large") {
     fail(
       failures,
       "B2D-PROGRESS-002",
@@ -1152,6 +7085,7 @@ export function parseSimpleProgress(
     )
     return { ...progress, failures }
   }
+  const json = extracted.body.trim()
 
   let snapshot
   try {
@@ -1177,11 +7111,7 @@ export function parseSimpleProgress(
     )
   }
   if (snapshot.schema_version !== 1) {
-    fail(
-      failures,
-      "B2D-PROGRESS-003",
-      "progress schema_version must equal 1"
-    )
+    fail(failures, "B2D-PROGRESS-003", "progress schema_version must equal 1")
   }
 
   const expected = normalizeRelPath(expectedPlanRelPath)
@@ -1194,11 +7124,7 @@ export function parseSimpleProgress(
     )
   }
   if (!optionalString(snapshot.updated_at)) {
-    fail(
-      failures,
-      "B2D-PROGRESS-003",
-      "updated_at must be a string or null"
-    )
+    fail(failures, "B2D-PROGRESS-003", "updated_at must be a string or null")
   }
 
   const tasks = validateProgressTasks(snapshot, plan, failures)
@@ -1212,18 +7138,1451 @@ export function validateSimpleDocuments({
   planMarkdown,
   progressMarkdown,
   planRelPath,
+  allowRouteChangeTransition = false,
 }) {
   const skill = validateSkillMarkdown(skillMarkdown)
   const plan = parseSimplePlan(planMarkdown)
+  const routingFailures = []
+  if (
+    !plan.routing &&
+    !plan.failures.some((failure) => failure.startsWith("[B2D-ROUTING-"))
+  ) {
+    fail(
+      routingFailures,
+      "B2D-ROUTING-001",
+      "authoritative document validation requires exactly one routing block"
+    )
+  }
+  const routing = plan.routing
+    ? validateRoutingSnapshot(plan.routing, plan, routingFailures)
+    : null
   const progress = parseSimpleProgress(progressMarkdown, planRelPath, plan)
+  const agreementFailures = []
+  let routeChange = { kind: "absent" }
+  if (progress.snapshot) {
+    routeChange = inspectPendingRouteChange(
+      progress.snapshot,
+      routing,
+      agreementFailures
+    )
+  }
+  if (routing && progress.snapshot) {
+    if (routeChange.kind === "transition") {
+      if (allowRouteChangeTransition && routeChange.reconstructed) {
+        validateProgressRouting(
+          progress.snapshot,
+          routeChange.reconstructed,
+          agreementFailures
+        )
+      } else {
+        fail(
+          agreementFailures,
+          "B2D-PROGRESS-009",
+          "half-applied pending_route_change is not a fully synchronized state"
+        )
+      }
+    } else {
+      validateProgressRouting(progress.snapshot, routing, agreementFailures)
+    }
+  }
   return {
-    failures: [...skill.failures, ...plan.failures, ...progress.failures],
+    failures: [
+      ...skill.failures,
+      ...plan.failures,
+      ...routingFailures,
+      ...progress.failures,
+      ...agreementFailures,
+    ],
     notes: [
       ...skill.notes,
       `Plan Tasks parsed: ${plan.tasks.length}`,
       `Progress Tasks parsed: ${progress.snapshot?.tasks?.length ?? 0}`,
     ],
     plan,
+    routing,
     progress,
+    routeChange,
   }
+}
+
+function nullableEqual(left, right) {
+  const first = left === undefined ? null : left
+  const second = right === undefined ? null : right
+  return first === second
+}
+
+function parseUtcInstant(value) {
+  if (typeof value !== "string" || !UTC_INSTANT_RE.test(value)) return null
+  const millis = Date.parse(value)
+  return Number.isFinite(millis) ? millis : null
+}
+
+function parseDecimalU64(value) {
+  if (typeof value !== "string" || !/^(0|[1-9][0-9]{0,19})$/.test(value)) {
+    return null
+  }
+  try {
+    const parsed = BigInt(value)
+    if (parsed < 0n || parsed > MAX_U64) return null
+    return parsed
+  } catch {
+    return null
+  }
+}
+
+function parseCursor(value) {
+  if (value === null) return { valid: true, value: null }
+  if (typeof value === "string" && CURSOR_RE.test(value)) {
+    return { valid: true, value }
+  }
+  return { valid: false, value: null }
+}
+
+function requestedNamespaceRow(run) {
+  return run.orchestration_binding?.namespace === ROUTE_BINDING_NAMESPACE
+}
+
+function recognizedTaskKey(value) {
+  const parsed = parseRecognizedWorkUnitKey(value)
+  return parsed?.kind === "task" ? parsed : null
+}
+
+function normalizeProgressStatus(state) {
+  return state === "cancelled" ? "canceled" : state
+}
+
+function statusAgrees(progressState, durableStatus) {
+  if (progressState === "unknown" || durableStatus === "unknown") return false
+  if (progressState === "stalled") return durableStatus === "running"
+  return normalizeProgressStatus(progressState) === durableStatus
+}
+
+function statusRefreshable(progressState, durableStatus) {
+  const from = normalizeProgressStatus(progressState)
+  if (from === "reserving") {
+    return ["running", "completed", "failed", "canceled"].includes(
+      durableStatus
+    )
+  }
+  if (from === "running") {
+    return ["completed", "failed", "canceled"].includes(durableStatus)
+  }
+  return false
+}
+
+function parseDurableRun(run, failures, seenTaskIds) {
+  if (!objectKeysExact(run, DURABLE_RUN_KEYS)) {
+    fail(failures, "B2D-DURABLE-001", "durable run fields are not exact")
+    return null
+  }
+  if (!nonEmptyString(run.task_id)) {
+    fail(
+      failures,
+      "B2D-DURABLE-001",
+      "durable task_id must be a non-empty string"
+    )
+    return null
+  }
+  if (seenTaskIds.has(run.task_id)) {
+    fail(
+      failures,
+      "B2D-DURABLE-001",
+      `duplicate durable Task ID: ${run.task_id}`
+    )
+    return null
+  }
+  seenTaskIds.add(run.task_id)
+  if (
+    !nonEmptyString(run.root_task_id) ||
+    !nonEmptyString(run.lineage_root_task_id)
+  ) {
+    fail(
+      failures,
+      "B2D-DURABLE-001",
+      `durable row ${run.task_id} is missing required lineage identity`
+    )
+    return null
+  }
+  for (const field of [
+    "previous_task_id",
+    "replaced_task_id",
+    "replacement_reason",
+    "work_unit_key",
+  ]) {
+    if (!optionalString(run[field])) {
+      fail(
+        failures,
+        "B2D-DURABLE-001",
+        `durable row ${run.task_id} ${field} must be a string or null`
+      )
+      return null
+    }
+  }
+  if (
+    !Number.isInteger(run.generic_generation) ||
+    run.generic_generation < 1 ||
+    run.generic_generation > Number.MAX_SAFE_INTEGER
+  ) {
+    fail(
+      failures,
+      "B2D-DURABLE-001",
+      `durable row ${run.task_id} generic_generation is invalid`
+    )
+    return null
+  }
+  if (
+    !positiveInteger(run.child_conversation_id) ||
+    run.child_conversation_id > MAX_I32
+  ) {
+    fail(
+      failures,
+      "B2D-DURABLE-001",
+      `durable row ${run.task_id} child_conversation_id is invalid`
+    )
+    return null
+  }
+  if (
+    !validAgentSelection({
+      agent_type: run.agent_type,
+      profile_id: run.profile_id,
+    })
+  ) {
+    fail(
+      failures,
+      "B2D-DURABLE-001",
+      `durable row ${run.task_id} has an invalid Agent/profile`
+    )
+    return null
+  }
+  if (!DURABLE_STATUSES.has(run.status)) {
+    fail(
+      failures,
+      "B2D-DURABLE-001",
+      `durable row ${run.task_id} has an invalid status`
+    )
+    return null
+  }
+  if (run.work_unit_key === null && run.orchestration_binding !== null) {
+    const parsedBinding = parseOrchestrationBinding(run.orchestration_binding)
+    if (
+      parsedBinding.valid &&
+      parsedBinding.binding.namespace !== ROUTE_BINDING_NAMESPACE
+    ) {
+      fail(
+        failures,
+        "B2D-DURABLE-001",
+        "foreign unkeyed rows are not valid query evidence"
+      )
+      return null
+    }
+  }
+  let binding = null
+  if (run.orchestration_binding !== null) {
+    const parsed = parseOrchestrationBinding(run.orchestration_binding)
+    if (!parsed.valid) {
+      fail(
+        failures,
+        "B2D-DURABLE-002",
+        `durable row ${run.task_id} binding is malformed: ${parsed.failures.join("; ")}`
+      )
+      return null
+    }
+    binding = parsed.binding
+  }
+  return {
+    task_id: run.task_id,
+    root_task_id: run.root_task_id,
+    previous_task_id: run.previous_task_id,
+    lineage_root_task_id: run.lineage_root_task_id,
+    replaced_task_id: run.replaced_task_id,
+    replacement_reason: run.replacement_reason,
+    generic_generation: run.generic_generation,
+    work_unit_key: run.work_unit_key,
+    child_conversation_id: run.child_conversation_id,
+    agent_type: run.agent_type,
+    profile_id: run.profile_id,
+    status: run.status,
+    orchestration_binding: binding,
+  }
+}
+
+function parseDurablePage(page, failures, seenTaskIds) {
+  if (!objectKeysExact(page, DURABLE_PAGE_KEYS)) {
+    fail(failures, "B2D-DURABLE-001", "durable page fields are not exact")
+    return null
+  }
+  if (page.schema_version !== 1) {
+    fail(
+      failures,
+      "B2D-DURABLE-001",
+      "durable page schema_version must equal 1"
+    )
+    return null
+  }
+  if (page.namespace !== ROUTE_BINDING_NAMESPACE) {
+    fail(
+      failures,
+      "B2D-DURABLE-001",
+      "durable page namespace must be brainstorm-to-delivery"
+    )
+    return null
+  }
+  if (typeof page.snapshot_id !== "string" || !UUID_RE.test(page.snapshot_id)) {
+    fail(failures, "B2D-DURABLE-001", "snapshot_id must be a lowercase UUID")
+    return null
+  }
+  if (parseDecimalU64(page.snapshot_revision) === null) {
+    fail(
+      failures,
+      "B2D-DURABLE-001",
+      "snapshot_revision must be an unsigned 64-bit decimal string"
+    )
+    return null
+  }
+  const createdAt = parseUtcInstant(page.snapshot_created_at)
+  const expiresAt = parseUtcInstant(page.snapshot_expires_at)
+  if (createdAt === null || expiresAt === null || expiresAt <= createdAt) {
+    fail(
+      failures,
+      "B2D-DURABLE-001",
+      "snapshot timestamps must be real UTC instants"
+    )
+    return null
+  }
+  if (
+    !Number.isInteger(page.total_rows) ||
+    page.total_rows < 0 ||
+    page.total_rows > MAX_DURABLE_SNAPSHOT_ROWS
+  ) {
+    fail(
+      failures,
+      "B2D-DURABLE-001",
+      "total_rows must be an integer in 0..=4096"
+    )
+    return null
+  }
+  if (!Number.isInteger(page.page_start) || page.page_start < 0) {
+    fail(
+      failures,
+      "B2D-DURABLE-001",
+      "page_start must be a non-negative integer"
+    )
+    return null
+  }
+  const requestCursor = parseCursor(page.request_cursor)
+  const nextCursor = parseCursor(page.next_cursor)
+  if (!requestCursor.valid || !nextCursor.valid) {
+    fail(failures, "B2D-DURABLE-001", "page cursors are malformed")
+    return null
+  }
+  if (!Array.isArray(page.runs)) {
+    fail(failures, "B2D-DURABLE-001", "page runs must be an array")
+    return null
+  }
+  if (typeof page.complete !== "boolean") {
+    fail(failures, "B2D-DURABLE-001", "complete must be a boolean")
+    return null
+  }
+  const runs = []
+  for (const run of page.runs) {
+    const parsed = parseDurableRun(run, failures, seenTaskIds)
+    if (parsed) runs.push(parsed)
+  }
+  return {
+    schema_version: page.schema_version,
+    namespace: page.namespace,
+    snapshot_id: page.snapshot_id,
+    snapshot_revision: page.snapshot_revision,
+    snapshot_created_at: page.snapshot_created_at,
+    snapshot_expires_at: page.snapshot_expires_at,
+    total_rows: page.total_rows,
+    page_start: page.page_start,
+    request_cursor: page.request_cursor,
+    runs,
+    next_cursor: page.next_cursor,
+    complete: page.complete,
+  }
+}
+
+/** Parse a complete raw durable evidence wrapper and its page envelopes. */
+export function parseDurableBindingEvidence(source, options = {}) {
+  const failures = []
+  const now = options.now instanceof Date ? options.now.getTime() : Date.now()
+  let value = source
+  if (typeof source === "string") {
+    if (byteLength(source) > MAX_DURABLE_EVIDENCE_BYTES) {
+      fail(
+        failures,
+        "B2D-DURABLE-001",
+        "durable evidence exceeds the 4 MiB limit"
+      )
+      return { pages: [], runs: [], snapshot: null, failures }
+    }
+    try {
+      value = JSON.parse(source)
+    } catch {
+      fail(failures, "B2D-DURABLE-001", "durable evidence is not valid JSON")
+      return { pages: [], runs: [], snapshot: null, failures }
+    }
+  }
+  if (!objectKeysExact(value, ["pages", "schema_version"])) {
+    fail(
+      failures,
+      "B2D-DURABLE-001",
+      "durable evidence wrapper fields are not exact"
+    )
+    return { pages: [], runs: [], snapshot: null, failures }
+  }
+  if (value.schema_version !== 1) {
+    fail(
+      failures,
+      "B2D-DURABLE-001",
+      "durable evidence schema_version must equal 1"
+    )
+    return { pages: [], runs: [], snapshot: null, failures }
+  }
+  if (!Array.isArray(value.pages) || value.pages.length === 0) {
+    fail(
+      failures,
+      "B2D-DURABLE-001",
+      "durable evidence requires at least one page"
+    )
+    return { pages: [], runs: [], snapshot: null, failures }
+  }
+
+  const seenTaskIds = new Set()
+  const pages = []
+  for (const page of value.pages) {
+    const parsed = parseDurablePage(page, failures, seenTaskIds)
+    if (parsed) pages.push(parsed)
+  }
+  if (failures.length > 0) {
+    return { pages: [], runs: [], snapshot: null, failures }
+  }
+
+  const first = pages[0]
+  const expiresAt = parseUtcInstant(first.snapshot_expires_at)
+  if (expiresAt !== null && expiresAt <= now) {
+    fail(failures, "B2D-DURABLE-001", "durable evidence snapshot is expired")
+    return { pages: [], runs: [], snapshot: null, failures }
+  }
+  if (first.page_start !== 0) {
+    fail(failures, "B2D-DURABLE-001", "first page_start must be zero")
+  }
+  if (first.request_cursor !== null) {
+    fail(failures, "B2D-DURABLE-001", "first request_cursor must be null")
+  }
+
+  let expectedStart = 0
+  let seenComplete = false
+  const runs = []
+  for (const [index, page] of pages.entries()) {
+    if (
+      page.snapshot_id !== first.snapshot_id ||
+      page.snapshot_revision !== first.snapshot_revision ||
+      page.snapshot_created_at !== first.snapshot_created_at ||
+      page.snapshot_expires_at !== first.snapshot_expires_at ||
+      page.total_rows !== first.total_rows ||
+      page.namespace !== first.namespace ||
+      page.schema_version !== first.schema_version
+    ) {
+      fail(
+        failures,
+        "B2D-DURABLE-001",
+        "durable pages mix snapshot identity or metadata"
+      )
+    }
+    if (seenComplete) {
+      fail(
+        failures,
+        "B2D-DURABLE-001",
+        "durable evidence has a trailing page after completion"
+      )
+    }
+    if (page.page_start !== expectedStart) {
+      fail(
+        failures,
+        "B2D-DURABLE-001",
+        "durable pages have a gap, overlap, or invalid order"
+      )
+    }
+    if (index > 0 && page.request_cursor !== pages[index - 1].next_cursor) {
+      fail(
+        failures,
+        "B2D-DURABLE-001",
+        "durable request_cursor does not echo the previous next_cursor"
+      )
+    }
+    if (page.complete) {
+      if (page.next_cursor !== null) {
+        fail(failures, "B2D-DURABLE-001", "final page next_cursor must be null")
+      }
+      seenComplete = true
+    } else if (page.next_cursor === null) {
+      fail(
+        failures,
+        "B2D-DURABLE-001",
+        "non-final page next_cursor must be non-null"
+      )
+    }
+    expectedStart += page.runs.length
+    runs.push(...page.runs)
+  }
+  if (!seenComplete) {
+    fail(
+      failures,
+      "B2D-DURABLE-001",
+      "durable evidence is missing a final page"
+    )
+  }
+  if (first.total_rows !== runs.length) {
+    fail(
+      failures,
+      "B2D-DURABLE-001",
+      "total_rows does not match the concatenated run count"
+    )
+  }
+  if (failures.length > 0) {
+    return { pages: [], runs: [], snapshot: null, failures }
+  }
+  return {
+    pages,
+    runs,
+    snapshot: {
+      snapshot_id: first.snapshot_id,
+      snapshot_revision: first.snapshot_revision,
+    },
+    failures,
+  }
+}
+
+function parsePendingRouteChangeObject(value, failures) {
+  if (!objectKeysExact(value, PENDING_ROUTE_CHANGE_KEYS)) {
+    fail(
+      failures,
+      "B2D-PROGRESS-003",
+      "pending_route_change fields are not exact"
+    )
+    return null
+  }
+  if (
+    !validAgentSelection({
+      agent_type: value.requested_agent_type,
+      profile_id: value.requested_profile_id,
+    })
+  ) {
+    fail(
+      failures,
+      "B2D-PROGRESS-003",
+      "pending_route_change requested Agent/profile is invalid"
+    )
+    return null
+  }
+  if (
+    !Number.isInteger(value.next_generation) ||
+    value.next_generation < 1 ||
+    value.next_generation > MAX_U32
+  ) {
+    fail(
+      failures,
+      "B2D-PROGRESS-003",
+      "pending_route_change next_generation is not a contiguous unsigned generation"
+    )
+    return null
+  }
+  if (!positiveInteger(value.effective_from_task_index)) {
+    fail(
+      failures,
+      "B2D-PROGRESS-003",
+      "pending_route_change effective_from_task_index is invalid"
+    )
+    return null
+  }
+  if (
+    !Array.isArray(value.affected_task_indices) ||
+    value.affected_task_indices.length === 0 ||
+    value.affected_task_indices.some((index) => !positiveInteger(index))
+  ) {
+    fail(
+      failures,
+      "B2D-PROGRESS-003",
+      "pending_route_change affected_task_indices are invalid"
+    )
+    return null
+  }
+  const affected = value.affected_task_indices
+  for (let offset = 1; offset < affected.length; offset += 1) {
+    if (affected[offset] !== affected[offset - 1] + 1) {
+      fail(
+        failures,
+        "B2D-PROGRESS-003",
+        "pending_route_change affected_task_indices must be a contiguous suffix"
+      )
+      return null
+    }
+  }
+  if (value.effective_from_task_index !== affected[0]) {
+    fail(
+      failures,
+      "B2D-PROGRESS-003",
+      "pending_route_change boundary must equal the first affected index"
+    )
+    return null
+  }
+  return {
+    requested_agent_type: value.requested_agent_type,
+    requested_profile_id: value.requested_profile_id,
+    next_generation: value.next_generation,
+    effective_from_task_index: value.effective_from_task_index,
+    affected_task_indices: [...affected],
+  }
+}
+
+function progressMatchesRouting(snapshot, routing) {
+  if (!isObject(snapshot) || !Array.isArray(snapshot.tasks) || !routing) {
+    return false
+  }
+  const progressByIndex = new Map(
+    snapshot.tasks
+      .filter((task) => isObject(task) && positiveInteger(task.index))
+      .map((task) => [task.index, task])
+  )
+  return routing.tasks.every((routeTask) => {
+    const task = progressByIndex.get(routeTask.index)
+    return (
+      task &&
+      task.task_agent_generation === routeTask.task_agent_generation &&
+      task.risk_level === routeTask.risk.level &&
+      skillContractsEqual(
+        task.expected_work_unit_keys,
+        routeTask.expected_work_unit_keys
+      )
+    )
+  })
+}
+
+function reconstructPriorRouting(routing, intent, failures) {
+  const priorGenerations = routing.generations.filter(
+    (generation) => generation.generation < intent.next_generation
+  )
+  const priorGeneration = priorGenerations.at(-1)
+  if (!priorGeneration) return null
+  const tasks = []
+  for (const routeTask of routing.tasks) {
+    if (routeTask.index < intent.effective_from_task_index) {
+      tasks.push(routeTask)
+      continue
+    }
+    const expected = deriveExpectedRoute(
+      { ...routeTask, task_agent_generation: priorGeneration.generation },
+      priorGeneration,
+      failures
+    )
+    if (!expected) return null
+    const binding = deriveOrchestrationBinding(
+      { ...routeTask, task_agent_generation: priorGeneration.generation },
+      priorGeneration,
+      expected
+    )
+    tasks.push({
+      ...routeTask,
+      task_agent_generation: priorGeneration.generation,
+      route: expected.route,
+      expected_work_unit_keys: expected.expected_work_unit_keys,
+      route_fingerprint: binding.route_fingerprint,
+      orchestration_binding: binding,
+    })
+  }
+  return { generations: priorGenerations, tasks }
+}
+
+function planMatchesRouteChangeIntent(routing, intent) {
+  const last = routing.generations.at(-1)
+  if (
+    !last ||
+    last.generation !== intent.next_generation ||
+    last.effective_from_task_index !== intent.effective_from_task_index ||
+    last.agent_type !== intent.requested_agent_type ||
+    last.profile_id !== intent.requested_profile_id
+  ) {
+    return false
+  }
+  return routing.tasks.every((task) =>
+    task.index < intent.effective_from_task_index
+      ? task.task_agent_generation < intent.next_generation
+      : task.task_agent_generation === intent.next_generation
+  )
+}
+
+function inspectPendingRouteChange(snapshot, routing, failures) {
+  if (!routing) {
+    if (
+      snapshot &&
+      "pending_route_change" in snapshot &&
+      snapshot.pending_route_change !== null
+    ) {
+      fail(
+        failures,
+        "B2D-PROGRESS-003",
+        "legacy progress cannot carry pending_route_change"
+      )
+    }
+    return { kind: "legacy" }
+  }
+  if (!isObject(snapshot) || !("pending_route_change" in snapshot)) {
+    fail(
+      failures,
+      "B2D-PROGRESS-003",
+      "routed progress requires pending_route_change"
+    )
+    return { kind: "missing" }
+  }
+  if (snapshot.pending_route_change === null) return { kind: "settled" }
+  const intent = parsePendingRouteChangeObject(
+    snapshot.pending_route_change,
+    failures
+  )
+  if (!intent) return { kind: "malformed" }
+
+  const planIndexes = routing.tasks.map((task) => task.index)
+  const expectedSuffix = planIndexes.filter(
+    (index) => index >= intent.effective_from_task_index
+  )
+  if (intent.affected_task_indices.join(",") !== expectedSuffix.join(",")) {
+    fail(
+      failures,
+      "B2D-PROGRESS-003",
+      "pending_route_change affected_task_indices must be the complete pending suffix"
+    )
+    return { kind: "malformed", intent }
+  }
+
+  const progressByIndex = new Map(
+    (Array.isArray(snapshot.tasks) ? snapshot.tasks : [])
+      .filter((task) => isObject(task) && positiveInteger(task.index))
+      .map((task) => [task.index, task])
+  )
+  const suffix = expectedSuffix.map((index) => progressByIndex.get(index))
+  const prefix = planIndexes
+    .filter((index) => index < intent.effective_from_task_index)
+    .map((index) => progressByIndex.get(index))
+  const suffixPendingEmpty = suffix.every(
+    (task) =>
+      task?.status === "pending" &&
+      Array.isArray(task.runs) &&
+      task.runs.length === 0
+  )
+  const prefixCompleted = prefix.every((task) => task?.status === "completed")
+  const noActive = snapshot.active_task_index === null
+  if (!suffixPendingEmpty || !prefixCompleted || !noActive) {
+    fail(
+      failures,
+      "B2D-PROGRESS-008",
+      "pending_route_change requires a completed prefix, null active Task, and empty pending suffix"
+    )
+    return { kind: "malformed", intent }
+  }
+
+  const lastGeneration = routing.generations.at(-1)?.generation
+  const matchesPlan = progressMatchesRouting(snapshot, routing)
+  if (lastGeneration === intent.next_generation - 1 && matchesPlan) {
+    return { kind: "pre", intent }
+  }
+  if (planMatchesRouteChangeIntent(routing, intent) && matchesPlan) {
+    return { kind: "post", intent }
+  }
+  const reconstructed = reconstructPriorRouting(routing, intent, [])
+  if (
+    planMatchesRouteChangeIntent(routing, intent) &&
+    reconstructed &&
+    progressMatchesRouting(snapshot, reconstructed)
+  ) {
+    return { kind: "transition", intent, reconstructed }
+  }
+  fail(
+    failures,
+    "B2D-PROGRESS-009",
+    "pending_route_change does not match a synchronized pre-revision, post-revision, or exact transition state"
+  )
+  return { kind: "disagreement", intent }
+}
+
+function admittedProgressRuns(snapshot) {
+  const entries = []
+  if (!isObject(snapshot) || !Array.isArray(snapshot.tasks)) return entries
+  for (const task of snapshot.tasks) {
+    if (!isObject(task) || !Array.isArray(task.runs)) continue
+    for (const [runIndex, run] of task.runs.entries()) {
+      if (!isObject(run)) continue
+      entries.push({ task, run, runIndex })
+    }
+  }
+  return entries
+}
+
+function eligibleUnresolvedIntent(run) {
+  return (
+    run.state === "reserving" &&
+    !nonEmptyString(run.task_id) &&
+    (run.child_conversation_id === null ||
+      run.child_conversation_id === undefined) &&
+    !nonEmptyString(run.root_task_id) &&
+    !nonEmptyString(run.previous_task_id) &&
+    !nonEmptyString(run.lineage_root_task_id) &&
+    (run.generic_generation === null || run.generic_generation === undefined) &&
+    !nonEmptyString(run.replaced_task_id) &&
+    !nonEmptyString(run.replacement_reason) &&
+    isObject(run.dispatch_intent) &&
+    run.dispatch_intent.adopted_after_lost_acknowledgement === false
+  )
+}
+
+function bindingEquals(left, right) {
+  if (left === null && right === null) return true
+  if (!left || !right) return false
+  return skillContractsEqual(left, right)
+}
+
+function findProgressTarget(entries, taskId) {
+  return entries.find(
+    (entry) => isObject(entry.run) && entry.run.task_id === taskId
+  )
+}
+
+function adoptionLineageMatches(kind, candidate, intent, target) {
+  if (kind === "first") {
+    return (
+      candidate.generic_generation === 1 &&
+      candidate.root_task_id === candidate.task_id &&
+      candidate.lineage_root_task_id === candidate.task_id &&
+      candidate.previous_task_id === null &&
+      candidate.replaced_task_id === null &&
+      candidate.replacement_reason === null
+    )
+  }
+  if (!target) return false
+  if (kind === "continue") {
+    return (
+      candidate.previous_task_id === intent.continuation_target_task_id &&
+      candidate.previous_task_id === target.task_id &&
+      candidate.root_task_id === target.root_task_id &&
+      candidate.lineage_root_task_id === target.lineage_root_task_id &&
+      candidate.child_conversation_id === target.child_conversation_id &&
+      candidate.agent_type === target.agent_type &&
+      nullableEqual(candidate.profile_id, target.profile_id) &&
+      candidate.work_unit_key === target.work_unit_key &&
+      bindingEquals(
+        candidate.orchestration_binding,
+        target.orchestration_binding
+      ) &&
+      candidate.generic_generation === target.generic_generation + 1 &&
+      candidate.replaced_task_id === null &&
+      candidate.replacement_reason === null
+    )
+  }
+  return (
+    candidate.replaced_task_id === intent.replacement_target_task_id &&
+    candidate.replacement_reason === intent.replacement_reason &&
+    candidate.generic_generation === 1 &&
+    candidate.root_task_id === candidate.task_id &&
+    candidate.previous_task_id === null &&
+    candidate.lineage_root_task_id === target.lineage_root_task_id &&
+    candidate.agent_type === target.agent_type &&
+    nullableEqual(candidate.profile_id, target.profile_id) &&
+    candidate.work_unit_key === target.work_unit_key &&
+    bindingEquals(
+      candidate.orchestration_binding,
+      target.orchestration_binding
+    ) &&
+    candidate.child_conversation_id !== target.child_conversation_id
+  )
+}
+
+function candidateMatchesIntent(entry, candidate, allEntries) {
+  const intent = entry.run.dispatch_intent
+  if (
+    candidate.work_unit_key !== entry.run.work_unit_key ||
+    candidate.agent_type !== entry.run.agent_type ||
+    !nullableEqual(candidate.profile_id, entry.run.profile_id) ||
+    !bindingEquals(
+      candidate.orchestration_binding,
+      entry.run.orchestration_binding
+    )
+  ) {
+    return false
+  }
+  const targetId =
+    intent.kind === "continue"
+      ? intent.continuation_target_task_id
+      : intent.kind === "replacement"
+        ? intent.replacement_target_task_id
+        : null
+  const target = targetId ? findProgressTarget(allEntries, targetId)?.run : null
+  return adoptionLineageMatches(intent.kind, candidate, intent, target)
+}
+
+function adoptAction(entry, candidate) {
+  return {
+    kind: "adopt_lost_acknowledgement",
+    task_index: entry.task.index,
+    progress_run_index: entry.runIndex,
+    task_id: candidate.task_id,
+    child_conversation_id: candidate.child_conversation_id,
+    root_task_id: candidate.root_task_id,
+    previous_task_id: candidate.previous_task_id,
+    lineage_root_task_id: candidate.lineage_root_task_id,
+    generic_generation: candidate.generic_generation,
+    replaced_task_id: candidate.replaced_task_id,
+    replacement_reason: candidate.replacement_reason,
+    work_unit_key: candidate.work_unit_key,
+    agent_type: candidate.agent_type,
+    profile_id: candidate.profile_id,
+    status: candidate.status,
+    orchestration_binding: candidate.orchestration_binding,
+  }
+}
+
+function identityAgrees(progressRun, durable) {
+  return (
+    progressRun.task_id === durable.task_id &&
+    progressRun.work_unit_key === durable.work_unit_key &&
+    progressRun.child_conversation_id === durable.child_conversation_id &&
+    nullableEqual(progressRun.root_task_id, durable.root_task_id) &&
+    nullableEqual(progressRun.previous_task_id, durable.previous_task_id) &&
+    nullableEqual(
+      progressRun.lineage_root_task_id,
+      durable.lineage_root_task_id
+    ) &&
+    nullableEqual(progressRun.generic_generation, durable.generic_generation) &&
+    nullableEqual(progressRun.replaced_task_id, durable.replaced_task_id) &&
+    nullableEqual(progressRun.replacement_reason, durable.replacement_reason) &&
+    progressRun.agent_type === durable.agent_type &&
+    nullableEqual(progressRun.profile_id, durable.profile_id)
+  )
+}
+
+/** Reconcile complete durable rows against Plan-derived bindings and progress. */
+export function reconcileDurableBindings({
+  evidence,
+  routing,
+  progressSnapshot,
+  routeChange,
+} = {}) {
+  const failures = []
+  const actions = []
+  if (!evidence || !routing || !progressSnapshot) {
+    fail(failures, "B2D-DURABLE-001", "durable reconciliation is incomplete")
+    return { failures, actions }
+  }
+
+  const entries = admittedProgressRuns(progressSnapshot)
+  const admittedIds = new Set(
+    entries
+      .filter((entry) => nonEmptyString(entry.run.task_id))
+      .map((entry) => entry.run.task_id)
+  )
+  const unmatched = evidence.runs.filter((run) => !admittedIds.has(run.task_id))
+  const eligible = entries.filter((entry) =>
+    eligibleUnresolvedIntent(entry.run)
+  )
+  const priorAdoption = entries.filter(
+    (entry) =>
+      entry.run.state === "reserving" &&
+      isObject(entry.run.dispatch_intent) &&
+      entry.run.dispatch_intent.adopted_after_lost_acknowledgement === true &&
+      !nonEmptyString(entry.run.task_id)
+  )
+  if (priorAdoption.length > 0) {
+    fail(
+      failures,
+      "B2D-DURABLE-009",
+      "lost-acknowledgement adoption was already marked and remains unresolved"
+    )
+    return { failures, actions }
+  }
+  if (eligible.length > 1) {
+    fail(
+      failures,
+      "B2D-DURABLE-009",
+      "lost-acknowledgement adoption is ambiguous: multiple unresolved intents"
+    )
+    return { failures, actions }
+  }
+  if (eligible.length === 1) {
+    const entry = eligible[0]
+    const matches = unmatched.filter((run) =>
+      candidateMatchesIntent(entry, run, entries)
+    )
+    if (matches.length !== 1) {
+      fail(
+        failures,
+        "B2D-DURABLE-009",
+        "lost-acknowledgement adoption is absent, ambiguous, or lineage-invalid"
+      )
+      return { failures, actions }
+    }
+    return { failures, actions: [adoptAction(entry, matches[0])] }
+  }
+
+  const affected = new Set(routeChange?.intent?.affected_task_indices ?? [])
+  if (routeChange?.intent) {
+    for (const run of evidence.runs) {
+      const recognized = recognizedTaskKey(run.work_unit_key)
+      if (recognized && affected.has(recognized.taskIndex)) {
+        fail(
+          failures,
+          "B2D-DURABLE-008",
+          `generation change touches durable Task ${recognized.taskIndex} row ${run.task_id}`
+        )
+      }
+    }
+  }
+
+  const durableById = new Map(evidence.runs.map((run) => [run.task_id, run]))
+  const progressById = new Map(
+    entries
+      .filter((entry) => nonEmptyString(entry.run.task_id))
+      .map((entry) => [entry.run.task_id, entry])
+  )
+  const refresh = []
+  const hard = []
+
+  for (const entry of entries) {
+    if (!nonEmptyString(entry.run.task_id)) continue
+    const durable = durableById.get(entry.run.task_id)
+    if (!durable) {
+      hard.push([
+        "B2D-DURABLE-003",
+        `admitted progress Task ID ${entry.run.task_id} has no durable row`,
+      ])
+      continue
+    }
+    const routeTask = routing.tasks.find(
+      (task) => task.index === entry.task.index
+    )
+    const recognized = recognizedTaskKey(entry.run.work_unit_key)
+    if (
+      !recognized ||
+      recognized.taskIndex !== entry.task.index ||
+      recognized.role !== entry.run.role ||
+      recognized.agentType !== entry.run.agent_type ||
+      recognized.agentType !== durable.agent_type ||
+      !nullableEqual(recognized.profileId, entry.run.profile_id)
+    ) {
+      hard.push([
+        "B2D-DURABLE-005",
+        `Task ${entry.task.index} work-unit key disagrees with Plan/progress/durable identity`,
+      ])
+    }
+    if (durable.orchestration_binding === null && recognized) {
+      hard.push([
+        "B2D-DURABLE-007",
+        `recognized routed row ${durable.task_id} is unbound`,
+      ])
+    }
+    if (
+      durable.orchestration_binding &&
+      routeTask?.orchestration_binding &&
+      (durable.orchestration_binding.generation !==
+        routeTask.orchestration_binding.generation ||
+        durable.orchestration_binding.route_fingerprint !==
+          routeTask.orchestration_binding.route_fingerprint ||
+        durable.orchestration_binding.namespace !==
+          routeTask.orchestration_binding.namespace)
+    ) {
+      hard.push([
+        "B2D-DURABLE-006",
+        `durable binding for ${durable.task_id} disagrees with the derived Task binding`,
+      ])
+    }
+    if (
+      !bindingEquals(
+        durable.orchestration_binding,
+        entry.run.orchestration_binding
+      )
+    ) {
+      hard.push([
+        "B2D-DURABLE-006",
+        `durable binding for ${durable.task_id} disagrees with the progress mirror`,
+      ])
+    }
+    const identityOk = identityAgrees(entry.run, durable)
+    const statusOk = statusAgrees(entry.run.state, durable.status)
+    if (!identityOk) {
+      hard.push([
+        "B2D-DURABLE-005",
+        `Task ${entry.task.index} identity or lineage disagrees for ${entry.run.task_id}`,
+      ])
+    } else if (!statusOk) {
+      if (statusRefreshable(entry.run.state, durable.status)) {
+        refresh.push([
+          "B2D-DURABLE-005",
+          `status-only refresh required: ${entry.run.task_id} ${entry.run.state} ${durable.status}`,
+        ])
+      } else {
+        hard.push([
+          "B2D-DURABLE-005",
+          `Task ${entry.task.index} status disagrees for ${entry.run.task_id}`,
+        ])
+      }
+    }
+  }
+
+  for (const run of evidence.runs) {
+    const recognized = recognizedTaskKey(run.work_unit_key)
+    const requested = requestedNamespaceRow(run)
+    if (recognized || requested) {
+      const mirror = progressById.get(run.task_id)
+      if (recognized && run.orchestration_binding === null) {
+        hard.push([
+          "B2D-DURABLE-007",
+          `recognized routed row ${run.task_id} is unbound`,
+        ])
+      }
+      if (
+        recognized &&
+        !routing.tasks.some((task) => task.index === recognized.taskIndex)
+      ) {
+        hard.push([
+          "B2D-DURABLE-004",
+          `recognized durable row ${run.task_id} is outside the Plan`,
+        ])
+      }
+      if (
+        recognized &&
+        run.orchestration_binding &&
+        run.orchestration_binding.namespace !== ROUTE_BINDING_NAMESPACE
+      ) {
+        hard.push([
+          "B2D-DURABLE-004",
+          `recognized durable row ${run.task_id} uses a foreign namespace`,
+        ])
+      }
+      if (!mirror) {
+        hard.push([
+          "B2D-DURABLE-004",
+          `bound or recognized durable row ${run.task_id} is missing from progress`,
+        ])
+      }
+    }
+  }
+
+  const uniqueHard = []
+  const seenHard = new Set()
+  for (const [rule, message] of hard) {
+    const key = `${rule}:${message}`
+    if (seenHard.has(key)) continue
+    seenHard.add(key)
+    uniqueHard.push([rule, message])
+  }
+  if (uniqueHard.length > 0) {
+    for (const [rule, message] of uniqueHard) fail(failures, rule, message)
+    return { failures, actions }
+  }
+  for (const [rule, message] of refresh) fail(failures, rule, message)
+  return { failures, actions }
+}
+
+function structuredFailures(failures) {
+  return failures.map((failure) => {
+    const text = String(failure)
+    const match = text.match(/^\[([^\]]+)\]\s*(.*)$/s)
+    return {
+      rule_id: match?.[1] ?? "B2D-VALIDATION-001",
+      message: match?.[2] ?? text,
+    }
+  })
+}
+
+function bindingFailure(failures, ruleId, message) {
+  fail(failures, ruleId, message)
+}
+
+function validateStaticBindingAgreement(snapshot, routing, failures) {
+  if (!isObject(snapshot) || !routing) return
+  const progressByIndex = new Map(
+    Array.isArray(snapshot.tasks)
+      ? snapshot.tasks
+          .filter((task) => isObject(task) && positiveInteger(task.index))
+          .map((task) => [task.index, task])
+      : []
+  )
+  for (const routeTask of routing.tasks) {
+    const progressTask = progressByIndex.get(routeTask.index)
+    const expectedBinding = routeTask.orchestration_binding
+    if (!progressTask) {
+      bindingFailure(
+        failures,
+        "B2D-BINDING-001",
+        `Task ${routeTask.index} is missing from static progress`
+      )
+      continue
+    }
+    if (progressTask.route_fingerprint !== expectedBinding?.route_fingerprint) {
+      bindingFailure(
+        failures,
+        "B2D-BINDING-001",
+        `Task ${routeTask.index} route_fingerprint disagrees with the derived binding`
+      )
+    }
+    if (progressTask.orchestration_binding !== undefined) {
+      const parsed = parseOrchestrationBinding(
+        progressTask.orchestration_binding
+      )
+      if (
+        !parsed.valid ||
+        !skillContractsEqual(parsed.binding, expectedBinding)
+      ) {
+        bindingFailure(
+          failures,
+          "B2D-BINDING-002",
+          `Task ${routeTask.index} orchestration_binding disagrees with the derived binding`
+        )
+      }
+    }
+    if (!Array.isArray(progressTask.runs)) continue
+    for (const [runIndex, run] of progressTask.runs.entries()) {
+      if (!isObject(run)) continue
+      const parsed = parseOrchestrationBinding(run.orchestration_binding)
+      if (
+        !parsed.valid ||
+        !skillContractsEqual(parsed.binding, expectedBinding)
+      ) {
+        bindingFailure(
+          failures,
+          "B2D-BINDING-003",
+          `Task ${routeTask.index} run ${runIndex + 1} orchestration_binding disagrees with the derived binding`
+        )
+      }
+    }
+  }
+}
+
+function validationEnvelope(failures, taskBindings = [], extras = {}) {
+  const actions = extras.reconciliation_actions ?? []
+  const failed = failures.length > 0
+  const adopting = !failed && actions.length > 0
+  return {
+    schema_version: 1,
+    admission_authorized:
+      extras.admission_authorized === true && !failed && !adopting,
+    durable_snapshot: failed ? null : (extras.durable_snapshot ?? null),
+    task_bindings: failed || adopting ? [] : taskBindings,
+    reconciliation_actions: failed ? [] : actions,
+    failures: structuredFailures(failures),
+  }
+}
+
+function parseEvidenceOption(raw, now) {
+  if (raw === undefined || raw === null) {
+    return {
+      pages: [],
+      runs: [],
+      snapshot: null,
+      failures: ["[B2D-CLI-001] durable evidence is required"],
+    }
+  }
+  return parseDurableBindingEvidence(raw, { now })
+}
+
+function documentAdmissionBlocks(runs) {
+  return runs.some((run) => {
+    const recognized = recognizedTaskKey(run.work_unit_key)
+    return requestedNamespaceRow(run) || recognized
+  })
+}
+
+/**
+ * Pure validator entry point for Skill-only, Plan-only derivation, static
+ * Plan/progress agreement, document admission, and full durable admission.
+ */
+export function runValidation(options = {}) {
+  const failures = []
+  const skillMarkdown = String(options.skillMarkdown ?? "")
+  const planMarkdown = options.planMarkdown
+  const progressMarkdown = options.progressMarkdown
+  const hasPlan = planMarkdown !== undefined && planMarkdown !== null
+  const hasProgress =
+    progressMarkdown !== undefined && progressMarkdown !== null
+  const derivePlanRouting =
+    options.derivePlanRouting === true || options.mode === "plan"
+  const outputJson = options.outputJson === true
+  const documentAdmission =
+    options.documentAdmission === true || options.mode === "document"
+  const admission = options.admission === true || options.mode === "admission"
+  const hasEvidence =
+    options.durableEvidence !== undefined && options.durableEvidence !== null
+
+  const skill = validateSkillMarkdown(skillMarkdown)
+  failures.push(...skill.failures)
+
+  if (documentAdmission) {
+    if (hasPlan || hasProgress || derivePlanRouting || admission) {
+      fail(
+        failures,
+        "B2D-CLI-001",
+        "document admission cannot include Plan, progress, or derive flags"
+      )
+    }
+    if (!hasEvidence || !outputJson) {
+      fail(
+        failures,
+        "B2D-CLI-001",
+        "document admission requires --durable-evidence and --output-json"
+      )
+    }
+    const evidence = parseEvidenceOption(options.durableEvidence, options.now)
+    failures.push(...evidence.failures)
+    if (failures.length > 0) return validationEnvelope(failures)
+    if (documentAdmissionBlocks(evidence.runs)) {
+      fail(
+        failures,
+        "B2D-DURABLE-004",
+        "document admission requires a snapshot with no requested-namespace or recognized Task-key row"
+      )
+      return validationEnvelope(failures)
+    }
+    return validationEnvelope([], [], {
+      admission_authorized: true,
+      durable_snapshot: evidence.snapshot,
+    })
+  }
+
+  if (!hasPlan) {
+    if (
+      hasProgress ||
+      derivePlanRouting ||
+      outputJson ||
+      options.planRelPath ||
+      admission ||
+      hasEvidence
+    ) {
+      fail(
+        failures,
+        "B2D-CLI-001",
+        "Plan, progress, and derivation flags require an explicit Plan mode"
+      )
+    }
+    return validationEnvelope(failures)
+  }
+
+  if (
+    typeof options.planRelPath !== "string" ||
+    options.planRelPath.length === 0
+  ) {
+    fail(failures, "B2D-CLI-001", "Plan mode requires --plan-rel-path")
+  }
+  if (derivePlanRouting && (hasProgress || hasEvidence || admission)) {
+    fail(
+      failures,
+      "B2D-CLI-001",
+      "Plan-only derivation cannot include progress, admission, or durable evidence"
+    )
+  }
+  if (derivePlanRouting && !outputJson) {
+    fail(failures, "B2D-CLI-001", "Plan-only derivation requires --output-json")
+  }
+  if (admission) {
+    if (!hasProgress || !hasEvidence || !outputJson || derivePlanRouting) {
+      fail(
+        failures,
+        "B2D-CLI-001",
+        "full admission requires Plan, progress, --plan-rel-path, --durable-evidence, and --output-json"
+      )
+    }
+  } else if (hasEvidence) {
+    fail(
+      failures,
+      "B2D-CLI-001",
+      "durable evidence requires --admission or --document-admission"
+    )
+  }
+  if (!derivePlanRouting && !hasProgress) {
+    fail(
+      failures,
+      "B2D-CLI-001",
+      "Static Plan validation requires a progress document"
+    )
+  }
+
+  if (hasProgress) {
+    const documents = validateSimpleDocuments({
+      skillMarkdown,
+      planMarkdown: String(planMarkdown),
+      progressMarkdown: String(progressMarkdown),
+      planRelPath: options.planRelPath,
+      allowRouteChangeTransition: !admission,
+    })
+    failures.push(...documents.failures)
+    const bindingRouting =
+      documents.routeChange?.kind === "transition" &&
+      !admission &&
+      documents.routeChange.reconstructed
+        ? documents.routeChange.reconstructed
+        : documents.routing
+    if (bindingRouting && documents.progress.snapshot) {
+      validateStaticBindingAgreement(
+        documents.progress.snapshot,
+        bindingRouting,
+        failures
+      )
+    }
+    if (admission) {
+      const evidence = parseEvidenceOption(options.durableEvidence, options.now)
+      failures.push(...evidence.failures)
+      if (
+        failures.length > 0 ||
+        !documents.routing ||
+        !documents.progress.snapshot
+      ) {
+        return validationEnvelope(failures)
+      }
+      const reconciled = reconcileDurableBindings({
+        evidence,
+        routing: documents.routing,
+        progressSnapshot: documents.progress.snapshot,
+        routeChange: documents.routeChange,
+      })
+      failures.push(...reconciled.failures)
+      if (reconciled.actions.length > 0 && failures.length === 0) {
+        return validationEnvelope([], [], {
+          admission_authorized: false,
+          durable_snapshot: evidence.snapshot,
+          reconciliation_actions: reconciled.actions,
+        })
+      }
+      if (failures.length > 0) return validationEnvelope(failures)
+      const taskBindings = deriveTaskBindings(documents.routing, failures)
+      if (failures.length > 0) return validationEnvelope(failures)
+      return validationEnvelope(failures, taskBindings, {
+        admission_authorized: true,
+        durable_snapshot: evidence.snapshot,
+      })
+    }
+    if (failures.length === 0 && documents.routing) {
+      const taskBindings = deriveTaskBindings(documents.routing, failures)
+      return validationEnvelope(failures, taskBindings)
+    }
+    return validationEnvelope(failures)
+  }
+
+  const plan = parseSimplePlan(String(planMarkdown))
+  const routingFailures = []
+  if (
+    !plan.routing &&
+    !plan.failures.some((failure) => failure.startsWith("[B2D-ROUTING-"))
+  ) {
+    fail(
+      routingFailures,
+      "B2D-ROUTING-001",
+      "authoritative document validation requires exactly one routing block"
+    )
+  }
+  const routing = plan.routing
+    ? validateRoutingSnapshot(plan.routing, plan, routingFailures)
+    : null
+  failures.push(...plan.failures, ...routingFailures)
+  if (failures.length > 0 || !routing) return validationEnvelope(failures)
+  const taskBindings = deriveTaskBindings(routing, failures)
+  return validationEnvelope(failures, taskBindings)
 }

@@ -37,6 +37,7 @@ pub mod remote_registry;
 pub mod session_attach;
 pub mod session_info;
 pub mod session_state;
+pub mod shared_session;
 pub mod stderr_tail;
 pub mod streaming_performance;
 pub mod terminal_adapter;

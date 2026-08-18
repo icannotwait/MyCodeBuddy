@@ -3854,11 +3854,17 @@ mod tests {
                 std::fs::write(&plan_path, b"# Plan\n\nInitial.\n").unwrap();
             }
 
-            let db = Arc::new(if install_v2_only_triggers {
+            let db = if install_v2_only_triggers {
                 fresh_in_memory_db().await
             } else {
                 crate::db::test_helpers::historical_completion_protocol_db_before_v2_only().await
-            });
+            };
+            if !install_v2_only_triggers {
+                crate::db::migration::install_for_historical_completion_fixture(&db)
+                    .await
+                    .expect("install orchestration binding migration for historical fixture");
+            }
+            let db = Arc::new(db);
             let folder = seed_folder(&db, workspace_path.to_str().unwrap()).await;
             let parent = seed_conversation(&db, folder, AgentType::Codex).await;
             let child = seed_conversation(&db, folder, AgentType::Codex).await;
@@ -3892,6 +3898,7 @@ mod tests {
             let runs = RunStore::new(db.clone());
             super::super::with_historical_workflow_fixture_mutations(runs.admit_gen1_reserving(
                 ReservingRunInsert {
+                    orchestration_binding: None,
                     task_id: task_id.clone(),
                     root_task_id: task_id.clone(),
                     previous_task_id: None,
@@ -4260,6 +4267,8 @@ mod tests {
                     task_preview: "must be fenced".into(),
                     request_fingerprint: format!("continue-fp-{}", fixture.task_id),
                     work_unit_key: None,
+                    supplied_orchestration_binding: None,
+                    effective_orchestration_binding: None,
                 }),
             )
             .await
@@ -4270,6 +4279,7 @@ mod tests {
             let replacement_task_id = format!("{}-replacement", fixture.task_id);
             let replacement_error = super::super::with_historical_workflow_fixture_mutations(
                 runs.admit_gen1_reserving(ReservingRunInsert {
+                    orchestration_binding: None,
                     task_id: replacement_task_id.clone(),
                     root_task_id: replacement_task_id.clone(),
                     previous_task_id: None,

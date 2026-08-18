@@ -1,0 +1,1132 @@
+# Review package: 94ba94f92b914b1dec4b5eb7833146bea28d1c33..e72a5f8345d238ad30ed4f7d966c18a9c868bc17
+
+## Commits
+e72a5f83 fix(skill): bind task routing relation scopes
+
+## Files changed
+ .../scripts/validate-contract.lib.mjs              | 401 +++++++++++++++++----
+ .../scripts/validate-contract.test.mjs             | 254 +++++++++++++
+ 2 files changed, 593 insertions(+), 62 deletions(-)
+
+## Diff
+diff --git a/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.lib.mjs b/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.lib.mjs
+index 19a743c6..30dec55d 100644
+--- a/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.lib.mjs
++++ b/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.lib.mjs
+@@ -451,20 +451,21 @@ const DOCUMENT_PERSON_ROLE_TERMS = new Set([
+   "authors",
+   "fixer",
+   "fixers",
+   "producer",
+   "producers",
+   "reviewer",
+   "reviewers",
+ ])
+ const ANTECEDENT_PREDICATES = new Set([
+   ...PRODUCTION_ACTIONS,
++  ...ORCHESTRATION_ACTIONS,
+   "discuss",
+   "discussed",
+   "discusses",
+   "discussing",
+   "list",
+   "listed",
+   "listing",
+   "lists",
+ ])
+ const NEGATION_TERMS = new Set([
+@@ -504,46 +505,44 @@ const REVIEW_ABSENCE_TERMS = new Set([
+   "omitted",
+   "omitting",
+   "without",
+ ])
+ const POSTPOSED_REVIEW_ABSENCE_TERMS = new Set([
+   "absent",
+   "lacking",
+   "missing",
+   "omitted",
+ ])
+-const POSTPOSED_REVIEW_SUBJECT_MODIFIERS = new Set([
+-  "a",
+-  "an",
+-  "agent",
+-  "are",
+-  "auxiliary",
+-  "be",
+-  "been",
+-  "being",
+-  "is",
+-  "primary",
+-  "remain",
+-  "remains",
+-  "review",
+-  "reviewer",
+-  "reviewers",
+-  "role",
+-  "slot",
+-  "the",
+-  "was",
+-  "were",
++const ACTOR_LINKS = new Set(["by", "to"])
++const NESTED_ACTOR_PREFIX_LINKS = new Set([
++  "after",
++  "before",
++  "for",
++  "from",
++  "of",
++  "through",
++  "with",
++])
++const ACTOR_RELATION_BOUNDARIES = new Set([
++  "after",
++  "before",
++  "during",
++  "if",
++  "once",
++  "unless",
++  "upon",
+   "when",
++  "while",
+ ])
+-const ACTOR_LINKS = new Set(["by", "to"])
+ const CLAUSE_COORDINATORS = new Set(["and", "but", "while", "yet"])
+ const PREDICATE_COORDINATORS = new Set(["and", "but"])
++const ALTERNATIVE_RESET_COORDINATORS = new Set(["but", "yet"])
+ const TASK_RELATION_BOUNDARIES = new Set([...CLAUSE_COORDINATORS, "or"])
+ const HIGH_TASK_SCOPES = new Set(["high", "high-risk"])
+ const NORMAL_TASK_SCOPES = new Set(["normal"])
+ const UNIVERSAL_TASK_SCOPES = new Set([
+   "all",
+   "always",
+   "each",
+   "every",
+   "unconditionally",
+ ])
+@@ -555,30 +554,70 @@ const EXPLICIT_TASK_ACTIVITY_TERMS = new Set([
+ const TASK_COMPLETION_TERMS = new Set([
+   "complete",
+   "completed",
+   "completes",
+   "completion",
+   "done",
+   "finish",
+   "finished",
+   "finishes",
+ ])
++const TASK_COMPLETION_BRIDGE_TERMS = new Set([
++  "already",
++  "be",
++  "been",
++  "being",
++  "can",
++  "could",
++  "had",
++  "has",
++  "have",
++  "is",
++  "may",
++  "might",
++  "must",
++  "now",
++  "was",
++  "were",
++  "will",
++  "would",
++])
+ const ACTIVE_TIMING_MARKERS = new Set(["during", "inside", "while"])
+ const BOUNDARY_TIMING_MARKERS = new Set([
+   "after",
+   "following",
+   "on",
+   "once",
+   "upon",
+   "when",
+ ])
+ const PRE_COMPLETION_TIMING_MARKERS = new Set(["before", "prior"])
++const TASK_REFERENCE_BOUNDARIES = new Set([
++  ...CLAUSE_COORDINATORS,
++  ...ACTIVE_TIMING_MARKERS,
++  ...BOUNDARY_TIMING_MARKERS,
++  ...PRE_COMPLETION_TIMING_MARKERS,
++  "for",
++  "from",
++  "of",
++  "through",
++  "to",
++  "until",
++  "with",
++])
++const REVIEW_SUBJECT_BOUNDARIES = new Set([
++  ...CLAUSE_COORDINATORS,
++  ...BOUNDARY_TIMING_MARKERS,
++  ...PRE_COMPLETION_TIMING_MARKERS,
++  "if",
++  "unless",
++])
+ const REVIEW_BYPASS_ACTIONS = new Set([
+   "instead",
+   "omit",
+   "omits",
+   "omitted",
+   "omitting",
+   "optional",
+   "optionally",
+   "place",
+   "replace",
+@@ -608,20 +647,40 @@ const REVIEW_REPLACEMENT_ACTIONS = new Set([
+   "standing",
+   "stands",
+   "stood",
+   "substitute",
+   "substituted",
+   "substitutes",
+   "substituting",
+ ])
+ const REVIEW_TAKE_ACTIONS = new Set(["take", "takes", "taking", "took"])
+ const REVIEW_REQUIREMENT_ACTIONS = new Set(["mandatory", "required"])
++const REVIEW_EXHAUSTIVE_QUANTIFIERS = new Set([
++  "alone",
++  "exclusively",
++  "only",
++  "solely",
++])
++const REVIEW_ACTOR_TAIL_TERMS = new Set([
++  "a",
++  "agent",
++  "an",
++  "auxiliary",
++  "primary",
++  "review",
++  "reviewer",
++  "reviewers",
++  "role",
++  "slot",
++  "the",
++])
++const QUANTIFIER_COMPLEMENT_LINKS = new Set(["about", "for", "on", "regarding"])
+ const REVIEW_SUBJECT_LINKS = new Set([
+   "although",
+   "am",
+   "are",
+   "be",
+   "been",
+   "being",
+   "is",
+   "remain",
+   "remains",
+@@ -1191,39 +1250,60 @@ function mentionsPluralGroup(tokens, mentions) {
+       new Set(["and", "or"]),
+       mentions[0].end,
+       mentions.at(-1).start
+     ) >= 0
+   )
+ }
+ 
+ function directivePronounAntecedent(tokens) {
+   const documents = directiveDocumentTargets(tokens)
+   const people = directivePeopleAntecedents(tokens)
+-  const predicate = tokenIndexes(tokens, ANTECEDENT_PREDICATES).at(-1)
++  const actors = directiveActors(tokens)
++  const predicate = tokenIndexes(tokens, ANTECEDENT_PREDICATES)
++    .filter(
++      (index) =>
++        !actors.some((actor) => actor.start <= index && index < actor.end)
++    )
++    .at(-1)
+   const documentMentions = documents.map((target) => ({
+     start: target.index,
+     end: target.index + 1,
+     plural: PLURAL_DOCUMENT_TARGETS.has(target.token),
+   }))
+   const documentObjects =
+     predicate === undefined
+       ? documentMentions
+       : documentMentions.filter((target) => target.start > predicate)
+   const peopleSubjects =
+     predicate === undefined
+       ? people
+       : people.filter((person) => person.end <= predicate)
++  const peopleRecipients =
++    predicate === undefined
++      ? []
++      : people.filter(
++          (person) =>
++            person.start > predicate &&
++            tokenIndex(
++              tokens,
++              new Set(["by", "to"]),
++              predicate + 1,
++              person.start
++            ) >= 0
++        )
+ 
+   const pluralDocuments = mentionsPluralGroup(tokens, documentObjects)
+-  const pluralPeople = mentionsPluralGroup(tokens, peopleSubjects)
+-  if (pluralDocuments) return "document"
++  const pluralPeople =
++    mentionsPluralGroup(tokens, peopleSubjects) ||
++    mentionsPluralGroup(tokens, peopleRecipients)
+   if (pluralPeople) return "people"
++  if (pluralDocuments) return "document"
+   return null
+ }
+ 
+ function directiveReviewers(tokens) {
+   const reviewers = []
+   for (const index of tokenIndexes(tokens, REVIEW_TERMS)) {
+     const start = Math.max(0, index - 4)
+     const prefix = tokens.slice(start, index + 1)
+     const userNamed =
+       prefix.includes("user-named") ||
+@@ -1422,85 +1502,144 @@ function nearestActionBefore(clause, index) {
+ function actorRelationPrefixIsValid(prefix) {
+   return (
+     prefix.length <= 6 &&
+     !prefix.some(
+       (token) =>
+         CLAUSE_COORDINATORS.has(token) ||
+         ACTOR_LINKS.has(token) ||
+         PRODUCTION_ACTIONS.has(token) ||
+         DIRECT_ROUTE_ACTIONS.has(token) ||
+         REVIEW_TERMS.has(token) ||
++        NESTED_ACTOR_PREFIX_LINKS.has(token) ||
+         ["task", "tasks"].includes(token)
+     )
+   )
+ }
+ 
+ function actorsAfterLink(clause, link, end = clause.tokens.length) {
+   const nextLink = tokenIndex(clause.tokens, ACTOR_LINKS, link + 1, end)
+-  const relationEnd = nextLink >= 0 ? nextLink : end
++  let relationEnd = nextLink >= 0 ? nextLink : end
++  const boundary = tokenIndex(
++    clause.tokens,
++    ACTOR_RELATION_BOUNDARIES,
++    link + 1,
++    relationEnd
++  )
++  if (boundary >= 0) relationEnd = boundary
+   const actors = clause.actors.filter(
+     (actor) => actor.start > link && actor.end <= relationEnd
+   )
+   if (actors.length === 0) return []
+   const prefix = clause.tokens.slice(link + 1, actors[0].start)
+   if (!actorRelationPrefixIsValid(prefix)) return []
+   return actors
+ }
+ 
+ function alternativeExclusionStart(clause, action, end) {
+   const starts = [
+     phraseIndex(clause.tokens, ["rather", "than"], action.index + 1, end),
+     phraseIndex(clause.tokens, ["instead", "of"], action.index + 1, end),
+   ].filter((index) => index >= 0)
+   return starts.length > 0 ? Math.min(...starts) : -1
+ }
+ 
++function positionIsExcludedAlternative(clause, alternativeStart, position) {
++  if (alternativeStart < 0 || position <= alternativeStart) return false
++  return (
++    tokenIndex(
++      clause.tokens,
++      ALTERNATIVE_RESET_COORDINATORS,
++      alternativeStart + 2,
++      position
++    ) < 0
++  )
++}
++
++function actionIsExcludedAlternative(clause, action) {
++  const previous = clause.actions
++    .filter((candidate) => candidate.index < action.index)
++    .at(-1)
++  const start = (previous?.index ?? -1) + 1
++  const starts = [
++    phraseIndex(clause.tokens, ["rather", "than"], start, action.index + 1),
++    phraseIndex(clause.tokens, ["instead", "of"], start, action.index + 1),
++  ].filter((index) => index >= 0)
++  if (starts.length === 0) return false
++  return positionIsExcludedAlternative(
++    clause,
++    Math.max(...starts),
++    action.index
++  )
++}
++
+ function actorBindingsAfterLink(clause, action, link, end) {
+   const actors = actorsAfterLink(clause, link, end)
+   const relationNegated = relationTargetIsNegated(clause, action, link)
+   const alternativeStart = alternativeExclusionStart(clause, action, end)
+   return actors.map((actor, index) => {
+     const localStart = index === 0 ? link + 1 : actors[index - 1].end
+     const coordinator = tokenIndexes(
+       clause.tokens,
+       CLAUSE_COORDINATORS,
+       localStart,
+       actor.start
+     ).at(-1)
+     const negationStart = (coordinator ?? localStart - 1) + 1
+     const explicitlyNegated =
+       tokenIndex(clause.tokens, NEGATION_TERMS, negationStart, actor.start) >= 0
+-    const excludedAlternative =
+-      alternativeStart >= 0 && actor.start > alternativeStart
++    const excludedAlternative = positionIsExcludedAlternative(
++      clause,
++      alternativeStart,
++      actor.start
++    )
+     return {
+       actor,
+       negated:
+         explicitlyNegated ||
+         excludedAlternative ||
+         (coordinator !== undefined && clause.tokens[coordinator] === "but"
+           ? false
+           : relationNegated),
+     }
+   })
+ }
+ 
+ function directPassiveActorsForAction(clause, action) {
+   const nextAction = clause.actions.find(
+     (candidate) => candidate.index > action.index
+   )
+   const actors = []
+-  for (const link of tokenIndexes(
++  const links = tokenIndexes(
+     clause.tokens,
+     new Set(["by"]),
+     action.index + 1,
+     nextAction?.index ?? clause.tokens.length
+-  )) {
++  )
++  for (const [linkIndex, link] of links.entries()) {
++    if (linkIndex > 0) {
++      const previousLink = links[linkIndex - 1]
++      const previousActor = clause.actors
++        .filter((actor) => actor.start > previousLink && actor.end <= link)
++        .at(-1)
++      const relationStart = previousActor?.end ?? previousLink + 1
++      const continuesRelation =
++        tokenIndex(
++          clause.tokens,
++          new Set(["and", "but", "or", "yet"]),
++          relationStart,
++          link
++        ) >= 0 ||
++        phraseIndex(clause.tokens, ["rather", "than"], relationStart, link) >=
++          0 ||
++        phraseIndex(clause.tokens, ["instead", "of"], relationStart, link) >= 0
++      if (!continuesRelation) continue
++    }
+     actors.push(
+       ...actorBindingsAfterLink(
+         clause,
+         action,
+         link,
+         nextAction?.index ?? clause.tokens.length
+       )
+         .filter((binding) => !binding.negated)
+         .map((binding) => binding.actor)
+     )
+@@ -2081,23 +2220,47 @@ function reviewerRoleIsExplicitlyAbsent(clause, action, role) {
+       ) {
+         return true
+       }
+       return tokenIndexes(
+         clause.tokens,
+         POSTPOSED_REVIEW_ABSENCE_TERMS,
+         actor.end,
+         Math.min(relationEnd, actor.end + 6)
+       ).some((absence) => {
+         if (actionIsNegated(clause.tokens, absence)) return false
+-        return clause.tokens
+-          .slice(actor.end, absence)
+-          .every((token) => POSTPOSED_REVIEW_SUBJECT_MODIFIERS.has(token))
++        const subjectLink = tokenIndex(
++          clause.tokens,
++          REVIEW_SUBJECT_LINKS,
++          actor.end,
++          absence
++        )
++        if (subjectLink < 0) return false
++        if (
++          tokenIndex(
++            clause.tokens,
++            REVIEW_SUBJECT_BOUNDARIES,
++            actor.end,
++            subjectLink
++          ) >= 0
++        ) {
++          return false
++        }
++        if (
++          tokenIndex(clause.tokens, CLAUSE_COORDINATORS, actor.end, absence) >=
++          0
++        ) {
++          return false
++        }
++        return !clause.actors.some(
++          (candidate) =>
++            candidate.start >= actor.end && candidate.end <= absence
++        )
+       })
+     })
+ }
+ 
+ function reviewerSetIsExplicitlyEmpty(clause, action) {
+   const segment = actionSegment(clause, action.index)
+   const absence = tokenIndexes(
+     clause.tokens,
+     REVIEW_ABSENCE_TERMS,
+     Math.max(segment.start, action.index - 5),
+@@ -2143,46 +2306,58 @@ function explicitReviewerCardinality(clause, action) {
+   const start = Math.max(
+     actionSegment(clause, action.index).start,
+     action.index - 6
+   )
+   const extraMarkers = tokenIndexes(
+     clause.tokens,
+     new Set(["additional", "another", "extra", "further", "surplus"]),
+     start,
+     action.index
+   )
+-  const markerQualifiesExpectedRole = (marker) =>
+-    tokenIndex(
+-      clause.tokens,
+-      new Set(["primary", "auxiliary"]),
+-      marker + 1,
+-      action.index
+-    ) >= 0 &&
+-    clause.actors.some(
+-      (actor) => actor.start > marker && actor.end <= action.index
++  const markerIntroducesComplementarySlot = (marker) => {
++    const slots = ["primary", "auxiliary"].filter(
++      (slot) =>
++        tokenIndex(clause.tokens, new Set([slot]), marker + 1, action.index) >=
++        0
+     )
++    if (
++      slots.length !== 1 ||
++      !clause.actors.some(
++        (actor) => actor.start > marker && actor.end <= action.index
++      )
++    ) {
++      return false
++    }
++    const slot = slots[0]
++    return clause.reviewers.some(
++      (reviewer) =>
++        reviewer.index !== action.index &&
++        ((slot === "primary" && reviewer.auxiliary) ||
++          (slot === "auxiliary" && reviewer.primary))
++    )
++  }
+   const countBeforeMore = tokenIndexes(
+     clause.tokens,
+     new Set([...counts.keys()]),
+     start,
+     action.index
+   ).some(
+     (count) =>
+       tokenIndex(
+         clause.tokens,
+         new Set(["more"]),
+         count + 1,
+         Math.min(action.index, count + 3)
+       ) >= 0
+   )
+   if (
+-    extraMarkers.some((marker) => !markerQualifiesExpectedRole(marker)) ||
++    extraMarkers.some((marker) => !markerIntroducesComplementarySlot(marker)) ||
+     countBeforeMore
+   ) {
+     return { extra: true, count: null, qualifiers: new Set() }
+   }
+   for (let index = action.index - 1; index >= start; index -= 1) {
+     const count = counts.get(clause.tokens[index])
+     if (count === undefined) continue
+     const qualifiers = new Set()
+     if (
+       tokenIndex(
+@@ -2235,29 +2410,64 @@ function reviewerCardinalityContradictsRoute(cardinality, normal, high) {
+       (normal && cardinality.count !== 1) || (high && cardinality.count !== 2)
+     )
+   }
+   return [...cardinality.qualifiers].some(
+     (qualifier) => cardinality.count !== expected.get(qualifier)
+   )
+ }
+ 
+ function reviewStatementIsExhaustive(clause, action) {
+   const segment = actionSegment(clause, action.index)
+-  if (
+-    tokenIndex(
++  for (const quantifier of tokenIndexes(
++    clause.tokens,
++    REVIEW_EXHAUSTIVE_QUANTIFIERS,
++    segment.start,
++    segment.end
++  )) {
++    if (
++      quantifier < action.index &&
++      clause.tokens
++        .slice(quantifier + 1, action.index)
++        .every((token) => REVIEW_ACTOR_TAIL_TERMS.has(token))
++    ) {
++      return true
++    }
++    if (ACTOR_LINKS.has(clause.tokens[quantifier + 1])) return true
++    const link = tokenIndexes(
+       clause.tokens,
+-      new Set(["alone", "only", "solely"]),
+-      segment.start,
+-      segment.end
+-    ) >= 0
+-  ) {
+-    return true
++      ACTOR_LINKS,
++      action.index + 1,
++      quantifier + 1
++    ).at(-1)
++    if (link === undefined) continue
++    const actors = actorsAfterLink(clause, link, segment.end)
++    if (
++      actors.some(
++        (actor) => actor.start > quantifier && actor.end <= segment.end
++      )
++    ) {
++      return true
++    }
++    if (QUANTIFIER_COMPLEMENT_LINKS.has(clause.tokens[quantifier + 1])) {
++      continue
++    }
++    if (
++      actors.some(
++        (actor) =>
++          actor.end <= quantifier &&
++          clause.tokens
++            .slice(actor.end, quantifier)
++            .every((token) => REVIEW_ACTOR_TAIL_TERMS.has(token))
++      )
++    ) {
++      return true
++    }
+   }
+   return (
+     ["reviewer", "reviewers"].some(
+       (reviewer) =>
+         phraseIndex(clause.tokens, ["no", "other", reviewer], action.index) >= 0
+     ) || phraseIndex(clause.tokens, ["no", "other", "agent"], action.index) >= 0
+   )
+ }
+ 
+ function actorsMatchReviewerSet(actors, expected) {
+@@ -2494,20 +2704,21 @@ function conflictsWithParentOwnership(clause) {
+       }
+       if (repeatedProducerSubjectForAction(clause, action)) continue
+       return true
+     }
+   }
+   return false
+ }
+ 
+ function conflictsWithTaskAgentRoute(clause) {
+   for (const action of clause.actions) {
++    if (actionIsExcludedAlternative(clause, action)) continue
+     const passiveSubjects = passiveActorsForAction(clause, action)
+     const scopes = actionTaskScopes(clause, action)
+     if (
+       action.kind === "review" &&
+       !reviewActionIsRoutePurpose(clause, action) &&
+       conflictsWithReviewRoute(clause, action, scopes)
+     ) {
+       return true
+     }
+     if (
+@@ -2574,23 +2785,69 @@ function conflictsWithConversationIdentity(clause) {
+ 
+ function taskStateIndexes(clause, task, states) {
+   return tokenIndexes(
+     clause.tokens,
+     states,
+     Math.max(0, task.index - 2),
+     task.index + 5
+   )
+ }
+ 
++function completionBelongsToTask(clause, task, completion) {
++  if (completion >= task.index && completion - task.index <= 4) {
++    return clause.tokens
++      .slice(task.index + 1, completion)
++      .every(
++        (token) =>
++          TASK_COMPLETION_BRIDGE_TERMS.has(token) || token.endsWith("ly")
++      )
++  }
++  if (
++    completion < task.index &&
++    task.index - completion <= 2 &&
++    clause.tokens[completion] !== "completion"
++  ) {
++    return true
++  }
++  if (clause.tokens[completion] !== "completion") return false
++  const objectLink = tokenIndex(
++    clause.tokens,
++    new Set(["of"]),
++    completion + 1,
++    task.index
++  )
++  return (
++    objectLink >= 0 &&
++    tokenIndex(
++      clause.tokens,
++      TASK_REFERENCE_BOUNDARIES,
++      objectLink + 1,
++      task.index
++    ) < 0 &&
++    tokenIndex(
++      clause.tokens,
++      new Set([
++        ...PRODUCTION_ACTIONS,
++        ...DIRECT_ROUTE_ACTIONS,
++        ...REVIEW_TERMS,
++      ]),
++      objectLink + 1,
++      task.index
++    ) < 0
++  )
++}
++
+ function taskHasCompletedState(clause, task) {
+-  return taskStateIndexes(clause, task, TASK_COMPLETION_TERMS).some(
+-    (state) => !actionIsNegated(clause.tokens, state)
++  return tokenIndexes(clause.tokens, TASK_COMPLETION_TERMS).some(
++    (state) =>
++      completionBelongsToTask(clause, task, state) &&
++      !actionIsNegated(clause.tokens, state)
+   )
+ }
+ 
+ function taskHasAffirmativeActivity(clause, task) {
+   const explicit = taskStateIndexes(clause, task, EXPLICIT_TASK_ACTIVITY_TERMS)
+   if (explicit.some((state) => !actionIsNegated(clause.tokens, state))) {
+     return true
+   }
+   return (
+     taskStateIndexes(clause, task, new Set(["current"])).length > 0 &&
+@@ -2638,33 +2895,33 @@ function timingSegmentEnd(clause, marker) {
+ function timingReferencesCompletion(clause, marker) {
+   const end = timingSegmentEnd(clause, marker)
+   return tokenIndexes(clause.tokens, TASK_COMPLETION_TERMS, marker + 1, end)
+     .filter((completion) => !actionIsNegated(clause.tokens, completion))
+     .some((completion) => {
+       if (
+         clause.tasks.some(
+           (task) =>
+             task.index > marker &&
+             task.index < end &&
+-            Math.abs(completion - task.index) <= 5
++            completionBelongsToTask(clause, task, completion)
+         )
+       ) {
+         return true
+       }
+       const hasTaskAnaphor =
+         tokenIndex(
+           clause.tokens,
+           new Set(["it", "its", "that", "this"]),
+           marker + 1,
+           Math.min(end, completion + 2)
+         ) >= 0
+-      const hasImplicitTaskSubject = completion - marker <= 2
++      const hasImplicitTaskSubject = completion === marker + 1
+       return (
+         clause.priorTasks.length > 0 &&
+         (hasTaskAnaphor || hasImplicitTaskSubject)
+       )
+     })
+ }
+ 
+ function hasCompletedTaskTiming(clause) {
+   return tokenIndexes(clause.tokens, BOUNDARY_TIMING_MARKERS).some((marker) =>
+     timingReferencesCompletion(clause, marker)
+@@ -2740,30 +2997,39 @@ function reviewerIsRequiredByContract(reviewer) {
+ function reviewAntecedentBefore(clause, index) {
+   const current = clause.reviewers.filter(
+     (reviewer) =>
+       reviewer.index < index && reviewerIsRequiredByContract(reviewer)
+   )
+   if (current.length > 0) return current.at(-1)
+   const prior = clause.priorReviewers.filter(reviewerIsRequiredByContract)
+   return prior.at(-1) ?? null
+ }
+ 
++function takeRoleObjectLink(clause, index) {
++  let cursor = index + 1
++  if (clause.tokens[cursor] === "on") cursor += 1
++  if (new Set(["a", "an", "the"]).has(clause.tokens[cursor])) cursor += 1
++  if (clause.tokens[cursor] !== "role") return -1
++  return tokenIndex(
++    clause.tokens,
++    new Set(["of"]),
++    cursor + 1,
++    Math.min(clause.tokens.length, cursor + 3)
++  )
++}
++
+ function reviewActionIsReplacement(clause, index) {
+   if (REVIEW_REPLACEMENT_ACTIONS.has(clause.tokens[index])) return true
++  if (!REVIEW_TAKE_ACTIONS.has(clause.tokens[index])) return false
+   return (
+-    REVIEW_TAKE_ACTIONS.has(clause.tokens[index]) &&
+-    tokenIndex(
+-      clause.tokens,
+-      new Set(["over"]),
+-      index + 1,
+-      Math.min(clause.tokens.length, index + 3)
+-    ) >= 0
++    clause.tokens[index + 1] === "over" ||
++    takeRoleObjectLink(clause, index) >= 0
+   )
+ }
+ 
+ function reviewBypassActionIndexes(
+   clause,
+   start = 0,
+   end = clause.tokens.length
+ ) {
+   const direct = tokenIndexes(clause.tokens, REVIEW_BYPASS_ACTIONS, start, end)
+   const takeOvers = tokenIndexes(
+@@ -2807,20 +3073,26 @@ function substitutionReviewTarget(clause, bypass) {
+       ) {
+         const replacementSubject = clause.reviewers
+           .filter((reviewer) => reviewer.index < bypass)
+           .at(-1)
+         return reviewAntecedentBefore(
+           clause,
+           replacementSubject?.index ?? bypass
+         )
+       }
+     }
++  } else if (REVIEW_TAKE_ACTIONS.has(token)) {
++    const roleObjectLink = takeRoleObjectLink(clause, bypass)
++    objectLink =
++      roleObjectLink >= 0
++        ? roleObjectLink
++        : tokenIndex(clause.tokens, new Set(["for"]), bypass + 1, bypass + 4)
+   } else if (reviewActionIsReplacement(clause, bypass)) {
+     objectLink = tokenIndex(
+       clause.tokens,
+       new Set(["for"]),
+       bypass + 1,
+       bypass + 4
+     )
+   }
+   if (objectLink < 0) return null
+   return (
+@@ -2848,20 +3120,25 @@ function reviewTargetForBypass(clause, bypass) {
+     tokenIndexes(
+       clause.tokens,
+       new Set(["reviewer", "role"]),
+       bypass + 1,
+       Math.min(segment.end, bypass + 6)
+     ).some((target) => {
+       const prefix = clause.tokens.slice(
+         Math.max(bypass + 1, target - 2),
+         target
+       )
++      if (clause.tokens[target] === "role") {
++        return new Set(["same", "that", "the", "their", "this", "its"]).has(
++          clause.tokens[target - 1]
++        )
++      }
+       return prefix.some((token) =>
+         new Set(["same", "that", "the", "their", "this", "its"]).has(token)
+       )
+     })
+   const pronounTarget =
+     replacement &&
+     (tokenIndex(
+       clause.tokens,
+       new Set(["former", "it", "them"]),
+       bypass + 1,
+diff --git a/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.test.mjs b/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.test.mjs
+index 36694883..5aeaa473 100644
+--- a/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.test.mjs
++++ b/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.test.mjs
+@@ -1928,20 +1928,274 @@ describe("Skill contract v2", () => {
+         reject: true,
+       },
+       {
+         prose:
+           "High Tasks are reviewed by Codex and the auxiliary review is missing.",
+         reject: true,
+       },
+     ])
+   })
+ 
++  it("round-12 binds passive implementers only to their governing relation", () => {
++    assertSkillClassifications([
++      {
++        prose:
++          "High Tasks are implemented by Codex after approval by the independently selected Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "Normal Tasks are implemented by following instructions from Codex.",
++        reject: false,
++      },
++      {
++        prose:
++          "High Tasks are implemented by the independently selected Task Agent.",
++        reject: true,
++      },
++      {
++        prose: "Normal Tasks are implemented by the resolved Task Agent.",
++        reject: false,
++      },
++    ])
++  })
++
++  it("round-12 binds completion timing to the Task that completes", () => {
++    assertSkillClassifications([
++      {
++        prose:
++          "The current Task is running. After review completes, change the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The current Task is running. When testing completes, change the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The current Task is running. Once validation finishes, change the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The current Task is running. After review completion, switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose: "After the active Task review completes, switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "When the running Task testing completes, change the Task Agent.",
++        reject: true,
++      },
++      {
++        prose: "After completion of the active Task, switch the Task Agent.",
++        reject: false,
++      },
++      {
++        prose: "After completion of the running Task, switch the Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "After completion of the currently active Task, switch the Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "The current Task is running. When complete, change the Task Agent.",
++        reject: false,
++      },
++    ])
++  })
++
++  it("round-12 binds replacement constructions to their reviewer object", () => {
++    assertSkillClassifications([
++      {
++        prose:
++          "Optional Design reviewers take the role of the required Codex reviewer.",
++        reject: true,
++      },
++      {
++        prose:
++          "Optional Design reviewers take on the role of the required Codex reviewer.",
++        reject: true,
++      },
++      {
++        prose: "The required Codex reviewer takes notes over time.",
++        reject: false,
++      },
++      {
++        prose:
++          "The Codex reviewer is mandatory. User-named Design reviewers replace the advisory role.",
++        reject: false,
++      },
++      {
++        prose:
++          "Optional Design reviewers take over for the required Codex reviewer.",
++        reject: true,
++      },
++      {
++        prose:
++          "The Codex reviewer is mandatory. User-named Design reviewers replace the role.",
++        reject: true,
++      },
++    ])
++  })
++
++  it("round-12 treats qualified same-slot reviewers as surplus", () => {
++    assertSkillClassifications([
++      {
++        prose: "High Tasks have another primary Codex reviewer.",
++        reject: true,
++      },
++      {
++        prose: "Normal Tasks have an additional primary Codex reviewer.",
++        reject: true,
++      },
++      {
++        prose: "Normal Tasks are reviewed by another primary Codex reviewer.",
++        reject: true,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by the primary Codex reviewer and another auxiliary Task Agent reviewer.",
++        reject: false,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by the primary Codex reviewer and yet another auxiliary Task Agent reviewer.",
++        reject: false,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by another auxiliary Task Agent reviewer and the primary Codex reviewer.",
++        reject: false,
++      },
++    ])
++  })
++
++  it("round-12 bounds alternative polarity to its contrast branch", () => {
++    assertSkillClassifications([
++      {
++        prose:
++          "High Tasks are implemented by Codex rather than by Grok, but by Gemini when Codex is unavailable.",
++        reject: true,
++      },
++      {
++        prose:
++          "High Tasks are implemented by Codex rather than by Grok but also by Gemini.",
++        reject: true,
++      },
++      {
++        prose:
++          "High Tasks are implemented by Codex rather than being implemented by Grok.",
++        reject: false,
++      },
++      {
++        prose:
++          "High Tasks are implemented by Grok rather than being implemented by Codex.",
++        reject: true,
++      },
++      {
++        prose:
++          "High Tasks are implemented by Codex rather than by Grok or by Gemini.",
++        reject: false,
++      },
++    ])
++  })
++
++  it("round-12 resolves plural pronouns by subject and recipient roles", () => {
++    assertSkillClassifications([
++      {
++        prose:
++          "The Plan Author sends the Plan and Design to the developers. The parent updates them with review findings.",
++        reject: false,
++      },
++      {
++        prose:
++          "The reviewers discuss the Plans. The parent updates them with assignments.",
++        reject: false,
++      },
++      {
++        prose:
++          "The Plan Author lists the Plan and Design. The parent updates them.",
++        reject: true,
++      },
++      {
++        prose:
++          "The Plan Author sends the Plan and Design to the developers. The parent updates the documents.",
++        reject: true,
++      },
++    ])
++  })
++
++  it("round-12 binds review exclusivity to the reviewer relation", () => {
++    assertSkillClassifications([
++      {
++        prose: "High Tasks are reviewed exclusively by Codex.",
++        reject: true,
++      },
++      {
++        prose: "High Tasks are reviewed solely by Codex.",
++        reject: true,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex for findings solely about correctness. The Task Agent provides the auxiliary review.",
++        reject: false,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex only for correctness. The Task Agent provides the auxiliary review.",
++        reject: false,
++      },
++      {
++        prose: "High Tasks are reviewed by Codex and the Task Agent alone.",
++        reject: false,
++      },
++    ])
++  })
++
++  it("round-12 binds postposed reviewer absence through its predicate", () => {
++    assertSkillClassifications([
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is definitely omitted.",
++        reject: true,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is unexpectedly missing.",
++        reject: true,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer for the high route is unexpectedly missing.",
++        reject: true,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent when evidence is missing.",
++        reject: false,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is definitely not omitted.",
++        reject: false,
++      },
++    ])
++  })
++
+   it("contains the complete operational policy and document JSON shapes", () => {
+     const policy = fencedJsonAfterHeading(
+       realSkill,
+       "### Operational policy JSON"
+     )
+     assert.deepEqual(policy.design_review_triggers, [
+       "spans_modules",
+       "migration",
+       "concurrency",
+       "security",

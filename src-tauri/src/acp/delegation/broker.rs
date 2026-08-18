@@ -91,10 +91,10 @@ use crate::acp::delegation::run_identity::{
     cold_resolve_allows, fence_allows_settlement, LiveRunRegistration, SettlementFenceDecision,
 };
 use crate::acp::delegation::run_store::{
-    derive_task_preview, launch_snapshot_from_run, request_fingerprint, Gen1AdmitOutcome,
-    PersistedRun, PromoteAttemptMeta, PromoteConflictClass, PromoteRetryClass, PromoteRunningKind,
-    PromoteRunningOutcome, RecoveryAdmissionAuthorization, ReservingRunInsert, RunStore,
-    TerminalCompletionAttentionMetric,
+    derive_task_preview, inherited_binding, launch_snapshot_from_run, request_fingerprint,
+    Gen1AdmitOutcome, PersistedRun, PromoteAttemptMeta, PromoteConflictClass, PromoteRetryClass,
+    PromoteRunningKind, PromoteRunningOutcome, RecoveryAdmissionAuthorization, ReservingRunInsert,
+    RunStore, TerminalCompletionAttentionMetric,
 };
 use crate::acp::delegation::runtime_stats::{DelegationRuntimeStats, RuntimeStatsProjector};
 use crate::acp::delegation::spawner::{ConnectionSpawner, DelegationLink};
@@ -2472,6 +2472,9 @@ fn store_err_to_delegation_error(err: TaskStoreError) -> DelegationError {
         TaskStoreError::BusyThread(m) => DelegationError::BusyThread(m),
         TaskStoreError::DuplicateParentTool(m) => DelegationError::DuplicateParentTool(m),
         TaskStoreError::InvalidReplacement(m) => DelegationError::InvalidReplacement(m),
+        TaskStoreError::OrchestrationBindingLineageMismatch => {
+            DelegationError::OrchestrationBindingLineageMismatch
+        }
         TaskStoreError::BudgetExhausted(m) => DelegationError::BudgetExhausted(m),
         TaskStoreError::RecoveryConfirmationRequired(projection) => {
             DelegationError::RecoveryConfirmationRequired(projection)
@@ -5924,6 +5927,15 @@ impl DelegationBroker {
         )
     )]
     pub async fn start_delegation(&self, mut req: DelegationRequest) -> DelegationTaskReport {
+        if let Some(binding) = req.orchestration_binding.as_ref() {
+            if let Err(message) = binding.validate() {
+                return report_err(
+                    req.agent_type,
+                    DelegationError::OrchestrationBindingInvalid(message.into()),
+                    None,
+                );
+            }
+        }
         // Whitespace-only host tool ids are treated as absent so exact
         // correlation (argument `correlation_id`) is used rather than the
         // explicit-id path. Nonblank host ids are opaque and must not be
@@ -6125,6 +6137,54 @@ impl DelegationBroker {
                 );
             }
         }
+
+        let replacement_source = match (
+            req.replaces_task_id.as_deref(),
+            self.run_store.as_ref(),
+        ) {
+            (Some(source_task_id), Some(runs)) => match runs.load_by_task_id(source_task_id).await {
+                Ok(Some(source))
+                    if source.parent_conversation_id == req.parent_conversation_id =>
+                {
+                    Some(source)
+                }
+                Ok(Some(_)) | Ok(None) => {
+                    self.drop_inflight(inflight_id).await;
+                    return report_err(
+                        req.agent_type,
+                        DelegationError::NotFound(source_task_id.into()),
+                        None,
+                    );
+                }
+                Err(error) => {
+                    self.drop_inflight(inflight_id).await;
+                    return report_err(
+                        req.agent_type,
+                        store_err_to_delegation_error(error),
+                        None,
+                    );
+                }
+            },
+            _ => None,
+        };
+        let effective_orchestration_binding = if let Some(source) = replacement_source.as_ref() {
+            match inherited_binding(
+                source.orchestration_binding.as_ref(),
+                req.orchestration_binding.as_ref(),
+            ) {
+                Ok(binding) => binding,
+                Err(error) => {
+                    self.drop_inflight(inflight_id).await;
+                    return report_err(
+                        req.agent_type,
+                        store_err_to_delegation_error(error),
+                        None,
+                    );
+                }
+            }
+        } else {
+            req.orchestration_binding.clone()
+        };
 
         if let (Some(source_task_id), Some(runs)) =
             (req.replaces_task_id.as_deref(), self.run_store.as_ref())
@@ -6356,6 +6416,7 @@ impl DelegationBroker {
             req.replacement_reason.as_deref(),
             None,
             &route_fp,
+            effective_orchestration_binding.as_ref(),
         );
 
         // Parent-tool exact-duplicate handling BEFORE reserve/spawn (design
@@ -6532,55 +6593,16 @@ impl DelegationBroker {
             }
             // Replacement: inherit lineage root from replaced run; admission_class
             // is Replacement. Otherwise normal gen-1 root.
-            let (admission_class, lineage_root_task_id, root_task_id) = if let Some(replaces) =
-                req.replaces_task_id.as_deref()
+            let (admission_class, lineage_root_task_id, root_task_id) = if let Some(source) =
+                replacement_source.as_ref()
             {
-                match runs.load_by_task_id(replaces).await {
-                    Ok(Some(src)) => (
-                        AdmissionClass::Replacement,
-                        src.lineage_root_task_id.clone(),
-                        // Replacement is a fresh generation-1 child
-                        // thread; only the lineage root is inherited.
-                        call_id.clone(),
-                    ),
-                    Ok(None) => {
-                        // Post-create / pre-admission: compensate the unused shell.
-                        if let Err(cleanup_err) = self
-                            .compensate_provisional_orphan(
-                                &runs.db().conn,
-                                child_row.id,
-                                "replacement source missing",
-                            )
-                            .await
-                        {
-                            self.drop_inflight(inflight_id).await;
-                            return report_err(req.agent_type, cleanup_err, Some(child_row.id));
-                        }
-                        self.drop_inflight(inflight_id).await;
-                        return report_err(
-                            req.agent_type,
-                            DelegationError::NotFound(replaces.to_string()),
-                            None,
-                        );
-                    }
-                    Err(e) => {
-                        // Store error after create: still compensate the orphan
-                        // child so it never remains a visible running shell.
-                        if let Err(cleanup_err) = self
-                            .compensate_provisional_orphan(
-                                &runs.db().conn,
-                                child_row.id,
-                                "replacement source load error",
-                            )
-                            .await
-                        {
-                            self.drop_inflight(inflight_id).await;
-                            return report_err(req.agent_type, cleanup_err, Some(child_row.id));
-                        }
-                        self.drop_inflight(inflight_id).await;
-                        return report_err(req.agent_type, store_err_to_delegation_error(e), None);
-                    }
-                }
+                (
+                    AdmissionClass::Replacement,
+                    source.lineage_root_task_id.clone(),
+                    // Replacement is a fresh generation-1 child
+                    // thread; only the lineage root is inherited.
+                    call_id.clone(),
+                )
             } else {
                 (
                     AdmissionClass::NormalRevision,
@@ -6589,6 +6611,11 @@ impl DelegationBroker {
                 )
             };
             let insert = ReservingRunInsert {
+                orchestration_binding: if replacement_source.is_some() {
+                    req.orchestration_binding.clone()
+                } else {
+                    effective_orchestration_binding.clone()
+                },
                 task_id: call_id.clone(),
                 root_task_id,
                 previous_task_id: None,
@@ -9152,6 +9179,16 @@ impl DelegationBroker {
         use crate::db::entities::conversation;
         use sea_orm::EntityTrait;
 
+        if let Some(binding) = req.orchestration_binding.as_ref() {
+            if let Err(message) = binding.validate() {
+                return report_err(
+                    AgentType::ClaudeCode,
+                    DelegationError::OrchestrationBindingInvalid(message.into()),
+                    None,
+                );
+            }
+        }
+
         // Whitespace-only host tool ids are treated as absent; preserve every
         // nonblank opaque id exactly (see start_delegation).
         if req.parent_tool_use_id.trim().is_empty() {
@@ -9356,6 +9393,20 @@ impl DelegationBroker {
                 );
             }
         };
+        let effective_orchestration_binding = match inherited_binding(
+            target.orchestration_binding.as_ref(),
+            req.orchestration_binding.as_ref(),
+        ) {
+            Ok(binding) => binding,
+            Err(error) => {
+                self.drop_inflight(inflight_id).await;
+                return report_err(
+                    target.agent_type,
+                    store_err_to_delegation_error(error),
+                    Some(target.child_conversation_id),
+                );
+            }
+        };
 
         if is_completion_format_repair_prompt(&req.task) {
             match runs.terminal_completion_protocol(&target.task_id).await {
@@ -9396,6 +9447,7 @@ impl DelegationBroker {
             None,
             Some(&req.target_task_id),
             &route_fp,
+            effective_orchestration_binding.as_ref(),
         );
 
         // Exact parent-tool replays are resolved before capability or
@@ -9450,6 +9502,8 @@ impl DelegationBroker {
             task_preview: derive_task_preview(&req.task),
             request_fingerprint: request_fp,
             work_unit_key: req.work_unit_key.clone(),
+            supplied_orchestration_binding: req.orchestration_binding.clone(),
+            effective_orchestration_binding,
         };
 
         // Record durable ownership under the same lock as the already-registered
@@ -16022,6 +16076,7 @@ mod tests {
                 .expect("agent type string")
                 .to_string();
             runs.insert_reserving(ReservingRunInsert {
+                orchestration_binding: None,
                 task_id: source_task_id.clone(),
                 root_task_id: source_task_id.clone(),
                 previous_task_id: None,
@@ -16115,6 +16170,7 @@ mod tests {
             );
             let runs = Arc::new(RunStore::new(db.clone()));
             runs.insert_reserving(ReservingRunInsert {
+                orchestration_binding: None,
                 task_id: source_task_id.into(),
                 root_task_id: source_task_id.into(),
                 previous_task_id: None,
@@ -16244,6 +16300,7 @@ mod tests {
                     external_handle: None,
                     correlation_id: Some("resume-correlation".into()),
                     recovery_authorization_id: Some(approved.authorization_id.clone()),
+                    orchestration_binding: None,
                 })
                 .await;
             assert_eq!(report.error_code.as_deref(), Some("unresumable"));
@@ -16473,6 +16530,7 @@ mod tests {
             );
             let runs = Arc::new(RunStore::new(db.clone()));
             runs.insert_reserving(ReservingRunInsert {
+                orchestration_binding: None,
                 task_id: source_task_id.into(),
                 root_task_id: source_task_id.into(),
                 previous_task_id: None,
@@ -16589,7 +16647,448 @@ mod tests {
             replacement_reason: None,
             correlation_id: None,
             recovery_authorization_id: None,
+            orchestration_binding: None,
         }
+    }
+
+    fn orchestration_binding_fixture() ->
+        crate::acp::delegation::types::OrchestrationBindingV1
+    {
+        crate::acp::delegation::types::OrchestrationBindingV1 {
+            schema_version: 1,
+            namespace: "brainstorm-to-delivery".into(),
+            generation: 1,
+            route_fingerprint:
+                "sha256:b498416d87bf6ba928bd7ddb5f1a451daf82300584f3d40b606c3c56f169ba7a"
+                    .into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn orchestration_binding_lineage_first_dispatch_validates_and_persists_before_spawn() {
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+
+        let invalid_mock = Arc::new(MockSpawner::new());
+        let invalid_broker = DelegationBroker::new(
+            invalid_mock.clone() as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        );
+        enable_delegation(&invalid_broker).await;
+        let mut invalid = request(1, "binding-invalid-direct");
+        let mut invalid_binding = orchestration_binding_fixture();
+        invalid_binding.namespace = "Invalid".into();
+        invalid.orchestration_binding = Some(invalid_binding);
+        let rejected = invalid_broker.start_delegation(invalid).await;
+        assert_eq!(
+            rejected.error_code.as_deref(),
+            Some("orchestration_binding_invalid")
+        );
+        assert!(invalid_mock.spawn_args.lock().await.is_empty());
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-binding-first").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("binding first parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db));
+        let mock = Arc::new(MockSpawner::new());
+        for child in ["binding-first-bound", "binding-first-unbound"] {
+            mock.queue_spawn(Ok(child.into())).await;
+            mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        }
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        let mut bound = request(parent.id, "binding-first-bound-tool");
+        bound.working_dir = Some(test_working_dir());
+        bound.orchestration_binding = Some(orchestration_binding_fixture());
+        let bound_report = broker.start_delegation(bound).await;
+        assert_eq!(bound_report.status, TaskStatus::Running, "{bound_report:?}");
+        let bound_run = runs
+            .load_by_task_id(bound_report.task_id.as_deref().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            bound_run.orchestration_binding,
+            Some(orchestration_binding_fixture())
+        );
+
+        let spawns_before_alias = mock.spawn_args.lock().await.len();
+        let mut alias = request(parent.id, "binding-first-bound-tool");
+        alias.working_dir = Some(test_working_dir());
+        let mut different_binding = orchestration_binding_fixture();
+        different_binding.namespace = "brainstorm-to-delivery-alt".into();
+        alias.orchestration_binding = Some(different_binding);
+        let alias_report = broker.start_delegation(alias).await;
+        assert_eq!(
+            alias_report.error_code.as_deref(),
+            Some("duplicate_parent_tool")
+        );
+        assert_eq!(mock.spawn_args.lock().await.len(), spawns_before_alias);
+
+        let mut unbound = request(parent.id, "binding-first-unbound-tool");
+        unbound.working_dir = Some(test_working_dir());
+        let unbound_report = broker.start_delegation(unbound).await;
+        assert_eq!(unbound_report.status, TaskStatus::Running, "{unbound_report:?}");
+        let unbound_run = runs
+            .load_by_task_id(unbound_report.task_id.as_deref().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(unbound_run.orchestration_binding, None);
+    }
+
+    #[tokio::test]
+    async fn orchestration_binding_lineage_continue_mismatch_precedes_admission_and_resume() {
+        use crate::acp::delegation::types::ContinueDelegationRequest;
+        use crate::db::entities::{conversation, delegation_task_run};
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+
+        let binding = orchestration_binding_fixture();
+        let mut changed_binding = binding.clone();
+        changed_binding.namespace = "brainstorm-to-delivery-alt".into();
+        let cases = [
+            (
+                "bound",
+                Some(binding.clone()),
+                Some(changed_binding),
+                Some(binding),
+            ),
+            (
+                "unbound",
+                None,
+                Some(orchestration_binding_fixture()),
+                None,
+            ),
+        ];
+
+        for (case, source_binding, mismatched_binding, accepted_binding) in cases {
+            let db = Arc::new(fresh_in_memory_db().await);
+            let folder = seed_folder(&db, &format!("/tmp/codeg-binding-continue-{case}")).await;
+            let parent = conversation_service::create(
+                &db.conn,
+                folder,
+                AgentType::ClaudeCode,
+                Some(format!("binding continue {case} parent")),
+                None,
+            )
+            .await
+            .expect("parent");
+            let source_task_id = format!("binding-continue-{case}-source");
+            let source_tool_id = format!("binding-continue-{case}-source-tool");
+            let work_unit_key = format!("binding-continue-{case}-unit");
+            let source_child = conversation_service::create_with_delegation(
+                &db.conn,
+                folder,
+                AgentType::ClaudeCode,
+                Some(format!("binding continue {case} source")),
+                None,
+                Some(DelegationLink {
+                    parent_conversation_id: parent.id,
+                    parent_tool_use_id: source_tool_id.clone(),
+                    delegation_call_id: source_task_id.clone(),
+                }),
+            )
+            .await
+            .expect("source child");
+            let child = conversation::Entity::find_by_id(source_child.id)
+                .one(&db.conn)
+                .await
+                .expect("load source child")
+                .expect("source child row");
+            let mut child = child.into_active_model();
+            child.external_id = Set(Some(format!("binding-continue-{case}-session")));
+            child.update(&db.conn).await.expect("set external session");
+
+            let workspace = test_working_dir();
+            let launch = build_live_launch_config(
+                AgentType::ClaudeCode,
+                None,
+                &workspace,
+                None,
+                BTreeMap::new(),
+            );
+            let runs = Arc::new(RunStore::new(db.clone()));
+            runs
+                .insert_reserving(ReservingRunInsert {
+                    orchestration_binding: source_binding.clone(),
+                    task_id: source_task_id.clone(),
+                    root_task_id: source_task_id.clone(),
+                    previous_task_id: None,
+                    generation: 1,
+                    parent_conversation_id: parent.id,
+                    parent_tool_use_id: Some(source_tool_id),
+                    child_conversation_id: source_child.id,
+                    agent_type: "claude_code".into(),
+                    profile_id: None,
+                    workspace_path: Some(launch.snapshot.workspace_path),
+                    route_fingerprint: Some(launch.snapshot.route_fingerprint),
+                    launch_snapshot_version: Some(launch.snapshot.launch_snapshot_version),
+                    mode_id: launch.snapshot.mode_id,
+                    config_values_json: Some(launch.snapshot.config_values_json),
+                    task_preview: Some(format!("binding continue {case} source")),
+                    request_fingerprint: Some(format!("binding-continue-{case}-fingerprint")),
+                    admission_class: AdmissionClass::NormalRevision,
+                    lineage_root_task_id: source_task_id.clone(),
+                    work_unit_key: Some(work_unit_key.clone()),
+                    history_only: false,
+                    replaced_task_id: None,
+                    replacement_reason: None,
+                    started_at: Some(Utc::now()),
+                })
+                .await
+                .expect("source reserve");
+            let source_connection_id = format!("binding-continue-{case}-connection");
+            runs
+                .bind_child_connection_while_reserving(&source_task_id, &source_connection_id)
+                .await
+                .expect("bind source connection");
+            runs
+                .promote_running(&source_task_id, &source_connection_id, Utc::now())
+                .await
+                .expect("promote source");
+            let source = delegation_task_run::Entity::find_by_id(&source_task_id)
+                .one(&db.conn)
+                .await
+                .expect("load source")
+                .expect("source row");
+            let mut source = source.into_active_model();
+            source.status = Set(DelegationRunStatus::Canceled);
+            source.error_code = Set(Some("parent_disconnected".into()));
+            source.termination_audit_json = Set(None);
+            source.finished_at = Set(Some(Utc::now()));
+            source.update(&db.conn).await.expect("legacy terminal source");
+
+            let authorization_id =
+                approve_continue_recovery(&db, &runs, &source_task_id).await;
+            let mock = Arc::new(MockSpawner::new());
+            let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+            let resumes_before = mock.resume_args.lock().await.len();
+            let spawns_before = mock.spawn_args.lock().await.len();
+            let mismatch_tool_id = format!("binding-continue-{case}-mismatch-tool");
+            let rejected = broker
+                .continue_delegation(ContinueDelegationRequest {
+                    parent_connection_id: "parent-conn".into(),
+                    parent_conversation_id: parent.id,
+                    parent_tool_use_id: mismatch_tool_id.clone(),
+                    target_task_id: source_task_id.clone(),
+                    task: "continue binding lineage".into(),
+                    work_unit_key: Some(work_unit_key.clone()),
+                    external_handle: None,
+                    correlation_id: Some(format!("binding-continue-{case}-mismatch")),
+                    recovery_authorization_id: Some(authorization_id.clone()),
+                    orchestration_binding: mismatched_binding,
+                })
+                .await;
+            assert_eq!(
+                rejected.error_code.as_deref(),
+                Some("orchestration_binding_lineage_mismatch"),
+                "{case}: {rejected:?}"
+            );
+            assert_eq!(mock.resume_args.lock().await.len(), resumes_before);
+            assert_eq!(mock.spawn_args.lock().await.len(), spawns_before);
+            assert!(
+                runs.load_by_parent_tool_use(parent.id, &mismatch_tool_id)
+                    .await
+                    .expect("load rejected tool id")
+                    .is_none(),
+                "{case}: lineage rejection must not create a durable run"
+            );
+
+            mock.queue_spawn(Ok(format!("binding-continue-{case}-resumed")))
+                .await;
+            mock.queue_send(Ok(accepted(source_child.id, Utc::now())))
+                .await;
+            let accepted_tool_id = format!("binding-continue-{case}-accepted-tool");
+            let accepted = broker
+                .continue_delegation(ContinueDelegationRequest {
+                    parent_connection_id: "parent-conn".into(),
+                    parent_conversation_id: parent.id,
+                    parent_tool_use_id: accepted_tool_id,
+                    target_task_id: source_task_id.clone(),
+                    task: "continue binding lineage".into(),
+                    work_unit_key: Some(work_unit_key),
+                    external_handle: None,
+                    correlation_id: Some(format!("binding-continue-{case}-accepted")),
+                    recovery_authorization_id: Some(authorization_id.clone()),
+                    orchestration_binding: accepted_binding,
+                })
+                .await;
+            assert_eq!(accepted.status, TaskStatus::Running, "{case}: {accepted:?}");
+            assert_eq!(mock.resume_args.lock().await.len(), resumes_before + 1);
+            assert_eq!(mock.spawn_args.lock().await.len(), spawns_before + 1);
+            let accepted_run = runs
+                .load_by_task_id(accepted.task_id.as_deref().expect("continued task id"))
+                .await
+                .expect("load continued run")
+                .expect("continued run");
+            assert_eq!(accepted_run.child_conversation_id, source_child.id);
+            assert_eq!(accepted_run.orchestration_binding, source_binding);
+            assert_eq!(
+                accepted_run.recovery_authorization_id.as_deref(),
+                Some(authorization_id.as_str()),
+                "{case}: rejected mismatch must leave the authorization reusable"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn orchestration_binding_lineage_replacement_mismatch_precedes_child_and_spawn() {
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-binding-replacement").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("binding replacement parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        let source_task_id = "binding-replacement-source".to_string();
+        let workspace = test_working_dir();
+        let launch = build_live_launch_config(
+            AgentType::ClaudeCode,
+            None,
+            &workspace,
+            None,
+            BTreeMap::new(),
+        );
+        let source_child = conversation_service::create_with_delegation(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("binding replacement source".into()),
+            None,
+            Some(DelegationLink {
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: "binding-replacement-source-tool".into(),
+                delegation_call_id: source_task_id.clone(),
+            }),
+        )
+        .await
+        .expect("source child");
+        runs
+            .insert_reserving(ReservingRunInsert {
+                orchestration_binding: Some(orchestration_binding_fixture()),
+                task_id: source_task_id.clone(),
+                root_task_id: source_task_id.clone(),
+                previous_task_id: None,
+                generation: 1,
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: Some("binding-replacement-source-tool".into()),
+                child_conversation_id: source_child.id,
+                agent_type: "claude_code".into(),
+                profile_id: None,
+                workspace_path: Some(launch.snapshot.workspace_path),
+                route_fingerprint: Some(launch.snapshot.route_fingerprint),
+                launch_snapshot_version: Some(launch.snapshot.launch_snapshot_version),
+                mode_id: launch.snapshot.mode_id,
+                config_values_json: Some(launch.snapshot.config_values_json),
+                task_preview: Some("binding replacement source".into()),
+                request_fingerprint: Some("binding-replacement-source-fingerprint".into()),
+                admission_class: AdmissionClass::NormalRevision,
+                lineage_root_task_id: source_task_id.clone(),
+                work_unit_key: Some("binding-replacement-unit".into()),
+                history_only: false,
+                replaced_task_id: None,
+                replacement_reason: None,
+                started_at: Some(Utc::now()),
+            })
+            .await
+            .expect("source reserve");
+        let finished_at = Utc::now();
+        runs
+            .settle_terminal(
+                &source_task_id,
+                TerminalTaskWrite::failed_with_evidence(
+                    "admission_unknown",
+                    finished_at,
+                    DelegationTerminationAuditV1::for_terminal_code(
+                        "admission_unknown",
+                        DelegationRunStatus::Reserving,
+                        true,
+                        finished_at,
+                    ),
+                ),
+            )
+            .await
+            .expect("terminal replacement source");
+        let authorization_id = approve_replacement_recovery(
+            &db,
+            &runs,
+            &source_task_id,
+            crate::acp::delegation::recovery_policy::ReplacementReason::AdmissionUnknown,
+        )
+        .await;
+        let children_before = conversation_service::list_children(&db.conn, parent.id)
+            .await
+            .unwrap()
+            .len();
+        let spawns_before = mock.spawn_args.lock().await.len();
+
+        let mut replacement = request(parent.id, "binding-replacement-mismatch-tool");
+        replacement.working_dir = Some(test_working_dir());
+        replacement.work_unit_key = Some("binding-replacement-unit".into());
+        replacement.replaces_task_id = Some(source_task_id.clone());
+        replacement.replacement_reason = Some("admission_unknown".into());
+        replacement.recovery_authorization_id = Some(authorization_id.clone());
+        let mut changed = orchestration_binding_fixture();
+        changed.namespace = "brainstorm-to-delivery-alt".into();
+        replacement.orchestration_binding = Some(changed);
+        let rejected = broker.start_delegation(replacement).await;
+        assert_eq!(
+            rejected.error_code.as_deref(),
+            Some("orchestration_binding_lineage_mismatch")
+        );
+        assert_eq!(mock.spawn_args.lock().await.len(), spawns_before);
+        assert_eq!(
+            conversation_service::list_children(&db.conn, parent.id)
+                .await
+                .unwrap()
+                .len(),
+            children_before,
+            "lineage rejection must precede provisional child allocation"
+        );
+
+        mock.queue_spawn(Ok("binding-replacement-exact".into()))
+            .await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let mut exact = request(parent.id, "binding-replacement-exact-tool");
+        exact.working_dir = Some(test_working_dir());
+        exact.work_unit_key = Some("binding-replacement-unit".into());
+        exact.replaces_task_id = Some(source_task_id);
+        exact.replacement_reason = Some("admission_unknown".into());
+        exact.recovery_authorization_id = Some(authorization_id);
+        exact.orchestration_binding = Some(orchestration_binding_fixture());
+        let accepted = broker.start_delegation(exact).await;
+        assert_eq!(accepted.status, TaskStatus::Running, "{accepted:?}");
+        let accepted_run = runs
+            .load_by_task_id(accepted.task_id.as_deref().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            accepted_run.orchestration_binding,
+            Some(orchestration_binding_fixture()),
+            "mismatch must not consume the authorization used by the exact call"
+        );
     }
 
     fn test_working_dir() -> String {
@@ -23787,6 +24286,7 @@ mod tests {
         let runs = Arc::new(RunStore::new(db.clone()));
         let task_id = "task-preboot-continue".to_string();
         runs.insert_reserving(ReservingRunInsert {
+            orchestration_binding: None,
             task_id: task_id.clone(),
             root_task_id: task_id.clone(),
             previous_task_id: Some("task-gen1".into()),
@@ -23993,6 +24493,7 @@ mod tests {
         let runs = Arc::new(RunStore::new(db.clone()));
         let task_id = "task-bind-fail-admission".to_string();
         runs.insert_reserving(ReservingRunInsert {
+            orchestration_binding: None,
             task_id: task_id.clone(),
             root_task_id: task_id.clone(),
             previous_task_id: None,
@@ -24520,6 +25021,7 @@ mod tests {
         let runs = Arc::new(RunStore::new(db.clone()));
         let task_id = "task-same-conn-running".to_string();
         runs.insert_reserving(ReservingRunInsert {
+            orchestration_binding: None,
             task_id: task_id.clone(),
             root_task_id: task_id.clone(),
             previous_task_id: None,
@@ -24829,6 +25331,7 @@ mod tests {
                     external_handle: None,
                     correlation_id: None,
                     recovery_authorization_id: None,
+                    orchestration_binding: None,
                 })
                 .await
         });
@@ -24982,6 +25485,7 @@ mod tests {
                     external_handle: None,
                     correlation_id: None,
                     recovery_authorization_id: None,
+                    orchestration_binding: None,
                 })
                 .await
         });
@@ -25087,6 +25591,7 @@ mod tests {
         let runs = Arc::new(RunStore::new(db.clone()));
         let task_id = "task-no-handoff".to_string();
         runs.insert_reserving(ReservingRunInsert {
+            orchestration_binding: None,
             task_id: task_id.clone(),
             root_task_id: task_id.clone(),
             previous_task_id: None,
@@ -25267,6 +25772,7 @@ mod tests {
                 external_handle: None,
                 correlation_id: None,
                 recovery_authorization_id: None,
+                orchestration_binding: None,
             })
             .await;
         assert_eq!(report.status, TaskStatus::Running, "{report:?}");
@@ -25670,6 +26176,7 @@ mod tests {
                         external_handle: None,
                         correlation_id: None,
                         recovery_authorization_id: None,
+                        orchestration_binding: None,
                     })
                     .await
             })
@@ -26208,6 +26715,7 @@ mod tests {
                         external_handle: None,
                         correlation_id: None,
                         recovery_authorization_id: None,
+                        orchestration_binding: None,
                     })
                     .await
             })
@@ -26713,6 +27221,7 @@ mod tests {
                         external_handle: None,
                         correlation_id: None,
                         recovery_authorization_id: None,
+                        orchestration_binding: None,
                     })
                     .await
             })
@@ -26793,6 +27302,7 @@ mod tests {
             let runs = Arc::new(RunStore::new(db.clone()));
             let task_id = format!("task-finalizer-{code}");
             runs.insert_reserving(ReservingRunInsert {
+                orchestration_binding: None,
                 task_id: task_id.clone(),
                 root_task_id: task_id.clone(),
                 previous_task_id: None,
@@ -27114,6 +27624,7 @@ mod tests {
                 external_handle: None,
                 correlation_id: None,
                 recovery_authorization_id: None,
+                orchestration_binding: None,
             })
             .await;
         assert_eq!(cont.status, TaskStatus::Running, "{cont:?}");
@@ -27287,6 +27798,7 @@ mod tests {
                 external_handle: None,
                 correlation_id: None,
                 recovery_authorization_id: None,
+                orchestration_binding: None,
             })
             .await;
         assert_eq!(cont.status, TaskStatus::Running, "{cont:?}");
@@ -27763,6 +28275,7 @@ mod tests {
         let runs = Arc::new(RunStore::new(db.clone()));
         let task_id = format!("task-boot-{label}");
         runs.insert_reserving(ReservingRunInsert {
+            orchestration_binding: None,
             task_id: task_id.clone(),
             root_task_id: task_id.clone(),
             previous_task_id: Some("task-gen1".into()),
@@ -28004,6 +28517,7 @@ mod tests {
         let runs = Arc::new(RunStore::new(db.clone()));
         let task_id = "task-boot-perm".to_string();
         runs.insert_reserving(ReservingRunInsert {
+            orchestration_binding: None,
             task_id: task_id.clone(),
             root_task_id: task_id.clone(),
             previous_task_id: Some("g1".into()),
@@ -28129,6 +28643,7 @@ mod tests {
         let task_id = "task-boot-perm-pe".to_string();
         let parent_conn = "parent-conn-perm-pe".to_string();
         runs.insert_reserving(ReservingRunInsert {
+            orchestration_binding: None,
             task_id: task_id.clone(),
             root_task_id: task_id.clone(),
             previous_task_id: Some("g1".into()),
@@ -28265,6 +28780,7 @@ mod tests {
         let task_id = "task-boot-perm-dur".to_string();
         let parent_conn = "parent-conn-perm-dur".to_string();
         runs.insert_reserving(ReservingRunInsert {
+            orchestration_binding: None,
             task_id: task_id.clone(),
             root_task_id: task_id.clone(),
             previous_task_id: Some("g1".into()),
@@ -28446,6 +28962,7 @@ mod tests {
         let task_id = "task-boot-pe-race".to_string();
         let parent_conn = "parent-conn-pe-race".to_string();
         runs.insert_reserving(ReservingRunInsert {
+            orchestration_binding: None,
             task_id: task_id.clone(),
             root_task_id: task_id.clone(),
             previous_task_id: Some("g1".into()),
@@ -28654,6 +29171,7 @@ mod tests {
         let task_id = "task-boot-cas-excl".to_string();
         let parent_conn = "parent-conn-cas-excl".to_string();
         runs.insert_reserving(ReservingRunInsert {
+            orchestration_binding: None,
             task_id: task_id.clone(),
             root_task_id: task_id.clone(),
             previous_task_id: Some("g1".into()),
@@ -29001,6 +29519,7 @@ mod tests {
                     external_handle: None,
                     correlation_id: None,
                     recovery_authorization_id: None,
+                    orchestration_binding: None,
                 })
                 .await
         });
@@ -29093,6 +29612,7 @@ mod tests {
                 external_handle: None,
                 correlation_id: None,
                 recovery_authorization_id: None,
+                orchestration_binding: None,
             })
             .await;
         assert_eq!(report.error_code.as_deref(), Some("unresumable"));
@@ -29919,6 +30439,7 @@ mod tests {
         let runs = Arc::new(RunStore::new(db.clone()));
         let task_id = "task-preboot-parent-cancel".to_string();
         runs.insert_reserving(ReservingRunInsert {
+            orchestration_binding: None,
             task_id: task_id.clone(),
             root_task_id: task_id.clone(),
             previous_task_id: Some("task-gen1".into()),
@@ -32868,6 +33389,7 @@ mod tests {
             mode_id: None,
             config_values_json: None,
             profile_id: None,
+            orchestration_binding: None,
             runtime_stats: None,
             replaced_task_id: None,
             replacement_reason: None,
@@ -35517,10 +36039,11 @@ mod tests {
         Arc<HistoricalWorkflowBroker>,
         i32,
     ) {
-        v2_plan_author_launch_fixture_with_db(Arc::new(
-            crate::db::test_helpers::historical_completion_protocol_db_before_v2_only().await,
-        ))
-        .await
+        let db = crate::db::test_helpers::historical_completion_protocol_db_before_v2_only().await;
+        crate::db::migration::install_for_historical_completion_fixture(&db)
+            .await
+            .expect("install orchestration binding migration for historical fixture");
+        v2_plan_author_launch_fixture_with_db(Arc::new(db)).await
     }
 
     fn v2_plan_author_request(parent_id: i32, tool_use_id: &str) -> DelegationRequest {
@@ -35733,6 +36256,7 @@ mod tests {
                 external_handle: None,
                 correlation_id: None,
                 recovery_authorization_id: None,
+                orchestration_binding: None,
             })
             .await;
 
@@ -35788,6 +36312,7 @@ mod tests {
                 external_handle: None,
                 correlation_id: None,
                 recovery_authorization_id: None,
+                orchestration_binding: None,
             })
             .await;
 
@@ -35942,6 +36467,7 @@ mod tests {
                         external_handle: None,
                         correlation_id: None,
                         recovery_authorization_id: None,
+                        orchestration_binding: None,
                     })
                     .await
             })
@@ -36203,6 +36729,7 @@ mod tests {
                     external_handle: None,
                     correlation_id: None,
                     recovery_authorization_id: None,
+                    orchestration_binding: None,
                 })
                 .await;
             assert_eq!(report.status, TaskStatus::Failed, "{report:?}");
@@ -36308,6 +36835,7 @@ mod tests {
                 external_handle: None,
                 correlation_id: None,
                 recovery_authorization_id: None,
+                orchestration_binding: None,
             })
             .await;
         assert_eq!(continued.status, TaskStatus::Failed, "{continued:?}");
@@ -36410,6 +36938,7 @@ mod tests {
                 external_handle: None,
                 correlation_id: None,
                 recovery_authorization_id: None,
+                orchestration_binding: None,
             })
             .await;
         assert_eq!(continued.status, TaskStatus::Failed, "{continued:?}");
@@ -36506,6 +37035,7 @@ mod tests {
             .expect("agent type string")
             .to_string();
         runs.admit_gen1_reserving(ReservingRunInsert {
+            orchestration_binding: None,
             task_id: task_id.into(),
             root_task_id: task_id.into(),
             previous_task_id: None,
@@ -36922,6 +37452,7 @@ mod tests {
                 None,
                 None,
                 &launch.snapshot.route_fingerprint,
+                None,
             );
             let terminal = match suffix {
                 "completed" => {
@@ -37896,6 +38427,7 @@ mod tests {
                 external_handle: None,
                 correlation_id: None,
                 recovery_authorization_id: None,
+                orchestration_binding: None,
             })
             .await;
         assert_eq!(
@@ -37940,6 +38472,7 @@ mod tests {
                 external_handle: None,
                 correlation_id: None,
                 recovery_authorization_id: None,
+                orchestration_binding: None,
             })
             .await;
         assert_eq!(
@@ -37974,6 +38507,7 @@ mod tests {
                 external_handle: None,
                 correlation_id: Some("cont-corr-1".into()),
                 recovery_authorization_id: None,
+                orchestration_binding: None,
             })
             .await;
         assert_eq!(
@@ -38011,6 +38545,7 @@ mod tests {
                 external_handle: Some("h-cont-claim-cancel".into()),
                 correlation_id: Some("cont-ext-cancel".into()),
                 recovery_authorization_id: None,
+                orchestration_binding: None,
             })
             .await;
         assert_eq!(report.error_code.as_deref(), Some("canceled"));
@@ -38050,6 +38585,7 @@ mod tests {
                 external_handle: None,
                 correlation_id: Some("cont-join-abandon".into()),
                 recovery_authorization_id: None,
+                orchestration_binding: None,
             })
             .await;
         assert_eq!(
@@ -38129,6 +38665,7 @@ mod tests {
                 external_handle: None,
                 correlation_id: Some("cont-bind".into()),
                 recovery_authorization_id: None,
+                orchestration_binding: None,
             })
             .await;
         assert!(
@@ -38227,6 +38764,7 @@ mod tests {
             external_handle: None,
             correlation_id: Some("cont-mcp-first".into()),
             recovery_authorization_id: None,
+            orchestration_binding: None,
         };
         let b2 = broker.clone();
         let cont_handle = tokio::spawn(async move { b2.continue_delegation(cont_req).await });
@@ -38404,6 +38942,7 @@ mod tests {
                 external_handle: None,
                 correlation_id: Some("corr-t2".into()),
                 recovery_authorization_id: None,
+                orchestration_binding: None,
             })
             .await;
         assert!(
@@ -38642,6 +39181,7 @@ mod tests {
                 external_handle: None,
                 correlation_id: None,
                 recovery_authorization_id: None,
+                orchestration_binding: None,
             })
             .await;
         assert_eq!(
@@ -38663,6 +39203,7 @@ mod tests {
                 external_handle: None,
                 correlation_id: Some("corr-timeout-nf".into()),
                 recovery_authorization_id: None,
+                orchestration_binding: None,
             })
             .await;
         assert_eq!(
@@ -38685,6 +39226,7 @@ mod tests {
                 external_handle: None,
                 correlation_id: Some(".leading-dot-invalid".into()),
                 recovery_authorization_id: None,
+                orchestration_binding: None,
             })
             .await;
         assert_eq!(
@@ -38723,6 +39265,7 @@ mod tests {
                 external_handle: None,
                 correlation_id: None,
                 recovery_authorization_id: None,
+                orchestration_binding: None,
             })
             .await;
         assert_eq!(
@@ -38963,6 +39506,7 @@ mod tests {
             None,
             None,
             gen1.route_fingerprint.as_deref().unwrap_or(""),
+            None,
         );
         assert_eq!(
             gen1.request_fingerprint.as_deref(),
@@ -39000,6 +39544,7 @@ mod tests {
                 external_handle: None,
                 correlation_id: Some(cont_secret.into()),
                 recovery_authorization_id: None,
+                orchestration_binding: None,
             })
             .await;
         assert!(cont.error_code.is_none(), "continue: {cont:?}");
@@ -39015,6 +39560,7 @@ mod tests {
             None,
             Some(&root_task_id),
             gen2.route_fingerprint.as_deref().unwrap_or(""),
+            None,
         );
         assert_eq!(gen2.request_fingerprint.as_deref(), Some(cont_fp.as_str()));
     }
@@ -39113,6 +39659,7 @@ mod tests {
                 external_handle: None,
                 correlation_id: Some(corr.into()),
                 recovery_authorization_id: None,
+                orchestration_binding: None,
             })
             .await;
         drop(_guard);
@@ -39217,6 +39764,7 @@ mod tests {
                 external_handle: None,
                 correlation_id: None,
                 recovery_authorization_id: None,
+                orchestration_binding: None,
             })
             .await;
 
@@ -39303,6 +39851,7 @@ mod tests {
             external_handle: None,
             correlation_id: None,
             recovery_authorization_id: None,
+            orchestration_binding: None,
         };
 
         let first = broker.continue_delegation(request.clone()).await;
@@ -39386,6 +39935,7 @@ mod tests {
             external_handle: None,
             correlation_id: None,
             recovery_authorization_id: None,
+            orchestration_binding: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -39542,6 +40092,7 @@ mod tests {
                         external_handle: None,
                         correlation_id: None,
                         recovery_authorization_id: None,
+                        orchestration_binding: None,
                     })
                     .await
             })
@@ -39665,6 +40216,7 @@ mod tests {
                 external_handle: None,
                 correlation_id: None,
                 recovery_authorization_id: None,
+                orchestration_binding: None,
             })
             .await;
         assert_eq!(report.error_code.as_deref(), Some("unresumable"));
@@ -39730,6 +40282,79 @@ mod tests {
             .expect("replacement run");
         assert_eq!(replacement_run.root_task_id, replacement_task_id);
         assert_eq!(replacement_run.lineage_root_task_id, root_task_id);
+    }
+
+    async fn approve_continue_recovery(
+        db: &crate::db::AppDatabase,
+        runs: &RunStore,
+        source_task_id: &str,
+    ) -> String {
+        use crate::acp::delegation::recovery_policy::{
+            decide_delegation_recovery, RecoveryRailSnapshot, RequestedRecoveryOperation,
+        };
+        use crate::acp::recovery_authorization::{
+            DelegationAuthorizationIdentity, RecoveryAllowedAction, RecoveryAuthorizationStore,
+            RecoveryChallenge, RecoverySubjectKind,
+        };
+
+        let source = runs
+            .load_by_task_id(source_task_id)
+            .await
+            .expect("load recovery source")
+            .expect("recovery source");
+        let eligibility = runs
+            .build_continue_eligibility(&source)
+            .await
+            .expect("build recovery eligibility");
+        let snapshot = crate::acp::delegation::run_store::recovery_source_from_continue_eligibility(
+            &eligibility,
+        );
+        let operation = RequestedRecoveryOperation::Continue;
+        let decision = decide_delegation_recovery(
+            &snapshot,
+            &RecoveryRailSnapshot {
+                agent_supports_reuse: eligibility.agent_supports_reuse,
+                unexpected_continue_budget_available: eligibility
+                    .unexpected_continue_budget_available,
+                replacement_budget_available: eligibility.replacement_budget_available,
+            },
+            operation.clone(),
+        );
+        assert!(decision.requires_authorization());
+        let projection =
+            crate::acp::delegation::types::DelegationRecoveryProjection::from(&decision);
+        let challenge = RecoveryChallenge {
+            parent_conversation_id: source.parent_conversation_id,
+            subject_kind: RecoverySubjectKind::DelegationTask,
+            subject_id: source.task_id.clone(),
+            delegation_identity: Some(DelegationAuthorizationIdentity {
+                source_task_id: source.task_id.clone(),
+                child_conversation_id: Some(source.child_conversation_id),
+                lineage_root_task_id: source.lineage_root_task_id.clone(),
+                work_unit_key: source.work_unit_key.clone(),
+            }),
+            source_state_fingerprint: decision.source_state_fingerprint,
+            allowed_action: RecoveryAllowedAction::Continue,
+            action_payload: crate::acp::delegation::run_store::recovery_action_payload(&operation),
+            cause_code: projection.cause_code,
+            risk_class: projection.risk_class,
+            display_reason: None,
+        };
+        let authorizations = RecoveryAuthorizationStore::new(db.conn.clone());
+        let now = Utc::now();
+        let pending = authorizations
+            .insert_pending(&challenge, now)
+            .await
+            .expect("insert continue authorization");
+        authorizations
+            .approve_pending(
+                &pending.authorization_id,
+                now,
+                now + chrono::Duration::minutes(10),
+            )
+            .await
+            .expect("approve continue authorization");
+        pending.authorization_id
     }
 
     /// Idempotent parent-tool replay of a successful admission_unknown
@@ -39861,6 +40486,7 @@ mod tests {
             .expect("agent type string")
             .to_string();
         runs.insert_reserving(ReservingRunInsert {
+            orchestration_binding: None,
             task_id: source_task_id.into(),
             root_task_id: source_task_id.into(),
             previous_task_id: None,
@@ -40069,6 +40695,7 @@ mod tests {
             external_handle: None,
             correlation_id: None,
             recovery_authorization_id: None,
+            orchestration_binding: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -40215,6 +40842,7 @@ mod tests {
             external_handle: None,
             correlation_id: None,
             recovery_authorization_id: None,
+            orchestration_binding: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -40356,6 +40984,7 @@ mod tests {
             external_handle: None,
             correlation_id: None,
             recovery_authorization_id: None,
+            orchestration_binding: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -40464,6 +41093,7 @@ mod tests {
             external_handle: None,
             correlation_id: None,
             recovery_authorization_id: None,
+            orchestration_binding: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -40566,6 +41196,7 @@ mod tests {
             external_handle: None,
             correlation_id: None,
             recovery_authorization_id: None,
+            orchestration_binding: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -40693,6 +41324,7 @@ mod tests {
             external_handle: None,
             correlation_id: None,
             recovery_authorization_id: None,
+            orchestration_binding: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -40808,6 +41440,7 @@ mod tests {
             external_handle: None,
             correlation_id: None,
             recovery_authorization_id: None,
+            orchestration_binding: None,
         };
         let first = broker.continue_delegation(cont_req.clone()).await;
         assert_eq!(first.status, TaskStatus::Running);
@@ -40903,6 +41536,7 @@ mod tests {
                 external_handle: Some("precancel-handle-1".into()),
                 correlation_id: None,
                 recovery_authorization_id: None,
+                orchestration_binding: None,
             })
             .await;
         assert_eq!(report.error_code.as_deref(), Some("canceled"));
@@ -40969,6 +41603,7 @@ mod tests {
             external_handle: None,
             correlation_id: None,
             recovery_authorization_id: None,
+            orchestration_binding: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -41482,6 +42117,7 @@ mod tests {
             external_handle: None,
             correlation_id: None,
             recovery_authorization_id: None,
+            orchestration_binding: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -41708,6 +42344,7 @@ mod tests {
             external_handle: None,
             correlation_id: None,
             recovery_authorization_id: None,
+            orchestration_binding: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -41818,6 +42455,7 @@ mod tests {
             external_handle: None,
             correlation_id: None,
             recovery_authorization_id: None,
+            orchestration_binding: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -41965,6 +42603,7 @@ mod tests {
             external_handle: None,
             correlation_id: None,
             recovery_authorization_id: None,
+            orchestration_binding: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -42128,6 +42767,7 @@ mod tests {
             external_handle: None,
             correlation_id: None,
             recovery_authorization_id: None,
+            orchestration_binding: None,
         };
         let driver = {
             let broker = broker.clone();
@@ -42313,6 +42953,7 @@ mod tests {
                 external_handle: None,
                 correlation_id: Some("corr-1485-acp".into()),
                 recovery_authorization_id: None,
+                orchestration_binding: None,
             })
             .await;
 
@@ -42436,6 +43077,7 @@ mod tests {
             external_handle: None,
             correlation_id: Some("corr-1485-mcp".into()),
             recovery_authorization_id: None,
+            orchestration_binding: None,
         };
         let b2 = broker.clone();
         let cont_handle = tokio::spawn(async move { b2.continue_delegation(cont_req).await });
@@ -42539,6 +43181,7 @@ mod tests {
                 external_handle: None,
                 correlation_id: None,
                 recovery_authorization_id: None,
+                orchestration_binding: None,
             })
             .await;
         assert_eq!(
@@ -42630,6 +43273,7 @@ mod tests {
                 external_handle: None,
                 correlation_id: Some("corr-1485-dup".into()),
                 recovery_authorization_id: None,
+                orchestration_binding: None,
             })
             .await;
         assert_eq!(
@@ -42853,6 +43497,7 @@ mod tests {
                 .expect("agent type string")
                 .to_string();
             runs.insert_reserving(ReservingRunInsert {
+                orchestration_binding: None,
                 task_id: task_id.clone(),
                 root_task_id: task_id.clone(),
                 previous_task_id: None,

@@ -1,0 +1,3144 @@
+# Review package: 1e885dee4e31ea167444b5bd3f78f21dd278f947..e7da74d9113511efd163536d2006db6fa7efeed2
+
+## Commits
+e7da74d9 fix(skill): bind round 15 directive relations
+
+## Files changed
+ .../scripts/validate-contract.lib.mjs              | 1286 +++++++++++++++++--
+ .../scripts/validate-contract.test.mjs             | 1343 ++++++++++++++++++++
+ 2 files changed, 2556 insertions(+), 73 deletions(-)
+
+## Diff
+diff --git a/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.lib.mjs b/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.lib.mjs
+index 64edb969..bfbd3e03 100644
+--- a/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.lib.mjs
++++ b/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.lib.mjs
+@@ -439,34 +439,75 @@ const PEOPLE_ANTECEDENT_TERMS = new Set([
+   "reviewers",
+ ])
+ const PLURAL_PEOPLE_ANTECEDENT_TERMS = new Set([
+   "authors",
+   "developers",
+   "fixers",
+   "people",
+   "producers",
+   "reviewers",
+ ])
+-const PEOPLE_ANTECEDENT_LINKS = new Set(["by", "for", "to", "with"])
+-const PEOPLE_ANTECEDENT_TARGET_PREFIX_TERMS = new Set([
++const PEOPLE_ANTECEDENT_LINKS = new Set([
++  "alongside",
++  "by",
++  "for",
++  "from",
++  "to",
++  "with",
++])
++const PEOPLE_ANTECEDENT_RELATION_BOUNDARIES = new Set([
++  "after",
++  "although",
++  "as",
++  "before",
++  "because",
++  "but",
++  "if",
++  "once",
++  "or",
++  "since",
++  "so",
++  "then",
++  "though",
++  "unless",
++  "until",
++  "when",
++  "whereas",
++  "while",
++  "yet",
++])
++const PEOPLE_CLAUSE_SUBJECT_STARTERS = new Set([
+   "a",
+-  "additional",
+   "an",
+-  "another",
+-  "design",
+-  "independent",
+-  "optional",
+-  "plan",
+-  "required",
+-  "selected",
++  "both",
++  "each",
++  "every",
+   "the",
+-  "user-named",
++  "these",
++  "this",
++  "those",
++])
++const PEOPLE_PARTITIVE_TARGET_HEADS = new Set([
++  "all",
++  "both",
++  "each",
++  "either",
++  "many",
++  "most",
++  "neither",
++  "none",
++  "some",
++])
++const PEOPLE_PARTICIPANT_ACTIONS = new Set([
++  "consult",
++  "consulted",
++  "consulting",
+ ])
+ const DOCUMENT_PERSON_ROLE_TERMS = new Set([
+   "author",
+   "authors",
+   "fixer",
+   "fixers",
+   "producer",
+   "producers",
+   "reviewer",
+   "reviewers",
+@@ -529,48 +570,157 @@ const REVIEW_ABSENCE_TERMS = new Set([
+   "without",
+ ])
+ const POSTPOSED_REVIEW_ABSENCE_TERMS = new Set([
+   "absent",
+   "lacking",
+   "missing",
+   "omitted",
+ ])
+ const POSTPOSED_REVIEW_ABSENCE_MODIFIERS = new Set([
+   "again",
++  "altogether",
++  "completely",
++  "entirely",
++  "later",
+   "now",
+   "often",
++  "overnight",
++  "soon",
+   "still",
+   "today",
++  "tomorrow",
+   "tonight",
++  "twice",
++  "yesterday",
+ ])
+ const POSTPOSED_REVIEW_ABSENCE_MODIFIER_PHRASES = [
++  ["as", "usual"],
++  ["at", "present"],
+   ["for", "now"],
+   ["often", "found"],
+   ["once", "again"],
++  ["once", "more"],
++  ["right", "now"],
+ ]
++const POSTPOSED_REVIEW_ABSENCE_TIME_TERMS = new Set([
++  "afternoon",
++  "day",
++  "days",
++  "evening",
++  "friday",
++  "fridays",
++  "monday",
++  "mondays",
++  "morning",
++  "month",
++  "months",
++  "night",
++  "nights",
++  "quarter",
++  "quarters",
++  "saturday",
++  "saturdays",
++  "sunday",
++  "sundays",
++  "thursday",
++  "thursdays",
++  "tuesday",
++  "tuesdays",
++  "wednesday",
++  "wednesdays",
++  "week",
++  "weeks",
++  "weekend",
++  "weekends",
++  "year",
++  "years",
++])
+ const POSTPOSED_REVIEW_ABSENCE_TRANSITIVE_TERMS = new Set([
+   "lacking",
+   "missing",
+ ])
+ const POSTPOSED_REVIEW_ABSENCE_COMPLEMENT_LINKS = new Set([
+   "after",
++  "as",
++  "at",
+   "before",
++  "because",
+   "during",
+   "for",
+   "from",
+   "in",
+   "on",
++  "over",
++  "across",
+   "since",
+   "through",
++  "throughout",
+   "until",
+   "when",
+   "while",
++  "with",
++  "without",
++])
++const POSTPOSED_REVIEW_ABSENCE_COMPLEMENT_PHRASES = [
++  ["due", "to"],
++  ["owing", "to"],
++]
++const POSTPOSED_REVIEW_ABSENCE_TIME_DETERMINERS = new Set([
++  "a",
++  "all",
++  "each",
++  "every",
++  "last",
++  "next",
++  "that",
++  "the",
++  "these",
++  "this",
++  "those",
++])
++const POSTPOSED_REVIEW_ABSENCE_TIME_QUALIFIERS = new Set([
++  "coming",
++  "few",
++  "entire",
++  "half",
++  "last",
++  "most",
++  "next",
++  "other",
++  "past",
++  "several",
++  "whole",
++])
++const POSTPOSED_REVIEW_ABSENCE_TIME_COUNTS = new Set([
++  "eight",
++  "five",
++  "four",
++  "nine",
++  "one",
++  "seven",
++  "six",
++  "ten",
++  "three",
++  "two",
++])
++const POSTPOSED_REVIEW_ABSENCE_TIME_DESCRIPTOR_TERMS = new Set([
++  ...POSTPOSED_REVIEW_ABSENCE_MODIFIERS,
++  ...POSTPOSED_REVIEW_ABSENCE_TIME_COUNTS,
++  ...POSTPOSED_REVIEW_ABSENCE_TIME_DETERMINERS,
++  ...POSTPOSED_REVIEW_ABSENCE_TIME_QUALIFIERS,
++  "and",
++  "couple",
++  "first",
++  "of",
++  "second",
++  "single",
++  "third",
+ ])
+ const ACTOR_LINKS = new Set(["by", "to"])
+ const NESTED_ACTOR_PREFIX_LINKS = new Set([
+   "after",
+   "before",
+   "for",
+   "from",
+   "of",
+   "through",
+   "with",
+@@ -645,23 +795,128 @@ const TASK_COMPLETION_BRIDGE_TERMS = new Set([
+   "now",
+   "was",
+   "were",
+   "will",
+   "would",
+ ])
+ const TASK_COMPONENT_SUFFIX_TERMS = new Set([
+   "review",
+   "reviews",
+   "test",
++  "tests",
+   "testing",
+   "validation",
+ ])
++const TASK_COMPONENT_ACTION_FORMS = new Set(["review", "test"])
++const TASK_COMPONENT_CONTINUATION_PREDICATES = new Set([
++  "continue",
++  "continues",
++  "continuing",
++])
++const TASK_REACTIVATION_PREDICATES = new Set([
++  "begin",
++  "begins",
++  "beginning",
++  "resume",
++  "resumes",
++  "resuming",
++  "restart",
++  "restarts",
++  "restarting",
++  "start",
++  "starts",
++  "starting",
++])
++const TASK_REACTIVATION_STATE_LINKS = new Set(["become", "becomes", "becoming"])
++const TASK_COMPONENT_STATE_LINKS = new Set([
++  "are",
++  "had",
++  "has",
++  "have",
++  "is",
++  "remain",
++  "remains",
++  "stays",
++  "was",
++  "were",
++])
++const TASK_UNFINISHED_STATE_TERMS = new Set([
++  "active",
++  "incomplete",
++  "ongoing",
++  "open",
++  "pending",
++  "running",
++  "underway",
++  "unfinished",
++])
++const PARTIAL_TASK_COMPLETION_TERMS = new Set([
++  "almost",
++  "barely",
++  "largely",
++  "mostly",
++  "nearly",
++  "partially",
++  "partly",
++  "provisionally",
++  "scarcely",
++  "substantially",
++])
++const TASK_STATE_CLAUSE_BOUNDARIES = new Set([
++  "although",
++  "and",
++  "because",
++  "but",
++  "if",
++  "though",
++  "unless",
++  "when",
++  "whereas",
++  "while",
++  "yet",
++])
++const TASK_STATE_MODIFIERS = new Set([
++  "actively",
++  "afterward",
++  "currently",
++  "still",
++  "then",
++  "yet",
++])
++const TASK_STATE_ANAPHOR_ADJUNCT_PREFIXES = [
++  ["according", "to"],
++  ["in", "fact"],
++]
++const TASK_STATE_CARRIED_ADJUNCT_STARTS = new Set([
++  "after",
++  "before",
++  "following",
++  "once",
++  "upon",
++  "when",
++])
++const TASK_STATE_SUBJECT_DETERMINERS = new Set([
++  "a",
++  "an",
++  "each",
++  "every",
++  "the",
++  "this",
++])
++const TASK_COMPLETION_SEQUENCE_TERMS = new Set([
++  "it",
++  "itself",
++  "longer",
++  "no",
++  "not",
++  "only",
++])
+ const ACTIVE_TIMING_MARKERS = new Set(["during", "inside", "while"])
+ const BOUNDARY_TIMING_MARKERS = new Set([
+   "after",
+   "following",
+   "on",
+   "once",
+   "upon",
+   "when",
+ ])
+ const PRE_COMPLETION_TIMING_MARKERS = new Set(["before", "prior"])
+@@ -721,28 +976,74 @@ const REVIEW_REPLACEMENT_ACTIONS = new Set([
+   "standing",
+   "stands",
+   "stood",
+   "substitute",
+   "substituted",
+   "substitutes",
+   "substituting",
+ ])
+ const REVIEW_TAKE_ACTIONS = new Set(["take", "takes", "taking", "took"])
+ const REVIEW_REQUIREMENT_ACTIONS = new Set(["mandatory", "required"])
+-const REVIEW_TARGET_DEMONSTRATIVES = new Set(["same", "that", "this"])
++const REVIEW_TARGET_ANAPHORIC_TERMS = new Set([
++  "aforementioned",
++  "former",
++  "original",
++  "previous",
++  "same",
++  "that",
++  "this",
++])
+ const GENERIC_REVIEW_TARGET_PREFIX_TERMS = new Set([
+   "a",
++  "aforementioned",
+   "an",
++  "assigned",
++  "former",
++  "original",
++  "previous",
++  "previously",
+   "same",
+   "that",
+   "the",
+   "this",
++  "very",
++])
++const REVIEW_TARGET_ADJUNCT_LINKS = new Set([
++  "after",
++  "as",
++  "before",
++  "because",
++  "by",
++  "during",
++  "for",
++  "if",
++  "in",
++  "once",
++  "since",
++  "unless",
++  "until",
++  "to",
++  "upon",
++  "when",
++  "whenever",
++  "while",
++])
++const REVIEW_TARGET_NON_ROLE_HEAD_TERMS = new Set([
++  ...POSTPOSED_REVIEW_ABSENCE_MODIFIERS,
++  "role",
++  "slot",
++])
++const REVIEW_TARGET_GENERIC_PERSON_TERMS = new Set([
++  "individual",
++  "one",
++  "party",
++  "person",
+ ])
+ const REVIEW_EXHAUSTIVE_QUANTIFIERS = new Set([
+   "alone",
+   "exclusively",
+   "only",
+   "solely",
+ ])
+ const REVIEW_ACTOR_TAIL_TERMS = new Set([
+   "a",
+   "agent",
+@@ -1099,56 +1400,82 @@ function directiveWindows(prose) {
+   const withoutKeys = prose.replace(
+     /\b(?:design|final_review|plan|task)\|[^\s.,;:]+/gi,
+     " "
+   )
+   for (const paragraph of withoutKeys
+     .normalize("NFKC")
+     .toLowerCase()
+     .split(/\n\s*\n+/)) {
+     let priorTokens = []
+     let priorActionBoundaryAfter = new Set()
++    let priorPossessiveIndexes = new Set()
++    let carriedTasks = []
+     for (const source of paragraph.split(/[.!?;]+/)) {
+       const matches = [...source.matchAll(/[a-z0-9]+(?:-[a-z0-9]+)*/g)]
+       const tokens = matches.map((match) => match[0])
+       const actionBoundaryAfter = matches.flatMap((match, index) => {
+         const gapStart = match.index + match[0].length
+         const gapEnd = matches[index + 1]?.index ?? source.length
+-        return /[,:]/.test(source.slice(gapStart, gapEnd)) ? [index] : []
++        return /[-,:\/()[\]\u2013\u2014]/.test(source.slice(gapStart, gapEnd))
++          ? [index]
++          : []
++      })
++      const possessiveIndexes = matches.flatMap((match, index) => {
++        const gapStart = match.index + match[0].length
++        const gapEnd = matches[index + 1]?.index ?? source.length
++        return /['\u2019]/.test(source.slice(gapStart, gapEnd)) ? [index] : []
+       })
++      const immediatePriorTasks = directiveTaskAntecedents(
++        priorTokens,
++        priorActionBoundaryAfter
++      )
++      const priorTasks =
++        immediatePriorTasks.length > 0 ? immediatePriorTasks : carriedTasks
+       for (let start = 0; start < tokens.length; start += step) {
+         windows.push({
+           tokens: tokens.slice(start, start + DIRECTIVE_WINDOW_TOKENS),
+           actionBoundaryAfter: new Set(
+             actionBoundaryAfter
+               .filter(
+                 (index) =>
+                   index >= start && index < start + DIRECTIVE_WINDOW_TOKENS
+               )
+               .map((index) => index - start)
+           ),
+           priorReviewers: directiveReviewers(priorTokens),
+-          priorTasks: directiveTaskAntecedents(
++          priorTasks,
++          priorDocumentTargets: directiveDocumentTargets(priorTokens),
++          priorPronounAntecedent: directivePronounAntecedent(
+             priorTokens,
++            priorPossessiveIndexes,
+             priorActionBoundaryAfter
+           ),
+-          priorDocumentTargets: directiveDocumentTargets(priorTokens),
+-          priorPronounAntecedent: directivePronounAntecedent(priorTokens),
+         })
+       }
+       if (tokens.length > 0) {
++        carriedTasks = carriedTaskAntecedentsAfterClause(
++          tokens,
++          new Set(actionBoundaryAfter),
++          carriedTasks
++        )
+         const priorStart = Math.max(0, tokens.length - DIRECTIVE_WINDOW_TOKENS)
+         priorTokens = tokens.slice(priorStart)
+         priorActionBoundaryAfter = new Set(
+           actionBoundaryAfter
+             .filter((index) => index >= priorStart)
+             .map((index) => index - priorStart)
+         )
++        priorPossessiveIndexes = new Set(
++          possessiveIndexes
++            .filter((index) => index >= priorStart)
++            .map((index) => index - priorStart)
++        )
+       }
+     }
+   }
+   return windows
+ }
+ 
+ function tokenIndex(tokens, candidates, start = 0, end = tokens.length) {
+   const limit = Math.min(tokens.length, end)
+   for (let index = Math.max(0, start); index < limit; index += 1) {
+     if (candidates.has(tokens[index])) return index
+@@ -1172,72 +1499,253 @@ function phraseIndex(tokens, phrase, start = 0, end = tokens.length) {
+       return index
+     }
+   }
+   return -1
+ }
+ 
+ function tokensArePostposedReviewAbsenceModifiers(tokens) {
+   let index = 0
+   while (index < tokens.length) {
+     const token = tokens[index]
++    const fractionalDuration = tokenIndexes(
++      tokens,
++      POSTPOSED_REVIEW_ABSENCE_TIME_TERMS,
++      index,
++      Math.min(tokens.length, index + 5)
++    ).find(
++      (time) =>
++        tokens
++          .slice(index, time)
++          .every(
++            (descriptor) =>
++              /^\d+$/.test(descriptor) ||
++              POSTPOSED_REVIEW_ABSENCE_TIME_DESCRIPTOR_TERMS.has(descriptor)
++          ) &&
++        phraseIndex(tokens, ["and", "a", "half"], time + 1, time + 4) ===
++          time + 1
++    )
++    if (fractionalDuration !== undefined) {
++      index = fractionalDuration + 4
++      continue
++    }
++    const duration = tokenIndexes(
++      tokens,
++      POSTPOSED_REVIEW_ABSENCE_TIME_TERMS,
++      index,
++      Math.min(tokens.length, index + 8)
++    ).find((time) =>
++      tokens
++        .slice(index, time)
++        .every(
++          (descriptor) =>
++            /^\d+$/.test(descriptor) ||
++            POSTPOSED_REVIEW_ABSENCE_TIME_DESCRIPTOR_TERMS.has(descriptor)
++        )
++    )
++    if (duration !== undefined) {
++      index = duration + 1
++      continue
++    }
++    if (
++      (/^\d+$/.test(token) ||
++        POSTPOSED_REVIEW_ABSENCE_TIME_COUNTS.has(token) ||
++        POSTPOSED_REVIEW_ABSENCE_MODIFIERS.has(token)) &&
++      POSTPOSED_REVIEW_ABSENCE_TIME_TERMS.has(tokens[index + 1])
++    ) {
++      index += 2
++      continue
++    }
++    if (token === "and" && index > 0 && index + 1 < tokens.length) {
++      index += 1
++      continue
++    }
++    if (POSTPOSED_REVIEW_ABSENCE_TIME_DETERMINERS.has(token)) {
++      let time = index + 1
++      while (
++        POSTPOSED_REVIEW_ABSENCE_TIME_QUALIFIERS.has(tokens[time]) ||
++        POSTPOSED_REVIEW_ABSENCE_TIME_COUNTS.has(tokens[time]) ||
++        /^\d+$/.test(tokens[time])
++      ) {
++        time += 1
++      }
++      if (POSTPOSED_REVIEW_ABSENCE_TIME_TERMS.has(tokens[time])) {
++        index = time + 1
++        continue
++      }
++    }
++    if (
++      POSTPOSED_REVIEW_ABSENCE_TIME_QUALIFIERS.has(token) &&
++      POSTPOSED_REVIEW_ABSENCE_TIME_TERMS.has(tokens[index + 1])
++    ) {
++      index += 2
++      continue
++    }
++    if (
++      token === "half" &&
++      POSTPOSED_REVIEW_ABSENCE_TIME_DETERMINERS.has(tokens[index + 1]) &&
++      POSTPOSED_REVIEW_ABSENCE_TIME_TERMS.has(tokens[index + 2])
++    ) {
++      index += 3
++      continue
++    }
++    if (
++      new Set(["half", "most"]).has(token) &&
++      tokens[index + 1] === "of" &&
++      POSTPOSED_REVIEW_ABSENCE_TIME_DETERMINERS.has(tokens[index + 2]) &&
++      POSTPOSED_REVIEW_ABSENCE_TIME_TERMS.has(tokens[index + 3])
++    ) {
++      index += 4
++      continue
++    }
+     const phrase = POSTPOSED_REVIEW_ABSENCE_MODIFIER_PHRASES.find((candidate) =>
+       candidate.every(
+         (phraseToken, offset) => tokens[index + offset] === phraseToken
+       )
+     )
+     if (phrase) {
+       index += phrase.length
+       continue
+     }
+     if (token.endsWith("ly") || POSTPOSED_REVIEW_ABSENCE_MODIFIERS.has(token)) {
+       index += 1
+       continue
+     }
+     return false
+   }
+   return true
+ }
+ 
++function reviewAbsenceTailStartsComplement(tail) {
++  const startsWithComplementPhrase =
++    POSTPOSED_REVIEW_ABSENCE_COMPLEMENT_PHRASES.some(
++      (phrase) => phraseIndex(tail, phrase, 0, phrase.length) === 0
++    )
++  const complementLinkIndicatesAbsence =
++    POSTPOSED_REVIEW_ABSENCE_COMPLEMENT_LINKS.has(tail[0]) &&
++    !(
++      (tail[0] === "at" && tail[1] === "least") ||
++      (tail[0] === "over" &&
++        !tokensArePostposedReviewAbsenceModifiers(tail.slice(1)))
++    )
++  return startsWithComplementPhrase || complementLinkIndicatesAbsence
++}
++
+ function postposedReviewAbsenceHasDirectObject(clause, absence, relationEnd) {
+-  if (
+-    !POSTPOSED_REVIEW_ABSENCE_TRANSITIVE_TERMS.has(clause.tokens[absence]) ||
+-    clause.actionBoundaryAfter.has(absence)
+-  ) {
++  const predicate = clause.tokens[absence]
++  if (!POSTPOSED_REVIEW_ABSENCE_TRANSITIVE_TERMS.has(predicate)) {
+     return false
+   }
+   const tail = clause.tokens.slice(absence + 1, relationEnd)
+   if (tail.length === 0) return false
+-  if (tokensArePostposedReviewAbsenceModifiers(tail)) return false
++  if (tokensArePostposedReviewAbsenceModifiers(tail)) {
++    return (
++      predicate === "lacking" &&
++      tail.some(
++        (token) =>
++          token.endsWith("ly") && !POSTPOSED_REVIEW_ABSENCE_MODIFIERS.has(token)
++      )
++    )
++  }
++  if (predicate === "lacking" && tail[0] === "in") return true
++  const modifierThenComplement = tail
++    .slice(1)
++    .some(
++      (_token, index) =>
++        tokensArePostposedReviewAbsenceModifiers(tail.slice(0, index + 1)) &&
++        reviewAbsenceTailStartsComplement(tail.slice(index + 1))
++    )
+   return !(
+     CLAUSE_COORDINATORS.has(tail[0]) ||
+-    POSTPOSED_REVIEW_ABSENCE_COMPLEMENT_LINKS.has(tail[0])
++    modifierThenComplement ||
++    reviewAbsenceTailStartsComplement(tail)
+   )
+ }
+ 
+-function peopleRelationIntroduces(tokens, predicate, person) {
+-  const targetPrefixIsBounded = (start) =>
+-    tokens
+-      .slice(start, person)
+-      .every(
+-        (token) =>
+-          token.endsWith("ly") ||
+-          PEOPLE_ANTECEDENT_TARGET_PREFIX_TERMS.has(token)
+-      )
++function peopleRelationIntroduces(
++  tokens,
++  predicate,
++  person,
++  possessiveIndexes,
++  actionBoundaryAfter
++) {
++  if (possessiveIndexes.has(person)) return false
++  const targetPrefixIsBounded = (start) => {
++    const prefix = tokens.slice(start, person)
++    const nestedObjectLink = prefix.lastIndexOf("of")
++    const nestedObjectHead = prefix
++      .slice(0, nestedObjectLink)
++      .findLast((token) => !new Set(["a", "an", "the"]).has(token))
++    if (
++      nestedObjectLink >= 0 &&
++      nestedObjectHead !== undefined &&
++      !PEOPLE_PARTITIVE_TARGET_HEADS.has(nestedObjectHead)
++    ) {
++      return false
++    }
++    const coordination = prefix.lastIndexOf("and")
++    const beforeCoordination = prefix.slice(0, coordination)
++    const afterCoordination = prefix.slice(coordination + 1)
++    const relationEndsAtPerson =
++      person === tokens.length - 1 ||
++      PEOPLE_ANTECEDENT_RELATION_BOUNDARIES.has(tokens[person + 1]) ||
++      PEOPLE_ANTECEDENT_LINKS.has(tokens[person + 1]) ||
++      tokens
++        .slice(person + 1)
++        .every(
++          (token) =>
++            token.endsWith("ly") ||
++            POSTPOSED_REVIEW_ABSENCE_MODIFIERS.has(token)
++        )
++    const relationCrossesPunctuation = [...actionBoundaryAfter].some(
++      (boundary) => boundary >= start && boundary < person
++    )
++    const coordinationStaysInTarget =
++      coordination < 0 ||
++      beforeCoordination.includes("both") ||
++      (afterCoordination.length > 0 &&
++        !PEOPLE_CLAUSE_SUBJECT_STARTERS.has(afterCoordination[0]) &&
++        relationEndsAtPerson)
++    return (
++      !prefix.some((token) =>
++        PEOPLE_ANTECEDENT_RELATION_BOUNDARIES.has(token)
++      ) &&
++      (!relationCrossesPunctuation ||
++        (coordination >= 0 && relationEndsAtPerson)) &&
++      coordinationStaysInTarget
++    )
++  }
+   const directLink = tokenIndexes(
+     tokens,
+     PEOPLE_ANTECEDENT_LINKS,
+     predicate + 1,
+     person
+   ).at(-1)
+   if (directLink !== undefined && targetPrefixIsBounded(directLink + 1)) {
+     return true
+   }
++  const participantLink = tokenIndexes(
++    tokens,
++    new Set(["after"]),
++    predicate + 1,
++    person
++  )
++    .filter(
++      (index) =>
++        tokenIndex(tokens, PEOPLE_PARTICIPANT_ACTIONS, index + 1, person) >= 0
++    )
++    .at(-1)
++  if (
++    participantLink !== undefined &&
++    targetPrefixIsBounded(participantLink + 1)
++  ) {
++    return true
++  }
+   const behalfLink = tokenIndexes(
+     tokens,
+     new Set(["on"]),
+     predicate + 1,
+     person
+   )
+     .filter(
+       (index) =>
+         phraseIndex(tokens, ["on", "behalf", "of"], index, index + 3) === index
+     )
+@@ -1381,38 +1889,73 @@ function directiveTasks(tokens) {
+       continue
+     }
+     tasks.push({ index, scopes: taskScopes(tokens, index) })
+   }
+   return tasks
+ }
+ 
+ function directiveTaskAntecedents(tokens, actionBoundaryAfter = new Set()) {
+   const clause = { tokens, actionBoundaryAfter }
+   return directiveTasks(tokens).map((task) => {
+-    const completed = taskHasCompletedState(clause, task)
+-    const postposedActivity = taskStateIndexes(
+-      clause,
+-      task,
+-      EXPLICIT_TASK_ACTIVITY_TERMS
+-    ).some(
+-      (state) => state > task.index && !actionIsNegated(clause.tokens, state)
+-    )
++    const completed = taskCompletedStateIndexes(clause, task).length > 0
+     return {
+       ...task,
+-      active:
+-        taskHasAffirmativeActivity(clause, task) &&
+-        (!completed || postposedActivity),
++      active: taskIsEffectivelyActive(clause, task),
+       completed,
+     }
+   })
+ }
+ 
++function carriedTaskAntecedentsAfterClause(
++  tokens,
++  actionBoundaryAfter,
++  priorTasks
++) {
++  const explicitTasks = directiveTaskAntecedents(tokens, actionBoundaryAfter)
++  if (explicitTasks.length > 0) return explicitTasks
++  if (priorTasks.length === 0) return []
++
++  const anaphors = tokenIndexes(tokens, new Set(["it", "itself"]))
++  const clause = { tokens, actionBoundaryAfter, tasks: [], priorTasks }
++  const completion = tokenIndexes(tokens, TASK_COMPLETION_TERMS).find(
++    (state) => {
++      const anaphor = anaphors.filter((index) => index < state).at(-1)
++      if (anaphor === undefined || state - anaphor > 5) return false
++      const prefix = tokens.slice(0, anaphor)
++      const plainPrefix = prefix.every(
++        (token) =>
++          TASK_STATE_MODIFIERS.has(token) ||
++          TASK_COMPLETION_BRIDGE_TERMS.has(token)
++      )
++      const leadingAdjunct =
++        prefix.length <= 4 &&
++        TASK_STATE_CARRIED_ADJUNCT_STARTS.has(prefix[0]) &&
++        actionBoundaryAfter.has(anaphor - 1) &&
++        tokenIndex(tokens, TASK_COMPLETION_TERMS, 0, anaphor) < 0
++      if (!plainPrefix && !leadingAdjunct) {
++        return false
++      }
++      const task = { ...priorTasks.at(-1), index: anaphor }
++      return (
++        completionBelongsToTask(clause, task, state) &&
++        !actionIsNegated(tokens, state)
++      )
++    }
++  )
++  if (completion === undefined) return priorTasks
++  return priorTasks.map((task, index) =>
++    index === priorTasks.length - 1
++      ? { ...task, active: false, completed: true }
++      : task
++  )
++}
++
+ function directiveDocumentTargets(tokens) {
+   const actors = directiveActors(tokens)
+   return tokens.flatMap((token, index) =>
+     DOCUMENT_OR_CODE_TARGETS.has(token) &&
+     !actors.some((actor) => actor.start <= index && index < actor.end) &&
+     !DOCUMENT_PERSON_ROLE_TERMS.has(tokens[index + 1])
+       ? [{ index, token }]
+       : []
+   )
+ }
+@@ -1444,21 +1987,25 @@ function mentionsPluralGroup(tokens, mentions) {
+   return (
+     tokenIndex(
+       tokens,
+       new Set(["and", "or"]),
+       mentions[0].end,
+       mentions.at(-1).start
+     ) >= 0
+   )
+ }
+ 
+-function directivePronounAntecedent(tokens) {
++function directivePronounAntecedent(
++  tokens,
++  possessiveIndexes = new Set(),
++  actionBoundaryAfter = new Set()
++) {
+   const documents = directiveDocumentTargets(tokens)
+   const people = directivePeopleAntecedents(tokens)
+   const actors = directiveActors(tokens)
+   const predicate = tokenIndexes(tokens, ANTECEDENT_PREDICATES)
+     .filter(
+       (index) =>
+         !actors.some((actor) => actor.start <= index && index < actor.end)
+     )
+     .at(-1)
+   const documentMentions = documents.map((target) => ({
+@@ -1473,21 +2020,27 @@ function directivePronounAntecedent(tokens) {
+   const peopleSubjects =
+     predicate === undefined
+       ? people
+       : people.filter((person) => person.end <= predicate)
+   const peopleRecipients =
+     predicate === undefined
+       ? []
+       : people.filter(
+           (person) =>
+             person.start > predicate &&
+-            peopleRelationIntroduces(tokens, predicate, person.start)
++            peopleRelationIntroduces(
++              tokens,
++              predicate,
++              person.start,
++              possessiveIndexes,
++              actionBoundaryAfter
++            )
+         )
+ 
+   const pluralDocuments = mentionsPluralGroup(tokens, documentObjects)
+   const pluralPeopleSubjects = mentionsPluralGroup(tokens, peopleSubjects)
+   const pluralPeopleRecipients = mentionsPluralGroup(tokens, peopleRecipients)
+   if (pluralPeopleRecipients) return "people"
+   if (
+     pluralDocuments &&
+     DOCUMENT_OBJECT_ANTECEDENT_PREDICATES.has(tokens[predicate])
+   ) {
+@@ -3017,91 +3570,535 @@ function conflictsWithConversationIdentity(clause) {
+ 
+ function taskStateIndexes(clause, task, states) {
+   return tokenIndexes(
+     clause.tokens,
+     states,
+     Math.max(0, task.index - 2),
+     task.index + 5
+   )
+ }
+ 
++function taskComponentIndex(clause, task) {
++  return tokenIndex(
++    clause.tokens,
++    TASK_COMPONENT_SUFFIX_TERMS,
++    task.index + 1,
++    task.index + 8
++  )
++}
++
++function stateHasTaskSubject(clause, task, state) {
++  const boundary = tokenIndexes(
++    clause.tokens,
++    TASK_STATE_CLAUSE_BOUNDARIES,
++    task.index + 1,
++    state
++  ).at(-1)
++  const segmentStart = boundary === undefined ? task.index + 1 : boundary + 1
++  const stateLink = tokenIndexes(
++    clause.tokens,
++    new Set([
++      ...TASK_COMPONENT_STATE_LINKS,
++      ...TASK_COMPONENT_CONTINUATION_PREDICATES,
++      ...TASK_REACTIVATION_PREDICATES,
++      ...TASK_REACTIVATION_STATE_LINKS,
++    ]),
++    segmentStart,
++    state
++  ).at(-1)
++  const subjectEnd = stateLink ?? state
++  const subjectPrefix = clause.tokens.slice(segmentStart, subjectEnd)
++  const subjectHead = subjectPrefix.findIndex(
++    (token) => !TASK_STATE_MODIFIERS.has(token) && !token.endsWith("ly")
++  )
++  const normalizedSubjectPrefix = subjectPrefix.slice(
++    subjectHead < 0 ? subjectPrefix.length : subjectHead
++  )
++  const adjunctTaskAnaphor = TASK_STATE_ANAPHOR_ADJUNCT_PREFIXES.some(
++    (prefix) =>
++      phraseIndex(
++        normalizedSubjectPrefix,
++        prefix,
++        0,
++        normalizedSubjectPrefix.length
++      ) === 0 &&
++      normalizedSubjectPrefix.at(-1) === "it" &&
++      !normalizedSubjectPrefix.slice(0, -1).includes("itself")
++  )
++  if (adjunctTaskAnaphor) return true
++  if (subjectPrefix.length === 0) return true
++  if (
++    subjectPrefix.every(
++      (token) => TASK_STATE_MODIFIERS.has(token) || token.endsWith("ly")
++    )
++  ) {
++    return true
++  }
++  if (
++    normalizedSubjectPrefix[0] === "its" &&
++    TASK_COMPONENT_SUFFIX_TERMS.has(normalizedSubjectPrefix.at(-1))
++  ) {
++    return true
++  }
++  if (new Set(["it", "itself"]).has(normalizedSubjectPrefix[0])) {
++    if (
++      normalizedSubjectPrefix.length > 1 &&
++      !(
++        normalizedSubjectPrefix.length === 2 &&
++        normalizedSubjectPrefix[1] === "itself"
++      )
++    ) {
++      return false
++    }
++    const previousBoundary = tokenIndexes(
++      clause.tokens,
++      TASK_STATE_CLAUSE_BOUNDARIES,
++      task.index + 1,
++      boundary
++    ).at(-1)
++    const previousStart =
++      previousBoundary === undefined ? task.index + 1 : previousBoundary + 1
++    const previousLink = tokenIndexes(
++      clause.tokens,
++      TASK_COMPONENT_STATE_LINKS,
++      previousStart,
++      boundary
++    ).at(-1)
++    return previousLink === undefined || previousLink === previousStart
++  }
++  if (TASK_COMPONENT_SUFFIX_TERMS.has(subjectPrefix.at(-1))) {
++    return !taskComponentStateHasActionObject(clause, subjectEnd - 1, state)
++  }
++  const laterDeterminer = subjectPrefix
++    .slice(2)
++    .some((token) => TASK_STATE_SUBJECT_DETERMINERS.has(token))
++  return (
++    new Set(["after", "before", "following"]).has(subjectPrefix[0]) &&
++    TASK_STATE_SUBJECT_DETERMINERS.has(subjectPrefix[1]) &&
++    subjectPrefix.length <= 4 &&
++    !laterDeterminer
++  )
++}
++
++function postposedTaskStateIndexes(clause, task, states) {
++  const nextTask = clause.tasks?.find(
++    (candidate) => candidate.index > task.index
++  )
++  const end = nextTask?.index ?? clause.tokens.length
++  return tokenIndexes(clause.tokens, states, task.index + 1, end).filter(
++    (state) => stateHasTaskSubject(clause, task, state)
++  )
++}
++
++function taskActivityStateIndexes(clause, task) {
++  const preposed = tokenIndexes(
++    clause.tokens,
++    EXPLICIT_TASK_ACTIVITY_TERMS,
++    Math.max(0, task.index - 2),
++    task.index + 1
++  )
++  const reactivations = postposedTaskStateIndexes(
++    clause,
++    task,
++    TASK_REACTIVATION_PREDICATES
++  ).filter((state) =>
++    taskCompletedStateIndexes(clause, task).some(
++      (completion) => completion < state
++    )
++  )
++  return [
++    ...new Set([
++      ...preposed,
++      ...postposedTaskStateIndexes(clause, task, EXPLICIT_TASK_ACTIVITY_TERMS),
++      ...reactivations,
++    ]),
++  ].sort((left, right) => left - right)
++}
++
++function taskComponentStateHasActionObject(clause, component, state) {
++  const boundary = [...clause.actionBoundaryAfter]
++    .filter((candidate) => candidate >= state)
++    .sort((left, right) => left - right)[0]
++  const object = clause.tokens.slice(state + 1, (boundary ?? state) + 1)
++  const head = object.findLast(
++    (token) =>
++      !TASK_STATE_MODIFIERS.has(token) &&
++      !TASK_UNFINISHED_STATE_TERMS.has(token) &&
++      !CLAUSE_COORDINATORS.has(token)
++  )
++  const headIndex = object.lastIndexOf(head)
++  return (
++    TASK_COMPONENT_ACTION_FORMS.has(clause.tokens[component]) &&
++    head !== undefined &&
++    (head.endsWith("s") ||
++      object
++        .slice(0, headIndex)
++        .some((token) => TASK_STATE_SUBJECT_DETERMINERS.has(token)))
++  )
++}
++
++function taskComponentHasUnfinishedState(clause, task) {
++  const component = taskComponentIndex(clause, task)
++  if (component < 0) return false
++  const end = Math.min(clause.tokens.length, component + 7)
++  const ellipticalState = tokenIndex(
++    clause.tokens,
++    TASK_UNFINISHED_STATE_TERMS,
++    component + 1,
++    end
++  )
++  const stateBoundaryAfter = (state) =>
++    [...clause.actionBoundaryAfter]
++      .filter((boundary) => boundary >= state && boundary < end)
++      .sort((left, right) => left - right)[0]
++  const stateEndsAtBoundary = (state) =>
++    stateBoundaryAfter(state) !== undefined ||
++    CLAUSE_COORDINATORS.has(clause.tokens[state + 1])
++  const ellipticalStateHasActionObject =
++    ellipticalState >= 0 &&
++    taskComponentStateHasActionObject(clause, component, ellipticalState)
++  const componentHasActionModifier = clause.tokens
++    .slice(task.index + 1, component)
++    .some((token) => token.endsWith("ly"))
++  if (
++    ellipticalState >= 0 &&
++    !actionIsNegated(clause.tokens, ellipticalState) &&
++    !componentHasActionModifier &&
++    !ellipticalStateHasActionObject &&
++    clause.tokens
++      .slice(component + 1, ellipticalState)
++      .every(
++        (token) => TASK_STATE_MODIFIERS.has(token) || token.endsWith("ly")
++      ) &&
++    (clause.tokens[ellipticalState + 1] === undefined ||
++      stateEndsAtBoundary(ellipticalState))
++  ) {
++    return true
++  }
++  const ellipticalCompletion = tokenIndex(
++    clause.tokens,
++    TASK_COMPLETION_TERMS,
++    component + 1,
++    end
++  )
++  if (
++    ellipticalCompletion >= 0 &&
++    tokenIndex(
++      clause.tokens,
++      NEGATION_TERMS,
++      component + 1,
++      ellipticalCompletion
++    ) >= 0 &&
++    clause.tokens
++      .slice(component + 1, ellipticalCompletion)
++      .every(
++        (token) =>
++          NEGATION_TERMS.has(token) ||
++          TASK_STATE_MODIFIERS.has(token) ||
++          token.endsWith("ly")
++      ) &&
++    (clause.tokens[ellipticalCompletion + 1] === undefined ||
++      stateEndsAtBoundary(ellipticalCompletion))
++  ) {
++    return true
++  }
++  const continuation = tokenIndex(
++    clause.tokens,
++    TASK_COMPONENT_CONTINUATION_PREDICATES,
++    component + 1,
++    end
++  )
++  const continuationAgrees =
++    clause.tokens[continuation] === "continues" ||
++    (clause.tokens[component] === "reviews" &&
++      clause.tokens[continuation] === "continue")
++  if (
++    continuation >= 0 &&
++    continuationAgrees &&
++    clause.tokens
++      .slice(component + 1, continuation)
++      .every((token) => TASK_STATE_MODIFIERS.has(token) || token.endsWith("ly"))
++  ) {
++    return true
++  }
++  const stateLink = tokenIndex(
++    clause.tokens,
++    TASK_COMPONENT_STATE_LINKS,
++    component + 1,
++    end
++  )
++  if (stateLink < 0) return false
++  if (
++    !clause.tokens
++      .slice(component + 1, stateLink)
++      .every(
++        (token) =>
++          TASK_COMPONENT_SUFFIX_TERMS.has(token) ||
++          TASK_STATE_MODIFIERS.has(token) ||
++          CLAUSE_COORDINATORS.has(token) ||
++          token.endsWith("ly")
++      )
++  ) {
++    return false
++  }
++  if (
++    tokenIndexes(
++      clause.tokens,
++      TASK_UNFINISHED_STATE_TERMS,
++      stateLink + 1,
++      end
++    ).some((state) => !actionIsNegated(clause.tokens, state))
++  ) {
++    return true
++  }
++  return tokenIndexes(
++    clause.tokens,
++    TASK_COMPLETION_TERMS,
++    stateLink + 1,
++    end
++  ).some((state) => {
++    if (actionIsNegated(clause.tokens, state)) return true
++    const predicateTail = clause.tokens.slice(stateLink + 1, state)
++    return (
++      predicateTail.some((token) => PARTIAL_TASK_COMPLETION_TERMS.has(token)) ||
++      phraseIndex(predicateTail, ["anything", "but"]) >= 0 ||
++      phraseIndex(predicateTail, ["nowhere", "near"]) >= 0 ||
++      phraseIndex(predicateTail, ["yet", "to"]) >= 0 ||
++      (["remain", "remains"].includes(clause.tokens[stateLink]) &&
++        phraseIndex(predicateTail, ["to", "be"]) >= 0)
++    )
++  })
++}
++
++function taskCompletionIsPartial(clause, task, completion) {
++  let start =
++    completion < task.index
++      ? Math.max(0, completion - 2)
++      : Math.min(task.index + 1, completion)
++  if (completion > task.index) {
++    const previousCompletion = tokenIndexes(
++      clause.tokens,
++      TASK_COMPLETION_TERMS,
++      task.index + 1,
++      completion
++    ).at(-1)
++    if (previousCompletion !== undefined) start = previousCompletion + 1
++  }
++  const end = Math.max(task.index, completion)
++  if (
++    tokenIndex(clause.tokens, PARTIAL_TASK_COMPLETION_TERMS, start, end) >= 0
++  ) {
++    return true
++  }
++  const tail = clause.tokens.slice(completion + 1, completion + 5)
++  const qualifierEnds = (index) =>
++    tail[index] === undefined ||
++    tail[index] === "then" ||
++    CLAUSE_COORDINATORS.has(tail[index])
++  let cursor = 0
++  if (new Set(["and", "but", "though", "yet"]).has(tail[cursor])) {
++    cursor += 1
++  }
++  if (new Set(["merely", "only"]).has(tail[cursor])) cursor += 1
++  let part = cursor + 1
++  if (new Set(["large", "significant", "substantial"]).has(tail[part])) {
++    part += 1
++  }
++  if (
++    tail[cursor] === "in" &&
++    tail[part] === "part" &&
++    qualifierEnds(part + 1)
++  ) {
++    return true
++  }
++  if (
++    tail[cursor] === "to" &&
++    new Set(["a", "an", "some"]).has(tail[cursor + 1]) &&
++    tail[cursor + 2] === "extent" &&
++    qualifierEnds(cursor + 3)
++  ) {
++    return true
++  }
++  const most = tail[cursor + 1] === "the" ? cursor + 2 : cursor + 1
++  if (
++    tail[cursor] === "for" &&
++    tail[most] === "most" &&
++    tail[most + 1] === "part" &&
++    qualifierEnds(most + 2)
++  ) {
++    return true
++  }
++  return (
++    PARTIAL_TASK_COMPLETION_TERMS.has(tail[cursor]) && qualifierEnds(cursor + 1)
++  )
++}
++
+ function completionBelongsToTask(clause, task, completion) {
+-  if (completion >= task.index && completion - task.index <= 4) {
++  if (taskCompletionIsPartial(clause, task, completion)) return false
++  const actionBoundary = [...clause.actionBoundaryAfter]
++    .filter((boundary) => boundary >= completion)
++    .sort((left, right) => left - right)[0]
++  const componentObject = tokenIndex(
++    clause.tokens,
++    TASK_COMPONENT_SUFFIX_TERMS,
++    completion + 1,
++    Math.min(
++      clause.tokens.length,
++      completion + 5,
++      actionBoundary === undefined ? clause.tokens.length : actionBoundary + 1
++    )
++  )
++  const componentObjectPrefix = clause.tokens.slice(
++    completion + 1,
++    componentObject < 0 ? completion + 1 : componentObject
++  )
++  if (
++    componentObject >= 0 &&
++    !componentObjectPrefix.some(
++      (token) =>
++        CLAUSE_COORDINATORS.has(token) ||
++        PEOPLE_ANTECEDENT_LINKS.has(token) ||
++        TASK_COMPONENT_STATE_LINKS.has(token) ||
++        TASK_STATE_CLAUSE_BOUNDARIES.has(token)
++    )
++  ) {
++    return false
++  }
++  const followingStateLink = tokenIndex(
++    clause.tokens,
++    TASK_COMPONENT_STATE_LINKS,
++    completion + 2,
++    completion + 12
++  )
++  const followingSubject = clause.tokens.slice(
++    completion + 1,
++    followingStateLink < 0 ? completion + 1 : followingStateLink
++  )
++  if (
++    completion > task.index &&
++    followingSubject.length > 0 &&
++    followingSubject.length <= 10 &&
++    followingSubject.some((token) => TASK_COMPONENT_SUFFIX_TERMS.has(token)) &&
++    !CLAUSE_COORDINATORS.has(followingSubject[0])
++  ) {
++    return false
++  }
++  if (completion >= task.index && completion - task.index <= 10) {
+     return clause.tokens
+       .slice(task.index + 1, completion)
+       .every(
+         (token) =>
+-          TASK_COMPLETION_BRIDGE_TERMS.has(token) || token.endsWith("ly")
++          TASK_COMPLETION_BRIDGE_TERMS.has(token) ||
++          TASK_COMPLETION_TERMS.has(token) ||
++          EXPLICIT_TASK_ACTIVITY_TERMS.has(token) ||
++          CLAUSE_COORDINATORS.has(token) ||
++          SEQUENTIAL_PASSIVE_RELATION_FILLERS.has(token) ||
++          TASK_COMPLETION_SEQUENCE_TERMS.has(token) ||
++          token.endsWith("ly")
+       )
+   }
+   if (
+     completion < task.index &&
+     task.index - completion <= 2 &&
+     clause.tokens[completion] !== "completion"
+   ) {
+     return true
+   }
+   if (clause.tokens[completion] !== "completion") return false
+   const objectLink = tokenIndex(
+     clause.tokens,
+     new Set(["of"]),
+     completion + 1,
+     task.index
+   )
+   return (
+     objectLink >= 0 &&
+     !(
+-      TASK_COMPONENT_SUFFIX_TERMS.has(clause.tokens[task.index + 1]) &&
+-      !clause.actionBoundaryAfter.has(task.index)
++      taskComponentIndex(clause, task) >= 0 &&
++      (!clause.actionBoundaryAfter.has(task.index) ||
++        taskComponentHasUnfinishedState(clause, task))
+     ) &&
+     tokenIndex(
+       clause.tokens,
+       TASK_REFERENCE_BOUNDARIES,
+       objectLink + 1,
+       task.index
+     ) < 0 &&
+     tokenIndex(
+       clause.tokens,
+       new Set([
+         ...PRODUCTION_ACTIONS,
+         ...DIRECT_ROUTE_ACTIONS,
+         ...REVIEW_TERMS,
+       ]),
+       objectLink + 1,
+       task.index
+     ) < 0
+   )
+ }
+ 
+-function taskHasCompletedState(clause, task) {
+-  return tokenIndexes(clause.tokens, TASK_COMPLETION_TERMS).some(
++function taskCompletedStateIndexes(clause, task) {
++  return tokenIndexes(clause.tokens, TASK_COMPLETION_TERMS).filter(
+     (state) =>
+       completionBelongsToTask(clause, task, state) &&
+       !actionIsNegated(clause.tokens, state)
+   )
+ }
+ 
++function taskHasCompletedState(clause, task) {
++  return taskCompletedStateIndexes(clause, task).length > 0
++}
++
++function affirmativeTaskActivityIndexes(clause, task) {
++  return taskActivityStateIndexes(clause, task).filter(
++    (state) => !actionIsNegated(clause.tokens, state)
++  )
++}
++
++function taskHasEffectiveExplicitActivity(clause, task) {
++  const activities = affirmativeTaskActivityIndexes(clause, task)
++  const completions = taskCompletedStateIndexes(clause, task)
++  if (activities.length > 0) {
++    if (completions.length === 0) return true
++    const lastCompletion = completions.at(-1)
++    if (lastCompletion < task.index) {
++      return activities.some((activity) => activity > task.index)
++    }
++    return activities.at(-1) > lastCompletion
++  }
++  return false
++}
++
++function taskIsEffectivelyActive(clause, task) {
++  if (taskHasEffectiveExplicitActivity(clause, task)) return true
++  const completions = taskCompletedStateIndexes(clause, task)
++  return (
++    taskStateIndexes(clause, task, new Set(["current"])).length > 0 &&
++    completions.length === 0
++  )
++}
++
+ function taskHasAffirmativeActivity(clause, task) {
+-  const explicit = taskStateIndexes(clause, task, EXPLICIT_TASK_ACTIVITY_TERMS)
++  const explicit = taskActivityStateIndexes(clause, task)
+   if (explicit.some((state) => !actionIsNegated(clause.tokens, state))) {
+     return true
+   }
+   return (
+     taskStateIndexes(clause, task, new Set(["current"])).length > 0 &&
+     !taskHasCompletedState(clause, task) &&
+     explicit.length === 0
+   )
+ }
+ 
+ function taskHasNegatedActivity(clause, task) {
+-  return taskStateIndexes(clause, task, EXPLICIT_TASK_ACTIVITY_TERMS).some(
+-    (state) => actionIsNegated(clause.tokens, state)
++  return taskActivityStateIndexes(clause, task).some((state) =>
++    actionIsNegated(clause.tokens, state)
+   )
+ }
+ 
+ function hasActiveTaskTiming(clause) {
+   return tokenIndexes(clause.tokens, ACTIVE_TIMING_MARKERS).some((marker) =>
+     clause.tasks.some(
+       (task) =>
+         Math.abs(task.index - marker) <= 8 &&
+         taskHasAffirmativeActivity(clause, task)
+     )
+@@ -3167,66 +4164,121 @@ function hasCompletedTaskTiming(clause) {
+ }
+ 
+ function hasPreCompletionTaskTiming(clause) {
+   return tokenIndexes(clause.tokens, PRE_COMPLETION_TIMING_MARKERS).some(
+     (marker) => timingReferencesCompletion(clause, marker)
+   )
+ }
+ 
+ function conflictsWithActiveTaskSwitch(clause) {
+   const { tokens } = clause
+-  const change = tokenIndex(
++  const changes = tokenIndexes(
+     tokens,
+     new Set([
+       "change",
+       "changes",
+       "changing",
+       "replace",
+       "replaces",
+       "replacing",
+       "switch",
+       "switches",
+       "switching",
+     ])
+   )
+-  if (change < 0 || actionIsNegated(tokens, change)) return false
+-  const hasAgent =
+-    tokenIndex(tokens, new Set(["agent", "agents"])) >= 0 ||
+-    clause.actors.some((actor) => ["codex", "task_agent"].includes(actor.role))
+-  if (!hasAgent) return false
++  const hasAffirmativeAgentChange = changes.some((change, index) => {
++    const actionBoundary = [...clause.actionBoundaryAfter]
++      .filter((boundary) => boundary < change)
++      .at(-1)
++    const changeSegmentStart =
++      Math.max(actionBoundary ?? -1, changes[index - 1] ?? -1) + 1
++    if (
++      actionIsNegated(
++        tokens.slice(changeSegmentStart, change + 1),
++        change - changeSegmentStart
++      )
++    ) {
++      return false
++    }
++    const subjectAgent = clause.actors
++      .filter(
++        (actor) =>
++          ["codex", "task_agent"].includes(actor.role) &&
++          actor.end <= change &&
++          tokens.slice(actor.end, change).every((token) => token.endsWith("ly"))
++      )
++      .at(-1)
++    if (subjectAgent) return true
++    const segment = actionSegment(clause, change)
++    const targetEnd = Math.min(
++      segment.end,
++      changes[index + 1] ?? clause.tokens.length
++    )
++    const agentToken = tokenIndex(
++      tokens,
++      new Set(["agent", "agents"]),
++      change + 1,
++      targetEnd
++    )
++    const agentActor = clause.actors.find(
++      (actor) =>
++        ["codex", "task_agent"].includes(actor.role) &&
++        actor.start > change &&
++        actor.end <= targetEnd
++    )
++    const target = [agentToken, agentActor?.start]
++      .filter((candidate) => candidate !== undefined && candidate >= 0)
++      .sort((left, right) => left - right)[0]
++    if (target === undefined) return false
++    const targetBoundary = [...clause.actionBoundaryAfter]
++      .filter((boundary) => boundary >= change && boundary < target)
++      .at(-1)
++    const excludedAlternative = positionIsExcludedAlternative(
++      clause,
++      alternativeExclusionStart(clause, { index: change }, targetEnd),
++      target
++    )
++    return (
++      !excludedAlternative &&
++      tokenIndex(
++        tokens,
++        NEGATION_TERMS,
++        (targetBoundary ?? change) + 1,
++        target
++      ) < 0
++    )
++  })
++  if (!hasAffirmativeAgentChange) return false
+   if (hasActiveTaskTiming(clause)) return true
+   if (hasPreCompletionTaskTiming(clause)) return true
+   if (hasCompletedTaskTiming(clause)) {
+-    const laterActiveState = clause.tasks.some(
+-      (task) =>
+-        taskStateIndexes(clause, task, EXPLICIT_TASK_ACTIVITY_TERMS).some(
+-          (state) => !actionIsNegated(clause.tokens, state)
+-        ) && !taskHasCompletedState(clause, task)
++    const laterActiveState = clause.tasks.some((task) =>
++      taskHasEffectiveExplicitActivity(clause, task)
+     )
+     return laterActiveState
+   }
+   if (
+     clause.tasks.some(
+       (task) =>
+-        taskHasAffirmativeActivity(clause, task) &&
+-        taskStateIndexes(clause, task, EXPLICIT_TASK_ACTIVITY_TERMS).length > 0
++        taskIsEffectivelyActive(clause, task) &&
++        taskActivityStateIndexes(clause, task).length > 0
+     )
+   ) {
+     return true
+   }
+   if (clause.tasks.some((task) => taskHasCompletedState(clause, task))) {
+     return false
+   }
+   if (clause.priorTasks.some((task) => task.active)) return true
+   if (clause.priorTasks.some((task) => task.completed)) return false
+   if (hasNegatedTaskActivityTiming(clause)) return false
+-  return clause.tasks.some((task) => taskHasAffirmativeActivity(clause, task))
++  return clause.tasks.some((task) => taskIsEffectivelyActive(clause, task))
+ }
+ 
+ function reviewerIsRequiredByContract(reviewer) {
+   return (
+     (reviewer.primary ||
+       reviewer.auxiliary ||
+       reviewer.codex ||
+       reviewer.required) &&
+     !reviewer.optionalDocument
+   )
+@@ -3336,38 +4388,126 @@ function substitutionReviewTarget(clause, bypass) {
+   const objectReviewer =
+     clause.reviewers.find(
+       (reviewer) =>
+         reviewer.index > objectLink && reviewer.index <= objectLink + 5
+     ) ?? null
+   if (
+     objectReviewer &&
+     !reviewerIsRequiredByContract(objectReviewer) &&
+     clause.tokens
+       .slice(objectLink + 1, objectReviewer.index)
+-      .some((token) => REVIEW_TARGET_DEMONSTRATIVES.has(token)) &&
++      .some((token) => REVIEW_TARGET_ANAPHORIC_TERMS.has(token)) &&
+     clause.tokens
+       .slice(objectLink + 1, objectReviewer.index)
+-      .every((token) => GENERIC_REVIEW_TARGET_PREFIX_TERMS.has(token))
++      .every(
++        (token) =>
++          GENERIC_REVIEW_TARGET_PREFIX_TERMS.has(token) ||
++          token.endsWith("ed") ||
++          token.endsWith("ly")
++      )
+   ) {
+     const replacementSubject = clause.reviewers
+       .filter((reviewer) => reviewer.index < bypass)
+       .at(-1)
+     return reviewAntecedentBefore(clause, replacementSubject?.index ?? bypass)
+   }
+-  const requiredPrimary = phraseIndex(
++  const objectTail = clause.tokens.slice(
++    objectLink + 1,
++    Math.min(clause.tokens.length, objectLink + 7)
++  )
++  const anaphoricOne = objectTail.findIndex(
++    (token, index) =>
++      token === "one" &&
++      objectTail
++        .slice(0, index)
++        .some((prefix) =>
++          new Set([
++            ...REVIEW_TARGET_ANAPHORIC_TERMS,
++            "mandatory",
++            "required",
++          ]).has(prefix)
++        )
++  )
++  if (!objectReviewer && anaphoricOne >= 0) {
++    const replacementSubject = clause.reviewers
++      .filter((reviewer) => reviewer.index < bypass)
++      .at(-1)
++    return reviewAntecedentBefore(clause, replacementSubject?.index ?? bypass)
++  }
++  const requiredPersonReference =
++    objectTail.some((token) => REVIEW_REQUIREMENT_ACTIONS.has(token)) &&
++    objectTail.some((token) => REVIEW_TARGET_GENERIC_PERSON_TERMS.has(token))
++  const requiredSlot = tokenIndexes(
+     clause.tokens,
+-    ["required", "primary"],
++    new Set(["auxiliary", "primary"]),
+     objectLink + 1,
+     objectLink + 6
++  ).find(
++    (slot) =>
++      tokenIndex(
++        clause.tokens,
++        REVIEW_REQUIREMENT_ACTIONS,
++        objectLink + 1,
++        slot
++      ) >= 0
++  )
++  const requiredSlotObjectEnd = tokenIndex(
++    clause.tokens,
++    REVIEW_TARGET_ADJUNCT_LINKS,
++    (requiredSlot ?? objectLink) + 1,
++    (requiredSlot ?? objectLink) + 6
++  )
++  const explicitRoleTail = clause.tokens.slice(
++    (requiredSlot ?? objectLink) + 1,
++    requiredSlotObjectEnd < 0
++      ? (requiredSlot ?? objectLink) + 6
++      : requiredSlotObjectEnd
+   )
+-  if (!objectReviewer && requiredPrimary >= 0) {
+-    return { index: requiredPrimary + 1, primary: true }
++  const explicitRoleHead = explicitRoleTail.findLast(
++    (token) => !token.endsWith("ed") && !token.endsWith("ly")
++  )
++  const genericPerson = objectTail.findIndex((token) =>
++    REVIEW_TARGET_GENERIC_PERSON_TERMS.has(token)
++  )
++  const requirement = objectTail.findIndex((token) =>
++    REVIEW_REQUIREMENT_ACTIONS.has(token)
++  )
++  const genericPersonHasRoleQualifier =
++    genericPerson >= 0 &&
++    objectTail
++      .slice(Math.max(0, requirement + 1), genericPerson)
++      .some(
++        (token) =>
++          !new Set(["a", "an", "auxiliary", "primary", "the"]).has(token)
++      )
++  const hasExplicitUnrelatedRole =
++    genericPerson >= 0
++      ? genericPersonHasRoleQualifier
++      : explicitRoleHead !== undefined &&
++        !REVIEW_TARGET_NON_ROLE_HEAD_TERMS.has(explicitRoleHead)
++  if (!objectReviewer && requiredPersonReference && !hasExplicitUnrelatedRole) {
++    const replacementSubject = clause.reviewers
++      .filter((reviewer) => reviewer.index < bypass)
++      .at(-1)
++    return reviewAntecedentBefore(clause, replacementSubject?.index ?? bypass)
++  }
++  if (
++    !objectReviewer &&
++    requiredSlot !== undefined &&
++    !hasExplicitUnrelatedRole
++  ) {
++    return {
++      index: requiredSlot,
++      auxiliary: clause.tokens[requiredSlot] === "auxiliary",
++      primary: clause.tokens[requiredSlot] === "primary",
++      required: true,
++    }
+   }
+   return objectReviewer
+ }
+ 
+ function reviewTargetForBypass(clause, bypass) {
+   const segment = actionSegment(clause, bypass)
+   const reviewers = clause.reviewers.filter(
+     (reviewer) =>
+       reviewer.index >= segment.start && reviewer.index < segment.end
+   )
+diff --git a/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.test.mjs b/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.test.mjs
+index c6e11f18..cec77f91 100644
+--- a/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.test.mjs
++++ b/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.test.mjs
+@@ -2813,20 +2813,1363 @@ describe("Skill contract v2", () => {
+         reject: false,
+       },
+       {
+         prose:
+           "High Tasks are reviewed by Codex and the Task Agent reviewer is often found not missing.",
+         reject: false,
+       },
+     ])
+   })
+ 
++  it("round-15 distinguishes Task component states from separated actions", () => {
++    assertSkillClassifications([
++      {
++        prose:
++          "The current Task is running. After completion of the active Task: review remains incomplete. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The current Task is running. After completion of the active Task, testing remains unfinished. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The current Task is running. After completion of the active Task: validation is still ongoing. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The current Task is running. After completion of the active Task: the review remains incomplete. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The current Task is running. After completion of the active Task: its review remains incomplete. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The current Task is running. After completion of the active Task: its final independent security review remains incomplete. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The current Task is running. After completion of the active Task: the final review remains incomplete. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The current Task is running. After completion of the active Task: review has not finished. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The current Task is running. After completion of the active Task: review has yet to finish. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The current Task is running. After completion of the active Task: review remains to be finished. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The current Task is running. After completion of the active Task (review pending), switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The current Task is running. After completion of the active Task (validation underway), switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The current Task is running. After completion of the active Task (review not complete), switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The current Task is running. After completion of the active Task (review pending final approval), switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The current Task is running. After completion of the active Task: review pending findings, then switch the Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "The current Task is running. After completion of the active Task (review not yet complete), switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The current Task is running. After completion of the active Task: review and testing remain incomplete. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The current Task is running. After completion of the active Task: review is not pending. Then switch the Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "The current Task is running. After completion of the active Task: review is not incomplete. Then switch the Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "The current Task is running. After completion of the active Task: carefully review pending issues, then switch the Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "The current Task is running. After completion of the active Task: review remains anything but complete. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The current Task is running. After completion of the active Task: review is scarcely complete. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The current Task is running. After completion of the active Task: review is almost complete. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The current Task is running. After completion of the active Task: review is barely complete. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The current Task is running. After completion of the active Task: review remains nowhere near complete. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The current Task is running. After completion of the active Task: review is fully complete. Then switch the Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "The current Task is running. After completion of the active Task: review is no longer incomplete. Then switch the Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "The current Task is running. After completion of the active Task: review is still pending. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The current Task is running. After completion of the active Task: review is complete. Then switch the Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "The current Task is running. After completion of the active Task: review still continues. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The current Task is running. After completion of the active Task - review the report and switch the Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "The current Task is running. After completion of the active Task -- test the results and switch the Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "The current Task is running. After completion of the active Task \u2014 validate the results and switch the Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "The current Task is running. After completion of the active Task (review the report) and switch the Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "The current Task is running. After completion of the active Task / review the report and switch the Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "The current Task is running. After completion of the active Task, review findings and switch the Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "The current Task is running. After completion of the active Task: test results and switch the Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "The current Task is running. After completion of the active Task: test whether the server is still running, then switch the Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "After completion of the active Task: review open issues, then switch the Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "After completion of the active Task: test running services, then switch the Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "The current Task is running. After completion of the active Task: review carefully, then continue by switching the Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "The current Task is running. After completion of the active Task review, switch the Task Agent.",
++        reject: true,
++      },
++    ])
++  })
++
++  it("round-15 resolves qualified anaphoric and explicit take-role targets", () => {
++    assertSkillClassifications([
++      {
++        prose:
++          "The Codex reviewer is mandatory. Another reviewer takes on the role of that very reviewer.",
++        reject: true,
++      },
++      {
++        prose:
++          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of that former reviewer.",
++        reject: true,
++      },
++      {
++        prose:
++          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of this original reviewer.",
++        reject: true,
++      },
++      {
++        prose:
++          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the former reviewer.",
++        reject: true,
++      },
++      {
++        prose:
++          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of that previous reviewer.",
++        reject: true,
++      },
++      {
++        prose:
++          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the aforementioned reviewer.",
++        reject: true,
++      },
++      {
++        prose:
++          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of that previously assigned reviewer.",
++        reject: true,
++      },
++      {
++        prose:
++          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of that previously designated reviewer.",
++        reject: true,
++      },
++      {
++        prose:
++          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required primary note taker.",
++        reject: false,
++      },
++      {
++        prose:
++          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required primary meeting note taker.",
++        reject: false,
++      },
++      {
++        prose:
++          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required primary note-taker.",
++        reject: false,
++      },
++      {
++        prose:
++          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required primary for this Task.",
++        reject: true,
++      },
++      {
++        prose:
++          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required primary for the producer.",
++        reject: true,
++      },
++      {
++        prose:
++          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required primary during final review.",
++        reject: true,
++      },
++      {
++        prose:
++          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required primary temporarily.",
++        reject: true,
++      },
++      {
++        prose:
++          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required primary whenever needed.",
++        reject: true,
++      },
++      {
++        prose:
++          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required primary after the implementer leaves.",
++        reject: true,
++      },
++      {
++        prose:
++          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required primary once the implementer leaves.",
++        reject: true,
++      },
++      {
++        prose:
++          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required primary if the implementer leaves.",
++        reject: true,
++      },
++      {
++        prose:
++          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required primary until the implementer returns.",
++        reject: true,
++      },
++      {
++        prose:
++          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required primary because the implementer left.",
++        reject: true,
++      },
++      {
++        prose:
++          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required primary unless the implementer returns.",
++        reject: true,
++      },
++      {
++        prose:
++          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required primary upon the implementer's departure.",
++        reject: true,
++      },
++      {
++        prose:
++          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required primary note taker once the implementer leaves.",
++        reject: false,
++      },
++      {
++        prose:
++          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required primary in case the producer leaves.",
++        reject: true,
++      },
++      {
++        prose:
++          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required primary as soon as the implementer leaves.",
++        reject: true,
++      },
++      {
++        prose:
++          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required primary meeting facilitator.",
++        reject: false,
++      },
++      {
++        prose:
++          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required primary contact person.",
++        reject: false,
++      },
++      {
++        prose:
++          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required contact person.",
++        reject: false,
++      },
++      {
++        prose:
++          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required primary now.",
++        reject: true,
++      },
++      {
++        prose:
++          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required primary selected for this Task.",
++        reject: true,
++      },
++      {
++        prose:
++          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required primary slot.",
++        reject: true,
++      },
++      {
++        prose:
++          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required auxiliary slot.",
++        reject: true,
++      },
++      {
++        prose:
++          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required primary today.",
++        reject: true,
++      },
++      {
++        prose:
++          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required individual.",
++        reject: true,
++      },
++      {
++        prose:
++          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required party.",
++        reject: true,
++      },
++      {
++        prose:
++          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required primary assigned to this Task.",
++        reject: true,
++      },
++      {
++        prose:
++          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required primary designated by the Plan.",
++        reject: true,
++      },
++      {
++        prose:
++          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the same one.",
++        reject: true,
++      },
++      {
++        prose:
++          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the mandatory one.",
++        reject: true,
++      },
++      {
++        prose:
++          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required primary meeting note taker temporarily.",
++        reject: false,
++      },
++      {
++        prose:
++          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of their advisory reviewer.",
++        reject: false,
++      },
++      {
++        prose:
++          "The Codex reviewer is mandatory. Another reviewer takes on the role of that optional Design reviewer.",
++        reject: false,
++      },
++      {
++        prose:
++          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required primary.",
++        reject: true,
++      },
++      {
++        prose:
++          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required primary reviewer.",
++        reject: true,
++      },
++    ])
++  })
++
++  it("round-15 binds people antecedents to their actual relations", () => {
++    assertSkillClassifications([
++      {
++        prose:
++          "The developers revise the Plan and Design for the reviewers' archive. The parent edits both of them.",
++        reject: true,
++      },
++      {
++        prose:
++          "The developers revise the Plan and Design for the archive of the reviewers. The parent edits both of them.",
++        reject: true,
++      },
++      {
++        prose:
++          "The developers revise the Plan and Design with the reviewers' annotations. The parent edits both of them.",
++        reject: true,
++      },
++      {
++        prose:
++          "The developers revise the Plan and Design on behalf of the reviewers' organization. The parent edits both of them.",
++        reject: true,
++      },
++      {
++        prose:
++          "The developers revise the Plan and Design by consulting both reviewers. The parent updates them on progress.",
++        reject: false,
++      },
++      {
++        prose:
++          "The developers revise the Plan and Design after consulting both reviewers. The parent updates them on progress.",
++        reject: false,
++      },
++      {
++        prose:
++          "The developers revise the Plan and Design reviewed by the senior reviewers. The parent updates them on progress.",
++        reject: false,
++      },
++      {
++        prose:
++          "The developers revise the Plan and Design reviewed by the external reviewers. The parent updates them on progress.",
++        reject: false,
++      },
++      {
++        prose:
++          "The developers revise the Plan and Design reviewed by 3 reviewers. The parent updates them on progress.",
++        reject: false,
++      },
++      {
++        prose:
++          "The developers revise the Plan and Design reviewed by the currently available reviewers. The parent updates them on progress.",
++        reject: false,
++      },
++      {
++        prose:
++          "The developers revise the Plan and Design by consulting both senior and external reviewers. The parent updates them on progress.",
++        reject: false,
++      },
++      {
++        prose:
++          "The developers revise the Plan and Design by consulting senior and external reviewers. The parent updates them on progress.",
++        reject: false,
++      },
++      {
++        prose:
++          "The developers revise the Plan and Design by consulting all of the currently available external reviewers. The parent updates them on progress.",
++        reject: false,
++      },
++      {
++        prose:
++          "The Plan Author revises the Plan and Design by carefully consulting all of the currently available external security reviewers. The parent updates them on progress.",
++        reject: false,
++      },
++      {
++        prose:
++          "The Plan Author revises the Plan and Design using feedback from the reviewers. The parent updates them on progress.",
++        reject: false,
++      },
++      {
++        prose:
++          "The Plan Author revises the Plan and Design alongside the reviewers. The parent updates them on progress.",
++        reject: false,
++      },
++      {
++        prose:
++          "The developers revise the Plan and Design for clarity: reviewers observe. The parent edits both of them.",
++        reject: true,
++      },
++      {
++        prose:
++          "The developers revise the Plan and Design for clarity so that three reviewers can respond. The parent edits both of them.",
++        reject: true,
++      },
++      {
++        prose:
++          "The developers revise the Plan and Design reviewed by locally and internationally recognized reviewers yesterday. The parent updates them on progress.",
++        reject: false,
++      },
++      {
++        prose:
++          "The Plan Author revises the Plan and Design for the reviewers who requested changes. The parent updates them on progress.",
++        reject: false,
++      },
++      {
++        prose:
++          "The developers revise the Plan and Design reviewed by senior and external reviewers. The parent updates them on progress.",
++        reject: false,
++      },
++      {
++        prose:
++          "The developers send the Plan and Design to the assigned reviewers. The parent updates them on progress.",
++        reject: false,
++      },
++      {
++        prose:
++          "The developers revise the Plan and Design for clarity while the reviewers observe. The parent edits them.",
++        reject: true,
++      },
++      {
++        prose:
++          "The developers revise the Plan and Design for clarity after the reviewers leave. The parent edits both of them.",
++        reject: true,
++      },
++      {
++        prose:
++          "The developers revise the Plan and Design for clarity since the reviewers left. The parent edits both of them.",
++        reject: true,
++      },
++      {
++        prose:
++          "The developers revise the Plan and Design for clarity and both reviewers observe. The parent edits both of them.",
++        reject: true,
++      },
++      {
++        prose:
++          "The developers revise the Plan and Design by working carefully and the reviewers observe. The parent edits both of them.",
++        reject: true,
++      },
++      {
++        prose:
++          "The developers revise the Plan and Design by working independently, then the reviewers observe. The parent edits both of them.",
++        reject: true,
++      },
++      {
++        prose:
++          "The developers revise the Plan and Design by working independently, and reviewers observe. The parent edits both of them.",
++        reject: true,
++      },
++      {
++        prose:
++          "The developers revise the Plan and Design by working independently, and senior reviewers observe. The parent edits both of them.",
++        reject: true,
++      },
++      {
++        prose:
++          "The developers revise the Plan and Design by working independently and reviewers observe. The parent edits both of them.",
++        reject: true,
++      },
++      {
++        prose:
++          "The developers revise the Plan and Design reviewed by senior, external, and security reviewers. The parent updates them on progress.",
++        reject: false,
++      },
++      {
++        prose:
++          "The developers revise the Plan and Design by working hard, and senior reviewers observe. The parent edits both of them.",
++        reject: true,
++      },
++      {
++        prose:
++          "The developers revise the Plan and Design reviewed by locally and internationally recognized reviewers. The parent updates them on progress.",
++        reject: false,
++      },
++    ])
++  })
++
++  it("round-15 distinguishes reviewer absence from transitive predicates", () => {
++    assertSkillClassifications([
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing right now.",
++        reject: true,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing this morning.",
++        reject: true,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing altogether.",
++        reject: true,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing at present.",
++        reject: true,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing as usual.",
++        reject: true,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing once more.",
++        reject: true,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing every Friday.",
++        reject: true,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing twice today.",
++        reject: true,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing because their assignment ended.",
++        reject: true,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing this afternoon.",
++        reject: true,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing tomorrow.",
++        reject: true,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing due to illness.",
++        reject: true,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing all day.",
++        reject: true,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing over the weekend.",
++        reject: true,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing without explanation.",
++        reject: true,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing throughout the day.",
++        reject: true,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing with no explanation.",
++        reject: true,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing all weekend.",
++        reject: true,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing across the weekend.",
++        reject: true,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing the entire day.",
++        reject: true,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing every other day.",
++        reject: true,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing all quarter.",
++        reject: true,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing three days.",
++        reject: true,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing the next three days.",
++        reject: true,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing these three days.",
++        reject: true,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing several days.",
++        reject: true,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing a few days.",
++        reject: true,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing most of the week.",
++        reject: true,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing the coming week.",
++        reject: true,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing half the week.",
++        reject: true,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing a couple of days.",
++        reject: true,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing every single day.",
++        reject: true,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing one and a half days.",
++        reject: true,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing the first three days.",
++        reject: true,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing a couple of findings.",
++        reject: false,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing the first three deadlines.",
++        reject: false,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing a day and a half.",
++        reject: true,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing the past week.",
++        reject: true,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing a dozen findings.",
++        reject: false,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing the next three deadlines.",
++        reject: false,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing yesterday morning.",
++        reject: true,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing - critical context.",
++        reject: false,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing (critical) context.",
++        reject: false,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing over half the required findings.",
++        reject: false,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing at least one deadline.",
++        reject: false,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing context.",
++        reject: false,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing evidence.",
++        reject: false,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing input.",
++        reject: false,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing the deadline.",
++        reject: false,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is lacking context.",
++        reject: false,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is lacking in experience.",
++        reject: false,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is lacking in critical context.",
++        reject: false,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is lacking technically.",
++        reject: false,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is lacking entirely.",
++        reject: true,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is lacking completely.",
++        reject: true,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing today because their assignment ended.",
++        reject: true,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is lacking all week due to illness.",
++        reject: true,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing today and tomorrow because their assignment ended.",
++        reject: true,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is lacking today and tomorrow.",
++        reject: true,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing all morning and afternoon.",
++        reject: true,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing all context and evidence.",
++        reject: false,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing Friday's deadline.",
++        reject: false,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is missing from the route.",
++        reject: true,
++      },
++    ])
++  })
++
++  it("round-15 preserves carried Task activity and completion order", () => {
++    assertSkillClassifications([
++      {
++        prose:
++          "The active Task is partially completed. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The active Task is only partly completed. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The active Task is provisionally completed. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The active Task is running. The Task Agent switches immediately.",
++        reject: true,
++      },
++      {
++        prose:
++          "The active Task is partially completed, but is now fully completed. Then switch the Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "The currently active Task is completed but is still running. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The active Task is completed and still running. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The active Task is completed but after the final checks is still actively running. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The active Task is completed but, according to telemetry, it is still running. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The active Task is completed but according to telemetry, it is still running. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The active Task is completed but according to the integration service itself, it is still running. Then switch the Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "The active Task is completed but in fact it remains active. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The active Task is fully completed while the integration service is still running. Then switch the Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "The active Task is completed but its validation is still running. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The active Task is completed but the review is still running. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose: "The Task continues running. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The active Task is completed but it is still running. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The active Task is completed but after final checks the integration service is still running. Then switch the Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "The active Task is completed but after release the server is still running. Then switch the Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "The active Task is completed but after checks service is still running. Then switch the Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "The active Task is completed but the service is restarted and it is still running. Then switch the Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "The active Task is completed, but only provisionally. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The active Task is completed, but only partly. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The active Task is completed, but only partially. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The active Task is completed in part. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The active Task is completed, though only partially. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The active Task is completed, yet only partly. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The active Task is completed only in part. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The active Task is completed merely in part. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The active Task is completed to some extent. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The active Task is completed to the full extent required. Then switch the Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "The active Task is nearly completed. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The active Task is completed in large part. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The active Task is fully completed but only partially celebrated. Then switch the Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "The Task is running and then completed. Then switch the Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "The Task is running and then it completed. Then switch the Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "The Task is running, but it has now completed. Then switch the Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "The Task is running and then it completed validation. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The Task is running and then it finished its review. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The Task is running and then it completed, then review findings and switch the Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "The Task is running. It completed validation. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The active Task is running. The separate build server reports that it completed. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose: "The Task is running. It completed. Then switch the Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "The Task is running. After final checks, it was fully completed. Then switch the Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "The Task is running. Then it completed. Then switch the Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "The active Task is running and completed reviews are archived. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The active Task is running and completed code reviews are archived. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The active Task is running and completed integration tests are archived. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The active Task is running and completed reviews of the implementation are archived. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The active Task is running and completed final independent external security reviews are archived. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The active Task is running and completed reviews and tests are archived. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The active Task is running and completed reviews and validation are archived. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The Task is completed and then running. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The Task is completed and then it starts running again. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The Task is completed, but afterward it resumes running. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The Task is completed, but it resumes. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The Task is completed, but it starts again. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The Task is completed, but it restarts. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The Task is completed, but it begins again. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The Task is completed, but it becomes active again. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The Task is completed, but the server restarts. Then switch the Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "The Task is completed, but the server becomes active again. Then switch the Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "The Task is completed, but it appears the server is still running. Then switch the Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "The active Task is running. Do not switch the build server, but switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The active Task is running. Switch the build server, but do not switch the Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "The active Task is running. Switch the build server, not the Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "The active Task is running. Switch the build server rather than the Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "The active Task is running. Switch the Task Agent rather than the build server.",
++        reject: true,
++      },
++      {
++        prose:
++          "The active Task is running. Do not change the build server. Switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The active Task is completed. Do not change the build server. Switch the Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "The active Task is running. Do not change the build server before switching the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The active Task is running. Do not switch the Task Agent while it runs; switch the Task Agent after it completes.",
++        reject: false,
++      },
++      {
++        prose:
++          "The active Task is fully completed. Then switch the Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "The active Task is completed and is no longer running. Then switch the Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "The active Task is mostly completed. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The active Task is completed for the most part. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The active Task is largely completed. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The active Task is substantially completed. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The active Task is almost completed. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The active Task is barely completed. Then switch the Task Agent.",
++        reject: true,
++      },
++    ])
++  })
++
+   it("contains the complete operational policy and document JSON shapes", () => {
+     const policy = fencedJsonAfterHeading(
+       realSkill,
+       "### Operational policy JSON"
+     )
+     assert.deepEqual(policy.design_review_triggers, [
+       "spans_modules",
+       "migration",
+       "concurrency",
+       "security",

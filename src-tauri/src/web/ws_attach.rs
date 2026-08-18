@@ -11,8 +11,8 @@
 //! The legacy global `acp://event` channel remains active during Phase 1-3
 //! for backward compatibility; Phase 4 retires it.
 
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::{fmt, sync::atomic::Ordering};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -21,6 +21,7 @@ use tokio::task::JoinHandle;
 use crate::acp::internal_bus::EventBusMetrics;
 use crate::acp::manager::ConnectionManager;
 use crate::acp::session_state::LiveSessionSnapshot;
+use crate::acp::shared_session::{LeaseSocketBinding, SharedSessionBroker};
 use crate::acp::types::EventEnvelope;
 
 /// Maximum number of events delivered in a single `replay` response. Larger
@@ -35,7 +36,7 @@ pub const REPLAY_BATCH_THRESHOLD: usize = 32;
 /// memory blow up if the client stops reading.
 pub const OUTBOUND_CAPACITY: usize = 64;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum ClientMsg {
     /// Subscribe this WebSocket to a specific connection's event stream.
@@ -45,12 +46,42 @@ pub enum ClientMsg {
         subscription_id: String,
         connection_id: String,
         #[serde(default)]
+        generation: Option<u64>,
+        #[serde(default)]
+        lease_id: Option<String>,
+        #[serde(default)]
         since_seq: Option<u64>,
     },
     /// Cancel a prior `attach` by `subscription_id`.
     Detach { subscription_id: String },
     /// Liveness check. Server replies with `pong`.
     Ping,
+}
+
+impl fmt::Debug for ClientMsg {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Attach {
+                subscription_id,
+                connection_id,
+                generation,
+                lease_id,
+                since_seq,
+            } => formatter
+                .debug_struct("ClientMsg::Attach")
+                .field("subscription_id", subscription_id)
+                .field("connection_id", connection_id)
+                .field("generation", generation)
+                .field("lease_id", &lease_id.as_ref().map(|_| "***"))
+                .field("since_seq", since_seq)
+                .finish(),
+            Self::Detach { subscription_id } => formatter
+                .debug_struct("ClientMsg::Detach")
+                .field("subscription_id", subscription_id)
+                .finish(),
+            Self::Ping => formatter.write_str("ClientMsg::Ping"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -89,13 +120,21 @@ pub enum ServerMsg {
     Pong,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DetachReason {
     /// `connection_id` is unknown to the manager (possibly GC'd, possibly
     /// never existed). Client should treat this as a terminal state for
     /// the conversation.
     ConnectionGone,
+    /// The supplied generation does not match the current shared session.
+    GenerationStale,
+    /// The supplied client lease id is not active on this generation.
+    LeaseMissing,
+    /// The supplied client lease id was recently expired.
+    LeaseExpired,
+    /// The public connection was replaced after a failed generation.
+    SessionReplaced,
     /// The per-connection broadcast channel dropped events because this
     /// subscriber couldn't keep up. Client must re-attach with its
     /// `lastAppliedSeq` to resync.
@@ -110,6 +149,7 @@ pub enum DetachReason {
 pub struct AttachOutcome {
     pub initial_msg: ServerMsg,
     pub receiver: tokio::sync::broadcast::Receiver<Arc<EventEnvelope>>,
+    pub binding: Option<LeaseSocketBinding>,
 }
 
 /// Decide-and-subscribe under a single `SessionState` read lock. The
@@ -125,12 +165,28 @@ pub async fn handle_attach(
     metrics: &EventBusMetrics,
     subscription_id: String,
     connection_id: String,
+    generation: Option<u64>,
+    lease_id: Option<String>,
     since_seq: Option<u64>,
 ) -> Result<AttachOutcome, DetachReason> {
-    let state_arc = manager
-        .get_state(&connection_id)
+    let broker = manager.shared_session_broker();
+    let (binding, retained_state) = match broker
+        .validate_and_bind_lease_with_state(&connection_id, generation, lease_id.as_deref())
         .await
-        .ok_or(DetachReason::ConnectionGone)?;
+    {
+        Ok((binding, state)) => (Some(binding), Some(state)),
+        Err(DetachReason::ConnectionGone) if generation.is_none() && lease_id.is_none() => {
+            (None, None)
+        }
+        Err(reason) => return Err(reason),
+    };
+    let state_arc = match retained_state {
+        Some(state) => state,
+        None => manager
+            .get_state(&connection_id)
+            .await
+            .ok_or(DetachReason::ConnectionGone)?,
+    };
 
     let s = state_arc.read().await;
 
@@ -142,11 +198,18 @@ pub async fn handle_attach(
     //   - cursor in ring buffer with small gap → replay
     //   - cursor in ring buffer with large gap → snapshot (cheaper)
     //   - cursor older than ring buffer → snapshot (only choice)
-    let snapshot_msg = || ServerMsg::Snapshot {
-        subscription_id: subscription_id.clone(),
-        connection_id: connection_id.clone(),
-        snapshot: Box::new(s.to_snapshot()),
-        event_seq: s.event_seq,
+    let snapshot_msg = || {
+        let mut snapshot = s.to_snapshot();
+        if let (Some(shared), Some(binding)) = (snapshot.shared_session.as_mut(), binding.as_ref())
+        {
+            shared.lease_expires_at = Some(binding.lease_expires_at);
+        }
+        ServerMsg::Snapshot {
+            subscription_id: subscription_id.clone(),
+            connection_id: connection_id.clone(),
+            snapshot: Box::new(snapshot),
+            event_seq: s.event_seq,
+        }
     };
 
     let initial_msg = match since_seq {
@@ -192,6 +255,7 @@ pub async fn handle_attach(
     Ok(AttachOutcome {
         initial_msg,
         receiver,
+        binding,
     })
 }
 
@@ -199,6 +263,9 @@ pub async fn handle_attach(
 /// and sends `Event` frames to the shared outbound channel. Exits on
 /// receiver close (connection went away) or `Lagged` (slow consumer); in
 /// both cases sends a `Detached` frame so the client knows to re-attach.
+/// Lease-bound subscriptions keep their binding in the WS subscription map
+/// when the retained state stream closes, allowing the next ping to classify
+/// a replacement through the broker's bounded generation tombstone.
 ///
 /// `cleanup_tx` carries `(subscription_id, epoch)` back to the WS main loop
 /// on every self-exit path so the loop can drop the now-completed
@@ -216,6 +283,7 @@ pub async fn handle_attach(
 ///
 /// `metrics` records `Lagged` exits so operators can correlate attach
 /// re-attachment storms with per-connection broadcast pressure.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_forwarder(
     subscription_id: String,
     epoch: u64,
@@ -223,6 +291,8 @@ pub fn spawn_forwarder(
     mut receiver: tokio::sync::broadcast::Receiver<Arc<EventEnvelope>>,
     outbound: mpsc::Sender<ServerMsg>,
     cleanup_tx: mpsc::Sender<(String, u64)>,
+    broker: SharedSessionBroker,
+    binding: Option<LeaseSocketBinding>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let signal_cleanup = || {
@@ -262,10 +332,25 @@ pub fn spawn_forwarder(
                     return;
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    let reason = match binding.as_ref() {
+                        Some(binding) => match broker
+                            .validate_and_bind_lease(
+                                &binding.connection_id,
+                                Some(binding.generation),
+                                Some(&binding.lease_id),
+                            )
+                            .await
+                        {
+                            Err(DetachReason::SessionReplaced) => return,
+                            Err(reason) => reason,
+                            Ok(_) => DetachReason::ConnectionGone,
+                        },
+                        None => DetachReason::ConnectionGone,
+                    };
                     let _ = outbound
                         .send(ServerMsg::Detached {
                             subscription_id: subscription_id.clone(),
-                            reason: DetachReason::ConnectionGone,
+                            reason,
                         })
                         .await;
                     signal_cleanup();
@@ -274,4 +359,24 @@ pub fn spawn_forwarder(
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn client_message_debug_redacts_lease_id() {
+        let message = ClientMsg::Attach {
+            subscription_id: "subscription".into(),
+            connection_id: "connection".into(),
+            generation: Some(7),
+            lease_id: Some("lease-secret".into()),
+            since_seq: None,
+        };
+
+        let debug = format!("{message:?}");
+        assert!(!debug.contains("lease-secret"));
+        assert!(debug.contains("***"));
+    }
 }

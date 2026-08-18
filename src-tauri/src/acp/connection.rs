@@ -512,6 +512,7 @@ struct ConnectionCleanupGuard {
     connection_id: String,
     connection_incarnation: String,
     tool_lease_registry: Arc<crate::acp::tool_watchdog::ToolExecutionLeaseRegistry>,
+    runtime: tokio::runtime::Handle,
 }
 
 impl Drop for ConnectionCleanupGuard {
@@ -524,7 +525,7 @@ impl Drop for ConnectionCleanupGuard {
         // entry becomes invisible to routing/scan. Manager-controlled disconnect
         // paths also clear synchronously; this path covers natural task exit
         // and panic unwind (remove_connection is idempotent).
-        tokio::spawn(async move {
+        self.runtime.spawn(async move {
             let _ = registry
                 .remove_connection(&connection_id, &incarnation)
                 .await;
@@ -779,8 +780,8 @@ pub(crate) fn suppression_application_for_plan(
 
 /// Process env for Codeg native-suppression plans.
 ///
-/// - Codex: merge `features.multi_agent=false` into the official `CODEX_CONFIG`
-///   JSON contract
+/// - Codex: merge `features.multi_agent=false` and `agents.enabled=false`
+///   into the official `CODEX_CONFIG` JSON contract (v1/v2 native tools)
 /// - Grok: set/override `GROK_SUBAGENTS=0` (documented host kill-switch; pairs
 ///   with argv `--no-subagents` and session `_meta.agentProfile` denylist)
 ///
@@ -839,6 +840,13 @@ where
         .as_object_mut()
         .ok_or_else(native_suppression_invalid)?;
     features.insert("multi_agent".into(), serde_json::Value::Bool(false));
+    let agents = root
+        .entry("agents")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    let agents = agents
+        .as_object_mut()
+        .ok_or_else(native_suppression_invalid)?;
+    agents.insert("enabled".into(), serde_json::Value::Bool(false));
     let serialized = serde_json::to_string(&config).map_err(|_| native_suppression_invalid())?;
 
     // Commit only after every fallible step succeeds. Remove case-equivalent
@@ -1708,7 +1716,9 @@ pub async fn spawn_agent_connection(
     session_attach_mode: crate::acp::session_attach::SessionAttachMode,
     tool_lease_registry: Arc<crate::acp::tool_watchdog::ToolExecutionLeaseRegistry>,
     mcp_cancel_registry: Arc<crate::acp::tool_watchdog::McpCancelRegistry>,
-) -> Result<SpawnHandshake, AcpError> {
+    existing_public_state: Option<Arc<RwLock<SessionState>>>,
+) -> Result<RegisteredSpawnAttempt, AcpError> {
+    let redact_shared_diagnostics = owner_window_label == "shared-server";
     // Create the authoritative session state up front. Subsequent emit_with_state
     // calls write through this state and increment its seq counter so the first
     // event the frontend sees has seq=1, not the placeholder 0 from Phase 0.
@@ -1734,24 +1744,37 @@ pub async fn spawn_agent_connection(
     initial_state.purpose = launch_context.purpose;
     initial_state.effective_locale = launch_context.inherited_locale.unwrap_or(AppLocale::En);
 
-    // Install the SessionStarted dedup signal BEFORE wrapping into Arc so the
-    // first event (StatusChanged{Connecting} below) doesn't race with the
-    // installer. The receiver is returned to `spawn_agent`, which holds the
-    // per-session dedup lock until this rx fires (or times out / aborts).
-    let session_started_rx = initial_state.install_session_started_signal();
+    // Install the SessionStarted dedup signal before the first event. A
+    // same-generation fallback replaces driver-owned fields inside the exact
+    // public Arc so existing subscribers keep one event stream and sequence.
+    let is_registered_replacement = existing_public_state.is_some();
+    let (session_state, session_started_rx) = match existing_public_state {
+        Some(session_state) => {
+            let session_started_rx = initial_state.install_session_started_signal();
+            session_state
+                .write()
+                .await
+                .prepare_registered_replacement(initial_state);
+            (session_state, session_started_rx)
+        }
+        None => {
+            let session_started_rx = initial_state.install_session_started_signal();
+            (Arc::new(RwLock::new(initial_state)), session_started_rx)
+        }
+    };
     let (route_bootstrap_tx, route_bootstrap_rx) =
         tokio::sync::oneshot::channel::<RouteBootstrapOutcome>();
 
-    let session_state = Arc::new(RwLock::new(initial_state));
-
-    emit_with_state(
-        &session_state,
-        &emitter,
-        AcpEvent::StatusChanged {
-            status: ConnectionStatus::Connecting,
-        },
-    )
-    .await;
+    if !is_registered_replacement {
+        emit_with_state(
+            &session_state,
+            &emitter,
+            AcpEvent::StatusChanged {
+                status: ConnectionStatus::Connecting,
+            },
+        )
+        .await;
+    }
 
     // Align ~/.hermes/.env's base-URL var with config.yaml's model.base_url so
     // Hermes' auxiliary tasks (title generation, compression, …) resolve the
@@ -1772,23 +1795,6 @@ pub async fn spawn_agent_connection(
     // backstop when the connection driver thread is torn down by process exit
     // before `ChildGuard::drop` can run. 0 = not spawned yet / unknown.
     let child_pid = Arc::new(std::sync::atomic::AtomicU32::new(0));
-    let agent = build_agent(agent_type, &runtime_env, &launch_cwd, &route_plan)
-        .await?
-        .on_spawn({
-            let child_pid = Arc::clone(&child_pid);
-            move |pid| child_pid.store(pid, std::sync::atomic::Ordering::SeqCst)
-        })
-        // Paired with `on_spawn`: publish 0 again once the process has been
-        // reaped, so the shutdown backstop can never `kill_tree` a pid the OS
-        // has already handed to someone else. Fires ONLY on a real reap — a
-        // connection that merely ended keeps its pid published, because the
-        // vendored `ChildGuard` signals the tree without waiting and the agent
-        // may still be running.
-        .on_exit({
-            let child_pid = Arc::clone(&child_pid);
-            move || child_pid.store(0, std::sync::atomic::Ordering::SeqCst)
-        });
-
     // Path policy for the ACP `fs/*` channel. Built HERE rather than inside
     // `run_connection` because it needs the full `runtime_env` (only the git
     // credential keys survive into `terminal_base_env` below), and a per-agent
@@ -1848,7 +1854,7 @@ pub async fn spawn_agent_connection(
             owner_window_label,
             owner_operation_id,
         );
-        {
+        if !is_registered_replacement {
             let mut st = session_state.write().await;
             st.owner_window_label = label.clone();
         }
@@ -1877,7 +1883,7 @@ pub async fn spawn_agent_connection(
                 origin,
                 route_preference,
                 route_capability,
-                child_pid,
+                child_pid: child_pid.clone(),
             },
         );
     }
@@ -1892,6 +1898,10 @@ pub async fn spawn_agent_connection(
     // process exit; no JoinHandle is awaited), so a thread is behaviorally
     // equivalent to the previous task.
     let connection_rt = tokio::runtime::Handle::current();
+    let driver_connection_incarnation = connection_incarnation.clone();
+    let driver_route_plan = route_plan.clone();
+    let registered_route_plan = route_plan.clone();
+    let registered_child_pid = child_pid.clone();
     // RAII guard built OUTSIDE the thread body and moved in: on a normal exit
     // or panic unwind its Drop removes the manager map entry, AND if the thread
     // fails to spawn the dropped closure runs the same Drop — so the entry is
@@ -1901,6 +1911,7 @@ pub async fn spawn_agent_connection(
         connection_id: cleanup_connection_id,
         connection_incarnation: connection_incarnation.clone(),
         tool_lease_registry,
+        runtime: connection_rt.clone(),
     };
 
     // Keep the manager's existing Tokio AbortHandle contract while the large
@@ -1913,6 +1924,7 @@ pub async fn spawn_agent_connection(
     });
     let driver_abort_handle = abort_signal_task.abort_handle();
     let spawn_failure_abort = driver_abort_handle.clone();
+    let (driver_start_tx, driver_start_rx) = tokio::sync::oneshot::channel::<()>();
 
     let connection_thread = std::thread::Builder::new()
         .name(format!("acp-conn-{conn_id}"))
@@ -1921,6 +1933,49 @@ pub async fn spawn_agent_connection(
             let _cleanup = cleanup_guard;
             let driver = async move {
                 let delegation_for_cleanup = delegation_injection.clone();
+                let agent =
+                    match build_agent(agent_type, &runtime_env, &launch_cwd, &driver_route_plan)
+                        .await
+                    {
+                        Ok(agent) => agent
+                            .on_spawn({
+                                let child_pid = Arc::clone(&child_pid);
+                                move |pid| child_pid.store(pid, std::sync::atomic::Ordering::SeqCst)
+                            })
+                            .on_exit({
+                                let child_pid = Arc::clone(&child_pid);
+                                move || child_pid.store(0, std::sync::atomic::Ordering::SeqCst)
+                            }),
+                        Err(error) => {
+                            let public_error = connection_driver_error_event(
+                                &error,
+                                agent_type,
+                                redact_shared_diagnostics,
+                            );
+                            let _ = route_bootstrap_tx.send(RouteBootstrapOutcome::Fatal(error));
+                            if let Some(injection) = delegation_for_cleanup {
+                                cleanup_delegation_parent(&injection, &conn_id, &state_clone).await;
+                            }
+                            emit_with_state(&state_clone, &emitter_clone, public_error).await;
+                            emit_with_state(
+                                &state_clone,
+                                &emitter_clone,
+                                AcpEvent::StatusChanged {
+                                    status: ConnectionStatus::Error,
+                                },
+                            )
+                            .await;
+                            emit_with_state(
+                                &state_clone,
+                                &emitter_clone,
+                                AcpEvent::StatusChanged {
+                                    status: ConnectionStatus::Disconnected,
+                                },
+                            )
+                            .await;
+                            return;
+                        }
+                    };
                 // run_connection reports bootstrap via oneshot; map AcpError paths to
                 // typed outcomes for the manager's single-attempt fallback policy.
                 let result = run_connection(
@@ -1941,8 +1996,8 @@ pub async fn spawn_agent_connection(
                     preferred_config_values,
                     delegation_injection,
                     workflow_child_mcp_binding,
-                    connection_incarnation,
-                    route_plan,
+                    driver_connection_incarnation,
+                    driver_route_plan,
                     route_bootstrap_tx,
                     session_attach_mode,
                     fs_policy,
@@ -1958,22 +2013,10 @@ pub async fn spawn_agent_connection(
                 }
 
                 if let Err(e) = result {
-                    let code = e.code().map(String::from);
                     emit_with_state(
                         &state_clone,
                         &emitter_clone,
-                        AcpEvent::Error {
-                            message: e.to_string(),
-                            agent_type: agent_type.to_string(),
-                            code,
-                            // The only genuinely terminal emit site: `run_connection`
-                            // is unwinding and the next event is `Disconnected`.
-                            // The lifecycle worker uses this flag to decide whether
-                            // to flip the conversation row to Cancelled and to
-                            // buffer the detail for the broker's cancel reason.
-                            details: None,
-                            terminal: true,
-                        },
+                        connection_driver_error_event(&e, agent_type, redact_shared_diagnostics),
                     )
                     .await;
                     // Drive the state machine through `Error` before `Disconnected`
@@ -2000,9 +2043,16 @@ pub async fn spawn_agent_connection(
                 .await;
             };
             connection_rt.block_on(async move {
+                let mut driver_abort_rx = driver_abort_rx;
+                if !wait_for_registered_driver_activation(driver_start_rx, &mut driver_abort_rx)
+                    .await
+                {
+                    abort_signal_task.abort();
+                    return;
+                }
                 tokio::select! {
                     _ = driver => {}
-                    _ = driver_abort_rx => {}
+                    _ = &mut driver_abort_rx => {}
                 }
                 abort_signal_task.abort();
             });
@@ -2026,11 +2076,29 @@ pub async fn spawn_agent_connection(
             conn.task_abort = Some(driver_abort_handle);
         }
     }
-
-    Ok(SpawnHandshake {
-        session_started_rx,
-        route_bootstrap_rx,
+    Ok(RegisteredSpawnAttempt {
+        connection_id,
+        connection_incarnation,
+        state: session_state,
+        emitter,
+        handshake: SpawnHandshake {
+            session_started_rx,
+            route_bootstrap_rx,
+        },
+        route_plan: registered_route_plan,
+        driver_start_tx: Some(driver_start_tx),
+        child_pid: registered_child_pid,
     })
+}
+
+async fn wait_for_registered_driver_activation(
+    driver_start_rx: tokio::sync::oneshot::Receiver<()>,
+    driver_abort_rx: &mut tokio::sync::oneshot::Receiver<()>,
+) -> bool {
+    tokio::select! {
+        start = driver_start_rx => start.is_ok(),
+        _ = driver_abort_rx => false,
+    }
 }
 
 /// A pending permission-card responder. `Acp` is a real ACP
@@ -4332,6 +4400,27 @@ pub struct SpawnHandshake {
     pub route_bootstrap_rx: tokio::sync::oneshot::Receiver<RouteBootstrapOutcome>,
 }
 
+/// A connection whose public state and cleanup fence are registered, while
+/// route readiness continues asynchronously in the owned driver.
+pub struct RegisteredSpawnAttempt {
+    pub connection_id: String,
+    pub connection_incarnation: String,
+    pub state: Arc<RwLock<SessionState>>,
+    pub emitter: EventEmitter,
+    pub handshake: SpawnHandshake,
+    pub route_plan: crate::acp::delegation::route::DelegationRoutePlan,
+    pub(crate) driver_start_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    pub(crate) child_pid: Arc<std::sync::atomic::AtomicU32>,
+}
+
+impl RegisteredSpawnAttempt {
+    pub(crate) fn activate_driver(&mut self) {
+        if let Some(driver_start_tx) = self.driver_start_tx.take() {
+            let _ = driver_start_tx.send(());
+        }
+    }
+}
+
 /// Locate the `codeg-mcp` companion binary across the supported deployment
 /// shapes:
 ///
@@ -6451,6 +6540,26 @@ fn bootstrap_outcome_from_acp_error(err: &AcpError) -> RouteBootstrapOutcome {
             RouteBootstrapOutcome::Fatal(AcpError::RouteUnavailable { reason: *reason })
         }
         other => RouteBootstrapOutcome::Fatal(AcpError::protocol(other.to_string())),
+    }
+}
+
+fn connection_driver_error_event(
+    error: &AcpError,
+    agent_type: AgentType,
+    redact_shared_diagnostics: bool,
+) -> AcpEvent {
+    let (message, code) = if redact_shared_diagnostics {
+        let error = crate::acp::shared_session::SharedSessionError::SessionUnavailable;
+        (error.to_string(), Some(error.code().to_string()))
+    } else {
+        (error.to_string(), error.code().map(String::from))
+    };
+    AcpEvent::Error {
+        message,
+        agent_type: agent_type.to_string(),
+        code,
+        details: None,
+        terminal: true,
     }
 }
 
@@ -11605,6 +11714,9 @@ fn grok_mcp_output_text(raw_output: &serde_json::Value) -> Option<String> {
 ///
 /// * a `delegate_to_agent` ack opens with
 ///   `"Delegation successful. task_id="` (`broker.rs::running_ack`);
+/// * a `continue_delegation` ack opens with `"Continuation running"` or
+///   `"Continuation is still admitting"` (`broker.rs::continue_running_ack` /
+///   `continue_idempotent_ack`);
 /// * `get_delegation_status` renders the compact `{"tasks":[..]}` JSON
 ///   (`companion.rs::render_batch_report`), whose items carry `task_id` +
 ///   a `status` from the fixed report vocabulary.
@@ -11624,6 +11736,11 @@ fn cursor_companion_title_from_content(content: Option<&str>) -> Option<&'static
     let text = content?.trim_start();
     if text.starts_with("Delegation successful. task_id=") {
         return Some(crate::acp::delegation::DELEGATE_TOOL_REWRITE_TITLE);
+    }
+    if text.starts_with("Continuation running in the existing child session. task_id=")
+        || text.starts_with("Continuation is still admitting the existing child session. task_id=")
+    {
+        return Some(crate::acp::delegation::CONTINUE_TOOL_REWRITE_TITLE);
     }
     // Cheap guards before the full JSON parse: the status report is a JSON
     // object whose first key is `tasks`.
@@ -14585,6 +14702,7 @@ mod tests {
                 replacement_reason: None,
                 correlation_id: None,
                 recovery_authorization_id: None,
+                orchestration_binding: None,
             })
             .await;
         assert_eq!(report.status, TaskStatus::Running);
@@ -16605,6 +16723,7 @@ mod tests {
         let config: serde_json::Value =
             serde_json::from_str(env.get("CODEX_CONFIG").unwrap()).unwrap();
         assert_eq!(config["features"]["multi_agent"], false);
+        assert_eq!(config["agents"]["enabled"], false);
         assert_eq!(env.get("KEEP").map(String::as_str), Some("yes"));
         assert!(!env.contains_key("CODEX_ACP_MULTI_AGENT"));
     }
@@ -16614,6 +16733,11 @@ mod tests {
         let original = serde_json::json!({
             "model": "gpt-5.4",
             "features": { "fast_mode": true, "multi_agent": true },
+            "agents": {
+                "enabled": true,
+                "max_threads": 4,
+                "web_researcher": { "description": "keep" }
+            },
             "nested": { "keep": [1, 2, 3] }
         });
         let mut env = BTreeMap::from([
@@ -16630,6 +16754,12 @@ mod tests {
         assert_eq!(merged["model"], "gpt-5.4");
         assert_eq!(merged["features"]["fast_mode"], true);
         assert_eq!(merged["features"]["multi_agent"], false);
+        assert_eq!(merged["agents"]["enabled"], false);
+        assert_eq!(merged["agents"]["max_threads"], 4);
+        assert_eq!(
+            merged["agents"]["web_researcher"],
+            original["agents"]["web_researcher"]
+        );
         assert_eq!(merged["nested"], original["nested"]);
         assert_eq!(
             env.get("CODEX_ACP_MULTI_AGENT").map(String::as_str),
@@ -16639,7 +16769,7 @@ mod tests {
 
     #[test]
     fn codex_codeg_route_rejects_malformed_official_config() {
-        for raw in ["not-json", "[]", r#"{"features":[]}"#] {
+        for raw in ["not-json", "[]", r#"{"features":[]}"#, r#"{"agents":[]}"#] {
             let mut env = BTreeMap::from([("CODEX_CONFIG".into(), raw.into())]);
             let err =
                 apply_route_environment(AgentType::Codex, &codeg_plan(AgentType::Codex), &mut env)
@@ -16668,6 +16798,7 @@ mod tests {
         let inherited = serde_json::json!({
             "model": "gpt-5.4",
             "features": { "fast_mode": true, "multi_agent": true },
+            "agents": { "enabled": true, "max_threads": 2 },
             "nested": { "keep": [1, 2, 3] }
         });
         let inherited = serde_json::to_string(&inherited).unwrap();
@@ -16687,13 +16818,15 @@ mod tests {
         assert_eq!(merged["model"], "gpt-5.4");
         assert_eq!(merged["features"]["fast_mode"], true);
         assert_eq!(merged["features"]["multi_agent"], false);
+        assert_eq!(merged["agents"]["enabled"], false);
+        assert_eq!(merged["agents"]["max_threads"], 2);
         assert_eq!(merged["nested"], serde_json::json!({ "keep": [1, 2, 3] }));
         assert_eq!(env.get("KEEP").map(String::as_str), Some("yes"));
     }
 
     #[test]
     fn codex_inherited_config_rejects_malformed_parent_value_atomically() {
-        for raw in ["not-json", "[]", r#"{"features":[]}"#] {
+        for raw in ["not-json", "[]", r#"{"features":[]}"#, r#"{"agents":[]}"#] {
             let mut env = BTreeMap::from([("KEEP".into(), "yes".into())]);
             let original = env.clone();
 
@@ -16740,6 +16873,7 @@ mod tests {
             serde_json::from_str(env.get("CODEX_CONFIG").unwrap()).unwrap();
         assert_eq!(merged["model"], "explicit");
         assert_eq!(merged["features"]["multi_agent"], false);
+        assert_eq!(merged["agents"]["enabled"], false);
     }
 
     #[test]
@@ -16774,6 +16908,7 @@ mod tests {
         let merged: serde_json::Value = serde_json::from_str(matching[0].1).unwrap();
         assert_eq!(merged["model"], "effective-explicit");
         assert_eq!(merged["features"]["multi_agent"], false);
+        assert_eq!(merged["agents"]["enabled"], false);
     }
 
     #[test]
@@ -16796,6 +16931,7 @@ mod tests {
             serde_json::from_str(env.get("CODEX_CONFIG").unwrap()).unwrap();
         assert_eq!(merged["model"], "inherited");
         assert_eq!(merged["features"]["multi_agent"], false);
+        assert_eq!(merged["agents"]["enabled"], false);
     }
 
     #[test]
@@ -17021,6 +17157,44 @@ mod tests {
             bootstrap_outcome_from_acp_error(&residual),
             RouteBootstrapOutcome::Fatal(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn shared_registered_build_failure_redacts_event_and_snapshot_detail() {
+        const SENTINEL_PATH: &str = "/private/tmp/SECRET-PATH";
+        const SENTINEL_TOKEN: &str = "TOKEN-SENTINEL";
+        let state = Arc::new(RwLock::new(SessionState::new(
+            "shared-redaction".into(),
+            AgentType::Codex,
+            None,
+            "shared-server".into(),
+            None,
+        )));
+        let error = AcpError::SpawnFailed(format!(
+            "spawn at {SENTINEL_PATH} failed with token {SENTINEL_TOKEN}"
+        ));
+
+        emit_with_state(
+            &state,
+            &EventEmitter::Noop,
+            connection_driver_error_event(&error, AgentType::Codex, true),
+        )
+        .await;
+
+        let state = state.read().await;
+        let events = serde_json::to_string(
+            &state
+                .recent_events_after(0)
+                .expect("shared error event is retained"),
+        )
+        .unwrap();
+        let snapshot = serde_json::to_string(&state.to_snapshot().last_error).unwrap();
+        for public_diagnostic in [&events, &snapshot] {
+            assert!(!public_diagnostic.contains(SENTINEL_PATH));
+            assert!(!public_diagnostic.contains(SENTINEL_TOKEN));
+        }
+        assert!(events.contains("session_unavailable"));
+        assert!(events.contains("shared session is unavailable"));
     }
 
     #[tokio::test]
@@ -17251,6 +17425,23 @@ mod tests {
             merged["mcpConfig"]["codeg-mcp"],
             grok_codeg_mcp_timeout_config()
         );
+    }
+
+    #[tokio::test]
+    async fn registered_driver_abort_before_activation_does_not_wait_for_start_sender_drop() {
+        let (driver_start_tx, driver_start_rx) = tokio::sync::oneshot::channel();
+        let (driver_abort_tx, mut driver_abort_rx) = tokio::sync::oneshot::channel();
+        let waiter = tokio::spawn(async move {
+            wait_for_registered_driver_activation(driver_start_rx, &mut driver_abort_rx).await
+        });
+
+        driver_abort_tx.send(()).unwrap();
+        let activated = tokio::time::timeout(std::time::Duration::from_millis(100), waiter)
+            .await
+            .expect("abort must release an unactivated registered driver")
+            .unwrap();
+        assert!(!activated);
+        drop(driver_start_tx);
     }
 
     #[test]
@@ -22563,6 +22754,106 @@ mod tests {
     }
 
     #[test]
+    fn cursor_companion_title_resolves_continue_ack() {
+        let running = "Continuation running in the existing child session. \
+                       task_id=799467c7-0188-4e7a-b5ef-241d4b141a83. Call \
+                       get_delegation_status with this id in the task_ids array.";
+        assert_eq!(
+            cursor_companion_title_from_content(Some(running)),
+            Some("codeg-mcp__continue_delegation")
+        );
+
+        let admitting = "Continuation is still admitting the existing child session. \
+                         task_id=799467c7-0188-4e7a-b5ef-241d4b141a83. Call \
+                         get_delegation_status with this id in the task_ids array.";
+        assert_eq!(
+            cursor_companion_title_from_content(Some(admitting)),
+            Some("codeg-mcp__continue_delegation")
+        );
+    }
+
+    #[tokio::test]
+    async fn cursor_identityless_continue_ack_rewrites_emitted_update_title() {
+        let state = Arc::new(RwLock::new(SessionState::new(
+            "conn-cursor-continue".into(),
+            AgentType::Cursor,
+            None,
+            "win".into(),
+            None,
+        )));
+        let emitter = EventEmitter::Noop;
+        let mut cache = ToolCallOutputCache::default();
+        let mut cb = CodeBuddyLiveState::default();
+
+        let call: SessionUpdate = serde_json::from_value(serde_json::json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "cursor-continue-call",
+            "title": "MCP: tool",
+            "status": "pending",
+        }))
+        .expect("valid Cursor identity-less tool_call");
+        emit_conversation_update(
+            &state,
+            &emitter,
+            AgentType::Cursor,
+            call,
+            None,
+            &mut cache,
+            &mut cb,
+            None,
+        )
+        .await;
+        assert!(cb.cursor_generic_mcp_ids.contains("cursor-continue-call"));
+
+        let update: SessionUpdate = serde_json::from_value(serde_json::json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "cursor-continue-call",
+            "status": "completed",
+            "content": [{
+                "type": "content",
+                "content": {
+                    "type": "text",
+                    "text": "Continuation running in the existing child session. task_id=run-2. Call get_delegation_status with this id in the task_ids array."
+                }
+            }],
+        }))
+        .expect("valid Cursor completion update");
+        emit_conversation_update(
+            &state,
+            &emitter,
+            AgentType::Cursor,
+            update,
+            None,
+            &mut cache,
+            &mut cb,
+            None,
+        )
+        .await;
+
+        assert!(!cb.cursor_generic_mcp_ids.contains("cursor-continue-call"));
+        assert_eq!(
+            cb.title_overrides
+                .get("cursor-continue-call")
+                .map(String::as_str),
+            Some("codeg-mcp__continue_delegation")
+        );
+        let events = state
+            .read()
+            .await
+            .recent_events_after(0)
+            .expect("events recorded");
+        let emitted_title = events.iter().find_map(|event| match &event.payload {
+            AcpEvent::ToolCallUpdate {
+                tool_call_id,
+                title,
+                ..
+            } if tool_call_id == "cursor-continue-call" => title.as_deref(),
+            _ => None,
+        });
+        assert_eq!(emitted_title, Some("codeg-mcp__continue_delegation"));
+    }
+
+    #[test]
     fn cursor_companion_title_resolves_status_report() {
         // Real-device shape: companion.rs::render_batch_report's compact JSON.
         let report = r#"{"tasks":[{"agent_type":"claude_code","child_conversation_id":1576,"duration_ms":27288,"status":"completed","task_id":"799467c7-0188-4e7a-b5ef-241d4b141a83","text":"done"}]}"#;
@@ -24332,6 +24623,7 @@ mod tests {
         let runs = Arc::new(RunStore::new(db.clone()));
         let task_id = format!("task-resume-contract-{label}");
         runs.insert_reserving(ReservingRunInsert {
+            orchestration_binding: None,
             task_id: task_id.clone(),
             root_task_id: task_id.clone(),
             previous_task_id: Some("task-gen1".into()),
@@ -24401,7 +24693,8 @@ mod tests {
 
     /// Client-side ResumeExistingOnly chain using production wire helpers + gate
     /// + production `refuse_unresumable_bootstrap` on refuse.
-    async fn run_resume_existing_contract(
+    async fn run_resume_existing_contract_for_agent(
+        agent_type: AgentType,
         mock: ResumeContractMockAgent,
         requested_session_id: &str,
         counters: ResumeContractCounters,
@@ -24428,7 +24721,7 @@ mod tests {
         let broker_for_refuse = settle.as_ref().map(|s| s.broker.clone());
         let state = Arc::new(RwLock::new(SessionState::new(
             connection_id.clone(),
-            AgentType::Codex,
+            agent_type,
             Some(PathBuf::from(".")),
             "main".into(),
             None,
@@ -24439,9 +24732,9 @@ mod tests {
             .connect_with(mock, async move |cx| {
                 let shell = test_placeholder_terminal_shell();
                 let init_req = build_initialize_request(
-                    AgentType::Codex,
+                    agent_type,
                     &shell.spec,
-                    adapter_for(AgentType::Codex),
+                    adapter_for(agent_type),
                     HostToolsPolicy::Default,
                 )
                 .map_err(|e| sacp::util::internal_error(e.to_string()))?;
@@ -24454,8 +24747,9 @@ mod tests {
                     .session_capabilities
                     .resume
                     .is_some();
+                let supports_load = init_resp.agent_capabilities.load_session;
 
-                let route_plan = native_plan(AgentType::Codex);
+                let route_plan = native_plan(agent_type);
                 let cwd = PathBuf::from(".");
                 let mut obs = ResumeContractObservation {
                     emit_session_id: None,
@@ -24473,12 +24767,12 @@ mod tests {
 
                 if supports_resume {
                     let resume_req = build_resume_session_request(
-                        AgentType::Codex,
+                        agent_type,
                         SessionId::new(requested.clone()),
                         &cwd,
                         Vec::new(),
                         &shell.spec,
-                        adapter_for(AgentType::Codex),
+                        adapter_for(agent_type),
                         &route_plan,
                         ConnectionPurpose::User,
                     )
@@ -24529,13 +24823,28 @@ mod tests {
                 }
 
                 // session/load (resume → load only; never session/new).
+                if !supports_load {
+                    apply_production_refuse(
+                        &state,
+                        &requested,
+                        "resume_existing_only: agent does not advertise the loadSession capability"
+                            .into(),
+                        broker_for_refuse.as_deref(),
+                        &connection_id,
+                        &mut event_rx,
+                        &mut obs,
+                    )
+                    .await;
+                    *outcome_slot.lock().unwrap() = Some(obs);
+                    return Ok(());
+                }
                 let load_req = build_load_session_request(
-                    AgentType::Codex,
+                    agent_type,
                     SessionId::new(requested.clone()),
                     &cwd,
                     Vec::new(),
                     &shell.spec,
-                    adapter_for(AgentType::Codex),
+                    adapter_for(agent_type),
                     &route_plan,
                     ConnectionPurpose::User,
                 )
@@ -24636,6 +24945,22 @@ mod tests {
         obs
     }
 
+    async fn run_resume_existing_contract(
+        mock: ResumeContractMockAgent,
+        requested_session_id: &str,
+        counters: ResumeContractCounters,
+        settle: Option<ResumeContractSettleFixture>,
+    ) -> ResumeContractObservation {
+        run_resume_existing_contract_for_agent(
+            AgentType::Codex,
+            mock,
+            requested_session_id,
+            counters,
+            settle,
+        )
+        .await
+    }
+
     #[tokio::test]
     async fn resume_existing_accepts_standard_no_id_resume_admits_prompt() {
         let body = empty_no_session_id_body();
@@ -24688,6 +25013,80 @@ mod tests {
         assert_eq!(obs.resume_count, 0);
         assert_eq!(obs.load_count, 1);
         assert_eq!(obs.session_new_count, 0);
+    }
+
+    #[tokio::test]
+    async fn cursor_load_only_capability_reuses_requested_session_and_admits_prompt() {
+        let (mock, counters) = ResumeContractMockAgent::with_counters(
+            false,
+            true,
+            ResumeContractRpcOutcome::Err {
+                code: -32601,
+                message: "Cursor does not advertise session/resume".into(),
+            },
+            ResumeContractRpcOutcome::Ok(empty_no_session_id_body()),
+        );
+        let obs = run_resume_existing_contract_for_agent(
+            AgentType::Cursor,
+            mock,
+            "cursor-session-load-only",
+            counters,
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            obs.emit_session_id.as_deref(),
+            Some("cursor-session-load-only")
+        );
+        assert!(obs.refused_reason.is_none(), "unexpected refuse: {obs:?}");
+        assert!(obs.prompt_admitted);
+        assert_eq!(obs.prompt_count, 1);
+        assert_eq!(obs.resume_count, 0);
+        assert_eq!(obs.load_count, 1);
+        assert_eq!(
+            obs.session_new_count, 0,
+            "Cursor ResumeExistingOnly must never create session/new"
+        );
+    }
+
+    #[tokio::test]
+    async fn cursor_without_load_capability_refuses_without_prompt_or_new_session() {
+        let (mock, counters) = ResumeContractMockAgent::with_counters(
+            false,
+            false,
+            ResumeContractRpcOutcome::Err {
+                code: -32601,
+                message: "Cursor does not advertise session/resume".into(),
+            },
+            ResumeContractRpcOutcome::Err {
+                code: -32601,
+                message: "session/load must not be called without capability".into(),
+            },
+        );
+        let obs = run_resume_existing_contract_for_agent(
+            AgentType::Cursor,
+            mock,
+            "cursor-session-unsupported",
+            counters,
+            None,
+        )
+        .await;
+
+        assert!(obs.emit_session_id.is_none());
+        assert!(!obs.prompt_admitted);
+        assert_eq!(obs.prompt_count, 0);
+        assert_eq!(obs.resume_count, 0);
+        assert_eq!(obs.load_count, 0);
+        assert_eq!(obs.session_new_count, 0);
+        assert!(obs.production_refuse_called);
+        assert_eq!(obs.session_load_failed_code.as_deref(), Some("unresumable"));
+        assert!(
+            obs.refused_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("loadSession capability")),
+            "unexpected refuse reason: {obs:?}"
+        );
     }
 
     #[tokio::test]

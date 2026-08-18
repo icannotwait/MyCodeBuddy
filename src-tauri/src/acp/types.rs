@@ -2,6 +2,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 use crate::acp::delegation::continuation::types::ContinuationWaitingProjection;
+use crate::acp::shared_session::{
+    SharedActiveTurnProjection, SharedQueuedPromptSummary, SharedSessionPhase, SharedTurnOutcome,
+};
 use crate::acp::tool_watchdog::ToolWatchdogProjection;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -255,6 +258,44 @@ pub enum AcpEvent {
     PlanUpdate { entries: Vec<PlanEntryInfo> },
     /// Connection status changed
     StatusChanged { status: ConnectionStatus },
+    /// Shared-session lifecycle projection changed for the installed generation.
+    SharedSessionPhaseChanged {
+        generation: u64,
+        phase: SharedSessionPhase,
+    },
+    /// A shared-session prompt was accepted into the waiting queue.
+    PromptQueued {
+        generation: u64,
+        item: SharedQueuedPromptSummary,
+    },
+    /// A waiting shared-session prompt was cancelled before dispatch.
+    PromptQueueItemCancelled {
+        generation: u64,
+        queue_item_id: String,
+    },
+    /// A shared-session prompt left the waiting queue and began a turn.
+    PromptDispatchStarted {
+        generation: u64,
+        turn: SharedActiveTurnProjection,
+    },
+    /// A waiting shared-session prompt failed before it could dispatch.
+    PromptQueueItemFailed {
+        generation: u64,
+        queue_item_id: String,
+        error_code: String,
+    },
+    /// Aggregate waiting-queue capacity projection.
+    PromptQueueDepthChanged {
+        generation: u64,
+        waiting_count: u32,
+        waiting_bytes: u64,
+    },
+    /// The active shared-session turn reached a terminal outcome.
+    SharedTurnSettled {
+        generation: u64,
+        turn_id: String,
+        outcome: SharedTurnOutcome,
+    },
     /// Error occurred
     Error {
         message: String,

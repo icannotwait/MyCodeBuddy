@@ -1,0 +1,305 @@
+# Review package: ed1cec8b276d8e9dba4911fdbfb07a2bcbbeeed2..1081eda2b0b24a470d0b591c47920b89c38d77b9
+
+## Commits
+1081eda2 fix(skill): bind round 20 validator relations
+
+## Files changed
+ .../scripts/validate-contract.lib.mjs              | 79 +++++++++++++++++++++-
+ .../scripts/validate-contract.test.mjs             | 57 ++++++++++++++++
+ 2 files changed, 134 insertions(+), 2 deletions(-)
+
+## Diff
+diff --git a/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.lib.mjs b/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.lib.mjs
+index f932902e..2e57cdd1 100644
+--- a/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.lib.mjs
++++ b/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.lib.mjs
+@@ -909,23 +909,25 @@ const AGENT_IDENTITY_OBJECT_TERMS = new Set([
+   "identities",
+   "identity",
+   "profile",
+   "profiles",
+ ])
+ const AGENT_IDENTITY_OBJECT_PREFIX_TERMS = new Set([
+   "a",
+   "an",
+   "current",
+   "its",
++  "own",
+   "selected",
+   "that",
+   "the",
++  "their",
+   "this",
+ ])
+ const TASK_STATE_ANAPHOR_ADJUNCT_PREFIXES = [
+   ["according", "to"],
+   ["in", "fact"],
+ ]
+ const TASK_STATE_REPORTING_PREDICATES = new Set([
+   "claim",
+   "claimed",
+   "claims",
+@@ -960,20 +962,34 @@ const TASK_STATE_CARRIED_ADJUNCT_STARTS = new Set([
+   "when",
+ ])
+ const TASK_STATE_SUBJECT_DETERMINERS = new Set([
+   "a",
+   "an",
+   "each",
+   "every",
+   "the",
+   "this",
+ ])
++const TASK_DIRECT_OBJECT_QUALIFIERS = new Set([
++  ...TASK_STATE_SUBJECT_DETERMINERS,
++  ...TASK_STATE_MODIFIERS,
++  ...EXPLICIT_TASK_ACTIVITY_TERMS,
++  "current",
++  "its",
++  "own",
++])
++const TASK_ANTECEDENT_NON_OBJECT_LINKS = new Set([
++  ...PEOPLE_ANTECEDENT_LINKS,
++  "about",
++  "of",
++  "regarding",
++])
+ const TASK_STATE_ADJUNCT_NON_SUBJECT_TERMS = new Set([
+   ...TASK_COMPONENT_STATE_LINKS,
+   ...TASK_STATE_MODIFIERS,
+   ...TASK_STATE_OBJECT_PRONOUN_MODIFIERS,
+   ...TASK_STATE_SUBJECT_DETERMINERS,
+   "according",
+   "after",
+   "before",
+   "fact",
+   "following",
+@@ -3867,20 +3883,48 @@ function adjunctFinalItHasNonTaskOwner(subjectPrefix, prefix) {
+   const reportingPredicate = beforeIt.findLastIndex((token) =>
+     TASK_STATE_REPORTING_PREDICATES.has(token)
+   )
+   if (reportingPredicate >= 0) return hasNonTaskOwner(reportingPredicate)
+   const participialPredicate = beforeIt.findLastIndex((token) =>
+     token.endsWith("ing")
+   )
+   return participialPredicate >= 0 && hasNonTaskOwner(participialPredicate)
+ }
+ 
++function taskMentionIsDirectAntecedentObject(
++  clause,
++  task,
++  subjectHeadIndex,
++  segmentEnd
++) {
++  const trailing = clause.tokens.slice(task.index + 1, segmentEnd)
++  if (
++    !trailing.every(
++      (token) => TASK_STATE_MODIFIERS.has(token) || token.endsWith("ly")
++    )
++  ) {
++    return false
++  }
++  let objectStart = task.index
++  while (objectStart > subjectHeadIndex + 1) {
++    const qualifier = clause.tokens[objectStart - 1]
++    if (
++      !TASK_DIRECT_OBJECT_QUALIFIERS.has(qualifier) &&
++      !qualifier.endsWith("ly")
++    ) {
++      break
++    }
++    objectStart -= 1
++  }
++  return !TASK_ANTECEDENT_NON_OBJECT_LINKS.has(clause.tokens[objectStart - 1])
++}
++
+ function previousSegmentHasExplicitNonTaskAntecedent(clause, start) {
+   const boundary = tokenIndexes(
+     clause.tokens,
+     TASK_STATE_CLAUSE_BOUNDARIES,
+     0,
+     start
+   ).at(-1)
+   if (boundary === undefined) return false
+   const previousBoundary = tokenIndexes(
+     clause.tokens,
+@@ -3899,21 +3943,29 @@ function previousSegmentHasExplicitNonTaskAntecedent(clause, start) {
+   const subjectTokens = clause.tokens.slice(modifier + 1, boundary)
+   const subjectHeadOffset = subjectTokens.findIndex(
+     (token) =>
+       !TASK_STATE_SUBJECT_DETERMINERS.has(token) &&
+       !TASK_STATE_MODIFIERS.has(token) &&
+       !token.endsWith("ly")
+   )
+   const subjectHead = subjectTokens[subjectHeadOffset]
+   const subjectHeadIndex = modifier + 1 + subjectHeadOffset
+   const hasCloserTaskAntecedent = directiveTasks(clause.tokens).some(
+-    (task) => task.index > subjectHeadIndex && task.index < boundary
++    (task) =>
++      task.index > subjectHeadIndex &&
++      task.index < boundary &&
++      taskMentionIsDirectAntecedentObject(
++        clause,
++        task,
++        subjectHeadIndex,
++        boundary
++      )
+   )
+   return (
+     subjectHead !== undefined &&
+     !hasCloserTaskAntecedent &&
+     !new Set(["it", "itself", "task"]).has(subjectHead)
+   )
+ }
+ 
+ function stateSegmentHasExplicitNonTaskSubject(clause, start, end) {
+   const predicate = tokenIndex(
+@@ -3947,20 +3999,39 @@ function stateSegmentHasExplicitNonTaskSubject(clause, start, end) {
+       !TASK_STATE_SUBJECT_DETERMINERS.has(token) &&
+       !TASK_STATE_MODIFIERS.has(token) &&
+       !token.endsWith("ly")
+   )
+   return (
+     subjectHead !== undefined &&
+     !new Set(["it", "itself", "task"]).has(subjectHead)
+   )
+ }
+ 
++function taskMentionIsAffirmativeDirectReactivationObject(
++  clause,
++  predicate,
++  taskIndex
++) {
++  if (
++    !TASK_REACTIVATION_PREDICATES.has(clause.tokens[predicate]) ||
++    actionIsNegated(clause.tokens, predicate)
++  ) {
++    return false
++  }
++  return clause.tokens
++    .slice(predicate + 1, taskIndex)
++    .every(
++      (token) =>
++        TASK_DIRECT_OBJECT_QUALIFIERS.has(token) || token.endsWith("ly")
++    )
++}
++
+ function taskMentionIsNestedInNonTaskSubject(clause, task, state) {
+   const predicate = TASK_REACTIVATION_PREDICATES.has(clause.tokens[state])
+     ? state
+     : tokenIndex(
+         clause.tokens,
+         new Set([
+           ...TASK_REACTIVATION_PREDICATES,
+           ...TASK_REACTIVATION_STATE_LINKS,
+         ]),
+         task.index + 1,
+@@ -3976,21 +4047,25 @@ function taskMentionIsNestedInNonTaskSubject(clause, task, state) {
+   const punctuationBoundary = [...(clause.actionBoundaryAfter ?? [])]
+     .filter((candidate) => candidate < task.index)
+     .sort((left, right) => right - left)[0]
+   const prefixStart = Math.max(boundary ?? -1, punctuationBoundary ?? -1) + 1
+   const prefix = clause.tokens.slice(prefixStart, task.index)
+   const objectLink = prefix.findLastIndex(
+     (token) => PEOPLE_ANTECEDENT_LINKS.has(token) || token.endsWith("ing")
+   )
+   if (objectLink < 0) return false
+   if (
+-    TASK_REACTIVATION_PREDICATES.has(clause.tokens[prefixStart + objectLink])
++    taskMentionIsAffirmativeDirectReactivationObject(
++      clause,
++      prefixStart + objectLink,
++      task.index
++    )
+   ) {
+     return false
+   }
+   const subjectHead = prefix
+     .slice(0, objectLink)
+     .find(
+       (token) =>
+         !TASK_STATE_SUBJECT_DETERMINERS.has(token) &&
+         !TASK_STATE_MODIFIERS.has(token) &&
+         !token.endsWith("ly")
+diff --git a/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.test.mjs b/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.test.mjs
+index f70b432e..a5409570 100644
+--- a/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.test.mjs
++++ b/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.test.mjs
+@@ -5035,20 +5035,77 @@ describe("Skill contract v2", () => {
+         reject: false,
+       },
+       {
+         prose:
+           "The active Task is completed but, with testing complete, the server restarts and it is still running. Then switch the Task Agent.",
+         reject: false,
+       },
+     ])
+   })
+ 
++  it("round-20 binds possessive qualifiers to direct selected-profile changes", () => {
++    assertSkillClassifications([
++      ...[
++        "will change their selected profile immediately",
++        "will change their current profile immediately",
++        "will change its own profile immediately",
++        "will change its selected profile immediately",
++      ].map((action) => ({
++        prose: `The active Task is running. The Task Agent ${action}.`,
++        reject: true,
++      })),
++      ...[
++        "will change the compiler profile immediately",
++        "will change its logging profile immediately",
++      ].map((action) => ({
++        prose: `The active Task is running. The Task Agent ${action}.`,
++        reject: false,
++      })),
++    ])
++  })
++
++  it("round-20 binds restart antecedents by their Task relation", () => {
++    assertSkillClassifications([
++      ...[
++        "starts a Task worker",
++        "monitors the Task log",
++        "for the Task fails",
++      ].map((relation) => ({
++        prose: `The Task is completed but a separate service ${relation} and the server restarts it and it is still running. Then switch the Task Agent.`,
++        reject: false,
++      })),
++      ...["monitors the Task", "restarts the Task"].map((relation) => ({
++        prose: `The Task is completed but a separate service ${relation} and the server restarts it and it is still running. Then switch the Task Agent.`,
++        reject: true,
++      })),
++    ])
++  })
++
++  it("round-20 requires affirmative direct parenthetical Task reactivation", () => {
++    assertSkillClassifications([
++      ...[
++        "not restarting the Task",
++        "without restarting the Task",
++        "restarting a worker that monitors the Task",
++        "restarting a Task worker",
++      ].map((parenthetical) => ({
++        prose: `The active Task is completed but the server, ${parenthetical}, restarts and it is still running. Then switch the Task Agent.`,
++        reject: false,
++      })),
++      {
++        prose:
++          "The active Task is completed but the server, restarting the Task, restarts and it is still running. Then switch the Task Agent.",
++        reject: true,
++      },
++    ])
++  })
++
+   it("contains the complete operational policy and document JSON shapes", () => {
+     const policy = fencedJsonAfterHeading(
+       realSkill,
+       "### Operational policy JSON"
+     )
+     assert.deepEqual(policy.design_review_triggers, [
+       "spans_modules",
+       "migration",
+       "concurrency",
+       "security",

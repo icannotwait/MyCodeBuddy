@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use axum::extract::ws::{Message, WebSocket};
@@ -11,6 +11,7 @@ use tokio::task::JoinHandle;
 
 use super::shutdown::ShutdownSignal;
 use super::ws_attach::{self, ClientMsg, DetachReason, ServerMsg, OUTBOUND_CAPACITY};
+use crate::acp::shared_session::{LeaseRenewalOutcome, LeaseSocketBinding};
 use crate::app_state::AppState;
 use crate::logging::throttle::{LagLogThrottle, LAG_LOG_WINDOW};
 
@@ -22,6 +23,7 @@ use crate::logging::throttle::{LagLogThrottle, LAG_LOG_WINDOW};
 struct ActiveSubscription {
     handle: JoinHandle<()>,
     epoch: u64,
+    binding: Option<LeaseSocketBinding>,
 }
 
 /// Apply a forwarder self-cleanup signal: remove the handle for `sub_id`
@@ -219,7 +221,7 @@ async fn handle_ws_connection(
             msg = socket.recv() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
-                        match serde_json::from_str::<ClientMsg>(&text) {
+                match serde_json::from_str::<ClientMsg>(&text) {
                             Ok(cmsg) => {
                                 handle_client_msg(
                                     cmsg,
@@ -263,6 +265,8 @@ async fn handle_client_msg(
         ClientMsg::Attach {
             subscription_id,
             connection_id,
+            generation,
+            lease_id,
             since_seq,
         } => {
             // Re-attach with the same subscription_id replaces the prior
@@ -277,6 +281,8 @@ async fn handle_client_msg(
                 state.acp_event_bus.metrics(),
                 subscription_id.clone(),
                 connection_id,
+                generation,
+                lease_id,
                 since_seq,
             )
             .await
@@ -302,8 +308,17 @@ async fn handle_client_msg(
                         outcome.receiver,
                         outbound_tx.clone(),
                         cleanup_tx.clone(),
+                        state.connection_manager.shared_session_broker(),
+                        outcome.binding.clone(),
                     );
-                    subscriptions.insert(subscription_id, ActiveSubscription { handle, epoch });
+                    subscriptions.insert(
+                        subscription_id,
+                        ActiveSubscription {
+                            handle,
+                            epoch,
+                            binding: outcome.binding,
+                        },
+                    );
                 }
                 Err(reason) => {
                     let _ = outbound_tx
@@ -321,9 +336,64 @@ async fn handle_client_msg(
             }
         }
         ClientMsg::Ping => {
+            let mut bindings = Vec::new();
+            let mut seen = HashSet::new();
+            for subscription in subscriptions.values() {
+                let Some(binding) = subscription.binding.as_ref() else {
+                    continue;
+                };
+                let key = binding_key(binding);
+                if seen.insert(key) {
+                    bindings.push(binding.clone());
+                }
+            }
+            let outcomes = state
+                .connection_manager
+                .shared_session_broker()
+                .renew_leases(&bindings)
+                .await;
+            let outcome_by_key: HashMap<_, _> = bindings
+                .into_iter()
+                .zip(outcomes)
+                .map(|(binding, outcome)| (binding_key(&binding), outcome))
+                .collect();
+            let mut detached = Vec::new();
+            for (subscription_id, subscription) in subscriptions.iter_mut() {
+                let Some(binding) = subscription.binding.as_ref() else {
+                    continue;
+                };
+                match outcome_by_key.get(&binding_key(binding)) {
+                    Some(LeaseRenewalOutcome::Renewed(renewed)) => {
+                        subscription.binding = Some(renewed.clone());
+                    }
+                    Some(LeaseRenewalOutcome::Detached(reason)) => {
+                        detached.push((subscription_id.clone(), *reason));
+                    }
+                    None => {}
+                }
+            }
+            for (subscription_id, reason) in detached {
+                if let Some(subscription) = subscriptions.remove(&subscription_id) {
+                    subscription.handle.abort();
+                }
+                let _ = outbound_tx
+                    .send(ServerMsg::Detached {
+                        subscription_id,
+                        reason,
+                    })
+                    .await;
+            }
             let _ = outbound_tx.send(ServerMsg::Pong).await;
         }
     }
+}
+
+fn binding_key(binding: &LeaseSocketBinding) -> (String, u64, String) {
+    (
+        binding.connection_id.clone(),
+        binding.generation,
+        binding.lease_id.clone(),
+    )
 }
 
 #[cfg(test)]
@@ -337,7 +407,11 @@ mod tests {
             // Park forever; aborted by cleanup paths or dropped at test end.
             std::future::pending::<()>().await;
         });
-        ActiveSubscription { handle, epoch }
+        ActiveSubscription {
+            handle,
+            epoch,
+            binding: None,
+        }
     }
 
     #[tokio::test]

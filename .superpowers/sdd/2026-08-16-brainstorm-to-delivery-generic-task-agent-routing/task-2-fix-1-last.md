@@ -1,0 +1,5 @@
+- Status: DONE
+- Commit SHA and subject: `ab23f5627b71319033b1a0ea74b53453431f9735 fix(workflow): require exact Simple markers`
+- One-line test summary: Routing 6/6, progress 7/7, full Simple parser 16/16; format and diff checks passed.
+- Concerns: CommonMark Minor intentionally deferred; existing non-blocking build warnings remain.
+- Report path: [task-2-report.md](/Users/pengchao/Documents/Codeg_Fork/codeg/.worktrees/b2d-generic-task-agent-routing/.superpowers/sdd/2026-08-16-brainstorm-to-delivery-generic-task-agent-routing/task-2-report.md)

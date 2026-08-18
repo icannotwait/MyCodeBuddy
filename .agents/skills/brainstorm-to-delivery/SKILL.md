@@ -1,35 +1,22 @@
 ---
 name: brainstorm-to-delivery
-description: Use when a Codeg conversation provides a completed Brainstorm file and asks for a high-quality locally deliverable implementation.
+description: Use when a Codeg conversation has an approved or completed Brainstorm artifact and needs the work carried through to a high-quality local delivery.
 ---
 
 # Brainstorm to Delivery
 
-Treat the completed Brainstorm named by the user as the requirements baseline.
-Do not repeat brainstorming. Continue through planning, implementation,
-verification, independent final review, and local delivery unless a decision
-changes requirements, scope, architecture, or user data handling.
+Coordinate delivery through Simple Markdown documents and generic delegation.
+Keep requirement, scope, architecture, and user-data decisions with the user.
+Keep the parent focused on coordination, adjudication, progress, and delivery.
 
-**Core contract:** The Plan defines the work. One structured progress document
-records orchestration. Generic delegation runs execute it. The parent keeps
-those sources reconciled and adjudicates reports against repository evidence.
-
-**REQUIRED SUB-SKILL:** Use `writing-plans` to create and revise the
-Implementation Plan.
-
-**REQUIRED SUB-SKILL:** Use `subagent-driven-development` for Task briefs,
-implementation, independent review, fix loops, reports, and final review. This
-Skill supplies the Codeg routing and Simple progress contract below.
-
-The following positive contract is authoritative. Execute its phases and
-ordered actions exactly; use the numbered sections for operational detail.
-
-<!-- codeg-b2d-skill-contract-v1
+<!-- codeg-b2d-skill-contract-v2
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "phase_order": [
     "establish-current-truth",
-    "produce-plan-and-register",
+    "resolve-task-agent",
+    "review-and-revise-design",
+    "author-and-review-plan",
     "maintain-progress",
     "apply-workspace-gate",
     "execute-tasks-serially",
@@ -38,20 +25,64 @@ ordered actions exactly; use the numbered sections for operational detail.
   ],
   "interfaces": {
     "plan_authoring": "writing-plans",
+    "task_execution": "subagent-driven-development",
     "registration": "register_simple_workflow",
     "first_run": "delegate_to_agent",
     "later_run": "continue_delegation",
     "join": "get_delegation_status",
-    "recovery_authorization": "request_recovery_authorization"
+    "recovery_authorization": "request_recovery_authorization",
+    "binding_query": "get_delegation_orchestration_bindings"
   },
   "plan_setup_order": [
-    "create-progress",
-    "write-plan",
-    "confirm-plan-on-disk",
-    "register-simple-workflow",
-    "sync-plan-tasks",
-    "review-plan"
+    "create-progress-shell",
+    "dispatch-plan-author",
+    "derive-plan-routing",
+    "initialize-progress-from-validator",
+    "validate-static-documents",
+    "validate-durable-admission",
+    "review-plan",
+    "register-simple-workflow"
   ],
+  "document_work": {
+    "parent_edits": false,
+    "design_review": "conditional",
+    "design_reviewer": "independent_codex",
+    "design_fixer": "independent_codex",
+    "plan_author": "independent_codex",
+    "plan_reviewer": "independent_codex",
+    "producer_reviewer_independence": true,
+    "plan_rereview": "full_latest_plan",
+    "user_named_reviewers": "design_and_plan_only",
+    "admission_cadence": "fresh_applicable_mode_before_every_dispatch_or_continuation"
+  },
+  "conversation_identity": {
+    "distinct_work_units": "distinct_child_conversations",
+    "continuation": "same_work_unit_only"
+  },
+  "task_agent": {
+    "default_agent_type": "grok",
+    "selection_source": "invocation",
+    "explicit_substitution": "forbidden",
+    "change_boundary": "completed_tasks_after_plan_revision_and_full_rereview"
+  },
+  "routing": {
+    "marker": "codeg-b2d-routing-v1",
+    "risk_policy_version": "b2d_task_risk_v1",
+    "normal": {
+      "implementer": "task_agent",
+      "reviewers": ["codex_primary"]
+    },
+    "high": {
+      "implementer": "codex",
+      "reviewers": ["codex_primary", "task_agent_auxiliary"]
+    },
+    "reviewer_slots": ["primary", "auxiliary"],
+    "task_order": "serial",
+    "high_review_fan_out": "parallel_after_implementation",
+    "binding_schema_version": 1,
+    "binding_namespace": "brainstorm-to-delivery",
+    "binding_source": "validator_output"
+  },
   "progress": {
     "marker": "codeg-simple-progress-v1",
     "mutation_order": [
@@ -59,255 +90,409 @@ ordered actions exactly; use the numbered sections for operational detail.
       "delegate",
       "record-admission",
       "record-observed-state"
-    ]
+    ],
+    "route_metadata": "additive",
+    "dispatch_intent": "operation_specific_before_call",
+    "pending_route_change": "record_before_plan_revision_clear_after_approval"
   },
   "workspace_policy": "preserve-user-changes",
-  "task_execution": {
-    "order": "serial",
-    "implementer": "grok",
-    "reviewer": "codex",
-    "review": "independent"
-  },
   "recovery": {
     "unexpected_continuations": 2,
     "logical_replacements": 1,
-    "replacement_retry": "pre-admission-only"
+    "replacement_retry": "pre-admission-only",
+    "durable_reconciliation": "fresh_complete_parent_scoped_snapshot",
+    "lost_acknowledgement": "one_exact_unresolved_intent",
+    "status_refresh": "state_only_then_fresh_full_admission"
   },
   "final_review": {
     "required": true,
     "independent": true,
-    "reviewer": "codex"
+    "reviewer": "codex",
+    "fix_owner": "task_producer"
   }
 }
 -->
 
 ## 1. Establish current truth
 
-1. Read repository instructions, the Brainstorm, relevant code and tests,
-   recent commits, and existing user changes.
-2. Inspect the live MCP schemas before constructing calls. Refresh tool
-   discovery before declaring a required agent or tool unavailable.
-3. Use this workflow allowlist even when an older client displays additional
-   workflow surfaces: `register_simple_workflow`, `delegate_to_agent`,
-   `continue_delegation`, `get_delegation_status`, `get_session_info`, and
-   `request_recovery_authorization` when a typed generic recovery response
-   requires it.
-4. Re-read the Plan, progress document, reports, Git state, and live generic
-   run status after compaction, interruption, or resumed work. Treat earlier
-   reasoning as provisional until disk and tool evidence confirm it.
+Read the invocation, Brainstorm, repository instructions, current Plan and
+progress when present, Task reports, reviews, commits, and worktree state.
+Inspect live Agent discovery and the schemas for
+get_delegation_orchestration_bindings, register_simple_workflow,
+delegate_to_agent, continue_delegation, get_delegation_status, and
+request_recovery_authorization. Require the query tool. Fetch every page of
+one complete parent-scoped snapshot into one OS-temporary raw evidence file.
+Reject and restart a stale, mixed, truncated, or oversized scan from page
+one. Remove the file after validation. Refresh discovery after compaction.
+Treat simulated Agent responses only as labeled test doubles. Preserve user
+files. Assign Design, Plan, implementation, fix, and review writing to child
+work units; keep the parent in the coordinator role. Query unavailability,
+DB failure, incomplete evidence, a missing query tool, wrong namespace, an
+unbound routed row, a deleted mirror, ambiguous adoption, an unavailable
+Agent or profile, or an exhausted rail blocks. Copy the validator's exact
+binding. Independent parent or Plan Author hashing is forbidden.
+get_delegation_status remains the join tool after admission.
 
-The parent coordinates and adjudicates. Routed children implement and review
-Task code. The parent may update the Plan and progress document but does not
-implement Task code.
+## 2. Resolve the Task Agent
 
-## 2. Produce the Plan and establish progress
+Resolve one Task Agent identity from the invocation before document work.
+Record an omitted selection as generation 1 with agent_type grok and a null
+profile. Validate an explicit built-in or custom Agent and profile against live
+discovery. Block an invalid, reserved, ambiguous, or unavailable selection and
+request an explicit user choice before recording a different identity.
 
-1. Choose workspace-relative Plan and progress paths. Before any reviewer
-   dispatch, create the progress document with the block from Section 3, an
-   empty `tasks` array, `active_task_index: null`, and a Markdown thread ledger.
-2. Self-check the Brainstorm for completeness and implementability. When it
-   spans modules, migration, concurrency, security, persistence, public
-   compatibility, or material ambiguity, record review intent in the ledger
-   and request independent document review. Update the ledger after every
-   observed state change; return revisions to the same reviewer thread.
-3. Use `writing-plans` to write a Plan no larger than 2 MiB. Its
-   `## Task N: Title` or `### Task N: Title` headings are contiguous and ordered
-   from Task 1. Give every Task exact file ownership, interfaces, verification
-   commands, report location, and commit boundary. Express dependencies through
-   prior Task outputs so execution remains serial.
-4. After the Plan exists on disk, call the root-only
-   `register_simple_workflow` tool:
+Keep generations contiguous from 1. For a boundary change, run this exact
+ordered mutation and recovery sequence:
+
+1. Fetch every page of a fresh snapshot and pass full admission against the unchanged Plan/progress.
+2. Prove every affected Task is pending with an empty run list and no selected durable row in any status.
+3. Persist `pending_route_change` with the requested Agent/profile, next generation, first affected index, and complete affected suffix.
+4. Confirm that exact Agent/profile is currently available; keep the intent and block on unavailability rather than substituting.
+5. Continue the same Plan Author to append the generation and rewrite only that suffix.
+6. Run Author then parent Plan-only derivation, resynchronize only those entries from the parent's exact output, pass combined static validation and a newly queried full admission, then continue every Plan Reviewer for complete re-review.
+7. After approval, fetch a new complete snapshot, pass full admission, clear `pending_route_change` to null, persist, and fetch/pass full admission again before the next Task.
+8. At any interruption, retain the intent, re-read Plan/progress/reviews, fetch a new complete snapshot, and identify the checkpoint. Resume synchronized states with full admission; resume the one Plan-ahead/progress-old state only through Plan-only derivation and the non-authorizing combined-static transition check, then replace the complete suffix and requery for full admission. Never infer, partially patch, or erase a half-applied change.
+
+Block Task dispatch while pending_route_change is non-null. A missing or
+altered intent, a partial resync, or any affected durable row blocks. Defer
+an active-Task change and request a user decision while preserving its
+admitted route.
+
+## 3. Review and revise Design
+
+Trigger Design review when the Brainstorm spans modules, migration,
+concurrency, security, persistence, externally visible compatibility, or
+material ambiguity. Always dispatch an independent Codex Design Reviewer when
+any trigger is present. Dispatch every user-named Design Reviewer as an
+additional separate document-only work unit. Use
+design|DESIGN_PATH|reviewer|AGENT|PROFILE for each reviewer. Dispatch an
+independent Codex Design Fixer on design|DESIGN_PATH|fixer|codex|none. Record
+an unbound intent, fetch a fresh snapshot, and run the applicable admission
+mode before every reviewer or Fixer dispatch or continuation. Use document
+admission only before a routed Plan and synchronized progress exist. Use
+full admission for every later Design decision. Any intervening delegation
+action invalidates the prior snapshot. These document runs stay unbound.
+Adjudicate findings against current artifacts. Continue the same Design Fixer
+for revisions and continue each separate reviewer for re-review. Request a
+user decision for requirement, scope, architecture, or user-data changes.
+Require covering Design reviews to approve the same latest Design.
+
+### Operational policy JSON
+
+Apply this exact inline policy. Treat each hard or soft array entry as an
+evidence object, count each distinct active soft signal once, and reject every
+condition named by `invalid`.
 
 ```json
 {
-  "plan_rel_path": "docs/superpowers/plans/example.md",
-  "progress_rel_path": ".superpowers/sdd/<root-id>/progress.md"
+  "design_review_triggers": [
+    "spans_modules",
+    "migration",
+    "concurrency",
+    "security",
+    "persistence",
+    "externally_visible_compatibility",
+    "material_ambiguity"
+  ],
+  "risk_policy": {
+    "version": "b2d_task_risk_v1",
+    "hard_triggers": [
+      { "kind": "concurrency_lifecycle", "trigger": "Threading, async coordination, cancellation, ordering, ownership lifetime, or process lifecycle behavior changes" },
+      { "kind": "security_trust_boundary", "trigger": "Authentication, authorization, secrets, sandboxing, trust-boundary validation, or privilege changes" },
+      { "kind": "migration_destructive_persistence", "trigger": "Schema/data migration, deletion, irreversible persistence, or destructive state transitions" },
+      { "kind": "public_compatibility", "trigger": "Public API, protocol, schema, serialized format, or externally consumed behavior changes" },
+      { "kind": "unsafe_ffi", "trigger": "Rust unsafe, native FFI, ABI, memory ownership, or equivalent low-level boundaries" },
+      { "kind": "update_rollback", "trigger": "Installer, updater, rollback, recovery, or version-transition behavior changes" }
+    ],
+    "soft_signals": [
+      { "kind": "cross_runtime_or_process", "score": 2, "trigger": "Changes code or a contract across runtime or process boundaries" },
+      { "kind": "broad_production_surface", "score": 1, "trigger": "Touches at least five production files, excluding tests, docs, snapshots, and generated output" },
+      { "kind": "multiple_ownership_modules", "score": 1, "trigger": "Touches at least two independently owned modules or subsystems" },
+      { "kind": "shared_interface", "score": 1, "trigger": "Changes an interface or contract consumed outside the owning module" },
+      { "kind": "dependency_or_build", "score": 1, "trigger": "Changes dependencies, lockfiles, build configuration, packaging, or deployment" },
+      { "kind": "multi_layer_without_test_seam", "score": 1, "trigger": "Spans at least two architectural layers without an isolated boundary test seam" }
+    ],
+    "evidence_fields": {
+      "hard_trigger": ["kind", "evidence"],
+      "soft_signal": ["kind", "score", "evidence"],
+      "evidence": "non-empty file, module, or interface facts"
+    },
+    "arithmetic": {
+      "distinct_active_signal_count": 1,
+      "any_hard_trigger_level": "high",
+      "normal_soft_score_range": [0, 2],
+      "high_soft_score_minimum": 3,
+      "invalid": "unknown, duplicate, contradictory, incorrect, or evidence-free"
+    }
+  },
+  "byte_limits": {
+    "plan_document": 2097152,
+    "routing_block": 262144,
+    "progress_document": 524288,
+    "progress_block": 65536
+  }
 }
 ```
 
-Both values are normalized workspace-relative paths. When no progress path was
-established, omit `progress_rel_path` and create the document at the returned
-path. Conversation identity is token-bound and is not an argument. Treat
-registration as locator metadata: an unavailable descriptor leaves the Plan,
-progress, and generic delegation contracts in force.
+Keep the Plan document at or below 2 MiB and its routing block at or below 256
+KiB. Keep the progress document at or below 512 KiB and its structured block
+at or below 64 KiB.
 
-5. Immediately refresh the block from the registered Plan: include every Task
-   as `pending`, keep `active_task_index: null`, and preserve the document-review
-   ledger. Refresh it again whenever a Plan revision changes Task headings.
-6. Record Plan-review intent in the Markdown ledger, then request an independent
-   Codex Plan review. Add user-named document reviewers only to Brainstorm/Plan
-   review. The parent adjudicates findings from documents and repository facts,
-   revises the Plan, and continues the same reviewer threads until Critical and
-   Important findings are resolved.
-7. Pause when a valid finding requires a user-owned change to requirements,
-   scope, architecture, or user data handling.
+## 4. Author and review Plan
 
-## 3. Maintain the progress contract
+Create only a bounded codeg-simple-progress-v1 shell. Pass document admission.
+Dispatch an independent Codex Plan Author with writing-plans on
+plan|PLAN_PATH|author|codex|none. Require ordered Task headings and exactly one
+bounded unfenced codeg-b2d-routing-v1 JSON block.
 
-Keep the progress document at or below 512 KiB, with exactly one structured
-block at or below 64 KiB:
+Run Plan-only derivation twice: Author, then parent. Initialize route fields
+only from the parent's exact rerun. Run combined static validation, then
+fetch a new complete snapshot and run full admission. Dispatch an independent
+Codex Plan Reviewer on plan|PLAN_PATH|reviewer|codex|none plus any user-named
+Plan reviewers. Review the complete latest Plan rather than a diff.
 
-```text
-<!-- codeg-simple-progress-v1
+Before every later Author or reviewer continuation, fetch a new complete
+snapshot and run full admission against synchronized Plan and progress. Route
+accepted findings to the same Plan Author. After approval, call
+register_simple_workflow. These document runs stay unbound.
+
+Preserve an archived legacy Simple run on its recorded route. Adding routing
+over admitted unbound history blocks.
+
+### Plan routing JSON
+
+Emit this complete JSON shape inside the single routing marker. Repeat the
+generation and Task entries as needed, and keep Task order identical to Plan
+headings.
+
+```json
 {
   "schema_version": 1,
-  "plan_rel_path": "docs/superpowers/plans/example.md",
-  "active_task_index": null,
+  "risk_policy_version": "b2d_task_risk_v1",
+  "task_agent_generations": [
+    {
+      "generation": 1,
+      "agent_type": "grok",
+      "profile_id": null,
+      "effective_from_task_index": 1
+    }
+  ],
   "tasks": [
     {
       "index": 1,
-      "status": "pending",
-      "runs": []
-    },
+      "task_agent_generation": 1,
+      "risk": {
+        "level": "high",
+        "hard_triggers": [],
+        "soft_signals": [
+          { "kind": "cross_runtime_or_process", "score": 2, "evidence": ["src/lib/transport", "src-tauri/src/web"] },
+          { "kind": "shared_interface", "score": 1, "evidence": ["transport request contract"] }
+        ],
+        "score": 3,
+        "reason": "Changes a shared desktop/server transport boundary."
+      },
+      "route": {
+        "implementer": { "agent_type": "codex", "profile_id": null },
+        "reviewers": [
+          { "slot": "primary", "agent_type": "codex", "profile_id": null },
+          { "slot": "auxiliary", "agent_type": "grok", "profile_id": null }
+        ]
+      }
+    }
+  ]
+}
+```
+
+## 5. Maintain progress
+
+Keep Plan Task indices, risk level, Task Agent generation, expected work-unit
+keys, status, commit, and runs synchronized in one progress block. Derive
+normal implementer keys as task|N|implementer|TASK_AGENT|PROFILE and high
+implementer keys as task|N|implementer|codex|none. Derive primary reviewer keys
+as task|N|reviewer|primary|codex|none and high auxiliary reviewer keys as
+task|N|reviewer|auxiliary|TASK_AGENT|PROFILE. Use
+final_review|reviewer|codex|none for final review.
+
+Before each call, append a new reserving run with the exact validator-copied
+orchestration_binding, full null durable identity, and an operation-specific
+dispatch_intent. After acknowledgement, fill every returned and durable field
+without deleting intent history. A definitive pre-reservation failure can
+close its dispatch intent with null durable identity. Only unknown
+acknowledgement stays reserving and adoption-eligible.
+
+Keep task_id globally unique and attach one non-null child conversation to
+only one complete work-unit key.
+
+### Progress JSON
+
+Maintain this complete JSON shape inside the single progress marker. Repeat
+Task and run entries without dropping route, lineage, dispatch_intent, or
+binding fields. Keep top-level pending_route_change null until a boundary
+change records the object below.
+
+```json
+{
+  "schema_version": 1,
+  "plan_rel_path": "docs/superpowers/plans/example.md",
+  "active_task_index": 1,
+  "pending_route_change": null,
+  "tasks": [
     {
-      "index": 2,
-      "status": "pending",
-      "runs": []
+      "index": 1,
+      "status": "in_progress",
+      "commit": null,
+      "risk_level": "high",
+      "task_agent_generation": 1,
+      "route_fingerprint": "sha256:b498416d87bf6ba928bd7ddb5f1a451daf82300584f3d40b606c3c56f169ba7a",
+      "expected_work_unit_keys": {
+        "implementer": "task|1|implementer|codex|none",
+        "reviewers": {
+          "primary": "task|1|reviewer|primary|codex|none",
+          "auxiliary": "task|1|reviewer|auxiliary|grok|none"
+        }
+      },
+      "runs": [
+        {
+          "role": "implementer",
+          "agent_type": "codex",
+          "profile_id": null,
+          "task_id": null,
+          "child_conversation_id": null,
+          "state": "reserving",
+          "work_unit_key": "task|1|implementer|codex|none",
+          "task_agent_generation": 1,
+          "root_task_id": null,
+          "previous_task_id": null,
+          "lineage_root_task_id": null,
+          "generic_generation": null,
+          "recovery_count": 0,
+          "replaced_task_id": null,
+          "replacement_reason": null,
+          "dispatch_intent": {
+            "kind": "first",
+            "continuation_target_task_id": null,
+            "replacement_target_task_id": null,
+            "replacement_reason": null,
+            "expected_root_task_id": null,
+            "expected_lineage_root_task_id": null,
+            "expected_generic_generation": 1,
+            "expected_child_conversation_id": null,
+            "adopted_after_lost_acknowledgement": false
+          },
+          "orchestration_binding": {
+            "schema_version": 1,
+            "namespace": "brainstorm-to-delivery",
+            "generation": 1,
+            "route_fingerprint": "sha256:b498416d87bf6ba928bd7ddb5f1a451daf82300584f3d40b606c3c56f169ba7a"
+          }
+        }
+      ]
     }
   ],
   "final_review_status": "pending",
-  "updated_at": "2026-08-11T00:00:00Z"
+  "updated_at": "2026-08-16T00:00:00Z"
 }
--->
 ```
 
-Use Task statuses `pending`, `in_progress`, `completed`, or `blocked`. Mirror
-observed generic run states as `reserving`, `running`, `completed`, `failed`,
-`canceled`, `cancelled`, `stalled`, or `unknown`. Keep commands, findings,
-recovery history, and the final-review thread ledger as normal Markdown after
-the block.
+### Pending route-change object
 
-Replace the whole block before each Task delegation mutation and after every
-observed Task state change. Before admission, set the current Task and
-`active_task_index`, then record intended role, agent, profile, action, and
-stable `work_unit_key` with state `reserving`. After admission, fill the
-returned task and child IDs. After status changes, record the observed state.
-For document and final-review runs, make the same before/after updates in the
-Markdown thread ledger. Mark a Task completed only after parent adjudication
-confirms implementation, review, repository evidence, and covering
-verification.
+Record this exact non-null object only after step 2 of the section 2 sequence
+proves a never-admitted pending suffix. Clear it only after approval and
+another full admission.
 
-## 4. Apply the workspace gate
+```json
+{
+  "pending_route_change": {
+    "requested_agent_type": "gemini",
+    "requested_profile_id": null,
+    "next_generation": 2,
+    "effective_from_task_index": 5,
+    "affected_task_indices": [5, 6, 7]
+  }
+}
+```
 
-Immediately before Task execution, and again after a material Plan revision or
-recovery, inspect branch, HEAD, `git status`, staged diff, unstaged diff, and
-Plan touchpoints.
+## 6. Apply the workspace gate
 
-- Preserve every pre-existing or user-owned change.
-- Continue with a recorded warning only when changes are few, attributable,
-  non-overlapping, and can be excluded from Task commits and review.
-- Request a user decision when ownership is unclear, changes overlap Task
-  files, or the Task cannot be committed and reviewed independently.
-- Tell every writing child that it is not alone in the worktree and must work
-  with current files without reverting other changes.
+Inspect git status, staged and unstaged diffs, recent commits, ignored
+delivery reports, and repository instructions before each producer dispatch.
+Record ownership and expected files. Preserve unrelated user changes, build
+outputs, generated files, and concurrent edits. Require every producer to
+inspect disk state before editing, stay within assigned files, use
+test-first development, and report exact tests and diffs. Pause on ambiguous
+ownership, destructive operations, secrets, external side effects, or
+user-owned decisions. Request direction and resume from refreshed truth.
 
-## 5. Execute Tasks serially
+## 7. Execute Tasks serially
 
-Execute implementation Tasks serially with these routes:
+Use subagent-driven-development and execute one Plan Task at a time. Before
+every first, continue, or replacement action, fetch a fresh complete snapshot
+and run full admission. Pass the exact emitted binding. Route changed
+pre-admission risk evidence through the same Plan Author, rerun validation,
+and continue every Plan reviewer for full re-review. Block changed
+post-admission evidence, including a coordinated Plan and progress generation
+rewrite against an admitted durable row.
 
-| Work | First run | Later work on the same unit |
-| --- | --- | --- |
-| Task implementation/fix | Grok via `delegate_to_agent` | Same Grok via `continue_delegation` |
-| Task independent review | Fresh Codex via `delegate_to_agent` | Same Codex via `continue_delegation` |
-| Final whole-branch review | Fresh Codex via `delegate_to_agent` | Same Codex for interrupted recovery and fix re-review |
+For a normal Task, dispatch the selected Task Agent as implementer and fixer;
+after it settles, dispatch an independent Codex primary reviewer. For a high
+Task, dispatch an independent Codex implementer and fixer; after it settles,
+admit the Codex primary intent, call, and acknowledgement first, refresh and
+validate, then admit the Task Agent auxiliary intent, call, and
+acknowledgement, after which those children may run concurrently. Keep high
+reviewers on distinct keys and child conversations. All routed Task work
+units share that Task's one binding.
 
-For a first run, call `delegate_to_agent` with `agent_type`, a self-contained
-`task`, a fresh `correlation_id`, `profile_id` when selected, `working_dir` when
-needed, and the stable `work_unit_key`. Include the Brainstorm/Plan references,
-exact Task scope, constraints, current repository state, required checks,
-report path, and the instruction to preserve unrelated work.
+Join every required Task run. Continue the owning producer for each accepted
+fix, invalidate all prior review conclusions for that Task, and rerun every
+required reviewer on the latest producer result. Complete a Task only after
+all expected key lineages end completed, checks pass, reviewers approve, and
+the owned commit and report are current.
 
-Use stable keys of at most 200 characters:
+## 8. Recover generic runs
 
-| Work unit | Key |
-| --- | --- |
-| Design reviewer | `design|{design_rel_path}|reviewer|{agent}|{profile_or_none}` |
-| Plan reviewer | `plan|{plan_rel_path}|reviewer|{agent}|{profile_or_none}` |
-| Task implementer | `task|{index}|implementer|{agent}|{profile_or_none}` |
-| Task reviewer | `task|{index}|reviewer|{agent}|{profile_or_none}` |
-| Final reviewer | `final_review|reviewer|codex|{profile_or_none}` |
+Continue a run with continue_delegation only on its stable key and child
+conversation. Join observed tasks through get_delegation_status. For recovery
+confirmation, call request_recovery_authorization and replay the authorized
+generic call.
 
-Normalize path material, keep role/agent/profile fixed for the work unit, and
-store the key plus latest task ID, child ID, recovery count, and replacement
-metadata in progress.
+After compaction or a lost response, query first. Apply only one exact
+validator adoption action to still-matching progress, mark
+adopted_after_lost_acknowledgement true, persist, requery, and revalidate.
+First, continue, and replacement lost acknowledgements adopt only an exact
+unresolved intent. Deleting the intent or mirror remains blocking.
 
-Complete each Task's implementation, targeted checks, Task-owned commit,
-independent review, fixes, and re-review before starting the next Task. The
-parent reads every report, checks it against the current diff/commit and test
-evidence, resolves Critical and Important findings, and records retained Minor
-findings with reasons.
+Only when every failure is B2D-DURABLE-005 with exact prefix
+`status-only refresh required:` and the validator reports no identity or
+binding failure, update each named progress run's state from its matched
+durable status, persist, discard the snapshot, fetch every page again, and
+rerun full admission. Treat a validator-confirmed status-only lifecycle
+advance as that state-only refresh loop, not a permanent identity failure.
+Never rewrite Task ID, child, lineage, Agent/profile, key, generation, or
+binding, and never idempotently replay an unresolved call before
+reconciliation.
 
-Join required runs with `get_delegation_status` using `task_ids`,
-`return_when: "all_terminal_or_attention"`, and `wait_ms: 0`. Re-join only
-required runs that remain active.
+If pending_route_change exists, start by fetching a fresh complete snapshot
+and resume the section 2 checkpoint sequence. Preserve at most two unexpected
+continuations and one logical replacement per complete key lineage. Surface
+the typed blocker and retain the recorded route.
 
-## 6. Continue and replace from generic run state
+Projection may emit simple_orchestration_binding_missing,
+simple_orchestration_binding_mismatch, and
+simple_orchestration_binding_orphan. Those warnings stay warning-only. They
+never create a Gate, Card, or completion decision.
 
-Prefer `continue_delegation` when the progress ledger and fresh status show a
-recoverable established work unit. Supply its latest terminal `task_id`, a
-self-contained new-turn `task`, a fresh `correlation_id`, and the same
-`work_unit_key`. A continuation prompt must require the child to:
+## 9. Complete final review
 
-1. re-inspect Git, current files, diffs, reports, and relevant test evidence;
-2. treat pre-interruption reasoning as provisional;
-3. audit partial filesystem changes;
-4. recreate any report that is not durably present; and
-5. rerun covering checks before claiming completion.
-
-When a generic call returns `recovery_confirmation_required`, call
-`request_recovery_authorization` with `subject_kind: "delegation_task"`, the
-returned task ID as `subject_id`, and a fresh `correlation_id`. Replay the exact
-rejected call with its `recovery_authorization_id`, unchanged action, key,
-agent, and profile. Keep that authorization ID transport-only; do not write it
-to progress or reports.
-
-When typed generic state selects `fresh_dispatch` for a first run that failed
-before admission and never established child or resume identity, call
-`delegate_to_agent` again with the same agent, profile, and key and without
-`replaces_task_id`. When a replacement itself fails before reaching `running`
-and typed state selects a pre-admission retry, repeat the same replacement key,
-`replaces_task_id`, and `replacement_reason`. These pre-running retries preserve
-the existing lineage and do not consume its one-replacement rail.
-
-Use a fresh `delegate_to_agent` replacement only when generic state selects a
-supported reason and budget remains. Supply the original agent/profile/key,
-`replaces_task_id` for the latest terminal source, and the exact
-`replacement_reason`: `unresumable`, `budget_exhausted_continue`,
-`not_supported`, `admission_failed`, or `admission_unknown`. Record replacement
-intent before the call and the new task/child IDs after admission.
-
-Preserve inherited consumption across each established work-unit lineage:
-
-| Generic recovery rail | Limit |
-| --- | --- |
-| Unexpected continuations | 2 |
-| Logical replacement | 1 |
-
-When either rail is exhausted or the required agent remains unavailable after
-discovery, record the typed blocker and surface it to the user.
-
-## 7. Final review and delivery
-
-After every implementation Task is complete:
-
-1. Re-read the Brainstorm, Plan, progress, Task reports, retained findings,
-   commits, full diff, and worktree state.
-2. Run scope-appropriate tests, lint, build, and project checks; rerun checks
-   invalidated by fixes.
-3. Set `final_review_status` to `in_progress`, record final-review intent in the
-   Markdown ledger, and dispatch a fresh independent Codex final reviewer.
-4. Adjudicate final findings from its report and current repository facts.
-   Route fixes through the owning implementer work unit, rerun covering checks,
-   and continue the same final-review Codex thread to review the changed
-   delivery state.
-5. Set final review to `completed` only when the reviewed repository state is
-   locally deliverable. A later code or report mutation reopens verification
-   and final review.
-6. Commit only owned changes locally. Do not merge, push, or create a PR unless
-   the user separately requests it.
-
-Report the delivered result, files and commits, exact commands and outcomes,
-review conclusions, retained Minors/risks, worktree state, and blockers.
-Automated evidence plus final review establish local delivery. Put manual UAT
-or product sign-off that does not change requirements in post-delivery
-follow-up rather than between implementation Tasks.
+After all Tasks complete, re-read the Brainstorm, Design, Plan, routing,
+progress, reports, reviews, commits, full branch diff, and worktree state.
+Run covering tests, lint, build, and project checks. Fetch a new complete
+snapshot and run full admission before dispatching a fresh independent Codex
+final reviewer on final_review|reviewer|codex|none. That work unit stays
+unbound. After each owning producer fix, fetch another fresh complete
+snapshot and run full admission before continuing the same final reviewer.
+Bound final fixes return to the owning Task producer and reopen Task and
+final review. Complete local delivery only when covering checks and
+independent final review approve the same latest state. Commit only owned
+changes locally. Leave merge, push, PR creation, and deployment to a
+separate explicit request. Report commits, exact commands, outcomes, review
+conclusions, retained Minors, worktree state, and blockers.

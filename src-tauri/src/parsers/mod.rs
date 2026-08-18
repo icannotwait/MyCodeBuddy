@@ -642,17 +642,17 @@ pub fn infer_context_window_max_tokens(model: Option<&str>) -> Option<u64> {
         return Some(262_144);
     }
     if normalized.starts_with("grok") {
-        // Context windows per x.ai docs (docs.x.ai/developers/models, 2026-07).
+        // Context windows per x.ai docs (docs.x.ai/developers/models, 2026-08).
         // Grok's model names churn, so match the known families before the
         // generic fallback, most-specific first:
-        //   grok-4.5              → 500K
+        //   grok-4.5 / grok-4.6   → 500K
         //   grok-4.3 / grok-4.20  → 1M
         //   grok-build-* / grok-code-fast-1 → 256K (coding models; the latter
         //                           is 256K despite the "fast" in its name)
         //   general -fast (grok-4-fast) → 2M
         // Default any unknown grok model to the conservative 256K rather than
         // guessing high.
-        if normalized.contains("4.5") {
+        if normalized.contains("4.5") || normalized.contains("4.6") {
             return Some(500_000);
         }
         if normalized.contains("4.3") || normalized.contains("4.20") {
@@ -1485,12 +1485,16 @@ earlier terminal context records.\n\
             infer_context_window_max_tokens(Some("claude-opus-4-6-10m-preview")),
             Some(200_000)
         );
-        // Grok context windows per x.ai docs: grok-4.5 = 500K, grok-4.3 /
-        // grok-4.20 = 1M, the coding/build models = 256K (grok-code-fast-1
-        // despite "fast"), the general -fast variants = 2M, and any unknown
-        // grok model falls back to the conservative 256K.
+        // Grok context windows per x.ai docs: grok-4.5 / grok-4.6 = 500K,
+        // grok-4.3 / grok-4.20 = 1M, the coding/build models = 256K
+        // (grok-code-fast-1 despite "fast"), the general -fast variants = 2M,
+        // and any unknown grok model falls back to the conservative 256K.
         assert_eq!(
             infer_context_window_max_tokens(Some("grok-4.5")),
+            Some(500_000)
+        );
+        assert_eq!(
+            infer_context_window_max_tokens(Some("grok-4.6")),
             Some(500_000)
         );
         assert_eq!(

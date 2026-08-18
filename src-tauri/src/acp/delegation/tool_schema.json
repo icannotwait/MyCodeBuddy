@@ -34,9 +34,40 @@
   },
   {
     "name": "delegate_to_agent",
-    "description": "Asynchronous cold child cannot see this conversation; returns task_id. Task must include all context. Fan out, then Join. For each distinct agent/profile mention, call once; pass profile_id for a profile.",
+    "description": "ASYNCHRONOUS: returns task_id. Cold child cannot see this conversation; task must include all context. Fan out, then Join. For each distinct agent/profile mention, call once; pass profile_id for a profile.",
     "inputSchema": {
       "type": "object",
+      "$defs": {
+        "b": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "schema_version",
+            "namespace",
+            "generation",
+            "route_fingerprint"
+          ],
+          "properties": {
+            "schema_version": {
+              "type": "integer",
+              "const": 1
+            },
+            "namespace": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9-]{0,63}$"
+            },
+            "generation": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4294967295
+            },
+            "route_fingerprint": {
+              "type": "string",
+              "pattern": "^sha256:[0-9a-f]{64}$"
+            }
+          }
+        }
+      },
       "required": [
         "agent_type",
         "task",
@@ -72,24 +103,24 @@
         },
         "correlation_id": {
           "type": "string",
-          "description": "Fresh per call."
+          "description": "Fresh."
         },
         "recovery_authorization_id": {
           "type": "string",
           "minLength": 1
         },
+        "orchestration_binding": {
+          "$ref": "#/$defs/b"
+        },
         "working_dir": {
-          "type": "string",
-          "description": "Absolute; defaults to parent."
+          "type": "string"
         },
         "work_unit_key": {
           "type": "string",
-          "maxLength": 200,
-          "description": "Recovery key."
+          "maxLength": 200
         },
         "replaces_task_id": {
-          "type": "string",
-          "description": "Pair with replacement_reason."
+          "type": "string"
         },
         "replacement_reason": {
           "type": "string",
@@ -100,14 +131,14 @@
             "admission_failed",
             "admission_unknown"
           ],
-          "description": "admission_failed/admission_unknown require explicit replacement; cancellation/stall does not; otherwise continue_delegation."
+          "description": "admission_failed/admission_unknown: explicit replacement, not continue."
         }
       }
     }
   },
   {
     "name": "register_simple_workflow",
-    "description": "Register workspace-relative Plan and progress paths for this Root conversation after the Plan exists.",
+    "description": "Register Plan/progress",
     "inputSchema": {
       "type": "object",
       "additionalProperties": false,
@@ -127,10 +158,81 @@
     }
   },
   {
-    "name": "continue_delegation",
-    "description": "Continue terminal task_id asynchronously with full context; never creates a child. Join via get_delegation_status.",
+    "name": "get_delegation_orchestration_bindings",
+    "description": "Read-only parent-scoped snapshot",
     "inputSchema": {
       "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "namespace"
+      ],
+      "properties": {
+        "namespace": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]{0,63}$"
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 200,
+          "default": 100
+        },
+        "snapshot_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "cursor": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9_-]+$"
+        }
+      },
+      "dependentRequired": {
+        "snapshot_id": [
+          "cursor"
+        ],
+        "cursor": [
+          "snapshot_id"
+        ]
+      }
+    }
+  },
+  {
+    "name": "continue_delegation",
+    "description": "Continue terminal task_id;reuse child",
+    "inputSchema": {
+      "type": "object",
+      "$defs": {
+        "b": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "schema_version",
+            "namespace",
+            "generation",
+            "route_fingerprint"
+          ],
+          "properties": {
+            "schema_version": {
+              "type": "integer",
+              "const": 1
+            },
+            "namespace": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9-]{0,63}$"
+            },
+            "generation": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4294967295
+            },
+            "route_fingerprint": {
+              "type": "string",
+              "pattern": "^sha256:[0-9a-f]{64}$"
+            }
+          }
+        }
+      },
       "required": [
         "task_id",
         "task",
@@ -145,23 +247,25 @@
         },
         "correlation_id": {
           "type": "string",
-          "description": "Fresh per invocation."
+          "description": "Fresh."
         },
         "recovery_authorization_id": {
           "type": "string",
           "minLength": 1
         },
+        "orchestration_binding": {
+          "$ref": "#/$defs/b"
+        },
         "work_unit_key": {
           "type": "string",
-          "maxLength": 200,
-          "description": "Prior key if omitted; max 200."
+          "maxLength": 200
         }
       }
     }
   },
   {
     "name": "get_delegation_status",
-    "description": "Join task_ids in input order. Omit wait_ms for an immediate snapshot. return_when=all_terminal_or_attention; wait_ms=0; positive wait_ms is rejected. wake_reason/attention_requests report attention, unavailable, or all requested tasks are terminal. Re-Join only still-running required tasks.",
+    "description": "task_ids input order;omit wait_ms for an immediate snapshot;return_when=all_terminal_or_attention;positive wait_ms is rejected;wake_reason,attention_requests: attention,unavailable,all requested tasks are terminal;re-join only still-running required.",
     "inputSchema": {
       "type": "object",
       "required": [
@@ -191,7 +295,7 @@
   },
   {
     "name": "cancel_delegation",
-    "description": "Cancel only when its result is no longer wanted. timeout is non-canceling: keep waiting with wait_ms for slow work. Already finished returns final result. taskfail, usercancel, and others cancel.",
+    "description": "Only when its result is no longer wanted; timeout is non-canceling; keep waiting with wait_ms for slow work; already finished: final result; taskfail, usercancel, and others cancel.",
     "inputSchema": {
       "type": "object",
       "required": [
@@ -216,10 +320,9 @@
   },
   {
     "name": "check_user_feedback",
-    "description": "Messages are available only through this tool. Non-blocking; call before starting implementation, a significant decision, and after a meaningful sub-task. HIGH-PRIORITY. Empty result means continue.",
+    "description": "Messages are available only through this tool;non-blocking;before starting implementation;significant decision;after a meaningful sub-task;HIGH-PRIORITY;empty result means continue.",
     "inputSchema": {
-      "type": "object",
-      "properties": {}
+      "type": "object"
     }
   },
   {
@@ -289,7 +392,7 @@
   },
   {
     "name": "get_session_info",
-    "description": "Resolve codeg://session/ to read-only metadata and optional recent messages. Use internal conversation ID, not the agent session ID. Missing is found: false, not an error.",
+    "description": "codeg://session/ read-only metadata;optional recent messages;internal conversation ID, not the agent session ID;found: false, not an error.",
     "inputSchema": {
       "type": "object",
       "required": [
@@ -308,7 +411,7 @@
   },
   {
     "name": "request_parent_decision",
-    "description": "Ask the direct parent for a blocking decision. Blocks until reply or closure; not for progress, logs, or warnings.",
+    "description": "direct parent blocking decision; blocks until reply or closure; not for progress, logs, or warnings.",
     "inputSchema": {
       "type": "object",
       "additionalProperties": false,
@@ -326,7 +429,7 @@
   },
   {
     "name": "reply_to_delegation",
-    "description": "Reply to an open direct-child Join decision. First reply wins; same reply is idempotent.",
+    "description": "Open direct-child Join decision; first reply wins; idempotent.",
     "inputSchema": {
       "type": "object",
       "additionalProperties": false,
@@ -348,7 +451,7 @@
   },
   {
     "name": "request_recovery_authorization",
-    "description": "After typed recovery_confirmation_required, request confirmation; replay the exact rejected call with recovery_authorization_id. Server derives action, target, warning, work-unit key, and delegation target. Results include subject_kind, subject_id, allowed_action, cause_code, expires_at, and action-specific target_state or replacement_reason metadata.",
+    "description": "recovery_confirmation_required;exact rejected call;subject_kind,allowed_action,cause_code,expires_at,target_state,replacement_reason",
     "inputSchema": {
       "type": "object",
       "additionalProperties": false,
@@ -376,22 +479,21 @@
         "proposed_user_reason": {
           "type": "string",
           "maxLength": 4096,
-          "description": "reset_plan_lineage only; otherwise rejected."
+          "description": "reset_plan_lineage only"
         }
       }
     }
   },
   {
     "name": "get_workflow_capabilities",
-    "description": "Discover workflow_manifest_v2.",
+    "description": "workflow_manifest_v2",
     "inputSchema": {
-      "type": "object",
-      "properties": {}
+      "type": "object"
     }
   },
   {
     "name": "get_workflow_state",
-    "description": "compact workflow index. Read plan/design/report_file for prose; get_session_info/get_delegation_status for detail.",
+    "description": "compact workflow index: report_file, get_session_info, get_delegation_status.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -410,7 +512,7 @@
   },
   {
     "name": "recover_workflow",
-    "description": "Root only. Call get_workflow_state, then request_recovery_authorization; use its receipt. Never creates a challenge.",
+    "description": "",
     "inputSchema": {
       "type": "object",
       "additionalProperties": false,
@@ -442,7 +544,7 @@
   },
   {
     "name": "publish_workflow_manifest",
-    "description": "Publish/CAS v2 workflow manifest.",
+    "description": "",
     "inputSchema": {
       "type": "object",
       "required": [
@@ -485,7 +587,7 @@
   },
   {
     "name": "settle_workflow_gate",
-    "description": "Root-only protocol-v2 Design/Plan settlement from durable platform evidence.",
+    "description": "",
     "inputSchema": {
       "type": "object",
       "additionalProperties": false,

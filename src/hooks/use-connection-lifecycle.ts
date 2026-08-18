@@ -17,6 +17,7 @@ import {
   type AgentType,
   type DelegationRoutePolicy,
   type PromptDraft,
+  type PromptEnqueueResult,
 } from "@/lib/types"
 import { getAgentLabel } from "@/lib/custom-agents"
 import { isDelegateViewerOnlyRejection } from "@/lib/delegate-access"
@@ -102,8 +103,10 @@ export interface UseConnectionLifecycleReturn {
       onDelegateViewerOnly?: () => void
       /** Settles caller-owned optimistic state after any other send failure. */
       onSendFailed?: (error: unknown) => void
+      /** Called only after broker queue admission is authoritative. */
+      onPromptAdmitted?: (result: PromptEnqueueResult | null) => void
     }
-  ) => void
+  ) => Promise<PromptEnqueueResult | null>
   handleSetConfigOption: (configId: string, valueId: string) => void
   handleCancel: () => void
   handleRespondPermission: (requestId: string, optionId: string) => void
@@ -123,10 +126,13 @@ export interface UseConnectionLifecycleReturn {
 export function shouldDisconnectOnUnmount(args: {
   status: string | null
   isViewer: boolean
+  /** Shared roots only release a lease; they never terminate the process. */
+  isSharedSession?: boolean
   backgroundOutstanding: number
   transientUnmount?: boolean
 }): boolean {
   if (args.transientUnmount) return false
+  if (args.isSharedSession) return true
   if (args.isViewer) return true
   return !isConnectionBusy(args)
 }
@@ -176,6 +182,7 @@ export function useConnectionLifecycle({
     modes,
     configOptions,
     hasCachedSelectors,
+    sharedSession,
   } = conn
   const isInteractiveStatus = status === "connected" || status === "prompting"
   const hasSelectorsData = modes !== null || configOptions !== null
@@ -404,6 +411,10 @@ export function useConnectionLifecycle({
   useEffect(() => {
     isTransientUnmountRef.current = isTransientUnmount
   }, [isTransientUnmount])
+  const sharedSessionRef = useRef(sharedSession)
+  useEffect(() => {
+    sharedSessionRef.current = sharedSession
+  }, [sharedSession])
 
   // Clean up on unmount (e.g. tab closed): disconnect the ACP connection
   // so it doesn't leak, and remove lingering tasks.
@@ -428,11 +439,12 @@ export function useConnectionLifecycle({
         shouldDisconnectOnUnmount({
           status: statusRef.current,
           isViewer: isViewerRef.current,
+          isSharedSession: sharedSessionRef.current !== null,
           backgroundOutstanding: backgroundOutstandingRef.current,
           transientUnmount: isTransientUnmountRef.current?.() === true,
         })
       ) {
-        connDisconnectRef.current().catch(() => {})
+        connDisconnectRef.current("provider_unmount").catch(() => {})
       }
       if (taskIdRef.current) {
         removeTask(taskIdRef.current)
@@ -542,8 +554,10 @@ export function useConnectionLifecycle({
         onContinuationWaiting?: () => void
         onDelegateViewerOnly?: () => void
         onSendFailed?: (error: unknown) => void
+        /** Called only after broker queue admission is authoritative. */
+        onPromptAdmitted?: (result: PromptEnqueueResult | null) => void
       }
-    ) => {
+    ): Promise<PromptEnqueueResult | null> => {
       touchActivity(contextKey)
       const onTurnInProgress = opts?.onTurnInProgress
       const onContinuationWaiting = opts?.onContinuationWaiting
@@ -551,7 +565,8 @@ export function useConnectionLifecycle({
         opts?.onDelegateViewerOnly ??
         (() => onDelegateViewerOnlyRef.current?.())
       const onSendFailed = opts?.onSendFailed
-      void (async () => {
+      const onPromptAdmitted = opts?.onPromptAdmitted
+      return (async () => {
         const currentModeId = modeIdRef.current
         if (modeId && modeId !== currentModeId) {
           await connSetMode(modeId)
@@ -559,7 +574,7 @@ export function useConnectionLifecycle({
           // calls before CurrentModeUpdate arrives from the agent.
           modeIdRef.current = modeId
         }
-        await sendPrompt(draft.blocks, {
+        const result = await sendPrompt(draft.blocks, {
           folderId: opts?.folderId,
           conversationId: opts?.conversationId,
           clientMessageId: opts?.clientMessageId,
@@ -568,10 +583,13 @@ export function useConnectionLifecycle({
             locale: getCurrentEffectiveAppLocale(),
           },
         })
+        onPromptAdmitted?.(result)
+        return result
       })().catch((e: unknown) => {
         if (e instanceof ContinuationWaitingError) {
           onContinuationWaiting?.()
-          return
+          if (conn.sharedSession) throw e
+          return null
         }
         if (e instanceof TurnBusyError) {
           // A turn was already in flight on the connection (another
@@ -579,11 +597,13 @@ export function useConnectionLifecycle({
           // observed yet). Not an error — the draft is re-queued by the caller
           // so it auto-sends when the current turn finishes.
           onTurnInProgress?.()
-          return
+          if (conn.sharedSession) throw e
+          return null
         }
         if (isDelegateViewerOnlyRejection(e)) {
           onViewerOnly()
-          return
+          if (conn.sharedSession) throw e
+          return null
         }
         console.error("[ConnLifecycle] sendPrompt:", e)
         const appError = extractAppCommandError(e)
@@ -592,9 +612,11 @@ export function useConnectionLifecycle({
           (e instanceof Error ? e.message : String(e ?? "unknown error"))
         toast.error(t("errors.sendPromptFailed", { error: message }))
         onSendFailed?.(e)
+        if (conn.sharedSession) throw e
+        return null
       })
     },
-    [connSetMode, sendPrompt, contextKey, touchActivity, t]
+    [connSetMode, sendPrompt, contextKey, touchActivity, t, conn.sharedSession]
   )
 
   const handleCancel = useCallback(() => {

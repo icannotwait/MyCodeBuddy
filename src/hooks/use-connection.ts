@@ -11,6 +11,7 @@ import {
   type PendingPermission,
   type PendingUserMessage,
   type PendingQuestion,
+  type SharedConnectionState,
 } from "@/contexts/acp-connections-context"
 import type {
   AcpPromptContext,
@@ -29,6 +30,7 @@ import type {
   SessionFailureRecord,
   SessionModeStateInfo,
   PromptInputBlock,
+  PromptEnqueueResult,
 } from "@/lib/types"
 
 const DEFAULT_PROMPT_CAPABILITIES: PromptCapabilitiesInfo = {
@@ -55,6 +57,7 @@ export interface UseConnectionReturn {
    * unaffected) — otherwise the attach subscription leaks past tab close.
    */
   isViewer: boolean
+  sharedSession: SharedConnectionState | null
   status: ConnectionStatus | null
   promptCapabilities: PromptCapabilitiesInfo
   supportsFork: boolean
@@ -127,7 +130,9 @@ export interface UseConnectionReturn {
     intent?: ConnectionIntent,
     retryObserverDiscovery?: boolean
   ) => Promise<void>
-  disconnect: () => Promise<void>
+  disconnect: (
+    origin?: import("@/lib/api").AcpDisconnectOrigin
+  ) => Promise<void>
   /** Restart the session (disconnect + resume same sessionId) so it picks up
    *  current agent/model settings. Returns `true` if it actually restarted,
    *  `false` on a no-op (viewer / delegation child / no connection). */
@@ -142,7 +147,7 @@ export interface UseConnectionReturn {
       clientMessageId?: string | null
       promptContext?: AcpPromptContext
     }
-  ) => Promise<void>
+  ) => Promise<PromptEnqueueResult | null>
   setMode: (modeId: string) => Promise<void>
   setConfigOption: (configId: string, valueId: string) => Promise<void>
   cancel: () => Promise<void>
@@ -236,6 +241,7 @@ export function useConnection(contextKey: string): UseConnectionReturn {
   const connectionId = connection?.connectionId ?? null
   const agentType = connection?.agentType ?? null
   const isViewer = connection?.isViewer ?? false
+  const sharedSession = connection?.sharedSession ?? null
   const status = connection?.status ?? null
   const promptCapabilities =
     connection?.promptCapabilities ?? DEFAULT_PROMPT_CAPABILITIES
@@ -300,9 +306,12 @@ export function useConnection(contextKey: string): UseConnectionReturn {
   // Drops `actions.disconnect`'s teardown-confirmed flag: this hook's callers
   // are closing a surface, and only a caller that reports a restart back to the
   // user (see `reapplyConfig`) has anything to do with that answer.
-  const disconnect = useCallback(async () => {
-    await actions.disconnect(contextKey)
-  }, [actions, contextKey])
+  const disconnect = useCallback(
+    async (origin?: import("@/lib/api").AcpDisconnectOrigin) => {
+      await actions.disconnect(contextKey, origin)
+    },
+    [actions, contextKey]
+  )
 
   const sendPrompt = useCallback(
     (
@@ -359,6 +368,7 @@ export function useConnection(contextKey: string): UseConnectionReturn {
       connectionId,
       agentType,
       isViewer,
+      sharedSession,
       status,
       promptCapabilities,
       supportsFork,
@@ -403,6 +413,7 @@ export function useConnection(contextKey: string): UseConnectionReturn {
       connectionId,
       agentType,
       isViewer,
+      sharedSession,
       status,
       promptCapabilities,
       supportsFork,

@@ -100,6 +100,7 @@ async fn completion_http_fixture() -> CompletionHttpFixture {
     });
     with_historical_workflow_fixture_mutations(RunStore::new(db_arc).admit_gen1_reserving(
         ReservingRunInsert {
+            orchestration_binding: None,
             task_id: task_id.clone(),
             root_task_id: task_id.clone(),
             previous_task_id: None,

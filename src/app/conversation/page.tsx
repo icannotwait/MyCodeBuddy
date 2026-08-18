@@ -50,7 +50,7 @@ const TOAST_DURATION_MS = 6000
 const COMMIT_ACK_POLL_MS = 750
 const COMMIT_ACK_POLL_MAX_MS = 30_000
 
-export function ConversationPageInner() {
+function ConversationPageInner() {
   const t = useTranslations("ConversationPopout")
   const searchParams = useSearchParams()
   const localDesktop = isLocalDesktop()

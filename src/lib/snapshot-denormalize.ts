@@ -15,6 +15,10 @@ import type {
   SessionFailureRecord,
   SessionModeStateInfo,
   SessionUsageUpdateInfo,
+  SharedActiveTurnProjection,
+  SharedQueuedPromptSummary,
+  SharedSessionPhase,
+  SharedSessionProjection,
   ToolCallState,
   ToolWatchdogProjection,
 } from "@/lib/types"
@@ -27,6 +31,40 @@ import type {
   PendingUserMessage,
   ToolCallInfo,
 } from "@/contexts/acp-connections-context"
+
+export type SharedSessionPhaseView =
+  | { phase: "reserved" }
+  | { phase: "bootstrapping" }
+  | { phase: "ready" }
+  | { phase: "failed"; errorCode: string; cleanupComplete: boolean }
+  | { phase: "closing" }
+
+export interface SharedQueuedPrompt {
+  queueItemId: string
+  enqueueSeq: number
+  clientMessageId: string
+  visibleText: string | null
+  visibleTextTruncated: boolean
+  attachmentCount: number
+  submittedAt: string
+  state: "queued" | "dispatching"
+}
+
+export interface SharedActiveTurn {
+  turnId: string
+  queueItemId: string
+  enqueueSeq: number
+  clientMessageId: string
+  stopRequested: boolean
+}
+
+export interface SharedSessionProjectionView {
+  generation: number
+  phase: SharedSessionPhaseView
+  queue: SharedQueuedPrompt[]
+  activeTurn: SharedActiveTurn | null
+  leaseExpiresAt: string | null
+}
 
 /**
  * Snapshot-derived subset of ConnectionState. Fields not present here
@@ -131,6 +169,7 @@ export interface SnapshotPatch {
    * the lease from the actionable map. `null` when the server omitted it.
    */
   lastToolWatchdogDiagnostic: ToolWatchdogProjection | null
+  sharedSession: SharedSessionProjectionView | null
 }
 
 const DEFAULT_PROMPT_CAPS: PromptCapabilitiesInfo = {
@@ -202,6 +241,71 @@ export function denormalizeSnapshot(wire: LiveSessionSnapshot): SnapshotPatch {
     toolWatchdogProjections: wire.tool_watchdog_projections ?? {},
     toolWatchdogMaxVersions: wire.tool_watchdog_max_versions ?? {},
     lastToolWatchdogDiagnostic: wire.last_tool_watchdog_diagnostic ?? null,
+    sharedSession: wire.shared_session
+      ? denormalizeSharedSession(wire.shared_session)
+      : null,
+  }
+}
+
+function denormalizeSharedSession(
+  wire: SharedSessionProjection
+): SharedSessionProjectionView {
+  return {
+    generation: wire.generation,
+    phase: denormalizeSharedSessionPhase(wire.phase),
+    queue: wire.queue.map(denormalizeSharedQueuedPrompt),
+    activeTurn: wire.active_turn
+      ? denormalizeSharedActiveTurn(wire.active_turn)
+      : null,
+    leaseExpiresAt: wire.lease_expires_at,
+  }
+}
+
+function denormalizeSharedSessionPhase(
+  wire: SharedSessionPhase
+): SharedSessionPhaseView {
+  switch (wire.phase) {
+    case "reserved":
+      return { phase: "reserved" }
+    case "bootstrapping":
+      return { phase: "bootstrapping" }
+    case "ready":
+      return { phase: "ready" }
+    case "failed":
+      return {
+        phase: "failed",
+        errorCode: wire.error_code,
+        cleanupComplete: wire.cleanup_complete,
+      }
+    case "closing":
+      return { phase: "closing" }
+  }
+}
+
+function denormalizeSharedQueuedPrompt(
+  wire: SharedQueuedPromptSummary
+): SharedQueuedPrompt {
+  return {
+    queueItemId: wire.queue_item_id,
+    enqueueSeq: wire.enqueue_seq,
+    clientMessageId: wire.client_message_id,
+    visibleText: wire.visible_text,
+    visibleTextTruncated: wire.visible_text_truncated,
+    attachmentCount: wire.attachment_count,
+    submittedAt: wire.submitted_at,
+    state: wire.state,
+  }
+}
+
+function denormalizeSharedActiveTurn(
+  wire: SharedActiveTurnProjection
+): SharedActiveTurn {
+  return {
+    turnId: wire.turn_id,
+    queueItemId: wire.queue_item_id,
+    enqueueSeq: wire.enqueue_seq,
+    clientMessageId: wire.client_message_id,
+    stopRequested: wire.stop_requested,
   }
 }
 

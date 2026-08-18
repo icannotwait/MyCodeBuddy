@@ -4723,6 +4723,7 @@ mod tests {
             replacement_reason: None,
             correlation_id: None,
             recovery_authorization_id: None,
+            orchestration_binding: None,
         }
     }
 

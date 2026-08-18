@@ -15,8 +15,15 @@ import { afterEach, describe, expect, it, vi } from "vitest"
 
 import type { RichComposerHandle } from "./composer/rich-composer"
 import { serializeDocToText } from "./composer/to-prompt-blocks"
-import { emitAttachFileToSession } from "@/lib/session-attachment-events"
+import {
+  emitAppendTextToSession,
+  emitAttachFileToSession,
+} from "@/lib/session-attachment-events"
 import { streamingPerfRecorder } from "@/lib/perf/streaming-perf-recorder"
+import {
+  loadMessageInputDraftV2,
+  saveMessageInputDraftV2,
+} from "@/lib/message-input-draft"
 
 // MessageInput holds its RichComposer handle internally and does not forward a
 // ref, so capture that handle through a partial mock that still renders the real
@@ -106,6 +113,20 @@ vi.mock("@/lib/transport", () => ({
 vi.mock("@/lib/turn-busy", () => ({
   isNoActiveTurnRejection: vi.fn(() => false),
 }))
+const apiMocks = vi.hoisted(() => ({
+  quickMessagesList: vi.fn(async () => [
+    { id: 1, title: "Saved reply", content: "saved reply body" },
+  ]),
+  uploadAttachment: vi.fn(),
+}))
+vi.mock("@/lib/api", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/api")>()
+  return {
+    ...actual,
+    quickMessagesList: apiMocks.quickMessagesList,
+    uploadAttachment: apiMocks.uploadAttachment,
+  }
+})
 // virtua renders 0 rows under jsdom — render children directly so the large
 // (searchable + virtualized) model list is exercisable here too.
 vi.mock("virtua", async () => {
@@ -164,6 +185,326 @@ function renderInput(
     </NextIntlClientProvider>
   )
 }
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (error: Error) => void
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res
+    reject = rej
+  })
+  return { promise, resolve, reject }
+}
+
+async function mountedEditor(): Promise<Editor> {
+  await waitFor(
+    () => expect(composerHandle.current?.getEditor()).toBeTruthy(),
+    { timeout: 5000 }
+  )
+  const editor = composerHandle.current?.getEditor()
+  if (!editor) throw new Error("composer editor not mounted")
+  return editor
+}
+
+function submitEditor(editor: Editor) {
+  editor.view.dom.dispatchEvent(
+    new KeyboardEvent("keydown", {
+      bubbles: true,
+      cancelable: true,
+      key: "Enter",
+    })
+  )
+}
+
+describe("MessageInput admission-aware clearing", () => {
+  afterEach(() => {
+    cleanup()
+    composerHandle.current = null
+    localStorage.clear()
+    vi.restoreAllMocks()
+    vi.unstubAllGlobals()
+    Reflect.deleteProperty(navigator, "clipboard")
+  })
+
+  it("retains and locks the draft until backend admission resolves", async () => {
+    const draftStorage = await import("@/lib/message-input-draft")
+    const clearDraft = vi.spyOn(draftStorage, "clearMessageInputDraftV2")
+    const admission = deferred<void>()
+    const onSend = vi.fn(() => admission.promise)
+    const storageKey = "shared-admission-success"
+    const { container } = renderInput({
+      onSend,
+      sendClearMode: "after-admission",
+      draftStorageKey: storageKey,
+    })
+    const editor = await mountedEditor()
+
+    act(() => editor.commands.insertContent("wait for admission"))
+    await waitFor(() =>
+      expect(loadMessageInputDraftV2(storageKey)).not.toBeNull()
+    )
+    act(() => submitEditor(editor))
+
+    expect(onSend).toHaveBeenCalledTimes(1)
+    expect(serializeDocToText(editor.state.doc)).toContain("wait for admission")
+    expect(editor.isEditable).toBe(false)
+    expect(screen.getByRole("button", { name: "Add" })).toBeDisabled()
+    expect(
+      container.querySelector<HTMLButtonElement>(
+        `button[title="${enMessages.Folder.chat.messageInput.send}"]`
+      )
+    ).toBeDisabled()
+
+    act(() => submitEditor(editor))
+    fireEvent.click(
+      container.querySelector<HTMLButtonElement>(
+        `button[title="${enMessages.Folder.chat.messageInput.send}"]`
+      )!
+    )
+    expect(onSend).toHaveBeenCalledTimes(1)
+
+    await act(async () => admission.resolve())
+    await waitFor(() =>
+      expect(serializeDocToText(editor.state.doc)).not.toContain(
+        "wait for admission"
+      )
+    )
+    expect(loadMessageInputDraftV2(storageKey)).toBeNull()
+    expect(clearDraft).toHaveBeenCalledTimes(1)
+  })
+
+  it("retains the complete draft and re-enables editing when admission rejects", async () => {
+    const admission = deferred<void>()
+    const onSend = vi.fn(() => admission.promise)
+    const storageKey = "shared-admission-failure"
+    renderInput({
+      onSend,
+      sendClearMode: "after-admission",
+      draftStorageKey: storageKey,
+      attachmentTabId: "tab-shared",
+    })
+    const editor = await mountedEditor()
+
+    act(() => {
+      editor.commands.insertContent("retry this ")
+      emitAttachFileToSession({
+        tabId: "tab-shared",
+        path: "/repo/context.ts",
+      })
+    })
+    await waitFor(() =>
+      expect(serializeDocToText(editor.state.doc)).toContain(
+        "[context.ts](file:///repo/context.ts)"
+      )
+    )
+    act(() => submitEditor(editor))
+    await act(async () => admission.reject(new Error("admission failed")))
+
+    expect(editor.isEditable).toBe(true)
+    expect(serializeDocToText(editor.state.doc)).toContain("retry this")
+    expect(serializeDocToText(editor.state.doc)).toContain(
+      "[context.ts](file:///repo/context.ts)"
+    )
+    expect(loadMessageInputDraftV2(storageKey)).not.toBeNull()
+  })
+
+  it("keeps immediate mode synchronous for local Tauri sends", async () => {
+    const admission = deferred<void>()
+    const onSend = vi.fn(() => admission.promise)
+    const storageKey = "local-immediate"
+    saveMessageInputDraftV2(storageKey, {
+      type: "doc",
+      content: [
+        { type: "paragraph", content: [{ type: "text", text: "old" }] },
+      ],
+    })
+    renderInput({ onSend, draftStorageKey: storageKey })
+    const editor = await mountedEditor()
+
+    act(() => editor.commands.insertContent("send now"))
+    act(() => submitEditor(editor))
+
+    expect(onSend).toHaveBeenCalledTimes(1)
+    expect(serializeDocToText(editor.state.doc)).not.toContain("send now")
+    expect(loadMessageInputDraftV2(storageKey)).toBeNull()
+    await act(async () => admission.resolve())
+  })
+
+  it("blocks context-menu mutation controls while admission is pending", async () => {
+    const admission = deferred<void>()
+    const clipboardRead = vi.fn(async () => "clipboard text")
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { ...navigator.clipboard, readText: clipboardRead },
+    })
+    renderInput({
+      onSend: vi.fn(() => admission.promise),
+      sendClearMode: "after-admission",
+    })
+    const editor = await mountedEditor()
+    act(() => {
+      editor.commands.insertContent("locked selection")
+      editor.commands.selectAll()
+      submitEditor(editor)
+    })
+
+    fireEvent.contextMenu(editor.view.dom)
+
+    expect(
+      await screen.findByRole("menuitem", { name: "Cut" })
+    ).toHaveAttribute("data-disabled")
+    expect(
+      screen.getByRole("menuitem", { name: "Paste as plain text" })
+    ).toHaveAttribute("data-disabled")
+    expect(
+      screen.getByRole("menuitem", { name: "Quick messages" })
+    ).toHaveAttribute("data-disabled")
+
+    await act(async () => admission.reject(new Error("admission failed")))
+  })
+
+  it("ignores external attachment and append events while admission is pending", async () => {
+    const admission = deferred<void>()
+    renderInput({
+      onSend: vi.fn(() => admission.promise),
+      sendClearMode: "after-admission",
+      attachmentTabId: "tab-shared",
+    })
+    const editor = await mountedEditor()
+    act(() => {
+      editor.commands.insertContent("original draft")
+      submitEditor(editor)
+      emitAttachFileToSession({
+        tabId: "tab-shared",
+        path: "/repo/late-context.ts",
+      })
+      emitAppendTextToSession({
+        tabId: "tab-shared",
+        text: "late appended text",
+      })
+    })
+
+    expect(serializeDocToText(editor.state.doc)).toContain("original draft")
+    expect(serializeDocToText(editor.state.doc)).not.toContain(
+      "late-context.ts"
+    )
+    expect(serializeDocToText(editor.state.doc)).not.toContain(
+      "late appended text"
+    )
+
+    await act(async () => admission.reject(new Error("admission failed")))
+  })
+
+  it("re-checks the admission latch after an asynchronous clipboard read", async () => {
+    vi.stubGlobal(
+      "ClipboardEvent",
+      class ClipboardEvent extends Event {
+        constructor(type: string) {
+          super(type)
+        }
+      }
+    )
+    const clipboard = deferred<string>()
+    const clipboardRead = vi.fn(() => clipboard.promise)
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { ...navigator.clipboard, readText: clipboardRead },
+    })
+    const admission = deferred<void>()
+    renderInput({
+      onSend: vi.fn(() => admission.promise),
+      sendClearMode: "after-admission",
+    })
+    const editor = await mountedEditor()
+    act(() => editor.commands.insertContent("send this"))
+
+    act(() => {
+      editor.view.dom.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          bubbles: true,
+          cancelable: true,
+          key: "v",
+          metaKey: true,
+          shiftKey: true,
+        })
+      )
+    })
+    await waitFor(() => expect(clipboardRead).toHaveBeenCalledTimes(1))
+    act(() => submitEditor(editor))
+    await act(async () => clipboard.resolve("must not be appended"))
+
+    expect(serializeDocToText(editor.state.doc)).toContain("send this")
+    expect(serializeDocToText(editor.state.doc)).not.toContain(
+      "must not be appended"
+    )
+
+    await act(async () => admission.reject(new Error("admission failed")))
+  })
+
+  it("drops an image whose decoding finishes after admission starts", async () => {
+    const upload = deferred<{
+      path: string
+      name: string
+      mimeType: string | null
+      size: number
+    }>()
+    apiMocks.uploadAttachment.mockReturnValue(upload.promise)
+    let finishImageRead: (() => void) | null = null
+    class DeferredFileReader {
+      result: string | null = null
+      error: DOMException | null = null
+      onerror: (() => void) | null = null
+      onload: (() => void) | null = null
+
+      readAsDataURL() {
+        finishImageRead = () => {
+          this.result = "data:image/png;base64,bGF0ZQ=="
+          this.onload?.()
+        }
+      }
+    }
+    vi.stubGlobal("FileReader", DeferredFileReader)
+
+    const admission = deferred<void>()
+    const onSend = vi.fn(() => admission.promise)
+    renderInput({ onSend, sendClearMode: "after-admission" })
+    const editor = await mountedEditor()
+    act(() => editor.commands.insertContent("send without late image"))
+
+    const image = new File(["late image"], "late-image.png", {
+      type: "image/png",
+    })
+    const paste = new Event("paste", { bubbles: true, cancelable: true })
+    Object.defineProperty(paste, "clipboardData", {
+      value: {
+        files: [image],
+        items: [],
+        getData: () => "",
+      },
+    })
+    act(() => editor.view.dom.dispatchEvent(paste))
+    await waitFor(() => expect(finishImageRead).not.toBeNull())
+
+    act(() => submitEditor(editor))
+    expect(onSend).toHaveBeenCalledTimes(1)
+    expect(onSend.mock.calls[0]?.[0].blocks).toEqual([
+      { type: "text", text: "send without late image" },
+    ])
+
+    await act(async () => {
+      finishImageRead?.()
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    expect(editor.isEditable).toBe(false)
+    expect(
+      screen.queryByRole("img", { name: "late-image.png" })
+    ).not.toBeInTheDocument()
+
+    await act(async () => admission.reject(new Error("admission failed")))
+  })
+})
 
 describe("MessageInput (RichComposer integration)", () => {
   afterEach(() => {

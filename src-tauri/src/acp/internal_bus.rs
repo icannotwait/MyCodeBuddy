@@ -449,6 +449,15 @@ pub struct EventBusMetricsSnapshot {
     pub desktop_runtime_failure_count: u64,
 }
 
+/// Additive operator snapshot. Event-bus counters remain flattened for
+/// compatibility while broker counters live under one bounded namespace.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AcpEventMetricsSnapshot {
+    #[serde(flatten)]
+    pub event_bus: EventBusMetricsSnapshot,
+    pub shared_session_broker: crate::acp::shared_session::SharedSessionMetricsSnapshot,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

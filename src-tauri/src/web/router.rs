@@ -44,6 +44,10 @@ pub fn build_router(
             get(handlers::event_metrics::get_event_metrics),
         )
         .route(
+            "/debug/shared_sessions",
+            get(handlers::acp::acp_get_shared_session_diagnostics),
+        )
+        .route(
             "/debug/delegation_metrics",
             get(handlers::delegation_metrics::get_delegation_metrics),
         )
@@ -760,12 +764,30 @@ pub fn build_router(
             post(handlers::acp::acp_env_diagnostics),
         )
         .route("/acp_connect", post(handlers::acp::acp_connect))
+        .route(
+            "/acp_connect_or_attach",
+            post(handlers::acp::acp_connect_or_attach),
+        )
+        .route("/acp_release_lease", post(handlers::acp::acp_release_lease))
+        .route(
+            "/acp_cancel_queued_prompt",
+            post(handlers::acp::acp_cancel_queued_prompt),
+        )
+        .route(
+            "/acp_terminate_shared_session",
+            post(handlers::acp::acp_terminate_shared_session),
+        )
         .route("/acp_disconnect", post(handlers::acp::acp_disconnect))
         .route(
             "/acp_touch_connection",
             post(handlers::acp::acp_touch_connection),
         )
-        .route("/acp_prompt", post(handlers::acp::acp_prompt))
+        .route(
+            "/acp_prompt",
+            post(handlers::acp::acp_prompt).layer(DefaultBodyLimit::max(
+                crate::acp::shared_session::MAX_WAITING_BYTES + 1024 * 1024,
+            )),
+        )
         .route("/acp_preflight", post(handlers::acp::acp_preflight))
         .route("/acp_set_mode", post(handlers::acp::acp_set_mode))
         .route(
