@@ -7,6 +7,7 @@ pub mod codex_cli;
 pub mod codex_goal;
 pub mod codex_model_catalog;
 pub mod connection;
+pub mod cursor_enrichment;
 pub mod custom_registry;
 pub mod cursor_store;
 pub mod delegation;
