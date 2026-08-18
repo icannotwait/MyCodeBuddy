@@ -8,6 +8,7 @@ use chrono::{DateTime, Utc};
 use regex::Regex;
 use walkdir::WalkDir;
 
+use crate::models::message::AutonomousTurnOrigin;
 use crate::models::*;
 use crate::parsers::codex_code_mode::{
     extract_chunk_ids, extract_shell_session_ids, is_code_mode_call, parse_code_mode_script,
@@ -271,6 +272,65 @@ impl CodexParser {
 
 pub(crate) fn resolve_codex_home_dir() -> PathBuf {
     resolve_codex_home_dir_from(std::env::var_os("CODEX_HOME"), dirs::home_dir())
+}
+
+/// Read `session_meta.payload.id` from a Codex rollout JSONL file.
+///
+/// Task 7 uses this to require an exact ACP session-id match and to reject
+/// missing, duplicate, or mismatched rollout files. A trailing partial line
+/// is ignored, matching the complete-byte watermark cursor.
+pub(crate) fn rollout_session_id(path: impl AsRef<std::path::Path>) -> Option<String> {
+    let bytes = fs::read(path.as_ref()).ok()?;
+    for (_start, record) in codex_complete_records(&bytes) {
+        let Ok(line) = std::str::from_utf8(codex_record_payload(record)) else {
+            continue;
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if value.get("type").and_then(|t| t.as_str()) != Some("session_meta") {
+            continue;
+        }
+        return value
+            .get("payload")
+            .and_then(|p| p.get("id"))
+            .and_then(|id| id.as_str())
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(|id| id.to_string());
+    }
+    None
+}
+
+/// Iterate complete newline-terminated rollout records.
+///
+/// Each item is `(start_offset, record)` where `record` includes the trailing
+/// `\n`. A trailing fragment without `\n` is omitted and is not part of the
+/// consumed-byte count (`start_offset + record.len()` of the last item, or 0).
+pub(crate) fn codex_complete_records(bytes: &[u8]) -> impl Iterator<Item = (u64, &[u8])> {
+    let mut start = 0usize;
+    std::iter::from_fn(move || {
+        let rest = bytes.get(start..)?;
+        let rel = rest.iter().position(|&b| b == b'\n')?;
+        let end = start + rel + 1;
+        let rec = &bytes[start..end];
+        let off = start as u64;
+        start = end;
+        Some((off, rec))
+    })
+}
+
+pub(crate) fn codex_record_payload(record: &[u8]) -> &[u8] {
+    let without_nl = record.strip_suffix(&[b'\n']).unwrap_or(record);
+    without_nl.strip_suffix(&[b'\r']).unwrap_or(without_nl)
+}
+
+/// Canonical id for a proven Codex Goal continuation.
+pub(crate) fn codex_goal_turn_id(turn_id: &str) -> String {
+    format!("codex-goal-turn-{turn_id}")
 }
 
 fn resolve_codex_home_dir_from(
@@ -1998,8 +2058,9 @@ impl CodexParser {
         path: &PathBuf,
         conversation_id: &str,
     ) -> Result<ConversationDetail, ParseError> {
-        let file = fs::File::open(path)?;
-        let reader = BufReader::new(file);
+        let bytes = fs::read(path)?;
+        let mut consumed_complete_bytes = 0u64;
+        let mut native_spans: Vec<CodexNativeTurnSpan> = Vec::new();
 
         let mut messages = Vec::new();
         let mut cwd: Option<String> = None;
@@ -2145,8 +2206,9 @@ impl CodexParser {
         let mut pending_reasoning: Vec<String> = Vec::new();
         let mut pending_reasoning_ts: Option<DateTime<Utc>> = None;
 
-        for line in reader.lines() {
-            let line = match line {
+        for (start, record) in codex_complete_records(&bytes) {
+            consumed_complete_bytes = start + record.len() as u64;
+            let line = match std::str::from_utf8(codex_record_payload(record)) {
                 Ok(l) => l,
                 Err(_) => continue,
             };
@@ -2154,7 +2216,7 @@ impl CodexParser {
                 continue;
             }
 
-            let value: serde_json::Value = match serde_json::from_str(&line) {
+            let value: serde_json::Value = match serde_json::from_str(line) {
                 Ok(v) => v,
                 Err(_) => continue,
             };
@@ -2260,6 +2322,20 @@ impl CodexParser {
                                 if let Some(ts) = parse_codex_timestamp(&value) {
                                     push_turn_start(&mut task_start_markers, ts);
                                 }
+                                close_open_native_turn(&mut native_spans, timestamp);
+                                native_spans.push(CodexNativeTurnSpan {
+                                    turn_id: payload_turn_id(payload),
+                                    started_at: timestamp,
+                                    ended_at: None,
+                                    goal_owned: false,
+                                });
+                            }
+                            "task_complete" => {
+                                close_matching_native_turn(
+                                    &mut native_spans,
+                                    payload_turn_id(payload),
+                                    timestamp,
+                                );
                             }
                             "user_message" => {
                                 active_agent_count = 0;
@@ -2268,6 +2344,18 @@ impl CodexParser {
                                     .and_then(|m| m.as_str())
                                     .unwrap_or("")
                                     .to_string();
+                                if is_codex_internal_context_message(&text) {
+                                    note_codex_internal_user_text(&text, &mut native_spans);
+                                    let has_images = payload
+                                        .get("images")
+                                        .and_then(|v| v.as_array())
+                                        .is_some_and(|images| {
+                                            images.iter().any(|image| image.as_str().is_some())
+                                        });
+                                    if !has_images {
+                                        continue;
+                                    }
+                                }
                                 let normalized = strip_blocked_resource_mentions(&text);
                                 let mut blocks: Vec<ContentBlock> = Vec::new();
                                 if !normalized.is_empty() {
@@ -2308,6 +2396,7 @@ impl CodexParser {
                                     continue;
                                 }
 
+                                close_open_native_turn(&mut native_spans, timestamp);
                                 messages.push(UnifiedMessage {
                                     id: format!("user-{}", messages.len()),
                                     role: MessageRole::User,
@@ -2700,7 +2789,9 @@ impl CodexParser {
                                 if !text.is_empty() {
                                     pending_reasoning.clear();
                                     messages.push(UnifiedMessage {
-                                        id: format!("thinking-{}", messages.len()),
+                                        id: payload_provider_id(payload).unwrap_or_else(|| {
+                                            format!("thinking-{}", messages.len())
+                                        }),
                                         role: MessageRole::Assistant,
                                         content: vec![ContentBlock::Thinking { text }],
                                         timestamp,
@@ -2950,7 +3041,9 @@ impl CodexParser {
                                             raw_args()
                                         };
                                         messages.push(UnifiedMessage {
-                                            id: format!("tool-{}", messages.len()),
+                                            id: tool_use_id.clone().unwrap_or_else(|| {
+                                                format!("tool-{}", messages.len())
+                                            }),
                                             role: MessageRole::Assistant,
                                             content: vec![ContentBlock::ToolUse {
                                                 tool_use_id,
@@ -3301,6 +3394,11 @@ impl CodexParser {
                                     payload.get("role").and_then(|r| r.as_str()).unwrap_or("");
                                 if role == "user" {
                                     active_agent_count = 0;
+                                    if let Some(text) = extract_codex_text_content(payload) {
+                                        if is_codex_internal_context_message(&text) {
+                                            note_codex_internal_user_text(&text, &mut native_spans);
+                                        }
+                                    }
                                     if let Some(blocks) =
                                         extract_response_item_user_image_blocks(payload)
                                     {
@@ -3319,8 +3417,11 @@ impl CodexParser {
                                             }
                                         }
 
+                                        close_open_native_turn(&mut native_spans, timestamp);
                                         messages.push(UnifiedMessage {
-                                            id: format!("user-{}", messages.len()),
+                                            id: payload_provider_id(payload).unwrap_or_else(|| {
+                                                format!("user-{}", messages.len())
+                                            }),
                                             role: MessageRole::User,
                                             content: blocks,
                                             timestamp,
@@ -3331,6 +3432,30 @@ impl CodexParser {
 
                                             reasoning_effort: None,
                                         });
+                                    }
+                                } else if role == "assistant" {
+                                    if let Some(text) = extract_codex_output_text(payload) {
+                                        let provider_id = payload_provider_id(payload);
+                                        if !adopt_duplicate_assistant_text(
+                                            &mut messages,
+                                            &text,
+                                            provider_id.as_deref(),
+                                        ) {
+                                            messages.push(UnifiedMessage {
+                                                id: provider_id.unwrap_or_else(|| {
+                                                    format!("assistant-{}", messages.len())
+                                                }),
+                                                role: MessageRole::Assistant,
+                                                content: vec![ContentBlock::Text { text }],
+                                                timestamp,
+                                                usage: None,
+                                                duration_ms: None,
+                                                model: None,
+                                                completed_at: Some(timestamp),
+
+                                                reasoning_effort: None,
+                                            });
+                                        }
                                     }
                                 }
                             }
@@ -3515,6 +3640,7 @@ impl CodexParser {
         fold_shell_session_polls(&mut messages, &poll_origins);
         apply_codex_turn_context_meta(&mut messages, &turn_context_snaps);
         let mut turns = group_into_turns(messages);
+        apply_codex_goal_turn_identity(&mut turns, &native_spans);
         reconcile_turn_usage(&mut turns, &recorded_round_usage);
         super::relocate_orphaned_tool_results(&mut turns);
         super::structurize_read_tool_output(&mut turns);
@@ -3556,7 +3682,7 @@ impl CodexParser {
             summary,
             turns,
             session_stats,
-            transcript_watermark: None,
+            transcript_watermark: Some(consumed_complete_bytes),
         })
     }
 }
@@ -3917,6 +4043,197 @@ fn is_environment_context_message(input: &str) -> bool {
 /// on the summary path, whose title fallback doesn't gate on image blocks).
 fn is_codex_internal_context_message(input: &str) -> bool {
     input.trim_start().starts_with("<codex_internal_context")
+}
+
+/// Goal-ownership classifier: the opening tag must carry `source="goal"` (or
+/// `source='goal'`). The body is never inspected — do not match the English
+/// “Continue working…” sentence.
+pub(crate) fn is_codex_goal_internal_context_message(input: &str) -> bool {
+    if !is_codex_internal_context_message(input) {
+        return false;
+    }
+    let trimmed = input.trim_start();
+    let Some(tag_end) = trimmed.find('>') else {
+        return false;
+    };
+    opening_tag_has_attr(&trimmed[..tag_end], "source", "goal")
+}
+
+fn opening_tag_has_attr(tag: &str, name: &str, value: &str) -> bool {
+    for quote in ['"', '\''] {
+        let needle = format!("{name}={quote}{value}{quote}");
+        let Some(idx) = tag.find(&needle) else {
+            continue;
+        };
+        let ok_before = match idx.checked_sub(1) {
+            None => true,
+            Some(prev) => tag.as_bytes()[prev].is_ascii_whitespace(),
+        };
+        if ok_before {
+            return true;
+        }
+    }
+    false
+}
+
+struct CodexNativeTurnSpan {
+    turn_id: Option<String>,
+    started_at: DateTime<Utc>,
+    ended_at: Option<DateTime<Utc>>,
+    goal_owned: bool,
+}
+
+fn payload_turn_id(payload: &serde_json::Value) -> Option<String> {
+    payload
+        .get("turn_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
+fn payload_provider_id(payload: &serde_json::Value) -> Option<String> {
+    payload
+        .get("id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
+fn note_codex_internal_user_text(text: &str, spans: &mut [CodexNativeTurnSpan]) {
+    if is_codex_goal_internal_context_message(text) {
+        if let Some(open) = spans.iter_mut().rev().find(|span| span.ended_at.is_none()) {
+            open.goal_owned = true;
+        }
+    }
+}
+
+fn close_open_native_turn(spans: &mut [CodexNativeTurnSpan], ended_at: DateTime<Utc>) {
+    if let Some(open) = spans.iter_mut().rev().find(|span| span.ended_at.is_none()) {
+        open.ended_at = Some(ended_at);
+    }
+}
+
+fn close_matching_native_turn(
+    spans: &mut [CodexNativeTurnSpan],
+    turn_id: Option<String>,
+    ended_at: DateTime<Utc>,
+) {
+    if let Some(turn_id) = turn_id.as_deref() {
+        if let Some(span) = spans
+            .iter_mut()
+            .rev()
+            .find(|span| span.ended_at.is_none() && span.turn_id.as_deref() == Some(turn_id))
+        {
+            span.ended_at = Some(ended_at);
+            return;
+        }
+    }
+    close_open_native_turn(spans, ended_at);
+}
+
+fn native_span_covers(span: &CodexNativeTurnSpan, ts: DateTime<Utc>) -> bool {
+    if ts < span.started_at {
+        return false;
+    }
+    match span.ended_at {
+        Some(end) => ts <= end,
+        None => true,
+    }
+}
+
+fn extract_codex_output_text(payload: &serde_json::Value) -> Option<String> {
+    let content = payload.get("content")?.as_array()?;
+    let mut parts = Vec::new();
+    for item in content {
+        if item.get("type").and_then(|t| t.as_str()) != Some("output_text") {
+            continue;
+        }
+        if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+            if !text.is_empty() {
+                parts.push(text);
+            }
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(""))
+    }
+}
+
+fn adopt_duplicate_assistant_text(
+    messages: &mut [UnifiedMessage],
+    text: &str,
+    provider_id: Option<&str>,
+) -> bool {
+    let Some(last) = messages.last_mut() else {
+        return false;
+    };
+    if !matches!(last.role, MessageRole::Assistant) {
+        return false;
+    }
+    match last.content.as_slice() {
+        [ContentBlock::Text { text: existing }] if existing == text => {
+            if let Some(id) = provider_id {
+                last.id = id.to_string();
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+fn apply_codex_goal_turn_identity(turns: &mut Vec<MessageTurn>, spans: &[CodexNativeTurnSpan]) {
+    for turn in turns.iter_mut() {
+        if !matches!(turn.role, TurnRole::Assistant) {
+            continue;
+        }
+        let Some(span) = spans
+            .iter()
+            .rev()
+            .find(|span| span.goal_owned && native_span_covers(span, turn.timestamp))
+        else {
+            continue;
+        };
+        if let Some(turn_id) = span.turn_id.as_deref() {
+            turn.id = codex_goal_turn_id(turn_id);
+        }
+        turn.autonomous_origin = Some(AutonomousTurnOrigin::AgentAutonomous);
+    }
+    merge_adjacent_goal_assistant_turns(turns);
+}
+
+fn merge_adjacent_goal_assistant_turns(turns: &mut Vec<MessageTurn>) {
+    let mut i = 0;
+    while i + 1 < turns.len() {
+        let same_goal = matches!(turns[i].role, TurnRole::Assistant)
+            && matches!(turns[i + 1].role, TurnRole::Assistant)
+            && turns[i].id == turns[i + 1].id
+            && turns[i].id.starts_with("codex-goal-turn-");
+        if !same_goal {
+            i += 1;
+            continue;
+        }
+        let next = turns.remove(i + 1);
+        turns[i].blocks.extend(next.blocks);
+        if turns[i].usage.is_none() {
+            turns[i].usage = next.usage;
+        }
+        if turns[i].duration_ms.is_none() {
+            turns[i].duration_ms = next.duration_ms;
+        }
+        if turns[i].model.is_none() {
+            turns[i].model = next.model;
+        }
+        if next.completed_at.is_some() {
+            turns[i].completed_at = next.completed_at;
+        }
+        if turns[i].reasoning_effort.is_none() {
+            turns[i].reasoning_effort = next.reasoning_effort;
+        }
+    }
 }
 
 fn extract_codex_title_candidate(input: &str, fallback_attached: bool) -> Option<String> {
@@ -4287,6 +4604,7 @@ mod tests {
     use super::CODEX_SCRIPT_TOOL_NAME;
     use super::CODEX_SUBAGENT_LAUNCH_KEY;
     use super::COLLAB_OP_KEY;
+    use crate::models::message::AutonomousTurnOrigin;
     use crate::models::{
         ContentBlock, MessageRole, MessageTurn, SessionStats, TurnRole, TurnUsage, UnifiedMessage,
     };
@@ -4608,6 +4926,332 @@ mod tests {
             .expect("parse detail ok");
         let _ = fs::remove_file(path);
         detail
+    }
+
+    fn write_rollout(content: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time ok")
+            .as_nanos();
+        let path: PathBuf = env::temp_dir().join(format!("codeg-codex-goal-{nanos}.jsonl"));
+        fs::write(&path, content).expect("write test jsonl");
+        path
+    }
+
+    fn parse_path(path: &PathBuf) -> crate::models::ConversationDetail {
+        let detail = CodexParser::new()
+            .parse_conversation_detail(path, "test")
+            .expect("parse detail ok");
+        let _ = fs::remove_file(path);
+        detail
+    }
+
+    const GOAL_CYCLE_JSONL: &str = concat!(
+        r#"{"timestamp":"2026-08-18T00:00:00Z","type":"session_meta","payload":{"id":"01abc","cwd":"/tmp"}}"#,
+        "\n",
+        r#"{"timestamp":"2026-08-18T00:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn_goal_1"}}"#,
+        "\n",
+        r#"{"timestamp":"2026-08-18T00:00:02Z","type":"response_item","payload":{"type":"message","role":"user","id":"msg_hidden","content":[{"type":"input_text","text":"<codex_internal_context source=\"goal\">\nContinue working toward the active thread goal.\n</codex_internal_context>"}]}}"#,
+        "\n",
+        r#"{"timestamp":"2026-08-18T00:00:03Z","type":"response_item","payload":{"type":"message","role":"assistant","id":"msg_live","content":[{"type":"output_text","text":"working"}]}}"#,
+        "\n",
+    );
+
+    #[test]
+    fn rollout_watermark_ignores_trailing_partial_line() {
+        let complete = concat!(
+            r#"{"timestamp":"2026-08-18T00:00:00Z","type":"session_meta","payload":{"id":"sess-1","cwd":"/tmp"}}"#,
+            "\n",
+        );
+        let path = write_rollout(&format!("{complete}{{\"type\":\""));
+        let detail = parse_path(&path);
+        assert_eq!(detail.transcript_watermark, Some(complete.len() as u64));
+    }
+
+    #[test]
+    fn goal_context_turn_uses_native_id_and_agent_autonomous_origin() {
+        let jsonl = GOAL_CYCLE_JSONL;
+        let detail = parse_path(&write_rollout(jsonl));
+        assert!(detail.turns.iter().all(|t| {
+            !matches!(t.role, TurnRole::User)
+                || !t.blocks.iter().any(|b| {
+                    matches!(b, ContentBlock::Text { text } if text.contains("codex_internal_context"))
+                })
+        }));
+        let auto = detail
+            .turns
+            .iter()
+            .find(|t| matches!(t.role, TurnRole::Assistant))
+            .unwrap();
+        assert_eq!(auto.id, "codex-goal-turn-turn_goal_1");
+        assert_eq!(
+            auto.autonomous_origin,
+            Some(AutonomousTurnOrigin::AgentAutonomous)
+        );
+        assert!(matches!(&auto.blocks[0], ContentBlock::Text { text } if text.contains("working")));
+    }
+
+    #[test]
+    fn non_goal_codex_turn_keeps_positional_id() {
+        let content = concat!(
+            r#"{"timestamp":"2026-08-18T00:00:00Z","type":"session_meta","payload":{"id":"plain-1","cwd":"/tmp"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-18T00:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn_plain"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-18T00:00:02Z","type":"event_msg","payload":{"type":"user_message","message":"hello"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-18T00:00:03Z","type":"event_msg","payload":{"type":"agent_message","message":"hi"}}"#,
+            "\n",
+        );
+        let detail = parse_path(&write_rollout(content));
+        let assistant = detail
+            .turns
+            .iter()
+            .find(|t| matches!(t.role, TurnRole::Assistant))
+            .unwrap();
+        assert!(assistant.id.starts_with("turn-"));
+        assert_eq!(assistant.autonomous_origin, None);
+    }
+
+    #[test]
+    fn goal_internal_context_never_becomes_title() {
+        let path = write_rollout(GOAL_CYCLE_JSONL);
+        let parser = CodexParser::new();
+        let summary = parser
+            .parse_jsonl_summary(&path)
+            .expect("parse summary ok")
+            .expect("summary exists");
+        if let Some(title) = summary.title.as_deref() {
+            assert!(
+                !title.contains("codex_internal_context") && !title.contains("Continue working"),
+                "summary title leaked internal context: {title}"
+            );
+        }
+        let detail = parser
+            .parse_conversation_detail(&path, "01abc")
+            .expect("parse detail ok");
+        if let Some(title) = detail.summary.title.as_deref() {
+            assert!(
+                !title.contains("codex_internal_context") && !title.contains("Continue working"),
+                "detail title leaked internal context: {title}"
+            );
+        }
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn incomplete_goal_turn_still_returns_partial_assistant() {
+        // GOAL_CYCLE_JSONL has task_started + assistant and no task_complete.
+        let detail = parse_path(&write_rollout(GOAL_CYCLE_JSONL));
+        let auto = detail
+            .turns
+            .iter()
+            .find(|t| matches!(t.role, TurnRole::Assistant))
+            .expect("partial assistant present before task_complete");
+        assert_eq!(auto.id, "codex-goal-turn-turn_goal_1");
+        assert!(matches!(&auto.blocks[0], ContentBlock::Text { text } if text.contains("working")));
+    }
+
+    #[test]
+    fn later_user_turn_is_not_swallowed_by_an_incomplete_goal_span() {
+        let jsonl = concat!(
+            r#"{"timestamp":"2026-08-18T00:00:00Z","type":"session_meta","payload":{"id":"01abc","cwd":"/tmp"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-18T00:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn_goal_1"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-18T00:00:02Z","type":"response_item","payload":{"type":"message","role":"user","id":"msg_hidden","content":[{"type":"input_text","text":"<codex_internal_context source=\"goal\">\nContinue working toward the active thread goal.\n</codex_internal_context>"}]}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-18T00:00:03Z","type":"response_item","payload":{"type":"message","role":"assistant","id":"msg_live","content":[{"type":"output_text","text":"working"}]}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-18T00:00:04Z","type":"event_msg","payload":{"type":"user_message","message":"follow up"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-18T00:00:05Z","type":"event_msg","payload":{"type":"agent_message","message":"later"}}"#,
+            "\n",
+        );
+        let detail = parse_path(&write_rollout(jsonl));
+        let assistants: Vec<&MessageTurn> = detail
+            .turns
+            .iter()
+            .filter(|t| matches!(t.role, TurnRole::Assistant))
+            .collect();
+        assert_eq!(assistants.len(), 2);
+        assert_eq!(assistants[0].id, "codex-goal-turn-turn_goal_1");
+        assert_eq!(
+            assistants[0].autonomous_origin,
+            Some(AutonomousTurnOrigin::AgentAutonomous)
+        );
+        assert!(assistants[1].id.starts_with("turn-"));
+        assert_eq!(assistants[1].autonomous_origin, None);
+        assert!(
+            matches!(&assistants[1].blocks[0], ContentBlock::Text { text } if text.contains("later"))
+        );
+    }
+
+    #[test]
+    fn goal_turn_identity_is_stable_across_repeated_parses() {
+        let path = write_rollout(GOAL_CYCLE_JSONL);
+        let parser = CodexParser::new();
+        let first = parser
+            .parse_conversation_detail(&path, "01abc")
+            .expect("first parse");
+        let second = parser
+            .parse_conversation_detail(&path, "01abc")
+            .expect("second parse");
+        let first_auto = first
+            .turns
+            .iter()
+            .find(|t| matches!(t.role, TurnRole::Assistant))
+            .unwrap();
+        let second_auto = second
+            .turns
+            .iter()
+            .find(|t| matches!(t.role, TurnRole::Assistant))
+            .unwrap();
+        assert_eq!(first_auto.id, second_auto.id);
+        assert_eq!(first_auto.autonomous_origin, second_auto.autonomous_origin);
+        assert_eq!(
+            serde_json::to_value(&first_auto.blocks).unwrap(),
+            serde_json::to_value(&second_auto.blocks).unwrap()
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn goal_turn_without_task_started_turn_id_keeps_positional_id() {
+        let jsonl = concat!(
+            r#"{"timestamp":"2026-08-18T00:00:00Z","type":"session_meta","payload":{"id":"01abc","cwd":"/tmp"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-18T00:00:01Z","type":"event_msg","payload":{"type":"task_started"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-18T00:00:02Z","type":"response_item","payload":{"type":"message","role":"user","id":"msg_hidden","content":[{"type":"input_text","text":"<codex_internal_context source=\"goal\">\nContinue working toward the active thread goal.\n</codex_internal_context>"}]}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-18T00:00:03Z","type":"response_item","payload":{"type":"message","role":"assistant","id":"msg_live","content":[{"type":"output_text","text":"working"}]}}"#,
+            "\n",
+        );
+        let detail = parse_path(&write_rollout(jsonl));
+        let auto = detail
+            .turns
+            .iter()
+            .find(|t| matches!(t.role, TurnRole::Assistant))
+            .unwrap();
+        assert!(
+            auto.id.starts_with("turn-"),
+            "missing turn_id must not invent Goal identity, got {}",
+            auto.id
+        );
+        assert_eq!(
+            auto.autonomous_origin,
+            Some(AutonomousTurnOrigin::AgentAutonomous)
+        );
+    }
+
+    #[test]
+    fn continue_working_sentence_alone_is_not_goal_ownership() {
+        let content = concat!(
+            r#"{"timestamp":"2026-08-18T00:00:00Z","type":"session_meta","payload":{"id":"plain-2","cwd":"/tmp"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-18T00:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn_plain"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-18T00:00:02Z","type":"event_msg","payload":{"type":"user_message","message":"Continue working toward the active thread goal."}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-18T00:00:03Z","type":"event_msg","payload":{"type":"agent_message","message":"ok"}}"#,
+            "\n",
+        );
+        let detail = parse_path(&write_rollout(content));
+        let assistant = detail
+            .turns
+            .iter()
+            .find(|t| matches!(t.role, TurnRole::Assistant))
+            .unwrap();
+        assert!(assistant.id.starts_with("turn-"));
+        assert_eq!(assistant.autonomous_origin, None);
+    }
+
+    #[test]
+    fn non_goal_internal_context_is_suppressed_but_not_autonomous() {
+        let jsonl = concat!(
+            r#"{"timestamp":"2026-08-18T00:00:00Z","type":"session_meta","payload":{"id":"01abc","cwd":"/tmp"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-18T00:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn_other"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-18T00:00:02Z","type":"response_item","payload":{"type":"message","role":"user","id":"msg_hidden","content":[{"type":"input_text","text":"<codex_internal_context source=\"compaction\">\nCompacted history.\n</codex_internal_context>"}]}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-18T00:00:03Z","type":"response_item","payload":{"type":"message","role":"assistant","id":"msg_live","content":[{"type":"output_text","text":"working"}]}}"#,
+            "\n",
+        );
+        let detail = parse_path(&write_rollout(jsonl));
+        assert!(detail.turns.iter().all(|t| {
+            !matches!(t.role, TurnRole::User)
+                || !t.blocks.iter().any(|b| {
+                    matches!(b, ContentBlock::Text { text } if text.contains("codex_internal_context"))
+                })
+        }));
+        let assistant = detail
+            .turns
+            .iter()
+            .find(|t| matches!(t.role, TurnRole::Assistant))
+            .unwrap();
+        assert!(assistant.id.starts_with("turn-"));
+        assert_eq!(assistant.autonomous_origin, None);
+    }
+
+    #[test]
+    fn acp_item_n_ids_are_never_canonical_message_turn_ids() {
+        let jsonl = concat!(
+            r#"{"timestamp":"2026-08-18T00:00:00Z","type":"session_meta","payload":{"id":"01abc","cwd":"/tmp"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-18T00:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn_goal_1"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-18T00:00:02Z","type":"response_item","payload":{"type":"message","role":"user","id":"item-1","content":[{"type":"input_text","text":"<codex_internal_context source=\"goal\">\nContinue working toward the active thread goal.\n</codex_internal_context>"}]}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-18T00:00:03Z","type":"response_item","payload":{"type":"message","role":"assistant","id":"item-2","content":[{"type":"output_text","text":"working"}]}}"#,
+            "\n",
+        );
+        let detail = parse_path(&write_rollout(jsonl));
+        let auto = detail
+            .turns
+            .iter()
+            .find(|t| matches!(t.role, TurnRole::Assistant))
+            .unwrap();
+        assert_eq!(auto.id, "codex-goal-turn-turn_goal_1");
+        assert!(!auto.id.starts_with("item-"));
+        assert!(detail.turns.iter().all(|t| !t.id.starts_with("item-")));
+    }
+
+    #[test]
+    fn goal_classification_requires_source_goal_attribute() {
+        assert!(super::is_codex_goal_internal_context_message(
+            "<codex_internal_context source=\"goal\">\nContinue working toward the active thread goal.\n</codex_internal_context>"
+        ));
+        assert!(super::is_codex_goal_internal_context_message(
+            "<codex_internal_context source='goal'>body</codex_internal_context>"
+        ));
+        assert!(!super::is_codex_goal_internal_context_message(
+            "Continue working toward the active thread goal."
+        ));
+        assert!(!super::is_codex_goal_internal_context_message(
+            "<codex_internal_context source=\"compaction\">Continue working toward the active thread goal.</codex_internal_context>"
+        ));
+        assert!(super::is_codex_internal_context_message(
+            "<codex_internal_context source=\"compaction\">x</codex_internal_context>"
+        ));
+    }
+
+    #[test]
+    fn rollout_session_id_reads_session_meta_payload_id() {
+        let path = write_rollout(GOAL_CYCLE_JSONL);
+        assert_eq!(super::rollout_session_id(&path).as_deref(), Some("01abc"));
+        let _ = fs::remove_file(&path);
+
+        let missing = env::temp_dir().join("codeg-codex-missing-session-meta.jsonl");
+        fs::write(&missing, "{\"type\":\"event_msg\",\"payload\":{}}\n").unwrap();
+        assert_eq!(super::rollout_session_id(&missing), None);
+        let _ = fs::remove_file(&missing);
+
+        assert_eq!(
+            super::rollout_session_id(&env::temp_dir().join("codeg-codex-no-such-file.jsonl")),
+            None
+        );
     }
 
     #[test]
