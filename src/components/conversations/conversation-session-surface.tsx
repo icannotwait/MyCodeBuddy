@@ -22,6 +22,7 @@ import {
   GoalControlProvider,
   type GoalControlValue,
 } from "@/components/message/goal-control-context"
+import { useAdvertisedGoalActions } from "@/hooks/use-goal-actions"
 import { useInitialHistoryScrollEligibility } from "@/components/message/initial-history-scroll-controller"
 import { ConversationShell } from "@/components/chat/conversation-shell"
 import { DelegateAccessStatus } from "@/components/chat/delegate-access-status"
@@ -2332,6 +2333,10 @@ export const ConversationSessionSurface = memo(
         </div>
       ) : null
 
+    const advertisedGoalActions = useAdvertisedGoalActions(
+      conn.connectionId,
+      connStatus
+    )
     const goalControlValue = useMemo<GoalControlValue>(() => {
       const live =
         conn.connectionId !== null &&
@@ -2344,9 +2349,11 @@ export const ConversationSessionSurface = memo(
               void acpActions.goalControl(tabId, action)
             }
           : null,
+        actions: advertisedGoalActions,
       }
     }, [
       acpActions,
+      advertisedGoalActions,
       conn.connectionId,
       conn.isViewer,
       connStatus,

@@ -487,7 +487,8 @@
     "templates": {
       "gemini": "---\nname: example-skill\ndescription: Describe when this skill should be used.\n---\n\n# Skill Name\n\nInstructions for the agent when this skill is active.\n\n## Workflow\n\n1. Add actionable step one.\n2. Add actionable step two.\n",
       "openCode": "---\nname: example-skill\ndescription: Describe when this skill should be used.\n---\n\n# Purpose\n\nDescribe what this skill helps with.\n\n# Steps\n\n1. Add actionable step one.\n2. Add actionable step two.\n",
-      "default": "---\nname: example-skill\ndescription: Describe when this skill should be used.\n---\n\n# Skill: example-skill\n\n## When to use\n\n- Describe trigger conditions.\n\n## Instructions\n\n1. Add actionable instruction one.\n2. Add actionable instruction two.\n"
+      "default": "---\nname: example-skill\ndescription: Describe when this skill should be used.\n---\n\n# Skill: example-skill\n\n## When to use\n\n- Describe trigger conditions.\n\n## Instructions\n\n1. Add actionable instruction one.\n2. Add actionable instruction two.\n",
+      "openClaw": "---\nname: example-skill\ndescription: Describe when this skill should be used.\nuser-invocable: true\ndisable-model-invocation: false\n---\n\n# Purpose\n\nDescribe what this skill helps with.\n\n# Instructions\n\n1. Add actionable instruction one.\n2. Add actionable instruction two.\n"
     }
   },
   "McpSettings": {
@@ -662,7 +663,8 @@
         "native": "Native"
       },
       "softWatchdog": "مراقب مرن (ثوان)",
-      "softWatchdogHint": "عتبة توقف للمراقبة فقط ({min}–{max}). 0 يعطل تعليم التوقف. لا تلغي ولا تغير المسار."
+      "softWatchdogHint": "عتبة توقف للمراقبة فقط ({min}–{max}). 0 يعطل تعليم التوقف. لا تلغي ولا تغير المسار.",
+      "withheldByHostTools": "لن تحصل {agents} على أدوات التفويض: مفتاح «دع الوكيل يتولى الملفات والأوامر» الخاص بها مُفعّل."
     },
     "actions": {
       "dragSort": "اسحب لإعادة الترتيب",
@@ -700,7 +702,9 @@
       "saveKimiCodeConfig": "حفظ إعدادات Kimi Code",
       "customInstall": "تثبيت مخصص",
       "saveKimiCodeRawConfig": "Save config.toml",
-      "diagnose": "تشخيص"
+      "diagnose": "تشخيص",
+      "saveOpenClawConfig": "حفظ إعداد OpenClaw",
+      "saveDeepSeekConfig": "حفظ إعدادات DeepSeek"
     },
     "status": {
       "enabled": "مفعّل",
@@ -1193,7 +1197,11 @@
       "piBinaryUninstallFailed": "فشل إلغاء تثبيت pi",
       "savePiTrustFailed": "فشل حفظ الثقة بمساحة العمل",
       "cursorSaved": "تم حفظ إعدادات Cursor",
-      "saveCursorConfigFailed": "فشل حفظ إعدادات Cursor"
+      "saveCursorConfigFailed": "فشل حفظ إعدادات Cursor",
+      "openClawSaved": "تم حفظ إعداد OpenClaw",
+      "saveOpenClawFailed": "فشل حفظ إعداد OpenClaw",
+      "deepseekSaved": "تم حفظ إعدادات DeepSeek",
+      "saveDeepSeekFailed": "تعذّر حفظ إعدادات DeepSeek"
     },
     "version": {
       "statusLabel": "حالة الإصدار",
@@ -1405,7 +1413,24 @@
       "ready": "المحوّل {adapterCmd} مثبّت — وهو ما يشغّله Codeg. يأتي ببيئة تشغيل خاصة به، لذا لا حاجة إلى {nativeLabel}؛ وإن ثبّتها لاحقاً فالاثنان يتعايشان ويتشاركان {configDir}."
     },
     "customAgentMcpLabel": "دعم MCP",
-    "customAgentMcpHint": "يرسل رفيق MCP المدمج في codeg إلى هذا الوكيل عند بدء الجلسة — وهو القناة التي تعتمد عليها الإحالة والتغذية الراجعة الحية وأدوات المهام. أوقفه مع الوكلاء الذين يرفضون خوادم MCP ويفشلون في الاتصال؛ ويسري التغيير من الاتصال التالي."
+    "customAgentMcpHint": "يرسل رفيق MCP المدمج في codeg إلى هذا الوكيل عند بدء الجلسة — وهو القناة التي تعتمد عليها الإحالة والتغذية الراجعة الحية وأدوات المهام. أوقفه مع الوكلاء الذين يرفضون خوادم MCP ويفشلون في الاتصال؛ ويسري التغيير من الاتصال التالي.",
+    "deepseek": {
+      "configManagement": "إعدادات DeepSeek Harness",
+      "configDescription": "نقطة النهاية والمفتاح متغيّرا بيئة يقرأهما deepseek-acp عند الإقلاع. أما النموذج ومستوى الاستدلال فمحدِّدان على مستوى الجلسة، ويُختاران من حقل الإدخال.",
+      "baseUrlLabel": "نقطة نهاية API",
+      "baseUrlHint": "اتركه فارغًا لاستخدام نقطة النهاية الرسمية. يسري على الجلسات التي تبدأ بعد الحفظ؛ أعد الاتصال بالجلسة الجارية كي تأخذ القيمة الجديدة.",
+      "baseUrlInvalid": "أدخل عنوان http(s) كاملًا وبدون سلسلة استعلام، مثل https://api.deepseek.com",
+      "apiKeyLabel": "مفتاح API",
+      "apiKeyHint": "يُمرَّر إلى الوكيل باسم DEEPSEEK_API_KEY. متغيّر البيئة له أسبقية على ملف بيانات الاعتماد، لذا اترك الحقل فارغًا إن كنت تسجّل الدخول من الطرفية."
+    },
+    "openClaw": {
+      "gatewayConfig": "إعداد Gateway",
+      "gatewayDescription": "قم بإعداد اتصال OpenClaw Gateway. يدعم gateway محليًا أو بعيدًا.",
+      "gatewayUrlHint": "اتركه فارغًا لاستخدام gateway.remote.url من إعداد openclaw المحلي.",
+      "gatewayTokenPlaceholder": "رمز مصادقة Gateway",
+      "gatewayTokenHint": "يُفضّل استخدام token-file بدل الرمز النصي متى أمكن؛ قم بالإعداد عبر openclaw CLI.",
+      "sessionKeyHint": "اختياري. حدّد مفتاح جلسة gateway؛ واتركه فارغًا للتعيين التلقائي لجلسة معزولة."
+    }
   },
   "SettingsPages": {
     "agentsLoading": "جارٍ تحميل إعدادات الوكلاء...",
@@ -2877,7 +2902,8 @@
       "agentSelector": {
         "noEnabledAgents": "لا يوجد وكلاء مفعّلون",
         "openAgentsSettings": "فتح إعدادات الوكلاء",
-        "notInstalled": "غير مثبّت"
+        "notInstalled": "غير مثبّت",
+        "moreAgents": "وكلاء إضافيون ({count})"
       },
       "subAgentOverlay": {
         "title": "الوكلاء الفرعيون",
@@ -3294,7 +3320,8 @@
             "blocked": "محظور",
             "usageLimited": "الاستخدام محدود",
             "budgetLimited": "الميزانية محدودة",
-            "complete": "مكتمل"
+            "complete": "مكتمل",
+            "limited": "تم بلوغ الحد"
           }
         },
         "field": {
@@ -3414,7 +3441,8 @@
           "outputMissing": "اقتطع codex مُخرَج النص البرمجي وأزال الفاصل الخاص بهذا الأمر، لذا تعذّر نسب أي مُخرَج إليه.",
           "sharedWith": "يحتوي هذا المقطع أيضًا على مُخرَج {commands} — إذ اقتطع codex الفواصل الخاصة بها.",
           "truncated": "مقتطع"
-        }
+        },
+        "agentCodexLaunchOnly": "تم التشغيل. لا يبلّغ Codex عن أي تقدّم إضافي لهذا الوكيل الفرعي — وستصل نتيجته كرسالة في هذه المحادثة."
       },
       "messageNav": {
         "title": "تنقل الرسائل",
@@ -3586,7 +3614,8 @@
       "contextCompaction": {
         "compacting": "جارٍ ضغط السياق…",
         "compacted": "تم ضغط السياق",
-        "compactedTokens": "تم ضغط السياق · {before} → {after} رمز"
+        "compactedTokens": "تم ضغط السياق · {before} → {after} رمز",
+        "failed": "فشل ضغط السياق"
       },
       "backgroundTasks": {
         "running": "{count, plural, one {مهمة خلفية واحدة قيد التشغيل} two {مهمتا خلفية قيد التشغيل} few {# مهام خلفية قيد التشغيل} other {# مهمة خلفية قيد التشغيل}}",
@@ -3678,6 +3707,26 @@
         "revokedToast": "أُلغيت الثقة — أُعيد الاتصال ليتوقف pi عن تحميل موارد المشروع",
         "trustedNoReconnect": "تم الوثوق بالمشروع — سيسري عند بدء pi في المرة القادمة",
         "revokedNoReconnect": "أُلغيت الثقة — ستسري عند بدء pi في المرة القادمة"
+      },
+      "sessionFailure": {
+        "category": {
+          "connection": "مشكلة في الاتصال",
+          "access": "مشكلة في الوصول",
+          "limit": "تم بلوغ الحد",
+          "request": "تم رفض الطلب",
+          "service": "مشكلة في الخدمة",
+          "unknown": "مشكلة في الجلسة"
+        },
+        "action": {
+          "retry": "إعادة المحاولة",
+          "login": "تسجيل الدخول",
+          "newSession": "جلسة جديدة"
+        },
+        "recovered": "تم التعافي",
+        "retryUnavailable": "لا توجد رسالة سابقة لإعادة إرسالها.",
+        "toggleDetails": "تبديل التفاصيل",
+        "dismiss": "تجاهل",
+        "moreIncidents": "+{count} أخرى"
       }
     },
     "diffPreview": {
@@ -5254,7 +5303,13 @@
     "eventCleanupFailed": "فشل تنظيف worktree",
     "eventResumeFallback": "فشل استئناف الجلسة؛ استُخدمت جلسة جديدة",
     "eventUserAction": "إجراء المستخدم",
-    "eventDiffStat": "لقطة التغييرات"
+    "eventDiffStat": "لقطة التغييرات",
+    "settingsWorktreeRoot": "موقع الـ worktree",
+    "settingsWorktreeRootHint": "المجلد الذي تُنشأ فيه worktrees المهام الجديدة، واحدة لكل مهمة. اتركه فارغًا لإنشائها بجوار مجلد المشروع؛ «~» هو مجلد المنزل، والمسار النسبي يُحسب انطلاقًا من مجلد المشروع.",
+    "settingsWorktreeRootPlaceholder": "~/codeg-worktrees",
+    "settingsWorktreeRootBrowse": "اختيار مجلد الـ worktree",
+    "settingsTabMerge": "الدمج",
+    "settingsTabWorktree": "Worktree"
   },
   "TokenUsage": {
     "title": "استهلاك الرموز",

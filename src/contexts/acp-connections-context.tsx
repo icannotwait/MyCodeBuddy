@@ -92,7 +92,10 @@ import {
   extractAppCommandError,
   toLocalizedErrorMessage,
 } from "@/lib/app-error"
-import { isConnectionBusy } from "@/lib/connection-teardown"
+import {
+  isConnectionBusy,
+  isConnectionGoneError,
+} from "@/lib/connection-teardown"
 import {
   completeLiveTranscriptTurn,
   enterOwnerPreserve,
@@ -124,6 +127,7 @@ import type {
   PendingPlanApprovalState,
   PlanApprovalAnswer,
   SessionConfigOptionInfo,
+  SessionFailureRecord,
   SessionModeStateInfo,
   SessionUsageUpdateInfo,
   PromptCapabilitiesInfo,
@@ -142,6 +146,14 @@ import type {
   AcpConnectOrAttachResponse,
   SharedSessionPhase,
 } from "@/lib/types"
+import {
+  dismissSessionFailures,
+  hasSettleableRetryIncident,
+  mergeSessionFailures,
+  settleSessionFailures,
+  upsertSessionFailure,
+  type SessionFailureSettleScope,
+} from "@/lib/session-failures"
 import type {
   SharedActiveTurn,
   SharedQueuedPrompt,
@@ -275,6 +287,10 @@ export interface ConnectionState {
    *  `pending_plan_approval`; cleared on `plan_approval_resolved` or turn end. */
   pendingPlanApproval: PendingPlanApprovalState | null
   claudeApiRetry: ClaudeApiRetryState | null
+  /** AIR typed session failure table (see `lib/session-failures.ts` for the
+   *  merge/settle contract). Retained resolved — entries double as per-id
+   *  revision watermarks; the banner splits active from resolved itself. */
+  sessionFailures: SessionFailureRecord[]
   error: string | null
   /**
    * Set when the agent rejected `session/load` non-recoverably because a
@@ -728,6 +744,32 @@ type Action =
       type: "STATUS_CHANGED"
       contextKey: string
       status: ConnectionStatus
+    }
+  | {
+      // One AIR typed session-failure upsert (`session_failure` event).
+      // Merged monotonically by id+revision; see `lib/session-failures.ts`.
+      type: "SESSION_FAILURE"
+      contextKey: string
+      record: SessionFailureRecord
+    }
+  | {
+      // Lifecycle settle for the AIR failure table (mirrors
+      // `SessionState::apply_event`). `retry_incidents` rides turn PROGRESS —
+      // fresh output proves the adapter reconnected. `warnings` is dispatched
+      // from the `turn_complete` handler on a CLEAN (`end_turn`) end only: a
+      // cancelled/failed exit ended a turn that did NOT recover, so its
+      // warnings must stay active.
+      type: "SETTLE_SESSION_FAILURES"
+      contextKey: string
+      scope: SessionFailureSettleScope
+    }
+  | {
+      // The user closed a strip. Client-local, like `DISMISS_CONFIG_STALE`.
+      // Takes every id that strip stood for: the collapsed warning bar closes
+      // its hidden siblings with it.
+      type: "DISMISS_SESSION_FAILURES"
+      contextKey: string
+      ids: string[]
     }
   | {
       // Mirror of a `background_activity` event onto the connection: the
@@ -1638,9 +1680,13 @@ function applyStreamingAction(
   }
 
   if (!newContent) return null
+  const sessionFailures = hasSettleableRetryIncident(conn.sessionFailures)
+    ? settleSessionFailures(conn.sessionFailures, "retry_incidents")
+    : conn.sessionFailures
   return {
     ...conn,
     liveMessage: { ...prev, content: newContent },
+    sessionFailures,
     // Streaming content implies the SDK has recovered from any in-flight
     // Claude API retry, so hide the retry banner immediately instead of
     // waiting for the prompt cycle to end.
@@ -1761,6 +1807,7 @@ function reduceSingleAction(
         pendingAskQuestion: null,
         pendingPlanApproval: null,
         claudeApiRetry: null,
+        sessionFailures: [],
         error: null,
         loadError: null,
         loadErrorCode: null,
@@ -1957,6 +2004,7 @@ function reduceSingleAction(
         pendingAskQuestion: null,
         pendingPlanApproval: null,
         claudeApiRetry: null,
+        sessionFailures: [],
         error: null,
         loadError: null,
         loadErrorCode: null,
@@ -2093,6 +2141,15 @@ function reduceSingleAction(
       // folding a stale snapshot's `lastError` back in here would resurrect an
       // error the current turn already cleared; it is recovered on the fresh
       // path below instead.
+      // AIR failure records merge on BOTH branches: the per-id monotonic rule
+      // is idempotent and can only add or upgrade entries, never clobber a
+      // fresher live one — so even a stale-by-eventSeq snapshot may safely
+      // contribute records this client attached too late to see live.
+      const mergedSessionFailures = mergeSessionFailures(
+        current.sessionFailures,
+        action.patch.sessionFailures
+      )
+
       if (action.patch.eventSeq <= current.lastAppliedSeq) {
         if (
           mergedSelectorsReady === current.selectorsReady &&
@@ -2102,6 +2159,7 @@ function reduceSingleAction(
           mergedAvailableCommands === current.availableCommands &&
           mergedPromptCapabilities === current.promptCapabilities &&
           mergedConversationId === current.conversationId &&
+          mergedSessionFailures === current.sessionFailures &&
           mergedSharedSession === current.sharedSession
         ) {
           return state
@@ -2116,6 +2174,7 @@ function reduceSingleAction(
           selectorsReady: mergedSelectorsReady,
           supportsFork: mergedSupportsFork,
           conversationId: mergedConversationId,
+          sessionFailures: mergedSessionFailures,
           sharedSession: mergedSharedSession,
         })
         return next
@@ -2196,6 +2255,7 @@ function reduceSingleAction(
         })(),
         // Fill-null conversation binding (draft tab → linked row).
         conversationId: mergedConversationId,
+        sessionFailures: mergedSessionFailures,
         // Recover the latest runtime error only from a fresh snapshot. The
         // stale path above deliberately preserves the current cleared value.
         error: action.patch.lastError,
@@ -2325,12 +2385,25 @@ function reduceSingleAction(
         updated.pendingQuestion = null
         updated.claudeApiRetry = null
         updated.error = null
+        // Starting a prompt past an active AIR failure acknowledges it —
+        // settle EVERYTHING (watermarks retained). A failure that is still
+        // real re-arms via a higher revision on the same id.
+        updated.sessionFailures = settleSessionFailures(
+          conn.sessionFailures,
+          "all"
+        )
         // The out-of-turn window ended: its tool-call contexts (kept only for
         // background permission enrichment) are stale for the new turn.
         updated.outOfTurnToolCalls = null
       } else if (conn.status === "prompting") {
         // Prompt cycle ended: clear in-flight Claude API retry banner.
         updated.claudeApiRetry = null
+        // AIR failures deliberately NOT settled here: leaving `prompting`
+        // covers error/cancel exits too, where the incident did not recover —
+        // settling on any exit painted a still-dead connection as a recovered
+        // warning. The `turn_complete` handler settles warnings on a clean
+        // `end_turn` instead (SETTLE_SESSION_FAILURES), after the response's
+        // terminal error escalation (if any) has already landed.
         // A blocked ask_user_question can't outlive its turn. The normal path
         // clears it via `question_resolved`; this is the safety net for a turn
         // that ended without one (agent error / abandoned block).
@@ -3151,6 +3224,39 @@ function reduceSingleAction(
       return next
     }
 
+    case "SESSION_FAILURE": {
+      const conn = state.get(action.contextKey)
+      if (!conn) return state
+      const merged = upsertSessionFailure(conn.sessionFailures, action.record)
+      // Stale/replayed upserts are rejected by reference — no re-render.
+      if (merged === conn.sessionFailures) return state
+      const next = writableConnections(state, mutateUnpublished)
+      next.set(action.contextKey, { ...conn, sessionFailures: merged })
+      return next
+    }
+
+    case "SETTLE_SESSION_FAILURES": {
+      const conn = state.get(action.contextKey)
+      if (!conn) return state
+      const settled = settleSessionFailures(conn.sessionFailures, action.scope)
+      // Nothing needed settling — same reference, no re-render.
+      if (settled === conn.sessionFailures) return state
+      const next = writableConnections(state, mutateUnpublished)
+      next.set(action.contextKey, { ...conn, sessionFailures: settled })
+      return next
+    }
+
+    case "DISMISS_SESSION_FAILURES": {
+      const conn = state.get(action.contextKey)
+      if (!conn) return state
+      const dismissed = dismissSessionFailures(conn.sessionFailures, action.ids)
+      // Unknown ids / already resolved — same reference, no re-render.
+      if (dismissed === conn.sessionFailures) return state
+      const next = writableConnections(state, mutateUnpublished)
+      next.set(action.contextKey, { ...conn, sessionFailures: dismissed })
+      return next
+    }
+
     case "ERROR": {
       const conn = state.get(action.contextKey)
       if (!conn) return state
@@ -3508,6 +3614,13 @@ function prepareMappedEnvelope(
         text: e.text,
         parentToolUseId: e.parent_tool_use_id ?? undefined,
       })
+      if (hasSettleableRetryIncident(snapshot.sessionFailures)) {
+        actions.push({
+          type: "SETTLE_SESSION_FAILURES",
+          contextKey,
+          scope: "retry_incidents",
+        })
+      }
       break
     case "thinking":
       actions.push({
@@ -3516,6 +3629,13 @@ function prepareMappedEnvelope(
         text: e.text,
         parentToolUseId: e.parent_tool_use_id ?? undefined,
       })
+      if (hasSettleableRetryIncident(snapshot.sessionFailures)) {
+        actions.push({
+          type: "SETTLE_SESSION_FAILURES",
+          contextKey,
+          scope: "retry_incidents",
+        })
+      }
       break
     case "turn_attempt_rollback":
       actions.push({ type: "TURN_ATTEMPT_ROLLBACK", contextKey })
@@ -3542,6 +3662,15 @@ function prepareMappedEnvelope(
         meta: (e.meta as ToolCallMeta) ?? null,
         images: e.images ?? null,
       })
+      // A new tool call is model output — the same recovery evidence as a
+      // content delta. Status-only `tool_call_update` is not.
+      if (hasSettleableRetryIncident(snapshot.sessionFailures)) {
+        actions.push({
+          type: "SETTLE_SESSION_FAILURES",
+          contextKey,
+          scope: "retry_incidents",
+        })
+      }
       break
     case "tool_call_update":
       actions.push({
@@ -3858,6 +3987,15 @@ function prepareMappedEnvelope(
         entries: e.entries,
       })
       break
+    case "session_failure":
+      // JetBrains AIR typed session failure upsert — merged monotonically
+      // by id+revision (stale/replayed records are dropped in the reducer).
+      actions.push({
+        type: "SESSION_FAILURE",
+        contextKey,
+        record: e.record,
+      })
+      break
     case "turn_retrying":
       actions.push({
         type: "CLAUDE_API_RETRY",
@@ -3873,6 +4011,18 @@ function prepareMappedEnvelope(
       })
       break
     case "turn_complete": {
+      // AIR retry warnings settle only at a CLEAN turn end, mirroring the
+      // backend's `apply_event`. A failed turn's terminal failure rides the
+      // prompt response and was emitted as a `session_failure` event just
+      // before this one, so settling here can no longer paint an unrecovered
+      // incident as recovered.
+      if (e.stop_reason === "end_turn") {
+        actions.push({
+          type: "SETTLE_SESSION_FAILURES",
+          contextKey,
+          scope: "warnings",
+        })
+      }
       actions.push({ type: "PERMISSION_CLEARED", contextKey })
       actions.push({
         type: "STATUS_CHANGED",
@@ -4560,6 +4710,15 @@ export interface AcpActionsValue {
    * subsequent settings change re-shows it. Wired to the banner's X button.
    */
   dismissConfigStale(contextKey: string): void
+  /**
+   * Close AIR failure strips (client-local, like `dismissConfigStale`) — one
+   * call per strip, carrying every record that strip stood for. The records
+   * stay in the table as their revision watermarks, so this silences only what
+   * was on screen: a failure that is still real re-arms via a higher revision.
+   * Unlike the recovery actions this is NOT gated on owning the session — a
+   * viewer dismissing a strip only edits its own projection.
+   */
+  dismissSessionFailures(contextKey: string, ids: string[]): void
 }
 
 function disconnectLeaseWithOrigin(
@@ -7031,6 +7190,14 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     ]
   )
 
+  const isConnectionOwnedLocally = useCallback((connectionId: string) => {
+    if (reverseMapRef.current.has(connectionId)) return true
+    for (const conn of storeRef.current.connections.values()) {
+      if (conn.connectionId === connectionId) return true
+    }
+    return false
+  }, [])
+
   const connect = useCallback(
     async (
       contextKey: string,
@@ -7779,7 +7946,11 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           (isTransferringOut(conversationId) ||
             isFrontendDisconnectSuppressed(conversationId))
         if (abandonedKeysRef.current.delete(contextKey)) {
-          if (!suppressBareSpawn) {
+          // The backend dedups by (agent, cwd, session), so `acpConnect` may
+          // have handed back a connection this client already holds under
+          // another contextKey. Killing that one would end a turn nobody
+          // asked to stop.
+          if (!suppressBareSpawn && !isConnectionOwnedLocally(connectionId)) {
             acpDisconnect(
               connectionId,
               disconnectLeaseWithOrigin(coldLease, "abandoned_connect")
@@ -7789,7 +7960,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         }
         const pendingRequest = pendingConnectRequestsRef.current.get(contextKey)
         if (pendingRequest && !sameConnectRequest(pendingRequest, request)) {
-          if (!suppressBareSpawn) {
+          if (!suppressBareSpawn && !isConnectionOwnedLocally(connectionId)) {
             acpDisconnect(
               connectionId,
               disconnectLeaseWithOrigin(coldLease, "abandoned_connect")
@@ -7966,6 +8137,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       connectAsViewer,
       consumeBufferedEvents,
       dispatch,
+      isConnectionOwnedLocally,
       releaseObserverAlias,
       resolveConnectBlockState,
       seedDelegationsFromSnapshot,
@@ -8094,10 +8266,25 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         dispatch({ type: "CONNECTION_REMOVED", contextKey })
         return true
       }
-      await acpDisconnect(
-        conn.connectionId,
-        disconnectLeaseWithOrigin(leaseArgsForDisconnect(conn), origin)
-      )
+      // A failed backend teardown must not strand the local entry: propagating
+      // would leak the attach subscription and leave an entry that makes the
+      // next `connect()` take its "already connected" fast path. Release
+      // locally either way, and report whether the backend is actually gone.
+      let tornDown = true
+      try {
+        await acpDisconnect(
+          conn.connectionId,
+          disconnectLeaseWithOrigin(leaseArgsForDisconnect(conn), origin)
+        )
+      } catch (error: unknown) {
+        if (!isConnectionGoneError(error)) {
+          console.warn(
+            "[Acp] backend teardown failed, releasing locally:",
+            error
+          )
+          tornDown = false
+        }
+      }
       reverseMapRef.current.delete(conn.connectionId)
       teardownAttachSubscription(contextKey)
       lastActivityRef.current.delete(contextKey)
@@ -8111,7 +8298,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         clearAliasesPointingTo(conn.connectionId)
       }
       dispatch({ type: "CONNECTION_REMOVED", contextKey })
-      return true
+      return tornDown
     },
     [
       clearAliasesPointingTo,
@@ -8154,7 +8341,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         workingDir ?? undefined,
         sessionId ?? undefined,
         boundConversationId ?? undefined,
-        boundRouteOverride,
+        boundRouteOverride ?? undefined,
         boundOwnerOperationId
       )
       // Reconnect regardless — the user is left with a working connection
@@ -8290,7 +8477,14 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       // An unconfirmed teardown is deliberately NOT fatal here: the local entry
       // is released either way, and refusing to reconnect would strand the user
       // on the dead connection this button exists to replace.
-      if (storeRef.current.connections.has(contextKey)) {
+      // Viewers live under the backend connectionId with the tab as an
+      // alias, so `connections.has(tabKey)` is false. Still detach first:
+      // otherwise `connect()` treats the leftover alias as a broker handoff
+      // and waits out the discovery delay ladder for the owner to die.
+      if (
+        storeRef.current.connections.has(contextKey) ||
+        observerAliasesRef.current.has(contextKey)
+      ) {
         await disconnect(contextKey, "connection_superseded")
       }
       await connect(
@@ -8308,6 +8502,13 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
   const dismissConfigStale = useCallback(
     (contextKey: string) => {
       dispatch({ type: "DISMISS_CONFIG_STALE", contextKey })
+    },
+    [dispatch]
+  )
+
+  const dismissSessionFailuresAction = useCallback(
+    (contextKey: string, ids: string[]) => {
+      dispatch({ type: "DISMISS_SESSION_FAILURES", contextKey, ids })
     },
     [dispatch]
   )
@@ -8907,6 +9108,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       reconnect,
       getReconnectInfo,
       dismissConfigStale,
+      dismissSessionFailures: dismissSessionFailuresAction,
     }),
     [
       connect,
@@ -8934,6 +9136,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       reconnect,
       getReconnectInfo,
       dismissConfigStale,
+      dismissSessionFailuresAction,
     ]
   )
 

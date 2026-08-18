@@ -36,12 +36,11 @@ impl FileSystemRuntimeError {
     }
 }
 
-/// Whether an ACP session mode / approval preset should lift the client-side
-/// workspace path sandbox for `fs/read_text_file` and `fs/write_text_file`.
-///
-/// Kept in sync with agent vocabularies:
-/// - Codex: `agent-full-access` (and legacy `full-access` / `danger-full-access`)
-/// - Claude Code: `bypassPermissions`
+/// Per-agent `env_json` / process-env key selecting the path-containment policy
+/// for the ACP `fs/*` channel. `default` | `strict` | `unrestricted`; anything
+/// else warns and falls back to `default`.
+/// Codex `agent-full-access` / Claude `bypassPermissions` (and the two
+/// legacy full-access aliases) skip the workspace-root containment check.
 pub fn mode_allows_outside_workspace(mode_id: &str) -> bool {
     matches!(
         mode_id,
@@ -49,9 +48,6 @@ pub fn mode_allows_outside_workspace(mode_id: &str) -> bool {
     )
 }
 
-/// Per-agent `env_json` / process-env key selecting the path-containment policy
-/// for the ACP `fs/*` channel. `default` | `strict` | `unrestricted`; anything
-/// else warns and falls back to `default`.
 pub(crate) const FS_POLICY_ENV: &str = "CODEG_ACP_FS_POLICY";
 /// Additional **writable** roots, joined with the platform `PATH` separator
 /// (`:` on unix, `;` on Windows — parsed with `std::env::split_paths`, so a
@@ -549,6 +545,22 @@ fn agent_root_slots(agent_type: AgentType) -> &'static [RootSlot] {
             trims: true,
             default_rel: &[".cline", "data"],
         }],
+        // DeepSeek Harness mirrors pi's two-root shape: the harness home
+        // (`DSH_HOME`, default `~/.dsh`) and the session-log root, which
+        // relocates independently via `DEEPSEEK_ACP_SESSIONS_ROOT` (else
+        // `$DSH_HOME/sessions`) — see `resolve_deepseek_sessions_root_from`.
+        AgentType::DeepSeek => &[
+            RootSlot {
+                candidates: &[("DSH_HOME", "")],
+                trims: false,
+                default_rel: &[".dsh"],
+            },
+            RootSlot {
+                candidates: &[("DEEPSEEK_ACP_SESSIONS_ROOT", ""), ("DSH_HOME", "sessions")],
+                trims: false,
+                default_rel: &[".dsh", "sessions"],
+            },
+        ],
         // pi's agent home and its session store relocate INDEPENDENTLY, so both
         // are genuine roots rather than alternatives. The sessions slot mirrors
         // `resolve_pi_sessions_dir_from`: the session override wins, else
@@ -657,8 +669,12 @@ impl FileSystemRuntime {
         let path_for_log = path.clone();
 
         let response = run_blocking_with_timeout("fs/read_text_file", move || {
-            read_text_file_impl(&path, line, limit, &policy.read_roots, allow_outside)
-                .map(ReadTextFileResponse::new)
+            let roots = if allow_outside {
+                Vec::new()
+            } else {
+                policy.read_roots.clone()
+            };
+            read_text_file_impl(&path, line, limit, &roots).map(ReadTextFileResponse::new)
         })
         .await;
 
@@ -700,7 +716,12 @@ impl FileSystemRuntime {
         let path_for_log = path.clone();
 
         let response = run_blocking_with_timeout("fs/write_text_file", move || {
-            ensure_path_allowed(&path, &policy.write_roots, true, allow_outside)?;
+            let roots = if allow_outside {
+                Vec::new()
+            } else {
+                policy.write_roots.clone()
+            };
+            ensure_path_allowed(&path, &roots, true)?;
             atomic_write_text(&path, content.as_bytes())?;
             Ok(WriteTextFileResponse::new())
         })
@@ -741,9 +762,8 @@ fn read_text_file_impl(
     line: Option<u32>,
     limit: Option<u32>,
     read_roots: &[PathBuf],
-    allow_outside_workspace: bool,
 ) -> Result<String, FileSystemRuntimeError> {
-    ensure_path_allowed(path, read_roots, false, allow_outside_workspace)?;
+    ensure_path_allowed(path, read_roots, false)?;
 
     let metadata = std::fs::metadata(path).map_err(|err| map_io_error("read", path, err))?;
     if metadata.len() > FS_MAX_FILE_SIZE_BYTES {
@@ -924,9 +944,8 @@ fn ensure_path_allowed(
     path: &Path,
     roots: &[PathBuf],
     for_write: bool,
-    allow_outside_workspace: bool,
 ) -> Result<(), FileSystemRuntimeError> {
-    if allow_outside_workspace || roots.is_empty() {
+    if roots.is_empty() {
         return Ok(());
     }
 
@@ -1885,7 +1904,7 @@ mod tests {
     fn root_slots_match_parser_resolvers() {
         use crate::parsers;
 
-        let expected: [(AgentType, PathBuf); 11] = [
+        let expected: [(AgentType, PathBuf); 12] = [
             (AgentType::Grok, parsers::grok::resolve_grok_home_dir()),
             (
                 AgentType::ClaudeCode,
@@ -1918,6 +1937,10 @@ mod tests {
             ),
             (AgentType::Cline, parsers::cline::cline_data_dir()),
             (AgentType::Pi, parsers::pi::resolve_pi_sessions_dir()),
+            (
+                AgentType::DeepSeek,
+                parsers::deepseek::resolve_deepseek_sessions_root(),
+            ),
         ];
 
         for (agent_type, resolver_root) in expected {
@@ -2003,7 +2026,7 @@ mod tests {
         }
     }
 
-    const ALL_AGENT_TYPES: [AgentType; 11] = [
+    const ALL_AGENT_TYPES: [AgentType; 12] = [
         AgentType::ClaudeCode,
         AgentType::Codex,
         AgentType::OpenCode,
@@ -2015,6 +2038,7 @@ mod tests {
         AgentType::Pi,
         AgentType::Grok,
         AgentType::Cursor,
+        AgentType::DeepSeek,
     ];
 
     #[test]
@@ -2027,47 +2051,6 @@ mod tests {
                 "{agent_type:?} produced a relative root: {roots:?}"
             );
         }
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn full_access_allows_path_outside_workspace() {
-        let workspace = temp_workspace();
-        let outside = std::env::temp_dir().join(format!("outside-{}.txt", uuid::Uuid::new_v4()));
-        fs::write(&outside, "outside-ok\n").expect("write outside file");
-
-        let runtime = FileSystemRuntime::new(workspace.clone()).with_allow_outside_workspace(true);
-        let response = runtime
-            .read_text_file(ReadTextFileRequest::new("sid", &outside))
-            .await
-            .expect("full access should allow outside path");
-        assert_eq!(response.content, "outside-ok\n");
-
-        runtime.set_allow_outside_workspace(false);
-        let error = runtime
-            .read_text_file(ReadTextFileRequest::new("sid", &outside))
-            .await
-            .expect_err("sandbox should re-engage when full access is off");
-        match error {
-            FileSystemRuntimeError::InvalidParams(message) => {
-                assert!(message.contains("outside the allowed read roots"));
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
-
-        let _ = fs::remove_file(outside);
-        let _ = fs::remove_dir_all(workspace);
-    }
-
-    #[test]
-    fn mode_allows_outside_workspace_recognizes_known_full_access_ids() {
-        assert!(mode_allows_outside_workspace("agent-full-access"));
-        assert!(mode_allows_outside_workspace("full-access"));
-        assert!(mode_allows_outside_workspace("danger-full-access"));
-        assert!(mode_allows_outside_workspace("bypassPermissions"));
-        assert!(!mode_allows_outside_workspace("agent"));
-        assert!(!mode_allows_outside_workspace("read-only"));
-        assert!(!mode_allows_outside_workspace("default"));
-        assert!(!mode_allows_outside_workspace("always-approve"));
     }
 
     #[tokio::test(flavor = "current_thread")]

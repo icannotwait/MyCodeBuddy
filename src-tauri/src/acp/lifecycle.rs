@@ -74,6 +74,7 @@ fn is_lifecycle_relevant(event: &AcpEvent) -> bool {
         || matches!(
             event,
             AcpEvent::Error {
+                details: None,
                 terminal: false,
                 ..
             }
@@ -4176,6 +4177,7 @@ mod tests {
             message: "boom".into(),
             agent_type: "claude_code".into(),
             code: None,
+            details: None,
             terminal: true,
         }));
 
@@ -4238,6 +4240,7 @@ mod tests {
             message: "transport closed".into(),
             agent_type: "claude_code".into(),
             code: None,
+            details: None,
             terminal: true,
         }));
 
@@ -4246,6 +4249,7 @@ mod tests {
             message: "turn refusal".into(),
             agent_type: "claude_code".into(),
             code: Some("turn_failed_refusal".into()),
+            details: None,
             terminal: false,
         }));
 
@@ -4836,6 +4840,7 @@ mod tests {
                 code: Some("turn_failed_refusal".into()),
                 // turn-failure Error: non-terminal. Worker MUST no-op (the
                 // upcoming TurnComplete maps the outcome via complete_call).
+                details: None,
                 terminal: false,
             },
         }));
@@ -4892,6 +4897,7 @@ mod tests {
                 message: "transport closed".into(),
                 agent_type: "claude_code".into(),
                 code: None,
+                details: None,
                 terminal: true,
             },
         }));
@@ -4949,6 +4955,7 @@ mod tests {
                 code: Some("auth_required".into()),
                 // Genuinely terminal: matches `connection.rs:493`, the only
                 // emit site where the run_connection task is unwinding.
+                details: None,
                 terminal: true,
             },
         }));
@@ -5092,6 +5099,7 @@ mod tests {
                 message: "Failed to load session, starting new: stale id".into(),
                 agent_type: "gemini".into(),
                 code: None,
+                details: None,
                 terminal: false,
             },
         }));
@@ -5187,6 +5195,7 @@ mod tests {
                 message: "Failed to set mode: bad id".into(),
                 agent_type: "claude_code".into(),
                 code: None,
+                details: None,
                 terminal: false,
             },
         }));

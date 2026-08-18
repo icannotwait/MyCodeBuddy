@@ -302,6 +302,7 @@ impl ParentContinuationPort for ManagerContinuationPort {
                 message: "Delegation continuation failed".to_string(),
                 agent_type: "codeg".to_string(),
                 code: Some(code.as_str().to_string()),
+                details: None,
                 terminal: matches!(
                     code,
                     ContinuationFailureCode::ParentConnectionLost

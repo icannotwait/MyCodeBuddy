@@ -183,14 +183,7 @@ fn continue_req(
     task: &str,
     work_unit: Option<&str>,
 ) -> ContinueDelegationRequest {
-    continue_req_bound(
-        parent_id,
-        tool_use,
-        target_task_id,
-        task,
-        work_unit,
-        None,
-    )
+    continue_req_bound(parent_id, tool_use, target_task_id, task, work_unit, None)
 }
 
 fn continue_req_bound(
@@ -981,11 +974,7 @@ fn skill_forward_v2_scenarios() -> Vec<SkillScenario> {
                     AgentType::Grok,
                     Some(task_binding.clone()),
                 ),
-                skill_route(
-                    "final_review|reviewer|codex|none",
-                    AgentType::Codex,
-                    None,
-                ),
+                skill_route("final_review|reviewer|codex|none", AgentType::Codex, None),
             ],
             expected_actions: &[SkillAction::Continue],
             must_differ_from: &[],
@@ -1041,7 +1030,11 @@ fn skill_forward_routing_invariants_eleven_v2_scenarios() {
                 .as_ref()
                 .unwrap_or_else(|| panic!("{} Task route must carry a binding", scenario.name));
             assert_eq!(first.schema_version, 1, "{}", scenario.name);
-            assert_eq!(first.namespace, "brainstorm-to-delivery", "{}", scenario.name);
+            assert_eq!(
+                first.namespace, "brainstorm-to-delivery",
+                "{}",
+                scenario.name
+            );
             if scenario.name != "boundary_agent_change_affects_pending_tasks" {
                 for binding in &task_bindings {
                     assert_eq!(
@@ -1213,8 +1206,7 @@ fn skill_forward_contract_v2_matches_skill() {
         "structured contract delegation interfaces"
     );
     assert_eq!(
-        contract["interfaces"]["binding_query"],
-        "get_delegation_orchestration_bindings",
+        contract["interfaces"]["binding_query"], "get_delegation_orchestration_bindings",
         "structured contract binding query"
     );
     assert_eq!(

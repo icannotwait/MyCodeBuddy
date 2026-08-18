@@ -3,7 +3,9 @@ pub mod claude;
 pub mod cline;
 pub mod codebuddy;
 pub mod codex;
+pub mod codex_code_mode;
 pub mod cursor;
+pub mod deepseek;
 pub mod gemini;
 pub mod grok;
 pub mod hermes;
@@ -152,6 +154,17 @@ pub fn external_transcript_sources() -> Vec<ExternalSource> {
             // `models.json`) under `~/.pi/agent` are never archived.
             agent: "pi",
             root: pi::resolve_pi_sessions_dir(),
+            is_file: false,
+            include_top: None,
+        },
+        ExternalSource {
+            // DeepSeek Harness (deepseek-acp) keeps a directory-per-session
+            // log store under `~/.dsh/sessions/<munged-cwd>/<uuid>/`
+            // (relocatable via `DEEPSEEK_ACP_SESSIONS_ROOT` / `DSH_HOME`).
+            // The resolver already points at the `sessions/` subtree, so the
+            // sibling `.credentials.yaml` under `~/.dsh` is never archived.
+            agent: "deepseek",
+            root: deepseek::resolve_deepseek_sessions_root(),
             is_file: false,
             include_top: None,
         },

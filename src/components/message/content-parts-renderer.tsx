@@ -14,6 +14,7 @@ import type { MessageRole, PlanEntryInfo } from "@/lib/types"
 import {
   aliasToolInputKeys,
   extractClaudeCodeMetaTitle,
+  extractClaudeCodeSkillName,
   normalizeToolName,
 } from "@/lib/tool-call-normalization"
 import { parseBackgroundLaunch } from "@/lib/background-task"
@@ -2404,7 +2405,13 @@ export const ToolCallPart = memo(function ToolCallPart({
     // jitters when the input lands. Same 80-char ellipsis as the derived
     // path for identical truncation behavior.
     const metaTitle = extractClaudeCodeMetaTitle(part.meta)
+    // claude-agent-acp ≥0.67 (#986): the invoked skill's name rides
+    // `_meta.claudeCode.skill` — authoritative over the input-derived
+    // "Skill: …" (same shape, so it flows through the same localization),
+    // and present from frame 1 before `rawInput` streams.
+    const metaSkillName = extractClaudeCodeSkillName(part.meta)
     const rawTitle =
+      (metaSkillName ? `Skill: ${metaSkillName}` : null) ??
       (metaTitle ? ellipsis(metaTitle, 80) : null) ??
       deriveToolTitle(
         normalizedToolName,

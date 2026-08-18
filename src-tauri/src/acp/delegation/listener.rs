@@ -5043,9 +5043,9 @@ mod tests {
                 case["name"]
             );
             assert_eq!(
-                serde_json::from_value::<
-                    crate::acp::delegation::types::OrchestrationBindingV1,
-                >(case["value"].clone())
+                serde_json::from_value::<crate::acp::delegation::types::OrchestrationBindingV1>(
+                    case["value"].clone()
+                )
                 .is_ok_and(|binding| binding.validate().is_ok()),
                 expected,
                 "semantic validation disagrees for {}",
@@ -5067,10 +5067,10 @@ mod tests {
                         "correlation_id": "binding-listener-red"
                     })
                 };
-                input.as_object_mut().unwrap().insert(
-                    "orchestration_binding".into(),
-                    case["value"].clone(),
-                );
+                input
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("orchestration_binding".into(), case["value"].clone());
                 let spawn_before = mock.spawn_args.lock().await.len();
                 let resume_before = mock.resume_args.lock().await.len();
                 let report = listener.process(make_request(input).await).await;

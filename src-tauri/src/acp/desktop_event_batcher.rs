@@ -957,6 +957,7 @@ mod tests {
                 message: "synthetic".into(),
                 agent_type: "grok".into(),
                 code: Some("synthetic".into()),
+                details: None,
                 terminal: false,
             },
             1,

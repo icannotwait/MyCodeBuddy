@@ -49,6 +49,7 @@ fn agent_type_label(agent: AgentType) -> &'static str {
         AgentType::Pi => "pi",
         AgentType::Grok => "grok",
         AgentType::Cursor => "cursor",
+        AgentType::DeepSeek => "deepseek",
         AgentType::Custom(_) => "custom",
     }
 }

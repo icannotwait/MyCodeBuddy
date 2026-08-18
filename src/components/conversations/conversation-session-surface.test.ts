@@ -1158,6 +1158,7 @@ vi.mock("@/hooks/use-session-feedback", () => ({
 vi.mock("@/lib/api", () => ({
   acpConnect: vi.fn(),
   acpFork: vi.fn(),
+  acpGetSessionSnapshot: vi.fn().mockResolvedValue({ goal_actions: [] }),
   createChatConversation: vi.fn(),
   createChatDir: vi.fn(),
   createConversation: vi.fn(),

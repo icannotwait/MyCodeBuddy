@@ -10,6 +10,7 @@ vi.mock("@/lib/api", () => ({
   setDelegationProfiles: vi.fn(),
   setDelegationBundle: vi.fn(),
   describeAgentOptions: vi.fn(),
+  acpListAgents: vi.fn(),
 }))
 
 vi.mock("sonner", () => ({
@@ -22,16 +23,32 @@ vi.mock("sonner", () => ({
 import { DelegationSettingsSection } from "./delegation-settings"
 import enMessages from "@/i18n/messages/en.json"
 import {
+  acpListAgents,
   getDelegationSettings,
   setDelegationBundle,
   getDelegationProfileCatalog,
   type DelegationSettings,
 } from "@/lib/api"
+import type { AcpAgentInfo } from "@/lib/types"
 
 const mockGetDelegationSettings = vi.mocked(getDelegationSettings)
 const mockSetDelegationBundle = vi.mocked(setDelegationBundle)
 const mockGetDelegationProfileCatalog = vi.mocked(getDelegationProfileCatalog)
 const mockToastError = vi.mocked(toast.error)
+const mockAcpListAgents = vi.mocked(acpListAgents)
+
+/** Just the fields the panel reads off an agent. */
+function agent(
+  name: string,
+  enabled: boolean,
+  hostToolsAgentMode: boolean
+): AcpAgentInfo {
+  return {
+    name,
+    enabled,
+    host_tools_agent_mode: hostToolsAgentMode,
+  } as unknown as AcpAgentInfo
+}
 
 function renderWithIntl() {
   return render(
@@ -71,6 +88,8 @@ beforeEach(() => {
     revision: 0,
   })
   mockToastError.mockReset()
+  mockAcpListAgents.mockReset()
+  mockAcpListAgents.mockResolvedValue([])
 })
 
 describe("DelegationSettingsSection", () => {
@@ -100,6 +119,52 @@ describe("DelegationSettingsSection", () => {
     ).toBeInTheDocument()
     // No timeout knob anymore — cancel flows through MCP notifications.
     expect(screen.queryByLabelText(/timeout/i)).not.toBeInTheDocument()
+  })
+
+  it("names the agents whose sandbox switch withholds the delegation tools", async () => {
+    // The reported confusion: the master switch reads "on" and the tools are
+    // still missing, because a per-agent switch withholds them.
+    mockGetDelegationSettings.mockResolvedValue(settings({ enabled: true }))
+    mockAcpListAgents.mockResolvedValue([
+      agent("Codex", true, true),
+      agent("Claude Code", true, true),
+      // Not affected: knob off, or the agent is disabled entirely.
+      agent("Grok", true, false),
+      agent("Pi", false, true),
+    ])
+
+    renderWithIntl()
+
+    const note = await screen.findByText(/will not get the delegation tools/)
+    expect(note).toHaveTextContent("Codex, Claude Code")
+    expect(note).not.toHaveTextContent("Grok")
+    expect(note).not.toHaveTextContent("Pi")
+  })
+
+  it("says nothing when no agent hands its channels back", async () => {
+    mockGetDelegationSettings.mockResolvedValue(settings({ enabled: true }))
+    mockAcpListAgents.mockResolvedValue([agent("Grok", true, false)])
+
+    renderWithIntl()
+
+    await screen.findByLabelText("Enable delegation")
+    expect(
+      screen.queryByText(/will not get the delegation tools/)
+    ).not.toBeInTheDocument()
+  })
+
+  it("says nothing while delegation itself is off", async () => {
+    // The switch above already explains the absence; a second reason would
+    // just be noise.
+    mockGetDelegationSettings.mockResolvedValue(settings({ enabled: false }))
+    mockAcpListAgents.mockResolvedValue([agent("Codex", true, true)])
+
+    renderWithIntl()
+
+    await screen.findByLabelText("Enable delegation")
+    expect(
+      screen.queryByText(/will not get the delegation tools/)
+    ).not.toBeInTheDocument()
   })
 
   it("saves the completed-result cache budget (MB); 0 means unlimited", async () => {

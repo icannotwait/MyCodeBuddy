@@ -27,6 +27,7 @@ import type {
   PromptCapabilitiesInfo,
   QuestionAnswer,
   SessionConfigOptionInfo,
+  SessionFailureRecord,
   SessionModeStateInfo,
   PromptInputBlock,
   PromptEnqueueResult,
@@ -37,6 +38,9 @@ const DEFAULT_PROMPT_CAPABILITIES: PromptCapabilitiesInfo = {
   audio: false,
   embedded_context: false,
 }
+
+/** Stable empty table so the no-failures common case never re-renders. */
+const EMPTY_SESSION_FAILURES: SessionFailureRecord[] = []
 
 export interface UseConnectionReturn {
   connectionId: string | null
@@ -73,6 +77,9 @@ export interface UseConnectionReturn {
   pendingAskQuestion: PendingQuestionState | null
   pendingPlanApproval: PendingPlanApprovalState | null
   claudeApiRetry: ClaudeApiRetryState | null
+  /** AIR typed session failure table (active + resolved; see
+   *  `lib/session-failures.ts`). `[]` when the connection has none. */
+  sessionFailures: SessionFailureRecord[]
   error: string | null
   loadError: string | null
   loadErrorCode: string | null
@@ -256,6 +263,7 @@ export function useConnection(contextKey: string): UseConnectionReturn {
   const pendingAskQuestion = connection?.pendingAskQuestion ?? null
   const pendingPlanApproval = connection?.pendingPlanApproval ?? null
   const claudeApiRetry = connection?.claudeApiRetry ?? null
+  const sessionFailures = connection?.sessionFailures ?? EMPTY_SESSION_FAILURES
   const error = connection?.error ?? null
   const loadError = connection?.loadError ?? null
   const loadErrorCode = connection?.loadErrorCode ?? null
@@ -377,6 +385,7 @@ export function useConnection(contextKey: string): UseConnectionReturn {
       pendingAskQuestion,
       pendingPlanApproval,
       claudeApiRetry,
+      sessionFailures,
       error,
       loadError,
       loadErrorCode,
@@ -421,6 +430,7 @@ export function useConnection(contextKey: string): UseConnectionReturn {
       pendingAskQuestion,
       pendingPlanApproval,
       claudeApiRetry,
+      sessionFailures,
       error,
       loadError,
       loadErrorCode,

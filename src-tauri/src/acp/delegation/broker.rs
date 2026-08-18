@@ -6138,33 +6138,32 @@ impl DelegationBroker {
             }
         }
 
-        let replacement_source = match (
-            req.replaces_task_id.as_deref(),
-            self.run_store.as_ref(),
-        ) {
-            (Some(source_task_id), Some(runs)) => match runs.load_by_task_id(source_task_id).await {
-                Ok(Some(source))
-                    if source.parent_conversation_id == req.parent_conversation_id =>
-                {
-                    Some(source)
+        let replacement_source = match (req.replaces_task_id.as_deref(), self.run_store.as_ref()) {
+            (Some(source_task_id), Some(runs)) => {
+                match runs.load_by_task_id(source_task_id).await {
+                    Ok(Some(source))
+                        if source.parent_conversation_id == req.parent_conversation_id =>
+                    {
+                        Some(source)
+                    }
+                    Ok(Some(_)) | Ok(None) => {
+                        self.drop_inflight(inflight_id).await;
+                        return report_err(
+                            req.agent_type,
+                            DelegationError::NotFound(source_task_id.into()),
+                            None,
+                        );
+                    }
+                    Err(error) => {
+                        self.drop_inflight(inflight_id).await;
+                        return report_err(
+                            req.agent_type,
+                            store_err_to_delegation_error(error),
+                            None,
+                        );
+                    }
                 }
-                Ok(Some(_)) | Ok(None) => {
-                    self.drop_inflight(inflight_id).await;
-                    return report_err(
-                        req.agent_type,
-                        DelegationError::NotFound(source_task_id.into()),
-                        None,
-                    );
-                }
-                Err(error) => {
-                    self.drop_inflight(inflight_id).await;
-                    return report_err(
-                        req.agent_type,
-                        store_err_to_delegation_error(error),
-                        None,
-                    );
-                }
-            },
+            }
             _ => None,
         };
         let effective_orchestration_binding = if let Some(source) = replacement_source.as_ref() {
@@ -6175,11 +6174,7 @@ impl DelegationBroker {
                 Ok(binding) => binding,
                 Err(error) => {
                     self.drop_inflight(inflight_id).await;
-                    return report_err(
-                        req.agent_type,
-                        store_err_to_delegation_error(error),
-                        None,
-                    );
+                    return report_err(req.agent_type, store_err_to_delegation_error(error), None);
                 }
             }
         } else {
@@ -6593,23 +6588,22 @@ impl DelegationBroker {
             }
             // Replacement: inherit lineage root from replaced run; admission_class
             // is Replacement. Otherwise normal gen-1 root.
-            let (admission_class, lineage_root_task_id, root_task_id) = if let Some(source) =
-                replacement_source.as_ref()
-            {
-                (
-                    AdmissionClass::Replacement,
-                    source.lineage_root_task_id.clone(),
-                    // Replacement is a fresh generation-1 child
-                    // thread; only the lineage root is inherited.
-                    call_id.clone(),
-                )
-            } else {
-                (
-                    AdmissionClass::NormalRevision,
-                    call_id.clone(),
-                    call_id.clone(),
-                )
-            };
+            let (admission_class, lineage_root_task_id, root_task_id) =
+                if let Some(source) = replacement_source.as_ref() {
+                    (
+                        AdmissionClass::Replacement,
+                        source.lineage_root_task_id.clone(),
+                        // Replacement is a fresh generation-1 child
+                        // thread; only the lineage root is inherited.
+                        call_id.clone(),
+                    )
+                } else {
+                    (
+                        AdmissionClass::NormalRevision,
+                        call_id.clone(),
+                        call_id.clone(),
+                    )
+                };
             let insert = ReservingRunInsert {
                 orchestration_binding: if replacement_source.is_some() {
                     req.orchestration_binding.clone()
@@ -16651,16 +16645,13 @@ mod tests {
         }
     }
 
-    fn orchestration_binding_fixture() ->
-        crate::acp::delegation::types::OrchestrationBindingV1
-    {
+    fn orchestration_binding_fixture() -> crate::acp::delegation::types::OrchestrationBindingV1 {
         crate::acp::delegation::types::OrchestrationBindingV1 {
             schema_version: 1,
             namespace: "brainstorm-to-delivery".into(),
             generation: 1,
             route_fingerprint:
-                "sha256:b498416d87bf6ba928bd7ddb5f1a451daf82300584f3d40b606c3c56f169ba7a"
-                    .into(),
+                "sha256:b498416d87bf6ba928bd7ddb5f1a451daf82300584f3d40b606c3c56f169ba7a".into(),
         }
     }
 
@@ -16736,7 +16727,11 @@ mod tests {
         let mut unbound = request(parent.id, "binding-first-unbound-tool");
         unbound.working_dir = Some(test_working_dir());
         let unbound_report = broker.start_delegation(unbound).await;
-        assert_eq!(unbound_report.status, TaskStatus::Running, "{unbound_report:?}");
+        assert_eq!(
+            unbound_report.status,
+            TaskStatus::Running,
+            "{unbound_report:?}"
+        );
         let unbound_run = runs
             .load_by_task_id(unbound_report.task_id.as_deref().unwrap())
             .await
@@ -16763,12 +16758,7 @@ mod tests {
                 Some(changed_binding),
                 Some(binding),
             ),
-            (
-                "unbound",
-                None,
-                Some(orchestration_binding_fixture()),
-                None,
-            ),
+            ("unbound", None, Some(orchestration_binding_fixture()), None),
         ];
 
         for (case, source_binding, mismatched_binding, accepted_binding) in cases {
@@ -16818,42 +16808,39 @@ mod tests {
                 BTreeMap::new(),
             );
             let runs = Arc::new(RunStore::new(db.clone()));
-            runs
-                .insert_reserving(ReservingRunInsert {
-                    orchestration_binding: source_binding.clone(),
-                    task_id: source_task_id.clone(),
-                    root_task_id: source_task_id.clone(),
-                    previous_task_id: None,
-                    generation: 1,
-                    parent_conversation_id: parent.id,
-                    parent_tool_use_id: Some(source_tool_id),
-                    child_conversation_id: source_child.id,
-                    agent_type: "claude_code".into(),
-                    profile_id: None,
-                    workspace_path: Some(launch.snapshot.workspace_path),
-                    route_fingerprint: Some(launch.snapshot.route_fingerprint),
-                    launch_snapshot_version: Some(launch.snapshot.launch_snapshot_version),
-                    mode_id: launch.snapshot.mode_id,
-                    config_values_json: Some(launch.snapshot.config_values_json),
-                    task_preview: Some(format!("binding continue {case} source")),
-                    request_fingerprint: Some(format!("binding-continue-{case}-fingerprint")),
-                    admission_class: AdmissionClass::NormalRevision,
-                    lineage_root_task_id: source_task_id.clone(),
-                    work_unit_key: Some(work_unit_key.clone()),
-                    history_only: false,
-                    replaced_task_id: None,
-                    replacement_reason: None,
-                    started_at: Some(Utc::now()),
-                })
-                .await
-                .expect("source reserve");
+            runs.insert_reserving(ReservingRunInsert {
+                orchestration_binding: source_binding.clone(),
+                task_id: source_task_id.clone(),
+                root_task_id: source_task_id.clone(),
+                previous_task_id: None,
+                generation: 1,
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: Some(source_tool_id),
+                child_conversation_id: source_child.id,
+                agent_type: "claude_code".into(),
+                profile_id: None,
+                workspace_path: Some(launch.snapshot.workspace_path),
+                route_fingerprint: Some(launch.snapshot.route_fingerprint),
+                launch_snapshot_version: Some(launch.snapshot.launch_snapshot_version),
+                mode_id: launch.snapshot.mode_id,
+                config_values_json: Some(launch.snapshot.config_values_json),
+                task_preview: Some(format!("binding continue {case} source")),
+                request_fingerprint: Some(format!("binding-continue-{case}-fingerprint")),
+                admission_class: AdmissionClass::NormalRevision,
+                lineage_root_task_id: source_task_id.clone(),
+                work_unit_key: Some(work_unit_key.clone()),
+                history_only: false,
+                replaced_task_id: None,
+                replacement_reason: None,
+                started_at: Some(Utc::now()),
+            })
+            .await
+            .expect("source reserve");
             let source_connection_id = format!("binding-continue-{case}-connection");
-            runs
-                .bind_child_connection_while_reserving(&source_task_id, &source_connection_id)
+            runs.bind_child_connection_while_reserving(&source_task_id, &source_connection_id)
                 .await
                 .expect("bind source connection");
-            runs
-                .promote_running(&source_task_id, &source_connection_id, Utc::now())
+            runs.promote_running(&source_task_id, &source_connection_id, Utc::now())
                 .await
                 .expect("promote source");
             let source = delegation_task_run::Entity::find_by_id(&source_task_id)
@@ -16866,10 +16853,12 @@ mod tests {
             source.error_code = Set(Some("parent_disconnected".into()));
             source.termination_audit_json = Set(None);
             source.finished_at = Set(Some(Utc::now()));
-            source.update(&db.conn).await.expect("legacy terminal source");
+            source
+                .update(&db.conn)
+                .await
+                .expect("legacy terminal source");
 
-            let authorization_id =
-                approve_continue_recovery(&db, &runs, &source_task_id).await;
+            let authorization_id = approve_continue_recovery(&db, &runs, &source_task_id).await;
             let mock = Arc::new(MockSpawner::new());
             let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
             let resumes_before = mock.resume_args.lock().await.len();
@@ -16984,52 +16973,50 @@ mod tests {
         )
         .await
         .expect("source child");
-        runs
-            .insert_reserving(ReservingRunInsert {
-                orchestration_binding: Some(orchestration_binding_fixture()),
-                task_id: source_task_id.clone(),
-                root_task_id: source_task_id.clone(),
-                previous_task_id: None,
-                generation: 1,
-                parent_conversation_id: parent.id,
-                parent_tool_use_id: Some("binding-replacement-source-tool".into()),
-                child_conversation_id: source_child.id,
-                agent_type: "claude_code".into(),
-                profile_id: None,
-                workspace_path: Some(launch.snapshot.workspace_path),
-                route_fingerprint: Some(launch.snapshot.route_fingerprint),
-                launch_snapshot_version: Some(launch.snapshot.launch_snapshot_version),
-                mode_id: launch.snapshot.mode_id,
-                config_values_json: Some(launch.snapshot.config_values_json),
-                task_preview: Some("binding replacement source".into()),
-                request_fingerprint: Some("binding-replacement-source-fingerprint".into()),
-                admission_class: AdmissionClass::NormalRevision,
-                lineage_root_task_id: source_task_id.clone(),
-                work_unit_key: Some("binding-replacement-unit".into()),
-                history_only: false,
-                replaced_task_id: None,
-                replacement_reason: None,
-                started_at: Some(Utc::now()),
-            })
-            .await
-            .expect("source reserve");
+        runs.insert_reserving(ReservingRunInsert {
+            orchestration_binding: Some(orchestration_binding_fixture()),
+            task_id: source_task_id.clone(),
+            root_task_id: source_task_id.clone(),
+            previous_task_id: None,
+            generation: 1,
+            parent_conversation_id: parent.id,
+            parent_tool_use_id: Some("binding-replacement-source-tool".into()),
+            child_conversation_id: source_child.id,
+            agent_type: "claude_code".into(),
+            profile_id: None,
+            workspace_path: Some(launch.snapshot.workspace_path),
+            route_fingerprint: Some(launch.snapshot.route_fingerprint),
+            launch_snapshot_version: Some(launch.snapshot.launch_snapshot_version),
+            mode_id: launch.snapshot.mode_id,
+            config_values_json: Some(launch.snapshot.config_values_json),
+            task_preview: Some("binding replacement source".into()),
+            request_fingerprint: Some("binding-replacement-source-fingerprint".into()),
+            admission_class: AdmissionClass::NormalRevision,
+            lineage_root_task_id: source_task_id.clone(),
+            work_unit_key: Some("binding-replacement-unit".into()),
+            history_only: false,
+            replaced_task_id: None,
+            replacement_reason: None,
+            started_at: Some(Utc::now()),
+        })
+        .await
+        .expect("source reserve");
         let finished_at = Utc::now();
-        runs
-            .settle_terminal(
-                &source_task_id,
-                TerminalTaskWrite::failed_with_evidence(
+        runs.settle_terminal(
+            &source_task_id,
+            TerminalTaskWrite::failed_with_evidence(
+                "admission_unknown",
+                finished_at,
+                DelegationTerminationAuditV1::for_terminal_code(
                     "admission_unknown",
+                    DelegationRunStatus::Reserving,
+                    true,
                     finished_at,
-                    DelegationTerminationAuditV1::for_terminal_code(
-                        "admission_unknown",
-                        DelegationRunStatus::Reserving,
-                        true,
-                        finished_at,
-                    ),
                 ),
-            )
-            .await
-            .expect("terminal replacement source");
+            ),
+        )
+        .await
+        .expect("terminal replacement source");
         let authorization_id = approve_replacement_recovery(
             &db,
             &runs,

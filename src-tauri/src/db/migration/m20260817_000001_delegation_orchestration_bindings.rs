@@ -84,10 +84,7 @@ pub(crate) async fn install_for_historical_completion_fixture(
 
     let manager = SchemaManager::new(&db.conn);
     if !manager
-        .has_column(
-            "delegation_task_runs",
-            "orchestration_schema_version",
-        )
+        .has_column("delegation_task_runs", "orchestration_schema_version")
         .await?
     {
         Migration.up(&manager).await?;
@@ -120,8 +117,7 @@ mod tests {
     use crate::db::migration::Migrator;
 
     const PRIOR_MIGRATION: &str = "m20260811_000001_simple_workflows";
-    const BINDING_MIGRATION: &str =
-        "m20260817_000001_delegation_orchestration_bindings";
+    const BINDING_MIGRATION: &str = "m20260817_000001_delegation_orchestration_bindings";
     const ZERO_FINGERPRINT: &str =
         "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 
@@ -278,8 +274,14 @@ mod tests {
         assert_eq!(
             columns,
             BTreeMap::from([
-                ("orchestration_generation".to_string(), ("INTEGER".to_string(), 0)),
-                ("orchestration_namespace".to_string(), ("TEXT".to_string(), 0)),
+                (
+                    "orchestration_generation".to_string(),
+                    ("INTEGER".to_string(), 0)
+                ),
+                (
+                    "orchestration_namespace".to_string(),
+                    ("TEXT".to_string(), 0)
+                ),
                 (
                     "orchestration_route_fingerprint".to_string(),
                     ("TEXT".to_string(), 0),
@@ -328,15 +330,9 @@ mod tests {
         .await
         .expect("all-set binding accepted");
 
-        let partial = insert_run(
-            &db,
-            "partial",
-            3,
-            "orchestration_schema_version",
-            "1",
-        )
-        .await
-        .expect_err("partial binding must be rejected");
+        let partial = insert_run(&db, "partial", 3, "orchestration_schema_version", "1")
+            .await
+            .expect_err("partial binding must be rejected");
         assert_trigger(partial, "trg_dtr_orchestration_binding_shape");
 
         let add = db
@@ -362,14 +358,12 @@ mod tests {
         assert_trigger(change, "trg_dtr_orchestration_binding_immutable");
 
         let clear = db
-            .execute(sql(
-                "UPDATE delegation_task_runs SET \
+            .execute(sql("UPDATE delegation_task_runs SET \
                  orchestration_schema_version = NULL, \
                  orchestration_namespace = NULL, \
                  orchestration_generation = NULL, \
                  orchestration_route_fingerprint = NULL \
-                 WHERE task_id = 'bound'",
-            ))
+                 WHERE task_id = 'bound'"))
             .await
             .expect_err("clearing a binding after insert must fail");
         assert_trigger(clear, "trg_dtr_orchestration_binding_immutable");

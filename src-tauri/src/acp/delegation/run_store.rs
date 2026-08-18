@@ -1357,14 +1357,16 @@ async fn insert_reserving_txn(
         profile_id: Set(insert.profile_id.clone()),
         workspace_path: Set(insert.workspace_path.clone()),
         route_fingerprint: Set(insert.route_fingerprint.clone()),
-        orchestration_schema_version: Set(orchestration_binding
-            .map(|binding| i64::from(binding.schema_version))),
-        orchestration_namespace: Set(orchestration_binding
-            .map(|binding| binding.namespace.clone())),
-        orchestration_generation: Set(orchestration_binding
-            .map(|binding| i64::from(binding.generation))),
-        orchestration_route_fingerprint: Set(orchestration_binding
-            .map(|binding| binding.route_fingerprint.clone())),
+        orchestration_schema_version: Set(
+            orchestration_binding.map(|binding| i64::from(binding.schema_version))
+        ),
+        orchestration_namespace: Set(orchestration_binding.map(|binding| binding.namespace.clone())),
+        orchestration_generation: Set(
+            orchestration_binding.map(|binding| i64::from(binding.generation))
+        ),
+        orchestration_route_fingerprint: Set(
+            orchestration_binding.map(|binding| binding.route_fingerprint.clone())
+        ),
         launch_snapshot_version: Set(insert.launch_snapshot_version.clone()),
         mode_id: Set(insert.mode_id.clone()),
         config_values_json: Set(insert.config_values_json.clone()),
@@ -3038,8 +3040,7 @@ impl RunStore {
                         target.orchestration_binding.as_ref(),
                         admission.supplied_orchestration_binding.as_ref(),
                     )?;
-                    if effective_orchestration_binding
-                        != admission.effective_orchestration_binding
+                    if effective_orchestration_binding != admission.effective_orchestration_binding
                     {
                         return Err(TaskStoreError::OrchestrationBindingLineageMismatch);
                     }
@@ -3681,9 +3682,8 @@ impl RunStore {
             None => None,
         };
         #[cfg(any(test, feature = "test-utils"))]
-        let inject_identity_failure = self.take_identity_lifecycle_fault(
-            LifecycleIdentityTestFault::PreAdmissionAfterRunWrite,
-        );
+        let inject_identity_failure = self
+            .take_identity_lifecycle_fault(LifecycleIdentityTestFault::PreAdmissionAfterRunWrite);
         #[cfg(not(any(test, feature = "test-utils")))]
         let inject_identity_failure = false;
 
@@ -5053,9 +5053,8 @@ impl RunStore {
     ) -> Result<(), TaskStoreError> {
         let encoded = encoded_runtime_stats(stats)?;
         #[cfg(any(test, feature = "test-utils"))]
-        let inject_identity_failure = self.take_identity_lifecycle_fault(
-            LifecycleIdentityTestFault::RuntimeStatsAfterRunWrite,
-        );
+        let inject_identity_failure = self
+            .take_identity_lifecycle_fault(LifecycleIdentityTestFault::RuntimeStatsAfterRunWrite);
         #[cfg(not(any(test, feature = "test-utils")))]
         let inject_identity_failure = false;
 
@@ -6046,26 +6045,8 @@ mod tests {
 
     #[test]
     fn fingerprint_field_order_matters() {
-        let a = request_fingerprint(
-            "t1",
-            "task",
-            Some("w"),
-            None,
-            None,
-            None,
-            "r1",
-            None,
-        );
-        let b = request_fingerprint(
-            "t1",
-            "task",
-            None,
-            Some("w"),
-            None,
-            None,
-            "r1",
-            None,
-        );
+        let a = request_fingerprint("t1", "task", Some("w"), None, None, None, "r1", None);
+        let b = request_fingerprint("t1", "task", None, Some("w"), None, None, "r1", None);
         assert_ne!(a, b);
     }
 
@@ -6112,16 +6093,7 @@ mod tests {
             "aa",
             None,
         );
-        let right = request_fingerprint(
-            "t",
-            "task",
-            Some("w"),
-            Some("x"),
-            None,
-            None,
-            "aa",
-            None,
-        );
+        let right = request_fingerprint("t", "task", Some("w"), Some("x"), None, None, "aa", None);
         assert_ne!(left, right);
     }
 
@@ -6162,8 +6134,7 @@ mod tests {
             namespace: "brainstorm-to-delivery".into(),
             generation: 2,
             route_fingerprint:
-                "sha256:b498416d87bf6ba928bd7ddb5f1a451daf82300584f3d40b606c3c56f169ba7a"
-                    .into(),
+                "sha256:b498416d87bf6ba928bd7ddb5f1a451daf82300584f3d40b606c3c56f169ba7a".into(),
         };
         let exact = request_fingerprint(
             "delegate_to_agent",
@@ -6299,8 +6270,7 @@ mod tests {
             namespace: "brainstorm-to-delivery".into(),
             generation: 1,
             route_fingerprint:
-                "sha256:b498416d87bf6ba928bd7ddb5f1a451daf82300584f3d40b606c3c56f169ba7a"
-                    .into(),
+                "sha256:b498416d87bf6ba928bd7ddb5f1a451daf82300584f3d40b606c3c56f169ba7a".into(),
         }
     }
 
@@ -6372,11 +6342,7 @@ mod tests {
     async fn orchestration_binding_lineage_continue_inherits_rejects_conversion_and_is_idempotent()
     {
         for (suffix, source_binding, supplied) in [
-            (
-                "bound-omitted",
-                Some(binding_fixture()),
-                None,
-            ),
+            ("bound-omitted", Some(binding_fixture()), None),
             (
                 "bound-exact",
                 Some(binding_fixture()),
@@ -6478,7 +6444,12 @@ mod tests {
         let mut source = sample_insert(&source_task_id, parent_id, child_id, 1, None);
         source.orchestration_binding = binding;
         store.insert_reserving(source).await.unwrap();
-        ensure_bound(&store, &source_task_id, format!("binding-repl-conn-{suffix}")).await;
+        ensure_bound(
+            &store,
+            &source_task_id,
+            format!("binding-repl-conn-{suffix}"),
+        )
+        .await;
         store
             .promote_running(
                 &source_task_id,
@@ -6490,11 +6461,7 @@ mod tests {
         store
             .settle_terminal(
                 &source_task_id,
-                TerminalTaskWrite::failed(
-                    "unresumable",
-                    Utc::now(),
-                    ConversationStatus::Cancelled,
-                ),
+                TerminalTaskWrite::failed("unresumable", Utc::now(), ConversationStatus::Cancelled),
             )
             .await
             .unwrap();
@@ -6515,13 +6482,8 @@ mod tests {
             let (db, store, parent_id, source_task_id) =
                 seed_binding_replacement_source(suffix, source_binding.clone()).await;
             let task_id = format!("binding-replacement-{suffix}");
-            let child_id = new_replacement_child(
-                &db,
-                parent_id,
-                &format!("tu-{task_id}"),
-                &task_id,
-            )
-            .await;
+            let child_id =
+                new_replacement_child(&db, parent_id, &format!("tu-{task_id}"), &task_id).await;
             let mut insert = base_replacement_insert(
                 &task_id,
                 parent_id,
@@ -6556,13 +6518,8 @@ mod tests {
             let (db, store, parent_id, source_task_id) =
                 seed_binding_replacement_source(suffix, source_binding).await;
             let task_id = format!("binding-replacement-{suffix}");
-            let child_id = new_replacement_child(
-                &db,
-                parent_id,
-                &format!("tu-{task_id}"),
-                &task_id,
-            )
-            .await;
+            let child_id =
+                new_replacement_child(&db, parent_id, &format!("tu-{task_id}"), &task_id).await;
             let mut insert = base_replacement_insert(
                 &task_id,
                 parent_id,
@@ -6593,10 +6550,7 @@ mod tests {
         route_fingerprint: Option<String>,
     }
 
-    async fn raw_binding_identity(
-        db: &AppDatabase,
-        task_id: &str,
-    ) -> BindingIdentitySnapshot {
+    async fn raw_binding_identity(db: &AppDatabase, task_id: &str) -> BindingIdentitySnapshot {
         let row = DelegationTaskRun::find_by_id(task_id)
             .one(&db.conn)
             .await
@@ -6614,12 +6568,7 @@ mod tests {
 
     async fn seed_bound_identity_fixture(
         suffix: &str,
-    ) -> (
-        Arc<AppDatabase>,
-        RunStore,
-        String,
-        BindingIdentitySnapshot,
-    ) {
+    ) -> (Arc<AppDatabase>, RunStore, String, BindingIdentitySnapshot) {
         let db = Arc::new(fresh_in_memory_db().await);
         let task_id = format!("durable-binding-{suffix}");
         let (parent_id, child_id) = seed_parent_child(&db, &task_id).await;
@@ -6641,13 +6590,14 @@ mod tests {
     async fn durable_binding_reserving_insert_is_atomic_and_reconstructs() {
         let (db, store, task_id, expected) = seed_bound_identity_fixture("atomic").await;
         assert_eq!(expected.schema_version, Some(1));
-        assert_eq!(expected.namespace.as_deref(), Some("brainstorm-to-delivery"));
+        assert_eq!(
+            expected.namespace.as_deref(),
+            Some("brainstorm-to-delivery")
+        );
         assert_eq!(expected.generation, Some(1));
         assert_eq!(
             expected.route_fingerprint.as_deref(),
-            Some(
-                "sha256:b498416d87bf6ba928bd7ddb5f1a451daf82300584f3d40b606c3c56f169ba7a"
-            )
+            Some("sha256:b498416d87bf6ba928bd7ddb5f1a451daf82300584f3d40b606c3c56f169ba7a")
         );
         let raw = DelegationTaskRun::find_by_id(&task_id)
             .one(&db.conn)
@@ -6759,7 +6709,10 @@ mod tests {
             .promote_running_detailed(&task_id, "binding-promote", Utc::now())
             .await
             .expect("typed promote outcome");
-        assert!(matches!(failed.kind, PromoteRunningKind::RetryExhausted { .. }));
+        assert!(matches!(
+            failed.kind,
+            PromoteRunningKind::RetryExhausted { .. }
+        ));
         assert_eq!(raw_binding_identity(&db, &task_id).await, original);
         store
             .promote_running(&task_id, "binding-promote", Utc::now())

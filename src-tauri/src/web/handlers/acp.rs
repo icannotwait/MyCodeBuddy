@@ -86,6 +86,7 @@ pub async fn registered_shared_spawn_attempt_for_http_test(
                 message: agent_stderr,
                 agent_type: launch.agent_type.as_wire().into_owned(),
                 code: Some("agent_stderr".into()),
+                details: None,
                 terminal: false,
             });
     }
@@ -1179,7 +1180,7 @@ pub async fn acp_goal_control(
     )
     .await?;
     manager
-        .goal_control(&params.connection_id, params.action)
+        .goal_control(&state.db.conn, &params.connection_id, params.action)
         .await
         .map_err(|e| AppCommandError::task_execution_failed(e.to_string()))?;
     Ok(Json(()))

@@ -1056,8 +1056,7 @@ mod tests {
         let visible = format!(
             "# Plan\n\n```info`bad\n<!-- codeg-b2d-routing-v1\n{VALID_ROUTING_JSON}\n-->\n```\n"
         );
-        let parsed =
-            parse_simple_plan(visible.as_bytes()).expect("parse visible marker");
+        let parsed = parse_simple_plan(visible.as_bytes()).expect("parse visible marker");
         assert!(parsed.routing.is_some());
         assert!(parsed.warning_codes.is_empty());
 
@@ -1588,11 +1587,9 @@ Run verification: `cargo test second`
             generation: 1,
             route_fingerprint: TASK6_FINGERPRINT.into(),
         };
-        let parsed = parse_simple_progress(
-            routed_progress_binding_fixture().as_bytes(),
-            "docs/plan.md",
-        )
-        .expect("parse routed binding progress");
+        let parsed =
+            parse_simple_progress(routed_progress_binding_fixture().as_bytes(), "docs/plan.md")
+                .expect("parse routed binding progress");
         let task = &parsed.snapshot.expect("snapshot").tasks[0];
 
         assert_eq!(task.route_fingerprint.as_deref(), Some(TASK6_FINGERPRINT));
@@ -1617,10 +1614,7 @@ Run verification: `cargo test second`
         let bounded = parse_simple_progress(padded.as_bytes(), "docs/plan.md")
             .expect("padded binding progress remains recoverable");
         assert_eq!(
-            bounded
-                .snapshot
-                .expect("bounded snapshot")
-                .tasks[0]
+            bounded.snapshot.expect("bounded snapshot").tasks[0]
                 .route_fingerprint
                 .as_deref(),
             Some(TASK6_FINGERPRINT)

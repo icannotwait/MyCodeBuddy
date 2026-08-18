@@ -487,7 +487,8 @@
     "templates": {
       "gemini": "---\nname: example-skill\ndescription: Describe when this skill should be used.\n---\n\n# Skill Name\n\nInstructions for the agent when this skill is active.\n\n## Workflow\n\n1. Add actionable step one.\n2. Add actionable step two.\n",
       "openCode": "---\nname: example-skill\ndescription: Describe when this skill should be used.\n---\n\n# Purpose\n\nDescribe what this skill helps with.\n\n# Steps\n\n1. Add actionable step one.\n2. Add actionable step two.\n",
-      "default": "---\nname: example-skill\ndescription: Describe when this skill should be used.\n---\n\n# Skill: example-skill\n\n## When to use\n\n- Describe trigger conditions.\n\n## Instructions\n\n1. Add actionable instruction one.\n2. Add actionable instruction two.\n"
+      "default": "---\nname: example-skill\ndescription: Describe when this skill should be used.\n---\n\n# Skill: example-skill\n\n## When to use\n\n- Describe trigger conditions.\n\n## Instructions\n\n1. Add actionable instruction one.\n2. Add actionable instruction two.\n",
+      "openClaw": "---\nname: example-skill\ndescription: Describe when this skill should be used.\nuser-invocable: true\ndisable-model-invocation: false\n---\n\n# Purpose\n\nDescribe what this skill helps with.\n\n# Instructions\n\n1. Add actionable instruction one.\n2. Add actionable instruction two.\n"
     }
   },
   "McpSettings": {
@@ -662,7 +663,8 @@
         "native": "Native"
       },
       "softWatchdog": "Soft-Watchdog (Sekunden)",
-      "softWatchdogHint": "Nur beobachtender Stall-Schwellwert ({min}–{max}). 0 deaktiviert Stall-Markierung. Bricht nicht ab und wechselt die Route nicht."
+      "softWatchdogHint": "Nur beobachtender Stall-Schwellwert ({min}–{max}). 0 deaktiviert Stall-Markierung. Bricht nicht ab und wechselt die Route nicht.",
+      "withheldByHostTools": "{agents} erhalten die Delegationswerkzeuge nicht: Ihr agentenspezifischer Schalter „Dateien und Befehle vom Agenten selbst ausführen lassen“ ist aktiv."
     },
     "actions": {
       "dragSort": "Zum Neuordnen ziehen",
@@ -700,7 +702,9 @@
       "saveKimiCodeConfig": "Kimi-Code-Konfiguration speichern",
       "customInstall": "Benutzerdefinierte Installation",
       "saveKimiCodeRawConfig": "Save config.toml",
-      "diagnose": "Diagnose"
+      "diagnose": "Diagnose",
+      "saveOpenClawConfig": "OpenClaw-Konfiguration speichern",
+      "saveDeepSeekConfig": "DeepSeek-Konfiguration speichern"
     },
     "status": {
       "enabled": "Aktiviert",
@@ -1193,7 +1197,11 @@
       "piBinaryUninstallFailed": "pi-Deinstallation fehlgeschlagen",
       "savePiTrustFailed": "Speichern des Arbeitsbereich-Vertrauens fehlgeschlagen",
       "cursorSaved": "Cursor-Konfiguration gespeichert",
-      "saveCursorConfigFailed": "Cursor-Konfiguration konnte nicht gespeichert werden"
+      "saveCursorConfigFailed": "Cursor-Konfiguration konnte nicht gespeichert werden",
+      "openClawSaved": "OpenClaw-Konfiguration gespeichert",
+      "saveOpenClawFailed": "Speichern der OpenClaw-Konfiguration fehlgeschlagen",
+      "deepseekSaved": "DeepSeek-Konfiguration gespeichert",
+      "saveDeepSeekFailed": "DeepSeek-Konfiguration konnte nicht gespeichert werden"
     },
     "version": {
       "statusLabel": "Versionsstatus",
@@ -1405,7 +1413,24 @@
       "ready": "Der Adapter {adapterCmd} ist installiert — ihn startet Codeg. Er bringt seine eigene Laufzeit mit, die {nativeLabel} wird also nicht benötigt; installierst du sie später, koexistieren beide und teilen sich {configDir}."
     },
     "customAgentMcpLabel": "MCP-Unterstützung",
-    "customAgentMcpHint": "Übergibt den in codeg integrierten MCP-Begleitprozess beim Sitzungsstart an diesen Agenten — der Kanal hinter Delegation, Live-Feedback und Aufgaben-Tools. Für einen Agenten, der MCP-Server ablehnt und deshalb keine Verbindung aufbaut, ausschalten; die Änderung gilt ab der nächsten Verbindung."
+    "customAgentMcpHint": "Übergibt den in codeg integrierten MCP-Begleitprozess beim Sitzungsstart an diesen Agenten — der Kanal hinter Delegation, Live-Feedback und Aufgaben-Tools. Für einen Agenten, der MCP-Server ablehnt und deshalb keine Verbindung aufbaut, ausschalten; die Änderung gilt ab der nächsten Verbindung.",
+    "deepseek": {
+      "configManagement": "DeepSeek-Harness-Konfiguration",
+      "configDescription": "Endpunkt und Schlüssel sind Umgebungsvariablen, die deepseek-acp beim Start liest. Modell und Denkstufe sind Auswahlfelder pro Sitzung — sie werden im Eingabefeld gewählt.",
+      "baseUrlLabel": "API-Endpunkt",
+      "baseUrlHint": "Leer lassen für den offiziellen Endpunkt. Gilt für Sitzungen, die nach dem Speichern starten – eine laufende Sitzung muss neu verbinden.",
+      "baseUrlInvalid": "Vollständige http(s)-URL ohne Query-String eingeben, zum Beispiel https://api.deepseek.com",
+      "apiKeyLabel": "API-Schlüssel",
+      "apiKeyHint": "Wird dem Agenten als DEEPSEEK_API_KEY übergeben. Eine Umgebungsvariable hat Vorrang vor der Zugangsdatendatei – lass das Feld leer, wenn du dich im Terminal anmeldest."
+    },
+    "openClaw": {
+      "gatewayConfig": "Gateway-Konfiguration",
+      "gatewayDescription": "OpenClaw-Gateway-Verbindung konfigurieren. Unterstützt lokales oder entferntes Gateway.",
+      "gatewayUrlHint": "Leer lassen, um gateway.remote.url aus der lokalen openclaw-Konfiguration zu verwenden.",
+      "gatewayTokenPlaceholder": "Gateway-Auth-Token",
+      "gatewayTokenHint": "Wenn möglich token-file statt Klartext-Token verwenden; über openclaw CLI konfigurieren.",
+      "sessionKeyHint": "Optional. Gateway-Session-Key angeben; leer lassen für automatische Zuweisung einer isolierten Session."
+    }
   },
   "SettingsPages": {
     "agentsLoading": "Agent-Einstellungen werden geladen...",
@@ -2877,7 +2902,8 @@
       "agentSelector": {
         "noEnabledAgents": "Keine aktivierten Agenten",
         "openAgentsSettings": "Agenten-Einstellungen öffnen",
-        "notInstalled": "Nicht installiert"
+        "notInstalled": "Nicht installiert",
+        "moreAgents": "Weitere Agenten ({count})"
       },
       "subAgentOverlay": {
         "title": "Subagenten",
@@ -3294,7 +3320,8 @@
             "blocked": "blockiert",
             "usageLimited": "Nutzung begrenzt",
             "budgetLimited": "Budget begrenzt",
-            "complete": "abgeschlossen"
+            "complete": "abgeschlossen",
+            "limited": "Limit erreicht"
           }
         },
         "field": {
@@ -3414,7 +3441,8 @@
           "outputMissing": "Codex hat die Skriptausgabe gekürzt und dabei das Trennzeichen dieses Befehls entfernt, sodass ihm keine Ausgabe zugeordnet werden konnte.",
           "sharedWith": "Enthält auch die Ausgabe von {commands} – codex hat deren Trennzeichen abgeschnitten.",
           "truncated": "gekürzt"
-        }
+        },
+        "agentCodexLaunchOnly": "Gestartet. Codex meldet keinen weiteren Fortschritt dieses Sub-Agenten – sein Ergebnis trifft als Nachricht in dieser Unterhaltung ein."
       },
       "messageNav": {
         "title": "Nachrichtennavigation",
@@ -3586,7 +3614,8 @@
       "contextCompaction": {
         "compacting": "Kontext wird komprimiert…",
         "compacted": "Kontext komprimiert",
-        "compactedTokens": "Kontext komprimiert · {before} → {after} Tokens"
+        "compactedTokens": "Kontext komprimiert · {before} → {after} Tokens",
+        "failed": "Kontextkomprimierung fehlgeschlagen"
       },
       "backgroundTasks": {
         "running": "{count, plural, one {# Hintergrundaufgabe läuft} other {# Hintergrundaufgaben laufen}}",
@@ -3678,6 +3707,26 @@
         "revokedToast": "Vertrauen widerrufen – neu verbunden, damit pi die Projektressourcen nicht mehr lädt",
         "trustedNoReconnect": "Projekt vertraut – gilt ab dem nächsten Start von pi",
         "revokedNoReconnect": "Vertrauen widerrufen – gilt ab dem nächsten Start von pi"
+      },
+      "sessionFailure": {
+        "category": {
+          "connection": "Verbindungsproblem",
+          "access": "Zugriffsproblem",
+          "limit": "Limit erreicht",
+          "request": "Anfrage abgelehnt",
+          "service": "Dienstproblem",
+          "unknown": "Sitzungsproblem"
+        },
+        "action": {
+          "retry": "Erneut versuchen",
+          "login": "Anmelden",
+          "newSession": "Neue Sitzung"
+        },
+        "recovered": "Wiederhergestellt",
+        "retryUnavailable": "Keine vorherige Nachricht zum erneuten Senden.",
+        "toggleDetails": "Details umschalten",
+        "dismiss": "Schließen",
+        "moreIncidents": "+{count} weitere"
       }
     },
     "diffPreview": {
@@ -5254,7 +5303,13 @@
     "eventCleanupFailed": "Worktree-Aufräumen fehlgeschlagen",
     "eventResumeFallback": "Sitzungsfortsetzung fehlgeschlagen, neue Sitzung",
     "eventUserAction": "Benutzeraktion",
-    "eventDiffStat": "Änderungs-Snapshot"
+    "eventDiffStat": "Änderungs-Snapshot",
+    "settingsWorktreeRoot": "Worktree-Verzeichnis",
+    "settingsWorktreeRootHint": "Verzeichnis, in dem neue Aufgaben-Worktrees angelegt werden – eines pro Aufgabe. Leer lassen, um sie neben dem Projektordner anzulegen; „~“ ist dein Home-Verzeichnis, ein relativer Pfad gilt relativ zum Projektordner.",
+    "settingsWorktreeRootPlaceholder": "~/codeg-worktrees",
+    "settingsWorktreeRootBrowse": "Worktree-Verzeichnis auswählen",
+    "settingsTabMerge": "Merge",
+    "settingsTabWorktree": "Worktree"
   },
   "TokenUsage": {
     "title": "Token-Verbrauch",
