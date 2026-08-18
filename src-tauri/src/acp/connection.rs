@@ -5466,7 +5466,7 @@ async fn run_connection(
                 } else {
                     None
                 };
-            if let Some(ref injected) = delegate_injection {
+            if delegate_injection.is_some() {
                 let mut s = state.write().await;
                 // Native steering is independent of the MCP companion — set it
                 // even when no codeg-mcp is injected (it's exactly the channel
@@ -11875,6 +11875,7 @@ fn classify_codex_subagent_activity(
 /// tool call from this request that update lands on an unknown id and renders as
 /// an untitled generic tool card, so `handle_permission_request` emits one.
 /// Gated on Codex, mirroring [`classify_codex_subagent_activity`].
+#[allow(dead_code)]
 fn is_codex_plan_review(
     agent_type: AgentType,
     meta: Option<&serde_json::Map<String, serde_json::Value>>,
@@ -11989,6 +11990,7 @@ fn resolve_goal_control(
 /// neutral `_meta.goal` for advertising connections, the legacy
 /// `_meta.codex.goal` otherwise — never both. Pure so the either/or contract
 /// is unit-tested without the connection machinery.
+#[allow(dead_code)]
 fn session_info_goal_value(
     neutral_goal_channel: bool,
     meta: Option<&serde_json::Map<String, serde_json::Value>>,
@@ -12091,6 +12093,7 @@ fn parse_session_failure_record(value: &serde_json::Value) -> Option<SessionFail
 /// `transport_lost` error escalation ONLY here — ignoring this carrier lost
 /// the terminal record entirely, so the turn-boundary settle painted the
 /// still-dead connection as a recovered warning.
+#[allow(dead_code)]
 fn response_session_failure(
     meta: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> Option<SessionFailureRecord> {
@@ -13456,7 +13459,7 @@ async fn emit_conversation_update(
                 || codex_subagent_launch;
             let meta_marks_background =
                 codebuddy_meta_marks_background(agent_type, tc.meta.as_ref());
-            let grok_spawn = grok_meta_marks_spawn_subagent(agent_type, tc.meta.as_ref());
+            let _grok_spawn = grok_meta_marks_spawn_subagent(agent_type, tc.meta.as_ref());
             let meta = tc.meta.map(serde_json::Value::Object);
             raw_output_cache.remove_if_final(&tool_call_id, Some(status.as_str()));
             // Avoid logging titles/payloads below — they can be model-generated
@@ -13654,7 +13657,7 @@ async fn emit_conversation_update(
                 || codex_subagent_launch;
             let meta_marks_background =
                 codebuddy_meta_marks_background(agent_type, tcu.meta.as_ref());
-            let grok_spawn = grok_meta_marks_spawn_subagent(agent_type, tcu.meta.as_ref());
+            let _grok_spawn = grok_meta_marks_spawn_subagent(agent_type, tcu.meta.as_ref());
             let meta = tcu.meta.clone().map(serde_json::Value::Object);
             raw_output_cache.remove_if_final(&tool_call_id, status.as_deref());
             // Re-assert any authoritative title rewrite (see fn doc): an update

@@ -2060,6 +2060,10 @@ impl CodexParser {
         // message ended up carrying it — see `reconcile_turn_usage`.
         let mut recorded_round_usage = TurnUsage::default();
 
+        // Per-turn model + reasoning effort from each `turn_context`.
+        let mut last_turn_context_ts: Option<DateTime<Utc>> = None;
+        let mut turn_context_snaps: Vec<CodexTurnContextSnap> = Vec::new();
+
         let mut first_timestamp: Option<DateTime<Utc>> = None;
         let mut last_timestamp: Option<DateTime<Utc>> = None;
 
@@ -2184,14 +2188,22 @@ impl CodexParser {
                 "turn_context" => {
                     // A new API turn means any prior agent lifecycle is complete.
                     active_agent_count = 0;
+                    let payload = value.get("payload");
+                    let ctx_model = payload
+                        .and_then(|p| p.get("model"))
+                        .and_then(|m| m.as_str())
+                        .map(|s| s.to_string());
+                    let ctx_effort = payload.and_then(codex_turn_context_effort);
                     if model.is_none() {
-                        model = value
-                            .get("payload")
-                            .and_then(|p| p.get("model"))
-                            .and_then(|m| m.as_str())
-                            .map(|s| s.to_string());
+                        model = ctx_model.clone();
                     }
-                    if let Some(ts) = parse_codex_timestamp(&value) {
+                    last_turn_context_ts = parse_codex_timestamp(&value);
+                    turn_context_snaps.push(CodexTurnContextSnap {
+                        ts: last_turn_context_ts.unwrap_or_else(Utc::now),
+                        model: ctx_model,
+                        effort: ctx_effort,
+                    });
+                    if let Some(ts) = last_turn_context_ts {
                         push_turn_start(&mut turn_context_markers, ts);
                     }
                 }
@@ -3502,6 +3514,7 @@ impl CodexParser {
         let folder_name = folder_path.as_ref().map(|p| folder_name_from_path(p));
 
         fold_shell_session_polls(&mut messages, &poll_origins);
+        apply_codex_turn_context_meta(&mut messages, &turn_context_snaps);
         let mut turns = group_into_turns(messages);
         reconcile_turn_usage(&mut turns, &recorded_round_usage);
         super::relocate_orphaned_tool_results(&mut turns);
@@ -4103,6 +4116,64 @@ fn strip_blocked_resource_mentions(input: &str) -> String {
     let text = image_tag_re.replace_all(&text, "").to_string();
     let text = collapsed_ws_re.replace_all(&text, " ").to_string();
     text.trim().to_string()
+}
+
+/// Snapshot of one Codex `turn_context` line (model + reasoning effort).
+struct CodexTurnContextSnap {
+    ts: DateTime<Utc>,
+    model: Option<String>,
+    effort: Option<String>,
+}
+
+fn codex_turn_context_effort(payload: &serde_json::Value) -> Option<String> {
+    let non_empty = |s: &str| {
+        let t = s.trim();
+        (!t.is_empty()).then(|| t.to_string())
+    };
+    payload
+        .get("effort")
+        .and_then(|v| v.as_str())
+        .and_then(non_empty)
+        .or_else(|| {
+            payload
+                .pointer("/collaboration_mode/settings/reasoning_effort")
+                .and_then(|v| v.as_str())
+                .and_then(non_empty)
+        })
+}
+
+/// Stamp model + reasoning effort from `turn_context` onto assistant/tool
+/// messages. Each message inherits the latest context at or before it.
+fn apply_codex_turn_context_meta(
+    messages: &mut [UnifiedMessage],
+    contexts: &[CodexTurnContextSnap],
+) {
+    if contexts.is_empty() {
+        return;
+    }
+    for msg in messages.iter_mut() {
+        if !matches!(msg.role, MessageRole::Assistant | MessageRole::Tool) {
+            continue;
+        }
+        let mut model = None;
+        let mut effort = None;
+        for ctx in contexts {
+            if ctx.ts <= msg.timestamp {
+                if ctx.model.is_some() {
+                    model = ctx.model.clone();
+                }
+                if ctx.effort.is_some() {
+                    effort = ctx.effort.clone();
+                }
+            }
+        }
+        if msg.model.is_none() {
+            msg.model = model;
+        }
+        if msg.reasoning_effort.is_none() {
+            msg.reasoning_effort = effort;
+        }
+    }
 }
 
 /// Group flat messages into conversation turns.

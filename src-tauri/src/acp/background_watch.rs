@@ -179,6 +179,7 @@ impl PromptLedger {
     /// start of a turn — one the wire is already rendering, so it must
     /// classify foreground like any prompt (see the `Steer` arm in
     /// `connection.rs`).
+    #[allow(dead_code)]
     pub(crate) fn record_text(&self, text: &str) {
         self.record_prompt_blocks(&[crate::acp::types::PromptInputBlock::Text {
             text: text.to_string(),
