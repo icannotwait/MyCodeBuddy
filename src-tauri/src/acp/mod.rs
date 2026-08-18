@@ -3,6 +3,7 @@ pub mod background_watch;
 pub mod binary_cache;
 pub mod bundled_agent;
 pub mod chat_authoring;
+pub mod codex_autonomous;
 pub mod codex_catalog_source;
 pub mod codex_cli;
 pub mod codex_goal;

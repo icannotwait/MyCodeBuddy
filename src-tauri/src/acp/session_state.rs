@@ -573,6 +573,10 @@ pub struct SessionState {
     /// Backend-internal routing only: not part of the client snapshot.
     pub neutral_goal_channel: bool,
 
+    /// Initialize-time autonomous policy inputs. `goal_version` is `Some(1)`
+    /// only when `_meta.goal.version == 1` exactly.
+    pub autonomous_caps: crate::acp::autonomous_activity::AutonomousCapabilities,
+
     /// Goal-control request method for this connection. Defaults to codex's
     /// legacy bespoke `_codex/session/goal_control`; overwritten at
     /// initialize when the adapter advertises the provider-neutral goal
@@ -786,6 +790,7 @@ impl SessionState {
             feedback_tool_available: false,
             native_steering_available: false,
             neutral_goal_channel: false,
+            autonomous_caps: crate::acp::autonomous_activity::AutonomousCapabilities::default(),
             goal_control_method: crate::acp::codex_goal::LEGACY_GOAL_CONTROL_METHOD.to_string(),
             goal_actions: None,
             goal_active: false,

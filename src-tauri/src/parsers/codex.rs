@@ -333,6 +333,18 @@ pub(crate) fn codex_goal_turn_id(turn_id: &str) -> String {
     format!("codex-goal-turn-{turn_id}")
 }
 
+/// Parse one rollout file with the same classification as cold detail.
+pub(crate) fn parse_codex_rollout(
+    path: impl AsRef<std::path::Path>,
+    conversation_id: &str,
+) -> Option<(Vec<MessageTurn>, u64)> {
+    let path = path.as_ref().to_path_buf();
+    let detail = CodexParser::new()
+        .parse_conversation_detail(&path, conversation_id)
+        .ok()?;
+    Some((detail.turns, detail.transcript_watermark.unwrap_or(0)))
+}
+
 fn resolve_codex_home_dir_from(
     codex_home_env: Option<std::ffi::OsString>,
     home_dir: Option<PathBuf>,
