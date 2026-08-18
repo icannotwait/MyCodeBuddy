@@ -5,10 +5,12 @@
 Direction approved in conversation on 2026-08-18. This document is the
 implementation specification.
 
-The first release supports only Claude Code and Grok. Every other built-in or
-custom ACP agent remains explicitly unsupported until its autonomous-turn
-behavior has been captured and verified. No implementation plan has been
-approved yet.
+The first release supports Claude Code, Grok, and capability-qualified Codex
+Goal continuations. Every other built-in or custom ACP agent remains explicitly
+unsupported until its autonomous-turn behavior has been captured and verified.
+Codex support is experimental and fails closed unless the running adapter
+advertises Goal extension version 1, `loadSession`, and a matching local rollout
+transcript can be resolved. No implementation plan has been approved yet.
 
 ## Executive Decision
 
@@ -20,6 +22,7 @@ and recovery rules explicit:
 enum AutonomousActivityPolicy {
     ClaudeTranscript,
     GrokIdleWire,
+    CodexGoalTranscript,
     Unsupported,
 }
 ```
@@ -28,6 +31,14 @@ Claude Code keeps its existing transcript-tail watcher. Grok gains an idle ACP
 observer that recognizes the verified background-task callback sequence and
 arms a short-lived `updates.jsonl` tail assembler. The assembler emits complete
 `MessageTurn` upserts through the existing `BackgroundActivity.turns` path.
+
+Codex gains a capability-gated Goal observer. Idle
+`session_info_update._meta.codex.threadStatus` transitions establish autonomous
+cycle ownership and terminal boundaries; the matching native rollout JSONL
+supplies persisted content, provider item/turn identity, replay recovery, and a
+complete-byte watermark. ACP `session/load` is not the retirement authority
+because the verified adapter rewrites live `msg_*` identities to positional
+`item-N` identities during replay.
 
 An autonomous reply is rendered as an independent assistant message with a
 localized `后台续写` marker. The hidden Grok `<system-reminder>` opens the
@@ -79,10 +90,42 @@ Grok idle ACP callback succeeds
 The guard itself is correct. Removing it would revive the older corruption in
 which an idle delta mutates the previous turn's completed `liveMessage`.
 
+### Codex Goal wire probe
+
+A real Windows probe on 2026-08-18 used Codex CLI 0.146.0 and
+`@agentclientprotocol/codex-acp` 1.4.0, session
+`01a014c9-04d4-7b93-9c4a-8f4e270106c2`. It established:
+
+1. the foreground `session/prompt` returned before the Goal continuation;
+2. setting an active Goal produced `threadStatus: active` and later assistant
+   updates while the client was idle;
+3. each observed autonomous cycle ended at `threadStatus: idle`;
+4. Goal status `complete` was not a turn terminal because assistant output
+   continued afterward;
+5. live message/thought updates carried stable Codex `msg_*`/`rs_*` ids;
+6. the native rollout preserved those provider ids and independent
+   `task_started`/`task_complete` turn ids; and
+7. ACP `session/load` recovered the content but rewrote message ids to
+   `item-1`, `item-2`, and so on.
+
+The same rollout persisted Goal-generated synthetic input as
+`<codex_internal_context source="goal">`. Codeg's native Codex parser already
+suppresses text-only internal envelopes; the autonomous adapter and cold parser
+must keep suppressing them and must never classify them by matching the English
+continuation text.
+
+The probe closes trigger, ownership, and terminal questions for Codex Goal
+continuations. It also proves that stock ACP replay alone cannot provide stable
+identity or safe overlay retirement. Codex support therefore requires the
+dedicated wire-plus-rollout policy in this document; it is not a generic ACP
+fallback.
+
 ## Goals
 
 - Surface Grok background-task follow-up turns without requiring a new user
   prompt or a manual reload.
+- Surface capability-qualified Codex Goal continuation cycles after the
+  initiating prompt or Goal-control request has returned.
 - Keep each autonomous continuation independent from the preceding foreground
   assistant reply.
 - Show a visible, localized background-continuation marker on the assistant
@@ -96,20 +139,24 @@ which an idle delta mutates the previous turn's completed `liveMessage`.
 - Make duplicate or replayed provider events idempotent.
 - Hand live overlay content to the authoritative parser without a disappearance
   or duplicate-message race.
-- Recover Grok content from `updates.jsonl` after a missed wire update,
-  reconnect, application reload, or process restart.
+- Recover Grok content from `updates.jsonl` and Codex Goal continuations from
+  native rollout JSONL after a missed wire update, reconnect, application
+  reload, or process restart.
 - Prevent active background work from being reaped by the idle connection
   sweeps.
 - Keep memory, transcript work, tool output, and stale episode lifetime bounded.
 
 ## Non-Goals
 
-- Generic autonomous-turn support for Codex, Cursor, OpenCode, Gemini, Cline,
-  Hermes, CodeBuddy, Kimi, Pi, DeepSeek, or custom ACP agents.
+- Generic autonomous-turn support for Cursor, OpenCode, Gemini, Cline, Hermes,
+  CodeBuddy, Kimi, Pi, DeepSeek, or custom ACP agents.
+- Codex autonomous support outside a negotiated Goal extension v1 session,
+  including inferring a parent continuation from subagent activity alone.
 - Inferring support because another agent happens to emit a similarly named
   update.
-- Changing the ACP protocol or requiring an upstream Grok change.
-- Rendering the hidden trigger or its raw `<system-reminder>` body.
+- Changing the ACP protocol or requiring an upstream Grok/Codex change.
+- Rendering the Grok hidden trigger, its raw `<system-reminder>` body, or Codex
+  Goal internal context.
 - Treating an autonomous episode as a Codeg-owned prompt or setting
   `turn_in_flight` for it.
 - Writing synthetic autonomous turns to the Codeg database.
@@ -117,9 +164,9 @@ which an idle delta mutates the previous turn's completed `liveMessage`.
 - Replacing the normal foreground streaming path.
 - Patching Grok's background launch cards from `task_completed` snapshots. The
   existing tool stream and output-poll cards remain authoritative in V1.
-- Guaranteeing live overlay streaming when Grok has not yet persisted the
-  corresponding records. Cold-load correctness takes priority over displaying
-  unconfirmed wire content.
+- Guaranteeing live overlay streaming when Grok or Codex has not yet persisted
+  the corresponding records. Cold-load correctness takes priority over
+  displaying unconfirmed wire content.
 
 ## Terminology
 
@@ -133,10 +180,15 @@ automation and agent-initiated work are other possible origins.
 **Hidden trigger** means an agent-authored user-shaped record that wakes the
 model but is marked not to appear in scrollback. For the verified Grok path it
 is a `user_message_chunk` with `_meta.hideFromScrollback == true` and a
-background-task reminder body.
+background-task reminder body. Codex Goal continuation input is also hidden,
+but is recognized structurally from the rollout's
+`<codex_internal_context source="goal">` envelope and owning native turn, never
+from its natural-language body.
 
-**Episode** means one hidden trigger and the assistant/thinking/tool updates it
-causes, ending at the matching `turn_completed`.
+**Episode** means one autonomous provider cycle and the
+assistant/thinking/tool updates it causes. Grok ends at the matching
+`turn_completed`; Codex ends at the `threadStatus: idle` that follows an
+idle-owned `threadStatus: active` cycle.
 
 **Overlay** means temporary `MessageTurn` data held in
 `conversation-runtime-store.backgroundTurns` until a detail parse has consumed
@@ -144,8 +196,9 @@ the same transcript bytes.
 
 **Transcript watermark** means the count of complete bytes consumed from the
 provider's authoritative session transcript. For Claude this is the Claude
-JSONL file; for Grok it is `updates.jsonl`. It is never an ACP sequence number,
-event count, timestamp, file mtime, or Codeg event sequence.
+JSONL file; for Grok it is `updates.jsonl`; for Codex it is the native rollout
+JSONL. It is never an ACP sequence number, event count, timestamp, file mtime,
+or Codeg event sequence.
 
 ## Core Invariants
 
@@ -160,11 +213,13 @@ event count, timestamp, file mtime, or Codeg event sequence.
 8. A transcript read may delay display, but it must not invent or lose content.
 9. Autonomous work does not claim a Codeg prompt generation and does not emit a
    foreground `TurnComplete`.
-10. A user prompt is never sent concurrently with an open Grok autonomous
-    episode.
+10. A user prompt is never sent concurrently with an open Grok or Codex
+    autonomous episode.
 11. Claude behavior remains unchanged except for normalized origin metadata and
     provider-neutral naming.
-12. Unsupported providers stay unsupported even when their event JSON looks
+12. Codex Goal status is metadata, not an episode terminal; only the matching
+    idle thread status closes the cycle.
+13. Unsupported providers stay unsupported even when their event JSON looks
     superficially similar.
 
 ## Selected Architecture
@@ -176,10 +231,12 @@ does not contain provider heuristics. Conceptually:
 
 ```rust
 impl AutonomousActivityPolicy {
-    fn for_agent(agent: AgentType) -> Self {
+    fn for_connection(agent: AgentType, caps: &AutonomousCapabilities) -> Self {
         match agent {
             AgentType::ClaudeCode => Self::ClaudeTranscript,
             AgentType::Grok => Self::GrokIdleWire,
+            AgentType::Codex if caps.goal_version == Some(1)
+                && caps.load_session => Self::CodexGoalTranscript,
             _ => Self::Unsupported,
         }
     }
@@ -192,12 +249,16 @@ adapter:
 - `ClaudeTranscript`: spawn the existing connection-scoped watcher.
 - `GrokIdleWire`: create an idle-wire observer plus a dormant transcript tail
   state.
+- `CodexGoalTranscript`: create an idle Goal-cycle observer plus a dormant
+  native rollout tail state; fail closed if the session's matching rollout
+  cannot be resolved.
 - `Unsupported`: create no observer, watcher, or heuristic fallback.
 
 The coordinator exposes narrow hooks rather than taking over the connection
 loop:
 
 ```text
+on_initialized(capabilities)
 on_session_ready(session_id, cwd)
 on_foreground_started()
 on_dispatch(raw_dispatch, ownership = foreground | idle)
@@ -206,10 +267,12 @@ on_disconnect()
 ```
 
 Claude uses the foreground hooks for its existing prompt ledger and held-turn
-suppression. Grok uses them to arm/rebaseline its transcript cursor and to make
-the idle/foreground ownership boundary explicit. Grok may observe task lifecycle
-records under either ownership for accounting, but it may open an autonomous
-episode only under `idle` ownership.
+suppression. Grok and Codex use them to arm/rebaseline their transcript cursors
+and to make the idle/foreground ownership boundary explicit. Grok may observe
+task lifecycle records under either ownership for accounting, but it may open
+an autonomous episode only under `idle` ownership. Codex may observe Goal cards
+under either ownership, but only an idle-owned `threadStatus: active` transition
+opens a Goal continuation episode.
 
 ### Why Grok is wire-triggered but transcript-backed
 
@@ -232,6 +295,27 @@ the responsibilities remain separate:
 - the accumulator converts persisted records into `MessageTurn` blocks; and
 - the normal Grok parser remains the cold-load authority for the full session.
 
+### Why Codex is Goal-wire-triggered but rollout-backed
+
+The verified Codex ACP stream provides three facts the native transcript alone
+cannot safely infer in real time: Goal v1 was negotiated, no Codeg prompt owns
+the updates, and `threadStatus: active -> idle` delimits one autonomous cycle.
+The native rollout provides what ACP replay does not: original item ids, native
+turn ids, exact persisted records, and a byte-coverage authority.
+
+The Codex adapter therefore buffers wire identity/order hints but emits only
+after the rollout tail has consumed the matching native records. Live
+`messageId`/tool ids are used to correlate wire updates with rollout
+`response_item` ids. The canonical `MessageTurn.id` is derived from the native
+`task_started.turn_id`; block identities come from the persisted `msg_*`,
+`rs_*`, call, and tool ids. The cold parser uses the same identities instead of
+its current positional `turn-N` ids for these recognized Goal cycles.
+
+The adapter does not use ACP `session/load` output for reconciliation: the
+captured adapter rewrites replay ids. `loadSession` remains a capability gate
+because reconnect/cold-load support is required, while Codeg's native parser is
+the content and watermark authority.
+
 ### Module boundary
 
 The intended boundary is:
@@ -251,10 +335,21 @@ acp/grok_autonomous.rs
   episode state machine
   event-triggered updates.jsonl tailing
 
+acp/codex_autonomous.rs
+  CodexGoalTranscript capability gate and idle thread-status observer
+  Goal-cycle episode state machine
+  event-triggered native rollout tailing
+
 parsers/grok.rs
   shared persisted-record scanner/assembler
   transcript watermark
   cold-load origin recovery
+
+parsers/codex.rs
+  shared complete-record rollout scanner
+  provider item/turn identity
+  transcript watermark
+  Goal internal-context suppression and cold-load origin recovery
 ```
 
 Provider-specific parsing must not move into the common coordinator.
@@ -267,7 +362,7 @@ The initial policy table is closed:
 | --- | --- | --- | --- | --- |
 | Claude Code | `ClaudeTranscript` | prompt ledger + Claude transcript | Claude transcript | supported |
 | Grok | `GrokIdleWire` | idle ACP sequence | Grok `updates.jsonl` tail | supported |
-| Codex | `Unsupported` | none | none | unsupported |
+| Codex | `CodexGoalTranscript` | negotiated Goal v1 + idle `threadStatus` | native rollout JSONL | experimental supported |
 | Cursor | `Unsupported` | none | none | unsupported |
 | OpenCode | `Unsupported` | none | none | unsupported |
 | Gemini | `Unsupported` | none | none | unsupported |
@@ -279,7 +374,16 @@ The initial policy table is closed:
 | DeepSeek | `Unsupported` | none | none | unsupported |
 | Custom ACP | `Unsupported` | none | none | unsupported |
 
-Adding a provider later requires captured fixtures proving its trigger,
+Codex selects `CodexGoalTranscript` only when the running process advertises
+`_meta.goal.version == 1` and `loadSession == true`. Session readiness attempts
+to discover exactly one rollout whose `session_meta.payload.id` equals the ACP
+session id. A not-yet-created file leaves the policy provisionally armed; an
+idle opening signal starts a 30-second retry window. No overlay is emitted
+before authority resolves. Missing capability, ambiguous rollout, discovery
+timeout, or an unrecognized thread-status shape downgrades that connection to
+`Unsupported`; agent type alone is insufficient.
+
+Adding another provider later requires captured fixtures proving its trigger,
 foreground/idle distinction, terminal boundary, replay identity, transcript or
 other recovery authority, and safe overlay retirement. It must add a new
 explicit policy variant or a reviewed mapping to an existing verified adapter.
@@ -363,7 +467,102 @@ episode classified only by the live prompt ledger and not reconstructible after
 a cold parse, the parser leaves origin absent rather than inventing ownership;
 this limitation does not apply to the background-task continuation in scope.
 
-No Grok logic enters `background_watch.rs`.
+No Grok or Codex logic enters `background_watch.rs`.
+
+## Codex Goal Transcript Adapter
+
+### Capability and authority gate
+
+Codex support is enabled per connection, not per installed agent label. All of
+these must hold:
+
+- the agent is the built-in `AgentType::Codex`;
+- initialize advertises `_meta.goal.version == 1`;
+- initialize advertises `loadSession == true`;
+- Codeg accepts only the advertised Goal control method and action vocabulary;
+- after session new/load, authority discovery can resolve exactly one native
+  rollout by matching `session_meta.payload.id` to the ACP session id within 30
+  seconds of an autonomous opening signal; and
+- the rollout is a regular file that can be scanned using the same Codex home
+  resolution as `CodexParser`.
+
+The adapter is not enabled for a custom agent named `codex`, for an older Codex
+ACP that does not advertise Goal v1, or merely because
+`session_info_update._meta.codex.threadStatus` appears. If rollout resolution
+fails after provisional policy selection, the connection downgrades to
+`Unsupported` for autonomous rendering while normal prompting and Goal cards
+continue to work.
+
+### Recognized cycle
+
+V1 recognizes this verified sequence while no Codeg `session/prompt` owns the
+session:
+
+```text
+session_info_update(_meta.goal.status = active)
+session_info_update(_meta.codex.threadStatus.type = active)
+agent thought/message/tool updates carrying provider ids
+optional session_info_update(_meta.goal.status = non-active)
+more agent thought/message/tool updates
+session_info_update(_meta.codex.threadStatus.type = idle)
+```
+
+The Goal-control request may still be awaiting its JSON-RPC response; that does
+not make the cycle foreground because it is not a Codeg `session/prompt` and
+does not own `liveMessage`. A later `active -> idle` pair under the same Goal is
+a second autonomous episode with a distinct native turn id.
+
+An idle `threadStatus: active` opens an episode only if Goal v1 was negotiated
+and an active Goal was observed for the session. `threadStatus: active` during a
+Codeg prompt belongs to the foreground prompt. Goal status `complete`,
+`blocked`, or `limited` updates the Goal card but never closes an already-open
+episode; the verified fixture emitted final assistant content after `complete`.
+
+### Rollout correlation and assembly
+
+On `threadStatus: active`, the adapter arms the native rollout tail at the last
+complete-byte baseline. It scans complete JSONL records until it finds the new
+native `event_msg.task_started.turn_id` and that turn's structurally tagged
+`<codex_internal_context source="goal">` input. That internal input is a trigger
+and ownership proof only; it creates no user turn or content block.
+
+The assembler consumes persisted response items belonging to the native turn:
+
+- `response_item.message.id` supplies stable `msg_*` identity;
+- reasoning response ids supply stable `rs_*` identity;
+- function/tool call ids retain their provider identity;
+- `task_started.turn_id` derives the canonical autonomous `MessageTurn.id`; and
+- `task_complete.turn_id` confirms that the persisted cycle reached its native
+  terminal record.
+
+Live ACP message/tool ids are correlation hints. A whole-turn
+`BackgroundActivity` upsert is emitted only after the matching rollout records
+have been consumed, and its watermark is the committed complete-byte offset.
+This avoids trusting ACP `session/load`'s positional `item-N` replay ids and
+prevents an unpersisted wire delta from becoming an overlay that history cannot
+cover.
+
+The scanner and full Codex parser share record classification and canonical id
+derivation. Existing non-Goal Codex turns may keep their current positional ids
+in V1; a structurally proven Goal continuation must use the native turn-derived
+id in both live assembly and cold parse.
+
+### Terminal behavior
+
+An idle `threadStatus: idle` closes the wire episode. Before the final upsert,
+the adapter tails through the matching persisted `task_complete` when available.
+It then emits the latest assembled turn and watermark, tombstones the native
+turn id, releases a queued Codeg prompt, and schedules a detail refetch.
+
+If wire idle arrives before rollout `task_complete`, the episode enters
+`AwaitingPersistence`: no terminal watermark is fabricated, retries continue
+within the bounded lifetime, and the overlay remains until parser coverage is
+proven. A missing wire idle may be recovered from a persisted `task_complete`
+only when the same Goal-owned native turn has already been structurally proven;
+the parser does not classify arbitrary Codex tasks as autonomous.
+
+No Codex Goal cycle calls foreground terminal handling, settles a prompt
+generation, or emits a foreground `TurnComplete`.
 
 ## Grok Idle-Wire Adapter
 
@@ -544,10 +743,18 @@ one authoritative parser, and the policy adapter guarantees that the watermark
 and `ConversationDetail.transcript_watermark` refer to that agent's same
 transcript source.
 
+`outstanding` becomes a provider-neutral autonomous keepalive count. Claude and
+Grok retain unresolved background-task counting. A qualified Codex connection
+contributes one unit while its Goal is active or a Goal episode remains open,
+then returns to zero only after the Goal is non-active and the episode closes.
+Codex sends an empty `settled` list, so this keepalive unit does not create a
+task-result card or settlement notification.
+
 For Claude, `watermark` keeps its current meaning. For Grok, it is the complete
-byte count consumed from `updates.jsonl`. ACP event sequence numbers, Grok
-`eventId`, `promptIndex`, task ids, and episode counters are never written into
-this field.
+byte count consumed from `updates.jsonl`. For Codex, it is the complete byte
+count consumed from the matching native rollout JSONL. ACP event sequence
+numbers, provider message ids, Grok `eventId`/`promptIndex`, task ids, and
+episode counters are never written into this field.
 
 An accounting-only event (`turns` is empty) carries the adapter's latest
 confirmed transcript offset. That offset is not attached to an overlay entry
@@ -558,12 +765,13 @@ instead of fabricating a content watermark.
 
 `ConversationDetail.transcript_watermark` keeps its optional type but its
 documentation changes from “Claude only” to “available for transcript-backed
-autonomous overlay providers.” Grok begins returning `Some(consumed_bytes)`.
+autonomous overlay providers.” Grok and Codex begin returning
+`Some(consumed_bytes)` for their authoritative transcript file.
 
 No database entity changes. `MessageTurn` remains parser/event data serialized
 over the existing Tauri or HTTP transport.
 
-## Grok Watermark and Overlay Retirement
+## Transcript Watermarks and Overlay Retirement
 
 This handoff is the correctness boundary.
 
@@ -603,6 +811,22 @@ If the transcript cannot be found or lags the wire:
 
 This may delay live display under filesystem failure, but it cannot cause the
 overlay to disappear before history contains it.
+
+Codex uses the same coverage rule against its native rollout:
+
+```text
+idle threadStatus active identifies a Goal cycle
+  -> rollout tailer finds task_started turn T + source="goal" context
+  -> tailer parses persisted response items through byte W
+  -> BackgroundActivity(turn id=codex-goal-turn-T, watermark=W)
+  -> frontend upserts overlay T@W
+  -> Codex detail parser later consumes the rollout through byte D
+  -> retire T only when D >= W
+```
+
+ACP `session/load` content and its `item-N` ids do not participate in this
+comparison. Stable native ids deduplicate display; only rollout byte coverage
+retires the overlay.
 
 ## Detailed Data Flow
 
@@ -652,6 +876,40 @@ Grok turn_completed while episode is open
   -> release queued Codeg prompt
   -> refetch detail
   -> Grok parser returns same turn + covering transcript watermark
+  -> overlay retires without flicker or duplication
+```
+
+### Codex
+
+```text
+initialize advertises Goal v1 + loadSession
+  -> resolve rollout by exact ACP/native session id
+  -> establish complete-byte baseline
+
+Goal active + idle threadStatus active
+  -> open one Codex Goal episode
+  -> arm rollout tail
+
+rollout task_started + source="goal" internal context
+  -> bind native turn id
+  -> suppress internal user-shaped input
+
+Codex thought/message/tool updates
+  -> correlate live provider ids with persisted response items
+  -> rebuild the native turn from complete rollout records
+  -> BackgroundActivity(same native turn id, whole-turn upsert, byte watermark)
+
+Goal status complete while episode is open
+  -> update Goal card only
+  -> keep the episode open
+
+idle threadStatus idle
+  -> tail through matching task_complete when available
+  -> emit final upsert
+  -> close/tombstone episode
+  -> release queued Codeg prompt
+  -> refetch detail
+  -> Codex parser returns the same native turn id + covering rollout watermark
   -> overlay retires without flicker or duplication
 ```
 
@@ -709,17 +967,59 @@ Closed
 the hidden trigger was classified. The active prompt path owns those updates;
 the adapter does not create an overlay copy.
 
+### Codex Goal autonomous episode
+
+```text
+Dormant
+  -- active Goal + threadStatus active while idle --> Opening
+
+Opening
+  -- matching rollout task_started + source=goal --> Open
+  -- foreground turn wins race ------------------> SuppressedForeground
+  -- rollout not created yet --------------------> AwaitingAuthority
+  -- ambiguous rollout --------------------------> UnsupportedForConnection
+  -- stale timeout ------------------------------> Abandoned
+
+AwaitingAuthority
+  -- exact rollout appears ----------------------> Open
+  -- discovery timeout --------------------------> UnsupportedForConnection
+
+Open
+  -- persisted native update --------------------> Open + whole-turn upsert
+  -- Goal terminal status -----------------------> Open, Goal card only
+  -- duplicate/replay ---------------------------> Open, no duplicate block
+  -- threadStatus idle --------------------------> AwaitingPersistedTerminal
+  -- stale timeout ------------------------------> Abandoned
+
+AwaitingPersistedTerminal
+  -- matching task_complete consumed ------------> Closed + final upsert/refetch
+  -- parser covers latest emitted watermark -----> Closed + overlay retirement
+  -- stale timeout ------------------------------> ClosedDegraded + refetch
+
+Closed
+  -- next idle threadStatus active under Goal ---> Opening, new native turn id
+  -- replay for tombstoned native turn ----------> ignored
+  -- tombstone TTL ------------------------------> Dormant storage reclaimed
+```
+
+`UnsupportedForConnection` affects only autonomous rendering. It does not
+disable normal Codex prompting, Goal control, or Goal-card updates. An active
+Goal counts as background keepalive work until it reaches a non-active status
+and no episode remains open, preventing the connection from being swept between
+closely spaced autonomous cycles.
+
 ### Prompt concurrency
 
-The connection loop is the serialization authority. Once an idle hidden trigger
-opens an episode, the normal prompt receive branch is gated while
-`autonomous_busy == true`; control-lane cancellation/disconnect and necessary
-permission handling remain available. A queued prompt stays in the existing
-bounded channel and is read only after the autonomous terminal or stale close.
+The connection loop is the serialization authority. Once an idle Grok trigger
+or Codex thread-status transition opens an episode, the normal prompt receive
+branch is gated while `autonomous_busy == true`; control-lane
+cancellation/disconnect, Codex Goal update/clear, and necessary permission
+handling remain available. A queued prompt stays in the existing bounded
+channel and is read only after the autonomous terminal or stale close.
 
-This prevents two requests from sharing one Grok session without pretending the
-autonomous episode is a Codeg prompt. It does not set `turn_in_flight`, allocate
-a prompt generation, create an optimistic user turn, or emit
+This prevents two requests from sharing one provider session without pretending
+the autonomous episode is a Codeg prompt. It does not set `turn_in_flight`,
+allocate a prompt generation, create an optimistic user turn, or emit
 `StatusChanged(prompting)`.
 
 If the prompt command wins the single-threaded select before the hidden trigger,
@@ -735,6 +1035,10 @@ Use provider `eventId` when present. For standard records without an event id,
 the adapter uses the ordered transcript occurrence after the episode's trigger
 offset. A bounded LRU remembers processed identities. Replaying the same hidden
 trigger, content record, tool update, or terminal cannot append twice.
+
+Codex prefers native `task_started.turn_id`, `response_item.id`, call id, and
+tool id. ACP live ids may correlate records but ACP replay's generated `item-N`
+ids are never admitted into the canonical identity set.
 
 ### Incremental tool updates
 
@@ -777,15 +1081,16 @@ already-verified Grok idle stream; it never searches an arbitrary old task.
 
 ### Transcript truncation or replacement
 
-If `updates.jsonl` shrinks below the committed cursor or its file identity
-changes, the tailer discards partial state, runs a detail refetch, and re-arms
-from the new parser watermark. It does not compare offsets across two file
-generations.
+If `updates.jsonl` or a Codex rollout shrinks below the committed cursor, or its
+file identity changes, the tailer discards partial state, runs a detail refetch,
+and re-arms from the new parser watermark. It does not compare offsets across
+two file generations. A replacement Codex rollout must also re-prove the exact
+native session id before the policy can resume.
 
 ## Disconnect, Reattach, and Cold-Load Recovery
 
-The authoritative recovery source is Grok's transcript, not the in-memory wire
-observer.
+The authoritative recovery sources are Grok's transcript and Codex's native
+rollout, not their in-memory wire observers or ACP replay ids.
 
 The Grok full parse tracks enough non-rendered control state to identify:
 
@@ -814,6 +1119,26 @@ parser's watermark and recovered task/episode index. If an autonomous episode
 is already open, subsequent upserts reuse its canonical id. It does not replay
 the whole session into the overlay.
 
+The Codex full parse tracks native `task_started`/`task_complete` boundaries,
+the owning turn id, provider response ids, and structurally tagged Goal internal
+context. On a cold detail load it:
+
+1. suppresses `<codex_internal_context source="goal">` and every other
+   text-only internal user envelope;
+2. marks only the structurally owned native turn as `agent_autonomous`;
+3. derives the canonical autonomous id from `task_started.turn_id`;
+4. internally retains provider ids for message, reasoning, call, and tool
+   records for correlation and deduplication;
+5. returns partial content if the matching `task_complete` has not appeared;
+   and
+6. returns the complete-byte rollout watermark.
+
+ACP `session/load` replay is treated as bootstrap display data, never as a new
+idle episode. After load, the native parser supplies canonical history. If the
+loaded session advertises an active Goal and subsequently emits an idle-owned
+`threadStatus: active`, the live adapter opens or reattaches using the parser's
+watermark and native turn index.
+
 An explicit disconnect retains current semantics: the CLI may terminate and
 background work may die. A window detach/reload that leaves the backend
 connection alive does not discard task accounting. If the process itself
@@ -827,6 +1152,12 @@ The adapter fails closed for classification and fails recoverably for display.
 These conditions create no autonomous overlay until a transcript parse can
 prove content:
 
+- missing Goal v1 or `loadSession` capability for Codex;
+- missing, unreadable, or ambiguous Codex rollout;
+- Codex rollout session id differing from the ACP session id;
+- idle Codex thread status without an active Goal;
+- missing/malformed Codex `source="goal"` structural context;
+- live Codex ids that cannot be reconciled to one native turn;
 - missing or unreadable Grok session directory;
 - missing `updates.jsonl`;
 - hidden chunk without the verified background-task shape;
@@ -842,6 +1173,7 @@ refetch, and a later reconnect/cold load can recover persisted content.
 Bounds for V1:
 
 - at most one open Grok autonomous episode per connection;
+- at most one open Codex autonomous episode per connection;
 - at most 16 awaiting-persistence/tombstoned episodes;
 - at most 64 running or recently settled task ids;
 - at most 1,024 remembered provider record identities;
@@ -850,6 +1182,8 @@ Bounds for V1:
 - use the existing per-block text/tool-output truncation limits;
 - cap total retained episode payload to 2 MiB after normalization;
 - retry immediately on a wire update and at one-second cadence while active;
+- retry Codex rollout authority discovery for at most 30 seconds after an idle
+  opening signal;
 - expire inactive task/episode state using
   `background_keepalive_max_age()` (default 3,600 seconds, existing environment
   override); and
@@ -911,6 +1245,12 @@ not create a new task-result card from `task_snapshot`. The visible assistant
 continuation is the primary user-facing completion signal. Adding Grok OS
 settlement notifications is a separate product decision.
 
+Codex Goal cards keep their existing create/update rendering. Goal status and
+the autonomous message marker may appear independently because Goal completion
+is not the cycle terminal. Codex V1 does not synthesize a background-task card
+or settlement notification from a Goal cycle; its one outstanding keepalive
+unit may still drive the existing active-background indicator.
+
 ## Compatibility and Migration
 
 - `autonomous_origin` is optional and omitted for all existing/unclassified
@@ -918,12 +1258,17 @@ settlement notifications is a separate product decision.
 - No SQLite migration or stored-row rewrite is required.
 - Normal Grok positional ids remain unchanged; only newly recognized autonomous
   turns use canonical episode ids.
+- Normal Codex positional ids remain unchanged in V1; structurally recognized
+  Goal continuation turns use native turn-derived ids in live and cold paths.
 - The Tauri and server transports serialize the same added optional field.
 - Claude's event type and frontend overlay action remain compatible.
-- Grok starts supplying `ConversationDetail.transcript_watermark`; consumers
-  already accept the field as optional.
-- Older session transcripts with no recognizable hidden trigger render exactly
-  as before.
+- Grok and Codex start supplying `ConversationDetail.transcript_watermark`;
+  consumers already accept the field as optional.
+- Older session transcripts with no recognizable Grok hidden trigger or Codex
+  Goal context render exactly as before.
+- Codex connections that fail capability or transcript-authority gates retain
+  normal foreground behavior and explicitly downgrade autonomous handling to
+  `Unsupported`.
 - Unsupported agents continue to have idle streaming dropped by the frontend
   guard. This is an explicit limitation, not an implicit promise of support.
 
@@ -957,10 +1302,10 @@ out-of-turn rendering.” This avoids claiming unsupported providers are covered
 
 - Hidden reminder text is used only for exact local classification and is
   discarded before event construction.
-- The reminder is not rendered, copied, logged, persisted by Codeg, or sent in
-  metrics.
-- Grok transcripts are read locally with the same user permissions as existing
-  conversation parsing.
+- Grok reminder text and Codex Goal internal context are not rendered, copied,
+  logged, persisted by Codeg, or sent in metrics.
+- Grok and Codex transcripts are read locally with the same user permissions as
+  existing conversation parsing.
 - No transcript file is modified, copied, checkpointed, or migrated.
 - Task snapshot command/output is not promoted into `BackgroundSettledInfo` in
   V1.
@@ -977,8 +1322,55 @@ out-of-turn rendering.” This avoids claiming unsupported providers are covered
 
 - Claude maps to `ClaudeTranscript`.
 - Grok maps to `GrokIdleWire`.
-- Every other built-in and a custom agent map to `Unsupported`.
+- Codex with Goal v1 and `loadSession` maps provisionally to
+  `CodexGoalTranscript` and remains enabled only after exact rollout resolution.
+- Codex missing either advertised capability maps to `Unsupported`.
+- A custom agent named `codex`, Cursor, every other built-in, and a custom agent
+  map to `Unsupported`.
 - No unsupported agent starts a watcher or observer.
+
+### Codex parser/scanner tests
+
+- returns the exact complete-byte rollout watermark;
+- does not count a trailing partial line until it is completed;
+- resolves a rollout only when `session_meta.payload.id` exactly matches the ACP
+  session id;
+- rejects missing, duplicate, and mismatched rollout authorities;
+- recognizes native `task_started`/`task_complete` turn boundaries;
+- recognizes Goal ownership from structured `source="goal"` context without
+  matching the continuation sentence;
+- suppresses every Goal internal context from user turns, DOM-facing content,
+  and title extraction;
+- assigns a native turn-derived id and `agent_autonomous` origin to a proven
+  Goal continuation;
+- internally preserves provider message/reasoning/call/tool identities for
+  correlation and deduplication;
+- returns an incomplete autonomous turn before `task_complete`;
+- repeated parses derive the same autonomous id and blocks; and
+- normal non-Goal Codex turn ids/content snapshots remain unchanged.
+
+### Codex observer/state-machine tests
+
+- provisional policy selection requires Goal v1 plus `loadSession`, and episode
+  activation additionally requires one exact rollout;
+- Goal active alone creates no assistant episode;
+- idle `threadStatus: active` under an active Goal opens one episode;
+- foreground `threadStatus: active` does not create an overlay copy;
+- a Goal-control request awaiting response does not make the episode foreground;
+- each later idle `active -> idle` cycle receives a distinct native turn id;
+- Goal status `complete` does not close the current episode;
+- thought/message/tool updates upsert one stable native turn;
+- ACP live `msg_*` ids correlate with rollout ids while replay `item-N` ids are
+  ignored for canonical identity;
+- `threadStatus: idle` closes the wire episode;
+- wire idle before native `task_complete` enters `AwaitingPersistence`;
+- duplicate thread statuses and replayed provider ids are idempotent;
+- a queued Codeg prompt is not sent until the open cycle closes;
+- an active Goal exempts the connection from idle sweep between cycles;
+- terminal Goal status plus no open cycle releases keepalive;
+- an ambiguous/replaced rollout or a missing rollout after the 30-second
+  authority window downgrades autonomous handling only; and
+- stale state releases prompt gating and keepalive.
 
 ### Grok parser/scanner tests
 
@@ -1024,7 +1416,10 @@ out-of-turn rendering.” This avoids claiming unsupported providers are covered
 - file-before-wire consumes already-appended records after the baseline;
 - a detail watermark behind an overlay keeps the overlay;
 - an equal or greater Grok watermark retires it;
+- an equal or greater Codex rollout watermark retires its overlay;
 - an unrelated ACP sequence value can never retire an overlay;
+- ACP `session/load` replay completion and positional `item-N` ids can never
+  retire a Codex overlay;
 - detail and overlay versions with the same autonomous id render once, with the
   newer overlay version winning until retirement;
 - a refetch between two incremental upserts cannot erase the later content;
@@ -1045,7 +1440,7 @@ out-of-turn rendering.” This avoids claiming unsupported providers are covered
 
 - out-of-turn streaming still does not mutate `liveMessage`;
 - `background_activity` upserts by stable turn id;
-- Grok overlay retirement uses its detail watermark;
+- Grok and Codex overlay retirement use their own detail watermarks;
 - an autonomous assistant renders `后台续写` in Chinese and the localized
   equivalent in another locale;
 - the hidden reminder text is absent from DOM and copy output;
@@ -1072,6 +1467,29 @@ Assert that no foreground `TurnComplete` is emitted, one marked assistant turn
 is incrementally upserted, the final refetch is requested, and the parser
 watermark retires the overlay.
 
+Add a captured, redacted Codex Goal fixture from Codex CLI 0.146.0 and
+`codex-acp` 1.4.0 containing two autonomous cycles:
+
+```text
+foreground prompt terminal
+Goal active
+idle threadStatus active
+native task_started + source="goal" context
+thought/message updates with rs_*/msg_* ids
+idle threadStatus idle + native task_complete
+idle threadStatus active
+Goal complete
+more thought/message updates
+idle threadStatus idle + native task_complete
+session/load replay using item-N ids
+```
+
+Drive the wire sequence and temporary rollout through the adapter. Assert that
+two independent `agent_autonomous` turns are emitted, Goal completion does not
+truncate the second turn, native ids remain stable after cold parse, internal
+context never renders, ACP replay ids are ignored, and rollout watermarks retire
+both overlays.
+
 Run the narrow Rust and Vitest targets first, then the repository-prescribed
 desktop/server checks and frontend lint/build appropriate to the final changed
 surface.
@@ -1084,12 +1502,17 @@ surface.
    regression suite.
 3. Land Grok cold-parse origin recovery and watermark support.
 4. Enable the Grok idle observer/tailer for the exact verified sequence.
-5. Land frontend marker, grouping boundary, same-id display dedupe, and
+5. Land Codex complete-record scanning, native Goal-turn ids, cold-parse origin
+   recovery, and rollout watermark support without enabling the observer.
+6. Add capability-qualified `CodexGoalTranscript`, enable its thread-status
+   observer/tailer only for the captured Goal v1 sequence, and verify downgrade
+   behavior.
+7. Land frontend marker, grouping boundary, same-id display dedupe, and
    localized strings.
-6. Exercise the redacted session-3806 integration fixture and a real local
-   background task on Windows.
-7. Watch failure-class counters and sampled logs for unsupported Grok shapes
-   before considering more origins or providers.
+8. Exercise the redacted Grok session-3806 and Codex Goal integration fixtures,
+   then run one real local flow for each on Windows.
+9. Watch failure-class counters and sampled logs for unsupported Grok/Codex
+   shapes before considering more origins or providers.
 
 There is no broad “all ACP agents” switch. The capability policy is the rollout
 gate. A future provider is added only after its fixtures and retirement authority
@@ -1117,10 +1540,23 @@ are known.
   attach content to the preceding foreground turn.
 - Grok background task accounting exempts genuinely running work from idle
   sweeps and expires stale work within the configured bound.
+- A capability-qualified Codex Goal produces an independent marked assistant
+  message after the initiating foreground prompt has returned.
+- Every idle Codex `threadStatus: active -> idle` cycle maps to one native
+  turn-derived id; Goal status changes never truncate that turn.
+- Codex Goal internal context is absent from user turns, titles, DOM, copy
+  output, events, diagnostics, and metrics.
+- Codex live upserts and cold parse use the same native turn/provider ids;
+  ACP replay `item-N` ids never replace them.
+- Codex overlay content remains until the detail parser covers the same rollout
+  bytes, and reconnect/cold load recovers the continuation and marker.
+- A Codex connection missing Goal v1, `loadSession`, or one exact native rollout
+  remains fully usable for foreground prompts but emits no autonomous overlay.
 - Claude's existing background tasks, cron/loop turns, settlement cards,
   notifications, and watermark handoff do not regress.
-- Codex, Cursor, and every other ACP agent remain explicitly unsupported rather
-  than being handled by unverified heuristics.
+- Cursor and every other unverified ACP agent remain explicitly unsupported;
+  `cursor/task` may update accounting/cards but cannot create a parent
+  autonomous assistant turn.
 - No Codeg database migration is introduced.
 
 ## File-Level Impact
@@ -1131,20 +1567,26 @@ Expected implementation surface:
   lifecycle contract.
 - `src-tauri/src/acp/grok_autonomous.rs` (new): Grok observer, task ledger,
   episode state, transcript-tail reconciliation, and tests.
+- `src-tauri/src/acp/codex_autonomous.rs` (new): Codex capability gate,
+  thread-status observer, Goal episode state, rollout-tail reconciliation, and
+  tests.
 - `src-tauri/src/acp/mod.rs`: register the new modules.
 - `src-tauri/src/acp/background_watch.rs`: expose the Claude adapter through
   the normalized lifecycle and annotate proven origins.
-- `src-tauri/src/acp/connection.rs`: choose policy, feed raw dispatches with
-  foreground/idle ownership, gate prompts during a Grok autonomous episode,
-  and handle idle terminal closure.
+- `src-tauri/src/acp/connection.rs`: choose policy from initialize capabilities,
+  feed raw dispatches with foreground/idle ownership, gate prompts during Grok
+  or Codex autonomous episodes, and handle provider-specific idle terminals.
 - `src-tauri/src/acp/types.rs`: provider-neutral `BackgroundActivity`
   documentation; event shape otherwise unchanged.
 - `src-tauri/src/acp/session_state.rs`: provider-neutral accounting comments
-  and autonomous activity assertions.
+  and autonomous keepalive assertions, including Codex's single Goal unit.
 - `src-tauri/src/models/message.rs`: `AutonomousTurnOrigin` and optional
   `MessageTurn.autonomous_origin`; update Rust struct literals mechanically.
 - `src-tauri/src/parsers/grok.rs`: shared complete-line scanner, transcript
   watermark, canonical autonomous ids, hidden-trigger cold recovery, and tests.
+- `src-tauri/src/parsers/codex.rs`: shared complete-record scanner, rollout
+  watermark, native Goal-turn identity, internal-context suppression,
+  cold-recovery origin, and tests.
 - `src-tauri/src/parsers/claude.rs`: cold-parse origin annotation for proven
   task-notification/automation shapes.
 - `src/lib/types.ts`: TypeScript origin type and updated watermark docs.
@@ -1153,7 +1595,7 @@ Expected implementation surface:
 - `src/stores/conversation-runtime-store.ts`: same-id display dedupe and origin
   preservation through overlay/detail reconciliation.
 - `src/stores/background-overlay.test.ts` and related window/timeline tests:
-  Grok watermark, race, and dedupe coverage.
+  Grok/Codex watermark, race, and dedupe coverage.
 - `src/components/message/message-list-view.tsx`: grouping boundary, group
   metadata, and marker rendering.
 - `src/components/message/message-list-view.test.tsx`: presentation and merge
@@ -1206,7 +1648,7 @@ retirement authority.
 
 Rejected. Transcript formats and autonomous semantics are provider-specific,
 and several agents do not expose a suitable local authority. V1 keeps Claude's
-required permanent poll and arms Grok tailing only around a verified idle
+required permanent poll and arms Grok/Codex tailing only around a verified idle
 episode.
 
 ### Support every ACP agent with matching event names
@@ -1214,6 +1656,26 @@ episode.
 Rejected. Private method names, hidden-message meaning, terminal ownership, and
 history persistence differ across hosts. Superficial JSON similarity is not a
 safe capability contract.
+
+### Use ACP session/load as Codex's replay authority
+
+Rejected. The captured adapter preserves content but rewrites live `msg_*` ids
+to positional `item-N` ids. It also exposes no transcript revision or byte
+coverage token, so it cannot provide stable replay identity or prove safe
+overlay retirement.
+
+### Recognize Codex Goal continuation by prompt text
+
+Rejected. A user may type the same sentence as Codex's synthetic continuation
+prompt, and adapter wording may change. Only the structured
+`<codex_internal_context source="goal">` envelope inside a negotiated Goal-owned
+native turn can classify cold history.
+
+### Treat Codex subagent activity as a parent autonomous turn
+
+Rejected. Codex subagent activity has provider ids and can support tool/task
+display, but the verified fixture proves only Goal continuation. No fixture yet
+shows that subagent completion independently opens a parent out-of-turn cycle.
 
 ### Render the hidden reminder as the user turn
 
@@ -1223,6 +1685,6 @@ into a false user/assistant exchange.
 
 ### Persist synthetic autonomous turns in Codeg's database
 
-Rejected for V1. Claude and Grok already have authoritative local transcripts,
-and the overlay/watermark handoff provides live continuity without a second
-durable message store or schema migration.
+Rejected for V1. Claude, Grok, and Codex already have authoritative local
+transcripts, and the overlay/watermark handoff provides live continuity without
+a second durable message store or schema migration.
