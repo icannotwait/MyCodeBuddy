@@ -326,14 +326,9 @@ impl GrokAutonomousAdapter {
                         self.episode.phase = EpisodePhase::Open;
                     }
                 }
-                None => {
-                    if find_hidden_trigger(&bytes, 0)
-                        .is_some_and(|(offset, _)| self.is_tombstoned(offset))
-                    {
-                        self.episode.phase = EpisodePhase::Closed;
-                        return;
-                    }
-                }
+                // File lags the wire: keep Opening. A from-0 tombstone close
+                // would drop a new adjacent cycle that has not persisted yet.
+                None => {}
             }
         }
 
@@ -1168,6 +1163,76 @@ mod tests {
             "replayed hidden reminder must not pin the prompt gate"
         );
         assert!(!should_hold_prompt(Some(&adapter)));
+    }
+
+    #[test]
+    fn second_cycle_while_file_lags_stays_opening_and_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("updates.jsonl");
+        std::fs::write(&path, "").unwrap();
+        let mut adapter = GrokAutonomousAdapter::new_for_test(path.clone());
+        adapter.on_session_ready("sess", &path);
+        adapter.on_raw_dispatch(
+            "_x.ai/session/update",
+            &json!({"update":{"sessionUpdate":"task_completed","task_id":"term_x"}}),
+            Ownership::Idle,
+        );
+        adapter.on_raw_dispatch(
+            "session/update",
+            &json!({"update":{
+                "sessionUpdate":"user_message_chunk",
+                "content":{"type":"text","text":HIDDEN_REMINDER},
+                "_meta":{"hideFromScrollback":true}
+            }}),
+            Ownership::Idle,
+        );
+        append_line(
+            &path,
+            &jsonl_update("session/update", &hidden_trigger_update(), 9),
+        );
+        append_line(
+            &path,
+            &jsonl_update("session/update", &agent_text_update("hello"), 10),
+        );
+        append_line(
+            &path,
+            &jsonl_update("session/update", &turn_completed_update(), 11),
+        );
+        adapter.on_raw_dispatch(
+            "session/update",
+            &json!({"update":{"sessionUpdate":"turn_completed","stop_reason":"end_turn"}}),
+            Ownership::Idle,
+        );
+        adapter.tail_once();
+        assert!(
+            !adapter.autonomous_busy(),
+            "first cycle closed after persisted terminal"
+        );
+
+        adapter.on_raw_dispatch(
+            "_x.ai/session/update",
+            &json!({"update":{"sessionUpdate":"task_completed","task_id":"term_x"}}),
+            Ownership::Idle,
+        );
+        adapter.on_raw_dispatch(
+            "session/update",
+            &json!({"update":{
+                "sessionUpdate":"user_message_chunk",
+                "content":{"type":"text","text":HIDDEN_REMINDER},
+                "_meta":{"hideFromScrollback":true}
+            }}),
+            Ownership::Idle,
+        );
+        assert!(
+            adapter.autonomous_busy(),
+            "adjacent second cycle opens before the file appends"
+        );
+        adapter.tail_once();
+        assert!(
+            adapter.autonomous_busy(),
+            "second cycle while file lags must stay Opening / busy, not Closed"
+        );
+        assert!(should_hold_prompt(Some(&adapter)));
     }
 
     #[test]
