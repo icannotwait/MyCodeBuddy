@@ -282,6 +282,16 @@ async fn resolve_shared_connect_target(
             .map_err(|error| map_acp_error(error.into()))?;
     }
 
+    crate::commands::delegate_access::ensure_connect_delegate_interactive(
+        &state.db,
+        &state.connection_manager,
+        params.agent_type,
+        params.external_session_id.as_deref(),
+        params.conversation_id,
+    )
+    .await
+    .map_err(map_acp_error)?;
+
     if params.conversation_id.is_some_and(|id| id <= 0) {
         return Err(invalid_shared_field("conversation_id"));
     }
@@ -1039,9 +1049,20 @@ async fn interaction_is_broker_managed(
 ) -> Result<bool, AppCommandError> {
     let routing_connection_id = match authoritative_owner {
         Some(owner) if owner != supplied_connection_id => {
-            return Err(map_acp_error(crate::acp::error::AcpError::Shared(
-                SharedSessionError::InteractionAlreadyResolved,
-            )))
+            // Broker-owned interactions treat a mismatched caller as already
+            // resolved so a local spoof cannot fence the lease. Legacy
+            // delegated children keep routing through the owner so viewer-only
+            // admission can reject without consuming the pending card.
+            if manager.is_broker_managed_connection(&owner).await
+                || manager
+                    .is_broker_managed_connection(supplied_connection_id)
+                    .await
+            {
+                return Err(map_acp_error(crate::acp::error::AcpError::Shared(
+                    SharedSessionError::InteractionAlreadyResolved,
+                )));
+            }
+            owner
         }
         Some(owner) => owner,
         None => supplied_connection_id.to_string(),
@@ -1313,18 +1334,18 @@ pub async fn acp_respond_permission(
     Json(params): Json<AcpRespondPermissionParams>,
 ) -> Result<Json<()>, AppCommandError> {
     let manager = &state.connection_manager;
-    crate::commands::delegate_access::ensure_web_shared_or_delegate_interactive(
-        &state.db,
-        manager,
-        &params.connection_id,
-        None,
-    )
-    .await
-    .map_err(map_acp_error)?;
     if manager
         .is_broker_managed_connection(&params.connection_id)
         .await
     {
+        crate::commands::delegate_access::ensure_web_shared_or_delegate_interactive(
+            &state.db,
+            manager,
+            &params.connection_id,
+            None,
+        )
+        .await
+        .map_err(map_acp_error)?;
         let guard =
             shared_mutation_guard(&params.connection_id, params.generation, params.lease_id)?;
         manager

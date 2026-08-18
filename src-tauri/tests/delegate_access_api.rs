@@ -381,11 +381,14 @@ async fn connect_omitted_conversation_id_with_locked_session_rejects_without_spa
 
     let response = fixture
         .server
-        .post("/api/acp_connect")
+        .post("/api/acp_connect_or_attach")
         .add_header("authorization", "Bearer token")
         .json(&json!({
             "agentType": "codex",
-            "sessionId": "locked-child-session"
+            "externalSessionId": "locked-child-session",
+            "deviceId": "delegate-device",
+            "clientInstanceId": "delegate-client",
+            "requestId": "locked-session-connect"
         }))
         .await;
     assert_eq!(response.status_code(), 409);
@@ -428,12 +431,15 @@ async fn connect_mismatched_conversation_and_session_rejects_without_spawn() {
 
     let response = fixture
         .server
-        .post("/api/acp_connect")
+        .post("/api/acp_connect_or_attach")
         .add_header("authorization", "Bearer token")
         .json(&json!({
             "agentType": "codex",
-            "sessionId": "child-session-x",
-            "conversationId": other.id
+            "externalSessionId": "child-session-x",
+            "conversationId": other.id,
+            "deviceId": "delegate-device",
+            "clientInstanceId": "delegate-client",
+            "requestId": "mismatched-session-connect"
         }))
         .await;
     assert_eq!(response.status_code(), 409);
