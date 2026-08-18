@@ -49,15 +49,17 @@ const SKILL_CONTRACT = {
     later_run: "continue_delegation",
     join: "get_delegation_status",
     recovery_authorization: "request_recovery_authorization",
+    binding_query: "get_delegation_orchestration_bindings",
   },
   plan_setup_order: [
-    "create-progress",
+    "create-progress-shell",
     "dispatch-plan-author",
-    "confirm-plan-on-disk",
-    "validate-routing",
+    "derive-plan-routing",
+    "initialize-progress-from-validator",
+    "validate-static-documents",
+    "validate-durable-admission",
     "review-plan",
     "register-simple-workflow",
-    "sync-plan-tasks",
   ],
   document_work: {
     parent_edits: false,
@@ -69,6 +71,8 @@ const SKILL_CONTRACT = {
     producer_reviewer_independence: true,
     plan_rereview: "full_latest_plan",
     user_named_reviewers: "design_and_plan_only",
+    admission_cadence:
+      "fresh_applicable_mode_before_every_dispatch_or_continuation",
   },
   conversation_identity: {
     distinct_work_units: "distinct_child_conversations",
@@ -91,6 +95,9 @@ const SKILL_CONTRACT = {
     reviewer_slots: ["primary", "auxiliary"],
     task_order: "serial",
     high_review_fan_out: "parallel_after_implementation",
+    binding_schema_version: 1,
+    binding_namespace: "brainstorm-to-delivery",
+    binding_source: "validator_output",
   },
   progress: {
     marker: "codeg-simple-progress-v1",
@@ -101,12 +108,17 @@ const SKILL_CONTRACT = {
       "record-observed-state",
     ],
     route_metadata: "additive",
+    dispatch_intent: "operation_specific_before_call",
+    pending_route_change: "record_before_plan_revision_clear_after_approval",
   },
   workspace_policy: "preserve-user-changes",
   recovery: {
     unexpected_continuations: 2,
     logical_replacements: 1,
     replacement_retry: "pre-admission-only",
+    durable_reconciliation: "fresh_complete_parent_scoped_snapshot",
+    lost_acknowledgement: "one_exact_unresolved_intent",
+    status_refresh: "state_only_then_fresh_full_admission",
   },
   final_review: {
     required: true,
@@ -451,6 +463,50 @@ describe("Skill contract v2", () => {
       "Switch Agent immediately inside the active Task.",
       "Skip the auxiliary review after a high-Task fix.",
       "When the user names a Design Reviewer, use that reviewer instead of the Codex Design Reviewer.",
+    ]) {
+      has(validateSkillMarkdown(`${skill}\n${prose}`).failures, "B2D-SKILL-005")
+    }
+  })
+
+  it("requires the durable query, validator binding source, and intent rules", () => {
+    const marker = "<!-- codeg-b2d-skill-contract-v2"
+    const start = realSkill.indexOf(marker)
+    assert.notEqual(start, -1)
+    const body = realSkill.slice(start + marker.length)
+    const end = body.indexOf("-->")
+    const contract = JSON.parse(body.slice(0, end).trim())
+    assert.deepEqual(contract, SKILL_CONTRACT)
+    assert.match(realSkill, /get_delegation_orchestration_bindings/)
+    assert.match(
+      realSkill,
+      /validator_output|validator's exact|validator-copied/
+    )
+    assert.match(realSkill, /dispatch_intent/)
+    assert.match(realSkill, /pending_route_change/)
+    assert.match(realSkill, /status-only refresh required:/)
+    assert.match(realSkill, /document admission/)
+    assert.match(realSkill, /full admission/)
+  })
+
+  it("rejects contradictory durable query, intent, and admission prose", () => {
+    for (const prose of [
+      "Fall back to get_delegation_status when the binding query is unavailable.",
+      "The parent hashes the route fingerprint for each Task.",
+      "The Plan Author hashes the orchestration binding independently.",
+      "Record the dispatch intent after the delegation call returns.",
+      "Adopt a durable row without an unresolved dispatch intent.",
+      "Reuse stale or mixed snapshot pages after compaction.",
+      "Authorize Task execution from static validation alone.",
+      "Bind the Design Reviewer run with an orchestration binding.",
+      "Bind the final-review run with an orchestration binding.",
+      "Change the generation of an admitted Task before reviewers start.",
+      "Omit the pending_route_change intent when changing the Task Agent.",
+      "Clear pending_route_change before Plan approval.",
+      "Dispatch a Task while pending_route_change remains non-null.",
+      "Treat a status-only refresh as a permanent blocker.",
+      "Rewrite the identity and binding during a status-only refresh.",
+      "Reuse one admission across Design and final-review continuations.",
+      "Treat Rust projection warnings as a Gate.",
     ]) {
       has(validateSkillMarkdown(`${skill}\n${prose}`).failures, "B2D-SKILL-005")
     }
@@ -5302,16 +5358,19 @@ describe("Skill contract v2", () => {
       "schema_version",
       "plan_rel_path",
       "active_task_index",
+      "pending_route_change",
       "tasks",
       "final_review_status",
       "updated_at",
     ])
+    assert.equal(progressShape.pending_route_change, null)
     assert.deepEqual(Object.keys(progressShape.tasks[0]), [
       "index",
       "status",
       "commit",
       "risk_level",
       "task_agent_generation",
+      "route_fingerprint",
       "expected_work_unit_keys",
       "runs",
     ])
@@ -5324,10 +5383,47 @@ describe("Skill contract v2", () => {
       "state",
       "work_unit_key",
       "task_agent_generation",
+      "root_task_id",
+      "previous_task_id",
+      "lineage_root_task_id",
+      "generic_generation",
       "recovery_count",
       "replaced_task_id",
       "replacement_reason",
+      "dispatch_intent",
+      "orchestration_binding",
     ])
+    assert.deepEqual(
+      Object.keys(progressShape.tasks[0].runs[0].dispatch_intent),
+      [
+        "kind",
+        "continuation_target_task_id",
+        "replacement_target_task_id",
+        "replacement_reason",
+        "expected_root_task_id",
+        "expected_lineage_root_task_id",
+        "expected_generic_generation",
+        "expected_child_conversation_id",
+        "adopted_after_lost_acknowledgement",
+      ]
+    )
+    assert.deepEqual(
+      Object.keys(progressShape.tasks[0].runs[0].orchestration_binding),
+      ["schema_version", "namespace", "generation", "route_fingerprint"]
+    )
+    const routeChange = fencedJsonAfterHeading(
+      realSkill,
+      "### Pending route-change object"
+    )
+    assert.deepEqual(routeChange, {
+      pending_route_change: {
+        requested_agent_type: "gemini",
+        requested_profile_id: null,
+        next_generation: 2,
+        effective_from_task_index: 5,
+        affected_task_indices: [5, 6, 7],
+      },
+    })
   })
 })
 
@@ -6379,13 +6475,14 @@ describe("durable route binding derivation", () => {
         "plan.md",
         "--derive-plan-routing",
       ],
-      { encoding: "utf8" }
+      { encoding: "utf8", env: conflictingColorEnv() }
     )
     assert.notEqual(missingJson.status, 0)
     assert.match(missingJson.stderr, /output-json/i)
 
     const skillOnly = spawnSync(process.execPath, [script], {
       encoding: "utf8",
+      env: conflictingColorEnv(),
     })
     assert.equal(skillOnly.status, 0)
     assert.match(skillOnly.stdout, /PASS:/)

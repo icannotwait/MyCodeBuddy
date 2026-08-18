@@ -28,7 +28,8 @@ use codeg_lib::acp::delegation::spawner::{
 use codeg_lib::acp::delegation::store::{DbDelegationTaskStore, DelegationTaskStore};
 use codeg_lib::acp::delegation::types::{
     ContinueDelegationRequest, DelegationError, DelegationOutcome, DelegationRequest,
-    DelegationSuccess, TaskStatus, CONTINUE_DELEGATION_TOOL, DELEGATE_TO_AGENT_TOOL,
+    DelegationSuccess, OrchestrationBindingV1, TaskStatus, CONTINUE_DELEGATION_TOOL,
+    DELEGATE_TO_AGENT_TOOL,
 };
 use codeg_lib::acp::termination::{
     AcpTerminationClassification, AcpTerminationReason, AcpTerminationSource,
@@ -94,6 +95,65 @@ fn test_working_dir() -> String {
     .into_owned()
 }
 
+const PUBLISHED_HIGH_VECTOR_JSON: &[u8] = br#"["codeg-b2d-route-binding-v1",1,"brainstorm-to-delivery",7,2,"high",["codex",null],[["primary","codex",null],["auxiliary","grok",null]],["task|7|implementer|codex|none","task|7|reviewer|primary|codex|none","task|7|reviewer|auxiliary|grok|none"]]"#;
+const PUBLISHED_HIGH_FINGERPRINT: &str =
+    "sha256:b498416d87bf6ba928bd7ddb5f1a451daf82300584f3d40b606c3c56f169ba7a";
+
+fn published_high_binding() -> OrchestrationBindingV1 {
+    OrchestrationBindingV1 {
+        schema_version: 1,
+        namespace: "brainstorm-to-delivery".into(),
+        generation: 2,
+        route_fingerprint: PUBLISHED_HIGH_FINGERPRINT.into(),
+    }
+}
+
+fn skill_task_binding() -> OrchestrationBindingV1 {
+    OrchestrationBindingV1 {
+        schema_version: 1,
+        namespace: "brainstorm-to-delivery".into(),
+        generation: 1,
+        route_fingerprint: PUBLISHED_HIGH_FINGERPRINT.into(),
+    }
+}
+
+fn is_routed_task_key(work_unit_key: &str) -> bool {
+    work_unit_key.starts_with("task|")
+}
+
+fn independently_hash_published_high_vector() -> String {
+    let output = std::process::Command::new("sha256sum")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write;
+            child
+                .stdin
+                .as_mut()
+                .expect("sha256sum stdin")
+                .write_all(PUBLISHED_HIGH_VECTOR_JSON)?;
+            child.wait_with_output()
+        })
+        .expect("hash published high vector independently");
+    assert!(output.status.success(), "sha256sum failed: {output:?}");
+    let hex = String::from_utf8(output.stdout).expect("sha256sum utf8");
+    let digest = hex
+        .split_whitespace()
+        .next()
+        .expect("sha256sum digest")
+        .to_ascii_lowercase();
+    format!("sha256:{digest}")
+}
+
+fn assert_run_binding(
+    run: &codeg_lib::acp::delegation::run_store::PersistedRun,
+    expected: Option<&OrchestrationBindingV1>,
+    label: &str,
+) {
+    assert_eq!(run.orchestration_binding.as_ref(), expected, "{label}");
+}
+
 fn delegate_req(
     parent_id: i32,
     tool_use: &str,
@@ -101,6 +161,18 @@ fn delegate_req(
     task: &str,
     _workdir: &str,
     work_unit: Option<&str>,
+) -> DelegationRequest {
+    delegate_req_bound(parent_id, tool_use, agent, task, _workdir, work_unit, None)
+}
+
+fn delegate_req_bound(
+    parent_id: i32,
+    tool_use: &str,
+    agent: AgentType,
+    task: &str,
+    _workdir: &str,
+    work_unit: Option<&str>,
+    orchestration_binding: Option<OrchestrationBindingV1>,
 ) -> DelegationRequest {
     DelegationRequest {
         parent_connection_id: "parent-conn".into(),
@@ -118,7 +190,7 @@ fn delegate_req(
         // Explicit parent_tool_use_id fixtures do not need correlation_id.
         correlation_id: None,
         recovery_authorization_id: None,
-        orchestration_binding: None,
+        orchestration_binding,
     }
 }
 
@@ -128,6 +200,24 @@ fn continue_req(
     target_task_id: &str,
     task: &str,
     work_unit: Option<&str>,
+) -> ContinueDelegationRequest {
+    continue_req_bound(
+        parent_id,
+        tool_use,
+        target_task_id,
+        task,
+        work_unit,
+        None,
+    )
+}
+
+fn continue_req_bound(
+    parent_id: i32,
+    tool_use: &str,
+    target_task_id: &str,
+    task: &str,
+    work_unit: Option<&str>,
+    orchestration_binding: Option<OrchestrationBindingV1>,
 ) -> ContinueDelegationRequest {
     ContinueDelegationRequest {
         parent_connection_id: "parent-conn".into(),
@@ -140,7 +230,7 @@ fn continue_req(
         // Explicit parent_tool_use_id fixtures do not need correlation_id.
         correlation_id: None,
         recovery_authorization_id: None,
-        orchestration_binding: None,
+        orchestration_binding,
     }
 }
 
@@ -656,16 +746,17 @@ enum SkillAction {
     BlockNoSubstitute,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct SkillRoute {
     work_unit_key: &'static str,
     agent: AgentType,
+    binding: Option<OrchestrationBindingV1>,
 }
 
 #[derive(Debug)]
 struct SkillScenario {
     name: &'static str,
-    routes: &'static [SkillRoute],
+    routes: Vec<SkillRoute>,
     expected_actions: &'static [SkillAction],
     /// Each route must not reuse any of these prior work-unit keys.
     must_differ_from: &'static [&'static str],
@@ -673,19 +764,35 @@ struct SkillScenario {
     max_replacements: i64,
 }
 
+fn skill_route(
+    work_unit_key: &'static str,
+    agent: AgentType,
+    binding: Option<OrchestrationBindingV1>,
+) -> SkillRoute {
+    SkillRoute {
+        work_unit_key,
+        agent,
+        binding,
+    }
+}
+
 fn skill_forward_v2_scenarios() -> Vec<SkillScenario> {
+    let task_binding = skill_task_binding();
+    let later_binding = published_high_binding();
     vec![
         SkillScenario {
             name: "default_normal_grok_plus_codex_primary",
-            routes: &[
-                SkillRoute {
-                    work_unit_key: "task|1|implementer|grok|none",
-                    agent: AgentType::Grok,
-                },
-                SkillRoute {
-                    work_unit_key: "task|1|reviewer|primary|codex|none",
-                    agent: AgentType::Codex,
-                },
+            routes: vec![
+                skill_route(
+                    "task|1|implementer|grok|none",
+                    AgentType::Grok,
+                    Some(task_binding.clone()),
+                ),
+                skill_route(
+                    "task|1|reviewer|primary|codex|none",
+                    AgentType::Codex,
+                    Some(task_binding.clone()),
+                ),
             ],
             expected_actions: &[SkillAction::FreshDelegate],
             must_differ_from: &[],
@@ -694,15 +801,17 @@ fn skill_forward_v2_scenarios() -> Vec<SkillScenario> {
         },
         SkillScenario {
             name: "selected_non_grok_normal_route",
-            routes: &[
-                SkillRoute {
-                    work_unit_key: "task|2|implementer|gemini|careful",
-                    agent: AgentType::Gemini,
-                },
-                SkillRoute {
-                    work_unit_key: "task|2|reviewer|primary|codex|none",
-                    agent: AgentType::Codex,
-                },
+            routes: vec![
+                skill_route(
+                    "task|2|implementer|gemini|careful",
+                    AgentType::Gemini,
+                    Some(task_binding.clone()),
+                ),
+                skill_route(
+                    "task|2|reviewer|primary|codex|none",
+                    AgentType::Codex,
+                    Some(task_binding.clone()),
+                ),
             ],
             expected_actions: &[SkillAction::FreshDelegate],
             must_differ_from: &[],
@@ -711,19 +820,22 @@ fn skill_forward_v2_scenarios() -> Vec<SkillScenario> {
         },
         SkillScenario {
             name: "high_codex_plus_primary_and_task_agent_auxiliary",
-            routes: &[
-                SkillRoute {
-                    work_unit_key: "task|3|implementer|codex|none",
-                    agent: AgentType::Codex,
-                },
-                SkillRoute {
-                    work_unit_key: "task|3|reviewer|primary|codex|none",
-                    agent: AgentType::Codex,
-                },
-                SkillRoute {
-                    work_unit_key: "task|3|reviewer|auxiliary|grok|none",
-                    agent: AgentType::Grok,
-                },
+            routes: vec![
+                skill_route(
+                    "task|3|implementer|codex|none",
+                    AgentType::Codex,
+                    Some(task_binding.clone()),
+                ),
+                skill_route(
+                    "task|3|reviewer|primary|codex|none",
+                    AgentType::Codex,
+                    Some(task_binding.clone()),
+                ),
+                skill_route(
+                    "task|3|reviewer|auxiliary|grok|none",
+                    AgentType::Grok,
+                    Some(task_binding.clone()),
+                ),
             ],
             expected_actions: &[SkillAction::FreshDelegate],
             must_differ_from: &[],
@@ -732,19 +844,22 @@ fn skill_forward_v2_scenarios() -> Vec<SkillScenario> {
         },
         SkillScenario {
             name: "codex_task_agent_keeps_three_distinct_units",
-            routes: &[
-                SkillRoute {
-                    work_unit_key: "task|4|implementer|codex|none",
-                    agent: AgentType::Codex,
-                },
-                SkillRoute {
-                    work_unit_key: "task|4|reviewer|primary|codex|none",
-                    agent: AgentType::Codex,
-                },
-                SkillRoute {
-                    work_unit_key: "task|4|reviewer|auxiliary|codex|none",
-                    agent: AgentType::Codex,
-                },
+            routes: vec![
+                skill_route(
+                    "task|4|implementer|codex|none",
+                    AgentType::Codex,
+                    Some(task_binding.clone()),
+                ),
+                skill_route(
+                    "task|4|reviewer|primary|codex|none",
+                    AgentType::Codex,
+                    Some(task_binding.clone()),
+                ),
+                skill_route(
+                    "task|4|reviewer|auxiliary|codex|none",
+                    AgentType::Codex,
+                    Some(task_binding.clone()),
+                ),
             ],
             expected_actions: &[SkillAction::FreshDelegate],
             must_differ_from: &[],
@@ -753,19 +868,22 @@ fn skill_forward_v2_scenarios() -> Vec<SkillScenario> {
         },
         SkillScenario {
             name: "high_fix_and_both_rereviews_continue",
-            routes: &[
-                SkillRoute {
-                    work_unit_key: "task|5|implementer|codex|none",
-                    agent: AgentType::Codex,
-                },
-                SkillRoute {
-                    work_unit_key: "task|5|reviewer|primary|codex|none",
-                    agent: AgentType::Codex,
-                },
-                SkillRoute {
-                    work_unit_key: "task|5|reviewer|auxiliary|grok|none",
-                    agent: AgentType::Grok,
-                },
+            routes: vec![
+                skill_route(
+                    "task|5|implementer|codex|none",
+                    AgentType::Codex,
+                    Some(task_binding.clone()),
+                ),
+                skill_route(
+                    "task|5|reviewer|primary|codex|none",
+                    AgentType::Codex,
+                    Some(task_binding.clone()),
+                ),
+                skill_route(
+                    "task|5|reviewer|auxiliary|grok|none",
+                    AgentType::Grok,
+                    Some(task_binding.clone()),
+                ),
             ],
             expected_actions: &[SkillAction::Continue],
             must_differ_from: &[],
@@ -774,15 +892,17 @@ fn skill_forward_v2_scenarios() -> Vec<SkillScenario> {
         },
         SkillScenario {
             name: "conditional_design_reviewer_and_fixer_are_separate",
-            routes: &[
-                SkillRoute {
-                    work_unit_key: "design|docs/design.md|reviewer|codex|none",
-                    agent: AgentType::Codex,
-                },
-                SkillRoute {
-                    work_unit_key: "design|docs/design.md|fixer|codex|none",
-                    agent: AgentType::Codex,
-                },
+            routes: vec![
+                skill_route(
+                    "design|docs/design.md|reviewer|codex|none",
+                    AgentType::Codex,
+                    None,
+                ),
+                skill_route(
+                    "design|docs/design.md|fixer|codex|none",
+                    AgentType::Codex,
+                    None,
+                ),
             ],
             expected_actions: &[SkillAction::Continue],
             must_differ_from: &[],
@@ -791,15 +911,17 @@ fn skill_forward_v2_scenarios() -> Vec<SkillScenario> {
         },
         SkillScenario {
             name: "plan_author_and_reviewer_stay_separate",
-            routes: &[
-                SkillRoute {
-                    work_unit_key: "plan|docs/plan.md|author|codex|none",
-                    agent: AgentType::Codex,
-                },
-                SkillRoute {
-                    work_unit_key: "plan|docs/plan.md|reviewer|codex|none",
-                    agent: AgentType::Codex,
-                },
+            routes: vec![
+                skill_route(
+                    "plan|docs/plan.md|author|codex|none",
+                    AgentType::Codex,
+                    None,
+                ),
+                skill_route(
+                    "plan|docs/plan.md|reviewer|codex|none",
+                    AgentType::Codex,
+                    None,
+                ),
             ],
             expected_actions: &[SkillAction::Continue],
             must_differ_from: &[],
@@ -808,15 +930,17 @@ fn skill_forward_v2_scenarios() -> Vec<SkillScenario> {
         },
         SkillScenario {
             name: "boundary_agent_change_affects_pending_tasks",
-            routes: &[
-                SkillRoute {
-                    work_unit_key: "task|7|implementer|grok|none",
-                    agent: AgentType::Grok,
-                },
-                SkillRoute {
-                    work_unit_key: "task|8|implementer|gemini|careful",
-                    agent: AgentType::Gemini,
-                },
+            routes: vec![
+                skill_route(
+                    "task|7|implementer|grok|none",
+                    AgentType::Grok,
+                    Some(task_binding.clone()),
+                ),
+                skill_route(
+                    "task|8|implementer|gemini|careful",
+                    AgentType::Gemini,
+                    Some(later_binding),
+                ),
             ],
             expected_actions: &[SkillAction::FreshDelegate],
             must_differ_from: &[],
@@ -825,10 +949,11 @@ fn skill_forward_v2_scenarios() -> Vec<SkillScenario> {
         },
         SkillScenario {
             name: "active_task_change_blocks_without_handoff",
-            routes: &[SkillRoute {
-                work_unit_key: "task|9|implementer|grok|none",
-                agent: AgentType::Grok,
-            }],
+            routes: vec![skill_route(
+                "task|9|implementer|grok|none",
+                AgentType::Grok,
+                Some(task_binding.clone()),
+            )],
             expected_actions: &[SkillAction::BlockNoSubstitute],
             must_differ_from: &[],
             max_unexpected_continues: 2,
@@ -836,10 +961,11 @@ fn skill_forward_v2_scenarios() -> Vec<SkillScenario> {
         },
         SkillScenario {
             name: "recovery_keeps_agent_profile_key_and_budgets",
-            routes: &[SkillRoute {
-                work_unit_key: "task|10|implementer|gemini|careful",
-                agent: AgentType::Gemini,
-            }],
+            routes: vec![skill_route(
+                "task|10|implementer|gemini|careful",
+                AgentType::Gemini,
+                Some(task_binding.clone()),
+            )],
             expected_actions: &[SkillAction::Continue, SkillAction::Replacement],
             must_differ_from: &[],
             max_unexpected_continues: 2,
@@ -847,31 +973,37 @@ fn skill_forward_v2_scenarios() -> Vec<SkillScenario> {
         },
         SkillScenario {
             name: "final_findings_return_to_owners_and_reopen_reviews",
-            routes: &[
-                SkillRoute {
-                    work_unit_key: "task|11|implementer|grok|none",
-                    agent: AgentType::Grok,
-                },
-                SkillRoute {
-                    work_unit_key: "task|11|reviewer|primary|codex|none",
-                    agent: AgentType::Codex,
-                },
-                SkillRoute {
-                    work_unit_key: "task|12|implementer|codex|none",
-                    agent: AgentType::Codex,
-                },
-                SkillRoute {
-                    work_unit_key: "task|12|reviewer|primary|codex|none",
-                    agent: AgentType::Codex,
-                },
-                SkillRoute {
-                    work_unit_key: "task|12|reviewer|auxiliary|grok|none",
-                    agent: AgentType::Grok,
-                },
-                SkillRoute {
-                    work_unit_key: "final_review|reviewer|codex|none",
-                    agent: AgentType::Codex,
-                },
+            routes: vec![
+                skill_route(
+                    "task|11|implementer|grok|none",
+                    AgentType::Grok,
+                    Some(task_binding.clone()),
+                ),
+                skill_route(
+                    "task|11|reviewer|primary|codex|none",
+                    AgentType::Codex,
+                    Some(task_binding.clone()),
+                ),
+                skill_route(
+                    "task|12|implementer|codex|none",
+                    AgentType::Codex,
+                    Some(task_binding.clone()),
+                ),
+                skill_route(
+                    "task|12|reviewer|primary|codex|none",
+                    AgentType::Codex,
+                    Some(task_binding.clone()),
+                ),
+                skill_route(
+                    "task|12|reviewer|auxiliary|grok|none",
+                    AgentType::Grok,
+                    Some(task_binding.clone()),
+                ),
+                skill_route(
+                    "final_review|reviewer|codex|none",
+                    AgentType::Codex,
+                    None,
+                ),
             ],
             expected_actions: &[SkillAction::Continue],
             must_differ_from: &[],
@@ -916,6 +1048,47 @@ fn skill_forward_routing_invariants_eleven_v2_scenarios() {
             .collect::<BTreeSet<_>>();
         assert_eq!(keys.len(), scenario.routes.len(), "{}", scenario.name);
 
+        let task_bindings = scenario
+            .routes
+            .iter()
+            .filter(|route| is_routed_task_key(route.work_unit_key))
+            .map(|route| route.binding.clone())
+            .collect::<Vec<_>>();
+        if !task_bindings.is_empty() {
+            let first = task_bindings[0]
+                .as_ref()
+                .unwrap_or_else(|| panic!("{} Task route must carry a binding", scenario.name));
+            assert_eq!(first.schema_version, 1, "{}", scenario.name);
+            assert_eq!(first.namespace, "brainstorm-to-delivery", "{}", scenario.name);
+            if scenario.name != "boundary_agent_change_affects_pending_tasks" {
+                for binding in &task_bindings {
+                    assert_eq!(
+                        binding.as_ref(),
+                        Some(first),
+                        "{} Task routes share one binding",
+                        scenario.name
+                    );
+                }
+            }
+        }
+        for route in &scenario.routes {
+            if is_routed_task_key(route.work_unit_key) {
+                assert!(
+                    route.binding.is_some(),
+                    "{} routed Task {} must be bound",
+                    scenario.name,
+                    route.work_unit_key
+                );
+            } else {
+                assert!(
+                    route.binding.is_none(),
+                    "{} document/final {} must stay unbound",
+                    scenario.name,
+                    route.work_unit_key
+                );
+            }
+        }
+
         let child_by_key = scenario
             .routes
             .iter()
@@ -923,7 +1096,7 @@ fn skill_forward_routing_invariants_eleven_v2_scenarios() {
             .map(|(index, route)| (route.work_unit_key, index + 1))
             .collect::<HashMap<_, _>>();
         assert_eq!(child_by_key.len(), keys.len(), "{}", scenario.name);
-        for left in scenario.routes {
+        for left in &scenario.routes {
             assert!(
                 left.work_unit_key.chars().count() <= 200,
                 "{} key too long",
@@ -939,7 +1112,7 @@ fn skill_forward_routing_invariants_eleven_v2_scenarios() {
             for prior_key in scenario.must_differ_from {
                 assert_ne!(left.work_unit_key, *prior_key, "{}", scenario.name);
             }
-            for right in scenario.routes {
+            for right in &scenario.routes {
                 if left.work_unit_key != right.work_unit_key {
                     assert_ne!(
                         child_by_key[left.work_unit_key], child_by_key[right.work_unit_key],
@@ -1058,6 +1231,25 @@ fn skill_forward_contract_v2_matches_skill() {
         "structured contract delegation interfaces"
     );
     assert_eq!(
+        contract["interfaces"]["binding_query"],
+        "get_delegation_orchestration_bindings",
+        "structured contract binding query"
+    );
+    assert_eq!(
+        contract["plan_setup_order"],
+        serde_json::json!([
+            "create-progress-shell",
+            "dispatch-plan-author",
+            "derive-plan-routing",
+            "initialize-progress-from-validator",
+            "validate-static-documents",
+            "validate-durable-admission",
+            "review-plan",
+            "register-simple-workflow"
+        ]),
+        "structured contract plan setup order"
+    );
+    assert_eq!(
         contract["routing"],
         serde_json::json!({
             "marker": "codeg-b2d-routing-v1",
@@ -1072,16 +1264,34 @@ fn skill_forward_contract_v2_matches_skill() {
             },
             "reviewer_slots": ["primary", "auxiliary"],
             "task_order": "serial",
-            "high_review_fan_out": "parallel_after_implementation"
+            "high_review_fan_out": "parallel_after_implementation",
+            "binding_schema_version": 1,
+            "binding_namespace": "brainstorm-to-delivery",
+            "binding_source": "validator_output"
         }),
         "structured contract routing"
+    );
+    assert_eq!(
+        contract["progress"]["dispatch_intent"],
+        "operation_specific_before_call"
+    );
+    assert_eq!(
+        contract["progress"]["pending_route_change"],
+        "record_before_plan_revision_clear_after_approval"
+    );
+    assert_eq!(
+        contract["document_work"]["admission_cadence"],
+        "fresh_applicable_mode_before_every_dispatch_or_continuation"
     );
     assert_eq!(
         contract["recovery"],
         serde_json::json!({
             "unexpected_continuations": 2,
             "logical_replacements": 1,
-            "replacement_retry": "pre-admission-only"
+            "replacement_retry": "pre-admission-only",
+            "durable_reconciliation": "fresh_complete_parent_scoped_snapshot",
+            "lost_acknowledgement": "one_exact_unresolved_intent",
+            "status_refresh": "state_only_then_fresh_full_admission"
         }),
         "structured contract recovery limits"
     );
@@ -1161,16 +1371,18 @@ async fn skill_forward_rereviews_continue_same_owned_sessions() {
         let initial_tool_use_id = format!("tu-skill-{name}-initial");
         let initial_task = format!("initial {name}");
         let initial_connection = format!("skill-{name}-initial");
+        let route_binding = is_routed_task_key(work_unit_key).then(skill_task_binding);
         let (initial_task_id, child_id) = start_and_complete(
             &broker,
             &mock,
-            delegate_req(
+            delegate_req_bound(
                 parent.id,
                 &initial_tool_use_id,
                 agent,
                 &initial_task,
                 workdir,
                 Some(work_unit_key),
+                route_binding.clone(),
             ),
             &initial_connection,
         )
@@ -1183,12 +1395,13 @@ async fn skill_forward_rereviews_continue_same_owned_sessions() {
         let continued_task_id = continue_and_complete(
             &broker,
             &mock,
-            continue_req(
+            continue_req_bound(
                 parent.id,
                 &continue_tool_use_id,
                 &initial_task_id,
                 &follow_up,
                 Some(work_unit_key),
+                route_binding.clone(),
             ),
             &continue_connection,
             child_id,
@@ -1206,6 +1419,14 @@ async fn skill_forward_rereviews_continue_same_owned_sessions() {
         );
         assert_eq!(continued.child_conversation_id, child_id);
         assert_eq!(continued.agent_type, agent);
+        let expected_binding = is_routed_task_key(work_unit_key).then(skill_task_binding);
+        assert_run_binding(&continued, expected_binding.as_ref(), name);
+        let initial = runs
+            .load_by_task_id(&initial_task_id)
+            .await
+            .expect("initial run lookup")
+            .expect("initial run");
+        assert_run_binding(&initial, expected_binding.as_ref(), name);
         children.insert(name, child_id);
     }
 
@@ -1237,7 +1458,7 @@ async fn skill_forward_new_task_and_final_review_start_fresh_sessions() {
     .expect("parent");
     let runs = Arc::new(RunStore::new(db.clone()));
     let mock = Arc::new(MockSpawner::new());
-    let broker = broker_with_run_store(mock.clone(), parent.id, runs).await;
+    let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
     let workdir = "/tmp/codeg-skill-fresh";
 
     // Scenarios 4-5: a new Task gets fresh Grok/Codex children and final
@@ -1291,20 +1512,30 @@ async fn skill_forward_new_task_and_final_review_start_fresh_sessions() {
         let tool_use_id = format!("tu-skill-fresh-{name}");
         let task = format!("fresh {name}");
         let connection = format!("skill-fresh-{name}");
-        let (_, child_id) = start_and_complete(
+        let route_binding = is_routed_task_key(work_unit_key).then(skill_task_binding);
+        let (task_id, child_id) = start_and_complete(
             &broker,
             &mock,
-            delegate_req(
+            delegate_req_bound(
                 parent.id,
                 &tool_use_id,
                 agent,
                 &task,
                 workdir,
                 Some(work_unit_key),
+                route_binding,
             ),
             &connection,
         )
         .await;
+        let persisted = runs
+            .load_by_task_id(&task_id)
+            .await
+            .expect("fresh run lookup")
+            .expect("fresh run");
+        assert_eq!(persisted.agent_type, agent);
+        let expected_binding = is_routed_task_key(work_unit_key).then(skill_task_binding);
+        assert_run_binding(&persisted, expected_binding.as_ref(), name);
         children.insert(name, child_id);
     }
 
@@ -1375,6 +1606,257 @@ async fn skill_forward_business_error_does_not_spawn_substitute() {
     assert_eq!(report.error_code.as_deref(), Some("invalid_replacement"));
     assert_eq!(mock.spawn_args.lock().await.len(), spawn_count_before);
     assert_eq!(list_run_rows(&db, parent.id).await.len(), 1);
+}
+
+#[test]
+fn skill_forward_published_high_vector_digest() {
+    assert_eq!(PUBLISHED_HIGH_VECTOR_JSON.len(), 245);
+    assert_eq!(
+        independently_hash_published_high_vector(),
+        PUBLISHED_HIGH_FINGERPRINT
+    );
+    let binding = published_high_binding();
+    binding.validate().expect("published high binding");
+}
+
+#[test]
+fn skill_forward_route_change_and_admission_cadence() {
+    let skill_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join(".agents")
+        .join("skills")
+        .join("brainstorm-to-delivery")
+        .join("SKILL.md");
+    let skill = std::fs::read_to_string(&skill_path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", skill_path.display()));
+    for needle in [
+        "pending_route_change",
+        "status-only refresh required:",
+        "document admission",
+        "full admission",
+        "get_delegation_orchestration_bindings",
+        "dispatch_intent",
+        "simple_orchestration_binding_missing",
+        "simple_orchestration_binding_mismatch",
+        "simple_orchestration_binding_orphan",
+        "adopted_after_lost_acknowledgement",
+    ] {
+        assert!(
+            skill.contains(needle),
+            "Skill must encode durable operating rule `{needle}`"
+        );
+    }
+    for checkpoint in [
+        "Fetch every page of a fresh snapshot and pass full admission against the unchanged Plan/progress.",
+        "Prove every affected Task is pending with an empty run list and no selected durable row in any status.",
+        "Persist `pending_route_change` with the requested Agent/profile, next generation, first affected index, and complete affected suffix.",
+        "Confirm that exact Agent/profile is currently available; keep the intent and block on unavailability rather than substituting.",
+        "Continue the same Plan Author to append the generation and rewrite only that suffix.",
+        "Run Author then parent Plan-only derivation, resynchronize only those entries from the parent's exact output, pass combined static validation and a newly queried full admission, then continue every Plan Reviewer for complete re-review.",
+        "After approval, fetch a new complete snapshot, pass full admission, clear `pending_route_change` to null, persist, and fetch/pass full admission again before the next Task.",
+        "At any interruption, retain the intent, re-read Plan/progress/reviews, fetch a new complete snapshot, and identify the checkpoint.",
+    ] {
+        assert!(
+            skill.contains(checkpoint),
+            "Skill must encode route-change checkpoint: {checkpoint}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn skill_forward_bound_task_inherits_and_blocks_generation_rewrite() {
+    let db = Arc::new(fresh_in_memory_db().await);
+    let folder = seed_folder(&db, "/tmp/codeg-skill-rewrite").await;
+    let parent = conversation_service::create(
+        &db.conn,
+        folder,
+        AgentType::ClaudeCode,
+        Some("skill rewrite parent".into()),
+        None,
+    )
+    .await
+    .expect("parent");
+    let runs = Arc::new(RunStore::new(db.clone()));
+    let mock = Arc::new(MockSpawner::new());
+    let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+    let work_unit_key = "task|3|implementer|codex|none";
+    let binding = skill_task_binding();
+    let (source_task_id, child_id) = start_and_complete(
+        &broker,
+        &mock,
+        delegate_req_bound(
+            parent.id,
+            "tu-skill-rewrite-source",
+            AgentType::Codex,
+            "admitted high implementer",
+            "/tmp/codeg-skill-rewrite",
+            Some(work_unit_key),
+            Some(binding.clone()),
+        ),
+        "skill-rewrite-source",
+    )
+    .await;
+    set_child_external_id(&db, child_id, "sess-skill-rewrite").await;
+    let source = runs
+        .load_by_task_id(&source_task_id)
+        .await
+        .expect("source lookup")
+        .expect("source");
+    assert_run_binding(&source, Some(&binding), "admitted implementer");
+
+    let continued_id = continue_and_complete(
+        &broker,
+        &mock,
+        continue_req_bound(
+            parent.id,
+            "tu-skill-rewrite-continue",
+            &source_task_id,
+            "continue same binding",
+            Some(work_unit_key),
+            None,
+        ),
+        "skill-rewrite-continue",
+        child_id,
+        AgentType::Codex,
+    )
+    .await;
+    let continued = runs
+        .load_by_task_id(&continued_id)
+        .await
+        .expect("continued lookup")
+        .expect("continued");
+    assert_run_binding(&continued, Some(&binding), "inherited continue");
+
+    let report = broker
+        .continue_delegation(continue_req_bound(
+            parent.id,
+            "tu-skill-rewrite-blocked",
+            &continued_id,
+            "coordinated generation rewrite",
+            Some(work_unit_key),
+            Some(published_high_binding()),
+        ))
+        .await;
+    assert_eq!(report.status, TaskStatus::Failed, "{report:?}");
+    assert_eq!(
+        report.error_code.as_deref(),
+        Some("orchestration_binding_lineage_mismatch"),
+        "{report:?}"
+    );
+
+    {
+        let row = DelegationTaskRun::find_by_id(&continued_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .expect("continued row");
+        let mut row = row.into_active_model();
+        row.status = Set(DelegationRunStatus::Failed);
+        row.error_code = Set(Some("unresumable".into()));
+        row.update(&db.conn).await.unwrap();
+    }
+    let mut replacement = delegate_req_bound(
+        parent.id,
+        "tu-skill-rewrite-replace",
+        AgentType::Codex,
+        "replacement keeps source binding",
+        "/tmp/codeg-skill-rewrite",
+        Some(work_unit_key),
+        None,
+    );
+    replacement.replaces_task_id = Some(continued_id.clone());
+    replacement.replacement_reason = Some(REPLACEMENT_REASON_UNRESUMABLE.into());
+    mock.queue_spawn(Ok("skill-rewrite-replace-spawn".into()))
+        .await;
+    mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+    let replaced = broker.start_delegation(replacement).await;
+    assert_eq!(replaced.status, TaskStatus::Running, "{replaced:?}");
+    let replaced_run = runs
+        .load_by_task_id(replaced.task_id.as_deref().expect("replaced id"))
+        .await
+        .expect("replaced lookup")
+        .expect("replaced");
+    assert_run_binding(&replaced_run, Some(&binding), "replacement inherits");
+}
+
+#[tokio::test]
+async fn skill_forward_unbound_document_final_and_legacy_vectors() {
+    let db = Arc::new(fresh_in_memory_db().await);
+    let folder = seed_folder(&db, "/tmp/codeg-skill-unbound").await;
+    let parent = conversation_service::create(
+        &db.conn,
+        folder,
+        AgentType::ClaudeCode,
+        Some("skill unbound parent".into()),
+        None,
+    )
+    .await
+    .expect("parent");
+    let runs = Arc::new(RunStore::new(db.clone()));
+    let mock = Arc::new(MockSpawner::new());
+    let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+    for (name, key, agent) in [
+        (
+            "design-continue",
+            "design|docs/codeg-design.md|reviewer|codex|none",
+            AgentType::Codex,
+        ),
+        (
+            "plan-continue",
+            "plan|docs/codeg-plan.md|author|codex|none",
+            AgentType::Codex,
+        ),
+        (
+            "final-continue",
+            "final_review|reviewer|codex|none",
+            AgentType::Codex,
+        ),
+        ("legacy-unbound", "unit-legacy-simple", AgentType::Grok),
+    ] {
+        let (task_id, child_id) = start_and_complete(
+            &broker,
+            &mock,
+            delegate_req(
+                parent.id,
+                &format!("tu-{name}"),
+                agent,
+                name,
+                "/tmp/codeg-skill-unbound",
+                Some(key),
+            ),
+            name,
+        )
+        .await;
+        set_child_external_id(&db, child_id, &format!("sess-{name}")).await;
+        let first = runs
+            .load_by_task_id(&task_id)
+            .await
+            .expect("first lookup")
+            .expect("first");
+        assert_run_binding(&first, None, name);
+        let continued_id = continue_and_complete(
+            &broker,
+            &mock,
+            continue_req(
+                parent.id,
+                &format!("tu-{name}-cont"),
+                &task_id,
+                &format!("continue {name}"),
+                Some(key),
+            ),
+            &format!("{name}-cont"),
+            child_id,
+            agent,
+        )
+        .await;
+        let continued = runs
+            .load_by_task_id(&continued_id)
+            .await
+            .expect("continued lookup")
+            .expect("continued");
+        assert_run_binding(&continued, None, name);
+        assert_eq!(continued.agent_type, agent);
+    }
 }
 
 // ---------------------------------------------------------------------------

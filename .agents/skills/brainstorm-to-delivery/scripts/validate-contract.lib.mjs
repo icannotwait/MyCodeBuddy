@@ -119,15 +119,17 @@ const REQUIRED_SKILL_CONTRACT = {
     later_run: "continue_delegation",
     join: "get_delegation_status",
     recovery_authorization: "request_recovery_authorization",
+    binding_query: "get_delegation_orchestration_bindings",
   },
   plan_setup_order: [
-    "create-progress",
+    "create-progress-shell",
     "dispatch-plan-author",
-    "confirm-plan-on-disk",
-    "validate-routing",
+    "derive-plan-routing",
+    "initialize-progress-from-validator",
+    "validate-static-documents",
+    "validate-durable-admission",
     "review-plan",
     "register-simple-workflow",
-    "sync-plan-tasks",
   ],
   document_work: {
     parent_edits: false,
@@ -139,6 +141,8 @@ const REQUIRED_SKILL_CONTRACT = {
     producer_reviewer_independence: true,
     plan_rereview: "full_latest_plan",
     user_named_reviewers: "design_and_plan_only",
+    admission_cadence:
+      "fresh_applicable_mode_before_every_dispatch_or_continuation",
   },
   conversation_identity: {
     distinct_work_units: "distinct_child_conversations",
@@ -164,6 +168,9 @@ const REQUIRED_SKILL_CONTRACT = {
     reviewer_slots: ["primary", "auxiliary"],
     task_order: "serial",
     high_review_fan_out: "parallel_after_implementation",
+    binding_schema_version: 1,
+    binding_namespace: "brainstorm-to-delivery",
+    binding_source: "validator_output",
   },
   progress: {
     marker: "codeg-simple-progress-v1",
@@ -174,12 +181,17 @@ const REQUIRED_SKILL_CONTRACT = {
       "record-observed-state",
     ],
     route_metadata: "additive",
+    dispatch_intent: "operation_specific_before_call",
+    pending_route_change: "record_before_plan_revision_clear_after_approval",
   },
   workspace_policy: "preserve-user-changes",
   recovery: {
     unexpected_continuations: 2,
     logical_replacements: 1,
     replacement_retry: "pre-admission-only",
+    durable_reconciliation: "fresh_complete_parent_scoped_snapshot",
+    lost_acknowledgement: "one_exact_unresolved_intent",
+    status_refresh: "state_only_then_fresh_full_admission",
   },
   final_review: {
     required: true,
@@ -196,6 +208,7 @@ const CONTRACT_ACTIONS = [
   "delegate_to_agent",
   "continue_delegation",
   "get_delegation_status",
+  "get_delegation_orchestration_bindings",
   "request_recovery_authorization",
   "recovery_confirmation_required",
   "recovery_authorization_id",
@@ -223,21 +236,33 @@ const NEGATED_CONTRACT_ACTION = new RegExp(
 )
 const POSITIVE_SKILL_DIRECTIVES = new Set([
   "adjudicate",
+  "adopt",
+  "append",
+  "block",
   "call",
   "choose",
+  "clear",
   "commit",
   "complete",
+  "confirm",
   "continue",
+  "copy",
   "create",
+  "discard",
   "dispatch",
   "execute",
+  "exhaust",
+  "fetch",
   "handle",
   "inspect",
   "join",
   "keep",
   "mark",
+  "pass",
+  "persist",
   "prefer",
   "preserve",
+  "prove",
   "read",
   "re-read",
   "record",
@@ -245,7 +270,9 @@ const POSITIVE_SKILL_DIRECTIVES = new Set([
   "replace",
   "replay",
   "report",
+  "requery",
   "request",
+  "require",
   "route",
   "run",
   "set",
@@ -5464,7 +5491,35 @@ function conflictsWithRequiredReview(clause) {
   })
 }
 
+const DURABLE_ORCHESTRATION_CONTRADICTIONS = [
+  /fall\s+back\s+to\s+get_delegation_status/,
+  /parent\s+hashes\s+the\s+route\s+fingerprint/,
+  /plan\s+author\s+hashes\s+the\s+orchestration\s+binding/,
+  /record\s+the\s+dispatch\s+intent\s+after\s+the\s+delegation\s+call/,
+  /adopt\s+a\s+durable\s+row\s+without\s+an\s+unresolved/,
+  /reuse\s+stale\s+or\s+mixed\s+snapshot\s+pages/,
+  /authorize\s+task\s+execution\s+from\s+static\s+validation/,
+  /bind\s+the\s+design\s+reviewer\s+run\s+with\s+an\s+orchestration\s+binding/,
+  /bind\s+the\s+final-review\s+run\s+with\s+an\s+orchestration\s+binding/,
+  /change\s+the\s+generation\s+of\s+an\s+admitted\s+task/,
+  /omit\s+the\s+pending_route_change/,
+  /clear\s+pending_route_change\s+before\s+plan\s+approval/,
+  /dispatch\s+a\s+task\s+while\s+pending_route_change/,
+  /treat\s+a\s+status-only\s+refresh\s+as\s+a\s+permanent\s+blocker/,
+  /rewrite\s+the\s+identity\s+and\s+binding\s+during\s+a\s+status-only/,
+  /reuse\s+one\s+admission\s+across\s+design\s+and\s+final-review/,
+  /treat\s+rust\s+projection\s+warnings\s+as\s+a\s+gate/,
+]
+
+function conflictsWithDurableOrchestration(prose) {
+  const text = String(prose ?? "").toLowerCase()
+  return DURABLE_ORCHESTRATION_CONTRADICTIONS.some((pattern) =>
+    pattern.test(text)
+  )
+}
+
 function hasConflictingSkillDirective(prose) {
+  if (conflictsWithDurableOrchestration(prose)) return true
   return directiveWindows(prose).some((window) => {
     const clause = parseDirectiveClause(window)
     return (
