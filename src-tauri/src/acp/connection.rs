@@ -21127,6 +21127,7 @@ mod tests {
 
     // ---- empty-turn diagnosis ----
 
+    #[cfg(feature = "unmerged-upstream-helpers")]
     fn drop_err(msg: &str) -> String {
         msg.to_string()
     }

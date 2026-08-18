@@ -2061,7 +2061,6 @@ impl CodexParser {
         let mut recorded_round_usage = TurnUsage::default();
 
         // Per-turn model + reasoning effort from each `turn_context`.
-        let mut last_turn_context_ts: Option<DateTime<Utc>> = None;
         let mut turn_context_snaps: Vec<CodexTurnContextSnap> = Vec::new();
 
         let mut first_timestamp: Option<DateTime<Utc>> = None;
@@ -2197,7 +2196,7 @@ impl CodexParser {
                     if model.is_none() {
                         model = ctx_model.clone();
                     }
-                    last_turn_context_ts = parse_codex_timestamp(&value);
+                    let last_turn_context_ts = parse_codex_timestamp(&value);
                     turn_context_snaps.push(CodexTurnContextSnap {
                         ts: last_turn_context_ts.unwrap_or_else(Utc::now),
                         model: ctx_model,

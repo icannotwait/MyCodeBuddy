@@ -46,6 +46,10 @@ server = []
 # `db::test_helpers` module) for integration tests in `tests/*.rs`. Without
 # this feature the items are physically uncompiled in release builds.
 test-utils = ["tauri?/devtools", "tauri?/test"]
+# Compiles helper-only unit tests that still track unmerged upstream helpers.
+# Off in CI; declare the feature so `cfg(feature = "unmerged-upstream-helpers")`
+# is a known check-cfg value (avoids unexpected_cfgs under -D warnings).
+unmerged-upstream-helpers = []
 
 [[bin]]
 name = "codeg"
