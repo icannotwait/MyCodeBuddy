@@ -3147,6 +3147,7 @@
         "showLess": "접기",
         "responseInterrupted": "응답이 중단됨",
         "waitingForSubagents": "하위 작업 대기 중…",
+        "backgroundContinuation": "백그라운드 이어쓰기",
         "loadOlderHistory": "이전 메시지 불러오기",
         "loadEarlier": "이전 메시지 불러오기",
         "loadingEarlier": "이전 메시지를 불러오는 중…"

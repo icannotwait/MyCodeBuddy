@@ -3147,6 +3147,7 @@
         "showLess": "Mostrar menos",
         "responseInterrupted": "Respuesta interrumpida",
         "waitingForSubagents": "Esperando a los subagentes…",
+        "backgroundContinuation": "Continuación en segundo plano",
         "loadOlderHistory": "Cargar mensajes anteriores",
         "loadEarlier": "Cargar mensajes anteriores",
         "loadingEarlier": "Cargando mensajes anteriores…"

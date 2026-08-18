@@ -395,8 +395,9 @@ export interface ConversationDetail {
    * transcript-backed autonomous overlay providers (Claude, Grok
    * `updates.jsonl`, Codex native rollout); absent elsewhere). Retires
    * background-overlay turns whose `background_activity` watermark it has
-   * caught up to — see `BackgroundOverlayEntry` in the conversation runtime
-   * store.
+   * caught up to (`>=`) — see `BackgroundOverlayEntry` in the conversation
+   * runtime store. Until retirement, a same-id overlay and detail turn render
+   * once, preferring the newer overlay (origin included).
    */
   transcript_watermark?: number | null
 }

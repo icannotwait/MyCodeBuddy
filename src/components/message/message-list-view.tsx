@@ -83,6 +83,7 @@ import {
   ChevronRight,
   CircleStop,
   CopyIcon,
+  History,
   Info,
   Loader2,
   Plus,
@@ -98,6 +99,7 @@ import {
 } from "@/lib/agent-plan"
 import type {
   AgentType,
+  AutonomousTurnOrigin,
   ConnectionStatus,
   MessageTurn,
   TurnOutcome,
@@ -207,6 +209,12 @@ export interface ResolvedMessageGroup {
    * this is the last non-null outcome across the run.
    */
   outcome?: TurnOutcome | null
+  /**
+   * Provider-stamped autonomous origin. Present only on background
+   * continuations; origin-only updates must produce a new group so memoized
+   * assistant rows re-render the marker.
+   */
+  autonomous_origin?: AutonomousTurnOrigin | null
 }
 
 function topLevelAssistantTextParts(
@@ -368,6 +376,44 @@ export function extractTextFromParts(parts: AdaptedContentPart[]): string {
 
 type AssistantTurnItem = Extract<ThreadRenderItem, { kind: "turn" }>
 
+function normalizeAutonomousOrigin(
+  origin: AutonomousTurnOrigin | null | undefined
+): AutonomousTurnOrigin | null {
+  return origin ?? null
+}
+
+/** Stable episode key used as a merge boundary for autonomous assistant runs. */
+function autonomousEpisodeKey(turnId: string): string {
+  const grok = turnId.match(/^grok-autonomous:(.+):assistant:\d+$/)
+  if (grok) return `grok-autonomous:${grok[1]}`
+  const claudeOverlay = turnId.match(/^bg-(\d+)-\d+$/)
+  if (claudeOverlay) return `bg-${claudeOverlay[1]}`
+  return turnId
+}
+
+function assistantAutonomousIdentity(item: AssistantTurnItem): {
+  origin: AutonomousTurnOrigin | null
+  episode: string | null
+} {
+  const origin = normalizeAutonomousOrigin(
+    item.group.autonomous_origin ?? item.sourceTurns[0]?.autonomous_origin
+  )
+  return {
+    origin,
+    episode: origin ? autonomousEpisodeKey(item.group.id) : null,
+  }
+}
+
+function shouldFlushAutonomousAssistantRun(
+  prev: AssistantTurnItem,
+  next: AssistantTurnItem
+): boolean {
+  const left = assistantAutonomousIdentity(prev)
+  const right = assistantAutonomousIdentity(next)
+  if (left.origin !== right.origin) return true
+  return left.origin != null && left.episode !== right.episode
+}
+
 /**
  * Cache entry for one merged assistant run, keyed on the run's FIRST member
  * group. Valid only while every member's group reference and item key still
@@ -431,6 +477,10 @@ function compactionOnlyMeta(
  * collapsible. Empty (no-content) turn items are treated as transparent and
  * do not break the run — that handles cases where parsers leave empty
  * placeholder turns between tool exchanges.
+ *
+ * Autonomous origin is a hard grouping boundary: a change in origin, or a
+ * change in autonomous episode id, flushes the buffer. Foreground assistants
+ * (neither side has origin) keep the current merge behavior.
  *
  * Exported for tests.
  */
@@ -566,6 +616,8 @@ export function mergeConsecutiveAssistantTurns(
         group: {
           ...last.group,
           id: first.group.id,
+          autonomous_origin:
+            first.group.autonomous_origin ?? last.group.autonomous_origin,
           parts: mergedParts,
           autolinkableTextParts:
             mergedAutolinkableTextParts.size > 0
@@ -606,6 +658,10 @@ export function mergeConsecutiveAssistantTurns(
       if (buffer.length === 0) {
         for (const s of skipped) result.push(s)
         skipped.length = 0
+      } else if (
+        shouldFlushAutonomousAssistantRun(buffer[buffer.length - 1], item)
+      ) {
+        flush()
       }
       buffer.push(item)
       continue
@@ -729,6 +785,15 @@ const HistoricalMessageGroup = memo(function HistoricalMessageGroup({
 
   return (
     <div className={dimmed ? "opacity-70" : undefined}>
+      {group.role === "assistant" && group.autonomous_origin ? (
+        <div
+          data-testid="background-continuation-marker"
+          className="mb-1.5 flex items-center gap-1.5 text-xs text-muted-foreground"
+        >
+          <History aria-hidden="true" className="h-3.5 w-3.5 shrink-0" />
+          <span>{t("backgroundContinuation")}</span>
+        </div>
+      ) : null}
       {/* Outcome-only turns keep the footer but suppress an empty bubble. */}
       {hasBody || group.role === "user" ? (
         <Message from={group.role}>
@@ -1407,8 +1472,9 @@ export function MessageListView({
     const rawItems: ThreadRenderItem[] = projected.messages.map((msg, i) => {
       const phase = timelineTurns[i].phase
       const role = msg.role === "tool" ? "assistant" : msg.role
+      const autonomousOrigin = allTurns[i].autonomous_origin ?? undefined
       let group = groupCache.get(msg)
-      if (!group) {
+      if (!group || group.autonomous_origin !== autonomousOrigin) {
         group = {
           id: msg.id,
           role,
@@ -1422,6 +1488,7 @@ export function MessageListView({
           reasoning_effort: msg.reasoning_effort,
           completed_at: msg.completed_at,
           outcome: msg.outcome,
+          autonomous_origin: autonomousOrigin,
         }
         groupCache.set(msg, group)
       }

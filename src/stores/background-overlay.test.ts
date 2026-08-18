@@ -202,6 +202,72 @@ describe("watermark hand-off on FETCH_DETAIL_SUCCESS", () => {
   })
 })
 
+describe("autonomous overlay same-id preference", () => {
+  it("same autonomous id prefers newer overlay until watermark covers it", () => {
+    actions().applyBackgroundActivity(
+      7,
+      [
+        {
+          ...turn("grok-autonomous:x:assistant:0", "v1"),
+          autonomous_origin: "background_task",
+        },
+      ],
+      100
+    )
+    useConversationRuntimeStore.setState((s) => {
+      const current = s.byConversationId.get(7)
+      if (!current) throw new Error("session missing")
+      const next = new Map(s.byConversationId)
+      next.set(7, {
+        ...current,
+        detail: detail({
+          transcript_watermark: 50,
+          turns: [turn("grok-autonomous:x:assistant:0", "old")],
+        }),
+      })
+      return { byConversationId: next }
+    })
+
+    const rows = selectTimelineTurns(useConversationRuntimeStore.getState(), 7)
+    const matches = rows.filter(
+      (r) => r.turn.id === "grok-autonomous:x:assistant:0"
+    )
+    expect(matches).toHaveLength(1)
+    expect(matches[0].turn.blocks[0]).toMatchObject({
+      type: "text",
+      text: "v1",
+    })
+    expect(matches[0].turn.autonomous_origin).toBe("background_task")
+  })
+
+  it("equal grok watermark retires the overlay", async () => {
+    actions().applyBackgroundActivity(
+      7,
+      [turn("grok-autonomous:x:assistant:0", "v1")],
+      200
+    )
+    mockGetFolderConversation.mockResolvedValueOnce(
+      detail({
+        transcript_watermark: 200,
+        turns: [turn("grok-autonomous:x:assistant:0", "old")],
+      })
+    )
+    actions().refetchDetail(7)
+    await flushMicrotasks()
+
+    expect(session(7)?.backgroundTurns).toHaveLength(0)
+    const matches = selectTimelineTurns(
+      useConversationRuntimeStore.getState(),
+      7
+    ).filter((r) => r.turn.id === "grok-autonomous:x:assistant:0")
+    expect(matches).toHaveLength(1)
+    expect(matches[0].turn.blocks[0]).toMatchObject({
+      type: "text",
+      text: "old",
+    })
+  })
+})
+
 describe("timeline assembly", () => {
   it("renders overlay turns as persisted-phase entries after detail turns", async () => {
     mockGetFolderConversation.mockResolvedValueOnce(

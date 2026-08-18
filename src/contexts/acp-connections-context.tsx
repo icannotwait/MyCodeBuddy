@@ -1598,7 +1598,7 @@ function applyStreamingAction(
     if (now - lastOutOfTurnDropLogAt > 5_000) {
       lastOutOfTurnDropLogAt = now
       console.debug(
-        "[acp] dropping out-of-turn streaming deltas (transcript overlay renders them)",
+        "[acp] dropping out-of-turn streaming deltas (provider policy owns out-of-turn rendering)",
         { contextKey: conn.contextKey, type: action.type }
       )
     }

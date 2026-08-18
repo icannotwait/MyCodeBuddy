@@ -10,6 +10,7 @@ import type {
   MessageTurn,
 } from "@/lib/types"
 import enMessages from "@/i18n/messages/en.json"
+import zhCNMessages from "@/i18n/messages/zh-CN.json"
 import {
   canReloadSessionLoadError,
   mergeConsecutiveAssistantTurns,
@@ -760,6 +761,7 @@ function assistantItem(
   id: string,
   groupOverrides: Partial<TurnItem["group"]> = {}
 ): ThreadItem {
+  const origin = groupOverrides.autonomous_origin
   return {
     key: `persisted-${id}`,
     kind: "turn",
@@ -776,7 +778,15 @@ function assistantItem(
     showStats: false,
     isRoleTransition: false,
     previousUserIndex: null,
-    sourceTurns: [],
+    sourceTurns: [
+      {
+        id,
+        role: "assistant",
+        blocks: [],
+        timestamp: "",
+        ...(origin != null ? { autonomous_origin: origin } : {}),
+      },
+    ],
   }
 }
 
@@ -1639,6 +1649,78 @@ describe("MessageListView sub-agent overlay composition", () => {
     __resetStreamingPerformanceConfigForTests()
     renderMessageList({ workspaceRootPath: "D:\\Repo\\Task7" })
     expect(lastOverlayProps().workspaceRootPath).toBe("D:\\Repo\\Task7")
+  })
+})
+
+describe("mergeConsecutiveAssistantTurns autonomous origin boundary", () => {
+  it("does not merge foreground into autonomous or autonomous into foreground", () => {
+    const merged = mergeConsecutiveAssistantTurns([
+      assistantItem("a", { autonomous_origin: undefined }),
+      assistantItem("b", { autonomous_origin: "background_task" }),
+      assistantItem("c", { autonomous_origin: undefined }),
+    ])
+    expect(merged).toHaveLength(3)
+  })
+
+  it("does not merge distinct autonomous episode ids", () => {
+    const merged = mergeConsecutiveAssistantTurns([
+      assistantItem("grok-autonomous:1:assistant:0", {
+        autonomous_origin: "background_task",
+      }),
+      assistantItem("grok-autonomous:2:assistant:0", {
+        autonomous_origin: "background_task",
+      }),
+    ])
+    expect(merged).toHaveLength(2)
+  })
+})
+
+describe("MessageListView autonomous continuation marker", () => {
+  beforeEach(() => {
+    resetConversationRuntimeStore()
+    __resetLiveTranscriptStoreForTests()
+    __resetStreamingPerformanceConfigForTests()
+  })
+
+  afterEach(() => {
+    cleanup()
+    resetConversationRuntimeStore()
+    __resetLiveTranscriptStoreForTests()
+    __resetStreamingPerformanceConfigForTests()
+  })
+
+  it("shows the zh-CN marker above autonomous content and never for historical turns", () => {
+    seedHistory([
+      userTurn("u1", "hello"),
+      assistantTurn("a1", "prior reply"),
+      {
+        ...assistantTurn("grok-autonomous:x:assistant:0", "continued work"),
+        autonomous_origin: "background_task",
+      },
+    ])
+
+    render(
+      <NextIntlClientProvider locale="zh-CN" messages={zhCNMessages}>
+        <MessageListView
+          conversationId={CID}
+          agentType="codex"
+          connStatus="connected"
+          isActive
+          showMessageNav={false}
+        />
+      </NextIntlClientProvider>
+    )
+
+    const markers = screen.getAllByTestId("background-continuation-marker")
+    expect(markers).toHaveLength(1)
+    expect(markers[0]).toHaveTextContent("后台续写")
+    expect(screen.getByText("continued work")).toBeInTheDocument()
+    expect(screen.getByText("prior reply")).toBeInTheDocument()
+    expect(screen.queryByText("<system-reminder>")).toBeNull()
+    expect(screen.queryByText(/Background task/)).toBeNull()
+    expect(
+      extractTextFromParts([{ type: "text", text: "continued work" }])
+    ).not.toContain("后台续写")
   })
 })
 
