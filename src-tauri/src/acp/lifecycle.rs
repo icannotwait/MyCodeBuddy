@@ -1939,8 +1939,8 @@ mod delegation_registration_tests {
     //! a key backfilled by a later update.
 
     use super::{
-        enricher_for_lifecycle, install_test_cursor_enricher, register_delegation_tool_call_from_event,
-        run_broker_tool_side_effects,
+        acquire_test_cursor_enricher_span, enricher_for_lifecycle, install_test_cursor_enricher,
+        register_delegation_tool_call_from_event, run_broker_tool_side_effects,
     };
     use crate::acp::cursor_enrichment::test_support::{FixedStore, MapSessions, SleepThenStore};
     use crate::acp::cursor_enrichment::{CursorEnrichmentSession, CursorStoreEnricher};
@@ -1963,7 +1963,9 @@ mod delegation_registration_tests {
     /// installed enricher from one test can never leak into a
     /// concurrently-running test under the default multi-thread `cargo
     /// test` runner. Construct AFTER `install_test_cursor_enricher(Some(..))`
-    /// and hold it for the rest of the test.
+    /// and hold it for the rest of the test, declared AFTER (so it drops
+    /// BEFORE) a held `acquire_test_cursor_enricher_span()` guard: the reset
+    /// to `None` must happen while the serialization span is still held.
     struct ResetTestCursorEnricherOnDrop;
 
     impl Drop for ResetTestCursorEnricherOnDrop {
@@ -2577,6 +2579,10 @@ mod delegation_registration_tests {
             .into(),
         )));
         let installed = Arc::new(CursorStoreEnricher::new(store, sessions, b.clone(), b.metrics()));
+        // Acquire the span BEFORE installing and hold it for the whole test
+        // (declared first so it drops LAST, after `_reset`) so no
+        // concurrently-running test can observe a torn value.
+        let _span = acquire_test_cursor_enricher_span();
         install_test_cursor_enricher(Some(installed.clone()));
         let _reset = ResetTestCursorEnricherOnDrop;
 
@@ -2621,6 +2627,10 @@ mod delegation_registration_tests {
     /// test actually exercises.
     #[tokio::test]
     async fn composition_yields_none_when_no_test_enricher_installed() {
+        // Hold the span for the whole check too: without it, a
+        // concurrently-running seam test could have `Some(..)` installed
+        // at the exact moment this reads, making the assertion flaky.
+        let _span = acquire_test_cursor_enricher_span();
         install_test_cursor_enricher(None);
         let _reset = ResetTestCursorEnricherOnDrop;
 
@@ -3061,11 +3071,113 @@ fn install_test_broker_tool_stall(
 static TEST_CURSOR_ENRICHER: std::sync::Mutex<Option<Arc<CursorStoreEnricher>>> =
     std::sync::Mutex::new(None);
 
+/// Serializes every access to [`TEST_CURSOR_ENRICHER`] — both individual
+/// reads/writes AND the *entire* install→read→reset span of a test that
+/// installs a value — across threads. Without this, two seam tests on
+/// separate OS threads (each `#[tokio::test]` gets its own thread under
+/// the default multi-thread `cargo test` runner) can interleave: one
+/// overwrites or clears the other's installed value mid-test, or an
+/// unrelated `lifecycle_subscriber_task`-driving test (which always
+/// expects `None`) observes a `Some` left mid-install by a concurrently
+/// running seam test.
+///
+/// A plain `std::sync::Mutex<()>` is NOT reentrant: a seam test needs to
+/// hold the lock for its whole body (via
+/// [`TestCursorEnricherSpanLock::acquire`]) while ALSO calling
+/// [`enricher_for_lifecycle`] on the very same thread, which itself takes
+/// the same lock to read the value — a non-reentrant mutex would
+/// self-deadlock on that second acquisition. This tracks the owning
+/// `ThreadId` (compared with `==`; never a `thread_local!`) so the owning
+/// thread can re-enter for free while every other thread blocks
+/// (spin-with-sleep, since contention is rare and test-only) until the
+/// count returns to zero.
+#[cfg(test)]
+struct TestCursorEnricherSpanLock {
+    owner: std::sync::Mutex<Option<(std::thread::ThreadId, usize)>>,
+}
+
+#[cfg(test)]
+static TEST_CURSOR_ENRICHER_SPAN_LOCK: TestCursorEnricherSpanLock = TestCursorEnricherSpanLock {
+    owner: std::sync::Mutex::new(None),
+};
+
+#[cfg(test)]
+impl TestCursorEnricherSpanLock {
+    /// Blocks the calling thread until the span is free (or already owned
+    /// by this same thread), then claims/re-enters it.
+    fn acquire(&'static self) -> TestCursorEnricherSpanGuard {
+        let this_thread = std::thread::current().id();
+        loop {
+            let mut owner = self.owner.lock().unwrap_or_else(|e| e.into_inner());
+            match *owner {
+                Some((tid, count)) if tid == this_thread => {
+                    *owner = Some((tid, count + 1));
+                    return TestCursorEnricherSpanGuard { lock: self };
+                }
+                None => {
+                    *owner = Some((this_thread, 1));
+                    return TestCursorEnricherSpanGuard { lock: self };
+                }
+                Some(_) => {
+                    // Owned by a different thread — drop the lock and
+                    // retry shortly. Contention is test-only and rare, so
+                    // a short spin-sleep is simpler and just as correct
+                    // as a condvar here.
+                    drop(owner);
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            }
+        }
+    }
+
+    fn release(&self) {
+        let mut owner = self.owner.lock().unwrap_or_else(|e| e.into_inner());
+        match *owner {
+            Some((tid, count)) if count > 1 => {
+                *owner = Some((tid, count - 1));
+            }
+            _ => {
+                *owner = None;
+            }
+        }
+    }
+}
+
+/// RAII handle for [`TestCursorEnricherSpanLock::acquire`]. Releasing (or
+/// decrementing the re-entrant count) happens on drop.
+#[cfg(test)]
+pub(crate) struct TestCursorEnricherSpanGuard {
+    lock: &'static TestCursorEnricherSpanLock,
+}
+
+#[cfg(test)]
+impl Drop for TestCursorEnricherSpanGuard {
+    fn drop(&mut self) {
+        self.lock.release();
+    }
+}
+
+/// Acquire (or, from the owning thread, re-enter) the seam's serialization
+/// span. A test that installs a value via [`install_test_cursor_enricher`]
+/// must call this FIRST and hold the returned guard for its entire body —
+/// including through any later call to [`enricher_for_lifecycle`] on the
+/// same thread (safe: re-entrant) — so no other thread can observe a
+/// partially-installed or prematurely-cleared value.
+#[cfg(test)]
+pub(crate) fn acquire_test_cursor_enricher_span() -> TestCursorEnricherSpanGuard {
+    TEST_CURSOR_ENRICHER_SPAN_LOCK.acquire()
+}
+
 /// Install (or clear, with `None`) the test-only [`CursorStoreEnricher`]
 /// returned by [`enricher_for_lifecycle`] under `#[cfg(test)]`. Test-only;
-/// production always takes the `#[cfg(not(test))]` branch below.
+/// production always takes the `#[cfg(not(test))]` branch below. Takes the
+/// span lock itself (re-entrant, so this is a no-op wait when the caller
+/// already holds it via [`acquire_test_cursor_enricher_span`]) so the write
+/// is always serialized against concurrent reads even if a caller forgets
+/// to hold the outer span.
 #[cfg(test)]
 pub(crate) fn install_test_cursor_enricher(enricher: Option<Arc<CursorStoreEnricher>>) {
+    let _span = TEST_CURSOR_ENRICHER_SPAN_LOCK.acquire();
     *TEST_CURSOR_ENRICHER
         .lock()
         .unwrap_or_else(|e| e.into_inner()) = enricher;
@@ -3076,7 +3188,10 @@ pub(crate) fn install_test_cursor_enricher(enricher: Option<Arc<CursorStoreEnric
 /// call site may construct a second production [`CursorStoreEnricher`].
 /// Under `#[cfg(test)]` this never touches [`CursorStoreReader::production`]
 /// (and therefore never opens `~/.cursor`): it returns whatever
-/// [`install_test_cursor_enricher`] last installed (`None` by default).
+/// [`install_test_cursor_enricher`] last installed (`None` by default),
+/// taking the same [`TestCursorEnricherSpanLock`] a seam test holds for its
+/// whole body so a subscriber test on another thread can never observe a
+/// `Some` mid-install.
 pub(crate) fn enricher_for_lifecycle(
     broker: &DelegationBroker,
     manager: &ConnectionManager,
@@ -3084,6 +3199,7 @@ pub(crate) fn enricher_for_lifecycle(
     #[cfg(test)]
     {
         let _ = (broker, manager);
+        let _span = TEST_CURSOR_ENRICHER_SPAN_LOCK.acquire();
         return TEST_CURSOR_ENRICHER
             .lock()
             .unwrap_or_else(|e| e.into_inner())
