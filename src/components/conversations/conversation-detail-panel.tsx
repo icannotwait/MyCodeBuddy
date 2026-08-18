@@ -54,18 +54,6 @@ import {
   type ConversationStatus,
   type EventEnvelope,
 } from "@/lib/types"
-import { getAgentLabel } from "@/lib/custom-agents"
-import {
-  getSavedModeId,
-  saveModePreference,
-} from "@/lib/selector-prefs-storage"
-import {
-  adoptLegacyNewConversationDraft,
-  buildConversationDraftStorageKey,
-  buildNewConversationDraftStorageKey,
-  clearMessageInputDraft,
-  saveMessageInputDraft,
-} from "@/lib/message-input-draft"
 import {
   ContextMenu,
   ContextMenuContent,
