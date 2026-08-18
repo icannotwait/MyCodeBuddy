@@ -1,0 +1,5 @@
+- Status: DONE
+- Commit SHA and subject: `6cfd1830 feat(workflow): parse Simple routing metadata`
+- One-line test summary: Routing 5/5, progress 6/6, Simple parser 14/14, key regression 15/15; formatting and diff checks passed.
+- Concerns: Existing sidecar and macOS linker warnings only; full Rust suite not run.
+- Report path: `.superpowers/sdd/2026-08-16-brainstorm-to-delivery-generic-task-agent-routing/task-2-report.md`

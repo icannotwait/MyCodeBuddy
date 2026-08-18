@@ -1,0 +1,1464 @@
+# Review package: 2d7467ab8c578a917d5ecfbc1d496cb0f3a48abf..943bfc291e7fa30d49c94b845e3528ba415a85a3
+
+## Commits
+943bfc29 fix(skill): bind generic task routing directives
+
+## Files changed
+ .../scripts/validate-contract.lib.mjs              | 486 +++++++++++++++++----
+ .../scripts/validate-contract.test.mjs             | 274 ++++++++++++
+ 2 files changed, 669 insertions(+), 91 deletions(-)
+
+## Diff
+diff --git a/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.lib.mjs b/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.lib.mjs
+index 82bb6e0a..a11d4659 100644
+--- a/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.lib.mjs
++++ b/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.lib.mjs
+@@ -234,20 +234,23 @@ const NAMED_AGENT_TERMS = new Set([
+   "codex",
+   "cursor",
+   "gemini",
+   "grok",
+   "hermes",
+   "kimi",
+   "open-code",
+   "opencode",
+   "pi",
+ ])
++const TASK_AGENT_NAME_TERMS = new Set(
++  [...NAMED_AGENT_TERMS].filter((name) => name !== "codex")
++)
+ const RESERVED_CUSTOM_AGENT_IDS = new Set([
+   ...BUILTIN_AGENT_TYPES,
+   "claude-acp",
+   "codex-acp",
+   "opencode",
+   "codebuddy-code",
+   "kimi-code",
+   "pi-acp",
+   "grok-build",
+   "kimi",
+@@ -383,38 +386,41 @@ const ORCHESTRATION_ACTIONS = new Set([
+   "tell",
+   "telling",
+   "tells",
+   "told",
+ ])
+ const PRODUCER_DELEGATION_ACTIONS = new Set([
+   ...ORCHESTRATION_ACTIONS,
+   ...DIRECT_ROUTE_ACTIONS,
+ ])
+ const FINITE_PARENT_PREDICATE_MARKERS = new Set([
+-  "afterward",
+   "can",
+   "could",
+   "did",
+   "does",
+   "itself",
+   "may",
+   "might",
+   "must",
+   "shall",
+   "should",
+   "will",
+   "would",
+ ])
+ const DOCUMENT_OR_CODE_TARGETS = new Set([
++  "artifact",
++  "artifacts",
+   "code",
+   "design",
+   "designs",
++  "document",
++  "documents",
+   "implementation",
+   "plan",
+   "plans",
+   "task",
+   "tasks",
+ ])
+ const NEGATION_TERMS = new Set([
+   "avoid",
+   "avoided",
+   "avoiding",
+@@ -439,36 +445,49 @@ const NEGATION_TERMS = new Set([
+   "refusing",
+   "without",
+ ])
+ const REVIEW_ABSENCE_TERMS = new Set([
+   "absent",
+   "lack",
+   "lacking",
+   "lacks",
+   "missing",
+   "no",
++  "omit",
++  "omits",
++  "omitted",
++  "omitting",
+   "without",
+ ])
++const POSTPOSED_REVIEW_ABSENCE_TERMS = new Set([
++  "absent",
++  "lacking",
++  "missing",
++  "omitted",
++])
+ const ACTOR_LINKS = new Set(["by", "to"])
+ const ACTOR_RELATION_MODIFIERS = new Set([
+   "a",
+   "an",
+   "both",
++  "current",
++  "currently",
+   "independent",
+   "mandatory",
+   "optional",
+   "primary",
+   "auxiliary",
+   "required",
+   "selected",
+   "separate",
+   "the",
++  "user-selected",
+ ])
+ const CLAUSE_COORDINATORS = new Set(["and", "but", "while", "yet"])
+ const PREDICATE_COORDINATORS = new Set(["and", "but"])
+ const TASK_RELATION_BOUNDARIES = new Set([...CLAUSE_COORDINATORS, "or"])
+ const HIGH_TASK_SCOPES = new Set(["high", "high-risk"])
+ const NORMAL_TASK_SCOPES = new Set(["normal"])
+ const UNIVERSAL_TASK_SCOPES = new Set([
+   "all",
+   "always",
+   "each",
+@@ -518,35 +537,43 @@ const REVIEW_BYPASS_ACTIONS = new Set([
+   "skips",
+   "skipping",
+   "stand",
+   "standing",
+   "stands",
+   "stood",
+   "substitute",
+   "substituted",
+   "substitutes",
+   "substituting",
++  "take",
++  "takes",
++  "taking",
++  "took",
+ ])
+ const REVIEW_REPLACEMENT_ACTIONS = new Set([
+   "place",
+   "replace",
+   "replaced",
+   "replaces",
+   "replacing",
+   "stand",
+   "standing",
+   "stands",
+   "stood",
+   "substitute",
+   "substituted",
+   "substitutes",
+   "substituting",
++  "take",
++  "takes",
++  "taking",
++  "took",
+ ])
+ const REVIEW_REQUIREMENT_ACTIONS = new Set(["mandatory", "required"])
+ const REVIEW_SUBJECT_LINKS = new Set([
+   "although",
+   "am",
+   "are",
+   "be",
+   "been",
+   "being",
+   "is",
+@@ -880,20 +907,21 @@ function directiveWindows(prose) {
+   for (const paragraph of withoutKeys
+     .normalize("NFKC")
+     .toLowerCase()
+     .split(/\n\s*\n+/)) {
+     let priorTokens = []
+     for (const source of paragraph.split(/[.!?;]+/)) {
+       const tokens = source.match(/[a-z0-9]+(?:-[a-z0-9]+)*/g) ?? []
+       for (let start = 0; start < tokens.length; start += step) {
+         windows.push({
+           tokens: tokens.slice(start, start + DIRECTIVE_WINDOW_TOKENS),
++          priorActors: directiveActors(priorTokens),
+           priorReviewers: directiveReviewers(priorTokens),
+           priorTasks: directiveTaskAntecedents(priorTokens),
+           priorDocumentTargets: directiveDocumentTargets(priorTokens),
+         })
+       }
+       if (tokens.length > 0) {
+         priorTokens = tokens.slice(-DIRECTIVE_WINDOW_TOKENS)
+       }
+     }
+   }
+@@ -937,35 +965,79 @@ function actionIsNegated(tokens, actionIndex) {
+   const prefix = tokens.slice(
+     Math.max(0, actionIndex - 6, (coordinator ?? -1) + 1),
+     actionIndex
+   )
+   return (
+     prefix.some((token) => NEGATION_TERMS.has(token)) ||
+     prefix.at(-1) === "from"
+   )
+ }
+ 
++function agentActorEnd(tokens, baseEnd) {
++  if (tokens[baseEnd] === "task" && tokens[baseEnd + 1] === "agent") {
++    return baseEnd + 2
++  }
++  return tokens[baseEnd] === "agent" ? baseEnd + 1 : baseEnd
++}
++
+ function directiveActors(tokens) {
+   const actors = []
+   for (const [index, token] of tokens.entries()) {
++    if (actors.some((actor) => actor.start <= index && index < actor.end)) {
++      continue
++    }
+     if (token === "parent") {
+       actors.push({ role: "parent", start: index, end: index + 1 })
+-    } else if (token === "grok") {
+-      actors.push({ role: "task_agent", start: index, end: index + 1 })
+     } else if (token === "codex") {
+-      actors.push({ role: "codex", start: index, end: index + 1 })
++      const end = agentActorEnd(tokens, index + 1)
++      actors.push({
++        role: end > index + 1 ? "task_agent" : "codex",
++        start: index,
++        end,
++      })
+     } else if (token === "task" && tokens[index + 1] === "agent") {
+       actors.push({ role: "task_agent", start: index, end: index + 2 })
+     } else if (token === "plan" && tokens[index + 1] === "author") {
+       actors.push({ role: "plan_author", start: index, end: index + 2 })
+     } else if (token === "design" && tokens[index + 1] === "fixer") {
+       actors.push({ role: "design_fixer", start: index, end: index + 2 })
++    } else if (token === "custom") {
++      const hasNamedId =
++        tokens[index + 1] !== undefined && tokens[index + 1] !== "agent"
++      const baseEnd = index + (hasNamedId ? 2 : 1)
++      actors.push({
++        role: "task_agent",
++        start: index,
++        end: agentActorEnd(tokens, baseEnd),
++      })
++    } else if (
++      TASK_AGENT_NAME_TERMS.has(token) &&
++      tokens[index - 1] !== "custom"
++    ) {
++      const baseEnd =
++        ["claude", "kimi"].includes(token) && tokens[index + 1] === "code"
++          ? index + 2
++          : index + 1
++      actors.push({
++        role: "task_agent",
++        start: index,
++        end: agentActorEnd(tokens, baseEnd),
++      })
++    } else if (
++      (token === "code" && tokens[index + 1] === "buddy") ||
++      (token === "open" && tokens[index + 1] === "code")
++    ) {
++      actors.push({
++        role: "task_agent",
++        start: index,
++        end: agentActorEnd(tokens, index + 2),
++      })
+     }
+   }
+   return actors
+ }
+ 
+ function directiveActions(tokens, actors) {
+   const roleTokens = new Set()
+   for (const actor of actors) {
+     if (actor.role !== "plan_author") continue
+     for (let index = actor.start; index < actor.end; index += 1) {
+@@ -1020,57 +1092,66 @@ function directiveTasks(tokens) {
+ function directiveTaskAntecedents(tokens) {
+   const clause = { tokens }
+   return directiveTasks(tokens).map((task) => ({
+     ...task,
+     active: taskHasAffirmativeActivity(clause, task),
+     completed: taskHasCompletedState(clause, task),
+   }))
+ }
+ 
+ function directiveDocumentTargets(tokens) {
+-  return tokens.filter((token) => DOCUMENT_OR_CODE_TARGETS.has(token))
++  const actors = directiveActors(tokens)
++  return tokens.flatMap((token, index) =>
++    DOCUMENT_OR_CODE_TARGETS.has(token) &&
++    !actors.some((actor) => actor.start <= index && index < actor.end)
++      ? [{ index, token }]
++      : []
++  )
+ }
+ 
+ function directiveReviewers(tokens) {
+   const reviewers = []
+   for (const index of tokenIndexes(tokens, REVIEW_TERMS)) {
+     const start = Math.max(0, index - 4)
+     const prefix = tokens.slice(start, index + 1)
+     const userNamed =
+       prefix.includes("user-named") ||
+       phraseIndex(tokens, ["user", "named"], start, index + 1) >= 0
+     reviewers.push({
+       index,
+       primary: prefix.includes("primary"),
+       auxiliary: prefix.includes("auxiliary"),
+       codex: prefix.includes("codex"),
++      required: prefix.includes("mandatory") || prefix.includes("required"),
+       optionalDocument:
+         userNamed && (prefix.includes("design") || prefix.includes("plan")),
+     })
+   }
+   return reviewers
+ }
+ 
+ function parseDirectiveClause(window) {
+   const {
+     tokens,
++    priorActors = [],
+     priorReviewers = [],
+     priorTasks = [],
+     priorDocumentTargets = [],
+   } = window
+   const actors = directiveActors(tokens)
+   return {
+     tokens,
+     actors,
+     actions: directiveActions(tokens, actors),
+     tasks: directiveTasks(tokens),
+     reviewers: directiveReviewers(tokens),
++    priorActors,
+     priorReviewers,
+     priorTasks,
+     priorDocumentTargets,
+   }
+ }
+ 
+ function actionSegment(clause, actionIndex) {
+   const coordinators = tokenIndexes(clause.tokens, CLAUSE_COORDINATORS)
+   const before = coordinators.filter((index) => index < actionIndex).at(-1)
+   const after = coordinators.find((index) => index > actionIndex)
+@@ -1243,34 +1324,50 @@ function actorsAfterLink(clause, link, end = clause.tokens.length) {
+   ) {
+     return []
+   }
+   return actors
+ }
+ 
+ function actorBindingsAfterLink(clause, action, link, end) {
+   const actors = actorsAfterLink(clause, link, end)
+   const relationNegated = relationTargetIsNegated(clause, action, link)
+   return actors.map((actor, index) => {
++    const previousActor = actors[index - 1]
+     const localStart = index === 0 ? link + 1 : actors[index - 1].end
+     const coordinator = tokenIndexes(
+       clause.tokens,
+       CLAUSE_COORDINATORS,
+       localStart,
+       actor.start
+     ).at(-1)
+     const negationStart = (coordinator ?? localStart - 1) + 1
+     const explicitlyNegated =
+       tokenIndex(clause.tokens, NEGATION_TERMS, negationStart, actor.start) >= 0
++    const excludedAlternative =
++      previousActor !== undefined &&
++      (phraseIndex(
++        clause.tokens,
++        ["rather", "than"],
++        previousActor.end,
++        actor.start
++      ) >= 0 ||
++        phraseIndex(
++          clause.tokens,
++          ["instead", "of"],
++          previousActor.end,
++          actor.start
++        ) >= 0)
+     return {
+       actor,
+       negated:
+         explicitlyNegated ||
++        excludedAlternative ||
+         (coordinator !== undefined && clause.tokens[coordinator] === "but"
+           ? false
+           : relationNegated),
+     }
+   })
+ }
+ 
+ function directPassiveActorsForAction(clause, action) {
+   const nextAction = clause.actions.find(
+     (candidate) => candidate.index > action.index
+@@ -1385,39 +1482,75 @@ function relationTargetIsNegated(clause, action, link) {
+   ) {
+     return true
+   }
+   if (coordinator !== undefined && clause.tokens[coordinator] === "but") {
+     return false
+   }
+   return actionIsNegated(clause.tokens, action.index)
+ }
+ 
+ function actionHasDocumentTarget(clause, action) {
++  const segment = actionSegment(clause, action.index)
++  const documentTargets = directiveDocumentTargets(clause.tokens)
+   if (
+-    tokenIndex(
+-      clause.tokens,
+-      DOCUMENT_OR_CODE_TARGETS,
+-      Math.max(0, action.index - 10),
+-      action.index + 10
+-    ) >= 0
++    documentTargets.some(
++      (target) => target.index >= segment.start && target.index < segment.end
++    )
+   ) {
+     return true
+   }
+-  const segment = actionSegment(clause, action.index)
+-  return (
+-    clause.priorDocumentTargets.length > 0 &&
+-    tokenIndex(
++  const hasDocumentAntecedent =
++    clause.priorDocumentTargets.length > 0 ||
++    documentTargets.some((target) => target.index < segment.start)
++  if (!hasDocumentAntecedent) return false
++  if (
++    tokenIndex(clause.tokens, new Set(["it"]), segment.start, segment.end) >=
++      0 ||
++    phraseIndex(
+       clause.tokens,
+-      new Set(["it", "them"]),
++      ["that", "document"],
++      segment.start,
++      segment.end
++    ) >= 0 ||
++    phraseIndex(
++      clause.tokens,
++      ["that", "artifact"],
++      segment.start,
++      segment.end
++    ) >= 0 ||
++    phraseIndex(
++      clause.tokens,
++      ["the", "document"],
++      segment.start,
++      segment.end
++    ) >= 0 ||
++    phraseIndex(
++      clause.tokens,
++      ["the", "artifact"],
+       segment.start,
+       segment.end
+     ) >= 0
++  ) {
++    return true
++  }
++  if (
++    clause.priorActors.length === 0 &&
++    clause.priorReviewers.length === 0 &&
++    tokenIndex(clause.tokens, new Set(["them"]), segment.start, segment.end) >=
++      0
++  ) {
++    return true
++  }
++
++  const trailing = clause.tokens.slice(action.index + 1, segment.end)
++  return trailing.every((token) =>
++    new Set(["again", "afterward", "directly", "too"]).has(token)
+   )
+ }
+ 
+ function reviewPurposeInRange(clause, start, end) {
+   if (tokenIndex(clause.tokens, REVIEW_TERMS, start, end) < 0) {
+     return null
+   }
+   if (tokenIndex(clause.tokens, new Set(["primary"]), start, end) >= 0) {
+     return "primary"
+   }
+@@ -1450,55 +1583,94 @@ function relationBindingsAfterLink(clause, action, link, end) {
+     clause.tokens,
+     CLAUSE_COORDINATORS,
+     action.index + 1,
+     link
+   ).at(-1)
+   const prefixSlot = singleReviewSlot(
+     clause,
+     (coordinator ?? action.index) + 1,
+     link
+   )
+-  const purpose = reviewPurposeInRange(
++  const relationPurpose = reviewPurposeInRange(
+     clause,
+     (coordinator ?? action.index) + 1,
+     relationEnd
+   )
+   return actors.map((actor) => {
+     const actorIndex = allActors.findIndex(
+       (candidate) => candidate.start === actor.start
+     )
+     const previousActor = allActors[actorIndex - 1]
++    const nextActor = allActors[actorIndex + 1]
+     const actorCoordinator = previousActor
+       ? tokenIndexes(
+           clause.tokens,
+           CLAUSE_COORDINATORS,
+           previousActor.end,
+           actor.start
+         ).at(-1)
+       : undefined
++    const nextActorCoordinator = nextActor
++      ? tokenIndexes(
++          clause.tokens,
++          CLAUSE_COORDINATORS,
++          actor.end,
++          nextActor.start
++        ).at(-1)
++      : undefined
++    let preStart =
++      actorIndex === 0
++        ? link + 1
++        : (actorCoordinator ?? previousActor.end - 1) + 1
++    if (previousActor && actorCoordinator === undefined) {
++      const previousRoleDescriptor = tokenIndex(
++        clause.tokens,
++        new Set([
++          "implementation",
++          "implementer",
++          "review",
++          "reviewer",
++          "reviewers",
++        ]),
++        previousActor.end,
++        actor.start
++      )
++      if (previousRoleDescriptor >= 0) preStart = previousRoleDescriptor + 1
++    }
++    const postEnd = nextActorCoordinator ?? nextActor?.start ?? relationEnd
++    const slot =
++      prefixSlot ??
++      singleReviewSlot(clause, preStart, actor.start) ??
++      singleReviewSlot(clause, actor.end, postEnd)
++    const localPurpose =
++      reviewPurposeInRange(clause, preStart, actor.start) ??
++      reviewPurposeInRange(clause, actor.end, postEnd)
++    const explicitImplementation =
++      tokenIndex(
++        clause.tokens,
++        new Set(["implementation", "implementer"]),
++        preStart,
++        actor.start
++      ) >= 0 ||
++      tokenIndex(
++        clause.tokens,
++        new Set(["implementation", "implementer"]),
++        actor.end,
++        postEnd
++      ) >= 0
+     return {
+       actor,
+-      purpose,
+-      slot:
+-        prefixSlot ??
+-        singleReviewSlot(
+-          clause,
+-          actorIndex === 0
+-            ? link + 1
+-            : (actorCoordinator ?? previousActor.end - 1) + 1,
+-          actor.start
+-        ) ??
+-        singleReviewSlot(
+-          clause,
+-          actor.end,
+-          allActors[actorIndex + 1]?.start ?? relationEnd
+-        ),
++      implementationExplicit: explicitImplementation,
++      purpose: explicitImplementation
++        ? null
++        : (slot ?? localPurpose ?? relationPurpose),
++      slot: explicitImplementation ? null : slot,
+     }
+   })
+ }
+ 
+ function routeTargetBindingsForAction(clause, action) {
+   const nextRoute = clause.actions.find(
+     (candidate) => candidate.kind === "route" && candidate.index > action.index
+   )
+   const end = nextRoute?.index ?? clause.tokens.length
+   const bindings = tokenIndexes(
+@@ -1510,20 +1682,21 @@ function routeTargetBindingsForAction(clause, action) {
+   const reflexive = tokenIndexes(
+     clause.tokens,
+     REFLEXIVE_TARGETS,
+     action.index + 1,
+     end
+   )
+   if (reflexive.length > 0 && !actionIsNegated(clause.tokens, action.index)) {
+     bindings.push(
+       ...subjectActorsForAction(clause, action).map((actor) => ({
+         actor,
++        implementationExplicit: false,
+         purpose: routeReviewPurpose(clause, action),
+         slot: null,
+       }))
+     )
+   }
+   return bindings.filter(
+     (binding, index) =>
+       bindings.findIndex(
+         (candidate) =>
+           candidate.actor.role === binding.actor.role &&
+@@ -1586,20 +1759,62 @@ function actionDelegatesToProducer(clause, parent, action) {
+         !relationTokens.some((token) => ["but", "then"].includes(token)) &&
+         !clause.actors.some(
+           (actor) =>
+             actor.start > previous.index && actor.end <= candidate.index
+         )
+       )
+     })
+   })
+ }
+ 
++function actionIsPassivelyDelegatedToProducer(clause, parent, action) {
++  return clause.actors.some((producer) => {
++    if (
++      !["design_fixer", "plan_author"].includes(producer.role) ||
++      producer.end > parent.start ||
++      parent.end > action.index
++    ) {
++      return false
++    }
++    const passiveLink = tokenIndex(
++      clause.tokens,
++      new Set(["by"]),
++      producer.end,
++      parent.start
++    )
++    const orchestration = tokenIndex(
++      clause.tokens,
++      ORCHESTRATION_ACTIONS,
++      producer.end,
++      parent.start
++    )
++    const infinitive = tokenIndex(
++      clause.tokens,
++      new Set(["to"]),
++      parent.end,
++      action.index
++    )
++    const repeatedParent = clause.actors.some(
++      (actor) =>
++        actor.role === "parent" &&
++        actor.start > parent.end &&
++        actor.end <= action.index
++    )
++    return (
++      passiveLink >= 0 &&
++      orchestration >= 0 &&
++      infinitive >= 0 &&
++      !repeatedParent
++    )
++  })
++}
++
+ function repeatedProducerSubjectForAction(clause, action) {
+   const previous = clause.actions
+     .filter(
+       (candidate) =>
+         candidate.kind === "production" && candidate.index < action.index
+     )
+     .at(-1)
+   if (!previous) return null
+   return clause.actors.find(
+     (actor) =>
+@@ -1690,45 +1905,89 @@ function reviewerSlotIsExplicitlyAbsent(clause, action, slotName) {
+   return tokenIndexes(
+     clause.tokens,
+     new Set([slotName]),
+     segment.start,
+     segment.end
+   ).some((slot) => relationIsExplicitlyAbsent(clause, slot, segment.start))
+ }
+ 
+ function reviewerRoleIsExplicitlyAbsent(clause, action, role) {
+   const segment = actionSegment(clause, action.index)
++  const nextAction = clause.actions.find(
++    (candidate) => candidate.index > action.index
++  )
++  const relationEnd = nextAction?.index ?? clause.tokens.length
+   return clause.actors
+     .filter(
+       (actor) =>
+         actor.role === role &&
+         actor.start >= segment.start &&
+-        actor.end <= segment.end
+-    )
+-    .some((actor) =>
+-      relationIsExplicitlyAbsent(clause, actor.start, segment.start)
++        actor.end <= relationEnd
+     )
++    .some((actor) => {
++      if (relationIsExplicitlyAbsent(clause, actor.start, segment.start)) {
++        return true
++      }
++      const negation = tokenIndexes(
++        clause.tokens,
++        NEGATION_TERMS,
++        Math.max(segment.start, actor.start - 5),
++        actor.start
++      ).at(-1)
++      if (
++        negation !== undefined &&
++        tokenIndex(
++          clause.tokens,
++          new Set(["alone", "only"]),
++          negation + 1,
++          relationEnd
++        ) < 0 &&
++        tokenIndex(
++          clause.tokens,
++          REVIEW_ABSENCE_TERMS,
++          negation + 1,
++          actor.start
++        ) < 0
++      ) {
++        return true
++      }
++      return tokenIndexes(
++        clause.tokens,
++        POSTPOSED_REVIEW_ABSENCE_TERMS,
++        actor.end,
++        Math.min(relationEnd, actor.end + 6)
++      ).some((absence) => !actionIsNegated(clause.tokens, absence))
++    })
+ }
+ 
+ function reviewerSetIsExplicitlyEmpty(clause, action) {
+   const segment = actionSegment(clause, action.index)
+   const absence = tokenIndexes(
+     clause.tokens,
+     REVIEW_ABSENCE_TERMS,
+     Math.max(segment.start, action.index - 5),
+     action.index
+   ).at(-1)
+   if (absence === undefined) return false
+   const qualified =
+     tokenIndex(
+       clause.tokens,
+-      new Set(["auxiliary", "codex", "other", "primary", "task", "agent"]),
++      new Set([
++        "agent",
++        "another",
++        "auxiliary",
++        "codex",
++        "more",
++        "other",
++        "primary",
++        "task",
++      ]),
+       absence + 1,
+       action.index
+     ) >= 0
+   return (
+     !qualified &&
+     relationIsExplicitlyAbsent(clause, action.index, segment.start)
+   )
+ }
+ 
+ function explicitReviewerCardinality(clause, action) {
+@@ -1745,24 +2004,25 @@ function explicitReviewerCardinality(clause, action) {
+     ["3", 3],
+     ["third", 3],
+   ])
+   const start = Math.max(
+     actionSegment(clause, action.index).start,
+     action.index - 6
+   )
+   if (
+     tokenIndex(
+       clause.tokens,
+-      new Set(["additional", "extra", "surplus"]),
++      new Set(["additional", "another", "extra", "surplus"]),
+       start,
+       action.index
+-    ) >= 0
++    ) >= 0 ||
++    phraseIndex(clause.tokens, ["one", "more"], start, action.index) >= 0
+   ) {
+     return { extra: true, count: null, qualifiers: new Set() }
+   }
+   for (let index = action.index - 1; index >= start; index -= 1) {
+     const count = counts.get(clause.tokens[index])
+     if (count === undefined) continue
+     const qualifiers = new Set()
+     if (
+       tokenIndex(
+         clause.tokens,
+@@ -1876,20 +2136,30 @@ function conflictsWithReviewRoute(clause, action, scopes) {
+   const actionSlot = reviewSlotForAction(clause, action)
+   if (
+     normal &&
+     (actionSlot === "auxiliary" ||
+       bindings.some((binding) => binding.slot === "auxiliary") ||
+       actors.length > 1)
+   ) {
+     return true
+   }
+   if (high && actors.length > 2) return true
++  if (
++    high &&
++    actors.length > 1 &&
++    actors.some(
++      (actor, index) =>
++        actors.findIndex((candidate) => candidate.role === actor.role) !== index
++    )
++  ) {
++    return true
++  }
+   if (
+     high &&
+     reviewStatementIsExhaustive(clause, action) &&
+     actors.length === 0 &&
+     actionSlot !== null
+   ) {
+     return true
+   }
+ 
+   for (const { actor, slot } of bindings) {
+@@ -1925,20 +2195,27 @@ function conflictsWithReviewRoute(clause, action, scopes) {
+   return false
+ }
+ 
+ function conflictsWithDirectRoute(clause, action, scopes) {
+   const bindings = routeTargetBindingsForAction(clause, action)
+   const normal = ["normal", "universal"].some((scope) => scopes.has(scope))
+   const high = ["high", "universal"].some((scope) => scopes.has(scope))
+   const reviewBindings = bindings.filter((binding) => binding.purpose)
+   const implementationBindings = bindings.filter((binding) => !binding.purpose)
+ 
++  if (
++    reviewBindings.length > 0 &&
++    implementationBindings.some((binding) => !binding.implementationExplicit)
++  ) {
++    return true
++  }
++
+   if (reviewBindings.length > 0) {
+     const targets = reviewBindings.map((binding) => binding.actor)
+     if (
+       normal &&
+       (targets.length > 1 ||
+         targets.some((target) => target.role !== "codex") ||
+         reviewBindings.some((binding) => binding.slot === "auxiliary"))
+     ) {
+       return true
+     }
+@@ -2011,21 +2288,24 @@ function reviewActionIsRoutePurpose(clause, action) {
+ }
+ 
+ function conflictsWithParentOwnership(clause) {
+   const parents = clause.actors.filter((actor) => actor.role === "parent")
+   for (const parent of parents) {
+     const link = linkBeforeActor(clause, parent)
+     if (link !== undefined && clause.tokens[link] === "by") {
+       const action = nearestActionBefore(clause, link)
+       if (
+         action?.kind === "production" &&
+-        actionHasDocumentTarget(clause, action) &&
++        (actionHasDocumentTarget(clause, action) ||
++          predicateActionGroup(clause, action).some((candidate) =>
++            actionHasDocumentTarget(clause, candidate)
++          )) &&
+         !relationTargetIsNegated(clause, action, link)
+       ) {
+         return true
+       }
+     }
+ 
+     for (const action of clause.actions) {
+       if (
+         action.kind !== "production" ||
+         action.index <= parent.start ||
+@@ -2034,21 +2314,26 @@ function conflictsWithParentOwnership(clause) {
+       ) {
+         continue
+       }
+       const passiveActors = passiveActorsForAction(clause, action)
+       if (
+         passiveActors.length > 0 &&
+         passiveActors.every((actor) => actor.role !== "parent")
+       ) {
+         continue
+       }
+-      if (actionDelegatesToProducer(clause, parent, action)) continue
++      if (
++        actionDelegatesToProducer(clause, parent, action) ||
++        actionIsPassivelyDelegatedToProducer(clause, parent, action)
++      ) {
++        continue
++      }
+       if (repeatedProducerSubjectForAction(clause, action)) continue
+       return true
+     }
+   }
+   return false
+ }
+ 
+ function conflictsWithTaskAgentRoute(clause) {
+   for (const action of clause.actions) {
+     const passiveSubjects = passiveActorsForAction(clause, action)
+@@ -2168,61 +2453,66 @@ function hasActiveTaskTiming(clause) {
+ function hasNegatedTaskActivityTiming(clause) {
+   return tokenIndexes(clause.tokens, ACTIVE_TIMING_MARKERS).some((marker) =>
+     clause.tasks.some(
+       (task) =>
+         Math.abs(task.index - marker) <= 8 &&
+         taskHasNegatedActivity(clause, task)
+     )
+   )
+ }
+ 
+-function hasCompletedTaskTiming(clause) {
+-  return tokenIndexes(clause.tokens, BOUNDARY_TIMING_MARKERS).some((marker) => {
+-    const completions = tokenIndexes(
++function timingSegmentEnd(clause, marker) {
++  return (
++    tokenIndexes(
+       clause.tokens,
+-      TASK_COMPLETION_TERMS,
+-      Math.max(0, marker - 10),
+-      marker + 11
+-    ).filter((completion) => !actionIsNegated(clause.tokens, completion))
+-    return clause.tasks.some(
+-      (task) =>
+-        Math.abs(task.index - marker) <= 10 &&
+-        completions.some((completion) => Math.abs(completion - task.index) <= 5)
+-    )
+-  })
++      new Set([...BOUNDARY_TIMING_MARKERS, ...PRE_COMPLETION_TIMING_MARKERS]),
++      marker + 1
++    )[0] ?? clause.tokens.length
++  )
+ }
+ 
+-function hasPreCompletionTaskTiming(clause, change) {
+-  return tokenIndexes(clause.tokens, PRE_COMPLETION_TIMING_MARKERS).some(
+-    (marker) => {
+-      const completions = tokenIndexes(
+-        clause.tokens,
+-        TASK_COMPLETION_TERMS,
+-        marker + 1,
+-        marker + 11
+-      ).filter((completion) => !actionIsNegated(clause.tokens, completion))
++function timingReferencesCompletion(clause, marker) {
++  const end = timingSegmentEnd(clause, marker)
++  return tokenIndexes(clause.tokens, TASK_COMPLETION_TERMS, marker + 1, end)
++    .filter((completion) => !actionIsNegated(clause.tokens, completion))
++    .some((completion) => {
+       if (
+-        !clause.tasks.some((task) =>
+-          completions.some(
+-            (completion) => Math.abs(completion - task.index) <= 5
+-          )
++        clause.tasks.some(
++          (task) =>
++            task.index > marker &&
++            task.index < end &&
++            Math.abs(completion - task.index) <= 5
+         )
+       ) {
+-        return false
++        return true
+       }
+       return (
+-        change < marker ||
+-        completions.some(
+-          (completion) => marker < completion && completion < change
+-        )
++        clause.priorTasks.length > 0 &&
++        tokenIndex(
++          clause.tokens,
++          new Set(["it", "its"]),
++          marker + 1,
++          Math.min(end, completion + 2)
++        ) >= 0
+       )
+-    }
++    })
++}
++
++function hasCompletedTaskTiming(clause) {
++  return tokenIndexes(clause.tokens, BOUNDARY_TIMING_MARKERS).some((marker) =>
++    timingReferencesCompletion(clause, marker)
++  )
++}
++
++function hasPreCompletionTaskTiming(clause) {
++  return tokenIndexes(clause.tokens, PRE_COMPLETION_TIMING_MARKERS).some(
++    (marker) => timingReferencesCompletion(clause, marker)
+   )
+ }
+ 
+ function conflictsWithActiveTaskSwitch(clause) {
+   const { tokens } = clause
+   const change = tokenIndex(
+     tokens,
+     new Set([
+       "change",
+       "changes",
+@@ -2231,49 +2521,49 @@ function conflictsWithActiveTaskSwitch(clause) {
+       "replaces",
+       "replacing",
+       "switch",
+       "switches",
+       "switching",
+     ])
+   )
+   if (change < 0 || actionIsNegated(tokens, change)) return false
+   const hasAgent =
+     tokenIndex(tokens, new Set(["agent", "agents"])) >= 0 ||
+-    phraseIndex(tokens, ["task", "agent"]) >= 0 ||
+-    tokenIndex(tokens, NAMED_AGENT_TERMS) >= 0
++    clause.actors.some((actor) => ["codex", "task_agent"].includes(actor.role))
+   if (!hasAgent) return false
+-  if (clause.tasks.length === 0) {
+-    if (clause.priorTasks.some((task) => task.active)) return true
+-    if (clause.priorTasks.some((task) => task.completed)) return false
+-  }
+   if (hasActiveTaskTiming(clause)) return true
+   if (
+     clause.tasks.some(
+       (task) =>
+         taskHasAffirmativeActivity(clause, task) &&
+         taskStateIndexes(clause, task, EXPLICIT_TASK_ACTIVITY_TERMS).length > 0
+     )
+   ) {
+     return true
+   }
+-  if (hasPreCompletionTaskTiming(clause, change)) return true
++  if (hasPreCompletionTaskTiming(clause)) return true
+   if (hasCompletedTaskTiming(clause)) return false
+   if (clause.tasks.some((task) => taskHasCompletedState(clause, task))) {
+     return false
+   }
++  if (clause.priorTasks.some((task) => task.active)) return true
++  if (clause.priorTasks.some((task) => task.completed)) return false
+   if (hasNegatedTaskActivityTiming(clause)) return false
+   return clause.tasks.some((task) => taskHasAffirmativeActivity(clause, task))
+ }
+ 
+ function reviewerIsRequiredByContract(reviewer) {
+   return (
+-    (reviewer.primary || reviewer.auxiliary || reviewer.codex) &&
++    (reviewer.primary ||
++      reviewer.auxiliary ||
++      reviewer.codex ||
++      reviewer.required) &&
+     !reviewer.optionalDocument
+   )
+ }
+ 
+ function reviewAntecedentBefore(clause, index) {
+   const current = clause.reviewers.filter(
+     (reviewer) =>
+       reviewer.index < index && reviewerIsRequiredByContract(reviewer)
+   )
+   if (current.length > 0) return current.at(-1)
+@@ -2364,20 +2654,32 @@ function reviewTargetForBypass(clause, bypass) {
+         clause.tokens,
+         ["this", "reviewer"],
+         bypass + 1,
+         Math.min(segment.end, bypass + 6)
+       ) >= 0 ||
+       phraseIndex(
+         clause.tokens,
+         ["this", "role"],
+         bypass + 1,
+         Math.min(segment.end, bypass + 6)
++      ) >= 0 ||
++      phraseIndex(
++        clause.tokens,
++        ["that", "role"],
++        bypass + 1,
++        Math.min(segment.end, bypass + 6)
++      ) >= 0 ||
++      phraseIndex(
++        clause.tokens,
++        ["its", "role"],
++        bypass + 1,
++        Math.min(segment.end, bypass + 6)
+       ) >= 0)
+   const passiveTarget =
+     replacement &&
+     tokenIndex(clause.tokens, new Set(["by"]), bypass + 1, segment.end) >= 0
+   if (pronounTarget || passiveTarget) {
+     const replacementSubject = before
+     return reviewAntecedentBefore(clause, replacementSubject?.index ?? bypass)
+   }
+   if (
+     before &&
+@@ -2398,43 +2700,45 @@ function reviewBypassIsNegated(clause, bypass) {
+       clause.tokens[bypass - 1] === "than")
+   )
+ }
+ 
+ function conflictsWithRequiredReview(clause) {
+   for (const requirement of tokenIndexes(
+     clause.tokens,
+     REVIEW_REQUIREMENT_ACTIONS
+   )) {
+     if (!actionIsNegated(clause.tokens, requirement)) continue
++    const segment = actionSegment(clause, requirement)
++    const negatedBypass = tokenIndexes(
++      clause.tokens,
++      REVIEW_BYPASS_ACTIONS,
++      segment.start,
++      requirement
++    )
++      .reverse()
++      .find((bypass) => reviewBypassIsNegated(clause, bypass))
++    if (negatedBypass !== undefined) continue
+     const target = reviewTargetForBypass(clause, requirement)
+-    if (
+-      target &&
+-      (target.primary || target.auxiliary || target.codex) &&
+-      !target.optionalDocument
+-    ) {
++    if (target && reviewerIsRequiredByContract(target)) {
+       return true
+     }
+   }
+   return tokenIndexes(clause.tokens, REVIEW_BYPASS_ACTIONS).some((bypass) => {
+     if (
+       clause.tokens[bypass] === "place" &&
+       !substitutionReviewTarget(clause, bypass)
+     ) {
+       return false
+     }
+     if (reviewBypassIsNegated(clause, bypass)) return false
+     const target = reviewTargetForBypass(clause, bypass)
+-    return Boolean(
+-      target &&
+-      (target.primary || target.auxiliary || target.codex) &&
+-      !target.optionalDocument
+-    )
++    return Boolean(target && reviewerIsRequiredByContract(target))
+   })
+ }
+ 
+ function hasConflictingSkillDirective(prose) {
+   return directiveWindows(prose).some((window) => {
+     const clause = parseDirectiveClause(window)
+     return (
+       conflictsWithParentOwnership(clause) ||
+       conflictsWithTaskAgentRoute(clause) ||
+       conflictsWithConversationIdentity(clause) ||
+diff --git a/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.test.mjs b/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.test.mjs
+index 10599564..f51d19b5 100644
+--- a/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.test.mjs
++++ b/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.test.mjs
+@@ -1317,20 +1317,294 @@ describe("Skill contract v2", () => {
+     }
+ 
+     for (const prose of [
+       "Switch from Grok to Gemini after the current Task completes.",
+       "Replace Grok once the current Task is done.",
+     ]) {
+       assert.deepEqual(validateSkillMarkdown(`${skill}\n${prose}`).failures, [])
+     }
+   })
+ 
++  it("round-10 rejects concrete and qualified Task Agents on invalid routes", () => {
++    for (const prose of [
++      "High Tasks are implemented by Gemini.",
++      "High Tasks are implemented by Cline.",
++      "High Tasks are implemented by Claude.",
++      "High Tasks are implemented by custom Acme Agent.",
++      "High Tasks are implemented by Hermes, Cursor, OpenCode, Kimi, or Pi.",
++      "Always use Gemini as the implementer.",
++      "Use Gemini as the implementer for all Tasks.",
++      "Route high Tasks to the currently selected Task Agent and Codex.",
++      "High Tasks are implemented by the user-selected Task Agent and Codex.",
++    ]) {
++      has(validateSkillMarkdown(`${skill}\n${prose}`).failures, "B2D-SKILL-005")
++    }
++
++    for (const prose of [
++      "Normal Tasks are implemented by Gemini.",
++      "High Tasks are implemented by Codex and reviewed by Gemini.",
++      "Route high Tasks to Codex for implementation and to Gemini for auxiliary review.",
++      "Normal Tasks are implemented by the currently selected Task Agent.",
++      "Normal Tasks are implemented by the Claude Code Task Agent.",
++      "Normal Tasks are implemented by the Gemini Task Agent.",
++      "The parent updates the Claude Code Task Agent with adjudicated findings.",
++      "The parent updates the Kimi Code Task Agent with adjudicated findings.",
++    ]) {
++      assert.deepEqual(validateSkillMarkdown(`${skill}\n${prose}`).failures, [])
++    }
++  })
++
++  it("round-10 resolves carried active Tasks against pronoun completion", () => {
++    for (const prose of [
++      "The current Task is running. Change the Task Agent after it completes.",
++      "The current Task is active. Switch the Task Agent once it is finished.",
++      "Before the next Task starts, after the current Task completes, switch the Task Agent.",
++      "The current Task is completed. Switch the Task Agent before the next Task starts.",
++    ]) {
++      assert.deepEqual(validateSkillMarkdown(`${skill}\n${prose}`).failures, [])
++    }
++
++    for (const prose of [
++      "The current Task is running. Change the Task Agent now.",
++      "The current Task is running. Change the Task Agent before it completes.",
++      "The current Task is running; switch the Task Agent before the next Task starts.",
++      "The current Task is active. Switch the Task Agent now, before the next Task begins.",
++    ]) {
++      has(validateSkillMarkdown(`${skill}\n${prose}`).failures, "B2D-SKILL-005")
++    }
++  })
++
++  it("round-10 resolves that-role reviewer replacement antecedents", () => {
++    for (const prose of [
++      "The Codex reviewer is mandatory. User-named Design reviewers replace that role.",
++      "The primary reviewer remains required; optional Plan reviewers substitute for that role.",
++    ]) {
++      has(validateSkillMarkdown(`${skill}\n${prose}`).failures, "B2D-SKILL-005")
++    }
++
++    for (const prose of [
++      "The Codex reviewer is mandatory. User-named Design reviewers must not replace that role.",
++      "The primary reviewer remains required; optional Plan reviewers do not substitute for that role.",
++    ]) {
++      assert.deepEqual(validateSkillMarkdown(`${skill}\n${prose}`).failures, [])
++    }
++  })
++
++  it("round-10 treats another and one-more reviewers as surplus", () => {
++    for (const prose of [
++      "Normal Tasks have another reviewer.",
++      "Normal Tasks have one more reviewer.",
++      "High Tasks have another reviewer.",
++      "High Tasks have one more reviewer.",
++      "Every normal Task gets yet another reviewer.",
++    ]) {
++      has(validateSkillMarkdown(`${skill}\n${prose}`).failures, "B2D-SKILL-005")
++    }
++
++    for (const prose of [
++      "Normal Tasks have no other reviewer.",
++      "Normal Tasks must not have another reviewer.",
++      "High Tasks have one primary reviewer and one auxiliary reviewer.",
++      "High Tasks must not add one more reviewer.",
++    ]) {
++      assert.deepEqual(validateSkillMarkdown(`${skill}\n${prose}`).failures, [])
++    }
++  })
++
++  it("round-10 binds rather-than and instead-of actor polarity", () => {
++    for (const prose of [
++      "High Tasks are implemented by Codex rather than Grok.",
++      "Route high Tasks to Codex instead of Grok.",
++      "Normal Tasks are implemented by the Task Agent rather than Codex.",
++      "High Tasks are implemented by Codex instead of Gemini.",
++      "Route normal Tasks to Gemini rather than Codex.",
++    ]) {
++      assert.deepEqual(validateSkillMarkdown(`${skill}\n${prose}`).failures, [])
++    }
++
++    for (const prose of [
++      "High Tasks are implemented by Gemini rather than Codex.",
++      "Route high Tasks to Grok instead of Codex.",
++      "Normal Tasks are implemented by Codex instead of Gemini.",
++    ]) {
++      has(validateSkillMarkdown(`${skill}\n${prose}`).failures, "B2D-SKILL-005")
++    }
++  })
++
++  it("round-10 preserves delegated producer ownership across afterward", () => {
++    for (const prose of [
++      "The parent asks the Plan Author to revise the Plan and afterward update the Design.",
++      "The parent asks the Plan Author to revise the Plan and afterward update it.",
++      "The parent directs the Design Fixer to fix and afterward update the Design.",
++    ]) {
++      assert.deepEqual(validateSkillMarkdown(`${skill}\n${prose}`).failures, [])
++    }
++
++    for (const prose of [
++      "The parent asks the Plan Author to revise the Plan and afterward the parent updates the Design.",
++      "The parent asks the Plan Author to revise the Plan and afterward will update the Design.",
++      "The parent directs the Design Fixer to fix the Design and afterward itself updates the Plan.",
++    ]) {
++      has(validateSkillMarkdown(`${skill}\n${prose}`).failures, "B2D-SKILL-005")
++    }
++  })
++
++  it("round-10 distinguishes document recipients and people pronouns from artifacts", () => {
++    for (const prose of [
++      "The parent updates the Plan Author with review findings.",
++      "The Plan Author and Codex reviewer discuss the Plan. The parent updates them with review findings.",
++      "The parent updates the Design Fixer with adjudicated findings.",
++      "The Design Fixer and Plan Author discuss the Design. The parent updates them with findings.",
++    ]) {
++      assert.deepEqual(validateSkillMarkdown(`${skill}\n${prose}`).failures, [])
++    }
++
++    for (const prose of [
++      "The parent updates the Plan directly with review findings.",
++      "The Plan Author discusses the Plan. The parent updates it with review findings.",
++      "The parent updates that Plan with review findings.",
++    ]) {
++      has(validateSkillMarkdown(`${skill}\n${prose}`).failures, "B2D-SKILL-005")
++    }
++  })
++
++  it("round-10 rejects incomplete and duplicate passive reviewer sets", () => {
++    for (const prose of [
++      "High Tasks are reviewed by Codex, not the Task Agent.",
++      "High Tasks are reviewed by Codex and Codex.",
++      "High Tasks are reviewed by Codex and the Task Agent is omitted.",
++      "High Tasks are reviewed by the Task Agent, not Codex.",
++      "Normal Tasks have another reviewer.",
++    ]) {
++      has(validateSkillMarkdown(`${skill}\n${prose}`).failures, "B2D-SKILL-005")
++    }
++
++    for (const prose of [
++      "High Tasks are reviewed by Codex and the Task Agent.",
++      "High Tasks are reviewed by the primary Codex reviewer and the auxiliary Codex Task Agent reviewer.",
++      "Normal Tasks are reviewed by Codex, not the Task Agent.",
++      "High Tasks must not omit the Task Agent auxiliary reviewer.",
++    ]) {
++      assert.deepEqual(validateSkillMarkdown(`${skill}\n${prose}`).failures, [])
++    }
++  })
++
++  it("round-10 resolves possessive-role and takeover reviewer replacements", () => {
++    for (const prose of [
++      "The Codex reviewer remains required; optional user-named Design reviewers may replace its role.",
++      "The Codex reviewer remains required; optional user-named Design reviewers may take over for it.",
++      "The Codex reviewer remains required; optional user-named Design reviewers may replace the mandatory reviewer.",
++      "The primary reviewer remains required; optional Plan reviewers take over its role.",
++    ]) {
++      has(validateSkillMarkdown(`${skill}\n${prose}`).failures, "B2D-SKILL-005")
++    }
++
++    for (const prose of [
++      "The Codex reviewer remains required; optional user-named Design reviewers may not replace its role.",
++      "The Codex reviewer remains required; optional user-named Design reviewers must not take over for it.",
++      "The Codex reviewer remains required; optional user-named Design reviewers do not replace the mandatory reviewer.",
++    ]) {
++      assert.deepEqual(validateSkillMarkdown(`${skill}\n${prose}`).failures, [])
++    }
++  })
++
++  it("round-10 keeps active-switch timing directional across clauses", () => {
++    for (const prose of [
++      "Before the next Task starts, after the current Task completes, switch the Task Agent.",
++      "The current Task is running. Change the Task Agent after it completes.",
++      "The current Task is completed; switch the Task Agent before the next Task starts.",
++    ]) {
++      assert.deepEqual(validateSkillMarkdown(`${skill}\n${prose}`).failures, [])
++    }
++
++    for (const prose of [
++      "The current Task is running; switch the Task Agent before the next Task starts.",
++      "The current Task is active. Before the next Task begins, change the Task Agent now.",
++      "Before the current Task completes, switch the Task Agent after the next Task is planned.",
++    ]) {
++      has(validateSkillMarkdown(`${skill}\n${prose}`).failures, "B2D-SKILL-005")
++    }
++  })
++
++  it("round-10 carries typed document antecedents into parent edit predicates", () => {
++    for (const prose of [
++      "The Plan Author writes the Plan; the parent revises that document.",
++      "The Plan Author writes the Plan. The parent revises.",
++      "The Design Fixer edits the Design. The parent updates that artifact.",
++      "The Plan Author authors the Plan; afterward the parent modifies it.",
++      "The parent revises that document.",
++      "The parent updates the artifact directly.",
++    ]) {
++      has(validateSkillMarkdown(`${skill}\n${prose}`).failures, "B2D-SKILL-005")
++    }
++
++    for (const prose of [
++      "The Plan Author writes the Plan. The parent discusses review findings.",
++      "The Plan Author writes the Plan. The parent updates the Plan Author.",
++      "The Design Fixer edits the Design. The parent revises the finding summary.",
++    ]) {
++      assert.deepEqual(validateSkillMarkdown(`${skill}\n${prose}`).failures, [])
++    }
++  })
++
++  it("round-10 recognizes custom identities in active Task switches", () => {
++    for (const prose of [
++      "Switch from custom:foo to custom:bar while the current Task is active.",
++      "Replace custom Acme Agent during the current Task.",
++      "Change from custom alpha to Gemini while a Task is running.",
++    ]) {
++      has(validateSkillMarkdown(`${skill}\n${prose}`).failures, "B2D-SKILL-005")
++    }
++
++    for (const prose of [
++      "Switch from custom:foo to custom:bar after the current Task completes.",
++      "Replace custom Acme Agent once the current Task is done.",
++    ]) {
++      assert.deepEqual(validateSkillMarkdown(`${skill}\n${prose}`).failures, [])
++    }
++  })
++
++  it("round-10 binds implementation and reviewer purpose within one route relation", () => {
++    for (const prose of [
++      "Route high Tasks to Codex for implementation and the primary Codex reviewer and the auxiliary Grok reviewer.",
++      "Route high Tasks to the Codex implementer, the primary Codex reviewer, and the auxiliary Gemini reviewer.",
++    ]) {
++      assert.deepEqual(validateSkillMarkdown(`${skill}\n${prose}`).failures, [])
++    }
++
++    for (const prose of [
++      "Route high Tasks to Grok for implementation and the primary Codex reviewer and the auxiliary Grok reviewer.",
++      "Route high Tasks to Codex for implementation and the primary Grok reviewer and the auxiliary Codex reviewer.",
++      "Route normal Tasks to the Codex implementer and the primary Codex reviewer.",
++    ]) {
++      has(validateSkillMarkdown(`${skill}\n${prose}`).failures, "B2D-SKILL-005")
++    }
++  })
++
++  it("round-10 recognizes passive parent delegation to document producers", () => {
++    for (const prose of [
++      "The Plan Author is asked by the parent to revise the Plan.",
++      "The Design Fixer is directed by the parent to fix the Design.",
++      "The Plan Author is instructed by the parent to update the Plan.",
++    ]) {
++      assert.deepEqual(validateSkillMarkdown(`${skill}\n${prose}`).failures, [])
++    }
++
++    for (const prose of [
++      "The Plan is revised by the parent.",
++      "The Design is fixed by the parent.",
++      "The Plan Author is asked by the parent to revise the Plan, and afterward the parent updates it.",
++    ]) {
++      has(validateSkillMarkdown(`${skill}\n${prose}`).failures, "B2D-SKILL-005")
++    }
++  })
++
+   it("contains the complete operational policy and document JSON shapes", () => {
+     const policy = fencedJsonAfterHeading(
+       realSkill,
+       "### Operational policy JSON"
+     )
+     assert.deepEqual(policy.design_review_triggers, [
+       "spans_modules",
+       "migration",
+       "concurrency",
+       "security",

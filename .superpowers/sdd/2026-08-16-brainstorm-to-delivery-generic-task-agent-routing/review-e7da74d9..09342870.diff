@@ -1,0 +1,1205 @@
+# Review package: e7da74d9113511efd163536d2006db6fa7efeed2..0934287082cccaeb9042418803a1d1af26fc3e0a
+
+## Commits
+09342870 fix(skill): bind round 16 directive relations
+
+## Files changed
+ .../scripts/validate-contract.lib.mjs              | 332 ++++++++++++++++++++-
+ .../scripts/validate-contract.test.mjs             | 309 +++++++++++++++++++
+ 2 files changed, 629 insertions(+), 12 deletions(-)
+
+## Diff
+diff --git a/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.lib.mjs b/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.lib.mjs
+index bfbd3e03..cd158ac3 100644
+--- a/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.lib.mjs
++++ b/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.lib.mjs
+@@ -495,20 +495,31 @@ const PEOPLE_PARTITIVE_TARGET_HEADS = new Set([
+   "most",
+   "neither",
+   "none",
+   "some",
+ ])
+ const PEOPLE_PARTICIPANT_ACTIONS = new Set([
+   "consult",
+   "consulted",
+   "consulting",
+ ])
++const PEOPLE_PURPOSE_ACTIONS = new Set([
++  "allow",
++  "allows",
++  "allowing",
++  "enable",
++  "enables",
++  "enabling",
++  "let",
++  "lets",
++  "letting",
++])
+ const DOCUMENT_PERSON_ROLE_TERMS = new Set([
+   "author",
+   "authors",
+   "fixer",
+   "fixers",
+   "producer",
+   "producers",
+   "reviewer",
+   "reviewers",
+ ])
+@@ -800,20 +811,21 @@ const TASK_COMPLETION_BRIDGE_TERMS = new Set([
+ ])
+ const TASK_COMPONENT_SUFFIX_TERMS = new Set([
+   "review",
+   "reviews",
+   "test",
+   "tests",
+   "testing",
+   "validation",
+ ])
+ const TASK_COMPONENT_ACTION_FORMS = new Set(["review", "test"])
++const TASK_COMPONENT_IMPERATIVE_PREFIX_TERMS = new Set(["please"])
+ const TASK_COMPONENT_CONTINUATION_PREDICATES = new Set([
+   "continue",
+   "continues",
+   "continuing",
+ ])
+ const TASK_REACTIVATION_PREDICATES = new Set([
+   "begin",
+   "begins",
+   "beginning",
+   "resume",
+@@ -875,43 +887,71 @@ const TASK_STATE_CLAUSE_BOUNDARIES = new Set([
+   "yet",
+ ])
+ const TASK_STATE_MODIFIERS = new Set([
+   "actively",
+   "afterward",
+   "currently",
+   "still",
+   "then",
+   "yet",
+ ])
++const AGENT_CHANGE_SUBJECT_BRIDGE_TERMS = new Set([
++  ...FINITE_PARENT_PREDICATE_MARKERS,
++  ...TASK_STATE_MODIFIERS,
++  "later",
++  "now",
++])
+ const TASK_STATE_ANAPHOR_ADJUNCT_PREFIXES = [
+   ["according", "to"],
+   ["in", "fact"],
+ ]
++const TASK_STATE_REPORTING_PREDICATES = new Set([
++  "claim",
++  "claimed",
++  "claims",
++  "indicate",
++  "indicated",
++  "indicates",
++  "report",
++  "reported",
++  "reports",
++  "say",
++  "says",
++  "said",
++])
++const TASK_STATE_OBJECT_PRONOUN_MODIFIERS = new Set([
++  "also",
++  "even",
++  "just",
++  "only",
++])
+ const TASK_STATE_CARRIED_ADJUNCT_STARTS = new Set([
+   "after",
+   "before",
+   "following",
+   "once",
+   "upon",
+   "when",
+ ])
+ const TASK_STATE_SUBJECT_DETERMINERS = new Set([
+   "a",
+   "an",
+   "each",
+   "every",
+   "the",
+   "this",
+ ])
+ const TASK_COMPLETION_SEQUENCE_TERMS = new Set([
++  "afterward",
+   "it",
+   "itself",
++  "later",
+   "longer",
+   "no",
+   "not",
+   "only",
+ ])
+ const ACTIVE_TIMING_MARKERS = new Set(["during", "inside", "while"])
+ const BOUNDARY_TIMING_MARKERS = new Set([
+   "after",
+   "following",
+   "on",
+@@ -1008,31 +1048,35 @@ const GENERIC_REVIEW_TARGET_PREFIX_TERMS = new Set([
+   "very",
+ ])
+ const REVIEW_TARGET_ADJUNCT_LINKS = new Set([
+   "after",
+   "as",
+   "before",
+   "because",
+   "by",
+   "during",
+   "for",
++  "from",
+   "if",
+   "in",
+   "once",
+   "since",
++  "that",
+   "unless",
+   "until",
+   "to",
+   "upon",
+   "when",
+   "whenever",
+   "while",
++  "which",
++  "who",
+ ])
+ const REVIEW_TARGET_NON_ROLE_HEAD_TERMS = new Set([
+   ...POSTPOSED_REVIEW_ABSENCE_MODIFIERS,
+   "role",
+   "slot",
+ ])
+ const REVIEW_TARGET_GENERIC_PERSON_TERMS = new Set([
+   "individual",
+   "one",
+   "party",
+@@ -1400,77 +1444,110 @@ function directiveWindows(prose) {
+   const withoutKeys = prose.replace(
+     /\b(?:design|final_review|plan|task)\|[^\s.,;:]+/gi,
+     " "
+   )
+   for (const paragraph of withoutKeys
+     .normalize("NFKC")
+     .toLowerCase()
+     .split(/\n\s*\n+/)) {
+     let priorTokens = []
+     let priorActionBoundaryAfter = new Set()
++    let priorImperativeBoundaryAfter = new Set()
+     let priorPossessiveIndexes = new Set()
+     let carriedTasks = []
+     for (const source of paragraph.split(/[.!?;]+/)) {
+       const matches = [...source.matchAll(/[a-z0-9]+(?:-[a-z0-9]+)*/g)]
+       const tokens = matches.map((match) => match[0])
+       const actionBoundaryAfter = matches.flatMap((match, index) => {
+         const gapStart = match.index + match[0].length
+         const gapEnd = matches[index + 1]?.index ?? source.length
+         return /[-,:\/()[\]\u2013\u2014]/.test(source.slice(gapStart, gapEnd))
+           ? [index]
+           : []
+       })
++      const imperativeBoundaryAfter = matches.flatMap((match, index) => {
++        const gapStart = match.index + match[0].length
++        const gapEnd = matches[index + 1]?.index ?? source.length
++        return /[-,:\/\u2013\u2014]/.test(source.slice(gapStart, gapEnd))
++          ? [index]
++          : []
++      })
+       const possessiveIndexes = matches.flatMap((match, index) => {
+         const gapStart = match.index + match[0].length
+         const gapEnd = matches[index + 1]?.index ?? source.length
+         return /['\u2019]/.test(source.slice(gapStart, gapEnd)) ? [index] : []
+       })
+       const immediatePriorTasks = directiveTaskAntecedents(
+         priorTokens,
+-        priorActionBoundaryAfter
++        priorActionBoundaryAfter,
++        priorPossessiveIndexes,
++        priorImperativeBoundaryAfter
+       )
+       const priorTasks =
+         immediatePriorTasks.length > 0 ? immediatePriorTasks : carriedTasks
+       for (let start = 0; start < tokens.length; start += step) {
+         windows.push({
+           tokens: tokens.slice(start, start + DIRECTIVE_WINDOW_TOKENS),
+           actionBoundaryAfter: new Set(
+             actionBoundaryAfter
+               .filter(
+                 (index) =>
+                   index >= start && index < start + DIRECTIVE_WINDOW_TOKENS
+               )
+               .map((index) => index - start)
+           ),
++          imperativeBoundaryAfter: new Set(
++            imperativeBoundaryAfter
++              .filter(
++                (index) =>
++                  index >= start && index < start + DIRECTIVE_WINDOW_TOKENS
++              )
++              .map((index) => index - start)
++          ),
++          possessiveIndexes: new Set(
++            possessiveIndexes
++              .filter(
++                (index) =>
++                  index >= start && index < start + DIRECTIVE_WINDOW_TOKENS
++              )
++              .map((index) => index - start)
++          ),
+           priorReviewers: directiveReviewers(priorTokens),
+           priorTasks,
+           priorDocumentTargets: directiveDocumentTargets(priorTokens),
+           priorPronounAntecedent: directivePronounAntecedent(
+             priorTokens,
+             priorPossessiveIndexes,
+             priorActionBoundaryAfter
+           ),
+         })
+       }
+       if (tokens.length > 0) {
+         carriedTasks = carriedTaskAntecedentsAfterClause(
+           tokens,
+           new Set(actionBoundaryAfter),
++          new Set(possessiveIndexes),
++          new Set(imperativeBoundaryAfter),
+           carriedTasks
+         )
+         const priorStart = Math.max(0, tokens.length - DIRECTIVE_WINDOW_TOKENS)
+         priorTokens = tokens.slice(priorStart)
+         priorActionBoundaryAfter = new Set(
+           actionBoundaryAfter
+             .filter((index) => index >= priorStart)
+             .map((index) => index - priorStart)
+         )
++        priorImperativeBoundaryAfter = new Set(
++          imperativeBoundaryAfter
++            .filter((index) => index >= priorStart)
++            .map((index) => index - priorStart)
++        )
+         priorPossessiveIndexes = new Set(
+           possessiveIndexes
+             .filter((index) => index >= priorStart)
+             .map((index) => index - priorStart)
+         )
+       }
+     }
+   }
+   return windows
+ }
+@@ -1641,28 +1718,36 @@ function postposedReviewAbsenceHasDirectObject(clause, absence, relationEnd) {
+       predicate === "lacking" &&
+       tail.some(
+         (token) =>
+           token.endsWith("ly") && !POSTPOSED_REVIEW_ABSENCE_MODIFIERS.has(token)
+       )
+     )
+   }
+   if (predicate === "lacking" && tail[0] === "in") return true
+   const modifierThenComplement = tail
+     .slice(1)
+-    .some(
++    .findIndex(
+       (_token, index) =>
+         tokensArePostposedReviewAbsenceModifiers(tail.slice(0, index + 1)) &&
+         reviewAbsenceTailStartsComplement(tail.slice(index + 1))
+     )
++  if (
++    predicate === "lacking" &&
++    modifierThenComplement >= 0 &&
++    tail[modifierThenComplement + 1] === "in" &&
++    tail[modifierThenComplement + 2] !== undefined
++  ) {
++    return true
++  }
+   return !(
+     CLAUSE_COORDINATORS.has(tail[0]) ||
+-    modifierThenComplement ||
++    modifierThenComplement >= 0 ||
+     reviewAbsenceTailStartsComplement(tail)
+   )
+ }
+ 
+ function peopleRelationIntroduces(
+   tokens,
+   predicate,
+   person,
+   possessiveIndexes,
+   actionBoundaryAfter
+@@ -1712,21 +1797,40 @@ function peopleRelationIntroduces(
+         (coordination >= 0 && relationEndsAtPerson)) &&
+       coordinationStaysInTarget
+     )
+   }
+   const directLink = tokenIndexes(
+     tokens,
+     PEOPLE_ANTECEDENT_LINKS,
+     predicate + 1,
+     person
+   ).at(-1)
+-  if (directLink !== undefined && targetPrefixIsBounded(directLink + 1)) {
++  const directLinkStartsPurposeClause =
++    directLink !== undefined &&
++    (phraseIndex(
++      tokens,
++      ["in", "order", "for"],
++      Math.max(predicate + 1, directLink - 2),
++      directLink + 1
++    ) ===
++      directLink - 2 ||
++      phraseIndex(tokens, ["in", "order", "that"], directLink + 1, person) >=
++        0 ||
++      tokenIndex(tokens, PEOPLE_PURPOSE_ACTIONS, directLink + 1, person) >= 0 ||
++      (tokens[directLink] === "for" &&
++        tokens[person + 1] === "to" &&
++        tokens[person + 2] !== undefined))
++  if (
++    directLink !== undefined &&
++    !directLinkStartsPurposeClause &&
++    targetPrefixIsBounded(directLink + 1)
++  ) {
+     return true
+   }
+   const participantLink = tokenIndexes(
+     tokens,
+     new Set(["after"]),
+     predicate + 1,
+     person
+   )
+     .filter(
+       (index) =>
+@@ -1886,38 +1990,55 @@ function directiveTasks(tokens) {
+       !["task", "tasks"].includes(token) ||
+       (token === "task" && tokens[index + 1] === "agent")
+     ) {
+       continue
+     }
+     tasks.push({ index, scopes: taskScopes(tokens, index) })
+   }
+   return tasks
+ }
+ 
+-function directiveTaskAntecedents(tokens, actionBoundaryAfter = new Set()) {
+-  const clause = { tokens, actionBoundaryAfter }
++function directiveTaskAntecedents(
++  tokens,
++  actionBoundaryAfter = new Set(),
++  possessiveIndexes = new Set(),
++  imperativeBoundaryAfter = new Set()
++) {
++  const clause = {
++    tokens,
++    actionBoundaryAfter,
++    possessiveIndexes,
++    imperativeBoundaryAfter,
++  }
+   return directiveTasks(tokens).map((task) => {
+     const completed = taskCompletedStateIndexes(clause, task).length > 0
+     return {
+       ...task,
+       active: taskIsEffectivelyActive(clause, task),
+       completed,
+     }
+   })
+ }
+ 
+ function carriedTaskAntecedentsAfterClause(
+   tokens,
+   actionBoundaryAfter,
++  possessiveIndexes,
++  imperativeBoundaryAfter,
+   priorTasks
+ ) {
+-  const explicitTasks = directiveTaskAntecedents(tokens, actionBoundaryAfter)
++  const explicitTasks = directiveTaskAntecedents(
++    tokens,
++    actionBoundaryAfter,
++    possessiveIndexes,
++    imperativeBoundaryAfter
++  )
+   if (explicitTasks.length > 0) return explicitTasks
+   if (priorTasks.length === 0) return []
+ 
+   const anaphors = tokenIndexes(tokens, new Set(["it", "itself"]))
+   const clause = { tokens, actionBoundaryAfter, tasks: [], priorTasks }
+   const completion = tokenIndexes(tokens, TASK_COMPLETION_TERMS).find(
+     (state) => {
+       const anaphor = anaphors.filter((index) => index < state).at(-1)
+       if (anaphor === undefined || state - anaphor > 5) return false
+       const prefix = tokens.slice(0, anaphor)
+@@ -1953,29 +2074,49 @@ function directiveDocumentTargets(tokens) {
+   const actors = directiveActors(tokens)
+   return tokens.flatMap((token, index) =>
+     DOCUMENT_OR_CODE_TARGETS.has(token) &&
+     !actors.some((actor) => actor.start <= index && index < actor.end) &&
+     !DOCUMENT_PERSON_ROLE_TERMS.has(tokens[index + 1])
+       ? [{ index, token }]
+       : []
+   )
+ }
+ 
++function peopleRoleModifiesDocument(tokens, index) {
++  const document = tokenIndex(
++    tokens,
++    DOCUMENT_OR_CODE_TARGETS,
++    index + 1,
++    Math.min(tokens.length, index + 5)
++  )
++  return (
++    document >= 0 &&
++    tokens
++      .slice(index + 1, document)
++      .every(
++        (token) =>
++          new Set(["and", "or"]).has(token) ||
++          PEOPLE_ANTECEDENT_TERMS.has(token)
++      )
++  )
++}
++
+ function directivePeopleAntecedents(tokens) {
+   const actors = directiveActors(tokens).map((actor) => ({
+     start: actor.start,
+     end: actor.end,
+     plural: false,
+   }))
+   const people = tokens.flatMap((token, index) =>
+     PEOPLE_ANTECEDENT_TERMS.has(token) &&
+-    !actors.some((actor) => actor.start <= index && index < actor.end)
++    !actors.some((actor) => actor.start <= index && index < actor.end) &&
++    !peopleRoleModifiesDocument(tokens, index)
+       ? [
+           {
+             start: index,
+             end: index + 1,
+             plural: PLURAL_PEOPLE_ANTECEDENT_TERMS.has(token),
+           },
+         ]
+       : []
+   )
+   return [...actors, ...people].sort((left, right) => left.start - right.start)
+@@ -2069,29 +2210,33 @@ function directiveReviewers(tokens) {
+         userNamed && (prefix.includes("design") || prefix.includes("plan")),
+     })
+   }
+   return reviewers
+ }
+ 
+ function parseDirectiveClause(window) {
+   const {
+     tokens,
+     actionBoundaryAfter = new Set(),
++    imperativeBoundaryAfter = new Set(),
++    possessiveIndexes = new Set(),
+     priorReviewers = [],
+     priorTasks = [],
+     priorDocumentTargets = [],
+     priorPronounAntecedent = null,
+   } = window
+   const actors = directiveActors(tokens)
+   return {
+     tokens,
+     actionBoundaryAfter,
++    imperativeBoundaryAfter,
++    possessiveIndexes,
+     actors,
+     actions: directiveActions(tokens, actors),
+     tasks: directiveTasks(tokens),
+     reviewers: directiveReviewers(tokens),
+     priorReviewers,
+     priorTasks,
+     priorDocumentTargets,
+     priorPronounAntecedent,
+   }
+ }
+@@ -3579,21 +3724,99 @@ function taskStateIndexes(clause, task, states) {
+ 
+ function taskComponentIndex(clause, task) {
+   return tokenIndex(
+     clause.tokens,
+     TASK_COMPONENT_SUFFIX_TERMS,
+     task.index + 1,
+     task.index + 8
+   )
+ }
+ 
++function adjunctFinalItHasNonTaskOwner(subjectPrefix, prefix) {
++  const beforeIt = subjectPrefix.slice(prefix.length, -1)
++  const objectPredicate = beforeIt.findLastIndex((token) =>
++    token.endsWith("ing")
++  )
++  return (
++    beforeIt.some((token) => TASK_STATE_REPORTING_PREDICATES.has(token)) ||
++    (objectPredicate > 0 &&
++      beforeIt
++        .slice(objectPredicate + 1)
++        .every((token) => TASK_STATE_OBJECT_PRONOUN_MODIFIERS.has(token)))
++  )
++}
++
++function stateSegmentHasExplicitNonTaskSubject(clause, start, end) {
++  const predicate = tokenIndex(
++    clause.tokens,
++    new Set([
++      ...TASK_REACTIVATION_PREDICATES,
++      ...TASK_REACTIVATION_STATE_LINKS,
++    ]),
++    start,
++    end
++  )
++  if (predicate < 0) return false
++  const subject = clause.tokens.slice(start, predicate)
++  const subjectHead = subject.find(
++    (token) =>
++      !TASK_STATE_SUBJECT_DETERMINERS.has(token) &&
++      !TASK_STATE_MODIFIERS.has(token) &&
++      !token.endsWith("ly")
++  )
++  return (
++    subjectHead !== undefined &&
++    !new Set(["it", "itself", "task"]).has(subjectHead)
++  )
++}
++
++function taskMentionIsNestedInNonTaskSubject(clause, task, state) {
++  const predicate = TASK_REACTIVATION_PREDICATES.has(clause.tokens[state])
++    ? state
++    : tokenIndex(
++        clause.tokens,
++        new Set([
++          ...TASK_REACTIVATION_PREDICATES,
++          ...TASK_REACTIVATION_STATE_LINKS,
++        ]),
++        task.index + 1,
++        state
++      )
++  if (predicate < 0) return false
++  const boundary = tokenIndexes(
++    clause.tokens,
++    TASK_STATE_CLAUSE_BOUNDARIES,
++    0,
++    task.index
++  ).at(-1)
++  const prefixStart = (boundary ?? -1) + 1
++  const prefix = clause.tokens.slice(prefixStart, task.index)
++  const objectLink = prefix.findLastIndex(
++    (token) => PEOPLE_ANTECEDENT_LINKS.has(token) || token.endsWith("ing")
++  )
++  if (objectLink < 0) return false
++  const subjectHead = prefix
++    .slice(0, objectLink)
++    .find(
++      (token) =>
++        !TASK_STATE_SUBJECT_DETERMINERS.has(token) &&
++        !TASK_STATE_MODIFIERS.has(token) &&
++        !token.endsWith("ly")
++    )
++  return (
++    subjectHead !== undefined &&
++    !new Set(["it", "itself", "task"]).has(subjectHead)
++  )
++}
++
+ function stateHasTaskSubject(clause, task, state) {
++  if (taskMentionIsNestedInNonTaskSubject(clause, task, state)) return false
+   const boundary = tokenIndexes(
+     clause.tokens,
+     TASK_STATE_CLAUSE_BOUNDARIES,
+     task.index + 1,
+     state
+   ).at(-1)
+   const segmentStart = boundary === undefined ? task.index + 1 : boundary + 1
+   const stateLink = tokenIndexes(
+     clause.tokens,
+     new Set([
+@@ -3615,21 +3838,22 @@ function stateHasTaskSubject(clause, task, state) {
+   )
+   const adjunctTaskAnaphor = TASK_STATE_ANAPHOR_ADJUNCT_PREFIXES.some(
+     (prefix) =>
+       phraseIndex(
+         normalizedSubjectPrefix,
+         prefix,
+         0,
+         normalizedSubjectPrefix.length
+       ) === 0 &&
+       normalizedSubjectPrefix.at(-1) === "it" &&
+-      !normalizedSubjectPrefix.slice(0, -1).includes("itself")
++      !normalizedSubjectPrefix.slice(0, -1).includes("itself") &&
++      !adjunctFinalItHasNonTaskOwner(normalizedSubjectPrefix, prefix)
+   )
+   if (adjunctTaskAnaphor) return true
+   if (subjectPrefix.length === 0) return true
+   if (
+     subjectPrefix.every(
+       (token) => TASK_STATE_MODIFIERS.has(token) || token.endsWith("ly")
+     )
+   ) {
+     return true
+   }
+@@ -3656,23 +3880,40 @@ function stateHasTaskSubject(clause, task, state) {
+       boundary
+     ).at(-1)
+     const previousStart =
+       previousBoundary === undefined ? task.index + 1 : previousBoundary + 1
+     const previousLink = tokenIndexes(
+       clause.tokens,
+       TASK_COMPONENT_STATE_LINKS,
+       previousStart,
+       boundary
+     ).at(-1)
++    if (
++      previousLink === undefined &&
++      stateSegmentHasExplicitNonTaskSubject(
++        clause,
++        previousStart,
++        boundary ?? state
++      )
++    ) {
++      return false
++    }
+     return previousLink === undefined || previousLink === previousStart
+   }
+   if (TASK_COMPONENT_SUFFIX_TERMS.has(subjectPrefix.at(-1))) {
++    const unrelatedPossessor = [...(clause.possessiveIndexes ?? [])].some(
++      (owner) =>
++        owner >= segmentStart &&
++        owner < subjectEnd - 1 &&
++        clause.tokens[owner] !== "task"
++    )
++    if (unrelatedPossessor) return false
+     return !taskComponentStateHasActionObject(clause, subjectEnd - 1, state)
+   }
+   const laterDeterminer = subjectPrefix
+     .slice(2)
+     .some((token) => TASK_STATE_SUBJECT_DETERMINERS.has(token))
+   return (
+     new Set(["after", "before", "following"]).has(subjectPrefix[0]) &&
+     TASK_STATE_SUBJECT_DETERMINERS.has(subjectPrefix[1]) &&
+     subjectPrefix.length <= 4 &&
+     !laterDeterminer
+@@ -3708,35 +3949,66 @@ function taskActivityStateIndexes(clause, task) {
+   return [
+     ...new Set([
+       ...preposed,
+       ...postposedTaskStateIndexes(clause, task, EXPLICIT_TASK_ACTIVITY_TERMS),
+       ...reactivations,
+     ]),
+   ].sort((left, right) => left - right)
+ }
+ 
+ function taskComponentStateHasActionObject(clause, component, state) {
++  const previousBoundary = [...clause.actionBoundaryAfter]
++    .filter((candidate) => candidate < component)
++    .sort((left, right) => right - left)[0]
++  const previousImperativeBoundary = [...(clause.imperativeBoundaryAfter ?? [])]
++    .filter((candidate) => candidate < component)
++    .sort((left, right) => right - left)[0]
++  const imperativePrefix = clause.tokens.slice(
++    (previousBoundary ?? -1) + 1,
++    component
++  )
++  const separatedImperative =
++    previousBoundary !== undefined &&
++    previousBoundary === previousImperativeBoundary &&
++    imperativePrefix.every(
++      (token) =>
++        TASK_COMPONENT_IMPERATIVE_PREFIX_TERMS.has(token) ||
++        TASK_STATE_MODIFIERS.has(token) ||
++        token.endsWith("ly")
++    )
++  const explicitlyMarkedImperative =
++    previousBoundary !== undefined &&
++    imperativePrefix.some((token) =>
++      TASK_COMPONENT_IMPERATIVE_PREFIX_TERMS.has(token)
++    )
++  const testRunningObject =
++    previousBoundary !== undefined &&
++    clause.tokens[component] === "test" &&
++    clause.tokens[state] === "running"
+   const boundary = [...clause.actionBoundaryAfter]
+     .filter((candidate) => candidate >= state)
+     .sort((left, right) => left - right)[0]
+   const object = clause.tokens.slice(state + 1, (boundary ?? state) + 1)
+   const head = object.findLast(
+     (token) =>
+       !TASK_STATE_MODIFIERS.has(token) &&
+       !TASK_UNFINISHED_STATE_TERMS.has(token) &&
+       !CLAUSE_COORDINATORS.has(token)
+   )
+   const headIndex = object.lastIndexOf(head)
+   return (
+     TASK_COMPONENT_ACTION_FORMS.has(clause.tokens[component]) &&
+     head !== undefined &&
+-    (head.endsWith("s") ||
++    (separatedImperative ||
++      explicitlyMarkedImperative ||
++      testRunningObject ||
++      head.endsWith("s") ||
+       object
+         .slice(0, headIndex)
+         .some((token) => TASK_STATE_SUBJECT_DETERMINERS.has(token)))
+   )
+ }
+ 
+ function taskComponentHasUnfinishedState(clause, task) {
+   const component = taskComponentIndex(clause, task)
+   if (component < 0) return false
+   const end = Math.min(clause.tokens.length, component + 7)
+@@ -3751,21 +4023,25 @@ function taskComponentHasUnfinishedState(clause, task) {
+       .filter((boundary) => boundary >= state && boundary < end)
+       .sort((left, right) => left - right)[0]
+   const stateEndsAtBoundary = (state) =>
+     stateBoundaryAfter(state) !== undefined ||
+     CLAUSE_COORDINATORS.has(clause.tokens[state + 1])
+   const ellipticalStateHasActionObject =
+     ellipticalState >= 0 &&
+     taskComponentStateHasActionObject(clause, component, ellipticalState)
+   const componentHasActionModifier = clause.tokens
+     .slice(task.index + 1, component)
+-    .some((token) => token.endsWith("ly"))
++    .some(
++      (token) =>
++        TASK_COMPONENT_IMPERATIVE_PREFIX_TERMS.has(token) ||
++        token.endsWith("ly")
++    )
+   if (
+     ellipticalState >= 0 &&
+     !actionIsNegated(clause.tokens, ellipticalState) &&
+     !componentHasActionModifier &&
+     !ellipticalStateHasActionObject &&
+     clause.tokens
+       .slice(component + 1, ellipticalState)
+       .every(
+         (token) => TASK_STATE_MODIFIERS.has(token) || token.endsWith("ly")
+       ) &&
+@@ -4197,21 +4473,27 @@ function conflictsWithActiveTaskSwitch(clause) {
+         change - changeSegmentStart
+       )
+     ) {
+       return false
+     }
+     const subjectAgent = clause.actors
+       .filter(
+         (actor) =>
+           ["codex", "task_agent"].includes(actor.role) &&
+           actor.end <= change &&
+-          tokens.slice(actor.end, change).every((token) => token.endsWith("ly"))
++          tokens
++            .slice(actor.end, change)
++            .every(
++              (token) =>
++                AGENT_CHANGE_SUBJECT_BRIDGE_TERMS.has(token) ||
++                token.endsWith("ly")
++            )
+       )
+       .at(-1)
+     if (subjectAgent) return true
+     const segment = actionSegment(clause, change)
+     const targetEnd = Math.min(
+       segment.end,
+       changes[index + 1] ?? clause.tokens.length
+     )
+     const agentToken = tokenIndex(
+       tokens,
+@@ -4326,20 +4608,45 @@ function reviewBypassActionIndexes(
+     clause.tokens,
+     REVIEW_TAKE_ACTIONS,
+     start,
+     end
+   ).filter((index) => reviewActionIsReplacement(clause, index))
+   return [...new Set([...direct, ...takeOvers])].sort(
+     (left, right) => left - right
+   )
+ }
+ 
++function reviewerModifierHasTrailingRoleHead(clause, reviewer, objectLink) {
++  if (!reviewer) return false
++  const limit = Math.min(clause.tokens.length, objectLink + 7)
++  const adjunct = tokenIndex(
++    clause.tokens,
++    REVIEW_TARGET_ADJUNCT_LINKS,
++    reviewer.index + 1,
++    limit
++  )
++  const tail = clause.tokens.slice(
++    reviewer.index + 1,
++    adjunct < 0 ? limit : adjunct
++  )
++  return tail.some(
++    (token) =>
++      !GENERIC_REVIEW_TARGET_PREFIX_TERMS.has(token) &&
++      !REVIEW_REQUIREMENT_ACTIONS.has(token) &&
++      !REVIEW_TARGET_NON_ROLE_HEAD_TERMS.has(token) &&
++      !REFLEXIVE_TARGETS.has(token) &&
++      !new Set(["a", "an", "auxiliary", "primary", "the"]).has(token) &&
++      !token.endsWith("ed") &&
++      !token.endsWith("ly")
++  )
++}
++
+ function substitutionReviewTarget(clause, bypass) {
+   const token = clause.tokens[bypass]
+   let objectLink = -1
+   if (token === "instead") {
+     objectLink = tokenIndex(
+       clause.tokens,
+       new Set(["of"]),
+       bypass + 1,
+       bypass + 3
+     )
+@@ -4385,20 +4692,21 @@ function substitutionReviewTarget(clause, bypass) {
+     )
+   }
+   if (objectLink < 0) return null
+   const objectReviewer =
+     clause.reviewers.find(
+       (reviewer) =>
+         reviewer.index > objectLink && reviewer.index <= objectLink + 5
+     ) ?? null
+   if (
+     objectReviewer &&
++    !reviewerModifierHasTrailingRoleHead(clause, objectReviewer, objectLink) &&
+     !reviewerIsRequiredByContract(objectReviewer) &&
+     clause.tokens
+       .slice(objectLink + 1, objectReviewer.index)
+       .some((token) => REVIEW_TARGET_ANAPHORIC_TERMS.has(token)) &&
+     clause.tokens
+       .slice(objectLink + 1, objectReviewer.index)
+       .every(
+         (token) =>
+           GENERIC_REVIEW_TARGET_PREFIX_TERMS.has(token) ||
+           token.endsWith("ed") ||
+diff --git a/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.test.mjs b/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.test.mjs
+index cec77f91..3b409da9 100644
+--- a/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.test.mjs
++++ b/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.test.mjs
+@@ -4156,20 +4156,329 @@ describe("Skill contract v2", () => {
+         reject: true,
+       },
+       {
+         prose:
+           "The active Task is barely completed. Then switch the Task Agent.",
+         reject: true,
+       },
+     ])
+   })
+ 
++  it("round-16 binds imperative objects and possessive Task components", () => {
++    assertSkillClassifications([
++      {
++        prose:
++          "After completion of the active Task: test running software, then switch the Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "After completion of the active Task: please review pending work, then switch the Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "After completion of the active Task: please test running code, then switch the Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "After completion of the active Task: please review pending issue, then switch the Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "After completion of the active Task: review pending issue, then switch the Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "The active Task is completed but the server's review is still running. Then switch the Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "After completion of the active Task: please review the pending issue, then switch the Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "The active Task is completed but the Task's review is still running. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The active Task is completed but its review is still running. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "After completion of the active Task (review pending final approval), switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "After completion of the active Task (test running software), switch the Task Agent.",
++        reject: false,
++      },
++    ])
++  })
++
++  it("round-16 preserves explicit role heads after reviewer modifiers", () => {
++    assertSkillClassifications([
++      {
++        prose:
++          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of that previously assigned reviewer contact person.",
++        reject: false,
++      },
++      {
++        prose:
++          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of that previously assigned reviewer note taker.",
++        reject: false,
++      },
++      {
++        prose:
++          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of that previously assigned reviewer.",
++        reject: true,
++      },
++      {
++        prose:
++          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of the required primary reviewer.",
++        reject: true,
++      },
++      {
++        prose:
++          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of that previously assigned reviewer from before.",
++        reject: true,
++      },
++      {
++        prose:
++          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of that previously assigned reviewer who served earlier.",
++        reject: true,
++      },
++      {
++        prose:
++          "The Codex reviewer is mandatory. Optional Design reviewers take on the role of that previously assigned reviewer that was assigned earlier.",
++        reject: true,
++      },
++    ])
++  })
++
++  it("round-16 bounds people relations at document heads and purpose clauses", () => {
++    assertSkillClassifications([
++      {
++        prose:
++          "The developers revise the Plan and Design after consulting both reviewer and producer Plans. The parent edits both of them.",
++        reject: true,
++      },
++      {
++        prose:
++          "The developers revise the Plan and Design after consulting both reviewer and producer. The parent updates both of them.",
++        reject: false,
++      },
++      {
++        prose:
++          "The developers revise the Plan and Design for clarity in order that three reviewers can respond. The parent edits both of them.",
++        reject: true,
++      },
++      {
++        prose:
++          "The developers revise the Plan and Design for clarity in order for three reviewers to respond. The parent edits both of them.",
++        reject: true,
++      },
++      {
++        prose:
++          "The developers revise the Plan and Design for clarity so that three reviewers can respond. The parent edits both of them.",
++        reject: true,
++      },
++      {
++        prose:
++          "The developers revise the Plan and Design for clarity, allowing three reviewers to respond. The parent edits both of them.",
++        reject: true,
++      },
++      {
++        prose:
++          "The developers revise the Plan and Design for three reviewers to use. The parent edits both of them.",
++        reject: true,
++      },
++      {
++        prose:
++          "The developers revise the Plan and Design with both reviewers to advise. The parent edits both of them.",
++        reject: false,
++      },
++    ])
++  })
++
++  it("round-16 keeps modified lacking-in predicates transitive", () => {
++    assertSkillClassifications([
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is lacking completely in experience.",
++        reject: false,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is lacking completely in critical context.",
++        reject: false,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is lacking entirely in experience.",
++        reject: false,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is lacking entirely in critical context.",
++        reject: false,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is lacking severely in experience.",
++        reject: false,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is lacking completely.",
++        reject: true,
++      },
++      {
++        prose:
++          "High Tasks are reviewed by Codex and the Task Agent reviewer is lacking in experience.",
++        reject: false,
++      },
++    ])
++  })
++
++  it("round-16 recognizes subject-first Agent change bridges", () => {
++    assertSkillClassifications([
++      ...["will", "must", "should", "can", "may"].map((modal) => ({
++        prose: `The active Task is running. The Task Agent ${modal} switch immediately.`,
++        reject: true,
++      })),
++      {
++        prose:
++          "The active Task is running. The Task Agent then switches immediately.",
++        reject: true,
++      },
++      {
++        prose:
++          "The active Task is running. The Task Agent itself switches immediately.",
++        reject: true,
++      },
++      {
++        prose:
++          "The active Task is running. The Task Agent later switches immediately.",
++        reject: true,
++      },
++      {
++        prose:
++          "The active Task is running. The Task Agent will not switch immediately.",
++        reject: false,
++      },
++      {
++        prose:
++          "The active Task is completed. The Task Agent will switch immediately.",
++        reject: false,
++      },
++      {
++        prose:
++          "The active Task is running. The build server will switch immediately.",
++        reject: false,
++      },
++    ])
++  })
++
++  it("round-16 lets later full completion supersede partial completion", () => {
++    assertSkillClassifications([
++      {
++        prose:
++          "The active Task is partially completed and later fully completed. Then switch the Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "The active Task is partially completed and afterward fully completed. Then switch the Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "The active Task is partially completed and later only partly completed. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The active Task is completed and afterward resumes running. Then switch the Task Agent.",
++        reject: true,
++      },
++    ])
++  })
++
++  it("round-16 keeps explicit non-Task subjects from claiming Task state", () => {
++    assertSkillClassifications([
++      {
++        prose:
++          "The active Task is completed but, according to telemetry, a separate server says that it is still running. Then switch the Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "The Task is completed but the server restarts and it is still running. Then switch the Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "The active Task is completed but in fact the integration service monitoring it remains active. Then switch the Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "The active Task is completed but according to telemetry the server tracking it is still running. Then switch the Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "The active Task is completed but in fact the integration service monitoring only it remains active. Then switch the Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "The active Task is completed but according to telemetry it is still running. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The active Task is completed but in fact it remains active. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The Task is completed but it restarts and it is still running. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The Task is completed but the server restarts and the Task is still running. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The Task is completed but the server for the Task restarts and it is still running. Then switch the Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "The Task is completed but the server monitoring the Task restarts and it is still running. Then switch the Task Agent.",
++        reject: false,
++      },
++    ])
++  })
++
+   it("contains the complete operational policy and document JSON shapes", () => {
+     const policy = fencedJsonAfterHeading(
+       realSkill,
+       "### Operational policy JSON"
+     )
+     assert.deepEqual(policy.design_review_triggers, [
+       "spans_modules",
+       "migration",
+       "concurrency",
+       "security",

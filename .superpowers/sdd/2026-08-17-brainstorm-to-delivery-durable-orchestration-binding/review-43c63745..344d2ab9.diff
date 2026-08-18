@@ -1,0 +1,325 @@
+# Review package: 43c63745..344d2ab99fabbf0c7e62d14bfb852f8272ce0f9c
+
+## Commits
+344d2ab9 test(delegation): prove continuation binding fence
+
+## Files changed
+ src-tauri/src/acp/delegation/broker.rs | 269 +++++++++++++++++++++++++++++++++
+ 1 file changed, 269 insertions(+)
+
+## Diff
+diff --git a/src-tauri/src/acp/delegation/broker.rs b/src-tauri/src/acp/delegation/broker.rs
+index 9dc20801..5bc4a666 100644
+--- a/src-tauri/src/acp/delegation/broker.rs
++++ b/src-tauri/src/acp/delegation/broker.rs
+@@ -16738,20 +16738,216 @@ mod tests {
+         let unbound_report = broker.start_delegation(unbound).await;
+         assert_eq!(unbound_report.status, TaskStatus::Running, "{unbound_report:?}");
+         let unbound_run = runs
+             .load_by_task_id(unbound_report.task_id.as_deref().unwrap())
+             .await
+             .unwrap()
+             .unwrap();
+         assert_eq!(unbound_run.orchestration_binding, None);
+     }
+ 
++    #[tokio::test]
++    async fn orchestration_binding_lineage_continue_mismatch_precedes_admission_and_resume() {
++        use crate::acp::delegation::types::ContinueDelegationRequest;
++        use crate::db::entities::{conversation, delegation_task_run};
++        use crate::db::service::conversation_service;
++        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
++        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
++
++        let binding = orchestration_binding_fixture();
++        let mut changed_binding = binding.clone();
++        changed_binding.namespace = "brainstorm-to-delivery-alt".into();
++        let cases = [
++            (
++                "bound",
++                Some(binding.clone()),
++                Some(changed_binding),
++                Some(binding),
++            ),
++            (
++                "unbound",
++                None,
++                Some(orchestration_binding_fixture()),
++                None,
++            ),
++        ];
++
++        for (case, source_binding, mismatched_binding, accepted_binding) in cases {
++            let db = Arc::new(fresh_in_memory_db().await);
++            let folder = seed_folder(&db, &format!("/tmp/codeg-binding-continue-{case}")).await;
++            let parent = conversation_service::create(
++                &db.conn,
++                folder,
++                AgentType::ClaudeCode,
++                Some(format!("binding continue {case} parent")),
++                None,
++            )
++            .await
++            .expect("parent");
++            let source_task_id = format!("binding-continue-{case}-source");
++            let source_tool_id = format!("binding-continue-{case}-source-tool");
++            let work_unit_key = format!("binding-continue-{case}-unit");
++            let source_child = conversation_service::create_with_delegation(
++                &db.conn,
++                folder,
++                AgentType::ClaudeCode,
++                Some(format!("binding continue {case} source")),
++                None,
++                Some(DelegationLink {
++                    parent_conversation_id: parent.id,
++                    parent_tool_use_id: source_tool_id.clone(),
++                    delegation_call_id: source_task_id.clone(),
++                }),
++            )
++            .await
++            .expect("source child");
++            let child = conversation::Entity::find_by_id(source_child.id)
++                .one(&db.conn)
++                .await
++                .expect("load source child")
++                .expect("source child row");
++            let mut child = child.into_active_model();
++            child.external_id = Set(Some(format!("binding-continue-{case}-session")));
++            child.update(&db.conn).await.expect("set external session");
++
++            let workspace = test_working_dir();
++            let launch = build_live_launch_config(
++                AgentType::ClaudeCode,
++                None,
++                &workspace,
++                None,
++                BTreeMap::new(),
++            );
++            let runs = Arc::new(RunStore::new(db.clone()));
++            runs
++                .insert_reserving(ReservingRunInsert {
++                    orchestration_binding: source_binding.clone(),
++                    task_id: source_task_id.clone(),
++                    root_task_id: source_task_id.clone(),
++                    previous_task_id: None,
++                    generation: 1,
++                    parent_conversation_id: parent.id,
++                    parent_tool_use_id: Some(source_tool_id),
++                    child_conversation_id: source_child.id,
++                    agent_type: "claude_code".into(),
++                    profile_id: None,
++                    workspace_path: Some(launch.snapshot.workspace_path),
++                    route_fingerprint: Some(launch.snapshot.route_fingerprint),
++                    launch_snapshot_version: Some(launch.snapshot.launch_snapshot_version),
++                    mode_id: launch.snapshot.mode_id,
++                    config_values_json: Some(launch.snapshot.config_values_json),
++                    task_preview: Some(format!("binding continue {case} source")),
++                    request_fingerprint: Some(format!("binding-continue-{case}-fingerprint")),
++                    admission_class: AdmissionClass::NormalRevision,
++                    lineage_root_task_id: source_task_id.clone(),
++                    work_unit_key: Some(work_unit_key.clone()),
++                    history_only: false,
++                    replaced_task_id: None,
++                    replacement_reason: None,
++                    started_at: Some(Utc::now()),
++                })
++                .await
++                .expect("source reserve");
++            let source_connection_id = format!("binding-continue-{case}-connection");
++            runs
++                .bind_child_connection_while_reserving(&source_task_id, &source_connection_id)
++                .await
++                .expect("bind source connection");
++            runs
++                .promote_running(&source_task_id, &source_connection_id, Utc::now())
++                .await
++                .expect("promote source");
++            let source = delegation_task_run::Entity::find_by_id(&source_task_id)
++                .one(&db.conn)
++                .await
++                .expect("load source")
++                .expect("source row");
++            let mut source = source.into_active_model();
++            source.status = Set(DelegationRunStatus::Canceled);
++            source.error_code = Set(Some("parent_disconnected".into()));
++            source.termination_audit_json = Set(None);
++            source.finished_at = Set(Some(Utc::now()));
++            source.update(&db.conn).await.expect("legacy terminal source");
++
++            let authorization_id =
++                approve_continue_recovery(&db, &runs, &source_task_id).await;
++            let mock = Arc::new(MockSpawner::new());
++            let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
++            let resumes_before = mock.resume_args.lock().await.len();
++            let spawns_before = mock.spawn_args.lock().await.len();
++            let mismatch_tool_id = format!("binding-continue-{case}-mismatch-tool");
++            let rejected = broker
++                .continue_delegation(ContinueDelegationRequest {
++                    parent_connection_id: "parent-conn".into(),
++                    parent_conversation_id: parent.id,
++                    parent_tool_use_id: mismatch_tool_id.clone(),
++                    target_task_id: source_task_id.clone(),
++                    task: "continue binding lineage".into(),
++                    work_unit_key: Some(work_unit_key.clone()),
++                    external_handle: None,
++                    correlation_id: Some(format!("binding-continue-{case}-mismatch")),
++                    recovery_authorization_id: Some(authorization_id.clone()),
++                    orchestration_binding: mismatched_binding,
++                })
++                .await;
++            assert_eq!(
++                rejected.error_code.as_deref(),
++                Some("orchestration_binding_lineage_mismatch"),
++                "{case}: {rejected:?}"
++            );
++            assert_eq!(mock.resume_args.lock().await.len(), resumes_before);
++            assert_eq!(mock.spawn_args.lock().await.len(), spawns_before);
++            assert!(
++                runs.load_by_parent_tool_use(parent.id, &mismatch_tool_id)
++                    .await
++                    .expect("load rejected tool id")
++                    .is_none(),
++                "{case}: lineage rejection must not create a durable run"
++            );
++
++            mock.queue_spawn(Ok(format!("binding-continue-{case}-resumed")))
++                .await;
++            mock.queue_send(Ok(accepted(source_child.id, Utc::now())))
++                .await;
++            let accepted_tool_id = format!("binding-continue-{case}-accepted-tool");
++            let accepted = broker
++                .continue_delegation(ContinueDelegationRequest {
++                    parent_connection_id: "parent-conn".into(),
++                    parent_conversation_id: parent.id,
++                    parent_tool_use_id: accepted_tool_id,
++                    target_task_id: source_task_id.clone(),
++                    task: "continue binding lineage".into(),
++                    work_unit_key: Some(work_unit_key),
++                    external_handle: None,
++                    correlation_id: Some(format!("binding-continue-{case}-accepted")),
++                    recovery_authorization_id: Some(authorization_id.clone()),
++                    orchestration_binding: accepted_binding,
++                })
++                .await;
++            assert_eq!(accepted.status, TaskStatus::Running, "{case}: {accepted:?}");
++            assert_eq!(mock.resume_args.lock().await.len(), resumes_before + 1);
++            assert_eq!(mock.spawn_args.lock().await.len(), spawns_before + 1);
++            let accepted_run = runs
++                .load_by_task_id(accepted.task_id.as_deref().expect("continued task id"))
++                .await
++                .expect("load continued run")
++                .expect("continued run");
++            assert_eq!(accepted_run.child_conversation_id, source_child.id);
++            assert_eq!(accepted_run.orchestration_binding, source_binding);
++            assert_eq!(
++                accepted_run.recovery_authorization_id.as_deref(),
++                Some(authorization_id.as_str()),
++                "{case}: rejected mismatch must leave the authorization reusable"
++            );
++        }
++    }
++
+     #[tokio::test]
+     async fn orchestration_binding_lineage_replacement_mismatch_precedes_child_and_spawn() {
+         use crate::db::service::conversation_service;
+         use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+ 
+         let db = Arc::new(fresh_in_memory_db().await);
+         let folder = seed_folder(&db, "/tmp/codeg-binding-replacement").await;
+         let parent = conversation_service::create(
+             &db.conn,
+             folder,
+@@ -40081,20 +40277,93 @@ mod tests {
+         let replacement_task_id = replacement.task_id.expect("replacement task id");
+         let replacement_run = runs
+             .load_by_task_id(&replacement_task_id)
+             .await
+             .unwrap()
+             .expect("replacement run");
+         assert_eq!(replacement_run.root_task_id, replacement_task_id);
+         assert_eq!(replacement_run.lineage_root_task_id, root_task_id);
+     }
+ 
++    async fn approve_continue_recovery(
++        db: &crate::db::AppDatabase,
++        runs: &RunStore,
++        source_task_id: &str,
++    ) -> String {
++        use crate::acp::delegation::recovery_policy::{
++            decide_delegation_recovery, RecoveryRailSnapshot, RequestedRecoveryOperation,
++        };
++        use crate::acp::recovery_authorization::{
++            DelegationAuthorizationIdentity, RecoveryAllowedAction, RecoveryAuthorizationStore,
++            RecoveryChallenge, RecoverySubjectKind,
++        };
++
++        let source = runs
++            .load_by_task_id(source_task_id)
++            .await
++            .expect("load recovery source")
++            .expect("recovery source");
++        let eligibility = runs
++            .build_continue_eligibility(&source)
++            .await
++            .expect("build recovery eligibility");
++        let snapshot = crate::acp::delegation::run_store::recovery_source_from_continue_eligibility(
++            &eligibility,
++        );
++        let operation = RequestedRecoveryOperation::Continue;
++        let decision = decide_delegation_recovery(
++            &snapshot,
++            &RecoveryRailSnapshot {
++                agent_supports_reuse: eligibility.agent_supports_reuse,
++                unexpected_continue_budget_available: eligibility
++                    .unexpected_continue_budget_available,
++                replacement_budget_available: eligibility.replacement_budget_available,
++            },
++            operation.clone(),
++        );
++        assert!(decision.requires_authorization());
++        let projection =
++            crate::acp::delegation::types::DelegationRecoveryProjection::from(&decision);
++        let challenge = RecoveryChallenge {
++            parent_conversation_id: source.parent_conversation_id,
++            subject_kind: RecoverySubjectKind::DelegationTask,
++            subject_id: source.task_id.clone(),
++            delegation_identity: Some(DelegationAuthorizationIdentity {
++                source_task_id: source.task_id.clone(),
++                child_conversation_id: Some(source.child_conversation_id),
++                lineage_root_task_id: source.lineage_root_task_id.clone(),
++                work_unit_key: source.work_unit_key.clone(),
++            }),
++            source_state_fingerprint: decision.source_state_fingerprint,
++            allowed_action: RecoveryAllowedAction::Continue,
++            action_payload: crate::acp::delegation::run_store::recovery_action_payload(&operation),
++            cause_code: projection.cause_code,
++            risk_class: projection.risk_class,
++            display_reason: None,
++        };
++        let authorizations = RecoveryAuthorizationStore::new(db.conn.clone());
++        let now = Utc::now();
++        let pending = authorizations
++            .insert_pending(&challenge, now)
++            .await
++            .expect("insert continue authorization");
++        authorizations
++            .approve_pending(
++                &pending.authorization_id,
++                now,
++                now + chrono::Duration::minutes(10),
++            )
++            .await
++            .expect("approve continue authorization");
++        pending.authorization_id
++    }
++
+     /// Idempotent parent-tool replay of a successful admission_unknown
+     /// replacement must carry the same warning as the fresh running ack.
+     async fn approve_replacement_recovery(
+         db: &crate::db::AppDatabase,
+         runs: &RunStore,
+         source_task_id: &str,
+         replacement_reason: crate::acp::delegation::recovery_policy::ReplacementReason,
+     ) -> String {
+         use crate::acp::delegation::recovery_policy::{
+             decide_delegation_recovery, RecoveryRailSnapshot, RequestedRecoveryOperation,

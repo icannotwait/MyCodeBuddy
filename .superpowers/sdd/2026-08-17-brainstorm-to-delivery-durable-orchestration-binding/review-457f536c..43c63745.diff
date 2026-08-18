@@ -1,0 +1,4045 @@
+# Review package: 457f536c..43c63745d501a2619b151522d550bcdf0450f931
+
+## Commits
+43c63745 feat(delegation): enforce binding lineage
+
+## Files changed
+ src-tauri/src/acp/connection.rs                    |   1 +
+ src-tauri/src/acp/delegation/broker.rs             | 460 ++++++++++++++++++---
+ src-tauri/src/acp/delegation/companion.rs          | 163 ++++++++
+ src-tauri/src/acp/delegation/listener.rs           | 138 ++++++-
+ src-tauri/src/acp/delegation/run_store.rs          | 364 +++++++++++++++-
+ src-tauri/src/acp/delegation/store.rs              |   7 +
+ src-tauri/src/acp/delegation/tool_schema.json      | 110 ++++-
+ src-tauri/src/acp/delegation/types.rs              |  12 +
+ .../acp/delegation/workflow/completion_evidence.rs |   2 +
+ .../src/acp/delegation/workflow/recovery_tests.rs  |   1 +
+ src-tauri/src/acp/lifecycle.rs                     |   1 +
+ src-tauri/tests/completion_protocol_v2.rs          |   3 +
+ .../tests/delegation_session_reuse_integration.rs  |   2 +
+ 13 files changed, 1169 insertions(+), 95 deletions(-)
+
+## Diff
+diff --git a/src-tauri/src/acp/connection.rs b/src-tauri/src/acp/connection.rs
+index 2e7b5420..0928569d 100644
+--- a/src-tauri/src/acp/connection.rs
++++ b/src-tauri/src/acp/connection.rs
+@@ -13771,20 +13771,21 @@ mod tests {
+                 profile_id: None,
+                 task: "child task".into(),
+                 working_dir: None,
+                 requested_working_dir: None,
+                 external_handle: None,
+                 work_unit_key: None,
+                 replaces_task_id: None,
+                 replacement_reason: None,
+                 correlation_id: None,
+                 recovery_authorization_id: None,
++                orchestration_binding: None,
+             })
+             .await;
+         assert_eq!(report.status, TaskStatus::Running);
+         (broker, spawner, report.task_id.expect("running task id"))
+     }
+ 
+     async fn delegation_suspend_task_status(
+         broker: &crate::acp::delegation::broker::DelegationBroker,
+         task_id: &str,
+     ) -> crate::acp::delegation::types::TaskStatus {
+diff --git a/src-tauri/src/acp/delegation/broker.rs b/src-tauri/src/acp/delegation/broker.rs
+index b2deede5..9dc20801 100644
+--- a/src-tauri/src/acp/delegation/broker.rs
++++ b/src-tauri/src/acp/delegation/broker.rs
+@@ -84,24 +84,24 @@ use crate::acp::delegation::meta_writer::{
+ #[cfg(test)]
+ use crate::acp::delegation::metrics::DelegationMetrics;
+ use crate::acp::delegation::metrics::{
+     CompletionMetricPhase, DelegationRecoveryMetricEvent, RecoveryMetricEventKind,
+     RuntimeProjectionErrorKind,
+ };
+ use crate::acp::delegation::run_identity::{
+     cold_resolve_allows, fence_allows_settlement, LiveRunRegistration, SettlementFenceDecision,
+ };
+ use crate::acp::delegation::run_store::{
+-    derive_task_preview, launch_snapshot_from_run, request_fingerprint, Gen1AdmitOutcome,
+-    PersistedRun, PromoteAttemptMeta, PromoteConflictClass, PromoteRetryClass, PromoteRunningKind,
+-    PromoteRunningOutcome, RecoveryAdmissionAuthorization, ReservingRunInsert, RunStore,
+-    TerminalCompletionAttentionMetric,
++    derive_task_preview, inherited_binding, launch_snapshot_from_run, request_fingerprint,
++    Gen1AdmitOutcome, PersistedRun, PromoteAttemptMeta, PromoteConflictClass, PromoteRetryClass,
++    PromoteRunningKind, PromoteRunningOutcome, RecoveryAdmissionAuthorization, ReservingRunInsert,
++    RunStore, TerminalCompletionAttentionMetric,
+ };
+ use crate::acp::delegation::runtime_stats::{DelegationRuntimeStats, RuntimeStatsProjector};
+ use crate::acp::delegation::spawner::{ConnectionSpawner, DelegationLink};
+ use crate::acp::delegation::store::{
+     DelegationTaskStore, NoopTaskStore, PendingTerminalRetry, PersistenceRetryPolicy, Settlement,
+     TaskStoreError, TerminalCompletionProtocol, TerminalTaskWrite,
+ };
+ use crate::acp::delegation::supervisor::SupervisorWake;
+ use crate::acp::delegation::types::{
+     cold_task_report_message, correlation_error_message, validate_correlation_id,
+@@ -2465,20 +2465,23 @@ fn continue_reserved_error_report(
+         continued_from_task_id,
+     )
+ }
+ 
+ /// Map durable store fence / fingerprint errors onto broker wire errors.
+ fn store_err_to_delegation_error(err: TaskStoreError) -> DelegationError {
+     match err {
+         TaskStoreError::BusyThread(m) => DelegationError::BusyThread(m),
+         TaskStoreError::DuplicateParentTool(m) => DelegationError::DuplicateParentTool(m),
+         TaskStoreError::InvalidReplacement(m) => DelegationError::InvalidReplacement(m),
++        TaskStoreError::OrchestrationBindingLineageMismatch => {
++            DelegationError::OrchestrationBindingLineageMismatch
++        }
+         TaskStoreError::BudgetExhausted(m) => DelegationError::BudgetExhausted(m),
+         TaskStoreError::RecoveryConfirmationRequired(projection) => {
+             DelegationError::RecoveryConfirmationRequired(projection)
+         }
+         TaskStoreError::RecoveryAuthorizationRejected { code } => {
+             DelegationError::RecoveryAuthorizationRejected {
+                 code: code.to_string(),
+             }
+         }
+         TaskStoreError::StaleTaskId(m) => DelegationError::StaleTaskId(m),
+@@ -5917,20 +5920,29 @@ impl DelegationBroker {
+         fields(
+             parent_connection_id = %req.parent_connection_id,
+             parent_tool_use_id = %req.parent_tool_use_id,
+             agent_type = ?req.agent_type,
+             working_dir = ?req.working_dir,
+             child_connection_id = tracing::field::Empty,
+             task_id = tracing::field::Empty,
+         )
+     )]
+     pub async fn start_delegation(&self, mut req: DelegationRequest) -> DelegationTaskReport {
++        if let Some(binding) = req.orchestration_binding.as_ref() {
++            if let Err(message) = binding.validate() {
++                return report_err(
++                    req.agent_type,
++                    DelegationError::OrchestrationBindingInvalid(message.into()),
++                    None,
++                );
++            }
++        }
+         // Whitespace-only host tool ids are treated as absent so exact
+         // correlation (argument `correlation_id`) is used rather than the
+         // explicit-id path. Nonblank host ids are opaque and must not be
+         // trimmed. Listener also applies this rule for MCP callers.
+         if req.parent_tool_use_id.trim().is_empty() {
+             req.parent_tool_use_id.clear();
+         }
+         // Register this setup as the VERY FIRST thing — before the pre-cancel
+         // check's `.await` and the (possibly multi-second) claim poll — so a
+         // parent cancel landing ANYWHERE from here to park reaches it, not just
+@@ -6119,20 +6131,68 @@ impl DelegationBroker {
+             {
+                 self.drop_inflight(inflight_id).await;
+                 return report_err(
+                     req.agent_type,
+                     workflow_store_error_to_delegation_error(error),
+                     None,
+                 );
+             }
+         }
+ 
++        let replacement_source = match (
++            req.replaces_task_id.as_deref(),
++            self.run_store.as_ref(),
++        ) {
++            (Some(source_task_id), Some(runs)) => match runs.load_by_task_id(source_task_id).await {
++                Ok(Some(source))
++                    if source.parent_conversation_id == req.parent_conversation_id =>
++                {
++                    Some(source)
++                }
++                Ok(Some(_)) | Ok(None) => {
++                    self.drop_inflight(inflight_id).await;
++                    return report_err(
++                        req.agent_type,
++                        DelegationError::NotFound(source_task_id.into()),
++                        None,
++                    );
++                }
++                Err(error) => {
++                    self.drop_inflight(inflight_id).await;
++                    return report_err(
++                        req.agent_type,
++                        store_err_to_delegation_error(error),
++                        None,
++                    );
++                }
++            },
++            _ => None,
++        };
++        let effective_orchestration_binding = if let Some(source) = replacement_source.as_ref() {
++            match inherited_binding(
++                source.orchestration_binding.as_ref(),
++                req.orchestration_binding.as_ref(),
++            ) {
++                Ok(binding) => binding,
++                Err(error) => {
++                    self.drop_inflight(inflight_id).await;
++                    return report_err(
++                        req.agent_type,
++                        store_err_to_delegation_error(error),
++                        None,
++                    );
++                }
++            }
++        } else {
++            req.orchestration_binding.clone()
++        };
++
+         if let (Some(source_task_id), Some(runs)) =
+             (req.replaces_task_id.as_deref(), self.run_store.as_ref())
+         {
+             if is_completion_format_repair_prompt(&req.task) {
+                 match runs.terminal_completion_protocol(source_task_id).await {
+                     Ok(TerminalCompletionProtocol::V2) => {
+                         let mode = crate::db::entities::delegation_workflow::CompletionProtocolMode::V2Enforce;
+                         self.metrics.record_format_repair_child_run(mode.clone());
+                         self.metrics.record_card_reemit_prompt(mode);
+                         self.drop_inflight(inflight_id).await;
+@@ -6349,21 +6409,21 @@ impl DelegationBroker {
+         );
+         let route_fp = live_launch.snapshot.route_fingerprint.clone();
+         let request_fp = request_fingerprint(
+             DELEGATE_TO_AGENT_TOOL,
+             &req.task,
+             req.work_unit_key.as_deref(),
+             req.replaces_task_id.as_deref(),
+             req.replacement_reason.as_deref(),
+             None,
+             &route_fp,
+-            None,
++            effective_orchestration_binding.as_ref(),
+         );
+ 
+         // Parent-tool exact-duplicate handling BEFORE reserve/spawn (design
+         // precedence). Matching fingerprint → idempotent running ack without
+         // creating a new child; mismatch → reject.
+         if let Some(runs) = self.run_store.as_ref() {
+             if !req.parent_tool_use_id.is_empty() {
+                 match runs
+                     .load_by_parent_tool_use(req.parent_conversation_id, &req.parent_tool_use_id)
+                     .await
+@@ -6526,78 +6586,43 @@ impl DelegationBroker {
+                 return report_err(
+                     req.agent_type,
+                     DelegationError::Canceled {
+                         reason: "canceled before spawn".into(),
+                     },
+                     Some(child_row.id),
+                 );
+             }
+             // Replacement: inherit lineage root from replaced run; admission_class
+             // is Replacement. Otherwise normal gen-1 root.
+-            let (admission_class, lineage_root_task_id, root_task_id) = if let Some(replaces) =
+-                req.replaces_task_id.as_deref()
++            let (admission_class, lineage_root_task_id, root_task_id) = if let Some(source) =
++                replacement_source.as_ref()
+             {
+-                match runs.load_by_task_id(replaces).await {
+-                    Ok(Some(src)) => (
+-                        AdmissionClass::Replacement,
+-                        src.lineage_root_task_id.clone(),
+-                        // Replacement is a fresh generation-1 child
+-                        // thread; only the lineage root is inherited.
+-                        call_id.clone(),
+-                    ),
+-                    Ok(None) => {
+-                        // Post-create / pre-admission: compensate the unused shell.
+-                        if let Err(cleanup_err) = self
+-                            .compensate_provisional_orphan(
+-                                &runs.db().conn,
+-                                child_row.id,
+-                                "replacement source missing",
+-                            )
+-                            .await
+-                        {
+-                            self.drop_inflight(inflight_id).await;
+-                            return report_err(req.agent_type, cleanup_err, Some(child_row.id));
+-                        }
+-                        self.drop_inflight(inflight_id).await;
+-                        return report_err(
+-                            req.agent_type,
+-                            DelegationError::NotFound(replaces.to_string()),
+-                            None,
+-                        );
+-                    }
+-                    Err(e) => {
+-                        // Store error after create: still compensate the orphan
+-                        // child so it never remains a visible running shell.
+-                        if let Err(cleanup_err) = self
+-                            .compensate_provisional_orphan(
+-                                &runs.db().conn,
+-                                child_row.id,
+-                                "replacement source load error",
+-                            )
+-                            .await
+-                        {
+-                            self.drop_inflight(inflight_id).await;
+-                            return report_err(req.agent_type, cleanup_err, Some(child_row.id));
+-                        }
+-                        self.drop_inflight(inflight_id).await;
+-                        return report_err(req.agent_type, store_err_to_delegation_error(e), None);
+-                    }
+-                }
++                (
++                    AdmissionClass::Replacement,
++                    source.lineage_root_task_id.clone(),
++                    // Replacement is a fresh generation-1 child
++                    // thread; only the lineage root is inherited.
++                    call_id.clone(),
++                )
+             } else {
+                 (
+                     AdmissionClass::NormalRevision,
+                     call_id.clone(),
+                     call_id.clone(),
+                 )
+             };
+             let insert = ReservingRunInsert {
+-                orchestration_binding: None,
++                orchestration_binding: if replacement_source.is_some() {
++                    req.orchestration_binding.clone()
++                } else {
++                    effective_orchestration_binding.clone()
++                },
+                 task_id: call_id.clone(),
+                 root_task_id,
+                 previous_task_id: None,
+                 generation: 1,
+                 parent_conversation_id: req.parent_conversation_id,
+                 parent_tool_use_id: if req.parent_tool_use_id.is_empty() {
+                     None
+                 } else {
+                     Some(req.parent_tool_use_id.clone())
+                 },
+@@ -9147,20 +9172,30 @@ impl DelegationBroker {
+     ) -> DelegationTaskReport {
+         use crate::acp::delegation::capability::gate_continue_session_reuse;
+         use crate::acp::delegation::capability::ContinueCapabilityDecision;
+         use crate::acp::delegation::run_store::{
+             derive_task_preview, request_fingerprint, ContinueAdmitOutcome, ContinueRunAdmission,
+         };
+         use crate::acp::delegation::types::CONTINUE_DELEGATION_TOOL;
+         use crate::db::entities::conversation;
+         use sea_orm::EntityTrait;
+ 
++        if let Some(binding) = req.orchestration_binding.as_ref() {
++            if let Err(message) = binding.validate() {
++                return report_err(
++                    AgentType::ClaudeCode,
++                    DelegationError::OrchestrationBindingInvalid(message.into()),
++                    None,
++                );
++            }
++        }
++
+         // Whitespace-only host tool ids are treated as absent; preserve every
+         // nonblank opaque id exactly (see start_delegation).
+         if req.parent_tool_use_id.trim().is_empty() {
+             req.parent_tool_use_id.clear();
+         }
+         // Match gen-1's whole-setup parent-end fence: from the first await of
+         // a valid continuation through the durable reservation, parent end
+         // must have a per-admission record to mark. Register BEFORE the
+         // correlation poll so cancel during exact claim is observed. Every
+         // early return below drops it; successful reservation hands off to
+@@ -9351,20 +9386,34 @@ impl DelegationBroker {
+             }
+             Err(e) => {
+                 self.drop_inflight(inflight_id).await;
+                 return report_err(
+                     AgentType::ClaudeCode,
+                     store_err_to_delegation_error(e),
+                     None,
+                 );
+             }
+         };
++        let effective_orchestration_binding = match inherited_binding(
++            target.orchestration_binding.as_ref(),
++            req.orchestration_binding.as_ref(),
++        ) {
++            Ok(binding) => binding,
++            Err(error) => {
++                self.drop_inflight(inflight_id).await;
++                return report_err(
++                    target.agent_type,
++                    store_err_to_delegation_error(error),
++                    Some(target.child_conversation_id),
++                );
++            }
++        };
+ 
+         if is_completion_format_repair_prompt(&req.task) {
+             match runs.terminal_completion_protocol(&target.task_id).await {
+                 Ok(TerminalCompletionProtocol::V2) => {
+                     let mode =
+                         crate::db::entities::delegation_workflow::CompletionProtocolMode::V2Enforce;
+                     self.metrics.record_card_reemit_prompt(mode);
+                     self.drop_inflight(inflight_id).await;
+                     return report_err(
+                         target.agent_type,
+@@ -9391,21 +9440,21 @@ impl DelegationBroker {
+         let request_fp = request_fingerprint(
+             CONTINUE_DELEGATION_TOOL,
+             &req.task,
+             req.work_unit_key
+                 .as_deref()
+                 .or(target.work_unit_key.as_deref()),
+             None,
+             None,
+             Some(&req.target_task_id),
+             &route_fp,
+-            None,
++            effective_orchestration_binding.as_ref(),
+         );
+ 
+         // Exact parent-tool replays are resolved before capability or
+         // lifecycle gates. Matching fingerprint is idempotent; terminal rows
+         // project durable status (never a false running reuse ack).
+         match runs
+             .load_by_parent_tool_use(req.parent_conversation_id, &req.parent_tool_use_id)
+             .await
+         {
+             Ok(Some(existing)) => {
+@@ -9446,20 +9495,22 @@ impl DelegationBroker {
+ 
+         let new_task_id = uuid::Uuid::new_v4().to_string();
+         let admission = ContinueRunAdmission {
+             task_id: new_task_id.clone(),
+             parent_conversation_id: req.parent_conversation_id,
+             parent_tool_use_id: req.parent_tool_use_id.clone(),
+             target_task_id: req.target_task_id.clone(),
+             task_preview: derive_task_preview(&req.task),
+             request_fingerprint: request_fp,
+             work_unit_key: req.work_unit_key.clone(),
++            supplied_orchestration_binding: req.orchestration_binding.clone(),
++            effective_orchestration_binding,
+         };
+ 
+         // Record durable ownership under the same lock as the already-registered
+         // admission fence, so parent end observes either the fence or the
+         // later durable row throughout note → reserve → handoff.
+         {
+             let mut inner = self.pending.inner.lock().await;
+             inner.note_parent_conversation(&req.parent_connection_id, req.parent_conversation_id);
+         }
+ 
+@@ -16242,20 +16293,21 @@ mod tests {
+                 .continue_delegation(ContinueDelegationRequest {
+                     parent_connection_id: "parent-conn".into(),
+                     parent_conversation_id: parent.id,
+                     parent_tool_use_id: "resume-authorized-tool".into(),
+                     target_task_id: source_task_id.into(),
+                     task: "private resume prompt prose".into(),
+                     work_unit_key: Some("resume-unit".into()),
+                     external_handle: None,
+                     correlation_id: Some("resume-correlation".into()),
+                     recovery_authorization_id: Some(approved.authorization_id.clone()),
++                    orchestration_binding: None,
+                 })
+                 .await;
+             assert_eq!(report.error_code.as_deref(), Some("unresumable"));
+             assert_eq!(spawner.resume_args.lock().await.len(), 1);
+             assert_eq!(
+                 spawner.resume_args.lock().await[0].external_session_id,
+                 "private-raw-resume-session"
+             );
+             let consumed = authorizations
+                 .find_by_id(&approved.authorization_id)
+@@ -16588,23 +16640,268 @@ mod tests {
+             profile_id: None,
+             task: "do x".into(),
+             working_dir: None,
+             requested_working_dir: None,
+             external_handle: None,
+             work_unit_key: None,
+             replaces_task_id: None,
+             replacement_reason: None,
+             correlation_id: None,
+             recovery_authorization_id: None,
++            orchestration_binding: None,
+         }
+     }
+ 
++    fn orchestration_binding_fixture() ->
++        crate::acp::delegation::types::OrchestrationBindingV1
++    {
++        crate::acp::delegation::types::OrchestrationBindingV1 {
++            schema_version: 1,
++            namespace: "brainstorm-to-delivery".into(),
++            generation: 1,
++            route_fingerprint:
++                "sha256:b498416d87bf6ba928bd7ddb5f1a451daf82300584f3d40b606c3c56f169ba7a"
++                    .into(),
++        }
++    }
++
++    #[tokio::test]
++    async fn orchestration_binding_lineage_first_dispatch_validates_and_persists_before_spawn() {
++        use crate::db::service::conversation_service;
++        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
++
++        let invalid_mock = Arc::new(MockSpawner::new());
++        let invalid_broker = DelegationBroker::new(
++            invalid_mock.clone() as Arc<dyn ConnectionSpawner>,
++            shallow_lookup(),
++        );
++        enable_delegation(&invalid_broker).await;
++        let mut invalid = request(1, "binding-invalid-direct");
++        let mut invalid_binding = orchestration_binding_fixture();
++        invalid_binding.namespace = "Invalid".into();
++        invalid.orchestration_binding = Some(invalid_binding);
++        let rejected = invalid_broker.start_delegation(invalid).await;
++        assert_eq!(
++            rejected.error_code.as_deref(),
++            Some("orchestration_binding_invalid")
++        );
++        assert!(invalid_mock.spawn_args.lock().await.is_empty());
++
++        let db = Arc::new(fresh_in_memory_db().await);
++        let folder = seed_folder(&db, "/tmp/codeg-binding-first").await;
++        let parent = conversation_service::create(
++            &db.conn,
++            folder,
++            AgentType::ClaudeCode,
++            Some("binding first parent".into()),
++            None,
++        )
++        .await
++        .expect("parent");
++        let runs = Arc::new(RunStore::new(db));
++        let mock = Arc::new(MockSpawner::new());
++        for child in ["binding-first-bound", "binding-first-unbound"] {
++            mock.queue_spawn(Ok(child.into())).await;
++            mock.queue_send(Ok(accepted(0, Utc::now()))).await;
++        }
++        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
++
++        let mut bound = request(parent.id, "binding-first-bound-tool");
++        bound.working_dir = Some(test_working_dir());
++        bound.orchestration_binding = Some(orchestration_binding_fixture());
++        let bound_report = broker.start_delegation(bound).await;
++        assert_eq!(bound_report.status, TaskStatus::Running, "{bound_report:?}");
++        let bound_run = runs
++            .load_by_task_id(bound_report.task_id.as_deref().unwrap())
++            .await
++            .unwrap()
++            .unwrap();
++        assert_eq!(
++            bound_run.orchestration_binding,
++            Some(orchestration_binding_fixture())
++        );
++
++        let spawns_before_alias = mock.spawn_args.lock().await.len();
++        let mut alias = request(parent.id, "binding-first-bound-tool");
++        alias.working_dir = Some(test_working_dir());
++        let mut different_binding = orchestration_binding_fixture();
++        different_binding.namespace = "brainstorm-to-delivery-alt".into();
++        alias.orchestration_binding = Some(different_binding);
++        let alias_report = broker.start_delegation(alias).await;
++        assert_eq!(
++            alias_report.error_code.as_deref(),
++            Some("duplicate_parent_tool")
++        );
++        assert_eq!(mock.spawn_args.lock().await.len(), spawns_before_alias);
++
++        let mut unbound = request(parent.id, "binding-first-unbound-tool");
++        unbound.working_dir = Some(test_working_dir());
++        let unbound_report = broker.start_delegation(unbound).await;
++        assert_eq!(unbound_report.status, TaskStatus::Running, "{unbound_report:?}");
++        let unbound_run = runs
++            .load_by_task_id(unbound_report.task_id.as_deref().unwrap())
++            .await
++            .unwrap()
++            .unwrap();
++        assert_eq!(unbound_run.orchestration_binding, None);
++    }
++
++    #[tokio::test]
++    async fn orchestration_binding_lineage_replacement_mismatch_precedes_child_and_spawn() {
++        use crate::db::service::conversation_service;
++        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
++
++        let db = Arc::new(fresh_in_memory_db().await);
++        let folder = seed_folder(&db, "/tmp/codeg-binding-replacement").await;
++        let parent = conversation_service::create(
++            &db.conn,
++            folder,
++            AgentType::ClaudeCode,
++            Some("binding replacement parent".into()),
++            None,
++        )
++        .await
++        .expect("parent");
++        let runs = Arc::new(RunStore::new(db.clone()));
++        let mock = Arc::new(MockSpawner::new());
++        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
++
++        let source_task_id = "binding-replacement-source".to_string();
++        let workspace = test_working_dir();
++        let launch = build_live_launch_config(
++            AgentType::ClaudeCode,
++            None,
++            &workspace,
++            None,
++            BTreeMap::new(),
++        );
++        let source_child = conversation_service::create_with_delegation(
++            &db.conn,
++            folder,
++            AgentType::ClaudeCode,
++            Some("binding replacement source".into()),
++            None,
++            Some(DelegationLink {
++                parent_conversation_id: parent.id,
++                parent_tool_use_id: "binding-replacement-source-tool".into(),
++                delegation_call_id: source_task_id.clone(),
++            }),
++        )
++        .await
++        .expect("source child");
++        runs
++            .insert_reserving(ReservingRunInsert {
++                orchestration_binding: Some(orchestration_binding_fixture()),
++                task_id: source_task_id.clone(),
++                root_task_id: source_task_id.clone(),
++                previous_task_id: None,
++                generation: 1,
++                parent_conversation_id: parent.id,
++                parent_tool_use_id: Some("binding-replacement-source-tool".into()),
++                child_conversation_id: source_child.id,
++                agent_type: "claude_code".into(),
++                profile_id: None,
++                workspace_path: Some(launch.snapshot.workspace_path),
++                route_fingerprint: Some(launch.snapshot.route_fingerprint),
++                launch_snapshot_version: Some(launch.snapshot.launch_snapshot_version),
++                mode_id: launch.snapshot.mode_id,
++                config_values_json: Some(launch.snapshot.config_values_json),
++                task_preview: Some("binding replacement source".into()),
++                request_fingerprint: Some("binding-replacement-source-fingerprint".into()),
++                admission_class: AdmissionClass::NormalRevision,
++                lineage_root_task_id: source_task_id.clone(),
++                work_unit_key: Some("binding-replacement-unit".into()),
++                history_only: false,
++                replaced_task_id: None,
++                replacement_reason: None,
++                started_at: Some(Utc::now()),
++            })
++            .await
++            .expect("source reserve");
++        let finished_at = Utc::now();
++        runs
++            .settle_terminal(
++                &source_task_id,
++                TerminalTaskWrite::failed_with_evidence(
++                    "admission_unknown",
++                    finished_at,
++                    DelegationTerminationAuditV1::for_terminal_code(
++                        "admission_unknown",
++                        DelegationRunStatus::Reserving,
++                        true,
++                        finished_at,
++                    ),
++                ),
++            )
++            .await
++            .expect("terminal replacement source");
++        let authorization_id = approve_replacement_recovery(
++            &db,
++            &runs,
++            &source_task_id,
++            crate::acp::delegation::recovery_policy::ReplacementReason::AdmissionUnknown,
++        )
++        .await;
++        let children_before = conversation_service::list_children(&db.conn, parent.id)
++            .await
++            .unwrap()
++            .len();
++        let spawns_before = mock.spawn_args.lock().await.len();
++
++        let mut replacement = request(parent.id, "binding-replacement-mismatch-tool");
++        replacement.working_dir = Some(test_working_dir());
++        replacement.work_unit_key = Some("binding-replacement-unit".into());
++        replacement.replaces_task_id = Some(source_task_id.clone());
++        replacement.replacement_reason = Some("admission_unknown".into());
++        replacement.recovery_authorization_id = Some(authorization_id.clone());
++        let mut changed = orchestration_binding_fixture();
++        changed.namespace = "brainstorm-to-delivery-alt".into();
++        replacement.orchestration_binding = Some(changed);
++        let rejected = broker.start_delegation(replacement).await;
++        assert_eq!(
++            rejected.error_code.as_deref(),
++            Some("orchestration_binding_lineage_mismatch")
++        );
++        assert_eq!(mock.spawn_args.lock().await.len(), spawns_before);
++        assert_eq!(
++            conversation_service::list_children(&db.conn, parent.id)
++                .await
++                .unwrap()
++                .len(),
++            children_before,
++            "lineage rejection must precede provisional child allocation"
++        );
++
++        mock.queue_spawn(Ok("binding-replacement-exact".into()))
++            .await;
++        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
++        let mut exact = request(parent.id, "binding-replacement-exact-tool");
++        exact.working_dir = Some(test_working_dir());
++        exact.work_unit_key = Some("binding-replacement-unit".into());
++        exact.replaces_task_id = Some(source_task_id);
++        exact.replacement_reason = Some("admission_unknown".into());
++        exact.recovery_authorization_id = Some(authorization_id);
++        exact.orchestration_binding = Some(orchestration_binding_fixture());
++        let accepted = broker.start_delegation(exact).await;
++        assert_eq!(accepted.status, TaskStatus::Running, "{accepted:?}");
++        let accepted_run = runs
++            .load_by_task_id(accepted.task_id.as_deref().unwrap())
++            .await
++            .unwrap()
++            .unwrap();
++        assert_eq!(
++            accepted_run.orchestration_binding,
++            Some(orchestration_binding_fixture()),
++            "mismatch must not consume the authorization used by the exact call"
++        );
++    }
++
+     fn test_working_dir() -> String {
+         resolve_workspace_path(None).expect("test working directory")
+     }
+ 
+     fn request_with_handle(parent_conv: i32, tool_use: &str, handle: &str) -> DelegationRequest {
+         let mut r = request(parent_conv, tool_use);
+         r.external_handle = Some(handle.to_string());
+         r
+     }
+ 
+@@ -24831,20 +25128,21 @@ mod tests {
+                 .continue_delegation(ContinueDelegationRequest {
+                     parent_connection_id: "parent-conn".into(),
+                     parent_conversation_id: parent.id,
+                     parent_tool_use_id: "tu-cont-bind-continue".into(),
+                     target_task_id: root_task_id,
+                     task: "continue after root".into(),
+                     work_unit_key: None,
+                     external_handle: None,
+                     correlation_id: None,
+                     recovery_authorization_id: None,
++                    orchestration_binding: None,
+                 })
+                 .await
+         });
+ 
+         entered_rx.await.expect("continue post-reserve entered");
+         // Continue reserved a new gen≥2 run; pre-bind a different owner so the
+         // handoff mint loses ownership (exercises transfer + BindOwnershipConflict).
+         let cont_rows = runs
+             .list_non_terminal_for_parent(parent.id)
+             .await
+@@ -24984,20 +25282,21 @@ mod tests {
+                 .continue_delegation(ContinueDelegationRequest {
+                     parent_connection_id: "parent-conn".into(),
+                     parent_conversation_id: parent_id,
+                     parent_tool_use_id: "tu-cont-term-continue".into(),
+                     target_task_id: root_for_continue,
+                     task: "continue after root".into(),
+                     work_unit_key: None,
+                     external_handle: None,
+                     correlation_id: None,
+                     recovery_authorization_id: None,
++                    orchestration_binding: None,
+                 })
+                 .await
+         });
+ 
+         entered_rx.await.expect("continue post-reserve entered");
+         let cont_rows = runs
+             .list_non_terminal_for_parent(parent.id)
+             .await
+             .expect("list");
+         let cont_run = cont_rows
+@@ -25270,20 +25569,21 @@ mod tests {
+             .continue_delegation(ContinueDelegationRequest {
+                 parent_connection_id: "parent-conn".into(),
+                 parent_conversation_id: parent.id,
+                 parent_tool_use_id: "tu-continue-promote-t".into(),
+                 target_task_id: root_task_id,
+                 task: "resume after root".into(),
+                 work_unit_key: None,
+                 external_handle: None,
+                 correlation_id: None,
+                 recovery_authorization_id: None,
++                orchestration_binding: None,
+             })
+             .await;
+         assert_eq!(report.status, TaskStatus::Running, "{report:?}");
+         let cont_id = report.task_id.expect("continued task id");
+         let cont = runs.load_by_task_id(&cont_id).await.unwrap().unwrap();
+         assert_eq!(cont.run_status, DelegationRunStatus::Running);
+         // Cancels may record root complete teardown; continued child must not cancel.
+         assert!(
+             !mock
+                 .cancels
+@@ -25673,20 +25973,21 @@ mod tests {
+                     .continue_delegation(ContinueDelegationRequest {
+                         parent_connection_id: "parent-conn".into(),
+                         parent_conversation_id: parent.id,
+                         parent_tool_use_id: "tu-budget-ex-cont".into(),
+                         target_task_id: root_task_id,
+                         task: "resume".into(),
+                         work_unit_key: None,
+                         external_handle: None,
+                         correlation_id: None,
+                         recovery_authorization_id: None,
++                        orchestration_binding: None,
+                     })
+                     .await
+             })
+         };
+ 
+         let (continued_task_id, lineage_root) = loop {
+             if let Ok(Some(run)) = runs
+                 .load_by_parent_tool_use(parent.id, "tu-budget-ex-cont")
+                 .await
+             {
+@@ -26211,20 +26512,21 @@ mod tests {
+                     .continue_delegation(ContinueDelegationRequest {
+                         parent_connection_id: "parent-conn".into(),
+                         parent_conversation_id: parent.id,
+                         parent_tool_use_id: "tu-cont-adopt-c".into(),
+                         target_task_id: root_task_id,
+                         task: "resume".into(),
+                         work_unit_key: None,
+                         external_handle: None,
+                         correlation_id: None,
+                         recovery_authorization_id: None,
++                        orchestration_binding: None,
+                     })
+                     .await
+             })
+         };
+         let continued_task_id = loop {
+             if let Ok(Some(run)) = runs
+                 .load_by_parent_tool_use(parent.id, "tu-cont-adopt-c")
+                 .await
+             {
+                 if run.child_connection_id.is_some() {
+@@ -26716,20 +27018,21 @@ mod tests {
+                     .continue_delegation(ContinueDelegationRequest {
+                         parent_connection_id: "parent-conn".into(),
+                         parent_conversation_id: parent.id,
+                         parent_tool_use_id: "tu-cont-adopt".into(),
+                         target_task_id: root_task_id,
+                         task: "resume".into(),
+                         work_unit_key: None,
+                         external_handle: None,
+                         correlation_id: None,
+                         recovery_authorization_id: None,
++                        orchestration_binding: None,
+                     })
+                     .await
+             })
+         };
+         let continued_task_id = loop {
+             if let Ok(Some(run)) = runs
+                 .load_by_parent_tool_use(parent.id, "tu-cont-adopt")
+                 .await
+             {
+                 if run.child_connection_id.is_some() {
+@@ -27118,20 +27421,21 @@ mod tests {
+             .continue_delegation(ContinueDelegationRequest {
+                 parent_connection_id: "parent-conn".into(),
+                 parent_conversation_id: parent.id,
+                 parent_tool_use_id: "tu-g12-cont".into(),
+                 target_task_id: root_task,
+                 task: "gen2 work".into(),
+                 work_unit_key: None,
+                 external_handle: None,
+                 correlation_id: None,
+                 recovery_authorization_id: None,
++                orchestration_binding: None,
+             })
+             .await;
+         assert_eq!(cont.status, TaskStatus::Running, "{cont:?}");
+         let cont_id = cont.task_id.expect("cont task");
+         let gen2 = runs.load_by_task_id(&cont_id).await.unwrap().unwrap();
+         assert_eq!(gen2.started_at, Some(t2));
+         assert_ne!(
+             gen1.started_at, gen2.started_at,
+             "generation timestamps must be distinct"
+         );
+@@ -27291,20 +27595,21 @@ mod tests {
+             .continue_delegation(ContinueDelegationRequest {
+                 parent_connection_id: "parent-conn".into(),
+                 parent_conversation_id: parent.id,
+                 parent_tool_use_id: "tu-cont-acc".into(),
+                 target_task_id: root_task,
+                 task: "continue work".into(),
+                 work_unit_key: None,
+                 external_handle: None,
+                 correlation_id: None,
+                 recovery_authorization_id: None,
++                orchestration_binding: None,
+             })
+             .await;
+         assert_eq!(cont.status, TaskStatus::Running, "{cont:?}");
+         let after_gen2 = broker.metrics().snapshot();
+         assert_eq!(after_gen2.accepted_count, 2);
+         assert_eq!(after_gen2.accepted_by_agent["claude_code"], 2);
+     }
+ 
+     #[tokio::test]
+     async fn idempotent_promote_no_double_accepted_metric() {
+@@ -29011,20 +29316,21 @@ mod tests {
+                 .continue_delegation(ContinueDelegationRequest {
+                     parent_connection_id: "parent-conn".into(),
+                     parent_conversation_id: parent.id,
+                     parent_tool_use_id: "tu-miss-continue".into(),
+                     target_task_id: root_task_id,
+                     task: "continue".into(),
+                     work_unit_key: None,
+                     external_handle: None,
+                     correlation_id: None,
+                     recovery_authorization_id: None,
++                    orchestration_binding: None,
+                 })
+                 .await
+         });
+         entered_rx.await.expect("entered post-reserve gate");
+         let child = conversation::Entity::find_by_id(child_id)
+             .one(&db.conn)
+             .await
+             .unwrap()
+             .unwrap();
+         let mut child = child.into_active_model();
+@@ -29103,20 +29409,21 @@ mod tests {
+             .continue_delegation(ContinueDelegationRequest {
+                 parent_connection_id: "parent-conn".into(),
+                 parent_conversation_id: parent.id,
+                 parent_tool_use_id: "tu-rf-continue".into(),
+                 target_task_id: root_task_id,
+                 task: "continue".into(),
+                 work_unit_key: None,
+                 external_handle: None,
+                 correlation_id: None,
+                 recovery_authorization_id: None,
++                orchestration_binding: None,
+             })
+             .await;
+         assert_eq!(report.error_code.as_deref(), Some("unresumable"));
+         let msg = report.message.unwrap_or_default();
+         assert!(
+             !msg.contains("secret token") && !msg.contains("xyz"),
+             "must not leak raw spawn error: {msg}"
+         );
+         assert_eq!(mock.resume_args.lock().await.len(), 1);
+         assert_eq!(
+@@ -35746,20 +36053,21 @@ mod tests {
+             .continue_delegation(ContinueDelegationRequest {
+                 parent_connection_id: "parent-conn".into(),
+                 parent_conversation_id: parent_id,
+                 parent_tool_use_id: "binding-continue-ok".into(),
+                 target_task_id: root_task_id.clone(),
+                 task: "continue the bound workflow child".into(),
+                 work_unit_key: Some(v2_plan_author_work_unit_key()),
+                 external_handle: None,
+                 correlation_id: None,
+                 recovery_authorization_id: None,
++                orchestration_binding: None,
+             })
+             .await;
+ 
+         assert_eq!(report.status, TaskStatus::Running, "{report:?}");
+         let continued_task_id = report.task_id.clone().unwrap();
+         assert_eq!(
+             broker
+                 .workflow_child_mcp_binding(runs.as_ref(), &continued_task_id)
+                 .await
+                 .unwrap(),
+@@ -35801,20 +36109,21 @@ mod tests {
+             .continue_delegation(ContinueDelegationRequest {
+                 parent_connection_id: "parent-conn".into(),
+                 parent_conversation_id: parent_id,
+                 parent_tool_use_id: "binding-continue-fail".into(),
+                 target_task_id: root_task_id,
+                 task: "continue the bound workflow child".into(),
+                 work_unit_key: Some(v2_plan_author_work_unit_key()),
+                 external_handle: None,
+                 correlation_id: None,
+                 recovery_authorization_id: None,
++                orchestration_binding: None,
+             })
+             .await;
+ 
+         assert_eq!(report.status, TaskStatus::Failed, "{report:?}");
+         assert_eq!(report.error_code.as_deref(), Some("admission_failed"));
+         assert_ne!(report.error_code.as_deref(), Some("unresumable"));
+         assert!(mock.resume_args.lock().await.is_empty());
+         let persisted = runs
+             .load_by_task_id(report.task_id.as_deref().unwrap())
+             .await
+@@ -35955,20 +36264,21 @@ mod tests {
+                     .continue_delegation(ContinueDelegationRequest {
+                         parent_connection_id: "parent-conn".into(),
+                         parent_conversation_id: parent_id,
+                         parent_tool_use_id: "binding-race-continue".into(),
+                         target_task_id: root_task_id,
+                         task: "continue after exact-v2 admission".into(),
+                         work_unit_key: Some(v2_plan_author_work_unit_key()),
+                         external_handle: None,
+                         correlation_id: None,
+                         recovery_authorization_id: None,
++                        orchestration_binding: None,
+                     })
+                     .await
+             })
+         };
+         entered_rx
+             .await
+             .expect("continuation admitted before spawn");
+         let admitted = runs
+             .load_by_parent_tool_use(parent_id, "binding-race-continue")
+             .await
+@@ -36216,20 +36526,21 @@ mod tests {
+                 .continue_delegation(ContinueDelegationRequest {
+                     parent_connection_id: "parent-conn".into(),
+                     parent_conversation_id: parent_id,
+                     parent_tool_use_id: tool_use_id.clone(),
+                     target_task_id: root_task_id,
+                     task: "continue rejected protocol pair".into(),
+                     work_unit_key: Some(v2_plan_author_work_unit_key()),
+                     external_handle: None,
+                     correlation_id: None,
+                     recovery_authorization_id: None,
++                    orchestration_binding: None,
+                 })
+                 .await;
+             assert_eq!(report.status, TaskStatus::Failed, "{report:?}");
+             assert_eq!(report.error_code.as_deref(), Some(expected_code));
+             if expected_code == "workflow_v2_retired" {
+                 assert_retirement_navigation(&report, parent_id);
+             }
+             assert_eq!(mock.spawn_args.lock().await.len(), spawn_count);
+             assert!(mock.resume_args.lock().await.is_empty());
+             assert!(runs
+@@ -36321,20 +36632,21 @@ mod tests {
+             .continue_delegation(ContinueDelegationRequest {
+                 parent_connection_id: "parent-conn".into(),
+                 parent_conversation_id: parent_id,
+                 parent_tool_use_id: "historical-continue".into(),
+                 target_task_id: root_task_id,
+                 task: "continue historical workflow".into(),
+                 work_unit_key: Some(v2_plan_author_work_unit_key()),
+                 external_handle: None,
+                 correlation_id: None,
+                 recovery_authorization_id: None,
++                orchestration_binding: None,
+             })
+             .await;
+         assert_eq!(continued.status, TaskStatus::Failed, "{continued:?}");
+         assert_eq!(
+             continued.error_code.as_deref(),
+             Some("legacy_completion_protocol_read_only")
+         );
+         assert!(mock.resume_args.lock().await.is_empty());
+         assert!(runs
+             .load_by_parent_tool_use(parent_id, "historical-continue")
+@@ -36423,20 +36735,21 @@ mod tests {
+             .continue_delegation(ContinueDelegationRequest {
+                 parent_connection_id: "parent-conn".into(),
+                 parent_conversation_id: parent_id,
+                 parent_tool_use_id: "dangling-admission-continue".into(),
+                 target_task_id: root_task_id,
+                 task: "must not launch without the claimed workflow header".into(),
+                 work_unit_key: Some(v2_plan_author_work_unit_key()),
+                 external_handle: None,
+                 correlation_id: None,
+                 recovery_authorization_id: None,
++                orchestration_binding: None,
+             })
+             .await;
+         assert_eq!(continued.status, TaskStatus::Failed, "{continued:?}");
+         assert_eq!(
+             continued.error_code.as_deref(),
+             Some("unsupported_completion_protocol")
+         );
+         assert!(mock.resume_args.lock().await.is_empty());
+         assert!(runs
+             .load_by_parent_tool_use(parent_id, "dangling-admission-continue")
+@@ -37911,20 +38224,21 @@ mod tests {
+             .continue_delegation(ContinueDelegationRequest {
+                 parent_connection_id: "parent-conn".into(),
+                 parent_conversation_id: 1,
+                 parent_tool_use_id: String::new(),
+                 target_task_id: "unknown-target".into(),
+                 task: "review the revision".into(),
+                 work_unit_key: None,
+                 external_handle: None,
+                 correlation_id: None,
+                 recovery_authorization_id: None,
++                orchestration_binding: None,
+             })
+             .await;
+         assert_eq!(
+             report.error_code.as_deref(),
+             Some("delegation_correlation_missing")
+         );
+         assert_eq!(
+             broker
+                 .take_pending_tool_call("parent-conn")
+                 .await
+@@ -37955,20 +38269,21 @@ mod tests {
+             .continue_delegation(ContinueDelegationRequest {
+                 parent_connection_id: "parent-conn".into(),
+                 parent_conversation_id: 1,
+                 parent_tool_use_id: String::new(),
+                 target_task_id: "unknown-target".into(),
+                 task: "review the revision".into(),
+                 work_unit_key: None,
+                 external_handle: None,
+                 correlation_id: None,
+                 recovery_authorization_id: None,
++                orchestration_binding: None,
+             })
+             .await;
+         assert_eq!(
+             report.error_code.as_deref(),
+             Some("delegation_correlation_missing")
+         );
+         assert_eq!(
+             broker
+                 .take_pending_tool_call("parent-conn")
+                 .await
+@@ -37989,20 +38304,21 @@ mod tests {
+             .continue_delegation(ContinueDelegationRequest {
+                 parent_connection_id: "parent-conn".into(),
+                 parent_conversation_id: 1,
+                 parent_tool_use_id: String::new(),
+                 target_task_id: "tgt-1".into(),
+                 task: "review the revision".into(),
+                 work_unit_key: None,
+                 external_handle: None,
+                 correlation_id: Some("cont-corr-1".into()),
+                 recovery_authorization_id: None,
++                orchestration_binding: None,
+             })
+             .await;
+         assert_eq!(
+             report.error_code.as_deref(),
+             Some("delegation_correlation_timeout")
+         );
+         assert_eq!(mock.spawn_count().await, 0);
+     }
+ 
+     #[tokio::test]
+@@ -38026,20 +38342,21 @@ mod tests {
+             .continue_delegation(ContinueDelegationRequest {
+                 parent_connection_id: "parent-conn".into(),
+                 parent_conversation_id: 1,
+                 parent_tool_use_id: String::new(),
+                 target_task_id: "tgt-ext-cancel".into(),
+                 task: "review the revision".into(),
+                 work_unit_key: None,
+                 external_handle: Some("h-cont-claim-cancel".into()),
+                 correlation_id: Some("cont-ext-cancel".into()),
+                 recovery_authorization_id: None,
++                orchestration_binding: None,
+             })
+             .await;
+         assert_eq!(report.error_code.as_deref(), Some("canceled"));
+         assert_eq!(mock.spawn_count().await, 0);
+         assert_eq!(broker.inflight_count().await, 0);
+     }
+ 
+     #[tokio::test]
+     async fn continue_delegation_join_abandoned_during_exact_claim_preserves_code() {
+         // Poll-time parent-end on continue must keep join_abandoned (not canceled).
+@@ -38065,20 +38382,21 @@ mod tests {
+             .continue_delegation(ContinueDelegationRequest {
+                 parent_connection_id: "parent-conn".into(),
+                 parent_conversation_id: 1,
+                 parent_tool_use_id: String::new(),
+                 target_task_id: "tgt-join-abandon".into(),
+                 task: "review the revision".into(),
+                 work_unit_key: None,
+                 external_handle: None,
+                 correlation_id: Some("cont-join-abandon".into()),
+                 recovery_authorization_id: None,
++                orchestration_binding: None,
+             })
+             .await;
+         assert_eq!(
+             report.error_code.as_deref(),
+             Some("join_abandoned"),
+             "must preserve JoinAbandoned, not collapse to canceled: {report:?}"
+         );
+         assert_eq!(mock.spawn_count().await, 0);
+         assert_eq!(broker.inflight_count().await, 0);
+     }
+@@ -38144,20 +38462,21 @@ mod tests {
+             .continue_delegation(ContinueDelegationRequest {
+                 parent_connection_id: "parent-conn".into(),
+                 parent_conversation_id: parent.id,
+                 parent_tool_use_id: " \t ".into(),
+                 target_task_id: root_task_id.clone(),
+                 task: "review the revision".into(),
+                 work_unit_key: None,
+                 external_handle: None,
+                 correlation_id: Some("cont-bind".into()),
+                 recovery_authorization_id: None,
++                orchestration_binding: None,
+             })
+             .await;
+         assert!(
+             report.error_code.is_none(),
+             "continue exact claim should succeed: err={:?} msg={:?}",
+             report.error_code,
+             report.message
+         );
+         assert_ne!(
+             report.error_code.as_deref(),
+@@ -38242,20 +38561,21 @@ mod tests {
+         let cont_req = ContinueDelegationRequest {
+             parent_connection_id: "parent-conn".into(),
+             parent_conversation_id: parent.id,
+             parent_tool_use_id: String::new(),
+             target_task_id: root_task_id.clone(),
+             task: "review the revision".into(),
+             work_unit_key: None,
+             external_handle: None,
+             correlation_id: Some("cont-mcp-first".into()),
+             recovery_authorization_id: None,
++            orchestration_binding: None,
+         };
+         let b2 = broker.clone();
+         let cont_handle = tokio::spawn(async move { b2.continue_delegation(cont_req).await });
+ 
+         // Wait until resolve_exact_claim is inside its poll loop, then register.
+         entered_rx
+             .await
+             .expect("continue must reach exact-claim poll before ACP card");
+         broker
+             .register_pending_tool_call_with_key(
+@@ -38419,20 +38739,21 @@ mod tests {
+             .continue_delegation(ContinueDelegationRequest {
+                 parent_connection_id: "parent-conn".into(),
+                 parent_conversation_id: parent.id,
+                 parent_tool_use_id: String::new(),
+                 target_task_id: t1_id.clone(),
+                 task: "revise the work".into(),
+                 work_unit_key: None,
+                 external_handle: None,
+                 correlation_id: Some("corr-t2".into()),
+                 recovery_authorization_id: None,
++                orchestration_binding: None,
+             })
+             .await;
+         assert!(
+             t2_report.error_code.is_none(),
+             "t2 continue: err={:?} msg={:?}",
+             t2_report.error_code,
+             t2_report.message
+         );
+         let t2_id = t2_report.task_id.clone().expect("t2 task id");
+         assert_ne!(t2_id, t1_id, "continuation mints a new task id");
+@@ -38657,20 +38978,21 @@ mod tests {
+             .continue_delegation(ContinueDelegationRequest {
+                 parent_connection_id: "parent-conn".into(),
+                 parent_conversation_id: parent.id,
+                 parent_tool_use_id: String::new(),
+                 target_task_id: "does-not-exist".into(),
+                 task: "review the revision".into(),
+                 work_unit_key: None,
+                 external_handle: None,
+                 correlation_id: None,
+                 recovery_authorization_id: None,
++                orchestration_binding: None,
+             })
+             .await;
+         assert_eq!(
+             missing.error_code.as_deref(),
+             Some("delegation_correlation_missing"),
+             "missing corr must beat not_found: {missing:?}"
+         );
+         assert_eq!(mock.spawn_count().await, 0);
+ 
+         // 2) Valid corr + no ACP + nonexistent target → correlation_timeout (not not_found).
+@@ -38678,20 +39000,21 @@ mod tests {
+             .continue_delegation(ContinueDelegationRequest {
+                 parent_connection_id: "parent-conn".into(),
+                 parent_conversation_id: parent.id,
+                 parent_tool_use_id: String::new(),
+                 target_task_id: "also-missing".into(),
+                 task: "review the revision".into(),
+                 work_unit_key: None,
+                 external_handle: None,
+                 correlation_id: Some("corr-timeout-nf".into()),
+                 recovery_authorization_id: None,
++                orchestration_binding: None,
+             })
+             .await;
+         assert_eq!(
+             timeout.error_code.as_deref(),
+             Some("delegation_correlation_timeout"),
+             "timeout must beat not_found: {timeout:?}"
+         );
+         assert_eq!(mock.spawn_count().await, 0);
+ 
+         // 3) Malformed correlation_id (present but invalid) → correlation_missing;
+@@ -38700,20 +39023,21 @@ mod tests {
+             .continue_delegation(ContinueDelegationRequest {
+                 parent_connection_id: "parent-conn".into(),
+                 parent_conversation_id: parent.id,
+                 parent_tool_use_id: String::new(),
+                 target_task_id: "malformed-target".into(),
+                 task: "review the revision".into(),
+                 work_unit_key: None,
+                 external_handle: None,
+                 correlation_id: Some(".leading-dot-invalid".into()),
+                 recovery_authorization_id: None,
++                orchestration_binding: None,
+             })
+             .await;
+         assert_eq!(
+             malformed.error_code.as_deref(),
+             Some("delegation_correlation_missing"),
+             "malformed corr must fail closed as missing: {malformed:?}"
+         );
+         assert_eq!(
+             mock.spawn_count().await,
+             0,
+@@ -38738,20 +39062,21 @@ mod tests {
+             .continue_delegation(ContinueDelegationRequest {
+                 parent_connection_id: "parent-conn".into(),
+                 parent_conversation_id: parent.id,
+                 parent_tool_use_id: String::new(),
+                 target_task_id: foreign_task,
+                 task: "steal".into(),
+                 work_unit_key: None,
+                 external_handle: None,
+                 correlation_id: None,
+                 recovery_authorization_id: None,
++                orchestration_binding: None,
+             })
+             .await;
+         assert_eq!(
+             ownership.error_code.as_deref(),
+             Some("delegation_correlation_missing"),
+             "corr must beat ownership/not_found: {ownership:?}"
+         );
+         // No reservation under the calling parent from failed correlation paths.
+         let all = DelegationTaskRun::find()
+             .all(&db.conn)
+@@ -39016,20 +39341,21 @@ mod tests {
+             .continue_delegation(ContinueDelegationRequest {
+                 parent_connection_id: "parent-conn".into(),
+                 parent_conversation_id: parent.id,
+                 parent_tool_use_id: String::new(),
+                 target_task_id: root_task_id.clone(),
+                 task: "more work".into(),
+                 work_unit_key: None,
+                 external_handle: None,
+                 correlation_id: Some(cont_secret.into()),
+                 recovery_authorization_id: None,
++                orchestration_binding: None,
+             })
+             .await;
+         assert!(cont.error_code.is_none(), "continue: {cont:?}");
+         let t2 = cont.task_id.expect("t2");
+         let gen2 = runs.load_by_task_id(&t2).await.expect("db").expect("gen2");
+         let gen2_dbg = format!("{gen2:?}");
+         assert!(!gen2_dbg.contains(cont_secret) && !gen2_dbg.contains(secret));
+         let cont_fp = request_fingerprint(
+             CONTINUE_DELEGATION_TOOL,
+             "more work",
+@@ -39130,20 +39456,21 @@ mod tests {
+             .continue_delegation(ContinueDelegationRequest {
+                 parent_connection_id: "parent-conn".into(),
+                 parent_conversation_id: parent.id,
+                 parent_tool_use_id: String::new(),
+                 target_task_id: root_task_id.clone(),
+                 task: "trace continue".into(),
+                 work_unit_key: None,
+                 external_handle: None,
+                 correlation_id: Some(corr.into()),
+                 recovery_authorization_id: None,
++                orchestration_binding: None,
+             })
+             .await;
+         drop(_guard);
+ 
+         assert!(
+             report.error_code.is_none(),
+             "successful continue for trace capture: {report:?}"
+         );
+         let bytes = buf.lock().unwrap().clone();
+         let log = String::from_utf8_lossy(&bytes);
+@@ -39234,20 +39561,21 @@ mod tests {
+             .continue_delegation(ContinueDelegationRequest {
+                 parent_connection_id: "parent-conn".into(),
+                 parent_conversation_id: parent.id,
+                 parent_tool_use_id: "tu-omit-continue".into(),
+                 target_task_id: root_task_id.clone(),
+                 task: "continue after omit-id attach".into(),
+                 work_unit_key: None,
+                 external_handle: None,
+                 correlation_id: None,
+                 recovery_authorization_id: None,
++                orchestration_binding: None,
+             })
+             .await;
+ 
+         assert!(
+             report.error_code.is_none(),
+             "omit-id continue must succeed: err={:?} msg={:?}",
+             report.error_code,
+             report.message
+         );
+         assert_eq!(report.status, TaskStatus::Running);
+@@ -39320,20 +39648,21 @@ mod tests {
+         let request = ContinueDelegationRequest {
+             parent_connection_id: "parent-conn".into(),
+             parent_conversation_id: parent.id,
+             parent_tool_use_id: "tu-continue".into(),
+             target_task_id: root_task_id.clone(),
+             task: "review the completed work".into(),
+             work_unit_key: None,
+             external_handle: None,
+             correlation_id: None,
+             recovery_authorization_id: None,
++            orchestration_binding: None,
+         };
+ 
+         let first = broker.continue_delegation(request.clone()).await;
+         assert_eq!(first.status, TaskStatus::Running);
+         assert_eq!(
+             first.continued_from_task_id.as_deref(),
+             Some(root_task_id.as_str())
+         );
+         assert_eq!(first.reused_session, Some(true));
+         let continued_task_id = first.task_id.clone().expect("continued task id");
+@@ -39403,20 +39732,21 @@ mod tests {
+         let request = ContinueDelegationRequest {
+             parent_connection_id: "parent-conn".into(),
+             parent_conversation_id: parent.id,
+             parent_tool_use_id: "tu-continue-admission".into(),
+             target_task_id: root_task_id,
+             task: "review the follow-up".into(),
+             work_unit_key: None,
+             external_handle: None,
+             correlation_id: None,
+             recovery_authorization_id: None,
++            orchestration_binding: None,
+         };
+         let driver = {
+             let broker = broker.clone();
+             tokio::spawn(async move { broker.continue_delegation(request).await })
+         };
+ 
+         let (continued_task_id, child_connection_id) = loop {
+             if let Ok(Some(run)) = runs
+                 .load_by_parent_tool_use(parent.id, "tu-continue-admission")
+                 .await
+@@ -39559,20 +39889,21 @@ mod tests {
+                     .continue_delegation(ContinueDelegationRequest {
+                         parent_connection_id: "parent-conn".into(),
+                         parent_conversation_id: parent.id,
+                         parent_tool_use_id: "tu-continue-promote-budget".into(),
+                         target_task_id: root_task_id,
+                         task: "resume after interruption".into(),
+                         work_unit_key: None,
+                         external_handle: None,
+                         correlation_id: None,
+                         recovery_authorization_id: None,
++                        orchestration_binding: None,
+                     })
+                     .await
+             })
+         };
+ 
+         let (continued_task_id, child_connection_id, lineage_root_task_id) = loop {
+             if let Ok(Some(run)) = runs
+                 .load_by_parent_tool_use(parent.id, "tu-continue-promote-budget")
+                 .await
+             {
+@@ -39682,20 +40013,21 @@ mod tests {
+             .continue_delegation(ContinueDelegationRequest {
+                 parent_connection_id: "parent-conn".into(),
+                 parent_conversation_id: parent.id,
+                 parent_tool_use_id: "tu-profile-continue".into(),
+                 target_task_id: root_task_id,
+                 task: "continue from the durable snapshot".into(),
+                 work_unit_key: None,
+                 external_handle: None,
+                 correlation_id: None,
+                 recovery_authorization_id: None,
++                orchestration_binding: None,
+             })
+             .await;
+         assert_eq!(report.error_code.as_deref(), Some("unresumable"));
+         assert_eq!(
+             mock.spawn_args.lock().await.len(),
+             1,
+             "missing profile must fail before resume spawn"
+         );
+     }
+ 
+@@ -40087,20 +40419,21 @@ mod tests {
+         let request = ContinueDelegationRequest {
+             parent_connection_id: "parent-conn".into(),
+             parent_conversation_id: parent.id,
+             parent_tool_use_id: "tu-post-reserve-cancel-continue".into(),
+             target_task_id: root_task_id.clone(),
+             task: "review the follow-up".into(),
+             work_unit_key: None,
+             external_handle: None,
+             correlation_id: None,
+             recovery_authorization_id: None,
++            orchestration_binding: None,
+         };
+         let driver = {
+             let broker = broker.clone();
+             tokio::spawn(async move { broker.continue_delegation(request).await })
+         };
+ 
+         entered_rx.await.expect("post-reserve gate entered");
+ 
+         let continued = runs
+             .load_by_parent_tool_use(parent.id, "tu-post-reserve-cancel-continue")
+@@ -40233,20 +40566,21 @@ mod tests {
+         let request = ContinueDelegationRequest {
+             parent_connection_id: "parent-conn".into(),
+             parent_conversation_id: parent.id,
+             parent_tool_use_id: "tu-pre-handoff-xfer-continue".into(),
+             target_task_id: root_task_id.clone(),
+             task: "review the follow-up".into(),
+             work_unit_key: None,
+             external_handle: None,
+             correlation_id: None,
+             recovery_authorization_id: None,
++            orchestration_binding: None,
+         };
+         let driver = {
+             let broker = broker.clone();
+             tokio::spawn(async move { broker.continue_delegation(request).await })
+         };
+ 
+         entered_rx
+             .await
+             .expect("post-reserve pre-handoff gate entered");
+ 
+@@ -40374,20 +40708,21 @@ mod tests {
+         let request = ContinueDelegationRequest {
+             parent_connection_id: "parent-conn".into(),
+             parent_conversation_id: parent.id,
+             parent_tool_use_id: "tu-pre-reserve-cancel-continue".into(),
+             target_task_id: root_task_id,
+             task: "review the follow-up".into(),
+             work_unit_key: None,
+             external_handle: None,
+             correlation_id: None,
+             recovery_authorization_id: None,
++            orchestration_binding: None,
+         };
+         let driver = {
+             let broker = broker.clone();
+             tokio::spawn(async move { broker.continue_delegation(request).await })
+         };
+ 
+         entered_rx.await.expect("post-note gate entered");
+         assert!(
+             runs.load_by_parent_tool_use(parent.id, "tu-pre-reserve-cancel-continue")
+                 .await
+@@ -40482,20 +40817,21 @@ mod tests {
+         let request = ContinueDelegationRequest {
+             parent_connection_id: "parent-conn".into(),
+             parent_conversation_id: parent.id,
+             parent_tool_use_id: "tu-reserve-cancel-continue".into(),
+             target_task_id: root_task_id,
+             task: "review the follow-up".into(),
+             work_unit_key: None,
+             external_handle: None,
+             correlation_id: None,
+             recovery_authorization_id: None,
++            orchestration_binding: None,
+         };
+         let driver = {
+             let broker = broker.clone();
+             tokio::spawn(async move { broker.continue_delegation(request).await })
+         };
+ 
+         let continued_task_id = {
+             let mut handoff_task_id = None;
+             for _ in 0..100 {
+                 if let Ok(Some(run)) = runs
+@@ -40584,20 +40920,21 @@ mod tests {
+         let cont_req = ContinueDelegationRequest {
+             parent_connection_id: "parent-conn".into(),
+             parent_conversation_id: parent.id,
+             parent_tool_use_id: "tu-resv-idemp-continue".into(),
+             target_task_id: root_task_id.clone(),
+             task: "follow up while still reserving".into(),
+             work_unit_key: None,
+             external_handle: None,
+             correlation_id: None,
+             recovery_authorization_id: None,
++            orchestration_binding: None,
+         };
+         let driver = {
+             let broker = broker.clone();
+             let req = cont_req.clone();
+             tokio::spawn(async move { broker.continue_delegation(req).await })
+         };
+ 
+         let continued_task_id = loop {
+             if let Ok(Some(run)) = runs
+                 .load_by_parent_tool_use(parent.id, "tu-resv-idemp-continue")
+@@ -40711,20 +41048,21 @@ mod tests {
+         let cont_req = ContinueDelegationRequest {
+             parent_connection_id: "parent-conn".into(),
+             parent_conversation_id: parent.id,
+             parent_tool_use_id: "tu-pc-continue".into(),
+             target_task_id: root_task_id.clone(),
+             task: "follow up".into(),
+             work_unit_key: None,
+             external_handle: None,
+             correlation_id: None,
+             recovery_authorization_id: None,
++            orchestration_binding: None,
+         };
+         let driver = {
+             let broker = broker.clone();
+             tokio::spawn(async move { broker.continue_delegation(cont_req).await })
+         };
+ 
+         // The handoff is intentionally registered before configuration
+         // re-resolution. Wait for both that durable identity and the actual
+         // continued spawn call, which is held by the gate below.
+         let continued_task_id = loop {
+@@ -40826,20 +41164,21 @@ mod tests {
+         let cont_req = ContinueDelegationRequest {
+             parent_connection_id: "parent-conn".into(),
+             parent_conversation_id: parent.id,
+             parent_tool_use_id: "tu-idemp-continue".into(),
+             target_task_id: root_task_id.clone(),
+             task: "review again".into(),
+             work_unit_key: None,
+             external_handle: None,
+             correlation_id: None,
+             recovery_authorization_id: None,
++            orchestration_binding: None,
+         };
+         let first = broker.continue_delegation(cont_req.clone()).await;
+         assert_eq!(first.status, TaskStatus::Running);
+         let continued_id = first.task_id.clone().expect("continued id");
+         broker
+             .complete_call(
+                 &continued_id,
+                 DelegationOutcome::from_err(
+                     DelegationError::Unresumable("resume failed later".into()),
+                     Some(child_id),
+@@ -40921,20 +41260,21 @@ mod tests {
+             .continue_delegation(ContinueDelegationRequest {
+                 parent_connection_id: "parent-conn".into(),
+                 parent_conversation_id: parent.id,
+                 parent_tool_use_id: "tu-precancel-continue".into(),
+                 target_task_id: root_task_id,
+                 task: "should cancel".into(),
+                 work_unit_key: None,
+                 external_handle: Some("precancel-handle-1".into()),
+                 correlation_id: None,
+                 recovery_authorization_id: None,
++                orchestration_binding: None,
+             })
+             .await;
+         assert_eq!(report.error_code.as_deref(), Some("canceled"));
+         assert_eq!(
+             mock.spawn_args.lock().await.len(),
+             1,
+             "only root spawn; continue must not resume after pre-cancel"
+         );
+     }
+ 
+@@ -40987,20 +41327,21 @@ mod tests {
+         let cont_req = ContinueDelegationRequest {
+             parent_connection_id: "parent-conn".into(),
+             parent_conversation_id: parent.id,
+             parent_tool_use_id: "tu-adm-disc".into(),
+             target_task_id: root_task_id,
+             task: "follow".into(),
+             work_unit_key: None,
+             external_handle: None,
+             correlation_id: None,
+             recovery_authorization_id: None,
++            orchestration_binding: None,
+         };
+         let driver = {
+             let broker = broker.clone();
+             tokio::spawn(async move { broker.continue_delegation(cont_req).await })
+         };
+         let (continued_task_id, child_connection_id) = loop {
+             if let Ok(Some(run)) = runs.load_by_parent_tool_use(parent.id, "tu-adm-disc").await {
+                 if let Some(cid) = run.child_connection_id {
+                     if broker.has_prompt_send_lease_for_test(&cid).await {
+                         break (run.task_id, cid);
+@@ -41500,20 +41841,21 @@ mod tests {
+         let continue_request = ContinueDelegationRequest {
+             parent_connection_id: "parent-conn".into(),
+             parent_conversation_id: parent.id,
+             parent_tool_use_id: parent_tool_use_id.clone(),
+             target_task_id: root_task_id,
+             task: "continue into pre-park race".into(),
+             work_unit_key: None,
+             external_handle: None,
+             correlation_id: None,
+             recovery_authorization_id: None,
++            orchestration_binding: None,
+         };
+         let driver = {
+             let broker = broker.clone();
+             tokio::spawn(async move { broker.continue_delegation(continue_request).await })
+         };
+         entered_rx.await.expect("continue must reach pre-park gate");
+         let row = runs
+             .load_by_parent_tool_use(parent.id, &parent_tool_use_id)
+             .await
+             .expect("load continuation")
+@@ -41726,20 +42068,21 @@ mod tests {
+         let cont_req = ContinueDelegationRequest {
+             parent_connection_id: "parent-conn".into(),
+             parent_conversation_id: parent.id,
+             parent_tool_use_id: "tu-prompt-lease-continue".into(),
+             target_task_id: root_task_id,
+             task: "follow-up under send lease".into(),
+             work_unit_key: None,
+             external_handle: None,
+             correlation_id: None,
+             recovery_authorization_id: None,
++            orchestration_binding: None,
+         };
+         let driver = {
+             let broker = broker.clone();
+             tokio::spawn(async move { broker.continue_delegation(cont_req).await })
+         };
+ 
+         let (continued_task_id, child_connection_id) = loop {
+             if let Ok(Some(run)) = runs
+                 .load_by_parent_tool_use(parent.id, "tu-prompt-lease-continue")
+                 .await
+@@ -41836,20 +42179,21 @@ mod tests {
+         let cont_req = ContinueDelegationRequest {
+             parent_connection_id: "parent-conn".into(),
+             parent_conversation_id: parent.id,
+             parent_tool_use_id: "tu-closed-handoff-reason-continue".into(),
+             target_task_id: root_task_id,
+             task: "follow-up under closed-handoff reason race".into(),
+             work_unit_key: None,
+             external_handle: None,
+             correlation_id: None,
+             recovery_authorization_id: None,
++            orchestration_binding: None,
+         };
+         let driver = {
+             let broker = broker.clone();
+             tokio::spawn(async move { broker.continue_delegation(cont_req).await })
+         };
+ 
+         let (continued_task_id, child_connection_id) = loop {
+             if let Ok(Some(run)) = runs
+                 .load_by_parent_tool_use(parent.id, "tu-closed-handoff-reason-continue")
+                 .await
+@@ -41983,20 +42327,21 @@ mod tests {
+         let cont_req = ContinueDelegationRequest {
+             parent_connection_id: "parent-conn".into(),
+             parent_conversation_id: parent.id,
+             parent_tool_use_id: "tu-closed-child-term-continue".into(),
+             target_task_id: root_task_id,
+             task: "follow-up under earlier child terminal".into(),
+             work_unit_key: None,
+             external_handle: None,
+             correlation_id: None,
+             recovery_authorization_id: None,
++            orchestration_binding: None,
+         };
+         let driver = {
+             let broker = broker.clone();
+             tokio::spawn(async move { broker.continue_delegation(cont_req).await })
+         };
+ 
+         let (continued_task_id, child_connection_id) = loop {
+             if let Ok(Some(run)) = runs
+                 .load_by_parent_tool_use(parent.id, "tu-closed-child-term-continue")
+                 .await
+@@ -42146,20 +42491,21 @@ mod tests {
+         let cont_req = ContinueDelegationRequest {
+             parent_connection_id: "parent-conn".into(),
+             parent_conversation_id: parent.id,
+             parent_tool_use_id: "tu-closed-reread-continue".into(),
+             target_task_id: root_task_id,
+             task: "follow-up under settle-clears-park race".into(),
+             work_unit_key: None,
+             external_handle: None,
+             correlation_id: None,
+             recovery_authorization_id: None,
++            orchestration_binding: None,
+         };
+         let driver = {
+             let broker = broker.clone();
+             tokio::spawn(async move { broker.continue_delegation(cont_req).await })
+         };
+ 
+         let (continued_task_id, child_connection_id) = loop {
+             if let Ok(Some(run)) = runs
+                 .load_by_parent_tool_use(parent.id, "tu-closed-reread-continue")
+                 .await
+@@ -42331,20 +42677,21 @@ mod tests {
+             .continue_delegation(ContinueDelegationRequest {
+                 parent_connection_id: "parent-conn".into(),
+                 parent_conversation_id: parent.id,
+                 parent_tool_use_id: String::new(), // host omits _meta.tool_use_id
+                 target_task_id: root_task_id.clone(),
+                 task: "review the revision".into(),
+                 work_unit_key: None,
+                 external_handle: None,
+                 correlation_id: Some("corr-1485-acp".into()),
+                 recovery_authorization_id: None,
++                orchestration_binding: None,
+             })
+             .await;
+ 
+         assert!(
+             report.error_code.is_none(),
+             "1485 ACP-before-MCP continue must succeed: err={:?} msg={:?}",
+             report.error_code,
+             report.message
+         );
+         assert_ne!(
+@@ -42454,20 +42801,21 @@ mod tests {
+         let cont_req = ContinueDelegationRequest {
+             parent_connection_id: "parent-conn".into(),
+             parent_conversation_id: parent.id,
+             parent_tool_use_id: String::new(),
+             target_task_id: root_task_id.clone(),
+             task: "review the revision".into(),
+             work_unit_key: None,
+             external_handle: None,
+             correlation_id: Some("corr-1485-mcp".into()),
+             recovery_authorization_id: None,
++            orchestration_binding: None,
+         };
+         let b2 = broker.clone();
+         let cont_handle = tokio::spawn(async move { b2.continue_delegation(cont_req).await });
+ 
+         entered_rx
+             .await
+             .expect("continue must reach exact-claim poll before ACP card");
+         broker
+             .register_pending_tool_call_with_key(
+                 "parent-conn",
+@@ -42557,20 +42905,21 @@ mod tests {
+             .continue_delegation(ContinueDelegationRequest {
+                 parent_connection_id: "parent-conn".into(),
+                 parent_conversation_id: parent.id,
+                 parent_tool_use_id: String::new(),
+                 target_task_id: "any-target".into(),
+                 task: "review the revision".into(),
+                 work_unit_key: None,
+                 external_handle: None,
+                 correlation_id: None,
+                 recovery_authorization_id: None,
++                orchestration_binding: None,
+             })
+             .await;
+         assert_eq!(
+             c.error_code.as_deref(),
+             Some("delegation_correlation_missing"),
+             "continue missing corr: {c:?}"
+         );
+ 
+         // Invalid correlation_id (leading '.') maps to missing, still no orphans.
+         let mut bad = request(parent.id, "");
+@@ -42648,20 +42997,21 @@ mod tests {
+             .continue_delegation(ContinueDelegationRequest {
+                 parent_connection_id: "parent-conn".into(),
+                 parent_conversation_id: parent.id,
+                 parent_tool_use_id: String::new(),
+                 target_task_id: "tgt-shared".into(),
+                 task: "review the revision".into(),
+                 work_unit_key: None,
+                 external_handle: None,
+                 correlation_id: Some("corr-1485-dup".into()),
+                 recovery_authorization_id: None,
++                orchestration_binding: None,
+             })
+             .await;
+         assert_eq!(
+             report.error_code.as_deref(),
+             Some("delegation_correlation_ambiguous"),
+             "duplicate complete key must be ambiguous: {report:?}"
+         );
+         assert_ne!(
+             report.error_code.as_deref(),
+             Some("missing_parent_tool_use_id")
+diff --git a/src-tauri/src/acp/delegation/companion.rs b/src-tauri/src/acp/delegation/companion.rs
+index d389d334..8f30968a 100644
+--- a/src-tauri/src/acp/delegation/companion.rs
++++ b/src-tauri/src/acp/delegation/companion.rs
+@@ -2787,20 +2787,21 @@ pub fn render_task_report(report: &Value) -> Value {
+         "isError": is_error,
+         "structuredContent": report.clone(),
+     })
+ }
+ 
+ #[cfg(test)]
+ mod tests {
+     use std::collections::{BTreeMap, HashSet};
+ 
+     use super::*;
++    use crate::acp::delegation::types::OrchestrationBindingV1;
+     use crate::acp::delegation::workflow::{
+         project_workflow_state_index, WorkflowIndexOmissionStep, WorkflowStateDto,
+         WorkflowStateIndexDto,
+     };
+ 
+     fn ctx() -> CompanionContext {
+         // Delegation-only by default so the existing delegation-focused tests
+         // keep seeing exactly the three delegation tools.
+         ctx_with(CompanionFeatures {
+             delegation: true,
+@@ -4117,20 +4118,182 @@ mod tests {
+             "method": "tools/call",
+             "params": { "name": name, "arguments": arguments }
+         })
+         .to_string()
+     }
+ 
+     fn tool_names(action: LineAction) -> Vec<String> {
+         list_tool_names(action)
+     }
+ 
++    fn schema_accepts(root: &Value, schema: &Value, candidate: &Value) -> bool {
++        if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
++            let Some(pointer) = reference.strip_prefix('#') else {
++                return false;
++            };
++            let Some(resolved) = root.pointer(pointer) else {
++                return false;
++            };
++            return schema_accepts(root, resolved, candidate);
++        }
++        if let Some(expected) = schema.get("const") {
++            if candidate != expected {
++                return false;
++            }
++        }
++        if let Some(values) = schema.get("enum").and_then(Value::as_array) {
++            if !values.contains(candidate) {
++                return false;
++            }
++        }
++        match schema.get("type").and_then(Value::as_str) {
++            Some("object") => {
++                let Some(object) = candidate.as_object() else {
++                    return false;
++                };
++                let properties = schema
++                    .get("properties")
++                    .and_then(Value::as_object)
++                    .cloned()
++                    .unwrap_or_default();
++                if schema.get("additionalProperties") == Some(&Value::Bool(false))
++                    && object.keys().any(|key| !properties.contains_key(key))
++                {
++                    return false;
++                }
++                if schema
++                    .get("required")
++                    .and_then(Value::as_array)
++                    .is_some_and(|required| {
++                        required
++                            .iter()
++                            .filter_map(Value::as_str)
++                            .any(|key| !object.contains_key(key))
++                    })
++                {
++                    return false;
++                }
++                object.iter().all(|(key, value)| {
++                    properties
++                        .get(key)
++                        .is_none_or(|property| schema_accepts(root, property, value))
++                })
++            }
++            Some("string") => {
++                let Some(value) = candidate.as_str() else {
++                    return false;
++                };
++                let len = value.chars().count() as u64;
++                if schema
++                    .get("minLength")
++                    .and_then(Value::as_u64)
++                    .is_some_and(|minimum| len < minimum)
++                    || schema
++                        .get("maxLength")
++                        .and_then(Value::as_u64)
++                        .is_some_and(|maximum| len > maximum)
++                {
++                    return false;
++                }
++                schema
++                    .get("pattern")
++                    .and_then(Value::as_str)
++                    .is_none_or(|pattern| regex::Regex::new(pattern).unwrap().is_match(value))
++            }
++            Some("integer") => {
++                let Some(value) = candidate.as_u64() else {
++                    return false;
++                };
++                !schema
++                    .get("minimum")
++                    .and_then(Value::as_u64)
++                    .is_some_and(|minimum| value < minimum)
++                    && !schema
++                        .get("maximum")
++                        .and_then(Value::as_u64)
++                        .is_some_and(|maximum| value > maximum)
++            }
++            Some("boolean") => candidate.is_boolean(),
++            Some(_) => false,
++            None => true,
++        }
++    }
++
++    #[test]
++    fn orchestration_binding_transport_schemas_match_shared_corpus() {
++        let corpus: Value = serde_json::from_str(include_str!(concat!(
++            env!("CARGO_MANIFEST_DIR"),
++            "/tests/fixtures/orchestration_binding_v1.json"
++        )))
++        .expect("valid orchestration binding corpus");
++        let catalog: Value = serde_json::from_str(TOOL_SCHEMA_JSON).expect("valid tool schema");
++
++        for tool_name in ["delegate_to_agent", "continue_delegation"] {
++            let tool = catalog
++                .as_array()
++                .unwrap()
++                .iter()
++                .find(|tool| tool["name"] == tool_name)
++                .unwrap();
++            let schema = &tool["inputSchema"];
++            assert!(
++                schema["properties"]["orchestration_binding"].is_object(),
++                "{tool_name} must publish orchestration_binding"
++            );
++            assert!(
++                !schema["required"]
++                    .as_array()
++                    .unwrap()
++                    .iter()
++                    .any(|required| required == "orchestration_binding"),
++                "{tool_name} binding must remain optional"
++            );
++
++            let omitted = if tool_name == "delegate_to_agent" {
++                json!({
++                    "agent_type": "grok",
++                    "task": "unbound first dispatch",
++                    "correlation_id": "binding-schema-omitted"
++                })
++            } else {
++                json!({
++                    "task_id": "source-task",
++                    "task": "unbound continuation",
++                    "correlation_id": "binding-schema-omitted"
++                })
++            };
++            assert!(schema_accepts(schema, schema, &omitted));
++
++            for case in corpus["cases"].as_array().unwrap() {
++                let mut input = omitted.clone();
++                input.as_object_mut().unwrap().insert(
++                    "orchestration_binding".into(),
++                    case["value"].clone(),
++                );
++                let expected = case["valid"].as_bool().unwrap();
++                assert_eq!(
++                    schema_accepts(schema, schema, &input),
++                    expected,
++                    "{tool_name} schema disagrees for {}",
++                    case["name"]
++                );
++                assert_eq!(
++                    serde_json::from_value::<OrchestrationBindingV1>(case["value"].clone())
++                        .is_ok_and(|binding| binding.validate().is_ok()),
++                    expected,
++                    "semantic validation disagrees for {}",
++                    case["name"]
++                );
++            }
++        }
++    }
++
+     fn assert_no_generic_coordination_side_channel_tools(names: &[String]) {
+         for forbidden in [
+             "progress",
+             "warning",
+             "log",
+             "heartbeat",
+             "detach",
+             "deliver_result",
+             "send_result",
+             "result_delivery",
+diff --git a/src-tauri/src/acp/delegation/listener.rs b/src-tauri/src/acp/delegation/listener.rs
+index 9a67bf1f..0a5ec6a5 100644
+--- a/src-tauri/src/acp/delegation/listener.rs
++++ b/src-tauri/src/acp/delegation/listener.rs
+@@ -41,22 +41,22 @@ use crate::acp::delegation::transport::{
+     BrokerCommitFeedbackRequest, BrokerCompleteWorkRequest, BrokerFeedbackRequest,
+     BrokerGetWorkflowStateRequest, BrokerMessage, BrokerParentDecisionRequest,
+     BrokerPublishWorkflowRequest, BrokerRecoverWorkflowRequest, BrokerRecoveryAuthorizationRequest,
+     BrokerRegisterSimpleWorkflowRequest, BrokerReplyDelegationRequest, BrokerRequest,
+     BrokerResponse, BrokerSessionRequest, BrokerSettleWorkflowRequest, BrokerStatusRequest,
+     CancelDelegationReason, CompanionReadyAck, CompanionRole,
+ };
+ use crate::acp::delegation::types::{
+     correlation_error_message, validate_correlation_id, CorrelationEntryPoint,
+     CorrelationFailureKind, DelegationReplyResult, DelegationRequest, DelegationReturnWhen,
+-    DelegationStatusBatch, DelegationTaskReport, DelegationWakeReason, ParentDecisionResult,
+-    TaskStatus,
++    DelegationStatusBatch, DelegationTaskReport, DelegationWakeReason, OrchestrationBindingV1,
++    ParentDecisionResult, TaskStatus,
+ };
+ #[cfg(test)]
+ use crate::acp::delegation::workflow::{
+     accept_complete_work_txn, ManifestDocument, PublishWorkflowRequest,
+ };
+ use crate::acp::delegation::workflow::{
+     decide_workflow_recovery, emit_workflow_compatibility_nudge, get_workflow_state_core,
+     guard_current_final_delivery_core, guard_task_final_delivery_core,
+     load_completion_protocol_header, recover_workflow_core, register_simple_workflow,
+     require_v2_mutation, settle_workflow_gate_v2_core,
+@@ -2408,20 +2408,25 @@ impl DelegationListener {
+         //    broker can't link the child row to the parent.
+         let parent_conversation_id = match self
+             .parent_lookup
+             .current_conversation_id(&req.parent_connection_id)
+             .await
+         {
+             Some(id) => id,
+             None => return cancel("parent has no active conversation"),
+         };
+ 
++        let orchestration_binding = match parse_orchestration_binding(&req.input) {
++            Ok(binding) => binding,
++            Err(message) => return report_failed("orchestration_binding_invalid", &message),
++        };
++
+         let work_unit_key = match parse_work_unit_key(&req.input) {
+             Ok(key) => key,
+             Err(message) => return report_failed("invalid_work_unit_key", &message),
+         };
+ 
+         // continue_delegation: tagged by companion or shape (task_id + task,
+         // no agent_type). Must run before agent_type is required.
+         let is_continue = req.input.get("_codeg_tool").and_then(|v| v.as_str())
+             == Some("continue_delegation")
+             || (req.input.get("task_id").is_some()
+@@ -2479,20 +2484,21 @@ impl DelegationListener {
+             let continue_req = crate::acp::delegation::types::ContinueDelegationRequest {
+                 parent_connection_id: req.parent_connection_id,
+                 parent_conversation_id,
+                 parent_tool_use_id,
+                 target_task_id,
+                 task: continue_task,
+                 work_unit_key,
+                 external_handle: req.external_handle,
+                 correlation_id,
+                 recovery_authorization_id,
++                orchestration_binding,
+             };
+             return self.broker.continue_delegation(continue_req).await;
+         }
+ 
+         // 3. Parse the delegate_to_agent arguments. Schema validation lives
+         //    on the LLM side; we only enforce what the broker can't.
+         let agent_type = match req.input.get("agent_type").and_then(|v| v.as_str()) {
+             Some(raw) => match parse_agent_type(raw) {
+                 Some(t) => t,
+                 None => return invalid_agent_type(raw),
+@@ -2542,25 +2548,42 @@ impl DelegationListener {
+             profile_id,
+             task,
+             working_dir,
+             requested_working_dir,
+             external_handle: req.external_handle,
+             work_unit_key,
+             replaces_task_id,
+             replacement_reason,
+             correlation_id,
+             recovery_authorization_id,
++            orchestration_binding,
+         };
+         self.broker.start_delegation(delegation_req).await
+     }
+ }
+ 
++/// Parse the optional durable orchestration identity from raw tool input.
++/// Absence is backward-compatible; every present invalid value fails closed.
++pub(crate) fn parse_orchestration_binding(
++    input: &Value,
++) -> Result<Option<OrchestrationBindingV1>, String> {
++    let Some(value) = input.get("orchestration_binding") else {
++        return Ok(None);
++    };
++    let binding: OrchestrationBindingV1 = serde_json::from_value(value.clone())
++        .map_err(|_| "orchestration_binding must be a complete v1 object".to_string())?;
++    binding
++        .validate()
++        .map_err(|message| format!("invalid orchestration_binding: {message}"))?;
++    Ok(Some(binding))
++}
++
+ /// Parse optional `correlation_id` from tool input.
+ ///
+ /// - absent → `Ok(None)` (caller may still bind via non-empty host tool id)
+ /// - present string that validates → `Ok(Some)`
+ /// - present null / empty / malformed / over-length / non-string → `Err`
+ ///   (maps to wire `delegation_correlation_missing` when host id is empty)
+ pub(crate) fn parse_correlation_id(input: &Value) -> Result<Option<String>, String> {
+     match input.get("correlation_id") {
+         None => Ok(None),
+         Some(Value::Null) => Err("correlation_id must not be null".into()),
+@@ -4807,20 +4830,123 @@ mod tests {
+             tokens,
+             Some(1),
+         );
+         let report = listener
+             .process(make_request(json!({"agent_type": "garbage", "task": "x"})).await)
+             .await;
+         assert_eq!(report.status, TaskStatus::Failed);
+         assert_eq!(report.error_code.as_deref(), Some("invalid_agent_type"));
+     }
+ 
++    #[tokio::test]
++    async fn orchestration_binding_transport_listener_matches_shared_corpus_before_side_effects() {
++        let corpus: Value = serde_json::from_str(include_str!(concat!(
++            env!("CARGO_MANIFEST_DIR"),
++            "/tests/fixtures/orchestration_binding_v1.json"
++        )))
++        .expect("valid orchestration binding corpus");
++        let tokens = Arc::new(TokenRegistry::default());
++        tokens
++            .register(
++                "tok".into(),
++                TokenEntry::legacy("parent-conn", test_working_dir()),
++            )
++            .await;
++        let mock = Arc::new(MockSpawner::new());
++        let listener = make_listener(make_broker(Arc::clone(&mock)).await, tokens, Some(1));
++
++        for case in corpus["cases"].as_array().unwrap() {
++            let expected = case["valid"].as_bool().unwrap();
++            let parsed = parse_orchestration_binding(&json!({
++                "orchestration_binding": case["value"].clone()
++            }));
++            assert_eq!(
++                parsed.is_ok(),
++                expected,
++                "listener parser disagrees for {}",
++                case["name"]
++            );
++            assert_eq!(
++                serde_json::from_value::<
++                    crate::acp::delegation::types::OrchestrationBindingV1,
++                >(case["value"].clone())
++                .is_ok_and(|binding| binding.validate().is_ok()),
++                expected,
++                "semantic validation disagrees for {}",
++                case["name"]
++            );
++
++            for tool_name in ["delegate_to_agent", "continue_delegation"] {
++                let mut input = if tool_name == "delegate_to_agent" {
++                    json!({
++                        "agent_type": "grok",
++                        "task": "bound first dispatch",
++                        "correlation_id": "binding-listener-red"
++                    })
++                } else {
++                    json!({
++                        "_codeg_tool": "continue_delegation",
++                        "task_id": "source-task",
++                        "task": "bound continuation",
++                        "correlation_id": "binding-listener-red"
++                    })
++                };
++                input.as_object_mut().unwrap().insert(
++                    "orchestration_binding".into(),
++                    case["value"].clone(),
++                );
++                let spawn_before = mock.spawn_args.lock().await.len();
++                let resume_before = mock.resume_args.lock().await.len();
++                let report = listener.process(make_request(input).await).await;
++                if expected {
++                    assert_ne!(
++                        report.error_code.as_deref(),
++                        Some("orchestration_binding_invalid"),
++                        "valid {} rejected by {tool_name}",
++                        case["name"]
++                    );
++                } else {
++                    assert_eq!(
++                        report.error_code.as_deref(),
++                        Some("orchestration_binding_invalid"),
++                        "invalid {} accepted by {tool_name}",
++                        case["name"]
++                    );
++                    assert_eq!(mock.spawn_args.lock().await.len(), spawn_before);
++                    assert_eq!(mock.resume_args.lock().await.len(), resume_before);
++                }
++            }
++        }
++
++        for input in [
++            json!({
++                "agent_type": "grok",
++                "task": "unbound first dispatch",
++                "correlation_id": "binding-listener-omitted"
++            }),
++            json!({
++                "_codeg_tool": "continue_delegation",
++                "task_id": "source-task",
++                "task": "unbound continuation",
++                "correlation_id": "binding-listener-omitted"
++            }),
++        ] {
++            assert_eq!(parse_orchestration_binding(&input).unwrap(), None);
++            let report = listener.process(make_request(input).await).await;
++            assert_ne!(
++                report.error_code.as_deref(),
++                Some("orchestration_binding_invalid"),
++                "omitted binding must remain backward compatible"
++            );
++        }
++    }
++
+     #[test]
+     fn cohort_frozen_workflow_error_uses_exact_wire_code() {
+         let outcome = workflow_store_error_value(WorkflowStoreError::CohortFrozen {
+             node_id: "Task 1".into(),
+         });
+ 
+         assert_eq!(outcome["error"]["code"], "cohort_frozen");
+     }
+ 
+     // -- Task 1: correlation_id parse/forward ------------------------------
+@@ -5329,20 +5455,21 @@ mod tests {
+                 profile_id: None,
+                 task: "do x".into(),
+                 working_dir: None,
+                 requested_working_dir: None,
+                 external_handle: None,
+                 work_unit_key: None,
+                 replaces_task_id: None,
+                 replacement_reason: None,
+                 correlation_id: None,
+                 recovery_authorization_id: None,
++                orchestration_binding: None,
+             })
+             .await;
+         let task_id = ack.task_id.clone().expect("running task carries an id");
+         (broker, tokens, task_id)
+     }
+ 
+     async fn complete_running_task(broker: &DelegationBroker, task_id: &str) {
+         broker
+             .complete_call(
+                 task_id,
+@@ -7001,20 +7128,21 @@ mod tests {
+                         profile_id: None,
+                         task: "do x".into(),
+                         working_dir: None,
+                         requested_working_dir: None,
+                         external_handle: None,
+                         work_unit_key: None,
+                         replaces_task_id: None,
+                         replacement_reason: None,
+                         correlation_id: None,
+                         recovery_authorization_id: None,
++                        orchestration_binding: None,
+                     })
+                     .await
+                     .task_id
+                     .unwrap()
+             }
+         };
+         let t1 = start("pt-1").await;
+         let t2 = start("pt-2").await;
+         broker
+             .complete_call(
+@@ -7110,20 +7238,21 @@ mod tests {
+                 profile_id: None,
+                 task: "do x".into(),
+                 working_dir: None,
+                 requested_working_dir: None,
+                 external_handle: None,
+                 work_unit_key: None,
+                 replaces_task_id: None,
+                 replacement_reason: None,
+                 correlation_id: None,
+                 recovery_authorization_id: None,
++                orchestration_binding: None,
+             })
+             .await;
+         let task_id = ack.task_id.clone().unwrap();
+ 
+         let listener = make_listener(broker.clone(), tokens, Some(1));
+         let (mut client, mut server) = duplex(8 * 1024);
+         let server_task = tokio::spawn(async move {
+             listener.serve_one(&mut server).await.unwrap();
+         });
+         let cancel = BrokerMessage::CancelTask(BrokerCancelTaskRequest {
+@@ -7160,20 +7289,21 @@ mod tests {
+                 profile_id: None,
+                 task: "do x".into(),
+                 working_dir: None,
+                 requested_working_dir: None,
+                 external_handle: None,
+                 work_unit_key: None,
+                 replaces_task_id: None,
+                 replacement_reason: None,
+                 correlation_id: None,
+                 recovery_authorization_id: None,
++                orchestration_binding: None,
+             })
+             .await;
+         let task_id = ack.task_id.clone().unwrap();
+ 
+         let listener = make_listener(broker.clone(), tokens, Some(1));
+         let (mut client, mut server) = duplex(8 * 1024);
+         let server_task = tokio::spawn(async move {
+             listener.serve_one(&mut server).await.unwrap();
+         });
+         let cancel = BrokerMessage::CancelTask(BrokerCancelTaskRequest {
+@@ -7349,20 +7479,21 @@ mod tests {
+                     profile_id: None,
+                     task: "do x".into(),
+                     working_dir: None,
+                     requested_working_dir: None,
+                     external_handle: Some("h-1".into()),
+                     work_unit_key: None,
+                     replaces_task_id: None,
+                     replacement_reason: None,
+                     correlation_id: None,
+                     recovery_authorization_id: None,
++                    orchestration_binding: None,
+                 };
+                 broker.handle_request(req).await
+             })
+         };
+         while broker.pending_count().await == 0 {
+             tokio::time::sleep(Duration::from_millis(5)).await;
+         }
+ 
+         // Drive a cancel through the listener — listener should ack with
+         // an empty BrokerResponse and the broker should drain the pending.
+@@ -10077,20 +10208,21 @@ mod tests {
+                 profile_id: None,
+                 task: "decide".into(),
+                 working_dir: None,
+                 requested_working_dir: None,
+                 external_handle: None,
+                 work_unit_key: None,
+                 replaces_task_id: None,
+                 replacement_reason: None,
+                 correlation_id: None,
+                 recovery_authorization_id: None,
++                orchestration_binding: None,
+             })
+             .await;
+         let task_id = ack.task_id.expect("running");
+         task_store.seed_edge(&task_id, 11, 22).await;
+         attention.seed_edge(&task_id, 11, 22).await;
+ 
+         let tokens = Arc::new(TokenRegistry::default());
+         tokens
+             .register("child-tok".into(), child_token_entry("child-conn"))
+             .await;
+@@ -10491,40 +10623,42 @@ mod tests {
+                 profile_id: None,
+                 task: "mid".into(),
+                 working_dir: None,
+                 requested_working_dir: None,
+                 external_handle: None,
+                 work_unit_key: None,
+                 replaces_task_id: None,
+                 replacement_reason: None,
+                 correlation_id: None,
+                 recovery_authorization_id: None,
++                orchestration_binding: None,
+             })
+             .await
+             .task_id
+             .unwrap();
+         let grandchild = broker
+             .start_delegation(crate::acp::delegation::types::DelegationRequest {
+                 parent_connection_id: "child-conn".into(),
+                 parent_conversation_id: 2,
+                 parent_tool_use_id: "pt-mid".into(),
+                 agent_type: AgentType::Codex,
+                 profile_id: None,
+                 task: "leaf".into(),
+                 working_dir: None,
+                 requested_working_dir: None,
+                 external_handle: None,
+                 work_unit_key: None,
+                 replaces_task_id: None,
+                 replacement_reason: None,
+                 correlation_id: None,
+                 recovery_authorization_id: None,
++                orchestration_binding: None,
+             })
+             .await
+             .task_id
+             .unwrap();
+         task_store.seed_edge(&root_child, 1, 2).await;
+         task_store.seed_edge(&grandchild, 2, 3).await;
+         attention.seed_edge(&root_child, 1, 2).await;
+         attention.seed_edge(&grandchild, 2, 3).await;
+ 
+         let tokens = Arc::new(TokenRegistry::default());
+diff --git a/src-tauri/src/acp/delegation/run_store.rs b/src-tauri/src/acp/delegation/run_store.rs
+index b1d73e72..7bac6600 100644
+--- a/src-tauri/src/acp/delegation/run_store.rs
++++ b/src-tauri/src/acp/delegation/run_store.rs
+@@ -642,20 +642,34 @@ pub enum ContinueDecision {
+ /// Inputs for durable continue reserve (post-fingerprint on target load).
+ #[derive(Debug, Clone)]
+ pub struct ContinueRunAdmission {
+     pub task_id: String,
+     pub parent_conversation_id: i32,
+     pub parent_tool_use_id: String,
+     pub target_task_id: String,
+     pub task_preview: String,
+     pub request_fingerprint: String,
+     pub work_unit_key: Option<String>,
++    pub supplied_orchestration_binding: Option<OrchestrationBindingV1>,
++    pub effective_orchestration_binding: Option<OrchestrationBindingV1>,
++}
++
++pub(crate) fn inherited_binding(
++    source: Option<&OrchestrationBindingV1>,
++    supplied: Option<&OrchestrationBindingV1>,
++) -> Result<Option<OrchestrationBindingV1>, TaskStoreError> {
++    match (source, supplied) {
++        (Some(source), None) => Ok(Some(source.clone())),
++        (Some(source), Some(value)) if source == value => Ok(Some(source.clone())),
++        (None, None) => Ok(None),
++        _ => Err(TaskStoreError::OrchestrationBindingLineageMismatch),
++    }
+ }
+ 
+ #[derive(Debug, Clone, Default)]
+ pub struct RecoveryAdmissionAuthorization {
+     pub authorization_id: Option<String>,
+     pub correlation_id: String,
+ }
+ 
+ pub(crate) fn recovery_action_payload(operation: &RequestedRecoveryOperation) -> Value {
+     match operation {
+@@ -1791,21 +1805,21 @@ async fn work_unit_replacement_at_limit_txn(
+     Ok(row
+         .map(|budget| budget.replacement_count >= REPLACEMENT_LIMIT)
+         .unwrap_or(false))
+ }
+ 
+ /// Replacement checks and the reserving insert share one transaction. The
+ /// replacement counter remains uncharged until `promote_running`, but these
+ /// checks cannot race a concurrently admitted replacement into a new lineage.
+ async fn validate_replacement_insert_txn(
+     txn: &DatabaseTransaction,
+-    insert: &ReservingRunInsert,
++    insert: &mut ReservingRunInsert,
+ ) -> Result<
+     (
+         crate::acp::delegation::recovery_policy::RecoveryDecision,
+         Option<String>,
+     ),
+     TaskStoreError,
+ > {
+     let replaced_id = insert
+         .replaced_task_id
+         .as_deref()
+@@ -1844,20 +1858,24 @@ async fn validate_replacement_insert_txn(
+             .map_err(map_db_err)?;
+     if !parent.is_some_and(|parent| parent.deleted_at.is_none()) {
+         return Err(TaskStoreError::NotFound(replaced_id.to_string()));
+     }
+     let source_agent_type = parse_known_agent_type(&source_row.agent_type).ok_or_else(|| {
+         TaskStoreError::InvalidReplacement("replacement source has unknown agent_type".into())
+     })?;
+     let source = model_to_persisted_run(source_row).ok_or_else(|| {
+         TaskStoreError::InvalidReplacement("replacement source is unreadable".into())
+     })?;
++    insert.orchestration_binding = inherited_binding(
++        source.orchestration_binding.as_ref(),
++        insert.orchestration_binding.as_ref(),
++    )?;
+     let source_recovery_authorization_id =
+         validated_recovery_provenance(txn, &source, source.recovery_authorization_id.as_deref())
+             .await?;
+     // 2. Same role/profile.
+     let insert_agent_type = parse_known_agent_type(&insert.agent_type).ok_or_else(|| {
+         TaskStoreError::InvalidReplacement("replacement agent_type is unknown".into())
+     })?;
+     if source_agent_type != insert_agent_type {
+         return Err(TaskStoreError::InvalidReplacement(
+             "replacement agent_type mismatch".into(),
+@@ -2630,21 +2648,21 @@ impl RunStore {
+         // (idempotent_existing, post-commit workflow side effect)
+         type Gen1Txn = (
+             Option<PersistedRun>,
+             WorkflowTxnSideEffect,
+             Option<RecoveryDecision>,
+         );
+         let outcome = self
+             .db
+             .conn
+             .transaction::<_, Gen1Txn, TaskStoreError>(|txn| {
+-                let insert = insert.clone();
++                let mut insert = insert.clone();
+                 let authorization = authorization.clone();
+                 Box::pin(async move {
+                     require_writable_conversation_workflow(
+                         txn,
+                         insert.parent_conversation_id,
+                     )
+                     .await
+                     .map_err(terminal_protocol_store_error)?;
+                     if let Some(source_task_id) = insert.replaced_task_id.as_deref() {
+                         ensure_task_completion_recovery_not_fenced_txn(txn, source_task_id)
+@@ -2677,21 +2695,21 @@ impl RunStore {
+                             };
+                         }
+                     }
+ 
+                     match (
+                         insert.replaced_task_id.is_some(),
+                         insert.replacement_reason.is_some(),
+                     ) {
+                         (true, true) => {
+                             let (initial_decision, inherited_authorization_id) =
+-                                validate_replacement_insert_txn(txn, &insert).await?;
++                                validate_replacement_insert_txn(txn, &mut insert).await?;
+                             preflight_replacement(
+                                 txn,
+                                 &insert.lineage_root_task_id,
+                                 insert.parent_conversation_id,
+                                 insert.work_unit_key.as_deref(),
+                             )
+                             .await?;
+                             let source_task_id = insert
+                                 .replaced_task_id
+                                 .as_deref()
+@@ -2949,20 +2967,41 @@ impl RunStore {
+                         .map_err(terminal_protocol_store_error)?;
+                     // SQLite read transactions cannot safely upgrade after a
+                     // concurrent replacement writes. Take the writer reservation
+                     // before every eligibility read so replacement and continue
+                     // serialize around the source child.
+                     lock_continue_admission_txn(txn, &admission.target_task_id).await?;
+                     ensure_task_completion_recovery_not_fenced_txn(txn, &admission.target_task_id)
+                         .await
+                         .map_err(completion_recovery_fence_error)?;
+ 
++                    let target = DelegationTaskRun::find_by_id(&admission.target_task_id)
++                        .one(txn)
++                        .await
++                        .map_err(map_db_err)?
++                        .and_then(model_to_persisted_run)
++                        .ok_or_else(|| {
++                            TaskStoreError::NotFound(admission.target_task_id.clone())
++                        })?;
++                    if target.parent_conversation_id != admission.parent_conversation_id {
++                        return Err(TaskStoreError::NotFound(admission.target_task_id.clone()));
++                    }
++                    let effective_orchestration_binding = inherited_binding(
++                        target.orchestration_binding.as_ref(),
++                        admission.supplied_orchestration_binding.as_ref(),
++                    )?;
++                    if effective_orchestration_binding
++                        != admission.effective_orchestration_binding
++                    {
++                        return Err(TaskStoreError::OrchestrationBindingLineageMismatch);
++                    }
++
+                     // Parent-tool exact-duplicate precedes busy/stale.
+                     if !admission.parent_tool_use_id.is_empty() {
+                         let existing = DelegationTaskRun::find()
+                             .filter(
+                                 delegation_task_run::Column::ParentConversationId
+                                     .eq(admission.parent_conversation_id),
+                             )
+                             .filter(
+                                 delegation_task_run::Column::ParentToolUseId
+                                     .eq(&admission.parent_tool_use_id),
+@@ -2977,33 +3016,20 @@ impl RunStore {
+                                     Ok((Some(existing), WorkflowTxnSideEffect::None, None))
+                                 }
+                                 _ => Err(TaskStoreError::DuplicateParentTool(format!(
+                                     "parent_tool_use_id {} already bound under parent {}",
+                                     admission.parent_tool_use_id, admission.parent_conversation_id
+                                 ))),
+                             };
+                         }
+                     }
+ 
+-                    let target = DelegationTaskRun::find_by_id(&admission.target_task_id)
+-                        .one(txn)
+-                        .await
+-                        .map_err(map_db_err)?
+-                        .and_then(model_to_persisted_run)
+-                        .ok_or_else(|| {
+-                            TaskStoreError::NotFound(admission.target_task_id.clone())
+-                        })?;
+-                    if target.parent_conversation_id != admission.parent_conversation_id {
+-                        // Cross-parent: do not reveal existence.
+-                        return Err(TaskStoreError::NotFound(admission.target_task_id.clone()));
+-                    }
+-
+                     // Precedence: not_found → fingerprint → (capability outside
+                     // store) → busy → stale → not_continuable → budget / insert.
+                     let eligibility = build_continue_eligibility_txn(txn, &target).await?;
+                     let source_snapshot = recovery_source_from_continue_eligibility(&eligibility);
+                     let initial_decision = decide_delegation_recovery(
+                         &source_snapshot,
+                         &RecoveryRailSnapshot {
+                             agent_supports_reuse: eligibility.agent_supports_reuse,
+                             unexpected_continue_budget_available: eligibility
+                                 .unexpected_continue_budget_available,
+@@ -3104,21 +3130,21 @@ impl RunStore {
+                                         TaskStoreError::Permanent(
+                                             "test run_store continue_admission gate release dropped"
+                                                 .into(),
+                                         )
+                                     })?;
+                             }
+                         }
+                     }
+ 
+                     let insert = ReservingRunInsert {
+-                        orchestration_binding: None,
++                        orchestration_binding: effective_orchestration_binding,
+                         task_id: admission.task_id.clone(),
+                         root_task_id: target.root_task_id.clone(),
+                         previous_task_id: Some(target.task_id.clone()),
+                         generation: target.generation + 1,
+                         parent_conversation_id: admission.parent_conversation_id,
+                         parent_tool_use_id: (!admission.parent_tool_use_id.is_empty())
+                             .then(|| admission.parent_tool_use_id.clone()),
+                         child_conversation_id: target.child_conversation_id,
+                         agent_type: serde_json::to_value(target.agent_type)
+                             .ok()
+@@ -6006,21 +6032,21 @@ mod tests {
+             Some("x"),
+             None,
+             None,
+             "aa",
+             None,
+         );
+         assert_ne!(left, right);
+     }
+ 
+     #[test]
+-    fn durable_binding_unbound_seven_string_fingerprints_retain_exact_digests() {
++    fn request_fingerprint_unbound_seven_string_inputs_retain_exact_digests() {
+         assert_eq!(
+             request_fingerprint(
+                 "delegate_to_agent",
+                 "do the thing",
+                 Some("work-1"),
+                 None,
+                 None,
+                 None,
+                 "AbCdEf",
+                 None,
+@@ -6036,21 +6062,21 @@ mod tests {
+                 None,
+                 Some("task-1"),
+                 "deadbeef",
+                 None,
+             ),
+             "f9487ae94c8b94155514942226be54829c3f5043fdf587d3c33886b01f04a97f"
+         );
+     }
+ 
+     #[test]
+-    fn durable_binding_bound_fingerprint_uses_exact_twelve_string_v2_array() {
++    fn request_fingerprint_bound_uses_exact_twelve_string_v2_array() {
+         let binding = crate::acp::delegation::types::OrchestrationBindingV1 {
+             schema_version: 1,
+             namespace: "brainstorm-to-delivery".into(),
+             generation: 2,
+             route_fingerprint:
+                 "sha256:b498416d87bf6ba928bd7ddb5f1a451daf82300584f3d40b606c3c56f169ba7a"
+                     .into(),
+         };
+         let exact = request_fingerprint(
+             "delegate_to_agent",
+@@ -6184,20 +6210,299 @@ mod tests {
+         crate::acp::delegation::types::OrchestrationBindingV1 {
+             schema_version: 1,
+             namespace: "brainstorm-to-delivery".into(),
+             generation: 1,
+             route_fingerprint:
+                 "sha256:b498416d87bf6ba928bd7ddb5f1a451daf82300584f3d40b606c3c56f169ba7a"
+                     .into(),
+         }
+     }
+ 
++    fn continue_binding_admission(
++        parent_id: i32,
++        source_task_id: &str,
++        suffix: &str,
++        supplied: Option<OrchestrationBindingV1>,
++        effective: Option<OrchestrationBindingV1>,
++    ) -> ContinueRunAdmission {
++        ContinueRunAdmission {
++            task_id: format!("binding-continue-{suffix}"),
++            parent_conversation_id: parent_id,
++            parent_tool_use_id: format!("tu-binding-continue-{suffix}"),
++            target_task_id: source_task_id.into(),
++            task_preview: derive_task_preview("continue bound work"),
++            request_fingerprint: request_fingerprint(
++                "continue_delegation",
++                "continue bound work",
++                Some("unit-a"),
++                None,
++                None,
++                Some(source_task_id),
++                "aabbccdd",
++                effective.as_ref(),
++            ),
++            work_unit_key: Some("unit-a".into()),
++            supplied_orchestration_binding: supplied,
++            effective_orchestration_binding: effective,
++        }
++    }
++
++    async fn seed_binding_continue_source(
++        suffix: &str,
++        binding: Option<OrchestrationBindingV1>,
++    ) -> (Arc<AppDatabase>, RunStore, i32, String) {
++        use crate::db::entities::conversation;
++        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
++
++        let db = Arc::new(fresh_in_memory_db().await);
++        let source_task_id = format!("binding-continue-source-{suffix}");
++        let (parent_id, child_id) = seed_parent_child(&db, &source_task_id).await;
++        let child = conversation::Entity::find_by_id(child_id)
++            .one(&db.conn)
++            .await
++            .unwrap()
++            .unwrap();
++        let mut child = child.into_active_model();
++        child.external_id = Set(Some(format!("binding-session-{suffix}")));
++        child.update(&db.conn).await.unwrap();
++        let store = RunStore::new(db.clone());
++        let mut source = sample_insert(&source_task_id, parent_id, child_id, 1, None);
++        source.orchestration_binding = binding;
++        store.insert_reserving(source).await.unwrap();
++        ensure_bound(&store, &source_task_id, format!("binding-conn-{suffix}")).await;
++        store
++            .promote_running(
++                &source_task_id,
++                format!("binding-conn-{suffix}"),
++                Utc::now(),
++            )
++            .await
++            .unwrap();
++        settle_completed(&store, &source_task_id).await;
++        (db, store, parent_id, source_task_id)
++    }
++
++    #[tokio::test]
++    async fn orchestration_binding_lineage_continue_inherits_rejects_conversion_and_is_idempotent()
++    {
++        for (suffix, source_binding, supplied) in [
++            (
++                "bound-omitted",
++                Some(binding_fixture()),
++                None,
++            ),
++            (
++                "bound-exact",
++                Some(binding_fixture()),
++                Some(binding_fixture()),
++            ),
++            ("unbound-omitted", None, None),
++        ] {
++            let (_db, store, parent_id, source_task_id) =
++                seed_binding_continue_source(suffix, source_binding.clone()).await;
++            let admission = continue_binding_admission(
++                parent_id,
++                &source_task_id,
++                suffix,
++                supplied,
++                source_binding.clone(),
++            );
++            let created = store
++                .admit_continue_reserving(admission.clone())
++                .await
++                .expect("matching lineage must reserve");
++            let run = match created {
++                ContinueAdmitOutcome::Created(run) => run,
++                other => panic!("expected created continuation, got {other:?}"),
++            };
++            assert_eq!(run.orchestration_binding, source_binding);
++
++            let mut replay = admission;
++            replay.task_id.push_str("-replay");
++            let replayed = store
++                .admit_continue_reserving(replay)
++                .await
++                .expect("omitted inherited binding must be idempotent");
++            assert!(matches!(replayed, ContinueAdmitOutcome::Idempotent(_)));
++        }
++
++        let mut mismatches = Vec::new();
++        let mut schema_version = binding_fixture();
++        schema_version.schema_version = 2;
++        mismatches.push(("schema-version", schema_version));
++        let mut namespace = binding_fixture();
++        namespace.namespace = "brainstorm-to-delivery-alt".into();
++        mismatches.push(("namespace", namespace));
++        let mut generation = binding_fixture();
++        generation.generation = 2;
++        mismatches.push(("generation", generation));
++        let mut fingerprint = binding_fixture();
++        fingerprint.route_fingerprint = format!("sha256:{}", "a".repeat(64));
++        mismatches.push(("fingerprint", fingerprint));
++
++        for (suffix, supplied) in mismatches {
++            let (_db, store, parent_id, source_task_id) =
++                seed_binding_continue_source(suffix, Some(binding_fixture())).await;
++            let admission = continue_binding_admission(
++                parent_id,
++                &source_task_id,
++                suffix,
++                Some(supplied.clone()),
++                Some(supplied),
++            );
++            let task_id = admission.task_id.clone();
++            let error = store
++                .admit_continue_reserving(admission)
++                .await
++                .expect_err("changed source identity must reject");
++            assert!(matches!(
++                error,
++                TaskStoreError::OrchestrationBindingLineageMismatch
++            ));
++            assert!(store.load_by_task_id(&task_id).await.unwrap().is_none());
++        }
++
++        let (_db, store, parent_id, source_task_id) =
++            seed_binding_continue_source("unbound-conversion", None).await;
++        let admission = continue_binding_admission(
++            parent_id,
++            &source_task_id,
++            "unbound-conversion",
++            Some(binding_fixture()),
++            Some(binding_fixture()),
++        );
++        let error = store
++            .admit_continue_reserving(admission)
++            .await
++            .expect_err("unbound source cannot become bound");
++        assert!(matches!(
++            error,
++            TaskStoreError::OrchestrationBindingLineageMismatch
++        ));
++    }
++
++    async fn seed_binding_replacement_source(
++        suffix: &str,
++        binding: Option<OrchestrationBindingV1>,
++    ) -> (Arc<AppDatabase>, RunStore, i32, String) {
++        let db = Arc::new(fresh_in_memory_db().await);
++        let source_task_id = format!("binding-replacement-source-{suffix}");
++        let (parent_id, child_id) = seed_parent_child(&db, &source_task_id).await;
++        let store = RunStore::new(db.clone());
++        let mut source = sample_insert(&source_task_id, parent_id, child_id, 1, None);
++        source.orchestration_binding = binding;
++        store.insert_reserving(source).await.unwrap();
++        ensure_bound(&store, &source_task_id, format!("binding-repl-conn-{suffix}")).await;
++        store
++            .promote_running(
++                &source_task_id,
++                format!("binding-repl-conn-{suffix}"),
++                Utc::now(),
++            )
++            .await
++            .unwrap();
++        store
++            .settle_terminal(
++                &source_task_id,
++                TerminalTaskWrite::failed(
++                    "unresumable",
++                    Utc::now(),
++                    ConversationStatus::Cancelled,
++                ),
++            )
++            .await
++            .unwrap();
++        (db, store, parent_id, source_task_id)
++    }
++
++    #[tokio::test]
++    async fn orchestration_binding_lineage_replacement_inherits_and_rejects_conversion() {
++        for (suffix, source_binding, supplied) in [
++            ("bound-omitted", Some(binding_fixture()), None),
++            (
++                "bound-exact",
++                Some(binding_fixture()),
++                Some(binding_fixture()),
++            ),
++            ("unbound-omitted", None, None),
++        ] {
++            let (db, store, parent_id, source_task_id) =
++                seed_binding_replacement_source(suffix, source_binding.clone()).await;
++            let task_id = format!("binding-replacement-{suffix}");
++            let child_id = new_replacement_child(
++                &db,
++                parent_id,
++                &format!("tu-{task_id}"),
++                &task_id,
++            )
++            .await;
++            let mut insert = base_replacement_insert(
++                &task_id,
++                parent_id,
++                child_id,
++                &source_task_id,
++                "unresumable",
++            );
++            insert.orchestration_binding = supplied;
++            let outcome = store
++                .admit_gen1_reserving(insert)
++                .await
++                .expect("matching replacement lineage must reserve");
++            let run = match outcome {
++                Gen1AdmitOutcome::Created(run) => run,
++                other => panic!("expected created replacement, got {other:?}"),
++            };
++            assert_eq!(run.orchestration_binding, source_binding);
++        }
++
++        for (suffix, source_binding, supplied) in [
++            (
++                "bound-mismatch",
++                Some(binding_fixture()),
++                Some({
++                    let mut changed = binding_fixture();
++                    changed.generation = 2;
++                    changed
++                }),
++            ),
++            ("unbound-conversion", None, Some(binding_fixture())),
++        ] {
++            let (db, store, parent_id, source_task_id) =
++                seed_binding_replacement_source(suffix, source_binding).await;
++            let task_id = format!("binding-replacement-{suffix}");
++            let child_id = new_replacement_child(
++                &db,
++                parent_id,
++                &format!("tu-{task_id}"),
++                &task_id,
++            )
++            .await;
++            let mut insert = base_replacement_insert(
++                &task_id,
++                parent_id,
++                child_id,
++                &source_task_id,
++                "unresumable",
++            );
++            insert.orchestration_binding = supplied;
++            let error = store
++                .admit_gen1_reserving(insert)
++                .await
++                .expect_err("replacement conversion must reject");
++            assert!(matches!(
++                error,
++                TaskStoreError::OrchestrationBindingLineageMismatch
++            ));
++            assert!(store.load_by_task_id(&task_id).await.unwrap().is_none());
++        }
++    }
++
+     #[derive(Debug, Clone, PartialEq, Eq)]
+     struct BindingIdentitySnapshot {
+         agent_type: String,
+         profile_id: Option<String>,
+         schema_version: Option<i64>,
+         namespace: Option<String>,
+         generation: Option<i64>,
+         route_fingerprint: Option<String>,
+     }
+ 
+@@ -10114,20 +10419,22 @@ mod tests {
+             None,
+         );
+         let admission = ContinueRunAdmission {
+             task_id: "continue-next".into(),
+             parent_conversation_id: parent_id,
+             parent_tool_use_id: "tu-continue".into(),
+             target_task_id: root.into(),
+             task_preview: derive_task_preview("review the revision"),
+             request_fingerprint: fingerprint.clone(),
+             work_unit_key: Some("unit-a".into()),
++            supplied_orchestration_binding: None,
++            effective_orchestration_binding: None,
+         };
+         let first = store
+             .admit_continue_reserving(admission.clone())
+             .await
+             .expect("first continuation reserve");
+         assert!(matches!(first, ContinueAdmitOutcome::Created(_)));
+ 
+         let mut replay = admission.clone();
+         replay.task_id = "continue-replay".into();
+         let second = store
+@@ -10146,20 +10453,22 @@ mod tests {
+         // isolates the work-unit mismatch rather than correctly hitting busy.
+         settle_completed(&store, "continue-next").await;
+         let mismatched_work_unit = ContinueRunAdmission {
+             task_id: "continue-wrong-unit".into(),
+             parent_conversation_id: parent_id,
+             parent_tool_use_id: "tu-wrong-unit".into(),
+             target_task_id: "continue-next".into(),
+             task_preview: derive_task_preview("review with wrong unit"),
+             request_fingerprint: "wrong-unit-fingerprint".into(),
+             work_unit_key: Some("unit-b".into()),
++            supplied_orchestration_binding: None,
++            effective_orchestration_binding: None,
+         };
+         let err = store
+             .admit_continue_reserving(mismatched_work_unit)
+             .await
+             .unwrap_err();
+         assert!(matches!(err, TaskStoreError::NotContinuable(_)));
+     }
+ 
+     /// Overlap precedence: busy_thread / stale_task_id beat work_unit_key mismatch.
+     #[tokio::test]
+@@ -10191,20 +10500,22 @@ mod tests {
+             .unwrap();
+         // Root still running → busy. Wrong work_unit_key must not preempt busy.
+         let busy_wrong_key = ContinueRunAdmission {
+             task_id: "cont-busy".into(),
+             parent_conversation_id: parent_id,
+             parent_tool_use_id: "tu-busy".into(),
+             target_task_id: root.into(),
+             task_preview: derive_task_preview("x"),
+             request_fingerprint: "fp-busy".into(),
+             work_unit_key: Some("unit-wrong".into()),
++            supplied_orchestration_binding: None,
++            effective_orchestration_binding: None,
+         };
+         let err = store
+             .admit_continue_reserving(busy_wrong_key)
+             .await
+             .unwrap_err();
+         assert!(
+             matches!(err, TaskStoreError::BusyThread(_)),
+             "busy must win over work_unit mismatch: {err:?}"
+         );
+ 
+@@ -10228,20 +10539,22 @@ mod tests {
+         settle_completed(&store, "prec-gen2-4111-8111-111111111111").await;
+ 
+         let stale_wrong_key = ContinueRunAdmission {
+             task_id: "cont-stale".into(),
+             parent_conversation_id: parent_id,
+             parent_tool_use_id: "tu-stale".into(),
+             target_task_id: root.into(), // stale: not latest on child
+             task_preview: derive_task_preview("x"),
+             request_fingerprint: "fp-stale".into(),
+             work_unit_key: Some("unit-wrong".into()),
++            supplied_orchestration_binding: None,
++            effective_orchestration_binding: None,
+         };
+         let err = store
+             .admit_continue_reserving(stale_wrong_key)
+             .await
+             .unwrap_err();
+         assert!(
+             matches!(err, TaskStoreError::StaleTaskId(_)),
+             "stale must win over work_unit mismatch: {err:?}"
+         );
+     }
+@@ -10278,20 +10591,22 @@ mod tests {
+ 
+         let err = store
+             .admit_continue_reserving(ContinueRunAdmission {
+                 task_id: "deleted-parent-continue".into(),
+                 parent_conversation_id: parent_id,
+                 parent_tool_use_id: "tu-deleted-parent-continue".into(),
+                 target_task_id: root.into(),
+                 task_preview: derive_task_preview("continue after parent deletion"),
+                 request_fingerprint: "deleted-parent-fingerprint".into(),
+                 work_unit_key: Some("unit-a".into()),
++                supplied_orchestration_binding: None,
++                effective_orchestration_binding: None,
+             })
+             .await
+             .unwrap_err();
+ 
+         assert!(
+             matches!(err, TaskStoreError::NotContinuable(_)),
+             "soft-deleted parent must fail closed: {err:?}"
+         );
+     }
+ 
+@@ -10343,20 +10658,22 @@ mod tests {
+ 
+         let err = store
+             .admit_continue_reserving(ContinueRunAdmission {
+                 task_id: "unknown-agent-continue".into(),
+                 parent_conversation_id: parent_id,
+                 parent_tool_use_id: "tu-unknown-agent-continue".into(),
+                 target_task_id: root.into(),
+                 task_preview: derive_task_preview("continue unknown agent"),
+                 request_fingerprint: "unknown-agent-fingerprint".into(),
+                 work_unit_key: Some("unit-a".into()),
++                supplied_orchestration_binding: None,
++                effective_orchestration_binding: None,
+             })
+             .await
+             .unwrap_err();
+ 
+         assert!(
+             matches!(err, TaskStoreError::NotContinuable(_)),
+             "unknown raw agent identity must not fall back to another agent: {err:?}"
+         );
+     }
+ 
+@@ -10420,20 +10737,22 @@ mod tests {
+ 
+         let continuation = store
+             .admit_continue_reserving(ContinueRunAdmission {
+                 task_id: "continue-replacement-race-continuation".into(),
+                 parent_conversation_id: parent_id,
+                 parent_tool_use_id: "tu-continue-replacement-race-continuation".into(),
+                 target_task_id: source_task_id.into(),
+                 task_preview: derive_task_preview("continue source child"),
+                 request_fingerprint: "continue-replacement-race-fingerprint".into(),
+                 work_unit_key: Some("unit-a".into()),
++                supplied_orchestration_binding: None,
++                effective_orchestration_binding: None,
+             })
+             .await
+             .expect_err("unsupported reuse must reject continue before creating a run");
+         assert!(matches!(continuation, TaskStoreError::NotContinuable(_)));
+ 
+         let replacement = store
+             .admit_gen1_reserving(replacement)
+             .await
+             .expect("central not_supported rail admits replacement");
+         assert!(matches!(replacement, Gen1AdmitOutcome::Created(_)));
+@@ -12585,20 +12904,22 @@ mod tests {
+             tokio::spawn(async move {
+                 store
+                     .admit_continue_reserving(ContinueRunAdmission {
+                         task_id: "continue-gate-timeout-child".into(),
+                         parent_conversation_id: parent_id,
+                         parent_tool_use_id: "tu-continue-gate-timeout".into(),
+                         target_task_id: root.into(),
+                         task_preview: derive_task_preview("continue under unreleased gate"),
+                         request_fingerprint: "continue-gate-timeout-fp".into(),
+                         work_unit_key: Some("unit-a".into()),
++                        supplied_orchestration_binding: None,
++                        effective_orchestration_binding: None,
+                     })
+                     .await
+             })
+         };
+         tokio::time::timeout(TEST_RUN_STORE_GATE_TIMEOUT, entered_rx)
+             .await
+             .expect("continuation did not enter gate within 5s")
+             .expect("continue admission gate dropped before entry");
+ 
+         // Trip the mid-txn gate with virtual time, then resume wall clock.
+@@ -12666,20 +12987,22 @@ mod tests {
+             tokio::spawn(async move {
+                 store
+                     .admit_continue_reserving(ContinueRunAdmission {
+                         task_id: "continue-gate-drop-child".into(),
+                         parent_conversation_id: parent_id,
+                         parent_tool_use_id: "tu-continue-gate-drop".into(),
+                         target_task_id: root.into(),
+                         task_preview: derive_task_preview("continue under dropped gate"),
+                         request_fingerprint: "continue-gate-drop-fp".into(),
+                         work_unit_key: Some("unit-a".into()),
++                        supplied_orchestration_binding: None,
++                        effective_orchestration_binding: None,
+                     })
+                     .await
+             })
+         };
+         tokio::time::timeout(TEST_RUN_STORE_GATE_TIMEOUT, entered_rx)
+             .await
+             .expect("continuation did not enter gate within 5s")
+             .expect("continue admission gate dropped before entry");
+ 
+         drop(release_tx);
+@@ -14875,20 +15198,22 @@ mod termination_audit {
+             suffix: &str,
+         ) -> ContinueRunAdmission {
+             ContinueRunAdmission {
+                 task_id: format!("recovery-continue-{suffix}"),
+                 parent_conversation_id: parent_id,
+                 parent_tool_use_id: format!("tu-recovery-continue-{suffix}"),
+                 target_task_id: source_task_id.to_string(),
+                 task_preview: derive_task_preview("continue authorized recovery"),
+                 request_fingerprint: format!("recovery-fingerprint-{suffix}"),
+                 work_unit_key: Some(format!("unit-{suffix}")),
++                supplied_orchestration_binding: None,
++                effective_orchestration_binding: None,
+             }
+         }
+ 
+         fn recovery_authorization(
+             authorization_id: Option<String>,
+             suffix: &str,
+         ) -> RecoveryAdmissionAuthorization {
+             RecoveryAdmissionAuthorization {
+                 authorization_id,
+                 correlation_id: format!("recovery-correlation-{suffix}"),
+@@ -14928,20 +15253,21 @@ mod termination_audit {
+             ContinueDelegationRequest {
+                 parent_connection_id: "recovery-parent-connection".into(),
+                 parent_conversation_id: parent_id,
+                 parent_tool_use_id: format!("tu-recovery-continue-{suffix}"),
+                 target_task_id: source_task_id.to_string(),
+                 task: "continue authorized recovery".into(),
+                 work_unit_key: Some(format!("unit-{suffix}")),
+                 external_handle: None,
+                 correlation_id: Some(format!("recovery-correlation-{suffix}")),
+                 recovery_authorization_id: authorization_id,
++                orchestration_binding: None,
+             }
+         }
+ 
+         async fn wait_for_resume_call(spawner: &MockSpawner) {
+             tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                 loop {
+                     if !spawner.resume_args.lock().await.is_empty() {
+                         break;
+                     }
+                     tokio::task::yield_now().await;
+diff --git a/src-tauri/src/acp/delegation/store.rs b/src-tauri/src/acp/delegation/store.rs
+index 3d3cff72..67ee9ecc 100644
+--- a/src-tauri/src/acp/delegation/store.rs
++++ b/src-tauri/src/acp/delegation/store.rs
+@@ -327,20 +327,24 @@ pub enum TaskStoreError {
+     /// Same `(parent_conversation_id, parent_tool_use_id)` already bound with
+     /// a different or missing request fingerprint. Wire code:
+     /// `duplicate_parent_tool`.
+     #[error("duplicate parent tool: {0}")]
+     DuplicateParentTool(String),
+     /// Replacement-qualified dual first-dispatch loser (orchestrated key
+     /// with established lineage without replaces). Wire code:
+     /// `invalid_replacement`.
+     #[error("invalid replacement: {0}")]
+     InvalidReplacement(String),
++    /// Explicit continuation/replacement binding disagrees with its source.
++    /// Wire code: `orchestration_binding_lineage_mismatch`.
++    #[error("orchestration binding lineage mismatch")]
++    OrchestrationBindingLineageMismatch,
+     /// Continue target is not the latest terminal run. Wire: `stale_task_id`.
+     #[error("stale task id: {0}")]
+     StaleTaskId(String),
+     /// Continue target fails eligibility. Wire: `not_continuable`.
+     #[error("not continuable: {0}")]
+     NotContinuable(String),
+     #[error("recovery confirmation required")]
+     RecoveryConfirmationRequired(DelegationRecoveryProjection),
+     #[error("recovery authorization rejected: {code}")]
+     RecoveryAuthorizationRejected { code: &'static str },
+@@ -374,20 +378,23 @@ impl TaskStoreError {
+     }
+ 
+     /// Stable wire code for MCP / broker reports when this error is
+     /// caller-facing. Returns `None` for internal permanent/transient cases.
+     pub fn wire_code(&self) -> Option<&'static str> {
+         match self {
+             Self::BudgetExhausted(_) => Some("budget_exhausted"),
+             Self::BusyThread(_) => Some("busy_thread"),
+             Self::DuplicateParentTool(_) => Some("duplicate_parent_tool"),
+             Self::InvalidReplacement(_) => Some("invalid_replacement"),
++            Self::OrchestrationBindingLineageMismatch => {
++                Some("orchestration_binding_lineage_mismatch")
++            }
+             Self::StaleTaskId(_) => Some("stale_task_id"),
+             Self::NotContinuable(_) => Some("not_continuable"),
+             Self::RecoveryConfirmationRequired(_) => Some("recovery_confirmation_required"),
+             Self::RecoveryAuthorizationRejected { code } => Some(code),
+             Self::NotFound(_) => Some("not_found"),
+             // Structured admission codes are returned via
+             // [`TaskStoreError::workflow_admission_code`] / DelegationError;
+             // this static umbrella remains for call sites that only need a
+             // coarse bucket.
+             Self::WorkflowAdmission { .. } => Some("workflow_admission_rejected"),
+diff --git a/src-tauri/src/acp/delegation/tool_schema.json b/src-tauri/src/acp/delegation/tool_schema.json
+index bcd4e3cd..7a61c1a6 100644
+--- a/src-tauri/src/acp/delegation/tool_schema.json
++++ b/src-tauri/src/acp/delegation/tool_schema.json
+@@ -30,20 +30,55 @@
+           "maxLength": 1024
+         }
+       }
+     }
+   },
+   {
+     "name": "delegate_to_agent",
+     "description": "Asynchronous cold child cannot see this conversation; returns task_id. Task must include all context. Fan out, then Join. For each distinct agent/profile mention, call once; pass profile_id for a profile.",
+     "inputSchema": {
+       "type": "object",
++      "$defs": {
++        "b": {
++          "type": "object",
++          "additionalProperties": false,
++          "required": [
++            "schema_version",
++            "namespace",
++            "generation",
++            "route_fingerprint"
++          ],
++          "properties": {
++            "schema_version": {
++              "type": "integer",
++              "const": 1
++            },
++            "namespace": {
++              "type": "string",
++              "minLength": 1,
++              "maxLength": 64,
++              "pattern": "^[a-z][a-z0-9-]{0,63}$"
++            },
++            "generation": {
++              "type": "integer",
++              "minimum": 1,
++              "maximum": 4294967295
++            },
++            "route_fingerprint": {
++              "type": "string",
++              "minLength": 71,
++              "maxLength": 71,
++              "pattern": "^sha256:[0-9a-f]{64}$"
++            }
++          }
++        }
++      },
+       "required": [
+         "agent_type",
+         "task",
+         "correlation_id"
+       ],
+       "properties": {
+         "agent_type": {
+           "type": "string",
+           "enum": [
+             "claude_code",
+@@ -63,103 +98,140 @@
+           "type": "string"
+         },
+         "profile_label": {
+           "type": "string"
+         },
+         "task": {
+           "type": "string"
+         },
+         "correlation_id": {
+           "type": "string",
+-          "description": "Fresh per call."
++          "description": "Fresh."
+         },
+         "recovery_authorization_id": {
+           "type": "string",
+           "minLength": 1
+         },
++        "orchestration_binding": {
++          "$ref": "#/$defs/b"
++        },
+         "working_dir": {
+-          "type": "string",
+-          "description": "Absolute; defaults to parent."
++          "type": "string"
+         },
+         "work_unit_key": {
+           "type": "string",
+-          "maxLength": 200,
+-          "description": "Recovery key."
++          "maxLength": 200
+         },
+         "replaces_task_id": {
+-          "type": "string",
+-          "description": "Pair with replacement_reason."
++          "type": "string"
+         },
+         "replacement_reason": {
+           "type": "string",
+           "enum": [
+             "unresumable",
+             "budget_exhausted_continue",
+             "not_supported",
+             "admission_failed",
+             "admission_unknown"
+           ],
+-          "description": "admission_failed/admission_unknown require explicit replacement; cancellation/stall does not; otherwise continue_delegation."
++          "description": "admission_failed/admission_unknown require explicit replacement; otherwise continue."
+         }
+       }
+     }
+   },
+   {
+     "name": "register_simple_workflow",
+-    "description": "Register workspace-relative Plan and progress paths for this Root conversation after the Plan exists.",
++    "description": "Register Root Plan/progress paths.",
+     "inputSchema": {
+       "type": "object",
+       "additionalProperties": false,
+       "required": [
+         "plan_rel_path"
+       ],
+       "properties": {
+         "plan_rel_path": {
+           "type": "string",
+           "minLength": 1
+         },
+         "progress_rel_path": {
+           "type": "string",
+           "minLength": 1
+         }
+       }
+     }
+   },
+   {
+     "name": "continue_delegation",
+-    "description": "Continue terminal task_id asynchronously with full context; never creates a child. Join via get_delegation_status.",
++    "description": "Continue terminal task_id; reuse child. Join via get_delegation_status.",
+     "inputSchema": {
+       "type": "object",
++      "$defs": {
++        "b": {
++          "type": "object",
++          "additionalProperties": false,
++          "required": [
++            "schema_version",
++            "namespace",
++            "generation",
++            "route_fingerprint"
++          ],
++          "properties": {
++            "schema_version": {
++              "type": "integer",
++              "const": 1
++            },
++            "namespace": {
++              "type": "string",
++              "minLength": 1,
++              "maxLength": 64,
++              "pattern": "^[a-z][a-z0-9-]{0,63}$"
++            },
++            "generation": {
++              "type": "integer",
++              "minimum": 1,
++              "maximum": 4294967295
++            },
++            "route_fingerprint": {
++              "type": "string",
++              "minLength": 71,
++              "maxLength": 71,
++              "pattern": "^sha256:[0-9a-f]{64}$"
++            }
++          }
++        }
++      },
+       "required": [
+         "task_id",
+         "task",
+         "correlation_id"
+       ],
+       "properties": {
+         "task_id": {
+           "type": "string"
+         },
+         "task": {
+           "type": "string"
+         },
+         "correlation_id": {
+           "type": "string",
+-          "description": "Fresh per invocation."
++          "description": "Fresh."
+         },
+         "recovery_authorization_id": {
+           "type": "string",
+           "minLength": 1
+         },
++        "orchestration_binding": {
++          "$ref": "#/$defs/b"
++        },
+         "work_unit_key": {
+           "type": "string",
+-          "maxLength": 200,
+-          "description": "Prior key if omitted; max 200."
++          "maxLength": 200
+         }
+       }
+     }
+   },
+   {
+     "name": "get_delegation_status",
+     "description": "Join task_ids in input order. Omit wait_ms for an immediate snapshot. return_when=all_terminal_or_attention; wait_ms=0; positive wait_ms is rejected. wake_reason/attention_requests report attention, unavailable, or all requested tasks are terminal. Re-Join only still-running required tasks.",
+     "inputSchema": {
+       "type": "object",
+       "required": [
+@@ -317,21 +389,21 @@
+         "message": {
+           "type": "string",
+           "minLength": 1,
+           "description": "Decision needed; max 16 KiB UTF-8."
+         }
+       }
+     }
+   },
+   {
+     "name": "reply_to_delegation",
+-    "description": "Reply to an open direct-child Join decision. First reply wins; same reply is idempotent.",
++    "description": "Open direct-child Join decision; first reply wins; idempotent.",
+     "inputSchema": {
+       "type": "object",
+       "additionalProperties": false,
+       "required": [
+         "request_id",
+         "reply"
+       ],
+       "properties": {
+         "request_id": {
+           "type": "string",
+@@ -339,21 +411,21 @@
+         },
+         "reply": {
+           "type": "string",
+           "minLength": 1
+         }
+       }
+     }
+   },
+   {
+     "name": "request_recovery_authorization",
+-    "description": "After typed recovery_confirmation_required, request confirmation; replay the exact rejected call with recovery_authorization_id. Server derives action, target, warning, work-unit key, and delegation target. Results include subject_kind, subject_id, allowed_action, cause_code, expires_at, and action-specific target_state or replacement_reason metadata.",
++    "description": "After recovery_confirmation_required, replay the exact rejected call with recovery_authorization_id. Returns subject_kind, allowed_action, cause_code, expires_at, target_state, replacement_reason.",
+     "inputSchema": {
+       "type": "object",
+       "additionalProperties": false,
+       "required": [
+         "subject_kind",
+         "subject_id",
+         "correlation_id"
+       ],
+       "properties": {
+         "subject_kind": {
+@@ -382,40 +454,40 @@
+   {
+     "name": "get_workflow_capabilities",
+     "description": "Discover workflow_manifest_v2.",
+     "inputSchema": {
+       "type": "object",
+       "properties": {}
+     }
+   },
+   {
+     "name": "get_workflow_state",
+-    "description": "compact workflow index. Read plan/design/report_file for prose; get_session_info/get_delegation_status for detail.",
++    "description": "compact workflow index: report_file, get_session_info, get_delegation_status.",
+     "inputSchema": {
+       "type": "object",
+       "properties": {
+         "workflow_id": {
+           "type": "string"
+         },
+         "detail": {
+           "type": "string",
+           "enum": [
+             "index"
+           ],
+           "default": "index"
+         }
+       }
+     }
+   },
+   {
+     "name": "recover_workflow",
+-    "description": "Root only. Call get_workflow_state, then request_recovery_authorization; use its receipt. Never creates a challenge.",
++    "description": "Recover Root workflow with an approved receipt.",
+     "inputSchema": {
+       "type": "object",
+       "additionalProperties": false,
+       "required": [
+         "workflow_id",
+         "recovery_authorization_id",
+         "expected_manifest_revision",
+         "correlation_id"
+       ],
+       "properties": {
+@@ -433,21 +505,21 @@
+         },
+         "correlation_id": {
+           "type": "string",
+           "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+         }
+       }
+     }
+   },
+   {
+     "name": "publish_workflow_manifest",
+-    "description": "Publish/CAS v2 workflow manifest.",
++    "description": "Publish/CAS v2 manifest.",
+     "inputSchema": {
+       "type": "object",
+       "required": [
+         "schema_version",
+         "workflow_kind",
+         "publication_token",
+         "workflow_state",
+         "plan_target_rel_path",
+         "risk_policy_version",
+         "task_policies",
+@@ -476,21 +548,21 @@
+           "const": "b2d_task_risk_v1"
+         },
+         "task_policies": {
+           "type": "array"
+         }
+       }
+     }
+   },
+   {
+     "name": "settle_workflow_gate",
+-    "description": "Root-only protocol-v2 Design/Plan settlement from durable platform evidence.",
++    "description": "Settle v2 Design/Plan from durable evidence.",
+     "inputSchema": {
+       "type": "object",
+       "additionalProperties": false,
+       "required": [
+         "workflow_id",
+         "gate_id",
+         "expected_graph_revision",
+         "summary"
+       ],
+       "properties": {
+diff --git a/src-tauri/src/acp/delegation/types.rs b/src-tauri/src/acp/delegation/types.rs
+index 279e8cf0..00890060 100644
+--- a/src-tauri/src/acp/delegation/types.rs
++++ b/src-tauri/src/acp/delegation/types.rs
+@@ -268,40 +268,44 @@ pub struct DelegationRequest {
+     /// `budget_exhausted_continue` / `not_supported`).
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub replacement_reason: Option<String>,
+     /// Caller-generated opaque call correlation token (transport-only). Used
+     /// when the host omits `_meta.tool_use_id` so ACP and MCP can bind the same
+     /// invocation. Not a task/run/conversation id; not persisted on the run.
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub correlation_id: Option<String>,
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub recovery_authorization_id: Option<String>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub orchestration_binding: Option<OrchestrationBindingV1>,
+ }
+ 
+ /// Everything the broker needs to dispatch a `continue_delegation` call.
+ #[derive(Debug, Clone, Serialize, Deserialize)]
+ pub struct ContinueDelegationRequest {
+     pub parent_connection_id: String,
+     pub parent_conversation_id: i32,
+     pub parent_tool_use_id: String,
+     pub target_task_id: String,
+     pub task: String,
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub work_unit_key: Option<String>,
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub external_handle: Option<String>,
+     /// Caller-generated opaque call correlation token (transport-only). See
+     /// [`DelegationRequest::correlation_id`].
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub correlation_id: Option<String>,
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub recovery_authorization_id: Option<String>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub orchestration_binding: Option<OrchestrationBindingV1>,
+ }
+ 
+ /// Max accepted length for a call `correlation_id` (inclusive).
+ pub const CORRELATION_ID_MAX_LEN: usize = 128;
+ 
+ /// What a still-running delegation child is blocked on.
+ #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+ #[serde(rename_all = "snake_case")]
+ pub enum BlockedKind {
+     Permission,
+@@ -633,20 +637,24 @@ pub enum DelegationError {
+     MissingParentToolUseId,
+     /// Agent type is not capability-enabled for session reuse (continue only).
+     #[error("session reuse not supported for this agent type")]
+     NotSupported,
+     /// Stored launch snapshot / profile cannot be re-launched for continue.
+     #[error("unresumable: {0}")]
+     Unresumable(String),
+     /// Replacement inputs failed server eligibility.
+     #[error("invalid replacement: {0}")]
+     InvalidReplacement(String),
++    #[error("orchestration binding invalid: {0}")]
++    OrchestrationBindingInvalid(String),
++    #[error("orchestration binding lineage mismatch")]
++    OrchestrationBindingLineageMismatch,
+     /// Platform recovery rail refused the operation.
+     #[error("budget exhausted: {0}")]
+     BudgetExhausted(String),
+     #[error("recovery confirmation required")]
+     RecoveryConfirmationRequired(DelegationRecoveryProjection),
+     #[error("recovery authorization rejected: {code}")]
+     RecoveryAuthorizationRejected { code: String },
+     /// Soft-delete of a provisional orphan child (fence/idempotent loser)
+     /// failed after retry. Fail-closed: do not return busy/idempotent success
+     /// while the no-run child may still be visible under the parent.
+@@ -1275,20 +1283,24 @@ impl DelegationOutcome {
+             DelegationError::ParentSessionGone => "canceled",
+             DelegationError::DuplicateParentTool(_) => "duplicate_parent_tool",
+             DelegationError::BusyThread(_) => "busy_thread",
+             DelegationError::NotFound(_) => "not_found",
+             DelegationError::StaleTaskId(_) => "stale_task_id",
+             DelegationError::NotContinuable(_) => "not_continuable",
+             DelegationError::MissingParentToolUseId => "missing_parent_tool_use_id",
+             DelegationError::NotSupported => "not_supported",
+             DelegationError::Unresumable(_) => "unresumable",
+             DelegationError::InvalidReplacement(_) => "invalid_replacement",
++            DelegationError::OrchestrationBindingInvalid(_) => "orchestration_binding_invalid",
++            DelegationError::OrchestrationBindingLineageMismatch => {
++                "orchestration_binding_lineage_mismatch"
++            }
+             DelegationError::BudgetExhausted(_) => "budget_exhausted",
+             DelegationError::RecoveryConfirmationRequired(_) => "recovery_confirmation_required",
+             // Handled above so the validated Task 8 rejection code is retained.
+             DelegationError::RecoveryAuthorizationRejected { .. } => {
+                 "recovery_authorization_rejected"
+             }
+             DelegationError::ProvisionalCleanupFailed(_) => "provisional_cleanup_failed",
+             DelegationError::ProvisionalTerminalizationFailed(_) => {
+                 "provisional_terminalization_failed"
+             }
+diff --git a/src-tauri/src/acp/delegation/workflow/completion_evidence.rs b/src-tauri/src/acp/delegation/workflow/completion_evidence.rs
+index f5687b3a..340a9a7a 100644
+--- a/src-tauri/src/acp/delegation/workflow/completion_evidence.rs
++++ b/src-tauri/src/acp/delegation/workflow/completion_evidence.rs
+@@ -4260,20 +4260,22 @@ mod tests {
+             let runs = RunStore::new(fixture.db.clone());
+             let error = super::super::with_historical_workflow_fixture_mutations(
+                 runs.admit_continue_reserving(ContinueRunAdmission {
+                     task_id: format!("{}-continue", fixture.task_id),
+                     parent_conversation_id: fixture.parent_conversation_id,
+                     parent_tool_use_id: format!("continue-{}", fixture.task_id),
+                     target_task_id: fixture.task_id.clone(),
+                     task_preview: "must be fenced".into(),
+                     request_fingerprint: format!("continue-fp-{}", fixture.task_id),
+                     work_unit_key: None,
++                    supplied_orchestration_binding: None,
++                    effective_orchestration_binding: None,
+                 }),
+             )
+             .await
+             .unwrap_err();
+             assert_eq!(error.workflow_admission_code(), Some(expected_code));
+ 
+             let source_run = fixture.stored_run().await;
+             let replacement_task_id = format!("{}-replacement", fixture.task_id);
+             let replacement_error = super::super::with_historical_workflow_fixture_mutations(
+                 runs.admit_gen1_reserving(ReservingRunInsert {
+diff --git a/src-tauri/src/acp/delegation/workflow/recovery_tests.rs b/src-tauri/src/acp/delegation/workflow/recovery_tests.rs
+index 38715dbf..bfbe5b8b 100644
+--- a/src-tauri/src/acp/delegation/workflow/recovery_tests.rs
++++ b/src-tauri/src/acp/delegation/workflow/recovery_tests.rs
+@@ -1037,20 +1037,21 @@ fn continue_request(
+     ContinueDelegationRequest {
+         parent_connection_id: "legacy-parent-connection".into(),
+         parent_conversation_id: parent,
+         parent_tool_use_id: "legacy-continue-tool".into(),
+         target_task_id: source_task_id.into(),
+         task: "continue legacy task".into(),
+         work_unit_key: Some("legacy-unit".into()),
+         external_handle: None,
+         correlation_id: Some("legacy-continue-correlation".into()),
+         recovery_authorization_id: authorization_id,
++        orchestration_binding: None,
+     }
+ }
+ 
+ async fn approve_continue_recovery(
+     db: &crate::db::AppDatabase,
+     parent: i32,
+     child: i32,
+     source_task_id: &str,
+     work_unit_key: &str,
+     decision: &RecoveryDecision,
+diff --git a/src-tauri/src/acp/lifecycle.rs b/src-tauri/src/acp/lifecycle.rs
+index 8d3aa01b..6e268471 100644
+--- a/src-tauri/src/acp/lifecycle.rs
++++ b/src-tauri/src/acp/lifecycle.rs
+@@ -4712,20 +4712,21 @@ mod tests {
+             profile_id: None,
+             task: "do x".into(),
+             working_dir: None,
+             requested_working_dir: None,
+             external_handle: None,
+             work_unit_key: None,
+             replaces_task_id: None,
+             replacement_reason: None,
+             correlation_id: None,
+             recovery_authorization_id: None,
++            orchestration_binding: None,
+         }
+     }
+ 
+     /// Stage a broker with one pending entry whose `child_connection_id`
+     /// matches the test connection. The returned join handle resolves
+     /// once the broker drains the entry (via cancel or complete).
+     async fn stage_pending_delegation(
+         child_conn_id: &str,
+         child_conv_id: i32,
+     ) -> (
+diff --git a/src-tauri/tests/completion_protocol_v2.rs b/src-tauri/tests/completion_protocol_v2.rs
+index d42eb828..a5764a4b 100644
+--- a/src-tauri/tests/completion_protocol_v2.rs
++++ b/src-tauri/tests/completion_protocol_v2.rs
+@@ -3242,20 +3242,21 @@ async fn run_session_2889_fixture() -> Session2889Result {
+         ContinueDelegationRequest {
+             parent_connection_id: "session-2889-parent".into(),
+             parent_conversation_id: parent,
+             parent_tool_use_id: "session-2889-card-reemit".into(),
+             target_task_id: first_reviewer_task_id.into(),
+             task: "CARD RE-EMIT ONLY".into(),
+             work_unit_key: first_reviewer.work_unit_key.clone(),
+             external_handle: None,
+             correlation_id: None,
+             recovery_authorization_id: None,
++            orchestration_binding: None,
+         },
+     ))
+     .await;
+     let persisted_runs = delegation_task_run::Entity::find()
+         .filter(delegation_task_run::Column::ParentConversationId.eq(parent))
+         .all(&db.conn)
+         .await
+         .unwrap();
+     let after_runs = persisted_runs.len() as u64;
+     let plan_reviewer_run_count = persisted_runs
+@@ -4624,20 +4625,21 @@ async fn v2_only_aggregate_acceptance() {
+         profile_id: None,
+         task: "dangling terminal aggregate".into(),
+         working_dir: Some(dangling_workspace.path().to_string_lossy().into_owned()),
+         requested_working_dir: None,
+         external_handle: None,
+         work_unit_key: Some(work_unit_key.clone()),
+         replaces_task_id: None,
+         replacement_reason: None,
+         correlation_id: None,
+         recovery_authorization_id: None,
++        orchestration_binding: None,
+     };
+     let dangling_report =
+         with_historical_workflow_fixture_mutations(broker.start_delegation(dangling_request)).await;
+     assert_eq!(
+         dangling_report.status,
+         TaskStatus::Running,
+         "{dangling_report:?}"
+     );
+     let dangling_task_id = dangling_report.task_id.expect("running task id");
+     let dangling_binding = delegation_workflow_run_binding::Entity::find_by_id(&dangling_task_id)
+@@ -4756,20 +4758,21 @@ async fn v2_only_aggregate_acceptance() {
+             profile_id: None,
+             task: "standalone card aggregate".into(),
+             working_dir: Some(standalone_workspace.path().to_string_lossy().into_owned()),
+             requested_working_dir: None,
+             external_handle: None,
+             work_unit_key: None,
+             replaces_task_id: None,
+             replacement_reason: None,
+             correlation_id: None,
+             recovery_authorization_id: None,
++            orchestration_binding: None,
+         })
+         .await;
+     assert_eq!(
+         standalone_report.status,
+         TaskStatus::Running,
+         "{standalone_report:?}"
+     );
+     let standalone_task_id = standalone_report.task_id.expect("standalone task id");
+     assert!(
+         delegation_workflow_run_binding::Entity::find_by_id(&standalone_task_id)
+diff --git a/src-tauri/tests/delegation_session_reuse_integration.rs b/src-tauri/tests/delegation_session_reuse_integration.rs
+index 99ae4aae..e58ef482 100644
+--- a/src-tauri/tests/delegation_session_reuse_integration.rs
++++ b/src-tauri/tests/delegation_session_reuse_integration.rs
+@@ -111,20 +111,21 @@ fn delegate_req(
+         task: task.into(),
+         working_dir: Some(test_working_dir()),
+         requested_working_dir: None,
+         external_handle: None,
+         work_unit_key: work_unit.map(str::to_string),
+         replaces_task_id: None,
+         replacement_reason: None,
+         // Explicit parent_tool_use_id fixtures do not need correlation_id.
+         correlation_id: None,
+         recovery_authorization_id: None,
++        orchestration_binding: None,
+     }
+ }
+ 
+ fn continue_req(
+     parent_id: i32,
+     tool_use: &str,
+     target_task_id: &str,
+     task: &str,
+     work_unit: Option<&str>,
+ ) -> ContinueDelegationRequest {
+@@ -132,20 +133,21 @@ fn continue_req(
+         parent_connection_id: "parent-conn".into(),
+         parent_conversation_id: parent_id,
+         parent_tool_use_id: tool_use.into(),
+         target_task_id: target_task_id.into(),
+         task: task.into(),
+         work_unit_key: work_unit.map(str::to_string),
+         external_handle: None,
+         // Explicit parent_tool_use_id fixtures do not need correlation_id.
+         correlation_id: None,
+         recovery_authorization_id: None,
++        orchestration_binding: None,
+     }
+ }
+ 
+ fn typed_running_termination_audit(
+     source: AcpTerminationSource,
+     reason: AcpTerminationReason,
+     admission_class: AdmissionClass,
+ ) -> String {
+     serde_json::to_string(&DelegationTerminationAuditV1::new(
+         AcpTerminationSummaryV1::new(

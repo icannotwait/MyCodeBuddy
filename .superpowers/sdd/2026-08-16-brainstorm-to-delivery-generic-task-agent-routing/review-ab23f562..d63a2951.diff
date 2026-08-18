@@ -1,0 +1,685 @@
+# Review package: ab23f562..d63a2951
+
+## Commits
+d63a2951 feat(workflow): reconcile Simple task routes
+
+## Files changed
+ src-tauri/src/acp/delegation/workflow/project.rs | 565 ++++++++++++++++++++++-
+ 1 file changed, 561 insertions(+), 4 deletions(-)
+
+## Diff
+diff --git a/src-tauri/src/acp/delegation/workflow/project.rs b/src-tauri/src/acp/delegation/workflow/project.rs
+index 3109181c..58f0ccdf 100644
+--- a/src-tauri/src/acp/delegation/workflow/project.rs
++++ b/src-tauri/src/acp/delegation/workflow/project.rs
+@@ -32,29 +32,31 @@ use super::dto::{
+     redact_display_string, redact_optional_display, safe_public_id, sha256_hex_str,
+     ArchivedWorkflowNavigationSnapshot, ProjectedNodeStatus, PublicIdAllocator,
+     SimpleWorkflowLocatorSnapshot, WorkflowCompatibility, WorkflowEdgeSnapshot,
+     WorkflowGateSnapshot, WorkflowGraphSnapshot, WorkflowNodeSnapshot, WorkflowNodeSyncState,
+     WorkflowOverallState, WorkflowPhaseSnapshot, WORKFLOW_GRAPH_SNAPSHOT_SCHEMA_VERSION,
+ };
+ use super::gates::{
+     evaluate_execution_gate, ExecutionGateEval, ExecutionGateInput, ExecutionGateKind,
+     ExecutionGateReason, ExecutionGateRunEvidence, RequiredReviewerEvidence, TerminalRunStatus,
+ };
+-use super::key::{normalize_rel_path, parse_recognized_work_unit_key};
++use super::key::{build_work_unit_key, normalize_rel_path, parse_recognized_work_unit_key};
+ use super::simple_parse::{
+     read_simple_plan, read_simple_progress, SimpleDeclaredStatus, SimpleFinalReviewStatus,
+-    SimpleParseError, SimplePlanDocument, SimpleProgressDocument,
++    SimpleParseError, SimplePlanDocument, SimpleProgressDocument, SimpleProgressTask,
++    SimpleRoutingSnapshot,
+ };
+ use super::types::{
+     ManifestDocument, ManifestNodeKind, ManifestNodeRole, ManifestTaskPolicy,
+-    ManifestWorkflowState, NormalizedGate, ParsedWorkUnitKey, ResolutionMode, TaskHardTriggerKind,
+-    TaskRiskLevel, TaskSoftSignalKind, WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY,
++    ManifestWorkflowState, NormalizedGate, ParsedWorkUnitKey, ResolutionMode, ReviewerSlot,
++    TaskHardTriggerKind, TaskRiskLevel, TaskSoftSignalKind, WorkUnitKeyParts,
++    WORKFLOW_KIND_BRAINSTORM_TO_DELIVERY,
+ };
+ use super::validate::validate_manifest_document;
+ 
+ /// Pull display-safe model / effort from a run's allowlisted launch snapshot.
+ ///
+ /// Keys match `launch_snapshot::ALLOWLISTED_CONFIG_KEYS`. Values are short
+ /// opaque ids (no secrets); empty / missing JSON yields `None`.
+ fn model_and_effort_from_config_json(
+     config_values_json: Option<&str>,
+ ) -> (Option<String>, Option<String>) {
+@@ -2135,20 +2137,232 @@ fn run_matches_task_index(run: &delegation_task_run::Model, task_index: u32) ->
+                     task_index: index,
+                     ..
+                 } | ParsedWorkUnitKey::TaskReviewer {
+                     task_index: index,
+                     ..
+                 } if index == task_index
+             )
+         })
+ }
+ 
++#[derive(Debug, Clone, PartialEq, Eq)]
++struct SimpleExpectedRoute {
++    risk_level: String,
++    task_agent_generation: u32,
++    implementer_key: String,
++    primary_reviewer_key: String,
++    auxiliary_reviewer_key: Option<String>,
++}
++
++fn derive_simple_expected_route(
++    routing: &SimpleRoutingSnapshot,
++    task_index: u32,
++) -> Result<SimpleExpectedRoute, &'static str> {
++    if routing.schema_version != 1 || routing.risk_policy_version != "b2d_task_risk_v1" {
++        return Err("unsupported routing metadata");
++    }
++
++    let mut matching_tasks = routing.tasks.iter().filter(|task| task.index == task_index);
++    let task = matching_tasks.next().ok_or("routing task missing")?;
++    if matching_tasks.next().is_some() {
++        return Err("routing task duplicated");
++    }
++    if task.task_agent_generation == 0 {
++        return Err("task Agent generation missing");
++    }
++
++    let mut matching_generations = routing
++        .task_agent_generations
++        .iter()
++        .filter(|generation| generation.generation == task.task_agent_generation);
++    let generation = matching_generations
++        .next()
++        .ok_or("task Agent generation missing")?;
++    if matching_generations.next().is_some()
++        || generation.effective_from_task_index == 0
++        || generation.effective_from_task_index > task_index
++    {
++        return Err("task Agent generation invalid");
++    }
++    if routing.task_agent_generations.iter().any(|candidate| {
++        candidate.generation != generation.generation
++            && candidate.effective_from_task_index <= task_index
++            && candidate.effective_from_task_index >= generation.effective_from_task_index
++    }) {
++        return Err("task Agent generation is not effective for task");
++    }
++
++    let primary_reviewers = task
++        .route
++        .reviewers
++        .iter()
++        .filter(|reviewer| reviewer.slot == ReviewerSlot::Primary)
++        .collect::<Vec<_>>();
++    let auxiliary_reviewers = task
++        .route
++        .reviewers
++        .iter()
++        .filter(|reviewer| reviewer.slot == ReviewerSlot::Auxiliary)
++        .collect::<Vec<_>>();
++    if primary_reviewers.len() != 1 {
++        return Err("primary reviewer shape invalid");
++    }
++    let primary = primary_reviewers[0];
++    if primary.agent_type != "codex" || primary.profile_id.is_some() {
++        return Err("primary reviewer route invalid");
++    }
++
++    let (expected_implementer_agent, expected_implementer_profile, auxiliary) =
++        match task.risk.level.as_str() {
++            "normal" => {
++                if task.route.reviewers.len() != 1
++                    || task.route.reviewers[0].slot != ReviewerSlot::Primary
++                    || !auxiliary_reviewers.is_empty()
++                {
++                    return Err("normal reviewer shape invalid");
++                }
++                (
++                    generation.agent_type.as_str(),
++                    generation.profile_id.as_deref(),
++                    None,
++                )
++            }
++            "high" => {
++                if task.route.reviewers.len() != 2
++                    || task.route.reviewers[0].slot != ReviewerSlot::Primary
++                    || task.route.reviewers[1].slot != ReviewerSlot::Auxiliary
++                    || auxiliary_reviewers.len() != 1
++                {
++                    return Err("high reviewer shape invalid");
++                }
++                let auxiliary = auxiliary_reviewers[0];
++                if auxiliary.agent_type != generation.agent_type
++                    || auxiliary.profile_id != generation.profile_id
++                {
++                    return Err("auxiliary reviewer not derived from task Agent generation");
++                }
++                ("codex", None, Some(auxiliary))
++            }
++            _ => return Err("unknown task risk level"),
++        };
++
++    if task.route.implementer.agent_type != expected_implementer_agent
++        || task.route.implementer.profile_id.as_deref() != expected_implementer_profile
++    {
++        return Err("implementer not derived from task Agent generation");
++    }
++
++    let implementer_key = build_work_unit_key(&WorkUnitKeyParts::TaskImplementer {
++        task_index,
++        agent_type: &task.route.implementer.agent_type,
++        profile_id: task.route.implementer.profile_id.as_deref(),
++    })
++    .map_err(|_| "invalid implementer Agent/profile")?;
++    let primary_reviewer_key = build_work_unit_key(&WorkUnitKeyParts::TaskReviewerSlotted {
++        task_index,
++        slot: ReviewerSlot::Primary,
++        agent_type: &primary.agent_type,
++        profile_id: primary.profile_id.as_deref(),
++    })
++    .map_err(|_| "invalid primary reviewer Agent/profile")?;
++    let auxiliary_reviewer_key = auxiliary
++        .map(|reviewer| {
++            build_work_unit_key(&WorkUnitKeyParts::TaskReviewerSlotted {
++                task_index,
++                slot: ReviewerSlot::Auxiliary,
++                agent_type: &reviewer.agent_type,
++                profile_id: reviewer.profile_id.as_deref(),
++            })
++            .map_err(|_| "invalid auxiliary reviewer Agent/profile")
++        })
++        .transpose()?;
++
++    Ok(SimpleExpectedRoute {
++        risk_level: task.risk.level.clone(),
++        task_agent_generation: task.task_agent_generation,
++        implementer_key,
++        primary_reviewer_key,
++        auxiliary_reviewer_key,
++    })
++}
++
++fn reconcile_simple_progress_route(
++    expected: &SimpleExpectedRoute,
++    progress: Option<&SimpleProgressTask>,
++    warnings: &mut Vec<String>,
++) {
++    let Some(progress) = progress else {
++        push_projection_warning(warnings, "simple_progress_expected_route_missing");
++        return;
++    };
++
++    if progress.risk_level.as_deref() != Some(expected.risk_level.as_str()) {
++        push_projection_warning(warnings, "simple_progress_risk_level_mismatch");
++    }
++    if progress.task_agent_generation != Some(expected.task_agent_generation) {
++        push_projection_warning(warnings, "simple_progress_task_agent_generation_mismatch");
++    }
++    if let Some(keys) = progress.expected_work_unit_keys.as_ref() {
++        if keys.implementer != expected.implementer_key {
++            push_projection_warning(warnings, "simple_progress_implementer_key_mismatch");
++        }
++        if keys.reviewers.primary != expected.primary_reviewer_key {
++            push_projection_warning(warnings, "simple_progress_primary_reviewer_key_mismatch");
++        }
++        if keys.reviewers.auxiliary != expected.auxiliary_reviewer_key {
++            push_projection_warning(warnings, "simple_progress_auxiliary_reviewer_key_mismatch");
++        }
++    } else {
++        push_projection_warning(warnings, "simple_progress_expected_route_missing");
++    }
++
++    let mut expected_keys = BTreeSet::from([
++        expected.implementer_key.as_str(),
++        expected.primary_reviewer_key.as_str(),
++    ]);
++    if let Some(auxiliary) = expected.auxiliary_reviewer_key.as_deref() {
++        expected_keys.insert(auxiliary);
++    }
++    let mut key_by_child = HashMap::<i32, &str>::new();
++    let mut run_outside_expected_route = false;
++    let mut route_child_not_independent = false;
++    for run in &progress.runs {
++        let Some(key) = run.work_unit_key.as_deref() else {
++            run_outside_expected_route = true;
++            continue;
++        };
++        if !expected_keys.contains(key) {
++            run_outside_expected_route = true;
++            continue;
++        }
++        let Some(child_id) = run.child_conversation_id else {
++            continue;
++        };
++        if key_by_child
++            .insert(child_id, key)
++            .is_some_and(|prior_key| prior_key != key)
++        {
++            route_child_not_independent = true;
++        }
++    }
++    if run_outside_expected_route {
++        push_projection_warning(warnings, "simple_progress_run_outside_expected_route");
++    }
++    if route_child_not_independent {
++        push_projection_warning(warnings, "simple_progress_route_child_not_independent");
++    }
++}
++
++fn run_matches_work_unit_key(run: &delegation_task_run::Model, expected_key: &str) -> bool {
++    run.work_unit_key.as_deref() == Some(expected_key)
++}
++
+ async fn project_simple_mode(
+     conn: &sea_orm::DatabaseConnection,
+     descriptor: &simple_workflow::Model,
+ ) -> Result<Option<WorkflowGraphSnapshot>, ProjectError> {
+     let parent = conversation::Entity::find_by_id(descriptor.parent_conversation_id)
+         .filter(conversation::Column::DeletedAt.is_null())
+         .one(conn)
+         .await
+         .map_err(db_err)?;
+     let Some(parent) = parent else {
+@@ -2244,35 +2458,65 @@ async fn project_simple_mode(
+             "simple_progress_active_task_missing_from_plan",
+         );
+     }
+ 
+     let mut nodes = Vec::with_capacity(plan.tasks.len());
+     let mut edges = Vec::with_capacity(plan.tasks.len().saturating_sub(1));
+     let mut prior_node_id: Option<String> = None;
+     for task in &plan.tasks {
+         let declared = progress_by_index.get(&task.index).copied();
+         let mut node_warning_codes = Vec::new();
++        let expected_route = plan.routing.as_ref().and_then(|routing| {
++            match derive_simple_expected_route(routing, task.index) {
++                Ok(expected) => {
++                    reconcile_simple_progress_route(&expected, declared, &mut node_warning_codes);
++                    Some(expected)
++                }
++                Err(_) => {
++                    push_projection_warning(&mut node_warning_codes, "simple_plan_routing_invalid");
++                    None
++                }
++            }
++        });
+         if declared.is_some()
+             && progress
+                 .warning_codes
+                 .iter()
+                 .any(|warning| warning == "simple_progress_plan_path_mismatch")
+         {
+             push_projection_warning(
+                 &mut node_warning_codes,
+                 "simple_progress_plan_path_mismatch",
+             );
+         }
+         let mut task_runs = parent_runs
+             .iter()
+             .filter(|run| run_matches_task_index(run, task.index))
+             .collect::<Vec<_>>();
++        if let Some(expected) = expected_route.as_ref() {
++            let route_keys = [
++                Some(expected.implementer_key.as_str()),
++                Some(expected.primary_reviewer_key.as_str()),
++                expected.auxiliary_reviewer_key.as_deref(),
++            ];
++            if task_runs.iter().any(|run| {
++                !route_keys
++                    .iter()
++                    .flatten()
++                    .any(|key| run_matches_work_unit_key(run, key))
++            }) {
++                push_projection_warning(
++                    &mut node_warning_codes,
++                    "simple_progress_run_outside_expected_route",
++                );
++            }
++        }
+         if let Some(declared) = declared {
+             for reference in &declared.runs {
+                 if let Some(task_id) = reference.task_id.as_deref() {
+                     match runs_by_id.get(task_id).copied() {
+                         Some(run) if run_matches_task_index(run, task.index) => {
+                             if !task_runs
+                                 .iter()
+                                 .any(|candidate| candidate.task_id == run.task_id)
+                             {
+                                 task_runs.push(run);
+@@ -3028,22 +3272,335 @@ fn _manifest_state_wire(s: ManifestWorkflowState) -> &'static str {
+         ManifestWorkflowState::Blocked => "blocked",
+     }
+ }
+ 
+ // ---------------------------------------------------------------------------
+ // Tests (B10 owned by Task 4 — projection)
+ // ---------------------------------------------------------------------------
+ 
+ #[cfg(test)]
+ mod tests {
++    use super::super::simple_parse::SimpleProgressTask;
++    use super::super::types::ReviewerSlot;
+     use super::*;
+ 
++    fn simple_routing_fixture(
++        task_index: u32,
++        risk_level: &str,
++        task_agent: &str,
++        task_agent_profile: Option<&str>,
++    ) -> super::super::simple_parse::SimpleRoutingSnapshot {
++        use super::super::simple_parse::{
++            SimpleAgentSelection, SimpleRiskEvidence, SimpleRoutingSnapshot, SimpleRoutingTask,
++            SimpleTaskAgentGeneration, SimpleTaskReviewerRoute, SimpleTaskRisk, SimpleTaskRoute,
++        };
++
++        let mut reviewers = vec![SimpleTaskReviewerRoute {
++            slot: ReviewerSlot::Primary,
++            agent_type: "codex".into(),
++            profile_id: None,
++        }];
++        let implementer = if risk_level == "high" {
++            reviewers.push(SimpleTaskReviewerRoute {
++                slot: ReviewerSlot::Auxiliary,
++                agent_type: task_agent.into(),
++                profile_id: task_agent_profile.map(str::to_string),
++            });
++            SimpleAgentSelection {
++                agent_type: "codex".into(),
++                profile_id: None,
++            }
++        } else {
++            SimpleAgentSelection {
++                agent_type: task_agent.into(),
++                profile_id: task_agent_profile.map(str::to_string),
++            }
++        };
++        SimpleRoutingSnapshot {
++            schema_version: 1,
++            risk_policy_version: "b2d_task_risk_v1".into(),
++            task_agent_generations: vec![SimpleTaskAgentGeneration {
++                generation: 7,
++                agent_type: task_agent.into(),
++                profile_id: task_agent_profile.map(str::to_string),
++                effective_from_task_index: 1,
++            }],
++            tasks: vec![SimpleRoutingTask {
++                index: task_index,
++                task_agent_generation: 7,
++                risk: SimpleTaskRisk {
++                    level: risk_level.into(),
++                    hard_triggers: Vec::<SimpleRiskEvidence>::new(),
++                    soft_signals: Vec::<SimpleRiskEvidence>::new(),
++                    score: 0,
++                    reason: "fixture".into(),
++                },
++                route: SimpleTaskRoute {
++                    implementer,
++                    reviewers,
++                },
++            }],
++        }
++    }
++
++    fn simple_progress_route_fixture(expected: &SimpleExpectedRoute) -> SimpleProgressTask {
++        use super::super::simple_parse::{SimpleExpectedReviewerKeys, SimpleExpectedWorkUnitKeys};
++
++        SimpleProgressTask {
++            index: 4,
++            status: SimpleDeclaredStatus::Pending,
++            commit: None,
++            risk_level: Some(expected.risk_level.clone()),
++            task_agent_generation: Some(expected.task_agent_generation),
++            expected_work_unit_keys: Some(SimpleExpectedWorkUnitKeys {
++                implementer: expected.implementer_key.clone(),
++                reviewers: SimpleExpectedReviewerKeys {
++                    primary: expected.primary_reviewer_key.clone(),
++                    auxiliary: expected.auxiliary_reviewer_key.clone(),
++                },
++            }),
++            runs: vec![],
++        }
++    }
++
++    #[test]
++    fn simple_projection_route_derives_normal_and_high_agent_selections() {
++        let cases = [
++            (
++                simple_routing_fixture(1, "normal", "grok", None),
++                1,
++                "task|1|implementer|grok|none",
++                "task|1|reviewer|primary|codex|none",
++                None,
++            ),
++            (
++                simple_routing_fixture(2, "normal", "custom:goose", Some("fast")),
++                2,
++                "task|2|implementer|custom:goose|fast",
++                "task|2|reviewer|primary|codex|none",
++                None,
++            ),
++            (
++                simple_routing_fixture(3, "high", "grok", None),
++                3,
++                "task|3|implementer|codex|none",
++                "task|3|reviewer|primary|codex|none",
++                Some("task|3|reviewer|auxiliary|grok|none"),
++            ),
++            (
++                simple_routing_fixture(4, "high", "codex", None),
++                4,
++                "task|4|implementer|codex|none",
++                "task|4|reviewer|primary|codex|none",
++                Some("task|4|reviewer|auxiliary|codex|none"),
++            ),
++        ];
++
++        for (routing, task_index, implementer, primary, auxiliary) in cases {
++            let route = derive_simple_expected_route(&routing, task_index).expect("valid route");
++            assert_eq!(route.risk_level, routing.tasks[0].risk.level);
++            assert_eq!(route.task_agent_generation, 7);
++            assert_eq!(route.implementer_key, implementer);
++            assert_eq!(route.primary_reviewer_key, primary);
++            assert_eq!(route.auxiliary_reviewer_key.as_deref(), auxiliary);
++        }
++    }
++
++    #[test]
++    fn simple_projection_route_rejects_ambiguous_or_untrusted_shapes() {
++        let valid = simple_routing_fixture(1, "normal", "grok", None);
++        let mut invalid = Vec::new();
++
++        let mut routing = valid.clone();
++        routing.tasks[0].risk.level = "future".into();
++        invalid.push(routing);
++
++        let mut routing = valid.clone();
++        routing.tasks.clear();
++        invalid.push(routing);
++
++        let mut routing = valid.clone();
++        routing.tasks.push(routing.tasks[0].clone());
++        invalid.push(routing);
++
++        let mut routing = valid.clone();
++        routing.task_agent_generations.clear();
++        invalid.push(routing);
++
++        let mut routing = valid.clone();
++        routing.tasks[0].route.reviewers.push(
++            super::super::simple_parse::SimpleTaskReviewerRoute {
++                slot: ReviewerSlot::Auxiliary,
++                agent_type: "grok".into(),
++                profile_id: None,
++            },
++        );
++        invalid.push(routing);
++
++        let mut routing = simple_routing_fixture(1, "high", "grok", None);
++        routing.tasks[0].route.reviewers.reverse();
++        invalid.push(routing);
++
++        let mut routing = valid.clone();
++        routing.tasks[0].route.implementer.profile_id = Some("bad|profile".into());
++        invalid.push(routing);
++
++        let mut routing = valid.clone();
++        routing.task_agent_generations[0].agent_type = "unknown-agent".into();
++        routing.tasks[0].route.implementer.agent_type = "unknown-agent".into();
++        invalid.push(routing);
++
++        let mut routing = valid;
++        routing.tasks[0].route.implementer.agent_type = "codex".into();
++        invalid.push(routing);
++
++        for routing in invalid {
++            assert!(
++                derive_simple_expected_route(&routing, 1).is_err(),
++                "invalid route must not produce trusted keys: {routing:?}"
++            );
++        }
++    }
++
++    #[test]
++    fn simple_projection_warns_once_for_each_progress_route_mismatch() {
++        let routing = simple_routing_fixture(4, "high", "codex", None);
++        let expected = derive_simple_expected_route(&routing, 4).expect("valid route");
++        let baseline = simple_progress_route_fixture(&expected);
++        let mutations: [(&str, Box<dyn Fn(&mut SimpleProgressTask)>); 5] = [
++            (
++                "simple_progress_risk_level_mismatch",
++                Box::new(|task| task.risk_level = Some("normal".into())),
++            ),
++            (
++                "simple_progress_task_agent_generation_mismatch",
++                Box::new(|task| task.task_agent_generation = Some(99)),
++            ),
++            (
++                "simple_progress_implementer_key_mismatch",
++                Box::new(|task| {
++                    task.expected_work_unit_keys.as_mut().unwrap().implementer =
++                        "task|4|implementer|grok|none".into()
++                }),
++            ),
++            (
++                "simple_progress_primary_reviewer_key_mismatch",
++                Box::new(|task| {
++                    task.expected_work_unit_keys
++                        .as_mut()
++                        .unwrap()
++                        .reviewers
++                        .primary = "task|4|reviewer|primary|grok|none".into()
++                }),
++            ),
++            (
++                "simple_progress_auxiliary_reviewer_key_mismatch",
++                Box::new(|task| {
++                    task.expected_work_unit_keys
++                        .as_mut()
++                        .unwrap()
++                        .reviewers
++                        .auxiliary = None
++                }),
++            ),
++        ];
++
++        for (warning, mutate) in mutations {
++            let mut progress = baseline.clone();
++            mutate(&mut progress);
++            let mut warnings = vec![];
++            reconcile_simple_progress_route(&expected, Some(&progress), &mut warnings);
++            reconcile_simple_progress_route(&expected, Some(&progress), &mut warnings);
++            assert_eq!(warnings, vec![warning]);
++        }
++    }
++
++    #[test]
++    fn simple_projection_warns_for_missing_outside_and_shared_child_routes() {
++        use super::super::simple_parse::SimpleProgressRun;
++
++        let routing = simple_routing_fixture(4, "high", "codex", None);
++        let expected = derive_simple_expected_route(&routing, 4).expect("valid route");
++
++        let mut missing_warnings = vec![];
++        reconcile_simple_progress_route(&expected, None, &mut missing_warnings);
++        assert_eq!(
++            missing_warnings,
++            vec!["simple_progress_expected_route_missing"]
++        );
++
++        let mut progress = simple_progress_route_fixture(&expected);
++        let run = |task_id: &str, key: &str, child_conversation_id| SimpleProgressRun {
++            role: "ignored".into(),
++            agent_type: "codex".into(),
++            profile_id: None,
++            task_id: Some(task_id.into()),
++            child_conversation_id,
++            state: "running".into(),
++            work_unit_key: Some(key.into()),
++            recovery_count: None,
++            replaced_task_id: None,
++            replacement_reason: None,
++        };
++        progress.runs = vec![
++            run("impl", &expected.implementer_key, Some(42)),
++            run("primary", &expected.primary_reviewer_key, Some(42)),
++            run("outside-a", "task|4|implementer|grok|none", Some(43)),
++            run("outside-b", "task|4|reviewer|primary|grok|none", Some(44)),
++        ];
++
++        let mut warnings = vec![];
++        reconcile_simple_progress_route(&expected, Some(&progress), &mut warnings);
++        assert_eq!(
++            warnings,
++            vec![
++                "simple_progress_run_outside_expected_route",
++                "simple_progress_route_child_not_independent",
++            ]
++        );
++    }
++
++    #[tokio::test]
++    async fn simple_projection_route_matches_durable_runs_by_complete_key() {
++        let (db, parent) = seed_parent().await;
++        insert_run(
++            &db,
++            parent,
++            "route-match",
++            Some("task|4|reviewer|primary|codex|none"),
++            DelegationRunStatus::Running,
++            1,
++            None,
++            None,
++            "codex",
++        )
++        .await;
++        let run = delegation_task_run::Entity::find_by_id("route-match")
++            .one(&db.conn)
++            .await
++            .expect("query run")
++            .expect("run");
++
++        assert!(run_matches_work_unit_key(
++            &run,
++            "task|4|reviewer|primary|codex|none"
++        ));
++        assert!(!run_matches_work_unit_key(
++            &run,
++            "task|4|reviewer|auxiliary|codex|none"
++        ));
++        assert!(!run_matches_work_unit_key(
++            &run,
++            "task|4|implementer|codex|none"
++        ));
++    }
++
+     #[test]
+     fn sum_elapsed_completed_ms_skips_open_latest_and_adds_finished() {
+         use chrono::{TimeZone, Utc};
+         let t0 = Utc.with_ymd_and_hms(2026, 7, 19, 0, 0, 0).unwrap();
+         let t1 = Utc.with_ymd_and_hms(2026, 7, 19, 0, 5, 0).unwrap(); // 5m
+         let t2 = Utc.with_ymd_and_hms(2026, 7, 19, 0, 10, 0).unwrap();
+         let t3 = Utc.with_ymd_and_hms(2026, 7, 19, 0, 12, 0).unwrap(); // 2m
+ 
+         let finished_a = delegation_task_run::Model {
+             task_id: "a".into(),

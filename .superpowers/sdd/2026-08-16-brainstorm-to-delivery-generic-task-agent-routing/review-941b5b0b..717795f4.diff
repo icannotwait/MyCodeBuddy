@@ -1,0 +1,559 @@
+# Review package: 941b5b0b..717795f4
+
+## Commits
+717795f4 feat(workflow): add slotted reviewer work units
+
+## Files changed
+ src-tauri/src/acp/delegation/workflow/admission.rs |   7 +-
+ src-tauri/src/acp/delegation/workflow/key.rs       | 117 ++++++++++++++++++++-
+ src-tauri/src/acp/delegation/workflow/project.rs   |  41 +++++++-
+ src-tauri/src/acp/delegation/workflow/types.rs     |  34 ++++++
+ 4 files changed, 194 insertions(+), 5 deletions(-)
+
+## Diff
+diff --git a/src-tauri/src/acp/delegation/workflow/admission.rs b/src-tauri/src/acp/delegation/workflow/admission.rs
+index 4246f063..f21ecf05 100644
+--- a/src-tauri/src/acp/delegation/workflow/admission.rs
++++ b/src-tauri/src/acp/delegation/workflow/admission.rs
+@@ -1473,20 +1473,21 @@ fn validate_identity_match(
+     if bind_profile != run_profile {
+         return Err(admission_err(
+             "workflow_profile_mismatch",
+             format!("profile_id {run_profile:?} does not match binding {bind_profile:?}"),
+         ));
+     }
+ 
+     // Role from key vs binding.
+     let (expected_role, expected_phase) = match parsed {
+         ParsedWorkUnitKey::Design { .. } => ("reviewer", "design"),
++        ParsedWorkUnitKey::DesignFixer { .. } => ("fixer", "design"),
+         ParsedWorkUnitKey::PlanAuthor { .. } => ("author", "plan"),
+         ParsedWorkUnitKey::PlanReviewer { .. } => ("reviewer", "plan"),
+         ParsedWorkUnitKey::TaskImplementer { .. } => ("implementer", PHASE_TASKS),
+         ParsedWorkUnitKey::TaskReviewer { .. } => ("reviewer", PHASE_TASKS),
+         ParsedWorkUnitKey::FinalReviewer { .. } => ("reviewer", PHASE_FINAL),
+         ParsedWorkUnitKey::FinalFixer { .. } => ("fixer", PHASE_FINAL),
+     };
+     if binding.role != expected_role {
+         return Err(admission_err(
+             "workflow_role_mismatch",
+@@ -1622,21 +1623,21 @@ async fn resolve_task_route<C: ConnectionTrait>(
+ 
+ async fn enforce_phase_readiness<C: ConnectionTrait>(
+     conn: &C,
+     header: &delegation_workflow::Model,
+     binding: &delegation_workflow_node_binding::Model,
+     parsed: &ParsedWorkUnitKey,
+     kind: AdmissionDispatchKind,
+     admission_class: &AdmissionClass,
+ ) -> Result<(), TaskStoreError> {
+     match parsed {
+-        ParsedWorkUnitKey::PlanAuthor { .. } => Ok(()),
++        ParsedWorkUnitKey::PlanAuthor { .. } | ParsedWorkUnitKey::DesignFixer { .. } => Ok(()),
+         // Document reviewers: only published Design/Plan nodes (already bound).
+         ParsedWorkUnitKey::Design { .. } | ParsedWorkUnitKey::PlanReviewer { .. } => Ok(()),
+ 
+         ParsedWorkUnitKey::TaskImplementer { task_index, .. }
+         | ParsedWorkUnitKey::TaskReviewer { task_index, .. } => {
+             // A8.3: **new** Task first-dispatch blocked while plan re-open / not approved.
+             if matches!(kind, AdmissionDispatchKind::FirstDispatch) {
+                 ensure_plan_approved_for_new_tasks(conn, header).await?;
+                 // Dependency: prior Task gates must pass for task_index > 1.
+                 ensure_prior_task_gates_pass(conn, header, *task_index).await?;
+@@ -2289,21 +2290,23 @@ async fn stamp_admission_fields<C: ConnectionTrait>(
+         Option<String>,
+         Option<i64>,
+         Option<String>,
+         Option<String>,
+         Option<i64>,
+         Option<String>,
+     ),
+     TaskStoreError,
+ > {
+     match parsed {
+-        ParsedWorkUnitKey::PlanAuthor { .. } => Ok((None, None, None, None, None, None)),
++        ParsedWorkUnitKey::PlanAuthor { .. } | ParsedWorkUnitKey::DesignFixer { .. } => {
++            Ok((None, None, None, None, None, None))
++        }
+         ParsedWorkUnitKey::Design { .. } => {
+             let (gate_id, cycle, digest) =
+                 document_gate_stamp(conn, header, binding, parsed).await?;
+             Ok((gate_id, cycle, digest, None, None, None))
+         }
+         ParsedWorkUnitKey::PlanReviewer { .. } => {
+             let (gate_id, cycle, digest) =
+                 document_gate_stamp(conn, header, binding, parsed).await?;
+             let plan_digest = digest
+                 .as_deref()
+diff --git a/src-tauri/src/acp/delegation/workflow/key.rs b/src-tauri/src/acp/delegation/workflow/key.rs
+index e9e98715..19af9d6b 100644
+--- a/src-tauri/src/acp/delegation/workflow/key.rs
++++ b/src-tauri/src/acp/delegation/workflow/key.rs
+@@ -1,17 +1,19 @@
+ //! Canonical A1/B1 `work_unit_key` derivation and recognition.
+ 
+ use unicode_normalization::UnicodeNormalization;
+ 
+ use crate::models::agent::AgentType;
+ 
+-use super::types::{ParsedWorkUnitKey, WorkUnitKeyParts, WorkflowError, MAX_WORK_UNIT_KEY_LEN};
++use super::types::{
++    ParsedWorkUnitKey, ReviewerSlot, WorkUnitKeyParts, WorkflowError, MAX_WORK_UNIT_KEY_LEN,
++};
+ 
+ /// Normalize a workspace-relative path to the B1 stored form:
+ /// UTF-8 NFC, separators → `/`, reject `|` / absolute / empty / `..` / controls,
+ /// and lowercase the path field on Windows before key construction.
+ pub fn normalize_rel_path(path: &str) -> Result<String, WorkflowError> {
+     if path.is_empty() {
+         return Err(WorkflowError::InvalidPath("empty path".into()));
+     }
+     if path.contains('|') {
+         return Err(WorkflowError::InvalidPath(
+@@ -87,20 +89,30 @@ pub fn build_work_unit_key(parts: &WorkUnitKeyParts<'_>) -> Result<String, Workf
+         WorkUnitKeyParts::Design {
+             rel_doc_path,
+             agent_type,
+             profile_id,
+         } => {
+             let path = normalize_rel_path(rel_doc_path)?;
+             let agent = validate_agent_type(agent_type)?;
+             let profile = profile_token(profile_id)?;
+             format!("design|{path}|reviewer|{agent}|{profile}")
+         }
++        WorkUnitKeyParts::DesignFixer {
++            rel_doc_path,
++            agent_type,
++            profile_id,
++        } => {
++            let path = normalize_rel_path(rel_doc_path)?;
++            let agent = validate_agent_type(agent_type)?;
++            let profile = profile_token(profile_id)?;
++            format!("design|{path}|fixer|{agent}|{profile}")
++        }
+         WorkUnitKeyParts::PlanAuthor {
+             rel_plan_path,
+             agent_type,
+             profile_id,
+         } => {
+             let path = normalize_rel_path(rel_plan_path)?;
+             let agent = validate_agent_type(agent_type)?;
+             let profile = profile_token(profile_id)?;
+             format!("plan|{path}|author|{agent}|{profile}")
+         }
+@@ -127,20 +139,32 @@ pub fn build_work_unit_key(parts: &WorkUnitKeyParts<'_>) -> Result<String, Workf
+         WorkUnitKeyParts::TaskReviewer {
+             task_index,
+             agent_type,
+             profile_id,
+         } => {
+             validate_task_index(*task_index)?;
+             let agent = validate_agent_type(agent_type)?;
+             let profile = profile_token(profile_id)?;
+             format!("task|{task_index}|reviewer|{agent}|{profile}")
+         }
++        WorkUnitKeyParts::TaskReviewerSlotted {
++            task_index,
++            slot,
++            agent_type,
++            profile_id,
++        } => {
++            validate_task_index(*task_index)?;
++            let agent = validate_agent_type(agent_type)?;
++            let profile = profile_token(profile_id)?;
++            let slot = slot.as_str();
++            format!("task|{task_index}|reviewer|{slot}|{agent}|{profile}")
++        }
+         WorkUnitKeyParts::FinalReviewer {
+             agent_type,
+             profile_id,
+         } => {
+             let agent = validate_agent_type(agent_type)?;
+             let profile = profile_token(profile_id)?;
+             format!("final_review|reviewer|{agent}|{profile}")
+         }
+         WorkUnitKeyParts::FinalFixer {
+             agent_type,
+@@ -178,20 +202,33 @@ pub fn parse_recognized_work_unit_key(key: &str) -> Option<ParsedWorkUnitKey> {
+                 return None;
+             }
+             let agent_type = validate_agent_type(agent).ok()?.to_string();
+             let profile_id = parse_profile(profile)?;
+             Some(ParsedWorkUnitKey::Design {
+                 rel_doc_path: rel,
+                 agent_type,
+                 profile_id,
+             })
+         }
++        ["design", path, "fixer", agent, profile] => {
++            let rel = normalize_rel_path(path).ok()?;
++            if rel != *path {
++                return None;
++            }
++            let agent_type = validate_agent_type(agent).ok()?.to_string();
++            let profile_id = parse_profile(profile)?;
++            Some(ParsedWorkUnitKey::DesignFixer {
++                rel_doc_path: rel,
++                agent_type,
++                profile_id,
++            })
++        }
+         ["plan", path, "author", agent, profile] => {
+             let rel = normalize_rel_path(path).ok()?;
+             if rel != *path {
+                 return None;
+             }
+             let profile_id = parse_profile(profile)?;
+             let agent_type = validate_agent_type(agent).ok()?.to_string();
+             Some(ParsedWorkUnitKey::PlanAuthor {
+                 rel_plan_path: rel,
+                 agent_type,
+@@ -214,26 +251,43 @@ pub fn parse_recognized_work_unit_key(key: &str) -> Option<ParsedWorkUnitKey> {
+         ["task", index, "implementer", agent, profile] => {
+             let task_index = parse_task_index_str(index)?;
+             let agent_type = validate_agent_type(agent).ok()?.to_string();
+             let profile_id = parse_profile(profile)?;
+             Some(ParsedWorkUnitKey::TaskImplementer {
+                 task_index,
+                 agent_type,
+                 profile_id,
+             })
+         }
++        ["task", index, "reviewer", slot, agent, profile] => {
++            let task_index = parse_task_index_str(index)?;
++            let slot = match *slot {
++                "primary" => ReviewerSlot::Primary,
++                "auxiliary" => ReviewerSlot::Auxiliary,
++                _ => return None,
++            };
++            let agent_type = validate_agent_type(agent).ok()?.to_string();
++            let profile_id = parse_profile(profile)?;
++            Some(ParsedWorkUnitKey::TaskReviewer {
++                task_index,
++                slot,
++                agent_type,
++                profile_id,
++            })
++        }
+         ["task", index, "reviewer", agent, profile] => {
+             let task_index = parse_task_index_str(index)?;
+             let agent_type = validate_agent_type(agent).ok()?.to_string();
+             let profile_id = parse_profile(profile)?;
+             Some(ParsedWorkUnitKey::TaskReviewer {
+                 task_index,
++                slot: ReviewerSlot::Primary,
+                 agent_type,
+                 profile_id,
+             })
+         }
+         ["final_review", "reviewer", agent, profile] => {
+             let agent_type = validate_agent_type(agent).ok()?.to_string();
+             let profile_id = parse_profile(profile)?;
+             Some(ParsedWorkUnitKey::FinalReviewer {
+                 agent_type,
+                 profile_id,
+@@ -412,20 +466,81 @@ mod tests {
+         assert_eq!(final_rev, "final_review|reviewer|codex|none");
+ 
+         let final_fix = build_work_unit_key(&WorkUnitKeyParts::FinalFixer {
+             agent_type: "grok",
+             profile_id: None,
+         })
+         .unwrap();
+         assert_eq!(final_fix, "final_review|fixer|grok|none");
+     }
+ 
++    #[test]
++    fn design_fixer_and_slotted_reviewers_round_trip() {
++        let fixer = build_work_unit_key(&WorkUnitKeyParts::DesignFixer {
++            rel_doc_path: "docs/design.md",
++            agent_type: "codex",
++            profile_id: None,
++        })
++        .unwrap();
++        assert_eq!(fixer, "design|docs/design.md|fixer|codex|none");
++        assert!(matches!(
++            parse_recognized_work_unit_key(&fixer),
++            Some(ParsedWorkUnitKey::DesignFixer { .. })
++        ));
++
++        for (slot, expected) in [
++            (ReviewerSlot::Primary, "task|7|reviewer|primary|codex|none"),
++            (
++                ReviewerSlot::Auxiliary,
++                "task|7|reviewer|auxiliary|codex|none",
++            ),
++        ] {
++            let key = build_work_unit_key(&WorkUnitKeyParts::TaskReviewerSlotted {
++                task_index: 7,
++                slot,
++                agent_type: "codex",
++                profile_id: None,
++            })
++            .unwrap();
++            assert_eq!(key, expected);
++            assert!(matches!(
++                parse_recognized_work_unit_key(&key),
++                Some(ParsedWorkUnitKey::TaskReviewer {
++                    task_index: 7,
++                    slot: parsed,
++                    ..
++                }) if parsed == slot
++            ));
++        }
++    }
++
++    #[test]
++    fn legacy_task_reviewer_is_primary_and_invalid_slots_fail() {
++        assert!(matches!(
++            parse_recognized_work_unit_key("task|7|reviewer|codex|none"),
++            Some(ParsedWorkUnitKey::TaskReviewer {
++                task_index: 7,
++                slot: ReviewerSlot::Primary,
++                ..
++            })
++        ));
++        for key in [
++            "task|7|reviewer|secondary|codex|none",
++            "task|0|reviewer|primary|codex|none",
++            "task|7|reviewer|primary|unknown-agent|none",
++            "design|../design.md|fixer|codex|none",
++            "design|docs/design.md|fixer|codex|bad|profile",
++        ] {
++            assert_eq!(parse_recognized_work_unit_key(key), None, "{key}");
++        }
++    }
++
+     #[test]
+     fn parse_round_trips_recognized_keys() {
+         let key = "design|docs/superpowers/specs/x.md|reviewer|code_buddy|a1c14cde-f9c0-4fce-9d7f-66c3f8e85039";
+         let parsed = parse_recognized_work_unit_key(key).expect("recognized");
+         match parsed {
+             ParsedWorkUnitKey::Design {
+                 rel_doc_path,
+                 agent_type,
+                 profile_id,
+             } => {
+diff --git a/src-tauri/src/acp/delegation/workflow/project.rs b/src-tauri/src/acp/delegation/workflow/project.rs
+index 42ded21d..3109181c 100644
+--- a/src-tauri/src/acp/delegation/workflow/project.rs
++++ b/src-tauri/src/acp/delegation/workflow/project.rs
+@@ -2696,45 +2696,49 @@ async fn project_observed_only(
+         phases,
+         nodes,
+         edges: vec![],
+         gates: vec![],
+     }))
+ }
+ 
+ fn parsed_meta(parsed: &ParsedWorkUnitKey) -> (String, String, Option<u32>) {
+     match parsed {
+         ParsedWorkUnitKey::Design { .. } => ("design".into(), "reviewer".into(), None),
++        ParsedWorkUnitKey::DesignFixer { .. } => ("design".into(), "fixer".into(), None),
+         ParsedWorkUnitKey::PlanAuthor { .. } => ("plan".into(), "author".into(), None),
+         ParsedWorkUnitKey::PlanReviewer { .. } => ("plan".into(), "reviewer".into(), None),
+         ParsedWorkUnitKey::TaskImplementer { task_index, .. } => {
+             ("tasks".into(), "implementer".into(), Some(*task_index))
+         }
+         ParsedWorkUnitKey::TaskReviewer { task_index, .. } => {
+             ("tasks".into(), "reviewer".into(), Some(*task_index))
+         }
+         ParsedWorkUnitKey::FinalReviewer { .. } => ("final".into(), "reviewer".into(), None),
+         ParsedWorkUnitKey::FinalFixer { .. } => ("final".into(), "fixer".into(), None),
+     }
+ }
+ 
+ /// Stable synthetic node id from work-unit key content (not HashMap order).
+ fn synthetic_node_id(parsed: &ParsedWorkUnitKey, work_unit_key: &str) -> String {
+     let key_tag = short_key_tag(work_unit_key);
+     match parsed {
+         ParsedWorkUnitKey::Design { .. } => format!("observed-design-{key_tag}"),
++        ParsedWorkUnitKey::DesignFixer { .. } => format!("observed-design-fixer-{key_tag}"),
+         ParsedWorkUnitKey::PlanAuthor { .. } => format!("observed-plan-author-{key_tag}"),
+         ParsedWorkUnitKey::PlanReviewer { .. } => format!("observed-plan-reviewer-{key_tag}"),
+         ParsedWorkUnitKey::TaskImplementer { task_index, .. } => {
+             format!("observed-task-{task_index}-impl")
+         }
+-        ParsedWorkUnitKey::TaskReviewer { task_index, .. } => {
+-            format!("observed-task-{task_index}-rev")
++        ParsedWorkUnitKey::TaskReviewer {
++            task_index, slot, ..
++        } => {
++            format!("observed-task-{task_index}-rev-{}-{key_tag}", slot.as_str())
+         }
+         ParsedWorkUnitKey::FinalReviewer { .. } => format!("observed-final-rev-{key_tag}"),
+         ParsedWorkUnitKey::FinalFixer { .. } => format!("observed-final-fix-{key_tag}"),
+     }
+ }
+ 
+ fn short_key_tag(work_unit_key: &str) -> String {
+     let hex = sha256_hex_str(work_unit_key);
+     hex[..12.min(hex.len())].to_string()
+ }
+@@ -6475,11 +6479,44 @@ mod tests {
+     fn simple_projection_warning_codes_are_deduplicated_and_bounded() {
+         let mut warnings = Vec::new();
+         push_projection_warning(&mut warnings, "duplicate");
+         push_projection_warning(&mut warnings, "duplicate");
+         for index in 0..100 {
+             push_projection_warning(&mut warnings, &format!("warning-{index}"));
+         }
+         assert_eq!(warnings.first().map(String::as_str), Some("duplicate"));
+         assert_eq!(warnings.len(), 64);
+     }
++
++    #[test]
++    fn observed_projection_slotted_keys_have_distinct_synthetic_ids() {
++        let keys = [
++            "task|7|reviewer|primary|codex|none",
++            "task|7|reviewer|auxiliary|codex|none",
++            "design|docs/design.md|fixer|codex|none",
++        ];
++        let parsed = keys
++            .iter()
++            .map(|key| parse_recognized_work_unit_key(key).expect("recognized key"))
++            .collect::<Vec<_>>();
++
++        assert_eq!(
++            parsed_meta(&parsed[0]),
++            ("tasks".into(), "reviewer".into(), Some(7))
++        );
++        assert_eq!(
++            parsed_meta(&parsed[1]),
++            ("tasks".into(), "reviewer".into(), Some(7))
++        );
++        assert_eq!(
++            parsed_meta(&parsed[2]),
++            ("design".into(), "fixer".into(), None)
++        );
++
++        let ids = parsed
++            .iter()
++            .zip(keys)
++            .map(|(parsed, key)| synthetic_node_id(parsed, key))
++            .collect::<BTreeSet<_>>();
++        assert_eq!(ids.len(), 3);
++    }
+ }
+diff --git a/src-tauri/src/acp/delegation/workflow/types.rs b/src-tauri/src/acp/delegation/workflow/types.rs
+index 5abdaf44..adc2c108 100644
+--- a/src-tauri/src/acp/delegation/workflow/types.rs
++++ b/src-tauri/src/acp/delegation/workflow/types.rs
+@@ -413,83 +413,117 @@ pub enum WorkflowError {
+     #[error("invalid agent type: {0}")]
+     InvalidAgentType(String),
+     #[error("invalid task index: {0}")]
+     InvalidTaskIndex(String),
+     #[error(transparent)]
+     RiskAssessmentInvalid(Box<WorkflowError>),
+     #[error(transparent)]
+     TaskRouteMismatch(Box<WorkflowError>),
+ }
+ 
++/// Stable identity for one Task reviewer in a multi-reviewer route.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(rename_all = "snake_case")]
++pub enum ReviewerSlot {
++    Primary,
++    Auxiliary,
++}
++
++impl ReviewerSlot {
++    pub const fn as_str(self) -> &'static str {
++        match self {
++            Self::Primary => "primary",
++            Self::Auxiliary => "auxiliary",
++        }
++    }
++}
++
+ /// Materials used to build a canonical A1 `work_unit_key`.
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub enum WorkUnitKeyParts<'a> {
+     Design {
+         rel_doc_path: &'a str,
+         agent_type: &'a str,
+         profile_id: Option<&'a str>,
+     },
++    DesignFixer {
++        rel_doc_path: &'a str,
++        agent_type: &'a str,
++        profile_id: Option<&'a str>,
++    },
+     PlanAuthor {
+         rel_plan_path: &'a str,
+         agent_type: &'a str,
+         profile_id: Option<&'a str>,
+     },
+     PlanReviewer {
+         rel_plan_path: &'a str,
+         agent_type: &'a str,
+         profile_id: Option<&'a str>,
+     },
+     TaskImplementer {
+         task_index: u32,
+         agent_type: &'a str,
+         profile_id: Option<&'a str>,
+     },
+     TaskReviewer {
+         task_index: u32,
+         agent_type: &'a str,
+         profile_id: Option<&'a str>,
+     },
++    TaskReviewerSlotted {
++        task_index: u32,
++        slot: ReviewerSlot,
++        agent_type: &'a str,
++        profile_id: Option<&'a str>,
++    },
+     FinalReviewer {
+         agent_type: &'a str,
+         profile_id: Option<&'a str>,
+     },
+     FinalFixer {
+         agent_type: &'a str,
+         profile_id: Option<&'a str>,
+     },
+ }
+ 
+ /// Result of parsing a recognized A1-grammar work unit key (A11).
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub enum ParsedWorkUnitKey {
+     Design {
+         rel_doc_path: String,
+         agent_type: String,
+         profile_id: Option<String>,
+     },
++    DesignFixer {
++        rel_doc_path: String,
++        agent_type: String,
++        profile_id: Option<String>,
++    },
+     PlanAuthor {
+         rel_plan_path: String,
+         agent_type: String,
+         profile_id: Option<String>,
+     },
+     PlanReviewer {
+         rel_plan_path: String,
+         agent_type: String,
+         profile_id: Option<String>,
+     },
+     TaskImplementer {
+         task_index: u32,
+         agent_type: String,
+         profile_id: Option<String>,
+     },
+     TaskReviewer {
+         task_index: u32,
++        slot: ReviewerSlot,
+         agent_type: String,
+         profile_id: Option<String>,
+     },
+     FinalReviewer {
+         agent_type: String,
+         profile_id: Option<String>,
+     },
+     FinalFixer {
+         agent_type: String,
+         profile_id: Option<String>,
