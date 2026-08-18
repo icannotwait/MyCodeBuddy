@@ -18,6 +18,7 @@ use std::time::Duration;
 use sea_orm::{DatabaseConnection, EntityTrait, TransactionTrait};
 use tokio::sync::{broadcast, mpsc};
 
+use crate::acp::cursor_enrichment::CursorStoreEnricher;
 use crate::acp::delegation::broker::{DelegationBroker, DelegationMatchKey};
 use crate::acp::delegation::types::{
     validate_correlation_id, DelegationError, DelegationOutcome, DelegationSuccess,
@@ -1937,16 +1938,21 @@ mod delegation_registration_tests {
     //! synthetic id before the move: args arriving on a `ToolCallUpdate`, and
     //! a key backfilled by a later update.
 
-    use super::register_delegation_tool_call_from_event;
+    use super::{register_delegation_tool_call_from_event, run_broker_tool_side_effects};
+    use crate::acp::cursor_enrichment::test_support::{FixedStore, MapSessions, SleepThenStore};
+    use crate::acp::cursor_enrichment::{CursorEnrichmentSession, CursorStoreEnricher};
+    use crate::acp::cursor_store::CursorStoredToolCall;
     use crate::acp::delegation::broker::{
         ConversationDepthLookup, DelegationBroker, DelegationMatchKey,
     };
     use crate::acp::delegation::spawner::{mock::MockSpawner, ConnectionSpawner};
     use crate::acp::delegation::types::DelegationError;
+    use crate::acp::internal_bus::InternalEventEnvelope;
     use crate::acp::types::{AcpEvent, EventEnvelope};
     use crate::models::AgentType;
     use async_trait::async_trait;
     use std::sync::Arc;
+    use std::time::Duration;
 
     struct RootDepth;
     #[async_trait]
@@ -2412,6 +2418,103 @@ mod delegation_registration_tests {
             "args-wrapped delegation input must produce a keyed entry"
         );
     }
+
+    /// The headline Task 5 wiring test: `run_broker_tool_side_effects` must
+    /// register the identity-less Cursor announcement with the broker
+    /// BEFORE calling `enricher.maybe_schedule` — otherwise the store-backed
+    /// backfill has nothing to attach to and silently no-ops (`Stale`).
+    #[tokio::test]
+    async fn run_broker_tool_side_effects_registers_then_enriches() {
+        let b = Arc::new(broker());
+        let id = "call-cursor-1\nfc_abc_0";
+        let env = tool_call_event(id, "MCP: tool", Some("{}"));
+        let store = Arc::new(FixedStore(CursorStoredToolCall {
+            tool_name: "mcp__codeg-mcp__delegate_to_agent".into(),
+            args: serde_json::json!({
+                "agent_type": "codex",
+                "task": "build it",
+                "correlation_id": "test-corr"
+            }),
+        }));
+        let sessions = Arc::new(MapSessions(std::sync::Mutex::new(
+            [(
+                "parent-conn".into(),
+                CursorEnrichmentSession {
+                    agent_type: AgentType::Cursor,
+                    external_session_id: "0198c9aa-1111-2222-3333-444455556666".into(),
+                },
+            )]
+            .into(),
+        )));
+        let enricher = CursorStoreEnricher::new(store, sessions, b.clone(), b.metrics());
+        let internal = InternalEventEnvelope {
+            event: Arc::new(env),
+            completion: None,
+        };
+        run_broker_tool_side_effects(b.as_ref(), &internal, Some(&enricher)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(b.metrics().snapshot().cursor_enrichment_scheduled, 1);
+        assert_eq!(
+            b.take_matching_tool_call("parent-conn", &codex_key("build it"))
+                .await
+                .as_deref(),
+            Some(id)
+        );
+    }
+
+    /// A terminal `ToolCallUpdate` that lands WHILE the store lookup is
+    /// still in flight must tombstone the entry, and the eventual (late)
+    /// store resolution must NOT resurrect it — the tombstone is the
+    /// permanent winner, never the late backfill.
+    #[tokio::test]
+    async fn terminal_event_during_lookup_prevents_late_backfill() {
+        let b = Arc::new(broker());
+        let id = "tc-term";
+        let env = tool_call_event(id, "MCP: tool", Some("{}"));
+        let store = Arc::new(SleepThenStore {
+            delay: Duration::from_millis(200),
+            result: Ok(CursorStoredToolCall {
+                tool_name: "delegate_to_agent".into(),
+                args: serde_json::json!({
+                    "agent_type": "codex",
+                    "task": "build it",
+                    "correlation_id": "test-corr"
+                }),
+            }),
+        });
+        let enricher = CursorStoreEnricher::new(
+            store,
+            Arc::new(MapSessions(std::sync::Mutex::new(
+                [(
+                    "parent-conn".into(),
+                    CursorEnrichmentSession {
+                        agent_type: AgentType::Cursor,
+                        external_session_id: "0198c9aa-1111-2222-3333-444455556666".into(),
+                    },
+                )]
+                .into(),
+            ))),
+            b.clone(),
+            b.metrics(),
+        );
+        let internal = InternalEventEnvelope {
+            event: Arc::new(env),
+            completion: None,
+        };
+        run_broker_tool_side_effects(b.as_ref(), &internal, Some(&enricher)).await;
+        register_delegation_tool_call_from_event(
+            &b,
+            &tool_call_update_event_with_status(id, Some("completed"), None),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            b.take_matching_tool_call("parent-conn", &codex_key("build it"))
+                .await
+                .is_none(),
+            "tombstone must win over late store backfill"
+        );
+    }
 }
 
 /// Per-connection worker that owns the cache for one connection and
@@ -2828,10 +2931,74 @@ fn install_test_broker_tool_stall(
     });
 }
 
+/// Test-only injection point for [`enricher_for_lifecycle`] so lifecycle
+/// dispatcher tests (which construct a real [`DelegationBroker`] and spawn
+/// [`lifecycle_subscriber_task`]) never fall through to the production
+/// branch and open `~/.cursor`. `None` (the default) means "no enrichment" —
+/// exactly the desired behavior for every existing lifecycle test that
+/// doesn't care about Cursor store correlation.
+#[cfg(test)]
+static TEST_CURSOR_ENRICHER: std::sync::Mutex<Option<Arc<CursorStoreEnricher>>> =
+    std::sync::Mutex::new(None);
+
+/// Install (or clear, with `None`) the test-only [`CursorStoreEnricher`]
+/// returned by [`enricher_for_lifecycle`] under `#[cfg(test)]`. Test-only;
+/// production always takes the `#[cfg(not(test))]` branch below.
+#[cfg(test)]
+pub(crate) fn install_test_cursor_enricher(enricher: Option<Arc<CursorStoreEnricher>>) {
+    *TEST_CURSOR_ENRICHER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = enricher;
+}
+
+/// The single production construction path for the Cursor-store enrichment
+/// coordinator. Called from [`lifecycle_subscriber_task`] only — no other
+/// call site may construct a second production [`CursorStoreEnricher`].
+/// Under `#[cfg(test)]` this never touches [`CursorStoreReader::production`]
+/// (and therefore never opens `~/.cursor`): it returns whatever
+/// [`install_test_cursor_enricher`] last installed (`None` by default).
+fn enricher_for_lifecycle(
+    broker: &DelegationBroker,
+    manager: &ConnectionManager,
+) -> Option<Arc<CursorStoreEnricher>> {
+    #[cfg(test)]
+    {
+        let _ = (broker, manager);
+        return TEST_CURSOR_ENRICHER
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+    }
+    #[cfg(not(test))]
+    {
+        use crate::acp::cursor_store::CursorStoreReader;
+        Some(Arc::new(CursorStoreEnricher::new(
+            Arc::new(CursorStoreReader::production()),
+            Arc::new(manager.clone_ref()),
+            Arc::new(broker.clone()),
+            broker.metrics(),
+        )))
+    }
+}
+
 /// Run parent tool_call registration + child runtime projection for one
-/// envelope. Always invoked from the dedicated broker-tool worker (never
-/// from the lifecycle `select!` branch).
-async fn run_broker_tool_side_effects(broker: &DelegationBroker, envelope: &InternalEventEnvelope) {
+/// envelope, plus (when `enricher` is `Some`) scheduling a best-effort
+/// Cursor-store enrichment lookup for identity-less MCP announcements.
+/// Always invoked from the dedicated broker-tool worker (never from the
+/// lifecycle `select!` branch).
+///
+/// Ordering is load-bearing: registration MUST land before
+/// `maybe_schedule`. The enrichment lookup's eventual
+/// `backfill_identityless_match_key` call only succeeds against an
+/// already-registered identity-less pending id — scheduling first would
+/// race the lookup against a not-yet-registered entry and backfill
+/// `Stale` every time. `maybe_schedule` itself is synchronous and
+/// non-blocking (see its type docs), so it never gets an `.await`.
+pub(crate) async fn run_broker_tool_side_effects(
+    broker: &DelegationBroker,
+    envelope: &InternalEventEnvelope,
+    enricher: Option<&CursorStoreEnricher>,
+) {
     #[cfg(test)]
     {
         let stall = {
@@ -2852,6 +3019,9 @@ async fn run_broker_tool_side_effects(broker: &DelegationBroker, envelope: &Inte
         }
     }
     register_delegation_tool_call_from_event(broker, envelope.event.as_ref()).await;
+    if let Some(enricher) = enricher {
+        enricher.maybe_schedule(envelope.event.as_ref());
+    }
     broker
         .project_child_tool_event(&envelope.connection_id, &envelope.payload)
         .await;
@@ -2930,6 +3100,13 @@ pub fn lifecycle_subscriber_task(
     let metrics = Arc::clone(bus.metrics());
 
     async move {
+        // Single production construction path for the Cursor-store
+        // enrichment coordinator — see `enricher_for_lifecycle`'s docs.
+        // `None` when there's no broker at all (delegation feature off).
+        let enricher: Option<Arc<CursorStoreEnricher>> = broker
+            .as_ref()
+            .and_then(|b| enricher_for_lifecycle(b.as_ref(), &manager));
+
         // Off-select serial worker for broker tool side-effects. Spawned
         // inside the async body so we are on a Tokio runtime (this function
         // is often constructed before `tauri::async_runtime::spawn`).
@@ -2937,9 +3114,11 @@ pub fn lifecycle_subscriber_task(
             let (tx, mut tool_rx) =
                 mpsc::channel::<Arc<InternalEventEnvelope>>(BROKER_TOOL_QUEUE_CAPACITY);
             let b = Arc::clone(b);
+            let enricher = enricher.clone();
             tokio::spawn(async move {
                 while let Some(env) = tool_rx.recv().await {
-                    run_broker_tool_side_effects(b.as_ref(), env.as_ref()).await;
+                    run_broker_tool_side_effects(b.as_ref(), env.as_ref(), enricher.as_deref())
+                        .await;
                 }
             });
             tx

@@ -21638,6 +21638,78 @@ mod tests {
         );
     }
 
+    /// Two identity-less Cursor announcements each get their own store-backed
+    /// key backfilled — with the store completions landing in the OPPOSITE
+    /// order from registration (B before A), and the MCP round-trip claims
+    /// also arriving reversed relative to each other. Every id must still
+    /// bind to its own key: no FIFO fallback, no cross-wired card.
+    #[tokio::test]
+    async fn two_cursor_keys_bind_own_ids_when_backfill_and_claim_reverse() {
+        let broker = DelegationBroker::new(
+            Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        );
+        let ka = key_with_corr("ka", "task A");
+        let kb = key_with_corr("kb", "task B");
+        broker
+            .register_identityless_tool_call("p1", "id-A".into())
+            .await;
+        broker
+            .register_identityless_tool_call("p1", "id-B".into())
+            .await;
+        // Store completion reversed: B then A.
+        assert_eq!(
+            broker
+                .backfill_identityless_match_key("p1", "id-B", kb.clone())
+                .await,
+            IdentitylessBackfillResult::Applied
+        );
+        assert_eq!(
+            broker
+                .backfill_identityless_match_key("p1", "id-A", ka.clone())
+                .await,
+            IdentitylessBackfillResult::Applied
+        );
+        // MCP arrival reversed relative to ACP: claim A then B or B then A — same bindings.
+        let claim_b = broker.resolve_exact_claim("p1", &kb, None, None).await;
+        let claim_a = broker.resolve_exact_claim("p1", &ka, None, None).await;
+        assert_eq!(claim_b, ExactClaimResult::Matched("id-B".into()));
+        assert_eq!(claim_a, ExactClaimResult::Matched("id-A".into()));
+    }
+
+    /// Two identity-less ids that both get backfilled to the SAME recovered
+    /// key (a genuine ambiguous case — the store gave two Cursor
+    /// announcements identical delegation args) must stay `Ambiguous` and
+    /// leave BOTH cards in `pending` rather than guessing a winner.
+    #[tokio::test]
+    async fn identical_backfilled_keys_stay_ambiguous() {
+        let broker = DelegationBroker::new(
+            Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        );
+        let k = key_with_corr("same", "same task");
+        broker
+            .register_identityless_tool_call("p1", "id-A".into())
+            .await;
+        broker
+            .register_identityless_tool_call("p1", "id-B".into())
+            .await;
+        broker
+            .backfill_identityless_match_key("p1", "id-A", k.clone())
+            .await;
+        broker
+            .backfill_identityless_match_key("p1", "id-B", k.clone())
+            .await;
+        assert_eq!(
+            broker.resolve_exact_claim("p1", &k, None, None).await,
+            ExactClaimResult::Ambiguous
+        );
+        let map = broker.tool_calls.inner.lock().await;
+        let pending = &map.get("p1").unwrap().pending;
+        assert_eq!(pending.len(), 2, "Ambiguous must not consume either card");
+        assert!(pending.iter().all(|p| p.match_key.as_ref() == Some(&k)));
+    }
+
     #[tokio::test]
     async fn parallel_delegations_bind_by_key_regardless_of_order() {
         // Two `delegate_to_agent` calls fire in parallel; both ACP tool_call

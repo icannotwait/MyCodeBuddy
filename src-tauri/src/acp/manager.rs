@@ -6477,7 +6477,7 @@ impl ConnectionManager {
         }
     }
 
-    async fn agent_type_for_connection(
+    pub(crate) async fn agent_type_for_connection(
         &self,
         connection_id: &str,
     ) -> Option<crate::models::AgentType> {
