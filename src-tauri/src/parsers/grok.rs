@@ -307,6 +307,16 @@ impl GrokParser {
         }
         None
     }
+
+    fn find_session_dir_loose(&self, conversation_id: &str) -> Option<PathBuf> {
+        for group in read_subdirs(&self.base_dir) {
+            let candidate = group.join(conversation_id);
+            if candidate.is_dir() {
+                return Some(candidate);
+            }
+        }
+        None
+    }
 }
 
 impl Default for GrokParser {
@@ -348,9 +358,14 @@ impl AgentParser for GrokParser {
 
 /// Locate `updates.jsonl` for an external Grok session id the same way
 /// [`GrokParser`] resolves conversation detail.
+///
+/// Returns the expected path when the session directory exists even if the
+/// file has not been created yet, so a later tail can retry `is_file()`.
 pub(crate) fn grok_updates_jsonl_path(session_id: &str) -> Option<PathBuf> {
-    GrokParser::new()
+    let parser = GrokParser::new();
+    parser
         .find_session_dir(session_id)
+        .or_else(|| parser.find_session_dir_loose(session_id))
         .map(|dir| dir.join("updates.jsonl"))
 }
 

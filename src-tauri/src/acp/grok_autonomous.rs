@@ -111,6 +111,7 @@ impl Episode {
 
 struct Tombstone {
     trigger_start: u64,
+    task_ids: Vec<String>,
     at: Instant,
 }
 
@@ -164,8 +165,11 @@ impl GrokAutonomousAdapter {
     pub(crate) fn on_session_ready(&mut self, session_id: &str, updates_jsonl_path: &Path) {
         self.session_id = session_id.to_string();
         if updates_jsonl_path.as_os_str().is_empty() {
-            self.updates_path = None;
-            self.baseline_ready = false;
+            if let Some(resolved) = self.resolve_updates_path() {
+                self.adopt_updates_path(&resolved);
+            } else {
+                self.baseline_ready = false;
+            }
             return;
         }
         self.updates_path = Some(updates_jsonl_path.to_path_buf());
@@ -294,7 +298,7 @@ impl GrokAutonomousAdapter {
         if !self.episode.is_active() {
             return;
         }
-        let Some(path) = self.updates_path.clone() else {
+        let Some(path) = self.resolve_updates_path() else {
             return;
         };
         let Ok(bytes) = std::fs::read(&path) else {
@@ -308,17 +312,27 @@ impl GrokAutonomousAdapter {
         }
 
         if self.episode.trigger_start.is_none() {
-            if let Some((offset, task_ids)) = find_hidden_trigger(&bytes, self.episode.tail_from) {
-                if self.is_tombstoned(offset) {
+            match find_hidden_trigger(&bytes, self.episode.tail_from) {
+                Some((offset, _)) if self.is_tombstoned(offset) => {
                     self.episode.phase = EpisodePhase::Closed;
                     return;
                 }
-                if self.episode.task_ids.is_empty() {
-                    self.episode.task_ids = task_ids;
+                Some((offset, task_ids)) => {
+                    if self.episode.task_ids.is_empty() {
+                        self.episode.task_ids = task_ids;
+                    }
+                    self.episode.trigger_start = Some(offset);
+                    if self.episode.phase == EpisodePhase::Opening {
+                        self.episode.phase = EpisodePhase::Open;
+                    }
                 }
-                self.episode.trigger_start = Some(offset);
-                if self.episode.phase == EpisodePhase::Opening {
-                    self.episode.phase = EpisodePhase::Open;
+                None => {
+                    if find_hidden_trigger(&bytes, 0)
+                        .is_some_and(|(offset, _)| self.is_tombstoned(offset))
+                    {
+                        self.episode.phase = EpisodePhase::Closed;
+                        return;
+                    }
                 }
             }
         }
@@ -420,13 +434,20 @@ impl GrokAutonomousAdapter {
         let matches_settled = task_ids
             .iter()
             .any(|id| self.recently_settled.iter().any(|s| s.id == *id));
-        if !matches_settled && !adjacent {
-            return GrokDispatchClaim::Unclaimed;
-        }
 
         if self.episode.is_active() {
             return GrokDispatchClaim::AutonomousContent;
         }
+
+        if self.tombstone_covers_task_ids(&task_ids) && !adjacent {
+            return GrokDispatchClaim::Unclaimed;
+        }
+
+        if !matches_settled && !adjacent {
+            return GrokDispatchClaim::Unclaimed;
+        }
+
+        self.consume_settled_ids(&task_ids);
 
         self.episode = Episode {
             phase: EpisodePhase::Opening,
@@ -449,6 +470,7 @@ impl GrokAutonomousAdapter {
         if let Some(trigger_start) = self.episode.trigger_start {
             self.tombstones.push_back(Tombstone {
                 trigger_start,
+                task_ids: self.episode.task_ids.clone(),
                 at: Instant::now(),
             });
             while self.tombstones.len() > TOMBSTONE_CAP {
@@ -525,6 +547,55 @@ impl GrokAutonomousAdapter {
         self.tombstones
             .iter()
             .any(|t| t.trigger_start == trigger_start)
+    }
+
+    fn tombstone_covers_task_ids(&self, task_ids: &[String]) -> bool {
+        !task_ids.is_empty()
+            && self.tombstones.iter().any(|tombstone| {
+                !tombstone.task_ids.is_empty()
+                    && task_ids.iter().all(|id| tombstone.task_ids.contains(id))
+            })
+    }
+
+    fn consume_settled_ids(&mut self, task_ids: &[String]) {
+        self.recently_settled
+            .retain(|settled| !task_ids.iter().any(|id| id == &settled.id));
+    }
+
+    fn adopt_updates_path(&mut self, path: &Path) {
+        self.updates_path = Some(path.to_path_buf());
+        if !path.is_file() {
+            self.baseline_ready = false;
+            return;
+        }
+        match std::fs::read(path) {
+            Ok(bytes) => {
+                let (turns, watermark) = grok_turns_from_bytes(&bytes, &self.session_id);
+                self.committed = watermark;
+                self.baseline_ready = true;
+                self.last_visible_is_user = matches!(
+                    turns.last(),
+                    Some(turn) if matches!(turn.role, TurnRole::User)
+                );
+            }
+            Err(_) => {
+                self.baseline_ready = false;
+            }
+        }
+    }
+
+    fn resolve_updates_path(&mut self) -> Option<PathBuf> {
+        if let Some(path) = &self.updates_path {
+            if path.is_file() {
+                return Some(path.clone());
+            }
+        }
+        if self.session_id.is_empty() {
+            return self.updates_path.clone();
+        }
+        let resolved = crate::parsers::grok::grok_updates_jsonl_path(&self.session_id)?;
+        self.updates_path = Some(resolved.clone());
+        Some(resolved)
     }
 
     fn expire(&mut self) {
@@ -678,7 +749,7 @@ mod tests {
     use crate::models::message::{AutonomousTurnOrigin, ContentBlock};
     use serde_json::json;
     use std::io::Write;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     const HIDDEN_REMINDER: &str = concat!(
         r#"<system-reminder>"#,
@@ -1035,5 +1106,138 @@ mod tests {
         let emitted = adapter.take_emitted();
         assert!(emitted.turns.is_empty());
         assert_eq!(emitted.watermark, 0);
+    }
+
+    #[test]
+    fn replayed_hidden_reminder_after_close_does_not_hold_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("updates.jsonl");
+        std::fs::write(&path, "").unwrap();
+        let mut adapter = GrokAutonomousAdapter::new_for_test(path.clone());
+        adapter.on_session_ready("sess", &path);
+        adapter.on_raw_dispatch(
+            "_x.ai/session/update",
+            &json!({"update":{"sessionUpdate":"task_completed","task_id":"term_x"}}),
+            Ownership::Idle,
+        );
+        adapter.on_raw_dispatch(
+            "session/update",
+            &json!({"update":{
+                "sessionUpdate":"user_message_chunk",
+                "content":{"type":"text","text":HIDDEN_REMINDER},
+                "_meta":{"hideFromScrollback":true}
+            }}),
+            Ownership::Idle,
+        );
+        append_line(
+            &path,
+            &jsonl_update("session/update", &hidden_trigger_update(), 9),
+        );
+        append_line(
+            &path,
+            &jsonl_update("session/update", &agent_text_update("hello"), 10),
+        );
+        append_line(
+            &path,
+            &jsonl_update("session/update", &turn_completed_update(), 11),
+        );
+        adapter.on_raw_dispatch(
+            "session/update",
+            &json!({"update":{"sessionUpdate":"turn_completed","stop_reason":"end_turn"}}),
+            Ownership::Idle,
+        );
+        adapter.tail_once();
+        assert!(
+            !adapter.autonomous_busy(),
+            "closed after persisted terminal"
+        );
+        let _ = adapter.take_emitted();
+
+        adapter.on_raw_dispatch(
+            "session/update",
+            &json!({"update":{
+                "sessionUpdate":"user_message_chunk",
+                "content":{"type":"text","text":HIDDEN_REMINDER},
+                "_meta":{"hideFromScrollback":true}
+            }}),
+            Ownership::Idle,
+        );
+        adapter.tail_once();
+        assert!(
+            !adapter.autonomous_busy(),
+            "replayed hidden reminder must not pin the prompt gate"
+        );
+        assert!(!should_hold_prompt(Some(&adapter)));
+    }
+
+    #[test]
+    fn missing_then_created_updates_jsonl_recovers() {
+        let home = tempfile::tempdir().unwrap();
+        let session_id = "019f45e3-e1ef-7690-a29f-fe2554382b49";
+        let session_dir = home.path().join("sessions").join("%2Ftmp").join(session_id);
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let path = session_dir.join("updates.jsonl");
+
+        with_temp_grok_home(home.path(), || {
+            let mut adapter = GrokAutonomousAdapter::new();
+            adapter.on_session_ready(session_id, Path::new(""));
+            adapter.on_raw_dispatch(
+                "_x.ai/session/update",
+                &json!({"update":{"sessionUpdate":"task_completed","task_id":"term_x"}}),
+                Ownership::Idle,
+            );
+            adapter.on_raw_dispatch(
+                "session/update",
+                &json!({"update":{
+                    "sessionUpdate":"user_message_chunk",
+                    "content":{"type":"text","text":HIDDEN_REMINDER},
+                    "_meta":{"hideFromScrollback":true}
+                }}),
+                Ownership::Idle,
+            );
+            assert!(adapter.autonomous_busy());
+            adapter.tail_once();
+            assert!(
+                adapter.take_emitted().turns.is_empty(),
+                "no emit while transcript is missing"
+            );
+
+            append_line(
+                &path,
+                &jsonl_update("session/update", &hidden_trigger_update(), 9),
+            );
+            append_line(
+                &path,
+                &jsonl_update("session/update", &agent_text_update("hello"), 10),
+            );
+            adapter.tail_once();
+            let emitted = adapter.take_emitted();
+            assert_eq!(emitted.turns.len(), 1, "later append must recover");
+            assert_eq!(
+                emitted.turns[0].autonomous_origin,
+                Some(AutonomousTurnOrigin::BackgroundTask)
+            );
+            assert!(emitted.watermark > 0);
+        });
+    }
+
+    fn with_temp_grok_home<T>(home: &std::path::Path, f: impl FnOnce() -> T) -> T {
+        use std::ffi::OsString;
+        use std::sync::{Mutex, OnceLock};
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let lock = LOCK.get_or_init(|| Mutex::new(()));
+        let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        struct Restore(Option<OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(v) => std::env::set_var("GROK_HOME", v),
+                    None => std::env::remove_var("GROK_HOME"),
+                }
+            }
+        }
+        let _restore = Restore(std::env::var_os("GROK_HOME"));
+        std::env::set_var("GROK_HOME", home);
+        f()
     }
 }

@@ -9874,11 +9874,9 @@ async fn run_conversation_loop<'a>(
     };
     if let Some(adapter) = grok_adapter.as_mut() {
         let sid = session.session_id().0.to_string();
-        if let Some(path) = crate::parsers::grok::grok_updates_jsonl_path(&sid) {
-            adapter.on_session_ready(&sid, &path);
-        } else {
-            adapter.on_session_ready(&sid, Path::new(""));
-        }
+        // File may not exist yet; the adapter re-resolves on each active tail.
+        let path = crate::parsers::grok::grok_updates_jsonl_path(&sid).unwrap_or_default();
+        adapter.on_session_ready(&sid, &path);
         flush_grok_autonomous(Some(adapter), state, emitter, &sid).await;
     }
     let mut held_prompt: Option<ConnectionCommand> = None;
