@@ -253,6 +253,23 @@ describe("AgentSelector", () => {
     expect(onSelect).toHaveBeenCalledWith("codex")
   })
 
+  it("centers the pill frame when align is center", () => {
+    mockUseAcpAgents.mockReturnValue({
+      agents: [agent("codex")],
+      fresh: true,
+      refresh: async () => {},
+    })
+    const { container } = renderWithIntl(
+      <AgentSelector
+        align="center"
+        defaultAgentType="codex"
+        onSelect={() => {}}
+      />
+    )
+    const row = container.querySelector('[data-slot="agent-selector"]')
+    expect(row).toHaveClass("justify-center")
+  })
+
   it("keeps the icon wrapper a flex box so the mark stays vertically centered", () => {
     // jsdom has no layout engine, so this guards the cause rather than the
     // symptom: as a bare inline box the wrapper lays the icon out on a text

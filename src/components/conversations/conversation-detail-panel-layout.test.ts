@@ -172,6 +172,23 @@ describe("ConversationDetailPanel new conversation layout", () => {
     expect(welcomeBranch).toContain("tall")
   })
 
+  it("centers the welcome agent pills via AgentSelector align, not a parent justify-center", () => {
+    // AgentSelector is `@container flex-1` so it can measure overflow. That
+    // makes a wrapping `flex justify-center` a no-op — the row is already
+    // full width and the pills sit at the start. The welcome page has to
+    // pass the intent down as `align="center"`.
+    const welcomeBranchStart = source.indexOf("{isWelcomeMode ? (")
+    const nextBranchStart = source.indexOf(
+      ") : showDraftHeader ?",
+      welcomeBranchStart
+    )
+    expect(welcomeBranchStart).toBeGreaterThan(-1)
+    expect(nextBranchStart).toBeGreaterThan(welcomeBranchStart)
+
+    const welcomeBranch = source.slice(welcomeBranchStart, nextBranchStart)
+    expect(welcomeBranch).toMatch(/<AgentSelector[\s\S]*?align="center"/)
+  })
+
   it("snaps the hidden keep-alive tab so `transition-all` descendants don't ghost", () => {
     // Inactive tabs stay mounted and hide with `visibility: hidden` (`invisible`).
     // In Tailwind v4 `transition-all` transitions `visibility` too, so welcome

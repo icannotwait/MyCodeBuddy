@@ -2574,6 +2574,7 @@ export const ConversationSessionSurface = memo(
                 />
                 <div className="flex justify-center">
                   <AgentSelector
+                    align="center"
                     defaultAgentType={selectedAgent}
                     onSelect={handleAgentSelect}
                     onFallback={handleAgentFallback}
