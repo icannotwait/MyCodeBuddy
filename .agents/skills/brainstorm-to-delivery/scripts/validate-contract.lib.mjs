@@ -9,6 +9,66 @@ export const MAX_PLAN_DOCUMENT_BYTES = 2 * 1024 * 1024
 export const MAX_PROGRESS_DOCUMENT_BYTES = 512 * 1024
 export const MAX_PROGRESS_BLOCK_BYTES = 64 * 1024
 export const MAX_ROUTING_BLOCK_BYTES = 256 * 1024
+export const MAX_DURABLE_EVIDENCE_BYTES = 4 * 1024 * 1024
+const MAX_DURABLE_SNAPSHOT_ROWS = 4096
+const DURABLE_STATUSES = new Set([
+  "reserving",
+  "running",
+  "completed",
+  "failed",
+  "canceled",
+])
+const DURABLE_PAGE_KEYS = [
+  "complete",
+  "namespace",
+  "next_cursor",
+  "page_start",
+  "request_cursor",
+  "runs",
+  "schema_version",
+  "snapshot_created_at",
+  "snapshot_expires_at",
+  "snapshot_id",
+  "snapshot_revision",
+  "total_rows",
+]
+const DURABLE_RUN_KEYS = [
+  "agent_type",
+  "child_conversation_id",
+  "generic_generation",
+  "lineage_root_task_id",
+  "orchestration_binding",
+  "previous_task_id",
+  "profile_id",
+  "replaced_task_id",
+  "replacement_reason",
+  "root_task_id",
+  "status",
+  "task_id",
+  "work_unit_key",
+]
+const DISPATCH_INTENT_KEYS = [
+  "adopted_after_lost_acknowledgement",
+  "continuation_target_task_id",
+  "expected_child_conversation_id",
+  "expected_generic_generation",
+  "expected_lineage_root_task_id",
+  "expected_root_task_id",
+  "kind",
+  "replacement_reason",
+  "replacement_target_task_id",
+]
+const PENDING_ROUTE_CHANGE_KEYS = [
+  "affected_task_indices",
+  "effective_from_task_index",
+  "next_generation",
+  "requested_agent_type",
+  "requested_profile_id",
+]
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
+const CURSOR_RE = /^[A-Za-z0-9_-]{1,128}$/
+const UTC_INSTANT_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/
+const MAX_U64 = 18446744073709551615n
 
 const MAX_I32 = 0x7fffffff
 const MAX_U32 = 0xffffffff
@@ -6406,6 +6466,106 @@ function validateRun(run, taskIndex, runIndex, failures) {
       `${label} has unsupported replacement_reason: ${run.replacement_reason}`
     )
   }
+
+  for (const field of [
+    "root_task_id",
+    "previous_task_id",
+    "lineage_root_task_id",
+  ]) {
+    if (field in run && !optionalString(run[field])) {
+      fail(
+        failures,
+        "B2D-PROGRESS-006",
+        `${label} ${field} must be a string or null`
+      )
+    }
+  }
+  if (
+    "generic_generation" in run &&
+    run.generic_generation !== null &&
+    run.generic_generation !== undefined &&
+    (!Number.isInteger(run.generic_generation) || run.generic_generation < 1)
+  ) {
+    fail(
+      failures,
+      "B2D-PROGRESS-006",
+      `${label} generic_generation must be a positive integer or null`
+    )
+  }
+  if ("dispatch_intent" in run && run.dispatch_intent !== undefined) {
+    validateDispatchIntent(run.dispatch_intent, label, failures)
+  }
+}
+
+function objectKeysExact(value, expected) {
+  if (!isObject(value)) return false
+  const actual = Object.keys(value).sort()
+  return (
+    actual.length === expected.length &&
+    actual.every((key, index) => key === expected[index])
+  )
+}
+
+function validateDispatchIntent(intent, label, failures) {
+  if (!objectKeysExact(intent, DISPATCH_INTENT_KEYS)) {
+    fail(
+      failures,
+      "B2D-PROGRESS-006",
+      `${label} dispatch_intent fields are not exact`
+    )
+    return
+  }
+  if (!["first", "continue", "replacement"].includes(intent.kind)) {
+    fail(
+      failures,
+      "B2D-PROGRESS-006",
+      `${label} dispatch_intent.kind is unsupported`
+    )
+  }
+  if (typeof intent.adopted_after_lost_acknowledgement !== "boolean") {
+    fail(
+      failures,
+      "B2D-PROGRESS-006",
+      `${label} adopted_after_lost_acknowledgement must be a boolean`
+    )
+  }
+  for (const field of [
+    "continuation_target_task_id",
+    "replacement_target_task_id",
+    "replacement_reason",
+    "expected_root_task_id",
+    "expected_lineage_root_task_id",
+  ]) {
+    if (!optionalString(intent[field])) {
+      fail(
+        failures,
+        "B2D-PROGRESS-006",
+        `${label} dispatch_intent.${field} must be a string or null`
+      )
+    }
+  }
+  if (
+    intent.expected_generic_generation !== null &&
+    (!Number.isInteger(intent.expected_generic_generation) ||
+      intent.expected_generic_generation < 1)
+  ) {
+    fail(
+      failures,
+      "B2D-PROGRESS-006",
+      `${label} expected_generic_generation must be a positive integer`
+    )
+  }
+  if (
+    intent.expected_child_conversation_id !== null &&
+    (!positiveInteger(intent.expected_child_conversation_id) ||
+      intent.expected_child_conversation_id > MAX_I32)
+  ) {
+    fail(
+      failures,
+      "B2D-PROGRESS-006",
+      `${label} expected_child_conversation_id must be a signed 32-bit integer or null`
+    )
+  }
 }
 
 function runProfileIdentity(run) {
@@ -6923,6 +7083,7 @@ export function validateSimpleDocuments({
   planMarkdown,
   progressMarkdown,
   planRelPath,
+  allowRouteChangeTransition = false,
 }) {
   const skill = validateSkillMarkdown(skillMarkdown)
   const plan = parseSimplePlan(planMarkdown)
@@ -6942,8 +7103,32 @@ export function validateSimpleDocuments({
     : null
   const progress = parseSimpleProgress(progressMarkdown, planRelPath, plan)
   const agreementFailures = []
+  let routeChange = { kind: "absent" }
+  if (progress.snapshot) {
+    routeChange = inspectPendingRouteChange(
+      progress.snapshot,
+      routing,
+      agreementFailures
+    )
+  }
   if (routing && progress.snapshot) {
-    validateProgressRouting(progress.snapshot, routing, agreementFailures)
+    if (routeChange.kind === "transition") {
+      if (allowRouteChangeTransition && routeChange.reconstructed) {
+        validateProgressRouting(
+          progress.snapshot,
+          routeChange.reconstructed,
+          agreementFailures
+        )
+      } else {
+        fail(
+          agreementFailures,
+          "B2D-PROGRESS-009",
+          "half-applied pending_route_change is not a fully synchronized state"
+        )
+      }
+    } else {
+      validateProgressRouting(progress.snapshot, routing, agreementFailures)
+    }
   }
   return {
     failures: [
@@ -6961,7 +7146,1089 @@ export function validateSimpleDocuments({
     plan,
     routing,
     progress,
+    routeChange,
   }
+}
+
+function nullableEqual(left, right) {
+  const first = left === undefined ? null : left
+  const second = right === undefined ? null : right
+  return first === second
+}
+
+function parseUtcInstant(value) {
+  if (typeof value !== "string" || !UTC_INSTANT_RE.test(value)) return null
+  const millis = Date.parse(value)
+  return Number.isFinite(millis) ? millis : null
+}
+
+function parseDecimalU64(value) {
+  if (typeof value !== "string" || !/^(0|[1-9][0-9]{0,19})$/.test(value)) {
+    return null
+  }
+  try {
+    const parsed = BigInt(value)
+    if (parsed < 0n || parsed > MAX_U64) return null
+    return parsed
+  } catch {
+    return null
+  }
+}
+
+function parseCursor(value) {
+  if (value === null) return { valid: true, value: null }
+  if (typeof value === "string" && CURSOR_RE.test(value)) {
+    return { valid: true, value }
+  }
+  return { valid: false, value: null }
+}
+
+function requestedNamespaceRow(run) {
+  return (
+    run.orchestration_binding === null ||
+    run.orchestration_binding?.namespace === ROUTE_BINDING_NAMESPACE
+  )
+}
+
+function recognizedTaskKey(value) {
+  const parsed = parseRecognizedWorkUnitKey(value)
+  return parsed?.kind === "task" ? parsed : null
+}
+
+function normalizeProgressStatus(state) {
+  return state === "cancelled" ? "canceled" : state
+}
+
+function statusAgrees(progressState, durableStatus) {
+  if (progressState === "unknown" || durableStatus === "unknown") return false
+  if (progressState === "stalled") return durableStatus === "running"
+  return normalizeProgressStatus(progressState) === durableStatus
+}
+
+function statusRefreshable(progressState, durableStatus) {
+  const from = normalizeProgressStatus(progressState)
+  if (from === "reserving") {
+    return ["running", "completed", "failed", "canceled"].includes(
+      durableStatus
+    )
+  }
+  if (from === "running") {
+    return ["completed", "failed", "canceled"].includes(durableStatus)
+  }
+  return false
+}
+
+function parseDurableRun(run, failures, seenTaskIds) {
+  if (!objectKeysExact(run, DURABLE_RUN_KEYS)) {
+    fail(failures, "B2D-DURABLE-001", "durable run fields are not exact")
+    return null
+  }
+  if (!nonEmptyString(run.task_id)) {
+    fail(
+      failures,
+      "B2D-DURABLE-001",
+      "durable task_id must be a non-empty string"
+    )
+    return null
+  }
+  if (seenTaskIds.has(run.task_id)) {
+    fail(
+      failures,
+      "B2D-DURABLE-001",
+      `duplicate durable Task ID: ${run.task_id}`
+    )
+    return null
+  }
+  seenTaskIds.add(run.task_id)
+  if (
+    !nonEmptyString(run.root_task_id) ||
+    !nonEmptyString(run.lineage_root_task_id)
+  ) {
+    fail(
+      failures,
+      "B2D-DURABLE-001",
+      `durable row ${run.task_id} is missing required lineage identity`
+    )
+    return null
+  }
+  for (const field of [
+    "previous_task_id",
+    "replaced_task_id",
+    "replacement_reason",
+    "work_unit_key",
+  ]) {
+    if (!optionalString(run[field])) {
+      fail(
+        failures,
+        "B2D-DURABLE-001",
+        `durable row ${run.task_id} ${field} must be a string or null`
+      )
+      return null
+    }
+  }
+  if (
+    !Number.isInteger(run.generic_generation) ||
+    run.generic_generation < 1 ||
+    run.generic_generation > Number.MAX_SAFE_INTEGER
+  ) {
+    fail(
+      failures,
+      "B2D-DURABLE-001",
+      `durable row ${run.task_id} generic_generation is invalid`
+    )
+    return null
+  }
+  if (
+    !positiveInteger(run.child_conversation_id) ||
+    run.child_conversation_id > MAX_I32
+  ) {
+    fail(
+      failures,
+      "B2D-DURABLE-001",
+      `durable row ${run.task_id} child_conversation_id is invalid`
+    )
+    return null
+  }
+  if (
+    !validAgentSelection({
+      agent_type: run.agent_type,
+      profile_id: run.profile_id,
+    })
+  ) {
+    fail(
+      failures,
+      "B2D-DURABLE-001",
+      `durable row ${run.task_id} has an invalid Agent/profile`
+    )
+    return null
+  }
+  if (!DURABLE_STATUSES.has(run.status)) {
+    fail(
+      failures,
+      "B2D-DURABLE-001",
+      `durable row ${run.task_id} has an invalid status`
+    )
+    return null
+  }
+  if (run.work_unit_key === null && run.orchestration_binding !== null) {
+    const parsedBinding = parseOrchestrationBinding(run.orchestration_binding)
+    if (
+      parsedBinding.valid &&
+      parsedBinding.binding.namespace !== ROUTE_BINDING_NAMESPACE
+    ) {
+      fail(
+        failures,
+        "B2D-DURABLE-001",
+        "foreign unkeyed rows are not valid query evidence"
+      )
+      return null
+    }
+  }
+  let binding = null
+  if (run.orchestration_binding !== null) {
+    const parsed = parseOrchestrationBinding(run.orchestration_binding)
+    if (!parsed.valid) {
+      fail(
+        failures,
+        "B2D-DURABLE-002",
+        `durable row ${run.task_id} binding is malformed: ${parsed.failures.join("; ")}`
+      )
+      return null
+    }
+    binding = parsed.binding
+  }
+  return {
+    task_id: run.task_id,
+    root_task_id: run.root_task_id,
+    previous_task_id: run.previous_task_id,
+    lineage_root_task_id: run.lineage_root_task_id,
+    replaced_task_id: run.replaced_task_id,
+    replacement_reason: run.replacement_reason,
+    generic_generation: run.generic_generation,
+    work_unit_key: run.work_unit_key,
+    child_conversation_id: run.child_conversation_id,
+    agent_type: run.agent_type,
+    profile_id: run.profile_id,
+    status: run.status,
+    orchestration_binding: binding,
+  }
+}
+
+function parseDurablePage(page, failures, seenTaskIds) {
+  if (!objectKeysExact(page, DURABLE_PAGE_KEYS)) {
+    fail(failures, "B2D-DURABLE-001", "durable page fields are not exact")
+    return null
+  }
+  if (page.schema_version !== 1) {
+    fail(
+      failures,
+      "B2D-DURABLE-001",
+      "durable page schema_version must equal 1"
+    )
+    return null
+  }
+  if (page.namespace !== ROUTE_BINDING_NAMESPACE) {
+    fail(
+      failures,
+      "B2D-DURABLE-001",
+      "durable page namespace must be brainstorm-to-delivery"
+    )
+    return null
+  }
+  if (typeof page.snapshot_id !== "string" || !UUID_RE.test(page.snapshot_id)) {
+    fail(failures, "B2D-DURABLE-001", "snapshot_id must be a lowercase UUID")
+    return null
+  }
+  if (parseDecimalU64(page.snapshot_revision) === null) {
+    fail(
+      failures,
+      "B2D-DURABLE-001",
+      "snapshot_revision must be an unsigned 64-bit decimal string"
+    )
+    return null
+  }
+  const createdAt = parseUtcInstant(page.snapshot_created_at)
+  const expiresAt = parseUtcInstant(page.snapshot_expires_at)
+  if (createdAt === null || expiresAt === null || expiresAt <= createdAt) {
+    fail(
+      failures,
+      "B2D-DURABLE-001",
+      "snapshot timestamps must be real UTC instants"
+    )
+    return null
+  }
+  if (
+    !Number.isInteger(page.total_rows) ||
+    page.total_rows < 0 ||
+    page.total_rows > MAX_DURABLE_SNAPSHOT_ROWS
+  ) {
+    fail(
+      failures,
+      "B2D-DURABLE-001",
+      "total_rows must be an integer in 0..=4096"
+    )
+    return null
+  }
+  if (!Number.isInteger(page.page_start) || page.page_start < 0) {
+    fail(
+      failures,
+      "B2D-DURABLE-001",
+      "page_start must be a non-negative integer"
+    )
+    return null
+  }
+  const requestCursor = parseCursor(page.request_cursor)
+  const nextCursor = parseCursor(page.next_cursor)
+  if (!requestCursor.valid || !nextCursor.valid) {
+    fail(failures, "B2D-DURABLE-001", "page cursors are malformed")
+    return null
+  }
+  if (!Array.isArray(page.runs)) {
+    fail(failures, "B2D-DURABLE-001", "page runs must be an array")
+    return null
+  }
+  if (typeof page.complete !== "boolean") {
+    fail(failures, "B2D-DURABLE-001", "complete must be a boolean")
+    return null
+  }
+  const runs = []
+  for (const run of page.runs) {
+    const parsed = parseDurableRun(run, failures, seenTaskIds)
+    if (parsed) runs.push(parsed)
+  }
+  return {
+    schema_version: page.schema_version,
+    namespace: page.namespace,
+    snapshot_id: page.snapshot_id,
+    snapshot_revision: page.snapshot_revision,
+    snapshot_created_at: page.snapshot_created_at,
+    snapshot_expires_at: page.snapshot_expires_at,
+    total_rows: page.total_rows,
+    page_start: page.page_start,
+    request_cursor: page.request_cursor,
+    runs,
+    next_cursor: page.next_cursor,
+    complete: page.complete,
+  }
+}
+
+/** Parse a complete raw durable evidence wrapper and its page envelopes. */
+export function parseDurableBindingEvidence(source, options = {}) {
+  const failures = []
+  const now = options.now instanceof Date ? options.now.getTime() : Date.now()
+  let value = source
+  if (typeof source === "string") {
+    if (byteLength(source) > MAX_DURABLE_EVIDENCE_BYTES) {
+      fail(
+        failures,
+        "B2D-DURABLE-001",
+        "durable evidence exceeds the 4 MiB limit"
+      )
+      return { pages: [], runs: [], snapshot: null, failures }
+    }
+    try {
+      value = JSON.parse(source)
+    } catch {
+      fail(failures, "B2D-DURABLE-001", "durable evidence is not valid JSON")
+      return { pages: [], runs: [], snapshot: null, failures }
+    }
+  }
+  if (!objectKeysExact(value, ["pages", "schema_version"])) {
+    fail(
+      failures,
+      "B2D-DURABLE-001",
+      "durable evidence wrapper fields are not exact"
+    )
+    return { pages: [], runs: [], snapshot: null, failures }
+  }
+  if (value.schema_version !== 1) {
+    fail(
+      failures,
+      "B2D-DURABLE-001",
+      "durable evidence schema_version must equal 1"
+    )
+    return { pages: [], runs: [], snapshot: null, failures }
+  }
+  if (!Array.isArray(value.pages) || value.pages.length === 0) {
+    fail(
+      failures,
+      "B2D-DURABLE-001",
+      "durable evidence requires at least one page"
+    )
+    return { pages: [], runs: [], snapshot: null, failures }
+  }
+
+  const seenTaskIds = new Set()
+  const pages = []
+  for (const page of value.pages) {
+    const parsed = parseDurablePage(page, failures, seenTaskIds)
+    if (parsed) pages.push(parsed)
+  }
+  if (failures.length > 0) {
+    return { pages: [], runs: [], snapshot: null, failures }
+  }
+
+  const first = pages[0]
+  const expiresAt = parseUtcInstant(first.snapshot_expires_at)
+  if (expiresAt !== null && expiresAt <= now) {
+    fail(failures, "B2D-DURABLE-001", "durable evidence snapshot is expired")
+    return { pages: [], runs: [], snapshot: null, failures }
+  }
+  if (first.page_start !== 0) {
+    fail(failures, "B2D-DURABLE-001", "first page_start must be zero")
+  }
+  if (first.request_cursor !== null) {
+    fail(failures, "B2D-DURABLE-001", "first request_cursor must be null")
+  }
+
+  let expectedStart = 0
+  let seenComplete = false
+  const runs = []
+  for (const [index, page] of pages.entries()) {
+    if (
+      page.snapshot_id !== first.snapshot_id ||
+      page.snapshot_revision !== first.snapshot_revision ||
+      page.snapshot_created_at !== first.snapshot_created_at ||
+      page.snapshot_expires_at !== first.snapshot_expires_at ||
+      page.total_rows !== first.total_rows ||
+      page.namespace !== first.namespace ||
+      page.schema_version !== first.schema_version
+    ) {
+      fail(
+        failures,
+        "B2D-DURABLE-001",
+        "durable pages mix snapshot identity or metadata"
+      )
+    }
+    if (seenComplete) {
+      fail(
+        failures,
+        "B2D-DURABLE-001",
+        "durable evidence has a trailing page after completion"
+      )
+    }
+    if (page.page_start !== expectedStart) {
+      fail(
+        failures,
+        "B2D-DURABLE-001",
+        "durable pages have a gap, overlap, or invalid order"
+      )
+    }
+    if (index > 0 && page.request_cursor !== pages[index - 1].next_cursor) {
+      fail(
+        failures,
+        "B2D-DURABLE-001",
+        "durable request_cursor does not echo the previous next_cursor"
+      )
+    }
+    if (page.complete) {
+      if (page.next_cursor !== null) {
+        fail(failures, "B2D-DURABLE-001", "final page next_cursor must be null")
+      }
+      seenComplete = true
+    } else if (page.next_cursor === null) {
+      fail(
+        failures,
+        "B2D-DURABLE-001",
+        "non-final page next_cursor must be non-null"
+      )
+    }
+    expectedStart += page.runs.length
+    runs.push(...page.runs)
+  }
+  if (!seenComplete) {
+    fail(
+      failures,
+      "B2D-DURABLE-001",
+      "durable evidence is missing a final page"
+    )
+  }
+  if (first.total_rows !== runs.length) {
+    fail(
+      failures,
+      "B2D-DURABLE-001",
+      "total_rows does not match the concatenated run count"
+    )
+  }
+  if (failures.length > 0) {
+    return { pages: [], runs: [], snapshot: null, failures }
+  }
+  return {
+    pages,
+    runs,
+    snapshot: {
+      snapshot_id: first.snapshot_id,
+      snapshot_revision: first.snapshot_revision,
+    },
+    failures,
+  }
+}
+
+function parsePendingRouteChangeObject(value, failures) {
+  if (!objectKeysExact(value, PENDING_ROUTE_CHANGE_KEYS)) {
+    fail(
+      failures,
+      "B2D-PROGRESS-003",
+      "pending_route_change fields are not exact"
+    )
+    return null
+  }
+  if (
+    !validAgentSelection({
+      agent_type: value.requested_agent_type,
+      profile_id: value.requested_profile_id,
+    })
+  ) {
+    fail(
+      failures,
+      "B2D-PROGRESS-003",
+      "pending_route_change requested Agent/profile is invalid"
+    )
+    return null
+  }
+  if (
+    !Number.isInteger(value.next_generation) ||
+    value.next_generation < 1 ||
+    value.next_generation > MAX_U32
+  ) {
+    fail(
+      failures,
+      "B2D-PROGRESS-003",
+      "pending_route_change next_generation is not a contiguous unsigned generation"
+    )
+    return null
+  }
+  if (!positiveInteger(value.effective_from_task_index)) {
+    fail(
+      failures,
+      "B2D-PROGRESS-003",
+      "pending_route_change effective_from_task_index is invalid"
+    )
+    return null
+  }
+  if (
+    !Array.isArray(value.affected_task_indices) ||
+    value.affected_task_indices.length === 0 ||
+    value.affected_task_indices.some((index) => !positiveInteger(index))
+  ) {
+    fail(
+      failures,
+      "B2D-PROGRESS-003",
+      "pending_route_change affected_task_indices are invalid"
+    )
+    return null
+  }
+  const affected = value.affected_task_indices
+  for (let offset = 1; offset < affected.length; offset += 1) {
+    if (affected[offset] !== affected[offset - 1] + 1) {
+      fail(
+        failures,
+        "B2D-PROGRESS-003",
+        "pending_route_change affected_task_indices must be a contiguous suffix"
+      )
+      return null
+    }
+  }
+  if (value.effective_from_task_index !== affected[0]) {
+    fail(
+      failures,
+      "B2D-PROGRESS-003",
+      "pending_route_change boundary must equal the first affected index"
+    )
+    return null
+  }
+  return {
+    requested_agent_type: value.requested_agent_type,
+    requested_profile_id: value.requested_profile_id,
+    next_generation: value.next_generation,
+    effective_from_task_index: value.effective_from_task_index,
+    affected_task_indices: [...affected],
+  }
+}
+
+function progressMatchesRouting(snapshot, routing) {
+  if (!isObject(snapshot) || !Array.isArray(snapshot.tasks) || !routing) {
+    return false
+  }
+  const progressByIndex = new Map(
+    snapshot.tasks
+      .filter((task) => isObject(task) && positiveInteger(task.index))
+      .map((task) => [task.index, task])
+  )
+  return routing.tasks.every((routeTask) => {
+    const task = progressByIndex.get(routeTask.index)
+    return (
+      task &&
+      task.task_agent_generation === routeTask.task_agent_generation &&
+      task.risk_level === routeTask.risk.level &&
+      skillContractsEqual(
+        task.expected_work_unit_keys,
+        routeTask.expected_work_unit_keys
+      )
+    )
+  })
+}
+
+function reconstructPriorRouting(routing, intent, failures) {
+  const priorGenerations = routing.generations.filter(
+    (generation) => generation.generation < intent.next_generation
+  )
+  const priorGeneration = priorGenerations.at(-1)
+  if (!priorGeneration) return null
+  const tasks = []
+  for (const routeTask of routing.tasks) {
+    if (routeTask.index < intent.effective_from_task_index) {
+      tasks.push(routeTask)
+      continue
+    }
+    const expected = deriveExpectedRoute(
+      { ...routeTask, task_agent_generation: priorGeneration.generation },
+      priorGeneration,
+      failures
+    )
+    if (!expected) return null
+    const binding = deriveOrchestrationBinding(
+      { ...routeTask, task_agent_generation: priorGeneration.generation },
+      priorGeneration,
+      expected
+    )
+    tasks.push({
+      ...routeTask,
+      task_agent_generation: priorGeneration.generation,
+      route: expected.route,
+      expected_work_unit_keys: expected.expected_work_unit_keys,
+      route_fingerprint: binding.route_fingerprint,
+      orchestration_binding: binding,
+    })
+  }
+  return { generations: priorGenerations, tasks }
+}
+
+function planMatchesRouteChangeIntent(routing, intent) {
+  const last = routing.generations.at(-1)
+  if (
+    !last ||
+    last.generation !== intent.next_generation ||
+    last.effective_from_task_index !== intent.effective_from_task_index ||
+    last.agent_type !== intent.requested_agent_type ||
+    last.profile_id !== intent.requested_profile_id
+  ) {
+    return false
+  }
+  return routing.tasks.every((task) =>
+    task.index < intent.effective_from_task_index
+      ? task.task_agent_generation < intent.next_generation
+      : task.task_agent_generation === intent.next_generation
+  )
+}
+
+function inspectPendingRouteChange(snapshot, routing, failures) {
+  if (!routing) {
+    if (
+      snapshot &&
+      "pending_route_change" in snapshot &&
+      snapshot.pending_route_change !== null
+    ) {
+      fail(
+        failures,
+        "B2D-PROGRESS-003",
+        "legacy progress cannot carry pending_route_change"
+      )
+    }
+    return { kind: "legacy" }
+  }
+  if (!isObject(snapshot) || !("pending_route_change" in snapshot)) {
+    fail(
+      failures,
+      "B2D-PROGRESS-003",
+      "routed progress requires pending_route_change"
+    )
+    return { kind: "missing" }
+  }
+  if (snapshot.pending_route_change === null) return { kind: "settled" }
+  const intent = parsePendingRouteChangeObject(
+    snapshot.pending_route_change,
+    failures
+  )
+  if (!intent) return { kind: "malformed" }
+
+  const planIndexes = routing.tasks.map((task) => task.index)
+  const expectedSuffix = planIndexes.filter(
+    (index) => index >= intent.effective_from_task_index
+  )
+  if (intent.affected_task_indices.join(",") !== expectedSuffix.join(",")) {
+    fail(
+      failures,
+      "B2D-PROGRESS-003",
+      "pending_route_change affected_task_indices must be the complete pending suffix"
+    )
+    return { kind: "malformed", intent }
+  }
+
+  const progressByIndex = new Map(
+    (Array.isArray(snapshot.tasks) ? snapshot.tasks : [])
+      .filter((task) => isObject(task) && positiveInteger(task.index))
+      .map((task) => [task.index, task])
+  )
+  const suffix = expectedSuffix.map((index) => progressByIndex.get(index))
+  const prefix = planIndexes
+    .filter((index) => index < intent.effective_from_task_index)
+    .map((index) => progressByIndex.get(index))
+  const suffixPendingEmpty = suffix.every(
+    (task) =>
+      task?.status === "pending" &&
+      Array.isArray(task.runs) &&
+      task.runs.length === 0
+  )
+  const prefixCompleted = prefix.every((task) => task?.status === "completed")
+  const noActive = snapshot.active_task_index === null
+  if (!suffixPendingEmpty || !prefixCompleted || !noActive) {
+    fail(
+      failures,
+      "B2D-PROGRESS-008",
+      "pending_route_change requires a completed prefix, null active Task, and empty pending suffix"
+    )
+    return { kind: "malformed", intent }
+  }
+
+  const lastGeneration = routing.generations.at(-1)?.generation
+  const matchesPlan = progressMatchesRouting(snapshot, routing)
+  if (lastGeneration === intent.next_generation - 1 && matchesPlan) {
+    return { kind: "pre", intent }
+  }
+  if (planMatchesRouteChangeIntent(routing, intent) && matchesPlan) {
+    return { kind: "post", intent }
+  }
+  const reconstructed = reconstructPriorRouting(routing, intent, [])
+  if (
+    planMatchesRouteChangeIntent(routing, intent) &&
+    reconstructed &&
+    progressMatchesRouting(snapshot, reconstructed)
+  ) {
+    return { kind: "transition", intent, reconstructed }
+  }
+  fail(
+    failures,
+    "B2D-PROGRESS-009",
+    "pending_route_change does not match a synchronized pre-revision, post-revision, or exact transition state"
+  )
+  return { kind: "disagreement", intent }
+}
+
+function admittedProgressRuns(snapshot) {
+  const entries = []
+  if (!isObject(snapshot) || !Array.isArray(snapshot.tasks)) return entries
+  for (const task of snapshot.tasks) {
+    if (!isObject(task) || !Array.isArray(task.runs)) continue
+    for (const [runIndex, run] of task.runs.entries()) {
+      if (!isObject(run)) continue
+      entries.push({ task, run, runIndex })
+    }
+  }
+  return entries
+}
+
+function eligibleUnresolvedIntent(run) {
+  return (
+    run.state === "reserving" &&
+    !nonEmptyString(run.task_id) &&
+    (run.child_conversation_id === null ||
+      run.child_conversation_id === undefined) &&
+    !nonEmptyString(run.root_task_id) &&
+    !nonEmptyString(run.previous_task_id) &&
+    !nonEmptyString(run.lineage_root_task_id) &&
+    (run.generic_generation === null || run.generic_generation === undefined) &&
+    !nonEmptyString(run.replaced_task_id) &&
+    !nonEmptyString(run.replacement_reason) &&
+    isObject(run.dispatch_intent) &&
+    run.dispatch_intent.adopted_after_lost_acknowledgement === false
+  )
+}
+
+function bindingEquals(left, right) {
+  if (left === null && right === null) return true
+  if (!left || !right) return false
+  return skillContractsEqual(left, right)
+}
+
+function findProgressTarget(entries, taskId) {
+  return entries.find(
+    (entry) => isObject(entry.run) && entry.run.task_id === taskId
+  )
+}
+
+function adoptionLineageMatches(kind, candidate, intent, target) {
+  if (kind === "first") {
+    return (
+      candidate.generic_generation === 1 &&
+      candidate.root_task_id === candidate.task_id &&
+      candidate.lineage_root_task_id === candidate.task_id &&
+      candidate.previous_task_id === null &&
+      candidate.replaced_task_id === null &&
+      candidate.replacement_reason === null
+    )
+  }
+  if (!target) return false
+  if (kind === "continue") {
+    return (
+      candidate.previous_task_id === intent.continuation_target_task_id &&
+      candidate.previous_task_id === target.task_id &&
+      candidate.root_task_id === target.root_task_id &&
+      candidate.lineage_root_task_id === target.lineage_root_task_id &&
+      candidate.child_conversation_id === target.child_conversation_id &&
+      candidate.agent_type === target.agent_type &&
+      nullableEqual(candidate.profile_id, target.profile_id) &&
+      candidate.work_unit_key === target.work_unit_key &&
+      bindingEquals(
+        candidate.orchestration_binding,
+        target.orchestration_binding
+      ) &&
+      candidate.generic_generation === target.generic_generation + 1 &&
+      candidate.replaced_task_id === null &&
+      candidate.replacement_reason === null
+    )
+  }
+  return (
+    candidate.replaced_task_id === intent.replacement_target_task_id &&
+    candidate.replacement_reason === intent.replacement_reason &&
+    candidate.generic_generation === 1 &&
+    candidate.root_task_id === candidate.task_id &&
+    candidate.previous_task_id === null &&
+    candidate.lineage_root_task_id === target.lineage_root_task_id &&
+    candidate.agent_type === target.agent_type &&
+    nullableEqual(candidate.profile_id, target.profile_id) &&
+    candidate.work_unit_key === target.work_unit_key &&
+    bindingEquals(
+      candidate.orchestration_binding,
+      target.orchestration_binding
+    ) &&
+    candidate.child_conversation_id !== target.child_conversation_id
+  )
+}
+
+function candidateMatchesIntent(entry, candidate, allEntries) {
+  const intent = entry.run.dispatch_intent
+  if (
+    candidate.work_unit_key !== entry.run.work_unit_key ||
+    candidate.agent_type !== entry.run.agent_type ||
+    !nullableEqual(candidate.profile_id, entry.run.profile_id) ||
+    !bindingEquals(
+      candidate.orchestration_binding,
+      entry.run.orchestration_binding
+    )
+  ) {
+    return false
+  }
+  const targetId =
+    intent.kind === "continue"
+      ? intent.continuation_target_task_id
+      : intent.kind === "replacement"
+        ? intent.replacement_target_task_id
+        : null
+  const target = targetId ? findProgressTarget(allEntries, targetId)?.run : null
+  return adoptionLineageMatches(intent.kind, candidate, intent, target)
+}
+
+function adoptAction(entry, candidate) {
+  return {
+    kind: "adopt_lost_acknowledgement",
+    task_index: entry.task.index,
+    progress_run_index: entry.runIndex,
+    task_id: candidate.task_id,
+    child_conversation_id: candidate.child_conversation_id,
+    root_task_id: candidate.root_task_id,
+    previous_task_id: candidate.previous_task_id,
+    lineage_root_task_id: candidate.lineage_root_task_id,
+    generic_generation: candidate.generic_generation,
+    replaced_task_id: candidate.replaced_task_id,
+    replacement_reason: candidate.replacement_reason,
+    work_unit_key: candidate.work_unit_key,
+    agent_type: candidate.agent_type,
+    profile_id: candidate.profile_id,
+    status: candidate.status,
+    orchestration_binding: candidate.orchestration_binding,
+  }
+}
+
+function identityAgrees(progressRun, durable) {
+  return (
+    progressRun.task_id === durable.task_id &&
+    progressRun.work_unit_key === durable.work_unit_key &&
+    progressRun.child_conversation_id === durable.child_conversation_id &&
+    nullableEqual(progressRun.root_task_id, durable.root_task_id) &&
+    nullableEqual(progressRun.previous_task_id, durable.previous_task_id) &&
+    nullableEqual(
+      progressRun.lineage_root_task_id,
+      durable.lineage_root_task_id
+    ) &&
+    nullableEqual(progressRun.generic_generation, durable.generic_generation) &&
+    nullableEqual(progressRun.replaced_task_id, durable.replaced_task_id) &&
+    nullableEqual(progressRun.replacement_reason, durable.replacement_reason) &&
+    progressRun.agent_type === durable.agent_type &&
+    nullableEqual(progressRun.profile_id, durable.profile_id)
+  )
+}
+
+/** Reconcile complete durable rows against Plan-derived bindings and progress. */
+export function reconcileDurableBindings({
+  evidence,
+  routing,
+  progressSnapshot,
+  routeChange,
+} = {}) {
+  const failures = []
+  const actions = []
+  if (!evidence || !routing || !progressSnapshot) {
+    fail(failures, "B2D-DURABLE-001", "durable reconciliation is incomplete")
+    return { failures, actions }
+  }
+
+  const entries = admittedProgressRuns(progressSnapshot)
+  const admittedIds = new Set(
+    entries
+      .filter((entry) => nonEmptyString(entry.run.task_id))
+      .map((entry) => entry.run.task_id)
+  )
+  const unmatched = evidence.runs.filter((run) => !admittedIds.has(run.task_id))
+  const eligible = entries.filter((entry) =>
+    eligibleUnresolvedIntent(entry.run)
+  )
+  const priorAdoption = entries.filter(
+    (entry) =>
+      entry.run.state === "reserving" &&
+      isObject(entry.run.dispatch_intent) &&
+      entry.run.dispatch_intent.adopted_after_lost_acknowledgement === true &&
+      !nonEmptyString(entry.run.task_id)
+  )
+  if (priorAdoption.length > 0) {
+    fail(
+      failures,
+      "B2D-DURABLE-009",
+      "lost-acknowledgement adoption was already marked and remains unresolved"
+    )
+    return { failures, actions }
+  }
+  if (eligible.length > 1) {
+    fail(
+      failures,
+      "B2D-DURABLE-009",
+      "lost-acknowledgement adoption is ambiguous: multiple unresolved intents"
+    )
+    return { failures, actions }
+  }
+  if (eligible.length === 1) {
+    const entry = eligible[0]
+    const matches = unmatched.filter((run) =>
+      candidateMatchesIntent(entry, run, entries)
+    )
+    if (matches.length !== 1) {
+      fail(
+        failures,
+        "B2D-DURABLE-009",
+        "lost-acknowledgement adoption is absent, ambiguous, or lineage-invalid"
+      )
+      return { failures, actions }
+    }
+    return { failures, actions: [adoptAction(entry, matches[0])] }
+  }
+
+  const affected = new Set(routeChange?.intent?.affected_task_indices ?? [])
+  if (routeChange?.intent) {
+    for (const run of evidence.runs) {
+      const recognized = recognizedTaskKey(run.work_unit_key)
+      if (recognized && affected.has(recognized.taskIndex)) {
+        fail(
+          failures,
+          "B2D-DURABLE-008",
+          `generation change touches durable Task ${recognized.taskIndex} row ${run.task_id}`
+        )
+      }
+    }
+  }
+
+  const durableById = new Map(evidence.runs.map((run) => [run.task_id, run]))
+  const progressById = new Map(
+    entries
+      .filter((entry) => nonEmptyString(entry.run.task_id))
+      .map((entry) => [entry.run.task_id, entry])
+  )
+  const refresh = []
+  const hard = []
+
+  for (const entry of entries) {
+    if (!nonEmptyString(entry.run.task_id)) continue
+    const durable = durableById.get(entry.run.task_id)
+    if (!durable) {
+      hard.push([
+        "B2D-DURABLE-003",
+        `admitted progress Task ID ${entry.run.task_id} has no durable row`,
+      ])
+      continue
+    }
+    const routeTask = routing.tasks.find(
+      (task) => task.index === entry.task.index
+    )
+    const recognized = recognizedTaskKey(entry.run.work_unit_key)
+    if (
+      !recognized ||
+      recognized.taskIndex !== entry.task.index ||
+      recognized.role !== entry.run.role ||
+      recognized.agentType !== entry.run.agent_type ||
+      recognized.agentType !== durable.agent_type ||
+      !nullableEqual(recognized.profileId, entry.run.profile_id)
+    ) {
+      hard.push([
+        "B2D-DURABLE-005",
+        `Task ${entry.task.index} work-unit key disagrees with Plan/progress/durable identity`,
+      ])
+    }
+    if (durable.orchestration_binding === null && recognized) {
+      hard.push([
+        "B2D-DURABLE-007",
+        `recognized routed row ${durable.task_id} is unbound`,
+      ])
+    }
+    if (
+      durable.orchestration_binding &&
+      routeTask?.orchestration_binding &&
+      (durable.orchestration_binding.generation !==
+        routeTask.orchestration_binding.generation ||
+        durable.orchestration_binding.route_fingerprint !==
+          routeTask.orchestration_binding.route_fingerprint ||
+        durable.orchestration_binding.namespace !==
+          routeTask.orchestration_binding.namespace)
+    ) {
+      hard.push([
+        "B2D-DURABLE-006",
+        `durable binding for ${durable.task_id} disagrees with the derived Task binding`,
+      ])
+    }
+    if (
+      !bindingEquals(
+        durable.orchestration_binding,
+        entry.run.orchestration_binding
+      )
+    ) {
+      hard.push([
+        "B2D-DURABLE-006",
+        `durable binding for ${durable.task_id} disagrees with the progress mirror`,
+      ])
+    }
+    const identityOk = identityAgrees(entry.run, durable)
+    const statusOk = statusAgrees(entry.run.state, durable.status)
+    if (!identityOk) {
+      hard.push([
+        "B2D-DURABLE-005",
+        `Task ${entry.task.index} identity or lineage disagrees for ${entry.run.task_id}`,
+      ])
+    } else if (!statusOk) {
+      if (statusRefreshable(entry.run.state, durable.status)) {
+        refresh.push([
+          "B2D-DURABLE-005",
+          `status-only refresh required: ${entry.run.task_id} ${entry.run.state} ${durable.status}`,
+        ])
+      } else {
+        hard.push([
+          "B2D-DURABLE-005",
+          `Task ${entry.task.index} status disagrees for ${entry.run.task_id}`,
+        ])
+      }
+    }
+  }
+
+  for (const run of evidence.runs) {
+    const recognized = recognizedTaskKey(run.work_unit_key)
+    const requested = requestedNamespaceRow(run)
+    if (recognized || requested) {
+      const mirror = progressById.get(run.task_id)
+      if (recognized && run.orchestration_binding === null) {
+        hard.push([
+          "B2D-DURABLE-007",
+          `recognized routed row ${run.task_id} is unbound`,
+        ])
+      }
+      if (
+        recognized &&
+        !routing.tasks.some((task) => task.index === recognized.taskIndex)
+      ) {
+        hard.push([
+          "B2D-DURABLE-004",
+          `recognized durable row ${run.task_id} is outside the Plan`,
+        ])
+      }
+      if (
+        recognized &&
+        run.orchestration_binding &&
+        run.orchestration_binding.namespace !== ROUTE_BINDING_NAMESPACE
+      ) {
+        hard.push([
+          "B2D-DURABLE-004",
+          `recognized durable row ${run.task_id} uses a foreign namespace`,
+        ])
+      }
+      if (!mirror) {
+        hard.push([
+          "B2D-DURABLE-004",
+          `bound or recognized durable row ${run.task_id} is missing from progress`,
+        ])
+      }
+    }
+  }
+
+  const uniqueHard = []
+  const seenHard = new Set()
+  for (const [rule, message] of hard) {
+    const key = `${rule}:${message}`
+    if (seenHard.has(key)) continue
+    seenHard.add(key)
+    uniqueHard.push([rule, message])
+  }
+  if (uniqueHard.length > 0) {
+    for (const [rule, message] of uniqueHard) fail(failures, rule, message)
+    return { failures, actions }
+  }
+  for (const [rule, message] of refresh) fail(failures, rule, message)
+  return { failures, actions }
 }
 
 function structuredFailures(failures) {
@@ -7039,20 +8306,43 @@ function validateStaticBindingAgreement(snapshot, routing, failures) {
   }
 }
 
-function validationEnvelope(failures, taskBindings = []) {
+function validationEnvelope(failures, taskBindings = [], extras = {}) {
+  const actions = extras.reconciliation_actions ?? []
+  const failed = failures.length > 0
+  const adopting = !failed && actions.length > 0
   return {
     schema_version: 1,
-    admission_authorized: false,
-    durable_snapshot: null,
-    task_bindings: failures.length === 0 ? taskBindings : [],
-    reconciliation_actions: [],
+    admission_authorized:
+      extras.admission_authorized === true && !failed && !adopting,
+    durable_snapshot: failed ? null : (extras.durable_snapshot ?? null),
+    task_bindings: failed || adopting ? [] : taskBindings,
+    reconciliation_actions: failed ? [] : actions,
     failures: structuredFailures(failures),
   }
 }
 
+function parseEvidenceOption(raw, now) {
+  if (raw === undefined || raw === null) {
+    return {
+      pages: [],
+      runs: [],
+      snapshot: null,
+      failures: ["[B2D-CLI-001] durable evidence is required"],
+    }
+  }
+  return parseDurableBindingEvidence(raw, { now })
+}
+
+function documentAdmissionBlocks(runs) {
+  return runs.some((run) => {
+    const recognized = recognizedTaskKey(run.work_unit_key)
+    return requestedNamespaceRow(run) || recognized
+  })
+}
+
 /**
- * Pure validator entry point for Skill-only, Plan-only derivation, and static
- * Plan/progress agreement. Durable evidence is intentionally not accepted.
+ * Pure validator entry point for Skill-only, Plan-only derivation, static
+ * Plan/progress agreement, document admission, and full durable admission.
  */
 export function runValidation(options = {}) {
   const failures = []
@@ -7065,12 +8355,56 @@ export function runValidation(options = {}) {
   const derivePlanRouting =
     options.derivePlanRouting === true || options.mode === "plan"
   const outputJson = options.outputJson === true
+  const documentAdmission =
+    options.documentAdmission === true || options.mode === "document"
+  const admission = options.admission === true || options.mode === "admission"
+  const hasEvidence =
+    options.durableEvidence !== undefined && options.durableEvidence !== null
 
   const skill = validateSkillMarkdown(skillMarkdown)
   failures.push(...skill.failures)
 
+  if (documentAdmission) {
+    if (hasPlan || hasProgress || derivePlanRouting || admission) {
+      fail(
+        failures,
+        "B2D-CLI-001",
+        "document admission cannot include Plan, progress, or derive flags"
+      )
+    }
+    if (!hasEvidence || !outputJson) {
+      fail(
+        failures,
+        "B2D-CLI-001",
+        "document admission requires --durable-evidence and --output-json"
+      )
+    }
+    const evidence = parseEvidenceOption(options.durableEvidence, options.now)
+    failures.push(...evidence.failures)
+    if (failures.length > 0) return validationEnvelope(failures)
+    if (documentAdmissionBlocks(evidence.runs)) {
+      fail(
+        failures,
+        "B2D-DURABLE-004",
+        "document admission requires a snapshot with no requested-namespace or recognized Task-key row"
+      )
+      return validationEnvelope(failures)
+    }
+    return validationEnvelope([], [], {
+      admission_authorized: true,
+      durable_snapshot: evidence.snapshot,
+    })
+  }
+
   if (!hasPlan) {
-    if (hasProgress || derivePlanRouting || outputJson || options.planRelPath) {
+    if (
+      hasProgress ||
+      derivePlanRouting ||
+      outputJson ||
+      options.planRelPath ||
+      admission ||
+      hasEvidence
+    ) {
       fail(
         failures,
         "B2D-CLI-001",
@@ -7086,15 +8420,30 @@ export function runValidation(options = {}) {
   ) {
     fail(failures, "B2D-CLI-001", "Plan mode requires --plan-rel-path")
   }
-  if (derivePlanRouting && hasProgress) {
+  if (derivePlanRouting && (hasProgress || hasEvidence || admission)) {
     fail(
       failures,
       "B2D-CLI-001",
-      "Plan-only derivation cannot include a progress document"
+      "Plan-only derivation cannot include progress, admission, or durable evidence"
     )
   }
   if (derivePlanRouting && !outputJson) {
     fail(failures, "B2D-CLI-001", "Plan-only derivation requires --output-json")
+  }
+  if (admission) {
+    if (!hasProgress || !hasEvidence || !outputJson || derivePlanRouting) {
+      fail(
+        failures,
+        "B2D-CLI-001",
+        "full admission requires Plan, progress, --plan-rel-path, --durable-evidence, and --output-json"
+      )
+    }
+  } else if (hasEvidence) {
+    fail(
+      failures,
+      "B2D-CLI-001",
+      "durable evidence requires --admission or --document-admission"
+    )
   }
   if (!derivePlanRouting && !hasProgress) {
     fail(
@@ -7110,18 +8459,57 @@ export function runValidation(options = {}) {
       planMarkdown: String(planMarkdown),
       progressMarkdown: String(progressMarkdown),
       planRelPath: options.planRelPath,
+      allowRouteChangeTransition: !admission,
     })
     failures.push(...documents.failures)
-    if (documents.routing && documents.progress.snapshot) {
+    const bindingRouting =
+      documents.routeChange?.kind === "transition" &&
+      !admission &&
+      documents.routeChange.reconstructed
+        ? documents.routeChange.reconstructed
+        : documents.routing
+    if (bindingRouting && documents.progress.snapshot) {
       validateStaticBindingAgreement(
         documents.progress.snapshot,
-        documents.routing,
+        bindingRouting,
         failures
       )
-      if (failures.length === 0) {
-        const taskBindings = deriveTaskBindings(documents.routing, failures)
-        return validationEnvelope(failures, taskBindings)
+    }
+    if (admission) {
+      const evidence = parseEvidenceOption(options.durableEvidence, options.now)
+      failures.push(...evidence.failures)
+      if (
+        failures.length > 0 ||
+        !documents.routing ||
+        !documents.progress.snapshot
+      ) {
+        return validationEnvelope(failures)
       }
+      const reconciled = reconcileDurableBindings({
+        evidence,
+        routing: documents.routing,
+        progressSnapshot: documents.progress.snapshot,
+        routeChange: documents.routeChange,
+      })
+      failures.push(...reconciled.failures)
+      if (reconciled.actions.length > 0 && failures.length === 0) {
+        return validationEnvelope([], [], {
+          admission_authorized: false,
+          durable_snapshot: evidence.snapshot,
+          reconciliation_actions: reconciled.actions,
+        })
+      }
+      if (failures.length > 0) return validationEnvelope(failures)
+      const taskBindings = deriveTaskBindings(documents.routing, failures)
+      if (failures.length > 0) return validationEnvelope(failures)
+      return validationEnvelope(failures, taskBindings, {
+        admission_authorized: true,
+        durable_snapshot: evidence.snapshot,
+      })
+    }
+    if (failures.length === 0 && documents.routing) {
+      const taskBindings = deriveTaskBindings(documents.routing, failures)
+      return validationEnvelope(failures, taskBindings)
     }
     return validationEnvelope(failures)
   }

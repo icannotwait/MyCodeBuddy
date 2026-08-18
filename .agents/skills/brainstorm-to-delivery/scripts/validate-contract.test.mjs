@@ -21,6 +21,7 @@ import {
   validateSimpleDocuments,
   validateSkillMarkdown,
 } from "./validate-contract.lib.mjs"
+import * as contractLib from "./validate-contract.lib.mjs"
 
 const here = dirname(fileURLToPath(import.meta.url))
 const realSkill = readFileSync(join(here, "..", "SKILL.md"), "utf8")
@@ -266,6 +267,10 @@ function run(
     recovery_count: 0,
     replaced_task_id: null,
     replacement_reason: null,
+    root_task_id: task_id,
+    previous_task_id: null,
+    lineage_root_task_id: task_id,
+    generic_generation: 1,
   }
 }
 
@@ -327,6 +332,7 @@ function progress(snapshot = routing()) {
     schema_version: 1,
     plan_rel_path: planRelPath,
     active_task_index: null,
+    pending_route_change: null,
     tasks: [
       progressTask(snapshot.tasks[0], "completed"),
       progressTask(snapshot.tasks[1], "pending", 20),
@@ -6679,3 +6685,1553 @@ describe("durable route binding derivation", () => {
     )
   })
 })
+
+const SNAPSHOT_ID = "1a641e16-36f4-4ec5-aa4f-18d18e6ab107"
+const SNAPSHOT_CREATED = "2099-01-01T00:00:00.000Z"
+const SNAPSHOT_EXPIRES = "2099-01-01T00:01:00.000Z"
+const CURSOR_A = "cursorA"
+const ZERO_FINGERPRINT =
+  "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+
+function conflictingColorEnv() {
+  return { ...process.env, FORCE_COLOR: "1", NO_COLOR: "1" }
+}
+
+function spawnCli(args, extraEnv = {}) {
+  return spawnSync(
+    process.execPath,
+    [join(here, "validate-contract.mjs"), ...args],
+    {
+      encoding: "utf8",
+      env: { ...conflictingColorEnv(), ...extraEnv },
+    }
+  )
+}
+
+function hasRule(failures, rule) {
+  const list = Array.isArray(failures) ? failures : []
+  const hit = list.some((failure) => {
+    if (typeof failure === "string") return failure.includes(`[${rule}]`)
+    return failure?.rule_id === rule
+  })
+  assert.ok(hit, `expected ${rule}; got ${JSON.stringify(failures)}`)
+}
+
+function evidencePage(overrides = {}, runs = []) {
+  return {
+    schema_version: 1,
+    namespace: "brainstorm-to-delivery",
+    snapshot_id: SNAPSHOT_ID,
+    snapshot_revision: "42",
+    snapshot_created_at: SNAPSHOT_CREATED,
+    snapshot_expires_at: SNAPSHOT_EXPIRES,
+    total_rows: runs.length,
+    page_start: 0,
+    request_cursor: null,
+    runs,
+    next_cursor: null,
+    complete: true,
+    ...overrides,
+    runs: overrides.runs ?? runs,
+  }
+}
+
+function evidenceWrapper(pages) {
+  return { schema_version: 1, pages }
+}
+
+function emptyEvidence() {
+  return evidenceWrapper([evidencePage({ snapshot_revision: "0" }, [])])
+}
+
+function firstIntent(overrides = {}) {
+  return {
+    kind: "first",
+    continuation_target_task_id: null,
+    replacement_target_task_id: null,
+    replacement_reason: null,
+    expected_root_task_id: null,
+    expected_lineage_root_task_id: null,
+    expected_generic_generation: 1,
+    expected_child_conversation_id: null,
+    adopted_after_lost_acknowledgement: false,
+    ...overrides,
+  }
+}
+
+function continueIntent(target, overrides = {}) {
+  return {
+    kind: "continue",
+    continuation_target_task_id: target.task_id,
+    replacement_target_task_id: null,
+    replacement_reason: null,
+    expected_root_task_id: target.root_task_id ?? target.task_id,
+    expected_lineage_root_task_id:
+      target.lineage_root_task_id ?? target.task_id,
+    expected_generic_generation: (target.generic_generation ?? 1) + 1,
+    expected_child_conversation_id: target.child_conversation_id,
+    adopted_after_lost_acknowledgement: false,
+    ...overrides,
+  }
+}
+
+function replacementIntent(target, reason = "unresumable", overrides = {}) {
+  return {
+    kind: "replacement",
+    continuation_target_task_id: null,
+    replacement_target_task_id: target.task_id,
+    replacement_reason: reason,
+    expected_root_task_id: null,
+    expected_lineage_root_task_id:
+      target.lineage_root_task_id ?? target.task_id,
+    expected_generic_generation: 1,
+    expected_child_conversation_id: null,
+    adopted_after_lost_acknowledgement: false,
+    ...overrides,
+  }
+}
+
+function durableRun(overrides = {}) {
+  const taskId = overrides.task_id ?? "6b228a7d-4ac9-4bc7-a16e-f4ecf6f0fd45"
+  return {
+    task_id: taskId,
+    root_task_id: taskId,
+    previous_task_id: null,
+    lineage_root_task_id: taskId,
+    replaced_task_id: null,
+    replacement_reason: null,
+    generic_generation: 1,
+    work_unit_key: "task|1|implementer|grok|none",
+    child_conversation_id: 10,
+    agent_type: "grok",
+    profile_id: null,
+    status: "completed",
+    orchestration_binding: null,
+    ...overrides,
+    task_id: overrides.task_id ?? taskId,
+    root_task_id: overrides.root_task_id ?? overrides.task_id ?? taskId,
+    lineage_root_task_id:
+      overrides.lineage_root_task_id ?? overrides.task_id ?? taskId,
+  }
+}
+
+function durableFromProgress(progressRun, overrides = {}) {
+  const status =
+    progressRun.state === "cancelled"
+      ? "canceled"
+      : progressRun.state === "stalled"
+        ? "running"
+        : progressRun.state
+  return durableRun({
+    task_id: progressRun.task_id,
+    root_task_id: progressRun.root_task_id ?? progressRun.task_id,
+    previous_task_id: progressRun.previous_task_id ?? null,
+    lineage_root_task_id:
+      progressRun.lineage_root_task_id ?? progressRun.task_id,
+    replaced_task_id: progressRun.replaced_task_id ?? null,
+    replacement_reason: progressRun.replacement_reason ?? null,
+    generic_generation: progressRun.generic_generation ?? 1,
+    work_unit_key: progressRun.work_unit_key,
+    child_conversation_id: progressRun.child_conversation_id,
+    agent_type: progressRun.agent_type,
+    profile_id: progressRun.profile_id,
+    status,
+    orchestration_binding: progressRun.orchestration_binding ?? null,
+    ...overrides,
+  })
+}
+
+function parseEvidence(value, options) {
+  assert.equal(typeof contractLib.parseDurableBindingEvidence, "function")
+  assert.equal(contractLib.MAX_DURABLE_EVIDENCE_BYTES, 4 * 1024 * 1024)
+  return contractLib.parseDurableBindingEvidence(
+    typeof value === "string" ? value : JSON.stringify(value),
+    options
+  )
+}
+
+function bindingsFor(snapshot, planMarkdown = plan(snapshot)) {
+  const parsed = parseSimplePlan(planMarkdown)
+  const failures = []
+  const normalized = validateRoutingSnapshot(parsed.routing, parsed, failures)
+  assert.deepEqual(failures, [])
+  const bindings = deriveTaskBindings(normalized)
+  assert.ok(bindings.length > 0)
+  return { parsed, normalized, bindings }
+}
+
+function applyBindings(state, bindings) {
+  for (const progressTask of state.tasks) {
+    const binding = bindings.find(
+      (entry) => entry.task_index === progressTask.index
+    )
+    progressTask.route_fingerprint =
+      binding.orchestration_binding.route_fingerprint
+    progressTask.orchestration_binding = binding.orchestration_binding
+    progressTask.risk_level = binding.risk_level
+    progressTask.task_agent_generation = binding.task_agent_generation
+    progressTask.expected_work_unit_keys = binding.expected_work_unit_keys
+    for (const entry of progressTask.runs) {
+      entry.orchestration_binding = binding.orchestration_binding
+      entry.task_agent_generation = binding.task_agent_generation
+    }
+  }
+  return state
+}
+
+function progressMarkdown(state) {
+  return `# Progress\n\n${block("codeg-simple-progress-v1", state)}\n`
+}
+
+function staticValidation(planMarkdown, state, extra = {}) {
+  return runValidation({
+    skillMarkdown: skill,
+    planMarkdown,
+    progressMarkdown: progressMarkdown(state),
+    planRelPath,
+    outputJson: true,
+    ...extra,
+  })
+}
+
+function fullAdmission(planMarkdown, state, pages, extra = {}) {
+  return runValidation({
+    skillMarkdown: skill,
+    planMarkdown,
+    progressMarkdown: progressMarkdown(state),
+    planRelPath,
+    admission: true,
+    outputJson: true,
+    durableEvidence: JSON.stringify(evidenceWrapper(pages)),
+    ...extra,
+  })
+}
+
+function documentAdmission(pages, extra = {}) {
+  return runValidation({
+    skillMarkdown: skill,
+    documentAdmission: true,
+    outputJson: true,
+    durableEvidence: JSON.stringify(evidenceWrapper(pages)),
+    ...extra,
+  })
+}
+
+function sevenTaskRouting(suffixAgent = identity("gemini"), suffixGen = 1) {
+  const generations = [
+    {
+      generation: 1,
+      agent_type: "grok",
+      profile_id: null,
+      effective_from_task_index: 1,
+    },
+  ]
+  if (suffixGen === 2) {
+    generations.push({
+      generation: 2,
+      ...suffixAgent,
+      effective_from_task_index: 5,
+    })
+  }
+  return {
+    schema_version: 1,
+    risk_policy_version: "b2d_task_risk_v1",
+    task_agent_generations: generations,
+    tasks: [1, 2, 3, 4, 5, 6, 7].map((index) =>
+      task(
+        index,
+        "high",
+        index >= 5 && suffixGen === 2 ? suffixAgent : identity(),
+        index >= 5 && suffixGen === 2 ? 2 : 1
+      )
+    ),
+  }
+}
+
+function sevenTaskPlan(snapshot) {
+  return `# Plan
+
+${block("codeg-b2d-routing-v1", snapshot)}
+
+## Task 1: One
+
+## Task 2: Two
+
+## Task 3: Three
+
+## Task 4: Four
+
+## Task 5: Five
+
+## Task 6: Six
+
+## Task 7: Seven
+`
+}
+
+function sevenTaskProgress(snapshot, suffixStatus = "pending") {
+  return {
+    schema_version: 1,
+    plan_rel_path: planRelPath,
+    active_task_index: null,
+    pending_route_change: null,
+    tasks: snapshot.tasks.map((routeTask, offset) =>
+      progressTask(
+        routeTask,
+        offset < 4 ? "completed" : suffixStatus,
+        10 + offset * 10
+      )
+    ),
+    final_review_status: "pending",
+    updated_at: "2026-08-16T00:00:00Z",
+  }
+}
+
+function routeChangeIntent(overrides = {}) {
+  return {
+    requested_agent_type: "gemini",
+    requested_profile_id: null,
+    next_generation: 2,
+    effective_from_task_index: 5,
+    affected_task_indices: [5, 6, 7],
+    ...overrides,
+  }
+}
+
+function matchedDurablePages(state) {
+  const runs = state.tasks.flatMap((task) =>
+    task.runs
+      .filter((entry) => typeof entry.task_id === "string" && entry.task_id)
+      .map((entry) => durableFromProgress(entry))
+  )
+  return [
+    evidencePage({ total_rows: runs.length, snapshot_revision: "7" }, runs),
+  ]
+}
+
+function twoTaskBoundState() {
+  const snapshot = routing()
+  const planMarkdown = plan(snapshot)
+  const { bindings } = bindingsFor(snapshot, planMarkdown)
+  const state = applyBindings(progress(snapshot), bindings)
+  return { snapshot, planMarkdown, bindings, state }
+}
+
+describe("durable page envelopes", () => {
+  it("exports the exact 4 MiB cap and preserves raw multi-page cursor envelopes", () => {
+    assert.equal(contractLib.MAX_DURABLE_EVIDENCE_BYTES, 4 * 1024 * 1024)
+    assert.equal(typeof contractLib.parseDurableBindingEvidence, "function")
+    const first = evidencePage(
+      {
+        total_rows: 2,
+        complete: false,
+        next_cursor: CURSOR_A,
+        snapshot_revision: "3",
+      },
+      [durableRun({ task_id: "row-1", child_conversation_id: 11 })]
+    )
+    const second = evidencePage(
+      {
+        total_rows: 2,
+        page_start: 1,
+        request_cursor: CURSOR_A,
+        next_cursor: null,
+        complete: true,
+        snapshot_revision: "3",
+      },
+      [
+        durableRun({
+          task_id: "row-2",
+          work_unit_key: "task|1|reviewer|primary|codex|none",
+          child_conversation_id: 12,
+          agent_type: "codex",
+        }),
+      ]
+    )
+    const parsed = parseEvidence(evidenceWrapper([first, second]))
+    assert.deepEqual(parsed.failures, [])
+    assert.equal(parsed.pages.length, 2)
+    assert.equal(parsed.pages[0].request_cursor, null)
+    assert.equal(parsed.pages[0].next_cursor, CURSOR_A)
+    assert.equal(parsed.pages[1].request_cursor, CURSOR_A)
+    assert.equal(parsed.runs.length, 2)
+    assert.deepEqual(parsed.snapshot, {
+      snapshot_id: SNAPSHOT_ID,
+      snapshot_revision: "3",
+    })
+  })
+
+  it("rejects every malformed page-envelope condition with B2D-DURABLE-001", () => {
+    const validRun = durableRun()
+    const twoPages = [
+      evidencePage(
+        {
+          total_rows: 2,
+          complete: false,
+          next_cursor: CURSOR_A,
+        },
+        [validRun]
+      ),
+      evidencePage(
+        {
+          total_rows: 2,
+          page_start: 1,
+          request_cursor: CURSOR_A,
+        },
+        [durableRun({ task_id: "row-2", child_conversation_id: 12 })]
+      ),
+    ]
+    const cases = [
+      ["over 4 MiB", "x".repeat(4 * 1024 * 1024 + 1)],
+      ["unknown wrapper field", { ...emptyEvidence(), extra: true }],
+      [
+        "unknown page field",
+        evidenceWrapper([evidencePage({ parent_id: "nope" }, [])]),
+      ],
+      [
+        "unknown run field",
+        evidenceWrapper([evidencePage({}, [durableRun({ prompt: "secret" })])]),
+      ],
+      [
+        "wrong schema",
+        evidenceWrapper([evidencePage({ schema_version: 2 }, [])]),
+      ],
+      [
+        "wrong namespace",
+        evidenceWrapper([evidencePage({ namespace: "other-namespace" }, [])]),
+      ],
+      [
+        "mixed snapshot id",
+        evidenceWrapper([
+          twoPages[0],
+          {
+            ...twoPages[1],
+            snapshot_id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+          },
+        ]),
+      ],
+      [
+        "mixed revision",
+        evidenceWrapper([
+          twoPages[0],
+          { ...twoPages[1], snapshot_revision: "99" },
+        ]),
+      ],
+      [
+        "mixed timestamps",
+        evidenceWrapper([
+          twoPages[0],
+          { ...twoPages[1], snapshot_created_at: "2099-01-01T00:00:01.000Z" },
+        ]),
+      ],
+      [
+        "mixed totals",
+        evidenceWrapper([twoPages[0], { ...twoPages[1], total_rows: 3 }]),
+      ],
+      [
+        "invalid decimal revision",
+        evidenceWrapper([evidencePage({ snapshot_revision: "01" }, [])]),
+      ],
+      [
+        "expired timestamps",
+        evidenceWrapper([
+          evidencePage(
+            {
+              snapshot_created_at: "2020-01-01T00:00:00.000Z",
+              snapshot_expires_at: "2020-01-01T00:01:00.000Z",
+            },
+            []
+          ),
+        ]),
+      ],
+      [
+        "total over 4096",
+        evidenceWrapper([evidencePage({ total_rows: 4097 }, [])]),
+      ],
+      [
+        "first offset not zero",
+        evidenceWrapper([evidencePage({ page_start: 1 }, [])]),
+      ],
+      [
+        "gap",
+        evidenceWrapper([twoPages[0], { ...twoPages[1], page_start: 3 }]),
+      ],
+      [
+        "overlap",
+        evidenceWrapper([twoPages[0], { ...twoPages[1], page_start: 0 }]),
+      ],
+      ["reordering", evidenceWrapper([twoPages[1], twoPages[0]])],
+      [
+        "duplicate Task IDs",
+        evidenceWrapper([
+          evidencePage({ total_rows: 2 }, [
+            validRun,
+            durableRun({ child_conversation_id: 99 }),
+          ]),
+        ]),
+      ],
+      [
+        "first non-null request cursor",
+        evidenceWrapper([evidencePage({ request_cursor: CURSOR_A }, [])]),
+      ],
+      [
+        "altered request cursor",
+        evidenceWrapper([
+          twoPages[0],
+          { ...twoPages[1], request_cursor: "alteredCursor" },
+        ]),
+      ],
+      [
+        "swapped request cursor",
+        evidenceWrapper([
+          { ...twoPages[0], next_cursor: "cursorB" },
+          { ...twoPages[1], request_cursor: CURSOR_A },
+        ]),
+      ],
+      [
+        "non-final null outgoing cursor",
+        evidenceWrapper([{ ...twoPages[0], next_cursor: null }, twoPages[1]]),
+      ],
+      [
+        "duplicate final page",
+        evidenceWrapper([
+          evidencePage({}, []),
+          evidencePage({ page_start: 0 }, []),
+        ]),
+      ],
+      [
+        "incomplete final page",
+        evidenceWrapper([
+          evidencePage({ total_rows: 2, complete: true }, [validRun]),
+        ]),
+      ],
+      [
+        "total/run-count mismatch",
+        evidenceWrapper([evidencePage({ total_rows: 1 }, [])]),
+      ],
+      [
+        "trailing page after completion",
+        evidenceWrapper([
+          evidencePage({}, []),
+          evidencePage({ page_start: 0, request_cursor: null }, []),
+        ]),
+      ],
+    ]
+    for (const [label, fixture] of cases) {
+      const parsed = parseEvidence(fixture)
+      hasRule(parsed.failures, "B2D-DURABLE-001")
+      assert.equal(parsed.runs?.length ?? 0, 0, label)
+    }
+  })
+
+  it("maps malformed binding grammar to B2D-DURABLE-002 and keeps row fields exact", () => {
+    const { bindings } = bindingsFor(routing())
+    const good = durableRun({
+      orchestration_binding: bindings[0].orchestration_binding,
+    })
+    const parsedGood = parseEvidence(
+      evidenceWrapper([evidencePage({}, [good])])
+    )
+    assert.deepEqual(parsedGood.failures, [])
+    assert.equal(parsedGood.runs[0].agent_type, "grok")
+    assert.equal(parsedGood.runs[0].status, "completed")
+
+    const malformed = [
+      { ...good, orchestration_binding: { extra: true } },
+      {
+        ...good,
+        orchestration_binding: {
+          ...bindings[0].orchestration_binding,
+          route_fingerprint: "sha256:ZZ",
+        },
+      },
+      {
+        ...good,
+        orchestration_binding: {
+          ...bindings[0].orchestration_binding,
+          namespace: "Not-Valid",
+        },
+      },
+      {
+        ...good,
+        orchestration_binding: {
+          ...bindings[0].orchestration_binding,
+          generation: 0,
+        },
+      },
+    ]
+    for (const run of malformed) {
+      hasRule(
+        parseEvidence(evidenceWrapper([evidencePage({}, [run])])).failures,
+        "B2D-DURABLE-002"
+      )
+    }
+  })
+})
+
+describe("durable reconciliation and root-cause", () => {
+  it("rejects an admitted progress Task ID with no durable row", () => {
+    const { planMarkdown, state } = twoTaskBoundState()
+    const result = fullAdmission(planMarkdown, state, [
+      evidencePage({ snapshot_revision: "0" }, []),
+    ])
+    assert.equal(result.admission_authorized, false)
+    assert.deepEqual(result.task_bindings, [])
+    hasRule(result.failures, "B2D-DURABLE-003")
+  })
+
+  it("rejects a bound durable row missing from progress or Plan", () => {
+    const { planMarkdown, state, bindings } = twoTaskBoundState()
+    const extra = durableRun({
+      task_id: "orphan-bound",
+      work_unit_key: "task|9|implementer|codex|none",
+      child_conversation_id: 77,
+      agent_type: "codex",
+      orchestration_binding: bindings[0].orchestration_binding,
+    })
+    const result = fullAdmission(planMarkdown, state, [
+      ...matchedDurablePages(state).map((page) => ({
+        ...page,
+        total_rows: page.runs.length + 1,
+        runs: [...page.runs, extra],
+      })),
+    ])
+    assert.equal(result.admission_authorized, false)
+    hasRule(result.failures, "B2D-DURABLE-004")
+  })
+
+  it("rejects identity, lineage, status, and actual Agent/profile disagreement", () => {
+    const { planMarkdown, state } = twoTaskBoundState()
+    const pages = matchedDurablePages(state)
+    const mutations = [
+      (run) => (run.child_conversation_id = 999),
+      (run) => (run.root_task_id = "other-root"),
+      (run) => (run.previous_task_id = "ghost"),
+      (run) => (run.lineage_root_task_id = "other-lineage"),
+      (run) => (run.generic_generation = 9),
+      (run) => (run.replaced_task_id = "ghost"),
+      (run) => (run.status = "failed"),
+      (run) => (run.agent_type = "codex"),
+      (run) => (run.profile_id = "deep"),
+      (run) => (run.work_unit_key = "task|1|reviewer|primary|codex|none"),
+    ]
+    for (const mutate of mutations) {
+      const clone = structuredClone(pages)
+      mutate(clone[0].runs[0])
+      const result = fullAdmission(planMarkdown, state, clone)
+      assert.equal(result.admission_authorized, false)
+      hasRule(result.failures, "B2D-DURABLE-005")
+    }
+  })
+
+  it("rejects durable generation/fingerprint drift from Task 4 derivation", () => {
+    const { planMarkdown, state } = twoTaskBoundState()
+    const pages = matchedDurablePages(state)
+    pages[0].runs[0].orchestration_binding = {
+      ...pages[0].runs[0].orchestration_binding,
+      generation: 2,
+      route_fingerprint: ZERO_FINGERPRINT,
+    }
+    const result = fullAdmission(planMarkdown, state, pages)
+    assert.equal(result.admission_authorized, false)
+    hasRule(result.failures, "B2D-DURABLE-006")
+  })
+
+  it("rejects a recognized routed Task row that is unbound", () => {
+    const { planMarkdown, state } = twoTaskBoundState()
+    const pages = matchedDurablePages(state)
+    pages[0].runs[0].orchestration_binding = null
+    const result = fullAdmission(planMarkdown, state, pages)
+    assert.equal(result.admission_authorized, false)
+    hasRule(result.failures, "B2D-DURABLE-007")
+  })
+
+  it("fails the generation-rewrite root-cause even when the implementer key still matches", () => {
+    const snapshot = routing()
+    const planMarkdown = plan(snapshot)
+    const { bindings } = bindingsFor(snapshot, planMarkdown)
+    const state = applyBindings(progress(snapshot), bindings)
+    state.tasks[1] = progressTask(snapshot.tasks[1], "in_progress", 20)
+    state.active_task_index = 2
+    const implementerKey = state.tasks[1].expected_work_unit_keys.implementer
+    state.tasks[1].runs = [
+      {
+        ...run(implementerKey, "running", "t2-i", 20, 1),
+        orchestration_binding: bindings[1].orchestration_binding,
+      },
+    ]
+    applyBindings(state, bindings)
+    const originalPages = matchedDurablePages(state)
+    assert.equal(implementerKey, "task|2|implementer|codex|none")
+
+    const rewritten = routing()
+    rewritten.task_agent_generations.push({
+      generation: 2,
+      agent_type: "gemini",
+      profile_id: null,
+      effective_from_task_index: 2,
+    })
+    rewritten.tasks[1] = task(2, "high", identity("gemini"), 2)
+    const rewrittenPlan = plan(rewritten)
+    const { bindings: newBindings } = bindingsFor(rewritten, rewrittenPlan)
+    const rewrittenState = applyBindings(structuredClone(state), newBindings)
+    rewrittenState.tasks[1].task_agent_generation = 2
+    rewrittenState.tasks[1].runs[0].task_agent_generation = 2
+    rewrittenState.tasks[1].runs[0].work_unit_key = implementerKey
+    assert.equal(
+      rewrittenState.tasks[1].runs[0].work_unit_key,
+      originalPages[0].runs.find((row) => row.task_id === "t2-i").work_unit_key
+    )
+    const result = fullAdmission(rewrittenPlan, rewrittenState, originalPages)
+    assert.equal(result.admission_authorized, false)
+    assert.deepEqual(result.task_bindings, [])
+    assert.ok(
+      result.failures.some((failure) =>
+        String(failure.rule_id).startsWith("B2D-DURABLE-")
+      )
+    )
+  })
+
+  it("blocks a wrong-namespace recognized key after deleting its progress mirror", () => {
+    const { planMarkdown, state } = twoTaskBoundState()
+    const foreign = durableRun({
+      task_id: "foreign-keyed",
+      work_unit_key: "task|2|implementer|codex|none",
+      child_conversation_id: 88,
+      agent_type: "codex",
+      orchestration_binding: {
+        schema_version: 1,
+        namespace: "other-namespace",
+        generation: 1,
+        route_fingerprint: ZERO_FINGERPRINT,
+      },
+    })
+    const pages = matchedDurablePages(state)
+    pages[0].runs.push(foreign)
+    pages[0].total_rows = pages[0].runs.length
+    const result = fullAdmission(planMarkdown, state, pages)
+    assert.equal(result.admission_authorized, false)
+    assert.ok(
+      result.failures.some((failure) =>
+        ["B2D-DURABLE-004", "B2D-DURABLE-006", "B2D-DURABLE-002"].includes(
+          failure.rule_id
+        )
+      )
+    )
+  })
+
+  it("keeps foreign unkeyed rows out of valid query evidence", () => {
+    const parsed = parseEvidence(emptyEvidence())
+    assert.deepEqual(parsed.failures, [])
+    assert.equal(
+      parsed.runs.some(
+        (run) =>
+          run.work_unit_key == null &&
+          run.orchestration_binding?.namespace !== "brainstorm-to-delivery"
+      ),
+      false
+    )
+    const injected = durableRun({
+      task_id: "foreign-unkeyed",
+      work_unit_key: null,
+      orchestration_binding: {
+        schema_version: 1,
+        namespace: "other-namespace",
+        generation: 1,
+        route_fingerprint: ZERO_FINGERPRINT,
+      },
+    })
+    hasRule(
+      parseEvidence(evidenceWrapper([evidencePage({}, [injected])])).failures,
+      "B2D-DURABLE-001"
+    )
+  })
+
+  it("fails first, continue, and replacement fixtures when durable Agent/profile is wrong", () => {
+    const { planMarkdown, bindings, state } = twoTaskBoundState()
+    const implementer = state.tasks[0].runs[0]
+    const cases = [
+      durableFromProgress(implementer, { agent_type: "codex" }),
+      durableFromProgress(implementer, { profile_id: "deep" }),
+    ]
+    for (const bad of cases) {
+      const pages = matchedDurablePages(state)
+      pages[0].runs[0] = {
+        ...pages[0].runs[0],
+        ...bad,
+        task_id: implementer.task_id,
+      }
+      const mapped = fullAdmission(planMarkdown, state, pages)
+      hasRule(mapped.failures, "B2D-DURABLE-005")
+    }
+
+    const reserving = {
+      ...run(
+        state.tasks[1].expected_work_unit_keys.implementer,
+        "reserving",
+        null,
+        null,
+        1
+      ),
+      root_task_id: null,
+      previous_task_id: null,
+      lineage_root_task_id: null,
+      generic_generation: null,
+      orchestration_binding: bindings[1].orchestration_binding,
+      dispatch_intent: firstIntent(),
+    }
+    const adopting = structuredClone(state)
+    adopting.tasks[1].status = "in_progress"
+    adopting.active_task_index = 2
+    adopting.tasks[1].runs = [reserving]
+    const candidate = durableRun({
+      task_id: "new-first",
+      work_unit_key: reserving.work_unit_key,
+      child_conversation_id: 44,
+      agent_type: "grok",
+      profile_id: null,
+      status: "running",
+      orchestration_binding: bindings[1].orchestration_binding,
+    })
+    const adoptPages = [...matchedDurablePages(state)]
+    adoptPages[0].runs.push(candidate)
+    adoptPages[0].total_rows = adoptPages[0].runs.length
+    const firstWrong = fullAdmission(planMarkdown, adopting, adoptPages)
+    assert.equal(firstWrong.admission_authorized, false)
+    assert.ok(
+      firstWrong.failures.some((failure) =>
+        ["B2D-DURABLE-005", "B2D-DURABLE-009"].includes(failure.rule_id)
+      )
+    )
+  })
+
+  function inProgressBoundState() {
+    const fixture = twoTaskBoundState()
+    fixture.state.tasks[0].status = "in_progress"
+    fixture.state.active_task_index = 1
+    return fixture
+  }
+
+  it("returns only the status-only refresh prefix for legal lifecycle advances", () => {
+    const { planMarkdown, state } = inProgressBoundState()
+    const advances = [
+      ["reserving", "running"],
+      ["reserving", "completed"],
+      ["reserving", "failed"],
+      ["reserving", "canceled"],
+      ["running", "completed"],
+      ["running", "failed"],
+      ["running", "canceled"],
+    ]
+    for (const [from, to] of advances) {
+      const current = structuredClone(state)
+      current.tasks[0].runs[0].state = from
+      const pages = matchedDurablePages(current)
+      pages[0].runs[0].status = to
+      const result = fullAdmission(planMarkdown, current, pages)
+      assert.equal(result.admission_authorized, false)
+      assert.deepEqual(result.task_bindings, [])
+      assert.deepEqual(result.reconciliation_actions, [])
+      assert.equal(result.failures.length, 1)
+      assert.equal(result.failures[0].rule_id, "B2D-DURABLE-005")
+      assert.equal(
+        result.failures[0].message,
+        `status-only refresh required: ${current.tasks[0].runs[0].task_id} ${from} ${to}`
+      )
+
+      current.tasks[0].runs[0].state = to === "canceled" ? "cancelled" : to
+      const refreshed = fullAdmission(planMarkdown, current, [
+        evidencePage({ snapshot_revision: "100" }, pages[0].runs),
+      ])
+      assert.deepEqual(refreshed.failures, [])
+      assert.equal(refreshed.admission_authorized, true)
+    }
+  })
+
+  it("never enters the refresh path for illegal status or mixed failures", () => {
+    const { planMarkdown, state } = inProgressBoundState()
+    const illegal = [
+      ["completed", "failed"],
+      ["failed", "completed"],
+      ["completed", "running"],
+      ["running", "reserving"],
+      ["completed", "unknown"],
+    ]
+    for (const [from, to] of illegal) {
+      const current = structuredClone(state)
+      current.tasks[0].runs[0].state = from
+      const pages = matchedDurablePages(current)
+      pages[0].runs[0].status = to
+      const result = fullAdmission(planMarkdown, current, pages)
+      assert.equal(result.admission_authorized, false)
+      assert.ok(
+        !result.failures.some((failure) =>
+          String(failure.message).startsWith("status-only refresh required:")
+        )
+      )
+    }
+
+    const mixed = structuredClone(state)
+    mixed.tasks[0].runs[0].state = "reserving"
+    const mixedPages = matchedDurablePages(mixed)
+    mixedPages[0].runs[0].status = "running"
+    mixedPages[0].runs[0].agent_type = "codex"
+    const mixedResult = fullAdmission(planMarkdown, mixed, mixedPages)
+    assert.ok(
+      !mixedResult.failures.some((failure) =>
+        failure.message.startsWith("status-only refresh required:")
+      )
+    )
+    hasRule(mixedResult.failures, "B2D-DURABLE-005")
+  })
+
+  it("validates the exact pending_route_change object and legal suffix", () => {
+    const oldRouting = sevenTaskRouting()
+    const oldPlan = sevenTaskPlan(oldRouting)
+    const { bindings } = bindingsFor(oldRouting, oldPlan)
+    const state = applyBindings(sevenTaskProgress(oldRouting), bindings)
+    state.pending_route_change = routeChangeIntent()
+    const valid = staticValidation(oldPlan, state)
+    assert.deepEqual(valid.failures, [])
+    assert.equal(valid.admission_authorized, false)
+
+    const malformed = [
+      { requested_agent_type: "gemini" },
+      { ...routeChangeIntent(), extra: true },
+      { ...routeChangeIntent(), requested_agent_type: "unavailable" },
+      { ...routeChangeIntent(), requested_profile_id: "none" },
+      { ...routeChangeIntent(), next_generation: 4 },
+      { ...routeChangeIntent(), next_generation: 0xffffffff + 1 },
+      { ...routeChangeIntent(), effective_from_task_index: 6 },
+      { ...routeChangeIntent(), affected_task_indices: [5, 5, 6, 7] },
+      { ...routeChangeIntent(), affected_task_indices: [5, 7] },
+      { ...routeChangeIntent(), affected_task_indices: [6, 7] },
+    ]
+    for (const intent of malformed) {
+      const current = structuredClone(state)
+      current.pending_route_change = intent
+      const result = staticValidation(oldPlan, current)
+      assert.equal(result.admission_authorized, false)
+      assert.ok(result.failures.length > 0, JSON.stringify(intent))
+    }
+
+    const nonempty = structuredClone(state)
+    nonempty.tasks[4].runs.push(
+      run(
+        nonempty.tasks[4].expected_work_unit_keys.implementer,
+        "reserving",
+        null,
+        null,
+        1
+      )
+    )
+    assert.ok(staticValidation(oldPlan, nonempty).failures.length > 0)
+
+    const active = structuredClone(state)
+    active.active_task_index = 4
+    active.tasks[3].status = "in_progress"
+    assert.ok(staticValidation(oldPlan, active).failures.length > 0)
+
+    const incompletePrior = structuredClone(state)
+    incompletePrior.tasks[3].status = "pending"
+    incompletePrior.tasks[3].runs = []
+    assert.ok(staticValidation(oldPlan, incompletePrior).failures.length > 0)
+  })
+
+  it("accepts synchronized pre- and post-revision states while the intent is pending", () => {
+    const oldRouting = sevenTaskRouting()
+    const oldPlan = sevenTaskPlan(oldRouting)
+    const { bindings: oldBindings } = bindingsFor(oldRouting, oldPlan)
+    const pre = applyBindings(sevenTaskProgress(oldRouting), oldBindings)
+    pre.pending_route_change = routeChangeIntent()
+    const preStatic = staticValidation(oldPlan, pre)
+    assert.deepEqual(preStatic.failures, [])
+    const preFull = fullAdmission(oldPlan, pre, matchedDurablePages(pre))
+    assert.deepEqual(preFull.failures, [])
+    assert.equal(preFull.admission_authorized, true)
+
+    const newRouting = sevenTaskRouting(identity("gemini"), 2)
+    const newPlan = sevenTaskPlan(newRouting)
+    const { bindings: newBindings } = bindingsFor(newRouting, newPlan)
+    const post = applyBindings(sevenTaskProgress(newRouting), newBindings)
+    post.pending_route_change = routeChangeIntent()
+    const postStatic = staticValidation(newPlan, post)
+    assert.deepEqual(postStatic.failures, [])
+    assert.equal(postStatic.task_bindings[4].task_agent_generation, 2)
+    const postFull = fullAdmission(newPlan, post, matchedDurablePages(post))
+    assert.deepEqual(postFull.failures, [])
+    assert.equal(postFull.admission_authorized, true)
+  })
+
+  it("recognizes only the exact Plan-ahead/progress-old transition in combined static mode", () => {
+    const oldRouting = sevenTaskRouting()
+    const oldPlan = sevenTaskPlan(oldRouting)
+    const { bindings: oldBindings } = bindingsFor(oldRouting, oldPlan)
+    const oldState = applyBindings(sevenTaskProgress(oldRouting), oldBindings)
+    oldState.pending_route_change = routeChangeIntent()
+    const newRouting = sevenTaskRouting(identity("gemini"), 2)
+    const newPlan = sevenTaskPlan(newRouting)
+    const { bindings: newBindings } = bindingsFor(newRouting, newPlan)
+
+    const transition = staticValidation(newPlan, oldState)
+    assert.deepEqual(transition.failures, [])
+    assert.equal(transition.admission_authorized, false)
+    assert.deepEqual(transition.reconciliation_actions, [])
+    assert.equal(transition.task_bindings.length, 7)
+    assert.deepEqual(
+      transition.task_bindings.map((entry) => entry.orchestration_binding),
+      newBindings.map((entry) => entry.orchestration_binding)
+    )
+
+    const full = fullAdmission(newPlan, oldState, matchedDurablePages(oldState))
+    assert.equal(full.admission_authorized, false)
+    assert.deepEqual(full.task_bindings, [])
+    assert.ok(full.failures.length > 0)
+
+    const partial = structuredClone(oldState)
+    partial.tasks[4].task_agent_generation = 2
+    partial.tasks[4].expected_work_unit_keys =
+      newBindings[4].expected_work_unit_keys
+    partial.tasks[4].route_fingerprint =
+      newBindings[4].orchestration_binding.route_fingerprint
+    const partialResult = staticValidation(newPlan, partial)
+    assert.ok(partialResult.failures.length > 0)
+    assert.deepEqual(partialResult.task_bindings, [])
+  })
+
+  it("uses B2D-DURABLE-008 when any affected durable row exists", () => {
+    const oldRouting = sevenTaskRouting()
+    const oldPlan = sevenTaskPlan(oldRouting)
+    const { bindings } = bindingsFor(oldRouting, oldPlan)
+    const state = applyBindings(sevenTaskProgress(oldRouting), bindings)
+    state.pending_route_change = routeChangeIntent()
+    for (const status of [
+      "reserving",
+      "running",
+      "completed",
+      "failed",
+      "canceled",
+    ]) {
+      const ghost = durableRun({
+        task_id: `affected-${status}`,
+        work_unit_key: state.tasks[4].expected_work_unit_keys.implementer,
+        child_conversation_id: 200,
+        agent_type: "codex",
+        status,
+        orchestration_binding: bindings[4].orchestration_binding,
+      })
+      const pages = matchedDurablePages(state)
+      pages[0].runs.push(ghost)
+      pages[0].total_rows = pages[0].runs.length
+      const result = fullAdmission(oldPlan, state, pages)
+      assert.equal(result.admission_authorized, false)
+      hasRule(result.failures, "B2D-DURABLE-008")
+    }
+  })
+})
+
+describe("lost acknowledgement adoption", () => {
+  function adoptionFixture(kind) {
+    const { snapshot, planMarkdown, bindings, state } = twoTaskBoundState()
+    const target = state.tasks[0].runs[0]
+    const key = state.tasks[1].expected_work_unit_keys.implementer
+    const binding = bindings[1].orchestration_binding
+    let intent
+    let candidate
+    if (kind === "first") {
+      intent = firstIntent()
+      candidate = durableRun({
+        task_id: "adopt-first",
+        work_unit_key: key,
+        child_conversation_id: 31,
+        agent_type: "codex",
+        status: "running",
+        orchestration_binding: binding,
+      })
+    } else if (kind === "continue") {
+      intent = continueIntent(target)
+      candidate = durableRun({
+        task_id: "adopt-continue",
+        root_task_id: target.root_task_id,
+        previous_task_id: target.task_id,
+        lineage_root_task_id: target.lineage_root_task_id,
+        generic_generation: target.generic_generation + 1,
+        work_unit_key: target.work_unit_key,
+        child_conversation_id: target.child_conversation_id,
+        agent_type: target.agent_type,
+        profile_id: target.profile_id,
+        status: "running",
+        orchestration_binding: target.orchestration_binding,
+      })
+    } else {
+      intent = replacementIntent(target)
+      candidate = durableRun({
+        task_id: "adopt-replace",
+        root_task_id: "adopt-replace",
+        previous_task_id: null,
+        lineage_root_task_id: target.lineage_root_task_id,
+        replaced_task_id: target.task_id,
+        replacement_reason: "unresumable",
+        generic_generation: 1,
+        work_unit_key: target.work_unit_key,
+        child_conversation_id: 91,
+        agent_type: target.agent_type,
+        profile_id: target.profile_id,
+        status: "reserving",
+        orchestration_binding: target.orchestration_binding,
+      })
+    }
+    const hostIndex = kind === "first" ? 1 : 0
+    const host = state.tasks[hostIndex]
+    const reserving = {
+      ...run(
+        kind === "first" ? key : target.work_unit_key,
+        "reserving",
+        null,
+        null,
+        1
+      ),
+      root_task_id: null,
+      previous_task_id: null,
+      lineage_root_task_id: null,
+      generic_generation: null,
+      replaced_task_id: null,
+      replacement_reason: null,
+      orchestration_binding:
+        kind === "first" ? binding : target.orchestration_binding,
+      dispatch_intent: intent,
+    }
+    if (kind === "first") {
+      host.status = "in_progress"
+      state.active_task_index = 2
+      host.runs = [reserving]
+    } else {
+      host.status = "in_progress"
+      state.active_task_index = host.index
+      host.runs.push(reserving)
+    }
+    const pages = matchedDurablePages({
+      ...state,
+      tasks: state.tasks.map((task, index) =>
+        index === hostIndex
+          ? { ...task, runs: task.runs.filter((entry) => entry !== reserving) }
+          : task
+      ),
+    })
+    pages[0].runs.push(candidate)
+    pages[0].total_rows = pages[0].runs.length
+    return {
+      snapshot,
+      planMarkdown,
+      state,
+      pages,
+      candidate,
+      reservingIndex: host.runs.indexOf(reserving),
+      taskIndex: host.index,
+    }
+  }
+
+  for (const kind of ["first", "continue", "replacement"]) {
+    it(`returns one non-authorizing ${kind} adopt_lost_acknowledgement action`, () => {
+      const fixture = adoptionFixture(kind)
+      const result = fullAdmission(
+        fixture.planMarkdown,
+        fixture.state,
+        fixture.pages
+      )
+      assert.equal(result.admission_authorized, false)
+      assert.deepEqual(result.task_bindings, [])
+      assert.deepEqual(result.failures, [])
+      assert.equal(result.reconciliation_actions.length, 1)
+      const action = result.reconciliation_actions[0]
+      assert.equal(action.kind, "adopt_lost_acknowledgement")
+      assert.equal(action.task_index, fixture.taskIndex)
+      assert.equal(action.progress_run_index, fixture.reservingIndex)
+      assert.equal(action.task_id, fixture.candidate.task_id)
+      assert.equal(
+        action.child_conversation_id,
+        fixture.candidate.child_conversation_id
+      )
+      assert.equal(action.root_task_id, fixture.candidate.root_task_id)
+      assert.equal(action.previous_task_id, fixture.candidate.previous_task_id)
+      assert.equal(
+        action.lineage_root_task_id,
+        fixture.candidate.lineage_root_task_id
+      )
+      assert.equal(
+        action.generic_generation,
+        fixture.candidate.generic_generation
+      )
+      assert.equal(action.replaced_task_id, fixture.candidate.replaced_task_id)
+      assert.equal(
+        action.replacement_reason,
+        fixture.candidate.replacement_reason
+      )
+      assert.equal(action.work_unit_key, fixture.candidate.work_unit_key)
+      assert.equal(action.agent_type, fixture.candidate.agent_type)
+      assert.equal(action.profile_id, fixture.candidate.profile_id)
+      assert.equal(action.status, fixture.candidate.status)
+      assert.deepEqual(
+        action.orchestration_binding,
+        fixture.candidate.orchestration_binding
+      )
+    })
+  }
+
+  it("blocks zero/two candidates, two intents, cross-match, prior adoption, and deleted mirrors", () => {
+    const zero = adoptionFixture("first")
+    zero.pages[0].runs.pop()
+    zero.pages[0].total_rows = zero.pages[0].runs.length
+    hasRule(
+      fullAdmission(zero.planMarkdown, zero.state, zero.pages).failures,
+      "B2D-DURABLE-009"
+    )
+
+    const two = adoptionFixture("first")
+    two.pages[0].runs.push(
+      durableRun({
+        task_id: "second-candidate",
+        work_unit_key: two.state.tasks[1].runs[0].work_unit_key,
+        child_conversation_id: 32,
+        agent_type: "codex",
+        status: "running",
+        orchestration_binding: two.state.tasks[1].runs[0].orchestration_binding,
+      })
+    )
+    two.pages[0].total_rows = two.pages[0].runs.length
+    hasRule(
+      fullAdmission(two.planMarkdown, two.state, two.pages).failures,
+      "B2D-DURABLE-009"
+    )
+
+    const twoIntents = adoptionFixture("first")
+    twoIntents.state.tasks[1].runs.push({
+      ...twoIntents.state.tasks[1].runs[0],
+      work_unit_key:
+        twoIntents.state.tasks[1].expected_work_unit_keys.reviewers.primary,
+      role: "reviewer",
+      agent_type: "codex",
+      dispatch_intent: firstIntent(),
+    })
+    hasRule(
+      fullAdmission(twoIntents.planMarkdown, twoIntents.state, twoIntents.pages)
+        .failures,
+      "B2D-DURABLE-009"
+    )
+
+    const cross = adoptionFixture("first")
+    cross.pages[0].runs.at(-1).work_unit_key =
+      cross.state.tasks[1].expected_work_unit_keys.reviewers.primary
+    hasRule(
+      fullAdmission(cross.planMarkdown, cross.state, cross.pages).failures,
+      "B2D-DURABLE-009"
+    )
+
+    const prior = adoptionFixture("first")
+    prior.state.tasks[1].runs[0].dispatch_intent.adopted_after_lost_acknowledgement = true
+    hasRule(
+      fullAdmission(prior.planMarkdown, prior.state, prior.pages).failures,
+      "B2D-DURABLE-009"
+    )
+
+    const deleted = twoTaskBoundState()
+    const orphan = durableFromProgress(deleted.state.tasks[0].runs[0], {
+      task_id: "deleted-mirror",
+      child_conversation_id: 70,
+    })
+    deleted.state.tasks[0].runs = []
+    deleted.state.tasks[0].status = "pending"
+    const deletedPages = [evidencePage({}, [orphan])]
+    const deletedResult = fullAdmission(
+      deleted.planMarkdown,
+      deleted.state,
+      deletedPages
+    )
+    assert.ok(
+      deletedResult.failures.some((failure) =>
+        ["B2D-DURABLE-004", "B2D-DURABLE-009"].includes(failure.rule_id)
+      )
+    )
+  })
+})
+
+describe("document and full admission CLI", () => {
+  it("authorizes document admission only for an empty requested-namespace snapshot", () => {
+    const empty = documentAdmission(emptyEvidence().pages)
+    assert.equal(empty.admission_authorized, true)
+    assert.deepEqual(empty.task_bindings, [])
+    assert.deepEqual(empty.reconciliation_actions, [])
+    assert.deepEqual(empty.durable_snapshot, {
+      snapshot_id: SNAPSHOT_ID,
+      snapshot_revision: "0",
+    })
+
+    const { bindings } = bindingsFor(routing())
+    const blocked = documentAdmission([
+      evidencePage({}, [
+        durableRun({
+          orchestration_binding: bindings[0].orchestration_binding,
+        }),
+      ]),
+    ])
+    assert.equal(blocked.admission_authorized, false)
+    assert.deepEqual(blocked.task_bindings, [])
+  })
+
+  it("bootstraps Plan/progress without a circular dependency", () => {
+    const snapshot = routing()
+    const planMarkdown = plan(snapshot)
+    const shell = {
+      schema_version: 1,
+      plan_rel_path: planRelPath,
+      active_task_index: null,
+      pending_route_change: null,
+      tasks: [],
+      final_review_status: "pending",
+      updated_at: "2026-08-16T00:00:00Z",
+    }
+    const beforeInit = staticValidation(planMarkdown, shell)
+    assert.ok(beforeInit.failures.length > 0)
+    assert.equal(beforeInit.admission_authorized, false)
+
+    const first = runValidation({
+      skillMarkdown: skill,
+      planMarkdown,
+      planRelPath,
+      derivePlanRouting: true,
+      outputJson: true,
+    })
+    const second = runValidation({
+      skillMarkdown: skill,
+      planMarkdown,
+      planRelPath,
+      derivePlanRouting: true,
+      outputJson: true,
+    })
+    assert.deepEqual(second.task_bindings, first.task_bindings)
+    const initialized = {
+      ...shell,
+      tasks: second.task_bindings.map((binding) => ({
+        index: binding.task_index,
+        status: "pending",
+        commit: null,
+        risk_level: binding.risk_level,
+        task_agent_generation: binding.task_agent_generation,
+        expected_work_unit_keys: binding.expected_work_unit_keys,
+        route_fingerprint: binding.orchestration_binding.route_fingerprint,
+        orchestration_binding: binding.orchestration_binding,
+        runs: [],
+      })),
+    }
+    const combined = staticValidation(planMarkdown, initialized)
+    assert.deepEqual(combined.failures, [])
+    const admitted = fullAdmission(
+      planMarkdown,
+      initialized,
+      emptyEvidence().pages
+    )
+    assert.deepEqual(admitted.failures, [])
+    assert.equal(admitted.admission_authorized, true)
+  })
+
+  it("covers route-change interruption checkpoints and blockers", () => {
+    const oldRouting = sevenTaskRouting()
+    const oldPlan = sevenTaskPlan(oldRouting)
+    const { bindings: oldBindings } = bindingsFor(oldRouting, oldPlan)
+    const oldState = applyBindings(sevenTaskProgress(oldRouting), oldBindings)
+    oldState.pending_route_change = routeChangeIntent()
+    const newRouting = sevenTaskRouting(identity("gemini"), 2)
+    const newPlan = sevenTaskPlan(newRouting)
+    const { bindings: newBindings } = bindingsFor(newRouting, newPlan)
+    const newState = applyBindings(sevenTaskProgress(newRouting), newBindings)
+    newState.pending_route_change = routeChangeIntent()
+
+    const recorded = fullAdmission(
+      oldPlan,
+      oldState,
+      matchedDurablePages(oldState)
+    )
+    assert.equal(recorded.admission_authorized, true)
+
+    const planAhead = staticValidation(newPlan, oldState)
+    assert.deepEqual(planAhead.failures, [])
+    assert.equal(planAhead.admission_authorized, false)
+    const planAheadFull = fullAdmission(
+      newPlan,
+      oldState,
+      matchedDurablePages(oldState)
+    )
+    assert.equal(planAheadFull.admission_authorized, false)
+
+    const resynced = fullAdmission(
+      newPlan,
+      newState,
+      matchedDurablePages(newState)
+    )
+    assert.equal(resynced.admission_authorized, true)
+
+    const reviewPending = fullAdmission(
+      newPlan,
+      newState,
+      matchedDurablePages(newState)
+    )
+    assert.equal(reviewPending.admission_authorized, true)
+
+    const approvedUncleared = fullAdmission(
+      newPlan,
+      newState,
+      matchedDurablePages(newState)
+    )
+    assert.equal(approvedUncleared.admission_authorized, true)
+    assert.equal(newState.pending_route_change.next_generation, 2)
+
+    const lostIntent = structuredClone(oldState)
+    lostIntent.pending_route_change = null
+    assert.ok(staticValidation(newPlan, lostIntent).failures.length > 0)
+
+    const clearedEarly = structuredClone(newState)
+    clearedEarly.pending_route_change = null
+    const clearedStatic = staticValidation(newPlan, clearedEarly)
+    assert.deepEqual(clearedStatic.failures, [])
+    const clearedHalf = structuredClone(oldState)
+    clearedHalf.pending_route_change = null
+    assert.ok(staticValidation(newPlan, clearedHalf).failures.length > 0)
+  })
+
+  it("covers the CLI authorization matrix with silent stderr", () => {
+    const tempRoot = mkdtempSync(join(tmpdir(), "b2d-task5-"))
+    try {
+      const { snapshot, planMarkdown, bindings, state } = twoTaskBoundState()
+      const planPath = join(tempRoot, "plan.md")
+      const progressPath = join(tempRoot, "progress.md")
+      const emptyPath = join(tempRoot, "empty.json")
+      const fullPath = join(tempRoot, "full.json")
+      const adoptPath = join(tempRoot, "adopt.json")
+      writeFileSync(planPath, planMarkdown)
+      writeFileSync(progressPath, progressMarkdown(state))
+      writeFileSync(emptyPath, JSON.stringify(emptyEvidence()))
+      writeFileSync(
+        fullPath,
+        JSON.stringify(evidenceWrapper(matchedDurablePages(state)))
+      )
+
+      const adopt = adoptionSetup(state, bindings)
+      writeFileSync(progressPath, progressMarkdown(adopt.state))
+      writeFileSync(adoptPath, JSON.stringify(evidenceWrapper(adopt.pages)))
+      writeFileSync(progressPath, progressMarkdown(state))
+
+      const documentOk = spawnCli([
+        "--document-admission",
+        "--durable-evidence",
+        emptyPath,
+        "--output-json",
+      ])
+      assert.equal(documentOk.status, 0)
+      assert.equal(documentOk.stderr, "")
+      assert.equal(JSON.parse(documentOk.stdout).admission_authorized, true)
+
+      const documentBlocked = spawnCli([
+        "--document-admission",
+        "--durable-evidence",
+        fullPath,
+        "--output-json",
+      ])
+      assert.notEqual(documentBlocked.status, 0)
+      assert.equal(documentBlocked.stderr, "")
+      assert.equal(
+        JSON.parse(documentBlocked.stdout).admission_authorized,
+        false
+      )
+
+      const fullOk = spawnCli([
+        "--plan",
+        planPath,
+        "--progress",
+        progressPath,
+        "--plan-rel-path",
+        planRelPath,
+        "--admission",
+        "--durable-evidence",
+        fullPath,
+        "--output-json",
+      ])
+      assert.equal(fullOk.status, 0)
+      assert.equal(fullOk.stderr, "")
+      const fullJson = JSON.parse(fullOk.stdout)
+      assert.equal(fullJson.admission_authorized, true)
+      assert.equal(fullJson.task_bindings.length, 2)
+
+      writeFileSync(progressPath, progressMarkdown(adopt.state))
+      const adoptCli = spawnCli([
+        "--plan",
+        planPath,
+        "--progress",
+        progressPath,
+        "--plan-rel-path",
+        planRelPath,
+        "--admission",
+        "--durable-evidence",
+        adoptPath,
+        "--output-json",
+      ])
+      assert.equal(adoptCli.status, 0)
+      assert.equal(adoptCli.stderr, "")
+      const adoptJson = JSON.parse(adoptCli.stdout)
+      assert.equal(adoptJson.admission_authorized, false)
+      assert.deepEqual(adoptJson.task_bindings, [])
+      assert.equal(adoptJson.reconciliation_actions.length, 1)
+
+      const missing = spawnCli(["--admission", "--output-json"])
+      assert.notEqual(missing.status, 0)
+      assert.equal(missing.stderr, "")
+
+      const withPlan = spawnCli([
+        "--document-admission",
+        "--plan",
+        planPath,
+        "--plan-rel-path",
+        planRelPath,
+        "--durable-evidence",
+        emptyPath,
+        "--output-json",
+      ])
+      assert.notEqual(withPlan.status, 0)
+      assert.equal(withPlan.stderr, "")
+      assert.ok(snapshot)
+    } finally {
+      rmSync(tempRoot, { recursive: true, force: true })
+    }
+  })
+})
+
+function adoptionSetup(state, bindings) {
+  const next = structuredClone(state)
+  const key = next.tasks[1].expected_work_unit_keys.implementer
+  const binding = bindings[1].orchestration_binding
+  next.tasks[1].status = "in_progress"
+  next.active_task_index = 2
+  next.tasks[1].runs = [
+    {
+      ...run(key, "reserving", null, null, 1),
+      root_task_id: null,
+      previous_task_id: null,
+      lineage_root_task_id: null,
+      generic_generation: null,
+      orchestration_binding: binding,
+      dispatch_intent: firstIntent(),
+    },
+  ]
+  const pages = matchedDurablePages(state)
+  pages[0].runs.push(
+    durableRun({
+      task_id: "cli-adopt",
+      work_unit_key: key,
+      child_conversation_id: 45,
+      agent_type: "codex",
+      status: "running",
+      orchestration_binding: binding,
+    })
+  )
+  pages[0].total_rows = pages[0].runs.length
+  return { state: next, pages }
+}
