@@ -376,28 +376,26 @@ pub enum AcpEvent {
     AvailableCommands { commands: Vec<AvailableCommandInfo> },
     /// Session usage/context window updated during conversation
     UsageUpdate { used: u64, size: u64 },
-    /// Out-of-turn activity surfaced from the agent's own session transcript
-    /// by the background watcher (`acp::background_watch`; Claude-only today).
-    /// Covers everything that happens OUTSIDE a codeg-driven prompt turn:
-    /// async sub-agent / background-shell `<task-notification>` completions,
-    /// the agent's continued work after them, and cron//loop autonomous turns
-    /// (which never produce ACP wire events at all — see issue #270). The
-    /// transcript is the single render source for out-of-turn content; wire
-    /// updates arriving out-of-turn are dropped by the frontend.
+    /// Out-of-turn activity surfaced by an autonomous-activity adapter
+    /// (`acp::autonomous_activity`) onto the shared overlay path. Covers work
+    /// that happens OUTSIDE a codeg-driven prompt turn — a provider's
+    /// background-task continuation, cron/loop automation, or other
+    /// agent-autonomous episode. The persisted session log is the render
+    /// source for that content; ordinary wire updates arriving out-of-turn
+    /// are dropped by the frontend.
     BackgroundActivity {
         session_id: String,
-        /// Out-of-turn turns parsed from the transcript tail. UPSERT semantics
-        /// keyed by `MessageTurn.id` (`bg-<episode-offset>-<idx>`) — a still-
-        /// growing turn is re-emitted whole on each poll tick that changed it.
+        /// Out-of-turn turns parsed from the session log. UPSERT semantics
+        /// keyed by `MessageTurn.id` — a still-growing turn is re-emitted
+        /// whole on each poll tick that changed it.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         turns: Vec<crate::models::message::MessageTurn>,
-        /// Launched-but-unresolved background tasks (async sub-agents +
-        /// background shell tasks) accounted from transcript acks. Mirrored
-        /// into `SessionState` to exempt the connection from both idle sweeps
-        /// while work is pending.
+        /// Launched-but-unresolved background tasks accounted from session
+        /// acks. Mirrored into `SessionState` to exempt the connection from
+        /// both idle sweeps while work is pending.
         outstanding: u32,
-        /// Tasks settled by `<task-notification>` records in this batch — the
-        /// frontend raises one OS notification per entry.
+        /// Tasks settled in this batch — the frontend raises one OS
+        /// notification per entry.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         settled: Vec<BackgroundSettledInfo>,
         /// Byte offset of the transcript parsed through at emission. The

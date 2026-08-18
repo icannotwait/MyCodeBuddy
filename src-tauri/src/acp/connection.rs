@@ -32,6 +32,7 @@ use sacp::{
 use sacp_tokio::AcpAgent;
 use tokio::sync::{mpsc, oneshot, watch, RwLock};
 
+use crate::acp::autonomous_activity::{AutonomousActivityPolicy, AutonomousCapabilities};
 use crate::acp::background_watch;
 use crate::acp::error::AcpError;
 use crate::acp::file_system_runtime::{
@@ -5105,9 +5106,12 @@ async fn run_connection(
     let _bg_watch = if is_hidden_generation {
         None
     } else {
-        background_watch::spawn_if_claude(
+        background_watch::spawn_for_policy(
+            AutonomousActivityPolicy::for_connection(
+                agent_type,
+                &AutonomousCapabilities::default(),
+            ),
             &connection_id,
-            agent_type,
             Arc::clone(&state),
             emitter.clone(),
             cwd_string.clone(),
