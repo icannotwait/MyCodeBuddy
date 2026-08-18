@@ -106,7 +106,6 @@ struct Tombstone {
 enum Discover {
     NotYetCreated,
     Armed(PathBuf),
-    Mismatch,
     Ambiguous,
 }
 
@@ -164,7 +163,7 @@ impl CodexAutonomousAdapter {
         self.session_id = session_id.to_string();
         match self.discover_rollout() {
             Discover::Armed(path) => self.adopt_path(path, true),
-            Discover::Mismatch | Discover::Ambiguous => self.downgrade_unsupported(),
+            Discover::Ambiguous => self.downgrade_unsupported(),
             Discover::NotYetCreated => {
                 self.authority = Authority::Provisional;
                 self.committed = 0;
@@ -421,10 +420,15 @@ impl CodexAutonomousAdapter {
         }
         if self.authority == Authority::Armed {
             if let Some(path) = &self.rollout_path {
-                if is_regular_file(path)
-                    && rollout_session_id(path).as_deref() == Some(self.session_id.as_str())
-                {
-                    return;
+                if is_regular_file(path) {
+                    match rollout_session_id(path).as_deref() {
+                        Some(id) if id == self.session_id => return,
+                        Some(_) => {
+                            self.downgrade_unsupported();
+                            return;
+                        }
+                        None => return,
+                    }
                 }
             }
             self.authority = Authority::Provisional;
@@ -441,7 +445,7 @@ impl CodexAutonomousAdapter {
                     self.episode.phase = EpisodePhase::Opening;
                 }
             }
-            Discover::Mismatch | Discover::Ambiguous => self.downgrade_unsupported(),
+            Discover::Ambiguous => self.downgrade_unsupported(),
             Discover::NotYetCreated => {
                 if self.episode.phase == EpisodePhase::Opening {
                     self.episode.phase = EpisodePhase::AwaitingAuthority;
@@ -482,7 +486,6 @@ impl CodexAutonomousAdapter {
             return Discover::NotYetCreated;
         }
         let mut matches = Vec::new();
-        let mut saw_regular_rollout = false;
         for entry in WalkDir::new(&root).into_iter().filter_map(|e| e.ok()) {
             let path = entry.path();
             if !is_regular_file(path) {
@@ -495,7 +498,6 @@ impl CodexAutonomousAdapter {
             if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
                 continue;
             }
-            saw_regular_rollout = true;
             if rollout_session_id(path).as_deref() == Some(self.session_id.as_str()) {
                 matches.push(path.to_path_buf());
             }
@@ -503,7 +505,6 @@ impl CodexAutonomousAdapter {
         match matches.len() {
             1 => Discover::Armed(matches.remove(0)),
             n if n > 1 => Discover::Ambiguous,
-            0 if saw_regular_rollout => Discover::Mismatch,
             _ => Discover::NotYetCreated,
         }
     }
@@ -1139,20 +1140,74 @@ mod tests {
     }
 
     #[test]
-    fn mismatched_session_id_is_unsupported() {
+    fn other_session_rollout_stays_provisional_until_matching_file_appears() {
         let (_dir, root) = tmp_sessions();
         write_rollout(
             &root,
             "other",
             &format!("{}\n", session_meta_line("other-session")),
         );
+        let mut adapter = CodexAutonomousAdapter::new_for_test("sess-1", root.clone());
+        adapter.on_session_ready("sess-1");
+        assert!(
+            !adapter.is_unsupported(),
+            "other sessions must not downgrade before this session's file exists"
+        );
+
+        feed_goal(&mut adapter, "active", Ownership::Idle);
+        feed_thread(&mut adapter, "active", Ownership::Idle);
+        assert!(
+            adapter.autonomous_busy(),
+            "idle open stays busy and not Unsupported while this rollout is absent"
+        );
+        assert!(!adapter.is_unsupported());
+        assert!(adapter.take_emitted().turns.is_empty());
+
+        let path = write_rollout(
+            &root,
+            "sess-1",
+            &format!("{}\n", session_meta_line("sess-1")),
+        );
+        append_line(
+            &path,
+            &task_started_line("turn_goal_1", "2026-08-18T00:00:01Z"),
+        );
+        append_line(&path, &goal_context_line("2026-08-18T00:00:02Z"));
+        append_line(
+            &path,
+            &assistant_line("msg_live", "working", "2026-08-18T00:00:03Z"),
+        );
+        adapter.tail_once();
+        let emitted = adapter.take_emitted();
+        assert_eq!(
+            emitted.turns.len(),
+            1,
+            "later matching rollout must recover"
+        );
+        assert_eq!(emitted.turns[0].id, codex_goal_turn_id("turn_goal_1"));
+        assert!(emitted.watermark > 0);
+    }
+
+    #[test]
+    fn mismatched_session_id_is_unsupported() {
+        let (_dir, root) = tmp_sessions();
+        let path = write_rollout(
+            &root,
+            "sess-1",
+            &format!("{}\n", session_meta_line("sess-1")),
+        );
         let mut adapter = CodexAutonomousAdapter::new_for_test("sess-1", root);
         adapter.on_session_ready("sess-1");
         feed_goal(&mut adapter, "active", Ownership::Idle);
         feed_thread(&mut adapter, "active", Ownership::Idle);
+        assert!(!adapter.is_unsupported());
+
+        std::fs::write(&path, format!("{}\n", session_meta_line("other-session"))).unwrap();
         adapter.tail_once();
-        assert!(adapter.is_unsupported());
-        assert!(adapter.take_emitted().turns.is_empty());
+        assert!(
+            adapter.is_unsupported(),
+            "adopted path whose session_meta.id became another session is a mismatch"
+        );
         assert!(!adapter.autonomous_busy());
     }
 
