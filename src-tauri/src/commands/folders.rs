@@ -7808,6 +7808,17 @@ branch refs/heads/main";
         (dir, repo, wt)
     }
 
+    /// Git porcelain on Windows emits `C:/...`; `canonicalize` emits `\\?\C:\...`.
+    fn same_worktree_path(left: &str, right: &str) -> bool {
+        let norm = |s: &str| {
+            crate::db::service::folder_service::normalize_folder_storage_path(s)
+                .replace('\\', '/')
+                .trim_end_matches('/')
+                .to_string()
+        };
+        norm(left) == norm(right)
+    }
+
     fn worktree_test_emitter() -> EventEmitter {
         EventEmitter::test_web_only(std::sync::Arc::new(
             crate::web::event_bridge::WebEventBroadcaster::new(),
@@ -7942,9 +7953,14 @@ branch refs/heads/main";
         .await
         .expect("force remove worktree and branch");
 
-        assert_eq!(
-            removal.worktree_path.as_deref(),
-            Some(canonical_worktree.as_str())
+        assert!(
+            removal
+                .worktree_path
+                .as_deref()
+                .is_some_and(|reported| { same_worktree_path(reported, &canonical_worktree) }),
+            "worktree_path {:?} should match {:?}",
+            removal.worktree_path,
+            canonical_worktree
         );
         assert!(removal.branch_deleted);
         assert_eq!(removal.folder_id, Some(wt_folder.id));
