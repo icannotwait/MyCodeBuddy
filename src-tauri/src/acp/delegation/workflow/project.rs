@@ -2456,7 +2456,8 @@ fn expected_task_binding(task: &SimpleProgressTask) -> SimpleTaskBindingExpectat
             invalid = true;
         }
     }
-    if let (Some(fingerprint), Some(binding)) = (task.route_fingerprint.as_deref(), complete.as_ref())
+    if let (Some(fingerprint), Some(binding)) =
+        (task.route_fingerprint.as_deref(), complete.as_ref())
     {
         if fingerprint != binding.route_fingerprint {
             invalid = true;
@@ -3147,7 +3148,10 @@ async fn project_simple_mode(
             );
         }
         if binding_orphan_tasks.contains(&task.index) {
-            push_projection_warning(&mut node_warning_codes, WARNING_ORCHESTRATION_BINDING_ORPHAN);
+            push_projection_warning(
+                &mut node_warning_codes,
+                WARNING_ORCHESTRATION_BINDING_ORPHAN,
+            );
         }
         if let (Some(expected), Some(declared_task)) = (expected_route.as_ref(), declared) {
             reconcile_simple_orchestration_binding(
@@ -8700,10 +8704,8 @@ mod tests {
             }
         });
         if include_run_binding {
-            run["orchestration_binding"] = task6_binding_json(
-                generation,
-                run_fingerprint.unwrap_or(fingerprint),
-            );
+            run["orchestration_binding"] =
+                task6_binding_json(generation, run_fingerprint.unwrap_or(fingerprint));
         }
         let mut tasks = vec![serde_json::json!({
             "index": 1,
@@ -8746,7 +8748,10 @@ mod tests {
     }
 
     fn task6_assert_warning_only(snapshot: &WorkflowGraphSnapshot) {
-        assert!(snapshot.gates.is_empty(), "binding drift must not create Gates");
+        assert!(
+            snapshot.gates.is_empty(),
+            "binding drift must not create Gates"
+        );
         assert_eq!(snapshot.workflow_id, None);
         assert_eq!(snapshot.manifest_revision, None);
         assert_eq!(snapshot.completion, None);
@@ -9175,8 +9180,7 @@ mod tests {
             ]
         );
         assert!(snapshot.edges.iter().any(|edge| {
-            edge.from == "simple-task-1-implementer"
-                && edge.to == "simple-task-1-reviewer-primary"
+            edge.from == "simple-task-1-implementer" && edge.to == "simple-task-1-reviewer-primary"
         }));
         assert!(snapshot.edges.iter().any(|edge| {
             edge.from == "simple-task-1-implementer"

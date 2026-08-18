@@ -4421,10 +4421,10 @@ mod tests {
 
             for case in corpus["cases"].as_array().unwrap() {
                 let mut input = omitted.clone();
-                input.as_object_mut().unwrap().insert(
-                    "orchestration_binding".into(),
-                    case["value"].clone(),
-                );
+                input
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("orchestration_binding".into(), case["value"].clone());
                 let expected = case["valid"].as_bool().unwrap();
                 assert_eq!(
                     schema_accepts(schema, schema, &input),
@@ -5847,10 +5847,7 @@ mod tests {
             )
             .await,
         );
-        let tools = catalog.result.unwrap()["tools"]
-            .as_array()
-            .unwrap()
-            .clone();
+        let tools = catalog.result.unwrap()["tools"].as_array().unwrap().clone();
         let schema = tools
             .iter()
             .find(|tool| tool["name"] == "get_delegation_orchestration_bindings")
@@ -5896,10 +5893,12 @@ mod tests {
             .iter()
             .find(|tool| tool["name"] == "request_recovery_authorization")
             .unwrap();
-        assert!(recovery["inputSchema"]["properties"]["proposed_user_reason"]["description"]
-            .as_str()
-            .unwrap()
-            .contains("reset_plan_lineage only"));
+        assert!(
+            recovery["inputSchema"]["properties"]["proposed_user_reason"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("reset_plan_lineage only")
+        );
 
         let page = json!({
             "schema_version": 1,

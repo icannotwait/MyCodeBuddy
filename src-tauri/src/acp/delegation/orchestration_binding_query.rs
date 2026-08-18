@@ -278,9 +278,7 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::*;
-    use crate::acp::delegation::run_store::{
-        PromoteRunningKind, ReservingRunInsert, RunStore,
-    };
+    use crate::acp::delegation::run_store::{PromoteRunningKind, ReservingRunInsert, RunStore};
     use crate::acp::delegation::spawner::DelegationLink;
     use crate::acp::delegation::store::TerminalTaskWrite;
     use crate::acp::delegation::types::OrchestrationBindingQueryRequest;
