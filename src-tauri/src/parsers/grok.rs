@@ -6,6 +6,9 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, TimeZone, Utc};
 use serde_json::Value;
 
+use sha2::{Digest, Sha256};
+
+use crate::models::message::AutonomousTurnOrigin;
 use crate::models::{
     AgentType, ContentBlock, ConversationDetail, ConversationSummary, MessageTurn, TurnRole,
     TurnUsage,
@@ -188,7 +191,7 @@ impl GrokParser {
     }
 
     fn build_summary(&self, session_dir: &Path, session_id: &str) -> Option<ConversationSummary> {
-        let parsed = parse_updates(&session_dir.join("updates.jsonl"));
+        let parsed = parse_updates(&session_dir.join("updates.jsonl"), session_id);
         // A session that never produced any user/assistant/tool content (only
         // metadata) is treated as empty — matches the "metadata-only is not
         // listed" rule of the other parsers.
@@ -227,7 +230,7 @@ impl GrokParser {
     }
 
     fn build_detail(&self, session_dir: &Path, session_id: &str) -> ConversationDetail {
-        let mut parsed = parse_updates(&session_dir.join("updates.jsonl"));
+        let mut parsed = parse_updates(&session_dir.join("updates.jsonl"), session_id);
         let meta = read_summary_json(session_dir);
 
         // Defensive normalization shared with the other parsers: hoist any tool
@@ -289,7 +292,7 @@ impl GrokParser {
             summary,
             turns: parsed.turns,
             session_stats,
-            transcript_watermark: None,
+            transcript_watermark: Some(parsed.consumed_complete_bytes),
         }
     }
 
@@ -447,10 +450,139 @@ struct ParsedUpdates {
     /// Model discovered in-stream (`user_message_chunk._meta.modelId`); a
     /// fallback when `summary.json` lacks `current_model_id`.
     model: Option<String>,
+    /// Bytes of complete `updates.jsonl` lines consumed, including each
+    /// trailing `\n`. A trailing partial line is not counted.
+    consumed_complete_bytes: u64,
 }
 
-fn parse_updates(path: &Path) -> ParsedUpdates {
-    let Ok(file) = fs::File::open(path) else {
+/// Idle-boundary hidden trigger waiting to stamp the next independently
+/// opened assistant turn.
+struct PendingGrokAutonomous {
+    trigger_start: u64,
+    task_ids: Vec<String>,
+}
+
+/// Canonical id for a Grok idle-boundary autonomous assistant turn.
+///
+/// Public format: `grok-autonomous:<episode-key>:assistant:0`
+///
+/// Episode-key UTF-8 material:
+/// - with task ids: `{session_id}+{sorted_task_ids}+{trigger_start_offset}`
+///   (`sorted_task_ids` is the referenced set, lexicographically sorted and
+///   joined by `,`)
+/// - without task ids: `{session_id}+{trigger_start_offset}`
+///
+/// `session_id` is the external Grok session uuid. `trigger_start_offset` is
+/// the hidden trigger's complete-line **start** byte offset in
+/// `updates.jsonl` (decimal, no leading zeros except `0`).
+///
+/// If that raw key contains a character outside `[A-Za-z0-9._+,-]`, it is
+/// replaced by the lowercase hex SHA-256 of the same UTF-8 material so the
+/// public id stays a legal token. Task 5 must call this function rather than
+/// re-deriving the key.
+pub(crate) fn grok_autonomous_turn_id(
+    session_id: &str,
+    task_ids: &[String],
+    trigger_start_offset: u64,
+) -> String {
+    let key = grok_autonomous_episode_key(session_id, task_ids, trigger_start_offset);
+    format!("grok-autonomous:{key}:assistant:0")
+}
+
+fn grok_autonomous_episode_key(
+    session_id: &str,
+    task_ids: &[String],
+    trigger_start_offset: u64,
+) -> String {
+    let mut ids: Vec<&str> = task_ids.iter().map(String::as_str).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    let raw = if ids.is_empty() {
+        format!("{session_id}+{trigger_start_offset}")
+    } else {
+        format!("{session_id}+{}+{trigger_start_offset}", ids.join(","))
+    };
+    if grok_episode_key_is_legal(&raw) {
+        raw
+    } else {
+        grok_episode_key_digest(raw.as_bytes())
+    }
+}
+
+fn grok_episode_key_is_legal(key: &str) -> bool {
+    !key.is_empty()
+        && key.bytes().all(|b| {
+            matches!(
+                b,
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' | b'-' | b'+' | b','
+            )
+        })
+}
+
+fn grok_episode_key_digest(material: &[u8]) -> String {
+    let digest = Sha256::digest(material);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(64);
+    for b in digest {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0xf) as usize] as char);
+    }
+    out
+}
+
+/// Iterate complete newline-terminated records in `bytes`.
+///
+/// Each item is `(start_offset, record)` where `record` includes the trailing
+/// `\n`. A trailing fragment without `\n` is omitted and is not part of the
+/// consumed-byte count (`start_offset + record.len()` of the last item, or 0).
+pub(crate) fn grok_complete_records(bytes: &[u8]) -> impl Iterator<Item = (u64, &[u8])> {
+    let mut start = 0usize;
+    std::iter::from_fn(move || {
+        let rest = bytes.get(start..)?;
+        let rel = rest.iter().position(|&b| b == b'\n')?;
+        let end = start + rel + 1;
+        let rec = &bytes[start..end];
+        let off = start as u64;
+        start = end;
+        Some((off, rec))
+    })
+}
+
+fn grok_record_payload(record: &[u8]) -> &[u8] {
+    let without_nl = record.strip_suffix(&[b'\n']).unwrap_or(record);
+    without_nl.strip_suffix(&[b'\r']).unwrap_or(without_nl)
+}
+
+fn is_grok_background_task_reminder(text: &str) -> bool {
+    text.contains("<system-reminder>") && text.contains("Background task")
+}
+
+/// Quoted names after `Background task` in the verified reminder shape.
+/// Does not scan arbitrary English continuation text.
+fn grok_reminder_task_ids(text: &str) -> Vec<String> {
+    let mut ids = Vec::new();
+    let mut rest = text;
+    const PREFIX: &str = "Background task \"";
+    while let Some(i) = rest.find(PREFIX) {
+        let after = &rest[i + PREFIX.len()..];
+        match after.find('"') {
+            Some(end) => {
+                let id = &after[..end];
+                if !id.is_empty() {
+                    ids.push(id.to_string());
+                }
+                rest = &after[end + 1..];
+            }
+            None => break,
+        }
+    }
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+fn parse_updates(path: &Path, session_id: &str) -> ParsedUpdates {
+    let Ok(bytes) = fs::read(path) else {
         return ParsedUpdates::default();
     };
 
@@ -468,13 +600,19 @@ fn parse_updates(path: &Path) -> ParsedUpdates {
     // this lets consecutive same-prompt chunks merge into a single user turn
     // instead of each opening a new (often empty) one.
     let mut open_user_prompt_index: Option<i64> = None;
+    let mut pending_autonomous: Option<PendingGrokAutonomous> = None;
+    let mut consumed_complete_bytes = 0u64;
 
-    for line in BufReader::new(file).lines() {
-        let Ok(line) = line else { continue };
+    for (start_offset, record) in grok_complete_records(&bytes) {
+        consumed_complete_bytes = start_offset + record.len() as u64;
+        let payload = grok_record_payload(record);
+        let Ok(line) = std::str::from_utf8(payload) else {
+            continue;
+        };
         if line.trim().is_empty() {
             continue;
         }
-        let Ok(v) = serde_json::from_str::<Value>(&line) else {
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
             continue;
         };
 
@@ -511,6 +649,19 @@ fn parse_updates(path: &Path) -> ParsedUpdates {
                 .and_then(Value::as_bool)
                 == Some(true)
         {
+            // Hidden reminders never become user turns. At an idle boundary
+            // (assistant already flushed) the verified background-task shape
+            // stamps the *next* independently opened assistant; mid-assistant
+            // injection is suppress-only and does not relabel the open turn.
+            if assistant.is_none() && pending_autonomous.is_none() {
+                let text = update_text(update);
+                if is_grok_background_task_reminder(&text) {
+                    pending_autonomous = Some(PendingGrokAutonomous {
+                        trigger_start: start_offset,
+                        task_ids: grok_reminder_task_ids(&text),
+                    });
+                }
+            }
             continue;
         }
 
@@ -542,6 +693,8 @@ fn parse_updates(path: &Path) -> ParsedUpdates {
             }
             flush_assistant(&mut assistant, &mut out.turns, &mut tool_result_idx);
             turn_meta = GrokTurnMeta::default();
+            // A visible user prompt is not an autonomous follow-up.
+            pending_autonomous = None;
         }
         turn_meta.observe(params_meta, update_meta);
 
@@ -596,12 +749,18 @@ fn parse_updates(path: &Path) -> ParsedUpdates {
             "agent_message_chunk" => {
                 out.content_events += 1;
                 let text = update_text(update);
-                append_text(ensure_assistant(&mut assistant, now), text);
+                append_text(
+                    ensure_assistant(&mut assistant, now, session_id, &mut pending_autonomous),
+                    text,
+                );
             }
             "agent_thought_chunk" => {
                 out.content_events += 1;
                 let text = update_text(update);
-                append_thinking(ensure_assistant(&mut assistant, now), text);
+                append_thinking(
+                    ensure_assistant(&mut assistant, now, session_id, &mut pending_autonomous),
+                    text,
+                );
             }
             "tool_call" => {
                 out.content_events += 1;
@@ -629,7 +788,8 @@ fn parse_updates(path: &Path) -> ParsedUpdates {
                     Some((_, input)) => grok_mcp_input_preview(input),
                     None => tool_input_preview(raw_input),
                 };
-                let turn = ensure_assistant(&mut assistant, now);
+                let turn =
+                    ensure_assistant(&mut assistant, now, session_id, &mut pending_autonomous);
                 turn.blocks.push(ContentBlock::ToolUse {
                     tool_use_id: Some(id.clone()),
                     tool_name,
@@ -692,7 +852,8 @@ fn parse_updates(path: &Path) -> ParsedUpdates {
                     .and_then(Value::as_str)
                     .map(str::to_string)
                     .unwrap_or_else(|| format!("grok-compaction-{}", out.content_events));
-                let turn = ensure_assistant(&mut assistant, now);
+                let turn =
+                    ensure_assistant(&mut assistant, now, session_id, &mut pending_autonomous);
                 turn.blocks.push(ContentBlock::ToolUse {
                     tool_use_id: Some(id.clone()),
                     tool_name: "context_compaction".to_string(),
@@ -734,11 +895,15 @@ fn parse_updates(path: &Path) -> ParsedUpdates {
         turn_meta.apply(prev);
     }
     flush_assistant(&mut assistant, &mut out.turns, &mut tool_result_idx);
+    out.consumed_complete_bytes = consumed_complete_bytes;
 
     // Assign stable, unique, index-based ids (the transcript is append-only, so
-    // positional ids are stable across re-parses).
+    // positional ids are stable across re-parses). Recognized autonomous
+    // assistants already have their canonical id — do not overwrite them.
     for (i, turn) in out.turns.iter_mut().enumerate() {
-        turn.id = format!("grok-turn-{i}");
+        if turn.id.is_empty() {
+            turn.id = format!("grok-turn-{i}");
+        }
     }
     out
 }
@@ -1229,10 +1394,22 @@ impl GrokTurnMeta {
     }
 }
 
-fn ensure_assistant(assistant: &mut Option<MessageTurn>, ts: DateTime<Utc>) -> &mut MessageTurn {
+fn ensure_assistant<'a>(
+    assistant: &'a mut Option<MessageTurn>,
+    ts: DateTime<Utc>,
+    session_id: &str,
+    pending: &mut Option<PendingGrokAutonomous>,
+) -> &'a mut MessageTurn {
     if assistant.is_none() {
+        let (id, origin) = match pending.take() {
+            Some(p) => (
+                grok_autonomous_turn_id(session_id, &p.task_ids, p.trigger_start),
+                Some(AutonomousTurnOrigin::BackgroundTask),
+            ),
+            None => (String::new(), None),
+        };
         *assistant = Some(MessageTurn {
-            id: String::new(),
+            id,
             role: TurnRole::Assistant,
             blocks: Vec::new(),
             timestamp: ts,
@@ -1242,7 +1419,7 @@ fn ensure_assistant(assistant: &mut Option<MessageTurn>, ts: DateTime<Utc>) -> &
             reasoning_effort: None,
             completed_at: None,
             outcome: None,
-            autonomous_origin: None,
+            autonomous_origin: origin,
         });
     }
     assistant.as_mut().expect("assistant just set")
@@ -1300,6 +1477,7 @@ fn read_subdirs(dir: &Path) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::message::AutonomousTurnOrigin;
     use std::io::Write;
     use std::sync::{Mutex, OnceLock};
 
@@ -1534,6 +1712,257 @@ mod tests {
         assert!(
             matches!(&detail.turns[2].blocks[0], ContentBlock::Text { text } if text == "那次失败可以忽略")
         );
+    }
+
+    #[test]
+    fn updates_watermark_is_complete_line_bytes_only() {
+        let complete = concat!(
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"hi"},"_meta":{"promptIndex":0}}},"timestamp":1}"#,
+            "\n",
+        );
+        let partial = r#"{"method":"session/update""#;
+        let (_tmp, sessions) = fixture(SUMMARY, &format!("{complete}{partial}"));
+        let detail = GrokParser::with_base_dir(sessions)
+            .get_conversation("019f45e3-e1ef-7690-a29f-fe2554382b49")
+            .unwrap();
+        assert_eq!(detail.transcript_watermark, Some(complete.len() as u64));
+    }
+
+    #[test]
+    fn idle_hidden_trigger_marks_following_assistant_background_task() {
+        let updates = concat!(
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"run it"},"_meta":{"promptIndex":0}}},"timestamp":1}"#,
+            "\n",
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"started"}}},"timestamp":2}"#,
+            "\n",
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"turn_completed","stop_reason":"end_turn"}},"timestamp":3}"#,
+            "\n",
+            r#"{"method":"_x.ai/session/update","params":{"sessionId":"s","update":{"sessionUpdate":"task_completed","task_id":"term_x"}},"timestamp":4}"#,
+            "\n",
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"<system-reminder>\nBackground task \"term_x\" completed (exit code: 0).\n</system-reminder>"},"_meta":{"hideFromScrollback":true,"promptIndex":1}}},"timestamp":5}"#,
+            "\n",
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"done"}}},"timestamp":6}"#,
+            "\n",
+        );
+        let (_tmp, sessions) = fixture(SUMMARY, updates);
+        let sessions_again = sessions.clone();
+        let detail = GrokParser::with_base_dir(sessions)
+            .get_conversation("019f45e3-e1ef-7690-a29f-fe2554382b49")
+            .unwrap();
+        assert_eq!(
+            detail
+                .turns
+                .iter()
+                .filter(|t| matches!(t.role, TurnRole::User))
+                .count(),
+            1
+        );
+        assert!(!detail.turns.iter().any(|t| t.blocks.iter().any(
+            |b| matches!(b, ContentBlock::Text { text } if text.contains("system-reminder"))
+        )));
+        let auto = detail
+            .turns
+            .iter()
+            .find(|t| t.autonomous_origin == Some(AutonomousTurnOrigin::BackgroundTask))
+            .expect("autonomous assistant");
+        assert!(auto.id.starts_with("grok-autonomous:"));
+        assert!(auto.id.ends_with(":assistant:0"));
+        let trigger_prefix = concat!(
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"run it"},"_meta":{"promptIndex":0}}},"timestamp":1}"#,
+            "\n",
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"started"}}},"timestamp":2}"#,
+            "\n",
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"turn_completed","stop_reason":"end_turn"}},"timestamp":3}"#,
+            "\n",
+            r#"{"method":"_x.ai/session/update","params":{"sessionId":"s","update":{"sessionUpdate":"task_completed","task_id":"term_x"}},"timestamp":4}"#,
+            "\n",
+        );
+        assert_eq!(
+            auto.id,
+            grok_autonomous_turn_id(
+                "019f45e3-e1ef-7690-a29f-fe2554382b49",
+                &["term_x".to_string()],
+                trigger_prefix.len() as u64,
+            )
+        );
+        assert!(matches!(&auto.blocks[0], ContentBlock::Text { text } if text == "done"));
+        let detail2 = GrokParser::with_base_dir(sessions_again)
+            .get_conversation("019f45e3-e1ef-7690-a29f-fe2554382b49")
+            .unwrap();
+        let auto2 = detail2
+            .turns
+            .iter()
+            .find(|t| t.autonomous_origin.is_some())
+            .unwrap();
+        assert_eq!(auto.id, auto2.id);
+    }
+
+    #[test]
+    fn hidden_reminder_inside_open_assistant_does_not_relabel_it() {
+        // Same reminder body as `hidden_user_chunk_does_not_split_the_reply`,
+        // injected while the first assistant is still open (no `turn_completed`).
+        let updates = concat!(
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"启动服务"},"_meta":{"modelId":"grok-4.5","promptIndex":0}}},"timestamp":1783584019}"#,
+            "\n",
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"已启动"}}},"timestamp":1783584020}"#,
+            "\n",
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"<system-reminder>\nBackground task \"term_x\" completed (exit code: 1).\n</system-reminder>"},"_meta":{"modelId":"grok-4.5","promptIndex":1,"hideFromScrollback":true}}},"timestamp":1783584022}"#,
+            "\n",
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"那次失败可以忽略"}}},"timestamp":1783584023}"#,
+            "\n",
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"turn_completed","prompt_id":"p1","stop_reason":"end_turn"}},"timestamp":1783584024}"#,
+            "\n",
+        );
+        let (_tmp, sessions) = fixture(SUMMARY, updates);
+        let detail = GrokParser::with_base_dir(sessions)
+            .get_conversation("019f45e3-e1ef-7690-a29f-fe2554382b49")
+            .unwrap();
+        assert_eq!(
+            detail
+                .turns
+                .iter()
+                .filter(|t| matches!(t.role, TurnRole::User))
+                .count(),
+            1
+        );
+        assert!(!detail.turns.iter().any(|t| t.blocks.iter().any(
+            |b| matches!(b, ContentBlock::Text { text } if text.contains("system-reminder"))
+        )));
+        assert_eq!(
+            detail
+                .turns
+                .iter()
+                .filter(|t| matches!(t.role, TurnRole::Assistant))
+                .count(),
+            1
+        );
+        assert!(
+            matches!(&detail.turns[1].blocks[0], ContentBlock::Text { text } if text == "已启动那次失败可以忽略")
+        );
+        assert!(detail.turns.iter().all(|t| t.autonomous_origin.is_none()));
+        assert!(detail.turns[1].id.starts_with("grok-turn-"));
+    }
+
+    #[test]
+    fn two_triggers_same_task_get_distinct_ids() {
+        let updates = concat!(
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"run it"},"_meta":{"promptIndex":0}}},"timestamp":1}"#,
+            "\n",
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"started"}}},"timestamp":2}"#,
+            "\n",
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"turn_completed","stop_reason":"end_turn"}},"timestamp":3}"#,
+            "\n",
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"<system-reminder>\nBackground task \"term_x\" completed (exit code: 0).\n</system-reminder>"},"_meta":{"hideFromScrollback":true}}},"timestamp":4}"#,
+            "\n",
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"first"}}},"timestamp":5}"#,
+            "\n",
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"turn_completed","stop_reason":"end_turn"}},"timestamp":6}"#,
+            "\n",
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"<system-reminder>\nBackground task \"term_x\" completed (exit code: 0).\n</system-reminder>"},"_meta":{"hideFromScrollback":true}}},"timestamp":7}"#,
+            "\n",
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"second"}}},"timestamp":8}"#,
+            "\n",
+        );
+        let (_tmp, sessions) = fixture(SUMMARY, updates);
+        let detail = GrokParser::with_base_dir(sessions)
+            .get_conversation("019f45e3-e1ef-7690-a29f-fe2554382b49")
+            .unwrap();
+        let autos: Vec<&MessageTurn> = detail
+            .turns
+            .iter()
+            .filter(|t| t.autonomous_origin == Some(AutonomousTurnOrigin::BackgroundTask))
+            .collect();
+        assert_eq!(autos.len(), 2);
+        assert!(matches!(&autos[0].blocks[0], ContentBlock::Text { text } if text == "first"));
+        assert!(matches!(&autos[1].blocks[0], ContentBlock::Text { text } if text == "second"));
+        assert_ne!(autos[0].id, autos[1].id);
+        assert!(autos[0].id.starts_with("grok-autonomous:"));
+        assert!(autos[1].id.starts_with("grok-autonomous:"));
+        assert!(autos[0].id.ends_with(":assistant:0"));
+        assert!(autos[1].id.ends_with(":assistant:0"));
+    }
+
+    #[test]
+    fn grok_autonomous_turn_id_documents_episode_key() {
+        assert_eq!(
+            grok_autonomous_turn_id(
+                "019f45e3-e1ef-7690-a29f-fe2554382b49",
+                &["term_x".to_string()],
+                42,
+            ),
+            "grok-autonomous:019f45e3-e1ef-7690-a29f-fe2554382b49+term_x+42:assistant:0"
+        );
+        assert_eq!(
+            grok_autonomous_turn_id("sess", &[], 7),
+            "grok-autonomous:sess+7:assistant:0"
+        );
+        let digested = grok_autonomous_turn_id("sess", &["a:b".to_string()], 1);
+        let key = digested
+            .strip_prefix("grok-autonomous:")
+            .and_then(|s| s.strip_suffix(":assistant:0"))
+            .unwrap();
+        assert_eq!(key.len(), 64);
+        assert!(key
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert_eq!(
+            digested,
+            grok_autonomous_turn_id("sess", &["a:b".to_string()], 1)
+        );
+    }
+
+    #[test]
+    fn malformed_and_non_utf8_complete_lines_count_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions = tmp.path().join("sessions");
+        let session = sessions
+            .join("%2FUsers%2Fme%2Fproj")
+            .join("019f45e3-e1ef-7690-a29f-fe2554382b49");
+        fs::create_dir_all(&session).unwrap();
+        write(&session, "summary.json", SUMMARY);
+        let good = concat!(
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"hi"},"_meta":{"promptIndex":0}}},"timestamp":1}"#,
+            "\n",
+        );
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(good.as_bytes());
+        bytes.extend_from_slice(b"not-json\n");
+        bytes.extend_from_slice(&[0xff, 0xfe, b'\n']);
+        fs::write(session.join("updates.jsonl"), &bytes).unwrap();
+        let detail = GrokParser::with_base_dir(sessions)
+            .get_conversation("019f45e3-e1ef-7690-a29f-fe2554382b49")
+            .unwrap();
+        assert_eq!(detail.transcript_watermark, Some(bytes.len() as u64));
+        assert_eq!(
+            detail
+                .turns
+                .iter()
+                .filter(|t| matches!(t.role, TurnRole::User))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn hidden_non_reminder_does_not_mark_origin() {
+        let updates = concat!(
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"run it"},"_meta":{"promptIndex":0}}},"timestamp":1}"#,
+            "\n",
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"started"}}},"timestamp":2}"#,
+            "\n",
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"turn_completed","stop_reason":"end_turn"}},"timestamp":3}"#,
+            "\n",
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"please continue the previous work"},"_meta":{"hideFromScrollback":true}}},"timestamp":4}"#,
+            "\n",
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"ok"}}},"timestamp":5}"#,
+            "\n",
+        );
+        let (_tmp, sessions) = fixture(SUMMARY, updates);
+        let detail = GrokParser::with_base_dir(sessions)
+            .get_conversation("019f45e3-e1ef-7690-a29f-fe2554382b49")
+            .unwrap();
+        assert!(detail.turns.iter().all(|t| t.autonomous_origin.is_none()));
+        assert!(detail.turns.iter().all(|t| t.id.starts_with("grok-turn-")));
     }
 
     #[test]
