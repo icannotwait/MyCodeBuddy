@@ -42,6 +42,10 @@ pub const WARNING_PROGRESS_DUPLICATE_TASK: &str = "simple_progress_duplicate_tas
 pub const WARNING_PROGRESS_UNKNOWN_STATUS: &str = "simple_progress_unknown_task_status";
 pub const WARNING_PROGRESS_UNKNOWN_RUN_STATE: &str = "simple_progress_unknown_run_state";
 pub const WARNING_PROGRESS_PLAN_PATH: &str = "simple_progress_plan_path_mismatch";
+pub const WARNING_ORCHESTRATION_BINDING_MISSING: &str = "simple_orchestration_binding_missing";
+pub const WARNING_ORCHESTRATION_BINDING_MISMATCH: &str = "simple_orchestration_binding_mismatch";
+pub const WARNING_ORCHESTRATION_BINDING_ORPHAN: &str = "simple_orchestration_binding_orphan";
+pub const SIMPLE_ORCHESTRATION_NAMESPACE: &str = "brainstorm-to-delivery";
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum SimpleParseError {
@@ -189,6 +193,63 @@ impl SimpleFinalReviewStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SimpleOrchestrationBinding {
+    pub schema_version: u32,
+    pub namespace: String,
+    pub generation: u32,
+    pub route_fingerprint: String,
+}
+
+impl SimpleOrchestrationBinding {
+    pub fn is_well_formed(&self) -> bool {
+        if self.schema_version != 1 {
+            return false;
+        }
+        let namespace = self.namespace.as_bytes();
+        if namespace.is_empty()
+            || namespace.len() > 64
+            || !namespace[0].is_ascii_lowercase()
+            || !namespace[1..]
+                .iter()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+        {
+            return false;
+        }
+        if self.generation == 0 {
+            return false;
+        }
+        route_fingerprint_is_well_formed(&self.route_fingerprint)
+    }
+}
+
+pub fn route_fingerprint_is_well_formed(fingerprint: &str) -> bool {
+    let bytes = fingerprint.as_bytes();
+    bytes.len() == 71
+        && bytes.starts_with(b"sha256:")
+        && bytes[7..]
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum SimpleBindingMirror {
+    #[default]
+    Absent,
+    Invalid,
+    Present(SimpleOrchestrationBinding),
+}
+
+impl SimpleBindingMirror {
+    pub fn as_present(&self) -> Option<&SimpleOrchestrationBinding> {
+        match self {
+            Self::Present(binding) => Some(binding),
+            Self::Absent | Self::Invalid => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SimpleProgressRun {
     pub role: String,
     pub agent_type: String,
@@ -200,6 +261,7 @@ pub struct SimpleProgressRun {
     pub recovery_count: Option<u32>,
     pub replaced_task_id: Option<String>,
     pub replacement_reason: Option<String>,
+    pub orchestration_binding: SimpleBindingMirror,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -221,6 +283,8 @@ pub struct SimpleProgressTask {
     pub commit: Option<String>,
     pub risk_level: Option<String>,
     pub task_agent_generation: Option<u32>,
+    pub route_fingerprint: Option<String>,
+    pub orchestration_binding: SimpleBindingMirror,
     pub expected_work_unit_keys: Option<SimpleExpectedWorkUnitKeys>,
     pub runs: Vec<SimpleProgressRun>,
 }
@@ -263,6 +327,8 @@ struct RawProgressRun {
     replaced_task_id: Option<String>,
     #[serde(default)]
     replacement_reason: Option<String>,
+    #[serde(default)]
+    orchestration_binding: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -276,6 +342,10 @@ struct RawProgressTask {
     risk_level: Option<String>,
     #[serde(default)]
     task_agent_generation: Option<u32>,
+    #[serde(default)]
+    route_fingerprint: Option<serde_json::Value>,
+    #[serde(default)]
+    orchestration_binding: Option<serde_json::Value>,
     #[serde(default)]
     expected_work_unit_keys: Option<SimpleExpectedWorkUnitKeys>,
     #[serde(default)]
@@ -306,6 +376,44 @@ fn push_warning(warnings: &mut Vec<String>, code: &str) {
         && !warnings.iter().any(|existing| existing == code)
     {
         warnings.push(code.to_string());
+    }
+}
+
+fn parse_optional_binding_mirror(
+    value: Option<serde_json::Value>,
+    warnings: &mut Vec<String>,
+) -> SimpleBindingMirror {
+    let Some(value) = value else {
+        return SimpleBindingMirror::Absent;
+    };
+    if value.is_null() {
+        return SimpleBindingMirror::Absent;
+    }
+    match serde_json::from_value::<SimpleOrchestrationBinding>(value) {
+        Ok(binding) if binding.is_well_formed() => SimpleBindingMirror::Present(binding),
+        _ => {
+            push_warning(warnings, WARNING_ORCHESTRATION_BINDING_MISMATCH);
+            SimpleBindingMirror::Invalid
+        }
+    }
+}
+
+fn parse_optional_route_fingerprint(
+    value: Option<serde_json::Value>,
+    warnings: &mut Vec<String>,
+) -> Option<String> {
+    match value {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(fingerprint)) => {
+            if !route_fingerprint_is_well_formed(&fingerprint) {
+                push_warning(warnings, WARNING_ORCHESTRATION_BINDING_MISMATCH);
+            }
+            Some(fingerprint)
+        }
+        Some(_) => {
+            push_warning(warnings, WARNING_ORCHESTRATION_BINDING_MISMATCH);
+            None
+        }
     }
 }
 
@@ -729,6 +837,10 @@ pub fn parse_simple_progress(
                     recovery_count: run.recovery_count,
                     replaced_task_id: run.replaced_task_id,
                     replacement_reason: run.replacement_reason,
+                    orchestration_binding: parse_optional_binding_mirror(
+                        run.orchestration_binding,
+                        &mut warnings,
+                    ),
                 }
             })
             .collect();
@@ -738,6 +850,14 @@ pub fn parse_simple_progress(
             commit: task.commit,
             risk_level: task.risk_level,
             task_agent_generation: task.task_agent_generation,
+            route_fingerprint: parse_optional_route_fingerprint(
+                task.route_fingerprint,
+                &mut warnings,
+            ),
+            orchestration_binding: parse_optional_binding_mirror(
+                task.orchestration_binding,
+                &mut warnings,
+            ),
             expected_work_unit_keys: task.expected_work_unit_keys,
             runs,
         });
@@ -1387,5 +1507,186 @@ Run verification: `cargo test second`
             read_simple_progress(workspace.path(), "missing.md", "docs/plan.md").await,
             Err(SimpleParseError::Unavailable(_))
         ));
+    }
+
+    const TASK6_FINGERPRINT: &str =
+        "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+
+    fn routed_progress_binding_fixture() -> String {
+        format!(
+            r#"<!-- codeg-simple-progress-v1
+{{
+  "schema_version": 1,
+  "plan_rel_path": "docs/plan.md",
+  "active_task_index": 1,
+  "pending_route_change": null,
+  "tasks": [{{
+    "index": 1,
+    "status": "in_progress",
+    "risk_level": "high",
+    "task_agent_generation": 1,
+    "route_fingerprint": "{fingerprint}",
+    "orchestration_binding": {{
+      "schema_version": 1,
+      "namespace": "brainstorm-to-delivery",
+      "generation": 1,
+      "route_fingerprint": "{fingerprint}"
+    }},
+    "expected_work_unit_keys": {{
+      "implementer": "task|1|implementer|codex|none",
+      "reviewers": {{
+        "primary": "task|1|reviewer|primary|codex|none",
+        "auxiliary": "task|1|reviewer|auxiliary|grok|none"
+      }}
+    }},
+    "runs": [{{
+      "role": "implementer",
+      "agent_type": "codex",
+      "profile_id": null,
+      "state": "reserving",
+      "work_unit_key": "task|1|implementer|codex|none",
+      "task_id": null,
+      "child_conversation_id": null,
+      "task_agent_generation": 1,
+      "root_task_id": null,
+      "previous_task_id": null,
+      "lineage_root_task_id": null,
+      "generic_generation": 1,
+      "replaced_task_id": null,
+      "replacement_reason": null,
+      "dispatch_intent": {{
+        "kind": "first",
+        "continuation_target_task_id": null,
+        "replacement_target_task_id": null,
+        "replacement_reason": null,
+        "expected_root_task_id": null,
+        "expected_lineage_root_task_id": null,
+        "expected_generic_generation": 1,
+        "expected_child_conversation_id": null,
+        "adopted_after_lost_acknowledgement": false
+      }},
+      "orchestration_binding": {{
+        "schema_version": 1,
+        "namespace": "brainstorm-to-delivery",
+        "generation": 1,
+        "route_fingerprint": "{fingerprint}"
+      }}
+    }}]
+  }}],
+  "final_review_status": "pending"
+}}
+-->"#,
+            fingerprint = TASK6_FINGERPRINT
+        )
+    }
+
+    #[test]
+    fn simple_orchestration_binding_parses_routed_progress_within_existing_bounds() {
+        let expected = SimpleOrchestrationBinding {
+            schema_version: 1,
+            namespace: SIMPLE_ORCHESTRATION_NAMESPACE.into(),
+            generation: 1,
+            route_fingerprint: TASK6_FINGERPRINT.into(),
+        };
+        let parsed = parse_simple_progress(
+            routed_progress_binding_fixture().as_bytes(),
+            "docs/plan.md",
+        )
+        .expect("parse routed binding progress");
+        let task = &parsed.snapshot.expect("snapshot").tasks[0];
+
+        assert_eq!(task.route_fingerprint.as_deref(), Some(TASK6_FINGERPRINT));
+        assert_eq!(
+            task.orchestration_binding,
+            SimpleBindingMirror::Present(expected.clone())
+        );
+        assert_eq!(
+            task.runs[0].orchestration_binding,
+            SimpleBindingMirror::Present(expected)
+        );
+        assert!(parsed.warning_codes.is_empty());
+
+        let pad = "x".repeat(32 * 1024);
+        let padded = format!(
+            r#"<!-- codeg-simple-progress-v1
+{{"schema_version":1,"plan_rel_path":"docs/plan.md","tasks":[{{"index":1,"status":"pending","route_fingerprint":"{TASK6_FINGERPRINT}","orchestration_binding":{{"schema_version":1,"namespace":"brainstorm-to-delivery","generation":1,"route_fingerprint":"{TASK6_FINGERPRINT}"}},"runs":[]}}],"final_review_status":"pending","pad":"{pad}"}}
+-->"#
+        );
+        assert!(padded.len() < MAX_SIMPLE_PROGRESS_BYTES);
+        assert!(padded.len() < MAX_SIMPLE_PROGRESS_BLOCK_BYTES + 256);
+        let bounded = parse_simple_progress(padded.as_bytes(), "docs/plan.md")
+            .expect("padded binding progress remains recoverable");
+        assert_eq!(
+            bounded
+                .snapshot
+                .expect("bounded snapshot")
+                .tasks[0]
+                .route_fingerprint
+                .as_deref(),
+            Some(TASK6_FINGERPRINT)
+        );
+
+        let over_block = format!(
+            "<!-- codeg-simple-progress-v1 {} -->",
+            "x".repeat(MAX_SIMPLE_PROGRESS_BLOCK_BYTES + 1)
+        );
+        let large = parse_simple_progress(over_block.as_bytes(), "docs/plan.md")
+            .expect("oversized block is recoverable");
+        assert!(large.snapshot.is_none());
+        assert_eq!(large.warning_codes, vec![WARNING_PROGRESS_TOO_LARGE]);
+
+        let mut over_file = routed_progress_binding_fixture();
+        over_file.push_str(&"#".repeat(MAX_SIMPLE_PROGRESS_BYTES + 1));
+        assert_eq!(
+            parse_simple_progress(over_file.as_bytes(), "docs/plan.md")
+                .expect_err("progress file limit"),
+            SimpleParseError::SizeLimitExceeded
+        );
+    }
+
+    #[test]
+    fn simple_orchestration_binding_keeps_snapshot_when_optional_mirror_is_malformed() {
+        let extra_field = br#"<!-- codeg-simple-progress-v1
+{
+  "schema_version": 1,
+  "plan_rel_path": "docs/plan.md",
+  "tasks": [{
+    "index": 1,
+    "status": "pending",
+    "route_fingerprint": 7,
+    "orchestration_binding": {
+      "schema_version": 1,
+      "namespace": "brainstorm-to-delivery",
+      "generation": 1,
+      "route_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "extra": true
+    },
+    "runs": [{
+      "role": "implementer",
+      "agent_type": "codex",
+      "state": "reserving",
+      "work_unit_key": "task|1|implementer|codex|none",
+      "orchestration_binding": ["not", "an", "object"]
+    }]
+  }],
+  "final_review_status": "pending"
+}
+-->"#;
+        let parsed = parse_simple_progress(extra_field, "docs/plan.md")
+            .expect("malformed optional binding stays recoverable");
+        let snapshot = parsed.snapshot.expect("snapshot must survive");
+        assert_eq!(snapshot.tasks[0].index, 1);
+        assert_eq!(
+            snapshot.tasks[0].orchestration_binding,
+            SimpleBindingMirror::Invalid
+        );
+        assert_eq!(
+            snapshot.tasks[0].runs[0].orchestration_binding,
+            SimpleBindingMirror::Invalid
+        );
+        assert_eq!(
+            parsed.warning_codes,
+            vec![WARNING_ORCHESTRATION_BINDING_MISMATCH]
+        );
     }
 }

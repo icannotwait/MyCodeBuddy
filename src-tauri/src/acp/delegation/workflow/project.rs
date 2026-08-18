@@ -41,9 +41,11 @@ use super::gates::{
 };
 use super::key::{build_work_unit_key, normalize_rel_path, parse_recognized_work_unit_key};
 use super::simple_parse::{
-    read_simple_plan, read_simple_progress, SimpleDeclaredStatus, SimpleFinalReviewStatus,
-    SimpleParseError, SimplePlanDocument, SimpleProgressDocument, SimpleProgressRun,
-    SimpleProgressTask, SimpleRoutingSnapshot,
+    read_simple_plan, read_simple_progress, route_fingerprint_is_well_formed, SimpleBindingMirror,
+    SimpleDeclaredStatus, SimpleFinalReviewStatus, SimpleOrchestrationBinding, SimpleParseError,
+    SimplePlanDocument, SimpleProgressDocument, SimpleProgressRun, SimpleProgressTask,
+    SimpleRoutingSnapshot, SIMPLE_ORCHESTRATION_NAMESPACE, WARNING_ORCHESTRATION_BINDING_MISMATCH,
+    WARNING_ORCHESTRATION_BINDING_MISSING, WARNING_ORCHESTRATION_BINDING_ORPHAN,
 };
 use super::types::{
     ManifestDocument, ManifestNodeKind, ManifestNodeRole, ManifestTaskPolicy,
@@ -2418,6 +2420,278 @@ fn reconcile_simple_progress_route(
     }
 }
 
+struct SimpleTaskBindingExpectation {
+    generation: Option<u32>,
+    fingerprint: Option<String>,
+    complete: Option<SimpleOrchestrationBinding>,
+    invalid: bool,
+}
+
+impl SimpleTaskBindingExpectation {
+    fn missing_expected(&self) -> bool {
+        !self.invalid && self.complete.is_none() && self.fingerprint.is_none()
+    }
+
+    fn agrees_with(&self, binding: &SimpleOrchestrationBinding) -> bool {
+        if self.invalid {
+            return false;
+        }
+        if let Some(complete) = &self.complete {
+            return complete == binding;
+        }
+        self.generation
+            .is_none_or(|generation| generation == binding.generation)
+            && self
+                .fingerprint
+                .as_deref()
+                .is_none_or(|fingerprint| fingerprint == binding.route_fingerprint)
+    }
+}
+
+fn expected_task_binding(task: &SimpleProgressTask) -> SimpleTaskBindingExpectation {
+    let complete = task.orchestration_binding.as_present().cloned();
+    let mut invalid = matches!(task.orchestration_binding, SimpleBindingMirror::Invalid);
+    if let Some(fingerprint) = task.route_fingerprint.as_deref() {
+        if !route_fingerprint_is_well_formed(fingerprint) {
+            invalid = true;
+        }
+    }
+    if let (Some(fingerprint), Some(binding)) = (task.route_fingerprint.as_deref(), complete.as_ref())
+    {
+        if fingerprint != binding.route_fingerprint {
+            invalid = true;
+        }
+    }
+    if let (Some(generation), Some(binding)) = (task.task_agent_generation, complete.as_ref()) {
+        if generation != binding.generation {
+            invalid = true;
+        }
+    }
+    if complete
+        .as_ref()
+        .is_some_and(|binding| !binding.is_well_formed())
+    {
+        invalid = true;
+    }
+    SimpleTaskBindingExpectation {
+        generation: task
+            .task_agent_generation
+            .or_else(|| complete.as_ref().map(|binding| binding.generation)),
+        fingerprint: task.route_fingerprint.clone().or_else(|| {
+            complete
+                .as_ref()
+                .map(|binding| binding.route_fingerprint.clone())
+        }),
+        complete,
+        invalid,
+    }
+}
+
+fn durable_binding_mirror(run: &delegation_task_run::Model) -> SimpleBindingMirror {
+    match (
+        run.orchestration_schema_version,
+        run.orchestration_namespace.as_ref(),
+        run.orchestration_generation,
+        run.orchestration_route_fingerprint.as_ref(),
+    ) {
+        (None, None, None, None) => SimpleBindingMirror::Absent,
+        (Some(schema), Some(namespace), Some(generation), Some(fingerprint)) => {
+            match (u32::try_from(schema), u32::try_from(generation)) {
+                (Ok(schema_version), Ok(generation)) => {
+                    let binding = SimpleOrchestrationBinding {
+                        schema_version,
+                        namespace: namespace.clone(),
+                        generation,
+                        route_fingerprint: fingerprint.clone(),
+                    };
+                    if binding.is_well_formed() {
+                        SimpleBindingMirror::Present(binding)
+                    } else {
+                        SimpleBindingMirror::Invalid
+                    }
+                }
+                _ => SimpleBindingMirror::Invalid,
+            }
+        }
+        _ => SimpleBindingMirror::Invalid,
+    }
+}
+
+fn simple_task_index_from_key(key: Option<&str>) -> Option<u32> {
+    match parse_recognized_work_unit_key(key?)? {
+        ParsedWorkUnitKey::TaskImplementer { task_index, .. }
+        | ParsedWorkUnitKey::TaskReviewer { task_index, .. } => Some(task_index),
+        _ => None,
+    }
+}
+
+fn durable_is_orphan_candidate(run: &delegation_task_run::Model) -> bool {
+    run.orchestration_namespace.as_deref() == Some(SIMPLE_ORCHESTRATION_NAMESPACE)
+        || simple_task_index_from_key(run.work_unit_key.as_deref()).is_some()
+}
+
+fn durable_matches_one_plan_and_progress(
+    run: &delegation_task_run::Model,
+    plan_indices: &BTreeSet<u32>,
+    progress_by_index: &BTreeMap<u32, &SimpleProgressTask>,
+) -> bool {
+    let mut matches = BTreeSet::new();
+    if let Some(index) = simple_task_index_from_key(run.work_unit_key.as_deref()) {
+        if plan_indices.contains(&index) && progress_by_index.contains_key(&index) {
+            matches.insert(index);
+        }
+    }
+    for (index, task) in progress_by_index {
+        if !plan_indices.contains(index) {
+            continue;
+        }
+        if task
+            .runs
+            .iter()
+            .any(|progress| progress.task_id.as_deref() == Some(run.task_id.as_str()))
+        {
+            matches.insert(*index);
+        }
+    }
+    matches.len() == 1
+}
+
+fn collect_orchestration_orphans(
+    parent_runs: &[delegation_task_run::Model],
+    plan_indices: &BTreeSet<u32>,
+    progress_by_index: &BTreeMap<u32, &SimpleProgressTask>,
+    task_orphans: &mut BTreeSet<u32>,
+    warnings: &mut Vec<String>,
+) {
+    for run in parent_runs {
+        if !durable_is_orphan_candidate(run) {
+            continue;
+        }
+        if durable_matches_one_plan_and_progress(run, plan_indices, progress_by_index) {
+            continue;
+        }
+        push_projection_warning(warnings, WARNING_ORCHESTRATION_BINDING_ORPHAN);
+        if let Some(index) = simple_task_index_from_key(run.work_unit_key.as_deref()) {
+            if plan_indices.contains(&index) {
+                task_orphans.insert(index);
+            }
+        }
+    }
+}
+
+fn progress_and_durable_identity_mismatch(
+    progress: &SimpleProgressRun,
+    durable: Option<&delegation_task_run::Model>,
+    expected_key: &str,
+    task_index: u32,
+) -> bool {
+    let (expected_agent, expected_profile) = simple_route_agent_and_profile(expected_key);
+    if simple_task_index_from_key(Some(expected_key)).is_some_and(|index| index != task_index) {
+        return true;
+    }
+    if !progress.agent_type.is_empty()
+        && expected_agent
+            .as_deref()
+            .is_some_and(|agent| agent != progress.agent_type)
+    {
+        return true;
+    }
+    if progress.profile_id.is_some() && progress.profile_id != expected_profile {
+        return true;
+    }
+    let Some(durable) = durable else {
+        return false;
+    };
+    if durable.work_unit_key.as_deref() != Some(expected_key)
+        || simple_task_index_from_key(durable.work_unit_key.as_deref())
+            .is_some_and(|index| index != task_index)
+        || expected_agent
+            .as_deref()
+            .is_some_and(|agent| agent != durable.agent_type)
+        || durable.profile_id != expected_profile
+        || (!progress.agent_type.is_empty() && progress.agent_type != durable.agent_type)
+        || (progress.profile_id.is_some() && progress.profile_id != durable.profile_id)
+    {
+        return true;
+    }
+    false
+}
+
+fn reconcile_simple_orchestration_binding(
+    expected: &SimpleExpectedRoute,
+    task_index: u32,
+    declared: &SimpleProgressTask,
+    parent_runs: &[delegation_task_run::Model],
+    warnings: &mut Vec<String>,
+) {
+    let expected_keys = simple_expected_route_keys(expected);
+    let task_expected = expected_task_binding(declared);
+    if task_expected.invalid {
+        push_projection_warning(warnings, WARNING_ORCHESTRATION_BINDING_MISMATCH);
+    }
+
+    let mut any_expected_run = false;
+    for run in &declared.runs {
+        let Some(key) = run.work_unit_key.as_deref() else {
+            continue;
+        };
+        if !expected_keys.contains(key) {
+            continue;
+        }
+        any_expected_run = true;
+        let durable = run.task_id.as_deref().and_then(|task_id| {
+            parent_runs
+                .iter()
+                .find(|candidate| candidate.task_id == task_id)
+        });
+        if progress_and_durable_identity_mismatch(run, durable, key, task_index) {
+            push_projection_warning(warnings, WARNING_ORCHESTRATION_BINDING_MISMATCH);
+        }
+
+        let durable_mirror = durable.map(durable_binding_mirror);
+        match (&run.orchestration_binding, durable_mirror.as_ref()) {
+            (SimpleBindingMirror::Invalid, _) | (_, Some(SimpleBindingMirror::Invalid)) => {
+                push_projection_warning(warnings, WARNING_ORCHESTRATION_BINDING_MISMATCH);
+            }
+            (SimpleBindingMirror::Absent, _) => {
+                push_projection_warning(warnings, WARNING_ORCHESTRATION_BINDING_MISSING);
+            }
+            (SimpleBindingMirror::Present(_), Some(SimpleBindingMirror::Absent)) => {
+                push_projection_warning(warnings, WARNING_ORCHESTRATION_BINDING_MISSING);
+            }
+            (SimpleBindingMirror::Present(_), None) if run.task_id.is_some() => {
+                push_projection_warning(warnings, WARNING_ORCHESTRATION_BINDING_MISSING);
+            }
+            (SimpleBindingMirror::Present(progress_binding), None) => {
+                if task_expected.missing_expected() {
+                    push_projection_warning(warnings, WARNING_ORCHESTRATION_BINDING_MISSING);
+                } else if !task_expected.agrees_with(progress_binding) {
+                    push_projection_warning(warnings, WARNING_ORCHESTRATION_BINDING_MISMATCH);
+                }
+            }
+            (
+                SimpleBindingMirror::Present(progress_binding),
+                Some(SimpleBindingMirror::Present(durable_binding)),
+            ) => {
+                if progress_binding != durable_binding {
+                    push_projection_warning(warnings, WARNING_ORCHESTRATION_BINDING_MISMATCH);
+                }
+                if task_expected.missing_expected() {
+                    push_projection_warning(warnings, WARNING_ORCHESTRATION_BINDING_MISSING);
+                } else if !task_expected.agrees_with(progress_binding)
+                    || !task_expected.agrees_with(durable_binding)
+                {
+                    push_projection_warning(warnings, WARNING_ORCHESTRATION_BINDING_MISMATCH);
+                }
+            }
+        }
+    }
+
+    if any_expected_run && task_expected.missing_expected() {
+        push_projection_warning(warnings, WARNING_ORCHESTRATION_BINDING_MISSING);
+    }
+}
+
 fn simple_expected_route_keys(expected: &SimpleExpectedRoute) -> BTreeSet<&str> {
     let mut keys = BTreeSet::from([
         expected.implementer_key.as_str(),
@@ -2723,6 +2997,17 @@ async fn project_simple_mode(
         );
     }
 
+    let mut binding_orphan_tasks = BTreeSet::new();
+    if plan.routing.is_some() && progress.snapshot.is_some() {
+        collect_orchestration_orphans(
+            &parent_runs,
+            &plan_indices,
+            &progress_by_index,
+            &mut binding_orphan_tasks,
+            &mut projection_warning_codes,
+        );
+    }
+
     let mut nodes = Vec::with_capacity(plan.tasks.len().saturating_mul(3));
     let mut edges = Vec::with_capacity(plan.tasks.len().saturating_mul(3));
     let mut prior_node_ids = Vec::<String>::new();
@@ -2859,6 +3144,18 @@ async fn project_simple_mode(
             push_projection_warning(
                 &mut node_warning_codes,
                 "simple_progress_unknown_task_status",
+            );
+        }
+        if binding_orphan_tasks.contains(&task.index) {
+            push_projection_warning(&mut node_warning_codes, WARNING_ORCHESTRATION_BINDING_ORPHAN);
+        }
+        if let (Some(expected), Some(declared_task)) = (expected_route.as_ref(), declared) {
+            reconcile_simple_orchestration_binding(
+                expected,
+                task.index,
+                declared_task,
+                &parent_runs,
+                &mut node_warning_codes,
             );
         }
 
@@ -3820,6 +4117,8 @@ mod tests {
             commit: None,
             risk_level: Some(expected.risk_level.clone()),
             task_agent_generation: Some(expected.task_agent_generation),
+            route_fingerprint: None,
+            orchestration_binding: super::super::simple_parse::SimpleBindingMirror::Absent,
             expected_work_unit_keys: Some(SimpleExpectedWorkUnitKeys {
                 implementer: expected.implementer_key.clone(),
                 reviewers: SimpleExpectedReviewerKeys {
@@ -4159,6 +4458,7 @@ mod tests {
             recovery_count: None,
             replaced_task_id: None,
             replacement_reason: None,
+            orchestration_binding: super::super::simple_parse::SimpleBindingMirror::Absent,
         };
         progress.runs = vec![
             run("impl", &expected.implementer_key, Some(42)),
@@ -5442,6 +5742,76 @@ mod tests {
             ..Default::default()
         };
         run.insert(&db.conn).await.expect("insert run");
+        child
+    }
+
+    async fn insert_bound_run(
+        db: &AppDatabase,
+        parent: i32,
+        task_id: &str,
+        work_unit_key: Option<&str>,
+        status: DelegationRunStatus,
+        generation: i64,
+        agent: &str,
+        binding: &super::super::simple_parse::SimpleOrchestrationBinding,
+    ) -> i32 {
+        let now = Utc::now();
+        let child = seed_conversation(
+            db,
+            seed_folder(db, &format!("/tmp/child-{task_id}")).await,
+            AgentType::Grok,
+        )
+        .await;
+        let run = delegation_task_run::ActiveModel {
+            task_id: Set(task_id.to_string()),
+            root_task_id: Set(task_id.to_string()),
+            previous_task_id: Set(None),
+            generation: Set(generation),
+            parent_conversation_id: Set(parent),
+            parent_tool_use_id: Set(None),
+            child_conversation_id: Set(child),
+            agent_type: Set(agent.into()),
+            profile_id: Set(None),
+            workspace_path: Set(None),
+            route_fingerprint: Set(None),
+            orchestration_schema_version: Set(Some(i64::from(binding.schema_version))),
+            orchestration_namespace: Set(Some(binding.namespace.clone())),
+            orchestration_generation: Set(Some(i64::from(binding.generation))),
+            orchestration_route_fingerprint: Set(Some(binding.route_fingerprint.clone())),
+            launch_snapshot_version: Set(None),
+            mode_id: Set(None),
+            config_values_json: Set(None),
+            task_preview: Set(None),
+            request_fingerprint: Set(None),
+            admission_class: Set(AdmissionClass::NormalRevision),
+            reached_running_at: Set(Some(now)),
+            lineage_root_task_id: Set(task_id.to_string()),
+            work_unit_key: Set(work_unit_key.map(|s| s.to_string())),
+            legacy_parent_tool_use_id: Set(None),
+            history_only: Set(false),
+            status: Set(status),
+            error_code: Set(None),
+            termination_audit_json: Set(None),
+            started_at: Set(Some(now)),
+            finished_at: Set(Some(now)),
+            tool_call_count: Set(None),
+            edit_tool_call_count: Set(None),
+            touched_files_json: Set(None),
+            touched_files_truncated: Set(None),
+            additions: Set(None),
+            deletions: Set(None),
+            line_counts_complete: Set(None),
+            card_summary_json: Set(None),
+            child_turn_anchor: Set(None),
+            child_connection_id: Set(None),
+            replaced_task_id: Set(None),
+            replacement_reason: Set(None),
+            recovery_authorization_id: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        };
+        run.insert(&db.conn).await.expect("insert bound run");
         child
     }
 
@@ -8267,5 +8637,634 @@ mod tests {
             .map(|(parsed, key)| synthetic_node_id(parsed, key))
             .collect::<BTreeSet<_>>();
         assert_eq!(ids.len(), 3);
+    }
+
+    const TASK6_FINGERPRINT: &str =
+        "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+    const TASK6_OTHER_FINGERPRINT: &str =
+        "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+
+    fn task6_binding(
+        generation: u32,
+        fingerprint: &str,
+    ) -> super::super::simple_parse::SimpleOrchestrationBinding {
+        super::super::simple_parse::SimpleOrchestrationBinding {
+            schema_version: 1,
+            namespace: super::super::simple_parse::SIMPLE_ORCHESTRATION_NAMESPACE.into(),
+            generation,
+            route_fingerprint: fingerprint.into(),
+        }
+    }
+
+    fn task6_binding_json(generation: u32, fingerprint: &str) -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": 1,
+            "namespace": "brainstorm-to-delivery",
+            "generation": generation,
+            "route_fingerprint": fingerprint,
+        })
+    }
+
+    fn task6_progress(
+        generation: u32,
+        fingerprint: &str,
+        include_run_binding: bool,
+        run_fingerprint: Option<&str>,
+        extra_tasks: Vec<serde_json::Value>,
+    ) -> serde_json::Value {
+        let mut run = serde_json::json!({
+            "role": "implementer",
+            "agent_type": "codex",
+            "profile_id": serde_json::Value::Null,
+            "state": "completed",
+            "work_unit_key": "task|1|implementer|codex|none",
+            "task_id": "bound-implementer",
+            "child_conversation_id": 11,
+            "task_agent_generation": generation,
+            "root_task_id": "bound-implementer",
+            "previous_task_id": serde_json::Value::Null,
+            "lineage_root_task_id": "bound-implementer",
+            "generic_generation": 1,
+            "replaced_task_id": serde_json::Value::Null,
+            "replacement_reason": serde_json::Value::Null,
+            "dispatch_intent": {
+                "kind": "first",
+                "continuation_target_task_id": serde_json::Value::Null,
+                "replacement_target_task_id": serde_json::Value::Null,
+                "replacement_reason": serde_json::Value::Null,
+                "expected_root_task_id": serde_json::Value::Null,
+                "expected_lineage_root_task_id": serde_json::Value::Null,
+                "expected_generic_generation": 1,
+                "expected_child_conversation_id": serde_json::Value::Null,
+                "adopted_after_lost_acknowledgement": false
+            }
+        });
+        if include_run_binding {
+            run["orchestration_binding"] = task6_binding_json(
+                generation,
+                run_fingerprint.unwrap_or(fingerprint),
+            );
+        }
+        let mut tasks = vec![serde_json::json!({
+            "index": 1,
+            "status": "in_progress",
+            "commit": serde_json::Value::Null,
+            "risk_level": "high",
+            "task_agent_generation": generation,
+            "route_fingerprint": fingerprint,
+            "orchestration_binding": task6_binding_json(generation, fingerprint),
+            "expected_work_unit_keys": {
+                "implementer": "task|1|implementer|codex|none",
+                "reviewers": {
+                    "primary": "task|1|reviewer|primary|codex|none",
+                    "auxiliary": "task|1|reviewer|auxiliary|codex|none"
+                }
+            },
+            "runs": [run]
+        })];
+        tasks.extend(extra_tasks);
+        serde_json::json!({
+            "schema_version": 1,
+            "plan_rel_path": "docs/simple-plan.md",
+            "active_task_index": 1,
+            "pending_route_change": serde_json::Value::Null,
+            "tasks": tasks,
+            "final_review_status": "pending"
+        })
+    }
+
+    fn task6_has_warning(snapshot: &WorkflowGraphSnapshot, code: &str) -> bool {
+        snapshot
+            .projection_warning_codes
+            .iter()
+            .any(|item| item == code)
+            || snapshot.nodes.iter().any(|node| {
+                node.projection_warning_codes
+                    .iter()
+                    .any(|item| item == code)
+            })
+    }
+
+    fn task6_assert_warning_only(snapshot: &WorkflowGraphSnapshot) {
+        assert!(snapshot.gates.is_empty(), "binding drift must not create Gates");
+        assert_eq!(snapshot.workflow_id, None);
+        assert_eq!(snapshot.manifest_revision, None);
+        assert_eq!(snapshot.completion, None);
+        assert_eq!(snapshot.compatibility, WorkflowCompatibility::Simple);
+    }
+
+    #[tokio::test]
+    async fn simple_orchestration_binding_missing_when_expected_run_lacks_progress_or_durable_binding(
+    ) {
+        let (db, parent) = seed_parent().await;
+        let routing = simple_multi_task_routing_fixture(&[(1, "high")]);
+        let progress = task6_progress(7, TASK6_FINGERPRINT, false, None, vec![]);
+        register_routed_simple_fixture(
+            &db,
+            parent,
+            &routing,
+            &[(1, "Missing binding")],
+            Some(progress),
+        )
+        .await;
+        insert_run(
+            &db,
+            parent,
+            "bound-implementer",
+            Some("task|1|implementer|codex|none"),
+            DelegationRunStatus::Completed,
+            1,
+            None,
+            None,
+            "codex",
+        )
+        .await;
+
+        let snapshot = project_workflow_graph_core(&db, parent)
+            .await
+            .expect("project missing binding");
+        assert!(
+            task6_has_warning(
+                &snapshot,
+                super::super::simple_parse::WARNING_ORCHESTRATION_BINDING_MISSING
+            ),
+            "missing progress/durable binding must warn: {:?}",
+            snapshot.projection_warning_codes
+        );
+        assert!(!task6_has_warning(
+            &snapshot,
+            super::super::simple_parse::WARNING_ORCHESTRATION_BINDING_ORPHAN
+        ));
+        task6_assert_warning_only(&snapshot);
+        let implementer = snapshot
+            .nodes
+            .iter()
+            .find(|node| node.node_id == "simple-task-1-implementer")
+            .expect("implementer");
+        assert_eq!(implementer.status, ProjectedNodeStatus::Completed);
+        assert_eq!(implementer.sync_state, WorkflowNodeSyncState::OutOfSync);
+        assert_ne!(snapshot.overall_state, WorkflowOverallState::Blocked);
+    }
+
+    #[tokio::test]
+    async fn simple_orchestration_binding_mismatch_when_progress_and_durable_disagree() {
+        let (db, parent) = seed_parent().await;
+        let routing = simple_multi_task_routing_fixture(&[(1, "high")]);
+        let progress = task6_progress(
+            7,
+            TASK6_FINGERPRINT,
+            true,
+            Some(TASK6_OTHER_FINGERPRINT),
+            vec![],
+        );
+        register_routed_simple_fixture(
+            &db,
+            parent,
+            &routing,
+            &[(1, "Mismatch binding")],
+            Some(progress),
+        )
+        .await;
+        insert_bound_run(
+            &db,
+            parent,
+            "bound-implementer",
+            Some("task|1|implementer|codex|none"),
+            DelegationRunStatus::Completed,
+            1,
+            "codex",
+            &task6_binding(1, TASK6_OTHER_FINGERPRINT),
+        )
+        .await;
+
+        let snapshot = project_workflow_graph_core(&db, parent)
+            .await
+            .expect("project mismatch binding");
+        assert!(
+            task6_has_warning(
+                &snapshot,
+                super::super::simple_parse::WARNING_ORCHESTRATION_BINDING_MISMATCH
+            ),
+            "progress/durable binding disagreement must warn: {:?}",
+            snapshot.projection_warning_codes
+        );
+        task6_assert_warning_only(&snapshot);
+        let implementer = snapshot
+            .nodes
+            .iter()
+            .find(|node| node.node_id == "simple-task-1-implementer")
+            .expect("implementer");
+        assert_eq!(implementer.status, ProjectedNodeStatus::Completed);
+        assert_eq!(implementer.sync_state, WorkflowNodeSyncState::OutOfSync);
+        assert_ne!(snapshot.overall_state, WorkflowOverallState::Blocked);
+    }
+
+    #[tokio::test]
+    async fn simple_orchestration_binding_orphan_when_durable_row_has_no_plan_progress_mirror() {
+        let (db, parent) = seed_parent().await;
+        let routing = simple_multi_task_routing_fixture(&[(1, "high")]);
+        let progress = task6_progress(7, TASK6_FINGERPRINT, true, None, vec![]);
+        register_routed_simple_fixture(
+            &db,
+            parent,
+            &routing,
+            &[(1, "Orphan binding")],
+            Some(progress),
+        )
+        .await;
+        insert_bound_run(
+            &db,
+            parent,
+            "bound-implementer",
+            Some("task|1|implementer|codex|none"),
+            DelegationRunStatus::Completed,
+            1,
+            "codex",
+            &task6_binding(7, TASK6_FINGERPRINT),
+        )
+        .await;
+        insert_bound_run(
+            &db,
+            parent,
+            "orphan-task-9",
+            Some("task|9|implementer|codex|none"),
+            DelegationRunStatus::Completed,
+            1,
+            "codex",
+            &task6_binding(7, TASK6_FINGERPRINT),
+        )
+        .await;
+
+        let snapshot = project_workflow_graph_core(&db, parent)
+            .await
+            .expect("project orphan binding");
+        assert!(
+            task6_has_warning(
+                &snapshot,
+                super::super::simple_parse::WARNING_ORCHESTRATION_BINDING_ORPHAN
+            ),
+            "unmatched bound Task-key row must warn: {:?}",
+            snapshot.projection_warning_codes
+        );
+        assert!(!task6_has_warning(
+            &snapshot,
+            super::super::simple_parse::WARNING_ORCHESTRATION_BINDING_MISSING
+        ));
+        task6_assert_warning_only(&snapshot);
+        assert_eq!(
+            snapshot
+                .nodes
+                .iter()
+                .map(|node| node.node_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "simple-task-1-implementer",
+                "simple-task-1-reviewer-primary",
+                "simple-task-1-reviewer-auxiliary",
+            ]
+        );
+    }
+
+    #[test]
+    fn simple_orchestration_binding_warnings_deduplicate_and_stay_within_cap() {
+        let mut warnings = Vec::new();
+        for _ in 0..8 {
+            push_projection_warning(
+                &mut warnings,
+                super::super::simple_parse::WARNING_ORCHESTRATION_BINDING_MISSING,
+            );
+            push_projection_warning(
+                &mut warnings,
+                super::super::simple_parse::WARNING_ORCHESTRATION_BINDING_MISMATCH,
+            );
+            push_projection_warning(
+                &mut warnings,
+                super::super::simple_parse::WARNING_ORCHESTRATION_BINDING_ORPHAN,
+            );
+        }
+        for index in 0..80 {
+            push_projection_warning(&mut warnings, &format!("other-warning-{index}"));
+        }
+        assert_eq!(
+            warnings
+                .iter()
+                .filter(|code| *code
+                    == super::super::simple_parse::WARNING_ORCHESTRATION_BINDING_MISSING)
+                .count(),
+            1
+        );
+        assert_eq!(
+            warnings
+                .iter()
+                .filter(|code| *code
+                    == super::super::simple_parse::WARNING_ORCHESTRATION_BINDING_MISMATCH)
+                .count(),
+            1
+        );
+        assert_eq!(
+            warnings
+                .iter()
+                .filter(|code| *code
+                    == super::super::simple_parse::WARNING_ORCHESTRATION_BINDING_ORPHAN)
+                .count(),
+            1
+        );
+        assert_eq!(warnings.len(), 64);
+        assert!(warnings.iter().all(|code| {
+            !code.starts_with("simple_orchestration_binding_")
+                || matches!(
+                    code.as_str(),
+                    super::super::simple_parse::WARNING_ORCHESTRATION_BINDING_MISSING
+                        | super::super::simple_parse::WARNING_ORCHESTRATION_BINDING_MISMATCH
+                        | super::super::simple_parse::WARNING_ORCHESTRATION_BINDING_ORPHAN
+                )
+        }));
+    }
+
+    #[tokio::test]
+    async fn simple_orchestration_binding_warnings_never_add_gates_or_change_admission() {
+        let (db, parent) = seed_parent().await;
+        let routing = simple_multi_task_routing_fixture(&[(1, "high")]);
+        let progress = task6_progress(7, TASK6_FINGERPRINT, false, None, vec![]);
+        register_routed_simple_fixture(
+            &db,
+            parent,
+            &routing,
+            &[(1, "Warning only")],
+            Some(progress),
+        )
+        .await;
+        insert_run(
+            &db,
+            parent,
+            "bound-implementer",
+            Some("task|1|implementer|codex|none"),
+            DelegationRunStatus::Completed,
+            1,
+            None,
+            None,
+            "codex",
+        )
+        .await;
+
+        let snapshot = project_workflow_graph_core(&db, parent)
+            .await
+            .expect("project warning-only fixture");
+        task6_assert_warning_only(&snapshot);
+        assert_eq!(snapshot.completion_protocol, None);
+        assert_eq!(snapshot.manifest_state, None);
+        assert_eq!(snapshot.graph_revision, None);
+        assert_ne!(snapshot.overall_state, WorkflowOverallState::Blocked);
+        assert!(snapshot.nodes.iter().all(|node| node.completion.is_none()));
+        assert!(
+            task6_has_warning(
+                &snapshot,
+                super::super::simple_parse::WARNING_ORCHESTRATION_BINDING_MISSING
+            ),
+            "fixture must still surface the missing warning"
+        );
+    }
+
+    #[tokio::test]
+    async fn simple_orchestration_binding_legacy_unbound_fixture_emits_none() {
+        let (db, parent) = seed_parent().await;
+        let workspace = parent_workspace(&db, parent).await;
+        std::fs::write(
+            std::path::Path::new(&workspace).join("docs/simple-plan.md"),
+            "## Task 1: Legacy unbound\n\nBody.\n",
+        )
+        .expect("write legacy plan");
+        std::fs::create_dir_all(
+            std::path::Path::new(&workspace).join(format!(".superpowers/sdd/{parent}")),
+        )
+        .expect("create progress directory");
+        std::fs::write(
+            std::path::Path::new(&workspace)
+                .join(format!(".superpowers/sdd/{parent}/progress.md")),
+            r#"<!-- codeg-simple-progress-v1
+{"schema_version":1,"plan_rel_path":"docs/simple-plan.md","active_task_index":1,"tasks":[{"index":1,"status":"in_progress","runs":[{"task_id":"legacy-unbound","role":"implementer","agent_type":"codex","state":"running","work_unit_key":"task|1|implementer|codex|none"}]}],"final_review_status":"pending"}
+-->"#,
+        )
+        .expect("write legacy progress");
+        super::super::simple::register_simple_workflow(
+            &db.conn,
+            parent,
+            "docs/simple-plan.md",
+            None,
+        )
+        .await
+        .expect("register legacy descriptor");
+        insert_run(
+            &db,
+            parent,
+            "legacy-unbound",
+            Some("task|1|implementer|codex|none"),
+            DelegationRunStatus::Running,
+            1,
+            None,
+            None,
+            "codex",
+        )
+        .await;
+
+        let snapshot = project_workflow_graph_core(&db, parent)
+            .await
+            .expect("project legacy unbound");
+        for code in [
+            super::super::simple_parse::WARNING_ORCHESTRATION_BINDING_MISSING,
+            super::super::simple_parse::WARNING_ORCHESTRATION_BINDING_MISMATCH,
+            super::super::simple_parse::WARNING_ORCHESTRATION_BINDING_ORPHAN,
+        ] {
+            assert!(
+                !task6_has_warning(&snapshot, code),
+                "legacy unbound fixture must not emit {code}: {:?}",
+                snapshot.projection_warning_codes
+            );
+        }
+        task6_assert_warning_only(&snapshot);
+        assert_eq!(snapshot.nodes[0].node_id, "simple-task-1");
+    }
+
+    #[tokio::test]
+    async fn simple_orchestration_binding_valid_high_route_nodes_and_edges_unchanged() {
+        let (db, parent) = seed_parent().await;
+        let routing = simple_multi_task_routing_fixture(&[(1, "high")]);
+        let mut progress = task6_progress(7, TASK6_FINGERPRINT, true, None, vec![]);
+        progress["tasks"][0]["runs"] = serde_json::json!([
+            {
+                "role": "implementer",
+                "agent_type": "codex",
+                "state": "completed",
+                "work_unit_key": "task|1|implementer|codex|none",
+                "task_id": "bound-implementer",
+                "orchestration_binding": task6_binding_json(7, TASK6_FINGERPRINT)
+            },
+            {
+                "role": "reviewer",
+                "agent_type": "codex",
+                "state": "completed",
+                "work_unit_key": "task|1|reviewer|primary|codex|none",
+                "task_id": "bound-primary",
+                "orchestration_binding": task6_binding_json(7, TASK6_FINGERPRINT)
+            },
+            {
+                "role": "reviewer",
+                "agent_type": "codex",
+                "state": "running",
+                "work_unit_key": "task|1|reviewer|auxiliary|codex|none",
+                "task_id": "bound-auxiliary",
+                "orchestration_binding": task6_binding_json(7, TASK6_FINGERPRINT)
+            }
+        ]);
+        progress["final_review_status"] = serde_json::json!("pending");
+        register_routed_simple_fixture(
+            &db,
+            parent,
+            &routing,
+            &[(1, "Valid high route")],
+            Some(progress),
+        )
+        .await;
+        insert_bound_run(
+            &db,
+            parent,
+            "bound-implementer",
+            Some("task|1|implementer|codex|none"),
+            DelegationRunStatus::Completed,
+            1,
+            "codex",
+            &task6_binding(7, TASK6_FINGERPRINT),
+        )
+        .await;
+        insert_bound_run(
+            &db,
+            parent,
+            "bound-primary",
+            Some("task|1|reviewer|primary|codex|none"),
+            DelegationRunStatus::Completed,
+            1,
+            "codex",
+            &task6_binding(7, TASK6_FINGERPRINT),
+        )
+        .await;
+        insert_bound_run(
+            &db,
+            parent,
+            "bound-auxiliary",
+            Some("task|1|reviewer|auxiliary|codex|none"),
+            DelegationRunStatus::Running,
+            1,
+            "codex",
+            &task6_binding(7, TASK6_FINGERPRINT),
+        )
+        .await;
+
+        let snapshot = project_workflow_graph_core(&db, parent)
+            .await
+            .expect("project valid high route");
+        assert_eq!(
+            snapshot
+                .nodes
+                .iter()
+                .map(|node| node.node_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "simple-task-1-implementer",
+                "simple-task-1-reviewer-primary",
+                "simple-task-1-reviewer-auxiliary",
+            ]
+        );
+        assert!(snapshot.edges.iter().any(|edge| {
+            edge.from == "simple-task-1-implementer"
+                && edge.to == "simple-task-1-reviewer-primary"
+        }));
+        assert!(snapshot.edges.iter().any(|edge| {
+            edge.from == "simple-task-1-implementer"
+                && edge.to == "simple-task-1-reviewer-auxiliary"
+        }));
+        assert_eq!(snapshot.edges.len(), 2);
+        assert_eq!(
+            snapshot
+                .nodes
+                .iter()
+                .find(|node| node.node_id == "simple-task-1-implementer")
+                .expect("implementer")
+                .status,
+            ProjectedNodeStatus::Completed
+        );
+        assert_eq!(
+            snapshot
+                .nodes
+                .iter()
+                .find(|node| node.node_id == "simple-task-1-reviewer-primary")
+                .expect("primary")
+                .status,
+            ProjectedNodeStatus::Completed
+        );
+        assert_eq!(
+            snapshot
+                .nodes
+                .iter()
+                .find(|node| node.node_id == "simple-task-1-reviewer-auxiliary")
+                .expect("auxiliary")
+                .status,
+            ProjectedNodeStatus::Running
+        );
+        for code in [
+            super::super::simple_parse::WARNING_ORCHESTRATION_BINDING_MISSING,
+            super::super::simple_parse::WARNING_ORCHESTRATION_BINDING_MISMATCH,
+            super::super::simple_parse::WARNING_ORCHESTRATION_BINDING_ORPHAN,
+        ] {
+            assert!(
+                !task6_has_warning(&snapshot, code),
+                "valid bindings must not emit {code}: {:?}",
+                snapshot.projection_warning_codes
+            );
+        }
+        task6_assert_warning_only(&snapshot);
+        for node in &snapshot.nodes {
+            assert_eq!(node.sync_state, WorkflowNodeSyncState::InSync);
+        }
+    }
+
+    #[tokio::test]
+    async fn simple_orchestration_binding_archived_manifest_projection_is_byte_stable() {
+        let (db, parent) = seed_parent().await;
+        publish_workflow_manifest_fixture(
+            &db,
+            &emitter(),
+            parent,
+            PublishWorkflowRequest {
+                document: design_plan_doc("task6-archived-stable"),
+            },
+        )
+        .await
+        .expect("publish archived manifest");
+
+        let first = project_workflow_graph_core(&db, parent)
+            .await
+            .expect("first archived projection");
+        let second = project_workflow_graph_core(&db, parent)
+            .await
+            .expect("second archived projection");
+        let first_bytes = serde_json::to_vec(&first).expect("serialize first archived snapshot");
+        let second_bytes = serde_json::to_vec(&second).expect("serialize second archived snapshot");
+        assert_eq!(first_bytes, second_bytes);
+        assert_eq!(first.compatibility, WorkflowCompatibility::Manifest);
+        assert!(first.workflow_id.is_some());
+        assert!(first.manifest_revision.is_some());
+        assert!(first.archived.is_some());
+        for code in [
+            super::super::simple_parse::WARNING_ORCHESTRATION_BINDING_MISSING,
+            super::super::simple_parse::WARNING_ORCHESTRATION_BINDING_MISMATCH,
+            super::super::simple_parse::WARNING_ORCHESTRATION_BINDING_ORPHAN,
+        ] {
+            assert!(
+                !task6_has_warning(&first, code),
+                "archived projection must not gain {code}"
+            );
+        }
+        let encoded = String::from_utf8(first_bytes).expect("archived json utf8");
+        assert!(!encoded.contains("simple_orchestration_binding_"));
     }
 }
