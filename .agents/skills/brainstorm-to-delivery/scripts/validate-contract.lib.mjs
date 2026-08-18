@@ -3,6 +3,8 @@
  * and its Plan/progress documents.
  */
 
+import { createHash } from "node:crypto"
+
 export const MAX_PLAN_DOCUMENT_BYTES = 2 * 1024 * 1024
 export const MAX_PROGRESS_DOCUMENT_BYTES = 512 * 1024
 export const MAX_PROGRESS_BLOCK_BYTES = 64 * 1024
@@ -11,6 +13,9 @@ export const MAX_ROUTING_BLOCK_BYTES = 256 * 1024
 const MAX_I32 = 0x7fffffff
 const MAX_U32 = 0xffffffff
 const MAX_UNEXPECTED_CONTINUATIONS = 2
+const ROUTE_BINDING_SCHEMA_VERSION = 1
+const ROUTE_BINDING_NAMESPACE = "brainstorm-to-delivery"
+const ROUTE_BINDING_INPUT_MARKER = "codeg-b2d-route-binding-v1"
 
 const SKILL_CONTRACT_MARKER = "<!-- codeg-b2d-skill-contract-v2"
 const ROUTING_MARKER = "<!-- codeg-b2d-routing-v1"
@@ -5844,6 +5849,202 @@ export function deriveExpectedRoute(task, generation, failures) {
   }
 }
 
+function isUnicodeScalarString(value) {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index)
+    if (code >= 0xd800 && code <= 0xdbff) {
+      if (index + 1 >= value.length) return false
+      const next = value.charCodeAt(index + 1)
+      if (next < 0xdc00 || next > 0xdfff) return false
+      index += 1
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      return false
+    }
+  }
+  return true
+}
+
+/** Assert the restricted I-JSON domain used by the route positional array. */
+export function assertRouteInputIsIJson(value, path = "$") {
+  if (value === null) return
+  if (typeof value === "string") {
+    if (!isUnicodeScalarString(value)) {
+      throw new TypeError(
+        `${path} contains a non-Unicode-scalar string (lone surrogate)`
+      )
+    }
+    return
+  }
+  if (typeof value === "number") {
+    if (!Number.isSafeInteger(value)) {
+      throw new TypeError(`${path} contains a non-safe integer`)
+    }
+    return
+  }
+  if (Array.isArray(value)) {
+    value.forEach((entry, index) =>
+      assertRouteInputIsIJson(entry, `${path}[${index}]`)
+    )
+    return
+  }
+  throw new TypeError(`${path} is outside the restricted I-JSON route domain`)
+}
+
+function routeAndKeys(expectedRoute) {
+  const route = expectedRoute?.route ?? expectedRoute
+  const expectedWorkUnitKeys = expectedRoute?.expected_work_unit_keys
+  if (!isObject(route) || !isObject(expectedWorkUnitKeys)) {
+    throw new TypeError(
+      "expectedRoute must contain a normalized route and keys"
+    )
+  }
+  if (!isObject(route.implementer) || !Array.isArray(route.reviewers)) {
+    throw new TypeError("expectedRoute has an invalid normalized route")
+  }
+  if (!isObject(expectedWorkUnitKeys.reviewers)) {
+    throw new TypeError("expectedRoute has invalid expected work-unit keys")
+  }
+  return { route, expectedWorkUnitKeys }
+}
+
+/** Build the closed positional value used for the RFC 8785 route identity. */
+export function deriveRouteBindingInput(task, generation, expectedRoute) {
+  const { route, expectedWorkUnitKeys } = routeAndKeys(expectedRoute)
+  const reviewers = route.reviewers.map((reviewer) => [
+    reviewer.slot,
+    reviewer.agent_type,
+    reviewer.profile_id,
+  ])
+  const keys = [
+    expectedWorkUnitKeys.implementer,
+    expectedWorkUnitKeys.reviewers.primary,
+  ]
+  if (expectedWorkUnitKeys.reviewers.auxiliary !== null) {
+    keys.push(expectedWorkUnitKeys.reviewers.auxiliary)
+  }
+  return [
+    ROUTE_BINDING_INPUT_MARKER,
+    ROUTE_BINDING_SCHEMA_VERSION,
+    ROUTE_BINDING_NAMESPACE,
+    task?.index,
+    task?.task_agent_generation,
+    task?.risk?.level,
+    [route.implementer.agent_type, route.implementer.profile_id],
+    reviewers,
+    keys,
+  ]
+}
+
+/** Derive the immutable v1 binding from already-normalized routing data. */
+export function deriveOrchestrationBinding(task, generation, expectedRoute) {
+  const input = deriveRouteBindingInput(task, generation, expectedRoute)
+  assertRouteInputIsIJson(input)
+  const bytes = Buffer.from(JSON.stringify(input), "utf8")
+  return {
+    schema_version: ROUTE_BINDING_SCHEMA_VERSION,
+    namespace: ROUTE_BINDING_NAMESPACE,
+    generation: task?.task_agent_generation,
+    route_fingerprint: `sha256:${createHash("sha256")
+      .update(bytes)
+      .digest("hex")}`,
+  }
+}
+
+/** Derive ordered bindings for a normalized routing snapshot. */
+export function deriveTaskBindings(routing, failures = []) {
+  if (
+    !routing ||
+    !Array.isArray(routing.tasks) ||
+    !Array.isArray(routing.generations)
+  ) {
+    return []
+  }
+  const start = failures.length
+  const bindings = []
+  for (const task of routing.tasks) {
+    const generation = routing.generations.find(
+      (candidate) => candidate.generation === task?.task_agent_generation
+    )
+    const expected = deriveExpectedRoute(task, generation, failures)
+    if (!expected) continue
+    let binding
+    try {
+      binding = deriveOrchestrationBinding(task, generation, expected)
+    } catch (error) {
+      fail(
+        failures,
+        "B2D-ROUTING-010",
+        `Task ${task?.index} route binding is not canonical: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      )
+      continue
+    }
+    bindings.push({
+      task_index: task.index,
+      risk_level: task.risk.level,
+      task_agent_generation: task.task_agent_generation,
+      expected_work_unit_keys: expected.expected_work_unit_keys,
+      orchestration_binding: binding,
+    })
+  }
+  return failures.length === start ? bindings : []
+}
+
+/** Parse the strict v1 binding shape shared with Rust and MCP. */
+export function parseOrchestrationBinding(value) {
+  const failures = []
+  if (!isObject(value)) {
+    failures.push("binding must be an object")
+    return { valid: false, binding: null, value: null, failures }
+  }
+  const keys = Object.keys(value).sort()
+  if (
+    keys.join(",") !==
+    ["generation", "namespace", "route_fingerprint", "schema_version"].join(",")
+  ) {
+    failures.push("binding fields are not exact")
+  }
+  if (value.schema_version !== ROUTE_BINDING_SCHEMA_VERSION) {
+    failures.push("schema_version must be 1")
+  }
+  if (
+    typeof value.namespace !== "string" ||
+    Buffer.byteLength(value.namespace, "utf8") === 0 ||
+    Buffer.byteLength(value.namespace, "utf8") > 64 ||
+    !/^[a-z][a-z0-9-]*$/.test(value.namespace)
+  ) {
+    failures.push("namespace is invalid")
+  }
+  if (
+    !Number.isInteger(value.generation) ||
+    value.generation < 1 ||
+    value.generation > MAX_U32
+  ) {
+    failures.push("generation must be an unsigned positive 32-bit integer")
+  }
+  if (
+    typeof value.route_fingerprint !== "string" ||
+    !/^sha256:[0-9a-f]{64}$/.test(value.route_fingerprint)
+  ) {
+    failures.push("route_fingerprint is invalid")
+  }
+  const binding =
+    failures.length === 0
+      ? {
+          schema_version: value.schema_version,
+          namespace: value.namespace,
+          generation: value.generation,
+          route_fingerprint: value.route_fingerprint,
+        }
+      : null
+  return { valid: failures.length === 0, binding, value: binding, failures }
+}
+
+export function validateOrchestrationBinding(value) {
+  return parseOrchestrationBinding(value).valid
+}
+
 /** Validate routing semantics and return normalized generations and Tasks. */
 export function validateRoutingSnapshot(snapshot, plan, failures) {
   const normalized = { generations: [], tasks: [] }
@@ -5960,14 +6161,34 @@ export function validateRoutingSnapshot(snapshot, plan, failures) {
         `Task ${routeTask.index} route is not the exact deterministic route`
       )
     }
-    normalized.tasks.push({
+    const normalizedTask = {
       ...routeTask,
       risk: {
         ...routeTask.risk,
         level: expectedLevel ?? routeTask.risk?.level,
       },
       expected_work_unit_keys: derived?.expected_work_unit_keys ?? null,
-    })
+    }
+    if (derived && expectedLevel) {
+      try {
+        const binding = deriveOrchestrationBinding(
+          normalizedTask,
+          generation,
+          derived
+        )
+        normalizedTask.route_fingerprint = binding.route_fingerprint
+        normalizedTask.orchestration_binding = binding
+      } catch (error) {
+        fail(
+          failures,
+          "B2D-ROUTING-010",
+          `Task ${routeTask.index} route binding is not canonical: ${
+            error instanceof Error ? error.message : String(error)
+          }`
+        )
+      }
+    }
+    normalized.tasks.push(normalizedTask)
   }
   for (const generation of normalized.generations) {
     const first = normalized.tasks.find(
@@ -6741,4 +6962,187 @@ export function validateSimpleDocuments({
     routing,
     progress,
   }
+}
+
+function structuredFailures(failures) {
+  return failures.map((failure) => {
+    const text = String(failure)
+    const match = text.match(/^\[([^\]]+)\]\s*(.*)$/s)
+    return {
+      rule_id: match?.[1] ?? "B2D-VALIDATION-001",
+      message: match?.[2] ?? text,
+    }
+  })
+}
+
+function bindingFailure(failures, ruleId, message) {
+  fail(failures, ruleId, message)
+}
+
+function validateStaticBindingAgreement(snapshot, routing, failures) {
+  if (!isObject(snapshot) || !routing) return
+  const progressByIndex = new Map(
+    Array.isArray(snapshot.tasks)
+      ? snapshot.tasks
+          .filter((task) => isObject(task) && positiveInteger(task.index))
+          .map((task) => [task.index, task])
+      : []
+  )
+  for (const routeTask of routing.tasks) {
+    const progressTask = progressByIndex.get(routeTask.index)
+    const expectedBinding = routeTask.orchestration_binding
+    if (!progressTask) {
+      bindingFailure(
+        failures,
+        "B2D-BINDING-001",
+        `Task ${routeTask.index} is missing from static progress`
+      )
+      continue
+    }
+    if (progressTask.route_fingerprint !== expectedBinding?.route_fingerprint) {
+      bindingFailure(
+        failures,
+        "B2D-BINDING-001",
+        `Task ${routeTask.index} route_fingerprint disagrees with the derived binding`
+      )
+    }
+    if (progressTask.orchestration_binding !== undefined) {
+      const parsed = parseOrchestrationBinding(
+        progressTask.orchestration_binding
+      )
+      if (
+        !parsed.valid ||
+        !skillContractsEqual(parsed.binding, expectedBinding)
+      ) {
+        bindingFailure(
+          failures,
+          "B2D-BINDING-002",
+          `Task ${routeTask.index} orchestration_binding disagrees with the derived binding`
+        )
+      }
+    }
+    if (!Array.isArray(progressTask.runs)) continue
+    for (const [runIndex, run] of progressTask.runs.entries()) {
+      if (!isObject(run)) continue
+      const parsed = parseOrchestrationBinding(run.orchestration_binding)
+      if (
+        !parsed.valid ||
+        !skillContractsEqual(parsed.binding, expectedBinding)
+      ) {
+        bindingFailure(
+          failures,
+          "B2D-BINDING-003",
+          `Task ${routeTask.index} run ${runIndex + 1} orchestration_binding disagrees with the derived binding`
+        )
+      }
+    }
+  }
+}
+
+function validationEnvelope(failures, taskBindings = []) {
+  return {
+    schema_version: 1,
+    admission_authorized: false,
+    durable_snapshot: null,
+    task_bindings: failures.length === 0 ? taskBindings : [],
+    reconciliation_actions: [],
+    failures: structuredFailures(failures),
+  }
+}
+
+/**
+ * Pure validator entry point for Skill-only, Plan-only derivation, and static
+ * Plan/progress agreement. Durable evidence is intentionally not accepted.
+ */
+export function runValidation(options = {}) {
+  const failures = []
+  const skillMarkdown = String(options.skillMarkdown ?? "")
+  const planMarkdown = options.planMarkdown
+  const progressMarkdown = options.progressMarkdown
+  const hasPlan = planMarkdown !== undefined && planMarkdown !== null
+  const hasProgress =
+    progressMarkdown !== undefined && progressMarkdown !== null
+  const derivePlanRouting =
+    options.derivePlanRouting === true || options.mode === "plan"
+  const outputJson = options.outputJson === true
+
+  const skill = validateSkillMarkdown(skillMarkdown)
+  failures.push(...skill.failures)
+
+  if (!hasPlan) {
+    if (hasProgress || derivePlanRouting || outputJson || options.planRelPath) {
+      fail(
+        failures,
+        "B2D-CLI-001",
+        "Plan, progress, and derivation flags require an explicit Plan mode"
+      )
+    }
+    return validationEnvelope(failures)
+  }
+
+  if (
+    typeof options.planRelPath !== "string" ||
+    options.planRelPath.length === 0
+  ) {
+    fail(failures, "B2D-CLI-001", "Plan mode requires --plan-rel-path")
+  }
+  if (derivePlanRouting && hasProgress) {
+    fail(
+      failures,
+      "B2D-CLI-001",
+      "Plan-only derivation cannot include a progress document"
+    )
+  }
+  if (derivePlanRouting && !outputJson) {
+    fail(failures, "B2D-CLI-001", "Plan-only derivation requires --output-json")
+  }
+  if (!derivePlanRouting && !hasProgress) {
+    fail(
+      failures,
+      "B2D-CLI-001",
+      "Static Plan validation requires a progress document"
+    )
+  }
+
+  if (hasProgress) {
+    const documents = validateSimpleDocuments({
+      skillMarkdown,
+      planMarkdown: String(planMarkdown),
+      progressMarkdown: String(progressMarkdown),
+      planRelPath: options.planRelPath,
+    })
+    failures.push(...documents.failures)
+    if (documents.routing && documents.progress.snapshot) {
+      validateStaticBindingAgreement(
+        documents.progress.snapshot,
+        documents.routing,
+        failures
+      )
+      if (failures.length === 0) {
+        const taskBindings = deriveTaskBindings(documents.routing, failures)
+        return validationEnvelope(failures, taskBindings)
+      }
+    }
+    return validationEnvelope(failures)
+  }
+
+  const plan = parseSimplePlan(String(planMarkdown))
+  const routingFailures = []
+  if (
+    !plan.routing &&
+    !plan.failures.some((failure) => failure.startsWith("[B2D-ROUTING-"))
+  ) {
+    fail(
+      routingFailures,
+      "B2D-ROUTING-001",
+      "authoritative document validation requires exactly one routing block"
+    )
+  }
+  const routing = plan.routing
+    ? validateRoutingSnapshot(plan.routing, plan, routingFailures)
+    : null
+  failures.push(...plan.failures, ...routingFailures)
+  if (failures.length > 0 || !routing) return validationEnvelope(failures)
+  const taskBindings = deriveTaskBindings(routing, failures)
+  return validationEnvelope(failures, taskBindings)
 }

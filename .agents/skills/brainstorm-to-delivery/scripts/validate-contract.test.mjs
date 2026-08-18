@@ -1,14 +1,21 @@
 import assert from "node:assert/strict"
-import { readFileSync } from "node:fs"
+import { spawnSync } from "node:child_process"
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { dirname, join } from "node:path"
 import { describe, it } from "node:test"
 import { fileURLToPath } from "node:url"
+import { tmpdir } from "node:os"
 import {
   MAX_ROUTING_BLOCK_BYTES,
+  deriveOrchestrationBinding,
+  deriveRouteBindingInput,
+  deriveTaskBindings,
   deriveExpectedRoute,
+  parseOrchestrationBinding,
   parseSimplePlan,
   parseSimpleProgress,
   parseSimpleRouting,
+  runValidation,
   validateProgressRouting,
   validateRoutingSnapshot,
   validateSimpleDocuments,
@@ -6037,5 +6044,638 @@ describe("progress agreement and per-key lineage", () => {
     const normalized = validateRoutingSnapshot(parsed.routing, parsed, failures)
     validateProgressRouting(progress(), normalized, failures)
     assert.deepEqual(failures, [])
+  })
+})
+
+describe("durable route binding derivation", () => {
+  const HIGH_ROUTE_INPUT = [
+    "codeg-b2d-route-binding-v1",
+    1,
+    "brainstorm-to-delivery",
+    7,
+    2,
+    "high",
+    ["codex", null],
+    [
+      ["primary", "codex", null],
+      ["auxiliary", "grok", null],
+    ],
+    [
+      "task|7|implementer|codex|none",
+      "task|7|reviewer|primary|codex|none",
+      "task|7|reviewer|auxiliary|grok|none",
+    ],
+  ]
+
+  it("derives the published high vector exactly", () => {
+    const highTask = {
+      index: 7,
+      task_agent_generation: 2,
+      risk: { level: "high" },
+    }
+    const highGeneration = {
+      generation: 2,
+      agent_type: "grok",
+      profile_id: null,
+      effective_from_task_index: 7,
+    }
+    const routeFailures = []
+    const highExpectedRoute = deriveExpectedRoute(
+      highTask,
+      highGeneration,
+      routeFailures
+    )
+    assert.deepEqual(routeFailures, [])
+    assert.deepEqual(
+      deriveRouteBindingInput(highTask, highGeneration, highExpectedRoute),
+      HIGH_ROUTE_INPUT
+    )
+    assert.equal(
+      deriveOrchestrationBinding(highTask, highGeneration, highExpectedRoute)
+        .route_fingerprint,
+      "sha256:b498416d87bf6ba928bd7ddb5f1a451daf82300584f3d40b606c3c56f169ba7a"
+    )
+  })
+
+  it("changes identity for every route input mutation but ignores source order", () => {
+    const taskValue = {
+      index: 7,
+      task_agent_generation: 2,
+      risk: { level: "high", unused: true },
+      irrelevant: "not part of the route",
+    }
+    const generation = {
+      generation: 2,
+      agent_type: "grok",
+      profile_id: null,
+      effective_from_task_index: 7,
+    }
+    const failures = []
+    const expected = deriveExpectedRoute(taskValue, generation, failures)
+    assert.deepEqual(failures, [])
+    const original = deriveOrchestrationBinding(
+      taskValue,
+      generation,
+      expected
+    ).route_fingerprint
+    const reviewerOrder = structuredClone(expected)
+    reviewerOrder.route.reviewers.reverse()
+    assert.notEqual(
+      deriveOrchestrationBinding(taskValue, generation, reviewerOrder)
+        .route_fingerprint,
+      original
+    )
+    const keyOrder = structuredClone(expected)
+    ;[
+      keyOrder.expected_work_unit_keys.reviewers.primary,
+      keyOrder.expected_work_unit_keys.reviewers.auxiliary,
+    ] = [
+      keyOrder.expected_work_unit_keys.reviewers.auxiliary,
+      keyOrder.expected_work_unit_keys.reviewers.primary,
+    ]
+    assert.notEqual(
+      deriveOrchestrationBinding(taskValue, generation, keyOrder)
+        .route_fingerprint,
+      original
+    )
+    for (const [label, change] of [
+      ["risk", (task) => (task.risk.level = "normal")],
+      ["Task index", (task) => (task.index = 8)],
+      ["generation", (task) => (task.task_agent_generation = 3)],
+      ["Agent", (generationValue) => (generationValue.agent_type = "gemini")],
+      [
+        "profile",
+        (generationValue) => (generationValue.profile_id = "careful"),
+      ],
+    ]) {
+      const changedTask = structuredClone(taskValue)
+      const changedGeneration = structuredClone(generation)
+      if (["Agent", "profile"].includes(label)) change(changedGeneration)
+      else change(changedTask)
+      const changedFailures = []
+      const changedExpected = deriveExpectedRoute(
+        changedTask,
+        changedGeneration,
+        changedFailures
+      )
+      assert.deepEqual(changedFailures, [], label)
+      assert.notEqual(
+        deriveOrchestrationBinding(
+          changedTask,
+          changedGeneration,
+          changedExpected
+        ).route_fingerprint,
+        original,
+        label
+      )
+    }
+  })
+
+  it("rejects lone surrogates and accepts escaped controls in the restricted value", () => {
+    const taskValue = {
+      index: 7,
+      task_agent_generation: 2,
+      risk: { level: "high" },
+    }
+    const generation = {
+      generation: 2,
+      agent_type: "grok",
+      profile_id: null,
+      effective_from_task_index: 7,
+    }
+    const failures = []
+    const expected = deriveExpectedRoute(taskValue, generation, failures)
+    assert.deepEqual(failures, [])
+    const controlRoute = structuredClone(expected)
+    controlRoute.expected_work_unit_keys.implementer =
+      "task|7|implementer|codex|line\nfeed"
+    assert.doesNotThrow(() =>
+      deriveOrchestrationBinding(taskValue, generation, controlRoute)
+    )
+    const surrogateRoute = structuredClone(expected)
+    surrogateRoute.expected_work_unit_keys.implementer =
+      "task|7|implementer|codex|\ud800"
+    assert.throws(
+      () => deriveOrchestrationBinding(taskValue, generation, surrogateRoute),
+      /I-JSON|Unicode scalar|surrogate/i
+    )
+  })
+
+  it("covers normal, maximum-generation, custom-agent, and exact Unicode profiles", () => {
+    const normalTask = {
+      index: 1,
+      task_agent_generation: 1,
+      risk: { level: "normal" },
+    }
+    const normalGeneration = {
+      generation: 1,
+      agent_type: "grok",
+      profile_id: null,
+      effective_from_task_index: 1,
+    }
+    const normalFailures = []
+    const normalRoute = deriveExpectedRoute(
+      normalTask,
+      normalGeneration,
+      normalFailures
+    )
+    assert.deepEqual(normalFailures, [])
+    const normalInput = deriveRouteBindingInput(
+      normalTask,
+      normalGeneration,
+      normalRoute
+    )
+    assert.equal(normalInput[7].length, 1)
+    assert.equal(normalInput[8].length, 2)
+
+    const maximumTask = {
+      index: 0xffffffff,
+      task_agent_generation: 0xffffffff,
+      risk: { level: "high" },
+    }
+    const maximumGeneration = {
+      generation: 0xffffffff,
+      agent_type: "custom:worker",
+      profile_id: "release",
+      effective_from_task_index: 0xffffffff,
+    }
+    const maximumFailures = []
+    const maximumRoute = deriveExpectedRoute(
+      maximumTask,
+      maximumGeneration,
+      maximumFailures
+    )
+    assert.deepEqual(maximumFailures, [])
+    assert.match(
+      deriveOrchestrationBinding(maximumTask, maximumGeneration, maximumRoute)
+        .route_fingerprint,
+      /^sha256:[0-9a-f]{64}$/
+    )
+
+    const composed = {
+      ...normalGeneration,
+      agent_type: "custom:worker",
+      profile_id: "café",
+    }
+    const decomposed = {
+      ...composed,
+      profile_id: "cafe\u0301",
+    }
+    const composedFailures = []
+    const decomposedFailures = []
+    const composedRoute = deriveExpectedRoute(
+      normalTask,
+      composed,
+      composedFailures
+    )
+    const decomposedRoute = deriveExpectedRoute(
+      normalTask,
+      decomposed,
+      decomposedFailures
+    )
+    assert.deepEqual(composedFailures, [])
+    assert.deepEqual(decomposedFailures, [])
+    assert.notEqual(
+      deriveOrchestrationBinding(normalTask, composed, composedRoute)
+        .route_fingerprint,
+      deriveOrchestrationBinding(normalTask, decomposed, decomposedRoute)
+        .route_fingerprint
+    )
+  })
+
+  it("matches every unchanged shared binding grammar corpus result", () => {
+    const fixture = JSON.parse(
+      readFileSync(
+        join(
+          here,
+          "../../../../src-tauri/tests/fixtures/orchestration_binding_v1.json"
+        ),
+        "utf8"
+      )
+    )
+    assert.deepEqual(Object.keys(fixture).sort(), ["cases", "schema_version"])
+    assert.equal(fixture.schema_version, 1)
+    assert.ok(Array.isArray(fixture.cases))
+    const names = fixture.cases.map((entry) => entry.name)
+    assert.equal(new Set(names).size, names.length)
+    for (const entry of fixture.cases) {
+      assert.deepEqual(Object.keys(entry).sort(), ["name", "valid", "value"])
+      assert.equal(typeof entry.name, "string")
+      assert.equal(typeof entry.valid, "boolean")
+      assert.equal(
+        parseOrchestrationBinding(entry.value).valid,
+        entry.valid,
+        entry.name
+      )
+    }
+  })
+
+  it("returns an exact non-authorizing plan-only envelope", () => {
+    const result = runValidation({
+      skillMarkdown: skill,
+      planMarkdown: plan(),
+      planRelPath,
+      derivePlanRouting: true,
+      outputJson: true,
+    })
+    assert.deepEqual(Object.keys(result), [
+      "schema_version",
+      "admission_authorized",
+      "durable_snapshot",
+      "task_bindings",
+      "reconciliation_actions",
+      "failures",
+    ])
+    assert.equal(result.schema_version, 1)
+    assert.equal(result.admission_authorized, false)
+    assert.equal(result.durable_snapshot, null)
+    assert.deepEqual(result.reconciliation_actions, [])
+    assert.deepEqual(result.failures, [])
+    assert.equal(result.task_bindings.length, 2)
+    assert.ok(
+      result.task_bindings.every((binding) => binding.orchestration_binding)
+    )
+  })
+
+  it("does not emit usable bindings when plan routing fails", () => {
+    const invalid = routing()
+    invalid.tasks[0].route.implementer = {
+      agent_type: "codex",
+      profile_id: null,
+    }
+    const result = runValidation({
+      skillMarkdown: skill,
+      planMarkdown: plan(invalid),
+      planRelPath,
+      derivePlanRouting: true,
+      outputJson: true,
+    })
+    assert.equal(result.admission_authorized, false)
+    assert.deepEqual(result.task_bindings, [])
+    assert.deepEqual(result.reconciliation_actions, [])
+    assert.ok(result.failures.length > 0)
+    assert.ok(
+      result.failures.every(
+        (failure) => Object.keys(failure).sort().join(",") === "message,rule_id"
+      )
+    )
+  })
+
+  it("keeps the CLI plan-only mode explicit and non-authorizing", () => {
+    const script = join(here, "validate-contract.mjs")
+    const missingJson = spawnSync(
+      process.execPath,
+      [
+        script,
+        "--plan",
+        "plan.md",
+        "--plan-rel-path",
+        "plan.md",
+        "--derive-plan-routing",
+      ],
+      { encoding: "utf8" }
+    )
+    assert.notEqual(missingJson.status, 0)
+    assert.match(missingJson.stderr, /output-json/i)
+
+    const skillOnly = spawnSync(process.execPath, [script], {
+      encoding: "utf8",
+    })
+    assert.equal(skillOnly.status, 0)
+    assert.match(skillOnly.stdout, /PASS:/)
+    assert.doesNotMatch(skillOnly.stdout, /admission_authorized\s*:\s*true/i)
+  })
+
+  it("covers successful static CLI output and structured mode failures", () => {
+    const script = join(here, "validate-contract.mjs")
+    const tempRoot = mkdtempSync(join(tmpdir(), "b2d-task4-"))
+    // Force the host color-env conflict so empty-stderr checks stay
+    // deterministic without requiring a particular parent environment.
+    const conflictingColorEnv = {
+      ...process.env,
+      FORCE_COLOR: "1",
+      NO_COLOR: "1",
+    }
+    const spawnCli = (args) =>
+      spawnSync(process.execPath, [script, ...args], {
+        encoding: "utf8",
+        env: conflictingColorEnv,
+      })
+    try {
+      const staticPlanPath = join(tempRoot, "plan.md")
+      const staticProgressPath = join(tempRoot, "progress.md")
+      const parsed = parseSimplePlan(plan())
+      const routingFailures = []
+      const normalized = validateRoutingSnapshot(
+        parsed.routing,
+        parsed,
+        routingFailures
+      )
+      assert.deepEqual(routingFailures, [])
+      const bindings = deriveTaskBindings(normalized)
+      const state = progress()
+      for (const progressTask of state.tasks) {
+        const binding = bindings.find(
+          (entry) => entry.task_index === progressTask.index
+        )
+        progressTask.route_fingerprint =
+          binding.orchestration_binding.route_fingerprint
+        for (const run of progressTask.runs) {
+          run.orchestration_binding = binding.orchestration_binding
+        }
+      }
+      writeFileSync(staticPlanPath, plan())
+      writeFileSync(
+        staticProgressPath,
+        `# Progress\n\n${block("codeg-simple-progress-v1", state)}\n`
+      )
+
+      const readable = spawnCli([
+        "--plan",
+        staticPlanPath,
+        "--progress",
+        staticProgressPath,
+        "--plan-rel-path",
+        planRelPath,
+      ])
+      assert.equal(readable.status, 0)
+      assert.match(readable.stdout, /PASS:/)
+      assert.equal(readable.stderr, "")
+
+      const json = spawnCli([
+        "--plan",
+        staticPlanPath,
+        "--progress",
+        staticProgressPath,
+        "--plan-rel-path",
+        planRelPath,
+        "--output-json",
+      ])
+      assert.equal(json.status, 0)
+      assert.equal(json.stderr, "")
+      const parsedJson = JSON.parse(json.stdout)
+      assert.deepEqual(Object.keys(parsedJson), [
+        "schema_version",
+        "admission_authorized",
+        "durable_snapshot",
+        "task_bindings",
+        "reconciliation_actions",
+        "failures",
+      ])
+      assert.equal(parsedJson.admission_authorized, false)
+      assert.deepEqual(parsedJson.failures, [])
+
+      const productionPlanPath = join(
+        here,
+        "../../../../docs/superpowers/plans/2026-08-17-brainstorm-to-delivery-durable-orchestration-binding.md"
+      )
+      const invalidModeArgs = [
+        [
+          "--plan",
+          productionPlanPath,
+          "--plan-rel-path",
+          planRelPath,
+          "--derive-plan-routing",
+          "--progress",
+          staticProgressPath,
+          "--output-json",
+        ],
+        [
+          "--plan",
+          productionPlanPath,
+          "--plan-rel-path",
+          planRelPath,
+          "--output-json",
+          "--durable-evidence",
+          staticProgressPath,
+        ],
+        [
+          "--plan",
+          productionPlanPath,
+          "--plan-rel-path",
+          planRelPath,
+          "--output-json",
+          "--unknown-flag",
+        ],
+      ]
+      for (const args of invalidModeArgs) {
+        const invalid = spawnCli(args)
+        assert.notEqual(invalid.status, 0)
+        assert.equal(invalid.stderr, "")
+        const envelope = JSON.parse(invalid.stdout)
+        assert.equal(envelope.admission_authorized, false)
+        assert.deepEqual(envelope.task_bindings, [])
+        assert.deepEqual(envelope.reconciliation_actions, [])
+        assert.ok(envelope.failures.length > 0)
+      }
+
+      const oversizedPlanPath = join(tempRoot, "oversized-plan.md")
+      writeFileSync(oversizedPlanPath, "x".repeat(2 * 1024 * 1024 + 1))
+      const oversized = spawnCli([
+        "--plan",
+        oversizedPlanPath,
+        "--plan-rel-path",
+        planRelPath,
+        "--derive-plan-routing",
+        "--output-json",
+      ])
+      assert.notEqual(oversized.status, 0)
+      assert.equal(oversized.stderr, "")
+      const oversizedEnvelope = JSON.parse(oversized.stdout)
+      assert.equal(oversizedEnvelope.admission_authorized, false)
+      assert.deepEqual(oversizedEnvelope.task_bindings, [])
+      assert.ok(oversizedEnvelope.failures.length > 0)
+
+      const missing = spawnCli([
+        "--plan",
+        join(tempRoot, "missing.md"),
+        "--plan-rel-path",
+        planRelPath,
+        "--derive-plan-routing",
+        "--output-json",
+      ])
+      assert.notEqual(missing.status, 0)
+      assert.equal(missing.stderr, "")
+      assert.equal(JSON.parse(missing.stdout).admission_authorized, false)
+    } finally {
+      rmSync(tempRoot, { recursive: true, force: true })
+    }
+  })
+
+  it("derives seven stable non-authorizing bindings from the production Plan", () => {
+    const productionPlan = readFileSync(
+      join(
+        here,
+        "../../../../docs/superpowers/plans/2026-08-17-brainstorm-to-delivery-durable-orchestration-binding.md"
+      ),
+      "utf8"
+    )
+    const options = {
+      skillMarkdown: realSkill,
+      planMarkdown: productionPlan,
+      planRelPath:
+        "docs/superpowers/plans/2026-08-17-brainstorm-to-delivery-durable-orchestration-binding.md",
+      derivePlanRouting: true,
+      outputJson: true,
+    }
+    const first = runValidation(options)
+    const second = runValidation(options)
+    assert.deepEqual(first.failures, [])
+    assert.equal(first.admission_authorized, false)
+    assert.equal(first.durable_snapshot, null)
+    assert.equal(first.task_bindings.length, 7)
+    const parsedProductionPlan = parseSimplePlan(productionPlan)
+    const productionFailures = []
+    const normalizedProduction = validateRoutingSnapshot(
+      parsedProductionPlan.routing,
+      parsedProductionPlan,
+      productionFailures
+    )
+    assert.deepEqual(productionFailures, [])
+    assert.deepEqual(normalizedProduction.generations, [
+      {
+        generation: 1,
+        agent_type: "grok",
+        profile_id: null,
+        effective_from_task_index: 1,
+      },
+    ])
+    assert.deepEqual(
+      first.task_bindings.map((entry) => entry.task_index),
+      [1, 2, 3, 4, 5, 6, 7]
+    )
+    assert.deepEqual(
+      first.task_bindings.map((entry) => entry.risk_level),
+      ["high", "high", "high", "high", "high", "high", "high"]
+    )
+    assert.deepEqual(
+      first.task_bindings.map((entry) => entry.task_agent_generation),
+      [1, 1, 1, 1, 1, 1, 1]
+    )
+    assert.deepEqual(
+      first.task_bindings.map((entry) => entry.expected_work_unit_keys),
+      Array.from({ length: 7 }, (_, offset) => {
+        const index = offset + 1
+        return {
+          implementer: `task|${index}|implementer|codex|none`,
+          reviewers: {
+            primary: `task|${index}|reviewer|primary|codex|none`,
+            auxiliary: `task|${index}|reviewer|auxiliary|grok|none`,
+          },
+        }
+      })
+    )
+    assert.ok(
+      first.task_bindings.every(
+        (entry) =>
+          entry.orchestration_binding.generation === 1 &&
+          /^sha256:[0-9a-f]{64}$/.test(
+            entry.orchestration_binding.route_fingerprint
+          )
+      )
+    )
+    assert.deepEqual(
+      second.task_bindings.map(
+        (entry) => entry.orchestration_binding.route_fingerprint
+      ),
+      first.task_bindings.map(
+        (entry) => entry.orchestration_binding.route_fingerprint
+      )
+    )
+  })
+
+  it("requires static Task and run bindings to agree exactly", () => {
+    const parsed = parseSimplePlan(plan())
+    const routingFailures = []
+    const normalized = validateRoutingSnapshot(
+      parsed.routing,
+      parsed,
+      routingFailures
+    )
+    assert.deepEqual(routingFailures, [])
+    const bindings = deriveTaskBindings(normalized)
+    const state = progress()
+    for (const task of state.tasks) {
+      const binding = bindings.find((entry) => entry.task_index === task.index)
+      task.route_fingerprint = binding.orchestration_binding.route_fingerprint
+      task.orchestration_binding = binding.orchestration_binding
+      for (const run of task.runs) {
+        run.orchestration_binding = binding.orchestration_binding
+      }
+    }
+    const valid = runValidation({
+      skillMarkdown: skill,
+      planMarkdown: plan(),
+      progressMarkdown: `# Progress\n\n${block(
+        "codeg-simple-progress-v1",
+        state
+      )}\n`,
+      planRelPath,
+      outputJson: true,
+    })
+    assert.deepEqual(valid.failures, [])
+    assert.equal(valid.admission_authorized, false)
+    assert.equal(valid.task_bindings.length, 2)
+
+    state.tasks[0].runs[0].orchestration_binding = {
+      ...state.tasks[0].runs[0].orchestration_binding,
+      route_fingerprint:
+        "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    }
+    const invalid = runValidation({
+      skillMarkdown: skill,
+      planMarkdown: plan(),
+      progressMarkdown: `# Progress\n\n${block(
+        "codeg-simple-progress-v1",
+        state
+      )}\n`,
+      planRelPath,
+      outputJson: true,
+    })
+    assert.equal(invalid.admission_authorized, false)
+    assert.deepEqual(invalid.task_bindings, [])
+    assert.ok(
+      invalid.failures.some((failure) => failure.rule_id === "B2D-BINDING-003")
+    )
   })
 })
