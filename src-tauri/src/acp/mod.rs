@@ -8,8 +8,8 @@ pub mod codex_goal;
 pub mod codex_model_catalog;
 pub mod connection;
 pub mod cursor_enrichment;
-pub mod custom_registry;
 pub mod cursor_store;
+pub mod custom_registry;
 pub mod delegation;
 #[cfg(feature = "tauri-runtime")]
 pub mod desktop_event_batcher;

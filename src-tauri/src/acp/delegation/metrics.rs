@@ -783,7 +783,8 @@ impl DelegationMetrics {
     /// backfill before the deadline. `elapsed` is the wall time since the
     /// lookup was scheduled (`maybe_schedule`'s `started` capture).
     pub fn record_cursor_enrichment_resolved(&self, elapsed: Duration) {
-        self.cursor_enrichment_resolved.fetch_add(1, Ordering::Relaxed);
+        self.cursor_enrichment_resolved
+            .fetch_add(1, Ordering::Relaxed);
         self.cursor_enrichment_duration_ms_count
             .fetch_add(1, Ordering::Relaxed);
         self.cursor_enrichment_duration_ms_total

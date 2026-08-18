@@ -1198,8 +1198,9 @@ fn is_delegation_invocation(title: &str, raw_input: Option<&str>) -> bool {
 }
 
 /// Build the broker's typed [`DelegationMatchKey`] from a delegation
-/// tool_call's `raw_input` JSON. Fields are values the LLM passed identically
-/// to the ACP tool call and the MCP `tools/call`, including `correlation_id`.
+/// tool_call's already-parsed args/`raw_input` JSON. Fields are values the
+/// LLM passed identically to the ACP tool call and the MCP `tools/call`,
+/// including `correlation_id`.
 ///
 /// Variant selection is structural (design discriminator):
 /// - presence of `task_id` → [`DelegationMatchKey::Continue`]
@@ -1207,11 +1208,11 @@ fn is_delegation_invocation(title: &str, raw_input: Option<&str>) -> bool {
 ///
 /// There is no fake agent and no `"continue:{id}:{task}"` sentinel. Continue
 /// ignores extraneous `working_dir`. The args are located via
-/// [`find_delegation_args`], so hosts that wrap or double-encode `raw_input`
+/// [`find_delegation_args`], so hosts that wrap or double-encode the value
 /// are keyed identically to hosts that send the fields at the top level.
-/// Returns `None` when `raw_input` is absent, not JSON, has no locatable
-/// complete key (missing/invalid `correlation_id`, missing task, etc.) — the
-/// broker then treats the entry as unkeyed until a later complete backfill.
+/// Returns `None` when there is no locatable complete key (missing/invalid
+/// `correlation_id`, missing task, etc.) — the broker then treats the entry
+/// as unkeyed until a later complete backfill.
 pub(crate) fn extract_delegation_match_key_from_value(
     value: &serde_json::Value,
 ) -> Option<DelegationMatchKey> {
@@ -1251,6 +1252,10 @@ pub(crate) fn extract_delegation_match_key_from_value(
     })
 }
 
+/// String-wrapper front end for [`extract_delegation_match_key_from_value`]:
+/// parses `raw_input` as JSON and delegates. Returns `None` when `raw_input`
+/// is absent or not valid JSON, in addition to every `None` case the value
+/// helper documents.
 fn extract_delegation_match_key(raw_input: Option<&str>) -> Option<DelegationMatchKey> {
     let raw = raw_input?;
     let parsed: serde_json::Value = serde_json::from_str(raw).ok()?;
@@ -2578,7 +2583,12 @@ mod delegation_registration_tests {
             )]
             .into(),
         )));
-        let installed = Arc::new(CursorStoreEnricher::new(store, sessions, b.clone(), b.metrics()));
+        let installed = Arc::new(CursorStoreEnricher::new(
+            store,
+            sessions,
+            b.clone(),
+            b.metrics(),
+        ));
         // Acquire the span BEFORE installing and hold it for the whole test
         // (declared first so it drops LAST, after `_reset`) so no
         // concurrently-running test can observe a torn value.

@@ -21545,10 +21545,7 @@ mod tests {
             IdentitylessBackfillResult::Applied
         );
         assert_eq!(
-            broker
-                .take_matching_tool_call("p1", &key)
-                .await
-                .as_deref(),
+            broker.take_matching_tool_call("p1", &key).await.as_deref(),
             Some("tc-claimed")
         );
         assert_eq!(
@@ -21584,7 +21581,8 @@ mod tests {
         let b1 = broker.clone();
         let k1 = key.clone();
         let backfill = tokio::spawn(async move {
-            b1.backfill_identityless_match_key("p1", "tc-race", k1).await
+            b1.backfill_identityless_match_key("p1", "tc-race", k1)
+                .await
         });
         let b2 = broker.clone();
         let tombstone =

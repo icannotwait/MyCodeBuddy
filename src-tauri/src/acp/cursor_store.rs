@@ -40,6 +40,33 @@ mod tests {
         }
     }
 
+    /// Like [`write_store`] but switches the store to WAL journal mode and
+    /// returns the writer connection instead of dropping it. Cursor's CLI
+    /// keeps live stores in WAL mode with most data uncheckpointed in
+    /// `-wal`; the caller must keep the returned connection alive for as
+    /// long as the test wants that data to stay out of the main file
+    /// (SQLite auto-checkpoints on last-connection-close by default).
+    fn write_store_wal(path: &Path, rows: &[serde_json::Value]) -> Connection {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let conn = Connection::open(path).unwrap();
+        conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE blobs (id TEXT PRIMARY KEY, data BLOB);
+             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+        )
+        .unwrap();
+        for (i, row) in rows.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO blobs (id, data) VALUES (?1, ?2)",
+                rusqlite::params![format!("row-{i}"), serde_json::to_vec(row).unwrap()],
+            )
+            .unwrap();
+        }
+        conn
+    }
+
     fn tool_call_blob(
         tool_call_id: &str,
         tool_name: &str,
@@ -281,6 +308,65 @@ mod tests {
         assert_eq!(before, after);
         std::fs::remove_dir_all(root).ok();
     }
+
+    #[test]
+    fn lookup_reads_wal_mode_store_with_data_still_in_wal_segment() {
+        let root = temp_cursor_dir();
+        let reader = CursorStoreReader::with_cursor_dir(root.clone());
+        let store = root.join("acp-sessions").join(SESSION).join("store.db");
+        let args = json!({"agent_type":"codex","task":"wal read","correlation_id":"c1"});
+        // Keep the writer connection open for the whole test: SQLite
+        // auto-checkpoints WAL content into the main file when the last
+        // connection closes, which would silently defeat the point of this
+        // test (proving the reader can see rows that are *only* in `-wal`).
+        let writer = write_store_wal(
+            &store,
+            &[tool_call_blob(
+                COMPOUND_ID,
+                "delegate_to_agent",
+                args.clone(),
+            )],
+        );
+        assert!(store.with_extension("db-wal").is_file());
+
+        let found = reader.lookup(SESSION, COMPOUND_ID).unwrap();
+        assert_eq!(found.args, args);
+
+        drop(writer);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn lookup_maps_writer_held_lock_to_retryable_store_unreadable() {
+        let root = temp_cursor_dir();
+        let reader = CursorStoreReader::with_cursor_dir(root.clone());
+        let store = root.join("acp-sessions").join(SESSION).join("store.db");
+        write_store(
+            &store,
+            &[tool_call_blob(
+                COMPOUND_ID,
+                "delegate_to_agent",
+                json!({"agent_type":"codex","task":"x","correlation_id":"c1"}),
+            )],
+        );
+
+        // Hold an EXCLUSIVE lock on the rollback-journal-mode file so the
+        // reader's own busy_timeout (50ms) expires while trying to acquire a
+        // SHARED lock, reproducing the SQLITE_BUSY/SQLITE_LOCKED family a
+        // live Cursor writer can transiently hold.
+        let mut writer = Connection::open(&store).unwrap();
+        let tx = writer
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Exclusive)
+            .unwrap();
+
+        assert_eq!(
+            reader.lookup(SESSION, COMPOUND_ID),
+            Err(CursorStoreError::StoreUnreadable)
+        );
+
+        drop(tx);
+        std::fs::remove_dir_all(root).ok();
+    }
 }
 
 use rusqlite::{Connection, OpenFlags};
@@ -334,8 +420,7 @@ impl CursorStoreReader {
             return Err(CursorStoreError::StoreNotFound);
         }
 
-        let entries =
-            std::fs::read_dir(chats).map_err(|_| CursorStoreError::StoreUnreadable)?;
+        let entries = std::fs::read_dir(chats).map_err(|_| CursorStoreError::StoreUnreadable)?;
         let mut found = None;
         for entry in entries {
             let entry = entry.map_err(|_| CursorStoreError::StoreUnreadable)?;
@@ -370,16 +455,13 @@ impl CursorStoreReader {
 
         let mut statement = conn
             .prepare("SELECT id, data FROM blobs")
-            .map_err(|_| CursorStoreError::SchemaIncompatible)?;
+            .map_err(|err| classify_sqlite_error(&err))?;
         let mut rows = statement
             .query([])
-            .map_err(|_| CursorStoreError::SchemaIncompatible)?;
+            .map_err(|err| classify_sqlite_error(&err))?;
         let mut found: Option<(String, Value, String)> = None;
 
-        while let Some(row) = rows
-            .next()
-            .map_err(|_| CursorStoreError::SchemaIncompatible)?
-        {
+        while let Some(row) = rows.next().map_err(|err| classify_sqlite_error(&err))? {
             let data = match row.get_ref(1) {
                 Ok(rusqlite::types::ValueRef::Blob(data)) => data,
                 Ok(rusqlite::types::ValueRef::Text(data)) => data,
@@ -427,10 +509,33 @@ impl CursorStoreReader {
     }
 }
 
+/// Classifies a `prepare`/`query`/row-step failure against the reader's
+/// read-only, no-recovery connection. `SQLITE_BUSY`/`SQLITE_LOCKED` (another
+/// process holding the store) and `SQLITE_READONLY*` (most notably
+/// `SQLITE_READONLY_RECOVERY`, which a read-only handle cannot service after
+/// a Cursor CLI crash leaves the wal-index needing recovery) are transient —
+/// the store may become readable once Cursor reopens it or the writer
+/// releases the lock, so these map to the retryable [`CursorStoreError::StoreUnreadable`]
+/// rather than the terminal [`CursorStoreError::SchemaIncompatible`]. Every
+/// other failure (e.g. missing `blobs` table) stays `SchemaIncompatible`.
+fn classify_sqlite_error(err: &rusqlite::Error) -> CursorStoreError {
+    match err {
+        rusqlite::Error::SqliteFailure(sqlite_err, _)
+            if matches!(
+                sqlite_err.code,
+                rusqlite::ErrorCode::DatabaseBusy
+                    | rusqlite::ErrorCode::DatabaseLocked
+                    | rusqlite::ErrorCode::ReadOnly
+            ) =>
+        {
+            CursorStoreError::StoreUnreadable
+        }
+        _ => CursorStoreError::SchemaIncompatible,
+    }
+}
+
 fn normalize_tool_name(tool_name: &str) -> String {
-    tool_name
-        .to_ascii_lowercase()
-        .replace([' ', '-'], "_")
+    tool_name.to_ascii_lowercase().replace([' ', '-'], "_")
 }
 
 pub fn validate_cursor_session_id(session_id: &str) -> Result<(), CursorStoreError> {
@@ -447,9 +552,7 @@ pub fn validate_cursor_session_id(session_id: &str) -> Result<(), CursorStoreErr
     let mut parts = path.components();
     match parts.next() {
         Some(Component::Normal(name))
-            if name != "."
-                && name != ".."
-                && name == std::ffi::OsStr::new(session_id) => {}
+            if name != "." && name != ".." && name == std::ffi::OsStr::new(session_id) => {}
         _ => return Err(CursorStoreError::InvalidSessionId),
     }
     if parts.next().is_some() {

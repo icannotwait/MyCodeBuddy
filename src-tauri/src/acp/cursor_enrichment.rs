@@ -1,7 +1,9 @@
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::acp::delegation::broker::{ConversationDepthLookup, DelegationBroker, DelegationMatchKey};
+    use crate::acp::delegation::broker::{
+        ConversationDepthLookup, DelegationBroker, DelegationMatchKey,
+    };
     use crate::acp::delegation::spawner::{mock::MockSpawner, ConnectionSpawner};
     use crate::acp::delegation::types::DelegationError;
     use crate::acp::types::{AcpEvent, EventEnvelope};
@@ -453,17 +455,15 @@ mod tests {
         let sessions = Arc::new(MapSessions(std::sync::Mutex::new(
             std::collections::HashMap::new(),
         )));
-        let enricher = CursorStoreEnricher::new(
-            store.clone(),
-            sessions,
-            broker,
-            metrics.clone(),
-        );
+        let enricher = CursorStoreEnricher::new(store.clone(), sessions, broker, metrics.clone());
         enricher.maybe_schedule(&mcp_tool_envelope("unknown-conn", "tc-1", Some("{}")));
         tokio::time::sleep(Duration::from_millis(30)).await;
         let snap = metrics.snapshot();
         assert_eq!(snap.cursor_enrichment_scheduled, 0);
-        assert!(snap.cursor_enrichment_failed.get("invalid_session").is_none());
+        assert!(snap
+            .cursor_enrichment_failed
+            .get("invalid_session")
+            .is_none());
         assert!(!store.called.load(Ordering::SeqCst));
     }
 
@@ -490,18 +490,15 @@ mod tests {
             )]
             .into(),
         )));
-        let enricher = CursorStoreEnricher::new(
-            store.clone(),
-            sessions,
-            broker,
-            metrics.clone(),
-        );
+        let enricher = CursorStoreEnricher::new(store.clone(), sessions, broker, metrics.clone());
         enricher.maybe_schedule(&mcp_tool_envelope("cursor-conn", "tc-1", Some("{}")));
         tokio::time::sleep(Duration::from_millis(30)).await;
         let snap = metrics.snapshot();
         assert_eq!(snap.cursor_enrichment_scheduled, 0);
         assert_eq!(
-            snap.cursor_enrichment_failed.get("invalid_session").copied(),
+            snap.cursor_enrichment_failed
+                .get("invalid_session")
+                .copied(),
             Some(1)
         );
         assert!(!store.called.load(Ordering::SeqCst));
@@ -710,7 +707,11 @@ mod tests {
             .into(),
         )));
         let enricher = CursorStoreEnricher::new(store, sessions, broker.clone(), metrics.clone());
-        enricher.maybe_schedule(&mcp_tool_envelope("cursor-conn", "tc-late-real", Some("{}")));
+        enricher.maybe_schedule(&mcp_tool_envelope(
+            "cursor-conn",
+            "tc-late-real",
+            Some("{}"),
+        ));
         tokio::time::sleep(CURSOR_STORE_LOOKUP_DEADLINE + Duration::from_millis(300)).await;
         assert_eq!(
             metrics
@@ -732,8 +733,8 @@ mod tests {
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::{
-        CursorEnrichmentSession, CursorEnrichmentSessionLookup, CursorStoreError, CursorStoreLookup,
-        CursorStoredToolCall,
+        CursorEnrichmentSession, CursorEnrichmentSessionLookup, CursorStoreError,
+        CursorStoreLookup, CursorStoredToolCall,
     };
     use std::collections::HashMap;
     use std::time::Duration;
@@ -794,7 +795,9 @@ use crate::acp::cursor_store::{
 };
 use crate::acp::delegation::broker::{DelegationBroker, DelegationMatchKey};
 use crate::acp::delegation::metrics::{agent_type_label, DelegationMetrics};
-use crate::acp::lifecycle::{extract_delegation_match_key_from_value, CURSOR_IDENTITYLESS_MCP_TITLE};
+use crate::acp::lifecycle::{
+    extract_delegation_match_key_from_value, CURSOR_IDENTITYLESS_MCP_TITLE,
+};
 use crate::acp::manager::ConnectionManager;
 use crate::acp::types::{AcpEvent, EventEnvelope};
 use crate::models::AgentType;
@@ -898,8 +901,13 @@ pub fn classify_store_tool_name(tool_name: &str) -> Option<CursorStoreToolKind> 
 fn key_matches_store_tool(key: &DelegationMatchKey, kind: CursorStoreToolKind) -> bool {
     matches!(
         (key, kind),
-        (DelegationMatchKey::Delegate { .. }, CursorStoreToolKind::Delegate)
-            | (DelegationMatchKey::Continue { .. }, CursorStoreToolKind::Continue)
+        (
+            DelegationMatchKey::Delegate { .. },
+            CursorStoreToolKind::Delegate
+        ) | (
+            DelegationMatchKey::Continue { .. },
+            CursorStoreToolKind::Continue
+        )
     )
 }
 
@@ -1163,16 +1171,16 @@ impl CursorStoreEnricher {
                 return;
             }
 
-            let permit = match tokio::time::timeout(remaining, self.semaphore.clone().acquire_owned())
-                .await
-            {
-                Ok(Ok(permit)) => permit,
-                _ => {
-                    self.metrics
-                        .record_cursor_enrichment_failed(CursorEnrichmentFailure::Deadline);
-                    return;
-                }
-            };
+            let permit =
+                match tokio::time::timeout(remaining, self.semaphore.clone().acquire_owned()).await
+                {
+                    Ok(Ok(permit)) => permit,
+                    _ => {
+                        self.metrics
+                            .record_cursor_enrichment_failed(CursorEnrichmentFailure::Deadline);
+                        return;
+                    }
+                };
 
             let remaining_before_scan = deadline.saturating_duration_since(Instant::now());
             if remaining_before_scan.is_zero() {
@@ -1209,8 +1217,9 @@ impl CursorStoreEnricher {
             match result {
                 Ok(stored) => {
                     let Some(kind) = classify_store_tool_name(&stored.tool_name) else {
-                        self.metrics
-                            .record_cursor_enrichment_failed(CursorEnrichmentFailure::UnsupportedTool);
+                        self.metrics.record_cursor_enrichment_failed(
+                            CursorEnrichmentFailure::UnsupportedTool,
+                        );
                         return;
                     };
                     let Some(match_key) = extract_delegation_match_key_from_value(&stored.args)
@@ -1293,7 +1302,9 @@ impl CursorStoreEnricher {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             let due = guard
-                .map(|last| now.saturating_duration_since(last) >= CURSOR_STORE_TERMINAL_WARN_WINDOW)
+                .map(|last| {
+                    now.saturating_duration_since(last) >= CURSOR_STORE_TERMINAL_WARN_WINDOW
+                })
                 .unwrap_or(true);
             if due {
                 *guard = Some(now);
