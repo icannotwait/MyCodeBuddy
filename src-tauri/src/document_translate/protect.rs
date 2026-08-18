@@ -1,9 +1,11 @@
 //! Fail-closed Markdown code protection for document translation.
 //!
 //! Fenced blocks (``` / ~~~) and single-level inline backticks are replaced
-//! with nonce-scoped placeholders. Restore requires the **exact** ordered
-//! multiset of tokens; any missing, duplicate, reordered, or altered token
-//! fails closed.
+//! with nonce-scoped placeholders. Restore is type-aware: fenced `CGCODE`
+//! tokens must stay in source order, while intact `CGINLINE` tokens may
+//! reorder inside the same fenced-code region. Cross-region inline moves,
+//! missing/duplicate/unknown tokens, and malformed current-nonce markers
+//! fail closed.
 
 use thiserror::Error;
 
@@ -11,12 +13,28 @@ use thiserror::Error;
 const TOKEN_OPEN: char = '⟦';
 const TOKEN_CLOSE: char = '⟧';
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntegrityFailureKind {
+    MalformedMarker,
+    UnknownToken,
+    MissingToken,
+    DuplicateToken,
+    FencedReorder,
+    InlineCrossRegion,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoreOutcome {
+    pub text: String,
+    pub inline_reorder_count: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ProtectError {
     #[error("nonce appears in source document")]
     NonceCollision,
     #[error("placeholder integrity check failed")]
-    IntegrityFailed,
+    IntegrityFailed(IntegrityFailureKind),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,29 +86,149 @@ pub fn protect_markdown(source: &str) -> Result<ProtectedDocument, ProtectError>
     Err(ProtectError::NonceCollision)
 }
 
-/// Restore originals into `output`. Fail-closed on any token mismatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlaceholderKind {
+    Code,
+    Inline,
+}
+
+struct ExpectedEntry<'a> {
+    token: &'a str,
+    kind: PlaceholderKind,
+    fence_region: usize,
+}
+
+/// Restore originals into `output`. Fail-closed on type-aware integrity errors.
 pub fn restore_markdown(
     output: &str,
     protected: &ProtectedDocument,
 ) -> Result<String, ProtectError> {
-    let found = extract_tokens(output, &protected.nonce);
-    let expected: Vec<&str> = protected.tokens().collect();
-    if found != expected {
-        return Err(ProtectError::IntegrityFailed);
+    Ok(restore_markdown_detailed(output, protected)?.text)
+}
+
+pub fn restore_markdown_detailed(
+    output: &str,
+    protected: &ProtectedDocument,
+) -> Result<RestoreOutcome, ProtectError> {
+    let mut fence_region = 0usize;
+    let mut expected = Vec::with_capacity(protected.placeholders.len());
+    for slot in &protected.placeholders {
+        let kind = if slot.token.contains("CGCODE_") {
+            PlaceholderKind::Code
+        } else {
+            PlaceholderKind::Inline
+        };
+        expected.push(ExpectedEntry {
+            token: slot.token.as_str(),
+            kind,
+            fence_region,
+        });
+        if kind == PlaceholderKind::Code {
+            fence_region += 1;
+        }
     }
 
+    let mut lookup = std::collections::HashMap::with_capacity(expected.len());
+    for (idx, entry) in expected.iter().enumerate() {
+        lookup.insert(entry.token, idx);
+    }
+    let expected_codes: Vec<&str> = expected
+        .iter()
+        .filter(|e| e.kind == PlaceholderKind::Code)
+        .map(|e| e.token)
+        .collect();
+    let expected_inlines: Vec<&str> = expected
+        .iter()
+        .filter(|e| e.kind == PlaceholderKind::Inline)
+        .map(|e| e.token)
+        .collect();
+
+    let mut counts = vec![0u8; expected.len()];
+    let mut next_code = 0usize;
+    let mut current_region = 0usize;
+    let mut output_inlines = Vec::with_capacity(expected_inlines.len());
+
+    let code_prefix = format!("{TOKEN_OPEN}CGCODE_{}_", protected.nonce);
+    let inline_prefix = format!("{TOKEN_OPEN}CGINLINE_{}_", protected.nonce);
+    let mut rest = output;
+    while let Some(pos) = find_next_token_start(rest, &code_prefix, &inline_prefix) {
+        let slice = &rest[pos..];
+        let (prefix, kind) = if slice.starts_with(&code_prefix) {
+            (code_prefix.as_str(), PlaceholderKind::Code)
+        } else {
+            (inline_prefix.as_str(), PlaceholderKind::Inline)
+        };
+        let after_prefix = &slice[prefix.len()..];
+        let digit_end = after_prefix
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .count();
+        if digit_end == 0 || !after_prefix[digit_end..].starts_with(TOKEN_CLOSE) {
+            return Err(ProtectError::IntegrityFailed(
+                IntegrityFailureKind::MalformedMarker,
+            ));
+        }
+        let token_len = prefix.len() + digit_end + TOKEN_CLOSE.len_utf8();
+        let token = &slice[..token_len];
+        let Some(&idx) = lookup.get(token) else {
+            return Err(ProtectError::IntegrityFailed(
+                IntegrityFailureKind::UnknownToken,
+            ));
+        };
+        counts[idx] = counts[idx].saturating_add(1);
+        if counts[idx] > 1 {
+            return Err(ProtectError::IntegrityFailed(
+                IntegrityFailureKind::DuplicateToken,
+            ));
+        }
+        match kind {
+            PlaceholderKind::Code => {
+                if next_code >= expected_codes.len() || token != expected_codes[next_code] {
+                    return Err(ProtectError::IntegrityFailed(
+                        IntegrityFailureKind::FencedReorder,
+                    ));
+                }
+                next_code += 1;
+                current_region += 1;
+            }
+            PlaceholderKind::Inline => {
+                if expected[idx].fence_region != current_region {
+                    return Err(ProtectError::IntegrityFailed(
+                        IntegrityFailureKind::InlineCrossRegion,
+                    ));
+                }
+                output_inlines.push(token);
+            }
+        }
+        rest = &slice[token_len..];
+    }
+
+    if counts.iter().any(|&c| c != 1) {
+        return Err(ProtectError::IntegrityFailed(
+            IntegrityFailureKind::MissingToken,
+        ));
+    }
+
+    let inline_reorder_count = expected_inlines
+        .iter()
+        .zip(output_inlines.iter())
+        .filter(|(expected_token, found)| expected_token != found)
+        .count();
+
     let mut result = output.to_string();
-    // Replace from longest tokens first is unnecessary (all unique); walk
-    // expected order so each original is put back once.
     for slot in &protected.placeholders {
-        // Exactly one occurrence was validated by the multiset/order check.
         if let Some(pos) = result.find(&slot.token) {
             result.replace_range(pos..pos + slot.token.len(), &slot.original);
         } else {
-            return Err(ProtectError::IntegrityFailed);
+            return Err(ProtectError::IntegrityFailed(
+                IntegrityFailureKind::MissingToken,
+            ));
         }
     }
-    Ok(result)
+    Ok(RestoreOutcome {
+        text: result,
+        inline_reorder_count,
+    })
 }
 
 fn protect_inner(source: &str, nonce: &str) -> ProtectedDocument {
@@ -364,44 +502,6 @@ fn replace_inline(
     out
 }
 
-/// Extract placeholder tokens for `nonce` in document order.
-fn extract_tokens(output: &str, nonce: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut rest = output;
-    // Match ⟦CGCODE_{nonce}_{n}⟧ or ⟦CGINLINE_{nonce}_{n}⟧
-    let code_prefix = format!("{TOKEN_OPEN}CGCODE_{nonce}_");
-    let inline_prefix = format!("{TOKEN_OPEN}CGINLINE_{nonce}_");
-
-    while let Some(pos) = find_next_token_start(rest, &code_prefix, &inline_prefix) {
-        let slice = &rest[pos..];
-        let prefix = if slice.starts_with(&code_prefix) {
-            &code_prefix
-        } else {
-            &inline_prefix
-        };
-        let after_prefix = &slice[prefix.len()..];
-        // digits then TOKEN_CLOSE
-        let digit_end = after_prefix
-            .chars()
-            .take_while(|c| c.is_ascii_digit())
-            .count();
-        if digit_end == 0 {
-            // Not a well-formed token; skip this open marker to avoid infinite loop.
-            rest = &slice[TOKEN_OPEN.len_utf8()..];
-            continue;
-        }
-        let after_digits = &after_prefix[digit_end..];
-        if !after_digits.starts_with(TOKEN_CLOSE) {
-            rest = &slice[TOKEN_OPEN.len_utf8()..];
-            continue;
-        }
-        let token_len = prefix.len() + digit_end + TOKEN_CLOSE.len_utf8();
-        tokens.push(slice[..token_len].to_string());
-        rest = &slice[token_len..];
-    }
-    tokens
-}
-
 fn find_next_token_start(s: &str, code_prefix: &str, inline_prefix: &str) -> Option<usize> {
     let c = s.find(code_prefix);
     let i = s.find(inline_prefix);
@@ -418,6 +518,21 @@ mod tests {
     use super::*;
 
     const NONCE: &str = "n0";
+
+    fn swap_once(haystack: &str, a: &str, b: &str) -> String {
+        haystack
+            .replacen(a, "@@TMP@@", 1)
+            .replacen(b, a, 1)
+            .replacen("@@TMP@@", b, 1)
+    }
+
+    fn token_pair(protected: &ProtectedDocument, a: &str, b: &str) {
+        assert!(
+            protected.text.contains(a) && protected.text.contains(b),
+            "missing tokens in {}",
+            protected.text
+        );
+    }
 
     #[test]
     fn round_trip_fenced_backtick_tilde_and_inline() {
@@ -485,7 +600,10 @@ Outro
         );
         let broken = protected.text.replacen("⟦CGCODE_n0_0⟧", "MISSING", 1);
         let err = restore_markdown(&broken, &protected).unwrap_err();
-        assert_eq!(err, ProtectError::IntegrityFailed);
+        assert_eq!(
+            err,
+            ProtectError::IntegrityFailed(IntegrityFailureKind::MissingToken)
+        );
     }
 
     #[test]
@@ -495,24 +613,171 @@ Outro
         let token = "⟦CGINLINE_n0_0⟧";
         let broken = format!("{} extra {token}", protected.text);
         let err = restore_markdown(&broken, &protected).unwrap_err();
-        assert_eq!(err, ProtectError::IntegrityFailed);
+        assert_eq!(
+            err,
+            ProtectError::IntegrityFailed(IntegrityFailureKind::DuplicateToken)
+        );
     }
 
     #[test]
-    fn reordered_tokens_fail() {
+    fn same_region_inline_reorder_restores() {
         let source = "A `first` B `second` C";
         let protected = protect_markdown_with_nonce(source, NONCE).unwrap();
         let t0 = "⟦CGINLINE_n0_0⟧";
         let t1 = "⟦CGINLINE_n0_1⟧";
-        assert!(protected.text.contains(t0) && protected.text.contains(t1));
-        // Swap token occurrences.
-        let broken = protected
+        token_pair(&protected, t0, t1);
+        let swapped = swap_once(&protected.text, t0, t1);
+        let outcome = restore_markdown_detailed(&swapped, &protected).unwrap();
+        assert_eq!(outcome.text, "A `second` B `first` C");
+        assert_eq!(outcome.inline_reorder_count, 2);
+    }
+
+    #[test]
+    fn observed_id_data_blobs_inline_swap_restores() {
+        let source = "It queries `id, data` from `blobs`.";
+        let protected = protect_markdown_with_nonce(source, NONCE).unwrap();
+        let t0 = "⟦CGINLINE_n0_0⟧";
+        let t1 = "⟦CGINLINE_n0_1⟧";
+        token_pair(&protected, t0, t1);
+        let output = format!("It queries-from {t1} the fields {t0}.");
+        let outcome = restore_markdown_detailed(&output, &protected).unwrap();
+        assert_eq!(
+            outcome.text,
+            "It queries-from `blobs` the fields `id, data`."
+        );
+        assert_eq!(outcome.inline_reorder_count, 2);
+    }
+
+    #[test]
+    fn multiple_same_region_inline_reorders_restore() {
+        let source = "use `a` then `b` then `c`.";
+        let protected = protect_markdown_with_nonce(source, NONCE).unwrap();
+        let t0 = "⟦CGINLINE_n0_0⟧";
+        let t1 = "⟦CGINLINE_n0_1⟧";
+        let t2 = "⟦CGINLINE_n0_2⟧";
+        let output = protected
             .text
-            .replacen(t0, "@@TMP@@", 1)
-            .replacen(t1, t0, 1)
-            .replacen("@@TMP@@", t1, 1);
+            .replacen(t0, "@@0@@", 1)
+            .replacen(t1, "@@1@@", 1)
+            .replacen(t2, "@@2@@", 1)
+            .replacen("@@0@@", t2, 1)
+            .replacen("@@1@@", t0, 1)
+            .replacen("@@2@@", t1, 1);
+        let outcome = restore_markdown_detailed(&output, &protected).unwrap();
+        assert_eq!(outcome.text, "use `c` then `a` then `b`.");
+        assert_eq!(outcome.inline_reorder_count, 3);
+    }
+
+    #[test]
+    fn inline_across_fenced_block_fails() {
+        let source = "before `one`\n```\nblock\n```\nafter `two`\n";
+        let protected = protect_markdown_with_nonce(source, NONCE).unwrap();
+        let inline0 = "⟦CGINLINE_n0_0⟧";
+        let inline1 = "⟦CGINLINE_n0_1⟧";
+        let code = "⟦CGCODE_n0_0⟧";
+        token_pair(&protected, inline0, inline1);
+        assert!(protected.text.contains(code));
+        let crossed = swap_once(&protected.text, inline0, inline1);
+        let err = restore_markdown(&crossed, &protected).unwrap_err();
+        assert_eq!(
+            err,
+            ProtectError::IntegrityFailed(IntegrityFailureKind::InlineCrossRegion)
+        );
+    }
+
+    #[test]
+    fn fenced_code_reorder_fails() {
+        let source = "```\none\n```\n\n```\ntwo\n```\n";
+        let protected = protect_markdown_with_nonce(source, NONCE).unwrap();
+        let c0 = "⟦CGCODE_n0_0⟧";
+        let c1 = "⟦CGCODE_n0_1⟧";
+        token_pair(&protected, c0, c1);
+        let swapped = swap_once(&protected.text, c0, c1);
+        let err = restore_markdown(&swapped, &protected).unwrap_err();
+        assert_eq!(
+            err,
+            ProtectError::IntegrityFailed(IntegrityFailureKind::FencedReorder)
+        );
+    }
+
+    #[test]
+    fn missing_inline_token_fails() {
+        let source = "A `one` and `two`";
+        let protected = protect_markdown_with_nonce(source, NONCE).unwrap();
+        let broken = protected.text.replacen("⟦CGINLINE_n0_1⟧", "GONE", 1);
         let err = restore_markdown(&broken, &protected).unwrap_err();
-        assert_eq!(err, ProtectError::IntegrityFailed);
+        assert_eq!(
+            err,
+            ProtectError::IntegrityFailed(IntegrityFailureKind::MissingToken)
+        );
+    }
+
+    #[test]
+    fn duplicate_fenced_token_fails() {
+        let source = "```\nblock\n```\n";
+        let protected = protect_markdown_with_nonce(source, NONCE).unwrap();
+        let token = "⟦CGCODE_n0_0⟧";
+        let broken = format!("{} extra {token}", protected.text);
+        let err = restore_markdown(&broken, &protected).unwrap_err();
+        assert_eq!(
+            err,
+            ProtectError::IntegrityFailed(IntegrityFailureKind::DuplicateToken)
+        );
+    }
+
+    #[test]
+    fn malformed_marker_fails_even_when_expected_tokens_present() {
+        let source = "use `code` please";
+        let protected = protect_markdown_with_nonce(source, NONCE).unwrap();
+        let complete = "⟦CGINLINE_n0_0⟧";
+        assert!(protected.text.contains(complete));
+        let truncated = format!("{} and ⟦CGINLINE_n0_", protected.text);
+        let err = restore_markdown(&truncated, &protected).unwrap_err();
+        assert_eq!(
+            err,
+            ProtectError::IntegrityFailed(IntegrityFailureKind::MalformedMarker)
+        );
+
+        let no_close = format!("{} and ⟦CGINLINE_n0_0", protected.text);
+        let err = restore_markdown(&no_close, &protected).unwrap_err();
+        assert_eq!(
+            err,
+            ProtectError::IntegrityFailed(IntegrityFailureKind::MalformedMarker)
+        );
+    }
+
+    #[test]
+    fn foreign_nonce_literal_is_ignored() {
+        let source = "use `code` please";
+        let protected = protect_markdown_with_nonce(source, NONCE).unwrap();
+        let output = format!(
+            "{} and literal ⟦CGINLINE_other_0⟧ plus ⟦CGCODE_ffff_1⟧",
+            protected.text
+        );
+        let restored = restore_markdown(&output, &protected).unwrap();
+        assert!(restored.contains("`code`"));
+        assert!(restored.contains("⟦CGINLINE_other_0⟧"));
+        assert!(restored.contains("⟦CGCODE_ffff_1⟧"));
+    }
+
+    #[test]
+    fn unchanged_mixed_document_round_trips_with_zero_inline_reorders() {
+        let source = "Intro `inline`\n\n```rust\nfn main() {}\n```\n\nOutro `x`\n";
+        let protected = protect_markdown_with_nonce(source, NONCE).unwrap();
+        let outcome = restore_markdown_detailed(&protected.text, &protected).unwrap();
+        assert_eq!(outcome.text, source);
+        assert_eq!(outcome.inline_reorder_count, 0);
+    }
+
+    #[test]
+    fn integrity_failed_display_is_content_free() {
+        let err = ProtectError::IntegrityFailed(IntegrityFailureKind::UnknownToken);
+        let rendered = err.to_string();
+        assert_eq!(rendered, "placeholder integrity check failed");
+        assert!(!rendered.contains("CGINLINE"));
+        assert!(!rendered.contains("CGCODE"));
+        assert!(!rendered.contains(NONCE));
+        assert!(!rendered.contains('⟦'));
     }
 
     #[test]
@@ -523,7 +788,10 @@ Outro
             .text
             .replace("⟦CGINLINE_n0_0⟧", "⟦CGINLINE_n0_99⟧");
         let err = restore_markdown(&broken, &protected).unwrap_err();
-        assert_eq!(err, ProtectError::IntegrityFailed);
+        assert_eq!(
+            err,
+            ProtectError::IntegrityFailed(IntegrityFailureKind::UnknownToken)
+        );
     }
 
     #[test]
