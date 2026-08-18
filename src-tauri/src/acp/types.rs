@@ -1579,6 +1579,7 @@ mod envelope_tests {
             reasoning_effort: None,
             completed_at: None,
             outcome: None,
+            autonomous_origin: None,
         };
         let json = serde_json::to_value(&turn).unwrap();
         assert!(json.get("outcome").is_none());
@@ -1628,6 +1629,7 @@ mod envelope_tests {
                 completed_at: Some(completed_at),
                 duration_ms: Some(1500),
             }),
+            autonomous_origin: None,
         };
         let json = serde_json::to_value(&turn).unwrap();
         assert_eq!(json["outcome"]["status"], "interrupted");

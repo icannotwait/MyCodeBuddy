@@ -255,6 +255,14 @@ pub struct TurnOutcome {
     pub duration_ms: Option<u64>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AutonomousTurnOrigin {
+    BackgroundTask,
+    Automation,
+    AgentAutonomous,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageTurn {
     pub id: String,
@@ -282,4 +290,64 @@ pub struct MessageTurn {
     /// Absent on ordinary end_turn and all legacy payloads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<TurnOutcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub autonomous_origin: Option<AutonomousTurnOrigin>,
+}
+
+#[cfg(test)]
+mod autonomous_origin_tests {
+    use super::{AutonomousTurnOrigin, MessageTurn};
+    use chrono::TimeZone;
+
+    fn bare_json() -> serde_json::Value {
+        serde_json::json!({
+            "id": "t1",
+            "role": "assistant",
+            "blocks": [],
+            "timestamp": "2026-08-18T00:00:00Z"
+        })
+    }
+
+    #[test]
+    fn missing_origin_deserializes_as_none() {
+        let turn: MessageTurn = serde_json::from_value(bare_json()).unwrap();
+        assert_eq!(turn.autonomous_origin, None);
+    }
+
+    #[test]
+    fn origin_round_trips_snake_case() {
+        let mut turn: MessageTurn = serde_json::from_value(bare_json()).unwrap();
+        turn.autonomous_origin = Some(AutonomousTurnOrigin::BackgroundTask);
+        let value = serde_json::to_value(&turn).unwrap();
+        assert_eq!(value["autonomous_origin"], "background_task");
+        let again: MessageTurn = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            again.autonomous_origin,
+            Some(AutonomousTurnOrigin::BackgroundTask)
+        );
+    }
+
+    #[test]
+    fn absent_origin_is_omitted_from_json() {
+        let turn: MessageTurn = serde_json::from_value(bare_json()).unwrap();
+        let value = serde_json::to_value(&turn).unwrap();
+        assert!(value.get("autonomous_origin").is_none());
+    }
+
+    #[test]
+    fn all_origin_wires_are_stable() {
+        assert_eq!(
+            serde_json::to_string(&AutonomousTurnOrigin::BackgroundTask).unwrap(),
+            "\"background_task\""
+        );
+        assert_eq!(
+            serde_json::to_string(&AutonomousTurnOrigin::Automation).unwrap(),
+            "\"automation\""
+        );
+        assert_eq!(
+            serde_json::to_string(&AutonomousTurnOrigin::AgentAutonomous).unwrap(),
+            "\"agent_autonomous\""
+        );
+        let _ts = chrono::Utc.with_ymd_and_hms(2026, 8, 18, 0, 0, 0).unwrap();
+    }
 }

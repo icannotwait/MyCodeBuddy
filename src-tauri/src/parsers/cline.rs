@@ -293,6 +293,7 @@ impl AgentParser for ClineParser {
                         reasoning_effort: None,
                         completed_at: Some(timestamp),
                         outcome: None,
+                        autonomous_origin: None,
                     });
                 }
                 "user" => {
@@ -315,6 +316,7 @@ impl AgentParser for ClineParser {
                             reasoning_effort: None,
                             completed_at: Some(timestamp),
                             outcome: None,
+                            autonomous_origin: None,
                         });
                     }
 
@@ -332,6 +334,7 @@ impl AgentParser for ClineParser {
                             reasoning_effort: None,
                             completed_at: Some(timestamp),
                             outcome: None,
+                            autonomous_origin: None,
                         });
                     }
                 }

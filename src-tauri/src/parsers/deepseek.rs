@@ -529,6 +529,7 @@ fn parse_session_events(text: &str) -> SessionParse {
                     completed_at: Some(ts),
                     reasoning_effort: None,
                     outcome: None,
+                    autonomous_origin: None,
                 });
             }
             "request/header" => {
@@ -729,6 +730,7 @@ fn ensure_assistant<'a>(
                 completed_at: None,
                 reasoning_effort: None,
                 outcome: None,
+                autonomous_origin: None,
             });
             let idx = turns.len() - 1;
             *open_assistant = Some(idx);

@@ -356,6 +356,11 @@ export interface TurnOutcome {
   duration_ms?: number | null
 }
 
+export type AutonomousTurnOrigin =
+  | "background_task"
+  | "automation"
+  | "agent_autonomous"
+
 export interface MessageTurn {
   id: string
   role: TurnRole
@@ -378,6 +383,7 @@ export interface MessageTurn {
   completed_at?: string | null
   /** Optional terminal outcome (e.g. user Stop interruption metadata). */
   outcome?: TurnOutcome | null
+  autonomous_origin?: AutonomousTurnOrigin | null
 }
 
 export interface ConversationDetail {
@@ -385,10 +391,12 @@ export interface ConversationDetail {
   turns: MessageTurn[]
   session_stats?: SessionStats | null
   /**
-   * Byte length of the source transcript this parse consumed (Claude only;
-   * absent elsewhere). Retires background-overlay turns whose
-   * `background_activity` watermark it has caught up to — see
-   * `BackgroundOverlayEntry` in the conversation runtime store.
+   * Byte length of the source transcript this parse consumed (available for
+   * transcript-backed autonomous overlay providers (Claude, Grok
+   * `updates.jsonl`, Codex native rollout); absent elsewhere). Retires
+   * background-overlay turns whose `background_activity` watermark it has
+   * caught up to — see `BackgroundOverlayEntry` in the conversation runtime
+   * store.
    */
   transcript_watermark?: number | null
 }

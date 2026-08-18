@@ -1150,6 +1150,7 @@ mod tests {
             reasoning_effort: None,
             completed_at: Some(chrono::Utc::now()),
             outcome: None,
+            autonomous_origin: None,
         };
         let env = Arc::new(EventEnvelope {
             seq: u64::MAX,

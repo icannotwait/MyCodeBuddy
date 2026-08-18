@@ -2948,6 +2948,7 @@ async fn continuation_coordinator_manager_ack_loss_marker_is_crash_safe() {
         reasoning_effort: None,
         completed_at: None,
         outcome: None,
+        autonomous_origin: None,
     }];
     filter_internal_continuation_turns(store.as_ref(), 7, &mut turns)
         .await
@@ -4543,6 +4544,7 @@ async fn delegation_continuation_e2e_prompt_snapshot_marker_and_hidden_from_publ
         reasoning_effort: None,
         completed_at: None,
         outcome: None,
+        autonomous_origin: None,
     }];
     filter_internal_continuation_turns(store.as_ref(), 7, &mut turns)
         .await

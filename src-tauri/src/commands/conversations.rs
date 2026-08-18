@@ -3354,6 +3354,7 @@ mod tests {
             reasoning_effort: None,
             completed_at: None,
             outcome: None,
+            autonomous_origin: None,
         }];
         let mut child = summary_child(42, "tu-1", "cancelled");
         child.delegation_call_id = Some("task-join".into());
@@ -3472,6 +3473,7 @@ mod tests {
             reasoning_effort: None,
             completed_at: None,
             outcome: None,
+            autonomous_origin: None,
         }
     }
 
@@ -3817,6 +3819,7 @@ Call get_delegation_status with the returned task_id to collect the result.";
             reasoning_effort: None,
             completed_at: None,
             outcome: None,
+            autonomous_origin: None,
         }
     }
 
@@ -3837,6 +3840,7 @@ Call get_delegation_status with the returned task_id to collect the result.";
             reasoning_effort: None,
             completed_at: completed.then_some(ts),
             outcome: None,
+            autonomous_origin: None,
         }
     }
 
@@ -4001,6 +4005,7 @@ Call get_delegation_status with the returned task_id to collect the result.";
             reasoning_effort: None,
             completed_at: None,
             outcome: None,
+            autonomous_origin: None,
         };
         let pending_image =
             |message_id: &str, data: &str| crate::acp::session_state::PendingUserMessage {
@@ -4225,6 +4230,7 @@ Call get_delegation_status with the returned task_id to collect the result.";
             reasoning_effort: None,
             completed_at: None,
             outcome: None,
+            autonomous_origin: None,
         }];
         let mut child = summary_child(5, "item_0", "pending_review");
         child.delegation_call_id = Some("c5168930-df71-49d5-b52d-79a642e357ac".into());
@@ -4302,6 +4308,7 @@ Call get_delegation_status with the returned task_id to collect the result.";
             reasoning_effort: None,
             completed_at: None,
             outcome: None,
+            autonomous_origin: None,
         }];
         let children = vec![summary_child(42, "tu-1", "completed")];
         inject_delegation_meta(&mut turns, &children);

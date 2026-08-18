@@ -387,6 +387,7 @@ pub fn project_turns(entries: &[TranscriptEntry]) -> Vec<MessageTurn> {
                     reasoning_effort: None,
                     completed_at: None,
                     outcome: None,
+                    autonomous_origin: None,
                 });
                 seq += 1;
                 prompt_just_recorded = true;
@@ -448,6 +449,7 @@ fn flush(pending: &mut Option<PendingTurn>, turns: &mut Vec<MessageTurn>, seq: &
         reasoning_effort: None,
         completed_at: Some(epoch_ms_to_utc(p.last_at_ms)),
         outcome: None,
+        autonomous_origin: None,
     });
     *seq += 1;
 }
@@ -547,6 +549,7 @@ fn apply_update(
                         reasoning_effort: None,
                         completed_at: None,
                         outcome: None,
+                        autonomous_origin: None,
                     });
                     *seq += 1;
                 }

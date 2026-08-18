@@ -1544,6 +1544,7 @@ earlier terminal context records.\n\
                 reasoning_effort: None,
                 completed_at: None,
                 outcome: None,
+                autonomous_origin: None,
             },
             MessageTurn {
                 id: "turn-1".to_string(),
@@ -1561,6 +1562,7 @@ earlier terminal context records.\n\
                 reasoning_effort: None,
                 completed_at: None,
                 outcome: None,
+                autonomous_origin: None,
             },
         ];
 
