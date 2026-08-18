@@ -444,17 +444,18 @@ pub struct SessionState {
     /// Size is human-bounded (one entry per note the user types this turn).
     pub feedback: Vec<FeedbackItem>,
 
-    /// Launched-but-unresolved background tasks (async sub-agents + background
-    /// shell tasks), mirrored from the transcript watcher's authoritative
-    /// accounting via `AcpEvent::BackgroundActivity` (`apply_event` is the only
-    /// writer). Drives `has_active_background_work()` — the idle-sweep
-    /// exemption that keeps the agent CLI alive through a silent background
-    /// build (killing the connection kills the CLI, and the background work
-    /// dies with it). Carried on `to_snapshot()` so a client attaching
-    /// mid-episode recovers the pending count without replaying events.
+    /// Launched-but-unresolved autonomous background work (Claude transcript
+    /// tasks, Grok background-task follow-ups, and later Codex Goal keepalive),
+    /// mirrored from the active adapter's `AcpEvent::BackgroundActivity`
+    /// (`apply_event` is the only writer). Drives `has_active_background_work()`
+    /// — the idle-sweep exemption that keeps the agent CLI alive through a
+    /// silent background build (killing the connection kills the CLI, and the
+    /// background work dies with it). Carried on `to_snapshot()` so a client
+    /// attaching mid-episode recovers the pending count without replaying
+    /// events.
     pub background_outstanding: u32,
     /// Instant of the most recent `BackgroundActivity` event. Bounds the sweep
-    /// exemption: if the watcher stops reporting (task died, bug) the
+    /// exemption: if the adapter/watcher stops reporting (task died, bug) the
     /// exemption lapses after `background_keepalive_max_age()` instead of
     /// pinning the connection alive forever. Backend-internal; not serialized.
     pub background_activity_at: Option<DateTime<Utc>>,
@@ -1643,7 +1644,7 @@ impl SessionState {
                 }
             }
             AcpEvent::BackgroundActivity { outstanding, .. } => {
-                // Mirror the watcher's authoritative accounting so the idle
+                // Mirror the adapter's authoritative accounting so the idle
                 // sweeps can exempt this connection while background work is
                 // pending. The turns/settled payloads are frontend-only; the
                 // trailing `last_activity_at = now` below additionally resets
@@ -1736,14 +1737,15 @@ impl SessionState {
         completion
     }
 
-    /// Whether this connection has launched background work (async sub-agent /
-    /// background shell task) that hasn't settled yet — the idle sweeps must
-    /// not reap it (disconnecting drops the `sacp` connection, which
-    /// terminates the agent CLI process, which kills the background work).
+    /// Whether this connection has launched autonomous background work (async
+    /// sub-agent, background shell task, or a Grok idle follow-up) that hasn't
+    /// settled yet — the idle sweeps must not reap it (disconnecting drops the
+    /// `sacp` connection, which terminates the agent CLI process, which kills
+    /// the background work).
     ///
     /// Bounded by `background_keepalive_max_age()`: the exemption requires a
-    /// `BackgroundActivity` event within the window, so a wedged/dead watcher
-    /// can't pin a connection alive forever. (The watcher itself also expires
+    /// `BackgroundActivity` event within the window, so a wedged/dead adapter
+    /// can't pin a connection alive forever. (The adapter itself also expires
     /// tasks past the same age and emits `outstanding: 0`, which resets
     /// `background_outstanding` here — this check is the belt to that
     /// suspenders.)

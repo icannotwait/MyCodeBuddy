@@ -298,7 +298,7 @@ impl GrokParser {
 
     /// Locate the `<session-uuid>` directory matching `conversation_id` across
     /// the `base_dir/<group>/` buckets (two shallow levels).
-    fn find_session_dir(&self, conversation_id: &str) -> Option<PathBuf> {
+    pub(crate) fn find_session_dir(&self, conversation_id: &str) -> Option<PathBuf> {
         for group in read_subdirs(&self.base_dir) {
             let candidate = group.join(conversation_id);
             if candidate.join("updates.jsonl").is_file() {
@@ -344,6 +344,21 @@ impl AgentParser for GrokParser {
             .ok_or_else(|| ParseError::ConversationNotFound(conversation_id.to_string()))?;
         Ok(self.build_detail(&session_dir, conversation_id))
     }
+}
+
+/// Locate `updates.jsonl` for an external Grok session id the same way
+/// [`GrokParser`] resolves conversation detail.
+pub(crate) fn grok_updates_jsonl_path(session_id: &str) -> Option<PathBuf> {
+    GrokParser::new()
+        .find_session_dir(session_id)
+        .map(|dir| dir.join("updates.jsonl"))
+}
+
+/// Assemble turns from complete `updates.jsonl` bytes with the same
+/// normalization as cold parse. Returns `(turns, consumed_complete_bytes)`.
+pub(crate) fn grok_turns_from_bytes(bytes: &[u8], session_id: &str) -> (Vec<MessageTurn>, u64) {
+    let parsed = parse_updates_from_bytes(bytes, session_id);
+    (parsed.turns, parsed.consumed_complete_bytes)
 }
 
 // ---------------------------------------------------------------------------
@@ -548,18 +563,18 @@ pub(crate) fn grok_complete_records(bytes: &[u8]) -> impl Iterator<Item = (u64, 
     })
 }
 
-fn grok_record_payload(record: &[u8]) -> &[u8] {
+pub(crate) fn grok_record_payload(record: &[u8]) -> &[u8] {
     let without_nl = record.strip_suffix(&[b'\n']).unwrap_or(record);
     without_nl.strip_suffix(&[b'\r']).unwrap_or(without_nl)
 }
 
-fn is_grok_background_task_reminder(text: &str) -> bool {
+pub(crate) fn is_grok_background_task_reminder(text: &str) -> bool {
     text.contains("<system-reminder>") && text.contains("Background task")
 }
 
 /// Quoted names after `Background task` in the verified reminder shape.
 /// Does not scan arbitrary English continuation text.
-fn grok_reminder_task_ids(text: &str) -> Vec<String> {
+pub(crate) fn grok_reminder_task_ids(text: &str) -> Vec<String> {
     let mut ids = Vec::new();
     let mut rest = text;
     const PREFIX: &str = "Background task \"";
@@ -585,7 +600,10 @@ fn parse_updates(path: &Path, session_id: &str) -> ParsedUpdates {
     let Ok(bytes) = fs::read(path) else {
         return ParsedUpdates::default();
     };
+    parse_updates_from_bytes(&bytes, session_id)
+}
 
+fn parse_updates_from_bytes(bytes: &[u8], session_id: &str) -> ParsedUpdates {
     let mut out = ParsedUpdates::default();
     // The in-flight assistant turn, plus a `toolCallId → index-of-its-ToolResult`
     // map scoped to that turn (cleared on every turn boundary).
@@ -654,12 +672,22 @@ fn parse_updates(path: &Path, session_id: &str) -> ParsedUpdates {
             // stamps the *next* independently opened assistant; mid-assistant
             // injection is suppress-only and does not relabel the open turn.
             if assistant.is_none() && pending_autonomous.is_none() {
-                let text = update_text(update);
-                if is_grok_background_task_reminder(&text) {
-                    pending_autonomous = Some(PendingGrokAutonomous {
-                        trigger_start: start_offset,
-                        task_ids: grok_reminder_task_ids(&text),
-                    });
+                // Parked T4: a hidden trigger after a committed User turn and
+                // before that prompt's assistant is not an idle-boundary
+                // follow-up. The verified sequence is trigger then assistant
+                // after an idle boundary (last committed turn is not User).
+                let last_is_user = matches!(
+                    out.turns.last(),
+                    Some(t) if matches!(t.role, TurnRole::User)
+                );
+                if !last_is_user {
+                    let text = update_text(update);
+                    if is_grok_background_task_reminder(&text) {
+                        pending_autonomous = Some(PendingGrokAutonomous {
+                            trigger_start: start_offset,
+                            task_ids: grok_reminder_task_ids(&text),
+                        });
+                    }
                 }
             }
             continue;
@@ -1963,6 +1991,29 @@ mod tests {
             .unwrap();
         assert!(detail.turns.iter().all(|t| t.autonomous_origin.is_none()));
         assert!(detail.turns.iter().all(|t| t.id.starts_with("grok-turn-")));
+    }
+
+    #[test]
+    fn hidden_trigger_after_committed_user_does_not_mark_that_assistant() {
+        let updates = concat!(
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"please continue"},"_meta":{"promptIndex":0}}},"timestamp":1}"#,
+            "\n",
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"<system-reminder>\nBackground task \"term_x\" completed (exit code: 0).\n</system-reminder>"},"_meta":{"hideFromScrollback":true}}},"timestamp":2}"#,
+            "\n",
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"user reply"}}},"timestamp":3}"#,
+            "\n",
+        );
+        let (_tmp, sessions) = fixture(SUMMARY, updates);
+        let detail = GrokParser::with_base_dir(sessions)
+            .get_conversation("019f45e3-e1ef-7690-a29f-fe2554382b49")
+            .unwrap();
+        let assistant = detail
+            .turns
+            .iter()
+            .find(|t| matches!(t.role, TurnRole::Assistant))
+            .expect("assistant");
+        assert!(assistant.autonomous_origin.is_none());
+        assert!(assistant.id.starts_with("grok-turn-"));
     }
 
     #[test]
