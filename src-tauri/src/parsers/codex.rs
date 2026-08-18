@@ -2428,18 +2428,20 @@ impl CodexParser {
                                     .and_then(|m| m.as_str())
                                     .unwrap_or("")
                                     .to_string();
-                                messages.push(UnifiedMessage {
-                                    id: format!("assistant-{}", messages.len()),
-                                    role: MessageRole::Assistant,
-                                    content: vec![ContentBlock::Text { text }],
-                                    timestamp,
-                                    usage: None,
-                                    duration_ms: None,
-                                    model: None,
-                                    completed_at: Some(timestamp),
+                                if !adopt_duplicate_assistant_text(&mut messages, &text, None) {
+                                    messages.push(UnifiedMessage {
+                                        id: format!("assistant-{}", messages.len()),
+                                        role: MessageRole::Assistant,
+                                        content: vec![ContentBlock::Text { text }],
+                                        timestamp,
+                                        usage: None,
+                                        duration_ms: None,
+                                        model: None,
+                                        completed_at: Some(timestamp),
 
-                                    reasoning_effort: None,
-                                });
+                                        reasoning_effort: None,
+                                    });
+                                }
                             }
                             "thread_goal_updated" => {
                                 // codex-acp v1.1.0 (#263) routes live goals through
@@ -5011,6 +5013,64 @@ mod tests {
             .unwrap();
         assert!(assistant.id.starts_with("turn-"));
         assert_eq!(assistant.autonomous_origin, None);
+    }
+
+    #[test]
+    fn dual_source_assistant_text_does_not_shift_following_turn_ids() {
+        // response_item.reasoning, then the spec's msg_* assistant record, then
+        // the historical event_msg.agent_message. The two text sources must
+        // collapse to one block so later positional turn-N ids stay put.
+        let jsonl = concat!(
+            r#"{"timestamp":"2026-08-18T00:00:00Z","type":"session_meta","payload":{"id":"dual-1","cwd":"/tmp"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-18T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"go"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-18T00:00:02Z","type":"response_item","payload":{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"thinking"}]}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-18T00:00:03Z","type":"response_item","payload":{"type":"message","role":"assistant","id":"msg_live","content":[{"type":"output_text","text":"working"}]}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-18T00:00:04Z","type":"event_msg","payload":{"type":"agent_message","message":"working"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-18T00:00:05Z","type":"event_msg","payload":{"type":"user_message","message":"next"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-18T00:00:06Z","type":"event_msg","payload":{"type":"agent_message","message":"later"}}"#,
+            "\n",
+        );
+        let detail = parse_path(&write_rollout(jsonl));
+        let working: Vec<&str> = detail
+            .turns
+            .iter()
+            .flat_map(|t| t.blocks.iter())
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } if text == "working" => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            working,
+            ["working"],
+            "one assistant text block, not both sources"
+        );
+        assert_eq!(detail.turns.len(), 5);
+        assert_eq!(detail.turns[0].id, "turn-0");
+        assert_eq!(detail.turns[1].id, "turn-1");
+        assert_eq!(detail.turns[2].id, "turn-2");
+        assert_eq!(detail.turns[3].id, "turn-3");
+        assert_eq!(detail.turns[4].id, "turn-4");
+        assert!(
+            matches!(&detail.turns[1].blocks[0], ContentBlock::Thinking { text } if text == "thinking")
+        );
+        assert!(
+            matches!(&detail.turns[2].blocks[0], ContentBlock::Text { text } if text == "working")
+        );
+        assert!(
+            matches!(&detail.turns[3].blocks[0], ContentBlock::Text { text } if text == "next")
+        );
+        assert!(
+            matches!(&detail.turns[4].blocks[0], ContentBlock::Text { text } if text == "later")
+        );
+        assert_eq!(detail.turns[3].autonomous_origin, None);
+        assert_eq!(detail.turns[4].autonomous_origin, None);
     }
 
     #[test]
