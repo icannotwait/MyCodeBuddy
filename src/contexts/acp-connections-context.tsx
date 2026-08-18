@@ -5462,12 +5462,6 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     []
   )
 
-  const resolveListenerReadyWaiters = useCallback(() => {
-    if (listenerReadyWaitersRef.current.length === 0) return
-    const waiters = listenerReadyWaitersRef.current
-    listenerReadyWaitersRef.current = []
-    for (const resolve of waiters) resolve()
-  }, [])
   const waitForListenerReady = useCallback(async () => {
     const phase = listenerPhaseRef.current
     if (phase === "ready") return
