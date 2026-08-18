@@ -282,6 +282,10 @@ async fn resolve_shared_connect_target(
             .map_err(|error| map_acp_error(error.into()))?;
     }
 
+    if params.conversation_id.is_some_and(|id| id <= 0) {
+        return Err(invalid_shared_field("conversation_id"));
+    }
+
     crate::commands::delegate_access::ensure_connect_delegate_interactive(
         &state.db,
         &state.connection_manager,
@@ -291,10 +295,6 @@ async fn resolve_shared_connect_target(
     )
     .await
     .map_err(map_acp_error)?;
-
-    if params.conversation_id.is_some_and(|id| id <= 0) {
-        return Err(invalid_shared_field("conversation_id"));
-    }
 
     if let Some(conversation_id) = params.conversation_id {
         let conversation =
