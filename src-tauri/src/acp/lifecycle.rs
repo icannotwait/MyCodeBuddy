@@ -1938,7 +1938,10 @@ mod delegation_registration_tests {
     //! synthetic id before the move: args arriving on a `ToolCallUpdate`, and
     //! a key backfilled by a later update.
 
-    use super::{register_delegation_tool_call_from_event, run_broker_tool_side_effects};
+    use super::{
+        enricher_for_lifecycle, install_test_cursor_enricher, register_delegation_tool_call_from_event,
+        run_broker_tool_side_effects,
+    };
     use crate::acp::cursor_enrichment::test_support::{FixedStore, MapSessions, SleepThenStore};
     use crate::acp::cursor_enrichment::{CursorEnrichmentSession, CursorStoreEnricher};
     use crate::acp::cursor_store::CursorStoredToolCall;
@@ -1948,11 +1951,26 @@ mod delegation_registration_tests {
     use crate::acp::delegation::spawner::{mock::MockSpawner, ConnectionSpawner};
     use crate::acp::delegation::types::DelegationError;
     use crate::acp::internal_bus::InternalEventEnvelope;
+    use crate::acp::manager::ConnectionManager;
     use crate::acp::types::{AcpEvent, EventEnvelope};
     use crate::models::AgentType;
     use async_trait::async_trait;
     use std::sync::Arc;
     use std::time::Duration;
+
+    /// RAII guard that clears the test-only `TEST_CURSOR_ENRICHER` seam on
+    /// drop — including on early return or panic via `?`/`assert!` — so an
+    /// installed enricher from one test can never leak into a
+    /// concurrently-running test under the default multi-thread `cargo
+    /// test` runner. Construct AFTER `install_test_cursor_enricher(Some(..))`
+    /// and hold it for the rest of the test.
+    struct ResetTestCursorEnricherOnDrop;
+
+    impl Drop for ResetTestCursorEnricherOnDrop {
+        fn drop(&mut self) {
+            install_test_cursor_enricher(None);
+        }
+    }
 
     struct RootDepth;
     #[async_trait]
@@ -2515,6 +2533,108 @@ mod delegation_registration_tests {
             "tombstone must win over late store backfill"
         );
     }
+
+    /// Exercises the actual injection seam `lifecycle_subscriber_task` uses
+    /// in production — `install_test_cursor_enricher` +
+    /// `enricher_for_lifecycle` — rather than bypassing it (the two tests
+    /// above hand-build a `CursorStoreEnricher` and pass it to
+    /// `run_broker_tool_side_effects` directly). This pins:
+    /// 1. `enricher_for_lifecycle` under `#[cfg(test)]` returns exactly the
+    ///    `Arc` last installed (`Arc::ptr_eq`), not a fresh clone-of-value.
+    /// 2. The `broker.as_ref().and_then(|b| enricher_for_lifecycle(b.as_ref(), &manager))`
+    ///    composition `lifecycle_subscriber_task` runs to obtain the
+    ///    worker's `enricher` — reproduced verbatim here — yields `Some`
+    ///    for a `Some(broker)` input when a test enricher is installed.
+    /// 3. The per-worker `Option<Arc<CursorStoreEnricher>>` →
+    ///    `.as_deref()` conversion `lifecycle_subscriber_task` performs
+    ///    before calling `run_broker_tool_side_effects` still drives a real
+    ///    schedule + backfill end to end.
+    ///
+    /// Without this test, `install_test_cursor_enricher` had zero callers
+    /// anywhere in the crate — permanent dead code, and the seam itself
+    /// unverified by CI.
+    #[tokio::test]
+    async fn installed_test_enricher_flows_through_lifecycle_composition_into_hook() {
+        let b = Arc::new(broker());
+        let id = "call-cursor-1\nfc_abc_0";
+        let env = tool_call_event(id, "MCP: tool", Some("{}"));
+        let store = Arc::new(FixedStore(CursorStoredToolCall {
+            tool_name: "mcp__codeg-mcp__delegate_to_agent".into(),
+            args: serde_json::json!({
+                "agent_type": "codex",
+                "task": "build it",
+                "correlation_id": "test-corr"
+            }),
+        }));
+        let sessions = Arc::new(MapSessions(std::sync::Mutex::new(
+            [(
+                "parent-conn".into(),
+                CursorEnrichmentSession {
+                    agent_type: AgentType::Cursor,
+                    external_session_id: "0198c9aa-1111-2222-3333-444455556666".into(),
+                },
+            )]
+            .into(),
+        )));
+        let installed = Arc::new(CursorStoreEnricher::new(store, sessions, b.clone(), b.metrics()));
+        install_test_cursor_enricher(Some(installed.clone()));
+        let _reset = ResetTestCursorEnricherOnDrop;
+
+        let manager = ConnectionManager::new();
+        // Reproduces `lifecycle_subscriber_task`'s own
+        // `broker.as_ref().and_then(|b| enricher_for_lifecycle(b.as_ref(), &manager))`
+        // composition, including the `Option<Arc<DelegationBroker>>` shape.
+        let broker_opt: Option<Arc<DelegationBroker>> = Some(b.clone());
+        let resolved = broker_opt
+            .as_ref()
+            .and_then(|inner| enricher_for_lifecycle(inner.as_ref(), &manager));
+        let resolved = resolved.expect("test enricher must be returned once installed");
+        assert!(
+            Arc::ptr_eq(&resolved, &installed),
+            "enricher_for_lifecycle must return the exact installed Arc under #[cfg(test)]"
+        );
+
+        // Reproduces the per-worker clone + `.as_deref()` conversion
+        // `lifecycle_subscriber_task` performs before calling
+        // `run_broker_tool_side_effects` on every dequeued envelope.
+        let worker_local: Option<Arc<CursorStoreEnricher>> = Some(resolved.clone());
+        let internal = InternalEventEnvelope {
+            event: Arc::new(env),
+            completion: None,
+        };
+        run_broker_tool_side_effects(b.as_ref(), &internal, worker_local.as_deref()).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(b.metrics().snapshot().cursor_enrichment_scheduled, 1);
+        assert_eq!(
+            b.take_matching_tool_call("parent-conn", &codex_key("build it"))
+                .await
+                .as_deref(),
+            Some(id)
+        );
+    }
+
+    /// The other half of the composition: with NO test enricher installed
+    /// (the default every other lifecycle test relies on), the same
+    /// `broker.as_ref().and_then(...)` composition must yield `None` for a
+    /// `Some(broker)` input — proving the default-safe path (no
+    /// `~/.cursor` access) is what every existing `lifecycle_subscriber_task`
+    /// test actually exercises.
+    #[tokio::test]
+    async fn composition_yields_none_when_no_test_enricher_installed() {
+        install_test_cursor_enricher(None);
+        let _reset = ResetTestCursorEnricherOnDrop;
+
+        let b = Arc::new(broker());
+        let manager = ConnectionManager::new();
+        let broker_opt: Option<Arc<DelegationBroker>> = Some(b.clone());
+        let resolved = broker_opt
+            .as_ref()
+            .and_then(|inner| enricher_for_lifecycle(inner.as_ref(), &manager));
+        assert!(
+            resolved.is_none(),
+            "no test enricher installed must compose to None, never fall through to production"
+        );
+    }
 }
 
 /// Per-connection worker that owns the cache for one connection and
@@ -2957,7 +3077,7 @@ pub(crate) fn install_test_cursor_enricher(enricher: Option<Arc<CursorStoreEnric
 /// Under `#[cfg(test)]` this never touches [`CursorStoreReader::production`]
 /// (and therefore never opens `~/.cursor`): it returns whatever
 /// [`install_test_cursor_enricher`] last installed (`None` by default).
-fn enricher_for_lifecycle(
+pub(crate) fn enricher_for_lifecycle(
     broker: &DelegationBroker,
     manager: &ConnectionManager,
 ) -> Option<Arc<CursorStoreEnricher>> {
