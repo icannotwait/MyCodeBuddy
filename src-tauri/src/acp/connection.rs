@@ -13887,6 +13887,7 @@ mod tests {
                 replacement_reason: None,
                 correlation_id: None,
                 recovery_authorization_id: None,
+                orchestration_binding: None,
             })
             .await;
         assert_eq!(report.status, TaskStatus::Running);
@@ -22562,6 +22563,7 @@ mod tests {
         let runs = Arc::new(RunStore::new(db.clone()));
         let task_id = format!("task-resume-contract-{label}");
         runs.insert_reserving(ReservingRunInsert {
+            orchestration_binding: None,
             task_id: task_id.clone(),
             root_task_id: task_id.clone(),
             previous_task_id: Some("task-gen1".into()),

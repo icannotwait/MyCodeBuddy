@@ -49,19 +49,23 @@ use crate::acp::delegation::attention::ATTENTION_PAYLOAD_MAX_BYTES;
 use crate::acp::delegation::transport::{
     client_ask_round_trip, client_cancel, client_cancel_task_round_trip, client_commit_feedback,
     client_complete_work_round_trip, client_feedback_round_trip,
-    client_get_workflow_state_round_trip, client_parent_decision_round_trip,
-    client_publish_workflow_round_trip, client_recover_workflow_round_trip,
-    client_recovery_authorization_round_trip, client_register_simple_workflow_round_trip,
-    client_reply_delegation_round_trip, client_round_trip, client_session_round_trip,
-    client_settle_workflow_round_trip, client_status_round_trip, BrokerAskRequest,
-    BrokerCancelRequest, BrokerCancelTaskRequest, BrokerCommitFeedbackRequest,
-    BrokerCompleteWorkRequest, BrokerFeedbackRequest, BrokerGetWorkflowStateRequest,
-    BrokerParentDecisionRequest, BrokerPublishWorkflowRequest, BrokerRecoverWorkflowRequest,
-    BrokerRecoveryAuthorizationRequest, BrokerRegisterSimpleWorkflowRequest,
-    BrokerReplyDelegationRequest, BrokerRequest, BrokerResponse, BrokerSessionRequest,
-    BrokerSettleWorkflowRequest, BrokerStatusRequest, CancelDelegationReason, CompanionRole,
+    client_get_workflow_state_round_trip, client_orchestration_bindings_round_trip,
+    client_parent_decision_round_trip, client_publish_workflow_round_trip,
+    client_recover_workflow_round_trip, client_recovery_authorization_round_trip,
+    client_register_simple_workflow_round_trip, client_reply_delegation_round_trip,
+    client_round_trip, client_session_round_trip, client_settle_workflow_round_trip,
+    client_status_round_trip, BrokerAskRequest, BrokerCancelRequest, BrokerCancelTaskRequest,
+    BrokerCommitFeedbackRequest, BrokerCompleteWorkRequest, BrokerFeedbackRequest,
+    BrokerGetWorkflowStateRequest, BrokerOrchestrationBindingsRequest, BrokerParentDecisionRequest,
+    BrokerPublishWorkflowRequest, BrokerRecoverWorkflowRequest, BrokerRecoveryAuthorizationRequest,
+    BrokerRegisterSimpleWorkflowRequest, BrokerReplyDelegationRequest, BrokerRequest,
+    BrokerResponse, BrokerSessionRequest, BrokerSettleWorkflowRequest, BrokerStatusRequest,
+    CancelDelegationReason, CompanionRole,
 };
-use crate::acp::delegation::types::{validate_correlation_id, DelegationReturnWhen};
+use crate::acp::delegation::types::{
+    validate_correlation_id, DelegationReturnWhen, OrchestrationBindingQueryError,
+    OrchestrationBindingQueryRequest,
+};
 use crate::acp::delegation::workflow::{
     CompleteWorkRequest, WorkflowIndexOmissionStep, WorkflowStateIndexDto,
     COMPLETE_WORK_REPORT_FILE_MAX_BYTES, COMPLETE_WORK_SUMMARY_MAX_BYTES,
@@ -364,6 +368,11 @@ impl CompanionContext {
                 self.features.completion_v2 && self.role == CompanionRole::DelegationChild
             }
             "reply_to_delegation" => self.features.delegation && self.features.coordination_v1,
+            "get_delegation_orchestration_bindings" => {
+                self.features.delegation
+                    && self.features.coordination_v1
+                    && self.role == CompanionRole::Root
+            }
             "register_simple_workflow" => {
                 self.features.delegation && self.role == CompanionRole::Root
             }
@@ -745,6 +754,40 @@ async fn build_tools_call_spawn(
             // whether the poll asked for a single id or a whole fan-out.
             let round_trip = Box::pin(async move { client_status_round_trip(&socket, &req).await });
             register_and_spawn(inflight, id, None, round_trip, render_status_result).await
+        }
+        "get_delegation_orchestration_bindings" => {
+            if arguments.as_object().is_some_and(|object| {
+                object.get("snapshot_id").is_some_and(Value::is_null)
+                    || object.get("cursor").is_some_and(Value::is_null)
+            }) {
+                return orchestration_binding_query_invalid_response(id);
+            }
+            let query: OrchestrationBindingQueryRequest = match serde_json::from_value(arguments) {
+                Ok(query) => query,
+                Err(_) => return orchestration_binding_query_invalid_response(id),
+            };
+            if query.validate().is_err() {
+                return orchestration_binding_query_invalid_response(id);
+            }
+            let req = BrokerOrchestrationBindingsRequest {
+                token: ctx.token.clone(),
+                namespace: query.namespace,
+                limit: query.limit,
+                snapshot_id: query.snapshot_id,
+                cursor: query.cursor,
+            };
+            let round_trip =
+                Box::pin(
+                    async move { client_orchestration_bindings_round_trip(&socket, &req).await },
+                );
+            register_and_spawn(
+                inflight,
+                id,
+                None,
+                round_trip,
+                render_orchestration_binding_page,
+            )
+            .await
         }
         "cancel_delegation" => {
             let task_id = match arguments.get("task_id").and_then(|v| v.as_str()) {
@@ -1339,6 +1382,37 @@ fn render_workflow_result(outcome: &Value) -> Value {
         "isError": is_error,
         "structuredContent": outcome.clone(),
     })
+}
+
+fn render_orchestration_binding_page(outcome: &Value) -> Value {
+    let is_error = outcome.get("error").is_some();
+    let content = if is_error {
+        vec![json!({
+            "type": "text",
+            "text": outcome
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .unwrap_or("orchestration binding query failed"),
+        })]
+    } else {
+        Vec::new()
+    };
+    json!({
+        "content": content,
+        "isError": is_error,
+        "structuredContent": outcome.clone(),
+    })
+}
+
+fn orchestration_binding_query_invalid_response(id: Value) -> LineAction {
+    let error = OrchestrationBindingQueryError::Invalid;
+    let outcome = json!({
+        "error": {
+            "code": error.code(),
+            "message": error.to_string(),
+        }
+    });
+    LineAction::Respond(ok(id, render_orchestration_binding_page(&outcome)))
 }
 
 fn render_recovery_authorization_result(outcome: &Value) -> Value {
@@ -2794,6 +2868,7 @@ mod tests {
     use std::collections::{BTreeMap, HashSet};
 
     use super::*;
+    use crate::acp::delegation::types::OrchestrationBindingV1;
     use crate::acp::delegation::workflow::{
         project_workflow_state_index, WorkflowIndexOmissionStep, WorkflowStateDto,
         WorkflowStateIndexDto,
@@ -3068,6 +3143,64 @@ mod tests {
             let (mut stream, _) = listener.accept().await.unwrap();
             let message: BrokerMessage = read_frame(&mut stream).await.unwrap();
             assert!(matches!(message, BrokerMessage::GetWorkflowState(_)));
+            write_frame(&mut stream, &BrokerResponse { outcome })
+                .await
+                .unwrap();
+        });
+        (socket, task)
+    }
+
+    #[cfg(windows)]
+    fn orchestration_broker_with_outcome(outcome: Value) -> (String, tokio::task::JoinHandle<()>) {
+        use crate::acp::delegation::transport::{
+            read_frame, write_frame, BrokerMessage, BrokerResponse,
+        };
+        use tokio::net::windows::named_pipe::ServerOptions;
+
+        let pipe_name = format!(
+            r"\\.\pipe\codeg-binding-query-test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        );
+        let mut server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&pipe_name)
+            .unwrap();
+        let task = tokio::spawn(async move {
+            server.connect().await.unwrap();
+            let message: BrokerMessage = read_frame(&mut server).await.unwrap();
+            let BrokerMessage::OrchestrationBindings(request) = message else {
+                panic!("expected orchestration binding query")
+            };
+            assert_eq!(request.token, "tok");
+            assert_eq!(request.namespace, "brainstorm-to-delivery");
+            write_frame(&mut server, &BrokerResponse { outcome })
+                .await
+                .unwrap();
+        });
+        (pipe_name, task)
+    }
+
+    #[cfg(unix)]
+    fn orchestration_broker_with_outcome(outcome: Value) -> (String, tokio::task::JoinHandle<()>) {
+        use crate::acp::delegation::transport::{
+            read_frame, write_frame, BrokerMessage, BrokerResponse,
+        };
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("binding-query.sock");
+        let socket = socket_path.to_string_lossy().to_string();
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let task = tokio::spawn(async move {
+            let _dir = dir;
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let message: BrokerMessage = read_frame(&mut stream).await.unwrap();
+            let BrokerMessage::OrchestrationBindings(request) = message else {
+                panic!("expected orchestration binding query")
+            };
+            assert_eq!(request.token, "tok");
+            assert_eq!(request.namespace, "brainstorm-to-delivery");
             write_frame(&mut stream, &BrokerResponse { outcome })
                 .await
                 .unwrap();
@@ -4122,6 +4255,168 @@ mod tests {
 
     fn tool_names(action: LineAction) -> Vec<String> {
         list_tool_names(action)
+    }
+
+    fn schema_accepts(root: &Value, schema: &Value, candidate: &Value) -> bool {
+        if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+            let Some(pointer) = reference.strip_prefix('#') else {
+                return false;
+            };
+            let Some(resolved) = root.pointer(pointer) else {
+                return false;
+            };
+            return schema_accepts(root, resolved, candidate);
+        }
+        if let Some(expected) = schema.get("const") {
+            if candidate != expected {
+                return false;
+            }
+        }
+        if let Some(values) = schema.get("enum").and_then(Value::as_array) {
+            if !values.contains(candidate) {
+                return false;
+            }
+        }
+        match schema.get("type").and_then(Value::as_str) {
+            Some("object") => {
+                let Some(object) = candidate.as_object() else {
+                    return false;
+                };
+                let properties = schema
+                    .get("properties")
+                    .and_then(Value::as_object)
+                    .cloned()
+                    .unwrap_or_default();
+                if schema.get("additionalProperties") == Some(&Value::Bool(false))
+                    && object.keys().any(|key| !properties.contains_key(key))
+                {
+                    return false;
+                }
+                if schema
+                    .get("required")
+                    .and_then(Value::as_array)
+                    .is_some_and(|required| {
+                        required
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .any(|key| !object.contains_key(key))
+                    })
+                {
+                    return false;
+                }
+                object.iter().all(|(key, value)| {
+                    properties
+                        .get(key)
+                        .is_none_or(|property| schema_accepts(root, property, value))
+                })
+            }
+            Some("string") => {
+                let Some(value) = candidate.as_str() else {
+                    return false;
+                };
+                let len = value.chars().count() as u64;
+                if schema
+                    .get("minLength")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|minimum| len < minimum)
+                    || schema
+                        .get("maxLength")
+                        .and_then(Value::as_u64)
+                        .is_some_and(|maximum| len > maximum)
+                {
+                    return false;
+                }
+                schema
+                    .get("pattern")
+                    .and_then(Value::as_str)
+                    .is_none_or(|pattern| regex::Regex::new(pattern).unwrap().is_match(value))
+            }
+            Some("integer") => {
+                let Some(value) = candidate.as_u64() else {
+                    return false;
+                };
+                !schema
+                    .get("minimum")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|minimum| value < minimum)
+                    && !schema
+                        .get("maximum")
+                        .and_then(Value::as_u64)
+                        .is_some_and(|maximum| value > maximum)
+            }
+            Some("boolean") => candidate.is_boolean(),
+            Some(_) => false,
+            None => true,
+        }
+    }
+
+    #[test]
+    fn orchestration_binding_transport_schemas_match_shared_corpus() {
+        let corpus: Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/orchestration_binding_v1.json"
+        )))
+        .expect("valid orchestration binding corpus");
+        let catalog: Value = serde_json::from_str(TOOL_SCHEMA_JSON).expect("valid tool schema");
+
+        for tool_name in ["delegate_to_agent", "continue_delegation"] {
+            let tool = catalog
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool["name"] == tool_name)
+                .unwrap();
+            let schema = &tool["inputSchema"];
+            assert!(
+                schema["properties"]["orchestration_binding"].is_object(),
+                "{tool_name} must publish orchestration_binding"
+            );
+            assert!(
+                !schema["required"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|required| required == "orchestration_binding"),
+                "{tool_name} binding must remain optional"
+            );
+
+            let omitted = if tool_name == "delegate_to_agent" {
+                json!({
+                    "agent_type": "grok",
+                    "task": "unbound first dispatch",
+                    "correlation_id": "binding-schema-omitted"
+                })
+            } else {
+                json!({
+                    "task_id": "source-task",
+                    "task": "unbound continuation",
+                    "correlation_id": "binding-schema-omitted"
+                })
+            };
+            assert!(schema_accepts(schema, schema, &omitted));
+
+            for case in corpus["cases"].as_array().unwrap() {
+                let mut input = omitted.clone();
+                input.as_object_mut().unwrap().insert(
+                    "orchestration_binding".into(),
+                    case["value"].clone(),
+                );
+                let expected = case["valid"].as_bool().unwrap();
+                assert_eq!(
+                    schema_accepts(schema, schema, &input),
+                    expected,
+                    "{tool_name} schema disagrees for {}",
+                    case["name"]
+                );
+                assert_eq!(
+                    serde_json::from_value::<OrchestrationBindingV1>(case["value"].clone())
+                        .is_ok_and(|binding| binding.validate().is_ok()),
+                    expected,
+                    "semantic validation disagrees for {}",
+                    case["name"]
+                );
+            }
+        }
     }
 
     fn assert_no_generic_coordination_side_channel_tools(names: &[String]) {
@@ -5432,6 +5727,266 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn orchestration_binding_query_catalog_requires_root_delegation_and_coordination() {
+        let production = CompanionFeatures {
+            delegation: true,
+            coordination_v1: true,
+            feedback: false,
+            ask: false,
+            sessions: false,
+            workflow_v2: false,
+            completion_v2: false,
+        };
+        let response = unwrap_respond(
+            dispatch_with_features(
+                production,
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+            )
+            .await,
+        );
+        let names: Vec<&str> = response.result.as_ref().unwrap()["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect();
+
+        assert!(
+            names.contains(&"get_delegation_orchestration_bindings"),
+            "production root catalog is missing the read-only binding query: {names:?}"
+        );
+        for retired in WORKFLOW_V2_TOOLS {
+            assert!(!names.contains(retired), "retired tool leaked: {retired}");
+        }
+
+        for features in [
+            CompanionFeatures {
+                delegation: false,
+                ..production
+            },
+            CompanionFeatures {
+                coordination_v1: false,
+                ..production
+            },
+        ] {
+            let hidden = list_tool_names(
+                dispatch_with_features(
+                    features,
+                    r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+                )
+                .await,
+            );
+            assert!(!hidden.contains(&"get_delegation_orchestration_bindings".into()));
+        }
+        let mut child = ctx_with(production);
+        child.role = CompanionRole::DelegationChild;
+        let hidden = list_tool_names(
+            dispatch_line(
+                &child,
+                Arc::new(InflightCalls::new()),
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+            )
+            .await,
+        );
+        assert!(!hidden.contains(&"get_delegation_orchestration_bindings".into()));
+
+        for retired in WORKFLOW_V2_TOOLS {
+            let call = json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": { "name": retired, "arguments": {} }
+            })
+            .to_string();
+            let response = unwrap_respond(dispatch_with_features(production, &call).await);
+            let error = response.error.expect("retired call is unavailable");
+            assert_eq!(error.code, -32602);
+            assert!(error.message.contains("unknown tool"));
+        }
+    }
+
+    #[tokio::test]
+    async fn orchestration_binding_query_raw_call_is_strict_and_structured_only() {
+        let production = CompanionFeatures {
+            delegation: true,
+            coordination_v1: true,
+            feedback: false,
+            ask: false,
+            sessions: false,
+            workflow_v2: false,
+            completion_v2: false,
+        };
+        let catalog = unwrap_respond(
+            dispatch_with_features(
+                production,
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+            )
+            .await,
+        );
+        let tools = catalog.result.unwrap()["tools"]
+            .as_array()
+            .unwrap()
+            .clone();
+        let schema = tools
+            .iter()
+            .find(|tool| tool["name"] == "get_delegation_orchestration_bindings")
+            .unwrap()["inputSchema"]
+            .clone();
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["required"], json!(["namespace"]));
+        assert_eq!(schema["properties"]["limit"]["default"], 100);
+        assert_eq!(
+            schema["dependentRequired"],
+            json!({
+                "snapshot_id": ["cursor"],
+                "cursor": ["snapshot_id"]
+            })
+        );
+
+        let descriptions = [
+            (
+                "register_simple_workflow",
+                ["register", "plan/progress"].as_slice(),
+            ),
+            (
+                "get_delegation_orchestration_bindings",
+                ["read-only", "parent-scoped", "snapshot"].as_slice(),
+            ),
+            (
+                "continue_delegation",
+                ["continue terminal task_id", "reuse child"].as_slice(),
+            ),
+        ];
+        for (name, phrases) in descriptions {
+            let description = tools
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .and_then(|tool| tool["description"].as_str())
+                .unwrap()
+                .to_ascii_lowercase();
+            for phrase in phrases {
+                assert!(description.contains(phrase), "{name} lost {phrase}");
+            }
+        }
+        let recovery = tools
+            .iter()
+            .find(|tool| tool["name"] == "request_recovery_authorization")
+            .unwrap();
+        assert!(recovery["inputSchema"]["properties"]["proposed_user_reason"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("reset_plan_lineage only"));
+
+        let page = json!({
+            "schema_version": 1,
+            "namespace": "brainstorm-to-delivery",
+            "snapshot_id": "1a641e16-36f4-4ec5-aa4f-18d18e6ab107",
+            "snapshot_revision": "0",
+            "snapshot_created_at": "2026-08-17T08:00:00Z",
+            "snapshot_expires_at": "2026-08-17T08:01:00Z",
+            "total_rows": 0,
+            "page_start": 0,
+            "request_cursor": null,
+            "runs": [],
+            "next_cursor": null,
+            "complete": true
+        });
+        let (socket_path, server) = orchestration_broker_with_outcome(page.clone());
+        let mut context = ctx_with(production);
+        context.socket_path = socket_path;
+        let call = json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "get_delegation_orchestration_bindings",
+                "arguments": { "namespace": "brainstorm-to-delivery" }
+            }
+        })
+        .to_string();
+        let LineAction::Spawn(spawned) =
+            dispatch_line(&context, Arc::new(InflightCalls::new()), &call).await
+        else {
+            panic!("valid query must reach the broker")
+        };
+        let response = spawned.future.await.response.unwrap();
+        server.await.unwrap();
+        let result = response.result.unwrap();
+        assert_eq!(result["structuredContent"], page);
+        assert_eq!(result["content"], json!([]));
+        assert_eq!(result["isError"], false);
+    }
+
+    #[tokio::test]
+    async fn orchestration_binding_query_invalid_public_calls_are_structured() {
+        let production = CompanionFeatures {
+            delegation: true,
+            coordination_v1: true,
+            feedback: false,
+            ask: false,
+            sessions: false,
+            workflow_v2: false,
+            completion_v2: false,
+        };
+        let snapshot_id = "1a641e16-36f4-4ec5-aa4f-18d18e6ab107";
+
+        for arguments in [
+            Value::Null,
+            json!({}),
+            json!({ "namespace": 7 }),
+            json!({
+                "namespace": "brainstorm-to-delivery",
+                "parent_conversation_id": 42
+            }),
+            json!({ "namespace": "Upper" }),
+            json!({ "namespace": "brainstorm-to-delivery", "limit": 0 }),
+            json!({ "namespace": "brainstorm-to-delivery", "limit": "100" }),
+            json!({ "namespace": "brainstorm-to-delivery", "snapshot_id": snapshot_id }),
+            json!({ "namespace": "brainstorm-to-delivery", "cursor": "abc" }),
+            json!({
+                "namespace": "brainstorm-to-delivery",
+                "snapshot_id": "not-a-uuid",
+                "cursor": "abc"
+            }),
+            json!({
+                "namespace": "brainstorm-to-delivery",
+                "snapshot_id": snapshot_id,
+                "cursor": "not+base64url"
+            }),
+            json!({
+                "namespace": "brainstorm-to-delivery",
+                "snapshot_id": snapshot_id,
+                "cursor": 7
+            }),
+            json!({
+                "namespace": "brainstorm-to-delivery",
+                "snapshot_id": null,
+                "cursor": null
+            }),
+        ] {
+            let invalid = json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "get_delegation_orchestration_bindings",
+                    "arguments": arguments
+                }
+            })
+            .to_string();
+            let response = unwrap_respond(dispatch_with_features(production, &invalid).await);
+            assert!(response.error.is_none());
+            let result = response.result.unwrap();
+            assert_eq!(result["isError"], true);
+            assert_eq!(
+                result["structuredContent"]["error"]["code"],
+                "orchestration_binding_query_invalid"
+            );
+            assert!(result["structuredContent"].get("runs").is_none());
+        }
+    }
+
+    #[tokio::test]
     async fn grok_tools_list_excludes_companion_ask_and_stays_within_fixed_stdio_budget() {
         let response = unwrap_respond(
             dispatch_with_features(
@@ -5458,12 +6013,14 @@ mod tests {
             "Grok tools/list line is {} bytes; fixed host-safe limit is 7680 bytes",
             line.len(),
         );
-        // Root + coordination_v1 + workflow_v2: reply + authorization + five workflow tools.
+        // Root + coordination_v1 + workflow_v2: binding query, reply,
+        // authorization, and five historical workflow tools.
         assert_eq!(
             names,
             vec![
                 "delegate_to_agent",
                 "register_simple_workflow",
+                "get_delegation_orchestration_bindings",
                 "continue_delegation",
                 "get_delegation_status",
                 "cancel_delegation",

@@ -13,19 +13,27 @@ Cards, or platform-owned completion evidence.
 
 ## Executive Decision
 
-Simple remains the only writable brainstorm-to-delivery mode. Its durable
-coordination surfaces remain the Brainstorm/Design, Implementation Plan,
-progress ledger, Git repository, and generic delegation runs.
+Simple remains the only writable brainstorm-to-delivery mode. Its coordination
+surfaces remain the Brainstorm/Design, Implementation Plan, progress ledger,
+Git repository, and generic delegation runs. Routed Task runs additionally
+carry an immutable generic orchestration binding. This binding supplies the
+durable historical reference that mutable Plan and progress documents cannot
+provide; it is run identity, not a platform-owned Simple admission Gate.
 
-The workflow gains four behaviors:
+The workflow gains five behaviors:
 
 1. The Grok-specific implementation role becomes a user-selectable **Task
    Agent** role. Grok remains the default.
 2. A dedicated Codex Plan Author writes and revises the Implementation Plan.
 3. Dedicated Codex document producers are separate from Codex document
-   reviewers. The parent orchestrator no longer edits Design or Plan content.
+   reviewers. The parent orchestrator coordinates but does not author or edit
+   Design, Plan, Skill prose, validator/test sources, or Task implementation.
 4. `b2d_task_risk_v1` selects a normal or high Task route. High Tasks force
    Codex implementation and use Codex plus Task Agent review.
+5. The validator derives a versioned route fingerprint for each Plan Task. The
+   parent copies the validator's exact `orchestration_binding` into every
+   routed Task delegation, and the generic run store preserves it across
+   continuation and replacement.
 
 ```text
 completed Brainstorm
@@ -44,8 +52,9 @@ completed Brainstorm
 
 The parent orchestrator selects and dispatches roles, reconciles files and
 generic runs, adjudicates findings against repository evidence, updates the
-progress ledger, and controls delivery. It does not write Design, Plan, or Task
-implementation content.
+progress ledger, and controls delivery. It does not author or edit Design,
+Plan, Skill prose, validator/test sources, or Task implementation; those
+artifacts remain owned by their independent producer work units.
 
 ## Goals
 
@@ -64,7 +73,17 @@ implementation content.
 - Keep Simple's non-blocking platform projection and generic delegation
   recovery model.
 - Make routing, recovery, and Task-Agent changes machine-checkable through
-  bounded Plan and progress contracts.
+  bounded Plan, progress, and parent-scoped durable-run evidence contracts.
+- Prevent a coordinated Plan/progress rewrite from changing the route or Task
+  Agent generation of a Task that has any admitted durable run.
+- Preserve the validator-derived workflow generation and route fingerprint in
+  generic run identity before child spawn or resume side effects.
+- Prove that the durable run's actual Agent and profile match the planned route
+  rather than trusting only the caller-supplied binding and mutable mirrors.
+- Discover recognized Task rows across binding namespaces so a wrong namespace
+  cannot hide admitted work after its progress mirror is removed.
+- Recover a committed reservation whose acknowledgement was lost only by
+  adopting one exact, unambiguous unresolved dispatch intent.
 
 ## Non-Goals
 
@@ -77,9 +96,15 @@ implementation content.
 - Silently substituting another Agent when the selected Task Agent is
   unavailable.
 - Supporting an Agent handoff inside an active Task.
+- Reusing the ACP launch/config `delegation_task_runs.route_fingerprint` for
+  workflow orchestration identity.
+- Backfilling or guessing orchestration bindings for historical runs.
+- Making Rust Simple projection the owner of route admission, completion, or
+  recovery decisions.
 - Restoring Plan finding-owner subsets, scoped reviewer cohorts, stagnation
   counters, or automatic holistic Plan rewrites.
-- Changing standalone delegation outside brainstorm-to-delivery.
+- Changing standalone/ad-hoc delegation behavior when the optional binding is
+  omitted.
 
 ## Terminology
 
@@ -90,6 +115,34 @@ reviewer for high Tasks. Grok is the default, not a special role.
 **Task Agent generation** is a monotonically increasing selection record. Each
 Task references exactly one generation. Changing the selection appends a new
 generation for pending Tasks and never rewrites prior Task identity.
+
+**Orchestration binding** is the optional, versioned generic delegation input
+and immutable durable run identity `{schema_version, namespace, generation,
+route_fingerprint}`. For this workflow its namespace is
+`brainstorm-to-delivery`, its generation is the Plan Task's Task Agent
+generation, and its fingerprint covers the complete derived Task route.
+
+**Orchestration route fingerprint** is the lowercase `sha256:<64 hex>` digest
+derived by the Node validator from canonical Task route input. It is distinct
+from `delegation_task_runs.route_fingerprint`, which identifies the ACP
+launch/config snapshot used for session reuse.
+
+**Durable binding snapshot** is a complete, parent-scoped read-only view of all
+runs bound to the requested namespace plus every keyed run that could conflict
+with that workflow, regardless of binding namespace. It includes actual
+Agent/profile, current status, lineage, and orchestration binding, contains no
+task prompt or child output, and is supplied to the validator for an
+execution-admission decision.
+
+**Unresolved dispatch intent** is one progress run entry written before a
+first dispatch, continuation, or replacement call. It records the exact route,
+binding, operation kind, and expected source lineage but has no returned Task
+or child identity. It can be reconciled once from a uniquely matching durable
+row after acknowledgement loss; it is not itself evidence of admission.
+
+**Admitted Task run** is a generic delegation run for which the reserving row
+exists. `reserving`, `running`, and every terminal status are admitted states;
+a pre-reservation tool failure is not admitted.
 
 **Primary reviewer** is the independent Codex Task reviewer required for both
 normal and high Tasks.
@@ -102,7 +155,8 @@ producer may continue its own work unit for revisions but cannot review or
 approve its own artifact.
 
 **Parent orchestrator** is the root conversation running the Skill. It owns
-coordination and adjudication, not document or Task production.
+coordination, progress updates, and adjudication, not Design, Plan, Skill
+prose, validator/tests, or Task production.
 
 ## System Invariants
 
@@ -113,8 +167,10 @@ coordination and adjudication, not document or Task production.
 4. A Task Agent generation is immutable once any Task referencing it is
    admitted.
 5. A Task's risk, producer route, and reviewer slots are fixed at admission.
-6. A Task Agent selection change can affect only pending Tasks after a Task
-   boundary and a newly reviewed Plan revision.
+6. A Task Agent selection change appends a generation and can affect only
+   never-admitted pending Tasks after a Task boundary and a newly reviewed Plan
+   revision. No Plan/progress rewrite can redefine an existing durable
+   binding.
 7. Distinct work-unit keys cannot share a child conversation ID. A continuation
    reuses only its own work unit's child conversation.
 8. Consequently, the Design Fixer, Plan Author, Task producers, document
@@ -127,10 +183,27 @@ coordination and adjudication, not document or Task production.
     latest producer result.
 12. Generic delegation continuation and replacement budgets remain
     authoritative for each stable work-unit lineage.
-13. Plan/progress/run disagreement creates a platform reconciliation warning,
-    not a platform admission gate. The Skill still fails closed before an
-    invalid route is dispatched.
-14. Requirement, scope, architecture, or user-data decisions remain owned by
+13. Every routed Task dispatch, continuation, or replacement uses the exact
+    binding emitted by deterministic validation. Continuations and
+    replacements inherit the source binding, and an explicit mismatch is
+    rejected before side effects or recovery-budget consumption.
+14. An orchestration binding is written in the reserving transaction and is
+    immutable after insert. Lifecycle and status updates cannot alter it.
+15. Before a workflow action that could dispatch, continue, recover, resume
+    after compaction, or change Task Agent selection, the Skill obtains a
+    complete fresh durable binding snapshot and fails closed on any missing,
+    extra, malformed, stale, truncated, or inconsistent evidence.
+16. A durable run's actual Agent/profile must agree with its canonical key,
+    Plan route, and progress mirror. Rows with recognized Task keys are
+    discoverable and validated even when bound to another namespace.
+17. A lost acknowledgement may fill missing Task/child identity only from one
+    unresolved intent and one uniquely matching durable row under the
+    operation-specific lineage rules. No intent means no adoption, so deleting
+    a progress mirror always remains an error.
+18. Plan/progress/run disagreement may create bounded Rust Simple projection
+    warnings, but never a platform admission Gate. The Skill and Node
+    validator own the fail-closed execution decision.
+19. Requirement, scope, architecture, or user-data decisions remain owned by
     the user. Agents may not infer a material change from a review finding.
 
 ## Role Contract
@@ -159,7 +232,9 @@ re-review continues the same Reviewer work units.
 The Plan Author is the only role that creates or edits the Plan. Its first
 prompt requires it to invoke and follow `writing-plans`. A review-driven Plan
 revision continues the same Author work unit. The parent may update progress
-and adjudication notes but cannot patch Plan content.
+and adjudication notes but cannot patch Plan content. The same coordination-only
+boundary prohibits the parent from authoring or editing Design, Skill prose,
+validator/test sources, or Task implementation.
 
 Plan re-review remains deliberately Simple: the same independent document
 Reviewer work units review the complete latest Plan after every revision until
@@ -221,19 +296,31 @@ The initial result is generation 1 and is supplied to the Plan Author.
 A Task Agent change is legal only when no Task is active and every prior Task
 is completed. The change procedure is:
 
-1. Record the requested Agent/profile and next generation in the progress
-   ledger as a pending route-change intent.
-2. Confirm the Agent and profile are available.
-3. Continue the Plan Author with a brief that appends the generation and
-   rewrites only pending Task routes.
-4. Run the deterministic Plan/routing validator.
-5. Continue the Plan Reviewer for a full latest-Plan review.
-6. After approval, update pending progress entries and admit the next Task.
+1. Query every page of the current `brainstorm-to-delivery` durable binding
+   snapshot and run full admission validation against the current Plan and
+   progress. Any unavailable, incomplete, stale, unbound, or mismatched
+   evidence blocks the change.
+2. Prove from durable evidence, not progress alone, that every affected Task
+   is pending and has never had a reserving row. Then record the requested
+   Agent/profile and next generation in progress as a pending route-change
+   intent.
+3. Confirm the Agent and profile are available.
+4. Continue the Plan Author with a brief that appends the next contiguous
+   generation and rewrites only the never-admitted pending Task suffix.
+5. The Author runs Plan-only derivation; the parent reruns it, updates only the
+   affected pending progress entries from that exact output, runs combined
+   static validation, obtains a new complete durable snapshot, and passes full
+   admission validation. Only then does it continue the Plan Reviewer for a
+   full latest-Plan review.
+6. After approval, obtain another complete durable snapshot and run full
+   admission validation before admitting the next Task.
 
 Completed and previously admitted Tasks retain their original generation,
 route, work-unit keys, run history, and recovery consumption. An unresolved
 blocked Task stops serial execution and is not a boundary for changing its own
-Agent.
+Agent. A failed or canceled reserving row is still admission and permanently
+freezes that Task route; only a failure before the reserving insert leaves the
+Task eligible for a boundary change.
 
 A change requested during an active Task is deferred until that Task reaches a
 boundary. If the user requires an immediate switch, the workflow blocks; this
@@ -299,6 +386,8 @@ The Skill replaces `codeg-b2d-skill-contract-v1` with exactly one
 - `b2d_task_risk_v1`;
 - normal and high producer/reviewer routes;
 - reviewer slots;
+- validator-derived durable orchestration bindings and complete binding-query
+  reconciliation before routed execution or recovery;
 - serial Task execution and parallel high review fan-out;
 - existing generic recovery limits; and
 - independent Codex final review.
@@ -375,7 +464,167 @@ Normal and high routes are derived rather than freely chosen.
 
 Plan Task bodies retain concise human-readable risk reasoning and evidence for
 review. There is no second Markdown routing matrix; avoiding duplicate
-machine-readable sources prevents drift.
+machine-readable sources prevents drift. The Plan does not hand-author an
+orchestration fingerprint. The validator derives it from the accepted routing
+block so the parent never has a second hashing implementation.
+
+### Generic orchestration binding v1
+
+`delegate_to_agent` and `continue_delegation` accept an optional
+`orchestration_binding`. The exact v1 wire shape is:
+
+```json
+{
+  "schema_version": 1,
+  "namespace": "brainstorm-to-delivery",
+  "generation": 2,
+  "route_fingerprint": "sha256:b498416d87bf6ba928bd7ddb5f1a451daf82300584f3d40b606c3c56f169ba7a"
+}
+```
+
+The object is all-or-none and rejects unknown fields. `schema_version` is the
+integer `1`. `namespace` is an ASCII string matching
+`^[a-z][a-z0-9-]{0,63}$`; this workflow requires the exact value
+`brainstorm-to-delivery`. `generation` is an integer in
+`1..=4294967295`, matching the Plan's positive unsigned 32-bit Task Agent
+generation. `route_fingerprint` must match
+`^sha256:[0-9a-f]{64}$` exactly. Empty strings, uppercase hex, numeric strings,
+partial objects, additional properties, and out-of-range numbers are
+malformed.
+
+The database representation uses four new nullable columns on
+`delegation_task_runs`:
+
+```text
+orchestration_schema_version INTEGER NULL
+orchestration_namespace TEXT NULL
+orchestration_generation INTEGER NULL
+orchestration_route_fingerprint TEXT NULL
+```
+
+All four columns are null for an unbound legacy/ad-hoc run or all four contain
+one valid binding. They are separate from the existing ACP/config
+`route_fingerprint`. The migration performs no backfill. A database trigger
+rejects any post-insert change to any of the four columns, including clearing
+or adding a binding; run-store APIs also omit them from every update model.
+
+For a routed Task, the Node validator constructs the following exact
+positional JSON value after validating the Plan route and deriving every key:
+
+```json
+[
+  "codeg-b2d-route-binding-v1",
+  1,
+  "brainstorm-to-delivery",
+  7,
+  2,
+  "high",
+  ["codex", null],
+  [
+    ["primary", "codex", null],
+    ["auxiliary", "grok", null]
+  ],
+  [
+    "task|7|implementer|codex|none",
+    "task|7|reviewer|primary|codex|none",
+    "task|7|reviewer|auxiliary|grok|none"
+  ]
+]
+```
+
+The positions are, in order: domain/schema tag, schema version, namespace,
+Task index, Task Agent generation, risk level, implementer Agent/profile,
+ordered reviewer tuples, and ordered expected work-unit keys. Reviewer order
+is always primary then auxiliary; normal Tasks omit the auxiliary tuple and
+key. Profiles use JSON `null` when absent, while work-unit keys retain their
+canonical `none` token. Agent/profile values and keys are the exact validated
+wire strings, including their exact Unicode scalar values; visually equivalent
+composed and decomposed profile IDs remain distinct route identities. The array
+is serialized as RFC 8785 JSON Canonicalization Scheme JSON with no
+insignificant whitespace, encoded as UTF-8, hashed with SHA-256, encoded as 64
+lowercase hexadecimal characters, and prefixed with `sha256:`. Implementations
+must use the published cross-language vectors; they may not approximate the
+encoding with delimiter joins or independently selected object-key order.
+
+The resulting Task binding is:
+
+```json
+{
+  "schema_version": 1,
+  "namespace": "brainstorm-to-delivery",
+  "generation": 2,
+  "route_fingerprint": "sha256:b498416d87bf6ba928bd7ddb5f1a451daf82300584f3d40b606c3c56f169ba7a"
+}
+```
+
+Every implementer and reviewer run for that Task uses the same binding because
+the fingerprint commits to the entire route and all its work-unit keys. The
+validator emits this object; the parent copies that exact object into the tool
+call and progress. The parent and Plan Author do not recompute the hash.
+
+For a first `delegate_to_agent`, binding validation occurs before depth,
+recovery-budget, child allocation, spawn, or resume work. The binding is part
+of `ReservingRunInsert` and all four columns are written by the same
+transaction that claims the run in `reserving`. A failure rolls back the whole
+reservation; there is no post-spawn attachment window.
+
+That reserving row already stores the effective `agent_type` and `profile_id`
+used to build the launch configuration. They remain insert-fixed run identity:
+no lifecycle/status update model may alter them. The binding query returns
+these persisted fields directly, allowing the validator to prove the actual
+reserved route instead of assuming that possession of a planned fingerprint
+means the caller used its planned Agent/profile.
+
+For `continue_delegation`, the source row is loaded under the existing
+admission transaction. An omitted binding inherits the source binding. A
+supplied binding must equal the source in all four fields. A bound source can
+never continue unbound, and an unbound source cannot acquire a binding through
+continuation. Replacement admission applies the same rule to the replaced
+lineage before replacement eligibility, authorization consumption, budget
+preflight/charge, child allocation, or spawn. The replacement row copies the
+source binding even when the caller supplies the matching object. These rules
+apply to every continuation/replacement generation and preserve the existing
+stable lineage and recovery budgets.
+
+Transport parsing returns `orchestration_binding_invalid` for malformed or
+partial input. Continue/replacement admission returns
+`orchestration_binding_lineage_mismatch` when a well-formed explicit binding
+does not exactly match the source or attempts bound/unbound conversion. Both
+are stable typed errors. Neither path performs child side effects or consumes
+recovery authorization/budget.
+
+The effective binding also participates in idempotency. For an unbound request,
+the current seven-string request-fingerprint tuple remains unchanged for old
+clients and stored replay rows. For a bound request, the request fingerprint is
+SHA-256 over deterministic JSON for this exact string array:
+
+```json
+[
+  "delegation-request-v2",
+  "delegate_to_agent",
+  "Implement Task 7 from the reviewed Plan.",
+  "task|7|implementer|codex|none",
+  "",
+  "",
+  "",
+  "5ea0c72cf8b44015a7fe8e796a05dc22",
+  "1",
+  "brainstorm-to-delivery",
+  "2",
+  "sha256:b498416d87bf6ba928bd7ddb5f1a451daf82300584f3d40b606c3c56f169ba7a"
+]
+```
+
+After the v2 domain tag, positions retain the existing order: tool, NFC task
+text, work-unit key, replaced Task ID, replacement reason, continuation target
+Task ID, and lowercase ACP route fingerprint. The final four strings are the
+orchestration schema version, namespace, decimal generation, and route
+fingerprint. Continue and replacement fingerprint the inherited effective
+binding after source comparison, even when the caller omitted it. Therefore
+two otherwise identical calls with different orchestration bindings cannot
+alias, while an exact retry remains idempotent. Rust serializes this fixed
+string array with `serde_json::to_vec`, hashes the resulting UTF-8 bytes, and
+stores the existing unprefixed lowercase hexadecimal request digest.
 
 ### Progress contract
 
@@ -384,18 +633,479 @@ with current Simple projection. Each Task gains additive routing context:
 
 - `risk_level`;
 - `task_agent_generation`;
+- the validator-derived `route_fingerprint`;
 - the expected implementer and reviewer-slot work-unit keys; and
 - the existing actual `runs` list.
 
+A routed high-Task entry and its admitted implementer use this additive shape:
+
+```json
+{
+  "index": 7,
+  "status": "in_progress",
+  "risk_level": "high",
+  "task_agent_generation": 2,
+  "route_fingerprint": "sha256:b498416d87bf6ba928bd7ddb5f1a451daf82300584f3d40b606c3c56f169ba7a",
+  "expected_work_unit_keys": {
+    "implementer": "task|7|implementer|codex|none",
+    "reviewers": {
+      "primary": "task|7|reviewer|primary|codex|none",
+      "auxiliary": "task|7|reviewer|auxiliary|grok|none"
+    }
+  },
+  "runs": [
+    {
+      "role": "implementer",
+      "agent_type": "codex",
+      "profile_id": null,
+      "state": "running",
+      "work_unit_key": "task|7|implementer|codex|none",
+      "task_id": "6b228a7d-4ac9-4bc7-a16e-f4ecf6f0fd45",
+      "child_conversation_id": 931,
+      "task_agent_generation": 2,
+      "root_task_id": "6b228a7d-4ac9-4bc7-a16e-f4ecf6f0fd45",
+      "previous_task_id": null,
+      "lineage_root_task_id": "6b228a7d-4ac9-4bc7-a16e-f4ecf6f0fd45",
+      "generic_generation": 1,
+      "replaced_task_id": null,
+      "replacement_reason": null,
+      "dispatch_intent": {
+        "kind": "first",
+        "continuation_target_task_id": null,
+        "replacement_target_task_id": null,
+        "replacement_reason": null,
+        "expected_root_task_id": null,
+        "expected_lineage_root_task_id": null,
+        "expected_generic_generation": 1,
+        "expected_child_conversation_id": null,
+        "adopted_after_lost_acknowledgement": false
+      },
+      "orchestration_binding": {
+        "schema_version": 1,
+        "namespace": "brainstorm-to-delivery",
+        "generation": 2,
+        "route_fingerprint": "sha256:b498416d87bf6ba928bd7ddb5f1a451daf82300584f3d40b606c3c56f169ba7a"
+      }
+    }
+  ]
+}
+```
+
+Before every routed call, the parent appends one run entry with the exact
+`orchestration_binding`, canonical key, Agent/profile, role/slot, state
+`reserving`, null returned Task/child and durable lineage fields, and a
+`dispatch_intent`. It never repurposes an older entry for a new call. The
+intent object has exactly the fields shown above and uses these operation
+contracts:
+
+- `first` has null continuation/replacement targets, reason, expected root,
+  lineage root, and child; its expected generic generation is `1`;
+- `continue` records only `continuation_target_task_id`, plus the target row's
+  root, lineage root, child, and next generic generation;
+- `replacement` records only `replacement_target_task_id` and the exact
+  replacement reason, the replaced row's lineage root, generic generation `1`,
+  and null expected root/child because the backend allocates a new root and
+  child.
+
+The parent sets `adopted_after_lost_acknowledgement` to `false` initially.
+After a normal acknowledgement it fills `task_id`, `child_conversation_id`,
+`root_task_id`, `previous_task_id`, `lineage_root_task_id`,
+`generic_generation`, `replaced_task_id`, `replacement_reason`, and current
+state from durable truth. It retains the intent fields as operation history. A
+definitive pre-reservation failure may retain the intent entry with state
+`failed` and all returned/durable lineage fields null; it is not unresolved,
+is not adoption-eligible, is not admission, and does not freeze an otherwise
+pending Task after complete durable evidence confirms there is no row. Only an
+acknowledgement whose outcome is unknown remains in `reserving`. A row in any
+durable status is admission.
+
 The Plan block is authoritative for planned classification and routes. Progress
 mirrors the effective route so the parent can reconcile intent with actual
-runs after compaction. The validator rejects Plan/progress route disagreement.
-The platform parser may project disagreement as warning state; it never turns
-the routing metadata into a workflow gate.
+runs after compaction. The durable row is authoritative for historical
+admission identity, actual Agent/profile, and lineage. The validator rejects
+Plan/progress disagreement and any progress/durable absence or mismatch except
+the one exact lost-acknowledgement adoption defined below. Mutable progress
+cannot erase admission: a durable Task row missing from progress is an error,
+not evidence that the Task is pending, and the validator never invents an
+intent or mirror. The platform parser may project disagreement as warning
+state; it never turns the routing metadata into a workflow Gate.
 
 The existing Plan, progress-block, and progress-document size limits remain in
 force. A bounded routing-block limit is added and must fit within the Plan's
 existing 2 MiB limit.
+
+### Durable binding query and snapshot
+
+The MCP companion adds the exact read-only tool name
+`get_delegation_orchestration_bindings`. Parent identity comes from the MCP
+token and is never accepted as input, so one parent cannot enumerate another
+parent's runs. A first-page input is:
+
+```json
+{
+  "namespace": "brainstorm-to-delivery",
+  "limit": 100
+}
+```
+
+A later-page input is:
+
+```json
+{
+  "namespace": "brainstorm-to-delivery",
+  "limit": 100,
+  "snapshot_id": "1a641e16-36f4-4ec5-aa4f-18d18e6ab107",
+  "cursor": "page-100"
+}
+```
+
+`namespace` is required and uses the binding namespace grammar. `limit` is
+optional, defaults to 100, and is limited to `1..=200`. The first call omits
+both `snapshot_id` and `cursor`; every later page supplies both values from the
+previous response. Supplying only one, changing namespace or limit mid-scan,
+or using a token from another parent is a typed error. Repeating the same
+snapshot/cursor request before expiry idempotently returns the same page, so a
+lost response is recoverable; the validator still rejects duplicate pages in
+the assembled evidence file.
+
+The input object rejects additional properties. `snapshot_id` is a
+server-minted lowercase UUID string. `cursor` is an opaque base64url string of
+1 to 128 ASCII characters bound to parent, namespace, snapshot, and offset;
+callers never construct it. `snapshot_revision` in responses is an unsigned
+64-bit counter serialized as a 1-to-20 digit decimal string so Node never loses
+integer precision. Snapshot timestamps are UTC RFC 3339 strings.
+
+At the first call, the backend reads one parent-scoped database snapshot and
+materializes at most 4096 rows. The selected rows are (a) every row whose
+orchestration namespace equals the requested namespace and (b) every row with
+a non-null `work_unit_key`, regardless of whether its binding is null, uses the
+requested namespace, or uses another namespace. The union is deduplicated by
+`task_id` before applying the cap. Foreign-namespace unkeyed rows remain
+excluded. This conflict-set selection lets the validator detect both an
+unbound routed legacy run and a recognized B2D Task key bound to the wrong
+namespace even when mutable progress removed its mirror. The stable order is
+`(created_at, task_id)`. More than 4096 selected rows fails without returning a
+partial snapshot.
+
+The in-process snapshot has a 60-second expiry and captures a parent-scoped
+binding-evidence revision. Every parent run insert and durable status
+transition increments that revision. If the revision changes between pages, the
+token expires, the process restarts, or 60 seconds elapse, pagination returns
+`orchestration_binding_snapshot_stale`; the parent discards every collected
+page and restarts at page one. It never combines pages from different
+snapshots. This produces one stable view even while statuses or run sets are
+changing.
+
+Malformed cursor/snapshot requests return
+`orchestration_binding_query_invalid`; row-cap overflow returns
+`orchestration_binding_query_too_large`; database/materialization failures
+return `orchestration_binding_query_failed`; and expired, restarted, or
+revision-invalidated scans return `orchestration_binding_snapshot_stale`.
+Every error returns no partial page.
+
+Each successful page has this envelope:
+
+```json
+{
+  "schema_version": 1,
+  "namespace": "brainstorm-to-delivery",
+  "snapshot_id": "1a641e16-36f4-4ec5-aa4f-18d18e6ab107",
+  "snapshot_revision": "42",
+  "snapshot_created_at": "2026-08-17T08:00:00Z",
+  "snapshot_expires_at": "2026-08-17T08:01:00Z",
+  "total_rows": 1,
+  "page_start": 0,
+  "request_cursor": null,
+  "runs": [
+    {
+      "task_id": "6b228a7d-4ac9-4bc7-a16e-f4ecf6f0fd45",
+      "root_task_id": "6b228a7d-4ac9-4bc7-a16e-f4ecf6f0fd45",
+      "previous_task_id": null,
+      "lineage_root_task_id": "6b228a7d-4ac9-4bc7-a16e-f4ecf6f0fd45",
+      "replaced_task_id": null,
+      "replacement_reason": null,
+      "generic_generation": 1,
+      "work_unit_key": "task|7|implementer|codex|none",
+      "child_conversation_id": 931,
+      "agent_type": "codex",
+      "profile_id": null,
+      "status": "running",
+      "orchestration_binding": {
+        "schema_version": 1,
+        "namespace": "brainstorm-to-delivery",
+        "generation": 2,
+        "route_fingerprint": "sha256:b498416d87bf6ba928bd7ddb5f1a451daf82300584f3d40b606c3c56f169ba7a"
+      }
+    }
+  ],
+  "next_cursor": null,
+  "complete": true
+}
+```
+
+The identity fields, including required canonical `agent_type` and required
+nullable `profile_id`, are exact bounded durable values for the route actually
+reserved and launched rather than values decoded from the binding. Unknown,
+missing, or out-of-contract Agent/profile values make the evidence unusable.
+Status is the durable
+`reserving`, `running`, `completed`, `failed`, or `canceled` value at snapshot
+creation. `orchestration_binding` is null only for an unbound selected row.
+The response never returns Agent prompt text, task preview, result text,
+termination details, card summaries, profile configuration, or child output.
+
+Every page echoes the cursor used to request it as `request_cursor`: the first
+page has JSON `null`, and every later page contains the exact opaque cursor
+supplied in that request. A non-final page has a non-null `next_cursor`; the
+final page has `next_cursor: null`. Neither cursor is row identity or something
+the caller may derive.
+
+The parent preserves the raw page envelopes in an OS-temporary evidence JSON
+file with this exact wrapper:
+
+```json
+{
+  "schema_version": 1,
+  "pages": [
+    {
+      "schema_version": 1,
+      "namespace": "brainstorm-to-delivery",
+      "snapshot_id": "1a641e16-36f4-4ec5-aa4f-18d18e6ab107",
+      "snapshot_revision": "42",
+      "snapshot_created_at": "2026-08-17T08:00:00Z",
+      "snapshot_expires_at": "2026-08-17T08:01:00Z",
+      "total_rows": 0,
+      "page_start": 0,
+      "request_cursor": null,
+      "runs": [],
+      "next_cursor": null,
+      "complete": true
+    }
+  ]
+}
+```
+
+The evidence file is capped at 4 MiB. The validator requires identical
+snapshot metadata on all pages, first `page_start` zero, contiguous
+non-overlapping ranges, first `request_cursor: null`, and for every page after
+the first an exact byte-for-byte equality between its `request_cursor` and the
+preceding page's `next_cursor`. It also requires non-null outgoing cursors on
+non-final pages, `runs.length` totals matching `total_rows`, and exactly one
+final page with `complete: true` and `next_cursor: null`. Missing, duplicate,
+reordered, mixed, expired, or truncated pages and any cursor-chain tampering
+fail. The temporary file is not a workflow manifest or durable workflow
+artifact and is removed after validation.
+
+### Validator modes and durable reconciliation
+
+The validator retains three non-authorizing contract modes for repository
+tests, Plan bootstrap, and author feedback:
+
+- no arguments validates only `SKILL.md`;
+- `--plan FILE --plan-rel-path REL_PATH --derive-plan-routing --output-json`
+  validates the Skill, Plan headings, routing block, risk policy, routes, keys,
+  and canonical fingerprints without requiring progress or durable evidence;
+  it is the Plan-only bootstrap/derivation mode and always reports
+  `admission_authorized: false`;
+- `--plan FILE --progress FILE --plan-rel-path REL_PATH` validates static
+  Skill/Plan/progress structure and derives route bindings, but reports
+  `admission_authorized: false` because no durable evidence was checked. It may
+  add `--output-json`; without that flag it retains the existing readable
+  PASS/FAIL output.
+
+`--derive-plan-routing` requires `--output-json`, is mutually exclusive with
+`--progress`, `--document-admission`, `--admission`, and
+`--durable-evidence`, and cannot authorize a dispatch. Its structured output is
+the trusted source used to initialize progress after the Plan first appears;
+the parent never derives routing fields itself.
+
+Before a reviewed routing block and synchronized progress exist, document
+dispatches use this deterministic pre-route admission mode:
+
+```text
+validate-contract.mjs --document-admission \
+  --durable-evidence FILE --output-json
+```
+
+It validates the Skill and complete durable page set and authorizes only an
+unbound Design/Plan work unit when there is no bound or unbound recognized Task
+row. It does not derive a Task binding. Once a reviewed Plan and synchronized
+progress exist, every document, Task, final-review, continuation, recovery, and
+selection-change decision uses the full admission mode below with Skill, Plan,
+progress, and durable evidence together.
+
+Full routed execution uses this exact mode:
+
+```text
+validate-contract.mjs --plan FILE --progress FILE \
+  --plan-rel-path REL_PATH --admission \
+  --durable-evidence FILE --output-json
+```
+
+`--admission` requires both `--durable-evidence` and `--output-json`. Successful
+JSON has this exact success shape:
+
+```json
+{
+  "schema_version": 1,
+  "admission_authorized": true,
+  "durable_snapshot": {
+    "snapshot_id": "1a641e16-36f4-4ec5-aa4f-18d18e6ab107",
+    "snapshot_revision": "42"
+  },
+  "task_bindings": [
+    {
+      "task_index": 7,
+      "risk_level": "high",
+      "task_agent_generation": 2,
+      "expected_work_unit_keys": {
+        "implementer": "task|7|implementer|codex|none",
+        "reviewers": {
+          "primary": "task|7|reviewer|primary|codex|none",
+          "auxiliary": "task|7|reviewer|auxiliary|grok|none"
+        }
+      },
+      "orchestration_binding": {
+        "schema_version": 1,
+        "namespace": "brainstorm-to-delivery",
+        "generation": 2,
+        "route_fingerprint": "sha256:b498416d87bf6ba928bd7ddb5f1a451daf82300584f3d40b606c3c56f169ba7a"
+      }
+    }
+  ],
+  "reconciliation_actions": [],
+  "failures": []
+}
+```
+
+Plan-only and combined static JSON use the same shape with
+`admission_authorized: false`, `durable_snapshot: null`, and the derived
+`task_bindings`, including risk, generation, expected keys, and binding, plus
+an empty `reconciliation_actions`. Admission failure exits nonzero, emits
+`admission_authorized: false`, emits no usable `task_bindings` or actions, and
+returns `{rule_id, message}` objects in `failures`.
+The Skill selects the active Task entry and copies the binding field-for-field
+without reserialization assumptions or recomputation; it never hashes the Plan
+itself.
+
+Before constructing identity maps, full reconciliation performs one bounded
+lost-acknowledgement adoption pass. An unresolved intent is eligible only when
+its returned Task/child and durable lineage fields are all null, its state is
+`reserving`, its adoption flag is false, and its operation fields satisfy the
+progress contract. Candidate matching is one-to-one within the same
+Task/work-unit key and globally unambiguous: the whole progress ledger must
+contain exactly one eligible unresolved intent, the snapshot must contain
+exactly one otherwise-unmatched durable candidate for it, and neither side may
+have another possible match. Key, exact binding, actual Agent/profile, and
+recognized Plan role/slot must agree. The row may have any valid current
+durable status because progress `reserving` here means acknowledgement is
+unresolved, not that the durable lifecycle is still at its initial status;
+adoption copies the row's exact current status.
+
+The operation-specific lineage match is exact:
+
+- `first`: durable generic generation is `1`; `root_task_id` and
+  `lineage_root_task_id` both equal its new `task_id`; `previous_task_id`,
+  `replaced_task_id`, and replacement reason are null;
+- `continue`: `previous_task_id` equals the recorded continuation target;
+  root, lineage root, child, Agent/profile, key, and binding equal that existing
+  target row; generic generation is exactly the target generation plus one;
+  replacement fields are null;
+- `replacement`: `replaced_task_id` and reason equal the recorded target and
+  reason; generic generation is `1`; root equals the new `task_id`;
+  `previous_task_id` is null; lineage root, Agent/profile, key, and binding are
+  inherited from the replaced row, while the new child is not shared with the
+  replaced child.
+
+For one exact match, the validator, not the parent, decides every field to
+adopt. It returns exit zero, `admission_authorized: false`, no usable
+`task_bindings`, and exactly one deterministic action for the one-to-one match
+in this shape:
+
+```json
+{
+  "kind": "adopt_lost_acknowledgement",
+  "task_index": 7,
+  "progress_run_index": 0,
+  "task_id": "6b228a7d-4ac9-4bc7-a16e-f4ecf6f0fd45",
+  "child_conversation_id": 931,
+  "root_task_id": "6b228a7d-4ac9-4bc7-a16e-f4ecf6f0fd45",
+  "previous_task_id": null,
+  "lineage_root_task_id": "6b228a7d-4ac9-4bc7-a16e-f4ecf6f0fd45",
+  "generic_generation": 1,
+  "replaced_task_id": null,
+  "replacement_reason": null,
+  "work_unit_key": "task|7|implementer|codex|none",
+  "agent_type": "codex",
+  "profile_id": null,
+  "status": "running",
+  "orchestration_binding": {
+    "schema_version": 1,
+    "namespace": "brainstorm-to-delivery",
+    "generation": 2,
+    "route_fingerprint": "sha256:b498416d87bf6ba928bd7ddb5f1a451daf82300584f3d40b606c3c56f169ba7a"
+  }
+}
+```
+
+`progress_run_index` is zero-based in the validated Task's current `runs`
+array. The parent applies only these exact actions to the same still-matching
+progress snapshot, sets `adopted_after_lost_acknowledgement: true`, persists
+progress, obtains a new complete snapshot, and reruns full admission from the
+beginning. If progress changed before application, it discards the actions and
+revalidates. Adoption does not dispatch, retry, consume another budget, or
+create a durable row. Zero matches, multiple matches, cross-matches, missing
+source lineage, or any field disagreement blocks. Most importantly, an
+unmatched durable row with no pre-existing unresolved intent is never
+synthesized into progress: a genuinely deleted mirror still fails.
+
+After that optional pass, full reconciliation constructs maps by durable
+`task_id` and progress `task_id` and enforces both directions:
+
+1. Every admitted progress run has exactly one durable row. Every selected row
+   bound to this namespace, and every selected row with a recognized B2D Task
+   key regardless of namespace, has exactly one progress mirror. A candidate
+   adoption returns before this authorization pass and must be persisted and
+   revalidated first.
+2. Task ID, canonical work-unit key, child conversation ID, root, previous,
+   lineage root, generic generation, replacement link/reason, and current
+   status agree and are internally consistent. Progress `cancelled` normalizes to durable
+   `canceled`; `stalled` may match only durable `running`; `unknown` never
+   authorizes admission. If identity and binding already match and only a
+   legitimate durable lifecycle transition is newer, the parent first updates
+   the progress state from the query and reruns validation; it never rewrites
+   identity or binding to make a mismatch pass.
+3. The work-unit key belongs to the indexed Plan Task and to its exact derived
+   implementer/reviewer set. Role, reviewer slot, Agent, and profile encoded in
+   the key agree with progress, Plan, and the durable row's actual
+   `agent_type`/`profile_id`.
+4. Durable binding schema/namespace, Task Agent generation, and fingerprint
+   equal the validator-derived binding for that Plan Task and the progress
+   mirror.
+5. A selected unbound row whose work-unit key is a recognized Task key for the
+   routed Plan blocks as unverifiable. A recognized Task row bound to any
+   namespace other than `brainstorm-to-delivery` blocks even when progress has
+   no mirror. A requested-namespace bound row with no Plan Task or no progress
+   mirror is an unexpected extra row and also blocks.
+6. A new Task Agent generation is legal only for a pending Task suffix with no
+   durable row in any status. Historical bindings remain byte-for-byte
+   unchanged.
+
+The stable durable rule families are:
+
+| Rule ID | Condition |
+| --- | --- |
+| `B2D-DURABLE-001` | Evidence envelope/page set is malformed, incomplete, stale, oversized, or mixed |
+| `B2D-DURABLE-002` | Binding format, namespace, or canonical fingerprint is invalid |
+| `B2D-DURABLE-003` | An admitted progress run has no durable row |
+| `B2D-DURABLE-004` | A bound durable row is missing from progress or is outside the Plan |
+| `B2D-DURABLE-005` | Task, work-unit, child, lineage, actual Agent/profile, or status identity disagrees |
+| `B2D-DURABLE-006` | Durable and derived generation/fingerprint disagree |
+| `B2D-DURABLE-007` | A routed Plan Task has an admitted unbound run |
+| `B2D-DURABLE-008` | A generation change touches a durably admitted Task |
+| `B2D-DURABLE-009` | Lost-acknowledgement intent adoption is absent, ambiguous, repeated, or lineage-inconsistent |
+
+These validator failures are execution blockers even though any similarly
+named Rust Simple projection warning remains informational.
 
 ## Canonical Work-Unit Keys
 
@@ -429,41 +1139,89 @@ provides the stable slot identity.
 
 The parent reads repository instructions, Brainstorm, relevant code and tests,
 recent commits, user changes, live delegation schemas, and available Agents.
-It resolves the initial Task Agent before document work starts.
+It verifies that `get_delegation_orchestration_bindings` is available and can
+return a complete snapshot, then runs document-admission validation before
+document work starts and resolves the initial Task Agent. Before a routed Plan
+exists, a new workflow requires the namespace snapshot to contain no bound or
+unbound recognized Task row; an existing Task row without recovery documents
+blocks rather than being ignored.
 
 ### Review and revise Design
 
 When a Design trigger is present, the parent records review intent and
-dispatches the independent Design Reviewer. Valid non-material findings are
-consolidated into the Design Fixer brief. Material requirement, scope,
-architecture, or user-data changes pause for user decision before the Fixer is
-continued. The Design Reviewer re-reviews the latest file.
+obtains a complete binding snapshot, supplies it to document-admission
+validation, and then dispatches the independent Design Reviewer. Valid
+non-material findings are consolidated into the Design Fixer brief. Material
+requirement, scope, architecture, or user-data changes pause for user decision
+before the Fixer is continued. The parent obtains a fresh complete snapshot
+and repeats document-admission validation before every Fixer continuation and
+Design re-review. These document work units remain unbound because no Task
+route is being admitted.
 
 ### Author and review Plan
 
-The parent creates the initial progress document and records Plan Author
-intent. The independent Codex Plan Author invokes `writing-plans`, writes the
-Plan and routing block, validates them, and reports the result. The independent
-Plan Reviewer reviews task decomposition, risk evidence, routing, verification,
-and repository fit. Valid findings return to the same Plan Author work unit.
+After a complete binding query and document-admission validation, the parent
+creates only the initial bounded progress shell and records Plan Author intent.
+The independent Codex Plan Author invokes `writing-plans` and writes the Plan
+and routing block. Initial bootstrap then has this mandatory order:
 
-After Plan approval, the parent registers the Simple descriptor and syncs all
-Task entries into progress. Registration remains locator metadata rather than
-an execution gate.
+1. The Plan Author runs Plan-only `--derive-plan-routing --output-json` and
+   reports the result; no progress file is required by that mode.
+2. The parent reruns the same Plan-only command against the file on disk and
+   initializes every ordered progress Task from its exact risk, generation,
+   expected-key, and binding output. It supplies only deterministic progress
+   defaults (`pending`, null commit, and empty runs), with null active Task and
+   pending final review; it does not derive or alter route data.
+3. The parent runs combined static Plan/progress validation. A mismatch returns
+   to the Plan Author or is corrected only by resynchronizing progress from the
+   unchanged validator output; the parent never edits the Plan.
+4. The parent obtains a fresh complete durable snapshot and runs full admission
+   validation against the now-synchronized Plan and progress.
+5. Only after those checks pass does it dispatch the independent Plan Reviewer,
+   which reviews task decomposition, risk evidence, routing, verification, and
+   repository fit.
+
+A fresh complete query and applicable document/full admission validation
+precedes every Author continuation and reviewer continuation. Valid findings
+return to the same Plan Author work unit. After every Author revision, the
+Author and parent repeat Plan-only derivation, the parent synchronizes only
+never-admitted affected progress entries from the exact output, then combined
+static and full durable admission must pass before re-review. These document
+runs remain unbound.
+
+After Plan approval, the parent registers the Simple descriptor, obtains a new
+complete snapshot, and reruns full admission validation. Task entries were
+already initialized before review, so approval does not introduce a second
+bootstrap source. Registration remains locator metadata rather than an
+execution Gate.
 
 ### Execute Tasks serially
 
-Immediately before each Task, the parent applies the existing workspace gate
-and validates the latest Plan/progress pair.
+Immediately before each Task and before each individual delegation action
+inside it, the parent applies the existing workspace gate, exhausts every page
+of a fresh binding snapshot, and runs full Plan/progress/durable admission
+validation. It records the run intent with the emitted binding and passes the
+exact same object to `delegate_to_agent`, `continue_delegation`, or a
+replacement call. After acknowledgement it records the returned Task and child
+identities, actual Agent/profile, lineage, and durable status in progress. If
+acknowledgement is lost after reservation, it obtains a fresh snapshot and runs
+the one-time intent-adoption procedure before any retry or recovery action.
+Any intervening delegation action invalidates the prior snapshot, so the next
+action requeries.
 
 For a normal Task, it dispatches or continues the Task Agent implementer,
 checks the report and repository state, then dispatches the Codex primary
-reviewer.
+reviewer. Both use the Task's single derived binding.
 
 For a high Task, it dispatches or continues the Codex implementer, checks the
-report and repository state, records both review intents, dispatches primary
-and auxiliary reviewers as separate work units, and joins both. Their review
-runs may execute concurrently; the next Task cannot start until both settle.
+report and repository state, then admits primary and auxiliary reviewers as
+separate work units. It records the primary intent immediately before that
+call, waits for its acknowledgement or exact adoption, obtains a fresh query
+and validation, then records and dispatches the auxiliary intent. No future
+intent is left in `reserving` while an earlier action is being admitted. Once
+both are durably admitted, their child runs may execute concurrently and the
+parent joins both. All three work units use the same Task binding. The next
+Task cannot start until both reviews settle.
 
 Critical and Important findings return in one adjudicated producer brief.
 After a fix, every reviewer required by that Task route re-reviews the latest
@@ -472,27 +1230,50 @@ result. Retained Minor findings require a recorded reason.
 ### Verify and deliver
 
 After all Tasks pass their routes, the parent runs scope-appropriate test,
-lint, build, and project checks. It then dispatches a fresh Codex final
-reviewer. Final fixes return to owning Task producer work units and reopen the
-affected Task review plus final review. Delivery is complete only from current
-repository evidence, covering verification, and approved final review.
+lint, build, and project checks. It obtains a fresh complete binding snapshot
+and full validation before dispatching a fresh Codex final reviewer. The final
+review work unit remains unbound because it is not a Plan Task route. Final
+fixes return to owning Task producer work units with that Task's exact durable
+binding and reopen the affected Task review plus final review. Delivery is
+complete only from current repository evidence, covering verification,
+durable reconciliation, and approved final review.
 
 ## Recovery and Error Handling
 
 Every first run uses `delegate_to_agent`; later work on the same unit uses
 `continue_delegation`. The existing limits remain two unexpected
 continuations and one logical replacement per established lineage, with
-pre-admission retries retaining current semantics.
+pre-admission retries retaining current semantics. Routed Task continuations
+and replacements inherit the source orchestration binding regardless of what
+mutable documents currently claim.
 
 After compaction, interruption, or resume, the parent re-reads the Design,
 Plan, routing block, progress, reports, Git state, and live generic run state.
-It treats remembered routing as provisional until those sources agree.
+It obtains every page of a new durable binding snapshot before status polling,
+continuation, replacement, recovery authorization, or another dispatch, then
+first attempts only the exact one-time adoption of any unresolved
+acknowledgement intent, then synchronizes status-only lifecycle advances into
+progress and runs full admission validation. Adoption persists the complete
+durable identity and forces a fresh query/validation; it does not trigger an
+idempotent replay. If there is no uniquely matching unresolved intent, the
+unmatched row blocks and the parent does not manufacture recovery state.
+`get_delegation_status` remains useful for task reports, but cannot substitute
+for the binding query because it does not expose work-unit or orchestration
+identity. Remembered routing and a retained report are provisional until all
+sources agree.
 
 The workflow blocks without substitution when:
 
 - the selected Task Agent or profile is unavailable;
+- the binding query/tool is unavailable or returns a DB error;
+- pagination is incomplete, truncated, mixed, expired, stale, oversized, or
+  otherwise not a complete snapshot;
 - the routing block is absent, malformed, oversized, or inconsistent;
 - risk signals, evidence, score, level, or derived route are invalid;
+- an expected durable row is missing, an extra bound row exists, a recognized
+  Task row uses the wrong namespace, a routed run is unbound, intent adoption
+  is absent or ambiguous, or any Task/work-unit/child/lineage/status/actual
+  Agent/profile/generation/fingerprint differs;
 - a producer and reviewer share a child conversation;
 - a high Task lacks either reviewer slot;
 - a Task Agent change touches an active, completed, or previously admitted
@@ -501,26 +1282,58 @@ The workflow blocks without substitution when:
 - a requested active-Task Agent handoff cannot be represented safely; or
 - generic continuation or replacement rails are exhausted.
 
-Plan/progress/durable-run mismatches that affect display still produce Simple
-projection warnings. They do not authorize the Skill to bypass an invalid
-route, generic identity rule, or recovery budget.
+The Skill never falls back to Plan/progress-only execution. It restarts a stale
+query from page one, but a repeated query failure remains a blocker rather than
+permission to continue. Plan/progress/durable-run mismatches may also produce
+Simple projection warnings for display; those warnings do not authorize the
+Skill to bypass an invalid route, generic identity rule, or recovery budget.
 
 ## Backend and Projection Changes
 
-This design requires bounded backend support for the expanded Simple key
-vocabulary, not a new workflow state machine:
+This design adds durable generic run identity and bounded read access, not a
+new workflow state machine:
 
-- recognize Design Fixer keys;
-- recognize explicit primary and auxiliary Task reviewer keys;
-- preserve legacy five-part Task reviewer parsing;
-- include reviewer slot in parsed identity and synthetic Simple node identity;
-- project simultaneous primary and auxiliary reviewer runs as separate nodes;
-- parse additive progress route metadata for reconciliation warnings where
-  useful; and
-- keep all routing discrepancies non-blocking at the platform layer.
+- `src-tauri/src/acp/delegation/types.rs` adds the strictly validated
+  `OrchestrationBindingV1` to
+  `DelegationRequest` and `ContinueDelegationRequest`, plus query request/page
+  DTOs and stable malformed/mismatch error codes;
+- `src-tauri/src/acp/delegation/tool_schema.json`, companion
+  dispatch/rendering, and `src-tauri/src/acp/delegation/listener.rs` parsing
+  expose the binding on both delegation tools and add
+  `get_delegation_orchestration_bindings` with no caller-supplied parent ID;
+- the broker validates first-dispatch bindings, resolves the effective source
+  binding for continuation/replacement, and rejects mismatches before child or
+  recovery side effects;
+- `src-tauri/src/acp/delegation/run_store.rs` includes the four binding fields in
+  `ReservingRunInsert`/`PersistedRun`, writes them in the reserving transaction,
+  incorporates the effective binding into v2 request fingerprints, and never
+  includes them in lifecycle update sets;
+- the `src-tauri/src/db/entities/delegation_task_run.rs` SeaORM entity and new
+  `src-tauri/src/db/migration/m20260817_000001_delegation_orchestration_bindings.rs`
+  migration add four nullable columns, an all-or-none insert trigger named
+  `trg_dtr_orchestration_binding_shape`, an update trigger named
+  `trg_dtr_orchestration_binding_immutable`, and the index
+  `(parent_conversation_id, orchestration_namespace, created_at, task_id)`
+  without guessed backfill;
+- the parent-scoped query materializes bounded, revision-stable pages and
+  returns only run identity (including actual Agent/profile and lineage),
+  status, and binding; its selected conflict set unions requested-namespace
+  rows with every keyed row across namespaces, and every page echoes its
+  request cursor;
+- existing Simple parsing still recognizes Design Fixer keys, explicit primary
+  and auxiliary reviewer keys, and legacy five-part primary reviewer keys; and
+- projection may add bounded warning codes
+  `simple_orchestration_binding_missing`,
+  `simple_orchestration_binding_mismatch`, and
+  `simple_orchestration_binding_orphan`, while preserving separate high-Task
+  nodes and warning-only sync state.
 
-No new database table, workflow header, manifest revision, gate cycle, or
-completion evidence row is introduced.
+The migration changes an existing generic run table but introduces no new
+database table, workflow header, manifest revision, Gate cycle, gate
+settlement, completion Card/evidence row, or platform completion decision.
+Rust Simple projection observes and warns; it does not authorize or reject a
+Task route. Generic transport may reject malformed input or a source-lineage
+mismatch because those are run identity violations, not Simple platform Gates.
 
 ## Skill and Validator Changes
 
@@ -528,8 +1341,20 @@ completion evidence row is introduced.
 
 - resolve the Task Agent from the invocation with Grok default;
 - dispatch independent Design Fixer, Plan Author, and document reviewers;
-- prohibit parent Design and Plan edits;
+- prohibit parent authorship or edits of Design, Plan, Skill prose,
+  validator/tests, and Task implementation while allowing coordination and
+  progress updates;
 - require `b2d_task_risk_v1` evidence and derived routes;
+- call `get_delegation_orchestration_bindings` to exhaustion before every
+  dispatch, continuation, recovery, compaction resume, and selection change;
+- treat query unavailability, stale/incomplete evidence, and every durable
+  mismatch as blocking without Plan/progress fallback;
+- initialize progress through non-authorizing Plan-only derivation before
+  combined static and full admission validation;
+- consume the validator's exact binding output for routed Task calls and
+  progress mirrors rather than independently hashing;
+- record operation-specific dispatch intents and adopt a lost acknowledgement
+  only through the exact one-to-one durable reconciliation rule;
 - execute normal and high routes exactly;
 - support boundary-only Task Agent changes;
 - make both high reviewers stale after every producer mutation;
@@ -543,83 +1368,208 @@ The JavaScript validator will add deterministic parsers and checks for:
 - Task Agent generations;
 - hard and soft risk arithmetic;
 - normal/high route derivation;
+- RFC 8785 canonical route fingerprint derivation and JSON output;
+- strict binding and durable-snapshot parsing with byte/row/page bounds;
+- Plan-only routing derivation for initial progress bootstrap;
 - primary/auxiliary reviewer keys;
-- Plan/progress agreement;
+- requested-namespace plus cross-namespace keyed-row discovery, exact cursor
+  chains, actual Agent/profile proof, and Plan/progress/durable agreement in
+  both directions;
+- one-time first/continue/replacement intent adoption with exact lineage and
+  ambiguity rejection;
 - per-key lineage stability;
 - producer/reviewer conversation independence when IDs are known; and
-- boundary-only pending-Task route changes.
+- boundary-only changes limited to never-admitted pending Tasks.
+
+Static Skill-only and document-only entry points remain usable without a live
+database, but their output explicitly cannot authorize execution. Only
+document-admission or full `--admission` with a complete current durable
+snapshot can return `admission_authorized: true`.
 
 ## Testing
 
-### Skill and document contract tests
+### Binding and validator tests
 
-- Missing Task Agent selection resolves to Grok.
-- Every supported built-in and valid `custom:*` identity can be selected.
-- Invalid, ambiguous, or unavailable selections never silently fall back.
-- Skill prose cannot restore a Grok-only implementer contract.
-- Parent Design/Plan writing language is rejected.
-- Plan Author, Design Fixer, and document reviewers use the required keys.
-- User-named document reviewers remain optional and cannot enter Task or final
-  review roles.
-- Every hard trigger forces high.
-- Soft scores 0 through 2 are normal; 3 and above are high.
-- Unknown, duplicate, contradictory, or evidence-free signals fail.
-- Normal and high routes contain exactly the required roles.
-- A Task-Agent generation change rewrites pending routes only.
-- Plan/progress mismatch fails deterministic document validation.
+- Shared JSON fixtures exercise valid minimum/maximum generations, namespace
+  boundaries, and exact lowercase fingerprints across MCP JSON Schema,
+  listener deserialization, Rust validation, and Node validation. Negative
+  vectors cover missing/extra fields, partial bindings, wrong types, zero and
+  overflow generation, empty/oversized/invalid namespace, uppercase or
+  wrong-length hex, and invalid prefix.
+- The canonical high-Task vector in this Design hashes to
+  `sha256:b498416d87bf6ba928bd7ddb5f1a451daf82300584f3d40b606c3c56f169ba7a`
+  in Node and the independent Rust test helper. Normal/high vectors, exact
+  Unicode strings, composed/decomposed profile distinctions,
+  null/profile values, custom Agents, and maximum Task indices prove
+  deterministic output. Reordering reviewer slots or work-unit keys, changing
+  risk, Agent/profile, Task index, or generation must change the digest;
+  irrelevant JSON object insertion order cannot.
+- Static Skill-only, Plan-only derivation, and combined Plan/progress CLI modes
+  remain usable and explicitly return `admission_authorized: false`. Plan-only
+  derivation rejects progress/admission flags and emits exact risk, generation,
+  keys, and binding output. Admission mode rejects a missing, expired,
+  malformed, oversized, mixed, non-contiguous, incomplete, or cursor-tampered
+  durable snapshot.
+- An end-to-end initial bootstrap test starts with a progress shell that has no
+  Tasks, has the Plan Author write the first Plan, runs Plan-only derivation,
+  initializes progress from an independent parent rerun, passes combined
+  static and full empty-snapshot admission, and only then admits Plan review.
+  Requiring combined validation before initialization must fail, proving the
+  sequence has no circular dependency.
+- Document-admission mode authorizes unbound Design/Plan work only with a
+  complete empty Task evidence set and rejects either a bound or unbound
+  recognized Task row before reviewed route documents exist.
+- Durable reconciliation has strict negatives for a missing/deleted progress
+  mirror, fabricated Task ID, wrong child conversation, wrong work-unit key,
+  wrong current status, wrong lineage, wrong generation, wrong fingerprint,
+  duplicate or unexpected extra durable row, and a routed admitted run whose
+  durable binding is null. Wrong durable actual Agent and wrong durable actual
+  profile fail for first dispatch, continuation, and replacement even when
+  Plan, progress, binding, and canonical key otherwise agree.
+- A recognized Task key bound to another valid namespace blocks in both
+  document and full admission. A regression deletes its mutable progress
+  mirror and proves the cross-namespace keyed conflict row is still discovered
+  and rejected; foreign unkeyed rows remain outside the selected set.
+- Lost-response fixtures cover first dispatch, continuation, and replacement.
+  Each exact one-intent/one-row case adopts the returned identity once, marks
+  reconciliation, requeries, and passes; zero-candidate, two-candidate,
+  cross-matched, wrong-source, wrong-lineage, wrong-status-state, wrong actual
+  Agent/profile, and repeated-adoption cases fail with `B2D-DURABLE-009`. The
+  deleted-mirror fixture has no unresolved intent and must still fail rather
+  than synthesize one.
+- The exact root-cause regression rewrites the Plan Task generation/route,
+  rewrites progress Task generation/fingerprint and every mirrored run
+  binding, and keeps the retained admitted high-Task Codex implementer durable
+  row at its original generation/fingerprint. Validation must fail with a
+  `B2D-DURABLE-*` identity rule even though the generation-invariant Codex
+  implementer work-unit key still matches.
+- Legal controls append a generation only for a never-admitted pending suffix,
+  keep all earlier durable rows unchanged, and pass. A reserving, failed,
+  canceled, running, or completed row on any affected Task makes the same
+  change fail.
+- Existing contract cases retain Grok defaulting, all supported built-in and
+  valid `custom:*` selection, no silent fallback, producer/reviewer
+  independence, risk arithmetic, exact normal/high routes, explicit reviewer
+  slots, legacy five-part primary readability, and Plan/progress checks.
 
-### Rust unit and projection tests
+### Rust transport, store, query, and projection tests
 
-- New Design Fixer and slotted reviewer keys round-trip canonically.
-- Legacy Task reviewer keys parse as primary.
-- Primary and auxiliary Codex reviewers remain distinct with identical
-  profiles.
-- Invalid slot, path, Agent, profile, index, or control characters fail.
-- Simple observation recognizes new keys without creating a workflow header.
-- Simple projection renders high producer and both reviewers independently.
-- Routing disagreement remains a warning rather than an admission failure.
+- Migration/entity round trips cover a valid binding, all-null legacy rows,
+  all-or-none rejection, no guessed backfill, exact separation from ACP
+  `route_fingerprint`, lookup indexing, and the database immutability trigger.
+- MCP schema and listener tests accept valid optional bindings on delegate and
+  continue, reject malformed values with `orchestration_binding_invalid`, and
+  expose the exact query tool and page fields. Parent isolation proves a token
+  cannot supply or infer another parent ID.
+- First dispatch persists the binding in the same reserving transaction before
+  spawn. Transaction rollback leaves no partial binding/run, and fault
+  injection proves no post-insert lifecycle/status path can mutate the four
+  binding fields or the insert-fixed actual Agent/profile identity.
+- Bound request fingerprints separate different generation/fingerprint values,
+  preserve exact idempotent replay, use the effective inherited binding, and
+  leave the existing unbound seven-field fingerprint behavior unchanged.
+- Continue inherits when omitted, accepts an exact explicit match, and rejects
+  mismatch or bound/unbound conversion before resume, child side effects,
+  authorization use, or budget consumption. Replacement has the same cases,
+  copies the replaced lineage binding, and rejects before eligibility side
+  effects or recovery-budget consumption.
+- Query tests cover default/min/max page size, stable ordering, multiple pages,
+  first-page null and later-page echoed `request_cursor`, exact cursor chaining,
+  total-row accounting, requested-namespace rows, all keyed unbound/same/foreign
+  namespace rows, exclusion of foreign unkeyed rows, union deduplication,
+  actual Agent/profile serialization, revision change, expiry/restart
+  staleness, truncation/row-cap/DB failure, and retry from page one. Offline
+  evidence tests swap or alter request/next cursors while retaining contiguous
+  row offsets and must fail. Serialized pages are asserted not to contain
+  prompt, preview, output, result, completion evidence, profile config, or
+  termination detail.
+- Simple key/parser/projection tests retain Design Fixer and slotted reviewer
+  round trips, legacy primary parsing, same-profile Codex reviewer separation,
+  invalid-key rejection, high producer plus both reviewer nodes, no workflow
+  header, bounded binding warnings, and warning-only sync state.
 
 ### Workflow scenarios
 
-1. No override runs a normal Task with Grok implementation and Codex review.
-2. A user-selected non-Grok Task Agent runs the complete normal route.
-3. A high Task forces Codex implementation and Codex plus Task Agent review.
-4. Task Agent Codex still produces three independent high-Task conversations.
-5. One high reviewer requests changes; the Codex implementer fixes and both
-   reviewers re-review.
-6. Conditional Design review uses separate Codex Reviewer and Fixer sessions.
-7. Plan initial authoring and every revision remain in the Plan Author session,
-   separate from Plan review.
-8. A boundary Agent change affects pending Tasks and preserves all prior
-   lineages.
-9. An active-Task switch request blocks or defers without a handoff dispatch.
-10. Agent unavailability, compaction, continuation, replacement, and exhausted
-    recovery rails preserve the recorded route.
-11. Final findings return to the correct normal or high producer and reopen
-    required reviews.
+1. No override runs a normal Task with Grok implementation, the shared Task
+   binding, and independent Codex review.
+2. A selected non-Grok Task Agent runs the complete normal route; a high Task
+   still forces Codex implementation plus Codex primary and Task Agent
+   auxiliary review.
+3. Task Agent Codex creates three independent high-Task conversations with one
+   shared binding and distinct canonical keys. A producer fix makes both
+   reviewers stale and both re-review.
+4. After a high Task's Codex producer has a reserving durable row under Grok's
+   auxiliary route, a coordinated Plan/progress attempt to switch that Task to
+   another Task Agent is blocked before reviewer dispatch.
+5. A boundary change after completed prior Tasks updates only never-admitted
+   pending Tasks, while an active-Task switch blocks or defers without a
+   handoff.
+6. Deleted progress mirrors, fabricated identities, wrong actual routes,
+   wrong-namespace keyed history, unbound routed history, stale/tampered
+   pagination, unavailable query, compaction, continuation, replacement, and
+   exhausted recovery rails all fail closed or preserve the original binding
+   as specified.
+7. Conditional Design review keeps separate Codex Reviewer/Fixer sessions;
+   Plan authoring and revisions keep one independent Plan Author session using
+   `writing-plans`; document runs remain outside Task binding admission.
+8. Final findings return to the correct normal or high producer, preserve its
+   Task binding, and reopen covering Task reviews plus final review.
+9. A legacy Simple workflow without `codeg-b2d-routing-v1` retains legacy
+   behavior. Adding the routing block while an admitted matching run is
+   unbound blocks rather than inventing evidence.
+10. Projection remains warning-only, and no scenario creates a manifest,
+    platform Gate, gate settlement, completion Card/evidence, or platform
+    completion decision.
+11. Lost acknowledgements after committed first, continuation, and replacement
+    reservations recover only from their exact unresolved intents; removing
+    the intent or deleting an admitted mirror remains blocking.
 
 ### Verification commands
 
-Implementation verification will include the focused Skill validator suite,
-the validator's production-file check, Rust key/parser/projection unit tests,
-and the brainstorm-to-delivery integration contract tests. Scope-appropriate
-formatting, lint, and Cargo checks will run for every changed runtime surface.
+Implementation verification includes the focused Skill validator suite, its
+production-file check, cross-language vectors, Rust query/store/listener/
+projection tests, and brainstorm-to-delivery integration scenarios. Every Rust
+compile, test, or lint command for this work disables default Tauri features
+and enables exactly `server,test-utils`, for example:
+
+```bash
+cd src-tauri
+cargo check --no-default-features --features server,test-utils --lib --bin codeg-server --bin codeg-mcp
+cargo test --no-default-features --features server,test-utils durable_binding
+cargo test --no-default-features --features server,test-utils simple_workflow
+cargo clippy --no-default-features --features server,test-utils --lib --bin codeg-server --bin codeg-mcp -- -D warnings
+```
+
+No verification command for this change enables the default `tauri-runtime`.
 
 ## Compatibility and Rollout
 
 Existing Simple workflows continue to parse their progress-v1 files and
-five-part reviewer keys. They are not retroactively assigned risk blocks or
-Task Agent generations. A resumed legacy workflow may continue under its
-recorded legacy route; adopting this design's adaptive routing requires a Plan
-Author revision that creates a complete routing block before the next pending
-Task.
+five-part reviewer keys. Migration columns are nullable and no historical row
+is assigned a guessed orchestration namespace, generation, or fingerprint.
+Standalone/ad-hoc delegation and old clients may omit the optional binding and
+retain the existing request-fingerprint behavior.
+
+A legacy Simple workflow without `codeg-b2d-routing-v1` keeps its recorded
+legacy behavior and treats binding projection as informational. Adopting the
+new routing block requires a Plan Author revision before the next pending Task
+and full durable validation. If any matching Task run was already admitted
+without a binding, the workflow cannot retroactively manufacture evidence and
+blocks for user resolution. Missing binding is not itself a Rust Simple Gate;
+it becomes an execution blocker only under the revised routed Skill contract.
 
 Archived manifest workflows remain read-only and retain their current
 projection. This design does not revive or convert them in place.
 
-The change ships atomically across the repository Skill, validators, canonical
-key parser, Simple projection, and integration contracts so no new Skill emits
-keys or routing data that the current runtime cannot recognize.
+The change ships atomically across migration/entity, generic request and query
+surfaces, broker/run store, repository Skill, validator, canonical key parser,
+Simple projection, and integration contracts. A revised Skill running against
+a backend without the query, actual Agent/profile fields, request-cursor echo,
+cross-namespace keyed conflict discovery, or binding schema fails closed; it
+never falls back to mutable documents. Query response additions are confined to
+the new tool and do not change standalone delegation. `get_delegation_status`
+remains wire-compatible but is not extended into the binding evidence surface,
+avoiding prompt/output leakage and preserving its current task-report contract.
 
 ## Success Criteria
 
@@ -628,10 +1578,28 @@ keys or routing data that the current runtime cannot recognize.
 - A user can select another Task Agent from the invocation message.
 - A Task Agent can change between Tasks without altering earlier lineages.
 - Design and Plan producers never review their own artifacts.
-- The parent orchestrator does not edit Design, Plan, or Task code.
+- The parent orchestrator coordinates and updates progress but does not author
+  or edit Design, Plan, Skill prose, validator/tests, or Task implementation.
+- Initial Plan routing is derived without progress, then progress is initialized
+  and jointly validated before the independent Plan Reviewer is dispatched.
 - Every Task has a validated `b2d_task_risk_v1` classification and derived
-  route before admission.
+  route before admission, and the parent uses the validator's exact binding.
 - High risk always forces Codex implementation and two independent reviewers.
 - Same-Agent reviewer combinations cannot collide in work-unit identity.
+- A reserving transaction durably fixes the complete Task route generation and
+  fingerprint before child side effects; no status/continuation/replacement
+  path can mutate it.
+- Complete parent-scoped durable evidence proves actual Agent/profile, detects
+  missing mirrors, extra rows, cross-namespace recognized keys, unbound routed
+  history, identity changes, cursor tampering, and coordinated Plan/progress
+  rewrites before execution or recovery.
+- A committed run with a lost acknowledgement is adopted only from one exact
+  operation-specific unresolved intent; a deleted mirror without such an
+  intent remains a blocking durable mismatch.
+- Legal boundary changes affect only never-admitted pending Tasks and preserve
+  every historical binding and recovery lineage.
+- Existing unbound generic delegation and routing-block-free legacy Simple
+  workflows remain compatible without guessed backfill.
 - Simple remains manifest-free, platform-gate-free, and recoverable through
-  Plan, progress, Git, reports, and generic delegation state.
+  Plan, progress, Git, reports, and generic delegation state. Rust projection
+  remains warning-only and owns no completion or admission decision.

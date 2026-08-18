@@ -1,0 +1,715 @@
+# Review package: 21401f42a993024fefc97b984c11196928e2dd74..816dbe92e62e5cd6d4cd8f7026fe4af4b18791de
+
+## Commits
+816dbe92 fix(workflow): bind routed admission evidence
+
+## Files changed
+ .agents/skills/brainstorm-to-delivery/SKILL.md     |  10 +-
+ .../scripts/validate-contract.lib.mjs              |  35 ++++++-
+ .../scripts/validate-contract.test.mjs             | 114 ++++++++++++++++++---
+ .../src/acp/delegation/workflow/simple_parse.rs    |  28 +++++
+ 4 files changed, 168 insertions(+), 19 deletions(-)
+
+## Diff
+diff --git a/.agents/skills/brainstorm-to-delivery/SKILL.md b/.agents/skills/brainstorm-to-delivery/SKILL.md
+index de250641..d8104e20 100644
+--- a/.agents/skills/brainstorm-to-delivery/SKILL.md
++++ b/.agents/skills/brainstorm-to-delivery/SKILL.md
+@@ -287,24 +287,25 @@ normal implementer keys as task|N|implementer|TASK_AGENT|PROFILE and high
+ implementer keys as task|N|implementer|codex|none. Derive primary reviewer keys
+ as task|N|reviewer|primary|codex|none and high auxiliary reviewer keys as
+ task|N|reviewer|auxiliary|TASK_AGENT|PROFILE. Use
+ final_review|reviewer|codex|none for final review.
+ 
+ Use the key token none only for a null profile. Emit explicit six-part primary
+ and auxiliary reviewer keys for routed Tasks. Read a legacy five-part Task
+ reviewer key only as a legacy primary lineage.
+ 
+ Before each call, record reserving intent with the exact Agent, profile, role,
+-and key. Call generic delegation. After admission, record task and child
+-conversation IDs. After each observation, record the latest state. Keep
+-task_id globally unique and attach one non-null child conversation to only one
+-complete work-unit key.
++key, and Task Agent generation. Never rewrite a run's generation after
++admission. Call generic delegation. After admission, record task and child
++conversation IDs. After each observation, record the latest state. Keep task_id
++globally unique and attach one non-null child conversation to only one complete
++work-unit key.
+ 
+ ### Progress JSON
+ 
+ Maintain this complete JSON shape inside the single progress marker. Repeat
+ Task and run entries without dropping route or lineage fields.
+ 
+ ```json
+ {
+   "schema_version": 1,
+   "plan_rel_path": "docs/superpowers/plans/example.md",
+@@ -325,20 +326,21 @@ Task and run entries without dropping route or lineage fields.
+       },
+       "runs": [
+         {
+           "role": "implementer",
+           "agent_type": "codex",
+           "profile_id": null,
+           "task_id": null,
+           "child_conversation_id": null,
+           "state": "reserving",
+           "work_unit_key": "task|1|implementer|codex|none",
++          "task_agent_generation": 1,
+           "recovery_count": 0,
+           "replaced_task_id": null,
+           "replacement_reason": null
+         }
+       ]
+     }
+   ],
+   "final_review_status": "pending",
+   "updated_at": "2026-08-16T00:00:00Z"
+ }
+diff --git a/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.lib.mjs b/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.lib.mjs
+index 76530f89..6fc82fcc 100644
+--- a/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.lib.mjs
++++ b/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.lib.mjs
+@@ -3986,20 +3986,28 @@ function stateSegmentHasExplicitNonTaskSubject(clause, start, end) {
+   const predicate = tokenIndex(
+     clause.tokens,
+     new Set([
+       ...TASK_REACTIVATION_PREDICATES,
+       ...TASK_REACTIVATION_STATE_LINKS,
+     ]),
+     start,
+     end
+   )
+   if (predicate < 0) return false
++  const causativeObject = predicate - 1
++  if (
++    clause.tokens[causativeObject] === "it" &&
++    PEOPLE_PURPOSE_ACTIONS.has(clause.tokens[causativeObject - 1]) &&
++    !previousSegmentHasExplicitNonTaskAntecedent(clause, start)
++  ) {
++    return false
++  }
+   const taskObject = tokenIndex(
+     clause.tokens,
+     new Set(["it"]),
+     predicate + 1,
+     end
+   )
+   if (
+     taskObject >= 0 &&
+     clause.tokens
+       .slice(predicate + 1, taskObject)
+@@ -5570,20 +5578,23 @@ export function validateSkillMarkdown(skillMarkdown) {
+       "B2D-SKILL-005",
+       "Skill prose contradicts required v2 ownership or routing"
+     )
+   }
+ 
+   return { failures, notes }
+ }
+ 
+ function fenceStart(line) {
+   const match = line.match(/^\s{0,3}(`{3,}|~{3,})/)
++  if (match?.[1][0] === "`" && line.slice(match[0].length).includes("`")) {
++    return null
++  }
+   return match ? { character: match[1][0], length: match[1].length } : null
+ }
+ 
+ function fenceEnd(line, fence) {
+   if (!fence) return false
+   const escaped = fence.character === "`" ? "`" : "~"
+   return new RegExp(`^\\s{0,3}${escaped}{${fence.length},}\\s*$`).test(line)
+ }
+ 
+ function extractUnfencedComment(source, marker, maxBlockBytes) {
+@@ -6138,20 +6149,31 @@ function validateRun(run, taskIndex, runIndex, failures) {
+       "B2D-PROGRESS-006",
+       `${label} recovery_count must be an unsigned 32-bit integer`
+     )
+   } else if (run.recovery_count > MAX_UNEXPECTED_CONTINUATIONS) {
+     fail(
+       failures,
+       "B2D-PROGRESS-006",
+       `${label} recovery_count permits at most 2 unexpected continuations`
+     )
+   }
++  if (
++    run.task_agent_generation !== undefined &&
++    (!positiveInteger(run.task_agent_generation) ||
++      run.task_agent_generation > MAX_U32)
++  ) {
++    fail(
++      failures,
++      "B2D-PROGRESS-006",
++      `${label} task_agent_generation must be an unsigned positive 32-bit integer`
++    )
++  }
+ 
+   const replaced = nonEmptyString(run.replaced_task_id)
+   const reason = nonEmptyString(run.replacement_reason)
+   if (replaced !== reason) {
+     fail(
+       failures,
+       "B2D-PROGRESS-006",
+       `${label} replacement linkage must include both replaced_task_id and ` +
+         "replacement_reason"
+     )
+@@ -6211,26 +6233,27 @@ function validateTaskRunLineages(task, failures, taskIds, childOwners) {
+   for (const [workUnitKey, entries] of groups) {
+     const first = entries[0].run
+     const firstProfile = runProfileIdentity(first)
+     const priorTaskIds = new Set()
+     const replacementAttempts = new Map()
+     for (const { run, runIndex } of entries) {
+       const label = `Task ${task.index} ${workUnitKey} run ${runIndex + 1}`
+       if (
+         run.work_unit_key !== first.work_unit_key ||
+         run.agent_type !== first.agent_type ||
+-        runProfileIdentity(run) !== firstProfile
++        runProfileIdentity(run) !== firstProfile ||
++        run.task_agent_generation !== first.task_agent_generation
+       ) {
+         fail(
+           failures,
+           "B2D-PROGRESS-006",
+-          `${label} changes key, agent, or profile within one lineage`
++          `${label} changes key, agent, profile, or Task Agent generation within one lineage`
+         )
+       }
+ 
+       const replaced = nonEmptyString(run.replaced_task_id)
+       const reason = nonEmptyString(run.replacement_reason)
+       if (replaced && reason) {
+         if (!priorTaskIds.has(run.replaced_task_id)) {
+           fail(
+             failures,
+             "B2D-PROGRESS-006",
+@@ -6470,20 +6493,27 @@ export function validateProgressRouting(snapshot, routing, failures) {
+         failures,
+         "B2D-PROGRESS-009",
+         `Task ${routeTask.index} route metadata disagrees with the Plan`
+       )
+     }
+     const allowed = expectedKeySet(expected)
+     const groups = new Map()
+     if (Array.isArray(task.runs)) {
+       for (const run of task.runs) {
+         if (!isObject(run) || !nonEmptyString(run.work_unit_key)) continue
++        if (run.task_agent_generation !== routeTask.task_agent_generation) {
++          fail(
++            failures,
++            "B2D-PROGRESS-009",
++            `Task ${routeTask.index} run is not bound to its routed Task Agent generation`
++          )
++        }
+         if (!allowed.has(run.work_unit_key)) {
+           fail(
+             failures,
+             "B2D-PROGRESS-009",
+             `Task ${routeTask.index} run is outside its expected route`
+           )
+         }
+         const entries = groups.get(run.work_unit_key) ?? []
+         entries.push(run)
+         groups.set(run.work_unit_key, entries)
+@@ -6547,20 +6577,21 @@ export function validateProgressRouting(snapshot, routing, failures) {
+         boundaryRoute?.task_agent_generation &&
+       skillContractsEqual(
+         boundary?.expected_work_unit_keys,
+         boundaryRoute?.expected_work_unit_keys
+       )
+     const implementerKey = boundaryRoute?.expected_work_unit_keys?.implementer
+     const hasAdmittedImplementerRun = boundaryRuns.some(
+       (run) =>
+         isObject(run) &&
+         run.work_unit_key === implementerKey &&
++        run.task_agent_generation === boundaryRoute?.task_agent_generation &&
+         nonEmptyString(run.task_id) &&
+         positiveInteger(run.child_conversation_id) &&
+         run.child_conversation_id <= MAX_I32
+     )
+     const historicalAdoptedBoundary =
+       boundary?.status !== "pending" &&
+       frozenRouteMatches &&
+       hasAdmittedImplementerRun &&
+       pendingTasksRemainClean
+     if (
+diff --git a/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.test.mjs b/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.test.mjs
+index ddac8cd1..098e637d 100644
+--- a/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.test.mjs
++++ b/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.test.mjs
+@@ -230,68 +230,83 @@ function plan(snapshot = routing()) {
+   return `# Plan
+ 
+ ${block("codeg-b2d-routing-v1", snapshot)}
+ 
+ ## Task 1: Parse documents
+ 
+ ### Task 2: Project progress
+ `
+ }
+ 
+-function run(key, state, task_id, child_conversation_id) {
++function run(
++  key,
++  state,
++  task_id,
++  child_conversation_id,
++  task_agent_generation = 1
++) {
+   const parts = key.split("|")
+   const slotted = parts.length === 6
+   const profile = parts[slotted ? 5 : 4]
+   return {
+     role: parts[2],
+     agent_type: parts[slotted ? 4 : 3],
+     profile_id: profile === "none" ? null : profile,
+     task_id,
+     child_conversation_id,
+     state,
+     work_unit_key: key,
++    task_agent_generation,
+     recovery_count: 0,
+     replaced_task_id: null,
+     replacement_reason: null,
+   }
+ }
+ 
+ function progressTask(routeTask, status, child = 10) {
+   const taskAgent =
+     routeTask.risk.level === "normal"
+       ? (routeTask.route?.implementer ?? identity())
+       : (routeTask.route?.reviewers?.[1] ?? identity())
+   const keys = expectedWorkUnitKeys(
+     routeTask.index,
+     routeTask.risk.level,
+     taskAgent
+   )
+   const runs = []
+   if (status === "completed") {
+     runs.push(
+-      run(keys.implementer, "completed", `t${routeTask.index}-i`, child)
++      run(
++        keys.implementer,
++        "completed",
++        `t${routeTask.index}-i`,
++        child,
++        routeTask.task_agent_generation
++      )
+     )
+     runs.push(
+       run(
+         keys.reviewers.primary,
+         "completed",
+         `t${routeTask.index}-p`,
+-        child + 1
++        child + 1,
++        routeTask.task_agent_generation
+       )
+     )
+     if (keys.reviewers.auxiliary) {
+       runs.push(
+         run(
+           keys.reviewers.auxiliary,
+           "completed",
+           `t${routeTask.index}-a`,
+-          child + 2
++          child + 2,
++          routeTask.task_agent_generation
+         )
+       )
+     }
+   }
+   return {
+     index: routeTask.index,
+     status,
+     commit: status === "completed" ? `commit-${routeTask.index}` : null,
+     risk_level: routeTask.risk.level,
+     task_agent_generation: routeTask.task_agent_generation,
+@@ -421,20 +436,40 @@ describe("Skill contract v2", () => {
+       "Use the Task Agent to implement high Tasks.",
+       "Reuse one Codex conversation for implementation and review.",
+       "Switch Agent immediately inside the active Task.",
+       "Skip the auxiliary review after a high-Task fix.",
+       "When the user names a Design Reviewer, use that reviewer instead of the Codex Design Reviewer.",
+     ]) {
+       has(validateSkillMarkdown(`${skill}\n${prose}`).failures, "B2D-SKILL-005")
+     }
+   })
+ 
++  it("round-22 treats a backtick-bearing backtick info string as visible prose", () => {
++    const contradiction = "The Task Agent implements high Tasks."
++    has(
++      validateSkillMarkdown(
++        `${skill}\n\`\`\`info\`bad\n${contradiction}\n\`\`\``
++      ).failures,
++      "B2D-SKILL-005"
++    )
++    assert.deepEqual(
++      validateSkillMarkdown(`${skill}\n\`\`\`info\n${contradiction}\n\`\`\``)
++        .failures,
++      []
++    )
++    assert.deepEqual(
++      validateSkillMarkdown(`${skill}\n~~~info\`allowed\n${contradiction}\n~~~`)
++        .failures,
++      []
++    )
++  })
++
+   it("rejects bounded ownership and route directive paraphrases", () => {
+     for (const prose of [
+       "The parent writes and revises every Plan.",
+       "Grok implements every Task, including high Tasks.",
+       "The parent authors all Design documents and Plans.",
+       "The Task Agent owns implementation for each high-risk Task.",
+     ]) {
+       has(validateSkillMarkdown(`${skill}\n${prose}`).failures, "B2D-SKILL-005")
+     }
+ 
+@@ -5141,20 +5176,35 @@ describe("Skill contract v2", () => {
+       },
+       ...["not restarting the Task", "without restarting the Task"].map(
+         (parenthetical) => ({
+           prose: `The active Task is completed but the server, ${parenthetical}, restarts and it is still running. Then switch the Task Agent.`,
+           reject: false,
+         })
+       ),
+     ])
+   })
+ 
++  it("round-22 binds causative restart objects to the active Task", () => {
++    assertSkillClassifications([
++      {
++        prose:
++          "The active Task is completed but the server, monitoring the Task, lets it restart and it is still running. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The active Task is completed but the server, monitoring the Task, lets itself restart and it is still running. Then switch the Task Agent.",
++        reject: false,
++      },
++    ])
++  })
++
+   it("contains the complete operational policy and document JSON shapes", () => {
+     const policy = fencedJsonAfterHeading(
+       realSkill,
+       "### Operational policy JSON"
+     )
+     assert.deepEqual(policy.design_review_triggers, [
+       "spans_modules",
+       "migration",
+       "concurrency",
+       "security",
+@@ -5253,20 +5303,21 @@ describe("Skill contract v2", () => {
+       "runs",
+     ])
+     assert.deepEqual(Object.keys(progressShape.tasks[0].runs[0]), [
+       "role",
+       "agent_type",
+       "profile_id",
+       "task_id",
+       "child_conversation_id",
+       "state",
+       "work_unit_key",
++      "task_agent_generation",
+       "recovery_count",
+       "replaced_task_id",
+       "replacement_reason",
+     ])
+   })
+ })
+ 
+ describe("bounded routing extraction", () => {
+   it("parses one exact unfenced block with ordered headings", () => {
+     const parsed = parseSimplePlan(plan())
+@@ -5742,30 +5793,31 @@ describe("progress agreement and per-key lineage", () => {
+     route.tasks.push(task(3, "high", selected, 2))
+     const routedPlan = `${plan(route)}\n## Task 3: Continue generation\n`
+     const state = progress(route)
+     state.tasks.push(progressTask(route.tasks[2], "pending", 30))
+ 
+     assert.deepEqual(validate(route, state, routedPlan), [], "pre-admission")
+ 
+     const implementer = state.tasks[1].expected_work_unit_keys.implementer
+     state.tasks[1].status = "in_progress"
+     state.active_task_index = 2
+-    state.tasks[1].runs.push(run(implementer, "running", "t2-i", 20))
++    state.tasks[1].runs.push(run(implementer, "running", "t2-i", 20, 2))
+     assert.deepEqual(validate(route, state, routedPlan), [], "admitted/active")
+ 
+     state.tasks[1].runs[0].state = "completed"
+     state.tasks[1].runs.push(
+       run(
+         state.tasks[1].expected_work_unit_keys.reviewers.primary,
+         "running",
+         "t2-p",
+-        21
++        21,
++        2
+       )
+     )
+     assert.deepEqual(
+       validate(route, state, routedPlan),
+       [],
+       "reviewer dispatch"
+     )
+ 
+     state.tasks[1].runs[1].state = "completed"
+     state.tasks[1].status = "completed"
+@@ -5773,21 +5825,22 @@ describe("progress agreement and per-key lineage", () => {
+     state.active_task_index = null
+     assert.deepEqual(validate(route, state, routedPlan), [], "completed")
+ 
+     state.tasks[2].status = "in_progress"
+     state.active_task_index = 3
+     state.tasks[2].runs.push(
+       run(
+         state.tasks[2].expected_work_unit_keys.implementer,
+         "running",
+         "t3-i",
+-        30
++        30,
++        2
+       )
+     )
+     assert.deepEqual(validate(route, state, routedPlan), [], "following Task")
+   })
+ 
+   it("rejects historical generation adoption by admitted reviewer-only runs", () => {
+     const route = routing()
+     const selected = identity("gemini", "careful")
+     route.task_agent_generations.push({
+       generation: 2,
+@@ -5802,28 +5855,58 @@ describe("progress agreement and per-key lineage", () => {
+       ["primary", "auxiliary"],
+     ]) {
+       const state = progress(route)
+       state.tasks[1].status = "in_progress"
+       state.active_task_index = 2
+       state.tasks[1].runs = reviewerSlots.map((slot, index) =>
+         run(
+           state.tasks[1].expected_work_unit_keys.reviewers[slot],
+           "running",
+           `t2-${slot}`,
+-          20 + index
++          20 + index,
++          2
+         )
+       )
+ 
+       has(validate(route, state), "B2D-ROUTING-007")
+     }
+   })
+ 
++  it("round-22 rejects rewriting an admitted high Task to a new Task Agent generation", () => {
++    const route = routing()
++    const state = progress(route)
++    state.tasks[1].status = "in_progress"
++    state.active_task_index = 2
++    state.tasks[1].runs.push(
++      run(
++        state.tasks[1].expected_work_unit_keys.implementer,
++        "running",
++        "t2-i",
++        20,
++        1
++      )
++    )
++
++    const selected = identity("gemini", "careful")
++    route.task_agent_generations.push({
++      generation: 2,
++      ...selected,
++      effective_from_task_index: 2,
++    })
++    route.tasks[1] = task(2, "high", selected, 2)
++    const rewritten = progressTask(route.tasks[1], "pending", 20)
++    state.tasks[1].task_agent_generation = rewritten.task_agent_generation
++    state.tasks[1].expected_work_unit_keys = rewritten.expected_work_unit_keys
++
++    has(validate(route, state), "B2D-ROUTING-007")
++  })
++
+   it("adopts a later generation only at an empty pending boundary", () => {
+     const route = routing()
+     const selected = identity("gemini", "careful")
+     route.task_agent_generations.push({
+       generation: 2,
+       ...selected,
+       effective_from_task_index: 2,
+     })
+     route.tasks[1] = task(2, "normal", selected, 2)
+     for (const mutate of [
+@@ -5834,31 +5917,33 @@ describe("progress agreement and per-key lineage", () => {
+       (p) => {
+         p.tasks[1].status = "blocked"
+         p.active_task_index = 2
+       },
+       (p) => {
+         p.tasks[1].runs = [
+           run(
+             p.tasks[1].expected_work_unit_keys.implementer,
+             "reserving",
+             "reserved",
+-            null
++            null,
++            2
+           ),
+         ]
+       },
+       (p) => {
+         p.tasks[1].runs = [
+           run(
+             p.tasks[1].expected_work_unit_keys.implementer,
+             "running",
+             "admitted",
+-            20
++            20,
++            2
+           ),
+         ]
+       },
+       (p) => {
+         p.tasks[0].status = "pending"
+         p.tasks[0].runs = []
+       },
+     ]) {
+       const state = progress(route)
+       mutate(state)
+@@ -5877,21 +5962,22 @@ describe("progress agreement and per-key lineage", () => {
+     route.tasks[1] = task(2, "normal", selected, 2)
+     route.tasks.push(task(3, "normal", selected, 2))
+     const routedPlan = `${plan(route)}\n## Task 3: Dirty later Task\n`
+     const state = progress(route)
+     state.tasks.push(progressTask(route.tasks[2], "pending", 30))
+     state.tasks[2].runs.push(
+       run(
+         state.tasks[2].expected_work_unit_keys.implementer,
+         "reserving",
+         "reserved-later",
+-        null
++        null,
++        2
+       )
+     )
+ 
+     has(validate(route, state, routedPlan), "B2D-ROUTING-007")
+   })
+ 
+   it("round-9 keeps the future pending suffix clean after generation admission", () => {
+     const route = routing()
+     const selected = identity("gemini", "careful")
+     route.task_agent_generations.push({
+@@ -5904,29 +5990,31 @@ describe("progress agreement and per-key lineage", () => {
+     const routedPlan = `${plan(route)}\n## Task 3: Preserve serial suffix\n`
+     const state = progress(route)
+     state.tasks.push(progressTask(route.tasks[2], "pending", 30))
+     state.tasks[1].status = "in_progress"
+     state.active_task_index = 2
+     state.tasks[1].runs.push(
+       run(
+         state.tasks[1].expected_work_unit_keys.implementer,
+         "running",
+         "t2-i",
+-        20
++        20,
++        2
+       )
+     )
+     state.tasks[2].runs.push(
+       run(
+         state.tasks[2].expected_work_unit_keys.implementer,
+         "reserving",
+         "reserved-later",
+-        null
++        null,
++        2
+       )
+     )
+ 
+     has(validate(route, state, routedPlan), "B2D-ROUTING-007")
+     state.tasks[2].runs = []
+     assert.deepEqual(validate(route, state, routedPlan), [])
+   })
+ 
+   it("returns deterministic failures for null Tasks during generation validation", () => {
+     const route = routing()
+diff --git a/src-tauri/src/acp/delegation/workflow/simple_parse.rs b/src-tauri/src/acp/delegation/workflow/simple_parse.rs
+index d288b0e8..0d5d45fe 100644
+--- a/src-tauri/src/acp/delegation/workflow/simple_parse.rs
++++ b/src-tauri/src/acp/delegation/workflow/simple_parse.rs
+@@ -335,20 +335,23 @@ fn markdown_fence_start(line: &str) -> Option<MarkdownFence> {
+         return None;
+     }
+     let character = *bytes.get(indentation)?;
+     if !matches!(character, b'`' | b'~') {
+         return None;
+     }
+     let length = bytes[indentation..]
+         .iter()
+         .take_while(|byte| **byte == character)
+         .count();
++    if character == b'`' && bytes[indentation + length..].contains(&b'`') {
++        return None;
++    }
+     (length >= 3).then_some(MarkdownFence { character, length })
+ }
+ 
+ fn markdown_fence_end(line: &str, fence: MarkdownFence) -> bool {
+     let bytes = line.as_bytes();
+     let indentation = bytes.iter().take_while(|byte| **byte == b' ').count();
+     if indentation > 3 {
+         return false;
+     }
+     let length = bytes[indentation..]
+@@ -921,20 +924,45 @@ mod tests {
+     fn simple_parse_routing_ignores_fenced_marker_examples() {
+         let plan = format!(
+             "# Plan\n\n```markdown\n<!-- codeg-b2d-routing-v1\n{{not-json}}\n-->\n```\n\n~~~markdown\n<!-- codeg-b2d-routing-v1\n{{also-not-json}}\n-->\n~~~\n\n<!-- codeg-b2d-routing-v1\n{VALID_ROUTING_JSON}\n-->\n\n## Task 1: Live routing\n"
+         );
+         let parsed = parse_simple_plan(plan.as_bytes()).expect("parse");
+ 
+         assert!(parsed.routing.is_some());
+         assert!(parsed.warning_codes.is_empty());
+     }
+ 
++    #[test]
++    fn simple_parse_routing_applies_commonmark_backtick_info_rule() {
++        let visible = format!(
++            "# Plan\n\n```info`bad\n<!-- codeg-b2d-routing-v1\n{VALID_ROUTING_JSON}\n-->\n```\n"
++        );
++        let parsed =
++            parse_simple_plan(visible.as_bytes()).expect("parse visible marker");
++        assert!(parsed.routing.is_some());
++        assert!(parsed.warning_codes.is_empty());
++
++        for fenced in [
++            format!(
++                "# Plan\n\n```info\n<!-- codeg-b2d-routing-v1\n{VALID_ROUTING_JSON}\n-->\n```\n"
++            ),
++            format!(
++                "# Plan\n\n~~~info`allowed\n<!-- codeg-b2d-routing-v1\n{VALID_ROUTING_JSON}\n-->\n~~~\n"
++            ),
++        ] {
++            let parsed =
++                parse_simple_plan(fenced.as_bytes()).expect("parse fenced marker");
++            assert!(parsed.routing.is_none());
++            assert!(parsed.warning_codes.is_empty());
++        }
++    }
++
+     #[test]
+     fn simple_parse_routing_ignores_prefix_lookalikes_before_live_marker() {
+         let plan = format!(
+             "# Plan\n\n<!-- codeg-b2d-routing-v10\n{{not-v1}}\n-->\n\n<!-- codeg-b2d-routing-v1-extra\n{{also-not-v1}}\n-->\n\n<!-- codeg-b2d-routing-v1\n{VALID_ROUTING_JSON}\n-->\n\n## Task 1: Live routing\n"
+         );
+         let parsed = parse_simple_plan(plan.as_bytes()).expect("parse");
+ 
+         assert_eq!(
+             parsed.routing.expect("live routing").risk_policy_version,
+             "b2d_task_risk_v1"

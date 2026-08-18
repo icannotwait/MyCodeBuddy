@@ -7,22 +7,31 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::artifact_resolver::{read_bounded_workspace_file, ArtifactError, ArtifactFailure};
-use super::key::normalize_rel_path;
+use super::key::{normalize_rel_path, parse_recognized_work_unit_key};
 use super::plan_material::{
     collect_headings_and_front_matter, normalize_source_for_parsing, MAX_PLAN_MATERIAL_BYTES,
     MAX_PLAN_SECTION_BYTES,
 };
+use super::types::ReviewerSlot;
 
 pub const MAX_SIMPLE_PROGRESS_BYTES: usize = 512 * 1024;
 pub const MAX_SIMPLE_PROGRESS_BLOCK_BYTES: usize = 64 * 1024;
+pub const MAX_SIMPLE_ROUTING_BLOCK_BYTES: usize = 256 * 1024;
 pub const MAX_SIMPLE_PROJECTION_WARNINGS: usize = 64;
 const PROGRESS_MARKER: &str = "<!-- codeg-simple-progress-v1";
+const ROUTING_MARKER: &str = "<!-- codeg-b2d-routing-v1";
 const COMMENT_END: &str = "-->";
 
 pub const WARNING_PLAN_DUPLICATE_TASK: &str = "simple_plan_duplicate_task_index";
 pub const WARNING_PLAN_MALFORMED_TASK: &str = "simple_plan_malformed_task_heading";
 pub const WARNING_PLAN_NON_CONTIGUOUS: &str = "simple_plan_non_contiguous_tasks";
 pub const WARNING_PLAN_SECTION_TRUNCATED: &str = "simple_plan_section_truncated";
+pub const WARNING_ROUTING_MULTIPLE: &str = "simple_routing_multiple_blocks";
+pub const WARNING_ROUTING_TRUNCATED: &str = "simple_routing_block_truncated";
+pub const WARNING_ROUTING_TOO_LARGE: &str = "simple_routing_block_too_large";
+pub const WARNING_ROUTING_INVALID_JSON: &str = "simple_routing_invalid_json";
+pub const WARNING_ROUTING_SCHEMA: &str = "simple_routing_schema_unsupported";
+pub const WARNING_ROUTING_POLICY: &str = "simple_routing_policy_unsupported";
 pub const WARNING_PROGRESS_MISSING: &str = "simple_progress_block_missing";
 pub const WARNING_PROGRESS_MULTIPLE: &str = "simple_progress_multiple_blocks";
 pub const WARNING_PROGRESS_TRUNCATED: &str = "simple_progress_block_truncated";
@@ -33,6 +42,10 @@ pub const WARNING_PROGRESS_DUPLICATE_TASK: &str = "simple_progress_duplicate_tas
 pub const WARNING_PROGRESS_UNKNOWN_STATUS: &str = "simple_progress_unknown_task_status";
 pub const WARNING_PROGRESS_UNKNOWN_RUN_STATE: &str = "simple_progress_unknown_run_state";
 pub const WARNING_PROGRESS_PLAN_PATH: &str = "simple_progress_plan_path_mismatch";
+pub const WARNING_ORCHESTRATION_BINDING_MISSING: &str = "simple_orchestration_binding_missing";
+pub const WARNING_ORCHESTRATION_BINDING_MISMATCH: &str = "simple_orchestration_binding_mismatch";
+pub const WARNING_ORCHESTRATION_BINDING_ORPHAN: &str = "simple_orchestration_binding_orphan";
+pub const SIMPLE_ORCHESTRATION_NAMESPACE: &str = "brainstorm-to-delivery";
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum SimpleParseError {
@@ -69,9 +82,69 @@ pub struct SimplePlanTask {
     pub verification_text: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SimpleAgentSelection {
+    pub agent_type: String,
+    pub profile_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SimpleTaskAgentGeneration {
+    pub generation: u32,
+    pub agent_type: String,
+    pub profile_id: Option<String>,
+    pub effective_from_task_index: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SimpleRiskEvidence {
+    pub kind: String,
+    pub score: Option<u32>,
+    pub evidence: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SimpleTaskRisk {
+    pub level: String,
+    pub hard_triggers: Vec<SimpleRiskEvidence>,
+    pub soft_signals: Vec<SimpleRiskEvidence>,
+    pub score: u32,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SimpleTaskReviewerRoute {
+    pub slot: ReviewerSlot,
+    pub agent_type: String,
+    pub profile_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SimpleTaskRoute {
+    pub implementer: SimpleAgentSelection,
+    pub reviewers: Vec<SimpleTaskReviewerRoute>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SimpleRoutingTask {
+    pub index: u32,
+    pub task_agent_generation: u32,
+    pub risk: SimpleTaskRisk,
+    pub route: SimpleTaskRoute,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SimpleRoutingSnapshot {
+    pub schema_version: u32,
+    pub risk_policy_version: String,
+    pub task_agent_generations: Vec<SimpleTaskAgentGeneration>,
+    pub tasks: Vec<SimpleRoutingTask>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct SimplePlanDocument {
     pub tasks: Vec<SimplePlanTask>,
+    pub routing: Option<SimpleRoutingSnapshot>,
     pub warning_codes: Vec<String>,
 }
 
@@ -120,6 +193,63 @@ impl SimpleFinalReviewStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SimpleOrchestrationBinding {
+    pub schema_version: u32,
+    pub namespace: String,
+    pub generation: u32,
+    pub route_fingerprint: String,
+}
+
+impl SimpleOrchestrationBinding {
+    pub fn is_well_formed(&self) -> bool {
+        if self.schema_version != 1 {
+            return false;
+        }
+        let namespace = self.namespace.as_bytes();
+        if namespace.is_empty()
+            || namespace.len() > 64
+            || !namespace[0].is_ascii_lowercase()
+            || !namespace[1..]
+                .iter()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+        {
+            return false;
+        }
+        if self.generation == 0 {
+            return false;
+        }
+        route_fingerprint_is_well_formed(&self.route_fingerprint)
+    }
+}
+
+pub fn route_fingerprint_is_well_formed(fingerprint: &str) -> bool {
+    let bytes = fingerprint.as_bytes();
+    bytes.len() == 71
+        && bytes.starts_with(b"sha256:")
+        && bytes[7..]
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum SimpleBindingMirror {
+    #[default]
+    Absent,
+    Invalid,
+    Present(SimpleOrchestrationBinding),
+}
+
+impl SimpleBindingMirror {
+    pub fn as_present(&self) -> Option<&SimpleOrchestrationBinding> {
+        match self {
+            Self::Present(binding) => Some(binding),
+            Self::Absent | Self::Invalid => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SimpleProgressRun {
     pub role: String,
     pub agent_type: String,
@@ -131,6 +261,19 @@ pub struct SimpleProgressRun {
     pub recovery_count: Option<u32>,
     pub replaced_task_id: Option<String>,
     pub replacement_reason: Option<String>,
+    pub orchestration_binding: SimpleBindingMirror,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SimpleExpectedReviewerKeys {
+    pub primary: String,
+    pub auxiliary: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SimpleExpectedWorkUnitKeys {
+    pub implementer: String,
+    pub reviewers: SimpleExpectedReviewerKeys,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -138,6 +281,11 @@ pub struct SimpleProgressTask {
     pub index: u32,
     pub status: SimpleDeclaredStatus,
     pub commit: Option<String>,
+    pub risk_level: Option<String>,
+    pub task_agent_generation: Option<u32>,
+    pub route_fingerprint: Option<String>,
+    pub orchestration_binding: SimpleBindingMirror,
+    pub expected_work_unit_keys: Option<SimpleExpectedWorkUnitKeys>,
     pub runs: Vec<SimpleProgressRun>,
 }
 
@@ -179,6 +327,8 @@ struct RawProgressRun {
     replaced_task_id: Option<String>,
     #[serde(default)]
     replacement_reason: Option<String>,
+    #[serde(default)]
+    orchestration_binding: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -188,6 +338,16 @@ struct RawProgressTask {
     status: String,
     #[serde(default)]
     commit: Option<String>,
+    #[serde(default)]
+    risk_level: Option<String>,
+    #[serde(default)]
+    task_agent_generation: Option<u32>,
+    #[serde(default)]
+    route_fingerprint: Option<serde_json::Value>,
+    #[serde(default)]
+    orchestration_binding: Option<serde_json::Value>,
+    #[serde(default)]
+    expected_work_unit_keys: Option<SimpleExpectedWorkUnitKeys>,
     #[serde(default)]
     runs: Vec<RawProgressRun>,
 }
@@ -216,6 +376,171 @@ fn push_warning(warnings: &mut Vec<String>, code: &str) {
         && !warnings.iter().any(|existing| existing == code)
     {
         warnings.push(code.to_string());
+    }
+}
+
+fn parse_optional_binding_mirror(
+    value: Option<serde_json::Value>,
+    warnings: &mut Vec<String>,
+) -> SimpleBindingMirror {
+    let Some(value) = value else {
+        return SimpleBindingMirror::Absent;
+    };
+    if value.is_null() {
+        return SimpleBindingMirror::Absent;
+    }
+    match serde_json::from_value::<SimpleOrchestrationBinding>(value) {
+        Ok(binding) if binding.is_well_formed() => SimpleBindingMirror::Present(binding),
+        _ => {
+            push_warning(warnings, WARNING_ORCHESTRATION_BINDING_MISMATCH);
+            SimpleBindingMirror::Invalid
+        }
+    }
+}
+
+fn parse_optional_route_fingerprint(
+    value: Option<serde_json::Value>,
+    warnings: &mut Vec<String>,
+) -> Option<String> {
+    match value {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(fingerprint)) => {
+            if !route_fingerprint_is_well_formed(&fingerprint) {
+                push_warning(warnings, WARNING_ORCHESTRATION_BINDING_MISMATCH);
+            }
+            Some(fingerprint)
+        }
+        Some(_) => {
+            push_warning(warnings, WARNING_ORCHESTRATION_BINDING_MISMATCH);
+            None
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SimpleCommentProblem {
+    Truncated,
+    TooLarge,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SimpleCommentBlock<'a> {
+    body: Option<&'a str>,
+    marker_count: usize,
+    problem: Option<SimpleCommentProblem>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MarkdownFence {
+    character: u8,
+    length: usize,
+}
+
+fn markdown_fence_start(line: &str) -> Option<MarkdownFence> {
+    let bytes = line.as_bytes();
+    let indentation = bytes.iter().take_while(|byte| **byte == b' ').count();
+    if indentation > 3 {
+        return None;
+    }
+    let character = *bytes.get(indentation)?;
+    if !matches!(character, b'`' | b'~') {
+        return None;
+    }
+    let length = bytes[indentation..]
+        .iter()
+        .take_while(|byte| **byte == character)
+        .count();
+    if character == b'`' && bytes[indentation + length..].contains(&b'`') {
+        return None;
+    }
+    (length >= 3).then_some(MarkdownFence { character, length })
+}
+
+fn markdown_fence_end(line: &str, fence: MarkdownFence) -> bool {
+    let bytes = line.as_bytes();
+    let indentation = bytes.iter().take_while(|byte| **byte == b' ').count();
+    if indentation > 3 {
+        return false;
+    }
+    let length = bytes[indentation..]
+        .iter()
+        .take_while(|byte| **byte == fence.character)
+        .count();
+    length >= fence.length
+        && bytes[indentation + length..]
+            .iter()
+            .all(|byte| matches!(byte, b' ' | b'\t' | b'\r'))
+}
+
+fn extract_unfenced_comment<'a>(
+    source: &'a str,
+    marker: &str,
+    max_block_bytes: usize,
+) -> SimpleCommentBlock<'a> {
+    let mut marker_offsets = Vec::new();
+    let mut fence = None;
+    let mut line_start = 0;
+
+    for line_with_ending in source.split_inclusive('\n') {
+        let line = line_with_ending
+            .strip_suffix('\n')
+            .unwrap_or(line_with_ending);
+        if let Some(active_fence) = fence {
+            if markdown_fence_end(line, active_fence) {
+                fence = None;
+            }
+            line_start += line_with_ending.len();
+            continue;
+        }
+        if let Some(opening_fence) = markdown_fence_start(line) {
+            fence = Some(opening_fence);
+            line_start += line_with_ending.len();
+            continue;
+        }
+
+        let indentation = line
+            .as_bytes()
+            .iter()
+            .take_while(|byte| **byte == b' ')
+            .count();
+        let marker_is_exact = line[indentation..]
+            .strip_prefix(marker)
+            // A marker ends with the line or ASCII whitespace before its body.
+            .is_some_and(|rest| rest.is_empty() || rest.as_bytes()[0].is_ascii_whitespace());
+        if indentation <= 3 && marker_is_exact {
+            marker_offsets.push(line_start + indentation);
+        }
+        line_start += line_with_ending.len();
+    }
+
+    let marker_count = marker_offsets.len();
+    let Some(marker_start) = marker_offsets.first().copied() else {
+        return SimpleCommentBlock {
+            body: None,
+            marker_count,
+            problem: None,
+        };
+    };
+    let body_start = marker_start + marker.len();
+    let Some(relative_end) = source[body_start..].find(COMMENT_END) else {
+        return SimpleCommentBlock {
+            body: None,
+            marker_count,
+            problem: Some(SimpleCommentProblem::Truncated),
+        };
+    };
+    let body = source[body_start..body_start + relative_end].trim();
+    if body.len() > max_block_bytes {
+        return SimpleCommentBlock {
+            body: None,
+            marker_count,
+            problem: Some(SimpleCommentProblem::TooLarge),
+        };
+    }
+    SimpleCommentBlock {
+        body: Some(body),
+        marker_count,
+        problem: None,
     }
 }
 
@@ -340,8 +665,40 @@ pub fn parse_simple_plan(bytes: &[u8]) -> Result<SimplePlanDocument, SimpleParse
     {
         push_warning(&mut warnings, WARNING_PLAN_NON_CONTIGUOUS);
     }
+    let routing_block =
+        extract_unfenced_comment(decoded, ROUTING_MARKER, MAX_SIMPLE_ROUTING_BLOCK_BYTES);
+    if routing_block.marker_count > 1 {
+        push_warning(&mut warnings, WARNING_ROUTING_MULTIPLE);
+    }
+    let routing = match (routing_block.body, routing_block.problem) {
+        (_, Some(SimpleCommentProblem::Truncated)) => {
+            push_warning(&mut warnings, WARNING_ROUTING_TRUNCATED);
+            None
+        }
+        (_, Some(SimpleCommentProblem::TooLarge)) => {
+            push_warning(&mut warnings, WARNING_ROUTING_TOO_LARGE);
+            None
+        }
+        (Some(json), None) => match serde_json::from_str::<SimpleRoutingSnapshot>(json) {
+            Ok(snapshot) if snapshot.schema_version != 1 => {
+                push_warning(&mut warnings, WARNING_ROUTING_SCHEMA);
+                None
+            }
+            Ok(snapshot) if snapshot.risk_policy_version != "b2d_task_risk_v1" => {
+                push_warning(&mut warnings, WARNING_ROUTING_POLICY);
+                None
+            }
+            Ok(snapshot) => Some(snapshot),
+            Err(_) => {
+                push_warning(&mut warnings, WARNING_ROUTING_INVALID_JSON);
+                None
+            }
+        },
+        (None, None) => None,
+    };
     Ok(SimplePlanDocument {
         tasks,
+        routing,
         warning_codes: warnings,
     })
 }
@@ -360,6 +717,16 @@ fn known_run_state(state: &str) -> bool {
     )
 }
 
+fn recognized_expected_work_unit_keys(keys: &SimpleExpectedWorkUnitKeys) -> bool {
+    parse_recognized_work_unit_key(&keys.implementer).is_some()
+        && parse_recognized_work_unit_key(&keys.reviewers.primary).is_some()
+        && keys
+            .reviewers
+            .auxiliary
+            .as_deref()
+            .is_none_or(|key| parse_recognized_work_unit_key(key).is_some())
+}
+
 pub fn parse_simple_progress(
     bytes: &[u8],
     expected_plan_rel_path: &str,
@@ -369,36 +736,42 @@ pub fn parse_simple_progress(
     }
     let source = std::str::from_utf8(bytes).map_err(|_| SimpleParseError::InvalidUtf8)?;
     let mut warnings = Vec::new();
-    let starts = source
-        .match_indices(PROGRESS_MARKER)
-        .map(|(offset, _)| offset)
-        .collect::<Vec<_>>();
-    let Some(start) = starts.first().copied() else {
+    let progress_block =
+        extract_unfenced_comment(source, PROGRESS_MARKER, MAX_SIMPLE_PROGRESS_BLOCK_BYTES);
+    if progress_block.marker_count == 0 {
         push_warning(&mut warnings, WARNING_PROGRESS_MISSING);
         return Ok(SimpleProgressDocument {
             snapshot: None,
             warning_codes: warnings,
         });
-    };
-    if starts.len() > 1 {
+    }
+    if progress_block.marker_count > 1 {
         push_warning(&mut warnings, WARNING_PROGRESS_MULTIPLE);
     }
-    let json_start = start + PROGRESS_MARKER.len();
-    let Some(relative_end) = source[json_start..].find(COMMENT_END) else {
-        push_warning(&mut warnings, WARNING_PROGRESS_TRUNCATED);
-        return Ok(SimpleProgressDocument {
-            snapshot: None,
-            warning_codes: warnings,
-        });
+    let json = match (progress_block.body, progress_block.problem) {
+        (_, Some(SimpleCommentProblem::Truncated)) => {
+            push_warning(&mut warnings, WARNING_PROGRESS_TRUNCATED);
+            return Ok(SimpleProgressDocument {
+                snapshot: None,
+                warning_codes: warnings,
+            });
+        }
+        (_, Some(SimpleCommentProblem::TooLarge)) => {
+            push_warning(&mut warnings, WARNING_PROGRESS_TOO_LARGE);
+            return Ok(SimpleProgressDocument {
+                snapshot: None,
+                warning_codes: warnings,
+            });
+        }
+        (Some(json), None) => json,
+        (None, None) => {
+            push_warning(&mut warnings, WARNING_PROGRESS_TRUNCATED);
+            return Ok(SimpleProgressDocument {
+                snapshot: None,
+                warning_codes: warnings,
+            });
+        }
     };
-    let json = source[json_start..json_start + relative_end].trim();
-    if json.len() > MAX_SIMPLE_PROGRESS_BLOCK_BYTES {
-        push_warning(&mut warnings, WARNING_PROGRESS_TOO_LARGE);
-        return Ok(SimpleProgressDocument {
-            snapshot: None,
-            warning_codes: warnings,
-        });
-    }
     let raw: RawProgressSnapshot = match serde_json::from_str(json) {
         Ok(raw) => raw,
         Err(_) => {
@@ -411,6 +784,18 @@ pub fn parse_simple_progress(
     };
     if raw.schema_version != 1 {
         push_warning(&mut warnings, WARNING_PROGRESS_SCHEMA);
+        return Ok(SimpleProgressDocument {
+            snapshot: None,
+            warning_codes: warnings,
+        });
+    }
+    if raw
+        .tasks
+        .iter()
+        .filter_map(|task| task.expected_work_unit_keys.as_ref())
+        .any(|keys| !recognized_expected_work_unit_keys(keys))
+    {
+        push_warning(&mut warnings, WARNING_PROGRESS_INVALID_JSON);
         return Ok(SimpleProgressDocument {
             snapshot: None,
             warning_codes: warnings,
@@ -452,6 +837,10 @@ pub fn parse_simple_progress(
                     recovery_count: run.recovery_count,
                     replaced_task_id: run.replaced_task_id,
                     replacement_reason: run.replacement_reason,
+                    orchestration_binding: parse_optional_binding_mirror(
+                        run.orchestration_binding,
+                        &mut warnings,
+                    ),
                 }
             })
             .collect();
@@ -459,6 +848,17 @@ pub fn parse_simple_progress(
             index: task.index,
             status,
             commit: task.commit,
+            risk_level: task.risk_level,
+            task_agent_generation: task.task_agent_generation,
+            route_fingerprint: parse_optional_route_fingerprint(
+                task.route_fingerprint,
+                &mut warnings,
+            ),
+            orchestration_binding: parse_optional_binding_mirror(
+                task.orchestration_binding,
+                &mut warnings,
+            ),
+            expected_work_unit_keys: task.expected_work_unit_keys,
             runs,
         });
     }
@@ -513,7 +913,195 @@ pub async fn read_simple_progress(
 
 #[cfg(test)]
 mod tests {
+    use super::super::types::ReviewerSlot;
     use super::*;
+
+    const VALID_ROUTING_JSON: &str = r#"{
+  "schema_version": 1,
+  "risk_policy_version": "b2d_task_risk_v1",
+  "task_agent_generations": [{
+    "generation": 1,
+    "agent_type": "grok",
+    "profile_id": null,
+    "effective_from_task_index": 1
+  }],
+  "tasks": [{
+    "index": 1,
+    "task_agent_generation": 1,
+    "risk": {
+      "level": "high",
+      "hard_triggers": [{
+        "kind": "public_compatibility",
+        "evidence": ["public parser model"]
+      }],
+      "soft_signals": [{
+        "kind": "shared_interface",
+        "score": 1,
+        "evidence": ["Simple Plan projection"]
+      }],
+      "score": 1,
+      "reason": "Adds routing metadata."
+    },
+    "route": {
+      "implementer": {"agent_type": "codex", "profile_id": null},
+      "reviewers": [
+        {"slot": "primary", "agent_type": "codex", "profile_id": null},
+        {"slot": "auxiliary", "agent_type": "grok", "profile_id": null}
+      ]
+    }
+  }]
+}"#;
+
+    fn routed_plan(routing_json: &str) -> String {
+        format!(
+            "# Plan\n\n<!-- codeg-b2d-routing-v1\n{routing_json}\n-->\n\n## Task 1: Parse routing\n\nBody.\n\n### Task 2: Preserve tasks\n\nRun parser tests.\n"
+        )
+    }
+
+    #[test]
+    fn simple_parse_routing_parses_one_bounded_block_with_real_task_headings() {
+        let parsed = parse_simple_plan(routed_plan(VALID_ROUTING_JSON).as_bytes()).expect("parse");
+        assert_eq!(
+            parsed
+                .tasks
+                .iter()
+                .map(|task| (task.index, task.title.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, "Parse routing"), (2, "Preserve tasks")]
+        );
+
+        let routing = parsed.routing.expect("routing");
+        assert_eq!(routing.schema_version, 1);
+        assert_eq!(routing.risk_policy_version, "b2d_task_risk_v1");
+        assert_eq!(routing.task_agent_generations[0].agent_type, "grok");
+        assert_eq!(routing.tasks[0].risk.hard_triggers[0].score, None);
+        assert_eq!(
+            routing.tasks[0].route.reviewers[1].slot,
+            ReviewerSlot::Auxiliary
+        );
+        assert!(parsed.warning_codes.is_empty());
+    }
+
+    #[test]
+    fn simple_parse_routing_keeps_legacy_plan_without_routing_warning() {
+        let parsed = parse_simple_plan(b"## Task 1: Legacy\n\nBody.\n").expect("parse legacy");
+
+        assert!(parsed.routing.is_none());
+        assert!(parsed.warning_codes.is_empty());
+    }
+
+    #[test]
+    fn simple_parse_routing_returns_tasks_and_exact_warning_for_bad_blocks() {
+        let valid = routed_plan(VALID_ROUTING_JSON);
+        let multiple = format!("{valid}\n<!-- codeg-b2d-routing-v1\n{VALID_ROUTING_JSON}\n-->\n");
+        let invalid_json = routed_plan("{not-json}");
+        let unsupported_schema = routed_plan(&VALID_ROUTING_JSON.replacen(
+            "\"schema_version\": 1",
+            "\"schema_version\": 2",
+            1,
+        ));
+        let unsupported_policy =
+            routed_plan(&VALID_ROUTING_JSON.replacen("b2d_task_risk_v1", "future_policy", 1));
+        let truncated = format!(
+            "## Task 1: Parse routing\n\nBody.\n<!-- codeg-b2d-routing-v1\n{VALID_ROUTING_JSON}\n"
+        );
+        let too_large = routed_plan(&"x".repeat(MAX_SIMPLE_ROUTING_BLOCK_BYTES + 1));
+
+        for (name, source, warning, routing_expected) in [
+            ("multiple", multiple, WARNING_ROUTING_MULTIPLE, true),
+            ("truncated", truncated, WARNING_ROUTING_TRUNCATED, false),
+            (
+                "invalid JSON",
+                invalid_json,
+                WARNING_ROUTING_INVALID_JSON,
+                false,
+            ),
+            (
+                "unsupported schema",
+                unsupported_schema,
+                WARNING_ROUTING_SCHEMA,
+                false,
+            ),
+            (
+                "unsupported policy",
+                unsupported_policy,
+                WARNING_ROUTING_POLICY,
+                false,
+            ),
+            ("too large", too_large, WARNING_ROUTING_TOO_LARGE, false),
+        ] {
+            let parsed = parse_simple_plan(source.as_bytes()).unwrap_or_else(|error| {
+                panic!("{name} routing problem must remain recoverable: {error}")
+            });
+            assert_eq!(parsed.tasks[0].index, 1, "{name}");
+            assert_eq!(parsed.tasks[0].title, "Parse routing", "{name}");
+            assert_eq!(parsed.routing.is_some(), routing_expected, "{name}");
+            assert_eq!(parsed.warning_codes, vec![warning], "{name}");
+        }
+    }
+
+    #[test]
+    fn simple_parse_routing_ignores_fenced_marker_examples() {
+        let plan = format!(
+            "# Plan\n\n```markdown\n<!-- codeg-b2d-routing-v1\n{{not-json}}\n-->\n```\n\n~~~markdown\n<!-- codeg-b2d-routing-v1\n{{also-not-json}}\n-->\n~~~\n\n<!-- codeg-b2d-routing-v1\n{VALID_ROUTING_JSON}\n-->\n\n## Task 1: Live routing\n"
+        );
+        let parsed = parse_simple_plan(plan.as_bytes()).expect("parse");
+
+        assert!(parsed.routing.is_some());
+        assert!(parsed.warning_codes.is_empty());
+    }
+
+    #[test]
+    fn simple_parse_routing_applies_commonmark_backtick_info_rule() {
+        let visible = format!(
+            "# Plan\n\n```info`bad\n<!-- codeg-b2d-routing-v1\n{VALID_ROUTING_JSON}\n-->\n```\n"
+        );
+        let parsed =
+            parse_simple_plan(visible.as_bytes()).expect("parse visible marker");
+        assert!(parsed.routing.is_some());
+        assert!(parsed.warning_codes.is_empty());
+
+        for fenced in [
+            format!(
+                "# Plan\n\n```info\n<!-- codeg-b2d-routing-v1\n{VALID_ROUTING_JSON}\n-->\n```\n"
+            ),
+            format!(
+                "# Plan\n\n~~~info`allowed\n<!-- codeg-b2d-routing-v1\n{VALID_ROUTING_JSON}\n-->\n~~~\n"
+            ),
+        ] {
+            let parsed =
+                parse_simple_plan(fenced.as_bytes()).expect("parse fenced marker");
+            assert!(parsed.routing.is_none());
+            assert!(parsed.warning_codes.is_empty());
+        }
+    }
+
+    #[test]
+    fn simple_parse_routing_ignores_prefix_lookalikes_before_live_marker() {
+        let plan = format!(
+            "# Plan\n\n<!-- codeg-b2d-routing-v10\n{{not-v1}}\n-->\n\n<!-- codeg-b2d-routing-v1-extra\n{{also-not-v1}}\n-->\n\n<!-- codeg-b2d-routing-v1\n{VALID_ROUTING_JSON}\n-->\n\n## Task 1: Live routing\n"
+        );
+        let parsed = parse_simple_plan(plan.as_bytes()).expect("parse");
+
+        assert_eq!(
+            parsed.routing.expect("live routing").risk_policy_version,
+            "b2d_task_risk_v1"
+        );
+        assert!(parsed.warning_codes.is_empty());
+    }
+
+    #[test]
+    fn simple_parse_routing_retains_plan_file_utf8_and_size_hard_bounds() {
+        assert_eq!(
+            parse_simple_plan(&[0xff]).expect_err("invalid UTF-8"),
+            SimpleParseError::InvalidUtf8
+        );
+        assert_eq!(
+            parse_simple_plan(&vec![b'x'; MAX_PLAN_MATERIAL_BYTES + 1])
+                .expect_err("Plan file limit"),
+            SimpleParseError::SizeLimitExceeded
+        );
+    }
 
     #[test]
     fn simple_parse_plan_uses_real_markdown_headings_and_warns_without_blocking() {
@@ -584,6 +1172,13 @@ Ignored duplicate.
             snapshot.tasks[0].status,
             SimpleDeclaredStatus::Unknown(ref value) if value == "mystery"
         ));
+        assert!(!matches!(
+            snapshot.tasks[0].status,
+            SimpleDeclaredStatus::Completed
+        ));
+        assert_eq!(snapshot.tasks[0].risk_level, None);
+        assert_eq!(snapshot.tasks[0].task_agent_generation, None);
+        assert_eq!(snapshot.tasks[0].expected_work_unit_keys, None);
         assert_eq!(
             parsed.warning_codes,
             vec![
@@ -592,6 +1187,189 @@ Ignored duplicate.
                 WARNING_PROGRESS_UNKNOWN_RUN_STATE,
             ]
         );
+    }
+
+    #[test]
+    fn simple_parse_progress_preserves_additive_route_metadata_and_canonical_keys() {
+        let progress = br#"<!-- codeg-simple-progress-v1
+{
+  "schema_version": 1,
+  "plan_rel_path": "docs/plan.md",
+  "active_task_index": null,
+  "tasks": [{
+    "index": 2,
+    "status": "pending",
+    "risk_level": "high",
+    "task_agent_generation": 1,
+    "expected_work_unit_keys": {
+      "implementer": "task|2|implementer|codex|none",
+      "reviewers": {
+        "primary": "task|2|reviewer|primary|codex|none",
+        "auxiliary": "task|2|reviewer|auxiliary|grok|none"
+      }
+    },
+    "runs": []
+  }],
+  "final_review_status": "pending"
+}
+-->"#;
+        let parsed = parse_simple_progress(progress, "docs/plan.md").expect("parse");
+        let task = &parsed.snapshot.expect("snapshot").tasks[0];
+
+        assert_eq!(task.risk_level.as_deref(), Some("high"));
+        assert_eq!(task.task_agent_generation, Some(1));
+        let keys = task
+            .expected_work_unit_keys
+            .as_ref()
+            .expect("expected keys");
+        assert_eq!(keys.implementer, "task|2|implementer|codex|none");
+        assert_eq!(keys.reviewers.primary, "task|2|reviewer|primary|codex|none");
+        assert_eq!(
+            keys.reviewers.auxiliary.as_deref(),
+            Some("task|2|reviewer|auxiliary|grok|none")
+        );
+        for key in [
+            Some(keys.implementer.as_str()),
+            Some(keys.reviewers.primary.as_str()),
+            keys.reviewers.auxiliary.as_deref(),
+        ] {
+            assert!(
+                key.and_then(super::super::key::parse_recognized_work_unit_key)
+                    .is_some(),
+                "expected route key must use the canonical grammar"
+            );
+        }
+        assert!(parsed.warning_codes.is_empty());
+    }
+
+    #[test]
+    fn simple_parse_progress_ignores_prefix_lookalikes_before_live_marker() {
+        let progress = br#"<!-- codeg-simple-progress-v10
+{"schema_version":10}
+-->
+<!-- codeg-simple-progress-v1-extra
+{"schema_version":1,"plan_rel_path":"docs/wrong.md","tasks":[]}
+-->
+<!-- codeg-simple-progress-v1
+{
+  "schema_version": 1,
+  "plan_rel_path": "docs/plan.md",
+  "tasks": [{"index": 1, "status": "pending", "runs": []}],
+  "final_review_status": "pending"
+}
+-->"#;
+        let parsed = parse_simple_progress(progress, "docs/plan.md").expect("parse");
+
+        let snapshot = parsed.snapshot.expect("live progress");
+        assert_eq!(snapshot.plan_rel_path, "docs/plan.md");
+        assert_eq!(snapshot.tasks.len(), 1);
+        assert!(parsed.warning_codes.is_empty());
+    }
+
+    #[test]
+    fn simple_parse_progress_rejects_malformed_nested_route_metadata_without_panicking() {
+        let wrong_type = br#"<!-- codeg-simple-progress-v1
+{
+  "schema_version": 1,
+  "plan_rel_path": "docs/plan.md",
+  "tasks": [{
+    "index": 1,
+    "expected_work_unit_keys": {
+      "implementer": "task|1|implementer|grok|none",
+      "reviewers": {"primary": 7, "auxiliary": null}
+    },
+    "runs": []
+  }],
+  "final_review_status": "pending"
+}
+-->"#;
+        let invalid_key = br#"<!-- codeg-simple-progress-v1
+{
+  "schema_version": 1,
+  "plan_rel_path": "docs/plan.md",
+  "tasks": [{
+    "index": 1,
+    "expected_work_unit_keys": {
+      "implementer": "not-a-canonical-key",
+      "reviewers": {
+        "primary": "task|1|reviewer|primary|codex|none",
+        "auxiliary": null
+      }
+    },
+    "runs": []
+  }],
+  "final_review_status": "pending"
+}
+-->"#;
+
+        for (name, malformed) in [
+            ("wrong nested type", wrong_type.as_slice()),
+            ("unrecognized key", invalid_key.as_slice()),
+        ] {
+            let parsed = parse_simple_progress(malformed, "docs/plan.md")
+                .unwrap_or_else(|error| panic!("{name} must be recoverable: {error}"));
+            assert!(parsed.snapshot.is_none(), "{name}");
+            assert_eq!(
+                parsed.warning_codes,
+                vec![WARNING_PROGRESS_INVALID_JSON],
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn simple_parse_progress_keeps_slotted_reviewer_runs_and_profiles_separate() {
+        let progress = br#"<!-- codeg-simple-progress-v1
+{
+  "schema_version": 1,
+  "plan_rel_path": "docs/plan.md",
+  "tasks": [{
+    "index": 2,
+    "status": "in_progress",
+    "runs": [
+      {
+        "role": "implementer",
+        "agent_type": "codex",
+        "profile_id": null,
+        "state": "completed",
+        "work_unit_key": "task|2|implementer|codex|none"
+      },
+      {
+        "role": "reviewer",
+        "agent_type": "codex",
+        "profile_id": "review-profile",
+        "state": "running",
+        "work_unit_key": "task|2|reviewer|primary|codex|review-profile"
+      },
+      {
+        "role": "reviewer",
+        "agent_type": "grok",
+        "profile_id": "task-profile",
+        "state": "running",
+        "work_unit_key": "task|2|reviewer|auxiliary|grok|task-profile"
+      }
+    ]
+  }],
+  "final_review_status": "pending"
+}
+-->"#;
+        let parsed = parse_simple_progress(progress, "docs/plan.md").expect("parse");
+        let snapshot = parsed.snapshot.expect("snapshot");
+        let runs = &snapshot.tasks[0].runs;
+
+        assert_eq!(runs.len(), 3);
+        assert_eq!(runs[1].profile_id.as_deref(), Some("review-profile"));
+        assert_eq!(runs[2].profile_id.as_deref(), Some("task-profile"));
+        assert_eq!(
+            runs[1].work_unit_key.as_deref(),
+            Some("task|2|reviewer|primary|codex|review-profile")
+        );
+        assert_eq!(
+            runs[2].work_unit_key.as_deref(),
+            Some("task|2|reviewer|auxiliary|grok|task-profile")
+        );
+        assert_ne!(runs[1].work_unit_key, runs[2].work_unit_key);
+        assert!(parsed.warning_codes.is_empty());
     }
 
     #[test]
@@ -729,5 +1507,186 @@ Run verification: `cargo test second`
             read_simple_progress(workspace.path(), "missing.md", "docs/plan.md").await,
             Err(SimpleParseError::Unavailable(_))
         ));
+    }
+
+    const TASK6_FINGERPRINT: &str =
+        "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+
+    fn routed_progress_binding_fixture() -> String {
+        format!(
+            r#"<!-- codeg-simple-progress-v1
+{{
+  "schema_version": 1,
+  "plan_rel_path": "docs/plan.md",
+  "active_task_index": 1,
+  "pending_route_change": null,
+  "tasks": [{{
+    "index": 1,
+    "status": "in_progress",
+    "risk_level": "high",
+    "task_agent_generation": 1,
+    "route_fingerprint": "{fingerprint}",
+    "orchestration_binding": {{
+      "schema_version": 1,
+      "namespace": "brainstorm-to-delivery",
+      "generation": 1,
+      "route_fingerprint": "{fingerprint}"
+    }},
+    "expected_work_unit_keys": {{
+      "implementer": "task|1|implementer|codex|none",
+      "reviewers": {{
+        "primary": "task|1|reviewer|primary|codex|none",
+        "auxiliary": "task|1|reviewer|auxiliary|grok|none"
+      }}
+    }},
+    "runs": [{{
+      "role": "implementer",
+      "agent_type": "codex",
+      "profile_id": null,
+      "state": "reserving",
+      "work_unit_key": "task|1|implementer|codex|none",
+      "task_id": null,
+      "child_conversation_id": null,
+      "task_agent_generation": 1,
+      "root_task_id": null,
+      "previous_task_id": null,
+      "lineage_root_task_id": null,
+      "generic_generation": 1,
+      "replaced_task_id": null,
+      "replacement_reason": null,
+      "dispatch_intent": {{
+        "kind": "first",
+        "continuation_target_task_id": null,
+        "replacement_target_task_id": null,
+        "replacement_reason": null,
+        "expected_root_task_id": null,
+        "expected_lineage_root_task_id": null,
+        "expected_generic_generation": 1,
+        "expected_child_conversation_id": null,
+        "adopted_after_lost_acknowledgement": false
+      }},
+      "orchestration_binding": {{
+        "schema_version": 1,
+        "namespace": "brainstorm-to-delivery",
+        "generation": 1,
+        "route_fingerprint": "{fingerprint}"
+      }}
+    }}]
+  }}],
+  "final_review_status": "pending"
+}}
+-->"#,
+            fingerprint = TASK6_FINGERPRINT
+        )
+    }
+
+    #[test]
+    fn simple_orchestration_binding_parses_routed_progress_within_existing_bounds() {
+        let expected = SimpleOrchestrationBinding {
+            schema_version: 1,
+            namespace: SIMPLE_ORCHESTRATION_NAMESPACE.into(),
+            generation: 1,
+            route_fingerprint: TASK6_FINGERPRINT.into(),
+        };
+        let parsed = parse_simple_progress(
+            routed_progress_binding_fixture().as_bytes(),
+            "docs/plan.md",
+        )
+        .expect("parse routed binding progress");
+        let task = &parsed.snapshot.expect("snapshot").tasks[0];
+
+        assert_eq!(task.route_fingerprint.as_deref(), Some(TASK6_FINGERPRINT));
+        assert_eq!(
+            task.orchestration_binding,
+            SimpleBindingMirror::Present(expected.clone())
+        );
+        assert_eq!(
+            task.runs[0].orchestration_binding,
+            SimpleBindingMirror::Present(expected)
+        );
+        assert!(parsed.warning_codes.is_empty());
+
+        let pad = "x".repeat(32 * 1024);
+        let padded = format!(
+            r#"<!-- codeg-simple-progress-v1
+{{"schema_version":1,"plan_rel_path":"docs/plan.md","tasks":[{{"index":1,"status":"pending","route_fingerprint":"{TASK6_FINGERPRINT}","orchestration_binding":{{"schema_version":1,"namespace":"brainstorm-to-delivery","generation":1,"route_fingerprint":"{TASK6_FINGERPRINT}"}},"runs":[]}}],"final_review_status":"pending","pad":"{pad}"}}
+-->"#
+        );
+        assert!(padded.len() < MAX_SIMPLE_PROGRESS_BYTES);
+        assert!(padded.len() < MAX_SIMPLE_PROGRESS_BLOCK_BYTES + 256);
+        let bounded = parse_simple_progress(padded.as_bytes(), "docs/plan.md")
+            .expect("padded binding progress remains recoverable");
+        assert_eq!(
+            bounded
+                .snapshot
+                .expect("bounded snapshot")
+                .tasks[0]
+                .route_fingerprint
+                .as_deref(),
+            Some(TASK6_FINGERPRINT)
+        );
+
+        let over_block = format!(
+            "<!-- codeg-simple-progress-v1 {} -->",
+            "x".repeat(MAX_SIMPLE_PROGRESS_BLOCK_BYTES + 1)
+        );
+        let large = parse_simple_progress(over_block.as_bytes(), "docs/plan.md")
+            .expect("oversized block is recoverable");
+        assert!(large.snapshot.is_none());
+        assert_eq!(large.warning_codes, vec![WARNING_PROGRESS_TOO_LARGE]);
+
+        let mut over_file = routed_progress_binding_fixture();
+        over_file.push_str(&"#".repeat(MAX_SIMPLE_PROGRESS_BYTES + 1));
+        assert_eq!(
+            parse_simple_progress(over_file.as_bytes(), "docs/plan.md")
+                .expect_err("progress file limit"),
+            SimpleParseError::SizeLimitExceeded
+        );
+    }
+
+    #[test]
+    fn simple_orchestration_binding_keeps_snapshot_when_optional_mirror_is_malformed() {
+        let extra_field = br#"<!-- codeg-simple-progress-v1
+{
+  "schema_version": 1,
+  "plan_rel_path": "docs/plan.md",
+  "tasks": [{
+    "index": 1,
+    "status": "pending",
+    "route_fingerprint": 7,
+    "orchestration_binding": {
+      "schema_version": 1,
+      "namespace": "brainstorm-to-delivery",
+      "generation": 1,
+      "route_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "extra": true
+    },
+    "runs": [{
+      "role": "implementer",
+      "agent_type": "codex",
+      "state": "reserving",
+      "work_unit_key": "task|1|implementer|codex|none",
+      "orchestration_binding": ["not", "an", "object"]
+    }]
+  }],
+  "final_review_status": "pending"
+}
+-->"#;
+        let parsed = parse_simple_progress(extra_field, "docs/plan.md")
+            .expect("malformed optional binding stays recoverable");
+        let snapshot = parsed.snapshot.expect("snapshot must survive");
+        assert_eq!(snapshot.tasks[0].index, 1);
+        assert_eq!(
+            snapshot.tasks[0].orchestration_binding,
+            SimpleBindingMirror::Invalid
+        );
+        assert_eq!(
+            snapshot.tasks[0].runs[0].orchestration_binding,
+            SimpleBindingMirror::Invalid
+        );
+        assert_eq!(
+            parsed.warning_codes,
+            vec![WARNING_ORCHESTRATION_BINDING_MISMATCH]
+        );
     }
 }

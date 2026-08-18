@@ -9670,6 +9670,7 @@ mod tests {
             }));
             super::super::with_historical_workflow_fixture_mutations(runs.admit_gen1_reserving(
                 ReservingRunInsert {
+                    orchestration_binding: None,
                     task_id: task_id.into(),
                     root_task_id: task_id.into(),
                     previous_task_id: None,
@@ -12346,6 +12347,7 @@ mod tests {
             }));
             super::super::with_historical_workflow_fixture_mutations(runs.admit_gen1_reserving(
                 ReservingRunInsert {
+                    orchestration_binding: None,
                     task_id: task_id.clone(),
                     root_task_id: task_id.clone(),
                     previous_task_id: None,

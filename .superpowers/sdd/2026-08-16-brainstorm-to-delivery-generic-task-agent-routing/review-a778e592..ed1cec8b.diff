@@ -1,0 +1,350 @@
+# Review package: a778e592e41c2b45bc7e0489140e4b31a9fac6cd..ed1cec8b276d8e9dba4911fdbfb07a2bcbbeeed2
+
+## Commits
+ed1cec8b fix(skill): bind round 19 validator relations
+
+## Files changed
+ .../scripts/validate-contract.lib.mjs              |  68 ++++++++---
+ .../scripts/validate-contract.test.mjs             | 135 +++++++++++++++++++++
+ 2 files changed, 186 insertions(+), 17 deletions(-)
+
+## Diff
+diff --git a/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.lib.mjs b/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.lib.mjs
+index bb08186a..f932902e 100644
+--- a/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.lib.mjs
++++ b/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.lib.mjs
+@@ -904,20 +904,30 @@ const AGENT_CHANGE_SUBJECT_BRIDGE_TERMS = new Set([
+   ...TASK_STATE_MODIFIERS,
+   "later",
+   "now",
+ ])
+ const AGENT_IDENTITY_OBJECT_TERMS = new Set([
+   "identities",
+   "identity",
+   "profile",
+   "profiles",
+ ])
++const AGENT_IDENTITY_OBJECT_PREFIX_TERMS = new Set([
++  "a",
++  "an",
++  "current",
++  "its",
++  "selected",
++  "that",
++  "the",
++  "this",
++])
+ const TASK_STATE_ANAPHOR_ADJUNCT_PREFIXES = [
+   ["according", "to"],
+   ["in", "fact"],
+ ]
+ const TASK_STATE_REPORTING_PREDICATES = new Set([
+   "claim",
+   "claimed",
+   "claims",
+   "indicate",
+   "indicated",
+@@ -3879,30 +3889,35 @@ function previousSegmentHasExplicitNonTaskAntecedent(clause, start) {
+     boundary
+   ).at(-1)
+   const segmentStart = (previousBoundary ?? -1) + 1
+   const modifier = tokenIndexes(
+     clause.tokens,
+     EXPLICIT_NON_TASK_ANTECEDENT_MODIFIERS,
+     segmentStart,
+     boundary
+   ).at(-1)
+   if (modifier === undefined) return false
+-  const subjectHead = clause.tokens
+-    .slice(modifier + 1, boundary)
+-    .find(
+-      (token) =>
+-        !TASK_STATE_SUBJECT_DETERMINERS.has(token) &&
+-        !TASK_STATE_MODIFIERS.has(token) &&
+-        !token.endsWith("ly")
+-    )
++  const subjectTokens = clause.tokens.slice(modifier + 1, boundary)
++  const subjectHeadOffset = subjectTokens.findIndex(
++    (token) =>
++      !TASK_STATE_SUBJECT_DETERMINERS.has(token) &&
++      !TASK_STATE_MODIFIERS.has(token) &&
++      !token.endsWith("ly")
++  )
++  const subjectHead = subjectTokens[subjectHeadOffset]
++  const subjectHeadIndex = modifier + 1 + subjectHeadOffset
++  const hasCloserTaskAntecedent = directiveTasks(clause.tokens).some(
++    (task) => task.index > subjectHeadIndex && task.index < boundary
++  )
+   return (
+     subjectHead !== undefined &&
++    !hasCloserTaskAntecedent &&
+     !new Set(["it", "itself", "task"]).has(subjectHead)
+   )
+ }
+ 
+ function stateSegmentHasExplicitNonTaskSubject(clause, start, end) {
+   const predicate = tokenIndex(
+     clause.tokens,
+     new Set([
+       ...TASK_REACTIVATION_PREDICATES,
+       ...TASK_REACTIVATION_STATE_LINKS,
+@@ -3960,20 +3975,25 @@ function taskMentionIsNestedInNonTaskSubject(clause, task, state) {
+   ).at(-1)
+   const punctuationBoundary = [...(clause.actionBoundaryAfter ?? [])]
+     .filter((candidate) => candidate < task.index)
+     .sort((left, right) => right - left)[0]
+   const prefixStart = Math.max(boundary ?? -1, punctuationBoundary ?? -1) + 1
+   const prefix = clause.tokens.slice(prefixStart, task.index)
+   const objectLink = prefix.findLastIndex(
+     (token) => PEOPLE_ANTECEDENT_LINKS.has(token) || token.endsWith("ing")
+   )
+   if (objectLink < 0) return false
++  if (
++    TASK_REACTIVATION_PREDICATES.has(clause.tokens[prefixStart + objectLink])
++  ) {
++    return false
++  }
+   const subjectHead = prefix
+     .slice(0, objectLink)
+     .find(
+       (token) =>
+         !TASK_STATE_SUBJECT_DETERMINERS.has(token) &&
+         !TASK_STATE_MODIFIERS.has(token) &&
+         !token.endsWith("ly")
+     )
+   if (subjectHead === undefined && punctuationBoundary !== undefined) {
+     const parentheticalEnd = [...(clause.actionBoundaryAfter ?? [])].some(
+@@ -4430,20 +4450,21 @@ function completionHasDirectObject(clause, completion) {
+     coordinator < 0 ? clause.tokens.length : coordinator
+   )
+   const tail = clause.tokens.slice(completion + 1, end)
+   const head = tail.findIndex(
+     (token) =>
+       !TASK_STATE_MODIFIERS.has(token) &&
+       !TASK_COMPLETION_SEQUENCE_TERMS.has(token) &&
+       !token.endsWith("ly")
+   )
+   if (head < 0) return false
++  if (clause.possessiveIndexes?.has(completion + 1 + head)) return true
+   if (
+     new Set([
+       ...ACTIVE_TIMING_MARKERS,
+       ...BOUNDARY_TIMING_MARKERS,
+       ...PRE_COMPLETION_TIMING_MARKERS,
+       "by",
+       "for",
+       "from",
+       "in",
+       "of",
+@@ -4695,29 +4716,42 @@ function hasCompletedTaskTiming(clause) {
+ }
+ 
+ function hasPreCompletionTaskTiming(clause) {
+   return tokenIndexes(clause.tokens, PRE_COMPLETION_TIMING_MARKERS).some(
+     (marker) => timingReferencesCompletion(clause, marker)
+   )
+ }
+ 
+ function changeHasExplicitNonAgentObject(clause, change) {
+   const segment = actionSegment(clause, change)
+-  if (
+-    tokenIndex(
+-      clause.tokens,
+-      AGENT_IDENTITY_OBJECT_TERMS,
+-      change + 1,
+-      segment.end
+-    ) >= 0
+-  ) {
+-    return false
++  const identityObject = tokenIndex(
++    clause.tokens,
++    AGENT_IDENTITY_OBJECT_TERMS,
++    change + 1,
++    segment.end
++  )
++  if (identityObject >= 0) {
++    const identityPrefix = clause.tokens
++      .slice(change + 1, identityObject)
++      .filter(
++        (token) =>
++          !AGENT_CHANGE_SUBJECT_BRIDGE_TERMS.has(token) &&
++          !TASK_STATE_MODIFIERS.has(token) &&
++          !token.endsWith("ly")
++      )
++    if (
++      identityPrefix.every((token) =>
++        AGENT_IDENTITY_OBJECT_PREFIX_TERMS.has(token)
++      )
++    ) {
++      return false
++    }
+   }
+   const tailActors = clause.actors.filter(
+     (actor) => actor.start > change && actor.end <= segment.end
+   )
+   if (
+     tailActors.length > 0 ||
+     tokenIndex(
+       clause.tokens,
+       new Set(["agent", "agents", ...REFLEXIVE_TARGETS]),
+       change + 1,
+diff --git a/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.test.mjs b/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.test.mjs
+index 66347e25..f70b432e 100644
+--- a/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.test.mjs
++++ b/.agents/skills/brainstorm-to-delivery/scripts/validate-contract.test.mjs
+@@ -4900,20 +4900,155 @@ describe("Skill contract v2", () => {
+         reject: false,
+       },
+       {
+         prose:
+           "The active Task is completed but, with testing complete, the server restarts and it is still running. Then switch the Task Agent.",
+         reject: false,
+       },
+     ])
+   })
+ 
++  it("round-19 distinguishes possessive temporal objects from completion adjuncts", () => {
++    assertSkillClassifications([
++      ...[
++        "today's documentation",
++        "yesterday's migration",
++        "tomorrow's checklist",
++        "tomorrow's migration",
++      ].map((object) => ({
++        prose: `The active Task is partially complete and later completed ${object}. Then switch the Task Agent.`,
++        reject: true,
++      })),
++      ...[
++        "yesterday",
++        "today",
++        "tomorrow",
++        "without issues",
++        "without errors",
++        "ahead of schedule",
++        "under budget",
++      ].map((adjunct) => ({
++        prose: `The active Task is partially complete and later completed ${adjunct}. Then switch the Task Agent.`,
++        reject: false,
++      })),
++      {
++        prose:
++          "The active Task is partially complete and later completed documentation. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The active Task is partially complete and afterward completed the migration. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The active Task is completed and afterward resumes running. Then switch the Task Agent.",
++        reject: true,
++      },
++    ])
++  })
++
++  it("round-19 binds identity terms only as direct Agent change objects", () => {
++    assertSkillClassifications([
++      ...[
++        "switches branches after checking the browser profile",
++        "will switch branches after comparing profiles",
++        "will change the compiler profile immediately",
++        "will change its logging profile immediately",
++      ].map((action) => ({
++        prose: `The active Task is running. The Task Agent ${action}.`,
++        reject: false,
++      })),
++      ...[
++        "will switch identities immediately",
++        "will switch profiles immediately",
++        "will change its selected profile immediately",
++      ].map((action) => ({
++        prose: `The active Task is running. The Task Agent ${action}.`,
++        reject: true,
++      })),
++      ...[
++        "will switch branches immediately",
++        "can change directories",
++        "should replace a file",
++        "may switch the logging mode",
++      ].map((action) => ({
++        prose: `The active Task is running. The Task Agent ${action}.`,
++        reject: false,
++      })),
++    ])
++  })
++
++  it("round-19 prefers a closer explicit Task restart antecedent", () => {
++    assertSkillClassifications([
++      ...["monitors the Task", "restarts the Task"].map((relation) => ({
++        prose: `The Task is completed but a separate service ${relation} and the server restarts it and it is still running. Then switch the Task Agent.`,
++        reject: true,
++      })),
++      {
++        prose:
++          "The Task is completed but a separate service fails and the server restarts it and it is still running. Then switch the Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "The Task is completed but the server restarts it and it is still running. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The Task is completed but the server restarts and it is still running. Then switch the Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "The Task is completed but the server restarts itself and it is still running. Then switch the Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "The Task is completed but the server restarts after it receives a signal and it is still running. Then switch the Task Agent.",
++        reject: false,
++      },
++    ])
++  })
++
++  it("round-19 preserves explicit Task reactivation inside a parenthetical", () => {
++    assertSkillClassifications([
++      {
++        prose:
++          "The active Task is completed but the server, restarting the Task, restarts and it is still running. Then switch the Task Agent.",
++        reject: true,
++      },
++      {
++        prose:
++          "The active Task is completed but the server, monitoring the Task, restarts and it is still running. Then switch the Task Agent.",
++        reject: false,
++      },
++      ...["monitoring", "testing"].map((activity) => ({
++        prose: `The active Task is completed but, with ${activity} complete, the Task restarts. Then switch the Task Agent.`,
++        reject: true,
++      })),
++      {
++        prose:
++          "The active Task is completed but, with monitoring complete, the server restarts. Then switch the Task Agent.",
++        reject: false,
++      },
++      {
++        prose:
++          "The active Task is completed but, with testing complete, the server restarts and it is still running. Then switch the Task Agent.",
++        reject: false,
++      },
++    ])
++  })
++
+   it("contains the complete operational policy and document JSON shapes", () => {
+     const policy = fencedJsonAfterHeading(
+       realSkill,
+       "### Operational policy JSON"
+     )
+     assert.deepEqual(policy.design_review_triggers, [
+       "spans_modules",
+       "migration",
+       "concurrency",
+       "security",

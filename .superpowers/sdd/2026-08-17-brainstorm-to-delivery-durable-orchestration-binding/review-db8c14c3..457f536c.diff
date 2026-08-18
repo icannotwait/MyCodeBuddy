@@ -1,0 +1,3548 @@
+# Review package: db8c14c3..457f536cb4c1731098f62752650aa54ebefeaf76
+
+## Commits
+457f536c feat(delegation): persist orchestration bindings
+
+## Files changed
+ src-tauri/src/acp/connection.rs                    |   1 +
+ src-tauri/src/acp/delegation/attention.rs          |   1 +
+ src-tauri/src/acp/delegation/broker.rs             |  34 +-
+ src-tauri/src/acp/delegation/listener.rs           |  22 +-
+ src-tauri/src/acp/delegation/run_store.rs          | 657 ++++++++++++++++++++-
+ src-tauri/src/acp/delegation/store.rs              |   2 +
+ src-tauri/src/acp/delegation/types.rs              | 113 ++++
+ src-tauri/src/acp/delegation/workflow/admission.rs |   1 +
+ .../acp/delegation/workflow/completion_evidence.rs |  12 +-
+ src-tauri/src/acp/delegation/workflow/project.rs   |  12 +
+ .../src/acp/delegation/workflow/recovery_tests.rs  |   2 +
+ src-tauri/src/acp/delegation/workflow/store.rs     |   2 +
+ src-tauri/src/db/entities/delegation_task_run.rs   |   4 +
+ ...817_000001_delegation_orchestration_bindings.rs | 392 ++++++++++++
+ src-tauri/src/db/migration/mod.rs                  |   6 +
+ src-tauri/tests/completion_protocol_v2.rs          |   5 +
+ src-tauri/tests/completion_transport_parity.rs     |   1 +
+ .../tests/delegation_session_reuse_integration.rs  |   7 +
+ .../tests/fixtures/orchestration_binding_v1.json   | 232 ++++++++
+ 19 files changed, 1473 insertions(+), 33 deletions(-)
+
+## Diff
+diff --git a/src-tauri/src/acp/connection.rs b/src-tauri/src/acp/connection.rs
+index e2d31a33..2e7b5420 100644
+--- a/src-tauri/src/acp/connection.rs
++++ b/src-tauri/src/acp/connection.rs
+@@ -22373,20 +22373,21 @@ mod tests {
+             folder,
+             AgentType::ClaudeCode,
+             Some(format!("child-{label}")),
+             None,
+         )
+         .await
+         .expect("child");
+         let runs = Arc::new(RunStore::new(db.clone()));
+         let task_id = format!("task-resume-contract-{label}");
+         runs.insert_reserving(ReservingRunInsert {
++            orchestration_binding: None,
+             task_id: task_id.clone(),
+             root_task_id: task_id.clone(),
+             previous_task_id: Some("task-gen1".into()),
+             generation: 2,
+             parent_conversation_id: parent.id,
+             parent_tool_use_id: Some(format!("pt-{label}")),
+             child_conversation_id: child.id,
+             agent_type: AgentType::ClaudeCode.to_string(),
+             profile_id: None,
+             workspace_path: Some(format!("/tmp/codeg-resume-contract-{label}")),
+diff --git a/src-tauri/src/acp/delegation/attention.rs b/src-tauri/src/acp/delegation/attention.rs
+index 2887d706..6e5cfea9 100644
+--- a/src-tauri/src/acp/delegation/attention.rs
++++ b/src-tauri/src/acp/delegation/attention.rs
+@@ -1198,20 +1198,21 @@ mod tests {
+         async fn seed_running_run(
+             db: &Arc<AppDatabase>,
+             parent_id: i32,
+             child_id: i32,
+             task_id: &str,
+             generation: i64,
+         ) {
+             let store = RunStore::new(db.clone());
+             store
+                 .insert_reserving(ReservingRunInsert {
++                    orchestration_binding: None,
+                     task_id: task_id.into(),
+                     root_task_id: task_id.into(),
+                     previous_task_id: None,
+                     generation,
+                     parent_conversation_id: parent_id,
+                     parent_tool_use_id: Some(format!("tu-{task_id}")),
+                     child_conversation_id: child_id,
+                     agent_type: "codex".into(),
+                     profile_id: None,
+                     workspace_path: Some("/tmp/ws".into()),
+diff --git a/src-tauri/src/acp/delegation/broker.rs b/src-tauri/src/acp/delegation/broker.rs
+index 291d6bd7..b2deede5 100644
+--- a/src-tauri/src/acp/delegation/broker.rs
++++ b/src-tauri/src/acp/delegation/broker.rs
+@@ -6349,20 +6349,21 @@ impl DelegationBroker {
+         );
+         let route_fp = live_launch.snapshot.route_fingerprint.clone();
+         let request_fp = request_fingerprint(
+             DELEGATE_TO_AGENT_TOOL,
+             &req.task,
+             req.work_unit_key.as_deref(),
+             req.replaces_task_id.as_deref(),
+             req.replacement_reason.as_deref(),
+             None,
+             &route_fp,
++            None,
+         );
+ 
+         // Parent-tool exact-duplicate handling BEFORE reserve/spawn (design
+         // precedence). Matching fingerprint → idempotent running ack without
+         // creating a new child; mismatch → reject.
+         if let Some(runs) = self.run_store.as_ref() {
+             if !req.parent_tool_use_id.is_empty() {
+                 match runs
+                     .load_by_parent_tool_use(req.parent_conversation_id, &req.parent_tool_use_id)
+                     .await
+@@ -6582,20 +6583,21 @@ impl DelegationBroker {
+                     }
+                 }
+             } else {
+                 (
+                     AdmissionClass::NormalRevision,
+                     call_id.clone(),
+                     call_id.clone(),
+                 )
+             };
+             let insert = ReservingRunInsert {
++                orchestration_binding: None,
+                 task_id: call_id.clone(),
+                 root_task_id,
+                 previous_task_id: None,
+                 generation: 1,
+                 parent_conversation_id: req.parent_conversation_id,
+                 parent_tool_use_id: if req.parent_tool_use_id.is_empty() {
+                     None
+                 } else {
+                     Some(req.parent_tool_use_id.clone())
+                 },
+@@ -9389,20 +9391,21 @@ impl DelegationBroker {
+         let request_fp = request_fingerprint(
+             CONTINUE_DELEGATION_TOOL,
+             &req.task,
+             req.work_unit_key
+                 .as_deref()
+                 .or(target.work_unit_key.as_deref()),
+             None,
+             None,
+             Some(&req.target_task_id),
+             &route_fp,
++            None,
+         );
+ 
+         // Exact parent-tool replays are resolved before capability or
+         // lifecycle gates. Matching fingerprint is idempotent; terminal rows
+         // project durable status (never a false running reuse ack).
+         match runs
+             .load_by_parent_tool_use(req.parent_conversation_id, &req.parent_tool_use_id)
+             .await
+         {
+             Ok(Some(existing)) => {
+@@ -16015,20 +16018,21 @@ mod tests {
+                 }),
+             )
+             .await
+             .expect("telemetry source child");
+             let agent_type = serde_json::to_value(AgentType::ClaudeCode)
+                 .expect("agent type json")
+                 .as_str()
+                 .expect("agent type string")
+                 .to_string();
+             runs.insert_reserving(ReservingRunInsert {
++                orchestration_binding: None,
+                 task_id: source_task_id.clone(),
+                 root_task_id: source_task_id.clone(),
+                 previous_task_id: None,
+                 generation: 1,
+                 parent_conversation_id: parent.id,
+                 parent_tool_use_id: Some("telemetry-source-tool".into()),
+                 child_conversation_id: source_child.id,
+                 agent_type,
+                 profile_id: None,
+                 workspace_path: Some(launch.snapshot.workspace_path),
+@@ -16108,20 +16112,21 @@ mod tests {
+             let workspace_path = test_working_dir();
+             let launch = build_live_launch_config(
+                 AgentType::ClaudeCode,
+                 None,
+                 &workspace_path,
+                 None,
+                 BTreeMap::new(),
+             );
+             let runs = Arc::new(RunStore::new(db.clone()));
+             runs.insert_reserving(ReservingRunInsert {
++                orchestration_binding: None,
+                 task_id: source_task_id.into(),
+                 root_task_id: source_task_id.into(),
+                 previous_task_id: None,
+                 generation: 1,
+                 parent_conversation_id: parent.id,
+                 parent_tool_use_id: Some("resume-source-tool".into()),
+                 child_conversation_id: source_child.id,
+                 agent_type: serde_json::to_value(AgentType::ClaudeCode)
+                     .unwrap()
+                     .as_str()
+@@ -16466,20 +16471,21 @@ mod tests {
+             let workspace_path = test_working_dir();
+             let launch = build_live_launch_config(
+                 AgentType::ClaudeCode,
+                 None,
+                 &workspace_path,
+                 None,
+                 BTreeMap::new(),
+             );
+             let runs = Arc::new(RunStore::new(db.clone()));
+             runs.insert_reserving(ReservingRunInsert {
++                orchestration_binding: None,
+                 task_id: source_task_id.into(),
+                 root_task_id: source_task_id.into(),
+                 previous_task_id: None,
+                 generation: 1,
+                 parent_conversation_id: parent.id,
+                 parent_tool_use_id: Some("status-source-tool".into()),
+                 child_conversation_id: source_child.id,
+                 agent_type: serde_json::to_value(AgentType::ClaudeCode)
+                     .unwrap()
+                     .as_str()
+@@ -23780,20 +23786,21 @@ mod tests {
+             folder,
+             AgentType::ClaudeCode,
+             Some("child-preboot".into()),
+             None,
+         )
+         .await
+         .expect("child");
+         let runs = Arc::new(RunStore::new(db.clone()));
+         let task_id = "task-preboot-continue".to_string();
+         runs.insert_reserving(ReservingRunInsert {
++            orchestration_binding: None,
+             task_id: task_id.clone(),
+             root_task_id: task_id.clone(),
+             previous_task_id: Some("task-gen1".into()),
+             generation: 2,
+             parent_conversation_id: parent.id,
+             parent_tool_use_id: Some("pt-continue-1".into()),
+             child_conversation_id: child.id,
+             agent_type: AgentType::ClaudeCode.to_string(),
+             profile_id: None,
+             workspace_path: Some("/tmp/codeg-pre-bootstrap-unres".into()),
+@@ -23986,20 +23993,21 @@ mod tests {
+             folder,
+             AgentType::ClaudeCode,
+             Some("child-bind-fail".into()),
+             None,
+         )
+         .await
+         .expect("child");
+         let runs = Arc::new(RunStore::new(db.clone()));
+         let task_id = "task-bind-fail-admission".to_string();
+         runs.insert_reserving(ReservingRunInsert {
++            orchestration_binding: None,
+             task_id: task_id.clone(),
+             root_task_id: task_id.clone(),
+             previous_task_id: None,
+             generation: 2,
+             parent_conversation_id: parent.id,
+             parent_tool_use_id: Some("pt-bind-fail".into()),
+             child_conversation_id: child.id,
+             agent_type: AgentType::ClaudeCode.to_string(),
+             profile_id: None,
+             workspace_path: Some("/tmp/codeg-bind-fail-handoff".into()),
+@@ -24513,20 +24521,21 @@ mod tests {
+             folder,
+             AgentType::ClaudeCode,
+             Some("child-same-run".into()),
+             None,
+         )
+         .await
+         .expect("child");
+         let runs = Arc::new(RunStore::new(db.clone()));
+         let task_id = "task-same-conn-running".to_string();
+         runs.insert_reserving(ReservingRunInsert {
++            orchestration_binding: None,
+             task_id: task_id.clone(),
+             root_task_id: task_id.clone(),
+             previous_task_id: None,
+             generation: 1,
+             parent_conversation_id: parent.id,
+             parent_tool_use_id: Some("pt-same-run".into()),
+             child_conversation_id: child.id,
+             agent_type: AgentType::ClaudeCode.to_string(),
+             profile_id: None,
+             workspace_path: Some("/tmp".into()),
+@@ -25080,20 +25089,21 @@ mod tests {
+             folder,
+             AgentType::ClaudeCode,
+             Some("child-no-handoff".into()),
+             None,
+         )
+         .await
+         .expect("child");
+         let runs = Arc::new(RunStore::new(db.clone()));
+         let task_id = "task-no-handoff".to_string();
+         runs.insert_reserving(ReservingRunInsert {
++            orchestration_binding: None,
+             task_id: task_id.clone(),
+             root_task_id: task_id.clone(),
+             previous_task_id: None,
+             generation: 2,
+             parent_conversation_id: parent.id,
+             parent_tool_use_id: Some("pt-no-handoff".into()),
+             child_conversation_id: child.id,
+             agent_type: AgentType::ClaudeCode.to_string(),
+             profile_id: None,
+             workspace_path: None,
+@@ -26786,20 +26796,21 @@ mod tests {
+                 folder,
+                 AgentType::ClaudeCode,
+                 Some(format!("child-{code}")),
+                 None,
+             )
+             .await
+             .unwrap();
+             let runs = Arc::new(RunStore::new(db.clone()));
+             let task_id = format!("task-finalizer-{code}");
+             runs.insert_reserving(ReservingRunInsert {
++                orchestration_binding: None,
+                 task_id: task_id.clone(),
+                 root_task_id: task_id.clone(),
+                 previous_task_id: None,
+                 generation: 1,
+                 parent_conversation_id: parent.id,
+                 parent_tool_use_id: Some(format!("pt-{code}")),
+                 child_conversation_id: child.id,
+                 agent_type: AgentType::ClaudeCode.to_string(),
+                 profile_id: None,
+                 workspace_path: Some(format!("/tmp/{code}")),
+@@ -27756,20 +27767,21 @@ mod tests {
+             folder,
+             AgentType::ClaudeCode,
+             Some(format!("child-{label}")),
+             None,
+         )
+         .await
+         .expect("child");
+         let runs = Arc::new(RunStore::new(db.clone()));
+         let task_id = format!("task-boot-{label}");
+         runs.insert_reserving(ReservingRunInsert {
++            orchestration_binding: None,
+             task_id: task_id.clone(),
+             root_task_id: task_id.clone(),
+             previous_task_id: Some("task-gen1".into()),
+             generation: 2,
+             parent_conversation_id: parent.id,
+             parent_tool_use_id: Some(format!("pt-{label}")),
+             child_conversation_id: child.id,
+             agent_type: AgentType::ClaudeCode.to_string(),
+             profile_id: None,
+             workspace_path: Some(format!("/tmp/codeg-boot-{label}")),
+@@ -27997,20 +28009,21 @@ mod tests {
+             folder,
+             AgentType::ClaudeCode,
+             Some("child-perm".into()),
+             None,
+         )
+         .await
+         .unwrap();
+         let runs = Arc::new(RunStore::new(db.clone()));
+         let task_id = "task-boot-perm".to_string();
+         runs.insert_reserving(ReservingRunInsert {
++            orchestration_binding: None,
+             task_id: task_id.clone(),
+             root_task_id: task_id.clone(),
+             previous_task_id: Some("g1".into()),
+             generation: 2,
+             parent_conversation_id: parent.id,
+             parent_tool_use_id: Some("pt-perm".into()),
+             child_conversation_id: child.id,
+             agent_type: AgentType::ClaudeCode.to_string(),
+             profile_id: None,
+             workspace_path: Some("/tmp/codeg-boot-perm".into()),
+@@ -28122,20 +28135,21 @@ mod tests {
+             AgentType::ClaudeCode,
+             Some("child-perm-pe".into()),
+             None,
+         )
+         .await
+         .unwrap();
+         let runs = Arc::new(RunStore::new(db.clone()));
+         let task_id = "task-boot-perm-pe".to_string();
+         let parent_conn = "parent-conn-perm-pe".to_string();
+         runs.insert_reserving(ReservingRunInsert {
++            orchestration_binding: None,
+             task_id: task_id.clone(),
+             root_task_id: task_id.clone(),
+             previous_task_id: Some("g1".into()),
+             generation: 2,
+             parent_conversation_id: parent.id,
+             parent_tool_use_id: Some("pt-perm-pe".into()),
+             child_conversation_id: child.id,
+             agent_type: AgentType::ClaudeCode.to_string(),
+             profile_id: None,
+             workspace_path: Some("/tmp/codeg-boot-perm-pe".into()),
+@@ -28258,20 +28272,21 @@ mod tests {
+             AgentType::ClaudeCode,
+             Some("child-perm-dur".into()),
+             None,
+         )
+         .await
+         .unwrap();
+         let runs = Arc::new(RunStore::new(db.clone()));
+         let task_id = "task-boot-perm-dur".to_string();
+         let parent_conn = "parent-conn-perm-dur".to_string();
+         runs.insert_reserving(ReservingRunInsert {
++            orchestration_binding: None,
+             task_id: task_id.clone(),
+             root_task_id: task_id.clone(),
+             previous_task_id: Some("g1".into()),
+             generation: 2,
+             parent_conversation_id: parent.id,
+             parent_tool_use_id: Some("pt-perm-dur".into()),
+             child_conversation_id: child.id,
+             agent_type: AgentType::ClaudeCode.to_string(),
+             profile_id: None,
+             workspace_path: Some("/tmp/codeg-boot-perm-dur".into()),
+@@ -28439,20 +28454,21 @@ mod tests {
+             AgentType::ClaudeCode,
+             Some("child-pe-race".into()),
+             None,
+         )
+         .await
+         .unwrap();
+         let runs = Arc::new(RunStore::new(db.clone()));
+         let task_id = "task-boot-pe-race".to_string();
+         let parent_conn = "parent-conn-pe-race".to_string();
+         runs.insert_reserving(ReservingRunInsert {
++            orchestration_binding: None,
+             task_id: task_id.clone(),
+             root_task_id: task_id.clone(),
+             previous_task_id: Some("g1".into()),
+             generation: 2,
+             parent_conversation_id: parent.id,
+             parent_tool_use_id: Some("pt-pe-race".into()),
+             child_conversation_id: child.id,
+             agent_type: AgentType::ClaudeCode.to_string(),
+             profile_id: None,
+             workspace_path: Some("/tmp/codeg-boot-pe-race".into()),
+@@ -28647,20 +28663,21 @@ mod tests {
+             AgentType::ClaudeCode,
+             Some("child-cas-excl".into()),
+             None,
+         )
+         .await
+         .unwrap();
+         let runs = Arc::new(RunStore::new(db.clone()));
+         let task_id = "task-boot-cas-excl".to_string();
+         let parent_conn = "parent-conn-cas-excl".to_string();
+         runs.insert_reserving(ReservingRunInsert {
++            orchestration_binding: None,
+             task_id: task_id.clone(),
+             root_task_id: task_id.clone(),
+             previous_task_id: Some("g1".into()),
+             generation: 2,
+             parent_conversation_id: parent.id,
+             parent_tool_use_id: Some("pt-cas-excl".into()),
+             child_conversation_id: child.id,
+             agent_type: AgentType::ClaudeCode.to_string(),
+             profile_id: None,
+             workspace_path: Some("/tmp/codeg-boot-cas-excl".into()),
+@@ -29912,20 +29929,21 @@ mod tests {
+             folder,
+             AgentType::ClaudeCode,
+             Some("child-preboot-cancel".into()),
+             None,
+         )
+         .await
+         .expect("child");
+         let runs = Arc::new(RunStore::new(db.clone()));
+         let task_id = "task-preboot-parent-cancel".to_string();
+         runs.insert_reserving(ReservingRunInsert {
++            orchestration_binding: None,
+             task_id: task_id.clone(),
+             root_task_id: task_id.clone(),
+             previous_task_id: Some("task-gen1".into()),
+             generation: 2,
+             parent_conversation_id: parent.id,
+             parent_tool_use_id: Some("pt-preboot-cancel".into()),
+             child_conversation_id: child.id,
+             agent_type: AgentType::ClaudeCode.to_string(),
+             profile_id: None,
+             workspace_path: Some("/tmp/codeg-preboot-parent-cancel".into()),
+@@ -32861,20 +32879,21 @@ mod tests {
+                 crate::db::entities::delegation_task_run::AdmissionClass::NormalRevision,
+             lineage_root_task_id: "run-1".into(),
+             work_unit_key: None,
+             history_only: false,
+             route_fingerprint: None,
+             workspace_path: None,
+             launch_snapshot_version: None,
+             mode_id: None,
+             config_values_json: None,
+             profile_id: None,
++            orchestration_binding: None,
+             runtime_stats: None,
+             replaced_task_id: None,
+             replacement_reason: None,
+             recovery_authorization_id: None,
+         };
+         let reserving_report = continue_idempotent_ack(&reserving, "run-2".into());
+         assert!(
+             reserving_report
+                 .message
+                 .as_deref()
+@@ -35510,24 +35529,25 @@ mod tests {
+     }
+ 
+     async fn v2_plan_author_launch_fixture_before_v2_only() -> (
+         Arc<crate::db::AppDatabase>,
+         Arc<RunStore>,
+         Arc<MockSpawner>,
+         Arc<crate::acp::delegation::event_emitter::mock::MockEventEmitter>,
+         Arc<HistoricalWorkflowBroker>,
+         i32,
+     ) {
+-        v2_plan_author_launch_fixture_with_db(Arc::new(
+-            crate::db::test_helpers::historical_completion_protocol_db_before_v2_only().await,
+-        ))
+-        .await
++        let db = crate::db::test_helpers::historical_completion_protocol_db_before_v2_only().await;
++        crate::db::migration::install_for_historical_completion_fixture(&db)
++            .await
++            .expect("install orchestration binding migration for historical fixture");
++        v2_plan_author_launch_fixture_with_db(Arc::new(db)).await
+     }
+ 
+     fn v2_plan_author_request(parent_id: i32, tool_use_id: &str) -> DelegationRequest {
+         let mut request = request(parent_id, tool_use_id);
+         request.agent_type = AgentType::Codex;
+         request.working_dir = Some(test_working_dir());
+         request.work_unit_key = Some(v2_plan_author_work_unit_key());
+         request
+     }
+ 
+@@ -36499,20 +36519,21 @@ mod tests {
+             }),
+         )
+         .await
+         .expect("seed terminal replay child");
+         let agent_type = serde_json::to_value(AgentType::ClaudeCode)
+             .expect("agent type json")
+             .as_str()
+             .expect("agent type string")
+             .to_string();
+         runs.admit_gen1_reserving(ReservingRunInsert {
++            orchestration_binding: None,
+             task_id: task_id.into(),
+             root_task_id: task_id.into(),
+             previous_task_id: None,
+             generation: 1,
+             parent_conversation_id: parent_id,
+             parent_tool_use_id: Some(parent_tool_use_id.into()),
+             child_conversation_id: child.id,
+             agent_type,
+             profile_id: None,
+             workspace_path: Some(launch.snapshot.workspace_path),
+@@ -36915,20 +36936,21 @@ mod tests {
+             entered_rx.await.expect("gen-1 precheck entered");
+ 
+             let request_fingerprint = request_fingerprint(
+                 DELEGATE_TO_AGENT_TOOL,
+                 "do x",
+                 None,
+                 None,
+                 None,
+                 None,
+                 &launch.snapshot.route_fingerprint,
++                None,
+             );
+             let terminal = match suffix {
+                 "completed" => {
+                     TerminalTaskWrite::completed(Utc::now(), ConversationStatus::PendingReview)
+                 }
+                 "failed" => TerminalTaskWrite::failed(
+                     "child_refusal",
+                     Utc::now(),
+                     ConversationStatus::Cancelled,
+                 ),
+@@ -38956,20 +38978,21 @@ mod tests {
+         );
+ 
+         let expected_fp = request_fingerprint(
+             DELEGATE_TO_AGENT_TOOL,
+             "do x",
+             None,
+             None,
+             None,
+             None,
+             gen1.route_fingerprint.as_deref().unwrap_or(""),
++            None,
+         );
+         assert_eq!(
+             gen1.request_fingerprint.as_deref(),
+             Some(expected_fp.as_str()),
+             "request_fingerprint must ignore correlation_id"
+         );
+ 
+         let child = conversation::Entity::find_by_id(child_id)
+             .one(&db.conn)
+             .await
+@@ -39008,20 +39031,21 @@ mod tests {
+         let gen2_dbg = format!("{gen2:?}");
+         assert!(!gen2_dbg.contains(cont_secret) && !gen2_dbg.contains(secret));
+         let cont_fp = request_fingerprint(
+             CONTINUE_DELEGATION_TOOL,
+             "more work",
+             None,
+             None,
+             None,
+             Some(&root_task_id),
+             gen2.route_fingerprint.as_deref().unwrap_or(""),
++            None,
+         );
+         assert_eq!(gen2.request_fingerprint.as_deref(), Some(cont_fp.as_str()));
+     }
+ 
+     #[tokio::test]
+     async fn after_exact_claim_resolution_tracing_does_not_log_correlation_id_field() {
+         // After resolution, structured tracing must not newly log `correlation_id=`.
+         // Capture fmt output for a successful empty-meta exact claim path.
+         use crate::acp::delegation::types::ContinueDelegationRequest;
+         use crate::db::entities::conversation;
+@@ -39854,20 +39878,21 @@ mod tests {
+             }),
+         )
+         .await
+         .expect("source child");
+         let agent_type = serde_json::to_value(AgentType::ClaudeCode)
+             .expect("agent type json")
+             .as_str()
+             .expect("agent type string")
+             .to_string();
+         runs.insert_reserving(ReservingRunInsert {
++            orchestration_binding: None,
+             task_id: source_task_id.into(),
+             root_task_id: source_task_id.into(),
+             previous_task_id: None,
+             generation: 1,
+             parent_conversation_id: parent.id,
+             parent_tool_use_id: Some("tu-adm-unk-idem-src".into()),
+             child_conversation_id: source_child.id,
+             agent_type,
+             profile_id: None,
+             workspace_path: Some(launch.snapshot.workspace_path.clone()),
+@@ -42846,20 +42871,21 @@ mod tests {
+             )
+             .await
+             .expect("child");
+             let runs = RunStore::new(db.clone());
+             let agent_type = serde_json::to_value(AgentType::ClaudeCode)
+                 .expect("agent type json")
+                 .as_str()
+                 .expect("agent type string")
+                 .to_string();
+             runs.insert_reserving(ReservingRunInsert {
++                orchestration_binding: None,
+                 task_id: task_id.clone(),
+                 root_task_id: task_id.clone(),
+                 previous_task_id: None,
+                 generation: 1,
+                 parent_conversation_id: parent.id,
+                 parent_tool_use_id: Some(format!("wave4-{suffix}-tool")),
+                 child_conversation_id: child.id,
+                 agent_type,
+                 profile_id: None,
+                 workspace_path: None,
+diff --git a/src-tauri/src/acp/delegation/listener.rs b/src-tauri/src/acp/delegation/listener.rs
+index abc9354d..9a67bf1f 100644
+--- a/src-tauri/src/acp/delegation/listener.rs
++++ b/src-tauri/src/acp/delegation/listener.rs
+@@ -8450,20 +8450,21 @@ mod tests {
+         }
+ 
+         async fn completion_tool_fixture_with_db(
+             db: Arc<crate::db::AppDatabase>,
+         ) -> CompletionToolFixture {
+             let folder = seed_folder(&db, "/tmp/completion-tool-contract").await;
+             let parent = seed_conversation(&db, folder, AgentType::Codex).await;
+             let child = seed_conversation(&db, folder, AgentType::Codex).await;
+             let runs = Arc::new(RunStore::new(Arc::clone(&db)));
+             runs.insert_reserving(ReservingRunInsert {
++                orchestration_binding: None,
+                 task_id: TASK_ID.into(),
+                 root_task_id: TASK_ID.into(),
+                 previous_task_id: None,
+                 generation: 1,
+                 parent_conversation_id: parent,
+                 parent_tool_use_id: Some("parent-tool".into()),
+                 child_conversation_id: child,
+                 agent_type: "codex".into(),
+                 profile_id: None,
+                 workspace_path: Some("/tmp/completion-tool-contract".into()),
+@@ -8627,24 +8628,26 @@ mod tests {
+                 listener,
+                 parent_id: parent,
+             }
+         }
+ 
+         async fn completion_tool_fixture() -> CompletionToolFixture {
+             completion_tool_fixture_with_db(Arc::new(fresh_in_memory_db().await)).await
+         }
+ 
+         async fn completion_tool_fixture_before_v2_only() -> CompletionToolFixture {
+-            completion_tool_fixture_with_db(Arc::new(
+-                crate::db::test_helpers::historical_completion_protocol_db_before_v2_only().await,
+-            ))
+-            .await
++            let db =
++                crate::db::test_helpers::historical_completion_protocol_db_before_v2_only().await;
++            crate::db::migration::install_for_historical_completion_fixture(&db)
++                .await
++                .expect("install orchestration binding migration for historical fixture");
++            completion_tool_fixture_with_db(Arc::new(db)).await
+         }
+ 
+         #[tokio::test]
+         async fn broker_accepts_only_live_bound_v2_child_and_orders_distinct_calls() {
+             let fixture = completion_tool_fixture().await;
+             for caller in [
+                 fixture.root_token(),
+                 fixture.v1_child_token(),
+                 fixture.unbound_child_token(),
+             ] {
+@@ -10777,24 +10780,26 @@ mod tests {
+                 listener,
+                 questions,
+             }
+         }
+ 
+         async fn recovery_fixture() -> RecoveryFixture {
+             recovery_fixture_with_db(Arc::new(fresh_in_memory_db().await)).await
+         }
+ 
+         async fn recovery_fixture_before_v2_only() -> RecoveryFixture {
+-            recovery_fixture_with_db(Arc::new(
+-                crate::db::test_helpers::historical_completion_protocol_db_before_v2_only().await,
+-            ))
+-            .await
++            let db =
++                crate::db::test_helpers::historical_completion_protocol_db_before_v2_only().await;
++            crate::db::migration::install_for_historical_completion_fixture(&db)
++                .await
++                .expect("install orchestration binding migration for historical fixture");
++            recovery_fixture_with_db(Arc::new(db)).await
+         }
+ 
+         async fn seed_confirmable_task(
+             fixture: &RecoveryFixture,
+             parent_id: i32,
+             label: &str,
+         ) -> String {
+             let task_id = format!("{label}-{}", uuid::Uuid::new_v4());
+             let child = conversation_service::create_with_delegation(
+                 &fixture.db.conn,
+@@ -10813,20 +10818,21 @@ mod tests {
+             let mut active: conversation::ActiveModel = child.clone().into();
+             active.external_id = Set(Some(format!("session-{label}")));
+             active
+                 .update(&fixture.db.conn)
+                 .await
+                 .expect("seed reusable session identity");
+ 
+             fixture
+                 .runs
+                 .insert_reserving(ReservingRunInsert {
++                    orchestration_binding: None,
+                     task_id: task_id.clone(),
+                     root_task_id: task_id.clone(),
+                     previous_task_id: None,
+                     generation: 1,
+                     parent_conversation_id: parent_id,
+                     parent_tool_use_id: Some(format!("tool-{label}")),
+                     child_conversation_id: child.id,
+                     agent_type: "codex".into(),
+                     profile_id: None,
+                     workspace_path: Some("/tmp/recovery-listener-contract".into()),
+diff --git a/src-tauri/src/acp/delegation/run_store.rs b/src-tauri/src/acp/delegation/run_store.rs
+index 3b546f67..b1d73e72 100644
+--- a/src-tauri/src/acp/delegation/run_store.rs
++++ b/src-tauri/src/acp/delegation/run_store.rs
+@@ -30,21 +30,22 @@ use crate::acp::delegation::recovery_policy::{
+ };
+ use crate::acp::delegation::runtime_stats::{
+     decode_persisted_runtime_stats, DelegationRuntimeStats, PersistedRuntimeStatsColumns,
+ };
+ use crate::acp::delegation::store::{
+     classify_sqlite_transient, is_transient_db_error, is_transient_sqlite, PersistedTask,
+     PromoteRetryPolicy, Settlement, SqliteTransientClass, TaskStoreError,
+     TerminalCompletionProtocol, TerminalTaskWrite,
+ };
+ use crate::acp::delegation::types::{
+-    DelegationRecoveryProjection, TaskStatus, WorkflowRetirementNavigation,
++    DelegationRecoveryProjection, OrchestrationBindingV1, TaskStatus,
++    WorkflowRetirementNavigation,
+ };
+ use crate::acp::delegation::workflow::admission::{
+     ensure_workflow_child_conversation_independent, resolve_and_stamp_terminal_artifact_txn,
+ };
+ use crate::acp::delegation::workflow::completion_evidence::ensure_task_completion_recovery_not_fenced_txn;
+ use crate::acp::delegation::workflow::{
+     admit_workflow_run_txn, emit_workflow_side_effect, on_mapped_run_transition_txn,
+     on_provisional_abandon_txn, on_terminal_settle_txn, require_writable_conversation_workflow,
+     AdmissionDispatchKind, ArtifactFailure, CompletionEvidenceError, CompletionIntentReason,
+     CompletionOutcome, CompletionRecoveryFenceError, CompletionRole, CompletionToolIntent,
+@@ -200,75 +201,97 @@ pub fn derive_task_preview(task: &str) -> String {
+     }
+     let mut redacted = task.to_string();
+     for re in secret_redaction_regexes() {
+         redacted = re.replace_all(&redacted, "[redacted]").into_owned();
+     }
+     redacted.chars().take(TASK_PREVIEW_SCALAR_CAP).collect()
+ }
+ 
+ /// Non-reversible request hash for exact duplicate detection.
+ ///
+-/// Canonicalization (fixed field order; absent optionals are **empty strings**,
+-/// never omitted):
++/// Unbound canonicalization preserves the legacy fixed field order; absent
++/// optionals are **empty strings**, never omitted:
+ /// 1. tool_name
+ /// 2. full task text (NFC-normalized)
+ /// 3. work_unit_key or empty
+ /// 4. replaces_task_id or empty
+ /// 5. replacement_reason or empty
+ /// 6. target task_id or empty
+ /// 7. route_fingerprint as lowercase hex
+ ///
++/// Bound requests prepend the `delegation-request-v2` domain tag and append
++/// the binding's schema version, namespace, generation, and route fingerprint
++/// as strings. Both forms use deterministic JSON-array serialization.
++///
+ /// Fields are encoded as a JSON array of strings via deterministic
+ /// `serde_json` serialization (not raw delimiter join). That framing is
+ /// immune to in-field U+001E / quote / control characters collapsing
+ /// distinct tuples into the same byte stream.
+ ///
+ /// Returns lowercase hex SHA-256 of the canonical bytes.
+ pub fn request_fingerprint(
+     tool_name: &str,
+     task_text: &str,
+     work_unit_key: Option<&str>,
+     replaces_task_id: Option<&str>,
+     replacement_reason: Option<&str>,
+     target_task_id: Option<&str>,
+     route_fingerprint_hex: &str,
++    orchestration_binding: Option<&OrchestrationBindingV1>,
+ ) -> String {
+     let task_nfc = nfc(task_text);
+     let route = route_fingerprint_hex.to_ascii_lowercase();
+-    let fields = [
+-        tool_name,
+-        task_nfc.as_str(),
+-        work_unit_key.unwrap_or(""),
+-        replaces_task_id.unwrap_or(""),
+-        replacement_reason.unwrap_or(""),
+-        target_task_id.unwrap_or(""),
+-        route.as_str(),
+-    ];
++    let fields = match orchestration_binding {
++        None => vec![
++            tool_name.to_owned(),
++            task_nfc,
++            work_unit_key.unwrap_or("").to_owned(),
++            replaces_task_id.unwrap_or("").to_owned(),
++            replacement_reason.unwrap_or("").to_owned(),
++            target_task_id.unwrap_or("").to_owned(),
++            route.to_owned(),
++        ],
++        Some(binding) => vec![
++            "delegation-request-v2".to_owned(),
++            tool_name.to_owned(),
++            task_nfc,
++            work_unit_key.unwrap_or("").to_owned(),
++            replaces_task_id.unwrap_or("").to_owned(),
++            replacement_reason.unwrap_or("").to_owned(),
++            target_task_id.unwrap_or("").to_owned(),
++            route.to_owned(),
++            binding.schema_version.to_string(),
++            binding.namespace.clone(),
++            binding.generation.to_string(),
++            binding.route_fingerprint.clone(),
++        ],
++    };
+     // Compact JSON array form is stable for plain strings (no key order issues).
+     let canonical =
+         serde_json::to_string(&fields).expect("request_fingerprint fields are plain strings");
+     let digest = Sha256::digest(canonical.as_bytes());
+     hex_lower(&digest)
+ }
+ 
+ /// Inputs for inserting a run in `reserving` status (durable claim before spawn/resume).
+ #[derive(Debug, Clone)]
+ pub struct ReservingRunInsert {
+     pub task_id: String,
+     pub root_task_id: String,
+     pub previous_task_id: Option<String>,
+     pub generation: i64,
+     pub parent_conversation_id: i32,
+     pub parent_tool_use_id: Option<String>,
+     pub child_conversation_id: i32,
+     pub agent_type: String,
+     pub profile_id: Option<String>,
++    pub orchestration_binding: Option<OrchestrationBindingV1>,
+     pub workspace_path: Option<String>,
+     pub route_fingerprint: Option<String>,
+     pub launch_snapshot_version: Option<String>,
+     pub mode_id: Option<String>,
+     pub config_values_json: Option<String>,
+     pub task_preview: Option<String>,
+     pub request_fingerprint: Option<String>,
+     pub admission_class: AdmissionClass,
+     pub lineage_root_task_id: String,
+     pub work_unit_key: Option<String>,
+@@ -333,20 +356,21 @@ pub struct PersistedRun {
+     pub admission_class: AdmissionClass,
+     pub lineage_root_task_id: String,
+     pub work_unit_key: Option<String>,
+     pub history_only: bool,
+     pub route_fingerprint: Option<String>,
+     pub workspace_path: Option<String>,
+     pub launch_snapshot_version: Option<String>,
+     pub mode_id: Option<String>,
+     pub config_values_json: Option<String>,
+     pub profile_id: Option<String>,
++    pub orchestration_binding: Option<OrchestrationBindingV1>,
+     pub runtime_stats: Option<DelegationRuntimeStats>,
+     /// Present when this run was admitted as an explicit replacement.
+     pub replaced_task_id: Option<String>,
+     pub replacement_reason: Option<String>,
+     pub recovery_authorization_id: Option<String>,
+ }
+ 
+ /// Retry metadata on every promote outcome (success or failure). Counts every
+ /// transient class observed across attempts (mixed BUSY then LOCKED both count).
+ /// SQLite primary/extended codes are retained from the last classified `DbErr`
+@@ -523,20 +547,27 @@ pub enum PromoteTestFault {
+     /// must roll back together when the attempt is retried/exhausted.
+     AfterBudgetTransient(SqliteTransientClass),
+     /// Fail **after status write, at projection** with a synthetic `DbErr` so
+     /// projection-side BUSY/LOCKED classify via raw `DbErr` (not Permanent).
+     AfterProjectionTransient(SqliteTransientClass),
+     /// Fail this attempt as a permanent/ambiguous error without opening a
+     /// promote write (commit-ambiguity reread against current durable truth).
+     AmbiguousPermanent { message: String },
+ }
+ 
++#[cfg(any(test, feature = "test-utils"))]
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum LifecycleIdentityTestFault {
++    PreAdmissionAfterRunWrite,
++    RuntimeStatsAfterRunWrite,
++}
++
+ /// Reconstruct the immutable non-secret launch snapshot carried by a durable
+ /// run. `None` is a legacy/incomplete snapshot and must never be resumed.
+ pub fn launch_snapshot_from_run(run: &PersistedRun) -> Option<LaunchSnapshot> {
+     Some(LaunchSnapshot {
+         workspace_path: run.workspace_path.clone()?,
+         route_fingerprint: run.route_fingerprint.clone()?,
+         launch_snapshot_version: run.launch_snapshot_version.clone()?,
+         mode_id: run.mode_id.clone(),
+         config_values_json: run.config_values_json.clone()?,
+         profile_id: run.profile_id.clone(),
+@@ -1160,20 +1191,45 @@ async fn preflight_replacement(
+             )));
+         }
+     }
+     Ok(())
+ }
+ 
+ // Promote charges use `charge_*_promote` (preserve raw DbErr). Insert-time
+ // paths only preflight rails; they never charge until promote.
+ 
+ fn model_to_persisted_run(row: delegation_task_run::Model) -> Option<PersistedRun> {
++    let orchestration_binding = match (
++        row.orchestration_schema_version,
++        row.orchestration_namespace.as_ref(),
++        row.orchestration_generation,
++        row.orchestration_route_fingerprint.as_ref(),
++    ) {
++        (None, None, None, None) => None,
++        (Some(schema_version), Some(namespace), Some(generation), Some(route_fingerprint)) => {
++            let binding = OrchestrationBindingV1 {
++                schema_version: u32::try_from(schema_version).ok()?,
++                namespace: namespace.clone(),
++                generation: u32::try_from(generation).ok()?,
++                route_fingerprint: route_fingerprint.clone(),
++            };
++            binding.validate().ok()?;
++            Some(binding)
++        }
++        _ => {
++            tracing::warn!(
++                task_id = %row.task_id,
++                "[run_store] partial orchestration binding is unreadable"
++            );
++            return None;
++        }
++    };
+     let status = run_status_to_task_status(&row.status)?;
+     let runtime_stats = match decode_persisted_runtime_stats(PersistedRuntimeStatsColumns {
+         started_at: row.started_at,
+         finished_at: row.finished_at,
+         tool_call_count: row.tool_call_count,
+         edit_tool_call_count: row.edit_tool_call_count,
+         touched_files_json: row.touched_files_json.as_deref(),
+         touched_files_truncated: row.touched_files_truncated,
+         additions: row.additions,
+         deletions: row.deletions,
+@@ -1210,20 +1266,21 @@ fn model_to_persisted_run(row: delegation_task_run::Model) -> Option<PersistedRu
+         admission_class: row.admission_class,
+         lineage_root_task_id: row.lineage_root_task_id,
+         work_unit_key: row.work_unit_key,
+         history_only: row.history_only,
+         route_fingerprint: row.route_fingerprint,
+         workspace_path: row.workspace_path,
+         launch_snapshot_version: row.launch_snapshot_version,
+         mode_id: row.mode_id,
+         config_values_json: row.config_values_json,
+         profile_id: row.profile_id,
++        orchestration_binding,
+         runtime_stats,
+         replaced_task_id: row.replaced_task_id,
+         replacement_reason: row.replacement_reason,
+         recovery_authorization_id: row.recovery_authorization_id,
+     })
+ }
+ 
+ /// Insert one `reserving` row using an already-open transaction. Admission
+ /// callers use this with their ownership/replacement checks in the same
+ /// transaction; the public wrapper below keeps the simple insertion API for
+@@ -1255,33 +1312,48 @@ async fn insert_reserving_txn(
+                 txn,
+                 &insert.lineage_root_task_id,
+                 insert.parent_conversation_id,
+                 insert.work_unit_key.as_deref(),
+             )
+             .await?;
+         }
+         AdmissionClass::NormalRevision => {}
+     }
+ 
++    let orchestration_binding = insert.orchestration_binding.as_ref();
++    if let Some(binding) = orchestration_binding {
++        binding.validate().map_err(|reason| {
++            TaskStoreError::Permanent(format!("invalid orchestration binding: {reason}"))
++        })?;
++    }
++
+     let now = Utc::now();
+     let model = delegation_task_run::ActiveModel {
+         task_id: Set(insert.task_id.clone()),
+         root_task_id: Set(insert.root_task_id.clone()),
+         previous_task_id: Set(insert.previous_task_id.clone()),
+         generation: Set(insert.generation),
+         parent_conversation_id: Set(insert.parent_conversation_id),
+         parent_tool_use_id: Set(insert.parent_tool_use_id.clone()),
+         child_conversation_id: Set(insert.child_conversation_id),
+         agent_type: Set(insert.agent_type.clone()),
+         profile_id: Set(insert.profile_id.clone()),
+         workspace_path: Set(insert.workspace_path.clone()),
+         route_fingerprint: Set(insert.route_fingerprint.clone()),
++        orchestration_schema_version: Set(orchestration_binding
++            .map(|binding| i64::from(binding.schema_version))),
++        orchestration_namespace: Set(orchestration_binding
++            .map(|binding| binding.namespace.clone())),
++        orchestration_generation: Set(orchestration_binding
++            .map(|binding| i64::from(binding.generation))),
++        orchestration_route_fingerprint: Set(orchestration_binding
++            .map(|binding| binding.route_fingerprint.clone())),
+         launch_snapshot_version: Set(insert.launch_snapshot_version.clone()),
+         mode_id: Set(insert.mode_id.clone()),
+         config_values_json: Set(insert.config_values_json.clone()),
+         task_preview: Set(insert.task_preview.clone()),
+         request_fingerprint: Set(insert.request_fingerprint.clone()),
+         admission_class: Set(insert.admission_class.clone()),
+         reached_running_at: Set(None),
+         lineage_root_task_id: Set(insert.lineage_root_task_id.clone()),
+         work_unit_key: Set(insert.work_unit_key.clone()),
+         legacy_parent_tool_use_id: Set(None),
+@@ -1966,20 +2038,24 @@ pub struct RunStore {
+     /// Test-only: fail the next out-of-transaction terminal protocol pre-read.
+     #[cfg(any(test, feature = "test-utils"))]
+     terminal_completion_protocol_load_failures_remaining: std::sync::atomic::AtomicUsize,
+     /// Test-only: fail after the run CAS write and before child projection.
+     #[cfg(any(test, feature = "test-utils"))]
+     terminal_transaction_fail: std::sync::atomic::AtomicBool,
+     /// Test-only: fail the next standalone recovery status projection. This
+     /// does not affect the transaction-local recovery policy evaluation.
+     #[cfg(any(test, feature = "test-utils"))]
+     recovery_projection_fail: std::sync::atomic::AtomicBool,
++    /// Test-only: fail selected lifecycle transactions after their run-row
++    /// write so rollback preserves insert-fixed identity.
++    #[cfg(any(test, feature = "test-utils"))]
++    identity_lifecycle_fault: std::sync::Mutex<Option<LifecycleIdentityTestFault>>,
+ }
+ 
+ /// Bound for test-only RunStore settle / continue-admission gate release waits.
+ /// Unreleased or dropped release senders must fail fast — never hang CI.
+ #[cfg(any(test, feature = "test-utils"))]
+ pub(crate) const TEST_RUN_STORE_GATE_TIMEOUT: std::time::Duration =
+     std::time::Duration::from_secs(5);
+ 
+ #[cfg(any(test, feature = "test-utils"))]
+ struct RunStoreSettleGate {
+@@ -2010,20 +2086,22 @@ impl RunStore {
+             identity_load_fail: std::sync::atomic::AtomicBool::new(false),
+             #[cfg(any(test, feature = "test-utils"))]
+             workflow_binding_load_fail: std::sync::atomic::AtomicBool::new(false),
+             #[cfg(any(test, feature = "test-utils"))]
+             terminal_completion_protocol_load_failures_remaining:
+                 std::sync::atomic::AtomicUsize::new(0),
+             #[cfg(any(test, feature = "test-utils"))]
+             terminal_transaction_fail: std::sync::atomic::AtomicBool::new(false),
+             #[cfg(any(test, feature = "test-utils"))]
+             recovery_projection_fail: std::sync::atomic::AtomicBool::new(false),
++            #[cfg(any(test, feature = "test-utils"))]
++            identity_lifecycle_fault: std::sync::Mutex::new(None),
+         }
+     }
+ 
+     /// Builder: attach workflow graph event emitter at construction.
+     pub fn with_workflow_emitter(self, emitter: EventEmitter) -> Self {
+         *self
+             .workflow_emitter
+             .write()
+             .unwrap_or_else(|e| e.into_inner()) = emitter;
+         self
+@@ -2262,20 +2340,42 @@ impl RunStore {
+         self.terminal_transaction_fail
+             .store(fail, std::sync::atomic::Ordering::SeqCst);
+     }
+ 
+     #[cfg(any(test, feature = "test-utils"))]
+     pub fn fail_next_recovery_projection(&self) {
+         self.recovery_projection_fail
+             .store(true, std::sync::atomic::Ordering::SeqCst);
+     }
+ 
++    #[cfg(any(test, feature = "test-utils"))]
++    pub fn fail_next_identity_lifecycle_write(&self, fault: LifecycleIdentityTestFault) {
++        *self
++            .identity_lifecycle_fault
++            .lock()
++            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(fault);
++    }
++
++    #[cfg(any(test, feature = "test-utils"))]
++    fn take_identity_lifecycle_fault(&self, expected: LifecycleIdentityTestFault) -> bool {
++        let mut fault = self
++            .identity_lifecycle_fault
++            .lock()
++            .unwrap_or_else(|poisoned| poisoned.into_inner());
++        if fault.as_ref() == Some(&expected) {
++            fault.take();
++            true
++        } else {
++            false
++        }
++    }
++
+     /// Test-only settle race gate.
+     ///
+     /// - [`Self::settle_terminal`]: signals `entered` then waits on `release`
+     ///   before applying the durable CAS (entry of settle path).
+     /// - [`Self::settle_pre_admission_failure_if_owned`]: signals after a
+     ///   still-`Reserving` own/unbound snapshot (would settle) and waits
+     ///   **before** the ownership-CAS write transaction (no lock held).
+     #[cfg(any(test, feature = "test-utils"))]
+     pub async fn install_settle_gate(
+         &self,
+@@ -3004,20 +3104,21 @@ impl RunStore {
+                                         TaskStoreError::Permanent(
+                                             "test run_store continue_admission gate release dropped"
+                                                 .into(),
+                                         )
+                                     })?;
+                             }
+                         }
+                     }
+ 
+                     let insert = ReservingRunInsert {
++                        orchestration_binding: None,
+                         task_id: admission.task_id.clone(),
+                         root_task_id: target.root_task_id.clone(),
+                         previous_task_id: Some(target.task_id.clone()),
+                         generation: target.generation + 1,
+                         parent_conversation_id: admission.parent_conversation_id,
+                         parent_tool_use_id: (!admission.parent_tool_use_id.is_empty())
+                             .then(|| admission.parent_tool_use_id.clone()),
+                         child_conversation_id: target.child_conversation_id,
+                         agent_type: serde_json::to_value(target.agent_type)
+                             .ok()
+@@ -3493,20 +3594,26 @@ impl RunStore {
+             Some("legacy_completion_protocol_read_only" | "unsupported_completion_protocol")
+         );
+         let conversation_status = terminal.conversation_status.clone();
+         let card_summary_json = terminal.card_summary_json.clone();
+         let termination_evidence = terminal.termination_evidence().cloned();
+         let expected = expected_child_connection_id.to_string();
+         let final_stats = match terminal.runtime_stats.as_ref() {
+             Some(stats) => Some(encoded_runtime_stats(stats)?),
+             None => None,
+         };
++        #[cfg(any(test, feature = "test-utils"))]
++        let inject_identity_failure = self.take_identity_lifecycle_fault(
++            LifecycleIdentityTestFault::PreAdmissionAfterRunWrite,
++        );
++        #[cfg(not(any(test, feature = "test-utils")))]
++        let inject_identity_failure = false;
+ 
+         let outcome = self
+             .db
+             .conn
+             .transaction::<_, (Option<Settlement>, WorkflowTxnSideEffect), TaskStoreError>(|txn| {
+                 let task_id = task_id.to_string();
+                 let error_code = error_code.clone();
+                 let conversation_status = conversation_status.clone();
+                 let card_summary_json = card_summary_json.clone();
+                 let termination_evidence = termination_evidence.clone();
+@@ -3570,20 +3677,26 @@ impl RunStore {
+                                     persisted.to_persisted_task().to_report(None),
+                                 )),
+                                 WorkflowTxnSideEffect::None,
+                             )),
+                             DelegationRunStatus::Running | DelegationRunStatus::Reserving => {
+                                 Ok((None, WorkflowTxnSideEffect::None))
+                             }
+                         };
+                     }
+ 
++                    if inject_identity_failure {
++                        return Err(TaskStoreError::Permanent(
++                            "injected pre-admission post-write failure".into(),
++                        ));
++                    }
++
+                     let won = DelegationTaskRun::find_by_id(&task_id)
+                         .one(txn)
+                         .await
+                         .map_err(map_db_err)?
+                         .ok_or_else(|| TaskStoreError::NotFound(task_id.clone()))?;
+                     let termination_audit_json =
+                         serialize_termination_evidence(termination_evidence.as_ref(), &won)?;
+                     if let Some(ref audit) = termination_audit_json {
+                         DelegationTaskRun::update_many()
+                             .col_expr(
+@@ -4819,20 +4932,26 @@ impl RunStore {
+     /// After settlement the run is frozen: terminal rows are never mutated by
+     /// this path (including `finished_at: Some` snapshots). Stale running
+     /// writes and post-settle attempts are benign no-ops. Terminal final
+     /// snapshots must be supplied via [`Self::settle_terminal`] instead.
+     pub async fn write_runtime_stats(
+         &self,
+         task_id: &str,
+         stats: &DelegationRuntimeStats,
+     ) -> Result<(), TaskStoreError> {
+         let encoded = encoded_runtime_stats(stats)?;
++        #[cfg(any(test, feature = "test-utils"))]
++        let inject_identity_failure = self.take_identity_lifecycle_fault(
++            LifecycleIdentityTestFault::RuntimeStatsAfterRunWrite,
++        );
++        #[cfg(not(any(test, feature = "test-utils")))]
++        let inject_identity_failure = false;
+ 
+         let outcome = self
+             .db
+             .conn
+             .transaction::<_, (), TaskStoreError>(|txn| {
+                 let task_id = task_id.to_string();
+                 let encoded = encoded.clone();
+                 Box::pin(async move {
+                     // True freeze after settle: only `running` rows accept writes.
+                     // Terminal (and reserving) rows are never mutated here.
+@@ -4869,20 +4988,26 @@ impl RunStore {
+                             }
+                             Some(_) => Err(TaskStoreError::Permanent(format!(
+                                 "running runtime_stats write matched no rows for still-running task {task_id}"
+                             ))),
+                             None => Err(TaskStoreError::Permanent(format!(
+                                 "running runtime_stats write matched no rows; task {task_id} missing"
+                             ))),
+                         };
+                     }
+ 
++                    if inject_identity_failure {
++                        return Err(TaskStoreError::Permanent(
++                            "injected runtime-stat post-write failure".into(),
++                        ));
++                    }
++
+                     let row = DelegationTaskRun::find_by_id(&task_id)
+                         .one(txn)
+                         .await
+                         .map_err(map_db_err)?
+                         .ok_or_else(|| {
+                             TaskStoreError::Permanent(format!(
+                                 "run {task_id} missing after runtime_stats write"
+                             ))
+                         })?;
+ 
+@@ -5727,114 +5852,263 @@ mod tests {
+     #[test]
+     fn fingerprint_is_stable_for_identical_inputs() {
+         let a = request_fingerprint(
+             "delegate_to_agent",
+             "do the thing",
+             Some("work-1"),
+             None,
+             None,
+             None,
+             "AbCdEf",
++            None,
+         );
+         let b = request_fingerprint(
+             "delegate_to_agent",
+             "do the thing",
+             Some("work-1"),
+             None,
+             None,
+             None,
+             "abcdef", // case-normalized
++            None,
+         );
+         assert_eq!(a, b);
+         assert_eq!(a.len(), 64);
+         assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+         assert_eq!(a, a.to_ascii_lowercase());
+     }
+ 
+     #[test]
+     fn fingerprint_empty_optionals_match_explicit_empty_strings() {
+         let none_side = request_fingerprint(
+             "continue_delegation",
+             "revise",
+             None,
+             None,
+             None,
+             Some("task-1"),
+             "deadbeef",
++            None,
+         );
+         let empty_side = request_fingerprint(
+             "continue_delegation",
+             "revise",
+             Some(""),
+             Some(""),
+             Some(""),
+             Some("task-1"),
+             "deadbeef",
++            None,
+         );
+         assert_eq!(none_side, empty_side);
+     }
+ 
+     #[test]
+     fn fingerprint_nfc_normalizes_task_text() {
+         // U+00E9 (é) vs e + combining acute U+0301
+         let composed = "caf\u{00e9}";
+         let decomposed = "cafe\u{0301}";
+         assert_ne!(composed.as_bytes(), decomposed.as_bytes());
+-        let a = request_fingerprint("delegate_to_agent", composed, None, None, None, None, "aa");
++        let a = request_fingerprint(
++            "delegate_to_agent",
++            composed,
++            None,
++            None,
++            None,
++            None,
++            "aa",
++            None,
++        );
+         let b = request_fingerprint(
+             "delegate_to_agent",
+             decomposed,
+             None,
+             None,
+             None,
+             None,
+             "aa",
++            None,
+         );
+         assert_eq!(a, b);
+     }
+ 
+     #[test]
+     fn fingerprint_field_order_matters() {
+-        let a = request_fingerprint("t1", "task", Some("w"), None, None, None, "r1");
+-        let b = request_fingerprint("t1", "task", None, Some("w"), None, None, "r1");
++        let a = request_fingerprint(
++            "t1",
++            "task",
++            Some("w"),
++            None,
++            None,
++            None,
++            "r1",
++            None,
++        );
++        let b = request_fingerprint(
++            "t1",
++            "task",
++            None,
++            Some("w"),
++            None,
++            None,
++            "r1",
++            None,
++        );
+         assert_ne!(a, b);
+     }
+ 
+     #[test]
+     fn fingerprint_delimiter_in_fields_does_not_collide() {
+         // Raw U+001E join collides these distinct 7-tuples:
+         //   tool="a", task="b\u{1e}c"  →  a RS b RS c …
+         //   tool="a\u{1e}b", task="c" →  a RS b RS c …
+         // Length-framed / JSON encoding must keep them distinct.
+         let rs = '\u{1e}';
+-        let left = request_fingerprint("a", &format!("b{rs}c"), None, None, None, None, "deadbeef");
+-        let right =
+-            request_fingerprint(&format!("a{rs}b"), "c", None, None, None, None, "deadbeef");
++        let left = request_fingerprint(
++            "a",
++            &format!("b{rs}c"),
++            None,
++            None,
++            None,
++            None,
++            "deadbeef",
++            None,
++        );
++        let right = request_fingerprint(
++            &format!("a{rs}b"),
++            "c",
++            None,
++            None,
++            None,
++            None,
++            "deadbeef",
++            None,
++        );
+         assert_ne!(
+             left, right,
+             "in-field RS must not create identical canonical bytes"
+         );
+ 
+         // Same for optional work_unit_key / replaces_task_id boundary.
+         let left = request_fingerprint(
+             "t",
+             "task",
+             Some(&format!("w{rs}x")),
+             None,
+             None,
+             None,
+             "aa",
++            None,
++        );
++        let right = request_fingerprint(
++            "t",
++            "task",
++            Some("w"),
++            Some("x"),
++            None,
++            None,
++            "aa",
++            None,
+         );
+-        let right = request_fingerprint("t", "task", Some("w"), Some("x"), None, None, "aa");
+         assert_ne!(left, right);
+     }
+ 
++    #[test]
++    fn durable_binding_unbound_seven_string_fingerprints_retain_exact_digests() {
++        assert_eq!(
++            request_fingerprint(
++                "delegate_to_agent",
++                "do the thing",
++                Some("work-1"),
++                None,
++                None,
++                None,
++                "AbCdEf",
++                None,
++            ),
++            "55687507f1ed929a92190fb1e1039e422dd219d2238a4b1e10a6968c32e557f4"
++        );
++        assert_eq!(
++            request_fingerprint(
++                "continue_delegation",
++                "revise",
++                None,
++                None,
++                None,
++                Some("task-1"),
++                "deadbeef",
++                None,
++            ),
++            "f9487ae94c8b94155514942226be54829c3f5043fdf587d3c33886b01f04a97f"
++        );
++    }
++
++    #[test]
++    fn durable_binding_bound_fingerprint_uses_exact_twelve_string_v2_array() {
++        let binding = crate::acp::delegation::types::OrchestrationBindingV1 {
++            schema_version: 1,
++            namespace: "brainstorm-to-delivery".into(),
++            generation: 2,
++            route_fingerprint:
++                "sha256:b498416d87bf6ba928bd7ddb5f1a451daf82300584f3d40b606c3c56f169ba7a"
++                    .into(),
++        };
++        let exact = request_fingerprint(
++            "delegate_to_agent",
++            "Implement Task 7 from the reviewed Plan.",
++            Some("task|7|implementer|codex|none"),
++            None,
++            None,
++            None,
++            "5ea0c72cf8b44015a7fe8e796a05dc22",
++            Some(&binding),
++        );
++        assert_eq!(
++            exact,
++            "aca47c464009a8f26bd36e0611b17f62cb7ed7942a387e38e878cf87087ff172"
++        );
++        assert_eq!(
++            exact,
++            request_fingerprint(
++                "delegate_to_agent",
++                "Implement Task 7 from the reviewed Plan.",
++                Some("task|7|implementer|codex|none"),
++                None,
++                None,
++                None,
++                "5ea0c72cf8b44015a7fe8e796a05dc22",
++                Some(&binding),
++            ),
++            "an exact bound retry must be stable"
++        );
++
++        let mut different_generation = binding.clone();
++        different_generation.generation = 3;
++        let mut different_fingerprint = binding.clone();
++        different_fingerprint.route_fingerprint = format!("sha256:{}", "0".repeat(64));
++        for different in [&different_generation, &different_fingerprint] {
++            assert_ne!(
++                exact,
++                request_fingerprint(
++                    "delegate_to_agent",
++                    "Implement Task 7 from the reviewed Plan.",
++                    Some("task|7|implementer|codex|none"),
++                    None,
++                    None,
++                    None,
++                    "5ea0c72cf8b44015a7fe8e796a05dc22",
++                    Some(different),
++                )
++            );
++        }
++    }
++
+     // ---- RunStore -----------------------------------------------------------
+ 
+     pub(crate) async fn seed_parent_child(db: &AppDatabase, call_id: &str) -> (i32, i32) {
+         let folder = seed_folder(db, "/tmp/codeg-run-store").await;
+         let parent = conversation_service::create(
+             &db.conn,
+             folder,
+             AgentType::ClaudeCode,
+             Some("parent".into()),
+             None,
+@@ -5859,20 +6133,21 @@ mod tests {
+     }
+ 
+     pub(crate) fn sample_insert(
+         task_id: &str,
+         parent_id: i32,
+         child_id: i32,
+         generation: i64,
+         previous: Option<&str>,
+     ) -> ReservingRunInsert {
+         ReservingRunInsert {
++            orchestration_binding: None,
+             task_id: task_id.into(),
+             root_task_id: previous
+                 .map(|_| "root-task".into())
+                 .unwrap_or_else(|| task_id.into()),
+             previous_task_id: previous.map(|s| s.into()),
+             generation,
+             parent_conversation_id: parent_id,
+             parent_tool_use_id: Some(format!("tu-{task_id}")),
+             child_conversation_id: child_id,
+             agent_type: "codex".into(),
+@@ -5884,33 +6159,371 @@ mod tests {
+             config_values_json: Some("{}".into()),
+             task_preview: Some(derive_task_preview("do work")),
+             request_fingerprint: Some(request_fingerprint(
+                 "delegate_to_agent",
+                 "do work",
+                 None,
+                 None,
+                 None,
+                 None,
+                 "aabbccdd",
++                None,
+             )),
+             admission_class: AdmissionClass::NormalRevision,
+             lineage_root_task_id: previous
+                 .map(|_| "root-task".into())
+                 .unwrap_or_else(|| task_id.into()),
+             work_unit_key: Some("unit-a".into()),
+             history_only: false,
+             replaced_task_id: None,
+             replacement_reason: None,
+             started_at: Some(Utc::now()),
+         }
+     }
+ 
++    fn binding_fixture() -> crate::acp::delegation::types::OrchestrationBindingV1 {
++        crate::acp::delegation::types::OrchestrationBindingV1 {
++            schema_version: 1,
++            namespace: "brainstorm-to-delivery".into(),
++            generation: 1,
++            route_fingerprint:
++                "sha256:b498416d87bf6ba928bd7ddb5f1a451daf82300584f3d40b606c3c56f169ba7a"
++                    .into(),
++        }
++    }
++
++    #[derive(Debug, Clone, PartialEq, Eq)]
++    struct BindingIdentitySnapshot {
++        agent_type: String,
++        profile_id: Option<String>,
++        schema_version: Option<i64>,
++        namespace: Option<String>,
++        generation: Option<i64>,
++        route_fingerprint: Option<String>,
++    }
++
++    async fn raw_binding_identity(
++        db: &AppDatabase,
++        task_id: &str,
++    ) -> BindingIdentitySnapshot {
++        let row = DelegationTaskRun::find_by_id(task_id)
++            .one(&db.conn)
++            .await
++            .expect("load raw binding identity")
++            .expect("binding fixture run");
++        BindingIdentitySnapshot {
++            agent_type: row.agent_type,
++            profile_id: row.profile_id,
++            schema_version: row.orchestration_schema_version,
++            namespace: row.orchestration_namespace,
++            generation: row.orchestration_generation,
++            route_fingerprint: row.orchestration_route_fingerprint,
++        }
++    }
++
++    async fn seed_bound_identity_fixture(
++        suffix: &str,
++    ) -> (
++        Arc<AppDatabase>,
++        RunStore,
++        String,
++        BindingIdentitySnapshot,
++    ) {
++        let db = Arc::new(fresh_in_memory_db().await);
++        let task_id = format!("durable-binding-{suffix}");
++        let (parent_id, child_id) = seed_parent_child(&db, &task_id).await;
++        let store = RunStore::new(db.clone());
++        let mut insert = sample_insert(&task_id, parent_id, child_id, 1, None);
++        insert.agent_type = "custom:binding-fixture".into();
++        insert.profile_id = Some("profile-binding-fixture".into());
++        insert.work_unit_key = Some(format!("binding-unit-{suffix}"));
++        insert.orchestration_binding = Some(binding_fixture());
++        store
++            .insert_reserving(insert)
++            .await
++            .expect("insert bound identity fixture");
++        let identity = raw_binding_identity(&db, &task_id).await;
++        (db, store, task_id, identity)
++    }
++
++    #[tokio::test]
++    async fn durable_binding_reserving_insert_is_atomic_and_reconstructs() {
++        let (db, store, task_id, expected) = seed_bound_identity_fixture("atomic").await;
++        assert_eq!(expected.schema_version, Some(1));
++        assert_eq!(expected.namespace.as_deref(), Some("brainstorm-to-delivery"));
++        assert_eq!(expected.generation, Some(1));
++        assert_eq!(
++            expected.route_fingerprint.as_deref(),
++            Some(
++                "sha256:b498416d87bf6ba928bd7ddb5f1a451daf82300584f3d40b606c3c56f169ba7a"
++            )
++        );
++        let raw = DelegationTaskRun::find_by_id(&task_id)
++            .one(&db.conn)
++            .await
++            .expect("load raw run")
++            .expect("run");
++        assert_eq!(raw.status, DelegationRunStatus::Reserving);
++        let persisted = store
++            .load_by_task_id(&task_id)
++            .await
++            .expect("load persisted run")
++            .expect("persisted run");
++        assert_eq!(persisted.orchestration_binding, Some(binding_fixture()));
++    }
++
++    #[tokio::test]
++    async fn durable_binding_forced_insert_error_leaves_no_run_or_partial_columns() {
++        let db = Arc::new(fresh_in_memory_db().await);
++        let task_id = "durable-binding-insert-rollback";
++        let (parent_id, child_id) = seed_parent_child(&db, task_id).await;
++        db.conn
++            .execute_unprepared(
++                "CREATE TRIGGER durable_binding_injected_insert_failure \
++                 AFTER INSERT ON delegation_task_runs \
++                 WHEN NEW.task_id = 'durable-binding-insert-rollback' \
++                 BEGIN SELECT RAISE(ABORT, 'durable_binding_injected_insert_failure'); END",
++            )
++            .await
++            .expect("install insert failure");
++        let store = RunStore::new(db.clone());
++        let mut insert = sample_insert(task_id, parent_id, child_id, 1, None);
++        insert.orchestration_binding = Some(binding_fixture());
++        let error = store
++            .insert_reserving(insert)
++            .await
++            .expect_err("forced insert transaction must fail");
++        assert!(error
++            .to_string()
++            .contains("durable_binding_injected_insert_failure"));
++        assert!(DelegationTaskRun::find_by_id(task_id)
++            .one(&db.conn)
++            .await
++            .expect("query rolled-back run")
++            .is_none());
++    }
++
++    #[tokio::test]
++    async fn durable_binding_direct_mutation_fails_and_partial_rows_are_unreadable() {
++        let (db, store, task_id, expected) = seed_bound_identity_fixture("immutable").await;
++        let error = db
++            .conn
++            .execute_unprepared(&format!(
++                "UPDATE delegation_task_runs SET orchestration_generation = 2 \
++                 WHERE task_id = '{task_id}'"
++            ))
++            .await
++            .expect_err("binding update must fail");
++        assert!(error
++            .to_string()
++            .contains("trg_dtr_orchestration_binding_immutable"));
++        assert_eq!(raw_binding_identity(&db, &task_id).await, expected);
++
++        db.conn
++            .execute_unprepared("DROP TRIGGER trg_dtr_orchestration_binding_immutable")
++            .await
++            .expect("drop immutable trigger for corrupt-row fixture");
++        db.conn
++            .execute_unprepared(&format!(
++                "UPDATE delegation_task_runs SET orchestration_namespace = NULL \
++                 WHERE task_id = '{task_id}'"
++            ))
++            .await
++            .expect("create impossible partial row");
++        assert!(store
++            .load_by_task_id(&task_id)
++            .await
++            .expect("load corrupt row")
++            .is_none());
++    }
++
++    async fn bind_and_promote(store: &RunStore, task_id: &str, connection_id: &str) {
++        store
++            .bind_child_connection_while_reserving(task_id, connection_id)
++            .await
++            .expect("bind child connection");
++        store
++            .promote_running(task_id, connection_id, Utc::now())
++            .await
++            .expect("promote bound fixture");
++    }
++
++    #[tokio::test]
++    async fn durable_binding_lifecycle_identity_fault_matrix_preserves_insert_fixed_bytes() {
++        // Reserving promotion: exhaust the built-in retry rail, prove rollback,
++        // then retry successfully.
++        let (db, store, task_id, original) = seed_bound_identity_fixture("promote").await;
++        store
++            .bind_child_connection_while_reserving(&task_id, "binding-promote")
++            .await
++            .expect("bind before promote fault");
++        store
++            .push_promote_faults([
++                PromoteTestFault::AfterClaimTransient(SqliteTransientClass::Busy),
++                PromoteTestFault::AfterClaimTransient(SqliteTransientClass::Busy),
++                PromoteTestFault::AfterClaimTransient(SqliteTransientClass::Busy),
++            ])
++            .await;
++        let failed = store
++            .promote_running_detailed(&task_id, "binding-promote", Utc::now())
++            .await
++            .expect("typed promote outcome");
++        assert!(matches!(failed.kind, PromoteRunningKind::RetryExhausted { .. }));
++        assert_eq!(raw_binding_identity(&db, &task_id).await, original);
++        store
++            .promote_running(&task_id, "binding-promote", Utc::now())
++            .await
++            .expect("successful promote retry");
++        assert_eq!(raw_binding_identity(&db, &task_id).await, original);
++
++        // Pre-admission terminalization: focused post-write failure hook.
++        let (db, store, task_id, original) = seed_bound_identity_fixture("pre-admission").await;
++        store.fail_next_identity_lifecycle_write(
++            LifecycleIdentityTestFault::PreAdmissionAfterRunWrite,
++        );
++        assert!(store
++            .settle_pre_admission_failure_if_owned(
++                &task_id,
++                "binding-pre-admission",
++                TerminalTaskWrite::failed(
++                    "spawn_failed",
++                    Utc::now(),
++                    ConversationStatus::Cancelled,
++                ),
++            )
++            .await
++            .is_err());
++        assert_eq!(raw_binding_identity(&db, &task_id).await, original);
++        store
++            .settle_pre_admission_failure_if_owned(
++                &task_id,
++                "binding-pre-admission",
++                TerminalTaskWrite::failed(
++                    "spawn_failed",
++                    Utc::now(),
++                    ConversationStatus::Cancelled,
++                ),
++            )
++            .await
++            .expect("successful pre-admission retry")
++            .expect("owned settlement");
++        assert_eq!(raw_binding_identity(&db, &task_id).await, original);
++
++        // Normal terminal settlement uses the existing one-shot transaction fault.
++        let (db, store, task_id, original) = seed_bound_identity_fixture("terminal").await;
++        bind_and_promote(&store, &task_id, "binding-terminal").await;
++        store.inject_terminal_transaction_failure(true);
++        assert!(store
++            .settle_terminal(
++                &task_id,
++                TerminalTaskWrite::failed(
++                    "process_exited",
++                    Utc::now(),
++                    ConversationStatus::Cancelled,
++                ),
++            )
++            .await
++            .is_err());
++        assert_eq!(raw_binding_identity(&db, &task_id).await, original);
++        store
++            .settle_terminal(
++                &task_id,
++                TerminalTaskWrite::failed(
++                    "process_exited",
++                    Utc::now(),
++                    ConversationStatus::Cancelled,
++                ),
++            )
++            .await
++            .expect("successful terminal retry");
++        assert_eq!(raw_binding_identity(&db, &task_id).await, original);
++
++        // Cancellation/cleanup goes through restart reconciliation and the
++        // existing terminal transaction fault.
++        let (db, store, task_id, original) = seed_bound_identity_fixture("cleanup").await;
++        bind_and_promote(&store, &task_id, "binding-cleanup").await;
++        store.inject_terminal_transaction_failure(true);
++        assert!(store.reconcile_non_terminal(Utc::now()).await.is_err());
++        assert_eq!(raw_binding_identity(&db, &task_id).await, original);
++        assert_eq!(
++            store
++                .reconcile_non_terminal(Utc::now())
++                .await
++                .expect("successful cleanup retry"),
++            1
++        );
++        assert_eq!(raw_binding_identity(&db, &task_id).await, original);
++
++        // Running runtime statistics: focused post-write failure hook.
++        let (db, store, task_id, original) = seed_bound_identity_fixture("runtime").await;
++        bind_and_promote(&store, &task_id, "binding-runtime").await;
++        let started_at = store
++            .load_by_task_id(&task_id)
++            .await
++            .expect("load running fixture")
++            .expect("running fixture")
++            .started_at
++            .expect("started at");
++        let stats = DelegationRuntimeStats::empty(started_at);
++        store.fail_next_identity_lifecycle_write(
++            LifecycleIdentityTestFault::RuntimeStatsAfterRunWrite,
++        );
++        assert!(store.write_runtime_stats(&task_id, &stats).await.is_err());
++        assert_eq!(raw_binding_identity(&db, &task_id).await, original);
++        store
++            .write_runtime_stats(&task_id, &stats)
++            .await
++            .expect("successful runtime-stat retry");
++        assert_eq!(raw_binding_identity(&db, &task_id).await, original);
++
++        // Final completion/projection writes share the terminal transaction;
++        // include a final runtime snapshot to exercise both run and child projection.
++        let (db, store, task_id, original) = seed_bound_identity_fixture("projection").await;
++        bind_and_promote(&store, &task_id, "binding-projection").await;
++        let started_at = store
++            .load_by_task_id(&task_id)
++            .await
++            .expect("load projection fixture")
++            .expect("projection fixture")
++            .started_at
++            .expect("started at");
++        let mut final_stats = DelegationRuntimeStats::empty(started_at);
++        final_stats.finished_at = Some(Utc::now());
++        store.inject_terminal_transaction_failure(true);
++        assert!(store
++            .settle_terminal(
++                &task_id,
++                TerminalTaskWrite::failed(
++                    "projection_failed",
++                    Utc::now(),
++                    ConversationStatus::Cancelled,
++                )
++                .with_runtime_stats(final_stats.clone()),
++            )
++            .await
++            .is_err());
++        assert_eq!(raw_binding_identity(&db, &task_id).await, original);
++        store
++            .settle_terminal(
++                &task_id,
++                TerminalTaskWrite::failed(
++                    "projection_failed",
++                    Utc::now(),
++                    ConversationStatus::Cancelled,
++                )
++                .with_runtime_stats(final_stats),
++            )
++            .await
++            .expect("successful completion/projection retry");
++        assert_eq!(raw_binding_identity(&db, &task_id).await, original);
++    }
++
+     async fn seed_workflow_mapped_run(
+         db: &Arc<AppDatabase>,
+         store: &RunStore,
+         task_id: &str,
+         parent_id: i32,
+         child_id: i32,
+         role: &str,
+         phase_id: &str,
+     ) {
+         store
+@@ -7840,20 +8453,21 @@ mod tests {
+         live.insert("model".into(), "gpt-test".into());
+         live.insert("api_key".into(), "sk-should-not-persist".into());
+         let launch = build_live_launch_config(
+             AgentType::Codex,
+             Some("profile-1"),
+             "/tmp/ws-gen1",
+             Some("default".into()),
+             live,
+         );
+         ReservingRunInsert {
++            orchestration_binding: None,
+             task_id: task_id.into(),
+             root_task_id: task_id.into(),
+             previous_task_id: None,
+             generation: 1,
+             parent_conversation_id: parent_id,
+             parent_tool_use_id: Some(tool_use.into()),
+             child_conversation_id: child_id,
+             agent_type: "codex".into(),
+             profile_id: launch.snapshot.profile_id.clone(),
+             workspace_path: Some(launch.snapshot.workspace_path.clone()),
+@@ -7871,20 +8485,21 @@ mod tests {
+                 task_text,
+                 work_unit_key,
+                 None,
+                 None,
+                 None,
+                 if route_fp.is_empty() {
+                     &launch.snapshot.route_fingerprint
+                 } else {
+                     route_fp
+                 },
++                None,
+             )),
+             admission_class: AdmissionClass::NormalRevision,
+             lineage_root_task_id: task_id.into(),
+             work_unit_key: work_unit_key.map(|s| s.into()),
+             history_only: false,
+             replaced_task_id: None,
+             replacement_reason: None,
+             started_at: Some(Utc::now()),
+         }
+     }
+@@ -9489,20 +10104,21 @@ mod tests {
+         settle_completed(&store, root).await;
+ 
+         let fingerprint = request_fingerprint(
+             "continue_delegation",
+             "review the revision",
+             Some("unit-a"),
+             None,
+             None,
+             Some(root),
+             "aabbccdd",
++            None,
+         );
+         let admission = ContinueRunAdmission {
+             task_id: "continue-next".into(),
+             parent_conversation_id: parent_id,
+             parent_tool_use_id: "tu-continue".into(),
+             target_task_id: root.into(),
+             task_preview: derive_task_preview("review the revision"),
+             request_fingerprint: fingerprint.clone(),
+             work_unit_key: Some("unit-a".into()),
+         };
+@@ -11466,20 +12082,21 @@ mod tests {
+             admission_class: AdmissionClass::NormalRevision,
+             lineage_root_task_id: "t".into(),
+             work_unit_key: None,
+             history_only: false,
+             route_fingerprint: None, // would match unresumable via empty route
+             workspace_path: None,
+             launch_snapshot_version: Some("v1".into()),
+             mode_id: None,
+             config_values_json: Some("{}".into()),
+             profile_id: None,
++            orchestration_binding: None,
+             runtime_stats: None,
+             replaced_task_id: None,
+             replacement_reason: None,
+             recovery_authorization_id: None,
+         };
+         assert!(!replacement_reason_matches_source(
+             REPLACEMENT_REASON_UNRESUMABLE,
+             &source,
+             true,
+             false,
+@@ -11542,20 +12159,21 @@ mod tests {
+             admission_class: AdmissionClass::NormalRevision,
+             lineage_root_task_id: "t".into(),
+             work_unit_key: Some("plan|x|author|codex|none".into()),
+             history_only: false,
+             route_fingerprint: Some("routehex".into()),
+             workspace_path: Some(r"\\?\G:\ws".into()),
+             launch_snapshot_version: Some("v1".into()),
+             mode_id: None,
+             config_values_json: Some("{}".into()),
+             profile_id: None,
++            orchestration_binding: None,
+             runtime_stats: None,
+             replaced_task_id: None,
+             replacement_reason: None,
+             recovery_authorization_id: None,
+         };
+         for code in [
+             "parent_disconnected",
+             "parent_canceled",
+             "parent_turn_failed",
+             "join_abandoned",
+@@ -14020,20 +14638,21 @@ mod termination_audit {
+                 parent_conversation_id: parent.id,
+                 parent_tool_use_id: format!("tu-{task_id}"),
+                 delegation_call_id: task_id.clone(),
+             }),
+         )
+         .await
+         .expect("child");
+         let store = RunStore::new(db.clone());
+         store
+             .insert_reserving(ReservingRunInsert {
++                orchestration_binding: None,
+                 task_id: task_id.clone(),
+                 root_task_id: task_id.clone(),
+                 previous_task_id: None,
+                 generation: 1,
+                 parent_conversation_id: parent.id,
+                 parent_tool_use_id: Some(format!("tu-{task_id}")),
+                 child_conversation_id: child.id,
+                 agent_type: "codex".into(),
+                 profile_id: None,
+                 workspace_path: Some("/tmp/codeg-termination-audit".into()),
+diff --git a/src-tauri/src/acp/delegation/store.rs b/src-tauri/src/acp/delegation/store.rs
+index 890dfe19..3d3cff72 100644
+--- a/src-tauri/src/acp/delegation/store.rs
++++ b/src-tauri/src/acp/delegation/store.rs
+@@ -2684,20 +2684,21 @@ mod tests {
+                 parent_conversation_id: parent.id,
+                 parent_tool_use_id: format!("tu-{task_id}"),
+                 delegation_call_id: task_id.into(),
+             }),
+         )
+         .await
+         .expect("child");
+ 
+         let runs = RunStore::new(db.clone());
+         runs.insert_reserving(ReservingRunInsert {
++            orchestration_binding: None,
+             task_id: task_id.into(),
+             root_task_id: task_id.into(),
+             previous_task_id: None,
+             generation: 1,
+             parent_conversation_id: parent.id,
+             parent_tool_use_id: Some(format!("tu-{task_id}")),
+             child_conversation_id: child.id,
+             agent_type: "codex".into(),
+             profile_id: None,
+             workspace_path: Some("/tmp/ws".into()),
+@@ -2707,20 +2708,21 @@ mod tests {
+             config_values_json: Some("{}".into()),
+             task_preview: Some(derive_task_preview("do work")),
+             request_fingerprint: Some(request_fingerprint(
+                 "delegate_to_agent",
+                 "do work",
+                 None,
+                 None,
+                 None,
+                 None,
+                 "aabbccdd",
++                None,
+             )),
+             admission_class: AdmissionClass::NormalRevision,
+             lineage_root_task_id: task_id.into(),
+             work_unit_key: None,
+             history_only: false,
+             replaced_task_id: None,
+             replacement_reason: None,
+             started_at: Some(Utc::now()),
+         })
+         .await
+diff --git a/src-tauri/src/acp/delegation/types.rs b/src-tauri/src/acp/delegation/types.rs
+index 95fa8139..279e8cf0 100644
+--- a/src-tauri/src/acp/delegation/types.rs
++++ b/src-tauri/src/acp/delegation/types.rs
+@@ -20,20 +20,133 @@ use crate::acp::delegation::recovery_policy::{
+     RecoveryDecision, RecoveryDisposition, ReplacementReason,
+ };
+ use crate::acp::delegation::workflow::{CompletionAttentionCas, CompletionOutcome};
+ use crate::models::AgentType;
+ 
+ /// MCP tool name for initial delegation — field 0 of `request_fingerprint`.
+ pub const DELEGATE_TO_AGENT_TOOL: &str = "delegate_to_agent";
+ /// MCP tool name for session reuse — field 0 of `request_fingerprint`.
+ pub const CONTINUE_DELEGATION_TOOL: &str = "continue_delegation";
+ 
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct OrchestrationBindingV1 {
++    pub schema_version: u32,
++    pub namespace: String,
++    pub generation: u32,
++    pub route_fingerprint: String,
++}
++
++impl OrchestrationBindingV1 {
++    pub fn validate(&self) -> Result<(), &'static str> {
++        if self.schema_version != 1 {
++            return Err("schema_version must be 1");
++        }
++        let namespace = self.namespace.as_bytes();
++        if namespace.is_empty()
++            || namespace.len() > 64
++            || !namespace[0].is_ascii_lowercase()
++            || !namespace[1..]
++                .iter()
++                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
++        {
++            return Err("namespace is invalid");
++        }
++        if self.generation == 0 {
++            return Err("generation must be positive");
++        }
++        let fingerprint = self.route_fingerprint.as_bytes();
++        if fingerprint.len() != 71
++            || !fingerprint.starts_with(b"sha256:")
++            || !fingerprint[7..]
++                .iter()
++                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
++        {
++            return Err("route_fingerprint is invalid");
++        }
++        Ok(())
++    }
++}
++
++#[cfg(test)]
++mod orchestration_binding_tests {
++    use std::collections::BTreeSet;
++
++    use serde_json::Value;
++
++    use super::OrchestrationBindingV1;
++
++    #[test]
++    fn delegation_orchestration_bindings_shared_corpus_is_exact_and_strict() {
++        let corpus: Value = serde_json::from_str(include_str!(concat!(
++            env!("CARGO_MANIFEST_DIR"),
++            "/tests/fixtures/orchestration_binding_v1.json"
++        )))
++        .expect("binding grammar corpus is JSON");
++        let top = corpus.as_object().expect("corpus top level is an object");
++        assert_eq!(
++            top.keys().map(String::as_str).collect::<BTreeSet<_>>(),
++            BTreeSet::from(["cases", "schema_version"])
++        );
++        assert_eq!(top["schema_version"], 1);
++
++        let cases = top["cases"].as_array().expect("cases is an array");
++        assert_eq!(cases.len(), 24);
++        let expected_names = BTreeSet::from([
++            "minimum",
++            "maximum",
++            "brainstorm_to_delivery",
++            "null",
++            "non_object",
++            "missing_schema_version",
++            "missing_namespace",
++            "missing_generation",
++            "missing_route_fingerprint",
++            "extra_field",
++            "wrong_schema_version",
++            "schema_version_string",
++            "namespace_number",
++            "generation_string",
++            "fingerprint_number",
++            "generation_zero",
++            "generation_overflow",
++            "namespace_empty",
++            "namespace_65_bytes",
++            "namespace_uppercase",
++            "namespace_underscore",
++            "fingerprint_uppercase_hex",
++            "fingerprint_wrong_length",
++            "fingerprint_wrong_prefix",
++        ]);
++        let mut names = BTreeSet::new();
++
++        for case in cases {
++            let case = case.as_object().expect("case is an object");
++            assert_eq!(
++                case.keys().map(String::as_str).collect::<BTreeSet<_>>(),
++                BTreeSet::from(["name", "valid", "value"])
++            );
++            let name = case["name"].as_str().expect("case name is a string");
++            assert!(names.insert(name), "duplicate corpus case name {name}");
++            let expected_valid = case["valid"].as_bool().expect("valid is a boolean");
++            let accepted = serde_json::from_value::<OrchestrationBindingV1>(case["value"].clone())
++                .ok()
++                .is_some_and(|binding| binding.validate().is_ok());
++            assert_eq!(
++                accepted, expected_valid,
++                "binding grammar case {name} had unexpected result"
++            );
++        }
++        assert_eq!(names, expected_names);
++    }
++}
++
+ /// Soft-watchdog health for a **running** Broker task only. Terminal tasks
+ /// have no observation. Observe-only — never a lifecycle / terminal state.
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+ #[serde(rename_all = "snake_case")]
+ pub enum TaskObservation {
+     Active,
+     Stalled,
+     WaitingInput,
+ }
+ 
+diff --git a/src-tauri/src/acp/delegation/workflow/admission.rs b/src-tauri/src/acp/delegation/workflow/admission.rs
+index f21ecf05..618a25d4 100644
+--- a/src-tauri/src/acp/delegation/workflow/admission.rs
++++ b/src-tauri/src/acp/delegation/workflow/admission.rs
+@@ -3854,20 +3854,21 @@ mod tests {
+     fn gen1_insert(
+         parent: i32,
+         child: i32,
+         task_id: &str,
+         agent: &str,
+         key: Option<&str>,
+         profile: Option<&str>,
+     ) -> ReservingRunInsert {
+         let workspace = AdmissionGitFixture::new().dir.keep();
+         ReservingRunInsert {
++            orchestration_binding: None,
+             task_id: task_id.into(),
+             root_task_id: task_id.into(),
+             previous_task_id: None,
+             generation: 1,
+             parent_conversation_id: parent,
+             parent_tool_use_id: Some(format!("tool-{task_id}")),
+             child_conversation_id: child,
+             agent_type: agent.into(),
+             profile_id: profile.map(|s| s.into()),
+             workspace_path: Some(workspace.to_string_lossy().into_owned()),
+diff --git a/src-tauri/src/acp/delegation/workflow/completion_evidence.rs b/src-tauri/src/acp/delegation/workflow/completion_evidence.rs
+index 239826a5..f5687b3a 100644
+--- a/src-tauri/src/acp/delegation/workflow/completion_evidence.rs
++++ b/src-tauri/src/acp/delegation/workflow/completion_evidence.rs
+@@ -3847,25 +3847,31 @@ mod tests {
+             let workspace_path = workspace.path().to_path_buf();
+             let design_path = workspace_path.join(DESIGN_REL_PATH);
+             std::fs::create_dir_all(design_path.parent().unwrap()).unwrap();
+             std::fs::write(&design_path, DESIGN_BYTES).unwrap();
+             if write_plan {
+                 let plan_path = workspace_path.join(PLAN_REL_PATH);
+                 std::fs::create_dir_all(plan_path.parent().unwrap()).unwrap();
+                 std::fs::write(&plan_path, b"# Plan\n\nInitial.\n").unwrap();
+             }
+ 
+-            let db = Arc::new(if install_v2_only_triggers {
++            let db = if install_v2_only_triggers {
+                 fresh_in_memory_db().await
+             } else {
+                 crate::db::test_helpers::historical_completion_protocol_db_before_v2_only().await
+-            });
++            };
++            if !install_v2_only_triggers {
++                crate::db::migration::install_for_historical_completion_fixture(&db)
++                    .await
++                    .expect("install orchestration binding migration for historical fixture");
++            }
++            let db = Arc::new(db);
+             let folder = seed_folder(&db, workspace_path.to_str().unwrap()).await;
+             let parent = seed_conversation(&db, folder, AgentType::Codex).await;
+             let child = seed_conversation(&db, folder, AgentType::Codex).await;
+             let author_key = build_work_unit_key(&WorkUnitKeyParts::PlanAuthor {
+                 rel_plan_path: PLAN_REL_PATH,
+                 agent_type: "codex",
+                 profile_id: None,
+             })
+             .unwrap();
+             let document = skeleton_document("task-10", &author_key, &author_node_id);
+@@ -3885,20 +3891,21 @@ mod tests {
+                 .unwrap();
+             let mut active: delegation_workflow::ActiveModel = header.into();
+             active.completion_protocol_version = Set(2);
+             active.completion_protocol_mode = Set(CompletionProtocolMode::V2Enforce);
+             active.update(&db.conn).await.unwrap();
+ 
+             let task_id = format!("task-10-{}", uuid::Uuid::new_v4());
+             let runs = RunStore::new(db.clone());
+             super::super::with_historical_workflow_fixture_mutations(runs.admit_gen1_reserving(
+                 ReservingRunInsert {
++                    orchestration_binding: None,
+                     task_id: task_id.clone(),
+                     root_task_id: task_id.clone(),
+                     previous_task_id: None,
+                     generation: 1,
+                     parent_conversation_id: parent,
+                     parent_tool_use_id: Some(format!("tool-{task_id}")),
+                     child_conversation_id: child,
+                     agent_type: "codex".into(),
+                     profile_id: None,
+                     workspace_path: Some(workspace_path.to_string_lossy().into_owned()),
+@@ -4263,20 +4270,21 @@ mod tests {
+                 }),
+             )
+             .await
+             .unwrap_err();
+             assert_eq!(error.workflow_admission_code(), Some(expected_code));
+ 
+             let source_run = fixture.stored_run().await;
+             let replacement_task_id = format!("{}-replacement", fixture.task_id);
+             let replacement_error = super::super::with_historical_workflow_fixture_mutations(
+                 runs.admit_gen1_reserving(ReservingRunInsert {
++                    orchestration_binding: None,
+                     task_id: replacement_task_id.clone(),
+                     root_task_id: replacement_task_id.clone(),
+                     previous_task_id: None,
+                     generation: 1,
+                     parent_conversation_id: fixture.parent_conversation_id,
+                     parent_tool_use_id: Some(format!("replace-{}", fixture.task_id)),
+                     child_conversation_id: source_run.child_conversation_id,
+                     agent_type: source_run.agent_type,
+                     profile_id: source_run.profile_id,
+                     workspace_path: source_run.workspace_path,
+diff --git a/src-tauri/src/acp/delegation/workflow/project.rs b/src-tauri/src/acp/delegation/workflow/project.rs
+index 3dadc347..49c6474f 100644
+--- a/src-tauri/src/acp/delegation/workflow/project.rs
++++ b/src-tauri/src/acp/delegation/workflow/project.rs
+@@ -4787,20 +4787,24 @@ mod tests {
+             root_task_id: "a".into(),
+             previous_task_id: None,
+             generation: 1,
+             parent_conversation_id: 1,
+             parent_tool_use_id: None,
+             child_conversation_id: 10,
+             agent_type: "grok".into(),
+             profile_id: None,
+             workspace_path: None,
+             route_fingerprint: None,
++            orchestration_schema_version: None,
++            orchestration_namespace: None,
++            orchestration_generation: None,
++            orchestration_route_fingerprint: None,
+             launch_snapshot_version: None,
+             mode_id: None,
+             config_values_json: None,
+             task_preview: None,
+             request_fingerprint: None,
+             admission_class:
+                 crate::db::entities::delegation_task_run::AdmissionClass::NormalRevision,
+             reached_running_at: None,
+             lineage_root_task_id: "a".into(),
+             work_unit_key: None,
+@@ -4835,38 +4839,46 @@ mod tests {
+             task_id: "b".into(),
+             generation: 2,
+             started_at: Some(t2),
+             finished_at: Some(t3),
+             status: DelegationRunStatus::Completed,
+             lineage_root_task_id: "a".into(),
+             root_task_id: "a".into(),
+             child_conversation_id: 11,
+             parent_conversation_id: 1,
+             agent_type: "grok".into(),
++            orchestration_schema_version: None,
++            orchestration_namespace: None,
++            orchestration_generation: None,
++            orchestration_route_fingerprint: None,
+             admission_class:
+                 crate::db::entities::delegation_task_run::AdmissionClass::NormalRevision,
+             history_only: false,
+             created_at: t2,
+             updated_at: t3,
+             ..finished_a.clone()
+         };
+         let open_c = delegation_task_run::Model {
+             task_id: "c".into(),
+             generation: 3,
+             started_at: Some(t3),
+             finished_at: None,
+             status: DelegationRunStatus::Running,
+             lineage_root_task_id: "a".into(),
+             root_task_id: "a".into(),
+             child_conversation_id: 12,
+             parent_conversation_id: 1,
+             agent_type: "grok".into(),
++            orchestration_schema_version: None,
++            orchestration_namespace: None,
++            orchestration_generation: None,
++            orchestration_route_fingerprint: None,
+             admission_class:
+                 crate::db::entities::delegation_task_run::AdmissionClass::NormalRevision,
+             history_only: false,
+             created_at: t3,
+             updated_at: t3,
+             ..finished_a.clone()
+         };
+ 
+         let all = [&finished_a, &finished_b, &open_c];
+         // Open latest excluded: 5m + 2m = 7m.
+diff --git a/src-tauri/src/acp/delegation/workflow/recovery_tests.rs b/src-tauri/src/acp/delegation/workflow/recovery_tests.rs
+index 657c1c28..38715dbf 100644
+--- a/src-tauri/src/acp/delegation/workflow/recovery_tests.rs
++++ b/src-tauri/src/acp/delegation/workflow/recovery_tests.rs
+@@ -935,20 +935,21 @@ async fn seed_legacy_parent_disconnect(
+             parent_conversation_id: parent.id,
+             parent_tool_use_id: "legacy-source-tool".into(),
+             delegation_call_id: source_task_id.clone(),
+         }),
+     )
+     .await
+     .expect("legacy child");
+     let store = Arc::new(RunStore::new(db.clone()));
+     store
+         .insert_reserving(ReservingRunInsert {
++            orchestration_binding: None,
+             task_id: source_task_id.clone(),
+             root_task_id: source_task_id.clone(),
+             previous_task_id: None,
+             generation: 1,
+             parent_conversation_id: parent.id,
+             parent_tool_use_id: Some("legacy-source-tool".into()),
+             child_conversation_id: child.id,
+             agent_type: "codex".into(),
+             profile_id: None,
+             workspace_path: Some("/tmp/legacy".into()),
+@@ -1089,20 +1090,21 @@ async fn approve_continue_recovery(
+     pending.authorization_id
+ }
+ 
+ fn replacement_insert(
+     parent: i32,
+     child: i32,
+     root_task_id: &str,
+     continued_task_id: &str,
+ ) -> ReservingRunInsert {
+     ReservingRunInsert {
++        orchestration_binding: None,
+         task_id: "legacy-replacement".into(),
+         root_task_id: "legacy-replacement".into(),
+         previous_task_id: Some(continued_task_id.into()),
+         generation: 1,
+         parent_conversation_id: parent,
+         parent_tool_use_id: Some("legacy-replacement-tool".into()),
+         child_conversation_id: child,
+         agent_type: "codex".into(),
+         profile_id: None,
+         workspace_path: Some("/tmp/legacy".into()),
+diff --git a/src-tauri/src/acp/delegation/workflow/store.rs b/src-tauri/src/acp/delegation/workflow/store.rs
+index c4a2596e..7e54391a 100644
+--- a/src-tauri/src/acp/delegation/workflow/store.rs
++++ b/src-tauri/src/acp/delegation/workflow/store.rs
+@@ -9663,20 +9663,21 @@ mod tests {
+                 db,
+                 seed_folder(db, workspace.to_str().unwrap()).await,
+                 AgentType::Codex,
+             )
+             .await;
+             let runs = RunStore::new(Arc::new(AppDatabase {
+                 conn: db.conn.clone(),
+             }));
+             super::super::with_historical_workflow_fixture_mutations(runs.admit_gen1_reserving(
+                 ReservingRunInsert {
++                    orchestration_binding: None,
+                     task_id: task_id.into(),
+                     root_task_id: task_id.into(),
+                     previous_task_id: None,
+                     generation: 1,
+                     parent_conversation_id: parent,
+                     parent_tool_use_id: Some(format!("tool-{task_id}")),
+                     child_conversation_id: child,
+                     agent_type: "codex".into(),
+                     profile_id: None,
+                     workspace_path: Some(workspace.to_string_lossy().into_owned()),
+@@ -12339,20 +12340,21 @@ mod tests {
+             ))
+             .one(&db.conn)
+             .await
+             .unwrap()
+             .unwrap();
+             let runs = RunStore::new(Arc::new(AppDatabase {
+                 conn: db.conn.clone(),
+             }));
+             super::super::with_historical_workflow_fixture_mutations(runs.admit_gen1_reserving(
+                 ReservingRunInsert {
++                    orchestration_binding: None,
+                     task_id: task_id.clone(),
+                     root_task_id: task_id.clone(),
+                     previous_task_id: None,
+                     generation: 1,
+                     parent_conversation_id: parent,
+                     parent_tool_use_id: Some(format!("tool-{task_id}")),
+                     child_conversation_id: child,
+                     agent_type: "codex".into(),
+                     profile_id: None,
+                     workspace_path: Some(workspace.path().to_string_lossy().into_owned()),
+diff --git a/src-tauri/src/db/entities/delegation_task_run.rs b/src-tauri/src/db/entities/delegation_task_run.rs
+index 0d681351..55d26739 100644
+--- a/src-tauri/src/db/entities/delegation_task_run.rs
++++ b/src-tauri/src/db/entities/delegation_task_run.rs
+@@ -52,20 +52,24 @@ pub struct Model {
+     pub root_task_id: String,
+     pub previous_task_id: Option<String>,
+     pub generation: i64,
+     pub parent_conversation_id: i32,
+     pub parent_tool_use_id: Option<String>,
+     pub child_conversation_id: i32,
+     pub agent_type: String,
+     pub profile_id: Option<String>,
+     pub workspace_path: Option<String>,
+     pub route_fingerprint: Option<String>,
++    pub orchestration_schema_version: Option<i64>,
++    pub orchestration_namespace: Option<String>,
++    pub orchestration_generation: Option<i64>,
++    pub orchestration_route_fingerprint: Option<String>,
+     pub launch_snapshot_version: Option<String>,
+     pub mode_id: Option<String>,
+     pub config_values_json: Option<String>,
+     pub task_preview: Option<String>,
+     pub request_fingerprint: Option<String>,
+     pub admission_class: AdmissionClass,
+     pub reached_running_at: Option<DateTimeUtc>,
+     pub lineage_root_task_id: String,
+     pub work_unit_key: Option<String>,
+     pub legacy_parent_tool_use_id: Option<String>,
+diff --git a/src-tauri/src/db/migration/m20260817_000001_delegation_orchestration_bindings.rs b/src-tauri/src/db/migration/m20260817_000001_delegation_orchestration_bindings.rs
+new file mode 100644
+index 00000000..997a20d7
+--- /dev/null
++++ b/src-tauri/src/db/migration/m20260817_000001_delegation_orchestration_bindings.rs
+@@ -0,0 +1,392 @@
++//! Immutable optional orchestration identity for generic delegation runs.
++
++use sea_orm_migration::prelude::*;
++
++#[derive(DeriveMigrationName)]
++pub struct Migration;
++
++#[async_trait::async_trait]
++impl MigrationTrait for Migration {
++    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
++        for statement in [
++            "ALTER TABLE delegation_task_runs ADD COLUMN orchestration_schema_version INTEGER NULL",
++            "ALTER TABLE delegation_task_runs ADD COLUMN orchestration_namespace TEXT NULL",
++            "ALTER TABLE delegation_task_runs ADD COLUMN orchestration_generation INTEGER NULL",
++            "ALTER TABLE delegation_task_runs ADD COLUMN orchestration_route_fingerprint TEXT NULL",
++            r#"CREATE TRIGGER trg_dtr_orchestration_binding_shape
++               BEFORE INSERT ON delegation_task_runs
++               WHEN (NEW.orchestration_schema_version IS NOT NULL) +
++                    (NEW.orchestration_namespace IS NOT NULL) +
++                    (NEW.orchestration_generation IS NOT NULL) +
++                    (NEW.orchestration_route_fingerprint IS NOT NULL) NOT IN (0, 4)
++               BEGIN
++                 SELECT RAISE(ABORT, 'trg_dtr_orchestration_binding_shape');
++               END"#,
++            r#"CREATE TRIGGER trg_dtr_orchestration_binding_immutable
++               BEFORE UPDATE OF orchestration_schema_version,
++                                orchestration_namespace,
++                                orchestration_generation,
++                                orchestration_route_fingerprint
++               ON delegation_task_runs
++               WHEN OLD.orchestration_schema_version IS NOT NEW.orchestration_schema_version
++                 OR OLD.orchestration_namespace IS NOT NEW.orchestration_namespace
++                 OR OLD.orchestration_generation IS NOT NEW.orchestration_generation
++                 OR OLD.orchestration_route_fingerprint IS NOT NEW.orchestration_route_fingerprint
++               BEGIN
++                 SELECT RAISE(ABORT, 'trg_dtr_orchestration_binding_immutable');
++               END"#,
++            r#"CREATE INDEX idx_dtr_parent_orchestration_created_task
++               ON delegation_task_runs(
++                 parent_conversation_id,
++                 orchestration_namespace,
++                 created_at,
++                 task_id
++               )"#,
++        ] {
++            manager
++                .get_connection()
++                .execute_unprepared(statement)
++                .await?;
++        }
++        Ok(())
++    }
++
++    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
++        for statement in [
++            "DROP INDEX IF EXISTS idx_dtr_parent_orchestration_created_task",
++            "DROP TRIGGER IF EXISTS trg_dtr_orchestration_binding_immutable",
++            "DROP TRIGGER IF EXISTS trg_dtr_orchestration_binding_shape",
++            "ALTER TABLE delegation_task_runs DROP COLUMN orchestration_route_fingerprint",
++            "ALTER TABLE delegation_task_runs DROP COLUMN orchestration_generation",
++            "ALTER TABLE delegation_task_runs DROP COLUMN orchestration_namespace",
++            "ALTER TABLE delegation_task_runs DROP COLUMN orchestration_schema_version",
++        ] {
++            manager
++                .get_connection()
++                .execute_unprepared(statement)
++                .await?;
++        }
++        Ok(())
++    }
++}
++
++/// Historical completion-protocol tests intentionally hold the schema before
++/// the v2-only migration while exercising run-store writes. Install this later
++/// independent migration out of order and record it so the normal migrator
++/// does not apply it twice when those fixtures advance.
++#[cfg(test)]
++pub(crate) async fn install_for_historical_completion_fixture(
++    db: &crate::db::AppDatabase,
++) -> Result<(), DbErr> {
++    use std::time::{SystemTime, UNIX_EPOCH};
++
++    use sea_orm::{ConnectionTrait, DbBackend, Statement};
++
++    let manager = SchemaManager::new(&db.conn);
++    if !manager
++        .has_column(
++            "delegation_task_runs",
++            "orchestration_schema_version",
++        )
++        .await?
++    {
++        Migration.up(&manager).await?;
++    }
++
++    let applied_at = SystemTime::now()
++        .duration_since(UNIX_EPOCH)
++        .expect("system time after Unix epoch")
++        .as_secs() as i64;
++    db.conn
++        .execute(Statement::from_sql_and_values(
++            DbBackend::Sqlite,
++            "INSERT OR IGNORE INTO seaql_migrations (version, applied_at) VALUES (?, ?)",
++            vec![
++                "m20260817_000001_delegation_orchestration_bindings".into(),
++                applied_at.into(),
++            ],
++        ))
++        .await?;
++    Ok(())
++}
++
++#[cfg(test)]
++mod tests {
++    use std::collections::BTreeMap;
++
++    use sea_orm::{ConnectionTrait, Database, DbBackend, Statement};
++
++    use super::*;
++    use crate::db::migration::Migrator;
++
++    const PRIOR_MIGRATION: &str = "m20260811_000001_simple_workflows";
++    const BINDING_MIGRATION: &str =
++        "m20260817_000001_delegation_orchestration_bindings";
++    const ZERO_FINGERPRINT: &str =
++        "sha256:0000000000000000000000000000000000000000000000000000000000000000";
++
++    fn sql(statement: impl Into<String>) -> Statement {
++        Statement::from_string(DbBackend::Sqlite, statement.into())
++    }
++
++    async fn open_through_prior_migration() -> sea_orm::DatabaseConnection {
++        let db = Database::connect("sqlite::memory:")
++            .await
++            .expect("open in-memory database");
++        let migrations = Migrator::migrations();
++        let prior_index = migrations
++            .iter()
++            .position(|migration| migration.name() == PRIOR_MIGRATION)
++            .expect("prior migration registered");
++        Migrator::up(&db, Some((prior_index + 1) as u32))
++            .await
++            .expect("apply prior migrations");
++        db.execute_unprepared("PRAGMA foreign_keys=OFF")
++            .await
++            .expect("disable unrelated foreign-key setup for raw run fixtures");
++        db
++    }
++
++    async fn open_with_binding_migration() -> sea_orm::DatabaseConnection {
++        let db = open_through_prior_migration().await;
++        Migration
++            .up(&SchemaManager::new(&db))
++            .await
++            .expect("apply orchestration binding migration");
++        db
++    }
++
++    async fn insert_run(
++        db: &sea_orm::DatabaseConnection,
++        task_id: &str,
++        child_conversation_id: i32,
++        binding_columns: &str,
++        binding_values: &str,
++    ) -> Result<(), DbErr> {
++        let columns = if binding_columns.is_empty() {
++            String::new()
++        } else {
++            format!(", {binding_columns}")
++        };
++        let values = if binding_values.is_empty() {
++            String::new()
++        } else {
++            format!(", {binding_values}")
++        };
++        db.execute(sql(format!(
++            "INSERT INTO delegation_task_runs (\
++             task_id, root_task_id, generation, parent_conversation_id, \
++             child_conversation_id, agent_type, admission_class, \
++             lineage_root_task_id, history_only, status, created_at, updated_at\
++             {columns}) VALUES (\
++             '{task_id}', '{task_id}', 1, 1, {child_conversation_id}, 'codex', 'normal_revision', \
++             '{task_id}', 0, 'reserving', '2026-08-17T00:00:00Z', \
++             '2026-08-17T00:00:00Z'{values})"
++        )))
++        .await
++        .map(|_| ())
++    }
++
++    async fn binding_values(
++        db: &sea_orm::DatabaseConnection,
++        task_id: &str,
++    ) -> (Option<i64>, Option<String>, Option<i64>, Option<String>) {
++        let row = db
++            .query_one(sql(format!(
++                "SELECT orchestration_schema_version, orchestration_namespace, \
++                 orchestration_generation, orchestration_route_fingerprint \
++                 FROM delegation_task_runs WHERE task_id = '{task_id}'"
++            )))
++            .await
++            .expect("query binding")
++            .expect("run exists");
++        (
++            row.try_get("", "orchestration_schema_version")
++                .expect("schema version"),
++            row.try_get("", "orchestration_namespace")
++                .expect("namespace"),
++            row.try_get("", "orchestration_generation")
++                .expect("generation"),
++            row.try_get("", "orchestration_route_fingerprint")
++                .expect("route fingerprint"),
++        )
++    }
++
++    fn assert_trigger(error: DbErr, trigger_name: &str) {
++        let message = error.to_string();
++        assert!(
++            message.contains(trigger_name),
++            "expected {trigger_name} in SQLite error, got {message}"
++        );
++    }
++
++    #[tokio::test]
++    async fn delegation_orchestration_bindings_preserve_legacy_rows_without_backfill() {
++        let db = open_through_prior_migration().await;
++        insert_run(&db, "legacy-run", 1, "", "")
++            .await
++            .expect("insert legacy run before migration");
++
++        Migration
++            .up(&SchemaManager::new(&db))
++            .await
++            .expect("apply orchestration binding migration");
++
++        assert_eq!(
++            binding_values(&db, "legacy-run").await,
++            (None, None, None, None)
++        );
++    }
++
++    #[tokio::test]
++    async fn delegation_orchestration_bindings_register_after_simple_workflows() {
++        let names = Migrator::migrations()
++            .iter()
++            .map(|migration| migration.name().to_string())
++            .collect::<Vec<_>>();
++        let prior_index = names
++            .iter()
++            .position(|name| name == PRIOR_MIGRATION)
++            .expect("prior migration registered");
++        assert_eq!(
++            names.get(prior_index + 1).map(String::as_str),
++            Some(BINDING_MIGRATION)
++        );
++    }
++
++    #[tokio::test]
++    async fn delegation_orchestration_bindings_have_exact_columns_and_index_order() {
++        let db = open_with_binding_migration().await;
++        let columns = db
++            .query_all(sql("PRAGMA table_info('delegation_task_runs')"))
++            .await
++            .expect("table info")
++            .into_iter()
++            .filter_map(|row| {
++                let name: String = row.try_get("", "name").expect("column name");
++                name.starts_with("orchestration_").then(|| {
++                    (
++                        name,
++                        (
++                            row.try_get::<String>("", "type").expect("column type"),
++                            row.try_get::<i64>("", "notnull").expect("nullability"),
++                        ),
++                    )
++                })
++            })
++            .collect::<BTreeMap<_, _>>();
++        assert_eq!(
++            columns,
++            BTreeMap::from([
++                ("orchestration_generation".to_string(), ("INTEGER".to_string(), 0)),
++                ("orchestration_namespace".to_string(), ("TEXT".to_string(), 0)),
++                (
++                    "orchestration_route_fingerprint".to_string(),
++                    ("TEXT".to_string(), 0),
++                ),
++                (
++                    "orchestration_schema_version".to_string(),
++                    ("INTEGER".to_string(), 0),
++                ),
++            ])
++        );
++
++        let index_columns = db
++            .query_all(sql(
++                "PRAGMA index_info('idx_dtr_parent_orchestration_created_task')",
++            ))
++            .await
++            .expect("index info")
++            .into_iter()
++            .map(|row| row.try_get::<String>("", "name").expect("index column"))
++            .collect::<Vec<_>>();
++        assert_eq!(
++            index_columns,
++            [
++                "parent_conversation_id",
++                "orchestration_namespace",
++                "created_at",
++                "task_id",
++            ]
++        );
++    }
++
++    #[tokio::test]
++    async fn delegation_orchestration_bindings_reject_partial_insert_and_every_update() {
++        let db = open_with_binding_migration().await;
++        insert_run(&db, "unbound", 1, "", "")
++            .await
++            .expect("all-null binding accepted");
++        insert_run(
++            &db,
++            "bound",
++            2,
++            "orchestration_schema_version, orchestration_namespace, \
++             orchestration_generation, orchestration_route_fingerprint",
++            &format!("1, 'brainstorm-to-delivery', 1, '{ZERO_FINGERPRINT}'"),
++        )
++        .await
++        .expect("all-set binding accepted");
++
++        let partial = insert_run(
++            &db,
++            "partial",
++            3,
++            "orchestration_schema_version",
++            "1",
++        )
++        .await
++        .expect_err("partial binding must be rejected");
++        assert_trigger(partial, "trg_dtr_orchestration_binding_shape");
++
++        let add = db
++            .execute(sql(format!(
++                "UPDATE delegation_task_runs SET \
++                 orchestration_schema_version = 1, \
++                 orchestration_namespace = 'brainstorm-to-delivery', \
++                 orchestration_generation = 1, \
++                 orchestration_route_fingerprint = '{ZERO_FINGERPRINT}' \
++                 WHERE task_id = 'unbound'"
++            )))
++            .await
++            .expect_err("adding a binding after insert must fail");
++        assert_trigger(add, "trg_dtr_orchestration_binding_immutable");
++
++        let change = db
++            .execute(sql(
++                "UPDATE delegation_task_runs SET orchestration_generation = 2 \
++                 WHERE task_id = 'bound'",
++            ))
++            .await
++            .expect_err("changing a binding after insert must fail");
++        assert_trigger(change, "trg_dtr_orchestration_binding_immutable");
++
++        let clear = db
++            .execute(sql(
++                "UPDATE delegation_task_runs SET \
++                 orchestration_schema_version = NULL, \
++                 orchestration_namespace = NULL, \
++                 orchestration_generation = NULL, \
++                 orchestration_route_fingerprint = NULL \
++                 WHERE task_id = 'bound'",
++            ))
++            .await
++            .expect_err("clearing a binding after insert must fail");
++        assert_trigger(clear, "trg_dtr_orchestration_binding_immutable");
++
++        db.execute(sql(
++            "UPDATE delegation_task_runs SET status = 'running' WHERE task_id = 'bound'",
++        ))
++        .await
++        .expect("status-only update succeeds");
++        assert_eq!(
++            binding_values(&db, "bound").await,
++            (
++                Some(1),
++                Some("brainstorm-to-delivery".to_string()),
++                Some(1),
++                Some(ZERO_FINGERPRINT.to_string()),
++            )
++        );
++    }
++}
+diff --git a/src-tauri/src/db/migration/mod.rs b/src-tauri/src/db/migration/mod.rs
+index 49689049..2d041613 100644
+--- a/src-tauri/src/db/migration/mod.rs
++++ b/src-tauri/src/db/migration/mod.rs
+@@ -58,20 +58,25 @@ mod m20260804_000002_completion_scope_and_gate_settlement;
+ mod m20260804_000003_completion_tool_intents_and_restart_link;
+ mod m20260804_000004_typed_completion_attention;
+ mod m20260806_000001_platform_design_root_binding;
+ mod m20260806_000002_final_reviewer_snapshots;
+ mod m20260806_000003_plan_round_authorization;
+ mod m20260806_000004_legacy_restart_context;
+ mod m20260807_000001_work_task_scheduled_at;
+ mod m20260808_000001_custom_agent_supports_mcp;
+ mod m20260809_000001_completion_protocol_v2_only;
+ mod m20260811_000001_simple_workflows;
++mod m20260817_000001_delegation_orchestration_bindings;
++#[cfg(test)]
++pub(crate) use m20260817_000001_delegation_orchestration_bindings::{
++    install_for_historical_completion_fixture,
++};
+ pub struct Migrator;
+ 
+ #[async_trait::async_trait]
+ impl MigratorTrait for Migrator {
+     fn migrations() -> Vec<Box<dyn MigrationTrait>> {
+         vec![
+             Box::new(m20260211_000001_init::Migration),
+             Box::new(m20260219_000001_folder_command::Migration),
+             Box::new(m20260221_000001_folder_is_open::Migration),
+             Box::new(m20260226_000001_agent_setting::Migration),
+@@ -128,13 +133,14 @@ impl MigratorTrait for Migrator {
+             Box::new(m20260804_000003_completion_tool_intents_and_restart_link::Migration),
+             Box::new(m20260804_000004_typed_completion_attention::Migration),
+             Box::new(m20260806_000001_platform_design_root_binding::Migration),
+             Box::new(m20260806_000002_final_reviewer_snapshots::Migration),
+             Box::new(m20260806_000003_plan_round_authorization::Migration),
+             Box::new(m20260806_000004_legacy_restart_context::Migration),
+             Box::new(m20260807_000001_work_task_scheduled_at::Migration),
+             Box::new(m20260808_000001_custom_agent_supports_mcp::Migration),
+             Box::new(m20260809_000001_completion_protocol_v2_only::Migration),
+             Box::new(m20260811_000001_simple_workflows::Migration),
++            Box::new(m20260817_000001_delegation_orchestration_bindings::Migration),
+         ]
+     }
+ }
+diff --git a/src-tauri/tests/completion_protocol_v2.rs b/src-tauri/tests/completion_protocol_v2.rs
+index b7d699cc..d42eb828 100644
+--- a/src-tauri/tests/completion_protocol_v2.rs
++++ b/src-tauri/tests/completion_protocol_v2.rs
+@@ -767,20 +767,21 @@ async fn seed_final_guard_binding(
+     db: &codeg_lib::db::AppDatabase,
+     parent: i32,
+     child: i32,
+     workflow_id: &str,
+     task_id: &str,
+ ) {
+     let runs = RunStore::new(Arc::new(codeg_lib::db::AppDatabase {
+         conn: db.conn.clone(),
+     }));
+     runs.insert_reserving(ReservingRunInsert {
++        orchestration_binding: None,
+         task_id: task_id.into(),
+         root_task_id: task_id.into(),
+         previous_task_id: None,
+         generation: 1,
+         parent_conversation_id: parent,
+         parent_tool_use_id: Some(format!("tool-{task_id}")),
+         child_conversation_id: child,
+         agent_type: "codex".into(),
+         profile_id: None,
+         workspace_path: Some("/tmp/task-4-final-guard".into()),
+@@ -838,20 +839,21 @@ async fn seed_conversation_workflow_association(
+     child: i32,
+     task_id: &str,
+     generation: i64,
+     created_at: chrono::DateTime<chrono::Utc>,
+     workflow_id: Option<&str>,
+ ) {
+     let runs = RunStore::new(Arc::new(codeg_lib::db::AppDatabase {
+         conn: db.conn.clone(),
+     }));
+     runs.insert_reserving(ReservingRunInsert {
++        orchestration_binding: None,
+         task_id: task_id.into(),
+         root_task_id: format!("root-{child}"),
+         previous_task_id: None,
+         generation,
+         parent_conversation_id: parent,
+         parent_tool_use_id: Some(format!("tool-{task_id}")),
+         child_conversation_id: child,
+         agent_type: "codex".into(),
+         profile_id: None,
+         workspace_path: Some("/tmp/task-4-root-associations".into()),
+@@ -1061,20 +1063,21 @@ async fn workflow_admission_requires_v2() {
+         let document = skeleton(&format!("task-5-admission-{index}"));
+         let work_unit_key = document.nodes[0].work_unit_key.clone().unwrap();
+         let _published = seed_historical_manifest(&db, &workflow_id, &document).await;
+ 
+         let task_id = format!("task-5-admission-run-{index}");
+         let runs = RunStore::new(Arc::new(codeg_lib::db::AppDatabase {
+             conn: db.conn.clone(),
+         }));
+         let error = runs
+             .admit_gen1_reserving(ReservingRunInsert {
++                orchestration_binding: None,
+                 task_id: task_id.clone(),
+                 root_task_id: task_id.clone(),
+                 previous_task_id: None,
+                 generation: 1,
+                 parent_conversation_id: parent,
+                 parent_tool_use_id: Some(format!("tool-{task_id}")),
+                 child_conversation_id: child,
+                 agent_type: "codex".into(),
+                 profile_id: None,
+                 workspace_path: Some(workspace.path().to_string_lossy().into_owned()),
+@@ -2507,20 +2510,21 @@ async fn admit_v2_fixture_run(
+     workspace: &Path,
+     task_id: &str,
+     agent_type: &str,
+     work_unit_key: String,
+     task_preview: &str,
+ ) {
+     let runs = Arc::new(RunStore::new(Arc::new(codeg_lib::db::AppDatabase {
+         conn: db.conn.clone(),
+     })));
+     with_historical_workflow_fixture_mutations(runs.admit_gen1_reserving(ReservingRunInsert {
++        orchestration_binding: None,
+         task_id: task_id.into(),
+         root_task_id: task_id.into(),
+         previous_task_id: None,
+         generation: 1,
+         parent_conversation_id: parent,
+         parent_tool_use_id: Some(format!("tool-{task_id}")),
+         child_conversation_id: child,
+         agent_type: agent_type.into(),
+         profile_id: None,
+         workspace_path: Some(workspace.to_string_lossy().into_owned()),
+@@ -2619,20 +2623,21 @@ async fn run_capability_case(case: CapabilityCase) -> CapabilityResult {
+         rel_plan_path: "docs/superpowers/plans/restarted-plan.md",
+         agent_type: "codex",
+         profile_id: None,
+     })
+     .unwrap();
+     let task_id = format!("task-18-capability-{}", uuid::Uuid::new_v4());
+     let runs = Arc::new(RunStore::new(Arc::new(codeg_lib::db::AppDatabase {
+         conn: db.conn.clone(),
+     })));
+     with_historical_workflow_fixture_mutations(runs.admit_gen1_reserving(ReservingRunInsert {
++        orchestration_binding: None,
+         task_id: task_id.clone(),
+         root_task_id: task_id.clone(),
+         previous_task_id: None,
+         generation: 1,
+         parent_conversation_id: parent,
+         parent_tool_use_id: Some(format!("tool-{task_id}")),
+         child_conversation_id: child,
+         agent_type: "codex".into(),
+         profile_id: None,
+         workspace_path: Some(workspace_path.to_string_lossy().into_owned()),
+diff --git a/src-tauri/tests/completion_transport_parity.rs b/src-tauri/tests/completion_transport_parity.rs
+index 5705bb43..d5e80707 100644
+--- a/src-tauri/tests/completion_transport_parity.rs
++++ b/src-tauri/tests/completion_transport_parity.rs
+@@ -93,20 +93,21 @@ async fn completion_http_fixture() -> CompletionHttpFixture {
+         workflow.completion_protocol_mode,
+         CompletionProtocolMode::V2Enforce
+     );
+ 
+     let task_id = format!("http-attention-{}", uuid::Uuid::new_v4());
+     let db_arc = Arc::new(codeg_lib::db::AppDatabase {
+         conn: db.conn.clone(),
+     });
+     with_historical_workflow_fixture_mutations(RunStore::new(db_arc).admit_gen1_reserving(
+         ReservingRunInsert {
++            orchestration_binding: None,
+             task_id: task_id.clone(),
+             root_task_id: task_id.clone(),
+             previous_task_id: None,
+             generation: 1,
+             parent_conversation_id: parent,
+             parent_tool_use_id: Some(format!("tool-{task_id}")),
+             child_conversation_id: child,
+             agent_type: "codex".into(),
+             profile_id: None,
+             workspace_path: Some(workspace_path.to_string_lossy().into_owned()),
+diff --git a/src-tauri/tests/delegation_session_reuse_integration.rs b/src-tauri/tests/delegation_session_reuse_integration.rs
+index aa87755c..99ae4aae 100644
+--- a/src-tauri/tests/delegation_session_reuse_integration.rs
++++ b/src-tauri/tests/delegation_session_reuse_integration.rs
+@@ -258,20 +258,21 @@ async fn list_run_rows(
+ fn unexpected_continue_insert(
+     task_id: &str,
+     parent_id: i32,
+     child_id: i32,
+     generation: i64,
+     previous_task_id: Option<&str>,
+     lineage_root_task_id: &str,
+     work_unit_key: &str,
+ ) -> ReservingRunInsert {
+     ReservingRunInsert {
++        orchestration_binding: None,
+         task_id: task_id.into(),
+         root_task_id: lineage_root_task_id.into(),
+         previous_task_id: previous_task_id.map(str::to_string),
+         generation,
+         parent_conversation_id: parent_id,
+         parent_tool_use_id: Some(format!("tu-{task_id}")),
+         child_conversation_id: child_id,
+         agent_type: "codex".into(),
+         profile_id: None,
+         workspace_path: Some(test_working_dir()),
+@@ -281,20 +282,21 @@ fn unexpected_continue_insert(
+         config_values_json: Some("{}".into()),
+         task_preview: Some(derive_task_preview("unexpected continuation")),
+         request_fingerprint: Some(request_fingerprint(
+             CONTINUE_DELEGATION_TOOL,
+             "unexpected continuation",
+             Some(work_unit_key),
+             None,
+             None,
+             previous_task_id,
+             "aabbccdd",
++            None,
+         )),
+         admission_class: AdmissionClass::UnexpectedContinue,
+         lineage_root_task_id: lineage_root_task_id.into(),
+         work_unit_key: Some(work_unit_key.into()),
+         history_only: false,
+         replaced_task_id: None,
+         replacement_reason: None,
+         started_at: Some(Utc::now()),
+     }
+ }
+@@ -947,40 +949,43 @@ fn skill_forward_routing_invariants_eleven_v2_scenarios() {
+         for action in scenario.expected_actions {
+             match action {
+                 SkillAction::Continue => assert!(!request_fingerprint(
+                     CONTINUE_DELEGATION_TOOL,
+                     "follow-up",
+                     Some(scenario.routes[0].work_unit_key),
+                     None,
+                     None,
+                     Some("prior-task"),
+                     "deadbeef",
++                    None,
+                 )
+                 .is_empty()),
+                 SkillAction::FreshDelegate => assert!(!request_fingerprint(
+                     DELEGATE_TO_AGENT_TOOL,
+                     "fresh task",
+                     Some(scenario.routes[0].work_unit_key),
+                     None,
+                     None,
+                     None,
+                     "deadbeef",
++                    None,
+                 )
+                 .is_empty()),
+                 SkillAction::Replacement => assert!(!request_fingerprint(
+                     DELEGATE_TO_AGENT_TOOL,
+                     "replacement",
+                     Some(scenario.routes[0].work_unit_key),
+                     Some("failed-task"),
+                     Some(REPLACEMENT_REASON_UNRESUMABLE),
+                     None,
+                     "deadbeef",
++                    None,
+                 )
+                 .is_empty()),
+                 SkillAction::BlockNoSubstitute => {
+                     assert_ne!("route_policy", REPLACEMENT_REASON_UNRESUMABLE)
+                 }
+             }
+         }
+     }
+ }
+ 
+@@ -1989,20 +1994,21 @@ async fn pre_admission_host_restart_allows_fresh_gen1_redispatch() {
+             parent_conversation_id: parent.id,
+             parent_tool_use_id: "tu-preadmit-fresh-source".into(),
+             delegation_call_id: source_task_id.into(),
+         }),
+     )
+     .await
+     .expect("source child");
+     let runs = Arc::new(RunStore::new(db.clone()));
+     let work_unit_key = "task|8|implementer|none";
+     runs.insert_reserving(ReservingRunInsert {
++        orchestration_binding: None,
+         task_id: source_task_id.into(),
+         root_task_id: source_task_id.into(),
+         previous_task_id: None,
+         generation: 1,
+         parent_conversation_id: parent.id,
+         parent_tool_use_id: Some("tu-preadmit-fresh-source".into()),
+         child_conversation_id: old_child.id,
+         agent_type: AgentType::Grok.to_string(),
+         profile_id: None,
+         workspace_path: Some(test_working_dir()),
+@@ -2012,20 +2018,21 @@ async fn pre_admission_host_restart_allows_fresh_gen1_redispatch() {
+         config_values_json: Some("{}".into()),
+         task_preview: Some(derive_task_preview("initial pre-admission dispatch")),
+         request_fingerprint: Some(request_fingerprint(
+             DELEGATE_TO_AGENT_TOOL,
+             "initial pre-admission dispatch",
+             Some(work_unit_key),
+             None,
+             None,
+             None,
+             "aabbccdd",
++            None,
+         )),
+         admission_class: AdmissionClass::NormalRevision,
+         lineage_root_task_id: source_task_id.into(),
+         work_unit_key: Some(work_unit_key.into()),
+         history_only: false,
+         replaced_task_id: None,
+         replacement_reason: None,
+         started_at: Some(Utc::now()),
+     })
+     .await
+diff --git a/src-tauri/tests/fixtures/orchestration_binding_v1.json b/src-tauri/tests/fixtures/orchestration_binding_v1.json
+new file mode 100644
+index 00000000..cf4a8532
+--- /dev/null
++++ b/src-tauri/tests/fixtures/orchestration_binding_v1.json
+@@ -0,0 +1,232 @@
++{
++  "schema_version": 1,
++  "cases": [
++    {
++      "name": "minimum",
++      "valid": true,
++      "value": {
++        "schema_version": 1,
++        "namespace": "a",
++        "generation": 1,
++        "route_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
++      }
++    },
++    {
++      "name": "maximum",
++      "valid": true,
++      "value": {
++        "schema_version": 1,
++        "namespace": "a123456789012345678901234567890123456789012345678901234567890123",
++        "generation": 4294967295,
++        "route_fingerprint": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
++      }
++    },
++    {
++      "name": "brainstorm_to_delivery",
++      "valid": true,
++      "value": {
++        "schema_version": 1,
++        "namespace": "brainstorm-to-delivery",
++        "generation": 2,
++        "route_fingerprint": "sha256:b498416d87bf6ba928bd7ddb5f1a451daf82300584f3d40b606c3c56f169ba7a"
++      }
++    },
++    {
++      "name": "null",
++      "valid": false,
++      "value": null
++    },
++    {
++      "name": "non_object",
++      "valid": false,
++      "value": []
++    },
++    {
++      "name": "missing_schema_version",
++      "valid": false,
++      "value": {
++        "namespace": "a",
++        "generation": 1,
++        "route_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
++      }
++    },
++    {
++      "name": "missing_namespace",
++      "valid": false,
++      "value": {
++        "schema_version": 1,
++        "generation": 1,
++        "route_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
++      }
++    },
++    {
++      "name": "missing_generation",
++      "valid": false,
++      "value": {
++        "schema_version": 1,
++        "namespace": "a",
++        "route_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
++      }
++    },
++    {
++      "name": "missing_route_fingerprint",
++      "valid": false,
++      "value": {
++        "schema_version": 1,
++        "namespace": "a",
++        "generation": 1
++      }
++    },
++    {
++      "name": "extra_field",
++      "valid": false,
++      "value": {
++        "schema_version": 1,
++        "namespace": "a",
++        "generation": 1,
++        "route_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
++        "extra": true
++      }
++    },
++    {
++      "name": "wrong_schema_version",
++      "valid": false,
++      "value": {
++        "schema_version": 2,
++        "namespace": "a",
++        "generation": 1,
++        "route_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
++      }
++    },
++    {
++      "name": "schema_version_string",
++      "valid": false,
++      "value": {
++        "schema_version": "1",
++        "namespace": "a",
++        "generation": 1,
++        "route_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
++      }
++    },
++    {
++      "name": "namespace_number",
++      "valid": false,
++      "value": {
++        "schema_version": 1,
++        "namespace": 1,
++        "generation": 1,
++        "route_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
++      }
++    },
++    {
++      "name": "generation_string",
++      "valid": false,
++      "value": {
++        "schema_version": 1,
++        "namespace": "a",
++        "generation": "1",
++        "route_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
++      }
++    },
++    {
++      "name": "fingerprint_number",
++      "valid": false,
++      "value": {
++        "schema_version": 1,
++        "namespace": "a",
++        "generation": 1,
++        "route_fingerprint": 0
++      }
++    },
++    {
++      "name": "generation_zero",
++      "valid": false,
++      "value": {
++        "schema_version": 1,
++        "namespace": "a",
++        "generation": 0,
++        "route_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
++      }
++    },
++    {
++      "name": "generation_overflow",
++      "valid": false,
++      "value": {
++        "schema_version": 1,
++        "namespace": "a",
++        "generation": 4294967296,
++        "route_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
++      }
++    },
++    {
++      "name": "namespace_empty",
++      "valid": false,
++      "value": {
++        "schema_version": 1,
++        "namespace": "",
++        "generation": 1,
++        "route_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
++      }
++    },
++    {
++      "name": "namespace_65_bytes",
++      "valid": false,
++      "value": {
++        "schema_version": 1,
++        "namespace": "a1111111111111111111111111111111111111111111111111111111111111111",
++        "generation": 1,
++        "route_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
++      }
++    },
++    {
++      "name": "namespace_uppercase",
++      "valid": false,
++      "value": {
++        "schema_version": 1,
++        "namespace": "A",
++        "generation": 1,
++        "route_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
++      }
++    },
++    {
++      "name": "namespace_underscore",
++      "valid": false,
++      "value": {
++        "schema_version": 1,
++        "namespace": "a_b",
++        "generation": 1,
++        "route_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
++      }
++    },
++    {
++      "name": "fingerprint_uppercase_hex",
++      "valid": false,
++      "value": {
++        "schema_version": 1,
++        "namespace": "a",
++        "generation": 1,
++        "route_fingerprint": "sha256:A000000000000000000000000000000000000000000000000000000000000000"
++      }
++    },
++    {
++      "name": "fingerprint_wrong_length",
++      "valid": false,
++      "value": {
++        "schema_version": 1,
++        "namespace": "a",
++        "generation": 1,
++        "route_fingerprint": "sha256:000000000000000000000000000000000000000000000000000000000000000"
++      }
++    },
++    {
++      "name": "fingerprint_wrong_prefix",
++      "valid": false,
++      "value": {
++        "schema_version": 1,
++        "namespace": "a",
++        "generation": 1,
++        "route_fingerprint": "sha257:0000000000000000000000000000000000000000000000000000000000000000"
++      }
++    }
++  ]
++}

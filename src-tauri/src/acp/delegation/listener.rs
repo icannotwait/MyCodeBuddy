@@ -39,17 +39,18 @@ use crate::acp::delegation::run_store::{
 use crate::acp::delegation::transport::{
     read_frame, write_frame, BrokerAskRequest, BrokerCancelRequest, BrokerCancelTaskRequest,
     BrokerCommitFeedbackRequest, BrokerCompleteWorkRequest, BrokerFeedbackRequest,
-    BrokerGetWorkflowStateRequest, BrokerMessage, BrokerParentDecisionRequest,
-    BrokerPublishWorkflowRequest, BrokerRecoverWorkflowRequest, BrokerRecoveryAuthorizationRequest,
-    BrokerRegisterSimpleWorkflowRequest, BrokerReplyDelegationRequest, BrokerRequest,
-    BrokerResponse, BrokerSessionRequest, BrokerSettleWorkflowRequest, BrokerStatusRequest,
-    CancelDelegationReason, CompanionReadyAck, CompanionRole,
+    BrokerGetWorkflowStateRequest, BrokerMessage, BrokerOrchestrationBindingsRequest,
+    BrokerParentDecisionRequest, BrokerPublishWorkflowRequest, BrokerRecoverWorkflowRequest,
+    BrokerRecoveryAuthorizationRequest, BrokerRegisterSimpleWorkflowRequest,
+    BrokerReplyDelegationRequest, BrokerRequest, BrokerResponse, BrokerSessionRequest,
+    BrokerSettleWorkflowRequest, BrokerStatusRequest, CancelDelegationReason, CompanionReadyAck,
+    CompanionRole,
 };
 use crate::acp::delegation::types::{
     correlation_error_message, validate_correlation_id, CorrelationEntryPoint,
     CorrelationFailureKind, DelegationReplyResult, DelegationRequest, DelegationReturnWhen,
-    DelegationStatusBatch, DelegationTaskReport, DelegationWakeReason, ParentDecisionResult,
-    TaskStatus,
+    DelegationStatusBatch, DelegationTaskReport, DelegationWakeReason, OrchestrationBindingV1,
+    ParentDecisionResult, TaskStatus,
 };
 #[cfg(test)]
 use crate::acp::delegation::workflow::{
@@ -325,6 +326,43 @@ impl StatusErrorEnvelope {
 struct ProcessedStatus {
     batch: DelegationStatusBatch,
     release_owner: Option<ForegroundMcpReleaseOwner>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OrchestrationBindingQueryAuthError {
+    InvalidToken,
+    RootOnly,
+    CoordinationUnavailable,
+    NoActiveConversation,
+}
+
+impl OrchestrationBindingQueryAuthError {
+    fn code(self) -> &'static str {
+        match self {
+            Self::InvalidToken => "invalid_token",
+            Self::RootOnly => "root_only",
+            Self::CoordinationUnavailable => "coordination_unavailable",
+            Self::NoActiveConversation => "no_active_conversation",
+        }
+    }
+
+    fn message(self) -> &'static str {
+        match self {
+            Self::InvalidToken => "invalid companion token",
+            Self::RootOnly => "orchestration binding queries are root-only",
+            Self::CoordinationUnavailable => "coordination is unavailable",
+            Self::NoActiveConversation => "no active parent conversation",
+        }
+    }
+
+    fn to_value(self) -> Value {
+        serde_json::json!({
+            "error": {
+                "code": self.code(),
+                "message": self.message(),
+            }
+        })
+    }
 }
 
 impl ProcessedStatus {
@@ -609,6 +647,9 @@ impl DelegationListener {
                     }
                     Err(_) => value_response(&StatusErrorEnvelope::continuation_arm_failed())?,
                 }
+            }
+            BrokerMessage::OrchestrationBindings(req) => {
+                value_response(&self.process_orchestration_bindings(req).await)?
             }
             BrokerMessage::CancelTask(req) => {
                 self.report_response(self.process_cancel_task(req).await)
@@ -1596,6 +1637,56 @@ impl DelegationListener {
             .await
     }
 
+    async fn orchestration_binding_query_auth_context(
+        &self,
+        token: &str,
+    ) -> Result<i32, OrchestrationBindingQueryAuthError> {
+        let entry = self
+            .tokens
+            .lookup(token)
+            .await
+            .ok_or(OrchestrationBindingQueryAuthError::InvalidToken)?;
+        if entry.role != CompanionRole::Root {
+            return Err(OrchestrationBindingQueryAuthError::RootOnly);
+        }
+        if !entry.coordination_v1 {
+            return Err(OrchestrationBindingQueryAuthError::CoordinationUnavailable);
+        }
+        self.parent_lookup
+            .current_conversation_id(&entry.parent_connection_id)
+            .await
+            .ok_or(OrchestrationBindingQueryAuthError::NoActiveConversation)
+    }
+
+    async fn process_orchestration_bindings(
+        &self,
+        req: BrokerOrchestrationBindingsRequest,
+    ) -> Value {
+        let parent_id = match self
+            .orchestration_binding_query_auth_context(&req.token)
+            .await
+        {
+            Ok(parent_id) => parent_id,
+            Err(error) => return error.to_value(),
+        };
+        let Some(runs) = self.broker.run_store() else {
+            return orchestration_binding_query_error_value(
+                crate::acp::delegation::types::OrchestrationBindingQueryError::Failed,
+            );
+        };
+        match runs
+            .get_orchestration_binding_page(parent_id, req.query())
+            .await
+        {
+            Ok(page) => serde_json::to_value(page).unwrap_or_else(|_| {
+                orchestration_binding_query_error_value(
+                    crate::acp::delegation::types::OrchestrationBindingQueryError::Failed,
+                )
+            }),
+            Err(error) => orchestration_binding_query_error_value(error),
+        }
+    }
+
     /// Auth + Root/`workflow_v2` gate for workflow mutation/recovery tools.
     async fn workflow_auth_context(
         &self,
@@ -2415,6 +2506,11 @@ impl DelegationListener {
             None => return cancel("parent has no active conversation"),
         };
 
+        let orchestration_binding = match parse_orchestration_binding(&req.input) {
+            Ok(binding) => binding,
+            Err(message) => return report_failed("orchestration_binding_invalid", &message),
+        };
+
         let work_unit_key = match parse_work_unit_key(&req.input) {
             Ok(key) => key,
             Err(message) => return report_failed("invalid_work_unit_key", &message),
@@ -2486,6 +2582,7 @@ impl DelegationListener {
                 external_handle: req.external_handle,
                 correlation_id,
                 recovery_authorization_id,
+                orchestration_binding,
             };
             return self.broker.continue_delegation(continue_req).await;
         }
@@ -2549,9 +2646,26 @@ impl DelegationListener {
             replacement_reason,
             correlation_id,
             recovery_authorization_id,
+            orchestration_binding,
         };
         self.broker.start_delegation(delegation_req).await
     }
+}
+
+/// Parse the optional durable orchestration identity from raw tool input.
+/// Absence is backward-compatible; every present invalid value fails closed.
+pub(crate) fn parse_orchestration_binding(
+    input: &Value,
+) -> Result<Option<OrchestrationBindingV1>, String> {
+    let Some(value) = input.get("orchestration_binding") else {
+        return Ok(None);
+    };
+    let binding: OrchestrationBindingV1 = serde_json::from_value(value.clone())
+        .map_err(|_| "orchestration_binding must be a complete v1 object".to_string())?;
+    binding
+        .validate()
+        .map_err(|message| format!("invalid orchestration_binding: {message}"))?;
+    Ok(Some(binding))
 }
 
 /// Parse optional `correlation_id` from tool input.
@@ -2803,6 +2917,17 @@ fn parse_gate_settlement_outcome(raw: &str) -> Result<GateSettlementOutcome, Str
             "outcome must be approved|changes_requested|blocked, got {other}"
         )),
     }
+}
+
+fn orchestration_binding_query_error_value(
+    error: crate::acp::delegation::types::OrchestrationBindingQueryError,
+) -> Value {
+    serde_json::json!({
+        "error": {
+            "code": error.code(),
+            "message": error.to_string(),
+        }
+    })
 }
 
 fn workflow_store_error_value(err: WorkflowStoreError) -> Value {
@@ -4618,6 +4743,81 @@ mod tests {
         )
     }
 
+    #[tokio::test]
+    async fn orchestration_binding_query_auth_is_root_coordination_and_token_scoped() {
+        let tokens = Arc::new(TokenRegistry::default());
+        let entry = |role, coordination_v1| TokenEntry {
+            parent_connection_id: "parent-conn".into(),
+            working_dir: test_working_dir(),
+            coordination_v1,
+            delegation_continuation_v1: true,
+            role,
+            workflow_v2: false,
+            completion_v2: false,
+            bound_task_id: None,
+        };
+        tokens
+            .register("root".into(), entry(CompanionRole::Root, true))
+            .await;
+        tokens
+            .register("child".into(), entry(CompanionRole::DelegationChild, true))
+            .await;
+        tokens
+            .register("no-coordination".into(), entry(CompanionRole::Root, false))
+            .await;
+        let listener = make_listener(
+            make_broker(Arc::new(MockSpawner::new())).await,
+            tokens.clone(),
+            Some(77),
+        );
+
+        assert_eq!(
+            listener
+                .orchestration_binding_query_auth_context("root")
+                .await,
+            Ok(77),
+            "workflow_v2=false must not block the read-only query"
+        );
+        for (token, expected) in [
+            ("invalid", OrchestrationBindingQueryAuthError::InvalidToken),
+            ("child", OrchestrationBindingQueryAuthError::RootOnly),
+            (
+                "no-coordination",
+                OrchestrationBindingQueryAuthError::CoordinationUnavailable,
+            ),
+        ] {
+            assert_eq!(
+                listener
+                    .orchestration_binding_query_auth_context(token)
+                    .await,
+                Err(expected)
+            );
+            let outcome = listener
+                .process_orchestration_bindings(BrokerOrchestrationBindingsRequest {
+                    token: token.into(),
+                    namespace: "brainstorm-to-delivery".into(),
+                    limit: 100,
+                    snapshot_id: None,
+                    cursor: None,
+                })
+                .await;
+            assert_eq!(outcome["error"]["code"], expected.code());
+            assert!(outcome.get("runs").is_none());
+        }
+
+        let no_parent = make_listener(
+            make_broker(Arc::new(MockSpawner::new())).await,
+            tokens,
+            None,
+        );
+        assert_eq!(
+            no_parent
+                .orchestration_binding_query_auth_context("root")
+                .await,
+            Err(OrchestrationBindingQueryAuthError::NoActiveConversation)
+        );
+    }
+
     fn make_listener_with_wait_cancel(
         broker: Arc<DelegationBroker>,
         tokens: Arc<TokenRegistry>,
@@ -4812,6 +5012,109 @@ mod tests {
             .await;
         assert_eq!(report.status, TaskStatus::Failed);
         assert_eq!(report.error_code.as_deref(), Some("invalid_agent_type"));
+    }
+
+    #[tokio::test]
+    async fn orchestration_binding_transport_listener_matches_shared_corpus_before_side_effects() {
+        let corpus: Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/orchestration_binding_v1.json"
+        )))
+        .expect("valid orchestration binding corpus");
+        let tokens = Arc::new(TokenRegistry::default());
+        tokens
+            .register(
+                "tok".into(),
+                TokenEntry::legacy("parent-conn", test_working_dir()),
+            )
+            .await;
+        let mock = Arc::new(MockSpawner::new());
+        let listener = make_listener(make_broker(Arc::clone(&mock)).await, tokens, Some(1));
+
+        for case in corpus["cases"].as_array().unwrap() {
+            let expected = case["valid"].as_bool().unwrap();
+            let parsed = parse_orchestration_binding(&json!({
+                "orchestration_binding": case["value"].clone()
+            }));
+            assert_eq!(
+                parsed.is_ok(),
+                expected,
+                "listener parser disagrees for {}",
+                case["name"]
+            );
+            assert_eq!(
+                serde_json::from_value::<
+                    crate::acp::delegation::types::OrchestrationBindingV1,
+                >(case["value"].clone())
+                .is_ok_and(|binding| binding.validate().is_ok()),
+                expected,
+                "semantic validation disagrees for {}",
+                case["name"]
+            );
+
+            for tool_name in ["delegate_to_agent", "continue_delegation"] {
+                let mut input = if tool_name == "delegate_to_agent" {
+                    json!({
+                        "agent_type": "grok",
+                        "task": "bound first dispatch",
+                        "correlation_id": "binding-listener-red"
+                    })
+                } else {
+                    json!({
+                        "_codeg_tool": "continue_delegation",
+                        "task_id": "source-task",
+                        "task": "bound continuation",
+                        "correlation_id": "binding-listener-red"
+                    })
+                };
+                input.as_object_mut().unwrap().insert(
+                    "orchestration_binding".into(),
+                    case["value"].clone(),
+                );
+                let spawn_before = mock.spawn_args.lock().await.len();
+                let resume_before = mock.resume_args.lock().await.len();
+                let report = listener.process(make_request(input).await).await;
+                if expected {
+                    assert_ne!(
+                        report.error_code.as_deref(),
+                        Some("orchestration_binding_invalid"),
+                        "valid {} rejected by {tool_name}",
+                        case["name"]
+                    );
+                } else {
+                    assert_eq!(
+                        report.error_code.as_deref(),
+                        Some("orchestration_binding_invalid"),
+                        "invalid {} accepted by {tool_name}",
+                        case["name"]
+                    );
+                    assert_eq!(mock.spawn_args.lock().await.len(), spawn_before);
+                    assert_eq!(mock.resume_args.lock().await.len(), resume_before);
+                }
+            }
+        }
+
+        for input in [
+            json!({
+                "agent_type": "grok",
+                "task": "unbound first dispatch",
+                "correlation_id": "binding-listener-omitted"
+            }),
+            json!({
+                "_codeg_tool": "continue_delegation",
+                "task_id": "source-task",
+                "task": "unbound continuation",
+                "correlation_id": "binding-listener-omitted"
+            }),
+        ] {
+            assert_eq!(parse_orchestration_binding(&input).unwrap(), None);
+            let report = listener.process(make_request(input).await).await;
+            assert_ne!(
+                report.error_code.as_deref(),
+                Some("orchestration_binding_invalid"),
+                "omitted binding must remain backward compatible"
+            );
+        }
     }
 
     #[test]
@@ -5336,6 +5639,7 @@ mod tests {
                 replacement_reason: None,
                 correlation_id: None,
                 recovery_authorization_id: None,
+                orchestration_binding: None,
             })
             .await;
         let task_id = ack.task_id.clone().expect("running task carries an id");
@@ -7008,6 +7312,7 @@ mod tests {
                         replacement_reason: None,
                         correlation_id: None,
                         recovery_authorization_id: None,
+                        orchestration_binding: None,
                     })
                     .await
                     .task_id
@@ -7117,6 +7422,7 @@ mod tests {
                 replacement_reason: None,
                 correlation_id: None,
                 recovery_authorization_id: None,
+                orchestration_binding: None,
             })
             .await;
         let task_id = ack.task_id.clone().unwrap();
@@ -7167,6 +7473,7 @@ mod tests {
                 replacement_reason: None,
                 correlation_id: None,
                 recovery_authorization_id: None,
+                orchestration_binding: None,
             })
             .await;
         let task_id = ack.task_id.clone().unwrap();
@@ -7356,6 +7663,7 @@ mod tests {
                     replacement_reason: None,
                     correlation_id: None,
                     recovery_authorization_id: None,
+                    orchestration_binding: None,
                 };
                 broker.handle_request(req).await
             })
@@ -8457,6 +8765,7 @@ mod tests {
             let child = seed_conversation(&db, folder, AgentType::Codex).await;
             let runs = Arc::new(RunStore::new(Arc::clone(&db)));
             runs.insert_reserving(ReservingRunInsert {
+                orchestration_binding: None,
                 task_id: TASK_ID.into(),
                 root_task_id: TASK_ID.into(),
                 previous_task_id: None,
@@ -8634,10 +8943,12 @@ mod tests {
         }
 
         async fn completion_tool_fixture_before_v2_only() -> CompletionToolFixture {
-            completion_tool_fixture_with_db(Arc::new(
-                crate::db::test_helpers::historical_completion_protocol_db_before_v2_only().await,
-            ))
-            .await
+            let db =
+                crate::db::test_helpers::historical_completion_protocol_db_before_v2_only().await;
+            crate::db::migration::install_for_historical_completion_fixture(&db)
+                .await
+                .expect("install orchestration binding migration for historical fixture");
+            completion_tool_fixture_with_db(Arc::new(db)).await
         }
 
         #[tokio::test]
@@ -10081,6 +10392,7 @@ mod tests {
                 replacement_reason: None,
                 correlation_id: None,
                 recovery_authorization_id: None,
+                orchestration_binding: None,
             })
             .await;
         let task_id = ack.task_id.expect("running");
@@ -10495,6 +10807,7 @@ mod tests {
                 replacement_reason: None,
                 correlation_id: None,
                 recovery_authorization_id: None,
+                orchestration_binding: None,
             })
             .await
             .task_id
@@ -10515,6 +10828,7 @@ mod tests {
                 replacement_reason: None,
                 correlation_id: None,
                 recovery_authorization_id: None,
+                orchestration_binding: None,
             })
             .await
             .task_id
@@ -10784,10 +11098,12 @@ mod tests {
         }
 
         async fn recovery_fixture_before_v2_only() -> RecoveryFixture {
-            recovery_fixture_with_db(Arc::new(
-                crate::db::test_helpers::historical_completion_protocol_db_before_v2_only().await,
-            ))
-            .await
+            let db =
+                crate::db::test_helpers::historical_completion_protocol_db_before_v2_only().await;
+            crate::db::migration::install_for_historical_completion_fixture(&db)
+                .await
+                .expect("install orchestration binding migration for historical fixture");
+            recovery_fixture_with_db(Arc::new(db)).await
         }
 
         async fn seed_confirmable_task(
@@ -10820,6 +11136,7 @@ mod tests {
             fixture
                 .runs
                 .insert_reserving(ReservingRunInsert {
+                    orchestration_binding: None,
                     task_id: task_id.clone(),
                     root_task_id: task_id.clone(),
                     previous_task_id: None,

@@ -4,7 +4,9 @@ use unicode_normalization::UnicodeNormalization;
 
 use crate::models::agent::AgentType;
 
-use super::types::{ParsedWorkUnitKey, WorkUnitKeyParts, WorkflowError, MAX_WORK_UNIT_KEY_LEN};
+use super::types::{
+    ParsedWorkUnitKey, ReviewerSlot, WorkUnitKeyParts, WorkflowError, MAX_WORK_UNIT_KEY_LEN,
+};
 
 /// Normalize a workspace-relative path to the B1 stored form:
 /// UTF-8 NFC, separators → `/`, reject `|` / absolute / empty / `..` / controls,
@@ -94,6 +96,16 @@ pub fn build_work_unit_key(parts: &WorkUnitKeyParts<'_>) -> Result<String, Workf
             let profile = profile_token(profile_id)?;
             format!("design|{path}|reviewer|{agent}|{profile}")
         }
+        WorkUnitKeyParts::DesignFixer {
+            rel_doc_path,
+            agent_type,
+            profile_id,
+        } => {
+            let path = normalize_rel_path(rel_doc_path)?;
+            let agent = validate_agent_type(agent_type)?;
+            let profile = profile_token(profile_id)?;
+            format!("design|{path}|fixer|{agent}|{profile}")
+        }
         WorkUnitKeyParts::PlanAuthor {
             rel_plan_path,
             agent_type,
@@ -133,6 +145,18 @@ pub fn build_work_unit_key(parts: &WorkUnitKeyParts<'_>) -> Result<String, Workf
             let agent = validate_agent_type(agent_type)?;
             let profile = profile_token(profile_id)?;
             format!("task|{task_index}|reviewer|{agent}|{profile}")
+        }
+        WorkUnitKeyParts::TaskReviewerSlotted {
+            task_index,
+            slot,
+            agent_type,
+            profile_id,
+        } => {
+            validate_task_index(*task_index)?;
+            let agent = validate_agent_type(agent_type)?;
+            let profile = profile_token(profile_id)?;
+            let slot = slot.as_str();
+            format!("task|{task_index}|reviewer|{slot}|{agent}|{profile}")
         }
         WorkUnitKeyParts::FinalReviewer {
             agent_type,
@@ -185,6 +209,19 @@ pub fn parse_recognized_work_unit_key(key: &str) -> Option<ParsedWorkUnitKey> {
                 profile_id,
             })
         }
+        ["design", path, "fixer", agent, profile] => {
+            let rel = normalize_rel_path(path).ok()?;
+            if rel != *path {
+                return None;
+            }
+            let agent_type = validate_agent_type(agent).ok()?.to_string();
+            let profile_id = parse_profile(profile)?;
+            Some(ParsedWorkUnitKey::DesignFixer {
+                rel_doc_path: rel,
+                agent_type,
+                profile_id,
+            })
+        }
         ["plan", path, "author", agent, profile] => {
             let rel = normalize_rel_path(path).ok()?;
             if rel != *path {
@@ -221,12 +258,29 @@ pub fn parse_recognized_work_unit_key(key: &str) -> Option<ParsedWorkUnitKey> {
                 profile_id,
             })
         }
+        ["task", index, "reviewer", slot, agent, profile] => {
+            let task_index = parse_task_index_str(index)?;
+            let slot = match *slot {
+                "primary" => ReviewerSlot::Primary,
+                "auxiliary" => ReviewerSlot::Auxiliary,
+                _ => return None,
+            };
+            let agent_type = validate_agent_type(agent).ok()?.to_string();
+            let profile_id = parse_profile(profile)?;
+            Some(ParsedWorkUnitKey::TaskReviewer {
+                task_index,
+                slot,
+                agent_type,
+                profile_id,
+            })
+        }
         ["task", index, "reviewer", agent, profile] => {
             let task_index = parse_task_index_str(index)?;
             let agent_type = validate_agent_type(agent).ok()?.to_string();
             let profile_id = parse_profile(profile)?;
             Some(ParsedWorkUnitKey::TaskReviewer {
                 task_index,
+                slot: ReviewerSlot::Primary,
                 agent_type,
                 profile_id,
             })
@@ -417,6 +471,157 @@ mod tests {
         })
         .unwrap();
         assert_eq!(final_fix, "final_review|fixer|grok|none");
+    }
+
+    #[test]
+    fn design_fixer_and_slotted_reviewers_round_trip() {
+        let fixer = build_work_unit_key(&WorkUnitKeyParts::DesignFixer {
+            rel_doc_path: "docs/design.md",
+            agent_type: "codex",
+            profile_id: None,
+        })
+        .unwrap();
+        assert_eq!(fixer, "design|docs/design.md|fixer|codex|none");
+        assert!(matches!(
+            parse_recognized_work_unit_key(&fixer),
+            Some(ParsedWorkUnitKey::DesignFixer { .. })
+        ));
+
+        for (slot, expected) in [
+            (ReviewerSlot::Primary, "task|7|reviewer|primary|codex|none"),
+            (
+                ReviewerSlot::Auxiliary,
+                "task|7|reviewer|auxiliary|codex|none",
+            ),
+        ] {
+            let key = build_work_unit_key(&WorkUnitKeyParts::TaskReviewerSlotted {
+                task_index: 7,
+                slot,
+                agent_type: "codex",
+                profile_id: None,
+            })
+            .unwrap();
+            assert_eq!(key, expected);
+            assert!(matches!(
+                parse_recognized_work_unit_key(&key),
+                Some(ParsedWorkUnitKey::TaskReviewer {
+                    task_index: 7,
+                    slot: parsed,
+                    ..
+                }) if parsed == slot
+            ));
+        }
+    }
+
+    #[test]
+    fn legacy_task_reviewer_is_primary_and_invalid_slots_fail() {
+        assert!(matches!(
+            parse_recognized_work_unit_key("task|7|reviewer|codex|none"),
+            Some(ParsedWorkUnitKey::TaskReviewer {
+                task_index: 7,
+                slot: ReviewerSlot::Primary,
+                ..
+            })
+        ));
+        for key in [
+            "task|7|reviewer|secondary|codex|none",
+            "task|0|reviewer|primary|codex|none",
+            "task|7|reviewer|primary|unknown-agent|none",
+            "design|../design.md|fixer|codex|none",
+            "design|docs/design.md|fixer|codex|bad|profile",
+        ] {
+            assert_eq!(parse_recognized_work_unit_key(key), None, "{key}");
+        }
+    }
+
+    #[test]
+    fn new_work_unit_branches_reuse_all_identity_validators_and_scalar_bounds() {
+        for parts in [
+            WorkUnitKeyParts::DesignFixer {
+                rel_doc_path: "../design.md",
+                agent_type: "codex",
+                profile_id: None,
+            },
+            WorkUnitKeyParts::DesignFixer {
+                rel_doc_path: "docs/design.md",
+                agent_type: "not_an_agent",
+                profile_id: None,
+            },
+            WorkUnitKeyParts::DesignFixer {
+                rel_doc_path: "docs/design.md",
+                agent_type: "codex",
+                profile_id: Some("bad\u{0007}profile"),
+            },
+        ] {
+            assert!(build_work_unit_key(&parts).is_err());
+        }
+
+        for parts in [
+            WorkUnitKeyParts::TaskReviewerSlotted {
+                task_index: 0,
+                slot: ReviewerSlot::Primary,
+                agent_type: "codex",
+                profile_id: None,
+            },
+            WorkUnitKeyParts::TaskReviewerSlotted {
+                task_index: 1,
+                slot: ReviewerSlot::Auxiliary,
+                agent_type: "not_an_agent",
+                profile_id: None,
+            },
+            WorkUnitKeyParts::TaskReviewerSlotted {
+                task_index: 1,
+                slot: ReviewerSlot::Auxiliary,
+                agent_type: "codex",
+                profile_id: Some("bad\u{0007}profile"),
+            },
+        ] {
+            assert!(build_work_unit_key(&parts).is_err());
+        }
+
+        for key in [
+            "design|docs/design.md|fixer|not_an_agent|none",
+            "design|docs/design.md|fixer|codex|bad\u{0007}profile",
+            "task|1|reviewer|auxiliary|not_an_agent|none",
+            "task|1|reviewer|auxiliary|codex|bad\u{0007}profile",
+            "task|01|reviewer|primary|codex|none",
+        ] {
+            assert_eq!(parse_recognized_work_unit_key(key), None, "{key:?}");
+        }
+
+        let design_profile_at_limit = "x".repeat(171);
+        let design_at_limit = build_work_unit_key(&WorkUnitKeyParts::DesignFixer {
+            rel_doc_path: "docs/d.md",
+            agent_type: "codex",
+            profile_id: Some(&design_profile_at_limit),
+        })
+        .expect("200-scalar Design Fixer key");
+        assert_eq!(design_at_limit.chars().count(), 200);
+        assert!(parse_recognized_work_unit_key(&design_at_limit).is_some());
+        assert!(build_work_unit_key(&WorkUnitKeyParts::DesignFixer {
+            rel_doc_path: "docs/d.md",
+            agent_type: "codex",
+            profile_id: Some(&"x".repeat(172)),
+        })
+        .is_err());
+
+        let reviewer_profile_at_limit = "x".repeat(170);
+        let reviewer_at_limit = build_work_unit_key(&WorkUnitKeyParts::TaskReviewerSlotted {
+            task_index: 1,
+            slot: ReviewerSlot::Primary,
+            agent_type: "codex",
+            profile_id: Some(&reviewer_profile_at_limit),
+        })
+        .expect("200-scalar slotted reviewer key");
+        assert_eq!(reviewer_at_limit.chars().count(), 200);
+        assert!(parse_recognized_work_unit_key(&reviewer_at_limit).is_some());
+        assert!(build_work_unit_key(&WorkUnitKeyParts::TaskReviewerSlotted {
+            task_index: 1,
+            slot: ReviewerSlot::Primary,
+            agent_type: "codex",
+            profile_id: Some(&"x".repeat(171)),
+        })
+        .is_err());
     }
 
     #[test]
