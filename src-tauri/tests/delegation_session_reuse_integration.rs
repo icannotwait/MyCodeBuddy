@@ -46,6 +46,7 @@ use codeg_lib::db::test_helpers::{fresh_in_memory_db, seed_folder};
 use codeg_lib::db::AppDatabase;
 use codeg_lib::models::AgentType;
 use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, IntoActiveModel, QueryFilter, Set};
+use sha2::{Digest, Sha256};
 use tokio::sync::Barrier;
 
 // ---------------------------------------------------------------------------
@@ -122,28 +123,9 @@ fn is_routed_task_key(work_unit_key: &str) -> bool {
 }
 
 fn independently_hash_published_high_vector() -> String {
-    let output = std::process::Command::new("sha256sum")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            child
-                .stdin
-                .as_mut()
-                .expect("sha256sum stdin")
-                .write_all(PUBLISHED_HIGH_VECTOR_JSON)?;
-            child.wait_with_output()
-        })
-        .expect("hash published high vector independently");
-    assert!(output.status.success(), "sha256sum failed: {output:?}");
-    let hex = String::from_utf8(output.stdout).expect("sha256sum utf8");
-    let digest = hex
-        .split_whitespace()
-        .next()
-        .expect("sha256sum digest")
-        .to_ascii_lowercase();
-    format!("sha256:{digest}")
+    // Test-only digest of the published high-route literal. Parent/Plan Author
+    // production code must not hash; the Node validator remains the source.
+    format!("sha256:{:x}", Sha256::digest(PUBLISHED_HIGH_VECTOR_JSON))
 }
 
 fn assert_run_binding(
