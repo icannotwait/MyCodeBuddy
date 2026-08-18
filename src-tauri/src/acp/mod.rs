@@ -1,3 +1,4 @@
+pub mod autonomous_activity;
 pub mod background_watch;
 pub mod binary_cache;
 pub mod bundled_agent;
