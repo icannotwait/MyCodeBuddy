@@ -4943,6 +4943,12 @@ function isAlertedError(error: unknown): error is AlertedError {
   return (error as { alerted?: unknown }).alerted === true
 }
 
+function isSharedSessionConfigConflict(error: unknown): boolean {
+  return (
+    extractAppCommandError(error)?.code === "shared_session_config_conflict"
+  )
+}
+
 // ── Provider ──
 
 export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
@@ -7331,12 +7337,11 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       intent: ConnectionIntent = "own_or_observe",
       retryObserverDiscovery = false
     ) => {
-      const rememberedSharedRequestId =
-        lastConnectParamsRef.current.get(contextKey)?.sharedRequestId
-      const rememberedRetryGeneration =
-        lastConnectParamsRef.current.get(contextKey)?.retryFailedGeneration
-      const rememberedSharedReconnect =
-        lastConnectParamsRef.current.get(contextKey)?.sharedReconnect
+      const remembered = lastConnectParamsRef.current.get(contextKey)
+      const launchIdentityChanged =
+        remembered != null &&
+        (remembered.agentType !== agentType ||
+          (remembered.workingDir ?? null) !== (workingDir ?? null))
       const request: ConnectRequest = {
         agentType,
         workingDir,
@@ -7346,9 +7351,15 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         ownerOperationId: ownerOperationId ?? null,
         intent,
         retryObserverDiscovery,
-        sharedRequestId: rememberedSharedRequestId ?? newSharedRequestId(),
-        retryFailedGeneration: rememberedRetryGeneration,
-        sharedReconnect: rememberedSharedReconnect,
+        sharedRequestId: launchIdentityChanged
+          ? newSharedRequestId()
+          : (remembered?.sharedRequestId ?? newSharedRequestId()),
+        retryFailedGeneration: launchIdentityChanged
+          ? undefined
+          : remembered?.retryFailedGeneration,
+        sharedReconnect: launchIdentityChanged
+          ? undefined
+          : remembered?.sharedReconnect,
       }
       // Remember BEFORE the in-flight early return and before the preflight can
       // throw: a connect that never produced a store entry is precisely when
@@ -7477,20 +7488,35 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           }
           const prefs = getSavedPrefsForConnect(agentType)
           const identity = getSharedClientIdentity()
-          const response = await acpConnectOrAttach({
-            conversationId: conversationId ?? null,
-            agentType,
-            workingDir: nextWorkingDir,
-            externalSessionId: sessionId ?? null,
-            delegationRouteOverride: delegationRouteOverride ?? null,
-            preferredModeId: prefs.modeId,
-            preferredConfigValues: prefs.configValues,
-            deviceId: identity.deviceId,
-            clientInstanceId: identity.clientInstanceId,
-            requestId: request.sharedRequestId ?? newSharedRequestId(),
-            retryFailedGeneration: request.retryFailedGeneration ?? null,
-          })
-          if (isConnectAbandonedOrSuperseded(contextKey, request)) {
+          const attachWith = (connectRequest: ConnectRequest) =>
+            acpConnectOrAttach({
+              conversationId: conversationId ?? null,
+              agentType,
+              workingDir: nextWorkingDir,
+              externalSessionId: sessionId ?? null,
+              delegationRouteOverride: delegationRouteOverride ?? null,
+              preferredModeId: prefs.modeId,
+              preferredConfigValues: prefs.configValues,
+              deviceId: identity.deviceId,
+              clientInstanceId: identity.clientInstanceId,
+              requestId: connectRequest.sharedRequestId ?? newSharedRequestId(),
+              retryFailedGeneration:
+                connectRequest.retryFailedGeneration ?? null,
+            })
+          let activeRequest = request
+          let response
+          try {
+            response = await attachWith(activeRequest)
+          } catch (error) {
+            if (!isSharedSessionConfigConflict(error)) throw error
+            activeRequest = {
+              ...activeRequest,
+              sharedRequestId: newSharedRequestId(),
+            }
+            lastConnectParamsRef.current.set(contextKey, activeRequest)
+            response = await attachWith(activeRequest)
+          }
+          if (isConnectAbandonedOrSuperseded(contextKey, activeRequest)) {
             acpReleaseLease(
               response.connectionId,
               response.generation,
@@ -7512,16 +7538,17 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
               generation: response.generation,
               leaseId: response.leaseId,
               leaseExpiresAt: response.leaseExpiresAt,
-              connectRequestId: request.sharedRequestId ?? newSharedRequestId(),
+              connectRequestId:
+                activeRequest.sharedRequestId ?? newSharedRequestId(),
               phase: sharedPhaseFromResponse(response),
               queue: [],
               activeTurn: null,
             },
           })
           const sameGeneration =
-            response.generation === request.sharedReconnect?.generation
+            response.generation === activeRequest.sharedReconnect?.generation
           const attachSinceSeq = sameGeneration
-            ? request.sharedReconnect?.sinceSeq
+            ? activeRequest.sharedReconnect?.sinceSeq
             : undefined
           setupAttachSubscription(
             contextKey,
@@ -7531,11 +7558,11 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             { generation: response.generation, leaseId: response.leaseId }
           )
           if (
-            request.retryFailedGeneration != null ||
-            request.sharedReconnect != null
+            activeRequest.retryFailedGeneration != null ||
+            activeRequest.sharedReconnect != null
           ) {
             lastConnectParamsRef.current.set(contextKey, {
-              ...request,
+              ...activeRequest,
               retryFailedGeneration: undefined,
               sharedReconnect: undefined,
             })

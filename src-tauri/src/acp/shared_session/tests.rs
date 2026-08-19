@@ -198,8 +198,7 @@ mod tests {
         );
         failed_request.launch_identity.agent_type =
             crate::models::agent::AgentType::custom("private-custom-agent").unwrap();
-        failed_request.launch_identity.route_capability =
-            SharedRouteCapability::RequiredCompanion;
+        failed_request.launch_identity.route_capability = SharedRouteCapability::RequiredCompanion;
         failed_request.launch_identity.working_dir_fingerprint = "private-working-dir".into();
         failed_request.launch_identity.route_fingerprint = "private-route-fingerprint".into();
         failed_request.launch_identity.terminal_shell_fingerprint = "private-shell".into();
@@ -2266,6 +2265,106 @@ mod tests {
         ));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn unoccupied_unbound_ephemeral_sessions_reap_after_lease_grace() {
+        let manager = ConnectionManager::new();
+        manager.configure_shared_client_lease_ttl(Duration::from_secs(90));
+        let broker = manager.shared_session_broker();
+        let key = SharedSessionKey::Ephemeral("draft-abandoned".into());
+        let attachment = broker
+            .reserve_or_attach(request(
+                key,
+                "draft-abandoned-conn",
+                "draft-client",
+                "draft-request",
+            ))
+            .await
+            .unwrap()
+            .attachment;
+        assert!(broker
+            .release_lease(&SharedMutationGuard {
+                connection_id: attachment.connection_id.clone(),
+                generation: attachment.generation,
+                lease_id: attachment.lease_id.clone(),
+            })
+            .await
+            .unwrap());
+        assert!(
+            !manager
+                .sweep_shared_sessions(None, Duration::from_secs(90))
+                .await
+                .removed
+        );
+        tokio::time::advance(Duration::from_secs(89)).await;
+        assert!(
+            !manager
+                .sweep_shared_sessions(None, Duration::from_secs(90))
+                .await
+                .removed
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(
+            manager
+                .sweep_shared_sessions(None, Duration::from_secs(90))
+                .await
+                .removed
+        );
+        assert!(broker
+            .diagnostic_for_connection(&attachment.connection_id)
+            .await
+            .is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn occupied_or_bound_sessions_are_not_abandoned_ephemeral_reaps() {
+        let manager = ConnectionManager::new();
+        manager.configure_shared_client_lease_ttl(Duration::from_secs(90));
+        let broker = manager.shared_session_broker();
+        let occupied = broker
+            .reserve_or_attach(request(
+                SharedSessionKey::Ephemeral("draft-occupied".into()),
+                "draft-occupied-conn",
+                "occupied-client",
+                "occupied-request",
+            ))
+            .await
+            .unwrap()
+            .attachment;
+        let bound = broker
+            .reserve_or_attach(request(
+                SharedSessionKey::Conversation(88),
+                "bound-conn",
+                "bound-client",
+                "bound-request",
+            ))
+            .await
+            .unwrap()
+            .attachment;
+        assert!(broker
+            .release_lease(&SharedMutationGuard {
+                connection_id: bound.connection_id.clone(),
+                generation: bound.generation,
+                lease_id: bound.lease_id.clone(),
+            })
+            .await
+            .unwrap());
+        tokio::time::advance(Duration::from_secs(90)).await;
+        assert!(
+            !manager
+                .sweep_shared_sessions(None, Duration::from_secs(90))
+                .await
+                .removed
+        );
+        assert!(broker
+            .diagnostic_for_connection(&occupied.connection_id)
+            .await
+            .is_some());
+        assert!(broker
+            .diagnostic_for_connection(&bound.connection_id)
+            .await
+            .is_some());
+    }
+
     #[tokio::test]
     async fn conversation_rekey_collision_fails_closed() {
         let broker = SharedSessionBroker::default();
@@ -2351,11 +2450,7 @@ mod tests {
 
         for (attachment, bound_conversation_id, driver) in [
             (&source, None, "source-driver"),
-            (
-                &destination,
-                Some(conversation_id),
-                "destination-driver",
-            ),
+            (&destination, Some(conversation_id), "destination-driver"),
         ] {
             let state = Arc::new(tokio::sync::RwLock::new(SessionState::new(
                 attachment.connection_id.clone(),
@@ -2401,11 +2496,7 @@ mod tests {
                 .await
         } else {
             broker
-                .bind_conversation_key(
-                    &source.connection_id,
-                    source.generation,
-                    conversation_id,
-                )
+                .bind_conversation_key(&source.connection_id, source.generation, conversation_id)
                 .await
         }
     }
@@ -2425,9 +2516,11 @@ mod tests {
                     .unwrap_err(),
                 SharedSessionError::ConversationKeyConflict
             );
-            assert!(broker
-                .is_managed_connection(&destination.connection_id)
-                .await);
+            assert!(
+                broker
+                    .is_managed_connection(&destination.connection_id)
+                    .await
+            );
         }
     }
 
@@ -2517,10 +2610,9 @@ mod tests {
                 .await
                 .is_none());
             let index = broker.index.lock().await;
-            assert!(index.is_replaced_connection(
-                &destination.connection_id,
-                destination.generation
-            ));
+            assert!(
+                index.is_replaced_connection(&destination.connection_id, destination.generation)
+            );
             drop(index);
             let after = broker.metrics().snapshot();
             assert_eq!(after.live_sessions, 1);
@@ -3241,11 +3333,7 @@ mod tests {
         );
         assert!(is_interaction_loser(&a) || is_interaction_loser(&b));
         assert_eq!(fixture.interaction_call_count(), 1);
-        let metrics = fixture
-            .manager
-            .shared_session_broker()
-            .metrics()
-            .snapshot();
+        let metrics = fixture.manager.shared_session_broker().metrics().snapshot();
         assert_eq!(metrics.interaction_winner_total, 1);
         assert_eq!(metrics.interaction_stale_total, 1);
     }
@@ -3313,11 +3401,7 @@ mod tests {
             &fixture.claim("plan-downstream-stale").await
         ));
 
-        let metrics = fixture
-            .manager
-            .shared_session_broker()
-            .metrics()
-            .snapshot();
+        let metrics = fixture.manager.shared_session_broker().metrics().snapshot();
         assert_eq!(metrics.interaction_winner_total, 0);
         assert_eq!(metrics.interaction_stale_total, 1);
     }
@@ -3804,9 +3888,7 @@ mod tests {
                 .clone()
         }
 
-        async fn attach_new_lease(
-            &self,
-        ) -> Result<SharedReserveOutcome, SharedSessionError> {
+        async fn attach_new_lease(&self) -> Result<SharedReserveOutcome, SharedSessionError> {
             let client = self.next_client.fetch_add(1, Ordering::SeqCst);
             self.broker
                 .reserve_or_attach(request(
@@ -3828,9 +3910,7 @@ mod tests {
         }
 
         async fn reap_now(&self) -> SharedSweepReport {
-            self.broker
-                .expire_leases(tokio::time::Instant::now())
-                .await;
+            self.broker.expire_leases(tokio::time::Instant::now()).await;
             let shared = self
                 .manager
                 .sweep_shared_sessions(Some(Duration::from_secs(900)), Duration::from_secs(90))
@@ -4365,10 +4445,12 @@ mod tests {
                 ..
             }
         ));
-        assert!(!manager
-            .sweep_shared_sessions(Some(Duration::from_secs(900)), Duration::from_secs(90))
-            .await
-            .removed);
+        assert!(
+            !manager
+                .sweep_shared_sessions(Some(Duration::from_secs(900)), Duration::from_secs(90))
+                .await
+                .removed
+        );
 
         broker
             .mark_cleanup_complete(&attachment.connection_id, attachment.generation)
@@ -4382,30 +4464,38 @@ mod tests {
             )
             .await
             .is_ok());
-        assert!(!manager
-            .sweep_shared_sessions(Some(Duration::from_secs(900)), Duration::from_secs(90))
-            .await
-            .removed);
+        assert!(
+            !manager
+                .sweep_shared_sessions(Some(Duration::from_secs(900)), Duration::from_secs(90))
+                .await
+                .removed
+        );
         let guard = SharedMutationGuard {
             connection_id: observer.connection_id,
             generation: observer.generation,
             lease_id: observer.lease_id,
         };
         assert!(broker.release_lease(&guard).await.unwrap());
-        assert!(!manager
-            .sweep_shared_sessions(Some(Duration::from_secs(900)), Duration::from_secs(90))
-            .await
-            .removed);
+        assert!(
+            !manager
+                .sweep_shared_sessions(Some(Duration::from_secs(900)), Duration::from_secs(90))
+                .await
+                .removed
+        );
         tokio::time::advance(Duration::from_secs(89)).await;
-        assert!(!manager
-            .sweep_shared_sessions(Some(Duration::from_secs(900)), Duration::from_secs(90))
-            .await
-            .removed);
+        assert!(
+            !manager
+                .sweep_shared_sessions(Some(Duration::from_secs(900)), Duration::from_secs(90))
+                .await
+                .removed
+        );
         tokio::time::advance(Duration::from_secs(1)).await;
-        assert!(manager
-            .sweep_shared_sessions(Some(Duration::from_secs(900)), Duration::from_secs(90))
-            .await
-            .removed);
+        assert!(
+            manager
+                .sweep_shared_sessions(Some(Duration::from_secs(900)), Duration::from_secs(90))
+                .await
+                .removed
+        );
         assert!(broker
             .diagnostic_for_connection(&attachment.connection_id)
             .await
@@ -4552,14 +4642,12 @@ mod tests {
         .unwrap();
         assert!(released);
 
-        assert!(
-            !tokio::time::timeout(
-                Duration::from_secs(1),
-                broker.remove_sweep_candidate(&stale_candidate),
-            )
-            .await
-            .expect("failed tombstone removal CAS must make bounded progress")
-        );
+        assert!(!tokio::time::timeout(
+            Duration::from_secs(1),
+            broker.remove_sweep_candidate(&stale_candidate),
+        )
+        .await
+        .expect("failed tombstone removal CAS must make bounded progress"));
         assert!(broker
             .evaluate_idle(Some(Duration::from_secs(900)), Duration::from_secs(90))
             .await
@@ -4582,7 +4670,12 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn idle_legacy_disconnect_touch_and_explicit_termination_are_fenced() {
         let fixture = idle_ready_fixture().await;
-        assert!(!fixture.manager.touch(&fixture.attachment.connection_id).await);
+        assert!(
+            !fixture
+                .manager
+                .touch(&fixture.attachment.connection_id)
+                .await
+        );
         assert!(matches!(
             fixture
                 .manager

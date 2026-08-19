@@ -3809,6 +3809,47 @@ impl ConnectionManager {
                         report.cleanup_incomplete += 1;
                     }
                 }
+                SharedSweepCandidateKind::AbandonedEphemeral => {
+                    let Some(transition) = self
+                        .shared_session_broker
+                        .begin_abandoned_ephemeral_reclaim(candidate, client_lease_ttl)
+                        .await
+                    else {
+                        continue;
+                    };
+                    let connection_id = transition.candidate.connection_id.clone();
+                    let generation = transition.candidate.generation;
+                    let _ = self
+                        .publish_shared_events(&connection_id, transition.events)
+                        .await;
+                    let started = tokio::time::Instant::now();
+                    let cleanup_complete = self
+                        .teardown_shared_driver(
+                            &connection_id,
+                            transition.force_abort,
+                            AcpDisconnectOrigin::IdleTimeout,
+                        )
+                        .await;
+                    self.shared_session_broker
+                        .record_cleanup_duration(started.elapsed());
+                    if cleanup_complete {
+                        if self
+                            .shared_session_broker
+                            .remove_sweep_candidate(&transition.candidate)
+                            .await
+                        {
+                            self.shared_launches
+                                .lock()
+                                .await
+                                .remove(&(connection_id, generation));
+                            report.removed = true;
+                            report.removed_count += 1;
+                        }
+                    } else {
+                        self.shared_session_broker.record_cleanup_incomplete();
+                        report.cleanup_incomplete += 1;
+                    }
+                }
             }
         }
         report

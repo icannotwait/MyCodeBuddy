@@ -637,6 +637,105 @@ describe("AcpConnectionsProvider shared server roots", () => {
     })
   })
 
+  it("mints a fresh shared request id when a draft folder or agent changes", async () => {
+    h.isDesktop = false
+    await mountProvider()
+    const draft = "new-tab"
+
+    await act(async () => {
+      await h.actions!.connect(draft, "claude_code", "/work")
+    })
+    const firstId = h.acpConnectOrAttach.mock.calls[0]?.[0].requestId
+
+    await act(async () => {
+      await h.actions!.connect(draft, "claude_code", "/other")
+    })
+    const afterFolderChange = h.acpConnectOrAttach.mock.calls[1]?.[0].requestId
+    expect(afterFolderChange).not.toBe(firstId)
+
+    await act(async () => {
+      await h.actions!.connect(draft, "codex", "/other")
+    })
+    expect(h.acpConnectOrAttach.mock.calls[2]?.[0].requestId).not.toBe(
+      afterFolderChange
+    )
+  })
+
+  it("reuses the shared request id when a draft reconnects with the same folder and agent", async () => {
+    h.isDesktop = false
+    await mountProvider()
+    const draft = "new-tab"
+
+    await act(async () => {
+      await h.actions!.connect(draft, "claude_code", "/work")
+    })
+    const originalRequestId = h.acpConnectOrAttach.mock.calls[0]?.[0].requestId
+    await act(async () => {
+      await h.actions!.disconnect(draft, "connection_superseded")
+    })
+    h.acpConnectOrAttach.mockClear()
+
+    await act(async () => {
+      await h.actions!.connect(draft, "claude_code", "/work")
+    })
+
+    expect(h.acpConnectOrAttach).toHaveBeenCalledTimes(1)
+    expect(h.acpConnectOrAttach.mock.calls[0]?.[0].requestId).toBe(
+      originalRequestId
+    )
+  })
+
+  it("retries a shared config conflict once with a fresh request id", async () => {
+    h.isDesktop = false
+    const conflict = {
+      code: "shared_session_config_conflict",
+      message:
+        "shared session configuration conflicts with connection d4cae8e7-d85f-4c92-82a2-c2eb3315d561",
+    }
+    h.acpConnectOrAttach
+      .mockRejectedValueOnce(conflict)
+      .mockResolvedValueOnce(
+        sharedResponse({ connectionId: "conn-retry", leaseId: "lease-2" })
+      )
+    await mountProvider()
+
+    await act(async () => {
+      await h.actions!.connect("new-tab", "claude_code", "/work")
+    })
+
+    expect(h.acpConnectOrAttach).toHaveBeenCalledTimes(2)
+    expect(h.acpConnectOrAttach.mock.calls[1]?.[0].requestId).not.toBe(
+      h.acpConnectOrAttach.mock.calls[0]?.[0].requestId
+    )
+    expect(h.store!.getConnection("new-tab")?.sharedSession).toMatchObject({
+      leaseId: "lease-2",
+      connectRequestId: h.acpConnectOrAttach.mock.calls[1]?.[0].requestId,
+    })
+    expect(h.pushAlert).not.toHaveBeenCalled()
+  })
+
+  it("does not retry a shared config conflict more than once", async () => {
+    h.isDesktop = false
+    const conflict = {
+      code: "shared_session_config_conflict",
+      message:
+        "shared session configuration conflicts with connection d4cae8e7-d85f-4c92-82a2-c2eb3315d561",
+    }
+    h.acpConnectOrAttach.mockRejectedValue(conflict)
+    await mountProvider()
+
+    await act(async () => {
+      await expect(
+        h.actions!.connect("new-tab", "claude_code", "/work")
+      ).rejects.toMatchObject(conflict)
+    })
+
+    expect(h.acpConnectOrAttach).toHaveBeenCalledTimes(2)
+    expect(h.acpConnectOrAttach.mock.calls[1]?.[0].requestId).not.toBe(
+      h.acpConnectOrAttach.mock.calls[0]?.[0].requestId
+    )
+  })
+
   it("does not retry a shared failure until cleanup completes", async () => {
     h.isDesktop = false
     h.acpConnectOrAttach.mockResolvedValue(
