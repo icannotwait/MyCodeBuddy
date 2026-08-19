@@ -1605,7 +1605,7 @@ describe("AcpConnectionsProvider reconnect (status-icon button)", () => {
     expect(result).toBe(true)
     expect(h.acpDisconnect).toHaveBeenCalledWith(
       "spawned-conn",
-      expect.objectContaining({ origin: "explicit_user" })
+      expect.objectContaining({ origin: "connection_superseded" })
     )
     // Same agent / cwd / session — the point is a fresh PROCESS, not new params,
     // which is exactly what connect()'s "nothing changed" fast path would skip.
@@ -1838,7 +1838,7 @@ describe("AcpConnectionsProvider reconnect (status-icon button)", () => {
     // Waited for the hung attempt to settle, then rebuilt what it produced.
     expect(h.acpDisconnect).toHaveBeenCalledWith(
       "spawned-conn",
-      expect.objectContaining({ origin: "explicit_user" })
+      expect.objectContaining({ origin: "connection_superseded" })
     )
     expect(h.acpConnect).toHaveBeenLastCalledWith(
       "claude_code",

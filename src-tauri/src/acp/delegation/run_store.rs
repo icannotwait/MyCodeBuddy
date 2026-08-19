@@ -232,6 +232,7 @@ pub fn derive_task_preview(task: &str) -> String {
 /// distinct tuples into the same byte stream.
 ///
 /// Returns lowercase hex SHA-256 of the canonical bytes.
+#[allow(clippy::too_many_arguments)]
 pub fn request_fingerprint(
     tool_name: &str,
     task_text: &str,

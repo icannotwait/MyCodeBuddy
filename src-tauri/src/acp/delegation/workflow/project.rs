@@ -4388,6 +4388,7 @@ mod tests {
         let routing = simple_routing_fixture(4, "high", "codex", None);
         let expected = derive_simple_expected_route(&routing, 4).expect("valid route");
         let baseline = simple_progress_route_fixture(&expected);
+        #[allow(clippy::type_complexity)]
         let mutations: [(&str, Box<dyn Fn(&mut SimpleProgressTask)>); 5] = [
             (
                 "simple_progress_risk_level_mismatch",
@@ -5749,6 +5750,7 @@ mod tests {
         child
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn insert_bound_run(
         db: &AppDatabase,
         parent: i32,
