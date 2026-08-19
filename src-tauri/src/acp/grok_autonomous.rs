@@ -14,7 +14,7 @@ use serde_json::Value;
 use crate::acp::autonomous_activity::{
     cap_normalized_turn_payload, complete_file_watermark, read_complete_record_batch,
     rotation_decision, AutonomousActivityPolicy, EpisodeRotation, ProviderRecordIdentities,
-    TranscriptFileIdentity,
+    TranscriptFileIdentity, EPISODE_PAYLOAD_MAX_BYTES, EPISODE_RECORD_FORCE_ROTATE,
 };
 use crate::acp::session_state::background_keepalive_max_age;
 use crate::acp::types::BackgroundSettledInfo;
@@ -197,7 +197,7 @@ impl GrokAutonomousAdapter {
                 self.committed = watermark;
                 self.baseline_ready = true;
                 self.file_identity = TranscriptFileIdentity::for_path(updates_jsonl_path).ok();
-                self.last_visible_is_user = false;
+                self.last_visible_is_user = last_visible_committed_is_user(updates_jsonl_path);
             }
             Err(_) => {
                 self.baseline_ready = false;
@@ -637,7 +637,7 @@ impl GrokAutonomousAdapter {
                 self.committed = watermark;
                 self.baseline_ready = true;
                 self.file_identity = TranscriptFileIdentity::for_path(path).ok();
-                self.last_visible_is_user = false;
+                self.last_visible_is_user = last_visible_committed_is_user(path);
             }
             Err(_) => {
                 self.baseline_ready = false;
@@ -713,6 +713,7 @@ impl GrokAutonomousAdapter {
         self.committed = complete_file_watermark(path).unwrap_or(0);
         self.baseline_ready = true;
         self.file_identity = Some(identity);
+        self.last_visible_is_user = last_visible_committed_is_user(path);
         self.needs_detail_refetch = true;
         self.emit_accounting();
     }
@@ -823,6 +824,71 @@ fn record_update(record: &[u8]) -> Option<Value> {
     let payload = grok_record_payload(record);
     let value: Value = serde_json::from_slice(payload).ok()?;
     value.pointer("/params/update").cloned()
+}
+
+fn last_visible_committed_is_user(path: &Path) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let Ok(watermark) = complete_file_watermark(path) else {
+        return false;
+    };
+    if watermark == 0 {
+        return false;
+    }
+    let window = (EPISODE_PAYLOAD_MAX_BYTES as u64).saturating_mul(4);
+    let from = watermark.saturating_sub(window);
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    if file.seek(SeekFrom::Start(from)).is_err() {
+        return false;
+    }
+    let mut bytes = vec![0u8; (watermark - from) as usize];
+    if file.read_exact(&mut bytes).is_err() {
+        return false;
+    }
+    let slice = if from == 0 {
+        bytes.as_slice()
+    } else {
+        match bytes.iter().position(|&b| b == b'\n') {
+            Some(index) => &bytes[index + 1..],
+            None => return false,
+        }
+    };
+    let records: Vec<&[u8]> = grok_complete_records(slice)
+        .map(|(_, record)| record)
+        .collect();
+    for record in records.iter().rev().take(EPISODE_RECORD_FORCE_ROTATE) {
+        let Some(update) = record_update(record) else {
+            continue;
+        };
+        let kind = update
+            .get("sessionUpdate")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let hidden = update
+            .pointer("/_meta/hideFromScrollback")
+            .and_then(Value::as_bool)
+            == Some(true);
+        if kind == "user_message_chunk" && hidden {
+            continue;
+        }
+        if kind == "user_message_chunk" {
+            return true;
+        }
+        if matches!(
+            kind,
+            "agent_message_chunk"
+                | "agent_thought_chunk"
+                | "tool_call"
+                | "tool_call_update"
+                | "auto_compact_completed"
+                | "turn_completed"
+        ) {
+            return false;
+        }
+    }
+    false
 }
 
 fn keepalive_std() -> std::time::Duration {
@@ -1293,6 +1359,42 @@ mod tests {
             &jsonl_update("session/update", &agent_text_update("user reply"), 3),
         );
         adapter.tail_once();
+        assert!(adapter.take_emitted().turns.is_empty());
+    }
+
+    #[test]
+    fn attach_with_trailing_visible_user_does_not_open_on_reminder() {
+        let user_line = jsonl_update(
+            "session/update",
+            &json!({
+                "sessionUpdate": "user_message_chunk",
+                "content": {"type": "text", "text": "please continue"},
+                "_meta": {"promptIndex": 2}
+            }),
+            1,
+        );
+        let hidden_line = jsonl_update("session/update", &hidden_trigger_update(), 2);
+        let (_dir, path) = tmp_updates(&format!("{user_line}\n{hidden_line}\n"));
+        let mut adapter = GrokAutonomousAdapter::new_for_test(path.clone());
+        adapter.on_session_ready("sess", &path);
+        adapter.on_raw_dispatch(
+            "_x.ai/session/update",
+            &json!({"update":{"sessionUpdate":"task_completed","task_id":"term_x"}}),
+            Ownership::Idle,
+        );
+        adapter.on_raw_dispatch(
+            "session/update",
+            &json!({"update":{
+                "sessionUpdate":"user_message_chunk",
+                "content":{"type":"text","text":HIDDEN_REMINDER},
+                "_meta":{"hideFromScrollback":true}
+            }}),
+            Ownership::Idle,
+        );
+        assert!(
+            !adapter.autonomous_busy(),
+            "reattach must recover a trailing visible User and reject the reminder"
+        );
         assert!(adapter.take_emitted().turns.is_empty());
     }
 

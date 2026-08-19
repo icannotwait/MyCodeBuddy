@@ -261,16 +261,7 @@ impl CodexAutonomousAdapter {
         }
         if self.episode.is_active() {
             if let Some(path) = self.rollout_path.clone() {
-                let changed = TranscriptFileIdentity::for_path(&path)
-                    .ok()
-                    .zip(std::fs::metadata(&path).ok())
-                    .is_some_and(|(identity, metadata)| {
-                        self.file_identity
-                            .as_ref()
-                            .is_some_and(|known| known != &identity)
-                            || metadata.len() < self.committed
-                    });
-                if changed {
+                if self.transcript_generation_lost(&path) {
                     self.reset_transcript_generation(&path);
                     return;
                 }
@@ -285,22 +276,13 @@ impl CodexAutonomousAdapter {
         let Some(path) = self.rollout_path.clone() else {
             return;
         };
-        let Ok(identity) = TranscriptFileIdentity::for_path(&path) else {
-            return;
-        };
-        let Ok(file_len) = std::fs::metadata(&path).map(|metadata| metadata.len()) else {
-            return;
-        };
-        if self
-            .file_identity
-            .as_ref()
-            .is_some_and(|known| known != &identity)
-            || file_len < self.committed
-        {
+        if self.transcript_generation_lost(&path) {
             self.reset_transcript_generation(&path);
             return;
         }
-        self.file_identity.get_or_insert(identity);
+        if let Ok(identity) = TranscriptFileIdentity::for_path(&path) {
+            self.file_identity.get_or_insert(identity);
+        }
 
         if self.episode.native_turn_id.is_none() {
             let Ok(batch) = read_complete_record_batch(&path, self.episode.tail_from) else {
@@ -512,20 +494,22 @@ impl CodexAutonomousAdapter {
             return;
         }
         if self.authority == Authority::Armed {
-            if let Some(path) = &self.rollout_path {
-                if is_regular_file(path) {
-                    match rollout_session_id(path).as_deref() {
+            if let Some(path) = self.rollout_path.clone() {
+                if is_regular_file(&path) {
+                    match rollout_session_id(&path).as_deref() {
                         Some(id) if id == self.session_id => return,
                         Some(_) => {
                             self.downgrade_unsupported();
                             return;
                         }
                         None => {
-                            self.authority = Authority::Provisional;
-                            self.rollout_path = None;
-                            self.file_identity = None;
+                            self.reset_transcript_generation(&path);
+                            return;
                         }
                     }
+                } else {
+                    self.reset_transcript_generation(&path);
+                    return;
                 }
             }
             self.authority = Authority::Provisional;
@@ -693,6 +677,21 @@ impl CodexAutonomousAdapter {
         self.episode.segment_record_count = 0;
         self.episode.segment_part = self.episode.segment_part.saturating_add(1);
         self.episode.published_id = None;
+    }
+
+    fn transcript_generation_lost(&self, path: &Path) -> bool {
+        match (
+            TranscriptFileIdentity::for_path(path),
+            std::fs::metadata(path),
+        ) {
+            (Ok(identity), Ok(metadata)) => {
+                self.file_identity
+                    .as_ref()
+                    .is_some_and(|known| known != &identity)
+                    || metadata.len() < self.committed
+            }
+            _ => true,
+        }
     }
 
     fn reset_transcript_generation(&mut self, path: &Path) {
@@ -1119,6 +1118,86 @@ mod tests {
         feed_thread(&mut adapter, "active", Ownership::Idle);
         assert_ne!(adapter.authority, Authority::Armed);
         assert!(adapter.episode.native_turn_id.is_none());
+    }
+
+    #[test]
+    fn missing_armed_rollout_resets_before_same_session_replacement_can_resume() {
+        let (_dir, root) = tmp_sessions();
+        let path = write_rollout(
+            &root,
+            "sess-1",
+            &format!("{}\n", session_meta_line("sess-1")),
+        );
+        let mut adapter = CodexAutonomousAdapter::new_for_test("sess-1", root);
+        adapter.on_session_ready("sess-1");
+        append_line(
+            &path,
+            &task_started_line("turn_goal_1", "2026-08-18T00:00:01Z"),
+        );
+        append_line(&path, &goal_context_line("2026-08-18T00:00:02Z"));
+        append_line(
+            &path,
+            &assistant_line("msg_live", "working-on-first-cycle", "2026-08-18T00:00:03Z"),
+        );
+        feed_goal(&mut adapter, "active", Ownership::Idle);
+        feed_thread(&mut adapter, "active", Ownership::Idle);
+        adapter.tail_once();
+        assert!(adapter.autonomous_busy());
+        assert_eq!(
+            adapter.episode.native_turn_id.as_deref(),
+            Some("turn_goal_1")
+        );
+        let prior_committed = adapter.committed;
+
+        fs::remove_file(&path).unwrap();
+        adapter.tail_once();
+        assert!(
+            !adapter.autonomous_busy(),
+            "missing armed rollout is generation loss and must drop the prompt gate"
+        );
+        assert!(adapter.take_detail_refetch());
+        assert_eq!(adapter.authority, Authority::Provisional);
+        assert!(adapter.rollout_path.is_none());
+        assert!(adapter.episode.native_turn_id.is_none());
+        assert!(adapter.episode.published_id.is_none());
+        assert_eq!(adapter.provider_record_identities.len(), 0);
+        assert!(!should_hold_prompt(Some(&adapter)));
+
+        let mut replacement = session_meta_line("sess-1");
+        replacement.push('\n');
+        while (replacement.len() as u64) < prior_committed {
+            replacement.push_str(&assistant_line(
+                "msg_pad",
+                "padding-to-avoid-shrink-detection",
+                "2026-08-18T00:00:04Z",
+            ));
+            replacement.push('\n');
+        }
+        replacement.push_str(&task_started_line("turn_goal_2", "2026-08-18T00:00:05Z"));
+        replacement.push('\n');
+        replacement.push_str(&goal_context_line("2026-08-18T00:00:06Z"));
+        replacement.push('\n');
+        replacement.push_str(&assistant_line(
+            "msg_next",
+            "second-generation",
+            "2026-08-18T00:00:07Z",
+        ));
+        replacement.push('\n');
+        fs::write(&path, replacement).unwrap();
+
+        feed_thread(&mut adapter, "active", Ownership::Idle);
+        adapter.tail_once();
+        assert!(adapter.autonomous_busy());
+        assert_eq!(
+            adapter.episode.native_turn_id.as_deref(),
+            Some("turn_goal_2"),
+            "same-session replacement must arm a fresh episode baseline"
+        );
+        let emitted = adapter.take_emitted();
+        assert!(emitted
+            .turns
+            .iter()
+            .all(|turn| turn.id == codex_goal_turn_id("turn_goal_2")));
     }
 
     fn session_info_params(goal_status: Option<&str>, thread_type: Option<&str>) -> Value {
