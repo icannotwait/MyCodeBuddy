@@ -234,7 +234,10 @@ pub fn build_translate_prompt(locale: AppLocale, body: &str) -> String {
 Return only the full translated document body.\n\
 Do not use tools. Do not wrap the entire answer in an outer code fence.\n\
 Do not add a preface or commentary.\n\
-Leave every placeholder like ⟦CGCODE_…⟧ and ⟦CGINLINE_…⟧ exactly unchanged.\n\
+Keep every placeholder like ⟦CGCODE_…⟧ and ⟦CGINLINE_…⟧ byte-for-byte unchanged and include each exactly once.\n\
+Keep all CGCODE placeholders in their original order.\n\
+CGINLINE placeholders may move only when required by target-language grammar;\n\
+do not move them across a CGCODE placeholder.\n\
 Do not translate source code, shell commands, file paths, URLs, or identifiers.\n\
 Keep proper nouns, product names, API names, and established technical English terms in English when standard.\n\
 Translate surrounding prose into {language}.\n\
@@ -257,6 +260,15 @@ mod tests {
         assert!(p.contains("Do not use tools."));
         assert!(p.contains("⟦CGCODE_…⟧"));
         assert!(p.contains("⟦CGINLINE_…⟧"));
+        assert!(p.contains(
+            "Keep every placeholder like ⟦CGCODE_…⟧ and ⟦CGINLINE_…⟧ byte-for-byte unchanged and include each exactly once."
+        ));
+        assert!(p.contains("Keep all CGCODE placeholders in their original order."));
+        assert!(p.contains(
+            "CGINLINE placeholders may move only when required by target-language grammar;"
+        ));
+        assert!(p.contains("do not move them across a CGCODE placeholder."));
+        assert!(!p.contains("Leave every placeholder like"));
         assert!(p.contains("Document:\nHello **world**"));
         assert!(!p.contains("conversation title"));
     }

@@ -10,8 +10,8 @@ pub mod service;
 pub mod types;
 
 pub use protect::{
-    protect_markdown, protect_markdown_with_nonce, restore_markdown, ProtectError,
-    ProtectedDocument,
+    protect_markdown, protect_markdown_with_nonce, restore_markdown, restore_markdown_detailed,
+    IntegrityFailureKind, ProtectError, ProtectedDocument, RestoreOutcome,
 };
 pub use runner::{DocumentTranslateAgent, DocumentTranslateRunner, InertDocumentTranslateAgent};
 pub use save::{resolve_save_target, save_translation_as_to_root};

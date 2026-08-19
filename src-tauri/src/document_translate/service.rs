@@ -20,7 +20,9 @@ use crate::auto_title::internal_sessions::InternalAgentSessionRegistry;
 use crate::auto_title::parse_supported_app_locale;
 use crate::commands::conversation_experience::load_document_translate_agent_from;
 use crate::db::AppDatabase;
-use crate::document_translate::protect::{protect_markdown, restore_markdown};
+use crate::document_translate::protect::{
+    protect_markdown, restore_markdown_detailed, ProtectError,
+};
 #[cfg(any(test, feature = "test-utils"))]
 use crate::document_translate::runner::InertDocumentTranslateAgent;
 use crate::document_translate::runner::{
@@ -128,9 +130,26 @@ impl DocumentTranslationService {
             let mapped = match result {
                 Ok(raw) => {
                     if let Some(ref protected) = protected {
-                        match restore_markdown(&raw, protected) {
-                            Ok(restored) => Ok(restored),
-                            Err(_) => Err(DocumentTranslateError::PlaceholderIntegrity),
+                        match restore_markdown_detailed(&raw, protected) {
+                            Ok(outcome) => {
+                                if outcome.inline_reorder_count > 0 {
+                                    tracing::debug!(
+                                        inline_reorder_count = outcome.inline_reorder_count,
+                                        "[document_translate] accepted inline placeholder reordering"
+                                    );
+                                }
+                                Ok(outcome.text)
+                            }
+                            Err(ProtectError::IntegrityFailed(kind)) => {
+                                tracing::warn!(
+                                    kind = ?kind,
+                                    "[document_translate] placeholder integrity failed"
+                                );
+                                Err(DocumentTranslateError::PlaceholderIntegrity)
+                            }
+                            Err(ProtectError::NonceCollision) => {
+                                Err(DocumentTranslateError::PlaceholderIntegrity)
+                            }
                         }
                     } else {
                         Ok(raw)
@@ -580,6 +599,92 @@ mod tests {
         assert!(result.translated_content.starts_with("TR: "));
         assert!(result.translated_content.contains("`code`"));
         assert!(!result.translated_content.contains('⟦'));
+    }
+
+    fn take_current_nonce_tokens(body: &str, kind: &str) -> Vec<String> {
+        let prefix = format!("⟦{kind}_");
+        let close = '⟧';
+        let mut tokens = Vec::new();
+        let mut rest = body;
+        while let Some(start) = rest.find(&prefix) {
+            let after = &rest[start + prefix.len()..];
+            let Some(end) = after.find(close) else {
+                break;
+            };
+            tokens.push(rest[start..start + prefix.len() + end + close.len_utf8()].to_string());
+            rest = &after[end + close.len_utf8()..];
+        }
+        tokens
+    }
+
+    #[tokio::test]
+    async fn markdown_same_region_inline_reorder_restores_original_spans() {
+        struct ReorderAgent;
+        #[async_trait]
+        impl DocumentTranslateAgent for ReorderAgent {
+            async fn run(
+                &self,
+                _agent: AgentType,
+                _locale: AppLocale,
+                body: &str,
+                _overall_deadline: Instant,
+            ) -> Result<String, DocumentTranslateError> {
+                let tokens = take_current_nonce_tokens(body, "CGINLINE");
+                assert_eq!(tokens.len(), 2, "protected body must contain two CGINLINE tokens");
+                let t0 = &tokens[0];
+                let t1 = &tokens[1];
+                Ok(format!("It queries-from {t1} the fields {t0}."))
+            }
+        }
+
+        let db = db_with_agent(Some(AgentType::Codex)).await;
+        let svc = DocumentTranslationService::new(db, Arc::new(ReorderAgent));
+        let result = svc
+            .translate(params("It queries `id, data` from `blobs`.", "markdown"))
+            .await
+            .expect("same-region inline reorder must succeed");
+        assert_eq!(
+            result.translated_content,
+            "It queries-from `blobs` the fields `id, data`."
+        );
+        assert!(!result.translated_content.contains('⟦'));
+    }
+
+    #[tokio::test]
+    async fn markdown_fenced_reorder_still_maps_to_placeholder_integrity() {
+        struct SwapFences;
+        #[async_trait]
+        impl DocumentTranslateAgent for SwapFences {
+            async fn run(
+                &self,
+                _agent: AgentType,
+                _locale: AppLocale,
+                body: &str,
+                _overall_deadline: Instant,
+            ) -> Result<String, DocumentTranslateError> {
+                let tokens = take_current_nonce_tokens(body, "CGCODE");
+                assert_eq!(tokens.len(), 2, "expected two CGCODE tokens");
+                let swapped = body
+                    .replacen(&tokens[0], "@@TMP@@", 1)
+                    .replacen(&tokens[1], &tokens[0], 1)
+                    .replacen("@@TMP@@", &tokens[1], 1);
+                Ok(swapped)
+            }
+        }
+
+        let db = db_with_agent(Some(AgentType::Codex)).await;
+        let svc = DocumentTranslationService::new(db, Arc::new(SwapFences));
+        let content = "```\none\n```\n\n```\ntwo\n```\n";
+        let err = svc
+            .translate(params(content, "markdown"))
+            .await
+            .expect_err("fenced reorder must fail closed");
+        assert_eq!(err, DocumentTranslateError::PlaceholderIntegrity);
+        let app = err.into_app_command_error();
+        assert_eq!(
+            app.i18n_key.as_deref(),
+            Some(crate::document_translate::types::I18N_PLACEHOLDER)
+        );
     }
 
     #[tokio::test]
