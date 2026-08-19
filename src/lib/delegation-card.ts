@@ -494,8 +494,10 @@ export type ParsedToolOutput =
  */
 export function isUncorrelatedDelegationFailure(
   output: ParsedToolOutput | null,
-  currentTaskId: string | null | undefined
+  currentTaskId: string | null | undefined,
+  options?: { syntheticHistorical?: boolean }
 ): boolean {
+  if (options?.syntheticHistorical) return false
   return !currentTaskId && output?.kind === "outcome" && output.isError === true
 }
 
@@ -894,7 +896,9 @@ export function parseDelegateRunIdentity(
     .map(parseStructuredDelegateReport)
     .filter((report): report is Record<string, unknown> => report !== null)
   const uncorrelatedFailure = outputCandidates.some((candidate) =>
-    isUncorrelatedDelegationFailure(candidate, taskId)
+    isUncorrelatedDelegationFailure(candidate, taskId, {
+      syntheticHistorical: parsedMeta?.syntheticHistorical === true,
+    })
   )
   const childConversationId = uncorrelatedFailure
     ? null

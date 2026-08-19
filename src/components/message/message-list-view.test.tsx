@@ -1,4 +1,11 @@
-import { act, fireEvent, render, screen, cleanup } from "@testing-library/react"
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  cleanup,
+  waitFor,
+} from "@testing-library/react"
 import { NextIntlClientProvider } from "next-intl"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import type { ReactNode } from "react"
@@ -6,6 +13,7 @@ import { forwardRef, useImperativeHandle, type Ref } from "react"
 import type { LiveMessage } from "@/contexts/acp-connections-context"
 import type {
   AcceptedConnectionFrame,
+  DbConversationSummary,
   EventEnvelope,
   MessageTurn,
 } from "@/lib/types"
@@ -34,10 +42,34 @@ import {
   initializeStreamingPerformanceConfig,
 } from "@/lib/acp/streaming-performance-config"
 
-const { virtualizerScrollToIndex, virtualizerKeysSpy } = vi.hoisted(() => ({
+const {
+  virtualizerScrollToIndex,
+  virtualizerKeysSpy,
+  listChildConversationsMock,
+} = vi.hoisted(() => ({
   virtualizerScrollToIndex: vi.fn(),
   virtualizerKeysSpy: vi.fn(),
+  listChildConversationsMock: vi.fn(async () => [] as const),
 }))
+
+vi.mock("@/lib/api", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/api")>()
+  return {
+    ...actual,
+    listChildConversations: (
+      ...args: Parameters<typeof actual.listChildConversations>
+    ) => listChildConversationsMock(...args),
+  }
+})
+
+vi.mock("@/lib/platform", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/platform")>()
+  return {
+    ...actual,
+    subscribe: vi.fn(async () => () => {}),
+    onTransportReconnect: vi.fn(() => () => {}),
+  }
+})
 
 // virtua / stick-to-bottom / heavy markdown — keep list tests focused.
 vi.mock("virtua", () => ({
@@ -306,6 +338,11 @@ import type { AdaptedToolCallPart } from "@/lib/adapters/ai-elements-adapter"
 import type { DelegationActivityView } from "@/lib/types"
 
 const CID = 501
+
+beforeEach(() => {
+  listChildConversationsMock.mockReset()
+  listChildConversationsMock.mockResolvedValue([])
+})
 
 function userTurn(id: string, text = id): MessageTurn {
   return {
@@ -615,17 +652,23 @@ function seedHistory(
   turns: MessageTurn[] = [
     userTurn("u1", "hello"),
     assistantTurn("a1", "prior reply"),
-  ]
+  ],
+  options?: { runtimeId?: number; dbConversationId?: number | null }
 ) {
+  const runtimeId = options?.runtimeId ?? CID
+  const dbConversationId =
+    options?.dbConversationId === undefined
+      ? runtimeId
+      : options.dbConversationId
   useConversationRuntimeStore.setState({
     byConversationId: new Map([
       [
-        CID,
+        runtimeId,
         {
-          conversationId: CID,
+          conversationId: runtimeId,
           detail: {
             summary: {
-              id: CID,
+              id: dbConversationId ?? runtimeId,
               folder_id: 1,
               agent_type: "codex",
               title: "t",
@@ -661,7 +704,7 @@ function seedHistory(
           sessionStats: null,
           syncState: "idle",
           externalId: "sid-1",
-          dbConversationId: CID,
+          dbConversationId,
           activeTurnToken: null,
           pendingCleanup: false,
           delegationActivities: [],
@@ -673,7 +716,7 @@ function seedHistory(
         },
       ],
     ]),
-    conversationIdByExternalId: new Map([["sid-1", CID]]),
+    conversationIdByExternalId: new Map([["sid-1", runtimeId]]),
   })
 }
 
@@ -712,11 +755,12 @@ function messageListUi(options?: {
   connStatus?: "connected" | "prompting" | "connecting" | "disconnected"
   isActive?: boolean
   workspaceRootPath?: string | null
+  conversationId?: number
 }) {
   return (
     <NextIntlClientProvider locale="en" messages={enMessages}>
       <MessageListView
-        conversationId={CID}
+        conversationId={options?.conversationId ?? CID}
         agentType="codex"
         connStatus={options?.connStatus ?? "prompting"}
         isActive={options?.isActive ?? true}
@@ -735,6 +779,7 @@ function renderMessageList(options?: {
   connStatus?: "connected" | "prompting" | "connecting" | "disconnected"
   isActive?: boolean
   workspaceRootPath?: string | null
+  conversationId?: number
 }) {
   return render(messageListUi(options))
 }
@@ -1534,12 +1579,42 @@ describe("MessageListView waiting-for-subagents bottom banner", () => {
   })
 })
 
+function durableChild(
+  overrides: Partial<DbConversationSummary> & Pick<DbConversationSummary, "id">
+): DbConversationSummary {
+  return {
+    folder_id: 1,
+    title: `child-${overrides.id}`,
+    title_locked: false,
+    auto_title_finalized: false,
+    agent_type: "codex",
+    status: "pending_review",
+    awaiting_reply_token: null,
+    kind: "delegate",
+    model: null,
+    git_branch: null,
+    external_id: null,
+    message_count: 0,
+    child_count: 0,
+    created_at: "2026-08-19T11:30:08.000Z",
+    updated_at: "2026-08-19T11:41:46.000Z",
+    pinned_at: null,
+    parent_id: CID,
+    parent_tool_use_id: `exec-${overrides.id}`,
+    delegation_call_id: `task-${overrides.id}`,
+    delegation_task_status: "completed",
+    ...overrides,
+  }
+}
+
 describe("MessageListView sub-agent overlay composition", () => {
   beforeEach(() => {
     resetConversationRuntimeStore()
     __resetLiveTranscriptStoreForTests()
     __resetStreamingPerformanceConfigForTests()
     subAgentOverlayPropsSpy.mockClear()
+    listChildConversationsMock.mockReset()
+    listChildConversationsMock.mockResolvedValue([])
     enableIncremental()
   })
 
@@ -1649,6 +1724,77 @@ describe("MessageListView sub-agent overlay composition", () => {
     __resetStreamingPerformanceConfigForTests()
     renderMessageList({ workspaceRootPath: "D:\\Repo\\Task7" })
     expect(lastOverlayProps().workspaceRootPath).toBe("D:\\Repo\\Task7")
+  })
+
+  it("fills overlay from durable children when the transcript has no delegate cards", async () => {
+    listChildConversationsMock.mockResolvedValue([
+      durableChild({ id: 3868, parent_tool_use_id: "exec-newer" }),
+      durableChild({
+        id: 3867,
+        parent_tool_use_id: "exec-older",
+        created_at: "2026-08-19T11:30:00.000Z",
+        delegation_started_at: "2026-08-19T11:30:00.000Z",
+      }),
+    ])
+    seedHistory([
+      userTurn("u1", "after compaction"),
+      assistantTurn("a1", "summary only"),
+    ])
+
+    renderMessageList()
+
+    await waitFor(() => {
+      expect(
+        (lastOverlayProps().delegations ?? []).map(
+          (delegation) => delegation.parentToolUseId
+        )
+      ).toEqual(["exec-older", "exec-newer"])
+    })
+    expect(listChildConversationsMock).toHaveBeenCalledWith(CID)
+  })
+
+  it("fills the legacy overlay from durable children when the transcript is empty", async () => {
+    __resetStreamingPerformanceConfigForTests()
+    listChildConversationsMock.mockResolvedValue([
+      durableChild({ id: 3867, parent_tool_use_id: "exec-older" }),
+    ])
+    seedHistory([])
+
+    renderMessageList()
+
+    await waitFor(() => {
+      expect(
+        (lastOverlayProps().delegations ?? []).map(
+          (delegation) => delegation.parentToolUseId
+        )
+      ).toEqual(["exec-older"])
+    })
+  })
+
+  it("queries durable children by the bound db id when the runtime key is virtual", async () => {
+    const runtimeId = -9
+    listChildConversationsMock.mockResolvedValue([
+      durableChild({
+        id: 3867,
+        parent_id: CID,
+        parent_tool_use_id: "exec-older",
+      }),
+    ])
+    seedHistory(
+      [userTurn("u1", "after compaction"), assistantTurn("a1", "summary only")],
+      { runtimeId, dbConversationId: CID }
+    )
+
+    renderMessageList({ conversationId: runtimeId })
+
+    await waitFor(() => {
+      expect(listChildConversationsMock).toHaveBeenCalledWith(CID)
+      expect(
+        (lastOverlayProps().delegations ?? []).map(
+          (delegation) => delegation.parentToolUseId
+        )
+      ).toEqual(["exec-older"])
+    })
   })
 })
 

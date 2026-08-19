@@ -947,6 +947,34 @@ describe("parseDelegateRunIdentity", () => {
     })
   })
 
+  it("keeps the child id on a synthetic historical failure that has no current run id", () => {
+    expect(
+      parseDelegateRunIdentity({
+        parentConversationId: 3866,
+        parentToolUseId: "child-3880",
+        input: JSON.stringify({ agent_type: "codex", task: "canceled" }),
+        output: JSON.stringify({
+          status: "canceled",
+          child_conversation_id: 3880,
+          error_code: "usercancel",
+          message: "usercancel",
+        }),
+        errorText: "usercancel",
+        meta: {
+          "codeg.delegation": {
+            status: "err",
+            child_conversation_id: 3880,
+            error_code: "usercancel",
+            synthetic_historical: true,
+          },
+        },
+      })
+    ).toMatchObject({
+      taskId: null,
+      childConversationId: 3880,
+    })
+  })
+
   it("does not group an uncorrelated failed run by an echoed child id", () => {
     expect(
       parseDelegateRunIdentity({

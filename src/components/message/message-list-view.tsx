@@ -59,6 +59,8 @@ import {
 } from "@/lib/tool-call-normalization"
 import { isDelegateToAgentToolName } from "@/lib/delegation-card"
 import type { DelegationCardSource } from "@/hooks/use-delegation-card-model"
+import { useDurableDelegationSources } from "@/hooks/use-durable-delegation-sources"
+import { mergeDelegationSourceLayers } from "@/lib/delegation-overlay-history"
 import {
   dedupeDelegationActivities,
   deriveNativeActivitiesFromToolCalls,
@@ -601,7 +603,8 @@ export function mergeConsecutiveAssistantTurns(
           mergedDuration = (mergedDuration ?? 0) + it.group.duration_ms
         }
         if (typeof it.group.generation_ms === "number") {
-          mergedGenerationMs = (mergedGenerationMs ?? 0) + it.group.generation_ms
+          mergedGenerationMs =
+            (mergedGenerationMs ?? 0) + it.group.generation_ms
         }
         if (typeof it.group.generation_tokens === "number") {
           mergedGenerationTokens =
@@ -1116,42 +1119,6 @@ const LiveAgentPlanOverlay = memo(function LiveAgentPlanOverlay({
 })
 
 /**
- * Merge live-transcript delegation rows into the full historical list.
- * Live rows win on `parentToolUseId` (fresher status/output while streaming);
- * live-only ids (not yet adapted into history) are appended in order.
- */
-function mergeLiveAndHistoricalDelegations(
-  historical: DelegationCardSource[],
-  live: DelegationCardSource[]
-): DelegationCardSource[] {
-  if (live.length === 0) return historical
-  if (historical.length === 0) return live
-
-  const liveById = new Map(
-    live.map((source) => [source.parentToolUseId, source])
-  )
-  const seen = new Set<string>()
-  const merged: DelegationCardSource[] = []
-
-  for (const source of historical) {
-    const liveSource = liveById.get(source.parentToolUseId)
-    if (liveSource) {
-      merged.push(liveSource)
-      seen.add(source.parentToolUseId)
-    } else {
-      merged.push(source)
-      seen.add(source.parentToolUseId)
-    }
-  }
-  for (const source of live) {
-    if (!seen.has(source.parentToolUseId)) {
-      merged.push(source)
-    }
-  }
-  return merged
-}
-
-/**
  * Sub-agent overlay: full conversation history, with live-transcript rows
  * preferred for the in-flight turn so status updates without waiting on
  * historical adaptation. Native activity is derived alongside and never
@@ -1208,12 +1175,11 @@ const LiveAwareSubAgentOverlay = memo(function LiveAwareSubAgentOverlay({
     return historicalActivities
   }, [liveActivities, historicalActivities])
   // Full-session historical rows + fresher live transcript rows for in-flight
-  // turns (live wins on parentToolUseId).
-  const delegations = useMemo(
-    () =>
-      mergeLiveAndHistoricalDelegations(historicalDelegations, liveDelegations),
-    [historicalDelegations, liveDelegations]
-  )
+  // turns. Live wins on tool / child / task identity.
+  const delegations = useMemo(() => {
+    if (liveDelegations.length === 0) return historicalDelegations
+    return mergeDelegationSourceLayers(historicalDelegations, liveDelegations)
+  }, [historicalDelegations, liveDelegations])
   // Conversation-scoped key so expand/collapse survives new turns and the
   // live↔historical handoff (unlike a per-message key which remounts the panel).
   const workflowGraph = useConversationRuntimeStore(
@@ -1265,6 +1231,17 @@ export function MessageListView({
     Number.isFinite(waitingForSubagentsArmedAtMs)
   const t = useTranslations("Folder.chat.messageList")
   const sharedT = useTranslations("Folder.chat.shared")
+  const durableConversationId = useConversationRuntimeStore(
+    useCallback(
+      (s) =>
+        s.byConversationId.get(conversationId)?.dbConversationId ??
+        conversationId,
+      [conversationId]
+    )
+  )
+  const durableDelegationSources = useDurableDelegationSources(
+    durableConversationId
+  )
   const useIncrementalLive = useStreamingPerformanceFlag(
     "incremental_live_transcript"
   )
@@ -1727,12 +1704,10 @@ export function MessageListView({
       ? `plan-${liveMessage.id}`
       : `plan-history-${conversationId}`
 
-  // All sub-agents delegated across the conversation (every assistant turn).
-  // Timeline order is preserved so older delegations stay above newer ones.
-  // The live streaming path merges fresher transcript rows on top of this list
-  // (see `LiveAwareSubAgentOverlay`); a non-delegating later reply no longer
-  // clears earlier history.
-  const allSessionDelegations = useMemo(() => {
+  // Transcript walk first, then durable children under it. Compaction can drop
+  // delegate cards from the visible tail; `list_child_conversations` still has
+  // them. Transcript / continue_delegation rows win on tool / child / task id.
+  const transcriptDelegations = useMemo(() => {
     const out: DelegationCardSource[] = []
     for (const item of threadItems) {
       if (item.kind === "turn" && item.group.role === "assistant") {
@@ -1741,6 +1716,14 @@ export function MessageListView({
     }
     return out.length > 0 ? out : EMPTY_DELEGATIONS
   }, [threadItems, conversationId])
+  const allSessionDelegations = useMemo(() => {
+    if (durableDelegationSources.length === 0) return transcriptDelegations
+    const merged = mergeDelegationSourceLayers(
+      durableDelegationSources,
+      transcriptDelegations
+    )
+    return merged.length > 0 ? merged : EMPTY_DELEGATIONS
+  }, [durableDelegationSources, transcriptDelegations])
   // Store-backed activities (COMPLETE_TURN / SET_LIVE_MESSAGE / detail fetch).
   // Stable empty reference when absent — required for Zustand getSnapshot.
   // Store is last-assistant-only by design; always merge with full-session

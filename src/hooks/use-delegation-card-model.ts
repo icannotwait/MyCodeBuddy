@@ -580,7 +580,8 @@ export function buildDelegationCardModel(input: {
     null
   const uncorrelatedFailure = isUncorrelatedDelegationFailure(
     toolOutput,
-    knownTaskId
+    knownTaskId,
+    { syntheticHistorical: parsedMeta?.syntheticHistorical === true }
   )
   const scopedChildProjection = uncorrelatedFailure ? null : childProjection
   const runScopedProjection = runScopedChildProjection(
@@ -991,7 +992,8 @@ export function useDelegationCardModel(
   }, [output, errorText])
   const fallbackUncorrelatedFailure = isUncorrelatedDelegationFailure(
     toolOutput,
-    parsedMeta?.taskId ?? displayTaskId
+    parsedMeta?.taskId ?? displayTaskId,
+    { syntheticHistorical: parsedMeta?.syntheticHistorical === true }
   )
   const fallbackChildConversationId = fallbackUncorrelatedFailure
     ? null
@@ -1036,7 +1038,8 @@ export function useDelegationCardModel(
     displayTaskId
   const uncorrelatedFailure = isUncorrelatedDelegationFailure(
     toolOutput,
-    currentTaskId
+    currentTaskId,
+    { syntheticHistorical: parsedMeta?.syntheticHistorical === true }
   )
 
   const childConversationId = uncorrelatedFailure
