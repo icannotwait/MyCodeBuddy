@@ -256,6 +256,7 @@ pub(crate) struct SharedSweepCandidate {
 pub(crate) enum SharedSweepCandidateKind {
     Ready,
     Failed,
+    AbandonedEphemeral,
 }
 
 pub(crate) struct SharedClosingTransition {
@@ -636,12 +637,44 @@ impl SharedSessionBroker {
         idle_grace: Option<Duration>,
         failed_grace: Duration,
     ) -> Vec<SharedSweepCandidate> {
-        let records: Vec<_> = self.index.lock().await.sessions.values().cloned().collect();
+        let records: Vec<_> = self
+            .index
+            .lock()
+            .await
+            .sessions
+            .iter()
+            .map(|(key, record)| (key.clone(), record.clone()))
+            .collect();
         let now = tokio::time::Instant::now();
         let mut candidates = Vec::new();
 
-        for record in records {
+        for (key, record) in records {
             let mut current = record.lock().await;
+            if matches!(key, SharedSessionKey::Ephemeral(_))
+                && matches!(
+                    current.phase,
+                    SharedSessionPhase::Reserved
+                        | SharedSessionPhase::Bootstrapping
+                        | SharedSessionPhase::Ready
+                )
+            {
+                current.failed_zero_since = None;
+                if current.has_broker_occupants() {
+                    current.idle_zero_since = None;
+                    continue;
+                }
+                let zero_since = current.idle_zero_since.get_or_insert(now);
+                if now.duration_since(*zero_since) >= failed_grace {
+                    candidates.push(SharedSweepCandidate {
+                        record: record.clone(),
+                        connection_id: current.connection_id.clone(),
+                        generation: current.generation,
+                        kind: SharedSweepCandidateKind::AbandonedEphemeral,
+                        failed_zero_since: None,
+                    });
+                }
+                continue;
+            }
             match current.phase {
                 SharedSessionPhase::Ready => {
                     current.failed_zero_since = None;
@@ -762,6 +795,93 @@ impl SharedSessionBroker {
         })
     }
 
+    pub(crate) async fn begin_abandoned_ephemeral_reclaim(
+        &self,
+        candidate: SharedSweepCandidate,
+        unoccupied_grace: Duration,
+    ) -> Option<SharedClosingTransition> {
+        loop {
+            let index = self.index.lock().await;
+            let Some(key) = index.by_connection.get(&candidate.connection_id).cloned() else {
+                return None;
+            };
+            if !matches!(key, SharedSessionKey::Ephemeral(_)) {
+                return None;
+            }
+            let authoritative = index
+                .sessions
+                .get(&key)
+                .is_some_and(|record| Arc::ptr_eq(record, &candidate.record));
+            if !authoritative {
+                return None;
+            }
+            let mut record = match candidate.record.try_lock() {
+                Ok(current) => current,
+                Err(_) => {
+                    drop(index);
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+            };
+            drop(index);
+            if record.connection_id != candidate.connection_id
+                || record.generation != candidate.generation
+                || !matches!(
+                    record.phase,
+                    SharedSessionPhase::Reserved
+                        | SharedSessionPhase::Bootstrapping
+                        | SharedSessionPhase::Ready
+                )
+            {
+                return None;
+            }
+            let old_enough = record.idle_zero_since.is_some_and(|zero_since| {
+                tokio::time::Instant::now().duration_since(zero_since) >= unoccupied_grace
+            });
+            if !old_enough || record.has_broker_occupants() {
+                record.idle_zero_since = None;
+                return None;
+            }
+
+            let force_abort = record.phase != SharedSessionPhase::Ready;
+            record.phase = SharedSessionPhase::Closing;
+            record.cleanup_complete = false;
+            record.begin_cleanup(tokio::time::Instant::now());
+            record.idle_zero_since = None;
+            if let Some(state) = record.state.clone() {
+                let mut state = state.write().await;
+                update_public_shared_phase(
+                    &mut state,
+                    candidate.generation,
+                    SharedSessionPhase::Closing,
+                );
+            }
+            let registration = SharedRegistrationState {
+                phase: SharedSessionPhase::Closing,
+                state: record.state.clone(),
+                emitter: record.emitter.clone(),
+                driver_incarnation: record.driver_incarnation.clone(),
+            };
+            let registration_tx = record.registration_tx.clone();
+            let lifecycle_tx = record.lifecycle_tx.clone();
+            let notify = record.notify.clone();
+            drop(record);
+
+            registration_tx.send_replace(registration);
+            lifecycle_tx.send_replace(SharedLifecycleState::Closing);
+            notify.notify_waiters();
+            let generation = candidate.generation;
+            return Some(SharedClosingTransition {
+                candidate,
+                events: vec![crate::acp::types::AcpEvent::SharedSessionPhaseChanged {
+                    generation,
+                    phase: SharedSessionPhase::Closing,
+                }],
+                force_abort,
+            });
+        }
+    }
+
     pub(crate) async fn begin_termination(
         &self,
         connection_id: &str,
@@ -858,7 +978,10 @@ impl SharedSessionBroker {
             };
             let removable = current.generation == candidate.generation
                 && match candidate.kind {
-                    SharedSweepCandidateKind::Ready => current.phase == SharedSessionPhase::Closing,
+                    SharedSweepCandidateKind::Ready
+                    | SharedSweepCandidateKind::AbandonedEphemeral => {
+                        current.phase == SharedSessionPhase::Closing
+                    }
                     SharedSweepCandidateKind::Failed => {
                         matches!(
                             current.phase,
@@ -889,7 +1012,10 @@ impl SharedSessionBroker {
             self.metrics.remove_active_leases(active_leases);
             self.metrics.remove_waiting(waiting_prompts, waiting_bytes);
             self.metrics.remove_live_session();
-            if candidate.kind == SharedSweepCandidateKind::Ready {
+            if matches!(
+                candidate.kind,
+                SharedSweepCandidateKind::Ready | SharedSweepCandidateKind::AbandonedEphemeral
+            ) {
                 self.metrics.record_idle_reclaimed();
             }
             return true;
@@ -4168,6 +4294,14 @@ impl SharedSessionRecord {
             _created_at_utc: request.now_utc,
             connect_count: 0,
         }
+    }
+
+    fn has_broker_occupants(&self) -> bool {
+        !self.active_leases.is_empty()
+            || self.active_turn.is_some()
+            || !self.waiting_prompts.is_empty()
+            || !self.host_owned_work.is_empty()
+            || self.interactions.has_any()
     }
 
     fn publish_registration(&self) {
