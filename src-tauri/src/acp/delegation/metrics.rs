@@ -2580,8 +2580,8 @@ mod tests {
         assert!(snap.admission_failed_by_agent.is_empty());
         assert_eq!(snap.settlement_retry_enqueued, 0);
         assert_eq!(snap.settlement_retry_exhausted, 0);
-        // Task 4: cursor_enrichment_* fields are absent from this legacy blob
-        // too, and must deserialize as zero/empty via #[serde(default)].
+        // cursor_enrichment_* fields are absent from this legacy blob too,
+        // and must deserialize as zero/empty via #[serde(default)].
         assert_eq!(snap.cursor_enrichment_scheduled, 0);
         assert_eq!(snap.cursor_enrichment_resolved, 0);
         assert!(snap.cursor_enrichment_failed.is_empty());

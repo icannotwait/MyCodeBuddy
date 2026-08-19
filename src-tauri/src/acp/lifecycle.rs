@@ -2444,10 +2444,10 @@ mod delegation_registration_tests {
         );
     }
 
-    /// The headline Task 5 wiring test: `run_broker_tool_side_effects` must
-    /// register the identity-less Cursor announcement with the broker
-    /// BEFORE calling `enricher.maybe_schedule` — otherwise the store-backed
-    /// backfill has nothing to attach to and silently no-ops (`Stale`).
+    /// `run_broker_tool_side_effects` must register the identity-less Cursor
+    /// announcement with the broker BEFORE calling `enricher.maybe_schedule`
+    /// — otherwise the store-backed backfill has nothing to attach to and
+    /// silently no-ops (`Stale`).
     #[tokio::test]
     async fn run_broker_tool_side_effects_registers_then_enriches() {
         let b = Arc::new(broker());

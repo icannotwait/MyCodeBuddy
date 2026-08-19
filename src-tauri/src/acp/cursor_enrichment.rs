@@ -505,6 +505,22 @@ mod tests {
     }
 
     #[test]
+    fn retryable_deadline_failure_uses_last_miss_class() {
+        assert_eq!(
+            retryable_deadline_failure(CursorStoreError::StoreNotFound),
+            CursorEnrichmentFailure::NotFound
+        );
+        assert_eq!(
+            retryable_deadline_failure(CursorStoreError::NoExactMatch),
+            CursorEnrichmentFailure::NoMatch
+        );
+        assert_eq!(
+            retryable_deadline_failure(CursorStoreError::StoreUnreadable),
+            CursorEnrichmentFailure::Unreadable
+        );
+    }
+
+    #[test]
     fn classify_store_tool_name_accepts_only_leaf_delegation_tools() {
         assert_eq!(
             classify_store_tool_name("mcp__codeg-mcp__delegate_to_agent"),
@@ -558,14 +574,14 @@ mod tests {
         assert_eq!(snap.cursor_enrichment_backfill.get("applied"), Some(&1));
     }
 
-    // --- Real on-disk `store.db` coordinator tests (Task 5) ---
+    // Real on-disk `store.db` coordinator tests.
     //
     // Everything above exercises `CursorStoreEnricher` against scripted
     // `CursorStoreLookup` fakes. These two instead wire the real
-    // `CursorStoreReader` (Task 2) at a throwaway temp `cursor_dir`, proving
-    // the full coordinator + reader integration handles a store file that
-    // doesn't exist yet and only appears mid-flight from a concurrent writer
-    // — exactly the ACP-vs-Cursor's-own-writer race the coordinator exists
+    // `CursorStoreReader` at a throwaway temp `cursor_dir`, proving the full
+    // coordinator + reader integration handles a store file that doesn't
+    // exist yet and only appears mid-flight from a concurrent writer —
+    // exactly the ACP-vs-Cursor's-own-writer race the coordinator exists
     // to bridge.
 
     fn temp_cursor_store_root() -> std::path::PathBuf {
@@ -673,8 +689,9 @@ mod tests {
 
     /// Sibling of the above: the writer thread doesn't land the blob until
     /// 1200 ms in — past `CURSOR_STORE_LOOKUP_DEADLINE` (1000 ms) — so the
-    /// coordinator must give up and record a `deadline` failure instead of
-    /// backfilling once the (now-existing) file would finally match.
+    /// coordinator must give up and record the last retryable class
+    /// (`not_found`) instead of backfilling once the (now-existing) file
+    /// would finally match.
     #[tokio::test]
     async fn real_store_write_after_deadline_fails_closed() {
         let metrics = Arc::new(DelegationMetrics::default());
@@ -717,7 +734,7 @@ mod tests {
             metrics
                 .snapshot()
                 .cursor_enrichment_failed
-                .get("deadline")
+                .get("not_found")
                 .copied(),
             Some(1)
         );
@@ -727,6 +744,43 @@ mod tests {
             .await
             .is_none());
         std::fs::remove_dir_all(&cursor_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn no_exact_match_until_deadline_records_no_match() {
+        let metrics = Arc::new(DelegationMetrics::default());
+        let broker = Arc::new(DelegationBroker::new(
+            Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+            Arc::new(RootDepth) as Arc<dyn ConversationDepthLookup>,
+        ));
+        broker
+            .register_identityless_tool_call("cursor-conn", "tc-miss".into())
+            .await;
+        let enricher = CursorStoreEnricher::new(
+            Arc::new(ScriptedStore {
+                inner: std::sync::Mutex::new(VecDeque::new()),
+            }),
+            Arc::new(MapSessions(std::sync::Mutex::new(
+                [("cursor-conn".into(), cursor_session())].into(),
+            ))),
+            broker,
+            metrics.clone(),
+        );
+        enricher.maybe_schedule(&mcp_tool_envelope("cursor-conn", "tc-miss", Some("{}")));
+        tokio::time::sleep(CURSOR_STORE_LOOKUP_DEADLINE + Duration::from_millis(300)).await;
+        assert_eq!(
+            metrics
+                .snapshot()
+                .cursor_enrichment_failed
+                .get("no_match")
+                .copied(),
+            Some(1)
+        );
+        assert!(metrics
+            .snapshot()
+            .cursor_enrichment_failed
+            .get("deadline")
+            .is_none());
     }
 }
 
@@ -850,8 +904,8 @@ impl CursorEnrichmentSessionLookup for ConnectionManager {
 }
 
 /// Abstracts a read-only Cursor store lookup so the coordinator can be
-/// unit-tested without touching `~/.cursor`. [`CursorStoreReader`] (Task 2)
-/// is the production implementation.
+/// unit-tested without touching `~/.cursor`. [`CursorStoreReader`] is the
+/// production implementation.
 pub trait CursorStoreLookup: Send + Sync {
     fn lookup(
         &self,
@@ -967,6 +1021,22 @@ fn terminal_store_failure(err: CursorStoreError) -> CursorEnrichmentFailure {
         CursorStoreError::NoExactMatch
         | CursorStoreError::StoreNotFound
         | CursorStoreError::StoreUnreadable => CursorEnrichmentFailure::NoMatch,
+    }
+}
+
+/// Maps the last retryable miss onto the closed failure label recorded when
+/// the lookup budget expires. A deadline with no prior attempt (queue delay
+/// consumed the whole window, or a scan itself overran before any miss)
+/// stays `Deadline`.
+fn retryable_deadline_failure(err: CursorStoreError) -> CursorEnrichmentFailure {
+    match err {
+        CursorStoreError::StoreNotFound => CursorEnrichmentFailure::NotFound,
+        CursorStoreError::NoExactMatch => CursorEnrichmentFailure::NoMatch,
+        CursorStoreError::StoreUnreadable => CursorEnrichmentFailure::Unreadable,
+        CursorStoreError::InvalidSessionId
+        | CursorStoreError::StoreAmbiguous
+        | CursorStoreError::SchemaIncompatible
+        | CursorStoreError::ConflictingRecords => CursorEnrichmentFailure::Deadline,
     }
 }
 
@@ -1157,17 +1227,16 @@ impl CursorStoreEnricher {
         self.metrics.record_cursor_enrichment_scheduled();
 
         let mut attempt: u32 = 0;
+        let mut last_retryable: Option<CursorStoreError> = None;
         loop {
             let now = Instant::now();
             if now >= deadline {
-                self.metrics
-                    .record_cursor_enrichment_failed(CursorEnrichmentFailure::Deadline);
+                self.record_deadline(last_retryable);
                 return;
             }
             let remaining = deadline.saturating_duration_since(now);
             if remaining.is_zero() {
-                self.metrics
-                    .record_cursor_enrichment_failed(CursorEnrichmentFailure::Deadline);
+                self.record_deadline(last_retryable);
                 return;
             }
 
@@ -1176,8 +1245,7 @@ impl CursorStoreEnricher {
                 {
                     Ok(Ok(permit)) => permit,
                     _ => {
-                        self.metrics
-                            .record_cursor_enrichment_failed(CursorEnrichmentFailure::Deadline);
+                        self.record_deadline(last_retryable);
                         return;
                     }
                 };
@@ -1185,8 +1253,7 @@ impl CursorStoreEnricher {
             let remaining_before_scan = deadline.saturating_duration_since(Instant::now());
             if remaining_before_scan.is_zero() {
                 drop(permit);
-                self.metrics
-                    .record_cursor_enrichment_failed(CursorEnrichmentFailure::Deadline);
+                self.record_deadline(last_retryable);
                 return;
             }
 
@@ -1200,8 +1267,7 @@ impl CursorStoreEnricher {
             .await;
 
             if Instant::now() >= deadline {
-                self.metrics
-                    .record_cursor_enrichment_failed(CursorEnrichmentFailure::Deadline);
+                self.record_deadline(last_retryable);
                 return;
             }
 
@@ -1248,6 +1314,7 @@ impl CursorStoreEnricher {
                     return;
                 }
                 Err(err) if is_retryable_store_error(err) => {
+                    last_retryable = Some(err);
                     tracing::trace!(
                         target: "cursor_enrichment",
                         agent_type = agent_type_label(session.agent_type),
@@ -1260,8 +1327,7 @@ impl CursorStoreEnricher {
                     );
                     let remaining_after = deadline.saturating_duration_since(Instant::now());
                     if remaining_after.is_zero() {
-                        self.metrics
-                            .record_cursor_enrichment_failed(CursorEnrichmentFailure::Deadline);
+                        self.record_deadline(last_retryable);
                         return;
                     }
                     let backoff = backoff_for_attempt(attempt, remaining_after);
@@ -1283,6 +1349,13 @@ impl CursorStoreEnricher {
                 }
             }
         }
+    }
+
+    fn record_deadline(&self, last_retryable: Option<CursorStoreError>) {
+        let failure = last_retryable
+            .map(retryable_deadline_failure)
+            .unwrap_or(CursorEnrichmentFailure::Deadline);
+        self.metrics.record_cursor_enrichment_failed(failure);
     }
 
     /// One WARN line per [`CURSOR_STORE_TERMINAL_WARN_WINDOW`] for terminal
