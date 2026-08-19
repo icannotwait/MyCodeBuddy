@@ -166,6 +166,7 @@ impl GrokAutonomousAdapter {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn new_for_test(updates_jsonl_path: PathBuf) -> Self {
         let mut adapter = Self::new();
         adapter.updates_path = Some(updates_jsonl_path);
@@ -270,19 +271,18 @@ impl GrokAutonomousAdapter {
                     GrokDispatchClaim::Unclaimed
                 }
             }
+            "turn_completed" if ownership == Ownership::Idle && self.episode.is_active() => {
+                self.last_idle_was_task_completed = false;
+                self.last_visible_is_user = false;
+                self.close_wire_episode();
+                self.tail_once();
+                GrokDispatchClaim::IdleTerminal
+            }
             "turn_completed" => {
-                if ownership == Ownership::Idle && self.episode.is_active() {
+                if ownership == Ownership::Idle {
                     self.last_idle_was_task_completed = false;
-                    self.last_visible_is_user = false;
-                    self.close_wire_episode();
-                    self.tail_once();
-                    GrokDispatchClaim::IdleTerminal
-                } else {
-                    if ownership == Ownership::Idle {
-                        self.last_idle_was_task_completed = false;
-                    }
-                    GrokDispatchClaim::Unclaimed
                 }
+                GrokDispatchClaim::Unclaimed
             }
             _ => {
                 if ownership == Ownership::Idle {

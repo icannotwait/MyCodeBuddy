@@ -350,8 +350,8 @@ pub(crate) fn codex_complete_records(bytes: &[u8]) -> impl Iterator<Item = (u64,
 }
 
 pub(crate) fn codex_record_payload(record: &[u8]) -> &[u8] {
-    let without_nl = record.strip_suffix(&[b'\n']).unwrap_or(record);
-    without_nl.strip_suffix(&[b'\r']).unwrap_or(without_nl)
+    let without_nl = record.strip_suffix(b"\n").unwrap_or(record);
+    without_nl.strip_suffix(b"\r").unwrap_or(without_nl)
 }
 
 /// Canonical id for a proven Codex Goal continuation.
@@ -360,6 +360,7 @@ pub(crate) fn codex_goal_turn_id(turn_id: &str) -> String {
 }
 
 /// Parse one rollout file with the same classification as cold detail.
+#[cfg(test)]
 pub(crate) fn parse_codex_rollout(
     path: impl AsRef<std::path::Path>,
     conversation_id: &str,
@@ -5403,7 +5404,7 @@ mod tests {
         let _ = fs::remove_file(&missing);
 
         assert_eq!(
-            super::rollout_session_id(&env::temp_dir().join("codeg-codex-no-such-file.jsonl")),
+            super::rollout_session_id(env::temp_dir().join("codeg-codex-no-such-file.jsonl")),
             None
         );
     }

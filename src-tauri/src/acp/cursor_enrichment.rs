@@ -460,10 +460,9 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(30)).await;
         let snap = metrics.snapshot();
         assert_eq!(snap.cursor_enrichment_scheduled, 0);
-        assert!(snap
+        assert!(!snap
             .cursor_enrichment_failed
-            .get("invalid_session")
-            .is_none());
+            .contains_key("invalid_session"));
         assert!(!store.called.load(Ordering::SeqCst));
     }
 
@@ -776,11 +775,10 @@ mod tests {
                 .copied(),
             Some(1)
         );
-        assert!(metrics
+        assert!(!metrics
             .snapshot()
             .cursor_enrichment_failed
-            .get("deadline")
-            .is_none());
+            .contains_key("deadline"));
     }
 }
 

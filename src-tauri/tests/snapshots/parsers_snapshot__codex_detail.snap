@@ -42,5 +42,6 @@ expression: detail
       "model": "gpt-5.1-codex",
       "completed_at": "[ts]"
     }
-  ]
+  ],
+  "transcript_watermark": 471
 }

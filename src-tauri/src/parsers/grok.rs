@@ -371,6 +371,7 @@ pub(crate) fn grok_updates_jsonl_path(session_id: &str) -> Option<PathBuf> {
 
 /// Assemble turns from complete `updates.jsonl` bytes with the same
 /// normalization as cold parse. Returns `(turns, consumed_complete_bytes)`.
+#[cfg(test)]
 pub(crate) fn grok_turns_from_bytes(bytes: &[u8], session_id: &str) -> (Vec<MessageTurn>, u64) {
     let parsed = parse_updates_from_bytes(bytes, session_id);
     (parsed.turns, parsed.consumed_complete_bytes)
@@ -603,8 +604,8 @@ pub(crate) fn grok_complete_records(bytes: &[u8]) -> impl Iterator<Item = (u64, 
 }
 
 pub(crate) fn grok_record_payload(record: &[u8]) -> &[u8] {
-    let without_nl = record.strip_suffix(&[b'\n']).unwrap_or(record);
-    without_nl.strip_suffix(&[b'\r']).unwrap_or(without_nl)
+    let without_nl = record.strip_suffix(b"\n").unwrap_or(record);
+    without_nl.strip_suffix(b"\r").unwrap_or(without_nl)
 }
 
 pub(crate) fn is_grok_background_task_reminder(text: &str) -> bool {

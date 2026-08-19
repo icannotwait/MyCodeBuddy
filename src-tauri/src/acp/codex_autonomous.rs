@@ -242,6 +242,7 @@ impl CodexAutonomousAdapter {
     }
 
     /// ACP `session/load` replay is bootstrap display data only.
+    #[cfg(test)]
     pub(crate) fn on_session_load_replay(&mut self, _items: &Value) {}
 
     pub(crate) fn on_disconnect(&mut self) {
@@ -416,6 +417,7 @@ impl CodexAutonomousAdapter {
         self.autonomous_busy()
     }
 
+    #[cfg(test)]
     pub(crate) fn is_unsupported(&self) -> bool {
         matches!(self.authority, Authority::Unsupported)
     }
@@ -838,14 +840,13 @@ fn find_goal_native_turn_id(
                         pending = payload.and_then(record_turn_id);
                         goal_owned = false;
                     }
-                    "user_message" => {
+                    "user_message"
                         if payload
                             .and_then(|p| p.get("message"))
                             .and_then(Value::as_str)
-                            .is_some_and(is_codex_goal_internal_context_message)
-                        {
-                            goal_owned = true;
-                        }
+                            .is_some_and(is_codex_goal_internal_context_message) =>
+                    {
+                        goal_owned = true;
                     }
                     _ => {}
                 }

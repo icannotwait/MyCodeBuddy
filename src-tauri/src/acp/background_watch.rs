@@ -50,9 +50,12 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::RwLock;
 
-use crate::acp::autonomous_activity::{AutonomousActivityPolicy, AutonomousCapabilities};
+use crate::acp::autonomous_activity::AutonomousActivityPolicy;
+#[cfg(test)]
+use crate::acp::autonomous_activity::AutonomousCapabilities;
 use crate::acp::session_state::{background_keepalive_max_age, SessionState};
 use crate::acp::types::{AcpEvent, BackgroundSettledInfo, ConnectionStatus};
+#[cfg(test)]
 use crate::models::agent::AgentType;
 use crate::models::message::{AutonomousTurnOrigin, MessageTurn};
 use crate::parsers::claude::{
@@ -223,6 +226,7 @@ pub(crate) fn spawn_for_policy(
 /// Thin wrapper so existing tests that name `spawn_if_claude` keep compiling.
 /// Maps `agent_type` through [`AutonomousActivityPolicy::for_connection`] with
 /// default capabilities.
+#[cfg(test)]
 pub(crate) fn spawn_if_claude(
     conn_id: &str,
     agent_type: AgentType,
