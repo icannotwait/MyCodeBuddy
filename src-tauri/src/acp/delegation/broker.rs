@@ -3408,6 +3408,14 @@ pub enum ExactClaimResult {
     Cancelled,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentitylessBackfillResult {
+    Applied,
+    Same,
+    Conflict,
+    Stale,
+}
+
 /// One captured parent-side `delegate_to_agent` / `continue_delegation`
 /// tool_call awaiting its matching MCP round-trip.
 struct PendingToolCall {
@@ -4949,6 +4957,39 @@ impl DelegationBroker {
             Instant::now(),
         )
         .await;
+    }
+
+    pub async fn backfill_identityless_match_key(
+        &self,
+        parent_connection_id: &str,
+        tool_call_id: &str,
+        recovered_key: DelegationMatchKey,
+    ) -> IdentitylessBackfillResult {
+        let mut map = self.tool_calls.inner.lock().await;
+        let Some(bucket) = map.get_mut(parent_connection_id) else {
+            return IdentitylessBackfillResult::Stale;
+        };
+        let Some(existing) = bucket
+            .pending
+            .iter_mut()
+            .find(|p| p.tool_call_id == tool_call_id)
+        else {
+            return IdentitylessBackfillResult::Stale;
+        };
+        if !existing.identityless {
+            return IdentitylessBackfillResult::Stale;
+        }
+        match &existing.match_key {
+            None => {
+                existing.match_key = Some(recovered_key);
+                IdentitylessBackfillResult::Applied
+            }
+            Some(current) if current == &recovered_key => IdentitylessBackfillResult::Same,
+            Some(_) => {
+                existing.key_conflicted = true;
+                IdentitylessBackfillResult::Conflict
+            }
+        }
     }
 
     /// `register_pending_tool_call` that also records the
@@ -21351,6 +21392,320 @@ mod tests {
             target_task_id: target_task_id.to_string(),
             task: task.to_string(),
         }
+    }
+
+    #[tokio::test]
+    async fn backfill_sets_key_on_identityless_pending_id() {
+        let broker = DelegationBroker::new(
+            Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        );
+        let id = "call-cursor-1\nfc_abc_0";
+        let key = key_with_corr("c-a", "task A");
+        broker
+            .register_identityless_tool_call("p1", id.into())
+            .await;
+        assert_eq!(
+            broker
+                .backfill_identityless_match_key("p1", id, key.clone())
+                .await,
+            IdentitylessBackfillResult::Applied
+        );
+        assert_eq!(
+            broker.take_matching_tool_call("p1", &key).await.as_deref(),
+            Some(id)
+        );
+    }
+
+    #[tokio::test]
+    async fn backfill_same_key_is_idempotent() {
+        let broker = DelegationBroker::new(
+            Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        );
+        let key = key_with_corr("c-a", "task A");
+        broker
+            .register_identityless_tool_call("p1", "tc-a".into())
+            .await;
+        assert_eq!(
+            broker
+                .backfill_identityless_match_key("p1", "tc-a", key.clone())
+                .await,
+            IdentitylessBackfillResult::Applied
+        );
+        assert_eq!(
+            broker
+                .backfill_identityless_match_key("p1", "tc-a", key.clone())
+                .await,
+            IdentitylessBackfillResult::Same
+        );
+        assert_eq!(
+            broker.take_matching_tool_call("p1", &key).await.as_deref(),
+            Some("tc-a")
+        );
+    }
+
+    #[tokio::test]
+    async fn backfill_conflicting_key_freezes_first_and_fails_closed() {
+        let broker = DelegationBroker::new(
+            Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        );
+        let k1 = key_with_corr("c1", "task A");
+        let k2 = key_with_corr("c2", "task A");
+        broker
+            .register_identityless_tool_call("p1", "tc-a".into())
+            .await;
+        assert_eq!(
+            broker
+                .backfill_identityless_match_key("p1", "tc-a", k1.clone())
+                .await,
+            IdentitylessBackfillResult::Applied
+        );
+        assert_eq!(
+            broker
+                .backfill_identityless_match_key("p1", "tc-a", k2.clone())
+                .await,
+            IdentitylessBackfillResult::Conflict
+        );
+        assert!(broker.take_matching_tool_call("p1", &k1).await.is_none());
+        assert!(broker.take_matching_tool_call("p1", &k2).await.is_none());
+        let map = broker.tool_calls.inner.lock().await;
+        let pending = &map.get("p1").unwrap().pending[0];
+        assert!(pending.key_conflicted);
+        assert_eq!(pending.match_key.as_ref(), Some(&k1));
+        assert!(pending.identityless);
+    }
+
+    #[tokio::test]
+    async fn backfill_rejects_non_identityless_and_other_parent() {
+        let broker = DelegationBroker::new(
+            Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        );
+        let host_key = key_with_corr("host", "wired");
+        let recovered = key_with_corr("store", "wired");
+        broker
+            .register_pending_tool_call_with_key("p1", "tc-host".into(), Some(host_key.clone()))
+            .await;
+        broker
+            .register_identityless_tool_call("p1", "tc-cursor".into())
+            .await;
+        assert_eq!(
+            broker
+                .backfill_identityless_match_key("p1", "tc-host", recovered.clone())
+                .await,
+            IdentitylessBackfillResult::Stale
+        );
+        assert_eq!(
+            broker
+                .backfill_identityless_match_key("p2", "tc-cursor", recovered.clone())
+                .await,
+            IdentitylessBackfillResult::Stale
+        );
+        assert_eq!(
+            broker
+                .take_matching_tool_call("p1", &host_key)
+                .await
+                .as_deref(),
+            Some("tc-host")
+        );
+        assert!(broker
+            .take_matching_tool_call("p1", &recovered)
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn backfill_does_not_resurrect_tombstoned_or_claimed_or_dropped_entries() {
+        let broker = DelegationBroker::new(
+            Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        );
+        let key = key_with_corr("c-a", "task A");
+        broker
+            .register_identityless_tool_call("p1", "tc-dead".into())
+            .await;
+        assert!(broker.tombstone_pending_tool_call("p1", "tc-dead").await);
+        assert_eq!(
+            broker
+                .backfill_identityless_match_key("p1", "tc-dead", key.clone())
+                .await,
+            IdentitylessBackfillResult::Stale
+        );
+        assert!(broker.take_matching_tool_call("p1", &key).await.is_none());
+
+        broker
+            .register_identityless_tool_call("p1", "tc-claimed".into())
+            .await;
+        assert_eq!(
+            broker
+                .backfill_identityless_match_key("p1", "tc-claimed", key.clone())
+                .await,
+            IdentitylessBackfillResult::Applied
+        );
+        assert_eq!(
+            broker.take_matching_tool_call("p1", &key).await.as_deref(),
+            Some("tc-claimed")
+        );
+        assert_eq!(
+            broker
+                .backfill_identityless_match_key("p1", "tc-claimed", key.clone())
+                .await,
+            IdentitylessBackfillResult::Stale
+        );
+
+        broker
+            .register_identityless_tool_call("p1", "tc-drop".into())
+            .await;
+        broker.drop_pending_tool_calls_for_parent("p1").await;
+        assert_eq!(
+            broker
+                .backfill_identityless_match_key("p1", "tc-drop", key.clone())
+                .await,
+            IdentitylessBackfillResult::Stale
+        );
+        assert!(broker.take_matching_tool_call("p1", &key).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn backfill_and_tombstone_have_one_safe_winner() {
+        let broker = Arc::new(DelegationBroker::new(
+            Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        ));
+        let key = key_with_corr("c-a", "task A");
+        broker
+            .register_identityless_tool_call("p1", "tc-race".into())
+            .await;
+        let b1 = broker.clone();
+        let k1 = key.clone();
+        let backfill = tokio::spawn(async move {
+            b1.backfill_identityless_match_key("p1", "tc-race", k1)
+                .await
+        });
+        let b2 = broker.clone();
+        let tombstone =
+            tokio::spawn(async move { b2.tombstone_pending_tool_call("p1", "tc-race").await });
+        let (backfill, tombstoned) = tokio::join!(backfill, tombstone);
+        let backfill = backfill.unwrap();
+        let tombstoned = tombstoned.unwrap();
+        match (backfill, tombstoned) {
+            (IdentitylessBackfillResult::Applied | IdentitylessBackfillResult::Same, true)
+            | (IdentitylessBackfillResult::Stale, true)
+            | (IdentitylessBackfillResult::Applied | IdentitylessBackfillResult::Same, false) => {}
+            other => panic!("unsafe backfill/tombstone pair: {other:?}"),
+        }
+        if tombstoned {
+            assert_eq!(
+                broker
+                    .backfill_identityless_match_key("p1", "tc-race", key.clone())
+                    .await,
+                IdentitylessBackfillResult::Stale
+            );
+        }
+        // Either the id is gone or it is the frozen recovered key. Never a new id.
+        let map = broker.tool_calls.inner.lock().await;
+        if let Some(bucket) = map.get("p1") {
+            assert!(bucket
+                .pending
+                .iter()
+                .all(|p| p.tool_call_id != "tc-race" || p.match_key.as_ref() == Some(&key)));
+        }
+    }
+
+    #[tokio::test]
+    async fn backfill_continue_key_is_claimable_by_exact_resolver() {
+        let broker = DelegationBroker::new(
+            Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        );
+        let key = continue_key("cont-1", "run-42", "review");
+        broker
+            .register_identityless_tool_call("p1", "tc-cont".into())
+            .await;
+        assert_eq!(
+            broker
+                .backfill_identityless_match_key("p1", "tc-cont", key.clone())
+                .await,
+            IdentitylessBackfillResult::Applied
+        );
+        assert_eq!(
+            broker.resolve_exact_claim("p1", &key, None, None).await,
+            ExactClaimResult::Matched("tc-cont".into())
+        );
+    }
+
+    /// Two identity-less Cursor announcements each get their own store-backed
+    /// key backfilled — with the store completions landing in the OPPOSITE
+    /// order from registration (B before A), and the MCP round-trip claims
+    /// also arriving reversed relative to each other. Every id must still
+    /// bind to its own key: no FIFO fallback, no cross-wired card.
+    #[tokio::test]
+    async fn two_cursor_keys_bind_own_ids_when_backfill_and_claim_reverse() {
+        let broker = DelegationBroker::new(
+            Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        );
+        let ka = key_with_corr("ka", "task A");
+        let kb = key_with_corr("kb", "task B");
+        broker
+            .register_identityless_tool_call("p1", "id-A".into())
+            .await;
+        broker
+            .register_identityless_tool_call("p1", "id-B".into())
+            .await;
+        // Store completion reversed: B then A.
+        assert_eq!(
+            broker
+                .backfill_identityless_match_key("p1", "id-B", kb.clone())
+                .await,
+            IdentitylessBackfillResult::Applied
+        );
+        assert_eq!(
+            broker
+                .backfill_identityless_match_key("p1", "id-A", ka.clone())
+                .await,
+            IdentitylessBackfillResult::Applied
+        );
+        // MCP arrival reversed relative to ACP: claim A then B or B then A — same bindings.
+        let claim_b = broker.resolve_exact_claim("p1", &kb, None, None).await;
+        let claim_a = broker.resolve_exact_claim("p1", &ka, None, None).await;
+        assert_eq!(claim_b, ExactClaimResult::Matched("id-B".into()));
+        assert_eq!(claim_a, ExactClaimResult::Matched("id-A".into()));
+    }
+
+    /// Two identity-less ids that both get backfilled to the SAME recovered
+    /// key (a genuine ambiguous case — the store gave two Cursor
+    /// announcements identical delegation args) must stay `Ambiguous` and
+    /// leave BOTH cards in `pending` rather than guessing a winner.
+    #[tokio::test]
+    async fn identical_backfilled_keys_stay_ambiguous() {
+        let broker = DelegationBroker::new(
+            Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+        );
+        let k = key_with_corr("same", "same task");
+        broker
+            .register_identityless_tool_call("p1", "id-A".into())
+            .await;
+        broker
+            .register_identityless_tool_call("p1", "id-B".into())
+            .await;
+        broker
+            .backfill_identityless_match_key("p1", "id-A", k.clone())
+            .await;
+        broker
+            .backfill_identityless_match_key("p1", "id-B", k.clone())
+            .await;
+        assert_eq!(
+            broker.resolve_exact_claim("p1", &k, None, None).await,
+            ExactClaimResult::Ambiguous
+        );
+        let map = broker.tool_calls.inner.lock().await;
+        let pending = &map.get("p1").unwrap().pending;
+        assert_eq!(pending.len(), 2, "Ambiguous must not consume either card");
+        assert!(pending.iter().all(|p| p.match_key.as_ref() == Some(&k)));
     }
 
     #[tokio::test]

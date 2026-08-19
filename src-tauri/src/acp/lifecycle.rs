@@ -18,6 +18,7 @@ use std::time::Duration;
 use sea_orm::{DatabaseConnection, EntityTrait, TransactionTrait};
 use tokio::sync::{broadcast, mpsc};
 
+use crate::acp::cursor_enrichment::CursorStoreEnricher;
 use crate::acp::delegation::broker::{DelegationBroker, DelegationMatchKey};
 use crate::acp::delegation::types::{
     validate_correlation_id, DelegationError, DelegationOutcome, DelegationSuccess,
@@ -1197,8 +1198,9 @@ fn is_delegation_invocation(title: &str, raw_input: Option<&str>) -> bool {
 }
 
 /// Build the broker's typed [`DelegationMatchKey`] from a delegation
-/// tool_call's `raw_input` JSON. Fields are values the LLM passed identically
-/// to the ACP tool call and the MCP `tools/call`, including `correlation_id`.
+/// tool_call's already-parsed args/`raw_input` JSON. Fields are values the
+/// LLM passed identically to the ACP tool call and the MCP `tools/call`,
+/// including `correlation_id`.
 ///
 /// Variant selection is structural (design discriminator):
 /// - presence of `task_id` → [`DelegationMatchKey::Continue`]
@@ -1206,20 +1208,15 @@ fn is_delegation_invocation(title: &str, raw_input: Option<&str>) -> bool {
 ///
 /// There is no fake agent and no `"continue:{id}:{task}"` sentinel. Continue
 /// ignores extraneous `working_dir`. The args are located via
-/// [`find_delegation_args`], so hosts that wrap or double-encode `raw_input`
+/// [`find_delegation_args`], so hosts that wrap or double-encode the value
 /// are keyed identically to hosts that send the fields at the top level.
-/// Returns `None` when `raw_input` is absent, not JSON, has no locatable
-/// complete key (missing/invalid `correlation_id`, missing task, etc.) — the
-/// broker then treats the entry as unkeyed until a later complete backfill.
-fn extract_delegation_match_key(raw_input: Option<&str>) -> Option<DelegationMatchKey> {
-    let raw = raw_input?;
-    let parsed: serde_json::Value = serde_json::from_str(raw).ok()?;
-    let args = find_delegation_args(&parsed, 0)?;
-    // Match MCP listener: reject blank/whitespace-only `task` for both
-    // Continue and Delegate, but store the original nonblank bytes (listener
-    // gates with `!s.trim().is_empty()` then keeps `s.to_string()` untrimmed).
-    // Admitting `""` / `"   "` as a complete key freezes K_blank and conflict-
-    // tombstones a later valid re-emit, so the real MCP call can never bind.
+/// Returns `None` when there is no locatable complete key (missing/invalid
+/// `correlation_id`, missing task, etc.) — the broker then treats the entry
+/// as unkeyed until a later complete backfill.
+pub(crate) fn extract_delegation_match_key_from_value(
+    value: &serde_json::Value,
+) -> Option<DelegationMatchKey> {
+    let args = find_delegation_args(value, 0)?;
     let task = args.get("task").and_then(|v| v.as_str())?;
     if task.trim().is_empty() {
         return None;
@@ -1229,9 +1226,6 @@ fn extract_delegation_match_key(raw_input: Option<&str>) -> Option<DelegationMat
     validate_correlation_id(correlation_id).ok()?;
     let correlation_id = correlation_id.to_string();
 
-    // Continue first: `task_id` discriminates continue_delegation.
-    // Normalize like the MCP listener (`s.trim()`) so ACP/MCP exact-match
-    // keys agree for accepted inputs such as `"task_id":" run-42 "`.
     if let Some(raw_task_id) = args.get("task_id").and_then(|v| v.as_str()) {
         let target_task_id = raw_task_id.trim();
         if target_task_id.is_empty() {
@@ -1244,8 +1238,6 @@ fn extract_delegation_match_key(raw_input: Option<&str>) -> Option<DelegationMat
         });
     }
 
-    // Delegate: parse `agent_type` through the same serde path the MCP listener
-    // uses so the stored enum equals `DelegationRequest::agent_type`.
     let at = args.get("agent_type")?;
     let agent_type: AgentType = serde_json::from_value(at.clone()).ok()?;
     let working_dir = args
@@ -1258,6 +1250,16 @@ fn extract_delegation_match_key(raw_input: Option<&str>) -> Option<DelegationMat
         task,
         working_dir,
     })
+}
+
+/// String-wrapper front end for [`extract_delegation_match_key_from_value`]:
+/// parses `raw_input` as JSON and delegates. Returns `None` when `raw_input`
+/// is absent or not valid JSON, in addition to every `None` case the value
+/// helper documents.
+fn extract_delegation_match_key(raw_input: Option<&str>) -> Option<DelegationMatchKey> {
+    let raw = raw_input?;
+    let parsed: serde_json::Value = serde_json::from_str(raw).ok()?;
+    extract_delegation_match_key_from_value(&parsed)
 }
 
 /// True when an ACP `ToolCallUpdate.status` string is terminal for delegation
@@ -1432,7 +1434,10 @@ async fn register_delegation_tool_call_from_event(
 
 #[cfg(test)]
 mod delegation_title_tests {
-    use super::{extract_delegation_match_key, is_delegation_invocation};
+    use super::{
+        extract_delegation_match_key, extract_delegation_match_key_from_value,
+        is_delegation_invocation,
+    };
     use crate::acp::delegation::broker::DelegationMatchKey;
     use crate::models::AgentType;
 
@@ -1833,6 +1838,58 @@ mod delegation_title_tests {
     }
 
     #[test]
+    fn value_helper_matches_string_helper_for_wrapped_delegate_args() {
+        let raw = r#"{"providerIdentifier":"codeg-mcp","toolName":"delegate_to_agent","args":{"agent_type":"codex","task":"build it","correlation_id":"test-corr"}}"#;
+        let value: serde_json::Value = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            extract_delegation_match_key(Some(raw)),
+            extract_delegation_match_key_from_value(&value)
+        );
+        assert_eq!(
+            extract_delegation_match_key_from_value(&value),
+            Some(DelegationMatchKey::Delegate {
+                correlation_id: "test-corr".into(),
+                agent_type: AgentType::Codex,
+                task: "build it".into(),
+                working_dir: None,
+            })
+        );
+    }
+
+    #[test]
+    fn value_helper_accepts_inner_args_object_without_reserializing() {
+        let args = serde_json::json!({
+            "task_id": " run-42 ",
+            "task": "review the revision",
+            "correlation_id": "cont-1"
+        });
+        assert_eq!(
+            extract_delegation_match_key_from_value(&args),
+            Some(DelegationMatchKey::Continue {
+                correlation_id: "cont-1".into(),
+                target_task_id: "run-42".into(),
+                task: "review the revision".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn value_helper_rejects_blank_task_and_invalid_correlation_id() {
+        assert!(extract_delegation_match_key_from_value(&serde_json::json!({
+            "agent_type": "codex",
+            "task": "   ",
+            "correlation_id": "corr-1"
+        }))
+        .is_none());
+        assert!(extract_delegation_match_key_from_value(&serde_json::json!({
+            "agent_type": "codex",
+            "task": "ok",
+            "correlation_id": ".bad"
+        }))
+        .is_none());
+    }
+
+    #[test]
     fn matches_via_raw_input_shape_when_title_is_unrecognized() {
         let raw = r#"{"agent_type":"codex","task":"smoke test"}"#;
         assert!(is_delegation_invocation("Delegate to codex", Some(raw)));
@@ -1886,16 +1943,41 @@ mod delegation_registration_tests {
     //! synthetic id before the move: args arriving on a `ToolCallUpdate`, and
     //! a key backfilled by a later update.
 
-    use super::register_delegation_tool_call_from_event;
+    use super::{
+        acquire_test_cursor_enricher_span, enricher_for_lifecycle, install_test_cursor_enricher,
+        register_delegation_tool_call_from_event, run_broker_tool_side_effects,
+    };
+    use crate::acp::cursor_enrichment::test_support::{FixedStore, MapSessions, SleepThenStore};
+    use crate::acp::cursor_enrichment::{CursorEnrichmentSession, CursorStoreEnricher};
+    use crate::acp::cursor_store::CursorStoredToolCall;
     use crate::acp::delegation::broker::{
         ConversationDepthLookup, DelegationBroker, DelegationMatchKey,
     };
     use crate::acp::delegation::spawner::{mock::MockSpawner, ConnectionSpawner};
     use crate::acp::delegation::types::DelegationError;
+    use crate::acp::internal_bus::InternalEventEnvelope;
+    use crate::acp::manager::ConnectionManager;
     use crate::acp::types::{AcpEvent, EventEnvelope};
     use crate::models::AgentType;
     use async_trait::async_trait;
     use std::sync::Arc;
+    use std::time::Duration;
+
+    /// RAII guard that clears the test-only `TEST_CURSOR_ENRICHER` seam on
+    /// drop — including on early return or panic via `?`/`assert!` — so an
+    /// installed enricher from one test can never leak into a
+    /// concurrently-running test under the default multi-thread `cargo
+    /// test` runner. Construct AFTER `install_test_cursor_enricher(Some(..))`
+    /// and hold it for the rest of the test, declared AFTER (so it drops
+    /// BEFORE) a held `acquire_test_cursor_enricher_span()` guard: the reset
+    /// to `None` must happen while the serialization span is still held.
+    struct ResetTestCursorEnricherOnDrop;
+
+    impl Drop for ResetTestCursorEnricherOnDrop {
+        fn drop(&mut self) {
+            install_test_cursor_enricher(None);
+        }
+    }
 
     struct RootDepth;
     #[async_trait]
@@ -2361,6 +2443,218 @@ mod delegation_registration_tests {
             "args-wrapped delegation input must produce a keyed entry"
         );
     }
+
+    /// `run_broker_tool_side_effects` must register the identity-less Cursor
+    /// announcement with the broker BEFORE calling `enricher.maybe_schedule`
+    /// — otherwise the store-backed backfill has nothing to attach to and
+    /// silently no-ops (`Stale`).
+    #[tokio::test]
+    async fn run_broker_tool_side_effects_registers_then_enriches() {
+        let b = Arc::new(broker());
+        let id = "call-cursor-1\nfc_abc_0";
+        let env = tool_call_event(id, "MCP: tool", Some("{}"));
+        let store = Arc::new(FixedStore(CursorStoredToolCall {
+            tool_name: "mcp__codeg-mcp__delegate_to_agent".into(),
+            args: serde_json::json!({
+                "agent_type": "codex",
+                "task": "build it",
+                "correlation_id": "test-corr"
+            }),
+        }));
+        let sessions = Arc::new(MapSessions(std::sync::Mutex::new(
+            [(
+                "parent-conn".into(),
+                CursorEnrichmentSession {
+                    agent_type: AgentType::Cursor,
+                    external_session_id: "0198c9aa-1111-2222-3333-444455556666".into(),
+                },
+            )]
+            .into(),
+        )));
+        let enricher = CursorStoreEnricher::new(store, sessions, b.clone(), b.metrics());
+        let internal = InternalEventEnvelope {
+            event: Arc::new(env),
+            completion: None,
+        };
+        run_broker_tool_side_effects(b.as_ref(), &internal, Some(&enricher)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(b.metrics().snapshot().cursor_enrichment_scheduled, 1);
+        assert_eq!(
+            b.take_matching_tool_call("parent-conn", &codex_key("build it"))
+                .await
+                .as_deref(),
+            Some(id)
+        );
+    }
+
+    /// A terminal `ToolCallUpdate` that lands WHILE the store lookup is
+    /// still in flight must tombstone the entry, and the eventual (late)
+    /// store resolution must NOT resurrect it — the tombstone is the
+    /// permanent winner, never the late backfill.
+    #[tokio::test]
+    async fn terminal_event_during_lookup_prevents_late_backfill() {
+        let b = Arc::new(broker());
+        let id = "tc-term";
+        let env = tool_call_event(id, "MCP: tool", Some("{}"));
+        let store = Arc::new(SleepThenStore {
+            delay: Duration::from_millis(200),
+            result: Ok(CursorStoredToolCall {
+                tool_name: "delegate_to_agent".into(),
+                args: serde_json::json!({
+                    "agent_type": "codex",
+                    "task": "build it",
+                    "correlation_id": "test-corr"
+                }),
+            }),
+        });
+        let enricher = CursorStoreEnricher::new(
+            store,
+            Arc::new(MapSessions(std::sync::Mutex::new(
+                [(
+                    "parent-conn".into(),
+                    CursorEnrichmentSession {
+                        agent_type: AgentType::Cursor,
+                        external_session_id: "0198c9aa-1111-2222-3333-444455556666".into(),
+                    },
+                )]
+                .into(),
+            ))),
+            b.clone(),
+            b.metrics(),
+        );
+        let internal = InternalEventEnvelope {
+            event: Arc::new(env),
+            completion: None,
+        };
+        run_broker_tool_side_effects(b.as_ref(), &internal, Some(&enricher)).await;
+        register_delegation_tool_call_from_event(
+            &b,
+            &tool_call_update_event_with_status(id, Some("completed"), None),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            b.take_matching_tool_call("parent-conn", &codex_key("build it"))
+                .await
+                .is_none(),
+            "tombstone must win over late store backfill"
+        );
+    }
+
+    /// Exercises the actual injection seam `lifecycle_subscriber_task` uses
+    /// in production — `install_test_cursor_enricher` +
+    /// `enricher_for_lifecycle` — rather than bypassing it (the two tests
+    /// above hand-build a `CursorStoreEnricher` and pass it to
+    /// `run_broker_tool_side_effects` directly). This pins:
+    /// 1. `enricher_for_lifecycle` under `#[cfg(test)]` returns exactly the
+    ///    `Arc` last installed (`Arc::ptr_eq`), not a fresh clone-of-value.
+    /// 2. The `broker.as_ref().and_then(|b| enricher_for_lifecycle(b.as_ref(), &manager))`
+    ///    composition `lifecycle_subscriber_task` runs to obtain the
+    ///    worker's `enricher` — reproduced verbatim here — yields `Some`
+    ///    for a `Some(broker)` input when a test enricher is installed.
+    /// 3. The per-worker `Option<Arc<CursorStoreEnricher>>` →
+    ///    `.as_deref()` conversion `lifecycle_subscriber_task` performs
+    ///    before calling `run_broker_tool_side_effects` still drives a real
+    ///    schedule + backfill end to end.
+    ///
+    /// Without this test, `install_test_cursor_enricher` had zero callers
+    /// anywhere in the crate — permanent dead code, and the seam itself
+    /// unverified by CI.
+    #[tokio::test]
+    async fn installed_test_enricher_flows_through_lifecycle_composition_into_hook() {
+        let b = Arc::new(broker());
+        let id = "call-cursor-1\nfc_abc_0";
+        let env = tool_call_event(id, "MCP: tool", Some("{}"));
+        let store = Arc::new(FixedStore(CursorStoredToolCall {
+            tool_name: "mcp__codeg-mcp__delegate_to_agent".into(),
+            args: serde_json::json!({
+                "agent_type": "codex",
+                "task": "build it",
+                "correlation_id": "test-corr"
+            }),
+        }));
+        let sessions = Arc::new(MapSessions(std::sync::Mutex::new(
+            [(
+                "parent-conn".into(),
+                CursorEnrichmentSession {
+                    agent_type: AgentType::Cursor,
+                    external_session_id: "0198c9aa-1111-2222-3333-444455556666".into(),
+                },
+            )]
+            .into(),
+        )));
+        let installed = Arc::new(CursorStoreEnricher::new(
+            store,
+            sessions,
+            b.clone(),
+            b.metrics(),
+        ));
+        // Acquire the span BEFORE installing and hold it for the whole test
+        // (declared first so it drops LAST, after `_reset`) so no
+        // concurrently-running test can observe a torn value.
+        let _span = acquire_test_cursor_enricher_span();
+        install_test_cursor_enricher(Some(installed.clone()));
+        let _reset = ResetTestCursorEnricherOnDrop;
+
+        let manager = ConnectionManager::new();
+        // Reproduces `lifecycle_subscriber_task`'s own
+        // `broker.as_ref().and_then(|b| enricher_for_lifecycle(b.as_ref(), &manager))`
+        // composition, including the `Option<Arc<DelegationBroker>>` shape.
+        let broker_opt: Option<Arc<DelegationBroker>> = Some(b.clone());
+        let resolved = broker_opt
+            .as_ref()
+            .and_then(|inner| enricher_for_lifecycle(inner.as_ref(), &manager));
+        let resolved = resolved.expect("test enricher must be returned once installed");
+        assert!(
+            Arc::ptr_eq(&resolved, &installed),
+            "enricher_for_lifecycle must return the exact installed Arc under #[cfg(test)]"
+        );
+
+        // Reproduces the per-worker clone + `.as_deref()` conversion
+        // `lifecycle_subscriber_task` performs before calling
+        // `run_broker_tool_side_effects` on every dequeued envelope.
+        let worker_local: Option<Arc<CursorStoreEnricher>> = Some(resolved.clone());
+        let internal = InternalEventEnvelope {
+            event: Arc::new(env),
+            completion: None,
+        };
+        run_broker_tool_side_effects(b.as_ref(), &internal, worker_local.as_deref()).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(b.metrics().snapshot().cursor_enrichment_scheduled, 1);
+        assert_eq!(
+            b.take_matching_tool_call("parent-conn", &codex_key("build it"))
+                .await
+                .as_deref(),
+            Some(id)
+        );
+    }
+
+    /// The other half of the composition: with NO test enricher installed
+    /// (the default every other lifecycle test relies on), the same
+    /// `broker.as_ref().and_then(...)` composition must yield `None` for a
+    /// `Some(broker)` input — proving the default-safe path (no
+    /// `~/.cursor` access) is what every existing `lifecycle_subscriber_task`
+    /// test actually exercises.
+    #[tokio::test]
+    async fn composition_yields_none_when_no_test_enricher_installed() {
+        // Hold the span for the whole check too: without it, a
+        // concurrently-running seam test could have `Some(..)` installed
+        // at the exact moment this reads, making the assertion flaky.
+        let _span = acquire_test_cursor_enricher_span();
+        install_test_cursor_enricher(None);
+        let _reset = ResetTestCursorEnricherOnDrop;
+
+        let b = Arc::new(broker());
+        let manager = ConnectionManager::new();
+        let broker_opt: Option<Arc<DelegationBroker>> = Some(b.clone());
+        let resolved = broker_opt
+            .as_ref()
+            .and_then(|inner| enricher_for_lifecycle(inner.as_ref(), &manager));
+        assert!(
+            resolved.is_none(),
+            "no test enricher installed must compose to None, never fall through to production"
+        );
+    }
 }
 
 /// Per-connection worker that owns the cache for one connection and
@@ -2777,10 +3071,180 @@ fn install_test_broker_tool_stall(
     });
 }
 
+/// Test-only injection point for [`enricher_for_lifecycle`] so lifecycle
+/// dispatcher tests (which construct a real [`DelegationBroker`] and spawn
+/// [`lifecycle_subscriber_task`]) never fall through to the production
+/// branch and open `~/.cursor`. `None` (the default) means "no enrichment" —
+/// exactly the desired behavior for every existing lifecycle test that
+/// doesn't care about Cursor store correlation.
+#[cfg(test)]
+static TEST_CURSOR_ENRICHER: std::sync::Mutex<Option<Arc<CursorStoreEnricher>>> =
+    std::sync::Mutex::new(None);
+
+/// Serializes every access to [`TEST_CURSOR_ENRICHER`] — both individual
+/// reads/writes AND the *entire* install→read→reset span of a test that
+/// installs a value — across threads. Without this, two seam tests on
+/// separate OS threads (each `#[tokio::test]` gets its own thread under
+/// the default multi-thread `cargo test` runner) can interleave: one
+/// overwrites or clears the other's installed value mid-test, or an
+/// unrelated `lifecycle_subscriber_task`-driving test (which always
+/// expects `None`) observes a `Some` left mid-install by a concurrently
+/// running seam test.
+///
+/// A plain `std::sync::Mutex<()>` is NOT reentrant: a seam test needs to
+/// hold the lock for its whole body (via
+/// [`TestCursorEnricherSpanLock::acquire`]) while ALSO calling
+/// [`enricher_for_lifecycle`] on the very same thread, which itself takes
+/// the same lock to read the value — a non-reentrant mutex would
+/// self-deadlock on that second acquisition. This tracks the owning
+/// `ThreadId` (compared with `==`; never a `thread_local!`) so the owning
+/// thread can re-enter for free while every other thread blocks
+/// (spin-with-sleep, since contention is rare and test-only) until the
+/// count returns to zero.
+#[cfg(test)]
+struct TestCursorEnricherSpanLock {
+    owner: std::sync::Mutex<Option<(std::thread::ThreadId, usize)>>,
+}
+
+#[cfg(test)]
+static TEST_CURSOR_ENRICHER_SPAN_LOCK: TestCursorEnricherSpanLock = TestCursorEnricherSpanLock {
+    owner: std::sync::Mutex::new(None),
+};
+
+#[cfg(test)]
+impl TestCursorEnricherSpanLock {
+    /// Blocks the calling thread until the span is free (or already owned
+    /// by this same thread), then claims/re-enters it.
+    fn acquire(&'static self) -> TestCursorEnricherSpanGuard {
+        let this_thread = std::thread::current().id();
+        loop {
+            let mut owner = self.owner.lock().unwrap_or_else(|e| e.into_inner());
+            match *owner {
+                Some((tid, count)) if tid == this_thread => {
+                    *owner = Some((tid, count + 1));
+                    return TestCursorEnricherSpanGuard { lock: self };
+                }
+                None => {
+                    *owner = Some((this_thread, 1));
+                    return TestCursorEnricherSpanGuard { lock: self };
+                }
+                Some(_) => {
+                    // Owned by a different thread — drop the lock and
+                    // retry shortly. Contention is test-only and rare, so
+                    // a short spin-sleep is simpler and just as correct
+                    // as a condvar here.
+                    drop(owner);
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            }
+        }
+    }
+
+    fn release(&self) {
+        let mut owner = self.owner.lock().unwrap_or_else(|e| e.into_inner());
+        match *owner {
+            Some((tid, count)) if count > 1 => {
+                *owner = Some((tid, count - 1));
+            }
+            _ => {
+                *owner = None;
+            }
+        }
+    }
+}
+
+/// RAII handle for [`TestCursorEnricherSpanLock::acquire`]. Releasing (or
+/// decrementing the re-entrant count) happens on drop.
+#[cfg(test)]
+pub(crate) struct TestCursorEnricherSpanGuard {
+    lock: &'static TestCursorEnricherSpanLock,
+}
+
+#[cfg(test)]
+impl Drop for TestCursorEnricherSpanGuard {
+    fn drop(&mut self) {
+        self.lock.release();
+    }
+}
+
+/// Acquire (or, from the owning thread, re-enter) the seam's serialization
+/// span. A test that installs a value via [`install_test_cursor_enricher`]
+/// must call this FIRST and hold the returned guard for its entire body —
+/// including through any later call to [`enricher_for_lifecycle`] on the
+/// same thread (safe: re-entrant) — so no other thread can observe a
+/// partially-installed or prematurely-cleared value.
+#[cfg(test)]
+pub(crate) fn acquire_test_cursor_enricher_span() -> TestCursorEnricherSpanGuard {
+    TEST_CURSOR_ENRICHER_SPAN_LOCK.acquire()
+}
+
+/// Install (or clear, with `None`) the test-only [`CursorStoreEnricher`]
+/// returned by [`enricher_for_lifecycle`] under `#[cfg(test)]`. Test-only;
+/// production always takes the `#[cfg(not(test))]` branch below. Takes the
+/// span lock itself (re-entrant, so this is a no-op wait when the caller
+/// already holds it via [`acquire_test_cursor_enricher_span`]) so the write
+/// is always serialized against concurrent reads even if a caller forgets
+/// to hold the outer span.
+#[cfg(test)]
+pub(crate) fn install_test_cursor_enricher(enricher: Option<Arc<CursorStoreEnricher>>) {
+    let _span = TEST_CURSOR_ENRICHER_SPAN_LOCK.acquire();
+    *TEST_CURSOR_ENRICHER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = enricher;
+}
+
+/// The single production construction path for the Cursor-store enrichment
+/// coordinator. Called from [`lifecycle_subscriber_task`] only — no other
+/// call site may construct a second production [`CursorStoreEnricher`].
+/// Under `#[cfg(test)]` this never touches [`CursorStoreReader::production`]
+/// (and therefore never opens `~/.cursor`): it returns whatever
+/// [`install_test_cursor_enricher`] last installed (`None` by default),
+/// taking the same [`TestCursorEnricherSpanLock`] a seam test holds for its
+/// whole body so a subscriber test on another thread can never observe a
+/// `Some` mid-install.
+pub(crate) fn enricher_for_lifecycle(
+    broker: &DelegationBroker,
+    manager: &ConnectionManager,
+) -> Option<Arc<CursorStoreEnricher>> {
+    #[cfg(test)]
+    {
+        let _ = (broker, manager);
+        let _span = TEST_CURSOR_ENRICHER_SPAN_LOCK.acquire();
+        return TEST_CURSOR_ENRICHER
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+    }
+    #[cfg(not(test))]
+    {
+        use crate::acp::cursor_store::CursorStoreReader;
+        Some(Arc::new(CursorStoreEnricher::new(
+            Arc::new(CursorStoreReader::production()),
+            Arc::new(manager.clone_ref()),
+            Arc::new(broker.clone()),
+            broker.metrics(),
+        )))
+    }
+}
+
 /// Run parent tool_call registration + child runtime projection for one
-/// envelope. Always invoked from the dedicated broker-tool worker (never
-/// from the lifecycle `select!` branch).
-async fn run_broker_tool_side_effects(broker: &DelegationBroker, envelope: &InternalEventEnvelope) {
+/// envelope, plus (when `enricher` is `Some`) scheduling a best-effort
+/// Cursor-store enrichment lookup for identity-less MCP announcements.
+/// Always invoked from the dedicated broker-tool worker (never from the
+/// lifecycle `select!` branch).
+///
+/// Ordering is load-bearing: registration MUST land before
+/// `maybe_schedule`. The enrichment lookup's eventual
+/// `backfill_identityless_match_key` call only succeeds against an
+/// already-registered identity-less pending id — scheduling first would
+/// race the lookup against a not-yet-registered entry and backfill
+/// `Stale` every time. `maybe_schedule` itself is synchronous and
+/// non-blocking (see its type docs), so it never gets an `.await`.
+pub(crate) async fn run_broker_tool_side_effects(
+    broker: &DelegationBroker,
+    envelope: &InternalEventEnvelope,
+    enricher: Option<&CursorStoreEnricher>,
+) {
     #[cfg(test)]
     {
         let stall = {
@@ -2801,6 +3265,9 @@ async fn run_broker_tool_side_effects(broker: &DelegationBroker, envelope: &Inte
         }
     }
     register_delegation_tool_call_from_event(broker, envelope.event.as_ref()).await;
+    if let Some(enricher) = enricher {
+        enricher.maybe_schedule(envelope.event.as_ref());
+    }
     broker
         .project_child_tool_event(&envelope.connection_id, &envelope.payload)
         .await;
@@ -2879,6 +3346,13 @@ pub fn lifecycle_subscriber_task(
     let metrics = Arc::clone(bus.metrics());
 
     async move {
+        // Single production construction path for the Cursor-store
+        // enrichment coordinator — see `enricher_for_lifecycle`'s docs.
+        // `None` when there's no broker at all (delegation feature off).
+        let enricher: Option<Arc<CursorStoreEnricher>> = broker
+            .as_ref()
+            .and_then(|b| enricher_for_lifecycle(b.as_ref(), &manager));
+
         // Off-select serial worker for broker tool side-effects. Spawned
         // inside the async body so we are on a Tokio runtime (this function
         // is often constructed before `tauri::async_runtime::spawn`).
@@ -2886,9 +3360,11 @@ pub fn lifecycle_subscriber_task(
             let (tx, mut tool_rx) =
                 mpsc::channel::<Arc<InternalEventEnvelope>>(BROKER_TOOL_QUEUE_CAPACITY);
             let b = Arc::clone(b);
+            let enricher = enricher.clone();
             tokio::spawn(async move {
                 while let Some(env) = tool_rx.recv().await {
-                    run_broker_tool_side_effects(b.as_ref(), env.as_ref()).await;
+                    run_broker_tool_side_effects(b.as_ref(), env.as_ref(), enricher.as_deref())
+                        .await;
                 }
             });
             tx

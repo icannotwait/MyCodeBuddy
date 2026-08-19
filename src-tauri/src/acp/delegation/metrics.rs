@@ -16,6 +16,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::acp::cursor_enrichment::CursorEnrichmentFailure;
+use crate::acp::delegation::broker::IdentitylessBackfillResult;
 use crate::acp::delegation::continuation::types::{
     ContinuationFailureCode, ContinuationState, ContinuationWakeReason,
 };
@@ -477,6 +479,26 @@ pub struct DelegationMetricsSnapshot {
     pub completion_scope_invalidations: BTreeMap<String, u64>,
     #[serde(default)]
     pub completion_protocol: CompletionProtocolMetricsSnapshot,
+    /// Count of Cursor-store enrichment lookups scheduled (only after the
+    /// spawned session gate confirms a live `Cursor` connection with a
+    /// validated external session id).
+    #[serde(default)]
+    pub cursor_enrichment_scheduled: u64,
+    /// Count of successful identity-less backfills (store match found and
+    /// applied/observed before the deadline).
+    #[serde(default)]
+    pub cursor_enrichment_resolved: u64,
+    /// Closed failure-class counters. Keys are exactly
+    /// [`crate::acp::cursor_enrichment::CursorEnrichmentFailure::as_str`].
+    #[serde(default)]
+    pub cursor_enrichment_failed: BTreeMap<String, u64>,
+    /// Closed backfill-result counters (`applied` | `same` | `conflict` | `stale`).
+    #[serde(default)]
+    pub cursor_enrichment_backfill: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub cursor_enrichment_duration_ms_count: u64,
+    #[serde(default)]
+    pub cursor_enrichment_duration_ms_total: u64,
 }
 
 /// Bounded completion-protocol observability. Every label is produced from a
@@ -582,6 +604,12 @@ pub struct DelegationMetrics {
     completion_format_only_child_runs: AtomicU64,
     completion_card_reemit_prompts: AtomicU64,
     completion_sibling_reruns: AtomicU64,
+    cursor_enrichment_scheduled: AtomicU64,
+    cursor_enrichment_resolved: AtomicU64,
+    cursor_enrichment_failed: Mutex<BTreeMap<String, u64>>,
+    cursor_enrichment_backfill: Mutex<BTreeMap<String, u64>>,
+    cursor_enrichment_duration_ms_count: AtomicU64,
+    cursor_enrichment_duration_ms_total: AtomicU64,
 }
 
 impl DelegationMetrics {
@@ -740,6 +768,45 @@ impl DelegationMetrics {
     pub fn record_completion_sibling_reruns(&self, count: u64) {
         self.completion_sibling_reruns
             .fetch_add(count, Ordering::Relaxed);
+    }
+
+    /// A bounded Cursor-store enrichment lookup was scheduled off the broker
+    /// worker. Only called after the spawned session gate confirms a live
+    /// `Cursor` connection with a validated external session id — a missing
+    /// or non-`Cursor` connection is skipped without incrementing this.
+    pub fn record_cursor_enrichment_scheduled(&self) {
+        self.cursor_enrichment_scheduled
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A scheduled lookup found and applied/observed its identity-less
+    /// backfill before the deadline. `elapsed` is the wall time since the
+    /// lookup was scheduled (`maybe_schedule`'s `started` capture).
+    pub fn record_cursor_enrichment_resolved(&self, elapsed: Duration) {
+        self.cursor_enrichment_resolved
+            .fetch_add(1, Ordering::Relaxed);
+        self.cursor_enrichment_duration_ms_count
+            .fetch_add(1, Ordering::Relaxed);
+        self.cursor_enrichment_duration_ms_total
+            .fetch_add(Self::duration_ms_saturating(elapsed), Ordering::Relaxed);
+    }
+
+    /// Closed failure-class counter for a scheduled Cursor-store enrichment
+    /// lookup that did not resolve. Label is the failure's stable
+    /// [`CursorEnrichmentFailure::as_str`].
+    pub fn record_cursor_enrichment_failed(&self, failure: CursorEnrichmentFailure) {
+        Self::inc_labeled(&self.cursor_enrichment_failed, failure.as_str().to_string());
+    }
+
+    /// Closed backfill-result counter (`applied` | `same` | `conflict` | `stale`).
+    pub fn record_cursor_enrichment_backfill(&self, result: IdentitylessBackfillResult) {
+        let label = match result {
+            IdentitylessBackfillResult::Applied => "applied",
+            IdentitylessBackfillResult::Same => "same",
+            IdentitylessBackfillResult::Conflict => "conflict",
+            IdentitylessBackfillResult::Stale => "stale",
+        };
+        Self::inc_labeled(&self.cursor_enrichment_backfill, label.to_string());
     }
 
     /// Guarded invariant boundary. Protocol v2 may never create a format-only
@@ -1287,6 +1354,16 @@ impl DelegationMetrics {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
+        let cursor_enrichment_failed = self
+            .cursor_enrichment_failed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let cursor_enrichment_backfill = self
+            .cursor_enrichment_backfill
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let completion_protocol = CompletionProtocolMetricsSnapshot {
             resolutions: completion_resolutions.clone(),
             tool_accepted: self
@@ -1414,6 +1491,16 @@ impl DelegationMetrics {
             completion_artifact_failures,
             completion_scope_invalidations,
             completion_protocol,
+            cursor_enrichment_scheduled: self.cursor_enrichment_scheduled.load(Ordering::Relaxed),
+            cursor_enrichment_resolved: self.cursor_enrichment_resolved.load(Ordering::Relaxed),
+            cursor_enrichment_failed,
+            cursor_enrichment_backfill,
+            cursor_enrichment_duration_ms_count: self
+                .cursor_enrichment_duration_ms_count
+                .load(Ordering::Relaxed),
+            cursor_enrichment_duration_ms_total: self
+                .cursor_enrichment_duration_ms_total
+                .load(Ordering::Relaxed),
         }
     }
 }
@@ -2493,12 +2580,24 @@ mod tests {
         assert!(snap.admission_failed_by_agent.is_empty());
         assert_eq!(snap.settlement_retry_enqueued, 0);
         assert_eq!(snap.settlement_retry_exhausted, 0);
+        // cursor_enrichment_* fields are absent from this legacy blob too,
+        // and must deserialize as zero/empty via #[serde(default)].
+        assert_eq!(snap.cursor_enrichment_scheduled, 0);
+        assert_eq!(snap.cursor_enrichment_resolved, 0);
+        assert!(snap.cursor_enrichment_failed.is_empty());
+        assert!(snap.cursor_enrichment_backfill.is_empty());
+        assert_eq!(snap.cursor_enrichment_duration_ms_count, 0);
+        assert_eq!(snap.cursor_enrichment_duration_ms_total, 0);
         // Fresh default snapshot also has empty maps and retains old fields.
         let fresh = DelegationMetrics::default().snapshot();
         assert!(fresh.accepted_by_agent.is_empty());
         assert!(fresh.promote_retries.is_empty());
         assert_eq!(fresh.accepted_count, 0);
         assert_eq!(fresh.completed_count, 0);
+        assert_eq!(fresh.cursor_enrichment_scheduled, 0);
+        assert_eq!(fresh.cursor_enrichment_resolved, 0);
+        assert!(fresh.cursor_enrichment_failed.is_empty());
+        assert!(fresh.cursor_enrichment_backfill.is_empty());
     }
 
     #[test]
