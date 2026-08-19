@@ -630,7 +630,11 @@ mod tests {
                 _overall_deadline: Instant,
             ) -> Result<String, DocumentTranslateError> {
                 let tokens = take_current_nonce_tokens(body, "CGINLINE");
-                assert_eq!(tokens.len(), 2, "protected body must contain two CGINLINE tokens");
+                assert_eq!(
+                    tokens.len(),
+                    2,
+                    "protected body must contain two CGINLINE tokens"
+                );
                 let t0 = &tokens[0];
                 let t1 = &tokens[1];
                 Ok(format!("It queries-from {t1} the fields {t0}."))
