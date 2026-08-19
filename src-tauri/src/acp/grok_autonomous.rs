@@ -11,14 +11,18 @@ use std::time::Instant;
 
 use serde_json::Value;
 
-use crate::acp::autonomous_activity::AutonomousActivityPolicy;
+use crate::acp::autonomous_activity::{
+    cap_normalized_turn_payload, complete_file_watermark, read_complete_record_batch,
+    rotation_decision, AutonomousActivityPolicy, EpisodeRotation, ProviderRecordIdentities,
+    TranscriptFileIdentity,
+};
 use crate::acp::session_state::background_keepalive_max_age;
 use crate::acp::types::BackgroundSettledInfo;
 use crate::models::agent::AgentType;
-use crate::models::message::{AutonomousTurnOrigin, MessageTurn, TurnRole};
+use crate::models::message::{AutonomousTurnOrigin, MessageTurn};
 use crate::parsers::grok::{
-    grok_autonomous_turn_id, grok_complete_records, grok_record_payload, grok_reminder_task_ids,
-    grok_turns_from_bytes, is_grok_background_task_reminder,
+    grok_autonomous_turn_from_segment, grok_autonomous_turn_id, grok_complete_records,
+    grok_record_payload, grok_reminder_task_ids, is_grok_background_task_reminder,
 };
 
 /// Connection-loop ownership of the dispatch currently being observed.
@@ -76,6 +80,9 @@ struct Episode {
     published_id: Option<String>,
     opened_at: Instant,
     tail_from: u64,
+    segment_from: u64,
+    segment_record_count: usize,
+    segment_part: u32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -98,6 +105,9 @@ impl Episode {
             published_id: None,
             opened_at: Instant::now(),
             tail_from: 0,
+            segment_from: 0,
+            segment_record_count: 0,
+            segment_part: 0,
         }
     }
 
@@ -130,6 +140,8 @@ pub(crate) struct GrokAutonomousAdapter {
     emitted: Option<GrokEmitted>,
     needs_detail_refetch: bool,
     last_visible_user_log: Option<Instant>,
+    file_identity: Option<TranscriptFileIdentity>,
+    provider_record_identities: ProviderRecordIdentities,
 }
 
 impl GrokAutonomousAdapter {
@@ -149,6 +161,8 @@ impl GrokAutonomousAdapter {
             emitted: None,
             needs_detail_refetch: false,
             last_visible_user_log: None,
+            file_identity: None,
+            provider_record_identities: ProviderRecordIdentities::default(),
         }
     }
 
@@ -178,15 +192,12 @@ impl GrokAutonomousAdapter {
             self.committed = 0;
             return;
         }
-        match std::fs::read(updates_jsonl_path) {
-            Ok(bytes) => {
-                let (turns, watermark) = grok_turns_from_bytes(&bytes, session_id);
+        match complete_file_watermark(updates_jsonl_path) {
+            Ok(watermark) => {
                 self.committed = watermark;
                 self.baseline_ready = true;
-                self.last_visible_is_user = matches!(
-                    turns.last(),
-                    Some(turn) if matches!(turn.role, TurnRole::User)
-                );
+                self.file_identity = TranscriptFileIdentity::for_path(updates_jsonl_path).ok();
+                self.last_visible_is_user = false;
             }
             Err(_) => {
                 self.baseline_ready = false;
@@ -291,6 +302,8 @@ impl GrokAutonomousAdapter {
         self.emitted = None;
         self.last_idle_was_task_completed = false;
         self.needs_detail_refetch = false;
+        self.file_identity = None;
+        self.provider_record_identities.clear();
     }
 
     pub(crate) fn tail_once(&mut self) {
@@ -301,55 +314,108 @@ impl GrokAutonomousAdapter {
         let Some(path) = self.resolve_updates_path() else {
             return;
         };
-        let Ok(bytes) = std::fs::read(&path) else {
+        let Ok(identity) = TranscriptFileIdentity::for_path(&path) else {
             return;
         };
-        let complete = complete_line_bytes(&bytes);
-        if complete < self.committed {
-            self.committed = complete;
-            self.needs_detail_refetch = true;
-            self.episode.tail_from = 0;
+        let Ok(file_len) = std::fs::metadata(&path).map(|metadata| metadata.len()) else {
+            return;
+        };
+        if self
+            .file_identity
+            .as_ref()
+            .is_some_and(|known| known != &identity)
+            || file_len < self.committed
+        {
+            self.reset_transcript_generation(&path, identity);
+            return;
         }
+        self.file_identity.get_or_insert(identity);
 
         if self.episode.trigger_start.is_none() {
-            match find_hidden_trigger(&bytes, self.episode.tail_from) {
-                Some((offset, _)) if self.is_tombstoned(offset) => {
+            let Ok(batch) = read_complete_record_batch(&path, self.episode.tail_from) else {
+                return;
+            };
+            self.remember_records(&batch.record_starts);
+            if batch.skipped_oversized_record {
+                self.committed = batch.next_offset;
+                self.episode.tail_from = batch.next_offset;
+                self.needs_detail_refetch = true;
+                return;
+            }
+            match find_hidden_trigger(&batch.bytes, self.episode.tail_from) {
+                Some((offset, _, _)) if self.is_tombstoned(offset) => {
                     self.episode.phase = EpisodePhase::Closed;
                     return;
                 }
-                Some((offset, task_ids)) => {
+                Some((offset, end, task_ids)) => {
                     if self.episode.task_ids.is_empty() {
                         self.episode.task_ids = task_ids;
                     }
                     self.episode.trigger_start = Some(offset);
+                    self.episode.segment_from = end;
                     if self.episode.phase == EpisodePhase::Opening {
                         self.episode.phase = EpisodePhase::Open;
                     }
                 }
                 // File lags the wire: keep Opening. A from-0 tombstone close
                 // would drop a new adjacent cycle that has not persisted yet.
-                None => {}
+                None => {
+                    self.committed = batch.next_offset;
+                    self.episode.tail_from = batch.next_offset;
+                    return;
+                }
             }
         }
 
         let Some(trigger_start) = self.episode.trigger_start else {
             return;
         };
-        let expected_id = self.episode.published_id.clone().unwrap_or_else(|| {
-            grok_autonomous_turn_id(&self.session_id, &self.episode.task_ids, trigger_start)
-        });
-        let (turns, watermark) = grok_turns_from_bytes(&bytes, &self.session_id);
-        let Some(turn) = turns.iter().find(|turn| turn.id == expected_id).cloned() else {
+        let Ok(batch) = read_complete_record_batch(&path, self.episode.segment_from) else {
+            return;
+        };
+        self.remember_records(&batch.record_starts);
+        if batch.skipped_oversized_record {
+            self.committed = batch.next_offset;
+            self.rotate_segment(batch.next_offset);
+            self.needs_detail_refetch = true;
+            return;
+        }
+        self.episode.segment_record_count = batch.record_starts.len();
+        let terminal_persisted =
+            file_has_turn_completed_after(&batch.bytes, self.episode.segment_from);
+        let Some(mut turn) = grok_autonomous_turn_from_segment(
+            &batch.bytes,
+            &self.session_id,
+            self.episode.segment_from,
+            trigger_start,
+            &self.episode.task_ids,
+        ) else {
+            self.committed = batch.next_offset;
+            if self.episode.phase == EpisodePhase::AwaitingPersistedTerminal && terminal_persisted {
+                self.finish_episode();
+            }
             return;
         };
         if turn.blocks.is_empty() {
             return;
         }
-        self.committed = watermark;
+        let base_id =
+            grok_autonomous_turn_id(&self.session_id, &self.episode.task_ids, trigger_start);
+        let expected_id = segmented_turn_id(&base_id, self.episode.segment_part);
+        turn.id = expected_id.clone();
+        self.committed = batch.next_offset;
         self.episode.published_id = Some(expected_id);
-        let terminal_persisted =
-            turn.completed_at.is_some() || file_has_turn_completed_after(&bytes, trigger_start);
-        self.emit_turn(turn);
+        let terminal_persisted = turn.completed_at.is_some() || terminal_persisted;
+        if let Some(turn) = cap_normalized_turn_payload(turn) {
+            self.emit_turn(turn);
+        }
+        if rotation_decision(self.episode.segment_record_count, terminal_persisted)
+            == Some(EpisodeRotation::Forced)
+            && !terminal_persisted
+        {
+            self.rotate_segment(batch.next_offset);
+            return;
+        }
         if self.episode.phase == EpisodePhase::AwaitingPersistedTerminal && terminal_persisted {
             self.finish_episode();
         }
@@ -451,6 +517,9 @@ impl GrokAutonomousAdapter {
             published_id: None,
             opened_at: Instant::now(),
             tail_from: self.committed,
+            segment_from: self.committed,
+            segment_record_count: 0,
+            segment_part: 0,
         };
         GrokDispatchClaim::AutonomousContent
     }
@@ -563,15 +632,12 @@ impl GrokAutonomousAdapter {
             self.baseline_ready = false;
             return;
         }
-        match std::fs::read(path) {
-            Ok(bytes) => {
-                let (turns, watermark) = grok_turns_from_bytes(&bytes, &self.session_id);
+        match complete_file_watermark(path) {
+            Ok(watermark) => {
                 self.committed = watermark;
                 self.baseline_ready = true;
-                self.last_visible_is_user = matches!(
-                    turns.last(),
-                    Some(turn) if matches!(turn.role, TurnRole::User)
-                );
+                self.file_identity = TranscriptFileIdentity::for_path(path).ok();
+                self.last_visible_is_user = false;
             }
             Err(_) => {
                 self.baseline_ready = false;
@@ -624,6 +690,32 @@ impl GrokAutonomousAdapter {
             self.last_visible_user_log = Some(now);
         }
     }
+
+    fn remember_records(&mut self, starts: &[u64]) {
+        for start in starts {
+            self.provider_record_identities
+                .remember(format!("{}:{start}", self.episode.segment_part));
+        }
+    }
+
+    fn rotate_segment(&mut self, next_offset: u64) {
+        self.episode.segment_from = next_offset;
+        self.episode.tail_from = next_offset;
+        self.episode.segment_record_count = 0;
+        self.episode.segment_part = self.episode.segment_part.saturating_add(1);
+        self.episode.published_id = None;
+    }
+
+    fn reset_transcript_generation(&mut self, path: &Path, identity: TranscriptFileIdentity) {
+        self.episode = Episode::dormant();
+        self.tombstones.clear();
+        self.provider_record_identities.clear();
+        self.committed = complete_file_watermark(path).unwrap_or(0);
+        self.baseline_ready = true;
+        self.file_identity = Some(identity);
+        self.needs_detail_refetch = true;
+        self.emit_accounting();
+    }
 }
 
 /// Prompt-receive gate used by `connection.rs`. One flag — do not invent a
@@ -661,16 +753,10 @@ fn extract_task_id(update: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
-fn complete_line_bytes(bytes: &[u8]) -> u64 {
-    grok_complete_records(bytes)
-        .last()
-        .map(|(start, record)| start + record.len() as u64)
-        .unwrap_or(0)
-}
-
-fn find_hidden_trigger(bytes: &[u8], from: u64) -> Option<(u64, Vec<String>)> {
+fn find_hidden_trigger(bytes: &[u8], base_offset: u64) -> Option<(u64, u64, Vec<String>)> {
     let mut last_is_user = false;
-    for (start, record) in grok_complete_records(bytes) {
+    for (relative_start, record) in grok_complete_records(bytes) {
+        let start = base_offset.saturating_add(relative_start);
         let Some(update) = record_update(record) else {
             continue;
         };
@@ -683,9 +769,6 @@ fn find_hidden_trigger(bytes: &[u8], from: u64) -> Option<(u64, Vec<String>)> {
             .and_then(Value::as_bool)
             == Some(true);
         if kind == "user_message_chunk" && hidden {
-            if start < from {
-                continue;
-            }
             if last_is_user {
                 continue;
             }
@@ -694,7 +777,11 @@ fn find_hidden_trigger(bytes: &[u8], from: u64) -> Option<(u64, Vec<String>)> {
                 .and_then(Value::as_str)
                 .unwrap_or("");
             if is_grok_background_task_reminder(text) {
-                return Some((start, grok_reminder_task_ids(text)));
+                return Some((
+                    start,
+                    start + record.len() as u64,
+                    grok_reminder_task_ids(text),
+                ));
             }
             continue;
         }
@@ -710,11 +797,9 @@ fn find_hidden_trigger(bytes: &[u8], from: u64) -> Option<(u64, Vec<String>)> {
     None
 }
 
-fn file_has_turn_completed_after(bytes: &[u8], after: u64) -> bool {
+fn file_has_turn_completed_after(bytes: &[u8], base_offset: u64) -> bool {
     grok_complete_records(bytes).any(|(start, record)| {
-        if start < after {
-            return false;
-        }
+        let _absolute_start = base_offset.saturating_add(start);
         record_update(record)
             .and_then(|update| {
                 update
@@ -724,6 +809,14 @@ fn file_has_turn_completed_after(bytes: &[u8], after: u64) -> bool {
             })
             .unwrap_or(false)
     })
+}
+
+fn segmented_turn_id(base: &str, part: u32) -> String {
+    if part == 0 {
+        base.to_string()
+    } else {
+        format!("{base}:part:{part}")
+    }
 }
 
 fn record_update(record: &[u8]) -> Option<Value> {
@@ -741,7 +834,12 @@ fn keepalive_std() -> std::time::Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::acp::autonomous_activity::{
+        normalized_turn_payload_len, EPISODE_PAYLOAD_MAX_BYTES, EPISODE_RECORD_FORCE_ROTATE,
+        PROVIDER_RECORD_IDENTITY_CAP,
+    };
     use crate::models::message::{AutonomousTurnOrigin, ContentBlock};
+    use crate::parsers::grok::grok_turns_from_bytes;
     use serde_json::json;
     use std::io::Write;
     use std::path::{Path, PathBuf};
@@ -802,6 +900,142 @@ mod tests {
             "sessionUpdate": "turn_completed",
             "stop_reason": "end_turn"
         })
+    }
+
+    #[test]
+    fn pathological_episode_force_rotates_and_keeps_identity_and_payload_bounds() {
+        let (_dir, path) = tmp_updates("");
+        let mut adapter = GrokAutonomousAdapter::new_for_test(path.clone());
+        adapter.on_session_ready("sess", &path);
+        adapter.on_raw_dispatch(
+            "_x.ai/session/update",
+            &json!({"update":{"sessionUpdate":"task_completed","task_id":"term_x"}}),
+            Ownership::Idle,
+        );
+        adapter.on_raw_dispatch(
+            "session/update",
+            &json!({"update": hidden_trigger_update()}),
+            Ownership::Idle,
+        );
+
+        let mut transcript = String::new();
+        transcript.push_str(&jsonl_update("session/update", &hidden_trigger_update(), 1));
+        transcript.push('\n');
+        for index in 0..(EPISODE_RECORD_FORCE_ROTATE + 1) {
+            transcript.push_str(&jsonl_update(
+                "session/update",
+                &agent_text_update(&format!("chunk-{index};")),
+                2 + index as i64,
+            ));
+            transcript.push('\n');
+        }
+        std::fs::write(&path, transcript).unwrap();
+
+        adapter.tail_once();
+        let first = adapter.take_emitted();
+        assert_eq!(first.turns.len(), 1);
+        assert!(normalized_turn_payload_len(&first.turns[0]) <= EPISODE_PAYLOAD_MAX_BYTES);
+        assert!(adapter.provider_record_identities.len() <= PROVIDER_RECORD_IDENTITY_CAP);
+        assert!(adapter.episode.segment_record_count < EPISODE_RECORD_FORCE_ROTATE);
+        let first_id = first.turns[0].id.clone();
+
+        adapter.tail_once();
+        let second = adapter.take_emitted();
+        assert_eq!(second.turns.len(), 1);
+        assert_ne!(second.turns[0].id, first_id);
+        assert!(format!("{:?}", second.turns[0].blocks).contains("chunk-1024"));
+    }
+
+    #[test]
+    fn terminal_only_segment_after_force_rotation_closes_episode() {
+        let (_dir, path) = tmp_updates("");
+        let mut adapter = GrokAutonomousAdapter::new_for_test(path.clone());
+        adapter.on_session_ready("sess", &path);
+        adapter.on_raw_dispatch(
+            "_x.ai/session/update",
+            &json!({"update":{"sessionUpdate":"task_completed","task_id":"term_x"}}),
+            Ownership::Idle,
+        );
+        adapter.on_raw_dispatch(
+            "session/update",
+            &json!({"update": hidden_trigger_update()}),
+            Ownership::Idle,
+        );
+        let mut transcript = format!(
+            "{}\n",
+            jsonl_update("session/update", &hidden_trigger_update(), 1)
+        );
+        for index in 0..EPISODE_RECORD_FORCE_ROTATE {
+            transcript.push_str(&jsonl_update(
+                "session/update",
+                &agent_text_update(&format!("chunk-{index};")),
+                2 + index as i64,
+            ));
+            transcript.push('\n');
+        }
+        std::fs::write(&path, transcript).unwrap();
+        adapter.tail_once();
+        assert_eq!(adapter.episode.segment_record_count, 0);
+
+        append_line(
+            &path,
+            &jsonl_update("session/update", &turn_completed_update(), 2000),
+        );
+        adapter.on_raw_dispatch(
+            "session/update",
+            &json!({"update": turn_completed_update()}),
+            Ownership::Idle,
+        );
+        assert!(!adapter.autonomous_busy());
+        assert!(adapter.take_detail_refetch());
+    }
+
+    #[test]
+    fn replacement_discards_episode_refetches_and_rebaselines_generation() {
+        let (_dir, path) = tmp_updates("");
+        let mut adapter = GrokAutonomousAdapter::new_for_test(path.clone());
+        adapter.on_session_ready("sess", &path);
+        adapter.on_raw_dispatch(
+            "_x.ai/session/update",
+            &json!({"update":{"sessionUpdate":"task_completed","task_id":"term_x"}}),
+            Ownership::Idle,
+        );
+        adapter.on_raw_dispatch(
+            "session/update",
+            &json!({"update": hidden_trigger_update()}),
+            Ownership::Idle,
+        );
+        append_line(
+            &path,
+            &jsonl_update("session/update", &hidden_trigger_update(), 1),
+        );
+        append_line(
+            &path,
+            &jsonl_update("session/update", &agent_text_update("working"), 2),
+        );
+        adapter.tail_once();
+        assert!(adapter.autonomous_busy());
+        assert_eq!(adapter.take_emitted().turns.len(), 1);
+
+        let replacement = path.with_extension("replacement");
+        std::fs::write(
+            &replacement,
+            format!(
+                "{}\n",
+                jsonl_update("session/update", &agent_text_update("replacement"), 3)
+            ),
+        )
+        .unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+
+        adapter.tail_once();
+        assert!(!adapter.autonomous_busy());
+        assert!(adapter.take_detail_refetch());
+        assert!(adapter.episode.trigger_start.is_none());
+        assert!(adapter.episode.published_id.is_none());
+        assert_eq!(adapter.provider_record_identities.len(), 0);
+        assert_eq!(adapter.committed, complete_file_watermark(&path).unwrap());
     }
 
     #[tokio::test]

@@ -7,6 +7,10 @@ use crate::acp::shared_session::{
 };
 use crate::acp::tool_watchdog::ToolWatchdogProjection;
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PromptInputBlock {
@@ -403,6 +407,10 @@ pub enum AcpEvent {
         /// `transcript_watermark` catches up (`>=`), closing the emit/refetch
         /// race without cross-namespace id dedup.
         watermark: u64,
+        /// One-shot cue for the frontend to refetch authoritative detail while
+        /// retaining overlay entries until transcript watermark coverage.
+        #[serde(default, skip_serializing_if = "is_false")]
+        detail_refetch: bool,
     },
     /// A `delegate_to_agent` MCP tool call from the parent agent has spawned a
     /// child sub-session and the child's prompt is in flight. Emitted as soon

@@ -12,7 +12,11 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use walkdir::WalkDir;
 
-use crate::acp::autonomous_activity::AutonomousActivityPolicy;
+use crate::acp::autonomous_activity::{
+    cap_normalized_turn_payload, complete_file_watermark, read_complete_record_batch,
+    rotation_decision, AutonomousActivityPolicy, EpisodeRotation, ProviderRecordIdentities,
+    TranscriptFileIdentity, EPISODE_RECORD_FORCE_ROTATE,
+};
 use crate::acp::grok_autonomous::Ownership;
 use crate::acp::session_state::background_keepalive_max_age;
 use crate::acp::types::BackgroundSettledInfo;
@@ -20,7 +24,7 @@ use crate::models::agent::AgentType;
 use crate::models::message::{AutonomousTurnOrigin, MessageTurn};
 use crate::parsers::codex::{
     codex_complete_records, codex_goal_turn_id, codex_record_payload,
-    is_codex_goal_internal_context_message, parse_codex_rollout, resolve_codex_home_dir,
+    is_codex_goal_internal_context_message, parse_codex_goal_segment, resolve_codex_home_dir,
     rollout_session_id,
 };
 
@@ -74,6 +78,9 @@ struct Episode {
     native_turn_id: Option<String>,
     opened_at: Instant,
     tail_from: u64,
+    segment_from: u64,
+    segment_record_count: usize,
+    segment_part: u32,
 }
 
 impl Episode {
@@ -84,6 +91,9 @@ impl Episode {
             native_turn_id: None,
             opened_at: Instant::now(),
             tail_from: 0,
+            segment_from: 0,
+            segment_record_count: 0,
+            segment_part: 0,
         }
     }
 
@@ -128,6 +138,8 @@ pub(crate) struct CodexAutonomousAdapter {
     tombstones: VecDeque<Tombstone>,
     emitted: Option<CodexEmitted>,
     needs_detail_refetch: bool,
+    file_identity: Option<TranscriptFileIdentity>,
+    provider_record_identities: ProviderRecordIdentities,
 }
 
 impl CodexAutonomousAdapter {
@@ -144,6 +156,8 @@ impl CodexAutonomousAdapter {
             tombstones: VecDeque::new(),
             emitted: None,
             needs_detail_refetch: false,
+            file_identity: None,
+            provider_record_identities: ProviderRecordIdentities::default(),
         }
     }
 
@@ -236,12 +250,31 @@ impl CodexAutonomousAdapter {
         self.emitted = None;
         self.needs_detail_refetch = false;
         self.authority_deadline = None;
+        self.file_identity = None;
+        self.provider_record_identities.clear();
     }
 
     pub(crate) fn tail_once(&mut self) {
         self.expire();
         if self.authority == Authority::Unsupported {
             return;
+        }
+        if self.episode.is_active() {
+            if let Some(path) = self.rollout_path.clone() {
+                let changed = TranscriptFileIdentity::for_path(&path)
+                    .ok()
+                    .zip(std::fs::metadata(&path).ok())
+                    .is_some_and(|(identity, metadata)| {
+                        self.file_identity
+                            .as_ref()
+                            .is_some_and(|known| known != &identity)
+                            || metadata.len() < self.committed
+                    });
+                if changed {
+                    self.reset_transcript_generation(&path);
+                    return;
+                }
+            }
         }
         if self.episode.is_active() {
             self.resolve_authority();
@@ -252,60 +285,117 @@ impl CodexAutonomousAdapter {
         let Some(path) = self.rollout_path.clone() else {
             return;
         };
-        let Ok(bytes) = std::fs::read(&path) else {
+        let Ok(identity) = TranscriptFileIdentity::for_path(&path) else {
             return;
         };
-        let complete = complete_line_bytes(&bytes);
-        if complete < self.committed {
-            self.committed = complete;
-            self.needs_detail_refetch = true;
-            self.episode.tail_from = 0;
+        let Ok(file_len) = std::fs::metadata(&path).map(|metadata| metadata.len()) else {
+            return;
+        };
+        if self
+            .file_identity
+            .as_ref()
+            .is_some_and(|known| known != &identity)
+            || file_len < self.committed
+        {
+            self.reset_transcript_generation(&path);
+            return;
         }
+        self.file_identity.get_or_insert(identity);
 
         if self.episode.native_turn_id.is_none() {
-            if let Some(turn_id) =
-                find_goal_native_turn_id(&bytes, self.episode.tail_from, &self.tombstones)
+            let Ok(batch) = read_complete_record_batch(&path, self.episode.tail_from) else {
+                return;
+            };
+            self.remember_records(&batch.record_starts);
+            if batch.skipped_oversized_record {
+                self.committed = batch.next_offset;
+                self.episode.tail_from = batch.next_offset;
+                self.needs_detail_refetch = true;
+                return;
+            }
+            if let Some((turn_id, proof_end)) =
+                find_goal_native_turn_id(&batch.bytes, self.episode.tail_from, &self.tombstones)
             {
                 if is_item_n_id(&turn_id) {
                     return;
                 }
                 self.episode.native_turn_id = Some(turn_id.clone());
                 self.episode.published_id = Some(codex_goal_turn_id(&turn_id));
+                self.episode.segment_from = proof_end;
                 if matches!(
                     self.episode.phase,
                     EpisodePhase::Opening | EpisodePhase::AwaitingAuthority
                 ) {
                     self.episode.phase = EpisodePhase::Open;
                 }
+            } else {
+                let next_from = if batch.record_starts.len() >= EPISODE_RECORD_FORCE_ROTATE {
+                    batch
+                        .record_starts
+                        .last()
+                        .copied()
+                        .unwrap_or(batch.next_offset)
+                } else {
+                    batch.next_offset
+                };
+                self.committed = next_from;
+                self.episode.tail_from = next_from;
+                return;
             }
         }
 
-        let Some(expected_id) = self.episode.published_id.clone() else {
+        let Some(native_turn_id) = self.episode.native_turn_id.clone() else {
             return;
         };
+        let base_id = codex_goal_turn_id(&native_turn_id);
+        let expected_id = segmented_turn_id(&base_id, self.episode.segment_part);
         if is_item_n_id(&expected_id) {
             return;
         }
-        let Some((turns, watermark)) = parse_codex_rollout(&path, &self.session_id) else {
+        let Ok(batch) = read_complete_record_batch(&path, self.episode.segment_from) else {
             return;
         };
-        let Some(turn) = turns.into_iter().find(|turn| turn.id == expected_id) else {
+        self.remember_records(&batch.record_starts);
+        if batch.skipped_oversized_record {
+            self.committed = batch.next_offset;
+            self.rotate_segment(batch.next_offset);
+            self.needs_detail_refetch = true;
+            return;
+        }
+        self.episode.segment_record_count = batch.record_starts.len();
+        let terminal_persisted =
+            has_task_complete(&batch.bytes, &native_turn_id, self.episode.segment_from);
+        let Some(mut turn) =
+            parse_codex_goal_segment(&batch.bytes, &self.session_id, &native_turn_id)
+        else {
+            self.committed = batch.next_offset;
+            if self.episode.phase == EpisodePhase::AwaitingPersistedTerminal && terminal_persisted {
+                self.finish_episode();
+            }
             return;
         };
+        turn.id = expected_id.clone();
         if turn.blocks.is_empty()
             || turn.autonomous_origin != Some(AutonomousTurnOrigin::AgentAutonomous)
         {
             return;
         }
-        self.committed = watermark;
-        self.emit_turn(turn);
+        self.committed = batch.next_offset;
+        self.episode.published_id = Some(expected_id);
+        if let Some(turn) = cap_normalized_turn_payload(turn) {
+            self.emit_turn(turn);
+        }
 
-        if self.episode.phase == EpisodePhase::AwaitingPersistedTerminal {
-            if let Some(native) = self.episode.native_turn_id.as_deref() {
-                if has_task_complete(&bytes, native, self.episode.tail_from) {
-                    self.finish_episode();
-                }
-            }
+        if rotation_decision(self.episode.segment_record_count, terminal_persisted)
+            == Some(EpisodeRotation::Forced)
+            && !terminal_persisted
+        {
+            self.rotate_segment(batch.next_offset);
+            return;
+        }
+
+        if self.episode.phase == EpisodePhase::AwaitingPersistedTerminal && terminal_persisted {
+            self.finish_episode();
         }
     }
 
@@ -398,6 +488,9 @@ impl CodexAutonomousAdapter {
             native_turn_id: None,
             opened_at: Instant::now(),
             tail_from: self.committed,
+            segment_from: self.committed,
+            segment_record_count: 0,
+            segment_part: 0,
         };
         if self.authority_deadline.is_none() && self.authority == Authority::Provisional {
             self.authority_deadline = Some(Instant::now() + AUTHORITY_RETRY);
@@ -427,7 +520,11 @@ impl CodexAutonomousAdapter {
                             self.downgrade_unsupported();
                             return;
                         }
-                        None => return,
+                        None => {
+                            self.authority = Authority::Provisional;
+                            self.rollout_path = None;
+                            self.file_identity = None;
+                        }
                     }
                 }
             }
@@ -467,9 +564,10 @@ impl CodexAutonomousAdapter {
     fn adopt_path(&mut self, path: PathBuf, rebaseline: bool) {
         self.rollout_path = Some(path.clone());
         self.authority = Authority::Armed;
+        self.file_identity = TranscriptFileIdentity::for_path(&path).ok();
         if rebaseline {
-            if let Ok(bytes) = std::fs::read(&path) {
-                self.committed = complete_line_bytes(&bytes);
+            if let Ok(watermark) = complete_file_watermark(&path) {
+                self.committed = watermark;
             }
         }
     }
@@ -581,6 +679,34 @@ impl CodexAutonomousAdapter {
             self.episode.phase = EpisodePhase::Abandoned;
         }
     }
+
+    fn remember_records(&mut self, starts: &[u64]) {
+        for start in starts {
+            self.provider_record_identities
+                .remember(format!("{}:{start}", self.episode.segment_part));
+        }
+    }
+
+    fn rotate_segment(&mut self, next_offset: u64) {
+        self.episode.segment_from = next_offset;
+        self.episode.tail_from = next_offset;
+        self.episode.segment_record_count = 0;
+        self.episode.segment_part = self.episode.segment_part.saturating_add(1);
+        self.episode.published_id = None;
+    }
+
+    fn reset_transcript_generation(&mut self, path: &Path) {
+        self.episode = Episode::dormant();
+        self.tombstones.clear();
+        self.provider_record_identities.clear();
+        self.committed = complete_file_watermark(path).unwrap_or(0);
+        self.needs_detail_refetch = true;
+        self.authority = Authority::Provisional;
+        self.authority_deadline = None;
+        self.rollout_path = None;
+        self.file_identity = None;
+        self.emit_accounting();
+    }
 }
 
 /// Prompt-receive gate used by `connection.rs`. One flag with Grok — do not
@@ -652,13 +778,6 @@ fn is_regular_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn complete_line_bytes(bytes: &[u8]) -> u64 {
-    codex_complete_records(bytes)
-        .last()
-        .map(|(start, record)| start + record.len() as u64)
-        .unwrap_or(0)
-}
-
 fn is_item_n_id(id: &str) -> bool {
     id.strip_prefix("item-")
         .is_some_and(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()))
@@ -695,15 +814,13 @@ fn extract_user_input_text(payload: &Value) -> Option<String> {
 
 fn find_goal_native_turn_id(
     bytes: &[u8],
-    from: u64,
+    base_offset: u64,
     tombstones: &VecDeque<Tombstone>,
-) -> Option<String> {
+) -> Option<(String, u64)> {
     let mut pending: Option<String> = None;
     let mut goal_owned = false;
-    for (start, record) in codex_complete_records(bytes) {
-        if start < from {
-            continue;
-        }
+    for (relative_start, record) in codex_complete_records(bytes) {
+        let start = base_offset.saturating_add(relative_start);
         let Ok(line) = std::str::from_utf8(codex_record_payload(record)) else {
             continue;
         };
@@ -752,7 +869,7 @@ fn find_goal_native_turn_id(
         }
         if let (Some(turn_id), true) = (pending.as_deref(), goal_owned) {
             if !is_item_n_id(turn_id) && !tombstones.iter().any(|tomb| tomb.turn_id == turn_id) {
-                return Some(turn_id.to_string());
+                return Some((turn_id.to_string(), start + record.len() as u64));
             }
         }
     }
@@ -760,10 +877,8 @@ fn find_goal_native_turn_id(
 }
 
 fn has_task_complete(bytes: &[u8], turn_id: &str, from: u64) -> bool {
-    for (start, record) in codex_complete_records(bytes) {
-        if start < from {
-            continue;
-        }
+    for (relative_start, record) in codex_complete_records(bytes) {
+        let _start = from.saturating_add(relative_start);
         let Ok(line) = std::str::from_utf8(codex_record_payload(record)) else {
             continue;
         };
@@ -786,6 +901,14 @@ fn has_task_complete(bytes: &[u8], turn_id: &str, from: u64) -> bool {
     false
 }
 
+fn segmented_turn_id(base: &str, part: u32) -> String {
+    if part == 0 {
+        base.to_string()
+    } else {
+        format!("{base}:part:{part}")
+    }
+}
+
 fn keepalive_std() -> Duration {
     background_keepalive_max_age()
         .to_std()
@@ -795,8 +918,11 @@ fn keepalive_std() -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::acp::autonomous_activity::AutonomousCapabilities;
-    use crate::parsers::codex::codex_goal_turn_id;
+    use crate::acp::autonomous_activity::{
+        normalized_turn_payload_len, AutonomousCapabilities, EPISODE_PAYLOAD_MAX_BYTES,
+        PROVIDER_RECORD_IDENTITY_CAP,
+    };
+    use crate::parsers::codex::{codex_goal_turn_id, parse_codex_rollout};
     use serde_json::json;
     use std::fs;
     use std::io::Write;
@@ -864,6 +990,135 @@ mod tests {
         format!(
             r#"{{"timestamp":"{ts}","type":"response_item","payload":{{"type":"message","role":"assistant","id":"{id}","content":[{{"type":"output_text","text":"{text}"}}]}}}}"#
         )
+    }
+
+    #[test]
+    fn pathological_episode_force_rotates_and_keeps_identity_and_payload_bounds() {
+        let (_dir, root) = tmp_sessions();
+        let path = write_rollout(
+            &root,
+            "sess-1",
+            &format!("{}\n", session_meta_line("sess-1")),
+        );
+        let mut adapter = CodexAutonomousAdapter::new_for_test("sess-1", root);
+        adapter.on_session_ready("sess-1");
+
+        let mut episode = String::new();
+        episode.push_str(&task_started_line("turn_goal_1", "2026-08-18T00:00:01Z"));
+        episode.push('\n');
+        episode.push_str(&goal_context_line("2026-08-18T00:00:02Z"));
+        episode.push('\n');
+        for index in 0..(EPISODE_RECORD_FORCE_ROTATE + 1) {
+            episode.push_str(&assistant_line(
+                &format!("msg_{index}"),
+                &format!("chunk-{index};"),
+                "2026-08-18T00:00:03Z",
+            ));
+            episode.push('\n');
+        }
+        append_line(&path, episode.trim_end());
+
+        feed_goal(&mut adapter, "active", Ownership::Idle);
+        feed_thread(&mut adapter, "active", Ownership::Idle);
+        adapter.tail_once();
+        let first = adapter.take_emitted();
+        assert_eq!(first.turns.len(), 1);
+        assert!(normalized_turn_payload_len(&first.turns[0]) <= EPISODE_PAYLOAD_MAX_BYTES);
+        assert!(adapter.provider_record_identities.len() <= PROVIDER_RECORD_IDENTITY_CAP);
+        assert!(adapter.episode.segment_record_count < EPISODE_RECORD_FORCE_ROTATE);
+        let first_id = first.turns[0].id.clone();
+
+        adapter.tail_once();
+        let second = adapter.take_emitted();
+        assert_eq!(second.turns.len(), 1);
+        assert_ne!(second.turns[0].id, first_id);
+        assert!(format!("{:?}", second.turns[0].blocks).contains("chunk-1024"));
+    }
+
+    #[test]
+    fn terminal_only_segment_after_force_rotation_closes_episode() {
+        let (_dir, root) = tmp_sessions();
+        let path = write_rollout(
+            &root,
+            "sess-1",
+            &format!("{}\n", session_meta_line("sess-1")),
+        );
+        let mut adapter = CodexAutonomousAdapter::new_for_test("sess-1", root);
+        adapter.on_session_ready("sess-1");
+        let mut episode = format!(
+            "{}\n{}\n",
+            task_started_line("turn_goal_1", "2026-08-18T00:00:01Z"),
+            goal_context_line("2026-08-18T00:00:02Z")
+        );
+        for index in 0..EPISODE_RECORD_FORCE_ROTATE {
+            episode.push_str(&assistant_line(
+                &format!("msg_{index}"),
+                &format!("chunk-{index};"),
+                "2026-08-18T00:00:03Z",
+            ));
+            episode.push('\n');
+        }
+        append_line(&path, episode.trim_end());
+        feed_goal(&mut adapter, "active", Ownership::Idle);
+        feed_thread(&mut adapter, "active", Ownership::Idle);
+        adapter.tail_once();
+        assert_eq!(adapter.episode.segment_record_count, 0);
+
+        append_line(
+            &path,
+            &task_complete_line("turn_goal_1", "2026-08-18T00:00:04Z"),
+        );
+        feed_thread(&mut adapter, "idle", Ownership::Idle);
+        assert!(!adapter.autonomous_busy());
+        assert!(adapter.take_detail_refetch());
+    }
+
+    #[test]
+    fn replacement_discards_episode_refetches_and_revokes_native_authority() {
+        let (_dir, root) = tmp_sessions();
+        let path = write_rollout(
+            &root,
+            "sess-1",
+            &format!("{}\n", session_meta_line("sess-1")),
+        );
+        let mut adapter = CodexAutonomousAdapter::new_for_test("sess-1", root);
+        adapter.on_session_ready("sess-1");
+        append_line(
+            &path,
+            &task_started_line("turn_goal_1", "2026-08-18T00:00:01Z"),
+        );
+        append_line(&path, &goal_context_line("2026-08-18T00:00:02Z"));
+        append_line(
+            &path,
+            &assistant_line("msg_live", "working", "2026-08-18T00:00:03Z"),
+        );
+        feed_goal(&mut adapter, "active", Ownership::Idle);
+        feed_thread(&mut adapter, "active", Ownership::Idle);
+        adapter.tail_once();
+        assert!(adapter.autonomous_busy());
+        assert_eq!(adapter.take_emitted().turns.len(), 1);
+
+        let replacement = path.with_extension("replacement");
+        fs::write(
+            &replacement,
+            format!("{}\n", session_meta_line("other-session")),
+        )
+        .unwrap();
+        fs::remove_file(&path).unwrap();
+        fs::rename(&replacement, &path).unwrap();
+
+        adapter.tail_once();
+        assert!(!adapter.autonomous_busy());
+        assert!(adapter.take_detail_refetch());
+        assert_eq!(adapter.authority, Authority::Provisional);
+        assert!(adapter.rollout_path.is_none());
+        assert!(adapter.episode.native_turn_id.is_none());
+        assert!(adapter.episode.published_id.is_none());
+        assert_eq!(adapter.provider_record_identities.len(), 0);
+
+        feed_thread(&mut adapter, "active", Ownership::Idle);
+        assert_ne!(adapter.authority, Authority::Armed);
+        assert!(adapter.episode.native_turn_id.is_none());
     }
 
     fn session_info_params(goal_status: Option<&str>, thread_type: Option<&str>) -> Value {

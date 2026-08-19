@@ -9906,6 +9906,7 @@ async fn run_conversation_loop<'a>(
         flush_codex_autonomous(Some(adapter), state, emitter, &sid).await;
     }
     let mut held_prompt: Option<ConnectionCommand> = None;
+    let mut cancelled_prompt_generations = HashSet::new();
     loop {
         // Wait for either a user command or a session update (e.g. available_commands_update)
         let input = loop {
@@ -10114,6 +10115,9 @@ async fn run_conversation_loop<'a>(
                 mark_awaiting_reply,
                 turn_generation,
             }) => {
+                if cancelled_prompt_generations.remove(&turn_generation) {
+                    continue;
+                }
                 if should_hold_autonomous_prompt(grok_adapter.as_ref(), codex_adapter.as_ref()) {
                     held_prompt = Some(ConnectionCommand::Prompt {
                         blocks,
@@ -11410,7 +11414,28 @@ async fn run_conversation_loop<'a>(
                 }
             }
             ConversationInput::Control(ConnectionControl::Cancel) => {
-                held_prompt = None;
+                let held_generation = match held_prompt.take() {
+                    Some(ConnectionCommand::Prompt {
+                        turn_generation, ..
+                    }) => Some(turn_generation),
+                    Some(other) => {
+                        held_prompt = Some(other);
+                        None
+                    }
+                    None => None,
+                };
+                if let Some(generation) = held_generation {
+                    state.write().await.rollback_queued_prompt(generation);
+                } else {
+                    let mut session_state = state.write().await;
+                    if let Some(generation) = session_state.active_turn_generation {
+                        if session_state.rollback_queued_prompt(generation) {
+                            // The Prompt command may still be in cmd_rx because
+                            // the biased control lane won this iteration.
+                            cancelled_prompt_generations.insert(generation);
+                        }
+                    }
+                }
                 let cx = session.connection();
                 let sid = session.session_id().clone();
                 let _ = cx.send_notification_to(Agent, CancelNotification::new(sid.clone()));
@@ -13516,14 +13541,10 @@ async fn flush_grok_autonomous(
         return;
     };
     let refetch = adapter.take_detail_refetch();
-    let Some(batch) = adapter.take_activity() else {
-        if refetch {
-            tracing::debug!(
-                session_id = %fallback_session_id,
-                "[ACP] Grok autonomous episode scheduled a detail refetch"
-            );
-        }
-        return;
+    let batch = match adapter.take_activity() {
+        Some(batch) => batch,
+        None if refetch => adapter.take_emitted(),
+        None => return,
     };
     let session_id = if adapter.session_id().is_empty() {
         fallback_session_id.to_string()
@@ -13539,6 +13560,7 @@ async fn flush_grok_autonomous(
             outstanding: batch.outstanding,
             settled: batch.settled,
             watermark: batch.watermark,
+            detail_refetch: refetch,
         },
     )
     .await;
@@ -13574,14 +13596,10 @@ async fn flush_codex_autonomous(
         return;
     };
     let refetch = adapter.take_detail_refetch();
-    let Some(batch) = adapter.take_activity() else {
-        if refetch {
-            tracing::debug!(
-                session_id = %fallback_session_id,
-                "[ACP] Codex autonomous episode scheduled a detail refetch"
-            );
-        }
-        return;
+    let batch = match adapter.take_activity() {
+        Some(batch) => batch,
+        None if refetch => adapter.take_emitted(),
+        None => return,
     };
     let session_id = if adapter.session_id().is_empty() {
         fallback_session_id.to_string()
@@ -13597,6 +13615,7 @@ async fn flush_codex_autonomous(
             outstanding: batch.outstanding,
             settled: batch.settled,
             watermark: batch.watermark,
+            detail_refetch: refetch,
         },
     )
     .await;

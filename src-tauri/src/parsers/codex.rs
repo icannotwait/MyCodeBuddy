@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use chrono::{DateTime, Utc};
@@ -280,9 +280,35 @@ pub(crate) fn resolve_codex_home_dir() -> PathBuf {
 /// missing, duplicate, or mismatched rollout files. A trailing partial line
 /// is ignored, matching the complete-byte watermark cursor.
 pub(crate) fn rollout_session_id(path: impl AsRef<std::path::Path>) -> Option<String> {
-    let bytes = fs::read(path.as_ref()).ok()?;
-    for (_start, record) in codex_complete_records(&bytes) {
-        let Ok(line) = std::str::from_utf8(codex_record_payload(record)) else {
+    const MAX_PREFIX_RECORDS: usize = 32;
+    const MAX_PREFIX_RECORD_BYTES: usize = 64 * 1024;
+
+    let file = fs::File::open(path.as_ref()).ok()?;
+    let mut reader = BufReader::new(file);
+    let mut record = Vec::new();
+    for _ in 0..MAX_PREFIX_RECORDS {
+        record.clear();
+        loop {
+            let buffer = reader.fill_buf().ok()?;
+            if buffer.is_empty() {
+                return None;
+            }
+            let take = buffer
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(buffer.len(), |index| index + 1);
+            if record.len().saturating_add(take) > MAX_PREFIX_RECORD_BYTES {
+                return None;
+            }
+            let complete = buffer[take - 1] == b'\n';
+            record.extend_from_slice(&buffer[..take]);
+            reader.consume(take);
+            if complete {
+                break;
+            }
+        }
+
+        let Ok(line) = std::str::from_utf8(codex_record_payload(&record)) else {
             continue;
         };
         if line.trim().is_empty() {
@@ -343,6 +369,53 @@ pub(crate) fn parse_codex_rollout(
         .parse_conversation_detail(&path, conversation_id)
         .ok()?;
     Some((detail.turns, detail.transcript_watermark.unwrap_or(0)))
+}
+
+/// Normalize a bounded, structurally proven Goal-owned rollout segment using
+/// the cold parser. The synthetic records provide only ownership context and
+/// are suppressed by the same parser rules as native Goal context.
+pub(crate) fn parse_codex_goal_segment(
+    bytes: &[u8],
+    conversation_id: &str,
+    native_turn_id: &str,
+) -> Option<MessageTurn> {
+    let session_meta = serde_json::json!({
+        "timestamp": "1970-01-01T00:00:00Z",
+        "type": "session_meta",
+        "payload": { "id": conversation_id, "cwd": "" }
+    });
+    let task_started = serde_json::json!({
+        "timestamp": "1970-01-01T00:00:00Z",
+        "type": "event_msg",
+        "payload": { "type": "task_started", "turn_id": native_turn_id }
+    });
+    let goal_context = serde_json::json!({
+        "timestamp": "1970-01-01T00:00:00Z",
+        "type": "response_item",
+        "payload": {
+            "type": "message",
+            "role": "user",
+            "id": "codeg-autonomous-goal-context",
+            "content": [{
+                "type": "input_text",
+                "text": "<codex_internal_context source=\"goal\">\n</codex_internal_context>"
+            }]
+        }
+    });
+    let mut normalized = Vec::with_capacity(bytes.len().saturating_add(512));
+    for record in [session_meta, task_started, goal_context] {
+        serde_json::to_writer(&mut normalized, &record).ok()?;
+        normalized.push(b'\n');
+    }
+    normalized.extend_from_slice(bytes);
+
+    let path = PathBuf::from(format!("rollout-{conversation_id}.jsonl"));
+    CodexParser::new()
+        .parse_conversation_detail_from_bytes(&path, conversation_id, &normalized)
+        .ok()?
+        .turns
+        .into_iter()
+        .find(|turn| turn.id == codex_goal_turn_id(native_turn_id))
 }
 
 fn resolve_codex_home_dir_from(
@@ -2071,6 +2144,15 @@ impl CodexParser {
         conversation_id: &str,
     ) -> Result<ConversationDetail, ParseError> {
         let bytes = fs::read(path)?;
+        self.parse_conversation_detail_from_bytes(path, conversation_id, &bytes)
+    }
+
+    fn parse_conversation_detail_from_bytes(
+        &self,
+        path: &Path,
+        conversation_id: &str,
+        bytes: &[u8],
+    ) -> Result<ConversationDetail, ParseError> {
         let mut consumed_complete_bytes = 0u64;
         let mut native_spans: Vec<CodexNativeTurnSpan> = Vec::new();
 
@@ -2218,7 +2300,7 @@ impl CodexParser {
         let mut pending_reasoning: Vec<String> = Vec::new();
         let mut pending_reasoning_ts: Option<DateTime<Utc>> = None;
 
-        for (start, record) in codex_complete_records(&bytes) {
+        for (start, record) in codex_complete_records(bytes) {
             consumed_complete_bytes = start + record.len() as u64;
             let line = match std::str::from_utf8(codex_record_payload(record)) {
                 Ok(l) => l,

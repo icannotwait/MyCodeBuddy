@@ -23487,6 +23487,7 @@ mod tests {
                             turns: Vec::new(),
                             settled: Vec::new(),
                             watermark: 0,
+                            detail_refetch: false,
                         },
                     )
                     .await

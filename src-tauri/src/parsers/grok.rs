@@ -376,6 +376,30 @@ pub(crate) fn grok_turns_from_bytes(bytes: &[u8], session_id: &str) -> (Vec<Mess
     (parsed.turns, parsed.consumed_complete_bytes)
 }
 
+/// Normalize one bounded autonomous episode segment. The hidden trigger may
+/// live in a previous scanner batch, so its proven context is supplied by the
+/// observer while record offsets remain absolute for stable identity.
+pub(crate) fn grok_autonomous_turn_from_segment(
+    bytes: &[u8],
+    session_id: &str,
+    base_offset: u64,
+    trigger_start: u64,
+    task_ids: &[String],
+) -> Option<MessageTurn> {
+    parse_updates_from_bytes_with_context(
+        bytes,
+        session_id,
+        base_offset,
+        Some(PendingGrokAutonomous {
+            trigger_start,
+            task_ids: task_ids.to_vec(),
+        }),
+    )
+    .turns
+    .into_iter()
+    .find(|turn| turn.autonomous_origin == Some(AutonomousTurnOrigin::BackgroundTask))
+}
+
 // ---------------------------------------------------------------------------
 // summary.json
 // ---------------------------------------------------------------------------
@@ -619,6 +643,15 @@ fn parse_updates(path: &Path, session_id: &str) -> ParsedUpdates {
 }
 
 fn parse_updates_from_bytes(bytes: &[u8], session_id: &str) -> ParsedUpdates {
+    parse_updates_from_bytes_with_context(bytes, session_id, 0, None)
+}
+
+fn parse_updates_from_bytes_with_context(
+    bytes: &[u8],
+    session_id: &str,
+    base_offset: u64,
+    initial_pending: Option<PendingGrokAutonomous>,
+) -> ParsedUpdates {
     let mut out = ParsedUpdates::default();
     // The in-flight assistant turn, plus a `toolCallId → index-of-its-ToolResult`
     // map scoped to that turn (cleared on every turn boundary).
@@ -633,10 +666,11 @@ fn parse_updates_from_bytes(bytes: &[u8], session_id: &str) -> ParsedUpdates {
     // this lets consecutive same-prompt chunks merge into a single user turn
     // instead of each opening a new (often empty) one.
     let mut open_user_prompt_index: Option<i64> = None;
-    let mut pending_autonomous: Option<PendingGrokAutonomous> = None;
+    let mut pending_autonomous = initial_pending;
     let mut consumed_complete_bytes = 0u64;
 
-    for (start_offset, record) in grok_complete_records(&bytes) {
+    for (relative_start, record) in grok_complete_records(bytes) {
+        let start_offset = base_offset.saturating_add(relative_start);
         consumed_complete_bytes = start_offset + record.len() as u64;
         let payload = grok_record_payload(record);
         let Ok(line) = std::str::from_utf8(payload) else {

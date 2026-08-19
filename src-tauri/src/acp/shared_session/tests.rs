@@ -4003,6 +4003,7 @@ mod tests {
                         outstanding: 1,
                         settled: Vec::new(),
                         watermark: 0,
+                        detail_refetch: false,
                     })
                     .await;
                 }
@@ -4103,6 +4104,7 @@ mod tests {
                         outstanding: 0,
                         settled: Vec::new(),
                         watermark: 1,
+                        detail_refetch: false,
                     })
                     .await;
                 }

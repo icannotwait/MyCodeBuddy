@@ -2635,6 +2635,8 @@ export type AcpEvent =
       outstanding: number
       settled?: BackgroundSettledInfo[]
       watermark: number
+      /** One-shot terminal/recovery cue to fold persisted overlay content. */
+      detail_refetch?: boolean
     }
   /**
    * A `delegate_to_agent` MCP tool call from the parent agent has spawned a

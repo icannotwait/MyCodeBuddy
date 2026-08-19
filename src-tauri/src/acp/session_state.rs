@@ -837,6 +837,22 @@ impl SessionState {
         self.status = ConnectionStatus::Connecting;
     }
 
+    /// Roll back a prompt admitted by the manager but not yet started on the
+    /// agent. This is generation-fenced because Stop may race a newly admitted
+    /// prompt after an older queued command has already been discarded.
+    pub fn rollback_queued_prompt(&mut self, generation: u64) -> bool {
+        if self.active_turn_generation != Some(generation) || !self.turn_in_flight {
+            return false;
+        }
+
+        self.active_turn_generation = None;
+        self.active_turn = None;
+        self.active_provider_turn_id = None;
+        self.turn_in_flight = false;
+        self.supervisor_wake.notify();
+        true
+    }
+
     /// Clear only the active turn fenced by `generation`, retaining session
     /// identity, history/route state, live delegation projections, and the
     /// latest internal-prompt admission fence.
@@ -2430,6 +2446,31 @@ mod tests {
     }
 
     #[test]
+    fn queued_prompt_rollback_is_generation_fenced_and_not_a_foreground_terminal() {
+        let mut state = fresh_state();
+        state.parent_turn_generation = 7;
+        state.active_turn_generation = Some(7);
+        state.turn_in_flight = true;
+        state.active_turn = Some(ActiveTurnContext {
+            token: "queued-turn".into(),
+            locale: AppLocale::En,
+        });
+
+        assert!(!state.rollback_queued_prompt(6));
+        assert_eq!(state.active_turn_generation, Some(7));
+        assert!(state.turn_in_flight);
+        assert!(state.active_turn.is_some());
+
+        assert!(state.rollback_queued_prompt(7));
+        assert_eq!(state.parent_turn_generation, 7);
+        assert_eq!(state.active_turn_generation, None);
+        assert!(!state.turn_in_flight);
+        assert!(state.active_turn.is_none());
+        assert_eq!(state.last_suspended_turn_generation, None);
+        assert_eq!(state.last_assistant_text, None);
+    }
+
+    #[test]
     fn shared_session_projection_reconstructs_queue_and_active_turn() {
         use crate::acp::shared_session::{
             SharedActiveTurnProjection, SharedQueuedPromptState, SharedQueuedPromptSummary,
@@ -3040,6 +3081,7 @@ mod tests {
             outstanding: 2,
             settled: vec![],
             watermark: 42,
+            detail_refetch: false,
         });
         assert_eq!(s.background_outstanding, 2);
         let now = Utc::now();
@@ -3057,6 +3099,7 @@ mod tests {
             outstanding: 0,
             settled: vec![],
             watermark: 43,
+            detail_refetch: false,
         });
         assert!(!s.has_active_background_work(Utc::now()));
     }
@@ -3070,6 +3113,7 @@ mod tests {
             outstanding: 3,
             settled: vec![],
             watermark: 0,
+            detail_refetch: false,
         });
         assert_eq!(s.to_snapshot().background_outstanding, 3);
         let json = serde_json::to_value(s.to_snapshot()).unwrap();

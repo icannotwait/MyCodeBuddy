@@ -761,6 +761,7 @@ impl WatchState {
             outstanding,
             settled,
             watermark: self.committed,
+            detail_refetch: false,
         })
     }
 
