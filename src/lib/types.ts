@@ -356,6 +356,11 @@ export interface TurnOutcome {
   duration_ms?: number | null
 }
 
+export type AutonomousTurnOrigin =
+  | "background_task"
+  | "automation"
+  | "agent_autonomous"
+
 export interface MessageTurn {
   id: string
   role: TurnRole
@@ -378,6 +383,7 @@ export interface MessageTurn {
   completed_at?: string | null
   /** Optional terminal outcome (e.g. user Stop interruption metadata). */
   outcome?: TurnOutcome | null
+  autonomous_origin?: AutonomousTurnOrigin | null
 }
 
 export interface ConversationDetail {
@@ -385,10 +391,13 @@ export interface ConversationDetail {
   turns: MessageTurn[]
   session_stats?: SessionStats | null
   /**
-   * Byte length of the source transcript this parse consumed (Claude only;
-   * absent elsewhere). Retires background-overlay turns whose
-   * `background_activity` watermark it has caught up to — see
-   * `BackgroundOverlayEntry` in the conversation runtime store.
+   * Byte length of the source transcript this parse consumed (available for
+   * transcript-backed autonomous overlay providers (Claude, Grok
+   * `updates.jsonl`, Codex native rollout); absent elsewhere). Retires
+   * background-overlay turns whose `background_activity` watermark it has
+   * caught up to (`>=`) — see `BackgroundOverlayEntry` in the conversation
+   * runtime store. Until retirement, a same-id overlay and detail turn render
+   * once, preferring the newer overlay (origin included).
    */
   transcript_watermark?: number | null
 }
@@ -2626,6 +2635,8 @@ export type AcpEvent =
       outstanding: number
       settled?: BackgroundSettledInfo[]
       watermark: number
+      /** One-shot terminal/recovery cue to fold persisted overlay content. */
+      detail_refetch?: boolean
     }
   /**
    * A `delegate_to_agent` MCP tool call from the parent agent has spawned a

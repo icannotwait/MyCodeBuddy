@@ -1,7 +1,9 @@
+pub mod autonomous_activity;
 pub mod background_watch;
 pub mod binary_cache;
 pub mod bundled_agent;
 pub mod chat_authoring;
+pub mod codex_autonomous;
 pub mod codex_catalog_source;
 pub mod codex_cli;
 pub mod codex_goal;
@@ -18,6 +20,7 @@ pub mod event_stream;
 pub mod feedback;
 pub mod file_system_runtime;
 pub mod fork;
+pub mod grok_autonomous;
 pub mod grok_retry;
 pub mod host_tools_policy;
 pub mod idle_sweep;

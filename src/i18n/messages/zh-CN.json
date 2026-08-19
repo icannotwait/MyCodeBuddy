@@ -3147,6 +3147,7 @@
         "showLess": "收起",
         "responseInterrupted": "响应已中断",
         "waitingForSubagents": "等待子任务中…",
+        "backgroundContinuation": "后台续写",
         "loadOlderHistory": "加载更早的消息",
         "loadEarlier": "加载更早的消息",
         "loadingEarlier": "正在加载更早的消息…"

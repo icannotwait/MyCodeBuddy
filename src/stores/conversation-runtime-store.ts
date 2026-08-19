@@ -4491,8 +4491,10 @@ function computeHistoricalTimeline(
   // completions, the agent's continued work after them, cron//loop turns)
   // parsed from the agent's own transcript by the backend watcher. They are
   // already-persisted facts shown ahead of the next detail refetch, which
-  // retires them via the watermark rule (see FETCH_DETAIL_SUCCESS) — so a
-  // persisted copy and an overlay copy never coexist here. Interleaved with
+  // retires them via the watermark rule (see FETCH_DETAIL_SUCCESS). Until
+  // `detail.transcript_watermark >= entry.watermark`, a same-id overlay and
+  // persisted copy are deduped to one row (keep-last assistant), so the
+  // newer overlay — and its autonomous origin — wins. Interleaved with
   // localTurns by timestamp so a foreground exchange completed BETWEEN
   // background turns keeps wall-clock order.
   const background: ConversationTimelineTurn[] = session.backgroundTurns.map(

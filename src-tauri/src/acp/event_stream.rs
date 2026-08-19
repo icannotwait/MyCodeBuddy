@@ -435,6 +435,7 @@ fn estimate_envelope_size(envelope: &EventEnvelope) -> usize {
             outstanding: _,
             settled,
             watermark: _,
+            detail_refetch: _,
         } => {
             json_str_len(session_id)
                 + turns.len().saturating_sub(1)
@@ -1150,6 +1151,7 @@ mod tests {
             reasoning_effort: None,
             completed_at: Some(chrono::Utc::now()),
             outcome: None,
+            autonomous_origin: None,
         };
         let env = Arc::new(EventEnvelope {
             seq: u64::MAX,
@@ -1179,6 +1181,7 @@ mod tests {
                     },
                 ],
                 watermark: u64::MAX,
+                detail_refetch: true,
             },
         });
         assert_ge_serialized(&env);
@@ -1193,6 +1196,7 @@ mod tests {
                 outstanding: 0,
                 settled: vec![],
                 watermark: 0,
+                detail_refetch: false,
             },
         });
         assert_ge_serialized(&env);

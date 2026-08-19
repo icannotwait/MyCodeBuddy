@@ -143,6 +143,7 @@ mod tests {
             reasoning_effort: None,
             completed_at: None,
             outcome: None,
+            autonomous_origin: None,
         }
     }
 

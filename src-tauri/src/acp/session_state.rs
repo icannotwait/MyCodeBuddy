@@ -444,17 +444,18 @@ pub struct SessionState {
     /// Size is human-bounded (one entry per note the user types this turn).
     pub feedback: Vec<FeedbackItem>,
 
-    /// Launched-but-unresolved background tasks (async sub-agents + background
-    /// shell tasks), mirrored from the transcript watcher's authoritative
-    /// accounting via `AcpEvent::BackgroundActivity` (`apply_event` is the only
-    /// writer). Drives `has_active_background_work()` — the idle-sweep
-    /// exemption that keeps the agent CLI alive through a silent background
-    /// build (killing the connection kills the CLI, and the background work
-    /// dies with it). Carried on `to_snapshot()` so a client attaching
-    /// mid-episode recovers the pending count without replaying events.
+    /// Launched-but-unresolved autonomous background work (Claude transcript
+    /// tasks, Grok background-task follow-ups, and later Codex Goal keepalive),
+    /// mirrored from the active adapter's `AcpEvent::BackgroundActivity`
+    /// (`apply_event` is the only writer). Drives `has_active_background_work()`
+    /// — the idle-sweep exemption that keeps the agent CLI alive through a
+    /// silent background build (killing the connection kills the CLI, and the
+    /// background work dies with it). Carried on `to_snapshot()` so a client
+    /// attaching mid-episode recovers the pending count without replaying
+    /// events.
     pub background_outstanding: u32,
     /// Instant of the most recent `BackgroundActivity` event. Bounds the sweep
-    /// exemption: if the watcher stops reporting (task died, bug) the
+    /// exemption: if the adapter/watcher stops reporting (task died, bug) the
     /// exemption lapses after `background_keepalive_max_age()` instead of
     /// pinning the connection alive forever. Backend-internal; not serialized.
     pub background_activity_at: Option<DateTime<Utc>>,
@@ -571,6 +572,10 @@ pub struct SessionState {
     /// across separate updates — can never render two goal cards.
     /// Backend-internal routing only: not part of the client snapshot.
     pub neutral_goal_channel: bool,
+
+    /// Initialize-time autonomous policy inputs. `goal_version` is `Some(1)`
+    /// only when `_meta.goal.version == 1` exactly.
+    pub autonomous_caps: crate::acp::autonomous_activity::AutonomousCapabilities,
 
     /// Goal-control request method for this connection. Defaults to codex's
     /// legacy bespoke `_codex/session/goal_control`; overwritten at
@@ -785,6 +790,7 @@ impl SessionState {
             feedback_tool_available: false,
             native_steering_available: false,
             neutral_goal_channel: false,
+            autonomous_caps: crate::acp::autonomous_activity::AutonomousCapabilities::default(),
             goal_control_method: crate::acp::codex_goal::LEGACY_GOAL_CONTROL_METHOD.to_string(),
             goal_actions: None,
             goal_active: false,
@@ -829,6 +835,22 @@ impl SessionState {
         self.event_stream = previous.event_stream;
         self.recent_events = previous.recent_events;
         self.status = ConnectionStatus::Connecting;
+    }
+
+    /// Roll back a prompt admitted by the manager but not yet started on the
+    /// agent. This is generation-fenced because Stop may race a newly admitted
+    /// prompt after an older queued command has already been discarded.
+    pub fn rollback_queued_prompt(&mut self, generation: u64) -> bool {
+        if self.active_turn_generation != Some(generation) || !self.turn_in_flight {
+            return false;
+        }
+
+        self.active_turn_generation = None;
+        self.active_turn = None;
+        self.active_provider_turn_id = None;
+        self.turn_in_flight = false;
+        self.supervisor_wake.notify();
+        true
     }
 
     /// Clear only the active turn fenced by `generation`, retaining session
@@ -1643,7 +1665,7 @@ impl SessionState {
                 }
             }
             AcpEvent::BackgroundActivity { outstanding, .. } => {
-                // Mirror the watcher's authoritative accounting so the idle
+                // Mirror the adapter's authoritative accounting so the idle
                 // sweeps can exempt this connection while background work is
                 // pending. The turns/settled payloads are frontend-only; the
                 // trailing `last_activity_at = now` below additionally resets
@@ -1736,14 +1758,15 @@ impl SessionState {
         completion
     }
 
-    /// Whether this connection has launched background work (async sub-agent /
-    /// background shell task) that hasn't settled yet — the idle sweeps must
-    /// not reap it (disconnecting drops the `sacp` connection, which
-    /// terminates the agent CLI process, which kills the background work).
+    /// Whether this connection has launched autonomous background work (async
+    /// sub-agent, background shell task, or a Grok idle follow-up) that hasn't
+    /// settled yet — the idle sweeps must not reap it (disconnecting drops the
+    /// `sacp` connection, which terminates the agent CLI process, which kills
+    /// the background work).
     ///
     /// Bounded by `background_keepalive_max_age()`: the exemption requires a
-    /// `BackgroundActivity` event within the window, so a wedged/dead watcher
-    /// can't pin a connection alive forever. (The watcher itself also expires
+    /// `BackgroundActivity` event within the window, so a wedged/dead adapter
+    /// can't pin a connection alive forever. (The adapter itself also expires
     /// tasks past the same age and emits `outstanding: 0`, which resets
     /// `background_outstanding` here — this check is the belt to that
     /// suspenders.)
@@ -2423,6 +2446,31 @@ mod tests {
     }
 
     #[test]
+    fn queued_prompt_rollback_is_generation_fenced_and_not_a_foreground_terminal() {
+        let mut state = fresh_state();
+        state.parent_turn_generation = 7;
+        state.active_turn_generation = Some(7);
+        state.turn_in_flight = true;
+        state.active_turn = Some(ActiveTurnContext {
+            token: "queued-turn".into(),
+            locale: AppLocale::En,
+        });
+
+        assert!(!state.rollback_queued_prompt(6));
+        assert_eq!(state.active_turn_generation, Some(7));
+        assert!(state.turn_in_flight);
+        assert!(state.active_turn.is_some());
+
+        assert!(state.rollback_queued_prompt(7));
+        assert_eq!(state.parent_turn_generation, 7);
+        assert_eq!(state.active_turn_generation, None);
+        assert!(!state.turn_in_flight);
+        assert!(state.active_turn.is_none());
+        assert_eq!(state.last_suspended_turn_generation, None);
+        assert_eq!(state.last_assistant_text, None);
+    }
+
+    #[test]
     fn shared_session_projection_reconstructs_queue_and_active_turn() {
         use crate::acp::shared_session::{
             SharedActiveTurnProjection, SharedQueuedPromptState, SharedQueuedPromptSummary,
@@ -3033,6 +3081,7 @@ mod tests {
             outstanding: 2,
             settled: vec![],
             watermark: 42,
+            detail_refetch: false,
         });
         assert_eq!(s.background_outstanding, 2);
         let now = Utc::now();
@@ -3050,6 +3099,7 @@ mod tests {
             outstanding: 0,
             settled: vec![],
             watermark: 43,
+            detail_refetch: false,
         });
         assert!(!s.has_active_background_work(Utc::now()));
     }
@@ -3063,6 +3113,7 @@ mod tests {
             outstanding: 3,
             settled: vec![],
             watermark: 0,
+            detail_refetch: false,
         });
         assert_eq!(s.to_snapshot().background_outstanding, 3);
         let json = serde_json::to_value(s.to_snapshot()).unwrap();

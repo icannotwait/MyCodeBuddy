@@ -3147,6 +3147,7 @@
         "showLess": "折りたたむ",
         "responseInterrupted": "応答が中断されました",
         "waitingForSubagents": "サブエージェントを待機中…",
+        "backgroundContinuation": "バックグラウンド継続",
         "loadOlderHistory": "以前のメッセージを読み込む",
         "loadEarlier": "以前のメッセージを読み込む",
         "loadingEarlier": "以前のメッセージを読み込み中…"

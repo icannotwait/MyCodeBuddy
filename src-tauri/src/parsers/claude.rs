@@ -246,6 +246,29 @@ fn is_task_notification_record(value: &serde_json::Value) -> bool {
         .is_some_and(|raw| raw.trim_start().starts_with("<task-notification>"))
 }
 
+/// Cron / `/loop` initiator the watcher already treats as out-of-turn
+/// automation: `isMeta` + bare string content + `userType: "external"`.
+/// Slash-command expansions are array content; `/goal` hooks share a
+/// command `promptId` and are excluded by the accumulator, not here.
+pub(crate) fn is_explicit_automation_marker(value: &serde_json::Value) -> bool {
+    if !is_meta_message(value) {
+        return false;
+    }
+    if value.get("type").and_then(|t| t.as_str()) != Some("user") {
+        return false;
+    }
+    if value.get("userType").and_then(|v| v.as_str()) != Some("external") {
+        return false;
+    }
+    let Some(raw) = value.pointer("/message/content").and_then(|c| c.as_str()) else {
+        return false;
+    };
+    if raw.trim_start().starts_with("<task-notification>") {
+        return false;
+    }
+    strip_system_tags(raw).is_some()
+}
+
 /// Resolve a buffered slash command against the record that follows it.
 ///
 /// A slash command is persisted as its own user record whose content is pure
@@ -1089,6 +1112,16 @@ pub(crate) struct ClaudeRecordAccumulator {
     /// task id → LATEST `<task-notification>` payload (the same id can notify
     /// more than once — a resumed sub-agent re-notifies; last wins).
     background_notifications: std::collections::HashMap<String, BackgroundNotification>,
+    /// Proven origin for the next assistant message, reconstructed from
+    /// transcript markers only (never from the live prompt ledger).
+    pending_autonomous_origin: Option<crate::models::message::AutonomousTurnOrigin>,
+    /// `promptId` of the last user-typed slash command. An `isMeta` string
+    /// sharing this id is that command's hook, not a cron/loop marker.
+    last_slash_command_prompt_id: Option<String>,
+    /// Assistant `UnifiedMessage.id` → origin proven while that message
+    /// was pushed. Applied in [`group_into_turns_with_origins`].
+    assistant_origins:
+        std::collections::HashMap<String, crate::models::message::AutonomousTurnOrigin>,
 }
 
 impl ClaudeRecordAccumulator {
@@ -1108,6 +1141,9 @@ impl ClaudeRecordAccumulator {
             open_goal: None,
             background_acks: std::collections::HashMap::new(),
             background_notifications: std::collections::HashMap::new(),
+            pending_autonomous_origin: None,
+            last_slash_command_prompt_id: None,
+            assistant_origins: std::collections::HashMap::new(),
         }
     }
 
@@ -1141,6 +1177,9 @@ impl ClaudeRecordAccumulator {
             open_goal,
             background_acks,
             background_notifications,
+            pending_autonomous_origin,
+            last_slash_command_prompt_id,
+            assistant_origins,
         } = self;
 
         let msg_type = value.get("type").and_then(|t| t.as_str()).unwrap_or("");
@@ -1171,7 +1210,22 @@ impl ClaudeRecordAccumulator {
 
         // Skip system meta messages and interrupt bookkeeping. The interrupt
         // marker already resolved a pending command above; it must not also
-        // render as a user turn.
+        // render as a user turn. Cron/`/loop` injections are `isMeta` + string
+        // + `userType: external` and must stamp the following assistant before
+        // this return hides the record.
+        if is_explicit_automation_marker(&value) {
+            let same_submission = matches!(
+                (
+                    last_slash_command_prompt_id.as_deref(),
+                    value.get("promptId").and_then(|p| p.as_str())
+                ),
+                (Some(cmd), Some(rec)) if cmd == rec
+            );
+            if !same_submission {
+                *pending_autonomous_origin =
+                    Some(crate::models::message::AutonomousTurnOrigin::Automation);
+            }
+        }
         if is_meta_message(&value) || is_interrupt_marker(&value) {
             return;
         }
@@ -1222,6 +1276,8 @@ impl ClaudeRecordAccumulator {
                     .and_then(|u| u.as_str())
                     .unwrap_or("")
                     .to_string();
+                *pending_autonomous_origin = None;
+                *last_slash_command_prompt_id = prompt_id.clone();
                 *pending_command = Some((
                     UnifiedMessage {
                         id: uuid,
@@ -1255,6 +1311,8 @@ impl ClaudeRecordAccumulator {
                     .and_then(|c| c.as_str())
                 {
                     if raw.trim_start().starts_with("<task-notification>") {
+                        *pending_autonomous_origin =
+                            Some(crate::models::message::AutonomousTurnOrigin::BackgroundTask);
                         if let Some(task_id) = capture_tag(task_notification_task_id_regex(), raw) {
                             background_notifications.insert(
                                 task_id,
@@ -1376,6 +1434,15 @@ impl ClaudeRecordAccumulator {
                     }
                 }
 
+                if matches!(role, MessageRole::User)
+                    && !content
+                        .iter()
+                        .all(|b| matches!(b, ContentBlock::ToolResult { .. }))
+                {
+                    *pending_autonomous_origin = None;
+                    *last_slash_command_prompt_id = None;
+                }
+
                 messages.push(UnifiedMessage {
                     id: uuid,
                     role,
@@ -1414,6 +1481,10 @@ impl ClaudeRecordAccumulator {
 
                 let content = extract_assistant_content(&value);
                 let usage = extract_usage(&value);
+
+                if let Some(origin) = *pending_autonomous_origin {
+                    assistant_origins.insert(uuid.clone(), origin);
+                }
 
                 messages.push(UnifiedMessage {
                     id: uuid,
@@ -1509,8 +1580,12 @@ impl ClaudeRecordAccumulator {
                         status: None,
                     });
                 } else {
+                    let synth_id = format!("synth-assistant-{}", messages.len());
+                    if let Some(origin) = *pending_autonomous_origin {
+                        assistant_origins.insert(synth_id.clone(), origin);
+                    }
                     messages.push(UnifiedMessage {
-                        id: format!("synth-assistant-{}", messages.len()),
+                        id: synth_id,
                         role: MessageRole::Assistant,
                         content: vec![ContentBlock::ToolUse {
                             tool_use_id: Some(synthetic_id),
@@ -1631,8 +1706,12 @@ impl ClaudeRecordAccumulator {
                     });
                 } else {
                     let timestamp = parse_timestamp(&value).unwrap_or_else(Utc::now);
+                    let synth_id = format!("synth-result-{}", messages.len());
+                    if let Some(origin) = *pending_autonomous_origin {
+                        assistant_origins.insert(synth_id.clone(), origin);
+                    }
                     messages.push(UnifiedMessage {
-                        id: format!("synth-result-{}", messages.len()),
+                        id: synth_id,
                         role: MessageRole::Assistant,
                         content: vec![ContentBlock::ToolResult {
                             tool_use_id: matching_id,
@@ -1764,13 +1843,14 @@ impl ClaudeParser {
             ai_title,
             first_timestamp,
             last_timestamp,
+            assistant_origins,
             ..
         } = acc;
 
         let folder_path = cwd.clone();
         let folder_name = folder_path.as_ref().map(|p| folder_name_from_path(p));
 
-        let mut turns = group_into_turns(messages);
+        let mut turns = group_into_turns_with_origins(messages, &assistant_origins);
         super::relocate_orphaned_tool_results(&mut turns);
         super::structurize_read_tool_output(&mut turns);
         super::resolve_patch_line_numbers(&mut turns, cwd.as_deref());
@@ -2275,6 +2355,13 @@ fn is_tool_result_only(msg: &UnifiedMessage) -> bool {
 /// this same Stage-B grouping over an incremental record suffix so overlay
 /// turns assemble exactly like a full detail parse would.
 pub(crate) fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn> {
+    group_into_turns_with_origins(messages, &std::collections::HashMap::new())
+}
+
+pub(crate) fn group_into_turns_with_origins(
+    messages: Vec<UnifiedMessage>,
+    origins: &std::collections::HashMap<String, crate::models::message::AutonomousTurnOrigin>,
+) -> Vec<MessageTurn> {
     let mut turns = Vec::new();
     let mut i = 0;
 
@@ -2288,6 +2375,7 @@ pub(crate) fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn
             let usage = msg.usage.clone();
             let duration_ms = msg.duration_ms;
             let turn_model = msg.model.clone();
+            let autonomous_origin = origins.get(&msg.id).copied();
             // Track the latest event time across the assistant message and
             // any tool-result-only user messages absorbed below; that's the
             // turn's true completion moment, not `timestamp + duration_ms`
@@ -2317,6 +2405,7 @@ pub(crate) fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn
                 reasoning_effort: None,
                 completed_at,
                 outcome: None,
+                autonomous_origin,
             });
         } else if matches!(msg.role, MessageRole::System) {
             turns.push(MessageTurn {
@@ -2330,6 +2419,7 @@ pub(crate) fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn
                 reasoning_effort: None,
                 completed_at: msg.completed_at,
                 outcome: None,
+                autonomous_origin: None,
             });
             i += 1;
         } else {
@@ -2344,6 +2434,7 @@ pub(crate) fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn
                 reasoning_effort: None,
                 completed_at: msg.completed_at,
                 outcome: None,
+                autonomous_origin: None,
             });
             i += 1;
         }
@@ -2395,7 +2486,7 @@ mod tests {
         }
         acc.finalize_background_lifecycle();
         let cwd = acc.cwd.clone();
-        let mut turns = group_into_turns(acc.messages);
+        let mut turns = group_into_turns_with_origins(acc.messages, &acc.assistant_origins);
         crate::parsers::relocate_orphaned_tool_results(&mut turns);
         crate::parsers::structurize_read_tool_output(&mut turns);
         crate::parsers::resolve_patch_line_numbers(&mut turns, cwd.as_deref());
@@ -2406,6 +2497,124 @@ mod tests {
             serde_json::to_string(&detail.turns).unwrap(),
             "accumulator pipeline must be byte-identical to the detail parse"
         );
+    }
+
+    fn parse_origin_fixture(session_id: &str, lines: &[&str]) -> ConversationDetail {
+        let dir = tempfile::tempdir().unwrap();
+        let proj = dir.path().join("-Users-test-proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        let path = proj.join(format!("{session_id}.jsonl"));
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+        ClaudeParser::with_base_dir(dir.path().to_path_buf())
+            .get_conversation(session_id)
+            .unwrap()
+    }
+
+    /// Same transcript dialect as `accumulator_pipeline_matches_full_detail_parse`:
+    /// a user-prompted launch, then a `<task-notification>` continuation.
+    #[test]
+    fn task_notification_continuation_is_background_task_origin() {
+        let detail = parse_origin_fixture(
+            "sess-task-origin",
+            &[
+                r#"{"type":"user","timestamp":"2026-07-07T03:40:00.000Z","uuid":"u1","cwd":"/Users/test/proj","message":{"role":"user","content":[{"type":"text","text":"run the build"}]}}"#,
+                r#"{"type":"assistant","timestamp":"2026-07-07T03:40:05.000Z","uuid":"a1","message":{"role":"assistant","model":"claude-sonnet-5","content":[{"type":"text","text":"Launching."},{"type":"tool_use","id":"toolu_01","name":"Agent","input":{"description":"Run pnpm build"}}]}}"#,
+                r#"{"type":"user","timestamp":"2026-07-07T03:40:06.000Z","uuid":"u2","message":{"role":"user","content":[{"tool_use_id":"toolu_01","type":"tool_result","content":[{"type":"text","text":"Async agent launched successfully. agentId: abc123"}]}]},"toolUseResult":{"isAsync":true,"status":"async_launched","agentId":"abc123","description":"Run pnpm build"}}"#,
+                r#"{"type":"user","timestamp":"2026-07-07T03:41:00.000Z","uuid":"u3","message":{"role":"user","content":"<task-notification>\n<task-id>abc123</task-id>\n<status>completed</status>\n<summary>Agent finished</summary>\n<result>Build OK</result>\n</task-notification>"}}"#,
+                r#"{"type":"assistant","timestamp":"2026-07-07T03:41:05.000Z","uuid":"a2","message":{"role":"assistant","model":"claude-sonnet-5","content":[{"type":"text","text":"Build finished cleanly."}]}}"#,
+            ],
+        );
+        let continuation = detail
+            .turns
+            .iter()
+            .find(|t| {
+                matches!(t.role, TurnRole::Assistant)
+                    && t.blocks.iter().any(|b| match b {
+                        ContentBlock::Text { text } => {
+                            !text.contains("<task-notification>")
+                                && text.contains("Build finished cleanly")
+                        }
+                        _ => false,
+                    })
+            })
+            .expect("assistant continuation after notification");
+        assert_eq!(
+            continuation.autonomous_origin,
+            Some(crate::models::message::AutonomousTurnOrigin::BackgroundTask)
+        );
+    }
+
+    #[test]
+    fn user_prompted_assistant_turn_has_no_autonomous_origin() {
+        let detail = parse_origin_fixture(
+            "sess-user-origin",
+            &[
+                r#"{"type":"user","timestamp":"2026-07-07T03:40:00.000Z","uuid":"u1","cwd":"/Users/test/proj","message":{"role":"user","content":[{"type":"text","text":"run the build"}]}}"#,
+                r#"{"type":"assistant","timestamp":"2026-07-07T03:40:05.000Z","uuid":"a1","message":{"role":"assistant","model":"claude-sonnet-5","content":[{"type":"text","text":"Launching."}]}}"#,
+            ],
+        );
+        let prompted = detail
+            .turns
+            .iter()
+            .find(|t| matches!(t.role, TurnRole::Assistant))
+            .expect("user-prompted assistant");
+        assert_eq!(prompted.autonomous_origin, None);
+    }
+
+    #[test]
+    fn cron_meta_string_continuation_is_automation_origin() {
+        let detail = parse_origin_fixture(
+            "sess-cron-origin",
+            &[
+                r#"{"type":"user","timestamp":"2026-07-07T03:42:00.000Z","uuid":"u4","isMeta":true,"userType":"external","message":{"role":"user","content":"check the weather"}}"#,
+                r#"{"type":"assistant","timestamp":"2026-07-07T03:42:05.000Z","uuid":"a3","message":{"role":"assistant","model":"claude-sonnet-5","content":[{"type":"text","text":"Sunny, 25°C."}]}}"#,
+            ],
+        );
+        let cron_reply = detail
+            .turns
+            .iter()
+            .find(|t| matches!(t.role, TurnRole::Assistant))
+            .expect("cron assistant continuation");
+        assert_eq!(
+            cron_reply.autonomous_origin,
+            Some(crate::models::message::AutonomousTurnOrigin::Automation)
+        );
+    }
+
+    #[test]
+    fn cold_parse_does_not_invent_origin_for_a_plain_user_prompt() {
+        let detail = parse_origin_fixture(
+            "sess-plain-origin",
+            &[
+                r#"{"type":"user","timestamp":"2026-07-07T03:48:00.000Z","uuid":"u1","message":{"role":"user","content":[{"type":"text","text":"keep going"}]}}"#,
+                r#"{"type":"assistant","timestamp":"2026-07-07T03:48:05.000Z","uuid":"a1","message":{"role":"assistant","model":"claude-sonnet-5","content":[{"type":"text","text":"Continuing."}]}}"#,
+            ],
+        );
+        let reply = detail
+            .turns
+            .iter()
+            .find(|t| matches!(t.role, TurnRole::Assistant))
+            .expect("plain assistant");
+        assert_eq!(reply.autonomous_origin, None);
+    }
+
+    #[test]
+    fn goal_hook_reply_is_not_automation_origin() {
+        let detail = parse_origin_fixture(
+            "sess-goal-hook-origin",
+            &[
+                r#"{"type":"user","timestamp":"2026-08-15T23:43:38.000Z","uuid":"u-goal","promptId":"p1","message":{"role":"user","content":"<command-name>/goal</command-name>\n<command-args>ship it</command-args>"}}"#,
+                r#"{"type":"user","timestamp":"2026-08-15T23:43:38.100Z","uuid":"u-out","promptId":"p1","message":{"role":"user","content":"<local-command-stdout>Goal set: ship it</local-command-stdout>"}}"#,
+                r#"{"type":"user","timestamp":"2026-08-15T23:43:38.200Z","uuid":"u-hook","promptId":"p1","isMeta":true,"userType":"external","message":{"role":"user","content":"A session-scoped Stop hook is now active with condition: ship it."}}"#,
+                r#"{"type":"assistant","timestamp":"2026-08-15T23:43:44.000Z","uuid":"a1","message":{"role":"assistant","model":"claude-sonnet-5","content":[{"type":"text","text":"On it."}]}}"#,
+            ],
+        );
+        let reply = detail
+            .turns
+            .iter()
+            .find(|t| matches!(t.role, TurnRole::Assistant))
+            .expect("goal hook assistant");
+        assert_eq!(reply.autonomous_origin, None);
     }
 
     #[test]
@@ -2520,6 +2729,7 @@ mod tests {
                 reasoning_effort: None,
                 completed_at: None,
                 outcome: None,
+                autonomous_origin: None,
             },
             MessageTurn {
                 id: "turn-1".to_string(),
@@ -2537,6 +2747,7 @@ mod tests {
                 reasoning_effort: None,
                 completed_at: None,
                 outcome: None,
+                autonomous_origin: None,
             },
         ];
 

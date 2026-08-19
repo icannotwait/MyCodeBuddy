@@ -3342,6 +3342,55 @@ describe("out-of-turn wire guard + background activity", () => {
     resetConversationRuntimeStore()
   })
 
+  it("terminal background_activity requests a preserved-live detail refetch without dropping its overlay", async () => {
+    const { useConversationRuntimeStore, resetConversationRuntimeStore } =
+      await import("@/stores/conversation-runtime-store")
+    resetConversationRuntimeStore()
+
+    const VIRTUAL = -10
+    const actions = useConversationRuntimeStore.getState().actions
+    actions.setExternalId(VIRTUAL, "sess-terminal")
+    actions.setDbConversationId(VIRTUAL, 43)
+    const refetchDetail = vi
+      .spyOn(actions, "refetchDetail")
+      .mockImplementation(() => {})
+
+    const handlers = await mountOwnerConnection()
+    emitAcpEvent(handlers, {
+      seq: 1,
+      connection_id: "spawned-conn",
+      type: "background_activity",
+      session_id: "sess-terminal",
+      turns: [
+        {
+          id: "grok-autonomous:terminal:assistant:0",
+          role: "assistant",
+          blocks: [{ type: "text", text: "terminal persisted reply" }],
+          timestamp: "2026-08-19T00:00:00.000Z",
+        },
+      ],
+      outstanding: 0,
+      watermark: 512,
+      detail_refetch: true,
+    })
+
+    expect(refetchDetail).toHaveBeenCalledWith(VIRTUAL, {
+      preserveLive: true,
+    })
+    expect(
+      useConversationRuntimeStore.getState().byConversationId.get(VIRTUAL)
+        ?.backgroundTurns
+    ).toMatchObject([
+      {
+        watermark: 512,
+        turn: { id: "grok-autonomous:terminal:assistant:0" },
+      },
+    ])
+
+    refetchDetail.mockRestore()
+    resetConversationRuntimeStore()
+  })
+
   it("does NOT arm the syncing-results hint for a wire-visible (#870-held) settle", async () => {
     const { resetConversationRuntimeStore } =
       await import("@/stores/conversation-runtime-store")

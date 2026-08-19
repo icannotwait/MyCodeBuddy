@@ -32,10 +32,19 @@ use sacp::{
 use sacp_tokio::AcpAgent;
 use tokio::sync::{mpsc, oneshot, watch, RwLock};
 
+use crate::acp::autonomous_activity::{AutonomousActivityPolicy, AutonomousCapabilities};
 use crate::acp::background_watch;
+use crate::acp::codex_autonomous::{
+    adapter_for_connection as codex_adapter_for_connection,
+    should_hold_prompt as should_hold_codex_prompt, CodexAutonomousAdapter, CodexDispatchClaim,
+};
 use crate::acp::error::AcpError;
 use crate::acp::file_system_runtime::{
     mode_allows_outside_workspace, FileSystemRuntime, FileSystemRuntimeError, FsAccessPolicy,
+};
+use crate::acp::grok_autonomous::{
+    adapter_for_connection, should_hold_prompt, GrokAutonomousAdapter, GrokDispatchClaim,
+    Ownership as GrokOwnership,
 };
 use crate::acp::grok_retry::{GrokRetryAction, GrokRetryReconciler};
 use crate::acp::host_tools_policy::{HostToolsPolicy, HOST_TOOLS_ENV};
@@ -5105,9 +5114,12 @@ async fn run_connection(
     let _bg_watch = if is_hidden_generation {
         None
     } else {
-        background_watch::spawn_if_claude(
+        background_watch::spawn_for_policy(
+            AutonomousActivityPolicy::for_connection(
+                agent_type,
+                &AutonomousCapabilities::default(),
+            ),
             &connection_id,
-            agent_type,
             Arc::clone(&state),
             emitter.clone(),
             cwd_string.clone(),
@@ -5481,6 +5493,18 @@ async fn run_connection(
             // None keeps the legacy codex method and resolves the vocabulary to
             // the legacy pair — see the SessionState field docs.
             let goal_control = goal_advertised_control(init_resp.meta.as_ref());
+            let autonomous_caps = AutonomousCapabilities {
+                goal_version: init_resp
+                    .meta
+                    .as_ref()
+                    .and_then(|m| m.get("goal"))
+                    .and_then(|g| g.get("version"))
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|v| u32::try_from(v).ok())
+                    .filter(|&v| v == 1),
+                load_session: init_resp.agent_capabilities.load_session,
+            };
+            state.write().await.autonomous_caps = autonomous_caps;
             // Whether this agent accepts MCP server entries over the ACP wire
             // (`session/new`'s `mcpServers`). This is the single chokepoint
             // feeding session/new, session/load, and the load→new fallback.
@@ -9860,6 +9884,29 @@ async fn run_conversation_loop<'a>(
     // prompt turn, journaled or not, so consecutive ordinals prove adjacent
     // turns to the reader.
     let mut cursor_turn_ord: u64 = 0;
+    let mut grok_adapter = {
+        let hidden = state.read().await.purpose.is_hidden_generation();
+        adapter_for_connection(agent_type, hidden)
+    };
+    let mut codex_adapter = {
+        let snapshot = state.read().await;
+        let hidden = snapshot.purpose.is_hidden_generation();
+        codex_adapter_for_connection(agent_type, hidden, &snapshot.autonomous_caps)
+    };
+    if let Some(adapter) = grok_adapter.as_mut() {
+        let sid = session.session_id().0.to_string();
+        // File may not exist yet; the adapter re-resolves on each active tail.
+        let path = crate::parsers::grok::grok_updates_jsonl_path(&sid).unwrap_or_default();
+        adapter.on_session_ready(&sid, &path);
+        flush_grok_autonomous(Some(adapter), state, emitter, &sid).await;
+    }
+    if let Some(adapter) = codex_adapter.as_mut() {
+        let sid = session.session_id().0.to_string();
+        adapter.on_session_ready(&sid);
+        flush_codex_autonomous(Some(adapter), state, emitter, &sid).await;
+    }
+    let mut held_prompt: Option<ConnectionCommand> = None;
+    let mut cancelled_prompt_generations = HashSet::new();
     loop {
         // Wait for either a user command or a session update (e.g. available_commands_update)
         let input = loop {
@@ -9932,6 +9979,30 @@ async fn run_conversation_loop<'a>(
                         }
                     }
                 }
+                _ = tokio::time::sleep(std::time::Duration::from_secs(1)),
+                    if grok_adapter.as_ref().is_some_and(|a| a.needs_periodic_tail())
+                        || codex_adapter.as_ref().is_some_and(|a| a.needs_periodic_tail()) =>
+                {
+                    if let Some(adapter) = grok_adapter.as_mut() {
+                        adapter.tail_once();
+                    }
+                    if let Some(adapter) = codex_adapter.as_mut() {
+                        adapter.tail_once();
+                    }
+                    let sid = session.session_id().0.to_string();
+                    flush_grok_autonomous(grok_adapter.as_mut(), state, emitter, &sid)
+                        .await;
+                    flush_codex_autonomous(codex_adapter.as_mut(), state, emitter, &sid)
+                        .await;
+                    if !should_hold_autonomous_prompt(
+                        grok_adapter.as_ref(),
+                        codex_adapter.as_ref(),
+                    ) {
+                        if let Some(cmd) = held_prompt.take() {
+                            break ConversationInput::Command(cmd);
+                        }
+                    }
+                }
                 update = session.read_update() => {
                     match update {
                         Ok(SessionMessage::SessionMessage(dispatch)) => {
@@ -9939,6 +10010,44 @@ async fn run_conversation_loop<'a>(
                             let st = Arc::clone(state);
                             let cwd_opt = Some(cwd);
                             let dispatch = fix_usage_update_nulls(dispatch);
+                            let grok_claim = grok_observe_raw(
+                                grok_adapter.as_mut(),
+                                &dispatch,
+                                GrokOwnership::Idle,
+                            );
+                            let codex_claim = codex_observe_raw(
+                                codex_adapter.as_mut(),
+                                &dispatch,
+                                GrokOwnership::Idle,
+                            );
+                            let sid = session.session_id().0.to_string();
+                            flush_grok_autonomous(
+                                grok_adapter.as_mut(),
+                                state,
+                                emitter,
+                                &sid,
+                            )
+                            .await;
+                            flush_codex_autonomous(
+                                codex_adapter.as_mut(),
+                                state,
+                                emitter,
+                                &sid,
+                            )
+                            .await;
+                            if grok_claim.skip_streaming_reducer()
+                                || codex_claim.skip_streaming_reducer()
+                            {
+                                if !should_hold_autonomous_prompt(
+                                    grok_adapter.as_ref(),
+                                    codex_adapter.as_ref(),
+                                ) {
+                                    if let Some(cmd) = held_prompt.take() {
+                                        break ConversationInput::Command(cmd);
+                                    }
+                                }
+                                continue;
+                            }
                             let _ = MatchDispatch::new(dispatch)
                                 .if_notification(
                                     async |notif: SessionNotification| {
@@ -9976,6 +10085,14 @@ async fn run_conversation_loop<'a>(
                                     Ok(())
                                 })
                                 .await;
+                            if !should_hold_autonomous_prompt(
+                                grok_adapter.as_ref(),
+                                codex_adapter.as_ref(),
+                            ) {
+                                if let Some(cmd) = held_prompt.take() {
+                                    break ConversationInput::Command(cmd);
+                                }
+                            }
                         }
                         Ok(_) => {}
                         Err(e) => {
@@ -9998,6 +10115,24 @@ async fn run_conversation_loop<'a>(
                 mark_awaiting_reply,
                 turn_generation,
             }) => {
+                if cancelled_prompt_generations.remove(&turn_generation) {
+                    continue;
+                }
+                if should_hold_autonomous_prompt(grok_adapter.as_ref(), codex_adapter.as_ref()) {
+                    held_prompt = Some(ConnectionCommand::Prompt {
+                        blocks,
+                        user_message,
+                        mark_awaiting_reply,
+                        turn_generation,
+                    });
+                    continue;
+                }
+                if let Some(adapter) = grok_adapter.as_mut() {
+                    adapter.on_foreground_started();
+                }
+                if let Some(adapter) = codex_adapter.as_mut() {
+                    adapter.on_foreground_started();
+                }
                 // Fingerprint the outgoing prompt for the background watcher's
                 // foreground/out-of-turn classifier BEFORE the blocks are
                 // consumed: the transcript record this prompt becomes must
@@ -10757,6 +10892,38 @@ async fn run_conversation_loop<'a>(
                                     let session_id = sid.clone();
                                     let cwd_opt = Some(cwd);
                                     let dispatch = fix_usage_update_nulls(dispatch);
+                                    let grok_claim = grok_observe_raw(
+                                        grok_adapter.as_mut(),
+                                        &dispatch,
+                                        GrokOwnership::Foreground,
+                                    );
+                                    let codex_claim = codex_observe_raw(
+                                        codex_adapter.as_mut(),
+                                        &dispatch,
+                                        GrokOwnership::Foreground,
+                                    );
+                                    flush_grok_autonomous(
+                                        grok_adapter.as_mut(),
+                                        state,
+                                        emitter,
+                                        sid.0.as_ref(),
+                                    )
+                                    .await;
+                                    flush_codex_autonomous(
+                                        codex_adapter.as_mut(),
+                                        state,
+                                        emitter,
+                                        sid.0.as_ref(),
+                                    )
+                                    .await;
+                                    if grok_claim.is_idle_terminal() {
+                                        continue;
+                                    }
+                                    if grok_claim.skip_streaming_reducer()
+                                        || codex_claim.skip_streaming_reducer()
+                                    {
+                                        continue;
+                                    }
                                     // Grok reports `/compact` results on ext methods
                                     // that bypass the typed pipeline below. Count a
                                     // visible compaction result before dispatch so a
@@ -11170,6 +11337,12 @@ async fn run_conversation_loop<'a>(
                         }
                     }
                 }
+                if let Some(adapter) = grok_adapter.as_mut() {
+                    adapter.on_foreground_ended();
+                }
+                if let Some(adapter) = codex_adapter.as_mut() {
+                    adapter.on_foreground_ended();
+                }
                 if disconnect_requested {
                     tracing::info!(
                         "[ACP] closing connection loop after disconnect; connection_id={conn_id}"
@@ -11241,6 +11414,28 @@ async fn run_conversation_loop<'a>(
                 }
             }
             ConversationInput::Control(ConnectionControl::Cancel) => {
+                let held_generation = match held_prompt.take() {
+                    Some(ConnectionCommand::Prompt {
+                        turn_generation, ..
+                    }) => Some(turn_generation),
+                    Some(other) => {
+                        held_prompt = Some(other);
+                        None
+                    }
+                    None => None,
+                };
+                if let Some(generation) = held_generation {
+                    state.write().await.rollback_queued_prompt(generation);
+                } else {
+                    let mut session_state = state.write().await;
+                    if let Some(generation) = session_state.active_turn_generation {
+                        if session_state.rollback_queued_prompt(generation) {
+                            // The Prompt command may still be in cmd_rx because
+                            // the biased control lane won this iteration.
+                            cancelled_prompt_generations.insert(generation);
+                        }
+                    }
+                }
                 let cx = session.connection();
                 let sid = session.session_id().clone();
                 let _ = cx.send_notification_to(Agent, CancelNotification::new(sid.clone()));
@@ -11342,6 +11537,12 @@ async fn run_conversation_loop<'a>(
                 break;
             }
         }
+    }
+    if let Some(adapter) = grok_adapter.as_mut() {
+        adapter.on_disconnect();
+    }
+    if let Some(adapter) = codex_adapter.as_mut() {
+        adapter.on_disconnect();
     }
     Ok(None)
 }
@@ -13306,6 +13507,123 @@ async fn drain_ready_in_prompt_updates(
             }
             _ => {}
         }
+    }
+}
+
+fn should_hold_autonomous_prompt(
+    grok: Option<&GrokAutonomousAdapter>,
+    codex: Option<&CodexAutonomousAdapter>,
+) -> bool {
+    should_hold_prompt(grok) || should_hold_codex_prompt(codex)
+}
+
+fn grok_observe_raw(
+    adapter: Option<&mut GrokAutonomousAdapter>,
+    dispatch: &Dispatch,
+    ownership: GrokOwnership,
+) -> GrokDispatchClaim {
+    let Some(adapter) = adapter else {
+        return GrokDispatchClaim::Unclaimed;
+    };
+    let Dispatch::Notification(notification) = dispatch else {
+        return GrokDispatchClaim::Unclaimed;
+    };
+    adapter.on_raw_dispatch(notification.method(), notification.params(), ownership)
+}
+
+async fn flush_grok_autonomous(
+    adapter: Option<&mut GrokAutonomousAdapter>,
+    state: &Arc<RwLock<SessionState>>,
+    emitter: &EventEmitter,
+    fallback_session_id: &str,
+) {
+    let Some(adapter) = adapter else {
+        return;
+    };
+    let refetch = adapter.take_detail_refetch();
+    let batch = match adapter.take_activity() {
+        Some(batch) => batch,
+        None if refetch => adapter.take_emitted(),
+        None => return,
+    };
+    let session_id = if adapter.session_id().is_empty() {
+        fallback_session_id.to_string()
+    } else {
+        adapter.session_id().to_string()
+    };
+    emit_with_state(
+        state,
+        emitter,
+        AcpEvent::BackgroundActivity {
+            session_id,
+            turns: batch.turns,
+            outstanding: batch.outstanding,
+            settled: batch.settled,
+            watermark: batch.watermark,
+            detail_refetch: refetch,
+        },
+    )
+    .await;
+    if refetch {
+        tracing::debug!(
+            session_id = %fallback_session_id,
+            "[ACP] Grok autonomous episode scheduled a detail refetch"
+        );
+    }
+}
+
+fn codex_observe_raw(
+    adapter: Option<&mut CodexAutonomousAdapter>,
+    dispatch: &Dispatch,
+    ownership: GrokOwnership,
+) -> CodexDispatchClaim {
+    let Some(adapter) = adapter else {
+        return CodexDispatchClaim::Unclaimed;
+    };
+    let Dispatch::Notification(notification) = dispatch else {
+        return CodexDispatchClaim::Unclaimed;
+    };
+    adapter.on_raw_dispatch(notification.method(), notification.params(), ownership)
+}
+
+async fn flush_codex_autonomous(
+    adapter: Option<&mut CodexAutonomousAdapter>,
+    state: &Arc<RwLock<SessionState>>,
+    emitter: &EventEmitter,
+    fallback_session_id: &str,
+) {
+    let Some(adapter) = adapter else {
+        return;
+    };
+    let refetch = adapter.take_detail_refetch();
+    let batch = match adapter.take_activity() {
+        Some(batch) => batch,
+        None if refetch => adapter.take_emitted(),
+        None => return,
+    };
+    let session_id = if adapter.session_id().is_empty() {
+        fallback_session_id.to_string()
+    } else {
+        adapter.session_id().to_string()
+    };
+    emit_with_state(
+        state,
+        emitter,
+        AcpEvent::BackgroundActivity {
+            session_id,
+            turns: batch.turns,
+            outstanding: batch.outstanding,
+            settled: batch.settled,
+            watermark: batch.watermark,
+            detail_refetch: refetch,
+        },
+    )
+    .await;
+    if refetch {
+        tracing::debug!(
+            session_id = %fallback_session_id,
+            "[ACP] Codex autonomous episode scheduled a detail refetch"
+        );
     }
 }
 

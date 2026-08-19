@@ -990,6 +990,7 @@ fn build_turns(
                         reasoning_effort: None,
                         completed_at: None,
                         outcome: None,
+                        autonomous_origin: None,
                     });
                 }
             }
@@ -1008,6 +1009,7 @@ fn build_turns(
                     reasoning_effort: None,
                     completed_at,
                     outcome: None,
+                    autonomous_origin: None,
                 });
             }
         } else if let Some(shell_turn) = wire::first_message(&turn_bytes, 2) {
@@ -1044,6 +1046,7 @@ fn build_turns(
                 reasoning_effort: None,
                 completed_at: None,
                 outcome: None,
+                autonomous_origin: None,
             });
             let tool_id = format!("cursor-shell-{i}");
             let (preview, exit_code) = output.unwrap_or((None, 0));
@@ -1078,6 +1081,7 @@ fn build_turns(
                 reasoning_effort: None,
                 completed_at,
                 outcome: None,
+                autonomous_origin: None,
             });
         }
     }

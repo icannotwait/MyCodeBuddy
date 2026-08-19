@@ -50,16 +50,17 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::RwLock;
 
+use crate::acp::autonomous_activity::{AutonomousActivityPolicy, AutonomousCapabilities};
 use crate::acp::session_state::{background_keepalive_max_age, SessionState};
 use crate::acp::types::{AcpEvent, BackgroundSettledInfo, ConnectionStatus};
 use crate::models::agent::AgentType;
-use crate::models::message::MessageTurn;
+use crate::models::message::{AutonomousTurnOrigin, MessageTurn};
 use crate::parsers::claude::{
-    capture_tag, find_session_file, group_into_turns, is_meta_message, slash_command_display,
-    task_notification_result_regex, task_notification_status_regex,
-    task_notification_summary_regex, task_notification_task_id_regex,
-    task_notification_tool_use_id_regex, ClaudeRecordAccumulator, BACKGROUND_RESULT_MAX_CHARS,
-    CONTEXT_CONTINUATION_PREFIX,
+    capture_tag, find_session_file, group_into_turns, is_explicit_automation_marker,
+    is_meta_message, slash_command_display, task_notification_result_regex,
+    task_notification_status_regex, task_notification_summary_regex,
+    task_notification_task_id_regex, task_notification_tool_use_id_regex, ClaudeRecordAccumulator,
+    BACKGROUND_RESULT_MAX_CHARS, CONTEXT_CONTINUATION_PREFIX,
 };
 use crate::parsers::truncate_str;
 use crate::web::event_bridge::{emit_with_state, EventEmitter};
@@ -197,8 +198,31 @@ impl Drop for BackgroundWatchGuard {
     }
 }
 
-/// Arm the transcript watcher for a Claude connection; other agents have no
-/// transcript-notification mechanism and get no watcher (returns `None`).
+/// Arm the transcript watcher when policy selects Claude transcript
+/// watching; other policies get no watcher (returns `None`).
+pub(crate) fn spawn_for_policy(
+    policy: AutonomousActivityPolicy,
+    conn_id: &str,
+    state: Arc<RwLock<SessionState>>,
+    emitter: EventEmitter,
+    cwd: String,
+    ledger: Arc<PromptLedger>,
+) -> Option<BackgroundWatchGuard> {
+    match policy {
+        AutonomousActivityPolicy::ClaudeTranscript => {
+            let conn_id = conn_id.to_string();
+            let handle = tokio::spawn(async move {
+                run_watch(conn_id, state, emitter, cwd, ledger).await;
+            });
+            Some(BackgroundWatchGuard(handle))
+        }
+        _ => None,
+    }
+}
+
+/// Thin wrapper so existing tests that name `spawn_if_claude` keep compiling.
+/// Maps `agent_type` through [`AutonomousActivityPolicy::for_connection`] with
+/// default capabilities.
 pub(crate) fn spawn_if_claude(
     conn_id: &str,
     agent_type: AgentType,
@@ -207,14 +231,14 @@ pub(crate) fn spawn_if_claude(
     cwd: String,
     ledger: Arc<PromptLedger>,
 ) -> Option<BackgroundWatchGuard> {
-    if agent_type != AgentType::ClaudeCode {
-        return None;
-    }
-    let conn_id = conn_id.to_string();
-    let handle = tokio::spawn(async move {
-        run_watch(conn_id, state, emitter, cwd, ledger).await;
-    });
-    Some(BackgroundWatchGuard(handle))
+    spawn_for_policy(
+        AutonomousActivityPolicy::for_connection(agent_type, &AutonomousCapabilities::default()),
+        conn_id,
+        state,
+        emitter,
+        cwd,
+        ledger,
+    )
 }
 
 async fn run_watch(
@@ -351,6 +375,11 @@ struct Episode {
     /// `collect_changed_turns` to tag each collected turn for the held-turn
     /// suppression filter in `tick()`.
     origin_task_id: Option<String>,
+    /// Proven overlay origin for assistant turns in this episode.
+    /// Task-notification initiators are `BackgroundTask`; explicit cron/loop
+    /// markers are `Automation`; ledger-only out-of-turn work is
+    /// `AgentAutonomous` (live overlay only).
+    autonomous_origin: AutonomousTurnOrigin,
 }
 
 enum Mode {
@@ -732,6 +761,7 @@ impl WatchState {
             outstanding,
             settled,
             watermark: self.committed,
+            detail_refetch: false,
         })
     }
 
@@ -1059,6 +1089,7 @@ impl WatchState {
                     ),
                     emitted_hashes: HashMap::new(),
                     origin_task_id: task_notification_origin_id(&initiator_text),
+                    autonomous_origin: episode_autonomous_origin(value, &initiator_text),
                 });
             }
             self.mode = Mode::Background;
@@ -1084,6 +1115,11 @@ impl WatchState {
                 // stretch (not a new initiator record) — the origin carries
                 // over unchanged.
                 let inherited_origin = self.episode.as_ref().and_then(|e| e.origin_task_id.clone());
+                let inherited_autonomous_origin = self
+                    .episode
+                    .as_ref()
+                    .map(|e| e.autonomous_origin)
+                    .unwrap_or(AutonomousTurnOrigin::AgentAutonomous);
                 self.episode = Some(Episode {
                     start_offset: self.next_episode_base(),
                     acc: ClaudeRecordAccumulator::new(
@@ -1091,6 +1127,7 @@ impl WatchState {
                     ),
                     emitted_hashes: HashMap::new(),
                     origin_task_id: inherited_origin,
+                    autonomous_origin: inherited_autonomous_origin,
                 });
             }
             if let Some(episode) = self.episode.as_mut() {
@@ -1109,6 +1146,7 @@ impl WatchState {
             return;
         }
         let origin_task_id = episode.origin_task_id.clone();
+        let autonomous_origin = episode.autonomous_origin;
         let mut messages = episode.acc.messages.clone();
         // An autonomous turn can itself launch background work; fold any
         // ack+notification pairs seen within this episode, same as the
@@ -1124,6 +1162,9 @@ impl WatchState {
         crate::parsers::backfill_turn_durations(&mut turns, &[]);
         for (idx, mut turn) in turns.into_iter().enumerate() {
             turn.id = format!("bg-{}-{}", episode.start_offset, idx);
+            if matches!(turn.role, crate::models::message::TurnRole::Assistant) {
+                turn.autonomous_origin = Some(autonomous_origin);
+            }
             let hash = hash_turn(&turn);
             if episode.emitted_hashes.get(&turn.id) == Some(&hash) {
                 continue;
@@ -1242,6 +1283,19 @@ fn task_notification_origin_id(text: &str) -> Option<String> {
     capture_tag(task_notification_task_id_regex(), trimmed)
 }
 
+fn episode_autonomous_origin(
+    value: &serde_json::Value,
+    initiator_text: &str,
+) -> AutonomousTurnOrigin {
+    if task_notification_origin_id(initiator_text).is_some() {
+        AutonomousTurnOrigin::BackgroundTask
+    } else if is_explicit_automation_marker(value) {
+        AutonomousTurnOrigin::Automation
+    } else {
+        AutonomousTurnOrigin::AgentAutonomous
+    }
+}
+
 /// The arm baseline separating pre-existing history from records written
 /// during this watch's lifetime: the byte offset of the first COMPLETE
 /// CONVERSATION line (a `user`/`assistant` record) whose timestamp is at or
@@ -1334,6 +1388,36 @@ fn hash_turn(turn: &MessageTurn) -> u64 {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn spawn_if_claude_and_spawn_for_policy_noop_for_non_claude() {
+        let state = Arc::new(RwLock::new(crate::acp::session_state::SessionState::new(
+            "c1".into(),
+            AgentType::Grok,
+            None,
+            "w".into(),
+            None,
+        )));
+        let ledger = PromptLedger::shared();
+        assert!(spawn_if_claude(
+            "c1",
+            AgentType::Grok,
+            Arc::clone(&state),
+            EventEmitter::Noop,
+            "/tmp".into(),
+            Arc::clone(&ledger),
+        )
+        .is_none());
+        assert!(spawn_for_policy(
+            AutonomousActivityPolicy::Unsupported,
+            "c1",
+            state,
+            EventEmitter::Noop,
+            "/tmp".into(),
+            ledger,
+        )
+        .is_none());
+    }
 
     fn temp_session(dir: &tempfile::TempDir) -> PathBuf {
         dir.path().join("session-1.jsonl")
@@ -1874,6 +1958,23 @@ mod tests {
             ))),
             "the notification's follow-up must render in the overlay"
         );
+        let continuation = turns
+            .iter()
+            .find(|t| {
+                matches!(t.role, crate::models::message::TurnRole::Assistant)
+                    && t.blocks.iter().any(|b| {
+                        matches!(
+                            b,
+                            crate::models::message::ContentBlock::Text { text }
+                                if text.contains("Build finished cleanly")
+                        )
+                    })
+            })
+            .expect("assistant continuation after notification");
+        assert_eq!(
+            continuation.autonomous_origin,
+            Some(crate::models::message::AutonomousTurnOrigin::BackgroundTask)
+        );
     }
 
     /// The window must never outlive the turn that opened it. Both resets are
@@ -2358,6 +2459,10 @@ mod tests {
             1,
             "a cron-originated turn has no task id to suppress on"
         );
+        assert_eq!(
+            turns[0].autonomous_origin,
+            Some(crate::models::message::AutonomousTurnOrigin::Automation)
+        );
     }
 
     /// A `<task-notification>` can name a task id that was launched (and
@@ -2499,6 +2604,36 @@ mod tests {
         );
         let (turns, ..) = unpack(tick_now(&mut ws, &ledger).expect("cron turn surfaces"));
         assert_eq!(turns.len(), 1, "cron assistant response renders as overlay");
+        assert_eq!(
+            turns[0].autonomous_origin,
+            Some(crate::models::message::AutonomousTurnOrigin::Automation)
+        );
+    }
+
+    #[test]
+    fn ledger_only_out_of_turn_overlay_is_agent_autonomous() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_session(&dir);
+        write_lines(&path, &[]);
+        let ledger = PromptLedger::shared();
+        let mut ws = WatchState::with_file_for_test("s1", path.clone());
+
+        write_lines(
+            &path,
+            &[
+                &user_prompt_array("u1", "injected follow-up"),
+                &assistant_text("a1", "working autonomously"),
+            ],
+        );
+        let (turns, ..) = unpack(tick_now(&mut ws, &ledger).expect("ledger-miss overlay"));
+        let reply = turns
+            .iter()
+            .find(|t| matches!(t.role, crate::models::message::TurnRole::Assistant))
+            .expect("out-of-turn assistant");
+        assert_eq!(
+            reply.autonomous_origin,
+            Some(crate::models::message::AutonomousTurnOrigin::AgentAutonomous)
+        );
     }
 
     #[test]

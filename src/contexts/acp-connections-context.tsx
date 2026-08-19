@@ -1598,7 +1598,7 @@ function applyStreamingAction(
     if (now - lastOutOfTurnDropLogAt > 5_000) {
       lastOutOfTurnDropLogAt = now
       console.debug(
-        "[acp] dropping out-of-turn streaming deltas (transcript overlay renders them)",
+        "[acp] dropping out-of-turn streaming deltas (provider policy owns out-of-turn rendering)",
         { contextKey: conn.contextKey, type: action.type }
       )
     }
@@ -3748,12 +3748,12 @@ function prepareMappedEnvelope(
       const turns = e.turns
       const watermark = e.watermark
       const settled = e.settled
+      const detailRefetch = e.detail_refetch === true
       const agentType = snapshot.agentType
       const statusAtPrepare = snapshot.status
       afterCommit.push(() => {
+        const conversationId = getConversationIdByExternalIdFromStore(sessionId)
         if (turns && turns.length > 0) {
-          const conversationId =
-            getConversationIdByExternalIdFromStore(sessionId)
           if (conversationId != null) {
             const runtime = useConversationRuntimeStore.getState()
             runtime.actions.applyBackgroundActivity(
@@ -3769,6 +3769,7 @@ function prepareMappedEnvelope(
             if (
               session &&
               session.backgroundTurns.length > OVERLAY_FOLD_THRESHOLD &&
+              !detailRefetch &&
               !session.detailLoading &&
               now - lastAt > OVERLAY_FOLD_MIN_INTERVAL_MS
             ) {
@@ -3778,6 +3779,11 @@ function prepareMappedEnvelope(
               })
             }
           }
+        }
+        if (detailRefetch && conversationId != null) {
+          useConversationRuntimeStore
+            .getState()
+            .actions.refetchDetail(conversationId, { preserveLive: true })
         }
         if (settled && settled.length > 0) {
           const agentLabel = getAgentLabel(agentType)
@@ -3793,8 +3799,6 @@ function prepareMappedEnvelope(
               () => {}
             )
           }
-          const conversationId =
-            getConversationIdByExternalIdFromStore(sessionId)
           if (conversationId != null) {
             const runtimeActions =
               useConversationRuntimeStore.getState().actions
