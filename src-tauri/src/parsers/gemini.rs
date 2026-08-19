@@ -821,6 +821,8 @@ fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn> {
                 completed_at: msg.completed_at,
                 outcome: None,
                 autonomous_origin: None,
+            generation_ms: None,
+            generation_tokens: None,
             });
             i += 1;
             continue;
@@ -839,6 +841,8 @@ fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn> {
                 completed_at: msg.completed_at,
                 outcome: None,
                 autonomous_origin: None,
+            generation_ms: None,
+            generation_tokens: None,
             });
             i += 1;
             continue;
@@ -885,6 +889,8 @@ fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn> {
             completed_at,
             outcome: None,
             autonomous_origin: None,
+            generation_ms: None,
+            generation_tokens: None,
         });
     }
 

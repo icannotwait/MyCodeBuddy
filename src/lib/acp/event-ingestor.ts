@@ -40,6 +40,11 @@ interface ConnectionDrainState {
   deliveryIdSet: Set<number>
 }
 
+function stampReceivedAt(event: EventEnvelope): EventEnvelope {
+  if (event.received_at != null) return event
+  return { ...event, received_at: performance.now() }
+}
+
 /**
  * Merge only adjacent same-type text/thinking deltas for one connection.
  * The merged envelope keeps the last event's `seq` and concatenates `text`.
@@ -61,6 +66,7 @@ export function compactAdjacentDeltas(
       out[out.length - 1] = {
         ...event,
         text: prev.text + event.text,
+        received_at: prev.received_at ?? event.received_at,
       }
       continue
     }
@@ -95,7 +101,10 @@ export class EventIngestor {
   pushBatch(batch: DesktopAcpEventBatch): void {
     if (this.disposed) return
     for (const event of batch.events) {
-      this.pending.push({ deliveryId: batch.batch_id, event })
+      this.pending.push({
+        deliveryId: batch.batch_id,
+        event: stampReceivedAt(event),
+      })
     }
     this.ensureScheduled()
   }
@@ -110,7 +119,11 @@ export class EventIngestor {
     this.syntheticDeliveryId += 1
     const deliveryId = this.syntheticDeliveryId
     for (const event of events) {
-      this.pending.push({ deliveryId, event, mappedKey: contextKey })
+      this.pending.push({
+        deliveryId,
+        event: stampReceivedAt(event),
+        mappedKey: contextKey,
+      })
     }
     this.ensureScheduled()
   }

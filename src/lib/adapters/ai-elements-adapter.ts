@@ -212,6 +212,8 @@ export interface AdaptedMessage {
   timestamp: string
   usage?: TurnUsage | null
   duration_ms?: number | null
+  generation_ms?: number | null
+  generation_tokens?: number | null
   model?: string | null
   reasoning_effort?: string | null
   /** Wall-clock completion time as ISO string (parsed once at the Rust layer). */
@@ -1993,6 +1995,8 @@ export function adaptMessageTurn(
     timestamp: turn.timestamp,
     usage: turn.usage,
     duration_ms: turn.duration_ms,
+    generation_ms: turn.generation_ms,
+    generation_tokens: turn.generation_tokens,
     model: turn.model,
     reasoning_effort: turn.reasoning_effort,
     completed_at: turn.completed_at,
@@ -2056,6 +2060,8 @@ interface TurnCacheEntry {
   role: MessageRole
   usage: TurnUsage | null | undefined
   duration_ms: number | null | undefined
+  generation_ms: number | null | undefined
+  generation_tokens: number | null | undefined
   model: string | null | undefined
   reasoning_effort: string | null | undefined
   completed_at: string | null | undefined
@@ -2131,6 +2137,8 @@ export function createMessageTurnAdapter(): MessageTurnAdapter {
             cached.role === turn.role &&
             cached.usage === turn.usage &&
             cached.duration_ms === turn.duration_ms &&
+            cached.generation_ms === turn.generation_ms &&
+            cached.generation_tokens === turn.generation_tokens &&
             cached.model === turn.model &&
             cached.reasoning_effort === turn.reasoning_effort &&
             cached.completed_at === turn.completed_at &&
@@ -2167,6 +2175,8 @@ export function createMessageTurnAdapter(): MessageTurnAdapter {
             role: turn.role,
             usage: turn.usage,
             duration_ms: turn.duration_ms,
+            generation_ms: turn.generation_ms,
+            generation_tokens: turn.generation_tokens,
             model: turn.model,
             reasoning_effort: turn.reasoning_effort,
             completed_at: turn.completed_at,

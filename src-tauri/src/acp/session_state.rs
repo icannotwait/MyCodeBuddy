@@ -1747,7 +1747,8 @@ impl SessionState {
             AcpEvent::ClaudeSdkMessage { .. }
             | AcpEvent::SessionLoadFailed { .. }
             | AcpEvent::TurnRetrying { .. }
-            | AcpEvent::UserPromptSent { .. } => {
+            | AcpEvent::UserPromptSent { .. }
+            | AcpEvent::RequestUsage { .. } => {
                 // 这些事件不直接修改 SessionState 的可见字段。
                 // UserPromptSent 是纯通知事件，仅供 chat-channel 推送消费。
                 // TurnRetrying 与 Claude 的 api_retry 一样是前端瞬态提示（重试横幅），

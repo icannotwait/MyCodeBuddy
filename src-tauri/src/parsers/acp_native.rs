@@ -388,6 +388,8 @@ pub fn project_turns(entries: &[TranscriptEntry]) -> Vec<MessageTurn> {
                     completed_at: None,
                     outcome: None,
                     autonomous_origin: None,
+            generation_ms: None,
+            generation_tokens: None,
                 });
                 seq += 1;
                 prompt_just_recorded = true;
@@ -450,6 +452,8 @@ fn flush(pending: &mut Option<PendingTurn>, turns: &mut Vec<MessageTurn>, seq: &
         completed_at: Some(epoch_ms_to_utc(p.last_at_ms)),
         outcome: None,
         autonomous_origin: None,
+            generation_ms: None,
+            generation_tokens: None,
     });
     *seq += 1;
 }
@@ -550,6 +554,8 @@ fn apply_update(
                         completed_at: None,
                         outcome: None,
                         autonomous_origin: None,
+            generation_ms: None,
+            generation_tokens: None,
                     });
                     *seq += 1;
                 }

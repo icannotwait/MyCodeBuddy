@@ -3159,8 +3159,9 @@
         "elapsedHours": "{value} Std",
         "elapsedMinutes": "{value} Min",
         "elapsedSeconds": "{value} Sek",
-        "outputSpeedAria": "Geschätzte Ausgabegeschwindigkeit",
-        "outputSpeedTooltip": "Geschätzte Ausgabegeschwindigkeit (Text + Denken)",
+        "outputSpeedAria": "Ausgabegeschwindigkeit",
+        "outputSpeedTooltip": "Abgerechnete Ausgabetokens ÷ Generierungszeit (inkl. Denken)",
+        "generationShareTooltip": "Generierung {generation} / Wandzeit {wall} ({percent}%)",
         "toolUseCount": "{count} Tool-Aufrufe"
       },
       "tool": {

@@ -3159,8 +3159,9 @@
         "elapsedHours": "{value}時間",
         "elapsedMinutes": "{value}分",
         "elapsedSeconds": "{value}秒",
-        "outputSpeedAria": "推定出力速度",
-        "outputSpeedTooltip": "推定出力速度（テキスト + 思考）",
+        "outputSpeedAria": "出力速度",
+        "outputSpeedTooltip": "課金出力トークン ÷ 生成時間（思考を含む）",
+        "generationShareTooltip": "生成 {generation} / 経過 {wall}（{percent}%）",
         "toolUseCount": "ツール使用 {count} 回"
       },
       "tool": {

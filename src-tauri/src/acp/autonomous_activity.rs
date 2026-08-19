@@ -473,6 +473,8 @@ mod tests {
             completed_at: None,
             outcome: None,
             autonomous_origin: None,
+            generation_ms: None,
+            generation_tokens: None,
         };
 
         let capped = cap_normalized_turn_payload(turn).expect("retain a bounded prefix");

@@ -384,6 +384,10 @@ export interface MessageTurn {
   /** Optional terminal outcome (e.g. user Stop interruption metadata). */
   outcome?: TurnOutcome | null
   autonomous_origin?: AutonomousTurnOrigin | null
+  /** Model generation time in ms (excludes tool wait). Overlay from live usage. */
+  generation_ms?: number | null
+  /** Billed output tokens paired with `generation_ms`. */
+  generation_tokens?: number | null
 }
 
 export interface ConversationDetail {
@@ -822,6 +826,8 @@ export interface DbConversationDetail {
   turns_total?: number | null
   /** Assistant turns in `full[0..turns_offset)` (baseline globalization). */
   assistant_turns_before_offset?: number | null
+  /** User turns in `full[0..turns_offset)`. */
+  user_turns_before_offset?: number | null
   /**
    * Structural fingerprint of `full[0..turns_offset)` as a fixed-width 16-hex
    * string (a raw u64 JSON number would be rounded past 2^53-1). Compared on
@@ -1089,6 +1095,8 @@ export interface ConversationTurnsPage {
   turns_offset: number
   turns_total: number
   assistant_turns_before_offset: number
+  /** User turns in `full[0..turns_offset)`. */
+  user_turns_before_offset: number
   /** H(0..turns_offset) — adopted as the window fingerprint after a prepend. */
   prefix_hash: string
   /** H(0..min(beforeIndex, total)) — must equal the client's current window
@@ -2618,6 +2626,11 @@ export type AcpEvent =
       used: number
       size: number
     }
+  | {
+      type: "request_usage"
+      output_tokens: number
+      duration_ms?: number | null
+    }
   /**
    * Out-of-turn activity surfaced from the agent's own session transcript by
    * the backend watcher (Claude only): async sub-agent / background-shell
@@ -3097,6 +3110,8 @@ export function emptyRuntimeStats(
 export type EventEnvelope = {
   seq: number
   connection_id: string
+  /** Client ingest timestamp (`performance.now()`). Not on the wire. */
+  received_at?: number
 } & AcpEvent
 
 /**

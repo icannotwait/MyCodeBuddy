@@ -38,6 +38,7 @@ pub mod prompt_hydration;
 pub mod question;
 pub mod recovery_authorization;
 pub mod registry;
+pub mod request_usage;
 pub mod remote_registry;
 pub mod session_attach;
 pub mod session_info;

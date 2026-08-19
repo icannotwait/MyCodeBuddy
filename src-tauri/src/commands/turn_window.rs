@@ -52,6 +52,7 @@ pub struct WindowMeta {
     pub offset: usize,
     pub total: usize,
     pub assistant_before: usize,
+    pub user_before: usize,
     /// Fingerprint of `turns[0..offset)` as a fixed-width 16-hex string.
     /// Serialized as a string because a raw u64 JSON number is rounded by
     /// JS `response.json()` past 2^53-1, which would systematically break
@@ -149,6 +150,10 @@ pub fn window_meta(turns: &[MessageTurn], offset: usize) -> WindowMeta {
             .iter()
             .filter(|t| matches!(t.role, TurnRole::Assistant))
             .count(),
+        user_before: prefix
+            .iter()
+            .filter(|t| matches!(t.role, TurnRole::User))
+            .count(),
         prefix_hash: prefix_fingerprint(prefix),
         uncovered_prefix_max_ts: prefix.iter().map(|t| t.timestamp).max(),
     }
@@ -172,6 +177,8 @@ mod tests {
             completed_at: None,
             outcome: None,
             autonomous_origin: None,
+            generation_ms: None,
+            generation_tokens: None,
         }
     }
 

@@ -3159,8 +3159,9 @@
         "elapsedHours": "{value} h",
         "elapsedMinutes": "{value} min",
         "elapsedSeconds": "{value} s",
-        "outputSpeedAria": "Vitesse de sortie estimée",
-        "outputSpeedTooltip": "Vitesse de sortie estimée (texte + raisonnement)",
+        "outputSpeedAria": "Vitesse de sortie",
+        "outputSpeedTooltip": "Jetons de sortie facturés ÷ temps de génération (raisonnement inclus)",
+        "generationShareTooltip": "Génération {generation} / horloge {wall} ({percent}%)",
         "toolUseCount": "{count} utilisations d'outils"
       },
       "tool": {

@@ -1234,6 +1234,8 @@ mod tests {
             completed_at: None,
             outcome: None,
             autonomous_origin: None,
+            generation_ms: None,
+            generation_tokens: None,
         }
     }
 
@@ -1370,6 +1372,7 @@ mod tests {
             turns_offset: None,
             turns_total: None,
             assistant_turns_before_offset: None,
+            user_turns_before_offset: None,
             prefix_hash: None,
             uncovered_prefix_max_ts: None,
         }

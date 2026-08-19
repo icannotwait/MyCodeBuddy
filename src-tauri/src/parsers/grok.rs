@@ -821,6 +821,8 @@ fn parse_updates_from_bytes_with_context(
                         completed_at: None,
                         outcome: None,
                         autonomous_origin: None,
+            generation_ms: None,
+            generation_tokens: None,
                     });
                 }
             }
@@ -1498,6 +1500,8 @@ fn ensure_assistant<'a>(
             completed_at: None,
             outcome: None,
             autonomous_origin: origin,
+            generation_ms: None,
+            generation_tokens: None,
         });
     }
     assistant.as_mut().expect("assistant just set")

@@ -3159,8 +3159,9 @@
         "elapsedHours": "{value}h",
         "elapsedMinutes": "{value}m",
         "elapsedSeconds": "{value}s",
-        "outputSpeedAria": "Estimated output speed",
-        "outputSpeedTooltip": "Estimated output speed (text + thinking)",
+        "outputSpeedAria": "Output speed",
+        "outputSpeedTooltip": "Billed output tokens divided by generation time (thinking included)",
+        "generationShareTooltip": "Generation {generation} / wall {wall} ({percent}%)",
         "toolUseCount": "{count} tool uses"
       },
       "tool": {

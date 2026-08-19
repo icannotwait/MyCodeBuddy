@@ -107,6 +107,7 @@ describe("merge repair transport contracts", () => {
       turns_offset: 40,
       turns_total: 80,
       assistant_turns_before_offset: 20,
+      user_turns_before_offset: 20,
       prefix_hash: "0000000000000040",
       prefix_hash_before_index: "0000000000000080",
       uncovered_prefix_max_ts: "2026-08-15T00:00:00.000Z",

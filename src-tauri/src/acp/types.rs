@@ -380,6 +380,14 @@ pub enum AcpEvent {
     AvailableCommands { commands: Vec<AvailableCommandInfo> },
     /// Session usage/context window updated during conversation
     UsageUpdate { used: u64, size: u64 },
+    /// One completed model request (Claude/Codex) or user turn (Grok)
+    /// with billed output tokens. `duration_ms` is the agent-reported
+    /// generation span when present; the client measures the burst otherwise.
+    RequestUsage {
+        output_tokens: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
+    },
     /// Out-of-turn activity surfaced by an autonomous-activity adapter
     /// (`acp::autonomous_activity`) onto the shared overlay path. Covers work
     /// that happens OUTSIDE a codeg-driven prompt turn — a provider's
@@ -1586,6 +1594,8 @@ mod envelope_tests {
             completed_at: None,
             outcome: None,
             autonomous_origin: None,
+            generation_ms: None,
+            generation_tokens: None,
         };
         let json = serde_json::to_value(&turn).unwrap();
         assert!(json.get("outcome").is_none());
@@ -1636,6 +1646,8 @@ mod envelope_tests {
                 duration_ms: Some(1500),
             }),
             autonomous_origin: None,
+            generation_ms: None,
+            generation_tokens: None,
         };
         let json = serde_json::to_value(&turn).unwrap();
         assert_eq!(json["outcome"]["status"], "interrupted");

@@ -3159,8 +3159,9 @@
         "elapsedHours": "{value} 小時",
         "elapsedMinutes": "{value} 分鐘",
         "elapsedSeconds": "{value} 秒",
-        "outputSpeedAria": "估算輸出速度",
-        "outputSpeedTooltip": "估算輸出速度（正文 + 思考）",
+        "outputSpeedAria": "輸出速度",
+        "outputSpeedTooltip": "依計費輸出 token ÷ 出字時間（含思考）",
+        "generationShareTooltip": "出字 {generation} / 牆鐘 {wall}（{percent}%）",
         "toolUseCount": "{count} 次工具呼叫"
       },
       "tool": {

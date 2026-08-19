@@ -10010,6 +10010,9 @@ async fn run_conversation_loop<'a>(
                             let st = Arc::clone(state);
                             let cwd_opt = Some(cwd);
                             let dispatch = fix_usage_update_nulls(dispatch);
+                            if let Dispatch::Notification(notification) = &dispatch {
+                                maybe_emit_request_usage(&st, &h, notification).await;
+                            }
                             let grok_claim = grok_observe_raw(
                                 grok_adapter.as_mut(),
                                 &dispatch,
@@ -10892,6 +10895,9 @@ async fn run_conversation_loop<'a>(
                                     let session_id = sid.clone();
                                     let cwd_opt = Some(cwd);
                                     let dispatch = fix_usage_update_nulls(dispatch);
+                                    if let Dispatch::Notification(notification) = &dispatch {
+                                        maybe_emit_request_usage(&st, &h, notification).await;
+                                    }
                                     let grok_claim = grok_observe_raw(
                                         grok_adapter.as_mut(),
                                         &dispatch,
@@ -12856,6 +12862,27 @@ fn is_claude_api_retry_message(message: &serde_json::Value) -> bool {
     matches!(message_type, Some("system")) && matches!(message_subtype, Some("api_retry"))
 }
 
+async fn maybe_emit_request_usage(
+    state: &Arc<RwLock<SessionState>>,
+    emitter: &EventEmitter,
+    notification: &UntypedMessage,
+) {
+    let Some(usage) =
+        crate::acp::request_usage::extract_request_usage(notification.method(), notification.params())
+    else {
+        return;
+    };
+    emit_with_state(
+        state,
+        emitter,
+        AcpEvent::RequestUsage {
+            output_tokens: usage.output_tokens,
+            duration_ms: usage.duration_ms,
+        },
+    )
+    .await;
+}
+
 fn map_claude_sdk_ext_notification(notification: &UntypedMessage) -> Option<AcpEvent> {
     if notification.method() != "_claude/sdkMessage" {
         return None;
@@ -13394,6 +13421,7 @@ async fn drain_ready_in_prompt_updates(
             SessionMessage::SessionMessage(dispatch) => {
                 let dispatch = fix_usage_update_nulls(dispatch);
                 if let Dispatch::Notification(notification) = &dispatch {
+                    maybe_emit_request_usage(state, emitter, notification).await;
                     if reconcile_grok_retry_dispatch(
                         agent_type,
                         notification,
@@ -19414,6 +19442,35 @@ mod tests {
         );
 
         assert!(claude_raw_sdk_session_meta(AgentType::Codex).is_none());
+    }
+
+    #[tokio::test]
+    async fn maybe_emit_request_usage_from_claude_assistant_sdk() {
+        use crate::web::event_bridge::{EventEmitter, WebEventBroadcaster};
+
+        let state = Arc::new(RwLock::new(SessionState::new(
+            "conn-test".into(),
+            AgentType::ClaudeCode,
+            None,
+            "win-test".into(),
+            None,
+        )));
+        let broadcaster = Arc::new(WebEventBroadcaster::new());
+        let emitter = EventEmitter::test_web_only(broadcaster.clone());
+        let raw = UntypedMessage::new(
+            "_claude/sdkMessage",
+            serde_json::json!({
+                "sessionId": "s",
+                "message": {
+                    "type": "assistant",
+                    "message": { "usage": { "output_tokens": 42 } }
+                }
+            }),
+        )
+        .unwrap();
+        maybe_emit_request_usage(&state, &emitter, &raw).await;
+        // RequestUsage does not mutate SessionState; the emit path must not panic.
+        assert!(state.read().await.usage.is_none());
     }
 
     #[test]

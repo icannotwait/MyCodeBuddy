@@ -3159,8 +3159,9 @@
         "elapsedHours": "{value}س",
         "elapsedMinutes": "{value}د",
         "elapsedSeconds": "{value}ث",
-        "outputSpeedAria": "السرعة التقديرية للإخراج",
-        "outputSpeedTooltip": "السرعة التقديرية للإخراج (نص + تفكير)",
+        "outputSpeedAria": "سرعة الإخراج",
+        "outputSpeedTooltip": "رموز الإخراج المفوترة ÷ زمن التوليد (يشمل التفكير)",
+        "generationShareTooltip": "التوليد {generation} / الساعة {wall} ({percent}%)",
         "toolUseCount": "{count} استخدامات للأدوات"
       },
       "tool": {

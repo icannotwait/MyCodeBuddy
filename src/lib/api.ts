@@ -2092,6 +2092,15 @@ export async function listOpenedTabs(): Promise<OpenedTabsSnapshot> {
   return getTransport().call("list_opened_tabs")
 }
 
+export async function saveTurnGenerationStat(params: {
+  conversationId: number
+  userOrdinal: number
+  generationMs: number
+  generationTokens: number
+}): Promise<void> {
+  await getTransport().call("save_turn_generation_stat", params)
+}
+
 export async function saveOpenedTabs(
   items: OpenedTab[],
   expectedVersion: number,

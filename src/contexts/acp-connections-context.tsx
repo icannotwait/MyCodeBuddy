@@ -27,6 +27,15 @@ import type {
 import { randomUUID } from "@/lib/utils"
 import { inferLiveToolName } from "@/lib/tool-call-normalization"
 import {
+  accumulateRequestUsage,
+  EMPTY_REQUEST_USAGE,
+  resolveRequestUsageSample,
+} from "@/lib/request-usage-speed"
+import {
+  aliasRequestUsageIds,
+  publishRequestUsage,
+} from "@/lib/request-usage-live"
+import {
   continuationFailureI18nKey,
   isContinuationFailureCode,
 } from "@/lib/continuation-waiting"
@@ -105,6 +114,7 @@ import {
   isUserStopNoCoordinatorCompletion,
   markUserStopNoCoordinatorCompletion,
   noteUserStopTurnOwnership,
+  resolveRuntimeConversationIdForOwnership,
   useConversationRuntimeStore,
 } from "@/stores/conversation-runtime-store"
 import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
@@ -270,6 +280,8 @@ export interface ConnectionState {
   configOptions: SessionConfigOptionInfo[] | null
   availableCommands: AvailableCommandInfo[] | null
   usage: SessionUsageUpdateInfo | null
+  requestUsage?: import("@/lib/request-usage-speed").RequestUsageSnapshot
+  generationClockStartedAt?: number | null
   liveMessage: LiveMessage | null
   pendingPermission: PendingPermission | null
   /** In-flight user prompt for the current turn — set from a `user_message`
@@ -976,6 +988,17 @@ type Action =
       type: "USAGE_UPDATE"
       contextKey: string
       usage: SessionUsageUpdateInfo
+    }
+  | {
+      type: "REQUEST_USAGE"
+      contextKey: string
+      outputTokens: number
+      durationMs: number
+    }
+  | {
+      type: "GENERATION_CLOCK_START"
+      contextKey: string
+      at: number
     }
   | {
       type: "EVENT_APPLIED"
@@ -1800,6 +1823,8 @@ function reduceSingleAction(
         configOptions: null,
         availableCommands: null,
         usage: null,
+        requestUsage: EMPTY_REQUEST_USAGE,
+        generationClockStartedAt: null,
         liveMessage: null,
         pendingPermission: null,
         pendingUserMessage: null,
@@ -1997,6 +2022,8 @@ function reduceSingleAction(
         configOptions: null,
         availableCommands: null,
         usage: null,
+        requestUsage: EMPTY_REQUEST_USAGE,
+        generationClockStartedAt: null,
         liveMessage: null,
         pendingPermission: null,
         pendingUserMessage: null,
@@ -2382,6 +2409,9 @@ function reduceSingleAction(
           content: [],
           startedAt: Date.now(),
         }
+        updated.requestUsage = EMPTY_REQUEST_USAGE
+        updated.generationClockStartedAt = null
+        publishRequestUsage(conn.conversationId, EMPTY_REQUEST_USAGE)
         updated.pendingQuestion = null
         updated.claudeApiRetry = null
         updated.error = null
@@ -2472,7 +2502,11 @@ function reduceSingleAction(
       const liveMessage = rollbackLiveMessageAttempt(conn.liveMessage)
       if (liveMessage === conn.liveMessage) return state
       const next = writableConnections(state, mutateUnpublished)
-      next.set(action.contextKey, { ...conn, liveMessage })
+      next.set(action.contextKey, {
+        ...conn,
+        liveMessage,
+        generationClockStartedAt: null,
+      })
       return next
     }
 
@@ -3017,6 +3051,19 @@ function reduceSingleAction(
         ...conn,
         conversationId: action.conversationId,
       })
+      if (conn.conversationId != null && conn.conversationId !== 0) {
+        aliasRequestUsageIds(conn.conversationId, action.conversationId)
+      }
+      const runtimeId = resolveRuntimeConversationIdForOwnership(
+        action.conversationId
+      )
+      if (runtimeId != null && runtimeId !== action.conversationId) {
+        aliasRequestUsageIds(runtimeId, action.conversationId)
+      }
+      publishRequestUsage(
+        action.conversationId,
+        conn.requestUsage ?? EMPTY_REQUEST_USAGE
+      )
       return next
     }
 
@@ -3306,9 +3353,44 @@ function reduceSingleAction(
       return next
     }
 
+    case "GENERATION_CLOCK_START": {
+      const conn = state.get(action.contextKey)
+      if (!conn || conn.generationClockStartedAt != null) return state
+      const next = writableConnections(state, mutateUnpublished)
+      next.set(action.contextKey, {
+        ...conn,
+        generationClockStartedAt: action.at,
+      })
+      return next
+    }
+
+    case "REQUEST_USAGE": {
+      const conn = state.get(action.contextKey)
+      if (!conn) return state
+      const sample = resolveRequestUsageSample(
+        { outputTokens: action.outputTokens, durationMs: action.durationMs },
+        action.durationMs
+      )
+      const requestUsage = accumulateRequestUsage(
+        conn.requestUsage ?? EMPTY_REQUEST_USAGE,
+        sample
+      )
+      const next = writableConnections(state, mutateUnpublished)
+      next.set(action.contextKey, {
+        ...conn,
+        requestUsage,
+        generationClockStartedAt: null,
+      })
+      publishRequestUsage(conn.conversationId, requestUsage)
+      return next
+    }
+
     case "USAGE_UPDATE": {
       const conn = state.get(action.contextKey)
       if (!conn) return state
+      if (action.usage.size <= 0) {
+        return state
+      }
       // Ignore usage updates that reset used to 0 when we already have
       // valid data — these come from synthetic responses for local commands
       // like /context and would overwrite the real context window usage.
@@ -3608,6 +3690,16 @@ function prepareMappedEnvelope(
       actions.push({ type: "STATUS_CHANGED", contextKey, status: e.status })
       break
     case "content_delta":
+      if (
+        !e.parent_tool_use_id &&
+        snapshot.generationClockStartedAt == null
+      ) {
+        actions.push({
+          type: "GENERATION_CLOCK_START",
+          contextKey,
+          at: e.received_at ?? performance.now(),
+        })
+      }
       actions.push({
         type: "CONTENT_DELTA",
         contextKey,
@@ -3623,6 +3715,16 @@ function prepareMappedEnvelope(
       }
       break
     case "thinking":
+      if (
+        !e.parent_tool_use_id &&
+        snapshot.generationClockStartedAt == null
+      ) {
+        actions.push({
+          type: "GENERATION_CLOCK_START",
+          contextKey,
+          at: e.received_at ?? performance.now(),
+        })
+      }
       actions.push({
         type: "THINKING",
         contextKey,
@@ -4204,6 +4306,21 @@ function prepareMappedEnvelope(
         usage: { used: e.used, size: e.size },
       })
       break
+    case "request_usage": {
+      const endedAt = e.received_at ?? performance.now()
+      const measured =
+        snapshot.generationClockStartedAt != null
+          ? endedAt - snapshot.generationClockStartedAt
+          : 0
+      const durationMs = e.duration_ms && e.duration_ms > 0 ? e.duration_ms : measured
+      actions.push({
+        type: "REQUEST_USAGE",
+        contextKey,
+        outputTokens: e.output_tokens,
+        durationMs,
+      })
+      break
+    }
     case "user_message":
     case "user_prompt_sent":
     case "conversation_status_changed":

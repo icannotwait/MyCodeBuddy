@@ -39,6 +39,7 @@ pub mod remote_workspace_connection;
 pub mod simple_workflow;
 pub mod token_usage_sync;
 pub mod token_usage_turn;
+pub mod turn_generation_stat;
 pub mod work_task;
 pub mod work_task_event;
 pub mod work_task_settings;

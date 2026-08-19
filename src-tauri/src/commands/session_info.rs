@@ -453,6 +453,8 @@ mod tests {
             completed_at: None,
             outcome: None,
             autonomous_origin: None,
+            generation_ms: None,
+            generation_tokens: None,
         }
     }
 

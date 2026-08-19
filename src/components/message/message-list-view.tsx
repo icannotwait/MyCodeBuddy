@@ -194,6 +194,8 @@ export interface ResolvedMessageGroup {
   autolinkableTextParts: ReadonlySet<AutolinkableTextPart>
   usage?: import("@/lib/types").TurnUsage | null
   duration_ms?: number | null
+  generation_ms?: number | null
+  generation_tokens?: number | null
   model?: string | null
   models?: string[]
   reasoning_effort?: string | null
@@ -556,6 +558,8 @@ export function mergeConsecutiveAssistantTurns(
       // agent loops, etc.) would visibly under-report tokens.
       let mergedUsage: import("@/lib/types").TurnUsage | null = null
       let mergedDuration: number | null = null
+      let mergedGenerationMs: number | null = null
+      let mergedGenerationTokens: number | null = null
       // Post-turn metadata may land on ANY sub-turn (Cursor's reparse patches
       // the FIRST local sub-turn when the parser emits fewer turns than the
       // live stream split into), so the merged completion time is the latest
@@ -596,6 +600,13 @@ export function mergeConsecutiveAssistantTurns(
         if (typeof it.group.duration_ms === "number") {
           mergedDuration = (mergedDuration ?? 0) + it.group.duration_ms
         }
+        if (typeof it.group.generation_ms === "number") {
+          mergedGenerationMs = (mergedGenerationMs ?? 0) + it.group.generation_ms
+        }
+        if (typeof it.group.generation_tokens === "number") {
+          mergedGenerationTokens =
+            (mergedGenerationTokens ?? 0) + it.group.generation_tokens
+        }
         if (it.group.model && !seenModels.has(it.group.model)) {
           seenModels.add(it.group.model)
           mergedModels.push(it.group.model)
@@ -625,6 +636,8 @@ export function mergeConsecutiveAssistantTurns(
               : EMPTY_AUTOLINKABLE_TEXT_PARTS,
           usage: mergedUsage,
           duration_ms: mergedDuration,
+          generation_ms: mergedGenerationMs,
+          generation_tokens: mergedGenerationTokens,
           model: mergedModels[0] ?? last.group.model,
           models: mergedModels.length > 1 ? mergedModels : undefined,
           reasoning_effort:
@@ -757,6 +770,7 @@ const HistoricalMessageGroup = memo(function HistoricalMessageGroup({
   sourceTurns,
   renderKind = "historicalRow",
   showThinking = true,
+  agentType,
 }: {
   group: ResolvedMessageGroup
   parentConversationId?: number | null
@@ -767,6 +781,7 @@ const HistoricalMessageGroup = memo(function HistoricalMessageGroup({
   sourceTurns?: MessageTurn[]
   renderKind?: "historicalRow" | "liveRow"
   showThinking?: boolean
+  agentType: AgentType
 }) {
   streamingPerfRecorder.countRender(renderKind)
   const t = useTranslations("Folder.chat.messageList")
@@ -852,6 +867,9 @@ const HistoricalMessageGroup = memo(function HistoricalMessageGroup({
         <TurnStats
           usage={group.usage}
           duration_ms={group.duration_ms}
+          generationMs={group.generation_ms}
+          generationTokens={group.generation_tokens}
+          agentType={agentType}
           model={group.model}
           models={group.models}
           reasoningEffort={group.reasoning_effort}
@@ -1046,6 +1064,7 @@ const LiveTurnStatsBanner = memo(function LiveTurnStatsBanner({
       <LiveTurnStats
         message={message}
         agentType={agentType}
+        conversationId={conversationId}
         isStreaming
         statusMode="waiting_for_subagents"
       />
@@ -1057,6 +1076,7 @@ const LiveTurnStatsBanner = memo(function LiveTurnStatsBanner({
       <LiveTurnStats
         message={activeLive}
         agentType={agentType}
+        conversationId={conversationId}
         isStreaming
         statusMode="auto"
       />
@@ -1484,6 +1504,8 @@ export function MessageListView({
           autolinkableTextParts: topLevelAssistantTextParts(msg),
           usage: msg.usage,
           duration_ms: msg.duration_ms,
+          generation_ms: msg.generation_ms,
+          generation_tokens: msg.generation_tokens,
           model: msg.model,
           reasoning_effort: msg.reasoning_effort,
           completed_at: msg.completed_at,
@@ -1661,6 +1683,7 @@ export function MessageListView({
                   item.phase === "streaming" ? "liveRow" : "historicalRow"
                 }
                 showThinking={showThinking}
+                agentType={agentType}
               />
             </div>
           )

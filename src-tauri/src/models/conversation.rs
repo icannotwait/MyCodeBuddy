@@ -186,6 +186,9 @@ pub struct DbConversationDetail {
     /// Assistant turns in `full[0..turns_offset)`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assistant_turns_before_offset: Option<usize>,
+    /// User turns in `full[0..turns_offset)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_turns_before_offset: Option<usize>,
     /// Structural fingerprint of `full[0..turns_offset)`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefix_hash: Option<String>,
@@ -200,6 +203,7 @@ pub struct ConversationTurnsPage {
     pub turns_offset: usize,
     pub turns_total: usize,
     pub assistant_turns_before_offset: usize,
+    pub user_turns_before_offset: usize,
     pub prefix_hash: String,
     pub prefix_hash_before_index: String,
     #[serde(skip_serializing_if = "Option::is_none")]

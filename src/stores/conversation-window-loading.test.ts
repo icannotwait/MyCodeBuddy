@@ -105,6 +105,9 @@ function windowedDetail(
     assistant_turns_before_offset: FULL.slice(0, offset).filter(
       (t) => t.role === "assistant"
     ).length,
+    user_turns_before_offset: FULL.slice(0, offset).filter(
+      (t) => t.role === "user"
+    ).length,
     prefix_hash: hashPrefix(offset),
     uncovered_prefix_max_ts: offset > 0 ? FULL[offset - 1].timestamp : null,
     ...overrides,
@@ -122,6 +125,9 @@ function page(
     turns_total: FULL.length,
     assistant_turns_before_offset: FULL.slice(0, start).filter(
       (t) => t.role === "assistant"
+    ).length,
+    user_turns_before_offset: FULL.slice(0, start).filter(
+      (t) => t.role === "user"
     ).length,
     prefix_hash: hashPrefix(start),
     prefix_hash_before_index: hashPrefix(end),

@@ -292,6 +292,13 @@ pub struct MessageTurn {
     pub outcome: Option<TurnOutcome>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub autonomous_origin: Option<AutonomousTurnOrigin>,
+    /// Model generation time (excludes tool wait). Overlay-only — parsers
+    /// leave this unset; `turn_generation_stat` fills it on conversation load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation_ms: Option<u64>,
+    /// Billed output tokens that produced [`Self::generation_ms`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation_tokens: Option<u64>,
 }
 
 #[cfg(test)]

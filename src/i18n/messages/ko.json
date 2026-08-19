@@ -3159,8 +3159,9 @@
         "elapsedHours": "{value}시간",
         "elapsedMinutes": "{value}분",
         "elapsedSeconds": "{value}초",
-        "outputSpeedAria": "예상 출력 속도",
-        "outputSpeedTooltip": "예상 출력 속도（텍스트 + 추론）",
+        "outputSpeedAria": "출력 속도",
+        "outputSpeedTooltip": "과금 출력 토큰 ÷ 생성 시간（추론 포함）",
+        "generationShareTooltip": "생성 {generation} / 경과 {wall}（{percent}%）",
         "toolUseCount": "도구 사용 {count}회"
       },
       "tool": {

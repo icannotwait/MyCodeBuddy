@@ -53,6 +53,36 @@ describe("TurnStats jump-to-previous-user gating", () => {
   })
 })
 
+describe("TurnStats generation speed gating", () => {
+  const speedAria =
+    enMessages.Folder.chat.liveTurnStats.outputSpeedAria
+
+  it("hides historical tok/s for agents without a request-usage adapter", () => {
+    renderStats(
+      <TurnStats
+        copyText="hello"
+        agentType="cursor"
+        generationMs={2000}
+        generationTokens={400}
+      />
+    )
+    expect(screen.queryByLabelText(speedAria)).not.toBeInTheDocument()
+  })
+
+  it("shows tok/s without fabricating a 100% wall share", () => {
+    renderStats(
+      <TurnStats
+        copyText="hello"
+        agentType="claude_code"
+        generationMs={2000}
+        generationTokens={400}
+      />
+    )
+    expect(screen.getByLabelText(speedAria)).toBeInTheDocument()
+    expect(screen.queryByText(/100%/)).not.toBeInTheDocument()
+  })
+})
+
 describe("TurnStats model and reasoning effort metadata", () => {
   it("shows model and archived reasoning effort in the footer", () => {
     const view = renderStats(

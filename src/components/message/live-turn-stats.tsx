@@ -1,6 +1,6 @@
 "use client"
 
-import { useEffect, useMemo, useState } from "react"
+import { useEffect, useMemo, useState, useSyncExternalStore } from "react"
 import { useLocale, useTranslations } from "next-intl"
 import type {
   LiveContentBlock,
@@ -15,13 +15,21 @@ import {
 import { FilePenLine, Plane, Timer } from "lucide-react"
 import type { AgentType } from "@/lib/types"
 import { AgentIcon } from "@/components/agent-icon"
-import { useTokenOutputSpeed } from "@/hooks/use-token-output-speed"
+import {
+  EMPTY_REQUEST_USAGE,
+  supportsRequestUsageDisplay,
+} from "@/lib/request-usage-speed"
+import {
+  getPublishedRequestUsage,
+  subscribeRequestUsage,
+} from "@/lib/request-usage-live"
 
 export type LiveTurnStatusMode = "auto" | "waiting_for_subagents"
 
 interface LiveTurnStatsProps {
   message: LiveMessage
   agentType: AgentType
+  conversationId?: number
   isStreaming?: boolean
   /**
    * `waiting_for_subagents` replaces the thinking/streaming label while keeping
@@ -317,6 +325,7 @@ export function extractLiveEditStats(message: LiveMessage): LiveEditStats {
 export function LiveTurnStats({
   message,
   agentType,
+  conversationId,
   isStreaming = true,
   statusMode = "auto",
 }: LiveTurnStatsProps) {
@@ -324,7 +333,21 @@ export function LiveTurnStats({
   const t = useTranslations("Folder.chat.liveTurnStats")
   const [elapsed, setElapsed] = useState(() => Date.now() - message.startedAt)
   const editStats = useMemo(() => extractLiveEditStats(message), [message])
-  const tps = useTokenOutputSpeed(message)
+  const showUsage = supportsRequestUsageDisplay(agentType)
+  const usageSnap = useSyncExternalStore(
+    subscribeRequestUsage,
+    () =>
+      conversationId != null
+        ? getPublishedRequestUsage(conversationId)
+        : EMPTY_REQUEST_USAGE,
+    () => EMPTY_REQUEST_USAGE
+  )
+  const tps = showUsage ? usageSnap.tps : null
+  const generationMs = showUsage ? usageSnap.generationMs : 0
+  const generationShare =
+    showUsage && elapsed > 0
+      ? Math.min(100, Math.round((generationMs / elapsed) * 100))
+      : 0
   const compactNumberFormatter = useMemo(
     () =>
       new Intl.NumberFormat(locale, {
@@ -391,24 +414,36 @@ export function LiveTurnStats({
             </span>
           </>
         )}
-        {tps != null && (
+        {showUsage && (
           <>
             <span className="hidden text-border leading-none @[30rem]/turnstats:inline">
               |
             </span>
-            {/* `tabular-nums` so the digits stop shimmering as the rate moves. */}
             <span
               className="hidden items-center gap-1 leading-none tabular-nums @[30rem]/turnstats:inline-flex"
               title={t("outputSpeedTooltip")}
             >
-              {/* Name hangs off the icon, matching `ComposerContextUsage` —
-                  `aria-label` on the bare wrapper span carries no role and
-                  isn't reliably exposed. */}
               <Plane
                 aria-label={t("outputSpeedAria")}
                 className="h-3 w-3 shrink-0"
               />
-              {tps.toFixed(1)} tok/s
+              {(tps ?? 0).toFixed(1)} tok/s
+            </span>
+            <span className="hidden text-border leading-none @[36rem]/turnstats:inline">
+              |
+            </span>
+            <span
+              className="hidden items-center gap-1 leading-none tabular-nums @[36rem]/turnstats:inline-flex"
+              title={t("generationShareTooltip", {
+                generation: formatElapsedLabel(generationMs, t),
+                wall: formatElapsedLabel(elapsed, t),
+                percent: generationShare,
+              })}
+            >
+              {formatElapsedLabel(generationMs, t)}
+              <span className="text-muted-foreground/80">
+                ({generationShare}%)
+              </span>
             </span>
           </>
         )}

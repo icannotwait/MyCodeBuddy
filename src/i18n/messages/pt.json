@@ -3159,8 +3159,9 @@
         "elapsedHours": "{value} h",
         "elapsedMinutes": "{value} min",
         "elapsedSeconds": "{value} s",
-        "outputSpeedAria": "Velocidade de saída estimada",
-        "outputSpeedTooltip": "Velocidade de saída estimada (texto + raciocínio)",
+        "outputSpeedAria": "Velocidade de saída",
+        "outputSpeedTooltip": "Tokens de saída faturados ÷ tempo de geração (inclui raciocínio)",
+        "generationShareTooltip": "Geração {generation} / relógio {wall} ({percent}%)",
         "toolUseCount": "{count} usos de ferramentas"
       },
       "tool": {

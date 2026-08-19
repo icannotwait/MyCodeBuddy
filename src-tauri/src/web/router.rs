@@ -265,6 +265,10 @@ pub fn build_router(
             post(handlers::conversations::update_conversation_pinned),
         )
         .route(
+            "/save_turn_generation_stat",
+            post(handlers::conversations::save_turn_generation_stat),
+        )
+        .route(
             "/clear_awaiting_reply",
             post(handlers::conversations::clear_awaiting_reply),
         )

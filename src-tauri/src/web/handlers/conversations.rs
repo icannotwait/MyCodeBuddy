@@ -463,6 +463,30 @@ pub struct UpdateConversationPinnedParams {
     pub pinned: bool,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveTurnGenerationStatParams {
+    pub conversation_id: i32,
+    pub user_ordinal: i32,
+    pub generation_ms: u64,
+    pub generation_tokens: u64,
+}
+
+pub async fn save_turn_generation_stat(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<SaveTurnGenerationStatParams>,
+) -> Result<Json<()>, AppCommandError> {
+    conv_commands::save_turn_generation_stat_core(
+        &state.db.conn,
+        params.conversation_id,
+        params.user_ordinal,
+        params.generation_ms,
+        params.generation_tokens,
+    )
+    .await?;
+    Ok(Json(()))
+}
+
 pub async fn update_conversation_pinned(
     Extension(state): Extension<Arc<AppState>>,
     Json(params): Json<UpdateConversationPinnedParams>,

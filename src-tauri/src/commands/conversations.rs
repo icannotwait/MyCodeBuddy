@@ -8,7 +8,9 @@ use crate::auto_title::{InternalAgentSessionRegistry, InternalSessionFilter};
 use crate::commands::delegation::{list_delegation_run_snapshots_core, DelegationRunSnapshot};
 use crate::db::entities::conversation;
 use crate::db::entities::folder::FolderKind;
-use crate::db::service::{conversation_service, folder_service, import_service, tab_service};
+use crate::db::service::{
+    conversation_service, folder_service, import_service, tab_service, turn_generation_service,
+};
 use crate::db::AppDatabase;
 use crate::models::conversation::ContinuationFailureProjection;
 use crate::models::*;
@@ -1608,6 +1610,15 @@ pub async fn get_folder_conversation_core(
     };
     inject_delegation_run_meta(&mut turns, &runs);
 
+    match turn_generation_service::list_for_conversation(conn, conversation_id).await {
+        Ok(stats) => turn_generation_service::overlay_generation_stats(&mut turns, &stats),
+        Err(error) => tracing::warn!(
+            conversation_id,
+            error = %error,
+            "failed to load turn generation overlay"
+        ),
+    }
+
     // Workflow graph projection is independent of transcript parsing. Errors
     // and corrupt manifests omit the graph (warn inside projector) and never
     // fail conversation detail load.
@@ -1629,6 +1640,7 @@ pub async fn get_folder_conversation_core(
             turns_offset: None,
             turns_total: None,
             assistant_turns_before_offset: None,
+            user_turns_before_offset: None,
             prefix_hash: None,
             uncovered_prefix_max_ts: None,
         },
@@ -1847,6 +1859,7 @@ fn apply_turn_window(
     detail.turns_offset = Some(meta.offset);
     detail.turns_total = Some(meta.total);
     detail.assistant_turns_before_offset = Some(meta.assistant_before);
+    detail.user_turns_before_offset = Some(meta.user_before);
     detail.prefix_hash = Some(meta.prefix_hash);
     detail.uncovered_prefix_max_ts = meta.uncovered_prefix_max_ts;
 }
@@ -1955,6 +1968,7 @@ pub async fn get_folder_conversation_turns_core(
         turns_offset: meta.offset,
         turns_total: meta.total,
         assistant_turns_before_offset: meta.assistant_before,
+        user_turns_before_offset: meta.user_before,
         prefix_hash: meta.prefix_hash,
         prefix_hash_before_index: seam.prefix_hash,
         uncovered_prefix_max_ts: meta.uncovered_prefix_max_ts,
@@ -2807,6 +2821,48 @@ pub async fn update_conversation_pinned_core(
         .map_err(AppCommandError::from)
 }
 
+pub async fn save_turn_generation_stat_core(
+    conn: &sea_orm::DatabaseConnection,
+    conversation_id: i32,
+    user_ordinal: i32,
+    generation_ms: u64,
+    generation_tokens: u64,
+) -> Result<(), AppCommandError> {
+    if conversation_id <= 0 || user_ordinal < 0 {
+        return Ok(());
+    }
+    turn_generation_service::upsert(
+        conn,
+        conversation_id,
+        turn_generation_service::GenerationStat {
+            user_ordinal,
+            generation_ms,
+            generation_tokens,
+        },
+    )
+    .await
+    .map_err(AppCommandError::from)
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn save_turn_generation_stat(
+    db: tauri::State<'_, AppDatabase>,
+    conversation_id: i32,
+    user_ordinal: i32,
+    generation_ms: u64,
+    generation_tokens: u64,
+) -> Result<(), AppCommandError> {
+    save_turn_generation_stat_core(
+        &db.conn,
+        conversation_id,
+        user_ordinal,
+        generation_ms,
+        generation_tokens,
+    )
+    .await
+}
+
 #[cfg(feature = "tauri-runtime")]
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
 pub async fn update_conversation_pinned(
@@ -3355,6 +3411,8 @@ mod tests {
             completed_at: None,
             outcome: None,
             autonomous_origin: None,
+            generation_ms: None,
+            generation_tokens: None,
         }];
         let mut child = summary_child(42, "tu-1", "cancelled");
         child.delegation_call_id = Some("task-join".into());
@@ -3474,6 +3532,8 @@ mod tests {
             completed_at: None,
             outcome: None,
             autonomous_origin: None,
+            generation_ms: None,
+            generation_tokens: None,
         }
     }
 
@@ -3820,6 +3880,8 @@ Call get_delegation_status with the returned task_id to collect the result.";
             completed_at: None,
             outcome: None,
             autonomous_origin: None,
+            generation_ms: None,
+            generation_tokens: None,
         }
     }
 
@@ -3841,6 +3903,8 @@ Call get_delegation_status with the returned task_id to collect the result.";
             completed_at: completed.then_some(ts),
             outcome: None,
             autonomous_origin: None,
+            generation_ms: None,
+            generation_tokens: None,
         }
     }
 
@@ -4006,6 +4070,8 @@ Call get_delegation_status with the returned task_id to collect the result.";
             completed_at: None,
             outcome: None,
             autonomous_origin: None,
+            generation_ms: None,
+            generation_tokens: None,
         };
         let pending_image =
             |message_id: &str, data: &str| crate::acp::session_state::PendingUserMessage {
@@ -4231,6 +4297,8 @@ Call get_delegation_status with the returned task_id to collect the result.";
             completed_at: None,
             outcome: None,
             autonomous_origin: None,
+            generation_ms: None,
+            generation_tokens: None,
         }];
         let mut child = summary_child(5, "item_0", "pending_review");
         child.delegation_call_id = Some("c5168930-df71-49d5-b52d-79a642e357ac".into());
@@ -4309,6 +4377,8 @@ Call get_delegation_status with the returned task_id to collect the result.";
             completed_at: None,
             outcome: None,
             autonomous_origin: None,
+            generation_ms: None,
+            generation_tokens: None,
         }];
         let children = vec![summary_child(42, "tu-1", "completed")];
         inject_delegation_meta(&mut turns, &children);
@@ -6770,6 +6840,7 @@ Call get_delegation_status with the returned task_id to collect the result.";
         assert_eq!(detail.turns_offset, Some(3));
         assert_eq!(detail.turns_total, Some(4));
         assert_eq!(detail.assistant_turns_before_offset, Some(1));
+        assert_eq!(detail.user_turns_before_offset, Some(2));
         assert_eq!(detail.turns.len(), 1);
         assert_eq!(detail.turns[0].id, "turn-3");
         assert_eq!(detail.summary.message_count, 4);

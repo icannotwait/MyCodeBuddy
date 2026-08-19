@@ -3,7 +3,19 @@ import type {
   LiveMessage,
   ToolCallInfo,
 } from "@/contexts/acp-connections-context"
-import { getFolderConversation, getFolderConversationTurns } from "@/lib/api"
+import {
+  getFolderConversation,
+  getFolderConversationTurns,
+  saveTurnGenerationStat,
+} from "@/lib/api"
+import {
+  aliasRequestUsageIds,
+  getPublishedRequestUsage,
+} from "@/lib/request-usage-live"
+import {
+  hiddenUserTurnsFromDetail,
+  userOrdinalForCurrentTurn,
+} from "@/lib/request-usage-speed"
 import {
   coldHistoryFetchOptions,
   countUserTurns,
@@ -1010,6 +1022,54 @@ function isImageGenerationToolCall(info: {
  * values, but the type system doesn't see that. Anything else falls back
  * to `null` and the renderer treats it as in-flight.
  */
+function stampGenerationOnAssistantTurns(
+  turns: MessageTurn[],
+  snap: { generationMs: number; outputTokens: number }
+): MessageTurn[] {
+  let lastAssistant = -1
+  for (let i = turns.length - 1; i >= 0; i--) {
+    if (turns[i].role === "assistant") {
+      lastAssistant = i
+      break
+    }
+  }
+  if (lastAssistant < 0) return turns
+  const next = turns.slice()
+  next[lastAssistant] = {
+    ...next[lastAssistant],
+    generation_ms: snap.generationMs,
+    generation_tokens: snap.outputTokens,
+  }
+  return next
+}
+
+function persistTurnGenerationFromSession(
+  conversationId: number,
+  session: ConversationRuntimeSession | undefined
+): void {
+  const snap = getPublishedRequestUsage(conversationId)
+  if (snap.sampleCount <= 0 || snap.generationMs <= 0) return
+  const dbId = session?.dbConversationId ?? conversationId
+  if (dbId <= 0) return
+  const loadedUser = countUserTurns(session?.detail?.turns)
+  const hidden = hiddenUserTurnsFromDetail(session?.detail)
+  const ordinal = userOrdinalForCurrentTurn({
+    totalUserTurnCount: hidden + loadedUser,
+    returnedUserTurnCount: loadedUser,
+    loadedTurns: session?.detail?.turns ?? [],
+    localTurns: [
+      ...(session?.localTurns ?? []),
+      ...(session?.optimisticTurns ?? []),
+    ],
+  })
+  void saveTurnGenerationStat({
+    conversationId: dbId,
+    userOrdinal: ordinal,
+    generationMs: snap.generationMs,
+    generationTokens: snap.outputTokens,
+  }).catch(() => {})
+}
+
 function narrowToolCallStatus(status: string): ToolCallStatus | null {
   switch (status) {
     case "pending":
@@ -2174,6 +2234,7 @@ function reducer(
         turns: [...prependTurns, ...detail.turns],
         turns_offset: page.turns_offset,
         assistant_turns_before_offset: page.assistant_turns_before_offset,
+        user_turns_before_offset: page.user_turns_before_offset,
         prefix_hash: page.prefix_hash,
         uncovered_prefix_max_ts: page.uncovered_prefix_max_ts ?? null,
         // `turns_total` stays the window's own (newer) value: the page's
@@ -2266,10 +2327,16 @@ function reducer(
       // a snapshot into localTurns, the live turn re-streams under the same id,
       // and a second COMPLETE_TURN would append it again. Identical ids mean the
       // same underlying turn, so the later (most complete) copy supersedes.
+      const usageSnap = getPublishedRequestUsage(action.conversationId)
+      const stampedStreaming =
+        usageSnap.sampleCount > 0
+          ? stampGenerationOnAssistantTurns(streamingTurns, usageSnap)
+          : streamingTurns
+
       const promotedRaw = [
         ...current.localTurns,
         ...current.optimisticTurns,
-        ...streamingTurns,
+        ...stampedStreaming,
       ]
       const promotedLastIndexById = new Map<string, number>()
       promotedRaw.forEach((turn, i) => promotedLastIndexById.set(turn.id, i))
@@ -5571,7 +5638,9 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
       // the complete, correct render; a later cold detail fetch (opening the tab
       // again, etc.) reconciles it against the DB whenever that naturally
       // happens.
+      const sessionBefore = get().byConversationId.get(conversationId)
       dispatch({ type: "COMPLETE_TURN", conversationId, liveMessage })
+      persistTurnGenerationFromSession(conversationId, sessionBefore)
     },
     appendOptimisticTurn: (conversationId, turn, turnToken) => {
       // New prompt: cancel coordinator timers + soft fence + bump generation.
@@ -5649,6 +5718,9 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
         stopCancelReconcileTimers(conversationId)
         stopSoftFenceTimer(conversationId)
         bumpCancelGeneration(conversationId)
+      }
+      if (conversationId !== dbConversationId) {
+        aliasRequestUsageIds(conversationId, dbConversationId)
       }
       dispatch({
         type: "SET_DB_CONVERSATION_ID",

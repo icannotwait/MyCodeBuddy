@@ -9,6 +9,7 @@ import {
   CopyIcon,
   Gauge,
   ListTodo,
+  Plane,
   Timer,
 } from "lucide-react"
 import { useLocale, useTranslations } from "next-intl"
@@ -23,7 +24,8 @@ import { useCreateTaskFromMessage } from "./use-create-task-from-message"
 import { formatElapsedLabel } from "@/lib/format-elapsed"
 import { formatTokenCount } from "@/lib/token-format"
 import { cn, copyTextToClipboard } from "@/lib/utils"
-import type { TurnUsage } from "@/lib/types"
+import type { AgentType, TurnUsage } from "@/lib/types"
+import { supportsRequestUsageDisplay } from "@/lib/request-usage-speed"
 
 interface TurnStatsProps {
   usage?: TurnUsage | null
@@ -37,6 +39,9 @@ interface TurnStatsProps {
   copyText?: string
   /** ISO timestamp marking when the assistant reply finished. */
   completedAt?: string | null
+  generationMs?: number | null
+  generationTokens?: number | null
+  agentType?: AgentType | null
 }
 
 const iconButtonClass =
@@ -53,6 +58,9 @@ export function TurnStats({
   isResponseComplete = true,
   copyText = "",
   completedAt,
+  generationMs,
+  generationTokens,
+  agentType,
 }: TurnStatsProps) {
   const locale = useLocale()
   const t = useTranslations("Folder.chat.messageList")
@@ -109,6 +117,20 @@ export function TurnStats({
   const hasEffort = displayEfforts.length > 0
   const hasUsage = Boolean(usage)
   const hasDuration = typeof duration_ms === "number" && duration_ms > 0
+  const hasGeneration =
+    agentType != null &&
+    supportsRequestUsageDisplay(agentType) &&
+    typeof generationMs === "number" &&
+    generationMs > 0 &&
+    typeof generationTokens === "number" &&
+    generationTokens > 0
+  const generationTps = hasGeneration
+    ? generationTokens / (generationMs / 1000)
+    : 0
+  const generationShare =
+    hasGeneration && hasDuration
+      ? Math.min(100, Math.round((generationMs / (duration_ms ?? 1)) * 100))
+      : null
   const hasCompletedAt = Boolean(completedLabel)
   // Usage OR duration: some agents (Cursor) never report per-turn token
   // usage, but a turn with a duration chip is still a substantial reply
@@ -150,6 +172,7 @@ export function TurnStats({
     !hasEffort &&
     !hasUsage &&
     !hasDuration &&
+    !hasGeneration &&
     !hasCompletedAt &&
     !hasJump
   )
@@ -277,6 +300,39 @@ export function TurnStats({
                       {formatTokenCount(usage.cache_creation_input_tokens)}
                     </span>
                   </div>
+                )}
+              </div>
+            </TooltipContent>
+          </Tooltip>
+        )}
+        {hasGeneration && (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                className={cn(iconButtonClass, "cursor-default tabular-nums")}
+                aria-label={tLive("outputSpeedAria")}
+              >
+                <Plane aria-hidden="true" className="h-3.5 w-3.5" />
+              </button>
+            </TooltipTrigger>
+            <TooltipContent side="top" className="max-w-xs">
+              <div className="flex flex-col gap-0.5">
+                <span className="font-mono tabular-nums">
+                  {generationTps.toFixed(1)} tok/s
+                </span>
+                {generationShare != null ? (
+                  <span>
+                    {tLive("generationShareTooltip", {
+                      generation: formatElapsedLabel(generationMs ?? 0, tLive),
+                      wall: formatElapsedLabel(duration_ms ?? 0, tLive),
+                      percent: generationShare,
+                    })}
+                  </span>
+                ) : (
+                  <span className="font-mono tabular-nums">
+                    {formatElapsedLabel(generationMs ?? 0, tLive)}
+                  </span>
                 )}
               </div>
             </TooltipContent>
