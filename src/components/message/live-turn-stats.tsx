@@ -7,6 +7,7 @@ import type {
   LiveMessage,
 } from "@/contexts/acp-connections-context"
 import { inferLiveToolName } from "@/lib/tool-call-normalization"
+import { tryParseJsonForOwner } from "@/lib/try-parse-json"
 import { formatElapsedLabel } from "@/lib/format-elapsed"
 import {
   countUnifiedDiffLineChanges,
@@ -58,14 +59,11 @@ function asObject(value: unknown): Record<string, unknown> | null {
 }
 
 function parseInputObject(
-  input: string | null
+  input: string | null,
+  owner: object
 ): Record<string, unknown> | null {
   if (!input) return null
-  try {
-    return asObject(JSON.parse(input))
-  } catch {
-    return null
-  }
+  return tryParseJsonForOwner(owner, input)
 }
 
 function unescapeInlineEscapes(text: string): string {
@@ -262,11 +260,13 @@ function computeBlockEditContribution(
   block: LiveContentBlock
 ): BlockEditContribution | null {
   if (block.type !== "tool_call") return null
+  const owner = block.info
   const toolName = inferLiveToolName({
     title: block.info.title,
     kind: block.info.kind,
     rawInput: block.info.raw_input,
     meta: block.info.meta,
+    owner,
   })
   if (toolName !== "edit" && toolName !== "write" && toolName !== "apply_patch")
     return null
@@ -275,7 +275,7 @@ function computeBlockEditContribution(
   let additions = 0
   let deletions = 0
 
-  const parsed = parseInputObject(block.info.raw_input)
+  const parsed = parseInputObject(block.info.raw_input, owner)
   for (const path of collectParsedPaths(parsed)) files.add(path)
 
   if (toolName === "apply_patch") {

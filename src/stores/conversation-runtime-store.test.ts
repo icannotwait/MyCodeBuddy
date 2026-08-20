@@ -1,4 +1,5 @@
-import { afterEach, describe, expect, it } from "vitest"
+import { afterEach, describe, expect, it, vi } from "vitest"
+import { resetJsonParseCacheForTests } from "@/lib/try-parse-json"
 import type {
   LiveContentBlock,
   LiveMessage,
@@ -192,6 +193,8 @@ function mutateHistoricalInput(
 
 afterEach(() => {
   resetConversationRuntimeStore()
+  resetJsonParseCacheForTests()
+  vi.restoreAllMocks()
 })
 
 describe("selectHistoricalTimelineTurns reference stability", () => {
@@ -728,6 +731,35 @@ describe("buildStreamingTurnsFromLiveMessage — native activity projection", ()
 
     const withoutHint = buildStreamingTurnsFromLiveMessage(CID, live)
     expect(withoutHint.delegationActivities).toHaveLength(0)
+  })
+
+  it("parses a large Write raw_input only once across rebuilds of the same tool", () => {
+    const info: ToolCallInfo = {
+      tool_call_id: "write-1",
+      title: "tool",
+      kind: "tool",
+      status: "completed",
+      content: null,
+      raw_input: JSON.stringify({
+        content: "x".repeat(128 * 1024),
+        file_path: "a.ts",
+      }),
+      raw_output_chunks: [],
+      raw_output_total_bytes: 0,
+      locations: null,
+      meta: null,
+      images: [],
+    }
+    const live: LiveMessage = {
+      id: "msg-write",
+      role: "assistant",
+      content: [{ type: "tool_call", info }],
+      startedAt: Date.parse("2026-07-16T10:00:00Z"),
+    }
+    const spy = vi.spyOn(JSON, "parse")
+    buildStreamingTurnsFromLiveMessage(CID, live)
+    buildStreamingTurnsFromLiveMessage(CID, live)
+    expect(spy).toHaveBeenCalledTimes(1)
   })
 })
 

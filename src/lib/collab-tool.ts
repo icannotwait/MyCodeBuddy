@@ -29,6 +29,8 @@
  * for the collab surface codex still emits.
  */
 
+import { tryParseJson, tryParseJsonForOwner } from "@/lib/try-parse-json"
+
 /** Canonical tool name the live collab path collapses to (see `inferLiveToolName`). */
 export const COLLAB_AGENT_TOOL_NAME = "collab_agent"
 
@@ -173,18 +175,13 @@ export function mergeCollabAgentStatus(
 }
 
 function tryParseObject(
-  rawInput: string | null | undefined
+  rawInput: string | null | undefined,
+  owner?: object
 ): Record<string, unknown> | null {
   if (!rawInput) return null
-  try {
-    const parsed = JSON.parse(rawInput)
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-      return null
-    }
-    return parsed as Record<string, unknown>
-  } catch {
-    return null
-  }
+  return owner
+    ? tryParseJsonForOwner(owner, rawInput)
+    : tryParseJson(rawInput)
 }
 
 /** A non-empty (trimmed) string, or null for anything else. */
@@ -201,9 +198,10 @@ function asText(v: unknown): string | null {
  * `prompt` can be empty for some collab phases.
  */
 export function isCodexCollabInput(
-  rawInput: string | null | undefined
+  rawInput: string | null | undefined,
+  owner?: object
 ): boolean {
-  const parsed = tryParseObject(rawInput)
+  const parsed = tryParseObject(rawInput, owner)
   if (!parsed) return false
   return (
     "senderThreadId" in parsed &&
@@ -220,20 +218,22 @@ export function isCodexCollabInput(
  */
 export function mergeCollabOp(
   rawInput: string | null | undefined,
-  op: string | null | undefined
+  op: string | null | undefined,
+  owner?: object
 ): string | null {
   const cleanOp = asText(op)
   if (!cleanOp) return null
-  const parsed = tryParseObject(rawInput)
+  const parsed = tryParseObject(rawInput, owner)
   if (!parsed) return null
   return JSON.stringify({ ...parsed, [COLLAB_OP_KEY]: cleanOp })
 }
 
 /** Parse the displayable fields out of a collab tool call's `rawInput`. */
 export function parseCollabToolInput(
-  rawInput: string | null | undefined
+  rawInput: string | null | undefined,
+  owner?: object
 ): CollabToolInfo | null {
-  const parsed = tryParseObject(rawInput)
+  const parsed = tryParseObject(rawInput, owner)
   if (!parsed) return null
 
   const agents: CollabAgentState[] = []

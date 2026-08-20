@@ -1,4 +1,5 @@
 import type { PlanEntryInfo } from "@/lib/types"
+import { parseJsonCached, parseJsonForOwner } from "@/lib/try-parse-json"
 
 /**
  * Pure plan/TodoWrite parsing helpers.
@@ -202,15 +203,14 @@ const KIMI_TODO_STATUSES = new Set(["pending", "in_progress", "done"])
  * non-Kimi shape, and for non-object / non-JSON input.
  */
 export function kimiTodoWriteEntries(
-  input: string | null | undefined
+  input: string | null | undefined,
+  owner?: object
 ): PlanEntryInfo[] | null {
   if (!input) return null
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(input)
-  } catch {
-    return null
-  }
+  const parsed = owner
+    ? parseJsonForOwner(owner, input)
+    : parseJsonCached(input)
+  if (parsed === undefined) return null
   const obj = asRecord(parsed)
   if (!obj || !Array.isArray(obj.todos) || obj.todos.length === 0) return null
 

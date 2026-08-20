@@ -41,7 +41,10 @@ type CollabAgg = {
 type CollabToolCallBlock = Extract<LiveContentBlock, { type: "tool_call" }>
 
 function isCollabBlock(block: LiveContentBlock): block is CollabToolCallBlock {
-  return block.type === "tool_call" && isCodexCollabInput(block.info.raw_input)
+  return (
+    block.type === "tool_call" &&
+    isCodexCollabInput(block.info.raw_input, block.info)
+  )
 }
 
 /** Rewrite a spawn block into the execution capsule: aggregated per-agent status,
@@ -116,7 +119,7 @@ export function collapseLiveCollabBlocks(
   for (const block of content) {
     if (!isCollabBlock(block)) continue
     const op = classifyCollabOp(block.info.title)
-    const info = parseCollabToolInput(block.info.raw_input)
+    const info = parseCollabToolInput(block.info.raw_input, block.info)
     if (!info) continue
     for (const a of info.agents) {
       const entry = agg.get(a.threadId) ?? {
@@ -142,7 +145,7 @@ export function collapseLiveCollabBlocks(
     const op = classifyCollabOp(block.info.title)
     if (op === "close") {
       const ids =
-        parseCollabToolInput(block.info.raw_input)?.agents.map(
+        parseCollabToolInput(block.info.raw_input, block.info)?.agents.map(
           (a) => a.threadId
         ) ?? []
       // Drop only when every targeted agent has a spawn capsule to absorb it.

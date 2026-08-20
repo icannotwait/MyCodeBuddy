@@ -1,5 +1,6 @@
-import { describe, expect, it } from "vitest"
+import { afterEach, describe, expect, it, vi } from "vitest"
 
+import { kimiTodoWriteEntries } from "./plan-parse"
 import {
   aliasToolInputKeys,
   claudeCodeMarksSubagent,
@@ -9,6 +10,12 @@ import {
   inferLiveToolName,
   normalizeToolName,
 } from "./tool-call-normalization"
+import { resetJsonParseCacheForTests } from "./try-parse-json"
+
+afterEach(() => {
+  resetJsonParseCacheForTests()
+  vi.restoreAllMocks()
+})
 
 describe("aliasToolInputKeys", () => {
   it("fills the canonical names OpenCode spells in camelCase", () => {
@@ -923,5 +930,31 @@ describe("inferLiveToolName codex plan_review marker", () => {
         meta: { codex: { kind: "plan_review" } },
       })
     ).toBe("bash")
+  })
+})
+
+describe("inferLiveToolName owner-scoped parse cache", () => {
+  it("parses a large Write rawInput only once when owner is reused", () => {
+    const owner = {}
+    const rawInput = JSON.stringify({
+      content: "x".repeat(128 * 1024),
+      file_path: "a.ts",
+    })
+    const spy = vi.spyOn(JSON, "parse")
+    expect(inferLiveToolName({ rawInput, owner })).toBe("write")
+    expect(inferLiveToolName({ rawInput, owner })).toBe("write")
+    expect(spy).toHaveBeenCalledTimes(1)
+  })
+
+  it("shares the owner cache with kimi todo detection on the same tool object", () => {
+    const owner = {}
+    const rawInput = JSON.stringify({
+      content: "x".repeat(128 * 1024),
+      file_path: "a.ts",
+    })
+    const spy = vi.spyOn(JSON, "parse")
+    expect(kimiTodoWriteEntries(rawInput, owner)).toBeNull()
+    expect(inferLiveToolName({ rawInput, owner })).toBe("write")
+    expect(spy).toHaveBeenCalledTimes(1)
   })
 })

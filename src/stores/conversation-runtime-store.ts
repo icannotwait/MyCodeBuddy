@@ -1157,7 +1157,7 @@ function resolveLiveToolInput(
   // rawInput so the card can render an op-aware title. Live-only path; falls
   // through to the raw input when there's no op or it isn't a JSON object.
   if (toolName === COLLAB_AGENT_TOOL_NAME && info.raw_input) {
-    const merged = mergeCollabOp(info.raw_input, info.title)
+    const merged = mergeCollabOp(info.raw_input, info.title, info)
     if (merged) return merged
   }
 
@@ -1256,7 +1256,7 @@ export function buildStreamingTurnsFromLiveMessage(
   let latestKimiTodoEntries: PlanEntryInfo[] | null = null
   for (const block of content) {
     if (block.type === "tool_call") {
-      const entries = kimiTodoWriteEntries(block.info.raw_input)
+      const entries = kimiTodoWriteEntries(block.info.raw_input, block.info)
       if (entries) latestKimiTodoEntries = entries
     }
   }
@@ -1287,6 +1287,7 @@ export function buildStreamingTurnsFromLiveMessage(
       kind: info.kind,
       rawInput: info.raw_input,
       meta: info.meta,
+      owner: info,
     })
     inferredNames.set(info.tool_call_id, name)
     return name
@@ -1515,7 +1516,7 @@ export function buildStreamingTurnsFromLiveMessage(
         // over. Fail-safe: if Kimi never emitted the plan, the converted plan
         // still shows (no data loss). Identity is the exact Kimi todo-write input
         // shape because the real tool name "TodoList" is never on the live wire.
-        const kimiTodos = kimiTodoWriteEntries(block.info.raw_input)
+        const kimiTodos = kimiTodoWriteEntries(block.info.raw_input, block.info)
         if (kimiTodos) {
           if (!hasLivePlan) {
             currentBlocks.push({ type: "plan", entries: kimiTodos })
@@ -1670,6 +1671,7 @@ export function buildStreamingTurnsFromLiveMessage(
       kind: block.info.kind,
       rawInput: block.info.raw_input,
       meta: block.info.meta,
+      owner: block.info,
     })
     activityToolInputs.push({
       toolCallId: block.info.tool_call_id,

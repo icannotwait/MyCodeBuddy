@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest"
+import { afterEach, describe, expect, it, vi } from "vitest"
 
 import {
   extractPlanMarkdown,
@@ -9,6 +9,12 @@ import {
   normalizeStatus,
   parseTodosFromJson,
 } from "./plan-parse"
+import { resetJsonParseCacheForTests } from "./try-parse-json"
+
+afterEach(() => {
+  resetJsonParseCacheForTests()
+  vi.restoreAllMocks()
+})
 
 describe("normalizeStatus", () => {
   it("maps common synonyms to the canonical status", () => {
@@ -181,6 +187,15 @@ describe("kimiTodoWriteEntries", () => {
         JSON.stringify({ todos: [{ title: "X", status: "IN_PROGRESS" }] })
       )
     ).toEqual([{ content: "X", status: "in_progress", priority: "medium" }])
+  })
+
+  it("parses a large Write payload only once when given a stable owner", () => {
+    const owner = {}
+    const huge = JSON.stringify({ content: "x".repeat(128 * 1024) })
+    const spy = vi.spyOn(JSON, "parse")
+    expect(kimiTodoWriteEntries(huge, owner)).toBeNull()
+    expect(kimiTodoWriteEntries(huge, owner)).toBeNull()
+    expect(spy).toHaveBeenCalledTimes(1)
   })
 })
 

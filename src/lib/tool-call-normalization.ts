@@ -5,6 +5,7 @@ import {
 import { CODEX_SCRIPT_TOOL_NAME } from "@/lib/codex-code-mode"
 import { COLLAB_AGENT_TOOL_NAME, isCodexCollabInput } from "@/lib/collab-tool"
 import { WAIT_TOOL_NAME, WRITE_STDIN_TOOL_NAME } from "@/lib/shell-session-tool"
+import { tryParseJson, tryParseJsonForOwner } from "@/lib/try-parse-json"
 
 const EXACT_TOOL_NAME_ALIASES: Record<string, string> = {
   shell_command: "bash",
@@ -223,17 +224,14 @@ export function parseGoalUpdateTitle(
   }
 }
 
-function tryParseInputObject(rawInput: string | null | undefined) {
+function tryParseInputObject(
+  rawInput: string | null | undefined,
+  owner?: object
+) {
   if (!rawInput) return null
-  try {
-    const parsed = JSON.parse(rawInput)
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-      return null
-    }
-    return parsed as Record<string, unknown>
-  } catch {
-    return null
-  }
+  return owner
+    ? tryParseJsonForOwner(owner, rawInput)
+    : tryParseJson(rawInput)
 }
 
 function hasAnyKey(obj: Record<string, unknown>, keys: string[]): boolean {
@@ -292,7 +290,8 @@ export function aliasToolInputKeys(
 function inferFromInput(
   rawInput: string | null | undefined,
   kind: string | null | undefined,
-  title: string | null | undefined
+  title: string | null | undefined,
+  owner?: object
 ): string | null {
   if (!rawInput) return null
 
@@ -317,7 +316,7 @@ function inferFromInput(
     return "bash"
   }
 
-  const parsed = tryParseInputObject(rawInput)
+  const parsed = tryParseInputObject(rawInput, owner)
   if (!parsed) return null
 
   // Cursor live MCP calls (`mcpToolCall`): rawInput carries the provider and
@@ -528,6 +527,7 @@ export function inferLiveToolName(params: {
   kind?: string | null
   rawInput?: string | null
   meta?: Record<string, unknown> | null
+  owner?: object
 }): string {
   // The backend (e.g. ACP connection layer for OpenCode sub-agent task
   // calls) may set `title="agent"` as an *authoritative* sentinel after
@@ -561,7 +561,8 @@ export function inferLiveToolName(params: {
   // dedicated collab card regardless of the title (and ahead of `inferFromInput`,
   // which returns null for this shape anyway, and the title alias that would
   // otherwise collapse `spawn_agent`→"agent" / `wait_agent`→"task").
-  if (isCodexCollabInput(params.rawInput)) return COLLAB_AGENT_TOOL_NAME
+  if (isCodexCollabInput(params.rawInput, params.owner))
+    return COLLAB_AGENT_TOOL_NAME
 
   // The codeg-mcp delegation companion tools carry their authoritative identity
   // in `meta.claudeCode.toolName` — claude-agent-acp sets it to the raw
@@ -622,7 +623,12 @@ export function inferLiveToolName(params: {
   // `Task` tool routed via `subagent_type`, OpenCode sub-agent calls, etc.)
   // keep priority. The meta-tool-name override below only kicks in when the
   // input shape is silent — i.e. synthesized events with no `rawInput`.
-  const byInput = inferFromInput(params.rawInput, params.kind, params.title)
+  const byInput = inferFromInput(
+    params.rawInput,
+    params.kind,
+    params.title,
+    params.owner
+  )
   if (byInput) return byInput
 
   // Claude-Code override: claude-agent-acp embeds the SDK tool name under
