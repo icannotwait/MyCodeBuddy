@@ -5719,7 +5719,7 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
         stopSoftFenceTimer(conversationId)
         bumpCancelGeneration(conversationId)
       }
-      if (conversationId !== dbConversationId) {
+      if (dbConversationId != null && conversationId !== dbConversationId) {
         aliasRequestUsageIds(conversationId, dbConversationId)
       }
       dispatch({
