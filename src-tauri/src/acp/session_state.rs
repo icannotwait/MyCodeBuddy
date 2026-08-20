@@ -147,6 +147,132 @@ pub fn visible_assistant_text(live: Option<&LiveMessage>) -> String {
         .join("")
 }
 
+/// 1 MiB cap for an *incomplete* streamed tool-input buffer. A later `}`
+/// must not be concatenated into truncated JSON. Complete JSON chunks are
+/// still accepted even when larger — this is not a license to drop
+/// persisted transcript.
+const RAW_INPUT_MAX_BYTES: usize = 1_048_576;
+
+/// Incremental JSON scanner for streamed `raw_input` fragments.
+/// Each chunk is scanned once; `serde_json::from_str` runs only when the
+/// structure closes (or when a single chunk is complete JSON).
+#[derive(Debug, Clone, Default)]
+struct RawJsonAccumulator {
+    buffer: String,
+    depth: i32,
+    in_string: bool,
+    escaped: bool,
+    frozen: bool,
+    #[cfg(test)]
+    parse_count: u32,
+}
+
+impl RawJsonAccumulator {
+    fn push(&mut self, chunk: &str, max_bytes: usize) -> Option<serde_json::Value> {
+        if self.frozen {
+            return self.try_standalone_complete(chunk);
+        }
+
+        if self.buffer.is_empty() {
+            let complete = self.feed_scan(chunk);
+            if complete {
+                if let Some(value) = self.parse_src(chunk) {
+                    return Some(value);
+                }
+            }
+            if chunk.len() > max_bytes {
+                self.reset_keep_parse_count();
+                self.frozen = true;
+                return None;
+            }
+            self.buffer.push_str(chunk);
+            return None;
+        }
+
+        if self.buffer.len().saturating_add(chunk.len()) > max_bytes {
+            self.frozen = true;
+            return None;
+        }
+
+        let complete = self.feed_scan(chunk);
+        self.buffer.push_str(chunk);
+        if complete {
+            let src = std::mem::take(&mut self.buffer);
+            match self.parse_src(&src) {
+                Some(value) => Some(value),
+                None => {
+                    self.buffer = src;
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    }
+
+    /// Sticky-frozen streams ignore further fragments unless the new chunk
+    /// is complete JSON by itself (a full replacement, not a continuation).
+    fn try_standalone_complete(&mut self, chunk: &str) -> Option<serde_json::Value> {
+        let mut probe = Self::default();
+        if !probe.feed_scan(chunk) {
+            return None;
+        }
+        self.parse_src(chunk)
+    }
+
+    fn feed_scan(&mut self, chunk: &str) -> bool {
+        let mut closed = false;
+        for &b in chunk.as_bytes() {
+            if self.in_string {
+                if self.escaped {
+                    self.escaped = false;
+                } else if b == b'\\' {
+                    self.escaped = true;
+                } else if b == b'"' {
+                    self.in_string = false;
+                }
+                continue;
+            }
+            match b {
+                b'"' => self.in_string = true,
+                b'{' | b'[' => self.depth += 1,
+                b'}' | b']' => {
+                    self.depth -= 1;
+                    if self.depth == 0 {
+                        closed = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        closed && self.depth == 0 && !self.in_string
+    }
+
+    fn parse_src(&mut self, src: &str) -> Option<serde_json::Value> {
+        #[cfg(test)]
+        {
+            self.parse_count = self.parse_count.saturating_add(1);
+        }
+        match serde_json::from_str(src) {
+            Ok(value) => {
+                self.reset_keep_parse_count();
+                Some(value)
+            }
+            Err(_) => None,
+        }
+    }
+
+    fn reset_keep_parse_count(&mut self) {
+        #[cfg(test)]
+        let parse_count = self.parse_count;
+        *self = Self::default();
+        #[cfg(test)]
+        {
+            self.parse_count = parse_count;
+        }
+    }
+}
+
 /// 工具调用的运行态。turn 完成时统一 clear。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCallState {
@@ -193,16 +319,27 @@ pub struct ToolCallState {
     /// base64; [`SessionState::to_snapshot`] caps image bytes on the wire.
     #[serde(default)]
     pub images: Vec<ToolCallImageInfo>,
-    /// 流式拼接的 input chunks（serde 不输出，仅运行时用）
+    /// Streamed raw_input scanner (serde skip). One buffer, one scan per chunk.
     #[serde(skip)]
-    pub raw_input_chunks: Vec<String>,
-    /// Concatenated chunk buffer used to parse incrementally (serde skip).
-    #[serde(skip)]
-    pub raw_input_accum: String,
-    /// Once incremental accum exceeds 1MiB, ignore further incomplete
-    /// fragments so a later `}` cannot parse a truncated object.
-    #[serde(skip)]
-    pub raw_input_frozen: bool,
+    raw_input: RawJsonAccumulator,
+}
+
+impl Default for ToolCallState {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            kind: ToolKind::Other,
+            label: String::new(),
+            status: ToolCallStatus::Pending,
+            input: None,
+            output: None,
+            content: None,
+            locations: None,
+            meta: None,
+            images: Vec::new(),
+            raw_input: RawJsonAccumulator::default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -2083,55 +2220,6 @@ impl SessionState {
         }
     }
 
-    fn json_buffer_might_be_complete(s: &str) -> bool {
-        let trimmed = s.trim();
-        let bytes = trimmed.as_bytes();
-        match bytes.first() {
-            Some(b'{') => {
-                if bytes.last() != Some(&b'}') {
-                    return false;
-                }
-            }
-            Some(b'[') => {
-                if bytes.last() != Some(&b']') {
-                    return false;
-                }
-            }
-            _ => return false,
-        }
-        let mut stack: Vec<u8> = Vec::new();
-        let mut in_str = false;
-        let mut escape = false;
-        for &b in bytes {
-            if in_str {
-                if escape {
-                    escape = false;
-                } else if b == b'\\' {
-                    escape = true;
-                } else if b == b'"' {
-                    in_str = false;
-                }
-                continue;
-            }
-            match b {
-                b'"' => in_str = true,
-                b'{' | b'[' => stack.push(b),
-                b'}' => {
-                    if stack.pop() != Some(b'{') {
-                        return false;
-                    }
-                }
-                b']' => {
-                    if stack.pop() != Some(b'[') {
-                        return false;
-                    }
-                }
-                _ => {}
-            }
-        }
-        stack.is_empty() && !in_str
-    }
-
     /// Insert-or-update a tool call entry. Used by both `ToolCall` (initial) and
     /// `ToolCallUpdate` events. `kind` is `Some` only on the initial event;
     /// title/status/content/raw_input/raw_output/locations/meta are merged
@@ -2171,9 +2259,7 @@ impl SessionState {
                 locations: None,
                 meta: None,
                 images: Vec::new(),
-                raw_input_chunks: Vec::new(),
-                raw_input_accum: String::new(),
-                raw_input_frozen: false,
+                raw_input: RawJsonAccumulator::default(),
             });
         if let Some(k) = kind {
             entry.kind = parse_tool_kind(k);
@@ -2188,34 +2274,8 @@ impl SessionState {
             entry.content = Some(c.to_string());
         }
         if let Some(chunk) = raw_input {
-            const MAX_CHUNKS: usize = 256;
-            const MAX_ACCUM_BYTES: usize = 1_048_576;
-            let chunk_bytes: usize = entry.raw_input_chunks.iter().map(String::len).sum();
-            if chunk_bytes.saturating_add(chunk.len()) <= MAX_ACCUM_BYTES {
-                if entry.raw_input_chunks.len() >= MAX_CHUNKS {
-                    let joined = std::mem::take(&mut entry.raw_input_chunks).join("");
-                    entry.raw_input_chunks.push(joined);
-                }
-                entry.raw_input_chunks.push(chunk.to_string());
-            }
-            if let Ok(value) = serde_json::from_str::<serde_json::Value>(chunk) {
+            if let Some(value) = entry.raw_input.push(chunk, RAW_INPUT_MAX_BYTES) {
                 entry.input = Some(value);
-                entry.raw_input_accum.clear();
-                entry.raw_input_frozen = false;
-            } else if entry.raw_input_frozen {
-                // Sticky freeze: a later `}` must not complete a truncated prefix.
-            } else if entry.raw_input_accum.len().saturating_add(chunk.len()) > MAX_ACCUM_BYTES {
-                entry.raw_input_frozen = true;
-            } else {
-                entry.raw_input_accum.push_str(chunk);
-                if Self::json_buffer_might_be_complete(&entry.raw_input_accum) {
-                    if let Ok(value) =
-                        serde_json::from_str::<serde_json::Value>(&entry.raw_input_accum)
-                    {
-                        entry.input = Some(value);
-                        entry.raw_input_accum.clear();
-                    }
-                }
             }
         }
         if let Some(text) = raw_output {
@@ -2485,9 +2545,7 @@ impl SessionState {
                     }
                 })
                 .collect(),
-            raw_input_chunks: Vec::new(),
-            raw_input_accum: String::new(),
-            raw_input_frozen: false,
+            raw_input: RawJsonAccumulator::default(),
         }
     }
 
@@ -2739,7 +2797,9 @@ impl SessionState {
         let total_images = self
             .active_tool_calls
             .values()
-            .fold(0usize, |total, tool| total.saturating_add(tool.images.len()))
+            .fold(0usize, |total, tool| {
+                total.saturating_add(tool.images.len())
+            })
             .saturating_add(
                 self.pending_user_message
                     .as_ref()
@@ -5099,9 +5159,7 @@ mod tests {
                         mime_type: "image/png".into(),
                         uri: None,
                     }],
-                    raw_input_chunks: Vec::new(),
-                    raw_input_accum: String::new(),
-                    raw_input_frozen: false,
+                    raw_input: RawJsonAccumulator::default(),
                 },
             );
         }
@@ -5199,9 +5257,7 @@ mod tests {
                     locations: None,
                     meta: None,
                     images: Vec::new(),
-                    raw_input_chunks: Vec::new(),
-                    raw_input_accum: String::new(),
-                    raw_input_frozen: false,
+                    raw_input: RawJsonAccumulator::default(),
                 },
             );
         }
@@ -5405,9 +5461,7 @@ mod tests {
                     "codeg.delegation": { "child_connection_id": "child-1" }
                 })),
                 images: Vec::new(),
-                raw_input_chunks: Vec::new(),
-                raw_input_accum: String::new(),
-                raw_input_frozen: false,
+                raw_input: RawJsonAccumulator::default(),
             },
         );
         let limits = SnapshotLimits {
@@ -5476,9 +5530,7 @@ mod tests {
                 locations: None,
                 meta: None,
                 images: Vec::new(),
-                raw_input_chunks: Vec::new(),
-                raw_input_accum: String::new(),
-                raw_input_frozen: false,
+                raw_input: RawJsonAccumulator::default(),
             },
         );
 
@@ -5493,7 +5545,10 @@ mod tests {
         let frame: serde_json::Value =
             serde_json::from_slice(&encoded).expect("snapshot frame is JSON");
         assert_eq!(frame["type"], "snapshot");
-        let truncation = snapshot.truncation.as_ref().expect("escape overflow truncated");
+        let truncation = snapshot
+            .truncation
+            .as_ref()
+            .expect("escape overflow truncated");
         assert!(
             truncation.truncated_text_fields >= 1,
             "JSON escape growth must count as a truncated text field"
@@ -6391,10 +6446,9 @@ mod tests {
         let entry = s.active_tool_calls.get("tc-1").unwrap();
         assert_eq!(entry.input, Some(serde_json::json!({"a": 1})));
         assert!(
-            entry.raw_input_accum.is_empty(),
+            entry.raw_input.buffer.is_empty(),
             "successful accum parse must clear the buffer"
         );
-        assert_eq!(entry.raw_input_chunks.len(), 2);
 
         let snapshot = s.to_snapshot();
         assert_eq!(snapshot.connection_id, "conn-test");
@@ -6410,12 +6464,12 @@ mod tests {
         assert_eq!(snapshot.config_options.as_ref().map(|v| v.len()), Some(1));
         assert_eq!(snapshot.active_tool_calls.len(), 1);
 
-        // Wire shape: raw_input_chunks must NOT be serialized.
+        // Wire shape: accumulator internals must NOT be serialized.
         let json = serde_json::to_value(&snapshot).unwrap();
         let tc_json = json["active_tool_calls"][0].clone();
         assert!(
-            tc_json.get("raw_input_chunks").is_none(),
-            "raw_input_chunks must be #[serde(skip)] (got {})",
+            tc_json.get("raw_input").is_none() && tc_json.get("raw_input_chunks").is_none(),
+            "raw_input accumulator must be #[serde(skip)] (got {})",
             tc_json
         );
         assert_eq!(tc_json["input"], serde_json::json!({"a": 1}));
@@ -6955,23 +7009,42 @@ mod tests {
     }
 
     #[test]
-    fn json_buffer_might_be_complete_is_string_and_nesting_aware() {
-        assert!(SessionState::json_buffer_might_be_complete(
-            r#"{"a":{"b":1}}"#
-        ));
-        assert!(!SessionState::json_buffer_might_be_complete(
-            r#"{"a":{"b":1}"#
-        ));
-        assert!(!SessionState::json_buffer_might_be_complete(
-            r#"{"msg": "hello}"#
-        ));
-        assert!(SessionState::json_buffer_might_be_complete(
-            r#"{"msg": "hello}"}"#
-        ));
-        assert!(SessionState::json_buffer_might_be_complete("[1,2]"));
-        assert!(!SessionState::json_buffer_might_be_complete("[1,2"));
-        assert!(!SessionState::json_buffer_might_be_complete(r#"[{"a":1]"#));
-        assert!(SessionState::json_buffer_might_be_complete(r#"[{"a":1}]"#));
+    fn raw_input_scan_is_string_and_nesting_aware() {
+        let mut complete = RawJsonAccumulator::default();
+        assert!(complete
+            .push(r#"{"a":{"b":1}}"#, RAW_INPUT_MAX_BYTES)
+            .is_some());
+
+        let mut nested_open = RawJsonAccumulator::default();
+        assert!(nested_open
+            .push(r#"{"a":{"b":1}"#, RAW_INPUT_MAX_BYTES)
+            .is_none());
+
+        let mut brace_in_string = RawJsonAccumulator::default();
+        assert!(brace_in_string
+            .push(r#"{"msg": "hello}"#, RAW_INPUT_MAX_BYTES)
+            .is_none());
+
+        let mut closed_string = RawJsonAccumulator::default();
+        assert!(closed_string
+            .push(r#"{"msg": "hello}"}"#, RAW_INPUT_MAX_BYTES)
+            .is_some());
+
+        let mut array = RawJsonAccumulator::default();
+        assert!(array.push("[1,2]", RAW_INPUT_MAX_BYTES).is_some());
+
+        let mut array_open = RawJsonAccumulator::default();
+        assert!(array_open.push("[1,2", RAW_INPUT_MAX_BYTES).is_none());
+
+        let mut mismatched = RawJsonAccumulator::default();
+        assert!(mismatched
+            .push(r#"[{"a":1]"#, RAW_INPUT_MAX_BYTES)
+            .is_none());
+
+        let mut nested_array = RawJsonAccumulator::default();
+        assert!(nested_array
+            .push(r#"[{"a":1}]"#, RAW_INPUT_MAX_BYTES)
+            .is_some());
     }
 
     #[test]
@@ -6991,7 +7064,7 @@ mod tests {
         });
         let entry = s.active_tool_calls.get("tc-nest").unwrap();
         assert!(entry.input.is_none());
-        assert_eq!(entry.raw_input_accum, r#"{"a":{"b":1}"#);
+        assert_eq!(entry.raw_input.buffer, r#"{"a":{"b":1}"#);
     }
 
     #[test]
@@ -7039,9 +7112,9 @@ mod tests {
             entry.input.is_none(),
             "a later closing brace must not parse the frozen truncated prefix"
         );
-        assert!(entry.raw_input_frozen);
+        assert!(entry.raw_input.frozen);
         assert_eq!(
-            entry.raw_input_accum.len(),
+            entry.raw_input.buffer.len(),
             first.len(),
             "overflowing chunk must freeze the prefix rather than clear or grow past 1MiB"
         );
@@ -7061,10 +7134,166 @@ mod tests {
         let entry = s.active_tool_calls.get("tc-cap").unwrap();
         assert_eq!(entry.input, Some(serde_json::json!({"ok": true})));
         assert!(
-            !entry.raw_input_frozen,
+            !entry.raw_input.frozen,
             "a complete replacement chunk must unfreeze"
         );
-        assert!(entry.raw_input_accum.is_empty());
+        assert!(entry.raw_input.buffer.is_empty());
+    }
+
+    fn streamed_raw_input_chunks(payload_len: usize) -> (String, Vec<String>) {
+        let payload = "a".repeat(payload_len);
+        let json = format!(r#"{{"payload":"{payload}"}}"#);
+        let mut chunks = Vec::with_capacity(10_000);
+        chunks.push(r#"{"payload":""#.to_string());
+        chunks.extend(payload.chars().map(|ch| ch.to_string()));
+        chunks.push(r#""}"#.to_string());
+        assert_eq!(chunks.concat(), json);
+        (payload, chunks)
+    }
+
+    #[test]
+    fn raw_input_scale_parses_complete_json_once_under_1mib() {
+        const MAX_BYTES: usize = 1_048_576;
+        let (payload, chunks) = streamed_raw_input_chunks(9_998);
+        assert_eq!(chunks.len(), 10_000);
+        let total: usize = chunks.iter().map(String::len).sum();
+        assert!(total < MAX_BYTES);
+
+        let mut acc = RawJsonAccumulator::default();
+        let mut parsed = None;
+        let mut some_count = 0usize;
+        let mut max_buf = 0usize;
+        for chunk in &chunks {
+            max_buf = max_buf.max(acc.buffer.len());
+            if let Some(value) = acc.push(chunk, MAX_BYTES) {
+                some_count += 1;
+                parsed = Some(value);
+            }
+            max_buf = max_buf.max(acc.buffer.len());
+            assert!(
+                acc.buffer.len() <= MAX_BYTES,
+                "accumulator buffer must stay within 1 MiB"
+            );
+        }
+        assert_eq!(some_count, 1, "structure must close exactly once");
+        assert_eq!(
+            acc.parse_count, 1,
+            "complete JSON must be parsed exactly once, not on every chunk"
+        );
+        assert!(max_buf <= MAX_BYTES);
+        assert!(
+            acc.buffer.is_empty(),
+            "successful parse must clear the buffer"
+        );
+        assert_eq!(parsed, Some(serde_json::json!({ "payload": payload })));
+
+        let mut s = fresh_state();
+        for (index, chunk) in chunks.iter().enumerate() {
+            if index == 0 {
+                s.apply_event(&AcpEvent::ToolCall {
+                    tool_call_id: "tc-scale".into(),
+                    title: "edit".into(),
+                    kind: "edit".into(),
+                    status: "pending".into(),
+                    content: None,
+                    raw_input: Some(chunk.clone()),
+                    raw_output: None,
+                    locations: None,
+                    meta: None,
+                    images: None,
+                });
+            } else {
+                s.apply_event(&AcpEvent::ToolCallUpdate {
+                    tool_call_id: "tc-scale".into(),
+                    title: None,
+                    status: None,
+                    content: None,
+                    raw_input: Some(chunk.clone()),
+                    raw_output: None,
+                    raw_output_append: None,
+                    locations: None,
+                    meta: None,
+                    images: None,
+                });
+            }
+        }
+        let entry = s.active_tool_calls.get("tc-scale").unwrap();
+        assert_eq!(entry.input, Some(serde_json::json!({ "payload": payload })));
+        assert_eq!(entry.raw_input.parse_count, 1);
+        assert!(entry.raw_input.buffer.len() <= MAX_BYTES);
+
+        let snapshot = serde_json::to_value(&s.to_snapshot()).unwrap();
+        let tc_json = &snapshot["active_tool_calls"][0];
+        assert!(
+            tc_json.get("raw_input").is_none(),
+            "snapshot must not serialize the accumulator (got {tc_json})"
+        );
+        assert!(tc_json.get("raw_input_chunks").is_none());
+        assert!(tc_json.get("buffer").is_none());
+        assert!(tc_json.get("raw_input_accum").is_none());
+        assert_eq!(tc_json["input"], serde_json::json!({ "payload": payload }));
+    }
+
+    #[test]
+    fn raw_input_sticky_freeze_rejects_later_closing_brace() {
+        const MAX_BYTES: usize = 1_048_576;
+        let mut acc = RawJsonAccumulator::default();
+        let first = format!("{{\"x\":\"{}", "a".repeat(600_000));
+        assert!(acc.push(&first, MAX_BYTES).is_none());
+        assert!(acc.push(&"a".repeat(600_000), MAX_BYTES).is_none());
+        assert!(acc.frozen);
+        assert!(acc.buffer.len() <= MAX_BYTES);
+        assert_eq!(acc.buffer.len(), first.len());
+
+        assert!(
+            acc.push("}", MAX_BYTES).is_none(),
+            "later closing brace must not be concatenated into truncated JSON"
+        );
+        assert!(acc.frozen);
+        assert_eq!(acc.buffer.len(), first.len());
+        assert_eq!(acc.parse_count, 0);
+
+        let mut s = fresh_state();
+        s.apply_event(&AcpEvent::ToolCall {
+            tool_call_id: "tc-sticky".into(),
+            title: "edit".into(),
+            kind: "edit".into(),
+            status: "pending".into(),
+            content: None,
+            raw_input: Some(first.clone()),
+            raw_output: None,
+            locations: None,
+            meta: None,
+            images: None,
+        });
+        s.apply_event(&AcpEvent::ToolCallUpdate {
+            tool_call_id: "tc-sticky".into(),
+            title: None,
+            status: None,
+            content: None,
+            raw_input: Some("a".repeat(600_000)),
+            raw_output: None,
+            raw_output_append: None,
+            locations: None,
+            meta: None,
+            images: None,
+        });
+        s.apply_event(&AcpEvent::ToolCallUpdate {
+            tool_call_id: "tc-sticky".into(),
+            title: None,
+            status: None,
+            content: None,
+            raw_input: Some("}".into()),
+            raw_output: None,
+            raw_output_append: None,
+            locations: None,
+            meta: None,
+            images: None,
+        });
+        let entry = s.active_tool_calls.get("tc-sticky").unwrap();
+        assert!(entry.input.is_none());
+        assert!(entry.raw_input.frozen);
+        assert_eq!(entry.raw_input.buffer.len(), first.len());
     }
 
     #[test]
