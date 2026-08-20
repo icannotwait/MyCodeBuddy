@@ -115,6 +115,7 @@ portable-pty = "0.8"
 pulldown-cmark = "0.13"
 anyhow = "1"
 urlencoding = "2"
+url = "2"
 fix-path-env = { git = "https://github.com/tauri-apps/fix-path-env-rs", version = "0.0.0", optional = true }
 sea-orm = { version = "1.1", features = ["sqlx-sqlite", "runtime-tokio-rustls", "macros"] }
 sea-orm-migration = { version = "1.1", features = ["sqlx-sqlite", "runtime-tokio-rustls"] }

@@ -1118,6 +1118,7 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "unicode-normalization",
+ "url",
  "urlencoding",
  "uuid",
  "walkdir",

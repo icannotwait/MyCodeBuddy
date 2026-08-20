@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use sea_orm::DatabaseConnection;
+use url::Url;
 
 use crate::db::service::app_metadata_service;
 use crate::models::system::{GitHubAccount, GitHubAccountsSettings};
@@ -383,6 +384,61 @@ pub async fn get_remote_url_by_name(repo_path: &str, remote_name: &str) -> Optio
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedHttpRemote {
+    scheme: String,
+    host: String,
+    port: Option<u16>,
+    path: String,
+}
+
+impl ParsedHttpRemote {
+    fn sanitized_url(&self) -> String {
+        match self.port {
+            Some(port) => format!("{}://{}:{}{}", self.scheme, self.host, port, self.path),
+            None => format!("{}://{}{}", self.scheme, self.host, self.path),
+        }
+    }
+}
+
+/// Parse an HTTP(S) git remote into scheme, host, explicit port, and path.
+///
+/// Username/password, query, and fragment are discarded. Scheme matching is
+/// ASCII case-insensitive. Never panics on a legal UTF-8 `str`.
+fn parse_http_remote(url: &str) -> Option<ParsedHttpRemote> {
+    let parsed = Url::parse(url.trim()).ok()?;
+    if !parsed.scheme().eq_ignore_ascii_case("https")
+        && !parsed.scheme().eq_ignore_ascii_case("http")
+    {
+        return None;
+    }
+    let host = match parsed.host()? {
+        url::Host::Domain(domain) => domain.to_string(),
+        url::Host::Ipv4(ip) => ip.to_string(),
+        url::Host::Ipv6(ip) => format!("[{ip}]"),
+    };
+    Some(ParsedHttpRemote {
+        scheme: parsed.scheme().to_ascii_lowercase(),
+        host,
+        port: parsed.port(),
+        path: parsed.path().to_string(),
+    })
+}
+
+/// Emit only scheme, host, explicit port, and path so logs never print
+/// userinfo, query, or fragment. Non-HTTP remotes are returned trimmed.
+fn sanitize_http_remote(url: &str) -> String {
+    match parse_http_remote(url) {
+        Some(parsed) => parsed.sanitized_url(),
+        None => url.trim().to_string(),
+    }
+}
+
+/// Strip secrets from a remote URL before it is written to logs.
+fn redact_remote_url_for_log(remote_url: &str) -> String {
+    sanitize_http_remote(remote_url)
+}
+
 /// Extract the hostname from a git remote URL.
 ///
 /// Handles both HTTPS and SSH URLs:
@@ -391,17 +447,8 @@ pub async fn get_remote_url_by_name(repo_path: &str, remote_name: &str) -> Optio
 fn extract_host(remote_url: &str) -> Option<String> {
     let url = remote_url.trim();
 
-    // HTTPS: https://github.com/...
-    if let Some(after_scheme) = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))
-    {
-        // Strip optional user@ prefix (e.g. https://user@github.com/...)
-        let after_at = after_scheme
-            .find('@')
-            .map(|i| &after_scheme[i + 1..])
-            .unwrap_or(after_scheme);
-        return after_at.split('/').next().map(|h| h.to_lowercase());
+    if let Some(parsed) = parse_http_remote(url) {
+        return Some(parsed.host.to_lowercase());
     }
 
     // SSH: git@github.com:user/repo.git
@@ -527,9 +574,12 @@ pub async fn try_inject_for_repo_remote(
         }
     };
 
-    // Only inject for HTTPS URLs (SSH uses keys, not tokens)
-    if !remote_url.starts_with("https://") && !remote_url.starts_with("http://") {
-        tracing::warn!("[GIT_CRED] skipping non-HTTPS URL: {}", remote_url);
+    // Only inject for HTTP(S) URLs (SSH uses keys, not tokens)
+    if parse_http_remote(&remote_url).is_none() {
+        tracing::warn!(
+            "[GIT_CRED] skipping non-HTTPS URL: {}",
+            redact_remote_url_for_log(&remote_url)
+        );
         return false;
     }
 
@@ -538,11 +588,11 @@ pub async fn try_inject_for_repo_remote(
         None => {
             tracing::info!(
                 "[GIT_CRED] no matching account for remote {}. Available hosts: {}",
-                remote_url,
+                redact_remote_url_for_log(&remote_url),
                 settings
                     .accounts
                     .iter()
-                    .map(|a| a.server_url.as_str())
+                    .map(|a| redact_remote_url_for_log(&a.server_url))
                     .collect::<Vec<_>>()
                     .join(", ")
             );
@@ -568,7 +618,7 @@ pub async fn try_inject_for_repo_remote(
 
     tracing::info!(
         "[GIT_CRED] injecting credentials for {} (user: {})",
-        remote_url,
+        redact_remote_url_for_log(&remote_url),
         account.username
     );
     inject_credentials(cmd, &account.username, &token, &askpass);
@@ -583,7 +633,7 @@ pub async fn try_inject_for_url(
     conn: &DatabaseConnection,
     app_data_dir: &Path,
 ) -> bool {
-    if !clone_url.starts_with("https://") && !clone_url.starts_with("http://") {
+    if parse_http_remote(clone_url).is_none() {
         return false;
     }
 
@@ -622,6 +672,124 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_redact_remote_url_strips_userinfo() {
+        assert_eq!(
+            redact_remote_url_for_log("https://x-access-token:ghs_secret@github.com/org/repo.git"),
+            "https://github.com/org/repo.git"
+        );
+        assert_eq!(
+            redact_remote_url_for_log("https://user@github.com/org/repo.git"),
+            "https://github.com/org/repo.git"
+        );
+        assert_eq!(
+            redact_remote_url_for_log("https://github.com/org/repo.git"),
+            "https://github.com/org/repo.git"
+        );
+        assert_eq!(
+            redact_remote_url_for_log("git@github.com:org/repo.git"),
+            "git@github.com:org/repo.git"
+        );
+        assert_eq!(
+            redact_remote_url_for_log("HTTPS://x-access-token:ghs_secret@github.com/org/repo.git"),
+            "https://github.com/org/repo.git"
+        );
+    }
+
+    /// Production change that must fail this test: slicing `url[..7]`/`url[..8]`
+    /// on a legal UTF-8 `str` whose byte 7 sits inside `é` (2-byte).
+    #[test]
+    fn sanitize_http_remote_does_not_panic_on_unicode_prefixed_https() {
+        let input = "ééééhttps://host/x";
+        let result = std::panic::catch_unwind(|| sanitize_http_remote(input));
+        assert!(result.is_ok(), "sanitizer must not panic on {input:?}");
+        let out = result.unwrap();
+        assert!(!out.contains("panic"));
+    }
+
+    /// Production change that must fail this test: leaving userinfo, `?query`,
+    /// or `#fragment` in log text, or rejecting mixed-case `HTTPS://`.
+    #[test]
+    fn sanitize_http_remote_strips_userinfo_query_fragment_from_mixed_case() {
+        let input = "HTTPS://token@host/x?secret=1#frag";
+        let result = std::panic::catch_unwind(|| sanitize_http_remote(input));
+        assert!(
+            result.is_ok(),
+            "sanitizer must not panic on mixed-case HTTPS with userinfo/query/fragment"
+        );
+        let out = result.unwrap();
+        assert!(
+            !out.contains("token") && !out.contains('@'),
+            "userinfo leaked: {out}"
+        );
+        assert!(
+            !out.contains("secret") && !out.contains('?'),
+            "query leaked: {out}"
+        );
+        assert!(
+            !out.contains("frag") && !out.contains('#'),
+            "fragment leaked: {out}"
+        );
+        assert_eq!(out, "https://host/x");
+        assert_eq!(
+            sanitize_http_remote("https://token@host:8443/org/repo.git?secret=1#frag"),
+            "https://host:8443/org/repo.git"
+        );
+    }
+
+    /// Production change that must fail this test: assuming scheme prefixes
+    /// exist and slicing without a length/`get` check.
+    #[test]
+    fn sanitize_http_remote_does_not_panic_on_short_strings() {
+        for input in ["", "h", "http", "https", "http:", "https:", "HTTP"] {
+            let result = std::panic::catch_unwind(|| sanitize_http_remote(input));
+            assert!(
+                result.is_ok(),
+                "sanitizer must not panic on short string {input:?}"
+            );
+        }
+    }
+
+    /// Production change that must fail this test: `url[..8]` on a legal `str`
+    /// whose byte 8 is not a character boundary (`中` is 3 bytes; 3 × 3 = 9).
+    #[test]
+    fn sanitize_http_remote_does_not_panic_on_utf8_char_boundary_str() {
+        let input = "中中中https://host/x";
+        assert!(input.is_char_boundary(0));
+        assert!(
+            !input.is_char_boundary(7),
+            "fixture must be a legal str that is not a boundary at byte 7"
+        );
+        assert!(
+            !input.is_char_boundary(8),
+            "fixture must be a legal str that is not a boundary at byte 8"
+        );
+        let result = std::panic::catch_unwind(|| sanitize_http_remote(input));
+        assert!(result.is_ok(), "sanitizer must not panic on {input:?}");
+    }
+
+    /// Production change that must fail this test: case-sensitive `starts_with`
+    /// (`https://` / `http://`) for clone-URL eligibility.
+    #[test]
+    fn parse_http_remote_accepts_mixed_case_clone_urls() {
+        for input in [
+            "HTTPS://github.com/org/repo.git",
+            "HTTP://github.com/org/repo.git",
+            "HtTpS://GitHub.COM/org/repo",
+        ] {
+            let parsed = parse_http_remote(input)
+                .unwrap_or_else(|| panic!("mixed-case HTTP(S) clone URL must parse: {input}"));
+            assert_eq!(parsed.host, "github.com");
+            assert!(
+                parsed.scheme.eq_ignore_ascii_case("http")
+                    || parsed.scheme.eq_ignore_ascii_case("https")
+            );
+        }
+        assert!(parse_http_remote("ééééhttps://host/x").is_none());
+        assert!(parse_http_remote("git@github.com:org/repo.git").is_none());
+        assert!(parse_http_remote("http").is_none());
+    }
+
+    #[test]
     fn test_extract_host_https() {
         assert_eq!(
             extract_host("https://github.com/user/repo.git"),
@@ -633,6 +801,14 @@ mod tests {
         );
         assert_eq!(
             extract_host("https://gitlab.example.com/org/repo"),
+            Some("gitlab.example.com".to_string())
+        );
+        assert_eq!(
+            extract_host("HTTPS://user:token@github.com/org/repo.git"),
+            Some("github.com".to_string())
+        );
+        assert_eq!(
+            extract_host("https://gitlab.example.com:8443/org/repo"),
             Some("gitlab.example.com".to_string())
         );
     }
