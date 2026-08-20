@@ -2107,6 +2107,14 @@ fn push_projection_warning(warnings: &mut Vec<String>, code: &str) {
     }
 }
 
+const SIMPLE_COMPLETED_TASK_MISSING_COMMIT: &str = "simple_completed_task_missing_commit";
+
+fn simple_warnings_affect_sync(warnings: &[String]) -> bool {
+    warnings
+        .iter()
+        .any(|code| code != SIMPLE_COMPLETED_TASK_MISSING_COMMIT)
+}
+
 fn simple_parse_warning(prefix: &str, error: &SimpleParseError) -> String {
     let suffix = match error {
         SimpleParseError::InvalidPath => "invalid_path",
@@ -2844,10 +2852,10 @@ fn project_simple_route_node(
         returned_reviewer_count: None,
         title: Some(simple_route_display_title(&task.title, spec.title_label)),
         status,
-        sync_state: if node_warning_codes.is_empty() {
-            WorkflowNodeSyncState::InSync
-        } else {
+        sync_state: if simple_warnings_affect_sync(&node_warning_codes) {
             WorkflowNodeSyncState::OutOfSync
+        } else {
+            WorkflowNodeSyncState::InSync
         },
         projection_warning_codes: node_warning_codes,
         status_reason: None,
@@ -3130,7 +3138,7 @@ async fn project_simple_mode(
             {
                 push_projection_warning(
                     &mut node_warning_codes,
-                    "simple_completed_task_missing_commit",
+                    SIMPLE_COMPLETED_TASK_MISSING_COMMIT,
                 );
             }
         }
@@ -3345,10 +3353,10 @@ async fn project_simple_mode(
             returned_reviewer_count: None,
             title: Some(redact_display_string(&task.title)),
             status,
-            sync_state: if node_warning_codes.is_empty() {
-                WorkflowNodeSyncState::InSync
-            } else {
+            sync_state: if simple_warnings_affect_sync(&node_warning_codes) {
                 WorkflowNodeSyncState::OutOfSync
+            } else {
+                WorkflowNodeSyncState::InSync
             },
             projection_warning_codes: node_warning_codes,
             status_reason: None,
@@ -8165,6 +8173,61 @@ mod tests {
             DerivedBranchTip::Pending,
             "highest completed task_index wins even with empty digest → Pending, not earlier A"
         );
+    }
+
+    #[tokio::test]
+    async fn simple_projection_missing_commit_is_advisory() {
+        let (db, parent) = seed_parent().await;
+        let workspace = parent_workspace(&db, parent).await;
+        std::fs::write(
+            std::path::Path::new(&workspace).join("docs/simple-plan.md"),
+            "## Task 1: Completed without commit\n",
+        )
+        .expect("write Simple plan");
+        std::fs::create_dir_all(
+            std::path::Path::new(&workspace).join(format!(".superpowers/sdd/{parent}")),
+        )
+        .expect("create progress directory");
+
+        super::super::simple::register_simple_workflow(
+            &db.conn,
+            parent,
+            "docs/simple-plan.md",
+            None,
+        )
+        .await
+        .expect("register Simple descriptor");
+        insert_run(
+            &db,
+            parent,
+            "simple-completed",
+            Some("task|1|implementer|codex|none"),
+            DelegationRunStatus::Completed,
+            1,
+            None,
+            None,
+            "codex",
+        )
+        .await;
+        std::fs::write(
+            std::path::Path::new(&workspace)
+                .join(format!(".superpowers/sdd/{parent}/progress.md")),
+            r#"<!-- codeg-simple-progress-v1
+{"schema_version":1,"plan_rel_path":"docs/simple-plan.md","tasks":[{"index":1,"status":"completed","runs":[{"task_id":"simple-completed","role":"implementer","agent_type":"codex","state":"completed"}]}],"final_review_status":"completed"}
+-->"#,
+        )
+        .expect("write Simple progress");
+
+        let snapshot = project_workflow_graph_core(&db, parent)
+            .await
+            .expect("Simple snapshot");
+        let task = snapshot.nodes.first().expect("projected task");
+        assert_eq!(task.status, ProjectedNodeStatus::Completed);
+        assert!(task
+            .projection_warning_codes
+            .iter()
+            .any(|code| code == "simple_completed_task_missing_commit"));
+        assert_eq!(task.sync_state, WorkflowNodeSyncState::InSync);
     }
 
     #[tokio::test]

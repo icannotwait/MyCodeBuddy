@@ -532,7 +532,7 @@ function simpleGraph(): WorkflowGraphSnapshot {
         title: "Blocked task",
         status: "blocked",
         sync_state: "out_of_sync",
-        projection_warning_codes: ["simple_completed_task_missing_commit"],
+        projection_warning_codes: ["simple_completed_task_terminal_run_failed"],
       }),
       node({
         node_id: "simple-task-5",
@@ -770,6 +770,35 @@ describe("Task 7 archived and Simple workflow rendering", () => {
     )
 
     expect(screen.getByText("Partial Simple projection")).toBeVisible()
+  })
+
+  it("does not surface a missing commit advisory as a projection warning", () => {
+    const graph = simpleGraph()
+    graph.projection_warning_codes = ["simple_completed_task_missing_commit"]
+    graph.nodes = [
+      node({
+        node_id: "simple-task-1",
+        kind: "task",
+        phase_id: "tasks",
+        task_index: 1,
+        title: "Completed without commit",
+        status: "completed",
+        sync_state: "out_of_sync",
+        projection_warning_codes: ["simple_completed_task_missing_commit"],
+      }),
+    ]
+
+    renderWithIntl(
+      <SubAgentOverlay
+        delegations={[]}
+        conversationId={42}
+        workflowGraph={graph}
+        workspaceRootPath="/repo"
+      />
+    )
+
+    expect(screen.queryByText("Partial Simple projection")).toBeNull()
+    expect(screen.queryByText("Task status is out of sync")).toBeNull()
   })
 
   it("releases and reacquires the Simple file watch when the conversation folder changes", async () => {

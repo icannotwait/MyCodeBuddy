@@ -88,6 +88,22 @@ function isLiveNodeStatus(status: WorkflowNodeSnapshot["status"]): boolean {
   return status === "running" || status === "reserving"
 }
 
+const SIMPLE_ADVISORY_WARNING_CODES = new Set([
+  "simple_completed_task_missing_commit",
+])
+
+function hasBlockingSimpleWarning(codes: readonly string[]): boolean {
+  return codes.some((code) => !SIMPLE_ADVISORY_WARNING_CODES.has(code))
+}
+
+function isSimpleNodeOutOfSync(node: WorkflowNodeSnapshot): boolean {
+  if (node.sync_state !== "out_of_sync") return false
+  return (
+    node.projection_warning_codes.length === 0 ||
+    hasBlockingSimpleWarning(node.projection_warning_codes)
+  )
+}
+
 /**
  * 1s tick while any live node needs a live elapsed clock.
  * Snapshot value must only change on interval fire — never return Date.now()
@@ -321,8 +337,10 @@ function SimpleWorkflowProjection({
   const locator = snapshot.simple ?? null
   const partial =
     locator == null ||
-    snapshot.projection_warning_codes.length > 0 ||
-    snapshot.nodes.some((node) => node.projection_warning_codes.length > 0)
+    hasBlockingSimpleWarning(snapshot.projection_warning_codes) ||
+    snapshot.nodes.some((node) =>
+      hasBlockingSimpleWarning(node.projection_warning_codes)
+    )
 
   const openFile = useCallback(
     (relPath: string) => {
@@ -471,7 +489,7 @@ function SimpleWorkflowProjection({
                       {operationalLine}
                     </p>
                   )}
-                  {node.sync_state === "out_of_sync" && (
+                  {isSimpleNodeOutOfSync(node) && (
                     <p className="break-words text-[11px] text-amber-700 dark:text-amber-300">
                       {t("simpleOutOfSync")}
                     </p>
