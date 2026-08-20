@@ -21,6 +21,7 @@ const handlers = {
   onReplay: vi.fn(),
   onEvent: vi.fn(),
   onDetached: vi.fn(),
+  onAttachError: vi.fn(),
 }
 
 function sentFrames(): object[] {

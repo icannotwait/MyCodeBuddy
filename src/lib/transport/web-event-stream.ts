@@ -2,6 +2,7 @@ import type { EventEnvelope, LiveSessionSnapshot } from "@/lib/types"
 import { randomUUID } from "@/lib/utils"
 import type {
   AttachDetachReason,
+  AttachErrorCode,
   AttachHandlers,
   AttachOptions,
   EventStream,
@@ -38,6 +39,11 @@ type ServerAttachFrame =
       type: "detached"
       subscription_id: string
       reason: AttachDetachReason
+    }
+  | {
+      type: "attach_error"
+      subscription_id?: string
+      code: AttachErrorCode
     }
   | { type: "pong" }
 
@@ -115,12 +121,25 @@ export class WebEventStream implements EventStream {
   }
 
   /**
+   * An inbound WS text frame exceeded the UI parse budget. Drop the matching
+   * wire subscription (or every attach if we cannot peek an id) and surface a
+   * recoverable attach error. Must not call `onDetached`.
+   */
+  notifyOversizedFrame(subscriptionId?: string): void {
+    this.failAttach(subscriptionId, "oversized_frame")
+  }
+
+  /**
    * Called by the host transport when an attach-protocol frame arrives on
    * the WS. Routes by `subscription_id` and updates `lastAppliedSeq`.
    */
   handleServerFrame(frame: unknown): void {
     if (!isAttachFrame(frame)) return
     if (frame.type === "pong") return
+    if (frame.type === "attach_error") {
+      this.failAttach(frame.subscription_id, asAttachErrorCode(frame.code))
+      return
+    }
 
     const sub = this.subs.get(frame.subscription_id)
     if (!sub) {
@@ -169,6 +188,27 @@ export class WebEventStream implements EventStream {
     // Do NOT send detach frames here — destroy() is called when the
     // transport is going away (logout, remote-workspace switch), so the
     // WS will close anyway and the server cleans up subscribers on close.
+  }
+
+  private failAttach(
+    subscriptionId: string | undefined,
+    code: AttachErrorCode
+  ): void {
+    const ids =
+      subscriptionId && this.subs.has(subscriptionId)
+        ? [subscriptionId]
+        : subscriptionId
+          ? []
+          : [...this.subs.keys()]
+    for (const id of ids) {
+      const sub = this.subs.get(id)
+      if (!sub) continue
+      this.subs.delete(id)
+      safeInvoke("onAttachError", () =>
+        sub.handlers.onAttachError(code, true)
+      )
+    }
+    this.syncSharedHeartbeat()
   }
 
   private detach(subscriptionId: string): void {
@@ -233,8 +273,16 @@ function isAttachFrame(frame: unknown): frame is ServerAttachFrame {
     type === "replay" ||
     type === "event" ||
     type === "detached" ||
+    type === "attach_error" ||
     type === "pong"
   )
+}
+
+function asAttachErrorCode(code: unknown): AttachErrorCode {
+  if (code === "snapshot_budget_exceeded" || code === "oversized_frame") {
+    return code
+  }
+  return "oversized_frame"
 }
 
 function safeInvoke(name: string, fn: () => void): void {

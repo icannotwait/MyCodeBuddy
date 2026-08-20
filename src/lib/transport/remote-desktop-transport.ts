@@ -39,6 +39,7 @@ const ATTACH_FRAME_TYPES = new Set([
   "replay",
   "event",
   "detached",
+  "attach_error",
   "pong",
 ])
 

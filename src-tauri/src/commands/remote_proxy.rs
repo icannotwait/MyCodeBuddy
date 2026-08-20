@@ -106,6 +106,10 @@ const WS_READY_CHANNEL: &str = "__ready__";
 const WS_DISCONNECTED_CHANNEL: &str = "__disconnected__";
 const WS_UNAUTHORIZED_CHANNEL: &str = "__unauthorized__";
 
+/// Must stay equal to the frontend `MAX_WS_FRAME_CHARS` parse backstop
+/// and the server `MAX_ATTACH_FRAME_BYTES` ceiling (4 MiB).
+const MAX_REMOTE_WS_FRAME_BYTES: usize = crate::acp::session_state::MAX_ATTACH_FRAME_BYTES;
+
 /// One entry per active remote `connection_id` with at least one webview
 /// subscribed.
 struct WsTaskEntry {
@@ -1783,26 +1787,79 @@ async fn forward_text_message(
     event_name: &str,
     text: &str,
 ) -> Result<(), String> {
-    // Validate the JSON shape minimally to surface server-side bugs
-    // (malformed frames) without dropping the frame entirely.
+    match classify_forwarded_text(text)? {
+        ForwardedWsText::AttachError(envelope) => {
+            emit_json_to_subscribers(app, entry, event_name, &envelope).await;
+            return Ok(());
+        }
+        ForwardedWsText::Parsed(envelope) => {
+            if envelope
+                .get("channel")
+                .and_then(Value::as_str)
+                .is_some_and(|channel| channel == WS_READY_CHANNEL)
+            {
+                *entry.ready.write().await = true;
+            }
+            emit_json_to_subscribers(app, entry, event_name, &envelope).await;
+            Ok(())
+        }
+    }
+}
+
+enum ForwardedWsText {
+    Parsed(Value),
+    AttachError(Value),
+}
+
+fn peek_ws_subscription_id(text: &str) -> Option<&str> {
+    let head = text.get(..text.len().min(512)).unwrap_or(text);
+    let key = "\"subscription_id\"";
+    let start = head.find(key)?;
+    let after_key = &head[start + key.len()..];
+    let colon = after_key.find(':')?;
+    let rest = after_key[colon + 1..].trim_start();
+    let rest = rest.strip_prefix('"')?;
+    let end = rest.find('"')?;
+    Some(&rest[..end])
+}
+
+/// Reject oversized text before `serde_json::from_str`. Never parses the
+/// oversized payload into `serde_json::Value`.
+fn oversized_text_attach_error(text: &str) -> Option<Value> {
+    if text.len() <= MAX_REMOTE_WS_FRAME_BYTES {
+        return None;
+    }
+    let mut envelope = serde_json::json!({
+        "type": "attach_error",
+        "code": "oversized_frame",
+    });
+    if let Some(id) = peek_ws_subscription_id(text) {
+        envelope["subscription_id"] = Value::String(id.to_string());
+    }
+    Some(envelope)
+}
+
+fn classify_forwarded_text(text: &str) -> Result<ForwardedWsText, String> {
+    if let Some(envelope) = oversized_text_attach_error(text) {
+        return Ok(ForwardedWsText::AttachError(envelope));
+    }
     let envelope: Value =
         serde_json::from_str(text).map_err(|e| format!("invalid WS frame: {e}"))?;
+    Ok(ForwardedWsText::Parsed(envelope))
+}
 
-    if envelope
-        .get("channel")
-        .and_then(Value::as_str)
-        .is_some_and(|channel| channel == WS_READY_CHANNEL)
-    {
-        *entry.ready.write().await = true;
-    }
-
+async fn emit_json_to_subscribers(
+    app: &AppHandle,
+    entry: &Arc<WsTaskEntry>,
+    event_name: &str,
+    payload: &Value,
+) {
     let labels = snapshot_subscribers(entry).await;
     for label in labels {
-        if let Err(e) = app.emit_to(EventTarget::webview(&label), event_name, &envelope) {
+        if let Err(e) = app.emit_to(EventTarget::webview(&label), event_name, payload) {
             tracing::error!("[RemoteProxy] emit_to {label} for {event_name} failed: {e}");
         }
     }
-    Ok(())
 }
 
 /// Emit one of the internal lifecycle channels (`__ready__`,
@@ -2288,6 +2345,41 @@ mod tests {
                 expected.map(str::to_string),
                 "case: {path}"
             );
+        }
+    }
+
+    #[test]
+    fn remote_proxy_rejects_oversized_frame_before_parse() {
+        assert_eq!(MAX_REMOTE_WS_FRAME_BYTES, 4 * 1024 * 1024);
+
+        let garbage = "x".repeat(MAX_REMOTE_WS_FRAME_BYTES + 1);
+        let garbage_result = classify_forwarded_text(&garbage)
+            .expect("oversized non-JSON must be rejected before serde_json::from_str");
+        match garbage_result {
+            ForwardedWsText::AttachError(envelope) => {
+                assert_eq!(envelope["type"], "attach_error");
+                assert_eq!(envelope["code"], "oversized_frame");
+            }
+            ForwardedWsText::Parsed(_) => {
+                panic!("oversized text must not be parsed into serde_json::Value")
+            }
+        }
+
+        let mut framed = String::from(r#"{"type":"snapshot","subscription_id":"sub-9","data":""#);
+        framed.push_str(&"x".repeat(MAX_REMOTE_WS_FRAME_BYTES));
+        framed.push_str(r#""}"#);
+        assert!(framed.len() > MAX_REMOTE_WS_FRAME_BYTES);
+        let framed_result = classify_forwarded_text(&framed)
+            .expect("oversized JSON must be rejected before serde_json::from_str");
+        match framed_result {
+            ForwardedWsText::AttachError(envelope) => {
+                assert_eq!(envelope["type"], "attach_error");
+                assert_eq!(envelope["code"], "oversized_frame");
+                assert_eq!(envelope["subscription_id"], "sub-9");
+            }
+            ForwardedWsText::Parsed(_) => {
+                panic!("oversized text must not be parsed into serde_json::Value")
+            }
         }
     }
 }

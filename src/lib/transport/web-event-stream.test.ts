@@ -53,6 +53,7 @@ const handlers = {
   onReplay: vi.fn(),
   onEvent: vi.fn(),
   onDetached: vi.fn(),
+  onAttachError: vi.fn(),
 }
 
 describe("WebEventStream reconnect mode", () => {

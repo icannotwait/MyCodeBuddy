@@ -24,6 +24,37 @@ const WEB_CALL_TIMEOUT_MS = 60_000
 // permanently lock the UI. On timeout we proceed without confirmation — the
 // pre-fix race window reopens, but the UI stays responsive.
 const READY_TIMEOUT_MS = 5_000
+// Attach snapshots can carry multi-MB tool images. Parsing those on the UI
+// thread stalls the tab; skip frames above this character budget.
+export const MAX_WS_FRAME_CHARS = 4 * 1024 * 1024
+
+export function wsFrameTextLength(data: unknown): number | null {
+  if (typeof data === "string") return data.length
+  if (typeof Blob !== "undefined" && data instanceof Blob) return data.size
+  if (data instanceof ArrayBuffer) return data.byteLength
+  if (ArrayBuffer.isView(data)) return data.byteLength
+  return null
+}
+
+export function shouldSkipOversizedWsFrame(data: unknown): boolean {
+  const length = wsFrameTextLength(data)
+  return length !== null && length > MAX_WS_FRAME_CHARS
+}
+
+/** Control frames (`__ready__`, pong) are tiny; never treat them as oversize. */
+export function isWsControlFrame(data: unknown): boolean {
+  if (typeof data !== "string" || data.length > 4096) return false
+  return (
+    data.includes(`"${WS_READY_CHANNEL}"`) || data.includes('"type":"pong"')
+  )
+}
+
+export function peekWsSubscriptionId(data: unknown): string | undefined {
+  if (typeof data !== "string") return undefined
+  const head = data.slice(0, 512)
+  const match = head.match(/"subscription_id"\s*:\s*"([^"]+)"/)
+  return match?.[1]
+}
 // Exponential backoff bounds, in milliseconds: 1s → 2s → 4s → … capped at
 // 32s. Cap matches the Rust-side WS_BACKOFF_MAX_SECS. We never stop retrying:
 // a dropped WS is treated as a transient connectivity problem (server
@@ -491,6 +522,16 @@ export class WebTransport implements Transport {
 
     this.ws.onmessage = (msg) => {
       try {
+        if (shouldSkipOversizedWsFrame(msg.data)) {
+          console.warn(
+            "[WebTransport] oversized WS frame; failing attach instead of JSON.parse",
+            wsFrameTextLength(msg.data)
+          )
+          this.eventStreamInstance?.notifyOversizedFrame(
+            peekWsSubscriptionId(msg.data)
+          )
+          return
+        }
         const parsed = JSON.parse(msg.data) as unknown
         // Attach-protocol frames carry a `type` discriminator; legacy
         // global-broadcast frames carry a `channel` discriminator. Routing

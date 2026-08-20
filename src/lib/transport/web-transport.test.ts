@@ -1,5 +1,42 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
-import { WebTransport } from "./web-transport"
+import {
+  MAX_WS_FRAME_CHARS,
+  isWsControlFrame,
+  peekWsSubscriptionId,
+  shouldSkipOversizedWsFrame,
+  WebTransport,
+} from "./web-transport"
+
+describe("shouldSkipOversizedWsFrame", () => {
+  it("skips strings above the parse budget", () => {
+    expect(shouldSkipOversizedWsFrame("ok")).toBe(false)
+    expect(shouldSkipOversizedWsFrame("x".repeat(MAX_WS_FRAME_CHARS + 1))).toBe(
+      true
+    )
+  })
+
+  it("aligns the client parse backstop with the 4 MiB server ceiling", () => {
+    const ceiling = 4 * 1024 * 1024
+    expect(shouldSkipOversizedWsFrame("x".repeat(ceiling))).toBe(false)
+    expect(shouldSkipOversizedWsFrame("x".repeat(ceiling + 1))).toBe(true)
+  })
+
+  it("never classifies a ready/pong control frame as oversize-skippable", () => {
+    expect(isWsControlFrame(JSON.stringify({ channel: "__ready__" }))).toBe(
+      true
+    )
+    expect(isWsControlFrame('{"type":"pong"}')).toBe(true)
+    expect(isWsControlFrame("x".repeat(MAX_WS_FRAME_CHARS + 1))).toBe(false)
+  })
+
+  it("peeks subscription_id without a full parse", () => {
+    expect(
+      peekWsSubscriptionId(
+        '{"type":"snapshot","subscription_id":"sub-1","event_seq":1}'
+      )
+    ).toBe("sub-1")
+  })
+})
 
 // Minimal controllable WebSocket stand-in: records instances and lets the test
 // drive the lifecycle (open / __ready__ frame / drop) deterministically. The
@@ -287,6 +324,59 @@ describe("WebTransport connection state machine", () => {
     ws.drop() // closes before it ever opened or readied
     expect(t.getConnectionSnapshot()).toBe("reconnecting")
     expect(localStorage.getItem("codeg_token")).toBe("tok") // token preserved
+  })
+})
+
+describe("WebTransport oversized attach recovery", () => {
+  function attachHandlers() {
+    return {
+      onSnapshot: vi.fn(),
+      onReplay: vi.fn(),
+      onEvent: vi.fn(),
+      onDetached: vi.fn(),
+      onAttachError: vi.fn(),
+    }
+  }
+
+  it("does not JSON.parse an oversized unknown frame or detach as connection_gone", () => {
+    const { t, ws } = connectReady()
+    const handlers = attachHandlers()
+    const stream = t.eventStream()
+    const sub = stream.attach("conn", {}, handlers)
+    const parseSpy = vi.spyOn(JSON, "parse")
+    const frame =
+      `{"type":"snapshot","subscription_id":"${sub.subscriptionId}","blob":"` +
+      "x".repeat(4 * 1024 * 1024) +
+      `"}`
+
+    parseSpy.mockClear()
+    ws.onmessage?.({ data: frame })
+
+    expect(parseSpy).not.toHaveBeenCalled()
+    expect(handlers.onDetached).not.toHaveBeenCalled()
+    expect(handlers.onAttachError).toHaveBeenCalledWith("oversized_frame", true)
+    parseSpy.mockRestore()
+  })
+
+  it("routes snapshot_budget_exceeded as attach error without detaching", () => {
+    const { t, ws } = connectReady()
+    const handlers = attachHandlers()
+    const stream = t.eventStream()
+    const sub = stream.attach("conn", {}, handlers)
+
+    ws.onmessage?.({
+      data: JSON.stringify({
+        type: "attach_error",
+        subscription_id: sub.subscriptionId,
+        code: "snapshot_budget_exceeded",
+      }),
+    })
+
+    expect(handlers.onDetached).not.toHaveBeenCalled()
+    expect(handlers.onAttachError).toHaveBeenCalledWith(
+      "snapshot_budget_exceeded",
+      true
+    )
   })
 })
 

@@ -21,6 +21,7 @@ import {
 } from "@/lib/acp/streaming-performance-config"
 import type { LiveTranscriptFrameSink } from "@/stores/live-transcript-store"
 import type {
+  AttachErrorCode,
   AttachHandlers,
   EventStreamSubscription,
 } from "@/lib/transport/types"
@@ -304,6 +305,11 @@ export interface ConnectionState {
    *  revision watermarks; the banner splits active from resolved itself. */
   sessionFailures: SessionFailureRecord[]
   error: string | null
+  /**
+   * Recoverable attach-protocol error. The agent process is still alive.
+   * Cleared on a successful snapshot hydrate or when the user/WS retries.
+   */
+  attachError?: { code: AttachErrorCode; retryable: boolean } | null
   /**
    * Set when the agent rejected `session/load` non-recoverably because a
    * historical session cannot be resumed.
@@ -972,6 +978,13 @@ type Action =
       retry: ClaudeApiRetryState | null
     }
   | { type: "ERROR"; contextKey: string; message: string }
+  | {
+      type: "ATTACH_ERROR"
+      contextKey: string
+      code: AttachErrorCode
+      retryable: boolean
+    }
+  | { type: "CLEAR_ATTACH_ERROR"; contextKey: string }
   | {
       type: "ACP_LOAD_ERROR"
       contextKey: string
@@ -1834,6 +1847,7 @@ function reduceSingleAction(
         claudeApiRetry: null,
         sessionFailures: [],
         error: null,
+        attachError: null,
         loadError: null,
         loadErrorCode: null,
         lastAppliedSeq: 0,
@@ -2033,6 +2047,7 @@ function reduceSingleAction(
         claudeApiRetry: null,
         sessionFailures: [],
         error: null,
+        attachError: null,
         loadError: null,
         loadErrorCode: null,
         lastAppliedSeq: 0,
@@ -2286,6 +2301,7 @@ function reduceSingleAction(
         // Recover the latest runtime error only from a fresh snapshot. The
         // stale path above deliberately preserves the current cleared value.
         error: action.patch.lastError,
+        attachError: null,
         lastAppliedSeq: action.patch.eventSeq,
         sharedSession: mergedSharedSession,
       })
@@ -3312,6 +3328,28 @@ function reduceSingleAction(
         ...conn,
         claudeApiRetry: null,
         error: action.message,
+      })
+      return next
+    }
+
+    case "ATTACH_ERROR": {
+      const conn = state.get(action.contextKey)
+      if (!conn) return state
+      const next = writableConnections(state, mutateUnpublished)
+      next.set(action.contextKey, {
+        ...conn,
+        attachError: { code: action.code, retryable: action.retryable },
+      })
+      return next
+    }
+
+    case "CLEAR_ATTACH_ERROR": {
+      const conn = state.get(action.contextKey)
+      if (!conn || conn.attachError == null) return state
+      const next = writableConnections(state, mutateUnpublished)
+      next.set(action.contextKey, {
+        ...conn,
+        attachError: null,
       })
       return next
     }
@@ -4815,6 +4853,12 @@ export interface AcpActionsValue {
    */
   reconnect(contextKey: string): Promise<boolean>
   /**
+   * Re-issue the attach subscription after a recoverable attach error
+   * (`snapshot_budget_exceeded` / `oversized_frame`). Does not disconnect
+   * the live agent.
+   */
+  retryAttach(contextKey: string): void
+  /**
    * The params `reconnect(contextKey)` would use, or `null` when it would be a
    * no-op. Lets the status popover name the agent and enable its button while
    * NO connection exists. Non-reactive by design — the values only change when
@@ -5068,6 +5112,17 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
   // is rekeyed (orphan rescue) so handlers reference the new contextKey.
   const attachSubscriptionsRef = useRef(
     new Map<string, EventStreamSubscription>()
+  )
+  type AttachRetryRecord = {
+    connectionId: string
+    sinceSeq: number | undefined
+    reconnectMode: "resume" | "cold"
+    shared: { generation: number; leaseId: string } | undefined
+    autoRetryUsed: boolean
+  }
+  const attachRetryRef = useRef(new Map<string, AttachRetryRecord>())
+  const retryAttachRef = useRef<(contextKey: string, isAuto: boolean) => void>(
+    () => {}
   )
 
   // Open tab keys — updated by child TabProvider via registerOpenTabKeys
@@ -6234,6 +6289,8 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       let activeSub: EventStreamSubscription | null = null
       const handlers: AttachHandlers = {
         onSnapshot: (snapshot) => {
+          const record = attachRetryRef.current.get(contextKey)
+          if (record) record.autoRetryUsed = false
           const patch = denormalizeSnapshot(snapshot)
           dispatch({ type: "HYDRATE_FROM_SNAPSHOT", contextKey, patch })
           surfaceSnapshotErrorDetailsRef.current(contextKey, patch)
@@ -6254,6 +6311,17 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         },
         onEvent: (envelope) => {
           applyMappedEnvelope(contextKey, envelope, true)
+        },
+        onAttachError: (code, retryable) => {
+          // Agent is still alive; only this attach frame failed. Keep
+          // canonical state and wait for a new WS ready or an explicit retry.
+          attachSubscriptionsRef.current.delete(contextKey)
+          dispatch({
+            type: "ATTACH_ERROR",
+            contextKey,
+            code,
+            retryable,
+          })
         },
         onDetached: (reason) => {
           if (reason === "lagged" || reason === "server_shutdown") {
@@ -6298,6 +6366,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
               })
             }
             attachSubscriptionsRef.current.delete(contextKey)
+            attachRetryRef.current.delete(contextKey)
             acpReleaseLease(
               connectionId,
               shared.generation,
@@ -6327,6 +6396,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           // tab alias that pointed at it so a later owner reconnect under the
           // tab key can resolve/getConnection correctly.
           attachSubscriptionsRef.current.delete(contextKey)
+          attachRetryRef.current.delete(contextKey)
           clearAliasesPointingTo(contextKey)
           reverseMapRef.current.delete(connectionId)
           pendingUnmappedEventsRef.current.delete(connectionId)
@@ -6350,6 +6420,14 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         handlers
       )
       attachSubscriptionsRef.current.set(contextKey, activeSub)
+      const prior = attachRetryRef.current.get(contextKey)
+      attachRetryRef.current.set(contextKey, {
+        connectionId,
+        sinceSeq,
+        reconnectMode,
+        shared,
+        autoRetryUsed: prior?.autoRetryUsed ?? false,
+      })
       return activeSub
     },
     [
@@ -6371,10 +6449,52 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     const sub = attachSubscriptionsRef.current.get(contextKey)
     if (!sub) return
     attachSubscriptionsRef.current.delete(contextKey)
+    attachRetryRef.current.delete(contextKey)
     try {
       sub.detach()
     } catch (err) {
       console.warn("[acp-context] attach detach threw:", err)
+    }
+  }, [])
+
+  const retryAttachNow = useCallback(
+    (contextKey: string, isAuto = false) => {
+      const canonical =
+        observerAliasesRef.current.get(contextKey) ?? contextKey
+      const record = attachRetryRef.current.get(canonical)
+      if (!record) return
+      const conn = storeRef.current.connections.get(canonical)
+      if (!conn?.attachError?.retryable) return
+      if (isAuto && record.autoRetryUsed) return
+      if (isAuto) record.autoRetryUsed = true
+      dispatch({ type: "CLEAR_ATTACH_ERROR", contextKey: canonical })
+      setupAttachSubscription(
+        canonical,
+        record.connectionId,
+        conn.lastAppliedSeq,
+        record.reconnectMode,
+        record.shared
+      )
+    },
+    [dispatch, setupAttachSubscription]
+  )
+  retryAttachRef.current = retryAttachNow
+
+  const retryAttach = useCallback(
+    (contextKey: string) => {
+      retryAttachNow(contextKey, false)
+    },
+    [retryAttachNow]
+  )
+
+  useEffect(() => {
+    const unsub = getTransport().onReconnect?.(() => {
+      for (const key of [...attachRetryRef.current.keys()]) {
+        retryAttachRef.current(key, true)
+      }
+    })
+    return () => {
+      unsub?.()
     }
   }, [])
 
@@ -9254,6 +9374,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       detachDelegationChild,
       reapplyConfig,
       reconnect,
+      retryAttach,
       getReconnectInfo,
       dismissConfigStale,
       dismissSessionFailures: dismissSessionFailuresAction,
@@ -9282,6 +9403,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       detachDelegationChild,
       reapplyConfig,
       reconnect,
+      retryAttach,
       getReconnectInfo,
       dismissConfigStale,
       dismissSessionFailuresAction,

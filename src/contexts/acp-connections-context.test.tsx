@@ -107,6 +107,10 @@ const h = vi.hoisted(() => {
       for (const cb of queued) cb(16)
     },
     publishedConnectionMaps: () => __getPublishedConnectionMapsCount(),
+    reconnectListeners: new Set<() => void>(),
+    fireReconnect() {
+      for (const cb of this.reconnectListeners) cb()
+    },
     subscribeRaw(handler: (event: EventEnvelope) => void) {
       // Registered via useAcpEvent after mount — tests call actions path.
       // Provider exposes subscribers only through the hook; for raw tests we
@@ -214,6 +218,12 @@ vi.mock("@/lib/transport", () => ({
     isDesktop: () => h.isDesktop,
     subscribe: h.subscribe,
     call: vi.fn(),
+    onReconnect: (callback: () => void) => {
+      h.reconnectListeners.add(callback)
+      return () => {
+        h.reconnectListeners.delete(callback)
+      }
+    },
   }),
   isRemoteDesktopMode: () => false,
 }))
@@ -963,6 +973,7 @@ beforeEach(() => {
   h.store = null
   h.eventStreamValue = h.stream
   h.isDesktop = true
+  h.reconnectListeners.clear()
   h.subscribeHandlers.clear()
   h.subscribe.mockClear()
   h.rafQueue.length = 0
@@ -7251,6 +7262,57 @@ describe("AcpConnectionsProvider canonical observer aliases", () => {
     expect(reconnected?.isViewer).toBeFalsy()
     // Owner state is keyed by the tab id (not a stale broker alias target).
     expect(reconnected?.contextKey).toBe(TAB)
+  })
+
+  it("snapshot_budget_exceeded keeps canonical connection in a recoverable attach error", async () => {
+    h.acpFindConnectionForConversation.mockResolvedValue({
+      connection_id: "broker-child",
+      event_seq: 0,
+    })
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sid", 42)
+    })
+    expect(h.store!.getConnection("broker-child")).toBeTruthy()
+    expect(h.attach).toHaveBeenCalledTimes(1)
+
+    act(() => {
+      latestAttachHandlers().onAttachError("snapshot_budget_exceeded", true)
+    })
+
+    const conn = h.store!.getConnection("broker-child")
+    expect(conn).toBeTruthy()
+    expect(h.store!.getConnection(TAB)?.connectionId).toBe("broker-child")
+    expect(conn?.attachError).toEqual({
+      code: "snapshot_budget_exceeded",
+      retryable: true,
+    })
+    expect(h.attach).toHaveBeenCalledTimes(1)
+
+    act(() => {
+      h.actions!.retryAttach("broker-child")
+    })
+    expect(h.attach).toHaveBeenCalledTimes(2)
+    expect(h.store!.getConnection("broker-child")?.attachError).toBeNull()
+    expect(h.store!.getConnection("broker-child")).toBeTruthy()
+
+    act(() => {
+      latestAttachHandlers().onAttachError("snapshot_budget_exceeded", true)
+    })
+    expect(h.attach).toHaveBeenCalledTimes(2)
+
+    act(() => {
+      h.fireReconnect()
+    })
+    expect(h.attach).toHaveBeenCalledTimes(3)
+
+    act(() => {
+      latestAttachHandlers().onAttachError("snapshot_budget_exceeded", true)
+    })
+    act(() => {
+      h.fireReconnect()
+    })
+    expect(h.attach).toHaveBeenCalledTimes(3)
   })
 
   it("orphan rescue does not rekey viewer off connectionId; second observer reuses state", async () => {

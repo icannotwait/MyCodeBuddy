@@ -25,6 +25,14 @@ export type AttachDetachReason =
   | "session_replaced"
 
 /**
+ * Recoverable attach-protocol errors. Distinct from `AttachDetachReason`:
+ * the live agent connection stays up and the client may retry.
+ */
+export type AttachErrorCode =
+  | "snapshot_budget_exceeded"
+  | "oversized_frame"
+
+/**
  * Per-subscription callbacks delivered by `EventStream.attach`. Exactly one
  * of `onSnapshot` / `onReplay` fires first (the response to the attach
  * itself), followed by zero or more `onEvent` calls until either the
@@ -38,6 +46,7 @@ export interface AttachHandlers {
   onReplay(events: EventEnvelope[], highWaterSeq: number): void
   onEvent(envelope: EventEnvelope): void
   onDetached(reason: AttachDetachReason): void
+  onAttachError(code: AttachErrorCode, retryable: boolean): void
 }
 
 export interface AttachOptions {

@@ -54,8 +54,20 @@ pub(super) fn serialize_server_msg(msg: &ServerMsg) -> Result<Option<Vec<u8>>, s
     if encoded.len() <= MAX_ATTACH_FRAME_BYTES {
         return Ok(Some(encoded));
     }
-    if matches!(msg, ServerMsg::Snapshot { .. }) {
+    if let ServerMsg::Snapshot {
+        subscription_id, ..
+    } = msg
+    {
+        let with_id = ServerMsg::AttachError {
+            subscription_id: subscription_id.clone(),
+            code: AttachErrorCode::SnapshotBudgetExceeded,
+        };
+        let encoded = serde_json::to_vec(&with_id)?;
+        if encoded.len() <= MAX_ATTACH_FRAME_BYTES {
+            return Ok(Some(encoded));
+        }
         return serde_json::to_vec(&ServerMsg::AttachError {
+            subscription_id: String::new(),
             code: AttachErrorCode::SnapshotBudgetExceeded,
         })
         .map(Some);

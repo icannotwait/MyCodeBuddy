@@ -171,7 +171,10 @@ pub enum ServerMsg {
     },
     /// A recoverable attach-protocol error. The socket and live agent
     /// connection remain active so the client can choose a recovery path.
-    AttachError { code: AttachErrorCode },
+    AttachError {
+        subscription_id: String,
+        code: AttachErrorCode,
+    },
     /// Liveness response.
     Pong,
 }
