@@ -21,6 +21,18 @@ pub struct TelegramBackend {
     resolved_chat_id: OnceCell<String>,
 }
 
+async fn interruptible_backoff(
+    shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
+    consecutive_errors: u32,
+) {
+    let exp = consecutive_errors.saturating_sub(1).min(16);
+    let delay = std::cmp::min(5u64.saturating_mul(2u64.saturating_pow(exp)), 30);
+    tokio::select! {
+        _ = tokio::time::sleep(Duration::from_secs(delay)) => {}
+        _ = shutdown_rx.changed() => {}
+    }
+}
+
 impl TelegramBackend {
     pub fn new(channel_id: i32, bot_token: String, chat_id: String, topic_mode: bool) -> Self {
         Self {
@@ -253,6 +265,8 @@ impl ChatChannelBackend for TelegramBackend {
 
         tokio::spawn(async move {
             let mut offset: i64 = 0;
+            let mut consecutive_errors: u32 = 0;
+            let mut stop_as_error = false;
             loop {
                 if *shutdown_rx.borrow() {
                     break;
@@ -272,59 +286,163 @@ impl ChatChannelBackend for TelegramBackend {
 
                 match result {
                     Ok(resp) => {
-                        // Recover from error state after successful poll
-                        {
-                            let mut s = status.lock().await;
-                            if *s == ChannelConnectionStatus::Error {
-                                *s = ChannelConnectionStatus::Connected;
-                            }
+                        let http_status = resp.status();
+                        if http_status.as_u16() == 409 {
+                            tracing::error!(
+                                "[Telegram] getUpdates conflict (409) — another poller is running; stopping"
+                            );
+                            stop_as_error = true;
+                            break;
+                        }
+                        if !http_status.is_success() {
+                            consecutive_errors += 1;
+                            tracing::error!("[Telegram] polling HTTP {http_status}");
+                            *status.lock().await = ChannelConnectionStatus::Error;
+                            interruptible_backoff(&mut shutdown_rx, consecutive_errors).await;
+                            continue;
                         }
 
-                        if let Ok(body) = resp.json::<serde_json::Value>().await {
-                            if let Some(updates) = body.get("result").and_then(|r| r.as_array()) {
-                                if !updates.is_empty() {
-                                    tracing::info!("[Telegram] got {} update(s)", updates.len());
+                        match resp.json::<serde_json::Value>().await {
+                            Ok(body) => {
+                                if body.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+                                    tracing::error!(
+                                        "[Telegram] getUpdates ok=false: {}",
+                                        body.get("description")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("unknown")
+                                    );
+                                    *status.lock().await = ChannelConnectionStatus::Error;
+                                    consecutive_errors += 1;
+                                    interruptible_backoff(&mut shutdown_rx, consecutive_errors)
+                                        .await;
+                                    continue;
                                 }
-                                for update in updates {
-                                    if let Some(uid) =
-                                        update.get("update_id").and_then(|u| u.as_i64())
-                                    {
-                                        offset = uid + 1;
+                                consecutive_errors = 0;
+                                // Recover from error state after successful poll
+                                {
+                                    let mut s = status.lock().await;
+                                    if *s == ChannelConnectionStatus::Error {
+                                        *s = ChannelConnectionStatus::Connected;
                                     }
-                                    if let Some(message) = update.get("message") {
-                                        if !telegram_message_chat_matches(
-                                            message,
-                                            &configured_chat_id,
-                                        ) {
-                                            tracing::debug!(
+                                }
+
+                                if let Some(updates) = body.get("result").and_then(|r| r.as_array())
+                                {
+                                    if !updates.is_empty() {
+                                        tracing::info!(
+                                            "[Telegram] got {} update(s)",
+                                            updates.len()
+                                        );
+                                    }
+                                    for update in updates {
+                                        if let Some(uid) =
+                                            update.get("update_id").and_then(|u| u.as_i64())
+                                        {
+                                            offset = uid + 1;
+                                        }
+                                        if let Some(message) = update.get("message") {
+                                            if !telegram_message_chat_matches(
+                                                message,
+                                                &configured_chat_id,
+                                            ) {
+                                                tracing::debug!(
                                                 "[Telegram] skipped message from unconfigured chat"
                                             );
-                                            continue;
-                                        }
-
-                                        if let Some(text) =
-                                            message.get("text").and_then(|t| t.as_str())
-                                        {
-                                            // Group chat filtering: only process if @bot is mentioned
-                                            let chat_type = message
-                                                .pointer("/chat/type")
-                                                .and_then(|v| v.as_str())
-                                                .unwrap_or("private");
-
-                                            if !telegram_should_process_text_message(
-                                                chat_type,
-                                                text,
-                                                &bot_username,
-                                                topic_mode,
-                                            ) {
-                                                tracing::debug!("[Telegram] skipped group msg without @bot: {text}");
                                                 continue;
                                             }
 
-                                            // Strip @bot_username from command text (case-insensitive)
-                                            let clean_text = strip_bot_mention(text, &bot_username);
+                                            if let Some(text) =
+                                                message.get("text").and_then(|t| t.as_str())
+                                            {
+                                                // Group chat filtering: only process if @bot is mentioned
+                                                let chat_type = message
+                                                    .pointer("/chat/type")
+                                                    .and_then(|v| v.as_str())
+                                                    .unwrap_or("private");
 
-                                            let sender_id = message
+                                                if !telegram_should_process_text_message(
+                                                    chat_type,
+                                                    text,
+                                                    &bot_username,
+                                                    topic_mode,
+                                                ) {
+                                                    tracing::debug!("[Telegram] skipped group msg without @bot: {text}");
+                                                    continue;
+                                                }
+
+                                                // Strip @bot_username from command text (case-insensitive)
+                                                let clean_text =
+                                                    strip_bot_mention(text, &bot_username);
+
+                                                let sender_id = message
+                                                    .pointer("/from/id")
+                                                    .and_then(json_scalar_to_string)
+                                                    .unwrap_or_default();
+                                                let target = telegram_message_target(
+                                                    channel_id,
+                                                    &configured_chat_id,
+                                                    topic_mode,
+                                                    message,
+                                                );
+                                                tracing::debug!(
+                                                    "[Telegram] dispatching: {clean_text}"
+                                                );
+                                                let send_result = command_tx
+                                                    .send(IncomingCommand {
+                                                        channel_id,
+                                                        sender_id,
+                                                        command_text: clean_text,
+                                                        callback_data: None,
+                                                        target,
+                                                        metadata: update.clone(),
+                                                    })
+                                                    .await;
+                                                if let Err(e) = send_result {
+                                                    tracing::error!(
+                                                        "[Telegram] command_tx.send failed: {e}"
+                                                    );
+                                                }
+                                            } else {
+                                                tracing::info!(
+                                                    "[Telegram] message update without text"
+                                                );
+                                            }
+                                        } else if let Some(callback) = update.get("callback_query")
+                                        {
+                                            let Some(message) = callback.get("message") else {
+                                                tracing::debug!(
+                                                    "[Telegram] skipped callback without message"
+                                                );
+                                                continue;
+                                            };
+                                            if !telegram_message_chat_matches(
+                                                message,
+                                                &configured_chat_id,
+                                            ) {
+                                                tracing::debug!(
+                                                "[Telegram] skipped callback from unconfigured chat"
+                                            );
+                                                continue;
+                                            }
+                                            if let Some(callback_id) =
+                                                callback.get("id").and_then(|v| v.as_str())
+                                            {
+                                                answer_callback_query(
+                                                    &client,
+                                                    &bot_token,
+                                                    callback_id,
+                                                )
+                                                .await;
+                                            }
+                                            let Some(data) =
+                                                callback.get("data").and_then(|v| v.as_str())
+                                            else {
+                                                tracing::debug!(
+                                                    "[Telegram] skipped callback without data"
+                                                );
+                                                continue;
+                                            };
+                                            let sender_id = callback
                                                 .pointer("/from/id")
                                                 .and_then(json_scalar_to_string)
                                                 .unwrap_or_default();
@@ -334,13 +452,15 @@ impl ChatChannelBackend for TelegramBackend {
                                                 topic_mode,
                                                 message,
                                             );
-                                            tracing::debug!("[Telegram] dispatching: {clean_text}");
+                                            tracing::debug!(
+                                                "[Telegram] dispatching callback: {data}"
+                                            );
                                             let send_result = command_tx
                                                 .send(IncomingCommand {
                                                     channel_id,
                                                     sender_id,
-                                                    command_text: clean_text,
-                                                    callback_data: None,
+                                                    command_text: data.to_string(),
+                                                    callback_data: Some(data.to_string()),
                                                     target,
                                                     metadata: update.clone(),
                                                 })
@@ -352,85 +472,40 @@ impl ChatChannelBackend for TelegramBackend {
                                             }
                                         } else {
                                             tracing::info!(
-                                                "[Telegram] message update without text"
+                                                "[Telegram] update without message/callback_query"
                                             );
                                         }
-                                    } else if let Some(callback) = update.get("callback_query") {
-                                        let Some(message) = callback.get("message") else {
-                                            tracing::debug!(
-                                                "[Telegram] skipped callback without message"
-                                            );
-                                            continue;
-                                        };
-                                        if !telegram_message_chat_matches(
-                                            message,
-                                            &configured_chat_id,
-                                        ) {
-                                            tracing::debug!(
-                                                "[Telegram] skipped callback from unconfigured chat"
-                                            );
-                                            continue;
-                                        }
-                                        if let Some(callback_id) =
-                                            callback.get("id").and_then(|v| v.as_str())
-                                        {
-                                            answer_callback_query(&client, &bot_token, callback_id)
-                                                .await;
-                                        }
-                                        let Some(data) =
-                                            callback.get("data").and_then(|v| v.as_str())
-                                        else {
-                                            tracing::debug!(
-                                                "[Telegram] skipped callback without data"
-                                            );
-                                            continue;
-                                        };
-                                        let sender_id = callback
-                                            .pointer("/from/id")
-                                            .and_then(json_scalar_to_string)
-                                            .unwrap_or_default();
-                                        let target = telegram_message_target(
-                                            channel_id,
-                                            &configured_chat_id,
-                                            topic_mode,
-                                            message,
-                                        );
-                                        tracing::debug!("[Telegram] dispatching callback: {data}");
-                                        let send_result = command_tx
-                                            .send(IncomingCommand {
-                                                channel_id,
-                                                sender_id,
-                                                command_text: data.to_string(),
-                                                callback_data: Some(data.to_string()),
-                                                target,
-                                                metadata: update.clone(),
-                                            })
-                                            .await;
-                                        if let Err(e) = send_result {
-                                            tracing::error!(
-                                                "[Telegram] command_tx.send failed: {e}"
-                                            );
-                                        }
-                                    } else {
-                                        tracing::info!(
-                                            "[Telegram] update without message/callback_query"
-                                        );
                                     }
+                                } else {
+                                    tracing::error!("[Telegram] getUpdates missing result");
+                                    *status.lock().await = ChannelConnectionStatus::Error;
+                                    consecutive_errors += 1;
+                                    interruptible_backoff(&mut shutdown_rx, consecutive_errors)
+                                        .await;
                                 }
                             }
-                        } else {
-                            tracing::error!("[Telegram] failed to parse response body");
+                            Err(_) => {
+                                tracing::error!("[Telegram] failed to parse response body");
+                                *status.lock().await = ChannelConnectionStatus::Error;
+                                consecutive_errors += 1;
+                                interruptible_backoff(&mut shutdown_rx, consecutive_errors).await;
+                            }
                         }
                     }
                     Err(e) => {
                         let msg = redact_token(e.to_string(), &bot_token);
                         tracing::error!("[Telegram] polling error: {msg}");
                         *status.lock().await = ChannelConnectionStatus::Error;
-                        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                        consecutive_errors += 1;
+                        interruptible_backoff(&mut shutdown_rx, consecutive_errors).await;
                     }
                 }
             }
-            *status.lock().await = ChannelConnectionStatus::Disconnected;
+            *status.lock().await = if stop_as_error {
+                ChannelConnectionStatus::Error
+            } else {
+                ChannelConnectionStatus::Disconnected
+            };
         });
 
         Ok(())

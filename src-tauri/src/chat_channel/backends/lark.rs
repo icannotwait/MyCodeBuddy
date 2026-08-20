@@ -292,16 +292,30 @@ impl LarkBackend {
                     }
                 };
 
-                let ws_result = tokio_tungstenite::connect_async(&ws_url).await;
+                const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+                let ws_result = tokio::select! {
+                    r = tokio::time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(&ws_url)) => r,
+                    _ = shutdown_rx.changed() => break,
+                };
                 let ws_stream = match ws_result {
-                    Ok((stream, _)) => {
+                    Ok(Ok((stream, _))) => {
                         *status.lock().await = ChannelConnectionStatus::Connected;
                         retry_count = 0;
                         tracing::info!("[Lark] WebSocket connected");
                         stream
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         tracing::error!("[Lark] WebSocket connect failed: {e}");
+                        *status.lock().await = ChannelConnectionStatus::Error;
+                        let delay = Duration::from_secs((2u64).pow(retry_count.min(5)));
+                        retry_count += 1;
+                        tokio::select! {
+                            _ = tokio::time::sleep(delay) => continue,
+                            _ = shutdown_rx.changed() => break,
+                        }
+                    }
+                    Err(_) => {
+                        tracing::error!("[Lark] WebSocket connect timed out");
                         *status.lock().await = ChannelConnectionStatus::Error;
                         let delay = Duration::from_secs((2u64).pow(retry_count.min(5)));
                         retry_count += 1;

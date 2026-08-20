@@ -8,24 +8,16 @@
 //! companion connection that no one will ever read from.
 //!
 //! When the parent codeg / codeg-server passes `--parent-pid <pid>` on
-//! the command line, `codeg-mcp` spawns this watchdog. It polls the OS
-//! every couple of seconds and, the moment the parent PID stops existing,
-//! tears down the process. Polling (vs. a kernel notification) keeps the
-//! implementation tiny and identical across platforms; the 2 s tick is
-//! invisible next to the other work `codeg-mcp` does.
-//!
-//! The check is intentionally not exposed as a long-lived handle — there
-//! is no graceful "stop watching" path because the only outcome is
-//! `process::exit`.
+//! the command line, `codeg-mcp` spawns this watchdog. Unix still polls
+//! existence. Windows opens the parent **once** with `SYNCHRONIZE` and
+//! waits on that handle so a recycled PID cannot look alive.
 //!
 //! Backward compatibility: the `--parent-pid` flag is optional. Older
 //! parents that don't pass it get today's behavior (no watchdog).
 
 use std::time::Duration;
 
-/// Default polling cadence. Fast enough that a stale `codeg-mcp.exe`
-/// releases its file handle well before a follow-up install retry, slow
-/// enough that the poll cost is invisible.
+/// Default polling cadence for Unix existence probes.
 pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Return `true` if a process with `pid` is currently alive (running, not
@@ -73,14 +65,8 @@ fn windows_parent_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
     }
-    // PROCESS_QUERY_LIMITED_INFORMATION is the lightest right that still
-    // works on Vista+ even for processes owned by other integrity levels;
-    // it's enough for OpenProcess + GetExitCodeProcess.
     let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
     if handle.is_null() {
-        // The most common reason is ERROR_INVALID_PARAMETER (PID is gone).
-        // ERROR_ACCESS_DENIED is theoretically possible but would not occur
-        // for a child watching its own parent in the same session.
         return false;
     }
     let mut code: u32 = 0;
@@ -88,24 +74,61 @@ fn windows_parent_alive(pid: u32) -> bool {
     unsafe {
         let _ = CloseHandle(handle);
     }
-    // STILL_ACTIVE (259) is what Windows returns while a process is running.
-    // A process that happened to exit with code 259 will be misreported as
-    // alive for one extra poll — harmless for our purpose.
     read_ok != 0 && code == STILL_ACTIVE as u32
 }
 
-/// Long-running task: poll `pid` until it no longer exists, then return.
+/// Long-running task: wait until `pid` no longer exists, then return.
 /// The caller is expected to terminate the process at that point — this
 /// function itself does not call `process::exit` so it stays testable.
 pub async fn wait_for_parent_exit(pid: u32, interval: Duration) {
     if pid == 0 {
         return;
     }
-    loop {
-        if !parent_alive(pid) {
-            return;
+    #[cfg(windows)]
+    {
+        let _ = interval;
+        windows_wait_for_parent_exit(pid).await;
+    }
+    #[cfg(unix)]
+    {
+        loop {
+            if !parent_alive(pid) {
+                return;
+            }
+            tokio::time::sleep(interval).await;
         }
-        tokio::time::sleep(interval).await;
+    }
+}
+
+/// `SYNCHRONIZE` (0x00100000). Held for the lifetime of the wait so a
+/// recycled PID cannot satisfy a later `OpenProcess`.
+#[cfg(windows)]
+const SYNCHRONIZE: u32 = 0x0010_0000;
+
+#[cfg(windows)]
+async fn windows_wait_for_parent_exit(pid: u32) {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, WaitForSingleObject, INFINITE, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    let handle = unsafe { OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return;
+    }
+    // HANDLE is a raw pointer and is not `Send`; the integer identity is.
+    let handle_bits = handle as usize;
+    let wait_result = tokio::task::spawn_blocking(move || {
+        let handle = handle_bits as windows_sys::Win32::Foundation::HANDLE;
+        let status = unsafe { WaitForSingleObject(handle, INFINITE) };
+        unsafe {
+            let _ = CloseHandle(handle);
+        }
+        status
+    })
+    .await;
+    if let Err(e) = wait_result {
+        let _ = e;
     }
 }
 
@@ -121,24 +144,44 @@ mod tests {
 
     #[test]
     fn pid_zero_is_dead() {
-        // Treated as "not a valid target" on every platform we support.
         assert!(!parent_alive(0));
     }
 
     #[test]
     fn obviously_missing_pid_is_dead() {
-        // A PID that almost certainly doesn't exist on a freshly booted
-        // host. Windows reuses PIDs aggressively, so we pick something
-        // way out of the usual range; if this ever flakes we can swap to
-        // spawning a child and reaping it.
         assert!(!parent_alive(0x7FFF_FFF0));
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn watcher_returns_immediately_for_dead_pid() {
-        // start_paused keeps tokio time deterministic — if the watcher
-        // wrongly slept here, the test would hang because nothing advances
-        // time, surfacing the regression rather than passing by accident.
         wait_for_parent_exit(0, Duration::from_secs(60)).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn watcher_returns_immediately_for_missing_pid() {
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            wait_for_parent_exit(0x7FFF_FFF0, Duration::from_millis(10)),
+        )
+        .await
+        .expect("missing pid must not block");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_wait_returns_after_child_exits() {
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "exit", "0"])
+            .spawn()
+            .expect("spawn cmd");
+        let pid = child.id();
+        let wait = tokio::spawn(async move {
+            wait_for_parent_exit(pid, Duration::from_secs(2)).await;
+        });
+        let _ = child.wait();
+        tokio::time::timeout(Duration::from_secs(5), wait)
+            .await
+            .expect("WaitForSingleObject should observe child exit")
+            .expect("join");
     }
 }

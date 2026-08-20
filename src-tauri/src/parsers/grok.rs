@@ -821,8 +821,8 @@ fn parse_updates_from_bytes_with_context(
                         completed_at: None,
                         outcome: None,
                         autonomous_origin: None,
-            generation_ms: None,
-            generation_tokens: None,
+                        generation_ms: None,
+                        generation_tokens: None,
                     });
                 }
             }

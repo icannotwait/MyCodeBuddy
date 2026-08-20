@@ -2406,8 +2406,8 @@ pub(crate) fn group_into_turns_with_origins(
                 completed_at,
                 outcome: None,
                 autonomous_origin,
-            generation_ms: None,
-            generation_tokens: None,
+                generation_ms: None,
+                generation_tokens: None,
             });
         } else if matches!(msg.role, MessageRole::System) {
             turns.push(MessageTurn {
@@ -2422,8 +2422,8 @@ pub(crate) fn group_into_turns_with_origins(
                 completed_at: msg.completed_at,
                 outcome: None,
                 autonomous_origin: None,
-            generation_ms: None,
-            generation_tokens: None,
+                generation_ms: None,
+                generation_tokens: None,
             });
             i += 1;
         } else {
@@ -2439,8 +2439,8 @@ pub(crate) fn group_into_turns_with_origins(
                 completed_at: msg.completed_at,
                 outcome: None,
                 autonomous_origin: None,
-            generation_ms: None,
-            generation_tokens: None,
+                generation_ms: None,
+                generation_tokens: None,
             });
             i += 1;
         }
@@ -2736,8 +2736,8 @@ mod tests {
                 completed_at: None,
                 outcome: None,
                 autonomous_origin: None,
-            generation_ms: None,
-            generation_tokens: None,
+                generation_ms: None,
+                generation_tokens: None,
             },
             MessageTurn {
                 id: "turn-1".to_string(),
@@ -2756,8 +2756,8 @@ mod tests {
                 completed_at: None,
                 outcome: None,
                 autonomous_origin: None,
-            generation_ms: None,
-            generation_tokens: None,
+                generation_ms: None,
+                generation_tokens: None,
             },
         ];
 

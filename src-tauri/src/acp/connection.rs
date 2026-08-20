@@ -504,24 +504,75 @@ enum TurnFinalizationDisposition {
 /// handshake times out. Converted back to `AcpError::InitializeTimeout`
 /// by the outer `.map_err(...)` in `run_connection`.
 const INIT_TIMEOUT_SENTINEL: &str = "__codeg_init_timeout__";
+const SESSION_LOAD_REPLAY_MAX_NOTIFICATIONS: u32 = 10_000;
+const SESSION_LOAD_REPLAY_MAX_WALL: std::time::Duration = std::time::Duration::from_secs(5);
+const SESSION_LOAD_REPLAY_DISCARD_WALL: std::time::Duration = std::time::Duration::from_secs(2);
+const SESSION_LOAD_REPLAY_MAX_DISCARD: u32 = 100_000;
+
+fn session_load_replay_budget_exhausted(drained: u32, started: std::time::Instant) -> bool {
+    drained >= SESSION_LOAD_REPLAY_MAX_NOTIFICATIONS
+        || started.elapsed() >= SESSION_LOAD_REPLAY_MAX_WALL
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionLoadReplayPhase {
+    Apply,
+    Discard,
+}
+
+fn session_load_replay_phase(
+    drained: u32,
+    started: std::time::Instant,
+    discarding: bool,
+) -> SessionLoadReplayPhase {
+    if discarding || session_load_replay_budget_exhausted(drained, started) {
+        SessionLoadReplayPhase::Discard
+    } else {
+        SessionLoadReplayPhase::Apply
+    }
+}
+
+fn session_load_discard_exhausted(discarded: u32, discard_started: std::time::Instant) -> bool {
+    discarded >= SESSION_LOAD_REPLAY_MAX_DISCARD
+        || discard_started.elapsed() >= SESSION_LOAD_REPLAY_DISCARD_WALL
+}
 
 /// RAII guard that removes the `AgentConnection` entry from the manager
 /// map when dropped. Runs on both normal task exit AND task panic, so a
 /// panic inside `run_connection` can't leak a stale map entry.
 ///
-/// The `Mutex` is async, so we take two paths:
-/// - If the lock is immediately available (`try_lock` succeeds), remove
-///   the entry synchronously in the current context.
-/// - Otherwise, spawn a short-lived cleanup task to acquire the lock
-///   and remove the entry asynchronously. The guard must hold owned
-///   `Arc<Mutex<_>>` and `String` so the spawned task has `'static`
-///   captures.
+/// Removal is incarnation-CAS: a late Drop after AllowedFallback / reconnect
+/// must not delete the replacement `AgentConnection` that reused the same
+/// `connection_id`. Manager-controlled disconnect already CASes; this path
+/// must match.
 struct ConnectionCleanupGuard {
     connections: Arc<tokio::sync::Mutex<HashMap<String, AgentConnection>>>,
     connection_id: String,
     connection_incarnation: String,
     tool_lease_registry: Arc<crate::acp::tool_watchdog::ToolExecutionLeaseRegistry>,
     runtime: tokio::runtime::Handle,
+}
+
+/// True when the map entry still names the incarnation that is dropping.
+fn should_remove_connection_if_incarnation_matches(
+    live_incarnation: Option<&str>,
+    dropping_incarnation: &str,
+) -> bool {
+    live_incarnation == Some(dropping_incarnation)
+}
+
+async fn remove_connection_if_same_incarnation(
+    connections: &tokio::sync::Mutex<HashMap<String, AgentConnection>>,
+    connection_id: &str,
+    incarnation: &str,
+) {
+    let mut map = connections.lock().await;
+    let live = map
+        .get(connection_id)
+        .map(|c| c.connection_incarnation.as_str());
+    if should_remove_connection_if_incarnation_matches(live, incarnation) {
+        map.remove(connection_id);
+    }
 }
 
 impl Drop for ConnectionCleanupGuard {
@@ -538,8 +589,104 @@ impl Drop for ConnectionCleanupGuard {
             let _ = registry
                 .remove_connection(&connection_id, &incarnation)
                 .await;
-            connections.lock().await.remove(&connection_id);
+            remove_connection_if_same_incarnation(&connections, &connection_id, &incarnation).await;
         });
+    }
+}
+
+#[cfg(test)]
+mod cleanup_guard_tests {
+    use super::{
+        session_load_discard_exhausted, session_load_replay_budget_exhausted,
+        session_load_replay_phase, should_remove_connection_if_incarnation_matches,
+        SessionLoadReplayPhase, SESSION_LOAD_REPLAY_DISCARD_WALL, SESSION_LOAD_REPLAY_MAX_DISCARD,
+        SESSION_LOAD_REPLAY_MAX_NOTIFICATIONS, SESSION_LOAD_REPLAY_MAX_WALL,
+    };
+
+    #[test]
+    fn cleanup_removes_only_the_dropping_incarnation() {
+        assert!(should_remove_connection_if_incarnation_matches(
+            Some("inc-1"),
+            "inc-1"
+        ));
+        assert!(!should_remove_connection_if_incarnation_matches(
+            Some("inc-2"),
+            "inc-1"
+        ));
+        assert!(!should_remove_connection_if_incarnation_matches(
+            None, "inc-1"
+        ));
+    }
+
+    #[test]
+    fn session_load_replay_stops_at_count_or_wall() {
+        let started = std::time::Instant::now();
+        assert!(!session_load_replay_budget_exhausted(1, started));
+        assert!(session_load_replay_budget_exhausted(
+            SESSION_LOAD_REPLAY_MAX_NOTIFICATIONS,
+            started
+        ));
+        assert!(session_load_replay_budget_exhausted(
+            0,
+            started - SESSION_LOAD_REPLAY_MAX_WALL
+        ));
+    }
+
+    #[test]
+    fn session_load_replay_switches_to_discard_after_budget() {
+        let started = std::time::Instant::now();
+        assert_eq!(
+            session_load_replay_phase(1, started, false),
+            SessionLoadReplayPhase::Apply
+        );
+        assert_eq!(
+            session_load_replay_phase(SESSION_LOAD_REPLAY_MAX_NOTIFICATIONS, started, false),
+            SessionLoadReplayPhase::Discard
+        );
+        assert_eq!(
+            session_load_replay_phase(1, started, true),
+            SessionLoadReplayPhase::Discard
+        );
+        assert!(session_load_discard_exhausted(
+            SESSION_LOAD_REPLAY_MAX_DISCARD,
+            started
+        ));
+        assert!(session_load_discard_exhausted(
+            0,
+            started - SESSION_LOAD_REPLAY_DISCARD_WALL
+        ));
+        assert!(!session_load_discard_exhausted(1, started));
+        // Hitting the discard cap must refuse attach (see the session/load
+        // drain) rather than `break` into the live conversation loop.
+    }
+
+    #[tokio::test]
+    async fn remove_connection_if_same_incarnation_leaves_a_newer_entry() {
+        use super::remove_connection_if_same_incarnation;
+        use crate::acp::manager::ConnectionManager;
+        use crate::acp::types::ConnectionStatus;
+        use crate::models::agent::AgentType;
+        use crate::web::event_bridge::EventEmitter;
+
+        let manager = ConnectionManager::new();
+        manager
+            .insert_test_connection("c-cas", AgentType::Codex, None, EventEmitter::Noop)
+            .await;
+        {
+            let mut map = manager.connections.lock().await;
+            if let Some(conn) = map.get_mut("c-cas") {
+                conn.connection_incarnation = "inc-new".into();
+            }
+        }
+        remove_connection_if_same_incarnation(&manager.connections, "c-cas", "inc-old").await;
+        {
+            let map = manager.connections.lock().await;
+            let live = map.get("c-cas").expect("replacement must remain");
+            assert_eq!(live.connection_incarnation, "inc-new");
+            assert_eq!(live.status, ConnectionStatus::Connected);
+        }
+        remove_connection_if_same_incarnation(&manager.connections, "c-cas", "inc-new").await;
+        assert!(manager.connections.lock().await.get("c-cas").is_none());
     }
 }
 
@@ -5038,6 +5185,7 @@ async fn run_connection(
         )
         .with_default_cwd(Some(cwd.clone())),
     );
+    crate::acp::terminal_runtime::register_acp_terminal_runtime(&terminal_runtime);
     // Grok's ACP terminal adapter creates client terminals but omits
     // ToolCallContent::Terminal. This bridge synthesizes the association
     // only when a unique in-progress shell tool is the sole candidate.
@@ -5914,16 +6062,16 @@ async fn run_connection(
                             crate::acp::session_attach::SessionStartedDecision::RefuseUnresumable {
                                 reason,
                             } => {
-                                tracing::warn!(
-                                    expected = %sid,
-                                    returned = ?returned_session_id,
-                                    "[ACP] load identity refuse: {reason}"
-                                );
-                                refuse_unresumable_bootstrap(
-                                    &state,
-                                    &emitter_clone,
-                                    &sid,
-                                    format!("resume_existing_only: {reason}"),
+                                    tracing::warn!(
+                                        expected = %sid,
+                                        returned = ?returned_session_id,
+                                        "[ACP] load identity refuse: {reason}"
+                                    );
+                                    refuse_unresumable_bootstrap(
+                                        &state,
+                                        &emitter_clone,
+                                        &sid,
+                                        format!("session_attach: {reason}"),
                                     delegation_injection
                                         .as_ref()
                                         .map(|inj| inj.broker.as_ref()),
@@ -5969,12 +6117,15 @@ async fn run_connection(
                         // time, hence no folder in the conversation list).
                         record_transcript_header(agent_type, &sid, &cwd.to_string_lossy());
                         let mut drained = 0u32;
+                        let replay_started = std::time::Instant::now();
                         // Cleared if the writer ever stalls: from then on the
                         // drain still runs to completion (the session is not
                         // usable until the replay is consumed) but records
                         // nothing more, so the transcript ends at a line
                         // boundary instead of growing holes.
                         let mut recording = hydrate_from_replay;
+                        let mut discarding = false;
+                        let mut discard_started: Option<std::time::Instant> = None;
                         while let Ok(Ok(msg)) = tokio::time::timeout(
                             std::time::Duration::from_millis(100),
                             session.read_update(),
@@ -5982,6 +6133,38 @@ async fn run_connection(
                         .await
                         {
                             drained += 1;
+                            if session_load_replay_phase(drained, replay_started, discarding)
+                                == SessionLoadReplayPhase::Discard
+                            {
+                                if !discarding {
+                                    tracing::warn!(
+                                        "[ACP] session/load replay drain hit budget after {drained} notifications; discarding remainder"
+                                    );
+                                    discarding = true;
+                                    discard_started = Some(std::time::Instant::now());
+                                }
+                                if session_load_discard_exhausted(
+                                    drained,
+                                    discard_started.unwrap_or(replay_started),
+                                ) {
+                                    tracing::warn!(
+                                        "[ACP] session/load remainder discard hit cap after {drained} notifications; refusing attach"
+                                    );
+                                    refuse_unresumable_bootstrap(
+                                        &state,
+                                        &emitter_clone,
+                                        &sid,
+                                        "session_load_replay_budget".to_string(),
+                                        delegation_injection
+                                            .as_ref()
+                                            .map(|inj| inj.broker.as_ref()),
+                                        &connection_id,
+                                    )
+                                    .await;
+                                    return Ok(());
+                                }
+                                continue;
+                            }
                             if let SessionMessage::SessionMessage(dispatch) = msg {
                                 let h = emitter_clone.clone();
                                 let st = Arc::clone(&state);
@@ -8789,7 +8972,7 @@ fn parent_turn_end_reason(stop_reason: &str) -> crate::acp::delegation::types::P
     }
 }
 
-async fn cleanup_delegation_parent(
+pub(crate) async fn cleanup_delegation_parent(
     injection: &DelegationInjection,
     connection_id: &str,
     state: &Arc<RwLock<SessionState>>,
@@ -12867,9 +13050,10 @@ async fn maybe_emit_request_usage(
     emitter: &EventEmitter,
     notification: &UntypedMessage,
 ) {
-    let Some(usage) =
-        crate::acp::request_usage::extract_request_usage(notification.method(), notification.params())
-    else {
+    let Some(usage) = crate::acp::request_usage::extract_request_usage(
+        notification.method(),
+        notification.params(),
+    ) else {
         return;
     };
     emit_with_state(

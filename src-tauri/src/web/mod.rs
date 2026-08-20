@@ -31,6 +31,10 @@ const WEB_SERVICE_AUTO_START_KEY: &str = "web_service_auto_start";
 pub const DEFAULT_WEB_SERVICE_PORT: u16 = 3080;
 
 pub struct WebServerState {
+    inner: Arc<WebServerStateInner>,
+}
+
+pub(crate) struct WebServerStateInner {
     handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     shutdown_tx: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     /// Coordinates shutdown of live WebSocket handlers. Sticky flag +
@@ -49,6 +53,14 @@ pub struct WebServerState {
     completion_authorizations: Arc<auth::CompletionAuthorizationRegistry>,
 }
 
+impl Clone for WebServerState {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
 impl Default for WebServerState {
     fn default() -> Self {
         Self::new()
@@ -58,21 +70,25 @@ impl Default for WebServerState {
 impl WebServerState {
     pub fn new() -> Self {
         Self {
-            handle: Mutex::new(None),
-            shutdown_tx: Mutex::new(None),
-            shutdown_signal: Arc::new(ShutdownSignal::new()),
-            port: AtomicU16::new(0),
-            token: Mutex::new(String::new()),
-            host: Mutex::new("0.0.0.0".to_string()),
-            running: std::sync::atomic::AtomicBool::new(false),
-            completion_authorizations: Arc::new(auth::CompletionAuthorizationRegistry::default()),
+            inner: Arc::new(WebServerStateInner {
+                handle: Mutex::new(None),
+                shutdown_tx: Mutex::new(None),
+                shutdown_signal: Arc::new(ShutdownSignal::new()),
+                port: AtomicU16::new(0),
+                token: Mutex::new(String::new()),
+                host: Mutex::new("0.0.0.0".to_string()),
+                running: std::sync::atomic::AtomicBool::new(false),
+                completion_authorizations: Arc::new(
+                    auth::CompletionAuthorizationRegistry::default(),
+                ),
+            }),
         }
     }
 
     /// Handle to the shutdown coordinator. Exposed so binaries / external
     /// callers (e.g. `codeg-server`) can pass it to `build_router`.
     pub fn shutdown_signal(&self) -> Arc<ShutdownSignal> {
-        self.shutdown_signal.clone()
+        self.inner.shutdown_signal.clone()
     }
 
     /// Mark the server as running from outside the Tauri command path.
@@ -83,21 +99,21 @@ impl WebServerState {
     /// owns the serve task itself, not this state. `stop_web_server`
     /// uses that absence to detect web mode and reject the call.
     pub fn mark_externally_running(&self, host: String, port: u16, token: String) {
-        self.port.store(port, Ordering::Relaxed);
-        *self.token.lock().unwrap() = token;
-        *self.host.lock().unwrap() = host;
-        self.running.store(true, Ordering::Release);
+        self.inner.port.store(port, Ordering::Relaxed);
+        *self.inner.token.lock().unwrap() = token;
+        *self.inner.host.lock().unwrap() = host;
+        self.inner.running.store(true, Ordering::Release);
     }
 
     /// True when the serve task is owned externally (e.g. by `codeg-server`
     /// `axum::serve` in standalone mode), in which case stop/start through
     /// this state must be a no-op.
     pub fn is_externally_managed(&self) -> bool {
-        self.handle.lock().unwrap().is_none() && self.running.load(Ordering::Acquire)
+        self.inner.handle.lock().unwrap().is_none() && self.inner.running.load(Ordering::Acquire)
     }
 
     pub fn completion_authorizations(&self) -> Arc<auth::CompletionAuthorizationRegistry> {
-        self.completion_authorizations.clone()
+        self.inner.completion_authorizations.clone()
     }
 }
 
@@ -533,11 +549,12 @@ pub(crate) async fn do_start_web_server_with_state(
     let ws = &app_state.web_server_state;
 
     // Atomically claim the running flag; concurrent starts see AlreadyExists.
-    ws.running
+    ws.inner
+        .running
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .map_err(|_| AppCommandError::new(AppErrorCode::AlreadyExists, ERR_ALREADY_RUNNING))?;
     let mut guard = RunningGuard {
-        running: &ws.running,
+        running: &ws.inner.running,
         armed: true,
     };
 
@@ -588,8 +605,8 @@ pub(crate) async fn do_start_web_server_with_state(
 
     // Reset before any handler subscribes, so a leftover signal from the
     // previous cycle cannot make a new handler exit immediately.
-    ws.shutdown_signal.reset();
-    let shutdown_signal = ws.shutdown_signal.clone();
+    ws.inner.shutdown_signal.reset();
+    let shutdown_signal = ws.inner.shutdown_signal.clone();
 
     // Sweep abandoned upload staging files from any previous run. Safe to
     // call before binding the listener; only touches `<uploads_root>/.tmp/`.
@@ -618,11 +635,11 @@ pub(crate) async fn do_start_web_server_with_state(
         }
     });
 
-    *ws.handle.lock().unwrap() = Some(handle);
-    *ws.shutdown_tx.lock().unwrap() = Some(shutdown_tx);
-    ws.port.store(actual_port, Ordering::Relaxed);
-    *ws.token.lock().unwrap() = token.clone();
-    *ws.host.lock().unwrap() = advertised_host.clone();
+    *ws.inner.handle.lock().unwrap() = Some(handle);
+    *ws.inner.shutdown_tx.lock().unwrap() = Some(shutdown_tx);
+    ws.inner.port.store(actual_port, Ordering::Relaxed);
+    *ws.inner.token.lock().unwrap() = token.clone();
+    *ws.inner.host.lock().unwrap() = advertised_host.clone();
     // running already true from compare_exchange; disarm guard so it doesn't flip back.
     guard.disarm();
 
@@ -635,14 +652,14 @@ pub(crate) async fn do_start_web_server_with_state(
 }
 
 pub(crate) async fn do_stop_web_server(state: &WebServerState) {
-    let handle_opt = state.handle.lock().unwrap().take();
-    let shutdown_tx = state.shutdown_tx.lock().unwrap().take();
+    let handle_opt = state.inner.handle.lock().unwrap().take();
+    let shutdown_tx = state.inner.shutdown_tx.lock().unwrap().take();
 
     // Trigger first: sticky flag means any handshake completing during
     // the stop window also exits, not just currently-waiting handlers.
     // Without this, hyper's graceful drain would wait for live WS
     // connections and we'd always fall through to the abort branch.
-    state.shutdown_signal.trigger();
+    state.inner.shutdown_signal.trigger();
 
     // Signal graceful shutdown so axum stops accepting new connections
     // and drops the listening socket once the serve future resolves.
@@ -665,20 +682,20 @@ pub(crate) async fn do_stop_web_server(state: &WebServerState) {
 
     // Only release the running flag after the listener is guaranteed dropped,
     // so a concurrent start() cannot race into a bind() while the old socket lingers.
-    state.port.store(0, Ordering::Relaxed);
-    *state.token.lock().unwrap() = String::new();
-    *state.host.lock().unwrap() = "0.0.0.0".to_string();
-    state.running.store(false, Ordering::Release);
+    state.inner.port.store(0, Ordering::Relaxed);
+    *state.inner.token.lock().unwrap() = String::new();
+    *state.inner.host.lock().unwrap() = "0.0.0.0".to_string();
+    state.inner.running.store(false, Ordering::Release);
     tracing::info!("[WEB] Web server stopped");
 }
 
 pub(crate) fn do_get_web_server_status(state: &WebServerState) -> Option<WebServerInfo> {
-    if !state.running.load(Ordering::Relaxed) {
+    if !state.inner.running.load(Ordering::Relaxed) {
         return None;
     }
-    let port = state.port.load(Ordering::Relaxed);
-    let host = state.host.lock().unwrap().clone();
-    let token = state.token.lock().unwrap().clone();
+    let port = state.inner.port.load(Ordering::Relaxed);
+    let host = state.inner.host.lock().unwrap().clone();
+    let token = state.inner.token.lock().unwrap().clone();
     let addresses = addresses_for_bind(&host, port);
     Some(WebServerInfo {
         port,
@@ -718,11 +735,12 @@ pub(crate) async fn do_start_web_server_tauri(
     let ws = state;
 
     // Atomically claim the running flag; concurrent starts see AlreadyExists.
-    ws.running
+    ws.inner
+        .running
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .map_err(|_| AppCommandError::new(AppErrorCode::AlreadyExists, ERR_ALREADY_RUNNING))?;
     let mut guard = RunningGuard {
-        running: &ws.running,
+        running: &ws.inner.running,
         armed: true,
     };
 
@@ -814,8 +832,9 @@ pub(crate) async fn do_start_web_server_tauri(
             .state::<Arc<crate::reference_search::ReferenceSearchRegistry>>()
             .inner()
             .clone(),
-        web_server_state: WebServerState::new(), // placeholder; not used by handlers
-        chat_channel_manager: crate::app_state::default_chat_channel_manager(),
+        web_server_state: (*app.state::<WebServerState>()).clone(),
+        chat_channel_manager: (*app.state::<crate::chat_channel::manager::ChatChannelManager>())
+            .clone_ref(),
         workspace_transfer: app
             .try_state::<Arc<crate::workspace_transfer::WorkspaceTransferManager>>()
             .map(|state| state.inner().clone())
@@ -898,8 +917,8 @@ pub(crate) async fn do_start_web_server_tauri(
     });
 
     // See do_start_web_server_with_state for rationale on the reset.
-    ws.shutdown_signal.reset();
-    let shutdown_signal = ws.shutdown_signal.clone();
+    ws.inner.shutdown_signal.reset();
+    let shutdown_signal = ws.inner.shutdown_signal.clone();
 
     // Sweep abandoned upload staging files. See the matching call in
     // `do_start_web_server_with_state` for rationale. Quota log/validate
@@ -929,11 +948,11 @@ pub(crate) async fn do_start_web_server_tauri(
         }
     });
 
-    *ws.handle.lock().unwrap() = Some(handle);
-    *ws.shutdown_tx.lock().unwrap() = Some(shutdown_tx);
-    ws.port.store(actual_port, Ordering::Relaxed);
-    *ws.token.lock().unwrap() = token.clone();
-    *ws.host.lock().unwrap() = advertised_host.clone();
+    *ws.inner.handle.lock().unwrap() = Some(handle);
+    *ws.inner.shutdown_tx.lock().unwrap() = Some(shutdown_tx);
+    ws.inner.port.store(actual_port, Ordering::Relaxed);
+    *ws.inner.token.lock().unwrap() = token.clone();
+    *ws.inner.host.lock().unwrap() = advertised_host.clone();
     // running already true from compare_exchange; disarm guard so it doesn't flip back.
     guard.disarm();
 

@@ -991,8 +991,8 @@ fn build_turns(
                         completed_at: None,
                         outcome: None,
                         autonomous_origin: None,
-            generation_ms: None,
-            generation_tokens: None,
+                        generation_ms: None,
+                        generation_tokens: None,
                     });
                 }
             }
@@ -1012,8 +1012,8 @@ fn build_turns(
                     completed_at,
                     outcome: None,
                     autonomous_origin: None,
-            generation_ms: None,
-            generation_tokens: None,
+                    generation_ms: None,
+                    generation_tokens: None,
                 });
             }
         } else if let Some(shell_turn) = wire::first_message(&turn_bytes, 2) {
@@ -1051,8 +1051,8 @@ fn build_turns(
                 completed_at: None,
                 outcome: None,
                 autonomous_origin: None,
-            generation_ms: None,
-            generation_tokens: None,
+                generation_ms: None,
+                generation_tokens: None,
             });
             let tool_id = format!("cursor-shell-{i}");
             let (preview, exit_code) = output.unwrap_or((None, 0));
@@ -1088,8 +1088,8 @@ fn build_turns(
                 completed_at,
                 outcome: None,
                 autonomous_origin: None,
-            generation_ms: None,
-            generation_tokens: None,
+                generation_ms: None,
+                generation_tokens: None,
             });
         }
     }

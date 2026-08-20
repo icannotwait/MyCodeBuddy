@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 use std::time::Duration;
 
 use sacp::schema::{
@@ -23,6 +23,35 @@ use crate::terminal::shell_flavor::{classify_shell_family, ShellFamily};
 
 type TerminalMap = HashMap<String, Arc<TerminalInstance>>;
 const DEFAULT_OUTPUT_BYTE_LIMIT: u64 = 1_000_000;
+
+fn acp_terminal_runtimes() -> &'static StdMutex<Vec<Weak<TerminalRuntime>>> {
+    static REGISTRY: OnceLock<StdMutex<Vec<Weak<TerminalRuntime>>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| StdMutex::new(Vec::new()))
+}
+
+/// Register a connection's ACP terminal runtime so process quit can kill
+/// `terminal/create` children that live only on the connection thread.
+pub fn register_acp_terminal_runtime(runtime: &Arc<TerminalRuntime>) {
+    let mut list = acp_terminal_runtimes()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    list.retain(|weak| weak.strong_count() > 0);
+    list.push(Arc::downgrade(runtime));
+}
+
+/// Kill every live ACP `terminal/create` process in this host.
+pub async fn kill_all_registered_acp_terminals() {
+    let runtimes: Vec<Arc<TerminalRuntime>> = {
+        let mut list = acp_terminal_runtimes()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        list.retain(|weak| weak.strong_count() > 0);
+        list.iter().filter_map(Weak::upgrade).collect()
+    };
+    for runtime in runtimes {
+        runtime.kill_all().await;
+    }
+}
 /// After the child process exits, wait up to this long for the stdout/stderr
 /// reader tasks to drain naturally before aborting them. Needed because a
 /// grandchild process (e.g. Node spawned from a `.cmd` shim on Windows) can
@@ -329,8 +358,9 @@ fn is_already_reaped(_err: &std::io::Error) -> bool {
 /// Everything else in this module reads a snapshot or signals this task, which
 /// is what keeps `terminal/output`, `terminal/kill` and session teardown off
 /// the unbounded `Child::wait`. The task ends only once the process is **known**
-/// to be gone, so it never drops a possibly-live child (tokio does not kill on
-/// drop, and codeg never sets `kill_on_drop`).
+/// to be gone. Spawn uses `kill_on_drop(true)` so aborting this owner (or
+/// dropping `Child` on task cancel) does not leak the OS process; quit still
+/// also runs [`kill_all_registered_acp_terminals`].
 async fn own_terminal_process(terminal: Arc<TerminalInstance>, mut child: tokio::process::Child) {
     let pid = child.id();
     // Cumulative across every pass, never overwritten: a later `SIGKILL` pass
@@ -678,6 +708,7 @@ impl TerminalRuntime {
             }
         };
         self.configure_command(&mut command, &request);
+        command.kill_on_drop(true);
 
         let mut child = crate::process::spawn_retrying_exec_busy(|| command.spawn())
             .await
@@ -870,6 +901,19 @@ impl TerminalRuntime {
         futures::future::join_all(removed.into_iter().map(|terminal| async move {
             if let Err(err) = terminal.kill_command().await {
                 tracing::error!("[ACP] Failed to release terminal during cleanup: {err:?}");
+            }
+        }))
+        .await;
+    }
+
+    pub async fn kill_all(&self) {
+        let removed: Vec<Arc<TerminalInstance>> = {
+            let mut terminals = self.terminals.lock().await;
+            terminals.drain().map(|(_, term)| term).collect()
+        };
+        futures::future::join_all(removed.into_iter().map(|terminal| async move {
+            if let Err(err) = terminal.kill_command().await {
+                tracing::error!("[ACP] Failed to kill terminal during shutdown: {err:?}");
             }
         }))
         .await;

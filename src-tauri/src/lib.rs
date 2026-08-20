@@ -1699,6 +1699,9 @@ mod tauri_app {
                             crate::acp::termination::AcpDisconnectOrigin::ApplicationShutdown,
                         ));
                     }
+                    tauri::async_runtime::block_on(
+                        crate::acp::terminal_runtime::kill_all_registered_acp_terminals(),
+                    );
                     if let Some(delivery) =
                         app.try_state::<std::sync::Arc<crate::acp::DesktopAcpDelivery>>()
                     {

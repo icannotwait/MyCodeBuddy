@@ -7,6 +7,9 @@
 //! resumability failure. When the agent omits the id or returns blank, the
 //! gate emits the requested/expected id (standard ACP resume/load responses
 //! often omit `sessionId`).
+//!
+//! Default attach uses the same present-id mismatch rule so a confused agent
+//! cannot rewrite the durable session identity.
 
 use serde::{Deserialize, Serialize};
 
@@ -86,23 +89,16 @@ pub fn resume_existing_has_session_id(session_id: Option<&str>) -> bool {
 
 /// Gate `SessionStarted` publication for an attach mode.
 ///
-/// - **Default**: emit with the requested/expected external id (existing UX).
-/// - **ResumeExistingOnly**: own the identity matrix via
-///   [`verify_external_session_id`]. Omitted or blank agent-returned ids are
-///   treated as accept-and-emit the requested id. A **present** mismatched
-///   agent-returned id is [`SessionStartedDecision::RefuseUnresumable`]
-///   (no identity rewrite, no prompt, disconnect only the new incarnation,
-///   settle `failed`/`unresumable`). Never falls through to `session/new`.
+/// Omitted or blank agent-returned ids accept-and-emit the requested id.
+/// A **present** mismatched agent-returned id is
+/// [`SessionStartedDecision::RefuseUnresumable`] for every attach mode
+/// (Default used to ignore a present mismatch and rewrite identity).
+/// ResumeExistingOnly still never falls through to `session/new`.
 pub fn gate_session_started_for_attach(
-    mode: SessionAttachMode,
+    _mode: SessionAttachMode,
     expected_external_id: &str,
     agent_returned_session_id: Option<&str>,
 ) -> SessionStartedDecision {
-    if !mode.is_resume_existing_only() {
-        return SessionStartedDecision::Emit {
-            session_id: expected_external_id.trim().to_string(),
-        };
-    }
     let actual = agent_returned_session_id
         .map(str::trim)
         .filter(|s| !s.is_empty());
@@ -211,17 +207,29 @@ mod tests {
     }
 
     #[test]
-    fn gate_default_always_emits_expected() {
+    fn gate_default_emits_expected_when_agent_omits_id() {
         assert_eq!(
-            gate_session_started_for_attach(
-                SessionAttachMode::Default,
-                "sess-x",
-                Some("sess-other"),
-            ),
+            gate_session_started_for_attach(SessionAttachMode::Default, "sess-x", None),
             SessionStartedDecision::Emit {
                 session_id: "sess-x".into(),
             }
         );
+    }
+
+    #[test]
+    fn gate_default_refuses_present_mismatched_agent_id() {
+        match gate_session_started_for_attach(
+            SessionAttachMode::Default,
+            "sess-x",
+            Some("sess-other"),
+        ) {
+            SessionStartedDecision::RefuseUnresumable { reason } => {
+                assert!(reason.contains("mismatch"));
+                assert!(reason.contains("sess-x"));
+                assert!(reason.contains("sess-other"));
+            }
+            other => panic!("expected refuse, got {other:?}"),
+        }
     }
 
     #[test]

@@ -3728,10 +3728,7 @@ function prepareMappedEnvelope(
       actions.push({ type: "STATUS_CHANGED", contextKey, status: e.status })
       break
     case "content_delta":
-      if (
-        !e.parent_tool_use_id &&
-        snapshot.generationClockStartedAt == null
-      ) {
+      if (!e.parent_tool_use_id && snapshot.generationClockStartedAt == null) {
         actions.push({
           type: "GENERATION_CLOCK_START",
           contextKey,
@@ -3753,10 +3750,7 @@ function prepareMappedEnvelope(
       }
       break
     case "thinking":
-      if (
-        !e.parent_tool_use_id &&
-        snapshot.generationClockStartedAt == null
-      ) {
+      if (!e.parent_tool_use_id && snapshot.generationClockStartedAt == null) {
         actions.push({
           type: "GENERATION_CLOCK_START",
           contextKey,
@@ -3923,7 +3917,9 @@ function prepareMappedEnvelope(
         if (detailRefetch && conversationId != null) {
           useConversationRuntimeStore
             .getState()
-            .actions.refetchDetail(conversationId, { preserveLive: true })
+            .actions.refetchDetail(conversationId, {
+              preserveLive: statusAtPrepare === "prompting",
+            })
         }
         if (settled && settled.length > 0) {
           const agentLabel = getAgentLabel(agentType)
@@ -4350,7 +4346,8 @@ function prepareMappedEnvelope(
         snapshot.generationClockStartedAt != null
           ? endedAt - snapshot.generationClockStartedAt
           : 0
-      const durationMs = e.duration_ms && e.duration_ms > 0 ? e.duration_ms : measured
+      const durationMs =
+        e.duration_ms && e.duration_ms > 0 ? e.duration_ms : measured
       actions.push({
         type: "REQUEST_USAGE",
         contextKey,
@@ -6459,8 +6456,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
 
   const retryAttachNow = useCallback(
     (contextKey: string, isAuto = false) => {
-      const canonical =
-        observerAliasesRef.current.get(contextKey) ?? contextKey
+      const canonical = observerAliasesRef.current.get(contextKey) ?? contextKey
       const record = attachRetryRef.current.get(canonical)
       if (!record) return
       const conn = storeRef.current.connections.get(canonical)
@@ -6475,9 +6471,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             ? conn.lastAppliedSeq
             : record.sinceSeq
       const reconnectMode =
-        errorCode === "snapshot_budget_exceeded"
-          ? "cold"
-          : record.reconnectMode
+        errorCode === "snapshot_budget_exceeded" ? "cold" : record.reconnectMode
       dispatch({ type: "CLEAR_ATTACH_ERROR", contextKey: canonical })
       setupAttachSubscription(
         canonical,

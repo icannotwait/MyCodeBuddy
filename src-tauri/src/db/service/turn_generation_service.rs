@@ -155,10 +155,7 @@ mod tests {
 
     #[test]
     fn overlay_skips_already_stamped_assistant() {
-        let mut turns = vec![
-            turn("u0", TurnRole::User),
-            turn("a0", TurnRole::Assistant),
-        ];
+        let mut turns = vec![turn("u0", TurnRole::User), turn("a0", TurnRole::Assistant)];
         turns[1].generation_ms = Some(1);
         overlay_generation_stats(
             &mut turns,

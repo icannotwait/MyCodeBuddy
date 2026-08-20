@@ -1646,8 +1646,8 @@ earlier terminal context records.\n\
                 completed_at: None,
                 outcome: None,
                 autonomous_origin: None,
-            generation_ms: None,
-            generation_tokens: None,
+                generation_ms: None,
+                generation_tokens: None,
             },
             MessageTurn {
                 id: "turn-1".to_string(),
@@ -1666,8 +1666,8 @@ earlier terminal context records.\n\
                 completed_at: None,
                 outcome: None,
                 autonomous_origin: None,
-            generation_ms: None,
-            generation_tokens: None,
+                generation_ms: None,
+                generation_tokens: None,
             },
         ];
 

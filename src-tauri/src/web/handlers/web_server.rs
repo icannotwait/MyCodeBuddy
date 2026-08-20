@@ -53,7 +53,7 @@ pub async fn start_web_server(
     // In web mode, the server is already running (this handler itself is served by it).
     // This endpoint is mainly useful in Tauri mode. Return current status as a noop.
     let ws = &state.web_server_state;
-    if ws.running.load(std::sync::atomic::Ordering::Relaxed) {
+    if ws.inner.running.load(std::sync::atomic::Ordering::Relaxed) {
         if let Some(info) = do_get_web_server_status(ws) {
             return Ok(Json(info));
         }

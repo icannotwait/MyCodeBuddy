@@ -530,8 +530,8 @@ fn parse_session_events(text: &str) -> SessionParse {
                     reasoning_effort: None,
                     outcome: None,
                     autonomous_origin: None,
-            generation_ms: None,
-            generation_tokens: None,
+                    generation_ms: None,
+                    generation_tokens: None,
                 });
             }
             "request/header" => {

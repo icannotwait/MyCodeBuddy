@@ -225,16 +225,9 @@ async fn main() -> ExitCode {
     // When delegation is enabled, establish the authenticated ready lease
     // BEFORE serving stdio tools. Failure exits non-zero so the agent never
     // sees a half-ready companion.
-    let _ready_hold = if features.delegation {
+    let mut ready_hold = if features.delegation {
         match client_establish_ready_lease(&args.socket_path, &args.token).await {
-            Ok(hold) => {
-                // Keep the socket open in the background until peer close /
-                // process exit; dropping it on shutdown marks the lease closed.
-                let hold_task = tokio::spawn(async move {
-                    hold.wait_until_closed().await;
-                });
-                Some(hold_task)
-            }
+            Ok(hold) => Some(hold),
             Err(e) => {
                 let _ = writeln!(std::io::stderr(), "codeg-mcp: ready lease failed: {e}");
                 return ExitCode::from(3);
@@ -259,6 +252,14 @@ async fn main() -> ExitCode {
             None => Box::pin(std::future::pending()),
         };
     tokio::pin!(watchdog);
+
+    let lease_closed = async {
+        match ready_hold.take() {
+            Some(hold) => hold.wait_until_closed().await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(lease_closed);
 
     loop {
         tokio::select! {
@@ -285,6 +286,14 @@ async fn main() -> ExitCode {
                 // until the parent agent CLI also closes stdin — defeating
                 // the watchdog. The agent CLI sees the stdout pipe close
                 // and tears down its MCP client cleanly.
+                std::process::exit(0);
+            }
+            _ = &mut lease_closed => {
+                drain_and_cancel_all(&ctx, &inflight, "ready lease closed").await;
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "codeg-mcp: ready lease closed, shutting down"
+                );
                 std::process::exit(0);
             }
             line_result = lines.next_line() => {

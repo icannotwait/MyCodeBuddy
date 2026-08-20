@@ -750,8 +750,8 @@ fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn> {
                 completed_at: msg.completed_at,
                 outcome: None,
                 autonomous_origin: None,
-            generation_ms: None,
-            generation_tokens: None,
+                generation_ms: None,
+                generation_tokens: None,
             });
             i += 1;
         } else if matches!(msg.role, MessageRole::System) {
@@ -767,8 +767,8 @@ fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn> {
                 completed_at: msg.completed_at,
                 outcome: None,
                 autonomous_origin: None,
-            generation_ms: None,
-            generation_tokens: None,
+                generation_ms: None,
+                generation_tokens: None,
             });
             i += 1;
         } else {
@@ -809,8 +809,8 @@ fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn> {
                 completed_at,
                 outcome: None,
                 autonomous_origin: None,
-            generation_ms: None,
-            generation_tokens: None,
+                generation_ms: None,
+                generation_tokens: None,
             });
         }
     }
