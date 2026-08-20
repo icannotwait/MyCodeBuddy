@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
+use ignore::WalkBuilder;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::Serialize;
 use tokio::sync::mpsc;
@@ -18,7 +19,19 @@ use crate::web::event_bridge::{emit_event, EventEmitter};
 
 pub const WORKSPACE_STATE_PROTOCOL_VERSION: u16 = 1;
 
-const WATCH_IGNORED_DIRS: &[&str] = &["__pycache__"];
+const WATCH_IGNORED_DIRS: &[&str] = &[
+    "__pycache__",
+    "node_modules",
+    "target",
+    ".next",
+    ".turbo",
+    "coverage",
+    ".cache",
+    ".venv",
+    "venv",
+    "Pods",
+    ".gradle",
+];
 const WATCH_DEBOUNCE_MS: u64 = 300;
 const WATCH_MAX_BATCH_WINDOW_MS: u64 = 1_500;
 const WATCH_MAX_CHANGED_PATHS: usize = 2_000;
@@ -281,7 +294,7 @@ impl WorkspaceStateCore {
 struct WorkspaceStreamEntry {
     root_canonical: PathBuf,
     root_display: String,
-    watcher: Option<RecommendedWatcher>,
+    control_task: Option<tokio::task::JoinHandle<()>>,
     task: Option<tokio::task::JoinHandle<()>>,
     ref_count: usize,
     // Number of subscribers that consume tree/git snapshots (aux file tree,
@@ -638,6 +651,16 @@ fn is_ignored_watch_path(path: &Path, root: &Path) -> bool {
     })
 }
 
+fn watch_event_should_enqueue(event: &notify::Event, root: &Path) -> bool {
+    if event.paths.is_empty() {
+        return true;
+    }
+    event
+        .paths
+        .iter()
+        .any(|path| !is_ignored_watch_path(path, root))
+}
+
 /// A directory outside the working tree that holds git metadata for a linked
 /// worktree, paired with the logical `.git`-relative prefix its contents map
 /// onto. An event under `path` becomes `<logical_base>/<rel>` and then flows
@@ -701,17 +724,17 @@ fn classify_watch_path(
 
 /// External git-metadata dirs to watch for a linked worktree so its git status
 /// refreshes on stage/commit/checkout/reset/ref-move — none of which touch the
-/// working directory the recursive root watch covers.
+/// working directory the pruned worktree watches cover.
 ///
 /// A linked worktree keeps its mutable per-checkout metadata (`index`, `HEAD`,
 /// `ORIG_HEAD`) in a PRIVATE dir at `<main>/.git/worktrees/<name>`, and its
 /// branch refs in the SHARED `<main>/.git/refs` (a bare `update-ref` /
 /// `reset --soft` moves the current branch there without touching the private
-/// dir). Both are bounded — neither contains `objects/` — so recursively
-/// watching them is cheap and safe across platforms.
+/// dir). Both are bounded — neither contains `objects/` — and are registered
+/// as NonRecursive watches of only the allowed metadata directories.
 ///
-/// Returns empty for a normal repo (`.git` is a directory the root watch
-/// already covers), when `.git` is absent/unreadable, and for submodules /
+/// Returns empty for a normal repo (`.git` is a directory collected via
+/// [`collect_git_metadata_watch_dirs`]), when `.git` is absent/unreadable, and for submodules /
 /// other gitlinks: their `.git` file points at a FULL repository containing
 /// `objects/`, which is costly to recursively watch and out of scope here. The
 /// linked-worktree signature is the `commondir` file git writes into the
@@ -723,7 +746,8 @@ fn resolve_worktree_git_watch_dirs(root_canonical: &Path) -> Vec<GitWatchDir> {
     let Ok(meta) = std::fs::symlink_metadata(&dot_git) else {
         return Vec::new();
     };
-    // A normal repo's `.git` is a directory the root watch already covers.
+    // A normal repo's `.git` is a directory; metadata watches are collected
+    // separately so the object store is never registered.
     if !meta.file_type().is_file() {
         return Vec::new();
     }
@@ -789,6 +813,353 @@ fn resolve_worktree_git_watch_dirs(root_canonical: &Path) -> Vec<GitWatchDir> {
     }
 
     dirs
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WatchControlMessage {
+    RegisterSubtree(PathBuf),
+    Rebuild,
+}
+
+#[derive(Default)]
+struct WorkspaceWatchRegistration {
+    paths: HashSet<PathBuf>,
+}
+
+impl WorkspaceWatchRegistration {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn watch_path<W: Watcher>(&mut self, watcher: &mut W, path: &Path) -> notify::Result<bool> {
+        if !self.paths.insert(path.to_path_buf()) {
+            return Ok(false);
+        }
+        match watcher.watch(path, RecursiveMode::NonRecursive) {
+            Ok(()) => Ok(true),
+            Err(err) => {
+                self.paths.remove(path);
+                Err(err)
+            }
+        }
+    }
+
+    fn watch_all<W: Watcher>(
+        &mut self,
+        watcher: &mut W,
+        dirs: impl IntoIterator<Item = PathBuf>,
+    ) -> notify::Result<()> {
+        let mut first_err = None;
+        for dir in dirs {
+            if let Err(err) = self.watch_path(watcher, &dir) {
+                if first_err.is_none() {
+                    first_err = Some(err);
+                }
+            }
+        }
+        match first_err {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    }
+
+    fn rebuild<W: Watcher>(&mut self, watcher: &mut W, dirs: Vec<PathBuf>) -> notify::Result<()> {
+        let new_paths: HashSet<PathBuf> = dirs.into_iter().collect();
+        let to_unwatch: Vec<PathBuf> = self.paths.difference(&new_paths).cloned().collect();
+        let to_watch: Vec<PathBuf> = new_paths.difference(&self.paths).cloned().collect();
+        for old in &to_unwatch {
+            let _ = watcher.unwatch(old);
+        }
+        for new_dir in &to_watch {
+            watcher.watch(new_dir, RecursiveMode::NonRecursive)?;
+        }
+        self.paths = new_paths;
+        Ok(())
+    }
+}
+
+fn canonicalize_watch_dir(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn is_hard_excluded_watch_dir_name(name: &str) -> bool {
+    WATCH_IGNORED_DIRS.iter().any(|ignored| *ignored == name)
+}
+
+fn is_git_info_watch_path(relative: &Path) -> bool {
+    let mut components = relative.components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(git)), Some(Component::Normal(info))) => {
+            git.to_string_lossy() == ".git" && info.to_string_lossy() == "info"
+        }
+        _ => false,
+    }
+}
+
+fn collect_allowed_git_subtree(dir: &Path, logical: &Path, out: &mut Vec<PathBuf>) {
+    if !dir.is_dir() {
+        return;
+    }
+    out.push(dir.to_path_buf());
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let child_logical = logical.join(entry.file_name());
+        if is_allowed_git_watch_path(&child_logical) || is_git_info_watch_path(&child_logical) {
+            collect_allowed_git_subtree(&entry.path(), &child_logical, out);
+        }
+    }
+}
+
+fn collect_git_metadata_watch_dirs(root: &Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let linked = resolve_worktree_git_watch_dirs(root);
+    if !linked.is_empty() {
+        for git_dir in &linked {
+            collect_allowed_git_subtree(&git_dir.path, Path::new(git_dir.logical_base), &mut dirs);
+        }
+        if let Some(private) = linked.first() {
+            if let Ok(commondir_raw) = std::fs::read_to_string(private.path.join("commondir")) {
+                let commondir_raw = commondir_raw.trim();
+                if !commondir_raw.is_empty() {
+                    let common = PathBuf::from(commondir_raw);
+                    let common = if common.is_absolute() {
+                        common
+                    } else {
+                        private.path.join(common)
+                    };
+                    let info = common.join("info");
+                    if info.is_dir() {
+                        dirs.push(info);
+                    }
+                }
+            }
+        }
+        return dirs;
+    }
+
+    let git_dir = root.join(".git");
+    if git_dir.is_dir() {
+        collect_allowed_git_subtree(&git_dir, Path::new(".git"), &mut dirs);
+    }
+    dirs
+}
+
+fn watch_directory_walk_builder(root: &Path) -> WalkBuilder {
+    let mut builder = WalkBuilder::new(root);
+    builder
+        .hidden(false)
+        .follow_links(false)
+        .git_ignore(true)
+        .git_global(false)
+        .git_exclude(true)
+        .ignore(true)
+        .parents(true)
+        .require_git(false)
+        .filter_entry(|entry| {
+            if entry.depth() == 0 {
+                return true;
+            }
+            let name = entry.file_name().to_string_lossy();
+            if name.as_ref() == ".git" {
+                return false;
+            }
+            let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+            is_dir && !is_hard_excluded_watch_dir_name(name.as_ref())
+        });
+    builder
+}
+
+fn start_path_should_not_be_watched(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    if name == ".git" || is_hard_excluded_watch_dir_name(name) {
+        return true;
+    }
+    dir_excluded_by_parent_ignore(path)
+}
+
+fn dir_excluded_by_parent_ignore(path: &Path) -> bool {
+    let mut dir = match path.parent() {
+        Some(parent) => parent.to_path_buf(),
+        None => return false,
+    };
+
+    loop {
+        for ignore_name in [".gitignore", ".ignore"] {
+            if ignore_file_excludes_dir(&dir.join(ignore_name), path, &dir) {
+                return true;
+            }
+        }
+        if ignore_file_excludes_dir(&dir.join(".git").join("info").join("exclude"), path, &dir) {
+            return true;
+        }
+        if dir.join(".git").exists() {
+            break;
+        }
+        if !dir.pop() {
+            break;
+        }
+    }
+    false
+}
+
+fn ignore_file_excludes_dir(ignore_file: &Path, path: &Path, gitignore_root: &Path) -> bool {
+    if !ignore_file.is_file() {
+        return false;
+    }
+    let Ok(relative) = path.strip_prefix(gitignore_root) else {
+        return false;
+    };
+    let mut builder = ignore::gitignore::GitignoreBuilder::new(gitignore_root);
+    if builder.add(ignore_file).is_some() {
+        return false;
+    }
+    let Ok(gi) = builder.build() else {
+        return false;
+    };
+    gi.matched(relative, true).is_ignore()
+}
+
+fn collect_watch_directories(root: &Path) -> Result<Vec<PathBuf>, AppCommandError> {
+    if start_path_should_not_be_watched(root) {
+        return Ok(Vec::new());
+    }
+
+    let mut dirs = HashSet::new();
+    let mut walk_err: Option<String> = None;
+
+    for result in watch_directory_walk_builder(root).build() {
+        match result {
+            Ok(entry) => {
+                let is_dir = entry
+                    .file_type()
+                    .map(|ft| ft.is_dir())
+                    .unwrap_or(entry.depth() == 0);
+                if is_dir {
+                    dirs.insert(canonicalize_watch_dir(entry.path()));
+                }
+            }
+            Err(err) => {
+                if walk_err.is_none() {
+                    walk_err = Some(err.to_string());
+                }
+            }
+        }
+    }
+
+    if dirs.is_empty() {
+        if let Some(err) = walk_err {
+            return Err(
+                AppCommandError::io_error("Failed to collect watch directories").with_detail(err),
+            );
+        }
+    }
+
+    for git_dir in collect_git_metadata_watch_dirs(root) {
+        dirs.insert(canonicalize_watch_dir(&git_dir));
+    }
+
+    Ok(dirs.into_iter().collect())
+}
+
+fn is_watch_rebuild_path(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    if matches!(name, ".gitignore" | ".ignore") {
+        return true;
+    }
+    if name == "exclude" {
+        return path
+            .parent()
+            .and_then(|parent| parent.file_name())
+            .and_then(|parent| parent.to_str())
+            == Some("info");
+    }
+    false
+}
+
+fn should_register_subtree(kind: &EventKind, path: &Path) -> bool {
+    match kind {
+        EventKind::Create(notify::event::CreateKind::Folder) => true,
+        EventKind::Create(_) => path.is_dir(),
+        EventKind::Modify(notify::event::ModifyKind::Name(notify::event::RenameMode::From)) => {
+            false
+        }
+        EventKind::Modify(notify::event::ModifyKind::Name(_)) => path.is_dir(),
+        _ => false,
+    }
+}
+
+fn watch_control_messages(event: &notify::Event) -> Vec<WatchControlMessage> {
+    if event.paths.iter().any(|path| is_watch_rebuild_path(path)) {
+        return vec![WatchControlMessage::Rebuild];
+    }
+    event
+        .paths
+        .iter()
+        .filter(|path| should_register_subtree(&event.kind, path))
+        .map(|path| WatchControlMessage::RegisterSubtree(path.clone()))
+        .collect()
+}
+
+async fn run_watch_registration_loop(
+    mut watcher: RecommendedWatcher,
+    mut registration: WorkspaceWatchRegistration,
+    mut control_rx: mpsc::UnboundedReceiver<WatchControlMessage>,
+    root: PathBuf,
+) {
+    while let Some(message) = control_rx.recv().await {
+        match message {
+            WatchControlMessage::RegisterSubtree(path) => match collect_watch_directories(&path) {
+                Ok(dirs) => {
+                    for dir in dirs {
+                        if let Err(err) = registration.watch_path(&mut watcher, &dir) {
+                            tracing::info!(
+                                "[workspace-state-watch] subtree watch failed for {}: {}",
+                                dir.display(),
+                                err
+                            );
+                        }
+                    }
+                }
+                Err(err) => {
+                    tracing::info!(
+                        "[workspace-state-watch] subtree collect failed for {}: {}",
+                        path.display(),
+                        err
+                    );
+                }
+            },
+            WatchControlMessage::Rebuild => match collect_watch_directories(&root) {
+                Ok(dirs) => {
+                    if let Err(err) = registration.rebuild(&mut watcher, dirs) {
+                        tracing::info!(
+                            "[workspace-state-watch] rebuild failed for {}: {}",
+                            root.display(),
+                            err
+                        );
+                    }
+                }
+                Err(err) => {
+                    tracing::info!(
+                        "[workspace-state-watch] rebuild collect failed for {}: {}",
+                        root.display(),
+                        err
+                    );
+                }
+            },
+        }
+    }
 }
 
 fn should_emit_watch_event(kind: &EventKind) -> bool {
@@ -1323,10 +1694,11 @@ pub async fn start_workspace_state_stream_core(
     let initial_is_git_repo = is_git_repo(&root_canonical);
     // A linked worktree's mutable git metadata (index/HEAD in a private dir,
     // branch refs in the shared refs dir) lives OUTSIDE the working dir, so the
-    // recursive root watch below never sees a commit / stage / checkout /
-    // ref-move there. Resolve those external dirs now so we can add extra
-    // watches and map their events back onto this root (see
-    // `classify_watch_path`). Empty for a normal repo (already covered).
+    // pruned worktree watches never see a commit / stage / checkout /
+    // ref-move there. Resolve those external dirs now so we can map their
+    // events back onto this root (see `classify_watch_path`) and so
+    // `collect_watch_directories` can register them NonRecursive. Empty for a
+    // normal repo (in-tree `.git` metadata is collected separately).
     let git_watch_dirs = if initial_is_git_repo {
         resolve_worktree_git_watch_dirs(&root_canonical)
     } else {
@@ -1377,18 +1749,29 @@ pub async fn start_workspace_state_stream_core(
         .await;
     }));
 
+    let (control_tx, control_rx) = mpsc::unbounded_channel::<WatchControlMessage>();
+    let mut control_rx = Some(control_rx);
     let root_display_for_error = root_path.clone();
     let dropped_events_for_callback = Arc::clone(&dropped_events);
+    let root_canonical_for_callback = root_canonical.clone();
     let mut watcher = Some(
         notify::recommended_watcher(
             move |result: Result<notify::Event, notify::Error>| match result {
-                Ok(event) => match event_tx.try_send(event) {
-                    Ok(()) => {}
-                    Err(TrySendError::Full(_)) => {
-                        dropped_events_for_callback.store(true, Ordering::Release);
+                Ok(event) => {
+                    for message in watch_control_messages(&event) {
+                        let _ = control_tx.send(message);
                     }
-                    Err(TrySendError::Closed(_)) => {}
-                },
+                    if !watch_event_should_enqueue(&event, &root_canonical_for_callback) {
+                        return;
+                    }
+                    match event_tx.try_send(event) {
+                        Ok(()) => {}
+                        Err(TrySendError::Full(_)) => {
+                            dropped_events_for_callback.store(true, Ordering::Release);
+                        }
+                        Err(TrySendError::Closed(_)) => {}
+                    }
+                }
                 Err(err) => {
                     tracing::error!(
                         "[workspace-state-watch] failed event for {}: {}",
@@ -1404,44 +1787,54 @@ pub async fn start_workspace_state_stream_core(
         })?,
     );
 
-    let watch_result = watcher
-        .as_mut()
-        .ok_or_else(|| AppCommandError::task_execution_failed("Failed to create watcher"))?
-        .watch(&root_canonical, RecursiveMode::Recursive);
+    let mut registration = WorkspaceWatchRegistration::new();
+    let watch_dirs = match collect_watch_directories(&root_canonical) {
+        Ok(dirs) if !dirs.is_empty() => dirs,
+        Ok(_) => vec![root_canonical.clone()],
+        Err(err) => {
+            tracing::info!(
+                "[workspace-state-watch] collect watch directories failed for {}: {}",
+                root_path,
+                err
+            );
+            vec![root_canonical.clone()]
+        }
+    };
 
-    if let Err(err) = watch_result {
+    let mut root_registered = false;
+    if let Some(active_watcher) = watcher.as_mut() {
+        if let Err(err) = registration.watch_all(active_watcher, watch_dirs) {
+            tracing::info!(
+                "[workspace-state-watch] some directory watches failed for {}: {}",
+                root_path,
+                err
+            );
+        }
+        root_registered = registration.paths.contains(&root_canonical);
+    }
+
+    let mut control_task = None;
+    if !root_registered {
         tracing::info!(
-            "[workspace-state-watch] degraded (no realtime updates) for {}: {}",
-            root_path,
-            err
+            "[workspace-state-watch] degraded (no realtime updates) for {}",
+            root_path
         );
         if let Some(mut created_watcher) = watcher.take() {
             let _ = created_watcher.unwatch(&root_canonical);
         }
+        control_rx.take();
         if let Some(created_task) = task.take() {
             created_task.abort();
         }
         if let Ok(mut guard) = state.lock() {
             guard.degraded = true;
         }
-    } else if let Some(active_watcher) = watcher.as_mut() {
-        // Root watch is live; also watch the linked worktree's external git
-        // metadata dirs (private index/HEAD + shared refs) so commit / stage /
-        // checkout / ref-move refresh git status. Best-effort per dir: a failure
-        // only loses that refresh path (working-tree edits still update), so we
-        // log and keep the stream healthy rather than degrading it. Cleanup
-        // rides on the watcher's Drop, which unwatches every registered path —
-        // no separate bookkeeping needed.
-        for dir in &git_watch_dirs {
-            if let Err(err) = active_watcher.watch(&dir.path, RecursiveMode::Recursive) {
-                tracing::info!(
-                    "[workspace-state-watch] worktree git-dir watch failed for {} ({}): {}",
-                    root_path,
-                    dir.path.display(),
-                    err
-                );
-            }
-        }
+    } else if let (Some(active_watcher), Some(control_rx)) = (watcher.take(), control_rx.take()) {
+        let root_for_control = root_canonical.clone();
+        control_task = Some(tokio::spawn(async move {
+            run_watch_registration_loop(active_watcher, registration, control_rx, root_for_control)
+                .await;
+        }));
     }
 
     let (should_cleanup_new_stream, start_snapshot, lost_race_upgrade) = {
@@ -1482,7 +1875,7 @@ pub async fn start_workspace_state_stream_core(
                 WorkspaceStreamEntry {
                     root_canonical: root_canonical.clone(),
                     root_display: root_path,
-                    watcher: watcher.take(),
+                    control_task: control_task.take(),
                     task: task.take(),
                     ref_count: 1,
                     full_subscribers: Arc::clone(&full_subscribers),
@@ -1494,6 +1887,9 @@ pub async fn start_workspace_state_stream_core(
     };
 
     if should_cleanup_new_stream {
+        if let Some(created_control) = control_task.take() {
+            created_control.abort();
+        }
         if let Some(mut created_watcher) = watcher.take() {
             let _ = created_watcher.unwatch(&root_canonical);
         }
@@ -1567,9 +1963,8 @@ pub async fn stop_workspace_state_stream_core(
     drop(streams);
 
     if let Some(mut entry) = removed_entry.take() {
-        if let Some(mut watcher) = entry.watcher.take() {
-            let _ = watcher.unwatch(&entry.root_canonical);
-            drop(watcher);
+        if let Some(control_task) = entry.control_task.take() {
+            control_task.abort();
         }
         if let Some(task) = entry.task.take() {
             task.abort();
@@ -1726,6 +2121,51 @@ mod tests {
             batch.changed_paths.insert((*path).to_string());
         }
         batch
+    }
+
+    #[test]
+    fn ignored_watch_paths_skip_heavy_build_dirs() {
+        let root = Path::new("/workspace");
+        assert!(is_ignored_watch_path(
+            &root.join("node_modules").join("pkg").join("index.js"),
+            root
+        ));
+        assert!(is_ignored_watch_path(
+            &root.join("target").join("debug").join("codeg"),
+            root
+        ));
+        assert!(is_ignored_watch_path(
+            &root.join(".next").join("cache"),
+            root
+        ));
+        assert!(is_ignored_watch_path(
+            &root.join("coverage").join("lcov.info"),
+            root
+        ));
+        assert!(!is_ignored_watch_path(
+            &root.join("src").join("main.rs"),
+            root
+        ));
+        assert!(!is_ignored_watch_path(&root.join("Cargo.toml"), root));
+        assert!(
+            !is_ignored_watch_path(&root.join("dist").join("out.js"), root),
+            "generic dist/ can be a source tree"
+        );
+        assert!(
+            !is_ignored_watch_path(&root.join("build").join("lib.rs"), root),
+            "generic build/ can be a source tree"
+        );
+    }
+
+    #[test]
+    fn watch_callback_drops_ignored_paths_before_enqueue() {
+        let root = Path::new("/workspace");
+        let mut ignored = notify::Event::new(notify::EventKind::Any);
+        ignored.paths = vec![root.join("node_modules").join("pkg").join("index.js")];
+        assert!(!watch_event_should_enqueue(&ignored, root));
+        let mut kept = notify::Event::new(notify::EventKind::Any);
+        kept.paths = vec![root.join("src").join("main.rs")];
+        assert!(watch_event_should_enqueue(&kept, root));
     }
 
     #[tokio::test]
@@ -2320,5 +2760,307 @@ mod tests {
         // `.git/index` is git-metadata → drives a git-status refresh, exactly
         // like a normal repo's in-tree `.git/index`.
         assert!(is_git_metadata_rel_path(".git/index"));
+    }
+
+    fn rel_watch_dirs(root: &Path, dirs: &[PathBuf]) -> HashSet<String> {
+        dirs.iter()
+            .filter_map(|path| {
+                let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+                if path == root {
+                    return Some(".".to_string());
+                }
+                path.strip_prefix(root)
+                    .ok()
+                    .map(|rel| normalize_slash_path(rel))
+            })
+            .collect()
+    }
+
+    fn path_has_component(path: &Path, name: &str) -> bool {
+        path.components()
+            .any(|component| matches!(component, Component::Normal(part) if part == name))
+    }
+
+    /// Linked worktree plus source, hidden, heavy, gitignored, and object-store
+    /// trees. Heavy dirs contain enough children that a recursive registration
+    /// list would be obviously wrong.
+    fn make_pruned_watch_fixture(root: &Path) -> (PathBuf, PathBuf, PathBuf) {
+        let (worktree, private, common_refs) = make_worktree_layout(root);
+        std::fs::create_dir_all(worktree.join("src/app")).expect("src/app");
+        std::fs::create_dir_all(worktree.join(".github/workflows")).expect(".github");
+        std::fs::write(worktree.join(".gitignore"), "secret_build/\n").expect("gitignore");
+        std::fs::create_dir_all(worktree.join("secret_build/nested")).expect("gitignored dir");
+
+        let node_modules = worktree.join("node_modules").join("pkg");
+        for i in 0..1_200 {
+            std::fs::create_dir_all(node_modules.join(format!("d{i}")))
+                .expect("node_modules child");
+        }
+        for i in 0..40 {
+            std::fs::create_dir_all(worktree.join("target").join(format!("crate{i}")))
+                .expect("target child");
+            std::fs::create_dir_all(worktree.join(".next").join(format!("cache{i}")))
+                .expect(".next child");
+        }
+
+        std::fs::create_dir_all(common_refs.join("tags")).expect("refs/tags");
+        let objects = root.join("main/.git/objects");
+        for i in 0..32 {
+            std::fs::create_dir_all(objects.join(format!("{i:02x}"))).expect("git objects");
+        }
+
+        (worktree, private, common_refs)
+    }
+
+    #[test]
+    fn collect_watch_directories_returns_root_and_allowed_dirs_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let layout_root = std::fs::canonicalize(dir.path()).expect("canonicalize layout");
+        let (worktree, private, common_refs) = make_pruned_watch_fixture(&layout_root);
+
+        let dirs = collect_watch_directories(&worktree).expect("collect watch dirs");
+        let rels = rel_watch_dirs(&worktree, &dirs);
+
+        assert!(rels.contains("."), "workspace root must be registered");
+        assert!(rels.contains("src"), "source dirs must be registered");
+        assert!(rels.contains("src/app"));
+        assert!(rels.contains(".github"), "ordinary hidden source dirs stay");
+        assert!(rels.contains(".github/workflows"));
+
+        for forbidden in ["node_modules", "target", ".next", "secret_build"] {
+            assert!(
+                !dirs.iter().any(|path| path_has_component(path, forbidden)),
+                "{forbidden} must not receive a watch descriptor"
+            );
+        }
+        assert!(
+            !dirs.iter().any(|path| path_has_component(path, "objects")),
+            "git object store must not be registered"
+        );
+        assert!(
+            !rels.iter().any(|rel| rel.starts_with("secret_build")),
+            "gitignored tree must be omitted"
+        );
+
+        let private = std::fs::canonicalize(&private).expect("canon private");
+        let common_refs = std::fs::canonicalize(&common_refs).expect("canon refs");
+        let heads = std::fs::canonicalize(common_refs.join("heads")).expect("canon heads");
+        assert!(
+            dirs.iter().any(|path| {
+                std::fs::canonicalize(path)
+                    .map(|p| p == private)
+                    .unwrap_or(false)
+            }),
+            "linked-worktree private metadata dir must be registered"
+        );
+        assert!(
+            dirs.iter().any(|path| {
+                std::fs::canonicalize(path)
+                    .map(|p| p == common_refs)
+                    .unwrap_or(false)
+            }),
+            "linked-worktree shared refs dir must be registered"
+        );
+        assert!(
+            dirs.iter().any(|path| {
+                std::fs::canonicalize(path)
+                    .map(|p| p == heads)
+                    .unwrap_or(false)
+            }),
+            "refs/heads must be registered for non-recursive coverage"
+        );
+        assert!(
+            !dirs.iter().any(|path| path_has_component(path, "tags")),
+            "refs/tags is not status-relevant and must not be registered"
+        );
+    }
+
+    #[test]
+    fn collect_watch_directories_converges_after_gitignore_change() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(dir.path()).expect("canonicalize root");
+        std::fs::create_dir_all(root.join("src")).expect("src");
+        std::fs::create_dir_all(root.join("generated/out")).expect("generated");
+        std::fs::write(root.join(".gitignore"), "").expect("empty gitignore");
+
+        let before = collect_watch_directories(&root).expect("collect before");
+        let before_rels = rel_watch_dirs(&root, &before);
+        assert!(before_rels.contains("generated"));
+        assert!(before_rels.contains("src"));
+
+        std::fs::write(root.join(".gitignore"), "generated/\n").expect("ignore generated");
+        let after = collect_watch_directories(&root).expect("collect after");
+        let after_rels = rel_watch_dirs(&root, &after);
+        assert!(!after_rels.contains("generated"));
+        assert!(!after_rels.iter().any(|rel| rel.starts_with("generated/")));
+        assert!(after_rels.contains("src"));
+        assert!(after_rels.contains("."));
+    }
+
+    #[test]
+    fn collect_watch_directories_skips_heavy_or_gitignored_start_paths() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(dir.path()).expect("canonicalize root");
+        std::fs::write(root.join(".gitignore"), "secret_build/\n").expect("gitignore");
+        std::fs::create_dir_all(root.join("src")).expect("src");
+        std::fs::create_dir_all(root.join("secret_build/nested")).expect("gitignored dir");
+        std::fs::create_dir_all(root.join("node_modules/pkg")).expect("node_modules");
+
+        let ignored = collect_watch_directories(&root.join("secret_build"))
+            .expect("collect gitignored start");
+        assert!(
+            ignored.is_empty(),
+            "RegisterSubtree on a gitignored dir must not register it"
+        );
+
+        let heavy =
+            collect_watch_directories(&root.join("node_modules")).expect("collect heavy start");
+        assert!(
+            heavy.is_empty(),
+            "RegisterSubtree on a hard-excluded dir must not register it"
+        );
+
+        let src = std::fs::canonicalize(root.join("src")).expect("canon src");
+        let allowed = collect_watch_directories(&src).expect("collect src");
+        assert!(
+            allowed
+                .iter()
+                .any(|path| std::fs::canonicalize(path).ok().as_ref() == Some(&src)),
+            "allowed subtree starts must still be registered"
+        );
+    }
+
+    #[derive(Default)]
+    struct RecordingWatcher {
+        watch_calls: Vec<(PathBuf, RecursiveMode)>,
+        unwatch_calls: Vec<PathBuf>,
+    }
+
+    impl notify::Watcher for RecordingWatcher {
+        fn new<F: notify::EventHandler>(
+            _event_handler: F,
+            _config: notify::Config,
+        ) -> notify::Result<Self> {
+            Ok(Self::default())
+        }
+
+        fn watch(&mut self, path: &Path, recursive_mode: RecursiveMode) -> notify::Result<()> {
+            self.watch_calls.push((path.to_path_buf(), recursive_mode));
+            Ok(())
+        }
+
+        fn unwatch(&mut self, path: &Path) -> notify::Result<()> {
+            self.unwatch_calls.push(path.to_path_buf());
+            Ok(())
+        }
+
+        fn kind() -> notify::WatcherKind {
+            notify::WatcherKind::NullWatcher
+        }
+    }
+
+    #[test]
+    fn workspace_watch_registration_does_not_double_register_on_rescan() {
+        let mut registration = WorkspaceWatchRegistration::new();
+        let mut watcher = RecordingWatcher::default();
+        let src = PathBuf::from("/workspace/src");
+        let root = PathBuf::from("/workspace");
+
+        registration
+            .watch_all(&mut watcher, [root.clone(), src.clone()])
+            .expect("first scan");
+        registration
+            .watch_all(&mut watcher, [root, src.clone()])
+            .expect("duplicate rescan");
+
+        let src_watches = watcher
+            .watch_calls
+            .iter()
+            .filter(|(path, _)| path == &src)
+            .count();
+        assert_eq!(src_watches, 1, "duplicate rescan must not double-register");
+        assert!(
+            watcher
+                .watch_calls
+                .iter()
+                .all(|(_, mode)| *mode == RecursiveMode::NonRecursive),
+            "every worktree directory must use NonRecursive"
+        );
+    }
+
+    #[test]
+    fn workspace_watch_registration_rebuild_drops_removed_directories() {
+        let mut registration = WorkspaceWatchRegistration::new();
+        let mut watcher = RecordingWatcher::default();
+        let root = PathBuf::from("/workspace");
+        let src = PathBuf::from("/workspace/src");
+        let generated = PathBuf::from("/workspace/generated");
+
+        registration
+            .watch_all(&mut watcher, [root.clone(), src.clone(), generated.clone()])
+            .expect("initial register");
+        watcher.watch_calls.clear();
+
+        registration
+            .rebuild(&mut watcher, vec![root, src])
+            .expect("rebuild");
+
+        assert_eq!(watcher.unwatch_calls, vec![generated]);
+        assert!(
+            watcher.watch_calls.is_empty(),
+            "kept directories must not be registered again"
+        );
+    }
+
+    #[test]
+    fn directory_create_emits_register_subtree_control_message() {
+        let mut event = notify::Event::new(EventKind::Create(notify::event::CreateKind::Folder));
+        event.paths.push(PathBuf::from("/workspace/src/new_mod"));
+        assert_eq!(
+            watch_control_messages(&event),
+            vec![WatchControlMessage::RegisterSubtree(PathBuf::from(
+                "/workspace/src/new_mod"
+            ))]
+        );
+    }
+
+    #[test]
+    fn ignore_file_change_emits_rebuild_control_message() {
+        for name in [".gitignore", ".ignore"] {
+            let mut event = notify::Event::new(EventKind::Modify(notify::event::ModifyKind::Data(
+                notify::event::DataChange::Any,
+            )));
+            event
+                .paths
+                .push(PathBuf::from(format!("/workspace/{name}")));
+            assert_eq!(
+                watch_control_messages(&event),
+                vec![WatchControlMessage::Rebuild],
+                "{name} changes must rebuild registration"
+            );
+        }
+    }
+
+    #[test]
+    fn git_exclude_change_emits_rebuild_control_message() {
+        let mut event = notify::Event::new(EventKind::Modify(notify::event::ModifyKind::Data(
+            notify::event::DataChange::Any,
+        )));
+        event
+            .paths
+            .push(PathBuf::from("/workspace/.git/info/exclude"));
+        assert_eq!(
+            watch_control_messages(&event),
+            vec![WatchControlMessage::Rebuild]
+        );
+    }
+
+    #[test]
+    fn ordinary_file_modify_does_not_emit_watch_control_message() {
+        let mut event = notify::Event::new(EventKind::Modify(notify::event::ModifyKind::Data(
+            notify::event::DataChange::Any,
+        )));
+        event.paths.push(PathBuf::from("/workspace/src/main.rs"));
+        assert!(watch_control_messages(&event).is_empty());
     }
 }
