@@ -13857,22 +13857,13 @@ mod tests {
             s.active_turn_generation = Some(1);
             s.turn_in_flight = true;
             // Seed a status-looking tool so a scan would find it — must not.
-            s.active_tool_calls.insert(
-                "scannable-status".into(),
-                crate::acp::session_state::ToolCallState {
-                    id: "scannable-status".into(),
-                    kind: crate::acp::session_state::ToolKind::Other,
-                    label: "codeg-mcp__get_delegation_status".into(),
-                    status: crate::acp::session_state::ToolCallStatus::InProgress,
-                    input: None,
-                    output: None,
-                    content: None,
-                    locations: None,
-                    meta: None,
-                    images: Vec::new(),
-                    raw_input_chunks: Vec::new(),
-                },
-            );
+            let mut scannable = crate::acp::session_state::ToolCallState::default();
+            scannable.id = "scannable-status".into();
+            scannable.kind = crate::acp::session_state::ToolKind::Other;
+            scannable.label = "codeg-mcp__get_delegation_status".into();
+            scannable.status = crate::acp::session_state::ToolCallStatus::InProgress;
+            s.active_tool_calls
+                .insert("scannable-status".into(), scannable);
         }
         let attr = LeaseAttribution::new(mgr.tool_lease_registry());
         let t0 = WatchdogInstant {
