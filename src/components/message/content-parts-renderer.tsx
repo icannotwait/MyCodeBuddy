@@ -21,7 +21,8 @@ import { parseBackgroundLaunch } from "@/lib/background-task"
 import { normalizePriority, normalizeStatus } from "@/lib/plan-parse"
 import { isDelegateToAgentToolName } from "@/lib/delegation-card"
 import { useTranslations } from "next-intl"
-import { cn } from "@/lib/utils"
+import { toast } from "sonner"
+import { cn, copyTextToClipboard } from "@/lib/utils"
 import {
   countUnifiedDiffLineChanges,
   estimateChangedLineStats,
@@ -1476,6 +1477,36 @@ export function parseReadOutput(raw: string): {
   return { startLine: 1, content: raw }
 }
 
+/** Split at most `maxLines` without materializing the rest of a large file. */
+function takeRenderedFileLines(
+  content: string,
+  maxLines: number
+): { lines: string[]; hiddenCount: number } {
+  const lines: string[] = []
+  let start = 0
+  while (lines.length < maxLines) {
+    const nl = content.indexOf("\n", start)
+    if (nl === -1) {
+      lines.push(content.slice(start))
+      return { lines, hiddenCount: 0 }
+    }
+    lines.push(content.slice(start, nl))
+    start = nl + 1
+  }
+  let hiddenCount = 0
+  let i = start
+  while (i < content.length) {
+    const nl = content.indexOf("\n", i)
+    if (nl === -1) {
+      hiddenCount += 1
+      break
+    }
+    hiddenCount += 1
+    i = nl + 1
+  }
+  return { lines, hiddenCount }
+}
+
 /** Lightweight file content viewer with line numbers */
 function FileContentLines({
   content,
@@ -1487,7 +1518,12 @@ function FileContentLines({
   /** "added" tints every line green to indicate new content (e.g. Write tool). */
   highlight?: "added"
 }) {
-  const lines = useMemo(() => content.split("\n"), [content])
+  const t = useTranslations("Folder.chat.contentParts")
+  const MAX_RENDERED_LINES = 400
+  const { lines: visible, hiddenCount } = useMemo(
+    () => takeRenderedFileLines(content, MAX_RENDERED_LINES),
+    [content]
+  )
   const rowClass =
     highlight === "added"
       ? "flex bg-green-500/10 text-green-900 dark:text-green-300"
@@ -1495,7 +1531,7 @@ function FileContentLines({
 
   return (
     <div className="inline-block min-w-full font-mono text-[12px] leading-[20px]">
-      {lines.map((line, i) => (
+      {visible.map((line, i) => (
         <div key={i} className={rowClass}>
           <span className="w-[3.5rem] shrink-0 select-none pr-1 text-right text-muted-foreground/40">
             {startLine + i}
@@ -1503,6 +1539,23 @@ function FileContentLines({
           <span className="flex-1 whitespace-pre pr-3">{line}</span>
         </div>
       ))}
+      {hiddenCount > 0 ? (
+        <div className="flex items-center gap-2 px-3 py-1 text-[11px] text-muted-foreground">
+          <span>{t("moreLines", { count: hiddenCount })}</span>
+          <button
+            type="button"
+            className="underline underline-offset-2 hover:text-foreground"
+            onClick={() => {
+              void (async () => {
+                const copied = await copyTextToClipboard(content)
+                if (!copied) toast.error(t("copyFailed"))
+              })()
+            }}
+          >
+            {t("copyAll")}
+          </button>
+        </div>
+      ) : null}
     </div>
   )
 }

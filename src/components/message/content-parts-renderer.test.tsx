@@ -1,6 +1,8 @@
-import { act, fireEvent, render, screen } from "@testing-library/react"
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { NextIntlClientProvider } from "next-intl"
+import { toast } from "sonner"
 import { beforeEach, describe, expect, it, vi } from "vitest"
+import { copyTextToClipboard } from "@/lib/utils"
 import type {
   AdaptedContentPart,
   AdaptedGoalRunPart,
@@ -56,6 +58,18 @@ vi.mock("@/components/diff/unified-diff-preview", () => ({
     <div data-testid="unified-diff">{diffText}</div>
   ),
 }))
+
+vi.mock("sonner", () => ({
+  toast: {
+    success: vi.fn(),
+    error: vi.fn(),
+  },
+}))
+
+vi.mock("@/lib/utils", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/utils")>()
+  return { ...actual, copyTextToClipboard: vi.fn().mockResolvedValue(true) }
+})
 
 vi.mock("./delegated-sub-thread", () => ({
   DelegatedSubThread: ({
@@ -462,5 +476,53 @@ describe("ContentPartsRenderer thinking visibility", () => {
     fireEvent.click(screen.getByRole("button"))
     expect(screen.queryByText("nested private chain")).not.toBeInTheDocument()
     expect(screen.getByText("visible result")).toBeInTheDocument()
+  })
+})
+
+function largeWriteTool(lineCount: number): {
+  part: AdaptedToolCallPart
+  content: string
+} {
+  const content = Array.from(
+    { length: lineCount },
+    (_, i) => `line ${i + 1}`
+  ).join("\n")
+  return {
+    content,
+    part: {
+      type: "tool-call",
+      toolCallId: "write-large",
+      toolName: "write",
+      input: JSON.stringify({
+        content,
+      }),
+      state: "output-available",
+      output: "ok",
+    },
+  }
+}
+
+describe("ContentPartsRenderer large file copy controls", () => {
+  beforeEach(() => {
+    vi.mocked(copyTextToClipboard).mockReset()
+    vi.mocked(copyTextToClipboard).mockResolvedValue(false)
+    vi.mocked(toast.error).mockReset()
+  })
+
+  it("uses translated hidden-line and copy text, and reports a localized copy failure", async () => {
+    const { part, content } = largeWriteTool(401)
+    wrap(<ToolCallPart part={part} />)
+    fireEvent.click(screen.getByRole("button"))
+
+    expect(screen.getByText("1 more lines")).toBeInTheDocument()
+    const copyAll = screen.getByRole("button", { name: "Copy all" })
+    fireEvent.click(copyAll)
+
+    await waitFor(() => {
+      expect(copyTextToClipboard).toHaveBeenCalledWith(content)
+      expect(toast.error).toHaveBeenCalledWith(
+        "Could not copy the full file content"
+      )
+    })
   })
 })
