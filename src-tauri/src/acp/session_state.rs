@@ -189,16 +189,20 @@ pub struct ToolCallState {
     /// Latest images attached to this tool call (e.g. codex-acp v0.14+
     /// image generation). Replace-on-update semantics matching `content`:
     /// a fresh `ToolCallUpdate` carrying `Some(images)` replaces the prior
-    /// vec, `None` preserves it. Persisted on snapshot so a frontend
-    /// reconnecting mid-turn or after refresh sees the same image that was
-    /// streamed live. ⚠ base64 image data can be multi-MB per entry; the
-    /// snapshot endpoint payload grows accordingly. This is the cost of
-    /// surviving page refresh without re-fetching from JSONL.
+    /// vec, `None` preserves it. Live in-memory state may hold multi-MB
+    /// base64; [`SessionState::to_snapshot`] caps image bytes on the wire.
     #[serde(default)]
     pub images: Vec<ToolCallImageInfo>,
     /// 流式拼接的 input chunks（serde 不输出，仅运行时用）
     #[serde(skip)]
     pub raw_input_chunks: Vec<String>,
+    /// Concatenated chunk buffer used to parse incrementally (serde skip).
+    #[serde(skip)]
+    pub raw_input_accum: String,
+    /// Once incremental accum exceeds 1MiB, ignore further incomplete
+    /// fragments so a later `}` cannot parse a truncated object.
+    #[serde(skip)]
+    pub raw_input_frozen: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -726,6 +730,52 @@ pub struct SessionState {
     /// capture (linked, non-internal). `None` outside an admitted turn or when
     /// capture was bypassed/failed.
     pub active_turn: Option<ActiveTurnContext>,
+}
+
+/// Hard ceiling for one server attach-protocol text frame.
+pub const MAX_ATTACH_FRAME_BYTES: usize = 4 * 1024 * 1024;
+
+/// Projection limits shared by HTTP, Tauri, and WebSocket snapshot callers.
+#[derive(Clone, Copy, Debug)]
+pub struct SnapshotLimits {
+    pub payload_bytes: usize,
+    pub tool_calls: usize,
+    pub images: usize,
+    pub failures: usize,
+    pub watchdog_tombstones: usize,
+}
+
+impl Default for SnapshotLimits {
+    fn default() -> Self {
+        Self {
+            // Reserve a full MiB for JSON structure and the ServerMsg envelope.
+            payload_bytes: 3 * 1024 * 1024,
+            tool_calls: 128,
+            images: 64,
+            failures: 256,
+            watchdog_tombstones: 512,
+        }
+    }
+}
+
+/// Loss information for a bounded snapshot projection.
+#[derive(Default, Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotTruncation {
+    pub omitted_tool_calls: usize,
+    pub omitted_images: usize,
+    pub omitted_failures: usize,
+    pub omitted_watchdog_tombstones: usize,
+    pub truncated_text_fields: usize,
+}
+
+impl SnapshotTruncation {
+    fn is_empty(&self) -> bool {
+        self.omitted_tool_calls == 0
+            && self.omitted_images == 0
+            && self.omitted_failures == 0
+            && self.omitted_watchdog_tombstones == 0
+            && self.truncated_text_fields == 0
+    }
 }
 
 impl SessionState {
@@ -2033,6 +2083,55 @@ impl SessionState {
         }
     }
 
+    fn json_buffer_might_be_complete(s: &str) -> bool {
+        let trimmed = s.trim();
+        let bytes = trimmed.as_bytes();
+        match bytes.first() {
+            Some(b'{') => {
+                if bytes.last() != Some(&b'}') {
+                    return false;
+                }
+            }
+            Some(b'[') => {
+                if bytes.last() != Some(&b']') {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+        let mut stack: Vec<u8> = Vec::new();
+        let mut in_str = false;
+        let mut escape = false;
+        for &b in bytes {
+            if in_str {
+                if escape {
+                    escape = false;
+                } else if b == b'\\' {
+                    escape = true;
+                } else if b == b'"' {
+                    in_str = false;
+                }
+                continue;
+            }
+            match b {
+                b'"' => in_str = true,
+                b'{' | b'[' => stack.push(b),
+                b'}' => {
+                    if stack.pop() != Some(b'{') {
+                        return false;
+                    }
+                }
+                b']' => {
+                    if stack.pop() != Some(b'[') {
+                        return false;
+                    }
+                }
+                _ => {}
+            }
+        }
+        stack.is_empty() && !in_str
+    }
+
     /// Insert-or-update a tool call entry. Used by both `ToolCall` (initial) and
     /// `ToolCallUpdate` events. `kind` is `Some` only on the initial event;
     /// title/status/content/raw_input/raw_output/locations/meta are merged
@@ -2073,6 +2172,8 @@ impl SessionState {
                 meta: None,
                 images: Vec::new(),
                 raw_input_chunks: Vec::new(),
+                raw_input_accum: String::new(),
+                raw_input_frozen: false,
             });
         if let Some(k) = kind {
             entry.kind = parse_tool_kind(k);
@@ -2087,15 +2188,34 @@ impl SessionState {
             entry.content = Some(c.to_string());
         }
         if let Some(chunk) = raw_input {
-            entry.raw_input_chunks.push(chunk.to_string());
-            // 后端目前发送的是已序列化的 JSON 文本（完整或正在累积）。
-            // 对最新片段做尽力解析；解析失败则尝试拼接历史片段。
+            const MAX_CHUNKS: usize = 256;
+            const MAX_ACCUM_BYTES: usize = 1_048_576;
+            let chunk_bytes: usize = entry.raw_input_chunks.iter().map(String::len).sum();
+            if chunk_bytes.saturating_add(chunk.len()) <= MAX_ACCUM_BYTES {
+                if entry.raw_input_chunks.len() >= MAX_CHUNKS {
+                    let joined = std::mem::take(&mut entry.raw_input_chunks).join("");
+                    entry.raw_input_chunks.push(joined);
+                }
+                entry.raw_input_chunks.push(chunk.to_string());
+            }
             if let Ok(value) = serde_json::from_str::<serde_json::Value>(chunk) {
                 entry.input = Some(value);
-            } else if let Ok(value) =
-                serde_json::from_str::<serde_json::Value>(&entry.raw_input_chunks.join(""))
-            {
-                entry.input = Some(value);
+                entry.raw_input_accum.clear();
+                entry.raw_input_frozen = false;
+            } else if entry.raw_input_frozen {
+                // Sticky freeze: a later `}` must not complete a truncated prefix.
+            } else if entry.raw_input_accum.len().saturating_add(chunk.len()) > MAX_ACCUM_BYTES {
+                entry.raw_input_frozen = true;
+            } else {
+                entry.raw_input_accum.push_str(chunk);
+                if Self::json_buffer_might_be_complete(&entry.raw_input_accum) {
+                    if let Ok(value) =
+                        serde_json::from_str::<serde_json::Value>(&entry.raw_input_accum)
+                    {
+                        entry.input = Some(value);
+                        entry.raw_input_accum.clear();
+                    }
+                }
             }
         }
         if let Some(text) = raw_output {
@@ -2152,17 +2272,344 @@ impl SessionState {
         }
     }
 
-    /// 拷贝出对外可见的 wire-friendly snapshot。Phase 2 snapshot 端点直接调用此方法。
-    pub fn to_snapshot(&self) -> LiveSessionSnapshot {
-        LiveSessionSnapshot {
+    pub(crate) fn watchdog_event_gate_seed(&self) -> (BTreeMap<String, u64>, Vec<String>) {
+        (
+            self.tool_watchdog_max_versions.clone(),
+            self.tool_watchdog_projections.keys().cloned().collect(),
+        )
+    }
+
+    const SNAPSHOT_TRUNCATED_SUFFIX: &'static str = "…[truncated]";
+    const MAX_SNAPSHOT_IMAGE_DATA_BYTES: usize = 64 * 1024;
+
+    fn truncate_snapshot_text(
+        value: &str,
+        remaining_payload_bytes: &mut usize,
+        truncation: &mut SnapshotTruncation,
+    ) -> String {
+        if value.len() <= *remaining_payload_bytes {
+            *remaining_payload_bytes -= value.len();
+            return value.to_owned();
+        }
+
+        truncation.truncated_text_fields += 1;
+        let suffix = Self::SNAPSHOT_TRUNCATED_SUFFIX;
+        if *remaining_payload_bytes <= suffix.len() {
+            *remaining_payload_bytes = 0;
+            return suffix.to_owned();
+        }
+
+        let mut prefix_bytes = (*remaining_payload_bytes - suffix.len()).min(value.len());
+        while !value.is_char_boundary(prefix_bytes) {
+            prefix_bytes -= 1;
+        }
+        let mut projected = String::with_capacity(prefix_bytes + suffix.len());
+        projected.push_str(&value[..prefix_bytes]);
+        projected.push_str(suffix);
+        *remaining_payload_bytes = 0;
+        projected
+    }
+
+    fn project_snapshot_json(
+        value: &serde_json::Value,
+        remaining_payload_bytes: &mut usize,
+        truncation: &mut SnapshotTruncation,
+    ) -> serde_json::Value {
+        let bytes = serde_json::to_vec(value)
+            .map(|encoded| encoded.len())
+            .unwrap_or(usize::MAX);
+        if bytes <= *remaining_payload_bytes {
+            *remaining_payload_bytes -= bytes;
+            return value.clone();
+        }
+
+        truncation.truncated_text_fields += 1;
+        serde_json::Value::String(Self::SNAPSHOT_TRUNCATED_SUFFIX.to_owned())
+    }
+
+    fn project_tool_output(
+        output: &ToolCallOutput,
+        remaining_payload_bytes: &mut usize,
+        truncation: &mut SnapshotTruncation,
+    ) -> ToolCallOutput {
+        match output {
+            ToolCallOutput::Text { content } => ToolCallOutput::Text {
+                content: Self::truncate_snapshot_text(content, remaining_payload_bytes, truncation),
+            },
+            ToolCallOutput::Error { message } => ToolCallOutput::Error {
+                message: Self::truncate_snapshot_text(message, remaining_payload_bytes, truncation),
+            },
+            ToolCallOutput::Json { value } => ToolCallOutput::Json {
+                value: Self::project_snapshot_json(value, remaining_payload_bytes, truncation),
+            },
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn project_tool_call(
+        entry: &ToolCallState,
+        limits: SnapshotLimits,
+        remaining_payload_bytes: &mut usize,
+        image_slots_used: &mut usize,
+        retained_image_payloads: &mut usize,
+        truncation: &mut SnapshotTruncation,
+    ) -> ToolCallState {
+        ToolCallState {
+            id: entry.id.clone(),
+            kind: entry.kind.clone(),
+            label: entry.label.clone(),
+            status: entry.status.clone(),
+            input: entry.input.as_ref().map(|value| {
+                Self::project_snapshot_json(value, remaining_payload_bytes, truncation)
+            }),
+            output: entry.output.as_ref().map(|output| {
+                Self::project_tool_output(output, remaining_payload_bytes, truncation)
+            }),
+            content: entry.content.as_ref().map(|content| {
+                Self::truncate_snapshot_text(content, remaining_payload_bytes, truncation)
+            }),
+            locations: entry.locations.as_ref().map(|value| {
+                Self::project_snapshot_json(value, remaining_payload_bytes, truncation)
+            }),
+            meta: entry.meta.as_ref().map(|value| {
+                Self::project_snapshot_json(value, remaining_payload_bytes, truncation)
+            }),
+            images: entry
+                .images
+                .iter()
+                .filter_map(|image| {
+                    if *image_slots_used >= limits.images {
+                        return None;
+                    }
+                    *image_slots_used += 1;
+                    if image.data.len() > Self::MAX_SNAPSHOT_IMAGE_DATA_BYTES
+                        || image.data.len() > *remaining_payload_bytes
+                    {
+                        Some(ToolCallImageInfo {
+                            data: String::new(),
+                            mime_type: image.mime_type.clone(),
+                            uri: Some("codeg:omitted-oversized-image".into()),
+                        })
+                    } else {
+                        *remaining_payload_bytes -= image.data.len();
+                        *retained_image_payloads += 1;
+                        Some(ToolCallImageInfo {
+                            data: image.data.clone(),
+                            mime_type: Self::truncate_snapshot_text(
+                                &image.mime_type,
+                                remaining_payload_bytes,
+                                truncation,
+                            ),
+                            uri: image.uri.as_ref().map(|uri| {
+                                Self::truncate_snapshot_text(
+                                    uri,
+                                    remaining_payload_bytes,
+                                    truncation,
+                                )
+                            }),
+                        })
+                    }
+                })
+                .collect(),
+            raw_input_chunks: Vec::new(),
+            raw_input_accum: String::new(),
+            raw_input_frozen: false,
+        }
+    }
+
+    fn project_live_message(
+        &self,
+        remaining_payload_bytes: &mut usize,
+        truncation: &mut SnapshotTruncation,
+    ) -> Option<LiveMessage> {
+        self.live_message.as_ref().map(|message| LiveMessage {
+            id: message.id.clone(),
+            role: message.role.clone(),
+            content: message
+                .content
+                .iter()
+                .map(|block| match block {
+                    LiveContentBlock::Text {
+                        text,
+                        parent_tool_use_id,
+                    } => LiveContentBlock::Text {
+                        text: Self::truncate_snapshot_text(
+                            text,
+                            remaining_payload_bytes,
+                            truncation,
+                        ),
+                        parent_tool_use_id: parent_tool_use_id.clone(),
+                    },
+                    LiveContentBlock::Thinking {
+                        text,
+                        parent_tool_use_id,
+                    } => LiveContentBlock::Thinking {
+                        text: Self::truncate_snapshot_text(
+                            text,
+                            remaining_payload_bytes,
+                            truncation,
+                        ),
+                        parent_tool_use_id: parent_tool_use_id.clone(),
+                    },
+                    LiveContentBlock::ToolCallRef { tool_call_id } => {
+                        LiveContentBlock::ToolCallRef {
+                            tool_call_id: tool_call_id.clone(),
+                        }
+                    }
+                    LiveContentBlock::Plan { entries } => LiveContentBlock::Plan {
+                        entries: Self::project_snapshot_json(
+                            entries,
+                            remaining_payload_bytes,
+                            truncation,
+                        ),
+                    },
+                })
+                .collect(),
+            started_at: message.started_at,
+        })
+    }
+
+    fn snapshot_structural_reserve(&self, limits: SnapshotLimits) -> usize {
+        const BASE_BYTES: usize = 32 * 1024;
+        const TOOL_BYTES: usize = 512;
+        const IMAGE_BYTES: usize = 128;
+        const FAILURE_BYTES: usize = 256;
+        const WATCHDOG_BYTES: usize = 96;
+        const LIVE_BLOCK_BYTES: usize = 64;
+
+        let live_blocks = self
+            .live_message
+            .as_ref()
+            .map(|message| message.content.len())
+            .unwrap_or(0);
+        let image_count = self
+            .active_tool_calls
+            .values()
+            .take(limits.tool_calls)
+            .fold(0usize, |total, tool| {
+                total.saturating_add(tool.images.len())
+            })
+            .min(limits.images);
+        BASE_BYTES
+            .saturating_add(
+                self.active_tool_calls
+                    .len()
+                    .min(limits.tool_calls)
+                    .saturating_mul(TOOL_BYTES),
+            )
+            .saturating_add(image_count.saturating_mul(IMAGE_BYTES))
+            .saturating_add(
+                self.session_failures
+                    .len()
+                    .min(limits.failures)
+                    .saturating_mul(FAILURE_BYTES),
+            )
+            .saturating_add(
+                self.tool_watchdog_max_versions
+                    .len()
+                    .min(limits.watchdog_tombstones)
+                    .saturating_mul(WATCHDOG_BYTES),
+            )
+            .saturating_add(live_blocks.saturating_mul(LIVE_BLOCK_BYTES))
+            .min(limits.payload_bytes)
+    }
+
+    fn failure_payload_bytes(failure: &SessionFailureRecord) -> usize {
+        serde_json::to_vec(failure)
+            .map(|encoded| encoded.len())
+            .unwrap_or(usize::MAX)
+    }
+
+    /// Build the bounded wire projection without mutating the live session.
+    pub fn to_snapshot_with_limits(&self, limits: SnapshotLimits) -> LiveSessionSnapshot {
+        let mut truncation = SnapshotTruncation::default();
+        let reserve = self.snapshot_structural_reserve(limits);
+        let mut remaining_payload_bytes = limits.payload_bytes.saturating_sub(reserve);
+        let live_message = self.project_live_message(&mut remaining_payload_bytes, &mut truncation);
+
+        let total_images = self.active_tool_calls.values().fold(0usize, |total, tool| {
+            total.saturating_add(tool.images.len())
+        });
+        let mut image_slots_used = 0;
+        let mut retained_image_payloads = 0;
+        let active_tool_calls: Vec<_> = self
+            .active_tool_calls
+            .values()
+            .take(limits.tool_calls)
+            .map(|entry| {
+                Self::project_tool_call(
+                    entry,
+                    limits,
+                    &mut remaining_payload_bytes,
+                    &mut image_slots_used,
+                    &mut retained_image_payloads,
+                    &mut truncation,
+                )
+            })
+            .collect();
+        truncation.omitted_tool_calls = self
+            .active_tool_calls
+            .len()
+            .saturating_sub(active_tool_calls.len());
+        truncation.omitted_images = total_images.saturating_sub(retained_image_payloads);
+
+        let mut session_failures = Vec::new();
+        for failure in self.session_failures.values().take(limits.failures) {
+            let bytes = Self::failure_payload_bytes(failure);
+            if bytes > remaining_payload_bytes {
+                continue;
+            }
+            remaining_payload_bytes -= bytes;
+            session_failures.push(failure.clone());
+        }
+        truncation.omitted_failures = self
+            .session_failures
+            .len()
+            .saturating_sub(session_failures.len());
+
+        // Actionable projections get their version floors first. Tombstones
+        // consume only the remaining slots; the live state retains every floor
+        // and continues rejecting stale producers after this projection.
+        let mut tool_watchdog_max_versions = BTreeMap::new();
+        for lease_id in self.tool_watchdog_projections.keys() {
+            if let Some(version) = self.tool_watchdog_max_versions.get(lease_id) {
+                remaining_payload_bytes = remaining_payload_bytes.saturating_sub(lease_id.len());
+                tool_watchdog_max_versions.insert(lease_id.clone(), *version);
+            }
+        }
+        let tombstone_slots = limits
+            .watchdog_tombstones
+            .saturating_sub(tool_watchdog_max_versions.len());
+        let mut retained_tombstones = 0;
+        for (lease_id, version) in &self.tool_watchdog_max_versions {
+            if self.tool_watchdog_projections.contains_key(lease_id) {
+                continue;
+            }
+            if retained_tombstones >= tombstone_slots || lease_id.len() > remaining_payload_bytes {
+                continue;
+            }
+            remaining_payload_bytes -= lease_id.len();
+            tool_watchdog_max_versions.insert(lease_id.clone(), *version);
+            retained_tombstones += 1;
+        }
+        let total_tombstones = self.tool_watchdog_max_versions.len().saturating_sub(
+            self.tool_watchdog_projections
+                .keys()
+                .filter(|lease_id| self.tool_watchdog_max_versions.contains_key(*lease_id))
+                .count(),
+        );
+        truncation.omitted_watchdog_tombstones =
+            total_tombstones.saturating_sub(retained_tombstones);
+
+        let mut snapshot = LiveSessionSnapshot {
             connection_id: self.connection_id.clone(),
             conversation_id: self.conversation_id,
             folder_id: self.folder_id,
             shared_session: self.shared_session.clone(),
             status: self.status.clone(),
             external_id: self.external_id.clone(),
-            live_message: self.live_message.clone(),
-            active_tool_calls: self.active_tool_calls.values().cloned().collect(),
+            live_message,
+            active_tool_calls,
             pending_permission: self.pending_permission.clone(),
             pending_question: self.pending_question.clone(),
             waiting_for_subagents: self.waiting_for_subagents.clone(),
@@ -2170,7 +2617,7 @@ impl SessionState {
             pending_user_message: self.pending_user_message.clone(),
             active_delegations: self.active_delegations.values().cloned().collect(),
             tool_watchdog_projections: self.tool_watchdog_projections.clone(),
-            tool_watchdog_max_versions: self.tool_watchdog_max_versions.clone(),
+            tool_watchdog_max_versions,
             last_tool_watchdog_diagnostic: self.last_tool_watchdog_diagnostic.clone(),
             feedback: self.feedback.clone(),
             background_outstanding: self.background_outstanding,
@@ -2187,10 +2634,20 @@ impl SessionState {
             config_stale_kind: self.config_stale_kind,
             delegation_route: self.delegation_route.clone(),
             last_error: self.last_error.clone(),
-            session_failures: self.session_failures.values().cloned().collect(),
+            session_failures,
             goal_actions: self.goal_actions.clone(),
+            truncation: None,
             event_seq: self.event_seq,
+        };
+        if !truncation.is_empty() {
+            snapshot.truncation = Some(truncation);
         }
+        snapshot
+    }
+
+    /// Build a bounded wire snapshot for every HTTP, Tauri, and WS caller.
+    pub fn to_snapshot(&self) -> LiveSessionSnapshot {
+        self.to_snapshot_with_limits(SnapshotLimits::default())
     }
 }
 
@@ -2338,6 +2795,9 @@ pub struct LiveSessionSnapshot {
     ///   maps to the legacy pair.
     #[serde(default)]
     pub goal_actions: Option<Vec<String>>,
+    /// Counts data removed or shortened by the bounded snapshot projection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncation: Option<SnapshotTruncation>,
     pub event_seq: u64,
 }
 
@@ -4357,6 +4817,235 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_enforces_aggregate_budget_and_reports_omissions() {
+        const MIB: usize = 1024 * 1024;
+        let mut s = fresh_state();
+        s.live_message = Some(LiveMessage {
+            id: "live-budget".into(),
+            role: MessageRole::Assistant,
+            content: vec![LiveContentBlock::Text {
+                text: "界".repeat(MIB / "界".len() + 1),
+                parent_tool_use_id: None,
+            }],
+            started_at: Utc::now(),
+        });
+
+        for index in 0..300 {
+            let id = format!("tool-{index:03}");
+            s.active_tool_calls.insert(
+                id.clone(),
+                ToolCallState {
+                    id,
+                    kind: ToolKind::Other,
+                    label: "budget fixture".into(),
+                    status: ToolCallStatus::InProgress,
+                    input: (index == 0).then(|| {
+                        serde_json::json!({
+                            "payload": "i".repeat(MIB),
+                        })
+                    }),
+                    output: (index == 0).then(|| ToolCallOutput::Text {
+                        content: "o".repeat(MIB),
+                    }),
+                    content: None,
+                    locations: None,
+                    meta: None,
+                    images: vec![ToolCallImageInfo {
+                        data: "a".repeat(256),
+                        mime_type: "image/png".into(),
+                        uri: None,
+                    }],
+                    raw_input_chunks: Vec::new(),
+                    raw_input_accum: String::new(),
+                    raw_input_frozen: false,
+                },
+            );
+        }
+
+        let live_bytes_before = match &s.live_message.as_ref().unwrap().content[0] {
+            LiveContentBlock::Text { text, .. } => text.len(),
+            _ => unreachable!("fixture uses a text block"),
+        };
+        let input_bytes_before = s.active_tool_calls["tool-000"].input.as_ref().unwrap()["payload"]
+            .as_str()
+            .unwrap()
+            .len();
+        let output_bytes_before = match s.active_tool_calls["tool-000"].output.as_ref().unwrap() {
+            ToolCallOutput::Text { content } => content.len(),
+            _ => unreachable!("fixture uses text output"),
+        };
+        let limits = SnapshotLimits {
+            payload_bytes: 96 * 1024,
+            tool_calls: 12,
+            images: 17,
+            failures: 8,
+            watchdog_tombstones: 8,
+        };
+
+        let snapshot = s.to_snapshot_with_limits(limits);
+        let encoded = serde_json::to_vec(&snapshot).expect("snapshot serializes");
+        assert!(
+            encoded.len() <= limits.payload_bytes,
+            "snapshot estimate {} must fit payload budget {}",
+            encoded.len(),
+            limits.payload_bytes
+        );
+        assert_eq!(snapshot.active_tool_calls.len(), 12);
+        let truncation = snapshot.truncation.as_ref().expect("omissions reported");
+        assert_eq!(truncation.omitted_tool_calls, 288);
+        assert_eq!(truncation.omitted_images, 300);
+        assert_eq!(truncation.omitted_failures, 0);
+        assert_eq!(truncation.omitted_watchdog_tombstones, 0);
+        assert_eq!(truncation.truncated_text_fields, 3);
+        let projected_live = match &snapshot.live_message.as_ref().unwrap().content[0] {
+            LiveContentBlock::Text { text, .. } => text,
+            _ => unreachable!("fixture uses a text block"),
+        };
+        assert!(projected_live.ends_with("[truncated]"));
+        assert!(projected_live.is_char_boundary(projected_live.len()));
+
+        assert_eq!(s.active_tool_calls.len(), 300);
+        assert_eq!(
+            s.active_tool_calls
+                .values()
+                .map(|tool| tool.images.len())
+                .sum::<usize>(),
+            300
+        );
+        assert_eq!(
+            match &s.live_message.as_ref().unwrap().content[0] {
+                LiveContentBlock::Text { text, .. } => text.len(),
+                _ => unreachable!("fixture uses a text block"),
+            },
+            live_bytes_before
+        );
+        assert_eq!(
+            s.active_tool_calls["tool-000"].input.as_ref().unwrap()["payload"]
+                .as_str()
+                .unwrap()
+                .len(),
+            input_bytes_before
+        );
+        assert_eq!(
+            match s.active_tool_calls["tool-000"].output.as_ref().unwrap() {
+                ToolCallOutput::Text { content } => content.len(),
+                _ => unreachable!("fixture uses text output"),
+            },
+            output_bytes_before
+        );
+    }
+
+    #[test]
+    fn snapshot_caps_tool_failure_and_watchdog_collections() {
+        use crate::acp::tool_watchdog::ToolWatchdogPhase;
+
+        let mut s = fresh_state();
+        for index in 0..300 {
+            let id = format!("tool-{index:03}");
+            s.active_tool_calls.insert(
+                id.clone(),
+                ToolCallState {
+                    id,
+                    kind: ToolKind::Read,
+                    label: "read".into(),
+                    status: ToolCallStatus::Pending,
+                    input: None,
+                    output: None,
+                    content: None,
+                    locations: None,
+                    meta: None,
+                    images: Vec::new(),
+                    raw_input_chunks: Vec::new(),
+                    raw_input_accum: String::new(),
+                    raw_input_frozen: false,
+                },
+            );
+        }
+        for index in 0..1000 {
+            let id = format!("failure-{index:04}");
+            s.session_failures.insert(
+                id.clone(),
+                SessionFailureRecord {
+                    id,
+                    revision: 1,
+                    category: "service".into(),
+                    severity: "warning".into(),
+                    title: "retry later".into(),
+                    details: None,
+                    actions: vec!["retry".into()],
+                    resolved: false,
+                },
+            );
+            s.tool_watchdog_max_versions
+                .insert(format!("tombstone-{index:04}"), index as u64 + 1);
+        }
+        for lease_id in ["actionable-a", "actionable-z"] {
+            let projection = sample_watchdog_projection(lease_id, 7, ToolWatchdogPhase::Grace);
+            s.tool_watchdog_projections
+                .insert(lease_id.into(), projection);
+            s.tool_watchdog_max_versions.insert(lease_id.into(), 7);
+        }
+        let limits = SnapshotLimits {
+            payload_bytes: 512 * 1024,
+            tool_calls: 4,
+            images: 4,
+            failures: 7,
+            watchdog_tombstones: 5,
+        };
+
+        let snapshot = s.to_snapshot_with_limits(limits);
+
+        assert_eq!(
+            snapshot
+                .active_tool_calls
+                .iter()
+                .map(|tool| tool.id.as_str())
+                .collect::<Vec<_>>(),
+            ["tool-000", "tool-001", "tool-002", "tool-003"]
+        );
+        assert_eq!(
+            snapshot
+                .session_failures
+                .iter()
+                .map(|failure| failure.id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "failure-0000",
+                "failure-0001",
+                "failure-0002",
+                "failure-0003",
+                "failure-0004",
+                "failure-0005",
+                "failure-0006",
+            ]
+        );
+        assert_eq!(
+            snapshot
+                .tool_watchdog_max_versions
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            [
+                "actionable-a",
+                "actionable-z",
+                "tombstone-0000",
+                "tombstone-0001",
+                "tombstone-0002",
+            ]
+        );
+        assert_eq!(snapshot.tool_watchdog_projections.len(), 2);
+        let truncation = snapshot.truncation.as_ref().expect("caps reported");
+        assert_eq!(truncation.omitted_tool_calls, 296);
+        assert_eq!(truncation.omitted_images, 0);
+        assert_eq!(truncation.omitted_failures, 993);
+        assert_eq!(truncation.omitted_watchdog_tombstones, 997);
+        assert_eq!(truncation.truncated_text_fields, 0);
+        assert_eq!(s.active_tool_calls.len(), 300);
+        assert_eq!(s.session_failures.len(), 1000);
+        assert_eq!(s.tool_watchdog_max_versions.len(), 1002);
+    }
+
+    #[test]
     fn tool_call_content_field_is_preserved_on_state() {
         let mut s = fresh_state();
         s.apply_event(&AcpEvent::ToolCall {
@@ -5213,8 +5902,7 @@ mod tests {
             used: 1234,
             size: 200_000,
         });
-        // Two raw_input fragments; the second is a complete JSON object
-        // and should overwrite `entry.input` with the parsed value.
+        // Two raw_input fragments; the second completes the object.
         s.apply_event(&AcpEvent::ToolCall {
             tool_call_id: "tc-1".into(),
             title: "edit".into(),
@@ -5232,7 +5920,7 @@ mod tests {
             title: None,
             status: None,
             content: None,
-            raw_input: Some("{\"a\":1}".into()),
+            raw_input: Some("1}".into()),
             raw_output: None,
             raw_output_append: None,
             locations: None,
@@ -5241,6 +5929,10 @@ mod tests {
         });
         let entry = s.active_tool_calls.get("tc-1").unwrap();
         assert_eq!(entry.input, Some(serde_json::json!({"a": 1})));
+        assert!(
+            entry.raw_input_accum.is_empty(),
+            "successful accum parse must clear the buffer"
+        );
         assert_eq!(entry.raw_input_chunks.len(), 2);
 
         let snapshot = s.to_snapshot();
@@ -5753,6 +6445,165 @@ mod tests {
             entry.images.is_empty(),
             "Some(empty vec) clears prior images"
         );
+    }
+
+    #[test]
+    fn snapshot_strips_oversized_tool_images_but_keeps_live_copy() {
+        let mut s = fresh_state();
+        let huge = ToolCallImageInfo {
+            data: "A".repeat(64 * 1024 + 8),
+            mime_type: "image/png".into(),
+            uri: None,
+        };
+        s.apply_event(&AcpEvent::ToolCall {
+            tool_call_id: "ig-huge".into(),
+            title: "Image generation".into(),
+            kind: "other".into(),
+            status: "completed".into(),
+            content: None,
+            raw_input: None,
+            raw_output: None,
+            locations: None,
+            meta: None,
+            images: Some(vec![huge]),
+        });
+        assert!(
+            s.active_tool_calls.get("ig-huge").unwrap().images[0]
+                .data
+                .len()
+                > 64 * 1024
+        );
+        let snap = s.to_snapshot();
+        let tc = snap
+            .active_tool_calls
+            .iter()
+            .find(|t| t.id == "ig-huge")
+            .unwrap();
+        assert!(tc.images[0].data.is_empty());
+        assert_eq!(
+            tc.images[0].uri.as_deref(),
+            Some("codeg:omitted-oversized-image")
+        );
+        assert!(
+            s.active_tool_calls.get("ig-huge").unwrap().images[0]
+                .data
+                .len()
+                > 64 * 1024,
+            "live in-memory copy must keep the full image after snapshot"
+        );
+    }
+
+    #[test]
+    fn json_buffer_might_be_complete_is_string_and_nesting_aware() {
+        assert!(SessionState::json_buffer_might_be_complete(
+            r#"{"a":{"b":1}}"#
+        ));
+        assert!(!SessionState::json_buffer_might_be_complete(
+            r#"{"a":{"b":1}"#
+        ));
+        assert!(!SessionState::json_buffer_might_be_complete(
+            r#"{"msg": "hello}"#
+        ));
+        assert!(SessionState::json_buffer_might_be_complete(
+            r#"{"msg": "hello}"}"#
+        ));
+        assert!(SessionState::json_buffer_might_be_complete("[1,2]"));
+        assert!(!SessionState::json_buffer_might_be_complete("[1,2"));
+        assert!(!SessionState::json_buffer_might_be_complete(r#"[{"a":1]"#));
+        assert!(SessionState::json_buffer_might_be_complete(r#"[{"a":1}]"#));
+    }
+
+    #[test]
+    fn incomplete_nested_object_does_not_parse_on_inner_brace() {
+        let mut s = fresh_state();
+        s.apply_event(&AcpEvent::ToolCall {
+            tool_call_id: "tc-nest".into(),
+            title: "edit".into(),
+            kind: "edit".into(),
+            status: "pending".into(),
+            content: None,
+            raw_input: Some(r#"{"a":{"b":1}"#.into()),
+            raw_output: None,
+            locations: None,
+            meta: None,
+            images: None,
+        });
+        let entry = s.active_tool_calls.get("tc-nest").unwrap();
+        assert!(entry.input.is_none());
+        assert_eq!(entry.raw_input_accum, r#"{"a":{"b":1}"#);
+    }
+
+    #[test]
+    fn raw_input_accum_freezes_at_cap_instead_of_clearing() {
+        let mut s = fresh_state();
+        let first = format!("{{\"x\":\"{}", "a".repeat(600_000));
+        s.apply_event(&AcpEvent::ToolCall {
+            tool_call_id: "tc-cap".into(),
+            title: "edit".into(),
+            kind: "edit".into(),
+            status: "pending".into(),
+            content: None,
+            raw_input: Some(first.clone()),
+            raw_output: None,
+            locations: None,
+            meta: None,
+            images: None,
+        });
+        s.apply_event(&AcpEvent::ToolCallUpdate {
+            tool_call_id: "tc-cap".into(),
+            title: None,
+            status: None,
+            content: None,
+            raw_input: Some("a".repeat(600_000)),
+            raw_output: None,
+            raw_output_append: None,
+            locations: None,
+            meta: None,
+            images: None,
+        });
+        s.apply_event(&AcpEvent::ToolCallUpdate {
+            tool_call_id: "tc-cap".into(),
+            title: None,
+            status: None,
+            content: None,
+            raw_input: Some("}".into()),
+            raw_output: None,
+            raw_output_append: None,
+            locations: None,
+            meta: None,
+            images: None,
+        });
+        let entry = s.active_tool_calls.get("tc-cap").unwrap();
+        assert!(
+            entry.input.is_none(),
+            "a later closing brace must not parse the frozen truncated prefix"
+        );
+        assert!(entry.raw_input_frozen);
+        assert_eq!(
+            entry.raw_input_accum.len(),
+            first.len(),
+            "overflowing chunk must freeze the prefix rather than clear or grow past 1MiB"
+        );
+
+        s.apply_event(&AcpEvent::ToolCallUpdate {
+            tool_call_id: "tc-cap".into(),
+            title: None,
+            status: None,
+            content: None,
+            raw_input: Some(r#"{"ok":true}"#.into()),
+            raw_output: None,
+            raw_output_append: None,
+            locations: None,
+            meta: None,
+            images: None,
+        });
+        let entry = s.active_tool_calls.get("tc-cap").unwrap();
+        assert_eq!(entry.input, Some(serde_json::json!({"ok": true})));
+        assert!(
+            !entry.raw_input_frozen,
+            "a complete replacement chunk must unfreeze"
+        );
+        assert!(entry.raw_input_accum.is_empty());
     }
 
     #[test]

@@ -10,7 +10,10 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use super::shutdown::ShutdownSignal;
-use super::ws_attach::{self, ClientMsg, DetachReason, ServerMsg, OUTBOUND_CAPACITY};
+use super::ws_attach::{
+    self, AttachErrorCode, ClientMsg, DetachReason, ServerMsg, OUTBOUND_CAPACITY,
+};
+use crate::acp::session_state::MAX_ATTACH_FRAME_BYTES;
 use crate::acp::shared_session::{LeaseRenewalOutcome, LeaseSocketBinding};
 use crate::app_state::AppState;
 use crate::logging::throttle::{LagLogThrottle, LAG_LOG_WINDOW};
@@ -39,6 +42,25 @@ fn apply_cleanup_signal(
             subscriptions.remove(sub_id);
         }
     }
+}
+
+/// Serialize one attach-protocol frame and enforce the hard WS ceiling.
+///
+/// A snapshot projection miss becomes a small recoverable protocol error.
+/// Other oversized frames are dropped by returning `None`; neither outcome
+/// closes the socket or removes the underlying agent connection.
+pub(super) fn serialize_server_msg(msg: &ServerMsg) -> Result<Option<Vec<u8>>, serde_json::Error> {
+    let encoded = serde_json::to_vec(msg)?;
+    if encoded.len() <= MAX_ATTACH_FRAME_BYTES {
+        return Ok(Some(encoded));
+    }
+    if matches!(msg, ServerMsg::Snapshot { .. }) {
+        return serde_json::to_vec(&ServerMsg::AttachError {
+            code: AttachErrorCode::SnapshotBudgetExceeded,
+        })
+        .map(Some);
+    }
+    Ok(None)
 }
 
 // MUST match `WS_READY_CHANNEL` in `src/lib/transport/constants.ts`.
@@ -168,11 +190,18 @@ async fn handle_ws_connection(
             outgoing = outbound_rx.recv() => {
                 match outgoing {
                     Some(msg) => {
-                        match serde_json::to_string(&msg) {
-                            Ok(text) => {
+                        match serialize_server_msg(&msg) {
+                            Ok(Some(encoded)) => {
+                                let text = String::from_utf8(encoded)
+                                    .expect("serde_json always produces UTF-8");
                                 if socket.send(Message::Text(text.into())).await.is_err() {
                                     break;
                                 }
+                            }
+                            Ok(None) => {
+                                tracing::warn!(
+                                    "[WS][WARN] dropped oversized non-snapshot ServerMsg"
+                                );
                             }
                             Err(e) => {
                                 tracing::warn!("[WS][WARN] failed to serialize ServerMsg: {e}");
@@ -306,6 +335,7 @@ async fn handle_client_msg(
                         epoch,
                         state.acp_event_bus.metrics().clone(),
                         outcome.receiver,
+                        outcome.watchdog_gate,
                         outbound_tx.clone(),
                         cleanup_tx.clone(),
                         state.connection_manager.shared_session_broker(),

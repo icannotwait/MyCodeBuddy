@@ -11,6 +11,7 @@
 //! The legacy global `acp://event` channel remains active during Phase 1-3
 //! for backward compatibility; Phase 4 retires it.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::{fmt, sync::atomic::Ordering};
 
@@ -22,7 +23,7 @@ use crate::acp::internal_bus::EventBusMetrics;
 use crate::acp::manager::ConnectionManager;
 use crate::acp::session_state::LiveSessionSnapshot;
 use crate::acp::shared_session::{LeaseSocketBinding, SharedSessionBroker};
-use crate::acp::types::EventEnvelope;
+use crate::acp::types::{AcpEvent, EventEnvelope};
 
 /// Maximum number of events delivered in a single `replay` response. Larger
 /// gaps fall through to a `snapshot` even when the ring buffer can satisfy
@@ -35,6 +36,52 @@ pub const REPLAY_BATCH_THRESHOLD: usize = 32;
 /// 64 in-flight messages is enough for short bursts without making
 /// memory blow up if the client stops reading.
 pub const OUTBOUND_CAPACITY: usize = 64;
+
+#[derive(Clone)]
+pub(crate) struct WatchdogEventGate {
+    floors: BTreeMap<String, u64>,
+    actionable: BTreeSet<String>,
+}
+
+impl WatchdogEventGate {
+    fn new(floors: BTreeMap<String, u64>, actionable: BTreeSet<String>) -> Self {
+        Self { floors, actionable }
+    }
+
+    fn allows(&mut self, event: &AcpEvent) -> bool {
+        let AcpEvent::ToolWatchdogChanged { projection } = event else {
+            return true;
+        };
+        use crate::acp::tool_watchdog::ToolWatchdogPhase;
+
+        let floor = self.floors.get(&projection.lease_id).copied().unwrap_or(0);
+        match projection.phase {
+            ToolWatchdogPhase::Cleared | ToolWatchdogPhase::TimedOut => {
+                if projection.version < floor {
+                    return false;
+                }
+                self.floors
+                    .insert(projection.lease_id.clone(), projection.version);
+                self.actionable.remove(&projection.lease_id);
+            }
+            ToolWatchdogPhase::Warning
+            | ToolWatchdogPhase::Grace
+            | ToolWatchdogPhase::Cancelling => {
+                let blocked_by_tombstone = projection.version < floor
+                    || (projection.version == floor
+                        && floor > 0
+                        && !self.actionable.contains(&projection.lease_id));
+                if blocked_by_tombstone {
+                    return false;
+                }
+                self.floors
+                    .insert(projection.lease_id.clone(), projection.version);
+                self.actionable.insert(projection.lease_id.clone());
+            }
+        }
+        true
+    }
+}
 
 #[derive(Clone, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
@@ -84,6 +131,12 @@ impl fmt::Debug for ClientMsg {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachErrorCode {
+    SnapshotBudgetExceeded,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMsg {
@@ -116,6 +169,9 @@ pub enum ServerMsg {
         subscription_id: String,
         reason: DetachReason,
     },
+    /// A recoverable attach-protocol error. The socket and live agent
+    /// connection remain active so the client can choose a recovery path.
+    AttachError { code: AttachErrorCode },
     /// Liveness response.
     Pong,
 }
@@ -150,6 +206,7 @@ pub struct AttachOutcome {
     pub initial_msg: ServerMsg,
     pub receiver: tokio::sync::broadcast::Receiver<Arc<EventEnvelope>>,
     pub binding: Option<LeaseSocketBinding>,
+    pub(crate) watchdog_gate: WatchdogEventGate,
 }
 
 /// Decide-and-subscribe under a single `SessionState` read lock. The
@@ -211,6 +268,9 @@ pub async fn handle_attach(
             event_seq: s.event_seq,
         }
     };
+    let (watchdog_floors, actionable_watchdogs) = s.watchdog_event_gate_seed();
+    let watchdog_gate =
+        WatchdogEventGate::new(watchdog_floors, actionable_watchdogs.into_iter().collect());
 
     let initial_msg = match since_seq {
         None => {
@@ -226,8 +286,13 @@ pub async fn handle_attach(
         }
         Some(cursor) => match s.recent_events_after(cursor) {
             Some(events) if events.len() <= REPLAY_BATCH_THRESHOLD && !events.is_empty() => {
-                let event_count = events.len() as u64;
                 let high_water_seq = events.last().expect("non-empty checked above").seq;
+                let mut replay_gate = watchdog_gate.clone();
+                let events: Vec<_> = events
+                    .into_iter()
+                    .filter(|event| replay_gate.allows(&event.payload))
+                    .collect();
+                let event_count = events.len() as u64;
                 metrics.replay_count.fetch_add(1, Ordering::Relaxed);
                 metrics
                     .replay_event_total
@@ -256,6 +321,7 @@ pub async fn handle_attach(
         initial_msg,
         receiver,
         binding,
+        watchdog_gate,
     })
 }
 
@@ -284,11 +350,12 @@ pub async fn handle_attach(
 /// `metrics` records `Lagged` exits so operators can correlate attach
 /// re-attachment storms with per-connection broadcast pressure.
 #[allow(clippy::too_many_arguments)]
-pub fn spawn_forwarder(
+pub(crate) fn spawn_forwarder(
     subscription_id: String,
     epoch: u64,
     metrics: Arc<EventBusMetrics>,
     mut receiver: tokio::sync::broadcast::Receiver<Arc<EventEnvelope>>,
+    mut watchdog_gate: WatchdogEventGate,
     outbound: mpsc::Sender<ServerMsg>,
     cleanup_tx: mpsc::Sender<(String, u64)>,
     broker: SharedSessionBroker,
@@ -301,6 +368,9 @@ pub fn spawn_forwarder(
         loop {
             match receiver.recv().await {
                 Ok(envelope) => {
+                    if !watchdog_gate.allows(&envelope.payload) {
+                        continue;
+                    }
                     let msg = ServerMsg::Event {
                         subscription_id: subscription_id.clone(),
                         envelope,
@@ -364,6 +434,12 @@ pub fn spawn_forwarder(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::acp::session_state::SessionState;
+    use crate::acp::tool_watchdog::{
+        CancellationScope, ToolCategory, ToolWatchdogPhase, ToolWatchdogProjection,
+    };
+    use crate::acp::types::{AcpEvent, ConnectionStatus, SessionFailureRecord, ToolCallImageInfo};
+    use crate::models::agent::AgentType;
 
     #[test]
     fn client_message_debug_redacts_lease_id() {
@@ -378,5 +454,121 @@ mod tests {
         let debug = format!("{message:?}");
         assert!(!debug.contains("lease-secret"));
         assert!(debug.contains("***"));
+    }
+
+    #[test]
+    fn serialized_snapshot_frame_never_exceeds_attach_frame_limit() {
+        const MIB: usize = 1024 * 1024;
+        let mut state = SessionState::new(
+            "snapshot-budget".into(),
+            AgentType::ClaudeCode,
+            None,
+            "window".into(),
+            None,
+        );
+        state.status = ConnectionStatus::Prompting;
+        state.apply_event(&AcpEvent::ContentDelta {
+            text: "l".repeat(MIB),
+            parent_tool_use_id: None,
+        });
+        for index in 0..300 {
+            state.apply_event(&AcpEvent::ToolCall {
+                tool_call_id: format!("tool-{index:03}"),
+                title: "budget fixture".into(),
+                kind: "other".into(),
+                status: "in_progress".into(),
+                content: None,
+                raw_input: (index == 0).then(|| format!(r#"{{"payload":"{}"}}"#, "i".repeat(MIB))),
+                raw_output: (index == 0).then(|| "o".repeat(MIB)),
+                locations: None,
+                meta: None,
+                images: Some(vec![ToolCallImageInfo {
+                    data: "a".repeat(256),
+                    mime_type: "image/png".into(),
+                    uri: None,
+                }]),
+            });
+        }
+        for index in 0..1000 {
+            state.apply_event(&AcpEvent::SessionFailure {
+                record: SessionFailureRecord {
+                    id: format!("failure-{index:04}"),
+                    revision: 1,
+                    category: "service".into(),
+                    severity: "warning".into(),
+                    title: "retry later".into(),
+                    details: None,
+                    actions: vec!["retry".into()],
+                    resolved: false,
+                },
+            });
+            state.apply_event(&AcpEvent::ToolWatchdogChanged {
+                projection: ToolWatchdogProjection {
+                    lease_id: format!("tombstone-{index:04}"),
+                    version: 1,
+                    tool_title: ToolCategory::Terminal,
+                    phase: ToolWatchdogPhase::TimedOut,
+                    last_progress_at: "2026-08-20T00:00:00Z".into(),
+                    transition_at: "2026-08-20T00:01:00Z".into(),
+                    transition_seq: index as u64,
+                    grace_deadline: None,
+                    cancellation_scope: Some(CancellationScope::Terminal),
+                    error_code: Some("tool_stalled_timeout".into()),
+                },
+            });
+        }
+
+        let snapshot = state.to_snapshot();
+        let frame = ServerMsg::Snapshot {
+            subscription_id: "subscription".into(),
+            connection_id: "snapshot-budget".into(),
+            event_seq: snapshot.event_seq,
+            snapshot: Box::new(snapshot.clone()),
+        };
+        let encoded = serde_json::to_vec(&frame).expect("snapshot frame serializes");
+        assert!(
+            encoded.len() <= crate::acp::session_state::MAX_ATTACH_FRAME_BYTES,
+            "snapshot frame {} exceeds {}",
+            encoded.len(),
+            crate::acp::session_state::MAX_ATTACH_FRAME_BYTES
+        );
+
+        let oversized = ServerMsg::Snapshot {
+            subscription_id: "s".repeat(crate::acp::session_state::MAX_ATTACH_FRAME_BYTES + 1),
+            connection_id: "snapshot-budget".into(),
+            snapshot: Box::new(snapshot),
+            event_seq: 0,
+        };
+        let checked = crate::web::ws::serialize_server_msg(&oversized)
+            .expect("fallback serializes")
+            .expect("oversized snapshot yields attach error");
+        assert!(checked.len() <= crate::acp::session_state::MAX_ATTACH_FRAME_BYTES);
+        let error: serde_json::Value =
+            serde_json::from_slice(&checked).expect("attach error is JSON");
+        assert_eq!(error["type"], "attach_error");
+        assert_eq!(error["code"], "snapshot_budget_exceeded");
+
+        let mut watchdog_gate = WatchdogEventGate::new(
+            std::collections::BTreeMap::from([("terminal-lease".into(), 5)]),
+            std::collections::BTreeSet::new(),
+        );
+        let stale = AcpEvent::ToolWatchdogChanged {
+            projection: ToolWatchdogProjection {
+                lease_id: "terminal-lease".into(),
+                version: 5,
+                tool_title: ToolCategory::Terminal,
+                phase: ToolWatchdogPhase::Cancelling,
+                last_progress_at: "2026-08-20T00:00:00Z".into(),
+                transition_at: "2026-08-20T00:01:00Z".into(),
+                transition_seq: 1,
+                grace_deadline: None,
+                cancellation_scope: Some(CancellationScope::Terminal),
+                error_code: None,
+            },
+        };
+        assert!(
+            !watchdog_gate.allows(&stale),
+            "an omitted terminal tombstone must still block its stale producer"
+        );
     }
 }
