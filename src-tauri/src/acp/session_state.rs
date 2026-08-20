@@ -18,8 +18,8 @@ use crate::acp::plan_approval::PendingPlanApprovalState;
 use crate::acp::question::PendingQuestionState;
 use crate::acp::types::{
     AcpEvent, AvailableCommandInfo, ConfigStaleKind, ConnectionStatus, EventEnvelope,
-    GrokEffortSpec, PromptCapabilitiesInfo, SessionConfigOptionInfo, SessionFailureRecord,
-    SessionModeStateInfo, ToolCallImageInfo,
+    GrokEffortSpec, PermissionOptionInfo, PromptCapabilitiesInfo, SessionConfigOptionInfo,
+    SessionFailureRecord, SessionModeStateInfo, ToolCallImageInfo, UserMessageBlock,
 };
 use crate::auto_title::{ConnectionPurpose, TurnCompletionSnapshot};
 use crate::models::agent::AgentType;
@@ -2282,31 +2282,97 @@ impl SessionState {
     const SNAPSHOT_TRUNCATED_SUFFIX: &'static str = "…[truncated]";
     const MAX_SNAPSHOT_IMAGE_DATA_BYTES: usize = 64 * 1024;
 
+    fn json_encoded_len<T: Serialize>(value: &T) -> usize {
+        serde_json::to_vec(value)
+            .map(|encoded| encoded.len())
+            .unwrap_or(usize::MAX)
+    }
+
+    /// Bytes `serde_json` adds for one char inside a JSON string (excluding quotes).
+    fn json_string_escape_cost(ch: char) -> usize {
+        match ch {
+            '"' | '\\' | '\u{0008}' | '\u{0009}' | '\u{000A}' | '\u{000C}' | '\u{000D}' => 2,
+            '\u{0000}'..='\u{001F}' => 6,
+            '\u{2028}' | '\u{2029}' => 6,
+            c => c.len_utf8(),
+        }
+    }
+
+    fn json_string_encoded_len(value: &str) -> usize {
+        2usize.saturating_add(
+            value
+                .chars()
+                .map(Self::json_string_escape_cost)
+                .sum::<usize>(),
+        )
+    }
+
+    fn prefix_bytes_within_json_body_budget(value: &str, body_budget: usize) -> usize {
+        let mut used = 0usize;
+        let mut prefix_bytes = 0usize;
+        for (i, ch) in value.char_indices() {
+            let cost = Self::json_string_escape_cost(ch);
+            if used.saturating_add(cost) > body_budget {
+                break;
+            }
+            used += cost;
+            prefix_bytes = i + ch.len_utf8();
+        }
+        prefix_bytes
+    }
+
+    fn truncated_json_marker() -> serde_json::Value {
+        serde_json::json!({ "truncated": true })
+    }
+
+    fn charge_or_zero(remaining_payload_bytes: &mut usize, bytes: usize) {
+        if bytes <= *remaining_payload_bytes {
+            *remaining_payload_bytes -= bytes;
+        } else {
+            *remaining_payload_bytes = 0;
+        }
+    }
+
     fn truncate_snapshot_text(
         value: &str,
         remaining_payload_bytes: &mut usize,
         truncation: &mut SnapshotTruncation,
     ) -> String {
-        if value.len() <= *remaining_payload_bytes {
-            *remaining_payload_bytes -= value.len();
+        let encoded = Self::json_string_encoded_len(value);
+        if encoded <= *remaining_payload_bytes {
+            *remaining_payload_bytes -= encoded;
             return value.to_owned();
         }
 
         truncation.truncated_text_fields += 1;
         let suffix = Self::SNAPSHOT_TRUNCATED_SUFFIX;
-        if *remaining_payload_bytes <= suffix.len() {
+        let suffix_encoded = Self::json_string_encoded_len(suffix);
+        if *remaining_payload_bytes <= suffix_encoded {
             *remaining_payload_bytes = 0;
             return suffix.to_owned();
         }
 
-        let mut prefix_bytes = (*remaining_payload_bytes - suffix.len()).min(value.len());
-        while !value.is_char_boundary(prefix_bytes) {
-            prefix_bytes -= 1;
-        }
+        let suffix_body = suffix_encoded.saturating_sub(2);
+        let prefix_body_budget = remaining_payload_bytes
+            .saturating_sub(2)
+            .saturating_sub(suffix_body);
+        let mut prefix_bytes =
+            Self::prefix_bytes_within_json_body_budget(value, prefix_body_budget);
         let mut projected = String::with_capacity(prefix_bytes + suffix.len());
         projected.push_str(&value[..prefix_bytes]);
         projected.push_str(suffix);
-        *remaining_payload_bytes = 0;
+        let mut projected_encoded = Self::json_string_encoded_len(&projected);
+        while projected_encoded > *remaining_payload_bytes && prefix_bytes > 0 {
+            prefix_bytes -= 1;
+            while prefix_bytes > 0 && !value.is_char_boundary(prefix_bytes) {
+                prefix_bytes -= 1;
+            }
+            projected.clear();
+            projected.push_str(&value[..prefix_bytes]);
+            projected.push_str(suffix);
+            projected_encoded = Self::json_string_encoded_len(&projected);
+        }
+        Self::charge_or_zero(remaining_payload_bytes, projected_encoded);
         projected
     }
 
@@ -2315,16 +2381,24 @@ impl SessionState {
         remaining_payload_bytes: &mut usize,
         truncation: &mut SnapshotTruncation,
     ) -> serde_json::Value {
-        let bytes = serde_json::to_vec(value)
-            .map(|encoded| encoded.len())
-            .unwrap_or(usize::MAX);
+        if let serde_json::Value::String(text) = value {
+            return serde_json::Value::String(Self::truncate_snapshot_text(
+                text,
+                remaining_payload_bytes,
+                truncation,
+            ));
+        }
+
+        let bytes = Self::json_encoded_len(value);
         if bytes <= *remaining_payload_bytes {
             *remaining_payload_bytes -= bytes;
             return value.clone();
         }
 
         truncation.truncated_text_fields += 1;
-        serde_json::Value::String(Self::SNAPSHOT_TRUNCATED_SUFFIX.to_owned())
+        let marker = Self::truncated_json_marker();
+        Self::charge_or_zero(remaining_payload_bytes, Self::json_encoded_len(&marker));
+        marker
     }
 
     fn project_tool_output(
@@ -2469,6 +2543,135 @@ impl SessionState {
         })
     }
 
+    fn pending_user_image_count(message: &PendingUserMessage) -> usize {
+        message
+            .blocks
+            .iter()
+            .filter(|block| matches!(block, UserMessageBlock::Image { .. }))
+            .count()
+    }
+
+    fn project_pending_user_message(
+        message: &PendingUserMessage,
+        limits: SnapshotLimits,
+        remaining_payload_bytes: &mut usize,
+        image_slots_used: &mut usize,
+        retained_image_payloads: &mut usize,
+        truncation: &mut SnapshotTruncation,
+    ) -> PendingUserMessage {
+        PendingUserMessage {
+            message_id: message.message_id.clone(),
+            blocks: message
+                .blocks
+                .iter()
+                .filter_map(|block| match block {
+                    UserMessageBlock::Text { text } => Some(UserMessageBlock::Text {
+                        text: Self::truncate_snapshot_text(
+                            text,
+                            remaining_payload_bytes,
+                            truncation,
+                        ),
+                    }),
+                    UserMessageBlock::Image { data, mime_type } => {
+                        if *image_slots_used >= limits.images {
+                            return None;
+                        }
+                        *image_slots_used += 1;
+                        if data.len() > Self::MAX_SNAPSHOT_IMAGE_DATA_BYTES
+                            || data.len() > *remaining_payload_bytes
+                        {
+                            Some(UserMessageBlock::Image {
+                                data: String::new(),
+                                mime_type: mime_type.clone(),
+                            })
+                        } else {
+                            *remaining_payload_bytes -= data.len();
+                            *retained_image_payloads += 1;
+                            Some(UserMessageBlock::Image {
+                                data: data.clone(),
+                                mime_type: Self::truncate_snapshot_text(
+                                    mime_type,
+                                    remaining_payload_bytes,
+                                    truncation,
+                                ),
+                            })
+                        }
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    fn project_pending_permission(
+        pending: &PendingPermissionState,
+        remaining_payload_bytes: &mut usize,
+        truncation: &mut SnapshotTruncation,
+    ) -> PendingPermissionState {
+        PendingPermissionState {
+            request_id: pending.request_id.clone(),
+            tool_call_id: pending.tool_call_id.clone(),
+            tool_call: Self::project_snapshot_json(
+                &pending.tool_call,
+                remaining_payload_bytes,
+                truncation,
+            ),
+            options: pending
+                .options
+                .iter()
+                .map(|option| PermissionOptionInfo {
+                    option_id: option.option_id.clone(),
+                    name: Self::truncate_snapshot_text(
+                        &option.name,
+                        remaining_payload_bytes,
+                        truncation,
+                    ),
+                    kind: option.kind.clone(),
+                    meta: option.meta.as_ref().map(|meta| {
+                        Self::project_snapshot_json(meta, remaining_payload_bytes, truncation)
+                    }),
+                })
+                .collect(),
+            created_at: pending.created_at,
+            queued: pending.queued,
+        }
+    }
+
+    fn project_last_error(
+        error: &SessionLastError,
+        remaining_payload_bytes: &mut usize,
+        truncation: &mut SnapshotTruncation,
+    ) -> SessionLastError {
+        SessionLastError {
+            message: Self::truncate_snapshot_text(
+                &error.message,
+                remaining_payload_bytes,
+                truncation,
+            ),
+            code: error.code.clone(),
+        }
+    }
+
+    fn project_available_commands(
+        commands: &[AvailableCommandInfo],
+        remaining_payload_bytes: &mut usize,
+        truncation: &mut SnapshotTruncation,
+    ) -> Vec<AvailableCommandInfo> {
+        commands
+            .iter()
+            .map(|command| AvailableCommandInfo {
+                name: command.name.clone(),
+                description: Self::truncate_snapshot_text(
+                    &command.description,
+                    remaining_payload_bytes,
+                    truncation,
+                ),
+                input_hint: command.input_hint.as_ref().map(|hint| {
+                    Self::truncate_snapshot_text(hint, remaining_payload_bytes, truncation)
+                }),
+            })
+            .collect()
+    }
+
     fn snapshot_structural_reserve(&self, limits: SnapshotLimits) -> usize {
         const BASE_BYTES: usize = 32 * 1024;
         const TOOL_BYTES: usize = 512;
@@ -2482,6 +2685,11 @@ impl SessionState {
             .as_ref()
             .map(|message| message.content.len())
             .unwrap_or(0);
+        let pending_user_images = self
+            .pending_user_message
+            .as_ref()
+            .map(Self::pending_user_image_count)
+            .unwrap_or(0);
         let image_count = self
             .active_tool_calls
             .values()
@@ -2489,6 +2697,7 @@ impl SessionState {
             .fold(0usize, |total, tool| {
                 total.saturating_add(tool.images.len())
             })
+            .saturating_add(pending_user_images)
             .min(limits.images);
         BASE_BYTES
             .saturating_add(
@@ -2527,9 +2736,16 @@ impl SessionState {
         let mut remaining_payload_bytes = limits.payload_bytes.saturating_sub(reserve);
         let live_message = self.project_live_message(&mut remaining_payload_bytes, &mut truncation);
 
-        let total_images = self.active_tool_calls.values().fold(0usize, |total, tool| {
-            total.saturating_add(tool.images.len())
-        });
+        let total_images = self
+            .active_tool_calls
+            .values()
+            .fold(0usize, |total, tool| total.saturating_add(tool.images.len()))
+            .saturating_add(
+                self.pending_user_message
+                    .as_ref()
+                    .map(Self::pending_user_image_count)
+                    .unwrap_or(0),
+            );
         let mut image_slots_used = 0;
         let mut retained_image_payloads = 0;
         let active_tool_calls: Vec<_> = self
@@ -2551,7 +2767,35 @@ impl SessionState {
             .active_tool_calls
             .len()
             .saturating_sub(active_tool_calls.len());
+        let pending_user_message = self.pending_user_message.as_ref().map(|message| {
+            Self::project_pending_user_message(
+                message,
+                limits,
+                &mut remaining_payload_bytes,
+                &mut image_slots_used,
+                &mut retained_image_payloads,
+                &mut truncation,
+            )
+        });
         truncation.omitted_images = total_images.saturating_sub(retained_image_payloads);
+        let pending_permission = self.pending_permission.as_ref().map(|pending| {
+            Self::project_pending_permission(pending, &mut remaining_payload_bytes, &mut truncation)
+        });
+        let last_error = self.last_error.as_ref().map(|error| {
+            Self::project_last_error(error, &mut remaining_payload_bytes, &mut truncation)
+        });
+        let available_commands = Self::project_available_commands(
+            &self.available_commands,
+            &mut remaining_payload_bytes,
+            &mut truncation,
+        );
+        let tool_watchdog_projections = self.tool_watchdog_projections.clone();
+        remaining_payload_bytes = remaining_payload_bytes
+            .saturating_sub(Self::json_encoded_len(&tool_watchdog_projections));
+        if let Some(diagnostic) = &self.last_tool_watchdog_diagnostic {
+            remaining_payload_bytes =
+                remaining_payload_bytes.saturating_sub(Self::json_encoded_len(diagnostic));
+        }
 
         let mut session_failures = Vec::new();
         for failure in self.session_failures.values().take(limits.failures) {
@@ -2610,13 +2854,13 @@ impl SessionState {
             external_id: self.external_id.clone(),
             live_message,
             active_tool_calls,
-            pending_permission: self.pending_permission.clone(),
+            pending_permission,
             pending_question: self.pending_question.clone(),
             waiting_for_subagents: self.waiting_for_subagents.clone(),
             pending_plan_approval: self.pending_plan_approval.clone(),
-            pending_user_message: self.pending_user_message.clone(),
+            pending_user_message,
             active_delegations: self.active_delegations.values().cloned().collect(),
-            tool_watchdog_projections: self.tool_watchdog_projections.clone(),
+            tool_watchdog_projections,
             tool_watchdog_max_versions,
             last_tool_watchdog_diagnostic: self.last_tool_watchdog_diagnostic.clone(),
             feedback: self.feedback.clone(),
@@ -2628,12 +2872,12 @@ impl SessionState {
             prompt_capabilities: self.prompt_capabilities.clone(),
             usage: self.usage.clone(),
             fork_supported: self.fork_supported,
-            available_commands: self.available_commands.clone(),
+            available_commands,
             selectors_ready: self.selectors_ready,
             config_stale: self.config_stale,
             config_stale_kind: self.config_stale_kind,
             delegation_route: self.delegation_route.clone(),
-            last_error: self.last_error.clone(),
+            last_error,
             session_failures,
             goal_actions: self.goal_actions.clone(),
             truncation: None,
@@ -5043,6 +5287,223 @@ mod tests {
         assert_eq!(s.active_tool_calls.len(), 300);
         assert_eq!(s.session_failures.len(), 1000);
         assert_eq!(s.tool_watchdog_max_versions.len(), 1002);
+    }
+
+    fn serialized_snapshot_frame(snapshot: &LiveSessionSnapshot) -> Vec<u8> {
+        serde_json::to_vec(&crate::web::ws_attach::ServerMsg::Snapshot {
+            subscription_id: "subscription".into(),
+            connection_id: snapshot.connection_id.clone(),
+            snapshot: Box::new(snapshot.clone()),
+            event_seq: snapshot.event_seq,
+        })
+        .expect("snapshot frame serializes")
+    }
+
+    fn assert_projected_json_keeps_object_shape(label: &str, value: Option<&serde_json::Value>) {
+        if let Some(value) = value {
+            assert!(
+                value.is_object() || value.is_array(),
+                "{label} must stay an object or array after truncation, got {value}"
+            );
+            assert!(
+                !value.is_string(),
+                "{label} must not become a JSON string, got {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_charges_pending_user_image_and_permission_against_attach_budget() {
+        const OVERSIZE: usize = 5 * 1024 * 1024;
+        let mut s = fresh_state();
+        let image_data = "A".repeat(OVERSIZE);
+        let permission_patch = "P".repeat(OVERSIZE);
+        s.pending_user_message = Some(PendingUserMessage {
+            message_id: "user-screenshot".into(),
+            blocks: vec![UserMessageBlock::Image {
+                data: image_data.clone(),
+                mime_type: "image/png".into(),
+            }],
+        });
+        s.pending_permission = Some(PendingPermissionState {
+            request_id: "perm-1".into(),
+            tool_call_id: "tc-perm".into(),
+            tool_call: serde_json::json!({
+                "rawInput": { "patch": permission_patch },
+            }),
+            options: vec![],
+            created_at: Utc::now(),
+            queued: 0,
+        });
+
+        let snapshot = s.to_snapshot();
+        let encoded = serialized_snapshot_frame(&snapshot);
+        assert!(
+            encoded.len() <= MAX_ATTACH_FRAME_BYTES,
+            "snapshot frame {} exceeds {}",
+            encoded.len(),
+            MAX_ATTACH_FRAME_BYTES
+        );
+        let frame: serde_json::Value =
+            serde_json::from_slice(&encoded).expect("snapshot frame is JSON");
+        assert_eq!(frame["type"], "snapshot");
+        let truncation = snapshot.truncation.as_ref().expect("truncation reported");
+        assert!(
+            truncation.omitted_images >= 1 || truncation.truncated_text_fields >= 1,
+            "large pending image/permission must count as truncation, got {truncation:?}"
+        );
+
+        match &s.pending_user_message.as_ref().unwrap().blocks[0] {
+            UserMessageBlock::Image { data, .. } => {
+                assert_eq!(data.len(), OVERSIZE, "live image bytes must stay intact");
+            }
+            other => panic!("expected live image block, got {other:?}"),
+        }
+        assert_eq!(
+            s.pending_permission.as_ref().unwrap().tool_call["rawInput"]["patch"]
+                .as_str()
+                .unwrap()
+                .len(),
+            OVERSIZE,
+            "live permission payload must stay intact"
+        );
+    }
+
+    #[test]
+    fn snapshot_truncated_json_meta_and_input_remain_objects() {
+        const MIB: usize = 1024 * 1024;
+        let mut s = fresh_state();
+        s.live_message = Some(LiveMessage {
+            id: "live-json-budget".into(),
+            role: MessageRole::Assistant,
+            content: vec![
+                LiveContentBlock::Text {
+                    text: "x".repeat(MIB),
+                    parent_tool_use_id: None,
+                },
+                LiveContentBlock::Plan {
+                    entries: serde_json::json!([{ "step": "one" }]),
+                },
+            ],
+            started_at: Utc::now(),
+        });
+        s.active_tool_calls.insert(
+            "tool-json".into(),
+            ToolCallState {
+                id: "tool-json".into(),
+                kind: ToolKind::Other,
+                label: "json shape".into(),
+                status: ToolCallStatus::InProgress,
+                input: Some(serde_json::json!({
+                    "command": "ls",
+                    "args": ["-la"],
+                })),
+                output: None,
+                content: None,
+                locations: Some(serde_json::json!({ "path": "src/main.rs" })),
+                meta: Some(serde_json::json!({
+                    "codeg.delegation": { "child_connection_id": "child-1" }
+                })),
+                images: Vec::new(),
+                raw_input_chunks: Vec::new(),
+                raw_input_accum: String::new(),
+                raw_input_frozen: false,
+            },
+        );
+        let limits = SnapshotLimits {
+            payload_bytes: 96 * 1024,
+            tool_calls: 4,
+            images: 4,
+            failures: 4,
+            watchdog_tombstones: 4,
+        };
+
+        let snapshot = s.to_snapshot_with_limits(limits);
+        let tool = snapshot
+            .active_tool_calls
+            .iter()
+            .find(|tool| tool.id == "tool-json")
+            .expect("tool projected");
+        assert_projected_json_keeps_object_shape("input", tool.input.as_ref());
+        assert_projected_json_keeps_object_shape("meta", tool.meta.as_ref());
+        assert_projected_json_keeps_object_shape("locations", tool.locations.as_ref());
+        let plan_entries = snapshot
+            .live_message
+            .as_ref()
+            .unwrap()
+            .content
+            .iter()
+            .find_map(|block| match block {
+                LiveContentBlock::Plan { entries } => Some(entries),
+                _ => None,
+            })
+            .expect("plan projected");
+        assert_projected_json_keeps_object_shape("plan", Some(plan_entries));
+        let truncation = snapshot.truncation.as_ref().expect("truncation reported");
+        assert!(
+            truncation.truncated_text_fields >= 4,
+            "live text plus truncated JSON fields must increment the counter, got {}",
+            truncation.truncated_text_fields
+        );
+        assert!(
+            tool.input.as_ref().is_none_or(|value| value.is_object()),
+            "truncated input must be omitted or remain an object"
+        );
+        assert!(
+            tool.meta.as_ref().is_none_or(|value| value.is_object()),
+            "truncated meta must be omitted or remain an object"
+        );
+    }
+
+    #[test]
+    fn snapshot_json_escape_expansion_stays_within_attach_frame() {
+        // Raw UTF-8 sits under the 3 MiB content budget, but JSON doubling of
+        // `\` would push a naive projection past the 4 MiB attach ceiling.
+        let backslashes = "\\".repeat(2 * 1024 * 1024 + 256 * 1024);
+        let mut s = fresh_state();
+        s.active_tool_calls.insert(
+            "tool-paths".into(),
+            ToolCallState {
+                id: "tool-paths".into(),
+                kind: ToolKind::Execute,
+                label: "dir".into(),
+                status: ToolCallStatus::Completed,
+                input: None,
+                output: Some(ToolCallOutput::Text {
+                    content: backslashes,
+                }),
+                content: None,
+                locations: None,
+                meta: None,
+                images: Vec::new(),
+                raw_input_chunks: Vec::new(),
+                raw_input_accum: String::new(),
+                raw_input_frozen: false,
+            },
+        );
+
+        let snapshot = s.to_snapshot();
+        let encoded = serialized_snapshot_frame(&snapshot);
+        assert!(
+            encoded.len() <= MAX_ATTACH_FRAME_BYTES,
+            "escaped snapshot frame {} exceeds {}",
+            encoded.len(),
+            MAX_ATTACH_FRAME_BYTES
+        );
+        let frame: serde_json::Value =
+            serde_json::from_slice(&encoded).expect("snapshot frame is JSON");
+        assert_eq!(frame["type"], "snapshot");
+        let truncation = snapshot.truncation.as_ref().expect("escape overflow truncated");
+        assert!(
+            truncation.truncated_text_fields >= 1,
+            "JSON escape growth must count as a truncated text field"
+        );
+        match &s.active_tool_calls["tool-paths"].output {
+            Some(ToolCallOutput::Text { content }) => {
+                assert_eq!(content.len(), 2 * 1024 * 1024 + 256 * 1024);
+            }
+            other => panic!("live output must stay the full backslash log, got {other:?}"),
+        }
     }
 
     #[test]
