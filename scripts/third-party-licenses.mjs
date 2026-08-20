@@ -23,6 +23,11 @@ export const CARGO_TARGETS = [
   "aarch64-apple-darwin",
 ]
 
+export const NPM_SUPPORTED_ARCHITECTURES = {
+  os: ["darwin", "linux", "win32"],
+  cpu: ["arm64", "x64"],
+}
+
 const compareStrings = (left, right) =>
   left < right ? -1 : left > right ? 1 : 0
 
@@ -271,11 +276,11 @@ const mergeEquivalentLicenseTexts = (identifier, left, right) => {
     )
 }
 
-export const collectCargoPackageUnion = (cargoMetadataRecords) => {
+const unionPackageRecords = (recordGroups) => {
   const packagesByIdentifier = new Map()
 
-  for (const cargoMetadata of cargoMetadataRecords) {
-    for (const record of collectCargoPackages(cargoMetadata)) {
+  for (const records of recordGroups) {
+    for (const record of records) {
       const identifier = packageIdentifier(record)
       const existing = packagesByIdentifier.get(identifier)
       if (!existing) {
@@ -308,6 +313,18 @@ export const collectCargoPackageUnion = (cargoMetadataRecords) => {
 
   return [...packagesByIdentifier.values()].sort(compareRecords)
 }
+
+export const collectNpmPackageUnion = (pnpmReports) =>
+  unionPackageRecords(
+    pnpmReports.map((pnpmReport) => collectNpmPackages(pnpmReport))
+  )
+
+export const collectCargoPackageUnion = (cargoMetadataRecords) =>
+  unionPackageRecords(
+    cargoMetadataRecords.map((cargoMetadata) =>
+      collectCargoPackages(cargoMetadata)
+    )
+  )
 
 export const renderLicenseReport = (records) => {
   const sortedRecords = records
@@ -355,6 +372,10 @@ export const renderLicenseReport = (records) => {
     "This report covers locked npm production dependencies and Cargo",
     "normal/build dependency graphs for the deterministic union of these targets:",
     ...CARGO_TARGETS.map((target) => `- ${target}`),
+    "npm optional native packages are included for these supported architectures:",
+    ...NPM_SUPPORTED_ARCHITECTURES.os.flatMap((os) =>
+      NPM_SUPPORTED_ARCHITECTURES.cpu.map((cpu) => `- ${os}/${cpu}`)
+    ),
     "",
     "PACKAGE INVENTORY",
     "=================",
@@ -433,7 +454,7 @@ export const generateLicenseReport = () => {
     )
   )
   const records = [
-    ...collectNpmPackages(pnpmReport),
+    ...collectNpmPackageUnion([pnpmReport]),
     ...collectCodexAcpPackages(),
     ...collectCargoPackageUnion(cargoMetadataRecords),
   ]

@@ -9,6 +9,7 @@ import {
   collectCargoPackages,
   collectCodexAcpPackages,
   collectNpmPackages,
+  collectNpmPackageUnion,
   findLicenseFiles,
   renderLicenseReport,
 } from "./third-party-licenses.mjs"
@@ -139,6 +140,79 @@ test("collects npm versions and accepts khroma's lowercase license file", () => 
   assert.deepEqual(records[2].licenseTexts, [
     { name: "license", text: "Khroma text" },
   ])
+})
+
+test("unions npm reports across Darwin, Windows, and Linux independently of host OS", async () => {
+  const { NPM_SUPPORTED_ARCHITECTURES } =
+    await import("./third-party-licenses.mjs")
+  const shared = makePackageDirectory("shared", { LICENSE: "Shared terms" })
+  const nativeDirectory = (name) =>
+    makePackageDirectory(name, { LICENSE: `${name} terms` })
+  const nativePackages = {
+    "darwin-arm64": nativeDirectory("fsevents-darwin-arm64"),
+    "darwin-x64": nativeDirectory("fsevents-darwin-x64"),
+    "linux-arm64": nativeDirectory("fsevents-linux-arm64"),
+    "linux-x64": nativeDirectory("fsevents-linux-x64"),
+    "win32-arm64": nativeDirectory("fsevents-win32-arm64"),
+    "win32-x64": nativeDirectory("fsevents-win32-x64"),
+  }
+  const npmEntry = (name, directory) => ({
+    name,
+    versions: ["1.0.0"],
+    paths: [directory],
+    license: "MIT",
+    homepage: `https://example.test/${name}`,
+  })
+  const reportForHost = (platformKeys) => ({
+    MIT: [
+      npmEntry("shared", shared),
+      ...platformKeys.map((key) =>
+        npmEntry(`@native/${key}`, nativePackages[key])
+      ),
+    ],
+  })
+  const darwinReport = reportForHost(["darwin-arm64", "darwin-x64"])
+  const windowsReport = reportForHost(["win32-arm64", "win32-x64"])
+  const linuxReport = reportForHost(["linux-arm64", "linux-x64"])
+
+  assert.deepEqual(NPM_SUPPORTED_ARCHITECTURES, {
+    os: ["darwin", "linux", "win32"],
+    cpu: ["arm64", "x64"],
+  })
+
+  const fromDarwin = collectNpmPackageUnion([
+    darwinReport,
+    windowsReport,
+    linuxReport,
+  ])
+  const fromWindows = collectNpmPackageUnion([
+    windowsReport,
+    darwinReport,
+    linuxReport,
+  ])
+  const fromLinux = collectNpmPackageUnion([
+    linuxReport,
+    windowsReport,
+    darwinReport,
+  ])
+
+  const expected = [
+    { name: "@native/darwin-arm64", version: "1.0.0" },
+    { name: "@native/darwin-x64", version: "1.0.0" },
+    { name: "@native/linux-arm64", version: "1.0.0" },
+    { name: "@native/linux-x64", version: "1.0.0" },
+    { name: "@native/win32-arm64", version: "1.0.0" },
+    { name: "@native/win32-x64", version: "1.0.0" },
+    { name: "shared", version: "1.0.0" },
+  ]
+  const namesAndVersions = (records) =>
+    records.map(({ name, version }) => ({ name, version }))
+
+  assert.deepEqual(namesAndVersions(fromDarwin), expected)
+  assert.deepEqual(namesAndVersions(fromWindows), expected)
+  assert.deepEqual(namesAndVersions(fromLinux), expected)
+  assert.deepEqual(fromDarwin, fromWindows)
+  assert.deepEqual(fromDarwin, fromLinux)
 })
 
 test("collects the bundled codex fork and locked production dependencies", () => {
@@ -648,6 +722,12 @@ test("sorts packages, omits paths, and deduplicates license text by hash", () =>
   assert.match(output, /aarch64-pc-windows-msvc/)
   assert.match(output, /x86_64-apple-darwin/)
   assert.match(output, /aarch64-apple-darwin/)
+  assert.match(output, /darwin\/arm64/)
+  assert.match(output, /darwin\/x64/)
+  assert.match(output, /linux\/arm64/)
+  assert.match(output, /linux\/x64/)
+  assert.match(output, /win32\/arm64/)
+  assert.match(output, /win32\/x64/)
 })
 
 test("rejects packages missing both a declaration and license text", () => {

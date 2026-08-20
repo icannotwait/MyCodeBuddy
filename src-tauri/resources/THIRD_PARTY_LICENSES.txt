@@ -6,6 +6,13 @@ normal/build dependency graphs for the deterministic union of these targets:
 - aarch64-pc-windows-msvc
 - x86_64-apple-darwin
 - aarch64-apple-darwin
+npm optional native packages are included for these supported architectures:
+- darwin/arm64
+- darwin/x64
+- linux/arm64
+- linux/x64
+- win32/arm64
+- win32/x64
 
 PACKAGE INVENTORY
 =================
@@ -3698,10 +3705,70 @@ Declared license: Apache-2.0
 Homepage: https://sharp.pixelplumbing.com
 License text SHA-256: 9ff562631a04b8cb1030c53fdf461bd749c9af0655d86e4f17eb270e935a7fe2
 
+npm:@img/sharp-darwin-x64@0.34.5
+Declared license: Apache-2.0
+Homepage: https://sharp.pixelplumbing.com
+License text SHA-256: 9ff562631a04b8cb1030c53fdf461bd749c9af0655d86e4f17eb270e935a7fe2
+
 npm:@img/sharp-libvips-darwin-arm64@1.2.4
 Declared license: LGPL-3.0-or-later
 Homepage: https://sharp.pixelplumbing.com
 License text SHA-256: none
+
+npm:@img/sharp-libvips-darwin-x64@1.2.4
+Declared license: LGPL-3.0-or-later
+Homepage: https://sharp.pixelplumbing.com
+License text SHA-256: none
+
+npm:@img/sharp-libvips-linux-arm64@1.2.4
+Declared license: LGPL-3.0-or-later
+Homepage: https://sharp.pixelplumbing.com
+License text SHA-256: none
+
+npm:@img/sharp-libvips-linux-x64@1.2.4
+Declared license: LGPL-3.0-or-later
+Homepage: https://sharp.pixelplumbing.com
+License text SHA-256: none
+
+npm:@img/sharp-libvips-linuxmusl-arm64@1.2.4
+Declared license: LGPL-3.0-or-later
+Homepage: https://sharp.pixelplumbing.com
+License text SHA-256: none
+
+npm:@img/sharp-libvips-linuxmusl-x64@1.2.4
+Declared license: LGPL-3.0-or-later
+Homepage: https://sharp.pixelplumbing.com
+License text SHA-256: none
+
+npm:@img/sharp-linux-arm64@0.34.5
+Declared license: Apache-2.0
+Homepage: https://sharp.pixelplumbing.com
+License text SHA-256: 9ff562631a04b8cb1030c53fdf461bd749c9af0655d86e4f17eb270e935a7fe2
+
+npm:@img/sharp-linux-x64@0.34.5
+Declared license: Apache-2.0
+Homepage: https://sharp.pixelplumbing.com
+License text SHA-256: 9ff562631a04b8cb1030c53fdf461bd749c9af0655d86e4f17eb270e935a7fe2
+
+npm:@img/sharp-linuxmusl-arm64@0.34.5
+Declared license: Apache-2.0
+Homepage: https://sharp.pixelplumbing.com
+License text SHA-256: 9ff562631a04b8cb1030c53fdf461bd749c9af0655d86e4f17eb270e935a7fe2
+
+npm:@img/sharp-linuxmusl-x64@0.34.5
+Declared license: Apache-2.0
+Homepage: https://sharp.pixelplumbing.com
+License text SHA-256: 9ff562631a04b8cb1030c53fdf461bd749c9af0655d86e4f17eb270e935a7fe2
+
+npm:@img/sharp-win32-arm64@0.34.5
+Declared license: Apache-2.0 AND LGPL-3.0-or-later
+Homepage: https://sharp.pixelplumbing.com
+License text SHA-256: 9ff562631a04b8cb1030c53fdf461bd749c9af0655d86e4f17eb270e935a7fe2
+
+npm:@img/sharp-win32-x64@0.34.5
+Declared license: Apache-2.0 AND LGPL-3.0-or-later
+Homepage: https://sharp.pixelplumbing.com
+License text SHA-256: 9ff562631a04b8cb1030c53fdf461bd749c9af0655d86e4f17eb270e935a7fe2
 
 npm:@inquirer/ansi@1.0.2
 Declared license: MIT
@@ -3797,6 +3864,41 @@ Declared license: MIT
 Homepage: https://github.com/vercel/next.js#readme
 License text SHA-256: none
 
+npm:@next/swc-darwin-x64@16.1.6
+Declared license: MIT
+Homepage: https://github.com/vercel/next.js#readme
+License text SHA-256: none
+
+npm:@next/swc-linux-arm64-gnu@16.1.6
+Declared license: MIT
+Homepage: https://github.com/vercel/next.js#readme
+License text SHA-256: none
+
+npm:@next/swc-linux-arm64-musl@16.1.6
+Declared license: MIT
+Homepage: https://github.com/vercel/next.js#readme
+License text SHA-256: none
+
+npm:@next/swc-linux-x64-gnu@16.1.6
+Declared license: MIT
+Homepage: https://github.com/vercel/next.js#readme
+License text SHA-256: none
+
+npm:@next/swc-linux-x64-musl@16.1.6
+Declared license: MIT
+Homepage: https://github.com/vercel/next.js#readme
+License text SHA-256: none
+
+npm:@next/swc-win32-arm64-msvc@16.1.6
+Declared license: MIT
+Homepage: https://github.com/vercel/next.js#readme
+License text SHA-256: none
+
+npm:@next/swc-win32-x64-msvc@16.1.6
+Declared license: MIT
+Homepage: https://github.com/vercel/next.js#readme
+License text SHA-256: none
+
 npm:@noble/ciphers@1.3.0
 Declared license: MIT
 Homepage: https://paulmillr.com/noble/
@@ -3885,6 +3987,41 @@ Homepage: https://github.com/parcel-bundler/watcher#readme
 License text SHA-256: f46060baf8276d8c6c987cd4b598780aa08068cb58d4e2545c1559a1b28af92f
 
 npm:@parcel/watcher-darwin-arm64@2.5.6
+Declared license: MIT
+Homepage: https://github.com/parcel-bundler/watcher#readme
+License text SHA-256: f46060baf8276d8c6c987cd4b598780aa08068cb58d4e2545c1559a1b28af92f
+
+npm:@parcel/watcher-darwin-x64@2.5.6
+Declared license: MIT
+Homepage: https://github.com/parcel-bundler/watcher#readme
+License text SHA-256: f46060baf8276d8c6c987cd4b598780aa08068cb58d4e2545c1559a1b28af92f
+
+npm:@parcel/watcher-linux-arm64-glibc@2.5.6
+Declared license: MIT
+Homepage: https://github.com/parcel-bundler/watcher#readme
+License text SHA-256: f46060baf8276d8c6c987cd4b598780aa08068cb58d4e2545c1559a1b28af92f
+
+npm:@parcel/watcher-linux-arm64-musl@2.5.6
+Declared license: MIT
+Homepage: https://github.com/parcel-bundler/watcher#readme
+License text SHA-256: f46060baf8276d8c6c987cd4b598780aa08068cb58d4e2545c1559a1b28af92f
+
+npm:@parcel/watcher-linux-x64-glibc@2.5.6
+Declared license: MIT
+Homepage: https://github.com/parcel-bundler/watcher#readme
+License text SHA-256: f46060baf8276d8c6c987cd4b598780aa08068cb58d4e2545c1559a1b28af92f
+
+npm:@parcel/watcher-linux-x64-musl@2.5.6
+Declared license: MIT
+Homepage: https://github.com/parcel-bundler/watcher#readme
+License text SHA-256: f46060baf8276d8c6c987cd4b598780aa08068cb58d4e2545c1559a1b28af92f
+
+npm:@parcel/watcher-win32-arm64@2.5.6
+Declared license: MIT
+Homepage: https://github.com/parcel-bundler/watcher#readme
+License text SHA-256: f46060baf8276d8c6c987cd4b598780aa08068cb58d4e2545c1559a1b28af92f
+
+npm:@parcel/watcher-win32-x64@2.5.6
 Declared license: MIT
 Homepage: https://github.com/parcel-bundler/watcher#readme
 License text SHA-256: f46060baf8276d8c6c987cd4b598780aa08068cb58d4e2545c1559a1b28af92f
@@ -4355,6 +4492,41 @@ Homepage: https://swc.rs
 License text SHA-256: none
 
 npm:@swc/core-darwin-arm64@1.15.18
+Declared license: Apache-2.0 AND MIT
+Homepage: https://swc.rs
+License text SHA-256: none
+
+npm:@swc/core-darwin-x64@1.15.18
+Declared license: Apache-2.0 AND MIT
+Homepage: https://swc.rs
+License text SHA-256: none
+
+npm:@swc/core-linux-arm64-gnu@1.15.18
+Declared license: Apache-2.0 AND MIT
+Homepage: https://swc.rs
+License text SHA-256: none
+
+npm:@swc/core-linux-arm64-musl@1.15.18
+Declared license: Apache-2.0 AND MIT
+Homepage: https://swc.rs
+License text SHA-256: none
+
+npm:@swc/core-linux-x64-gnu@1.15.18
+Declared license: Apache-2.0 AND MIT
+Homepage: https://swc.rs
+License text SHA-256: none
+
+npm:@swc/core-linux-x64-musl@1.15.18
+Declared license: Apache-2.0 AND MIT
+Homepage: https://swc.rs
+License text SHA-256: none
+
+npm:@swc/core-win32-arm64-msvc@1.15.18
+Declared license: Apache-2.0 AND MIT
+Homepage: https://swc.rs
+License text SHA-256: none
+
+npm:@swc/core-win32-x64-msvc@1.15.18
 Declared license: Apache-2.0 AND MIT
 Homepage: https://swc.rs
 License text SHA-256: none
@@ -19406,6 +19578,13 @@ THIS SOFTWARE.
 SHA-256: 9ff562631a04b8cb1030c53fdf461bd749c9af0655d86e4f17eb270e935a7fe2
 Packages:
 - npm:@img/sharp-darwin-arm64@0.34.5
+- npm:@img/sharp-darwin-x64@0.34.5
+- npm:@img/sharp-linux-arm64@0.34.5
+- npm:@img/sharp-linux-x64@0.34.5
+- npm:@img/sharp-linuxmusl-arm64@0.34.5
+- npm:@img/sharp-linuxmusl-x64@0.34.5
+- npm:@img/sharp-win32-arm64@0.34.5
+- npm:@img/sharp-win32-x64@0.34.5
 - npm:sharp@0.34.5
 
 Apache License
@@ -25301,6 +25480,13 @@ SOFTWARE.
 SHA-256: f46060baf8276d8c6c987cd4b598780aa08068cb58d4e2545c1559a1b28af92f
 Packages:
 - npm:@parcel/watcher-darwin-arm64@2.5.6
+- npm:@parcel/watcher-darwin-x64@2.5.6
+- npm:@parcel/watcher-linux-arm64-glibc@2.5.6
+- npm:@parcel/watcher-linux-arm64-musl@2.5.6
+- npm:@parcel/watcher-linux-x64-glibc@2.5.6
+- npm:@parcel/watcher-linux-x64-musl@2.5.6
+- npm:@parcel/watcher-win32-arm64@2.5.6
+- npm:@parcel/watcher-win32-x64@2.5.6
 - npm:@parcel/watcher@2.5.6
 
 MIT License
