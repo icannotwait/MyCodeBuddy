@@ -1732,6 +1732,9 @@ impl ConnectionManager {
         &self,
         launch: SharedConnectLaunch,
     ) -> Result<SharedSessionAttachment, AcpError> {
+        let _permit = self.admission.admit()?;
+        #[cfg(test)]
+        self.hold_after_admission_for_test().await;
         self.admission.ensure_accepting()?;
         assert_eq!(
             launch.launch_context.purpose, launch.launch_identity.purpose,
@@ -12406,6 +12409,40 @@ mod tests {
             manager.connections.lock().await.is_empty(),
             "drain must remove the parent and the admitted connection"
         );
+        assert_eq!(manager.admission_in_flight_for_test(), 0);
+    }
+
+    #[tokio::test]
+    async fn shutdown_admission_race_shared_connect_cannot_attach_after_shutdown() {
+        let manager = ConnectionManager::new_with_shared_spawn_driver(Arc::new(
+            FakeSharedSpawnDriver::immediate_ready(),
+        ));
+        let existing = manager
+            .connect_or_attach_shared(shared_launch(802, "creator").await)
+            .await
+            .unwrap();
+        assert_ne!(existing.phase, SharedSessionPhase::Reserved);
+
+        let (reached, resume) = install_admission_insert_hold(&manager);
+        let held_manager = manager.clone_ref();
+        let held = tokio::spawn(async move {
+            held_manager
+                .connect_or_attach_shared(shared_launch(802, "attacher").await)
+                .await
+        });
+        reached.notified().await;
+
+        manager.begin_shutdown();
+        let mut wait = Box::pin(manager.wait_for_admissions());
+        assert!(
+            matches!(futures::poll!(wait.as_mut()), std::task::Poll::Pending),
+            "wait_for_admissions returned while shared connect was still in flight"
+        );
+        assert_eq!(manager.admission_in_flight_for_test(), 1);
+
+        resume.notify_one();
+        assert_server_shutting_down(held.await.expect("held shared connect join"));
+        wait.await;
         assert_eq!(manager.admission_in_flight_for_test(), 0);
     }
 
