@@ -102,6 +102,10 @@ impl HttpResponse {
         self.assert_status(StatusCode::UNAUTHORIZED)
     }
 
+    fn assert_status_service_unavailable(self) -> Self {
+        self.assert_status(StatusCode::SERVICE_UNAVAILABLE)
+    }
+
     fn assert_code(self, code: &str) -> Self {
         assert_eq!(self.body.get("code").and_then(Value::as_str), Some(code));
         self
@@ -2484,6 +2488,17 @@ async fn shutdown_fences_admission_keeps_release_available_and_restart_is_empty(
         .await
         .assert_status_ok();
 
+    fixture.manager().begin_shutdown();
+    fixture
+        .post_connect(
+            "shutdown-device-2",
+            "shutdown-client-2",
+            "shutdown-connect-2",
+        )
+        .await
+        .assert_status_service_unavailable()
+        .assert_code("server_shutting_down");
+
     fixture
         .manager()
         .shared_session_broker()
@@ -2502,13 +2517,13 @@ async fn shutdown_fences_admission_keeps_release_available_and_restart_is_empty(
 
     fixture
         .post_connect(
-            "shutdown-device-2",
-            "shutdown-client-2",
-            "shutdown-connect-2",
+            "shutdown-device-3",
+            "shutdown-client-3",
+            "shutdown-connect-3",
         )
         .await
-        .assert_status_conflict()
-        .assert_code("shared_session_closing");
+        .assert_status_service_unavailable()
+        .assert_code("server_shutting_down");
     fixture
         .post_json("/acp_prompt", prompt)
         .await
@@ -2555,7 +2570,7 @@ async fn shutdown_fences_admission_keeps_release_available_and_restart_is_empty(
 
     fixture
         .manager()
-        .disconnect_all(AcpDisconnectOrigin::ApplicationShutdown)
+        .drain_for_shutdown(AcpDisconnectOrigin::ApplicationShutdown)
         .await;
     assert!(fixture
         .manager()

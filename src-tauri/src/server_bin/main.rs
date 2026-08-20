@@ -726,15 +726,64 @@ async fn async_main() -> ExitCode {
         tracing::info!("  {}", addr);
     }
 
-    // Start serving
-    if let Err(e) = axum::serve(listener, router).await {
-        tracing::error!("[SERVER] Server error: {}", e);
-        return ExitCode::from(1);
+    let connection_manager = state.connection_manager.clone_ref();
+    let shutdown_for_serve = state.web_server_state.shutdown_signal();
+    let shutdown_for_axum = shutdown_for_serve.clone();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router)
+            .with_graceful_shutdown(async move {
+                shutdown_for_axum.wait().await;
+            })
+            .await
+    });
+
+    wait_for_shutdown_signal().await;
+    tracing::info!("[SERVER] shutdown signal received; stopping accept then draining ACP");
+    connection_manager.begin_shutdown();
+    shutdown_for_serve.trigger();
+    connection_manager.wait_for_admissions().await;
+    match server.await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            tracing::error!("[SERVER] Server error: {}", e);
+            return ExitCode::from(1);
+        }
+        Err(e) => {
+            tracing::error!("[SERVER] Server join error: {}", e);
+            return ExitCode::from(1);
+        }
     }
+    connection_manager
+        .drain_for_shutdown(codeg_lib::acp::termination::AcpDisconnectOrigin::ApplicationShutdown)
+        .await;
+    codeg_lib::acp::terminal_runtime::kill_all_registered_acp_terminals().await;
     // Graceful shutdown: release any live office watch preview servers
     // (kill_on_drop is the backstop, but this frees their ports promptly).
     codeg_lib::office_watch::stop_all_office_watches();
     ExitCode::SUCCESS
+}
+
+async fn wait_for_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("[SERVER] could not install SIGTERM handler: {e}");
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = sigterm.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 fn default_data_dir() -> PathBuf {

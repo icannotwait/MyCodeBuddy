@@ -121,6 +121,9 @@ pub enum AcpError {
     /// message and the frontend renders the suggestion alongside it.
     #[error("{0}")]
     McpRejectedByAgent(String),
+    /// Process-wide ACP admission is closed because the server is shutting down.
+    #[error("server is shutting down")]
+    ServerShuttingDown,
     #[error(transparent)]
     Shared(#[from] SharedSessionError),
 }
@@ -185,6 +188,7 @@ impl AcpError {
                 Some("completion_protocol_configuration_removed")
             }
             Self::McpRejectedByAgent(_) => Some("mcp_rejected_by_agent"),
+            Self::ServerShuttingDown => Some("server_shutting_down"),
             Self::Shared(error) => Some(error.code()),
             Self::Protocol(_) => None,
         }
@@ -336,6 +340,10 @@ impl AcpError {
                 )
                 .with_detail(*variable),
             ),
+            AcpError::ServerShuttingDown => Some(AppCommandError::new(
+                AppErrorCode::ServerShuttingDown,
+                "server is shutting down",
+            )),
             AcpError::Shared(error) => Some(AppCommandError::new(
                 app_error_code_for_shared_session(error),
                 error.to_string(),

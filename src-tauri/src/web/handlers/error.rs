@@ -16,6 +16,7 @@ fn status_for_app_error_code(code: AppErrorCode) -> StatusCode {
         | AppErrorCode::InvalidSharedSessionField
         | AppErrorCode::InvalidPattern
         | AppErrorCode::InvalidRequest => StatusCode::BAD_REQUEST,
+        AppErrorCode::ServerShuttingDown => StatusCode::SERVICE_UNAVAILABLE,
         AppErrorCode::NotFound => StatusCode::NOT_FOUND,
         AppErrorCode::AlreadyExists
         | AppErrorCode::TurnInProgress

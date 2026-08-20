@@ -579,6 +579,13 @@ struct DisconnectFinalCasHook {
 
 #[cfg(test)]
 #[derive(Clone)]
+struct AdmissionInsertHold {
+    reached: Arc<tokio::sync::Notify>,
+    resume: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
 struct RebindAfterSnapshotHook {
     reached: Arc<tokio::sync::Notify>,
     resume: Arc<tokio::sync::Notify>,
@@ -713,6 +720,106 @@ impl SharedControlAdapter for ManagerSharedControlAdapter {
     }
 }
 
+struct AdmissionState {
+    accepting: bool,
+    in_flight: usize,
+}
+
+/// Process-wide ACP connection admission. Closed by
+/// [`ConnectionManager::begin_shutdown`]; RAII permits keep in-flight
+/// creates visible until they insert into the map or fail.
+pub struct ConnectionAdmissionGate {
+    state: std::sync::Mutex<AdmissionState>,
+    drained: tokio::sync::Notify,
+}
+
+/// Held from the start of a create/spawn path until the connection is in
+/// the manager map or the attempt fails.
+pub struct ConnectionAdmissionPermit {
+    gate: Arc<ConnectionAdmissionGate>,
+}
+
+impl ConnectionAdmissionGate {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: std::sync::Mutex::new(AdmissionState {
+                accepting: true,
+                in_flight: 0,
+            }),
+            drained: tokio::sync::Notify::new(),
+        })
+    }
+
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, AdmissionState> {
+        self.state.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
+    fn admit(self: &Arc<Self>) -> Result<ConnectionAdmissionPermit, AcpError> {
+        let mut state = self.lock_state();
+        if !state.accepting {
+            return Err(AcpError::ServerShuttingDown);
+        }
+        state.in_flight += 1;
+        Ok(ConnectionAdmissionPermit {
+            gate: Arc::clone(self),
+        })
+    }
+
+    fn ensure_accepting(&self) -> Result<(), AcpError> {
+        if self.lock_state().accepting {
+            Ok(())
+        } else {
+            Err(AcpError::ServerShuttingDown)
+        }
+    }
+
+    fn close(&self) {
+        let mut state = self.lock_state();
+        state.accepting = false;
+        let idle = state.in_flight == 0;
+        drop(state);
+        if idle {
+            self.drained.notify_waiters();
+        }
+    }
+
+    async fn close_and_wait(&self) {
+        self.close();
+        self.wait_until_idle().await;
+    }
+
+    async fn wait_until_idle(&self) {
+        loop {
+            let notified = self.drained.notified();
+            if self.lock_state().in_flight == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    fn snapshot(&self) -> (bool, usize) {
+        let state = self.lock_state();
+        (state.accepting, state.in_flight)
+    }
+
+    fn release(&self) {
+        let mut state = self.lock_state();
+        state.in_flight = state.in_flight.saturating_sub(1);
+        let notify = !state.accepting;
+        drop(state);
+        if notify {
+            self.drained.notify_waiters();
+        }
+    }
+}
+
+impl Drop for ConnectionAdmissionPermit {
+    fn drop(&mut self) {
+        self.gate.release();
+    }
+}
+
 pub struct ConnectionManager {
     pub(crate) connections: Arc<Mutex<HashMap<String, AgentConnection>>>,
     /// Per-(agent, working_dir, session_id) async mutex. Held across the
@@ -782,6 +889,7 @@ pub struct ConnectionManager {
     shared_session_broker: SharedSessionBroker,
     shared_control_adapter: Arc<dyn SharedControlAdapter>,
     shared_launches: Arc<Mutex<HashMap<(String, u64), SharedConnectLaunch>>>,
+    admission: Arc<ConnectionAdmissionGate>,
     #[cfg(any(test, feature = "test-utils"))]
     shared_spawn_override: Option<Arc<dyn SharedSpawnDriver>>,
     #[cfg(any(test, feature = "test-utils"))]
@@ -804,6 +912,10 @@ pub struct ConnectionManager {
     shared_enqueue_finalize_hook: Arc<std::sync::Mutex<Option<SharedEnqueueFinalizeHook>>>,
     #[cfg(test)]
     shared_enqueue_publication_hook: Arc<std::sync::Mutex<Option<SharedEnqueuePublicationHook>>>,
+    #[cfg(test)]
+    admission_insert_hold: Arc<std::sync::Mutex<Option<AdmissionInsertHold>>>,
+    #[cfg(test)]
+    stub_direct_spawn: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// A parked `ask_user_question` awaiting its answer. The `sender` resolves the
@@ -883,6 +995,7 @@ impl ConnectionManager {
             shared_session_broker: SharedSessionBroker::default(),
             shared_control_adapter: Arc::new(ManagerSharedControlAdapter),
             shared_launches: Arc::new(Mutex::new(HashMap::new())),
+            admission: ConnectionAdmissionGate::new(),
             #[cfg(any(test, feature = "test-utils"))]
             shared_spawn_override: None,
             #[cfg(any(test, feature = "test-utils"))]
@@ -907,6 +1020,10 @@ impl ConnectionManager {
             shared_enqueue_finalize_hook: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
             shared_enqueue_publication_hook: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            admission_insert_hold: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            stub_direct_spawn: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -932,6 +1049,7 @@ impl ConnectionManager {
             shared_session_broker: self.shared_session_broker.clone(),
             shared_control_adapter: self.shared_control_adapter.clone(),
             shared_launches: self.shared_launches.clone(),
+            admission: self.admission.clone(),
             #[cfg(any(test, feature = "test-utils"))]
             shared_spawn_override: self.shared_spawn_override.clone(),
             #[cfg(any(test, feature = "test-utils"))]
@@ -956,6 +1074,10 @@ impl ConnectionManager {
             shared_enqueue_finalize_hook: self.shared_enqueue_finalize_hook.clone(),
             #[cfg(test)]
             shared_enqueue_publication_hook: self.shared_enqueue_publication_hook.clone(),
+            #[cfg(test)]
+            admission_insert_hold: self.admission_insert_hold.clone(),
+            #[cfg(test)]
+            stub_direct_spawn: self.stub_direct_spawn.clone(),
         }
     }
 
@@ -1610,6 +1732,7 @@ impl ConnectionManager {
         &self,
         launch: SharedConnectLaunch,
     ) -> Result<SharedSessionAttachment, AcpError> {
+        self.admission.ensure_accepting()?;
         assert_eq!(
             launch.launch_context.purpose, launch.launch_identity.purpose,
             "shared launch purpose must match its reserved identity"
@@ -2161,6 +2284,7 @@ impl ConnectionManager {
         launch: SharedConnectLaunch,
         existing_public_state: Option<Arc<RwLock<SessionState>>>,
     ) -> Result<RegisteredSpawnAttempt, AcpError> {
+        let _permit = self.admission.admit()?;
         #[cfg(any(test, feature = "test-utils"))]
         self.shared_spawn_count
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -3246,6 +3370,27 @@ impl ConnectionManager {
             crate::acp::delegation::workflow::WorkflowChildMcpBinding,
         >,
     ) -> Result<String, AcpError> {
+        let _permit = self.admission.admit()?;
+        #[cfg(test)]
+        self.hold_after_admission_for_test().await;
+        #[cfg(test)]
+        if self
+            .stub_direct_spawn
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            let connection_id = preallocated_connection_id
+                .clone()
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            self.insert_test_connection(
+                &connection_id,
+                agent_type,
+                working_dir.as_ref().map(PathBuf::from),
+                emitter,
+            )
+            .await;
+            return Ok(connection_id);
+        }
+
         // Connection dedup: when resuming an agent session (session_id is
         // Some), look for a live AgentConnection that already represents
         // the same external session in the same working_dir for the same
@@ -5718,6 +5863,7 @@ impl ConnectionManager {
         link_conversation_id: Option<i32>,
         link_folder_id: Option<i32>,
     ) -> Result<ForkResultInfo, AcpError> {
+        let _permit = self.admission.admit()?;
         let (state_arc, cmd_tx, emitter) = {
             let connections = self.connections.lock().await;
             let conn = connections
@@ -7869,14 +8015,22 @@ impl ConnectionManager {
         })
     }
 
-    /// Disconnect every current connection, then hard-kill any agent process
-    /// tree whose live PID remains published after the grace window.
-    ///
-    /// `take_connections_for_disconnect` preserves the fork's watchdog and
-    /// incarnation fences before anything becomes unroutable. PID cells stay
-    /// shared with the process callbacks so a late spawn is still reached and
-    /// a process reaped during the grace window is skipped.
-    pub async fn disconnect_all(&self, origin: AcpDisconnectOrigin) -> usize {
+    /// Close manager-wide connection admission. New spawn/connect requests
+    /// fail with [`AcpError::ServerShuttingDown`]. Already-issued permits
+    /// remain valid until they insert or fail.
+    pub fn begin_shutdown(&self) {
+        self.admission.close();
+    }
+
+    /// Wait until every issued admission permit has been released.
+    pub async fn wait_for_admissions(&self) {
+        self.admission.close_and_wait().await;
+    }
+
+    /// Drain live connections after admission is closed. Loops until admission
+    /// is closed, in-flight permits are zero, and the connection map is empty.
+    pub async fn drain_for_shutdown(&self, origin: AcpDisconnectOrigin) -> usize {
+        self.admission.close();
         let shutdown_diagnostics = if origin == AcpDisconnectOrigin::ApplicationShutdown {
             self.shared_session_broker.begin_shutdown().await;
             self.shared_session_diagnostics().await
@@ -7895,9 +8049,7 @@ impl ConnectionManager {
         }
         let mut disconnected = 0usize;
         let mut pid_cells: Vec<Arc<std::sync::atomic::AtomicU32>> = Vec::new();
-        // Two snapshots: a connection inserted during the first take is
-        // caught on the second pass.
-        for _ in 0..2 {
+        loop {
             let planned: Vec<DisconnectSelection> = {
                 let connections = self.connections.lock().await;
                 connections
@@ -7907,37 +8059,98 @@ impl ConnectionManager {
                     })
                     .collect()
             };
-            if planned.is_empty() {
+            let (accepting, in_flight) = self.admission.snapshot();
+            if !accepting && in_flight == 0 && planned.is_empty() {
                 break;
+            }
+            if planned.is_empty() {
+                self.admission.wait_until_idle().await;
+                continue;
             }
             let removed = self.take_connections_for_disconnect(planned, origin).await;
             disconnected += removed.len();
-            crate::acp::terminal_runtime::kill_all_registered_acp_terminals().await;
-            for (_id, conn) in removed {
-                let pre_loop = {
-                    let st = conn.state.read().await;
-                    matches!(st.status, ConnectionStatus::Connecting)
-                };
-                if pre_loop {
-                    if let Some(abort) = conn.task_abort {
-                        abort.abort();
-                    }
-                    emit_with_state(
-                        &conn.state,
-                        &conn.emitter,
-                        AcpEvent::StatusChanged {
-                            status: ConnectionStatus::Disconnected,
-                        },
-                    )
-                    .await;
-                }
-                // Shutdown cannot wait for a saturated command lane. A missed
-                // graceful signal is covered by the process-tree backstop below.
-                let _ = conn.control_tx.try_send(ConnectionControl::Disconnect);
-                pid_cells.push(conn.child_pid);
-            }
+            self.dispatch_taken_disconnects(removed, &mut pid_cells)
+                .await;
         }
-        tracing::info!("[ACP] disconnect_all count={}", disconnected);
+        tracing::info!("[ACP] drain_for_shutdown count={}", disconnected);
+        self.finish_disconnect_backstop(
+            origin,
+            disconnected,
+            pid_cells,
+            shutdown_shared_pid_cells,
+            shutdown_diagnostics,
+        )
+        .await;
+        disconnected
+    }
+
+    #[cfg(test)]
+    pub fn admission_in_flight_for_test(&self) -> usize {
+        self.admission.snapshot().1
+    }
+
+    #[cfg(test)]
+    pub fn enable_stub_direct_spawn_for_test(&self) {
+        self.stub_direct_spawn
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    async fn hold_after_admission_for_test(&self) {
+        let hook = self
+            .admission_insert_hold
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        if let Some(hook) = hook {
+            hook.reached.notify_one();
+            hook.resume.notified().await;
+        }
+    }
+
+    async fn dispatch_taken_disconnects(
+        &self,
+        removed: Vec<(String, crate::acp::connection::AgentConnection)>,
+        pid_cells: &mut Vec<Arc<std::sync::atomic::AtomicU32>>,
+    ) {
+        crate::acp::terminal_runtime::kill_all_registered_acp_terminals().await;
+        for (conn_id, conn) in removed {
+            let pre_loop = {
+                let st = conn.state.read().await;
+                matches!(st.status, ConnectionStatus::Connecting)
+            };
+            if pre_loop {
+                if let Some(abort) = conn.task_abort {
+                    abort.abort();
+                }
+                if let Some(inj) = self.delegation_snapshot() {
+                    crate::acp::connection::cleanup_delegation_parent(&inj, &conn_id, &conn.state)
+                        .await;
+                }
+                emit_with_state(
+                    &conn.state,
+                    &conn.emitter,
+                    AcpEvent::StatusChanged {
+                        status: ConnectionStatus::Disconnected,
+                    },
+                )
+                .await;
+            }
+            // Shutdown cannot wait for a saturated command lane. A missed
+            // graceful signal is covered by the process-tree backstop below.
+            let _ = conn.control_tx.try_send(ConnectionControl::Disconnect);
+            pid_cells.push(conn.child_pid);
+        }
+    }
+
+    async fn finish_disconnect_backstop(
+        &self,
+        origin: AcpDisconnectOrigin,
+        disconnected: usize,
+        mut pid_cells: Vec<Arc<std::sync::atomic::AtomicU32>>,
+        shutdown_shared_pid_cells: Vec<Arc<std::sync::atomic::AtomicU32>>,
+        shutdown_diagnostics: Vec<SharedSessionDiagnostic>,
+    ) {
         for shared_pid in shutdown_shared_pid_cells {
             if !pid_cells.iter().any(|pid| Arc::ptr_eq(pid, &shared_pid)) {
                 pid_cells.push(shared_pid);
@@ -7970,6 +8183,9 @@ impl ConnectionManager {
             .await;
         }
 
+        if origin != AcpDisconnectOrigin::ApplicationShutdown {
+            return;
+        }
         for diagnostic in shutdown_diagnostics {
             let absent = !self
                 .connections
@@ -7995,7 +8211,46 @@ impl ConnectionManager {
                 );
             }
         }
+    }
 
+    /// Disconnect every current connection, then hard-kill any agent process
+    /// tree whose live PID remains published after the grace window.
+    ///
+    /// `take_connections_for_disconnect` preserves the fork's watchdog and
+    /// incarnation fences before anything becomes unroutable. PID cells stay
+    /// shared with the process callbacks so a late spawn is still reached and
+    /// a process reaped during the grace window is skipped.
+    pub async fn disconnect_all(&self, origin: AcpDisconnectOrigin) -> usize {
+        if origin == AcpDisconnectOrigin::ApplicationShutdown {
+            self.begin_shutdown();
+            self.wait_for_admissions().await;
+            return self.drain_for_shutdown(origin).await;
+        }
+        let mut disconnected = 0usize;
+        let mut pid_cells: Vec<Arc<std::sync::atomic::AtomicU32>> = Vec::new();
+        // Two snapshots: a connection inserted during the first take is
+        // caught on the second pass.
+        for _ in 0..2 {
+            let planned: Vec<DisconnectSelection> = {
+                let connections = self.connections.lock().await;
+                connections
+                    .iter()
+                    .map(|(id, connection)| {
+                        DisconnectSelection::incarnation_only(id.clone(), connection)
+                    })
+                    .collect()
+            };
+            if planned.is_empty() {
+                break;
+            }
+            let removed = self.take_connections_for_disconnect(planned, origin).await;
+            disconnected += removed.len();
+            self.dispatch_taken_disconnects(removed, &mut pid_cells)
+                .await;
+        }
+        tracing::info!("[ACP] disconnect_all count={}", disconnected);
+        self.finish_disconnect_backstop(origin, disconnected, pid_cells, Vec::new(), Vec::new())
+            .await;
         disconnected
     }
 
@@ -10607,6 +10862,7 @@ mod tests {
         RouteDegradedReason, RouteResolutionInput, SuppressionCapability,
         ROUTE_ADAPTER_CONTRACT_VERSION,
     };
+    use crate::acp::delegation::spawner::ConnectionSpawner;
     use crate::acp::plan_approval::PlanApprovalDecision;
     use crate::acp::session_attach::SessionAttachMode;
     use crate::acp::session_state::SessionState;
@@ -10627,6 +10883,21 @@ mod tests {
     use std::sync::{Arc, Mutex as StdMutex};
     use std::time::Duration;
     use tokio::sync::{broadcast, mpsc, RwLock};
+
+    fn install_admission_insert_hold(
+        manager: &ConnectionManager,
+    ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        *manager
+            .admission_insert_hold
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(AdmissionInsertHold {
+            reached: reached.clone(),
+            resume: resume.clone(),
+        });
+        (reached, resume)
+    }
 
     struct FakeSharedSpawnDriver {
         outcomes: StdMutex<VecDeque<tokio::sync::oneshot::Receiver<RouteBootstrapOutcome>>>,
@@ -12011,6 +12282,131 @@ mod tests {
         tokio::time::advance(DISCONNECT_ALL_GRACE).await;
         assert_eq!(shutdown.await, 0);
         assert!(manager.shared_session_diagnostics().await.is_empty());
+    }
+
+    fn assert_server_shutting_down<T: std::fmt::Debug>(result: Result<T, AcpError>) {
+        match result {
+            Err(error) => {
+                assert_eq!(
+                    error.code(),
+                    Some("server_shutting_down"),
+                    "expected server_shutting_down, got {error:?}"
+                );
+            }
+            Ok(value) => panic!("expected server_shutting_down, accepted {value:?}"),
+        }
+    }
+
+    async fn spawn_direct_for_admission_test(
+        manager: &ConnectionManager,
+    ) -> Result<String, AcpError> {
+        manager
+            .spawn_agent(
+                AgentType::Codex,
+                None,
+                None,
+                AcpLaunchInputs::with_placeholder_route(
+                    BTreeMap::new(),
+                    SystemTerminalSettings::default(),
+                ),
+                "test-window".into(),
+                EventEmitter::Noop,
+                None,
+                BTreeMap::new(),
+                ConnectionLaunchContext::default(),
+                None,
+                None,
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn shutdown_admission_race_rejects_new_spawns_and_drains_admitted_ones() {
+        let driver = Arc::new(FakeSharedSpawnDriver::immediate_ready());
+        let manager = ConnectionManager::new_with_shared_spawn_driver(driver);
+        manager.enable_stub_direct_spawn_for_test();
+        manager
+            .insert_test_connection(
+                "parent-for-child",
+                AgentType::Codex,
+                None,
+                EventEmitter::Noop,
+            )
+            .await;
+
+        let (reached, resume) = install_admission_insert_hold(&manager);
+        let held_manager = manager.clone_ref();
+        let held =
+            tokio::spawn(async move { spawn_direct_for_admission_test(&held_manager).await });
+        reached.notified().await;
+        assert_eq!(manager.admission_in_flight_for_test(), 1);
+        assert!(
+            !manager
+                .connections
+                .lock()
+                .await
+                .values()
+                .any(|connection| connection.id != "parent-for-child"),
+            "admitted spawn must not insert before the hold is released"
+        );
+
+        manager.begin_shutdown();
+
+        let cloned = manager.clone_ref();
+        assert_server_shutting_down(spawn_direct_for_admission_test(&cloned).await);
+
+        let shared = cloned.connect_or_attach_shared(shared_launch(801, "shutdown-client").await);
+        assert_server_shutting_down(shared.await);
+
+        let db = Arc::new(crate::db::test_helpers::fresh_in_memory_db().await);
+        let spawner = ConnectionManagerSpawner {
+            manager: Arc::new(cloned.clone_ref()),
+            db,
+            data_dir: Arc::new(PathBuf::from("/tmp")),
+            runtime: crate::commands::delegation::DelegationRuntimeSettings::default(),
+        };
+        let child = spawner
+            .spawn(
+                "parent-for-child",
+                AgentType::Codex,
+                None,
+                None,
+                BTreeMap::new(),
+            )
+            .await;
+        match child {
+            Err(error) => {
+                let message = error.to_string();
+                assert!(
+                    message.contains("shutting down") || message.contains("server_shutting_down"),
+                    "delegated spawn must fail with server_shutting_down, got {message}"
+                );
+            }
+            Ok(id) => panic!("expected delegated spawn to be fenced, accepted {id}"),
+        }
+
+        tokio::time::pause();
+        let mut drain =
+            Box::pin(cloned.drain_for_shutdown(AcpDisconnectOrigin::ApplicationShutdown));
+        tokio::select! {
+            biased;
+            _ = drain.as_mut() => {
+                panic!("drain returned while an admitted spawn was still in flight");
+            }
+            result = async {
+                resume.notify_one();
+                held.await.expect("held spawn join")
+            } => {
+                result.expect("admitted spawn must finish after shutdown");
+            }
+        }
+        tokio::time::advance(DISCONNECT_ALL_GRACE).await;
+        drain.await;
+        assert!(
+            manager.connections.lock().await.is_empty(),
+            "drain must remove the parent and the admitted connection"
+        );
+        assert_eq!(manager.admission_in_flight_for_test(), 0);
     }
 
     #[tokio::test]
@@ -15659,14 +16055,7 @@ mod tests {
             })
         };
         reached.notified().await;
-        insert_fake_connection(
-            &mgr,
-            "live-1",
-            AgentType::Codex,
-            None,
-            EventEmitter::Noop,
-        )
-        .await;
+        insert_fake_connection(&mgr, "live-1", AgentType::Codex, None, EventEmitter::Noop).await;
         stamp_owner(&mgr, "live-1", "conversation-7", "op-other", 1, Some(7)).await;
         resume.notify_one();
         let err = tokio::time::timeout(Duration::from_secs(5), rebind)

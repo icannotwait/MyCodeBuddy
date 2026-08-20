@@ -184,6 +184,9 @@ pub enum AppErrorCode {
     /// Protocol identity, scope, or other request shape is invalid.
     /// HTTP 400.
     InvalidRequest,
+    /// ACP connection admission is closed because the process is shutting down.
+    /// HTTP 503.
+    ServerShuttingDown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, thiserror::Error)]
