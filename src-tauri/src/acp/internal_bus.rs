@@ -21,8 +21,9 @@
 //!    the global broadcaster, the per-connection stream is the sole path
 //!    and the dedup goes away.
 
+use std::collections::HashMap;
 use std::ops::Deref;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -36,12 +37,18 @@ use crate::auto_title::TurnCompletionSnapshot;
 /// burst tolerance is identical.
 const BUS_CAPACITY: usize = 4096;
 
-/// Dedicated lane for lifecycle-critical events (`TurnComplete`,
-/// `SessionStarted`, …). Bounded but large: these fire a handful of times
-/// per turn, never at ContentDelta rate. When the lifecycle consumer is
-/// briefly busy, the lane absorbs the burst without blocking emitters and
-/// without competing with the broadcast buffer that ContentDelta floods.
-const CRITICAL_LANE_CAPACITY: usize = 1024;
+/// Per-destination FIFO depth for lifecycle-critical events. Bounded so a
+/// stalled worker applies backpressure only to that connection's emitters.
+const DESTINATION_INGRESS_CAPACITY: usize = 1024;
+
+/// Spawner that owns the unique FIFO consumer for one destination.
+pub type LifecycleWorkerSpawner =
+    Arc<dyn Fn(String, u64, mpsc::Receiver<Arc<InternalEventEnvelope>>) + Send + Sync>;
+
+/// Ingress is shut down (`drain_and_close`) or the destination sender is gone
+/// after a failed replacement retry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LifecycleClosed;
 
 /// Internal-only wrapper around the public event envelope. May carry an
 /// immutable turn-completion sidecar for lifecycle title work. Public
@@ -76,6 +83,170 @@ pub fn is_lifecycle_critical(payload: &AcpEvent) -> bool {
     )
 }
 
+/// Per-connection lifecycle FIFO. One sender and one consumer per destination;
+/// saturation backpressures only that connection.
+pub struct LifecycleIngress {
+    destinations: Mutex<HashMap<String, Arc<DestinationIngress>>>,
+    capacity: usize,
+    next_incarnation: AtomicU64,
+    spawner: Mutex<Option<LifecycleWorkerSpawner>>,
+    closed: AtomicBool,
+}
+
+struct DestinationIngress {
+    incarnation: u64,
+    tx: mpsc::Sender<Arc<InternalEventEnvelope>>,
+    rx: Mutex<Option<mpsc::Receiver<Arc<InternalEventEnvelope>>>>,
+}
+
+impl LifecycleIngress {
+    pub fn new() -> Self {
+        Self::new_with_capacity(DESTINATION_INGRESS_CAPACITY)
+    }
+
+    pub fn new_with_capacity(capacity: usize) -> Self {
+        Self {
+            destinations: Mutex::new(HashMap::new()),
+            capacity: capacity.max(1),
+            next_incarnation: AtomicU64::new(0),
+            spawner: Mutex::new(None),
+            closed: AtomicBool::new(false),
+        }
+    }
+
+    pub fn set_spawner(&self, spawner: LifecycleWorkerSpawner) {
+        let pending: Vec<(String, Arc<DestinationIngress>)> = {
+            *self.spawner.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&spawner));
+            self.lock_destinations()
+                .iter()
+                .map(|(id, dest)| (id.clone(), Arc::clone(dest)))
+                .collect()
+        };
+        for (conn_id, dest) in pending {
+            self.maybe_spawn(&conn_id, &dest);
+        }
+    }
+
+    pub fn take_receiver(&self, connection_id: &str) -> mpsc::Receiver<Arc<InternalEventEnvelope>> {
+        let dest = self.get_or_create(connection_id);
+        let rx = dest
+            .rx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .expect("destination receiver already taken");
+        rx
+    }
+
+    pub async fn send(&self, env: Arc<InternalEventEnvelope>) -> Result<(), LifecycleClosed> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(LifecycleClosed);
+        }
+        let conn_id = env.connection_id.clone();
+        let dest = self.get_or_create(&conn_id);
+        match dest.tx.send(Arc::clone(&env)).await {
+            Ok(()) => Ok(()),
+            Err(_) => {
+                if self.closed.load(Ordering::Acquire) {
+                    return Err(LifecycleClosed);
+                }
+                self.replace_if_incarnation(&conn_id, dest.incarnation);
+                let dest2 = self.get_or_create(&conn_id);
+                dest2.tx.send(env).await.map_err(|_| LifecycleClosed)
+            }
+        }
+    }
+
+    pub async fn drain_and_close(&self) {
+        self.closed.store(true, Ordering::Release);
+        let _dropped = {
+            let mut map = self.lock_destinations();
+            std::mem::take(&mut *map)
+        };
+    }
+
+    pub fn remove_if_incarnation(&self, connection_id: &str, incarnation: u64) {
+        let mut map = self.lock_destinations();
+        if map
+            .get(connection_id)
+            .is_some_and(|dest| dest.incarnation == incarnation)
+        {
+            map.remove(connection_id);
+        }
+    }
+
+    fn try_offer(&self, env: Arc<InternalEventEnvelope>) -> Result<(), Arc<InternalEventEnvelope>> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(env);
+        }
+        let conn_id = env.connection_id.clone();
+        let dest = self.get_or_create(&conn_id);
+        match dest.tx.try_send(env) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(env)) => Err(env),
+            Err(mpsc::error::TrySendError::Closed(env)) => {
+                self.replace_if_incarnation(&conn_id, dest.incarnation);
+                let dest2 = self.get_or_create(&conn_id);
+                dest2.tx.try_send(env).map_err(|e| match e {
+                    mpsc::error::TrySendError::Full(env)
+                    | mpsc::error::TrySendError::Closed(env) => env,
+                })
+            }
+        }
+    }
+
+    fn get_or_create(&self, connection_id: &str) -> Arc<DestinationIngress> {
+        let dest = {
+            let mut map = self.lock_destinations();
+            if let Some(existing) = map.get(connection_id) {
+                return Arc::clone(existing);
+            }
+            let (tx, rx) = mpsc::channel(self.capacity);
+            let incarnation = self.next_incarnation.fetch_add(1, Ordering::Relaxed) + 1;
+            let dest = Arc::new(DestinationIngress {
+                incarnation,
+                tx,
+                rx: Mutex::new(Some(rx)),
+            });
+            map.insert(connection_id.to_string(), Arc::clone(&dest));
+            dest
+        };
+        self.maybe_spawn(connection_id, &dest);
+        dest
+    }
+
+    fn maybe_spawn(&self, connection_id: &str, dest: &Arc<DestinationIngress>) {
+        let spawner = self
+            .spawner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let Some(spawner) = spawner else {
+            return;
+        };
+        let Some(rx) = dest.rx.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+            return;
+        };
+        spawner(connection_id.to_string(), dest.incarnation, rx);
+    }
+
+    fn replace_if_incarnation(&self, connection_id: &str, incarnation: u64) {
+        let mut map = self.lock_destinations();
+        if map
+            .get(connection_id)
+            .is_some_and(|dest| dest.incarnation == incarnation)
+        {
+            map.remove(connection_id);
+        }
+    }
+
+    fn lock_destinations(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<String, Arc<DestinationIngress>>> {
+        self.destinations.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 /// Process-wide bus delivering ACP envelopes to in-process consumers.
 ///
 /// Subscribers (lifecycle / pet / chat-channel) call `subscribe()` once at
@@ -83,30 +254,27 @@ pub fn is_lifecycle_critical(payload: &AcpEvent) -> bool {
 /// `emit_with_state` calls `send_with_completion()` after the per-connection
 /// stream so the envelope arrives in lockstep with the WS attach delivery.
 ///
-/// Lifecycle-critical events are **also** pushed onto a dedicated mpsc lane
-/// (`take_critical_rx`) so a broadcast `Lagged` (ContentDelta flood while the
-/// dispatcher was briefly busy) cannot silently drop `TurnComplete` and leave
-/// conversation rows stuck at `in_progress`.
-#[derive(Debug)]
+/// Lifecycle-critical events also enter [`LifecycleIngress`]: one FIFO
+/// sender per connection so a stalled destination cannot drop or reorder
+/// `TurnComplete`, and cannot block a different connection.
 pub struct InternalEventBus {
     sender: broadcast::Sender<Arc<InternalEventEnvelope>>,
-    critical_tx: mpsc::Sender<Arc<InternalEventEnvelope>>,
-    /// Taken once by the lifecycle subscriber. `Mutex` so `new` stays sync
-    /// and only one consumer can own the receiver.
-    critical_rx: Mutex<Option<mpsc::Receiver<Arc<InternalEventEnvelope>>>>,
+    critical_ingress: Arc<LifecycleIngress>,
     metrics: Arc<EventBusMetrics>,
 }
 
 impl InternalEventBus {
     pub fn new(metrics: Arc<EventBusMetrics>) -> Self {
         let (sender, _) = broadcast::channel(BUS_CAPACITY);
-        let (critical_tx, critical_rx) = mpsc::channel(CRITICAL_LANE_CAPACITY);
         Self {
             sender,
-            critical_tx,
-            critical_rx: Mutex::new(Some(critical_rx)),
+            critical_ingress: Arc::new(LifecycleIngress::new()),
             metrics,
         }
+    }
+
+    pub fn lifecycle_ingress(&self) -> &Arc<LifecycleIngress> {
+        &self.critical_ingress
     }
 
     /// Broadcast a sidecar-free internal event. Used by direct producers and
@@ -116,26 +284,61 @@ impl InternalEventBus {
     }
 
     /// Broadcast a public envelope with an optional completion sidecar.
-    /// Used only by the shared event-bridge emit core.
     ///
-    /// Lifecycle-critical payloads are always mirrored onto the critical
-    /// lane (even when there are currently zero broadcast subscribers) so
+    /// Lifecycle-critical payloads are always mirrored onto per-destination
+    /// ingress (even when there are currently zero broadcast subscribers) so
     /// status CAS cannot depend solely on the lag-prone broadcast path.
     pub fn send_with_completion(
         &self,
         event: Arc<EventEnvelope>,
         completion: Option<Arc<TurnCompletionSnapshot>>,
     ) {
-        let critical = is_lifecycle_critical(&event.payload);
-        let connection_id = event.connection_id.clone();
-        let payload_label = if critical {
-            critical_payload_label(&event.payload)
-        } else {
-            ""
-        };
+        let internal = self.make_internal(event, completion);
+        self.broadcast_internal(&internal);
+        if is_lifecycle_critical(&internal.payload) {
+            self.offer_critical(internal);
+        }
+    }
 
-        let internal = Arc::new(InternalEventEnvelope { event, completion });
+    /// Broadcast, then **await** the destination FIFO. Emitters must call this
+    /// only after dropping the SessionState write lock.
+    pub async fn send_lifecycle(
+        &self,
+        event: Arc<EventEnvelope>,
+        completion: Option<Arc<TurnCompletionSnapshot>>,
+    ) {
+        let internal = self.make_internal(event, completion);
+        self.broadcast_internal(&internal);
+        if !is_lifecycle_critical(&internal.payload) {
+            return;
+        }
+        let connection_id = internal.connection_id.clone();
+        let payload_label = critical_payload_label(&internal.payload);
+        match self.critical_ingress.send(Arc::clone(&internal)).await {
+            Ok(()) => {
+                self.note_critical_enqueued(&connection_id, payload_label);
+            }
+            Err(_) => {
+                tracing::error!(
+                    connection_id = %connection_id,
+                    event = %payload_label,
+                    "[ACP][bus][ERROR] lifecycle ingress closed — \
+                     no lifecycle consumer; status CAS will not run"
+                );
+            }
+        }
+    }
 
+    fn make_internal(
+        &self,
+        event: Arc<EventEnvelope>,
+        completion: Option<Arc<TurnCompletionSnapshot>>,
+    ) -> Arc<InternalEventEnvelope> {
+        Arc::new(InternalEventEnvelope { event, completion })
+    }
+
+    fn broadcast_internal(&self, internal: &Arc<InternalEventEnvelope>) {
+        let critical = is_lifecycle_critical(&internal.payload);
         let receivers = self.sender.receiver_count();
         if receivers > 0 {
             // SendError can only fire when receiver_count() == 0, which we just
@@ -143,93 +346,50 @@ impl InternalEventBus {
             // (a subscriber dropping between the check and the send) and a
             // dropped envelope in that exact window is benign — there's no one
             // to deliver to anyway.
-            let _ = self.sender.send(Arc::clone(&internal));
+            let _ = self.sender.send(Arc::clone(internal));
             self.metrics.emitted_count.fetch_add(1, Ordering::Relaxed);
         } else if critical {
             tracing::warn!(
-                connection_id = %connection_id,
-                event = %payload_label,
+                connection_id = %internal.connection_id,
+                event = %critical_payload_label(&internal.payload),
                 "[ACP][bus] broadcast has 0 subscribers for critical event; \
-                 relying on critical lifecycle lane only"
+                 relying on critical lifecycle ingress only"
             );
         }
+    }
 
-        if critical {
-            match self.critical_tx.try_send(Arc::clone(&internal)) {
-                Ok(()) => {
-                    self.metrics
-                        .critical_lane_emit_count
-                        .fetch_add(1, Ordering::Relaxed);
-                    if matches!(internal.payload, AcpEvent::TurnComplete { .. }) {
-                        tracing::info!(
-                            connection_id = %connection_id,
-                            event = %payload_label,
-                            broadcast_receivers = receivers,
-                            has_completion_sidecar = internal.completion.is_some(),
-                            "[ACP][bus] TurnComplete on critical lifecycle lane"
-                        );
+    fn offer_critical(&self, internal: Arc<InternalEventEnvelope>) {
+        let connection_id = internal.connection_id.clone();
+        let payload_label = critical_payload_label(&internal.payload);
+        match self.critical_ingress.try_offer(internal) {
+            Ok(()) => self.note_critical_enqueued(&connection_id, payload_label),
+            Err(env) => {
+                self.metrics
+                    .critical_lane_full_count
+                    .fetch_add(1, Ordering::Relaxed);
+                let ingress = Arc::clone(&self.critical_ingress);
+                let metrics = Arc::clone(&self.metrics);
+                tokio::runtime::Handle::current().spawn(async move {
+                    if ingress.send(env).await.is_ok() {
+                        metrics
+                            .critical_lane_emit_count
+                            .fetch_add(1, Ordering::Relaxed);
                     }
-                }
-                Err(mpsc::error::TrySendError::Full(env)) => {
-                    // Never drop lifecycle-critical envelopes on Full. A
-                    // blocked lifecycle consumer must not lose TurnComplete —
-                    // spawn a deliverer that waits (no timeout) for capacity.
-                    self.metrics
-                        .critical_lane_full_count
-                        .fetch_add(1, Ordering::Relaxed);
-                    tracing::error!(
-                        connection_id = %connection_id,
-                        event = %payload_label,
-                        "[ACP][bus][ERROR] critical lifecycle lane FULL — \
-                         spawning unbounded overflow deliverer (will not drop \
-                         TurnComplete/SessionStarted)"
-                    );
-                    let tx = self.critical_tx.clone();
-                    let conn = connection_id.clone();
-                    let label = payload_label;
-                    // Must not panic if called outside a runtime (emit paths
-                    // are normally on Tokio; this is belt-and-suspenders).
-                    match tokio::runtime::Handle::try_current() {
-                        Ok(handle) => {
-                            handle.spawn(async move {
-                                match tx.send(env).await {
-                                    Ok(()) => {
-                                        tracing::info!(
-                                            connection_id = %conn,
-                                            event = %label,
-                                            "[ACP][bus] critical lane overflow deliver succeeded"
-                                        );
-                                    }
-                                    Err(_) => {
-                                        tracing::error!(
-                                            connection_id = %conn,
-                                            event = %label,
-                                            "[ACP][bus][ERROR] critical lifecycle lane CLOSED \
-                                             during overflow deliver — status CAS will not run"
-                                        );
-                                    }
-                                }
-                            });
-                        }
-                        Err(_) => {
-                            tracing::error!(
-                                connection_id = %connection_id,
-                                event = %payload_label,
-                                "[ACP][bus][ERROR] critical lane FULL and no Tokio runtime \
-                                 for overflow deliver — event may be lost"
-                            );
-                        }
-                    }
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => {
-                    tracing::error!(
-                        connection_id = %connection_id,
-                        event = %payload_label,
-                        "[ACP][bus][ERROR] critical lifecycle lane CLOSED — \
-                         no lifecycle consumer; status CAS will not run"
-                    );
-                }
+                });
             }
+        }
+    }
+
+    fn note_critical_enqueued(&self, connection_id: &str, payload_label: &str) {
+        self.metrics
+            .critical_lane_emit_count
+            .fetch_add(1, Ordering::Relaxed);
+        if payload_label == "TurnComplete" {
+            tracing::info!(
+                connection_id = %connection_id,
+                event = %payload_label,
+                "[ACP][bus] TurnComplete on critical lifecycle ingress"
+            );
         }
     }
 
@@ -239,15 +399,6 @@ impl InternalEventBus {
     /// and bumps `lagged_count`.
     pub fn subscribe(&self) -> broadcast::Receiver<Arc<InternalEventEnvelope>> {
         self.sender.subscribe()
-    }
-
-    /// Take the once-only critical-lane receiver. Lifecycle must call this
-    /// at subscriber start; subsequent calls return `None`.
-    pub fn take_critical_rx(&self) -> Option<mpsc::Receiver<Arc<InternalEventEnvelope>>> {
-        self.critical_rx
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take()
     }
 
     pub fn metrics(&self) -> &Arc<EventBusMetrics> {
@@ -462,6 +613,8 @@ pub struct AcpEventMetricsSnapshot {
 mod tests {
     use super::*;
     use crate::acp::types::AcpEvent;
+    use std::future::Future;
+    use std::sync::atomic::AtomicUsize;
 
     fn fake_envelope(seq: u64) -> Arc<EventEnvelope> {
         Arc::new(EventEnvelope {
@@ -506,8 +659,7 @@ mod tests {
     async fn turn_complete_hits_critical_lane_even_without_broadcast_subscribers() {
         let metrics = Arc::new(EventBusMetrics::default());
         let bus = InternalEventBus::new(metrics.clone());
-        let mut critical = bus.take_critical_rx().expect("critical rx");
-        assert!(bus.take_critical_rx().is_none(), "critical rx is once-only");
+        let mut critical = bus.lifecycle_ingress().take_receiver("c-crit");
 
         let env = Arc::new(EventEnvelope {
             seq: 9,
@@ -539,7 +691,7 @@ mod tests {
     async fn content_delta_does_not_use_critical_lane() {
         let metrics = Arc::new(EventBusMetrics::default());
         let bus = InternalEventBus::new(metrics.clone());
-        let mut critical = bus.take_critical_rx().expect("critical rx");
+        let mut critical = bus.lifecycle_ingress().take_receiver("c1");
         let _broadcast = bus.subscribe();
         bus.send(fake_envelope(1));
         assert!(
@@ -582,5 +734,142 @@ mod tests {
         assert_eq!(snapshot.desktop_raw_bytes, 4_096);
         assert_eq!(snapshot.desktop_emit_failure_count, 2);
         assert_eq!(snapshot.desktop_batch_max_events, 17);
+    }
+
+    fn turn_complete_internal(
+        conn: &str,
+        seq: u64,
+        session_id: &str,
+    ) -> Arc<InternalEventEnvelope> {
+        Arc::new(InternalEventEnvelope {
+            event: Arc::new(EventEnvelope {
+                seq,
+                connection_id: conn.into(),
+                payload: AcpEvent::TurnComplete {
+                    session_id: session_id.into(),
+                    stop_reason: "end_turn".into(),
+                    agent_type: "codex".into(),
+                    mark_awaiting_reply: false,
+                    termination_source: None,
+                    provider_turn_id: None,
+                },
+            }),
+            completion: None,
+        })
+    }
+
+    fn session_id_of(env: &InternalEventEnvelope) -> &str {
+        match &env.payload {
+            AcpEvent::TurnComplete { session_id, .. } => session_id.as_str(),
+            other => panic!("expected TurnComplete, got {other:?}"),
+        }
+    }
+
+    fn assert_send_pending<F: Future>(fut: &mut std::pin::Pin<&mut F>) {
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(&waker);
+        assert!(
+            fut.as_mut().poll(&mut cx).is_pending(),
+            "send must stay pending while the destination is saturated"
+        );
+    }
+
+    #[tokio::test]
+    async fn critical_ingress_preserves_fifo_through_saturation() {
+        let ingress = LifecycleIngress::new_with_capacity(1);
+        let mut rx = ingress.take_receiver("c1");
+        let hold = Arc::new(tokio::sync::Barrier::new(2));
+        let hold_worker = Arc::clone(&hold);
+        let (got_tx, mut got_rx) = mpsc::channel::<String>(8);
+
+        tokio::spawn(async move {
+            hold_worker.wait().await;
+            while let Some(env) = rx.recv().await {
+                got_tx.send(session_id_of(&env).to_string()).await.unwrap();
+            }
+        });
+
+        let event_a = turn_complete_internal("c1", 1, "A");
+        let event_b = turn_complete_internal("c1", 2, "B");
+        let event_c = turn_complete_internal("c1", 3, "C");
+
+        ingress.send(event_a).await.expect("A fits in capacity 1");
+        let mut send_b = std::pin::pin!(ingress.send(event_b));
+        assert_send_pending(&mut send_b);
+        let mut send_c = std::pin::pin!(ingress.send(event_c));
+        assert_send_pending(&mut send_c);
+
+        hold.wait().await;
+        send_b.await.expect("B must complete after drain starts");
+        send_c.await.expect("C must complete after drain starts");
+
+        let first = got_rx.recv().await.expect("A");
+        let second = got_rx.recv().await.expect("B");
+        let third = got_rx.recv().await.expect("C");
+        assert_eq!(
+            [first.as_str(), second.as_str(), third.as_str()],
+            ["A", "B", "C"],
+            "saturated destination must preserve A/B/C FIFO"
+        );
+    }
+
+    #[tokio::test]
+    async fn critical_ingress_never_drops_before_shutdown() {
+        let ingress = Arc::new(LifecycleIngress::new_with_capacity(1));
+        let mut rx = ingress.take_receiver("c-drop");
+        let start = Arc::new(tokio::sync::Barrier::new(2));
+        let start_worker = Arc::clone(&start);
+        let received = Arc::new(AtomicUsize::new(0));
+        let received_worker = Arc::clone(&received);
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+
+        tokio::spawn(async move {
+            start_worker.wait().await;
+            while let Some(_env) = rx.recv().await {
+                received_worker.fetch_add(1, Ordering::SeqCst);
+            }
+            let _ = done_tx.send(());
+        });
+
+        const PRODUCERS: usize = 4;
+        const PER_PRODUCER: usize = 5;
+        let submitted = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Barrier::new(PRODUCERS + 1));
+        let mut joins = Vec::new();
+        for producer in 0..PRODUCERS {
+            let ingress = Arc::clone(&ingress);
+            let submitted = Arc::clone(&submitted);
+            let started = Arc::clone(&started);
+            joins.push(tokio::spawn(async move {
+                started.wait().await;
+                for i in 0..PER_PRODUCER {
+                    let seq = (producer * PER_PRODUCER + i + 1) as u64;
+                    ingress
+                        .send(turn_complete_internal("c-drop", seq, "keep"))
+                        .await
+                        .expect("critical send must not drop before shutdown");
+                    submitted.fetch_add(1, Ordering::SeqCst);
+                }
+            }));
+        }
+
+        started.wait().await;
+        start.wait().await;
+        for join in joins {
+            join.await.expect("producer task");
+        }
+        let submitted_count = submitted.load(Ordering::SeqCst);
+        ingress.drain_and_close().await;
+        done_rx.await.expect("consumer finished after drain");
+        assert_eq!(
+            submitted_count,
+            PRODUCERS * PER_PRODUCER,
+            "every producer send must complete before drain"
+        );
+        assert_eq!(
+            received.load(Ordering::SeqCst),
+            submitted_count,
+            "drain must deliver every event submitted before shutdown"
+        );
     }
 }

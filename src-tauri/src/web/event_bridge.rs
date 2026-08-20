@@ -4,9 +4,11 @@ use std::sync::Arc;
 use serde::{ser::SerializeStruct, Serialize, Serializer};
 use tokio::sync::{broadcast, RwLock};
 
+use crate::acp::internal_bus::is_lifecycle_critical;
 #[cfg(feature = "tauri-runtime")]
 use crate::acp::{desktop_event_batcher, DesktopAcpDelivery};
 use crate::acp::{AcpEvent, EventBusMetrics, EventEnvelope, InternalEventBus, SessionState};
+use crate::auto_title::TurnCompletionSnapshot;
 
 /// Broadcast-delivered event.
 ///
@@ -385,6 +387,27 @@ pub fn emit_event(emitter: &EventEmitter, event: &str, payload: impl Serialize) 
     }
 }
 
+/// Publish to the in-process bus after the SessionState write lock is
+/// released. Critical lifecycle events await the per-destination FIFO so
+/// backpressure cannot hold SessionState.
+async fn publish_to_internal_bus(
+    bus: &InternalEventBus,
+    envelope: Arc<EventEnvelope>,
+    completion: Option<Arc<TurnCompletionSnapshot>>,
+    evicted: usize,
+) {
+    if evicted > 0 {
+        bus.metrics()
+            .ring_buffer_evict_count
+            .fetch_add(evicted as u64, Ordering::Relaxed);
+    }
+    if is_lifecycle_critical(&envelope.payload) {
+        bus.send_lifecycle(envelope, completion).await;
+    } else {
+        bus.send_with_completion(envelope, completion);
+    }
+}
+
 /// 统一 ACP 事件发射入口。
 ///
 /// 流程：
@@ -492,12 +515,8 @@ where
             // immediate per-envelope delivery even when the desktop queue
             // applies backpressure on the awaited delivery branch below.
             if let Some(bus) = app.try_state::<Arc<InternalEventBus>>() {
-                bus.send_with_completion(Arc::clone(&envelope_arc), completion);
-                if evicted > 0 {
-                    bus.metrics()
-                        .ring_buffer_evict_count
-                        .fetch_add(evicted as u64, Ordering::Relaxed);
-                }
+                publish_to_internal_bus(&**bus, Arc::clone(&envelope_arc), completion, evicted)
+                    .await;
             }
 
             // Tauri webview listener is the desktop frontend's only ACP path
@@ -529,12 +548,8 @@ where
             }
         }
         EventEmitter::WebOnly { bus, .. } => {
-            bus.send_with_completion(Arc::clone(&envelope_arc), completion);
-            if evicted > 0 {
-                bus.metrics()
-                    .ring_buffer_evict_count
-                    .fetch_add(evicted as u64, Ordering::Relaxed);
-            }
+            publish_to_internal_bus(bus.as_ref(), Arc::clone(&envelope_arc), completion, evicted)
+                .await;
         }
         // Noop still publishes the ordinary public envelope to the private
         // connection stream (above) but sends neither internal-bus nor
