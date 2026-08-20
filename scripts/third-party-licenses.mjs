@@ -28,6 +28,42 @@ export const NPM_SUPPORTED_ARCHITECTURES = {
   cpu: ["arm64", "x64"],
 }
 
+export const NPM_TARGETS = NPM_SUPPORTED_ARCHITECTURES.os.flatMap((os) =>
+  NPM_SUPPORTED_ARCHITECTURES.cpu.map((cpu) => ({ os, cpu }))
+)
+
+export const npmLicenseListArgsForTarget = ({ os, cpu }) => [
+  "licenses",
+  "list",
+  "--prod",
+  "--json",
+  `--config.os=${os}`,
+  `--config.cpu=${cpu}`,
+]
+
+export const assertNpmUnionCoversDeclaredArchitectures = (records) => {
+  for (const { os, cpu } of NPM_TARGETS) {
+    const token = `${os}-${cpu}`
+    const covered = records.some(
+      (record) =>
+        record.ecosystem === "npm" && String(record.name).includes(token)
+    )
+    if (!covered) {
+      throw new Error(
+        `npm license union is missing optional packages for ${os}/${cpu}`
+      )
+    }
+  }
+  return records
+}
+
+export const collectDeclaredNpmLicenseRecords = (loadReportForTarget) =>
+  assertNpmUnionCoversDeclaredArchitectures(
+    collectNpmPackageUnion(
+      NPM_TARGETS.map((target) => loadReportForTarget(target))
+    )
+  )
+
 const compareStrings = (left, right) =>
   left < right ? -1 : left > right ? 1 : 0
 
@@ -434,10 +470,12 @@ const readJsonCommand = (command, args, cwd) => {
 
 export const generateLicenseReport = () => {
   const pnpmCommand = process.platform === "win32" ? "pnpm.cmd" : "pnpm"
-  const pnpmReport = readJsonCommand(
-    pnpmCommand,
-    ["licenses", "list", "--prod", "--json"],
-    repositoryRoot
+  const npmRecords = collectDeclaredNpmLicenseRecords((target) =>
+    readJsonCommand(
+      pnpmCommand,
+      npmLicenseListArgsForTarget(target),
+      repositoryRoot
+    )
   )
   const cargoMetadataRecords = CARGO_TARGETS.map((target) =>
     readJsonCommand(
@@ -454,7 +492,7 @@ export const generateLicenseReport = () => {
     )
   )
   const records = [
-    ...collectNpmPackageUnion([pnpmReport]),
+    ...npmRecords,
     ...collectCodexAcpPackages(),
     ...collectCargoPackageUnion(cargoMetadataRecords),
   ]

@@ -17,6 +17,32 @@ const ILINK_CHANNEL_VERSION: &str = "1.0.2";
 /// Maximum number of messages buffered while context_token is expired.
 const MAX_PENDING_MESSAGES: usize = 50;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WeixinGetUpdatesPlan {
+    next_cursor: String,
+    process_msgs: bool,
+    backoff: bool,
+    ret: Option<i64>,
+}
+
+/// Cursor may advance in the same body as a non-zero `ret`. Process `msgs`
+/// before backing off so those updates are not dropped (they cannot be retried).
+fn plan_getupdates(cursor: &str, body: &serde_json::Value) -> WeixinGetUpdatesPlan {
+    let ret = body.get("ret").and_then(|v| v.as_i64());
+    let next_cursor = body
+        .get("get_updates_buf")
+        .and_then(|v| v.as_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or(cursor)
+        .to_string();
+    WeixinGetUpdatesPlan {
+        next_cursor,
+        process_msgs: true,
+        backoff: matches!(ret, Some(code) if code != 0),
+        ret,
+    }
+}
+
 /// Shared HTTP client for QR code auth requests (avoids re-creating TLS state).
 fn qr_client() -> reqwest::Client {
     use std::sync::OnceLock;
@@ -576,20 +602,158 @@ impl ChatChannelBackend for WeixinBackend {
 
                         match resp.json::<serde_json::Value>().await {
                             Ok(body) => {
-                                let ret = body.get("ret").and_then(|v| v.as_i64());
+                                let plan = plan_getupdates(&cursor, &body);
+                                cursor = plan.next_cursor;
 
-                                // Always update cursor if present
-                                if let Some(new_cursor) =
-                                    body.get("get_updates_buf").and_then(|v| v.as_str())
-                                {
-                                    if !new_cursor.is_empty() {
-                                        cursor = new_cursor.to_string();
+                                // Process messages
+                                if plan.process_msgs {
+                                    if let Some(msgs) = body.get("msgs").and_then(|v| v.as_array())
+                                    {
+                                        if !msgs.is_empty() {
+                                            tracing::info!(
+                                                "[Weixin] got {} message(s)",
+                                                msgs.len()
+                                            );
+                                        }
+                                        for msg in msgs {
+                                            // Only handle user messages (message_type=1),
+                                            // skip bot echo (message_type=2)
+                                            let msg_type =
+                                                msg.get("message_type").and_then(|v| v.as_i64());
+                                            if msg_type != Some(1) {
+                                                continue;
+                                            }
+
+                                            // Extract text from type=1 (text) or type=3 (voice-to-text)
+                                            let text = msg
+                                                .get("item_list")
+                                                .and_then(|v| v.as_array())
+                                                .and_then(|items| {
+                                                    items.iter().find_map(|item| {
+                                                        let t = item
+                                                            .get("type")
+                                                            .and_then(|v| v.as_i64())?;
+                                                        match t {
+                                                            1 => item
+                                                                .pointer("/text_item/text")
+                                                                .and_then(|v| v.as_str()),
+                                                            3 => item
+                                                                .pointer("/voice_item/text")
+                                                                .and_then(|v| v.as_str()),
+                                                            _ => None,
+                                                        }
+                                                    })
+                                                });
+
+                                            let text = match text {
+                                                Some(t) if !t.is_empty() => t,
+                                                _ => {
+                                                    tracing::warn!(
+                                                        "[Weixin] skipped non-text message"
+                                                    );
+                                                    continue;
+                                                }
+                                            };
+
+                                            let from_user_id = msg
+                                                .get("from_user_id")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or_default();
+                                            let context_token = msg
+                                                .get("context_token")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or_default();
+
+                                            // Store reply context for outbound messages
+                                            // Single lock scope to avoid TOCTOU
+                                            if !from_user_id.is_empty() && !context_token.is_empty()
+                                            {
+                                                let was_expired = {
+                                                    let mut guard = reply_context.lock().await;
+                                                    let was = guard
+                                                        .as_ref()
+                                                        .map(|c| c.expired)
+                                                        .unwrap_or(false);
+                                                    *guard = Some(WeixinReplyContext {
+                                                        to_user_id: from_user_id.to_string(),
+                                                        context_token: context_token.to_string(),
+                                                        expired: false,
+                                                    });
+                                                    was
+                                                };
+
+                                                // Resend buffered messages with fresh context
+                                                if was_expired {
+                                                    let buffered: Vec<String> = pending_messages
+                                                        .lock()
+                                                        .await
+                                                        .drain(..)
+                                                        .collect();
+                                                    if !buffered.is_empty() {
+                                                        tracing::info!(
+                                                    "[Weixin] context refreshed, resending {} buffered message(s)",
+                                                    buffered.len()
+                                                );
+                                                        for pending_text in &buffered {
+                                                            let ok = WeixinBackend::do_send(
+                                                                SendRequest {
+                                                                    client: &client,
+                                                                    base_url: &base_url,
+                                                                    bot_token: &bot_token,
+                                                                    wechat_uin: &wechat_uin,
+                                                                    to_user_id: from_user_id,
+                                                                    context_token,
+                                                                    text: pending_text,
+                                                                    reply_context: &reply_context,
+                                                                    pending_messages:
+                                                                        &pending_messages,
+                                                                },
+                                                            )
+                                                            .await;
+                                                            if let Err(e) = ok {
+                                                                tracing::error!(
+                                                                    "[Weixin] resend error: {e}"
+                                                                );
+                                                                // Re-buffer remaining on hard error
+                                                                let mut buf =
+                                                                    pending_messages.lock().await;
+                                                                if buf.len() < MAX_PENDING_MESSAGES
+                                                                {
+                                                                    buf.push(pending_text.clone());
+                                                                }
+                                                            }
+                                                            // If do_send returned Ok(false), it
+                                                            // already re-buffered internally.
+                                                        }
+                                                    }
+                                                }
+                                            }
+
+                                            tracing::debug!("[Weixin] dispatching: {text}");
+                                            let send_result = command_tx
+                                                .send(IncomingCommand {
+                                                    channel_id,
+                                                    sender_id: from_user_id.to_string(),
+                                                    command_text: text.to_string(),
+                                                    callback_data: None,
+                                                    target: ChannelMessageTarget::channel(
+                                                        channel_id,
+                                                    ),
+                                                    metadata: msg.clone(),
+                                                })
+                                                .await;
+                                            if let Err(e) = send_result {
+                                                tracing::error!(
+                                                    "[Weixin] command_tx.send failed: {e}"
+                                                );
+                                            }
+                                        }
                                     }
                                 }
 
-                                if let Some(r) = ret {
-                                    if r != 0 {
-                                        consecutive_errors += 1;
+                                if plan.backoff {
+                                    consecutive_errors += 1;
+                                    if let Some(r) = plan.ret {
                                         tracing::info!(
                                             "[Weixin] getupdates ret={r} ({consecutive_errors})"
                                         );
@@ -611,8 +775,8 @@ impl ChatChannelBackend for WeixinBackend {
                                             _ = tokio::time::sleep(Duration::from_secs(delay)) => {}
                                             _ = shutdown_rx.changed() => {}
                                         }
-                                        continue;
                                     }
+                                    continue;
                                 }
 
                                 consecutive_errors = 0;
@@ -620,136 +784,6 @@ impl ChatChannelBackend for WeixinBackend {
                                     let mut s = status.lock().await;
                                     if *s == ChannelConnectionStatus::Error {
                                         *s = ChannelConnectionStatus::Connected;
-                                    }
-                                }
-
-                                // Process messages
-                                if let Some(msgs) = body.get("msgs").and_then(|v| v.as_array()) {
-                                    if !msgs.is_empty() {
-                                        tracing::info!("[Weixin] got {} message(s)", msgs.len());
-                                    }
-                                    for msg in msgs {
-                                        // Only handle user messages (message_type=1),
-                                        // skip bot echo (message_type=2)
-                                        let msg_type =
-                                            msg.get("message_type").and_then(|v| v.as_i64());
-                                        if msg_type != Some(1) {
-                                            continue;
-                                        }
-
-                                        // Extract text from type=1 (text) or type=3 (voice-to-text)
-                                        let text = msg
-                                            .get("item_list")
-                                            .and_then(|v| v.as_array())
-                                            .and_then(|items| {
-                                                items.iter().find_map(|item| {
-                                                    let t = item
-                                                        .get("type")
-                                                        .and_then(|v| v.as_i64())?;
-                                                    match t {
-                                                        1 => item
-                                                            .pointer("/text_item/text")
-                                                            .and_then(|v| v.as_str()),
-                                                        3 => item
-                                                            .pointer("/voice_item/text")
-                                                            .and_then(|v| v.as_str()),
-                                                        _ => None,
-                                                    }
-                                                })
-                                            });
-
-                                        let text = match text {
-                                            Some(t) if !t.is_empty() => t,
-                                            _ => {
-                                                tracing::warn!("[Weixin] skipped non-text message");
-                                                continue;
-                                            }
-                                        };
-
-                                        let from_user_id = msg
-                                            .get("from_user_id")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or_default();
-                                        let context_token = msg
-                                            .get("context_token")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or_default();
-
-                                        // Store reply context for outbound messages
-                                        // Single lock scope to avoid TOCTOU
-                                        if !from_user_id.is_empty() && !context_token.is_empty() {
-                                            let was_expired = {
-                                                let mut guard = reply_context.lock().await;
-                                                let was = guard
-                                                    .as_ref()
-                                                    .map(|c| c.expired)
-                                                    .unwrap_or(false);
-                                                *guard = Some(WeixinReplyContext {
-                                                    to_user_id: from_user_id.to_string(),
-                                                    context_token: context_token.to_string(),
-                                                    expired: false,
-                                                });
-                                                was
-                                            };
-
-                                            // Resend buffered messages with fresh context
-                                            if was_expired {
-                                                let buffered: Vec<String> = pending_messages
-                                                    .lock()
-                                                    .await
-                                                    .drain(..)
-                                                    .collect();
-                                                if !buffered.is_empty() {
-                                                    tracing::info!(
-                                                    "[Weixin] context refreshed, resending {} buffered message(s)",
-                                                    buffered.len()
-                                                );
-                                                    for pending_text in &buffered {
-                                                        let ok =
-                                                            WeixinBackend::do_send(SendRequest {
-                                                                client: &client,
-                                                                base_url: &base_url,
-                                                                bot_token: &bot_token,
-                                                                wechat_uin: &wechat_uin,
-                                                                to_user_id: from_user_id,
-                                                                context_token,
-                                                                text: pending_text,
-                                                                reply_context: &reply_context,
-                                                                pending_messages: &pending_messages,
-                                                            })
-                                                            .await;
-                                                        if let Err(e) = ok {
-                                                            tracing::error!(
-                                                                "[Weixin] resend error: {e}"
-                                                            );
-                                                            // Re-buffer remaining on hard error
-                                                            let mut buf =
-                                                                pending_messages.lock().await;
-                                                            if buf.len() < MAX_PENDING_MESSAGES {
-                                                                buf.push(pending_text.clone());
-                                                            }
-                                                        }
-                                                        // If do_send returned Ok(false), it
-                                                        // already re-buffered internally.
-                                                    }
-                                                }
-                                            }
-                                        }
-
-                                        tracing::debug!("[Weixin] dispatching: {text}");
-                                        let send_result = command_tx
-                                            .send(IncomingCommand {
-                                                channel_id,
-                                                sender_id: from_user_id.to_string(),
-                                                command_text: text.to_string(),
-                                                callback_data: None,
-                                                target: ChannelMessageTarget::channel(channel_id),
-                                                metadata: msg.clone(),
-                                            })
-                                            .await;
-                                        if let Err(e) = send_result {
-                                            tracing::error!("[Weixin] command_tx.send failed: {e}");
-                                        }
                                     }
                                 }
                             }
@@ -858,5 +892,61 @@ impl ChatChannelBackend for WeixinBackend {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nonzero_ret_still_processes_msgs_after_cursor_advances() {
+        let body = serde_json::json!({
+            "ret": -2,
+            "get_updates_buf": "cursor-2",
+            "msgs": [{
+                "message_type": 1,
+                "item_list": [{ "type": 1, "text_item": { "text": "hello" } }]
+            }]
+        });
+        let plan = plan_getupdates("cursor-1", &body);
+        assert_eq!(plan.next_cursor, "cursor-2");
+        assert!(
+            plan.process_msgs,
+            "non-zero ret must still process msgs; cursor already advanced"
+        );
+        assert!(plan.backoff);
+        assert_eq!(plan.ret, Some(-2));
+    }
+
+    #[test]
+    fn session_expired_ret_still_processes_then_backs_off() {
+        let body = serde_json::json!({
+            "ret": -14,
+            "get_updates_buf": "cursor-expired",
+            "msgs": [{
+                "message_type": 1,
+                "item_list": [{ "type": 1, "text_item": { "text": "late" } }]
+            }]
+        });
+        let plan = plan_getupdates("cursor-1", &body);
+        assert_eq!(plan.next_cursor, "cursor-expired");
+        assert!(plan.process_msgs);
+        assert!(plan.backoff);
+        assert_eq!(plan.ret, Some(-14));
+    }
+
+    #[test]
+    fn zero_ret_processes_without_backoff() {
+        let body = serde_json::json!({
+            "ret": 0,
+            "get_updates_buf": "cursor-2",
+            "msgs": []
+        });
+        let plan = plan_getupdates("cursor-1", &body);
+        assert_eq!(plan.next_cursor, "cursor-2");
+        assert!(plan.process_msgs);
+        assert!(!plan.backoff);
+        assert_eq!(plan.ret, Some(0));
     }
 }

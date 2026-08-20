@@ -3884,7 +3884,6 @@ function prepareMappedEnvelope(
       const settled = e.settled
       const detailRefetch = e.detail_refetch === true
       const agentType = snapshot.agentType
-      const statusAtPrepare = snapshot.status
       afterCommit.push(() => {
         const conversationId = getConversationIdByExternalIdFromStore(sessionId)
         if (turns && turns.length > 0) {
@@ -3909,7 +3908,7 @@ function prepareMappedEnvelope(
             ) {
               overlayFoldRefetchAt.set(conversationId, now)
               runtime.actions.refetchDetail(conversationId, {
-                preserveLive: statusAtPrepare === "prompting",
+                preserveLive: true,
               })
             }
           }
@@ -3918,7 +3917,7 @@ function prepareMappedEnvelope(
           useConversationRuntimeStore
             .getState()
             .actions.refetchDetail(conversationId, {
-              preserveLive: statusAtPrepare === "prompting",
+              preserveLive: true,
             })
         }
         if (settled && settled.length > 0) {

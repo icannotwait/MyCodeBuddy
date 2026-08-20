@@ -2115,8 +2115,14 @@ function reducer(
         ...(isActivelyInteracting
           ? keepAllLiveBuffers
             ? {}
-            : { localTurns: [] }
-          : { localTurns: [], optimisticTurns: [], liveMessage: null }),
+            : {
+                localTurns: retireCoveredLocalTurns(current.localTurns, detail),
+              }
+          : {
+              localTurns: retireCoveredLocalTurns(current.localTurns, detail),
+              optimisticTurns: [],
+              liveMessage: null,
+            }),
       }
       // When live buffers are cleared, re-derive activities from the last
       // assistant turn in detail (+ any remaining localTurns). While live is

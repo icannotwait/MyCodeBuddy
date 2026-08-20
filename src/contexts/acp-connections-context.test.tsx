@@ -3452,7 +3452,7 @@ describe("out-of-turn wire guard + background activity", () => {
     resetConversationRuntimeStore()
   })
 
-  it("terminal background_activity requests a detail refetch without preserveLive when idle", async () => {
+  it("terminal background_activity requests a detail refetch with preserveLive when idle", async () => {
     const { useConversationRuntimeStore, resetConversationRuntimeStore } =
       await import("@/stores/conversation-runtime-store")
     resetConversationRuntimeStore()
@@ -3485,7 +3485,7 @@ describe("out-of-turn wire guard + background activity", () => {
     })
 
     expect(refetchDetail).toHaveBeenCalledWith(VIRTUAL, {
-      preserveLive: false,
+      preserveLive: true,
     })
     expect(
       useConversationRuntimeStore.getState().byConversationId.get(VIRTUAL)

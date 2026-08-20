@@ -8,9 +8,11 @@ import {
   collectCargoPackageUnion,
   collectCargoPackages,
   collectCodexAcpPackages,
+  collectDeclaredNpmLicenseRecords,
   collectNpmPackages,
   collectNpmPackageUnion,
   findLicenseFiles,
+  NPM_TARGETS,
   renderLicenseReport,
 } from "./third-party-licenses.mjs"
 
@@ -213,6 +215,70 @@ test("unions npm reports across Darwin, Windows, and Linux independently of host
   assert.deepEqual(namesAndVersions(fromLinux), expected)
   assert.deepEqual(fromDarwin, fromWindows)
   assert.deepEqual(fromDarwin, fromLinux)
+})
+
+test("collectDeclaredNpmLicenseRecords loads one report per os/cpu and fails if a target is missing", () => {
+  const shared = makePackageDirectory("shared", { LICENSE: "Shared terms" })
+  const nativeDirectory = (name) =>
+    makePackageDirectory(name, { LICENSE: `${name} terms` })
+  const npmEntry = (name, directory) => ({
+    name,
+    versions: ["1.0.0"],
+    paths: [directory],
+    license: "MIT",
+    homepage: `https://example.test/${name}`,
+  })
+  const reportForKeys = (platformKeys) => ({
+    MIT: [
+      npmEntry("shared", shared),
+      ...platformKeys.map((key) =>
+        npmEntry(`@native/${key}`, nativeDirectory(`fsevents-${key}`))
+      ),
+    ],
+  })
+
+  assert.deepEqual(NPM_TARGETS, [
+    { os: "darwin", cpu: "arm64" },
+    { os: "darwin", cpu: "x64" },
+    { os: "linux", cpu: "arm64" },
+    { os: "linux", cpu: "x64" },
+    { os: "win32", cpu: "arm64" },
+    { os: "win32", cpu: "x64" },
+  ])
+
+  const loads = []
+  const records = collectDeclaredNpmLicenseRecords(({ os, cpu }) => {
+    loads.push(`${os}/${cpu}`)
+    return reportForKeys([`${os}-${cpu}`])
+  })
+  assert.deepEqual([...loads].sort(), [
+    "darwin/arm64",
+    "darwin/x64",
+    "linux/arm64",
+    "linux/x64",
+    "win32/arm64",
+    "win32/x64",
+  ])
+  assert.deepEqual(
+    records.map(({ name, version }) => ({ name, version })),
+    [
+      { name: "@native/darwin-arm64", version: "1.0.0" },
+      { name: "@native/darwin-x64", version: "1.0.0" },
+      { name: "@native/linux-arm64", version: "1.0.0" },
+      { name: "@native/linux-x64", version: "1.0.0" },
+      { name: "@native/win32-arm64", version: "1.0.0" },
+      { name: "@native/win32-x64", version: "1.0.0" },
+      { name: "shared", version: "1.0.0" },
+    ]
+  )
+
+  assert.throws(
+    () =>
+      collectDeclaredNpmLicenseRecords(({ os, cpu }) =>
+        os === "linux" ? reportForKeys([]) : reportForKeys([`${os}-${cpu}`])
+      ),
+    /linux\/(?:arm64|x64)/
+  )
 })
 
 test("collects the bundled codex fork and locked production dependencies", () => {

@@ -19,6 +19,17 @@ import {
   selectTimelineTurns,
   useConversationRuntimeStore,
 } from "@/stores/conversation-runtime-store"
+import { getFolderConversation } from "@/lib/api"
+
+vi.mock("@/lib/api", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/api")>()
+  return {
+    ...actual,
+    getFolderConversation: vi.fn(actual.getFolderConversation),
+  }
+})
+
+const mockGetFolderConversation = vi.mocked(getFolderConversation)
 
 const CID = 42
 const OTHER_CID = 99
@@ -923,6 +934,65 @@ describe("runtime store — production agentType + delegationActivities", () => 
         ?.localTurns ?? []
     expect(local.length).toBe(81)
     expect(local.some((t) => t.id === "live-42-cap-0")).toBe(true)
+    expect(local.some((t) => t.id === "live-42-cap-80")).toBe(true)
+  })
+
+  it("idle FETCH_DETAIL_SUCCESS retires only localTurns already in detail", async () => {
+    const { actions } = useConversationRuntimeStore.getState()
+    actions.fetchDetail(CID)
+    useConversationRuntimeStore.setState((s) => {
+      const session = s.byConversationId.get(CID)!
+      const next = new Map(s.byConversationId)
+      next.set(CID, {
+        ...session,
+        detail: detailWithTurns([assistantTurn("live-42-keep-me")]),
+        detailLoading: false,
+        syncState: "idle",
+      })
+      return { byConversationId: next }
+    })
+
+    const covered: LiveMessage = {
+      id: "keep-me",
+      role: "assistant",
+      content: [{ type: "text", text: "already persisted" }],
+      startedAt: Date.parse("2026-07-16T10:00:00Z"),
+    }
+    actions.setLiveMessage(CID, covered, true)
+    actions.completeTurn(CID, covered)
+
+    for (let i = 0; i < 81; i++) {
+      const live: LiveMessage = {
+        id: `cap-${i}`,
+        role: "assistant",
+        content: [{ type: "text", text: `t${i}` }],
+        startedAt: Date.parse("2026-07-16T10:00:00Z") + i,
+      }
+      actions.setLiveMessage(CID, live, true)
+      actions.completeTurn(CID, live)
+    }
+    expect(
+      useConversationRuntimeStore.getState().byConversationId.get(CID)
+        ?.localTurns.length
+    ).toBe(81)
+
+    mockGetFolderConversation.mockResolvedValueOnce(
+      detailWithTurns([
+        assistantTurn("live-42-keep-me"),
+        assistantTurn("live-42-cap-0"),
+      ])
+    )
+    actions.refetchDetail(CID, { preserveLive: false })
+    await Promise.resolve()
+    await Promise.resolve()
+
+    const local =
+      useConversationRuntimeStore.getState().byConversationId.get(CID)
+        ?.localTurns ?? []
+    expect(local.some((t) => t.id === "live-42-keep-me")).toBe(false)
+    expect(local.some((t) => t.id === "live-42-cap-0")).toBe(false)
+    expect(local.length).toBe(80)
+    expect(local.some((t) => t.id === "live-42-cap-1")).toBe(true)
     expect(local.some((t) => t.id === "live-42-cap-80")).toBe(true)
   })
 })
