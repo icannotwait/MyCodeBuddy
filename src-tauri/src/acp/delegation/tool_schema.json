@@ -262,7 +262,7 @@
   },
   {
     "name": "get_delegation_status",
-    "description": "task_ids input order;omit wait_ms for an immediate snapshot;return_when=all_terminal_or_attention;positive wait_ms is rejected;wake_reason,attention_requests: attention,unavailable,all requested tasks are terminal;re-join only still-running required.",
+    "description": "task_ids input order;Snapshot: omit wait_ms for an immediate snapshot;Join: return_when=all_terminal_or_attention requires explicit wait_ms=0;No positive wait_ms;wake_reason/attention_requests:attention,unavailable,all terminal;Re-join only required running tasks",
     "inputSchema": {
       "type": "object",
       "required": [

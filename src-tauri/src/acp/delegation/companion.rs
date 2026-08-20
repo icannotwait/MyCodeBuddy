@@ -4484,9 +4484,9 @@ mod tests {
         let coordination_guidance = tool_guidance(status);
         for required in [
             "omit wait_ms for an immediate snapshot",
-            "return_when=all_terminal_or_attention",
-            "positive wait_ms is rejected",
-            "re-join only still-running required",
+            "return_when=all_terminal_or_attention requires explicit wait_ms=0",
+            "no positive wait_ms",
+            "re-join only required running tasks",
         ] {
             assert!(
                 coordination_guidance.contains(required),
@@ -4888,9 +4888,9 @@ mod tests {
                     "all_terminal_or_attention",
                     "omit wait_ms for an immediate snapshot",
                     "return_when=all_terminal_or_attention",
-                    "positive wait_ms is rejected",
-                    "re-join only still-running required",
-                    "all requested tasks are terminal",
+                    "no positive wait_ms",
+                    "re-join only required running tasks",
+                    "all terminal",
                     "attention",
                     "unavailable",
                     "input order",
