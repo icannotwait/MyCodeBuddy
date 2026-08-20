@@ -852,6 +852,22 @@ function retireCoveredBackgroundTurns(
   return retained.length === backgroundTurns.length ? backgroundTurns : retained
 }
 
+/**
+ * Drop localTurns whose ids are already in persisted `detail.turns`.
+ * Unpersisted remainder is the only copy in an owner tab that does not
+ * refetch, so it is never truncated by count.
+ */
+function retireCoveredLocalTurns(
+  localTurns: MessageTurn[],
+  detail: DbConversationDetail | null
+): MessageTurn[] {
+  if (localTurns.length === 0) return localTurns
+  const persistedIds = new Set(detail?.turns.map((t) => t.id) ?? [])
+  if (persistedIds.size === 0) return localTurns
+  const retained = localTurns.filter((t) => !persistedIds.has(t.id))
+  return retained.length === localTurns.length ? localTurns : retained
+}
+
 function batchStartCapture(
   current: ConversationRuntimeSession,
   promptId: string
@@ -2255,6 +2271,7 @@ function reducer(
         ...s,
         detail: nextDetail,
         backgroundTurns: nextBackgroundTurns,
+        localTurns: retireCoveredLocalTurns(current.localTurns, nextDetail),
         loadingOlderTurns: false,
         // Explicit prepend signal for the virtualized thread's `shift`
         // derivation — see the field doc.
@@ -2379,7 +2396,7 @@ function reducer(
 
       return updateSessionInState(state, action.conversationId, () => ({
         ...current,
-        localTurns: promoted,
+        localTurns: retireCoveredLocalTurns(promoted, current.detail),
         optimisticTurns: [],
         liveMessage: null,
         syncState: "idle",
@@ -5728,7 +5745,7 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
         stopSoftFenceTimer(conversationId)
         bumpCancelGeneration(conversationId)
       }
-      if (conversationId !== dbConversationId) {
+      if (dbConversationId != null && conversationId !== dbConversationId) {
         aliasRequestUsageIds(conversationId, dbConversationId)
       }
       dispatch({

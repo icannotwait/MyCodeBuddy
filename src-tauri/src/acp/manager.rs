@@ -10461,6 +10461,24 @@ mod disconnect_origin {
         assert_ne!(replacement_incarnation, original_incarnation);
         resume.notify_one();
 
+        // `disconnect_all` snapshots twice so a connection inserted during the
+        // first take is still collected. Handshake that second take; otherwise
+        // the test waits on join while the second pass waits on `resume`.
+        reached.notified().await;
+        manager
+            .insert_test_connection("replaced", AgentType::Codex, None, EventEmitter::Noop)
+            .await;
+        let second_replacement_incarnation = manager
+            .connections
+            .lock()
+            .await
+            .get("replaced")
+            .expect("second replacement connection")
+            .connection_incarnation
+            .clone();
+        assert_ne!(second_replacement_incarnation, replacement_incarnation);
+        resume.notify_one();
+
         assert_eq!(disconnect.await.expect("disconnect join"), 0);
         assert_eq!(evidence.peek("gone"), None);
         assert_eq!(evidence.peek("replaced"), None);
@@ -10472,10 +10490,11 @@ mod disconnect_origin {
                 .get("replaced")
                 .expect("replacement must remain routable")
                 .connection_incarnation,
-            replacement_incarnation
+            second_replacement_incarnation
         );
         assert_registry_remains_routable(&manager, "gone", &gone_incarnation).await;
         assert_registry_remains_routable(&manager, "replaced", &original_incarnation).await;
+        assert_registry_remains_routable(&manager, "replaced", &replacement_incarnation).await;
     }
 
     #[tokio::test]

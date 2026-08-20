@@ -4710,14 +4710,14 @@ mod tests {
                 let Some(value) = candidate.as_u64() else {
                     return false;
                 };
-                !schema
+                schema
                     .get("minimum")
                     .and_then(Value::as_u64)
-                    .is_some_and(|minimum| value < minimum)
-                    && !schema
+                    .is_none_or(|minimum| value >= minimum)
+                    && schema
                         .get("maximum")
                         .and_then(Value::as_u64)
-                        .is_some_and(|maximum| value > maximum)
+                        .is_none_or(|maximum| value <= maximum)
             }
             Some("boolean") => candidate.is_boolean(),
             Some(_) => false,

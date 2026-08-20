@@ -99,6 +99,12 @@ struct DestinationIngress {
     rx: Mutex<Option<mpsc::Receiver<Arc<InternalEventEnvelope>>>>,
 }
 
+impl Default for LifecycleIngress {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LifecycleIngress {
     pub fn new() -> Self {
         Self::new_with_capacity(DESTINATION_INGRESS_CAPACITY)
@@ -724,7 +730,7 @@ mod tests {
 
     fn assert_send_pending<F: Future>(fut: &mut std::pin::Pin<&mut F>) {
         let waker = std::task::Waker::noop();
-        let mut cx = std::task::Context::from_waker(&waker);
+        let mut cx = std::task::Context::from_waker(waker);
         assert!(
             fut.as_mut().poll(&mut cx).is_pending(),
             "send must stay pending while the destination is saturated"

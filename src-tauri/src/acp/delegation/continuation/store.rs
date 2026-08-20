@@ -1935,10 +1935,10 @@ impl ContinuationStore for InMemoryContinuationStore {
         conversation_id: i32,
     ) -> Result<Option<ContinuationRecord>, ContStoreError> {
         let inner = self.inner.lock().await;
-        if !inner
+        if inner
             .parent_statuses
             .get(&conversation_id)
-            .is_some_and(|status| status == "cancelled")
+            .is_none_or(|status| status != "cancelled")
         {
             return Ok(None);
         }

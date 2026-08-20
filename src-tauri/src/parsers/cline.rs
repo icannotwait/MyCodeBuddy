@@ -139,6 +139,7 @@ std::thread_local! {
 }
 
 #[cfg(any(test, feature = "test-utils"))]
+#[allow(dead_code)] // reserved single-scan counter for parser tests
 pub(crate) fn take_history_body_reads() -> usize {
     HISTORY_BODY_READS.with(|c| c.replace(0))
 }
@@ -343,8 +344,8 @@ impl AgentParser for ClineParser {
                         completed_at: Some(timestamp),
                         outcome: None,
                         autonomous_origin: None,
-            generation_ms: None,
-            generation_tokens: None,
+                        generation_ms: None,
+                        generation_tokens: None,
                     });
                 }
                 "user" => {
@@ -368,8 +369,8 @@ impl AgentParser for ClineParser {
                             completed_at: Some(timestamp),
                             outcome: None,
                             autonomous_origin: None,
-            generation_ms: None,
-            generation_tokens: None,
+                            generation_ms: None,
+                            generation_tokens: None,
                         });
                     }
 
@@ -388,8 +389,8 @@ impl AgentParser for ClineParser {
                             completed_at: Some(timestamp),
                             outcome: None,
                             autonomous_origin: None,
-            generation_ms: None,
-            generation_tokens: None,
+                            generation_ms: None,
+                            generation_tokens: None,
                         });
                     }
                 }

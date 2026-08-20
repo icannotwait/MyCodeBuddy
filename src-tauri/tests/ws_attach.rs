@@ -25,7 +25,7 @@ use codeg_lib::models::agent::AgentType;
 use codeg_lib::web::event_bridge::emit_with_state;
 use codeg_lib::web::router::build_router;
 use codeg_lib::web::shutdown::ShutdownSignal;
-use codeg_lib::web::ws_attach::{spawn_forwarder, DetachReason, ServerMsg};
+use codeg_lib::web::ws_attach::{spawn_forwarder, DetachReason, ServerMsg, WatchdogEventGate};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
@@ -463,6 +463,7 @@ async fn ws_lag_reconnect_snapshot_restores_shared_state_and_lease_expiry() {
         1,
         state.acp_event_bus.metrics().clone(),
         receiver,
+        WatchdogEventGate::default(),
         outbound_tx,
         cleanup_tx,
         state.connection_manager.shared_session_broker(),

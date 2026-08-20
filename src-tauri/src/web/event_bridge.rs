@@ -515,8 +515,7 @@ where
             // immediate per-envelope delivery even when the desktop queue
             // applies backpressure on the awaited delivery branch below.
             if let Some(bus) = app.try_state::<Arc<InternalEventBus>>() {
-                publish_to_internal_bus(&**bus, Arc::clone(&envelope_arc), completion, evicted)
-                    .await;
+                publish_to_internal_bus(&bus, Arc::clone(&envelope_arc), completion, evicted).await;
             }
 
             // Tauri webview listener is the desktop frontend's only ACP path

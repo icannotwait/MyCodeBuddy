@@ -1863,7 +1863,7 @@ async fn validate_replacement_insert_txn(
             .one(txn)
             .await
             .map_err(map_db_err)?;
-    if !parent.is_some_and(|parent| parent.deleted_at.is_none()) {
+    if parent.is_none_or(|parent| parent.deleted_at.is_some()) {
         return Err(TaskStoreError::NotFound(replaced_id.to_string()));
     }
     let source_agent_type = parse_known_agent_type(&source_row.agent_type).ok_or_else(|| {
@@ -3503,7 +3503,7 @@ impl RunStore {
             .one(&self.db.conn)
             .await
             .map_err(map_db_err)?;
-        if !parent.is_some_and(|parent| parent.deleted_at.is_none()) {
+        if parent.is_none_or(|parent| parent.deleted_at.is_some()) {
             return Ok((false, false, false));
         }
         let run = DelegationTaskRun::find_by_id(&target.task_id)

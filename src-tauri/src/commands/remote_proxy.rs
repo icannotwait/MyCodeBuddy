@@ -1790,7 +1790,7 @@ async fn forward_text_message(
     match classify_forwarded_text(text)? {
         ForwardedWsText::AttachError(envelope) => {
             emit_json_to_subscribers(app, entry, event_name, &envelope).await;
-            return Ok(());
+            Ok(())
         }
         ForwardedWsText::Parsed(envelope) => {
             if envelope

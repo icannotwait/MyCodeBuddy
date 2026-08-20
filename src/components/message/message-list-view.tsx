@@ -1681,7 +1681,7 @@ export function MessageListView({
           return null
       }
     },
-    [showThinking, conversationId, userTurnHeader]
+    [showThinking, conversationId, userTurnHeader, agentType]
   )
 
   const emptyState = useMemo(

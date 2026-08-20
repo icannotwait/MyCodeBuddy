@@ -41,16 +41,13 @@ use tokio::sync::RwLock;
 /// Capacity of the off-select broker tool-effects overflow mailbox.
 const LIFECYCLE_OVERFLOW_CAPACITY: usize = 4096;
 
-fn broker_tool_overflow_tx() -> mpsc::Sender<(
+type BrokerToolOverflowTx = mpsc::Sender<(
     mpsc::Sender<Arc<InternalEventEnvelope>>,
     Arc<InternalEventEnvelope>,
-)> {
-    static TX: OnceLock<
-        mpsc::Sender<(
-            mpsc::Sender<Arc<InternalEventEnvelope>>,
-            Arc<InternalEventEnvelope>,
-        )>,
-    > = OnceLock::new();
+)>;
+
+fn broker_tool_overflow_tx() -> BrokerToolOverflowTx {
+    static TX: OnceLock<BrokerToolOverflowTx> = OnceLock::new();
     TX.get_or_init(|| {
         let (tx, mut rx) = mpsc::channel::<(
             mpsc::Sender<Arc<InternalEventEnvelope>>,
@@ -87,6 +84,7 @@ fn broker_tool_overflow_tx() -> mpsc::Sender<(
 /// Registration runs on a dedicated off-select broker-tool worker via
 /// `register_delegation_tool_call_from_event`, so these high-frequency events
 /// never need to reach a lifecycle worker and never park the dispatcher.
+#[allow(dead_code)] // reserved for lifecycle-worker filtering
 fn is_lifecycle_relevant(event: &AcpEvent) -> bool {
     // Keep in sync with `internal_bus::is_lifecycle_critical` (critical lane).
     // Non-terminal `Error` is also worker-relevant for logging paths that still
@@ -138,6 +136,7 @@ fn is_blocking_prompt_event(event: &AcpEvent) -> bool {
 /// fires mid-turn from `turn_failure_error_event` while the child connection
 /// stays alive, and the worker must survive to process the trailing
 /// `TurnComplete`. (P2 follow-up in the v0.14.3 post-mortem review.)
+#[allow(dead_code)] // reserved dispatcher teardown predicate
 fn is_dispatcher_terminal(event: &AcpEvent) -> bool {
     matches!(
         event,
@@ -4426,7 +4425,7 @@ mod tests {
 
     fn assert_send_pending<F: Future>(fut: &mut std::pin::Pin<&mut F>) {
         let waker = std::task::Waker::noop();
-        let mut cx = std::task::Context::from_waker(&waker);
+        let mut cx = std::task::Context::from_waker(waker);
         assert!(
             fut.as_mut().poll(&mut cx).is_pending(),
             "send must stay pending while the destination is saturated"

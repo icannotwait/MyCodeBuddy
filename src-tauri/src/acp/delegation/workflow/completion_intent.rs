@@ -1125,7 +1125,7 @@ fn normalize_report_path(path: &str, allow_markdown: bool) -> Option<String> {
     }
     let path = normalized.join("/");
     let lowercase = path.to_lowercase();
-    if !lowercase.ends_with(".md") && !(allow_markdown && lowercase.ends_with(".markdown")) {
+    if !(lowercase.ends_with(".md") || (allow_markdown && lowercase.ends_with(".markdown"))) {
         return None;
     }
     Some(path)

@@ -37,8 +37,8 @@ pub const REPLAY_BATCH_THRESHOLD: usize = 32;
 /// memory blow up if the client stops reading.
 pub const OUTBOUND_CAPACITY: usize = 64;
 
-#[derive(Clone)]
-pub(crate) struct WatchdogEventGate {
+#[derive(Clone, Default)]
+pub struct WatchdogEventGate {
     floors: BTreeMap<String, u64>,
     actionable: BTreeSet<String>,
 }
@@ -353,7 +353,7 @@ pub async fn handle_attach(
 /// `metrics` records `Lagged` exits so operators can correlate attach
 /// re-attachment storms with per-connection broadcast pressure.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn spawn_forwarder(
+pub fn spawn_forwarder(
     subscription_id: String,
     epoch: u64,
     metrics: Arc<EventBusMetrics>,

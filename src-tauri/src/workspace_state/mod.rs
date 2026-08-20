@@ -889,7 +889,7 @@ fn canonicalize_watch_dir(path: &Path) -> PathBuf {
 }
 
 fn is_hard_excluded_watch_dir_name(name: &str) -> bool {
-    WATCH_IGNORED_DIRS.iter().any(|ignored| *ignored == name)
+    WATCH_IGNORED_DIRS.contains(&name)
 }
 
 fn is_git_info_watch_path(relative: &Path) -> bool {
@@ -2896,9 +2896,7 @@ mod tests {
                 if path == root {
                     return Some(".".to_string());
                 }
-                path.strip_prefix(root)
-                    .ok()
-                    .map(|rel| normalize_slash_path(rel))
+                path.strip_prefix(root).ok().map(normalize_slash_path)
             })
             .collect()
     }

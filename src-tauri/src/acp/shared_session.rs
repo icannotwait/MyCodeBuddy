@@ -802,9 +802,7 @@ impl SharedSessionBroker {
     ) -> Option<SharedClosingTransition> {
         loop {
             let index = self.index.lock().await;
-            let Some(key) = index.by_connection.get(&candidate.connection_id).cloned() else {
-                return None;
-            };
+            let key = index.by_connection.get(&candidate.connection_id).cloned()?;
             if !matches!(key, SharedSessionKey::Ephemeral(_)) {
                 return None;
             }

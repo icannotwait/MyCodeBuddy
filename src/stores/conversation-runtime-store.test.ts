@@ -878,4 +878,51 @@ describe("runtime store — production agentType + delegationActivities", () => 
       selectDelegationActivities(useConversationRuntimeStore.getState(), CID)
     ).toHaveLength(0)
   })
+
+  it("COMPLETE_TURN drops same-id persisted turns and keeps unpersisted history", () => {
+    const { actions } = useConversationRuntimeStore.getState()
+    actions.fetchDetail(CID)
+    useConversationRuntimeStore.setState((s) => {
+      const session = s.byConversationId.get(CID)!
+      const next = new Map(s.byConversationId)
+      next.set(CID, {
+        ...session,
+        detail: detailWithTurns([assistantTurn("live-42-keep-me")]),
+        detailLoading: false,
+      })
+      return { byConversationId: next }
+    })
+
+    const covered: LiveMessage = {
+      id: "keep-me",
+      role: "assistant",
+      content: [{ type: "text", text: "already persisted" }],
+      startedAt: Date.parse("2026-07-16T10:00:00Z"),
+    }
+    actions.setLiveMessage(CID, covered, true)
+    actions.completeTurn(CID, covered)
+    expect(
+      useConversationRuntimeStore
+        .getState()
+        .byConversationId.get(CID)
+        ?.localTurns.some((t) => t.id === "live-42-keep-me")
+    ).toBe(false)
+
+    for (let i = 0; i < 81; i++) {
+      const live: LiveMessage = {
+        id: `cap-${i}`,
+        role: "assistant",
+        content: [{ type: "text", text: `t${i}` }],
+        startedAt: Date.parse("2026-07-16T10:00:00Z") + i,
+      }
+      actions.setLiveMessage(CID, live, true)
+      actions.completeTurn(CID, live)
+    }
+    const local =
+      useConversationRuntimeStore.getState().byConversationId.get(CID)
+        ?.localTurns ?? []
+    expect(local.length).toBe(81)
+    expect(local.some((t) => t.id === "live-42-cap-0")).toBe(true)
+    expect(local.some((t) => t.id === "live-42-cap-80")).toBe(true)
+  })
 })

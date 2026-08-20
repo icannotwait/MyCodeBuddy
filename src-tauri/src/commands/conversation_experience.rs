@@ -377,15 +377,27 @@ mod barrier_commit_hooks {
     }
 
     pub(super) fn take_fail_raise_as_ambiguous() -> bool {
+        #[cfg(any(test, feature = "test-utils"))]
+        if !crate::auto_title::title_key::test_hooks::is_suite_owner() {
+            return false;
+        }
         FAIL_NEXT_RAISE_AS_AMBIGUOUS.swap(false, Ordering::SeqCst)
     }
 
     pub(super) fn take_fail_success_as_ambiguous() -> bool {
+        #[cfg(any(test, feature = "test-utils"))]
+        if !crate::auto_title::title_key::test_hooks::is_suite_owner() {
+            return false;
+        }
         FAIL_NEXT_SUCCESS_AS_AMBIGUOUS.swap(false, Ordering::SeqCst)
     }
 
     /// Returns true when this raise should fail cleanly (no barrier write).
     pub(super) fn take_fail_raise_clean() -> bool {
+        #[cfg(any(test, feature = "test-utils"))]
+        if !crate::auto_title::title_key::test_hooks::is_suite_owner() {
+            return false;
+        }
         let n = RAISE_CLEAN_FAIL_SKIPS.load(Ordering::SeqCst);
         if n < 0 {
             return false;

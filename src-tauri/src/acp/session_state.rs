@@ -7222,7 +7222,7 @@ mod tests {
         assert_eq!(entry.raw_input.parse_count, 1);
         assert!(entry.raw_input.buffer.len() <= MAX_BYTES);
 
-        let snapshot = serde_json::to_value(&s.to_snapshot()).unwrap();
+        let snapshot = serde_json::to_value(s.to_snapshot()).unwrap();
         let tc_json = &snapshot["active_tool_calls"][0];
         assert!(
             tc_json.get("raw_input").is_none(),

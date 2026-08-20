@@ -7702,7 +7702,7 @@ async fn verify_plan_gate_ready<C: sea_orm::ConnectionTrait>(
         let binding_matches = binding.summary_validated
             && binding.manifest_revision == active_manifest_revision
             && binding.content_fingerprint.as_deref() == Some(current_content_fingerprint)
-            && !prior_ts.is_some_and(|timestamp| binding.created_at <= timestamp);
+            && prior_ts.is_none_or(|timestamp| binding.created_at > timestamp);
         let run = delegation_task_run::Entity::find_by_id(binding.task_id)
             .one(conn)
             .await
@@ -13629,11 +13629,9 @@ mod tests {
         assert_eq!(a.workflow_id, b.workflow_id);
         assert_eq!(a.manifest_revision, 1);
         assert_eq!(b.manifest_revision, 1);
-        // Both succeed; at least one may be idempotent replay after serialization.
-        assert!(
-            a.idempotent_replay
-                || b.idempotent_replay
-                || (!a.idempotent_replay && !b.idempotent_replay),
+        // Both concurrent publishes must succeed; one may be an idempotent replay.
+        assert_eq!(
+            a.workflow_id, b.workflow_id,
             "both results usable: a={a:?} b={b:?}"
         );
         let headers = delegation_workflow::Entity::find()
