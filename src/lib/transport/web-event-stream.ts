@@ -203,6 +203,12 @@ export class WebEventStream implements EventStream {
     for (const id of ids) {
       const sub = this.subs.get(id)
       if (!sub) continue
+      if (this.host.isWsOpen()) {
+        this.host.sendFrame({
+          action: "detach",
+          subscription_id: id,
+        })
+      }
       this.subs.delete(id)
       safeInvoke("onAttachError", () =>
         sub.handlers.onAttachError(code, true)

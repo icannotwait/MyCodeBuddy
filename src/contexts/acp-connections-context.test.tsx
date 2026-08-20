@@ -7293,6 +7293,7 @@ describe("AcpConnectionsProvider canonical observer aliases", () => {
       h.actions!.retryAttach("broker-child")
     })
     expect(h.attach).toHaveBeenCalledTimes(2)
+    expect(h.attach.mock.calls.at(-1)?.[1]).toEqual({ reconnectMode: "cold" })
     expect(h.store!.getConnection("broker-child")?.attachError).toBeNull()
     expect(h.store!.getConnection("broker-child")).toBeTruthy()
 
@@ -7305,6 +7306,7 @@ describe("AcpConnectionsProvider canonical observer aliases", () => {
       h.fireReconnect()
     })
     expect(h.attach).toHaveBeenCalledTimes(3)
+    expect(h.attach.mock.calls.at(-1)?.[1]).toEqual({ reconnectMode: "cold" })
 
     act(() => {
       latestAttachHandlers().onAttachError("snapshot_budget_exceeded", true)
@@ -7313,6 +7315,63 @@ describe("AcpConnectionsProvider canonical observer aliases", () => {
       h.fireReconnect()
     })
     expect(h.attach).toHaveBeenCalledTimes(3)
+  })
+
+  it("clears a parked attach retry record on disconnect so a new session can auto-retry", async () => {
+    h.acpFindConnectionForConversation.mockResolvedValue({
+      connection_id: "broker-child",
+      event_seq: 0,
+    })
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sid", 42)
+    })
+
+    act(() => {
+      latestAttachHandlers().onAttachError("snapshot_budget_exceeded", true)
+    })
+    act(() => {
+      h.fireReconnect()
+    })
+    expect(h.attach).toHaveBeenCalledTimes(2)
+
+    act(() => {
+      latestAttachHandlers().onAttachError("snapshot_budget_exceeded", true)
+    })
+    await act(async () => {
+      await h.actions!.disconnect(TAB)
+    })
+
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sid", 42)
+    })
+    expect(h.attach).toHaveBeenCalledTimes(3)
+
+    act(() => {
+      latestAttachHandlers().onAttachError("snapshot_budget_exceeded", true)
+    })
+    act(() => {
+      h.fireReconnect()
+    })
+    expect(h.attach).toHaveBeenCalledTimes(4)
+  })
+
+  it("retries snapshot_budget_exceeded as a cold attach instead of sinceSeq 0", async () => {
+    h.acpFindConnectionForConversation.mockResolvedValue(null)
+    h.acpConnect.mockResolvedValue("spawned-conn")
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sid", 42)
+    })
+    expect(h.attach.mock.calls.at(-1)?.[1]).toEqual({})
+
+    act(() => {
+      latestAttachHandlers().onAttachError("snapshot_budget_exceeded", true)
+    })
+    act(() => {
+      h.actions!.retryAttach(TAB)
+    })
+    expect(h.attach.mock.calls.at(-1)?.[1]).toEqual({ reconnectMode: "cold" })
   })
 
   it("orphan rescue does not rekey viewer off connectionId; second observer reuses state", async () => {

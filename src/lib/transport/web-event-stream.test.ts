@@ -229,4 +229,42 @@ describe("WebEventStream reconnect mode", () => {
     expect(f.sendFrame).not.toHaveBeenCalled()
     stream.destroy()
   })
+
+  it("sends detach before dropping a failed attach subscription", () => {
+    const f = hostFixture()
+    const stream = new WebEventStream(f.host)
+    const sub = stream.attach("conn", {}, handlers)
+    f.sendFrame.mockClear()
+
+    stream.notifyOversizedFrame(sub.subscriptionId)
+
+    expect(f.sendFrame).toHaveBeenCalledWith({
+      action: "detach",
+      subscription_id: sub.subscriptionId,
+    })
+    expect(handlers.onAttachError).toHaveBeenCalledWith("oversized_frame", true)
+    expect(handlers.onDetached).not.toHaveBeenCalled()
+  })
+
+  it("sends detach for a snapshot_budget_exceeded attach_error frame", () => {
+    const f = hostFixture()
+    const stream = new WebEventStream(f.host)
+    const sub = stream.attach("conn", {}, handlers)
+    f.sendFrame.mockClear()
+
+    stream.handleServerFrame({
+      type: "attach_error",
+      subscription_id: sub.subscriptionId,
+      code: "snapshot_budget_exceeded",
+    })
+
+    expect(f.sendFrame).toHaveBeenCalledWith({
+      action: "detach",
+      subscription_id: sub.subscriptionId,
+    })
+    expect(handlers.onAttachError).toHaveBeenCalledWith(
+      "snapshot_budget_exceeded",
+      true
+    )
+  })
 })

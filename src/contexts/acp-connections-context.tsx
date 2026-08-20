@@ -6447,9 +6447,9 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
   // `setupAttachSubscription`.
   const teardownAttachSubscription = useCallback((contextKey: string) => {
     const sub = attachSubscriptionsRef.current.get(contextKey)
+    attachRetryRef.current.delete(contextKey)
     if (!sub) return
     attachSubscriptionsRef.current.delete(contextKey)
-    attachRetryRef.current.delete(contextKey)
     try {
       sub.detach()
     } catch (err) {
@@ -6467,12 +6467,23 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       if (!conn?.attachError?.retryable) return
       if (isAuto && record.autoRetryUsed) return
       if (isAuto) record.autoRetryUsed = true
+      const errorCode = conn.attachError.code
+      const sinceSeq =
+        errorCode === "snapshot_budget_exceeded"
+          ? undefined
+          : conn.lastAppliedSeq > 0
+            ? conn.lastAppliedSeq
+            : record.sinceSeq
+      const reconnectMode =
+        errorCode === "snapshot_budget_exceeded"
+          ? "cold"
+          : record.reconnectMode
       dispatch({ type: "CLEAR_ATTACH_ERROR", contextKey: canonical })
       setupAttachSubscription(
         canonical,
         record.connectionId,
-        conn.lastAppliedSeq,
-        record.reconnectMode,
+        sinceSeq,
+        reconnectMode,
         record.shared
       )
     },
