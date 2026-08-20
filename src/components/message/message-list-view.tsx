@@ -1127,6 +1127,7 @@ const LiveAgentPlanOverlay = memo(function LiveAgentPlanOverlay({
  */
 const LiveAwareSubAgentOverlay = memo(function LiveAwareSubAgentOverlay({
   conversationId,
+  durableConversationId,
   agentType,
   isStreaming,
   historicalDelegations,
@@ -1138,6 +1139,7 @@ const LiveAwareSubAgentOverlay = memo(function LiveAwareSubAgentOverlay({
   onOpenRootConversation,
 }: {
   conversationId: number
+  durableConversationId: number
   agentType: AgentType
   isStreaming: boolean
   historicalDelegations: DelegationCardSource[]
@@ -1194,7 +1196,7 @@ const LiveAwareSubAgentOverlay = memo(function LiveAwareSubAgentOverlay({
       activities={activities}
       overlayKey={historicalKey}
       defaultExpanded
-      conversationId={conversationId}
+      conversationId={durableConversationId}
       workflowGraph={workflowGraph}
       workspaceRootPath={workspaceRootPath}
       isActive={isActive}
@@ -2092,6 +2094,7 @@ export function MessageListView({
         {useIncrementalLive ? (
           <LiveAwareSubAgentOverlay
             conversationId={conversationId}
+            durableConversationId={durableConversationId}
             agentType={agentType}
             isStreaming={connStatus === "prompting"}
             historicalDelegations={allSessionDelegations}
@@ -2109,7 +2112,7 @@ export function MessageListView({
             activities={sessionActivities}
             overlayKey={subAgentOverlayKey}
             defaultExpanded
-            conversationId={conversationId}
+            conversationId={durableConversationId}
             workflowGraph={workflowGraph}
             workspaceRootPath={workspaceRootPath}
             isActive={isActive}

@@ -12,6 +12,10 @@ import type {
 } from "@/lib/types"
 import type { LiveMessage } from "@/contexts/acp-connections-context"
 import {
+  __resetWorkflowGraphStoreForTests,
+  useWorkflowGraphStore,
+} from "@/lib/workflow-graph-store"
+import {
   __getCancelGenerationForTests,
   __getUserStopOwnershipForTests,
   CANCEL_RECONCILE_DELAYS_MS,
@@ -215,12 +219,14 @@ function deferredDetail(): {
 
 beforeEach(() => {
   resetConversationRuntimeStore()
+  __resetWorkflowGraphStoreForTests()
   mockGet.mockReset()
   vi.useFakeTimers()
 })
 
 afterEach(() => {
   resetConversationRuntimeStore()
+  __resetWorkflowGraphStoreForTests()
   vi.useRealTimers()
 })
 
@@ -1181,6 +1187,51 @@ describe("FE15 Manual Reload during pending is authoritative", () => {
       .byConversationId.get(runtimeId)
     expect(s?.pendingCancel).toBeNull()
     expect(s?.detail?.turns).toHaveLength(2)
+  })
+
+  it("seeds detail workflow graph under the bound db id", async () => {
+    const runtimeId = -7
+    const workflowGraph = {
+      schema_version: 1,
+      workflow_id: "wf-durable-key",
+      workflow_kind: "brainstorm_to_delivery",
+      manifest_revision: 1,
+      graph_revision: 1,
+      manifest_state: "published",
+      compatibility: "manifest" as const,
+      overall_state: "running" as const,
+      projection_warning_codes: [],
+      current_phase_id: "plan",
+      current_node_ids: [],
+      phases: [],
+      nodes: [],
+      edges: [],
+      gates: [],
+    }
+    useConversationRuntimeStore.setState({
+      byConversationId: new Map([
+        [
+          runtimeId,
+          emptySession(runtimeId, {
+            dbConversationId: CID,
+          }),
+        ],
+      ]),
+    })
+    mockGet.mockResolvedValueOnce(
+      detail([], {
+        workflow_graph: workflowGraph,
+      })
+    )
+
+    actions().reloadDetail(runtimeId, { reason: "manual_reload" })
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(useWorkflowGraphStore.getState().getSnapshot(CID)).toEqual(
+      workflowGraph
+    )
+    expect(useWorkflowGraphStore.getState().getSnapshot(runtimeId)).toBeNull()
   })
 })
 

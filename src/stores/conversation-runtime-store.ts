@@ -4128,10 +4128,17 @@ function installWorkflowGraphFromDetail(
   conversationId: number,
   detail: DbConversationDetail
 ): void {
+  const session = useConversationRuntimeStore
+    .getState()
+    .byConversationId.get(conversationId)
+  const durableConversationId = resolvePersistedConversationId(
+    session,
+    conversationId
+  )
   // Soft-attach: null/undefined clears only when revision gate allows.
   useWorkflowGraphStore
     .getState()
-    .applyFromDetail(conversationId, detail.workflow_graph)
+    .applyFromDetail(durableConversationId, detail.workflow_graph)
 }
 
 function afterDetailFetchSuccess(

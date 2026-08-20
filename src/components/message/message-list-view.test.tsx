@@ -272,6 +272,7 @@ vi.mock("@/components/chat/sub-agent-overlay", () => ({
   SubAgentOverlay: (props: {
     activities?: Array<{ task_id?: string; origin?: string }>
     delegations?: Array<{ parentToolUseId: string }>
+    conversationId?: number | null
     defaultExpanded?: boolean
     overlayKey?: string | null
     isActive?: boolean
@@ -569,6 +570,7 @@ function setStoreActivities(activities: DelegationActivityView[]) {
 function lastOverlayProps(): {
   activities?: Array<{ task_id?: string; origin?: string }>
   delegations?: Array<{ parentToolUseId: string }>
+  conversationId?: number | null
   defaultExpanded?: boolean
   overlayKey?: string | null
   isActive?: boolean
@@ -1725,6 +1727,32 @@ describe("MessageListView sub-agent overlay composition", () => {
     renderMessageList({ workspaceRootPath: "D:\\Repo\\Task7" })
     expect(lastOverlayProps().workspaceRootPath).toBe("D:\\Repo\\Task7")
   })
+
+  it.each([
+    { mode: "incremental", incremental: true },
+    { mode: "legacy", incremental: false },
+  ])(
+    "updates the $mode workflow overlay to the bound db id",
+    async ({ incremental }) => {
+      if (!incremental) __resetStreamingPerformanceConfigForTests()
+      const runtimeId = -9
+      seedHistory(undefined, { runtimeId, dbConversationId: null })
+
+      renderMessageList({ conversationId: runtimeId })
+      expect(lastOverlayProps().conversationId).toBe(runtimeId)
+
+      act(() => {
+        useConversationRuntimeStore
+          .getState()
+          .actions.setDbConversationId(runtimeId, CID)
+      })
+
+      await waitFor(() => {
+        expect(listChildConversationsMock).toHaveBeenCalledWith(CID)
+        expect(lastOverlayProps().conversationId).toBe(CID)
+      })
+    }
+  )
 
   it("fills overlay from durable children when the transcript has no delegate cards", async () => {
     listChildConversationsMock.mockResolvedValue([
