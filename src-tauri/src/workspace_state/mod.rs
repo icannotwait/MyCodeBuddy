@@ -869,11 +869,17 @@ impl WorkspaceWatchRegistration {
         let to_watch: Vec<PathBuf> = new_paths.difference(&self.paths).cloned().collect();
         for old in &to_unwatch {
             let _ = watcher.unwatch(old);
+            self.paths.remove(old);
         }
         for new_dir in &to_watch {
-            watcher.watch(new_dir, RecursiveMode::NonRecursive)?;
+            if let Err(err) = self.watch_path(watcher, new_dir) {
+                tracing::info!(
+                    "[workspace-state-watch] rebuild watch failed for {}: {}",
+                    new_dir.display(),
+                    err
+                );
+            }
         }
-        self.paths = new_paths;
         Ok(())
     }
 }
@@ -918,6 +924,23 @@ fn collect_allowed_git_subtree(dir: &Path, logical: &Path, out: &mut Vec<PathBuf
     }
 }
 
+fn linked_worktree_common_git_dir(root: &Path) -> Option<PathBuf> {
+    let linked = resolve_worktree_git_watch_dirs(root);
+    let private = linked.first()?;
+    let commondir_raw = std::fs::read_to_string(private.path.join("commondir")).ok()?;
+    let commondir_raw = commondir_raw.trim();
+    if commondir_raw.is_empty() {
+        return None;
+    }
+    let common = PathBuf::from(commondir_raw);
+    let common = if common.is_absolute() {
+        common
+    } else {
+        private.path.join(common)
+    };
+    std::fs::canonicalize(common).ok()
+}
+
 fn collect_git_metadata_watch_dirs(root: &Path) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     let linked = resolve_worktree_git_watch_dirs(root);
@@ -925,21 +948,10 @@ fn collect_git_metadata_watch_dirs(root: &Path) -> Vec<PathBuf> {
         for git_dir in &linked {
             collect_allowed_git_subtree(&git_dir.path, Path::new(git_dir.logical_base), &mut dirs);
         }
-        if let Some(private) = linked.first() {
-            if let Ok(commondir_raw) = std::fs::read_to_string(private.path.join("commondir")) {
-                let commondir_raw = commondir_raw.trim();
-                if !commondir_raw.is_empty() {
-                    let common = PathBuf::from(commondir_raw);
-                    let common = if common.is_absolute() {
-                        common
-                    } else {
-                        private.path.join(common)
-                    };
-                    let info = common.join("info");
-                    if info.is_dir() {
-                        dirs.push(info);
-                    }
-                }
+        if let Some(common) = linked_worktree_common_git_dir(root) {
+            let info = common.join("info");
+            if info.is_dir() {
+                dirs.push(info);
             }
         }
         return dirs;
@@ -987,6 +999,19 @@ fn start_path_should_not_be_watched(path: &Path) -> bool {
     dir_excluded_by_parent_ignore(path)
 }
 
+fn git_exclude_files_for_worktree(dir: &Path) -> Vec<(PathBuf, PathBuf)> {
+    let dot_git = dir.join(".git");
+    if dot_git.is_dir() {
+        return vec![(dot_git.join("info").join("exclude"), dir.to_path_buf())];
+    }
+    if dot_git.is_file() {
+        if let Some(common) = linked_worktree_common_git_dir(dir) {
+            return vec![(common.join("info").join("exclude"), dir.to_path_buf())];
+        }
+    }
+    Vec::new()
+}
+
 fn dir_excluded_by_parent_ignore(path: &Path) -> bool {
     let mut dir = match path.parent() {
         Some(parent) => parent.to_path_buf(),
@@ -999,8 +1024,10 @@ fn dir_excluded_by_parent_ignore(path: &Path) -> bool {
                 return true;
             }
         }
-        if ignore_file_excludes_dir(&dir.join(".git").join("info").join("exclude"), path, &dir) {
-            return true;
+        for (exclude_file, matcher_root) in git_exclude_files_for_worktree(&dir) {
+            if ignore_file_excludes_dir(&exclude_file, path, &matcher_root) {
+                return true;
+            }
         }
         if dir.join(".git").exists() {
             break;
@@ -1019,14 +1046,109 @@ fn ignore_file_excludes_dir(ignore_file: &Path, path: &Path, gitignore_root: &Pa
     let Ok(relative) = path.strip_prefix(gitignore_root) else {
         return false;
     };
-    let mut builder = ignore::gitignore::GitignoreBuilder::new(gitignore_root);
-    if builder.add(ignore_file).is_some() {
+    let Ok(contents) = std::fs::read_to_string(ignore_file) else {
         return false;
+    };
+    let mut builder = ignore::gitignore::GitignoreBuilder::new(gitignore_root);
+    for line in contents.lines() {
+        if builder.add_line(None, line).is_err() {
+            return false;
+        }
     }
     let Ok(gi) = builder.build() else {
         return false;
     };
-    gi.matched(relative, true).is_ignore()
+    let mut candidate = relative.to_path_buf();
+    loop {
+        if gi.matched(&candidate, true).is_ignore() {
+            return true;
+        }
+        if !candidate.pop() || candidate.as_os_str().is_empty() {
+            return false;
+        }
+    }
+}
+
+fn logical_git_watch_path(git_root: &Path, path: &Path, logical_base: &Path) -> PathBuf {
+    match path.strip_prefix(git_root) {
+        Ok(rel) if rel.as_os_str().is_empty() => logical_base.to_path_buf(),
+        Ok(rel) => logical_base.join(rel),
+        Err(_) => logical_base.to_path_buf(),
+    }
+}
+
+fn is_git_watch_logical_allowed(logical: &Path) -> bool {
+    logical == Path::new(".git")
+        || is_allowed_git_watch_path(logical)
+        || is_git_info_watch_path(logical)
+}
+
+fn collect_allowed_git_dirs_from(
+    path: &Path,
+    git_root: &Path,
+    logical_base: &Path,
+) -> Vec<PathBuf> {
+    let logical = logical_git_watch_path(git_root, path, logical_base);
+    if !is_git_watch_logical_allowed(&logical) {
+        return Vec::new();
+    }
+    let mut dirs = Vec::new();
+    collect_allowed_git_subtree(path, &logical, &mut dirs);
+    dirs
+}
+
+fn collect_git_subtree_watch_directories(
+    workspace_root: &Path,
+    path: &Path,
+) -> Option<Vec<PathBuf>> {
+    let path = canonicalize_watch_dir(path);
+    if !path.is_dir() {
+        return None;
+    }
+    let workspace_root = canonicalize_watch_dir(workspace_root);
+
+    for git_dir in resolve_worktree_git_watch_dirs(&workspace_root) {
+        if path == git_dir.path || path.starts_with(&git_dir.path) {
+            return Some(collect_allowed_git_dirs_from(
+                &path,
+                &git_dir.path,
+                Path::new(git_dir.logical_base),
+            ));
+        }
+    }
+
+    let in_tree_git = workspace_root.join(".git");
+    if in_tree_git.is_dir() {
+        let git_dir = canonicalize_watch_dir(&in_tree_git);
+        if path == git_dir || path.starts_with(&git_dir) {
+            return Some(collect_allowed_git_dirs_from(
+                &path,
+                &git_dir,
+                Path::new(".git"),
+            ));
+        }
+    } else if path.file_name().is_some_and(|name| name == ".git") {
+        return Some(collect_allowed_git_dirs_from(
+            &path,
+            &path,
+            Path::new(".git"),
+        ));
+    }
+
+    None
+}
+
+fn collect_subtree_watch_directories(
+    workspace_root: &Path,
+    path: &Path,
+) -> Result<Vec<PathBuf>, AppCommandError> {
+    if let Some(dirs) = collect_git_subtree_watch_directories(workspace_root, path) {
+        return Ok(dirs
+            .into_iter()
+            .map(|dir| canonicalize_watch_dir(&dir))
+            .collect());
+    }
+    collect_watch_directories(path)
 }
 
 fn collect_watch_directories(root: &Path) -> Result<Vec<PathBuf>, AppCommandError> {
@@ -1067,6 +1189,9 @@ fn collect_watch_directories(root: &Path) -> Result<Vec<PathBuf>, AppCommandErro
     for git_dir in collect_git_metadata_watch_dirs(root) {
         dirs.insert(canonicalize_watch_dir(&git_dir));
     }
+
+    let canonical_root = canonicalize_watch_dir(root);
+    dirs.retain(|dir| *dir == canonical_root || !dir_excluded_by_parent_ignore(dir));
 
     Ok(dirs.into_iter().collect())
 }
@@ -1120,26 +1245,28 @@ async fn run_watch_registration_loop(
 ) {
     while let Some(message) = control_rx.recv().await {
         match message {
-            WatchControlMessage::RegisterSubtree(path) => match collect_watch_directories(&path) {
-                Ok(dirs) => {
-                    for dir in dirs {
-                        if let Err(err) = registration.watch_path(&mut watcher, &dir) {
-                            tracing::info!(
-                                "[workspace-state-watch] subtree watch failed for {}: {}",
-                                dir.display(),
-                                err
-                            );
+            WatchControlMessage::RegisterSubtree(path) => {
+                match collect_subtree_watch_directories(&root, &path) {
+                    Ok(dirs) => {
+                        for dir in dirs {
+                            if let Err(err) = registration.watch_path(&mut watcher, &dir) {
+                                tracing::info!(
+                                    "[workspace-state-watch] subtree watch failed for {}: {}",
+                                    dir.display(),
+                                    err
+                                );
+                            }
                         }
                     }
+                    Err(err) => {
+                        tracing::info!(
+                            "[workspace-state-watch] subtree collect failed for {}: {}",
+                            path.display(),
+                            err
+                        );
+                    }
                 }
-                Err(err) => {
-                    tracing::info!(
-                        "[workspace-state-watch] subtree collect failed for {}: {}",
-                        path.display(),
-                        err
-                    );
-                }
-            },
+            }
             WatchControlMessage::Rebuild => match collect_watch_directories(&root) {
                 Ok(dirs) => {
                     if let Err(err) = registration.rebuild(&mut watcher, dirs) {
@@ -2930,10 +3057,100 @@ mod tests {
         );
     }
 
+    #[test]
+    fn collect_watch_directories_registers_git_init_metadata_not_object_store() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(dir.path()).expect("canonicalize root");
+        std::fs::create_dir_all(root.join("src")).expect("src");
+        std::fs::create_dir_all(root.join(".git/refs/heads")).expect("refs/heads");
+        std::fs::create_dir_all(root.join(".git/refs/tags")).expect("refs/tags");
+        std::fs::create_dir_all(root.join(".git/objects/pack")).expect("objects");
+        std::fs::create_dir_all(root.join(".git/info")).expect("info");
+        std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n").expect("HEAD");
+
+        let dirs = collect_subtree_watch_directories(&root, &root.join(".git"))
+            .expect("collect .git after git init");
+        let git = std::fs::canonicalize(root.join(".git")).expect("canon .git");
+        let rels = rel_watch_dirs(&git, &dirs);
+
+        assert!(rels.contains("."), ".git itself must be registered");
+        assert!(rels.contains("refs"));
+        assert!(rels.contains("refs/heads"));
+        assert!(
+            rels.contains("info"),
+            ".git/info must be registered for exclude"
+        );
+        assert!(
+            !dirs.iter().any(|path| path_has_component(path, "tags")),
+            "refs/tags must not receive a watch descriptor"
+        );
+        assert!(
+            !dirs.iter().any(|path| path_has_component(path, "objects")),
+            "git object store must not be registered"
+        );
+    }
+
+    #[test]
+    fn collect_subtree_watch_directories_does_not_register_refs_tags() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(dir.path()).expect("canonicalize root");
+        std::fs::create_dir_all(root.join(".git/refs/heads")).expect("heads");
+        std::fs::create_dir_all(root.join(".git/refs/tags/v1")).expect("tags");
+
+        let dirs = collect_subtree_watch_directories(&root, &root.join(".git/refs/tags"))
+            .expect("collect tags subtree");
+        assert!(
+            dirs.is_empty() || !dirs.iter().any(|path| path_has_component(path, "tags")),
+            "creating refs/tags must not register the tags tree"
+        );
+    }
+
+    #[test]
+    fn collect_watch_directories_respects_linked_worktree_exclude_on_start_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let layout_root = std::fs::canonicalize(dir.path()).expect("canonicalize layout");
+        let (worktree, private, _) = make_worktree_layout(&layout_root);
+        let common = std::fs::canonicalize(private.join("../..")).expect("canon common git dir");
+        std::fs::create_dir_all(common.join("info")).expect("common info");
+        std::fs::write(common.join("info/exclude"), "secret_build/\n").expect("exclude");
+        std::fs::create_dir_all(worktree.join("src")).expect("src");
+        std::fs::create_dir_all(worktree.join("secret_build/nested")).expect("excluded dir");
+
+        let secret = worktree.join("secret_build");
+        let common_resolved = linked_worktree_common_git_dir(&worktree);
+        assert!(
+            dir_excluded_by_parent_ignore(&secret),
+            "start path must match commondir exclude; common={common_resolved:?} exclude_exists={} secret={secret:?} worktree={worktree:?}",
+            common
+                .join("info")
+                .join("exclude")
+                .is_file()
+        );
+
+        let from_root = collect_watch_directories(&worktree).expect("collect worktree");
+        let leaked: Vec<_> = from_root
+            .iter()
+            .filter(|path| path_has_component(path, "secret_build"))
+            .cloned()
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "root collect must honor linked-worktree exclude, leaked={leaked:?}"
+        );
+
+        let from_start = collect_watch_directories(&worktree.join("secret_build"))
+            .expect("collect excluded start path");
+        assert!(
+            from_start.is_empty(),
+            "RegisterSubtree on a dir ignored only by commondir exclude must not register it"
+        );
+    }
+
     #[derive(Default)]
     struct RecordingWatcher {
         watch_calls: Vec<(PathBuf, RecursiveMode)>,
         unwatch_calls: Vec<PathBuf>,
+        fail_on: Option<PathBuf>,
     }
 
     impl notify::Watcher for RecordingWatcher {
@@ -2946,6 +3163,9 @@ mod tests {
 
         fn watch(&mut self, path: &Path, recursive_mode: RecursiveMode) -> notify::Result<()> {
             self.watch_calls.push((path.to_path_buf(), recursive_mode));
+            if self.fail_on.as_deref() == Some(path) {
+                return Err(notify::Error::generic("injected watch failure"));
+            }
             Ok(())
         }
 
@@ -3009,6 +3229,67 @@ mod tests {
         assert!(
             watcher.watch_calls.is_empty(),
             "kept directories must not be registered again"
+        );
+    }
+
+    #[test]
+    fn workspace_watch_registration_rebuild_keeps_set_in_sync_when_watch_fails() {
+        let mut registration = WorkspaceWatchRegistration::new();
+        let root = PathBuf::from("/workspace");
+        let stale = PathBuf::from("/workspace/stale");
+        let failing = PathBuf::from("/workspace/failing");
+        let ok = PathBuf::from("/workspace/ok");
+        let mut watcher = RecordingWatcher {
+            fail_on: Some(failing.clone()),
+            ..Default::default()
+        };
+
+        registration
+            .watch_all(&mut watcher, [root.clone(), stale.clone()])
+            .expect("seed");
+        watcher.watch_calls.clear();
+        watcher.unwatch_calls.clear();
+
+        let result = registration.rebuild(
+            &mut watcher,
+            vec![root.clone(), failing.clone(), ok.clone()],
+        );
+        assert!(
+            result.is_ok(),
+            "rebuild must not abort remaining dirs on a watch failure: {result:?}"
+        );
+        assert!(
+            watcher.unwatch_calls.contains(&stale),
+            "removed dirs must still be unwatched"
+        );
+        assert!(
+            !registration.paths.contains(&stale),
+            "unwatched dirs must leave the registration set"
+        );
+        assert!(
+            registration.paths.contains(&ok),
+            "dirs whose watch succeeded must be recorded"
+        );
+        assert!(
+            !registration.paths.contains(&failing),
+            "dirs whose watch failed must not be recorded"
+        );
+        assert!(registration.paths.contains(&root));
+
+        watcher.watch_calls.clear();
+        registration
+            .rebuild(
+                &mut watcher,
+                vec![root.clone(), failing.clone(), ok.clone()],
+            )
+            .expect("second rebuild");
+        assert!(
+            !watcher.watch_calls.iter().any(|(path, _)| path == &ok),
+            "already-live watches must not be registered again"
+        );
+        assert!(
+            watcher.watch_calls.iter().any(|(path, _)| path == &failing),
+            "failed dirs must be retried on the next rebuild"
         );
     }
 
