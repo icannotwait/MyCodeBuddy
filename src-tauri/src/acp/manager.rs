@@ -579,6 +579,13 @@ struct DisconnectFinalCasHook {
 
 #[cfg(test)]
 #[derive(Clone)]
+struct RebindAfterSnapshotHook {
+    reached: Arc<tokio::sync::Notify>,
+    resume: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
 struct SharedEnqueueFinalizeHook {
     reached: Arc<tokio::sync::Barrier>,
     resume: Arc<tokio::sync::Barrier>,
@@ -792,6 +799,8 @@ pub struct ConnectionManager {
     #[cfg(test)]
     disconnect_final_cas_hook: Arc<std::sync::Mutex<Option<DisconnectFinalCasHook>>>,
     #[cfg(test)]
+    rebind_after_snapshot_hook: Arc<std::sync::Mutex<Option<RebindAfterSnapshotHook>>>,
+    #[cfg(test)]
     shared_enqueue_finalize_hook: Arc<std::sync::Mutex<Option<SharedEnqueueFinalizeHook>>>,
     #[cfg(test)]
     shared_enqueue_publication_hook: Arc<std::sync::Mutex<Option<SharedEnqueuePublicationHook>>>,
@@ -893,6 +902,8 @@ impl ConnectionManager {
             #[cfg(test)]
             disconnect_final_cas_hook: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
+            rebind_after_snapshot_hook: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
             shared_enqueue_finalize_hook: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
             shared_enqueue_publication_hook: Arc::new(std::sync::Mutex::new(None)),
@@ -939,6 +950,8 @@ impl ConnectionManager {
             shared_settler_supervisor_completed: self.shared_settler_supervisor_completed.clone(),
             #[cfg(test)]
             disconnect_final_cas_hook: self.disconnect_final_cas_hook.clone(),
+            #[cfg(test)]
+            rebind_after_snapshot_hook: self.rebind_after_snapshot_hook.clone(),
             #[cfg(test)]
             shared_enqueue_finalize_hook: self.shared_enqueue_finalize_hook.clone(),
             #[cfg(test)]
@@ -6093,6 +6106,30 @@ impl ConnectionManager {
             self.clear_tool_leases(conn_id, &conn.connection_incarnation)
                 .await;
             tracing::info!("[ACP] disconnect connection={}", conn_id);
+            // Initialize does not drain `control_rx` until `run_conversation_loop`.
+            // Abort only while still Connecting so a Connected session can unwind
+            // through Disconnect (delegation cleanup + Disconnected emit).
+            let pre_loop = {
+                let st = conn.state.read().await;
+                matches!(st.status, ConnectionStatus::Connecting)
+            };
+            if pre_loop {
+                if let Some(abort) = conn.task_abort {
+                    abort.abort();
+                }
+                if let Some(inj) = self.delegation_snapshot() {
+                    crate::acp::connection::cleanup_delegation_parent(&inj, conn_id, &conn.state)
+                        .await;
+                }
+                emit_with_state(
+                    &conn.state,
+                    &conn.emitter,
+                    AcpEvent::StatusChanged {
+                        status: ConnectionStatus::Disconnected,
+                    },
+                )
+                .await;
+            }
             // Bound control-lane admit so a saturated/stalled receiver cannot
             // hang escalation after leases are already cleared and the map
             // entry removed. Send errors/timeouts are best-effort.
@@ -6144,7 +6181,7 @@ impl ConnectionManager {
             SpecificCancelOutcome, TERMINAL_ACK_TIMEOUT, TERMINAL_ADMIT_TIMEOUT,
         };
 
-        let control_tx = {
+        let (state, control_tx) = {
             let connections = self.connections.lock().await;
             let conn = connections
                 .get(&stamp.connection_id)
@@ -6152,15 +6189,15 @@ impl ConnectionManager {
             if conn.connection_incarnation != stamp.connection_incarnation {
                 return Err(SpecificCancelOutcome::Failed);
             }
-            // Turn generation guard: refuse after the stamped turn ended/replaced.
-            let state = conn.state.read().await;
+            (Arc::clone(&conn.state), conn.control_tx.clone())
+        };
+        {
+            let state = state.read().await;
             match state.active_turn_generation {
                 Some(active) if active == stamp.turn_generation => {}
                 _ => return Err(SpecificCancelOutcome::Failed),
             }
-            drop(state);
-            conn.control_tx.clone()
-        };
+        }
 
         let admit_deadline = tokio::time::Instant::now() + TERMINAL_ADMIT_TIMEOUT;
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
@@ -7480,25 +7517,29 @@ impl ConnectionManager {
         operation_id: &str,
         to_label: &str,
     ) -> (usize, Option<u64>) {
-        let mut connections = self.connections.lock().await;
+        let to_write: Vec<(u64, Arc<RwLock<SessionState>>)> = {
+            let mut connections = self.connections.lock().await;
+            let mut to_write = Vec::new();
+            for conn in connections.values_mut() {
+                if conn.owner_window_label != from_label {
+                    continue;
+                }
+                if conn.owner_operation_id.as_deref() != Some(operation_id) {
+                    continue;
+                }
+                conn.owner_window_label = to_label.to_string();
+                conn.ownership_generation = conn.ownership_generation.saturating_add(1).max(1);
+                to_write.push((conn.ownership_generation, Arc::clone(&conn.state)));
+            }
+            to_write
+        };
         let mut rebound = 0usize;
         let mut max_gen: Option<u64> = None;
-        for conn in connections.values_mut() {
-            if conn.owner_window_label != from_label {
-                continue;
-            }
-            if conn.owner_operation_id.as_deref() != Some(operation_id) {
-                continue;
-            }
-            conn.owner_window_label = to_label.to_string();
-            conn.ownership_generation = conn.ownership_generation.saturating_add(1).max(1);
-            // Keep owner_operation_id stamp (v1).
-            let mut st = conn.state.write().await;
+        for (gen, state) in to_write {
+            let mut st = state.write().await;
             st.owner_window_label = to_label.to_string();
             rebound += 1;
-            max_gen = Some(max_gen.map_or(conn.ownership_generation, |m| {
-                m.max(conn.ownership_generation)
-            }));
+            max_gen = Some(max_gen.map_or(gen, |m| m.max(gen)));
         }
         if rebound > 0 {
             tracing::info!(
@@ -7527,11 +7568,102 @@ impl ConnectionManager {
         use crate::acp::owner_rebind::RebindResult;
         use crate::app_error::AppCommandError;
 
-        let mut connections = self.connections.lock().await;
+        struct RebindRow {
+            id: String,
+            parent_connection_id: Option<String>,
+            owner_window_label: String,
+            owner_operation_id: Option<String>,
+            ownership_generation: u64,
+            connection_incarnation: String,
+            origin: crate::acp::delegation::route::DelegationConnectionOrigin,
+            state: Arc<tokio::sync::RwLock<SessionState>>,
+        }
 
-        // Locate root
+        struct ExpectedRebindTarget {
+            id: String,
+            connection_incarnation: String,
+            owner_window_label: String,
+            owner_operation_id: Option<String>,
+            ownership_generation: u64,
+        }
+
+        fn rebind_cas_failed(
+            kind: &str,
+            expected: impl std::fmt::Display,
+            have: impl std::fmt::Display,
+        ) -> AppCommandError {
+            AppCommandError::task_execution_failed(format!(
+                "{kind} CAS failed: expected {expected}, have {have}"
+            ))
+        }
+
+        fn mismatch_expected_rebind_target(
+            live: &AgentConnection,
+            expected: &ExpectedRebindTarget,
+        ) -> Option<AppCommandError> {
+            if live.connection_incarnation != expected.connection_incarnation {
+                return Some(rebind_cas_failed(
+                    "incarnation",
+                    &expected.connection_incarnation,
+                    &live.connection_incarnation,
+                ));
+            }
+            if live.owner_window_label != expected.owner_window_label {
+                return Some(rebind_cas_failed(
+                    "owner label",
+                    &expected.owner_window_label,
+                    &live.owner_window_label,
+                ));
+            }
+            if live.owner_operation_id != expected.owner_operation_id {
+                return Some(rebind_cas_failed(
+                    "owner operation",
+                    expected.owner_operation_id.as_deref().unwrap_or(""),
+                    live.owner_operation_id.as_deref().unwrap_or(""),
+                ));
+            }
+            if live.ownership_generation != expected.ownership_generation {
+                return Some(rebind_cas_failed(
+                    "generation",
+                    expected.ownership_generation,
+                    live.ownership_generation,
+                ));
+            }
+            None
+        }
+
+        let snapshot: Vec<RebindRow> = {
+            let connections = self.connections.lock().await;
+            connections
+                .iter()
+                .map(|(id, conn)| RebindRow {
+                    id: id.clone(),
+                    parent_connection_id: conn.parent_connection_id.clone(),
+                    owner_window_label: conn.owner_window_label.clone(),
+                    owner_operation_id: conn.owner_operation_id.clone(),
+                    ownership_generation: conn.ownership_generation,
+                    connection_incarnation: conn.connection_incarnation.clone(),
+                    origin: conn.origin,
+                    state: Arc::clone(&conn.state),
+                })
+                .collect()
+        };
+
+        #[cfg(test)]
+        {
+            let hook = self
+                .rebind_after_snapshot_hook
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone();
+            if let Some(hook) = hook {
+                hook.reached.notify_one();
+                hook.resume.notified().await;
+            }
+        }
+
         let root_id = if let Some(cid) = connection_id {
-            if connections.contains_key(cid) {
+            if snapshot.iter().any(|row| row.id == cid) {
                 cid.to_string()
             } else {
                 return Err(AppCommandError::not_found(format!(
@@ -7540,13 +7672,12 @@ impl ConnectionManager {
             }
         } else {
             let mut found: Option<String> = None;
-            for (id, conn) in connections.iter() {
-                let state = conn.state.read().await;
+            for row in &snapshot {
+                let state = row.state.read().await;
                 if state.conversation_id == Some(conversation_id) {
-                    // Prefer non-delegation-child roots when possible
-                    found = Some(id.clone());
+                    found = Some(row.id.clone());
                     if !matches!(
-                        conn.origin,
+                        row.origin,
                         crate::acp::delegation::route::DelegationConnectionOrigin::CodegChild
                     ) {
                         break;
@@ -7560,26 +7691,41 @@ impl ConnectionManager {
             })?
         };
 
-        let root = connections
-            .get(&root_id)
+        let root = snapshot
+            .iter()
+            .find(|row| row.id == root_id)
             .ok_or_else(|| AppCommandError::not_found(format!("connection {root_id} not found")))?;
 
-        // CAS on label / generation / operation
         let current_label = root.owner_window_label.clone();
         let current_gen = root.ownership_generation;
         let current_op = root.owner_operation_id.clone();
+        let root_expected = ExpectedRebindTarget {
+            id: root_id.clone(),
+            connection_incarnation: root.connection_incarnation.clone(),
+            owner_window_label: current_label.clone(),
+            owner_operation_id: current_op.clone(),
+            ownership_generation: current_gen,
+        };
 
-        // Already at target with the same op: idempotent success with the live
-        // generation. Must run *before* expected-generation CAS so a pre-ready
-        // detached reverse (which advances gen) followed by abort reverse with a
-        // stale expected gen still refreshes the post-reverse lease rather than
-        // becoming Superseded.
+        // Idempotent success is only allowed after re-checking the live root.
         if current_label == to_owner_window && current_op.as_deref() == Some(operation_id) {
-            return Ok(RebindResult {
-                rebound_count: 0,
-                ownership_generation: current_gen,
-                operation_id: operation_id.to_string(),
-            });
+            let connections = self.connections.lock().await;
+            return match connections.get(&root_id) {
+                Some(live) => {
+                    if let Some(err) = mismatch_expected_rebind_target(live, &root_expected) {
+                        Err(err)
+                    } else {
+                        Ok(RebindResult {
+                            rebound_count: 0,
+                            ownership_generation: current_gen,
+                            operation_id: operation_id.to_string(),
+                        })
+                    }
+                }
+                None => Err(AppCommandError::not_found(format!(
+                    "connection {root_id} not found"
+                ))),
+            };
         }
 
         if let Some(exp) = expected_generation {
@@ -7590,17 +7736,12 @@ impl ConnectionManager {
             }
         }
 
-        let label_ok = current_label == from_owner_window;
-        if !label_ok {
+        if current_label != from_owner_window {
             return Err(AppCommandError::task_execution_failed(format!(
                 "owner label CAS failed: expected {from_owner_window}, have {current_label}"
             )));
         }
 
-        // Source operation CAS on reverse (conversation-* → main / non-conversation):
-        // delayed close for op A must not reverse a newer incarnation B on the same
-        // label (ABA). Forward rebind intentionally stamps a new operation_id, so
-        // this check is reverse-only.
         if !to_owner_window.starts_with("conversation-") {
             let root_op = current_op.as_deref().unwrap_or("");
             if root_op != operation_id {
@@ -7611,54 +7752,44 @@ impl ConnectionManager {
         }
 
         let new_gen = current_gen.saturating_add(1).max(1);
-
         let prior_label = current_label;
-        let mut rebound = 0usize;
 
-        // Root + descendants: conversation graph (active_delegations) and
-        // parent_connection_id edges (children registered before broker links
-        // conversation ids). Fixed-point expansion under the connections lock.
         let mut related_connection_ids = std::collections::HashSet::new();
         related_connection_ids.insert(root_id.clone());
         let mut related_conversation_ids = std::collections::HashSet::new();
         related_conversation_ids.insert(conversation_id);
-        if let Some(root_conn) = connections.get(&root_id) {
-            let st = root_conn.state.read().await;
+        if let Some(root_row) = snapshot.iter().find(|row| row.id == root_id) {
+            let st = root_row.state.read().await;
             for d in st.active_delegations.values() {
                 related_conversation_ids.insert(d.child_conversation_id);
             }
         }
 
-        // (id, parent_connection_id, conversation_id, child conversation ids)
-        type RelatedCandidate = (String, Option<String>, Option<i32>, Vec<i32>);
         let mut expanded = true;
         while expanded {
             expanded = false;
-            let snapshot: Vec<RelatedCandidate> = {
-                let mut rows = Vec::new();
-                for (id, conn) in connections.iter() {
-                    if related_connection_ids.contains(id) {
-                        continue;
-                    }
-                    if conn.owner_window_label != prior_label {
-                        continue;
-                    }
-                    let st = conn.state.read().await;
-                    let child_convs: Vec<i32> = st
-                        .active_delegations
-                        .values()
-                        .map(|d| d.child_conversation_id)
-                        .collect();
-                    rows.push((
-                        id.clone(),
-                        conn.parent_connection_id.clone(),
-                        st.conversation_id,
-                        child_convs,
-                    ));
+            let mut rows = Vec::new();
+            for row in &snapshot {
+                if related_connection_ids.contains(&row.id) {
+                    continue;
                 }
-                rows
-            };
-            for (id, parent_id, conv_id, child_convs) in snapshot {
+                if row.owner_window_label != prior_label {
+                    continue;
+                }
+                let st = row.state.read().await;
+                let child_convs: Vec<i32> = st
+                    .active_delegations
+                    .values()
+                    .map(|d| d.child_conversation_id)
+                    .collect();
+                rows.push((
+                    row.id.clone(),
+                    row.parent_connection_id.clone(),
+                    st.conversation_id,
+                    child_convs,
+                ));
+            }
+            for (id, parent_id, conv_id, child_convs) in rows {
                 let parent_linked = parent_id
                     .as_ref()
                     .is_some_and(|pid| related_connection_ids.contains(pid));
@@ -7678,17 +7809,57 @@ impl ConnectionManager {
             }
         }
 
-        let targets: Vec<String> = related_connection_ids.into_iter().collect();
-
-        for id in targets {
-            if let Some(conn) = connections.get_mut(&id) {
+        let expected_targets: Vec<ExpectedRebindTarget> = snapshot
+            .iter()
+            .filter(|row| related_connection_ids.contains(&row.id))
+            .map(|row| ExpectedRebindTarget {
+                id: row.id.clone(),
+                connection_incarnation: row.connection_incarnation.clone(),
+                owner_window_label: row.owner_window_label.clone(),
+                owner_operation_id: row.owner_operation_id.clone(),
+                ownership_generation: row.ownership_generation,
+            })
+            .collect();
+        let to_write: Vec<Arc<tokio::sync::RwLock<SessionState>>> = {
+            let mut connections = self.connections.lock().await;
+            for expected in &expected_targets {
+                match connections.get(&expected.id) {
+                    Some(live) => {
+                        if let Some(err) = mismatch_expected_rebind_target(live, expected) {
+                            return Err(err);
+                        }
+                    }
+                    None => {
+                        return Err(rebind_cas_failed(
+                            "incarnation",
+                            &expected.connection_incarnation,
+                            "<absent>",
+                        ));
+                    }
+                }
+            }
+            let mut to_write = Vec::new();
+            for expected in &expected_targets {
+                let Some(conn) = connections.get_mut(&expected.id) else {
+                    return Err(rebind_cas_failed(
+                        "incarnation",
+                        &expected.connection_incarnation,
+                        "<absent>",
+                    ));
+                };
                 conn.owner_window_label = to_owner_window.to_string();
                 conn.owner_operation_id = Some(operation_id.to_string());
                 conn.ownership_generation = new_gen;
-                let mut st = conn.state.write().await;
-                st.owner_window_label = to_owner_window.to_string();
-                rebound += 1;
+                to_write.push(Arc::clone(&conn.state));
             }
+            to_write
+        };
+
+        let mut rebound = 0usize;
+        for state in to_write {
+            let mut st = state.write().await;
+            st.owner_window_label = to_owner_window.to_string();
+            rebound += 1;
         }
 
         Ok(RebindResult {
@@ -7722,34 +7893,51 @@ impl ConnectionManager {
                 shutdown_shared_pid_cells.push(pid);
             }
         }
-        let planned: Vec<DisconnectSelection> = {
-            let connections = self.connections.lock().await;
-            connections
-                .iter()
-                .map(|(id, connection)| {
-                    DisconnectSelection::incarnation_only(id.clone(), connection)
-                })
-                .collect()
-        };
-        let removed = self.take_connections_for_disconnect(planned, origin).await;
-        let disconnected = removed.len();
-        let handles: Vec<(
-            LaneSender<ConnectionControl>,
-            Arc<std::sync::atomic::AtomicU32>,
-        )> = removed
-            .into_iter()
-            .map(|(_id, conn)| (conn.control_tx, conn.child_pid))
-            .collect();
-
-        // Shutdown cannot wait for a saturated command lane. A missed graceful
-        // signal is covered by the process-tree backstop below.
-        for (control_tx, _) in &handles {
-            let _ = control_tx.try_send(ConnectionControl::Disconnect);
+        let mut disconnected = 0usize;
+        let mut pid_cells: Vec<Arc<std::sync::atomic::AtomicU32>> = Vec::new();
+        // Two snapshots: a connection inserted during the first take is
+        // caught on the second pass.
+        for _ in 0..2 {
+            let planned: Vec<DisconnectSelection> = {
+                let connections = self.connections.lock().await;
+                connections
+                    .iter()
+                    .map(|(id, connection)| {
+                        DisconnectSelection::incarnation_only(id.clone(), connection)
+                    })
+                    .collect()
+            };
+            if planned.is_empty() {
+                break;
+            }
+            let removed = self.take_connections_for_disconnect(planned, origin).await;
+            disconnected += removed.len();
+            crate::acp::terminal_runtime::kill_all_registered_acp_terminals().await;
+            for (_id, conn) in removed {
+                let pre_loop = {
+                    let st = conn.state.read().await;
+                    matches!(st.status, ConnectionStatus::Connecting)
+                };
+                if pre_loop {
+                    if let Some(abort) = conn.task_abort {
+                        abort.abort();
+                    }
+                    emit_with_state(
+                        &conn.state,
+                        &conn.emitter,
+                        AcpEvent::StatusChanged {
+                            status: ConnectionStatus::Disconnected,
+                        },
+                    )
+                    .await;
+                }
+                // Shutdown cannot wait for a saturated command lane. A missed
+                // graceful signal is covered by the process-tree backstop below.
+                let _ = conn.control_tx.try_send(ConnectionControl::Disconnect);
+                pid_cells.push(conn.child_pid);
+            }
         }
         tracing::info!("[ACP] disconnect_all count={}", disconnected);
-
-        let mut pid_cells: Vec<Arc<std::sync::atomic::AtomicU32>> =
-            handles.into_iter().map(|(_, pid)| pid).collect();
         for shared_pid in shutdown_shared_pid_cells {
             if !pid_cells.iter().any(|pid| Arc::ptr_eq(pid, &shared_pid)) {
                 pid_cells.push(shared_pid);
@@ -9754,6 +9942,64 @@ mod disconnect_origin {
             "a surviving disconnect loser must not be fenced"
         );
         let _ = admit_registry_tool(manager, connection_id, incarnation, 99).await;
+    }
+
+    #[tokio::test]
+    async fn disconnect_aborts_a_connecting_driver_that_ignores_control() {
+        let manager = Arc::new(ConnectionManager::new());
+        manager
+            .insert_test_connection("c-connecting", AgentType::Codex, None, EventEmitter::Noop)
+            .await;
+        let join = tokio::spawn(async move {
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+        let abort = join.abort_handle();
+        let state = {
+            let mut map = manager.connections.lock().await;
+            let conn = map.get_mut("c-connecting").expect("test connection");
+            conn.task_abort = Some(abort);
+            conn.status = ConnectionStatus::Connecting;
+            Arc::clone(&conn.state)
+        };
+        state.write().await.status = ConnectionStatus::Connecting;
+        manager
+            .disconnect_with_origin("c-connecting", AcpDisconnectOrigin::LegacyUnspecified)
+            .await
+            .expect("disconnect");
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(1), join)
+            .await
+            .expect("aborted driver must finish");
+        assert!(joined.is_err(), "driver task must be aborted");
+    }
+
+    #[tokio::test]
+    async fn disconnect_does_not_abort_a_connected_driver() {
+        let manager = Arc::new(ConnectionManager::new());
+        manager
+            .insert_test_connection("c-connected", AgentType::Codex, None, EventEmitter::Noop)
+            .await;
+        let join = tokio::spawn(async move {
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+        let abort = join.abort_handle();
+        {
+            let mut map = manager.connections.lock().await;
+            let conn = map.get_mut("c-connected").expect("test connection");
+            conn.task_abort = Some(abort);
+            conn.status = ConnectionStatus::Connected;
+        }
+        manager
+            .disconnect_with_origin("c-connected", AcpDisconnectOrigin::LegacyUnspecified)
+            .await
+            .expect("disconnect");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !join.is_finished(),
+            "Connected disconnect must send Disconnect, not abort the driver"
+        );
+        join.abort();
     }
 
     #[tokio::test]
@@ -15189,6 +15435,256 @@ mod tests {
             assert_eq!(conn.owner_window_label, "main");
             assert_eq!(conn.owner_operation_id.as_deref(), Some("op-B"));
             assert_eq!(conn.ownership_generation, 4);
+        }
+    }
+
+    fn install_rebind_after_snapshot_hook(
+        manager: &ConnectionManager,
+    ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        *manager
+            .rebind_after_snapshot_hook
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(RebindAfterSnapshotHook {
+            reached: reached.clone(),
+            resume: resume.clone(),
+        });
+        (reached, resume)
+    }
+
+    /// Snapshot includes a child; replacing that ID with a new incarnation
+    /// before the final map lock must fail closed and leave the replacement
+    /// owner untouched.
+    #[tokio::test]
+    async fn rebind_fails_when_child_id_replaced_with_new_incarnation_after_snapshot() {
+        let mgr = Arc::new(ConnectionManager::new());
+        insert_fake_connection(
+            &mgr,
+            "root-cas",
+            AgentType::ClaudeCode,
+            None,
+            EventEmitter::Noop,
+        )
+        .await;
+        stamp_owner(&mgr, "root-cas", "conversation-1", "op-1", 1, Some(1)).await;
+        mgr.insert_test_child_adopting_parent_ownership(
+            "child-reuse",
+            "root-cas",
+            AgentType::ClaudeCode,
+            None,
+            EventEmitter::Noop,
+        )
+        .await;
+        stamp_owner(&mgr, "child-reuse", "conversation-1", "op-1", 1, Some(2)).await;
+
+        let (reached, resume) = install_rebind_after_snapshot_hook(&mgr);
+        let rebind = {
+            let mgr = Arc::clone(&mgr);
+            tokio::spawn(async move {
+                mgr.rebind_connection_owner_window(
+                    1,
+                    Some("root-cas"),
+                    "conversation-1",
+                    "main",
+                    "op-1",
+                    Some(1),
+                )
+                .await
+            })
+        };
+        reached.notified().await;
+        insert_fake_connection(
+            &mgr,
+            "child-reuse",
+            AgentType::Codex,
+            None,
+            EventEmitter::Noop,
+        )
+        .await;
+        stamp_owner(
+            &mgr,
+            "child-reuse",
+            "conversation-99",
+            "op-new",
+            7,
+            Some(99),
+        )
+        .await;
+        let replacement_incarnation = {
+            let map = mgr.connections.lock().await;
+            map.get("child-reuse")
+                .expect("replacement")
+                .connection_incarnation
+                .clone()
+        };
+        resume.notify_one();
+        let err = tokio::time::timeout(Duration::from_secs(5), rebind)
+            .await
+            .expect("rebind must finish")
+            .expect("rebind join")
+            .expect_err("ID reuse must fail closed");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("incarnation CAS"),
+            "coded incarnation CAS error required, got: {msg}"
+        );
+        {
+            let map = mgr.connections.lock().await;
+            let root = map.get("root-cas").expect("root present");
+            assert_eq!(root.owner_window_label, "conversation-1");
+            assert_eq!(root.owner_operation_id.as_deref(), Some("op-1"));
+            assert_eq!(root.ownership_generation, 1);
+            let replacement = map.get("child-reuse").expect("replacement present");
+            assert_eq!(replacement.owner_window_label, "conversation-99");
+            assert_eq!(replacement.owner_operation_id.as_deref(), Some("op-new"));
+            assert_eq!(replacement.ownership_generation, 7);
+            assert_eq!(replacement.connection_incarnation, replacement_incarnation);
+        }
+    }
+
+    /// Snapshot includes root, a mutating child, and a sibling. Changing only
+    /// the child's owner/generation after snapshot (same incarnation) must
+    /// fail the whole rebind; root and sibling stay unmodified.
+    #[tokio::test]
+    async fn rebind_fails_when_child_owner_generation_changes_after_snapshot() {
+        let mgr = Arc::new(ConnectionManager::new());
+        insert_fake_connection(
+            &mgr,
+            "root-cas",
+            AgentType::ClaudeCode,
+            None,
+            EventEmitter::Noop,
+        )
+        .await;
+        stamp_owner(&mgr, "root-cas", "conversation-1", "op-1", 1, Some(1)).await;
+        for child_id in ["child-mut", "child-sib"] {
+            mgr.insert_test_child_adopting_parent_ownership(
+                child_id,
+                "root-cas",
+                AgentType::ClaudeCode,
+                None,
+                EventEmitter::Noop,
+            )
+            .await;
+            stamp_owner(&mgr, child_id, "conversation-1", "op-1", 1, Some(2)).await;
+        }
+        let child_incarnation = {
+            let map = mgr.connections.lock().await;
+            map.get("child-mut")
+                .expect("child")
+                .connection_incarnation
+                .clone()
+        };
+
+        let (reached, resume) = install_rebind_after_snapshot_hook(&mgr);
+        let rebind = {
+            let mgr = Arc::clone(&mgr);
+            tokio::spawn(async move {
+                mgr.rebind_connection_owner_window(
+                    1,
+                    Some("root-cas"),
+                    "conversation-1",
+                    "main",
+                    "op-1",
+                    Some(1),
+                )
+                .await
+            })
+        };
+        reached.notified().await;
+        {
+            let mut map = mgr.connections.lock().await;
+            let child = map.get_mut("child-mut").expect("child present");
+            child.owner_window_label = "conversation-99".into();
+            child.ownership_generation = 99;
+            assert_eq!(child.connection_incarnation, child_incarnation);
+        }
+        resume.notify_one();
+        let err = tokio::time::timeout(Duration::from_secs(5), rebind)
+            .await
+            .expect("rebind must finish")
+            .expect("rebind join")
+            .expect_err("child owner/generation drift must fail closed");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("owner label CAS") || msg.contains("generation CAS"),
+            "coded owner/generation CAS error required, got: {msg}"
+        );
+        {
+            let map = mgr.connections.lock().await;
+            let root = map.get("root-cas").expect("root present");
+            assert_eq!(root.owner_window_label, "conversation-1");
+            assert_eq!(root.owner_operation_id.as_deref(), Some("op-1"));
+            assert_eq!(root.ownership_generation, 1);
+            let sibling = map.get("child-sib").expect("sibling present");
+            assert_eq!(sibling.owner_window_label, "conversation-1");
+            assert_eq!(sibling.owner_operation_id.as_deref(), Some("op-1"));
+            assert_eq!(sibling.ownership_generation, 1);
+            let child = map.get("child-mut").expect("mutated child present");
+            assert_eq!(child.owner_window_label, "conversation-99");
+            assert_eq!(child.ownership_generation, 99);
+            assert_eq!(child.connection_incarnation, child_incarnation);
+        }
+    }
+
+    /// Snapshot shows the root already on the target owner+op; replacing the
+    /// root before returning success must re-check the live entry and fail.
+    #[tokio::test]
+    async fn rebind_idempotent_early_return_rechecks_live_root_after_snapshot() {
+        let mgr = Arc::new(ConnectionManager::new());
+        insert_fake_connection(
+            &mgr,
+            "live-1",
+            AgentType::ClaudeCode,
+            None,
+            EventEmitter::Noop,
+        )
+        .await;
+        stamp_owner(&mgr, "live-1", "main", "op-B", 4, Some(7)).await;
+
+        let (reached, resume) = install_rebind_after_snapshot_hook(&mgr);
+        let rebind = {
+            let mgr = Arc::clone(&mgr);
+            tokio::spawn(async move {
+                mgr.rebind_connection_owner_window(
+                    7,
+                    Some("live-1"),
+                    "conversation-7",
+                    "main",
+                    "op-B",
+                    Some(3),
+                )
+                .await
+            })
+        };
+        reached.notified().await;
+        insert_fake_connection(
+            &mgr,
+            "live-1",
+            AgentType::Codex,
+            None,
+            EventEmitter::Noop,
+        )
+        .await;
+        stamp_owner(&mgr, "live-1", "conversation-7", "op-other", 1, Some(7)).await;
+        resume.notify_one();
+        let err = tokio::time::timeout(Duration::from_secs(5), rebind)
+            .await
+            .expect("rebind must finish")
+            .expect("rebind join")
+            .expect_err("stale idempotent snapshot must not succeed");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("CAS"),
+            "coded CAS error required after live re-check, got: {msg}"
+        );
+        {
+            let map = mgr.connections.lock().await;
+            let replacement = map.get("live-1").expect("replacement present");
+            assert_eq!(replacement.owner_window_label, "conversation-7");
+            assert_eq!(replacement.owner_operation_id.as_deref(), Some("op-other"));
+            assert_eq!(replacement.ownership_generation, 1);
         }
     }
 
