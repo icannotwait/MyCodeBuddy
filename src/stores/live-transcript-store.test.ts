@@ -19,6 +19,7 @@ import {
   completeStreamingMarkdown,
   createIncrementalStreamBlocks,
 } from "@/lib/markdown/incremental-stream-blocks"
+import { resetJsonParseCacheForTests } from "@/lib/try-parse-json"
 import {
   createLiveTranscriptStore,
   getToolJoinedOutput,
@@ -66,7 +67,8 @@ function frame(
 
 describe("live-transcript-store", () => {
   afterEach(() => {
-    // no shared singleton mutation in these tests — each creates its own store
+    resetJsonParseCacheForTests()
+    vi.restoreAllMocks()
   })
 
   it("notifies only the changed segment and conversation once", () => {
@@ -316,6 +318,40 @@ describe("live-transcript-store", () => {
     const updated = store.getToolGroup(9, store.getToolGroupIds(9)[0])!
     expect(updated.runningCount).toBe(1)
     expect(updated.errorCount).toBe(0)
+  })
+
+  it("parses a large Write raw_input only once when text deltas refresh tool groups", () => {
+    const info: ToolCallInfo = {
+      tool_call_id: "write-1",
+      title: "tool",
+      kind: "tool",
+      status: "completed",
+      content: null,
+      raw_input: JSON.stringify({
+        content: "x".repeat(128 * 1024),
+        file_path: "a.ts",
+      }),
+      raw_output_chunks: [],
+      raw_output_total_bytes: 0,
+      locations: null,
+      meta: null,
+      images: [],
+    }
+    const live = (text: string): LiveMessage => ({
+      id: "m-write",
+      role: "assistant",
+      content: [
+        { type: "tool_call", info },
+        { type: "text", text },
+      ],
+      startedAt: 1,
+    })
+    const store = createLiveTranscriptStore()
+    const spy = vi.spyOn(JSON, "parse")
+    store.rebuild(11, "c1", live("a"), 1)
+    store.publish(11, frame([content("c1", 2, "b")]), live("ab"))
+    store.publish(11, frame([content("c1", 3, "c")]), live("abc"))
+    expect(spy).toHaveBeenCalledTimes(1)
   })
 
   it("reuses unchanged tool-group summary refs so sibling groups stay cold", () => {

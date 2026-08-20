@@ -105,6 +105,7 @@ function liveToolName(info: ToolCallInfo): string {
     kind: info.kind,
     rawInput: info.raw_input,
     meta: info.meta,
+    owner: info,
   })
 }
 

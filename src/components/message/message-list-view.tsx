@@ -983,6 +983,7 @@ function extractLiveDelegationSources(
         kind: block.info.kind,
         rawInput: block.info.raw_input,
         meta: block.info.meta,
+        owner: block.info,
       })
     )
     if (!isDelegateToAgentToolName(toolName)) continue
