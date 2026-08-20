@@ -28,9 +28,7 @@ export type AttachDetachReason =
  * Recoverable attach-protocol errors. Distinct from `AttachDetachReason`:
  * the live agent connection stays up and the client may retry.
  */
-export type AttachErrorCode =
-  | "snapshot_budget_exceeded"
-  | "oversized_frame"
+export type AttachErrorCode = "snapshot_budget_exceeded" | "oversized_frame"
 
 /**
  * Per-subscription callbacks delivered by `EventStream.attach`. Exactly one

@@ -210,9 +210,7 @@ export class WebEventStream implements EventStream {
         })
       }
       this.subs.delete(id)
-      safeInvoke("onAttachError", () =>
-        sub.handlers.onAttachError(code, true)
-      )
+      safeInvoke("onAttachError", () => sub.handlers.onAttachError(code, true))
     }
     this.syncSharedHeartbeat()
   }

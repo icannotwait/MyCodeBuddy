@@ -179,9 +179,7 @@ function tryParseObject(
   owner?: object
 ): Record<string, unknown> | null {
   if (!rawInput) return null
-  return owner
-    ? tryParseJsonForOwner(owner, rawInput)
-    : tryParseJson(rawInput)
+  return owner ? tryParseJsonForOwner(owner, rawInput) : tryParseJson(rawInput)
 }
 
 /** A non-empty (trimmed) string, or null for anything else. */

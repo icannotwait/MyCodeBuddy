@@ -65,7 +65,9 @@ export function getPublishedRequestUsage(
   conversationId: number
 ): RequestUsageSnapshot {
   const canonical = canonicalOf.get(conversationId) ?? conversationId
-  return snaps.get(canonical) ?? snaps.get(conversationId) ?? EMPTY_REQUEST_USAGE
+  return (
+    snaps.get(canonical) ?? snaps.get(conversationId) ?? EMPTY_REQUEST_USAGE
+  )
 }
 
 export function subscribeRequestUsage(listener: () => void): () => void {

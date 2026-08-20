@@ -229,9 +229,7 @@ function tryParseInputObject(
   owner?: object
 ) {
   if (!rawInput) return null
-  return owner
-    ? tryParseJsonForOwner(owner, rawInput)
-    : tryParseJson(rawInput)
+  return owner ? tryParseJsonForOwner(owner, rawInput) : tryParseJson(rawInput)
 }
 
 function hasAnyKey(obj: Record<string, unknown>, keys: string[]): boolean {
