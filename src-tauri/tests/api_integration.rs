@@ -470,7 +470,8 @@ async fn automatic_title_root_and_delegated_child_update_once_without_updated_at
         });
         state
             .acp_event_bus
-            .send_with_completion(env, Some(completion));
+            .send_lifecycle(env, Some(completion))
+            .await;
     }
 
     // Wait until lifecycle has applied usable completion (jobs ready) and
@@ -875,7 +876,8 @@ async fn concurrent_auto_title_saves_hold_the_gate_through_off_cancellation() {
     });
     state
         .acp_event_bus
-        .send_with_completion(env, Some(completion));
+        .send_lifecycle(env, Some(completion))
+        .await;
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {

@@ -2691,6 +2691,8 @@ async fn connection_worker_loop(
     manager: ConnectionManager,
     broker: Option<Arc<DelegationBroker>>,
     mut rx: mpsc::Receiver<Arc<InternalEventEnvelope>>,
+    ingress: Weak<LifecycleIngress>,
+    incarnation: u64,
 ) {
     // 1-entry HashMap so we can reuse `handle_terminal_event` (also keeps the
     // existing test surface intact — tests still drive a `&mut HashMap`).
@@ -2717,16 +2719,23 @@ async fn connection_worker_loop(
             AcpEvent::StatusChanged {
                 status: ConnectionStatus::Disconnected,
             } => {
-                if terminal_dispatched {
-                    continue;
+                if !terminal_dispatched {
+                    if let Err(e) = handle_terminal_event(&db, &mut cache, &connection_id).await {
+                        tracing::error!(
+                            "[lifecycle][ERROR] terminal event for {connection_id}: {e}"
+                        );
+                    }
+                    if let Some(b) = broker.as_ref() {
+                        forward_disconnect_to_broker(b.as_ref(), &connection_id, None).await;
+                    }
+                    terminal_dispatched = true;
                 }
-                if let Err(e) = handle_terminal_event(&db, &mut cache, &connection_id).await {
-                    tracing::error!("[lifecycle][ERROR] terminal event for {connection_id}: {e}");
+                // Last expected event on this FIFO. Drop the dest sender so
+                // already-queued items drain, then recv returns None.
+                // Do not drop on Error(terminal) — Disconnected would respawn.
+                if let Some(ingress) = ingress.upgrade() {
+                    ingress.remove_if_incarnation(&connection_id, incarnation);
                 }
-                if let Some(b) = broker.as_ref() {
-                    forward_disconnect_to_broker(b.as_ref(), &connection_id, None).await;
-                }
-                terminal_dispatched = true;
             }
             AcpEvent::Error {
                 message,
@@ -2863,7 +2872,16 @@ fn spawn_lifecycle_destination_worker(
     ingress: Weak<LifecycleIngress>,
 ) {
     tokio::spawn(async move {
-        connection_worker_loop(conn_id.clone(), db_conn, manager, broker, worker_rx).await;
+        connection_worker_loop(
+            conn_id.clone(),
+            db_conn,
+            manager,
+            broker,
+            worker_rx,
+            ingress.clone(),
+            incarnation,
+        )
+        .await;
         if let Some(ingress) = ingress.upgrade() {
             ingress.remove_if_incarnation(&conn_id, incarnation);
         }
@@ -4455,6 +4473,94 @@ mod tests {
             .expect("A2 completes after A starts draining");
     }
 
+    fn disconnected_internal(conn: &str, seq: u64) -> Arc<InternalEventEnvelope> {
+        Arc::new(InternalEventEnvelope {
+            event: Arc::new(EventEnvelope {
+                seq,
+                connection_id: conn.into(),
+                payload: AcpEvent::StatusChanged {
+                    status: ConnectionStatus::Disconnected,
+                },
+            }),
+            completion: None,
+        })
+    }
+
+    fn terminal_error_internal(conn: &str, seq: u64) -> Arc<InternalEventEnvelope> {
+        Arc::new(InternalEventEnvelope {
+            event: Arc::new(EventEnvelope {
+                seq,
+                connection_id: conn.into(),
+                payload: AcpEvent::Error {
+                    message: "boom".into(),
+                    agent_type: "claude_code".into(),
+                    code: None,
+                    details: None,
+                    terminal: true,
+                },
+            }),
+            completion: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn disconnected_exits_destination_worker_after_queued_drain() {
+        let db = test_helpers::fresh_in_memory_db().await;
+        let mgr = ConnectionManager::new();
+        let ingress = Arc::new(LifecycleIngress::new_with_capacity(8));
+        let (exited_tx, exited_rx) = tokio::sync::oneshot::channel::<()>();
+        let exited_tx = Arc::new(std::sync::Mutex::new(Some(exited_tx)));
+        let weak = Arc::downgrade(&ingress);
+        let db_conn = db.conn.clone();
+        let mgr_clone = mgr.clone_ref();
+        ingress.set_spawner(Arc::new(move |conn_id, incarnation, rx| {
+            let db_conn = db_conn.clone();
+            let mgr_clone = mgr_clone.clone_ref();
+            let weak = weak.clone();
+            let exited_tx = Arc::clone(&exited_tx);
+            tokio::spawn(async move {
+                connection_worker_loop(
+                    conn_id.clone(),
+                    db_conn,
+                    mgr_clone,
+                    None,
+                    rx,
+                    weak.clone(),
+                    incarnation,
+                )
+                .await;
+                if let Some(ingress) = weak.upgrade() {
+                    ingress.remove_if_incarnation(&conn_id, incarnation);
+                }
+                if let Some(tx) = exited_tx.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                    let _ = tx.send(());
+                }
+            });
+        }));
+
+        ingress
+            .send(terminal_error_internal("c-term", 1))
+            .await
+            .unwrap();
+        let mut exited = std::pin::pin!(exited_rx);
+        assert!(
+            std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(exited.as_mut().poll(cx).is_pending())
+            })
+            .await,
+            "terminal Error must not drop the dest sender or the worker"
+        );
+
+        ingress
+            .send(disconnected_internal("c-term", 2))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), exited)
+            .await
+            .expect("worker must exit after Disconnected")
+            .expect("exit signal");
+    }
+
     /// Predicate must accept exactly the event types the worker handles.
     /// If a future worker arm starts caring about a new event type without
     /// updating `is_lifecycle_relevant`, this test catches the drift.
@@ -4585,6 +4691,14 @@ mod tests {
         }));
     }
 
+    async fn emit_bus(bus: &InternalEventBus, env: Arc<EventEnvelope>) {
+        if is_lifecycle_critical(&env.payload) {
+            bus.send_lifecycle(env, None).await;
+        } else {
+            bus.send(env);
+        }
+    }
+
     /// Poll the conversation row's status until it matches `expected` or
     /// the timeout elapses. Used because the dispatcher exits as soon as
     /// the bus closes, but its workers may still be draining queued events
@@ -4660,14 +4774,18 @@ mod tests {
         // synchronously inside `lifecycle_subscriber_task`, so by the time
         // `tokio::spawn` returns, the receiver IS registered.
         for i in 0..50 {
-            bus.send(Arc::new(EventEnvelope {
-                seq: i,
-                connection_id: "c1".to_string(),
-                payload: AcpEvent::ContentDelta {
-                    text: format!("delta {i}"),
-                    parent_tool_use_id: None,
-                },
-            }));
+            emit_bus(
+                &bus,
+                Arc::new(EventEnvelope {
+                    seq: i,
+                    connection_id: "c1".to_string(),
+                    payload: AcpEvent::ContentDelta {
+                        text: format!("delta {i}"),
+                        parent_tool_use_id: None,
+                    },
+                }),
+            )
+            .await;
         }
 
         // Close the bus to drain the dispatcher.
@@ -4720,26 +4838,34 @@ mod tests {
             None,
         ));
 
-        bus.send(Arc::new(EventEnvelope {
-            seq: 1,
-            connection_id: "c1".to_string(),
-            payload: AcpEvent::SessionStarted {
-                session_id: "ext-final".into(),
-            },
-        }));
-        bus.send(Arc::new(EventEnvelope {
-            seq: 2,
-            connection_id: "c1".to_string(),
-            payload: AcpEvent::TurnComplete {
-                session_id: "ext-final".into(),
-                stop_reason: "end_turn".into(),
-                agent_type: "claude_code".into(),
-                mark_awaiting_reply: false,
+        emit_bus(
+            &bus,
+            Arc::new(EventEnvelope {
+                seq: 1,
+                connection_id: "c1".to_string(),
+                payload: AcpEvent::SessionStarted {
+                    session_id: "ext-final".into(),
+                },
+            }),
+        )
+        .await;
+        emit_bus(
+            &bus,
+            Arc::new(EventEnvelope {
+                seq: 2,
+                connection_id: "c1".to_string(),
+                payload: AcpEvent::TurnComplete {
+                    session_id: "ext-final".into(),
+                    stop_reason: "end_turn".into(),
+                    agent_type: "claude_code".into(),
+                    mark_awaiting_reply: false,
 
-                termination_source: None,
-                provider_turn_id: None,
-            },
-        }));
+                    termination_source: None,
+                    provider_turn_id: None,
+                },
+            }),
+        )
+        .await;
 
         let observed_external =
             poll_external_id(&db, conv.id, "ext-final", Duration::from_millis(500)).await;
@@ -4793,29 +4919,37 @@ mod tests {
         // Burst of 200 SessionStarted events (each writes external_id).
         // All share one per-destination FIFO with the trailing TurnComplete.
         for i in 1..=200u64 {
-            bus.send(Arc::new(EventEnvelope {
-                seq: i,
-                connection_id: "c1".to_string(),
-                payload: AcpEvent::SessionStarted {
-                    session_id: format!("ext-{i:03}"),
-                },
-            }));
+            emit_bus(
+                &bus,
+                Arc::new(EventEnvelope {
+                    seq: i,
+                    connection_id: "c1".to_string(),
+                    payload: AcpEvent::SessionStarted {
+                        session_id: format!("ext-{i:03}"),
+                    },
+                }),
+            )
+            .await;
         }
 
         // The critical event: TurnComplete that MUST flip the row.
-        bus.send(Arc::new(EventEnvelope {
-            seq: 201,
-            connection_id: "c1".to_string(),
-            payload: AcpEvent::TurnComplete {
-                session_id: "ext-200".into(),
-                stop_reason: "end_turn".into(),
-                agent_type: "claude_code".into(),
-                mark_awaiting_reply: false,
+        emit_bus(
+            &bus,
+            Arc::new(EventEnvelope {
+                seq: 201,
+                connection_id: "c1".to_string(),
+                payload: AcpEvent::TurnComplete {
+                    session_id: "ext-200".into(),
+                    stop_reason: "end_turn".into(),
+                    agent_type: "claude_code".into(),
+                    mark_awaiting_reply: false,
 
-                termination_source: None,
-                provider_turn_id: None,
-            },
-        }));
+                    termination_source: None,
+                    provider_turn_id: None,
+                },
+            }),
+        )
+        .await;
 
         // The private-stream acknowledgement is emitted after the worker
         // commits the trailing event. `dispatcher.await` only performs
@@ -4897,22 +5031,26 @@ mod tests {
         ));
 
         // ToolCall lands first and parks the broker tool worker on the stall.
-        bus.send(Arc::new(EventEnvelope {
-            seq: 1,
-            connection_id: "child-tool-flood".to_string(),
-            payload: AcpEvent::ToolCall {
-                tool_call_id: "tc-stall".into(),
-                title: "bash".into(),
-                kind: "execute".into(),
-                status: "in_progress".into(),
-                content: None,
-                raw_input: Some(r#"{"command":"sleep"}"#.into()),
-                raw_output: None,
-                locations: None,
-                meta: None,
-                images: None,
-            },
-        }));
+        emit_bus(
+            &bus,
+            Arc::new(EventEnvelope {
+                seq: 1,
+                connection_id: "child-tool-flood".to_string(),
+                payload: AcpEvent::ToolCall {
+                    tool_call_id: "tc-stall".into(),
+                    title: "bash".into(),
+                    kind: "execute".into(),
+                    status: "in_progress".into(),
+                    content: None,
+                    raw_input: Some(r#"{"command":"sleep"}"#.into()),
+                    raw_output: None,
+                    locations: None,
+                    meta: None,
+                    images: None,
+                },
+            }),
+        )
+        .await;
 
         // Yield so the broker tool worker dequeues and hits the stall.
         for _ in 0..20 {
@@ -4920,19 +5058,23 @@ mod tests {
         }
 
         // TurnComplete must CAS while the stall is still held.
-        bus.send(Arc::new(EventEnvelope {
-            seq: 2,
-            connection_id: "parent-stall".to_string(),
-            payload: AcpEvent::TurnComplete {
-                session_id: "s-stall".into(),
-                stop_reason: "end_turn".into(),
-                agent_type: "claude_code".into(),
-                mark_awaiting_reply: false,
+        emit_bus(
+            &bus,
+            Arc::new(EventEnvelope {
+                seq: 2,
+                connection_id: "parent-stall".to_string(),
+                payload: AcpEvent::TurnComplete {
+                    session_id: "s-stall".into(),
+                    stop_reason: "end_turn".into(),
+                    agent_type: "claude_code".into(),
+                    mark_awaiting_reply: false,
 
-                termination_source: None,
-                provider_turn_id: None,
-            },
-        }));
+                    termination_source: None,
+                    provider_turn_id: None,
+                },
+            }),
+        )
+        .await;
 
         let observed = poll_status(
             &db,
@@ -5130,19 +5272,23 @@ mod tests {
             Some(broker.clone()),
         ));
 
-        bus.send(Arc::new(EventEnvelope {
-            seq: 1,
-            connection_id: "c-no-drain".to_string(),
-            payload: AcpEvent::Error {
-                message: "Gemini refused the prompt.".into(),
-                agent_type: "gemini".into(),
-                code: Some("turn_failed_refusal".into()),
-                // turn-failure Error: non-terminal. Worker MUST no-op (the
-                // upcoming TurnComplete maps the outcome via complete_call).
-                details: None,
-                terminal: false,
-            },
-        }));
+        emit_bus(
+            &bus,
+            Arc::new(EventEnvelope {
+                seq: 1,
+                connection_id: "c-no-drain".to_string(),
+                payload: AcpEvent::Error {
+                    message: "Gemini refused the prompt.".into(),
+                    agent_type: "gemini".into(),
+                    code: Some("turn_failed_refusal".into()),
+                    // turn-failure Error: non-terminal. Worker MUST no-op (the
+                    // upcoming TurnComplete maps the outcome via complete_call).
+                    details: None,
+                    terminal: false,
+                },
+            }),
+        )
+        .await;
 
         // Give the worker time to process Error. Without the fix it would
         // call `cancel_by_child_connection` and the pending entry would
@@ -5155,13 +5301,17 @@ mod tests {
         );
 
         // Cleanup: send Disconnected so the driver resolves, dispatcher exits.
-        bus.send(Arc::new(EventEnvelope {
-            seq: 2,
-            connection_id: "c-no-drain".to_string(),
-            payload: AcpEvent::StatusChanged {
-                status: ConnectionStatus::Disconnected,
-            },
-        }));
+        emit_bus(
+            &bus,
+            Arc::new(EventEnvelope {
+                seq: 2,
+                connection_id: "c-no-drain".to_string(),
+                payload: AcpEvent::StatusChanged {
+                    status: ConnectionStatus::Disconnected,
+                },
+            }),
+        )
+        .await;
         drop(bus);
         let _ = driver.await;
         let _ = dispatcher.await;
@@ -5189,17 +5339,21 @@ mod tests {
             Some(broker.clone()),
         ));
 
-        bus.send(Arc::new(EventEnvelope {
-            seq: 1,
-            connection_id: "c-error-alone".to_string(),
-            payload: AcpEvent::Error {
-                message: "transport closed".into(),
-                agent_type: "claude_code".into(),
-                code: None,
-                details: None,
-                terminal: true,
-            },
-        }));
+        emit_bus(
+            &bus,
+            Arc::new(EventEnvelope {
+                seq: 1,
+                connection_id: "c-error-alone".to_string(),
+                payload: AcpEvent::Error {
+                    message: "transport closed".into(),
+                    agent_type: "claude_code".into(),
+                    code: None,
+                    details: None,
+                    terminal: true,
+                },
+            }),
+        )
+        .await;
         // Deliberately no Disconnected — simulates the bus dropping it
         // (Lagged) or the run_connection task aborting after Error.
 
@@ -5245,26 +5399,34 @@ mod tests {
             Some(broker.clone()),
         ));
 
-        bus.send(Arc::new(EventEnvelope {
-            seq: 1,
-            connection_id: "c-auth-fail".to_string(),
-            payload: AcpEvent::Error {
-                message: "Authentication required".into(),
-                agent_type: "gemini".into(),
-                code: Some("auth_required".into()),
-                // Genuinely terminal: matches `connection.rs:493`, the only
-                // emit site where the run_connection task is unwinding.
-                details: None,
-                terminal: true,
-            },
-        }));
-        bus.send(Arc::new(EventEnvelope {
-            seq: 2,
-            connection_id: "c-auth-fail".to_string(),
-            payload: AcpEvent::StatusChanged {
-                status: ConnectionStatus::Disconnected,
-            },
-        }));
+        emit_bus(
+            &bus,
+            Arc::new(EventEnvelope {
+                seq: 1,
+                connection_id: "c-auth-fail".to_string(),
+                payload: AcpEvent::Error {
+                    message: "Authentication required".into(),
+                    agent_type: "gemini".into(),
+                    code: Some("auth_required".into()),
+                    // Genuinely terminal: matches `connection.rs:493`, the only
+                    // emit site where the run_connection task is unwinding.
+                    details: None,
+                    terminal: true,
+                },
+            }),
+        )
+        .await;
+        emit_bus(
+            &bus,
+            Arc::new(EventEnvelope {
+                seq: 2,
+                connection_id: "c-auth-fail".to_string(),
+                payload: AcpEvent::StatusChanged {
+                    status: ConnectionStatus::Disconnected,
+                },
+            }),
+        )
+        .await;
 
         let outcome = driver.await.unwrap();
         match &outcome {
@@ -5302,13 +5464,17 @@ mod tests {
             Some(broker.clone()),
         ));
 
-        bus.send(Arc::new(EventEnvelope {
-            seq: 1,
-            connection_id: "c-bare-disco".to_string(),
-            payload: AcpEvent::StatusChanged {
-                status: ConnectionStatus::Disconnected,
-            },
-        }));
+        emit_bus(
+            &bus,
+            Arc::new(EventEnvelope {
+                seq: 1,
+                connection_id: "c-bare-disco".to_string(),
+                payload: AcpEvent::StatusChanged {
+                    status: ConnectionStatus::Disconnected,
+                },
+            }),
+        )
+        .await;
 
         let outcome = driver.await.unwrap();
         match &outcome {
@@ -5344,13 +5510,17 @@ mod tests {
             Some(broker.clone()),
         ));
 
-        bus.send(Arc::new(EventEnvelope {
-            seq: 1,
-            connection_id: "c-disco-store".to_string(),
-            payload: AcpEvent::StatusChanged {
-                status: ConnectionStatus::Disconnected,
-            },
-        }));
+        emit_bus(
+            &bus,
+            Arc::new(EventEnvelope {
+                seq: 1,
+                connection_id: "c-disco-store".to_string(),
+                payload: AcpEvent::StatusChanged {
+                    status: ConnectionStatus::Disconnected,
+                },
+            }),
+        )
+        .await;
 
         let _outcome = driver.await.unwrap();
         assert_eq!(store.settle_call_count().await, 1);
@@ -5391,17 +5561,21 @@ mod tests {
 
         // A non-terminal Error fires first (e.g. recoverable session/load
         // fallback during child setup). The worker MUST ignore it.
-        bus.send(Arc::new(EventEnvelope {
-            seq: 1,
-            connection_id: "c-nonterm".to_string(),
-            payload: AcpEvent::Error {
-                message: "Failed to load session, starting new: stale id".into(),
-                agent_type: "gemini".into(),
-                code: None,
-                details: None,
-                terminal: false,
-            },
-        }));
+        emit_bus(
+            &bus,
+            Arc::new(EventEnvelope {
+                seq: 1,
+                connection_id: "c-nonterm".to_string(),
+                payload: AcpEvent::Error {
+                    message: "Failed to load session, starting new: stale id".into(),
+                    agent_type: "gemini".into(),
+                    code: None,
+                    details: None,
+                    terminal: false,
+                },
+            }),
+        )
+        .await;
         // Non-terminal Error must not settle durable state.
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(
@@ -5410,13 +5584,17 @@ mod tests {
             "non-terminal Error must not settle durable task store"
         );
         // Then a later, unrelated Disconnected (e.g. the parent disconnects).
-        bus.send(Arc::new(EventEnvelope {
-            seq: 2,
-            connection_id: "c-nonterm".to_string(),
-            payload: AcpEvent::StatusChanged {
-                status: ConnectionStatus::Disconnected,
-            },
-        }));
+        emit_bus(
+            &bus,
+            Arc::new(EventEnvelope {
+                seq: 2,
+                connection_id: "c-nonterm".to_string(),
+                payload: AcpEvent::StatusChanged {
+                    status: ConnectionStatus::Disconnected,
+                },
+            }),
+        )
+        .await;
 
         let outcome = driver.await.unwrap();
         assert_eq!(
@@ -5477,27 +5655,35 @@ mod tests {
 
         // ConversationLinked first so the cache binds (matches production:
         // try_cache_link runs before any terminal event).
-        bus.send(Arc::new(EventEnvelope {
-            seq: 1,
-            connection_id: "c-row".to_string(),
-            payload: AcpEvent::ConversationLinked {
-                conversation_id: conv.id,
-                folder_id,
-                parent_conversation_id: None,
-                parent_tool_use_id: None,
-            },
-        }));
-        bus.send(Arc::new(EventEnvelope {
-            seq: 2,
-            connection_id: "c-row".to_string(),
-            payload: AcpEvent::Error {
-                message: "Failed to set mode: bad id".into(),
-                agent_type: "claude_code".into(),
-                code: None,
-                details: None,
-                terminal: false,
-            },
-        }));
+        emit_bus(
+            &bus,
+            Arc::new(EventEnvelope {
+                seq: 1,
+                connection_id: "c-row".to_string(),
+                payload: AcpEvent::ConversationLinked {
+                    conversation_id: conv.id,
+                    folder_id,
+                    parent_conversation_id: None,
+                    parent_tool_use_id: None,
+                },
+            }),
+        )
+        .await;
+        emit_bus(
+            &bus,
+            Arc::new(EventEnvelope {
+                seq: 2,
+                connection_id: "c-row".to_string(),
+                payload: AcpEvent::Error {
+                    message: "Failed to set mode: bad id".into(),
+                    agent_type: "claude_code".into(),
+                    code: None,
+                    details: None,
+                    terminal: false,
+                },
+            }),
+        )
+        .await;
 
         // Give the worker time to (NOT) process the row flip.
         tokio::time::sleep(Duration::from_millis(50)).await;

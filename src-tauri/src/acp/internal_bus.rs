@@ -128,7 +128,9 @@ impl LifecycleIngress {
     }
 
     pub fn take_receiver(&self, connection_id: &str) -> mpsc::Receiver<Arc<InternalEventEnvelope>> {
-        let dest = self.get_or_create(connection_id);
+        let dest = self
+            .get_or_create(connection_id)
+            .expect("lifecycle ingress closed");
         let rx = dest
             .rx
             .lock()
@@ -139,11 +141,8 @@ impl LifecycleIngress {
     }
 
     pub async fn send(&self, env: Arc<InternalEventEnvelope>) -> Result<(), LifecycleClosed> {
-        if self.closed.load(Ordering::Acquire) {
-            return Err(LifecycleClosed);
-        }
         let conn_id = env.connection_id.clone();
-        let dest = self.get_or_create(&conn_id);
+        let dest = self.get_or_create(&conn_id)?;
         match dest.tx.send(Arc::clone(&env)).await {
             Ok(()) => Ok(()),
             Err(_) => {
@@ -151,16 +150,16 @@ impl LifecycleIngress {
                     return Err(LifecycleClosed);
                 }
                 self.replace_if_incarnation(&conn_id, dest.incarnation);
-                let dest2 = self.get_or_create(&conn_id);
+                let dest2 = self.get_or_create(&conn_id)?;
                 dest2.tx.send(env).await.map_err(|_| LifecycleClosed)
             }
         }
     }
 
     pub async fn drain_and_close(&self) {
-        self.closed.store(true, Ordering::Release);
         let _dropped = {
             let mut map = self.lock_destinations();
+            self.closed.store(true, Ordering::Release);
             std::mem::take(&mut *map)
         };
     }
@@ -175,31 +174,17 @@ impl LifecycleIngress {
         }
     }
 
-    fn try_offer(&self, env: Arc<InternalEventEnvelope>) -> Result<(), Arc<InternalEventEnvelope>> {
-        if self.closed.load(Ordering::Acquire) {
-            return Err(env);
-        }
-        let conn_id = env.connection_id.clone();
-        let dest = self.get_or_create(&conn_id);
-        match dest.tx.try_send(env) {
-            Ok(()) => Ok(()),
-            Err(mpsc::error::TrySendError::Full(env)) => Err(env),
-            Err(mpsc::error::TrySendError::Closed(env)) => {
-                self.replace_if_incarnation(&conn_id, dest.incarnation);
-                let dest2 = self.get_or_create(&conn_id);
-                dest2.tx.try_send(env).map_err(|e| match e {
-                    mpsc::error::TrySendError::Full(env)
-                    | mpsc::error::TrySendError::Closed(env) => env,
-                })
-            }
-        }
-    }
-
-    fn get_or_create(&self, connection_id: &str) -> Arc<DestinationIngress> {
+    fn get_or_create(
+        &self,
+        connection_id: &str,
+    ) -> Result<Arc<DestinationIngress>, LifecycleClosed> {
         let dest = {
             let mut map = self.lock_destinations();
+            if self.closed.load(Ordering::Acquire) {
+                return Err(LifecycleClosed);
+            }
             if let Some(existing) = map.get(connection_id) {
-                return Arc::clone(existing);
+                return Ok(Arc::clone(existing));
             }
             let (tx, rx) = mpsc::channel(self.capacity);
             let incarnation = self.next_incarnation.fetch_add(1, Ordering::Relaxed) + 1;
@@ -212,7 +197,7 @@ impl LifecycleIngress {
             dest
         };
         self.maybe_spawn(connection_id, &dest);
-        dest
+        Ok(dest)
     }
 
     fn maybe_spawn(&self, connection_id: &str, dest: &Arc<DestinationIngress>) {
@@ -251,12 +236,10 @@ impl LifecycleIngress {
 ///
 /// Subscribers (lifecycle / pet / chat-channel) call `subscribe()` once at
 /// startup and hold the receiver for the lifetime of the process.
-/// `emit_with_state` calls `send_with_completion()` after the per-connection
-/// stream so the envelope arrives in lockstep with the WS attach delivery.
-///
-/// Lifecycle-critical events also enter [`LifecycleIngress`]: one FIFO
-/// sender per connection so a stalled destination cannot drop or reorder
-/// `TurnComplete`, and cannot block a different connection.
+/// `emit_with_state` broadcasts non-critical events with
+/// `send_with_completion()` after the per-connection stream, and awaits
+/// [`InternalEventBus::send_lifecycle`] for critical payloads so they enter
+/// one FIFO sender per connection.
 pub struct InternalEventBus {
     sender: broadcast::Sender<Arc<InternalEventEnvelope>>,
     critical_ingress: Arc<LifecycleIngress>,
@@ -285,9 +268,8 @@ impl InternalEventBus {
 
     /// Broadcast a public envelope with an optional completion sidecar.
     ///
-    /// Lifecycle-critical payloads are always mirrored onto per-destination
-    /// ingress (even when there are currently zero broadcast subscribers) so
-    /// status CAS cannot depend solely on the lag-prone broadcast path.
+    /// Critical lifecycle payloads must use [`Self::send_lifecycle`] so they
+    /// enqueue only through [`LifecycleIngress::send`] on the caller.
     pub fn send_with_completion(
         &self,
         event: Arc<EventEnvelope>,
@@ -295,9 +277,6 @@ impl InternalEventBus {
     ) {
         let internal = self.make_internal(event, completion);
         self.broadcast_internal(&internal);
-        if is_lifecycle_critical(&internal.payload) {
-            self.offer_critical(internal);
-        }
     }
 
     /// Broadcast, then **await** the destination FIFO. Emitters must call this
@@ -355,28 +334,6 @@ impl InternalEventBus {
                 "[ACP][bus] broadcast has 0 subscribers for critical event; \
                  relying on critical lifecycle ingress only"
             );
-        }
-    }
-
-    fn offer_critical(&self, internal: Arc<InternalEventEnvelope>) {
-        let connection_id = internal.connection_id.clone();
-        let payload_label = critical_payload_label(&internal.payload);
-        match self.critical_ingress.try_offer(internal) {
-            Ok(()) => self.note_critical_enqueued(&connection_id, payload_label),
-            Err(env) => {
-                self.metrics
-                    .critical_lane_full_count
-                    .fetch_add(1, Ordering::Relaxed);
-                let ingress = Arc::clone(&self.critical_ingress);
-                let metrics = Arc::clone(&self.metrics);
-                tokio::runtime::Handle::current().spawn(async move {
-                    if ingress.send(env).await.is_ok() {
-                        metrics
-                            .critical_lane_emit_count
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
-                });
-            }
         }
     }
 
@@ -674,7 +631,7 @@ mod tests {
             },
         });
         // No broadcast subscriber — previous code would no-op entirely.
-        bus.send_with_completion(env, None);
+        bus.send_lifecycle(env, None).await;
 
         let got = tokio::time::timeout(Duration::from_secs(1), critical.recv())
             .await
@@ -871,5 +828,109 @@ mod tests {
             submitted_count,
             "drain must deliver every event submitted before shutdown"
         );
+    }
+
+    #[tokio::test]
+    async fn critical_ingress_send_with_completion_does_not_enqueue() {
+        let metrics = Arc::new(EventBusMetrics::default());
+        let bus = InternalEventBus::new(metrics.clone());
+        let mut critical = bus.lifecycle_ingress().take_receiver("c-sync");
+        let env = Arc::new(EventEnvelope {
+            seq: 1,
+            connection_id: "c-sync".into(),
+            payload: AcpEvent::TurnComplete {
+                session_id: "sync".into(),
+                stop_reason: "end_turn".into(),
+                agent_type: "codex".into(),
+                mark_awaiting_reply: false,
+                termination_source: None,
+                provider_turn_id: None,
+            },
+        });
+        bus.send_with_completion(env, None);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), critical.recv())
+                .await
+                .is_err(),
+            "critical events must enqueue only via send_lifecycle, not send_with_completion"
+        );
+        assert_eq!(metrics.critical_lane_emit_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn critical_ingress_refuses_create_after_drain_and_close() {
+        let ingress = LifecycleIngress::new_with_capacity(1);
+        let spawned = Arc::new(AtomicUsize::new(0));
+        let spawned_worker = Arc::clone(&spawned);
+        ingress.set_spawner(Arc::new(move |_, _, rx| {
+            spawned_worker.fetch_add(1, Ordering::SeqCst);
+            drop(rx);
+        }));
+        ingress.drain_and_close().await;
+        assert_eq!(
+            ingress.send(turn_complete_internal("late", 1, "X")).await,
+            Err(LifecycleClosed)
+        );
+        assert_eq!(
+            spawned.load(Ordering::SeqCst),
+            0,
+            "drain must not allow a late get_or_create to spawn"
+        );
+        let take = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ingress.take_receiver("late")
+        }));
+        assert!(
+            take.is_err(),
+            "take_receiver after drain must not resurrect a destination"
+        );
+        assert!(
+            ingress.lock_destinations().is_empty(),
+            "closed ingress must refuse new map entries"
+        );
+    }
+
+    #[tokio::test]
+    async fn critical_ingress_replaces_dead_worker_without_dropping_new_dest() {
+        let ingress = Arc::new(LifecycleIngress::new_with_capacity(1));
+        let rx1 = ingress.take_receiver("c-dead");
+        let inc1 = ingress
+            .lock_destinations()
+            .get("c-dead")
+            .expect("dest exists")
+            .incarnation;
+        drop(rx1);
+
+        let (spawned_tx, mut spawned_rx) = mpsc::unbounded_channel();
+        ingress.set_spawner(Arc::new(move |_, inc, rx| {
+            spawned_tx.send((inc, rx)).unwrap();
+        }));
+
+        let hold_old_cleanup = Arc::new(tokio::sync::Barrier::new(2));
+        let hold_worker = Arc::clone(&hold_old_cleanup);
+        let ingress_cleanup = Arc::clone(&ingress);
+        tokio::spawn(async move {
+            hold_worker.wait().await;
+            ingress_cleanup.remove_if_incarnation("c-dead", inc1);
+        });
+
+        ingress
+            .send(turn_complete_internal("c-dead", 1, "A"))
+            .await
+            .expect("closed dest must be replaced and the event retried");
+        let (inc2, mut rx2) = spawned_rx
+            .recv()
+            .await
+            .expect("replacement worker must spawn");
+        assert_ne!(inc1, inc2, "replacement must use a new incarnation");
+        let got_a = rx2.recv().await.expect("retried event");
+        assert_eq!(session_id_of(&got_a), "A");
+
+        hold_old_cleanup.wait().await;
+        ingress
+            .send(turn_complete_internal("c-dead", 2, "B"))
+            .await
+            .expect("old cleanup must not delete the replacement dest");
+        let got_b = rx2.recv().await.expect("event on replacement dest");
+        assert_eq!(session_id_of(&got_b), "B");
     }
 }
