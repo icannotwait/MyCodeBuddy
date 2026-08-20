@@ -193,9 +193,106 @@ pub enum ParseError {
     InvalidData(String),
 }
 
+pub struct RecoveryQuery<'a> {
+    pub cwd: &'a str,
+    pub approx: DateTime<Utc>,
+    pub max_skew: chrono::Duration,
+    pub ambiguity: chrono::Duration,
+}
+
+impl RecoveryQuery<'_> {
+    pub fn cwd_matches(&self, summary: &ConversationSummary) -> bool {
+        summary
+            .folder_path
+            .as_deref()
+            .is_some_and(|path| path_eq_for_matching(path, self.cwd))
+    }
+
+    pub fn skew(&self, summary: &ConversationSummary) -> chrono::Duration {
+        let started = (summary.started_at - self.approx).abs();
+        match summary.ended_at {
+            Some(ended) => started.min((ended - self.approx).abs()),
+            None => started,
+        }
+    }
+}
+
+pub(crate) struct RecoveryCandidateTracker<T> {
+    max_skew: chrono::Duration,
+    ambiguity: chrono::Duration,
+    best: Option<(chrono::Duration, T)>,
+    second: Option<(chrono::Duration, T)>,
+}
+
+impl<T> RecoveryCandidateTracker<T> {
+    pub(crate) fn new(query: &RecoveryQuery<'_>) -> Self {
+        Self {
+            max_skew: query.max_skew,
+            ambiguity: query.ambiguity,
+            best: None,
+            second: None,
+        }
+    }
+
+    pub(crate) fn consider(&mut self, skew: chrono::Duration, item: T) {
+        match &self.best {
+            None => self.best = Some((skew, item)),
+            Some((best_skew, _)) if skew < *best_skew => {
+                self.second = self.best.take();
+                self.best = Some((skew, item));
+            }
+            Some(_) => match &self.second {
+                None => self.second = Some((skew, item)),
+                Some((second_skew, _)) if skew < *second_skew => {
+                    self.second = Some((skew, item));
+                }
+                _ => {}
+            },
+        }
+    }
+
+    pub(crate) fn unique_winner(self) -> Option<T> {
+        let (best_skew, best) = self.best?;
+        if best_skew > self.max_skew {
+            return None;
+        }
+        if let Some((second_skew, _)) = self.second {
+            if second_skew <= self.max_skew && (second_skew - best_skew) < self.ambiguity {
+                return None;
+            }
+        }
+        Some(best)
+    }
+}
+
+pub(crate) fn select_unique_recovery_match<'a>(
+    summaries: impl IntoIterator<Item = &'a ConversationSummary>,
+    query: &RecoveryQuery<'_>,
+    accept: &dyn Fn(&ConversationSummary) -> bool,
+) -> Option<&'a ConversationSummary> {
+    let mut tracker = RecoveryCandidateTracker::new(query);
+    for summary in summaries {
+        if !accept(summary) || !query.cwd_matches(summary) {
+            continue;
+        }
+        tracker.consider(query.skew(summary), summary);
+    }
+    tracker.unique_winner()
+}
+
 pub trait AgentParser {
     fn list_conversations(&self) -> Result<Vec<ConversationSummary>, ParseError>;
     fn get_conversation(&self, conversation_id: &str) -> Result<ConversationDetail, ParseError>;
+    /// Parser-specific stale-session recovery. Default is fail-closed so a
+    /// generic caller cannot fall back to listing every conversation.
+    fn recover_conversation(
+        &self,
+        query: &RecoveryQuery<'_>,
+        accept: &dyn Fn(&ConversationSummary) -> bool,
+    ) -> Result<Option<ConversationDetail>, ParseError> {
+        let _ = (query, accept);
+        Ok(None)
+    }
 }
 
 /// Truncate a string to `max_len` characters, appending "..." if truncated.
@@ -1219,9 +1316,13 @@ mod tests {
     use super::{
         fold_reference_links, infer_context_window_max_tokens, is_safe_subagent_id,
         latest_turn_total_usage_tokens, merge_context_window_stats, path_eq_for_matching,
-        sanitize_user_blocks, title_from_user_text, visible_user_text,
+        sanitize_user_blocks, select_unique_recovery_match, title_from_user_text,
+        visible_user_text, RecoveryQuery,
     };
-    use crate::models::{ContentBlock, MessageTurn, SessionStats, TurnRole, TurnUsage};
+    use crate::models::{
+        AgentType, ContentBlock, ConversationSummary, MessageTurn, SessionStats, TurnRole,
+        TurnUsage,
+    };
 
     fn test_terminal_context() -> String {
         test_terminal_context_for("PowerShell 7", "powershell", "PowerShell")
@@ -1615,5 +1716,115 @@ earlier terminal context records.\n\
             "C:\\Users\\demo\\workspace\\codeg",
             "C:/Users/demo/workspace/codeg"
         ));
+    }
+
+    fn recovery_summary(
+        id: &str,
+        cwd: &str,
+        started_at: chrono::DateTime<Utc>,
+        ended_at: Option<chrono::DateTime<Utc>>,
+    ) -> ConversationSummary {
+        ConversationSummary {
+            id: id.to_string(),
+            agent_type: AgentType::Cline,
+            folder_path: Some(cwd.to_string()),
+            folder_name: Some("app".into()),
+            title: Some(id.to_string()),
+            started_at,
+            ended_at,
+            message_count: 1,
+            model: None,
+            git_branch: None,
+            parent_id: None,
+            parent_tool_use_id: None,
+            delegation_call_id: None,
+        }
+    }
+
+    fn recovery_query<'a>(cwd: &'a str, approx: chrono::DateTime<Utc>) -> RecoveryQuery<'a> {
+        RecoveryQuery {
+            cwd,
+            approx,
+            max_skew: chrono::Duration::minutes(5),
+            ambiguity: chrono::Duration::seconds(60),
+        }
+    }
+
+    #[test]
+    fn recovery_rejects_when_best_skew_exceeds_five_minutes() {
+        let t0 = Utc::now();
+        let far = recovery_summary("far", "/tmp/app", t0 + chrono::Duration::minutes(6), None);
+        let query = recovery_query("/tmp/app", t0);
+        assert!(
+            select_unique_recovery_match(std::slice::from_ref(&far), &query, &|_| true).is_none(),
+            "best skew beyond 5 minutes must fail closed"
+        );
+    }
+
+    #[test]
+    fn recovery_rejects_when_two_candidates_within_sixty_seconds() {
+        let t0 = Utc::now();
+        let a = recovery_summary("a", "/tmp/app", t0, None);
+        let b = recovery_summary("b", "/tmp/app", t0 + chrono::Duration::seconds(30), None);
+        let query = recovery_query("/tmp/app", t0);
+        assert!(
+            select_unique_recovery_match(&[a, b], &query, &|_| true).is_none(),
+            "two remaining candidates within 60s must fail closed"
+        );
+    }
+
+    #[test]
+    fn recovery_selects_unique_candidate_inside_five_minutes() {
+        let t0 = Utc::now();
+        let cwd = "/tmp/app";
+        let only = recovery_summary("hit", cwd, t0 + chrono::Duration::minutes(2), None);
+        let query = recovery_query(cwd, t0);
+        assert_eq!(
+            select_unique_recovery_match(std::slice::from_ref(&only), &query, &|_| true)
+                .map(|s| s.id.as_str()),
+            Some("hit")
+        );
+
+        let slash = recovery_summary("win", r"D:\tmp\app", t0, None);
+        let query_win = recovery_query("D:/tmp/app", t0);
+        assert_eq!(
+            select_unique_recovery_match(std::slice::from_ref(&slash), &query_win, &|_| true)
+                .map(|s| s.id.as_str()),
+            Some("win"),
+            "cwd matching must treat backslash and forward slash as the same path"
+        );
+
+        let mut ended_near = recovery_summary("ended", cwd, t0 - chrono::Duration::hours(1), None);
+        ended_near.ended_at = Some(t0);
+        assert_eq!(
+            select_unique_recovery_match(std::slice::from_ref(&ended_near), &query, &|_| true)
+                .map(|s| s.id.as_str()),
+            Some("ended"),
+            "ended_at near approx must match even if started_at is outside the skew window"
+        );
+
+        let nearer = recovery_summary("near", cwd, t0, None);
+        let farther = recovery_summary("farther", cwd, t0 + chrono::Duration::seconds(90), None);
+        assert_eq!(
+            select_unique_recovery_match(&[nearer, farther], &query, &|_| true)
+                .map(|s| s.id.as_str()),
+            Some("near"),
+            "a second candidate 90s away is unique enough to keep the nearer one"
+        );
+    }
+
+    #[test]
+    fn recovery_excludes_internal_then_ranks() {
+        let t0 = Utc::now();
+        let cwd = "/tmp/app";
+        let internal = recovery_summary("internal", cwd, t0, None);
+        let legal = recovery_summary("legal", cwd, t0 + chrono::Duration::seconds(90), None);
+        let query = recovery_query(cwd, t0);
+        assert_eq!(
+            select_unique_recovery_match(&[internal, legal], &query, &|s| s.id != "internal")
+                .map(|s| s.id.as_str()),
+            Some("legal"),
+            "internal nearest candidate must be dropped before ranking so the legal second wins"
+        );
     }
 }

@@ -9,11 +9,26 @@ use walkdir::WalkDir;
 use crate::models::*;
 use crate::parsers::{
     folder_name_from_path, sanitize_user_blocks, title_from_user_text, truncate_str, visible_title,
-    visible_user_text, AgentParser, ParseError,
+    visible_user_text, AgentParser, ParseError, RecoveryCandidateTracker, RecoveryQuery,
 };
 
 pub struct GeminiParser {
     base_dir: PathBuf,
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+std::thread_local! {
+    static CHAT_FILE_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+pub(crate) fn take_chat_file_walks() -> usize {
+    CHAT_FILE_WALKS.with(|c| c.replace(0))
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+fn note_chat_file_walk() {
+    CHAT_FILE_WALKS.with(|c| c.set(c.get() + 1));
 }
 
 impl Default for GeminiParser {
@@ -160,6 +175,8 @@ impl GeminiParser {
     }
 
     fn list_chat_files(&self) -> Vec<PathBuf> {
+        #[cfg(any(test, feature = "test-utils"))]
+        note_chat_file_walk();
         let mut files: Vec<PathBuf> = Vec::new();
 
         // Scan both tmp/ (active sessions) and history/ (archived sessions)
@@ -774,6 +791,36 @@ impl AgentParser for GeminiParser {
         Ok(conversations)
     }
 
+    fn recover_conversation(
+        &self,
+        query: &RecoveryQuery<'_>,
+        accept: &dyn Fn(&ConversationSummary) -> bool,
+    ) -> Result<Option<ConversationDetail>, ParseError> {
+        let mut tracker = RecoveryCandidateTracker::new(query);
+        for chat_file in self.list_chat_files() {
+            let raw = match fs::read_to_string(&chat_file) {
+                Ok(raw) => raw,
+                Err(_) => continue,
+            };
+            let Some(value) = Self::parse_chat_value(&chat_file, &raw) else {
+                continue;
+            };
+            let Some(summary) = self.parse_summary_from_value(&chat_file, &value) else {
+                continue;
+            };
+            if !accept(&summary) || !query.cwd_matches(&summary) {
+                continue;
+            }
+            let skew = query.skew(&summary);
+            let id = summary.id.clone();
+            tracker.consider(skew, (chat_file, value, id));
+        }
+        let Some((path, value, id)) = tracker.unique_winner() else {
+            return Ok(None);
+        };
+        Ok(Some(self.parse_conversation_detail(&path, &value, &id)?))
+    }
+
     fn get_conversation(&self, conversation_id: &str) -> Result<ConversationDetail, ParseError> {
         for chat_file in self.list_chat_files() {
             let raw = match fs::read_to_string(&chat_file) {
@@ -902,7 +949,7 @@ mod tests {
     use super::resolve_gemini_base_dir_from;
     use super::GeminiParser;
     use crate::models::{ContentBlock, TurnRole};
-    use crate::parsers::AgentParser;
+    use crate::parsers::{AgentParser, RecoveryQuery};
     use chrono::{DateTime, Utc};
     use std::env;
     use std::fs;
@@ -1349,6 +1396,98 @@ earlier terminal context records.\n\
         assert!(visible_user_texts
             .iter()
             .any(|text| text.contains("partial")));
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    fn recovery_query<'a>(cwd: &'a str, approx: DateTime<Utc>) -> RecoveryQuery<'a> {
+        RecoveryQuery {
+            cwd,
+            approx,
+            max_skew: chrono::Duration::minutes(5),
+            ambiguity: chrono::Duration::seconds(60),
+        }
+    }
+
+    fn write_gemini_chat(
+        base: &std::path::Path,
+        alias: &str,
+        cwd: &str,
+        session_id: &str,
+        start: &str,
+        last: &str,
+        prompt: &str,
+    ) {
+        let chats_dir = base.join("tmp").join(alias).join("chats");
+        fs::create_dir_all(&chats_dir).expect("create chat dir");
+        fs::write(base.join("tmp").join(alias).join(".project_root"), cwd)
+            .expect("write project root");
+        let content = format!(
+            r#"{{
+  "sessionId": "{session_id}",
+  "startTime": "{start}",
+  "lastUpdated": "{last}",
+  "messages": [
+    {{
+      "id": "u1",
+      "timestamp": "{start}",
+      "type": "user",
+      "content": [{{"text": "{prompt}"}}]
+    }}
+  ]
+}}"#
+        );
+        fs::write(
+            chats_dir.join(format!("session-{session_id}.json")),
+            content,
+        )
+        .expect("write chat file");
+    }
+
+    #[test]
+    fn recovery_gemini_stale_id_in_one_walk() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time ok")
+            .as_nanos();
+        let base: PathBuf = env::temp_dir().join(format!("codeg-gemini-recovery-{nanos}"));
+        let cwd = "/Users/test/workspace/demo";
+        write_gemini_chat(
+            &base,
+            "codeg",
+            cwd,
+            "winner-real-id",
+            "2026-03-02T12:00:10.000Z",
+            "2026-03-02T12:00:40.000Z",
+            "winner prompt",
+        );
+        write_gemini_chat(
+            &base,
+            "codeg",
+            cwd,
+            "decoy-far-id",
+            "2026-03-02T12:20:00.000Z",
+            "2026-03-02T12:21:00.000Z",
+            "decoy prompt",
+        );
+
+        super::take_chat_file_walks();
+        let parser = GeminiParser::with_base_dir(base.clone());
+        let approx = "2026-03-02T12:00:00Z"
+            .parse::<DateTime<Utc>>()
+            .expect("approx");
+        let recovered = parser
+            .recover_conversation(&recovery_query(cwd, approx), &|_| true)
+            .expect("recover")
+            .expect("stale ACP UUID must recover the cwd+time winner");
+
+        assert_eq!(recovered.summary.id, "winner-real-id");
+        assert_eq!(recovered.summary.title.as_deref(), Some("winner prompt"));
+        assert_eq!(
+            super::take_chat_file_walks(),
+            1,
+            "Gemini recovery must finish in one list_chat_files walk"
+        );
 
         let _ = fs::remove_dir_all(base);
     }

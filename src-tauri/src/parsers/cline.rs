@@ -10,8 +10,9 @@ use crate::models::{
 };
 
 use super::{
-    backfill_turn_durations, compute_session_stats, folder_name_from_path, title_from_user_text,
-    truncate_str, visible_title, visible_user_text, AgentParser, ParseError,
+    backfill_turn_durations, compute_session_stats, folder_name_from_path,
+    select_unique_recovery_match, title_from_user_text, truncate_str, visible_title,
+    visible_user_text, AgentParser, ParseError, RecoveryQuery,
 };
 
 // ---------------------------------------------------------------------------
@@ -132,8 +133,33 @@ impl ClineParser {
     }
 }
 
-impl AgentParser for ClineParser {
-    fn list_conversations(&self) -> Result<Vec<ConversationSummary>, ParseError> {
+#[cfg(any(test, feature = "test-utils"))]
+std::thread_local! {
+    static HISTORY_BODY_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+pub(crate) fn take_history_body_reads() -> usize {
+    HISTORY_BODY_READS.with(|c| c.replace(0))
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+fn note_history_body_read() {
+    HISTORY_BODY_READS.with(|c| c.set(c.get() + 1));
+}
+
+impl ClineParser {
+    fn read_api_history_raw(&self, tasks_dir: &std::path::Path) -> Result<String, std::io::Error> {
+        let api_path = tasks_dir.join("api_conversation_history.json");
+        #[cfg(any(test, feature = "test-utils"))]
+        note_history_body_read();
+        fs::read_to_string(api_path)
+    }
+
+    fn list_task_history_summaries(
+        &self,
+        read_message_counts: bool,
+    ) -> Result<Vec<ConversationSummary>, ParseError> {
         let history_path = self.base_dir.join("state").join("taskHistory.json");
         if !history_path.exists() {
             return Ok(vec![]);
@@ -149,14 +175,17 @@ impl AgentParser for ClineParser {
                 continue;
             }
 
-            // Read model from task_metadata.json or taskHistory entry
-            let model = entry.model_id.clone().or_else(|| {
-                let meta_path = tasks_dir.join("task_metadata.json");
-                fs::read_to_string(meta_path)
-                    .ok()
-                    .and_then(|raw| serde_json::from_str::<TaskMetadata>(&raw).ok())
-                    .and_then(|meta| meta.model_usage.first().and_then(|u| u.model_id.clone()))
-            });
+            let model = if read_message_counts {
+                entry.model_id.clone().or_else(|| {
+                    let meta_path = tasks_dir.join("task_metadata.json");
+                    fs::read_to_string(meta_path)
+                        .ok()
+                        .and_then(|raw| serde_json::from_str::<TaskMetadata>(&raw).ok())
+                        .and_then(|meta| meta.model_usage.first().and_then(|u| u.model_id.clone()))
+                })
+            } else {
+                entry.model_id.clone()
+            };
 
             let folder_path = entry.cwd_on_task_initialization.clone();
             let folder_name = folder_path.as_deref().map(folder_name_from_path);
@@ -167,13 +196,15 @@ impl AgentParser for ClineParser {
                 .and_then(|t| visible_title(Some(t.trim().to_string())))
                 .map(|t| title_from_user_text(&t));
 
-            // Count messages from api_conversation_history.json
-            let api_path = tasks_dir.join("api_conversation_history.json");
-            let message_count = fs::read_to_string(&api_path)
-                .ok()
-                .and_then(|raw| serde_json::from_str::<Vec<serde_json::Value>>(&raw).ok())
-                .map(|msgs| msgs.len() as u32)
-                .unwrap_or(0);
+            let message_count = if read_message_counts {
+                self.read_api_history_raw(&tasks_dir)
+                    .ok()
+                    .and_then(|raw| serde_json::from_str::<Vec<serde_json::Value>>(&raw).ok())
+                    .map(|msgs| msgs.len() as u32)
+                    .unwrap_or(0)
+            } else {
+                0
+            };
 
             // started_at from task id (which is a timestamp), ended_at from ts
             let started_at = ts_to_datetime(entry.id.parse::<i64>().unwrap_or(entry.ts));
@@ -202,6 +233,24 @@ impl AgentParser for ClineParser {
 
         Ok(summaries)
     }
+}
+
+impl AgentParser for ClineParser {
+    fn list_conversations(&self) -> Result<Vec<ConversationSummary>, ParseError> {
+        self.list_task_history_summaries(true)
+    }
+
+    fn recover_conversation(
+        &self,
+        query: &RecoveryQuery<'_>,
+        accept: &dyn Fn(&ConversationSummary) -> bool,
+    ) -> Result<Option<ConversationDetail>, ParseError> {
+        let summaries = self.list_task_history_summaries(false)?;
+        let Some(winner) = select_unique_recovery_match(&summaries, query, accept) else {
+            return Ok(None);
+        };
+        Ok(Some(self.get_conversation(&winner.id)?))
+    }
 
     fn get_conversation(&self, conversation_id: &str) -> Result<ConversationDetail, ParseError> {
         let tasks_dir = self.base_dir.join("tasks").join(conversation_id);
@@ -218,7 +267,7 @@ impl AgentParser for ClineParser {
             ));
         }
 
-        let raw = fs::read_to_string(&api_path)?;
+        let raw = self.read_api_history_raw(&tasks_dir)?;
         let messages: Vec<ApiMessage> = serde_json::from_str(&raw)?;
 
         // Read metadata for model/cwd
@@ -834,6 +883,86 @@ earlier terminal context records.\n\
             )),
             "expected indented route feedback to remain visible, got {:?}",
             tool_parts.user_blocks
+        );
+    }
+
+    fn recovery_query<'a>(cwd: &'a str, approx: DateTime<Utc>) -> super::super::RecoveryQuery<'a> {
+        super::super::RecoveryQuery {
+            cwd,
+            approx,
+            max_skew: chrono::Duration::minutes(5),
+            ambiguity: chrono::Duration::seconds(60),
+        }
+    }
+
+    fn write_task_history(base: &std::path::Path, entries: &[serde_json::Value]) {
+        fs::create_dir_all(base.join("state")).unwrap();
+        fs::write(
+            base.join("state").join("taskHistory.json"),
+            serde_json::Value::Array(entries.to_vec()).to_string(),
+        )
+        .unwrap();
+    }
+
+    fn write_task_body(base: &std::path::Path, id: &str, body: &str) {
+        let dir = base.join("tasks").join(id);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("api_conversation_history.json"), body).unwrap();
+    }
+
+    fn history_entry(id: &str, ts: i64, cwd: &str, task: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "ts": ts,
+            "task": task,
+            "cwdOnTaskInitialization": cwd
+        })
+    }
+
+    #[test]
+    fn recovery_cline_does_not_read_every_history_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let cwd = "/tmp/cline-recovery";
+        let approx_ms = 1_700_000_000_000i64;
+        let winner_id = (approx_ms + 10_000).to_string();
+        let other_cwd_id = (approx_ms + 5_000).to_string();
+        let far_id = (approx_ms + 600_000).to_string();
+        let approx = Utc.timestamp_millis_opt(approx_ms).single().unwrap();
+
+        write_task_history(
+            base,
+            &[
+                history_entry(&winner_id, approx_ms + 10_000, cwd, "winner prompt"),
+                history_entry(&other_cwd_id, approx_ms + 5_000, "/tmp/other", "other cwd"),
+                history_entry(&far_id, approx_ms + 600_000, cwd, "too far"),
+            ],
+        );
+        write_task_body(
+            base,
+            &winner_id,
+            &serde_json::json!([{
+                "role": "user",
+                "ts": approx_ms + 10_000,
+                "content": "winner prompt"
+            }])
+            .to_string(),
+        );
+        write_task_body(base, &other_cwd_id, "MUST_NOT_READ_OTHER_CWD_BODY");
+        write_task_body(base, &far_id, "MUST_NOT_READ_FAR_BODY");
+
+        super::take_history_body_reads();
+        let parser = ClineParser::with_base_dir(base.to_path_buf());
+        let recovered = parser
+            .recover_conversation(&recovery_query(cwd, approx), &|_| true)
+            .expect("recover")
+            .expect("unique in-window Cline task");
+
+        assert_eq!(recovered.summary.id, winner_id);
+        assert_eq!(
+            super::take_history_body_reads(),
+            1,
+            "recovery must open only the winning api_conversation_history.json"
         );
     }
 }

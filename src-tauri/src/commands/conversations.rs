@@ -29,7 +29,7 @@ use crate::parsers::opencode::OpenCodeParser;
 use crate::parsers::pi::PiParser;
 use crate::parsers::{
     folder_name_from_path, normalize_path_for_matching, path_eq_for_matching, AgentParser,
-    ParseError,
+    ParseError, RecoveryQuery,
 };
 use crate::web::event_bridge::{
     emit_event, ConversationChange, ConversationsBulkChanged, EventEmitter, ImportScanProgress,
@@ -1445,6 +1445,32 @@ fn inject_delegation_run_meta(turns: &mut [MessageTurn], runs: &[DelegationRunSn
     }
 }
 
+fn try_recover_stale_session(
+    parser: &dyn AgentParser,
+    agent_type: AgentType,
+    cwd: Option<&str>,
+    approx: chrono::DateTime<chrono::Utc>,
+    filter: &InternalSessionFilter,
+) -> Option<crate::models::ConversationDetail> {
+    let cwd = cwd.filter(|s| !s.trim().is_empty())?;
+    let query = RecoveryQuery {
+        cwd,
+        approx,
+        max_skew: chrono::Duration::minutes(5),
+        ambiguity: chrono::Duration::seconds(60),
+    };
+    parser
+        .recover_conversation(&query, &|summary| {
+            !filter.contains(
+                agent_type,
+                Some(summary.id.as_str()),
+                summary.folder_path.as_deref(),
+            )
+        })
+        .ok()
+        .flatten()
+}
+
 /// Core logic for loading a folder conversation with parser fallback.
 /// Shared by both the Tauri command and the web handler.
 ///
@@ -1465,19 +1491,21 @@ pub async fn get_folder_conversation_core(
         if let Some(ref ext_id) = summary.external_id {
             let at = summary.agent_type;
             let eid = ext_id.clone();
-            let db_created_at = summary.created_at;
             // Prefer the recorded origin cwd (set when a removed task worktree's
             // conversations were re-parented) over the current folder's path — the
             // session file still carries the ORIGINAL cwd, so matching on the new
             // parent folder would never find it.
-            let folder_path_for_fallback = match summary.origin_cwd.clone() {
-                Some(cwd) => Some(cwd),
-                None => folder_service::get_folder_by_id(conn, summary.folder_id)
+            let cwd_hint = match summary.origin_cwd.clone() {
+                Some(origin) if !origin.trim().is_empty() => Some(origin),
+                _ => folder_service::get_folder_by_id(conn, summary.folder_id)
                     .await
                     .ok()
                     .flatten()
                     .map(|f| f.path),
             };
+            // Rank against row creation, not last-write: `updated_at` moves
+            // with every turn and can pick a later task in the same cwd.
+            let approx_time = summary.created_at;
             // Hold the shared discovery lease across the entire direct/fallback
             // parser boundary so a concurrent register cannot race mid-recovery.
             let (guard, filter) = registry.shared_filter().await.map_err(|e| {
@@ -1513,34 +1541,34 @@ pub async fn get_folder_conversation_core(
                         ))
                     }
                     Err(crate::parsers::ParseError::ConversationNotFound(_)) => {
-                        // The external_id may no longer match any local file —
-                        // e.g. an ACP session UUID (Cline) or a stale ID after
-                        // session/new fallback overwrote the original (Gemini CLI).
-                        // Fall back to matching by folder_path and started_at from
-                        // the parsed conversation list.
+                        // ACP UUIDs / Gemini session/new fallback can leave a
+                        // stale external_id. Recover inside one parser walk
+                        // using cwd+time bounds, with internals excluded
+                        // before ranking so a hidden nearest row cannot mask
+                        // a legal second candidate.
+                        if let Some(recovered) = try_recover_stale_session(
+                            parser.as_ref(),
+                            at,
+                            cwd_hint.as_deref(),
+                            approx_time,
+                            &filter,
+                        ) {
+                            let new_id = recovered.summary.id.clone();
+                            let title = recovered.summary.title.clone();
+                            return Ok((
+                                recovered.turns,
+                                recovered.session_stats,
+                                Some(new_id),
+                                title,
+                                recovered.transcript_watermark,
+                            ));
+                        }
                         if matches!(at, AgentType::Cline | AgentType::Gemini) {
-                            if let Ok(all) = parser.list_conversations() {
-                                let matched = select_folder_time_fallback(
-                                    all,
-                                    folder_path_for_fallback.as_deref(),
-                                    db_created_at,
-                                    &filter,
-                                );
-                                if let Some(conv) = matched {
-                                    let new_ext_id = conv.id.clone();
-                                    if let Ok(d) = parser.get_conversation(&new_ext_id) {
-                                        let d =
-                                            reject_internal_detail(at, &new_ext_id, d, &filter)?;
-                                        return Ok((
-                                            d.turns,
-                                            d.session_stats,
-                                            Some(new_ext_id),
-                                            d.summary.title,
-                                            d.transcript_watermark,
-                                        ));
-                                    }
-                                }
-                            }
+                            tracing::warn!(
+                                agent = ?at,
+                                external_id = %eid,
+                                "[conversations] session file not found; skipping full-list fallback"
+                            );
                         }
                         Ok((vec![], None, None, None, None))
                     }
@@ -4937,6 +4965,86 @@ Call get_delegation_status with the returned task_id to collect the result.";
         assert!(all
             .iter()
             .any(|f| f.id == chat_id && f.kind == FolderKind::Chat));
+    }
+
+    #[tokio::test]
+    async fn recovery_excludes_internal_then_ranks() {
+        let db = fresh_in_memory_db().await;
+        let data_dir = TempDir::new().expect("tempdir");
+        let registry =
+            InternalAgentSessionRegistry::new_empty_for_test(db.conn.clone(), data_dir.path())
+                .expect("registry");
+
+        let cwd = "/tmp/recovery-app";
+        let approx_ms = 1_700_000_100_000i64;
+        let internal_id = approx_ms.to_string();
+        let legal_id = (approx_ms + 90_000).to_string();
+        let approx = chrono::DateTime::from_timestamp_millis(approx_ms).expect("approx");
+
+        let fixture = TempDir::new().expect("cline fixture");
+        let base = fixture.path();
+        std::fs::create_dir_all(base.join("state")).expect("state dir");
+        std::fs::create_dir_all(base.join("tasks").join(&internal_id)).expect("internal task");
+        std::fs::create_dir_all(base.join("tasks").join(&legal_id)).expect("legal task");
+        let history = serde_json::json!([
+            {
+                "id": internal_id,
+                "ts": approx_ms,
+                "task": "internal nearest",
+                "cwdOnTaskInitialization": cwd
+            },
+            {
+                "id": legal_id,
+                "ts": approx_ms + 90_000,
+                "task": "legal second",
+                "cwdOnTaskInitialization": cwd
+            }
+        ]);
+        std::fs::write(
+            base.join("state").join("taskHistory.json"),
+            history.to_string(),
+        )
+        .expect("history");
+        std::fs::write(
+            base.join("tasks")
+                .join(&internal_id)
+                .join("api_conversation_history.json"),
+            serde_json::json!([{
+                "role": "user",
+                "ts": approx_ms,
+                "content": "internal nearest"
+            }])
+            .to_string(),
+        )
+        .expect("internal body");
+        std::fs::write(
+            base.join("tasks")
+                .join(&legal_id)
+                .join("api_conversation_history.json"),
+            serde_json::json!([{
+                "role": "user",
+                "ts": approx_ms + 90_000,
+                "content": "legal second"
+            }])
+            .to_string(),
+        )
+        .expect("legal body");
+
+        registry
+            .register(
+                AgentType::Cline,
+                &internal_id,
+                InternalSessionPurpose::Title,
+            )
+            .await
+            .expect("register internal");
+        let (_, filter) = registry.shared_filter().await.expect("filter");
+        let parser = ClineParser::with_base_dir(base.to_path_buf());
+        let recovered =
+            super::try_recover_stale_session(&parser, AgentType::Cline, Some(cwd), approx, &filter)
+                .expect("legal second candidate must win after excluding the internal nearest");
+        assert_eq!(recovered.summary.id, legal_id);
+        assert_eq!(recovered.summary.title.as_deref(), Some("legal second"));
     }
 
     #[tokio::test]
