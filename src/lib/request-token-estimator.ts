@@ -1,3 +1,5 @@
+import { estimateTokens } from "@/lib/token-speed"
+import type { RequestUsageSample } from "@/lib/request-usage-speed"
 import type { AgentType, SessionConfigOptionInfo } from "@/lib/types"
 
 export type EstimatorProvider = "gpt" | "grok"
@@ -152,4 +154,224 @@ export function expandVisibleTokens(
   if (!Number.isFinite(expanded) || expanded <= 0) return null
   const rounded = Math.round(expanded)
   return rounded > 0 ? rounded : null
+}
+
+export interface SnapshotBaseline {
+  currentText: string
+  currentMeasurement: number
+  ownerEpoch: number | null
+  snapshotAtEpochStart: number
+  epochLocalContribution: number
+}
+
+export interface RequestTokenEstimatorState {
+  epoch: number
+  startedAt: number | null
+  visibleTokens: number
+  frozenProfile: FrozenReasoningProfile | null
+  baselines: ReadonlyMap<string, SnapshotBaseline>
+}
+
+export interface EstimatorObservation {
+  agentType: Extract<AgentType, "codex" | "grok">
+  configOptions: readonly SessionConfigOptionInfo[] | null | undefined
+  receivedAt: number
+}
+
+export interface EstimatorHydrationSeed {
+  planText: string
+  toolInputs: readonly (readonly [string, string])[]
+}
+
+export interface EstimatedRequestSettlement {
+  state: RequestTokenEstimatorState
+  sample: RequestUsageSample | null
+}
+
+export function createRequestTokenEstimator(): RequestTokenEstimatorState {
+  return {
+    epoch: 0,
+    startedAt: null,
+    visibleTokens: 0,
+    frozenProfile: null,
+    baselines: new Map(),
+  }
+}
+
+function addContribution(
+  state: RequestTokenEstimatorState,
+  contribution: number,
+  observation: EstimatorObservation
+): RequestTokenEstimatorState {
+  if (!Number.isFinite(contribution) || contribution === 0) return state
+  const nextVisible = Math.max(0, state.visibleTokens + contribution)
+  if (state.startedAt !== null) {
+    return { ...state, visibleTokens: nextVisible }
+  }
+  if (contribution < 0 || nextVisible <= 0) {
+    return { ...state, visibleTokens: nextVisible }
+  }
+  const profile = resolveReasoningProfile(
+    observation.agentType,
+    observation.configOptions
+  )
+  if (!profile) return state
+  return {
+    ...state,
+    startedAt: observation.receivedAt,
+    visibleTokens: nextVisible,
+    frozenProfile: profile,
+  }
+}
+
+export function observeEstimatedDelta(
+  state: RequestTokenEstimatorState,
+  text: string,
+  observation: EstimatorObservation
+): RequestTokenEstimatorState {
+  return addContribution(state, estimateTokens(text), observation)
+}
+
+export function observeEstimatedSnapshot(
+  state: RequestTokenEstimatorState,
+  key: string,
+  text: string,
+  observation: EstimatorObservation
+): RequestTokenEstimatorState {
+  const previous = state.baselines.get(key) ?? {
+    currentText: "",
+    currentMeasurement: 0,
+    ownerEpoch: null,
+    snapshotAtEpochStart: 0,
+    epochLocalContribution: 0,
+  }
+  if (text === previous.currentText) return state
+
+  const isAppend = text.startsWith(previous.currentText)
+  const currentMeasurement = isAppend
+    ? previous.currentMeasurement +
+      estimateTokens(text, previous.currentText.length)
+    : estimateTokens(text)
+  let snapshotAtEpochStart = previous.snapshotAtEpochStart
+  let epochLocalContribution = previous.epochLocalContribution
+
+  if (previous.ownerEpoch !== state.epoch) {
+    snapshotAtEpochStart = isAppend ? previous.currentMeasurement : 0
+    epochLocalContribution = isAppend
+      ? currentMeasurement - previous.currentMeasurement
+      : currentMeasurement
+  } else if (isAppend) {
+    epochLocalContribution += currentMeasurement - previous.currentMeasurement
+  } else {
+    epochLocalContribution = Math.max(
+      0,
+      currentMeasurement - snapshotAtEpochStart
+    )
+  }
+
+  const priorLocal =
+    previous.ownerEpoch === state.epoch ? previous.epochLocalContribution : 0
+  const baselines = new Map(state.baselines)
+  baselines.set(key, {
+    currentText: text,
+    currentMeasurement,
+    ownerEpoch: state.epoch,
+    snapshotAtEpochStart,
+    epochLocalContribution,
+  })
+  return addContribution(
+    { ...state, baselines },
+    epochLocalContribution - priorLocal,
+    observation
+  )
+}
+
+export function hasUnsettledEstimatedRequest(
+  state: RequestTokenEstimatorState
+): boolean {
+  return state.startedAt !== null
+}
+
+export function hasPositiveEstimatedOutput(
+  state: RequestTokenEstimatorState
+): boolean {
+  return hasUnsettledEstimatedRequest(state) && state.visibleTokens > 0
+}
+
+function advanceEpoch(
+  state: RequestTokenEstimatorState
+): RequestTokenEstimatorState {
+  const baselines = new Map<string, SnapshotBaseline>()
+  for (const [key, baseline] of state.baselines) {
+    baselines.set(key, {
+      ...baseline,
+      ownerEpoch: null,
+      snapshotAtEpochStart: 0,
+      epochLocalContribution: 0,
+    })
+  }
+  return {
+    epoch: state.epoch + 1,
+    startedAt: null,
+    visibleTokens: 0,
+    frozenProfile: null,
+    baselines,
+  }
+}
+
+export function discardEstimatedRequest(
+  state: RequestTokenEstimatorState
+): RequestTokenEstimatorState {
+  if (state.startedAt === null && state.visibleTokens === 0) return state
+  return advanceEpoch(state)
+}
+
+export function settleEstimatedRequest(
+  state: RequestTokenEstimatorState,
+  endedAt: number
+): EstimatedRequestSettlement {
+  if (state.startedAt === null) return { state, sample: null }
+  const nextState = advanceEpoch(state)
+  const durationMs = endedAt - state.startedAt
+  if (
+    !Number.isFinite(durationMs) ||
+    durationMs < 1 ||
+    state.visibleTokens <= 0 ||
+    !state.frozenProfile
+  ) {
+    return { state: nextState, sample: null }
+  }
+  const outputTokens = expandVisibleTokens(
+    state.visibleTokens,
+    state.frozenProfile.reasoningRatio
+  )
+  return {
+    state: nextState,
+    sample: outputTokens ? { outputTokens, durationMs, estimated: true } : null,
+  }
+}
+
+export function replaceEstimatorFromHydration(
+  state: RequestTokenEstimatorState,
+  seed: EstimatorHydrationSeed
+): RequestTokenEstimatorState {
+  const baselines = new Map<string, SnapshotBaseline>()
+  const addSeed = (key: string, text: string) => {
+    baselines.set(key, {
+      currentText: text,
+      currentMeasurement: estimateTokens(text),
+      ownerEpoch: null,
+      snapshotAtEpochStart: 0,
+      epochLocalContribution: 0,
+    })
+  }
+  addSeed("plan", seed.planText)
+  for (const [key, text] of seed.toolInputs) addSeed(key, text)
+  return {
+    epoch: state.epoch + 1,
+    startedAt: null,
+    visibleTokens: 0,
+    frozenProfile: null,
+    baselines,
+  }
 }
