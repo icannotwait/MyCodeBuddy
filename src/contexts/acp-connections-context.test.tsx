@@ -22,7 +22,10 @@ import type {
 import { parsePermissionToolCall } from "@/lib/permission-request"
 import { subscribeDesktopAcpEvents } from "@/lib/transport/desktop-acp-events"
 import { saveConfigPreference } from "@/lib/selector-prefs-storage"
-import { getPublishedRequestUsage } from "@/lib/request-usage-live"
+import {
+  getPublishedRequestUsage,
+  subscribeRequestUsage,
+} from "@/lib/request-usage-live"
 import {
   resetAppWorkspaceStore,
   useAppWorkspaceStore,
@@ -1132,6 +1135,39 @@ async function connectCodex(conversationId: number) {
 }
 
 describe("Codex estimated request usage", () => {
+  it("publishes one notification after committing an estimated sample", async () => {
+    const conversationId = 4_210
+    const handlers = await connectCodex(conversationId)
+    const committedSampleCounts: number[] = []
+    const unsubscribe = subscribeRequestUsage(() => {
+      committedSampleCounts.push(
+        h.store!.getConnection(TAB)?.requestUsage?.sampleCount ?? -1
+      )
+    })
+
+    try {
+      emitAcpEvent(handlers, {
+        seq: 2,
+        connection_id: "spawned-conn",
+        type: "content_delta",
+        text: "abcd",
+        received_at: 100,
+      })
+      emitAcpEvent(handlers, {
+        seq: 3,
+        connection_id: "spawned-conn",
+        type: "usage_update",
+        used: 10,
+        size: 100,
+        received_at: 1_100,
+      })
+    } finally {
+      unsubscribe()
+    }
+
+    expect(committedSampleCounts).toEqual([1])
+  })
+
   it("settles root output at a plain usage_update using ingest duration", async () => {
     const conversationId = 4_201
     const handlers = await connectCodex(conversationId)

@@ -1125,6 +1125,7 @@ interface PreparedConnectionFrame {
 }
 
 type ConnectionsMap = Map<string, ConnectionState>
+type ReducerEffect = () => void
 
 /** Test-only: counts outer-map clones from writableConnections. */
 let writableConnectionsCloneCount = 0
@@ -1867,7 +1868,8 @@ function recordOutOfTurnToolCall(
 function reduceSingleAction(
   state: ConnectionsMap,
   action: Exclude<Action, { type: "APPLY_EVENT_FRAME" }>,
-  mutateUnpublished = false
+  mutateUnpublished = false,
+  effects?: ReducerEffect[]
 ): ConnectionsMap {
   switch (action.type) {
     case "CONNECTION_CREATED": {
@@ -2483,7 +2485,9 @@ function reduceSingleAction(
         }
         updated.requestUsage = EMPTY_REQUEST_USAGE
         updated.generationClockStartedAt = null
-        publishRequestUsage(conn.conversationId, EMPTY_REQUEST_USAGE)
+        effects?.push(() =>
+          publishRequestUsage(conn.conversationId, EMPTY_REQUEST_USAGE)
+        )
         updated.pendingQuestion = null
         updated.claudeApiRetry = null
         updated.error = null
@@ -2914,7 +2918,8 @@ function reduceSingleAction(
             type: "TOOL_CALL_UPDATE",
             ...sub,
           },
-          mutateUnpublished
+          mutateUnpublished,
+          effects
         )
       }
       return current
@@ -3149,18 +3154,25 @@ function reduceSingleAction(
         ...conn,
         conversationId: action.conversationId,
       })
-      if (conn.conversationId != null && conn.conversationId !== 0) {
-        aliasRequestUsageIds(conn.conversationId, action.conversationId)
+      const previousConversationId = conn.conversationId
+      if (previousConversationId != null && previousConversationId !== 0) {
+        effects?.push(() =>
+          aliasRequestUsageIds(previousConversationId, action.conversationId)
+        )
       }
       const runtimeId = resolveRuntimeConversationIdForOwnership(
         action.conversationId
       )
       if (runtimeId != null && runtimeId !== action.conversationId) {
-        aliasRequestUsageIds(runtimeId, action.conversationId)
+        effects?.push(() =>
+          aliasRequestUsageIds(runtimeId, action.conversationId)
+        )
       }
-      publishRequestUsage(
-        action.conversationId,
-        conn.requestUsage ?? EMPTY_REQUEST_USAGE
+      effects?.push(() =>
+        publishRequestUsage(
+          action.conversationId,
+          conn.requestUsage ?? EMPTY_REQUEST_USAGE
+        )
       )
       return next
     }
@@ -3538,7 +3550,9 @@ function reduceSingleAction(
         generationClockStartedAt: null,
       })
       if (requestUsage !== currentRequestUsage) {
-        publishRequestUsage(conn.conversationId, requestUsage)
+        effects?.push(() =>
+          publishRequestUsage(conn.conversationId, requestUsage)
+        )
       }
       return next
     }
@@ -3580,7 +3594,9 @@ function reduceSingleAction(
         usage,
       })
       if (requestUsage !== currentRequestUsage) {
-        publishRequestUsage(conn.conversationId, requestUsage)
+        effects?.push(() =>
+          publishRequestUsage(conn.conversationId, requestUsage)
+        )
       }
       return next
     }
@@ -3592,7 +3608,8 @@ function reduceSingleAction(
 
 function connectionsReducer(
   state: ConnectionsMap,
-  action: Action
+  action: Action,
+  effects?: ReducerEffect[]
 ): ConnectionsMap {
   if (action.type === "APPLY_EVENT_FRAME") {
     const next = writableConnections(state, false)
@@ -3601,7 +3618,7 @@ function connectionsReducer(
       const beforeConn = next.get(frame.contextKey)
       if (!beforeConn) continue
       for (const item of frame.actions) {
-        reduceSingleAction(next, item, true)
+        reduceSingleAction(next, item, true, effects)
       }
       const reduced = next.get(frame.contextKey)
       if (reduced && frame.highestSeq > reduced.lastAppliedSeq) {
@@ -3614,7 +3631,7 @@ function connectionsReducer(
     }
     return changed ? next : state
   }
-  return reduceSingleAction(state, action, false)
+  return reduceSingleAction(state, action, false, effects)
 }
 
 /** @internal — for frame-action parity tests. */
@@ -5779,15 +5796,21 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         getPrepareEnv()
       )
       const previous = storeRef.current.connections
-      const next = connectionsReducer(previous, {
-        type: "APPLY_EVENT_FRAME",
-        frames: prepared.connections,
-      })
+      const reducerEffects: ReducerEffect[] = []
+      const next = connectionsReducer(
+        previous,
+        {
+          type: "APPLY_EVENT_FRAME",
+          frames: prepared.connections,
+        },
+        reducerEffects
+      )
       if (next !== previous) {
         storeRef.current.connections = next
         if (process.env.NODE_ENV === "test") {
           publishedConnectionMapsCount += 1
         }
+        for (const effect of reducerEffects) effect()
       }
       streamingPerfRecorder.markConnectionFrameCommitted(
         frame.deliveryIds,
@@ -5872,13 +5895,15 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         return
       }
       const prev = storeRef.current.connections
-      const next = connectionsReducer(prev, action)
+      const reducerEffects: ReducerEffect[] = []
+      const next = connectionsReducer(prev, action, reducerEffects)
       if (next === prev) return // no change
 
       storeRef.current.connections = next
       if (process.env.NODE_ENV === "test") {
         publishedConnectionMapsCount += 1
       }
+      for (const effect of reducerEffects) effect()
 
       const mirrorLiveMessage = (key: string) => {
         mirrorLiveMessageForCanonical(key, prev, next, [])
