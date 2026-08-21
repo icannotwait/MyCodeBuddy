@@ -883,9 +883,8 @@ function turnTextContent(turn: MessageTurn): string {
 
 /**
  * Last-round window: the persist snapshot has caught up to the overlay's
- * last user without needing equal clocks. Text/content match is the
- * primary proof; a sole user on both sides with persist user count
- * covering that one round is the fallback.
+ * last user without needing equal clocks. Only matching last-user text
+ * is proof — a sole overlay user plus any persist history is not.
  */
 function lastUsersCorrespond(
   localTurns: readonly MessageTurn[],
@@ -895,10 +894,7 @@ function lastUsersCorrespond(
 ): boolean {
   const localText = turnTextContent(localTurns[lastLocalUserIdx]!)
   const persistText = turnTextContent(persisted[lastPersistUserIdx]!)
-  if (localText.length > 0 && localText === persistText) return true
-  const localUserCount = localTurns.filter((t) => t.role === "user").length
-  const persistUserCount = persisted.filter((t) => t.role === "user").length
-  return localUserCount === 1 && persistUserCount >= 1
+  return localText.length > 0 && localText === persistText
 }
 
 /**
@@ -941,7 +937,11 @@ function retireCoveredLocalTurns(
     if (persistedIds.has(t.id)) return false
     const key = persistIdentityKey(t)
     if (key && persistedIdentity.has(key)) return false
-    return !(lastRoundCovered && i > lastLocalUserIdx && t.role === "assistant")
+    return !(
+      lastRoundCovered &&
+      ((i === lastLocalUserIdx && t.role === "user") ||
+        (i > lastLocalUserIdx && t.role === "assistant"))
+    )
   })
   return retained.length === localTurns.length ? localTurns : retained
 }

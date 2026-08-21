@@ -1124,9 +1124,23 @@ describe("owner overlay retirement without live-* persist ids", () => {
     expect(session.localTurns.some((t) => t.id === "live-42-latest")).toBe(
       false
     )
+    expect(session.localTurns.some((t) => t.id === "msg-latest")).toBe(false)
     expect(session.localTurns.some((t) => t.id === "live-42-earlier")).toBe(
       true
     )
+
+    const promptCopies = selectHistoricalTimelineTurns(
+      useConversationRuntimeStore.getState(),
+      CID
+    ).filter((entry) => {
+      const block = entry.turn.blocks[0]
+      return (
+        entry.turn.role === "user" &&
+        block?.type === "text" &&
+        block.text === "latest prompt"
+      )
+    })
+    expect(promptCopies).toHaveLength(1)
 
     const latestCopies = selectHistoricalTimelineTurns(
       useConversationRuntimeStore.getState(),
@@ -1141,5 +1155,30 @@ describe("owner overlay retirement without live-* persist ids", () => {
     })
     expect(latestCopies).toHaveLength(1)
     expect(latestCopies[0]?.turn.id).toBe("cursor-turn-0")
+  })
+
+  it("completeTurn against stale settled detail does not drop a new last assistant", () => {
+    const { actions } = useConversationRuntimeStore.getState()
+    const startedAt = Date.parse("2026-08-20T15:00:00.000Z")
+    seedRuntimeSession({
+      detail: detailWithTurns([
+        userTurn("u-old", "old prompt", "2026-08-20T11:00:00.000Z"),
+        assistantTurn("a-old", "old reply", "2026-08-20T11:00:01.000Z"),
+      ]),
+      localTurns: [
+        userTurn("optimistic-new", "new prompt", "2026-08-20T15:00:00.000Z"),
+      ],
+      liveOwnsActiveTurn: false,
+      syncState: "awaiting_persist",
+    })
+
+    const fresh = liveMessage("fresh", "fresh reply", startedAt)
+    actions.completeTurn(CID, fresh)
+
+    const local =
+      useConversationRuntimeStore.getState().byConversationId.get(CID)
+        ?.localTurns ?? []
+    expect(local.some((t) => t.id === `live-${CID}-fresh`)).toBe(true)
+    expect(local.some((t) => t.id === "optimistic-new")).toBe(true)
   })
 })
