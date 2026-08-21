@@ -51,6 +51,10 @@ GITHUB_SECRETS.md
 # Local linked worktrees
 .worktrees/
 
+# Local task/runtime artifacts (WSL disks, unpack trees)
+.task-runtimes/
+.runclave-unpack/
+
 # Local accelerated tauri build stamps / config override
 .codeg-build-cache/
 
