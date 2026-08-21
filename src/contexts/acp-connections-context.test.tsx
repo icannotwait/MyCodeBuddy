@@ -26,6 +26,8 @@ import {
   getPublishedRequestUsage,
   subscribeRequestUsage,
 } from "@/lib/request-usage-live"
+import { EMPTY_REQUEST_USAGE } from "@/lib/request-usage-speed"
+import type { SnapshotPatch } from "@/lib/snapshot-denormalize"
 import {
   resetAppWorkspaceStore,
   useAppWorkspaceStore,
@@ -289,6 +291,44 @@ function sharedResponse(
     disposition: "created" as const,
     phase: "ready" as const,
     eventSeq: 0,
+    ...overrides,
+  }
+}
+
+function estimatorSnapshotPatch(
+  overrides: Partial<SnapshotPatch> = {}
+): SnapshotPatch {
+  return {
+    connectionId: "spawned-conn",
+    conversationId: 4_300,
+    status: "prompting",
+    sessionId: "codex-session",
+    modes: null,
+    configOptions: null,
+    availableCommands: null,
+    usage: null,
+    liveMessage: null,
+    pendingPermission: null,
+    pendingAskQuestion: null,
+    pendingPlanApproval: null,
+    pendingUserMessage: null,
+    promptCapabilities: null,
+    selectorsReady: false,
+    supportsFork: false,
+    configStale: false,
+    configStaleKind: null,
+    backgroundOutstanding: 0,
+    sessionFailures: [],
+    lastError: null,
+    lastErrorDetails: null,
+    eventSeq: 1,
+    activeDelegations: [],
+    delegationRoute: null,
+    waitingForSubagents: null,
+    toolWatchdogProjections: {},
+    toolWatchdogMaxVersions: {},
+    lastToolWatchdogDiagnostic: null,
+    sharedSession: null,
     ...overrides,
   }
 }
@@ -1565,6 +1605,219 @@ describe("Codex estimated request usage", () => {
       generationMs: 2_000,
       estimatedSampleCount: 2,
     })
+  })
+})
+
+describe("request estimator hydration", () => {
+  it("preserves active state for a stale snapshot", async () => {
+    const conversationId = 4_301
+    const handlers = await connectCodex(conversationId)
+    emitAcpEvent(handlers, {
+      seq: 2,
+      connection_id: "spawned-conn",
+      type: "content_delta",
+      text: "abcd",
+      received_at: 100,
+    })
+
+    h.denormalizeSnapshot.mockReturnValue(
+      estimatorSnapshotPatch({ eventSeq: 1, conversationId })
+    )
+    hydrateSnapshot(handlers, {
+      event_seq: 1,
+    } as unknown as LiveSessionSnapshot)
+    emitAcpEvent(handlers, {
+      seq: 3,
+      connection_id: "spawned-conn",
+      type: "usage_update",
+      used: 1,
+      size: 100,
+      received_at: 1_100,
+    })
+
+    expect(getPublishedRequestUsage(conversationId).sampleCount).toBe(1)
+  })
+
+  it("accepted hydration clears the ledger and seeds unchanged plan/tool input", async () => {
+    const conversationId = 4_302
+    const handlers = await connectCodex(conversationId)
+    emitAcpEvent(handlers, {
+      seq: 2,
+      connection_id: "spawned-conn",
+      type: "content_delta",
+      text: "abcd",
+      received_at: 100,
+    })
+    emitAcpEvent(handlers, {
+      seq: 3,
+      connection_id: "spawned-conn",
+      type: "usage_update",
+      used: 1,
+      size: 100,
+      received_at: 1_100,
+    })
+    expect(getPublishedRequestUsage(conversationId).estimatedSampleCount).toBe(
+      1
+    )
+
+    h.denormalizeSnapshot.mockReturnValue(
+      estimatorSnapshotPatch({
+        eventSeq: 4,
+        conversationId,
+        liveMessage: {
+          id: "hydrated-live",
+          role: "assistant",
+          startedAt: Date.now(),
+          content: [
+            {
+              type: "plan",
+              entries: [
+                {
+                  content: "seeded plan",
+                  priority: "medium",
+                  status: "pending",
+                },
+              ],
+            },
+            {
+              type: "tool_call",
+              info: {
+                tool_call_id: "seeded-tool",
+                title: "terminal",
+                kind: "execute",
+                status: "pending",
+                content: null,
+                raw_input: "seeded args",
+                raw_output_chunks: [],
+                raw_output_total_bytes: 0,
+                locations: null,
+                meta: null,
+                images: [],
+              },
+            },
+          ],
+        },
+      })
+    )
+    hydrateSnapshot(handlers, {
+      event_seq: 4,
+    } as unknown as LiveSessionSnapshot)
+
+    expect(getPublishedRequestUsage(conversationId)).toEqual(
+      EMPTY_REQUEST_USAGE
+    )
+
+    emitAcpEvent(handlers, {
+      seq: 5,
+      connection_id: "spawned-conn",
+      type: "tool_call_update",
+      tool_call_id: "seeded-tool",
+      title: null,
+      status: "in_progress",
+      content: null,
+      raw_input: "seeded args",
+      raw_input_is_model_authored: true,
+      raw_output: null,
+      received_at: 2_000,
+    })
+    emitAcpEvent(handlers, {
+      seq: 6,
+      connection_id: "spawned-conn",
+      type: "usage_update",
+      used: 2,
+      size: 100,
+      received_at: 3_000,
+    })
+    expect(getPublishedRequestUsage(conversationId).sampleCount).toBe(0)
+
+    emitAcpEvent(handlers, {
+      seq: 7,
+      connection_id: "spawned-conn",
+      type: "tool_call_update",
+      tool_call_id: "seeded-tool",
+      title: null,
+      status: "in_progress",
+      content: null,
+      raw_input: "seeded args plus new model text",
+      raw_input_is_model_authored: true,
+      raw_output: null,
+      received_at: 4_000,
+    })
+    emitAcpEvent(handlers, {
+      seq: 8,
+      connection_id: "spawned-conn",
+      type: "usage_update",
+      used: 3,
+      size: 100,
+      received_at: 5_000,
+    })
+    expect(getPublishedRequestUsage(conversationId)).toMatchObject({
+      sampleCount: 1,
+      estimatedSampleCount: 1,
+    })
+  })
+
+  it.each([
+    { type: "turn_attempt_rollback" as const, attempt: 1 },
+    { type: "status_changed" as const, status: "connected" as const },
+  ])("discards unsettled output on $type", async (resetEvent) => {
+    const conversationId =
+      resetEvent.type === "turn_attempt_rollback" ? 4_303 : 4_304
+    const handlers = await connectCodex(conversationId)
+    emitAcpEvent(handlers, {
+      seq: 2,
+      connection_id: "spawned-conn",
+      type: "content_delta",
+      text: "unsettled output",
+      received_at: 100,
+    })
+    emitAcpEvent(handlers, {
+      seq: 3,
+      connection_id: "spawned-conn",
+      received_at: 200,
+      ...resetEvent,
+    })
+    emitAcpEvent(handlers, {
+      seq: 4,
+      connection_id: "spawned-conn",
+      type: "usage_update",
+      used: 1,
+      size: 100,
+      received_at: 1_100,
+    })
+
+    expect(getPublishedRequestUsage(conversationId).sampleCount).toBe(0)
+  })
+
+  it("new prompting state clears the prior ledger and active request", async () => {
+    const conversationId = 4_305
+    const handlers = await connectCodex(conversationId)
+    emitAcpEvent(handlers, {
+      seq: 2,
+      connection_id: "spawned-conn",
+      type: "content_delta",
+      text: "abcd",
+      received_at: 100,
+    })
+    emitAcpEvent(handlers, {
+      seq: 3,
+      connection_id: "spawned-conn",
+      type: "usage_update",
+      used: 1,
+      size: 100,
+      received_at: 1_100,
+    })
+    emitAcpEvent(handlers, {
+      seq: 4,
+      connection_id: "spawned-conn",
+      type: "status_changed",
+      status: "prompting",
+      received_at: 2_000,
+    })
+
+    expect(getPublishedRequestUsage(conversationId)).toEqual(
+      EMPTY_REQUEST_USAGE
+    )
   })
 })
 

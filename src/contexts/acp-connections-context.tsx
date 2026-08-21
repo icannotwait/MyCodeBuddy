@@ -38,7 +38,9 @@ import {
   hasUnsettledEstimatedRequest,
   observeEstimatedDelta,
   observeEstimatedSnapshot,
+  replaceEstimatorFromHydration,
   settleEstimatedRequest,
+  type EstimatorHydrationSeed,
   type EstimatorObservation,
   type RequestTokenEstimatorState,
 } from "@/lib/request-token-estimator"
@@ -1641,6 +1643,22 @@ function estimatorFor(conn: ConnectionState): RequestTokenEstimatorState {
   return conn.requestEstimator ?? createRequestTokenEstimator()
 }
 
+function estimatorHydrationSeed(
+  liveMessage: LiveMessage | null
+): EstimatorHydrationSeed {
+  const planEntries: string[] = []
+  const toolInputs: Array<readonly [string, string]> = []
+  for (const block of liveMessage?.content ?? []) {
+    if (block.type === "plan") {
+      for (const entry of block.entries) planEntries.push(entry.content)
+    }
+    if (block.type === "tool_call" && block.info.raw_input != null) {
+      toolInputs.push([`tool:${block.info.tool_call_id}`, block.info.raw_input])
+    }
+  }
+  return { planText: planEntries.join("\n"), toolInputs }
+}
+
 function estimatorObservation(
   conn: ConnectionState,
   receivedAt: number
@@ -2285,6 +2303,10 @@ function reduceSingleAction(
         action.patch.pendingPermission,
         hydratedLiveMessage ?? current.liveMessage
       )
+      const hydratedRequestEstimator = replaceEstimatorFromHydration(
+        estimatorFor(current),
+        estimatorHydrationSeed(hydratedLiveMessage)
+      )
       const next = writableConnections(state, mutateUnpublished)
       next.set(action.contextKey, {
         ...current,
@@ -2294,6 +2316,9 @@ function reduceSingleAction(
         configOptions: action.patch.configOptions,
         availableCommands: action.patch.availableCommands,
         usage: action.patch.usage,
+        requestEstimator: hydratedRequestEstimator,
+        requestUsage: EMPTY_REQUEST_USAGE,
+        generationClockStartedAt: null,
         liveMessage: hydratedLiveMessage,
         pendingPermission: hydratedPendingPermission,
         pendingAskQuestion: action.patch.pendingAskQuestion,
@@ -2363,6 +2388,9 @@ function reduceSingleAction(
         lastAppliedSeq: action.patch.eventSeq,
         sharedSession: mergedSharedSession,
       })
+      effects?.push(() =>
+        publishRequestUsage(mergedConversationId, EMPTY_REQUEST_USAGE)
+      )
       return next
     }
 
@@ -2483,6 +2511,7 @@ function reduceSingleAction(
           content: [],
           startedAt: Date.now(),
         }
+        updated.requestEstimator = createRequestTokenEstimator()
         updated.requestUsage = EMPTY_REQUEST_USAGE
         updated.generationClockStartedAt = null
         effects?.push(() =>
@@ -2502,6 +2531,8 @@ function reduceSingleAction(
         // background permission enrichment) are stale for the new turn.
         updated.outOfTurnToolCalls = null
       } else if (conn.status === "prompting") {
+        updated.requestEstimator = discardEstimatedRequest(estimatorFor(conn))
+        updated.generationClockStartedAt = null
         // Prompt cycle ended: clear in-flight Claude API retry banner.
         updated.claudeApiRetry = null
         // AIR failures deliberately NOT settled here: leaving `prompting`
@@ -2575,12 +2606,20 @@ function reduceSingleAction(
       if (!conn || conn.status !== "prompting" || !conn.liveMessage) {
         return state
       }
+      const currentEstimator = estimatorFor(conn)
+      const requestEstimator = discardEstimatedRequest(currentEstimator)
       const liveMessage = rollbackLiveMessageAttempt(conn.liveMessage)
-      if (liveMessage === conn.liveMessage) return state
+      if (
+        liveMessage === conn.liveMessage &&
+        requestEstimator === currentEstimator
+      ) {
+        return state
+      }
       const next = writableConnections(state, mutateUnpublished)
       next.set(action.contextKey, {
         ...conn,
         liveMessage,
+        requestEstimator,
         generationClockStartedAt: null,
       })
       return next
@@ -6461,10 +6500,12 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             patch.eventSeq
           )
           // Feed cursor back so a queued batch drops old events.
-          eventIngestorRef.current?.resumeConnection(
-            connectionId,
-            patch.eventSeq
-          )
+          const applied = storeRef.current.connections.get(contextKey)
+          const resumeSeq =
+            applied?.connectionId === connectionId
+              ? applied.lastAppliedSeq
+              : patch.eventSeq
+          eventIngestorRef.current?.resumeConnection(connectionId, resumeSeq)
         },
         onReplay: (events) => {
           pushMappedEvents(contextKey, events, true)
