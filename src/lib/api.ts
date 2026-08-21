@@ -843,8 +843,8 @@ export async function acpUpdateAgentConfig(
      * /compact) — ordinary turns carry the composer preset's policy instead. */
     codex_sandbox?: CodexSandboxStructuredConfig | null
     grok_config_toml?: string | null
-    /** Grok structured controls (mode / reasoning effort); merged onto the
-     * on-disk config.toml server-side. */
+    /** Grok structured controls (mode, model, endpoints, and compaction);
+     * merged onto the on-disk config.toml server-side. */
     grok_structured?: GrokStructuredConfig | null
     /** Raw ~/.cursor/cli-config.json text (advanced editor; whole file). */
     cursor_cli_config_json?: string | null

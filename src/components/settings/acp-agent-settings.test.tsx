@@ -97,6 +97,7 @@ const grokDraft = (
   grokCustomApiBackend: "responses",
   grokCustomContextWindow: "",
   grokAutoCompactThreshold: "",
+  grokCliChatProxyBaseUrl: "",
   ...overrides,
 })
 // The custom-model group when no model id is set (all removed / null).
@@ -107,6 +108,7 @@ const emptyCustoms = {
   customApiBackend: null,
   customContextWindow: null,
   autoCompactThresholdPercent: null,
+  cliChatProxyBaseUrl: null,
 }
 
 describe("Codex CLI runtime env toggle", () => {
@@ -415,6 +417,7 @@ describe("buildGrokStructuredConfig — Grok panel save payload", () => {
       customApiBackend: "chat_completions",
       customContextWindow: 131072,
       autoCompactThresholdPercent: 80,
+      cliChatProxyBaseUrl: null,
     })
   })
 
@@ -458,6 +461,7 @@ describe("buildGrokStructuredConfig — Grok panel save payload", () => {
       customApiBackend: "responses",
       customContextWindow: null,
       autoCompactThresholdPercent: 100,
+      cliChatProxyBaseUrl: null,
     })
   })
 
@@ -488,6 +492,42 @@ describe("buildGrokStructuredConfig — Grok panel save payload", () => {
         ...emptyCustoms,
       })
     }
+  })
+
+  // CLI chat proxy is `[endpoints].cli_chat_proxy_base_url`, not a
+  // `[model.<id>]` key — it still writes when no custom model is set.
+  it("writes cli chat proxy without a model id", () => {
+    expect(
+      buildGrokStructuredConfig(
+        grokDraft({
+          grokCliChatProxyBaseUrl: "  https://grok-proxy.acme.com/v1  ",
+        })
+      )
+    ).toEqual({
+      permissionMode: null,
+      defaultReasoningEffort: null,
+      ...emptyCustoms,
+      cliChatProxyBaseUrl: "https://grok-proxy.acme.com/v1",
+    })
+  })
+
+  // Switching away from the custom auth method must not drop a configured
+  // CLI proxy: the endpoints key is independent of the managed model block.
+  it("keeps cli chat proxy when the auth method isn't custom", () => {
+    expect(
+      buildGrokStructuredConfig(
+        grokDraft({
+          grokAuthMode: "subscription",
+          grokCustomModelId: "my-grok",
+          grokCliChatProxyBaseUrl: "https://grok-proxy.acme.com/v1",
+        })
+      )
+    ).toEqual({
+      permissionMode: null,
+      defaultReasoningEffort: null,
+      ...emptyCustoms,
+      cliChatProxyBaseUrl: "https://grok-proxy.acme.com/v1",
+    })
   })
 })
 

@@ -3775,6 +3775,9 @@ export interface GrokSettings {
   custom_context_window: number | null
   /** [session].auto_compact_threshold_percent — 0–100 (Grok default 85). */
   auto_compact_threshold_percent: number | null
+  /** [endpoints].cli_chat_proxy_base_url — Grok CLI chat-proxy (default
+   * https://cli-chat-proxy.grok.com/v1). Independent of [model.<id>]. */
+  cli_chat_proxy_base_url: string | null
 }
 
 /** Structured-control values the Grok settings panel sends on save. Each
@@ -3791,6 +3794,8 @@ export interface GrokStructuredConfig {
   customApiBackend: string | null
   customContextWindow: number | null
   autoCompactThresholdPercent: number | null
+  /** [endpoints].cli_chat_proxy_base_url. Empty/null removes the key. */
+  cliChatProxyBaseUrl: string | null
 }
 
 /** Parsed keys from ~/.cursor/cli-config.json (shared with the Cursor CLI's

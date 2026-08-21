@@ -3705,6 +3705,7 @@ fn parse_grok_settings(raw_toml: &str) -> GrokSettings {
         custom_api_backend,
         custom_context_window,
         auto_compact_threshold_percent,
+        cli_chat_proxy_base_url: get("endpoints", "cli_chat_proxy_base_url"),
     }
 }
 
@@ -3782,8 +3783,9 @@ pub(crate) fn codex_launch_initial_agent_mode() -> Option<String> {
 }
 
 /// Merge the Grok panel's structured control values into the raw config.toml
-/// text, format-preservingly (comments/layout of unmanaged keys are kept). Each
-/// `Some(value)` sets its documented key; each `None` removes it. Returns the
+/// text, format-preservingly (comments/layout of unmanaged keys are kept). Most
+/// fields use snapshot semantics (`Some` sets, `None` removes); the CLI proxy
+/// uses absent/null patch semantics for older-client compatibility. Returns the
 /// new TOML text (still validated on the way to disk by
 /// `persist_grok_native_config_files`).
 fn apply_grok_structured_config(
@@ -3806,6 +3808,18 @@ fn apply_grok_structured_config(
         settings.default_reasoning_effort.as_deref(),
     )?;
     apply_grok_custom_model(&mut doc, settings)?;
+    // `[endpoints].cli_chat_proxy_base_url` — global CLI chat-proxy, independent
+    // of the managed `[model.<id>]` block. An omitted wire field leaves the key
+    // untouched for older clients; explicit null/blank removes it so Grok falls
+    // back to https://cli-chat-proxy.grok.com/v1.
+    if let Some(value) = settings.cli_chat_proxy_base_url.as_ref() {
+        set_or_remove_grok_key(
+            &mut doc,
+            "endpoints",
+            "cli_chat_proxy_base_url",
+            trimmed_opt(value.as_deref()),
+        )?;
+    }
     // `[session].auto_compact_threshold_percent` — clamp to the documented 0–100
     // range so an out-of-band value can never write an invalid config.
     set_or_remove_grok_number(
@@ -12916,6 +12930,86 @@ mod tests {
         let base = "[models]\ndefault = \"grok-4.5\"\n";
         let merged = apply_grok_structured_config(base, &GrokStructuredConfig::default()).unwrap();
         assert!(merged.contains("default = \"grok-4.5\""));
+    }
+
+    #[test]
+    fn parse_grok_settings_reads_cli_chat_proxy_base_url() {
+        let toml = "[endpoints]\ncli_chat_proxy_base_url = \"https://grok-proxy.acme.com/v1\"\n";
+        let s = parse_grok_settings(toml);
+        assert_eq!(
+            s.cli_chat_proxy_base_url.as_deref(),
+            Some("https://grok-proxy.acme.com/v1")
+        );
+    }
+
+    #[test]
+    fn apply_grok_cli_chat_proxy_distinguishes_omitted_from_explicit_null() {
+        let base = "[endpoints]\ncli_chat_proxy_base_url = \"https://old/v1\"\n";
+
+        let omitted: GrokStructuredConfig = serde_json::from_str("{}").unwrap();
+        let preserved = apply_grok_structured_config(base, &omitted).unwrap();
+        assert_eq!(
+            parse_grok_settings(&preserved)
+                .cli_chat_proxy_base_url
+                .as_deref(),
+            Some("https://old/v1"),
+            "an older or partial payload must leave the endpoint untouched"
+        );
+
+        let explicit_null: GrokStructuredConfig =
+            serde_json::from_str(r#"{"cliChatProxyBaseUrl":null}"#).unwrap();
+        let removed = apply_grok_structured_config(base, &explicit_null).unwrap();
+        assert!(
+            parse_grok_settings(&removed)
+                .cli_chat_proxy_base_url
+                .is_none(),
+            "the current UI's explicit null must remove the endpoint"
+        );
+    }
+
+    #[test]
+    fn apply_grok_cli_chat_proxy_round_trips_independently_of_custom_model() {
+        let merged = apply_grok_structured_config(
+            "",
+            &GrokStructuredConfig {
+                cli_chat_proxy_base_url: Some(Some("https://grok-proxy.acme.com/v1".into())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(merged.contains("[endpoints]"));
+        assert!(merged.contains("cli_chat_proxy_base_url = \"https://grok-proxy.acme.com/v1\""));
+        let back = parse_grok_settings(&merged);
+        assert_eq!(
+            back.cli_chat_proxy_base_url.as_deref(),
+            Some("https://grok-proxy.acme.com/v1")
+        );
+        assert!(back.custom_model_id.is_none());
+    }
+
+    #[test]
+    fn apply_grok_cli_chat_proxy_empty_omits_key_and_keeps_sibling() {
+        let base = "[endpoints]\ncli_chat_proxy_base_url = \"https://old/v1\"\n\
+                    models_base_url = \"https://keep/v1\"\n";
+        let merged = apply_grok_structured_config(
+            base,
+            &GrokStructuredConfig {
+                cli_chat_proxy_base_url: Some(Some("   ".into())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            !merged.contains("cli_chat_proxy_base_url"),
+            "empty cli proxy must omit the key"
+        );
+        assert!(
+            merged.contains("models_base_url = \"https://keep/v1\""),
+            "unmanaged [endpoints] sibling must be preserved"
+        );
+        assert!(parse_grok_settings(&merged)
+            .cli_chat_proxy_base_url
+            .is_none());
     }
 
     #[test]

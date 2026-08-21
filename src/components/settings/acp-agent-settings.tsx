@@ -254,6 +254,7 @@ interface AgentDraft {
   grokCustomApiBackend: string
   grokCustomContextWindow: string
   grokAutoCompactThreshold: string
+  grokCliChatProxyBaseUrl: string
   openCodeAuthJsonText: string
   clineProvider: ClineProvider
   clineApiKey: string
@@ -2978,11 +2979,12 @@ export function buildGrokStructuredConfig(draft: {
   grokCustomApiBackend: string
   grokCustomContextWindow: string
   grokAutoCompactThreshold: string
+  grokCliChatProxyBaseUrl: string
 }): GrokStructuredConfig {
   // The custom-model group applies only in the `custom` auth method; the
   // subscription / api_key methods omit the codeg-managed [model.<id>] block
-  // (an empty id → the backend removes it). Permission mode, reasoning effort
-  // and compaction below stay independent of the auth method.
+  // (an empty id → the backend removes it). Permission mode, reasoning effort,
+  // compaction, and CLI chat proxy stay independent of the auth method.
   const modelId =
     draft.grokAuthMode === "custom" ? draft.grokCustomModelId.trim() : ""
   const positiveInt = (raw: string): number | null => {
@@ -3012,6 +3014,10 @@ export function buildGrokStructuredConfig(draft: {
       : null,
     // Compaction is session-global, independent of the custom model.
     autoCompactThresholdPercent: percent(draft.grokAutoCompactThreshold),
+    // CLI chat proxy is `[endpoints].cli_chat_proxy_base_url`, not a
+    // `[model.<id>]` key — it writes even without a model id, and is not
+    // dropped when the auth method isn't custom.
+    cliChatProxyBaseUrl: draft.grokCliChatProxyBaseUrl.trim() || null,
   }
 }
 
@@ -3034,6 +3040,7 @@ export function buildGrokSaveOptions(
     grokCustomApiBackend: string
     grokCustomContextWindow: string
     grokAutoCompactThreshold: string
+    grokCliChatProxyBaseUrl: string
     grokConfigTomlText: string
   },
   agentGrokConfigToml: string | null
@@ -3527,6 +3534,7 @@ function buildAgentDraft(agent: AcpAgentInfo): AgentDraft {
       agent.grok_settings?.auto_compact_threshold_percent != null
         ? String(agent.grok_settings.auto_compact_threshold_percent)
         : "",
+    grokCliChatProxyBaseUrl: agent.grok_settings?.cli_chat_proxy_base_url ?? "",
     openCodeAuthJsonText,
     clineProvider: clineImportant.provider,
     clineApiKey: clineImportant.apiKey,
@@ -4584,6 +4592,8 @@ export function AcpAgentSettings() {
                           options.grokStructured.customContextWindow,
                         auto_compact_threshold_percent:
                           options.grokStructured.autoCompactThresholdPercent,
+                        cli_chat_proxy_base_url:
+                          options.grokStructured.cliChatProxyBaseUrl,
                       }
                     : agent.grok_settings,
                 }
@@ -10528,6 +10538,31 @@ supports_websockets = true`}
                               </SelectContent>
                             </Select>
                           </div>
+                        </div>
+
+                        <div className="space-y-1.5">
+                          <label className="text-[11px] text-muted-foreground">
+                            {t("grok.customCliProxyBaseUrlLabel")}
+                          </label>
+                          <Input
+                            value={selectedDraft.grokCliChatProxyBaseUrl}
+                            onChange={(event) =>
+                              updateSelectedDraft((current) => ({
+                                ...current,
+                                grokCliChatProxyBaseUrl: event.target.value,
+                              }))
+                            }
+                            placeholder={t(
+                              "grok.customCliProxyBaseUrlPlaceholder"
+                            )}
+                            aria-label={t("grok.customCliProxyBaseUrlLabel")}
+                            autoComplete="off"
+                            spellCheck={false}
+                            disabled={grokSaving}
+                          />
+                          <p className="text-[11px] text-muted-foreground">
+                            {t("grok.customCliProxyBaseUrlHint")}
+                          </p>
                         </div>
 
                         <div className="space-y-1.5">

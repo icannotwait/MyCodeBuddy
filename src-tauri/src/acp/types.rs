@@ -1125,10 +1125,15 @@ pub struct GrokSettings {
     /// `[session].auto_compact_threshold_percent` — auto-compact trigger, 0–100
     /// (Grok's default is 85).
     pub auto_compact_threshold_percent: Option<i64>,
+    /// `[endpoints].cli_chat_proxy_base_url` — Grok CLI chat-proxy (default
+    /// `https://cli-chat-proxy.grok.com/v1`). Independent of the managed
+    /// `[model.<id>]` block. `None` ⇒ Grok's official cli-chat-proxy.
+    pub cli_chat_proxy_base_url: Option<String>,
 }
 
-/// The structured-control values the Grok settings panel sends on save. Each
-/// `Some(value)` sets the corresponding key; each `None` removes it. Merged
+/// The structured-control values the Grok settings panel sends on save. Except
+/// for the compatibility-safe CLI proxy patch documented below, each
+/// `Some(value)` sets the corresponding key and each `None` removes it. Merged
 /// (format-preserving, via `toml_edit`) onto the current on-disk config.toml so
 /// unmanaged keys/comments are preserved. camelCase on the wire to match the
 /// enclosing request body (`AcpUpdateAgentConfigParams`).
@@ -1137,7 +1142,10 @@ pub struct GrokSettings {
 /// (or renames to) `[model.<id>]` + `[models].default = "<id>"`; an empty/`None`
 /// id removes the codeg-managed block and its default. Within an active model,
 /// each empty sub-field omits its key (e.g. empty `custom_base_url` ⇒ Grok falls
-/// back to the official endpoint).
+/// back to the official endpoint). `cli_chat_proxy_base_url` is independent of
+/// that group and uses patch semantics for compatibility with older clients:
+/// absent leaves `[endpoints].cli_chat_proxy_base_url` untouched, explicit null
+/// removes it, and a string sets it.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GrokStructuredConfig {
@@ -1149,6 +1157,8 @@ pub struct GrokStructuredConfig {
     pub custom_api_backend: Option<String>,
     pub custom_context_window: Option<i64>,
     pub auto_compact_threshold_percent: Option<i64>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub cli_chat_proxy_base_url: Option<Option<String>>,
 }
 
 /// The subset of `~/.cursor/cli-config.json` surfaced as structured controls
