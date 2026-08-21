@@ -541,6 +541,7 @@ type Action =
       conversationId: number
       turns: MessageTurn[]
       watermark: number
+      transcriptReset: boolean
     }
   | {
       // An async sub-agent settled: flip its launch card in-memory by rewriting
@@ -2503,17 +2504,18 @@ function reducer(
     }
 
     case "APPLY_BACKGROUND_ACTIVITY": {
-      if (action.turns.length === 0) return state
+      if (action.turns.length === 0 && !action.transcriptReset) return state
       // `updateSessionInState` materializes an empty session when the
       // conversation isn't loaded here yet — the overlay survives until the
       // tab opens and the cold detail fetch reconciles it away (its watermark
       // rule), so a completion landing on a closed tab isn't lost.
       return updateSessionInState(state, action.conversationId, (current) => {
         const indexById = new Map<string, number>()
-        current.backgroundTurns.forEach((entry, i) =>
-          indexById.set(entry.turn.id, i)
-        )
-        const next = current.backgroundTurns.slice()
+        const currentEntries = action.transcriptReset
+          ? []
+          : current.backgroundTurns
+        currentEntries.forEach((entry, i) => indexById.set(entry.turn.id, i))
+        const next = currentEntries.slice()
         for (const turn of action.turns) {
           const entry: BackgroundOverlayEntry = {
             turn,
@@ -3401,8 +3403,9 @@ export interface RuntimeActions {
   applyBackgroundActivity: (
     conversationId: number,
     turns: MessageTurn[],
-    watermark: number
-  ) => void
+    watermark: number,
+    transcriptReset?: boolean
+  ) => boolean
   resolveBackgroundTask: (
     conversationId: number,
     settlement: PendingBackgroundSettlement
@@ -5785,13 +5788,27 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
         bumpCancelGeneration(conversationId)
       }
     },
-    applyBackgroundActivity: (conversationId, turns, watermark) =>
+    applyBackgroundActivity: (
+      conversationId,
+      turns,
+      watermark,
+      transcriptReset = false
+    ) => {
+      const currentEntries = transcriptReset
+        ? []
+        : (get().byConversationId.get(conversationId)?.backgroundTurns ?? [])
+      const ids = new Set(currentEntries.map((entry) => entry.turn.id))
+      for (const turn of turns) ids.add(turn.id)
+      const evicted = ids.size > BACKGROUND_OVERLAY_HARD_CAP
       dispatch({
         type: "APPLY_BACKGROUND_ACTIVITY",
         conversationId,
         turns,
         watermark,
-      }),
+        transcriptReset,
+      })
+      return evicted
+    },
     resolveBackgroundTask: (conversationId, settlement) =>
       dispatch({
         type: "RESOLVE_BACKGROUND_TASK",

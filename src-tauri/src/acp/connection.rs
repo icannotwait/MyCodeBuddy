@@ -13787,6 +13787,7 @@ async fn flush_grok_autonomous(
             settled: batch.settled,
             watermark: batch.watermark,
             detail_refetch: refetch,
+            transcript_reset: batch.transcript_reset,
         },
     )
     .await;
@@ -13842,6 +13843,7 @@ async fn flush_codex_autonomous(
             settled: batch.settled,
             watermark: batch.watermark,
             detail_refetch: refetch,
+            transcript_reset: false,
         },
     )
     .await;

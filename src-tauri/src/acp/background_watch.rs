@@ -766,6 +766,7 @@ impl WatchState {
             settled,
             watermark: self.committed,
             detail_refetch: false,
+            transcript_reset: false,
         })
     }
 

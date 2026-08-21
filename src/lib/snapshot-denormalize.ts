@@ -121,6 +121,10 @@ export interface SnapshotPatch {
    *  the one-shot `background_activity` events won't replay. `0` when the
    *  server omitted the field. */
   backgroundOutstanding: number
+  /** Snapshot recovery cue for background detail omitted from event replay. */
+  backgroundDetailRevision: number
+  /** Authoritative transcript byte-space generation for overlay invalidation. */
+  backgroundTranscriptGeneration: number
   /** AIR typed session failure table carried by the snapshot — resolved
    *  entries and their revision watermarks included. MERGED into the in-memory
    *  table by the monotonic per-id rule (`mergeSessionFailures`) on BOTH
@@ -231,6 +235,8 @@ export function denormalizeSnapshot(wire: LiveSessionSnapshot): SnapshotPatch {
     configStale: wire.config_stale ?? false,
     configStaleKind: wire.config_stale_kind ?? null,
     backgroundOutstanding: wire.background_outstanding ?? 0,
+    backgroundDetailRevision: wire.background_detail_revision ?? 0,
+    backgroundTranscriptGeneration: wire.background_transcript_generation ?? 0,
     sessionFailures: wire.session_failures ?? [],
     lastError,
     lastErrorDetails,

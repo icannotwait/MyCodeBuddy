@@ -386,6 +386,8 @@ pub(crate) fn grok_autonomous_turn_from_segment(
     base_offset: u64,
     trigger_start: u64,
     task_ids: &[String],
+    candidate_task_ids: &[String],
+    allow_legacy_terminal: bool,
 ) -> Option<MessageTurn> {
     parse_updates_from_bytes_with_context(
         bytes,
@@ -394,8 +396,11 @@ pub(crate) fn grok_autonomous_turn_from_segment(
         Some(PendingGrokAutonomous {
             trigger_start,
             task_ids: task_ids.to_vec(),
-            candidate_task_ids: Vec::new(),
+            candidate_task_ids: candidate_task_ids.to_vec(),
+            wake_generations: Vec::new(),
+            allow_legacy_terminal,
         }),
+        true,
     )
     .turns
     .into_iter()
@@ -517,6 +522,8 @@ struct PendingGrokAutonomous {
     trigger_start: u64,
     task_ids: Vec<String>,
     candidate_task_ids: Vec<String>,
+    wake_generations: Vec<(String, u64)>,
+    allow_legacy_terminal: bool,
 }
 
 /// Canonical id for a Grok idle-boundary autonomous assistant turn.
@@ -651,13 +658,11 @@ pub(crate) fn grok_reminder_task_ids(text: &str) -> Vec<String> {
     ids
 }
 
-fn structured_wake_task_id(update: &Value) -> Option<String> {
-    if update.get("sessionUpdate").and_then(Value::as_str) != Some("task_completed")
-        || update.get("will_wake").and_then(Value::as_bool) != Some(true)
-    {
+fn task_completion_wake_disposition(update: &Value) -> Option<(String, Option<bool>)> {
+    if update.get("sessionUpdate").and_then(Value::as_str) != Some("task_completed") {
         return None;
     }
-    update
+    let task_id = update
         .get("task_id")
         .and_then(Value::as_str)
         .or_else(|| {
@@ -666,15 +671,47 @@ fn structured_wake_task_id(update: &Value) -> Option<String> {
                 .and_then(Value::as_str)
         })
         .filter(|id| !id.is_empty())
-        .map(str::to_string)
+        .map(str::to_string)?;
+    Some((task_id, update.get("will_wake").and_then(Value::as_bool)))
 }
 
-fn task_completed_prompt_task_id(update: &Value) -> Option<&str> {
+pub(crate) fn grok_task_completed_prompt_task_id(update: &Value) -> Option<&str> {
     update
         .get("prompt_id")
         .and_then(Value::as_str)
         .and_then(|prompt_id| prompt_id.strip_prefix("task-completed-"))
         .filter(|task_id| !task_id.is_empty())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GrokAutonomousTerminalMatch<'a> {
+    Legacy,
+    Task(&'a str),
+}
+
+pub(crate) fn grok_autonomous_terminal_match<'a>(
+    update: &'a Value,
+    task_ids: &[String],
+    candidate_task_ids: &[String],
+    allow_legacy_terminal: bool,
+) -> Option<GrokAutonomousTerminalMatch<'a>> {
+    let Some(prompt_id) = update.get("prompt_id") else {
+        return (allow_legacy_terminal && candidate_task_ids.is_empty() && !task_ids.is_empty())
+            .then_some(GrokAutonomousTerminalMatch::Legacy);
+    };
+    let prompt_id = prompt_id.as_str()?;
+    let task_id = prompt_id
+        .strip_prefix("task-completed-")
+        .filter(|task_id| !task_id.is_empty())?;
+    let expected_ids = if candidate_task_ids.is_empty() {
+        task_ids
+    } else {
+        candidate_task_ids
+    };
+    expected_ids
+        .iter()
+        .any(|expected| expected == task_id)
+        .then_some(GrokAutonomousTerminalMatch::Task(task_id))
 }
 
 fn parse_updates(path: &Path, session_id: &str) -> ParsedUpdates {
@@ -685,7 +722,7 @@ fn parse_updates(path: &Path, session_id: &str) -> ParsedUpdates {
 }
 
 fn parse_updates_from_bytes(bytes: &[u8], session_id: &str) -> ParsedUpdates {
-    parse_updates_from_bytes_with_context(bytes, session_id, 0, None)
+    parse_updates_from_bytes_with_context(bytes, session_id, 0, None, false)
 }
 
 fn parse_updates_from_bytes_with_context(
@@ -693,6 +730,7 @@ fn parse_updates_from_bytes_with_context(
     session_id: &str,
     base_offset: u64,
     initial_pending: Option<PendingGrokAutonomous>,
+    retain_unresolved_at_eof: bool,
 ) -> ParsedUpdates {
     let mut out = ParsedUpdates::default();
     // The in-flight assistant turn, plus a `toolCallId → index-of-its-ToolResult`
@@ -710,7 +748,10 @@ fn parse_updates_from_bytes_with_context(
     let mut open_user_prompt_index: Option<i64> = None;
     let mut pending_autonomous = initial_pending;
     let mut active_autonomous: Option<PendingGrokAutonomous> = None;
-    let mut expected_wakes = std::collections::VecDeque::<String>::new();
+    let mut expected_wakes = std::collections::VecDeque::<(String, u64)>::new();
+    let mut structured_wake_dispositions = std::collections::HashSet::<String>::new();
+    let mut recent_completion_ids = std::collections::HashSet::<String>::new();
+    let mut foreground_invalidated_ids = std::collections::HashSet::<String>::new();
     let mut consumed_complete_bytes = 0u64;
 
     for (relative_start, record) in grok_complete_records(bytes) {
@@ -746,9 +787,23 @@ fn parse_updates_from_bytes_with_context(
             .get("sessionUpdate")
             .and_then(Value::as_str)
             .unwrap_or("");
-        if let Some(task_id) = structured_wake_task_id(update) {
-            expected_wakes.retain(|id| id != &task_id);
-            expected_wakes.push_back(task_id);
+        if let Some((task_id, will_wake)) = task_completion_wake_disposition(update) {
+            if pending_autonomous.as_ref().is_some_and(|pending| {
+                pending.task_ids.iter().any(|id| id == &task_id)
+                    || pending.candidate_task_ids.iter().any(|id| id == &task_id)
+            }) {
+                pending_autonomous = None;
+            }
+            expected_wakes.retain(|(id, _)| id != &task_id);
+            structured_wake_dispositions.remove(&task_id);
+            foreground_invalidated_ids.remove(&task_id);
+            recent_completion_ids.insert(task_id.clone());
+            if let Some(will_wake) = will_wake {
+                structured_wake_dispositions.insert(task_id.clone());
+                if will_wake {
+                    expected_wakes.push_back((task_id, start_offset));
+                }
+            }
         }
 
         // Grok injects its own reminders (a background task finishing, …) as
@@ -782,29 +837,60 @@ fn parse_updates_from_bytes_with_context(
                     let legacy_task_ids = grok_reminder_task_ids(&text);
                     let matching_structured: Vec<String> = legacy_task_ids
                         .iter()
-                        .filter(|id| expected_wakes.iter().any(|pending| pending == *id))
+                        .filter(|id| expected_wakes.iter().any(|(pending, _)| pending == *id))
                         .cloned()
                         .collect();
-                    let is_legacy_reminder = !legacy_task_ids.is_empty();
-                    let (task_ids, candidate_task_ids) = if !matching_structured.is_empty() {
-                        (matching_structured, Vec::new())
-                    } else if is_legacy_reminder {
-                        (legacy_task_ids, Vec::new())
-                    } else if expected_wakes.len() == 1 {
-                        (expected_wakes.pop_front().into_iter().collect(), Vec::new())
-                    } else if !expected_wakes.is_empty() {
-                        (Vec::new(), expected_wakes.iter().cloned().collect())
-                    } else {
-                        (Vec::new(), Vec::new())
-                    };
+                    let legacy_fallback_task_ids: Vec<String> = legacy_task_ids
+                        .iter()
+                        .filter(|id| {
+                            !structured_wake_dispositions.contains(*id)
+                                && !foreground_invalidated_ids.contains(*id)
+                        })
+                        .cloned()
+                        .collect();
+                    let (task_ids, candidate_task_ids, allow_legacy_terminal) =
+                        if !matching_structured.is_empty() {
+                            (matching_structured, Vec::new(), false)
+                        } else if !legacy_fallback_task_ids.is_empty() {
+                            (legacy_fallback_task_ids, Vec::new(), true)
+                        } else if expected_wakes.len() == 1 {
+                            (
+                                expected_wakes
+                                    .front()
+                                    .map(|(id, _)| vec![id.clone()])
+                                    .unwrap_or_default(),
+                                Vec::new(),
+                                false,
+                            )
+                        } else if !expected_wakes.is_empty() {
+                            (
+                                Vec::new(),
+                                expected_wakes.iter().map(|(id, _)| id.clone()).collect(),
+                                false,
+                            )
+                        } else {
+                            (Vec::new(), Vec::new(), false)
+                        };
                     if !task_ids.is_empty() || !candidate_task_ids.is_empty() {
+                        let selected_ids = if candidate_task_ids.is_empty() {
+                            task_ids.as_slice()
+                        } else {
+                            candidate_task_ids.as_slice()
+                        };
+                        let wake_generations: Vec<(String, u64)> = expected_wakes
+                            .iter()
+                            .filter(|(id, _)| selected_ids.contains(id))
+                            .cloned()
+                            .collect();
                         if candidate_task_ids.is_empty() {
-                            expected_wakes.retain(|id| !task_ids.contains(id));
+                            expected_wakes.retain(|wake| !wake_generations.contains(wake));
                         }
                         pending_autonomous = Some(PendingGrokAutonomous {
                             trigger_start: start_offset,
                             task_ids,
                             candidate_task_ids,
+                            wake_generations,
+                            allow_legacy_terminal,
                         });
                     }
                 } else {
@@ -842,12 +928,21 @@ fn parse_updates_from_bytes_with_context(
             if let Some(prev) = assistant.as_mut() {
                 turn_meta.apply(prev);
             }
-            flush_assistant(&mut assistant, &mut out.turns, &mut tool_result_idx);
+            if active_autonomous
+                .as_ref()
+                .is_some_and(|active| !active.candidate_task_ids.is_empty())
+            {
+                assistant.take();
+                tool_result_idx.clear();
+            } else {
+                flush_assistant(&mut assistant, &mut out.turns, &mut tool_result_idx);
+            }
             active_autonomous = None;
             turn_meta = GrokTurnMeta::default();
             // A visible user prompt is not an autonomous follow-up.
             pending_autonomous = None;
             expected_wakes.clear();
+            foreground_invalidated_ids.extend(recent_completion_ids.drain());
         }
         turn_meta.observe(params_meta, update_meta);
 
@@ -988,16 +1083,47 @@ fn parse_updates_from_bytes_with_context(
                 apply_tool_result(assistant.as_mut(), &tool_result_idx, &id, output, failed);
             }
             "turn_completed" => {
+                let autonomous_terminal = active_autonomous
+                    .as_ref()
+                    .or(pending_autonomous.as_ref())
+                    .map(|active| {
+                        grok_autonomous_terminal_match(
+                            update,
+                            &active.task_ids,
+                            &active.candidate_task_ids,
+                            active.allow_legacy_terminal,
+                        )
+                    });
+                if autonomous_terminal.is_some_and(|matched| matched.is_none()) {
+                    continue;
+                }
+                if assistant.is_none() {
+                    if let Some(pending) = pending_autonomous.take() {
+                        if !pending.candidate_task_ids.is_empty() {
+                            if let Some(GrokAutonomousTerminalMatch::Task(task_id)) =
+                                autonomous_terminal.flatten()
+                            {
+                                if let Some(generation) =
+                                    pending
+                                        .wake_generations
+                                        .iter()
+                                        .find_map(|(id, generation)| {
+                                            (id == task_id).then_some(*generation)
+                                        })
+                                {
+                                    expected_wakes.retain(|(id, pending_generation)| {
+                                        id != task_id || *pending_generation != generation
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
                 if let Some(mut turn) = assistant.take() {
                     if let Some(active) = active_autonomous.take() {
                         if !active.candidate_task_ids.is_empty() {
-                            if let Some(task_id) =
-                                task_completed_prompt_task_id(update).filter(|task_id| {
-                                    active
-                                        .candidate_task_ids
-                                        .iter()
-                                        .any(|candidate| candidate == task_id)
-                                })
+                            if let Some(GrokAutonomousTerminalMatch::Task(task_id)) =
+                                autonomous_terminal.flatten()
                             {
                                 let resolved = vec![task_id.to_string()];
                                 turn.id = grok_autonomous_turn_id(
@@ -1005,7 +1131,15 @@ fn parse_updates_from_bytes_with_context(
                                     &resolved,
                                     active.trigger_start,
                                 );
-                                expected_wakes.retain(|id| id != task_id);
+                                if let Some(generation) =
+                                    active.wake_generations.iter().find_map(|(id, generation)| {
+                                        (id == task_id).then_some(*generation)
+                                    })
+                                {
+                                    expected_wakes.retain(|(id, pending_generation)| {
+                                        id != task_id || *pending_generation != generation
+                                    });
+                                }
                             }
                         }
                     }
@@ -1093,7 +1227,16 @@ fn parse_updates_from_bytes_with_context(
     if let Some(prev) = assistant.as_mut() {
         turn_meta.apply(prev);
     }
-    flush_assistant(&mut assistant, &mut out.turns, &mut tool_result_idx);
+    if !retain_unresolved_at_eof
+        && active_autonomous
+            .as_ref()
+            .is_some_and(|active| !active.candidate_task_ids.is_empty())
+    {
+        assistant.take();
+        tool_result_idx.clear();
+    } else {
+        flush_assistant(&mut assistant, &mut out.turns, &mut tool_result_idx);
+    }
     out.consumed_complete_bytes = consumed_complete_bytes;
 
     // Assign stable, unique, index-based ids (the transcript is append-only, so

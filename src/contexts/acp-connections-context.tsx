@@ -3883,16 +3883,18 @@ function prepareMappedEnvelope(
       const watermark = e.watermark
       const settled = e.settled
       const detailRefetch = e.detail_refetch === true
+      const transcriptReset = e.transcript_reset === true
       const agentType = snapshot.agentType
       afterCommit.push(() => {
         const conversationId = getConversationIdByExternalIdFromStore(sessionId)
-        if (turns && turns.length > 0) {
+        if ((turns && turns.length > 0) || transcriptReset) {
           if (conversationId != null) {
             const runtime = useConversationRuntimeStore.getState()
-            runtime.actions.applyBackgroundActivity(
+            const overlayEvicted = runtime.actions.applyBackgroundActivity(
               conversationId,
-              turns,
-              watermark
+              turns ?? [],
+              watermark,
+              transcriptReset
             )
             const session = useConversationRuntimeStore
               .getState()
@@ -3903,8 +3905,9 @@ function prepareMappedEnvelope(
               session &&
               session.backgroundTurns.length > OVERLAY_FOLD_THRESHOLD &&
               !detailRefetch &&
-              !session.detailLoading &&
-              now - lastAt > OVERLAY_FOLD_MIN_INTERVAL_MS
+              (overlayEvicted ||
+                (!session.detailLoading &&
+                  now - lastAt > OVERLAY_FOLD_MIN_INTERVAL_MS))
             ) {
               overlayFoldRefetchAt.set(conversationId, now)
               runtime.actions.refetchDetail(conversationId, {
@@ -6283,11 +6286,27 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       if (!stream) return null
 
       let activeSub: EventStreamSubscription | null = null
+      let lastBackgroundDetailRevision = 0
+      let lastBackgroundTranscriptGeneration = 0
       const handlers: AttachHandlers = {
         onSnapshot: (snapshot) => {
           const record = attachRetryRef.current.get(contextKey)
           if (record) record.autoRetryUsed = false
           const patch = denormalizeSnapshot(snapshot)
+          const detailRevision = patch.backgroundDetailRevision ?? 0
+          const transcriptGeneration = patch.backgroundTranscriptGeneration ?? 0
+          const recoverBackgroundDetail =
+            detailRevision > lastBackgroundDetailRevision
+          const resetBackgroundTranscript =
+            transcriptGeneration > lastBackgroundTranscriptGeneration
+          lastBackgroundDetailRevision = Math.max(
+            lastBackgroundDetailRevision,
+            detailRevision
+          )
+          lastBackgroundTranscriptGeneration = Math.max(
+            lastBackgroundTranscriptGeneration,
+            transcriptGeneration
+          )
           dispatch({ type: "HYDRATE_FROM_SNAPSHOT", contextKey, patch })
           surfaceSnapshotErrorDetailsRef.current(contextKey, patch)
           lastActivityRef.current.set(contextKey, Date.now())
@@ -6301,6 +6320,27 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             connectionId,
             patch.eventSeq
           )
+          if (recoverBackgroundDetail || resetBackgroundTranscript) {
+            const runtimeConversationId =
+              (patch.sessionId
+                ? getConversationIdByExternalIdFromStore(patch.sessionId)
+                : null) ?? patch.conversationId
+            if (runtimeConversationId != null) {
+              const runtimeActions =
+                useConversationRuntimeStore.getState().actions
+              if (resetBackgroundTranscript) {
+                runtimeActions.applyBackgroundActivity(
+                  runtimeConversationId,
+                  [],
+                  0,
+                  true
+                )
+              }
+              runtimeActions.refetchDetail(runtimeConversationId, {
+                preserveLive: true,
+              })
+            }
+          }
         },
         onReplay: (events) => {
           pushMappedEvents(contextKey, events, true)

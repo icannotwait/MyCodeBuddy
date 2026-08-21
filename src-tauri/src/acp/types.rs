@@ -419,6 +419,10 @@ pub enum AcpEvent {
         /// retaining overlay entries until transcript watermark coverage.
         #[serde(default, skip_serializing_if = "is_false")]
         detail_refetch: bool,
+        /// The transcript file was replaced, invalidating earlier byte-offset
+        /// watermarks held by frontend background overlays.
+        #[serde(default, skip_serializing_if = "is_false")]
+        transcript_reset: bool,
     },
     /// A `delegate_to_agent` MCP tool call from the parent agent has spawned a
     /// child sub-session and the child's prompt is in flight. Emitted as soon

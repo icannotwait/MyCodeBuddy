@@ -436,6 +436,7 @@ fn estimate_envelope_size(envelope: &EventEnvelope) -> usize {
             settled,
             watermark: _,
             detail_refetch: _,
+            transcript_reset: _,
         } => {
             json_str_len(session_id)
                 + turns.len().saturating_sub(1)
@@ -1184,6 +1185,7 @@ mod tests {
                 ],
                 watermark: u64::MAX,
                 detail_refetch: true,
+                transcript_reset: true,
             },
         });
         assert_ge_serialized(&env);
@@ -1199,6 +1201,7 @@ mod tests {
                 settled: vec![],
                 watermark: 0,
                 detail_refetch: false,
+                transcript_reset: false,
             },
         });
         assert_ge_serialized(&env);

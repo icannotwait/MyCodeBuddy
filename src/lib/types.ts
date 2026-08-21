@@ -2650,6 +2650,8 @@ export type AcpEvent =
       watermark: number
       /** One-shot terminal/recovery cue to fold persisted overlay content. */
       detail_refetch?: boolean
+      /** Transcript byte offsets restarted after an atomic file replacement. */
+      transcript_reset?: boolean
     }
   /**
    * A `delegate_to_agent` MCP tool call from the parent agent has spawned a
@@ -3537,6 +3539,12 @@ export interface LiveSessionSnapshot {
    *  mid-episode recover the pending count the one-shot `background_activity`
    *  events won't replay. Absent / omitted when zero. */
   background_outstanding?: number
+  /** Monotonic cue that background activity changed persisted detail. A
+   *  snapshot with a newer non-zero value requires an authoritative refetch. */
+  background_detail_revision?: number
+  /** Monotonic replacement generation for transcript byte offsets. A newer
+   *  value invalidates background overlays from the previous file. */
+  background_transcript_generation?: number
   /** Whether this agent has the `check_user_feedback` tool (fixed at launch).
    *  The frontend gates the feedback bar on this — the agent's real capability —
    *  not the (possibly later-toggled) global setting. Absent → `false`. */

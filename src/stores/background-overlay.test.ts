@@ -163,6 +163,14 @@ describe("APPLY_BACKGROUND_ACTIVITY", () => {
       `bg-x-${BACKGROUND_OVERLAY_HARD_CAP + 4}`
     )
   })
+
+  it("clears the previous transcript generation even when reset has no turns", () => {
+    actions().applyBackgroundActivity(7, [turn("bg-old", "old")], 900)
+
+    actions().applyBackgroundActivity(7, [], 10, true)
+
+    expect(session(7)?.backgroundTurns).toEqual([])
+  })
 })
 
 describe("watermark hand-off on FETCH_DETAIL_SUCCESS", () => {

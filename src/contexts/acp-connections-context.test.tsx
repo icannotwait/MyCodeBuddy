@@ -3501,6 +3501,215 @@ describe("out-of-turn wire guard + background activity", () => {
     resetConversationRuntimeStore()
   })
 
+  it("hard-cap overlay eviction bypasses an earlier fold-refetch throttle", async () => {
+    const { useConversationRuntimeStore, resetConversationRuntimeStore } =
+      await import("@/stores/conversation-runtime-store")
+    resetConversationRuntimeStore()
+
+    const VIRTUAL = -12
+    const actions = useConversationRuntimeStore.getState().actions
+    actions.setExternalId(VIRTUAL, "sess-overlay-eviction")
+    actions.setDbConversationId(VIRTUAL, 45)
+    const refetchDetail = vi
+      .spyOn(actions, "refetchDetail")
+      .mockImplementation(() => {})
+    const handlers = await mountOwnerConnection()
+    const turns = (start: number, count: number) =>
+      Array.from({ length: count }, (_, offset) => {
+        const index = start + offset
+        return {
+          id: `grok-autonomous:bg-${index}:assistant:0`,
+          role: "assistant" as const,
+          blocks: [{ type: "text" as const, text: `reply ${index}` }],
+          timestamp: "2026-08-19T00:00:00.000Z",
+        }
+      })
+
+    emitAcpEvent(handlers, {
+      seq: 1,
+      connection_id: "spawned-conn",
+      type: "background_activity",
+      session_id: "sess-overlay-eviction",
+      turns: turns(0, 61),
+      outstanding: 0,
+      watermark: 1000,
+    })
+    expect(refetchDetail).toHaveBeenCalledTimes(1)
+
+    emitAcpEvent(handlers, {
+      seq: 2,
+      connection_id: "spawned-conn",
+      type: "background_activity",
+      session_id: "sess-overlay-eviction",
+      turns: turns(61, 240),
+      outstanding: 0,
+      watermark: 2000,
+    })
+
+    const entries = useConversationRuntimeStore
+      .getState()
+      .byConversationId.get(VIRTUAL)?.backgroundTurns
+    expect(entries).toHaveLength(300)
+    expect(entries?.[0]?.turn.id).toBe("grok-autonomous:bg-1:assistant:0")
+    expect(refetchDetail).toHaveBeenCalledTimes(2)
+
+    refetchDetail.mockRestore()
+    resetConversationRuntimeStore()
+  })
+
+  it("hard-cap overlay eviction supersedes an in-flight detail refetch", async () => {
+    const { useConversationRuntimeStore, resetConversationRuntimeStore } =
+      await import("@/stores/conversation-runtime-store")
+    resetConversationRuntimeStore()
+
+    const VIRTUAL = -14
+    const actions = useConversationRuntimeStore.getState().actions
+    actions.setExternalId(VIRTUAL, "sess-overlay-in-flight")
+    actions.setDbConversationId(VIRTUAL, 47)
+    const turns = (start: number, count: number) =>
+      Array.from({ length: count }, (_, offset) => {
+        const index = start + offset
+        return {
+          id: `grok-autonomous:in-flight-${index}:assistant:0`,
+          role: "assistant" as const,
+          blocks: [{ type: "text" as const, text: `reply ${index}` }],
+          timestamp: "2026-08-19T00:00:00.000Z",
+        }
+      })
+    actions.applyBackgroundActivity(VIRTUAL, turns(0, 300), 1000)
+    useConversationRuntimeStore.setState((state) => {
+      const current = state.byConversationId.get(VIRTUAL)!
+      const byConversationId = new Map(state.byConversationId)
+      byConversationId.set(VIRTUAL, { ...current, detailLoading: true })
+      return { byConversationId }
+    })
+    const refetchDetail = vi
+      .spyOn(actions, "refetchDetail")
+      .mockImplementation(() => {})
+    const handlers = await mountOwnerConnection()
+
+    emitAcpEvent(handlers, {
+      seq: 1,
+      connection_id: "spawned-conn",
+      type: "background_activity",
+      session_id: "sess-overlay-in-flight",
+      turns: turns(300, 1),
+      outstanding: 0,
+      watermark: 2000,
+    })
+
+    const entries = useConversationRuntimeStore
+      .getState()
+      .byConversationId.get(VIRTUAL)?.backgroundTurns
+    expect(entries).toHaveLength(300)
+    expect(entries?.[0]?.turn.id).toBe(
+      "grok-autonomous:in-flight-1:assistant:0"
+    )
+    expect(refetchDetail).toHaveBeenCalledTimes(1)
+
+    refetchDetail.mockRestore()
+    resetConversationRuntimeStore()
+  })
+
+  it("transcript reset clears overlays even when background_activity has no turns", async () => {
+    const { useConversationRuntimeStore, resetConversationRuntimeStore } =
+      await import("@/stores/conversation-runtime-store")
+    resetConversationRuntimeStore()
+
+    const VIRTUAL = -11
+    const actions = useConversationRuntimeStore.getState().actions
+    actions.setExternalId(VIRTUAL, "sess-reset")
+    actions.setDbConversationId(VIRTUAL, 44)
+    actions.applyBackgroundActivity(
+      VIRTUAL,
+      [
+        {
+          id: "grok-autonomous:old:assistant:0",
+          role: "assistant",
+          blocks: [{ type: "text", text: "old generation" }],
+          timestamp: "2026-08-19T00:00:00.000Z",
+        },
+      ],
+      4096
+    )
+    const refetchDetail = vi
+      .spyOn(actions, "refetchDetail")
+      .mockImplementation(() => {})
+
+    const handlers = await mountOwnerConnection()
+    emitAcpEvent(handlers, {
+      seq: 1,
+      connection_id: "spawned-conn",
+      type: "background_activity",
+      session_id: "sess-reset",
+      outstanding: 0,
+      watermark: 32,
+      detail_refetch: true,
+      transcript_reset: true,
+    })
+
+    expect(
+      useConversationRuntimeStore.getState().byConversationId.get(VIRTUAL)
+        ?.backgroundTurns
+    ).toEqual([])
+    expect(refetchDetail).toHaveBeenCalledWith(VIRTUAL, {
+      preserveLive: true,
+    })
+
+    refetchDetail.mockRestore()
+    resetConversationRuntimeStore()
+  })
+
+  it("snapshot recovery clears an old transcript generation and refetches detail", async () => {
+    const { useConversationRuntimeStore, resetConversationRuntimeStore } =
+      await import("@/stores/conversation-runtime-store")
+    resetConversationRuntimeStore()
+
+    const VIRTUAL = -13
+    const actions = useConversationRuntimeStore.getState().actions
+    actions.setExternalId(VIRTUAL, "sess-snapshot-recovery")
+    actions.setDbConversationId(VIRTUAL, 46)
+    actions.applyBackgroundActivity(
+      VIRTUAL,
+      [
+        {
+          id: "grok-autonomous:old-generation:assistant:0",
+          role: "assistant",
+          blocks: [{ type: "text", text: "old generation" }],
+          timestamp: "2026-08-19T00:00:00.000Z",
+        },
+      ],
+      4096
+    )
+    const refetchDetail = vi
+      .spyOn(actions, "refetchDetail")
+      .mockImplementation(() => {})
+    const handlers = await mountOwnerConnection()
+    h.denormalizeSnapshot.mockReturnValueOnce({
+      ...h.denormalizeSnapshot(),
+      connectionId: "spawned-conn",
+      sessionId: "sess-snapshot-recovery",
+      eventSeq: 5,
+      backgroundDetailRevision: 1,
+      backgroundTranscriptGeneration: 1,
+    })
+
+    hydrateSnapshot(handlers, {
+      event_seq: 5,
+    } as unknown as LiveSessionSnapshot)
+
+    expect(
+      useConversationRuntimeStore.getState().byConversationId.get(VIRTUAL)
+        ?.backgroundTurns
+    ).toEqual([])
+    expect(refetchDetail).toHaveBeenCalledWith(VIRTUAL, {
+      preserveLive: true,
+    })
+
+    refetchDetail.mockRestore()
+    resetConversationRuntimeStore()
+  })
+
   it("does NOT arm the syncing-results hint for a wire-visible (#870-held) settle", async () => {
     const { resetConversationRuntimeStore } =
       await import("@/stores/conversation-runtime-store")

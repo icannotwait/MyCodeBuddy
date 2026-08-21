@@ -5,24 +5,27 @@
 //! follow-ups surface as `AcpEvent::BackgroundActivity` without owning the
 //! foreground prompt path.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use serde_json::Value;
 
 use crate::acp::autonomous_activity::{
-    cap_normalized_turn_payload, complete_file_watermark, read_complete_record_batch,
-    rotation_decision, AutonomousActivityPolicy, EpisodeRotation, ProviderRecordIdentities,
-    TranscriptFileIdentity, EPISODE_PAYLOAD_MAX_BYTES, EPISODE_RECORD_FORCE_ROTATE,
+    cap_normalized_turn_payload, complete_file_watermark, normalized_turn_payload_len,
+    read_complete_record_batch, rotation_decision, AutonomousActivityPolicy, EpisodeRotation,
+    ProviderRecordIdentities, TranscriptFileIdentity, EPISODE_PAYLOAD_MAX_BYTES,
+    EPISODE_RECORD_FORCE_ROTATE,
 };
 use crate::acp::session_state::background_keepalive_max_age;
 use crate::acp::types::BackgroundSettledInfo;
 use crate::models::agent::AgentType;
 use crate::models::message::{AutonomousTurnOrigin, MessageTurn};
 use crate::parsers::grok::{
-    grok_autonomous_turn_from_segment, grok_autonomous_turn_id, grok_complete_records,
-    grok_record_payload, grok_reminder_task_ids, is_grok_background_task_reminder,
+    grok_autonomous_terminal_match, grok_autonomous_turn_from_segment, grok_autonomous_turn_id,
+    grok_complete_records, grok_record_payload, grok_reminder_task_ids,
+    grok_task_completed_prompt_task_id, is_grok_background_task_reminder,
+    GrokAutonomousTerminalMatch,
 };
 
 /// Connection-loop ownership of the dispatch currently being observed.
@@ -58,6 +61,8 @@ pub(crate) struct GrokEmitted {
     pub outstanding: u32,
     pub settled: Vec<BackgroundSettledInfo>,
     pub watermark: u64,
+    pub transcript_reset: bool,
+    payload_bytes: usize,
 }
 
 const TASK_CAP: usize = 64;
@@ -69,7 +74,21 @@ struct TaskEntry {
 
 struct SettledTask {
     id: String,
+    generation: u64,
     at: Instant,
+}
+
+struct ExpectedWake {
+    id: String,
+    generation: u64,
+    at: Instant,
+    seed_from: Option<u64>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct WakeGeneration {
+    id: String,
+    generation: u64,
 }
 
 #[derive(Clone)]
@@ -77,9 +96,18 @@ struct Episode {
     phase: EpisodePhase,
     task_ids: Vec<String>,
     candidate_task_ids: Vec<String>,
-    seed_trigger_from_task_ids: bool,
+    wake_generations: Vec<WakeGeneration>,
+    trigger_seed_task_ids: Vec<String>,
+    allow_legacy_trigger: bool,
+    deferred_turns: VecDeque<DeferredTurn>,
+    deferred_payload_bytes: usize,
+    deferred_overflowed: bool,
     trigger_start: Option<u64>,
+    trigger_event_id: Option<String>,
     published_id: Option<String>,
+    has_content: bool,
+    wire_content_observed: bool,
+    replacement_recovery: bool,
     opened_at: Instant,
     tail_from: u64,
     segment_from: u64,
@@ -104,9 +132,18 @@ impl Episode {
             phase: EpisodePhase::Dormant,
             task_ids: Vec::new(),
             candidate_task_ids: Vec::new(),
-            seed_trigger_from_task_ids: false,
+            wake_generations: Vec::new(),
+            trigger_seed_task_ids: Vec::new(),
+            allow_legacy_trigger: false,
+            deferred_turns: VecDeque::new(),
+            deferred_payload_bytes: 0,
+            deferred_overflowed: false,
             trigger_start: None,
+            trigger_event_id: None,
             published_id: None,
+            has_content: false,
+            wire_content_observed: false,
+            replacement_recovery: false,
             opened_at: Instant::now(),
             tail_from: 0,
             segment_from: 0,
@@ -126,7 +163,15 @@ impl Episode {
 struct Tombstone {
     trigger_start: u64,
     task_ids: Vec<String>,
+    wake_generations: Vec<WakeGeneration>,
     at: Instant,
+}
+
+#[derive(Clone)]
+struct DeferredTurn {
+    segment_part: u32,
+    turn: MessageTurn,
+    payload_bytes: usize,
 }
 
 pub(crate) struct GrokAutonomousAdapter {
@@ -137,7 +182,9 @@ pub(crate) struct GrokAutonomousAdapter {
     tasks: HashMap<String, TaskEntry>,
     task_order: VecDeque<String>,
     recently_settled: VecDeque<SettledTask>,
-    expected_wakes: VecDeque<SettledTask>,
+    expected_wakes: VecDeque<ExpectedWake>,
+    structured_wake_dispositions: VecDeque<SettledTask>,
+    next_wake_generation: u64,
     last_idle_was_task_completed: bool,
     last_visible_is_user: bool,
     episode: Episode,
@@ -160,6 +207,8 @@ impl GrokAutonomousAdapter {
             task_order: VecDeque::new(),
             recently_settled: VecDeque::new(),
             expected_wakes: VecDeque::new(),
+            structured_wake_dispositions: VecDeque::new(),
+            next_wake_generation: 0,
             last_idle_was_task_completed: false,
             last_visible_is_user: false,
             episode: Episode::dormant(),
@@ -214,9 +263,27 @@ impl GrokAutonomousAdapter {
     }
 
     pub(crate) fn on_foreground_started(&mut self) {
-        self.expected_wakes.clear();
+        self.clear_wake_evidence();
+        self.rebaseline_committed();
         self.last_idle_was_task_completed = false;
-        if self.episode.phase == EpisodePhase::Opening {
+        if self.episode.is_active() {
+            let mut needs_reconciliation = self.episode.has_content
+                || self.episode.wire_content_observed
+                || self.episode.published_id.is_some()
+                || !self.episode.deferred_turns.is_empty();
+            self.episode.deferred_turns.clear();
+            self.episode.deferred_payload_bytes = 0;
+            self.episode.deferred_overflowed = false;
+            if let Some(emitted) = self.emitted.as_mut() {
+                if !emitted.turns.is_empty() {
+                    emitted.turns.clear();
+                    emitted.payload_bytes = 0;
+                    needs_reconciliation = true;
+                }
+            }
+            if needs_reconciliation {
+                self.needs_detail_refetch = true;
+            }
             self.episode.phase = EpisodePhase::SuppressedForeground;
         }
     }
@@ -251,23 +318,32 @@ impl GrokAutonomousAdapter {
             }
             "task_completed" => {
                 if let Some(task_id) = extract_task_id(update) {
-                    self.complete_task(task_id.clone());
-                    if update.get("will_wake").and_then(Value::as_bool) == Some(true) {
-                        self.expect_wake(task_id);
-                    }
+                    let generation = self.next_wake_generation;
+                    self.next_wake_generation = self.next_wake_generation.saturating_add(1);
+                    self.complete_task(task_id.clone(), generation);
+                    self.record_wake_disposition(
+                        task_id,
+                        update.get("will_wake").and_then(Value::as_bool),
+                        generation,
+                    );
                 }
                 if ownership == Ownership::Idle {
                     self.last_idle_was_task_completed = true;
                 }
                 GrokDispatchClaim::Accounting
             }
-            "user_message_chunk" => self.observe_user_chunk(update, ownership),
+            "user_message_chunk" => self.observe_user_chunk(
+                update,
+                ownership,
+                dispatch_event_id(params).map(str::to_string),
+            ),
             "agent_message_chunk"
             | "agent_thought_chunk"
             | "tool_call"
             | "tool_call_update"
             | "auto_compact_completed" => {
                 if ownership == Ownership::Idle && self.episode.is_active() {
+                    self.episode.wire_content_observed = true;
                     self.last_idle_was_task_completed = false;
                     self.last_visible_is_user = false;
                     self.tail_once();
@@ -295,6 +371,8 @@ impl GrokAutonomousAdapter {
         self.task_order.clear();
         self.recently_settled.clear();
         self.expected_wakes.clear();
+        self.structured_wake_dispositions.clear();
+        self.next_wake_generation = 0;
         self.episode = Episode::dormant();
         self.tombstones.clear();
         self.emitted = None;
@@ -340,16 +418,20 @@ impl GrokAutonomousAdapter {
                 self.needs_detail_refetch = true;
                 return;
             }
-            let seed_task_ids = if self.episode.seed_trigger_from_task_ids {
-                if self.episode.candidate_task_ids.is_empty() {
-                    self.episode.task_ids.as_slice()
-                } else {
-                    self.episode.candidate_task_ids.as_slice()
-                }
+            let required_task_ids = if self.episode.candidate_task_ids.is_empty() {
+                self.episode.task_ids.clone()
             } else {
-                &[]
+                self.episode.candidate_task_ids.clone()
             };
-            match find_hidden_trigger(&batch.bytes, self.episode.tail_from, seed_task_ids) {
+            let trigger_search = find_hidden_trigger(
+                &batch.bytes,
+                self.episode.tail_from,
+                &required_task_ids,
+                &self.episode.trigger_seed_task_ids,
+                self.episode.allow_legacy_trigger,
+                self.episode.trigger_event_id.as_deref(),
+            );
+            match trigger_search.trigger {
                 Some(trigger) if self.is_tombstoned(trigger.start) => {
                     self.episode.phase = EpisodePhase::Closed;
                     return;
@@ -359,6 +441,10 @@ impl GrokAutonomousAdapter {
                         self.episode.phase = EpisodePhase::Closed;
                         return;
                     }
+                    self.mark_expected_wakes_seedable(
+                        &trigger_search.pending_task_ids,
+                        trigger.end,
+                    );
                     if self.episode.task_ids.is_empty()
                         && self.episode.candidate_task_ids.is_empty()
                     {
@@ -366,6 +452,7 @@ impl GrokAutonomousAdapter {
                         self.episode.candidate_task_ids = trigger.candidate_task_ids;
                     }
                     self.episode.trigger_start = Some(trigger.start);
+                    self.episode.trigger_event_id = trigger.event_id;
                     self.episode.segment_from = trigger.end;
                     if self.episode.phase == EpisodePhase::Opening {
                         self.episode.phase = EpisodePhase::Open;
@@ -374,8 +461,21 @@ impl GrokAutonomousAdapter {
                 // File lags the wire: keep Opening. A from-0 tombstone close
                 // would drop a new adjacent cycle that has not persisted yet.
                 None => {
+                    self.mark_expected_wakes_seedable(
+                        &trigger_search.pending_task_ids,
+                        batch.next_offset,
+                    );
+                    self.episode.trigger_seed_task_ids = trigger_search
+                        .pending_task_ids
+                        .iter()
+                        .filter(|id| required_task_ids.contains(id))
+                        .cloned()
+                        .collect();
                     self.committed = batch.next_offset;
                     self.episode.tail_from = batch.next_offset;
+                    if self.episode.replacement_recovery && batch.next_offset == file_len {
+                        self.episode = Episode::dormant();
+                    }
                     return;
                 }
             }
@@ -388,6 +488,7 @@ impl GrokAutonomousAdapter {
             return;
         };
         self.remember_records(&batch.record_starts);
+        self.mark_persisted_expected_wakes(&batch.bytes, self.episode.segment_from);
         if batch.skipped_oversized_record {
             self.committed = batch.next_offset;
             self.rotate_segment(batch.next_offset);
@@ -395,24 +496,41 @@ impl GrokAutonomousAdapter {
             return;
         }
         self.episode.segment_record_count = batch.record_starts.len();
-        let terminal_persisted =
-            file_has_turn_completed_after(&batch.bytes, self.episode.segment_from);
+        let persisted_terminal = persisted_turn_completed_match(
+            &batch.bytes,
+            &self.episode.task_ids,
+            &self.episode.candidate_task_ids,
+            self.episode.allow_legacy_trigger,
+        );
+        if let Some(PersistedTerminalMatch::Task(task_id)) = persisted_terminal.as_ref() {
+            if !self.episode.candidate_task_ids.is_empty() {
+                self.resolve_candidate(task_id);
+            }
+        }
+        let terminal_persisted = persisted_terminal.is_some();
         let Some(mut turn) = grok_autonomous_turn_from_segment(
             &batch.bytes,
             &self.session_id,
             self.episode.segment_from,
             trigger_start,
             &self.episode.task_ids,
+            &self.episode.candidate_task_ids,
+            self.episode.allow_legacy_trigger,
         ) else {
             self.committed = batch.next_offset;
-            if self.episode.phase == EpisodePhase::AwaitingPersistedTerminal && terminal_persisted {
+            if terminal_persisted {
                 self.finish_episode();
             }
             return;
         };
         if turn.blocks.is_empty() {
+            self.committed = batch.next_offset;
+            if terminal_persisted {
+                self.finish_episode();
+            }
             return;
         }
+        self.episode.has_content = true;
         let base_id =
             grok_autonomous_turn_id(&self.session_id, &self.episode.task_ids, trigger_start);
         let expected_id = segmented_turn_id(&base_id, self.episode.segment_part);
@@ -420,19 +538,29 @@ impl GrokAutonomousAdapter {
         self.committed = batch.next_offset;
         self.episode.published_id = Some(expected_id);
         let terminal_persisted = turn.completed_at.is_some() || terminal_persisted;
+        let rotation = rotation_decision(self.episode.segment_record_count, terminal_persisted);
+        let original_payload_bytes = normalized_turn_payload_len(&turn);
+        let bounded_turn = cap_normalized_turn_payload(turn);
+        if bounded_turn
+            .as_ref()
+            .is_none_or(|bounded| normalized_turn_payload_len(bounded) < original_payload_bytes)
+        {
+            self.needs_detail_refetch = true;
+        }
         if self.episode.candidate_task_ids.is_empty() {
-            if let Some(turn) = cap_normalized_turn_payload(turn) {
+            if let Some(turn) = bounded_turn {
                 self.emit_turn(turn);
             }
+        } else if rotation == Some(EpisodeRotation::Forced) && !terminal_persisted {
+            if let Some(turn) = bounded_turn {
+                self.defer_candidate_turn(self.episode.segment_part, turn);
+            }
         }
-        if rotation_decision(self.episode.segment_record_count, terminal_persisted)
-            == Some(EpisodeRotation::Forced)
-            && !terminal_persisted
-        {
+        if rotation == Some(EpisodeRotation::Forced) && !terminal_persisted {
             self.rotate_segment(batch.next_offset);
             return;
         }
-        if self.episode.phase == EpisodePhase::AwaitingPersistedTerminal && terminal_persisted {
+        if terminal_persisted {
             self.finish_episode();
         }
     }
@@ -447,6 +575,8 @@ impl GrokAutonomousAdapter {
             } else {
                 0
             },
+            transcript_reset: false,
+            payload_bytes: 0,
         })
     }
 
@@ -472,14 +602,19 @@ impl GrokAutonomousAdapter {
         self.episode.is_active()
     }
 
-    fn observe_user_chunk(&mut self, update: &Value, ownership: Ownership) -> GrokDispatchClaim {
+    fn observe_user_chunk(
+        &mut self,
+        update: &Value,
+        ownership: Ownership,
+        event_id: Option<String>,
+    ) -> GrokDispatchClaim {
         let hidden = update
             .pointer("/_meta/hideFromScrollback")
             .and_then(Value::as_bool)
             == Some(true);
         if !hidden {
             if ownership == Ownership::Idle {
-                self.expected_wakes.clear();
+                self.clear_wake_evidence();
                 self.last_visible_is_user = true;
                 self.last_idle_was_task_completed = false;
                 self.log_visible_idle_user();
@@ -492,7 +627,7 @@ impl GrokAutonomousAdapter {
             .and_then(Value::as_str)
             .unwrap_or("");
         if ownership != Ownership::Idle {
-            self.expected_wakes.clear();
+            self.clear_wake_evidence();
             if self.episode.phase == EpisodePhase::Opening {
                 self.episode.phase = EpisodePhase::SuppressedForeground;
             }
@@ -506,10 +641,12 @@ impl GrokAutonomousAdapter {
             return GrokDispatchClaim::Unclaimed;
         }
         let is_legacy_reminder = is_grok_background_task_reminder(text);
-        let legacy_task_ids = is_legacy_reminder
-            .then(|| grok_reminder_task_ids(text))
-            .unwrap_or_default();
-        let Some((task_ids, candidate_task_ids)) =
+        let legacy_task_ids = if is_legacy_reminder {
+            grok_reminder_task_ids(text)
+        } else {
+            Vec::new()
+        };
+        let Some((task_ids, candidate_task_ids, structured_evidence)) =
             self.expected_wake_evidence(&legacy_task_ids, is_legacy_reminder)
         else {
             return GrokDispatchClaim::Unclaimed;
@@ -522,12 +659,13 @@ impl GrokAutonomousAdapter {
         let matches_settled = evidence_ids
             .iter()
             .any(|id| self.recently_settled.iter().any(|s| s.id == *id));
+        let wake_generations = self.wake_generations_for_ids(evidence_ids);
 
         if self.episode.is_active() {
             return GrokDispatchClaim::AutonomousContent;
         }
 
-        if self.tombstone_covers_task_ids(evidence_ids) && !adjacent {
+        if self.tombstone_covers_wake(evidence_ids, &wake_generations) && !adjacent {
             return GrokDispatchClaim::Unclaimed;
         }
 
@@ -535,42 +673,39 @@ impl GrokAutonomousAdapter {
             return GrokDispatchClaim::Unclaimed;
         }
 
+        let trigger_seed_task_ids = self.seedable_expected_wake_ids(evidence_ids, self.committed);
         if candidate_task_ids.is_empty() {
-            self.consume_expected_wakes(&task_ids);
-            self.consume_settled_ids(&task_ids);
+            self.consume_wake_generations(&wake_generations);
         }
-        self.open_episode(task_ids, candidate_task_ids, true);
+        self.open_episode(
+            task_ids,
+            candidate_task_ids,
+            wake_generations,
+            trigger_seed_task_ids,
+            !structured_evidence,
+            event_id,
+        );
         GrokDispatchClaim::AutonomousContent
     }
 
     fn observe_idle_terminal(&mut self, update: &Value) -> GrokDispatchClaim {
         self.last_idle_was_task_completed = false;
-        let terminal_task_id = task_completed_prompt_task_id(update);
+        let terminal_task_id = grok_task_completed_prompt_task_id(update);
 
         if self.episode.is_active() {
+            let Some(terminal_match) = grok_autonomous_terminal_match(
+                update,
+                &self.episode.task_ids,
+                &self.episode.candidate_task_ids,
+                self.episode.allow_legacy_trigger,
+            ) else {
+                return GrokDispatchClaim::Unclaimed;
+            };
             if !self.episode.candidate_task_ids.is_empty() {
-                let Some(task_id) = terminal_task_id else {
+                let GrokAutonomousTerminalMatch::Task(task_id) = terminal_match else {
                     return GrokDispatchClaim::Unclaimed;
                 };
-                if !self
-                    .episode
-                    .candidate_task_ids
-                    .iter()
-                    .any(|id| id == task_id)
-                {
-                    return GrokDispatchClaim::Unclaimed;
-                }
-                let resolved = vec![task_id.to_string()];
-                self.consume_expected_wakes(&resolved);
-                self.consume_settled_ids(&resolved);
-                self.episode.task_ids = resolved;
-                self.episode.candidate_task_ids.clear();
-            }
-            if terminal_task_id.is_some_and(|task_id| {
-                !self.episode.task_ids.is_empty()
-                    && !self.episode.task_ids.iter().any(|id| id == task_id)
-            }) {
-                return GrokDispatchClaim::Unclaimed;
+                self.resolve_candidate(task_id);
             }
             self.last_visible_is_user = false;
             self.close_wire_episode();
@@ -587,16 +722,29 @@ impl GrokAutonomousAdapter {
 
         let task_ids = vec![task_id.to_string()];
         let has_live_wake = self.expected_wakes.iter().any(|wake| wake.id == task_id);
-        if self.tombstone_covers_task_ids(&task_ids) && !has_live_wake {
+        let has_structured_disposition = self.has_structured_wake_disposition(task_id);
+        let persisted_wake =
+            (!has_live_wake && !has_structured_disposition && !self.last_visible_is_user)
+                .then(|| self.persisted_trigger_match(task_id))
+                .flatten();
+        if !has_live_wake && persisted_wake.is_none() {
             return GrokDispatchClaim::Unclaimed;
         }
-        let has_persisted_wake = !has_live_wake && self.persisted_trigger_matches(task_id);
-        if !has_live_wake && !has_persisted_wake {
-            return GrokDispatchClaim::Unclaimed;
-        }
-        self.consume_expected_wakes(&task_ids);
-        self.consume_settled_ids(&task_ids);
-        self.open_episode(task_ids, Vec::new(), has_live_wake);
+        let trigger_seed_task_ids = self.seedable_expected_wake_ids(&task_ids, self.committed);
+        let wake_generations = self.wake_generations_for_ids(&task_ids);
+        self.consume_wake_generations(&wake_generations);
+        let allow_legacy_trigger = persisted_wake
+            .as_ref()
+            .is_some_and(|trigger| trigger.allow_legacy_terminal);
+        let trigger_event_id = persisted_wake.and_then(|trigger| trigger.event_id);
+        self.open_episode(
+            task_ids,
+            Vec::new(),
+            wake_generations,
+            trigger_seed_task_ids,
+            allow_legacy_trigger,
+            trigger_event_id,
+        );
         self.close_wire_episode();
         self.tail_once();
         GrokDispatchClaim::IdleTerminal
@@ -606,21 +754,49 @@ impl GrokAutonomousAdapter {
         &mut self,
         task_ids: Vec<String>,
         candidate_task_ids: Vec<String>,
-        seed_trigger_from_task_ids: bool,
+        wake_generations: Vec<WakeGeneration>,
+        trigger_seed_task_ids: Vec<String>,
+        allow_legacy_trigger: bool,
+        trigger_event_id: Option<String>,
     ) {
         self.episode = Episode {
             phase: EpisodePhase::Opening,
             task_ids,
             candidate_task_ids,
-            seed_trigger_from_task_ids,
+            wake_generations,
+            trigger_seed_task_ids,
+            allow_legacy_trigger,
+            deferred_turns: VecDeque::new(),
+            deferred_payload_bytes: 0,
+            deferred_overflowed: false,
             trigger_start: None,
+            trigger_event_id,
             published_id: None,
+            has_content: false,
+            wire_content_observed: false,
+            replacement_recovery: false,
             opened_at: Instant::now(),
             tail_from: self.committed,
             segment_from: self.committed,
             segment_record_count: 0,
             segment_part: 0,
         };
+    }
+
+    fn resolve_candidate(&mut self, task_id: &str) {
+        let resolved = vec![task_id.to_string()];
+        let generations: Vec<WakeGeneration> = self
+            .episode
+            .wake_generations
+            .iter()
+            .filter(|wake| wake.id == task_id)
+            .cloned()
+            .collect();
+        self.consume_wake_generations(&generations);
+        self.episode.task_ids = resolved;
+        self.episode.candidate_task_ids.clear();
+        self.episode.wake_generations = generations;
+        self.emit_deferred_turns();
     }
 
     fn close_wire_episode(&mut self) {
@@ -634,6 +810,7 @@ impl GrokAutonomousAdapter {
             self.tombstones.push_back(Tombstone {
                 trigger_start,
                 task_ids: self.episode.task_ids.clone(),
+                wake_generations: self.episode.wake_generations.clone(),
                 at: Instant::now(),
             });
             while self.tombstones.len() > TOMBSTONE_CAP {
@@ -665,71 +842,254 @@ impl GrokAutonomousAdapter {
         self.emit_accounting();
     }
 
-    fn complete_task(&mut self, task_id: String) {
+    fn complete_task(&mut self, task_id: String, generation: u64) {
         self.tasks.remove(&task_id);
         self.task_order.retain(|id| id != &task_id);
         self.recently_settled.retain(|s| s.id != task_id);
         self.recently_settled.push_back(SettledTask {
             id: task_id,
+            generation,
             at: Instant::now(),
         });
         self.emit_accounting();
     }
 
-    fn expect_wake(&mut self, task_id: String) {
+    fn expect_wake(&mut self, task_id: String, generation: u64) {
         self.expected_wakes.retain(|wake| wake.id != task_id);
         while self.expected_wakes.len() >= TASK_CAP {
             self.expected_wakes.pop_front();
         }
-        self.expected_wakes.push_back(SettledTask {
+        self.expected_wakes.push_back(ExpectedWake {
             id: task_id,
+            generation,
+            at: Instant::now(),
+            seed_from: None,
+        });
+    }
+
+    fn record_wake_disposition(
+        &mut self,
+        task_id: String,
+        will_wake: Option<bool>,
+        generation: u64,
+    ) {
+        let supersedes_unstarted_episode = self.episode.is_active()
+            && !self.episode.has_content
+            && !self.episode.wire_content_observed
+            && (self.episode.task_ids.iter().any(|id| id == &task_id)
+                || self
+                    .episode
+                    .candidate_task_ids
+                    .iter()
+                    .any(|id| id == &task_id));
+        if supersedes_unstarted_episode {
+            self.episode = Episode::dormant();
+        }
+        self.expected_wakes.retain(|wake| wake.id != task_id);
+        self.structured_wake_dispositions
+            .retain(|disposition| disposition.id != task_id);
+        let Some(will_wake) = will_wake else {
+            return;
+        };
+        self.remember_wake_disposition(task_id.clone(), generation);
+        if will_wake {
+            self.expect_wake(task_id, generation);
+        }
+    }
+
+    fn remember_wake_disposition(&mut self, task_id: String, generation: u64) {
+        while self.structured_wake_dispositions.len() >= TASK_CAP {
+            self.structured_wake_dispositions.pop_front();
+        }
+        self.structured_wake_dispositions.push_back(SettledTask {
+            id: task_id,
+            generation,
             at: Instant::now(),
         });
+    }
+
+    fn has_structured_wake_disposition(&self, task_id: &str) -> bool {
+        self.structured_wake_dispositions
+            .iter()
+            .any(|disposition| disposition.id == task_id)
     }
 
     fn expected_wake_evidence(
         &self,
         reminder_ids: &[String],
         is_legacy_reminder: bool,
-    ) -> Option<(Vec<String>, Vec<String>)> {
+    ) -> Option<(Vec<String>, Vec<String>, bool)> {
         let matching: Vec<String> = reminder_ids
             .iter()
             .filter(|id| self.expected_wakes.iter().any(|wake| wake.id == **id))
             .cloned()
             .collect();
         if !matching.is_empty() {
-            return Some((matching, Vec::new()));
+            return Some((matching, Vec::new(), true));
         }
         if is_legacy_reminder {
-            return Some((reminder_ids.to_vec(), Vec::new()));
+            let fallback_ids: Vec<String> = reminder_ids
+                .iter()
+                .filter(|id| !self.has_structured_wake_disposition(id))
+                .cloned()
+                .collect();
+            if !fallback_ids.is_empty() {
+                return Some((fallback_ids, Vec::new(), false));
+            }
         }
         match self.expected_wakes.len() {
             0 => None,
-            1 => Some((vec![self.expected_wakes.front()?.id.clone()], Vec::new())),
+            1 => Some((
+                vec![self.expected_wakes.front()?.id.clone()],
+                Vec::new(),
+                true,
+            )),
             _ => Some((
                 Vec::new(),
                 self.expected_wakes
                     .iter()
                     .map(|wake| wake.id.clone())
                     .collect(),
+                true,
             )),
         }
     }
 
-    fn consume_expected_wakes(&mut self, task_ids: &[String]) {
-        self.expected_wakes
-            .retain(|wake| !task_ids.iter().any(|id| id == &wake.id));
+    fn wake_generations_for_ids(&self, task_ids: &[String]) -> Vec<WakeGeneration> {
+        task_ids
+            .iter()
+            .filter_map(|task_id| {
+                self.expected_wakes
+                    .iter()
+                    .find(|wake| wake.id == *task_id)
+                    .map(|wake| wake.generation)
+                    .or_else(|| {
+                        self.recently_settled
+                            .iter()
+                            .find(|settled| settled.id == *task_id)
+                            .map(|settled| settled.generation)
+                    })
+                    .map(|generation| WakeGeneration {
+                        id: task_id.clone(),
+                        generation,
+                    })
+            })
+            .collect()
     }
 
-    fn persisted_trigger_matches(&mut self, task_id: &str) -> bool {
-        let Some(path) = self.resolve_updates_path() else {
-            return false;
-        };
+    fn consume_wake_generations(&mut self, generations: &[WakeGeneration]) {
+        self.expected_wakes.retain(|wake| {
+            !generations.iter().any(|generation| {
+                generation.id == wake.id && generation.generation == wake.generation
+            })
+        });
+        self.recently_settled.retain(|settled| {
+            !generations.iter().any(|generation| {
+                generation.id == settled.id && generation.generation == settled.generation
+            })
+        });
+    }
+
+    fn seedable_expected_wake_ids(&self, task_ids: &[String], boundary: u64) -> Vec<String> {
+        self.expected_wakes
+            .iter()
+            .filter(|wake| {
+                task_ids.iter().any(|id| id == &wake.id)
+                    && wake
+                        .seed_from
+                        .is_some_and(|seed_from| seed_from <= boundary)
+            })
+            .map(|wake| wake.id.clone())
+            .collect()
+    }
+
+    fn mark_expected_wakes_seedable(&mut self, task_ids: &[String], seed_from: u64) {
+        for wake in &mut self.expected_wakes {
+            if task_ids.iter().any(|id| id == &wake.id) {
+                wake.seed_from = Some(
+                    wake.seed_from
+                        .map_or(seed_from, |existing| existing.min(seed_from)),
+                );
+            }
+        }
+    }
+
+    fn mark_persisted_expected_wakes(&mut self, bytes: &[u8], base_offset: u64) {
+        for (relative_start, record) in grok_complete_records(bytes) {
+            let Some(update) = record_update(record) else {
+                continue;
+            };
+            let Some((task_id, Some(true))) = task_completion_wake_disposition(&update) else {
+                continue;
+            };
+            let record_end = base_offset
+                .saturating_add(relative_start)
+                .saturating_add(record.len() as u64);
+            self.mark_expected_wakes_seedable(&[task_id], record_end);
+        }
+    }
+
+    fn persisted_trigger_match(&mut self, task_id: &str) -> Option<HiddenTrigger> {
+        let path = self.resolve_updates_path()?;
         let Ok(batch) = read_complete_record_batch(&path, self.committed) else {
-            return false;
+            return None;
         };
-        find_hidden_trigger(&batch.bytes, self.committed, &[])
-            .is_some_and(|trigger| trigger.contains_task_id(task_id))
+        let required = vec![task_id.to_string()];
+        find_hidden_trigger(&batch.bytes, self.committed, &required, &[], true, None)
+            .trigger
+            .filter(|trigger| !self.is_tombstoned(trigger.start))
+    }
+
+    fn defer_candidate_turn(&mut self, segment_part: u32, turn: MessageTurn) {
+        let payload_bytes = normalized_turn_payload_len(&turn);
+        while self
+            .episode
+            .deferred_payload_bytes
+            .saturating_add(payload_bytes)
+            > EPISODE_PAYLOAD_MAX_BYTES
+        {
+            let Some(evicted) = self.episode.deferred_turns.pop_front() else {
+                break;
+            };
+            self.episode.deferred_payload_bytes = self
+                .episode
+                .deferred_payload_bytes
+                .saturating_sub(evicted.payload_bytes);
+            self.episode.deferred_overflowed = true;
+        }
+        if payload_bytes <= EPISODE_PAYLOAD_MAX_BYTES {
+            self.episode.deferred_payload_bytes = self
+                .episode
+                .deferred_payload_bytes
+                .saturating_add(payload_bytes);
+            self.episode.deferred_turns.push_back(DeferredTurn {
+                segment_part,
+                turn,
+                payload_bytes,
+            });
+        } else {
+            self.episode.deferred_overflowed = true;
+        }
+        if self.episode.deferred_overflowed {
+            self.needs_detail_refetch = true;
+        }
+    }
+
+    fn emit_deferred_turns(&mut self) {
+        let Some(trigger_start) = self.episode.trigger_start else {
+            return;
+        };
+        let base_id =
+            grok_autonomous_turn_id(&self.session_id, &self.episode.task_ids, trigger_start);
+        let deferred = std::mem::take(&mut self.episode.deferred_turns);
+        self.episode.deferred_payload_bytes = 0;
+        if self.episode.deferred_overflowed {
+            self.needs_detail_refetch = true;
+        }
+        for mut entry in deferred {
+            entry.turn.id = segmented_turn_id(&base_id, entry.segment_part);
+            self.emit_turn(entry.turn);
+        }
     }
 
     fn emit_accounting(&mut self) {
@@ -741,6 +1101,8 @@ impl GrokAutonomousAdapter {
             outstanding: self.outstanding(),
             settled: Vec::new(),
             watermark: self.committed,
+            transcript_reset: false,
+            payload_bytes: 0,
         });
     }
 
@@ -748,12 +1110,42 @@ impl GrokAutonomousAdapter {
         if turn.autonomous_origin != Some(AutonomousTurnOrigin::BackgroundTask) {
             return;
         }
-        self.emitted = Some(GrokEmitted {
-            turns: vec![turn],
-            outstanding: self.outstanding(),
-            settled: Vec::new(),
-            watermark: self.committed,
-        });
+        let original_payload_bytes = normalized_turn_payload_len(&turn);
+        let Some(turn) = cap_normalized_turn_payload(turn) else {
+            self.needs_detail_refetch = true;
+            return;
+        };
+        let payload_bytes = normalized_turn_payload_len(&turn);
+        let outstanding = self.outstanding();
+        let mut payload_reduced = payload_bytes < original_payload_bytes;
+        if let Some(emitted) = self.emitted.as_mut() {
+            while emitted.payload_bytes.saturating_add(payload_bytes) > EPISODE_PAYLOAD_MAX_BYTES {
+                if emitted.turns.is_empty() {
+                    break;
+                }
+                let removed = emitted.turns.remove(0);
+                emitted.payload_bytes = emitted
+                    .payload_bytes
+                    .saturating_sub(normalized_turn_payload_len(&removed));
+                payload_reduced = true;
+            }
+            emitted.turns.push(turn);
+            emitted.payload_bytes = emitted.payload_bytes.saturating_add(payload_bytes);
+            emitted.outstanding = outstanding;
+            emitted.watermark = self.committed;
+        } else {
+            self.emitted = Some(GrokEmitted {
+                turns: vec![turn],
+                outstanding,
+                settled: Vec::new(),
+                watermark: self.committed,
+                transcript_reset: false,
+                payload_bytes,
+            });
+        }
+        if payload_reduced {
+            self.needs_detail_refetch = true;
+        }
     }
 
     fn path_is_readable(&self) -> bool {
@@ -768,17 +1160,52 @@ impl GrokAutonomousAdapter {
             .any(|t| t.trigger_start == trigger_start)
     }
 
-    fn tombstone_covers_task_ids(&self, task_ids: &[String]) -> bool {
+    fn tombstone_covers_wake(
+        &self,
+        task_ids: &[String],
+        wake_generations: &[WakeGeneration],
+    ) -> bool {
         !task_ids.is_empty()
             && self.tombstones.iter().any(|tombstone| {
                 !tombstone.task_ids.is_empty()
-                    && task_ids.iter().all(|id| tombstone.task_ids.contains(id))
+                    && task_ids.iter().all(|id| {
+                        if let Some(current) = wake_generations.iter().find(|wake| &wake.id == id) {
+                            tombstone.wake_generations.contains(current)
+                        } else {
+                            tombstone.task_ids.contains(id)
+                        }
+                    })
             })
     }
 
-    fn consume_settled_ids(&mut self, task_ids: &[String]) {
-        self.recently_settled
-            .retain(|settled| !task_ids.iter().any(|id| id == &settled.id));
+    fn clear_wake_evidence(&mut self) {
+        let invalidated: Vec<(String, u64)> = self
+            .recently_settled
+            .iter()
+            .map(|settled| (settled.id.clone(), settled.generation))
+            .collect();
+        for (task_id, generation) in invalidated {
+            self.structured_wake_dispositions
+                .retain(|disposition| disposition.id != task_id);
+            self.remember_wake_disposition(task_id, generation);
+        }
+        self.recently_settled.clear();
+        self.expected_wakes.clear();
+        // Keep structured/foreground-invalidated dispositions as a generation
+        // barrier. A new completion for the same task id replaces it.
+    }
+
+    fn rebaseline_committed(&mut self) {
+        let Some(path) = self.resolve_updates_path() else {
+            return;
+        };
+        let Ok(watermark) = complete_file_watermark(&path) else {
+            return;
+        };
+        self.committed = watermark;
+        self.baseline_ready = true;
+        self.file_identity = TranscriptFileIdentity::for_path(&path).ok();
+        self.last_visible_is_user = last_visible_committed_is_user(&path);
     }
 
     fn adopt_updates_path(&mut self, path: &Path) {
@@ -825,11 +1252,17 @@ impl GrokAutonomousAdapter {
         });
         self.recently_settled.retain(|s| s.at.elapsed() < max_age);
         self.expected_wakes.retain(|s| s.at.elapsed() < max_age);
+        self.structured_wake_dispositions
+            .retain(|s| s.at.elapsed() < max_age);
         self.tombstones.retain(|t| t.at.elapsed() < max_age);
         if self.episode.is_active() && self.episode.opened_at.elapsed() >= max_age {
-            if self.episode.phase == EpisodePhase::AwaitingPersistedTerminal {
+            if self.episode.phase == EpisodePhase::AwaitingPersistedTerminal
+                || !self.episode.deferred_turns.is_empty()
+            {
                 self.needs_detail_refetch = true;
             }
+            self.episode.deferred_turns.clear();
+            self.episode.deferred_payload_bytes = 0;
             self.episode.phase = EpisodePhase::Abandoned;
         }
     }
@@ -863,16 +1296,82 @@ impl GrokAutonomousAdapter {
     }
 
     fn reset_transcript_generation(&mut self, path: &Path, identity: TranscriptFileIdentity) {
-        self.episode = Episode::dormant();
-        self.expected_wakes.clear();
+        let previous_episode = std::mem::replace(&mut self.episode, Episode::dormant());
         self.tombstones.clear();
         self.provider_record_identities.clear();
-        self.committed = complete_file_watermark(path).unwrap_or(0);
+        let replacement_watermark = complete_file_watermark(path).unwrap_or(0);
+        for wake in &mut self.expected_wakes {
+            wake.seed_from = Some(replacement_watermark);
+        }
+        let previous_trigger_event_id = previous_episode.trigger_event_id.clone();
+        if previous_episode.is_active() && previous_trigger_event_id.is_some() {
+            let awaiting_terminal =
+                previous_episode.phase == EpisodePhase::AwaitingPersistedTerminal;
+            self.episode = Episode {
+                phase: if awaiting_terminal {
+                    EpisodePhase::AwaitingPersistedTerminal
+                } else {
+                    EpisodePhase::Opening
+                },
+                task_ids: previous_episode.task_ids,
+                candidate_task_ids: previous_episode.candidate_task_ids,
+                wake_generations: previous_episode.wake_generations,
+                trigger_seed_task_ids: Vec::new(),
+                allow_legacy_trigger: previous_episode.allow_legacy_trigger,
+                deferred_turns: VecDeque::new(),
+                deferred_payload_bytes: 0,
+                deferred_overflowed: false,
+                trigger_start: None,
+                trigger_event_id: previous_trigger_event_id,
+                published_id: None,
+                has_content: previous_episode.has_content,
+                wire_content_observed: previous_episode.wire_content_observed,
+                replacement_recovery: true,
+                opened_at: Instant::now(),
+                tail_from: 0,
+                segment_from: 0,
+                segment_record_count: 0,
+                segment_part: 0,
+            };
+            let required_task_ids = if self.episode.candidate_task_ids.is_empty() {
+                self.episode.task_ids.clone()
+            } else {
+                self.episode.candidate_task_ids.clone()
+            };
+            let replacement_has_evidence = read_complete_record_batch(path, 0)
+                .ok()
+                .map(|batch| {
+                    let search = find_hidden_trigger(
+                        &batch.bytes,
+                        0,
+                        &required_task_ids,
+                        &[],
+                        self.episode.allow_legacy_trigger,
+                        self.episode.trigger_event_id.as_deref(),
+                    );
+                    let at_physical_eof = std::fs::metadata(path)
+                        .map(|metadata| batch.next_offset == metadata.len())
+                        .unwrap_or(false);
+                    search.trigger.is_some() || !at_physical_eof
+                })
+                .unwrap_or(true);
+            if replacement_has_evidence {
+                self.committed = 0;
+            } else {
+                self.episode = Episode::dormant();
+                self.committed = replacement_watermark;
+            }
+        } else {
+            self.committed = replacement_watermark;
+        }
         self.baseline_ready = true;
         self.file_identity = Some(identity);
         self.last_visible_is_user = last_visible_committed_is_user(path);
         self.needs_detail_refetch = true;
         self.emit_accounting();
+        if let Some(emitted) = self.emitted.as_mut() {
+            emitted.transcript_reset = true;
+        }
     }
 }
 
@@ -914,7 +1413,7 @@ fn extract_task_id(update: &Value) -> Option<String> {
 fn grok_dispatch_update<'a>(method: &str, params: &'a Value) -> Option<&'a Value> {
     let logical_method = method.strip_prefix('_').unwrap_or(method);
     let expected_kind = match logical_method {
-        "session/update" | "x.ai/session/update" => None,
+        "session/update" | "x.ai/session/update" | "x.ai/session_notification" => None,
         "x.ai/task_backgrounded" => Some("task_backgrounded"),
         "x.ai/task_completed" => Some("task_completed"),
         _ => return None,
@@ -928,19 +1427,13 @@ fn grok_dispatch_update<'a>(method: &str, params: &'a Value) -> Option<&'a Value
     Some(update)
 }
 
-fn task_completed_prompt_task_id(update: &Value) -> Option<&str> {
-    update
-        .get("prompt_id")
-        .and_then(Value::as_str)
-        .and_then(|prompt_id| prompt_id.strip_prefix("task-completed-"))
-        .filter(|task_id| !task_id.is_empty())
-}
-
-fn structured_wake_task_id(update: &Value) -> Option<String> {
-    (update.get("sessionUpdate").and_then(Value::as_str) == Some("task_completed")
-        && update.get("will_wake").and_then(Value::as_bool) == Some(true))
-    .then(|| extract_task_id(update))
-    .flatten()
+fn task_completion_wake_disposition(update: &Value) -> Option<(String, Option<bool>)> {
+    (update.get("sessionUpdate").and_then(Value::as_str) == Some("task_completed"))
+        .then(|| {
+            extract_task_id(update)
+                .map(|task_id| (task_id, update.get("will_wake").and_then(Value::as_bool)))
+        })
+        .flatten()
 }
 
 struct HiddenTrigger {
@@ -948,6 +1441,13 @@ struct HiddenTrigger {
     end: u64,
     task_ids: Vec<String>,
     candidate_task_ids: Vec<String>,
+    allow_legacy_terminal: bool,
+    event_id: Option<String>,
+}
+
+struct HiddenTriggerSearch {
+    trigger: Option<HiddenTrigger>,
+    pending_task_ids: Vec<String>,
 }
 
 impl HiddenTrigger {
@@ -969,13 +1469,17 @@ fn trigger_matches_episode(trigger: &HiddenTrigger, episode: &Episode) -> bool {
 fn find_hidden_trigger(
     bytes: &[u8],
     base_offset: u64,
-    expected_task_ids: &[String],
-) -> Option<HiddenTrigger> {
+    required_task_ids: &[String],
+    seed_task_ids: &[String],
+    allow_legacy_trigger: bool,
+    required_event_id: Option<&str>,
+) -> HiddenTriggerSearch {
     let mut last_is_user = false;
-    let mut pending_task_ids: VecDeque<String> = expected_task_ids.iter().cloned().collect();
+    let mut pending_task_ids: VecDeque<String> = seed_task_ids.iter().cloned().collect();
+    let mut structured_dispositions: HashSet<String> = seed_task_ids.iter().cloned().collect();
     for (relative_start, record) in grok_complete_records(bytes) {
         let start = base_offset.saturating_add(relative_start);
-        let Some(update) = record_update(record) else {
+        let Some((update, event_id)) = record_update_and_event_id(record) else {
             continue;
         };
         let kind = update
@@ -986,9 +1490,14 @@ fn find_hidden_trigger(
             .pointer("/_meta/hideFromScrollback")
             .and_then(Value::as_bool)
             == Some(true);
-        if let Some(task_id) = structured_wake_task_id(&update) {
-            if !pending_task_ids.iter().any(|id| id == &task_id) {
-                pending_task_ids.push_back(task_id);
+        if let Some((task_id, will_wake)) = task_completion_wake_disposition(&update) {
+            pending_task_ids.retain(|pending| pending != &task_id);
+            structured_dispositions.remove(&task_id);
+            if let Some(will_wake) = will_wake {
+                structured_dispositions.insert(task_id.clone());
+                if will_wake {
+                    pending_task_ids.push_back(task_id);
+                }
             }
             continue;
         }
@@ -1006,26 +1515,59 @@ fn find_hidden_trigger(
                 .filter(|id| pending_task_ids.iter().any(|pending| pending == *id))
                 .cloned()
                 .collect();
-            let (task_ids, candidate_task_ids) = if !structured_task_ids.is_empty() {
-                (structured_task_ids, Vec::new())
-            } else if is_grok_background_task_reminder(text) {
-                (legacy_task_ids, Vec::new())
+            let legacy_fallback_task_ids: Vec<String> = legacy_task_ids
+                .iter()
+                .filter(|id| allow_legacy_trigger && !structured_dispositions.contains(*id))
+                .cloned()
+                .collect();
+            let (task_ids, candidate_task_ids, allow_legacy_terminal) = if !structured_task_ids
+                .is_empty()
+            {
+                (structured_task_ids, Vec::new(), false)
+            } else if is_grok_background_task_reminder(text) && !legacy_fallback_task_ids.is_empty()
+            {
+                (legacy_fallback_task_ids, Vec::new(), true)
             } else if pending_task_ids.len() == 1 {
                 (
                     pending_task_ids.pop_front().into_iter().collect(),
                     Vec::new(),
+                    false,
                 )
             } else if !pending_task_ids.is_empty() {
-                (Vec::new(), pending_task_ids.iter().cloned().collect())
+                (
+                    Vec::new(),
+                    pending_task_ids.iter().cloned().collect(),
+                    false,
+                )
             } else {
                 continue;
             };
-            return Some(HiddenTrigger {
+            let trigger = HiddenTrigger {
                 start,
                 end: start + record.len() as u64,
                 task_ids,
                 candidate_task_ids,
-            });
+                allow_legacy_terminal,
+                event_id,
+            };
+            if required_event_id
+                .is_some_and(|required| trigger.event_id.as_deref() != Some(required))
+            {
+                pending_task_ids.retain(|id| !trigger.contains_task_id(id));
+                continue;
+            }
+            if required_task_ids.is_empty()
+                || required_task_ids
+                    .iter()
+                    .any(|id| trigger.contains_task_id(id))
+            {
+                return HiddenTriggerSearch {
+                    trigger: Some(trigger),
+                    pending_task_ids: pending_task_ids.into(),
+                };
+            }
+            pending_task_ids.retain(|id| !trigger.contains_task_id(id));
+            continue;
         }
         if kind == "user_message_chunk" {
             last_is_user = true;
@@ -1037,20 +1579,39 @@ fn find_hidden_trigger(
             last_is_user = false;
         }
     }
-    None
+    HiddenTriggerSearch {
+        trigger: None,
+        pending_task_ids: pending_task_ids.into(),
+    }
 }
 
-fn file_has_turn_completed_after(bytes: &[u8], base_offset: u64) -> bool {
-    grok_complete_records(bytes).any(|(start, record)| {
-        let _absolute_start = base_offset.saturating_add(start);
-        record_update(record)
-            .and_then(|update| {
-                update
-                    .get("sessionUpdate")
-                    .and_then(Value::as_str)
-                    .map(|kind| kind == "turn_completed")
-            })
-            .unwrap_or(false)
+enum PersistedTerminalMatch {
+    Legacy,
+    Task(String),
+}
+
+fn persisted_turn_completed_match(
+    bytes: &[u8],
+    task_ids: &[String],
+    candidate_task_ids: &[String],
+    allow_legacy_terminal: bool,
+) -> Option<PersistedTerminalMatch> {
+    grok_complete_records(bytes).find_map(|(_, record)| {
+        let update = record_update(record)?;
+        if update.get("sessionUpdate").and_then(Value::as_str) != Some("turn_completed") {
+            return None;
+        }
+        match grok_autonomous_terminal_match(
+            &update,
+            task_ids,
+            candidate_task_ids,
+            allow_legacy_terminal,
+        )? {
+            GrokAutonomousTerminalMatch::Legacy => Some(PersistedTerminalMatch::Legacy),
+            GrokAutonomousTerminalMatch::Task(task_id) => {
+                Some(PersistedTerminalMatch::Task(task_id.to_string()))
+            }
+        }
     })
 }
 
@@ -1063,9 +1624,26 @@ fn segmented_turn_id(base: &str, part: u32) -> String {
 }
 
 fn record_update(record: &[u8]) -> Option<Value> {
+    record_update_and_event_id(record).map(|(update, _)| update)
+}
+
+fn record_update_and_event_id(record: &[u8]) -> Option<(Value, Option<String>)> {
     let payload = grok_record_payload(record);
     let value: Value = serde_json::from_slice(payload).ok()?;
-    value.pointer("/params/update").cloned()
+    let update = value.pointer("/params/update").cloned()?;
+    let event_id = value
+        .pointer("/params/_meta/eventId")
+        .and_then(Value::as_str)
+        .filter(|event_id| !event_id.is_empty())
+        .map(str::to_string);
+    Some((update, event_id))
+}
+
+fn dispatch_event_id(params: &Value) -> Option<&str> {
+    params
+        .pointer("/_meta/eventId")
+        .and_then(Value::as_str)
+        .filter(|event_id| !event_id.is_empty())
 }
 
 fn last_visible_committed_is_user(path: &Path) -> bool {
@@ -1180,9 +1758,22 @@ mod tests {
     }
 
     fn jsonl_update(method: &str, update: &Value, timestamp: i64) -> String {
+        jsonl_update_with_event_id(method, update, timestamp, None)
+    }
+
+    fn jsonl_update_with_event_id(
+        method: &str,
+        update: &Value,
+        timestamp: i64,
+        event_id: Option<&str>,
+    ) -> String {
         json!({
             "method": method,
-            "params": {"sessionId": "s", "update": update},
+            "params": {
+                "sessionId": "s",
+                "update": update,
+                "_meta": event_id.map(|event_id| json!({"eventId": event_id})),
+            },
             "timestamp": timestamp
         })
         .to_string()
@@ -1299,6 +1890,53 @@ mod tests {
     }
 
     #[test]
+    fn empty_assistant_chunk_with_persisted_terminal_closes_episode() {
+        let (_dir, path) = tmp_updates("");
+        let mut adapter = GrokAutonomousAdapter::new_for_test(path.clone());
+        adapter.on_session_ready("session-empty-terminal", &path);
+        let completed = json!({
+            "sessionUpdate":"task_completed",
+            "task_snapshot":{"task_id":"task-a"},
+            "will_wake":true
+        });
+        let hidden = json!({
+            "sessionUpdate":"user_message_chunk",
+            "content":{"type":"text","text":"unknown hidden event"},
+            "_meta":{"hideFromScrollback":true}
+        });
+        adapter.on_raw_dispatch(
+            "_x.ai/task_completed",
+            &json!({"update":completed}),
+            Ownership::Idle,
+        );
+        adapter.on_raw_dispatch("session/update", &json!({"update":hidden}), Ownership::Idle);
+        let terminal = json!({
+            "sessionUpdate":"turn_completed",
+            "prompt_id":"task-completed-task-a",
+            "stop_reason":"end_turn"
+        });
+        std::fs::write(
+            &path,
+            [
+                jsonl_update("_x.ai/session/update", &completed, 1),
+                jsonl_update("session/update", &hidden, 2),
+                jsonl_update("session/update", &agent_text_update(""), 3),
+                jsonl_update("_x.ai/session/update", &terminal, 4),
+            ]
+            .join("\n")
+                + "\n",
+        )
+        .unwrap();
+
+        adapter.tail_once();
+
+        assert!(!adapter.autonomous_busy());
+        assert_eq!(adapter.committed, complete_file_watermark(&path).unwrap());
+        assert!(adapter.take_emitted().turns.is_empty());
+        assert!(adapter.take_detail_refetch());
+    }
+
+    #[test]
     fn replacement_discards_episode_refetches_and_rebaselines_generation() {
         let (_dir, path) = tmp_updates("");
         let mut adapter = GrokAutonomousAdapter::new_for_test(path.clone());
@@ -1344,6 +1982,445 @@ mod tests {
         assert!(adapter.episode.published_id.is_none());
         assert_eq!(adapter.provider_record_identities.len(), 0);
         assert_eq!(adapter.committed, complete_file_watermark(&path).unwrap());
+    }
+
+    #[test]
+    fn replacement_with_an_incomplete_episode_keeps_tailing_until_live_terminal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("updates.jsonl");
+        std::fs::write(&path, "").unwrap();
+        let mut adapter = GrokAutonomousAdapter::new_for_test(path.clone());
+        adapter.on_session_ready("session-replacement-active", &path);
+        let completed = json!({
+            "sessionUpdate":"task_completed",
+            "task_snapshot":{"task_id":"task-a"},
+            "will_wake":true
+        });
+        let hidden = json!({
+            "sessionUpdate":"user_message_chunk",
+            "content":{"type":"text","text":"unknown hidden event"},
+            "_meta":{"hideFromScrollback":true}
+        });
+        for (method, live_method, update, timestamp, event_id) in [
+            (
+                "_x.ai/session/update",
+                "_x.ai/task_completed",
+                completed.clone(),
+                1,
+                "completion-current",
+            ),
+            (
+                "session/update",
+                "session/update",
+                hidden.clone(),
+                2,
+                "trigger-current",
+            ),
+            (
+                "session/update",
+                "session/update",
+                agent_text_update("old-partial"),
+                3,
+                "content-old",
+            ),
+        ] {
+            append_line(
+                &path,
+                &jsonl_update_with_event_id(method, &update, timestamp, Some(event_id)),
+            );
+            adapter.on_raw_dispatch(
+                live_method,
+                &json!({"update":update,"_meta":{"eventId":event_id}}),
+                Ownership::Idle,
+            );
+            adapter.take_emitted();
+        }
+        assert!(adapter.autonomous_busy());
+
+        let replacement = path.with_extension("replacement");
+        let replacement_prefix = [
+            jsonl_update_with_event_id(
+                "_x.ai/session/update",
+                &completed,
+                10,
+                Some("completion-current"),
+            ),
+            jsonl_update_with_event_id("session/update", &hidden, 11, Some("trigger-current")),
+            jsonl_update_with_event_id(
+                "session/update",
+                &agent_text_update("replacement-partial-"),
+                12,
+                Some("content-replacement"),
+            ),
+        ]
+        .join("\n")
+            + "\n";
+        std::fs::write(&replacement, replacement_prefix).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+
+        adapter.tail_once();
+        assert!(adapter.autonomous_busy());
+        assert!(adapter.take_detail_refetch());
+
+        let final_chunk = agent_text_update("final");
+        append_line(&path, &jsonl_update("session/update", &final_chunk, 13));
+        adapter.on_raw_dispatch(
+            "session/update",
+            &json!({"update":final_chunk}),
+            Ownership::Idle,
+        );
+        let mut emitted = adapter.take_emitted().turns;
+        let terminal = json!({
+            "sessionUpdate":"turn_completed",
+            "prompt_id":"task-completed-task-a",
+            "stop_reason":"end_turn"
+        });
+        append_line(&path, &jsonl_update("_x.ai/session/update", &terminal, 14));
+        let claim = adapter.on_raw_dispatch(
+            "x.ai/session_notification",
+            &json!({"update":terminal}),
+            Ownership::Idle,
+        );
+        emitted.extend(adapter.take_emitted().turns);
+
+        assert!(claim.is_idle_terminal());
+        assert!(emitted.iter().any(|turn| {
+            turn.autonomous_origin == Some(AutonomousTurnOrigin::BackgroundTask)
+                && turn.blocks.iter().any(
+                    |block| matches!(block, ContentBlock::Text { text } if text == "replacement-partial-final"),
+                )
+        }));
+        assert!(!adapter.autonomous_busy());
+    }
+
+    #[test]
+    fn replacement_preserves_queued_wake_generations_outside_the_active_episode() {
+        for queued_task_id in ["task-a", "task-b"] {
+            let (_dir, path) = tmp_updates("");
+            let session_id = format!("session-replacement-queued-{queued_task_id}");
+            let mut adapter = GrokAutonomousAdapter::new_for_test(path.clone());
+            adapter.on_session_ready(&session_id, &path);
+            let active_completed = json!({
+                "sessionUpdate":"task_completed",
+                "task_snapshot":{"task_id":"task-a"},
+                "will_wake":true
+            });
+            let active_hidden = json!({
+                "sessionUpdate":"user_message_chunk",
+                "content":{"type":"text","text":"unknown active hidden event"},
+                "_meta":{"hideFromScrollback":true}
+            });
+            for (method, live_method, update, timestamp, event_id) in [
+                (
+                    "_x.ai/session/update",
+                    "_x.ai/task_completed",
+                    active_completed.clone(),
+                    1,
+                    "completion-active",
+                ),
+                (
+                    "session/update",
+                    "session/update",
+                    active_hidden.clone(),
+                    2,
+                    "trigger-active",
+                ),
+                (
+                    "session/update",
+                    "session/update",
+                    agent_text_update("active reply"),
+                    3,
+                    "content-active",
+                ),
+            ] {
+                append_line(
+                    &path,
+                    &jsonl_update_with_event_id(method, &update, timestamp, Some(event_id)),
+                );
+                adapter.on_raw_dispatch(
+                    live_method,
+                    &json!({"update":update,"_meta":{"eventId":event_id}}),
+                    Ownership::Idle,
+                );
+                adapter.take_emitted();
+            }
+            assert!(adapter.autonomous_busy());
+
+            let queued_completed = json!({
+                "sessionUpdate":"task_completed",
+                "task_snapshot":{"task_id":queued_task_id},
+                "will_wake":true
+            });
+            append_line(
+                &path,
+                &jsonl_update_with_event_id(
+                    "_x.ai/session/update",
+                    &queued_completed,
+                    4,
+                    Some("completion-queued"),
+                ),
+            );
+            adapter.on_raw_dispatch(
+                "_x.ai/task_completed",
+                &json!({"update":queued_completed,"_meta":{"eventId":"completion-queued"}}),
+                Ownership::Idle,
+            );
+            adapter.take_emitted();
+
+            let active_terminal = json!({
+                "sessionUpdate":"turn_completed",
+                "prompt_id":"task-completed-task-a",
+                "stop_reason":"end_turn"
+            });
+            let replacement = path.with_extension("replacement");
+            std::fs::write(
+                &replacement,
+                [
+                    jsonl_update_with_event_id(
+                        "_x.ai/session/update",
+                        &active_completed,
+                        10,
+                        Some("completion-active"),
+                    ),
+                    jsonl_update_with_event_id(
+                        "session/update",
+                        &active_hidden,
+                        11,
+                        Some("trigger-active"),
+                    ),
+                    jsonl_update_with_event_id(
+                        "session/update",
+                        &agent_text_update("replacement active reply"),
+                        12,
+                        Some("content-replacement"),
+                    ),
+                    jsonl_update_with_event_id(
+                        "_x.ai/session/update",
+                        &queued_completed,
+                        13,
+                        Some("completion-queued"),
+                    ),
+                    jsonl_update_with_event_id(
+                        "x.ai/session_notification",
+                        &active_terminal,
+                        14,
+                        Some("terminal-active"),
+                    ),
+                ]
+                .join("\n")
+                    + "\n",
+            )
+            .unwrap();
+            std::fs::remove_file(&path).unwrap();
+            std::fs::rename(&replacement, &path).unwrap();
+
+            adapter.tail_once();
+            adapter.tail_once();
+            adapter.take_emitted();
+            assert!(!adapter.autonomous_busy());
+
+            let queued_hidden = json!({
+                "sessionUpdate":"user_message_chunk",
+                "content":{"type":"text","text":"wording changed hidden wake"},
+                "_meta":{"hideFromScrollback":true}
+            });
+            let queued_terminal = json!({
+                "sessionUpdate":"turn_completed",
+                "prompt_id":format!("task-completed-{queued_task_id}"),
+                "stop_reason":"end_turn"
+            });
+            for (method, update, timestamp, event_id) in [
+                (
+                    "session/update",
+                    queued_hidden.clone(),
+                    15,
+                    "trigger-queued",
+                ),
+                (
+                    "session/update",
+                    agent_text_update("queued reply"),
+                    16,
+                    "content-queued",
+                ),
+                (
+                    "x.ai/session_notification",
+                    queued_terminal,
+                    17,
+                    "terminal-queued",
+                ),
+            ] {
+                append_line(
+                    &path,
+                    &jsonl_update_with_event_id(method, &update, timestamp, Some(event_id)),
+                );
+            }
+            let claim = adapter.on_raw_dispatch(
+                "session/update",
+                &json!({"update":queued_hidden,"_meta":{"eventId":"trigger-queued"}}),
+                Ownership::Idle,
+            );
+            adapter.tail_once();
+            let emitted = adapter.take_emitted();
+
+            assert_eq!(claim, GrokDispatchClaim::AutonomousContent);
+            assert!(emitted.turns.iter().any(|turn| {
+                turn.id.contains(&format!("+{queued_task_id}+"))
+                    && turn.blocks.iter().any(
+                        |block| matches!(block, ContentBlock::Text { text } if text == "queued reply"),
+                    )
+            }));
+            assert!(!adapter.autonomous_busy());
+        }
+    }
+
+    #[test]
+    fn replacement_rejects_a_stale_same_id_trigger_event() {
+        let (_dir, path) = tmp_updates("");
+        let mut adapter = GrokAutonomousAdapter::new_for_test(path.clone());
+        adapter.on_session_ready("session-replacement-stale", &path);
+        let completed = json!({
+            "sessionUpdate":"task_completed",
+            "task_snapshot":{"task_id":"task-a"},
+            "will_wake":true
+        });
+        let hidden = json!({
+            "sessionUpdate":"user_message_chunk",
+            "content":{"type":"text","text":"unknown hidden event"},
+            "_meta":{"hideFromScrollback":true}
+        });
+        for (method, live_method, update, timestamp, event_id) in [
+            (
+                "_x.ai/session/update",
+                "_x.ai/task_completed",
+                completed.clone(),
+                1,
+                "completion-current",
+            ),
+            (
+                "session/update",
+                "session/update",
+                hidden.clone(),
+                2,
+                "trigger-current",
+            ),
+            (
+                "session/update",
+                "session/update",
+                agent_text_update("current-partial"),
+                3,
+                "content-current",
+            ),
+        ] {
+            append_line(
+                &path,
+                &jsonl_update_with_event_id(method, &update, timestamp, Some(event_id)),
+            );
+            adapter.on_raw_dispatch(
+                live_method,
+                &json!({"update":update,"_meta":{"eventId":event_id}}),
+                Ownership::Idle,
+            );
+            adapter.take_emitted();
+        }
+        assert!(adapter.autonomous_busy());
+
+        let replacement = path.with_extension("replacement");
+        std::fs::write(
+            &replacement,
+            [
+                jsonl_update_with_event_id(
+                    "_x.ai/session/update",
+                    &completed,
+                    10,
+                    Some("completion-stale"),
+                ),
+                jsonl_update_with_event_id("session/update", &hidden, 11, Some("trigger-stale")),
+                jsonl_update_with_event_id(
+                    "session/update",
+                    &agent_text_update("stale-reply"),
+                    12,
+                    Some("content-stale"),
+                ),
+            ]
+            .join("\n")
+                + "\n",
+        )
+        .unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+
+        adapter.tail_once();
+
+        assert!(!adapter.autonomous_busy());
+        assert!(adapter.take_detail_refetch());
+        let emitted = adapter.take_emitted();
+        assert!(emitted.transcript_reset);
+        assert!(emitted.turns.is_empty());
+    }
+
+    #[test]
+    fn replacement_without_a_trigger_event_id_abandons_same_id_recovery() {
+        let (_dir, path) = tmp_updates("");
+        let mut adapter = GrokAutonomousAdapter::new_for_test(path.clone());
+        adapter.on_session_ready("session-replacement-no-event-id", &path);
+        let completed = json!({
+            "sessionUpdate":"task_completed",
+            "task_snapshot":{"task_id":"task-a"},
+            "will_wake":true
+        });
+        let hidden = json!({
+            "sessionUpdate":"user_message_chunk",
+            "content":{"type":"text","text":"unknown hidden event"},
+            "_meta":{"hideFromScrollback":true}
+        });
+        for (method, live_method, update, timestamp) in [
+            (
+                "_x.ai/session/update",
+                "_x.ai/task_completed",
+                completed.clone(),
+                1,
+            ),
+            ("session/update", "session/update", hidden.clone(), 2),
+            (
+                "session/update",
+                "session/update",
+                agent_text_update("current-partial"),
+                3,
+            ),
+        ] {
+            append_line(&path, &jsonl_update(method, &update, timestamp));
+            adapter.on_raw_dispatch(live_method, &json!({"update":update}), Ownership::Idle);
+            adapter.take_emitted();
+        }
+        assert!(adapter.autonomous_busy());
+
+        let replacement = path.with_extension("replacement");
+        std::fs::write(
+            &replacement,
+            [
+                jsonl_update("_x.ai/session/update", &completed, 10),
+                jsonl_update("session/update", &hidden, 11),
+                jsonl_update(
+                    "session/update",
+                    &agent_text_update("replacement-partial"),
+                    12,
+                ),
+            ]
+            .join("\n")
+                + "\n",
+        )
+        .unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+
+        adapter.tail_once();
+
+        assert!(!adapter.autonomous_busy());
+        assert!(adapter.take_detail_refetch());
+        let emitted = adapter.take_emitted();
+        assert!(emitted.transcript_reset);
+        assert!(emitted.turns.is_empty());
     }
 
     #[tokio::test]
@@ -1474,6 +2551,62 @@ mod tests {
         );
         adapter.tail_once();
         assert!(adapter.take_emitted().turns.is_empty());
+    }
+
+    #[test]
+    fn foreground_start_abandons_open_and_awaiting_persisted_terminal_episodes() {
+        for awaiting_terminal in [false, true] {
+            let (_dir, path) = tmp_updates("");
+            let session_id = if awaiting_terminal {
+                "session-foreground-awaiting"
+            } else {
+                "session-foreground-open"
+            };
+            let mut adapter = GrokAutonomousAdapter::new_for_test(path.clone());
+            adapter.on_session_ready(session_id, &path);
+            let completed = json!({
+                "sessionUpdate":"task_completed",
+                "task_snapshot":{"task_id":"task-a"},
+                "will_wake":true
+            });
+            let hidden = json!({
+                "sessionUpdate":"user_message_chunk",
+                "content":{"type":"text","text":"unknown hidden wake"},
+                "_meta":{"hideFromScrollback":true}
+            });
+            std::fs::write(
+                &path,
+                [
+                    jsonl_update("_x.ai/session/update", &completed, 1),
+                    jsonl_update("session/update", &hidden, 2),
+                    jsonl_update("session/update", &agent_text_update("stale reply"), 3),
+                ]
+                .join("\n")
+                    + "\n",
+            )
+            .unwrap();
+            adapter.on_raw_dispatch(
+                "_x.ai/task_completed",
+                &json!({"update":completed}),
+                Ownership::Idle,
+            );
+            adapter.on_raw_dispatch("session/update", &json!({"update":hidden}), Ownership::Idle);
+            adapter.tail_once();
+            assert_eq!(adapter.take_emitted().turns.len(), 1);
+            if awaiting_terminal {
+                adapter.close_wire_episode();
+            }
+            assert!(adapter.autonomous_busy());
+
+            adapter.on_foreground_started();
+
+            assert!(!adapter.autonomous_busy());
+            assert!(adapter.episode.phase == EpisodePhase::SuppressedForeground);
+            assert!(adapter.episode.deferred_turns.is_empty());
+            assert!(adapter.take_detail_refetch());
+            adapter.on_foreground_ended();
+            assert!(adapter.episode.phase == EpisodePhase::Dormant);
+        }
     }
 
     #[test]
@@ -1814,6 +2947,68 @@ mod tests {
     }
 
     #[test]
+    fn persisted_structured_completion_survives_hidden_trigger_file_lag() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("updates.jsonl");
+        std::fs::write(&path, "").unwrap();
+        let mut adapter = GrokAutonomousAdapter::new_for_test(path.clone());
+        adapter.on_session_ready("session-delayed-hidden", &path);
+
+        let completed = json!({
+            "sessionUpdate":"task_completed",
+            "task_snapshot":{"task_id":"delayed-task"},
+            "will_wake":true
+        });
+        append_line(&path, &jsonl_update("_x.ai/session/update", &completed, 1));
+        adapter.on_raw_dispatch(
+            "_x.ai/task_completed",
+            &json!({"update":completed}),
+            Ownership::Idle,
+        );
+
+        let hidden = json!({
+            "sessionUpdate":"user_message_chunk",
+            "content":{"type":"text","text":"provider wording changed"},
+            "_meta":{"hideFromScrollback":true}
+        });
+        let claim = adapter.on_raw_dispatch(
+            "session/update",
+            &json!({"update":hidden.clone()}),
+            Ownership::Idle,
+        );
+        assert_eq!(claim, GrokDispatchClaim::AutonomousContent);
+        adapter.tail_once();
+
+        let terminal = json!({
+            "sessionUpdate":"turn_completed",
+            "prompt_id":"task-completed-delayed-task",
+            "stop_reason":"end_turn"
+        });
+        for (update, timestamp) in [
+            (hidden, 2),
+            (agent_text_update("delayed-reply"), 3),
+            (terminal.clone(), 4),
+        ] {
+            append_line(&path, &jsonl_update("session/update", &update, timestamp));
+        }
+        let terminal_claim = adapter.on_raw_dispatch(
+            "session/update",
+            &json!({"update":terminal}),
+            Ownership::Idle,
+        );
+        let emitted = adapter.take_emitted();
+
+        assert!(terminal_claim.is_idle_terminal());
+        assert!(emitted.turns.iter().any(|turn| {
+            turn.id.contains("+delayed-task+")
+                && turn.blocks.iter().any(
+                    |block| matches!(block, ContentBlock::Text { text } if text == "delayed-reply"),
+                )
+        }));
+        assert!(!adapter.autonomous_busy());
+    }
+
+    #[test]
     fn missing_then_created_updates_jsonl_recovers() {
         let home = tempfile::tempdir().unwrap();
         let session_id = "019f45e3-e1ef-7690-a29f-fe2554382b49";
@@ -1875,14 +3070,18 @@ mod tests {
             .collect()
     }
 
-    fn is_grok_task_completed_line(line: &str) -> bool {
+    fn is_grok_update_line(line: &str, expected_kind: &str) -> bool {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             return false;
         };
         value
             .pointer("/params/update/sessionUpdate")
             .and_then(Value::as_str)
-            == Some("task_completed")
+            == Some(expected_kind)
+    }
+
+    fn is_grok_task_completed_line(line: &str) -> bool {
+        is_grok_update_line(line, "task_completed")
     }
 
     fn blocks_contain_system_reminder(blocks: &[ContentBlock]) -> bool {
@@ -2022,8 +3221,8 @@ mod tests {
             .collect();
         let split = lines
             .iter()
-            .position(|line| is_grok_task_completed_line(line))
-            .expect("fixture must contain task_completed");
+            .position(|line| is_grok_update_line(line, "task_backgrounded"))
+            .expect("fixture must contain task_backgrounded");
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("updates.jsonl");
         std::fs::write(&path, "").unwrap();
@@ -2048,9 +3247,13 @@ mod tests {
                 .get("method")
                 .and_then(Value::as_str)
                 .expect("fixture line has method");
-            let live_method = match kind {
-                "task_backgrounded" => "_x.ai/task_backgrounded",
-                "task_completed" => "_x.ai/task_completed",
+            let logical_method = persisted_method
+                .strip_prefix('_')
+                .unwrap_or(persisted_method);
+            let live_method = match (logical_method, kind) {
+                ("x.ai/session/update", "task_backgrounded") => "x.ai/task_backgrounded",
+                ("x.ai/session/update", "task_completed") => "x.ai/task_completed",
+                ("x.ai/session/update", "turn_completed") => "x.ai/session_notification",
                 _ => persisted_method,
             };
             let claim = adapter.on_raw_dispatch(live_method, &params, Ownership::Idle);
@@ -2084,6 +3287,23 @@ mod tests {
     }
 
     #[test]
+    fn logical_session_notification_carriers_are_accepted() {
+        for method in ["x.ai/session_notification", "_x.ai/session_notification"] {
+            let params = json!({"update":{
+                "sessionUpdate":"turn_completed",
+                "prompt_id":"task-completed-task-a",
+                "stop_reason":"end_turn"
+            }});
+            assert_eq!(
+                grok_dispatch_update(method, &params)
+                    .and_then(|update| update.get("sessionUpdate"))
+                    .and_then(Value::as_str),
+                Some("turn_completed")
+            );
+        }
+    }
+
+    #[test]
     fn latest_monitor_completion_fixture_cold_parse_marks_autonomous_turn() {
         let bytes = GROK_MONITOR_COMPLETION.as_bytes();
         let trigger_start = grok_complete_records(bytes)
@@ -2114,6 +3334,157 @@ mod tests {
         assert!(turns
             .iter()
             .all(|turn| !blocks_contain_system_reminder(&turn.blocks)));
+    }
+
+    #[test]
+    fn persisted_terminal_without_live_carrier_closes_singleton_episode() {
+        let (_dir, path) = tmp_updates("");
+        let mut adapter = GrokAutonomousAdapter::new_for_test(path.clone());
+        adapter.on_session_ready("session-persisted-singleton", &path);
+        let completed = json!({
+            "sessionUpdate":"task_completed",
+            "task_snapshot":{"task_id":"term_x"},
+            "will_wake":true
+        });
+        append_line(&path, &jsonl_update("_x.ai/session/update", &completed, 1));
+        adapter.on_raw_dispatch(
+            "_x.ai/task_completed",
+            &json!({"update":completed}),
+            Ownership::Idle,
+        );
+        adapter.take_emitted();
+        append_line(
+            &path,
+            &jsonl_update("session/update", &hidden_trigger_update(), 2),
+        );
+        adapter.on_raw_dispatch(
+            "session/update",
+            &json!({"update":hidden_trigger_update()}),
+            Ownership::Idle,
+        );
+        append_line(
+            &path,
+            &jsonl_update("session/update", &agent_text_update("persisted-only"), 3),
+        );
+        let terminal = json!({
+            "sessionUpdate":"turn_completed",
+            "prompt_id":"task-completed-term_x",
+            "stop_reason":"end_turn"
+        });
+        append_line(&path, &jsonl_update("_x.ai/session/update", &terminal, 4));
+
+        adapter.tail_once();
+        let emitted = adapter.take_emitted();
+
+        assert!(emitted.turns.iter().any(|turn| {
+            turn.id.contains("+term_x+")
+                && turn.blocks.iter().any(
+                    |block| matches!(block, ContentBlock::Text { text } if text == "persisted-only"),
+                )
+        }));
+        assert!(!adapter.autonomous_busy());
+        assert!(adapter.take_detail_refetch());
+    }
+
+    #[test]
+    fn persisted_terminal_without_live_carrier_resolves_candidate_episode() {
+        let (_dir, path) = tmp_updates("");
+        let mut adapter = GrokAutonomousAdapter::new_for_test(path.clone());
+        adapter.on_session_ready("session-persisted-candidate", &path);
+        for (timestamp, task_id) in [(1, "task-a"), (2, "task-b")] {
+            let completed = json!({
+                "sessionUpdate":"task_completed",
+                "task_snapshot":{"task_id":task_id},
+                "will_wake":true
+            });
+            append_line(
+                &path,
+                &jsonl_update("_x.ai/session/update", &completed, timestamp),
+            );
+            adapter.on_raw_dispatch(
+                "_x.ai/task_completed",
+                &json!({"update":completed}),
+                Ownership::Idle,
+            );
+            adapter.take_emitted();
+        }
+        let hidden = json!({
+            "sessionUpdate":"user_message_chunk",
+            "content":{"type":"text","text":"unknown hidden event"},
+            "_meta":{"hideFromScrollback":true}
+        });
+        append_line(&path, &jsonl_update("session/update", &hidden, 3));
+        adapter.on_raw_dispatch("session/update", &json!({"update":hidden}), Ownership::Idle);
+        append_line(
+            &path,
+            &jsonl_update("session/update", &agent_text_update("candidate-b"), 4),
+        );
+        let terminal = json!({
+            "sessionUpdate":"turn_completed",
+            "prompt_id":"task-completed-task-b",
+            "stop_reason":"end_turn"
+        });
+        append_line(&path, &jsonl_update("_x.ai/session/update", &terminal, 5));
+
+        adapter.tail_once();
+        let emitted = adapter.take_emitted();
+
+        assert!(emitted.turns.iter().any(|turn| {
+            turn.id.contains("+task-b+")
+                && turn.blocks.iter().any(
+                    |block| matches!(block, ContentBlock::Text { text } if text == "candidate-b"),
+                )
+        }));
+        assert!(!adapter.autonomous_busy());
+        assert!(adapter.take_detail_refetch());
+    }
+
+    #[test]
+    fn persisted_terminal_without_live_carrier_closes_terminal_only_candidate_episode() {
+        let (_dir, path) = tmp_updates("");
+        let mut adapter = GrokAutonomousAdapter::new_for_test(path.clone());
+        adapter.on_session_ready("session-persisted-terminal-only", &path);
+        for (timestamp, task_id) in [(1, "task-a"), (2, "task-b")] {
+            let completed = json!({
+                "sessionUpdate":"task_completed",
+                "task_snapshot":{"task_id":task_id},
+                "will_wake":true
+            });
+            append_line(
+                &path,
+                &jsonl_update("_x.ai/session/update", &completed, timestamp),
+            );
+            adapter.on_raw_dispatch(
+                "_x.ai/task_completed",
+                &json!({"update":completed}),
+                Ownership::Idle,
+            );
+            adapter.take_emitted();
+        }
+        let hidden = json!({
+            "sessionUpdate":"user_message_chunk",
+            "content":{"type":"text","text":"unknown hidden event"},
+            "_meta":{"hideFromScrollback":true}
+        });
+        append_line(&path, &jsonl_update("session/update", &hidden, 3));
+        adapter.on_raw_dispatch("session/update", &json!({"update":hidden}), Ownership::Idle);
+        let terminal = json!({
+            "sessionUpdate":"turn_completed",
+            "prompt_id":"task-completed-task-b",
+            "stop_reason":"end_turn"
+        });
+        append_line(&path, &jsonl_update("_x.ai/session/update", &terminal, 4));
+
+        adapter.tail_once();
+
+        assert!(adapter.take_emitted().turns.is_empty());
+        assert_eq!(adapter.expected_wakes.len(), 1);
+        assert_eq!(
+            adapter.expected_wakes.front().map(|wake| wake.id.as_str()),
+            Some("task-a")
+        );
+        assert!(!adapter.autonomous_busy());
+        assert!(adapter.take_detail_refetch());
     }
 
     #[test]
@@ -2586,7 +3957,344 @@ mod tests {
     }
 
     #[test]
-    fn candidate_rotation_preserves_all_live_segments_until_terminal_resolution() {
+    fn newer_negative_completion_revokes_structured_wake_live_and_cold() {
+        let positive = json!({
+            "sessionUpdate":"task_completed",
+            "task_snapshot":{"task_id":"task-a"},
+            "will_wake":true
+        });
+        let negative = json!({
+            "sessionUpdate":"task_completed",
+            "task_snapshot":{"task_id":"task-a"},
+            "will_wake":false
+        });
+        let hidden = json!({
+            "sessionUpdate":"user_message_chunk",
+            "content":{"type":"text","text":"unknown hidden event"},
+            "_meta":{"hideFromScrollback":true}
+        });
+        let terminal = json!({
+            "sessionUpdate":"turn_completed",
+            "prompt_id":"task-completed-task-a",
+            "stop_reason":"end_turn"
+        });
+        let records = [
+            ("_x.ai/task_completed", positive, 1),
+            ("_x.ai/task_completed", negative, 2),
+            ("session/update", hidden, 3),
+            ("session/update", agent_text_update("must-stay-ordinary"), 4),
+            ("session/update", terminal, 5),
+        ];
+        let transcript = records
+            .iter()
+            .map(|(method, update, timestamp)| jsonl_update(method, update, *timestamp))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        let (cold_turns, _) = grok_turns_from_bytes(transcript.as_bytes(), "session-negative");
+        assert!(cold_turns
+            .iter()
+            .all(|turn| turn.autonomous_origin.is_none()));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("updates.jsonl");
+        std::fs::write(&path, "").unwrap();
+        let mut adapter = GrokAutonomousAdapter::new_for_test(path.clone());
+        adapter.on_session_ready("session-negative", &path);
+        let mut emitted = Vec::new();
+        for (method, update, timestamp) in records {
+            append_line(&path, &jsonl_update(method, &update, timestamp));
+            adapter.on_raw_dispatch(method, &json!({"update":update}), Ownership::Idle);
+            emitted.extend(adapter.take_emitted().turns);
+        }
+        assert!(emitted.iter().all(|turn| turn.autonomous_origin.is_none()));
+        assert!(!adapter.autonomous_busy());
+    }
+
+    #[test]
+    fn reused_structured_task_id_skips_an_older_legacy_trigger() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("updates.jsonl");
+        std::fs::write(&path, "").unwrap();
+        let mut adapter = GrokAutonomousAdapter::new_for_test(path.clone());
+        adapter.on_session_ready("session-reused-structured", &path);
+
+        let terminal = json!({
+            "sessionUpdate":"turn_completed",
+            "prompt_id":"task-completed-term_x",
+            "stop_reason":"end_turn"
+        });
+        for (update, timestamp) in [
+            (hidden_trigger_update(), 1),
+            (agent_text_update("old-reply"), 2),
+            (terminal.clone(), 3),
+        ] {
+            append_line(&path, &jsonl_update("session/update", &update, timestamp));
+        }
+
+        let completed = json!({
+            "sessionUpdate":"task_completed",
+            "task_snapshot":{"task_id":"term_x"},
+            "will_wake":true
+        });
+        append_line(&path, &jsonl_update("_x.ai/session/update", &completed, 4));
+        adapter.on_raw_dispatch(
+            "_x.ai/task_completed",
+            &json!({"update":completed}),
+            Ownership::Idle,
+        );
+        for (update, timestamp) in [
+            (hidden_trigger_update(), 5),
+            (agent_text_update("new-reply"), 6),
+            (terminal.clone(), 7),
+        ] {
+            append_line(&path, &jsonl_update("session/update", &update, timestamp));
+        }
+
+        let claim = adapter.on_raw_dispatch(
+            "session/update",
+            &json!({"update":terminal}),
+            Ownership::Idle,
+        );
+        let emitted = adapter.take_emitted();
+        assert!(claim.is_idle_terminal());
+        assert!(emitted.turns.iter().any(|turn| turn
+            .blocks
+            .iter()
+            .any(|block| matches!(block, ContentBlock::Text { text } if text == "new-reply"))));
+        assert!(!emitted.turns.iter().any(|turn| turn
+            .blocks
+            .iter()
+            .any(|block| matches!(block, ContentBlock::Text { text } if text == "old-reply"))));
+    }
+
+    #[test]
+    fn newer_completion_supersedes_an_unstarted_same_id_trigger_live_and_cold() {
+        let old_completed = json!({
+            "sessionUpdate":"task_completed",
+            "task_snapshot":{"task_id":"term_x"}
+        });
+        let new_completed = json!({
+            "sessionUpdate":"task_completed",
+            "task_snapshot":{"task_id":"term_x"},
+            "will_wake":true
+        });
+        let new_hidden = json!({
+            "sessionUpdate":"user_message_chunk",
+            "content":{"type":"text","text":"provider wording changed"},
+            "_meta":{"hideFromScrollback":true}
+        });
+        let terminal = json!({
+            "sessionUpdate":"turn_completed",
+            "prompt_id":"task-completed-term_x",
+            "stop_reason":"end_turn"
+        });
+        let records = [
+            ("_x.ai/task_completed", old_completed, 1),
+            ("session/update", hidden_trigger_update(), 2),
+            ("_x.ai/task_completed", new_completed, 3),
+            ("session/update", new_hidden, 4),
+            ("session/update", agent_text_update("new-generation"), 5),
+            ("session/update", terminal, 6),
+        ];
+        let lines: Vec<String> = records
+            .iter()
+            .map(|(method, update, timestamp)| jsonl_update(method, update, *timestamp))
+            .collect();
+        let new_trigger_offset = lines[..3]
+            .iter()
+            .map(|line| line.len() as u64 + 1)
+            .sum::<u64>();
+        let expected_id_fragment = format!("+term_x+{new_trigger_offset}:assistant:0");
+        let transcript = lines.join("\n") + "\n";
+        let (cold_turns, _) = grok_turns_from_bytes(transcript.as_bytes(), "session-generation");
+        assert!(cold_turns.iter().any(|turn| {
+            turn.id.contains(&expected_id_fragment)
+                && turn.blocks.iter().any(
+                    |block| matches!(block, ContentBlock::Text { text } if text == "new-generation"),
+                )
+        }));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("updates.jsonl");
+        std::fs::write(&path, "").unwrap();
+        let mut adapter = GrokAutonomousAdapter::new_for_test(path.clone());
+        adapter.on_session_ready("session-generation", &path);
+        let mut emitted = Vec::new();
+        for ((method, update, _), line) in records.into_iter().zip(lines) {
+            append_line(&path, &line);
+            adapter.on_raw_dispatch(method, &json!({"update":update}), Ownership::Idle);
+            emitted.extend(adapter.take_emitted().turns);
+        }
+        assert!(emitted.iter().any(|turn| {
+            turn.id.contains(&expected_id_fragment)
+                && turn.blocks.iter().any(
+                    |block| matches!(block, ContentBlock::Text { text } if text == "new-generation"),
+                )
+        }));
+        assert!(!adapter.autonomous_busy());
+    }
+
+    #[test]
+    fn foreground_start_invalidates_legacy_settlement_evidence() {
+        let (_dir, path) = tmp_updates("");
+        let mut adapter = GrokAutonomousAdapter::new_for_test(path);
+        adapter.on_raw_dispatch(
+            "_x.ai/task_completed",
+            &json!({"update":{
+                "sessionUpdate":"task_completed",
+                "task_snapshot":{"task_id":"term_x"},
+                "will_wake":true
+            }}),
+            Ownership::Idle,
+        );
+        adapter.on_foreground_started();
+        adapter.on_foreground_ended();
+
+        let claim = adapter.on_raw_dispatch(
+            "session/update",
+            &json!({"update":hidden_trigger_update()}),
+            Ownership::Idle,
+        );
+        assert_eq!(claim, GrokDispatchClaim::Unclaimed);
+        assert!(!adapter.autonomous_busy());
+    }
+
+    #[test]
+    fn live_candidate_waits_for_its_persisted_terminal() {
+        let completed = |task_id: &str| {
+            json!({
+                "sessionUpdate":"task_completed",
+                "task_snapshot":{"task_id":task_id},
+                "will_wake":true
+            })
+        };
+        let terminal = |task_id: &str| {
+            json!({
+                "sessionUpdate":"turn_completed",
+                "prompt_id":format!("task-completed-{task_id}"),
+                "stop_reason":"end_turn"
+            })
+        };
+        let hidden = json!({
+            "sessionUpdate":"user_message_chunk",
+            "content":{"type":"text","text":"unknown hidden event"},
+            "_meta":{"hideFromScrollback":true}
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("updates.jsonl");
+        std::fs::write(&path, "").unwrap();
+        let mut adapter = GrokAutonomousAdapter::new_for_test(path.clone());
+        adapter.on_session_ready("session-live-terminal", &path);
+        for (index, task_id) in ["task-a", "task-b"].into_iter().enumerate() {
+            let update = completed(task_id);
+            append_line(
+                &path,
+                &jsonl_update("_x.ai/session/update", &update, index as i64 + 1),
+            );
+            adapter.on_raw_dispatch(
+                "_x.ai/task_completed",
+                &json!({"update":update}),
+                Ownership::Idle,
+            );
+            adapter.take_emitted();
+        }
+        for (update, timestamp) in [(hidden.clone(), 3), (agent_text_update("before-"), 4)] {
+            append_line(&path, &jsonl_update("session/update", &update, timestamp));
+            adapter.on_raw_dispatch("session/update", &json!({"update":update}), Ownership::Idle);
+            adapter.take_emitted();
+        }
+        append_line(
+            &path,
+            &jsonl_update("session/update", &terminal("unrelated"), 5),
+        );
+        let wire_terminal = terminal("task-b");
+        let claim = adapter.on_raw_dispatch(
+            "session/update",
+            &json!({"update":wire_terminal.clone()}),
+            Ownership::Idle,
+        );
+        let mut emitted = adapter.take_emitted().turns;
+        assert!(claim.is_idle_terminal());
+        assert!(adapter.autonomous_busy());
+
+        for (update, timestamp) in [(agent_text_update("after"), 6), (wire_terminal, 7)] {
+            append_line(&path, &jsonl_update("session/update", &update, timestamp));
+        }
+        adapter.tail_once();
+        emitted.extend(adapter.take_emitted().turns);
+        assert!(emitted.iter().any(|turn| {
+            turn.id.contains("+task-b+")
+                && turn.blocks.iter().any(
+                    |block| matches!(block, ContentBlock::Text { text } if text == "before-after"),
+                )
+        }));
+        assert!(!adapter.autonomous_busy());
+    }
+
+    #[test]
+    fn explicit_mismatched_terminal_does_not_split_a_singleton_episode() {
+        let completed = json!({
+            "sessionUpdate":"task_completed",
+            "task_snapshot":{"task_id":"task-a"},
+            "will_wake":true
+        });
+        let hidden = json!({
+            "sessionUpdate":"user_message_chunk",
+            "content":{"type":"text","text":"unknown hidden event"},
+            "_meta":{"hideFromScrollback":true}
+        });
+        let terminal = |task_id: &str| {
+            json!({
+                "sessionUpdate":"turn_completed",
+                "prompt_id":format!("task-completed-{task_id}"),
+                "stop_reason":"end_turn"
+            })
+        };
+        let records = [
+            ("_x.ai/task_completed", completed, 1),
+            ("session/update", hidden, 2),
+            ("session/update", agent_text_update("before-"), 3),
+            ("session/update", terminal("task-b"), 4),
+            ("session/update", agent_text_update("after"), 5),
+            ("session/update", terminal("task-a"), 6),
+        ];
+        let transcript = records
+            .iter()
+            .map(|(method, update, timestamp)| jsonl_update(method, update, *timestamp))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        let (cold_turns, _) = grok_turns_from_bytes(transcript.as_bytes(), "session-singleton");
+        assert!(cold_turns.iter().any(|turn| {
+            turn.id.contains("+task-a+")
+                && turn.blocks.iter().any(
+                    |block| matches!(block, ContentBlock::Text { text } if text == "before-after"),
+                )
+        }));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("updates.jsonl");
+        std::fs::write(&path, "").unwrap();
+        let mut adapter = GrokAutonomousAdapter::new_for_test(path.clone());
+        adapter.on_session_ready("session-singleton", &path);
+        let mut emitted = Vec::new();
+        for (method, update, timestamp) in records {
+            append_line(&path, &jsonl_update(method, &update, timestamp));
+            adapter.on_raw_dispatch(method, &json!({"update":update}), Ownership::Idle);
+            emitted.extend(adapter.take_emitted().turns);
+        }
+        assert!(emitted.iter().any(|turn| {
+            turn.id.contains("+task-a+")
+                && turn.blocks.iter().any(
+                    |block| matches!(block, ContentBlock::Text { text } if text == "before-after"),
+                )
+        }));
+        assert!(!adapter.autonomous_busy());
+    }
+
+    #[test]
+    fn candidate_rotation_uses_bounded_detail_refetch_until_terminal_resolution() {
         let completed = |task_id: &str| {
             json!({
                 "sessionUpdate":"task_completed",
@@ -2619,22 +4327,33 @@ mod tests {
         }
         append_line(&path, &jsonl_update("session/update", &hidden, 3));
         adapter.on_raw_dispatch("session/update", &json!({"update":hidden}), Ownership::Idle);
-        for index in 0..=EPISODE_RECORD_FORCE_ROTATE {
-            append_line(
-                &path,
-                &jsonl_update(
-                    "session/update",
-                    &agent_text_update(&format!("chunk-{index};")),
-                    index as i64 + 4,
-                ),
+        let padding = "x".repeat(2_200);
+        for rotation in 0..2 {
+            for index in 0..EPISODE_RECORD_FORCE_ROTATE {
+                append_line(
+                    &path,
+                    &jsonl_update(
+                        "session/update",
+                        &agent_text_update(&format!(
+                            "{}-{index}:{padding}",
+                            if rotation == 0 {
+                                "old-marker"
+                            } else {
+                                "new-marker"
+                            }
+                        )),
+                        (rotation * EPISODE_RECORD_FORCE_ROTATE + index) as i64 + 4,
+                    ),
+                );
+            }
+            adapter.on_raw_dispatch(
+                "session/update",
+                &json!({"update":agent_text_update("tail-hint")}),
+                Ownership::Idle,
             );
+            assert!(adapter.take_emitted().turns.is_empty());
         }
-        adapter.on_raw_dispatch(
-            "session/update",
-            &json!({"update":agent_text_update("tail-hint")}),
-            Ownership::Idle,
-        );
-        assert!(adapter.take_emitted().turns.is_empty());
+        assert!(adapter.take_detail_refetch());
 
         let terminal = json!({
             "sessionUpdate":"turn_completed",
@@ -2648,15 +4367,694 @@ mod tests {
             Ownership::Idle,
         );
         let emitted = adapter.take_emitted();
-        let rendered = format!("{:?}", emitted.turns);
 
         assert!(claim.is_idle_terminal());
-        assert!(rendered.contains("chunk-0;"));
-        assert!(rendered.contains(&format!("chunk-{};", EPISODE_RECORD_FORCE_ROTATE)));
+        assert!(
+            emitted
+                .turns
+                .iter()
+                .map(normalized_turn_payload_len)
+                .sum::<usize>()
+                <= EPISODE_PAYLOAD_MAX_BYTES
+        );
+        let live_rendered = format!("{:?}", emitted.turns);
+        assert!(live_rendered.contains("new-marker-0:"));
+        assert!(!live_rendered.contains("old-marker-0:"));
         assert!(emitted
             .turns
             .iter()
             .all(|turn| turn.id.contains("+task-b+")));
+        assert!(adapter.take_detail_refetch());
+        assert!(!adapter.autonomous_busy());
+
+        let transcript = std::fs::read(&path).unwrap();
+        let (cold_turns, _) = grok_turns_from_bytes(&transcript, "session-rotation");
+        let rendered = format!("{cold_turns:?}");
+        assert!(rendered.contains("old-marker-0:"));
+        assert!(rendered.contains("new-marker-0:"));
+        assert!(cold_turns
+            .iter()
+            .filter(|turn| { turn.autonomous_origin == Some(AutonomousTurnOrigin::BackgroundTask) })
+            .all(|turn| turn.id.contains("+task-b+")));
+    }
+
+    #[test]
+    fn resolved_candidate_id_cannot_grow_emitted_payload_past_the_episode_limit() {
+        let long_task_id = format!("task-{}", "x".repeat(16 * 1024));
+        let mut adapter = GrokAutonomousAdapter::new();
+        adapter.session_id = "session-final-id-cap".into();
+        adapter.open_episode(
+            Vec::new(),
+            vec![long_task_id.clone()],
+            Vec::new(),
+            Vec::new(),
+            false,
+            None,
+        );
+        adapter.episode.trigger_start = Some(7);
+
+        let turn = MessageTurn {
+            id: "candidate".into(),
+            role: crate::models::message::TurnRole::Assistant,
+            blocks: vec![ContentBlock::Text {
+                text: "y".repeat(EPISODE_PAYLOAD_MAX_BYTES),
+            }],
+            timestamp: chrono::Utc::now(),
+            usage: None,
+            duration_ms: None,
+            model: None,
+            reasoning_effort: None,
+            completed_at: None,
+            outcome: None,
+            autonomous_origin: Some(AutonomousTurnOrigin::BackgroundTask),
+            generation_ms: None,
+            generation_tokens: None,
+        };
+        let bounded = cap_normalized_turn_payload(turn).expect("retain a bounded prefix");
+        assert!(normalized_turn_payload_len(&bounded) <= EPISODE_PAYLOAD_MAX_BYTES);
+        adapter.defer_candidate_turn(0, bounded);
+
+        adapter.episode.task_ids = vec![long_task_id];
+        adapter.episode.candidate_task_ids.clear();
+        adapter.emit_deferred_turns();
+
+        let emitted = adapter.take_emitted();
+        assert!(emitted.payload_bytes <= EPISODE_PAYLOAD_MAX_BYTES);
+        assert!(
+            emitted
+                .turns
+                .iter()
+                .map(normalized_turn_payload_len)
+                .sum::<usize>()
+                <= EPISODE_PAYLOAD_MAX_BYTES
+        );
+        assert!(adapter.take_detail_refetch());
+    }
+
+    #[test]
+    fn newer_same_id_completion_keeps_singleton_episode_after_forced_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("updates.jsonl");
+        std::fs::write(&path, "").unwrap();
+        let mut adapter = GrokAutonomousAdapter::new_for_test(path.clone());
+        adapter.on_session_ready("session-singleton-rotation", &path);
+        let completed = json!({
+            "sessionUpdate":"task_completed",
+            "task_snapshot":{"task_id":"task-a"},
+            "will_wake":true
+        });
+        append_line(&path, &jsonl_update("_x.ai/session/update", &completed, 1));
+        adapter.on_raw_dispatch(
+            "_x.ai/task_completed",
+            &json!({"update":completed.clone()}),
+            Ownership::Idle,
+        );
+        adapter.take_emitted();
+        let hidden = json!({
+            "sessionUpdate":"user_message_chunk",
+            "content":{"type":"text","text":"unknown hidden event"},
+            "_meta":{"hideFromScrollback":true}
+        });
+        append_line(&path, &jsonl_update("session/update", &hidden, 2));
+        adapter.on_raw_dispatch("session/update", &json!({"update":hidden}), Ownership::Idle);
+        for index in 0..EPISODE_RECORD_FORCE_ROTATE {
+            append_line(
+                &path,
+                &jsonl_update(
+                    "session/update",
+                    &agent_text_update(&format!("old-{index};")),
+                    index as i64 + 3,
+                ),
+            );
+        }
+        adapter.on_raw_dispatch(
+            "session/update",
+            &json!({"update":agent_text_update("tail-hint")}),
+            Ownership::Idle,
+        );
+        assert_eq!(adapter.episode.segment_part, 1);
+        assert!(!adapter.take_emitted().turns.is_empty());
+
+        adapter.on_raw_dispatch(
+            "_x.ai/task_completed",
+            &json!({"update":completed}),
+            Ownership::Idle,
+        );
+
+        assert!(adapter.autonomous_busy());
+        assert_eq!(adapter.episode.segment_part, 1);
+    }
+
+    #[test]
+    fn newer_same_id_completion_keeps_candidate_episode_after_forced_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("updates.jsonl");
+        std::fs::write(&path, "").unwrap();
+        let mut adapter = GrokAutonomousAdapter::new_for_test(path.clone());
+        adapter.on_session_ready("session-candidate-rotation-reuse", &path);
+        for (index, task_id) in ["task-a", "task-b"].into_iter().enumerate() {
+            let completed = json!({
+                "sessionUpdate":"task_completed",
+                "task_snapshot":{"task_id":task_id},
+                "will_wake":true
+            });
+            append_line(
+                &path,
+                &jsonl_update("_x.ai/session/update", &completed, index as i64 + 1),
+            );
+            adapter.on_raw_dispatch(
+                "_x.ai/task_completed",
+                &json!({"update":completed}),
+                Ownership::Idle,
+            );
+            adapter.take_emitted();
+        }
+        let hidden = json!({
+            "sessionUpdate":"user_message_chunk",
+            "content":{"type":"text","text":"unknown hidden event"},
+            "_meta":{"hideFromScrollback":true}
+        });
+        append_line(&path, &jsonl_update("session/update", &hidden, 3));
+        adapter.on_raw_dispatch("session/update", &json!({"update":hidden}), Ownership::Idle);
+        for index in 0..EPISODE_RECORD_FORCE_ROTATE {
+            append_line(
+                &path,
+                &jsonl_update(
+                    "session/update",
+                    &agent_text_update(&format!("candidate-{index};")),
+                    index as i64 + 4,
+                ),
+            );
+        }
+        adapter.on_raw_dispatch(
+            "session/update",
+            &json!({"update":agent_text_update("tail-hint")}),
+            Ownership::Idle,
+        );
+        assert_eq!(adapter.episode.segment_part, 1);
+        assert!(!adapter.episode.deferred_turns.is_empty());
+
+        adapter.on_raw_dispatch(
+            "_x.ai/task_completed",
+            &json!({"update":{
+                "sessionUpdate":"task_completed",
+                "task_snapshot":{"task_id":"task-a"},
+                "will_wake":true
+            }}),
+            Ownership::Idle,
+        );
+
+        assert!(adapter.autonomous_busy());
+        assert_eq!(adapter.episode.segment_part, 1);
+        assert!(!adapter.episode.deferred_turns.is_empty());
+    }
+
+    #[test]
+    fn candidate_terminal_consumes_only_its_same_id_completion_generation_live_and_cold() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("updates.jsonl");
+        std::fs::write(&path, "").unwrap();
+        let mut adapter = GrokAutonomousAdapter::new_for_test(path.clone());
+        adapter.on_session_ready("session-candidate-generation", &path);
+        for (timestamp, task_id) in [(1, "task-a"), (2, "task-b")] {
+            let completed = json!({
+                "sessionUpdate":"task_completed",
+                "task_snapshot":{"task_id":task_id},
+                "will_wake":true
+            });
+            append_line(
+                &path,
+                &jsonl_update("_x.ai/session/update", &completed, timestamp),
+            );
+            adapter.on_raw_dispatch(
+                "_x.ai/task_completed",
+                &json!({"update":completed}),
+                Ownership::Idle,
+            );
+            adapter.take_emitted();
+        }
+        let hidden = json!({
+            "sessionUpdate":"user_message_chunk",
+            "content":{"type":"text","text":"unknown hidden event"},
+            "_meta":{"hideFromScrollback":true}
+        });
+        append_line(&path, &jsonl_update("session/update", &hidden, 3));
+        adapter.on_raw_dispatch("session/update", &json!({"update":hidden}), Ownership::Idle);
+        let old_content = agent_text_update("old candidate reply");
+        append_line(&path, &jsonl_update("session/update", &old_content, 4));
+        adapter.on_raw_dispatch(
+            "session/update",
+            &json!({"update":old_content}),
+            Ownership::Idle,
+        );
+        assert!(adapter.episode.has_content);
+
+        let newer_a = json!({
+            "sessionUpdate":"task_completed",
+            "task_snapshot":{"task_id":"task-a"},
+            "will_wake":true
+        });
+        append_line(&path, &jsonl_update("_x.ai/session/update", &newer_a, 5));
+        adapter.on_raw_dispatch(
+            "_x.ai/task_completed",
+            &json!({"update":newer_a}),
+            Ownership::Idle,
+        );
+        adapter.take_emitted();
+        let old_terminal = json!({
+            "sessionUpdate":"turn_completed",
+            "prompt_id":"task-completed-task-a",
+            "stop_reason":"end_turn"
+        });
+        append_line(
+            &path,
+            &jsonl_update("x.ai/session/update", &old_terminal, 6),
+        );
+        adapter.on_raw_dispatch(
+            "x.ai/session_notification",
+            &json!({"update":old_terminal}),
+            Ownership::Idle,
+        );
+        let mut live_turns = adapter.take_emitted().turns;
+
+        assert!(adapter
+            .expected_wakes
+            .iter()
+            .any(|wake| wake.id == "task-a"));
+        assert!(adapter
+            .expected_wakes
+            .iter()
+            .any(|wake| wake.id == "task-b"));
+        let newer_hidden = json!({
+            "sessionUpdate":"user_message_chunk",
+            "content":{"type":"text","text":"<system-reminder>\nBackground task \"task-a\" completed (exit code: 0).\n</system-reminder>"},
+            "_meta":{"hideFromScrollback":true}
+        });
+        append_line(&path, &jsonl_update("session/update", &newer_hidden, 7));
+        adapter.on_raw_dispatch(
+            "session/update",
+            &json!({"update":newer_hidden}),
+            Ownership::Idle,
+        );
+        let new_content = agent_text_update("new task-a reply");
+        append_line(&path, &jsonl_update("session/update", &new_content, 8));
+        adapter.on_raw_dispatch(
+            "session/update",
+            &json!({"update":new_content}),
+            Ownership::Idle,
+        );
+        live_turns.extend(adapter.take_emitted().turns);
+        let new_terminal = json!({
+            "sessionUpdate":"turn_completed",
+            "prompt_id":"task-completed-task-a",
+            "stop_reason":"end_turn"
+        });
+        append_line(
+            &path,
+            &jsonl_update("x.ai/session/update", &new_terminal, 9),
+        );
+        adapter.on_raw_dispatch(
+            "x.ai/session_notification",
+            &json!({"update":new_terminal}),
+            Ownership::Idle,
+        );
+        live_turns.extend(adapter.take_emitted().turns);
+
+        assert!(live_turns.iter().any(|turn| {
+            turn.id.contains("+task-a+")
+                && turn.blocks.iter().any(
+                    |block| matches!(block, ContentBlock::Text { text } if text == "new task-a reply"),
+                )
+        }));
+        assert!(!adapter.autonomous_busy());
+
+        let transcript = std::fs::read(&path).unwrap();
+        let (cold_turns, _) = grok_turns_from_bytes(&transcript, "session-candidate-generation");
+        assert!(cold_turns.iter().any(|turn| {
+            turn.id.contains("+task-a+")
+                && turn.blocks.iter().any(
+                    |block| matches!(block, ContentBlock::Text { text } if text == "new task-a reply"),
+                )
+        }));
+    }
+
+    #[test]
+    fn wire_content_prevents_same_id_completion_from_superseding_a_lagged_episode() {
+        let (_dir, path) = tmp_updates("");
+        let mut adapter = GrokAutonomousAdapter::new_for_test(path.clone());
+        adapter.on_session_ready("session-wire-content-generation", &path);
+        let completed = json!({
+            "sessionUpdate":"task_completed",
+            "task_snapshot":{"task_id":"term_x"},
+            "will_wake":true
+        });
+        append_line(&path, &jsonl_update("_x.ai/session/update", &completed, 1));
+        adapter.on_raw_dispatch(
+            "_x.ai/task_completed",
+            &json!({"update":completed}),
+            Ownership::Idle,
+        );
+        adapter.take_emitted();
+        append_line(
+            &path,
+            &jsonl_update("session/update", &hidden_trigger_update(), 2),
+        );
+        adapter.on_raw_dispatch(
+            "session/update",
+            &json!({"update":hidden_trigger_update()}),
+            Ownership::Idle,
+        );
+        adapter.on_raw_dispatch(
+            "session/update",
+            &json!({"update":agent_text_update("wire-only content")}),
+            Ownership::Idle,
+        );
+        assert!(!adapter.episode.has_content);
+
+        let newer = json!({
+            "sessionUpdate":"task_completed",
+            "task_snapshot":{"task_id":"term_x"},
+            "will_wake":true
+        });
+        append_line(&path, &jsonl_update("_x.ai/session/update", &newer, 3));
+        adapter.on_raw_dispatch(
+            "_x.ai/task_completed",
+            &json!({"update":newer}),
+            Ownership::Idle,
+        );
+
+        assert!(adapter.autonomous_busy());
+        assert!(adapter.episode.trigger_start.is_some());
+    }
+
+    #[test]
+    fn foreground_invalidation_blocks_lagged_legacy_terminal_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("updates.jsonl");
+        std::fs::write(&path, "").unwrap();
+        let mut adapter = GrokAutonomousAdapter::new_for_test(path.clone());
+        adapter.on_session_ready("session-foreground-lag", &path);
+        let negative = json!({
+            "sessionUpdate":"task_completed",
+            "task_snapshot":{"task_id":"term_x"},
+            "will_wake":false
+        });
+        append_line(&path, &jsonl_update("_x.ai/session/update", &negative, 1));
+        adapter.on_raw_dispatch(
+            "_x.ai/task_completed",
+            &json!({"update":negative}),
+            Ownership::Idle,
+        );
+        adapter.take_emitted();
+        adapter.on_foreground_started();
+        adapter.on_foreground_ended();
+
+        for (update, timestamp) in [
+            (hidden_trigger_update(), 2),
+            (agent_text_update("stale-reply"), 3),
+        ] {
+            append_line(&path, &jsonl_update("session/update", &update, timestamp));
+        }
+        let terminal = json!({
+            "sessionUpdate":"turn_completed",
+            "prompt_id":"task-completed-term_x",
+            "stop_reason":"end_turn"
+        });
+        append_line(&path, &jsonl_update("session/update", &terminal, 4));
+
+        let claim = adapter.on_raw_dispatch(
+            "session/update",
+            &json!({"update":terminal}),
+            Ownership::Idle,
+        );
+
+        assert_eq!(claim, GrokDispatchClaim::Unclaimed);
+        assert!(adapter.take_emitted().turns.is_empty());
+        assert!(!adapter.autonomous_busy());
+    }
+
+    #[test]
+    fn foreground_invalidation_blocks_lagged_legacy_completion_without_will_wake() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("updates.jsonl");
+        std::fs::write(&path, "").unwrap();
+        let mut adapter = GrokAutonomousAdapter::new_for_test(path.clone());
+        adapter.on_session_ready("session-foreground-legacy", &path);
+        let completed = json!({
+            "sessionUpdate":"task_completed",
+            "task_snapshot":{"task_id":"term_x"}
+        });
+        append_line(&path, &jsonl_update("_x.ai/session/update", &completed, 1));
+        adapter.on_raw_dispatch(
+            "_x.ai/task_completed",
+            &json!({"update":completed}),
+            Ownership::Idle,
+        );
+        adapter.take_emitted();
+
+        let foreground_prompt = json!({
+            "sessionUpdate":"user_message_chunk",
+            "content":{"type":"text","text":"foreground prompt"},
+            "_meta":{"promptIndex":1}
+        });
+        let foreground_terminal = json!({
+            "sessionUpdate":"turn_completed",
+            "prompt_id":"user-turn-1",
+            "stop_reason":"end_turn"
+        });
+        for (update, timestamp) in [
+            (foreground_prompt, 2),
+            (agent_text_update("foreground reply"), 3),
+            (foreground_terminal, 4),
+        ] {
+            append_line(&path, &jsonl_update("session/update", &update, timestamp));
+        }
+        adapter.on_foreground_started();
+        adapter.on_foreground_ended();
+
+        for (update, timestamp) in [
+            (hidden_trigger_update(), 5),
+            (agent_text_update("stale legacy reply"), 6),
+        ] {
+            append_line(&path, &jsonl_update("session/update", &update, timestamp));
+        }
+        let terminal = json!({
+            "sessionUpdate":"turn_completed",
+            "prompt_id":"task-completed-term_x",
+            "stop_reason":"end_turn"
+        });
+        append_line(&path, &jsonl_update("session/update", &terminal, 7));
+
+        let claim = adapter.on_raw_dispatch(
+            "x.ai/session_notification",
+            &json!({"update":terminal}),
+            Ownership::Idle,
+        );
+
+        assert_eq!(claim, GrokDispatchClaim::Unclaimed);
+        assert!(adapter.take_emitted().turns.is_empty());
+        assert!(!adapter.autonomous_busy());
+        let transcript = std::fs::read(&path).unwrap();
+        let (cold_turns, _) = grok_turns_from_bytes(&transcript, "session-foreground-legacy");
+        assert!(cold_turns.iter().all(|turn| {
+            turn.autonomous_origin != Some(AutonomousTurnOrigin::BackgroundTask)
+                || !turn.blocks.iter().any(|block| {
+                    matches!(block, ContentBlock::Text { text } if text == "stale legacy reply")
+                })
+        }));
+    }
+
+    #[test]
+    fn initial_payload_cap_requests_detail_refetch() {
+        let (_dir, path) = tmp_updates("");
+        let mut adapter = GrokAutonomousAdapter::new_for_test(path.clone());
+        adapter.on_session_ready("session-initial-payload-cap", &path);
+        let completed = json!({
+            "sessionUpdate":"task_completed",
+            "task_snapshot":{"task_id":"term_x"},
+            "will_wake":true
+        });
+        append_line(&path, &jsonl_update("_x.ai/session/update", &completed, 1));
+        adapter.on_raw_dispatch(
+            "_x.ai/task_completed",
+            &json!({"update":completed}),
+            Ownership::Idle,
+        );
+        adapter.take_emitted();
+        append_line(
+            &path,
+            &jsonl_update("session/update", &hidden_trigger_update(), 2),
+        );
+        adapter.on_raw_dispatch(
+            "session/update",
+            &json!({"update":hidden_trigger_update()}),
+            Ownership::Idle,
+        );
+        append_line(
+            &path,
+            &jsonl_update(
+                "session/update",
+                &agent_text_update(&"z".repeat(EPISODE_PAYLOAD_MAX_BYTES + 4096)),
+                3,
+            ),
+        );
+
+        adapter.tail_once();
+        let emitted = adapter.take_emitted();
+
+        assert_eq!(emitted.turns.len(), 1);
+        assert!(normalized_turn_payload_len(&emitted.turns[0]) <= EPISODE_PAYLOAD_MAX_BYTES);
+        assert!(adapter.take_detail_refetch());
+    }
+
+    #[test]
+    fn cold_visible_prompt_drops_an_unresolved_candidate_turn() {
+        let completed = |task_id: &str| {
+            json!({
+                "sessionUpdate":"task_completed",
+                "task_snapshot":{"task_id":task_id},
+                "will_wake":true
+            })
+        };
+        let hidden = json!({
+            "sessionUpdate":"user_message_chunk",
+            "content":{"type":"text","text":"unknown hidden event"},
+            "_meta":{"hideFromScrollback":true}
+        });
+        let visible = json!({
+            "sessionUpdate":"user_message_chunk",
+            "content":{"type":"text","text":"foreground prompt"},
+            "_meta":{"promptIndex":7}
+        });
+        let transcript = [
+            jsonl_update("_x.ai/session/update", &completed("task-a"), 1),
+            jsonl_update("_x.ai/session/update", &completed("task-b"), 2),
+            jsonl_update("session/update", &hidden, 3),
+            jsonl_update("session/update", &agent_text_update("unresolved"), 4),
+            jsonl_update("session/update", &visible, 5),
+        ]
+        .join("\n")
+            + "\n";
+
+        let (turns, _) = grok_turns_from_bytes(transcript.as_bytes(), "session-candidate-prompt");
+
+        assert!(turns
+            .iter()
+            .all(|turn| turn.autonomous_origin != Some(AutonomousTurnOrigin::BackgroundTask)));
+        assert!(turns.iter().any(|turn| {
+            matches!(turn.role, crate::models::message::TurnRole::User)
+                && turn.blocks.iter().any(
+                    |block| matches!(block, ContentBlock::Text { text } if text == "foreground prompt"),
+                )
+        }));
+    }
+
+    #[test]
+    fn cold_terminal_only_candidate_does_not_contaminate_the_next_wake() {
+        let completed = |task_id: &str| {
+            json!({
+                "sessionUpdate":"task_completed",
+                "task_snapshot":{"task_id":task_id},
+                "will_wake":true
+            })
+        };
+        let hidden = json!({
+            "sessionUpdate":"user_message_chunk",
+            "content":{"type":"text","text":"unknown hidden event"},
+            "_meta":{"hideFromScrollback":true}
+        });
+        let terminal = |task_id: &str| {
+            json!({
+                "sessionUpdate":"turn_completed",
+                "prompt_id":format!("task-completed-{task_id}"),
+                "stop_reason":"end_turn"
+            })
+        };
+        let transcript = [
+            jsonl_update("_x.ai/session/update", &completed("task-a"), 1),
+            jsonl_update("_x.ai/session/update", &completed("task-b"), 2),
+            jsonl_update("session/update", &hidden, 3),
+            jsonl_update("session/update", &terminal("task-b"), 4),
+            jsonl_update("_x.ai/session/update", &completed("task-c"), 5),
+            jsonl_update("session/update", &hidden, 6),
+            jsonl_update("session/update", &agent_text_update("task-c-reply"), 7),
+            jsonl_update("session/update", &terminal("task-c"), 8),
+        ]
+        .join("\n")
+            + "\n";
+
+        let (turns, _) = grok_turns_from_bytes(transcript.as_bytes(), "session-terminal-only");
+
+        assert!(turns.iter().any(|turn| {
+            turn.autonomous_origin == Some(AutonomousTurnOrigin::BackgroundTask)
+                && turn.id.contains("+task-c+")
+                && turn.blocks.iter().any(
+                    |block| matches!(block, ContentBlock::Text { text } if text == "task-c-reply"),
+                )
+        }));
+    }
+
+    #[test]
+    fn promptless_terminal_does_not_close_a_structured_episode_live_or_cold() {
+        let completed = json!({
+            "sessionUpdate":"task_completed",
+            "task_snapshot":{"task_id":"task-a"},
+            "will_wake":true
+        });
+        let hidden = json!({
+            "sessionUpdate":"user_message_chunk",
+            "content":{"type":"text","text":"unknown hidden event"},
+            "_meta":{"hideFromScrollback":true}
+        });
+        let promptless = json!({
+            "sessionUpdate":"turn_completed",
+            "stop_reason":"end_turn"
+        });
+        let terminal = json!({
+            "sessionUpdate":"turn_completed",
+            "prompt_id":"task-completed-task-a",
+            "stop_reason":"end_turn"
+        });
+        let records = [
+            ("_x.ai/session/update", completed, 1),
+            ("session/update", hidden, 2),
+            ("session/update", agent_text_update("before-"), 3),
+            ("session/update", promptless, 4),
+            ("session/update", agent_text_update("after"), 5),
+            ("session/update", terminal, 6),
+        ];
+        let transcript = records
+            .iter()
+            .map(|(method, update, timestamp)| jsonl_update(method, update, *timestamp))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        let (cold_turns, _) = grok_turns_from_bytes(transcript.as_bytes(), "session-promptless");
+        assert!(cold_turns.iter().any(|turn| {
+            turn.autonomous_origin == Some(AutonomousTurnOrigin::BackgroundTask)
+                && turn.blocks.iter().any(
+                    |block| matches!(block, ContentBlock::Text { text } if text == "before-after"),
+                )
+        }));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("updates.jsonl");
+        std::fs::write(&path, "").unwrap();
+        let mut adapter = GrokAutonomousAdapter::new_for_test(path.clone());
+        adapter.on_session_ready("session-promptless", &path);
+        let mut live_turns = Vec::new();
+        for (method, update, timestamp) in records {
+            append_line(&path, &jsonl_update(method, &update, timestamp));
+            adapter.on_raw_dispatch(method, &json!({"update":update}), Ownership::Idle);
+            live_turns.extend(adapter.take_emitted().turns);
+        }
+        assert!(live_turns.iter().any(|turn| {
+            turn.autonomous_origin == Some(AutonomousTurnOrigin::BackgroundTask)
+                && turn.blocks.iter().any(
+                    |block| matches!(block, ContentBlock::Text { text } if text == "before-after"),
+                )
+        }));
+        assert!(!adapter.autonomous_busy());
     }
 
     #[test]

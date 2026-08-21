@@ -595,6 +595,14 @@ pub struct SessionState {
     /// attaching mid-episode recovers the pending count without replaying
     /// events.
     pub background_outstanding: u32,
+    /// Monotonic recovery cue for background payloads that change persisted
+    /// conversation detail. Snapshot attach uses it when the corresponding
+    /// event was too large for replay or fell out of the recent-event ring.
+    pub background_detail_revision: u64,
+    /// Monotonic transcript byte-space generation. A replacement increments it
+    /// so snapshot clients clear overlays whose watermarks belong to the old
+    /// file before refetching authoritative detail.
+    pub background_transcript_generation: u64,
     /// Instant of the most recent `BackgroundActivity` event. Bounds the sweep
     /// exemption: if the adapter/watcher stops reporting (task died, bug) the
     /// exemption lapses after `background_keepalive_max_age()` instead of
@@ -955,6 +963,8 @@ impl SessionState {
             last_tool_watchdog_diagnostic: None,
             feedback: Vec::new(),
             background_outstanding: 0,
+            background_detail_revision: 0,
+            background_transcript_generation: 0,
             background_activity_at: None,
             modes: None,
             current_mode: None,
@@ -1851,13 +1861,29 @@ impl SessionState {
                     }
                 }
             }
-            AcpEvent::BackgroundActivity { outstanding, .. } => {
+            AcpEvent::BackgroundActivity {
+                turns,
+                outstanding,
+                settled,
+                detail_refetch,
+                transcript_reset,
+                ..
+            } => {
                 // Mirror the adapter's authoritative accounting so the idle
                 // sweeps can exempt this connection while background work is
                 // pending. The turns/settled payloads are frontend-only; the
                 // trailing `last_activity_at = now` below additionally resets
                 // the backend idle timer on every batch of transcript activity.
                 self.background_outstanding = *outstanding;
+                if !turns.is_empty() || !settled.is_empty() || *detail_refetch || *transcript_reset
+                {
+                    self.background_detail_revision =
+                        self.background_detail_revision.saturating_add(1);
+                }
+                if *transcript_reset {
+                    self.background_transcript_generation =
+                        self.background_transcript_generation.saturating_add(1);
+                }
                 self.background_activity_at = Some(Utc::now());
             }
             AcpEvent::ToolWatchdogChanged { projection } => {
@@ -2925,6 +2951,8 @@ impl SessionState {
             last_tool_watchdog_diagnostic: self.last_tool_watchdog_diagnostic.clone(),
             feedback: self.feedback.clone(),
             background_outstanding: self.background_outstanding,
+            background_detail_revision: self.background_detail_revision,
+            background_transcript_generation: self.background_transcript_generation,
             feedback_tool_available: self.feedback_tool_available,
             modes: self.modes.clone(),
             current_mode: self.current_mode.clone(),
@@ -3046,6 +3074,14 @@ pub struct LiveSessionSnapshot {
     /// common no-background case keeps the wire shape byte-identical.
     #[serde(default, skip_serializing_if = "u32_is_zero")]
     pub background_outstanding: u32,
+    /// Monotonic cue that at least one background event changed persisted
+    /// detail. Omitted at zero for mixed-version compatibility.
+    #[serde(default, skip_serializing_if = "u64_is_zero")]
+    pub background_detail_revision: u64,
+    /// Monotonic transcript replacement generation. Snapshot clients compare
+    /// this before retaining byte-offset-based overlays.
+    #[serde(default, skip_serializing_if = "u64_is_zero")]
+    pub background_transcript_generation: u64,
     /// Whether this agent has the `check_user_feedback` tool (see
     /// `SessionState.feedback_tool_available`). `#[serde(default)]` so older
     /// payloads deserialize to `false`; the frontend gates the feedback bar on
@@ -3107,6 +3143,10 @@ pub struct LiveSessionSnapshot {
 
 /// `skip_serializing_if` helper for `LiveSessionSnapshot.background_outstanding`.
 fn u32_is_zero(v: &u32) -> bool {
+    *v == 0
+}
+
+fn u64_is_zero(v: &u64) -> bool {
     *v == 0
 }
 
@@ -3847,6 +3887,7 @@ mod tests {
             settled: vec![],
             watermark: 42,
             detail_refetch: false,
+            transcript_reset: false,
         });
         assert_eq!(s.background_outstanding, 2);
         let now = Utc::now();
@@ -3865,6 +3906,7 @@ mod tests {
             settled: vec![],
             watermark: 43,
             detail_refetch: false,
+            transcript_reset: false,
         });
         assert!(!s.has_active_background_work(Utc::now()));
     }
@@ -3879,6 +3921,7 @@ mod tests {
             settled: vec![],
             watermark: 0,
             detail_refetch: false,
+            transcript_reset: false,
         });
         assert_eq!(s.to_snapshot().background_outstanding, 3);
         let json = serde_json::to_value(s.to_snapshot()).unwrap();
@@ -3887,11 +3930,59 @@ mod tests {
             Some(3)
         );
 
+        s.apply_event(&AcpEvent::BackgroundActivity {
+            session_id: "sid".into(),
+            turns: vec![],
+            outstanding: 0,
+            settled: vec![],
+            watermark: 64,
+            detail_refetch: true,
+            transcript_reset: true,
+        });
+        let recovery = serde_json::to_value(s.to_snapshot()).unwrap();
+        assert_eq!(
+            recovery
+                .get("background_detail_revision")
+                .and_then(|v| v.as_u64()),
+            Some(1)
+        );
+        assert_eq!(
+            recovery
+                .get("background_transcript_generation")
+                .and_then(|v| v.as_u64()),
+            Some(1)
+        );
+
+        s.apply_event(&AcpEvent::BackgroundActivity {
+            session_id: "sid".into(),
+            turns: vec![],
+            outstanding: 0,
+            settled: vec![],
+            watermark: 96,
+            detail_refetch: true,
+            transcript_reset: false,
+        });
+        let second_recovery = serde_json::to_value(s.to_snapshot()).unwrap();
+        assert_eq!(
+            second_recovery
+                .get("background_detail_revision")
+                .and_then(|v| v.as_u64()),
+            Some(2)
+        );
+        assert_eq!(
+            second_recovery
+                .get("background_transcript_generation")
+                .and_then(|v| v.as_u64()),
+            Some(1)
+        );
+
         // Zero is skipped so the common no-background snapshot stays
         // byte-identical with the pre-feature wire shape.
         let zero = fresh_state();
         let json = serde_json::to_value(zero.to_snapshot()).unwrap();
         assert!(json.get("background_outstanding").is_none());
+        assert!(json.get("background_detail_revision").is_none());
+        assert!(json.get("background_transcript_generation").is_none());
     }
 
     #[test]
