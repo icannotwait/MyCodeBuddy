@@ -3162,6 +3162,8 @@
         "outputSpeedAria": "出力速度",
         "outputSpeedTooltip": "課金出力トークン ÷ 生成時間（思考を含む）",
         "generationShareTooltip": "生成 {generation} / 経過 {wall}（{percent}%）",
+        "estimatedAria": "推定値",
+        "estimatedTooltip": "プロバイダーのリクエスト使用量を取得できないため、観測可能な出力から推定したライブ値です。",
         "toolUseCount": "ツール使用 {count} 回"
       },
       "tool": {

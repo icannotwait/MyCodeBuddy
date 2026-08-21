@@ -3162,6 +3162,8 @@
         "outputSpeedAria": "سرعة الإخراج",
         "outputSpeedTooltip": "رموز الإخراج المفوترة ÷ زمن التوليد (يشمل التفكير)",
         "generationShareTooltip": "التوليد {generation} / الساعة {wall} ({percent}%)",
+        "estimatedAria": "قيمة تقديرية",
+        "estimatedTooltip": "قيمة مباشرة مقدّرة من المخرجات القابلة للملاحظة لأن موفر الخدمة لا يتيح استخدام الطلب.",
         "toolUseCount": "{count} استخدامات للأدوات"
       },
       "tool": {

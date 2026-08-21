@@ -3162,6 +3162,8 @@
         "outputSpeedAria": "Velocidade de saída",
         "outputSpeedTooltip": "Tokens de saída faturados ÷ tempo de geração (inclui raciocínio)",
         "generationShareTooltip": "Geração {generation} / relógio {wall} ({percent}%)",
+        "estimatedAria": "Valor estimado",
+        "estimatedTooltip": "Valor ao vivo estimado pela saída observável porque o provedor não disponibiliza o uso por solicitação.",
         "toolUseCount": "{count} usos de ferramentas"
       },
       "tool": {

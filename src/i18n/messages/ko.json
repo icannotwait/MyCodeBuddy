@@ -3162,6 +3162,8 @@
         "outputSpeedAria": "출력 속도",
         "outputSpeedTooltip": "과금 출력 토큰 ÷ 생성 시간（추론 포함）",
         "generationShareTooltip": "생성 {generation} / 경과 {wall}（{percent}%）",
+        "estimatedAria": "추정값",
+        "estimatedTooltip": "공급자가 요청별 사용량을 제공하지 않아 관찰 가능한 출력으로 추정한 실시간 값입니다.",
         "toolUseCount": "도구 사용 {count}회"
       },
       "tool": {

@@ -3162,6 +3162,8 @@
         "outputSpeedAria": "輸出速度",
         "outputSpeedTooltip": "依計費輸出 token ÷ 出字時間（含思考）",
         "generationShareTooltip": "出字 {generation} / 牆鐘 {wall}（{percent}%）",
+        "estimatedAria": "估算值",
+        "estimatedTooltip": "由於提供商未提供請求用量，此即時值根據可觀察輸出估算。",
         "toolUseCount": "{count} 次工具呼叫"
       },
       "tool": {

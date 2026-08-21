@@ -3162,6 +3162,8 @@
         "outputSpeedAria": "Ausgabegeschwindigkeit",
         "outputSpeedTooltip": "Abgerechnete Ausgabetokens ÷ Generierungszeit (inkl. Denken)",
         "generationShareTooltip": "Generierung {generation} / Wandzeit {wall} ({percent}%)",
+        "estimatedAria": "Geschätzter Wert",
+        "estimatedTooltip": "Aus der sichtbaren Ausgabe geschätzter Live-Wert, da der Anbieter keine Nutzungsdaten pro Anfrage bereitstellt.",
         "toolUseCount": "{count} Tool-Aufrufe"
       },
       "tool": {

@@ -3162,6 +3162,8 @@
         "outputSpeedAria": "Output speed",
         "outputSpeedTooltip": "Billed output tokens divided by generation time (thinking included)",
         "generationShareTooltip": "Generation {generation} / wall {wall} ({percent}%)",
+        "estimatedAria": "Estimated value",
+        "estimatedTooltip": "Live value estimated from observable output because provider request usage is unavailable.",
         "toolUseCount": "{count} tool uses"
       },
       "tool": {
