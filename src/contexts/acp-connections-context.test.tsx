@@ -8267,6 +8267,80 @@ describe("AcpConnectionsProvider canonical observer aliases", () => {
     expect(h.store!.getConnection(TAB)).toBeUndefined()
   })
 
+  it("stale gap recovery resumes from the newer accepted cursor", async () => {
+    h.acpFindConnectionForConversation.mockResolvedValue({
+      connection_id: "broker-child",
+      event_seq: 0,
+    })
+    h.denormalizeSnapshot.mockImplementation(
+      (snapshot: { connection_id: string; event_seq: number }) =>
+        estimatorSnapshotPatch({
+          connectionId: snapshot.connection_id,
+          conversationId: 42,
+          eventSeq: snapshot.event_seq,
+        })
+    )
+    let resolveGapSnapshot: (snapshot: LiveSessionSnapshot) => void = () => {}
+    h.acpGetSessionSnapshot.mockImplementationOnce(
+      () =>
+        new Promise<LiveSessionSnapshot>((resolve) => {
+          resolveGapSnapshot = resolve
+        })
+    )
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sid", 42)
+    })
+    const handlers = latestAttachHandlers()
+    emitAcpEvent(handlers, {
+      seq: 1,
+      connection_id: "broker-child",
+      type: "status_changed",
+      status: "prompting",
+    })
+
+    emitAcpEvent(handlers, {
+      seq: 3,
+      connection_id: "broker-child",
+      type: "content_delta",
+      text: "gap-buffered",
+    })
+    await act(async () => {
+      await Promise.resolve()
+    })
+    expect(h.acpGetSessionSnapshot).toHaveBeenCalledTimes(1)
+
+    hydrateSnapshot(handlers, {
+      connection_id: "broker-child",
+      event_seq: 4,
+    } as LiveSessionSnapshot)
+    emitAcpEvent(handlers, {
+      seq: 5,
+      connection_id: "broker-child",
+      type: "content_delta",
+      text: "newer-live",
+    })
+    expect(h.store!.getConnection(TAB)?.lastAppliedSeq).toBe(5)
+
+    await act(async () => {
+      resolveGapSnapshot({
+        connection_id: "broker-child",
+        event_seq: 2,
+      } as LiveSessionSnapshot)
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+    emitAcpEvent(handlers, {
+      seq: 6,
+      connection_id: "broker-child",
+      type: "content_delta",
+      text: "after-stale-recovery",
+    })
+
+    expect(h.store!.getConnection(TAB)?.lastAppliedSeq).toBe(6)
+    expect(h.acpGetSessionSnapshot).toHaveBeenCalledTimes(1)
+  })
+
   it("sequence-gap null recovery re-resolves key after interleaved owner orphan rekey", async () => {
     const ORPHAN = "new-orphan-tab"
     const TAB2 = "conv-2-claude_code-99"

@@ -6226,7 +6226,12 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             patch.activeDelegations,
             patch.eventSeq
           )
-          ingestor?.resumeConnection(gap.connectionId, patch.eventSeq)
+          const applied = storeRef.current.connections.get(contextKey)
+          const resumeSeq =
+            applied?.connectionId === gap.connectionId
+              ? applied.lastAppliedSeq
+              : patch.eventSeq
+          ingestor?.resumeConnection(gap.connectionId, resumeSeq)
         } catch (err) {
           console.warn(
             "[acp-context] sequence gap recovery failed",

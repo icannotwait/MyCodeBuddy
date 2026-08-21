@@ -510,13 +510,20 @@ export function LiveTurnStats({
     Number.isFinite(displayedUsage.tps) &&
     displayedUsage.tps > 0 &&
     tpsLabel !== "0.0"
-  const validGeneration =
+  const positiveGeneration =
     Number.isFinite(displayedUsage.generationMs) &&
     displayedUsage.generationMs > 0
   const generationShare =
-    validGeneration && elapsed > 0
+    positiveGeneration && elapsed > 0
       ? Math.min(100, Math.round((displayedUsage.generationMs / elapsed) * 100))
       : 0
+  const generationLabel = positiveGeneration
+    ? formatElapsedLabel(displayedUsage.generationMs, t)
+    : ""
+  const validGeneration =
+    generationLabel !== "" &&
+    generationLabel !== formatElapsedLabel(0, t) &&
+    generationShare > 0
   const compactNumberFormatter = useMemo(
     () =>
       new Intl.NumberFormat(locale, {
@@ -634,10 +641,7 @@ export function LiveTurnStats({
               title={
                 validGeneration
                   ? t("generationShareTooltip", {
-                      generation: formatElapsedLabel(
-                        displayedUsage.generationMs,
-                        t
-                      ),
+                      generation: generationLabel,
                       wall: formatElapsedLabel(elapsed, t),
                       percent: generationShare,
                     })
@@ -646,7 +650,7 @@ export function LiveTurnStats({
             >
               {validGeneration && (
                 <>
-                  {formatElapsedLabel(displayedUsage.generationMs, t)}
+                  {generationLabel}
                   <span className="text-muted-foreground/80">
                     ({generationShare}%)
                   </span>

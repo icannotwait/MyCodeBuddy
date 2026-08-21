@@ -153,6 +153,38 @@ describe("EventIngestor", () => {
     expect(merged).toMatchObject([{ seq: 2, text: "ab", received_at: 100 }])
   })
 
+  it.each([
+    ["root then subagent", undefined, "tool-1"],
+    ["subagent then root", "tool-1", undefined],
+  ] as const)(
+    "does not compact across the ownership boundary: %s",
+    (_name, firstParent, secondParent) => {
+      const merged = compactAdjacentDeltas([
+        {
+          ...content("c1", 1, "root-or-child-a"),
+          parent_tool_use_id: firstParent,
+        },
+        {
+          ...content("c1", 2, "root-or-child-b"),
+          parent_tool_use_id: secondParent,
+        },
+      ])
+
+      expect(merged).toEqual([
+        expect.objectContaining({
+          seq: 1,
+          text: "root-or-child-a",
+          parent_tool_use_id: firstParent,
+        }),
+        expect.objectContaining({
+          seq: 2,
+          text: "root-or-child-b",
+          parent_tool_use_id: secondParent,
+        }),
+      ])
+    }
+  )
+
   it("deduplicates, compacts, and commits once on the next frame", () => {
     const h = createIngestorHarness({ c1: { key: "tab-1", cursor: 10 } })
     h.pushBatch(

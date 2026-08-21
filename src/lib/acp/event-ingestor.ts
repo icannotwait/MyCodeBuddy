@@ -61,7 +61,8 @@ export function compactAdjacentDeltas(
       prev.type === event.type &&
       (event.type === "content_delta" || event.type === "thinking") &&
       (prev.type === "content_delta" || prev.type === "thinking") &&
-      prev.type === event.type
+      prev.type === event.type &&
+      (prev.parent_tool_use_id ?? null) === (event.parent_tool_use_id ?? null)
     ) {
       out[out.length - 1] = {
         ...event,

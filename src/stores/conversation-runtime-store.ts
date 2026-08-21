@@ -2444,7 +2444,7 @@ function reducer(
       // same underlying turn, so the later (most complete) copy supersedes.
       const usageSnap = getPublishedRequestUsage(action.conversationId)
       const stampedStreaming =
-        usageSnap.sampleCount > 0
+        usageSnap.sampleCount > 0 && usageSnap.estimatedSampleCount === 0
           ? stampGenerationOnAssistantTurns(streamingTurns, usageSnap)
           : streamingTurns
 

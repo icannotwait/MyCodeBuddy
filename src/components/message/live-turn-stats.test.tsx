@@ -222,6 +222,34 @@ describe("LiveTurnStats request usage transition", () => {
     expect(screen.getByTestId("generation-share-slot")).toHaveClass("invisible")
   })
 
+  it("hides a settled sub-second generation duration", () => {
+    publishRequestUsage(5_013, {
+      outputTokens: 10,
+      generationMs: 999,
+      tps: 10,
+      sampleCount: 1,
+      estimatedSampleCount: 0,
+    })
+    renderUsage(5_013)
+    act(() => vi.advanceTimersByTime(5_016))
+
+    expect(screen.getByTestId("generation-share-slot")).toHaveClass("invisible")
+  })
+
+  it("hides the generation slot during the formatted-zero transition", () => {
+    publishRequestUsage(5_014, {
+      outputTokens: 100,
+      generationMs: 1_000,
+      tps: 100,
+      sampleCount: 1,
+      estimatedSampleCount: 0,
+    })
+    renderUsage(5_014)
+    act(() => vi.advanceTimersByTime(33))
+
+    expect(screen.getByTestId("generation-share-slot")).toHaveClass("invisible")
+  })
+
   it("hides formatted-zero speed without hiding valid generation share", () => {
     publishRequestUsage(5_011, {
       outputTokens: 1,
@@ -394,7 +422,7 @@ describe("LiveTurnStats request usage transition", () => {
       estimatedSampleCount: 1,
     })
     renderUsage(5_007)
-    act(() => vi.advanceTimersByTime(33))
+    act(() => vi.advanceTimersByTime(5_016))
 
     const markers = screen.getAllByRole("button", {
       name: enMessages.Folder.chat.liveTurnStats.estimatedAria,

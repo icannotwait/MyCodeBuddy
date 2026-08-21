@@ -19,10 +19,7 @@ import {
   selectTimelineTurns,
   useConversationRuntimeStore,
 } from "@/stores/conversation-runtime-store"
-import {
-  getFolderConversation,
-  saveTurnGenerationStat,
-} from "@/lib/api"
+import { getFolderConversation, saveTurnGenerationStat } from "@/lib/api"
 import { publishRequestUsage } from "@/lib/request-usage-live"
 import { EMPTY_REQUEST_USAGE } from "@/lib/request-usage-speed"
 
@@ -282,6 +279,39 @@ describe("live request usage persistence boundary", () => {
   ])("does not persist $name snapshots", ({ snapshot }) => {
     completeWith(snapshot)
     expect(mockSaveTurnGenerationStat).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    {
+      name: "estimated-only",
+      snapshot: {
+        outputTokens: 10,
+        generationMs: 1_000,
+        tps: 10,
+        sampleCount: 1,
+        estimatedSampleCount: 1,
+      },
+    },
+    {
+      name: "mixed",
+      snapshot: {
+        outputTokens: 30,
+        generationMs: 2_000,
+        tps: 15,
+        sampleCount: 2,
+        estimatedSampleCount: 1,
+      },
+    },
+  ])("keeps $name usage out of promoted turns", ({ snapshot }) => {
+    completeWith(snapshot)
+
+    const promotedAssistant = useConversationRuntimeStore
+      .getState()
+      .byConversationId.get(CID)!
+      .localTurns.find((turn) => turn.role === "assistant")
+    expect(promotedAssistant).toBeDefined()
+    expect(promotedAssistant).not.toHaveProperty("generation_ms")
+    expect(promotedAssistant).not.toHaveProperty("generation_tokens")
   })
 
   it("persists a positive all-exact snapshot unchanged", () => {
