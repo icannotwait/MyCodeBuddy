@@ -33,6 +33,16 @@ import {
   resolveRequestUsageSample,
 } from "@/lib/request-usage-speed"
 import {
+  createRequestTokenEstimator,
+  discardEstimatedRequest,
+  hasUnsettledEstimatedRequest,
+  observeEstimatedDelta,
+  observeEstimatedSnapshot,
+  settleEstimatedRequest,
+  type EstimatorObservation,
+  type RequestTokenEstimatorState,
+} from "@/lib/request-token-estimator"
+import {
   aliasRequestUsageIds,
   publishRequestUsage,
 } from "@/lib/request-usage-live"
@@ -282,6 +292,7 @@ export interface ConnectionState {
   availableCommands: AvailableCommandInfo[] | null
   usage: SessionUsageUpdateInfo | null
   requestUsage?: import("@/lib/request-usage-speed").RequestUsageSnapshot
+  requestEstimator?: import("@/lib/request-token-estimator").RequestTokenEstimatorState
   generationClockStartedAt?: number | null
   liveMessage: LiveMessage | null
   pendingPermission: PendingPermission | null
@@ -684,6 +695,14 @@ const OBSERVER_DISCOVERY_DELAYS_MS = [0, 300, 700, 1500, 2500] as const
 
 // ── Reducer actions ──
 
+type EstimatorActionContext = {
+  receivedAt: number
+}
+
+type ToolEstimatorActionContext = EstimatorActionContext & {
+  raw_input_is_model_authored?: boolean
+}
+
 type Action =
   | {
       type: "CONNECTION_CREATED"
@@ -806,7 +825,7 @@ type Action =
     }
   | StreamingAction
   | { type: "STREAM_BATCH"; actions: StreamingAction[] }
-  | {
+  | ({
       type: "TOOL_CALL"
       contextKey: string
       tool_call_id: string
@@ -820,8 +839,8 @@ type Action =
       meta: ToolCallMeta
       /** `null` when the wire event omitted the field (no images). */
       images: ToolCallImage[] | null
-    }
-  | {
+    } & ToolEstimatorActionContext)
+  | ({
       type: "TOOL_CALL_UPDATE"
       contextKey: string
       tool_call_id: string
@@ -841,26 +860,28 @@ type Action =
        * `[a, b]` to replace.
        */
       images: ToolCallImage[] | null
-    }
+    } & ToolEstimatorActionContext)
   | {
       type: "BATCH_TOOL_CALL_UPDATES"
-      actions: Array<{
-        contextKey: string
-        tool_call_id: string
-        title: string | null
-        fallback_title: string
-        fallback_kind: string
-        status: string | null
-        content: string | null
-        raw_input: string | null
-        raw_output: string | null
-        raw_output_append?: boolean
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        locations: any | null
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        meta: any | null
-        images: ToolCallImage[] | null
-      }>
+      actions: Array<
+        {
+          contextKey: string
+          tool_call_id: string
+          title: string | null
+          fallback_title: string
+          fallback_kind: string
+          status: string | null
+          content: string | null
+          raw_input: string | null
+          raw_output: string | null
+          raw_output_append?: boolean
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          locations: any | null
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          meta: any | null
+          images: ToolCallImage[] | null
+        } & ToolEstimatorActionContext
+      >
     }
   | {
       type: "PERMISSION_REQUEST"
@@ -966,11 +987,11 @@ type Action =
       configId: string
       valueId: string
     }
-  | {
+  | ({
       type: "PLAN_UPDATE"
       contextKey: string
       entries: PlanEntryInfo[]
-    }
+    } & EstimatorActionContext)
   | { type: "TURN_ATTEMPT_ROLLBACK"; contextKey: string }
   | {
       type: "CLAUDE_API_RETRY"
@@ -1001,12 +1022,14 @@ type Action =
       type: "USAGE_UPDATE"
       contextKey: string
       usage: SessionUsageUpdateInfo
+      boundaryAt: number
     }
   | {
       type: "REQUEST_USAGE"
       contextKey: string
       outputTokens: number
-      durationMs: number
+      durationMs: number | null
+      endedAt: number
     }
   | {
       type: "GENERATION_CLOCK_START"
@@ -1063,18 +1086,18 @@ type Action =
     }
 
 type StreamingAction =
-  | {
+  | ({
       type: "CONTENT_DELTA"
       contextKey: string
       text: string
       parentToolUseId?: string
-    }
-  | {
+    } & EstimatorActionContext)
+  | ({
       type: "THINKING"
       contextKey: string
       text: string
       parentToolUseId?: string
-    }
+    } & EstimatorActionContext)
 
 type MapLevelAction = Extract<
   Action,
@@ -1613,6 +1636,28 @@ function rollbackLiveMessageAttempt(prev: LiveMessage): LiveMessage {
 /** Last time an out-of-turn drop was logged — module-level sampling clock. */
 let lastOutOfTurnDropLogAt = 0
 
+function estimatorFor(conn: ConnectionState): RequestTokenEstimatorState {
+  return conn.requestEstimator ?? createRequestTokenEstimator()
+}
+
+function estimatorObservation(
+  conn: ConnectionState,
+  receivedAt: number
+): EstimatorObservation {
+  return {
+    agentType: conn.agentType === "grok" ? "grok" : "codex",
+    configOptions: conn.configOptions,
+    receivedAt,
+  }
+}
+
+function requiredReceivedAt(event: EventEnvelope): number {
+  if (event.received_at == null) {
+    throw new Error("accepted ACP event is missing received_at")
+  }
+  return event.received_at
+}
+
 function applyStreamingAction(
   conn: ConnectionState,
   action: StreamingAction
@@ -1719,10 +1764,19 @@ function applyStreamingAction(
   const sessionFailures = hasSettleableRetryIncident(conn.sessionFailures)
     ? settleSessionFailures(conn.sessionFailures, "retry_incidents")
     : conn.sessionFailures
+  const requestEstimator =
+    conn.agentType === "codex" && !action.parentToolUseId
+      ? observeEstimatedDelta(
+          estimatorFor(conn),
+          action.text,
+          estimatorObservation(conn, action.receivedAt)
+        )
+      : conn.requestEstimator
   return {
     ...conn,
     liveMessage: { ...prev, content: newContent },
     sessionFailures,
+    requestEstimator,
     // Streaming content implies the SDK has recovered from any in-flight
     // Claude API retry, so hide the retry banner immediately instead of
     // waiting for the prompt cycle to end.
@@ -1837,6 +1891,7 @@ function reduceSingleAction(
         availableCommands: null,
         usage: null,
         requestUsage: EMPTY_REQUEST_USAGE,
+        requestEstimator: createRequestTokenEstimator(),
         generationClockStartedAt: null,
         liveMessage: null,
         pendingPermission: null,
@@ -2037,6 +2092,7 @@ function reduceSingleAction(
         availableCommands: null,
         usage: null,
         requestUsage: EMPTY_REQUEST_USAGE,
+        requestEstimator: createRequestTokenEstimator(),
         generationClockStartedAt: null,
         liveMessage: null,
         pendingPermission: null,
@@ -2592,6 +2648,18 @@ function reduceSingleAction(
         })
         return next
       }
+      const requestEstimator =
+        conn.agentType === "codex" &&
+        action.raw_input_is_model_authored === true &&
+        action.raw_input != null &&
+        action.raw_input.length > 0
+          ? observeEstimatedSnapshot(
+              estimatorFor(conn),
+              `tool:${action.tool_call_id}`,
+              action.raw_input,
+              estimatorObservation(conn, action.receivedAt)
+            )
+          : estimatorFor(conn)
       const prev = ensureLiveMessage(conn.liveMessage)
       const existingIndex = prev.content.findIndex(
         (b) =>
@@ -2662,6 +2730,7 @@ function reduceSingleAction(
           nextInfo
         ),
         claudeApiRetry: null,
+        requestEstimator,
       })
       return next
     }
@@ -2714,6 +2783,18 @@ function reduceSingleAction(
         })
         return next
       }
+      const requestEstimator =
+        conn.agentType === "codex" &&
+        action.raw_input_is_model_authored === true &&
+        action.raw_input != null &&
+        action.raw_input.length > 0
+          ? observeEstimatedSnapshot(
+              estimatorFor(conn),
+              `tool:${action.tool_call_id}`,
+              action.raw_input,
+              estimatorObservation(conn, action.receivedAt)
+            )
+          : estimatorFor(conn)
       const prev = ensureLiveMessage(conn.liveMessage)
       const existingIndex = prev.content.findIndex(
         (b) =>
@@ -2819,6 +2900,7 @@ function reduceSingleAction(
           nextInfo
         ),
         claudeApiRetry: null,
+        requestEstimator,
       })
       return next
     }
@@ -3233,6 +3315,17 @@ function reduceSingleAction(
       if (!conn) return state
       // Same out-of-turn guard as TOOL_CALL / streaming deltas.
       if (conn.status !== "prompting") return state
+      const planText = action.entries.map((entry) => entry.content).join("\n")
+      const currentEstimator = estimatorFor(conn)
+      const requestEstimator =
+        conn.agentType === "codex"
+          ? observeEstimatedSnapshot(
+              currentEstimator,
+              "plan",
+              planText,
+              estimatorObservation(conn, action.receivedAt)
+            )
+          : currentEstimator
       const prev = ensureLiveMessage(conn.liveMessage)
       const nonPlanContent = prev.content.filter(
         (block) => block.type !== "plan"
@@ -3248,7 +3341,10 @@ function reduceSingleAction(
         currentPlan === undefined &&
         nonPlanContent.length === prev.content.length
       ) {
-        return state
+        if (requestEstimator === currentEstimator) return state
+        const next = writableConnections(state, mutateUnpublished)
+        next.set(action.contextKey, { ...conn, requestEstimator })
+        return next
       }
 
       const isAlreadyCanonicalPlan =
@@ -3257,7 +3353,12 @@ function reduceSingleAction(
         prev.content.length === nonPlanContent.length + 1 &&
         prev.content[prev.content.length - 1]?.type === "plan"
 
-      if (isAlreadyCanonicalPlan) return state
+      if (isAlreadyCanonicalPlan) {
+        if (requestEstimator === currentEstimator) return state
+        const next = writableConnections(state, mutateUnpublished)
+        next.set(action.contextKey, { ...conn, requestEstimator })
+        return next
+      }
 
       const newContent =
         action.entries.length === 0
@@ -3272,6 +3373,7 @@ function reduceSingleAction(
         ...conn,
         liveMessage: { ...prev, content: newContent },
         claudeApiRetry: null,
+        requestEstimator,
       })
       return next
     }
@@ -3405,47 +3507,81 @@ function reduceSingleAction(
     case "REQUEST_USAGE": {
       const conn = state.get(action.contextKey)
       if (!conn) return state
+      const estimator = estimatorFor(conn)
+      if (
+        conn.agentType === "codex" &&
+        !hasUnsettledEstimatedRequest(estimator)
+      ) {
+        return state
+      }
+      const measuredStart =
+        conn.agentType === "codex"
+          ? estimator.startedAt
+          : conn.generationClockStartedAt
+      const measuredDuration =
+        measuredStart != null ? action.endedAt - measuredStart : 0
       const sample = resolveRequestUsageSample(
         { outputTokens: action.outputTokens, durationMs: action.durationMs },
-        action.durationMs
+        measuredDuration
       )
-      const requestUsage = accumulateRequestUsage(
-        conn.requestUsage ?? EMPTY_REQUEST_USAGE,
-        sample
-      )
+      const currentRequestUsage = conn.requestUsage ?? EMPTY_REQUEST_USAGE
+      const requestUsage = accumulateRequestUsage(currentRequestUsage, sample)
+      const requestEstimator =
+        conn.agentType === "codex"
+          ? discardEstimatedRequest(estimator)
+          : estimator
       const next = writableConnections(state, mutateUnpublished)
       next.set(action.contextKey, {
         ...conn,
         requestUsage,
+        requestEstimator,
         generationClockStartedAt: null,
       })
-      publishRequestUsage(conn.conversationId, requestUsage)
+      if (requestUsage !== currentRequestUsage) {
+        publishRequestUsage(conn.conversationId, requestUsage)
+      }
       return next
     }
 
     case "USAGE_UPDATE": {
       const conn = state.get(action.contextKey)
       if (!conn) return state
-      if (action.usage.size <= 0) {
-        return state
-      }
-      // Ignore usage updates that reset used to 0 when we already have
-      // valid data — these come from synthetic responses for local commands
-      // like /context and would overwrite the real context window usage.
-      if (action.usage.used === 0 && conn.usage && conn.usage.used > 0) {
-        return state
-      }
+      const currentEstimator = estimatorFor(conn)
+      const settlement =
+        conn.agentType === "codex"
+          ? settleEstimatedRequest(currentEstimator, action.boundaryAt)
+          : { state: currentEstimator, sample: null }
+      const currentRequestUsage = conn.requestUsage ?? EMPTY_REQUEST_USAGE
+      const requestUsage = settlement.sample
+        ? accumulateRequestUsage(currentRequestUsage, settlement.sample)
+        : currentRequestUsage
+
+      let usage = conn.usage
       if (
-        conn.usage?.used === action.usage.used &&
-        conn.usage?.size === action.usage.size
+        action.usage.size > 0 &&
+        !(action.usage.used === 0 && usage && usage.used > 0) &&
+        (usage?.used !== action.usage.used || usage?.size !== action.usage.size)
+      ) {
+        usage = action.usage
+      }
+
+      if (
+        settlement.state === currentEstimator &&
+        requestUsage === currentRequestUsage &&
+        usage === conn.usage
       ) {
         return state
       }
       const next = writableConnections(state, mutateUnpublished)
       next.set(action.contextKey, {
         ...conn,
-        usage: action.usage,
+        requestEstimator: settlement.state,
+        requestUsage,
+        usage,
       })
+      if (requestUsage !== currentRequestUsage) {
+        publishRequestUsage(conn.conversationId, requestUsage)
+      }
       return next
     }
 
@@ -3732,7 +3868,7 @@ function prepareMappedEnvelope(
         actions.push({
           type: "GENERATION_CLOCK_START",
           contextKey,
-          at: e.received_at ?? performance.now(),
+          at: requiredReceivedAt(e),
         })
       }
       actions.push({
@@ -3740,6 +3876,7 @@ function prepareMappedEnvelope(
         contextKey,
         text: e.text,
         parentToolUseId: e.parent_tool_use_id ?? undefined,
+        receivedAt: requiredReceivedAt(e),
       })
       if (hasSettleableRetryIncident(snapshot.sessionFailures)) {
         actions.push({
@@ -3754,7 +3891,7 @@ function prepareMappedEnvelope(
         actions.push({
           type: "GENERATION_CLOCK_START",
           contextKey,
-          at: e.received_at ?? performance.now(),
+          at: requiredReceivedAt(e),
         })
       }
       actions.push({
@@ -3762,6 +3899,7 @@ function prepareMappedEnvelope(
         contextKey,
         text: e.text,
         parentToolUseId: e.parent_tool_use_id ?? undefined,
+        receivedAt: requiredReceivedAt(e),
       })
       if (hasSettleableRetryIncident(snapshot.sessionFailures)) {
         actions.push({
@@ -3791,10 +3929,12 @@ function prepareMappedEnvelope(
         status: e.status,
         content: e.content,
         raw_input: e.raw_input,
+        raw_input_is_model_authored: e.raw_input_is_model_authored,
         raw_output: e.raw_output,
         locations: e.locations ?? null,
         meta: (e.meta as ToolCallMeta) ?? null,
         images: e.images ?? null,
+        receivedAt: requiredReceivedAt(e),
       })
       // A new tool call is model output — the same recovery evidence as a
       // content delta. Status-only `tool_call_update` is not.
@@ -3817,11 +3957,13 @@ function prepareMappedEnvelope(
         status: e.status,
         content: e.content,
         raw_input: e.raw_input,
+        raw_input_is_model_authored: e.raw_input_is_model_authored,
         raw_output: e.raw_output,
         raw_output_append: e.raw_output_append,
         locations: e.locations ?? null,
         meta: (e.meta as ToolCallMeta) ?? null,
         images: e.images ?? null,
+        receivedAt: requiredReceivedAt(e),
       })
       break
     case "permission_resolved":
@@ -4124,6 +4266,7 @@ function prepareMappedEnvelope(
         type: "PLAN_UPDATE",
         contextKey,
         entries: e.entries,
+        receivedAt: requiredReceivedAt(e),
       })
       break
     case "session_failure":
@@ -4337,21 +4480,17 @@ function prepareMappedEnvelope(
         type: "USAGE_UPDATE",
         contextKey,
         usage: { used: e.used, size: e.size },
+        boundaryAt: requiredReceivedAt(e),
       })
       break
     case "request_usage": {
-      const endedAt = e.received_at ?? performance.now()
-      const measured =
-        snapshot.generationClockStartedAt != null
-          ? endedAt - snapshot.generationClockStartedAt
-          : 0
-      const durationMs =
-        e.duration_ms && e.duration_ms > 0 ? e.duration_ms : measured
+      const endedAt = requiredReceivedAt(e)
       actions.push({
         type: "REQUEST_USAGE",
         contextKey,
         outputTokens: e.output_tokens,
-        durationMs,
+        durationMs: e.duration_ms && e.duration_ms > 0 ? e.duration_ms : null,
+        endedAt,
       })
       break
     }

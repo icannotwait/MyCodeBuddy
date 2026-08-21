@@ -22,6 +22,7 @@ import type {
 import { parsePermissionToolCall } from "@/lib/permission-request"
 import { subscribeDesktopAcpEvents } from "@/lib/transport/desktop-acp-events"
 import { saveConfigPreference } from "@/lib/selector-prefs-storage"
+import { getPublishedRequestUsage } from "@/lib/request-usage-live"
 import {
   resetAppWorkspaceStore,
   useAppWorkspaceStore,
@@ -1106,6 +1107,430 @@ function hydrateSnapshot(
     handlers.onSnapshot(snapshot, snapshot.event_seq)
   })
 }
+
+async function connectCodex(conversationId: number) {
+  h.acpFindConnectionForConversation.mockResolvedValue(null)
+  await mountProvider()
+  await act(async () => {
+    await h.actions!.connect(
+      TAB,
+      "codex",
+      "/tmp/x",
+      "codex-session",
+      conversationId
+    )
+  })
+  const handlers = latestAttachHandlers()
+  emitAcpEvent(handlers, {
+    seq: 1,
+    connection_id: "spawned-conn",
+    type: "status_changed",
+    status: "prompting",
+    received_at: 10,
+  })
+  return handlers
+}
+
+describe("Codex estimated request usage", () => {
+  it("settles root output at a plain usage_update using ingest duration", async () => {
+    const conversationId = 4_201
+    const handlers = await connectCodex(conversationId)
+    emitAcpEvent(handlers, {
+      seq: 2,
+      connection_id: "spawned-conn",
+      type: "content_delta",
+      text: "abcd",
+      received_at: 100,
+    })
+    emitAcpEvent(handlers, {
+      seq: 3,
+      connection_id: "spawned-conn",
+      type: "usage_update",
+      used: 10,
+      size: 100,
+      received_at: 1_100,
+    })
+
+    expect(getPublishedRequestUsage(conversationId)).toEqual({
+      outputTokens: 2,
+      generationMs: 1_000,
+      tps: 2,
+      sampleCount: 1,
+      estimatedSampleCount: 1,
+    })
+    expect(h.store!.getConnection(TAB)?.usage).toEqual({ used: 10, size: 100 })
+  })
+
+  it("uses ingest stamps when output and boundary share one replay frame", async () => {
+    const conversationId = 4_208
+    const handlers = await connectCodex(conversationId)
+    const reducerNow = vi.spyOn(performance, "now").mockReturnValue(50_000)
+
+    try {
+      act(() => {
+        handlers.onReplay(
+          [
+            {
+              seq: 2,
+              connection_id: "spawned-conn",
+              type: "content_delta",
+              text: "abcd",
+              received_at: 100,
+            },
+            {
+              seq: 3,
+              connection_id: "spawned-conn",
+              type: "usage_update",
+              used: 10,
+              size: 100,
+              received_at: 1_100,
+            },
+          ],
+          3
+        )
+      })
+    } finally {
+      reducerNow.mockRestore()
+    }
+
+    expect(getPublishedRequestUsage(conversationId)).toMatchObject({
+      outputTokens: 2,
+      generationMs: 1_000,
+      tps: 2,
+      sampleCount: 1,
+      estimatedSampleCount: 1,
+    })
+  })
+
+  it("does not settle boundaries before output or duplicate boundaries", async () => {
+    const conversationId = 4_202
+    const handlers = await connectCodex(conversationId)
+    emitAcpEvent(handlers, {
+      seq: 2,
+      connection_id: "spawned-conn",
+      type: "usage_update",
+      used: 1,
+      size: 100,
+      received_at: 100,
+    })
+    emitAcpEvent(handlers, {
+      seq: 3,
+      connection_id: "spawned-conn",
+      type: "content_delta",
+      text: "abcd",
+      received_at: 200,
+    })
+    emitAcpEvent(handlers, {
+      seq: 4,
+      connection_id: "spawned-conn",
+      type: "usage_update",
+      used: 2,
+      size: 100,
+      received_at: 1_200,
+    })
+    emitAcpEvent(handlers, {
+      seq: 5,
+      connection_id: "spawned-conn",
+      type: "usage_update",
+      used: 2,
+      size: 100,
+      received_at: 1_300,
+    })
+
+    expect(getPublishedRequestUsage(conversationId).sampleCount).toBe(1)
+  })
+
+  it("processes exact usage first and suppresses its matching estimate", async () => {
+    const conversationId = 4_203
+    const handlers = await connectCodex(conversationId)
+    emitAcpEvent(handlers, {
+      seq: 2,
+      connection_id: "spawned-conn",
+      type: "content_delta",
+      text: "a".repeat(400),
+      received_at: 100,
+    })
+    emitAcpEvent(handlers, {
+      seq: 3,
+      connection_id: "spawned-conn",
+      type: "request_usage",
+      output_tokens: 77,
+      received_at: 1_100,
+    })
+    emitAcpEvent(handlers, {
+      seq: 4,
+      connection_id: "spawned-conn",
+      type: "usage_update",
+      used: 77,
+      size: 100_000,
+      received_at: 1_101,
+    })
+
+    expect(getPublishedRequestUsage(conversationId)).toEqual({
+      outputTokens: 77,
+      generationMs: 1_000,
+      tps: 77,
+      sampleCount: 1,
+      estimatedSampleCount: 0,
+    })
+  })
+
+  it("settles exact usage after 10 to 12 to 3 retracts visible output to zero", async () => {
+    const conversationId = 4_209
+    const handlers = await connectCodex(conversationId)
+    emitAcpEvent(handlers, {
+      seq: 2,
+      connection_id: "spawned-conn",
+      type: "tool_call",
+      tool_call_id: "reconciled-tool",
+      title: "terminal",
+      kind: "execute",
+      status: "in_progress",
+      content: null,
+      raw_input: "a".repeat(40),
+      raw_input_is_model_authored: true,
+      raw_output: null,
+      received_at: 100,
+    })
+    emitAcpEvent(handlers, {
+      seq: 3,
+      connection_id: "spawned-conn",
+      type: "request_usage",
+      output_tokens: 10,
+      received_at: 1_100,
+    })
+    emitAcpEvent(handlers, {
+      seq: 4,
+      connection_id: "spawned-conn",
+      type: "usage_update",
+      used: 10,
+      size: 100_000,
+      received_at: 1_101,
+    })
+    emitAcpEvent(handlers, {
+      seq: 5,
+      connection_id: "spawned-conn",
+      type: "tool_call_update",
+      tool_call_id: "reconciled-tool",
+      title: null,
+      status: "in_progress",
+      content: null,
+      raw_input: "a".repeat(48),
+      raw_input_is_model_authored: true,
+      raw_output: null,
+      received_at: 2_000,
+    })
+    emitAcpEvent(handlers, {
+      seq: 6,
+      connection_id: "spawned-conn",
+      type: "tool_call_update",
+      tool_call_id: "reconciled-tool",
+      title: null,
+      status: "in_progress",
+      content: null,
+      raw_input: "b".repeat(12),
+      raw_input_is_model_authored: true,
+      raw_output: null,
+      received_at: 2_100,
+    })
+
+    expect(h.store!.getConnection(TAB)?.requestEstimator).toMatchObject({
+      startedAt: 2_000,
+      visibleTokens: 0,
+    })
+
+    emitAcpEvent(handlers, {
+      seq: 7,
+      connection_id: "spawned-conn",
+      type: "request_usage",
+      output_tokens: 7,
+      received_at: 3_000,
+    })
+    emitAcpEvent(handlers, {
+      seq: 8,
+      connection_id: "spawned-conn",
+      type: "usage_update",
+      used: 17,
+      size: 100_000,
+      received_at: 3_001,
+    })
+
+    expect(getPublishedRequestUsage(conversationId)).toEqual({
+      outputTokens: 17,
+      generationMs: 2_000,
+      tps: 8.5,
+      sampleCount: 2,
+      estimatedSampleCount: 0,
+    })
+    expect(h.store!.getConnection(TAB)?.requestEstimator?.startedAt).toBeNull()
+  })
+
+  it("ignores a late exact Codex sample before new output", async () => {
+    const conversationId = 4_204
+    const handlers = await connectCodex(conversationId)
+    emitAcpEvent(handlers, {
+      seq: 2,
+      connection_id: "spawned-conn",
+      type: "content_delta",
+      text: "abcd",
+      received_at: 100,
+    })
+    emitAcpEvent(handlers, {
+      seq: 3,
+      connection_id: "spawned-conn",
+      type: "usage_update",
+      used: 1,
+      size: 100,
+      received_at: 1_100,
+    })
+    const before = getPublishedRequestUsage(conversationId)
+    emitAcpEvent(handlers, {
+      seq: 4,
+      connection_id: "spawned-conn",
+      type: "request_usage",
+      output_tokens: 999,
+      received_at: 1_200,
+    })
+
+    expect(getPublishedRequestUsage(conversationId)).toBe(before)
+  })
+
+  it("counts root thinking, plan text, and only explicitly authored tool input", async () => {
+    const conversationId = 4_205
+    const handlers = await connectCodex(conversationId)
+    emitAcpEvent(handlers, {
+      seq: 2,
+      connection_id: "spawned-conn",
+      type: "thinking",
+      text: "a".repeat(40),
+      received_at: 100,
+    })
+    emitAcpEvent(handlers, {
+      seq: 3,
+      connection_id: "spawned-conn",
+      type: "plan_update",
+      entries: [
+        { content: "b".repeat(40), priority: "medium", status: "pending" },
+      ],
+      received_at: 200,
+    })
+    emitAcpEvent(handlers, {
+      seq: 4,
+      connection_id: "spawned-conn",
+      type: "tool_call",
+      tool_call_id: "synthetic",
+      title: "edit",
+      kind: "edit",
+      status: "pending",
+      content: null,
+      raw_input: "c".repeat(400),
+      raw_output: null,
+      received_at: 300,
+    })
+    emitAcpEvent(handlers, {
+      seq: 5,
+      connection_id: "spawned-conn",
+      type: "tool_call",
+      tool_call_id: "authored",
+      title: "terminal",
+      kind: "execute",
+      status: "pending",
+      content: null,
+      raw_input: "d".repeat(40),
+      raw_input_is_model_authored: true,
+      raw_output: null,
+      received_at: 400,
+    })
+    emitAcpEvent(handlers, {
+      seq: 6,
+      connection_id: "spawned-conn",
+      type: "usage_update",
+      used: 1,
+      size: 100,
+      received_at: 1_100,
+    })
+
+    expect(getPublishedRequestUsage(conversationId).outputTokens).toBe(56)
+  })
+
+  it("excludes parented subagent output", async () => {
+    const conversationId = 4_206
+    const handlers = await connectCodex(conversationId)
+    emitAcpEvent(handlers, {
+      seq: 2,
+      connection_id: "spawned-conn",
+      type: "content_delta",
+      text: "a".repeat(400),
+      parent_tool_use_id: "parent-tool",
+      received_at: 100,
+    })
+    emitAcpEvent(handlers, {
+      seq: 3,
+      connection_id: "spawned-conn",
+      type: "usage_update",
+      used: 1,
+      size: 100,
+      received_at: 1_100,
+    })
+
+    expect(getPublishedRequestUsage(conversationId).sampleCount).toBe(0)
+  })
+
+  it("starts the second request after tool time instead of including the gap", async () => {
+    const conversationId = 4_207
+    const handlers = await connectCodex(conversationId)
+    for (const event of [
+      {
+        seq: 2,
+        type: "content_delta" as const,
+        text: "abcd",
+        received_at: 100,
+      },
+      {
+        seq: 3,
+        type: "usage_update" as const,
+        used: 1,
+        size: 100,
+        received_at: 1_100,
+      },
+      {
+        seq: 4,
+        type: "tool_call_update" as const,
+        tool_call_id: "tool",
+        title: null,
+        status: "completed",
+        content: null,
+        raw_input: null,
+        raw_output: "result",
+        received_at: 8_000,
+      },
+      {
+        seq: 5,
+        type: "content_delta" as const,
+        text: "efgh",
+        received_at: 10_000,
+      },
+      {
+        seq: 6,
+        type: "usage_update" as const,
+        used: 2,
+        size: 100,
+        received_at: 11_000,
+      },
+    ]) {
+      emitAcpEvent(handlers, {
+        connection_id: "spawned-conn",
+        ...event,
+      })
+    }
+
+    expect(getPublishedRequestUsage(conversationId)).toMatchObject({
+      sampleCount: 2,
+      generationMs: 2_000,
+      estimatedSampleCount: 2,
+    })
+  })
+})
 
 describe("AcpConnectionsProvider cross-client viewer lifecycle", () => {
   it("attaches as a viewer (no spawn) when a live connection is discovered", async () => {
@@ -5141,11 +5566,21 @@ describe("APPLY_EVENT_FRAME reducer parity", () => {
   }> = [
     {
       name: "CONTENT_DELTA",
-      action: { type: "CONTENT_DELTA", contextKey: "k1", text: "hi" },
+      action: {
+        type: "CONTENT_DELTA",
+        contextKey: "k1",
+        text: "hi",
+        receivedAt: 1,
+      },
     },
     {
       name: "THINKING",
-      action: { type: "THINKING", contextKey: "k1", text: "hmm" },
+      action: {
+        type: "THINKING",
+        contextKey: "k1",
+        text: "hmm",
+        receivedAt: 1,
+      },
     },
     {
       name: "STATUS_CHANGED",
@@ -5179,6 +5614,7 @@ describe("APPLY_EVENT_FRAME reducer parity", () => {
         type: "USAGE_UPDATE",
         contextKey: "k1",
         usage: { used: 1, size: 10 },
+        boundaryAt: 1,
       },
     },
     {
@@ -5277,6 +5713,7 @@ describe("APPLY_EVENT_FRAME reducer parity", () => {
         type: "PLAN_UPDATE",
         contextKey: "k1",
         entries: [{ content: "a", status: "pending", priority: "medium" }],
+        receivedAt: 1,
       },
     },
     {
@@ -5313,6 +5750,7 @@ describe("APPLY_EVENT_FRAME reducer parity", () => {
         locations: null,
         meta: null,
         images: null,
+        receivedAt: 1,
       },
     },
     {
@@ -5332,6 +5770,7 @@ describe("APPLY_EVENT_FRAME reducer parity", () => {
         locations: null,
         meta: null,
         images: null,
+        receivedAt: 1,
       },
     },
     {

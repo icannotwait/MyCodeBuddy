@@ -6,7 +6,11 @@ import type {
   EventEnvelope,
   SequenceGap,
 } from "@/lib/types"
-import { EventIngestor } from "./event-ingestor"
+import {
+  EventIngestor,
+  compactAdjacentDeltas,
+  prepareEventEnvelope,
+} from "./event-ingestor"
 
 function batch(
   batch_id: number,
@@ -130,6 +134,25 @@ function createIngestorHarness(
 }
 
 describe("EventIngestor", () => {
+  it("stamps a missing received_at exactly once before queueing", () => {
+    const now = vi.spyOn(performance, "now").mockReturnValue(123.5)
+    const original = content("c1", 1, "a")
+    const prepared = prepareEventEnvelope(original)
+
+    expect(prepared.received_at).toBe(123.5)
+    expect(prepareEventEnvelope(prepared)).toBe(prepared)
+    expect(now).toHaveBeenCalledTimes(1)
+  })
+
+  it("keeps the first merged delta ingest stamp", () => {
+    const merged = compactAdjacentDeltas([
+      { ...content("c1", 1, "a"), received_at: 100 },
+      { ...content("c1", 2, "b"), received_at: 250 },
+    ])
+
+    expect(merged).toMatchObject([{ seq: 2, text: "ab", received_at: 100 }])
+  })
+
   it("deduplicates, compacts, and commits once on the next frame", () => {
     const h = createIngestorHarness({ c1: { key: "tab-1", cursor: 10 } })
     h.pushBatch(
