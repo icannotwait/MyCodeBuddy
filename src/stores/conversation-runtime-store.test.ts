@@ -1073,4 +1073,73 @@ describe("owner overlay retirement without live-* persist ids", () => {
       expect(latestCopies[0]?.turn.id).toBe("cursor-turn-0")
     }
   )
+
+  it("settled refetch retires last-round overlay when parser and live clocks differ", async () => {
+    const { actions } = useConversationRuntimeStore.getState()
+    seedRuntimeSession({
+      detail: detailWithTurns([
+        userTurn("u-old", "old prompt", "2026-08-20T11:00:00.000Z"),
+        assistantTurn("a-old", "old reply", "2026-08-20T11:00:01.000Z"),
+      ]),
+      localTurns: [
+        assistantTurn(
+          "live-42-earlier",
+          "earlier overlay",
+          "2026-08-20T11:30:00.000Z"
+        ),
+        userTurn("msg-latest", "latest prompt", "2026-08-20T12:00:00.000Z"),
+        assistantTurn(
+          "live-42-latest",
+          "latest reply",
+          "2026-08-20T12:00:01.000Z"
+        ),
+      ],
+      liveOwnsActiveTurn: false,
+      syncState: "idle",
+    })
+
+    mockGetFolderConversation.mockResolvedValueOnce(
+      detailWithTurns([
+        userTurn("u-old", "old prompt", "2026-08-20T11:00:00.000Z"),
+        assistantTurn("a-old", "old reply", "2026-08-20T11:00:01.000Z"),
+        userTurn(
+          "550e8400-e29b-41d4-a716-446655440000",
+          "latest prompt",
+          "2026-08-20T14:00:00.000Z"
+        ),
+        assistantTurn(
+          "cursor-turn-0",
+          "latest reply",
+          "2026-08-20T14:00:05.000Z"
+        ),
+      ])
+    )
+    actions.refetchDetail(CID, { preserveLive: false })
+    await Promise.resolve()
+    await Promise.resolve()
+
+    const session = useConversationRuntimeStore
+      .getState()
+      .byConversationId.get(CID)!
+    expect(session.localTurns.some((t) => t.id === "live-42-latest")).toBe(
+      false
+    )
+    expect(session.localTurns.some((t) => t.id === "live-42-earlier")).toBe(
+      true
+    )
+
+    const latestCopies = selectHistoricalTimelineTurns(
+      useConversationRuntimeStore.getState(),
+      CID
+    ).filter((entry) => {
+      const block = entry.turn.blocks[0]
+      return (
+        entry.turn.role === "assistant" &&
+        block?.type === "text" &&
+        block.text === "latest reply"
+      )
+    })
+    expect(latestCopies).toHaveLength(1)
+    expect(latestCopies[0]?.turn.id).toBe("cursor-turn-0")
+  })
 })

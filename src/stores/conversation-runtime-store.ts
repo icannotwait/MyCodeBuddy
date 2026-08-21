@@ -863,10 +863,49 @@ function persistIdentityKey(turn: MessageTurn): string | null {
   return `${turn.role}\0${turn.timestamp}`
 }
 
+function lastIndexOfRole(
+  turns: readonly MessageTurn[],
+  role: MessageTurn["role"]
+): number {
+  for (let i = turns.length - 1; i >= 0; i--) {
+    if (turns[i]!.role === role) return i
+  }
+  return -1
+}
+
+function turnTextContent(turn: MessageTurn): string {
+  let out = ""
+  for (const block of turn.blocks) {
+    if (block.type === "text") out += block.text
+  }
+  return out
+}
+
 /**
- * Drop localTurns already proven persisted in `detail.turns` by id or
- * by role+timestamp. Unpersisted remainder is the only copy in an owner
- * tab that does not refetch, so it is never truncated by count.
+ * Last-round window: the persist snapshot has caught up to the overlay's
+ * last user without needing equal clocks. Text/content match is the
+ * primary proof; a sole user on both sides with persist user count
+ * covering that one round is the fallback.
+ */
+function lastUsersCorrespond(
+  localTurns: readonly MessageTurn[],
+  persisted: readonly MessageTurn[],
+  lastLocalUserIdx: number,
+  lastPersistUserIdx: number
+): boolean {
+  const localText = turnTextContent(localTurns[lastLocalUserIdx]!)
+  const persistText = turnTextContent(persisted[lastPersistUserIdx]!)
+  if (localText.length > 0 && localText === persistText) return true
+  const localUserCount = localTurns.filter((t) => t.role === "user").length
+  const persistUserCount = persisted.filter((t) => t.role === "user").length
+  return localUserCount === 1 && persistUserCount >= 1
+}
+
+/**
+ * Drop localTurns already proven persisted in `detail.turns` by id,
+ * role+timestamp, or a settled last-round window. Unpersisted remainder
+ * is the only copy in an owner tab that does not refetch, so it is
+ * never truncated by count.
  */
 function retireCoveredLocalTurns(
   localTurns: MessageTurn[],
@@ -881,10 +920,28 @@ function retireCoveredLocalTurns(
     const key = persistIdentityKey(turn)
     if (key) persistedIdentity.add(key)
   }
-  const retained = localTurns.filter((t) => {
+  // Mid-turn snapshots can carry a partial persist of the same reply.
+  // Last-round retirement needs a settled assistant after the last user.
+  const lastLocalUserIdx = lastIndexOfRole(localTurns, "user")
+  const lastPersistUserIdx = lastIndexOfRole(persisted, "user")
+  const lastRoundCovered =
+    detail.in_flight_user_turn_id == null &&
+    lastLocalUserIdx >= 0 &&
+    lastPersistUserIdx >= 0 &&
+    persisted
+      .slice(lastPersistUserIdx + 1)
+      .some((t) => t.role === "assistant") &&
+    lastUsersCorrespond(
+      localTurns,
+      persisted,
+      lastLocalUserIdx,
+      lastPersistUserIdx
+    )
+  const retained = localTurns.filter((t, i) => {
     if (persistedIds.has(t.id)) return false
     const key = persistIdentityKey(t)
-    return !(key && persistedIdentity.has(key))
+    if (key && persistedIdentity.has(key)) return false
+    return !(lastRoundCovered && i > lastLocalUserIdx && t.role === "assistant")
   })
   return retained.length === localTurns.length ? localTurns : retained
 }
@@ -2126,7 +2183,8 @@ function reducer(
       // Mid-turn snapshots can carry a partial persist of the same reply.
       // Do not retire the more-complete overlay against that partial.
       // Settled refetches — including idle `preserveLive` detail_refetch —
-      // still drop overlays proven persisted (id or role+timestamp).
+      // still drop overlays proven persisted (id, role+timestamp, or a
+      // last-round window after the last corresponding user).
       const nextLocalTurns = detailIsInFlight
         ? current.localTurns
         : retireCoveredLocalTurns(current.localTurns, detail)
