@@ -627,6 +627,56 @@ mod tests {
         .unwrap();
     }
 
+    fn push_proto_varint(out: &mut Vec<u8>, mut value: u64) {
+        while value >= 0x80 {
+            out.push((value as u8) | 0x80);
+            value >>= 7;
+        }
+        out.push(value as u8);
+    }
+
+    fn proto_bytes(field_number: u32, value: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        push_proto_varint(&mut out, u64::from(field_number) << 3 | 2);
+        push_proto_varint(&mut out, value.len() as u64);
+        out.extend_from_slice(value);
+        out
+    }
+
+    fn proto_string_value(value: &str) -> Vec<u8> {
+        proto_bytes(3, value.as_bytes())
+    }
+
+    fn proto_mcp_arg(key: &str, value: &str) -> Vec<u8> {
+        let mut entry = proto_bytes(1, key.as_bytes());
+        entry.extend(proto_bytes(2, &proto_string_value(value)));
+        proto_bytes(2, &entry)
+    }
+
+    fn write_real_binary_delegate_blob(store_path: &std::path::Path, tool_call_id: &str) {
+        if let Some(parent) = store_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let conn = rusqlite::Connection::open(store_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE blobs (id TEXT PRIMARY KEY, data BLOB);
+             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+        )
+        .unwrap();
+
+        let mut mcp_args = proto_mcp_arg("agent_type", "codex");
+        mcp_args.extend(proto_mcp_arg("task", "build it"));
+        mcp_args.extend(proto_mcp_arg("correlation_id", "real-store-corr"));
+        mcp_args.extend(proto_bytes(3, tool_call_id.as_bytes()));
+        mcp_args.extend(proto_bytes(5, b"delegate_to_agent"));
+        let blob = proto_bytes(2, &proto_bytes(7, &mcp_args));
+        conn.execute(
+            "INSERT INTO blobs (id, data) VALUES (?1, ?2)",
+            rusqlite::params!["row-0", blob],
+        )
+        .unwrap();
+    }
+
     fn real_delegate_key() -> DelegationMatchKey {
         DelegationMatchKey::Delegate {
             correlation_id: "real-store-corr".into(),
@@ -681,6 +731,54 @@ mod tests {
                 .await
                 .as_deref(),
             Some("tc-real")
+        );
+        assert_eq!(metrics.snapshot().cursor_enrichment_resolved, 1);
+        std::fs::remove_dir_all(&cursor_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn real_binary_store_backfills_before_json_tool_call_is_persisted() {
+        let metrics = Arc::new(DelegationMetrics::default());
+        let broker = Arc::new(DelegationBroker::new(
+            Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+            Arc::new(RootDepth) as Arc<dyn ConversationDepthLookup>,
+        ));
+        let session_id = "0198c9aa-aaaa-bbbb-cccc-111122223333";
+        let tool_call_id = "call-cursor-proto\nfc_cursor_proto_0";
+        broker
+            .register_identityless_tool_call("cursor-conn", tool_call_id.into())
+            .await;
+        let cursor_dir = temp_cursor_store_root();
+        let store_path = cursor_dir
+            .join("acp-sessions")
+            .join(session_id)
+            .join("store.db");
+        write_real_binary_delegate_blob(&store_path, tool_call_id);
+
+        let enricher = CursorStoreEnricher::new(
+            Arc::new(CursorStoreReader::with_cursor_dir(cursor_dir.clone())),
+            Arc::new(MapSessions(std::sync::Mutex::new(
+                [(
+                    "cursor-conn".into(),
+                    CursorEnrichmentSession {
+                        agent_type: AgentType::Cursor,
+                        external_session_id: session_id.into(),
+                    },
+                )]
+                .into(),
+            ))),
+            broker.clone(),
+            metrics.clone(),
+        );
+        enricher.maybe_schedule(&mcp_tool_envelope("cursor-conn", tool_call_id, Some("{}")));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        assert_eq!(
+            broker
+                .take_matching_tool_call("cursor-conn", &real_delegate_key())
+                .await
+                .as_deref(),
+            Some(tool_call_id)
         );
         assert_eq!(metrics.snapshot().cursor_enrichment_resolved, 1);
         std::fs::remove_dir_all(&cursor_dir).ok();

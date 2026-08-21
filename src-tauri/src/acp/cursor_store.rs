@@ -4,18 +4,21 @@ mod tests {
     use rusqlite::Connection;
     use serde_json::json;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     const COMPOUND_ID: &str = "call-cursor-1\nfc_abc_0";
     const SESSION: &str = "0198c9aa-1111-2222-3333-444455556666";
+    static NEXT_TEMP_DIR: AtomicU64 = AtomicU64::new(0);
 
     fn temp_cursor_dir() -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "codeg-cursor-store-{}-{}",
+            "codeg-cursor-store-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            NEXT_TEMP_DIR.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -38,6 +41,135 @@ mod tests {
             )
             .unwrap();
         }
+    }
+
+    fn write_raw_store(path: &Path, rows: &[Vec<u8>]) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE blobs (id TEXT PRIMARY KEY, data BLOB);
+             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+        )
+        .unwrap();
+        for (i, row) in rows.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO blobs (id, data) VALUES (?1, ?2)",
+                rusqlite::params![format!("row-{i}"), row],
+            )
+            .unwrap();
+        }
+    }
+
+    fn push_varint(out: &mut Vec<u8>, mut value: u64) {
+        while value >= 0x80 {
+            out.push((value as u8) | 0x80);
+            value >>= 7;
+        }
+        out.push(value as u8);
+    }
+
+    fn length_delimited(field_number: u32, value: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        push_varint(&mut out, u64::from(field_number) << 3 | 2);
+        push_varint(&mut out, value.len() as u64);
+        out.extend_from_slice(value);
+        out
+    }
+
+    fn varint_value(field_number: u32, value: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        push_varint(&mut out, u64::from(field_number) << 3);
+        push_varint(&mut out, value);
+        out
+    }
+
+    fn string_value(value: &str) -> Vec<u8> {
+        length_delimited(3, value.as_bytes())
+    }
+
+    fn bool_value(value: bool) -> Vec<u8> {
+        varint_value(4, u64::from(value))
+    }
+
+    fn null_value() -> Vec<u8> {
+        varint_value(1, 0)
+    }
+
+    fn number_value(value: f64) -> Vec<u8> {
+        let mut out = vec![(2_u8 << 3) | 1];
+        out.extend(value.to_bits().to_le_bytes());
+        out
+    }
+
+    fn value_map_entry(key: &str, value: Vec<u8>) -> Vec<u8> {
+        let mut entry = length_delimited(1, key.as_bytes());
+        entry.extend(length_delimited(2, &value));
+        entry
+    }
+
+    fn struct_value(entries: Vec<(&str, Vec<u8>)>) -> Vec<u8> {
+        let mut structure = Vec::new();
+        for (key, value) in entries {
+            structure.extend(length_delimited(1, &value_map_entry(key, value)));
+        }
+        length_delimited(5, &structure)
+    }
+
+    fn list_value(values: Vec<Vec<u8>>) -> Vec<u8> {
+        let mut list = Vec::new();
+        for value in values {
+            list.extend(length_delimited(1, &value));
+        }
+        length_delimited(6, &list)
+    }
+
+    fn protobuf_mcp_message_with_args(
+        tool_call_id: &str,
+        tool_name: &str,
+        args: Vec<(&str, Vec<u8>)>,
+    ) -> Vec<u8> {
+        // Cursor's generated `agent.v1.McpArgs`: fields 2/3/5 are args,
+        // tool_call_id and tool_name. The outer length-delimited messages
+        // mirror the fact that McpArgs is nested in Cursor's persisted state.
+        let mut mcp = length_delimited(1, b"codeg-mcp-delegate_to_agent");
+        for (key, value) in args {
+            mcp.extend(length_delimited(2, &value_map_entry(key, value)));
+        }
+        mcp.extend(length_delimited(3, tool_call_id.as_bytes()));
+        mcp.extend(length_delimited(4, b"codeg-mcp"));
+        mcp.extend(length_delimited(5, tool_name.as_bytes()));
+        mcp.extend(length_delimited(9, b"codeg-mcp"));
+        mcp
+    }
+
+    fn protobuf_mcp_blob_with_args(
+        tool_call_id: &str,
+        tool_name: &str,
+        args: Vec<(&str, Vec<u8>)>,
+    ) -> Vec<u8> {
+        let mcp = protobuf_mcp_message_with_args(tool_call_id, tool_name, args);
+        length_delimited(2, &length_delimited(7, &mcp))
+    }
+
+    fn nest_protobuf_message(mut message: Vec<u8>, depth: usize) -> Vec<u8> {
+        for _ in 0..depth {
+            message = length_delimited(7, &message);
+        }
+        message
+    }
+
+    fn protobuf_mcp_blob(tool_call_id: &str) -> Vec<u8> {
+        protobuf_mcp_blob_with_args(
+            tool_call_id,
+            "delegate_to_agent",
+            vec![
+                ("agent_type", string_value("codex")),
+                ("task", string_value("build it")),
+                ("correlation_id", string_value("proto-corr-1")),
+            ],
+        )
     }
 
     /// Like [`write_store`] but switches the store to WAL journal mode and
@@ -224,6 +356,216 @@ mod tests {
     }
 
     #[test]
+    fn lookup_recovers_binary_mcp_args_before_json_tool_call_is_persisted() {
+        let root = temp_cursor_dir();
+        let reader = CursorStoreReader::with_cursor_dir(root.clone());
+        let store = root.join("acp-sessions").join(SESSION).join("store.db");
+        write_raw_store(&store, &[protobuf_mcp_blob(COMPOUND_ID)]);
+
+        let found = reader.lookup(SESSION, COMPOUND_ID).unwrap();
+        assert_eq!(found.tool_name, "delegate_to_agent");
+        assert_eq!(
+            found.args,
+            json!({
+                "agent_type": "codex",
+                "task": "build it",
+                "correlation_id": "proto-corr-1"
+            })
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn lookup_decodes_nested_protobuf_structs_and_lists() {
+        let root = temp_cursor_dir();
+        let reader = CursorStoreReader::with_cursor_dir(root.clone());
+        let store = root.join("acp-sessions").join(SESSION).join("store.db");
+        let nested = struct_value(vec![
+            ("enabled", bool_value(true)),
+            ("threshold", number_value(2.5)),
+            (
+                "labels",
+                list_value(vec![string_value("one"), null_value()]),
+            ),
+        ]);
+        write_raw_store(
+            &store,
+            &[protobuf_mcp_blob_with_args(
+                COMPOUND_ID,
+                "delegate_to_agent",
+                vec![("settings", nested)],
+            )],
+        );
+
+        assert_eq!(
+            reader.lookup(SESSION, COMPOUND_ID).unwrap().args,
+            json!({
+                "settings": {
+                    "enabled": true,
+                    "threshold": 2.5,
+                    "labels": ["one", null]
+                }
+            })
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn malformed_anchored_protobuf_record_is_not_accepted() {
+        let root = temp_cursor_dir();
+        let reader = CursorStoreReader::with_cursor_dir(root.clone());
+        let store = root.join("acp-sessions").join(SESSION).join("store.db");
+        write_raw_store(
+            &store,
+            &[protobuf_mcp_blob_with_args(
+                COMPOUND_ID,
+                "delegate_to_agent",
+                vec![("task", vec![0x1a, 0x05, b'x'])],
+            )],
+        );
+
+        assert_eq!(
+            reader.lookup(SESSION, COMPOUND_ID),
+            Err(CursorStoreError::ConflictingRecords)
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn malformed_anchored_record_rejects_valid_sibling() {
+        let root = temp_cursor_dir();
+        let reader = CursorStoreReader::with_cursor_dir(root.clone());
+        let store = root.join("acp-sessions").join(SESSION).join("store.db");
+        let malformed = protobuf_mcp_blob_with_args(
+            COMPOUND_ID,
+            "delegate_to_agent",
+            vec![("task", vec![0x1a, 0x05, b'x'])],
+        );
+        write_raw_store(&store, &[protobuf_mcp_blob(COMPOUND_ID), malformed]);
+
+        assert_eq!(
+            reader.lookup(SESSION, COMPOUND_ID),
+            Err(CursorStoreError::ConflictingRecords)
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn protobuf_scan_accepts_max_depth_and_rejects_deeper_candidate() {
+        let message = || {
+            protobuf_mcp_message_with_args(
+                COMPOUND_ID,
+                "delegate_to_agent",
+                vec![("task", string_value("depth"))],
+            )
+        };
+
+        let root = temp_cursor_dir();
+        let reader = CursorStoreReader::with_cursor_dir(root.clone());
+        let store = root.join("acp-sessions").join(SESSION).join("store.db");
+        write_raw_store(&store, &[nest_protobuf_message(message(), 24)]);
+        assert_eq!(
+            reader.lookup(SESSION, COMPOUND_ID).unwrap().args["task"],
+            "depth"
+        );
+        std::fs::remove_dir_all(root).ok();
+
+        let root = temp_cursor_dir();
+        let reader = CursorStoreReader::with_cursor_dir(root.clone());
+        let store = root.join("acp-sessions").join(SESSION).join("store.db");
+        write_raw_store(&store, &[nest_protobuf_message(message(), 25)]);
+        assert_eq!(
+            reader.lookup(SESSION, COMPOUND_ID),
+            Err(CursorStoreError::StoreUnreadable)
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn conflicting_json_and_protobuf_records_fail_closed() {
+        let root = temp_cursor_dir();
+        let reader = CursorStoreReader::with_cursor_dir(root.clone());
+        let store = root.join("acp-sessions").join(SESSION).join("store.db");
+        write_raw_store(
+            &store,
+            &[
+                serde_json::to_vec(&tool_call_blob(
+                    COMPOUND_ID,
+                    "delegate_to_agent",
+                    json!({
+                        "agent_type": "codex",
+                        "task": "different",
+                        "correlation_id": "proto-corr-1"
+                    }),
+                ))
+                .unwrap(),
+                protobuf_mcp_blob(COMPOUND_ID),
+            ],
+        );
+
+        assert_eq!(
+            reader.lookup(SESSION, COMPOUND_ID),
+            Err(CursorStoreError::ConflictingRecords)
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn identical_json_and_protobuf_records_are_accepted() {
+        let root = temp_cursor_dir();
+        let reader = CursorStoreReader::with_cursor_dir(root.clone());
+        let store = root.join("acp-sessions").join(SESSION).join("store.db");
+        let args = json!({
+            "agent_type": "codex",
+            "task": "build it",
+            "correlation_id": "proto-corr-1"
+        });
+        write_raw_store(
+            &store,
+            &[
+                serde_json::to_vec(&tool_call_blob(
+                    COMPOUND_ID,
+                    "delegate_to_agent",
+                    args.clone(),
+                ))
+                .unwrap(),
+                protobuf_mcp_blob(COMPOUND_ID),
+            ],
+        );
+
+        assert_eq!(reader.lookup(SESSION, COMPOUND_ID).unwrap().args, args);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn identical_json_and_protobuf_integer_numbers_are_accepted() {
+        let root = temp_cursor_dir();
+        let reader = CursorStoreReader::with_cursor_dir(root.clone());
+        let store = root.join("acp-sessions").join(SESSION).join("store.db");
+        let args = json!({"attempt": 1});
+        write_raw_store(
+            &store,
+            &[
+                serde_json::to_vec(&tool_call_blob(
+                    COMPOUND_ID,
+                    "delegate_to_agent",
+                    args.clone(),
+                ))
+                .unwrap(),
+                protobuf_mcp_blob_with_args(
+                    COMPOUND_ID,
+                    "delegate_to_agent",
+                    vec![("attempt", number_value(1.0))],
+                ),
+            ],
+        );
+
+        assert_eq!(reader.lookup(SESSION, COMPOUND_ID).unwrap().args, args);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn conflicting_same_id_records_fail_closed_independent_of_row_order() {
         let root = temp_cursor_dir();
         let reader = CursorStoreReader::with_cursor_dir(root.clone());
@@ -373,6 +715,8 @@ use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 use std::path::{Component, Path, PathBuf};
 
+use super::cursor_store_proto::{find_mcp_tool_calls, ProtobufScanBudget, ProtobufScanError};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CursorStoredToolCall {
     pub tool_name: String,
@@ -460,46 +804,50 @@ impl CursorStoreReader {
             .query([])
             .map_err(|err| classify_sqlite_error(&err))?;
         let mut found: Option<(String, Value, String)> = None;
+        let mut protobuf_budget = ProtobufScanBudget::default();
 
         while let Some(row) = rows.next().map_err(|err| classify_sqlite_error(&err))? {
+            protobuf_budget
+                .record_store_row()
+                .map_err(classify_protobuf_scan_error)?;
             let data = match row.get_ref(1) {
                 Ok(rusqlite::types::ValueRef::Blob(data)) => data,
                 Ok(rusqlite::types::ValueRef::Text(data)) => data,
                 _ => continue,
             };
-            let text = match std::str::from_utf8(data) {
-                Ok(text) => text,
-                Err(_) => continue,
-            };
-            let value: Value = match serde_json::from_str(text) {
-                Ok(value) => value,
-                Err(_) => continue,
-            };
-            let Some(content) = value.get("content").and_then(Value::as_array) else {
-                continue;
-            };
-
-            for item in content {
-                if item.get("type").and_then(Value::as_str) != Some("tool-call")
-                    || item.get("toolCallId").and_then(Value::as_str) != Some(tool_call_id)
-                {
-                    continue;
-                }
-                let Some(tool_name) = item.get("toolName").and_then(Value::as_str) else {
-                    continue;
-                };
-                let Some(args) = item.get("args") else {
-                    continue;
-                };
-                let normalized = normalize_tool_name(tool_name);
-
-                if let Some((existing_name, existing_args, _)) = &found {
-                    if existing_name != &normalized || existing_args != args {
-                        return Err(CursorStoreError::ConflictingRecords);
+            protobuf_budget
+                .record_store_bytes(data.len())
+                .map_err(classify_protobuf_scan_error)?;
+            if let Ok(text) = std::str::from_utf8(data) {
+                if let Ok(value) = serde_json::from_str::<Value>(text) {
+                    if let Some(content) = value.get("content").and_then(Value::as_array) {
+                        for item in content {
+                            if item.get("type").and_then(Value::as_str) != Some("tool-call")
+                                || item.get("toolCallId").and_then(Value::as_str)
+                                    != Some(tool_call_id)
+                            {
+                                continue;
+                            }
+                            let Some(tool_name) = item.get("toolName").and_then(Value::as_str)
+                            else {
+                                continue;
+                            };
+                            let Some(args) = item.get("args") else {
+                                continue;
+                            };
+                            protobuf_budget
+                                .record_json_candidate()
+                                .map_err(classify_protobuf_scan_error)?;
+                            merge_candidate(&mut found, tool_name.to_owned(), args.clone())?;
+                        }
                     }
-                } else {
-                    found = Some((normalized, args.clone(), tool_name.to_owned()));
                 }
+            }
+
+            let protobuf_candidates = find_mcp_tool_calls(data, tool_call_id, &mut protobuf_budget)
+                .map_err(classify_protobuf_scan_error)?;
+            for candidate in protobuf_candidates {
+                merge_candidate(&mut found, candidate.tool_name, candidate.args)?;
             }
         }
 
@@ -507,6 +855,29 @@ impl CursorStoreReader {
             .map(|(_, args, tool_name)| CursorStoredToolCall { tool_name, args })
             .ok_or(CursorStoreError::NoExactMatch)
     }
+}
+
+fn classify_protobuf_scan_error(err: ProtobufScanError) -> CursorStoreError {
+    match err {
+        ProtobufScanError::MalformedAnchoredRecord => CursorStoreError::ConflictingRecords,
+        ProtobufScanError::WorkLimitExceeded => CursorStoreError::StoreUnreadable,
+    }
+}
+
+fn merge_candidate(
+    found: &mut Option<(String, Value, String)>,
+    tool_name: String,
+    args: Value,
+) -> Result<(), CursorStoreError> {
+    let normalized = normalize_tool_name(&tool_name);
+    if let Some((existing_name, existing_args, _)) = found {
+        if existing_name != &normalized || existing_args != &args {
+            return Err(CursorStoreError::ConflictingRecords);
+        }
+    } else {
+        *found = Some((normalized, args, tool_name));
+    }
+    Ok(())
 }
 
 /// Classifies a `prepare`/`query`/row-step failure against the reader's

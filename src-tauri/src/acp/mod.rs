@@ -11,6 +11,7 @@ pub mod codex_model_catalog;
 pub mod connection;
 pub mod cursor_enrichment;
 pub mod cursor_store;
+mod cursor_store_proto;
 pub mod custom_registry;
 pub mod delegation;
 #[cfg(feature = "tauri-runtime")]
