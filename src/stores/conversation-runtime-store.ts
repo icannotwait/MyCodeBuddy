@@ -921,7 +921,7 @@ function retireCoveredLocalTurns(
   const lastLocalUserIdx = lastIndexOfRole(localTurns, "user")
   const lastPersistUserIdx = lastIndexOfRole(persisted, "user")
   const lastRoundCovered =
-    detail.in_flight_user_turn_id == null &&
+    detail?.in_flight_user_turn_id == null &&
     lastLocalUserIdx >= 0 &&
     lastPersistUserIdx >= 0 &&
     persisted
