@@ -482,6 +482,7 @@ mod tests {
                 status: "in_progress".into(),
                 content: None,
                 raw_input: (index == 0).then(|| format!(r#"{{"payload":"{}"}}"#, "i".repeat(MIB))),
+                raw_input_is_model_authored: None,
                 raw_output: (index == 0).then(|| "o".repeat(MIB)),
                 locations: None,
                 meta: None,
