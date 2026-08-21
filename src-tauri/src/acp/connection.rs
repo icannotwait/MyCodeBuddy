@@ -345,6 +345,10 @@ pub enum ConnectionCommand {
         /// `AcpEvent::TurnComplete` emitted for this prompt so the lifecycle
         /// CAS can decide whether to mint a generation token.
         mark_awaiting_reply: bool,
+        /// Broker-generated delegation kickoffs must reach the child before
+        /// pre-kickoff Codex telemetry can be treated as autonomous activity.
+        /// False for all ordinary foreground, background, and internal prompts.
+        bypass_autonomous_hold: bool,
         turn_generation: u64,
     },
     SetMode {
@@ -10180,6 +10184,7 @@ async fn run_conversation_loop<'a>(
                     if !should_hold_autonomous_prompt(
                         grok_adapter.as_ref(),
                         codex_adapter.as_ref(),
+                        false,
                     ) {
                         if let Some(cmd) = held_prompt.take() {
                             break ConversationInput::Command(cmd);
@@ -10227,6 +10232,7 @@ async fn run_conversation_loop<'a>(
                                 if !should_hold_autonomous_prompt(
                                     grok_adapter.as_ref(),
                                     codex_adapter.as_ref(),
+                                    false,
                                 ) {
                                     if let Some(cmd) = held_prompt.take() {
                                         break ConversationInput::Command(cmd);
@@ -10274,6 +10280,7 @@ async fn run_conversation_loop<'a>(
                             if !should_hold_autonomous_prompt(
                                 grok_adapter.as_ref(),
                                 codex_adapter.as_ref(),
+                                false,
                             ) {
                                 if let Some(cmd) = held_prompt.take() {
                                     break ConversationInput::Command(cmd);
@@ -10299,16 +10306,22 @@ async fn run_conversation_loop<'a>(
                 blocks,
                 user_message,
                 mark_awaiting_reply,
+                bypass_autonomous_hold,
                 turn_generation,
             }) => {
                 if cancelled_prompt_generations.remove(&turn_generation) {
                     continue;
                 }
-                if should_hold_autonomous_prompt(grok_adapter.as_ref(), codex_adapter.as_ref()) {
+                if should_hold_autonomous_prompt(
+                    grok_adapter.as_ref(),
+                    codex_adapter.as_ref(),
+                    bypass_autonomous_hold,
+                ) {
                     held_prompt = Some(ConnectionCommand::Prompt {
                         blocks,
                         user_message,
                         mark_awaiting_reply,
+                        bypass_autonomous_hold,
                         turn_generation,
                     });
                     continue;
@@ -13725,8 +13738,9 @@ async fn drain_ready_in_prompt_updates(
 fn should_hold_autonomous_prompt(
     grok: Option<&GrokAutonomousAdapter>,
     codex: Option<&CodexAutonomousAdapter>,
+    bypass_autonomous_hold: bool,
 ) -> bool {
-    should_hold_prompt(grok) || should_hold_codex_prompt(codex)
+    !bypass_autonomous_hold && (should_hold_prompt(grok) || should_hold_codex_prompt(codex))
 }
 
 fn grok_observe_raw(
@@ -14749,6 +14763,47 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::sync::Arc;
 
+    #[test]
+    fn delegation_prompt_bypasses_false_pre_kickoff_codex_hold() {
+        let sessions = tempfile::tempdir().expect("tempdir");
+        let mut adapter =
+            CodexAutonomousAdapter::new_for_test("delegation-child", sessions.path().to_path_buf());
+        adapter.on_session_ready("delegation-child");
+        adapter.on_raw_dispatch(
+            "session/update",
+            &serde_json::json!({
+                "update": {
+                    "sessionUpdate": "session_info_update",
+                    "_meta": {
+                        "goal": { "status": "active", "objective": "child task" }
+                    }
+                }
+            }),
+            GrokOwnership::Idle,
+        );
+        adapter.on_raw_dispatch(
+            "session/update",
+            &serde_json::json!({
+                "update": {
+                    "sessionUpdate": "session_info_update",
+                    "_meta": {
+                        "codex": { "threadStatus": { "type": "active" } }
+                    }
+                }
+            }),
+            GrokOwnership::Idle,
+        );
+
+        assert!(
+            should_hold_autonomous_prompt(None, Some(&adapter), false),
+            "ordinary prompts must still wait while Codex reports autonomous activity"
+        );
+        assert!(
+            !should_hold_autonomous_prompt(None, Some(&adapter), true),
+            "delegation kickoff must not be held before its first prompt reaches Codex"
+        );
+    }
+
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
     enum StubPermissionOutcome {
         Selected,
@@ -15590,6 +15645,7 @@ mod tests {
                 }],
                 user_message: None,
                 mark_awaiting_reply: false,
+                bypass_autonomous_hold: false,
                 turn_generation: 1,
             })
             .await
@@ -15700,6 +15756,7 @@ mod tests {
                 }],
                 user_message: None,
                 mark_awaiting_reply: false,
+                bypass_autonomous_hold: false,
                 turn_generation: 1,
             })
             .await
@@ -15795,6 +15852,7 @@ mod tests {
                 }],
                 user_message: None,
                 mark_awaiting_reply: false,
+                bypass_autonomous_hold: false,
                 turn_generation: 1,
             })
             .await
@@ -15902,6 +15960,7 @@ mod tests {
                 }],
                 user_message: None,
                 mark_awaiting_reply: false,
+                bypass_autonomous_hold: false,
                 turn_generation: 1,
             })
             .await
@@ -15982,6 +16041,7 @@ mod tests {
                 }],
                 user_message: None,
                 mark_awaiting_reply: false,
+                bypass_autonomous_hold: false,
                 turn_generation: 1,
             })
             .await
@@ -16246,6 +16306,7 @@ mod tests {
                 }],
                 user_message: None,
                 mark_awaiting_reply: false,
+                bypass_autonomous_hold: false,
                 turn_generation: 1,
             })
             .await
@@ -16343,6 +16404,7 @@ mod tests {
                 }],
                 user_message: None,
                 mark_awaiting_reply: false,
+                bypass_autonomous_hold: false,
                 turn_generation: 1,
             })
             .await
@@ -16481,6 +16543,7 @@ mod tests {
                 }],
                 user_message: None,
                 mark_awaiting_reply: false,
+                bypass_autonomous_hold: false,
                 turn_generation: 1,
             })
             .await
@@ -16630,6 +16693,7 @@ mod tests {
                 }],
                 user_message: None,
                 mark_awaiting_reply: false,
+                bypass_autonomous_hold: false,
                 turn_generation: 1,
             })
             .await

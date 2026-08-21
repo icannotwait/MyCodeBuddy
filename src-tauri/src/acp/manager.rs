@@ -4669,6 +4669,9 @@ impl ConnectionManager {
         conn_id: &str,
         blocks: Vec<PromptInputBlock>,
         user_message: Option<(String, Vec<crate::acp::UserMessageBlock>)>,
+        // True only for broker-generated delegation kickoffs. They must reach
+        // the child before pre-kickoff telemetry can hold the foreground prompt.
+        bypass_autonomous_hold: bool,
         // When true, scan the prompt for composer-emitted profile mentions and
         // register them as mandatory routes for this connection. Must be false
         // for broker-generated child/delegation tasks so nested task text
@@ -4780,6 +4783,7 @@ impl ConnectionManager {
             blocks,
             user_message,
             mark_awaiting_reply,
+            bypass_autonomous_hold,
             turn_generation,
         });
         Ok(())
@@ -4948,6 +4952,7 @@ impl ConnectionManager {
             blocks: vec![PromptInputBlock::Text { text: prompt_text }],
             user_message: None,
             mark_awaiting_reply: true,
+            bypass_autonomous_hold: false,
             turn_generation,
         });
         Ok(PromptAdmissionResult::Admitted)
@@ -5003,7 +5008,7 @@ impl ConnectionManager {
         // Non-linked UI sends: register mandatory routes + mark attention.
         // Capture runs only when the connection is already linked (and not
         // internal); unlinked paths bypass capture by design.
-        self.send_prompt_inner(Some(db), conn_id, blocks, None, true, true, capture)
+        self.send_prompt_inner(Some(db), conn_id, blocks, None, false, true, true, capture)
             .await
     }
 
@@ -5029,7 +5034,7 @@ impl ConnectionManager {
         }
         self.admit_external_prompt(&state_arc, None, PromptAdmissionSource::Background)
             .await?;
-        self.send_prompt_inner(None, conn_id, blocks, None, true, false, None)
+        self.send_prompt_inner(None, conn_id, blocks, None, false, true, false, None)
             .await
     }
 
@@ -5062,7 +5067,7 @@ impl ConnectionManager {
         let prompt_lock = self.clone_prompt_lock(conn_id).await?;
         let _guard = prompt_lock.lock_owned().await;
         // No db / capture: internal purposes always bypass title capture.
-        self.send_prompt_inner(None, conn_id, blocks, None, false, false, None)
+        self.send_prompt_inner(None, conn_id, blocks, None, false, false, false, None)
             .await
     }
 
@@ -5497,6 +5502,7 @@ impl ConnectionManager {
             } else {
                 None
             };
+        let bypass_autonomous_hold = delegation.is_some();
 
         // We hold `_prompt_guard` here, so call the lock-free inner helper —
         // re-entering `send_prompt` would try to acquire the same mutex and
@@ -5519,6 +5525,7 @@ impl ConnectionManager {
                 conn_id,
                 blocks,
                 user_message,
+                bypass_autonomous_hold,
                 delegation.is_none(),
                 mark_awaiting_reply,
                 capture,
@@ -16719,6 +16726,7 @@ mod tests {
                 blocks: one_text_block(),
                 user_message: None,
                 mark_awaiting_reply: false,
+                bypass_autonomous_hold: false,
                 turn_generation: 1,
             })
             .await
@@ -18408,6 +18416,7 @@ mod tests {
                 }],
                 user_message: None,
                 mark_awaiting_reply: false,
+                bypass_autonomous_hold: false,
                 turn_generation: 1,
             })
             .await
@@ -18422,6 +18431,7 @@ mod tests {
                 text: "blocked".into(),
             }],
             None,
+            false,
             true,
             true,
             None,
@@ -18575,11 +18585,26 @@ mod tests {
         .await
         .expect("delegation kickoff enqueues");
 
-        let prompts = drain_prompt_user_messages(&mut cmd_rx);
-        assert_eq!(prompts.len(), 1, "the kickoff prompt is enqueued");
+        let command = cmd_rx.try_recv().expect("the kickoff prompt is enqueued");
+        let ConnectionCommand::Prompt {
+            user_message,
+            bypass_autonomous_hold,
+            ..
+        } = command
+        else {
+            panic!("delegation kickoff must enqueue a Prompt command");
+        };
         assert!(
-            prompts[0].is_none(),
+            user_message.is_none(),
             "delegation child Prompt must carry NO user_message (kickoff is surfaced separately)"
+        );
+        assert!(
+            bypass_autonomous_hold,
+            "delegation kickoff must bypass a pre-kickoff autonomous hold"
+        );
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "delegation kickoff must enqueue exactly one command"
         );
         let pending = mgr
             .get_state(conn_id)
