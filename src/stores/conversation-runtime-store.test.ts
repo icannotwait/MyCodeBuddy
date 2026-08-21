@@ -996,3 +996,81 @@ describe("runtime store — production agentType + delegationActivities", () => 
     expect(local.some((t) => t.id === "live-42-cap-80")).toBe(true)
   })
 })
+
+describe("owner overlay retirement without live-* persist ids", () => {
+  // Production parsers persist UUID / cursor-turn-N / grok-turn-N ids.
+  // Promoted overlays always use live-${cid}-${msgId}. If retirement still
+  // requires an id match, a settled refetch keeps both copies and the last
+  // assistant renders twice for the rest of the tab.
+  it.each([false, true] as const)(
+    "settled refetch retires the live overlay when persist uses parser ids (preserveLive: %s)",
+    async (preserveLive) => {
+      const startedAt = Date.parse("2026-08-20T12:00:00.000Z")
+      const persistTs = new Date(startedAt).toISOString()
+      const { actions } = useConversationRuntimeStore.getState()
+
+      seedRuntimeSession({
+        detail: detailWithTurns([
+          userTurn("u-old", "old prompt", "2026-08-20T11:00:00.000Z"),
+          assistantTurn("a-old", "old reply", "2026-08-20T11:00:01.000Z"),
+        ]),
+        liveOwnsActiveTurn: false,
+        syncState: "idle",
+      })
+
+      const covered = liveMessage("latest", "latest reply", startedAt)
+      actions.setLiveMessage(CID, covered, true)
+      actions.completeTurn(CID, covered)
+
+      const pending = liveMessage(
+        "pending",
+        "not on disk yet",
+        startedAt + 60_000
+      )
+      actions.setLiveMessage(CID, pending, true)
+      actions.completeTurn(CID, pending)
+
+      const overlayId = `live-${CID}-latest`
+      expect(
+        useConversationRuntimeStore
+          .getState()
+          .byConversationId.get(CID)
+          ?.localTurns.some((t) => t.id === overlayId)
+      ).toBe(true)
+
+      mockGetFolderConversation.mockResolvedValueOnce(
+        detailWithTurns([
+          userTurn("u-old", "old prompt", "2026-08-20T11:00:00.000Z"),
+          assistantTurn("a-old", "old reply", "2026-08-20T11:00:01.000Z"),
+          userTurn("550e8400-e29b-41d4-a716-446655440000", "prompt", persistTs),
+          assistantTurn("cursor-turn-0", "latest reply", persistTs),
+        ])
+      )
+      actions.refetchDetail(CID, { preserveLive })
+      await Promise.resolve()
+      await Promise.resolve()
+
+      const session = useConversationRuntimeStore
+        .getState()
+        .byConversationId.get(CID)!
+      expect(session.localTurns.some((t) => t.id === overlayId)).toBe(false)
+      expect(
+        session.localTurns.some((t) => t.id === `live-${CID}-pending`)
+      ).toBe(true)
+
+      const latestCopies = selectHistoricalTimelineTurns(
+        useConversationRuntimeStore.getState(),
+        CID
+      ).filter((entry) => {
+        const block = entry.turn.blocks[0]
+        return (
+          entry.turn.role === "assistant" &&
+          block?.type === "text" &&
+          block.text === "latest reply"
+        )
+      })
+      expect(latestCopies).toHaveLength(1)
+      expect(latestCopies[0]?.turn.id).toBe("cursor-turn-0")
+    }
+  )
+})

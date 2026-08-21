@@ -853,18 +853,39 @@ function retireCoveredBackgroundTurns(
 }
 
 /**
- * Drop localTurns whose ids are already in persisted `detail.turns`.
- * Unpersisted remainder is the only copy in an owner tab that does not
- * refetch, so it is never truncated by count.
+ * Persist proof for an overlay turn. Parsers never write `live-*` ids
+ * (those are client-only promote keys), so id match alone never retires
+ * a production overlay. Role + timestamp is the same-turn identity the
+ * persist snapshot can prove; empty timestamps are not a proof.
+ */
+function persistIdentityKey(turn: MessageTurn): string | null {
+  if (!turn.timestamp) return null
+  return `${turn.role}\0${turn.timestamp}`
+}
+
+/**
+ * Drop localTurns already proven persisted in `detail.turns` by id or
+ * by role+timestamp. Unpersisted remainder is the only copy in an owner
+ * tab that does not refetch, so it is never truncated by count.
  */
 function retireCoveredLocalTurns(
   localTurns: MessageTurn[],
   detail: DbConversationDetail | null
 ): MessageTurn[] {
   if (localTurns.length === 0) return localTurns
-  const persistedIds = new Set(detail?.turns.map((t) => t.id) ?? [])
-  if (persistedIds.size === 0) return localTurns
-  const retained = localTurns.filter((t) => !persistedIds.has(t.id))
+  const persisted = detail?.turns ?? []
+  if (persisted.length === 0) return localTurns
+  const persistedIds = new Set(persisted.map((t) => t.id))
+  const persistedIdentity = new Set<string>()
+  for (const turn of persisted) {
+    const key = persistIdentityKey(turn)
+    if (key) persistedIdentity.add(key)
+  }
+  const retained = localTurns.filter((t) => {
+    if (persistedIds.has(t.id)) return false
+    const key = persistIdentityKey(t)
+    return !(key && persistedIdentity.has(key))
+  })
   return retained.length === localTurns.length ? localTurns : retained
 }
 
@@ -2066,21 +2087,22 @@ function reducer(
 
       // DB data is authoritative for completed turns. Normally clear all the
       // in-flight buffers (localTurns/optimisticTurns/liveMessage). Preserve
-      // them when the user actively sent a message and is awaiting the agent
-      // response (awaiting_persist), OR the caller asked to keep the live state
-      // via `preserveLive` (the sub-agent dialog, folding the persisted user
-      // kickoff in while the child still streams/just-finished its reply — the
-      // bridged/promoted reply must outlive the fetch so a late partial can't
-      // momentarily replace it).
+      // liveMessage / optimisticTurns when the user actively sent a message
+      // and is awaiting the agent response (awaiting_persist), OR the caller
+      // asked to keep the live state via `preserveLive` (the sub-agent dialog,
+      // folding the persisted user kickoff in while the child still
+      // streams/just-finished its reply — the bridged/promoted reply must
+      // outlive the fetch so a late partial can't momentarily replace it).
       //
       // A detail that carries `in_flight_user_turn_id` is itself a MID-TURN
       // snapshot (the backend only stamps it while a turn is running). Such a
-      // response must not clobber a more-complete live/promoted reply: a stale one
-      // landing just after `completeTurn` promoted the reply would otherwise clear
-      // `localTurns`, and the next live turn's in-flight suppression (keyed off the
-      // stale id) could then hide that completed reply. So treat it like
-      // `preserveLive` and keep every live buffer; a settled (non-in-flight) load
-      // replaces them authoritatively.
+      // response must not clobber a more-complete live/promoted reply: a stale
+      // one landing just after `completeTurn` promoted the reply would
+      // otherwise clear `localTurns`, and the next live turn's in-flight
+      // suppression (keyed off the stale id) could then hide that completed
+      // reply. So skip overlay retirement while in-flight; a settled
+      // (non-in-flight) load still retires overlays the persist snapshot
+      // proves — even when `preserveLive` keeps liveMessage.
       const detailIsInFlight = detail.in_flight_user_turn_id != null
       const isActivelyInteracting =
         current.syncState === "awaiting_persist" ||
@@ -2101,6 +2123,13 @@ function reducer(
         detail.transcript_watermark ?? null,
         detail.uncovered_prefix_max_ts ?? null
       )
+      // Mid-turn snapshots can carry a partial persist of the same reply.
+      // Do not retire the more-complete overlay against that partial.
+      // Settled refetches — including idle `preserveLive` detail_refetch —
+      // still drop overlays proven persisted (id or role+timestamp).
+      const nextLocalTurns = detailIsInFlight
+        ? current.localTurns
+        : retireCoveredLocalTurns(current.localTurns, detail)
 
       const nextSessionBase: ConversationRuntimeSession = {
         ...current,
@@ -2113,13 +2142,9 @@ function reducer(
         sessionStats: detail.session_stats ?? current.sessionStats,
         backgroundTurns: nextBackgroundTurns,
         ...(isActivelyInteracting
-          ? keepAllLiveBuffers
-            ? {}
-            : {
-                localTurns: retireCoveredLocalTurns(current.localTurns, detail),
-              }
+          ? { localTurns: nextLocalTurns }
           : {
-              localTurns: retireCoveredLocalTurns(current.localTurns, detail),
+              localTurns: nextLocalTurns,
               optimisticTurns: [],
               liveMessage: null,
             }),
