@@ -4871,8 +4871,10 @@ async fn emit_post_ready_unavailable(
 
 /// After ACP session/new|load|resume succeeds: wait for Codeg ready lease when
 /// required, emit Connected, signal bootstrap Ready, and monitor post-ready
-/// availability (false → one `DelegationAvailabilityChanged` only + one
-/// `delegation_unavailable` audit). Never mutates immutable route fields.
+/// availability. Ready success also emits `DelegationAvailabilityChanged
+/// { available: true }` so web clients that attached during bootstrap unstick
+/// the banner. Post-ready false emits one `DelegationAvailabilityChanged` + one
+/// `delegation_unavailable` audit. Never mutates immutable route fields.
 async fn finish_route_ready(
     state: &Arc<RwLock<SessionState>>,
     emitter: &EventEmitter,
@@ -4913,6 +4915,12 @@ async fn finish_route_ready(
             let mut s = state.write().await;
             s.set_delegation_available(true);
         }
+        emit_with_state(
+            state,
+            emitter,
+            AcpEvent::DelegationAvailabilityChanged { available: true },
+        )
+        .await;
         // Post-ready close: flip availability only; one event; no route change.
         // Check current value first so a close that races before the monitor
         // starts still emits exactly once (watch::changed misses past values).
@@ -24543,6 +24551,65 @@ mod tests {
 
         let after = state.read().await.delegation_route.clone();
         assert!(!after.delegation_available, "availability must flip false");
+        assert_eq!(
+            after.effective, route_before.effective,
+            "immutable route fields must not change"
+        );
+        assert_eq!(after.requested, route_before.requested);
+        assert_eq!(after.source, route_before.source);
+        assert_eq!(after.managed, route_before.managed);
+        assert_eq!(after.degraded_reason, route_before.degraded_reason);
+    }
+
+    /// Ready success must emit `available: true` so web clients that attached
+    /// during bootstrap (snapshot still false) unstick the banner. Route fields
+    /// stay immutable. Mirrors the emit used by `finish_route_ready`.
+    #[tokio::test]
+    async fn finish_route_ready_success_emits_availability_true_no_route_mutation() {
+        use crate::acp::delegation::route::{
+            DelegationRoutePlan, DelegationRoutePolicy, DelegationRouteSource,
+            NativeSuppressionPlan, ROUTE_ADAPTER_CONTRACT_VERSION,
+        };
+        use crate::acp::session_state::SessionState;
+        use crate::web::event_bridge::{emit_with_state, EventEmitter};
+
+        let plan = DelegationRoutePlan {
+            managed: true,
+            requested: DelegationRoutePolicy::Codeg,
+            effective: DelegationRoutePolicy::Codeg,
+            source: DelegationRouteSource::GlobalDefault,
+            native_suppression: NativeSuppressionPlan::CodexMultiAgentFalse,
+            expose_codeg_delegation: true,
+            degraded_reason: None,
+            adapter_contract_version: ROUTE_ADAPTER_CONTRACT_VERSION.to_string(),
+            fingerprint: "test-ready-avail-true".into(),
+        };
+        let state = Arc::new(tokio::sync::RwLock::new(SessionState::new(
+            "conn-avail-true".into(),
+            AgentType::Codex,
+            None,
+            "win".into(),
+            None,
+        )));
+        {
+            let mut s = state.write().await;
+            s.set_route_plan_snapshot(&plan);
+            // Bootstrap snapshot: attached before ready, availability still false.
+            s.set_delegation_available(false);
+        }
+        let route_before = state.read().await.delegation_route.clone();
+        assert!(!route_before.delegation_available);
+        assert_eq!(route_before.effective, DelegationRoutePolicy::Codeg);
+
+        emit_with_state(
+            &state,
+            &EventEmitter::Noop,
+            AcpEvent::DelegationAvailabilityChanged { available: true },
+        )
+        .await;
+
+        let after = state.read().await.delegation_route.clone();
+        assert!(after.delegation_available, "availability must flip true");
         assert_eq!(
             after.effective, route_before.effective,
             "immutable route fields must not change"
