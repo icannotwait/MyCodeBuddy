@@ -394,6 +394,7 @@ pub(crate) fn grok_autonomous_turn_from_segment(
         Some(PendingGrokAutonomous {
             trigger_start,
             task_ids: task_ids.to_vec(),
+            candidate_task_ids: Vec::new(),
         }),
     )
     .turns
@@ -515,6 +516,7 @@ struct ParsedUpdates {
 struct PendingGrokAutonomous {
     trigger_start: u64,
     task_ids: Vec<String>,
+    candidate_task_ids: Vec<String>,
 }
 
 /// Canonical id for a Grok idle-boundary autonomous assistant turn.
@@ -609,31 +611,70 @@ pub(crate) fn grok_record_payload(record: &[u8]) -> &[u8] {
 }
 
 pub(crate) fn is_grok_background_task_reminder(text: &str) -> bool {
-    text.contains("<system-reminder>") && text.contains("Background task")
+    !grok_reminder_task_ids(text).is_empty()
 }
 
-/// Quoted names after `Background task` in the verified reminder shape.
+/// Task IDs from the verified Grok Bash and Monitor completion templates.
 /// Does not scan arbitrary English continuation text.
 pub(crate) fn grok_reminder_task_ids(text: &str) -> Vec<String> {
+    let Some(body) = text
+        .trim()
+        .strip_prefix("<system-reminder>")
+        .and_then(|text| text.strip_suffix("</system-reminder>"))
+    else {
+        return Vec::new();
+    };
     let mut ids = Vec::new();
-    let mut rest = text;
-    const PREFIX: &str = "Background task \"";
-    while let Some(i) = rest.find(PREFIX) {
-        let after = &rest[i + PREFIX.len()..];
-        match after.find('"') {
-            Some(end) => {
-                let id = &after[..end];
-                if !id.is_empty() {
-                    ids.push(id.to_string());
-                }
-                rest = &after[end + 1..];
-            }
-            None => break,
+    for line in body.lines().map(str::trim) {
+        let shape = if line.starts_with("Background task \"") {
+            Some(("Background task \"", " completed (", ")."))
+        } else if line.starts_with("Monitor \"") {
+            Some(("Monitor \"", " ended: [monitor ended: ", "]."))
+        } else {
+            None
+        };
+        let Some((prefix, middle, suffix)) = shape else {
+            continue;
+        };
+        let after_prefix = &line[prefix.len()..];
+        let Some(quote) = after_prefix.find('"') else {
+            continue;
+        };
+        let id = &after_prefix[..quote];
+        let rest = &after_prefix[quote + 1..];
+        if !id.is_empty() && rest.starts_with(middle) && rest.ends_with(suffix) {
+            ids.push(id.to_string());
         }
     }
     ids.sort();
     ids.dedup();
     ids
+}
+
+fn structured_wake_task_id(update: &Value) -> Option<String> {
+    if update.get("sessionUpdate").and_then(Value::as_str) != Some("task_completed")
+        || update.get("will_wake").and_then(Value::as_bool) != Some(true)
+    {
+        return None;
+    }
+    update
+        .get("task_id")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            update
+                .pointer("/task_snapshot/task_id")
+                .and_then(Value::as_str)
+        })
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+}
+
+fn task_completed_prompt_task_id(update: &Value) -> Option<&str> {
+    update
+        .get("prompt_id")
+        .and_then(Value::as_str)
+        .and_then(|prompt_id| prompt_id.strip_prefix("task-completed-"))
+        .filter(|task_id| !task_id.is_empty())
 }
 
 fn parse_updates(path: &Path, session_id: &str) -> ParsedUpdates {
@@ -668,6 +709,8 @@ fn parse_updates_from_bytes_with_context(
     // instead of each opening a new (often empty) one.
     let mut open_user_prompt_index: Option<i64> = None;
     let mut pending_autonomous = initial_pending;
+    let mut active_autonomous: Option<PendingGrokAutonomous> = None;
+    let mut expected_wakes = std::collections::VecDeque::<String>::new();
     let mut consumed_complete_bytes = 0u64;
 
     for (relative_start, record) in grok_complete_records(bytes) {
@@ -703,6 +746,10 @@ fn parse_updates_from_bytes_with_context(
             .get("sessionUpdate")
             .and_then(Value::as_str)
             .unwrap_or("");
+        if let Some(task_id) = structured_wake_task_id(update) {
+            expected_wakes.retain(|id| id != &task_id);
+            expected_wakes.push_back(task_id);
+        }
 
         // Grok injects its own reminders (a background task finishing, …) as
         // `user_message_chunk`s and marks them `_meta.hideFromScrollback` — its
@@ -732,13 +779,39 @@ fn parse_updates_from_bytes_with_context(
                 );
                 if !last_is_user {
                     let text = update_text(update);
-                    if is_grok_background_task_reminder(&text) {
+                    let legacy_task_ids = grok_reminder_task_ids(&text);
+                    let matching_structured: Vec<String> = legacy_task_ids
+                        .iter()
+                        .filter(|id| expected_wakes.iter().any(|pending| pending == *id))
+                        .cloned()
+                        .collect();
+                    let is_legacy_reminder = !legacy_task_ids.is_empty();
+                    let (task_ids, candidate_task_ids) = if !matching_structured.is_empty() {
+                        (matching_structured, Vec::new())
+                    } else if is_legacy_reminder {
+                        (legacy_task_ids, Vec::new())
+                    } else if expected_wakes.len() == 1 {
+                        (expected_wakes.pop_front().into_iter().collect(), Vec::new())
+                    } else if !expected_wakes.is_empty() {
+                        (Vec::new(), expected_wakes.iter().cloned().collect())
+                    } else {
+                        (Vec::new(), Vec::new())
+                    };
+                    if !task_ids.is_empty() || !candidate_task_ids.is_empty() {
+                        if candidate_task_ids.is_empty() {
+                            expected_wakes.retain(|id| !task_ids.contains(id));
+                        }
                         pending_autonomous = Some(PendingGrokAutonomous {
                             trigger_start: start_offset,
-                            task_ids: grok_reminder_task_ids(&text),
+                            task_ids,
+                            candidate_task_ids,
                         });
                     }
+                } else {
+                    expected_wakes.clear();
                 }
+            } else if assistant.is_some() {
+                expected_wakes.clear();
             }
             continue;
         }
@@ -770,9 +843,11 @@ fn parse_updates_from_bytes_with_context(
                 turn_meta.apply(prev);
             }
             flush_assistant(&mut assistant, &mut out.turns, &mut tool_result_idx);
+            active_autonomous = None;
             turn_meta = GrokTurnMeta::default();
             // A visible user prompt is not an autonomous follow-up.
             pending_autonomous = None;
+            expected_wakes.clear();
         }
         turn_meta.observe(params_meta, update_meta);
 
@@ -830,7 +905,13 @@ fn parse_updates_from_bytes_with_context(
                 out.content_events += 1;
                 let text = update_text(update);
                 append_text(
-                    ensure_assistant(&mut assistant, now, session_id, &mut pending_autonomous),
+                    ensure_assistant(
+                        &mut assistant,
+                        now,
+                        session_id,
+                        &mut pending_autonomous,
+                        &mut active_autonomous,
+                    ),
                     text,
                 );
             }
@@ -838,7 +919,13 @@ fn parse_updates_from_bytes_with_context(
                 out.content_events += 1;
                 let text = update_text(update);
                 append_thinking(
-                    ensure_assistant(&mut assistant, now, session_id, &mut pending_autonomous),
+                    ensure_assistant(
+                        &mut assistant,
+                        now,
+                        session_id,
+                        &mut pending_autonomous,
+                        &mut active_autonomous,
+                    ),
                     text,
                 );
             }
@@ -868,8 +955,13 @@ fn parse_updates_from_bytes_with_context(
                     Some((_, input)) => grok_mcp_input_preview(input),
                     None => tool_input_preview(raw_input),
                 };
-                let turn =
-                    ensure_assistant(&mut assistant, now, session_id, &mut pending_autonomous);
+                let turn = ensure_assistant(
+                    &mut assistant,
+                    now,
+                    session_id,
+                    &mut pending_autonomous,
+                    &mut active_autonomous,
+                );
                 turn.blocks.push(ContentBlock::ToolUse {
                     tool_use_id: Some(id.clone()),
                     tool_name,
@@ -897,10 +989,31 @@ fn parse_updates_from_bytes_with_context(
             }
             "turn_completed" => {
                 if let Some(mut turn) = assistant.take() {
+                    if let Some(active) = active_autonomous.take() {
+                        if !active.candidate_task_ids.is_empty() {
+                            if let Some(task_id) =
+                                task_completed_prompt_task_id(update).filter(|task_id| {
+                                    active
+                                        .candidate_task_ids
+                                        .iter()
+                                        .any(|candidate| candidate == task_id)
+                                })
+                            {
+                                let resolved = vec![task_id.to_string()];
+                                turn.id = grok_autonomous_turn_id(
+                                    session_id,
+                                    &resolved,
+                                    active.trigger_start,
+                                );
+                                expected_wakes.retain(|id| id != task_id);
+                            }
+                        }
+                    }
                     turn_meta.apply(&mut turn);
                     turn.completed_at = Some(now);
                     out.turns.push(turn);
                 }
+                active_autonomous = None;
                 turn_meta = GrokTurnMeta::default();
                 tool_result_idx.clear();
             }
@@ -932,8 +1045,13 @@ fn parse_updates_from_bytes_with_context(
                     .and_then(Value::as_str)
                     .map(str::to_string)
                     .unwrap_or_else(|| format!("grok-compaction-{}", out.content_events));
-                let turn =
-                    ensure_assistant(&mut assistant, now, session_id, &mut pending_autonomous);
+                let turn = ensure_assistant(
+                    &mut assistant,
+                    now,
+                    session_id,
+                    &mut pending_autonomous,
+                    &mut active_autonomous,
+                );
                 turn.blocks.push(ContentBlock::ToolUse {
                     tool_use_id: Some(id.clone()),
                     tool_name: "context_compaction".to_string(),
@@ -956,8 +1074,9 @@ fn parse_updates_from_bytes_with_context(
             //
             // In particular `task_completed`'s snapshot is deliberately NOT
             // applied to the launching tool call: Grok reports that CALL as
-            // `completed` on the wire (it did start the task), the live path
-            // never receives this ext notification at all, and the task's real
+            // `completed` on the wire (it did start the task). The live
+            // autonomous adapter consumes this extension for lifecycle evidence
+            // but likewise does not render its snapshot; the task's real
             // outcome — command, exit code, output — renders from the
             // `get_command_or_subagent_output` polls (see
             // `grok_task_output_envelope`). Writing the snapshot here would make
@@ -1479,13 +1598,15 @@ fn ensure_assistant<'a>(
     ts: DateTime<Utc>,
     session_id: &str,
     pending: &mut Option<PendingGrokAutonomous>,
+    active_autonomous: &mut Option<PendingGrokAutonomous>,
 ) -> &'a mut MessageTurn {
     if assistant.is_none() {
         let (id, origin) = match pending.take() {
-            Some(p) => (
-                grok_autonomous_turn_id(session_id, &p.task_ids, p.trigger_start),
-                Some(AutonomousTurnOrigin::BackgroundTask),
-            ),
+            Some(p) => {
+                let id = grok_autonomous_turn_id(session_id, &p.task_ids, p.trigger_start);
+                *active_autonomous = Some(p);
+                (id, Some(AutonomousTurnOrigin::BackgroundTask))
+            }
             None => (String::new(), None),
         };
         *assistant = Some(MessageTurn {
@@ -1600,6 +1721,33 @@ mod tests {
         write(&session, "summary.json", summary);
         write(&session, "updates.jsonl", updates);
         (tmp, sessions)
+    }
+
+    #[test]
+    fn legacy_completion_reminders_only_accept_verified_bash_and_monitor_shapes() {
+        let bash = concat!(
+            "<system-reminder>\n",
+            "Background task \"term_x\" completed (exit code: 0).\n",
+            "Command: pnpm build | Duration: 1.0s\n",
+            "</system-reminder>",
+        );
+        let monitor = concat!(
+            "<system-reminder>\n",
+            "Monitor \"monitor-1\" ended: [monitor ended: exited (code 0)].\n",
+            "Description: build\n",
+            "</system-reminder>",
+        );
+
+        assert_eq!(grok_reminder_task_ids(bash), vec!["term_x"]);
+        assert_eq!(grok_reminder_task_ids(monitor), vec!["monitor-1"]);
+        assert!(is_grok_background_task_reminder(bash));
+        assert!(is_grok_background_task_reminder(monitor));
+        assert!(!is_grok_background_task_reminder(
+            "<system-reminder>Background task text changed</system-reminder>"
+        ));
+        assert!(!is_grok_background_task_reminder(
+            "Background task \"term_x\" completed (exit code: 0)."
+        ));
     }
 
     const SUMMARY: &str = r#"{
