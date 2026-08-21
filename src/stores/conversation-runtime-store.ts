@@ -1142,7 +1142,14 @@ function persistTurnGenerationFromSession(
   session: ConversationRuntimeSession | undefined
 ): void {
   const snap = getPublishedRequestUsage(conversationId)
-  if (snap.sampleCount <= 0 || snap.generationMs <= 0) return
+  if (
+    snap.sampleCount <= 0 ||
+    snap.outputTokens <= 0 ||
+    snap.generationMs <= 0 ||
+    snap.estimatedSampleCount > 0
+  ) {
+    return
+  }
   const dbId = session?.dbConversationId ?? conversationId
   if (dbId <= 0) return
   const loadedUser = countUserTurns(session?.detail?.turns)
