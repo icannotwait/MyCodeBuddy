@@ -100,6 +100,135 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn attaching_after_session_id_is_bound_does_not_conflict() {
+        let broker = SharedSessionBroker::default();
+        let first = broker
+            .reserve_or_attach(request(
+                SharedSessionKey::Conversation(9),
+                "conn-a",
+                "client-a",
+                "req-a",
+            ))
+            .await
+            .unwrap();
+        assert!(first.created);
+
+        let mut resume = request(
+            SharedSessionKey::Conversation(9),
+            "conn-b",
+            "client-b",
+            "req-b",
+        );
+        resume.launch_identity.external_session_id = Some("grok-session-xyz".into());
+        let second = broker.reserve_or_attach(resume).await.unwrap();
+
+        assert!(!second.created);
+        assert_eq!(
+            second.attachment.connection_id,
+            first.attachment.connection_id
+        );
+        assert_eq!(
+            broker
+                .launch_identity_for_connection(&first.attachment.connection_id)
+                .await
+                .unwrap()
+                .external_session_id
+                .as_deref(),
+            Some("grok-session-xyz")
+        );
+
+        let mut other = request(
+            SharedSessionKey::Conversation(9),
+            "conn-c",
+            "client-c",
+            "req-c",
+        );
+        other.launch_identity.external_session_id = Some("other-session".into());
+        assert!(matches!(
+            broker.reserve_or_attach(other).await,
+            Err(SharedSessionError::ConfigConflict {
+                conflict_kind: SharedConfigConflictKind::ExternalSession,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn attaching_without_session_id_joins_a_bound_session() {
+        let broker = SharedSessionBroker::default();
+        let mut first_request = request(
+            SharedSessionKey::Conversation(10),
+            "conn-a",
+            "client-a",
+            "req-a",
+        );
+        first_request.launch_identity.external_session_id = Some("grok-session-xyz".into());
+        let first = broker.reserve_or_attach(first_request).await.unwrap();
+
+        let second = broker
+            .reserve_or_attach(request(
+                SharedSessionKey::Conversation(10),
+                "conn-b",
+                "client-b",
+                "req-b",
+            ))
+            .await
+            .unwrap();
+
+        assert!(!second.created);
+        assert_eq!(
+            second.attachment.connection_id,
+            first.attachment.connection_id
+        );
+        assert_eq!(
+            broker
+                .launch_identity_for_connection(&first.attachment.connection_id)
+                .await
+                .unwrap()
+                .external_session_id
+                .as_deref(),
+            Some("grok-session-xyz")
+        );
+    }
+
+    #[tokio::test]
+    async fn attaching_a_different_session_id_still_conflicts() {
+        let broker = SharedSessionBroker::default();
+        let mut first_request = request(
+            SharedSessionKey::Conversation(11),
+            "conn-a",
+            "client-a",
+            "req-a",
+        );
+        first_request.launch_identity.external_session_id = Some("session-a".into());
+        let first = broker.reserve_or_attach(first_request).await.unwrap();
+
+        let mut conflicting = request(
+            SharedSessionKey::Conversation(11),
+            "conn-b",
+            "client-b",
+            "req-b",
+        );
+        conflicting.launch_identity.external_session_id = Some("session-b".into());
+        assert!(matches!(
+            broker.reserve_or_attach(conflicting).await,
+            Err(SharedSessionError::ConfigConflict {
+                conflict_kind: SharedConfigConflictKind::ExternalSession,
+                ..
+            })
+        ));
+        assert_eq!(
+            broker
+                .launch_identity_for_connection(&first.attachment.connection_id)
+                .await
+                .unwrap()
+                .external_session_id
+                .as_deref(),
+            Some("session-a")
+        );
+    }
+
+    #[tokio::test]
     async fn failed_retry_requires_cleanup_and_increments_generation() {
         let broker = SharedSessionBroker::default();
         let first = broker

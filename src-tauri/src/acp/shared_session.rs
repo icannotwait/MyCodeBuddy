@@ -4344,7 +4344,7 @@ impl SharedSessionRecord {
     }
 
     fn check_attach_identity(
-        &self,
+        &mut self,
         requested: &SharedLaunchIdentity,
     ) -> Result<(), SharedSessionError> {
         let conflict_kind = if self.launch_identity.agent_type != requested.agent_type {
@@ -4352,7 +4352,10 @@ impl SharedSessionRecord {
         } else if self.launch_identity.working_dir_fingerprint != requested.working_dir_fingerprint
         {
             Some(SharedConfigConflictKind::WorkingDirectory)
-        } else if self.launch_identity.external_session_id != requested.external_session_id {
+        } else if Self::external_session_ids_conflict(
+            &self.launch_identity.external_session_id,
+            &requested.external_session_id,
+        ) {
             Some(SharedConfigConflictKind::ExternalSession)
         } else if self.launch_identity.attach_mode != requested.attach_mode {
             Some(SharedConfigConflictKind::AttachMode)
@@ -4374,7 +4377,21 @@ impl SharedSessionRecord {
                 conflict_kind,
             });
         }
+        // Conversation roots freeze launch identity at reserve, before
+        // SessionStarted persists the agent session id. Later attachers learn
+        // that id from the conversation row and must join the live process
+        // instead of 409. Promote None → Some so a later different id conflicts.
+        if self.launch_identity.external_session_id.is_none() {
+            self.launch_identity.external_session_id = requested.external_session_id.clone();
+        }
         Ok(())
+    }
+
+    fn external_session_ids_conflict(stored: &Option<String>, requested: &Option<String>) -> bool {
+        match (stored.as_deref(), requested.as_deref()) {
+            (Some(stored), Some(requested)) => stored != requested,
+            _ => false,
+        }
     }
 
     fn retry_decision(
