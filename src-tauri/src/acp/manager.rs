@@ -5228,37 +5228,36 @@ impl ConnectionManager {
                 }
             }
 
-            // UI new-conversation path: SessionStarted applied state.external_id
-            // back during acp_connect, but conversation_id was None then so the
-            // lifecycle subscriber's SessionStarted handler skipped the DB write.
-            // Now that we just linked the row in the same prompt_lock critical
-            // section, snapshot external_id and persist it synchronously — no
-            // dependence on broadcaster eventual consistency. The chat_channel
-            // reverse-order path (link before SessionStarted) is unaffected and
-            // continues to be handled by the lifecycle subscriber.
-            let (cid_opt, eid_opt) = {
-                let s = state_arc.read().await;
-                (s.conversation_id, s.external_id.clone())
-            };
-            if let (Some(cid), Some(eid)) = (cid_opt, eid_opt) {
-                conversation_service::update_external_id(&db.conn, cid, eid)
-                    .await
-                    .map_err(|e| AcpError::protocol(e.to_string()))?;
-                // SessionStarted arrived BEFORE this link, so the lifecycle
-                // subscriber skipped its broadcast (no conversation_id then).
-                // Now that external_id is persisted, converge every client's
-                // sidebar with the complete summary — this also corrects a
-                // Branch B upsert above that necessarily carried
-                // `external_id: null`. Root-only via the helper.
-                crate::commands::conversations::emit_conversation_upsert(&emitter, &db.conn, cid)
-                    .await;
-            } else if cid_opt.is_some() {
-                tracing::info!(
-                    "[manager] send_prompt_linked: conversation linked but \
-                     external_id not yet on state (conn={conn_id}); lifecycle \
-                     subscriber will catch up when SessionStarted arrives"
-                );
-            }
+        }
+
+        // Persist external_id whenever both conversation_id and session id
+        // are known. Shared-session new tabs bind the conversation key
+        // before the first send_prompt_linked, so already_linked is true
+        // and the first-link branch is skipped. Previously this write lived
+        // only inside !already_linked, leaving conversation.external_id NULL
+        // even though the agent already has a session UUID.
+        let (cid_opt, eid_opt) = {
+            let s = state_arc.read().await;
+            (s.conversation_id, s.external_id.clone())
+        };
+        if let (Some(cid), Some(eid)) = (cid_opt, eid_opt) {
+            conversation_service::update_external_id(&db.conn, cid, eid)
+                .await
+                .map_err(|e| AcpError::protocol(e.to_string()))?;
+            // SessionStarted arrived BEFORE this link, so the lifecycle
+            // subscriber skipped its broadcast (no conversation_id then).
+            // Now that external_id is persisted, converge every client's
+            // sidebar with the complete summary — this also corrects a
+            // Branch B upsert above that necessarily carried
+            // `external_id: null`. Root-only via the helper.
+            crate::commands::conversations::emit_conversation_upsert(&emitter, &db.conn, cid)
+                .await;
+        } else if cid_opt.is_some() {
+            tracing::info!(
+                "[manager] send_prompt_linked: conversation linked but \
+                 external_id not yet on state (conn={conn_id}); lifecycle \
+                 subscriber will catch up when SessionStarted arrives"
+            );
         }
 
         // Centralized status transition: every prompt send flips the
