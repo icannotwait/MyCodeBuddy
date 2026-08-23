@@ -214,6 +214,73 @@ describe("GrokSessionImage bounded live lifecycle", () => {
     vi.restoreAllMocks()
   })
 
+  it.each([
+    ["invalid", "images/a/b.png"],
+    ["absent", undefined],
+  ])("keeps %s src inactive across complete to live", async (_, src) => {
+    const unexpected = deferred<GrokSessionImageResolution>()
+    mocks.resolve.mockReturnValue(unexpected.promise)
+    const view = render(
+      <GrokConversationProvider conversationId={42}>
+        <GrokSessionImageScope phase="complete">
+          <GrokSessionImage src={src} alt="inactive" />
+        </GrokSessionImageScope>
+      </GrokConversationProvider>
+    )
+    expect(screen.getByText("inactive")).toHaveClass("text-muted-foreground")
+    expect(mocks.resolve).not.toHaveBeenCalled()
+    expect(vi.getTimerCount()).toBe(0)
+
+    view.rerender(
+      <GrokConversationProvider conversationId={42}>
+        <GrokSessionImageScope phase="live">
+          <GrokSessionImage src={src} alt="inactive" />
+        </GrokSessionImageScope>
+      </GrokConversationProvider>
+    )
+    await flushEffects()
+
+    expect(screen.getByText("inactive")).toHaveClass("text-muted-foreground")
+    expect(screen.getByText("inactive")).not.toHaveAttribute("aria-busy")
+    expect(mocks.resolve).not.toHaveBeenCalled()
+    expect(vi.getTimerCount()).toBe(0)
+    await act(async () => vi.advanceTimersByTimeAsync(10_000))
+    expect(mocks.resolve).not.toHaveBeenCalled()
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it("keeps an invalid src inactive when a live scope gains its durable id", async () => {
+    const unexpected = deferred<GrokSessionImageResolution>()
+    mocks.resolve.mockReturnValue(unexpected.promise)
+    const view = render(
+      <GrokConversationProvider conversationId={null}>
+        <GrokSessionImageScope phase="live">
+          <GrokSessionImage src="images/a/b.png" alt="inactive" />
+        </GrokSessionImageScope>
+      </GrokConversationProvider>
+    )
+    expect(screen.getByText("inactive")).toHaveClass("text-muted-foreground")
+    expect(mocks.resolve).not.toHaveBeenCalled()
+    expect(vi.getTimerCount()).toBe(0)
+
+    view.rerender(
+      <GrokConversationProvider conversationId={42}>
+        <GrokSessionImageScope phase="live">
+          <GrokSessionImage src="images/a/b.png" alt="inactive" />
+        </GrokSessionImageScope>
+      </GrokConversationProvider>
+    )
+    await flushEffects()
+
+    expect(screen.getByText("inactive")).toHaveClass("text-muted-foreground")
+    expect(screen.getByText("inactive")).not.toHaveAttribute("aria-busy")
+    expect(mocks.resolve).not.toHaveBeenCalled()
+    expect(vi.getTimerCount()).toBe(0)
+    await act(async () => vi.advanceTimersByTimeAsync(10_000))
+    expect(mocks.resolve).not.toHaveBeenCalled()
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
   it("live not_found attempts at 0 400 1200 and 2500 ms only", async () => {
     mocks.resolve.mockRejectedValue({ code: "not_found", message: "missing" })
     renderImage({ src: "images/a.png", alt: "a" }, "live")

@@ -516,7 +516,16 @@ export function GrokSessionImage({
       return
     }
 
-    if (!currentRunner || phase === null) return
+    if (
+      !currentRunner ||
+      phase === null ||
+      identityKey === null ||
+      conversationId === null ||
+      extension === null ||
+      typeof src !== "string"
+    ) {
+      return
+    }
     const control = currentRunner.control
     if (control.phase === phase) return
 
@@ -539,15 +548,15 @@ export function GrokSessionImage({
       controlRef.current = freshControl
       const freshRunner = createRunner(
         freshControl,
-        identityKey!,
-        conversationId!,
-        src!,
-        GROK_SESSION_IMAGE_MIME_BY_EXTENSION[extension!]
+        identityKey,
+        conversationId,
+        src,
+        GROK_SESSION_IMAGE_MIME_BY_EXTENSION[extension]
       )
       runnerRef.current = freshRunner
       pendingRenderResetRef.current = {
         generation,
-        view: loadingState(identityKey!),
+        view: loadingState(identityKey),
       }
       freshRunner.start()
       return
