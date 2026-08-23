@@ -282,6 +282,11 @@ fn inspect_raster_header<R: std::io::BufRead + std::io::Seek>(
         .map_err(AppCommandError::io)?;
     let (width, height) = match image::ImageReader::with_format(reader, sniffed).into_dimensions() {
         Ok(dimensions) => dimensions,
+        Err(image::ImageError::IoError(error))
+            if error.kind() != std::io::ErrorKind::UnexpectedEof =>
+        {
+            return Err(AppCommandError::io(error));
+        }
         Err(_) => return Ok(RasterHeaderOutcome::NotReady),
     };
     let pixels = u64::from(width)
@@ -451,7 +456,56 @@ mod href_parser_tests {
 mod candidate_tests {
     use super::*;
     use crate::app_error::AppErrorCode;
-    use std::io::Cursor;
+    use std::io::{BufRead, Cursor, Read, Seek, SeekFrom};
+
+    struct FailsDuringDimensionRead {
+        cursor: Cursor<Vec<u8>>,
+        start_seek_count: usize,
+    }
+
+    impl FailsDuringDimensionRead {
+        fn new(bytes: Vec<u8>) -> Self {
+            Self {
+                cursor: Cursor::new(bytes),
+                start_seek_count: 0,
+            }
+        }
+
+        fn read_error(&self) -> std::io::Error {
+            std::io::Error::other("simulated raster read failure")
+        }
+    }
+
+    impl Read for FailsDuringDimensionRead {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if self.start_seek_count >= 2 {
+                return Err(self.read_error());
+            }
+            self.cursor.read(buffer)
+        }
+    }
+
+    impl BufRead for FailsDuringDimensionRead {
+        fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+            if self.start_seek_count >= 2 {
+                return Err(self.read_error());
+            }
+            self.cursor.fill_buf()
+        }
+
+        fn consume(&mut self, amount: usize) {
+            self.cursor.consume(amount);
+        }
+    }
+
+    impl Seek for FailsDuringDimensionRead {
+        fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+            if position == SeekFrom::Start(0) {
+                self.start_seek_count += 1;
+            }
+            self.cursor.seek(position)
+        }
+    }
 
     fn crc32_ieee(bytes: &[u8]) -> u32 {
         let mut crc = u32::MAX;
@@ -644,6 +698,20 @@ mod candidate_tests {
                 CandidateOutcome::NotReady
             ));
         }
+    }
+
+    #[test]
+    fn non_eof_dimension_read_error_is_terminal_io_error() {
+        let image_ref = parse_grok_session_image_ref("images/a.png").unwrap();
+        let reader = FailsDuringDimensionRead::new(png_header(2, 3));
+
+        let error = inspect_raster_header(reader, &image_ref).unwrap_err();
+
+        assert_eq!(error.code, AppErrorCode::IoError);
+        assert_eq!(
+            error.detail.as_deref(),
+            Some("simulated raster read failure")
+        );
     }
 
     #[test]
