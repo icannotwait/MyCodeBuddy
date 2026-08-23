@@ -343,10 +343,38 @@ pub(crate) enum GrokSessionMatchStrictness {
     Loose,
 }
 
+#[cfg(any(test, windows))]
+fn is_unsupported_drive_relative_root_shape(has_root: bool, starts_with_prefix: bool) -> bool {
+    !has_root && starts_with_prefix
+}
+
+#[cfg(windows)]
+fn is_unsupported_drive_relative_sessions_root(path: &Path) -> bool {
+    is_unsupported_drive_relative_root_shape(
+        path.has_root(),
+        matches!(
+            path.components().next(),
+            Some(std::path::Component::Prefix(_))
+        ),
+    )
+}
+
+#[cfg(not(windows))]
+fn is_unsupported_drive_relative_sessions_root(_path: &Path) -> bool {
+    false
+}
+
 pub(crate) fn locate_grok_session_dir(
     sessions_root: &Path,
     session_id: &str,
 ) -> Result<Option<PathBuf>, GrokSessionLocatorError> {
+    if is_unsupported_drive_relative_sessions_root(sessions_root) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Grok sessions root must not be drive-relative",
+        )
+        .into());
+    }
     let entries = match fs::read_dir(sessions_root) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -1961,6 +1989,23 @@ mod tests {
             locate_grok_session_dir(&sessions, "session-1"),
             Err(GrokSessionLocatorError::Io(error))
                 if error.kind() == std::io::ErrorKind::NotFound
+        ));
+    }
+
+    #[test]
+    fn drive_relative_root_shape_is_terminal() {
+        assert!(is_unsupported_drive_relative_root_shape(false, true));
+        assert!(!is_unsupported_drive_relative_root_shape(true, true));
+        assert!(!is_unsupported_drive_relative_root_shape(false, false));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn drive_relative_sessions_root_is_rejected_before_fallback() {
+        assert!(matches!(
+            locate_grok_session_dir(Path::new(r"C:grok\sessions"), "session-1"),
+            Err(GrokSessionLocatorError::Io(error))
+                if error.kind() == std::io::ErrorKind::InvalidInput
         ));
     }
 

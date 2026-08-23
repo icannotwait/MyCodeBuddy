@@ -43,15 +43,18 @@ pub(crate) fn metadata_is_symlink_or_reparse(metadata: &std::fs::Metadata) -> bo
 /// reached through an existing symlink/reparse component. Callers use this
 /// only after a followed filesystem operation returned `NotFound`.
 ///
-/// Windows drive and UNC prefixes are not probeable until their root
-/// component is present. Ordinary relative paths remain supported without
-/// interpreting a bare `C:` drive prefix as a filesystem root.
+/// Windows rooted drive and UNC prefixes are not probeable until their root
+/// component is present. Ordinary and drive-relative paths are probed once a
+/// normal component exists, without interpreting a bare `C:` prefix as a
+/// filesystem target.
 pub(crate) fn has_dangling_alias_component(path: &Path) -> std::io::Result<bool> {
-    let probe_relative =
-        !path.has_root() && !matches!(path.components().next(), Some(Component::Prefix(_)));
+    let probe_relative = !path.has_root();
     let mut prefix = PathBuf::new();
     for component in path.components() {
         prefix.push(component.as_os_str());
+        if probe_relative && matches!(component, Component::Prefix(_)) {
+            continue;
+        }
         if !prefix.has_root() && !probe_relative {
             continue;
         }

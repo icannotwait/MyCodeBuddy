@@ -1577,6 +1577,23 @@ mod resolver_tests {
         assert_eq!(error.code, AppErrorCode::IoError);
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn drive_relative_sessions_root_denies_workspace_fallback() {
+        let fixture = ResolverFixture::new().await;
+        fixture.put_png(&fixture.workspace_root, 2, 3);
+
+        let error = resolve_grok_session_image_core(
+            &fixture.db,
+            PathBuf::from(r"C:grok\sessions"),
+            fixture.request(false),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.code, AppErrorCode::IoError);
+    }
+
     #[tokio::test]
     async fn origin_cwd_existing_directory_wins_current_folder() {
         let fixture = ResolverFixture::new().await;
