@@ -1,11 +1,18 @@
 use std::path::{Path, PathBuf};
 
+use base64::Engine as _;
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use serde::{Deserialize, Serialize};
 
-use crate::app_error::AppCommandError;
+use crate::app_error::{AppCommandError, AppErrorCode};
 use crate::commands::confined_file::{
-    read_confined_regular_file, ConfinedRead, FILE_BASE64_DEFAULT_MAX_BYTES,
+    metadata_is_symlink_or_reparse, read_confined_regular_file, run_file_io, ConfinedRead,
+    FILE_BASE64_DEFAULT_MAX_BYTES,
 };
+use crate::db::entities::{conversation, folder};
+use crate::db::AppDatabase;
+use crate::models::agent::AgentType;
+use crate::parsers::grok::{locate_grok_session_dir, GrokSessionLocatorError};
 
 pub(crate) const GROK_IMAGE_MAX_BYTES: usize = FILE_BASE64_DEFAULT_MAX_BYTES;
 pub(crate) const GROK_IMAGE_MAX_PIXELS: u64 = 40_000_000;
@@ -349,6 +356,290 @@ fn inspect_image_candidate(
         mime_type: image_ref.format.extension_mime(),
         bytes,
     }))
+}
+
+const GROK_IMAGE_SOURCE_NOT_FOUND: &str = "Grok session image source was not found";
+
+fn source_not_found() -> AppCommandError {
+    AppCommandError::not_found(GROK_IMAGE_SOURCE_NOT_FOUND)
+}
+
+fn validate_external_session_id(value: &str) -> Result<(), AppCommandError> {
+    let bytes = value.as_bytes();
+    let valid_shape = (1..=255).contains(&bytes.len())
+        && bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'));
+    let stem = value.split('.').next().unwrap_or(value);
+    if !valid_shape
+        || matches!(value, "." | "..")
+        || value.ends_with('.')
+        || is_windows_device_stem(stem)
+    {
+        return Err(AppCommandError::invalid_input(
+            "Invalid Grok external session id",
+        ));
+    }
+    Ok(())
+}
+
+fn invalid_session_authority() -> AppCommandError {
+    AppCommandError::invalid_input("Invalid Grok session authority")
+}
+
+fn map_session_authority_io(error: std::io::Error) -> AppCommandError {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        return AppCommandError::new(
+            AppErrorCode::IoError,
+            "Grok session authority changed during resolution",
+        )
+        .with_detail(error.to_string());
+    }
+    AppCommandError::io(error)
+}
+
+fn validate_session_authority(
+    sessions_root: &Path,
+    session_dir: &Path,
+    external_id: &str,
+) -> Result<PathBuf, AppCommandError> {
+    use std::ffi::OsStr;
+    use std::path::Component;
+
+    let canonical_root = std::fs::canonicalize(sessions_root).map_err(map_session_authority_io)?;
+    if !std::fs::metadata(&canonical_root)
+        .map_err(map_session_authority_io)?
+        .is_dir()
+    {
+        return Err(invalid_session_authority());
+    }
+    let relative = session_dir
+        .strip_prefix(sessions_root)
+        .map_err(|_| invalid_session_authority())?;
+    let mut components = relative.components();
+    let Some(Component::Normal(group)) = components.next() else {
+        return Err(invalid_session_authority());
+    };
+    let Some(Component::Normal(session)) = components.next() else {
+        return Err(invalid_session_authority());
+    };
+    if components.next().is_some() || session != OsStr::new(external_id) {
+        return Err(invalid_session_authority());
+    }
+
+    let lexical_group = sessions_root.join(group);
+    for path in [&lexical_group, session_dir] {
+        let metadata = std::fs::symlink_metadata(path).map_err(map_session_authority_io)?;
+        if metadata_is_symlink_or_reparse(&metadata) || !metadata.is_dir() {
+            return Err(invalid_session_authority());
+        }
+    }
+
+    let canonical_session = std::fs::canonicalize(session_dir).map_err(map_session_authority_io)?;
+    let canonical_relative = canonical_session
+        .strip_prefix(&canonical_root)
+        .map_err(|_| invalid_session_authority())?;
+    if canonical_relative.components().count() != 2 {
+        return Err(invalid_session_authority());
+    }
+    Ok(canonical_session)
+}
+
+fn has_dangling_alias_component(path: &Path) -> Result<bool, AppCommandError> {
+    let mut prefix = PathBuf::new();
+    for component in path.components() {
+        prefix.push(component.as_os_str());
+        // A Windows `C:` prefix alone is drive-relative; start probing only
+        // after the following RootDir makes the prefix absolute.
+        if !prefix.has_root() {
+            continue;
+        }
+        match std::fs::symlink_metadata(&prefix) {
+            Ok(metadata) if metadata_is_symlink_or_reparse(&metadata) => {
+                match std::fs::metadata(&prefix) {
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        return Ok(true);
+                    }
+                    Err(error) => return Err(AppCommandError::io(error)),
+                }
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(AppCommandError::io(error)),
+        }
+    }
+    Ok(false)
+}
+
+fn inspect_workspace_root(path: &Path) -> Result<Option<PathBuf>, AppCommandError> {
+    if !path.is_absolute() {
+        return Err(AppCommandError::invalid_input(
+            "Workspace root must be absolute",
+        ));
+    }
+    match std::fs::metadata(path) {
+        Ok(metadata) if metadata.is_dir() => Ok(Some(path.to_path_buf())),
+        Ok(_) => Err(AppCommandError::invalid_input(
+            "Workspace root must be a directory",
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if has_dangling_alias_component(path)? {
+                Err(AppCommandError::invalid_input("Workspace root is dangling"))
+            } else {
+                Ok(None)
+            }
+        }
+        Err(error) => Err(AppCommandError::io(error)),
+    }
+}
+
+async fn select_workspace_root(
+    db: &AppDatabase,
+    conversation: &conversation::Model,
+) -> Result<Option<PathBuf>, AppCommandError> {
+    if let Some(origin_cwd) = conversation
+        .origin_cwd
+        .as_deref()
+        .filter(|origin_cwd| !origin_cwd.is_empty())
+    {
+        let origin_cwd = PathBuf::from(origin_cwd);
+        if let Some(root) = run_file_io(move || inspect_workspace_root(&origin_cwd)).await? {
+            return Ok(Some(root));
+        }
+    }
+
+    let folder = folder::Entity::find_by_id(conversation.folder_id)
+        .filter(folder::Column::DeletedAt.is_null())
+        .one(&db.conn)
+        .await
+        .map_err(|error| AppCommandError::db(error.into()))?;
+    let Some(folder) = folder else {
+        return Ok(None);
+    };
+    let folder_path = PathBuf::from(folder.path);
+    run_file_io(move || inspect_workspace_root(&folder_path)).await
+}
+
+fn response_from_candidate(
+    candidate: ResolvedCandidate,
+    origin: GrokSessionImageOrigin,
+    include_data: bool,
+) -> Result<ResolveGrokSessionImageResponse, AppCommandError> {
+    let ResolvedCandidate {
+        canonical_path,
+        mime_type,
+        bytes,
+    } = candidate;
+    let simplified_path = crate::paths::simplify_verbatim_path(&canonical_path);
+    let path = simplified_path
+        .to_str()
+        .ok_or_else(|| AppCommandError::invalid_input("Resolved image path is not valid UTF-8"))?
+        .to_owned();
+    #[cfg(windows)]
+    if path.starts_with(r"\\?\") {
+        return Err(AppCommandError::invalid_input(
+            "Resolved image path cannot be represented by the frontend",
+        ));
+    }
+    let data_base64 = match (include_data, bytes) {
+        (true, Some(bytes)) if !bytes.is_empty() => {
+            Some(base64::engine::general_purpose::STANDARD.encode(bytes))
+        }
+        (false, None) => None,
+        _ => {
+            return Err(AppCommandError::task_execution_failed(
+                "Resolved image byte invariant was violated",
+            ));
+        }
+    };
+    Ok(ResolveGrokSessionImageResponse {
+        path,
+        origin,
+        mime_type: mime_type.to_owned(),
+        data_base64,
+    })
+}
+
+pub async fn resolve_grok_session_image_core(
+    db: &AppDatabase,
+    sessions_root: PathBuf,
+    request: ResolveGrokSessionImageRequest,
+) -> Result<ResolveGrokSessionImageResponse, AppCommandError> {
+    if request.conversation_id <= 0 {
+        return Err(AppCommandError::invalid_input(
+            "Conversation id must be positive",
+        ));
+    }
+
+    let conversation = conversation::Entity::find_by_id(request.conversation_id)
+        .filter(conversation::Column::DeletedAt.is_null())
+        .one(&db.conn)
+        .await
+        .map_err(|error| AppCommandError::db(error.into()))?;
+    let Some(conversation) = conversation else {
+        return Err(source_not_found());
+    };
+    if conversation.agent_type != AgentType::Grok.as_wire().as_ref() {
+        return Err(source_not_found());
+    }
+    let Some(external_id) = conversation
+        .external_id
+        .as_deref()
+        .filter(|external_id| !external_id.is_empty())
+    else {
+        return Err(source_not_found());
+    };
+    validate_external_session_id(external_id)?;
+    let image_ref = parse_grok_session_image_ref(&request.href)?;
+
+    let session_external_id = external_id.to_owned();
+    let session_image_ref = image_ref.clone();
+    let session_root_for_io = sessions_root.clone();
+    let include_data = request.include_data;
+    let session_outcome = run_file_io(move || {
+        let session_dir = match locate_grok_session_dir(&session_root_for_io, &session_external_id)
+        {
+            Ok(Some(session_dir)) => session_dir,
+            Ok(None) => return Ok(CandidateOutcome::Absent),
+            Err(GrokSessionLocatorError::Ambiguous { .. }) => {
+                return Err(AppCommandError::invalid_input(
+                    "Ambiguous Grok session image source",
+                ));
+            }
+            Err(GrokSessionLocatorError::Io(error)) => {
+                return Err(map_session_authority_io(error));
+            }
+        };
+        let canonical_session =
+            validate_session_authority(&session_root_for_io, &session_dir, &session_external_id)?;
+        inspect_image_candidate(&canonical_session, &session_image_ref, include_data)
+    })
+    .await?;
+
+    if let CandidateOutcome::Found(candidate) = session_outcome {
+        return response_from_candidate(
+            candidate,
+            GrokSessionImageOrigin::Session,
+            request.include_data,
+        );
+    }
+
+    let Some(workspace_root) = select_workspace_root(db, &conversation).await? else {
+        return Err(source_not_found());
+    };
+    let workspace_outcome =
+        run_file_io(move || inspect_image_candidate(&workspace_root, &image_ref, include_data))
+            .await?;
+    match workspace_outcome {
+        CandidateOutcome::Found(candidate) => response_from_candidate(
+            candidate,
+            GrokSessionImageOrigin::Workspace,
+            request.include_data,
+        ),
+        CandidateOutcome::Absent | CandidateOutcome::NotReady => Err(source_not_found()),
+    }
 }
 
 #[cfg(test)]
@@ -780,5 +1071,996 @@ mod candidate_tests {
             inspect_raster_header(Cursor::new(&captured), &image_ref).unwrap(),
             RasterHeaderOutcome::Ready
         );
+    }
+}
+
+#[cfg(test)]
+mod resolver_tests {
+    use super::candidate_tests::png_header;
+    use super::*;
+    use crate::app_error::AppErrorCode;
+    use crate::db::entities::{conversation, folder};
+    use crate::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
+    use crate::db::AppDatabase;
+    use crate::models::agent::AgentType;
+    #[allow(unused_imports)]
+    use base64::Engine as _;
+    #[allow(unused_imports)]
+    use sea_orm::{
+        ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, IntoActiveModel, QueryFilter,
+        Set,
+    };
+    use std::path::{Path, PathBuf};
+
+    const SOURCE_NOT_FOUND: &str = "Grok session image source was not found";
+
+    struct ResolverFixture {
+        db: AppDatabase,
+        _temp: tempfile::TempDir,
+        sessions_root: PathBuf,
+        workspace_root: PathBuf,
+        session_root: PathBuf,
+        conversation_id: i32,
+    }
+
+    impl ResolverFixture {
+        async fn new() -> Self {
+            let title_key_guard = crate::auto_title::title_key::test_hooks::SuiteGuard::enter();
+            crate::auto_title::title_key::test_hooks::push_override_get(
+                crate::auto_title::title_key::TitleKeyState::Absent,
+            );
+            let temp = tempfile::tempdir().unwrap();
+            let sessions_root = temp.path().join("grok/sessions");
+            let workspace_root = temp.path().join("workspace");
+            let external_id = "session-123".to_string();
+            let session_root = sessions_root.join("group-a").join(&external_id);
+            std::fs::create_dir_all(&session_root).unwrap();
+            std::fs::write(session_root.join("updates.jsonl"), b"\n").unwrap();
+            std::fs::create_dir_all(&workspace_root).unwrap();
+
+            let db = fresh_in_memory_db().await;
+            let folder_id = seed_folder(&db, workspace_root.to_str().unwrap()).await;
+            let conversation_id = seed_conversation(&db, folder_id, AgentType::Grok).await;
+            drop(title_key_guard);
+            let row = conversation::Entity::find_by_id(conversation_id)
+                .one(&db.conn)
+                .await
+                .unwrap()
+                .unwrap();
+            let mut active = row.into_active_model();
+            active.external_id = Set(Some(external_id.clone()));
+            active.update(&db.conn).await.unwrap();
+
+            Self {
+                db,
+                _temp: temp,
+                sessions_root,
+                workspace_root,
+                session_root,
+                conversation_id,
+            }
+        }
+
+        fn request(&self, include_data: bool) -> ResolveGrokSessionImageRequest {
+            ResolveGrokSessionImageRequest {
+                conversation_id: self.conversation_id,
+                href: "images/a.png".into(),
+                include_data,
+            }
+        }
+
+        fn put_png(&self, root: &Path, width: u32, height: u32) -> Vec<u8> {
+            let bytes = png_header(width, height);
+            std::fs::create_dir_all(root.join("images")).unwrap();
+            std::fs::write(root.join("images/a.png"), &bytes).unwrap();
+            bytes
+        }
+
+        fn put_bytes(&self, root: &Path, name: &str, bytes: &[u8]) {
+            std::fs::create_dir_all(root.join("images")).unwrap();
+            std::fs::write(root.join("images").join(name), bytes).unwrap();
+        }
+
+        async fn conversation(&self) -> conversation::Model {
+            conversation::Entity::find_by_id(self.conversation_id)
+                .one(&self.db.conn)
+                .await
+                .unwrap()
+                .unwrap()
+        }
+
+        async fn set_external_id(&self, value: Option<String>) {
+            let mut active = self.conversation().await.into_active_model();
+            active.external_id = Set(value);
+            active.update(&self.db.conn).await.unwrap();
+        }
+
+        async fn set_origin_cwd(&self, value: Option<String>) {
+            let mut active = self.conversation().await.into_active_model();
+            active.origin_cwd = Set(value);
+            active.update(&self.db.conn).await.unwrap();
+        }
+
+        async fn set_agent_type(&self, value: &str) {
+            let mut active = self.conversation().await.into_active_model();
+            active.agent_type = Set(value.to_owned());
+            active.update(&self.db.conn).await.unwrap();
+        }
+
+        async fn delete_conversation(&self) {
+            let mut active = self.conversation().await.into_active_model();
+            active.deleted_at = Set(Some(chrono::Utc::now()));
+            active.update(&self.db.conn).await.unwrap();
+        }
+
+        async fn folder(&self) -> folder::Model {
+            let conversation = self.conversation().await;
+            folder::Entity::find_by_id(conversation.folder_id)
+                .one(&self.db.conn)
+                .await
+                .unwrap()
+                .unwrap()
+        }
+
+        async fn set_folder_path(&self, value: String) {
+            let mut active = self.folder().await.into_active_model();
+            active.path = Set(value);
+            active.update(&self.db.conn).await.unwrap();
+        }
+
+        async fn delete_folder(&self) {
+            let mut active = self.folder().await.into_active_model();
+            active.deleted_at = Set(Some(chrono::Utc::now()));
+            active.update(&self.db.conn).await.unwrap();
+        }
+
+        async fn resolve(
+            &self,
+            include_data: bool,
+        ) -> Result<ResolveGrokSessionImageResponse, AppCommandError> {
+            resolve_grok_session_image_core(
+                &self.db,
+                self.sessions_root.clone(),
+                self.request(include_data),
+            )
+            .await
+        }
+    }
+
+    fn jpeg_bytes() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        image::DynamicImage::new_rgba8(2, 3)
+            .write_to(std::io::Cursor::new(&mut bytes), image::ImageFormat::Jpeg)
+            .unwrap();
+        bytes
+    }
+
+    fn assert_public_not_found(error: AppCommandError) {
+        assert_eq!(error.code, AppErrorCode::NotFound);
+        assert_eq!(error.message, SOURCE_NOT_FOUND);
+    }
+
+    #[cfg(unix)]
+    fn directory_alias(target: &Path, alias: &Path) -> bool {
+        std::os::unix::fs::symlink(target, alias).unwrap();
+        true
+    }
+
+    #[cfg(windows)]
+    fn directory_alias(target: &Path, alias: &Path) -> bool {
+        match std::os::windows::fs::symlink_dir(target, alias) {
+            Ok(()) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => false,
+            Err(error) => panic!("failed to create directory alias: {error}"),
+        }
+    }
+
+    #[cfg(unix)]
+    fn file_alias(target: &Path, alias: &Path) -> bool {
+        std::os::unix::fs::symlink(target, alias).unwrap();
+        true
+    }
+
+    #[cfg(windows)]
+    fn file_alias(target: &Path, alias: &Path) -> bool {
+        match std::os::windows::fs::symlink_file(target, alias) {
+            Ok(()) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => false,
+            Err(error) => panic!("failed to create file alias: {error}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn safe_session_hit_returns_session_path_mime_and_same_handle_bytes() {
+        let fixture = ResolverFixture::new().await;
+        let bytes = fixture.put_png(&fixture.session_root, 2, 3);
+        let response = resolve_grok_session_image_core(
+            &fixture.db,
+            fixture.sessions_root.clone(),
+            fixture.request(true),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.origin, GrokSessionImageOrigin::Session);
+        assert_eq!(response.mime_type, "image/png");
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(response.data_base64.unwrap())
+                .unwrap(),
+            bytes
+        );
+        assert_eq!(
+            PathBuf::from(&response.path),
+            crate::paths::simplify_verbatim_path(
+                &std::fs::canonicalize(fixture.session_root.join("images/a.png")).unwrap()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn session_wins_without_querying_a_deleted_folder() {
+        let fixture = ResolverFixture::new().await;
+        fixture.put_png(&fixture.session_root, 2, 3);
+        fixture.delete_folder().await;
+        let response = fixture.resolve(false).await.unwrap();
+        assert_eq!(response.origin, GrokSessionImageOrigin::Session);
+        assert!(response.data_base64.is_none());
+    }
+
+    #[tokio::test]
+    async fn workspace_only_hit_returns_workspace_and_both_files_prefer_session() {
+        let fixture = ResolverFixture::new().await;
+        let workspace_bytes = fixture.put_png(&fixture.workspace_root, 2, 3);
+        let workspace = fixture.resolve(true).await.unwrap();
+        assert_eq!(workspace.origin, GrokSessionImageOrigin::Workspace);
+        assert_eq!(
+            PathBuf::from(&workspace.path),
+            crate::paths::simplify_verbatim_path(
+                &std::fs::canonicalize(fixture.workspace_root.join("images/a.png")).unwrap()
+            )
+        );
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(workspace.data_base64.unwrap())
+                .unwrap(),
+            workspace_bytes
+        );
+
+        fixture.put_png(&fixture.session_root, 4, 5);
+        let session = fixture.resolve(false).await.unwrap();
+        assert_eq!(session.origin, GrokSessionImageOrigin::Session);
+    }
+
+    #[tokio::test]
+    async fn non_positive_ids_reject_before_database_lookup() {
+        let fixture = ResolverFixture::new().await;
+        fixture.db.conn.clone().close().await.unwrap();
+        for conversation_id in [0, -1, i32::MIN] {
+            let request = ResolveGrokSessionImageRequest {
+                conversation_id,
+                href: "images/a.png".into(),
+                include_data: false,
+            };
+            let error = resolve_grok_session_image_core(
+                &fixture.db,
+                fixture.sessions_root.clone(),
+                request,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.code, AppErrorCode::InvalidInput);
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_deleted_non_grok_and_empty_external_id_share_not_found() {
+        let missing = ResolverFixture::new().await;
+        let mut request = missing.request(false);
+        request.conversation_id = i32::MAX;
+        let missing_error =
+            resolve_grok_session_image_core(&missing.db, missing.sessions_root.clone(), request)
+                .await
+                .unwrap_err();
+
+        let deleted = ResolverFixture::new().await;
+        deleted.delete_conversation().await;
+        let deleted_error = deleted.resolve(false).await.unwrap_err();
+
+        let non_grok = ResolverFixture::new().await;
+        non_grok.set_agent_type("codex").await;
+        let non_grok_error = non_grok.resolve(false).await.unwrap_err();
+
+        let empty = ResolverFixture::new().await;
+        empty.set_external_id(Some(String::new())).await;
+        let empty_error = empty.resolve(false).await.unwrap_err();
+
+        for error in [missing_error, deleted_error, non_grok_error, empty_error] {
+            assert_public_not_found(error);
+        }
+    }
+
+    #[tokio::test]
+    async fn privacy_gate_precedes_href_parsing() {
+        let missing = ResolverFixture::new().await;
+        let mut missing_request = missing.request(false);
+        missing_request.conversation_id = i32::MAX;
+        missing_request.href = "../private.png".into();
+        let missing_error = resolve_grok_session_image_core(
+            &missing.db,
+            missing.sessions_root.clone(),
+            missing_request,
+        )
+        .await
+        .unwrap_err();
+
+        let deleted = ResolverFixture::new().await;
+        deleted.delete_conversation().await;
+        let mut deleted_request = deleted.request(false);
+        deleted_request.href = "../private.png".into();
+        let deleted_error = resolve_grok_session_image_core(
+            &deleted.db,
+            deleted.sessions_root.clone(),
+            deleted_request,
+        )
+        .await
+        .unwrap_err();
+
+        let non_grok = ResolverFixture::new().await;
+        non_grok.set_agent_type("codex").await;
+        let mut non_grok_request = non_grok.request(false);
+        non_grok_request.href = "../private.png".into();
+        let non_grok_error = resolve_grok_session_image_core(
+            &non_grok.db,
+            non_grok.sessions_root.clone(),
+            non_grok_request,
+        )
+        .await
+        .unwrap_err();
+
+        let empty = ResolverFixture::new().await;
+        empty.set_external_id(Some(String::new())).await;
+        let mut empty_request = empty.request(false);
+        empty_request.href = "../private.png".into();
+        let empty_error =
+            resolve_grok_session_image_core(&empty.db, empty.sessions_root.clone(), empty_request)
+                .await
+                .unwrap_err();
+
+        for error in [missing_error, deleted_error, non_grok_error, empty_error] {
+            assert_public_not_found(error);
+        }
+    }
+
+    #[tokio::test]
+    async fn valid_grok_row_rejects_invalid_href_before_filesystem_lookup() {
+        let fixture = ResolverFixture::new().await;
+        std::fs::remove_dir_all(&fixture.sessions_root).unwrap();
+        if !directory_alias(
+            &fixture.sessions_root.with_file_name("missing"),
+            &fixture.sessions_root,
+        ) {
+            return;
+        }
+        let mut request = fixture.request(false);
+        request.href = "../private.png".into();
+        let error =
+            resolve_grok_session_image_core(&fixture.db, fixture.sessions_root.clone(), request)
+                .await
+                .unwrap_err();
+        assert_eq!(error.code, AppErrorCode::InvalidInput);
+        assert_eq!(error.message, INVALID_REF_MESSAGE);
+    }
+
+    #[tokio::test]
+    async fn database_query_failure_preserves_database_error() {
+        let fixture = ResolverFixture::new().await;
+        fixture.db.conn.clone().close().await.unwrap();
+        let error = fixture.resolve(false).await.unwrap_err();
+        assert_eq!(error.code, AppErrorCode::DatabaseError);
+    }
+
+    #[tokio::test]
+    async fn external_id_accepts_ascii_boundaries() {
+        for external_id in ["a".to_owned(), format!("a{}", "z".repeat(254))] {
+            let fixture = ResolverFixture::new().await;
+            fixture.set_external_id(Some(external_id)).await;
+            assert_public_not_found(fixture.resolve(false).await.unwrap_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn external_id_rejects_every_unsafe_shape() {
+        for external_id in [
+            "a".repeat(256),
+            "_leading".into(),
+            "slash/value".into(),
+            r"back\slash".into(),
+            "colon:value".into(),
+            "white space".into(),
+            "目标".into(),
+            ".".into(),
+            "..".into(),
+            "trailing.".into(),
+            "CON".into(),
+            "con.session".into(),
+            "COM1".into(),
+            "LPT9".into(),
+        ] {
+            let fixture = ResolverFixture::new().await;
+            fixture.set_external_id(Some(external_id)).await;
+            let error = fixture.resolve(false).await.unwrap_err();
+            assert_eq!(error.code, AppErrorCode::InvalidInput);
+        }
+    }
+
+    #[tokio::test]
+    async fn strict_and_loose_locator_hits_both_resolve() {
+        let fixture = ResolverFixture::new().await;
+        fixture.put_png(&fixture.session_root, 2, 3);
+        let strict = fixture.resolve(false).await.unwrap();
+        assert_eq!(strict.origin, GrokSessionImageOrigin::Session);
+
+        std::fs::remove_file(fixture.session_root.join("updates.jsonl")).unwrap();
+        let loose = fixture.resolve(false).await.unwrap();
+        assert_eq!(loose.origin, GrokSessionImageOrigin::Session);
+        assert_eq!(strict.path, loose.path);
+    }
+
+    #[tokio::test]
+    async fn duplicate_strict_and_duplicate_loose_are_invalid_input() {
+        for strict in [true, false] {
+            let fixture = ResolverFixture::new().await;
+            fixture.put_png(&fixture.workspace_root, 2, 3);
+            let duplicate = fixture.sessions_root.join("group-b/session-123");
+            std::fs::create_dir_all(&duplicate).unwrap();
+            if strict {
+                std::fs::write(duplicate.join("updates.jsonl"), b"\n").unwrap();
+            } else {
+                std::fs::remove_file(fixture.session_root.join("updates.jsonl")).unwrap();
+            }
+            let error = fixture.resolve(false).await.unwrap_err();
+            assert_eq!(error.code, AppErrorCode::InvalidInput);
+        }
+    }
+
+    #[tokio::test]
+    async fn session_hit_does_not_inspect_invalid_origin_cwd() {
+        let fixture = ResolverFixture::new().await;
+        fixture.put_png(&fixture.session_root, 2, 3);
+        fixture.set_origin_cwd(Some("relative/path".into())).await;
+        fixture.delete_folder().await;
+        let response = fixture.resolve(false).await.unwrap();
+        assert_eq!(response.origin, GrokSessionImageOrigin::Session);
+    }
+
+    #[tokio::test]
+    async fn missing_sessions_root_allows_workspace() {
+        let fixture = ResolverFixture::new().await;
+        fixture.put_png(&fixture.workspace_root, 2, 3);
+        std::fs::remove_dir_all(&fixture.sessions_root).unwrap();
+        let response = fixture.resolve(false).await.unwrap();
+        assert_eq!(response.origin, GrokSessionImageOrigin::Workspace);
+    }
+
+    #[tokio::test]
+    async fn missing_candidates_under_both_existing_authorities_end_not_found() {
+        let fixture = ResolverFixture::new().await;
+        assert_public_not_found(fixture.resolve(false).await.unwrap_err());
+    }
+
+    #[tokio::test]
+    async fn dangling_sessions_root_is_io_error_without_workspace_fallback() {
+        let fixture = ResolverFixture::new().await;
+        fixture.put_png(&fixture.workspace_root, 2, 3);
+        std::fs::remove_dir_all(&fixture.sessions_root).unwrap();
+        if !directory_alias(
+            &fixture.sessions_root.with_file_name("missing"),
+            &fixture.sessions_root,
+        ) {
+            return;
+        }
+        let error = fixture.resolve(false).await.unwrap_err();
+        assert_eq!(error.code, AppErrorCode::IoError);
+    }
+
+    #[tokio::test]
+    async fn origin_cwd_existing_directory_wins_current_folder() {
+        let fixture = ResolverFixture::new().await;
+        let origin = fixture._temp.path().join("origin");
+        std::fs::create_dir(&origin).unwrap();
+        fixture.put_png(&origin, 4, 5);
+        fixture.put_png(&fixture.workspace_root, 2, 3);
+        fixture
+            .set_origin_cwd(Some(origin.to_str().unwrap().to_owned()))
+            .await;
+        fixture.delete_folder().await;
+        let response = fixture.resolve(false).await.unwrap();
+        assert_eq!(response.origin, GrokSessionImageOrigin::Workspace);
+        assert_eq!(
+            PathBuf::from(response.path),
+            crate::paths::simplify_verbatim_path(
+                &std::fs::canonicalize(origin.join("images/a.png")).unwrap()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn unset_or_empty_origin_cwd_uses_current_folder() {
+        for origin_cwd in [None, Some(String::new())] {
+            let fixture = ResolverFixture::new().await;
+            fixture.put_png(&fixture.workspace_root, 2, 3);
+            fixture.set_origin_cwd(origin_cwd).await;
+            let response = fixture.resolve(false).await.unwrap();
+            assert_eq!(response.origin, GrokSessionImageOrigin::Workspace);
+            assert_eq!(
+                PathBuf::from(response.path),
+                crate::paths::simplify_verbatim_path(
+                    &std::fs::canonicalize(fixture.workspace_root.join("images/a.png")).unwrap()
+                )
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_origin_cwd_falls_back_to_current_folder() {
+        let fixture = ResolverFixture::new().await;
+        fixture.put_png(&fixture.workspace_root, 2, 3);
+        fixture
+            .set_origin_cwd(Some(
+                fixture
+                    ._temp
+                    .path()
+                    .join("ordinary-missing")
+                    .to_str()
+                    .unwrap()
+                    .to_owned(),
+            ))
+            .await;
+        let response = fixture.resolve(false).await.unwrap();
+        assert_eq!(response.origin, GrokSessionImageOrigin::Workspace);
+        assert_eq!(
+            PathBuf::from(response.path),
+            crate::paths::simplify_verbatim_path(
+                &std::fs::canonicalize(fixture.workspace_root.join("images/a.png")).unwrap()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn dangling_origin_cwd_rejects_without_current_folder_fallback() {
+        for ancestor in [false, true] {
+            let fixture = ResolverFixture::new().await;
+            fixture.put_png(&fixture.workspace_root, 2, 3);
+            let alias = fixture._temp.path().join(if ancestor {
+                "dangling-ancestor"
+            } else {
+                "dangling-final"
+            });
+            if !directory_alias(&fixture._temp.path().join("missing-target"), &alias) {
+                return;
+            }
+            let origin = if ancestor { alias.join("child") } else { alias };
+            fixture
+                .set_origin_cwd(Some(origin.to_str().unwrap().to_owned()))
+                .await;
+            let error = fixture.resolve(false).await.unwrap_err();
+            assert_eq!(error.code, AppErrorCode::InvalidInput);
+        }
+    }
+
+    #[tokio::test]
+    async fn relative_origin_cwd_and_nondirectory_origin_reject() {
+        for origin in [PathBuf::from("relative/path"), PathBuf::new()] {
+            let fixture = ResolverFixture::new().await;
+            fixture.put_png(&fixture.workspace_root, 2, 3);
+            let value = if origin.as_os_str().is_empty() {
+                let file = fixture._temp.path().join("origin-file");
+                std::fs::write(&file, b"not a directory").unwrap();
+                file
+            } else {
+                origin
+            };
+            fixture
+                .set_origin_cwd(Some(value.to_str().unwrap().to_owned()))
+                .await;
+            let error = fixture.resolve(false).await.unwrap_err();
+            assert_eq!(error.code, AppErrorCode::InvalidInput);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unreadable_origin_cwd_preserves_permission_denied() {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct RestorePermissions {
+            path: PathBuf,
+            permissions: std::fs::Permissions,
+        }
+        impl Drop for RestorePermissions {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.path, self.permissions.clone());
+            }
+        }
+
+        let fixture = ResolverFixture::new().await;
+        fixture.put_png(&fixture.workspace_root, 2, 3);
+        let parent = fixture._temp.path().join("unreadable-origin-parent");
+        let origin = parent.join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        fixture
+            .set_origin_cwd(Some(origin.to_str().unwrap().to_owned()))
+            .await;
+        let permissions = std::fs::metadata(&parent).unwrap().permissions();
+        let _restore = RestorePermissions {
+            path: parent.clone(),
+            permissions,
+        };
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0)).unwrap();
+        let probe = std::fs::metadata(&origin);
+        if !matches!(probe, Err(ref error) if error.kind() == std::io::ErrorKind::PermissionDenied)
+        {
+            return;
+        }
+        let error = fixture.resolve(false).await.unwrap_err();
+        assert_eq!(error.code, AppErrorCode::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn missing_or_deleted_current_folder_ends_not_found() {
+        let missing = ResolverFixture::new().await;
+        missing
+            .db
+            .conn
+            .execute_unprepared("PRAGMA foreign_keys=OFF")
+            .await
+            .unwrap();
+        let mut active = missing.conversation().await.into_active_model();
+        active.folder_id = Set(i32::MAX);
+        active.update(&missing.db.conn).await.unwrap();
+        assert_public_not_found(missing.resolve(false).await.unwrap_err());
+
+        let deleted = ResolverFixture::new().await;
+        deleted.delete_folder().await;
+        assert_public_not_found(deleted.resolve(false).await.unwrap_err());
+    }
+
+    #[tokio::test]
+    async fn relative_or_nondirectory_current_folder_rejects() {
+        for path in [PathBuf::from("relative/path"), PathBuf::new()] {
+            let fixture = ResolverFixture::new().await;
+            let value = if path.as_os_str().is_empty() {
+                let file = fixture._temp.path().join("folder-file");
+                std::fs::write(&file, b"not a directory").unwrap();
+                file.to_str().unwrap().to_owned()
+            } else {
+                path.to_str().unwrap().to_owned()
+            };
+            fixture.set_folder_path(value).await;
+            let error = fixture.resolve(false).await.unwrap_err();
+            assert_eq!(error.code, AppErrorCode::InvalidInput);
+        }
+    }
+
+    #[tokio::test]
+    async fn dangling_current_folder_rejects() {
+        for ancestor in [false, true] {
+            let fixture = ResolverFixture::new().await;
+            let alias = fixture._temp.path().join(if ancestor {
+                "folder-dangling-ancestor"
+            } else {
+                "folder-dangling-final"
+            });
+            if !directory_alias(&fixture._temp.path().join("missing-folder-target"), &alias) {
+                return;
+            }
+            let folder = if ancestor { alias.join("child") } else { alias };
+            fixture
+                .set_folder_path(folder.to_str().unwrap().to_owned())
+                .await;
+            let error = fixture.resolve(false).await.unwrap_err();
+            assert_eq!(error.code, AppErrorCode::InvalidInput);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unreadable_current_folder_preserves_permission_denied() {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct RestorePermissions {
+            path: PathBuf,
+            permissions: std::fs::Permissions,
+        }
+        impl Drop for RestorePermissions {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.path, self.permissions.clone());
+            }
+        }
+
+        let fixture = ResolverFixture::new().await;
+        let parent = fixture._temp.path().join("unreadable-folder-parent");
+        let folder = parent.join("folder");
+        std::fs::create_dir_all(&folder).unwrap();
+        fixture
+            .set_folder_path(folder.to_str().unwrap().to_owned())
+            .await;
+        let permissions = std::fs::metadata(&parent).unwrap().permissions();
+        let _restore = RestorePermissions {
+            path: parent.clone(),
+            permissions,
+        };
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0)).unwrap();
+        let probe = std::fs::metadata(&folder);
+        if !matches!(probe, Err(ref error) if error.kind() == std::io::ErrorKind::PermissionDenied)
+        {
+            return;
+        }
+        let error = fixture.resolve(false).await.unwrap_err();
+        assert_eq!(error.code, AppErrorCode::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn session_not_ready_allows_workspace_but_rejected_session_does_not() {
+        let not_ready = ResolverFixture::new().await;
+        not_ready.put_bytes(&not_ready.session_root, "a.png", b"\x89PNG");
+        not_ready.put_png(&not_ready.workspace_root, 2, 3);
+        let response = not_ready.resolve(false).await.unwrap();
+        assert_eq!(response.origin, GrokSessionImageOrigin::Workspace);
+
+        let rejected = ResolverFixture::new().await;
+        rejected.put_bytes(&rejected.session_root, "a.png", &jpeg_bytes());
+        rejected.put_png(&rejected.workspace_root, 2, 3);
+        let error = rejected.resolve(false).await.unwrap_err();
+        assert_eq!(error.code, AppErrorCode::InvalidInput);
+    }
+
+    #[tokio::test]
+    async fn session_permission_and_oversize_errors_do_not_fall_back() {
+        let oversize = ResolverFixture::new().await;
+        oversize.put_png(&oversize.workspace_root, 2, 3);
+        let mut bytes = png_header(1, 1);
+        bytes.resize(GROK_IMAGE_MAX_BYTES + 1, 0);
+        oversize.put_bytes(&oversize.session_root, "a.png", &bytes);
+        let error = oversize.resolve(false).await.unwrap_err();
+        assert_eq!(error.code, AppErrorCode::InvalidInput);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            struct RestorePermissions {
+                path: PathBuf,
+                permissions: std::fs::Permissions,
+            }
+            impl Drop for RestorePermissions {
+                fn drop(&mut self) {
+                    let _ = std::fs::set_permissions(&self.path, self.permissions.clone());
+                }
+            }
+
+            let permission = ResolverFixture::new().await;
+            permission.put_png(&permission.workspace_root, 2, 3);
+            permission.put_png(&permission.session_root, 2, 3);
+            let images = permission.session_root.join("images");
+            let permissions = std::fs::metadata(&images).unwrap().permissions();
+            let _restore = RestorePermissions {
+                path: images.clone(),
+                permissions,
+            };
+            std::fs::set_permissions(&images, std::fs::Permissions::from_mode(0)).unwrap();
+            let probe = std::fs::read_dir(&images);
+            if matches!(
+                probe,
+                Err(ref error) if error.kind() == std::io::ErrorKind::PermissionDenied
+            ) {
+                let error = permission.resolve(false).await.unwrap_err();
+                assert_eq!(error.code, AppErrorCode::PermissionDenied);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn workspace_not_ready_ends_not_found() {
+        let fixture = ResolverFixture::new().await;
+        fixture.put_bytes(&fixture.workspace_root, "a.png", b"\x89PNG");
+        assert_public_not_found(fixture.resolve(false).await.unwrap_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlinked_group_and_session_identity_reject() {
+        for group_alias in [true, false] {
+            let fixture = ResolverFixture::new().await;
+            fixture.put_png(&fixture.workspace_root, 2, 3);
+            std::fs::remove_dir_all(&fixture.sessions_root).unwrap();
+            std::fs::create_dir_all(&fixture.sessions_root).unwrap();
+            if group_alias {
+                let real_group = fixture._temp.path().join("real-group");
+                let session = real_group.join("session-123");
+                std::fs::create_dir_all(&session).unwrap();
+                std::fs::write(session.join("updates.jsonl"), b"\n").unwrap();
+                std::os::unix::fs::symlink(&real_group, fixture.sessions_root.join("group-a"))
+                    .unwrap();
+            } else {
+                let group = fixture.sessions_root.join("group-a");
+                let real_session = fixture._temp.path().join("real-session");
+                std::fs::create_dir_all(&group).unwrap();
+                std::fs::create_dir_all(&real_session).unwrap();
+                std::fs::write(real_session.join("updates.jsonl"), b"\n").unwrap();
+                std::os::unix::fs::symlink(&real_session, group.join("session-123")).unwrap();
+            }
+            let error = fixture.resolve(false).await.unwrap_err();
+            assert_eq!(error.code, AppErrorCode::InvalidInput);
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_session_reparse_identity_rejects_when_creation_is_available() {
+        let fixture = ResolverFixture::new().await;
+        fixture.put_png(&fixture.workspace_root, 2, 3);
+        std::fs::remove_dir_all(&fixture.sessions_root).unwrap();
+        std::fs::create_dir_all(&fixture.sessions_root).unwrap();
+        let real_group = fixture._temp.path().join("real-group");
+        let session = real_group.join("session-123");
+        std::fs::create_dir_all(&session).unwrap();
+        std::fs::write(session.join("updates.jsonl"), b"\n").unwrap();
+        if !directory_alias(&real_group, &fixture.sessions_root.join("group-a")) {
+            return;
+        }
+        let error = fixture.resolve(false).await.unwrap_err();
+        assert_eq!(error.code, AppErrorCode::InvalidInput);
+    }
+
+    #[tokio::test]
+    async fn escaping_dangling_and_directory_candidates_reject_without_fallback() {
+        enum Shape {
+            Escape,
+            Dangling,
+            Directory,
+        }
+        for session_authority in [true, false] {
+            for shape in [Shape::Escape, Shape::Dangling, Shape::Directory] {
+                let fixture = ResolverFixture::new().await;
+                let root = if session_authority {
+                    fixture.put_png(&fixture.workspace_root, 2, 3);
+                    &fixture.session_root
+                } else {
+                    &fixture.workspace_root
+                };
+                std::fs::create_dir_all(root.join("images")).unwrap();
+                let candidate = root.join("images/a.png");
+                let created = match shape {
+                    Shape::Escape => {
+                        let outside = fixture._temp.path().join("outside.png");
+                        std::fs::write(&outside, png_header(2, 3)).unwrap();
+                        file_alias(&outside, &candidate)
+                    }
+                    Shape::Dangling => {
+                        file_alias(&fixture._temp.path().join("missing.png"), &candidate)
+                    }
+                    Shape::Directory => {
+                        std::fs::create_dir(&candidate).unwrap();
+                        true
+                    }
+                };
+                if !created {
+                    continue;
+                }
+                let error = fixture.resolve(false).await.unwrap_err();
+                assert_eq!(error.code, AppErrorCode::InvalidInput);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn same_images_directory_file_symlink_passes() {
+        let fixture = ResolverFixture::new().await;
+        fixture.put_bytes(&fixture.session_root, "real.png", &png_header(2, 3));
+        std::os::unix::fs::symlink("real.png", fixture.session_root.join("images/a.png")).unwrap();
+        fixture.delete_folder().await;
+        let response = fixture.resolve(false).await.unwrap();
+        assert_eq!(response.origin, GrokSessionImageOrigin::Session);
+        assert_eq!(
+            PathBuf::from(response.path),
+            crate::paths::simplify_verbatim_path(
+                &std::fs::canonicalize(fixture.session_root.join("images/real.png")).unwrap()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn uppercase_href_extension_returns_header_mime() {
+        let fixture = ResolverFixture::new().await;
+        fixture.put_bytes(&fixture.session_root, "a.JPEG", &jpeg_bytes());
+        let mut request = fixture.request(false);
+        request.href = "images/a.JPEG".into();
+        let response =
+            resolve_grok_session_image_core(&fixture.db, fixture.sessions_root.clone(), request)
+                .await
+                .unwrap();
+        assert_eq!(response.mime_type, "image/jpeg");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_canonical_result_path_rejects() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let candidate = ResolvedCandidate {
+            canonical_path: PathBuf::from(std::ffi::OsString::from_vec(vec![b'/', 0xff, b'a'])),
+            mime_type: "image/png",
+            bytes: None,
+        };
+        let error =
+            response_from_candidate(candidate, GrokSessionImageOrigin::Session, false).unwrap_err();
+        assert_eq!(error.code, AppErrorCode::InvalidInput);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_unsimplifiable_verbatim_result_path_rejects() {
+        let candidate = ResolvedCandidate {
+            canonical_path: PathBuf::from(
+                r"\\?\Volume{7b2f1c40-0000-0000-0000-100000000000}\images\a.png",
+            ),
+            mime_type: "image/png",
+            bytes: None,
+        };
+        let error =
+            response_from_candidate(candidate, GrokSessionImageOrigin::Session, false).unwrap_err();
+        assert_eq!(error.code, AppErrorCode::InvalidInput);
+    }
+
+    #[tokio::test]
+    async fn include_data_false_omits_data_but_still_rejects_bad_header_size_and_pixels() {
+        let valid = ResolverFixture::new().await;
+        valid.put_png(&valid.session_root, 2, 3);
+        let response = valid.resolve(false).await.unwrap();
+        assert!(response.data_base64.is_none());
+
+        let bad_header = ResolverFixture::new().await;
+        bad_header.put_bytes(&bad_header.session_root, "a.png", &jpeg_bytes());
+        assert_eq!(
+            bad_header.resolve(false).await.unwrap_err().code,
+            AppErrorCode::InvalidInput
+        );
+
+        let size = ResolverFixture::new().await;
+        let mut bytes = png_header(1, 1);
+        bytes.resize(GROK_IMAGE_MAX_BYTES + 1, 0);
+        size.put_bytes(&size.session_root, "a.png", &bytes);
+        assert_eq!(
+            size.resolve(false).await.unwrap_err().code,
+            AppErrorCode::InvalidInput
+        );
+
+        let pixels = ResolverFixture::new().await;
+        pixels.put_png(&pixels.session_root, 40_000_001, 1);
+        assert_eq!(
+            pixels.resolve(false).await.unwrap_err().code,
+            AppErrorCode::InvalidInput
+        );
+    }
+
+    #[test]
+    fn response_conversion_rejects_byte_presence_mismatch_without_panicking() {
+        for (include_data, bytes) in [
+            (true, None),
+            (true, Some(Vec::new())),
+            (false, Some(vec![1_u8])),
+        ] {
+            let candidate = ResolvedCandidate {
+                canonical_path: PathBuf::from("/tmp/images/a.png"),
+                mime_type: "image/png",
+                bytes,
+            };
+            let error =
+                response_from_candidate(candidate, GrokSessionImageOrigin::Session, include_data)
+                    .unwrap_err();
+            assert_eq!(error.code, AppErrorCode::TaskExecutionFailed);
+        }
     }
 }
