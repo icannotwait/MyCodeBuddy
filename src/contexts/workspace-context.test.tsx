@@ -4615,6 +4615,43 @@ describe("resolved image snapshot tabs", () => {
     })
   })
 
+  it("resolved_open_invalidates_a_generic_open_before_path_resolution", async () => {
+    let resolveOlder: ((value: string) => void) | null = null
+    mockedApi.readFileBase64.mockImplementationOnce(
+      () => new Promise((resolve) => (resolveOlder = resolve))
+    )
+    renderResolvedHarness()
+
+    let olderSettle: OpenFileSettleResult | undefined
+    await act(async () => {
+      void capture.openFilePreview("/repo/images/a.png").then((result) => {
+        olderSettle = result
+      })
+      capture.openResolvedImagePreview(resolvedInput())
+      await Promise.resolve()
+    })
+
+    expect(capture.fileTabs).toHaveLength(1)
+    expect(capture.fileTabs[0]).toMatchObject({
+      content: "data:image/png;base64,c25hcHNob3Q=",
+      loading: false,
+      snapshotSource: resolvedInput().source,
+    })
+    expect(olderSettle).toEqual({ ok: false, reason: "stale" })
+    expect(mockedApi.readFileBase64).not.toHaveBeenCalled()
+
+    if (resolveOlder) {
+      await act(async () => {
+        resolveOlder!("b2xkLXByZS1yZXNvbHZl")
+      })
+    }
+    expect(capture.fileTabs[0]).toMatchObject({
+      content: "data:image/png;base64,c25hcHNob3Q=",
+      loading: false,
+      snapshotSource: resolvedInput().source,
+    })
+  })
+
   it("invalid_resolved_input_mutates_nothing", async () => {
     renderResolvedHarness()
     await act(async () => {
@@ -4897,6 +4934,151 @@ describe("resolved image snapshot tabs", () => {
       saveError: null,
       snapshotSource: resolvedInput().source,
     })
+  })
+
+  it("snapshot_incarnation_blocks_an_older_reload_success_after_ordinary_conversion", async () => {
+    mockedApi.readFileForEdit.mockResolvedValueOnce(
+      snapshotEdit("a.ts", "ordinary-a", "a-1")
+    )
+    renderResolvedHarness()
+    await act(async () => {
+      await capture.openFilePreview("/repo/a.ts")
+    })
+
+    let resolveOlder:
+      | ((value: ReturnType<typeof snapshotEdit>) => void)
+      | null = null
+    mockedApi.readFileForEdit.mockImplementationOnce(
+      () => new Promise((resolve) => (resolveOlder = resolve))
+    )
+    await act(async () => {
+      void capture.reloadActiveFile()
+    })
+    await act(async () => {
+      capture.openResolvedImagePreview(resolvedInput({ path: "/repo/a.ts" }))
+    })
+
+    mockedApi.readFileForEdit.mockResolvedValueOnce(
+      snapshotEdit("a.ts", "newer-ordinary", "a-2")
+    )
+    await act(async () => {
+      await capture.openFilePreview("/repo/a.ts")
+    })
+    expect(
+      capture.fileTabs.find((tab) => tab.path === "/repo/a.ts")
+    ).toMatchObject({
+      content: "newer-ordinary",
+      loading: false,
+      saveState: "idle",
+      snapshotSource: undefined,
+    })
+
+    await act(async () => {
+      resolveOlder!(snapshotEdit("a.ts", "late-success", "a-late"))
+    })
+
+    expect(
+      capture.fileTabs.find((tab) => tab.path === "/repo/a.ts")
+    ).toMatchObject({
+      content: "newer-ordinary",
+      savedContent: "newer-ordinary",
+      etag: "a-2",
+      loading: false,
+      saveState: "idle",
+      snapshotSource: undefined,
+    })
+  })
+
+  it("snapshot_incarnation_blocks_an_older_reload_error_after_ordinary_conversion", async () => {
+    mockedApi.readFileForEdit.mockResolvedValueOnce(
+      snapshotEdit("a.ts", "ordinary-a", "a-1")
+    )
+    renderResolvedHarness()
+    await act(async () => {
+      await capture.openFilePreview("/repo/a.ts")
+    })
+
+    let rejectOlder: ((error: Error) => void) | null = null
+    mockedApi.readFileForEdit.mockImplementationOnce(
+      () => new Promise((_resolve, reject) => (rejectOlder = reject))
+    )
+    await act(async () => {
+      void capture.reloadActiveFile()
+    })
+    await act(async () => {
+      capture.openResolvedImagePreview(resolvedInput({ path: "/repo/a.ts" }))
+    })
+
+    mockedApi.readFileForEdit.mockResolvedValueOnce(
+      snapshotEdit("a.ts", "newer-ordinary", "a-2")
+    )
+    await act(async () => {
+      await capture.openFilePreview("/repo/a.ts")
+    })
+
+    await act(async () => {
+      rejectOlder!(new Error("late-error"))
+    })
+
+    expect(
+      capture.fileTabs.find((tab) => tab.path === "/repo/a.ts")
+    ).toMatchObject({
+      content: "newer-ordinary",
+      savedContent: "newer-ordinary",
+      etag: "a-2",
+      loading: false,
+      saveState: "idle",
+      saveError: null,
+      snapshotSource: undefined,
+    })
+  })
+
+  it("watcher_discards_a_pre_snapshot_read_after_ordinary_conversion", async () => {
+    mockedApi.readFileForEdit
+      .mockResolvedValueOnce(snapshotEdit("anchor.ts", "anchor", "anchor-1"))
+      .mockResolvedValueOnce(snapshotEdit("a.ts", "ordinary-a", "a-1"))
+    renderResolvedHarness()
+    await act(async () => {
+      await capture.openFilePreview("/repo/anchor.ts")
+      await capture.openFilePreview("/repo/a.ts")
+    })
+
+    let resolveWatch:
+      | ((value: ReturnType<typeof snapshotEdit>) => void)
+      | null = null
+    mockedApi.readFileForEdit.mockImplementationOnce(
+      () => new Promise((resolve) => (resolveWatch = resolve))
+    )
+    await act(async () => {
+      workspaceStoreMock.emitRoot("/repo", ["a.ts"])
+      await Promise.resolve()
+    })
+
+    await act(async () => {
+      capture.openResolvedImagePreview(resolvedInput({ path: "/repo/a.ts" }))
+    })
+    mockedApi.readFileForEdit.mockResolvedValueOnce(
+      snapshotEdit("a.ts", "newer-ordinary", "a-2")
+    )
+    await act(async () => {
+      await capture.openFilePreview("/repo/a.ts")
+    })
+
+    await act(async () => {
+      resolveWatch!(snapshotEdit("a.ts", "late-watch", "a-late"))
+    })
+
+    expect(
+      capture.fileTabs.find((tab) => tab.path === "/repo/a.ts")
+    ).toMatchObject({
+      content: "newer-ordinary",
+      savedContent: "newer-ordinary",
+      etag: "a-2",
+      loading: false,
+      saveState: "idle",
+      snapshotSource: undefined,
+    })
+    expect(capture.conflictPath).toBeNull()
   })
 
   it("snapshot_is_pinned_against_hidden_content_eviction", async () => {
