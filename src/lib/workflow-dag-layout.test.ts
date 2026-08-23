@@ -174,6 +174,29 @@ describe("layoutWorkflowDag", () => {
     ])
   })
 
+  it("applies role and source order when all task indexes are null", () => {
+    const result = layoutWorkflowDag({
+      nodes: [
+        node("null-review", null, "reviewer"),
+        node("null-impl", null, "implementer"),
+        node("null-author", null, "author"),
+        node("null-impl-second", null, "implementer"),
+      ],
+      edges: [],
+      viewportWidth: 1_200,
+      direction: "ltr",
+    })
+
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.nodes.map((item) => item.nodeId)).toEqual([
+      "null-impl",
+      "null-impl-second",
+      "null-author",
+      "null-review",
+    ])
+  })
+
   it("uses the minimum width and expands the inner canvas for three siblings", () => {
     const result = layoutWorkflowDag({
       nodes: [node("a", 1, null), node("b", 2, null), node("c", 3, null)],

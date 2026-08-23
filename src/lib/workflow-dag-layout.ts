@@ -162,8 +162,9 @@ export function layoutWorkflowDag({
     indices.sort((a, b) => {
       const left = nodes[a]
       const right = nodes[b]
-      const task = taskOrder(left.task_index) - taskOrder(right.task_index)
-      if (task !== 0) return task
+      const leftTask = taskOrder(left.task_index)
+      const rightTask = taskOrder(right.task_index)
+      if (leftTask !== rightTask) return leftTask - rightTask
       const role = roleOrder(left.role) - roleOrder(right.role)
       return role !== 0 ? role : a - b
     })
