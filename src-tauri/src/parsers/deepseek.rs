@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -89,6 +90,41 @@ pub(crate) fn resolve_deepseek_sessions_root() -> PathBuf {
     )
 }
 
+/// Resolve the store visible to a DeepSeek child launched with `runtime_env`.
+/// An explicit map value replaces (or, when empty, removes) the parent value;
+/// an absent key inherits Codeg's process environment, matching the ACP spawn
+/// layer used by `build_session_runtime_env`. Returns `None` when resolving the
+/// default or a `~/` DSH_HOME would require a child home that cannot be named
+/// safely; callers must omit DeepSeek history rather than scan Codeg's profile.
+pub(crate) fn resolve_deepseek_sessions_root_for_runtime_env(
+    runtime_env: &BTreeMap<String, String>,
+) -> Option<PathBuf> {
+    if let Some(sessions_root) = crate::acp::file_system_runtime::child_env_value(
+        runtime_env,
+        "DEEPSEEK_ACP_SESSIONS_ROOT",
+        false,
+    ) {
+        return Some(PathBuf::from(sessions_root));
+    }
+
+    let dsh_home = crate::acp::file_system_runtime::child_env_value(runtime_env, "DSH_HOME", false)
+        .filter(|value| !value.to_string_lossy().trim().is_empty());
+    let dsh_home = match dsh_home {
+        Some(value) => {
+            let value = value.to_string_lossy();
+            let needs_home = value == "~" || value.starts_with("~/") || value.starts_with("~\\");
+            if needs_home {
+                let child_home = crate::acp::file_system_runtime::child_home_dir(runtime_env)?;
+                expand_home_prefix(&value, Some(&child_home))
+            } else {
+                expand_home_prefix(&value, None)
+            }
+        }
+        None => crate::acp::file_system_runtime::child_home_dir(runtime_env)?.join(".dsh"),
+    };
+    Some(dsh_home.join("sessions"))
+}
+
 fn resolve_deepseek_sessions_root_from(
     sessions_env: Option<OsString>,
     dsh_home_env: Option<OsString>,
@@ -146,6 +182,11 @@ impl DeepSeekParser {
         Self {
             base_dir: resolve_deepseek_sessions_root(),
         }
+    }
+
+    pub(crate) fn from_runtime_env(runtime_env: &BTreeMap<String, String>) -> Option<Self> {
+        resolve_deepseek_sessions_root_for_runtime_env(runtime_env)
+            .map(|base_dir| Self { base_dir })
     }
 
     /// Construct a parser pointed at an explicit sessions directory (test
@@ -530,8 +571,8 @@ fn parse_session_events(text: &str) -> SessionParse {
                     reasoning_effort: None,
                     outcome: None,
                     autonomous_origin: None,
-            generation_ms: None,
-            generation_tokens: None,
+                    generation_ms: None,
+                    generation_tokens: None,
                 });
             }
             "request/header" => {
@@ -892,6 +933,143 @@ mod tests {
         assert_eq!(
             resolve_deepseek_sessions_root_from(None, None, Some(PathBuf::from("/home/demo"))),
             PathBuf::from("/home/demo/.dsh/sessions")
+        );
+    }
+
+    #[test]
+    fn runtime_env_sessions_root_precedence_matches_child_process() {
+        let explicit = BTreeMap::from([
+            ("DSH_HOME".to_string(), "/tmp/runtime-dsh".to_string()),
+            (
+                "DEEPSEEK_ACP_SESSIONS_ROOT".to_string(),
+                "/tmp/runtime-sessions".to_string(),
+            ),
+        ]);
+        assert_eq!(
+            resolve_deepseek_sessions_root_for_runtime_env(&explicit),
+            Some(PathBuf::from("/tmp/runtime-sessions"))
+        );
+
+        let dsh_fallback = BTreeMap::from([
+            ("DEEPSEEK_ACP_SESSIONS_ROOT".to_string(), String::new()),
+            ("DSH_HOME".to_string(), "/tmp/runtime-dsh".to_string()),
+        ]);
+        assert_eq!(
+            resolve_deepseek_sessions_root_for_runtime_env(&dsh_fallback),
+            Some(PathBuf::from("/tmp/runtime-dsh/sessions"))
+        );
+
+        #[cfg(windows)]
+        let (home_key, runtime_home) = ("USERPROFILE", r"C:\runtime-home");
+        #[cfg(not(windows))]
+        let (home_key, runtime_home) = ("HOME", "/tmp/runtime-home");
+        let defaults = BTreeMap::from([
+            ("DEEPSEEK_ACP_SESSIONS_ROOT".to_string(), String::new()),
+            ("DSH_HOME".to_string(), String::new()),
+            (home_key.to_string(), runtime_home.to_string()),
+        ]);
+        let expected = PathBuf::from(runtime_home).join(".dsh").join("sessions");
+        assert_eq!(
+            resolve_deepseek_sessions_root_for_runtime_env(&defaults),
+            Some(expected)
+        );
+
+        let tilde_dsh = BTreeMap::from([
+            ("DEEPSEEK_ACP_SESSIONS_ROOT".to_string(), String::new()),
+            ("DSH_HOME".to_string(), "~/custom-dsh".to_string()),
+            (home_key.to_string(), runtime_home.to_string()),
+        ]);
+        assert_eq!(
+            resolve_deepseek_sessions_root_for_runtime_env(&tilde_dsh),
+            Some(
+                PathBuf::from(runtime_home)
+                    .join("custom-dsh")
+                    .join("sessions")
+            )
+        );
+    }
+
+    #[test]
+    fn runtime_env_sessions_root_is_unresolved_without_a_child_home() {
+        #[cfg(windows)]
+        let home_key = "USERPROFILE";
+        #[cfg(not(windows))]
+        let home_key = "HOME";
+
+        for home in ["", "relative-child-home"] {
+            let runtime_env = BTreeMap::from([
+                ("DEEPSEEK_ACP_SESSIONS_ROOT".to_string(), String::new()),
+                ("DSH_HOME".to_string(), String::new()),
+                (home_key.to_string(), home.to_string()),
+            ]);
+            assert_eq!(
+                resolve_deepseek_sessions_root_for_runtime_env(&runtime_env),
+                None
+            );
+            assert!(DeepSeekParser::from_runtime_env(&runtime_env).is_none());
+
+            let tilde_dsh = BTreeMap::from([
+                ("DEEPSEEK_ACP_SESSIONS_ROOT".to_string(), String::new()),
+                ("DSH_HOME".to_string(), "~/custom-dsh".to_string()),
+                (home_key.to_string(), home.to_string()),
+            ]);
+            assert_eq!(
+                resolve_deepseek_sessions_root_for_runtime_env(&tilde_dsh),
+                None
+            );
+        }
+
+        #[cfg(windows)]
+        {
+            let relocated_pair = BTreeMap::from([
+                ("DEEPSEEK_ACP_SESSIONS_ROOT".to_string(), String::new()),
+                ("DSH_HOME".to_string(), String::new()),
+                ("HOMEDRIVE".to_string(), "Z:".to_string()),
+                ("HOMEPATH".to_string(), r"\relocated-home".to_string()),
+            ]);
+            assert_eq!(
+                resolve_deepseek_sessions_root_for_runtime_env(&relocated_pair),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_env_explicit_roots_do_not_require_a_child_home() {
+        #[cfg(windows)]
+        let home_key = "USERPROFILE";
+        #[cfg(not(windows))]
+        let home_key = "HOME";
+        #[cfg(windows)]
+        let explicit_sessions_root = r"C:\runtime-explicit-sessions";
+        #[cfg(not(windows))]
+        let explicit_sessions_root = "/tmp/runtime-explicit-sessions";
+        #[cfg(windows)]
+        let absolute_dsh_root = r"C:\runtime-dsh";
+        #[cfg(not(windows))]
+        let absolute_dsh_root = "/tmp/runtime-dsh";
+
+        let explicit_sessions = BTreeMap::from([
+            (
+                "DEEPSEEK_ACP_SESSIONS_ROOT".to_string(),
+                explicit_sessions_root.to_string(),
+            ),
+            ("DSH_HOME".to_string(), String::new()),
+            (home_key.to_string(), String::new()),
+        ]);
+        assert_eq!(
+            resolve_deepseek_sessions_root_for_runtime_env(&explicit_sessions),
+            Some(PathBuf::from(explicit_sessions_root))
+        );
+
+        let absolute_dsh = BTreeMap::from([
+            ("DEEPSEEK_ACP_SESSIONS_ROOT".to_string(), String::new()),
+            ("DSH_HOME".to_string(), absolute_dsh_root.to_string()),
+            (home_key.to_string(), String::new()),
+        ]);
+        assert_eq!(
+            resolve_deepseek_sessions_root_for_runtime_env(&absolute_dsh),
+            Some(PathBuf::from(absolute_dsh_root).join("sessions"))
         );
     }
 

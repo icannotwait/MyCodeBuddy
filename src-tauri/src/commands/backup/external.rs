@@ -17,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 use zip::ZipArchive;
 
 use crate::app_error::AppCommandError;
-use crate::parsers::{external_transcript_sources, ExternalSource};
+use crate::parsers::ExternalSource;
 
 use super::archive::{ArchiveBuilder, ProgressFn};
 use super::restore::ConflictPolicy;
@@ -37,13 +37,14 @@ pub struct ExternalConflict {
 
 /// Pack external transcript trees into the archive. Returns whether anything
 /// was added (drives the manifest's `includes_external_transcripts`).
-pub fn add_external_sources(
+pub(crate) fn add_external_sources_with_sources(
     builder: &mut ArchiveBuilder,
+    sources: &[ExternalSource],
     cancel: &CancellationToken,
     progress: &mut ProgressFn<'_>,
 ) -> Result<bool, AppCommandError> {
     let mut packed = false;
-    for src in external_transcript_sources() {
+    for src in sources {
         if cancel.is_cancelled() {
             return Err(cancelled_error());
         }
@@ -83,11 +84,7 @@ pub fn add_external_sources(
 
 /// Scan a (plaintext) backup ZIP for external entries whose live target already
 /// exists, so the UI can surface conflicts before any write.
-pub fn scan_external_conflicts(zip_path: &Path) -> Result<Vec<ExternalConflict>, AppCommandError> {
-    scan_external_conflicts_with_sources(zip_path, &external_transcript_sources())
-}
-
-fn scan_external_conflicts_with_sources(
+pub(crate) fn scan_external_conflicts_with_sources(
     zip_path: &Path,
     sources: &[ExternalSource],
 ) -> Result<Vec<ExternalConflict>, AppCommandError> {
@@ -126,20 +123,7 @@ fn scan_external_conflicts_with_sources(
 /// back to their original CLI locations, honoring `policy`. Returns the live
 /// paths that were skipped because they already existed and overwrite was not
 /// authorized. Never overwrites a conflicting file under `SkipExisting`.
-pub fn restore_external_from_staging(
-    staged_external: &Path,
-    policy: ConflictPolicy,
-    cancel: &CancellationToken,
-) -> Result<Vec<String>, AppCommandError> {
-    restore_external_with_sources(
-        staged_external,
-        &external_transcript_sources(),
-        policy,
-        cancel,
-    )
-}
-
-fn restore_external_with_sources(
+pub(crate) fn restore_external_with_sources(
     staged_external: &Path,
     sources: &[ExternalSource],
     policy: ConflictPolicy,

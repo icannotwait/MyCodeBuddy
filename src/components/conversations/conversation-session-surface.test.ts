@@ -9,7 +9,8 @@ import { flushSync } from "react-dom"
 import { act, cleanup, render, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
-import type { EventEnvelope } from "@/lib/types"
+import type { EventEnvelope, SessionFailureRecord } from "@/lib/types"
+import type { SessionFailureAction } from "@/lib/session-failures"
 import {
   __connectionsReducerForTests,
   type ConnectionState,
@@ -485,6 +486,12 @@ type CapturedShellProps = {
   onReconnect?: () => void
   interactionLocked?: boolean
   error?: string | null
+  sessionFailures?: SessionFailureRecord[]
+  onSessionFailureAction?: (
+    action: SessionFailureAction,
+    failure: SessionFailureRecord
+  ) => void
+  onSessionFailureDismiss?: (ids: string[]) => void
   topBanner?: unknown
   onSend?: (
     draft: {
@@ -497,6 +504,7 @@ type CapturedShellProps = {
   sendClearMode?: "immediate" | "after-admission"
   sharedQueue?: SharedQueuedPrompt[]
   onSharedQueueCancel?: (queueItemId: string) => Promise<void>
+  onSharedQueueFailedDismiss?: (queueItemId: string) => void
   onForkSend?: (
     draft: {
       blocks: Array<{ type: "text"; text: string }>
@@ -617,9 +625,13 @@ const surfaceH = vi.hoisted(() => ({
   delegateAccessLoading: false,
   /** Lifecycle mock conn.error (owner shell error path). */
   connError: null as string | null,
+  isViewer: false,
+  sessionFailures: [] as SessionFailureRecord[],
+  dismissSessionFailures: vi.fn(),
   queueItems: [] as QueueItem[],
   enqueue: vi.fn(),
   cancelQueuedPrompt: vi.fn(async () => undefined),
+  dismissFailedSharedPrompt: vi.fn(),
   sharedSession: null as HarnessSharedSession | null,
   providerConnections: new Map<string, ConnectionState>(),
   reloadSignal: 0,
@@ -740,7 +752,7 @@ vi.mock("@/hooks/use-connection-lifecycle", () => ({
         status: surfaceH.connStatus,
         sessionId: null,
         connectionId: surfaceH.lifecycleConnectionId,
-        isViewer: false,
+        isViewer: surfaceH.isViewer,
         error: surfaceH.connError,
         loadError: null,
         loadErrorCode: null,
@@ -759,6 +771,7 @@ vi.mock("@/hooks/use-connection-lifecycle", () => ({
         pendingUserMessage: null,
         waitingForSubagents: null,
         claudeApiRetry: null,
+        sessionFailures: surfaceH.sessionFailures,
         agentType: "claude",
         connectedWorkingDir: "/tmp/project",
         supportsFork: surfaceH.supportsFork,
@@ -799,6 +812,8 @@ vi.mock("@/contexts/acp-connections-context", async (importOriginal) => {
       setActiveKey: vi.fn(),
       touchActivity: vi.fn(),
       cancelQueuedPrompt: surfaceH.cancelQueuedPrompt,
+      dismissFailedSharedPrompt: surfaceH.dismissFailedSharedPrompt,
+      dismissSessionFailures: surfaceH.dismissSessionFailures,
     }),
     useAcpEvent: (handler: (e: EventEnvelope) => void) => {
       surfaceH.acpEventHandlers.push(handler)
@@ -1057,12 +1072,16 @@ vi.mock("@/components/chat/conversation-shell", async () => {
         onReconnect: props.onReconnect,
         interactionLocked: props.interactionLocked,
         error: props.error ?? null,
+        sessionFailures: props.sessionFailures,
+        onSessionFailureAction: props.onSessionFailureAction,
+        onSessionFailureDismiss: props.onSessionFailureDismiss,
         topBanner: props.topBanner,
         onSend: props.onSend,
         onEnqueue: props.onEnqueue,
         sendClearMode: props.sendClearMode,
         sharedQueue: props.sharedQueue,
         onSharedQueueCancel: props.onSharedQueueCancel,
+        onSharedQueueFailedDismiss: props.onSharedQueueFailedDismiss,
         onForkSend: props.onForkSend,
         draftRestore: props.draftRestore,
         queue: props.queue,
@@ -1231,6 +1250,17 @@ function directDraft(text = "direct-now") {
   return {
     blocks: [{ type: "text" as const, text }],
     displayText: text,
+  }
+}
+
+function terminalSessionFailure(): SessionFailureRecord {
+  return {
+    id: "failure-1",
+    revision: 1,
+    category: "connection",
+    severity: "error",
+    title: "Session disconnected",
+    actions: ["retry", "login", "new_session"],
   }
 }
 
@@ -1428,6 +1458,9 @@ function resetSurfaceHarness() {
   surfaceH.delegateAccessLoading = false
   surfaceH.delegateSyncError = null
   surfaceH.connError = null
+  surfaceH.isViewer = false
+  surfaceH.sessionFailures = []
+  surfaceH.dismissSessionFailures.mockClear()
   surfaceH.refreshDelegateAccess.mockClear()
   surfaceH.removeOptimisticTurn.mockReset()
   surfaceH.removeOptimisticTurn.mockImplementation(
@@ -1447,6 +1480,7 @@ function resetSurfaceHarness() {
   surfaceH.enqueue.mockReset()
   surfaceH.cancelQueuedPrompt.mockReset()
   surfaceH.cancelQueuedPrompt.mockResolvedValue(undefined)
+  surfaceH.dismissFailedSharedPrompt.mockReset()
   surfaceH.sharedSession = null
   surfaceH.providerConnections = new Map()
   surfaceH.reloadSignal = 0
@@ -1464,6 +1498,91 @@ function resetSurfaceHarness() {
   surfaceH.supportsFork = false
   surfaceH.isDelegationChild = false
 }
+
+describe("ConversationSessionSurface session failure wiring", () => {
+  beforeEach(resetSurfaceHarness)
+  afterEach(cleanup)
+
+  it("passes live failures and owner recovery actions to ConversationShell", async () => {
+    const failure = terminalSessionFailure()
+    surfaceH.sessionFailures = [failure]
+    surfaceH.connStatus = "error"
+    surfaceH.conversations = [fullSummary(42, "in_progress")]
+
+    await act(async () => {
+      renderSurface(42)
+      await Promise.resolve()
+    })
+
+    expect(surfaceH.shellProps?.sessionFailures).toEqual([failure])
+    expect(surfaceH.shellProps?.onSessionFailureAction).toEqual(
+      expect.any(Function)
+    )
+    await act(async () => {
+      surfaceH.shellProps?.onSessionFailureAction?.("retry", failure)
+      await Promise.resolve()
+    })
+    expect(lifecycleCapture.handleReconnect).toHaveBeenCalledTimes(1)
+  })
+
+  it("shows failures to viewers with local dismiss but no owner recovery action", async () => {
+    const failure = terminalSessionFailure()
+    surfaceH.sessionFailures = [failure]
+    surfaceH.isViewer = true
+    surfaceH.connStatus = "connected"
+    surfaceH.conversations = [fullSummary(42, "in_progress")]
+
+    await act(async () => {
+      renderSurface(42)
+      await Promise.resolve()
+    })
+
+    expect(surfaceH.shellProps?.sessionFailures).toEqual([failure])
+    expect(surfaceH.shellProps?.onSessionFailureAction).toBeUndefined()
+    expect(surfaceH.shellProps?.onSessionFailureDismiss).toEqual(
+      expect.any(Function)
+    )
+    act(() => {
+      surfaceH.shellProps?.onSessionFailureDismiss?.([failure.id])
+    })
+    expect(surfaceH.dismissSessionFailures).toHaveBeenCalledWith("tab-1", [
+      failure.id,
+    ])
+  })
+})
+
+describe("ConversationSessionSurface send connection-loss race", () => {
+  beforeEach(resetSurfaceHarness)
+  afterEach(cleanup)
+
+  it("restores the MessageInput draft and rolls back the optimistic turn", async () => {
+    const failure = Object.assign(new Error("connection not found: tab-1"), {
+      code: "connection_not_found",
+    })
+    lifecycleCapture.handleSend.mockImplementation(
+      async (_draft, _mode, opts) => {
+        opts?.onSendFailed?.(failure)
+        return null
+      }
+    )
+    surfaceH.renderRealComposer = true
+    surfaceH.connStatus = "connected"
+    surfaceH.conversations = [fullSummary(42, "in_progress")]
+
+    act(() => {
+      renderSurface(42)
+    })
+    const editor = await sendDraft("keep this race draft")
+
+    await waitFor(() => expect(surfaceH.runtimeOptimisticTurns).toHaveLength(0))
+    await waitFor(() =>
+      expect(serializeDocToText(editor.state.doc)).toContain(
+        "keep this race draft"
+      )
+    )
+    expect(surfaceH.removeOptimisticTurn).toHaveBeenCalledTimes(1)
+  })
+})
 
 describe("ConversationSessionSurface authoritative shared queue", () => {
   beforeEach(resetSurfaceHarness)
@@ -1648,6 +1767,24 @@ describe("ConversationSessionSurface authoritative shared queue", () => {
     await surfaceH.shellProps?.onSharedQueueCancel?.("q2")
 
     expect(surfaceH.cancelQueuedPrompt).toHaveBeenCalledWith("tab-1", "q2")
+  })
+
+  it("wires failed shared queue dismissal through the local provider action", () => {
+    mountSharedSurfaceWithQueue([
+      {
+        ...sharedQueued("q2", 2, "m2", "recover me"),
+        state: "failed",
+        errorCode: "prompt_hydration_failed",
+      },
+    ])
+
+    surfaceH.shellProps?.onSharedQueueFailedDismiss?.("q2")
+
+    expect(surfaceH.dismissFailedSharedPrompt).toHaveBeenCalledWith(
+      "tab-1",
+      "q2"
+    )
+    expect(surfaceH.cancelQueuedPrompt).not.toHaveBeenCalled()
   })
 })
 

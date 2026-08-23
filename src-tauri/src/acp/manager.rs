@@ -5227,7 +5227,6 @@ impl ConnectionManager {
                     ));
                 }
             }
-
         }
 
         // Persist external_id whenever both conversation_id and session id
@@ -5250,8 +5249,7 @@ impl ConnectionManager {
             // sidebar with the complete summary — this also corrects a
             // Branch B upsert above that necessarily carried
             // `external_id: null`. Root-only via the helper.
-            crate::commands::conversations::emit_conversation_upsert(&emitter, &db.conn, cid)
-                .await;
+            crate::commands::conversations::emit_conversation_upsert(&emitter, &db.conn, cid).await;
         } else if cid_opt.is_some() {
             tracing::info!(
                 "[manager] send_prompt_linked: conversation linked but \

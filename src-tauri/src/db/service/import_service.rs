@@ -1,3 +1,6 @@
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
 use sea_orm::{
     ActiveModelTrait, ActiveValue::NotSet, ColumnTrait, DatabaseConnection, EntityTrait,
     QueryFilter, Set,
@@ -39,8 +42,11 @@ const ALL_PARSER_AGENTS: [AgentType; 12] = [
     AgentType::DeepSeek,
 ];
 
-fn build_parser(agent_type: AgentType) -> Box<dyn AgentParser> {
-    match agent_type {
+fn build_parser(
+    agent_type: AgentType,
+    deepseek_env: &BTreeMap<String, String>,
+) -> Option<Box<dyn AgentParser>> {
+    Some(match agent_type {
         AgentType::ClaudeCode => Box::new(ClaudeParser::new()),
         AgentType::Codex => Box::new(CodexParser::new()),
         AgentType::OpenCode => Box::new(OpenCodeParser::new()),
@@ -52,12 +58,12 @@ fn build_parser(agent_type: AgentType) -> Box<dyn AgentParser> {
         AgentType::Pi => Box::new(PiParser::new()),
         AgentType::Grok => Box::new(GrokParser::new()),
         AgentType::Cursor => Box::new(CursorParser::new()),
-        AgentType::DeepSeek => Box::new(DeepSeekParser::new()),
+        AgentType::DeepSeek => Box::new(DeepSeekParser::from_runtime_env(deepseek_env)?),
         // Custom agents' history lives in codeg's own ACP transcript.
         AgentType::Custom(_) => {
             Box::new(crate::parsers::acp_native::AcpNativeParser::new(agent_type))
         }
-    }
+    })
 }
 
 /// List every local agent's sessions — one `spawn_blocking` per parser so the
@@ -75,21 +81,27 @@ fn build_parser(agent_type: AgentType) -> Box<dyn AgentParser> {
 /// Duplicates are dropped by `(agent_type, id)`, matching
 /// `list_conversations_sync`.
 pub(crate) async fn collect_local_summaries<F>(
+    deepseek_env: BTreeMap<String, String>,
     mut on_agent_done: F,
 ) -> Vec<(AgentType, ConversationSummary)>
 where
     F: FnMut(AgentType, u32, u32, u32),
 {
     let total = ALL_PARSER_AGENTS.len() as u32;
+    let deepseek_env = Arc::new(deepseek_env);
 
     let tasks: Vec<(AgentType, tokio::task::JoinHandle<Vec<ConversationSummary>>)> =
         ALL_PARSER_AGENTS
             .into_iter()
             .map(|at| {
+                let deepseek_env = Arc::clone(&deepseek_env);
                 (
                     at,
                     tokio::task::spawn_blocking(move || {
-                        match build_parser(at).list_conversations() {
+                        let Some(parser) = build_parser(at, &deepseek_env) else {
+                            return Vec::new();
+                        };
+                        match parser.list_conversations() {
                             Ok(convs) => convs,
                             Err(e) => {
                                 tracing::error!("Error listing {} conversations: {}", at, e);
@@ -141,8 +153,14 @@ pub(crate) async fn collect_visible_local_summaries<F>(
 where
     F: FnMut(AgentType, u32, u32, u32),
 {
+    let deepseek_env = crate::commands::acp::build_agent_effective_config_env(
+        registry.database_connection(),
+        AgentType::DeepSeek,
+    )
+    .await
+    .map_err(|error| DbError::Database(sea_orm::DbErr::Custom(error.to_string())))?;
     let (guard, filter) = registry.shared_filter().await?;
-    let summaries = collect_local_summaries(on_agent_done).await;
+    let summaries = collect_local_summaries(deepseek_env, on_agent_done).await;
     let visible = filter_internal_summaries(summaries, &filter);
     drop(guard);
     Ok(visible)
@@ -387,6 +405,22 @@ mod tests {
     use super::*;
     use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
     use chrono::Utc;
+
+    #[test]
+    fn import_parser_omits_deepseek_when_child_home_is_unresolved() {
+        #[cfg(windows)]
+        let home_key = "USERPROFILE";
+        #[cfg(not(windows))]
+        let home_key = "HOME";
+        let runtime_env = BTreeMap::from([
+            ("DEEPSEEK_ACP_SESSIONS_ROOT".to_string(), String::new()),
+            ("DSH_HOME".to_string(), String::new()),
+            (home_key.to_string(), String::new()),
+        ]);
+
+        assert!(build_parser(AgentType::DeepSeek, &runtime_env).is_none());
+        assert!(build_parser(AgentType::ClaudeCode, &runtime_env).is_some());
+    }
 
     fn summary(id: &str, title: Option<&str>) -> ConversationSummary {
         ConversationSummary {

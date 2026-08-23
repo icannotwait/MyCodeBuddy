@@ -158,8 +158,9 @@ mod tauri_commands {
     pub async fn backup_scan_external_conflicts(
         src_path: String,
         passphrase: Option<String>,
+        db: State<'_, AppDatabase>,
     ) -> Result<Vec<ExternalConflict>, AppCommandError> {
-        scan_external_conflicts_core(Path::new(&src_path), passphrase.as_deref()).await
+        scan_external_conflicts_core(&db.conn, Path::new(&src_path), passphrase.as_deref()).await
     }
 
     #[tauri::command]
@@ -173,7 +174,13 @@ mod tauri_commands {
     ) -> Result<StagedRestore, AppCommandError> {
         // `db` is taken so a restore can't race in-flight DB work; the swap
         // itself happens on next startup before any connection opens.
-        let _ = &db;
+        let external_mode = external_mode.unwrap_or_default();
+        let external_sources =
+            if matches!(external_mode, ExternalRestoreMode::OriginalLocations { .. }) {
+                super::core::effective_external_transcript_sources(&db.conn).await?
+            } else {
+                Vec::new()
+            };
         let data_dir = resolve_data_dir(&app)?;
         let (op_id, cancel) = transfer.register_transfer().await;
         let emitter = EventEmitter::Tauri(app.clone());
@@ -181,7 +188,8 @@ mod tauri_commands {
             Path::new(&src_path),
             &data_dir,
             passphrase.as_deref(),
-            external_mode.unwrap_or_default(),
+            external_mode,
+            external_sources,
             &emitter,
             &op_id,
             &cancel,

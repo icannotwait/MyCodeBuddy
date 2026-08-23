@@ -1,7 +1,7 @@
 "use client"
 
 import { useCallback, useRef, useState } from "react"
-import { Paperclip, X } from "lucide-react"
+import { CircleAlert, Paperclip, X } from "lucide-react"
 import { useTranslations } from "next-intl"
 
 import type { SharedQueuedPrompt } from "@/lib/snapshot-denormalize"
@@ -9,11 +9,13 @@ import type { SharedQueuedPrompt } from "@/lib/snapshot-denormalize"
 interface SharedMessageQueueDisplayProps {
   queue: SharedQueuedPrompt[]
   onCancel: (queueItemId: string) => Promise<void>
+  onDismissFailed: (queueItemId: string) => void
 }
 
 export function SharedMessageQueueDisplay({
   queue,
   onCancel,
+  onDismissFailed,
 }: SharedMessageQueueDisplayProps) {
   const t = useTranslations("Folder.chat.messageQueue")
   const [pendingCancelIds, setPendingCancelIds] = useState<Set<string>>(
@@ -68,6 +70,16 @@ export function SharedMessageQueueDisplay({
                   </span>
                 )}
               </span>
+              {item.state === "failed" ? (
+                <span
+                  role="status"
+                  title={item.errorCode ?? undefined}
+                  className="inline-flex min-w-0 max-w-40 shrink items-center gap-1 truncate text-destructive"
+                >
+                  <CircleAlert className="size-2.5 shrink-0" aria-hidden />
+                  <span className="truncate">{item.errorCode}</span>
+                </span>
+              ) : null}
               {item.state === "queued" ? (
                 <button
                   type="button"
@@ -76,6 +88,17 @@ export function SharedMessageQueueDisplay({
                   title={t("deleteItem")}
                   aria-label={t("deleteItem")}
                   className="shrink-0 p-0.5 text-muted-foreground hover:text-foreground disabled:opacity-50"
+                >
+                  <X className="size-2.5" aria-hidden />
+                </button>
+              ) : null}
+              {item.state === "failed" ? (
+                <button
+                  type="button"
+                  onClick={() => onDismissFailed(item.queueItemId)}
+                  title={t("deleteItem")}
+                  aria-label={t("deleteItem")}
+                  className="shrink-0 p-0.5 text-muted-foreground hover:text-foreground"
                 >
                   <X className="size-2.5" aria-hidden />
                 </button>

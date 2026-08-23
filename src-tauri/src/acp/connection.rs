@@ -2170,11 +2170,33 @@ struct QueuedPermission {
     request_id: String,
     tool_call: serde_json::Value,
     options: Vec<PermissionOptionInfo>,
+    /// Codex plan-review requests have no preceding `tool_call`; keep their
+    /// synthetic seed attached to the queue card so it is published only when
+    /// the permission itself becomes visible (initially or after promotion).
+    plan_review_seed: Option<AcpEvent>,
+    /// Active parent-turn generation captured when the plan-review request
+    /// reached the handler. `None` is invalid for a plan review and causes
+    /// admission to fail closed; ordinary permissions leave this unset.
+    plan_review_turn_generation: Option<u64>,
+}
+
+impl QueuedPermission {
+    fn plan_review_tool_call_id(&self) -> Option<&str> {
+        match self.plan_review_seed.as_ref() {
+            Some(AcpEvent::ToolCall { tool_call_id, .. }) => Some(tool_call_id),
+            _ => None,
+        }
+    }
 }
 
 struct ResolvedPermission {
     answered: bool,
     next: Option<QueuedPermission>,
+}
+
+struct DrainedPermissions {
+    visible_request_id: Option<String>,
+    published_plan_review_tool_call_ids: HashSet<String>,
 }
 
 /// Responder ownership and the single visible-card projection share one lock.
@@ -2183,6 +2205,10 @@ struct ResolvedPermission {
 struct PermissionQueue<R = PendingPermission> {
     responders: HashMap<String, R>,
     showing: Option<String>,
+    /// Every plan-review seed actually published during the current turn.
+    /// Answering its permission deliberately does not remove it: Codex's
+    /// sparse terminal update may race the later terminal drain.
+    published_plan_review_tool_call_ids: HashSet<String>,
     waiting: VecDeque<QueuedPermission>,
 }
 
@@ -2191,6 +2217,7 @@ impl<R> Default for PermissionQueue<R> {
         Self {
             responders: HashMap::new(),
             showing: None,
+            published_plan_review_tool_call_ids: HashSet::new(),
             waiting: VecDeque::new(),
         }
     }
@@ -2201,6 +2228,10 @@ impl<R: PermissionResponder> PermissionQueue<R> {
         self.responders.insert(card.request_id.clone(), responder);
         if self.showing.is_none() {
             self.showing = Some(card.request_id.clone());
+            if let Some(tool_call_id) = card.plan_review_tool_call_id() {
+                self.published_plan_review_tool_call_ids
+                    .insert(tool_call_id.to_string());
+            }
             Some(card)
         } else {
             self.waiting.push_back(card);
@@ -2219,6 +2250,13 @@ impl<R: PermissionResponder> PermissionQueue<R> {
         if self.showing.as_deref() == Some(request_id) {
             let next = self.waiting.pop_front();
             self.showing = next.as_ref().map(|card| card.request_id.clone());
+            if let Some(tool_call_id) = next
+                .as_ref()
+                .and_then(QueuedPermission::plan_review_tool_call_id)
+            {
+                self.published_plan_review_tool_call_ids
+                    .insert(tool_call_id.to_string());
+            }
             ResolvedPermission {
                 answered: true,
                 next,
@@ -2232,12 +2270,17 @@ impl<R: PermissionResponder> PermissionQueue<R> {
         }
     }
 
-    fn drain(&mut self) -> Option<String> {
+    fn drain(&mut self) -> DrainedPermissions {
         for (_, pending) in self.responders.drain() {
             pending.respond_cancelled();
         }
         self.waiting.clear();
-        self.showing.take()
+        DrainedPermissions {
+            visible_request_id: self.showing.take(),
+            published_plan_review_tool_call_ids: std::mem::take(
+                &mut self.published_plan_review_tool_call_ids,
+            ),
+        }
     }
 
     fn waiting_len(&self) -> usize {
@@ -2257,6 +2300,43 @@ async fn permission_log_scope(state: &Arc<RwLock<SessionState>>) -> String {
     }
 }
 
+async fn publish_visible_permission_card(
+    state: &Arc<RwLock<SessionState>>,
+    emitter: &EventEmitter,
+    card: QueuedPermission,
+    queued: u32,
+) {
+    let QueuedPermission {
+        request_id,
+        tool_call,
+        options,
+        plan_review_seed,
+        plan_review_turn_generation: _,
+    } = card;
+    if let Some(seed) = plan_review_seed {
+        emit_with_state(state, emitter, seed).await;
+    }
+    emit_with_state(
+        state,
+        emitter,
+        AcpEvent::PermissionRequest {
+            request_id,
+            tool_call,
+            options,
+            queued,
+        },
+    )
+    .await;
+}
+
+fn plan_review_turn_matches(
+    turn_in_flight: bool,
+    active_generation: Option<u64>,
+    request_generation: Option<u64>,
+) -> bool {
+    turn_in_flight && request_generation.is_some() && request_generation == active_generation
+}
+
 async fn admit_permission(
     perms: &PendingPermissions,
     state: &Arc<RwLock<SessionState>>,
@@ -2267,8 +2347,30 @@ async fn admit_permission(
     // Keeping admission and publication in one critical section prevents a
     // concurrent drain from leaving a visible card with no live responder.
     let mut queue = perms.lock().await;
-    let scope = permission_log_scope(state).await;
     let request_id = card.request_id.clone();
+    // Plan review's synthetic ToolCall and permission card are both scoped to
+    // the exact parent turn observed when the request reached the handler. If
+    // terminal drain won this queue lock, or a newer prompt already reused the
+    // boolean in-flight flag, reject the old request by generation and publish
+    // neither half of the card. Ordinary permissions keep their existing
+    // admission behavior.
+    if card.plan_review_seed.is_some() {
+        let expected_generation = card.plan_review_turn_generation;
+        let (turn_in_flight, active_generation) = {
+            let state = state.read().await;
+            (state.turn_in_flight, state.active_turn_generation)
+        };
+        if !plan_review_turn_matches(turn_in_flight, active_generation, expected_generation) {
+            tracing::info!(
+                expected_generation = ?expected_generation,
+                active_generation = ?active_generation,
+                "[ACP] stale plan-review permission {request_id} cancelled after turn change"
+            );
+            responder.respond_cancelled();
+            return;
+        }
+    }
+    let scope = permission_log_scope(state).await;
     match queue.admit(responder, card) {
         Some(card) => {
             tracing::info!(
@@ -2276,17 +2378,7 @@ async fn admit_permission(
                 card.request_id,
                 queue.waiting_len()
             );
-            emit_with_state(
-                state,
-                emitter,
-                AcpEvent::PermissionRequest {
-                    request_id: card.request_id,
-                    tool_call: card.tool_call,
-                    options: card.options,
-                    queued: 0,
-                },
-            )
-            .await;
+            publish_visible_permission_card(state, emitter, card, 0).await;
             tool_watchdog_pause_permission(state, emitter).await;
         }
         None => {
@@ -2327,17 +2419,7 @@ async fn resolve_permission(
             "[ACP] permission {} promoted {scope} after {request_id} (waiting={depth})",
             card.request_id
         );
-        emit_with_state(
-            state,
-            emitter,
-            AcpEvent::PermissionRequest {
-                request_id: card.request_id,
-                tool_call: card.tool_call,
-                options: card.options,
-                queued: depth as u32,
-            },
-        )
-        .await;
+        publish_visible_permission_card(state, emitter, card, depth as u32).await;
     }
     // Promotion precedes resolution. Both reducers clear by request id, so the
     // trailing old-id resolution cannot erase the newly promoted card.
@@ -2374,8 +2456,55 @@ async fn drain_permissions_locked(
     state: &Arc<RwLock<SessionState>>,
     emitter: &EventEmitter,
 ) {
-    if let Some(request_id) = queue.drain() {
+    let drained = queue.drain();
+    if let Some(request_id) = drained.visible_request_id.as_ref() {
         tracing::info!("[ACP] permission {request_id} cancelled by drain");
+    }
+
+    // Published plan-review seeds stay tracked after the user answers because
+    // Codex's sparse terminal update can race this terminal drain. Settle only
+    // seeds that are still live/pending; a provider-completed/failed seed wins,
+    // and waiting seeds are absent because they were never published.
+    let mut unsettled_plan_reviews = {
+        let state = state.read().await;
+        drained
+            .published_plan_review_tool_call_ids
+            .into_iter()
+            .filter(|tool_call_id| {
+                state
+                    .active_tool_calls
+                    .get(tool_call_id)
+                    .is_some_and(|tool| {
+                        matches!(
+                            &tool.status,
+                            crate::acp::session_state::ToolCallStatus::Pending
+                                | crate::acp::session_state::ToolCallStatus::InProgress
+                        )
+                    })
+            })
+            .collect::<Vec<_>>()
+    };
+    unsettled_plan_reviews.sort();
+    for tool_call_id in unsettled_plan_reviews {
+        emit_with_state(
+            state,
+            emitter,
+            AcpEvent::ToolCallUpdate {
+                tool_call_id,
+                title: None,
+                status: Some("failed".into()),
+                content: None,
+                raw_input: None,
+                raw_output: Some("plan_review_cancelled".into()),
+                raw_output_append: None,
+                locations: None,
+                meta: None,
+                images: None,
+            },
+        )
+        .await;
+    }
+    if let Some(request_id) = drained.visible_request_id {
         emit_with_state(state, emitter, AcpEvent::PermissionResolved { request_id }).await;
     }
     tool_watchdog_resume(state).await;
@@ -5152,6 +5281,7 @@ async fn run_connection(
                         &emitter_inner,
                         &perms,
                         &perm_cwd,
+                        agent_type,
                         req,
                         responder,
                     )
@@ -5587,31 +5717,18 @@ async fn run_connection(
                 } else {
                     None
                 };
-            if delegate_injection.is_some() {
+            {
+                let companion = delegate_injection
+                    .as_ref()
+                    .map(|injected| (injected.token.as_str(), injected.feedback_available));
                 let mut s = state.write().await;
-                // Native steering is independent of the MCP companion — set it
-                // even when no codeg-mcp is injected (it's exactly the channel
-                // that needs no tool; OpenClaw-style `supports_mcp: false`
-                // agents could ship it someday).
-                s.native_steering_available = native_steering_available;
-                s.neutral_goal_channel = neutral_goal_channel;
-                // The vocabulary is decided HERE for every adapter, advertising
-                // or not — this assignment is what flips it from "unknown" to
-                // known, and a client reading the snapshot before it lands must
-                // see `None` rather than a legacy pair it would latch (a claude
-                // session offering a Pause the adapter rejects).
-                let (goal_method, goal_actions) = resolve_goal_control(goal_control);
-                if let Some(method) = goal_method {
-                    s.goal_control_method = method;
-                }
-                s.goal_actions = Some(goal_actions);
-                if let Some(ref injected) = delegate_injection {
-                    s.delegation_token = Some(injected.token.clone());
-                    // The agent's actual feedback capability for this session
-                    // — the authoritative gate for submit + UI, fixed at
-                    // launch.
-                    s.feedback_tool_available = injected.feedback_available;
-                }
+                apply_initialized_connection_capabilities(
+                    &mut s,
+                    native_steering_available,
+                    neutral_goal_channel,
+                    goal_control,
+                    companion,
+                );
             }
             // Take the lease waiter out so we can wait on it after ACP session.
             let mut pending_lease = delegate_injection
@@ -6951,6 +7068,8 @@ async fn handle_elicitation_request(
                     request_id,
                     tool_call,
                     options,
+                    plan_review_seed: None,
+                    plan_review_turn_generation: None,
                 },
             )
             .await;
@@ -7063,14 +7182,15 @@ async fn handle_permission_request(
     emitter: &EventEmitter,
     perms: &PendingPermissions,
     cwd: &str,
+    agent_type: AgentType,
     req: RequestPermissionRequest,
     responder: Responder<RequestPermissionResponse>,
 ) {
     // Hidden generation has no interactive UI path: decline immediately and
     // still emit so the private-stream runner observes Interactive failure.
-    let is_hidden_generation = {
+    let (is_hidden_generation, request_turn_generation) = {
         let s = state.read().await;
-        s.purpose.is_hidden_generation()
+        (s.purpose.is_hidden_generation(), s.active_turn_generation)
     };
     if is_hidden_generation {
         let request_id = uuid::Uuid::new_v4().to_string();
@@ -7092,6 +7212,30 @@ async fn handle_permission_request(
     }
 
     let request_id = uuid::Uuid::new_v4().to_string();
+
+    // Codex Plan-mode review gate: seed the tool call codex never announced,
+    // so its later sparse `tool_call_update` (status + rawOutput only) merges
+    // into a correctly identified plan-review card. Keep the seed on the queue
+    // card: admission/promotion publishes it immediately before the matching
+    // permission while holding the queue lock, and drain drops both together.
+    // Request `_meta` is the classification source and must ride the seed for
+    // the frontend's plan-review UI. Ordinary permissions carry no seed.
+    let is_plan_review = is_codex_plan_review(agent_type, req.meta.as_ref());
+    let plan_review_seed = is_plan_review.then(|| AcpEvent::ToolCall {
+        tool_call_id: req.tool_call.tool_call_id.to_string(),
+        title: req.tool_call.fields.title.clone().unwrap_or_default(),
+        kind: "switch_mode".to_string(),
+        status: "pending".to_string(),
+        content: None,
+        raw_input: None,
+        raw_output: None,
+        locations: None,
+        meta: req
+            .meta
+            .as_ref()
+            .map(|meta| serde_json::Value::Object(meta.clone())),
+        images: None,
+    });
 
     let options: Vec<PermissionOptionInfo> =
         req.options.iter().map(map_permission_option).collect();
@@ -7137,6 +7281,12 @@ async fn handle_permission_request(
             request_id,
             tool_call: tool_call_value,
             options,
+            plan_review_seed,
+            plan_review_turn_generation: if is_plan_review {
+                request_turn_generation
+            } else {
+                None
+            },
         },
     )
     .await;
@@ -9382,8 +9532,8 @@ async fn finalize_bound_prompt_response(
     turn_timing_probe: &mut Option<(u64, String, u64)>,
     broker: Option<&crate::acp::delegation::broker::DelegationBroker>,
 ) -> Result<BoundPromptFinalization, sacp::Error> {
-    let reason = match prompt_result {
-        Ok(response) => response.stop_reason,
+    let response = match prompt_result {
+        Ok(response) => response,
         Err(error) => {
             if let Some(mut lease) = suspension.take() {
                 reject_suspension_lease(&mut lease, "suspend_prompt_response_failed");
@@ -9391,6 +9541,23 @@ async fn finalize_bound_prompt_response(
             return Err(error);
         }
     };
+    // AIR's terminal failure is carried on the prompt response rather than a
+    // session-info update. Apply it through the same SessionFailure path before
+    // TurnComplete can settle the turn's retry warnings. The adapters disguise
+    // this terminal failure as `end_turn`, so its typed error also suppresses
+    // the synthetic empty-turn diagnosis below.
+    let terminal_failure = response_session_failure(response.meta.as_ref());
+    if let Some(record) = &terminal_failure {
+        emit_with_state(
+            state,
+            emitter,
+            AcpEvent::SessionFailure {
+                record: record.clone(),
+            },
+        )
+        .await;
+    }
+    let reason = response.stop_reason;
     let bound = merge_terminal_assoc_binds(
         sid.0.as_ref(),
         terminal_assoc.as_ref(),
@@ -9410,7 +9577,14 @@ async fn finalize_bound_prompt_response(
         .await;
     }
     let raw_reason_str = stop_reason_to_str(reason);
-    let reason_str = rewrite_end_turn_if_empty(raw_reason_str, turn_had_agent_output);
+    let reason_str = if terminal_failure
+        .as_ref()
+        .is_some_and(|record| record.severity == "error")
+    {
+        raw_reason_str
+    } else {
+        rewrite_end_turn_if_empty(raw_reason_str, turn_had_agent_output)
+    };
     if reason_str == "end_turn" {
         journal_turn_span(turn_timing_probe, conn_id, &sid.0).await;
     }
@@ -12205,9 +12379,9 @@ fn classify_codex_subagent_activity(
 /// announced as a `tool_call` — the only follow-up on the wire is a
 /// `tool_call_update` carrying just a status and `rawOutput`. Without seeding a
 /// tool call from this request that update lands on an unknown id and renders as
-/// an untitled generic tool card, so `handle_permission_request` emits one.
+/// an untitled generic tool card, so `handle_permission_request` attaches one
+/// to the permission queue card for atomic publication.
 /// Gated on Codex, mirroring [`classify_codex_subagent_activity`].
-#[allow(dead_code)]
 fn is_codex_plan_review(
     agent_type: AgentType,
     meta: Option<&serde_json::Map<String, serde_json::Value>>,
@@ -12317,12 +12491,39 @@ fn resolve_goal_control(
     }
 }
 
+/// Commit the initialize-time capabilities to the session in one place.
+/// Steering and goal support belong to the ACP connection itself; only the
+/// token and feedback tool depend on a successfully injected companion.
+fn apply_initialized_connection_capabilities(
+    state: &mut SessionState,
+    native_steering_available: bool,
+    neutral_goal_channel: bool,
+    goal_control: Option<(String, Vec<String>)>,
+    companion: Option<(&str, bool)>,
+) {
+    state.native_steering_available = native_steering_available;
+    state.neutral_goal_channel = neutral_goal_channel;
+
+    // Resolve every adapter, advertising or not, from "unknown" to its final
+    // vocabulary during initialize. A pre-initialize snapshot deliberately
+    // retains `None` so clients cannot latch the legacy controls too early.
+    let (goal_method, goal_actions) = resolve_goal_control(goal_control);
+    if let Some(method) = goal_method {
+        state.goal_control_method = method;
+    }
+    state.goal_actions = Some(goal_actions);
+
+    if let Some((token, feedback_available)) = companion {
+        state.delegation_token = Some(token.to_string());
+        state.feedback_tool_available = feedback_available;
+    }
+}
+
 /// Pick the goal payload out of a `session_info_update`'s `_meta` according to
 /// the channel pinned at initialize (see [`init_advertises_goal`]): the
 /// neutral `_meta.goal` for advertising connections, the legacy
 /// `_meta.codex.goal` otherwise — never both. Pure so the either/or contract
 /// is unit-tested without the connection machinery.
-#[allow(dead_code)]
 fn session_info_goal_value(
     neutral_goal_channel: bool,
     meta: Option<&serde_json::Map<String, serde_json::Value>>,
@@ -12425,7 +12626,6 @@ fn parse_session_failure_record(value: &serde_json::Value) -> Option<SessionFail
 /// `transport_lost` error escalation ONLY here — ignoring this carrier lost
 /// the terminal record entirely, so the turn-boundary settle painted the
 /// still-dead connection as a recovered warning.
-#[allow(dead_code)]
 fn response_session_failure(
     meta: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> Option<SessionFailureRecord> {
@@ -12875,9 +13075,10 @@ async fn maybe_emit_request_usage(
     emitter: &EventEmitter,
     notification: &UntypedMessage,
 ) {
-    let Some(usage) =
-        crate::acp::request_usage::extract_request_usage(notification.method(), notification.params())
-    else {
+    let Some(usage) = crate::acp::request_usage::extract_request_usage(
+        notification.method(),
+        notification.params(),
+    ) else {
         return;
     };
     emit_with_state(
@@ -14333,32 +14534,32 @@ async fn emit_conversation_update(
                         s.active_provider_turn_id = Some(turn_id.to_string());
                     }
                 }
-                if let Some(goal) = codex_meta.get("goal") {
-                    if let Some(marker) = crate::acp::codex_goal::next_goal_marker(
-                        &mut cb_state.codex_open_goal,
-                        goal,
-                    ) {
-                        cb_state.codex_goal_seq += 1;
-                        let tool_call_id =
-                            crate::acp::codex_goal::goal_tool_call_id(cb_state.codex_goal_seq);
-                        emit_with_state(
-                            state,
-                            emitter,
-                            AcpEvent::ToolCall {
-                                tool_call_id,
-                                title: marker.title,
-                                kind: "other".to_string(),
-                                status: "completed".to_string(),
-                                content: None,
-                                raw_input: Some(marker.input_json),
-                                raw_output: Some(marker.output_json),
-                                locations: None,
-                                meta: None,
-                                images: None,
-                            },
-                        )
-                        .await;
-                    }
+            }
+            let neutral_goal_channel = state.read().await.neutral_goal_channel;
+            if let Some(goal) = session_info_goal_value(neutral_goal_channel, info.meta.as_ref()) {
+                if let Some(marker) =
+                    crate::acp::codex_goal::next_goal_marker(&mut cb_state.codex_open_goal, goal)
+                {
+                    cb_state.codex_goal_seq += 1;
+                    let tool_call_id =
+                        crate::acp::codex_goal::goal_tool_call_id(cb_state.codex_goal_seq);
+                    emit_with_state(
+                        state,
+                        emitter,
+                        AcpEvent::ToolCall {
+                            tool_call_id,
+                            title: marker.title,
+                            kind: "other".to_string(),
+                            status: "completed".to_string(),
+                            content: None,
+                            raw_input: Some(marker.input_json),
+                            raw_output: Some(marker.output_json),
+                            locations: None,
+                            meta: None,
+                            images: None,
+                        },
+                    )
+                    .await;
                 }
                 // Mirror "a goal run is open" (⟺ the last snapshot was active,
                 // see `next_goal_marker`) onto the session state, where
@@ -14616,6 +14817,8 @@ mod tests {
                 request_id: request_id.to_string(),
                 tool_call: serde_json::json!({"toolCallId": request_id}),
                 options: Vec::new(),
+                plan_review_seed: None,
+                plan_review_turn_generation: None,
             },
         )
     }
@@ -14688,7 +14891,9 @@ mod tests {
         admit_stub_permission(&mut queue, &log, "b");
         admit_stub_permission(&mut queue, &log, "c");
 
-        assert_eq!(queue.drain().as_deref(), Some("a"));
+        let drained = queue.drain();
+        assert_eq!(drained.visible_request_id.as_deref(), Some("a"));
+        assert!(drained.published_plan_review_tool_call_ids.is_empty());
         assert_eq!(queue.showing, None);
         assert_eq!(queue.waiting_len(), 0);
         let mut outcomes = log.lock().unwrap().clone();
@@ -14701,6 +14906,775 @@ mod tests {
                 ("c".into(), StubPermissionOutcome::Cancelled),
             ]
         );
+    }
+
+    #[test]
+    fn permission_queue_does_not_track_unpublished_waiting_plan_review_seed() {
+        let (mut queue, log) = stub_permission_queue();
+        admit_stub_permission(&mut queue, &log, "ordinary-visible");
+        assert!(queue
+            .admit(
+                StubPermissionResponder {
+                    request_id: "plan-waiting".into(),
+                    log: Arc::clone(&log),
+                },
+                QueuedPermission {
+                    request_id: "plan-waiting".into(),
+                    tool_call: serde_json::json!({"toolCallId": "plan-review:waiting"}),
+                    options: Vec::new(),
+                    plan_review_seed: Some(AcpEvent::ToolCall {
+                        tool_call_id: "plan-review:waiting".into(),
+                        title: "Waiting review".into(),
+                        kind: "switch_mode".into(),
+                        status: "pending".into(),
+                        content: None,
+                        raw_input: None,
+                        raw_output: None,
+                        locations: None,
+                        meta: None,
+                        images: None,
+                    }),
+                    plan_review_turn_generation: Some(1),
+                },
+            )
+            .is_none());
+        assert!(queue.published_plan_review_tool_call_ids.is_empty());
+
+        let drained = queue.drain();
+        assert!(drained.published_plan_review_tool_call_ids.is_empty());
+    }
+
+    #[test]
+    fn plan_review_generation_fence_requires_exact_present_active_generation() {
+        assert!(plan_review_turn_matches(true, Some(7), Some(7)));
+        assert!(!plan_review_turn_matches(false, Some(7), Some(7)));
+        assert!(!plan_review_turn_matches(true, Some(8), Some(7)));
+        assert!(!plan_review_turn_matches(true, None, Some(7)));
+        assert!(!plan_review_turn_matches(true, Some(7), None));
+        assert!(!plan_review_turn_matches(true, None, None));
+    }
+
+    struct PermissionRequestProbeAgent {
+        request: RequestPermissionRequest,
+        response_completed: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl sacp::ConnectTo<Client> for PermissionRequestProbeAgent {
+        async fn connect_to(self, client: impl sacp::ConnectTo<Agent>) -> Result<(), sacp::Error> {
+            Agent
+                .builder()
+                .connect_with(client, async move |cx: ConnectionTo<Client>| {
+                    let result = cx.send_request_to(Client, self.request).block_task().await;
+                    self.response_completed
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    result?;
+                    Ok(())
+                })
+                .await
+        }
+    }
+
+    fn permission_request_with_meta(meta: Option<Meta>) -> RequestPermissionRequest {
+        RequestPermissionRequest::new(
+            SessionId::new("session-plan-review"),
+            sacp::schema::ToolCallUpdate::new(
+                "plan-review:item-7",
+                sacp::schema::ToolCallUpdateFields::new()
+                    .title("Review implementation plan".to_string())
+                    .kind(sacp::schema::ToolKind::SwitchMode)
+                    .status(sacp::schema::ToolCallStatus::Pending)
+                    .raw_input(serde_json::json!({"plan": "Implement the approved design"})),
+            ),
+            vec![PermissionOption::new(
+                "implement_plan",
+                "Implement plan",
+                PermissionOptionKind::AllowOnce,
+            )],
+        )
+        .meta(meta)
+    }
+
+    async fn run_permission_request_through_handler(
+        agent_type: AgentType,
+        request: RequestPermissionRequest,
+    ) -> Vec<std::sync::Arc<crate::acp::types::EventEnvelope>> {
+        let state = Arc::new(RwLock::new(SessionState::new(
+            "conn-plan-review".into(),
+            agent_type,
+            None,
+            "test".into(),
+            None,
+        )));
+        {
+            let mut state = state.write().await;
+            state.turn_in_flight = true;
+            state.parent_turn_generation = 1;
+            state.active_turn_generation = Some(1);
+        }
+        let emitter = EventEmitter::Noop;
+        let perms: PendingPermissions =
+            Arc::new(tokio::sync::Mutex::new(PermissionQueue::default()));
+        let handler_state = Arc::clone(&state);
+        let handler_emitter = emitter.clone();
+        let handler_perms = Arc::clone(&perms);
+        let main_state = Arc::clone(&state);
+        let main_emitter = emitter.clone();
+        let main_perms = Arc::clone(&perms);
+
+        Client
+            .builder()
+            .on_receive_request(
+                async move |request: RequestPermissionRequest,
+                            responder: Responder<RequestPermissionResponse>,
+                            _cx: ConnectionTo<Agent>| {
+                    handle_permission_request(
+                        &handler_state,
+                        &handler_emitter,
+                        &handler_perms,
+                        ".",
+                        agent_type,
+                        request,
+                        responder,
+                    )
+                    .await;
+                    Ok(())
+                },
+                on_receive_request!(),
+            )
+            .connect_with(
+                PermissionRequestProbeAgent {
+                    request,
+                    response_completed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                },
+                async move |_cx: ConnectionTo<Agent>| {
+                    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                        loop {
+                            if main_state.read().await.pending_permission.is_some() {
+                                break;
+                            }
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .expect("permission request must become visible");
+                    let events = main_state
+                        .read()
+                        .await
+                        .recent_events_after(0)
+                        .expect("contiguous permission events");
+                    drain_permissions(&main_perms, &main_state, &main_emitter).await;
+                    Ok(events)
+                },
+            )
+            .await
+            .expect("permission probe connection")
+    }
+
+    #[tokio::test]
+    async fn regression_plan_review_old_generation_admission_leaves_no_seed_or_permission() {
+        let state = Arc::new(RwLock::new(SessionState::new(
+            "conn-plan-review-race".into(),
+            AgentType::Codex,
+            None,
+            "test".into(),
+            None,
+        )));
+        {
+            let mut state = state.write().await;
+            state.turn_in_flight = true;
+            state.parent_turn_generation = 1;
+            state.active_turn_generation = Some(1);
+        }
+        let emitter = EventEmitter::Noop;
+        let perms: PendingPermissions =
+            Arc::new(tokio::sync::Mutex::new(PermissionQueue::default()));
+        // Hold admission's lock until the test has drained the old turn and
+        // published TurnComplete. This deterministically makes drain win the
+        // same lock race that used to leave a plan-review seed/card zombie.
+        let queue_guard = Arc::clone(&perms).lock_owned().await;
+        let handler_entered = Arc::new(tokio::sync::Notify::new());
+        let response_completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let handler_state = Arc::clone(&state);
+        let handler_emitter = emitter.clone();
+        let handler_perms = Arc::clone(&perms);
+        let handler_entered_signal = Arc::clone(&handler_entered);
+        let main_state = Arc::clone(&state);
+        let main_emitter = emitter.clone();
+        let main_perms = Arc::clone(&perms);
+        let main_response_completed = Arc::clone(&response_completed);
+        let review_meta = meta_map(serde_json::json!({
+            "codex": {"kind": "plan_review", "planItemId": "item-7"}
+        }));
+
+        let (events, pending_was_visible, responder_completed) = Client
+            .builder()
+            .on_receive_request(
+                async move |request: RequestPermissionRequest,
+                            responder: Responder<RequestPermissionResponse>,
+                            _cx: ConnectionTo<Agent>| {
+                    handler_entered_signal.notify_one();
+                    handle_permission_request(
+                        &handler_state,
+                        &handler_emitter,
+                        &handler_perms,
+                        ".",
+                        AgentType::Codex,
+                        request,
+                        responder,
+                    )
+                    .await;
+                    Ok(())
+                },
+                on_receive_request!(),
+            )
+            .connect_with(
+                PermissionRequestProbeAgent {
+                    request: permission_request_with_meta(Some(review_meta)),
+                    response_completed,
+                },
+                async move |_cx: ConnectionTo<Agent>| {
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(1),
+                        handler_entered.notified(),
+                    )
+                    .await
+                    .expect("permission handler must reach admission");
+
+                    let mut queue_guard = queue_guard;
+                    drain_permissions_locked(&mut queue_guard, &main_state, &main_emitter).await;
+                    emit_with_state(
+                        &main_state,
+                        &main_emitter,
+                        AcpEvent::TurnComplete {
+                            session_id: "session-plan-review".into(),
+                            stop_reason: "end_turn".into(),
+                            agent_type: AgentType::Codex.to_string(),
+                            mark_awaiting_reply: false,
+                            termination_source: None,
+                            provider_turn_id: None,
+                        },
+                    )
+                    .await;
+                    // A fresh prompt starts before the old request is allowed
+                    // through admission. A boolean-only fence mistakes this
+                    // N+1 turn for the old request's N turn.
+                    {
+                        let mut state = main_state.write().await;
+                        state.turn_in_flight = true;
+                        state.parent_turn_generation = 2;
+                        state.active_turn_generation = Some(2);
+                    }
+                    drop(queue_guard);
+
+                    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                        loop {
+                            if main_response_completed.load(std::sync::atomic::Ordering::SeqCst)
+                                || main_state.read().await.pending_permission.is_some()
+                            {
+                                break;
+                            }
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .expect("admission must either cancel or publish the permission");
+
+                    let pending_was_visible = main_state.read().await.pending_permission.is_some();
+                    let events = main_state
+                        .read()
+                        .await
+                        .recent_events_after(0)
+                        .expect("contiguous race events");
+                    if pending_was_visible {
+                        drain_permissions(&main_perms, &main_state, &main_emitter).await;
+                    }
+                    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                        while !main_response_completed.load(std::sync::atomic::Ordering::SeqCst) {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .expect("responder must complete after cancellation");
+                    Ok((
+                        events,
+                        pending_was_visible,
+                        main_response_completed.load(std::sync::atomic::Ordering::SeqCst),
+                    ))
+                },
+            )
+            .await
+            .expect("permission race probe connection");
+
+        assert!(responder_completed, "stale responder must be cancelled");
+        assert!(
+            !pending_was_visible,
+            "stale permission must not be published"
+        );
+        assert!(events.iter().all(|event| !matches!(
+            event.payload,
+            AcpEvent::ToolCall { .. } | AcpEvent::PermissionRequest { .. }
+        )));
+    }
+
+    #[tokio::test]
+    async fn regression_visible_plan_review_seed_fails_before_terminal_permission_drain() {
+        let state = Arc::new(RwLock::new(SessionState::new(
+            "conn-plan-review-visible-drain".into(),
+            AgentType::Codex,
+            None,
+            "test".into(),
+            None,
+        )));
+        {
+            let mut state = state.write().await;
+            state.turn_in_flight = true;
+            state.parent_turn_generation = 1;
+            state.active_turn_generation = Some(1);
+        }
+        let emitter = EventEmitter::Noop;
+        let perms: PendingPermissions =
+            Arc::new(tokio::sync::Mutex::new(PermissionQueue::default()));
+        let response_completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let handler_state = Arc::clone(&state);
+        let handler_emitter = emitter.clone();
+        let handler_perms = Arc::clone(&perms);
+        let main_state = Arc::clone(&state);
+        let main_emitter = emitter.clone();
+        let main_perms = Arc::clone(&perms);
+        let main_response_completed = Arc::clone(&response_completed);
+        let review_meta = meta_map(serde_json::json!({
+            "codex": {"kind": "plan_review", "planItemId": "item-7"}
+        }));
+
+        let events = Client
+            .builder()
+            .on_receive_request(
+                async move |request: RequestPermissionRequest,
+                            responder: Responder<RequestPermissionResponse>,
+                            _cx: ConnectionTo<Agent>| {
+                    handle_permission_request(
+                        &handler_state,
+                        &handler_emitter,
+                        &handler_perms,
+                        ".",
+                        AgentType::Codex,
+                        request,
+                        responder,
+                    )
+                    .await;
+                    Ok(())
+                },
+                on_receive_request!(),
+            )
+            .connect_with(
+                PermissionRequestProbeAgent {
+                    request: permission_request_with_meta(Some(review_meta)),
+                    response_completed,
+                },
+                async move |_cx: ConnectionTo<Agent>| {
+                    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                        while main_state.read().await.pending_permission.is_none() {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .expect("plan-review permission must become visible");
+
+                    // Mirror terminal finalization's queue-lock ordering but
+                    // inspect the reducer state between drain and TurnComplete.
+                    let mut queue = main_perms.lock().await;
+                    drain_permissions_locked(&mut queue, &main_state, &main_emitter).await;
+                    {
+                        let state = main_state.read().await;
+                        assert!(state.pending_permission.is_none());
+                        let seed = state.active_tool_calls.get("plan-review:item-7").expect(
+                            "visible plan-review seed must remain addressable until turn end",
+                        );
+                        assert_eq!(
+                            seed.status,
+                            crate::acp::session_state::ToolCallStatus::Failed
+                        );
+                        match &seed.output {
+                            Some(crate::acp::session_state::ToolCallOutput::Text { content }) => {
+                                assert_eq!(content, "plan_review_cancelled");
+                            }
+                            other => panic!("expected stable cancellation output, got {other:?}"),
+                        }
+                    }
+                    emit_with_state(
+                        &main_state,
+                        &main_emitter,
+                        AcpEvent::TurnComplete {
+                            session_id: "session-plan-review".into(),
+                            stop_reason: "cancelled".into(),
+                            agent_type: AgentType::Codex.to_string(),
+                            mark_awaiting_reply: false,
+                            termination_source: None,
+                            provider_turn_id: None,
+                        },
+                    )
+                    .await;
+                    drop(queue);
+
+                    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                        while !main_response_completed.load(std::sync::atomic::Ordering::SeqCst) {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .expect("drain must cancel the displayed responder");
+
+                    let state = main_state.read().await;
+                    assert!(!state.turn_in_flight);
+                    assert!(state.active_tool_calls.is_empty());
+                    Ok(state
+                        .recent_events_after(0)
+                        .expect("contiguous plan-review drain events"))
+                },
+            )
+            .await
+            .expect("visible plan-review drain probe connection");
+
+        let seed_index = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    &event.payload,
+                    AcpEvent::ToolCall { tool_call_id, .. } if tool_call_id == "plan-review:item-7"
+                )
+            })
+            .expect("plan-review seed event");
+        let permission_index = events
+            .iter()
+            .position(|event| matches!(event.payload, AcpEvent::PermissionRequest { .. }))
+            .expect("permission request event");
+        let terminal_index = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    &event.payload,
+                    AcpEvent::ToolCallUpdate {
+                        tool_call_id,
+                        status: Some(status),
+                        raw_output: Some(raw_output),
+                        ..
+                    } if tool_call_id == "plan-review:item-7"
+                        && status == "failed"
+                        && raw_output == "plan_review_cancelled"
+                )
+            })
+            .expect("terminal plan-review update");
+        let resolved_index = events
+            .iter()
+            .position(|event| matches!(event.payload, AcpEvent::PermissionResolved { .. }))
+            .expect("permission resolved event");
+        let turn_complete_index = events
+            .iter()
+            .position(|event| matches!(event.payload, AcpEvent::TurnComplete { .. }))
+            .expect("turn complete event");
+        assert!(seed_index < permission_index);
+        assert!(permission_index < terminal_index);
+        assert!(terminal_index < resolved_index);
+        assert!(resolved_index < turn_complete_index);
+    }
+
+    async fn run_answered_permission_then_terminal_drain(
+        agent_type: AgentType,
+        request: RequestPermissionRequest,
+        provider_completed_tool_call_id: Option<&str>,
+    ) -> Vec<std::sync::Arc<crate::acp::types::EventEnvelope>> {
+        let state = Arc::new(RwLock::new(SessionState::new(
+            "conn-answered-plan-review-drain".into(),
+            agent_type,
+            None,
+            "test".into(),
+            None,
+        )));
+        {
+            let mut state = state.write().await;
+            state.turn_in_flight = true;
+            state.parent_turn_generation = 1;
+            state.active_turn_generation = Some(1);
+        }
+        let emitter = EventEmitter::Noop;
+        let perms: PendingPermissions =
+            Arc::new(tokio::sync::Mutex::new(PermissionQueue::default()));
+        let response_completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let handler_state = Arc::clone(&state);
+        let handler_emitter = emitter.clone();
+        let handler_perms = Arc::clone(&perms);
+        let main_state = Arc::clone(&state);
+        let main_emitter = emitter.clone();
+        let main_perms = Arc::clone(&perms);
+        let main_response_completed = Arc::clone(&response_completed);
+        let provider_completed_tool_call_id = provider_completed_tool_call_id.map(str::to_string);
+
+        Client
+            .builder()
+            .on_receive_request(
+                async move |request: RequestPermissionRequest,
+                            responder: Responder<RequestPermissionResponse>,
+                            _cx: ConnectionTo<Agent>| {
+                    handle_permission_request(
+                        &handler_state,
+                        &handler_emitter,
+                        &handler_perms,
+                        ".",
+                        agent_type,
+                        request,
+                        responder,
+                    )
+                    .await;
+                    Ok(())
+                },
+                on_receive_request!(),
+            )
+            .connect_with(
+                PermissionRequestProbeAgent {
+                    request,
+                    response_completed,
+                },
+                async move |_cx: ConnectionTo<Agent>| {
+                    let request_id =
+                        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                            loop {
+                                if let Some(pending) =
+                                    main_state.read().await.pending_permission.as_ref()
+                                {
+                                    break pending.request_id.clone();
+                                }
+                                tokio::task::yield_now().await;
+                            }
+                        })
+                        .await
+                        .expect("permission must become visible before answer");
+
+                    resolve_permission(
+                        &main_perms,
+                        &main_state,
+                        &main_emitter,
+                        request_id,
+                        "implement_plan".into(),
+                    )
+                    .await;
+                    if let Some(tool_call_id) = provider_completed_tool_call_id {
+                        emit_with_state(
+                            &main_state,
+                            &main_emitter,
+                            AcpEvent::ToolCallUpdate {
+                                tool_call_id,
+                                title: None,
+                                status: Some("completed".into()),
+                                content: None,
+                                raw_input: None,
+                                raw_output: Some("provider_completed".into()),
+                                raw_output_append: None,
+                                locations: None,
+                                meta: None,
+                                images: None,
+                            },
+                        )
+                        .await;
+                    }
+                    drain_permissions_then_emit(
+                        &main_perms,
+                        &main_state,
+                        &main_emitter,
+                        AcpEvent::TurnComplete {
+                            session_id: "session-plan-review".into(),
+                            stop_reason: "cancelled".into(),
+                            agent_type: agent_type.to_string(),
+                            mark_awaiting_reply: false,
+                            termination_source: None,
+                            provider_turn_id: None,
+                        },
+                    )
+                    .await;
+
+                    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                        while !main_response_completed.load(std::sync::atomic::Ordering::SeqCst) {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .expect("answered permission responder must complete");
+                    Ok(main_state
+                        .read()
+                        .await
+                        .recent_events_after(0)
+                        .expect("contiguous answered-drain events"))
+                },
+            )
+            .await
+            .expect("answered permission drain probe connection")
+    }
+
+    #[tokio::test]
+    async fn regression_answered_plan_review_without_provider_update_fails_on_terminal_drain() {
+        let review_meta = meta_map(serde_json::json!({
+            "codex": {"kind": "plan_review", "planItemId": "item-7"}
+        }));
+        let events = run_answered_permission_then_terminal_drain(
+            AgentType::Codex,
+            permission_request_with_meta(Some(review_meta)),
+            None,
+        )
+        .await;
+
+        let answered_index = events
+            .iter()
+            .position(|event| matches!(event.payload, AcpEvent::PermissionResolved { .. }))
+            .expect("answer must resolve the visible permission");
+        let terminal_index = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    &event.payload,
+                    AcpEvent::ToolCallUpdate {
+                        tool_call_id,
+                        status: Some(status),
+                        raw_output: Some(raw_output),
+                        ..
+                    } if tool_call_id == "plan-review:item-7"
+                        && status == "failed"
+                        && raw_output == "plan_review_cancelled"
+                )
+            })
+            .expect("terminal drain must settle the answered pending seed");
+        let turn_complete_index = events
+            .iter()
+            .position(|event| matches!(event.payload, AcpEvent::TurnComplete { .. }))
+            .expect("turn complete event");
+        assert!(answered_index < terminal_index);
+        assert!(terminal_index < turn_complete_index);
+    }
+
+    #[tokio::test]
+    async fn regression_answered_completed_plan_review_is_not_failed_again_on_drain() {
+        let review_meta = meta_map(serde_json::json!({
+            "codex": {"kind": "plan_review", "planItemId": "item-7"}
+        }));
+        let events = run_answered_permission_then_terminal_drain(
+            AgentType::Codex,
+            permission_request_with_meta(Some(review_meta)),
+            Some("plan-review:item-7"),
+        )
+        .await;
+
+        assert!(events.iter().any(|event| matches!(
+            &event.payload,
+            AcpEvent::ToolCallUpdate {
+                tool_call_id,
+                status: Some(status),
+                raw_output: Some(raw_output),
+                ..
+            } if tool_call_id == "plan-review:item-7"
+                && status == "completed"
+                && raw_output == "provider_completed"
+        )));
+        assert!(events.iter().all(|event| !matches!(
+            &event.payload,
+            AcpEvent::ToolCallUpdate {
+                status: Some(status),
+                raw_output: Some(raw_output),
+                ..
+            } if status == "failed" && raw_output == "plan_review_cancelled"
+        )));
+    }
+
+    #[tokio::test]
+    async fn regression_answered_ordinary_permission_gets_no_plan_review_terminal_update() {
+        let events = run_answered_permission_then_terminal_drain(
+            AgentType::Codex,
+            permission_request_with_meta(None),
+            None,
+        )
+        .await;
+
+        assert!(events.iter().all(|event| !matches!(
+            &event.payload,
+            AcpEvent::ToolCallUpdate {
+                raw_output: Some(raw_output),
+                ..
+            } if raw_output == "plan_review_cancelled"
+        )));
+    }
+
+    #[tokio::test]
+    async fn regression_codex_plan_review_permission_seeds_tool_call_with_request_meta() {
+        let review_meta = meta_map(serde_json::json!({
+            "codex": {"kind": "plan_review", "planItemId": "item-7"}
+        }));
+        let events = run_permission_request_through_handler(
+            AgentType::Codex,
+            permission_request_with_meta(Some(review_meta.clone())),
+        )
+        .await;
+
+        let seed_index = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    &event.payload,
+                    AcpEvent::ToolCall { tool_call_id, .. }
+                        if tool_call_id == "plan-review:item-7"
+                )
+            })
+            .expect("plan review must seed the tool call codex never announces");
+        let permission_index = events
+            .iter()
+            .position(|event| matches!(event.payload, AcpEvent::PermissionRequest { .. }))
+            .expect("permission request event");
+        assert!(seed_index < permission_index);
+        match &events[seed_index].payload {
+            AcpEvent::ToolCall {
+                title,
+                kind,
+                status,
+                raw_input,
+                raw_output,
+                meta,
+                ..
+            } => {
+                assert_eq!(title, "Review implementation plan");
+                assert_eq!(kind, "switch_mode");
+                assert_eq!(status, "pending");
+                assert_eq!(raw_input, &None);
+                assert_eq!(raw_output, &None);
+                assert_eq!(meta, &Some(serde_json::Value::Object(review_meta)));
+            }
+            other => panic!("expected seeded plan-review ToolCall, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn regression_plan_review_seed_is_codex_and_kind_scoped() {
+        let review_meta = meta_map(serde_json::json!({
+            "codex": {"kind": "plan_review", "planItemId": "item-7"}
+        }));
+        let non_codex = run_permission_request_through_handler(
+            AgentType::ClaudeCode,
+            permission_request_with_meta(Some(review_meta)),
+        )
+        .await;
+        assert!(!non_codex
+            .iter()
+            .any(|event| matches!(event.payload, AcpEvent::ToolCall { .. })));
+
+        let other_kind = meta_map(serde_json::json!({
+            "codex": {"kind": "mcp_tool_call"}
+        }));
+        let non_review = run_permission_request_through_handler(
+            AgentType::Codex,
+            permission_request_with_meta(Some(other_kind)),
+        )
+        .await;
+        assert!(!non_review
+            .iter()
+            .any(|event| matches!(event.payload, AcpEvent::ToolCall { .. })));
     }
 
     struct SuspensionLoopMockAgent {
@@ -18108,6 +19082,267 @@ mod tests {
         v.as_object().expect("object").clone()
     }
 
+    async fn emit_goal_session_info_for_test(
+        state: &Arc<RwLock<SessionState>>,
+        cb_state: &mut CodeBuddyLiveState,
+        meta: serde_json::Map<String, serde_json::Value>,
+    ) {
+        let mut raw_output_cache = ToolCallOutputCache::default();
+        emit_conversation_update(
+            state,
+            &EventEmitter::Noop,
+            AgentType::Codex,
+            SessionUpdate::SessionInfoUpdate(sacp::schema::SessionInfoUpdate::new().meta(meta)),
+            None,
+            &mut raw_output_cache,
+            cb_state,
+            None,
+        )
+        .await;
+    }
+
+    fn goal_tool_titles(
+        events: &[std::sync::Arc<crate::acp::types::EventEnvelope>],
+    ) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|event| match &event.payload {
+                AcpEvent::ToolCall { title, .. } if title.starts_with("Goal updated") => {
+                    Some(title.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn regression_session_info_uses_pinned_neutral_goal_channel_for_all_transitions() {
+        let state = Arc::new(RwLock::new(SessionState::new(
+            "conn-neutral-goal".into(),
+            AgentType::Codex,
+            None,
+            "test".into(),
+            None,
+        )));
+        state.write().await.neutral_goal_channel = true;
+        let mut cb_state = CodeBuddyLiveState::default();
+
+        // Set: a transitional adapter may publish both namespaces, but the
+        // initialize-time neutral choice must make exactly the top-level goal
+        // observable in the existing goal-card path.
+        emit_goal_session_info_for_test(
+            &state,
+            &mut cb_state,
+            meta_map(serde_json::json!({
+                "goal": {"objective": "neutral set", "status": "active"},
+                "codex": {"goal": {"objective": "legacy must be ignored", "status": "active"}}
+            })),
+        )
+        .await;
+        assert!(state.read().await.goal_active);
+
+        // Update and pause stay on the same neutral channel and update the
+        // canonical open-goal state used by goal controls.
+        emit_goal_session_info_for_test(
+            &state,
+            &mut cb_state,
+            meta_map(serde_json::json!({
+                "goal": {"objective": "neutral updated", "status": "active"}
+            })),
+        )
+        .await;
+        assert!(state.read().await.goal_active);
+        emit_goal_session_info_for_test(
+            &state,
+            &mut cb_state,
+            meta_map(serde_json::json!({
+                "goal": {"objective": "neutral updated", "status": "paused"}
+            })),
+        )
+        .await;
+        assert!(!state.read().await.goal_active);
+
+        // Clear closes the currently active goal through the same marker path.
+        emit_goal_session_info_for_test(
+            &state,
+            &mut cb_state,
+            meta_map(serde_json::json!({
+                "goal": {"objective": "neutral clear", "status": "active"}
+            })),
+        )
+        .await;
+        assert!(state.read().await.goal_active);
+        emit_goal_session_info_for_test(
+            &state,
+            &mut cb_state,
+            meta_map(serde_json::json!({"goal": null})),
+        )
+        .await;
+        assert!(!state.read().await.goal_active);
+
+        let events = state
+            .read()
+            .await
+            .recent_events_after(0)
+            .expect("contiguous goal events");
+        assert_eq!(
+            goal_tool_titles(&events),
+            vec![
+                "Goal updated (active): neutral set",
+                "Goal updated (active): neutral updated",
+                "Goal updated (paused): neutral updated",
+                "Goal updated (active): neutral clear",
+                "Goal updated (complete): neutral clear",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn regression_session_info_legacy_goal_channel_ignores_neutral_sibling() {
+        let state = Arc::new(RwLock::new(SessionState::new(
+            "conn-legacy-goal".into(),
+            AgentType::Codex,
+            None,
+            "test".into(),
+            None,
+        )));
+        state.write().await.neutral_goal_channel = false;
+        let mut cb_state = CodeBuddyLiveState::default();
+        emit_goal_session_info_for_test(
+            &state,
+            &mut cb_state,
+            meta_map(serde_json::json!({
+                "goal": {"objective": "neutral must be ignored", "status": "active"},
+                "codex": {"goal": {"objective": "legacy selected", "status": "active"}}
+            })),
+        )
+        .await;
+
+        let events = state
+            .read()
+            .await
+            .recent_events_after(0)
+            .expect("contiguous legacy goal events");
+        assert_eq!(
+            goal_tool_titles(&events),
+            vec!["Goal updated (active): legacy selected"]
+        );
+    }
+
+    #[tokio::test]
+    async fn regression_bound_prompt_applies_terminal_air_failure_before_turn_complete() {
+        let state = Arc::new(RwLock::new(SessionState::new(
+            "conn-air-response".into(),
+            AgentType::Codex,
+            None,
+            "test".into(),
+            None,
+        )));
+        emit_with_state(
+            &state,
+            &EventEmitter::Noop,
+            AcpEvent::SessionFailure {
+                record: SessionFailureRecord {
+                    id: "prompt-1:connection".into(),
+                    revision: 1,
+                    category: "connection".into(),
+                    severity: "warning".into(),
+                    title: "Reconnecting".into(),
+                    details: None,
+                    actions: Vec::new(),
+                    resolved: false,
+                },
+            },
+        )
+        .await;
+        let response_meta = meta_map(serde_json::json!({
+            "jetbrains": {"air": {
+                "version": 1,
+                "sessionFailure": {
+                    "id": "prompt-1:connection",
+                    "revision": 2,
+                    "category": "connection",
+                    "severity": "error",
+                    "title": "The connection to Codex was lost.",
+                    "actions": ["new_session"]
+                }
+            }}
+        }));
+        let response = sacp::schema::PromptResponse::new(StopReason::EndTurn).meta(response_meta);
+        let mut suspension = None;
+        let terminal_assoc = Arc::new(std::sync::Mutex::new(TerminalAssocFallback::new(false)));
+        let terminal_runtime = Arc::new(TerminalRuntime::new(
+            BTreeMap::new(),
+            test_placeholder_terminal_shell().spec,
+            adapter_for(AgentType::Codex),
+        ));
+        let perms: PendingPermissions =
+            Arc::new(tokio::sync::Mutex::new(PermissionQueue::default()));
+        let mut tracked_terminal_tool_calls = HashMap::new();
+        let mut turn_timing_probe = None;
+
+        let outcome = finalize_bound_prompt_response(
+            Ok(response),
+            &mut suspension,
+            &state,
+            &EventEmitter::Noop,
+            "conn-air-response",
+            &SessionId::new("session-air-response"),
+            AgentType::Codex,
+            false,
+            &terminal_assoc,
+            &mut tracked_terminal_tool_calls,
+            &terminal_runtime,
+            &perms,
+            false,
+            crate::acp_transcript::now_epoch_ms(),
+            &mut turn_timing_probe,
+            None,
+        )
+        .await
+        .expect("bound prompt finalization");
+        assert!(!outcome.status_restored_by_suspension);
+        assert!(!outcome.disconnect_requested);
+
+        let events = state
+            .read()
+            .await
+            .recent_events_after(0)
+            .expect("contiguous AIR response events");
+        let failure_index = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    &event.payload,
+                    AcpEvent::SessionFailure { record }
+                        if record.id == "prompt-1:connection" && record.revision == 2
+                )
+            })
+            .expect("terminal response failure event");
+        let turn_complete_index = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    &event.payload,
+                    AcpEvent::TurnComplete { stop_reason, .. } if stop_reason == "end_turn"
+                )
+            })
+            .expect("clean wire stop reason remains the turn boundary");
+        assert!(failure_index < turn_complete_index);
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event.payload, AcpEvent::Error { .. })));
+
+        let state = state.read().await;
+        let failure = state
+            .session_failures
+            .get("prompt-1:connection")
+            .expect("terminal failure in session state");
+        assert_eq!(failure.revision, 2);
+        assert_eq!(failure.severity, "error");
+        assert!(!failure.resolved);
+    }
+
     fn subagent_launch_input(
         agent_type: AgentType,
         meta: Option<&serde_json::Map<String, serde_json::Value>>,
@@ -18429,6 +19664,38 @@ mod tests {
             resolve_goal_control(None),
             (None, vec!["pause".to_string(), "clear".to_string()])
         );
+    }
+
+    #[test]
+    fn regression_initialize_capabilities_apply_without_delegate_injection() {
+        let mut state = SessionState::new(
+            "c-goal-no-companion".to_string(),
+            AgentType::ClaudeCode,
+            None,
+            "w".to_string(),
+            None,
+        );
+
+        apply_initialized_connection_capabilities(
+            &mut state,
+            true,
+            true,
+            Some((
+                "_session/goal".to_string(),
+                vec!["set".to_string(), "clear".to_string()],
+            )),
+            None,
+        );
+
+        assert!(state.native_steering_available);
+        assert!(state.neutral_goal_channel);
+        assert_eq!(state.goal_control_method, "_session/goal");
+        assert_eq!(
+            state.goal_actions,
+            Some(vec!["set".to_string(), "clear".to_string()])
+        );
+        assert_eq!(state.delegation_token, None);
+        assert!(!state.feedback_tool_available);
     }
 
     #[test]

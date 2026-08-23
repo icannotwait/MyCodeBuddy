@@ -47,7 +47,13 @@ export interface SharedQueuedPrompt {
   visibleTextTruncated: boolean
   attachmentCount: number
   submittedAt: string
-  state: "queued" | "dispatching"
+  /** `failed` is a client-retained terminal row. The broker removes failed
+   * items from its live queue, but the UI keeps the last known summary so the
+   * user's prompt and failure reason do not disappear. */
+  state: "queued" | "dispatching" | "failed"
+  errorCode?: string | null
+  /** Sequence of the latest failure-lifecycle event this client row proves. */
+  failureEventSeq?: number
 }
 
 export interface SharedActiveTurn {
@@ -56,6 +62,8 @@ export interface SharedActiveTurn {
   enqueueSeq: number
   clientMessageId: string
   stopRequested: boolean
+  /** Client-only copy of the queue summary retained while dispatching. */
+  promptSummary?: SharedQueuedPrompt | null
 }
 
 export interface SharedSessionProjectionView {

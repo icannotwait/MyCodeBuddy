@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::acp::delegation::continuation::filter_internal_continuation_turns;
 use crate::acp::delegation::continuation::store::{ContinuationStore, DbContinuationStore};
@@ -229,12 +229,32 @@ pub fn select_folder_time_fallback(
 }
 
 /// Synchronous implementation shared by list_conversations, list_folders, and get_stats.
+async fn deepseek_effective_env(
+    conn: &sea_orm::DatabaseConnection,
+    needed: bool,
+) -> Result<BTreeMap<String, String>, AppCommandError> {
+    if !needed {
+        return Ok(BTreeMap::new());
+    }
+    crate::commands::acp::build_agent_effective_config_env(conn, AgentType::DeepSeek)
+        .await
+        .map_err(|error| {
+            AppCommandError::database_error("Failed to resolve DeepSeek history environment")
+                .with_detail(error.to_string())
+        })
+}
+
+fn includes_deepseek_history(agent_type: Option<AgentType>) -> bool {
+    agent_type.is_none_or(|agent_type| agent_type == AgentType::DeepSeek)
+}
+
 fn list_conversations_sync(
     agent_type: Option<AgentType>,
     search: Option<String>,
     sort_by: Option<String>,
     folder_path: Option<String>,
     filter: &InternalSessionFilter,
+    deepseek_env: &BTreeMap<String, String>,
 ) -> Vec<ConversationSummary> {
     let mut all_rows: Vec<(AgentType, ConversationSummary)> = Vec::new();
     let mut seen_keys = HashSet::new();
@@ -251,8 +271,12 @@ fn list_conversations_sync(
         (AgentType::Pi, Box::new(PiParser::new())),
         (AgentType::Grok, Box::new(GrokParser::new())),
         (AgentType::Cursor, Box::new(CursorParser::new())),
-        (AgentType::DeepSeek, Box::new(DeepSeekParser::new())),
     ];
+    if includes_deepseek_history(agent_type) {
+        if let Some(parser) = DeepSeekParser::from_runtime_env(deepseek_env) {
+            parsers.push((AgentType::DeepSeek, Box::new(parser)));
+        }
+    }
     // Registered custom agents read back from codeg's own ACP transcripts, so
     // their sessions participate in folder grouping and stats like any other.
     for custom in crate::acp::custom_registry::all() {
@@ -345,13 +369,25 @@ pub async fn list_conversations_core(
     sort_by: Option<String>,
     folder_path: Option<String>,
 ) -> Result<Vec<ConversationSummary>, AppCommandError> {
+    let deepseek_env = deepseek_effective_env(
+        registry.database_connection(),
+        includes_deepseek_history(agent_type),
+    )
+    .await?;
     let (guard, filter) = registry.shared_filter().await.map_err(|e| {
         AppCommandError::database_error("Failed to acquire internal session filter")
             .with_detail(e.to_string())
     })?;
     tokio::task::spawn_blocking(move || {
         let _guard = guard;
-        list_conversations_sync(agent_type, search, sort_by, folder_path, &filter)
+        list_conversations_sync(
+            agent_type,
+            search,
+            sort_by,
+            folder_path,
+            &filter,
+            &deepseek_env,
+        )
     })
     .await
     .map_err(|e| {
@@ -385,6 +421,11 @@ pub async fn get_conversation_core(
     agent_type: AgentType,
     conversation_id: String,
 ) -> Result<ConversationDetail, AppCommandError> {
+    let deepseek_env = deepseek_effective_env(
+        registry.database_connection(),
+        agent_type == AgentType::DeepSeek,
+    )
+    .await?;
     let (guard, filter) = registry.shared_filter().await.map_err(|e| {
         AppCommandError::database_error("Failed to acquire internal session filter")
             .with_detail(e.to_string())
@@ -403,7 +444,12 @@ pub async fn get_conversation_core(
             AgentType::Pi => Box::new(PiParser::new()),
             AgentType::Grok => Box::new(GrokParser::new()),
             AgentType::Cursor => Box::new(CursorParser::new()),
-            AgentType::DeepSeek => Box::new(DeepSeekParser::new()),
+            AgentType::DeepSeek => Box::new(
+                DeepSeekParser::from_runtime_env(&deepseek_env).ok_or_else(|| {
+                    AppCommandError::not_found("DeepSeek conversation history is unavailable")
+                        .with_detail("the DeepSeek child home cannot be resolved")
+                })?,
+            ),
             // Custom ACP agents have no native store to reverse-engineer;
             // their history is codeg's own ACP transcript.
             AgentType::Custom(_) => Box::new(AcpNativeParser::new(agent_type)),
@@ -434,13 +480,15 @@ pub async fn get_conversation(
 pub async fn list_folders_core(
     registry: &InternalAgentSessionRegistry,
 ) -> Result<Vec<FolderInfo>, AppCommandError> {
+    let deepseek_env = deepseek_effective_env(registry.database_connection(), true).await?;
     let (guard, filter) = registry.shared_filter().await.map_err(|e| {
         AppCommandError::database_error("Failed to acquire internal session filter")
             .with_detail(e.to_string())
     })?;
     tokio::task::spawn_blocking(move || -> Result<Vec<FolderInfo>, AppCommandError> {
         let _guard = guard;
-        let all_conversations = list_conversations_sync(None, None, None, None, &filter);
+        let all_conversations =
+            list_conversations_sync(None, None, None, None, &filter, &deepseek_env);
         Ok(compute_folders(&all_conversations))
     })
     .await
@@ -460,13 +508,15 @@ pub async fn list_folders(
 pub async fn get_stats_core(
     registry: &InternalAgentSessionRegistry,
 ) -> Result<AgentStats, AppCommandError> {
+    let deepseek_env = deepseek_effective_env(registry.database_connection(), true).await?;
     let (guard, filter) = registry.shared_filter().await.map_err(|e| {
         AppCommandError::database_error("Failed to acquire internal session filter")
             .with_detail(e.to_string())
     })?;
     tokio::task::spawn_blocking(move || -> Result<AgentStats, AppCommandError> {
         let _guard = guard;
-        let all_conversations = list_conversations_sync(None, None, None, None, &filter);
+        let all_conversations =
+            list_conversations_sync(None, None, None, None, &filter, &deepseek_env);
         Ok(compute_stats(&all_conversations))
     })
     .await
@@ -487,13 +537,15 @@ pub async fn get_stats(
 pub async fn get_sidebar_data_core(
     registry: &InternalAgentSessionRegistry,
 ) -> Result<SidebarData, AppCommandError> {
+    let deepseek_env = deepseek_effective_env(registry.database_connection(), true).await?;
     let (guard, filter) = registry.shared_filter().await.map_err(|e| {
         AppCommandError::database_error("Failed to acquire internal session filter")
             .with_detail(e.to_string())
     })?;
     tokio::task::spawn_blocking(move || -> Result<SidebarData, AppCommandError> {
         let _guard = guard;
-        let all_conversations = list_conversations_sync(None, None, None, None, &filter);
+        let all_conversations =
+            list_conversations_sync(None, None, None, None, &filter, &deepseek_env);
         let folders = compute_folders(&all_conversations);
         let stats = compute_stats(&all_conversations);
         Ok(SidebarData { folders, stats })
@@ -1466,6 +1518,7 @@ pub async fn get_folder_conversation_core(
             let at = summary.agent_type;
             let eid = ext_id.clone();
             let db_created_at = summary.created_at;
+            let deepseek_env = deepseek_effective_env(conn, at == AgentType::DeepSeek).await?;
             // Prefer the recorded origin cwd (set when a removed task worktree's
             // conversations were re-parented) over the current folder's path — the
             // session file still carries the ORIGINAL cwd, so matching on the new
@@ -1498,7 +1551,14 @@ pub async fn get_folder_conversation_core(
                     AgentType::Pi => Box::new(PiParser::new()),
                     AgentType::Grok => Box::new(GrokParser::new()),
                     AgentType::Cursor => Box::new(CursorParser::new()),
-                    AgentType::DeepSeek => Box::new(DeepSeekParser::new()),
+                    AgentType::DeepSeek => Box::new(
+                        DeepSeekParser::from_runtime_env(&deepseek_env).ok_or_else(|| {
+                            AppCommandError::not_found(
+                                "DeepSeek conversation history is unavailable",
+                            )
+                            .with_detail("the DeepSeek child home cannot be resolved")
+                        })?,
+                    ),
                     AgentType::Custom(_) => Box::new(AcpNativeParser::new(at)),
                 };
                 match parser.get_conversation(&eid) {
@@ -3110,6 +3170,239 @@ mod tests {
     ) -> Arc<InternalAgentSessionRegistry> {
         InternalAgentSessionRegistry::new_empty_for_test(db.conn.clone(), data_dir)
             .expect("empty registry")
+    }
+
+    async fn deepseek_history_fixture(
+        env: std::collections::BTreeMap<String, String>,
+    ) -> (
+        crate::db::AppDatabase,
+        TempDir,
+        Arc<InternalAgentSessionRegistry>,
+        String,
+        String,
+    ) {
+        let db = fresh_in_memory_db().await;
+        crate::db::service::agent_setting_service::ensure_defaults(
+            &db.conn,
+            &[
+                crate::db::service::agent_setting_service::AgentDefaultInput {
+                    agent_type: AgentType::DeepSeek,
+                    registry_id: "deepseek".into(),
+                    default_sort_order: 0,
+                },
+            ],
+        )
+        .await
+        .expect("seed DeepSeek setting");
+        crate::db::service::agent_setting_service::update(
+            &db.conn,
+            AgentType::DeepSeek,
+            crate::db::service::agent_setting_service::AgentSettingsUpdate {
+                enabled: true,
+                env_json: Some(serde_json::to_string(&env).expect("serialize env")),
+                model_provider_id: None,
+            },
+        )
+        .await
+        .expect("save DeepSeek env");
+
+        let sessions_root = env
+            .get("DEEPSEEK_ACP_SESSIONS_ROOT")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                env.get("DSH_HOME")
+                    .map(|home| std::path::PathBuf::from(home).join("sessions"))
+            })
+            .expect("fixture env names a sessions root");
+        let session_id = format!("deepseek-history-{}", uuid::Uuid::new_v4());
+        let cwd = sessions_root
+            .parent()
+            .expect("sessions root parent")
+            .join("workspace")
+            .to_string_lossy()
+            .into_owned();
+        let session_dir = sessions_root.join("--fixture--").join(&session_id);
+        std::fs::create_dir_all(&session_dir).expect("create DeepSeek session dir");
+        let log = [
+            serde_json::json!({
+                "type": "session",
+                "version": 0,
+                "id": session_id.clone(),
+                "createdAt": 1_786_708_736_990_i64,
+                "cwd": cwd.clone(),
+                "delegationDepth": 0
+            })
+            .to_string(),
+            serde_json::json!({
+                "type": "user/message",
+                "seq": 1,
+                "time": 1_786_708_737_018_i64,
+                "data": {
+                    "content": [{"type": "text", "text": "effective env history"}],
+                    "source": {"kind": "user"},
+                    "role": "user",
+                    "id": "u-1"
+                }
+            })
+            .to_string(),
+        ]
+        .join("\n");
+        std::fs::write(session_dir.join("session.jsonl"), log).expect("write DeepSeek session");
+
+        let data_dir = tempfile::tempdir().expect("registry data dir");
+        let registry = inert_internal_session_registry(&db, data_dir.path()).await;
+        (db, data_dir, registry, session_id, cwd)
+    }
+
+    #[test]
+    fn deepseek_env_lookup_is_gated_by_requested_agent() {
+        assert!(!includes_deepseek_history(Some(AgentType::ClaudeCode)));
+        assert!(!includes_deepseek_history(Some(AgentType::Custom(
+            "history-gate-test"
+        ))));
+        assert!(includes_deepseek_history(Some(AgentType::DeepSeek)));
+        assert!(includes_deepseek_history(None));
+    }
+
+    #[tokio::test]
+    async fn deepseek_list_uses_dsh_home_from_agent_effective_env() {
+        let home = tempfile::tempdir().expect("DeepSeek home");
+        let (db, _data_dir, registry, session_id, _cwd) =
+            deepseek_history_fixture(std::collections::BTreeMap::from([(
+                "DSH_HOME".to_string(),
+                home.path().to_string_lossy().into_owned(),
+            )]))
+            .await;
+
+        let conversations = list_conversations_core(
+            registry.as_ref(),
+            Some(AgentType::DeepSeek),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("list DeepSeek conversations");
+
+        assert!(
+            conversations.iter().any(|summary| summary.id == session_id),
+            "saved DSH_HOME must drive parser construction; rows={conversations:?}"
+        );
+        drop(db);
+    }
+
+    #[tokio::test]
+    async fn deepseek_detail_prefers_sessions_override_from_agent_effective_env() {
+        let dsh_home = tempfile::tempdir().expect("unused DeepSeek home");
+        let sessions = tempfile::tempdir().expect("DeepSeek sessions");
+        let (db, _data_dir, registry, session_id, _cwd) =
+            deepseek_history_fixture(std::collections::BTreeMap::from([
+                (
+                    "DSH_HOME".to_string(),
+                    dsh_home.path().to_string_lossy().into_owned(),
+                ),
+                (
+                    "DEEPSEEK_ACP_SESSIONS_ROOT".to_string(),
+                    sessions.path().to_string_lossy().into_owned(),
+                ),
+            ]))
+            .await;
+
+        let detail =
+            get_conversation_core(registry.as_ref(), AgentType::DeepSeek, session_id.clone())
+                .await
+                .expect("load DeepSeek detail from sessions override");
+
+        assert_eq!(detail.summary.id, session_id);
+        assert_eq!(detail.turns.len(), 1);
+        drop(db);
+    }
+
+    #[tokio::test]
+    async fn deepseek_import_uses_agent_effective_env_parser_root() {
+        let sessions = tempfile::tempdir().expect("DeepSeek sessions");
+        let (db, _data_dir, registry, _session_id, cwd) =
+            deepseek_history_fixture(std::collections::BTreeMap::from([(
+                "DEEPSEEK_ACP_SESSIONS_ROOT".to_string(),
+                sessions.path().to_string_lossy().into_owned(),
+            )]))
+            .await;
+        let folder_id = seed_folder(&db, &cwd).await;
+
+        let (result, _) = import_service::import_local_conversations(
+            &db.conn,
+            registry.as_ref(),
+            folder_id,
+            &cwd,
+        )
+        .await
+        .expect("import DeepSeek history");
+
+        assert_eq!(result.imported, 1);
+    }
+
+    #[tokio::test]
+    async fn deepseek_history_is_omitted_when_child_home_is_unresolved() {
+        #[cfg(windows)]
+        let home_key = "USERPROFILE";
+        #[cfg(not(windows))]
+        let home_key = "HOME";
+
+        let db = fresh_in_memory_db().await;
+        crate::db::service::agent_setting_service::ensure_defaults(
+            &db.conn,
+            &[
+                crate::db::service::agent_setting_service::AgentDefaultInput {
+                    agent_type: AgentType::DeepSeek,
+                    registry_id: "deepseek".into(),
+                    default_sort_order: 0,
+                },
+            ],
+        )
+        .await
+        .expect("seed DeepSeek setting");
+        let env = std::collections::BTreeMap::from([
+            ("DEEPSEEK_ACP_SESSIONS_ROOT".to_string(), String::new()),
+            ("DSH_HOME".to_string(), String::new()),
+            (home_key.to_string(), String::new()),
+        ]);
+        crate::db::service::agent_setting_service::update(
+            &db.conn,
+            AgentType::DeepSeek,
+            crate::db::service::agent_setting_service::AgentSettingsUpdate {
+                enabled: true,
+                env_json: Some(serde_json::to_string(&env).expect("serialize env")),
+                model_provider_id: None,
+            },
+        )
+        .await
+        .expect("save DeepSeek env");
+        let data_dir = tempfile::tempdir().expect("registry data dir");
+        let registry = inert_internal_session_registry(&db, data_dir.path()).await;
+
+        let listed = list_conversations_core(
+            registry.as_ref(),
+            Some(AgentType::DeepSeek),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("an unresolved DeepSeek history root is an empty listing");
+        assert!(listed.is_empty());
+
+        let error = get_conversation_core(
+            registry.as_ref(),
+            AgentType::DeepSeek,
+            "unresolvable-deepseek-history".to_string(),
+        )
+        .await
+        .expect_err("detail cannot read an unresolved history root");
+        assert_eq!(error.code, AppErrorCode::NotFound);
+        assert_eq!(
+            error.message,
+            "DeepSeek conversation history is unavailable"
+        );
     }
 
     // ──────────────────────────────────────────────────────────────────────

@@ -72,6 +72,10 @@ pub struct InternalAgentSessionRegistry {
 }
 
 impl InternalAgentSessionRegistry {
+    pub(crate) fn database_connection(&self) -> &DatabaseConnection {
+        &self.conn
+    }
+
     /// Load persisted rows and prepare the reserved title-run root.
     pub async fn load(conn: DatabaseConnection, data_dir: &Path) -> Result<Arc<Self>, DbError> {
         let reserved_root = ensure_reserved_root(data_dir)?;

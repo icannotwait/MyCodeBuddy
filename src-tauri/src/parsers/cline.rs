@@ -294,8 +294,8 @@ impl AgentParser for ClineParser {
                         completed_at: Some(timestamp),
                         outcome: None,
                         autonomous_origin: None,
-            generation_ms: None,
-            generation_tokens: None,
+                        generation_ms: None,
+                        generation_tokens: None,
                     });
                 }
                 "user" => {
@@ -319,8 +319,8 @@ impl AgentParser for ClineParser {
                             completed_at: Some(timestamp),
                             outcome: None,
                             autonomous_origin: None,
-            generation_ms: None,
-            generation_tokens: None,
+                            generation_ms: None,
+                            generation_tokens: None,
                         });
                     }
 
@@ -339,8 +339,8 @@ impl AgentParser for ClineParser {
                             completed_at: Some(timestamp),
                             outcome: None,
                             autonomous_origin: None,
-            generation_ms: None,
-            generation_tokens: None,
+                            generation_ms: None,
+                            generation_tokens: None,
                         });
                     }
                 }

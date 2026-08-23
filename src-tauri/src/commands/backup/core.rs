@@ -36,14 +36,31 @@ pub struct BackupOptions {
     pub passphrase: Option<String>,
 }
 
-/// Everything the engine needs to assemble a backup, resolved by the caller
-/// (desktop command / web handler) so the engine stays free of env lookups.
+/// Everything the engine needs to assemble a backup, shared by the desktop
+/// command and web handler.
 pub struct BackupInputs<'a> {
     pub conn: &'a DatabaseConnection,
     pub data_dir: &'a Path,
     pub uploads_root: PathBuf,
     pub app_version: &'a str,
     pub runtime_label: &'static str,
+}
+
+pub(crate) async fn effective_external_transcript_sources(
+    conn: &DatabaseConnection,
+) -> Result<Vec<crate::parsers::ExternalSource>, AppCommandError> {
+    let deepseek_env = crate::commands::acp::build_agent_effective_config_env(
+        conn,
+        crate::models::AgentType::DeepSeek,
+    )
+    .await
+    .map_err(|error| {
+        AppCommandError::database_error("Failed to resolve external transcript environment")
+            .with_detail(error.to_string())
+    })?;
+    Ok(crate::parsers::external_transcript_sources_for_runtime_env(
+        &deepseek_env,
+    ))
 }
 
 /// Build a backup archive at `dest_path`. Emits [`BACKUP_PROGRESS_EVENT`]
@@ -85,6 +102,11 @@ pub(crate) async fn create_backup_core(
     let tokens_json = inputs.data_dir.join("tokens.json");
     let prefs_json = crate::paths::codeg_home_dir().join("preferences.json");
     let include_external = options.include_external_transcripts;
+    let external_sources = if include_external {
+        effective_external_transcript_sources(inputs.conn).await?
+    } else {
+        Vec::new()
+    };
 
     let zip_tmp_c = zip_tmp.clone();
     let db_snapshot_c = db_snapshot.clone();
@@ -122,7 +144,12 @@ pub(crate) async fn create_backup_core(
             }
             let mut manifest = manifest_template;
             let packed_external = if include_external {
-                external::add_external_sources(&mut builder, &cancel_c, &mut prog)?
+                external::add_external_sources_with_sources(
+                    &mut builder,
+                    &external_sources,
+                    &cancel_c,
+                    &mut prog,
+                )?
             } else {
                 false
             };
@@ -222,9 +249,11 @@ pub(crate) async fn inspect_backup_core(
 /// exists. Called only when the user opts to restore to original locations,
 /// so the UI can surface conflicts before any write.
 pub(crate) async fn scan_external_conflicts_core(
+    conn: &DatabaseConnection,
     src: &Path,
     passphrase: Option<&str>,
 ) -> Result<Vec<super::external::ExternalConflict>, AppCommandError> {
+    let external_sources = effective_external_transcript_sources(conn).await?;
     let src_buf = src.to_path_buf();
     let encrypted = tokio::task::spawn_blocking(move || crypto::is_encrypted(&src_buf))
         .await
@@ -232,11 +261,13 @@ pub(crate) async fn scan_external_conflicts_core(
             AppCommandError::task_execution_failed("Scan task failed").with_detail(e.to_string())
         })??;
     let (zip_path, _guard) = obtain_plaintext_zip(src, encrypted, passphrase).await?;
-    tokio::task::spawn_blocking(move || super::external::scan_external_conflicts(&zip_path))
-        .await
-        .map_err(|e| {
-            AppCommandError::task_execution_failed("Scan task failed").with_detail(e.to_string())
-        })?
+    tokio::task::spawn_blocking(move || {
+        super::external::scan_external_conflicts_with_sources(&zip_path, &external_sources)
+    })
+    .await
+    .map_err(|e| {
+        AppCommandError::task_execution_failed("Scan task failed").with_detail(e.to_string())
+    })?
 }
 
 /// Run `VACUUM INTO` to produce a transactionally-consistent, defragmented
@@ -384,6 +415,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn external_archive_sources_use_deepseek_agent_effective_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_disk_db(dir.path()).await;
+        crate::db::service::agent_setting_service::ensure_defaults(
+            &db.conn,
+            &[
+                crate::db::service::agent_setting_service::AgentDefaultInput {
+                    agent_type: crate::models::AgentType::DeepSeek,
+                    registry_id: "deepseek".into(),
+                    default_sort_order: 0,
+                },
+            ],
+        )
+        .await
+        .expect("seed DeepSeek setting");
+        let dsh_home = dir.path().join("ignored-dsh-home");
+        let sessions_root = dir.path().join("agent-configured-sessions");
+        let env = std::collections::BTreeMap::from([
+            (
+                "DSH_HOME".to_string(),
+                dsh_home.to_string_lossy().into_owned(),
+            ),
+            (
+                "DEEPSEEK_ACP_SESSIONS_ROOT".to_string(),
+                sessions_root.to_string_lossy().into_owned(),
+            ),
+        ]);
+        crate::db::service::agent_setting_service::update(
+            &db.conn,
+            crate::models::AgentType::DeepSeek,
+            crate::db::service::agent_setting_service::AgentSettingsUpdate {
+                enabled: true,
+                env_json: Some(serde_json::to_string(&env).unwrap()),
+                model_provider_id: None,
+            },
+        )
+        .await
+        .expect("save DeepSeek env");
+
+        let sources = effective_external_transcript_sources(&db.conn)
+            .await
+            .expect("resolve archive sources");
+        let deepseek = sources
+            .iter()
+            .find(|source| source.agent == "deepseek")
+            .expect("DeepSeek archive source");
+
+        assert_eq!(deepseek.root, sessions_root);
+    }
+
+    #[tokio::test]
+    async fn external_archive_sources_omit_unresolved_deepseek_child_home() {
+        #[cfg(windows)]
+        let home_key = "USERPROFILE";
+        #[cfg(not(windows))]
+        let home_key = "HOME";
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_disk_db(dir.path()).await;
+        crate::db::service::agent_setting_service::ensure_defaults(
+            &db.conn,
+            &[
+                crate::db::service::agent_setting_service::AgentDefaultInput {
+                    agent_type: crate::models::AgentType::DeepSeek,
+                    registry_id: "deepseek".into(),
+                    default_sort_order: 0,
+                },
+            ],
+        )
+        .await
+        .expect("seed DeepSeek setting");
+        let env = std::collections::BTreeMap::from([
+            ("DEEPSEEK_ACP_SESSIONS_ROOT".to_string(), String::new()),
+            ("DSH_HOME".to_string(), String::new()),
+            (home_key.to_string(), String::new()),
+        ]);
+        crate::db::service::agent_setting_service::update(
+            &db.conn,
+            crate::models::AgentType::DeepSeek,
+            crate::db::service::agent_setting_service::AgentSettingsUpdate {
+                enabled: true,
+                env_json: Some(serde_json::to_string(&env).unwrap()),
+                model_provider_id: None,
+            },
+        )
+        .await
+        .expect("save DeepSeek env");
+
+        let sources = effective_external_transcript_sources(&db.conn)
+            .await
+            .expect("resolve archive sources");
+        assert!(sources.iter().all(|source| source.agent != "deepseek"));
+    }
+
+    #[tokio::test]
     async fn backup_roundtrip_plaintext() {
         let dir = tempfile::tempdir().unwrap();
         let db = fresh_disk_db(dir.path()).await;
@@ -508,6 +634,7 @@ mod tests {
             restore_dir.path(),
             None,
             ExternalRestoreMode::Skip,
+            Vec::new(),
             &EventEmitter::Noop,
             "r1",
             &cancel,
@@ -563,6 +690,7 @@ mod tests {
             restore_dir.path(),
             None,
             ExternalRestoreMode::Skip,
+            Vec::new(),
             &EventEmitter::Noop,
             "e2",
             &cancel,

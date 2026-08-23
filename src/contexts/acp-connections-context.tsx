@@ -102,6 +102,7 @@ import {
   toLocalizedErrorMessage,
 } from "@/lib/app-error"
 import {
+  CONNECTION_NOT_FOUND_CODE,
   isConnectionBusy,
   isConnectionGoneError,
 } from "@/lib/connection-teardown"
@@ -747,7 +748,12 @@ type Action =
         | { type: "prompt_queue_item_failed" }
         | { type: "prompt_queue_depth_changed" }
         | { type: "shared_turn_settled" }
-      >
+      > & { seq: number }
+    }
+  | {
+      type: "DISMISS_FAILED_SHARED_PROMPT"
+      contextKey: string
+      queueItemId: string
     }
   | { type: "CONNECTION_REMOVED"; contextKey: string }
   | { type: "REMOVE_ALL" }
@@ -1934,6 +1940,10 @@ function reduceSingleAction(
             queue: shared.queue.filter(
               (item) => item.queueItemId !== event.queue_item_id
             ),
+            activeTurn:
+              shared.activeTurn?.queueItemId === event.queue_item_id
+                ? { ...shared.activeTurn, promptSummary: null }
+                : shared.activeTurn,
           }
           break
         }
@@ -1941,39 +1951,126 @@ function reduceSingleAction(
           const event = action.event as Extract<
             AcpEvent,
             { type: "prompt_queue_item_failed" }
-          >
+          > & { seq: number }
+          const failedItem =
+            shared.queue.find(
+              (item) => item.queueItemId === event.queue_item_id
+            ) ??
+            (shared.activeTurn?.queueItemId === event.queue_item_id
+              ? shared.activeTurn.promptSummary
+              : null)
+          if (!failedItem) return state
+          const failedRow: SharedQueuedPrompt = {
+            ...failedItem,
+            state: "failed",
+            errorCode: event.error_code,
+            failureEventSeq: event.seq,
+          }
           nextShared = {
             ...shared,
-            queue: shared.queue.filter(
-              (item) => item.queueItemId !== event.queue_item_id
-            ),
+            queue: [
+              ...shared.queue.filter(
+                (item) => item.queueItemId !== event.queue_item_id
+              ),
+              failedRow,
+            ],
+            activeTurn:
+              shared.activeTurn?.queueItemId === event.queue_item_id
+                ? { ...shared.activeTurn, promptSummary: null }
+                : shared.activeTurn,
           }
           break
         }
         case "prompt_dispatch_started": {
           const turn = action.event.turn
+          const promptSummary =
+            shared.queue.find(
+              (item) => item.queueItemId === turn.queue_item_id
+            ) ?? null
           nextShared = {
             ...shared,
             queue: shared.queue.filter(
               (item) => item.queueItemId !== turn.queue_item_id
             ),
-            activeTurn: sharedTurnFromWire(turn),
+            activeTurn: {
+              ...sharedTurnFromWire(turn),
+              promptSummary,
+            },
           }
           break
         }
-        case "shared_turn_settled":
+        case "shared_turn_settled": {
           if (shared.activeTurn?.turnId !== action.event.turn_id) return state
+          const settledQueueItemId = shared.activeTurn.queueItemId
+          const existingFailedRow = shared.queue.find(
+            (item) =>
+              item.queueItemId === settledQueueItemId && item.state === "failed"
+          )
+          const synthesizedFailedRow =
+            action.event.outcome === "failed" &&
+            !existingFailedRow &&
+            shared.activeTurn.promptSummary
+              ? {
+                  ...shared.activeTurn.promptSummary,
+                  state: "failed" as const,
+                  errorCode: "shared_turn_failed",
+                  failureEventSeq: action.event.seq,
+                }
+              : null
           nextShared = {
             ...shared,
+            queue:
+              action.event.outcome === "failed"
+                ? existingFailedRow
+                  ? shared.queue.map((item) =>
+                      item === existingFailedRow
+                        ? {
+                            ...item,
+                            failureEventSeq: Math.max(
+                              item.failureEventSeq ?? 0,
+                              action.event.seq
+                            ),
+                          }
+                        : item
+                    )
+                  : synthesizedFailedRow
+                    ? [
+                        ...shared.queue.filter(
+                          (item) => item.queueItemId !== settledQueueItemId
+                        ),
+                        synthesizedFailedRow,
+                      ]
+                    : shared.queue
+                : shared.queue.filter(
+                    (item) => item.queueItemId !== settledQueueItemId
+                  ),
             activeTurn: null,
           }
           break
+        }
         case "prompt_queue_depth_changed":
           return state
       }
       if (nextShared === shared) return state
       const next = writableConnections(state, mutateUnpublished)
       next.set(action.contextKey, { ...current, sharedSession: nextShared })
+      return next
+    }
+
+    case "DISMISS_FAILED_SHARED_PROMPT": {
+      const current = state.get(action.contextKey)
+      const shared = current?.sharedSession
+      if (!current || !shared) return state
+      const queue = shared.queue.filter(
+        (item) =>
+          item.queueItemId !== action.queueItemId || item.state !== "failed"
+      )
+      if (queue.length === shared.queue.length) return state
+      const next = writableConnections(state, mutateUnpublished)
+      next.set(action.contextKey, {
+        ...current,
+        sharedSession: { ...shared, queue },
+      })
       return next
     }
 
@@ -2150,8 +2247,15 @@ function reduceSingleAction(
           ? {
               ...current.sharedSession,
               phase: action.patch.sharedSession.phase,
-              queue: action.patch.sharedSession.queue,
-              activeTurn: action.patch.sharedSession.activeTurn,
+              queue: mergeSharedQueueWithRetainedFailures(
+                current.sharedSession.queue,
+                action.patch.sharedSession.queue,
+                action.patch.eventSeq
+              ),
+              activeTurn: mergeSharedActiveTurnPromptSummary(
+                current.sharedSession.activeTurn,
+                action.patch.sharedSession.activeTurn
+              ),
               leaseExpiresAt:
                 action.patch.sharedSession.leaseExpiresAt ??
                 current.sharedSession.leaseExpiresAt,
@@ -3654,6 +3758,40 @@ function sharedQueueItemFromWire(
   }
 }
 
+function mergeSharedQueueWithRetainedFailures(
+  current: SharedQueuedPrompt[],
+  incoming: SharedQueuedPrompt[],
+  incomingEventSeq: number
+): SharedQueuedPrompt[] {
+  const incomingIds = new Set(incoming.map((item) => item.queueItemId))
+  const retainedFailures = current.filter(
+    (item) =>
+      item.state === "failed" &&
+      !incomingIds.has(item.queueItemId) &&
+      item.failureEventSeq != null &&
+      item.failureEventSeq >= incomingEventSeq
+  )
+  return retainedFailures.length > 0
+    ? [...incoming, ...retainedFailures]
+    : incoming
+}
+
+function mergeSharedActiveTurnPromptSummary(
+  current: SharedActiveTurn | null,
+  incoming: SharedActiveTurn | null
+): SharedActiveTurn | null {
+  if (
+    !current ||
+    !incoming ||
+    current.turnId !== incoming.turnId ||
+    current.queueItemId !== incoming.queueItemId ||
+    current.promptSummary === undefined
+  ) {
+    return incoming
+  }
+  return { ...incoming, promptSummary: current.promptSummary }
+}
+
 function sharedTurnFromWire(
   turn: import("@/lib/types").SharedActiveTurnProjection
 ): SharedActiveTurn {
@@ -3690,10 +3828,7 @@ function prepareMappedEnvelope(
       actions.push({ type: "STATUS_CHANGED", contextKey, status: e.status })
       break
     case "content_delta":
-      if (
-        !e.parent_tool_use_id &&
-        snapshot.generationClockStartedAt == null
-      ) {
+      if (!e.parent_tool_use_id && snapshot.generationClockStartedAt == null) {
         actions.push({
           type: "GENERATION_CLOCK_START",
           contextKey,
@@ -3715,10 +3850,7 @@ function prepareMappedEnvelope(
       }
       break
     case "thinking":
-      if (
-        !e.parent_tool_use_id &&
-        snapshot.generationClockStartedAt == null
-      ) {
+      if (!e.parent_tool_use_id && snapshot.generationClockStartedAt == null) {
         actions.push({
           type: "GENERATION_CLOCK_START",
           contextKey,
@@ -3750,6 +3882,13 @@ function prepareMappedEnvelope(
       })
       break
     case "tool_call":
+      if (snapshot.generationClockStartedAt == null) {
+        actions.push({
+          type: "GENERATION_CLOCK_START",
+          contextKey,
+          at: e.received_at ?? performance.now(),
+        })
+      }
       actions.push({
         type: "TOOL_CALL",
         contextKey,
@@ -4312,7 +4451,8 @@ function prepareMappedEnvelope(
         snapshot.generationClockStartedAt != null
           ? endedAt - snapshot.generationClockStartedAt
           : 0
-      const durationMs = e.duration_ms && e.duration_ms > 0 ? e.duration_ms : measured
+      const durationMs =
+        e.duration_ms && e.duration_ms > 0 ? e.duration_ms : measured
       actions.push({
         type: "REQUEST_USAGE",
         contextKey,
@@ -4404,6 +4544,8 @@ function onlyCursorChanged(
     before.backgroundOutstanding === after.backgroundOutstanding &&
     before.backgroundSettleSyncingSince ===
       after.backgroundSettleSyncingSince &&
+    before.sharedSession === after.sharedSession &&
+    before.sessionFailures === after.sessionFailures &&
     before.outOfTurnToolCalls === after.outOfTurnToolCalls &&
     before.isViewer === after.isViewer &&
     before.isDelegationChild === after.isDelegationChild &&
@@ -4712,6 +4854,7 @@ export interface AcpActionsValue {
   ): Promise<void>
   cancel(contextKey: string): Promise<void>
   cancelQueuedPrompt(contextKey: string, queueItemId: string): Promise<void>
+  dismissFailedSharedPrompt(contextKey: string, queueItemId: string): void
   respondPermission(
     contextKey: string,
     requestId: string,
@@ -8508,7 +8651,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
   // (conversationId, and everything at all once the entry is gone).
   const resolveReconnectRequest = useCallback(
     (contextKey: string): ConnectRequest | null => {
-      const conn = storeRef.current.connections.get(contextKey)
+      const conn = storeRef.current.connections.get(canonicalKey(contextKey))
       // Broker-owned: its lifetime is the parent's delegation_started /
       // _completed pair, and disconnecting would kill a child the user never
       // spawned. Bail before falling back to any remembered params.
@@ -8520,7 +8663,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         agentType,
         workingDir: conn?.workingDir ?? remembered?.workingDir ?? undefined,
         sessionId: conn?.sessionId ?? remembered?.sessionId ?? undefined,
-        conversationId: remembered?.conversationId,
+        conversationId: conn?.conversationId ?? remembered?.conversationId,
         delegationRouteOverride: remembered?.delegationRouteOverride,
         ownerOperationId: remembered?.ownerOperationId,
         sharedRequestId: remembered?.sharedRequestId,
@@ -8530,7 +8673,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         retryObserverDiscovery: remembered?.retryObserverDiscovery ?? false,
       }
     },
-    []
+    [canonicalKey]
   )
 
   const getReconnectInfo = useCallback(
@@ -8656,9 +8799,13 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
 
   const dismissSessionFailuresAction = useCallback(
     (contextKey: string, ids: string[]) => {
-      dispatch({ type: "DISMISS_SESSION_FAILURES", contextKey, ids })
+      dispatch({
+        type: "DISMISS_SESSION_FAILURES",
+        contextKey: canonicalKey(contextKey),
+        ids,
+      })
     },
-    [dispatch]
+    [canonicalKey, dispatch]
   )
 
   const disconnectAll = useCallback(async () => {
@@ -8746,7 +8893,11 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       }
       const key = canonicalKey(contextKey)
       const conn = storeRef.current.connections.get(key)
-      if (!conn) return null
+      if (!conn) {
+        throw Object.assign(new Error(`connection not found: ${contextKey}`), {
+          code: CONNECTION_NOT_FOUND_CODE,
+        })
+      }
       lastActivityRef.current.set(key, Date.now())
       const promptContext = opts?.promptContext ?? {
         visibleText: null,
@@ -8931,6 +9082,17 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       }
     },
     [canonicalKey, convergeSharedMutation]
+  )
+
+  const dismissFailedSharedPrompt = useCallback(
+    (contextKey: string, queueItemId: string) => {
+      dispatch({
+        type: "DISMISS_FAILED_SHARED_PROMPT",
+        contextKey: canonicalKey(contextKey),
+        queueItemId,
+      })
+    },
+    [canonicalKey, dispatch]
   )
 
   const goalControl = useCallback(
@@ -9240,6 +9402,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       setConfigOption,
       cancel,
       cancelQueuedPrompt,
+      dismissFailedSharedPrompt,
       goalControl,
       respondPermission,
       answerQuestion,
@@ -9268,6 +9431,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       setConfigOption,
       cancel,
       cancelQueuedPrompt,
+      dismissFailedSharedPrompt,
       goalControl,
       respondPermission,
       answerQuestion,

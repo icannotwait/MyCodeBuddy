@@ -139,8 +139,10 @@ describe("useConnectionLifecycle send-failure surfacing", () => {
     consoleError.mockRestore()
   })
 
-  it("invokes onSendFailed (after the toast) so the caller can settle optimistic state", async () => {
-    const error = { code: "http_error", message: "HTTP 413" }
+  it("toasts and invokes onSendFailed when the connection disappears before lookup", async () => {
+    const error = Object.assign(new Error("connection not found: ctx-1"), {
+      code: "connection_not_found",
+    })
     sendPrompt.mockRejectedValue(error)
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => {})
     const calls: string[] = []

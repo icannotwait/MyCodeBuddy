@@ -62,6 +62,7 @@ import {
   type TerminalDisconnectLatch,
 } from "@/lib/terminal-reconnect"
 import { TurnBusyError } from "@/lib/turn-busy"
+import type { SessionFailureAction } from "@/lib/session-failures"
 import { continuationFailureI18nKey } from "@/lib/continuation-waiting"
 import { consumeDelegatedChildTabIntent } from "@/lib/delegated-child-tab-intent"
 import {
@@ -1569,8 +1570,16 @@ export const ConversationSessionSurface = memo(
 
         const onSendFailed = () => {
           removeOptimisticTurn(effectiveConversationId, optimisticTurn.id)
-          if (conn.sharedSession) {
-            setSyncState(effectiveConversationId, "idle")
+          setSyncState(effectiveConversationId, "idle")
+          if (conn.sharedSession) return
+          if (fromQueueFlush) {
+            mqRequeueFront(draft, selectedModeIdArg ?? null)
+          } else {
+            promptDraftRestoreRevisionRef.current += 1
+            setPromptDraftRestore({
+              revision: promptDraftRestoreRevisionRef.current,
+              draft,
+            })
           }
         }
 
@@ -2054,6 +2063,12 @@ export const ConversationSessionSurface = memo(
       [acpActions, tabId]
     )
 
+    const handleSharedQueueFailedDismiss = useCallback(
+      (queueItemId: string) =>
+        acpActions.dismissFailedSharedPrompt(tabId, queueItemId),
+      [acpActions, tabId]
+    )
+
     const handleSetConfigOption = useCallback(
       (configId: string, valueId: string) => {
         if (interactionLocked) return
@@ -2326,6 +2341,30 @@ export const ConversationSessionSurface = memo(
       workingDirForConnection,
     ])
 
+    const handleSessionFailureAction = useCallback(
+      (action: SessionFailureAction) => {
+        switch (action) {
+          case "retry":
+            void handleReconnect()
+            break
+          case "login":
+            handleOpenAgentsSettings()
+            break
+          case "new_session":
+            handleOpenNewSession()
+            break
+        }
+      },
+      [handleOpenAgentsSettings, handleOpenNewSession, handleReconnect]
+    )
+
+    const handleSessionFailureDismiss = useCallback(
+      (ids: string[]) => {
+        acpActions.dismissSessionFailures(tabId, ids)
+      },
+      [acpActions, tabId]
+    )
+
     // Delegation child tab: adopt live ownership + kickoff before detail races.
     useEffect(() => {
       if (!delegatedOpenIntent?.liveOwnsActiveTurn) return
@@ -2534,6 +2573,13 @@ export const ConversationSessionSurface = memo(
         agentName={getAgentLabel(selectedAgent)}
         error={shellConnectionError}
         claudeApiRetry={conn.claudeApiRetry}
+        sessionFailures={conn.sessionFailures}
+        onSessionFailureAction={
+          !conn.isViewer && !interactionLocked
+            ? handleSessionFailureAction
+            : undefined
+        }
+        onSessionFailureDismiss={handleSessionFailureDismiss}
         pendingPermission={conn.pendingPermission}
         pendingQuestion={conn.pendingQuestion}
         pendingAskQuestion={conn.pendingAskQuestion}
@@ -2575,6 +2621,9 @@ export const ConversationSessionSurface = memo(
         sharedQueue={conn.sharedSession?.queue}
         onSharedQueueCancel={
           conn.sharedSession ? handleSharedQueueCancel : undefined
+        }
+        onSharedQueueFailedDismiss={
+          conn.sharedSession ? handleSharedQueueFailedDismiss : undefined
         }
         onEnqueue={conn.sharedSession ? undefined : mqEnqueue}
         onQueueReorder={conn.sharedSession ? undefined : mqReorder}

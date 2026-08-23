@@ -618,7 +618,7 @@ impl SharedSessionBroker {
             let waiting_prompts = current.waiting_prompts.len();
             let waiting_bytes = current.waiting_bytes;
             drop(current);
-            index.sessions.remove(&key);
+            index.remove_canonical_session(&key);
             index.by_connection.remove(connection_id);
             drop(index);
             self.index_epoch
@@ -1002,7 +1002,7 @@ impl SharedSessionBroker {
             let waiting_prompts = current.waiting_prompts.len();
             let waiting_bytes = current.waiting_bytes;
             drop(current);
-            index.sessions.remove(&key);
+            index.remove_canonical_session(&key);
             index.by_connection.remove(&candidate.connection_id);
             drop(index);
             self.index_epoch
@@ -2049,8 +2049,12 @@ impl SharedSessionBroker {
             {
                 return Err(SharedSessionError::GenerationStale);
             }
-            if source_key == destination_key {
-                return Ok(());
+            if let SharedSessionKey::Conversation(current_conversation_id) = &source_key {
+                return if *current_conversation_id == conversation_id {
+                    Ok(())
+                } else {
+                    Err(SharedSessionError::ConversationKeyConflict)
+                };
             }
 
             if let Some(destination) = index.sessions.get(&destination_key).cloned() {
@@ -2065,6 +2069,7 @@ impl SharedSessionBroker {
                         return Err(SharedSessionError::ConversationKeyConflict);
                     }
                     self.account_replaced_conversation_destination(&mut index, &destination_record);
+                    index.remove_aliases_for_canonical(&destination_key);
                 }
             }
 
@@ -2074,7 +2079,10 @@ impl SharedSessionBroker {
                 .insert(destination_key.clone(), source.clone());
             index
                 .by_connection
-                .insert(connection_id.to_string(), destination_key);
+                .insert(connection_id.to_string(), destination_key.clone());
+            if matches!(&source_key, SharedSessionKey::ExternalSession { .. }) {
+                index.insert_alias(source_key, destination_key);
+            }
             source_record.notify.notify_waiters();
             self.index_epoch
                 .send_modify(|epoch| *epoch = epoch.saturating_add(1));
@@ -2161,6 +2169,7 @@ impl SharedSessionBroker {
 
             if let Some(destination_record) = destination_record {
                 self.account_replaced_conversation_destination(&mut index, &destination_record);
+                index.remove_aliases_for_canonical(&destination_key);
             }
             index.sessions.remove(&source_key);
             index
@@ -2168,7 +2177,10 @@ impl SharedSessionBroker {
                 .insert(destination_key.clone(), source.clone());
             index
                 .by_connection
-                .insert(guard.connection_id.clone(), destination_key);
+                .insert(guard.connection_id.clone(), destination_key.clone());
+            if matches!(&source_key, SharedSessionKey::ExternalSession { .. }) {
+                index.insert_alias(source_key, destination_key);
+            }
             public_state.conversation_id = Some(conversation_id);
             public_state.folder_id = Some(folder_id);
             source_record.notify.notify_waiters();
@@ -2546,7 +2558,7 @@ impl SharedSessionBroker {
             let lookup = {
                 let mut index = self.index.lock().await;
                 self.ensure_accepting()?;
-                if let Some(record) = index.sessions.get(&request.key) {
+                if let Some(record) = index.record_for_key(&request.key) {
                     ReserveLookup::Existing(record.clone())
                 } else {
                     let mut initial = SharedSessionRecord::reserved(&request, 1, None);
@@ -3357,7 +3369,7 @@ impl SharedSessionBroker {
         loop {
             let record = {
                 let index = self.index.lock().await;
-                index.sessions.get(key).cloned()
+                index.record_for_key(key).cloned()
             };
             if let Some(record) = record {
                 let mut registration = record.lock().await.registration_tx.subscribe();
@@ -3530,9 +3542,10 @@ impl SharedSessionBroker {
         failed_generation: u64,
     ) -> Result<Option<SharedReserveOutcome>, SharedSessionError> {
         let mut index = self.index.lock().await;
+        let canonical_key = index.canonical_key(&request.key);
         let is_authoritative = index
             .sessions
-            .get(&request.key)
+            .get(&canonical_key)
             .is_some_and(|current| Arc::ptr_eq(current, expected_record));
         if !is_authoritative {
             return Ok(None);
@@ -3590,8 +3603,8 @@ impl SharedSessionBroker {
         index.by_connection.remove(&old_connection_id);
         index
             .by_connection
-            .insert(request.connection_id.clone(), request.key.clone());
-        index.sessions.insert(request.key.clone(), replacement);
+            .insert(request.connection_id.clone(), canonical_key.clone());
+        index.sessions.insert(canonical_key, replacement);
         self.index_epoch
             .send_modify(|epoch| *epoch = epoch.saturating_add(1));
         self.metrics.remove_active_leases(old_active_leases);
@@ -3938,17 +3951,55 @@ impl Default for BrokerLimits {
 #[derive(Default)]
 struct SharedSessionIndex {
     sessions: HashMap<SharedSessionKey, Arc<Mutex<SharedSessionRecord>>>,
+    aliases: HashMap<SharedSessionKey, SharedSessionKey>,
     by_connection: HashMap<String, SharedSessionKey>,
     replaced_connections: VecDeque<ReplacedConnectionTombstone>,
 }
 
 impl SharedSessionIndex {
+    fn insert_alias(&mut self, alias: SharedSessionKey, canonical: SharedSessionKey) {
+        debug_assert!(alias != canonical);
+        debug_assert!(!self.aliases.contains_key(&canonical));
+        debug_assert!(!self.sessions.contains_key(&alias));
+        debug_assert!(self.sessions.contains_key(&canonical));
+        self.aliases.insert(alias, canonical);
+    }
+
+    fn canonical_key(&self, key: &SharedSessionKey) -> SharedSessionKey {
+        match self.aliases.get(key) {
+            Some(canonical) => {
+                debug_assert!(self.sessions.contains_key(canonical));
+                canonical.clone()
+            }
+            None => key.clone(),
+        }
+    }
+
+    fn record_for_key(&self, key: &SharedSessionKey) -> Option<&Arc<Mutex<SharedSessionRecord>>> {
+        let canonical = self.aliases.get(key).unwrap_or(key);
+        debug_assert!(self.aliases.get(key).is_none() || self.sessions.contains_key(canonical));
+        self.sessions.get(canonical)
+    }
+
     fn record_for_connection(
         &self,
         connection_id: &str,
     ) -> Option<&Arc<Mutex<SharedSessionRecord>>> {
         let key = self.by_connection.get(connection_id)?;
         self.sessions.get(key)
+    }
+
+    fn remove_aliases_for_canonical(&mut self, key: &SharedSessionKey) {
+        self.aliases
+            .retain(|alias, canonical| alias != key && canonical != key);
+    }
+
+    fn remove_canonical_session(
+        &mut self,
+        key: &SharedSessionKey,
+    ) -> Option<Arc<Mutex<SharedSessionRecord>>> {
+        self.remove_aliases_for_canonical(key);
+        self.sessions.remove(key)
     }
 
     fn is_replaced_connection(&self, connection_id: &str, generation: u64) -> bool {
@@ -4228,6 +4279,11 @@ struct SharedSessionRecord {
     lifecycle_tx: watch::Sender<SharedLifecycleState>,
     active_leases: HashMap<ClientIdentity, ActiveLease>,
     connect_ledger: HashMap<ConnectIdentity, SharedSessionAttachment>,
+    // One bounded pointer per client into `connect_ledger`. It distinguishes
+    // retrying the current request after release/expiry (which may renew) from
+    // replaying an older request after a newer attach incarnation superseded
+    // it (which must return its frozen result without revoking the newer lease).
+    latest_connect_identities: HashMap<ClientIdentity, ConnectIdentity>,
     prompt_ledger: HashMap<PromptIdentity, PromptLedgerEntry>,
     waiting_prompts: VecDeque<QueuedPromptRecord>,
     waiting_bytes: usize,
@@ -4273,6 +4329,7 @@ impl SharedSessionRecord {
             lifecycle_tx,
             active_leases: HashMap::new(),
             connect_ledger: HashMap::new(),
+            latest_connect_identities: HashMap::new(),
             prompt_ledger: HashMap::new(),
             waiting_prompts: VecDeque::new(),
             waiting_bytes: 0,
@@ -4470,6 +4527,16 @@ impl SharedSessionRecord {
                 self.connect_count = self.connect_count.saturating_add(1);
                 return Ok((previous.clone(), false));
             }
+            let was_superseded = self
+                .latest_connect_identities
+                .get(&client_identity)
+                .is_some_and(|latest| latest != &connect_identity);
+            if was_superseded {
+                // The ledger is the idempotency result. Replaying it is not a
+                // new attach and therefore cannot rotate the current lease.
+                self.connect_count = self.connect_count.saturating_add(1);
+                return Ok((previous.clone(), false));
+            }
         }
 
         let is_new_client = !self.active_leases.contains_key(&client_identity);
@@ -4486,25 +4553,24 @@ impl SharedSessionRecord {
         let wall_expiry = request.now_utc
             + chrono::Duration::from_std(lease_ttl)
                 .expect("shared session lease TTL must fit chrono::Duration");
-        let lease = self
-            .active_leases
-            .entry(client_identity)
-            .or_insert_with(|| ActiveLease {
-                lease_id: uuid::Uuid::new_v4().to_string(),
-                expires_at: monotonic_expiry,
-                expires_at_utc: wall_expiry,
-            });
-        lease.expires_at = monotonic_expiry;
-        lease.expires_at_utc = wall_expiry;
+        let lease_id = uuid::Uuid::new_v4().to_string();
+        let lease = ActiveLease {
+            lease_id: lease_id.clone(),
+            expires_at: monotonic_expiry,
+            expires_at_utc: wall_expiry,
+        };
+        self.active_leases.insert(client_identity.clone(), lease);
 
         let attachment = SharedSessionAttachment {
             connection_id: self.connection_id.clone(),
             generation: self.generation,
-            lease_id: lease.lease_id.clone(),
-            lease_expires_at: lease.expires_at_utc,
+            lease_id,
+            lease_expires_at: wall_expiry,
             disposition,
             phase: self.phase.clone(),
         };
+        self.latest_connect_identities
+            .insert(client_identity, connect_identity.clone());
         self.connect_ledger
             .insert(connect_identity, attachment.clone());
         self.idle_zero_since = None;

@@ -58,6 +58,7 @@ interface ChatInputProps {
   queue?: QueuedMessage[]
   sharedQueue?: SharedQueuedPrompt[]
   onSharedQueueCancel?: (queueItemId: string) => Promise<void>
+  onSharedQueueFailedDismiss?: (queueItemId: string) => void
   onEnqueue?: (draft: PromptDraft, modeId: string | null) => void
   onQueueReorder?: (items: QueuedMessage[]) => void
   onQueueEdit?: (id: string) => void
@@ -142,6 +143,7 @@ export const ChatInput = memo(function ChatInput({
   queue,
   sharedQueue,
   onSharedQueueCancel,
+  onSharedQueueFailedDismiss,
   onEnqueue,
   onQueueReorder,
   onQueueEdit,
@@ -210,10 +212,11 @@ export const ChatInput = memo(function ChatInput({
         if (event.pointerType !== "mouse") event.stopPropagation()
       }}
     >
-      {sharedQueue && onSharedQueueCancel ? (
+      {sharedQueue && onSharedQueueCancel && onSharedQueueFailedDismiss ? (
         <SharedMessageQueueDisplay
           queue={sharedQueue}
           onCancel={onSharedQueueCancel}
+          onDismissFailed={onSharedQueueFailedDismiss}
         />
       ) : null}
       {queue &&
