@@ -68,10 +68,7 @@ fn invalid_alias() -> AppCommandError {
     AppCommandError::invalid_input("Path is outside workspace root")
 }
 
-fn is_alias_resolution_failure(error: &std::io::Error) -> bool {
-    if error.kind() == std::io::ErrorKind::NotFound {
-        return true;
-    }
+fn is_definitive_alias_resolution_failure(error: &std::io::Error) -> bool {
     #[cfg(unix)]
     if error.raw_os_error() == Some(libc::ELOOP) {
         return true;
@@ -83,8 +80,14 @@ fn is_alias_resolution_failure(error: &std::io::Error) -> bool {
     false
 }
 
+fn is_alias_resolution_failure(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound || is_definitive_alias_resolution_failure(error)
+}
+
 fn map_alias_resolution_error(error: std::io::Error, alias_observed: bool) -> AppCommandError {
-    if alias_observed && is_alias_resolution_failure(&error) {
+    if is_definitive_alias_resolution_failure(&error)
+        || (alias_observed && is_alias_resolution_failure(&error))
+    {
         invalid_alias()
     } else {
         AppCommandError::io(error)
@@ -449,6 +452,18 @@ mod tests {
             true,
         )
         .unwrap_err();
+        assert_eq!(error.code, AppErrorCode::InvalidInput);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn definitive_alias_failure_is_invalid_without_prior_observation() {
+        #[cfg(unix)]
+        let raw_os_error = libc::ELOOP;
+        #[cfg(windows)]
+        let raw_os_error = 1921;
+        let error =
+            map_alias_resolution_error(std::io::Error::from_raw_os_error(raw_os_error), false);
         assert_eq!(error.code, AppErrorCode::InvalidInput);
     }
 
