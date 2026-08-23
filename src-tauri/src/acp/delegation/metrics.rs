@@ -1568,6 +1568,8 @@ pub fn agent_type_label(agent: AgentType) -> &'static str {
         AgentType::Grok => "grok",
         AgentType::Cursor => "cursor",
         AgentType::DeepSeek => "deepseek",
+        AgentType::Qoder => "qoder",
+        AgentType::Antigravity => "antigravity",
         AgentType::Custom(_) => "custom",
     }
 }

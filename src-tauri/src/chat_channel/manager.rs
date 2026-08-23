@@ -375,6 +375,9 @@ impl ChatChannelManager {
             manager_for_session_events,
             conn_mgr.clone_ref(),
             db_conn.clone(),
+            // Cloned rather than moved: the command dispatcher below still
+            // takes the original. The subscriber needs one that outlives any
+            // individual connection — see the fn's own doc.
             emitter.clone(),
         );
 

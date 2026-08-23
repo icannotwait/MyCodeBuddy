@@ -3606,6 +3606,8 @@ mod tests {
                 "grok",
                 "cursor",
                 "deepseek",
+                "qoder",
+                "antigravity",
             ]
         );
         assert!(delegate["inputSchema"]["properties"]["profile_id"].is_object());
@@ -3771,7 +3773,7 @@ mod tests {
             .as_array()
             .unwrap();
 
-        assert_eq!(agents.len(), 10);
+        assert_eq!(agents.len(), 12);
         assert!(!agents.iter().any(|agent| agent == "codex"));
         assert!(!agents.iter().any(|agent| agent == "grok"));
         assert!(agents.iter().any(|agent| agent == "code_buddy"));
@@ -3783,6 +3785,9 @@ mod tests {
         }));
     }
 
+    // An empty disabled list (the parent omitted `--disabled-agents`) leaves
+    // the schema byte-identical to the embedded builtin set — the exact
+    // behavior every pre-flag parent relies on.
     #[tokio::test]
     async fn empty_disabled_list_serves_the_embedded_builtin_enum_unchanged() {
         let line = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#;
@@ -3799,9 +3804,9 @@ mod tests {
             .as_array()
             .unwrap()
             .clone();
-        assert_eq!(agents.len(), 12);
+        assert_eq!(agents.len(), 14);
         assert_eq!(agents[0], "claude_code");
-        assert_eq!(agents[11], "deepseek");
+        assert_eq!(agents[13], "antigravity");
     }
 
     #[tokio::test]

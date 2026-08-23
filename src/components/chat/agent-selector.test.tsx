@@ -24,6 +24,7 @@ function agent(
     skills_capable: true,
     registry_id: `${agentType}-registry`,
     registry_version: null,
+    supports_custom_version: false,
     name: agentType,
     description: "",
     available: true,
@@ -353,8 +354,9 @@ describe("AgentSelector", () => {
     const { container } = renderWithIntl(
       <AgentSelector defaultAgentType="claude_code" onSelect={onSelect} />
     )
-    // `deepseek` is last in the list, so it is certainly one of the collapsed
-    // ones — it has no pill in the row to click.
+    // `deepseek` is last in THIS fixture (which is deliberately a fixed list,
+    // not `ALL_AGENT_TYPES` — the overflow count below is asserted exactly), so
+    // it is certainly one of the collapsed ones and has no pill to click.
     const label = getAgentLabel("deepseek")
     expect(
       pills(container).some((pill) => pill.textContent?.includes(label))

@@ -467,10 +467,67 @@ impl AutomationEngine {
         }
     }
 
+    /// Fire an enqueue-task automation: create a todo work task carrying the
+    /// captured prompt (and the automation's agent as the per-task override),
+    /// then settle the run synchronously — there is no session to wait for, so
+    /// none of the TurnComplete / reconcile settle paths ever see this run.
+    async fn enqueue_task(
+        &self,
+        auto: &AutomationInfo,
+        cfg: &AutomationConfig,
+        run_id: i32,
+    ) -> Result<(), String> {
+        let folder_id = auto
+            .root_folder_id
+            .ok_or_else(|| "automation has no target folder".to_string())?;
+        let task_cfg = crate::models::WorkTaskConfig {
+            prompt_blocks: cfg.prompt_blocks.clone(),
+            display_text: cfg.display_text.clone(),
+            agent_type: Some(auto.agent_type.clone()),
+            mode_id: cfg.mode_id.clone(),
+            config_values: cfg.config_values.clone(),
+            label_snapshot: cfg.label_snapshot.clone(),
+            deliverable: None,
+        };
+        let draft = crate::models::WorkTaskDraft {
+            folder_id,
+            title: first_chars(&auto.name, 80),
+            config: serde_json::to_value(&task_cfg).map_err(|e| e.to_string())?,
+        };
+        // The command core (not the bare service) so the task board gets its
+        // `task://changed` broadcast and the work-task pump its nudge for free.
+        let info =
+            crate::commands::work_task::work_task_create_core(&self.emitter, &self.db, draft)
+                .await
+                .map_err(|e| e.to_string())?;
+
+        let settled = automation_service::settle_run(
+            &self.db.conn,
+            run_id,
+            AutomationRunStatus::Succeeded,
+            None,
+            None,
+            Some(format!("queued task #{}: {}", info.id, info.title)),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        if settled {
+            self.emit(AutomationChange::RunSettled {
+                automation_id: auto.id,
+                run_id,
+                status: "succeeded".to_string(),
+            });
+        }
+        Ok(())
+    }
+
     /// Replay the captured composer snapshot through the existing launch chain.
     async fn launch(&self, auto: &AutomationInfo, run_id: i32) -> Result<(), String> {
         let cfg: AutomationConfig =
             serde_json::from_value(auto.config.clone()).map_err(|e| format!("bad config: {e}"))?;
+        if cfg.action == crate::models::AutomationAction::EnqueueTask {
+            return self.enqueue_task(auto, &cfg, run_id).await;
+        }
         let agent_type = parse_agent_type(&auto.agent_type)?;
         let blocks = cfg
             .prompt_blocks

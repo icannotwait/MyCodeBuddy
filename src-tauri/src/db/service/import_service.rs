@@ -12,6 +12,7 @@ use crate::db::entities::conversation;
 use crate::db::error::DbError;
 use crate::db::service::conversation_service;
 use crate::models::{AgentType, ConversationSummary, ImportResult};
+use crate::parsers::antigravity::AntigravityParser;
 use crate::parsers::claude::ClaudeParser;
 use crate::parsers::cline::ClineParser;
 use crate::parsers::codebuddy::CodeBuddyParser;
@@ -24,10 +25,11 @@ use crate::parsers::hermes::HermesParser;
 use crate::parsers::kimi_code::KimiCodeParser;
 use crate::parsers::opencode::OpenCodeParser;
 use crate::parsers::pi::PiParser;
+use crate::parsers::qoder::QoderParser;
 use crate::parsers::{path_eq_for_matching, AgentParser};
 
 /// Every locally-parsable agent, in the canonical parser order.
-const ALL_PARSER_AGENTS: [AgentType; 12] = [
+const ALL_PARSER_AGENTS: [AgentType; 14] = [
     AgentType::ClaudeCode,
     AgentType::Codex,
     AgentType::OpenCode,
@@ -40,6 +42,8 @@ const ALL_PARSER_AGENTS: [AgentType; 12] = [
     AgentType::Grok,
     AgentType::Cursor,
     AgentType::DeepSeek,
+    AgentType::Qoder,
+    AgentType::Antigravity,
 ];
 
 fn build_parser(
@@ -59,6 +63,8 @@ fn build_parser(
         AgentType::Grok => Box::new(GrokParser::new()),
         AgentType::Cursor => Box::new(CursorParser::new()),
         AgentType::DeepSeek => Box::new(DeepSeekParser::from_runtime_env(deepseek_env)?),
+        AgentType::Qoder => Box::new(QoderParser::new()),
+        AgentType::Antigravity => Box::new(AntigravityParser::new()),
         // Custom agents' history lives in codeg's own ACP transcript.
         AgentType::Custom(_) => {
             Box::new(crate::parsers::acp_native::AcpNativeParser::new(agent_type))
@@ -293,6 +299,133 @@ pub(crate) enum ImportOutcome {
 #[cfg(test)]
 pub(crate) type ImportOutcomeForTest = ImportOutcome;
 
+/// The `conversation.agent_type` column's string form.
+fn agent_type_db_str(agent_type: &AgentType) -> String {
+    serde_json::to_value(agent_type)
+        .ok()
+        .and_then(|value| value.as_str().map(String::from))
+        .unwrap_or_default()
+}
+
+/// Reconcile ONE already-imported conversation against a fresh parse of its
+/// agent-side session file. Returns `true` when a row was written, so the
+/// caller can count it and broadcast a sidebar upsert. Never inserts, never
+/// moves the conversation between folders.
+///
+/// Two independent refreshes, because a re-scan can find either kind of drift
+/// (or both) — a session titled after the fact, and a session the user kept
+/// working on in the agent's own CLI:
+///
+/// * [`conversation_service::refresh_auto_title`] adopts a title that did not
+///   exist at first import. A missing/empty parsed title leaves the existing
+///   one intact rather than nulling it, a locked title is never clobbered, and
+///   it deliberately does not bump `updated_at` (a title is metadata, not
+///   activity).
+/// * [`conversation_service::refresh_external_activity`] adopts the transcript's
+///   own last-activity time into `updated_at` (plus the fresh `message_count`)
+///   when it is strictly newer, so a conversation continued outside codeg sorts
+///   and reads correctly in a recency-ordered sidebar.
+///
+/// Both are single conditional UPDATEs whose guards are re-evaluated by the
+/// database at write time, so a concurrent manual rename or a live turn wins.
+/// The `if` conditions here only mirror those guards in Rust to skip the
+/// round-trip when nothing drifted — a converged conversation (the common case,
+/// and every row on a re-scan) costs ZERO statements, which is what keeps a
+/// whole-machine scan over thousands of imported sessions cheap.
+async fn refresh_existing(
+    conn: &DatabaseConnection,
+    existing: &conversation::Model,
+    summary: &ConversationSummary,
+) -> Result<bool, DbError> {
+    // Rows the sidebar never shows are left completely alone: a soft-deleted
+    // conversation must stay deleted (never resurrected or rewritten), and a
+    // delegation child is not a sidebar row (the upsert broadcast suppresses it
+    // too, which would also desync the `updated` count).
+    if existing.parent_id.is_some() || existing.deleted_at.is_some() {
+        return Ok(false);
+    }
+
+    let mut wrote = false;
+
+    if !existing.title_locked {
+        if let Some(title) = summary
+            .title
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty() && existing.title.as_deref() != Some(*t))
+        {
+            wrote |= conversation_service::refresh_auto_title(conn, existing.id, title.to_string())
+                .await?;
+        }
+    }
+
+    if let Some(activity_at) = summary.ended_at.filter(|at| *at > existing.updated_at) {
+        wrote |= conversation_service::refresh_external_activity(
+            conn,
+            existing.id,
+            activity_at,
+            summary.message_count,
+        )
+        .await?;
+    }
+
+    Ok(wrote)
+}
+
+/// Refresh every already-imported session in `items` in place — see
+/// [`refresh_existing`]. Returns the ids actually written so the caller can
+/// broadcast sidebar upserts.
+///
+/// Unlike [`import_one`] this NEVER inserts: a session the user has not
+/// imported yet stays untouched (and unimported) until they pick it. It rides
+/// along with the import-picker scan, which already has to load `rows` — every
+/// conversation carrying an `external_id` — to mark which sessions exist, so
+/// the sync costs one index build plus one UPDATE per row that genuinely
+/// drifted, with no per-session SELECT.
+///
+/// `rows` is matched, not `items`, so every row carrying an `external_id` is
+/// visited directly rather than looked up per session. (An earlier version of
+/// this comment claimed the pair had no unique index and that duplicate rows
+/// therefore had to converge — both are wrong: the init migration creates
+/// `idx_conversation_external_agent` UNIQUE over `(external_id, agent_type)`,
+/// so duplicates cannot exist. The iteration shape is unchanged; only the
+/// stated reason was.) A row error is logged and skipped: a best-effort refresh
+/// must never fail the scan it rides along with.
+pub(crate) async fn sync_imported_sessions(
+    conn: &DatabaseConnection,
+    rows: &[conversation::Model],
+    items: &[(AgentType, ConversationSummary)],
+) -> Vec<i32> {
+    let parsed: std::collections::HashMap<(String, &str), &ConversationSummary> = items
+        .iter()
+        .map(|(at, s)| ((agent_type_db_str(at), s.id.as_str()), s))
+        .collect();
+
+    let mut refreshed = Vec::new();
+    for row in rows {
+        if row.parent_id.is_some() || row.deleted_at.is_some() {
+            continue;
+        }
+        let Some(external_id) = row.external_id.as_deref() else {
+            continue;
+        };
+        let Some(summary) = parsed.get(&(row.agent_type.clone(), external_id)) else {
+            continue;
+        };
+        match refresh_existing(conn, row, summary).await {
+            Ok(true) => refreshed.push(row.id),
+            Ok(false) => {}
+            Err(e) => tracing::error!(
+                "Failed to refresh imported session {} ({}): {}",
+                external_id,
+                row.agent_type,
+                e
+            ),
+        }
+    }
+    refreshed
+}
+
 #[cfg(test)]
 pub(crate) async fn import_one_for_test(
     conn: &DatabaseConnection,
@@ -316,10 +449,7 @@ pub(crate) async fn import_one(
     agent_type: &AgentType,
     summary: &ConversationSummary,
 ) -> Result<ImportOutcome, DbError> {
-    let at_str = serde_json::to_value(agent_type)
-        .ok()
-        .and_then(|v| v.as_str().map(String::from))
-        .unwrap_or_default();
+    let at_str = agent_type_db_str(agent_type);
 
     let exists = conversation::Entity::find()
         .filter(conversation::Column::ExternalId.eq(&summary.id))
@@ -328,27 +458,24 @@ pub(crate) async fn import_one(
         .await?;
 
     if let Some(existing) = exists {
-        // Preserve the original skip for rows the sidebar never shows: a
-        // soft-deleted conversation must stay deleted (never resurrected or
-        // rewritten), and a delegation child is not a sidebar row (the upsert
-        // broadcast suppresses it too, which would also desync the `updated`
-        // count). Only a visible root conversation gets its title refreshed.
+        // Preserve the original skip for rows the sidebar never shows.
         if existing.parent_id.is_some() || existing.deleted_at.is_some() {
             return Ok(ImportOutcome::Skipped);
         }
-        if let Some(title) = summary
-            .title
-            .as_deref()
-            .map(str::trim)
-            .filter(|t| !t.is_empty())
+        if let Err(error) =
+            crate::db::service::token_usage_service::mark_stale_for_reparse(conn, existing.id).await
         {
-            if conversation_service::refresh_auto_title(conn, existing.id, title.to_string())
-                .await?
-            {
-                return Ok(ImportOutcome::Updated(existing.id));
-            }
+            tracing::warn!(
+                conversation_id = existing.id,
+                error = %error,
+                "import: failed to invalidate the token-usage stamp"
+            );
         }
-        return Ok(ImportOutcome::Skipped);
+        return Ok(if refresh_existing(conn, &existing, summary).await? {
+            ImportOutcome::Updated(existing.id)
+        } else {
+            ImportOutcome::Skipped
+        });
     }
 
     let created_at = summary.started_at;

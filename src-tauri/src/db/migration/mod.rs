@@ -70,6 +70,8 @@ mod m20260817_000001_work_task_conversation_title;
 mod m20260819_000001_turn_generation_stat;
 #[cfg(test)]
 pub(crate) use m20260817_000001_delegation_orchestration_bindings::install_for_historical_completion_fixture;
+mod m20260818_000001_work_task_source;
+mod m20260819_000001_work_task_completion_kind;
 pub struct Migrator;
 
 #[async_trait::async_trait]
@@ -143,6 +145,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20260817_000001_delegation_orchestration_bindings::Migration),
             Box::new(m20260817_000001_work_task_conversation_title::Migration),
             Box::new(m20260819_000001_turn_generation_stat::Migration),
+            Box::new(m20260818_000001_work_task_source::Migration),
+            Box::new(m20260819_000001_work_task_completion_kind::Migration),
         ]
     }
 }

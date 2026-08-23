@@ -7,6 +7,10 @@ import Suggestion, {
   type Trigger,
 } from "@tiptap/suggestion"
 
+import { isImeCompositionKey } from "@/lib/ime-composition"
+
+import { findMentionMatch } from "./mention-match"
+
 /** Live render state the plugin pushes to React while the `@` panel is open. */
 export interface MentionRenderState {
   query: string
@@ -210,27 +214,22 @@ export const MentionSuggestion = Extension.create<MentionSuggestionOptions>({
     const mentionSuggestion = Suggestion({
       editor,
       ...mentionMatchOptions,
-      findSuggestionMatch: findMentionSuggestionMatch,
+      findSuggestionMatch: findMentionMatch,
       items: () => [],
       command: () => {},
       // Clear exitSuggestion's dismissedRange when our rematch meta is present
       // so compositionend can reopen the same `@` range.
       shouldResetDismissed: ({ transaction }) =>
         transaction.getMeta(COMPOSITION_REMATCH_META) != null,
-      allow: ({ state }) => {
-        if (editor.view.composing) return false
-        return !state.selection.$from.parent.type.spec.code
-      },
+      // Let Tiptap track the trigger throughout mobile IME composition; the
+      // companion plugin below still forces one clean rematch on compositionend.
+      allow: ({ state }) => !state.selection.$from.parent.type.spec.code,
       render: () => ({
         onStart: (props) => controller.onStart(toRenderState(props)),
         onUpdate: (props) => controller.onUpdate(toRenderState(props)),
         onExit: () => controller.onExit(),
         onKeyDown: ({ event }) => {
-          if (
-            event.isComposing ||
-            event.keyCode === 229 ||
-            editor.view.composing
-          ) {
+          if (isImeCompositionKey(event) || editor.view.composing) {
             return false
           }
           return controller.onKeyDown(event)

@@ -250,6 +250,8 @@ export interface ClaudeApiRetryState {
   error: string | null
   errorStatus: number | null
   retryDelayMs: number | null
+  /** Whether this agent reports an error cause for retry events. */
+  reportsError: boolean
 }
 
 export type LiveContentBlock =
@@ -1210,6 +1212,7 @@ function parseClaudeApiRetryEvent(
     error: typeof message.error === "string" ? message.error : null,
     errorStatus: asFiniteNumber(message.error_status),
     retryDelayMs: asFiniteNumber(message.retry_delay_ms),
+    reportsError: true,
   }
 }
 
@@ -4086,6 +4089,10 @@ function prepareMappedEnvelope(
         sessionId: e.session_id,
       })
       break
+    case "native_session_title":
+      // The backend applies the title to the conversation row and broadcasts
+      // `conversation://changed`; keep the streaming queue untouched.
+      break
     case "conversation_linked": {
       actions.push({
         type: "CONVERSATION_LINKED",
@@ -4247,11 +4254,12 @@ function prepareMappedEnvelope(
         contextKey,
         retry: {
           sessionId: snapshot.sessionId ?? "",
-          attempt: null,
-          maxRetries: null,
-          error: e.message,
+          attempt: e.attempt ?? null,
+          maxRetries: e.max_retries ?? null,
+          error: e.message || null,
           errorStatus: e.error_status ?? null,
-          retryDelayMs: null,
+          retryDelayMs: e.retry_delay_ms ?? null,
+          reportsError: e.message.trim().length > 0,
         },
       })
       break

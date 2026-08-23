@@ -1343,10 +1343,11 @@ export const ConversationSessionSurface = memo(
 
     useEffect(() => {
       if (effectiveConversationId <= 0) return
-      setExternalId(
-        effectiveConversationId,
-        detail?.summary.external_id ?? null
-      )
+      // Never clear a resolved id while detail is temporarily absent during a
+      // refetch; doing so can reconnect with session/new and strand history.
+      const persisted = detail?.summary.external_id
+      if (!persisted) return
+      setExternalId(effectiveConversationId, persisted)
     }, [effectiveConversationId, detail?.summary.external_id, setExternalId])
 
     useEffect(() => {

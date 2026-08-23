@@ -4638,6 +4638,7 @@ describe("AcpConnectionsProvider frame transactions (raw order)", () => {
       error: "rate limited",
       errorStatus: 429,
       retryDelayMs: null,
+      reportsError: true,
     })
     expect(active.lastAppliedSeq).toBe(3)
 

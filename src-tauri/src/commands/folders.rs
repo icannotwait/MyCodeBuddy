@@ -100,7 +100,7 @@ async fn prepare_remote_git_cmd_for_url(
 }
 
 /// Classify a git remote command error, detecting authentication failures.
-fn classify_remote_git_error(operation: &str, stderr: &[u8]) -> AppCommandError {
+pub(crate) fn classify_remote_git_error(operation: &str, stderr: &[u8]) -> AppCommandError {
     let msg = String::from_utf8_lossy(stderr).trim().to_string();
     tracing::error!("[GIT_CMD] {} failed, stderr: {}", operation, msg);
     let lower = msg.to_lowercase();
@@ -428,7 +428,17 @@ async fn count_changed_files_between(
     )))
 }
 
-fn ensure_pushable_branch_name(branch: &str) -> Result<(), AppCommandError> {
+/// Reject a caller-supplied push target that isn't a plain branch name.
+///
+/// The value reaches `git` as its own argv element (no shell), so quoting isn't
+/// the concern — it's that `git push <remote> <value>` reads the value as a
+/// REFSPEC, and this path is reachable from the push window's `?branch=` query
+/// and from the server-mode HTTP API. Left unchecked, `:main` deletes the remote
+/// branch, `+main:main` force-pushes over it, and `--mirror` parses as a flag.
+/// So: no leading `-`/`+`, no `:`, no whitespace or control characters. What
+/// survives can only be a single ref name — `ensure_local_branch_exists` then
+/// confirms it actually is one.
+pub(crate) fn ensure_pushable_branch_name(branch: &str) -> Result<(), AppCommandError> {
     let rejected = branch.is_empty()
         || branch.starts_with('-')
         || branch.starts_with('+')

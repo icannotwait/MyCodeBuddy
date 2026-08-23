@@ -66,7 +66,10 @@ describe("RequestUsageAccumulator", () => {
 
   it("resets to zero", () => {
     const acc = new RequestUsageAccumulator()
-    acc.push({ outputTokens: 10, durationMs: 1000 } satisfies RequestUsageSample)
+    acc.push({
+      outputTokens: 10,
+      durationMs: 1000,
+    } satisfies RequestUsageSample)
     acc.reset()
     expect(acc.snapshot().sampleCount).toBe(0)
     expect(acc.snapshot().tps).toBe(0)
@@ -74,9 +77,7 @@ describe("RequestUsageAccumulator", () => {
 
   it("uses a measured clock when the sample has no duration", () => {
     const acc = new RequestUsageAccumulator()
-    acc.push(
-      resolveRequestUsageSample({ outputTokens: 80 }, 2000)
-    )
+    acc.push(resolveRequestUsageSample({ outputTokens: 80 }, 2000))
     expect(acc.snapshot()).toMatchObject({
       outputTokens: 80,
       generationMs: 2000,

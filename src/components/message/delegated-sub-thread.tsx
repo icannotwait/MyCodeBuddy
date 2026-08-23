@@ -28,6 +28,7 @@ import { DelegationCardChrome } from "@/components/message/delegation-card-chrom
 import { DelegationRunSummary } from "@/components/message/delegation-run-summary"
 import { StatusBadge } from "@/components/message/delegation-status-badge"
 import { openDelegatedChildSession } from "@/lib/open-delegated-child-session"
+import { useSessionViewerHost } from "@/components/message/session-viewer-host"
 import { useDelegationCardModel } from "@/hooks/use-delegation-card-model"
 import type { DelegationCardSource } from "@/hooks/use-delegation-card-model"
 
@@ -70,22 +71,21 @@ export function DelegatedSubThread({
 }: Props) {
   const t = useTranslations("Folder.chat.delegation")
   const [filesExpanded, setFilesExpanded] = useState(false)
-  const model = useDelegationCardModel(
-    {
-      parentToolUseId,
-      parentConversationId,
-      input,
-      output,
-      errorText,
-      state,
-      meta,
-    },
-    {
-      workUnitSources,
-      stickyKey: workUnitKey,
-      explicitUserCancel,
-    }
-  )
+  const viewerHost = useSessionViewerHost()
+  const source: DelegationCardSource = {
+    parentToolUseId,
+    parentConversationId,
+    input,
+    output,
+    errorText,
+    state,
+    meta,
+  }
+  const model = useDelegationCardModel(source, {
+    workUnitSources,
+    stickyKey: workUnitKey,
+    explicitUserCancel,
+  })
   const {
     agentType,
     agentDisplayLabel,
@@ -192,7 +192,11 @@ export function DelegatedSubThread({
         {canOpenChild && (
           <button
             type="button"
-            onClick={onOpenChild}
+            onClick={() =>
+              viewerHost
+                ? viewerHost.open({ kind: "delegation", source })
+                : onOpenChild()
+            }
             className="shrink-0 flex items-center gap-1.5 px-3 border-l border-border text-xs font-medium text-foreground/80 hover:bg-muted/60 hover:text-foreground transition-colors"
             title={t("openDetail")}
             aria-label={t("openDetail")}

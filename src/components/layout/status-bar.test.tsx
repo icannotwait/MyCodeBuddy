@@ -31,6 +31,9 @@ vi.mock("./status-bar-update", () => ({
 vi.mock("./command-dropdown", () => ({
   CommandDropdown: () => <span data-testid="command-dropdown" />,
 }))
+vi.mock("./quick-actions-dropdown", () => ({
+  QuickActionsDropdown: () => <span data-testid="quick-actions-dropdown" />,
+}))
 
 describe("StatusBar", () => {
   it.each([false, true])(

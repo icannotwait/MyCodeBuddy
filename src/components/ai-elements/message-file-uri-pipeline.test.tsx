@@ -21,7 +21,7 @@ describe("MessageResponse Windows file URI pipeline", () => {
     await waitFor(() => {
       expect(
         container.querySelector(
-          "button[data-resource-kind='file'][title='/C:/repo/src/app.ts#L12']"
+          "button[data-resource-kind='file'][title='C:/repo/src/app.ts:12']"
         )
       ).not.toBeNull()
     })
@@ -42,7 +42,7 @@ describe("MessageResponse Windows file URI pipeline", () => {
     await waitFor(() => {
       expect(
         container.querySelector(
-          "button[data-resource-kind='file'][title='/D:/MyCodeBuddy/src-tauri/src/acp/delegation/companion.rs:1037']"
+          "button[data-resource-kind='file'][title='D:/MyCodeBuddy/src-tauri/src/acp/delegation/companion.rs:1037']"
         )
       ).not.toBeNull()
     })

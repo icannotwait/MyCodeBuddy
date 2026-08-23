@@ -52,6 +52,9 @@ struct RegistryAgentItem {
     distribution: CustomAgentSpec,
 }
 
+#[cfg(test)]
+const BUILTIN_REGISTRY_ALIASES: &[&str] = &["kimi", "qoder"];
+
 async fn fetch_registry_payload() -> Result<RegistryPayload, AppCommandError> {
     let response = reqwest::Client::new()
         .get(REGISTRY_URL)
@@ -262,7 +265,7 @@ pub async fn fetch_catalog(
     Ok(out)
 }
 
-/// Whether an id is one of codeg's eleven hand-written agents. Deliberately
+/// Whether an id is one of codeg's hand-written built-in agents. Deliberately
 /// does NOT consult the custom registry (unlike `registry::from_registry_id`,
 /// which resolves registered custom ids too) — the picker needs "codeg ships
 /// this natively", not "codeg can currently launch this".
@@ -478,8 +481,39 @@ mod tests {
         // only the alias table catches it.
         assert!(is_builtin_registry_id("kimi"));
         assert!(is_builtin_registry_id("kimi-code"));
+        // Same story for Qoder (`qoder` upstream, `qoder-cli` here). Every
+        // alias must ALSO be an id the custom registry would refuse, which is
+        // exactly why offering it in the picker is a dead end rather than a
+        // duplicate — see the assertion below.
+        assert!(is_builtin_registry_id("qoder"));
+        assert!(is_builtin_registry_id("qoder-cli"));
+        // Antigravity needs NO alias: codeg's registry id is byte-identical
+        // to the one the ACP registry publishes, so the picker resolves it
+        // through the built-in table and never offers a duplicate entry.
+        assert!(is_builtin_registry_id("antigravity-acp"));
         assert!(!is_builtin_registry_id("goose"));
         assert!(!is_builtin_registry_id("qwen-code"));
+    }
+
+    // Why a missing alias is a BUG and not just noise. The two entries in the
+    // table fail differently, and Qoder is the worse of the two:
+    //
+    // * `kimi` IS a legal custom-agent id (codeg's wire name is `kimi_code`),
+    //   so without the alias the picker would let the user add a SECOND,
+    //   redundant Kimi alongside the built-in.
+    // * `qoder` is NOT (it is codeg's wire name, blocked outright), so without
+    //   the alias the picker lists an entry whose "Add" button can only ever
+    //   error — a dead end with no way for the user to understand it.
+    #[test]
+    fn aliases_that_are_addable_would_duplicate_and_the_rest_would_dead_end() {
+        assert!(crate::models::agent::is_valid_custom_agent_id("kimi"));
+        assert!(!crate::models::agent::is_valid_custom_agent_id("qoder"));
+        for alias in BUILTIN_REGISTRY_ALIASES {
+            assert!(
+                is_builtin_registry_id(alias),
+                "alias `{alias}` must read as built-in"
+            );
+        }
     }
 
     fn catalog_entry(id: &str, spec: CustomAgentSpec) -> RegistryCatalogAgent {

@@ -23,6 +23,7 @@ Codeg (Code Generation) é um workspace de codificação multiagente. Ele reúne
 
 ![gallery](../images/workspace-light.png#gh-light-mode-only)
 ![gallery](../images/workspace-dark.png#gh-dark-mode-only)
+Ele agrega as sessões de todas as CLIs de agentes suportadas em um único espaço de trabalho pesquisável e permite que um agente principal delegue a subagentes de outros tipos dentro de uma mesma tarefa. O trabalho que você prefere não acompanhar vai para o quadro de tarefas a fazer: cada tarefa no próprio branch, rodando sem supervisão, esperando a sua revisão antes de entrar. O Codeg roda como aplicativo de desktop, servidor independente ou contêiner Docker, com clientes nativos de iOS e Android para quando você está longe da mesa; quinze agentes já vêm integrados e você pode registrar por conta própria qualquer outro agente compatível com ACP.
 
 ## Patrocinadores
 
@@ -63,6 +64,7 @@ Codeg (Code Generation) é um workspace de codificação multiagente. Ele reúne
 
 ![Codeg Light](../images/workspace-light.png#gh-light-mode-only)
 ![Codeg Dark](../images/workspace-dark.png#gh-dark-mode-only)
+Claude Code · Codex · Gemini · OpenClaw · OpenCode · Cline · Hermes · CodeBuddy · Kimi Code · Pi · Grok · Cursor · DeepSeek Harness · Qoder · Google Antigravity
 
 ## Colaboração Multi-Agente
 

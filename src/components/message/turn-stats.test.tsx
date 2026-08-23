@@ -54,8 +54,7 @@ describe("TurnStats jump-to-previous-user gating", () => {
 })
 
 describe("TurnStats generation speed gating", () => {
-  const speedAria =
-    enMessages.Folder.chat.liveTurnStats.outputSpeedAria
+  const speedAria = enMessages.Folder.chat.liveTurnStats.outputSpeedAria
 
   it("hides historical tok/s for agents without a request-usage adapter", () => {
     renderStats(

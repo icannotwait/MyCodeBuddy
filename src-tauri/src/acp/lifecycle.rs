@@ -41,7 +41,7 @@ use tokio::sync::RwLock;
 /// Per-connection worker queue depth. Sized for the **filtered** event set
 /// only (see `is_lifecycle_relevant`) — high-frequency events (ContentDelta,
 /// ToolCall*, PermissionRequest) are dropped at the dispatcher and never
-/// enter the queue. The remaining 5 event types arrive at most a handful
+/// enter the queue. The remaining 6 event types arrive at most a handful
 /// of times per turn, so 64 slots is comfortable headroom for a sustained
 /// SQLite stall without forcing the dispatcher to block on `send`.
 const WORKER_QUEUE_CAPACITY: usize = 64;
@@ -74,11 +74,12 @@ fn is_lifecycle_relevant(event: &AcpEvent) -> bool {
     is_lifecycle_critical(event)
         || matches!(
             event,
-            AcpEvent::Error {
-                details: None,
-                terminal: false,
-                ..
-            }
+            AcpEvent::NativeSessionTitle { .. }
+                | AcpEvent::Error {
+                    details: None,
+                    terminal: false,
+                    ..
+                }
         )
 }
 
@@ -638,9 +639,23 @@ pub(crate) async fn handle_event(
             else {
                 return Ok(());
             };
-            let conversation_id = state_arc.read().await.conversation_id;
+            let (conversation_id, agent_type) = {
+                let snap = state_arc.read().await;
+                (snap.conversation_id, snap.agent_type)
+            };
             if let Some(cid) = conversation_id {
-                conversation_service::update_external_id(db_conn, cid, session_id.clone()).await?;
+                // Guarded bind: the row may already be bound to a DIFFERENT
+                // session. That is legitimate for a fork (which has already
+                // inserted the sibling holding the outgoing id, so this is a
+                // plain re-point) and for a custom agent continuing its
+                // conversation under a new session (`continues`), and
+                // destructive otherwise — a session re-minted under a live
+                // binding would otherwise overwrite the id the row's whole
+                // history hangs off. See codeg#500.
+                let continues = crate::acp::continued_session_ids(agent_type, session_id);
+                let preserved =
+                    conversation_service::bind_external_id(db_conn, cid, session_id, &continues)
+                        .await?;
                 // The external_id just landed on the row. The create-time
                 // sidebar upsert carried `external_id: null` (no session yet),
                 // so re-broadcast the full summary on `conversation://changed`
@@ -648,6 +663,10 @@ pub(crate) async fn handle_event(
                 // delegation children). Best-effort, after the DB write.
                 crate::commands::conversations::emit_conversation_upsert(&emitter, db_conn, cid)
                     .await;
+                crate::commands::conversations::emit_preserved_conversation(
+                    &emitter, db_conn, preserved,
+                )
+                .await;
             }
             Ok(())
         }
@@ -772,6 +791,43 @@ pub(crate) async fn handle_event(
                 )
                 .await;
                 crate::commands::conversations::emit_conversation_state(&emitter, patch);
+            }
+            Ok(())
+        }
+        AcpEvent::NativeSessionTitle { title } => {
+            // Live ACP session title: write it onto the bound row the moment
+            // the agent publishes it. `refresh_auto_title` is a no-op when the
+            // user renamed the chat, when the value is unchanged, or when the
+            // string is empty — so repeating the same title across goal
+            // snapshots does not churn the sidebar.
+            let Some((state_arc, emitter)) =
+                manager.get_state_and_emitter(&envelope.connection_id).await
+            else {
+                return Ok(());
+            };
+            let conversation_id = { state_arc.read().await.conversation_id };
+            // Title published before the first prompt binds the row: drop it.
+            // `emit_conversation_update` never caches an unbound title, so a
+            // later resend is still accepted. Failing that, the next detail
+            // load recovers it only where the agent's own transcript carries
+            // the name — see the note at that emit site.
+            let Some(cid) = conversation_id else {
+                return Ok(());
+            };
+            // Unlocked on purpose: a later ACP title or a session-file parse
+            // can still replace this. Identical repeats are filtered at emit
+            // time so CodeBuddy's per-turn fallback cannot ping-pong the
+            // sidebar. Soft-deleted rows are skipped by the UPDATE predicate.
+            if conversation_service::refresh_auto_title(db_conn, cid, title.clone()).await? {
+                crate::commands::conversations::emit_conversation_upsert(&emitter, db_conn, cid)
+                    .await;
+                if let Some(ccm) = manager.chat_channel() {
+                    crate::commands::conversations::spawn_sync_conversation_title_until_current(
+                        db_conn.clone(),
+                        ccm,
+                        cid,
+                    );
+                }
             }
             Ok(())
         }
@@ -3658,11 +3714,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handle_event_native_session_title_writes_and_upserts() {
+        use crate::web::event_bridge::{WebEventBroadcaster, CONVERSATION_CHANGED_EVENT};
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/test-native-title").await;
+        let conv =
+            conversation_service::create(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
+                .await
+                .unwrap();
+        let broadcaster = Arc::new(WebEventBroadcaster::new());
+        let mut rx = broadcaster.subscribe();
+        let mgr = ConnectionManager::new();
+        {
+            let mut map = mgr.connections.lock().await;
+            let mut conn = fake_connection_with_state("c1", Some(conv.id));
+            conn.emitter = EventEmitter::test_web_only(broadcaster.clone());
+            map.insert("c1".to_string(), conn);
+        }
+        let env = EventEnvelope {
+            seq: 1,
+            connection_id: "c1".to_string(),
+            payload: AcpEvent::NativeSessionTitle {
+                title: "  Fix login flow  ".into(),
+            },
+        };
+        handle_event(&db.conn, &mgr, &env, None).await.unwrap();
+
+        let reloaded = conversation_service::get_by_id(&db.conn, conv.id)
+            .await
+            .unwrap();
+        assert_eq!(reloaded.title.as_deref(), Some("Fix login flow"));
+        assert!(!reloaded.title_locked);
+
+        let evt = rx
+            .try_recv()
+            .expect("a written native title should broadcast a conversation upsert");
+        assert_eq!(evt.channel, CONVERSATION_CHANGED_EVENT);
+        let p = &*evt.payload;
+        assert_eq!(p["kind"], "upsert");
+        assert_eq!(p["summary"]["title"], "Fix login flow");
+    }
+
+    #[tokio::test]
+    async fn handle_event_native_session_title_skips_locked_and_unbound() {
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/test-native-title-skip").await;
+        let conv =
+            conversation_service::create(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
+                .await
+                .unwrap();
+        conversation_service::update_title(&db.conn, conv.id, "User pick".into())
+            .await
+            .unwrap();
+
+        let mgr = ConnectionManager::new();
+        {
+            let mut map = mgr.connections.lock().await;
+            map.insert(
+                "locked".to_string(),
+                fake_connection_with_state("locked", Some(conv.id)),
+            );
+            map.insert(
+                "unbound".to_string(),
+                fake_connection_with_state("unbound", None),
+            );
+        }
+        let locked_env = EventEnvelope {
+            seq: 1,
+            connection_id: "locked".to_string(),
+            payload: AcpEvent::NativeSessionTitle {
+                title: "agent title".into(),
+            },
+        };
+        handle_event(&db.conn, &mgr, &locked_env, None)
+            .await
+            .unwrap();
+        let unbound_env = EventEnvelope {
+            seq: 2,
+            connection_id: "unbound".to_string(),
+            payload: AcpEvent::NativeSessionTitle {
+                title: "should not land anywhere".into(),
+            },
+        };
+        handle_event(&db.conn, &mgr, &unbound_env, None)
+            .await
+            .unwrap();
+
+        let reloaded = conversation_service::get_by_id(&db.conn, conv.id)
+            .await
+            .unwrap();
+        assert_eq!(reloaded.title.as_deref(), Some("User pick"));
+        assert!(reloaded.title_locked);
+    }
+
+    #[tokio::test]
     async fn handle_event_session_started_skips_soft_deleted_conversation() {
         // A fork emits `SessionStarted{S2}`. If the bound conversation was
         // soft-deleted while its ACP connection stayed live (delete only
         // soft-marks the row; it never disconnects the agent), this late write
-        // must be a total no-op: `update_external_id` is guarded on
+        // must be a total no-op: `bind_external_id` is guarded on
         // `deleted_at IS NULL`, so the deleted row keeps its S1 session id and
         // its `updated_at`, and `emit_conversation_upsert` (which re-fetches via
         // `get_by_id`, itself deleted-filtered) broadcasts nothing. This locks
@@ -3677,7 +3827,7 @@ mod tests {
             conversation_service::create(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
                 .await
                 .unwrap();
-        conversation_service::update_external_id(&db.conn, conv.id, "session-S1".into())
+        conversation_service::bind_external_id(&db.conn, conv.id, "session-S1", &[])
             .await
             .unwrap();
         conversation_service::soft_delete(&db.conn, conv.id)
@@ -4645,6 +4795,9 @@ mod tests {
             folder_id: 1,
             parent_conversation_id: None,
             parent_tool_use_id: None,
+        }));
+        assert!(is_lifecycle_relevant(&AcpEvent::NativeSessionTitle {
+            title: "Fix login".into(),
         }));
         assert!(is_lifecycle_relevant(&AcpEvent::StatusChanged {
             status: ConnectionStatus::Disconnected,

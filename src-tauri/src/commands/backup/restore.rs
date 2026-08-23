@@ -98,6 +98,7 @@ struct PendingRestore {
 
 /// Decrypt + extract + verify a backup into a staging dir and write the pending
 /// marker. Does NOT touch live data — the swap happens at next startup.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn stage_restore_core(
     src: &Path,
     data_dir: &Path,

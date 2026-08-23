@@ -726,6 +726,14 @@ pub struct SessionState {
     /// capture (linked, non-internal). `None` outside an admitted turn or when
     /// capture was bypassed/failed.
     pub active_turn: Option<ActiveTurnContext>,
+
+    /// Last live ACP session title we actually emitted on this connection.
+    /// Used to skip identical `session_info_update.title` repeats (CodeBuddy
+    /// resends its fallback after every turn with no last-sent guard).
+    /// Backend-internal: not on the client snapshot. Cleared on
+    /// `ConversationLinked` so a title dropped while the row was still
+    /// unbound can be accepted on the next send.
+    pub last_native_title: Option<String>,
 }
 
 impl SessionState {
@@ -816,6 +824,7 @@ impl SessionState {
             purpose: ConnectionPurpose::User,
             effective_locale: AppLocale::En,
             active_turn: None,
+            last_native_title: None,
         }
     }
 
@@ -1498,6 +1507,10 @@ impl SessionState {
             } => {
                 self.conversation_id = Some(*conversation_id);
                 self.folder_id = Some(*folder_id);
+                // A title published before this bind was dropped (no row yet).
+                // Forget the skip-cache so a later resend of the same string
+                // is not suppressed.
+                self.last_native_title = None;
             }
             AcpEvent::PlanUpdate { entries } => {
                 // Replace any existing Plan block, then append at end.
@@ -1748,7 +1761,8 @@ impl SessionState {
             | AcpEvent::SessionLoadFailed { .. }
             | AcpEvent::TurnRetrying { .. }
             | AcpEvent::UserPromptSent { .. }
-            | AcpEvent::RequestUsage { .. } => {
+            | AcpEvent::RequestUsage { .. }
+            | AcpEvent::NativeSessionTitle { .. } => {
                 // 这些事件不直接修改 SessionState 的可见字段。
                 // UserPromptSent 是纯通知事件，仅供 chat-channel 推送消费。
                 // TurnRetrying 与 Claude 的 api_retry 一样是前端瞬态提示（重试横幅），
@@ -2444,6 +2458,32 @@ mod tests {
             "win-test".to_string(),
             None,
         )
+    }
+
+    /// `ConversationLinked` must forget the live-title skip-cache.
+    ///
+    /// Today this clear can only ever be a no-op: `emit_conversation_update`
+    /// refuses to cache a title while `conversation_id` is `None`, and both
+    /// producers of `ConversationLinked` fire only from that same unbound
+    /// state, so the cache is already empty every time this runs. It is kept —
+    /// and pinned here — because the day something rebinds a LIVE connection to
+    /// another row, a cache carried over from the old one would classify the
+    /// new row's first title as a repeat and leave it Untitled for the rest of
+    /// the connection, with no error anywhere to point at.
+    #[test]
+    fn conversation_linked_clears_the_native_title_skip_cache() {
+        let mut s = fresh_state();
+        s.last_native_title = Some("Fix the login flow".into());
+
+        s.apply_event(&AcpEvent::ConversationLinked {
+            conversation_id: 7,
+            folder_id: 1,
+            parent_conversation_id: None,
+            parent_tool_use_id: None,
+        });
+
+        assert_eq!(s.conversation_id, Some(7));
+        assert!(s.last_native_title.is_none());
     }
 
     #[test]

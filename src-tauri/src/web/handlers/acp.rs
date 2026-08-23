@@ -1721,6 +1721,23 @@ pub async fn acp_update_agent_config(
     Ok(Json(affected))
 }
 
+/// Optional live personal access token from the Qoder settings form, forwarded
+/// so the `status` probe reports on what's on screen.
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct QoderProbeParams {
+    pub personal_access_token: Option<String>,
+}
+
+pub async fn acp_qoder_auth_status(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<QoderProbeParams>,
+) -> Result<Json<crate::acp::types::QoderAuthStatus>, AppCommandError> {
+    Ok(Json(
+        acp_commands::acp_qoder_auth_status_core(&state.db, params.personal_access_token).await,
+    ))
+}
+
 /// Optional live API key from the Cursor settings form, forwarded so the
 /// `status` / `models` probes test what's on screen (empty ⇒ browser-login).
 #[derive(Deserialize, Default)]
@@ -1914,6 +1931,15 @@ pub async fn acp_validate_pi_command(
     Ok(Json(acp_commands::acp_validate_pi_command_core(
         params.command,
     )))
+}
+
+pub async fn acp_sync_antigravity_settings(
+    Extension(state): Extension<Arc<AppState>>,
+) -> Result<Json<crate::acp::connection::AntigravitySyncReport>, AppCommandError> {
+    let result = acp_commands::acp_sync_antigravity_settings_core(&state.db)
+        .await
+        .map_err(|e| AppCommandError::task_execution_failed(e.to_string()))?;
+    Ok(Json(result))
 }
 
 #[derive(Deserialize)]

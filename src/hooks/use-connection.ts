@@ -95,8 +95,9 @@ export interface UseConnectionReturn {
   isDelegationChild: boolean
   /** Launched-but-unresolved background tasks on this connection (async
    *  sub-agents / background shells, accounted from the transcript by the
-   *  backend watcher). Drives the "background tasks running" chip; non-zero
-   *  also exempts the connection from the idle sweeps. */
+   *  backend watcher). The count is never rendered — it exists so the unmount
+   *  teardown (`shouldDisconnectOnUnmount`) spares a connection whose agent CLI
+   *  still has background work to finish. */
   backgroundOutstanding: number
   /** Epoch ms while a settled background task's follow-up reply is still being
    *  generated/surfaced (cleared when overlay turns arrive). Drives the chip's

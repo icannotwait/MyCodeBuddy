@@ -22,6 +22,7 @@ pub mod file_io;
 pub mod folder_commands;
 pub mod folder_links;
 pub mod folders;
+pub mod forge;
 pub mod history_window;
 pub mod logging;
 pub mod mcp;
