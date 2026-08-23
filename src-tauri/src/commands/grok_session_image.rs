@@ -1720,7 +1720,7 @@ mod resolver_tests {
             path: parent.clone(),
             permissions,
         };
-        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0)).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o0)).unwrap();
         let probe = std::fs::metadata(&origin);
         if !matches!(probe, Err(ref error) if error.kind() == std::io::ErrorKind::PermissionDenied)
         {
@@ -1814,7 +1814,7 @@ mod resolver_tests {
             path: parent.clone(),
             permissions,
         };
-        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0)).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o0)).unwrap();
         let probe = std::fs::metadata(&folder);
         if !matches!(probe, Err(ref error) if error.kind() == std::io::ErrorKind::PermissionDenied)
         {
@@ -1872,7 +1872,7 @@ mod resolver_tests {
                 path: images.clone(),
                 permissions,
             };
-            std::fs::set_permissions(&images, std::fs::Permissions::from_mode(0)).unwrap();
+            std::fs::set_permissions(&images, std::fs::Permissions::from_mode(0o0)).unwrap();
             let probe = std::fs::read_dir(&images);
             if matches!(
                 probe,

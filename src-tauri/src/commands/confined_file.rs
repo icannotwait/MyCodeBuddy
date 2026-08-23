@@ -653,7 +653,7 @@ mod tests {
                 path: images.clone(),
                 mode: original_mode,
             };
-            std::fs::set_permissions(&images, std::fs::Permissions::from_mode(0)).unwrap();
+            std::fs::set_permissions(&images, std::fs::Permissions::from_mode(0o0)).unwrap();
             let result = read_confined_regular_file(
                 root.path(),
                 Path::new("images/a.png"),
