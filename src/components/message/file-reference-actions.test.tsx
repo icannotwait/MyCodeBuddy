@@ -1,5 +1,6 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { NextIntlClientProvider } from "next-intl"
+import { useLayoutEffect } from "react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import enMessages from "@/i18n/messages/en.json"
@@ -53,9 +54,53 @@ import {
   GrokSessionImageScope,
 } from "@/components/ai-elements/grok-session-image-context"
 
+type MenuLayoutSnapshot = {
+  target: string
+  conversationId: number | null
+  revealDisabled: boolean | null
+  relativeDisabled: boolean | null
+  absoluteDisabled: boolean | null
+}
+
+function MenuLayoutObserver({
+  target,
+  conversationId,
+  onSnapshot,
+}: {
+  target: string
+  conversationId: number | null
+  onSnapshot: (snapshot: MenuLayoutSnapshot) => void
+}) {
+  useLayoutEffect(() => {
+    const menu = document.querySelector<HTMLElement>("[role='menu']")
+    if (!menu) return
+    const items = Array.from(
+      menu.querySelectorAll<HTMLElement>("[role='menuitem']")
+    )
+    const disabled = (label: string | RegExp) => {
+      const menuItem = items.find((candidate) =>
+        typeof label === "string"
+          ? candidate.textContent === label
+          : label.test(candidate.textContent ?? "")
+      )
+      return menuItem ? menuItem.hasAttribute("data-disabled") : null
+    }
+    onSnapshot({
+      target,
+      conversationId,
+      revealDisabled: disabled(/^Open in/),
+      relativeDisabled: disabled("Copy relative path"),
+      absoluteDisabled: disabled("Copy absolute path"),
+    })
+  }, [conversationId, onSnapshot, target])
+
+  return null
+}
+
 function actionsTree(
   target: string,
-  scope: GrokSessionImageScopeValue | null = null
+  scope: GrokSessionImageScopeValue | null = null,
+  onMenuLayout?: (snapshot: MenuLayoutSnapshot) => void
 ) {
   return (
     // The outer handler stands in for the conversation panel's own context menu
@@ -63,16 +108,25 @@ function actionsTree(
     <NextIntlClientProvider locale="en" messages={enMessages}>
       <GrokConversationProvider conversationId={scope?.conversationId ?? null}>
         <GrokSessionImageScope phase={scope?.phase ?? null}>
-          <div
-            onContextMenu={mocks.ancestorContextMenu}
-            onPointerDown={mocks.ancestorPointerDown}
-          >
-            <FileReferenceActions target={target}>
-              <button type="button" data-testid="badge">
-                app.ts
-              </button>
-            </FileReferenceActions>
-          </div>
+          <>
+            <div
+              onContextMenu={mocks.ancestorContextMenu}
+              onPointerDown={mocks.ancestorPointerDown}
+            >
+              <FileReferenceActions target={target}>
+                <button type="button" data-testid="badge">
+                  app.ts
+                </button>
+              </FileReferenceActions>
+            </div>
+            {onMenuLayout ? (
+              <MenuLayoutObserver
+                target={target}
+                conversationId={scope?.conversationId ?? null}
+                onSnapshot={onMenuLayout}
+              />
+            ) : null}
+          </>
         </GrokSessionImageScope>
       </GrokConversationProvider>
     </NextIntlClientProvider>
@@ -81,9 +135,10 @@ function actionsTree(
 
 function renderActions(
   target: string,
-  scope: GrokSessionImageScopeValue | null = null
+  scope: GrokSessionImageScopeValue | null = null,
+  onMenuLayout?: (snapshot: MenuLayoutSnapshot) => void
 ) {
-  return render(actionsTree(target, scope))
+  return render(actionsTree(target, scope, onMenuLayout))
 }
 
 function deferred<T>() {
@@ -474,6 +529,112 @@ describe("FileReferenceActions", () => {
       })
     })
     expect(item("Copy absolute path")).not.toHaveAttribute("data-disabled")
+  })
+
+  it("committed_target_and_scope_changes_fail_closed_before_passive_effects", async () => {
+    const targetB = deferred<GrokSessionImageResolution>()
+    const scopeB = deferred<GrokSessionImageResolution>()
+    const scopeAAgain = deferred<GrokSessionImageResolution>()
+    mocks.resolveGrokSessionImage
+      .mockResolvedValueOnce({
+        path: "/workspace/images/a.png",
+        origin: "workspace",
+        mimeType: "image/png",
+      })
+      .mockReturnValueOnce(targetB.promise)
+      .mockReturnValueOnce(scopeB.promise)
+      .mockReturnValueOnce(scopeAAgain.promise)
+    const snapshots: MenuLayoutSnapshot[] = []
+    const captureLayout = (snapshot: MenuLayoutSnapshot) => {
+      snapshots.push(snapshot)
+    }
+    const latestSnapshot = () => snapshots[snapshots.length - 1]
+    const view = renderActions(
+      "images/a.png",
+      { conversationId: 42, phase: "complete" },
+      captureLayout
+    )
+    openMenu()
+    await waitFor(() =>
+      expect(item("Copy absolute path")).not.toHaveAttribute("data-disabled")
+    )
+
+    view.rerender(
+      actionsTree(
+        "images/b.png",
+        { conversationId: 42, phase: "complete" },
+        captureLayout
+      )
+    )
+    expect(latestSnapshot()).toEqual({
+      target: "images/b.png",
+      conversationId: 42,
+      revealDisabled: true,
+      relativeDisabled: true,
+      absoluteDisabled: true,
+    })
+    await waitFor(() =>
+      expect(mocks.resolveGrokSessionImage).toHaveBeenCalledTimes(2)
+    )
+
+    await act(async () => {
+      targetB.resolve({
+        path: "/workspace/images/b.png",
+        origin: "workspace",
+        mimeType: "image/png",
+      })
+    })
+    expect(item("Copy absolute path")).not.toHaveAttribute("data-disabled")
+
+    view.rerender(
+      actionsTree(
+        "images/b.png",
+        { conversationId: 43, phase: "complete" },
+        captureLayout
+      )
+    )
+    expect(latestSnapshot()).toEqual({
+      target: "images/b.png",
+      conversationId: 43,
+      revealDisabled: true,
+      relativeDisabled: true,
+      absoluteDisabled: true,
+    })
+    await waitFor(() =>
+      expect(mocks.resolveGrokSessionImage).toHaveBeenCalledTimes(3)
+    )
+
+    view.rerender(
+      actionsTree(
+        "images/b.png",
+        { conversationId: 42, phase: "complete" },
+        captureLayout
+      )
+    )
+    expect(latestSnapshot()).toEqual({
+      target: "images/b.png",
+      conversationId: 42,
+      revealDisabled: true,
+      relativeDisabled: true,
+      absoluteDisabled: true,
+    })
+    await waitFor(() =>
+      expect(mocks.resolveGrokSessionImage).toHaveBeenCalledTimes(4)
+    )
+
+    view.unmount()
+    await act(async () => {
+      scopeB.resolve({
+        path: "/workspace/images/b.png",
+        origin: "workspace",
+        mimeType: "image/png",
+      })
+      scopeAAgain.resolve({
+        path: "/workspace/images/b.png",
+        origin: "workspace",
+        mimeType: "image/png",
+      })
+    })
   })
 
   it("malformed_menu_resolution_fails_closed", async () => {
