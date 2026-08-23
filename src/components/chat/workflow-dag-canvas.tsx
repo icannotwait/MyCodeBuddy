@@ -156,7 +156,7 @@ export function WorkflowDagCanvas({
       !position && "w-full",
       estimated && "border-dashed text-muted-foreground opacity-80",
       current && "border-s-2 border-s-blue-500",
-      selected && "ring-2 ring-blue-500 ring-inset",
+      selected && "inset-ring-2 inset-ring-blue-500",
       node.status === "blocked" && "border-destructive/70"
     )
     const style = position

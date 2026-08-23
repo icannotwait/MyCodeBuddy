@@ -895,6 +895,22 @@ describe("WorkflowDagCanvas", () => {
     expect(screen.queryByTestId("workflow-dag-svg")).not.toBeInTheDocument()
   })
 
+  it("keeps selection and focus-visible rings in independent visual channels", () => {
+    renderDagCanvas(simpleDagGraph())
+    publishDagWidth(288)
+
+    const selected = screen.getByTestId("workflow-dag-node-t2-primary")
+    selected.focus()
+
+    expect(selected).toHaveFocus()
+    expect(selected).toHaveClass("inset-ring-2", "inset-ring-blue-500")
+    expect(selected).toHaveClass(
+      "focus-visible:ring-2",
+      "focus-visible:ring-ring",
+      "focus-visible:ring-offset-2"
+    )
+  })
+
   it("derives screen-reader relationships from edges, not node.deps", () => {
     const graph = simpleDagGraph()
     graph.nodes = graph.nodes.map((item) => ({
