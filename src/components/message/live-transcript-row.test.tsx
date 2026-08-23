@@ -91,6 +91,20 @@ vi.mock("./content-parts-renderer", () => ({
   ),
 }))
 
+vi.mock("@/components/ai-elements/grok-session-image-context", () => ({
+  GrokConversationProvider: ({ children }: { children: React.ReactNode }) =>
+    children,
+  GrokSessionImageScope: ({
+    children,
+    phase,
+  }: {
+    children: React.ReactNode
+    phase: "live" | "complete" | null
+  }) => <div data-grok-phase={phase ?? undefined}>{children}</div>,
+  useGrokConversationId: () => null,
+  useGrokSessionImageScope: () => null,
+}))
+
 import {
   adaptLiveToolPart,
   buildLiveFooterItems,
@@ -526,6 +540,40 @@ describe("LiveTranscriptRow", () => {
     renderRow()
     expect(screen.getByTestId("live-transcript-row")).toBeInTheDocument()
     expect(screen.getByTestId("message-response")).toHaveTextContent("hello")
+  })
+
+  it("scopes only Grok live text and excludes tool segments", () => {
+    const message: LiveMessage = {
+      id: "grok-text-and-tool",
+      role: "assistant",
+      content: [
+        { type: "text", text: "grok live text" },
+        { type: "tool_call", info: tool("scope-tool") },
+      ],
+      startedAt: 1,
+    }
+    liveTranscriptStore.rebuild(CID, "c1", message, 2)
+    render(
+      <NextIntlClientProvider locale="en" messages={enMessages}>
+        <LiveTranscriptRow conversationId={CID} agentType="grok" showThinking />
+      </NextIntlClientProvider>
+    )
+
+    expect(
+      screen.getByText("grok live text").closest("[data-grok-phase]")
+    ).toHaveAttribute("data-grok-phase", "live")
+    expect(
+      screen.getByTestId("tool-part-scope-tool").closest("[data-grok-phase]")
+    ).toBeNull()
+  })
+
+  it("does not scope non-Grok live text", () => {
+    liveTranscriptStore.rebuild(CID, "c1", liveMessage("codex live text"), 1)
+    renderRow()
+
+    expect(
+      screen.getByText("codex live text").closest("[data-grok-phase]")
+    ).toBeNull()
   })
 
   it("hides the exact live interrupt marker on parent and child sessions", () => {

@@ -176,10 +176,37 @@ vi.mock("@/components/ai-elements/reasoning", () => ({
   ),
 }))
 
+vi.mock("@/components/ai-elements/grok-session-image-context", () => ({
+  GrokConversationProvider: ({
+    children,
+    conversationId,
+  }: {
+    children: ReactNode
+    conversationId: number | null
+  }) => (
+    <div
+      data-testid="grok-conversation-provider"
+      data-grok-conversation-id={conversationId ?? "none"}
+    >
+      {children}
+    </div>
+  ),
+  GrokSessionImageScope: ({
+    children,
+    phase,
+  }: {
+    children: ReactNode
+    phase: "live" | "complete" | null
+  }) => <div data-grok-phase={phase ?? undefined}>{children}</div>,
+  useGrokConversationId: () => null,
+  useGrokSessionImageScope: () => null,
+}))
+
 vi.mock("./content-parts-renderer", () => ({
   ContentPartsRenderer: ({
     parts,
     autolinkLocalPathParts,
+    grokSessionImagePhase,
   }: {
     parts: Array<{
       type: string
@@ -194,8 +221,12 @@ vi.mock("./content-parts-renderer", () => ({
       type: string
       text?: string
     }>
+    grokSessionImagePhase?: "live" | "complete" | null
   }) => (
-    <div data-testid="content-parts">
+    <div
+      data-testid="content-parts"
+      data-grok-phase={grokSessionImagePhase ?? undefined}
+    >
       {parts.map((part, index) =>
         part.type === "text" ? (
           <span
@@ -756,12 +787,13 @@ function messageListUi(options?: {
   isActive?: boolean
   workspaceRootPath?: string | null
   conversationId?: number
+  agentType?: "codex" | "grok"
 }) {
   return (
     <NextIntlClientProvider locale="en" messages={enMessages}>
       <MessageListView
         conversationId={options?.conversationId ?? CID}
-        agentType="codex"
+        agentType={options?.agentType ?? "codex"}
         connStatus={options?.connStatus ?? "prompting"}
         isActive={options?.isActive ?? true}
         workspaceRootPath={options?.workspaceRootPath ?? null}
@@ -780,9 +812,106 @@ function renderMessageList(options?: {
   isActive?: boolean
   workspaceRootPath?: string | null
   conversationId?: number
+  agentType?: "codex" | "grok"
 }) {
   return render(messageListUi(options))
 }
+
+describe("MessageListView Grok durable identity and phases", () => {
+  beforeEach(() => {
+    resetConversationRuntimeStore()
+    __resetLiveTranscriptStoreForTests()
+    __resetStreamingPerformanceConfigForTests()
+  })
+
+  afterEach(() => {
+    cleanup()
+    resetConversationRuntimeStore()
+    __resetLiveTranscriptStoreForTests()
+    __resetStreamingPerformanceConfigForTests()
+  })
+
+  it("provides the positive durable binding for a virtual Grok conversation", () => {
+    seedHistory(undefined, { runtimeId: -7, dbConversationId: 42 })
+
+    renderMessageList({ conversationId: -7, agentType: "grok" })
+
+    expect(screen.getByTestId("grok-conversation-provider")).toHaveAttribute(
+      "data-grok-conversation-id",
+      "42"
+    )
+  })
+
+  it("does not provide a virtual Grok id without a durable binding", () => {
+    seedHistory(undefined, { runtimeId: -7, dbConversationId: null })
+
+    renderMessageList({ conversationId: -7, agentType: "grok" })
+
+    expect(screen.getByTestId("grok-conversation-provider")).toHaveAttribute(
+      "data-grok-conversation-id",
+      "none"
+    )
+  })
+
+  it("does not provide a durable id for non-Grok conversations", () => {
+    seedHistory(undefined, { runtimeId: 42, dbConversationId: 42 })
+
+    renderMessageList({ conversationId: 42, agentType: "codex" })
+
+    expect(screen.getByTestId("grok-conversation-provider")).toHaveAttribute(
+      "data-grok-conversation-id",
+      "none"
+    )
+  })
+
+  it("reacts when a mounted virtual Grok conversation gains a durable binding", async () => {
+    seedHistory(undefined, { runtimeId: -7, dbConversationId: null })
+    renderMessageList({ conversationId: -7, agentType: "grok" })
+    expect(screen.getByTestId("grok-conversation-provider")).toHaveAttribute(
+      "data-grok-conversation-id",
+      "none"
+    )
+
+    act(() => {
+      useConversationRuntimeStore.setState((state) => {
+        const session = state.byConversationId.get(-7)
+        if (!session) throw new Error("virtual conversation fixture is missing")
+        const byConversationId = new Map(state.byConversationId)
+        byConversationId.set(-7, { ...session, dbConversationId: 42 })
+        return { byConversationId }
+      })
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("grok-conversation-provider")).toHaveAttribute(
+        "data-grok-conversation-id",
+        "42"
+      )
+    })
+  })
+
+  it("marks compatibility live history as live and persisted history as complete", () => {
+    seedHistory([
+      userTurn("u1", "hello"),
+      assistantTurn("a1", "prior reply"),
+      userTurn("u2", "follow up"),
+    ])
+    act(() => {
+      useConversationRuntimeStore
+        .getState()
+        .actions.setLiveMessage(CID, liveMessage("compat live reply"), true)
+    })
+
+    renderMessageList({ agentType: "grok" })
+
+    expect(
+      screen.getByText("prior reply").closest("[data-grok-phase]")
+    ).toHaveAttribute("data-grok-phase", "complete")
+    expect(
+      screen.getByText("compat live reply").closest("[data-grok-phase]")
+    ).toHaveAttribute("data-grok-phase", "live")
+  })
+})
 
 function assistantTexts(): string[] {
   return screen
