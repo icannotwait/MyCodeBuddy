@@ -676,6 +676,7 @@ export function mergeConsecutiveAssistantTurns(
         for (const s of skipped) result.push(s)
         skipped.length = 0
       } else if (
+        buffer[buffer.length - 1].phase !== item.phase ||
         shouldFlushAutonomousAssistantRun(buffer[buffer.length - 1], item)
       ) {
         flush()
@@ -1243,8 +1244,18 @@ export function MessageListView({
       [conversationId]
     )
   )
+  const persistedAgentType = useConversationRuntimeStore(
+    useCallback(
+      (s) =>
+        s.byConversationId.get(conversationId)?.detail?.summary.agent_type ??
+        null,
+      [conversationId]
+    )
+  )
   const grokConversationId =
-    agentType === "grok" && durableConversationId > 0
+    agentType === "grok" &&
+    persistedAgentType === "grok" &&
+    durableConversationId > 0
       ? durableConversationId
       : null
   const durableDelegationSources = useDurableDelegationSources(

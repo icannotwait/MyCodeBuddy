@@ -684,7 +684,11 @@ function seedHistory(
     userTurn("u1", "hello"),
     assistantTurn("a1", "prior reply"),
   ],
-  options?: { runtimeId?: number; dbConversationId?: number | null }
+  options?: {
+    runtimeId?: number
+    dbConversationId?: number | null
+    persistedAgentType?: DbConversationSummary["agent_type"]
+  }
 ) {
   const runtimeId = options?.runtimeId ?? CID
   const dbConversationId =
@@ -701,7 +705,7 @@ function seedHistory(
             summary: {
               id: dbConversationId ?? runtimeId,
               folder_id: 1,
-              agent_type: "codex",
+              agent_type: options?.persistedAgentType ?? "codex",
               title: "t",
               title_locked: false,
               auto_title_finalized: false,
@@ -832,7 +836,11 @@ describe("MessageListView Grok durable identity and phases", () => {
   })
 
   it("provides the positive durable binding for a virtual Grok conversation", () => {
-    seedHistory(undefined, { runtimeId: -7, dbConversationId: 42 })
+    seedHistory(undefined, {
+      runtimeId: -7,
+      dbConversationId: 42,
+      persistedAgentType: "grok",
+    })
 
     renderMessageList({ conversationId: -7, agentType: "grok" })
 
@@ -842,8 +850,12 @@ describe("MessageListView Grok durable identity and phases", () => {
     )
   })
 
-  it("does not provide a virtual Grok id without a durable binding", () => {
-    seedHistory(undefined, { runtimeId: -7, dbConversationId: null })
+  it("rejects caller Grok identity when the persisted summary is non-Grok", () => {
+    seedHistory(undefined, {
+      runtimeId: -7,
+      dbConversationId: 42,
+      persistedAgentType: "codex",
+    })
 
     renderMessageList({ conversationId: -7, agentType: "grok" })
 
@@ -853,8 +865,27 @@ describe("MessageListView Grok durable identity and phases", () => {
     )
   })
 
-  it("does not provide a durable id for non-Grok conversations", () => {
-    seedHistory(undefined, { runtimeId: 42, dbConversationId: 42 })
+  it("does not provide a virtual Grok id without a durable binding", () => {
+    seedHistory(undefined, {
+      runtimeId: -7,
+      dbConversationId: null,
+      persistedAgentType: "grok",
+    })
+
+    renderMessageList({ conversationId: -7, agentType: "grok" })
+
+    expect(screen.getByTestId("grok-conversation-provider")).toHaveAttribute(
+      "data-grok-conversation-id",
+      "none"
+    )
+  })
+
+  it("rejects caller non-Grok identity when the persisted summary is Grok", () => {
+    seedHistory(undefined, {
+      runtimeId: 42,
+      dbConversationId: 42,
+      persistedAgentType: "grok",
+    })
 
     renderMessageList({ conversationId: 42, agentType: "codex" })
 
@@ -865,7 +896,11 @@ describe("MessageListView Grok durable identity and phases", () => {
   })
 
   it("reacts when a mounted virtual Grok conversation gains a durable binding", async () => {
-    seedHistory(undefined, { runtimeId: -7, dbConversationId: null })
+    seedHistory(undefined, {
+      runtimeId: -7,
+      dbConversationId: null,
+      persistedAgentType: "grok",
+    })
     renderMessageList({ conversationId: -7, agentType: "grok" })
     expect(screen.getByTestId("grok-conversation-provider")).toHaveAttribute(
       "data-grok-conversation-id",
@@ -891,11 +926,9 @@ describe("MessageListView Grok durable identity and phases", () => {
   })
 
   it("marks compatibility live history as live and persisted history as complete", () => {
-    seedHistory([
-      userTurn("u1", "hello"),
-      assistantTurn("a1", "prior reply"),
-      userTurn("u2", "follow up"),
-    ])
+    seedHistory([userTurn("u1", "hello"), assistantTurn("a1", "prior reply")], {
+      persistedAgentType: "grok",
+    })
     act(() => {
       useConversationRuntimeStore
         .getState()
