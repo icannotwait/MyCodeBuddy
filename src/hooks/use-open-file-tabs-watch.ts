@@ -85,6 +85,7 @@ async function resolveFileChangeDecision(
   fileTabsRef: RefObject<FileWorkspaceTab[]>
 ): Promise<FileChangeDecision> {
   if (tabSnapshot.kind !== "file") return { kind: "none" }
+  if (tabSnapshot.snapshotSource) return { kind: "none" }
   const path = tabSnapshot.path
   if (!path) return { kind: "none" }
   if (tabSnapshot.loading) return { kind: "none" }
@@ -94,6 +95,7 @@ async function resolveFileChangeDecision(
   const stillSameTab = (): FileWorkspaceTab | null => {
     const latestTab = (fileTabsRef.current ?? []).find((t) => t.id === tabId)
     if (!latestTab || latestTab.kind !== "file") return null
+    if (latestTab.snapshotSource) return null
     if (latestTab.path !== path) return null
     if (latestTab.loading) return null
     return latestTab
@@ -210,7 +212,7 @@ export function useOpenFileTabsWatch({
   const watchSignature = useMemo(() => {
     const rootByFolder = new Map<number, string>()
     for (const tab of fileTabs) {
-      if (tab.kind !== "file" || !tab.path) continue
+      if (tab.kind !== "file" || !tab.path || tab.snapshotSource) continue
       const owning = findOwningFolder(tab.path, allFolders)
       if (!owning) continue
       rootByFolder.set(owning.folderId, owning.rootPath)
@@ -250,9 +252,10 @@ export function useOpenFileTabsWatch({
         const openFileTabs = (fileTabsRef.current ?? []).filter(
           (t) =>
             t.kind === "file" &&
-            t.path &&
+            Boolean(t.path) &&
+            !t.snapshotSource &&
             !t.loading &&
-            isPathUnderRoot(t.path, rootPath)
+            isPathUnderRoot(t.path!, rootPath)
         )
         if (openFileTabs.length === 0) return
 
@@ -435,6 +438,7 @@ export function useOpenFileTabsWatch({
     }
     const isTransition = lastActivationCheckedTabIdRef.current !== tab.id
     lastActivationCheckedTabIdRef.current = tab.id
+    if (tab.snapshotSource) return
 
     if (tab.stale && !tab.loading) {
       if (!tab.isDirty) {

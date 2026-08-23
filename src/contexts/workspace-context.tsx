@@ -41,7 +41,7 @@ import {
   saveFileContent,
   saveFileCopy,
 } from "@/lib/api"
-import type { FileEditContent } from "@/lib/types"
+import type { FileEditContent, GrokSessionImageMimeType } from "@/lib/types"
 import {
   expandHomePath,
   findOwningFolder,
@@ -76,6 +76,10 @@ import {
   type WorkspaceExternalConflict,
 } from "@/hooks/use-open-file-tabs-watch"
 import { useOfficeAutoPreview } from "@/lib/office-preview-prefs"
+import {
+  GROK_SESSION_IMAGE_MIME_BY_EXTENSION,
+  parseGrokSessionImageRef,
+} from "@/lib/markdown/grok-session-image"
 
 export type WorkspaceMode = "conversation" | "fusion"
 export type WorkspacePane = "conversation" | "files"
@@ -84,6 +88,19 @@ export type { TranslationTransientMeta, DocumentTranslateFormat }
 type FileWorkspaceTabKind = "file" | "diff" | "rich-diff"
 type FileSaveState = "idle" | "saving" | "error"
 type LineEnding = "lf" | "crlf" | "mixed" | "none"
+
+export type FileSnapshotSource = {
+  type: "grok-session-image"
+  conversationId: number
+  href: string
+}
+
+export type ResolvedImagePreviewInput = {
+  path: string
+  mimeType: GrokSessionImageMimeType
+  dataBase64: string
+  source: FileSnapshotSource
+}
 
 export interface FileWorkspaceTab {
   id: string
@@ -119,6 +136,7 @@ export interface FileWorkspaceTab {
   // True after at least one successful content settle for this tab. Cold
   // open failures (never true) remove the tab; warm failures keep content.
   hasLoadedSuccessfully: boolean
+  snapshotSource?: FileSnapshotSource
   /**
    * Pathless in-memory result tabs (document translation). Not disk-watched;
    * pinned against content eviction until the user closes the tab.
@@ -164,6 +182,9 @@ interface WorkspaceActionsValue {
     path: string,
     options?: OpenFileOptions
   ) => Promise<OpenFileSettleResult>
+  openResolvedImagePreview: (
+    input: ResolvedImagePreviewInput
+  ) => OpenFileSettleResult
   // Refetch the open tab matching the absolute `path` without changing
   // activeFileTabId. No-op when no tab matches or when the tab has unsaved
   // local edits (use markTabsStale for that case).
@@ -851,6 +872,18 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
     return gen
   }, [])
 
+  const supersedeFetchGeneration = useCallback(
+    (tabId: string): number => {
+      const previous = inFlightLoadsRef.current.get(tabId)
+      if (previous !== undefined) {
+        finishOpenSettle(tabId, previous, { ok: false, reason: "stale" })
+      }
+      pendingMaximizeOnSuccessRef.current.delete(tabId)
+      return beginFetchGeneration(tabId)
+    },
+    [beginFetchGeneration, finishOpenSettle]
+  )
+
   const decideLoad = useCallback(
     (
       seed: FileWorkspaceTab,
@@ -894,8 +927,10 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
       // unsaved edits.
       const stalePromotesReload =
         existing.kind === "file" && existing.stale === true && !existing.isDirty
+      const snapshotPromotesReload =
+        existing.kind === "file" && existing.snapshotSource !== undefined
 
-      if (!reload && !stalePromotesReload) {
+      if (!reload && !stalePromotesReload && !snapshotPromotesReload) {
         // Cache hit — nothing to do.
         return { kind: "skip" }
       }
@@ -1104,12 +1139,23 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
       const tabId = buildFileTabId({ kind: "file", path: absPath })
       const existing = fileTabsRef.current.find((t) => t.id === tabId)
       if (!existing || existing.kind !== "file") return
-      if (existing.isDirty) return
+      if (existing.snapshotSource || existing.isDirty) return
       if (inFlightLoadsRef.current.has(tabId)) return
 
       const image = isImageFile(absPath)
 
-      markTabRefreshing(tabId)
+      setFileTabs((prev) =>
+        prev.map((tab) =>
+          tab.id === tabId && !tab.snapshotSource
+            ? {
+                ...tab,
+                loading: true,
+                saveState: "idle",
+                saveError: null,
+              }
+            : tab
+        )
+      )
       const gen = beginFetchGeneration(tabId)
 
       try {
@@ -1134,10 +1180,16 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
           }
           setFileTabs((prev) =>
             prev.map((tab) =>
-              tab.id === tabId ? { ...tab, ...imagePatch } : tab
+              tab.id === tabId && !tab.snapshotSource
+                ? { ...tab, ...imagePatch }
+                : tab
             )
           )
-          patchFileTabRef(tabId, imagePatch)
+          if (
+            !fileTabsRef.current.find((tab) => tab.id === tabId)?.snapshotSource
+          ) {
+            patchFileTabRef(tabId, imagePatch)
+          }
           return
         }
 
@@ -1166,9 +1218,17 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
           hasLoadedSuccessfully: true as const,
         }
         setFileTabs((prev) =>
-          prev.map((tab) => (tab.id === tabId ? { ...tab, ...textPatch } : tab))
+          prev.map((tab) =>
+            tab.id === tabId && !tab.snapshotSource
+              ? { ...tab, ...textPatch }
+              : tab
+          )
         )
-        patchFileTabRef(tabId, textPatch)
+        if (
+          !fileTabsRef.current.find((tab) => tab.id === tabId)?.snapshotSource
+        ) {
+          patchFileTabRef(tabId, textPatch)
+        }
       } catch (error) {
         if (!settleFetch(tabId, gen)) return
         // Warm toast if previously loaded; no-op path when tab was closed
@@ -1182,7 +1242,6 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
       beginFetchGeneration,
       failOpenTab,
       fetchGitBase,
-      markTabRefreshing,
       patchFileTabRef,
       settleFetch,
       t,
@@ -1202,7 +1261,7 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
       const idx = prev.findIndex((tab) => tab.id === tabId)
       if (idx < 0) return prev
       const tab = prev[idx]
-      if (tab.stale === true) return prev
+      if (tab.snapshotSource || tab.stale === true) return prev
       const updated = [...prev]
       updated[idx] = { ...tab, stale: true }
       return updated
@@ -1223,7 +1282,9 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
     setFileTabs((prev) => {
       let changed = false
       const next = prev.map((tab) => {
-        if (!tabIds.has(tab.id) || tab.kind !== "file") return tab
+        if (!tabIds.has(tab.id) || tab.kind !== "file" || tab.snapshotSource) {
+          return tab
+        }
         if (tab.stale === true) return tab
         changed = true
         return { ...tab, stale: true }
@@ -1257,7 +1318,9 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
       // setFileTabs updater below, where prev reflects every earlier
       // queued updater (including the keystroke).
       const existing = fileTabsRef.current.find((t) => t.id === tabId)
-      if (!existing || existing.kind !== "file") return
+      if (!existing || existing.kind !== "file" || existing.snapshotSource) {
+        return
+      }
 
       const gen = beginFetchGeneration(tabId)
       const fetchedEtag = fetched.etag
@@ -1271,6 +1334,7 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
       setFileTabs((prev) =>
         prev.map((tab) => {
           if (tab.id !== tabId || tab.kind !== "file") return tab
+          if (tab.snapshotSource) return tab
           if (tab.isDirty) return { ...tab, stale: true }
           return {
             ...tab,
@@ -1319,6 +1383,7 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
           setFileTabs((prev) =>
             prev.map((tab) => {
               if (tab.id !== tabId || tab.kind !== "file") return tab
+              if (tab.snapshotSource) return tab
               if (tab.etag !== fetchedEtag) return tab
               return {
                 ...tab,
@@ -1347,7 +1412,9 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
       // Outer existence check only; the dirty guard is atomic inside the
       // updater (see applyExternalReload for the same race shape).
       const existing = fileTabsRef.current.find((t) => t.id === tabId)
-      if (!existing || existing.kind !== "file") return
+      if (!existing || existing.kind !== "file" || existing.snapshotSource) {
+        return
+      }
 
       // Bump generation so any concurrent fetch's settle is invalidated
       // and cannot overwrite the error message we are about to write.
@@ -1355,6 +1422,7 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
       setFileTabs((prev) =>
         prev.map((tab) => {
           if (tab.id !== tabId || tab.kind !== "file") return tab
+          if (tab.snapshotSource) return tab
           // Symmetric with applyExternalReload's dirty refusal: surface
           // the divergence via stale rather than silently no-op. Callers
           // typically also call markTabsStale, so this is usually
@@ -1379,7 +1447,14 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
       )
       // Mirror ref so same-turn openFilePreview retry sees savedContent.
       fileTabsRef.current = fileTabsRef.current.map((tab) => {
-        if (tab.id !== tabId || tab.kind !== "file" || tab.isDirty) return tab
+        if (
+          tab.id !== tabId ||
+          tab.kind !== "file" ||
+          tab.snapshotSource ||
+          tab.isDirty
+        ) {
+          return tab
+        }
         const preservedSaved =
           typeof tab.savedContent === "string" && tab.savedContent.length > 0
             ? tab.savedContent
@@ -1397,6 +1472,77 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
       settleFetch(tabId, gen)
     },
     [beginFetchGeneration, settleFetch, t]
+  )
+
+  const openResolvedImagePreview = useCallback(
+    (input: ResolvedImagePreviewInput): OpenFileSettleResult => {
+      const parsedSource = parseGrokSessionImageRef(input.source.href)
+      if (
+        !isAbsoluteFilePath(input.path) ||
+        input.source.type !== "grok-session-image" ||
+        !Number.isInteger(input.source.conversationId) ||
+        input.source.conversationId <= 0 ||
+        !parsedSource ||
+        parsedSource.path !== input.source.href ||
+        GROK_SESSION_IMAGE_MIME_BY_EXTENSION[parsedSource.extension] !==
+          input.mimeType ||
+        typeof input.dataBase64 !== "string" ||
+        input.dataBase64.trim().length === 0
+      ) {
+        return { ok: false, reason: "resolve" }
+      }
+
+      let absPath = normalizeAbsPath(input.path)
+      const owning = findOwningFolder(
+        absPath,
+        useAppWorkspaceStore.getState().allFolders
+      )
+      if (owning) absPath = joinRootRel(owning.rootPath, owning.relPath)
+      if (!splitAbsPath(absPath)) return { ok: false, reason: "resolve" }
+
+      const tabId = buildFileTabId({ kind: "file", path: absPath })
+      const gen = supersedeFetchGeneration(tabId)
+      const imageContent = `data:${input.mimeType};base64,${input.dataBase64}`
+      const nextTab: FileWorkspaceTab = {
+        id: tabId,
+        kind: "file",
+        folderId: null,
+        title: fileName(absPath),
+        description: absPath,
+        path: absPath,
+        language: "image",
+        content: imageContent,
+        loading: false,
+        savedContent: imageContent,
+        isDirty: false,
+        etag: null,
+        mtimeMs: null,
+        readonly: true,
+        lineEnding: "none",
+        saveState: "idle",
+        saveError: null,
+        stale: false,
+        hasLoadedSuccessfully: true,
+        snapshotSource: { ...input.source },
+      }
+      const upsert = (tabs: FileWorkspaceTab[]) => {
+        const index = tabs.findIndex((tab) => tab.id === tabId)
+        if (index < 0) return [...tabs, nextTab]
+        const next = [...tabs]
+        next[index] = nextTab
+        return next
+      }
+      fileTabsRef.current = upsert(fileTabsRef.current)
+      setFileTabs(upsert)
+      settleFetch(tabId, gen)
+      setPendingFileReveal(null)
+      setActiveFileTabId(tabId)
+      activeFileTabIdRef.current = tabId
+      activateFilePane()
+      setFilesMaximized(true)
+      return { ok: true, tabId }
+    },
+    [activateFilePane, settleFetch, supersedeFetchGeneration]
   )
 
   const openFilePreview = useCallback(
@@ -1485,6 +1631,7 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
               saveError: null,
               stale: false,
               hasLoadedSuccessfully: true as const,
+              snapshotSource: undefined,
             }
             setFileTabs((prev) =>
               prev.map((tab) =>
@@ -1519,6 +1666,7 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
               saveError: null,
               stale: false,
               hasLoadedSuccessfully: true as const,
+              snapshotSource: undefined,
             }
             setFileTabs((prev) =>
               prev.map((tab) =>
@@ -1557,6 +1705,7 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
             loading: false,
             stale: false,
             hasLoadedSuccessfully: true as const,
+            snapshotSource: undefined,
           }
           setFileTabs((prev) =>
             prev.map((tab) =>
@@ -2445,14 +2594,16 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
       const tab = fileTabsRef.current.find(
         (candidate) => candidate.id === tabId
       )
-      if (!tab || tab.kind !== "file" || !tab.path) return
+      if (!tab || tab.kind !== "file" || !tab.path || tab.snapshotSource) {
+        return
+      }
       const tabPath = tab.path
       const io = splitAbsPath(tabPath)
       if (!io) return
 
       setFileTabs((prev) =>
         prev.map((candidate) =>
-          candidate.id === tabId
+          candidate.id === tabId && !candidate.snapshotSource
             ? {
                 ...candidate,
                 loading: true,
@@ -2474,7 +2625,7 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
         )
         setFileTabs((prev) =>
           prev.map((candidate) =>
-            candidate.id === tabId
+            candidate.id === tabId && !candidate.snapshotSource
               ? {
                   ...candidate,
                   content: result.content,
@@ -2500,7 +2651,7 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
         const message = toErrorMessage(error)
         setFileTabs((prev) =>
           prev.map((candidate) =>
-            candidate.id === tabId
+            candidate.id === tabId && !candidate.snapshotSource
               ? {
                   ...candidate,
                   loading: false,
@@ -2770,6 +2921,7 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
           !tab.loading &&
           tab.saveState !== "saving" &&
           tab.content.length > 0 &&
+          !tab.snapshotSource &&
           tab.transient?.type !== "translation"
       )
       .map((tab) => ({
@@ -2796,7 +2948,12 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
         if (!toUnload.has(tab.id) || tab.kind !== "file") return tab
         // Atomic re-check: a keystroke/save enqueued in the same batch
         // must win over the eviction.
-        if (tab.isDirty || tab.loading || tab.saveState === "saving") {
+        if (
+          tab.snapshotSource ||
+          tab.isDirty ||
+          tab.loading ||
+          tab.saveState === "saving"
+        ) {
           return tab
         }
         return {
@@ -2982,6 +3139,7 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
       closeAllFileTabs,
       reorderFileTabs,
       openFilePreview,
+      openResolvedImagePreview,
       reloadOpenFileBackground,
       applyExternalReload,
       markTabsStale,
@@ -3012,6 +3170,7 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
       closeAllFileTabs,
       reorderFileTabs,
       openFilePreview,
+      openResolvedImagePreview,
       reloadOpenFileBackground,
       applyExternalReload,
       markTabsStale,
