@@ -1,10 +1,11 @@
 "use client"
 
 import type { ReactNode } from "react"
-import { useMemo } from "react"
+import { useEffect, useMemo, useState } from "react"
 import { useTranslations } from "next-intl"
 import { toast } from "sonner"
 
+import { useGrokSessionImageScope } from "@/components/ai-elements/grok-session-image-context"
 import { parseLocalFileTarget } from "@/components/ai-elements/link-safety"
 import {
   ContextMenu,
@@ -13,12 +14,18 @@ import {
   ContextMenuTrigger,
 } from "@/components/ui/context-menu"
 import { useActiveFolder } from "@/contexts/active-folder-context"
+import { resolveGrokSessionImage } from "@/lib/api"
 import { toErrorMessage } from "@/lib/app-error"
 import { expandHomePath, isHomeRelativePath } from "@/lib/file-open-target"
 import {
+  isAbsoluteFilePath,
   toAbsoluteFilePath,
   toFolderRelativePath,
 } from "@/lib/file-path-display"
+import {
+  GROK_SESSION_IMAGE_MIME_BY_EXTENSION,
+  parseGrokSessionImageRef,
+} from "@/lib/markdown/grok-session-image"
 import { isLocalDesktop, revealItemInDir } from "@/lib/platform"
 import { copyTextFromMenu } from "@/lib/utils"
 
@@ -33,6 +40,17 @@ export interface FileReferencePaths {
   /** Path relative to the active folder; null when the file lives outside it. */
   relative: string | null
 }
+
+type GrokMenuGateToken = Readonly<{ identity: string }>
+
+type GrokMenuResolution =
+  | { token: GrokMenuGateToken; status: "loading"; paths: null }
+  | { token: GrokMenuGateToken | null; status: "failed"; paths: null }
+  | {
+      token: GrokMenuGateToken
+      status: "ready"
+      paths: FileReferencePaths
+    }
 
 /**
  * Resolve a rendered file reference — a `file://` uri (user-message badge) or a
@@ -94,10 +112,98 @@ function FileReferenceActionsMenu({ target }: { target: string }) {
   const t = useTranslations("Folder.chat.fileActions")
   const { activeFolder } = useActiveFolder()
   const folderPath = activeFolder?.path
-  const paths = useMemo(
-    () => resolveFileReferenceTarget(target, folderPath),
-    [target, folderPath]
+  const scope = useGrokSessionImageScope()
+  const grokRef = scope ? parseGrokSessionImageRef(target) : null
+  const canonicalGrokPath = grokRef?.path ?? null
+  const grokExtension = grokRef?.extension ?? null
+  const grokConversationId = scope?.conversationId ?? null
+  const gateIdentity =
+    grokConversationId !== null &&
+    canonicalGrokPath !== null &&
+    grokExtension !== null
+      ? `${grokConversationId}\0${target}\0${canonicalGrokPath}`
+      : null
+  const gateToken = useMemo<GrokMenuGateToken | null>(
+    () => (gateIdentity === null ? null : { identity: gateIdentity }),
+    [gateIdentity]
   )
+  const [grokResolution, setGrokResolution] = useState<GrokMenuResolution>({
+    token: null,
+    status: "failed",
+    paths: null,
+  })
+  const genericPaths = useMemo(
+    () => (gateToken ? null : resolveFileReferenceTarget(target, folderPath)),
+    [gateToken, target, folderPath]
+  )
+
+  useEffect(() => {
+    if (
+      !gateToken ||
+      grokConversationId === null ||
+      canonicalGrokPath === null ||
+      grokExtension === null
+    ) {
+      return
+    }
+    let cancelled = false
+    // Fail closed in the same effect that launches the new keyed request.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setGrokResolution({ token: gateToken, status: "loading", paths: null })
+    void resolveGrokSessionImage({
+      conversationId: grokConversationId,
+      href: target,
+      includeData: false,
+    }).then(
+      (resolution) => {
+        if (cancelled) return
+        if (
+          !resolution ||
+          typeof resolution !== "object" ||
+          typeof resolution.path !== "string" ||
+          !isAbsoluteFilePath(resolution.path) ||
+          (resolution.origin !== "session" &&
+            resolution.origin !== "workspace") ||
+          resolution.mimeType !==
+            GROK_SESSION_IMAGE_MIME_BY_EXTENSION[grokExtension]
+        ) {
+          setGrokResolution({
+            token: gateToken,
+            status: "failed",
+            paths: null,
+          })
+          return
+        }
+        setGrokResolution({
+          token: gateToken,
+          status: "ready",
+          paths: {
+            absolute: resolution.path,
+            relative:
+              resolution.origin === "workspace" ? canonicalGrokPath : null,
+          },
+        })
+      },
+      () => {
+        if (!cancelled) {
+          setGrokResolution({
+            token: gateToken,
+            status: "failed",
+            paths: null,
+          })
+        }
+      }
+    )
+    return () => {
+      cancelled = true
+    }
+  }, [gateToken, grokConversationId, target, canonicalGrokPath, grokExtension])
+
+  const paths = gateToken
+    ? grokResolution.token === gateToken && grokResolution.status === "ready"
+      ? grokResolution.paths
+      : null
+    : genericPaths
 
   const handleReveal = () => {
     if (!paths) return
@@ -177,12 +283,14 @@ export function FileReferenceActions({
 }) {
   // Folder-independent: whether this target is a local file at all. The full
   // resolution (which needs the active folder) happens inside the open menu.
+  const scope = useGrokSessionImageScope()
+  const grokRef = scope ? parseGrokSessionImageRef(target) : null
   const isLocalFile = useMemo(
     () => parseLocalFileTarget(target) !== null,
     [target]
   )
 
-  if (!isLocalFile) return <>{children}</>
+  if (!isLocalFile && !grokRef) return <>{children}</>
 
   return (
     <ContextMenu>

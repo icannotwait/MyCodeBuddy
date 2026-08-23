@@ -27,6 +27,10 @@ import {
   estimateChangedLineStats,
 } from "@/lib/line-change-stats"
 import { MessageResponse } from "@/components/ai-elements/message"
+import {
+  GrokSessionImageScope,
+  type GrokSessionImagePhase,
+} from "@/components/ai-elements/grok-session-image-context"
 import { Shimmer } from "@/components/ai-elements/shimmer"
 import {
   Collapsible,
@@ -3146,8 +3150,11 @@ interface ContentPartsRendererProps {
   role?: MessageRole
   parentConversationId?: number | null
   autolinkLocalPathParts?: ReadonlySet<AutolinkableTextPart>
+  /** Source-role assistant text identities allowed to activate Grok images. */
+  grokSessionImageTextParts?: ReadonlySet<AutolinkableTextPart>
   /** When false, reasoning parts are not mounted. Defaults true for non-conversation callers. */
   showThinking?: boolean
+  grokSessionImagePhase?: GrokSessionImagePhase | null
 }
 
 export const ContentPartsRenderer = memo(function ContentPartsRenderer({
@@ -3155,7 +3162,9 @@ export const ContentPartsRenderer = memo(function ContentPartsRenderer({
   role,
   parentConversationId,
   autolinkLocalPathParts,
+  grokSessionImageTextParts,
   showThinking = true,
+  grokSessionImagePhase,
 }: ContentPartsRendererProps) {
   const renderPart = (
     part: AdaptedContentPart,
@@ -3163,6 +3172,26 @@ export const ContentPartsRenderer = memo(function ContentPartsRenderer({
     isTopLevel: boolean
   ): ReactNode => {
     if (part.type === "text") {
+      if (
+        isTopLevel &&
+        role === "assistant" &&
+        (grokSessionImageTextParts?.has(part) ?? false) &&
+        grokSessionImagePhase !== null &&
+        grokSessionImagePhase !== undefined
+      ) {
+        return (
+          <GrokSessionImageScope
+            key={`text-${keyId}`}
+            phase={grokSessionImagePhase}
+          >
+            <TextPart
+              text={part.text}
+              isUser={false}
+              autolinkLocalPaths={autolinkLocalPathParts?.has(part) ?? false}
+            />
+          </GrokSessionImageScope>
+        )
+      }
       return (
         <TextPart
           key={`text-${keyId}`}

@@ -78,6 +78,38 @@ async fn protected_endpoint_accepts_correct_token() {
 }
 
 #[tokio::test]
+async fn grok_session_image_route_rejects_missing_authentication() {
+    let (server, _data, _static) = build_test_server().await;
+    let response = server
+        .post("/api/resolve_grok_session_image")
+        .json(&json!({
+            "conversationId": 999,
+            "href": "images/a.png",
+            "includeData": false
+        }))
+        .await;
+    assert_eq!(response.status_code(), 401);
+}
+
+#[tokio::test]
+async fn grok_session_image_route_returns_structured_not_found_before_filesystem_lookup() {
+    let (server, _data, _static) = build_test_server().await;
+    let response = server
+        .post("/api/resolve_grok_session_image")
+        .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
+        .json(&json!({
+            "conversationId": 999,
+            "href": "images/a.png",
+            "includeData": false
+        }))
+        .await;
+    assert_eq!(response.status_code(), 404);
+    let body: Value = response.json();
+    assert_eq!(body["code"], "not_found");
+    assert!(body.get("dataBase64").is_none());
+}
+
+#[tokio::test]
 async fn repaired_commands_are_registered_in_web_runtime() {
     let (server, _data, _static) = build_test_server().await;
     let workspace = tempfile::tempdir().expect("workspace");

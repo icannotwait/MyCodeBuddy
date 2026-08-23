@@ -176,10 +176,38 @@ vi.mock("@/components/ai-elements/reasoning", () => ({
   ),
 }))
 
+vi.mock("@/components/ai-elements/grok-session-image-context", () => ({
+  GrokConversationProvider: ({
+    children,
+    conversationId,
+  }: {
+    children: ReactNode
+    conversationId: number | null
+  }) => (
+    <div
+      data-testid="grok-conversation-provider"
+      data-grok-conversation-id={conversationId ?? "none"}
+    >
+      {children}
+    </div>
+  ),
+  GrokSessionImageScope: ({
+    children,
+    phase,
+  }: {
+    children: ReactNode
+    phase: "live" | "complete" | null
+  }) => <div data-grok-phase={phase ?? undefined}>{children}</div>,
+  useGrokConversationId: () => null,
+  useGrokSessionImageScope: () => null,
+}))
+
 vi.mock("./content-parts-renderer", () => ({
   ContentPartsRenderer: ({
     parts,
     autolinkLocalPathParts,
+    grokSessionImagePhase,
+    grokSessionImageTextParts,
   }: {
     parts: Array<{
       type: string
@@ -194,8 +222,16 @@ vi.mock("./content-parts-renderer", () => ({
       type: string
       text?: string
     }>
+    grokSessionImagePhase?: "live" | "complete" | null
+    grokSessionImageTextParts?: ReadonlySet<{
+      type: string
+      text?: string
+    }>
   }) => (
-    <div data-testid="content-parts">
+    <div
+      data-testid="content-parts"
+      data-grok-phase={grokSessionImagePhase ?? undefined}
+    >
       {parts.map((part, index) =>
         part.type === "text" ? (
           <span
@@ -203,6 +239,9 @@ vi.mock("./content-parts-renderer", () => ({
             data-testid="assistant-text"
             data-autolink-local-paths={String(
               autolinkLocalPathParts?.has(part) ?? false
+            )}
+            data-grok-session-image-eligible={String(
+              grokSessionImageTextParts?.has(part) ?? false
             )}
           >
             {part.text}
@@ -653,7 +692,11 @@ function seedHistory(
     userTurn("u1", "hello"),
     assistantTurn("a1", "prior reply"),
   ],
-  options?: { runtimeId?: number; dbConversationId?: number | null }
+  options?: {
+    runtimeId?: number
+    dbConversationId?: number | null
+    persistedAgentType?: DbConversationSummary["agent_type"]
+  }
 ) {
   const runtimeId = options?.runtimeId ?? CID
   const dbConversationId =
@@ -670,7 +713,7 @@ function seedHistory(
             summary: {
               id: dbConversationId ?? runtimeId,
               folder_id: 1,
-              agent_type: "codex",
+              agent_type: options?.persistedAgentType ?? "codex",
               title: "t",
               title_locked: false,
               auto_title_finalized: false,
@@ -756,12 +799,13 @@ function messageListUi(options?: {
   isActive?: boolean
   workspaceRootPath?: string | null
   conversationId?: number
+  agentType?: "codex" | "grok"
 }) {
   return (
     <NextIntlClientProvider locale="en" messages={enMessages}>
       <MessageListView
         conversationId={options?.conversationId ?? CID}
-        agentType="codex"
+        agentType={options?.agentType ?? "codex"}
         connStatus={options?.connStatus ?? "prompting"}
         isActive={options?.isActive ?? true}
         workspaceRootPath={options?.workspaceRootPath ?? null}
@@ -780,9 +824,143 @@ function renderMessageList(options?: {
   isActive?: boolean
   workspaceRootPath?: string | null
   conversationId?: number
+  agentType?: "codex" | "grok"
 }) {
   return render(messageListUi(options))
 }
+
+describe("MessageListView Grok durable identity and phases", () => {
+  beforeEach(() => {
+    resetConversationRuntimeStore()
+    __resetLiveTranscriptStoreForTests()
+    __resetStreamingPerformanceConfigForTests()
+  })
+
+  afterEach(() => {
+    cleanup()
+    resetConversationRuntimeStore()
+    __resetLiveTranscriptStoreForTests()
+    __resetStreamingPerformanceConfigForTests()
+  })
+
+  it("provides the positive durable binding for a virtual Grok conversation", () => {
+    seedHistory(undefined, {
+      runtimeId: -7,
+      dbConversationId: 42,
+      persistedAgentType: "grok",
+    })
+
+    renderMessageList({ conversationId: -7, agentType: "grok" })
+
+    expect(screen.getByTestId("grok-conversation-provider")).toHaveAttribute(
+      "data-grok-conversation-id",
+      "42"
+    )
+  })
+
+  it("rejects caller Grok identity when the persisted summary is non-Grok", () => {
+    seedHistory(undefined, {
+      runtimeId: -7,
+      dbConversationId: 42,
+      persistedAgentType: "codex",
+    })
+
+    renderMessageList({ conversationId: -7, agentType: "grok" })
+
+    expect(screen.getByTestId("grok-conversation-provider")).toHaveAttribute(
+      "data-grok-conversation-id",
+      "none"
+    )
+  })
+
+  it("does not provide a virtual Grok id without a durable binding", () => {
+    seedHistory(undefined, {
+      runtimeId: -7,
+      dbConversationId: null,
+      persistedAgentType: "grok",
+    })
+
+    renderMessageList({ conversationId: -7, agentType: "grok" })
+
+    expect(screen.getByTestId("grok-conversation-provider")).toHaveAttribute(
+      "data-grok-conversation-id",
+      "none"
+    )
+  })
+
+  it("rejects caller non-Grok identity when the persisted summary is Grok", () => {
+    seedHistory(undefined, {
+      runtimeId: 42,
+      dbConversationId: 42,
+      persistedAgentType: "grok",
+    })
+
+    renderMessageList({ conversationId: 42, agentType: "codex" })
+
+    expect(screen.getByTestId("grok-conversation-provider")).toHaveAttribute(
+      "data-grok-conversation-id",
+      "none"
+    )
+  })
+
+  it("reacts when a mounted virtual Grok conversation gains a durable binding", async () => {
+    seedHistory(undefined, {
+      runtimeId: -7,
+      dbConversationId: null,
+      persistedAgentType: "grok",
+    })
+    renderMessageList({ conversationId: -7, agentType: "grok" })
+    expect(screen.getByTestId("grok-conversation-provider")).toHaveAttribute(
+      "data-grok-conversation-id",
+      "none"
+    )
+
+    act(() => {
+      useConversationRuntimeStore.setState((state) => {
+        const session = state.byConversationId.get(-7)
+        if (!session) throw new Error("virtual conversation fixture is missing")
+        const byConversationId = new Map(state.byConversationId)
+        byConversationId.set(-7, { ...session, dbConversationId: 42 })
+        return { byConversationId }
+      })
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("grok-conversation-provider")).toHaveAttribute(
+        "data-grok-conversation-id",
+        "42"
+      )
+    })
+  })
+
+  it("marks compatibility live history as live and persisted history as complete", () => {
+    seedHistory([userTurn("u1", "hello"), assistantTurn("a1", "prior reply")], {
+      persistedAgentType: "grok",
+    })
+    act(() => {
+      useConversationRuntimeStore
+        .getState()
+        .actions.setLiveMessage(CID, liveMessage("compat live reply"), true)
+    })
+
+    renderMessageList({ agentType: "grok" })
+
+    expect(
+      screen.getByText("prior reply").closest("[data-grok-phase]")
+    ).toHaveAttribute("data-grok-phase", "complete")
+    expect(screen.getByText("prior reply")).toHaveAttribute(
+      "data-grok-session-image-eligible",
+      "true"
+    )
+    expect(
+      screen.getByText("compat live reply").closest("[data-grok-phase]")
+    ).toHaveAttribute("data-grok-phase", "live")
+    expect(screen.getByText("compat live reply")).toHaveAttribute(
+      "data-grok-session-image-eligible",
+      "true"
+    )
+  })
+})
 
 function assistantTexts(): string[] {
   return screen
@@ -817,6 +995,7 @@ function assistantItem(
       resources: [],
       images: [],
       autolinkableTextParts: new Set(),
+      grokSessionImageTextParts: new Set(),
       ...groupOverrides,
     },
     phase: "persisted",
@@ -1229,14 +1408,36 @@ describe("MessageListView live footer isolation", () => {
       toolTurn("t1", toolText),
     ])
 
-    renderMessageList()
+    renderMessageList({ agentType: "grok" })
 
     expect(screen.getByText(assistantText)).toHaveAttribute(
       "data-autolink-local-paths",
       "true"
     )
+    expect(screen.getByText(assistantText)).toHaveAttribute(
+      "data-grok-session-image-eligible",
+      "true"
+    )
     expect(screen.getByText(toolText)).toHaveAttribute(
       "data-autolink-local-paths",
+      "false"
+    )
+    expect(screen.getByText(toolText)).toHaveAttribute(
+      "data-grok-session-image-eligible",
+      "false"
+    )
+  })
+
+  it("keeps standalone source-tool Markdown outside Grok image scope", () => {
+    const toolText = "![tool](images/tool.png)"
+    seedHistory([userTurn("u1", "hello"), toolTurn("t1", toolText)], {
+      persistedAgentType: "grok",
+    })
+
+    renderMessageList({ agentType: "grok" })
+
+    expect(screen.getByText(toolText)).toHaveAttribute(
+      "data-grok-session-image-eligible",
       "false"
     )
   })
@@ -1954,6 +2155,7 @@ function makeGroup(
     resources: [],
     images: [],
     autolinkableTextParts: new Set(),
+    grokSessionImageTextParts: new Set(),
   }
 }
 

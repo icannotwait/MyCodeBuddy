@@ -29,6 +29,7 @@ import type {
 } from "@/contexts/acp-connections-context"
 import { useAgentThinkingVisibility } from "@/hooks/use-acp-agents"
 import { isWindowedDetail } from "@/lib/turn-window"
+import { GrokConversationProvider } from "@/components/ai-elements/grok-session-image-context"
 import { ContentPartsRenderer } from "./content-parts-renderer"
 import { LiveTranscriptRow } from "./live-transcript-row"
 import { ContextCompactionCard } from "./context-compaction-card"
@@ -194,6 +195,12 @@ export interface ResolvedMessageGroup {
    * is display-normalized to assistant is intentionally excluded.
    */
   autolinkableTextParts: ReadonlySet<AutolinkableTextPart>
+  /**
+   * Top-level text identities whose original adapted/source role was
+   * `assistant`. Kept separate from the display role because source `tool`
+   * turns are rendered in assistant bubbles and can be merged into them.
+   */
+  grokSessionImageTextParts: ReadonlySet<AutolinkableTextPart>
   usage?: import("@/lib/types").TurnUsage | null
   duration_ms?: number | null
   generation_ms?: number | null
@@ -548,9 +555,13 @@ export function mergeConsecutiveAssistantTurns(
       // Union source-assistant text identities across sub-turns so eligibility
       // survives display-role merges (tool text identities stay out).
       const mergedAutolinkableTextParts = new Set<AutolinkableTextPart>()
+      const mergedGrokSessionImageTextParts = new Set<AutolinkableTextPart>()
       for (const item of buffer) {
         for (const part of item.group.autolinkableTextParts) {
           mergedAutolinkableTextParts.add(part)
+        }
+        for (const part of item.group.grokSessionImageTextParts) {
+          mergedGrokSessionImageTextParts.add(part)
         }
       }
 
@@ -637,6 +648,10 @@ export function mergeConsecutiveAssistantTurns(
             mergedAutolinkableTextParts.size > 0
               ? mergedAutolinkableTextParts
               : EMPTY_AUTOLINKABLE_TEXT_PARTS,
+          grokSessionImageTextParts:
+            mergedGrokSessionImageTextParts.size > 0
+              ? mergedGrokSessionImageTextParts
+              : EMPTY_AUTOLINKABLE_TEXT_PARTS,
           usage: mergedUsage,
           duration_ms: mergedDuration,
           generation_ms: mergedGenerationMs,
@@ -675,6 +690,7 @@ export function mergeConsecutiveAssistantTurns(
         for (const s of skipped) result.push(s)
         skipped.length = 0
       } else if (
+        buffer[buffer.length - 1].phase !== item.phase ||
         shouldFlushAutonomousAssistantRun(buffer[buffer.length - 1], item)
       ) {
         flush()
@@ -800,6 +816,8 @@ const HistoricalMessageGroup = memo(function HistoricalMessageGroup({
     group.images.length > 0
   const showInterruptedFooter =
     group.role === "assistant" && group.outcome?.status === "interrupted"
+  const grokSessionImagePhase =
+    agentType === "grok" ? (isResponseComplete ? "complete" : "live") : null
 
   return (
     <div className={dimmed ? "opacity-70" : undefined}>
@@ -839,7 +857,9 @@ const HistoricalMessageGroup = memo(function HistoricalMessageGroup({
                 autolinkLocalPathParts={
                   isResponseComplete ? group.autolinkableTextParts : undefined
                 }
+                grokSessionImageTextParts={group.grokSessionImageTextParts}
                 showThinking={showThinking}
+                grokSessionImagePhase={grokSessionImagePhase}
               />
             </MessageContent>
           )}
@@ -1239,6 +1259,20 @@ export function MessageListView({
       [conversationId]
     )
   )
+  const persistedAgentType = useConversationRuntimeStore(
+    useCallback(
+      (s) =>
+        s.byConversationId.get(conversationId)?.detail?.summary.agent_type ??
+        null,
+      [conversationId]
+    )
+  )
+  const grokConversationId =
+    agentType === "grok" &&
+    persistedAgentType === "grok" &&
+    durableConversationId > 0
+      ? durableConversationId
+      : null
   const durableDelegationSources = useDurableDelegationSources(
     durableConversationId
   )
@@ -1469,6 +1503,7 @@ export function MessageListView({
     const rawItems: ThreadRenderItem[] = projected.messages.map((msg, i) => {
       const phase = timelineTurns[i].phase
       const role = msg.role === "tool" ? "assistant" : msg.role
+      const sourceAssistantTextParts = topLevelAssistantTextParts(msg)
       const autonomousOrigin = allTurns[i].autonomous_origin ?? undefined
       let group = groupCache.get(msg)
       if (!group || group.autonomous_origin !== autonomousOrigin) {
@@ -1478,7 +1513,8 @@ export function MessageListView({
           parts: msg.content,
           resources: msg.userResources ?? [],
           images: msg.userImages ?? [],
-          autolinkableTextParts: topLevelAssistantTextParts(msg),
+          autolinkableTextParts: sourceAssistantTextParts,
+          grokSessionImageTextParts: sourceAssistantTextParts,
           usage: msg.usage,
           duration_ms: msg.duration_ms,
           generation_ms: msg.generation_ms,
@@ -1678,7 +1714,7 @@ export function MessageListView({
           return null
       }
     },
-    [showThinking, conversationId, userTurnHeader]
+    [showThinking, conversationId, userTurnHeader, agentType]
   )
 
   const emptyState = useMemo(
@@ -1980,79 +2016,82 @@ export function MessageListView({
   }
 
   return (
-    <div className="relative flex h-full min-h-0 flex-col">
-      <MessageThread
-        className="flex-1 min-h-0"
-        resize={
-          hasLiveTranscript || initialHistoryScrollActive ? "instant" : "smooth"
-        }
-      >
-        <InitialHistoryScrollController
-          pending={initialHistoryScrollActive}
-          historyReady={historyLoadComplete}
-          hasHistoryRows={hasPersistedHistoryRows}
-          onFinish={finishInitialHistoryScroll}
-        />
-        <AutoScrollOnSend signal={sendSignal} />
-        <VirtualizedMessageThread
-          items={threadItems}
-          getItemKey={getThreadItemKey}
-          renderItem={renderThreadItem}
-          emptyState={emptyState}
-          header={
-            historyWindow?.has_more_before ? (
-              <div className="flex justify-center pb-2">
-                <Button
-                  type="button"
-                  size="sm"
-                  variant="outline"
-                  onClick={onLoadOlderHistory}
-                  disabled={detailHistoryLoadingOlder}
-                  aria-busy={detailHistoryLoadingOlder}
-                  data-testid="load-older-history"
-                >
-                  {detailHistoryLoadingOlder ? (
-                    <Loader2
-                      aria-hidden="true"
-                      className="me-1.5 h-3.5 w-3.5 animate-spin"
-                    />
-                  ) : null}
-                  {detailHistoryLoadingOlder
-                    ? t("loading")
-                    : t("loadOlderHistory")}
-                </Button>
-              </div>
-            ) : null
+    <GrokConversationProvider conversationId={grokConversationId}>
+      <div className="relative flex h-full min-h-0 flex-col">
+        <MessageThread
+          className="flex-1 min-h-0"
+          resize={
+            hasLiveTranscript || initialHistoryScrollActive
+              ? "instant"
+              : "smooth"
           }
-          footer={liveFooter}
-          scrollApiRef={scrollApiRef}
-          hasOlder={hasOlderTurns}
-          isLoadingOlder={loadingOlderTurns}
-          onLoadOlder={handleLoadOlder}
-          loadOlderLabel={t("loadEarlier")}
-          loadingOlderLabel={t("loadingEarlier")}
-          prependEpoch={olderTurnsPrependEpoch}
-          prependScopeKey={conversationId}
+        >
+          <InitialHistoryScrollController
+            pending={initialHistoryScrollActive}
+            historyReady={historyLoadComplete}
+            hasHistoryRows={hasPersistedHistoryRows}
+            onFinish={finishInitialHistoryScroll}
+          />
+          <AutoScrollOnSend signal={sendSignal} />
+          <VirtualizedMessageThread
+            items={threadItems}
+            getItemKey={getThreadItemKey}
+            renderItem={renderThreadItem}
+            emptyState={emptyState}
+            header={
+              historyWindow?.has_more_before ? (
+                <div className="flex justify-center pb-2">
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    onClick={onLoadOlderHistory}
+                    disabled={detailHistoryLoadingOlder}
+                    aria-busy={detailHistoryLoadingOlder}
+                    data-testid="load-older-history"
+                  >
+                    {detailHistoryLoadingOlder ? (
+                      <Loader2
+                        aria-hidden="true"
+                        className="me-1.5 h-3.5 w-3.5 animate-spin"
+                      />
+                    ) : null}
+                    {detailHistoryLoadingOlder
+                      ? t("loading")
+                      : t("loadOlderHistory")}
+                  </Button>
+                </div>
+              ) : null
+            }
+            footer={liveFooter}
+            scrollApiRef={scrollApiRef}
+            hasOlder={hasOlderTurns}
+            isLoadingOlder={loadingOlderTurns}
+            onLoadOlder={handleLoadOlder}
+            loadOlderLabel={t("loadEarlier")}
+            loadingOlderLabel={t("loadingEarlier")}
+            prependEpoch={olderTurnsPrependEpoch}
+            prependScopeKey={conversationId}
+          />
+          <MessageThreadScrollButton
+            onBeforeScrollToBottom={() => {
+              scrollApiRef.current?.footerScroll?.markAtBottom()
+            }}
+          />
+        </MessageThread>
+        <LiveTurnStatsBanner
+          conversationId={conversationId}
+          agentType={agentType}
+          isStreaming={
+            connStatus === "prompting" &&
+            (useIncrementalLive ? hasLiveTranscript : Boolean(liveMessage))
+          }
+          isWaitingForSubagents={isWaitingForSubagents}
+          waitingArmedAtMs={
+            isWaitingForSubagents ? waitingForSubagentsArmedAtMs : null
+          }
         />
-        <MessageThreadScrollButton
-          onBeforeScrollToBottom={() => {
-            scrollApiRef.current?.footerScroll?.markAtBottom()
-          }}
-        />
-      </MessageThread>
-      <LiveTurnStatsBanner
-        conversationId={conversationId}
-        agentType={agentType}
-        isStreaming={
-          connStatus === "prompting" &&
-          (useIncrementalLive ? hasLiveTranscript : Boolean(liveMessage))
-        }
-        isWaitingForSubagents={isWaitingForSubagents}
-        waitingArmedAtMs={
-          isWaitingForSubagents ? waitingForSubagentsArmedAtMs : null
-        }
-      />
-      {/* Shared overlay stack pinned to the inline-start edge (top-left in LTR,
+        {/* Shared overlay stack pinned to the inline-start edge (top-left in LTR,
           top-right in RTL). A flex column keeps the order stable regardless of
           each panel's expand/collapse height: the message navigator first, then
           the plan panel, then the sub-agent panel. Empty panels render null and
@@ -2061,62 +2100,63 @@ export function MessageListView({
           edge), rounded on the end side — that expand toward the inline-end on
           hover. Logical `start-0` + `items-start` keep the anchor and the bullet
           on the same side, so the whole stack mirrors cleanly in RTL. */}
-      <div className="pointer-events-none absolute start-0 top-4 z-20 flex max-w-[min(28rem,calc(100%-2rem))] flex-col items-start gap-2">
-        {showMessageNav && userMessageCount > 0 && (
-          <ConversationMessageNav
-            count={userMessageCount}
-            expanded={navExpanded}
-            onToggle={setNavExpanded}
-            entries={navEntries}
-            scrollApiRef={scrollApiRef}
-          />
-        )}
-        {useIncrementalLive ? (
-          <LiveAgentPlanOverlay
-            conversationId={conversationId}
-            entries={historicalPlanEntries}
-            planKey={historicalPlanKey}
-            isStreaming={connStatus === "prompting"}
-          />
-        ) : (
-          <AgentPlanOverlay
-            key={agentPlanOverlayKey}
-            message={liveMessage ?? null}
-            entries={historicalPlanEntries}
-            planKey={historicalPlanKey}
-            defaultExpanded={false}
-            isStreaming={connStatus === "prompting"}
-          />
-        )}
-        {useIncrementalLive ? (
-          <LiveAwareSubAgentOverlay
-            conversationId={conversationId}
-            agentType={agentType}
-            isStreaming={connStatus === "prompting"}
-            historicalDelegations={allSessionDelegations}
-            historicalActivities={sessionActivities}
-            historicalKey={subAgentOverlayKey}
-            workspaceRootPath={workspaceRootPath}
-            isActive={isActive}
-            onResumeRoot={onResumeRoot}
-            onOpenRootConversation={onOpenRootConversation}
-          />
-        ) : (
-          <SubAgentOverlay
-            key={subAgentOverlayKey}
-            delegations={allSessionDelegations}
-            activities={sessionActivities}
-            overlayKey={subAgentOverlayKey}
-            defaultExpanded
-            conversationId={conversationId}
-            workflowGraph={workflowGraph}
-            workspaceRootPath={workspaceRootPath}
-            isActive={isActive}
-            onResumeRoot={onResumeRoot}
-            onOpenRootConversation={onOpenRootConversation}
-          />
-        )}
+        <div className="pointer-events-none absolute start-0 top-4 z-20 flex max-w-[min(28rem,calc(100%-2rem))] flex-col items-start gap-2">
+          {showMessageNav && userMessageCount > 0 && (
+            <ConversationMessageNav
+              count={userMessageCount}
+              expanded={navExpanded}
+              onToggle={setNavExpanded}
+              entries={navEntries}
+              scrollApiRef={scrollApiRef}
+            />
+          )}
+          {useIncrementalLive ? (
+            <LiveAgentPlanOverlay
+              conversationId={conversationId}
+              entries={historicalPlanEntries}
+              planKey={historicalPlanKey}
+              isStreaming={connStatus === "prompting"}
+            />
+          ) : (
+            <AgentPlanOverlay
+              key={agentPlanOverlayKey}
+              message={liveMessage ?? null}
+              entries={historicalPlanEntries}
+              planKey={historicalPlanKey}
+              defaultExpanded={false}
+              isStreaming={connStatus === "prompting"}
+            />
+          )}
+          {useIncrementalLive ? (
+            <LiveAwareSubAgentOverlay
+              conversationId={conversationId}
+              agentType={agentType}
+              isStreaming={connStatus === "prompting"}
+              historicalDelegations={allSessionDelegations}
+              historicalActivities={sessionActivities}
+              historicalKey={subAgentOverlayKey}
+              workspaceRootPath={workspaceRootPath}
+              isActive={isActive}
+              onResumeRoot={onResumeRoot}
+              onOpenRootConversation={onOpenRootConversation}
+            />
+          ) : (
+            <SubAgentOverlay
+              key={subAgentOverlayKey}
+              delegations={allSessionDelegations}
+              activities={sessionActivities}
+              overlayKey={subAgentOverlayKey}
+              defaultExpanded
+              conversationId={conversationId}
+              workflowGraph={workflowGraph}
+              workspaceRootPath={workspaceRootPath}
+              isActive={isActive}
+              onResumeRoot={onResumeRoot}
+              onOpenRootConversation={onOpenRootConversation}
+            />
+          )}
+        </div>
       </div>
-    </div>
+    </GrokConversationProvider>
   )
 }

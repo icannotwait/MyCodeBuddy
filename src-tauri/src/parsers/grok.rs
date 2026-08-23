@@ -8,6 +8,7 @@ use serde_json::Value;
 
 use sha2::{Digest, Sha256};
 
+use crate::commands::confined_file::has_dangling_alias_component;
 use crate::models::message::AutonomousTurnOrigin;
 use crate::models::{
     AgentType, ContentBlock, ConversationDetail, ConversationSummary, MessageTurn, TurnRole,
@@ -322,6 +323,111 @@ impl GrokParser {
 impl Default for GrokParser {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum GrokSessionLocatorError {
+    #[error("Grok sessions scan failed: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("Ambiguous Grok session id at {strictness:?} strictness ({count} matches)")]
+    Ambiguous {
+        strictness: GrokSessionMatchStrictness,
+        count: usize,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GrokSessionMatchStrictness {
+    Strict,
+    Loose,
+}
+
+#[cfg(any(test, windows))]
+fn is_unsupported_drive_relative_root_shape(has_root: bool, starts_with_prefix: bool) -> bool {
+    !has_root && starts_with_prefix
+}
+
+#[cfg(windows)]
+fn is_unsupported_drive_relative_sessions_root(path: &Path) -> bool {
+    is_unsupported_drive_relative_root_shape(
+        path.has_root(),
+        matches!(
+            path.components().next(),
+            Some(std::path::Component::Prefix(_))
+        ),
+    )
+}
+
+#[cfg(not(windows))]
+fn is_unsupported_drive_relative_sessions_root(_path: &Path) -> bool {
+    false
+}
+
+pub(crate) fn locate_grok_session_dir(
+    sessions_root: &Path,
+    session_id: &str,
+) -> Result<Option<PathBuf>, GrokSessionLocatorError> {
+    if is_unsupported_drive_relative_sessions_root(sessions_root) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Grok sessions root must not be drive-relative",
+        )
+        .into());
+    }
+    let entries = match fs::read_dir(sessions_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match has_dangling_alias_component(sessions_root) {
+                Ok(false) => return Ok(None),
+                Ok(true) => return Err(error.into()),
+                Err(other) => return Err(other.into()),
+            }
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let mut strict = Vec::new();
+    let mut loose = Vec::new();
+
+    for entry in entries {
+        let entry = entry?;
+        let group_type = entry.file_type()?;
+        if !group_type.is_dir() && !group_type.is_symlink() {
+            continue;
+        }
+        let candidate = entry.path().join(session_id);
+        let candidate_metadata = match fs::symlink_metadata(&candidate) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if !candidate_metadata.is_dir() && !candidate_metadata.file_type().is_symlink() {
+            continue;
+        }
+        loose.push(candidate.clone());
+
+        match fs::metadata(candidate.join("updates.jsonl")) {
+            Ok(metadata) if metadata.is_file() => strict.push(candidate),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    strict.sort();
+    loose.sort();
+    let (matches, strictness) = if strict.is_empty() {
+        (&loose, GrokSessionMatchStrictness::Loose)
+    } else {
+        (&strict, GrokSessionMatchStrictness::Strict)
+    };
+    match matches.as_slice() {
+        [] => Ok(None),
+        [only] => Ok(Some(only.clone())),
+        many => Err(GrokSessionLocatorError::Ambiguous {
+            strictness,
+            count: many.len(),
+        }),
     }
 }
 
@@ -1600,6 +1706,307 @@ mod tests {
         write(&session, "summary.json", summary);
         write(&session, "updates.jsonl", updates);
         (tmp, sessions)
+    }
+
+    #[test]
+    fn injected_locator_prefers_one_strict_match_over_loose_matches() {
+        let root = tempfile::tempdir().unwrap();
+        let strict = root.path().join("a/session-1");
+        let loose = root.path().join("b/session-1");
+        fs::create_dir_all(&strict).unwrap();
+        fs::create_dir_all(&loose).unwrap();
+        fs::write(strict.join("updates.jsonl"), b"\n").unwrap();
+        assert_eq!(
+            locate_grok_session_dir(root.path(), "session-1").unwrap(),
+            Some(strict)
+        );
+    }
+
+    #[test]
+    fn injected_locator_uses_one_loose_match_when_no_strict_match_exists() {
+        let root = tempfile::tempdir().unwrap();
+        let loose = root.path().join("a/session-1");
+        fs::create_dir_all(&loose).unwrap();
+        assert_eq!(
+            locate_grok_session_dir(root.path(), "session-1").unwrap(),
+            Some(loose)
+        );
+    }
+
+    #[test]
+    fn missing_sessions_root_is_absent() {
+        let root = tempfile::tempdir().unwrap().path().join("gone");
+        assert_eq!(locate_grok_session_dir(&root, "session-1").unwrap(), None);
+    }
+
+    #[test]
+    fn duplicate_strict_matches_are_rejected_deterministically() {
+        let root = tempfile::tempdir().unwrap();
+        for group in ["z", "a"] {
+            let dir = root.path().join(group).join("session-1");
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("updates.jsonl"), b"\n").unwrap();
+        }
+        assert!(matches!(
+            locate_grok_session_dir(root.path(), "session-1"),
+            Err(GrokSessionLocatorError::Ambiguous {
+                strictness: GrokSessionMatchStrictness::Strict,
+                count: 2,
+            })
+        ));
+    }
+
+    #[test]
+    fn duplicate_loose_matches_are_rejected_deterministically() {
+        let root = tempfile::tempdir().unwrap();
+        for group in ["z", "a"] {
+            fs::create_dir_all(root.path().join(group).join("session-1")).unwrap();
+        }
+        assert!(matches!(
+            locate_grok_session_dir(root.path(), "session-1"),
+            Err(GrokSessionLocatorError::Ambiguous {
+                strictness: GrokSessionMatchStrictness::Loose,
+                count: 2,
+            })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_sessions_root_preserves_permission_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct RestorePermissions {
+            path: PathBuf,
+            permissions: fs::Permissions,
+        }
+
+        impl Drop for RestorePermissions {
+            fn drop(&mut self) {
+                fs::set_permissions(&self.path, self.permissions.clone()).unwrap();
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let original = fs::metadata(root.path()).unwrap().permissions();
+        let _restore = RestorePermissions {
+            path: root.path().to_path_buf(),
+            permissions: original,
+        };
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o000)).unwrap();
+        let probe = fs::read_dir(root.path()).unwrap_err();
+        if probe.kind() != std::io::ErrorKind::PermissionDenied {
+            return;
+        }
+
+        assert!(matches!(
+            locate_grok_session_dir(root.path(), "session-1"),
+            Err(GrokSessionLocatorError::Io(error))
+                if error.kind() == std::io::ErrorKind::PermissionDenied
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_group_preserves_permission_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct RestorePermissions {
+            path: PathBuf,
+            permissions: fs::Permissions,
+        }
+
+        impl Drop for RestorePermissions {
+            fn drop(&mut self) {
+                fs::set_permissions(&self.path, self.permissions.clone()).unwrap();
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let group = root.path().join("a");
+        let candidate = group.join("session-1");
+        fs::create_dir_all(&candidate).unwrap();
+        let original = fs::metadata(&group).unwrap().permissions();
+        let _restore = RestorePermissions {
+            path: group.clone(),
+            permissions: original,
+        };
+        fs::set_permissions(&group, fs::Permissions::from_mode(0o000)).unwrap();
+        let probe = fs::symlink_metadata(&candidate).unwrap_err();
+        if probe.kind() != std::io::ErrorKind::PermissionDenied {
+            return;
+        }
+
+        assert!(matches!(
+            locate_grok_session_dir(root.path(), "session-1"),
+            Err(GrokSessionLocatorError::Io(error))
+                if error.kind() == std::io::ErrorKind::PermissionDenied
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_updates_metadata_preserves_permission_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct RestorePermissions {
+            path: PathBuf,
+            permissions: fs::Permissions,
+        }
+
+        impl Drop for RestorePermissions {
+            fn drop(&mut self) {
+                fs::set_permissions(&self.path, self.permissions.clone()).unwrap();
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let session = root.path().join("a/session-1");
+        fs::create_dir_all(&session).unwrap();
+        fs::write(session.join("updates.jsonl"), b"\n").unwrap();
+        let original = fs::metadata(&session).unwrap().permissions();
+        let _restore = RestorePermissions {
+            path: session.clone(),
+            permissions: original,
+        };
+        fs::set_permissions(&session, fs::Permissions::from_mode(0o000)).unwrap();
+        let probe = fs::metadata(session.join("updates.jsonl")).unwrap_err();
+        if probe.kind() != std::io::ErrorKind::PermissionDenied {
+            return;
+        }
+
+        assert!(matches!(
+            locate_grok_session_dir(root.path(), "session-1"),
+            Err(GrokSessionLocatorError::Io(error))
+                if error.kind() == std::io::ErrorKind::PermissionDenied
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_session_identity_is_returned_for_authority_validation() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let target = external.path().join("session-1");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("updates.jsonl"), b"\n").unwrap();
+        let alias = root.path().join("a/session-1");
+        fs::create_dir_all(alias.parent().unwrap()).unwrap();
+        symlink(&target, &alias).unwrap();
+
+        assert_eq!(
+            locate_grok_session_dir(root.path(), "session-1").unwrap(),
+            Some(alias)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_group_identity_is_returned_for_authority_validation() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let target = external.path().join("session-1");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("updates.jsonl"), b"\n").unwrap();
+        let group_alias = root.path().join("a");
+        symlink(external.path(), &group_alias).unwrap();
+        let alias = group_alias.join("session-1");
+
+        assert_eq!(
+            locate_grok_session_dir(root.path(), "session-1").unwrap(),
+            Some(alias)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_sessions_root_is_an_error_not_absent() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        symlink(root.path().join("missing"), &sessions).unwrap();
+
+        assert!(matches!(
+            locate_grok_session_dir(&sessions, "session-1"),
+            Err(GrokSessionLocatorError::Io(error))
+                if error.kind() == std::io::ErrorKind::NotFound
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_sessions_root_ancestor_is_an_error_not_absent() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let dangling_ancestor = root.path().join("grok");
+        symlink(root.path().join("missing-grok"), &dangling_ancestor).unwrap();
+        let sessions = dangling_ancestor.join("sessions");
+
+        assert!(matches!(
+            locate_grok_session_dir(&sessions, "session-1"),
+            Err(GrokSessionLocatorError::Io(error))
+                if error.kind() == std::io::ErrorKind::NotFound
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn dangling_sessions_root_is_an_error_not_absent() {
+        use std::os::windows::fs::symlink_dir;
+
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        if symlink_dir(root.path().join("missing"), &sessions).is_err() {
+            return;
+        }
+
+        assert!(matches!(
+            locate_grok_session_dir(&sessions, "session-1"),
+            Err(GrokSessionLocatorError::Io(error))
+                if error.kind() == std::io::ErrorKind::NotFound
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn dangling_sessions_root_ancestor_is_an_error_not_absent() {
+        use std::os::windows::fs::symlink_dir;
+
+        let root = tempfile::tempdir().unwrap();
+        let dangling_ancestor = root.path().join("grok");
+        if symlink_dir(root.path().join("missing-grok"), &dangling_ancestor).is_err() {
+            return;
+        }
+        let sessions = dangling_ancestor.join("sessions");
+
+        assert!(matches!(
+            locate_grok_session_dir(&sessions, "session-1"),
+            Err(GrokSessionLocatorError::Io(error))
+                if error.kind() == std::io::ErrorKind::NotFound
+        ));
+    }
+
+    #[test]
+    fn drive_relative_root_shape_is_terminal() {
+        assert!(is_unsupported_drive_relative_root_shape(false, true));
+        assert!(!is_unsupported_drive_relative_root_shape(true, true));
+        assert!(!is_unsupported_drive_relative_root_shape(false, false));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn drive_relative_sessions_root_is_rejected_before_fallback() {
+        assert!(matches!(
+            locate_grok_session_dir(Path::new(r"C:grok\sessions"), "session-1"),
+            Err(GrokSessionLocatorError::Io(error))
+                if error.kind() == std::io::ErrorKind::InvalidInput
+        ));
     }
 
     const SUMMARY: &str = r#"{
