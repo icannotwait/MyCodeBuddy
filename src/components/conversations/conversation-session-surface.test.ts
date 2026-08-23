@@ -527,6 +527,7 @@ type QueueItem = {
     displayText: string
   }
   modeId: string | null
+  optimisticTurnId?: string
 }
 
 const lifecycleCapture = vi.hoisted(() => ({
@@ -904,11 +905,16 @@ vi.mock("@/hooks/use-message-queue", () => ({
       return surfaceH.queueItems
     },
     enqueue: surfaceH.enqueue.mockImplementation(
-      (draft: QueueItem["draft"], modeId: string | null = null): QueueItem => {
+      (
+        draft: QueueItem["draft"],
+        modeId: string | null = null,
+        options?: { optimisticTurnId?: string }
+      ): QueueItem => {
         const item: QueueItem = {
           id: `q-${surfaceH.queueItems.length + 1}`,
           draft,
           modeId,
+          optimisticTurnId: options?.optimisticTurnId,
         }
         surfaceH.queueItems.push(item)
         return item
@@ -1479,7 +1485,7 @@ describe("ConversationSessionSurface authoritative shared queue", () => {
     expect(surfaceH.shellProps?.onForkSend).toEqual(expect.any(Function))
   })
 
-  it("removes optimistic history when admission is queued and keeps the authoritative queue", async () => {
+  it("keeps the optimistic user turn when shared admission is queued", async () => {
     const queue = [sharedQueued("q2", 2, "m2", "later")]
     lifecycleCapture.handleSend.mockImplementation(
       async (_draft, _mode, opts) => {
@@ -1496,7 +1502,8 @@ describe("ConversationSessionSurface authoritative shared queue", () => {
 
     const editor = await sendDraft("later")
 
-    await waitFor(() => expect(surfaceH.runtimeOptimisticTurns).toHaveLength(0))
+    await waitFor(() => expect(surfaceH.runtimeOptimisticTurns).toHaveLength(1))
+    expect(surfaceH.runtimeOptimisticTurns[0]?.role).toBe("user")
     await waitFor(() =>
       expect(serializeDocToText(editor.state.doc)).not.toContain("later")
     )
@@ -2233,6 +2240,38 @@ describe("ConversationSessionSurface connection-transition stale ACP handler", (
     // Delivery-time store lookup sees B → arm latch + queue pause.
     expect(lifecycleCapture.lastOptions!.autoConnectAllowed).toBe(false)
     expect(surfaceH.shellProps?.queuePaused).toBe(true)
+  })
+})
+
+describe("ConversationSessionSurface queued follow-up user turns", () => {
+  beforeEach(() => {
+    resetSurfaceHarness()
+  })
+  afterEach(cleanup)
+
+  it("keeps a timeline bubble when a direct send joins a non-empty local queue", () => {
+    surfaceH.conversations = [fullSummary(42, "in_progress")]
+    surfaceH.connStatus = "connected"
+    surfaceH.queueItems = [historicalHead()]
+
+    act(() => {
+      renderSurface(42)
+    })
+
+    act(() => {
+      surfaceH.shellProps!.onSend!(directDraft("follow-up"))
+    })
+
+    expect(lifecycleCapture.handleSend).not.toHaveBeenCalled()
+    expect(surfaceH.enqueue).toHaveBeenCalled()
+    expect(surfaceH.runtimeOptimisticTurns).toHaveLength(1)
+    expect(surfaceH.runtimeOptimisticTurns[0]?.role).toBe("user")
+    const enqueueOpts = surfaceH.enqueue.mock.calls.at(-1)?.[2] as
+      | { optimisticTurnId?: string }
+      | undefined
+    expect(enqueueOpts?.optimisticTurnId).toBe(
+      surfaceH.runtimeOptimisticTurns[0]?.id
+    )
   })
 })
 

@@ -55,6 +55,35 @@ export function shouldQueueDirectSend(
 }
 
 /**
+ * Why a prompt is sitting in a queue instead of on the agent wire.
+ * The sender still needs a timeline bubble for queued/pending admission;
+ * the bubble is removed only when the prompt is abandoned.
+ */
+export type OptimisticQueuedReason =
+  | "tail_queue"
+  | "busy_requeue"
+  | "shared_admission_queued"
+  | "queue_item_cancelled"
+  | "send_failed"
+  | "continuation_waiting"
+
+/** Keep the local user turn visible while the prompt is only queued. */
+export function shouldRetainOptimisticTurnWhileQueued(
+  reason: OptimisticQueuedReason
+): boolean {
+  switch (reason) {
+    case "tail_queue":
+    case "busy_requeue":
+    case "shared_admission_queued":
+      return true
+    case "queue_item_cancelled":
+    case "send_failed":
+    case "continuation_waiting":
+      return false
+  }
+}
+
+/**
  * Whether a fork-and-send must be blocked because the message queue is
  * non-empty. Fork is an immediate session side effect (it re-points the live
  * session), so it cannot run while drafts are queued for the CURRENT session —

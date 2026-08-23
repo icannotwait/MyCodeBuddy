@@ -6,6 +6,7 @@ import {
   QUEUE_FLUSH_RETRY_BACKOFF_MS,
   shouldQueueDirectSend,
   shouldRejectDuplicateCreate,
+  shouldRetainOptimisticTurnWhileQueued,
 } from "./queue-flush"
 
 describe("flushRetryDelayMs", () => {
@@ -97,6 +98,26 @@ describe("isConnectionReady", () => {
     // A real cwd vs. no cwd is still a mismatch.
     expect(isConnectionReady("connected", cwd, null)).toBe(false)
     expect(isConnectionReady("connected", null, cwd)).toBe(false)
+  })
+})
+
+describe("shouldRetainOptimisticTurnWhileQueued", () => {
+  it("keeps the timeline bubble while the prompt is only queued", () => {
+    expect(shouldRetainOptimisticTurnWhileQueued("tail_queue")).toBe(true)
+    expect(shouldRetainOptimisticTurnWhileQueued("busy_requeue")).toBe(true)
+    expect(
+      shouldRetainOptimisticTurnWhileQueued("shared_admission_queued")
+    ).toBe(true)
+  })
+
+  it("drops the bubble when the prompt is abandoned", () => {
+    expect(shouldRetainOptimisticTurnWhileQueued("queue_item_cancelled")).toBe(
+      false
+    )
+    expect(shouldRetainOptimisticTurnWhileQueued("send_failed")).toBe(false)
+    expect(shouldRetainOptimisticTurnWhileQueued("continuation_waiting")).toBe(
+      false
+    )
   })
 })
 
