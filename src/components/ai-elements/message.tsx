@@ -35,6 +35,8 @@ import {
   defaultRehypePlugins,
   defaultRemarkPlugins,
 } from "streamdown"
+import { GrokSessionImage } from "./grok-session-image"
+import { useGrokSessionImageScope } from "./grok-session-image-context"
 import { markdownLinkComponents } from "./markdown-link"
 import { rehypePluginsAllowingCodeg } from "./rehype-allow-codeg"
 import { remarkAutolinkLocalPaths } from "./remark-autolink-local-paths"
@@ -400,6 +402,20 @@ const remarkPluginsWithLocalPaths = [
 // sanitization (rendering them as "[blocked]"); re-derive it so they survive to
 // MarkdownLink → ReferenceBadge. See rehype-allow-codeg for the full rationale.
 const rehypePlugins = rehypePluginsAllowingCodeg(defaultRehypePlugins)
+const grokSessionImageRehypePlugins = rehypePluginsAllowingCodeg(
+  defaultRehypePlugins,
+  { grokSessionImages: true }
+)
+
+type StreamdownComponents = NonNullable<
+  ComponentProps<typeof Streamdown>["components"]
+>
+
+const linkComponents: StreamdownComponents = markdownLinkComponents
+const grokSessionImageComponents = {
+  ...markdownLinkComponents,
+  "codeg-grok-session-image": GrokSessionImage,
+} as StreamdownComponents
 
 /**
  * Observe whether an element is near the viewport (with a 600px root margin).
@@ -459,6 +475,23 @@ function MessageResponseImpl({
   )
   const policy = policyFor(richContentState, nearViewport)
   const plugins = useStreamdownPlugins(text, policy)
+  const grokScope = useGrokSessionImageScope()
+  const selectedRehypePlugins = grokScope
+    ? grokSessionImageRehypePlugins
+    : rehypePlugins
+  const selectedAppComponents = grokScope
+    ? grokSessionImageComponents
+    : linkComponents
+  const components = useMemo(
+    () =>
+      props.components
+        ? { ...props.components, ...selectedAppComponents }
+        : selectedAppComponents,
+    [props.components, selectedAppComponents]
+  )
+  // Streamdown's outer memo ignores rehype/component changes. Remount only
+  // when this security gate flips so stale scoped output cannot cross it.
+  const pipelineKey = grokScope ? "grok-session-images" : "default-markdown"
 
   return (
     <div ref={ref} className="min-w-0">
@@ -468,8 +501,9 @@ function MessageResponseImpl({
           className
         )}
         plugins={plugins}
-        rehypePlugins={rehypePlugins}
         {...props}
+        key={pipelineKey}
+        rehypePlugins={selectedRehypePlugins}
         // App-selected remark plugins are authoritative so a caller's
         // remarkPlugins array cannot disable autolinkLocalPaths opt-in.
         remarkPlugins={
@@ -477,7 +511,7 @@ function MessageResponseImpl({
         }
         // Merge after spreading props so a caller can still override other
         // elements, but the link icon + safety routing on `a` always wins.
-        components={{ ...props.components, ...markdownLinkComponents }}
+        components={components}
       >
         {normalized}
       </Streamdown>

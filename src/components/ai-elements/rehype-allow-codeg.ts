@@ -2,11 +2,16 @@ import type { ComponentProps } from "react"
 import type { Streamdown } from "streamdown"
 
 import { isLocalPathLike } from "@/lib/markdown/local-path-links"
+import { parseGrokSessionImageRef } from "@/lib/markdown/grok-session-image"
 
 type RehypePlugins = NonNullable<
   ComponentProps<typeof Streamdown>["rehypePlugins"]
 >
 type RehypePlugin = RehypePlugins[number]
+
+export type RehypeAllowCodegOptions = {
+  grokSessionImages?: boolean
+}
 
 /** Minimal view of rehype-sanitize's schema — only the protocol allow-list we widen. */
 type SanitizeSchema = {
@@ -17,11 +22,16 @@ type SanitizeSchema = {
 type HastNode = {
   type?: string
   tagName?: string
-  properties?: { href?: unknown; [key: string]: unknown }
+  properties?: {
+    href?: unknown
+    src?: unknown
+    alt?: unknown
+    [key: string]: unknown
+  }
   children?: HastNode[]
 }
 
-/** Placeholder absolute URL rehype-harden will always accept and leave as an `<a>`. */
+/** Placeholder absolute URL rehype-harden will always accept. */
 const PRESERVE_PLACEHOLDER = "https://__codeg.local__/preserve"
 
 function decodeUriSafely(value: string): string {
@@ -56,39 +66,71 @@ function walkElements(node: HastNode, visit: (el: HastNode) => void): void {
 
 /**
  * Wrap Streamdown's `[harden, options]` so local-path hrefs keep their original
- * string through harden. Harden only sees a safe placeholder for those anchors;
- * originals are restored afterward on the same element nodes.
+ * string and opted-in Grok image refs can be retagged after hardening. Harden
+ * only sees safe placeholders; originals are restored on the same nodes.
  */
 function wrapHardenPreservingLocalPaths(
-  hardenEntry: RehypePlugin
+  hardenEntry: RehypePlugin,
+  allowOptions?: RehypeAllowCodegOptions
 ): RehypePlugin {
-  const [hardenFn, options] = (
+  const [hardenFn, hardenOptions] = (
     Array.isArray(hardenEntry) ? hardenEntry : [hardenEntry]
   ) as [(opts?: unknown) => (tree: HastNode) => void, unknown?]
 
-  return function rehypeHardenPreservingLocalPaths() {
-    const runHarden = hardenFn(options)
+  const createTransform = () => {
+    const runHarden = hardenFn(hardenOptions)
     return (tree: HastNode) => {
-      const preserved = new Map<HastNode, string>()
+      const preservedHrefs = new Map<HastNode, string>()
+      const preservedImages = new Map<HastNode, { src: string; alt: unknown }>()
       walkElements(tree, (node) => {
-        if (node.tagName !== "a") return
-        const href = node.properties?.href
-        if (typeof href !== "string" || !shouldPreserveLocalPathHref(href)) {
+        if (node.tagName === "a") {
+          const href = node.properties?.href
+          if (typeof href === "string" && shouldPreserveLocalPathHref(href)) {
+            preservedHrefs.set(node, href)
+            if (node.properties) node.properties.href = PRESERVE_PLACEHOLDER
+          }
           return
         }
-        preserved.set(node, href)
-        if (node.properties) node.properties.href = PRESERVE_PLACEHOLDER
+
+        if (
+          node.tagName !== "img" ||
+          allowOptions?.grokSessionImages !== true
+        ) {
+          return
+        }
+        const src = node.properties?.src
+        if (typeof src !== "string" || !parseGrokSessionImageRef(src)) return
+        preservedImages.set(node, { src, alt: node.properties?.alt })
+        if (node.properties) node.properties.src = PRESERVE_PLACEHOLDER
       })
 
       runHarden(tree)
 
-      for (const [node, href] of preserved) {
+      for (const [node, href] of preservedHrefs) {
         if (node.tagName === "a" && node.properties) {
           node.properties.href = href
         }
       }
+      for (const [node, { src, alt }] of preservedImages) {
+        node.tagName = "codeg-grok-session-image"
+        node.properties = {
+          src,
+          ...(typeof alt === "string" ? { alt } : {}),
+        }
+      }
     }
   }
+
+  // Streamdown keys its processor cache by plugin function name. Keep the two
+  // module-stable pipelines distinguishable so toggling scope cannot reuse the
+  // opt-in processor for ordinary Markdown (or vice versa).
+  return allowOptions?.grokSessionImages === true
+    ? function rehypeHardenPreservingLocalPathsAndGrokSessionImages() {
+        return createTransform()
+      }
+    : function rehypeHardenPreservingLocalPaths() {
+        return createTransform()
+      }
 }
 
 /**
@@ -119,11 +161,12 @@ function wrapHardenPreservingLocalPaths(
  * default list via `Object.values`).
  */
 export function rehypePluginsAllowingCodeg(
-  defaults: Record<string, RehypePlugin>
+  defaults: Record<string, RehypePlugin>,
+  options?: RehypeAllowCodegOptions
 ): RehypePlugins {
   return Object.entries(defaults).map<RehypePlugin>(([key, plugin]) => {
     if (key === "harden") {
-      return wrapHardenPreservingLocalPaths(plugin)
+      return wrapHardenPreservingLocalPaths(plugin, options)
     }
     if (key !== "sanitize") return plugin
     const [sanitizePlugin, schema] = (
