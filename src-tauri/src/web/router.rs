@@ -503,6 +503,10 @@ pub fn build_router(
             post(handlers::git::git_delete_remote_branch),
         )
         .route("/clone_repository", post(handlers::git::clone_repository))
+        .route(
+            "/resolve_grok_session_image",
+            post(handlers::grok_session_image::resolve_grok_session_image),
+        )
         // ─── Files ───
         .route(
             "/read_file_preview",

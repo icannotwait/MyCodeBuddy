@@ -39,6 +39,7 @@ import {
   setToolWatchdogSettings,
   matchReferenceRegex,
   nextReferenceSearchPage,
+  resolveGrokSessionImage,
   saveTranslationAs,
   startReferenceSearch,
   translateDocument,
@@ -89,6 +90,38 @@ describe("getFolderConversation history window payload", () => {
       historyUserTurnLimit: 0,
       historyBeforeTurnId: undefined,
     })
+  })
+})
+
+describe("resolveGrokSessionImage transport payload", () => {
+  beforeEach(() => {
+    mockTransport.call.mockReset()
+    mockTransport.call.mockResolvedValue({
+      path: "/tmp/images/a.png",
+      origin: "session",
+      mimeType: "image/png",
+      dataBase64: "AA==",
+    })
+  })
+
+  it("uses one transport call with exact camelCase defaults", async () => {
+    await resolveGrokSessionImage({ conversationId: 42, href: "images/a.png" })
+    expect(mockTransport.call).toHaveBeenCalledWith(
+      "resolve_grok_session_image",
+      { conversationId: 42, href: "images/a.png", includeData: false }
+    )
+  })
+
+  it("passes includeData true without a direct Tauri wrapper", async () => {
+    await resolveGrokSessionImage({
+      conversationId: 42,
+      href: "images/a.png",
+      includeData: true,
+    })
+    expect(mockTransport.call).toHaveBeenCalledWith(
+      "resolve_grok_session_image",
+      { conversationId: 42, href: "images/a.png", includeData: true }
+    )
   })
 })
 

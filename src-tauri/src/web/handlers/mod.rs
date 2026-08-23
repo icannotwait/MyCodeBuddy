@@ -20,6 +20,7 @@ pub mod folder_commands;
 pub mod folder_links;
 pub mod folders;
 pub mod git;
+pub mod grok_session_image;
 pub mod logging;
 pub mod mcp;
 pub mod model_provider;

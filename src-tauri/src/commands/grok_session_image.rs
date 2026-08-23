@@ -5,6 +5,8 @@ use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use serde::{Deserialize, Serialize};
 
 use crate::app_error::{AppCommandError, AppErrorCode};
+#[cfg(feature = "tauri-runtime")]
+use crate::app_state::AppState;
 use crate::commands::confined_file::{
     metadata_is_symlink_or_reparse, read_confined_regular_file, run_file_io, ConfinedRead,
     FILE_BASE64_DEFAULT_MAX_BYTES,
@@ -12,6 +14,8 @@ use crate::commands::confined_file::{
 use crate::db::entities::{conversation, folder};
 use crate::db::AppDatabase;
 use crate::models::agent::AgentType;
+#[cfg(feature = "tauri-runtime")]
+use crate::parsers::grok::resolve_grok_home_dir;
 use crate::parsers::grok::{locate_grok_session_dir, GrokSessionLocatorError};
 
 pub(crate) const GROK_IMAGE_MAX_BYTES: usize = FILE_BASE64_DEFAULT_MAX_BYTES;
@@ -640,6 +644,26 @@ pub async fn resolve_grok_session_image_core(
         ),
         CandidateOutcome::Absent | CandidateOutcome::NotReady => Err(source_not_found()),
     }
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[tauri::command]
+pub async fn resolve_grok_session_image(
+    state: tauri::State<'_, AppState>,
+    conversation_id: i32,
+    href: String,
+    include_data: Option<bool>,
+) -> Result<ResolveGrokSessionImageResponse, AppCommandError> {
+    resolve_grok_session_image_core(
+        &state.db,
+        resolve_grok_home_dir().join("sessions"),
+        ResolveGrokSessionImageRequest {
+            conversation_id,
+            href,
+            include_data: include_data.unwrap_or(false),
+        },
+    )
+    .await
 }
 
 #[cfg(test)]
