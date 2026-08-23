@@ -121,16 +121,22 @@ function wrapHardenPreservingLocalPaths(
     }
   }
 
-  // Streamdown keys its processor cache by plugin function name. Keep the two
-  // module-stable pipelines distinguishable so toggling scope cannot reuse the
-  // opt-in processor for ordinary Markdown (or vice versa).
-  return allowOptions?.grokSessionImages === true
-    ? function rehypeHardenPreservingLocalPathsAndGrokSessionImages() {
-        return createTransform()
-      }
-    : function rehypeHardenPreservingLocalPaths() {
-        return createTransform()
-      }
+  const hardenPlugin = function rehypeHardenPreservingLocalPaths() {
+    return createTransform()
+  }
+
+  // Streamdown 2.2 keys processors by plugin.name plus serialized tuple
+  // options. Production minification can erase function names, so encode the
+  // security scope in the stable tuple data instead of relying on the name.
+  return [
+    hardenPlugin,
+    {
+      codegCacheScope:
+        allowOptions?.grokSessionImages === true
+          ? "grok-session-images"
+          : "ordinary-markdown",
+    },
+  ] as RehypePlugin
 }
 
 /**

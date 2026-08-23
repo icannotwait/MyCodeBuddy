@@ -33,6 +33,12 @@ function hardenEntry(plugins: unknown[]): unknown {
   return plugins[hardenIndex]
 }
 
+function serializedTupleOptions(plugin: unknown): string | null {
+  if (!Array.isArray(plugin) || plugin.length < 2) return null
+  const serialized = JSON.stringify(plugin[1])
+  return typeof serialized === "string" ? serialized : null
+}
+
 function runHardenTree(plugin: unknown, children: HastNode[]): HastNode {
   const factory =
     typeof plugin === "function"
@@ -87,6 +93,26 @@ describe("rehypePluginsAllowingCodeg", () => {
       if (key === "sanitize" || key === "harden") return
       expect(result[i]).toBe(defaultRehypePlugins[key])
     })
+  })
+
+  it("gives Streamdown distinct serializable harden cache descriptors", () => {
+    const ordinary = hardenEntry(
+      rehypePluginsAllowingCodeg(defaultRehypePlugins)
+    )
+    const grokImages = hardenEntry(
+      rehypePluginsAllowingCodeg(defaultRehypePlugins, {
+        grokSessionImages: true,
+      })
+    )
+    const ordinaryOptions = serializedTupleOptions(ordinary)
+    const grokImageOptions = serializedTupleOptions(grokImages)
+
+    // Streamdown 2.2 appends JSON.stringify(tupleOptions) to its processor
+    // cache key. These descriptors must stay distinct even if a production
+    // minifier erases both plugin function names.
+    expect(ordinaryOptions).not.toBeNull()
+    expect(grokImageOptions).not.toBeNull()
+    expect(grokImageOptions).not.toBe(ordinaryOptions)
   })
 
   it("clones rather than mutating the shipped sanitize schema", () => {
