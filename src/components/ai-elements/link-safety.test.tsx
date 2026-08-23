@@ -5,20 +5,30 @@ import type { LinkSafetyModalProps } from "streamdown"
 import {
   FilePathLink,
   openLinkWithSafety,
+  useOpenLinkOrFile,
   useStreamdownLinkSafety,
 } from "@/components/ai-elements/link-safety"
+import type { GrokSessionImageScopeValue } from "./grok-session-image-context"
 
 const mocks = vi.hoisted(() => ({
   openUrl: vi.fn(),
   openFilePreview: vi.fn(),
+  openResolvedImagePreview: vi.fn(),
+  resolveGrokSessionImage: vi.fn(),
   toastError: vi.fn(),
   isDesktop: vi.fn(() => false),
   getActiveRemoteConnectionId: vi.fn(() => null),
   activeFolderPath: "/repo" as string | null,
+  grokScope: null as GrokSessionImageScopeValue | null,
+  linkT: vi.fn((key: string) => key),
+  workspaceT: vi.fn((key: string, values?: { name?: string }) =>
+    key === "unableOpenFile" ? `${key}:${values?.name ?? ""}` : key
+  ),
 }))
 
 vi.mock("next-intl", () => ({
-  useTranslations: () => (key: string) => key,
+  useTranslations: (namespace: string) =>
+    namespace === "Folder.workspaceContext" ? mocks.workspaceT : mocks.linkT,
 }))
 
 vi.mock("sonner", () => ({
@@ -36,6 +46,14 @@ vi.mock("@/lib/transport", () => ({
   getActiveRemoteConnectionId: mocks.getActiveRemoteConnectionId,
 }))
 
+vi.mock("@/lib/api", () => ({
+  resolveGrokSessionImage: mocks.resolveGrokSessionImage,
+}))
+
+vi.mock("./grok-session-image-context", () => ({
+  useGrokSessionImageScope: () => mocks.grokScope,
+}))
+
 vi.mock("@/contexts/active-folder-context", () => ({
   useActiveFolder: () => ({
     activeFolder:
@@ -46,8 +64,19 @@ vi.mock("@/contexts/active-folder-context", () => ({
 vi.mock("@/contexts/workspace-context", () => ({
   useWorkspaceActions: () => ({
     openFilePreview: mocks.openFilePreview,
+    openResolvedImagePreview: mocks.openResolvedImagePreview,
   }),
 }))
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res
+    reject = rej
+  })
+  return { promise, resolve, reject }
+}
 
 function LinkSafetyHarness({ url }: { url: string }) {
   const linkSafety = useStreamdownLinkSafety()
@@ -78,17 +107,35 @@ function LinkSafetyHarness({ url }: { url: string }) {
   )
 }
 
+function DirectOpenHarness({ url }: { url: string }) {
+  const open = useOpenLinkOrFile()
+  return (
+    <button type="button" onClick={() => void open(url)}>
+      Open target
+    </button>
+  )
+}
+
 describe("link safety direct opening", () => {
   beforeEach(() => {
     mocks.openUrl.mockReset()
     mocks.openFilePreview.mockReset()
+    mocks.openResolvedImagePreview.mockReset()
+    mocks.resolveGrokSessionImage.mockReset()
     mocks.toastError.mockReset()
     mocks.isDesktop.mockReset()
     mocks.isDesktop.mockReturnValue(false)
     mocks.getActiveRemoteConnectionId.mockReset()
     mocks.getActiveRemoteConnectionId.mockReturnValue(null)
     mocks.openFilePreview.mockResolvedValue(undefined)
+    mocks.openResolvedImagePreview.mockReturnValue({
+      ok: true,
+      tabId: "file:resolved",
+    })
     mocks.activeFolderPath = "/repo"
+    mocks.grokScope = null
+    mocks.linkT.mockClear()
+    mocks.workspaceT.mockClear()
     vi.spyOn(window, "open").mockReturnValue(null)
   })
 
@@ -526,5 +573,291 @@ describe("link safety direct opening", () => {
       expect(replacementOpenPreview).toHaveBeenCalledTimes(1)
     })
     expect(initialOpenPreview).toHaveBeenCalledTimes(1)
+  })
+
+  it("gated Grok badge resolves bytes and opens the authoritative snapshot", async () => {
+    mocks.grokScope = { conversationId: 42, phase: "complete" }
+    mocks.openResolvedImagePreview.mockReturnValue({
+      ok: true,
+      tabId: "file:%2Fsession%2Fimages%2Fa.png",
+    })
+    mocks.resolveGrokSessionImage.mockResolvedValue({
+      path: "/session/images/a.png",
+      origin: "session",
+      mimeType: "image/png",
+      dataBase64: "YWJj",
+    })
+
+    render(<LinkSafetyHarness url="images/a.png" />)
+    fireEvent.click(screen.getByRole("button", { name: "Trigger link" }))
+
+    await waitFor(() => {
+      expect(mocks.resolveGrokSessionImage).toHaveBeenCalledWith({
+        conversationId: 42,
+        href: "images/a.png",
+        includeData: true,
+      })
+    })
+    expect(mocks.openResolvedImagePreview).toHaveBeenCalledWith({
+      path: "/session/images/a.png",
+      mimeType: "image/png",
+      dataBase64: "YWJj",
+      source: {
+        type: "grok-session-image",
+        conversationId: 42,
+        href: "images/a.png",
+      },
+    })
+    expect(mocks.openFilePreview).not.toHaveBeenCalled()
+  })
+
+  it("gated not_found uses existing wording and never falls through", async () => {
+    mocks.grokScope = { conversationId: 42, phase: "complete" }
+    mocks.resolveGrokSessionImage.mockRejectedValue({
+      code: "not_found",
+      message: "missing",
+    })
+
+    render(<LinkSafetyHarness url="./images/a.png" />)
+    fireEvent.click(screen.getByRole("button", { name: "Trigger link" }))
+
+    await waitFor(() => expect(mocks.toastError).toHaveBeenCalled())
+    expect(mocks.toastError).toHaveBeenCalledWith("unableOpenFile:a.png")
+    expect(mocks.openFilePreview).not.toHaveBeenCalled()
+    expect(mocks.openUrl).not.toHaveBeenCalled()
+  })
+
+  it("invalid_input_permission_and_transport_errors_use_local_open_error_and_stop", async () => {
+    mocks.grokScope = { conversationId: 42, phase: "complete" }
+    const errors = [
+      { code: "invalid_input", message: "bad href" },
+      { code: "permission_denied", message: "denied" },
+      new Error("transport down"),
+    ]
+
+    for (const error of errors) {
+      mocks.resolveGrokSessionImage.mockRejectedValueOnce(error)
+      const view = render(<DirectOpenHarness url="images/a.png" />)
+      fireEvent.click(screen.getByRole("button", { name: "Open target" }))
+      await waitFor(() => {
+        expect(mocks.toastError).toHaveBeenLastCalledWith("errorFailedOpen", {
+          description: error instanceof Error ? error.message : error.message,
+        })
+      })
+      view.unmount()
+    }
+
+    expect(mocks.openFilePreview).not.toHaveBeenCalled()
+    expect(mocks.openUrl).not.toHaveBeenCalled()
+  })
+
+  it("non_grok_and_nonmatching_grok_links_keep_generic_behavior", async () => {
+    mocks.grokScope = { conversationId: 42, phase: "complete" }
+    const first = render(<DirectOpenHarness url="docs/a.md" />)
+    fireEvent.click(screen.getByRole("button", { name: "Open target" }))
+    await waitFor(() => {
+      expect(mocks.openFilePreview).toHaveBeenCalledWith("docs/a.md", {
+        line: undefined,
+      })
+    })
+    first.unmount()
+
+    render(<DirectOpenHarness url="images/a.bmp" />)
+    fireEvent.click(screen.getByRole("button", { name: "Open target" }))
+    await waitFor(() => {
+      expect(mocks.openFilePreview).toHaveBeenCalledWith("images/a.bmp", {
+        line: undefined,
+      })
+    })
+
+    expect(mocks.resolveGrokSessionImage).not.toHaveBeenCalled()
+  })
+
+  it("rapid_repeated_same_href_clicks_share_one_inflight_promise_but_different_hrefs_do_not", async () => {
+    mocks.grokScope = { conversationId: 42, phase: "complete" }
+    const a = deferred<{
+      path: string
+      origin: "session"
+      mimeType: "image/png"
+      dataBase64: string
+    }>()
+    const b = deferred<{
+      path: string
+      origin: "session"
+      mimeType: "image/png"
+      dataBase64: string
+    }>()
+    mocks.resolveGrokSessionImage
+      .mockReturnValueOnce(a.promise)
+      .mockReturnValueOnce(b.promise)
+    const { rerender } = render(<DirectOpenHarness url="images/a.png" />)
+
+    fireEvent.click(screen.getByRole("button", { name: "Open target" }))
+    fireEvent.click(screen.getByRole("button", { name: "Open target" }))
+    expect(mocks.resolveGrokSessionImage).toHaveBeenCalledTimes(1)
+
+    rerender(<DirectOpenHarness url="images/b.png" />)
+    fireEvent.click(screen.getByRole("button", { name: "Open target" }))
+    expect(mocks.resolveGrokSessionImage).toHaveBeenCalledTimes(2)
+
+    await act(async () => {
+      a.resolve({
+        path: "/session/images/a.png",
+        origin: "session",
+        mimeType: "image/png",
+        dataBase64: "YQ==",
+      })
+      b.resolve({
+        path: "/session/images/b.png",
+        origin: "session",
+        mimeType: "image/png",
+        dataBase64: "Yg==",
+      })
+    })
+  })
+
+  it("malformed_or_action_rejected_success_fails_closed", async () => {
+    mocks.grokScope = { conversationId: 42, phase: "complete" }
+    const malformed = [
+      null,
+      {
+        path: "/session/images/a.png",
+        origin: "session",
+        mimeType: "image/png",
+      },
+      {
+        path: "/session/images/a.png",
+        origin: "other",
+        mimeType: "image/png",
+        dataBase64: "YWJj",
+      },
+      {
+        path: "images/a.png",
+        origin: "session",
+        mimeType: "image/png",
+        dataBase64: "YWJj",
+      },
+      {
+        path: "/session/images/a.png",
+        origin: "session",
+        mimeType: "image/jpeg",
+        dataBase64: "YWJj",
+      },
+    ]
+
+    for (const resolution of malformed) {
+      mocks.resolveGrokSessionImage.mockResolvedValueOnce(resolution)
+      const view = render(<DirectOpenHarness url="images/a.png" />)
+      fireEvent.click(screen.getByRole("button", { name: "Open target" }))
+      await waitFor(() => {
+        expect(mocks.toastError).toHaveBeenLastCalledWith("errorFailedOpen", {
+          description: "Resolved image response was malformed",
+        })
+      })
+      view.unmount()
+    }
+
+    mocks.openResolvedImagePreview.mockReturnValueOnce({
+      ok: false,
+      reason: "resolve",
+    })
+    mocks.resolveGrokSessionImage.mockResolvedValueOnce({
+      path: "/session/images/a.png",
+      origin: "session",
+      mimeType: "image/png",
+      dataBase64: "YWJj",
+    })
+    const view = render(<DirectOpenHarness url="images/a.png" />)
+    fireEvent.click(screen.getByRole("button", { name: "Open target" }))
+    await waitFor(() => {
+      expect(mocks.toastError).toHaveBeenLastCalledWith("errorFailedOpen", {
+        description: "Resolved image preview rejected the response",
+      })
+    })
+    view.unmount()
+
+    expect(mocks.openFilePreview).not.toHaveBeenCalled()
+    expect(mocks.openUrl).not.toHaveBeenCalled()
+  })
+
+  it("conversation_change_ignores_a_late_gated_click_result", async () => {
+    mocks.grokScope = { conversationId: 42, phase: "complete" }
+    const pending = deferred<{
+      path: string
+      origin: "session"
+      mimeType: "image/png"
+      dataBase64: string
+    }>()
+    mocks.resolveGrokSessionImage.mockReturnValue(pending.promise)
+    const { rerender } = render(<DirectOpenHarness url="images/a.png" />)
+    fireEvent.click(screen.getByRole("button", { name: "Open target" }))
+    expect(mocks.resolveGrokSessionImage).toHaveBeenCalledTimes(1)
+
+    mocks.grokScope = null
+    rerender(<DirectOpenHarness url="images/a.png" />)
+    await act(async () => {
+      pending.resolve({
+        path: "/session/images/a.png",
+        origin: "session",
+        mimeType: "image/png",
+        dataBase64: "YWJj",
+      })
+    })
+
+    expect(mocks.openResolvedImagePreview).not.toHaveBeenCalled()
+    expect(mocks.openFilePreview).not.toHaveBeenCalled()
+    expect(mocks.toastError).not.toHaveBeenCalled()
+  })
+
+  it("leaving_and_returning_to_the_same_conversation_invalidates_the_old_click", async () => {
+    mocks.grokScope = { conversationId: 42, phase: "complete" }
+    const first = deferred<{
+      path: string
+      origin: "session"
+      mimeType: "image/png"
+      dataBase64: string
+    }>()
+    const second = deferred<{
+      path: string
+      origin: "session"
+      mimeType: "image/png"
+      dataBase64: string
+    }>()
+    mocks.resolveGrokSessionImage
+      .mockReturnValueOnce(first.promise)
+      .mockReturnValueOnce(second.promise)
+    const { rerender } = render(<DirectOpenHarness url="images/a.png" />)
+    fireEvent.click(screen.getByRole("button", { name: "Open target" }))
+
+    mocks.grokScope = null
+    rerender(<DirectOpenHarness url="images/a.png" />)
+    mocks.grokScope = { conversationId: 42, phase: "complete" }
+    rerender(<DirectOpenHarness url="images/a.png" />)
+    fireEvent.click(screen.getByRole("button", { name: "Open target" }))
+    expect(mocks.resolveGrokSessionImage).toHaveBeenCalledTimes(2)
+
+    await act(async () => {
+      first.resolve({
+        path: "/session/images/a.png",
+        origin: "session",
+        mimeType: "image/png",
+        dataBase64: "b2xk",
+      })
+    })
+    expect(mocks.openResolvedImagePreview).not.toHaveBeenCalled()
+    expect(mocks.toastError).not.toHaveBeenCalled()
+
+    await act(async () => {
+      second.resolve({
+        path: "/session/images/a.png",
+        origin: "session",
+        mimeType: "image/png",
+        dataBase64: "bmV3",
+      })
+    })
+    expect(mocks.openResolvedImagePreview).toHaveBeenCalledTimes(1)
+    expect(mocks.openResolvedImagePreview).toHaveBeenCalledWith(
+      expect.objectContaining({ dataBase64: "bmV3" })
+    )
   })
 })
