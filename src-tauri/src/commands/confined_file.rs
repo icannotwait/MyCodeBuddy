@@ -39,6 +39,40 @@ pub(crate) fn metadata_is_symlink_or_reparse(metadata: &std::fs::Metadata) -> bo
     metadata.file_type().is_symlink()
 }
 
+/// Distinguish a genuinely missing lexical component from a missing target
+/// reached through an existing symlink/reparse component. Callers use this
+/// only after a followed filesystem operation returned `NotFound`.
+///
+/// Windows drive and UNC prefixes are not probeable until their root
+/// component is present. Ordinary relative paths remain supported without
+/// interpreting a bare `C:` drive prefix as a filesystem root.
+pub(crate) fn has_dangling_alias_component(path: &Path) -> std::io::Result<bool> {
+    let probe_relative =
+        !path.has_root() && !matches!(path.components().next(), Some(Component::Prefix(_)));
+    let mut prefix = PathBuf::new();
+    for component in path.components() {
+        prefix.push(component.as_os_str());
+        if !prefix.has_root() && !probe_relative {
+            continue;
+        }
+        match std::fs::symlink_metadata(&prefix) {
+            Ok(metadata) if metadata_is_symlink_or_reparse(&metadata) => {
+                match std::fs::metadata(&prefix) {
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        return Ok(true);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(false)
+}
+
 fn validate_relative_path(path: &Path) -> Result<Vec<&std::ffi::OsStr>, AppCommandError> {
     let mut normal_components = Vec::new();
     for component in path.components() {

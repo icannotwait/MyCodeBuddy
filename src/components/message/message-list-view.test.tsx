@@ -207,6 +207,7 @@ vi.mock("./content-parts-renderer", () => ({
     parts,
     autolinkLocalPathParts,
     grokSessionImagePhase,
+    grokSessionImageTextParts,
   }: {
     parts: Array<{
       type: string
@@ -222,6 +223,10 @@ vi.mock("./content-parts-renderer", () => ({
       text?: string
     }>
     grokSessionImagePhase?: "live" | "complete" | null
+    grokSessionImageTextParts?: ReadonlySet<{
+      type: string
+      text?: string
+    }>
   }) => (
     <div
       data-testid="content-parts"
@@ -234,6 +239,9 @@ vi.mock("./content-parts-renderer", () => ({
             data-testid="assistant-text"
             data-autolink-local-paths={String(
               autolinkLocalPathParts?.has(part) ?? false
+            )}
+            data-grok-session-image-eligible={String(
+              grokSessionImageTextParts?.has(part) ?? false
             )}
           >
             {part.text}
@@ -940,9 +948,17 @@ describe("MessageListView Grok durable identity and phases", () => {
     expect(
       screen.getByText("prior reply").closest("[data-grok-phase]")
     ).toHaveAttribute("data-grok-phase", "complete")
+    expect(screen.getByText("prior reply")).toHaveAttribute(
+      "data-grok-session-image-eligible",
+      "true"
+    )
     expect(
       screen.getByText("compat live reply").closest("[data-grok-phase]")
     ).toHaveAttribute("data-grok-phase", "live")
+    expect(screen.getByText("compat live reply")).toHaveAttribute(
+      "data-grok-session-image-eligible",
+      "true"
+    )
   })
 })
 
@@ -979,6 +995,7 @@ function assistantItem(
       resources: [],
       images: [],
       autolinkableTextParts: new Set(),
+      grokSessionImageTextParts: new Set(),
       ...groupOverrides,
     },
     phase: "persisted",
@@ -1391,14 +1408,36 @@ describe("MessageListView live footer isolation", () => {
       toolTurn("t1", toolText),
     ])
 
-    renderMessageList()
+    renderMessageList({ agentType: "grok" })
 
     expect(screen.getByText(assistantText)).toHaveAttribute(
       "data-autolink-local-paths",
       "true"
     )
+    expect(screen.getByText(assistantText)).toHaveAttribute(
+      "data-grok-session-image-eligible",
+      "true"
+    )
     expect(screen.getByText(toolText)).toHaveAttribute(
       "data-autolink-local-paths",
+      "false"
+    )
+    expect(screen.getByText(toolText)).toHaveAttribute(
+      "data-grok-session-image-eligible",
+      "false"
+    )
+  })
+
+  it("keeps standalone source-tool Markdown outside Grok image scope", () => {
+    const toolText = "![tool](images/tool.png)"
+    seedHistory([userTurn("u1", "hello"), toolTurn("t1", toolText)], {
+      persistedAgentType: "grok",
+    })
+
+    renderMessageList({ agentType: "grok" })
+
+    expect(screen.getByText(toolText)).toHaveAttribute(
+      "data-grok-session-image-eligible",
       "false"
     )
   })
@@ -2116,6 +2155,7 @@ function makeGroup(
     resources: [],
     images: [],
     autolinkableTextParts: new Set(),
+    grokSessionImageTextParts: new Set(),
   }
 }
 

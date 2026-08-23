@@ -441,6 +441,7 @@ describe("ContentPartsRenderer local-path autolink scope", () => {
 
 describe("ContentPartsRenderer Grok session image scope", () => {
   it("scopes only top-level assistant text and excludes nested goal text", () => {
+    const top = { type: "text" as const, text: "top" }
     const start: AdaptedToolCallPart = {
       type: "tool-call",
       toolCallId: "goal-1",
@@ -453,8 +454,9 @@ describe("ContentPartsRenderer Grok session image scope", () => {
       <ContentPartsRenderer
         role="assistant"
         grokSessionImagePhase="complete"
+        grokSessionImageTextParts={new Set([top])}
         parts={[
-          { type: "text", text: "top" },
+          top,
           {
             type: "goal-run",
             start,
@@ -494,11 +496,13 @@ describe("ContentPartsRenderer Grok session image scope", () => {
   })
 
   it("does not scope user text even when a phase is supplied", () => {
+    const user = { type: "text" as const, text: "user" }
     wrap(
       <ContentPartsRenderer
         role="user"
         grokSessionImagePhase="live"
-        parts={[{ type: "text", text: "user" }]}
+        grokSessionImageTextParts={new Set([user])}
+        parts={[user]}
       />
     )
     expect(screen.getByText("user").closest("[data-grok-phase]")).toBeNull()
@@ -525,6 +529,36 @@ describe("ContentPartsRenderer Grok session image scope", () => {
       screen.getByText("tool markdown").closest("[data-grok-phase]")
     ).toBeNull()
   })
+
+  it.each(["complete", "live"] as const)(
+    "scopes only source-assistant text identities in the %s phase",
+    (phase) => {
+      const assistantText: AdaptedTextPart = {
+        type: "text",
+        text: `assistant-${phase}`,
+      }
+      const sourceToolText: AdaptedTextPart = {
+        type: "text",
+        text: `tool-${phase}`,
+      }
+
+      wrap(
+        <ContentPartsRenderer
+          role="assistant"
+          grokSessionImagePhase={phase}
+          grokSessionImageTextParts={new Set([assistantText])}
+          parts={[assistantText, sourceToolText]}
+        />
+      )
+
+      expect(
+        screen.getByText(`assistant-${phase}`).closest("[data-grok-phase]")
+      ).toHaveAttribute("data-grok-phase", phase)
+      expect(
+        screen.getByText(`tool-${phase}`).closest("[data-grok-phase]")
+      ).toBeNull()
+    }
+  )
 })
 
 describe("ContentPartsRenderer thinking visibility", () => {

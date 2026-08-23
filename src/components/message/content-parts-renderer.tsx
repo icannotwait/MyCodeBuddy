@@ -3150,6 +3150,8 @@ interface ContentPartsRendererProps {
   role?: MessageRole
   parentConversationId?: number | null
   autolinkLocalPathParts?: ReadonlySet<AutolinkableTextPart>
+  /** Source-role assistant text identities allowed to activate Grok images. */
+  grokSessionImageTextParts?: ReadonlySet<AutolinkableTextPart>
   /** When false, reasoning parts are not mounted. Defaults true for non-conversation callers. */
   showThinking?: boolean
   grokSessionImagePhase?: GrokSessionImagePhase | null
@@ -3160,6 +3162,7 @@ export const ContentPartsRenderer = memo(function ContentPartsRenderer({
   role,
   parentConversationId,
   autolinkLocalPathParts,
+  grokSessionImageTextParts,
   showThinking = true,
   grokSessionImagePhase,
 }: ContentPartsRendererProps) {
@@ -3172,6 +3175,7 @@ export const ContentPartsRenderer = memo(function ContentPartsRenderer({
       if (
         isTopLevel &&
         role === "assistant" &&
+        (grokSessionImageTextParts?.has(part) ?? false) &&
         grokSessionImagePhase !== null &&
         grokSessionImagePhase !== undefined
       ) {

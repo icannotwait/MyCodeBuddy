@@ -8,8 +8,8 @@ use crate::app_error::{AppCommandError, AppErrorCode};
 #[cfg(feature = "tauri-runtime")]
 use crate::app_state::AppState;
 use crate::commands::confined_file::{
-    metadata_is_symlink_or_reparse, read_confined_regular_file, run_file_io, ConfinedRead,
-    FILE_BASE64_DEFAULT_MAX_BYTES,
+    has_dangling_alias_component, metadata_is_symlink_or_reparse, read_confined_regular_file,
+    run_file_io, ConfinedRead, FILE_BASE64_DEFAULT_MAX_BYTES,
 };
 use crate::db::entities::{conversation, folder};
 use crate::db::AppDatabase;
@@ -450,33 +450,6 @@ fn validate_session_authority(
     Ok(canonical_session)
 }
 
-fn has_dangling_alias_component(path: &Path) -> Result<bool, AppCommandError> {
-    let mut prefix = PathBuf::new();
-    for component in path.components() {
-        prefix.push(component.as_os_str());
-        // A Windows `C:` prefix alone is drive-relative; start probing only
-        // after the following RootDir makes the prefix absolute.
-        if !prefix.has_root() {
-            continue;
-        }
-        match std::fs::symlink_metadata(&prefix) {
-            Ok(metadata) if metadata_is_symlink_or_reparse(&metadata) => {
-                match std::fs::metadata(&prefix) {
-                    Ok(_) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        return Ok(true);
-                    }
-                    Err(error) => return Err(AppCommandError::io(error)),
-                }
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => return Err(AppCommandError::io(error)),
-        }
-    }
-    Ok(false)
-}
-
 fn inspect_workspace_root(path: &Path) -> Result<Option<PathBuf>, AppCommandError> {
     if !path.is_absolute() {
         return Err(AppCommandError::invalid_input(
@@ -489,7 +462,7 @@ fn inspect_workspace_root(path: &Path) -> Result<Option<PathBuf>, AppCommandErro
             "Workspace root must be a directory",
         )),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            if has_dangling_alias_component(path)? {
+            if has_dangling_alias_component(path).map_err(AppCommandError::io)? {
                 Err(AppCommandError::invalid_input("Workspace root is dangling"))
             } else {
                 Ok(None)
@@ -1583,6 +1556,23 @@ mod resolver_tests {
         ) {
             return;
         }
+        let error = fixture.resolve(false).await.unwrap_err();
+        assert_eq!(error.code, AppErrorCode::IoError);
+    }
+
+    #[tokio::test]
+    async fn dangling_sessions_root_ancestor_denies_workspace_fallback() {
+        let fixture = ResolverFixture::new().await;
+        fixture.put_png(&fixture.workspace_root, 2, 3);
+        let sessions_parent = fixture.sessions_root.parent().unwrap().to_path_buf();
+        std::fs::remove_dir_all(&sessions_parent).unwrap();
+        if !directory_alias(
+            &sessions_parent.with_file_name("missing-grok-root"),
+            &sessions_parent,
+        ) {
+            return;
+        }
+
         let error = fixture.resolve(false).await.unwrap_err();
         assert_eq!(error.code, AppErrorCode::IoError);
     }

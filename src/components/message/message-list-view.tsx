@@ -195,6 +195,12 @@ export interface ResolvedMessageGroup {
    * is display-normalized to assistant is intentionally excluded.
    */
   autolinkableTextParts: ReadonlySet<AutolinkableTextPart>
+  /**
+   * Top-level text identities whose original adapted/source role was
+   * `assistant`. Kept separate from the display role because source `tool`
+   * turns are rendered in assistant bubbles and can be merged into them.
+   */
+  grokSessionImageTextParts: ReadonlySet<AutolinkableTextPart>
   usage?: import("@/lib/types").TurnUsage | null
   duration_ms?: number | null
   generation_ms?: number | null
@@ -549,9 +555,13 @@ export function mergeConsecutiveAssistantTurns(
       // Union source-assistant text identities across sub-turns so eligibility
       // survives display-role merges (tool text identities stay out).
       const mergedAutolinkableTextParts = new Set<AutolinkableTextPart>()
+      const mergedGrokSessionImageTextParts = new Set<AutolinkableTextPart>()
       for (const item of buffer) {
         for (const part of item.group.autolinkableTextParts) {
           mergedAutolinkableTextParts.add(part)
+        }
+        for (const part of item.group.grokSessionImageTextParts) {
+          mergedGrokSessionImageTextParts.add(part)
         }
       }
 
@@ -637,6 +647,10 @@ export function mergeConsecutiveAssistantTurns(
           autolinkableTextParts:
             mergedAutolinkableTextParts.size > 0
               ? mergedAutolinkableTextParts
+              : EMPTY_AUTOLINKABLE_TEXT_PARTS,
+          grokSessionImageTextParts:
+            mergedGrokSessionImageTextParts.size > 0
+              ? mergedGrokSessionImageTextParts
               : EMPTY_AUTOLINKABLE_TEXT_PARTS,
           usage: mergedUsage,
           duration_ms: mergedDuration,
@@ -843,6 +857,7 @@ const HistoricalMessageGroup = memo(function HistoricalMessageGroup({
                 autolinkLocalPathParts={
                   isResponseComplete ? group.autolinkableTextParts : undefined
                 }
+                grokSessionImageTextParts={group.grokSessionImageTextParts}
                 showThinking={showThinking}
                 grokSessionImagePhase={grokSessionImagePhase}
               />
@@ -1488,6 +1503,7 @@ export function MessageListView({
     const rawItems: ThreadRenderItem[] = projected.messages.map((msg, i) => {
       const phase = timelineTurns[i].phase
       const role = msg.role === "tool" ? "assistant" : msg.role
+      const sourceAssistantTextParts = topLevelAssistantTextParts(msg)
       const autonomousOrigin = allTurns[i].autonomous_origin ?? undefined
       let group = groupCache.get(msg)
       if (!group || group.autonomous_origin !== autonomousOrigin) {
@@ -1497,7 +1513,8 @@ export function MessageListView({
           parts: msg.content,
           resources: msg.userResources ?? [],
           images: msg.userImages ?? [],
-          autolinkableTextParts: topLevelAssistantTextParts(msg),
+          autolinkableTextParts: sourceAssistantTextParts,
+          grokSessionImageTextParts: sourceAssistantTextParts,
           usage: msg.usage,
           duration_ms: msg.duration_ms,
           generation_ms: msg.generation_ms,

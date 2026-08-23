@@ -8,6 +8,7 @@ use serde_json::Value;
 
 use sha2::{Digest, Sha256};
 
+use crate::commands::confined_file::has_dangling_alias_component;
 use crate::models::message::AutonomousTurnOrigin;
 use crate::models::{
     AgentType, ContentBlock, ConversationDetail, ConversationSummary, MessageTurn, TurnRole,
@@ -349,11 +350,9 @@ pub(crate) fn locate_grok_session_dir(
     let entries = match fs::read_dir(sessions_root) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            match fs::symlink_metadata(sessions_root) {
-                Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => {
-                    return Ok(None);
-                }
-                Ok(_) => return Err(error.into()),
+            match has_dangling_alias_component(sessions_root) {
+                Ok(false) => return Ok(None),
+                Ok(true) => return Err(error.into()),
                 Err(other) => return Err(other.into()),
             }
         }
@@ -1911,6 +1910,23 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn dangling_sessions_root_ancestor_is_an_error_not_absent() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let dangling_ancestor = root.path().join("grok");
+        symlink(root.path().join("missing-grok"), &dangling_ancestor).unwrap();
+        let sessions = dangling_ancestor.join("sessions");
+
+        assert!(matches!(
+            locate_grok_session_dir(&sessions, "session-1"),
+            Err(GrokSessionLocatorError::Io(error))
+                if error.kind() == std::io::ErrorKind::NotFound
+        ));
+    }
+
     #[cfg(windows)]
     #[test]
     fn dangling_sessions_root_is_an_error_not_absent() {
@@ -1921,6 +1937,25 @@ mod tests {
         if symlink_dir(root.path().join("missing"), &sessions).is_err() {
             return;
         }
+
+        assert!(matches!(
+            locate_grok_session_dir(&sessions, "session-1"),
+            Err(GrokSessionLocatorError::Io(error))
+                if error.kind() == std::io::ErrorKind::NotFound
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn dangling_sessions_root_ancestor_is_an_error_not_absent() {
+        use std::os::windows::fs::symlink_dir;
+
+        let root = tempfile::tempdir().unwrap();
+        let dangling_ancestor = root.path().join("grok");
+        if symlink_dir(root.path().join("missing-grok"), &dangling_ancestor).is_err() {
+            return;
+        }
+        let sessions = dangling_ancestor.join("sessions");
 
         assert!(matches!(
             locate_grok_session_dir(&sessions, "session-1"),
