@@ -1,6 +1,9 @@
 import { act, render, screen } from "@testing-library/react"
 import { beforeEach, describe, expect, it, vi } from "vitest"
 import {
+  type FileWorkspaceTab,
+  type OpenFileSettleResult,
+  type ResolvedImagePreviewInput,
   WorkspaceProvider,
   useWorkspaceActions,
   useWorkspaceContext,
@@ -4376,5 +4379,1080 @@ describe("document translation transient tabs", () => {
 
     // Transient content still present after another tab becomes active.
     expect(snap.content).toBe("must-not-evict")
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Task 7: resolver-backed image snapshots
+// ---------------------------------------------------------------------------
+
+type ResolvedImageCapture = {
+  fileTabs: FileWorkspaceTab[]
+  activeFileTabId: string | null
+  filesMaximized: boolean
+  conflictPath: string | null
+  openResolvedImagePreview: (
+    input: ResolvedImagePreviewInput
+  ) => OpenFileSettleResult
+  openFilePreview: (path: string) => Promise<OpenFileSettleResult>
+  closeFileTab: (tabId: string) => void
+  markTabsStale: (path: string) => void
+  applyExternalReload: (
+    path: string,
+    fetched: {
+      path: string
+      content: string
+      etag: string
+      mtime_ms: number | null
+      readonly: boolean
+      line_ending: "lf" | "crlf" | "mixed" | "none"
+    }
+  ) => Promise<void>
+  rejectFileTab: (path: string, errorMessage: string) => void
+  reloadActiveFile: () => Promise<void>
+  updateActiveFileContent: (content: string) => void
+  saveActiveFile: (options?: { force?: boolean }) => Promise<boolean>
+}
+
+function resolvedInput(
+  overrides: Partial<ResolvedImagePreviewInput> = {}
+): ResolvedImagePreviewInput {
+  return {
+    path: "/repo/images/a.png",
+    mimeType: "image/png",
+    dataBase64: "c25hcHNob3Q=",
+    source: {
+      type: "grok-session-image",
+      conversationId: 42,
+      href: "images/a.png",
+    },
+    ...overrides,
+  }
+}
+
+function snapshotEdit(path: string, content: string, etag = "disk-etag") {
+  return {
+    path,
+    content,
+    etag,
+    mtime_ms: 1,
+    readonly: false,
+    line_ending: "none" as const,
+  }
+}
+
+function fileNameForTest(path: string): string {
+  return path.split("/").pop() ?? path
+}
+
+function ResolvedImageHarness({
+  onCapture,
+}: {
+  onCapture?: (capture: ResolvedImageCapture) => void
+}) {
+  const {
+    openResolvedImagePreview,
+    openFilePreview,
+    closeFileTab,
+    markTabsStale,
+    applyExternalReload,
+    rejectFileTab,
+    reloadActiveFile,
+    updateActiveFileContent,
+    saveActiveFile,
+  } = useWorkspaceActions()
+  const { fileTabs, activeFileTab, activeFileTabId } = useWorkspaceFileTabs()
+  const { filesMaximized } = useWorkspaceView()
+  const { externalConflict } = useWorkspaceExternalConflict()
+  const openResolved = () => openResolvedImagePreview(resolvedInput())
+
+  onCapture?.({
+    fileTabs,
+    activeFileTabId,
+    filesMaximized,
+    conflictPath: externalConflict?.path ?? null,
+    openResolvedImagePreview,
+    openFilePreview,
+    closeFileTab,
+    markTabsStale,
+    applyExternalReload,
+    rejectFileTab,
+    reloadActiveFile,
+    updateActiveFileContent,
+    saveActiveFile,
+  })
+
+  return (
+    <>
+      <button onClick={openResolved}>resolved</button>
+      <button onClick={() => void openFilePreview("/repo/images/a.png")}>
+        ordinary
+      </button>
+      <button onClick={() => markTabsStale("/repo/images/a.png")}>stale</button>
+      <button
+        onClick={() =>
+          void applyExternalReload(
+            "/repo/images/a.png",
+            snapshotEdit("a.png", "disk")
+          )
+        }
+      >
+        external-reload
+      </button>
+      <button onClick={() => rejectFileTab("/repo/images/a.png", "gone")}>
+        reject
+      </button>
+      <button onClick={() => void reloadActiveFile()}>reload-active</button>
+      <button onClick={() => activeFileTab && closeFileTab(activeFileTab.id)}>
+        close
+      </button>
+      <output data-testid="snapshot-tab">
+        {JSON.stringify(
+          fileTabs.find((tab) => tab.path === "/repo/images/a.png") ?? null
+        )}
+      </output>
+    </>
+  )
+}
+
+describe("resolved image snapshot tabs", () => {
+  let capture: ResolvedImageCapture
+
+  beforeEach(() => {
+    mockedApi.readFileForEdit.mockReset()
+    mockedApi.readFileBase64.mockReset()
+    mockedApi.gitIsTracked.mockReset()
+    mockedApi.gitShowFile.mockReset()
+    mockedApi.saveFileContent.mockReset()
+    mockedApi.gitIsTracked.mockResolvedValue(false)
+    mockedApi.gitShowFile.mockResolvedValue("")
+    toastMock.error.mockReset()
+  })
+
+  function renderResolvedHarness() {
+    return render(
+      <WorkspaceProvider>
+        <ResolvedImageHarness onCapture={(next) => (capture = next)} />
+      </WorkspaceProvider>
+    )
+  }
+
+  async function closeDirtyCapturedTab(path: string) {
+    const tab = capture.fileTabs.find((candidate) => candidate.path === path)
+    expect(tab).toBeDefined()
+    await act(async () => {
+      capture.closeFileTab(tab!.id)
+    })
+    await act(async () => {
+      screen.getByText("dirtyCloseConfirm").click()
+    })
+    expect(capture.fileTabs.some((candidate) => candidate.path === path)).toBe(
+      false
+    )
+  }
+
+  it("seeds a normal absolute-path image tab from validated bytes without a read", async () => {
+    renderResolvedHarness()
+
+    let result: OpenFileSettleResult | undefined
+    await act(async () => {
+      result = capture.openResolvedImagePreview(resolvedInput())
+    })
+
+    const tab = JSON.parse(screen.getByTestId("snapshot-tab").textContent!)
+    expect(result).toEqual({
+      ok: true,
+      tabId: "file:%2Frepo%2Fimages%2Fa.png",
+    })
+    expect(tab).toMatchObject({
+      id: "file:%2Frepo%2Fimages%2Fa.png",
+      path: "/repo/images/a.png",
+      language: "image",
+      content: "data:image/png;base64,c25hcHNob3Q=",
+      savedContent: "data:image/png;base64,c25hcHNob3Q=",
+      readonly: true,
+      loading: false,
+      hasLoadedSuccessfully: true,
+      snapshotSource: {
+        type: "grok-session-image",
+        conversationId: 42,
+        href: "images/a.png",
+      },
+    })
+    expect(capture.activeFileTabId).toBe("file:%2Frepo%2Fimages%2Fa.png")
+    expect(capture.filesMaximized).toBe(true)
+    expect(mockedApi.readFileBase64).not.toHaveBeenCalled()
+    expect(mockedApi.readFileForEdit).not.toHaveBeenCalled()
+  })
+
+  it("repeated resolved opens refresh the same tab and latest bytes win", async () => {
+    renderResolvedHarness()
+
+    await act(async () => {
+      capture.openResolvedImagePreview(
+        resolvedInput({ dataBase64: "Zmlyc3Q=" })
+      )
+      capture.openResolvedImagePreview(
+        resolvedInput({ dataBase64: "c2Vjb25k" })
+      )
+    })
+
+    expect(capture.fileTabs).toHaveLength(1)
+    expect(capture.fileTabs[0]).toMatchObject({
+      id: "file:%2Frepo%2Fimages%2Fa.png",
+      content: "data:image/png;base64,c2Vjb25k",
+      savedContent: "data:image/png;base64,c2Vjb25k",
+    })
+  })
+
+  it("resolved_open_invalidates_an_older_generic_read", async () => {
+    let resolveOlder: ((value: string) => void) | null = null
+    mockedApi.readFileBase64.mockImplementationOnce(
+      () => new Promise((resolve) => (resolveOlder = resolve))
+    )
+    renderResolvedHarness()
+
+    let olderSettle: OpenFileSettleResult | undefined
+    await act(async () => {
+      void capture.openFilePreview("/repo/images/a.png").then((result) => {
+        olderSettle = result
+      })
+    })
+    expect(capture.fileTabs[0]).toMatchObject({ loading: true })
+
+    await act(async () => {
+      capture.openResolvedImagePreview(resolvedInput())
+      await Promise.resolve()
+    })
+    expect(olderSettle).toEqual({ ok: false, reason: "stale" })
+
+    await act(async () => {
+      resolveOlder!("b2xkLWRpc2s=")
+    })
+    expect(capture.fileTabs).toHaveLength(1)
+    expect(capture.fileTabs[0]).toMatchObject({
+      content: "data:image/png;base64,c25hcHNob3Q=",
+      loading: false,
+      snapshotSource: resolvedInput().source,
+    })
+  })
+
+  it("resolved_open_invalidates_a_generic_open_before_path_resolution", async () => {
+    let resolveOlder: ((value: string) => void) | null = null
+    mockedApi.readFileBase64.mockImplementationOnce(
+      () => new Promise((resolve) => (resolveOlder = resolve))
+    )
+    renderResolvedHarness()
+
+    let olderSettle: OpenFileSettleResult | undefined
+    await act(async () => {
+      void capture.openFilePreview("/repo/images/a.png").then((result) => {
+        olderSettle = result
+      })
+      capture.openResolvedImagePreview(resolvedInput())
+      await Promise.resolve()
+    })
+
+    expect(capture.fileTabs).toHaveLength(1)
+    expect(capture.fileTabs[0]).toMatchObject({
+      content: "data:image/png;base64,c25hcHNob3Q=",
+      loading: false,
+      snapshotSource: resolvedInput().source,
+    })
+    expect(olderSettle).toEqual({ ok: false, reason: "stale" })
+    expect(mockedApi.readFileBase64).not.toHaveBeenCalled()
+
+    if (resolveOlder) {
+      await act(async () => {
+        resolveOlder!("b2xkLXByZS1yZXNvbHZl")
+      })
+    }
+    expect(capture.fileTabs[0]).toMatchObject({
+      content: "data:image/png;base64,c25hcHNob3Q=",
+      loading: false,
+      snapshotSource: resolvedInput().source,
+    })
+  })
+
+  it("invalid_resolved_input_mutates_nothing", async () => {
+    renderResolvedHarness()
+    await act(async () => {
+      capture.openResolvedImagePreview(resolvedInput())
+    })
+    const tabsBefore = JSON.stringify(capture.fileTabs)
+    const activeBefore = capture.activeFileTabId
+
+    const invalidInputs: ResolvedImagePreviewInput[] = [
+      resolvedInput({ path: "images/a.png" }),
+      resolvedInput({
+        source: {
+          type: "grok-session-image",
+          conversationId: 0,
+          href: "images/a.png",
+        },
+      }),
+      resolvedInput({
+        source: {
+          type: "grok-session-image",
+          conversationId: 42,
+          href: "./images/a.png",
+        },
+      }),
+      resolvedInput({
+        source: {
+          type: "grok-session-image",
+          conversationId: 42,
+          href: "images/a.jpg",
+        },
+      }),
+      resolvedInput({ dataBase64: "   " }),
+    ]
+
+    for (const input of invalidInputs) {
+      let result: OpenFileSettleResult | undefined
+      await act(async () => {
+        result = capture.openResolvedImagePreview(input)
+      })
+      expect(result).toEqual({ ok: false, reason: "resolve" })
+      expect(JSON.stringify(capture.fileTabs)).toBe(tabsBefore)
+      expect(capture.activeFileTabId).toBe(activeBefore)
+    }
+  })
+
+  it("ordinary_open_forces_reload_and_success_clears_snapshot_source", async () => {
+    mockedApi.readFileBase64.mockResolvedValueOnce("ZGlzay1pbWFnZQ==")
+    renderResolvedHarness()
+    await act(async () => {
+      capture.openResolvedImagePreview(resolvedInput())
+    })
+
+    let result: OpenFileSettleResult | undefined
+    await act(async () => {
+      result = await capture.openFilePreview("/repo/images/a.png")
+    })
+
+    expect(result).toEqual({
+      ok: true,
+      tabId: "file:%2Frepo%2Fimages%2Fa.png",
+    })
+    expect(mockedApi.readFileBase64).toHaveBeenCalledTimes(1)
+    expect(capture.fileTabs[0]).toMatchObject({
+      content: "data:image/png;base64,ZGlzay1pbWFnZQ==",
+      loading: false,
+    })
+    expect(capture.fileTabs[0].snapshotSource).toBeUndefined()
+  })
+
+  it.each([
+    { path: "/repo/a.ts", language: "typescript", content: "disk-ts" },
+    { path: "/repo/a.html", language: "html", content: "disk-html" },
+  ])(
+    "converts a snapshot at $path to the complete path-derived text shape",
+    async ({ path, language, content }) => {
+      mockedApi.readFileForEdit.mockResolvedValueOnce({
+        path: fileNameForTest(path),
+        content,
+        etag: `${language}-etag`,
+        mtime_ms: 7,
+        readonly: false,
+        line_ending: "lf",
+      })
+      renderResolvedHarness()
+
+      await act(async () => {
+        capture.openResolvedImagePreview(resolvedInput({ path }))
+        await capture.openFilePreview(path)
+      })
+
+      const tab = capture.fileTabs.find((candidate) => candidate.path === path)
+      expect(tab).toMatchObject({
+        language,
+        content,
+        savedContent: content,
+        isDirty: false,
+        etag: `${language}-etag`,
+        mtimeMs: 7,
+        readonly: false,
+        lineEnding: "lf",
+        loading: false,
+        saveState: "idle",
+      })
+      expect(tab?.snapshotSource).toBeUndefined()
+      expect(tab?.originalContent).toBeUndefined()
+      expect(tab?.modifiedContent).toBeUndefined()
+      expect(tab?.transient).toBeUndefined()
+    }
+  )
+
+  it("converts a snapshot to a clean office shell without retaining image bytes", async () => {
+    const path = "/repo/report.docx"
+    renderResolvedHarness()
+
+    await act(async () => {
+      capture.openResolvedImagePreview(resolvedInput({ path }))
+      await capture.openFilePreview(path)
+    })
+
+    const tab = capture.fileTabs.find((candidate) => candidate.path === path)
+    expect(tab).toMatchObject({
+      language: "office",
+      content: "",
+      savedContent: "",
+      isDirty: false,
+      etag: null,
+      mtimeMs: null,
+      readonly: true,
+      lineEnding: "none",
+      loading: false,
+      saveState: "idle",
+    })
+    expect(tab?.snapshotSource).toBeUndefined()
+    expect(tab?.gitBaseContent).toBeUndefined()
+    expect(tab?.originalContent).toBeUndefined()
+    expect(tab?.modifiedContent).toBeUndefined()
+    expect(mockedApi.readFileForEdit).not.toHaveBeenCalled()
+    expect(mockedApi.readFileBase64).not.toHaveBeenCalled()
+  })
+
+  it("refuses to replace or activate an ordinary same-id dirty tab", async () => {
+    mockedApi.readFileForEdit
+      .mockResolvedValueOnce(snapshotEdit("a.ts", "disk-a", "a-1"))
+      .mockResolvedValueOnce(snapshotEdit("b.ts", "disk-b", "b-1"))
+    renderResolvedHarness()
+
+    await act(async () => {
+      await capture.openFilePreview("/repo/a.ts")
+      capture.updateActiveFileContent("dirty-a")
+      await capture.openFilePreview("/repo/b.ts")
+    })
+    const activeBefore = capture.activeFileTabId
+
+    let result: OpenFileSettleResult | undefined
+    await act(async () => {
+      result = capture.openResolvedImagePreview(
+        resolvedInput({ path: "/repo/a.ts" })
+      )
+    })
+
+    expect(result).toEqual({ ok: false, reason: "stale" })
+    expect(capture.activeFileTabId).toBe(activeBefore)
+    expect(
+      capture.fileTabs.find((candidate) => candidate.path === "/repo/a.ts")
+    ).toMatchObject({
+      content: "dirty-a",
+      isDirty: true,
+      saveState: "idle",
+      snapshotSource: undefined,
+    })
+  })
+
+  it("refuses to replace or activate an ordinary same-id saving tab", async () => {
+    let resolveSave: ((value: ReturnType<typeof snapshotEdit>) => void) | null =
+      null
+    mockedApi.readFileForEdit
+      .mockResolvedValueOnce(snapshotEdit("a.ts", "disk-a", "a-1"))
+      .mockResolvedValueOnce(snapshotEdit("b.ts", "disk-b", "b-1"))
+    mockedApi.saveFileContent.mockImplementationOnce(
+      () => new Promise((resolve) => (resolveSave = resolve))
+    )
+    renderResolvedHarness()
+
+    let savePromise!: Promise<boolean>
+    await act(async () => {
+      await capture.openFilePreview("/repo/a.ts")
+      capture.updateActiveFileContent("dirty-a")
+      savePromise = capture.saveActiveFile()
+      await Promise.resolve()
+      await capture.openFilePreview("/repo/b.ts")
+    })
+    const activeBefore = capture.activeFileTabId
+    expect(
+      capture.fileTabs.find((candidate) => candidate.path === "/repo/a.ts")
+    ).toMatchObject({ saveState: "saving" })
+
+    let result: OpenFileSettleResult | undefined
+    await act(async () => {
+      result = capture.openResolvedImagePreview(
+        resolvedInput({ path: "/repo/a.ts" })
+      )
+    })
+
+    expect(result).toEqual({ ok: false, reason: "stale" })
+    expect(capture.activeFileTabId).toBe(activeBefore)
+    expect(
+      capture.fileTabs.find((candidate) => candidate.path === "/repo/a.ts")
+    ).toMatchObject({
+      content: "dirty-a",
+      isDirty: true,
+      saveState: "saving",
+      snapshotSource: undefined,
+    })
+
+    await act(async () => {
+      resolveSave!(snapshotEdit("a.ts", "ignored", "saved-a"))
+      await savePromise
+    })
+  })
+
+  it("drops a preverification save after the tab is closed, snapshotted, and reopened", async () => {
+    const path = "/outside/a.ts"
+    let resolvePreverify:
+      | ((value: ReturnType<typeof snapshotEdit>) => void)
+      | null = null
+    mockedApi.readFileForEdit
+      .mockResolvedValueOnce(snapshotEdit("a.ts", "disk-a", "a-1"))
+      // The first settled activation of an unwatched file performs its own
+      // freshness read. Keep that independent from the save preverification
+      // promise this regression intentionally leaves pending.
+      .mockResolvedValueOnce(snapshotEdit("a.ts", "disk-a", "a-1"))
+      .mockImplementationOnce(
+        () => new Promise((resolve) => (resolvePreverify = resolve))
+      )
+      .mockResolvedValueOnce(snapshotEdit("a.ts", "newer-a", "a-2"))
+    mockedApi.saveFileContent.mockResolvedValue(
+      snapshotEdit("a.ts", "stale", "stale-save")
+    )
+    renderResolvedHarness()
+
+    let staleSave!: Promise<boolean>
+    await act(async () => {
+      await capture.openFilePreview(path)
+      await Promise.resolve()
+    })
+    await act(async () => {
+      capture.updateActiveFileContent("dirty-a")
+      staleSave = capture.saveActiveFile()
+      await Promise.resolve()
+    })
+    await closeDirtyCapturedTab(path)
+    await act(async () => {
+      capture.openResolvedImagePreview(resolvedInput({ path }))
+      await capture.openFilePreview(path)
+    })
+
+    await act(async () => {
+      resolvePreverify!(snapshotEdit("a.ts", "disk-a", "a-1"))
+      await staleSave
+    })
+
+    expect(mockedApi.saveFileContent).not.toHaveBeenCalled()
+    expect(capture.conflictPath).toBeNull()
+    expect(toastMock.error).not.toHaveBeenCalled()
+    expect(
+      capture.fileTabs.find((candidate) => candidate.path === path)
+    ).toMatchObject({
+      content: "newer-a",
+      savedContent: "newer-a",
+      etag: "a-2",
+      saveState: "idle",
+      saveError: null,
+      snapshotSource: undefined,
+    })
+  })
+
+  it("drops a late save success and its self-write echo after A-to-snapshot-to-A", async () => {
+    const path = "/repo/a.ts"
+    let resolveSave: ((value: ReturnType<typeof snapshotEdit>) => void) | null =
+      null
+    mockedApi.readFileForEdit
+      .mockResolvedValueOnce(snapshotEdit("a.ts", "disk-a", "a-1"))
+      .mockResolvedValueOnce(snapshotEdit("a.ts", "dirty-a", "save-etag"))
+    mockedApi.saveFileContent.mockImplementationOnce(
+      () => new Promise((resolve) => (resolveSave = resolve))
+    )
+    renderResolvedHarness()
+
+    let staleSave!: Promise<boolean>
+    await act(async () => {
+      await capture.openFilePreview(path)
+      capture.updateActiveFileContent("dirty-a")
+      staleSave = capture.saveActiveFile()
+      await Promise.resolve()
+    })
+    await closeDirtyCapturedTab(path)
+    await act(async () => {
+      capture.openResolvedImagePreview(resolvedInput({ path }))
+      await capture.openFilePreview(path)
+    })
+
+    await act(async () => {
+      resolveSave!(snapshotEdit("a.ts", "ignored", "save-etag"))
+      await staleSave
+    })
+
+    const readsBeforeEvent = mockedApi.readFileForEdit.mock.calls.length
+    mockedApi.readFileForEdit.mockResolvedValueOnce(
+      snapshotEdit("a.ts", "external-v3", "external-etag")
+    )
+    await act(async () => {
+      workspaceStoreMock.emitRoot("/repo", ["a.ts"])
+      await Promise.resolve()
+    })
+
+    expect(mockedApi.readFileForEdit).toHaveBeenCalledTimes(
+      readsBeforeEvent + 1
+    )
+    expect(
+      capture.fileTabs.find((candidate) => candidate.path === path)
+    ).toMatchObject({
+      content: "external-v3",
+      savedContent: "external-v3",
+      etag: "external-etag",
+      isDirty: false,
+      saveState: "idle",
+      saveError: null,
+      snapshotSource: undefined,
+    })
+    expect(capture.conflictPath).toBeNull()
+    expect(toastMock.error).not.toHaveBeenCalled()
+  })
+
+  it("drops a late save error after A-to-snapshot-to-A", async () => {
+    const path = "/repo/a.ts"
+    let rejectSave: ((error: Error) => void) | null = null
+    mockedApi.readFileForEdit
+      .mockResolvedValueOnce(snapshotEdit("a.ts", "disk-a", "a-1"))
+      .mockResolvedValueOnce(snapshotEdit("a.ts", "newer-a", "a-2"))
+    mockedApi.saveFileContent.mockImplementationOnce(
+      () => new Promise((_resolve, reject) => (rejectSave = reject))
+    )
+    renderResolvedHarness()
+
+    let staleSave!: Promise<boolean>
+    await act(async () => {
+      await capture.openFilePreview(path)
+      capture.updateActiveFileContent("dirty-a")
+      staleSave = capture.saveActiveFile()
+      await Promise.resolve()
+    })
+    await closeDirtyCapturedTab(path)
+    await act(async () => {
+      capture.openResolvedImagePreview(resolvedInput({ path }))
+      await capture.openFilePreview(path)
+    })
+
+    await act(async () => {
+      rejectSave!(new Error("stale-save-error"))
+      await staleSave
+    })
+
+    expect(
+      capture.fileTabs.find((candidate) => candidate.path === path)
+    ).toMatchObject({
+      content: "newer-a",
+      savedContent: "newer-a",
+      etag: "a-2",
+      isDirty: false,
+      saveState: "idle",
+      saveError: null,
+      snapshotSource: undefined,
+    })
+    expect(capture.conflictPath).toBeNull()
+    expect(toastMock.error).not.toHaveBeenCalled()
+  })
+
+  it("failed_ordinary_conversion_preserves_validated_snapshot", async () => {
+    mockedApi.readFileBase64.mockRejectedValueOnce(new Error("disk failed"))
+    renderResolvedHarness()
+    await act(async () => {
+      capture.openResolvedImagePreview(resolvedInput())
+    })
+
+    let result: OpenFileSettleResult | undefined
+    await act(async () => {
+      result = await capture.openFilePreview("/repo/images/a.png")
+    })
+
+    expect(result).toEqual({ ok: false, reason: "load" })
+    expect(capture.fileTabs[0]).toMatchObject({
+      content: "data:image/png;base64,c25hcHNob3Q=",
+      savedContent: "data:image/png;base64,c25hcHNob3Q=",
+      loading: false,
+      snapshotSource: resolvedInput().source,
+    })
+  })
+
+  it("snapshot_ignores_stale_apply_reject_and_workspace_events", async () => {
+    mockedApi.readFileForEdit.mockResolvedValueOnce(
+      snapshotEdit("a.ts", "ordinary", "ordinary-etag")
+    )
+    renderResolvedHarness()
+
+    await act(async () => {
+      await capture.openFilePreview("/repo/a.ts")
+    })
+    expect(workspaceStoreMock.acquiredCount("/repo")).toBe(1)
+
+    const settlePendingWatch = async (outcome: "reload" | "missing") => {
+      let resolveWatch:
+        | ((value: ReturnType<typeof snapshotEdit>) => void)
+        | null = null
+      let rejectWatch: ((error: Error) => void) | null = null
+      mockedApi.readFileForEdit.mockImplementationOnce(
+        () =>
+          new Promise((resolve, reject) => {
+            resolveWatch = resolve
+            rejectWatch = reject
+          })
+      )
+
+      await act(async () => {
+        workspaceStoreMock.emitRoot("/repo", ["a.ts"])
+        await Promise.resolve()
+      })
+      const readsAfterEvent = mockedApi.readFileForEdit.mock.calls.length
+
+      await act(async () => {
+        capture.openResolvedImagePreview(resolvedInput({ path: "/repo/a.ts" }))
+      })
+
+      await act(async () => {
+        if (outcome === "missing") {
+          rejectWatch!(new Error("gone"))
+        } else {
+          resolveWatch!(snapshotEdit("a.ts", "late-disk", "late-etag"))
+        }
+      })
+
+      const tab = capture.fileTabs.find((item) => item.path === "/repo/a.ts")
+      expect(tab).toMatchObject({
+        content: "data:image/png;base64,c25hcHNob3Q=",
+        loading: false,
+        snapshotSource: resolvedInput().source,
+      })
+      expect(capture.conflictPath).toBeNull()
+      expect(mockedApi.readFileForEdit).toHaveBeenCalledTimes(readsAfterEvent)
+    }
+
+    await settlePendingWatch("reload")
+
+    mockedApi.readFileForEdit.mockResolvedValueOnce(
+      snapshotEdit("a.ts", "ordinary-again", "ordinary-2")
+    )
+    await act(async () => {
+      await capture.openFilePreview("/repo/a.ts")
+    })
+    await settlePendingWatch("reload")
+
+    mockedApi.readFileForEdit.mockResolvedValueOnce(
+      snapshotEdit("a.ts", "ordinary-third", "ordinary-3")
+    )
+    await act(async () => {
+      await capture.openFilePreview("/repo/a.ts")
+    })
+    await settlePendingWatch("missing")
+
+    const readsBeforeAutomaticPaths =
+      mockedApi.readFileForEdit.mock.calls.length
+    await act(async () => {
+      capture.markTabsStale("/repo/a.ts")
+      void capture.applyExternalReload(
+        "/repo/a.ts",
+        snapshotEdit("a.ts", "automatic-apply", "automatic-etag")
+      )
+      capture.rejectFileTab("/repo/a.ts", "automatic-reject")
+      void capture.reloadActiveFile()
+      workspaceStoreMock.emitRoot("/repo", ["a.ts"])
+      await Promise.resolve()
+    })
+
+    expect(
+      capture.fileTabs.find((item) => item.path === "/repo/a.ts")
+    ).toMatchObject({
+      content: "data:image/png;base64,c25hcHNob3Q=",
+      loading: false,
+      stale: false,
+      saveState: "idle",
+      snapshotSource: resolvedInput().source,
+    })
+    expect(mockedApi.readFileForEdit).toHaveBeenCalledTimes(
+      readsBeforeAutomaticPaths
+    )
+    expect(mockedApi.readFileBase64).not.toHaveBeenCalled()
+  })
+
+  it("snapshot_ignores_reload_active_file_until_an_ordinary_open", async () => {
+    mockedApi.readFileBase64.mockResolvedValueOnce("b3JkaW5hcnk=")
+    mockedApi.readFileForEdit.mockResolvedValueOnce(
+      snapshotEdit("a.png", "manual-reload", "manual-etag")
+    )
+    renderResolvedHarness()
+    await act(async () => {
+      capture.openResolvedImagePreview(resolvedInput())
+      await capture.reloadActiveFile()
+    })
+
+    expect(mockedApi.readFileBase64).not.toHaveBeenCalled()
+    expect(mockedApi.readFileForEdit).not.toHaveBeenCalled()
+    expect(capture.fileTabs[0].snapshotSource).toEqual(resolvedInput().source)
+
+    await act(async () => {
+      await capture.openFilePreview("/repo/images/a.png")
+    })
+    expect(capture.fileTabs[0].snapshotSource).toBeUndefined()
+    expect(mockedApi.readFileBase64).toHaveBeenCalledTimes(1)
+
+    await act(async () => {
+      await capture.reloadActiveFile()
+    })
+    expect(mockedApi.readFileForEdit).toHaveBeenCalledTimes(1)
+  })
+
+  it("resolved_snapshot_blocks_an_older_reload_active_result", async () => {
+    mockedApi.readFileForEdit.mockResolvedValueOnce(
+      snapshotEdit("a.ts", "ordinary-a", "a-1")
+    )
+    renderResolvedHarness()
+    await act(async () => {
+      await capture.openFilePreview("/repo/a.ts")
+    })
+
+    let resolveOlder:
+      | ((value: ReturnType<typeof snapshotEdit>) => void)
+      | null = null
+    mockedApi.readFileForEdit.mockImplementationOnce(
+      () => new Promise((resolve) => (resolveOlder = resolve))
+    )
+    await act(async () => {
+      void capture.reloadActiveFile()
+    })
+    await act(async () => {
+      capture.openResolvedImagePreview(resolvedInput({ path: "/repo/a.ts" }))
+    })
+    await act(async () => {
+      resolveOlder!(snapshotEdit("a.ts", "late-success", "a-late"))
+    })
+
+    expect(
+      capture.fileTabs.find((tab) => tab.path === "/repo/a.ts")
+    ).toMatchObject({
+      content: "data:image/png;base64,c25hcHNob3Q=",
+      loading: false,
+      saveState: "idle",
+      snapshotSource: resolvedInput().source,
+    })
+
+    mockedApi.readFileForEdit.mockResolvedValueOnce(
+      snapshotEdit("b.ts", "ordinary-b", "b-1")
+    )
+    await act(async () => {
+      await capture.openFilePreview("/repo/b.ts")
+    })
+    let rejectOlder: ((error: Error) => void) | null = null
+    mockedApi.readFileForEdit.mockImplementationOnce(
+      () => new Promise((_resolve, reject) => (rejectOlder = reject))
+    )
+    await act(async () => {
+      void capture.reloadActiveFile()
+    })
+    await act(async () => {
+      capture.openResolvedImagePreview(resolvedInput({ path: "/repo/b.ts" }))
+    })
+    await act(async () => {
+      rejectOlder!(new Error("late-error"))
+    })
+
+    expect(
+      capture.fileTabs.find((tab) => tab.path === "/repo/b.ts")
+    ).toMatchObject({
+      content: "data:image/png;base64,c25hcHNob3Q=",
+      loading: false,
+      saveState: "idle",
+      saveError: null,
+      snapshotSource: resolvedInput().source,
+    })
+  })
+
+  it("snapshot_incarnation_blocks_an_older_reload_success_after_ordinary_conversion", async () => {
+    mockedApi.readFileForEdit.mockResolvedValueOnce(
+      snapshotEdit("a.ts", "ordinary-a", "a-1")
+    )
+    renderResolvedHarness()
+    await act(async () => {
+      await capture.openFilePreview("/repo/a.ts")
+    })
+
+    let resolveOlder:
+      | ((value: ReturnType<typeof snapshotEdit>) => void)
+      | null = null
+    mockedApi.readFileForEdit.mockImplementationOnce(
+      () => new Promise((resolve) => (resolveOlder = resolve))
+    )
+    await act(async () => {
+      void capture.reloadActiveFile()
+    })
+    await act(async () => {
+      capture.openResolvedImagePreview(resolvedInput({ path: "/repo/a.ts" }))
+    })
+
+    mockedApi.readFileForEdit.mockResolvedValueOnce(
+      snapshotEdit("a.ts", "newer-ordinary", "a-2")
+    )
+    await act(async () => {
+      await capture.openFilePreview("/repo/a.ts")
+    })
+    expect(
+      capture.fileTabs.find((tab) => tab.path === "/repo/a.ts")
+    ).toMatchObject({
+      content: "newer-ordinary",
+      loading: false,
+      saveState: "idle",
+      snapshotSource: undefined,
+    })
+
+    await act(async () => {
+      resolveOlder!(snapshotEdit("a.ts", "late-success", "a-late"))
+    })
+
+    expect(
+      capture.fileTabs.find((tab) => tab.path === "/repo/a.ts")
+    ).toMatchObject({
+      content: "newer-ordinary",
+      savedContent: "newer-ordinary",
+      etag: "a-2",
+      loading: false,
+      saveState: "idle",
+      snapshotSource: undefined,
+    })
+  })
+
+  it("snapshot_incarnation_blocks_an_older_reload_error_after_ordinary_conversion", async () => {
+    mockedApi.readFileForEdit.mockResolvedValueOnce(
+      snapshotEdit("a.ts", "ordinary-a", "a-1")
+    )
+    renderResolvedHarness()
+    await act(async () => {
+      await capture.openFilePreview("/repo/a.ts")
+    })
+
+    let rejectOlder: ((error: Error) => void) | null = null
+    mockedApi.readFileForEdit.mockImplementationOnce(
+      () => new Promise((_resolve, reject) => (rejectOlder = reject))
+    )
+    await act(async () => {
+      void capture.reloadActiveFile()
+    })
+    await act(async () => {
+      capture.openResolvedImagePreview(resolvedInput({ path: "/repo/a.ts" }))
+    })
+
+    mockedApi.readFileForEdit.mockResolvedValueOnce(
+      snapshotEdit("a.ts", "newer-ordinary", "a-2")
+    )
+    await act(async () => {
+      await capture.openFilePreview("/repo/a.ts")
+    })
+
+    await act(async () => {
+      rejectOlder!(new Error("late-error"))
+    })
+
+    expect(
+      capture.fileTabs.find((tab) => tab.path === "/repo/a.ts")
+    ).toMatchObject({
+      content: "newer-ordinary",
+      savedContent: "newer-ordinary",
+      etag: "a-2",
+      loading: false,
+      saveState: "idle",
+      saveError: null,
+      snapshotSource: undefined,
+    })
+  })
+
+  it("watcher_discards_a_pre_snapshot_read_after_ordinary_conversion", async () => {
+    mockedApi.readFileForEdit
+      .mockResolvedValueOnce(snapshotEdit("anchor.ts", "anchor", "anchor-1"))
+      .mockResolvedValueOnce(snapshotEdit("a.ts", "ordinary-a", "a-1"))
+    renderResolvedHarness()
+    await act(async () => {
+      await capture.openFilePreview("/repo/anchor.ts")
+      await capture.openFilePreview("/repo/a.ts")
+    })
+
+    let resolveWatch:
+      | ((value: ReturnType<typeof snapshotEdit>) => void)
+      | null = null
+    mockedApi.readFileForEdit.mockImplementationOnce(
+      () => new Promise((resolve) => (resolveWatch = resolve))
+    )
+    await act(async () => {
+      workspaceStoreMock.emitRoot("/repo", ["a.ts"])
+      await Promise.resolve()
+    })
+
+    await act(async () => {
+      capture.openResolvedImagePreview(resolvedInput({ path: "/repo/a.ts" }))
+    })
+    mockedApi.readFileForEdit.mockResolvedValueOnce(
+      snapshotEdit("a.ts", "newer-ordinary", "a-2")
+    )
+    await act(async () => {
+      await capture.openFilePreview("/repo/a.ts")
+    })
+
+    await act(async () => {
+      resolveWatch!(snapshotEdit("a.ts", "late-watch", "a-late"))
+    })
+
+    expect(
+      capture.fileTabs.find((tab) => tab.path === "/repo/a.ts")
+    ).toMatchObject({
+      content: "newer-ordinary",
+      savedContent: "newer-ordinary",
+      etag: "a-2",
+      loading: false,
+      saveState: "idle",
+      snapshotSource: undefined,
+    })
+    expect(capture.conflictPath).toBeNull()
+  })
+
+  it("snapshot_is_pinned_against_hidden_content_eviction", async () => {
+    const oversized = "x".repeat(48 * 1024 * 1024 + 1024)
+    mockedApi.readFileForEdit.mockImplementation(
+      (_root: string, path: string) =>
+        Promise.resolve(
+          snapshotEdit(
+            path,
+            path === "huge.ts" ? oversized : "active",
+            `${path}-etag`
+          )
+        )
+    )
+    renderResolvedHarness()
+    await act(async () => {
+      capture.openResolvedImagePreview(resolvedInput())
+    })
+    await act(async () => {
+      await capture.openFilePreview("/repo/huge.ts")
+    })
+    await act(async () => {
+      await capture.openFilePreview("/repo/active.ts")
+    })
+
+    expect(
+      capture.fileTabs.find((tab) => tab.path === "/repo/images/a.png")
+    ).toMatchObject({
+      content: "data:image/png;base64,c25hcHNob3Q=",
+      stale: false,
+      snapshotSource: resolvedInput().source,
+    })
+  })
+
+  it("closing_releases_snapshot_content", async () => {
+    renderResolvedHarness()
+    await act(async () => {
+      capture.openResolvedImagePreview(resolvedInput())
+    })
+    const tabId = capture.activeFileTabId!
+
+    await act(async () => {
+      capture.closeFileTab(tabId)
+    })
+
+    expect(capture.fileTabs).toEqual([])
+    expect(capture.activeFileTabId).toBeNull()
+    expect(screen.getByTestId("snapshot-tab")).toHaveTextContent("null")
   })
 })

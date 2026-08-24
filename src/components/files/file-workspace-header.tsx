@@ -37,10 +37,13 @@ export function FileWorkspaceHeader() {
   // preview toggle for markdown/html, browser-open for html.
   const canPreview =
     activeFileTab.kind === "file" &&
+    !activeFileTab.snapshotSource &&
     (activeFileTab.language === "markdown" ||
       isHtmlPreviewable(activeFileTab.path))
   const canOpenInBrowser =
-    activeFileTab.kind === "file" && isHtmlPreviewable(activeFileTab.path)
+    activeFileTab.kind === "file" &&
+    !activeFileTab.snapshotSource &&
+    isHtmlPreviewable(activeFileTab.path)
   const isPreviewActive =
     canPreview && activeFileTabId
       ? previewFileTabIds.has(activeFileTabId)

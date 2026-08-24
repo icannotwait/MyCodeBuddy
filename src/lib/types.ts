@@ -4712,6 +4712,26 @@ export interface FilePreviewContent {
   content: string
 }
 
+export type GrokSessionImageOrigin = "session" | "workspace"
+export type GrokSessionImageMimeType =
+  | "image/png"
+  | "image/jpeg"
+  | "image/webp"
+  | "image/gif"
+
+export interface GrokSessionImageResolution {
+  path: string
+  origin: GrokSessionImageOrigin
+  mimeType: GrokSessionImageMimeType
+  dataBase64?: string
+}
+
+export interface ResolveGrokSessionImageInput {
+  conversationId: number
+  href: string
+  includeData?: boolean
+}
+
 export interface FileEditContent {
   path: string
   content: string

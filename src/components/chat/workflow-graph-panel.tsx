@@ -1,15 +1,18 @@
 "use client"
 
 /**
- * Expanded workflow graph: collapsible phase lanes with adaptive node rows.
- * Observed nodes open via child-tab path; estimated nodes are non-actionable.
- * Node rows mirror SubAgentOverlayRow card chrome (no per-node detail expand).
+ * Hook-free compatibility dispatcher for workflow projections. Simple renders
+ * its task dependency DAG and selected-node detail; manifest and observed-only
+ * snapshots retain the collapsible phase-lane graph.
  */
 
 import {
   memo,
   useCallback,
+  useEffect,
+  useId,
   useMemo,
+  useRef,
   useState,
   useSyncExternalStore,
 } from "react"
@@ -26,6 +29,7 @@ import { AgentIcon } from "@/components/agent-icon"
 import { useOpenLinkOrFile } from "@/components/ai-elements/link-safety"
 import { WorkflowStatusIcon } from "@/components/chat/workflow-status-icon"
 import { CompletionDecisionCard } from "@/components/chat/completion-decision-card"
+import { WorkflowDagCanvas } from "@/components/chat/workflow-dag-canvas"
 import { phaseProgressFragments } from "@/components/chat/workflow-phase-rail"
 import { Badge } from "@/components/ui/badge"
 import { getAgentLabel } from "@/lib/custom-agents"
@@ -317,7 +321,156 @@ function HistoricalCompletionCard({
   )
 }
 
-function SimpleWorkflowProjection({
+function hasUnambiguousNodeIds(
+  nodes: readonly WorkflowNodeSnapshot[]
+): boolean {
+  const seen = new Set<string>()
+  for (const node of nodes) {
+    if (!node.node_id.trim() || seen.has(node.node_id)) return false
+    seen.add(node.node_id)
+  }
+  return true
+}
+
+function SimpleWorkflowDagDetail({
+  node,
+  detailId,
+  onOpenSession,
+}: {
+  node: WorkflowNodeSnapshot
+  detailId: string
+  onOpenSession: (node: WorkflowNodeSnapshot) => void
+}) {
+  const t = useTranslations("Folder.chat.workflowGraph")
+  const tLive = useTranslations("Folder.chat.liveTurnStats")
+  const tDel = useTranslations("Folder.chat.delegation")
+  const nowMs = useNowMs(isLiveNodeStatus(node.status))
+  const title = nodeDisplayTitle(node)
+  const agentType = isAgentType(node.agent_type) ? node.agent_type : null
+  const agentLabel = agentType ? getAgentLabel(agentType) : null
+  const model = node.model?.trim() || null
+  const effort = node.effort?.trim() || null
+  const liveRun =
+    node.latest_run_status === "running" ||
+    node.latest_run_status === "reserving"
+      ? node.latest_run_status
+      : isLiveNodeStatus(node.status)
+        ? node.status
+        : null
+  const operationalLine = buildOperationalLine(
+    node,
+    nowMs,
+    tLive as unknown as LiveStatsTranslator,
+    tDel as unknown as EditSegmentTranslator
+  )
+  const metadata = [
+    node.task_index != null ? t("taskIndex", { index: node.task_index }) : null,
+    node.role ? t("roleLabel", { role: node.role }) : null,
+    agentLabel ? t("agentLabel", { agent: agentLabel }) : null,
+    model ? t("modelLabel", { model }) : null,
+    effort ? t("effortLabel", { effort }) : null,
+  ].filter(Boolean) as string[]
+  const counters = [
+    node.run_count > 0 ? t("runCount", { count: node.run_count }) : null,
+    node.replacement_count > 0
+      ? t("replacementCount", { count: node.replacement_count })
+      : null,
+    node.round_count != null && node.round_count > 0
+      ? t("roundCount", { count: node.round_count })
+      : null,
+  ].filter(Boolean) as string[]
+  const estimated = isEstimatedNode(node)
+  const openable = canOpenWorkflowNode(node)
+
+  return (
+    <section
+      id={detailId}
+      role="region"
+      aria-label={t("dagSelectedNode")}
+      data-testid="workflow-dag-detail"
+      data-status={node.status}
+      data-sync-state={node.sync_state}
+      className="min-w-0 space-y-2 rounded-xl border bg-card p-3"
+    >
+      <div className="flex min-w-0 flex-wrap items-start gap-2">
+        <WorkflowStatusIcon
+          visualStatus={node.status}
+          className="mt-0.5 size-4 shrink-0"
+        />
+        <div className="min-w-0 flex-1">
+          <h3
+            className="break-words text-sm font-semibold"
+            title={title}
+            dir="auto"
+          >
+            {title}
+          </h3>
+          {liveRun && (
+            <p className="text-xs text-blue-600 dark:text-blue-400">
+              {t("simpleLiveRun", {
+                status: t(`nodeStatus.${liveRun}`),
+              })}
+            </p>
+          )}
+        </div>
+        <Badge variant="secondary" className="shrink-0 text-[10px]">
+          {t(`nodeStatus.${node.status}`)}
+        </Badge>
+      </div>
+
+      {metadata.length > 0 && (
+        <div className="flex min-w-0 flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
+          {metadata.map((item, index) => (
+            <span key={`${index}:${item}`} className="min-w-0 break-words">
+              {item}
+            </span>
+          ))}
+        </div>
+      )}
+      {operationalLine && (
+        <p
+          className="break-words text-xs text-muted-foreground"
+          title={operationalLine}
+        >
+          {operationalLine}
+        </p>
+      )}
+      {counters.length > 0 && (
+        <p className="break-words text-xs text-muted-foreground">
+          {counters.join(" · ")}
+        </p>
+      )}
+      {isSimpleNodeOutOfSync(node) && (
+        <p className="flex items-center gap-1.5 text-xs text-amber-700 dark:text-amber-300">
+          <AlertTriangleIcon className="size-3.5 shrink-0" aria-hidden />
+          <span>{t("simpleOutOfSync")}</span>
+        </p>
+      )}
+
+      {openable ? (
+        <div className="flex justify-end">
+          <button
+            type="button"
+            data-testid={`simple-task-open-${node.node_id}`}
+            className="inline-flex h-8 items-center gap-1.5 rounded-md border px-2 text-xs font-medium hover:bg-muted/60"
+            onClick={() => onOpenSession(node)}
+            aria-label={t("openSession")}
+            title={t("openSession")}
+          >
+            <Eye className="size-3.5" aria-hidden />
+            <span>{t("openSession")}</span>
+          </button>
+        </div>
+      ) : (
+        <p className="text-xs text-muted-foreground">
+          {t(estimated ? "estimatedNonActionable" : "noSessions")}
+        </p>
+      )}
+    </section>
+  )
+}
+
+function SimpleWorkflowDagPanel({
   snapshot,
   workspaceRootPath,
   className,
@@ -327,13 +480,7 @@ function SimpleWorkflowProjection({
   className?: string
 }) {
   const t = useTranslations("Folder.chat.workflowGraph")
-  const tLive = useTranslations("Folder.chat.liveTurnStats")
-  const tDel = useTranslations("Folder.chat.delegation")
   const openLinkOrFile = useOpenLinkOrFile()
-  const needsLiveClock = snapshot.nodes.some((node) =>
-    isLiveNodeStatus(node.status)
-  )
-  const nowMs = useNowMs(needsLiveClock)
   const locator = snapshot.simple ?? null
   const partial =
     locator == null ||
@@ -341,6 +488,74 @@ function SimpleWorkflowProjection({
     snapshot.nodes.some((node) =>
       hasBlockingSimpleWarning(node.projection_warning_codes)
     )
+  const dagNodes = useMemo(
+    () =>
+      snapshot.nodes.map<WorkflowNodeSnapshot>((node) =>
+        node.sync_state === "out_of_sync" && !isSimpleNodeOutOfSync(node)
+          ? { ...node, sync_state: "in_sync" }
+          : node
+      ),
+    [snapshot.nodes]
+  )
+  const idsAreUnambiguous = useMemo(
+    () => hasUnambiguousNodeIds(snapshot.nodes),
+    [snapshot.nodes]
+  )
+  const nodeIds = useMemo(
+    () => new Set(snapshot.nodes.map((node) => node.node_id)),
+    [snapshot.nodes]
+  )
+  const preferredCurrentId = idsAreUnambiguous
+    ? (snapshot.current_node_ids.find((nodeId) => nodeIds.has(nodeId)) ?? null)
+    : null
+  const [selectedNodeId, setSelectedNodeId] = useState<string | null>(
+    preferredCurrentId
+  )
+  const userSelectionDirty = useRef(false)
+  const reactDetailId = useId()
+  const detailId = `workflow-dag-detail-${reactDetailId.replace(
+    /[^A-Za-z0-9_-]/g,
+    ""
+  )}`
+
+  useEffect(() => {
+    setSelectedNodeId((previous) => {
+      if (!idsAreUnambiguous) {
+        userSelectionDirty.current = false
+        return null
+      }
+      if (
+        userSelectionDirty.current &&
+        previous != null &&
+        nodeIds.has(previous)
+      ) {
+        return previous
+      }
+      if (userSelectionDirty.current) userSelectionDirty.current = false
+      return preferredCurrentId
+    })
+  }, [idsAreUnambiguous, nodeIds, preferredCurrentId])
+
+  const selectNode = useCallback(
+    (nodeId: string) => {
+      if (!idsAreUnambiguous || !nodeIds.has(nodeId)) return
+      userSelectionDirty.current = true
+      setSelectedNodeId(nodeId)
+    },
+    [idsAreUnambiguous, nodeIds]
+  )
+  const selectedNode =
+    idsAreUnambiguous && selectedNodeId != null
+      ? (snapshot.nodes.find((node) => node.node_id === selectedNodeId) ?? null)
+      : null
+  const tasksPhase = useMemo(
+    () =>
+      buildPhaseRail({ ...snapshot, gates: [] }).find(
+        (phase) => phase.kind === "tasks"
+      )!,
+    [snapshot]
+  )
+  const progressParts = phaseProgressFragments(tasksPhase, t)
 
   const openFile = useCallback(
     (relPath: string) => {
@@ -415,110 +630,56 @@ function SimpleWorkflowProjection({
         </div>
       )}
 
-      <div className="flex min-w-0 items-center justify-between gap-2 px-1">
-        <span className="min-w-0 text-xs font-semibold">
-          {t("simpleTasks")}
-        </span>
-        <span className="shrink-0 text-[10px] text-muted-foreground">
-          {t("simpleTaskCount", { count: snapshot.nodes.length })}
-        </span>
-      </div>
+      <section
+        className="min-w-0 space-y-2"
+        data-testid="workflow-graph-lane-tasks"
+        aria-label={t("phase.tasks")}
+      >
+        <div className="flex min-w-0 flex-wrap items-center gap-1.5 px-1">
+          <WorkflowStatusIcon visualStatus={tasksPhase.status} />
+          <span className="min-w-0 flex-1 truncate text-xs font-semibold">
+            {t("phase.tasks")}
+          </span>
+          <span className="ms-auto flex max-w-full flex-wrap items-center justify-end gap-1.5 text-[10px] text-muted-foreground">
+            <span>{t(`phaseStatus.${tasksPhase.status}`)}</span>
+            <span className="tabular-nums">
+              {progressParts.length > 0
+                ? progressParts.join(" · ")
+                : t("simpleTaskCount", { count: snapshot.nodes.length })}
+            </span>
+          </span>
+        </div>
 
-      {snapshot.nodes.length === 0 ? (
-        <p className="px-1 py-2 text-xs text-muted-foreground">
-          {t("simpleNoTasks")}
-        </p>
-      ) : (
-        <ul className="divide-y divide-border/60 border-y border-border/60">
-          {snapshot.nodes.map((node) => {
-            const title = nodeDisplayTitle(node)
-            const openable = canOpenWorkflowNode(node)
-            const liveRun =
-              node.latest_run_status === "running" ||
-              node.latest_run_status === "reserving"
-                ? node.latest_run_status
-                : isLiveNodeStatus(node.status)
-                  ? node.status
-                  : null
-            const operationalLine = buildOperationalLine(
-              node,
-              nowMs,
-              tLive as unknown as LiveStatsTranslator,
-              tDel as unknown as EditSegmentTranslator
-            )
-            return (
-              <li
-                key={node.node_id}
-                className="flex min-h-12 min-w-0 items-center gap-2 px-1 py-1.5"
-                data-testid={`simple-task-row-${node.node_id}`}
-                data-sync-state={node.sync_state}
-              >
-                <WorkflowStatusIcon visualStatus={node.status} />
-                <div className="min-w-0 flex-1">
-                  <div className="flex min-w-0 items-center gap-1.5">
-                    {node.task_index != null && (
-                      <span className="shrink-0 text-[10px] font-medium text-muted-foreground">
-                        {t("taskIndex", { index: node.task_index })}
-                      </span>
-                    )}
-                    <span
-                      className="min-w-0 flex-1 truncate text-xs font-medium"
-                      title={title}
-                    >
-                      {title}
-                    </span>
-                    <Badge
-                      variant="secondary"
-                      className="h-4 shrink-0 px-1 text-[10px]"
-                    >
-                      {t(`nodeStatus.${node.status}`)}
-                    </Badge>
-                  </div>
-                  {liveRun && (
-                    <p className="truncate text-[11px] text-blue-600 dark:text-blue-400">
-                      {t("simpleLiveRun", {
-                        status: t(`nodeStatus.${liveRun}`),
-                      })}
-                    </p>
-                  )}
-                  {operationalLine && (
-                    <p
-                      className="truncate text-[11px] text-muted-foreground"
-                      title={operationalLine}
-                    >
-                      {operationalLine}
-                    </p>
-                  )}
-                  {isSimpleNodeOutOfSync(node) && (
-                    <p className="break-words text-[11px] text-amber-700 dark:text-amber-300">
-                      {t("simpleOutOfSync")}
-                    </p>
-                  )}
-                </div>
-                {openable && (
-                  <button
-                    type="button"
-                    className="inline-flex size-7 shrink-0 items-center justify-center rounded-md hover:bg-muted/60"
-                    data-testid={`simple-task-open-${node.node_id}`}
-                    onClick={() => openSession(node)}
-                    title={t("openSession")}
-                    aria-label={t("openSession")}
-                  >
-                    <Eye className="size-3.5" aria-hidden />
-                  </button>
-                )}
-              </li>
-            )
-          })}
-        </ul>
-      )}
+        {snapshot.nodes.length === 0 ? (
+          <p className="px-1 py-2 text-xs text-muted-foreground">
+            {t("simpleNoTasks")}
+          </p>
+        ) : (
+          <WorkflowDagCanvas
+            nodes={dagNodes}
+            edges={snapshot.edges}
+            currentNodeIds={snapshot.current_node_ids}
+            selectedNodeId={selectedNodeId}
+            detailId={detailId}
+            nodeDisplayTitle={nodeDisplayTitle}
+            onSelect={selectNode}
+          />
+        )}
+
+        {selectedNode && (
+          <SimpleWorkflowDagDetail
+            node={selectedNode}
+            detailId={detailId}
+            onOpenSession={openSession}
+          />
+        )}
+      </section>
     </div>
   )
 }
 
-export const WorkflowGraphPanel = memo(function WorkflowGraphPanel({
+const NonSimpleWorkflowGraphPanel = memo(function NonSimpleWorkflowGraphPanel({
   snapshot,
-  workspaceRootPath,
   className,
   onOpenRootConversation,
 }: WorkflowGraphPanelProps) {
@@ -747,16 +908,6 @@ export const WorkflowGraphPanel = memo(function WorkflowGraphPanel({
           )
         )}
       </div>
-    )
-  }
-
-  if (snapshot.compatibility === "simple") {
-    return (
-      <SimpleWorkflowProjection
-        snapshot={snapshot}
-        workspaceRootPath={workspaceRootPath}
-        className={className}
-      />
     )
   }
 
@@ -994,4 +1145,28 @@ export const WorkflowGraphPanel = memo(function WorkflowGraphPanel({
       )}
     </div>
   )
+})
+
+export const WorkflowGraphPanel = memo(function WorkflowGraphPanel(
+  props: WorkflowGraphPanelProps
+) {
+  if (props.snapshot.compatibility === "simple") {
+    const locator = props.snapshot.simple
+    const selectionScope =
+      props.conversationId != null
+        ? `conversation:${props.conversationId}`
+        : `locator:${JSON.stringify([
+            locator?.plan_rel_path ?? "",
+            locator?.progress_rel_path ?? "",
+          ])}`
+    return (
+      <SimpleWorkflowDagPanel
+        key={selectionScope}
+        snapshot={props.snapshot}
+        workspaceRootPath={props.workspaceRootPath}
+        className={props.className}
+      />
+    )
+  }
+  return <NonSimpleWorkflowGraphPanel {...props} />
 })

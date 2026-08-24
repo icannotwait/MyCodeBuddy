@@ -488,7 +488,7 @@ describe("ConversationDetailPanel send-path hardening", () => {
     const guardIdx = source.indexOf("shouldRejectDuplicateCreate(")
     // The CALL site (assignment), not the function definition earlier in the file.
     const optimisticIdx = source.indexOf(
-      "const optimisticTurn = buildOptimisticUserTurnFromDraft("
+      "const builtOptimistic = buildOptimisticUserTurnFromDraft("
     )
     expect(guardIdx).toBeGreaterThan(-1)
     expect(optimisticIdx).toBeGreaterThan(guardIdx)

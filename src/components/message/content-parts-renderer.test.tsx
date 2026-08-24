@@ -90,6 +90,20 @@ vi.mock("./delegated-sub-thread", () => ({
   ),
 }))
 
+vi.mock("@/components/ai-elements/grok-session-image-context", () => ({
+  GrokConversationProvider: ({ children }: { children: React.ReactNode }) =>
+    children,
+  GrokSessionImageScope: ({
+    children,
+    phase,
+  }: {
+    children: React.ReactNode
+    phase: "live" | "complete" | null
+  }) => <div data-grok-phase={phase ?? undefined}>{children}</div>,
+  useGrokConversationId: () => null,
+  useGrokSessionImageScope: () => null,
+}))
+
 import { ContentPartsRenderer, ToolCallPart } from "./content-parts-renderer"
 
 function wrap(ui: React.ReactElement) {
@@ -437,6 +451,128 @@ describe("ContentPartsRenderer local-path autolink scope", () => {
       "true"
     )
   })
+})
+
+describe("ContentPartsRenderer Grok session image scope", () => {
+  it("scopes only top-level assistant text and excludes nested goal text", () => {
+    const top = { type: "text" as const, text: "top" }
+    const start: AdaptedToolCallPart = {
+      type: "tool-call",
+      toolCallId: "goal-1",
+      toolName: "create_goal",
+      input: JSON.stringify({ objective: "test" }),
+      state: "output-error",
+      errorText: "failed",
+    }
+    wrap(
+      <ContentPartsRenderer
+        role="assistant"
+        grokSessionImagePhase="complete"
+        grokSessionImageTextParts={new Set([top])}
+        parts={[
+          top,
+          {
+            type: "goal-run",
+            start,
+            end: null,
+            items: [{ type: "text", text: "nested" }],
+            isRunning: false,
+          },
+        ]}
+      />
+    )
+    expect(
+      screen.getByText("top").closest("[data-grok-phase]")
+    ).toHaveAttribute("data-grok-phase", "complete")
+    expect(screen.getByText("nested").closest("[data-grok-phase]")).toBeNull()
+  })
+
+  it("does not scope reasoning or proposed-plan content", () => {
+    wrap(
+      <ContentPartsRenderer
+        role="assistant"
+        grokSessionImagePhase="complete"
+        parts={[
+          { type: "reasoning", content: "thinking", isStreaming: false },
+          {
+            type: "proposed-plan",
+            markdown: "plan markdown",
+            isStreaming: false,
+          },
+        ]}
+      />
+    )
+    fireEvent.click(screen.getByRole("button", { name: "Thought" }))
+    expect(screen.getByText("thinking").closest("[data-grok-phase]")).toBeNull()
+    expect(
+      screen.getByText("plan markdown").closest("[data-grok-phase]")
+    ).toBeNull()
+  })
+
+  it("does not scope user text even when a phase is supplied", () => {
+    const user = { type: "text" as const, text: "user" }
+    wrap(
+      <ContentPartsRenderer
+        role="user"
+        grokSessionImagePhase="live"
+        grokSessionImageTextParts={new Set([user])}
+        parts={[user]}
+      />
+    )
+    expect(screen.getByText("user").closest("[data-grok-phase]")).toBeNull()
+  })
+
+  it("does not scope Markdown rendered inside a tool body", () => {
+    const taskTool: AdaptedToolCallPart = {
+      type: "tool-call",
+      toolCallId: "task-1",
+      toolName: "task",
+      input: JSON.stringify({ description: "child" }),
+      state: "output-available",
+      output: "tool markdown",
+    }
+    wrap(
+      <ContentPartsRenderer
+        role="assistant"
+        grokSessionImagePhase="complete"
+        parts={[taskTool]}
+      />
+    )
+    fireEvent.click(screen.getByRole("button"))
+    expect(
+      screen.getByText("tool markdown").closest("[data-grok-phase]")
+    ).toBeNull()
+  })
+
+  it.each(["complete", "live"] as const)(
+    "scopes only source-assistant text identities in the %s phase",
+    (phase) => {
+      const assistantText: AdaptedTextPart = {
+        type: "text",
+        text: `assistant-${phase}`,
+      }
+      const sourceToolText: AdaptedTextPart = {
+        type: "text",
+        text: `tool-${phase}`,
+      }
+
+      wrap(
+        <ContentPartsRenderer
+          role="assistant"
+          grokSessionImagePhase={phase}
+          grokSessionImageTextParts={new Set([assistantText])}
+          parts={[assistantText, sourceToolText]}
+        />
+      )
+
+      expect(
+        screen.getByText(`assistant-${phase}`).closest("[data-grok-phase]")
+      ).toHaveAttribute("data-grok-phase", phase)
+      expect(
+        screen.getByText(`tool-${phase}`).closest("[data-grok-phase]")
+      ).toBeNull()
+    }
+  )
 })
 
 describe("ContentPartsRenderer thinking visibility", () => {

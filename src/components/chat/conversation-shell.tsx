@@ -113,6 +113,7 @@ interface ConversationShellProps {
   queue?: QueuedMessage[]
   sharedQueue?: SharedQueuedPrompt[]
   onSharedQueueCancel?: (queueItemId: string) => Promise<void>
+  onSharedQueueFailedDismiss?: (queueItemId: string) => void
   onEnqueue?: (draft: PromptDraft, modeId: string | null) => void
   onQueueReorder?: (items: QueuedMessage[]) => void
   onQueueEdit?: (id: string) => void
@@ -198,6 +199,7 @@ export function ConversationShell({
   queue,
   sharedQueue,
   onSharedQueueCancel,
+  onSharedQueueFailedDismiss,
   onEnqueue,
   onQueueReorder,
   onQueueEdit,
@@ -361,6 +363,7 @@ export function ConversationShell({
               queue={queue}
               sharedQueue={sharedQueue}
               onSharedQueueCancel={onSharedQueueCancel}
+              onSharedQueueFailedDismiss={onSharedQueueFailedDismiss}
               onEnqueue={onEnqueue}
               onQueueReorder={onQueueReorder}
               onQueueEdit={onQueueEdit}

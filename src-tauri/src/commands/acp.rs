@@ -8753,6 +8753,33 @@ pub async fn acp_preflight(
 /// Diverging any of these from the others reintroduces the
 /// "[UI shows options] != [delegation gets options]" inconsistency that
 /// the multi-agent settings panel was designed to prevent.
+async fn build_agent_effective_config_env_from_setting(
+    conn: &sea_orm::DatabaseConnection,
+    agent_type: AgentType,
+    setting: Option<&crate::db::entities::agent_setting::Model>,
+) -> BTreeMap<String, String> {
+    let local_config_json = load_agent_local_config_json(agent_type);
+    let mut runtime_env =
+        build_runtime_env_from_setting(agent_type, setting, local_config_json.as_deref());
+    apply_model_provider_env(agent_type, setting, &mut runtime_env, conn).await;
+    runtime_env
+}
+
+/// Resolve the settings/native-config/provider portion of an agent's launch
+/// environment without rejecting disabled agents or adding Codeg's terminal
+/// credential-helper keys. History discovery uses this so relocatable agent
+/// stores follow the same per-agent `env_json` values as a launched child while
+/// remaining readable after the agent is disabled.
+pub(crate) async fn build_agent_effective_config_env(
+    conn: &sea_orm::DatabaseConnection,
+    agent_type: AgentType,
+) -> Result<BTreeMap<String, String>, AcpError> {
+    let setting = agent_setting_service::get_by_agent_type(conn, agent_type)
+        .await
+        .map_err(|e| AcpError::protocol(e.to_string()))?;
+    Ok(build_agent_effective_config_env_from_setting(conn, agent_type, setting.as_ref()).await)
+}
+
 pub(crate) async fn build_session_runtime_env(
     db: &AppDatabase,
     agent_type: AgentType,
@@ -8772,10 +8799,8 @@ pub(crate) async fn build_session_runtime_env(
         )));
     }
 
-    let local_config_json = load_agent_local_config_json(agent_type);
     let mut runtime_env =
-        build_runtime_env_from_setting(agent_type, setting.as_ref(), local_config_json.as_deref());
-    apply_model_provider_env(agent_type, setting.as_ref(), &mut runtime_env, &db.conn).await;
+        build_agent_effective_config_env_from_setting(&db.conn, agent_type, setting.as_ref()).await;
 
     // codex resume no longer needs a `MODEL_PROVIDER` pin: codex-acp 1.0.1
     // (#224) resolves the resumed provider from `~/.codex/config.toml` via

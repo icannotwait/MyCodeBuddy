@@ -1,0 +1,221 @@
+{
+  "accepted": [
+    {
+      "input": "images/2.png",
+      "expected": {
+        "path": "images/2.png",
+        "filename": "2.png",
+        "extension": "png"
+      }
+    },
+    {
+      "input": "./images/photo.jpg",
+      "expected": {
+        "path": "images/photo.jpg",
+        "filename": "photo.jpg",
+        "extension": "jpg"
+      }
+    },
+    {
+      "input": "images/photo.jpeg",
+      "expected": {
+        "path": "images/photo.jpeg",
+        "filename": "photo.jpeg",
+        "extension": "jpeg"
+      }
+    },
+    {
+      "input": "images/frame.webp",
+      "expected": {
+        "path": "images/frame.webp",
+        "filename": "frame.webp",
+        "extension": "webp"
+      }
+    },
+    {
+      "input": "images/anim.gif",
+      "expected": {
+        "path": "images/anim.gif",
+        "filename": "anim.gif",
+        "extension": "gif"
+      }
+    },
+    {
+      "input": "images/UPPER.PNG",
+      "expected": {
+        "path": "images/UPPER.PNG",
+        "filename": "UPPER.PNG",
+        "extension": "png"
+      }
+    },
+    {
+      "input": "images/UPPER.JPG",
+      "expected": {
+        "path": "images/UPPER.JPG",
+        "filename": "UPPER.JPG",
+        "extension": "jpg"
+      }
+    },
+    {
+      "input": "images/UPPER.JPEG",
+      "expected": {
+        "path": "images/UPPER.JPEG",
+        "filename": "UPPER.JPEG",
+        "extension": "jpeg"
+      }
+    },
+    {
+      "input": "images/UPPER.WEBP",
+      "expected": {
+        "path": "images/UPPER.WEBP",
+        "filename": "UPPER.WEBP",
+        "extension": "webp"
+      }
+    },
+    {
+      "input": "images/UPPER.GIF",
+      "expected": {
+        "path": "images/UPPER.GIF",
+        "filename": "UPPER.GIF",
+        "extension": "gif"
+      }
+    },
+    {
+      "input": "images/Mix.JpEg",
+      "expected": {
+        "path": "images/Mix.JpEg",
+        "filename": "Mix.JpEg",
+        "extension": "jpeg"
+      }
+    },
+    {
+      "input": " ./images/My%20Image.PNG#preview ",
+      "expected": {
+        "path": "images/My Image.PNG",
+        "filename": "My Image.PNG",
+        "extension": "png"
+      }
+    },
+    {
+      "input": "images/2.png?cache=1",
+      "expected": {
+        "path": "images/2.png",
+        "filename": "2.png",
+        "extension": "png"
+      }
+    },
+    {
+      "input": "images/2.png#preview",
+      "expected": {
+        "path": "images/2.png",
+        "filename": "2.png",
+        "extension": "png"
+      }
+    },
+    {
+      "input": "images/%E7%9B%AE%E6%A0%87.webp",
+      "expected": {
+        "path": "images/目标.webp",
+        "filename": "目标.webp",
+        "extension": "webp"
+      }
+    },
+    {
+      "input": "images/a+b.png",
+      "expected": {
+        "path": "images/a+b.png",
+        "filename": "a+b.png",
+        "extension": "png"
+      }
+    },
+    {
+      "input": "images/100%25.png",
+      "expected": {
+        "path": "images/100%.png",
+        "filename": "100%.png",
+        "extension": "png"
+      }
+    },
+    {
+      "input": "images/.hidden.png",
+      "expected": {
+        "path": "images/.hidden.png",
+        "filename": ".hidden.png",
+        "extension": "png"
+      }
+    },
+    {
+      "input": "images/COM10.png",
+      "expected": {
+        "path": "images/COM10.png",
+        "filename": "COM10.png",
+        "extension": "png"
+      }
+    },
+    {
+      "input": "images/trailing%20.png",
+      "expected": {
+        "path": "images/trailing .png",
+        "filename": "trailing .png",
+        "extension": "png"
+      }
+    }
+  ],
+  "rejected": [
+    { "input": "", "reason": "empty" },
+    { "input": "   ", "reason": "space-only" },
+    { "input": "\timages/2.png", "reason": "raw-control-before-trim" },
+    { "input": "\u0000images/2.png", "reason": "raw-nul-before-trim" },
+    { "input": "images/2.png\u007f", "reason": "raw-del" },
+    {
+      "input": "\u00a0images/2.png",
+      "reason": "non-ascii-space-is-not-trimmed"
+    },
+    { "input": "../../images/2.png", "reason": "parent-component" },
+    { "input": "images/../2.png", "reason": "parent-component" },
+    { "input": "././images/2.png", "reason": "two-leading-dot-segments" },
+    { "input": "images/foo/bar.png", "reason": "nested" },
+    { "input": "images/foo%2Fbar.png", "reason": "encoded-slash" },
+    { "input": "images/foo%5Cbar.png", "reason": "encoded-backslash" },
+    { "input": "images\\foo.png", "reason": "raw-backslash" },
+    { "input": "/images/2.png", "reason": "posix-absolute" },
+    { "input": "//server/images/2.png", "reason": "protocol-relative" },
+    { "input": "~/.grok/images/2.png", "reason": "home-relative" },
+    { "input": "C:/images/2.png", "reason": "windows-drive" },
+    { "input": "C:\\images\\2.png", "reason": "windows-drive-backslash" },
+    { "input": "file:///tmp/2.png", "reason": "file-scheme" },
+    { "input": "https://example.com/2.png", "reason": "https-scheme" },
+    { "input": "data:image/png;base64,AA==", "reason": "data-scheme" },
+    { "input": "blob:https://example.com/id", "reason": "blob-scheme" },
+    { "input": "images/2.svg", "reason": "unsupported-extension" },
+    { "input": "images/2.bmp", "reason": "unsupported-extension" },
+    { "input": "images/no-extension", "reason": "missing-extension" },
+    { "input": "images/.png", "reason": "extension-dot-first" },
+    { "input": "images/name.", "reason": "trailing-dot" },
+    { "input": "images/%ZZ.png", "reason": "invalid-percent" },
+    { "input": "images/%.png", "reason": "short-percent" },
+    { "input": "images/%C3%28.png", "reason": "invalid-percent-utf8" },
+    { "input": "images/a%3Fb.png", "reason": "encoded-question" },
+    { "input": "images/a%23b.png", "reason": "encoded-hash" },
+    { "input": "images/%00.png", "reason": "encoded-nul" },
+    { "input": "images/%1F.png", "reason": "encoded-control" },
+    { "input": "images/%7F.png", "reason": "encoded-del" },
+    { "input": "images/%3Cbad.png", "reason": "portable-less-than" },
+    { "input": "images/%3Ebad.png", "reason": "portable-greater-than" },
+    { "input": "images/a%3Ab.png", "reason": "portable-colon" },
+    { "input": "images/a%22b.png", "reason": "portable-quote" },
+    { "input": "images/a%7Cb.png", "reason": "portable-pipe" },
+    { "input": "images/a%2Ab.png", "reason": "portable-star" },
+    { "input": "images/%20leading.png", "reason": "filename-leading-space" },
+    { "input": "images/trailing.png%20", "reason": "filename-trailing-space" },
+    { "input": "images/CON.png", "reason": "windows-device" },
+    { "input": "images/con.preview.png", "reason": "windows-device-stem" },
+    { "input": "images/PRN.jpg", "reason": "windows-device" },
+    { "input": "images/AUX.jpeg", "reason": "windows-device" },
+    { "input": "images/NUL.webp", "reason": "windows-device" },
+    { "input": "images/COM1.gif", "reason": "windows-device" },
+    { "input": "images/com9.PNG", "reason": "windows-device" },
+    { "input": "images/LPT1.png", "reason": "windows-device" },
+    { "input": "images/lpt9.png", "reason": "windows-device" }
+  ]
+}

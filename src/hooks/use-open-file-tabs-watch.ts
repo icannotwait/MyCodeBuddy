@@ -82,20 +82,31 @@ interface FileIoTarget {
 async function resolveFileChangeDecision(
   tabSnapshot: FileWorkspaceTab,
   io: FileIoTarget,
-  fileTabsRef: RefObject<FileWorkspaceTab[]>
+  fileTabsRef: RefObject<FileWorkspaceTab[]>,
+  snapshotIncarnationByTabIdRef: RefObject<Map<string, number>>
 ): Promise<FileChangeDecision> {
   if (tabSnapshot.kind !== "file") return { kind: "none" }
+  if (tabSnapshot.snapshotSource) return { kind: "none" }
   const path = tabSnapshot.path
   if (!path) return { kind: "none" }
   if (tabSnapshot.loading) return { kind: "none" }
 
   const tabId = tabSnapshot.id
+  const snapshotIncarnation =
+    snapshotIncarnationByTabIdRef.current?.get(tabId) ?? 0
 
   const stillSameTab = (): FileWorkspaceTab | null => {
     const latestTab = (fileTabsRef.current ?? []).find((t) => t.id === tabId)
     if (!latestTab || latestTab.kind !== "file") return null
+    if (latestTab.snapshotSource) return null
     if (latestTab.path !== path) return null
     if (latestTab.loading) return null
+    if (
+      (snapshotIncarnationByTabIdRef.current?.get(tabId) ?? 0) !==
+      snapshotIncarnation
+    ) {
+      return null
+    }
     return latestTab
   }
 
@@ -156,6 +167,7 @@ export interface UseOpenFileTabsWatchParams {
   fileTabs: FileWorkspaceTab[]
   // Latest-state mirrors owned by the provider.
   fileTabsRef: RefObject<FileWorkspaceTab[]>
+  snapshotIncarnationByTabIdRef: RefObject<Map<string, number>>
   activeFileTabIdRef: RefObject<string | null>
   // Render-scoped active tab for the stale-on-activation pass.
   activeFileTab: FileWorkspaceTab | null
@@ -189,6 +201,7 @@ export interface UseOpenFileTabsWatchParams {
 export function useOpenFileTabsWatch({
   fileTabs,
   fileTabsRef,
+  snapshotIncarnationByTabIdRef,
   activeFileTabIdRef,
   activeFileTab,
   allFolders,
@@ -210,7 +223,7 @@ export function useOpenFileTabsWatch({
   const watchSignature = useMemo(() => {
     const rootByFolder = new Map<number, string>()
     for (const tab of fileTabs) {
-      if (tab.kind !== "file" || !tab.path) continue
+      if (tab.kind !== "file" || !tab.path || tab.snapshotSource) continue
       const owning = findOwningFolder(tab.path, allFolders)
       if (!owning) continue
       rootByFolder.set(owning.folderId, owning.rootPath)
@@ -250,9 +263,10 @@ export function useOpenFileTabsWatch({
         const openFileTabs = (fileTabsRef.current ?? []).filter(
           (t) =>
             t.kind === "file" &&
-            t.path &&
+            Boolean(t.path) &&
+            !t.snapshotSource &&
             !t.loading &&
-            isPathUnderRoot(t.path, rootPath)
+            isPathUnderRoot(t.path!, rootPath)
         )
         if (openFileTabs.length === 0) return
 
@@ -311,7 +325,12 @@ export function useOpenFileTabsWatch({
 
           const io = splitAbsPath(path)
           if (!io) continue
-          const decision = await resolveFileChangeDecision(tab, io, fileTabsRef)
+          const decision = await resolveFileChangeDecision(
+            tab,
+            io,
+            fileTabsRef,
+            snapshotIncarnationByTabIdRef
+          )
           if (disposed) return
 
           if (decision.kind === "none") continue
@@ -408,6 +427,7 @@ export function useOpenFileTabsWatch({
   }, [
     watchSignature,
     fileTabsRef,
+    snapshotIncarnationByTabIdRef,
     activeFileTabIdRef,
     reloadOpenFileBackground,
     applyExternalReload,
@@ -435,6 +455,7 @@ export function useOpenFileTabsWatch({
     }
     const isTransition = lastActivationCheckedTabIdRef.current !== tab.id
     lastActivationCheckedTabIdRef.current = tab.id
+    if (tab.snapshotSource) return
 
     if (tab.stale && !tab.loading) {
       if (!tab.isDirty) {
@@ -445,7 +466,12 @@ export function useOpenFileTabsWatch({
       const io = splitAbsPath(tab.path)
       if (!io) return
       void (async () => {
-        const decision = await resolveFileChangeDecision(tab, io, fileTabsRef)
+        const decision = await resolveFileChangeDecision(
+          tab,
+          io,
+          fileTabsRef,
+          snapshotIncarnationByTabIdRef
+        )
         if (decision.kind === "conflict") {
           enqueueExternalConflict({
             path: decision.path,
@@ -478,7 +504,12 @@ export function useOpenFileTabsWatch({
     const io = splitAbsPath(tab.path)
     if (!io) return
     void (async () => {
-      const decision = await resolveFileChangeDecision(tab, io, fileTabsRef)
+      const decision = await resolveFileChangeDecision(
+        tab,
+        io,
+        fileTabsRef,
+        snapshotIncarnationByTabIdRef
+      )
       if (decision.kind === "conflict") {
         enqueueExternalConflict({
           path: decision.path,
@@ -500,6 +531,7 @@ export function useOpenFileTabsWatch({
   }, [
     activeFileTab,
     fileTabsRef,
+    snapshotIncarnationByTabIdRef,
     allFolders,
     openFilePreview,
     applyExternalReload,

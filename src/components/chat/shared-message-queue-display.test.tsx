@@ -4,6 +4,11 @@ import { afterEach, describe, expect, it, vi } from "vitest"
 
 import enMessages from "@/i18n/messages/en.json"
 import type { SharedQueuedPrompt } from "@/lib/snapshot-denormalize"
+import type { EventEnvelope } from "@/lib/types"
+import {
+  __connectionsReducerForTests,
+  type ConnectionState,
+} from "@/contexts/acp-connections-context"
 
 import { SharedMessageQueueDisplay } from "./shared-message-queue-display"
 
@@ -38,13 +43,147 @@ function deferred() {
 
 function renderQueue(
   queue: SharedQueuedPrompt[],
-  onCancel: (queueItemId: string) => Promise<void> = vi.fn(async () => {})
+  onCancel: (queueItemId: string) => Promise<void> = vi.fn(async () => {}),
+  onDismissFailed: (queueItemId: string) => void = vi.fn()
 ) {
   return render(
     <NextIntlClientProvider locale="en" messages={enMessages}>
-      <SharedMessageQueueDisplay queue={queue} onCancel={onCancel} />
+      <SharedMessageQueueDisplay
+        queue={queue}
+        onCancel={onCancel}
+        onDismissFailed={onDismissFailed}
+      />
     </NextIntlClientProvider>
   )
+}
+
+function initialSharedConnection(): Map<string, ConnectionState> {
+  return new Map([
+    [
+      "tab-1",
+      {
+        connectionId: "conn-1",
+        lastAppliedSeq: 0,
+        sharedSession: {
+          generation: 1,
+          queue: [],
+          activeTurn: null,
+        },
+      } as ConnectionState,
+    ],
+  ])
+}
+
+function reduceSharedEvent(
+  state: Map<string, ConnectionState>,
+  event: EventEnvelope
+): Map<string, ConnectionState> {
+  const reduced = __connectionsReducerForTests(state, {
+    type: "SHARED_SESSION_EVENT",
+    contextKey: "tab-1",
+    event,
+  } as never)
+  return __connectionsReducerForTests(reduced, {
+    type: "EVENT_APPLIED",
+    contextKey: "tab-1",
+    seq: event.seq,
+  } as never)
+}
+
+function failedLifecycleState(): Map<string, ConnectionState> {
+  let state = initialSharedConnection()
+  state = reduceSharedEvent(state, queuedEvent())
+  state = reduceSharedEvent(state, dispatchStartedEvent())
+  state = reduceSharedEvent(state, failedEvent())
+  return reduceSharedEvent(state, settledEvent("failed"))
+}
+
+function settledOnlyFailedLifecycleState(): Map<string, ConnectionState> {
+  let state = initialSharedConnection()
+  state = reduceSharedEvent(state, queuedEvent())
+  state = reduceSharedEvent(state, dispatchStartedEvent())
+  return reduceSharedEvent(state, settledEvent("failed", 3))
+}
+
+function hydrateEmptyQueue(
+  state: Map<string, ConnectionState>,
+  eventSeq: number
+): Map<string, ConnectionState> {
+  return __connectionsReducerForTests(state, {
+    type: "HYDRATE_FROM_SNAPSHOT",
+    contextKey: "tab-1",
+    patch: {
+      connectionId: "conn-1",
+      eventSeq,
+      sharedSession: {
+        generation: 1,
+        phase: { phase: "ready" },
+        queue: [],
+        activeTurn: null,
+        leaseExpiresAt: null,
+      },
+    },
+  } as never)
+}
+
+function queuedEvent(seq = 1): EventEnvelope {
+  return {
+    seq,
+    connection_id: "conn-1",
+    type: "prompt_queued",
+    generation: 1,
+    item: {
+      queue_item_id: "q2",
+      enqueue_seq: 2,
+      client_message_id: "m-q2",
+      visible_text: "do not lose me",
+      visible_text_truncated: false,
+      attachment_count: 0,
+      submitted_at: "2026-08-16T00:00:00.000Z",
+      state: "queued",
+    },
+  }
+}
+
+function dispatchStartedEvent(seq = 2): EventEnvelope {
+  return {
+    seq,
+    connection_id: "conn-1",
+    type: "prompt_dispatch_started",
+    generation: 1,
+    turn: {
+      turn_id: "turn-q2",
+      queue_item_id: "q2",
+      enqueue_seq: 2,
+      client_message_id: "m-q2",
+      stop_requested: false,
+    },
+  }
+}
+
+function failedEvent(seq = 3): EventEnvelope {
+  return {
+    seq,
+    connection_id: "conn-1",
+    type: "prompt_queue_item_failed",
+    generation: 1,
+    queue_item_id: "q2",
+    error_code: "prompt_hydration_failed",
+  }
+}
+
+function settledEvent(
+  outcome: "completed" | "cancelled" | "failed",
+  seq = 4
+): EventEnvelope {
+  return {
+    seq,
+    connection_id: "conn-1",
+    type: "shared_turn_settled",
+    generation: 1,
+    turn_id: "turn-q2",
+    outcome,
+  }
 }
 
 describe("SharedMessageQueueDisplay", () => {
@@ -92,5 +231,205 @@ describe("SharedMessageQueueDisplay", () => {
 
     expect(cancel).not.toBeDisabled()
     expect(screen.getByText("keep me")).toBeInTheDocument()
+  })
+
+  it("keeps a reducer-failed prompt visible across hydrate with a local dismiss action", () => {
+    const initialQueue = [queued("q2", 2, "do not lose me")]
+    const initial = new Map([
+      [
+        "tab-1",
+        {
+          connectionId: "conn-1",
+          lastAppliedSeq: 7,
+          sharedSession: {
+            generation: 1,
+            queue: initialQueue,
+          },
+        } as ConnectionState,
+      ],
+    ])
+    const reduced = __connectionsReducerForTests(initial, {
+      type: "SHARED_SESSION_EVENT",
+      contextKey: "tab-1",
+      event: {
+        seq: 7,
+        connection_id: "conn-1",
+        type: "prompt_queue_item_failed",
+        generation: 1,
+        queue_item_id: "q2",
+        error_code: "prompt_hydration_failed",
+      },
+    } as never)
+    const hydrated = __connectionsReducerForTests(reduced, {
+      type: "HYDRATE_FROM_SNAPSHOT",
+      contextKey: "tab-1",
+      patch: {
+        connectionId: "conn-1",
+        eventSeq: 7,
+        sharedSession: {
+          generation: 1,
+          phase: { phase: "ready" },
+          queue: [],
+          activeTurn: null,
+          leaseExpiresAt: null,
+        },
+      },
+    } as never)
+    const queue = hydrated.get("tab-1")?.sharedSession?.queue ?? []
+    const onCancel = vi.fn(async () => {})
+    const onDismissFailed = vi.fn()
+
+    renderQueue(queue, onCancel, onDismissFailed)
+
+    expect(screen.getByText("do not lose me")).toBeInTheDocument()
+    expect(screen.getByText("prompt_hydration_failed")).toBeInTheDocument()
+    fireEvent.click(screen.getByRole("button", { name: "Remove" }))
+    expect(onDismissFailed).toHaveBeenCalledWith("q2")
+    expect(onCancel).not.toHaveBeenCalled()
+  })
+
+  it("keeps prompt evidence through queued, dispatch, failed, and failed-settled events", () => {
+    const state = failedLifecycleState()
+
+    const shared = state.get("tab-1")?.sharedSession
+    expect(shared?.activeTurn).toBeNull()
+    expect(shared?.queue).toEqual([
+      expect.objectContaining({
+        queueItemId: "q2",
+        visibleText: "do not lose me",
+        state: "failed",
+        errorCode: "prompt_hydration_failed",
+        failureEventSeq: 4,
+      }),
+    ])
+
+    renderQueue(shared?.queue ?? [])
+    expect(screen.getByText("do not lose me")).toBeInTheDocument()
+    expect(screen.getByText("prompt_hydration_failed")).toBeInTheDocument()
+  })
+
+  it("synthesizes a failed row when dispatch settles failed without a queue failure event", () => {
+    const shared = settledOnlyFailedLifecycleState().get("tab-1")?.sharedSession
+
+    expect(shared?.activeTurn).toBeNull()
+    expect(shared?.queue).toEqual([
+      expect.objectContaining({
+        queueItemId: "q2",
+        visibleText: "do not lose me",
+        state: "failed",
+        errorCode: "shared_turn_failed",
+        failureEventSeq: 3,
+      }),
+    ])
+  })
+
+  it("bounds and locally dismisses a failed row synthesized by settlement", () => {
+    const failed = settledOnlyFailedLifecycleState()
+
+    expect(
+      hydrateEmptyQueue(failed, 2).get("tab-1")?.sharedSession?.queue
+    ).toHaveLength(1)
+    expect(
+      hydrateEmptyQueue(failed, 3).get("tab-1")?.sharedSession?.queue
+    ).toHaveLength(1)
+    expect(
+      hydrateEmptyQueue(failed, 4).get("tab-1")?.sharedSession?.queue
+    ).toEqual([])
+
+    const dismissed = __connectionsReducerForTests(failed, {
+      type: "DISMISS_FAILED_SHARED_PROMPT",
+      contextKey: "tab-1",
+      queueItemId: "q2",
+    } as never)
+    expect(dismissed.get("tab-1")?.sharedSession?.queue).toEqual([])
+  })
+
+  it.each(["completed", "cancelled"] as const)(
+    "clears dispatch evidence on a %s settlement",
+    (outcome) => {
+      let state = initialSharedConnection()
+      state = reduceSharedEvent(state, queuedEvent())
+      state = reduceSharedEvent(state, dispatchStartedEvent())
+      state = reduceSharedEvent(state, settledEvent(outcome, 3))
+      state = reduceSharedEvent(state, failedEvent(4))
+
+      expect(state.get("tab-1")?.sharedSession).toMatchObject({
+        queue: [],
+        activeTurn: null,
+      })
+    }
+  )
+
+  it("bounds failed-row retention to older or equal snapshots", () => {
+    const failed = failedLifecycleState()
+
+    const older = hydrateEmptyQueue(failed, 3)
+    expect(older.get("tab-1")?.sharedSession?.queue).toHaveLength(1)
+
+    const equal = hydrateEmptyQueue(failed, 4)
+    expect(equal.get("tab-1")?.sharedSession?.queue).toHaveLength(1)
+
+    const newer = hydrateEmptyQueue(failed, 5)
+    expect(newer.get("tab-1")?.sharedSession?.queue).toEqual([])
+  })
+
+  it("keeps dispatch evidence through an equal active-turn snapshot", () => {
+    let state = initialSharedConnection()
+    state = reduceSharedEvent(state, queuedEvent())
+    state = reduceSharedEvent(state, dispatchStartedEvent())
+    state = __connectionsReducerForTests(state, {
+      type: "HYDRATE_FROM_SNAPSHOT",
+      contextKey: "tab-1",
+      patch: {
+        connectionId: "conn-1",
+        eventSeq: 2,
+        sharedSession: {
+          generation: 1,
+          phase: { phase: "ready" },
+          queue: [],
+          activeTurn: {
+            turnId: "turn-q2",
+            queueItemId: "q2",
+            enqueueSeq: 2,
+            clientMessageId: "m-q2",
+            stopRequested: false,
+          },
+          leaseExpiresAt: null,
+        },
+      },
+    } as never)
+    state = reduceSharedEvent(state, failedEvent())
+    state = reduceSharedEvent(state, settledEvent("failed"))
+
+    expect(state.get("tab-1")?.sharedSession?.queue).toEqual([
+      expect.objectContaining({
+        queueItemId: "q2",
+        visibleText: "do not lose me",
+        state: "failed",
+      }),
+    ])
+  })
+
+  it("locally dismisses failed rows without calling backend cancel", () => {
+    const failedQueue =
+      failedLifecycleState().get("tab-1")?.sharedSession?.queue
+    const onCancel = vi.fn(async () => {})
+    const onDismissFailed = vi.fn()
+    renderQueue(failedQueue ?? [], onCancel, onDismissFailed)
+
+    fireEvent.click(screen.getByRole("button", { name: "Remove" }))
+
+    expect(onDismissFailed).toHaveBeenCalledWith("q2")
+    expect(onCancel).not.toHaveBeenCalled()
+  })
+
+  it("removes a failed row through the local reducer action", () => {
+    const dismissed = __connectionsReducerForTests(failedLifecycleState(), {
+      type: "DISMISS_FAILED_SHARED_PROMPT",
+      contextKey: "tab-1",
+      queueItemId: "q2",
+    } as never)
+
+    expect(dismissed.get("tab-1")?.sharedSession?.queue).toEqual([])
   })
 })

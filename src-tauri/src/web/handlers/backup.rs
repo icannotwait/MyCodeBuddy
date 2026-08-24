@@ -236,7 +236,9 @@ pub async fn backup_scan_external_conflicts(
     Json(params): Json<InspectParams>,
 ) -> Result<Json<Vec<crate::commands::backup::external::ExternalConflict>>, AppCommandError> {
     let src = resolve_upload(&state, &params.upload_id)?;
-    let conflicts = core::scan_external_conflicts_core(&src, params.passphrase.as_deref()).await?;
+    let conflicts =
+        core::scan_external_conflicts_core(&state.db.conn, &src, params.passphrase.as_deref())
+            .await?;
     Ok(Json(conflicts))
 }
 
@@ -264,12 +266,20 @@ pub async fn backup_restore_stage(
     Json(params): Json<StageParams>,
 ) -> Result<Json<StageResult>, AppCommandError> {
     let src = resolve_upload(&state, &params.upload_id)?;
+    let external_mode = params.external_mode.unwrap_or_default();
+    let external_sources = if matches!(external_mode, ExternalRestoreMode::OriginalLocations { .. })
+    {
+        core::effective_external_transcript_sources(&state.db.conn).await?
+    } else {
+        Vec::new()
+    };
     let (op_id, cancel) = state.workspace_transfer.register_transfer().await;
     let staged = restore::stage_restore_core(
         &src,
         &state.data_dir,
         params.passphrase.as_deref(),
-        params.external_mode.unwrap_or_default(),
+        external_mode,
+        external_sources,
         &state.emitter,
         &op_id,
         &cancel,

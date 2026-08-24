@@ -41,6 +41,21 @@ describe("useMessageQueue bounce FIFO ordering", () => {
     expect(dequeued?.draft.displayText).toBe("A")
   })
 
+  it("stores optimisticTurnId on enqueue and requeueFront", () => {
+    const { result } = renderHook(() => useMessageQueue())
+    act(() =>
+      result.current.enqueue(draft("A"), null, { optimisticTurnId: "opt-a" })
+    )
+    expect(result.current.queue[0]?.optimisticTurnId).toBe("opt-a")
+    act(() =>
+      result.current.requeueFront(draft("B"), null, {
+        optimisticTurnId: "opt-b",
+      })
+    )
+    expect(result.current.queue[0]?.optimisticTurnId).toBe("opt-b")
+    expect(result.current.queue[1]?.optimisticTurnId).toBe("opt-a")
+  })
+
   it("enqueue still appends to the tail (front vs tail are distinct)", () => {
     const { result } = renderHook(() => useMessageQueue())
     act(() => result.current.enqueue(draft("A"), null))

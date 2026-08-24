@@ -100,6 +100,135 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn attaching_after_session_id_is_bound_does_not_conflict() {
+        let broker = SharedSessionBroker::default();
+        let first = broker
+            .reserve_or_attach(request(
+                SharedSessionKey::Conversation(9),
+                "conn-a",
+                "client-a",
+                "req-a",
+            ))
+            .await
+            .unwrap();
+        assert!(first.created);
+
+        let mut resume = request(
+            SharedSessionKey::Conversation(9),
+            "conn-b",
+            "client-b",
+            "req-b",
+        );
+        resume.launch_identity.external_session_id = Some("grok-session-xyz".into());
+        let second = broker.reserve_or_attach(resume).await.unwrap();
+
+        assert!(!second.created);
+        assert_eq!(
+            second.attachment.connection_id,
+            first.attachment.connection_id
+        );
+        assert_eq!(
+            broker
+                .launch_identity_for_connection(&first.attachment.connection_id)
+                .await
+                .unwrap()
+                .external_session_id
+                .as_deref(),
+            Some("grok-session-xyz")
+        );
+
+        let mut other = request(
+            SharedSessionKey::Conversation(9),
+            "conn-c",
+            "client-c",
+            "req-c",
+        );
+        other.launch_identity.external_session_id = Some("other-session".into());
+        assert!(matches!(
+            broker.reserve_or_attach(other).await,
+            Err(SharedSessionError::ConfigConflict {
+                conflict_kind: SharedConfigConflictKind::ExternalSession,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn attaching_without_session_id_joins_a_bound_session() {
+        let broker = SharedSessionBroker::default();
+        let mut first_request = request(
+            SharedSessionKey::Conversation(10),
+            "conn-a",
+            "client-a",
+            "req-a",
+        );
+        first_request.launch_identity.external_session_id = Some("grok-session-xyz".into());
+        let first = broker.reserve_or_attach(first_request).await.unwrap();
+
+        let second = broker
+            .reserve_or_attach(request(
+                SharedSessionKey::Conversation(10),
+                "conn-b",
+                "client-b",
+                "req-b",
+            ))
+            .await
+            .unwrap();
+
+        assert!(!second.created);
+        assert_eq!(
+            second.attachment.connection_id,
+            first.attachment.connection_id
+        );
+        assert_eq!(
+            broker
+                .launch_identity_for_connection(&first.attachment.connection_id)
+                .await
+                .unwrap()
+                .external_session_id
+                .as_deref(),
+            Some("grok-session-xyz")
+        );
+    }
+
+    #[tokio::test]
+    async fn attaching_a_different_session_id_still_conflicts() {
+        let broker = SharedSessionBroker::default();
+        let mut first_request = request(
+            SharedSessionKey::Conversation(11),
+            "conn-a",
+            "client-a",
+            "req-a",
+        );
+        first_request.launch_identity.external_session_id = Some("session-a".into());
+        let first = broker.reserve_or_attach(first_request).await.unwrap();
+
+        let mut conflicting = request(
+            SharedSessionKey::Conversation(11),
+            "conn-b",
+            "client-b",
+            "req-b",
+        );
+        conflicting.launch_identity.external_session_id = Some("session-b".into());
+        assert!(matches!(
+            broker.reserve_or_attach(conflicting).await,
+            Err(SharedSessionError::ConfigConflict {
+                conflict_kind: SharedConfigConflictKind::ExternalSession,
+                ..
+            })
+        ));
+        assert_eq!(
+            broker
+                .launch_identity_for_connection(&first.attachment.connection_id)
+                .await
+                .unwrap()
+                .external_session_id
+                .as_deref(),
+            Some("session-a")
+        );
+    }
+
+    #[tokio::test]
     async fn failed_retry_requires_cleanup_and_increments_generation() {
         let broker = SharedSessionBroker::default();
         let first = broker
@@ -470,7 +599,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn same_client_instance_renews_across_device_ids() {
+    async fn same_client_instance_rotates_lease_across_device_ids() {
         let broker = SharedSessionBroker::default();
         let first = broker
             .reserve_or_attach(request(
@@ -491,10 +620,146 @@ mod tests {
 
         let second = broker.reserve_or_attach(second_request).await.unwrap();
 
-        assert_eq!(second.attachment.lease_id, first.attachment.lease_id);
+        assert_ne!(second.attachment.lease_id, first.attachment.lease_id);
         assert_eq!(second.attachment.disposition, SharedDisposition::Attached);
         assert!(!second.created);
         assert_eq!(broker.metrics().snapshot().active_leases, 1);
+    }
+
+    #[tokio::test]
+    async fn stale_release_from_previous_attach_incarnation_keeps_current_lease() {
+        let broker = SharedSessionBroker::default();
+        let first = broker
+            .reserve_or_attach(request(
+                SharedSessionKey::Conversation(13),
+                "conn-a",
+                "client-a",
+                "req-a",
+            ))
+            .await
+            .unwrap();
+        let second = broker
+            .reserve_or_attach(request(
+                SharedSessionKey::Conversation(13),
+                "conn-b",
+                "client-a",
+                "req-b",
+            ))
+            .await
+            .unwrap();
+
+        assert_ne!(second.attachment.lease_id, first.attachment.lease_id);
+        assert_eq!(broker.metrics().snapshot().active_leases, 1);
+        assert!(!broker
+            .release_lease(&SharedMutationGuard {
+                connection_id: first.attachment.connection_id,
+                generation: first.attachment.generation,
+                lease_id: first.attachment.lease_id,
+            })
+            .await
+            .unwrap());
+        assert!(broker
+            .validate_guard(&SharedMutationGuard {
+                connection_id: second.attachment.connection_id,
+                generation: second.attachment.generation,
+                lease_id: second.attachment.lease_id,
+            })
+            .await
+            .is_ok());
+        assert_eq!(broker.metrics().snapshot().active_leases, 1);
+    }
+
+    #[tokio::test]
+    async fn stale_connect_retry_does_not_revoke_newer_attach_incarnation() {
+        let broker = SharedSessionBroker::default();
+        let first_request = request(
+            SharedSessionKey::Conversation(14),
+            "conn-a",
+            "client-a",
+            "req-a",
+        );
+        let first = broker
+            .reserve_or_attach(first_request.clone())
+            .await
+            .unwrap();
+        let second = broker
+            .reserve_or_attach(request(
+                SharedSessionKey::Conversation(14),
+                "conn-b",
+                "client-a",
+                "req-b",
+            ))
+            .await
+            .unwrap();
+
+        let stale_retry = broker.reserve_or_attach(first_request).await.unwrap();
+
+        assert_eq!(
+            stale_retry.attachment.connection_id,
+            first.attachment.connection_id
+        );
+        assert_eq!(
+            stale_retry.attachment.generation,
+            first.attachment.generation
+        );
+        assert_eq!(stale_retry.attachment.lease_id, first.attachment.lease_id);
+        assert_eq!(
+            stale_retry.attachment.lease_expires_at,
+            first.attachment.lease_expires_at
+        );
+        assert_eq!(
+            stale_retry.attachment.disposition,
+            first.attachment.disposition
+        );
+        assert_eq!(stale_retry.attachment.phase, first.attachment.phase);
+        assert!(!stale_retry.created);
+        assert!(broker
+            .validate_guard(&SharedMutationGuard {
+                connection_id: second.attachment.connection_id,
+                generation: second.attachment.generation,
+                lease_id: second.attachment.lease_id,
+            })
+            .await
+            .is_ok());
+        assert_eq!(broker.metrics().snapshot().active_leases, 1);
+    }
+
+    #[tokio::test]
+    async fn latest_connect_retry_after_release_renews_without_growing_ledger() {
+        let broker = SharedSessionBroker::with_limits_for_test(1, 1);
+        let connect = request(
+            SharedSessionKey::Conversation(15),
+            "conn-a",
+            "client-a",
+            "req-a",
+        );
+        let first = broker.reserve_or_attach(connect.clone()).await.unwrap();
+        assert!(broker
+            .release_lease(&SharedMutationGuard {
+                connection_id: first.attachment.connection_id,
+                generation: first.attachment.generation,
+                lease_id: first.attachment.lease_id.clone(),
+            })
+            .await
+            .unwrap());
+
+        let retry = broker.reserve_or_attach(connect).await.unwrap();
+
+        assert_ne!(retry.attachment.lease_id, first.attachment.lease_id);
+        assert_eq!(retry.attachment.disposition, SharedDisposition::Attached);
+        assert!(!retry.created);
+        assert_eq!(broker.metrics().snapshot().active_leases, 1);
+        assert!(matches!(
+            broker
+                .reserve_or_attach(request(
+                    SharedSessionKey::Conversation(15),
+                    "conn-b",
+                    "client-a",
+                    "req-b",
+                ))
+                .await,
+            Err(SharedSessionError::ConnectLedgerCapacityExceeded)
+        ));
     }
 
     #[tokio::test]
@@ -2417,6 +2682,261 @@ mod tests {
                 .await,
             Some(SharedSessionKey::Ephemeral(key)) if key == "ephemeral-b"
         ));
+    }
+
+    #[tokio::test]
+    async fn external_session_alias_survives_conversation_binding() {
+        for guarded in [false, true] {
+            let broker = SharedSessionBroker::default();
+            let conversation_id = if guarded { 881 } else { 880 };
+            let external_key = SharedSessionKey::ExternalSession {
+                agent_type: crate::models::agent::AgentType::Codex,
+                normalized_working_dir: "/tmp/shared-external-alias".into(),
+                external_session_id: "external-session-a".into(),
+            };
+            let mut first_request = request(
+                external_key.clone(),
+                "external-connection-a",
+                "external-client-a",
+                "external-request-a",
+            );
+            first_request.launch_identity.external_session_id = Some("external-session-a".into());
+            let first = broker.reserve_or_attach(first_request).await.unwrap();
+
+            if guarded {
+                let state = Arc::new(tokio::sync::RwLock::new(SessionState::new(
+                    first.attachment.connection_id.clone(),
+                    crate::models::agent::AgentType::Codex,
+                    Some("external-session-a".into()),
+                    "shared-server".into(),
+                    Some(9),
+                )));
+                broker
+                    .install_registered(
+                        &first.attachment.connection_id,
+                        first.attachment.generation,
+                        "external-driver".into(),
+                        state,
+                        EventEmitter::Noop,
+                        Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                    )
+                    .await
+                    .unwrap();
+                broker
+                    .bind_conversation_key_guarded(
+                        &SharedMutationGuard {
+                            connection_id: first.attachment.connection_id.clone(),
+                            generation: first.attachment.generation,
+                            lease_id: first.attachment.lease_id.clone(),
+                        },
+                        conversation_id,
+                        9,
+                    )
+                    .await
+                    .unwrap();
+            } else {
+                broker
+                    .bind_conversation_key(
+                        &first.attachment.connection_id,
+                        first.attachment.generation,
+                        conversation_id,
+                    )
+                    .await
+                    .unwrap();
+            }
+
+            {
+                let index = broker.index.lock().await;
+                let canonical = SharedSessionKey::Conversation(conversation_id);
+                assert!(index.aliases.get(&external_key) == Some(&canonical));
+                assert!(index.sessions.contains_key(&canonical));
+                assert!(!index.sessions.contains_key(&external_key));
+                assert!(!index.aliases.contains_key(&canonical));
+                assert!(index.aliases.iter().all(|(alias, target)| {
+                    !index.sessions.contains_key(alias)
+                        && index.sessions.contains_key(target)
+                        && !index.aliases.contains_key(target)
+                }));
+            }
+
+            let mut second_request = request(
+                external_key,
+                "external-connection-b",
+                "external-client-b",
+                "external-request-b",
+            );
+            second_request.launch_identity.external_session_id = Some("external-session-a".into());
+            let second = broker.reserve_or_attach(second_request).await.unwrap();
+
+            assert!(!second.created);
+            assert_eq!(
+                second.attachment.connection_id,
+                first.attachment.connection_id
+            );
+            assert_eq!(broker.metrics().snapshot().live_sessions, 1);
+            assert_eq!(broker.diagnostics().await.len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn external_alias_survives_rejected_conversation_to_conversation_rebind() {
+        let broker = SharedSessionBroker::default();
+        let external_key = SharedSessionKey::ExternalSession {
+            agent_type: crate::models::agent::AgentType::Codex,
+            normalized_working_dir: "/tmp/shared-external-alias-rebind".into(),
+            external_session_id: "external-session-rebind".into(),
+        };
+        let mut initial = request(
+            external_key.clone(),
+            "external-rebind-connection-a",
+            "external-rebind-client-a",
+            "external-rebind-request-a",
+        );
+        initial.launch_identity.external_session_id = Some("external-session-rebind".into());
+        let first = broker.reserve_or_attach(initial).await.unwrap();
+        broker
+            .bind_conversation_key(
+                &first.attachment.connection_id,
+                first.attachment.generation,
+                884,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            broker
+                .bind_conversation_key(
+                    &first.attachment.connection_id,
+                    first.attachment.generation,
+                    885,
+                )
+                .await
+                .unwrap_err(),
+            SharedSessionError::ConversationKeyConflict
+        );
+
+        let mut reconnect = request(
+            external_key.clone(),
+            "external-rebind-connection-b",
+            "external-rebind-client-b",
+            "external-rebind-request-b",
+        );
+        reconnect.launch_identity.external_session_id = Some("external-session-rebind".into());
+        let attached = broker.reserve_or_attach(reconnect).await.unwrap();
+
+        assert!(!attached.created);
+        assert_eq!(
+            attached.attachment.connection_id,
+            first.attachment.connection_id
+        );
+        assert_eq!(broker.metrics().snapshot().live_sessions, 1);
+        let index = broker.index.lock().await;
+        assert!(index.aliases.get(&external_key) == Some(&SharedSessionKey::Conversation(884)));
+        assert_eq!(index.sessions.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn external_session_alias_is_removed_with_canonical_session() {
+        let broker = SharedSessionBroker::default();
+        let external_key = SharedSessionKey::ExternalSession {
+            agent_type: crate::models::agent::AgentType::Codex,
+            normalized_working_dir: "/tmp/shared-external-alias-cleanup".into(),
+            external_session_id: "external-session-cleanup".into(),
+        };
+        let mut connect = request(
+            external_key.clone(),
+            "external-cleanup-connection",
+            "external-cleanup-client",
+            "external-cleanup-request",
+        );
+        connect.launch_identity.external_session_id = Some("external-session-cleanup".into());
+        let first = broker.reserve_or_attach(connect).await.unwrap();
+        broker
+            .bind_conversation_key(
+                &first.attachment.connection_id,
+                first.attachment.generation,
+                882,
+            )
+            .await
+            .unwrap();
+
+        broker.begin_shutdown().await;
+        assert!(
+            broker
+                .remove_shutdown_session(
+                    &first.attachment.connection_id,
+                    first.attachment.generation,
+                )
+                .await
+        );
+
+        let index = broker.index.lock().await;
+        assert!(index.sessions.is_empty());
+        assert!(index.aliases.is_empty());
+        assert!(index.by_connection.is_empty());
+        assert!(index.record_for_key(&external_key).is_none());
+    }
+
+    #[tokio::test]
+    async fn failed_generation_replacement_through_external_alias_stays_canonical() {
+        let broker = SharedSessionBroker::default();
+        let external_key = SharedSessionKey::ExternalSession {
+            agent_type: crate::models::agent::AgentType::Codex,
+            normalized_working_dir: "/tmp/shared-external-alias-replacement".into(),
+            external_session_id: "external-session-replacement".into(),
+        };
+        let mut initial = request(
+            external_key.clone(),
+            "external-replacement-old",
+            "external-replacement-client-a",
+            "external-replacement-request-a",
+        );
+        initial.launch_identity.external_session_id = Some("external-session-replacement".into());
+        let first = broker.reserve_or_attach(initial).await.unwrap();
+        broker
+            .bind_conversation_key(
+                &first.attachment.connection_id,
+                first.attachment.generation,
+                883,
+            )
+            .await
+            .unwrap();
+        broker
+            .mark_failed(
+                &first.attachment.connection_id,
+                first.attachment.generation,
+                "companion_initialization_failed",
+                false,
+            )
+            .await
+            .unwrap();
+        broker
+            .mark_cleanup_complete(&first.attachment.connection_id, first.attachment.generation)
+            .await
+            .unwrap();
+
+        let mut retry = request(
+            external_key.clone(),
+            "external-replacement-new",
+            "external-replacement-client-b",
+            "external-replacement-request-b",
+        );
+        retry.launch_identity.external_session_id = Some("external-session-replacement".into());
+        retry.retry_failed_generation = Some(first.attachment.generation);
+        let replacement = broker.reserve_or_attach(retry).await.unwrap();
+
+        assert!(replacement.created);
+        assert_eq!(replacement.attachment.generation, 2);
+        assert!(
+            broker
+                .key_for_connection_for_test(&replacement.attachment.connection_id)
+                .await
+                == Some(SharedSessionKey::Conversation(883))
+        );
+        let index = broker.index.lock().await;
+        assert!(index.aliases.get(&external_key) == Some(&SharedSessionKey::Conversation(883)));
+        assert_eq!(index.sessions.len(), 1);
+        assert!(index.record_for_key(&external_key).is_some());
     }
 
     async fn conversation_rekey_fixture(

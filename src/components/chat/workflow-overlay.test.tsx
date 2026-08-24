@@ -1,4 +1,5 @@
 import {
+  act,
   fireEvent,
   render,
   screen,
@@ -10,6 +11,8 @@ import { NextIntlClientProvider } from "next-intl"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import { SubAgentOverlay } from "./sub-agent-overlay"
+import { WorkflowDagCanvas } from "./workflow-dag-canvas"
+import { WorkflowGraphPanel } from "./workflow-graph-panel"
 import enMessages from "@/i18n/messages/en.json"
 import { getWorkflowGraphSnapshot, resolveCompletionDecision } from "@/lib/api"
 import { openDelegatedChildSession } from "@/lib/open-delegated-child-session"
@@ -409,6 +412,58 @@ function renderWithIntl(
   )
 }
 
+type ObservedDagResize = {
+  callback: ResizeObserverCallback
+  observer: ResizeObserver
+  target: Element
+}
+
+let observedDagResizes: ObservedDagResize[] = []
+
+class DagResizeObserver implements ResizeObserver {
+  private readonly callback: ResizeObserverCallback
+
+  constructor(callback: ResizeObserverCallback) {
+    this.callback = callback
+  }
+
+  observe(target: Element): void {
+    observedDagResizes.push({
+      callback: this.callback,
+      observer: this,
+      target,
+    })
+  }
+
+  unobserve(target: Element): void {
+    observedDagResizes = observedDagResizes.filter(
+      (entry) => entry.target !== target || entry.observer !== this
+    )
+  }
+
+  disconnect(): void {
+    observedDagResizes = observedDagResizes.filter(
+      (entry) => entry.observer !== this
+    )
+  }
+}
+
+function publishDagWidth(width: number): void {
+  act(() => {
+    for (const entry of observedDagResizes) {
+      entry.callback(
+        [
+          {
+            target: entry.target,
+            contentRect: { width } as DOMRectReadOnly,
+          } as ResizeObserverEntry,
+        ],
+        entry.observer
+      )
+    }
+  })
+}
+
 function workspaceStoreDouble() {
   const token = { mode: "paths" as const }
   const unsubscribe = vi.fn()
@@ -570,7 +625,145 @@ function simpleGraph(): WorkflowGraphSnapshot {
   }
 }
 
+function simpleDagGraph(): WorkflowGraphSnapshot {
+  return {
+    schema_version: 1,
+    workflow_kind: "brainstorm_to_delivery",
+    compatibility: "simple",
+    overall_state: "in_progress",
+    simple: {
+      plan_rel_path: "docs/superpowers/plans/dag.md",
+      progress_rel_path: ".superpowers/sdd/88/progress.md",
+    },
+    projection_warning_codes: ["simple_progress_block_missing"],
+    current_phase_id: "tasks",
+    current_node_ids: ["t2-primary", "t2-aux"],
+    phases: [{ id: "tasks", kind: "tasks", title: null }],
+    nodes: [
+      node({
+        node_id: "t1-impl",
+        kind: "task",
+        phase_id: "tasks",
+        role: "implementer",
+        agent_type: "codex",
+        task_index: 1,
+        title: "Task 1 implementation",
+        status: "completed",
+        is_observed: true,
+        latest_child_conversation_id: 101,
+      }),
+      node({
+        node_id: "t1-primary",
+        kind: "task",
+        phase_id: "tasks",
+        role: "reviewer",
+        agent_type: "codex",
+        task_index: 1,
+        title: "Task 1 primary review",
+        status: "completed",
+        is_observed: true,
+        latest_child_conversation_id: 102,
+      }),
+      node({
+        node_id: "t2-impl",
+        kind: "task",
+        phase_id: "tasks",
+        role: "implementer",
+        agent_type: "codex",
+        task_index: 2,
+        title: "Task 2 implementation",
+        status: "completed",
+        is_observed: true,
+        latest_child_conversation_id: 201,
+      }),
+      node({
+        node_id: "t2-primary",
+        kind: "task",
+        phase_id: "tasks",
+        role: "reviewer",
+        agent_type: "codex",
+        model: "gpt-5.6",
+        effort: "high",
+        task_index: 2,
+        title: "Task 2 primary review",
+        status: "running",
+        latest_run_status: "running",
+        is_observed: true,
+        latest_child_conversation_id: 202,
+        run_count: 2,
+        replacement_count: 1,
+        round_count: 3,
+        elapsed_completed_ms: 102_000,
+        tool_call_count: 6,
+        touched_file_count: 3,
+        additions: 74,
+        deletions: 12,
+        line_counts_complete: true,
+      }),
+      node({
+        node_id: "t2-aux",
+        kind: "task",
+        phase_id: "tasks",
+        role: "reviewer",
+        agent_type: "codex",
+        task_index: 2,
+        title: "Task 2 auxiliary review",
+        status: "running",
+        latest_run_status: "running",
+        is_observed: true,
+        latest_child_conversation_id: 203,
+        sync_state: "out_of_sync",
+        projection_warning_codes: ["simple_completed_task_terminal_run_failed"],
+      }),
+      node({
+        node_id: "t3-impl",
+        kind: "task",
+        phase_id: "tasks",
+        role: "implementer",
+        agent_type: "codex",
+        task_index: 3,
+        title: "Task 3 implementation",
+        status: "estimated",
+      }),
+      node({
+        node_id: "t3-primary",
+        kind: "task",
+        phase_id: "tasks",
+        role: "reviewer",
+        agent_type: "codex",
+        task_index: 3,
+        title: "Task 3 primary review",
+        status: "estimated",
+      }),
+    ],
+    edges: [
+      { id: "e-1", from: "t1-impl", to: "t1-primary" },
+      { id: "e-2", from: "t1-primary", to: "t2-impl" },
+      { id: "e-3", from: "t2-impl", to: "t2-primary" },
+      { id: "e-4", from: "t2-impl", to: "t2-aux" },
+      { id: "e-5", from: "t2-primary", to: "t3-impl" },
+      { id: "e-6", from: "t2-aux", to: "t3-impl" },
+      { from: "t3-impl", to: "t3-primary" },
+    ],
+    gates: [
+      {
+        gate_id: "simple-gate-must-not-render",
+        gate_kind: "tasks",
+        resolution_mode: "parent_adjudication",
+        required_reviewer_node_ids: ["t2-primary"],
+        required_count: 1,
+        returned_count: 0,
+        running_count: 1,
+        blocked_count: 0,
+      },
+    ],
+    completion: completionProjection(),
+  }
+}
+
 beforeEach(() => {
+  observedDagResizes = []
+  vi.stubGlobal("ResizeObserver", DagResizeObserver)
   __resetWorkflowGraphStoreForTests()
   vi.mocked(openDelegatedChildSession).mockClear()
   openWorkflowFile.mockClear()
@@ -591,7 +784,601 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  vi.unstubAllGlobals()
   vi.restoreAllMocks()
+})
+
+function renderDagCanvas(
+  graph: WorkflowGraphSnapshot,
+  overrides: Partial<
+    Pick<
+      React.ComponentProps<typeof WorkflowDagCanvas>,
+      "currentNodeIds" | "selectedNodeId" | "onSelect"
+    >
+  > = {},
+  locale = "en"
+) {
+  const onSelect = overrides.onSelect ?? vi.fn()
+  const view = render(
+    <NextIntlClientProvider locale={locale} messages={enMessages}>
+      <WorkflowDagCanvas
+        nodes={graph.nodes}
+        edges={graph.edges}
+        currentNodeIds={overrides.currentNodeIds ?? graph.current_node_ids}
+        selectedNodeId={
+          overrides.selectedNodeId === undefined
+            ? "t2-primary"
+            : overrides.selectedNodeId
+        }
+        detailId="test-dag-detail"
+        nodeDisplayTitle={(item) => item.title?.trim() || item.node_id}
+        onSelect={onSelect}
+      />
+    </NextIntlClientProvider>
+  )
+  return { ...view, onSelect }
+}
+
+function simplePanelView(
+  snapshot: WorkflowGraphSnapshot,
+  conversationId: number | null
+) {
+  return (
+    <NextIntlClientProvider locale="en" messages={enMessages}>
+      <WorkflowGraphPanel
+        snapshot={snapshot}
+        conversationId={conversationId}
+        workspaceRootPath="/repo"
+      />
+    </NextIntlClientProvider>
+  )
+}
+
+describe("WorkflowDagCanvas", () => {
+  it("stays measurable while width is zero, then renders layered edges and buttons", () => {
+    const graph = simpleDagGraph()
+    const { onSelect } = renderDagCanvas(graph)
+
+    const canvas = screen.getByTestId("workflow-dag-canvas")
+    expect(canvas).toHaveAttribute("role", "group")
+    expect(canvas).toHaveAttribute("aria-label", "Task dependency graph")
+    expect(canvas).toHaveAttribute("aria-busy", "true")
+    expect(screen.queryByTestId("workflow-dag-svg")).not.toBeInTheDocument()
+    expect(screen.queryByTestId("workflow-dag-error")).not.toBeInTheDocument()
+
+    publishDagWidth(288)
+
+    expect(canvas).toHaveAttribute("aria-busy", "false")
+    const svg = screen.getByTestId("workflow-dag-svg")
+    expect(svg).toHaveAttribute("aria-hidden", "true")
+    expect(svg).toHaveClass("pointer-events-none")
+    expect(screen.getAllByTestId(/^workflow-dag-edge-/)).toHaveLength(7)
+    const edge = screen.getByTestId("workflow-dag-edge-2")
+    expect(edge).toHaveAttribute("data-from", "t2-impl")
+    expect(edge).toHaveAttribute("data-to", "t2-primary")
+    expect(edge).toHaveAttribute("data-edge-id", "e-3")
+    expect(screen.getByTestId("workflow-dag-edge-6")).not.toHaveAttribute(
+      "data-edge-id"
+    )
+    const marker = svg.querySelector("marker")
+    expect(marker?.id).toMatch(/^[A-Za-z0-9_-]+$/)
+    expect(marker).toHaveAttribute("aria-hidden", "true")
+    expect(edge).toHaveAttribute("marker-end", `url(#${marker!.id})`)
+
+    const selected = screen.getByTestId("workflow-dag-node-t2-primary")
+    expect(selected).toHaveAttribute("aria-pressed", "true")
+    expect(selected).toHaveAttribute("aria-controls", "test-dag-detail")
+    expect(selected).toHaveAttribute("data-status", "running")
+    expect(selected).toHaveAttribute("data-selected", "true")
+    expect(selected).toHaveAccessibleName(/Current workflow node/)
+    expect(selected).not.toHaveAttribute("aria-current")
+    expect(within(selected).getByText("Task 2 primary review")).toHaveAttribute(
+      "dir",
+      "auto"
+    )
+    const auxiliary = screen.getByTestId("workflow-dag-node-t2-aux")
+    expect(auxiliary).toHaveAttribute("data-current", "true")
+    expect(auxiliary).toHaveAttribute("data-sync-state", "out_of_sync")
+    expect(auxiliary).toHaveAccessibleName(/Task status is out of sync/)
+    expect(screen.getByTestId("workflow-dag-node-t3-impl")).toHaveAttribute(
+      "data-estimated",
+      "true"
+    )
+    fireEvent.click(auxiliary)
+    expect(onSelect).toHaveBeenCalledWith("t2-aux")
+
+    publishDagWidth(0)
+    expect(screen.getByTestId("workflow-dag-canvas")).toHaveAttribute(
+      "aria-busy",
+      "true"
+    )
+    expect(screen.queryByTestId("workflow-dag-svg")).not.toBeInTheDocument()
+  })
+
+  it("keeps selection and focus-visible rings in independent visual channels", () => {
+    renderDagCanvas(simpleDagGraph())
+    publishDagWidth(288)
+
+    const selected = screen.getByTestId("workflow-dag-node-t2-primary")
+    selected.focus()
+
+    expect(selected).toHaveFocus()
+    expect(selected).toHaveClass("inset-ring-2", "inset-ring-blue-500")
+    expect(selected).toHaveClass(
+      "focus-visible:ring-2",
+      "focus-visible:ring-ring",
+      "focus-visible:ring-offset-2"
+    )
+  })
+
+  it("derives screen-reader relationships from edges, not node.deps", () => {
+    const graph = simpleDagGraph()
+    graph.nodes = graph.nodes.map((item) => ({
+      ...item,
+      deps: ["incorrect-secondary-authority"],
+    }))
+    renderDagCanvas(graph)
+    publishDagWidth(288)
+
+    const button = screen.getByTestId("workflow-dag-node-t3-impl")
+    const descriptionId = button.getAttribute("aria-describedby")
+    expect(descriptionId).toBeTruthy()
+    expect(descriptionId).not.toContain("t3-impl")
+    const description = document.getElementById(descriptionId!)
+    expect(description).toHaveClass("sr-only")
+    expect(description).toHaveTextContent("Depends on Task 2 primary review")
+    expect(description).toHaveTextContent("Task 2 auxiliary review")
+    expect(description).toHaveTextContent("Required by Task 3 primary review")
+    expect(description).not.toHaveTextContent("incorrect-secondary-authority")
+  })
+
+  it("mirrors node coordinates from the Arabic locale", () => {
+    renderDagCanvas(simpleDagGraph(), {}, "ar")
+    publishDagWidth(288)
+
+    expect(screen.getByTestId("workflow-dag-canvas")).toHaveAttribute(
+      "dir",
+      "rtl"
+    )
+    expect(screen.getByTestId("workflow-dag-node-t2-primary")).toHaveStyle({
+      left: "150px",
+    })
+    expect(screen.getByTestId("workflow-dag-node-t2-aux")).toHaveStyle({
+      left: "8px",
+    })
+  })
+
+  it("uses synchronous and window-resize measurement without ResizeObserver", () => {
+    let width = 224
+    vi.stubGlobal("ResizeObserver", undefined)
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(
+      () => ({ width }) as DOMRect
+    )
+    renderDagCanvas(simpleDagGraph())
+
+    expect(screen.getByTestId("workflow-dag-node-t2-primary")).toHaveStyle({
+      width: "98px",
+    })
+    width = 448
+    fireEvent(window, new Event("resize"))
+    expect(screen.getByTestId("workflow-dag-node-t2-primary")).toHaveStyle({
+      width: "148px",
+    })
+  })
+
+  it("renders a bounded fallback without partial SVG for invalid topology", () => {
+    const graph = simpleDagGraph()
+    graph.edges = [...graph.edges, { from: "t3-primary", to: "t1-impl" }]
+    const { onSelect } = renderDagCanvas(graph)
+    publishDagWidth(288)
+
+    const error = screen.getByTestId("workflow-dag-error")
+    expect(error).toHaveAttribute("data-layout-error", "cycle")
+    expect(error).toHaveAttribute("role", "status")
+    expect(error).toHaveTextContent("Task dependencies could not be displayed")
+    const fallback = screen.getByTestId("workflow-dag-fallback")
+    expect(fallback).toHaveAttribute(
+      "aria-label",
+      "Tasks without dependency layout"
+    )
+    const fallbackButtons = within(fallback).getAllByRole("button")
+    expect(
+      fallbackButtons.map((button) => button.getAttribute("title"))
+    ).toEqual(graph.nodes.map((node) => node.title))
+    for (const button of fallbackButtons) {
+      expect(button).not.toHaveAttribute("aria-describedby")
+    }
+    fireEvent.click(screen.getByTestId("workflow-dag-node-t2-aux"))
+    expect(onSelect).toHaveBeenCalledWith("t2-aux")
+    expect(screen.queryByTestId("workflow-dag-svg")).not.toBeInTheDocument()
+  })
+
+  it("keeps duplicate IDs non-interactive", () => {
+    const graph = simpleDagGraph()
+    graph.nodes = [graph.nodes[0], { ...graph.nodes[0] }]
+    graph.edges = []
+    renderDagCanvas(graph, {
+      currentNodeIds: ["t1-impl"],
+      selectedNodeId: "t1-impl",
+    })
+    publishDagWidth(288)
+
+    expect(screen.getByTestId("workflow-dag-error")).toHaveAttribute(
+      "data-layout-error",
+      "duplicate_node"
+    )
+    expect(
+      within(screen.getByTestId("workflow-dag-fallback")).queryAllByRole(
+        "button"
+      )
+    ).toHaveLength(0)
+    const summaries = within(
+      screen.getByTestId("workflow-dag-fallback")
+    ).getAllByTitle("Task 1 implementation")
+    expect(summaries).toHaveLength(2)
+    for (const summary of summaries) {
+      expect(summary).toHaveAttribute("data-current", "false")
+      expect(summary).toHaveAttribute("data-selected", "false")
+      expect(summary).not.toHaveClass("border-s-2")
+      expect(summary).not.toHaveClass("ring-2")
+    }
+  })
+})
+
+describe("Simple workflow DAG integration", () => {
+  it("renders only the Tasks DAG and one complete selected-node detail", async () => {
+    renderWithIntl(
+      <div className="w-72">
+        <SubAgentOverlay
+          delegations={[]}
+          conversationId={88}
+          workflowGraph={simpleDagGraph()}
+          workspaceRootPath="/repo"
+        />
+      </div>
+    )
+    publishDagWidth(288)
+
+    expect(screen.getByTestId("workflow-graph-panel")).toHaveAttribute(
+      "data-compatibility",
+      "simple"
+    )
+    const tasks = screen.getByTestId("workflow-graph-lane-tasks")
+    expect(within(tasks).getByText("Tasks")).toBeVisible()
+    expect(within(tasks).getByText("Current")).toBeVisible()
+    expect(within(tasks).getByText("Task 2 / 3")).toBeVisible()
+    expect(screen.getAllByTestId(/^workflow-dag-node-/)).toHaveLength(7)
+    const edgePaths = screen.getAllByTestId(/^workflow-dag-edge-/)
+    expect(edgePaths).toHaveLength(7)
+    expect(new Set(edgePaths.map((path) => path.getAttribute("d"))).size).toBe(
+      7
+    )
+    expect(screen.queryByTestId(/^simple-task-row-/)).not.toBeInTheDocument()
+    expect(
+      screen.queryByTestId("workflow-graph-lane-design")
+    ).not.toBeInTheDocument()
+    expect(
+      screen.queryByTestId("workflow-graph-lane-plan")
+    ).not.toBeInTheDocument()
+    expect(
+      screen.queryByTestId("workflow-graph-lane-final")
+    ).not.toBeInTheDocument()
+    expect(screen.queryByTestId("workflow-graph-edges")).not.toBeInTheDocument()
+    expect(
+      screen.queryByTestId("workflow-dependencies-toggle")
+    ).not.toBeInTheDocument()
+    expect(
+      screen.queryByTestId("workflow-expand-toggle")
+    ).not.toBeInTheDocument()
+    expect(
+      screen.queryByTestId("workflow-lane-toggle-tasks")
+    ).not.toBeInTheDocument()
+
+    const currentButtons = [
+      screen.getByTestId("workflow-dag-node-t2-primary"),
+      screen.getByTestId("workflow-dag-node-t2-aux"),
+    ]
+    for (const button of currentButtons) {
+      expect(button).toHaveAttribute("data-current", "true")
+    }
+    expect(
+      screen
+        .getAllByTestId(/^workflow-dag-node-/)
+        .filter((button) => button.getAttribute("aria-pressed") === "true")
+    ).toHaveLength(1)
+
+    expect(screen.getAllByTestId("workflow-dag-detail")).toHaveLength(1)
+    let detail = screen.getByTestId("workflow-dag-detail")
+    expect(detail.id).not.toBe("")
+    expect(detail).toHaveAttribute("role", "region")
+    expect(detail).toHaveAttribute("aria-label", "Selected workflow node")
+    expect(detail).not.toHaveAttribute("aria-live")
+    expect(
+      within(detail).getByRole("heading", { name: "Task 2 primary review" })
+    ).toHaveAttribute("dir", "auto")
+    expect(screen.getByTestId("workflow-dag-node-t2-primary")).toHaveAttribute(
+      "aria-controls",
+      detail.id
+    )
+    expect(detail).toHaveTextContent("Task 2 primary review")
+    expect(detail).toHaveTextContent("Task 2")
+    expect(detail).toHaveTextContent("Role: reviewer")
+    expect(detail).toHaveTextContent("Agent: Codex")
+    expect(detail).toHaveTextContent("Model: gpt-5.6")
+    expect(detail).toHaveTextContent("Effort: high")
+    expect(detail).toHaveTextContent("Running")
+    expect(detail).toHaveTextContent("Live run: Running")
+    expect(detail).toHaveTextContent("1m 42s")
+    expect(detail).toHaveTextContent("6 tool uses")
+    expect(detail).toHaveTextContent("3 files")
+    expect(detail).toHaveTextContent("+74 -12")
+    expect(detail).toHaveTextContent("Runs 2")
+    expect(detail).toHaveTextContent("Replacements 1")
+    expect(detail).toHaveTextContent("Round 3")
+    expect(
+      within(detail).queryByText(/Depends on|Required by|依赖|解锁/)
+    ).not.toBeInTheDocument()
+
+    await userEvent.click(screen.getByTestId("workflow-dag-node-t2-aux"))
+    expect(openDelegatedChildSession).not.toHaveBeenCalled()
+    detail = screen.getByTestId("workflow-dag-detail")
+    expect(detail).toHaveTextContent("Task 2 auxiliary review")
+    expect(detail).toHaveTextContent("Task status is out of sync")
+
+    await userEvent.click(screen.getByTestId("workflow-dag-node-t3-impl"))
+    detail = screen.getByTestId("workflow-dag-detail")
+    expect(detail).toHaveTextContent("Estimated — no session yet")
+    expect(
+      within(detail).queryByRole("button", { name: "Open conversation" })
+    ).not.toBeInTheDocument()
+
+    await userEvent.click(screen.getByTestId("workflow-dag-node-t2-primary"))
+    await userEvent.click(screen.getByTestId("simple-task-open-t2-primary"))
+    expect(openDelegatedChildSession).toHaveBeenCalledWith({
+      childConversationId: 202,
+      agentType: "codex",
+      title: "Task 2 primary review",
+    })
+
+    expect(screen.getByText("Partial Simple projection")).toBeVisible()
+    expect(screen.queryByText("Reviewer cohort")).not.toBeInTheDocument()
+    expect(screen.queryByText("Decision required")).not.toBeInTheDocument()
+    expect(screen.queryByText("Evidence validated")).not.toBeInTheDocument()
+    expect(screen.queryByText("0 / 1")).not.toBeInTheDocument()
+  })
+
+  it("tracks current selection until a user choice, repairs removal, and resets by conversation", () => {
+    const graph = {
+      ...simpleDagGraph(),
+      current_node_ids: ["stale-node", "t2-primary", "t2-aux"],
+    }
+    const view = render(simplePanelView(graph, 88))
+    publishDagWidth(288)
+    expect(screen.getByTestId("workflow-dag-node-t2-primary")).toHaveAttribute(
+      "aria-pressed",
+      "true"
+    )
+
+    const automatic = { ...graph, current_node_ids: ["t2-aux"] }
+    view.rerender(simplePanelView(automatic, 88))
+    expect(screen.getByTestId("workflow-dag-node-t2-aux")).toHaveAttribute(
+      "aria-pressed",
+      "true"
+    )
+
+    fireEvent.click(screen.getByTestId("workflow-dag-node-t1-primary"))
+    const refreshed = { ...automatic, current_node_ids: ["t2-primary"] }
+    view.rerender(simplePanelView(refreshed, 88))
+    expect(screen.getByTestId("workflow-dag-node-t1-primary")).toHaveAttribute(
+      "aria-pressed",
+      "true"
+    )
+
+    const removed = {
+      ...refreshed,
+      nodes: refreshed.nodes.filter((item) => item.node_id !== "t1-primary"),
+      edges: refreshed.edges.filter(
+        (edge) => edge.from !== "t1-primary" && edge.to !== "t1-primary"
+      ),
+    }
+    view.rerender(simplePanelView(removed, 88))
+    expect(screen.getByTestId("workflow-dag-node-t2-primary")).toHaveAttribute(
+      "aria-pressed",
+      "true"
+    )
+
+    fireEvent.click(screen.getByTestId("workflow-dag-node-t1-impl"))
+    const nextConversation = {
+      ...graph,
+      current_node_ids: ["t2-aux"],
+    }
+    view.rerender(simplePanelView(nextConversation, 99))
+    publishDagWidth(288)
+    expect(screen.getByTestId("workflow-dag-node-t2-aux")).toHaveAttribute(
+      "aria-pressed",
+      "true"
+    )
+    expect(screen.getByTestId("workflow-dag-detail")).toHaveTextContent(
+      "Task 2 auxiliary review"
+    )
+  })
+
+  it.each([
+    ["no", []],
+    ["only stale", ["stale-node"]],
+  ] as const)(
+    "shows no detail for %s current IDs until the user selects",
+    (_name, currentNodeIds) => {
+      const graph = {
+        ...simpleDagGraph(),
+        current_node_ids: [...currentNodeIds],
+      }
+      render(simplePanelView(graph, 88))
+      publishDagWidth(288)
+
+      expect(
+        screen
+          .getAllByTestId(/^workflow-dag-node-/)
+          .filter((button) => button.getAttribute("aria-pressed") === "true")
+      ).toHaveLength(0)
+      expect(
+        screen.queryByTestId("workflow-dag-detail")
+      ).not.toBeInTheDocument()
+
+      fireEvent.click(screen.getByTestId("workflow-dag-node-t1-impl"))
+      expect(screen.getByTestId("workflow-dag-node-t1-impl")).toHaveAttribute(
+        "aria-pressed",
+        "true"
+      )
+      expect(screen.getByTestId("workflow-dag-detail")).toHaveTextContent(
+        "Task 1 implementation"
+      )
+    }
+  )
+
+  it("uses the locator pair as the selection scope when no conversation ID exists", () => {
+    const graph = simpleDagGraph()
+    const view = render(simplePanelView(graph, null))
+    publishDagWidth(288)
+    fireEvent.click(screen.getByTestId("workflow-dag-node-t1-impl"))
+
+    const nextLocator = {
+      ...graph,
+      simple: {
+        plan_rel_path: "docs/superpowers/plans/another.md",
+        progress_rel_path: ".superpowers/sdd/89/progress.md",
+      },
+      current_node_ids: ["t2-aux"],
+    }
+    view.rerender(simplePanelView(nextLocator, null))
+    publishDagWidth(288)
+
+    expect(screen.getByTestId("workflow-dag-node-t2-aux")).toHaveAttribute(
+      "aria-pressed",
+      "true"
+    )
+  })
+
+  it("keeps a missing-locator projection warning separate from graph validation", () => {
+    const graph = simpleDagGraph()
+    graph.simple = null
+    graph.projection_warning_codes = []
+    graph.nodes = graph.nodes.map((item) => ({
+      ...item,
+      projection_warning_codes: [],
+    }))
+    render(simplePanelView(graph, 88))
+    publishDagWidth(288)
+
+    expect(screen.getByTestId("simple-projection-warning")).toBeInTheDocument()
+    expect(screen.getByText("Partial Simple projection")).toBeVisible()
+    expect(screen.queryByTestId("workflow-dag-error")).not.toBeInTheDocument()
+    expect(screen.getByTestId("workflow-dag-svg")).toBeInTheDocument()
+  })
+
+  it("does not label an observed node without a child session as estimated", () => {
+    const graph = simpleDagGraph()
+    graph.nodes = graph.nodes.map((item) =>
+      item.node_id === "t3-primary"
+        ? { ...item, status: "pending", is_observed: true }
+        : item
+    )
+    graph.current_node_ids = ["t3-primary"]
+    render(simplePanelView(graph, 88))
+    publishDagWidth(288)
+
+    const detail = screen.getByTestId("workflow-dag-detail")
+    expect(detail).toHaveTextContent("No sub-agent sessions yet")
+    expect(detail).not.toHaveTextContent("Estimated — no session yet")
+  })
+
+  it.each([
+    {
+      name: "cycle",
+      error: "cycle",
+      mutate(graph: WorkflowGraphSnapshot) {
+        graph.edges = [...graph.edges, { from: "t3-primary", to: "t1-impl" }]
+      },
+    },
+    {
+      name: "dangling endpoint",
+      error: "dangling_edge",
+      mutate(graph: WorkflowGraphSnapshot) {
+        graph.edges = [
+          { from: "t1-impl", to: "missing-node" },
+          ...graph.edges.slice(1),
+        ]
+      },
+    },
+    {
+      name: "long edge",
+      error: "unsupported_edge_span",
+      mutate(graph: WorkflowGraphSnapshot) {
+        graph.edges = [...graph.edges, { from: "t1-impl", to: "t2-impl" }]
+      },
+    },
+  ])("shows a measured fallback for $name", ({ error, mutate }) => {
+    const graph = simpleDagGraph()
+    mutate(graph)
+    render(simplePanelView(graph, 88))
+    publishDagWidth(288)
+
+    expect(screen.getByTestId("workflow-dag-error")).toHaveAttribute(
+      "data-layout-error",
+      error
+    )
+    expect(screen.getByTestId("workflow-dag-fallback")).toBeInTheDocument()
+    expect(screen.queryByTestId("workflow-dag-svg")).not.toBeInTheDocument()
+  })
+
+  it.each(["duplicate", "blank"] as const)(
+    "does not expose ambiguous selection for a %s node ID",
+    (kind) => {
+      const graph = simpleDagGraph()
+      graph.nodes =
+        kind === "duplicate"
+          ? [graph.nodes[0], { ...graph.nodes[0] }]
+          : [{ ...graph.nodes[0], node_id: "   " }]
+      graph.edges = []
+      graph.current_node_ids = []
+      render(simplePanelView(graph, 88))
+      publishDagWidth(288)
+
+      expect(
+        within(screen.getByTestId("workflow-dag-fallback")).queryAllByRole(
+          "button"
+        )
+      ).toHaveLength(0)
+      expect(
+        screen.queryByTestId("workflow-dag-detail")
+      ).not.toBeInTheDocument()
+      expect(screen.queryByTestId("workflow-dag-svg")).not.toBeInTheDocument()
+    }
+  )
+
+  it("uses the existing empty state without mounting a canvas", () => {
+    const graph = simpleDagGraph()
+    graph.nodes = []
+    graph.edges = []
+    graph.current_node_ids = []
+    render(simplePanelView(graph, 88))
+
+    expect(screen.getByText("No Plan tasks found")).toBeVisible()
+    expect(screen.queryByTestId("workflow-dag-canvas")).not.toBeInTheDocument()
+    expect(screen.queryByTestId("workflow-dag-detail")).not.toBeInTheDocument()
+  })
+
+  it("accepts a non-empty edgeless graph as one rank", () => {
+    const graph = simpleDagGraph()
+    graph.edges = []
+    render(simplePanelView(graph, 88))
+    publishDagWidth(224)
+
+    expect(screen.getByTestId("workflow-dag-svg")).toBeInTheDocument()
+    expect(screen.queryAllByTestId(/^workflow-dag-edge-/)).toHaveLength(0)
+    expect(screen.getAllByTestId(/^workflow-dag-node-/)).toHaveLength(7)
+    expect(screen.queryByTestId("workflow-dag-error")).not.toBeInTheDocument()
+  })
 })
 
 describe("Task 7 archived and Simple workflow rendering", () => {
@@ -708,30 +1495,44 @@ describe("Task 7 archived and Simple workflow rendering", () => {
       </div>,
       messages
     )
+    publishDagWidth(288)
 
     expect(
-      within(screen.getByTestId("simple-task-row-simple-task-1")).getByText(
+      within(screen.getByTestId("workflow-dag-node-simple-task-1")).getByText(
         "Pending"
       )
     ).toBeVisible()
     expect(
-      within(screen.getByTestId("simple-task-row-simple-task-2")).getByText(
+      within(screen.getByTestId("workflow-dag-node-simple-task-2")).getByText(
         "In progress"
       )
     ).toBeVisible()
     expect(
-      within(screen.getByTestId("simple-task-row-simple-task-3")).getByText(
+      within(screen.getByTestId("workflow-dag-node-simple-task-3")).getByText(
         "Completed"
       )
     ).toBeVisible()
     expect(
-      within(screen.getByTestId("simple-task-row-simple-task-4")).getByText(
+      within(screen.getByTestId("workflow-dag-node-simple-task-4")).getByText(
         "Blocked"
       )
     ).toBeVisible()
+    expect(
+      within(screen.getByTestId("workflow-graph-lane-tasks")).getByText(
+        "5 tasks"
+      )
+    ).toBeVisible()
     expect(screen.getByText("Partial Simple projection")).toBeVisible()
-    expect(screen.getByText("Task status is out of sync")).toBeVisible()
-    expect(screen.getByText("Live run: Running")).toBeVisible()
+
+    await userEvent.click(screen.getByTestId("workflow-dag-node-simple-task-4"))
+    expect(screen.getByTestId("workflow-dag-detail")).toHaveTextContent(
+      "Task status is out of sync"
+    )
+
+    await userEvent.click(screen.getByTestId("workflow-dag-node-simple-task-5"))
+    expect(screen.getByTestId("workflow-dag-detail")).toHaveTextContent(
+      "Live run: Running"
+    )
 
     await userEvent.click(screen.getByTestId("simple-task-open-simple-task-5"))
     expect(openDelegatedChildSession).toHaveBeenCalledWith(
@@ -749,6 +1550,9 @@ describe("Task 7 archived and Simple workflow rendering", () => {
       "/repo/.superpowers/sdd/42/progress.md"
     )
     expect(screen.getByTestId("simple-progress-link")).toHaveClass("min-w-0")
+    expect(
+      screen.queryByTestId("simple-task-row-simple-task-1")
+    ).not.toBeInTheDocument()
 
     expect(screen.queryByText("Reviewer cohort")).toBeNull()
     expect(screen.queryByText("Decision required")).toBeNull()

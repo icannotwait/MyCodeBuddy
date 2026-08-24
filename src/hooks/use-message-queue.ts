@@ -8,17 +8,27 @@ export interface QueuedMessage {
   id: string
   draft: PromptDraft
   modeId: string | null
+  /** Timeline bubble id retained while this item waits to dispatch. */
+  optimisticTurnId?: string
 }
 
 export interface UseMessageQueueReturn {
   queue: QueuedMessage[]
-  enqueue: (draft: PromptDraft, modeId: string | null) => void
+  enqueue: (
+    draft: PromptDraft,
+    modeId: string | null,
+    options?: { optimisticTurnId?: string }
+  ) => void
   /**
    * Put a draft back at the FRONT of the queue. Used when an auto-flushed item
    * was dequeued, sent, and bounced (TurnBusyError): it must return to the head
    * so it retries before items that were already behind it (FIFO preserved).
    */
-  requeueFront: (draft: PromptDraft, modeId: string | null) => void
+  requeueFront: (
+    draft: PromptDraft,
+    modeId: string | null,
+    options?: { optimisticTurnId?: string }
+  ) => void
   dequeue: () => QueuedMessage | undefined
   remove: (id: string) => void
   reorder: (items: QueuedMessage[]) => void
@@ -57,15 +67,39 @@ export function useMessageQueue(): UseMessageQueueReturn {
   }, [])
 
   const enqueue = useCallback(
-    (draft: PromptDraft, modeId: string | null) => {
-      commit([...queueRef.current, { id: randomUUID(), draft, modeId }])
+    (
+      draft: PromptDraft,
+      modeId: string | null,
+      options?: { optimisticTurnId?: string }
+    ) => {
+      commit([
+        ...queueRef.current,
+        {
+          id: randomUUID(),
+          draft,
+          modeId,
+          optimisticTurnId: options?.optimisticTurnId,
+        },
+      ])
     },
     [commit]
   )
 
   const requeueFront = useCallback(
-    (draft: PromptDraft, modeId: string | null) => {
-      commit([{ id: randomUUID(), draft, modeId }, ...queueRef.current])
+    (
+      draft: PromptDraft,
+      modeId: string | null,
+      options?: { optimisticTurnId?: string }
+    ) => {
+      commit([
+        {
+          id: randomUUID(),
+          draft,
+          modeId,
+          optimisticTurnId: options?.optimisticTurnId,
+        },
+        ...queueRef.current,
+      ])
     },
     [commit]
   )

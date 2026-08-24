@@ -41,7 +41,7 @@ import {
   saveFileContent,
   saveFileCopy,
 } from "@/lib/api"
-import type { FileEditContent } from "@/lib/types"
+import type { FileEditContent, GrokSessionImageMimeType } from "@/lib/types"
 import {
   expandHomePath,
   findOwningFolder,
@@ -76,6 +76,10 @@ import {
   type WorkspaceExternalConflict,
 } from "@/hooks/use-open-file-tabs-watch"
 import { useOfficeAutoPreview } from "@/lib/office-preview-prefs"
+import {
+  GROK_SESSION_IMAGE_MIME_BY_EXTENSION,
+  parseGrokSessionImageRef,
+} from "@/lib/markdown/grok-session-image"
 
 export type WorkspaceMode = "conversation" | "fusion"
 export type WorkspacePane = "conversation" | "files"
@@ -84,6 +88,19 @@ export type { TranslationTransientMeta, DocumentTranslateFormat }
 type FileWorkspaceTabKind = "file" | "diff" | "rich-diff"
 type FileSaveState = "idle" | "saving" | "error"
 type LineEnding = "lf" | "crlf" | "mixed" | "none"
+
+export type FileSnapshotSource = {
+  type: "grok-session-image"
+  conversationId: number
+  href: string
+}
+
+export type ResolvedImagePreviewInput = {
+  path: string
+  mimeType: GrokSessionImageMimeType
+  dataBase64: string
+  source: FileSnapshotSource
+}
 
 export interface FileWorkspaceTab {
   id: string
@@ -119,6 +136,7 @@ export interface FileWorkspaceTab {
   // True after at least one successful content settle for this tab. Cold
   // open failures (never true) remove the tab; warm failures keep content.
   hasLoadedSuccessfully: boolean
+  snapshotSource?: FileSnapshotSource
   /**
    * Pathless in-memory result tabs (document translation). Not disk-watched;
    * pinned against content eviction until the user closes the tab.
@@ -164,6 +182,9 @@ interface WorkspaceActionsValue {
     path: string,
     options?: OpenFileOptions
   ) => Promise<OpenFileSettleResult>
+  openResolvedImagePreview: (
+    input: ResolvedImagePreviewInput
+  ) => OpenFileSettleResult
   // Refetch the open tab matching the absolute `path` without changing
   // activeFileTabId. No-op when no tab matches or when the tab has unsaved
   // local edits (use markTabsStale for that case).
@@ -505,6 +526,19 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
     >
   >(new Map())
   const nextLoadGenRef = useRef(0)
+  // Persistent per-tab fence for trusted snapshot replacements. Unlike the
+  // snapshotSource marker, this survives a later ordinary conversion, so an
+  // automatic read that started before snapshot B cannot mutate ordinary A
+  // after B has already been converted back to disk-backed content.
+  const snapshotIncarnationByTabIdRef = useRef<Map<string, number>>(new Map())
+  const nextSnapshotIncarnationRef = useRef(0)
+  // Monotonic logical identity for every tab id. A path may cycle through
+  // ordinary A -> closed -> trusted snapshot B -> ordinary A while an older
+  // save is still awaiting I/O. The id alone cannot distinguish those
+  // incarnations, so every whole-tab creation/replacement/close advances this
+  // fence and async saves capture it before their first await.
+  const tabIncarnationByTabIdRef = useRef<Map<string, number>>(new Map())
+  const nextTabIncarnationRef = useRef(0)
   // Most-recently-active tab ids, most recent first. Drives the memory
   // guardrail's least-recently-active eviction order.
   const tabRecencyRef = useRef<string[]>([])
@@ -689,10 +723,30 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
     [activateFilePane]
   )
 
+  const bumpTabIncarnation = useCallback((tabId: string): number => {
+    nextTabIncarnationRef.current += 1
+    const incarnation = nextTabIncarnationRef.current
+    tabIncarnationByTabIdRef.current.set(tabId, incarnation)
+    return incarnation
+  }, [])
+
+  const currentTabIncarnation = useCallback(
+    (tabId: string): number => tabIncarnationByTabIdRef.current.get(tabId) ?? 0,
+    []
+  )
+
+  const isTabIncarnationCurrent = useCallback(
+    (tabId: string, incarnation: number): boolean =>
+      currentTabIncarnation(tabId) === incarnation,
+    [currentTabIncarnation]
+  )
+
   // Insert a freshly created (loading, empty) tab. Caller has verified no tab
   // with this id exists. If a race introduced one, leave it alone.
   const seedLoadingTab = useCallback(
     (nextTab: FileWorkspaceTab) => {
+      if (fileTabsRef.current.some((tab) => tab.id === nextTab.id)) return
+      bumpTabIncarnation(nextTab.id)
       setFileTabs((prev) => {
         if (prev.some((tab) => tab.id === nextTab.id)) return prev
         return [...prev, nextTab]
@@ -723,7 +777,7 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
         })
       }
     },
-    [activateFilePane]
+    [activateFilePane, bumpTabIncarnation]
   )
 
   // Mark an existing tab as refreshing. Preserves content / originalContent /
@@ -840,6 +894,33 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
     []
   )
 
+  // Commit a disk-backed ready shape as one logical transition. In
+  // particular, converting a trusted image snapshot must not merely overlay
+  // bytes onto its image state: language and every mode-specific field come
+  // from the path-derived seed/result. Advancing the general incarnation at
+  // that boundary also fences saves belonging to a prior same-id tab.
+  const commitPathReadyTab = useCallback(
+    (tabId: string, patch: Partial<FileWorkspaceTab>): boolean => {
+      const current = fileTabsRef.current.find((tab) => tab.id === tabId)
+      if (!current || current.kind !== "file") return false
+      const incarnation = current.snapshotSource
+        ? bumpTabIncarnation(tabId)
+        : currentTabIncarnation(tabId)
+      const apply = (tabs: FileWorkspaceTab[]): FileWorkspaceTab[] =>
+        tabs.map((tab) =>
+          tab.id === tabId &&
+          tab.kind === "file" &&
+          isTabIncarnationCurrent(tabId, incarnation)
+            ? { ...tab, ...patch }
+            : tab
+        )
+      fileTabsRef.current = apply(fileTabsRef.current)
+      setFileTabs(apply)
+      return true
+    },
+    [bumpTabIncarnation, currentTabIncarnation, isTabIncarnationCurrent]
+  )
+
   // Orchestrates the "I want to start (or restart) a load for this tab" flow.
   // Encapsulates: cache short-circuit, in-flight dedup, error retry, forced
   // refresh, and cold-load creation. Returns whether the caller should
@@ -850,6 +931,30 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
     inFlightLoadsRef.current.set(tabId, gen)
     return gen
   }, [])
+
+  const currentSnapshotIncarnation = useCallback(
+    (tabId: string): number =>
+      snapshotIncarnationByTabIdRef.current.get(tabId) ?? 0,
+    []
+  )
+
+  const isSnapshotIncarnationCurrent = useCallback(
+    (tabId: string, incarnation: number): boolean =>
+      currentSnapshotIncarnation(tabId) === incarnation,
+    [currentSnapshotIncarnation]
+  )
+
+  const supersedeFetchGeneration = useCallback(
+    (tabId: string): number => {
+      const previous = inFlightLoadsRef.current.get(tabId)
+      if (previous !== undefined) {
+        finishOpenSettle(tabId, previous, { ok: false, reason: "stale" })
+      }
+      pendingMaximizeOnSuccessRef.current.delete(tabId)
+      return beginFetchGeneration(tabId)
+    },
+    [beginFetchGeneration, finishOpenSettle]
+  )
 
   const decideLoad = useCallback(
     (
@@ -894,8 +999,10 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
       // unsaved edits.
       const stalePromotesReload =
         existing.kind === "file" && existing.stale === true && !existing.isDirty
+      const snapshotPromotesReload =
+        existing.kind === "file" && existing.snapshotSource !== undefined
 
-      if (!reload && !stalePromotesReload) {
+      if (!reload && !stalePromotesReload && !snapshotPromotesReload) {
         // Cache hit — nothing to do.
         return { kind: "skip" }
       }
@@ -1104,12 +1211,26 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
       const tabId = buildFileTabId({ kind: "file", path: absPath })
       const existing = fileTabsRef.current.find((t) => t.id === tabId)
       if (!existing || existing.kind !== "file") return
-      if (existing.isDirty) return
+      if (existing.snapshotSource || existing.isDirty) return
       if (inFlightLoadsRef.current.has(tabId)) return
+      const snapshotIncarnation = currentSnapshotIncarnation(tabId)
 
       const image = isImageFile(absPath)
 
-      markTabRefreshing(tabId)
+      setFileTabs((prev) =>
+        prev.map((tab) =>
+          tab.id === tabId &&
+          !tab.snapshotSource &&
+          isSnapshotIncarnationCurrent(tabId, snapshotIncarnation)
+            ? {
+                ...tab,
+                loading: true,
+                saveState: "idle",
+                saveError: null,
+              }
+            : tab
+        )
+      )
       const gen = beginFetchGeneration(tabId)
 
       try {
@@ -1121,6 +1242,10 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
             15_000,
             t("previewRequestTimedOut")
           )
+          if (!isSnapshotIncarnationCurrent(tabId, snapshotIncarnation)) {
+            settleFetch(tabId, gen)
+            return
+          }
           if (!settleFetch(tabId, gen)) return
           const imagePatch = {
             content: `data:${mime};base64,${b64}`,
@@ -1134,10 +1259,20 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
           }
           setFileTabs((prev) =>
             prev.map((tab) =>
-              tab.id === tabId ? { ...tab, ...imagePatch } : tab
+              tab.id === tabId &&
+              !tab.snapshotSource &&
+              isSnapshotIncarnationCurrent(tabId, snapshotIncarnation)
+                ? { ...tab, ...imagePatch }
+                : tab
             )
           )
-          patchFileTabRef(tabId, imagePatch)
+          if (
+            !fileTabsRef.current.find((tab) => tab.id === tabId)
+              ?.snapshotSource &&
+            isSnapshotIncarnationCurrent(tabId, snapshotIncarnation)
+          ) {
+            patchFileTabRef(tabId, imagePatch)
+          }
           return
         }
 
@@ -1149,6 +1284,10 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
           15_000,
           t("previewRequestTimedOut")
         )
+        if (!isSnapshotIncarnationCurrent(tabId, snapshotIncarnation)) {
+          settleFetch(tabId, gen)
+          return
+        }
         if (!settleFetch(tabId, gen)) return
         const textPatch = {
           content: result.content,
@@ -1166,10 +1305,26 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
           hasLoadedSuccessfully: true as const,
         }
         setFileTabs((prev) =>
-          prev.map((tab) => (tab.id === tabId ? { ...tab, ...textPatch } : tab))
+          prev.map((tab) =>
+            tab.id === tabId &&
+            !tab.snapshotSource &&
+            isSnapshotIncarnationCurrent(tabId, snapshotIncarnation)
+              ? { ...tab, ...textPatch }
+              : tab
+          )
         )
-        patchFileTabRef(tabId, textPatch)
+        if (
+          !fileTabsRef.current.find((tab) => tab.id === tabId)
+            ?.snapshotSource &&
+          isSnapshotIncarnationCurrent(tabId, snapshotIncarnation)
+        ) {
+          patchFileTabRef(tabId, textPatch)
+        }
       } catch (error) {
+        if (!isSnapshotIncarnationCurrent(tabId, snapshotIncarnation)) {
+          settleFetch(tabId, gen)
+          return
+        }
         if (!settleFetch(tabId, gen)) return
         // Warm toast if previously loaded; no-op path when tab was closed
         // (settle already returned false above). Never invent error tabs.
@@ -1180,9 +1335,10 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
     },
     [
       beginFetchGeneration,
+      currentSnapshotIncarnation,
       failOpenTab,
       fetchGitBase,
-      markTabRefreshing,
+      isSnapshotIncarnationCurrent,
       patchFileTabRef,
       settleFetch,
       t,
@@ -1193,44 +1349,70 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
   // reload (clean) or a conflict prompt (dirty). The watcher calls this for
   // dirty non-active tabs when an external change is observed, since silently
   // reloading would discard the user's unsaved edits.
-  const markTabsStale = useCallback((rawPath: string) => {
-    const tabId = buildFileTabId({
-      kind: "file",
-      path: normalizeAbsPath(rawPath),
-    })
-    setFileTabs((prev) => {
-      const idx = prev.findIndex((tab) => tab.id === tabId)
-      if (idx < 0) return prev
-      const tab = prev[idx]
-      if (tab.stale === true) return prev
-      const updated = [...prev]
-      updated[idx] = { ...tab, stale: true }
-      return updated
-    })
-  }, [])
+  const markTabsStale = useCallback(
+    (rawPath: string) => {
+      const tabId = buildFileTabId({
+        kind: "file",
+        path: normalizeAbsPath(rawPath),
+      })
+      const snapshotIncarnation = currentSnapshotIncarnation(tabId)
+      setFileTabs((prev) => {
+        if (!isSnapshotIncarnationCurrent(tabId, snapshotIncarnation)) {
+          return prev
+        }
+        const idx = prev.findIndex((tab) => tab.id === tabId)
+        if (idx < 0) return prev
+        const tab = prev[idx]
+        if (tab.snapshotSource || tab.stale === true) return prev
+        const updated = [...prev]
+        updated[idx] = { ...tab, stale: true }
+        return updated
+      })
+    },
+    [currentSnapshotIncarnation, isSnapshotIncarnationCurrent]
+  )
 
   // Batch variant for the watcher's lazy background pass: N affected
   // background tabs cost ONE setState and zero disk reads. Patches ONLY
   // the `stale` flag — never content or any other field — so it composes
   // safely with concurrent keystroke updaters in the same React batch.
-  const markTabsStaleBatch = useCallback((rawPaths: string[]) => {
-    if (rawPaths.length === 0) return
-    const tabIds = new Set(
-      rawPaths.map((rawPath) =>
-        buildFileTabId({ kind: "file", path: normalizeAbsPath(rawPath) })
+  const markTabsStaleBatch = useCallback(
+    (rawPaths: string[]) => {
+      if (rawPaths.length === 0) return
+      const tabIds = new Set(
+        rawPaths.map((rawPath) =>
+          buildFileTabId({ kind: "file", path: normalizeAbsPath(rawPath) })
+        )
       )
-    )
-    setFileTabs((prev) => {
-      let changed = false
-      const next = prev.map((tab) => {
-        if (!tabIds.has(tab.id) || tab.kind !== "file") return tab
-        if (tab.stale === true) return tab
-        changed = true
-        return { ...tab, stale: true }
+      const snapshotIncarnations = new Map(
+        [...tabIds].map((tabId) => [tabId, currentSnapshotIncarnation(tabId)])
+      )
+      setFileTabs((prev) => {
+        let changed = false
+        const next = prev.map((tab) => {
+          if (
+            !tabIds.has(tab.id) ||
+            tab.kind !== "file" ||
+            tab.snapshotSource
+          ) {
+            return tab
+          }
+          const snapshotIncarnation = snapshotIncarnations.get(tab.id)
+          if (
+            snapshotIncarnation === undefined ||
+            !isSnapshotIncarnationCurrent(tab.id, snapshotIncarnation)
+          ) {
+            return tab
+          }
+          if (tab.stale === true) return tab
+          changed = true
+          return { ...tab, stale: true }
+        })
+        return changed ? next : prev
       })
-      return changed ? next : prev
-    })
-  }, [])
+    },
+    [currentSnapshotIncarnation, isSnapshotIncarnationCurrent]
+  )
 
   // Write a prefetched FileEditContent into the matching tab. The change-
   // detection watcher uses this after its resolver has already read the
@@ -1257,7 +1439,10 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
       // setFileTabs updater below, where prev reflects every earlier
       // queued updater (including the keystroke).
       const existing = fileTabsRef.current.find((t) => t.id === tabId)
-      if (!existing || existing.kind !== "file") return
+      if (!existing || existing.kind !== "file" || existing.snapshotSource) {
+        return
+      }
+      const snapshotIncarnation = currentSnapshotIncarnation(tabId)
 
       const gen = beginFetchGeneration(tabId)
       const fetchedEtag = fetched.etag
@@ -1271,6 +1456,10 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
       setFileTabs((prev) =>
         prev.map((tab) => {
           if (tab.id !== tabId || tab.kind !== "file") return tab
+          if (tab.snapshotSource) return tab
+          if (!isSnapshotIncarnationCurrent(tabId, snapshotIncarnation)) {
+            return tab
+          }
           if (tab.isDirty) return { ...tab, stale: true }
           return {
             ...tab,
@@ -1307,8 +1496,9 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
       // openFilePreview reload / close+reopen changed the tab, the tab
       // carries a different etag. The final write checks tab.etag ===
       // fetchedEtag inside the updater so a stale fetch can never paint
-      // gitter decorations onto a tab whose content has moved on. No
-      // separate generation token needed — etag is the natural fingerprint.
+      // gutter decorations onto a tab whose content has moved on. The
+      // persistent snapshot incarnation additionally closes A→B→A, where
+      // a later ordinary conversion could coincidentally restore the etag.
       void (async () => {
         try {
           const gitBaseContent = await withTimeout(
@@ -1316,9 +1506,14 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
             15_000,
             t("previewRequestTimedOut")
           )
+          if (!isSnapshotIncarnationCurrent(tabId, snapshotIncarnation)) return
           setFileTabs((prev) =>
             prev.map((tab) => {
               if (tab.id !== tabId || tab.kind !== "file") return tab
+              if (tab.snapshotSource) return tab
+              if (!isSnapshotIncarnationCurrent(tabId, snapshotIncarnation)) {
+                return tab
+              }
               if (tab.etag !== fetchedEtag) return tab
               return {
                 ...tab,
@@ -1331,7 +1526,14 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
         }
       })()
     },
-    [beginFetchGeneration, fetchGitBase, settleFetch, t]
+    [
+      beginFetchGeneration,
+      currentSnapshotIncarnation,
+      fetchGitBase,
+      isSnapshotIncarnationCurrent,
+      settleFetch,
+      t,
+    ]
   )
 
   // Mark a clean open tab as load-failed. Used by the change-detection
@@ -1347,7 +1549,10 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
       // Outer existence check only; the dirty guard is atomic inside the
       // updater (see applyExternalReload for the same race shape).
       const existing = fileTabsRef.current.find((t) => t.id === tabId)
-      if (!existing || existing.kind !== "file") return
+      if (!existing || existing.kind !== "file" || existing.snapshotSource) {
+        return
+      }
+      const snapshotIncarnation = currentSnapshotIncarnation(tabId)
 
       // Bump generation so any concurrent fetch's settle is invalidated
       // and cannot overwrite the error message we are about to write.
@@ -1355,6 +1560,10 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
       setFileTabs((prev) =>
         prev.map((tab) => {
           if (tab.id !== tabId || tab.kind !== "file") return tab
+          if (tab.snapshotSource) return tab
+          if (!isSnapshotIncarnationCurrent(tabId, snapshotIncarnation)) {
+            return tab
+          }
           // Symmetric with applyExternalReload's dirty refusal: surface
           // the divergence via stale rather than silently no-op. Callers
           // typically also call markTabsStale, so this is usually
@@ -1379,7 +1588,15 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
       )
       // Mirror ref so same-turn openFilePreview retry sees savedContent.
       fileTabsRef.current = fileTabsRef.current.map((tab) => {
-        if (tab.id !== tabId || tab.kind !== "file" || tab.isDirty) return tab
+        if (
+          tab.id !== tabId ||
+          tab.kind !== "file" ||
+          tab.snapshotSource ||
+          tab.isDirty ||
+          !isSnapshotIncarnationCurrent(tabId, snapshotIncarnation)
+        ) {
+          return tab
+        }
         const preservedSaved =
           typeof tab.savedContent === "string" && tab.savedContent.length > 0
             ? tab.savedContent
@@ -1396,7 +1613,115 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
       })
       settleFetch(tabId, gen)
     },
-    [beginFetchGeneration, settleFetch, t]
+    [
+      beginFetchGeneration,
+      currentSnapshotIncarnation,
+      isSnapshotIncarnationCurrent,
+      settleFetch,
+      t,
+    ]
+  )
+
+  const openResolvedImagePreview = useCallback(
+    (input: ResolvedImagePreviewInput): OpenFileSettleResult => {
+      const parsedSource = parseGrokSessionImageRef(input.source.href)
+      if (
+        !isAbsoluteFilePath(input.path) ||
+        input.source.type !== "grok-session-image" ||
+        !Number.isInteger(input.source.conversationId) ||
+        input.source.conversationId <= 0 ||
+        !parsedSource ||
+        parsedSource.path !== input.source.href ||
+        GROK_SESSION_IMAGE_MIME_BY_EXTENSION[parsedSource.extension] !==
+          input.mimeType ||
+        typeof input.dataBase64 !== "string" ||
+        input.dataBase64.trim().length === 0
+      ) {
+        return { ok: false, reason: "resolve" }
+      }
+
+      let absPath = normalizeAbsPath(input.path)
+      const owning = findOwningFolder(
+        absPath,
+        useAppWorkspaceStore.getState().allFolders
+      )
+      if (owning) absPath = joinRootRel(owning.rootPath, owning.relPath)
+      if (!splitAbsPath(absPath)) return { ok: false, reason: "resolve" }
+
+      const tabId = buildFileTabId({ kind: "file", path: absPath })
+      const existing = fileTabsRef.current.find((tab) => tab.id === tabId)
+      // A resolved image is a whole-tab replacement. It may refresh an
+      // existing trusted snapshot, but it must never destroy an ordinary
+      // unsaved buffer or a write currently owned by that ordinary tab.
+      if (
+        existing?.kind === "file" &&
+        (existing.isDirty || existing.saveState === "saving")
+      ) {
+        return { ok: false, reason: "stale" }
+      }
+
+      nextSnapshotIncarnationRef.current += 1
+      snapshotIncarnationByTabIdRef.current.set(
+        tabId,
+        nextSnapshotIncarnationRef.current
+      )
+      const tabIncarnation = bumpTabIncarnation(tabId)
+      const gen = supersedeFetchGeneration(tabId)
+      const imageContent = `data:${input.mimeType};base64,${input.dataBase64}`
+      const nextTab: FileWorkspaceTab = {
+        id: tabId,
+        kind: "file",
+        folderId: null,
+        title: fileName(absPath),
+        description: absPath,
+        path: absPath,
+        language: "image",
+        content: imageContent,
+        loading: false,
+        savedContent: imageContent,
+        isDirty: false,
+        etag: null,
+        mtimeMs: null,
+        readonly: true,
+        lineEnding: "none",
+        saveState: "idle",
+        saveError: null,
+        stale: false,
+        hasLoadedSuccessfully: true,
+        snapshotSource: { ...input.source },
+      }
+      const upsert = (tabs: FileWorkspaceTab[]) => {
+        const index = tabs.findIndex((tab) => tab.id === tabId)
+        if (!isTabIncarnationCurrent(tabId, tabIncarnation)) return tabs
+        if (index < 0) return [...tabs, nextTab]
+        const current = tabs[index]
+        if (
+          current.kind === "file" &&
+          (current.isDirty || current.saveState === "saving")
+        ) {
+          return tabs
+        }
+        const next = [...tabs]
+        next[index] = nextTab
+        return next
+      }
+      fileTabsRef.current = upsert(fileTabsRef.current)
+      setFileTabs(upsert)
+      settleFetch(tabId, gen)
+      setPendingFileReveal(null)
+      setActiveFileTabId(tabId)
+      activeFileTabIdRef.current = tabId
+      activateFilePane()
+      setFilesMaximized(true)
+      return { ok: true, tabId }
+    },
+    [
+      activateFilePane,
+      bumpTabIncarnation,
+      isTabIncarnationCurrent,
+      settleFetch,
+      supersedeFetchGeneration,
+    ]
   )
 
   const openFilePreview = useCallback(
@@ -1404,6 +1729,7 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
       rawPath: string,
       options?: OpenFileOptions
     ): Promise<OpenFileSettleResult> => {
+      const openedAtSnapshotIncarnation = nextSnapshotIncarnationRef.current
       const maximizeOnSuccess = options?.maximizeOnSuccess !== false
       const absPath = await resolveOpenAbsolutePath(rawPath, options?.folderId)
       if (!absPath) {
@@ -1414,6 +1740,10 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
       if (!io) {
         toast.error(t("unableOpenFile", { name: fileName(absPath) }))
         return { ok: false, reason: "resolve" }
+      }
+      const tabId = buildFileTabId({ kind: "file", path: absPath })
+      if (currentSnapshotIncarnation(tabId) > openedAtSnapshotIncarnation) {
+        return { ok: false, reason: "stale" }
       }
       const requestedLine =
         typeof options?.line === "number" && Number.isFinite(options.line)
@@ -1429,7 +1759,6 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
       } else {
         setPendingFileReveal(null)
       }
-      const tabId = buildFileTabId({ kind: "file", path: absPath })
       const displayName = fileName(absPath)
       const image = isImageFile(absPath)
       const office = !image && isOfficePreviewable(absPath)
@@ -1478,20 +1807,29 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
               return
             }
             const officePatch = {
+              language: seed.language,
               content: "",
+              originalContent: undefined,
+              modifiedContent: undefined,
+              gitBaseContent: undefined,
+              savedContent: "",
+              isDirty: false,
+              etag: null,
+              mtimeMs: null,
               readonly: true as const,
+              lineEnding: "none" as const,
               loading: false,
               saveState: "idle" as const,
               saveError: null,
               stale: false,
               hasLoadedSuccessfully: true as const,
+              snapshotSource: undefined,
+              transient: undefined,
             }
-            setFileTabs((prev) =>
-              prev.map((tab) =>
-                tab.id === tabId ? { ...tab, ...officePatch } : tab
-              )
-            )
-            patchFileTabRef(tabId, officePatch)
+            if (!commitPathReadyTab(tabId, officePatch)) {
+              settle({ ok: false, reason: "stale" })
+              return
+            }
             maybeMaximizeAfterSuccess(tabId)
             settle({ ok: true, tabId })
             return
@@ -1511,21 +1849,29 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
             }
             const imageContent = `data:${mime};base64,${b64}`
             const imagePatch = {
+              language: seed.language,
               content: imageContent,
+              originalContent: undefined,
+              modifiedContent: undefined,
+              gitBaseContent: undefined,
               savedContent: imageContent,
+              isDirty: false,
+              etag: null,
+              mtimeMs: null,
               readonly: true as const,
+              lineEnding: "none" as const,
               loading: false,
               saveState: "idle" as const,
               saveError: null,
               stale: false,
               hasLoadedSuccessfully: true as const,
+              snapshotSource: undefined,
+              transient: undefined,
             }
-            setFileTabs((prev) =>
-              prev.map((tab) =>
-                tab.id === tabId ? { ...tab, ...imagePatch } : tab
-              )
-            )
-            patchFileTabRef(tabId, imagePatch)
+            if (!commitPathReadyTab(tabId, imagePatch)) {
+              settle({ ok: false, reason: "stale" })
+              return
+            }
             maybeMaximizeAfterSuccess(tabId)
             settle({ ok: true, tabId })
             return
@@ -1544,7 +1890,10 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
             return
           }
           const textPatch = {
+            language: seed.language,
             content: result.content,
+            originalContent: undefined,
+            modifiedContent: undefined,
             gitBaseContent: dedupeGitBase(result.content, gitBaseContent),
             savedContent: result.content,
             isDirty: false,
@@ -1557,14 +1906,13 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
             loading: false,
             stale: false,
             hasLoadedSuccessfully: true as const,
+            snapshotSource: undefined,
+            transient: undefined,
           }
-          setFileTabs((prev) =>
-            prev.map((tab) =>
-              tab.id === tabId ? { ...tab, ...textPatch } : tab
-            )
-          )
-          // Keep ref current for immediate warm-fail checks / concurrent paths.
-          patchFileTabRef(tabId, textPatch)
+          if (!commitPathReadyTab(tabId, textPatch)) {
+            settle({ ok: false, reason: "stale" })
+            return
+          }
           maybeMaximizeAfterSuccess(tabId)
           settle({ ok: true, tabId })
         } catch (error) {
@@ -1585,12 +1933,13 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
       return settlePromise
     },
     [
+      commitPathReadyTab,
       decideLoad,
+      currentSnapshotIncarnation,
       failOpenTab,
       fetchGitBase,
       finishOpenSettle,
       maybeMaximizeAfterSuccess,
-      patchFileTabRef,
       resolveOpenAbsolutePath,
       settleFetch,
       startOpenSettle,
@@ -2287,6 +2636,32 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
 
       const io = splitAbsPath(tab.path)
       if (!io) return false
+      const saveIncarnation = currentTabIncarnation(tabId)
+      const isCurrentSaveOwner = (): boolean =>
+        isTabIncarnationCurrent(tabId, saveIncarnation) &&
+        fileTabsRef.current.some(
+          (candidate) =>
+            candidate.id === tabId &&
+            candidate.kind === "file" &&
+            candidate.path === tab.path
+        )
+      const updateCurrentSaveOwner = (
+        update: (candidate: FileWorkspaceTab) => FileWorkspaceTab
+      ): boolean => {
+        if (!isCurrentSaveOwner()) return false
+        const updateTabs = (tabs: FileWorkspaceTab[]): FileWorkspaceTab[] =>
+          tabs.map((candidate) =>
+            candidate.id === tabId &&
+            candidate.kind === "file" &&
+            candidate.path === tab.path &&
+            isTabIncarnationCurrent(tabId, saveIncarnation)
+              ? update(candidate)
+              : candidate
+          )
+        fileTabsRef.current = updateTabs(fileTabsRef.current)
+        setFileTabs(updateTabs)
+        return true
+      }
 
       // Divergence guard (covers EVERY write path — manual save, 5s
       // autosave, blur/switch/close saves — because they all funnel here):
@@ -2304,10 +2679,12 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
       if ((tab.stale || unwatched) && !options?.force) {
         try {
           const latest = await readFileForEdit(io.rootPath, io.ioPath)
+          if (!isCurrentSaveOwner()) return false
           if ((latest.etag ?? null) !== (tab.etag ?? null)) {
             // Forced: the user just asked to save and the save is being
             // refused — the dialog must re-appear even if this divergence
             // was announced before and dismissed/compared.
+            if (!isCurrentSaveOwner()) return false
             enqueueExternalConflict(
               {
                 path: tab.path,
@@ -2320,16 +2697,15 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
             return false
           }
         } catch (error) {
+          if (!isCurrentSaveOwner()) return false
           // Disk unreadable (deleted/locked). Keep the dirty buffer and
           // fail the save visibly; the user decides via the error state.
           const message = toErrorMessage(error)
-          setFileTabs((prev) =>
-            prev.map((candidate) =>
-              candidate.id === tabId
-                ? { ...candidate, saveState: "error", saveError: message }
-                : candidate
-            )
-          )
+          updateCurrentSaveOwner((candidate) => ({
+            ...candidate,
+            saveState: "error",
+            saveError: message,
+          }))
           return false
         }
       }
@@ -2337,19 +2713,22 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
       const contentAtSaveStart = tab.content
       const expectedEtag = options?.force ? null : (tab.etag ?? null)
 
-      setFileTabs((prev) =>
-        prev.map((candidate) =>
-          candidate.id === tabId
-            ? {
-                ...candidate,
-                saveState: "saving",
-                saveError: null,
-              }
-            : candidate
-        )
-      )
+      if (!isCurrentSaveOwner()) return false
+      if (
+        !updateCurrentSaveOwner((candidate) => ({
+          ...candidate,
+          saveState: "saving",
+          saveError: null,
+        }))
+      ) {
+        return false
+      }
 
       try {
+        // Recheck after the state/ref transition and immediately before the
+        // write call. A synchronous close/replacement must not let an old
+        // save start against a new same-id tab.
+        if (!isCurrentSaveOwner()) return false
         const result = await withTimeout(
           saveFileContent(
             io.rootPath,
@@ -2360,17 +2739,15 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
           20_000,
           t("saveRequestTimedOut")
         )
+        if (!isCurrentSaveOwner()) return false
 
         // One-shot echo record: the watcher will see this write as a
         // change event; suppress that single event for this path.
+        if (!isCurrentSaveOwner()) return false
         recordSelfWriteEcho(tab.path, result.etag)
 
-        setFileTabs((prev) =>
-          prev.map((candidate) => {
-            if (candidate.id !== tabId || candidate.kind !== "file") {
-              return candidate
-            }
-
+        if (
+          !updateCurrentSaveOwner((candidate) => {
             const savedContent = contentAtSaveStart
             return {
               ...candidate,
@@ -2387,26 +2764,29 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
               saveError: null,
             }
           })
-        )
+        ) {
+          return false
+        }
 
         return true
       } catch (error) {
+        if (!isCurrentSaveOwner()) return false
         const message = toErrorMessage(error)
-        setFileTabs((prev) =>
-          prev.map((candidate) =>
-            candidate.id === tabId
-              ? {
-                  ...candidate,
-                  saveState: "error",
-                  saveError: message,
-                }
-              : candidate
-          )
-        )
+        updateCurrentSaveOwner((candidate) => ({
+          ...candidate,
+          saveState: "error",
+          saveError: message,
+        }))
         return false
       }
     },
-    [enqueueExternalConflict, recordSelfWriteEcho, t]
+    [
+      currentTabIncarnation,
+      enqueueExternalConflict,
+      isTabIncarnationCurrent,
+      recordSelfWriteEcho,
+      t,
+    ]
   )
 
   useEffect(() => {
@@ -2445,14 +2825,19 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
       const tab = fileTabsRef.current.find(
         (candidate) => candidate.id === tabId
       )
-      if (!tab || tab.kind !== "file" || !tab.path) return
+      if (!tab || tab.kind !== "file" || !tab.path || tab.snapshotSource) {
+        return
+      }
+      const snapshotIncarnation = currentSnapshotIncarnation(tabId)
       const tabPath = tab.path
       const io = splitAbsPath(tabPath)
       if (!io) return
 
       setFileTabs((prev) =>
         prev.map((candidate) =>
-          candidate.id === tabId
+          candidate.id === tabId &&
+          !candidate.snapshotSource &&
+          isSnapshotIncarnationCurrent(tabId, snapshotIncarnation)
             ? {
                 ...candidate,
                 loading: true,
@@ -2472,9 +2857,12 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
           15_000,
           t("reloadRequestTimedOut")
         )
+        if (!isSnapshotIncarnationCurrent(tabId, snapshotIncarnation)) return
         setFileTabs((prev) =>
           prev.map((candidate) =>
-            candidate.id === tabId
+            candidate.id === tabId &&
+            !candidate.snapshotSource &&
+            isSnapshotIncarnationCurrent(tabId, snapshotIncarnation)
               ? {
                   ...candidate,
                   content: result.content,
@@ -2497,10 +2885,13 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
           )
         )
       } catch (error) {
+        if (!isSnapshotIncarnationCurrent(tabId, snapshotIncarnation)) return
         const message = toErrorMessage(error)
         setFileTabs((prev) =>
           prev.map((candidate) =>
-            candidate.id === tabId
+            candidate.id === tabId &&
+            !candidate.snapshotSource &&
+            isSnapshotIncarnationCurrent(tabId, snapshotIncarnation)
               ? {
                   ...candidate,
                   loading: false,
@@ -2512,7 +2903,7 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
         )
       }
     },
-    [fetchGitBase, t]
+    [currentSnapshotIncarnation, fetchGitBase, isSnapshotIncarnationCurrent, t]
   )
 
   const reloadActiveFile = useCallback(async () => {
@@ -2536,6 +2927,11 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
 
   const closeFileTabNow = useCallback(
     (tabId: string) => {
+      if (!fileTabsRef.current.some((tab) => tab.id === tabId)) return
+      bumpTabIncarnation(tabId)
+      fileTabsRef.current = fileTabsRef.current.filter(
+        (candidate) => candidate.id !== tabId
+      )
       setFileTabs((prev) => {
         const idx = prev.findIndex((tab) => tab.id === tabId)
         if (idx < 0) return prev
@@ -2571,7 +2967,12 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
         return next
       })
     },
-    [activateConversationPane, activateFilePane, finishOpenSettleClosed]
+    [
+      activateConversationPane,
+      activateFilePane,
+      bumpTabIncarnation,
+      finishOpenSettleClosed,
+    ]
   )
 
   const closeFileTab = useCallback(
@@ -2595,6 +2996,16 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
 
   const closeOtherFileTabsNow = useCallback(
     (tabId: string) => {
+      if (!fileTabsRef.current.some((tab) => tab.id === tabId)) return
+      const closingIds = fileTabsRef.current
+        .filter((tab) => tab.id !== tabId)
+        .map((tab) => tab.id)
+      for (const closingId of closingIds) {
+        bumpTabIncarnation(closingId)
+      }
+      fileTabsRef.current = fileTabsRef.current.filter(
+        (tab) => tab.id === tabId
+      )
       setFileTabs((prev) => {
         const remaining = prev.filter((tab) => tab.id === tabId)
         if (remaining.length === 0) return prev
@@ -2611,7 +3022,7 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
         return remaining
       })
     },
-    [activateFilePane, finishOpenSettleClosed]
+    [activateFilePane, bumpTabIncarnation, finishOpenSettleClosed]
   )
 
   const closeOtherFileTabs = useCallback(
@@ -2635,6 +3046,10 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
   )
 
   const closeAllFileTabsNow = useCallback(() => {
+    for (const tab of fileTabsRef.current) {
+      bumpTabIncarnation(tab.id)
+    }
+    fileTabsRef.current = []
     setFileTabs((prev) => {
       for (const tab of prev) {
         finishOpenSettleClosed(tab.id)
@@ -2648,7 +3063,7 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
       activateConversationPane()
       return []
     })
-  }, [activateConversationPane, finishOpenSettleClosed])
+  }, [activateConversationPane, bumpTabIncarnation, finishOpenSettleClosed])
 
   /**
    * Close exactly the snapshotted ids (used after dirty-close confirm).
@@ -2659,6 +3074,16 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
     (ids: readonly string[], preferredActiveId?: string | null) => {
       const idSet = new Set(ids)
       if (idSet.size === 0) return
+      const closingIds = fileTabsRef.current
+        .filter((tab) => idSet.has(tab.id))
+        .map((tab) => tab.id)
+      if (closingIds.length === 0) return
+      for (const closingId of closingIds) {
+        bumpTabIncarnation(closingId)
+      }
+      fileTabsRef.current = fileTabsRef.current.filter(
+        (tab) => !idSet.has(tab.id)
+      )
       setFileTabs((prev) => {
         const closing = prev.filter((tab) => idSet.has(tab.id))
         if (closing.length === 0) return prev
@@ -2696,7 +3121,12 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
         return next
       })
     },
-    [activateConversationPane, activateFilePane, finishOpenSettleClosed]
+    [
+      activateConversationPane,
+      activateFilePane,
+      bumpTabIncarnation,
+      finishOpenSettleClosed,
+    ]
   )
 
   const closeAllFileTabs = useCallback(() => {
@@ -2770,6 +3200,7 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
           !tab.loading &&
           tab.saveState !== "saving" &&
           tab.content.length > 0 &&
+          !tab.snapshotSource &&
           tab.transient?.type !== "translation"
       )
       .map((tab) => ({
@@ -2790,13 +3221,28 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
       HIDDEN_TAB_CONTENT_BUDGET_CHARS
     )
     if (toUnload.size === 0) return
+    const snapshotIncarnations = new Map(
+      [...toUnload].map((tabId) => [tabId, currentSnapshotIncarnation(tabId)])
+    )
 
     setFileTabs((prev) =>
       prev.map((tab) => {
         if (!toUnload.has(tab.id) || tab.kind !== "file") return tab
+        const snapshotIncarnation = snapshotIncarnations.get(tab.id)
+        if (
+          snapshotIncarnation === undefined ||
+          !isSnapshotIncarnationCurrent(tab.id, snapshotIncarnation)
+        ) {
+          return tab
+        }
         // Atomic re-check: a keystroke/save enqueued in the same batch
         // must win over the eviction.
-        if (tab.isDirty || tab.loading || tab.saveState === "saving") {
+        if (
+          tab.snapshotSource ||
+          tab.isDirty ||
+          tab.loading ||
+          tab.saveState === "saving"
+        ) {
           return tab
         }
         return {
@@ -2808,7 +3254,12 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
         }
       })
     )
-  }, [fileTabs, activeFileTabId])
+  }, [
+    fileTabs,
+    activeFileTabId,
+    currentSnapshotIncarnation,
+    isSnapshotIncarnationCurrent,
+  ])
 
   // Once the active tab is clean and settled (e.g. the user reloaded, or a
   // successful save resolved the divergence), any conflict recorded for
@@ -2838,6 +3289,7 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
   useOpenFileTabsWatch({
     fileTabs,
     fileTabsRef,
+    snapshotIncarnationByTabIdRef,
     activeFileTabIdRef,
     activeFileTab,
     allFolders,
@@ -2982,6 +3434,7 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
       closeAllFileTabs,
       reorderFileTabs,
       openFilePreview,
+      openResolvedImagePreview,
       reloadOpenFileBackground,
       applyExternalReload,
       markTabsStale,
@@ -3012,6 +3465,7 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
       closeAllFileTabs,
       reorderFileTabs,
       openFilePreview,
+      openResolvedImagePreview,
       reloadOpenFileBackground,
       applyExternalReload,
       markTabsStale,

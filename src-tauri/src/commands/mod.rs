@@ -6,6 +6,7 @@ pub mod background;
 pub mod backup;
 pub mod chat_authoring;
 pub mod chat_channel;
+pub(crate) mod confined_file;
 pub mod conversation_experience;
 #[cfg(feature = "tauri-runtime")]
 pub mod conversation_popout;
@@ -22,6 +23,7 @@ pub mod file_io;
 pub mod folder_commands;
 pub mod folder_links;
 pub mod folders;
+pub mod grok_session_image;
 pub mod history_window;
 pub mod logging;
 pub mod mcp;

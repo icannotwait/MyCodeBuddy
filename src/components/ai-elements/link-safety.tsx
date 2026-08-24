@@ -1,18 +1,31 @@
 "use client"
 
 import type { ReactNode } from "react"
-import { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react"
 import { useTranslations } from "next-intl"
+import { resolveGrokSessionImage } from "@/lib/api"
 import { openUrl } from "@/lib/platform"
 import { getActiveRemoteConnectionId, isDesktop } from "@/lib/transport"
-import { toErrorMessage } from "@/lib/app-error"
+import { extractAppCommandError, toErrorMessage } from "@/lib/app-error"
 import type { LinkSafetyConfig, LinkSafetyModalProps } from "streamdown"
 import { toast } from "sonner"
 import { useActiveFolder } from "@/contexts/active-folder-context"
 import { useWorkspaceActions } from "@/contexts/workspace-context"
+import { useGrokSessionImageScope } from "@/components/ai-elements/grok-session-image-context"
 import { isHomeRelativePath } from "@/lib/file-open-target"
 import { isAbsoluteFilePath } from "@/lib/file-path-display"
 import { isLocalPathLike } from "@/lib/markdown/local-path-links"
+import {
+  GROK_SESSION_IMAGE_MIME_BY_EXTENSION,
+  parseGrokSessionImageRef,
+} from "@/lib/markdown/grok-session-image"
 import { cn } from "@/lib/utils"
 
 export interface LocalFileTarget {
@@ -32,6 +45,8 @@ const ALLOWED_EXTERNAL_PROTOCOLS = new Set([
 // page load. They must NOT be opened via `window.open(_, "_blank")` — most
 // browsers leave behind an empty `about:blank` tab once the OS handler fires.
 const OS_HANDLER_PROTOCOLS = new Set(["mailto:", "tel:"])
+const useIsomorphicLayoutEffect =
+  typeof window !== "undefined" ? useLayoutEffect : useEffect
 
 function normalizeSlashPath(path: string): string {
   return path.replace(/\\/g, "/")
@@ -340,12 +355,109 @@ function DirectLinkOpen({
  */
 export function useOpenLinkOrFile() {
   const t = useTranslations("Folder.chat.linkSafety")
+  const workspaceT = useTranslations("Folder.workspaceContext")
   const { activeFolder: folder } = useActiveFolder()
   const folderPath = folder?.path
-  const { openFilePreview } = useWorkspaceActions()
+  const grokScope = useGrokSessionImageScope()
+  const grokConversationId = grokScope?.conversationId ?? null
+  const { openFilePreview, openResolvedImagePreview } = useWorkspaceActions()
+  const resolveImage = resolveGrokSessionImage
+  const grokInflightRef = useRef(new Map<string, Promise<void>>())
+  const mountedRef = useRef(true)
+  const currentConversationIdRef = useRef<number | null>(grokConversationId)
+  const scopeEpochRef = useRef(0)
+
+  useIsomorphicLayoutEffect(() => {
+    if (currentConversationIdRef.current !== grokConversationId) {
+      currentConversationIdRef.current = grokConversationId
+      scopeEpochRef.current += 1
+      grokInflightRef.current.clear()
+    }
+  }, [grokConversationId])
+
+  useIsomorphicLayoutEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+      scopeEpochRef.current += 1
+      grokInflightRef.current.clear()
+    }
+  }, [])
 
   return useCallback(
     async (url: string) => {
+      const grokRef =
+        grokConversationId !== null ? parseGrokSessionImageRef(url) : null
+      if (grokConversationId !== null && grokRef) {
+        const conversationId = grokConversationId
+        const scopeEpoch = scopeEpochRef.current
+        const inflightKey = `${scopeEpoch}\0${conversationId}\0${grokRef.path}`
+        const existing = grokInflightRef.current.get(inflightKey)
+        if (existing) return existing
+
+        const isCurrent = () =>
+          mountedRef.current &&
+          currentConversationIdRef.current === conversationId &&
+          scopeEpochRef.current === scopeEpoch
+        const task = (async (): Promise<void> => {
+          try {
+            const resolution = await resolveImage({
+              conversationId,
+              href: url,
+              includeData: true,
+            })
+            if (!isCurrent()) return
+            if (
+              !resolution ||
+              typeof resolution !== "object" ||
+              typeof resolution.path !== "string" ||
+              !isAbsoluteFilePath(resolution.path) ||
+              (resolution.origin !== "session" &&
+                resolution.origin !== "workspace") ||
+              resolution.mimeType !==
+                GROK_SESSION_IMAGE_MIME_BY_EXTENSION[grokRef.extension] ||
+              typeof resolution.dataBase64 !== "string" ||
+              resolution.dataBase64.trim().length === 0
+            ) {
+              throw new Error("Resolved image response was malformed")
+            }
+            const opened = openResolvedImagePreview({
+              path: resolution.path,
+              mimeType: resolution.mimeType,
+              dataBase64: resolution.dataBase64,
+              source: {
+                type: "grok-session-image",
+                conversationId,
+                href: grokRef.path,
+              },
+            })
+            if (!opened.ok) {
+              throw new Error("Resolved image preview rejected the response")
+            }
+          } catch (error) {
+            if (!isCurrent()) return
+            if (extractAppCommandError(error)?.code === "not_found") {
+              toast.error(
+                workspaceT("unableOpenFile", { name: grokRef.filename })
+              )
+            } else {
+              toast.error(t("errorFailedOpen"), {
+                description: toErrorMessage(error),
+              })
+            }
+          }
+        })()
+        grokInflightRef.current.set(inflightKey, task)
+        try {
+          await task
+        } finally {
+          if (grokInflightRef.current.get(inflightKey) === task) {
+            grokInflightRef.current.delete(inflightKey)
+          }
+        }
+        return
+      }
+
       const localTarget = parseLocalFileTarget(url)
       if (localTarget) {
         // Absolute and ~ paths open with no folder context (works in chat
@@ -398,7 +510,15 @@ export function useOpenLinkOrFile() {
         })
       }
     },
-    [folderPath, openFilePreview, t]
+    [
+      folderPath,
+      grokConversationId,
+      openFilePreview,
+      openResolvedImagePreview,
+      resolveImage,
+      t,
+      workspaceT,
+    ]
   )
 }
 

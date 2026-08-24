@@ -373,7 +373,7 @@ fn resolve_root_slot(slot: &RootSlot, runtime_env: &BTreeMap<String, String>) ->
 ///
 /// `None` when the child's home cannot be named as an absolute path, in which
 /// case the caller refuses the slot rather than guessing at a root.
-fn child_home_dir(runtime_env: &BTreeMap<String, String>) -> Option<PathBuf> {
+pub(crate) fn child_home_dir(runtime_env: &BTreeMap<String, String>) -> Option<PathBuf> {
     // `dirs::home_dir()` ignores `$HOME` on Windows, where the home var the
     // agents actually read is `USERPROFILE`.
     #[cfg(windows)]
@@ -462,7 +462,7 @@ fn child_home_dir(runtime_env: &BTreeMap<String, String>) -> Option<PathBuf> {
 /// them), while the rest take the raw `OsString` and only reject an empty one.
 /// Inherited values go through `var_os` so a non-UTF-8 path is not silently
 /// dropped.
-fn child_env_value(
+pub(crate) fn child_env_value(
     runtime_env: &BTreeMap<String, String>,
     key: &str,
     trims: bool,

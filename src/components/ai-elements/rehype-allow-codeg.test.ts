@@ -16,11 +16,30 @@ function hrefProtocols(plugin: unknown): string[] | undefined {
 type HastNode = {
   type?: string
   tagName?: string
-  properties?: { href?: string; title?: string; class?: string }
+  properties?: {
+    href?: string
+    src?: string
+    alt?: string
+    title?: string
+    class?: string
+    [key: string]: unknown
+  }
   children?: HastNode[]
 }
 
-function runHardenPlugin(plugin: unknown, href: string): HastNode {
+function hardenEntry(plugins: unknown[]): unknown {
+  const hardenIndex = Object.keys(defaultRehypePlugins).indexOf("harden")
+  expect(hardenIndex).toBeGreaterThanOrEqual(0)
+  return plugins[hardenIndex]
+}
+
+function serializedTupleOptions(plugin: unknown): string | null {
+  if (!Array.isArray(plugin) || plugin.length < 2) return null
+  const serialized = JSON.stringify(plugin[1])
+  return typeof serialized === "string" ? serialized : null
+}
+
+function runHardenTree(plugin: unknown, children: HastNode[]): HastNode {
   const factory =
     typeof plugin === "function"
       ? plugin
@@ -33,17 +52,20 @@ function runHardenPlugin(plugin: unknown, href: string): HastNode {
   const transform = factory()
   const tree: HastNode = {
     type: "root",
-    children: [
-      {
-        type: "element",
-        tagName: "a",
-        properties: { href },
-        children: [{ type: "text", value: "x" } as HastNode],
-      },
-    ],
+    children,
   }
   transform(tree)
-  return tree.children![0]!
+  return tree
+}
+
+function runHardenElement(plugin: unknown, element: HastNode): HastNode {
+  return runHardenTree(plugin, [
+    {
+      type: "element",
+      children: [],
+      ...element,
+    },
+  ]).children![0]!
 }
 
 describe("rehypePluginsAllowingCodeg", () => {
@@ -73,6 +95,26 @@ describe("rehypePluginsAllowingCodeg", () => {
     })
   })
 
+  it("gives Streamdown distinct serializable harden cache descriptors", () => {
+    const ordinary = hardenEntry(
+      rehypePluginsAllowingCodeg(defaultRehypePlugins)
+    )
+    const grokImages = hardenEntry(
+      rehypePluginsAllowingCodeg(defaultRehypePlugins, {
+        grokSessionImages: true,
+      })
+    )
+    const ordinaryOptions = serializedTupleOptions(ordinary)
+    const grokImageOptions = serializedTupleOptions(grokImages)
+
+    // Streamdown 2.2 appends JSON.stringify(tupleOptions) to its processor
+    // cache key. These descriptors must stay distinct even if a production
+    // minifier erases both plugin function names.
+    expect(ordinaryOptions).not.toBeNull()
+    expect(grokImageOptions).not.toBeNull()
+    expect(grokImageOptions).not.toBe(ordinaryOptions)
+  })
+
   it("clones rather than mutating the shipped sanitize schema", () => {
     // The shipped default must not already contain codeg, else the fix is moot.
     expect(hrefProtocols(defaultRehypePlugins.sanitize)).not.toContain("codeg")
@@ -89,25 +131,127 @@ describe("rehypePluginsAllowingCodeg", () => {
     "/repo/src/a.ts",
     "/D:/repo/a.ts",
   ])("preserves local path href through harden: %s", (href) => {
-    const keys = Object.keys(defaultRehypePlugins)
-    const hardenIndex = keys.indexOf("harden")
-    expect(hardenIndex).toBeGreaterThanOrEqual(0)
-    const wrapped =
-      rehypePluginsAllowingCodeg(defaultRehypePlugins)[hardenIndex]
-    const node = runHardenPlugin(wrapped, href)
+    const wrapped = hardenEntry(
+      rehypePluginsAllowingCodeg(defaultRehypePlugins)
+    )
+    const node = runHardenElement(wrapped, {
+      tagName: "a",
+      properties: { href },
+      children: [{ type: "text", value: "x" } as HastNode],
+    })
     expect(node.tagName).toBe("a")
     expect(node.properties?.href).toBe(href)
   })
 
   it("still hardens non-local hrefs (does not preserve https rewrite)", () => {
-    const keys = Object.keys(defaultRehypePlugins)
-    const hardenIndex = keys.indexOf("harden")
-    const wrapped =
-      rehypePluginsAllowingCodeg(defaultRehypePlugins)[hardenIndex]
+    const wrapped = hardenEntry(
+      rehypePluginsAllowingCodeg(defaultRehypePlugins)
+    )
     // Default streamdown harden allows * prefixes; https survives.
-    const node = runHardenPlugin(wrapped, "https://example.com/docs")
+    const node = runHardenElement(wrapped, {
+      tagName: "a",
+      properties: { href: "https://example.com/docs" },
+      children: [{ type: "text", value: "x" } as HastNode],
+    })
     expect(node.tagName).toBe("a")
     expect(node.properties?.href).toMatch(/^https:\/\/example\.com/)
+  })
+
+  it("default options still let harden block a local image", () => {
+    const harden = hardenEntry(rehypePluginsAllowingCodeg(defaultRehypePlugins))
+    const node = runHardenElement(harden, {
+      tagName: "img",
+      properties: { src: "images/2.png", alt: "x" },
+    })
+    expect(node.tagName).not.toBe("codeg-grok-session-image")
+    expect(JSON.stringify(node)).toContain("blocked")
+  })
+
+  it("opt-in preserves and retags exactly a valid Grok image", () => {
+    const harden = hardenEntry(
+      rehypePluginsAllowingCodeg(defaultRehypePlugins, {
+        grokSessionImages: true,
+      })
+    )
+    const node = runHardenElement(harden, {
+      tagName: "img",
+      properties: {
+        src: "images/2.png",
+        alt: "x",
+        title: "drop",
+        onerror: "drop",
+        "data-model": "drop",
+      },
+    })
+    expect(node).toMatchObject({
+      tagName: "codeg-grok-session-image",
+      properties: { src: "images/2.png", alt: "x" },
+    })
+    expect(Object.keys(node.properties ?? {}).sort()).toEqual(["alt", "src"])
+  })
+
+  it.each([
+    "docs/foo.png",
+    "images/a/b.png",
+    "file:///tmp/a.png",
+    "images/a.svg",
+    "images/%ZZ.png",
+  ])("does not preserve a non-matching image: %s", (src) => {
+    const harden = hardenEntry(
+      rehypePluginsAllowingCodeg(defaultRehypePlugins, {
+        grokSessionImages: true,
+      })
+    )
+    const node = runHardenElement(harden, {
+      tagName: "img",
+      properties: { src, alt: "x" },
+    })
+    expect(node.tagName).not.toBe("codeg-grok-session-image")
+  })
+
+  it("keeps https images on the ordinary img tag under opt-in", () => {
+    const harden = hardenEntry(
+      rehypePluginsAllowingCodeg(defaultRehypePlugins, {
+        grokSessionImages: true,
+      })
+    )
+    const node = runHardenElement(harden, {
+      tagName: "img",
+      properties: { src: "https://example.com/a.png", alt: "remote" },
+    })
+    expect(node.tagName).toBe("img")
+    expect(node.properties?.src).toBe("https://example.com/a.png")
+  })
+
+  it("restores a local anchor and valid image independently in one tree", () => {
+    const harden = hardenEntry(
+      rehypePluginsAllowingCodeg(defaultRehypePlugins, {
+        grokSessionImages: true,
+      })
+    )
+    const tree = runHardenTree(harden, [
+      {
+        type: "element",
+        tagName: "a",
+        properties: { href: "docs/a.md" },
+        children: [{ type: "text", value: "doc" } as HastNode],
+      },
+      {
+        type: "element",
+        tagName: "img",
+        properties: { src: "images/2.png", alt: "x" },
+        children: [],
+      },
+    ])
+
+    expect(tree.children?.[0]).toMatchObject({
+      tagName: "a",
+      properties: { href: "docs/a.md" },
+    })
+    expect(tree.children?.[1]).toMatchObject({
+      tagName: "codeg-grok-session-image",
+      properties: { src: "images/2.png", alt: "x" },
+    })
   })
 })
 

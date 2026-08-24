@@ -525,6 +525,38 @@ async fn persisted_external_and_ephemeral_connect_retries_reuse_the_same_lease()
 }
 
 #[tokio::test]
+async fn conversation_attach_after_session_id_is_persisted_reuses_the_live_root() {
+    let fixture = shared_http_fixture_with_pending_bootstrap().await;
+    let first = fixture
+        .post_connect("device-a", "client-a", "request-a")
+        .await
+        .assert_status_ok()
+        .json::<AcpConnectOrAttachResponse>();
+
+    codeg_lib::db::service::conversation_service::update_external_id(
+        &fixture.state.db.conn,
+        fixture.conversation_id,
+        "bound-session-id".into(),
+    )
+    .await
+    .expect("persist conversation external id");
+
+    let mut body = fixture.connect_json("device-b", "client-b", "request-b");
+    body["externalSessionId"] = json!("bound-session-id");
+    let second = fixture
+        .post_json("/acp_connect_or_attach", body)
+        .await
+        .assert_status_ok()
+        .json::<AcpConnectOrAttachResponse>();
+
+    assert_eq!(first.connection_id, second.connection_id);
+    assert_eq!(first.generation, second.generation);
+    assert_ne!(first.lease_id, second.lease_id);
+    assert_eq!(second.disposition, SharedDisposition::Attached);
+    assert_eq!(fixture.spawn_count(), 1);
+}
+
+#[tokio::test]
 async fn invalid_identity_fields_reject_before_reservation_or_spawn() {
     let fixture = shared_http_fixture_with_pending_bootstrap().await;
     let mut wrong_agent = fixture.connect_json("device", "client", "wrong-agent");

@@ -227,6 +227,12 @@ export interface ConversationRuntimeSession {
 
   // Temporary state
   optimisticTurns: MessageTurn[]
+  /**
+   * Optimistic user-turn ids that are queued locally and not yet on the wire.
+   * They stay visible in the timeline but must not flip `awaiting_persist` or
+   * be promoted by `COMPLETE_TURN` of a different in-flight prompt.
+   */
+  queuedOptimisticTurnIds?: string[]
   liveMessage: LiveMessage | null
 
   // Sync
@@ -557,6 +563,7 @@ type Action =
       conversationId: number
       turn: MessageTurn
       turnToken: string
+      queuePending?: boolean
     }
   | {
       // Roll back an optimistic user turn that never reached the backend
@@ -698,6 +705,7 @@ function createEmptySession(
     backgroundTurns: [],
     pendingBackgroundSettlements: [],
     optimisticTurns: [],
+    queuedOptimisticTurnIds: [],
     liveMessage: null,
     syncState: "idle",
     activeTurnToken: null,
@@ -2204,7 +2212,10 @@ function reducer(
           ? { localTurns: nextLocalTurns }
           : {
               localTurns: nextLocalTurns,
-              optimisticTurns: [],
+              optimisticTurns: (current.optimisticTurns ?? []).filter((turn) =>
+                (current.queuedOptimisticTurnIds ?? []).includes(turn.id)
+              ),
+              queuedOptimisticTurnIds: current.queuedOptimisticTurnIds ?? [],
               liveMessage: null,
             }),
       }
@@ -2442,9 +2453,16 @@ function reducer(
           ? stampGenerationOnAssistantTurns(streamingTurns, usageSnap)
           : streamingTurns
 
+      const queuedIds = new Set(current.queuedOptimisticTurnIds ?? [])
+      const inFlightOptimistic = current.optimisticTurns.filter(
+        (turn) => !queuedIds.has(turn.id)
+      )
+      const queuedOptimistic = current.optimisticTurns.filter((turn) =>
+        queuedIds.has(turn.id)
+      )
       const promotedRaw = [
         ...current.localTurns,
-        ...current.optimisticTurns,
+        ...inFlightOptimistic,
         ...stampedStreaming,
       ]
       const promotedLastIndexById = new Map<string, number>()
@@ -2487,7 +2505,8 @@ function reducer(
       return updateSessionInState(state, action.conversationId, () => ({
         ...current,
         localTurns: retireCoveredLocalTurns(promoted, current.detail),
-        optimisticTurns: [],
+        optimisticTurns: queuedOptimistic,
+        queuedOptimisticTurnIds: queuedOptimistic.map((turn) => turn.id),
         liveMessage: null,
         syncState: "idle",
         activeTurnToken: null,
@@ -2614,10 +2633,39 @@ function reducer(
       // reconciliation (coordinator timers are stopped by the action layer).
       // Explicit exit: clear soft fence + owner_preserve + pending.
       return updateSessionInState(state, action.conversationId, (current) => {
+        const existingIds = new Set(current.optimisticTurns.map((t) => t.id))
+        const alreadyPresent = existingIds.has(action.turn.id)
+        const queuedIds = new Set(current.queuedOptimisticTurnIds ?? [])
+        if (action.queuePending) {
+          queuedIds.add(action.turn.id)
+          const optimisticTurns = alreadyPresent
+            ? current.optimisticTurns
+            : [...current.optimisticTurns, action.turn]
+          const inFlightId =
+            current.activeTurnToken === action.turn.id
+              ? null
+              : current.activeTurnToken
+          const hasInFlight =
+            inFlightId != null &&
+            optimisticTurns.some(
+              (turn) => turn.id === inFlightId && !queuedIds.has(turn.id)
+            )
+          return {
+            ...current,
+            optimisticTurns,
+            queuedOptimisticTurnIds: [...queuedIds],
+            activeTurnToken: hasInFlight ? inFlightId : null,
+            syncState: hasInFlight ? current.syncState : "idle",
+          }
+        }
+        queuedIds.delete(action.turn.id)
         const capture = batchStartCapture(current, action.turn.id)
         return {
           ...current,
-          optimisticTurns: [...current.optimisticTurns, action.turn],
+          optimisticTurns: alreadyPresent
+            ? current.optimisticTurns
+            : [...current.optimisticTurns, action.turn],
+          queuedOptimisticTurnIds: [...queuedIds],
           syncState: "awaiting_persist",
           activeTurnToken: action.turnToken,
           historyAssistantBaseline: capture.baseline,
@@ -2635,16 +2683,32 @@ function reducer(
       const remaining = current.optimisticTurns.filter(
         (t) => t.id !== action.id
       )
+      const remainingQueued = (current.queuedOptimisticTurnIds ?? []).filter(
+        (id) => id !== action.id
+      )
       // Not found → no-op (avoid a needless re-render / identity change).
-      if (remaining.length === current.optimisticTurns.length) return state
+      if (
+        remaining.length === current.optimisticTurns.length &&
+        remainingQueued.length ===
+          (current.queuedOptimisticTurnIds ?? []).length
+      ) {
+        return state
+      }
+      const inFlightRemaining = remaining.some(
+        (turn) =>
+          turn.id === current.activeTurnToken &&
+          !remainingQueued.includes(turn.id)
+      )
       return updateSessionInState(state, action.conversationId, (s) => ({
         ...s,
         optimisticTurns: remaining,
+        queuedOptimisticTurnIds: remainingQueued,
+        activeTurnToken: inFlightRemaining ? s.activeTurnToken : null,
         // Drop back to idle once the last in-flight optimistic turn is rolled
         // back, so the `awaiting_persist` set on append doesn't linger and
         // suppress the next detail reconciliation. Concurrent optimistic turns
         // (if any) keep us awaiting_persist.
-        syncState: remaining.length === 0 ? "idle" : s.syncState,
+        syncState: inFlightRemaining ? s.syncState : "idle",
       }))
     }
 
@@ -2911,6 +2975,10 @@ function reducer(
         detailHistoryLoadingOlder: false,
         localTurns: [...from.localTurns, ...to.localTurns],
         optimisticTurns: [...from.optimisticTurns, ...to.optimisticTurns],
+        queuedOptimisticTurnIds: [
+          ...(from.queuedOptimisticTurnIds ?? []),
+          ...(to.queuedOptimisticTurnIds ?? []),
+        ],
         liveMessage: mergedLiveMessage,
         syncState: to.syncState !== "idle" ? to.syncState : from.syncState,
         activeTurnToken: to.activeTurnToken ?? from.activeTurnToken,
@@ -3396,7 +3464,8 @@ export interface RuntimeActions {
   appendOptimisticTurn: (
     conversationId: number,
     turn: MessageTurn,
-    turnToken: string
+    turnToken: string,
+    options?: { queuePending?: boolean }
   ) => void
   removeOptimisticTurn: (conversationId: number, id: string) => void
   appendViewerUserTurn: (conversationId: number, turn: MessageTurn) => void
@@ -5760,16 +5829,20 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
       dispatch({ type: "COMPLETE_TURN", conversationId, liveMessage })
       persistTurnGenerationFromSession(conversationId, sessionBefore)
     },
-    appendOptimisticTurn: (conversationId, turn, turnToken) => {
+    appendOptimisticTurn: (conversationId, turn, turnToken, options) => {
       // New prompt: cancel coordinator timers + soft fence + bump generation.
-      stopCancelReconcileTimers(conversationId)
-      stopSoftFenceTimer(conversationId)
-      bumpCancelGeneration(conversationId)
+      // Parking a queued/bounced turn is not a new prompt — keep cancel state.
+      if (!options?.queuePending) {
+        stopCancelReconcileTimers(conversationId)
+        stopSoftFenceTimer(conversationId)
+        bumpCancelGeneration(conversationId)
+      }
       dispatch({
         type: "APPEND_OPTIMISTIC_TURN",
         conversationId,
         turn,
         turnToken,
+        queuePending: options?.queuePending,
       })
     },
     removeOptimisticTurn: (conversationId, id) =>

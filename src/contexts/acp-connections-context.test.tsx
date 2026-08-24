@@ -1,5 +1,5 @@
-import { useEffect } from "react"
-import { act, render, waitFor } from "@testing-library/react"
+import { useEffect, type ReactNode } from "react"
+import { act, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import {
   AcpConnectionsProvider,
@@ -22,6 +22,7 @@ import type {
 import { parsePermissionToolCall } from "@/lib/permission-request"
 import { subscribeDesktopAcpEvents } from "@/lib/transport/desktop-acp-events"
 import { saveConfigPreference } from "@/lib/selector-prefs-storage"
+import { useConnection } from "@/hooks/use-connection"
 import {
   resetAppWorkspaceStore,
   useAppWorkspaceStore,
@@ -262,10 +263,28 @@ function Probe() {
   return null
 }
 
-async function mountProvider() {
+function ConnectionProjectionProbe({ contextKey }: { contextKey: string }) {
+  const connection = useConnection(contextKey)
+  const queue =
+    connection.sharedSession?.queue
+      .map(
+        (item) =>
+          `${item.queueItemId}:${item.state}:${item.errorCode ?? "none"}`
+      )
+      .join(",") ?? "none"
+  const failures = connection.sessionFailures
+    .map((failure) => `${failure.id}:${failure.title}`)
+    .join(",")
+  return (
+    <output data-testid="connection-projection">{`${queue}|${failures}`}</output>
+  )
+}
+
+async function mountProvider(children?: ReactNode) {
   const view = render(
     <AcpConnectionsProvider>
       <Probe />
+      {children}
     </AcpConnectionsProvider>
   )
   await act(async () => {})
@@ -308,6 +327,125 @@ describe("AcpConnectionsProvider shared server roots", () => {
       generation: 1,
       leaseId: "lease-1",
     })
+  })
+
+  it("notifies useConnection for queue and queue-failure projections", async () => {
+    h.isDesktop = false
+    await mountProvider(<ConnectionProjectionProbe contextKey={TAB} />)
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/work", "sess", 42)
+    })
+
+    const handlers = latestAttachHandlers()
+    emitAcpEvent(handlers, {
+      seq: 1,
+      connection_id: "conn",
+      type: "prompt_queued",
+      generation: 1,
+      item: {
+        queue_item_id: "queue-1",
+        enqueue_seq: 1,
+        client_message_id: "message-1",
+        visible_text: "keep visible",
+        visible_text_truncated: false,
+        attachment_count: 0,
+        submitted_at: "2026-01-01T00:00:00.000Z",
+        state: "queued",
+      },
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("connection-projection")).toHaveTextContent(
+        "queue-1:queued:none"
+      )
+    })
+
+    emitAcpEvent(handlers, {
+      seq: 2,
+      connection_id: "conn",
+      type: "prompt_queue_item_failed",
+      generation: 1,
+      queue_item_id: "queue-1",
+      error_code: "prompt_hydration_failed",
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("connection-projection")).toHaveTextContent(
+        "queue-1:failed:prompt_hydration_failed"
+      )
+    })
+  })
+
+  it("notifies useConnection for a session-failure projection", async () => {
+    h.isDesktop = false
+    await mountProvider(<ConnectionProjectionProbe contextKey={TAB} />)
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/work", "sess", 42)
+    })
+
+    emitAcpEvent(latestAttachHandlers(), {
+      seq: 1,
+      connection_id: "conn",
+      type: "session_failure",
+      record: {
+        id: "failure-1",
+        revision: 1,
+        category: "connection",
+        severity: "error",
+        title: "Connection dropped",
+        actions: ["new_session"],
+      },
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("connection-projection")).toHaveTextContent(
+        "failure-1:Connection dropped"
+      )
+    })
+  })
+
+  it("locally dismisses a failed shared prompt without backend cancellation", async () => {
+    h.isDesktop = false
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/work", "sess", 42)
+    })
+    const handlers = latestAttachHandlers()
+    emitAcpEvent(handlers, {
+      seq: 1,
+      connection_id: "conn",
+      type: "prompt_queued",
+      generation: 1,
+      item: {
+        queue_item_id: "queue-failed",
+        enqueue_seq: 1,
+        client_message_id: "message-failed",
+        visible_text: "recover me",
+        visible_text_truncated: false,
+        attachment_count: 0,
+        submitted_at: "2026-01-01T00:00:00.000Z",
+        state: "queued",
+      },
+    })
+    emitAcpEvent(handlers, {
+      seq: 2,
+      connection_id: "conn",
+      type: "prompt_queue_item_failed",
+      generation: 1,
+      queue_item_id: "queue-failed",
+      error_code: "prompt_hydration_failed",
+    })
+    expect(h.store!.getConnection(TAB)?.sharedSession?.queue).toEqual([
+      expect.objectContaining({
+        queueItemId: "queue-failed",
+        state: "failed",
+      }),
+    ])
+
+    act(() => {
+      h.actions!.dismissFailedSharedPrompt(TAB, "queue-failed")
+    })
+
+    expect(h.store!.getConnection(TAB)?.sharedSession?.queue).toEqual([])
+    expect(h.acpCancelQueuedPrompt).not.toHaveBeenCalled()
   })
 
   it.each(["created", "attached"] as const)(
@@ -1730,6 +1868,40 @@ describe("AcpConnectionsProvider reconnect (status-icon button)", () => {
       null
     )
     expect(h.store!.getConnection(TAB)?.connectionId).toBe("respawned-conn")
+  })
+
+  it("reconnects with the live conversation linked after an external-only connect", async () => {
+    h.acpFindConnectionForConversation.mockResolvedValue(null)
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "external-only")
+    })
+    const handlers = latestAttachHandlers()
+    emitAcpEvent(handlers, {
+      seq: 1,
+      connection_id: "spawned-conn",
+      type: "conversation_linked",
+      conversation_id: 99,
+      folder_id: 1,
+    })
+    expect(h.store!.getConnection(TAB)?.conversationId).toBe(99)
+
+    h.acpConnect.mockClear()
+    h.acpConnect.mockResolvedValue("respawned-linked")
+    await act(async () => {
+      await h.actions!.reconnect(TAB)
+    })
+
+    expect(h.acpConnect).toHaveBeenLastCalledWith(
+      "claude_code",
+      "/tmp/x",
+      "external-only",
+      undefined,
+      {},
+      99,
+      undefined,
+      null
+    )
   })
 
   it("rebuilds even when the backend no longer knows the connection", async () => {
@@ -5714,6 +5886,75 @@ describe("APPLY_EVENT_FRAME reducer parity", () => {
   )
 })
 
+describe("request usage generation clock", () => {
+  async function connectPromptingOwner() {
+    h.acpFindConnectionForConversation.mockResolvedValue(null)
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1", 2)
+    })
+    const handlers = latestAttachHandlers()
+    emitAcpEvent(handlers, {
+      seq: 1,
+      connection_id: "spawned-conn",
+      type: "status_changed",
+      status: "prompting",
+    })
+    return handlers
+  }
+
+  it("keeps tool-call-only usage by starting the clock on top-level tool output", async () => {
+    const handlers = await connectPromptingOwner()
+
+    emitAcpEvent(handlers, {
+      seq: 2,
+      connection_id: "spawned-conn",
+      received_at: 1_000,
+      type: "tool_call",
+      tool_call_id: "tool-1",
+      title: "Read",
+      kind: "read",
+      status: "in_progress",
+      content: null,
+      raw_input: null,
+      raw_output: null,
+    })
+    emitAcpEvent(handlers, {
+      seq: 3,
+      connection_id: "spawned-conn",
+      received_at: 1_750,
+      type: "request_usage",
+      output_tokens: 25,
+      duration_ms: null,
+    })
+
+    expect(h.store!.getConnection(TAB)?.requestUsage).toMatchObject({
+      outputTokens: 25,
+      generationMs: 750,
+      sampleCount: 1,
+    })
+  })
+
+  it("does not start the clock for a status-only tool call update", async () => {
+    const handlers = await connectPromptingOwner()
+
+    emitAcpEvent(handlers, {
+      seq: 2,
+      connection_id: "spawned-conn",
+      received_at: 1_000,
+      type: "tool_call_update",
+      tool_call_id: "tool-1",
+      title: null,
+      status: "completed",
+      content: null,
+      raw_input: null,
+      raw_output: null,
+    })
+
+    expect(h.store!.getConnection(TAB)?.generationClockStartedAt).toBeNull()
+  })
+})
+
 describe("send_prompt_forwards_prompt_context_to_api", () => {
   it("forwards promptContext as the required sixth argument to acpPrompt", async () => {
     await mountProvider()
@@ -5849,13 +6090,14 @@ describe("root_conversation_activity_at_acp_dispatch_boundaries", () => {
     expect(optimistic.has(2)).toBe(false)
   })
 
-  it("does not begin activity for an unknown connection context", async () => {
+  it("rejects a connection-not-found error for an unknown connection context", async () => {
     await mountProvider()
 
-    await act(async () => {
-      await h.actions!.sendPrompt("missing-key", [
-        { type: "text", text: "wire" },
-      ])
+    await expect(
+      h.actions!.sendPrompt("missing-key", [{ type: "text", text: "wire" }])
+    ).rejects.toMatchObject({
+      code: "connection_not_found",
+      message: expect.stringContaining("missing-key"),
     })
 
     expect(acpPromptMock).not.toHaveBeenCalled()
@@ -7230,6 +7472,76 @@ describe("AcpConnectionsProvider canonical observer aliases", () => {
     )
     expect(h.store!.getConnection(TAB)?.contextKey).toBe("broker-child")
     expect(h.attach).toHaveBeenCalledTimes(1)
+  })
+
+  it("dismisses canonical session failures through a viewer tab alias", async () => {
+    h.acpFindConnectionForConversation.mockResolvedValue({
+      connection_id: "broker-child",
+      event_seq: 0,
+    })
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sid", 42)
+    })
+    emitAcpEvent(latestAttachHandlers(), {
+      seq: 1,
+      connection_id: "broker-child",
+      type: "session_failure",
+      record: {
+        id: "viewer-failure",
+        revision: 1,
+        category: "connection",
+        severity: "error",
+        title: "Viewer can close this failure",
+        actions: ["new_session"],
+      },
+    })
+    expect(h.store!.getConnection(TAB)?.sessionFailures[0]).toMatchObject({
+      id: "viewer-failure",
+      resolved: false,
+    })
+
+    act(() => {
+      h.actions!.dismissSessionFailures(TAB, ["viewer-failure"])
+    })
+
+    expect(
+      h.store!.getConnection("broker-child")?.sessionFailures[0]
+    ).toMatchObject({
+      id: "viewer-failure",
+      resolved: true,
+      dismissed: true,
+    })
+  })
+
+  it("reconnects a viewer alias with the canonical live conversation id", async () => {
+    h.acpFindConnectionForConversation.mockResolvedValue({
+      connection_id: "broker-child",
+      event_seq: 0,
+    })
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sid", 42)
+    })
+    emitAcpEvent(latestAttachHandlers(), {
+      seq: 1,
+      connection_id: "broker-child",
+      type: "conversation_linked",
+      conversation_id: 99,
+      folder_id: 1,
+    })
+    expect(h.store!.getConnection(TAB)?.conversationId).toBe(99)
+    h.acpFindConnectionForConversation.mockClear()
+
+    await act(async () => {
+      await h.actions!.reconnect(TAB)
+    })
+
+    expect(h.acpFindConnectionForConversation).toHaveBeenLastCalledWith(
+      99,
+      "sid",
+      "claude_code"
+    )
   })
 
   it("fans canonical updates to alias listeners and alias live sinks", async () => {

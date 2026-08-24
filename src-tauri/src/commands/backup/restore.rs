@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
 use crate::app_error::{AppCommandError, BACKUP_I18N_KEY_ALREADY_PENDING};
+use crate::parsers::ExternalSource;
 
 use super::archive;
 use super::core;
@@ -102,6 +103,7 @@ pub(crate) async fn stage_restore_core(
     data_dir: &Path,
     passphrase: Option<&str>,
     external_mode: ExternalRestoreMode,
+    external_sources: Vec<ExternalSource>,
     emitter: &EventEmitter,
     op_id: &str,
     cancel: &CancellationToken,
@@ -181,16 +183,24 @@ pub(crate) async fn stage_restore_core(
     //    would tell the UI "failed / don't restart" while the marker silently
     //    applies on the next launch. Any external failure is logged and the
     //    stage still reports success.
-    let (restored_external_path, skipped_conflicts) =
-        match handle_external(&staging_root, data_dir, &manifest, external_mode, cancel).await {
-            Ok(result) => result,
-            Err(e) => {
-                tracing::error!(
-                    "[RESTORE] external transcript handling failed (core restore still staged): {e}"
-                );
-                (None, Vec::new())
-            }
-        };
+    let (restored_external_path, skipped_conflicts) = match handle_external(
+        &staging_root,
+        data_dir,
+        &manifest,
+        external_mode,
+        external_sources,
+        cancel,
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(e) => {
+            tracing::error!(
+                "[RESTORE] external transcript handling failed (core restore still staged): {e}"
+            );
+            (None, Vec::new())
+        }
+    };
 
     emit(emitter, op_id, BackupPhase::Done);
 
@@ -385,6 +395,7 @@ async fn handle_external(
     data_dir: &Path,
     manifest: &BackupManifest,
     mode: ExternalRestoreMode,
+    external_sources: Vec<ExternalSource>,
     cancel: &CancellationToken,
 ) -> Result<(Option<String>, Vec<String>), AppCommandError> {
     let staged_external = staging_root.join("external");
@@ -413,7 +424,12 @@ async fn handle_external(
             let staged_c = staged_external.clone();
             let cancel_c = cancel.clone();
             let skipped = tokio::task::spawn_blocking(move || {
-                super::external::restore_external_from_staging(&staged_c, on_conflict, &cancel_c)
+                super::external::restore_external_with_sources(
+                    &staged_c,
+                    &external_sources,
+                    on_conflict,
+                    &cancel_c,
+                )
             })
             .await
             .map_err(spawn_err)??;

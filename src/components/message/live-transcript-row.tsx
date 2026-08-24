@@ -12,6 +12,7 @@ import {
   ReasoningTrigger,
 } from "@/components/ai-elements/reasoning"
 import { Shimmer } from "@/components/ai-elements/shimmer"
+import { GrokSessionImageScope } from "@/components/ai-elements/grok-session-image-context"
 import {
   ContentPartsRenderer,
   ToolCallPart,
@@ -441,6 +442,7 @@ const LiveGeneratedImageSegment = memo(function LiveGeneratedImageSegment({
 const LiveTranscriptSegmentView = memo(function LiveTranscriptSegmentView({
   conversationId,
   segmentId,
+  agentType,
   onToolRender,
 }: {
   conversationId: number
@@ -456,10 +458,14 @@ const LiveTranscriptSegmentView = memo(function LiveTranscriptSegmentView({
 
   switch (segment.type) {
     case "text":
-      return deferredRich ? (
-        <LiveIncrementalTextSegment document={segment.document} />
-      ) : (
-        <LiveTextSegment text={segment.text} />
+      return (
+        <GrokSessionImageScope phase={agentType === "grok" ? "live" : null}>
+          {deferredRich ? (
+            <LiveIncrementalTextSegment document={segment.document} />
+          ) : (
+            <LiveTextSegment text={segment.text} />
+          )}
+        </GrokSessionImageScope>
       )
     case "thinking":
       return <LiveThinkingSegment text={segment.text} isStreaming />

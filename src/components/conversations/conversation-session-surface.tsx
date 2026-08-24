@@ -53,6 +53,7 @@ import {
   forkSendBlockedByQueue,
   isConnectionReady,
   shouldQueueDirectSend,
+  shouldRetainOptimisticTurnWhileQueued,
   shouldRejectDuplicateCreate,
 } from "@/lib/queue-flush"
 import {
@@ -61,6 +62,7 @@ import {
   type TerminalDisconnectLatch,
 } from "@/lib/terminal-reconnect"
 import { TurnBusyError } from "@/lib/turn-busy"
+import type { SessionFailureAction } from "@/lib/session-failures"
 import { continuationFailureI18nKey } from "@/lib/continuation-waiting"
 import { consumeDelegatedChildTabIntent } from "@/lib/delegated-child-tab-intent"
 import {
@@ -1043,7 +1045,7 @@ export const ConversationSessionSurface = memo(
       (
         draft: PromptDraft,
         modeId?: string | null,
-        opts?: { fromQueueFlush?: boolean }
+        opts?: { fromQueueFlush?: boolean; optimisticTurnId?: string }
       ) => void
     >(() => {})
     // Timestamp of the last send that bounced with TurnBusyError. The flush below
@@ -1111,6 +1113,7 @@ export const ConversationSessionSurface = memo(
           // on a bounce, returns it to the FRONT (vs a direct send → tail).
           handleSendRef.current(next.draft, next.modeId, {
             fromQueueFlush: true,
+            optimisticTurnId: next.optimisticTurnId,
           })
         }
       }, wait)
@@ -1414,7 +1417,7 @@ export const ConversationSessionSurface = memo(
         // input send (no flag) must NOT jump ahead of already-queued items: when
         // a queue exists it tail-enqueues instead of sending, and on a bounce it
         // re-queues at the TAIL.
-        opts?: { fromQueueFlush?: boolean }
+        opts?: { fromQueueFlush?: boolean; optimisticTurnId?: string }
       ): void | Promise<unknown> => {
         // Access lock first — do not queue, clear draft, or build optimistic turns.
         if (interactionLocked) return
@@ -1442,23 +1445,6 @@ export const ConversationSessionSurface = memo(
         if (conn.waitingForSubagents) return
 
         const fromQueueFlush = opts?.fromQueueFlush ?? false
-        // Preserve FIFO: a direct send issued while the queue is non-empty joins
-        // the tail rather than racing ahead of the queued items. Read the
-        // queue length synchronously (it reflects a same-tick bounce requeue).
-        // During terminal pause, direct sends bypass historical head so the user
-        // can continue without draining stale queued drafts first.
-        if (
-          !conn.sharedSession &&
-          shouldQueueDirectSend(
-            fromQueueFlush,
-            mqGetQueueLength(),
-            queuePausedByTerminalDisconnect
-          )
-        ) {
-          mqEnqueue(draft, selectedModeIdArg ?? null)
-          return
-        }
-
         // Single-flight the unbound new-tab create. A second direct submit fired
         // before the first create resolves (a double Enter / double click) would
         // otherwise append an optimistic turn it can never deliver: the
@@ -1476,10 +1462,42 @@ export const ConversationSessionSurface = memo(
           return
         }
 
-        const optimisticTurn = buildOptimisticUserTurnFromDraft(
+        const builtOptimistic = buildOptimisticUserTurnFromDraft(
           draft,
           sharedT("attachedResources")
         )
+        const optimisticTurn = opts?.optimisticTurnId
+          ? { ...builtOptimistic, id: opts.optimisticTurnId }
+          : builtOptimistic
+
+        // Preserve FIFO: a direct send issued while the queue is non-empty joins
+        // the tail rather than racing ahead of the queued items. Read the
+        // queue length synchronously (it reflects a same-tick bounce requeue).
+        // During terminal pause, direct sends bypass historical head so the user
+        // can continue without draining stale queued drafts first.
+        // Keep a timeline bubble for the queued prompt so follow-ups are visible
+        // immediately; do not set awaiting_persist (that would deadlock flush).
+        if (
+          !conn.sharedSession &&
+          shouldQueueDirectSend(
+            fromQueueFlush,
+            mqGetQueueLength(),
+            queuePausedByTerminalDisconnect
+          )
+        ) {
+          appendOptimisticTurn(
+            effectiveConversationId,
+            optimisticTurn,
+            optimisticTurn.id,
+            { queuePending: true }
+          )
+          setSendSignal((prev) => prev + 1)
+          mqEnqueue(draft, selectedModeIdArg ?? null, {
+            optimisticTurnId: optimisticTurn.id,
+          })
+          return
+        }
+
         appendOptimisticTurn(
           effectiveConversationId,
           optimisticTurn,
@@ -1512,13 +1530,23 @@ export const ConversationSessionSurface = memo(
         // the bounce so the flush backs off instead of immediately retrying.
         const onTurnInProgress = () => {
           lastFlushBounceAtRef.current = Date.now()
-          removeOptimisticTurn(effectiveConversationId, optimisticTurn.id)
+          if (shouldRetainOptimisticTurnWhileQueued("busy_requeue")) {
+            appendOptimisticTurn(
+              effectiveConversationId,
+              optimisticTurn,
+              optimisticTurn.id,
+              { queuePending: true }
+            )
+          } else {
+            removeOptimisticTurn(effectiveConversationId, optimisticTurn.id)
+          }
+          const queuedOpts = { optimisticTurnId: optimisticTurn.id }
           // FIFO: the auto-flush draft WAS the queue head → return it to the
           // front; a direct send (queue was empty when it left) → tail.
           if (fromQueueFlush) {
-            mqRequeueFront(draft, selectedModeIdArg ?? null)
+            mqRequeueFront(draft, selectedModeIdArg ?? null, queuedOpts)
           } else {
-            mqEnqueue(draft, selectedModeIdArg ?? null)
+            mqEnqueue(draft, selectedModeIdArg ?? null, queuedOpts)
           }
         }
 
@@ -1542,15 +1570,27 @@ export const ConversationSessionSurface = memo(
 
         const onSendFailed = () => {
           removeOptimisticTurn(effectiveConversationId, optimisticTurn.id)
-          if (conn.sharedSession) {
-            setSyncState(effectiveConversationId, "idle")
+          setSyncState(effectiveConversationId, "idle")
+          if (conn.sharedSession) return
+          if (fromQueueFlush) {
+            mqRequeueFront(draft, selectedModeIdArg ?? null)
+          } else {
+            promptDraftRestoreRevisionRef.current += 1
+            setPromptDraftRestore({
+              revision: promptDraftRestoreRevisionRef.current,
+              draft,
+            })
           }
         }
 
         const onPromptAdmitted = (
           result: import("@/lib/types").PromptEnqueueResult | null
         ) => {
-          if (conn.sharedSession && result?.state === "queued") {
+          if (
+            conn.sharedSession &&
+            result?.state === "queued" &&
+            !shouldRetainOptimisticTurnWhileQueued("shared_admission_queued")
+          ) {
             removeOptimisticTurn(effectiveConversationId, optimisticTurn.id)
             setSyncState(effectiveConversationId, "idle")
           }
@@ -2023,6 +2063,12 @@ export const ConversationSessionSurface = memo(
       [acpActions, tabId]
     )
 
+    const handleSharedQueueFailedDismiss = useCallback(
+      (queueItemId: string) =>
+        acpActions.dismissFailedSharedPrompt(tabId, queueItemId),
+      [acpActions, tabId]
+    )
+
     const handleSetConfigOption = useCallback(
       (configId: string, valueId: string) => {
         if (interactionLocked) return
@@ -2058,12 +2104,21 @@ export const ConversationSessionSurface = memo(
           // optimistic turn and re-queue so it isn't stranded or lost.
           onTurnInProgress: () => {
             lastFlushBounceAtRef.current = Date.now()
-            removeOptimisticTurn(effectiveConversationId, optimisticTurn.id)
+            if (shouldRetainOptimisticTurnWhileQueued("busy_requeue")) {
+              appendOptimisticTurn(
+                effectiveConversationId,
+                optimisticTurn,
+                optimisticTurn.id,
+                { queuePending: true }
+              )
+            } else {
+              removeOptimisticTurn(effectiveConversationId, optimisticTurn.id)
+            }
             // A direct answer (never dequeued from the queue) re-queues at the
             // TAIL — it was sent after any already-queued items, so FIFO keeps it
             // behind them. (Only the auto-flush path, whose draft WAS the head,
             // re-queues at the front.)
-            mqEnqueue(draft, null)
+            mqEnqueue(draft, null, { optimisticTurnId: optimisticTurn.id })
           },
           onSendFailed: () => {
             removeOptimisticTurn(effectiveConversationId, optimisticTurn.id)
@@ -2155,8 +2210,17 @@ export const ConversationSessionSurface = memo(
           clientMessageId: optimisticTurn.id,
           onTurnInProgress: () => {
             lastFlushBounceAtRef.current = Date.now()
-            removeOptimisticTurn(effectiveConversationId, optimisticTurn.id)
-            mqEnqueue(draft, null)
+            if (shouldRetainOptimisticTurnWhileQueued("busy_requeue")) {
+              appendOptimisticTurn(
+                effectiveConversationId,
+                optimisticTurn,
+                optimisticTurn.id,
+                { queuePending: true }
+              )
+            } else {
+              removeOptimisticTurn(effectiveConversationId, optimisticTurn.id)
+            }
+            mqEnqueue(draft, null, { optimisticTurnId: optimisticTurn.id })
           },
           onSendFailed: () => {
             removeOptimisticTurn(effectiveConversationId, optimisticTurn.id)
@@ -2276,6 +2340,30 @@ export const ConversationSessionSurface = memo(
       tabId,
       workingDirForConnection,
     ])
+
+    const handleSessionFailureAction = useCallback(
+      (action: SessionFailureAction) => {
+        switch (action) {
+          case "retry":
+            void handleReconnect()
+            break
+          case "login":
+            handleOpenAgentsSettings()
+            break
+          case "new_session":
+            handleOpenNewSession()
+            break
+        }
+      },
+      [handleOpenAgentsSettings, handleOpenNewSession, handleReconnect]
+    )
+
+    const handleSessionFailureDismiss = useCallback(
+      (ids: string[]) => {
+        acpActions.dismissSessionFailures(tabId, ids)
+      },
+      [acpActions, tabId]
+    )
 
     // Delegation child tab: adopt live ownership + kickoff before detail races.
     useEffect(() => {
@@ -2485,6 +2573,13 @@ export const ConversationSessionSurface = memo(
         agentName={getAgentLabel(selectedAgent)}
         error={shellConnectionError}
         claudeApiRetry={conn.claudeApiRetry}
+        sessionFailures={conn.sessionFailures}
+        onSessionFailureAction={
+          !conn.isViewer && !interactionLocked
+            ? handleSessionFailureAction
+            : undefined
+        }
+        onSessionFailureDismiss={handleSessionFailureDismiss}
         pendingPermission={conn.pendingPermission}
         pendingQuestion={conn.pendingQuestion}
         pendingAskQuestion={conn.pendingAskQuestion}
@@ -2527,10 +2622,29 @@ export const ConversationSessionSurface = memo(
         onSharedQueueCancel={
           conn.sharedSession ? handleSharedQueueCancel : undefined
         }
+        onSharedQueueFailedDismiss={
+          conn.sharedSession ? handleSharedQueueFailedDismiss : undefined
+        }
         onEnqueue={conn.sharedSession ? undefined : mqEnqueue}
         onQueueReorder={conn.sharedSession ? undefined : mqReorder}
         onQueueEdit={conn.sharedSession ? undefined : handleQueueEdit}
-        onQueueDelete={conn.sharedSession ? undefined : mqRemove}
+        onQueueDelete={
+          conn.sharedSession
+            ? undefined
+            : (id: string) => {
+                const item = msgQueue.find((queued) => queued.id === id)
+                mqRemove(id)
+                if (
+                  item?.optimisticTurnId &&
+                  !shouldRetainOptimisticTurnWhileQueued("queue_item_cancelled")
+                ) {
+                  removeOptimisticTurn(
+                    effectiveConversationId,
+                    item.optimisticTurnId
+                  )
+                }
+              }
+        }
         editingItemId={mqEditingItemId}
         editingDraftText={editingQueueDraftText}
         editingDraftBlocks={editingQueueDraftBlocks}

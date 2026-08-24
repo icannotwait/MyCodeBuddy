@@ -82,6 +82,42 @@ describe("i18n locale key parity vs en.json", () => {
     }
   })
 
+  it("defines Simple DAG copy and relationship placeholders", () => {
+    const dagKeys = [
+      "dagAria",
+      "dagSelectedNode",
+      "dagCurrentNode",
+      "dagDependsOn",
+      "dagRequiredBy",
+      "dagInvalidGraph",
+      "dagFallbackAria",
+    ] as const
+
+    for (const messages of locales) {
+      const workflow = (
+        messages as unknown as {
+          Folder: { chat: { workflowGraph: Record<string, string> } }
+        }
+      ).Folder.chat.workflowGraph
+
+      for (const key of dagKeys) {
+        expect(workflow[key], `missing workflow DAG key ${key}`).toEqual(
+          expect.any(String)
+        )
+        expect(workflow[key].trim(), `empty workflow DAG key ${key}`).not.toBe(
+          ""
+        )
+      }
+      expect(
+        Object.keys(workflow)
+          .filter((key) => key.startsWith("dag"))
+          .sort()
+      ).toEqual([...dagKeys].sort())
+      expect(workflow.dagDependsOn).toContain("{nodes}")
+      expect(workflow.dagRequiredBy).toContain("{nodes}")
+    }
+  })
+
   it("defines restart-required pop-out copy in all ten locales", () => {
     for (const messages of locales) {
       const popout = messages.ConversationPopout as Record<string, string>

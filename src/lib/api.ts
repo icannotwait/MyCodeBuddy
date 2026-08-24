@@ -181,6 +181,8 @@ import type {
   PromptEnqueueResult,
   SharedMutationContext,
   SharedPromptAdmission,
+  ResolveGrokSessionImageInput,
+  GrokSessionImageResolution,
 } from "./types"
 
 export async function listConversations(params?: {
@@ -4575,6 +4577,16 @@ export async function readFileBase64(
   return getTransport().call("read_file_base64", {
     path,
     maxBytes: maxBytes ?? null,
+  })
+}
+
+export function resolveGrokSessionImage(
+  input: ResolveGrokSessionImageInput
+): Promise<GrokSessionImageResolution> {
+  return getTransport().call("resolve_grok_session_image", {
+    conversationId: input.conversationId,
+    href: input.href,
+    includeData: input.includeData ?? false,
   })
 }
 

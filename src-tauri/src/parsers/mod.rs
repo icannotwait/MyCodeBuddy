@@ -15,7 +15,7 @@ pub mod pi;
 mod summary_cache;
 
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
@@ -58,7 +58,16 @@ impl ExternalSource {
 /// environment (honoring `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, etc.). Sources
 /// whose root does not exist are still listed; callers skip missing roots.
 pub fn external_transcript_sources() -> Vec<ExternalSource> {
-    let sources = vec![
+    external_transcript_sources_for_runtime_env(&BTreeMap::new())
+}
+
+/// Enumerate external transcript sources using the effective environment of
+/// the DeepSeek child process for its relocatable session store. Other parsers
+/// retain their existing process-environment resolvers.
+pub(crate) fn external_transcript_sources_for_runtime_env(
+    deepseek_env: &BTreeMap<String, String>,
+) -> Vec<ExternalSource> {
+    let mut sources = vec![
         ExternalSource {
             agent: "claude",
             root: claude::resolve_claude_config_dir().join("projects"),
@@ -157,18 +166,21 @@ pub fn external_transcript_sources() -> Vec<ExternalSource> {
             is_file: false,
             include_top: None,
         },
-        ExternalSource {
-            // DeepSeek Harness (deepseek-acp) keeps a directory-per-session
-            // log store under `~/.dsh/sessions/<munged-cwd>/<uuid>/`
-            // (relocatable via `DEEPSEEK_ACP_SESSIONS_ROOT` / `DSH_HOME`).
-            // The resolver already points at the `sessions/` subtree, so the
-            // sibling `.credentials.yaml` under `~/.dsh` is never archived.
+    ];
+    if let Some(root) = deepseek::resolve_deepseek_sessions_root_for_runtime_env(deepseek_env) {
+        // DeepSeek Harness (deepseek-acp) keeps a directory-per-session log
+        // store under `~/.dsh/sessions/<munged-cwd>/<uuid>/` (relocatable via
+        // `DEEPSEEK_ACP_SESSIONS_ROOT` / `DSH_HOME`). The resolver already
+        // points at the `sessions/` subtree, so the sibling `.credentials.yaml`
+        // under `~/.dsh` is never archived. If the child's home was removed or
+        // made relative, omit the source instead of scanning Codeg's profile.
+        sources.push(ExternalSource {
             agent: "deepseek",
-            root: deepseek::resolve_deepseek_sessions_root(),
+            root,
             is_file: false,
             include_top: None,
-        },
-    ];
+        });
+    }
     sources
 }
 
@@ -1314,10 +1326,10 @@ mod tests {
     use chrono::Utc;
 
     use super::{
-        fold_reference_links, infer_context_window_max_tokens, is_safe_subagent_id,
-        latest_turn_total_usage_tokens, merge_context_window_stats, path_eq_for_matching,
-        sanitize_user_blocks, select_unique_recovery_match, title_from_user_text,
-        visible_user_text, RecoveryQuery,
+        external_transcript_sources_for_runtime_env, fold_reference_links,
+        infer_context_window_max_tokens, is_safe_subagent_id, latest_turn_total_usage_tokens,
+        merge_context_window_stats, path_eq_for_matching, sanitize_user_blocks,
+        select_unique_recovery_match, title_from_user_text, visible_user_text, RecoveryQuery,
     };
     use crate::models::{
         AgentType, ContentBlock, ConversationSummary, MessageTurn, SessionStats, TurnRole,
@@ -1326,6 +1338,91 @@ mod tests {
 
     fn test_terminal_context() -> String {
         test_terminal_context_for("PowerShell 7", "powershell", "PowerShell")
+    }
+
+    #[test]
+    fn deepseek_external_source_is_omitted_when_child_home_is_unknown() {
+        #[cfg(windows)]
+        let home_key = "USERPROFILE";
+        #[cfg(not(windows))]
+        let home_key = "HOME";
+
+        for home in ["", "relative-child-home"] {
+            let runtime_env = std::collections::BTreeMap::from([
+                ("DEEPSEEK_ACP_SESSIONS_ROOT".to_string(), String::new()),
+                ("DSH_HOME".to_string(), String::new()),
+                (home_key.to_string(), home.to_string()),
+            ]);
+            assert!(
+                external_transcript_sources_for_runtime_env(&runtime_env)
+                    .iter()
+                    .all(|source| source.agent != "deepseek"),
+                "an unresolved child home must not fall back to Codeg's profile"
+            );
+        }
+
+        #[cfg(windows)]
+        {
+            let runtime_env = std::collections::BTreeMap::from([
+                ("DEEPSEEK_ACP_SESSIONS_ROOT".to_string(), String::new()),
+                ("DSH_HOME".to_string(), String::new()),
+                ("HOMEDRIVE".to_string(), "Z:".to_string()),
+                ("HOMEPATH".to_string(), r"\relocated-home".to_string()),
+            ]);
+            assert!(
+                external_transcript_sources_for_runtime_env(&runtime_env)
+                    .iter()
+                    .all(|source| source.agent != "deepseek"),
+                "a relocated Windows home pair must not use Codeg's USERPROFILE"
+            );
+        }
+    }
+
+    #[test]
+    fn deepseek_external_source_keeps_explicit_runtime_roots_without_child_home() {
+        #[cfg(windows)]
+        let home_key = "USERPROFILE";
+        #[cfg(not(windows))]
+        let home_key = "HOME";
+        #[cfg(windows)]
+        let explicit_sessions_root = r"C:\deepseek-explicit-sessions";
+        #[cfg(not(windows))]
+        let explicit_sessions_root = "/tmp/deepseek-explicit-sessions";
+        #[cfg(windows)]
+        let absolute_dsh_root = r"C:\deepseek-absolute-home";
+        #[cfg(not(windows))]
+        let absolute_dsh_root = "/tmp/deepseek-absolute-home";
+
+        let explicit_sessions = std::collections::BTreeMap::from([
+            (
+                "DEEPSEEK_ACP_SESSIONS_ROOT".to_string(),
+                explicit_sessions_root.to_string(),
+            ),
+            ("DSH_HOME".to_string(), String::new()),
+            (home_key.to_string(), String::new()),
+        ]);
+        let sessions_source = external_transcript_sources_for_runtime_env(&explicit_sessions)
+            .into_iter()
+            .find(|source| source.agent == "deepseek")
+            .expect("an explicit sessions root remains resolvable");
+        assert_eq!(
+            sessions_source.root,
+            std::path::PathBuf::from(explicit_sessions_root)
+        );
+
+        let absolute_dsh = std::collections::BTreeMap::from([
+            ("DEEPSEEK_ACP_SESSIONS_ROOT".to_string(), String::new()),
+            ("DSH_HOME".to_string(), absolute_dsh_root.to_string()),
+            (home_key.to_string(), String::new()),
+        ]);
+        let dsh_source = external_transcript_sources_for_runtime_env(&absolute_dsh)
+            .into_iter()
+            .find(|source| source.agent == "deepseek")
+            .expect("an absolute DSH_HOME remains resolvable");
+        assert_eq!(
+            dsh_source.root,
+            std::path::PathBuf::from(absolute_dsh_root).join("sessions")
+        );
     }
 
     fn test_terminal_context_for(

@@ -129,6 +129,7 @@ mod tauri_app {
                 conversations::save_turn_generation_stat,
                 conversations::clear_awaiting_reply,
                 conversations::delete_conversation,
+                crate::commands::grok_session_image::resolve_grok_session_image,
                 folders::load_folder_history,
                 folders::get_folder,
                 folders::list_open_folder_details,
@@ -1740,6 +1741,7 @@ mod tauri_app {
                 "conversations :: get_folder_conversation_turns",
                 "folders :: git_update_branch",
                 "folders :: git_remove_worktree",
+                "crate :: commands :: grok_session_image :: resolve_grok_session_image",
             ];
 
             let registered = super::production_tauri_command_paths();

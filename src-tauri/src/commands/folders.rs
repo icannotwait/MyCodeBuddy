@@ -19,6 +19,10 @@ use tokio_util::sync::CancellationToken;
 use tauri::Manager;
 
 use crate::app_error::AppCommandError;
+use crate::commands::confined_file::{
+    read_confined_regular_file, run_file_io, ConfinedRead, FILE_BASE64_DEFAULT_MAX_BYTES,
+    FILE_BASE64_MAX_BYTES,
+};
 use crate::db::error::DbError;
 use crate::db::service::folder_service;
 use crate::db::AppDatabase;
@@ -4231,12 +4235,6 @@ pub(crate) fn build_file_tree_sync(
 const FILE_OPEN_HARD_LIMIT: usize = 50_000_000;
 /// Save limit: refuse to save content larger than 50 MB.
 const FILE_SAVE_HARD_LIMIT: usize = 50_000_000;
-const FILE_BASE64_DEFAULT_MAX_BYTES: usize = 20_000_000;
-const FILE_BASE64_MAX_BYTES: usize = 100_000_000;
-const FILE_IO_MAX_CONCURRENT_OPS: usize = 8;
-
-static FILE_IO_SEMAPHORE: LazyLock<Semaphore> =
-    LazyLock::new(|| Semaphore::new(FILE_IO_MAX_CONCURRENT_OPS));
 
 fn to_git_literal_pathspec(path: &str) -> String {
     format!(":(literal){path}")
@@ -4510,21 +4508,6 @@ fn sync_directory(path: &Path) -> Result<(), AppCommandError> {
 #[cfg(not(unix))]
 fn sync_directory(_path: &Path) -> Result<(), AppCommandError> {
     Ok(())
-}
-
-async fn run_file_io<T, F>(f: F) -> Result<T, AppCommandError>
-where
-    T: Send + 'static,
-    F: FnOnce() -> Result<T, AppCommandError> + Send + 'static,
-{
-    let _permit = FILE_IO_SEMAPHORE
-        .acquire()
-        .await
-        .map_err(|_| AppCommandError::task_execution_failed("File I/O runtime is unavailable"))?;
-
-    tokio::task::spawn_blocking(f).await.map_err(|e| {
-        AppCommandError::task_execution_failed("File I/O task failed").with_detail(e.to_string())
-    })?
 }
 
 // ─── Directory browser helpers (for web/server mode) ───
@@ -4892,37 +4875,6 @@ pub async fn read_file_base64(
     .await
 }
 
-/// Open a file for reading, refusing a final-component symlink (unix) so a
-/// path validated by canonicalization cannot be redirected through a symlink
-/// swapped in afterward.
-#[cfg(unix)]
-fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-}
-
-#[cfg(windows)]
-fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
-    use std::os::windows::fs::OpenOptionsExt;
-    // FILE_FLAG_OPEN_REPARSE_POINT opens the reparse point itself instead of
-    // following it, so a symlink/junction swapped in after validation is opened
-    // (and then rejected by the is_file() check) rather than followed outside
-    // the workspace root.
-    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-    std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(path)
-}
-
-#[cfg(not(any(unix, windows)))]
-fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
-    std::fs::File::open(path)
-}
-
 /// Like `read_file_base64`, but confined to a workspace root: the path is
 /// relative to `root_path` and is canonicalized (resolving symlinks) so it can
 /// never read outside the workspace. Used by the HTML preview to inline local
@@ -4935,59 +4887,28 @@ pub async fn read_workspace_file_base64(
     max_bytes: Option<usize>,
 ) -> Result<String, AppCommandError> {
     let root = PathBuf::from(&root_path);
-    if !root.exists() || !root.is_dir() {
-        return Err(AppCommandError::not_found("Folder does not exist"));
-    }
-
-    let target = resolve_tree_path(&root, &path)?;
-    if !target.exists() {
-        return Err(AppCommandError::not_found("File does not exist"));
-    }
-    if !target.is_file() {
-        return Err(AppCommandError::invalid_input("Path is not a file"));
-    }
-
     let limit = max_bytes
         .unwrap_or(FILE_BASE64_DEFAULT_MAX_BYTES)
         .clamp(4_096, FILE_BASE64_MAX_BYTES);
 
     run_file_io(move || {
-        use std::io::Read;
-        // Canonicalize and confine, then open a single handle (O_NOFOLLOW on
-        // unix) and do metadata + read on the fd. This closes the check-then-
-        // read race: the original `target` symlink can't be re-resolved (we use
-        // the canonical path), a final-component symlink swapped in after the
-        // check makes the open fail, and metadata/read never re-look-up the path.
-        let canonical_root = std::fs::canonicalize(&root).map_err(AppCommandError::io)?;
-        let canonical_target = std::fs::canonicalize(&target).map_err(AppCommandError::io)?;
-        if !canonical_target.starts_with(&canonical_root) {
-            return Err(AppCommandError::invalid_input(
-                "Path is outside workspace root",
-            ));
+        let root_metadata = std::fs::metadata(&root).map_err(|error| match error.kind() {
+            std::io::ErrorKind::NotFound => AppCommandError::not_found("Folder does not exist"),
+            _ => AppCommandError::io(error),
+        })?;
+        if !root_metadata.is_dir() {
+            return Err(AppCommandError::not_found("Folder does not exist"));
         }
-        let mut file = open_no_follow(&canonical_target).map_err(AppCommandError::io)?;
-        let metadata = file.metadata().map_err(AppCommandError::io)?;
-        if !metadata.is_file() {
-            return Err(AppCommandError::invalid_input("Path is not a file"));
+        resolve_tree_path(&root, &path)?;
+        match read_confined_regular_file(&root, Path::new(&path), None, limit, true)? {
+            ConfinedRead::Absent => Err(AppCommandError::not_found("File does not exist")),
+            ConfinedRead::Found(found) => {
+                let bytes = found.bytes.ok_or_else(|| {
+                    AppCommandError::task_execution_failed("Confined file reader returned no bytes")
+                })?;
+                Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
+            }
         }
-        if metadata.len() > limit as u64 {
-            return Err(
-                AppCommandError::invalid_input("File is too large to attach")
-                    .with_detail(format!("max_bytes={limit}")),
-            );
-        }
-        // take(limit + 1) bounds the read even if the file grows after fstat.
-        let mut bytes = Vec::new();
-        Read::take(&mut file, limit as u64 + 1)
-            .read_to_end(&mut bytes)
-            .map_err(AppCommandError::io)?;
-        if bytes.len() > limit {
-            return Err(
-                AppCommandError::invalid_input("File is too large to attach")
-                    .with_detail(format!("max_bytes={limit}")),
-            );
-        }
-        Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
     })
     .await
 }
@@ -8666,6 +8587,43 @@ mod workspace_confinement_tests {
             res.is_err(),
             "symlink escaping the workspace must be rejected"
         );
+    }
+
+    #[tokio::test]
+    async fn workspace_reader_preserves_minimum_limit_clamping() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("exact.bin"), vec![1_u8; 4_096]).unwrap();
+        std::fs::write(root.path().join("over.bin"), vec![1_u8; 4_097]).unwrap();
+        assert!(read_workspace_file_base64(
+            root.path().to_string_lossy().into_owned(),
+            "exact.bin".into(),
+            Some(1),
+        )
+        .await
+        .is_ok());
+        let error = read_workspace_file_base64(
+            root.path().to_string_lossy().into_owned(),
+            "over.bin".into(),
+            Some(1),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, crate::app_error::AppErrorCode::InvalidInput);
+        assert_eq!(error.detail.as_deref(), Some("max_bytes=4096"));
+    }
+
+    #[tokio::test]
+    async fn workspace_reader_preserves_root_before_path_error_precedence() {
+        let temp = tempfile::tempdir().unwrap();
+        let error = read_workspace_file_base64(
+            temp.path().join("missing").to_string_lossy().into_owned(),
+            "../escape.png".into(),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, crate::app_error::AppErrorCode::NotFound);
+        assert_eq!(error.message, "Folder does not exist");
     }
 
     #[test]
