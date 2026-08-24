@@ -70,6 +70,27 @@ mod tests {
         }
     }
 
+    /// Lookups run on `spawn_blocking` and retry until the store deadline.
+    /// Fixed sleeps miss Windows CI; wait for the resolve metric instead.
+    async fn wait_for_enrichment_resolved(metrics: &DelegationMetrics, timeout: Duration) {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if metrics.snapshot().cursor_enrichment_resolved >= 1 {
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                let snap = metrics.snapshot();
+                panic!(
+                    "timed out waiting for cursor enrichment resolve (scheduled={}, resolved={}, failed={:?})",
+                    snap.cursor_enrichment_scheduled,
+                    snap.cursor_enrichment_resolved,
+                    snap.cursor_enrichment_failed
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     #[tokio::test]
     async fn schedules_only_cursor_identityless_mcp_shape() {
         let metrics = Arc::new(DelegationMetrics::default());
@@ -724,7 +745,11 @@ mod tests {
         )));
         let enricher = CursorStoreEnricher::new(store, sessions, broker.clone(), metrics.clone());
         enricher.maybe_schedule(&mcp_tool_envelope("cursor-conn", "tc-real", Some("{}")));
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        wait_for_enrichment_resolved(
+            metrics.as_ref(),
+            CURSOR_STORE_LOOKUP_DEADLINE + Duration::from_millis(500),
+        )
+        .await;
         assert_eq!(
             broker
                 .take_matching_tool_call("cursor-conn", &real_delegate_key())
@@ -771,7 +796,11 @@ mod tests {
             metrics.clone(),
         );
         enricher.maybe_schedule(&mcp_tool_envelope("cursor-conn", tool_call_id, Some("{}")));
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        wait_for_enrichment_resolved(
+            metrics.as_ref(),
+            CURSOR_STORE_LOOKUP_DEADLINE + Duration::from_millis(500),
+        )
+        .await;
 
         assert_eq!(
             broker
