@@ -45,7 +45,7 @@ use crate::acp_transcript::{self, EntryKind, Transcript, TranscriptEntry};
 use crate::models::agent::AgentType;
 use crate::models::conversation::{ConversationDetail, ConversationSummary, SessionStats};
 use crate::models::message::{ContentBlock, ImageData, MessageTurn, TurnRole, TurnUsage};
-use crate::parsers::{AgentParser, ParseError};
+use crate::parsers::{sanitize_user_blocks, visible_user_text, AgentParser, ParseError};
 
 pub struct AcpNativeParser {
     agent_type: AgentType,
@@ -239,6 +239,7 @@ fn prompt_blocks(payload: &serde_json::Value) -> Vec<ContentBlock> {
             }
         }
     }
+    sanitize_user_blocks(&mut blocks);
     blocks
 }
 
@@ -376,22 +377,24 @@ pub fn project_turns(entries: &[TranscriptEntry]) -> Vec<MessageTurn> {
             EntryKind::Prompt => {
                 flush(&mut pending, &mut turns, &mut seq);
                 let blocks = prompt_blocks(&entry.p);
-                turns.push(MessageTurn {
-                    id: format!("acp-{seq}"),
-                    role: TurnRole::User,
-                    blocks,
-                    timestamp: epoch_ms_to_utc(entry.t),
-                    usage: None,
-                    duration_ms: None,
-                    model: None,
-                    reasoning_effort: None,
-                    completed_at: None,
-                    outcome: None,
-                    autonomous_origin: None,
-                    generation_ms: None,
-                    generation_tokens: None,
-                });
-                seq += 1;
+                if !blocks.is_empty() {
+                    turns.push(MessageTurn {
+                        id: format!("acp-{seq}"),
+                        role: TurnRole::User,
+                        blocks,
+                        timestamp: epoch_ms_to_utc(entry.t),
+                        usage: None,
+                        duration_ms: None,
+                        model: None,
+                        reasoning_effort: None,
+                        completed_at: None,
+                        outcome: None,
+                        autonomous_origin: None,
+                        generation_ms: None,
+                        generation_tokens: None,
+                    });
+                    seq += 1;
+                }
                 prompt_just_recorded = true;
                 turn_start_hint = Some(entry.t);
             }
@@ -526,6 +529,9 @@ fn apply_update(
                 return;
             }
             let text = content_block_text(&chunk.content);
+            let Some(text) = visible_user_text(&text) else {
+                return;
+            };
             if text.is_empty() {
                 return;
             }
@@ -1152,6 +1158,73 @@ mod tests {
         assert_eq!(turns.len(), 2, "echo must not create a second user turn");
         assert!(matches!(turns[0].role, TurnRole::User));
         assert!(matches!(turns[1].role, TurnRole::Assistant));
+    }
+
+    fn test_codeg_terminal_context() -> String {
+        "<codeg_terminal_context version=\"1\">\n\
+Selected shell: PowerShell 7\n\
+Dialect: powershell\n\
+Generate shell command lines using PowerShell syntax.\n\
+ACP command+args requests may still execute directly.\n\
+This context is authoritative for the current connection and supersedes\n\
+earlier terminal context records.\n\
+</codeg_terminal_context>"
+            .to_string()
+    }
+
+    fn user_turn_texts(turns: &[MessageTurn]) -> Vec<String> {
+        turns
+            .iter()
+            .filter(|t| matches!(t.role, TurnRole::User))
+            .flat_map(|t| t.blocks.iter())
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn hides_codeg_terminal_context_from_recorded_prompt_and_replay() {
+        let ctx = test_codeg_terminal_context();
+        let mixed = format!("是在Worktable的Actor里加么 {ctx}");
+        let prompt_with_extra_block = entry(
+            1,
+            EntryKind::Prompt,
+            serde_json::json!([
+                { "type": "text", "text": "hello" },
+                { "type": "text", "text": ctx }
+            ]),
+        );
+        let recorded = project_turns(&[
+            prompt_with_extra_block,
+            update(2, text_chunk("agent_message_chunk", "ok")),
+            prompt(10, &mixed),
+            update(11, text_chunk("agent_message_chunk", "ok2")),
+        ]);
+        let recorded_user = user_turn_texts(&recorded);
+        assert_eq!(recorded_user, vec!["hello".to_string(), "是在Worktable的Actor里加么".to_string()]);
+        assert!(!recorded_user.iter().any(|t| t.contains("Selected shell:")));
+
+        let replayed = project_turns(&[
+            update(1, text_chunk("user_message_chunk", &ctx)),
+            update(2, text_chunk("agent_message_chunk", "ok")),
+            update(3, text_chunk("user_message_chunk", &mixed)),
+            update(4, text_chunk("agent_message_chunk", "ok2")),
+            update(
+                5,
+                text_chunk(
+                    "user_message_chunk",
+                    "<codeg_terminal_context version=\"1\">partial",
+                ),
+            ),
+        ]);
+        let replayed_user = user_turn_texts(&replayed);
+        assert!(!replayed_user.iter().any(|t| t.contains("Selected shell:")));
+        assert!(replayed_user
+            .iter()
+            .any(|t| t == "是在Worktable的Actor里加么"));
+        assert!(replayed_user.iter().any(|t| t.contains("partial")));
     }
 
     #[test]

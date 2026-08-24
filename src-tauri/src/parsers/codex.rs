@@ -16,7 +16,8 @@ use crate::parsers::codex_code_mode::{
     CodeModeScript, ScriptStatus, Separator, CODEX_SCRIPT_TOOL_NAME,
 };
 use crate::parsers::{
-    folder_name_from_path, title_from_user_text, truncate_str, AgentParser, ParseError,
+    folder_name_from_path, title_from_user_text, truncate_str, visible_user_text, AgentParser,
+    ParseError,
 };
 
 pub struct CodexParser {
@@ -2452,9 +2453,12 @@ impl CodexParser {
                                     }
                                 }
                                 let normalized = strip_blocked_resource_mentions(&text);
+                                let visible = visible_user_text(&normalized);
                                 let mut blocks: Vec<ContentBlock> = Vec::new();
-                                if !normalized.is_empty() {
-                                    blocks.push(ContentBlock::Text { text: normalized });
+                                if let Some(visible) = visible.as_ref().filter(|text| !text.is_empty()) {
+                                    blocks.push(ContentBlock::Text {
+                                        text: visible.clone(),
+                                    });
                                 }
 
                                 if let Some(images) =
@@ -2477,6 +2481,11 @@ impl CodexParser {
                                 }
 
                                 if blocks.is_empty() {
+                                    // Envelope-only / mandatory-route text with no images is
+                                    // machine context, not a user turn.
+                                    if visible.is_none() && !normalized.is_empty() {
+                                        continue;
+                                    }
                                     blocks.push(ContentBlock::Text {
                                         text: "Attached resources".to_string(),
                                     });
@@ -4360,7 +4369,7 @@ fn extract_codex_title_candidate(input: &str, fallback_attached: bool) -> Option
             None
         }
     } else {
-        Some(title_from_user_text(&cleaned))
+        visible_user_text(&cleaned).map(|visible| title_from_user_text(&visible))
     }
 }
 
@@ -4737,6 +4746,112 @@ mod tests {
         let input = "修复 codex 会话标题";
         let got = extract_codex_title_candidate(input, true);
         assert_eq!(got.as_deref(), Some("修复 codex 会话标题"));
+    }
+
+    fn test_codeg_terminal_context() -> String {
+        "<codeg_terminal_context version=\"1\">\n\
+Selected shell: PowerShell 7\n\
+Dialect: powershell\n\
+Generate shell command lines using PowerShell syntax.\n\
+ACP command+args requests may still execute directly.\n\
+This context is authoritative for the current connection and supersedes\n\
+earlier terminal context records.\n\
+</codeg_terminal_context>"
+            .to_string()
+    }
+
+    fn user_turn_texts(detail: &crate::models::ConversationDetail) -> Vec<String> {
+        detail
+            .turns
+            .iter()
+            .filter(|t| matches!(t.role, TurnRole::User))
+            .flat_map(|t| t.blocks.iter())
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn title_candidate_strips_codeg_terminal_context() {
+        let ctx = test_codeg_terminal_context();
+        assert_eq!(extract_codex_title_candidate(&ctx, true), None);
+        assert_eq!(
+            extract_codex_title_candidate(&format!("是在Worktable的Actor里加么 {ctx}"), true)
+                .as_deref(),
+            Some("是在Worktable的Actor里加么")
+        );
+        assert_eq!(
+            extract_codex_title_candidate(
+                "<codeg_terminal_context version=\"1\">partial</codeg_terminal_context>",
+                true
+            )
+            .as_deref(),
+            Some("<codeg_terminal_context version=\"1\">partial</codeg_terminal_context>")
+        );
+    }
+
+    #[test]
+    fn hides_codeg_terminal_context_from_history_and_title() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time ok")
+            .as_nanos();
+        let path: PathBuf = env::temp_dir().join(format!("codeg-codex-term-ctx-{nanos}.jsonl"));
+        let ctx = test_codeg_terminal_context();
+        let real_plus = format!("是在Worktable的Actor里加么 {ctx}");
+        let lines = [
+            serde_json::json!({
+                "timestamp": "2026-03-01T10:00:00Z",
+                "type": "session_meta",
+                "payload": {"id": "term-ctx", "cwd": "/tmp/demo"}
+            }),
+            serde_json::json!({
+                "timestamp": "2026-03-01T10:00:01Z",
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": ctx}
+            }),
+            serde_json::json!({
+                "timestamp": "2026-03-01T10:00:02Z",
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": real_plus}
+            }),
+            serde_json::json!({
+                "timestamp": "2026-03-01T10:00:03Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "message": "<codeg_terminal_context version=\"1\">partial"
+                }
+            }),
+        ];
+        let content: String = lines.iter().map(|v| format!("{v}\n")).collect();
+        fs::write(&path, content).expect("write test jsonl");
+
+        let parser = CodexParser::new();
+        let summary = parser
+            .parse_jsonl_summary(&path)
+            .expect("parse summary ok")
+            .expect("summary exists");
+        let detail = parser
+            .parse_conversation_detail(&path, "term-ctx")
+            .expect("parse detail ok");
+
+        assert_eq!(summary.title.as_deref(), Some("是在Worktable的Actor里加么"));
+        assert_eq!(detail.summary.title.as_deref(), Some("是在Worktable的Actor里加么"));
+        let visible_user_texts = user_turn_texts(&detail);
+        assert!(!visible_user_texts
+            .iter()
+            .any(|text| text.contains("Selected shell:")));
+        assert!(visible_user_texts
+            .iter()
+            .any(|text| text == "是在Worktable的Actor里加么"));
+        assert!(visible_user_texts
+            .iter()
+            .any(|text| text.contains("partial")));
+
+        let _ = fs::remove_file(path);
     }
 
     #[test]
