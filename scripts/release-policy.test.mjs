@@ -133,7 +133,7 @@ test("finds upstream URLs in runtime-owned files", () => {
 })
 
 test("repository identity matches the MyCodeBuddy release policy", () => {
-  const version = "0.26.1-mycodebuddy.1"
+  const version = "0.27.0-mycodebuddy.1"
   const packageJson = JSON.parse(readRepositoryFile("package.json"))
   const cargoToml = readRepositoryFile("src-tauri/Cargo.toml")
   const tauriConfig = JSON.parse(
@@ -156,7 +156,7 @@ test("repository identity matches the MyCodeBuddy release policy", () => {
   assert.equal(packageJson.version, version)
   assert.match(readRepositoryFile("install.ps1"), new RegExp(`v${version}`))
   const syncGuide = readRepositoryFile("docs/UPSTREAM_SYNC.md")
-  assert.match(syncGuide, /sync\/codeg-0\.26\.1/)
+  assert.match(syncGuide, /sync\/codeg-0\.27\.0/)
   assert.match(syncGuide, new RegExp(version.replaceAll(".", String.raw`\.`)))
   assertComplianceResources(tauriConfig)
   for (const path of [
