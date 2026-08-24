@@ -62,6 +62,9 @@ struct Args {
     features: Option<String>,
     /// Launch role. Omitted by older launchers → Root.
     role: CompanionRole,
+    /// Launch-time depth snapshot. Omitted by older launchers to preserve their
+    /// prior behavior; the main-process broker still enforces the hard limit.
+    can_spawn_child: bool,
     /// Immutable ACP connection incarnation used in fallback tool-call ids.
     connection_incarnation_id: String,
     /// Built-in slugs removed from the closed delegate target enum.
@@ -85,6 +88,7 @@ fn parse_args() -> Result<Args, String> {
     let mut parent_pid = None;
     let mut features = None;
     let mut role = None;
+    let mut can_spawn_child = None;
     let mut connection_incarnation_id = None;
     let mut disabled_agents = None;
 
@@ -130,6 +134,15 @@ fn parse_args() -> Result<Args, String> {
                     .ok_or_else(|| "--role requires a value".to_string())?;
                 role = Some(parse_role(&raw)?);
             }
+            "--can-spawn-child" => {
+                let raw = iter
+                    .next()
+                    .ok_or_else(|| "--can-spawn-child requires a value".to_string())?;
+                can_spawn_child = Some(
+                    raw.parse::<bool>()
+                        .map_err(|e| format!("--can-spawn-child must be true or false: {e}"))?,
+                );
+            }
             "--connection-incarnation-id" => {
                 connection_incarnation_id =
                     Some(iter.next().ok_or_else(|| {
@@ -149,7 +162,7 @@ fn parse_args() -> Result<Args, String> {
             }
             "--help" | "-h" => {
                 println!(
-                    "codeg-mcp --parent-connection-id <uuid> --socket-path <path> --token <secret> [--parent-pid <pid>] [--features delegation,coordination_v1,feedback,ask,sessions,workflow_v2] [--role root|delegation_child] [--disabled-agents <agent>,...] [--custom-agents <ignored>]"
+                    "codeg-mcp --parent-connection-id <uuid> --socket-path <path> --token <secret> [--parent-pid <pid>] [--features delegation,coordination_v1,feedback,ask,sessions,workflow_v2] [--role root|delegation_child] [--can-spawn-child true|false] [--disabled-agents <agent>,...] [--custom-agents <ignored>]"
                 );
                 std::process::exit(0);
             }
@@ -168,6 +181,7 @@ fn parse_args() -> Result<Args, String> {
         features,
         // Older launchers omit --role; default Root for backward compatibility.
         role: role.unwrap_or(CompanionRole::Root),
+        can_spawn_child: can_spawn_child.unwrap_or(true),
         disabled_agents,
     })
 }
@@ -218,6 +232,7 @@ async fn main() -> ExitCode {
         token: args.token.clone(),
         features,
         role: args.role,
+        can_spawn_child: args.can_spawn_child,
         connection_incarnation_id: args.connection_incarnation_id,
         disabled_agents: parse_csv(args.disabled_agents.as_deref()),
     };
@@ -471,6 +486,7 @@ mod tests {
                 completion_v2: false,
             },
             role: CompanionRole::Root,
+            can_spawn_child: true,
             connection_incarnation_id: "test-incarnation".into(),
             disabled_agents: Vec::new(),
         };

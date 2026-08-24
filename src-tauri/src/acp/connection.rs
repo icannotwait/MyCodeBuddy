@@ -1903,6 +1903,8 @@ pub async fn spawn_agent_connection(
     // temporary English defaults; Task 4C wires real sources.
     initial_state.purpose = launch_context.purpose;
     initial_state.effective_locale = launch_context.inherited_locale.unwrap_or(AppLocale::En);
+    let is_delegation_child = launch_context.purpose == ConnectionPurpose::Delegation;
+    let delegation_can_spawn_child = launch_context.delegation_can_spawn_child;
 
     // Install the SessionStarted dedup signal before the first event. A
     // same-generation fallback replaces driver-owned fields inside the exact
@@ -2158,6 +2160,8 @@ pub async fn spawn_agent_connection(
                     workflow_child_mcp_binding,
                     driver_connection_incarnation,
                     driver_route_plan,
+                    is_delegation_child,
+                    delegation_can_spawn_child,
                     route_bootstrap_tx,
                     session_attach_mode,
                     fs_policy,
@@ -2646,6 +2650,7 @@ async fn drain_permissions_locked(
                 status: Some("failed".into()),
                 content: None,
                 raw_input: None,
+                raw_input_is_model_authored: None,
                 raw_output: Some("plan_review_cancelled".into()),
                 raw_output_append: None,
                 locations: None,
@@ -4881,8 +4886,8 @@ fn continuation_enabled_for_launch(
 struct CompanionInjection {
     token: String,
     feedback_available: bool,
-    /// Present when `plan.expose_codeg_delegation` — manager/connection wait
-    /// on this before emitting Connected.
+    /// Present when this launch injects the delegation feature; the connection
+    /// waits on it before emitting Connected.
     delegation_lease: Option<crate::acp::delegation::lease::CompanionLeaseWaiter>,
 }
 
@@ -4896,12 +4901,17 @@ async fn inject_codeg_mcp(
     host_tools: HostToolsPolicy,
     plan: &crate::acp::delegation::route::DelegationRoutePlan,
     connection_incarnation_id: &str,
+    is_delegation_child: bool,
+    can_spawn_child: bool,
     binding: Option<&crate::acp::delegation::workflow::WorkflowChildMcpBinding>,
 ) -> Option<CompanionInjection> {
-    // Feature list follows the immutable launch plan for Codeg delegation —
-    // never the live Broker settings toggle. Feedback/ask/sessions remain
-    // independent launch-time snapshots of their runtime configs.
-    let delegation_enabled = delegation_enabled(plan.expose_codeg_delegation, host_tools);
+    // Children keep the management surface across a settings downgrade;
+    // `can_spawn_child` independently hides new delegation while the broker
+    // remains the hard authority. Roots continue to follow the route plan.
+    let delegation_enabled = delegation_enabled(
+        plan.expose_codeg_delegation || is_delegation_child,
+        host_tools,
+    );
     // Join capability is connection-bound and follows Codeg delegation exposure.
     let coordination_v1 = delegation_enabled;
     let delegation_continuation_v1 = delegation_enabled
@@ -4910,7 +4920,7 @@ async fn inject_codeg_mcp(
             agent_type,
             std::env::var_os("CODEG_DELEGATION_CONTINUATION_V1").as_deref(),
         );
-    let role = if plan.source == crate::acp::delegation::route::DelegationRouteSource::ForcedChild {
+    let role = if is_delegation_child {
         crate::acp::delegation::transport::CompanionRole::DelegationChild
     } else {
         crate::acp::delegation::transport::CompanionRole::Root
@@ -4991,6 +5001,8 @@ async fn inject_codeg_mcp(
         features_arg,
         "--role".to_string(),
         role_arg.to_string(),
+        "--can-spawn-child".to_string(),
+        can_spawn_child.to_string(),
         "--connection-incarnation-id".to_string(),
         connection_incarnation_id.to_string(),
     ];
@@ -5168,7 +5180,8 @@ async fn finish_route_ready(
     use crate::acp::delegation::lease::ready_lease_timeout;
     use crate::acp::delegation::route::RouteDegradedReason;
 
-    if delegation_enabled(route_plan.expose_codeg_delegation, host_tools) {
+    if delegation_enabled(route_plan.expose_codeg_delegation, host_tools) || pending_lease.is_some()
+    {
         let Some(mut waiter) = pending_lease.take() else {
             let mut guard = route_bootstrap_tx.lock().await;
             if let Some(tx) = guard.take() {
@@ -5294,6 +5307,8 @@ async fn run_connection(
     workflow_child_mcp_binding: Option<crate::acp::delegation::workflow::WorkflowChildMcpBinding>,
     connection_incarnation_id: String,
     route_plan: crate::acp::delegation::route::DelegationRoutePlan,
+    is_delegation_child: bool,
+    delegation_can_spawn_child: bool,
     route_bootstrap_tx: tokio::sync::oneshot::Sender<RouteBootstrapOutcome>,
     session_attach_mode: crate::acp::session_attach::SessionAttachMode,
     fs_policy: FsAccessPolicy,
@@ -5860,6 +5875,8 @@ async fn run_connection(
                             host_tools,
                             &route_plan,
                             &connection_incarnation_id,
+                            is_delegation_child,
+                            delegation_can_spawn_child,
                             workflow_child_mcp_binding.as_ref(),
                         )
                         .await
@@ -7417,6 +7434,7 @@ async fn handle_permission_request(
         status: "pending".to_string(),
         content: None,
         raw_input: None,
+        raw_input_is_model_authored: None,
         raw_output: None,
         locations: None,
         meta: req
@@ -15199,6 +15217,7 @@ mod tests {
                         status: "pending".into(),
                         content: None,
                         raw_input: None,
+                        raw_input_is_model_authored: None,
                         raw_output: None,
                         locations: None,
                         meta: None,
@@ -15740,6 +15759,7 @@ mod tests {
                                 status: Some("completed".into()),
                                 content: None,
                                 raw_input: None,
+                                raw_input_is_model_authored: None,
                                 raw_output: Some("provider_completed".into()),
                                 raw_output_append: None,
                                 locations: None,
@@ -26017,6 +26037,8 @@ mod tests {
             HostToolsPolicy::Default,
             &plan,
             "test-incarnation",
+            false,
+            false,
             None,
         )
         .await;
@@ -26037,8 +26059,13 @@ mod tests {
         unsafe {
             std::env::set_var("CODEG_MCP_BIN", std::env::current_exe().unwrap());
         }
-        let mut forced_child_plan = codeg_plan(AgentType::Codex);
-        forced_child_plan.source = DelegationRouteSource::ForcedChild;
+        let mut unmanaged_child_plan = codeg_plan(AgentType::OpenCode);
+        unmanaged_child_plan.managed = false;
+        unmanaged_child_plan.requested = DelegationRoutePolicy::Native;
+        unmanaged_child_plan.effective = DelegationRoutePolicy::Native;
+        unmanaged_child_plan.source = DelegationRouteSource::GlobalDefault;
+        unmanaged_child_plan.native_suppression = NativeSuppressionPlan::None;
+        unmanaged_child_plan.expose_codeg_delegation = false;
         let binding = crate::acp::delegation::workflow::WorkflowChildMcpBinding {
             task_id: "bound-task".into(),
             workflow_id: "bound-workflow".into(),
@@ -26050,10 +26077,12 @@ mod tests {
             &injection,
             "child-connection",
             std::path::Path::new("/tmp"),
-            AgentType::Codex,
+            AgentType::OpenCode,
             HostToolsPolicy::Default,
-            &forced_child_plan,
+            &unmanaged_child_plan,
             "child-incarnation",
+            true,
+            false,
             Some(&binding),
         )
         .await;
@@ -26063,7 +26092,7 @@ mod tests {
                 None => std::env::remove_var("CODEG_MCP_BIN"),
             }
         }
-        let injected = injected.expect("forced child injection");
+        let injected = injected.expect("unmanaged child injection");
 
         let McpServer::Stdio(server) = &servers[0] else {
             panic!("expected stdio companion");
@@ -26072,10 +26101,13 @@ mod tests {
             let index = server.args.iter().position(|value| value == name).unwrap();
             server.args[index + 1].as_str()
         };
-        assert!(!argument_after("--features")
+        let features = argument_after("--features");
+        assert!(features.split(',').any(|feature| feature == "delegation"));
+        assert!(!features
             .split(',')
             .any(|feature| feature == "completion_v2"));
         assert_eq!(argument_after("--role"), "delegation_child");
+        assert_eq!(argument_after("--can-spawn-child"), "false");
         assert_eq!(
             argument_after("--connection-incarnation-id"),
             "child-incarnation"
@@ -26088,6 +26120,47 @@ mod tests {
         );
         assert!(!token.completion_v2);
         assert_eq!(token.bound_task_id.as_deref(), Some("bound-task"));
+    }
+
+    #[tokio::test]
+    async fn management_only_child_waits_for_actual_delegation_lease() {
+        use crate::acp::delegation::lease::CompanionLeaseRegistry;
+        use crate::acp::session_state::SessionState;
+        use crate::web::event_bridge::EventEmitter;
+
+        let plan = native_plan(AgentType::OpenCode);
+        assert!(!plan.expose_codeg_delegation);
+        let state = Arc::new(tokio::sync::RwLock::new(SessionState::new(
+            "management-only-child".into(),
+            AgentType::OpenCode,
+            None,
+            "win".into(),
+            None,
+        )));
+        state.write().await.set_route_plan_snapshot(&plan);
+
+        let leases = CompanionLeaseRegistry::default();
+        let mut pending_lease = Some(leases.register("management-only-token").await);
+        leases.mark_ready("management-only-token").await.unwrap();
+        let (route_bootstrap_tx, _route_bootstrap_rx) = tokio::sync::oneshot::channel();
+        let route_bootstrap_tx = Arc::new(tokio::sync::Mutex::new(Some(route_bootstrap_tx)));
+
+        finish_route_ready(
+            &state,
+            &EventEmitter::Noop,
+            &plan,
+            HostToolsPolicy::Default,
+            &mut pending_lease,
+            &route_bootstrap_tx,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            pending_lease.is_none(),
+            "actual delegation lease must be consumed"
+        );
+        assert!(state.read().await.delegation_route.delegation_available);
     }
 
     // Disabled custom slugs never become companion arguments. Disabled

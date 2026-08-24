@@ -140,6 +140,7 @@ impl TitleConnectionDriver for ManagerTitleConnectionDriver {
                 ConnectionLaunchContext {
                     purpose: ConnectionPurpose::InternalTitle,
                     inherited_locale: Some(locale),
+                    delegation_can_spawn_child: false,
                 },
                 None,
                 None,

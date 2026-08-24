@@ -129,6 +129,24 @@ fn test_control_sender() -> LaneSender<ConnectionControl> {
 /// IM message, or the webhook body.
 const USER_PROMPT_PREVIEW_MAX_CHARS: usize = 500;
 
+fn delegation_child_prompt(task: &str, can_spawn_child: bool) -> String {
+    let nested_delegation = if can_spawn_child {
+        "Nested delegation available: yes. Use it only when the assigned task explicitly requires independent work."
+    } else {
+        "Nested delegation available: no. Do not attempt to create additional subagents."
+    };
+    format!(
+        "{task}\n\n<codeg_delegation_context>\n\
+You are a delegation child working for a parent session.\n\
+Complete the assigned task directly and return the result to the parent.\n\
+Do not broaden the task beyond the delegated scope.\n\
+Follow any skill rule that says dispatched subagents must ignore that skill.\n\
+{nested_delegation}\n\
+When parent input is required, use request_parent_decision when that tool is available; otherwise return the blocker to the parent. Do not ask the user directly.\n\
+</codeg_delegation_context>"
+    )
+}
+
 /// Production primary wait for map absence after unexposed teardown.
 const TEARDOWN_MAP_WAIT_PRIMARY: Duration = Duration::from_secs(5);
 /// Production extended wait after primary timeout before fail-closed.
@@ -136,10 +154,14 @@ const TEARDOWN_MAP_WAIT_EXTENDED: Duration = Duration::from_secs(2);
 
 /// Launch policy for delegated children. Built only by the spawn-owned parent
 /// launch snapshot resolver that `ConnectionManagerSpawner::spawn` consumes.
-fn delegation_launch_context(parent_effective_locale: AppLocale) -> ConnectionLaunchContext {
+fn delegation_launch_context(
+    parent_effective_locale: AppLocale,
+    can_spawn_child: bool,
+) -> ConnectionLaunchContext {
     ConnectionLaunchContext {
         purpose: ConnectionPurpose::Delegation,
         inherited_locale: Some(parent_effective_locale),
+        delegation_can_spawn_child: can_spawn_child,
     }
 }
 
@@ -151,6 +173,7 @@ fn internal_probe_launch_context() -> ConnectionLaunchContext {
     ConnectionLaunchContext {
         purpose: ConnectionPurpose::InternalProbe,
         inherited_locale: None,
+        delegation_can_spawn_child: false,
     }
 }
 
@@ -5334,7 +5357,16 @@ impl ConnectionManager {
                     // "Untitled" until the first detail load backfills it. Roots
                     // (no delegation) keep `None` and follow the existing backfill.
                     let seed_title = if delegation.is_some() {
-                        delegation_child_title_seed(&blocks)
+                        match capture
+                            .as_ref()
+                            .and_then(|capture| capture.visible_text.as_deref())
+                        {
+                            Some(text) if !text.trim().is_empty() => {
+                                Some(crate::parsers::title_from_user_text(text.trim()))
+                            }
+                            Some(_) => None,
+                            None => delegation_child_title_seed(&blocks),
+                        }
                     } else {
                         None
                     };
@@ -9477,6 +9509,7 @@ impl ConnectionManagerSpawner {
     async fn resolve_parent_spawn_launch_snapshot(
         &self,
         parent_connection_id: &str,
+        can_spawn_child: bool,
     ) -> Result<ParentSpawnLaunchSnapshot, crate::acp::delegation::spawner::SpawnerError> {
         use crate::acp::delegation::spawner::SpawnerError;
         // Falling back is not safe: a child whose emitter is wired to a
@@ -9501,7 +9534,7 @@ impl ConnectionManagerSpawner {
             owner_operation_id: parent.owner_operation_id.clone(),
             ownership_generation: parent.ownership_generation,
             parent_working_dir,
-            launch_context: delegation_launch_context(parent_locale),
+            launch_context: delegation_launch_context(parent_locale, can_spawn_child),
         })
     }
 }
@@ -9515,10 +9548,11 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
         working_dir: Option<String>,
         preferred_mode_id: Option<String>,
         preferred_config_values: BTreeMap<String, String>,
+        can_spawn_child: bool,
     ) -> Result<String, crate::acp::delegation::spawner::SpawnerError> {
         use crate::acp::delegation::spawner::SpawnerError;
         let parent = self
-            .resolve_parent_spawn_launch_snapshot(parent_connection_id)
+            .resolve_parent_spawn_launch_snapshot(parent_connection_id, can_spawn_child)
             .await?;
         let effective_working_dir = working_dir.or(parent.parent_working_dir);
 
@@ -9567,11 +9601,12 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
         working_dir: Option<String>,
         preferred_mode_id: Option<String>,
         preferred_config_values: BTreeMap<String, String>,
+        can_spawn_child: bool,
         workflow_binding: Option<crate::acp::delegation::workflow::WorkflowChildMcpBinding>,
     ) -> Result<String, crate::acp::delegation::spawner::SpawnerError> {
         use crate::acp::delegation::spawner::SpawnerError;
         let parent = self
-            .resolve_parent_spawn_launch_snapshot(parent_connection_id)
+            .resolve_parent_spawn_launch_snapshot(parent_connection_id, can_spawn_child)
             .await?;
         let effective_working_dir = working_dir.or(parent.parent_working_dir);
         let runtime = self.runtime.snapshot();
@@ -9616,11 +9651,12 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
         preferred_config_values: BTreeMap<String, String>,
         external_session_id: String,
         preallocated_connection_id: Option<String>,
+        can_spawn_child: bool,
     ) -> Result<String, crate::acp::delegation::spawner::SpawnerError> {
         use crate::acp::delegation::spawner::SpawnerError;
         use crate::acp::session_attach::SessionAttachMode;
         let parent = self
-            .resolve_parent_spawn_launch_snapshot(parent_connection_id)
+            .resolve_parent_spawn_launch_snapshot(parent_connection_id, can_spawn_child)
             .await?;
         let effective_working_dir = working_dir.or(parent.parent_working_dir);
         let runtime = self.runtime.snapshot();
@@ -9664,11 +9700,12 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
         preferred_config_values: BTreeMap<String, String>,
         external_session_id: String,
         preallocated_connection_id: Option<String>,
+        can_spawn_child: bool,
         workflow_binding: Option<crate::acp::delegation::workflow::WorkflowChildMcpBinding>,
     ) -> Result<String, crate::acp::delegation::spawner::SpawnerError> {
         use crate::acp::delegation::spawner::SpawnerError;
         let parent = self
-            .resolve_parent_spawn_launch_snapshot(parent_connection_id)
+            .resolve_parent_spawn_launch_snapshot(parent_connection_id, can_spawn_child)
             .await?;
         let effective_working_dir = working_dir.or(parent.parent_working_dir);
         let runtime = self.runtime.snapshot();
@@ -9708,6 +9745,7 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
         &self,
         conn_id: &str,
         task: String,
+        can_spawn_child: bool,
         link: crate::acp::delegation::spawner::DelegationLink,
         prebound_child: Option<(i32, i32)>,
     ) -> Result<
@@ -9757,12 +9795,13 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
         // Broker task is the authoritative visible text; locale resolves via
         // the child's inherited effective_locale (capture locale = None).
         let capture = Some(PromptCaptureContext::new(Some(task.clone()), None));
+        let agent_prompt = delegation_child_prompt(&task, can_spawn_child);
         match self
             .manager
             .send_prompt_linked(
                 &self.db,
                 conn_id,
-                vec![PromptInputBlock::Text { text: task }],
+                vec![PromptInputBlock::Text { text: agent_prompt }],
                 folder_id,
                 conversation_id,
                 link_for_send,
@@ -12400,6 +12439,7 @@ mod tests {
                 None,
                 None,
                 BTreeMap::new(),
+                false,
             )
             .await;
         match child {
@@ -12837,7 +12877,7 @@ mod tests {
         // Production spawn-owned resolver: must read live parent state and build
         // Delegation + parent effective_locale (not English default).
         let snapshot = spawner
-            .resolve_parent_spawn_launch_snapshot(parent_id)
+            .resolve_parent_spawn_launch_snapshot(parent_id, true)
             .await
             .expect("parent spawn launch snapshot");
         assert_eq!(
@@ -12849,6 +12889,7 @@ mod tests {
             Some(AppLocale::ZhCn),
             "delegated child must inherit parent effective_locale, not English default"
         );
+        assert!(snapshot.launch_context.delegation_can_spawn_child);
         assert_eq!(
             snapshot.parent_working_dir.as_deref(),
             Some(parent_workdir.to_string_lossy().as_ref())
@@ -12887,6 +12928,7 @@ mod tests {
             .send_prompt_linked_for_delegation(
                 child_id,
                 task.clone(),
+                false,
                 DelegationLink {
                     parent_conversation_id: parent_conversation.id,
                     parent_tool_use_id: "tu-locale".into(),
@@ -12902,14 +12944,33 @@ mod tests {
             "accepted path must sample prompt_accepted_at"
         );
 
-        // Drain the enqueued command so the receiver stays live for the assert.
-        let _ = child_rx.try_recv();
+        let command = child_rx.try_recv().expect("delegation prompt");
+        let ConnectionCommand::Prompt { blocks, .. } = command else {
+            panic!("delegation kickoff must enqueue a Prompt command");
+        };
+        let PromptInputBlock::Text { text } = &blocks[0] else {
+            panic!("delegation kickoff must remain a text prompt");
+        };
+        assert!(text.starts_with(&task));
+        assert!(text.contains("You are a delegation child working for a parent session."));
+        assert!(text.contains("Nested delegation available: no."));
+        assert!(text.contains("use request_parent_decision when that tool is available"));
 
         let job = auto_title_job::Entity::find_by_id(conversation_id)
             .one(&db.conn)
             .await
             .expect("query job")
             .expect("job enrolled");
+        let child = crate::db::entities::conversation::Entity::find_by_id(conversation_id)
+            .one(&db.conn)
+            .await
+            .expect("query child")
+            .expect("child conversation");
+        assert_eq!(
+            child.title.as_deref(),
+            Some(crate::parsers::title_from_user_text(&task).as_str()),
+            "child title must use the raw broker task, not the injected identity envelope"
+        );
         assert_eq!(
             job.first_user_text.as_deref(),
             Some(task.as_str()),
@@ -13006,6 +13067,7 @@ mod tests {
             .send_prompt_linked_for_delegation(
                 child_id,
                 "task body for stale timestamp".into(),
+                false,
                 DelegationLink {
                     parent_conversation_id: parent_conversation.id,
                     parent_tool_use_id: "tu-stale-ts".into(),
@@ -13085,6 +13147,7 @@ mod tests {
             .send_prompt_linked_for_delegation(
                 child_id,
                 "reg-only manager task".into(),
+                false,
                 DelegationLink {
                     parent_conversation_id: parent_conversation.id,
                     parent_tool_use_id: "tu-mgr-reg-only".into(),
@@ -13174,6 +13237,7 @@ mod tests {
             .send_prompt_linked_for_delegation(
                 child_id,
                 "reg-only closed task".into(),
+                false,
                 DelegationLink {
                     parent_conversation_id: parent_conversation.id,
                     parent_tool_use_id: "tu-mgr-reg-closed".into(),

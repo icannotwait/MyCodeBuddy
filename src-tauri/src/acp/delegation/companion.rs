@@ -349,6 +349,9 @@ pub struct CompanionContext {
     pub features: CompanionFeatures,
     /// Immutable launch role (`--role root|delegation_child`).
     pub role: CompanionRole,
+    /// Launch-time depth snapshot. The broker remains the hard authority when
+    /// settings change after launch; this only suppresses doomed child spawns.
+    pub can_spawn_child: bool,
     /// Immutable ACP connection incarnation supplied by the launcher.
     pub connection_incarnation_id: String,
     /// Built-in agent slugs disabled in settings. These may only narrow the
@@ -388,6 +391,10 @@ impl CompanionContext {
             | "publish_workflow_manifest"
             | "settle_workflow_gate"
             | "recover_workflow" => self.features.workflow_v2 && self.role == CompanionRole::Root,
+            "delegate_to_agent" => {
+                self.features.delegation
+                    && (self.role == CompanionRole::Root || self.can_spawn_child)
+            }
             other => self.features.allows_legacy_tool(other),
         }
     }
@@ -3096,6 +3103,7 @@ mod tests {
             token: "tok".into(),
             features,
             role: CompanionRole::Root,
+            can_spawn_child: true,
             connection_incarnation_id: "test-incarnation".into(),
             disabled_agents: Vec::new(),
         }
@@ -7437,6 +7445,7 @@ mod tests {
             token: "tok".into(),
             features: FEEDBACK_ONLY,
             role: CompanionRole::Root,
+            can_spawn_child: true,
             connection_incarnation_id: "test-incarnation".into(),
             disabled_agents: Vec::new(),
         };
@@ -7495,6 +7504,36 @@ mod tests {
         assert!(child.contains(&"request_parent_decision".into()));
         assert!(child.contains(&"reply_to_delegation".into()));
         assert_no_generic_coordination_side_channel_tools(&child);
+    }
+
+    #[tokio::test]
+    async fn depth_limited_child_hides_only_new_delegation_tool() {
+        let mut child = coordination_child();
+        child.can_spawn_child = false;
+
+        let names = tool_names(dispatch_with_context(child.clone(), tools_list()).await);
+        assert!(!names.contains(&"delegate_to_agent".into()));
+        assert!(names.contains(&"continue_delegation".into()));
+        assert!(names.contains(&"get_delegation_status".into()));
+        assert!(names.contains(&"cancel_delegation".into()));
+
+        let response = unwrap_respond(
+            dispatch_with_context(
+                child,
+                &call(
+                    11,
+                    "delegate_to_agent",
+                    json!({"agent_type":"codex","task":"nested"}),
+                ),
+            )
+            .await,
+        );
+        assert_eq!(response.error.unwrap().code, -32602);
+
+        let mut child_with_capacity = coordination_child();
+        child_with_capacity.can_spawn_child = true;
+        let names = tool_names(dispatch_with_context(child_with_capacity, tools_list()).await);
+        assert!(names.contains(&"delegate_to_agent".into()));
     }
 
     #[tokio::test]

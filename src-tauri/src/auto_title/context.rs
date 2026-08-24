@@ -210,6 +210,7 @@ mod tests {
         let launch = ConnectionLaunchContext {
             purpose: ConnectionPurpose::User,
             inherited_locale: Some(AppLocale::En),
+            delegation_can_spawn_child: false,
         };
         assert_eq!(launch.purpose, ConnectionPurpose::User);
         assert_eq!(launch.inherited_locale, Some(AppLocale::En));

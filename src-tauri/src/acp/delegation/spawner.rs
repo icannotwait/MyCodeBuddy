@@ -127,6 +127,7 @@ pub trait ConnectionSpawner: Send + Sync {
         working_dir: Option<String>,
         preferred_mode_id: Option<String>,
         preferred_config_values: BTreeMap<String, String>,
+        can_spawn_child: bool,
     ) -> Result<String, SpawnerError>;
 
     /// Task-6 forced-child launch carrying a binding read from committed
@@ -138,6 +139,7 @@ pub trait ConnectionSpawner: Send + Sync {
         working_dir: Option<String>,
         preferred_mode_id: Option<String>,
         preferred_config_values: BTreeMap<String, String>,
+        can_spawn_child: bool,
         _workflow_binding: Option<WorkflowChildMcpBinding>,
     ) -> Result<String, SpawnerError> {
         self.spawn(
@@ -146,6 +148,7 @@ pub trait ConnectionSpawner: Send + Sync {
             working_dir,
             preferred_mode_id,
             preferred_config_values,
+            can_spawn_child,
         )
         .await
     }
@@ -165,6 +168,7 @@ pub trait ConnectionSpawner: Send + Sync {
         preferred_config_values: BTreeMap<String, String>,
         external_session_id: String,
         preallocated_connection_id: Option<String>,
+        can_spawn_child: bool,
     ) -> Result<String, SpawnerError>;
 
     #[allow(clippy::too_many_arguments)]
@@ -177,6 +181,7 @@ pub trait ConnectionSpawner: Send + Sync {
         preferred_config_values: BTreeMap<String, String>,
         external_session_id: String,
         preallocated_connection_id: Option<String>,
+        can_spawn_child: bool,
         _workflow_binding: Option<WorkflowChildMcpBinding>,
     ) -> Result<String, SpawnerError> {
         self.spawn_resume_existing(
@@ -187,6 +192,7 @@ pub trait ConnectionSpawner: Send + Sync {
             preferred_config_values,
             external_session_id,
             preallocated_connection_id,
+            can_spawn_child,
         )
         .await
     }
@@ -208,6 +214,7 @@ pub trait ConnectionSpawner: Send + Sync {
         &self,
         conn_id: &str,
         task: String,
+        can_spawn_child: bool,
         link: DelegationLink,
         prebound_child: Option<(i32, i32)>,
     ) -> Result<AcceptedDelegationPrompt, SpawnerError>;
@@ -272,6 +279,7 @@ pub mod mock {
         pub working_dir: Option<String>,
         pub preferred_mode_id: Option<String>,
         pub preferred_config_values: BTreeMap<String, String>,
+        pub can_spawn_child: bool,
         pub workflow_binding: Option<WorkflowChildMcpBinding>,
     }
 
@@ -283,6 +291,7 @@ pub mod mock {
         pub working_dir: Option<String>,
         pub external_session_id: String,
         pub preallocated_connection_id: Option<String>,
+        pub can_spawn_child: bool,
         pub workflow_binding: Option<WorkflowChildMcpBinding>,
     }
 
@@ -336,6 +345,7 @@ pub mod mock {
             working_dir: Option<String>,
             preferred_mode_id: Option<String>,
             preferred_config_values: BTreeMap<String, String>,
+            can_spawn_child: bool,
         ) -> Result<String, SpawnerError> {
             self.spawn_args.lock().await.push(SpawnCallArgs {
                 parent_connection_id: parent_connection_id.to_string(),
@@ -343,6 +353,7 @@ pub mod mock {
                 working_dir,
                 preferred_mode_id,
                 preferred_config_values,
+                can_spawn_child,
                 workflow_binding: None,
             });
             // Honor a test-installed gate: block here (after recording the call,
@@ -366,6 +377,7 @@ pub mod mock {
             working_dir: Option<String>,
             preferred_mode_id: Option<String>,
             preferred_config_values: BTreeMap<String, String>,
+            can_spawn_child: bool,
             workflow_binding: Option<WorkflowChildMcpBinding>,
         ) -> Result<String, SpawnerError> {
             self.spawn_args.lock().await.push(SpawnCallArgs {
@@ -374,6 +386,7 @@ pub mod mock {
                 working_dir,
                 preferred_mode_id,
                 preferred_config_values,
+                can_spawn_child,
                 workflow_binding,
             });
             let gate = self.spawn_gate.lock().await.take();
@@ -396,6 +409,7 @@ pub mod mock {
             preferred_config_values: BTreeMap<String, String>,
             external_session_id: String,
             preallocated_connection_id: Option<String>,
+            can_spawn_child: bool,
         ) -> Result<String, SpawnerError> {
             self.resume_args.lock().await.push(ResumeCallArgs {
                 parent_connection_id: parent_connection_id.to_string(),
@@ -403,6 +417,7 @@ pub mod mock {
                 working_dir: working_dir.clone(),
                 external_session_id,
                 preallocated_connection_id: preallocated_connection_id.clone(),
+                can_spawn_child,
                 workflow_binding: None,
             });
             // Reuse spawn queue; when preallocated, prefer returning that id
@@ -414,6 +429,7 @@ pub mod mock {
                     working_dir,
                     preferred_mode_id,
                     preferred_config_values,
+                    can_spawn_child,
                 )
                 .await;
             match result {
@@ -436,6 +452,7 @@ pub mod mock {
             preferred_config_values: BTreeMap<String, String>,
             external_session_id: String,
             preallocated_connection_id: Option<String>,
+            can_spawn_child: bool,
             workflow_binding: Option<WorkflowChildMcpBinding>,
         ) -> Result<String, SpawnerError> {
             self.resume_args.lock().await.push(ResumeCallArgs {
@@ -444,6 +461,7 @@ pub mod mock {
                 working_dir: working_dir.clone(),
                 external_session_id,
                 preallocated_connection_id: preallocated_connection_id.clone(),
+                can_spawn_child,
                 workflow_binding: workflow_binding.clone(),
             });
             let result = self
@@ -453,6 +471,7 @@ pub mod mock {
                     working_dir,
                     preferred_mode_id,
                     preferred_config_values,
+                    can_spawn_child,
                     workflow_binding,
                 )
                 .await;
@@ -471,6 +490,7 @@ pub mod mock {
             &self,
             _conn_id: &str,
             _task: String,
+            _can_spawn_child: bool,
             _link: DelegationLink,
             prebound_child: Option<(i32, i32)>,
         ) -> Result<AcceptedDelegationPrompt, SpawnerError> {
@@ -522,6 +542,7 @@ pub mod mock {
                     None,
                     None,
                     BTreeMap::new(),
+                    false,
                 )
                 .await
                 .unwrap_err();

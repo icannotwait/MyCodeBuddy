@@ -2736,6 +2736,7 @@ async fn run_capability_case(case: CapabilityCase) -> CapabilityResult {
         token: child_token,
         features: HISTORICAL_COMPLETION_CHILD_FEATURES,
         role: CompanionRole::DelegationChild,
+        can_spawn_child: true,
         connection_incarnation_id: format!("incarnation-{task_id}"),
         disabled_agents: Vec::new(),
     };
@@ -2745,6 +2746,7 @@ async fn run_capability_case(case: CapabilityCase) -> CapabilityResult {
         token: root_token,
         features: HISTORICAL_WORKFLOW_ROOT_FEATURES,
         role: CompanionRole::Root,
+        can_spawn_child: true,
         connection_incarnation_id: format!("root-incarnation-{task_id}"),
         disabled_agents: Vec::new(),
     };

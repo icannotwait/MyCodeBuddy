@@ -55,6 +55,7 @@ pub(crate) async fn channel_launch_context_from_db(
     ConnectionLaunchContext {
         purpose: ConnectionPurpose::User,
         inherited_locale: Some(resolve_channel_app_locale(db).await),
+        delegation_can_spawn_child: false,
     }
 }
 

@@ -111,6 +111,7 @@ impl DocumentConnectionDriver for ManagerDocumentConnectionDriver {
                 ConnectionLaunchContext {
                     purpose: ConnectionPurpose::InternalTranslate,
                     inherited_locale: Some(locale),
+                    delegation_can_spawn_child: false,
                 },
                 None,
                 None,

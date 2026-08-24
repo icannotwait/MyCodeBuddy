@@ -10155,6 +10155,7 @@ mod tests {
                 completion_v2: false,
             },
             role: CompanionRole::Root,
+            can_spawn_child: true,
             connection_incarnation_id: "test-incarnation".into(),
             disabled_agents: Vec::new(),
         };

@@ -170,6 +170,7 @@ impl ConnectionPurpose {
 pub struct ConnectionLaunchContext {
     pub purpose: ConnectionPurpose,
     pub inherited_locale: Option<AppLocale>,
+    pub delegation_can_spawn_child: bool,
 }
 
 impl Default for ConnectionLaunchContext {
@@ -180,6 +181,7 @@ impl Default for ConnectionLaunchContext {
         Self {
             purpose: ConnectionPurpose::User,
             inherited_locale: Some(AppLocale::En),
+            delegation_can_spawn_child: false,
         }
     }
 }
@@ -272,6 +274,7 @@ pub async fn user_launch_context_from_db(conn: &DatabaseConnection) -> Connectio
     ConnectionLaunchContext {
         purpose: ConnectionPurpose::User,
         inherited_locale: Some(language),
+        delegation_can_spawn_child: false,
     }
 }
 

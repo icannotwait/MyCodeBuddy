@@ -6288,7 +6288,8 @@ impl DelegationBroker {
         // The child the broker is about to create would sit at `parent_depth + 1`.
         // Reject only when the *child* depth would strictly exceed the limit;
         // a child sitting exactly at `depth_limit` is allowed.
-        if parent_depth + 1 > cfg.depth_limit {
+        let child_depth = parent_depth + 1;
+        if child_depth > cfg.depth_limit {
             self.drop_inflight(inflight_id).await;
             return report_err(
                 req.agent_type,
@@ -6299,6 +6300,7 @@ impl DelegationBroker {
                 None,
             );
         }
+        let can_spawn_child = child_depth < cfg.depth_limit;
 
         // --- Spawn child connection --------------------------------------------
         // Pull per-agent overrides from the broker config (defaults to empty).
@@ -7008,6 +7010,7 @@ impl DelegationBroker {
                 req.working_dir.clone(),
                 live_launch.preferred_mode_id.clone(),
                 live_launch.preferred_config_values.clone(),
+                can_spawn_child,
                 workflow_binding,
             )
             .await;
@@ -7403,6 +7406,7 @@ impl DelegationBroker {
             .send_prompt_linked_for_delegation(
                 &child_connection_id,
                 dispatch_prompt,
+                can_spawn_child,
                 link,
                 prebound_child,
             )
@@ -9905,6 +9909,30 @@ impl DelegationBroker {
         }
 
         let cfg = self.config_snapshot().await;
+        let can_spawn_child = {
+            let lookup = self.depth_lookup.clone();
+            match crate::acp::delegation::depth::compute_depth(
+                reserved.child_conversation_id,
+                |id| {
+                    let lookup = lookup.clone();
+                    async move { lookup.parent_of(id).await }
+                },
+                cfg.depth_limit + 1,
+            )
+            .await
+            {
+                Ok(depth) => cfg.enabled && depth < cfg.depth_limit,
+                Err(error) => {
+                    tracing::warn!(
+                        task_id = %reserved.task_id,
+                        child_conversation_id = reserved.child_conversation_id,
+                        error = %error,
+                        "[delegation] failed to resolve continuation depth; suppressing nested delegation tool"
+                    );
+                    false
+                }
+            }
+        };
         if let Some(report) = self
             .continue_abort_if_handoff_closed(ContinueHandoffGate {
                 task_id: &reserved.task_id,
@@ -10185,6 +10213,7 @@ impl DelegationBroker {
                 preferred_config,
                 external_id,
                 Some(handoff.child_connection_id.clone()),
+                can_spawn_child,
                 workflow_binding,
             )
             .await;
@@ -10457,6 +10486,7 @@ impl DelegationBroker {
             .send_prompt_linked_for_delegation(
                 &child_connection_id,
                 dispatch_prompt,
+                can_spawn_child,
                 link,
                 Some((reserved.child_conversation_id, folder_id)),
             )
@@ -23649,6 +23679,48 @@ mod tests {
             .await;
         let outcome = driver.await.unwrap();
         assert!(matches!(outcome, DelegationOutcome::Ok(_)));
+        assert!(mock.spawn_args.lock().await[0].can_spawn_child);
+    }
+
+    #[tokio::test]
+    async fn child_at_depth_limit_cannot_spawn_another_child() {
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("c2".into())).await;
+        mock.queue_send(Ok(accepted(8, Utc::now()))).await;
+        let lookup =
+            Arc::new(MockDepth(vec![(1, None), (2, Some(1))])) as Arc<dyn ConversationDepthLookup>;
+        let broker = DelegationBroker::new(mock.clone() as Arc<dyn ConnectionSpawner>, lookup);
+        broker
+            .set_config(DelegationConfig {
+                enabled: true,
+                depth_limit: 2,
+                ..DelegationConfig::default()
+            })
+            .await;
+
+        let driver = {
+            let broker = broker.clone();
+            tokio::spawn(async move { broker.handle_request(request(2, "pt-2")).await })
+        };
+        while broker.pending_count().await == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let call_id = broker.peek_first_pending_call_id().await.unwrap();
+        broker
+            .complete_call(
+                &call_id,
+                DelegationOutcome::Ok(DelegationSuccess {
+                    text: "ok".into(),
+                    child_conversation_id: 8,
+                    child_agent_type: AgentType::ClaudeCode,
+                    turn_count: 1,
+                    duration_ms: 5,
+                    token_usage: None,
+                }),
+            )
+            .await;
+        assert!(matches!(driver.await.unwrap(), DelegationOutcome::Ok(_)));
+        assert!(!mock.spawn_args.lock().await[0].can_spawn_child);
     }
 
     // -- Meta writer lifecycle --------------------------------------------
@@ -27791,6 +27863,7 @@ mod tests {
                 working_dir: Option<String>,
                 preferred_mode_id: Option<String>,
                 preferred_config_values: BTreeMap<String, String>,
+                can_spawn_child: bool,
             ) -> Result<String, SpawnerError> {
                 self.inner
                     .spawn(
@@ -27799,6 +27872,7 @@ mod tests {
                         working_dir,
                         preferred_mode_id,
                         preferred_config_values,
+                        can_spawn_child,
                     )
                     .await
             }
@@ -27811,6 +27885,7 @@ mod tests {
                 preferred_config_values: BTreeMap<String, String>,
                 external_session_id: String,
                 preallocated_connection_id: Option<String>,
+                can_spawn_child: bool,
             ) -> Result<String, SpawnerError> {
                 self.inner
                     .spawn_resume_existing(
@@ -27821,6 +27896,7 @@ mod tests {
                         preferred_config_values,
                         external_session_id,
                         preallocated_connection_id,
+                        can_spawn_child,
                     )
                     .await
             }
@@ -27828,11 +27904,18 @@ mod tests {
                 &self,
                 connection_id: &str,
                 prompt: String,
+                can_spawn_child: bool,
                 link: crate::acp::delegation::spawner::DelegationLink,
                 prebound: Option<(i32, i32)>,
             ) -> Result<AcceptedDelegationPrompt, SpawnerError> {
                 self.inner
-                    .send_prompt_linked_for_delegation(connection_id, prompt, link, prebound)
+                    .send_prompt_linked_for_delegation(
+                        connection_id,
+                        prompt,
+                        can_spawn_child,
+                        link,
+                        prebound,
+                    )
                     .await
             }
             async fn cancel(&self, conn_id: &str) -> Result<(), SpawnerError> {
@@ -36585,6 +36668,9 @@ mod tests {
             "binding-continue-root",
         )
         .await;
+        let mut config = broker.config_snapshot().await;
+        config.enabled = false;
+        broker.set_config(config).await;
         mock.queue_spawn(Ok("binding-continue-process".into()))
             .await;
         mock.queue_send(Ok(accepted(child_id, Utc::now()))).await;
@@ -36620,6 +36706,7 @@ mod tests {
         );
         let resume_args = mock.resume_args.lock().await;
         assert_eq!(resume_args.len(), 1);
+        assert!(!resume_args[0].can_spawn_child);
         assert_eq!(
             resume_args[0].workflow_binding,
             Some(crate::acp::delegation::workflow::WorkflowChildMcpBinding {
