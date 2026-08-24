@@ -1179,6 +1179,7 @@ fn build_historical_run_meta(run: &DelegationRunSnapshot) -> serde_json::Value {
         "root_task_id": run.root_task_id,
         "generation": run.generation,
         "child_conversation_id": run.child_conversation_id,
+        "agent_type": run.agent_type,
         "synthetic_historical": true,
     });
     let object = value
@@ -3957,6 +3958,7 @@ Call get_delegation_status with the returned task_id to collect the result.";
             assert_eq!(inner["task_id"], expected_task_id);
             assert_eq!(inner["generation"], expected_generation);
             assert_eq!(inner["child_conversation_id"], 42);
+            assert_eq!(inner["agent_type"], "grok");
             assert_eq!(inner["synthetic_historical"], true);
         }
     }

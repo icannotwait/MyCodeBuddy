@@ -82,6 +82,8 @@ const KNOWN_AGENT_TYPES: ReadonlySet<AgentType> = new Set<AgentType>(
 
 export type ParsedMeta = {
   status: DelegationStatus
+  /** Durable run agent used when continuation input omits agent_type. */
+  agentType: AgentType | null
   /** Bounded broker task preview for identity-less parent tool calls. */
   task: string | null
   taskId: string | null
@@ -268,12 +270,18 @@ export function parseDelegationMeta(
   }
   const child_connection_id = obj["child_connection_id"]
   const child_conversation_id = obj["child_conversation_id"]
+  const agent_type = obj["agent_type"]
   const error_code = obj["error_code"]
   const task_preview = obj["task_preview"]
   const task_id = obj["task_id"]
   const generation = obj["generation"]
   return {
     status,
+    agentType:
+      typeof agent_type === "string" &&
+      KNOWN_AGENT_TYPES.has(agent_type as AgentType)
+        ? (agent_type as AgentType)
+        : null,
     task:
       typeof task_preview === "string" && task_preview ? task_preview : null,
     taskId: readNonEmptyString(task_id),

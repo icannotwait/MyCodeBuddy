@@ -82,6 +82,7 @@ describe("parseDelegationMeta", () => {
 
     expect(parsed).toEqual({
       status: "ok",
+      agentType: null,
       task: null,
       taskId: "task-abc",
       childConnectionId: "child-conn",
@@ -102,6 +103,7 @@ describe("parseDelegationMeta", () => {
       parseDelegationMeta({
         "codeg.delegation": {
           status: "completed",
+          agent_type: "codex",
           task_id: "run-3",
           child_conversation_id: 42,
           generation: 3,
@@ -109,12 +111,27 @@ describe("parseDelegationMeta", () => {
         },
       })
     ).toMatchObject({
+      agentType: "codex",
       taskId: "run-3",
       childConversationId: 42,
       generation: 3,
       syntheticHistorical: true,
     })
   })
+
+  it.each([42, "unknown-agent"])(
+    "rejects invalid historical agent_type %j",
+    (agentType) => {
+      expect(
+        parseDelegationMeta({
+          "codeg.delegation": {
+            status: "completed",
+            agent_type: agentType,
+          },
+        })?.agentType
+      ).toBeNull()
+    }
+  )
 
   it("returns null runtimeStats when shape invalid", () => {
     expect(

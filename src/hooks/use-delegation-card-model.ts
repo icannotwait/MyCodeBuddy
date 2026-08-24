@@ -671,6 +671,7 @@ export function buildDelegationCardModel(input: {
   const agentType: AgentType | null =
     effectiveBinding?.agentType ??
     parsedInput.agentType ??
+    parsedMeta?.agentType ??
     agentTypeFromRunSnapshot(effectiveRunSnapshot)
   // Cold recovery may only have summary error_code — fold projection last.
   // Correlation failures never mint a run snapshot; surface the wire code from

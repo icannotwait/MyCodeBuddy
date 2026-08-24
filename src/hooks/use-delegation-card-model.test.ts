@@ -10,6 +10,7 @@ import {
 import type { DelegationBinding } from "@/lib/delegation-binding-reduce"
 import type { ChildCardProjection } from "@/lib/delegation-child-projection-cache"
 import {
+  parseDelegationMeta,
   parseInput,
   type ParsedMeta,
   type ParsedToolOutput,
@@ -82,6 +83,7 @@ function binding(
 function meta(overrides: Partial<ParsedMeta> = {}): ParsedMeta {
   return {
     status: "running",
+    agentType: null,
     task: null,
     taskId: "task-meta",
     childConnectionId: "c-meta",
@@ -1321,6 +1323,55 @@ describe("mergeDelegationWorkUnitModel", () => {
 })
 
 describe("buildDelegationCardModel — identity + secondary", () => {
+  it("restores a historical continuation agent before snapshot hydration", () => {
+    const parsedMeta = parseDelegationMeta({
+      "codeg.delegation": {
+        status: "completed",
+        agent_type: "grok",
+        task_id: "run-2",
+        child_conversation_id: 99,
+        generation: 2,
+        synthetic_historical: true,
+      },
+    })
+
+    const model = build({
+      parsedInput: parseInput(
+        JSON.stringify({ task_id: "run-1", task: "continue the review" })
+      ),
+      parsedMeta,
+      runSnapshot: null,
+    })
+
+    expect(model.agentType).toBe("grok")
+  })
+
+  it("keeps historical identity after a malformed snapshot hydrates", () => {
+    const parsedMeta = parseDelegationMeta({
+      "codeg.delegation": {
+        status: "completed",
+        agent_type: "grok",
+        task_id: "run-2",
+        child_conversation_id: 99,
+        generation: 2,
+        synthetic_historical: true,
+      },
+    })
+
+    const model = build({
+      parsedInput: parseInput(
+        JSON.stringify({ task_id: "run-1", task: "continue the review" })
+      ),
+      parsedMeta,
+      runSnapshot: runSnapshot({
+        task_id: "run-2",
+        agent_type: "unknown-agent",
+      }),
+    })
+
+    expect(model.agentType).toBe("grok")
+  })
+
   it("prefers binding identity and broker task id", () => {
     const model = build({
       binding: binding({
