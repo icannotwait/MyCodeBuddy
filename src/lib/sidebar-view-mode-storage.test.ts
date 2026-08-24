@@ -5,10 +5,12 @@ import {
   loadSectionCollapsed,
   loadSectionOrder,
   loadShowRecent,
+  loadSortMode,
   moveSectionInOrder,
   normalizeSectionOrder,
   saveSectionOrder,
   saveShowRecent,
+  saveSortMode,
 } from "./sidebar-view-mode-storage"
 
 const SECTION_ORDER_KEY = "workspace:sidebar-section-order"
@@ -113,6 +115,21 @@ describe("section-order persistence", () => {
   it("falls back to the default for corrupt JSON", () => {
     localStorage.setItem(SECTION_ORDER_KEY, "{oops")
     expect(loadSectionOrder()).toEqual(DEFAULT_SECTION_ORDER)
+  })
+})
+
+describe("loadSortMode", () => {
+  beforeEach(() => localStorage.clear())
+
+  it("defaults to updated so a fresh reply promotes the session", () => {
+    expect(loadSortMode()).toBe("updated")
+  })
+
+  it("respects an explicitly-stored created preference", () => {
+    saveSortMode("created")
+    expect(loadSortMode()).toBe("created")
+    saveSortMode("updated")
+    expect(loadSortMode()).toBe("updated")
   })
 })
 

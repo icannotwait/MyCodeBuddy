@@ -155,7 +155,7 @@ export function Sidebar() {
   const [showCompleted, setShowCompleted] = useState(false)
   const [showWorktrees, setShowWorktrees] = useState(true)
   const [showRecent, setShowRecent] = useState(true)
-  const [sortMode, setSortMode] = useState<SidebarSortMode>("created")
+  const [sortMode, setSortMode] = useState<SidebarSortMode>("updated")
   const [sectionOrder, setSectionOrder] = useState<SidebarSectionOrder>(
     DEFAULT_SECTION_ORDER
   )

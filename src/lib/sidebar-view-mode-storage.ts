@@ -233,14 +233,16 @@ export function saveShowRecent(value: boolean): void {
 }
 
 export function loadSortMode(): SidebarSortMode {
-  if (typeof window === "undefined") return "created"
+  // Activity-first: a new turn on an old session must surface at the top.
+  // `"created"` is only used when the user explicitly picks it in the funnel.
+  if (typeof window === "undefined") return "updated"
   try {
     const raw = localStorage.getItem(SORT_MODE_KEY)
     if (raw === "updated" || raw === "created") return raw
   } catch {
     /* ignore */
   }
-  return "created"
+  return "updated"
 }
 
 export function saveSortMode(value: SidebarSortMode): void {

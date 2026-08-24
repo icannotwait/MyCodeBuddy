@@ -923,6 +923,35 @@ describe("SidebarConversationList — activity order and optimistic labels", () 
     expect(text).toContain("5m")
   })
 
+  it("defaults to activity order so a new turn on an old session surfaces first", () => {
+    render(
+      <NextIntlClientProvider locale="en" messages={enMessages}>
+        <SidebarConversationList showCompleted />
+      </NextIntlClientProvider>
+    )
+    const text = document.body.textContent ?? ""
+    expect(text.indexOf("conv-12")).toBeLessThan(text.indexOf("conv-11"))
+    const row12 = document.querySelector('[data-conversation-id="12"]')
+    expect(row12?.textContent).toContain("5m")
+  })
+
+  it("shows created-time labels when the user picks created sort", () => {
+    render(
+      <NextIntlClientProvider locale="en" messages={enMessages}>
+        <SidebarConversationList showCompleted sortMode="created" />
+      </NextIntlClientProvider>
+    )
+    const text = document.body.textContent ?? ""
+    // created_at: conv-11 is 1m old, conv-12 is 2d old.
+    expect(text.indexOf("conv-11")).toBeLessThan(text.indexOf("conv-12"))
+    expect(
+      document.querySelector('[data-conversation-id="11"]')?.textContent
+    ).toContain("1m")
+    expect(
+      document.querySelector('[data-conversation-id="12"]')?.textContent
+    ).toContain("2d")
+  })
+
   it("promotes a real optimistic activity and labels it now", () => {
     // Seed id 12 with an older authoritative updated_at so promotion comes from
     // the optimistic overlay, not the initial data order.

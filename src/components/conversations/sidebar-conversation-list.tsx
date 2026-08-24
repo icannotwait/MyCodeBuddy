@@ -742,7 +742,7 @@ export interface SidebarConversationListProps {
 export function SidebarConversationList({
   ref,
   showCompleted = true,
-  sortMode = "created",
+  sortMode = "updated",
   sectionOrder = DEFAULT_SECTION_ORDER,
   showWorktrees = false,
   showRecent = false,
@@ -2519,7 +2519,9 @@ export function SidebarConversationList({
         isOpenInTab={openTabKeys.has(`${conv.agent_type}:${conv.id}`)}
         mainTabCount={tabs.length}
         timeLabel={formatRelative(
-          getEffectiveConversationUpdatedAt(conv, optimisticActivityById),
+          sortMode === "created"
+            ? conv.created_at
+            : getEffectiveConversationUpdatedAt(conv, optimisticActivityById),
           now
         )}
         onSelect={handleSelect}

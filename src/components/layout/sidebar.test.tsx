@@ -20,6 +20,7 @@ const spies = vi.hoisted(() => ({
     showWorktrees?: boolean
     showCompleted?: boolean
     showRecent?: boolean
+    sortMode?: "created" | "updated"
     sectionOrder?: readonly string[]
   } | null,
 }))
@@ -34,6 +35,7 @@ vi.mock("@/components/conversations/sidebar-conversation-list", () => ({
     showWorktrees?: boolean
     showCompleted?: boolean
     showRecent?: boolean
+    sortMode?: "created" | "updated"
     sectionOrder?: readonly string[]
   }) => {
     spies.listProps = props
@@ -161,6 +163,11 @@ describe("Sidebar — fixed New chat / Search region", () => {
     expect(await findByText("Sort by")).toBeTruthy()
     expect(await findByText("Created time")).toBeTruthy()
     expect(await findByText("Updated time")).toBeTruthy()
+  })
+
+  it("defaults sort mode to updated time and threads it to the list", () => {
+    renderSidebar()
+    expect(spies.listProps?.sortMode).toBe("updated")
   })
 })
 
