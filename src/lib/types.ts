@@ -2403,6 +2403,7 @@ export type AcpEvent =
       status: string
       content: string | null
       raw_input: string | null
+      raw_input_is_model_authored?: boolean
       raw_output: string | null
       locations?: unknown
       meta?: unknown
@@ -2416,6 +2417,7 @@ export type AcpEvent =
       status: string | null
       content: string | null
       raw_input: string | null
+      raw_input_is_model_authored?: boolean
       raw_output: string | null
       raw_output_append?: boolean
       locations?: unknown

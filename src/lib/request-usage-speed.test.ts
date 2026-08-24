@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest"
 import {
   RequestUsageAccumulator,
+  accumulateRequestUsage,
+  EMPTY_REQUEST_USAGE,
   hiddenUserTurnsFromDetail,
   overlayGenerationOnTurns,
   resolveRequestUsageSample,
@@ -32,6 +34,7 @@ describe("RequestUsageAccumulator", () => {
       generationMs: 0,
       tps: 0,
       sampleCount: 0,
+      estimatedSampleCount: 0,
     })
   })
 
@@ -61,6 +64,7 @@ describe("RequestUsageAccumulator", () => {
       generationMs: 0,
       tps: 0,
       sampleCount: 0,
+      estimatedSampleCount: 0,
     })
   })
 
@@ -84,6 +88,56 @@ describe("RequestUsageAccumulator", () => {
       sampleCount: 1,
     })
     expect(acc.snapshot().tps).toBeCloseTo(40)
+  })
+})
+
+describe("estimated request usage provenance", () => {
+  it("keeps all-exact aggregates exact", () => {
+    const exact = accumulateRequestUsage(EMPTY_REQUEST_USAGE, {
+      outputTokens: 100,
+      durationMs: 1_000,
+    })
+
+    expect(exact).toEqual({
+      outputTokens: 100,
+      generationMs: 1_000,
+      tps: 100,
+      sampleCount: 1,
+      estimatedSampleCount: 0,
+    })
+  })
+
+  it("counts estimated samples without losing token-weighted rate", () => {
+    const estimated = accumulateRequestUsage(EMPTY_REQUEST_USAGE, {
+      outputTokens: 100,
+      durationMs: 1_000,
+      estimated: true,
+    })
+    const mixed = accumulateRequestUsage(estimated, {
+      outputTokens: 300,
+      durationMs: 1_000,
+    })
+
+    expect(mixed).toEqual({
+      outputTokens: 400,
+      generationMs: 2_000,
+      tps: 200,
+      sampleCount: 2,
+      estimatedSampleCount: 1,
+    })
+  })
+
+  it("tracks provenance in RequestUsageAccumulator", () => {
+    const acc = new RequestUsageAccumulator()
+    acc.push({ outputTokens: 20, durationMs: 500, estimated: true })
+    acc.push({ outputTokens: 30, durationMs: 500 })
+
+    expect(acc.snapshot()).toMatchObject({
+      sampleCount: 2,
+      estimatedSampleCount: 1,
+      outputTokens: 50,
+      generationMs: 1_000,
+    })
   })
 })
 

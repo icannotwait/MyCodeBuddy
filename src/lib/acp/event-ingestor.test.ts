@@ -6,7 +6,11 @@ import type {
   EventEnvelope,
   SequenceGap,
 } from "@/lib/types"
-import { EventIngestor } from "./event-ingestor"
+import {
+  EventIngestor,
+  compactAdjacentDeltas,
+  prepareEventEnvelope,
+} from "./event-ingestor"
 
 function batch(
   batch_id: number,
@@ -130,6 +134,57 @@ function createIngestorHarness(
 }
 
 describe("EventIngestor", () => {
+  it("stamps a missing received_at exactly once before queueing", () => {
+    const now = vi.spyOn(performance, "now").mockReturnValue(123.5)
+    const original = content("c1", 1, "a")
+    const prepared = prepareEventEnvelope(original)
+
+    expect(prepared.received_at).toBe(123.5)
+    expect(prepareEventEnvelope(prepared)).toBe(prepared)
+    expect(now).toHaveBeenCalledTimes(1)
+  })
+
+  it("keeps the first merged delta ingest stamp", () => {
+    const merged = compactAdjacentDeltas([
+      { ...content("c1", 1, "a"), received_at: 100 },
+      { ...content("c1", 2, "b"), received_at: 250 },
+    ])
+
+    expect(merged).toMatchObject([{ seq: 2, text: "ab", received_at: 100 }])
+  })
+
+  it.each([
+    ["root then subagent", undefined, "tool-1"],
+    ["subagent then root", "tool-1", undefined],
+  ] as const)(
+    "does not compact across the ownership boundary: %s",
+    (_name, firstParent, secondParent) => {
+      const merged = compactAdjacentDeltas([
+        {
+          ...content("c1", 1, "root-or-child-a"),
+          parent_tool_use_id: firstParent,
+        },
+        {
+          ...content("c1", 2, "root-or-child-b"),
+          parent_tool_use_id: secondParent,
+        },
+      ])
+
+      expect(merged).toEqual([
+        expect.objectContaining({
+          seq: 1,
+          text: "root-or-child-a",
+          parent_tool_use_id: firstParent,
+        }),
+        expect.objectContaining({
+          seq: 2,
+          text: "root-or-child-b",
+          parent_tool_use_id: secondParent,
+        }),
+      ])
+    }
+  )
+
   it("deduplicates, compacts, and commits once on the next frame", () => {
     const h = createIngestorHarness({ c1: { key: "tab-1", cursor: 10 } })
     h.pushBatch(

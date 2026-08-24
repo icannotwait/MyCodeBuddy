@@ -18,6 +18,7 @@ export function supportsRequestUsageDisplay(agentType: AgentType): boolean {
 export interface RequestUsageSample {
   outputTokens: number
   durationMs?: number | null
+  estimated?: boolean
 }
 
 export interface RequestUsageSnapshot {
@@ -25,6 +26,7 @@ export interface RequestUsageSnapshot {
   generationMs: number
   tps: number
   sampleCount: number
+  estimatedSampleCount: number
 }
 
 export interface TurnGenerationStat {
@@ -146,6 +148,7 @@ export const EMPTY_REQUEST_USAGE: RequestUsageSnapshot = {
   generationMs: 0,
   tps: 0,
   sampleCount: 0,
+  estimatedSampleCount: 0,
 }
 
 const EMPTY = EMPTY_REQUEST_USAGE
@@ -164,6 +167,8 @@ export function accumulateRequestUsage(
     generationMs,
     tps: outputTokens / (generationMs / 1000),
     sampleCount: prev.sampleCount + 1,
+    estimatedSampleCount:
+      prev.estimatedSampleCount + (sample.estimated === true ? 1 : 0),
   }
 }
 
@@ -172,6 +177,7 @@ export class RequestUsageAccumulator {
   private outputTokens = 0
   private generationMs = 0
   private sampleCount = 0
+  private estimatedSampleCount = 0
 
   push(sample: RequestUsageSample): void {
     const tokens = sample.outputTokens
@@ -180,12 +186,14 @@ export class RequestUsageAccumulator {
     this.outputTokens += tokens
     this.generationMs += durationMs
     this.sampleCount += 1
+    if (sample.estimated === true) this.estimatedSampleCount += 1
   }
 
   reset(): void {
     this.outputTokens = 0
     this.generationMs = 0
     this.sampleCount = 0
+    this.estimatedSampleCount = 0
   }
 
   snapshot(): RequestUsageSnapshot {
@@ -197,6 +205,7 @@ export class RequestUsageAccumulator {
       generationMs: this.generationMs,
       tps: this.outputTokens / (this.generationMs / 1000),
       sampleCount: this.sampleCount,
+      estimatedSampleCount: this.estimatedSampleCount,
     }
   }
 }

@@ -19,17 +19,21 @@ import {
   selectTimelineTurns,
   useConversationRuntimeStore,
 } from "@/stores/conversation-runtime-store"
-import { getFolderConversation } from "@/lib/api"
+import { getFolderConversation, saveTurnGenerationStat } from "@/lib/api"
+import { publishRequestUsage } from "@/lib/request-usage-live"
+import { EMPTY_REQUEST_USAGE } from "@/lib/request-usage-speed"
 
 vi.mock("@/lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/api")>()
   return {
     ...actual,
     getFolderConversation: vi.fn(actual.getFolderConversation),
+    saveTurnGenerationStat: vi.fn(async () => undefined),
   }
 })
 
 const mockGetFolderConversation = vi.mocked(getFolderConversation)
+const mockSaveTurnGenerationStat = vi.mocked(saveTurnGenerationStat)
 
 const CID = 42
 const OTHER_CID = 99
@@ -206,6 +210,149 @@ afterEach(() => {
   resetConversationRuntimeStore()
   resetJsonParseCacheForTests()
   vi.restoreAllMocks()
+})
+
+describe("live request usage persistence boundary", () => {
+  function completeWith(snapshot: {
+    outputTokens: number
+    generationMs: number
+    tps: number
+    sampleCount: number
+    estimatedSampleCount: number
+  }) {
+    mockSaveTurnGenerationStat.mockClear()
+    seedRuntimeSession({
+      detail: detailWithTurns([userTurn("u1")]),
+      optimisticTurns: [userTurn("u2")],
+    })
+    publishRequestUsage(CID, snapshot)
+    useConversationRuntimeStore
+      .getState()
+      .actions.completeTurn(CID, liveMessage("live", "done"))
+  }
+
+  it.each([
+    {
+      name: "empty",
+      snapshot: EMPTY_REQUEST_USAGE,
+    },
+    {
+      name: "non-positive tokens",
+      snapshot: {
+        outputTokens: 0,
+        generationMs: 1_000,
+        tps: 0,
+        sampleCount: 1,
+        estimatedSampleCount: 0,
+      },
+    },
+    {
+      name: "non-positive duration",
+      snapshot: {
+        outputTokens: 10,
+        generationMs: 0,
+        tps: 0,
+        sampleCount: 1,
+        estimatedSampleCount: 0,
+      },
+    },
+    {
+      name: "estimated only",
+      snapshot: {
+        outputTokens: 10,
+        generationMs: 1_000,
+        tps: 10,
+        sampleCount: 1,
+        estimatedSampleCount: 1,
+      },
+    },
+    {
+      name: "mixed exact and estimated",
+      snapshot: {
+        outputTokens: 30,
+        generationMs: 2_000,
+        tps: 15,
+        sampleCount: 2,
+        estimatedSampleCount: 1,
+      },
+    },
+  ])("does not persist $name snapshots", ({ snapshot }) => {
+    completeWith(snapshot)
+    expect(mockSaveTurnGenerationStat).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    {
+      name: "estimated-only",
+      snapshot: {
+        outputTokens: 10,
+        generationMs: 1_000,
+        tps: 10,
+        sampleCount: 1,
+        estimatedSampleCount: 1,
+      },
+    },
+    {
+      name: "mixed",
+      snapshot: {
+        outputTokens: 30,
+        generationMs: 2_000,
+        tps: 15,
+        sampleCount: 2,
+        estimatedSampleCount: 1,
+      },
+    },
+  ])("keeps $name usage out of promoted turns", ({ snapshot }) => {
+    completeWith(snapshot)
+
+    const promotedAssistant = useConversationRuntimeStore
+      .getState()
+      .byConversationId.get(CID)!
+      .localTurns.find((turn) => turn.role === "assistant")
+    expect(promotedAssistant).toBeDefined()
+    expect(promotedAssistant).not.toHaveProperty("generation_ms")
+    expect(promotedAssistant).not.toHaveProperty("generation_tokens")
+  })
+
+  it("persists a positive all-exact snapshot unchanged", () => {
+    completeWith({
+      outputTokens: 77,
+      generationMs: 1_500,
+      tps: 77 / 1.5,
+      sampleCount: 1,
+      estimatedSampleCount: 0,
+    })
+
+    expect(mockSaveTurnGenerationStat).toHaveBeenCalledWith({
+      conversationId: CID,
+      userOrdinal: 1,
+      generationMs: 1_500,
+      generationTokens: 77,
+    })
+  })
+
+  it("allows exact persistence after an empty hydrate publication", () => {
+    publishRequestUsage(CID, {
+      outputTokens: 30,
+      generationMs: 2_000,
+      tps: 15,
+      sampleCount: 2,
+      estimatedSampleCount: 1,
+    })
+    publishRequestUsage(CID, EMPTY_REQUEST_USAGE)
+    completeWith({
+      outputTokens: 25,
+      generationMs: 500,
+      tps: 50,
+      sampleCount: 1,
+      estimatedSampleCount: 0,
+    })
+
+    expect(mockSaveTurnGenerationStat).toHaveBeenCalledTimes(1)
+    expect(mockSaveTurnGenerationStat).toHaveBeenCalledWith(
+      expect.objectContaining({ generationTokens: 25, generationMs: 500 })
+    )
+  })
 })
 
 describe("selectHistoricalTimelineTurns reference stability", () => {

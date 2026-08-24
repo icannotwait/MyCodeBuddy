@@ -145,6 +145,8 @@ pub enum AcpEvent {
         status: String,
         content: Option<String>,
         raw_input: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        raw_input_is_model_authored: Option<bool>,
         raw_output: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         locations: Option<serde_json::Value>,
@@ -162,6 +164,8 @@ pub enum AcpEvent {
         status: Option<String>,
         content: Option<String>,
         raw_input: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        raw_input_is_model_authored: Option<bool>,
         raw_output: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         raw_output_append: Option<bool>,

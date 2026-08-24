@@ -1,6 +1,13 @@
 "use client"
 
-import { useEffect, useMemo, useState, useSyncExternalStore } from "react"
+import {
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react"
 import { useLocale, useTranslations } from "next-intl"
 import type {
   LiveContentBlock,
@@ -17,13 +24,21 @@ import { FilePenLine, Plane, Timer } from "lucide-react"
 import type { AgentType } from "@/lib/types"
 import { AgentIcon } from "@/components/agent-icon"
 import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip"
+import {
   EMPTY_REQUEST_USAGE,
   supportsRequestUsageDisplay,
 } from "@/lib/request-usage-speed"
+import type { RequestUsageSnapshot } from "@/lib/request-usage-speed"
 import {
   getPublishedRequestUsage,
   subscribeRequestUsage,
 } from "@/lib/request-usage-live"
+import { cn } from "@/lib/utils"
 
 export type LiveTurnStatusMode = "auto" | "waiting_for_subagents"
 
@@ -322,6 +337,149 @@ export function extractLiveEditStats(message: LiveMessage): LiveEditStats {
   return { files: files.size, additions, deletions }
 }
 
+interface DisplayedUsage {
+  tps: number
+  generationMs: number
+}
+
+interface UsageTransition {
+  startedAt: number
+  start: DisplayedUsage
+  target: DisplayedUsage
+}
+
+const ZERO_DISPLAYED_USAGE: DisplayedUsage = { tps: 0, generationMs: 0 }
+const USAGE_TRANSITION_MS = 5_000
+const USAGE_TICK_MS = 33
+
+function easeOutCubic(progress: number): number {
+  return 1 - Math.pow(1 - progress, 3)
+}
+
+function interpolateUsage(
+  transition: UsageTransition,
+  now: number
+): DisplayedUsage {
+  const progress = Math.min(
+    1,
+    Math.max(0, (now - transition.startedAt) / USAGE_TRANSITION_MS)
+  )
+  const eased = easeOutCubic(progress)
+  return {
+    tps:
+      transition.start.tps +
+      (transition.target.tps - transition.start.tps) * eased,
+    generationMs:
+      transition.start.generationMs +
+      (transition.target.generationMs - transition.start.generationMs) * eased,
+  }
+}
+
+function useAnimatedRequestUsage(
+  conversationId: number | null | undefined,
+  enabled: boolean,
+  snapshot: RequestUsageSnapshot
+): DisplayedUsage {
+  const [displayed, setDisplayed] = useState(ZERO_DISPLAYED_USAGE)
+  const displayedRef = useRef(displayed)
+  const transitionRef = useRef<UsageTransition | null>(null)
+  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const conversationRef = useRef(conversationId)
+
+  useLayoutEffect(() => {
+    const clearTargetInterval = () => {
+      if (intervalRef.current !== null) {
+        clearInterval(intervalRef.current)
+        intervalRef.current = null
+      }
+    }
+    const commit = (value: DisplayedUsage) => {
+      displayedRef.current = value
+      setDisplayed(value)
+    }
+    const changedConversation = conversationRef.current !== conversationId
+    conversationRef.current = conversationId
+    const validTarget =
+      enabled &&
+      snapshot.sampleCount > 0 &&
+      Number.isFinite(snapshot.tps) &&
+      snapshot.tps > 0 &&
+      Number.isFinite(snapshot.generationMs) &&
+      snapshot.generationMs > 0
+
+    if (!validTarget) {
+      clearTargetInterval()
+      transitionRef.current = null
+      commit(ZERO_DISPLAYED_USAGE)
+      return clearTargetInterval
+    }
+
+    const now = performance.now()
+    const start = changedConversation
+      ? ZERO_DISPLAYED_USAGE
+      : transitionRef.current
+        ? interpolateUsage(transitionRef.current, now)
+        : displayedRef.current
+    clearTargetInterval()
+    commit(start)
+    transitionRef.current = {
+      startedAt: now,
+      start,
+      target: {
+        tps: snapshot.tps,
+        generationMs: snapshot.generationMs,
+      },
+    }
+    intervalRef.current = setInterval(() => {
+      const transition = transitionRef.current
+      if (!transition) return
+      const tickNow = performance.now()
+      if (tickNow - transition.startedAt >= USAGE_TRANSITION_MS) {
+        clearTargetInterval()
+        transitionRef.current = null
+        commit(transition.target)
+        return
+      }
+      commit(interpolateUsage(transition, tickNow))
+    }, USAGE_TICK_MS)
+
+    return clearTargetInterval
+  }, [
+    conversationId,
+    enabled,
+    snapshot.generationMs,
+    snapshot.sampleCount,
+    snapshot.tps,
+  ])
+
+  return displayed
+}
+
+function ApproximationMarker({
+  label,
+  tooltip,
+}: {
+  label: string
+  tooltip: string
+}) {
+  const [open, setOpen] = useState(false)
+  return (
+    <Tooltip open={open} onOpenChange={setOpen}>
+      <TooltipTrigger asChild>
+        <button
+          type="button"
+          aria-label={label}
+          className="shrink-0 cursor-help text-foreground/80 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+          onClick={() => setOpen((value) => !value)}
+        >
+          ≈
+        </button>
+      </TooltipTrigger>
+      <TooltipContent side="top">{tooltip}</TooltipContent>
+    </Tooltip>
+  )
+}
+
 export function LiveTurnStats({
   message,
   agentType,
@@ -342,12 +500,30 @@ export function LiveTurnStats({
         : EMPTY_REQUEST_USAGE,
     () => EMPTY_REQUEST_USAGE
   )
-  const tps = showUsage ? usageSnap.tps : null
-  const generationMs = showUsage ? usageSnap.generationMs : 0
+  const displayedUsage = useAnimatedRequestUsage(
+    conversationId,
+    showUsage,
+    usageSnap
+  )
+  const tpsLabel = displayedUsage.tps.toFixed(1)
+  const validTps =
+    Number.isFinite(displayedUsage.tps) &&
+    displayedUsage.tps > 0 &&
+    tpsLabel !== "0.0"
+  const positiveGeneration =
+    Number.isFinite(displayedUsage.generationMs) &&
+    displayedUsage.generationMs > 0
   const generationShare =
-    showUsage && elapsed > 0
-      ? Math.min(100, Math.round((generationMs / elapsed) * 100))
+    positiveGeneration && elapsed > 0
+      ? Math.min(100, Math.round((displayedUsage.generationMs / elapsed) * 100))
       : 0
+  const generationLabel = positiveGeneration
+    ? formatElapsedLabel(displayedUsage.generationMs, t)
+    : ""
+  const validGeneration =
+    generationLabel !== "" &&
+    generationLabel !== formatElapsedLabel(0, t) &&
+    generationShare > 0
   const compactNumberFormatter = useMemo(
     () =>
       new Intl.NumberFormat(locale, {
@@ -415,37 +591,79 @@ export function LiveTurnStats({
           </>
         )}
         {showUsage && (
-          <>
-            <span className="hidden text-border leading-none @[30rem]/turnstats:inline">
+          <TooltipProvider delayDuration={0}>
+            <span
+              className={cn(
+                "hidden text-border leading-none @[30rem]/turnstats:inline",
+                !validTps && "invisible"
+              )}
+            >
               |
             </span>
             <span
-              className="hidden items-center gap-1 leading-none tabular-nums @[30rem]/turnstats:inline-flex"
-              title={t("outputSpeedTooltip")}
+              data-testid="output-speed-slot"
+              className={cn(
+                "hidden w-[7.5rem] items-center gap-1 leading-none tabular-nums @[30rem]/turnstats:inline-flex",
+                !validTps && "invisible"
+              )}
+              title={validTps ? t("outputSpeedTooltip") : undefined}
             >
-              <Plane
-                aria-label={t("outputSpeedAria")}
-                className="h-3 w-3 shrink-0"
-              />
-              {(tps ?? 0).toFixed(1)} tok/s
+              {validTps && (
+                <>
+                  <Plane
+                    aria-label={t("outputSpeedAria")}
+                    className="h-3 w-3 shrink-0"
+                  />
+                  <span>{tpsLabel} tok/s</span>
+                  {usageSnap.estimatedSampleCount > 0 && (
+                    <ApproximationMarker
+                      label={t("estimatedAria")}
+                      tooltip={t("estimatedTooltip")}
+                    />
+                  )}
+                </>
+              )}
             </span>
-            <span className="hidden text-border leading-none @[36rem]/turnstats:inline">
+            <span
+              className={cn(
+                "hidden text-border leading-none @[36rem]/turnstats:inline",
+                !validGeneration && "invisible"
+              )}
+            >
               |
             </span>
             <span
-              className="hidden items-center gap-1 leading-none tabular-nums @[36rem]/turnstats:inline-flex"
-              title={t("generationShareTooltip", {
-                generation: formatElapsedLabel(generationMs, t),
-                wall: formatElapsedLabel(elapsed, t),
-                percent: generationShare,
-              })}
+              data-testid="generation-share-slot"
+              className={cn(
+                "hidden w-[8.5rem] items-center gap-1 leading-none tabular-nums @[36rem]/turnstats:inline-flex",
+                !validGeneration && "invisible"
+              )}
+              title={
+                validGeneration
+                  ? t("generationShareTooltip", {
+                      generation: generationLabel,
+                      wall: formatElapsedLabel(elapsed, t),
+                      percent: generationShare,
+                    })
+                  : undefined
+              }
             >
-              {formatElapsedLabel(generationMs, t)}
-              <span className="text-muted-foreground/80">
-                ({generationShare}%)
-              </span>
+              {validGeneration && (
+                <>
+                  {generationLabel}
+                  <span className="text-muted-foreground/80">
+                    ({generationShare}%)
+                  </span>
+                  {usageSnap.estimatedSampleCount > 0 && (
+                    <ApproximationMarker
+                      label={t("estimatedAria")}
+                      tooltip={t("estimatedTooltip")}
+                    />
+                  )}
+                </>
+              )}
             </span>
-          </>
+          </TooltipProvider>
         )}
       </div>
     </div>

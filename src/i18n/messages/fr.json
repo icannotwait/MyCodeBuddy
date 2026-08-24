@@ -3172,6 +3172,8 @@
         "outputSpeedAria": "Vitesse de sortie",
         "outputSpeedTooltip": "Jetons de sortie facturés ÷ temps de génération (raisonnement inclus)",
         "generationShareTooltip": "Génération {generation} / horloge {wall} ({percent}%)",
+        "estimatedAria": "Valeur estimée",
+        "estimatedTooltip": "Valeur en direct estimée à partir de la sortie observable, car l’utilisation par requête du fournisseur est indisponible.",
         "toolUseCount": "{count} utilisations d'outils"
       },
       "tool": {

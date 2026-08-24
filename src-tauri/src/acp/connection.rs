@@ -7056,6 +7056,7 @@ async fn handle_grok_ask_user_question(
                                 crate::acp::question::grok_result_card_input(&card_specs)
                                     .to_string(),
                             ),
+                            raw_input_is_model_authored: None,
                             raw_output: Some(
                                 crate::acp::question::grok_result_card_output(&outcome).to_string(),
                             ),
@@ -7341,6 +7342,7 @@ async fn handle_elicitation_request(
                                         )
                                         .to_string(),
                                     ),
+                                    raw_input_is_model_authored: None,
                                     raw_output: Some(
                                         crate::acp::question::grok_result_card_output(&outcome)
                                             .to_string(),
@@ -8320,6 +8322,7 @@ async fn emit_terminal_output_update(
             status: None,
             content: None,
             raw_input: None,
+            raw_input_is_model_authored: None,
             raw_output: Some(payload),
             raw_output_append: Some(append),
             locations: None,
@@ -9930,6 +9933,7 @@ async fn finalize_active_watchdog_cancel(
                 status: Some("failed".into()),
                 content: None,
                 raw_input: None,
+                raw_input_is_model_authored: None,
                 raw_output: Some(error_code.to_string()),
                 raw_output_append: None,
                 locations: None,
@@ -12135,6 +12139,18 @@ fn resolve_live_tool_input(text: &str, cwd: Option<&str>) -> String {
     text.to_string()
 }
 
+fn prepare_live_tool_input(
+    selected: Option<(String, bool)>,
+    cwd: Option<&str>,
+) -> (Option<String>, Option<bool>) {
+    let Some((original, came_directly_from_model)) = selected else {
+        return (None, None);
+    };
+    let resolved = resolve_live_tool_input(&original, cwd);
+    let authored = (came_directly_from_model && resolved == original).then_some(true);
+    (Some(resolved), authored)
+}
+
 /// Try to inject `_start_line` into a JSON object with `file_path` + `old_string`.
 /// Returns true if injected.
 fn inject_start_line(value: &mut serde_json::Value, cwd: Option<&str>) -> bool {
@@ -13508,6 +13524,7 @@ fn map_grok_ext_notification(
                 status: "completed".to_string(),
                 content: None,
                 raw_input: None,
+                raw_input_is_model_authored: None,
                 raw_output: None,
                 locations: None,
                 meta: Some(serde_json::Value::Object(meta)),
@@ -14293,10 +14310,15 @@ async fn emit_conversation_update(
                 .map(|c| unwrap_codebuddy_deferred_output(agent_type, &c).unwrap_or(c));
             let images = extract_tool_call_images(&tc.content);
             let codex_subagent_launch = codex_subagent.is_some();
-            let raw_input = codex_subagent
-                .or(synthesized_edit)
-                .or(own_raw_input)
-                .map(|text| resolve_live_tool_input(&text, cwd));
+            let selected_input = if let Some(input) = codex_subagent {
+                Some((input, false))
+            } else if let Some(input) = synthesized_edit {
+                Some((input, false))
+            } else {
+                own_raw_input.map(|input| (input, grok_use_tool.is_none()))
+            };
+            let (raw_input, raw_input_is_model_authored) =
+                prepare_live_tool_input(selected_input, cwd);
             // Initial tool_call notification — the frontend reducer
             // treats `raw_output` as a full replacement, so we bypass
             // the diff path and seed the cache with the current snapshot.
@@ -14414,6 +14436,7 @@ async fn emit_conversation_update(
                     status,
                     content,
                     raw_input,
+                    raw_input_is_model_authored,
                     raw_output,
                     locations,
                     meta,
@@ -14492,10 +14515,15 @@ async fn emit_conversation_update(
                 .as_deref()
                 .and_then(extract_tool_call_images);
             let codex_subagent_launch = codex_subagent.is_some();
-            let raw_input = codex_subagent
-                .or(synthesized_edit)
-                .or(own_raw_input)
-                .map(|text| resolve_live_tool_input(&text, cwd));
+            let selected_input = if let Some(input) = codex_subagent {
+                Some((input, false))
+            } else if let Some(input) = synthesized_edit {
+                Some((input, false))
+            } else {
+                own_raw_input.map(|input| (input, grok_use_tool.is_none()))
+            };
+            let (raw_input, raw_input_is_model_authored) =
+                prepare_live_tool_input(selected_input, cwd);
             // Diff the incoming raw_output against the last snapshot we
             // emitted for this tool call. This turns cumulative snapshots
             // from agents (Claude Code, Codex, …) into incremental deltas
@@ -14625,6 +14653,7 @@ async fn emit_conversation_update(
                     status,
                     content,
                     raw_input,
+                    raw_input_is_model_authored,
                     raw_output,
                     raw_output_append,
                     locations,
@@ -14752,6 +14781,7 @@ async fn emit_conversation_update(
                             status: "completed".to_string(),
                             content: None,
                             raw_input: Some(marker.input_json),
+                            raw_input_is_model_authored: None,
                             raw_output: Some(marker.output_json),
                             locations: None,
                             meta: None,
@@ -20680,6 +20710,81 @@ mod tests {
     }
 
     #[test]
+    fn raw_input_model_authorship_marks_unchanged_provider_arguments() {
+        let input = r#"{"command":"pwd"}"#.to_string();
+        let (raw_input, authored) = prepare_live_tool_input(Some((input.clone(), true)), None);
+
+        assert_eq!(raw_input.as_deref(), Some(input.as_str()));
+        assert_eq!(authored, Some(true));
+    }
+
+    #[test]
+    fn raw_input_model_authorship_fails_closed_for_synthesized_input() {
+        let (raw_input, authored) = prepare_live_tool_input(
+            Some((
+                r#"{"file_path":"x.rs","new_string":"x"}"#.to_string(),
+                false,
+            )),
+            None,
+        );
+
+        assert!(raw_input.is_some());
+        assert_eq!(authored, None);
+    }
+
+    #[test]
+    fn raw_input_model_authorship_fails_closed_when_edit_resolution_changes_value() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(dir.path().join("x.txt"), "before\nafter\n").expect("fixture file");
+        let input = serde_json::json!({
+            "file_path": "x.txt",
+            "old_string": "after",
+            "new_string": "changed"
+        })
+        .to_string();
+        let (raw_input, authored) =
+            prepare_live_tool_input(Some((input, true)), dir.path().to_str());
+
+        assert!(raw_input.expect("resolved input").contains("_start_line"));
+        assert_eq!(authored, None);
+    }
+
+    #[test]
+    fn raw_input_model_authorship_serializes_only_true() {
+        let event = AcpEvent::ToolCall {
+            tool_call_id: "call-1".into(),
+            title: "terminal".into(),
+            kind: "execute".into(),
+            status: "pending".into(),
+            content: None,
+            raw_input: Some(r#"{"command":"pwd"}"#.into()),
+            raw_input_is_model_authored: Some(true),
+            raw_output: None,
+            locations: None,
+            meta: None,
+            images: None,
+        };
+        let value = serde_json::to_value(event).expect("serialize tool call");
+        assert_eq!(value["raw_input_is_model_authored"], true);
+
+        let unmarked = AcpEvent::ToolCall {
+            tool_call_id: "call-2".into(),
+            title: "edit".into(),
+            kind: "edit".into(),
+            status: "pending".into(),
+            content: None,
+            raw_input: Some(r#"{"file_path":"x.rs"}"#.into()),
+            raw_input_is_model_authored: None,
+            raw_output: None,
+            locations: None,
+            meta: None,
+            images: None,
+        };
+        let value = serde_json::to_value(unmarked).expect("serialize unmarked call");
+        assert!(value.get("raw_input_is_model_authored").is_none());
+    }
+
+    #[test]
     fn synthesize_edit_single_diff_makes_canonical_edit() {
         let content = vec![diff_content("/a.rs", Some("old line\n"), "new line\n")];
         let json = synthesize_edit_input_from_diffs(&content).expect("one diff -> canonical edit");
@@ -21834,6 +21939,7 @@ mod tests {
                 status: "in_progress".into(),
                 content: None,
                 raw_input: None,
+                raw_input_is_model_authored: None,
                 raw_output: None,
                 locations: None,
                 meta: None,

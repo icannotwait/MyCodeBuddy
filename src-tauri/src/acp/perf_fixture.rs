@@ -160,6 +160,7 @@ fn tool_call(id: &str, index: usize, seed: u64) -> AcpEvent {
             })
             .to_string(),
         ),
+        raw_input_is_model_authored: None,
         raw_output: None,
         locations: None,
         meta: None,
@@ -174,6 +175,7 @@ fn tool_append(id: &str, output: String) -> AcpEvent {
         status: None,
         content: None,
         raw_input: None,
+        raw_input_is_model_authored: None,
         raw_output: Some(output),
         raw_output_append: Some(true),
         locations: None,
@@ -189,6 +191,7 @@ fn tool_complete(id: &str, output: String) -> AcpEvent {
         status: Some("completed".into()),
         content: None,
         raw_input: None,
+        raw_input_is_model_authored: None,
         raw_output: Some(output),
         raw_output_append: Some(true),
         locations: None,

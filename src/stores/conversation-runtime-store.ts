@@ -1204,7 +1204,14 @@ function persistTurnGenerationFromSession(
   session: ConversationRuntimeSession | undefined
 ): void {
   const snap = getPublishedRequestUsage(conversationId)
-  if (snap.sampleCount <= 0 || snap.generationMs <= 0) return
+  if (
+    snap.sampleCount <= 0 ||
+    snap.outputTokens <= 0 ||
+    snap.generationMs <= 0 ||
+    snap.estimatedSampleCount > 0
+  ) {
+    return
+  }
   const dbId = session?.dbConversationId ?? conversationId
   if (dbId <= 0) return
   const loadedUser = countUserTurns(session?.detail?.turns)
@@ -2502,7 +2509,7 @@ function reducer(
       // same underlying turn, so the later (most complete) copy supersedes.
       const usageSnap = getPublishedRequestUsage(action.conversationId)
       const stampedStreaming =
-        usageSnap.sampleCount > 0
+        usageSnap.sampleCount > 0 && usageSnap.estimatedSampleCount === 0
           ? stampGenerationOnAssistantTurns(streamingTurns, usageSnap)
           : streamingTurns
 

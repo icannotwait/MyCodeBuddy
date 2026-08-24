@@ -40,7 +40,7 @@ interface ConnectionDrainState {
   deliveryIdSet: Set<number>
 }
 
-function stampReceivedAt(event: EventEnvelope): EventEnvelope {
+export function prepareEventEnvelope(event: EventEnvelope): EventEnvelope {
   if (event.received_at != null) return event
   return { ...event, received_at: performance.now() }
 }
@@ -61,7 +61,8 @@ export function compactAdjacentDeltas(
       prev.type === event.type &&
       (event.type === "content_delta" || event.type === "thinking") &&
       (prev.type === "content_delta" || prev.type === "thinking") &&
-      prev.type === event.type
+      prev.type === event.type &&
+      (prev.parent_tool_use_id ?? null) === (event.parent_tool_use_id ?? null)
     ) {
       out[out.length - 1] = {
         ...event,
@@ -103,7 +104,7 @@ export class EventIngestor {
     for (const event of batch.events) {
       this.pending.push({
         deliveryId: batch.batch_id,
-        event: stampReceivedAt(event),
+        event: prepareEventEnvelope(event),
       })
     }
     this.ensureScheduled()
@@ -121,7 +122,7 @@ export class EventIngestor {
     for (const event of events) {
       this.pending.push({
         deliveryId,
-        event: stampReceivedAt(event),
+        event: prepareEventEnvelope(event),
         mappedKey: contextKey,
       })
     }
