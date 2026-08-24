@@ -2070,6 +2070,25 @@ mod delegation_registration_tests {
         }
     }
 
+    /// Store lookup runs on `spawn_blocking`; a fixed 50ms sleep misses
+    /// Windows CI under load. Wait for the resolve metric instead.
+    async fn wait_for_cursor_enrichment_resolved(broker: &DelegationBroker, timeout: Duration) {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if broker.metrics().snapshot().cursor_enrichment_resolved >= 1 {
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                let snap = broker.metrics().snapshot();
+                panic!(
+                    "timed out waiting for cursor enrichment resolve (scheduled={}, resolved={})",
+                    snap.cursor_enrichment_scheduled, snap.cursor_enrichment_resolved
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     /// `tool_call_update_event` with an explicit `status` (the base helper
     /// hardcodes `None`). Used to drive the terminal-tombstone branch.
     fn tool_call_update_event_with_status(
@@ -2498,7 +2517,7 @@ mod delegation_registration_tests {
             completion: None,
         };
         run_broker_tool_side_effects(b.as_ref(), &internal, Some(&enricher)).await;
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        wait_for_cursor_enrichment_resolved(b.as_ref(), Duration::from_secs(2)).await;
         assert_eq!(b.metrics().snapshot().cursor_enrichment_scheduled, 1);
         assert_eq!(
             b.take_matching_tool_call("parent-conn", &codex_key("build it"))
@@ -2640,7 +2659,7 @@ mod delegation_registration_tests {
             completion: None,
         };
         run_broker_tool_side_effects(b.as_ref(), &internal, worker_local.as_deref()).await;
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        wait_for_cursor_enrichment_resolved(b.as_ref(), Duration::from_secs(2)).await;
         assert_eq!(b.metrics().snapshot().cursor_enrichment_scheduled, 1);
         assert_eq!(
             b.take_matching_tool_call("parent-conn", &codex_key("build it"))
