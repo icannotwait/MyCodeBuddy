@@ -23,7 +23,7 @@ pub(crate) struct ConfinedRegularFile {
 #[derive(Debug)]
 pub(crate) enum ConfinedRead {
     Absent,
-    Found(ConfinedRegularFile),
+    Found(Box<ConfinedRegularFile>),
 }
 
 #[cfg(windows)]
@@ -257,12 +257,12 @@ pub(crate) fn read_confined_regular_file(
         None
     };
 
-    Ok(ConfinedRead::Found(ConfinedRegularFile {
+    Ok(ConfinedRead::Found(Box::new(ConfinedRegularFile {
         canonical_path: canonical_target,
         metadata,
         file,
         bytes,
-    }))
+    })))
 }
 
 fn read_bounded<R: std::io::Read>(

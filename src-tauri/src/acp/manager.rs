@@ -6547,6 +6547,7 @@ impl ConnectionManager {
     /// [`CONTROL_LANE_ADMIT_TIMEOUT`](crate::acp::tool_watchdog::CONTROL_LANE_ADMIT_TIMEOUT).
     /// On timeout/closed lane returns `Err` so the supervisor marks turn-stage
     /// failed and continues disconnect/settlement.
+    #[allow(clippy::result_unit_err)]
     pub async fn cancel_turn_if_current(
         &self,
         stamp: &crate::acp::tool_watchdog::LeaseStamp,
@@ -6861,6 +6862,7 @@ impl ConnectionManager {
     }
 
     /// Incarnation-guarded disconnect (final convergence fallback).
+    #[allow(clippy::result_unit_err)]
     pub async fn disconnect_if_incarnation(
         &self,
         connection_id: &str,

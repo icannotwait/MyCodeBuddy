@@ -906,6 +906,49 @@ function lastUsersCorrespond(
   return localText.length > 0 && localText === persistText
 }
 
+function lastAssistantTextAfter(
+  turns: readonly MessageTurn[],
+  afterIdx: number
+): string | null {
+  for (let i = turns.length - 1; i > afterIdx; i--) {
+    if (turns[i]!.role !== "assistant") continue
+    const text = turnTextContent(turns[i]!)
+    return text.length > 0 ? text : null
+  }
+  return null
+}
+
+/**
+ * Same completed round, not a repeated prompt: persist last-user text matches
+ * the overlay, AND the settled assistant bodies match. A prior "continue"
+ * that already has its own reply must not retire a new overlay with the same
+ * user text (delegate baseline / awaiting_persist completeTurn).
+ */
+function lastRoundsCorrespond(
+  localTurns: readonly MessageTurn[],
+  persisted: readonly MessageTurn[],
+  lastLocalUserIdx: number,
+  lastPersistUserIdx: number
+): boolean {
+  if (
+    !lastUsersCorrespond(
+      localTurns,
+      persisted,
+      lastLocalUserIdx,
+      lastPersistUserIdx
+    )
+  ) {
+    return false
+  }
+  const localAssistant = lastAssistantTextAfter(localTurns, lastLocalUserIdx)
+  const persistAssistant = lastAssistantTextAfter(persisted, lastPersistUserIdx)
+  return (
+    localAssistant != null &&
+    persistAssistant != null &&
+    localAssistant === persistAssistant
+  )
+}
+
 /**
  * Drop localTurns already proven persisted in `detail.turns` by id,
  * role+timestamp, or a settled last-round window. Unpersisted remainder
@@ -929,19 +972,29 @@ function retireCoveredLocalTurns(
   // Last-round retirement needs a settled assistant after the last user.
   const lastLocalUserIdx = lastIndexOfRole(localTurns, "user")
   const lastPersistUserIdx = lastIndexOfRole(persisted, "user")
+  const persistSettled = detail?.in_flight_user_turn_id == null
+  const persistHasAssistantAfterLastUser =
+    lastPersistUserIdx >= 0
+      ? persisted
+          .slice(lastPersistUserIdx + 1)
+          .some((t) => t.role === "assistant")
+      : persisted.some((t) => t.role === "assistant")
+  // Persist with no user turn is a folded replacement of the last overlay
+  // round (async-sub-agent launch ack → `[[codeg-background-task]]` marker).
+  // Persist with a last user only covers the overlay when the assistant
+  // bodies match — otherwise it is an earlier same-text prompt.
   const lastRoundCovered =
-    detail?.in_flight_user_turn_id == null &&
+    persistSettled &&
     lastLocalUserIdx >= 0 &&
-    lastPersistUserIdx >= 0 &&
-    persisted
-      .slice(lastPersistUserIdx + 1)
-      .some((t) => t.role === "assistant") &&
-    lastUsersCorrespond(
-      localTurns,
-      persisted,
-      lastLocalUserIdx,
-      lastPersistUserIdx
-    )
+    persistHasAssistantAfterLastUser &&
+    (lastPersistUserIdx >= 0
+      ? lastRoundsCorrespond(
+          localTurns,
+          persisted,
+          lastLocalUserIdx,
+          lastPersistUserIdx
+        )
+      : true)
   const retained = localTurns.filter((t, i) => {
     if (persistedIds.has(t.id)) return false
     const key = persistIdentityKey(t)

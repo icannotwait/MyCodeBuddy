@@ -40,22 +40,12 @@ enum DecodeError {
     WorkLimitExceeded,
 }
 
+#[derive(Default)]
 pub(super) struct ProtobufScanBudget {
     visited_rows: usize,
     visited_bytes: usize,
     visited_fields: usize,
     candidates: usize,
-}
-
-impl Default for ProtobufScanBudget {
-    fn default() -> Self {
-        Self {
-            visited_rows: 0,
-            visited_bytes: 0,
-            visited_fields: 0,
-            candidates: 0,
-        }
-    }
 }
 
 impl ProtobufScanBudget {

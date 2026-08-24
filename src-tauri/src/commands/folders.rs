@@ -4354,13 +4354,13 @@ fn ensure_path_in_workspace(root: &Path, target: &Path) -> Result<(), AppCommand
 /// Decode a UTF-16 payload (BOM already stripped) little- or big-endian.
 /// A trailing odd byte is dropped — text editors never need half a code unit.
 fn decode_utf16_payload(payload: &[u8], little_endian: bool) -> String {
-    let unit_count = payload.len() / 2;
-    let mut units = Vec::with_capacity(unit_count);
-    for chunk in payload.chunks_exact(2) {
+    let (chunks, _) = payload.as_chunks::<2>();
+    let mut units = Vec::with_capacity(chunks.len());
+    for &[b0, b1] in chunks {
         let unit = if little_endian {
-            u16::from_le_bytes([chunk[0], chunk[1]])
+            u16::from_le_bytes([b0, b1])
         } else {
-            u16::from_be_bytes([chunk[0], chunk[1]])
+            u16::from_be_bytes([b0, b1])
         };
         units.push(unit);
     }

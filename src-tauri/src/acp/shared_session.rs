@@ -3975,7 +3975,7 @@ impl SharedSessionIndex {
 
     fn record_for_key(&self, key: &SharedSessionKey) -> Option<&Arc<Mutex<SharedSessionRecord>>> {
         let canonical = self.aliases.get(key).unwrap_or(key);
-        debug_assert!(self.aliases.get(key).is_none() || self.sessions.contains_key(canonical));
+        debug_assert!(!self.aliases.contains_key(key) || self.sessions.contains_key(canonical));
         self.sessions.get(canonical)
     }
 
