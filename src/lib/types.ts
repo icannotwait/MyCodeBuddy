@@ -3296,6 +3296,7 @@ export interface DesktopAcpEventHandlers {
 export interface AcceptedConnectionFrame {
   contextKey: string
   connectionId: string
+  deliverySource?: "desktop" | "mapped" | "mixed"
   deliveryIds: readonly number[]
   applyEvents: readonly EventEnvelope[]
   rawEvents: readonly EventEnvelope[]

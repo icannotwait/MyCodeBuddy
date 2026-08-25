@@ -4011,6 +4011,62 @@ describe("AcpConnectionsProvider liveMessage sink (mirror out of React)", () => 
     expect(order.filter((x) => x === "sink")).toHaveLength(1)
     expect(order.indexOf("sink")).toBeLessThan(order.indexOf("notify"))
   })
+
+  it("keeps settled replay content behind the stale reconnect guard", async () => {
+    const handlers = await connectOwner()
+    const { useConversationRuntimeStore, resetConversationRuntimeStore } =
+      await import("@/stores/conversation-runtime-store")
+    resetConversationRuntimeStore()
+    const runtimeActions = useConversationRuntimeStore.getState().actions
+    const settled: LiveMessage = {
+      id: "settled",
+      role: "assistant",
+      content: [{ type: "text", text: "already persisted" }],
+      startedAt: 1_700_000_000_000,
+    }
+    runtimeActions.setLiveMessage(42, settled, true)
+    runtimeActions.completeTurn(42, settled)
+    h.actions!.registerLiveMessageSink(TAB, (message, isLive) => {
+      runtimeActions.setLiveMessage(42, message, isLive)
+    })
+
+    try {
+      act(() => {
+        handlers.onReplay(
+          [
+            {
+              connection_id: "spawned-conn",
+              seq: 1,
+              type: "status_changed",
+              status: "prompting",
+            },
+            {
+              connection_id: "spawned-conn",
+              seq: 2,
+              type: "content_delta",
+              text: "already persisted",
+            },
+            {
+              connection_id: "spawned-conn",
+              seq: 3,
+              type: "turn_complete",
+              session_id: "sess-1",
+              stop_reason: "end_turn",
+              mark_awaiting_reply: false,
+            },
+          ],
+          3
+        )
+      })
+
+      expect(
+        useConversationRuntimeStore.getState().byConversationId.get(42)
+          ?.liveMessage
+      ).toBeNull()
+    } finally {
+      resetConversationRuntimeStore()
+    }
+  })
 })
 
 describe("out-of-turn wire guard + background activity", () => {
@@ -5048,6 +5104,50 @@ describe("AcpConnectionsProvider frame transactions (raw order)", () => {
     ).toEqual(["turn_complete"])
     expect(h.store!.getConnection(TAB)?.liveMessage).toBe(liveMessage)
     expect(transcriptStore.getConversation(42)?.status).toBe("completing")
+  })
+
+  it("publishes final content as live when turn_complete shares its RAF frame", async () => {
+    await mountDesktopOwner()
+    const sink = vi.fn()
+    h.actions!.registerLiveMessageSink(TAB, sink)
+
+    act(() => {
+      h.emitDesktopBatch(
+        batch(1, [
+          {
+            connection_id: "owner-conn",
+            seq: 1,
+            type: "status_changed",
+            status: "prompting",
+          },
+        ])
+      )
+      h.runAnimationFrame()
+    })
+    sink.mockClear()
+
+    act(() => {
+      h.emitDesktopBatch(
+        batch(2, [
+          content("owner-conn", 2, "final answer"),
+          {
+            connection_id: "owner-conn",
+            seq: 3,
+            type: "turn_complete",
+            session_id: "sess-1",
+            stop_reason: "end_turn",
+            mark_awaiting_reply: false,
+          },
+        ])
+      )
+      h.runAnimationFrame()
+    })
+
+    expect(sink).toHaveBeenCalledTimes(1)
+    expect(sink.mock.calls[0]![0].content).toEqual([
+      { type: "text", text: "final answer" },
+    ])
+    expect(sink.mock.calls[0]![1]).toBe(true)
   })
 
   it("raw subscribers run after commit in original envelope order", async () => {

@@ -13,12 +13,17 @@ import type {
 import type { BackgroundOverlayEntry } from "@/stores/conversation-runtime-store"
 import {
   buildStreamingTurnsFromLiveMessage,
+  completeLiveTranscriptTurn,
   resetConversationRuntimeStore,
   selectDelegationActivities,
   selectHistoricalTimelineTurns,
   selectTimelineTurns,
   useConversationRuntimeStore,
 } from "@/stores/conversation-runtime-store"
+import {
+  __resetLiveTranscriptStoreForTests,
+  liveTranscriptStore,
+} from "@/stores/live-transcript-store"
 import { getFolderConversation, saveTurnGenerationStat } from "@/lib/api"
 import { publishRequestUsage } from "@/lib/request-usage-live"
 import { EMPTY_REQUEST_USAGE } from "@/lib/request-usage-speed"
@@ -208,8 +213,32 @@ function mutateHistoricalInput(
 
 afterEach(() => {
   resetConversationRuntimeStore()
+  __resetLiveTranscriptStoreForTests()
   resetJsonParseCacheForTests()
   vi.restoreAllMocks()
+})
+
+describe("completeLiveTranscriptTurn", () => {
+  it("keeps the live transcript when the canonical turn was not promoted", () => {
+    seedRuntimeSession({
+      detail: detailWithTurns([userTurn("u1"), assistantTurn("a1")]),
+      syncState: "idle",
+    })
+    const final = liveMessage("latest", "latest Codex reply")
+    liveTranscriptStore.rebuild(CID, "owner-conn", final, 3)
+    vi.spyOn(console, "warn").mockImplementation(() => {})
+
+    completeLiveTranscriptTurn(CID)
+
+    expect(
+      useConversationRuntimeStore.getState().byConversationId.get(CID)
+        ?.localTurns
+    ).toEqual([])
+    expect(liveTranscriptStore.getConversation(CID)).toMatchObject({
+      messageId: "latest",
+      status: "completing",
+    })
+  })
 })
 
 describe("live request usage persistence boundary", () => {

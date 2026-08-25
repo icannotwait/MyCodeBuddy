@@ -6244,6 +6244,11 @@ export function completeLiveTranscriptTurn(
   conversationId: number,
   liveMessage?: LiveMessage | null
 ): void {
+  const runtimeBefore = useConversationRuntimeStore
+    .getState()
+    .byConversationId.get(conversationId)
+  const sourceLiveMessage =
+    liveMessage !== undefined ? liveMessage : runtimeBefore?.liveMessage
   const live = liveTranscriptStore.getConversation(conversationId)
   if (live) {
     liveTranscriptStore.markCompleting(conversationId, live.messageId)
@@ -6262,7 +6267,15 @@ export function completeLiveTranscriptTurn(
   useConversationRuntimeStore
     .getState()
     .actions.completeTurn(conversationId, liveMessage)
-  if (live) {
+  const runtimeAfter = useConversationRuntimeStore
+    .getState()
+    .byConversationId.get(conversationId)
+  const promoted =
+    sourceLiveMessage != null &&
+    sourceLiveMessage.id === live?.messageId &&
+    runtimeAfter !== runtimeBefore &&
+    runtimeAfter?.liveMessage === null
+  if (live && promoted) {
     liveTranscriptStore.removeIfMessage(conversationId, live.messageId)
   }
 }

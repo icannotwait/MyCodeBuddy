@@ -4730,6 +4730,7 @@ interface PreparedEventFrame {
   changedConnections: Array<{
     contextKey: string
     deliveryIds: readonly number[]
+    liveMessageIsLive: boolean | undefined
   }>
   renderChangedConnections: Array<{ contextKey: string }>
 }
@@ -4820,7 +4821,9 @@ function prepareEventFrame(
 
     const before = connections.get(contextKey) ?? snapshot
     const actions: FrameAction[] = []
+    let liveMessageIsLive: boolean | undefined
     for (const event of connFrame.applyEvents) {
+      const previousLiveMessage = snapshot.liveMessage
       const prepared = prepareMappedEnvelope(contextKey, event, snapshot, env)
       actions.push(...prepared.actions)
       afterCommit.push(...prepared.afterCommit)
@@ -4828,7 +4831,12 @@ function prepareEventFrame(
         draft = reduceSingleAction(draft, item, false)
       }
       const nextSnap = draft.get(contextKey)
-      if (nextSnap) snapshot = nextSnap
+      if (nextSnap) {
+        if (nextSnap.liveMessage !== previousLiveMessage) {
+          liveMessageIsLive = nextSnap.status === "prompting"
+        }
+        snapshot = nextSnap
+      }
     }
 
     // Cursor advance (mirrors APPLY_EVENT_FRAME)
@@ -4853,6 +4861,10 @@ function prepareEventFrame(
       changedConnections.push({
         contextKey,
         deliveryIds: connFrame.deliveryIds,
+        liveMessageIsLive:
+          connFrame.deliverySource === "desktop"
+            ? liveMessageIsLive
+            : undefined,
       })
       if (!onlyCursorChanged(before, after)) {
         renderChangedConnections.push({ contextKey })
@@ -5895,7 +5907,8 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       previous: ConnectionsMap,
       next: ConnectionsMap,
       deliveryIds: readonly number[],
-      connectionFrame?: AcceptedConnectionFrame
+      connectionFrame?: AcceptedConnectionFrame,
+      liveMessageIsLive?: boolean
     ) => {
       const sinks = liveSinksRef.current.get(key)
       if (!sinks) return
@@ -5913,7 +5926,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         try {
           sinks.canonical(
             nextConn.liveMessage,
-            nextConn.status === "prompting",
+            liveMessageIsLive ?? nextConn.status === "prompting",
             deliveryIds
           )
           streamingPerfRecorder.flushQueuedLivePublication()
@@ -5953,7 +5966,8 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       previous: ConnectionsMap,
       next: ConnectionsMap,
       deliveryIds: readonly number[],
-      connectionFrame?: AcceptedConnectionFrame
+      connectionFrame?: AcceptedConnectionFrame,
+      liveMessageIsLive?: boolean
     ) => {
       // At most one sink invocation per registered key: canonical first,
       // then each open tab alias (two open aliases mirror into two sessions).
@@ -5962,7 +5976,8 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         previous,
         next,
         deliveryIds,
-        connectionFrame
+        connectionFrame,
+        liveMessageIsLive
       )
       for (const alias of aliasKeysFor(canonical)) {
         mirrorLiveMessageOnce(
@@ -5970,7 +5985,8 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           previous,
           next,
           deliveryIds,
-          connectionFrame
+          connectionFrame,
+          liveMessageIsLive
         )
       }
     },
@@ -6046,7 +6062,8 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           previous,
           next,
           connection.deliveryIds,
-          framesByKey.get(connection.contextKey)
+          framesByKey.get(connection.contextKey),
+          connection.liveMessageIsLive
         )
       }
       for (const effect of prepared.afterCommit) effect()

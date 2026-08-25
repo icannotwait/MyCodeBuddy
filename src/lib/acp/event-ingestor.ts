@@ -26,6 +26,7 @@ export interface EventIngestorDeps {
 
 interface PendingItem {
   deliveryId: number
+  deliverySource: "desktop" | "mapped"
   event: EventEnvelope
   /** Pre-resolved context key from `pushMapped` (attach path). */
   mappedKey?: string
@@ -33,6 +34,7 @@ interface PendingItem {
 
 interface ConnectionDrainState {
   contextKey: string
+  deliverySource: "desktop" | "mapped" | "mixed"
   provisional: number
   accepted: EventEnvelope[]
   acceptedItems: PendingItem[]
@@ -104,6 +106,7 @@ export class EventIngestor {
     for (const event of batch.events) {
       this.pending.push({
         deliveryId: batch.batch_id,
+        deliverySource: "desktop",
         event: prepareEventEnvelope(event),
       })
     }
@@ -122,6 +125,7 @@ export class EventIngestor {
     for (const event of events) {
       this.pending.push({
         deliveryId,
+        deliverySource: "mapped",
         event: prepareEventEnvelope(event),
         mappedKey: contextKey,
       })
@@ -215,6 +219,7 @@ export class EventIngestor {
       if (!state) {
         state = {
           contextKey,
+          deliverySource: item.deliverySource,
           provisional: this.initialCursor(connectionId, contextKey),
           accepted: [],
           acceptedItems: [],
@@ -247,6 +252,9 @@ export class EventIngestor {
       }
 
       state.provisional = event.seq
+      if (state.deliverySource !== item.deliverySource) {
+        state.deliverySource = "mixed"
+      }
       state.accepted.push(event)
       state.acceptedItems.push(item)
       acceptedItems.push(item)
@@ -269,6 +277,7 @@ export class EventIngestor {
       connections.push({
         contextKey: state.contextKey,
         connectionId,
+        deliverySource: state.deliverySource,
         deliveryIds: state.deliveryIds,
         applyEvents: compactAdjacentDeltas(state.accepted),
         rawEvents: state.accepted,
