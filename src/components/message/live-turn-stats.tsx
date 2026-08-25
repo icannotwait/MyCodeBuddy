@@ -15,7 +15,10 @@ import type {
 } from "@/contexts/acp-connections-context"
 import { inferLiveToolName } from "@/lib/tool-call-normalization"
 import { tryParseJsonForOwner } from "@/lib/try-parse-json"
-import { formatElapsedLabel } from "@/lib/format-elapsed"
+import {
+  formatElapsedLabel,
+  type ElapsedUnitTranslator,
+} from "@/lib/format-elapsed"
 import {
   countUnifiedDiffLineChanges,
   estimateChangedLineStats,
@@ -41,6 +44,9 @@ import {
 import { cn } from "@/lib/utils"
 
 export type LiveTurnStatusMode = "auto" | "waiting_for_subagents"
+
+/** Live tok/s and generation-share are unfinished. Set true to show them. */
+export const LIVE_TURN_REQUEST_USAGE_VISIBLE = false
 
 interface LiveTurnStatsProps {
   message: LiveMessage
@@ -455,6 +461,37 @@ function useAnimatedRequestUsage(
   return displayed
 }
 
+function isVisibleTps(tps: number): boolean {
+  return Number.isFinite(tps) && tps > 0 && tps.toFixed(1) !== "0.0"
+}
+
+function generationSharePercent(
+  generationMs: number,
+  elapsedMs: number
+): number {
+  if (
+    !Number.isFinite(generationMs) ||
+    generationMs <= 0 ||
+    !Number.isFinite(elapsedMs) ||
+    elapsedMs <= 0
+  ) {
+    return 0
+  }
+  return Math.min(100, Math.round((generationMs / elapsedMs) * 100))
+}
+
+function isVisibleGeneration(
+  generationMs: number,
+  elapsedMs: number,
+  t: ElapsedUnitTranslator
+): boolean {
+  if (!Number.isFinite(generationMs) || generationMs <= 0) return false
+  if (formatElapsedLabel(generationMs, t) === formatElapsedLabel(0, t)) {
+    return false
+  }
+  return generationSharePercent(generationMs, elapsedMs) > 0
+}
+
 function ApproximationMarker({
   label,
   tooltip,
@@ -491,7 +528,8 @@ export function LiveTurnStats({
   const t = useTranslations("Folder.chat.liveTurnStats")
   const [elapsed, setElapsed] = useState(() => Date.now() - message.startedAt)
   const editStats = useMemo(() => extractLiveEditStats(message), [message])
-  const showUsage = supportsRequestUsageDisplay(agentType)
+  const showUsage =
+    LIVE_TURN_REQUEST_USAGE_VISIBLE && supportsRequestUsageDisplay(agentType)
   const usageSnap = useSyncExternalStore(
     subscribeRequestUsage,
     () =>
@@ -506,24 +544,30 @@ export function LiveTurnStats({
     usageSnap
   )
   const tpsLabel = displayedUsage.tps.toFixed(1)
-  const validTps =
-    Number.isFinite(displayedUsage.tps) &&
-    displayedUsage.tps > 0 &&
-    tpsLabel !== "0.0"
-  const positiveGeneration =
-    Number.isFinite(displayedUsage.generationMs) &&
-    displayedUsage.generationMs > 0
-  const generationShare =
-    positiveGeneration && elapsed > 0
-      ? Math.min(100, Math.round((displayedUsage.generationMs / elapsed) * 100))
-      : 0
-  const generationLabel = positiveGeneration
+  const validTps = isVisibleTps(displayedUsage.tps)
+  // Keep the slots in the row only when a real target exists (covers the
+  // 5s tween from 0). Empty/invalid snapshots must collapse — previously
+  // `invisible` plus leftover rem boxes sat to the right of a justify-center
+  // row, so "streaming | 26s" looked left of center and "tok/s ≈" had a
+  // trailing gap.
+  const reserveTps =
+    showUsage && usageSnap.sampleCount > 0 && isVisibleTps(usageSnap.tps)
+  const generationShare = generationSharePercent(
+    displayedUsage.generationMs,
+    elapsed
+  )
+  const generationLabel = isVisibleGeneration(
+    displayedUsage.generationMs,
+    elapsed,
+    t
+  )
     ? formatElapsedLabel(displayedUsage.generationMs, t)
     : ""
-  const validGeneration =
-    generationLabel !== "" &&
-    generationLabel !== formatElapsedLabel(0, t) &&
-    generationShare > 0
+  const validGeneration = generationLabel !== ""
+  const reserveGeneration =
+    showUsage &&
+    usageSnap.sampleCount > 0 &&
+    isVisibleGeneration(usageSnap.generationMs, elapsed, t)
   const compactNumberFormatter = useMemo(
     () =>
       new Intl.NumberFormat(locale, {
@@ -594,8 +638,9 @@ export function LiveTurnStats({
           <TooltipProvider delayDuration={0}>
             <span
               className={cn(
-                "hidden text-border leading-none @[30rem]/turnstats:inline",
-                !validTps && "invisible"
+                "hidden text-border leading-none",
+                reserveTps && "@[30rem]/turnstats:inline",
+                reserveTps && !validTps && "invisible"
               )}
             >
               |
@@ -603,8 +648,9 @@ export function LiveTurnStats({
             <span
               data-testid="output-speed-slot"
               className={cn(
-                "hidden w-[7.5rem] items-center gap-1 leading-none tabular-nums @[30rem]/turnstats:inline-flex",
-                !validTps && "invisible"
+                "hidden items-center gap-1 leading-none tabular-nums",
+                reserveTps && "@[30rem]/turnstats:inline-flex",
+                reserveTps && !validTps && "invisible"
               )}
               title={validTps ? t("outputSpeedTooltip") : undefined}
             >
@@ -626,8 +672,9 @@ export function LiveTurnStats({
             </span>
             <span
               className={cn(
-                "hidden text-border leading-none @[36rem]/turnstats:inline",
-                !validGeneration && "invisible"
+                "hidden text-border leading-none",
+                reserveGeneration && "@[36rem]/turnstats:inline",
+                reserveGeneration && !validGeneration && "invisible"
               )}
             >
               |
@@ -635,8 +682,9 @@ export function LiveTurnStats({
             <span
               data-testid="generation-share-slot"
               className={cn(
-                "hidden w-[8.5rem] items-center gap-1 leading-none tabular-nums @[36rem]/turnstats:inline-flex",
-                !validGeneration && "invisible"
+                "hidden items-center gap-1 leading-none tabular-nums",
+                reserveGeneration && "@[36rem]/turnstats:inline-flex",
+                reserveGeneration && !validGeneration && "invisible"
               )}
               title={
                 validGeneration

@@ -2,7 +2,11 @@ import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { NextIntlClientProvider } from "next-intl"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
-import { extractLiveEditStats, LiveTurnStats } from "./live-turn-stats"
+import {
+  extractLiveEditStats,
+  LIVE_TURN_REQUEST_USAGE_VISIBLE,
+  LiveTurnStats,
+} from "./live-turn-stats"
 import type {
   LiveContentBlock,
   LiveMessage,
@@ -67,6 +71,18 @@ function renderUsage(conversationId: number) {
         isStreaming
       />
     </NextIntlClientProvider>
+  )
+}
+
+function expectCollapsedUsageSlot(
+  testId: "output-speed-slot" | "generation-share-slot"
+) {
+  const el = screen.getByTestId(testId)
+  expect(el).not.toHaveClass("invisible")
+  expect(el).not.toHaveClass(
+    testId === "output-speed-slot"
+      ? "@[30rem]/turnstats:inline-flex"
+      : "@[36rem]/turnstats:inline-flex"
   )
 }
 
@@ -171,294 +187,377 @@ describe("LiveTurnStats status label", () => {
   })
 })
 
-describe("LiveTurnStats request usage transition", () => {
-  beforeEach(() => {
-    vi.useFakeTimers()
-    vi.setSystemTime(new Date("2026-08-21T00:00:00.000Z"))
-    const startedAt = Date.now()
-    vi.spyOn(performance, "now").mockImplementation(
-      () => Date.now() - startedAt
-    )
-  })
+describe.skipIf(LIVE_TURN_REQUEST_USAGE_VISIBLE)(
+  "LiveTurnStats request usage visibility",
+  () => {
+    afterEach(() => {
+      cleanup()
+    })
 
-  afterEach(() => {
-    cleanup()
-    vi.unstubAllGlobals()
-    vi.restoreAllMocks()
-    vi.useRealTimers()
-  })
+    it("omits tok/s and generation-share from the streaming banner", () => {
+      const message = msg([textBlock("streaming")])
+      message.startedAt = Date.now() - 10_000
+      publishRequestUsage(5_030, {
+        outputTokens: 100,
+        generationMs: 13_000,
+        tps: 76.7,
+        sampleCount: 1,
+        estimatedSampleCount: 1,
+      })
+      render(
+        <NextIntlClientProvider locale="en" messages={enMessages}>
+          <LiveTurnStats
+            message={message}
+            agentType="codex"
+            conversationId={5_030}
+            isStreaming
+          />
+        </NextIntlClientProvider>
+      )
 
-  it.each([
-    ["empty", 5_001, EMPTY_REQUEST_USAGE],
-    [
-      "non-finite",
-      5_009,
-      {
+      expect(screen.queryByTestId("output-speed-slot")).not.toBeInTheDocument()
+      expect(
+        screen.queryByTestId("generation-share-slot")
+      ).not.toBeInTheDocument()
+      expect(screen.queryByText(/tok\/s/)).not.toBeInTheDocument()
+    })
+  }
+)
+
+describe.skipIf(!LIVE_TURN_REQUEST_USAGE_VISIBLE)(
+  "LiveTurnStats request usage transition",
+  () => {
+    beforeEach(() => {
+      vi.useFakeTimers()
+      vi.setSystemTime(new Date("2026-08-21T00:00:00.000Z"))
+      const startedAt = Date.now()
+      vi.spyOn(performance, "now").mockImplementation(
+        () => Date.now() - startedAt
+      )
+    })
+
+    afterEach(() => {
+      cleanup()
+      vi.unstubAllGlobals()
+      vi.restoreAllMocks()
+      vi.useRealTimers()
+    })
+
+    it.each([
+      ["empty", 5_001, EMPTY_REQUEST_USAGE],
+      [
+        "non-finite",
+        5_009,
+        {
+          outputTokens: 10,
+          generationMs: Number.NaN,
+          tps: Number.NaN,
+          sampleCount: 1,
+          estimatedSampleCount: 0,
+        },
+      ],
+      [
+        "non-positive",
+        5_010,
+        {
+          outputTokens: 10,
+          generationMs: 0,
+          tps: -1,
+          sampleCount: 1,
+          estimatedSampleCount: 0,
+        },
+      ],
+    ] as const)("hides %s metrics", (_name, conversationId, snapshot) => {
+      publishRequestUsage(conversationId, snapshot)
+      renderUsage(conversationId)
+      act(() => vi.advanceTimersByTime(5_016))
+
+      expect(screen.queryByText(/tok\/s$/)).not.toBeInTheDocument()
+      expectCollapsedUsageSlot("output-speed-slot")
+      expectCollapsedUsageSlot("generation-share-slot")
+    })
+
+    it("does not reserve centered-row space for empty usage metrics", () => {
+      // `invisible` + fixed widths on unused tok/s and generation slots sat to
+      // the right of "streaming | 26s" inside a justify-center row, so the
+      // visible status looked left-of-center for the whole turn.
+      publishRequestUsage(5_020, EMPTY_REQUEST_USAGE)
+      renderUsage(5_020)
+
+      expectCollapsedUsageSlot("output-speed-slot")
+      expectCollapsedUsageSlot("generation-share-slot")
+    })
+
+    it("sizes visible usage slots to their content, not a leftover rem box", () => {
+      // w-[7.5rem] / w-[8.5rem] left a gap after "tok/s ≈" and "13s (37%) ≈"
+      // because the copy is shorter than those boxes and the slots are
+      // left-aligned.
+      publishRequestUsage(5_021, {
+        outputTokens: 100,
+        generationMs: 1_000,
+        tps: 76.7,
+        sampleCount: 1,
+        estimatedSampleCount: 1,
+      })
+      renderUsage(5_021)
+      act(() => vi.advanceTimersByTime(5_016))
+
+      expect(screen.getByTestId("output-speed-slot")).not.toHaveClass(
+        "w-[7.5rem]"
+      )
+      expect(screen.getByTestId("generation-share-slot")).not.toHaveClass(
+        "w-[8.5rem]"
+      )
+      expect(screen.getByText(/tok\/s$/)).toBeInTheDocument()
+      expect(screen.getByTestId("generation-share-slot")).toHaveTextContent(
+        /\(\d+%\)/
+      )
+    })
+
+    it("hides a settled sub-second generation duration", () => {
+      publishRequestUsage(5_013, {
         outputTokens: 10,
-        generationMs: Number.NaN,
-        tps: Number.NaN,
+        generationMs: 999,
+        tps: 10,
         sampleCount: 1,
         estimatedSampleCount: 0,
-      },
-    ],
-    [
-      "non-positive",
-      5_010,
-      {
-        outputTokens: 10,
-        generationMs: 0,
-        tps: -1,
+      })
+      renderUsage(5_013)
+      act(() => vi.advanceTimersByTime(5_016))
+
+      expectCollapsedUsageSlot("generation-share-slot")
+    })
+
+    it("hides the generation slot during the formatted-zero transition", () => {
+      publishRequestUsage(5_014, {
+        outputTokens: 100,
+        generationMs: 1_000,
+        tps: 100,
         sampleCount: 1,
         estimatedSampleCount: 0,
-      },
-    ],
-  ] as const)("hides %s metrics", (_name, conversationId, snapshot) => {
-    publishRequestUsage(conversationId, snapshot)
-    renderUsage(conversationId)
-    act(() => vi.advanceTimersByTime(5_016))
+      })
+      renderUsage(5_014)
+      act(() => vi.advanceTimersByTime(33))
 
-    expect(screen.queryByText(/tok\/s$/)).not.toBeInTheDocument()
-    expect(screen.getByTestId("output-speed-slot")).toHaveClass("invisible")
-    expect(screen.getByTestId("generation-share-slot")).toHaveClass("invisible")
-  })
-
-  it("hides a settled sub-second generation duration", () => {
-    publishRequestUsage(5_013, {
-      outputTokens: 10,
-      generationMs: 999,
-      tps: 10,
-      sampleCount: 1,
-      estimatedSampleCount: 0,
+      expect(screen.getByTestId("generation-share-slot")).toHaveClass(
+        "invisible"
+      )
     })
-    renderUsage(5_013)
-    act(() => vi.advanceTimersByTime(5_016))
 
-    expect(screen.getByTestId("generation-share-slot")).toHaveClass("invisible")
-  })
+    it("hides formatted-zero speed without hiding valid generation share", () => {
+      publishRequestUsage(5_011, {
+        outputTokens: 1,
+        generationMs: 1_000,
+        tps: 0.04,
+        sampleCount: 1,
+        estimatedSampleCount: 0,
+      })
+      renderUsage(5_011)
+      act(() => vi.advanceTimersByTime(5_016))
 
-  it("hides the generation slot during the formatted-zero transition", () => {
-    publishRequestUsage(5_014, {
-      outputTokens: 100,
-      generationMs: 1_000,
-      tps: 100,
-      sampleCount: 1,
-      estimatedSampleCount: 0,
+      expect(screen.queryByText("0.0 tok/s")).not.toBeInTheDocument()
+      expectCollapsedUsageSlot("output-speed-slot")
+      expect(screen.getByTestId("generation-share-slot")).not.toHaveClass(
+        "invisible"
+      )
+      expect(screen.getByTestId("generation-share-slot")).toHaveTextContent(
+        /\(7%\)/
+      )
     })
-    renderUsage(5_014)
-    act(() => vi.advanceTimersByTime(33))
 
-    expect(screen.getByTestId("generation-share-slot")).toHaveClass("invisible")
-  })
+    it("ticks every 33ms and reaches the exact target on the 5016ms tick", () => {
+      publishRequestUsage(5_002, {
+        outputTokens: 100,
+        generationMs: 1_000,
+        tps: 100,
+        sampleCount: 1,
+        estimatedSampleCount: 0,
+      })
+      renderUsage(5_002)
 
-  it("hides formatted-zero speed without hiding valid generation share", () => {
-    publishRequestUsage(5_011, {
-      outputTokens: 1,
-      generationMs: 1_000,
-      tps: 0.04,
-      sampleCount: 1,
-      estimatedSampleCount: 0,
+      expect(screen.queryByText("0.0 tok/s")).not.toBeInTheDocument()
+      act(() => vi.advanceTimersByTime(32))
+      expect(screen.getByTestId("output-speed-slot")).toHaveClass("invisible")
+      act(() => vi.advanceTimersByTime(1))
+      expect(screen.getByTestId("output-speed-slot")).not.toHaveClass(
+        "invisible"
+      )
+      expect(screen.getByText(/tok\/s$/)).not.toHaveTextContent("100.0 tok/s")
+
+      act(() => vi.advanceTimersByTime(4_950))
+      expect(vi.getTimerCount()).toBe(2)
+      act(() => vi.advanceTimersByTime(33))
+      expect(screen.getByText(/tok\/s$/)).toHaveTextContent("100.0 tok/s")
+      expect(vi.getTimerCount()).toBe(1)
     })
-    renderUsage(5_011)
-    act(() => vi.advanceTimersByTime(5_016))
 
-    expect(screen.queryByText("0.0 tok/s")).not.toBeInTheDocument()
-    expect(screen.getByTestId("output-speed-slot")).toHaveClass("invisible")
-    expect(screen.getByTestId("generation-share-slot")).not.toHaveClass(
-      "invisible"
-    )
-    expect(screen.getByTestId("generation-share-slot")).toHaveTextContent(
-      /\(7%\)/
-    )
-  })
-
-  it("ticks every 33ms and reaches the exact target on the 5016ms tick", () => {
-    publishRequestUsage(5_002, {
-      outputTokens: 100,
-      generationMs: 1_000,
-      tps: 100,
-      sampleCount: 1,
-      estimatedSampleCount: 0,
-    })
-    renderUsage(5_002)
-
-    expect(screen.queryByText("0.0 tok/s")).not.toBeInTheDocument()
-    act(() => vi.advanceTimersByTime(32))
-    expect(screen.getByTestId("output-speed-slot")).toHaveClass("invisible")
-    act(() => vi.advanceTimersByTime(1))
-    expect(screen.getByTestId("output-speed-slot")).not.toHaveClass("invisible")
-    expect(screen.getByText(/tok\/s$/)).not.toHaveTextContent("100.0 tok/s")
-
-    act(() => vi.advanceTimersByTime(4_950))
-    expect(vi.getTimerCount()).toBe(2)
-    act(() => vi.advanceTimersByTime(33))
-    expect(screen.getByText(/tok\/s$/)).toHaveTextContent("100.0 tok/s")
-    expect(vi.getTimerCount()).toBe(1)
-  })
-
-  it("replaces a target from the current interpolated value", () => {
-    publishRequestUsage(5_003, {
-      outputTokens: 100,
-      generationMs: 1_000,
-      tps: 100,
-      sampleCount: 1,
-      estimatedSampleCount: 0,
-    })
-    renderUsage(5_003)
-    act(() => vi.advanceTimersByTime(990))
-    const before = Number.parseFloat(
-      screen.getByText(/tok\/s$/).textContent ?? "0"
-    )
-
-    act(() => {
+    it("replaces a target from the current interpolated value", () => {
       publishRequestUsage(5_003, {
-        outputTokens: 400,
-        generationMs: 2_000,
-        tps: 200,
-        sampleCount: 2,
+        outputTokens: 100,
+        generationMs: 1_000,
+        tps: 100,
+        sampleCount: 1,
         estimatedSampleCount: 0,
       })
-    })
-    const atReplacement = Number.parseFloat(
-      screen.getByText(/tok\/s$/).textContent ?? "0"
-    )
-    expect(atReplacement).toBeCloseTo(before, 1)
+      renderUsage(5_003)
+      act(() => vi.advanceTimersByTime(990))
+      const before = Number.parseFloat(
+        screen.getByText(/tok\/s$/).textContent ?? "0"
+      )
 
-    act(() => vi.advanceTimersByTime(33))
-    const after = Number.parseFloat(
-      screen.getByText(/tok\/s$/).textContent ?? "0"
-    )
-    expect(after).toBeGreaterThan(atReplacement)
-    expect(after).toBeLessThan(200)
-  })
-
-  it("hides immediately on reset and clears target work on unmount", () => {
-    publishRequestUsage(5_004, {
-      outputTokens: 100,
-      generationMs: 1_000,
-      tps: 100,
-      sampleCount: 1,
-      estimatedSampleCount: 0,
-    })
-    const view = renderUsage(5_004)
-    act(() => vi.advanceTimersByTime(330))
-    expect(vi.getTimerCount()).toBe(2)
-
-    act(() => publishRequestUsage(5_004, EMPTY_REQUEST_USAGE))
-    expect(screen.getByTestId("output-speed-slot")).toHaveClass("invisible")
-    expect(vi.getTimerCount()).toBe(1)
-
-    view.unmount()
-    expect(vi.getTimerCount()).toBe(0)
-  })
-
-  it("resets the transition when conversation identity changes", () => {
-    publishRequestUsage(5_005, {
-      outputTokens: 100,
-      generationMs: 1_000,
-      tps: 100,
-      sampleCount: 1,
-      estimatedSampleCount: 0,
-    })
-    const message = msg([textBlock("streaming")])
-    message.startedAt = Date.now() - 10_000
-    const view = render(
-      <NextIntlClientProvider locale="en" messages={enMessages}>
-        <LiveTurnStats
-          message={message}
-          agentType="codex"
-          conversationId={5_005}
-        />
-      </NextIntlClientProvider>
-    )
-    act(() => vi.advanceTimersByTime(330))
-    publishRequestUsage(5_006, EMPTY_REQUEST_USAGE)
-    view.rerender(
-      <NextIntlClientProvider locale="en" messages={enMessages}>
-        <LiveTurnStats
-          message={message}
-          agentType="codex"
-          conversationId={5_006}
-        />
-      </NextIntlClientProvider>
-    )
-
-    expect(screen.getByTestId("output-speed-slot")).toHaveClass("invisible")
-    expect(vi.getTimerCount()).toBe(1)
-  })
-
-  it("keeps the five-second transition when reduced motion is requested", () => {
-    vi.stubGlobal(
-      "matchMedia",
-      vi.fn().mockReturnValue({
-        matches: true,
-        media: "(prefers-reduced-motion: reduce)",
-        onchange: null,
-        addEventListener: vi.fn(),
-        removeEventListener: vi.fn(),
-        addListener: vi.fn(),
-        removeListener: vi.fn(),
-        dispatchEvent: vi.fn(),
+      act(() => {
+        publishRequestUsage(5_003, {
+          outputTokens: 400,
+          generationMs: 2_000,
+          tps: 200,
+          sampleCount: 2,
+          estimatedSampleCount: 0,
+        })
       })
-    )
-    publishRequestUsage(5_012, {
-      outputTokens: 100,
-      generationMs: 1_000,
-      tps: 100,
-      sampleCount: 1,
-      estimatedSampleCount: 0,
-    })
-    renderUsage(5_012)
+      const atReplacement = Number.parseFloat(
+        screen.getByText(/tok\/s$/).textContent ?? "0"
+      )
+      expect(atReplacement).toBeCloseTo(before, 1)
 
-    act(() => vi.advanceTimersByTime(33))
-    expect(screen.getByText(/tok\/s$/)).not.toHaveTextContent("100.0 tok/s")
-  })
-
-  it("shows one accessible estimate marker for each approximate metric", async () => {
-    publishRequestUsage(5_007, {
-      outputTokens: 100,
-      generationMs: 1_000,
-      tps: 100,
-      sampleCount: 1,
-      estimatedSampleCount: 1,
+      act(() => vi.advanceTimersByTime(33))
+      const after = Number.parseFloat(
+        screen.getByText(/tok\/s$/).textContent ?? "0"
+      )
+      expect(after).toBeGreaterThan(atReplacement)
+      expect(after).toBeLessThan(200)
     })
-    renderUsage(5_007)
-    act(() => vi.advanceTimersByTime(5_016))
 
-    const markers = screen.getAllByRole("button", {
-      name: enMessages.Folder.chat.liveTurnStats.estimatedAria,
-    })
-    expect(markers).toHaveLength(2)
-    expect(markers[0]).toHaveTextContent("≈")
-    act(() => markers[0].focus())
-    expect(markers[0]).toHaveFocus()
-    act(() => markers[0].blur())
-    act(() => {
-      fireEvent.click(markers[0])
-      vi.advanceTimersByTime(0)
-    })
-    expect(screen.getByRole("tooltip")).toHaveTextContent(
-      enMessages.Folder.chat.liveTurnStats.estimatedTooltip
-    )
-  })
+    it("hides immediately on reset and clears target work on unmount", () => {
+      publishRequestUsage(5_004, {
+        outputTokens: 100,
+        generationMs: 1_000,
+        tps: 100,
+        sampleCount: 1,
+        estimatedSampleCount: 0,
+      })
+      const view = renderUsage(5_004)
+      act(() => vi.advanceTimersByTime(330))
+      expect(vi.getTimerCount()).toBe(2)
 
-  it("shows no approximation marker for exact-only usage", () => {
-    publishRequestUsage(5_008, {
-      outputTokens: 100,
-      generationMs: 1_000,
-      tps: 100,
-      sampleCount: 1,
-      estimatedSampleCount: 0,
-    })
-    renderUsage(5_008)
-    act(() => vi.advanceTimersByTime(33))
+      act(() => publishRequestUsage(5_004, EMPTY_REQUEST_USAGE))
+      expectCollapsedUsageSlot("output-speed-slot")
+      expect(vi.getTimerCount()).toBe(1)
 
-    expect(
-      screen.queryByRole("button", {
+      view.unmount()
+      expect(vi.getTimerCount()).toBe(0)
+    })
+
+    it("resets the transition when conversation identity changes", () => {
+      publishRequestUsage(5_005, {
+        outputTokens: 100,
+        generationMs: 1_000,
+        tps: 100,
+        sampleCount: 1,
+        estimatedSampleCount: 0,
+      })
+      const message = msg([textBlock("streaming")])
+      message.startedAt = Date.now() - 10_000
+      const view = render(
+        <NextIntlClientProvider locale="en" messages={enMessages}>
+          <LiveTurnStats
+            message={message}
+            agentType="codex"
+            conversationId={5_005}
+          />
+        </NextIntlClientProvider>
+      )
+      act(() => vi.advanceTimersByTime(330))
+      publishRequestUsage(5_006, EMPTY_REQUEST_USAGE)
+      view.rerender(
+        <NextIntlClientProvider locale="en" messages={enMessages}>
+          <LiveTurnStats
+            message={message}
+            agentType="codex"
+            conversationId={5_006}
+          />
+        </NextIntlClientProvider>
+      )
+
+      expectCollapsedUsageSlot("output-speed-slot")
+      expect(vi.getTimerCount()).toBe(1)
+    })
+
+    it("keeps the five-second transition when reduced motion is requested", () => {
+      vi.stubGlobal(
+        "matchMedia",
+        vi.fn().mockReturnValue({
+          matches: true,
+          media: "(prefers-reduced-motion: reduce)",
+          onchange: null,
+          addEventListener: vi.fn(),
+          removeEventListener: vi.fn(),
+          addListener: vi.fn(),
+          removeListener: vi.fn(),
+          dispatchEvent: vi.fn(),
+        })
+      )
+      publishRequestUsage(5_012, {
+        outputTokens: 100,
+        generationMs: 1_000,
+        tps: 100,
+        sampleCount: 1,
+        estimatedSampleCount: 0,
+      })
+      renderUsage(5_012)
+
+      act(() => vi.advanceTimersByTime(33))
+      expect(screen.getByText(/tok\/s$/)).not.toHaveTextContent("100.0 tok/s")
+    })
+
+    it("shows one accessible estimate marker for each approximate metric", async () => {
+      publishRequestUsage(5_007, {
+        outputTokens: 100,
+        generationMs: 1_000,
+        tps: 100,
+        sampleCount: 1,
+        estimatedSampleCount: 1,
+      })
+      renderUsage(5_007)
+      act(() => vi.advanceTimersByTime(5_016))
+
+      const markers = screen.getAllByRole("button", {
         name: enMessages.Folder.chat.liveTurnStats.estimatedAria,
       })
-    ).not.toBeInTheDocument()
-  })
+      expect(markers).toHaveLength(2)
+      expect(markers[0]).toHaveTextContent("≈")
+      act(() => markers[0].focus())
+      expect(markers[0]).toHaveFocus()
+      act(() => markers[0].blur())
+      act(() => {
+        fireEvent.click(markers[0])
+        vi.advanceTimersByTime(0)
+      })
+      expect(screen.getByRole("tooltip")).toHaveTextContent(
+        enMessages.Folder.chat.liveTurnStats.estimatedTooltip
+      )
+    })
 
+    it("shows no approximation marker for exact-only usage", () => {
+      publishRequestUsage(5_008, {
+        outputTokens: 100,
+        generationMs: 1_000,
+        tps: 100,
+        sampleCount: 1,
+        estimatedSampleCount: 0,
+      })
+      renderUsage(5_008)
+      act(() => vi.advanceTimersByTime(33))
+
+      expect(
+        screen.queryByRole("button", {
+          name: enMessages.Folder.chat.liveTurnStats.estimatedAria,
+        })
+      ).not.toBeInTheDocument()
+    })
+  }
+)
+
+describe("LiveTurnStats request usage copy", () => {
   it.each([
     ["ar", arMessages],
     ["de", deMessages],
