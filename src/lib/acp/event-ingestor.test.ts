@@ -435,6 +435,25 @@ describe("EventIngestor", () => {
     expect(h.rawSeqs()).toEqual([1, 2])
   })
 
+  it("keeps mapped delivery provenance per event in a mixed frame", () => {
+    const h = createIngestorHarness({ c1: { key: "tab-1", cursor: 0 } })
+    h.ingestor.pushMapped(
+      "tab-1",
+      [content("c1", 1, "replayed")],
+      "resume_replay"
+    )
+    h.ingestor.pushMapped("tab-1", [content("c1", 2, "live")], "live")
+
+    h.runFrame()
+
+    expect([
+      ...(h.commits[0].connections[0].eventDeliverySourceBySeq ?? []),
+    ]).toEqual([
+      [1, "resume_replay"],
+      [2, "live"],
+    ])
+  })
+
   it("flushNow drains immediately without waiting for a frame", () => {
     const h = createIngestorHarness({ c1: { key: "tab-1", cursor: 0 } })
     h.pushBatch(batch(1, [content("c1", 1, "a")]))

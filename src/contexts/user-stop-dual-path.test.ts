@@ -1,11 +1,11 @@
 /**
- * Task 6 — Dual-path completion wiring.
+ * Task 6 — Completion idempotency around a typed cancellation envelope.
  *
- * Design FE case 11: status-edge promotion then late typed turn_complete
- * (and reverse) records one outcome and starts one coordinator.
+ * A pre-promoted runtime followed by a typed turn_complete (and reverse)
+ * records one outcome and starts one coordinator.
  *
  * Envelope path is the sole START_CANCEL_RECONCILE / RECORD_TURN_OUTCOME
- * starter for user_stop; status-edge remains promotion-only.
+ * starter for user_stop; plain COMPLETE_TURN remains promotion-only.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { readFileSync } from "node:fs"
@@ -17,7 +17,10 @@ import type {
 } from "@/lib/types"
 import type { LiveMessage } from "@/contexts/acp-connections-context"
 import {
+  __getCancelGenerationForTests,
   __getUserStopOwnershipForTests,
+  CANCEL_RECONCILE_DELAYS_MS,
+  enterOwnerPreserve,
   getConversationIdByExternalIdFromStore,
   noteUserStopTurnOwnership,
   resetConversationRuntimeStore,
@@ -128,6 +131,56 @@ function seed(overrides: Partial<ConversationRuntimeSession> = {}): void {
   })
 }
 
+const VIRTUAL_ALIAS = -9
+
+function seedAliasPair(): LiveMessage {
+  const live = liveMessage("lm-alias", "shared interrupted reply")
+  const makeAlias = (conversationId: number) =>
+    emptySession(conversationId, {
+      externalId: SESSION,
+      dbConversationId: CID,
+      optimisticTurns: [userTurn(`u-${conversationId}`, "shared prompt")],
+      liveMessage: live,
+      syncState: "awaiting_persist",
+      activeTurnToken: `tok-${conversationId}`,
+      lastTurnOwned: true,
+    })
+  useConversationRuntimeStore.setState({
+    byConversationId: new Map([
+      [VIRTUAL_ALIAS, makeAlias(VIRTUAL_ALIAS)],
+      [CID, makeAlias(CID)],
+    ]),
+    conversationIdByExternalId: new Map([[SESSION, CID]]),
+  })
+  noteUserStopTurnOwnership(VIRTUAL_ALIAS)
+  noteUserStopTurnOwnership(CID)
+  return live
+}
+
+function acceptAliasPair(finalLiveMessage: LiveMessage): void {
+  acceptUserStopTurnComplete({
+    sessionId: SESSION,
+    connectionId: CONN,
+    completionSeq: SEQ,
+    stopReason: "cancelled",
+    terminationSource: "user_stop",
+    providerTurnId: PROVIDER,
+    snapshotConversationId: CID,
+    finalLiveMessage,
+  })
+}
+
+function deferredDetail(): {
+  promise: Promise<DbConversationDetail>
+  resolve: (detail: DbConversationDetail) => void
+} {
+  let resolve!: (detail: DbConversationDetail) => void
+  const promise = new Promise<DbConversationDetail>((done) => {
+    resolve = done
+  })
+  return { promise, resolve }
+}
+
 function session(): ConversationRuntimeSession {
   const s = useConversationRuntimeStore.getState().byConversationId.get(CID)
   if (!s) throw new Error("missing session")
@@ -138,8 +191,8 @@ function actions() {
   return useConversationRuntimeStore.getState().actions
 }
 
-/** Status-edge / COMPLETE_TURN promotion path (session-surface). */
-function promoteStatusEdge(live?: LiveMessage | null): void {
+/** Plain COMPLETE_TURN promotion without cancellation envelope metadata. */
+function promoteBeforeEnvelope(live?: LiveMessage | null): void {
   actions().completeTurn(CID, live === undefined ? undefined : live)
 }
 
@@ -206,10 +259,10 @@ afterEach(() => {
   vi.useRealTimers()
 })
 
-// ── FE case 11: dual-path orderings ──
+// ── FE case 11: completion orderings ──
 
-describe("FE11 dual-path completion orderings", () => {
-  it("status-edge then late typed turn_complete: one outcome, one coordinator", async () => {
+describe("FE11 completion orderings", () => {
+  it("pre-promotion then late typed turn_complete: one outcome, one coordinator", async () => {
     seed({
       localTurns: [userTurn("u1")],
       optimisticTurns: [],
@@ -223,8 +276,8 @@ describe("FE11 dual-path completion orderings", () => {
     // Cancel ownership snapshotted at user Stop (before turn_complete).
     noteUserStopTurnOwnership(CID)
 
-    // Path A: status-edge promotes first (no envelope fields).
-    promoteStatusEdge()
+    // Path A: plain COMPLETE_TURN promotes first (no envelope fields).
+    promoteBeforeEnvelope()
     expect(session().liveMessage).toBeNull()
     expect(session().localTurns.some((t) => t.role === "assistant")).toBe(true)
     expect(lastTurn(session().localTurns)?.outcome).toBeUndefined()
@@ -259,7 +312,7 @@ describe("FE11 dual-path completion orderings", () => {
     expect(mockGet).toHaveBeenCalledTimes(1)
   })
 
-  it("typed envelope then status-edge: one outcome, one coordinator, content kept", async () => {
+  it("typed envelope then duplicate promotion: one outcome, one coordinator, content kept", async () => {
     seed({
       localTurns: [userTurn("u1")],
       optimisticTurns: [],
@@ -295,8 +348,8 @@ describe("FE11 dual-path completion orderings", () => {
       textBlocks.some((b) => b.type === "text" && b.text.includes("partial"))
     ).toBe(true)
 
-    // Path A late: status-edge is promotion-only (already drained — no-op).
-    promoteStatusEdge()
+    // Path A late: plain COMPLETE_TURN is promotion-only (already drained — no-op).
+    promoteBeforeEnvelope()
     expect(
       session().localTurns.filter((t) => t.role === "assistant")
     ).toHaveLength(1)
@@ -322,7 +375,7 @@ describe("FE11 dual-path completion orderings", () => {
     noteUserStopTurnOwnership(CID)
     const ownedGen = __getUserStopOwnershipForTests(CID)?.cancelGeneration
     expect(ownedGen).toBeTypeOf("number")
-    promoteStatusEdge()
+    promoteBeforeEnvelope()
     const afterA = session()
     expect(afterA.activeTurnToken).toBeNull()
     expect(afterA.localTurns.some((t) => t.role === "assistant")).toBe(true)
@@ -367,7 +420,7 @@ describe("FE11 dual-path completion orderings", () => {
     mockGet.mockResolvedValue(detailWithFence())
 
     noteUserStopTurnOwnership(CID)
-    promoteStatusEdge()
+    promoteBeforeEnvelope()
 
     // Next prompt B, then B completes (clears activeTurnToken to null again).
     actions().appendOptimisticTurn(
@@ -376,7 +429,7 @@ describe("FE11 dual-path completion orderings", () => {
       "tok-B"
     )
     actions().setLiveMessage(CID, liveMessage("lm-b", "reply B"))
-    promoteStatusEdge()
+    promoteBeforeEnvelope()
     expect(session().activeTurnToken).toBeNull()
     expect(session().liveMessage).toBeNull()
     expect(session().optimisticTurns).toHaveLength(0)
@@ -463,7 +516,7 @@ describe("FE11 dual-path completion orderings", () => {
       syncState: "awaiting_persist",
       activeTurnToken: "tok-3",
     })
-    promoteStatusEdge()
+    promoteBeforeEnvelope()
     acceptUserStopTurnComplete({
       sessionId: SESSION,
       connectionId: CONN,
@@ -724,6 +777,179 @@ describe("FE11 dual-path completion orderings", () => {
         ?.pendingCancel?.completionSeq
     ).toBe(SEQ)
   })
+
+  it("elects the durable alias once and reconciles every unchanged follower", async () => {
+    const finalLiveMessage = seedAliasPair()
+    mockGet.mockResolvedValue(detailWithFence())
+
+    acceptAliasPair(finalLiveMessage)
+
+    for (const conversationId of [VIRTUAL_ALIAS, CID]) {
+      const alias = useConversationRuntimeStore
+        .getState()
+        .byConversationId.get(conversationId)!
+      expect(alias.localTurns.at(-1)).toMatchObject({
+        role: "assistant",
+        blocks: [{ type: "text", text: "shared interrupted reply" }],
+        outcome: { source: "user_stop", provider_turn_id: PROVIDER },
+      })
+    }
+    expect(
+      useConversationRuntimeStore.getState().byConversationId.get(CID)
+        ?.pendingCancel
+    ).toMatchObject({ completionSeq: SEQ })
+    expect(
+      useConversationRuntimeStore.getState().byConversationId.get(VIRTUAL_ALIAS)
+        ?.ownerPreserve
+    ).toBe(true)
+
+    await vi.advanceTimersByTimeAsync(CANCEL_RECONCILE_DELAYS_MS[0])
+    expect(mockGet).toHaveBeenCalledTimes(1)
+    expect(mockGet).toHaveBeenCalledWith(42, expect.any(Object))
+    for (const conversationId of [VIRTUAL_ALIAS, CID]) {
+      expect(
+        useConversationRuntimeStore
+          .getState()
+          .byConversationId.get(conversationId)
+          ?.detail?.turns.at(-1)
+      ).toMatchObject({ id: "a-persisted" })
+    }
+    expect(getConversationIdByExternalIdFromStore(SESSION)).toBe(CID)
+  })
+
+  it("prefers the positive durable alias when no snapshot owner is available", () => {
+    const finalLiveMessage = seedAliasPair()
+
+    acceptUserStopTurnComplete({
+      sessionId: SESSION,
+      connectionId: CONN,
+      completionSeq: SEQ,
+      stopReason: "cancelled",
+      terminationSource: "user_stop",
+      providerTurnId: PROVIDER,
+      finalLiveMessage,
+    })
+
+    expect(
+      useConversationRuntimeStore.getState().byConversationId.get(CID)
+        ?.pendingCancel
+    ).toMatchObject({ completionSeq: SEQ })
+    expect(
+      useConversationRuntimeStore.getState().byConversationId.get(VIRTUAL_ALIAS)
+        ?.pendingCancel
+    ).toBeNull()
+  })
+
+  it("transfers an invalidated coordinator to an unchanged durable follower", async () => {
+    seedAliasPair()
+    const runtimeActions = actions()
+    const outcome = {
+      status: "interrupted" as const,
+      stop_reason: "cancelled",
+      source: "user_stop" as const,
+      provider_turn_id: PROVIDER,
+    }
+    for (const conversationId of [VIRTUAL_ALIAS, CID]) {
+      runtimeActions.recordTurnOutcome({
+        conversationId,
+        connectionId: CONN,
+        completionSeq: SEQ,
+        outcome,
+      })
+    }
+    enterOwnerPreserve(CID)
+    runtimeActions.startCancelReconcile({
+      conversationId: VIRTUAL_ALIAS,
+      connectionId: CONN,
+      completionSeq: SEQ,
+      providerTurnId: PROVIDER,
+      sessionId: SESSION,
+      followerConversationIds: [CID],
+    })
+    mockGet.mockResolvedValue(detailWithFence())
+
+    runtimeActions.removeConversation(VIRTUAL_ALIAS)
+
+    expect(
+      useConversationRuntimeStore.getState().byConversationId.get(CID)
+        ?.pendingCancel
+    ).toMatchObject({ completionSeq: SEQ })
+    await vi.advanceTimersByTimeAsync(CANCEL_RECONCILE_DELAYS_MS[0])
+    expect(mockGet).toHaveBeenCalledTimes(1)
+    expect(mockGet).toHaveBeenCalledWith(CID, expect.any(Object))
+    expect(
+      useConversationRuntimeStore
+        .getState()
+        .byConversationId.get(CID)
+        ?.detail?.turns.at(-1)
+    ).toMatchObject({ id: "a-persisted" })
+  })
+
+  it("keeps the durable external-id owner when a virtual alias is removed", () => {
+    seedAliasPair()
+
+    actions().removeConversation(VIRTUAL_ALIAS)
+
+    expect(getConversationIdByExternalIdFromStore(SESSION)).toBe(CID)
+  })
+
+  it("re-elects a remaining alias when the indexed external-id owner is removed", () => {
+    seedAliasPair()
+
+    actions().removeConversation(CID)
+
+    expect(getConversationIdByExternalIdFromStore(SESSION)).toBe(VIRTUAL_ALIAS)
+  })
+
+  it("does not retain a migrated follower as the coordinator owner follower", async () => {
+    const finalLiveMessage = seedAliasPair()
+    mockGet.mockResolvedValue(detailWithFence())
+    acceptAliasPair(finalLiveMessage)
+
+    actions().migrateConversation(VIRTUAL_ALIAS, CID)
+    const generationBefore = __getCancelGenerationForTests(CID)
+
+    await vi.advanceTimersByTimeAsync(CANCEL_RECONCILE_DELAYS_MS[0])
+
+    expect(mockGet).toHaveBeenCalledTimes(1)
+    expect(
+      useConversationRuntimeStore
+        .getState()
+        .byConversationId.get(CID)
+        ?.detail?.turns.at(-1)
+    ).toMatchObject({ id: "a-persisted" })
+    expect(__getCancelGenerationForTests(CID)).toBe(generationBefore + 1)
+  })
+
+  it("does not fan reconciliation into a follower that started a new turn", async () => {
+    const finalLiveMessage = seedAliasPair()
+    const pending = deferredDetail()
+    mockGet.mockReturnValue(pending.promise)
+
+    acceptAliasPair(finalLiveMessage)
+    await vi.advanceTimersByTimeAsync(CANCEL_RECONCILE_DELAYS_MS[0])
+    expect(mockGet).toHaveBeenCalledTimes(1)
+
+    actions().appendOptimisticTurn(
+      VIRTUAL_ALIAS,
+      userTurn("u-next", "new follower prompt"),
+      "tok-next"
+    )
+    pending.resolve(detailWithFence())
+    await Promise.resolve()
+    await Promise.resolve()
+
+    const owner = useConversationRuntimeStore
+      .getState()
+      .byConversationId.get(CID)!
+    const follower = useConversationRuntimeStore
+      .getState()
+      .byConversationId.get(VIRTUAL_ALIAS)!
+    expect(owner.detail?.turns.at(-1)).toMatchObject({ id: "a-persisted" })
+    expect(follower.detail).toBeNull()
+    expect(follower.optimisticTurns.map((turn) => turn.id)).toContain("u-next")
+    expect(follower.activeTurnToken).toBe("tok-next")
+  })
 })
 
 // ── Wiring audits (source-level; sole starter + Manual Reload) ──
@@ -748,7 +974,7 @@ describe("dual-path wiring audits", () => {
     )
   })
 
-  it("conversation-session-surface promotes only and Manual Reload uses reloadDetail", () => {
+  it("conversation-session-surface leaves cancel reconciliation to the provider", () => {
     const src = readFileSync(
       resolve(
         root,
@@ -756,24 +982,9 @@ describe("dual-path wiring audits", () => {
       ),
       "utf8"
     )
-    expect(src).toContain("completeLiveTranscriptTurn")
     expect(src).toContain("reloadDetail")
     expect(src).toContain('reason: "manual_reload"')
     expect(src).not.toContain("startCancelReconcile")
     expect(src).not.toContain("recordTurnOutcome")
-  })
-
-  it("conversation-detail-panel background listener does not double-start coordinator", () => {
-    const src = readFileSync(
-      resolve(
-        root,
-        "src/components/conversations/conversation-detail-panel.tsx"
-      ),
-      "utf8"
-    )
-    expect(src).toContain("completeLiveTranscriptTurn")
-    expect(src).not.toContain("startCancelReconcile")
-    expect(src).not.toContain("recordTurnOutcome")
-    expect(src).not.toContain("acceptUserStopTurnComplete")
   })
 })

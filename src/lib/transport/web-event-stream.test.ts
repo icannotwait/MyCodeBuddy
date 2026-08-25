@@ -78,6 +78,35 @@ describe("WebEventStream reconnect mode", () => {
     )
   })
 
+  it.each([
+    { label: "resume", options: { sinceSeq: 7 }, expectedCursor: 7 },
+    {
+      label: "cold attach",
+      options: { reconnectMode: "cold" as const, sinceSeq: 7 },
+      expectedCursor: undefined,
+    },
+  ])(
+    "reports the cursor that authenticated a $label replay",
+    ({ options, expectedCursor }) => {
+      const f = hostFixture()
+      const stream = new WebEventStream(f.host)
+      const sub = stream.attach("conn", options, handlers)
+      const events = [
+        { seq: 8, connection_id: "conn", type: "turn_complete" as const },
+      ]
+
+      stream.handleServerFrame({
+        type: "replay",
+        subscription_id: sub.subscriptionId,
+        connection_id: "conn",
+        events,
+        high_water_seq: 8,
+      })
+
+      expect(handlers.onReplay).toHaveBeenCalledWith(events, 8, expectedCursor)
+    }
+  )
+
   it("cold-reattaches a delegate observer even after applying events", () => {
     const f = hostFixture()
     const stream = new WebEventStream(f.host)

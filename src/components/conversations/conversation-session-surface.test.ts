@@ -9,11 +9,16 @@ import { flushSync } from "react-dom"
 import { act, cleanup, render, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
-import type { EventEnvelope, SessionFailureRecord } from "@/lib/types"
+import type {
+  CreateChatConversationResult,
+  EventEnvelope,
+  SessionFailureRecord,
+} from "@/lib/types"
 import type { SessionFailureAction } from "@/lib/session-failures"
 import {
   __connectionsReducerForTests,
   type ConnectionState,
+  type PendingUserMessage,
 } from "@/contexts/acp-connections-context"
 import type {
   SharedActiveTurn,
@@ -25,8 +30,9 @@ import {
   type TerminalDisconnectLatch,
 } from "@/lib/terminal-reconnect"
 import { shouldQueueDirectSend } from "@/lib/queue-flush"
-import { createConversation } from "@/lib/api"
+import { createChatConversation, createConversation } from "@/lib/api"
 import { emitAttachFileToSession } from "@/lib/session-attachment-events"
+import { completeLiveTranscriptTurn } from "@/stores/conversation-runtime-store"
 import type { RichComposerHandle } from "@/components/chat/composer/rich-composer"
 import { serializeDocToText } from "@/components/chat/composer/to-prompt-blocks"
 
@@ -636,11 +642,22 @@ const surfaceH = vi.hoisted(() => ({
   providerConnections: new Map<string, ConnectionState>(),
   reloadSignal: 0,
   runtimeOptimisticTurns: [] as Array<{ id: string; role: "user" }>,
+  runtimeQueuedOptimisticTurnIds: [] as string[],
   runtimeUserTurns: [] as Array<{ id: string; role: "user" }>,
+  pendingUserMessage: null as PendingUserMessage | null,
+  tabStoreState: {
+    tabs: [{ id: "tab-1", folderId: 1, isPinned: true }],
+    rawTabs: [{ id: "tab-1" }],
+    groupOf: { "tab-1": "g-main" } as Record<string, string>,
+    groupLayout: { type: "group" as const, id: "g-main" },
+  },
+  removeConversation: vi.fn(),
+  setPendingCleanup: vi.fn(),
   dequeueCalls: 0,
   shellProps: null as CapturedShellProps | null,
   messageListProps: null as CapturedMessageListProps | null,
   openTab: vi.fn(async () => true),
+  bindConversationTab: vi.fn(),
   /** Lifecycle mock `conn.supportsFork` (fork affordance wiring). */
   supportsFork: false,
   /** Broker-known delegated-child identity before detail hydration. */
@@ -768,7 +785,7 @@ vi.mock("@/hooks/use-connection-lifecycle", () => ({
         pendingPermission: null,
         pendingQuestion: null,
         pendingAskQuestion: null,
-        pendingUserMessage: null,
+        pendingUserMessage: surfaceH.pendingUserMessage,
         waitingForSubagents: null,
         claudeApiRetry: null,
         sessionFailures: surfaceH.sessionFailures,
@@ -824,7 +841,10 @@ vi.mock("@/contexts/acp-connections-context", async (importOriginal) => {
       getConnection: (key: string) => {
         if (key !== "tab-1") return undefined
         if (surfaceH.currentConnectionId == null) return undefined
-        return { connectionId: surfaceH.currentConnectionId }
+        return {
+          ...surfaceH.providerConnections.get(key),
+          connectionId: surfaceH.currentConnectionId,
+        }
       },
       getActiveKey: () => null,
       subscribeKey: () => () => undefined,
@@ -892,27 +912,27 @@ vi.mock("@/stores/app-workspace-store", () => {
   return { useAppWorkspaceStore }
 })
 
-vi.mock("@/contexts/tab-context", () => ({
-  useTabActions: () => ({
-    openTab: surfaceH.openTab,
-    bindConversationTab: vi.fn(),
-    setChatDraftWorkingDir: vi.fn(),
-    setTabRuntimeConversationId: vi.fn(),
-    pinTab: vi.fn(),
-    openNewConversationTab: vi.fn(),
-    closeTab: vi.fn(),
-    confirmDraftAgent: vi.fn(),
-    setDraftAgentFromFallback: vi.fn(),
-  }),
-  useTabStore: (
-    sel: (s: {
-      tabs: Array<{ id: string; folderId: number; isPinned: boolean }>
-    }) => unknown
-  ) =>
-    sel({
-      tabs: [{ id: "tab-1", folderId: 1, isPinned: true }],
+vi.mock("@/contexts/tab-context", () => {
+  const useTabStore = Object.assign(
+    (sel: (s: typeof surfaceH.tabStoreState) => unknown) =>
+      sel(surfaceH.tabStoreState),
+    { getState: () => surfaceH.tabStoreState }
+  )
+  return {
+    useTabActions: () => ({
+      openTab: surfaceH.openTab,
+      bindConversationTab: surfaceH.bindConversationTab,
+      setChatDraftWorkingDir: vi.fn(),
+      setTabRuntimeConversationId: vi.fn(),
+      pinTab: vi.fn(),
+      openNewConversationTab: vi.fn(),
+      closeTab: vi.fn(),
+      confirmDraftAgent: vi.fn(),
+      setDraftAgentFromFallback: vi.fn(),
     }),
-}))
+    useTabStore,
+  }
+})
 
 vi.mock("@/hooks/use-message-queue", () => ({
   useMessageQueue: () => ({
@@ -973,12 +993,24 @@ vi.mock("@/hooks/use-conversation-detail", () => ({
 
 vi.mock("@/stores/conversation-runtime-store", () => ({
   completeLiveTranscriptTurn: vi.fn(),
+  getRuntimeSession: () => ({
+    optimisticTurns: surfaceH.runtimeOptimisticTurns,
+  }),
   useConversationRuntimeActions: () => ({
     appendOptimisticTurn: (
       _conversationId: number,
-      turn: { id: string; role: "user" }
+      turn: { id: string; role: "user" },
+      _turnToken: string,
+      options?: { queuePending?: boolean }
     ) => {
-      surfaceH.runtimeOptimisticTurns.push(turn)
+      if (
+        !surfaceH.runtimeOptimisticTurns.some((item) => item.id === turn.id)
+      ) {
+        surfaceH.runtimeOptimisticTurns.push(turn)
+      }
+      surfaceH.runtimeQueuedOptimisticTurnIds = options?.queuePending
+        ? [...new Set([...surfaceH.runtimeQueuedOptimisticTurnIds, turn.id])]
+        : surfaceH.runtimeQueuedOptimisticTurnIds.filter((id) => id !== turn.id)
     },
     removeOptimisticTurn: surfaceH.removeOptimisticTurn,
     appendViewerUserTurn: (
@@ -993,13 +1025,13 @@ vi.mock("@/stores/conversation-runtime-store", () => ({
     reloadDetail: surfaceH.reloadDetail,
     syncTurnMetadata: vi.fn(() => () => undefined),
     syncDelegateTerminalDetail: surfaceH.syncDelegateTerminalDetail,
-    removeConversation: vi.fn(),
+    removeConversation: surfaceH.removeConversation,
     setAcpLoadError: vi.fn(),
     setDbConversationId: vi.fn(),
     setExternalId: vi.fn(),
     setLiveMessage: vi.fn(),
     setLiveOwnsActiveTurn: vi.fn(),
-    setPendingCleanup: vi.fn(),
+    setPendingCleanup: surfaceH.setPendingCleanup,
     setSyncState: surfaceH.setSyncState,
   }),
   useConversationRuntimeStore: (
@@ -1414,8 +1446,8 @@ function emitShared(
   )
   surfaceH.sharedSession = surfaceH.providerConnections.get("tab-1")!
     .sharedSession as HarnessSharedSession
-  for (const handler of surfaceH.acpEventHandlers) handler(envelope)
   act(() => {
+    for (const handler of surfaceH.acpEventHandlers) handler(envelope)
     view.rerender(
       createElement(ConversationSessionSurface, {
         ...surfaceProps(42),
@@ -1432,6 +1464,7 @@ function armTerminalDisconnect() {
 }
 
 function resetSurfaceHarness() {
+  vi.mocked(completeLiveTranscriptTurn).mockClear()
   lifecycleCapture.lastOptions = null
   lifecycleCapture.handleReconnect.mockClear()
   lifecycleCapture.handleSend.mockClear()
@@ -1441,6 +1474,7 @@ function resetSurfaceHarness() {
   lifecycleCapture.handleSend.mockResolvedValue(null)
   vi.mocked(createConversation).mockReset()
   vi.mocked(createConversation).mockResolvedValue(99)
+  vi.mocked(createChatConversation).mockReset()
   surfaceH.conversations = []
   surfaceH.acpEventHandlers = []
   surfaceH.connStatus = null
@@ -1468,6 +1502,8 @@ function resetSurfaceHarness() {
       surfaceH.runtimeOptimisticTurns = surfaceH.runtimeOptimisticTurns.filter(
         (turn) => turn.id !== turnId
       )
+      surfaceH.runtimeQueuedOptimisticTurnIds =
+        surfaceH.runtimeQueuedOptimisticTurnIds.filter((id) => id !== turnId)
     }
   )
   surfaceH.setSyncState.mockClear()
@@ -1485,11 +1521,22 @@ function resetSurfaceHarness() {
   surfaceH.providerConnections = new Map()
   surfaceH.reloadSignal = 0
   surfaceH.runtimeOptimisticTurns = []
+  surfaceH.runtimeQueuedOptimisticTurnIds = []
   surfaceH.runtimeUserTurns = []
+  surfaceH.pendingUserMessage = null
+  surfaceH.tabStoreState = {
+    tabs: [{ id: "tab-1", folderId: 1, isPinned: true }],
+    rawTabs: [{ id: "tab-1" }],
+    groupOf: { "tab-1": "g-main" },
+    groupLayout: { type: "group", id: "g-main" },
+  }
+  surfaceH.removeConversation.mockClear()
+  surfaceH.setPendingCleanup.mockClear()
   surfaceH.dequeueCalls = 0
   surfaceH.shellProps = null
   surfaceH.messageListProps = null
   surfaceH.openTab.mockClear()
+  surfaceH.bindConversationTab.mockClear()
   surfaceH.renderRoot = null
   surfaceH.renderRealComposer = false
   surfaceH.chatInputSendClearMode = null
@@ -1623,6 +1670,9 @@ describe("ConversationSessionSurface authoritative shared queue", () => {
 
     await waitFor(() => expect(surfaceH.runtimeOptimisticTurns).toHaveLength(1))
     expect(surfaceH.runtimeOptimisticTurns[0]?.role).toBe("user")
+    expect(surfaceH.runtimeQueuedOptimisticTurnIds).toEqual([
+      surfaceH.runtimeOptimisticTurns[0]!.id,
+    ])
     await waitFor(() =>
       expect(serializeDocToText(editor.state.doc)).not.toContain("later")
     )
@@ -1630,7 +1680,46 @@ describe("ConversationSessionSurface authoritative shared queue", () => {
     expect(surfaceH.shellProps?.sendClearMode).toBe("after-admission")
   })
 
-  it("dispatch-start plus user-message restores the exact queued message once", () => {
+  it("does not requeue a settled turn when shared admission returns late", async () => {
+    let resolveAdmission!: (
+      result: import("@/lib/types").PromptEnqueueResult
+    ) => void
+    const admission = new Promise<import("@/lib/types").PromptEnqueueResult>(
+      (resolve) => {
+        resolveAdmission = resolve
+      }
+    )
+    lifecycleCapture.handleSend.mockImplementation(
+      async (_draft, _mode, opts) => {
+        const result = await admission
+        opts?.onPromptAdmitted?.(result)
+        return result
+      }
+    )
+    const view = mountSharedSurface()
+
+    await sendDraft("dispatch race")
+    await waitFor(() => expect(surfaceH.runtimeOptimisticTurns).toHaveLength(1))
+    const messageId = surfaceH.runtimeOptimisticTurns[0]!.id
+    emitShared(view, {
+      type: "prompt_dispatch_started",
+      turn: sharedTurn("q2", messageId),
+    })
+    emitShared(view, { type: "shared_turn_settled", turnId: "turn-q2" })
+    // The provider promotes the completed turn before raw subscribers run.
+    surfaceH.runtimeOptimisticTurns = []
+    surfaceH.runtimeQueuedOptimisticTurnIds = []
+
+    await act(async () => {
+      resolveAdmission({ queueItemId: "q2", enqueueSeq: 2, state: "queued" })
+      await admission
+    })
+
+    expect(surfaceH.runtimeOptimisticTurns).toEqual([])
+    expect(surfaceH.runtimeQueuedOptimisticTurnIds).toEqual([])
+  })
+
+  it("projects a user message from provider state instead of raw delivery", async () => {
     const view = mountSharedSurfaceWithQueue([
       sharedQueued("q2", 2, "m2", "later"),
     ])
@@ -1650,6 +1739,21 @@ describe("ConversationSessionSurface authoritative shared queue", () => {
     expect(surfaceH.runtimeUserTurns).toHaveLength(0)
     emitAcp(message)
     emitAcp(message)
+    expect(surfaceH.runtimeUserTurns).toHaveLength(0)
+
+    surfaceH.pendingUserMessage = {
+      messageId: "m2",
+      blocks: [{ type: "text", text: "later" }],
+    }
+    await act(async () => {
+      view.rerender(
+        createElement(ConversationSessionSurface, {
+          ...surfaceProps(42),
+          showActiveFlow: true,
+        })
+      )
+      await Promise.resolve()
+    })
 
     expect(
       surfaceH.runtimeUserTurns.filter((runtimeTurn) => runtimeTurn.id === "m2")
@@ -1822,6 +1926,178 @@ describe("ConversationSessionSurface useConnectionLifecycle options harness", ()
     // pollution across cases that mutate surfaceH harness fields.
     cleanup()
   })
+
+  it("preserves the runtime during a split-group reparent unmount", () => {
+    surfaceH.conversations = [fullSummary(42, "completed")]
+    surfaceH.connStatus = "connected"
+    surfaceH.tabStoreState.groupOf = { "tab-1": "g-next" }
+    surfaceH.tabStoreState.groupLayout = { type: "group", id: "g-next" }
+    const view = render(
+      createElement(ConversationSessionSurface, {
+        ...surfaceProps(42),
+        groupId: "g-main",
+      })
+    )
+    surfaceH.removeConversation.mockClear()
+    surfaceH.setPendingCleanup.mockClear()
+
+    act(() => view.unmount())
+
+    expect(surfaceH.removeConversation).not.toHaveBeenCalled()
+    expect(surfaceH.setPendingCleanup).not.toHaveBeenCalled()
+  })
+
+  it("removes the runtime during a real idle unmount", () => {
+    surfaceH.conversations = [fullSummary(42, "completed")]
+    surfaceH.connStatus = "connected"
+    const view = render(
+      createElement(ConversationSessionSurface, {
+        ...surfaceProps(42),
+        groupId: "g-main",
+      })
+    )
+
+    act(() => view.unmount())
+
+    expect(surfaceH.removeConversation).toHaveBeenCalledOnce()
+    expect(surfaceH.removeConversation).toHaveBeenCalledWith(42)
+  })
+
+  it("finishes first-send creation across a split-group reparent", async () => {
+    let resolveCreate!: (conversationId: number) => void
+    vi.mocked(createConversation).mockImplementation(
+      () =>
+        new Promise<number>((resolve) => {
+          resolveCreate = resolve
+        })
+    )
+    surfaceH.connStatus = "connected"
+    const view = render(
+      createElement(ConversationSessionSurface, {
+        ...surfaceProps(null),
+        groupId: "g-main",
+      })
+    )
+
+    act(() => {
+      surfaceH.shellProps!.onSend!(directDraft("reparent first send"))
+    })
+    await waitFor(() => expect(createConversation).toHaveBeenCalledOnce())
+
+    surfaceH.tabStoreState.groupOf = { "tab-1": "g-next" }
+    surfaceH.tabStoreState.groupLayout = { type: "group", id: "g-next" }
+    act(() => view.unmount())
+
+    await act(async () => {
+      resolveCreate(99)
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    expect(surfaceH.bindConversationTab).toHaveBeenCalledOnce()
+    expect(surfaceH.bindConversationTab).toHaveBeenCalledWith(
+      "tab-1",
+      99,
+      "claude",
+      "reparent first send",
+      expect.any(Number)
+    )
+    expect(lifecycleCapture.handleSend).toHaveBeenCalledOnce()
+    expect(lifecycleCapture.handleSend).toHaveBeenCalledWith(
+      directDraft("reparent first send"),
+      undefined,
+      expect.objectContaining({ conversationId: 99 })
+    )
+  })
+
+  it.each([
+    { label: "conversation", chat: false },
+    { label: "chat", chat: true },
+  ])(
+    "does not send a deferred $label create after reparent then real close",
+    async ({ chat }) => {
+      let resolveCreate!: () => void
+      if (chat) {
+        vi.mocked(createChatConversation).mockImplementation(
+          () =>
+            new Promise<CreateChatConversationResult>((resolve) => {
+              resolveCreate = () =>
+                resolve({
+                  conversationId: 99,
+                  folderId: 9,
+                  folder: {
+                    id: 9,
+                    name: "Chat",
+                    path: "/tmp/chat",
+                    git_branch: null,
+                    default_agent_type: "claude",
+                    last_agent_type: "claude",
+                    last_opened_at: BASELINE,
+                    sort_order: 0,
+                    color: "",
+                    parent_id: null,
+                    kind: "chat",
+                    alias: null,
+                  },
+                })
+            })
+        )
+        surfaceH.tabStoreState.tabs = [
+          {
+            id: "tab-1",
+            folderId: 1,
+            isPinned: true,
+            isChat: true,
+            workingDir: "/tmp/project",
+          },
+        ]
+      } else {
+        vi.mocked(createConversation).mockImplementation(
+          () =>
+            new Promise<number>((resolve) => {
+              resolveCreate = () => resolve(99)
+            })
+        )
+      }
+      surfaceH.connStatus = "connected"
+      const original = render(
+        createElement(ConversationSessionSurface, {
+          ...surfaceProps(null),
+          groupId: "g-main",
+        })
+      )
+
+      act(() => {
+        surfaceH.shellProps!.onSend!(directDraft("close before create"))
+      })
+      await waitFor(() =>
+        expect(
+          chat ? createChatConversation : createConversation
+        ).toHaveBeenCalledOnce()
+      )
+
+      surfaceH.tabStoreState.groupOf = { "tab-1": "g-next" }
+      surfaceH.tabStoreState.groupLayout = { type: "group", id: "g-next" }
+      act(() => original.unmount())
+      const replacement = render(
+        createElement(ConversationSessionSurface, {
+          ...surfaceProps(null),
+          groupId: "g-next",
+        })
+      )
+      surfaceH.tabStoreState.rawTabs = []
+      act(() => replacement.unmount())
+
+      await act(async () => {
+        resolveCreate()
+        await Promise.resolve()
+        await Promise.resolve()
+      })
+
+      expect(surfaceH.bindConversationTab).not.toHaveBeenCalled()
+      expect(lifecycleCapture.handleSend).not.toHaveBeenCalled()
+    }
+  )
 
   it("routes durable workflow controls through the root send and tab entries", async () => {
     surfaceH.conversations = [
@@ -2962,6 +3238,7 @@ describe("ConversationSessionSurface delegated viewer-only access", () => {
       accessReason: "task_running",
       connStatus: "connected",
     })
+    expect(completeLiveTranscriptTurn).not.toHaveBeenCalled()
     expect(surfaceH.syncDelegateTerminalDetail).toHaveBeenCalledWith(42)
   })
 

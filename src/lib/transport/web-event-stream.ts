@@ -75,6 +75,8 @@ interface ActiveSub {
    * re-attaching after a reconnect (unless reconnectMode is cold).
    */
   lastAppliedSeq: number | undefined
+  /** Cursor on the most recently sent attach frame, if it was a resume. */
+  lastAttachSinceSeq: number | undefined
   /** `cold` always omits the wire cursor after WS reconnect. */
   reconnectMode: "resume" | "cold"
   shared: { generation: number; leaseId: string } | undefined
@@ -104,6 +106,7 @@ export class WebEventStream implements EventStream {
     this.subs.set(subscriptionId, {
       connectionId,
       lastAppliedSeq: options.sinceSeq,
+      lastAttachSinceSeq: undefined,
       reconnectMode: options.reconnectMode ?? "resume",
       shared: options.shared ? { ...options.shared } : undefined,
       handlers,
@@ -161,7 +164,11 @@ export class WebEventStream implements EventStream {
       case "replay":
         sub.lastAppliedSeq = frame.high_water_seq
         safeInvoke("onReplay", () =>
-          sub.handlers.onReplay(frame.events, frame.high_water_seq)
+          sub.handlers.onReplay(
+            frame.events,
+            frame.high_water_seq,
+            sub.lastAttachSinceSeq
+          )
         )
         break
       case "event":
@@ -233,11 +240,13 @@ export class WebEventStream implements EventStream {
   private sendAttach(subscriptionId: string): void {
     const sub = this.subs.get(subscriptionId)
     if (!sub) return
-    this.host.sendFrame({
+    const sinceSeq =
+      sub.reconnectMode === "cold" ? undefined : sub.lastAppliedSeq
+    const sent = this.host.sendFrame({
       action: "attach",
       subscription_id: subscriptionId,
       connection_id: sub.connectionId,
-      since_seq: sub.reconnectMode === "cold" ? undefined : sub.lastAppliedSeq,
+      since_seq: sinceSeq,
       ...(sub.shared
         ? {
             generation: sub.shared.generation,
@@ -245,6 +254,7 @@ export class WebEventStream implements EventStream {
           }
         : {}),
     })
+    if (sent) sub.lastAttachSinceSeq = sinceSeq
   }
 
   private reattachAll(): void {

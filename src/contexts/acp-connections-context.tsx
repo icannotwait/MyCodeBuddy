@@ -124,6 +124,7 @@ import {
   enterOwnerPreserve,
   getConversationIdByExternalIdFromStore,
   getUserStopFenceToken,
+  hasCurrentUserStopTurnOwnership,
   isStaleUserStopEnvelope,
   isUserStopNoCoordinatorCompletion,
   markUserStopNoCoordinatorCompletion,
@@ -136,10 +137,12 @@ import type {
   AgentType,
   AcpAgentStatus,
   AcpEvent,
+  AcpEventDeliverySource,
   ActiveDelegationState,
   AvailableCommandInfo,
   ConfigStaleKind,
   ConnectionStatus,
+  ContentBlock,
   ConversationConnectionInfo,
   DelegationRoutePolicy,
   DelegationRouteSnapshot,
@@ -154,6 +157,7 @@ import type {
   SessionFailureRecord,
   SessionModeStateInfo,
   SessionUsageUpdateInfo,
+  MessageTurn,
   PromptCapabilitiesInfo,
   AcceptedConnectionFrame,
   AcceptedEventFrame,
@@ -251,6 +255,29 @@ export interface PendingUserMessage {
   blocks: UserMessageBlock[]
 }
 
+/** Build the runtime user turn shared by live and snapshot viewer projection. */
+export function buildUserTurnFromMessageBlocks(
+  messageId: string,
+  blocks: UserMessageBlock[]
+): MessageTurn {
+  const contentBlocks: ContentBlock[] = blocks.map((block) =>
+    block.type === "image"
+      ? {
+          type: "image",
+          data: block.data,
+          mime_type: block.mime_type,
+          uri: null,
+        }
+      : { type: "text", text: block.text }
+  )
+  return {
+    id: messageId,
+    role: "user",
+    blocks: contentBlocks,
+    timestamp: new Date().toISOString(),
+  }
+}
+
 export interface PendingQuestion {
   tool_call_id: string
   question: string
@@ -298,6 +325,10 @@ export interface ConnectionState {
   requestEstimator?: import("@/lib/request-token-estimator").RequestTokenEstimatorState
   generationClockStartedAt?: number | null
   liveMessage: LiveMessage | null
+  /** Final live message admitted by a runtime-owned turn_complete commit. */
+  acceptedCompletionMessageId?: string | null
+  /** Runtime aliases allowed to adopt the retained accepted completion. */
+  acceptedCompletionRuntimeConversationIds?: readonly number[] | null
   pendingPermission: PendingPermission | null
   /** In-flight user prompt for the current turn — set from a `user_message`
    *  event or a snapshot's `pending_user_message`. A VIEWER mirrors this into
@@ -789,6 +820,17 @@ type Action =
       type: "STATUS_CHANGED"
       contextKey: string
       status: ConnectionStatus
+    }
+  | {
+      type: "PENDING_USER_MESSAGE_CHANGED"
+      contextKey: string
+      message: PendingUserMessage | null
+    }
+  | {
+      type: "TURN_COMPLETION_ACCEPTED"
+      contextKey: string
+      messageId: string
+      runtimeConversationIds: readonly number[]
     }
   | {
       // One AIR typed session-failure upsert (`session_failure` event).
@@ -1920,6 +1962,8 @@ function reduceSingleAction(
         requestEstimator: createRequestTokenEstimator(),
         generationClockStartedAt: null,
         liveMessage: null,
+        acceptedCompletionMessageId: null,
+        acceptedCompletionRuntimeConversationIds: null,
         pendingPermission: null,
         pendingUserMessage: null,
         pendingQuestion: null,
@@ -2212,6 +2256,8 @@ function reduceSingleAction(
         requestEstimator: createRequestTokenEstimator(),
         generationClockStartedAt: null,
         liveMessage: null,
+        acceptedCompletionMessageId: null,
+        acceptedCompletionRuntimeConversationIds: null,
         pendingPermission: null,
         pendingUserMessage: null,
         pendingQuestion: null,
@@ -2609,6 +2655,8 @@ function reduceSingleAction(
       const next = writableConnections(state, mutateUnpublished)
       const updated = { ...conn, status: action.status }
       if (action.status === "prompting") {
+        updated.acceptedCompletionMessageId = null
+        updated.acceptedCompletionRuntimeConversationIds = null
         updated.liveMessage = {
           id: randomUUID(),
           role: "assistant",
@@ -2635,6 +2683,7 @@ function reduceSingleAction(
         // background permission enrichment) are stale for the new turn.
         updated.outOfTurnToolCalls = null
       } else if (conn.status === "prompting") {
+        updated.pendingUserMessage = null
         updated.requestEstimator = discardEstimatedRequest(estimatorFor(conn))
         updated.generationClockStartedAt = null
         // Prompt cycle ended: clear in-flight Claude API retry banner.
@@ -2654,6 +2703,39 @@ function reduceSingleAction(
         updated.pendingPlanApproval = null
       }
       next.set(action.contextKey, updated)
+      return next
+    }
+
+    case "PENDING_USER_MESSAGE_CHANGED": {
+      const conn = state.get(action.contextKey)
+      if (!conn || conn.pendingUserMessage === action.message) return state
+      const next = writableConnections(state, mutateUnpublished)
+      next.set(action.contextKey, {
+        ...conn,
+        pendingUserMessage: action.message,
+      })
+      return next
+    }
+
+    case "TURN_COMPLETION_ACCEPTED": {
+      const conn = state.get(action.contextKey)
+      if (!conn || conn.liveMessage?.id !== action.messageId) return state
+      if (
+        conn.acceptedCompletionMessageId === action.messageId &&
+        conn.acceptedCompletionRuntimeConversationIds?.length ===
+          action.runtimeConversationIds.length &&
+        conn.acceptedCompletionRuntimeConversationIds.every(
+          (id, index) => id === action.runtimeConversationIds[index]
+        )
+      ) {
+        return state
+      }
+      const next = writableConnections(state, mutateUnpublished)
+      next.set(action.contextKey, {
+        ...conn,
+        acceptedCompletionMessageId: action.messageId,
+        acceptedCompletionRuntimeConversationIds: action.runtimeConversationIds,
+      })
       return next
     }
 
@@ -3803,7 +3885,7 @@ export type __FrameActionForTests = FrameAction
  * attach so reverse envelope→status-edge order attaches to the cancelled
  * assistant.
  */
-export function acceptUserStopTurnComplete(params: {
+interface UserStopTurnCompleteParams {
   sessionId: string
   connectionId: string
   completionSeq: number
@@ -3811,39 +3893,141 @@ export function acceptUserStopTurnComplete(params: {
   terminationSource?: "user_stop" | null
   providerTurnId?: string | null
   snapshotConversationId?: number | null
-}): void {
-  if (params.terminationSource !== "user_stop") return
+  runtimeConversationId?: number | null
+  runtimeConversationIds?: readonly number[]
+  finalLiveMessage?: LiveMessage | null
+}
 
-  const conversationId =
-    getConversationIdByExternalIdFromStore(params.sessionId) ??
-    params.snapshotConversationId ??
+function resolveUserStopRuntimeConversationIds(
+  params: UserStopTurnCompleteParams
+): number[] {
+  const state = useConversationRuntimeStore.getState()
+  const conversationIds = new Set<number>()
+  const addCandidate = (conversationId: number | null | undefined) => {
+    if (conversationId == null) return
+    const runtimeId = resolveRuntimeConversationIdForOwnership(conversationId)
+    if (runtimeId == null) return
+    const runtime = state.byConversationId.get(runtimeId)
+    if (!runtime) return
+    if (runtime.externalId && runtime.externalId !== params.sessionId) return
+    conversationIds.add(runtimeId)
+  }
+
+  if (params.runtimeConversationIds) {
+    for (const conversationId of params.runtimeConversationIds) {
+      addCandidate(conversationId)
+    }
+    return [...conversationIds]
+  }
+
+  if (params.runtimeConversationId != null) {
+    addCandidate(params.runtimeConversationId)
+    return [...conversationIds]
+  }
+
+  for (const [conversationId, runtime] of state.byConversationId) {
+    if (runtime.externalId === params.sessionId) {
+      conversationIds.add(conversationId)
+    }
+  }
+  addCandidate(getConversationIdByExternalIdFromStore(params.sessionId))
+  addCandidate(params.snapshotConversationId)
+  addCandidate(
     useAppWorkspaceStore
       .getState()
-      .conversations.find((c) => c.external_id === params.sessionId)?.id ??
-    null
-  if (conversationId == null) return
+      .conversations.find((c) => c.external_id === params.sessionId)?.id
+  )
+  return [...conversationIds]
+}
 
+function persistedRuntimeConversationId(conversationId: number): number | null {
+  const runtime = useConversationRuntimeStore
+    .getState()
+    .byConversationId.get(conversationId)
+  if (!runtime) return null
+  const persistedId = runtime.dbConversationId ?? conversationId
+  return persistedId > 0 ? persistedId : null
+}
+
+function electUserStopCoordinatorOwner(
+  params: UserStopTurnCompleteParams,
+  conversationIds: readonly number[]
+): number | null {
+  const durable = conversationIds
+    .map((conversationId) => ({
+      conversationId,
+      persistedId: persistedRuntimeConversationId(conversationId),
+    }))
+    .filter(
+      (
+        candidate
+      ): candidate is { conversationId: number; persistedId: number } =>
+        candidate.persistedId != null
+    )
+  if (durable.length === 0) return null
+
+  const preferredRuntimeId =
+    params.snapshotConversationId != null
+      ? resolveRuntimeConversationIdForOwnership(params.snapshotConversationId)
+      : null
+  if (
+    preferredRuntimeId != null &&
+    durable.some((candidate) => candidate.conversationId === preferredRuntimeId)
+  ) {
+    return preferredRuntimeId
+  }
+
+  const connectionDurableId =
+    params.snapshotConversationId != null && params.snapshotConversationId > 0
+      ? params.snapshotConversationId
+      : null
+  const matchingConnection = durable
+    .filter((candidate) => candidate.persistedId === connectionDurableId)
+    .sort((a, b) => a.conversationId - b.conversationId)[0]
+  if (matchingConnection) return matchingConnection.conversationId
+
+  const durabilityRank = (candidate: (typeof durable)[number]) => {
+    if (
+      candidate.conversationId > 0 &&
+      candidate.conversationId === candidate.persistedId
+    ) {
+      return 0
+    }
+    return candidate.conversationId > 0 ? 1 : 2
+  }
+  durable.sort(
+    (a, b) =>
+      durabilityRank(a) - durabilityRank(b) ||
+      a.conversationId - b.conversationId
+  )
+  return durable[0]!.conversationId
+}
+
+function acceptUserStopTurnCompleteForRuntime(
+  params: UserStopTurnCompleteParams,
+  conversationId: number
+): "recorded" | "duplicate" | "skipped" | null {
   // Ownership fence: Cancel snapshotted cancelGeneration (+ token). If a
   // newer prompt (or other lifecycle bump) advanced generation, this envelope
   // is stale — do not promote/attach/start under the newer transcript.
   if (isStaleUserStopEnvelope(conversationId)) {
-    return
+    return null
   }
 
   const prePromote = useConversationRuntimeStore
     .getState()
     .byConversationId.get(conversationId)
-  if (!prePromote) return
-
-  // Prefer cancel-time ownership token; fall back to pre-promote session token.
-  const fenceToken = getUserStopFenceToken(conversationId) ?? null
+  if (!prePromote) return null
 
   // Promote only while undrained cancel buffers remain (avoids COMPLETE_TURN
   // "already-drained" warnings when status-edge already promoted).
   const needsPromote =
     prePromote.liveMessage != null || prePromote.optimisticTurns.length > 0
   if (needsPromote) {
-    completeLiveTranscriptTurn(conversationId)
+    completeLiveTranscriptTurn(
+      conversationId,
+      params.finalLiveMessage ?? undefined
+    )
   }
 
   const providerTurnId =
@@ -3866,55 +4050,68 @@ export function acceptUserStopTurnComplete(params: {
     completionSeq: params.completionSeq,
     outcome,
   })
+  return outcomeStatus
+}
 
-  // First unbound/missing-provider acceptance is terminal for coordinator
-  // start. Track completion identity so redelivery after migrate/bind never
-  // starts cancel reconcile (outcome footer remains idempotent separately).
-  if (
+export function acceptUserStopTurnComplete(
+  params: UserStopTurnCompleteParams
+): void {
+  if (params.terminationSource !== "user_stop") return
+  const accepted: Array<{
+    conversationId: number
+    outcomeStatus: "recorded" | "duplicate" | "skipped"
+  }> = []
+  for (const conversationId of resolveUserStopRuntimeConversationIds(params)) {
+    const outcomeStatus = acceptUserStopTurnCompleteForRuntime(
+      params,
+      conversationId
+    )
+    if (outcomeStatus) accepted.push({ conversationId, outcomeStatus })
+  }
+  if (accepted.length === 0 || params.stopReason !== "cancelled") return
+
+  const providerTurnId =
+    typeof params.providerTurnId === "string" &&
+    params.providerTurnId.length > 0
+      ? params.providerTurnId
+      : null
+  const conversationIds = accepted.map((item) => item.conversationId)
+  const ownerConversationId = providerTurnId
+    ? electUserStopCoordinatorOwner(params, conversationIds)
+    : null
+  const noCoordinator =
+    ownerConversationId == null ||
     isUserStopNoCoordinatorCompletion(params.connectionId, params.completionSeq)
-  ) {
-    enterOwnerPreserve(conversationId)
-    return
-  }
 
-  // Duplicate completion: decision already made on first accept — do not
-  // re-run coordinator transition logic.
-  if (outcomeStatus === "duplicate") {
-    return
-  }
-
-  // Coordinator start gates: non-empty provider id + positive persisted
-  // conversation id. Missing provider id or unbound detail id (≤0) still
-  // record the outcome above, enter durable owner_preserve, and skip the
-  // coordinator (design Round 4e).
-  if (params.stopReason === "cancelled" && providerTurnId) {
-    const sessionAfter = useConversationRuntimeStore
-      .getState()
-      .byConversationId.get(conversationId)
-    const persistedId = sessionAfter?.dbConversationId ?? conversationId
-    if (persistedId > 0) {
-      runtimeActions.startCancelReconcile({
-        conversationId,
-        connectionId: params.connectionId,
-        completionSeq: params.completionSeq,
-        providerTurnId,
-        activeTurnToken: fenceToken,
-      })
-    } else {
-      markUserStopNoCoordinatorCompletion(
-        params.connectionId,
-        params.completionSeq
-      )
-      enterOwnerPreserve(conversationId)
-    }
-  } else if (params.stopReason === "cancelled") {
-    // user_stop accepted without provider_turn_id.
+  if (noCoordinator) {
     markUserStopNoCoordinatorCompletion(
       params.connectionId,
       params.completionSeq
     )
+    for (const conversationId of conversationIds) {
+      enterOwnerPreserve(conversationId)
+    }
+    return
+  }
+
+  const followerConversationIds = conversationIds.filter(
+    (conversationId) => conversationId !== ownerConversationId
+  )
+  for (const conversationId of followerConversationIds) {
     enterOwnerPreserve(conversationId)
   }
+  if (!accepted.some((item) => item.outcomeStatus === "recorded")) return
+  if (!providerTurnId) return
+
+  useConversationRuntimeStore.getState().actions.startCancelReconcile({
+    conversationId: ownerConversationId,
+    connectionId: params.connectionId,
+    completionSeq: params.completionSeq,
+    providerTurnId,
+    activeTurnToken: getUserStopFenceToken(ownerConversationId) ?? null,
+    sessionId: params.sessionId,
+    followerConversationIds,
+  })
 }
 
 interface PreparedEnvelope {
@@ -4542,27 +4739,6 @@ function prepareMappedEnvelope(
           }
         }
       }
-      // Dual-path: only typed user_stop may record outcome + start coordinator.
-      // completion_seq = EventEnvelope.seq. Status-edge remains promotion-only.
-      if (e.termination_source === "user_stop") {
-        const sessionId = e.session_id
-        const connectionId = e.connection_id
-        const completionSeq = e.seq
-        const stopReason = e.stop_reason
-        const providerTurnId = e.provider_turn_id ?? null
-        const snapshotConversationId = snapshot.conversationId ?? null
-        afterCommit.push(() => {
-          acceptUserStopTurnComplete({
-            sessionId,
-            connectionId,
-            completionSeq,
-            stopReason,
-            terminationSource: "user_stop",
-            providerTurnId,
-            snapshotConversationId,
-          })
-        })
-      }
       const agentLabel = getAgentLabel(snapshot.agentType)
       const fn = env.folderName
       afterCommit.push(() => {
@@ -4699,6 +4875,12 @@ function prepareMappedEnvelope(
       break
     }
     case "user_message":
+      actions.push({
+        type: "PENDING_USER_MESSAGE_CHANGED",
+        contextKey,
+        message: { messageId: e.message_id, blocks: e.blocks },
+      })
+      break
     case "user_prompt_sent":
     case "conversation_status_changed":
     case "delegation_started":
@@ -4727,6 +4909,14 @@ function prepareMappedEnvelope(
 interface PreparedEventFrame {
   connections: PreparedConnectionFrame[]
   afterCommit: Array<() => void>
+  connectionSteps: Array<{
+    contextKey: string
+    previousConnection: ConnectionState
+    nextConnection: ConnectionState
+    connectionFrame: AcceptedConnectionFrame
+    liveMessageIsLive: boolean | undefined
+    completionRuntimeConversationIds: readonly number[] | undefined
+  }>
   changedConnections: Array<{
     contextKey: string
     deliveryIds: readonly number[]
@@ -4760,6 +4950,9 @@ function onlyCursorChanged(
     before.connectionId === after.connectionId &&
     before.status === after.status &&
     before.liveMessage === after.liveMessage &&
+    before.acceptedCompletionMessageId === after.acceptedCompletionMessageId &&
+    before.acceptedCompletionRuntimeConversationIds ===
+      after.acceptedCompletionRuntimeConversationIds &&
     before.pendingPermission === after.pendingPermission &&
     before.pendingQuestion === after.pendingQuestion &&
     before.pendingAskQuestion === after.pendingAskQuestion &&
@@ -4795,6 +4988,103 @@ function onlyCursorChanged(
   )
 }
 
+interface TurnCompleteAdmission {
+  accepted: boolean
+  runtimeConversationIds: number[]
+}
+
+function resolveKnownConnectionSessionId(
+  connection: ConnectionState
+): string | null {
+  if (connection.sessionId != null) return connection.sessionId
+  if (connection.conversationId == null) return null
+  return (
+    useAppWorkspaceStore
+      .getState()
+      .conversations.find((row) => row.id === connection.conversationId)
+      ?.external_id ?? null
+  )
+}
+
+function admitTurnComplete(
+  snapshot: ConnectionState,
+  event: TurnCompleteEnvelope,
+  frameInitialLiveMessage: LiveMessage | null,
+  terminalDeliveryIsAuthoritative: boolean
+): TurnCompleteAdmission {
+  if (snapshot.status !== "prompting" || snapshot.liveMessage == null) {
+    return { accepted: false, runtimeConversationIds: [] }
+  }
+  if (snapshot.sessionId != null && snapshot.sessionId !== event.session_id) {
+    return { accepted: false, runtimeConversationIds: [] }
+  }
+
+  const projectedInFrame = snapshot.liveMessage !== frameInitialLiveMessage
+  const owners: number[] = []
+  let hasMappedRuntime = false
+  for (const [
+    runtimeConversationId,
+    runtime,
+  ] of useConversationRuntimeStore.getState().byConversationId) {
+    const runtimeLiveMatches =
+      runtime.liveMessage?.id === snapshot.liveMessage.id
+    const mappedToConnection =
+      runtime.externalId === event.session_id ||
+      (snapshot.conversationId != null &&
+        (runtime.conversationId === snapshot.conversationId ||
+          runtime.dbConversationId === snapshot.conversationId))
+    if (!mappedToConnection && !runtimeLiveMatches) {
+      continue
+    }
+    hasMappedRuntime = true
+    const sessionMatches =
+      runtime.externalId != null
+        ? runtime.externalId === event.session_id
+        : snapshot.sessionId === event.session_id
+    if (!sessionMatches) continue
+    if (runtime.liveMessage != null && !runtimeLiveMatches) {
+      continue
+    }
+    if (
+      !runtimeLiveMatches &&
+      !(
+        mappedToConnection &&
+        (projectedInFrame || terminalDeliveryIsAuthoritative)
+      )
+    ) {
+      continue
+    }
+    if (
+      event.termination_source === "user_stop" &&
+      isStaleUserStopEnvelope(runtimeConversationId)
+    ) {
+      continue
+    }
+    owners.push(runtimeConversationId)
+  }
+  const knownSessionId = resolveKnownConnectionSessionId(snapshot)
+  return {
+    accepted:
+      owners.length > 0 ||
+      (!hasMappedRuntime &&
+        (knownSessionId == null || knownSessionId === event.session_id)),
+    runtimeConversationIds: owners,
+  }
+}
+
+function hasAuthoritativeTerminalDelivery(
+  frame: AcceptedConnectionFrame,
+  terminalSeq: number
+): boolean {
+  const source = frame.eventDeliverySourceBySeq?.get(terminalSeq)
+  if (source != null) {
+    return (
+      source === "desktop" || source === "live" || source === "resume_replay"
+    )
+  }
+  return frame.deliverySource === "desktop"
+}
+
 function prepareEventFrame(
   frame: AcceptedEventFrame,
   connections: ConnectionsMap,
@@ -4805,6 +5095,7 @@ function prepareEventFrame(
   let draft = new Map(connections)
   const preparedConnections: PreparedConnectionFrame[] = []
   const afterCommit: Array<() => void> = []
+  const connectionSteps: PreparedEventFrame["connectionSteps"] = []
   const changedConnections: PreparedEventFrame["changedConnections"] = []
   const renderChangedConnections: PreparedEventFrame["renderChangedConnections"] =
     []
@@ -4822,7 +5113,61 @@ function prepareEventFrame(
     const before = connections.get(contextKey) ?? snapshot
     const actions: FrameAction[] = []
     let liveMessageIsLive: boolean | undefined
-    for (const event of connFrame.applyEvents) {
+    let stepBefore = before
+    let stepEvents: EventEnvelope[] = []
+    let stepRawFloor = before.lastAppliedSeq
+    let stepLiveMessageIsLive: boolean | undefined
+    let stepCompletionRuntimeConversationIds: readonly number[] | undefined
+    const pushConnectionStep = (
+      highestSeq: number,
+      nextSnapshot: ConnectionState
+    ) => {
+      const stepNext =
+        highestSeq > nextSnapshot.lastAppliedSeq
+          ? { ...nextSnapshot, lastAppliedSeq: highestSeq }
+          : nextSnapshot
+      connectionSteps.push({
+        contextKey,
+        previousConnection: stepBefore,
+        nextConnection: stepNext,
+        connectionFrame: {
+          ...connFrame,
+          applyEvents: stepEvents,
+          rawEvents: connFrame.rawEvents.filter(
+            (event) => event.seq > stepRawFloor && event.seq <= highestSeq
+          ),
+          highestSeq,
+        },
+        liveMessageIsLive:
+          connFrame.deliverySource === "desktop"
+            ? stepLiveMessageIsLive
+            : undefined,
+        completionRuntimeConversationIds: stepCompletionRuntimeConversationIds,
+      })
+      stepBefore = stepNext
+      stepEvents = []
+      stepRawFloor = highestSeq
+      stepLiveMessageIsLive = undefined
+      stepCompletionRuntimeConversationIds = undefined
+    }
+
+    for (
+      let eventIndex = 0;
+      eventIndex < connFrame.applyEvents.length;
+      eventIndex += 1
+    ) {
+      const event = connFrame.applyEvents[eventIndex]!
+      if (event.type === "turn_complete") {
+        const admission = admitTurnComplete(
+          snapshot,
+          event,
+          before.liveMessage,
+          hasAuthoritativeTerminalDelivery(connFrame, event.seq)
+        )
+        if (!admission.accepted) continue
+        stepCompletionRuntimeConversationIds = admission.runtimeConversationIds
+      }
+      stepEvents.push(event)
       const previousLiveMessage = snapshot.liveMessage
       const prepared = prepareMappedEnvelope(contextKey, event, snapshot, env)
       actions.push(...prepared.actions)
@@ -4834,8 +5179,12 @@ function prepareEventFrame(
       if (nextSnap) {
         if (nextSnap.liveMessage !== previousLiveMessage) {
           liveMessageIsLive = nextSnap.status === "prompting"
+          stepLiveMessageIsLive = liveMessageIsLive
         }
         snapshot = nextSnap
+      }
+      if (event.type === "turn_complete") {
+        pushConnectionStep(event.seq, snapshot)
       }
     }
 
@@ -4847,6 +5196,10 @@ function prepareEventFrame(
       }
       draft.set(contextKey, advanced)
       snapshot = advanced
+    }
+
+    if (stepEvents.length > 0) {
+      pushConnectionStep(connFrame.highestSeq, snapshot)
     }
 
     preparedConnections.push({
@@ -4875,6 +5228,7 @@ function prepareEventFrame(
   return {
     connections: preparedConnections,
     afterCommit,
+    connectionSteps,
     changedConnections,
     renderChangedConnections,
   }
@@ -5006,6 +5360,108 @@ export function selectTranscriptApplyEvents(
   return out
 }
 
+type TurnCompleteEnvelope = EventEnvelope &
+  Extract<AcpEvent, { type: "turn_complete" }>
+type UserMessageEnvelope = EventEnvelope &
+  Extract<AcpEvent, { type: "user_message" }>
+
+interface FinalFrameCompletion {
+  turnComplete: TurnCompleteEnvelope
+  userMessage: UserMessageEnvelope | null
+  expectedSharedUserMessageId: string | null
+}
+
+/**
+ * Select a completion only while it still owns the frame-final live turn.
+ * A later accepted prompt/user transition invalidates the earlier completion.
+ */
+function selectFinalFrameCompletion(
+  events: readonly EventEnvelope[],
+  sharedSession: SharedConnectionState | null
+): FinalFrameCompletion | null {
+  let expectedSharedUserMessageId =
+    sharedSession?.activeTurn?.clientMessageId ?? null
+  let pendingUserMessage: UserMessageEnvelope | null = null
+  let selected: FinalFrameCompletion | null = null
+
+  for (const event of events) {
+    if (
+      event.type === "prompt_dispatch_started" &&
+      sharedSession &&
+      event.generation === sharedSession.generation
+    ) {
+      selected = null
+      expectedSharedUserMessageId = event.turn.client_message_id
+      continue
+    }
+    if (event.type === "user_message") {
+      selected = null
+      pendingUserMessage = event
+      continue
+    }
+    if (event.type === "status_changed" && event.status === "prompting") {
+      selected = null
+      continue
+    }
+    if (event.type === "turn_complete") {
+      selected = {
+        turnComplete: event,
+        userMessage: pendingUserMessage,
+        expectedSharedUserMessageId,
+      }
+      pendingUserMessage = null
+    }
+  }
+
+  return selected
+}
+
+function resolveCompletionRuntimeConversationId(
+  connection: ConnectionState,
+  sessionId: string
+): number | null {
+  const runtimeState = useConversationRuntimeStore.getState()
+  const runtimeConversationId =
+    runtimeState.conversationIdByExternalId.get(sessionId) ??
+    connection.conversationId ??
+    null
+  if (runtimeConversationId == null) return null
+
+  const runtime = runtimeState.byConversationId.get(runtimeConversationId)
+  if (!runtime) return null
+  if (connection.sessionId !== sessionId && runtime.externalId !== sessionId) {
+    return null
+  }
+  if (
+    connection.conversationId != null &&
+    runtime.conversationId !== connection.conversationId &&
+    runtime.dbConversationId !== connection.conversationId
+  ) {
+    return null
+  }
+  return runtimeConversationId
+}
+
+function connectionHasCompletionOwner(
+  connection: ConnectionState,
+  sessionId: string
+): boolean {
+  if (connection.sessionId == null) return true
+  if (connection.sessionId === sessionId) return true
+  if (!connection.liveMessage) return false
+  for (const runtime of useConversationRuntimeStore
+    .getState()
+    .byConversationId.values()) {
+    if (
+      runtime.liveMessage === connection.liveMessage &&
+      runtime.externalId === sessionId
+    ) {
+      return true
+    }
+  }
+  return false
+}
+
 // ── Ref-based store (replaces useReducer + Context) ──
 
 interface InternalStore {
@@ -5047,26 +5503,31 @@ export function useConnectionStore(): ConnectionStoreApi {
  * re-rendering on every streaming token — only the runtime-store subscriber (the
  * message list) re-renders. `isLive` is `status === "prompting"`, which the
  * runtime reducer uses to bypass its stale-reconnect-replay guard.
+ * Return `false` when the canonical runtime rejects the message; transcript
+ * publication/rebuild is then skipped so stale replay cannot resurrect a footer.
  */
 export type LiveMessageSink = (
   liveMessage: LiveMessage,
   isLive: boolean,
   /** Optional ACP delivery IDs for streaming-perf live-publication marks. */
   deliveryIds?: readonly number[]
-) => void
+) => boolean | void
 
 /**
  * Per-connection live sinks: canonical runtime mirror + optional UI transcript
  * projection. Frame commit calls `canonical` once, then `transcript.publish`
- * once with the accepted connection frame. Registration and snapshot hydrate
- * call `transcript.rebuild` with the current canonical message.
+ * once with the accepted connection frame unless canonical returns `false`.
+ * Registration and snapshot hydrate follow the same acknowledgement before
+ * calling `transcript.rebuild` with the current canonical message.
  */
 export interface ConnectionLiveSinks {
+  /** Runtime session owned by these sinks; terminal projection is owner-gated. */
+  runtimeConversationId?: number
   canonical(
     liveMessage: LiveMessage,
     isLive: boolean,
     deliveryIds?: readonly number[]
-  ): void
+  ): boolean | void
   transcript?: LiveTranscriptFrameSink
 }
 
@@ -5904,44 +6365,80 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
   const mirrorLiveMessageOnce = useCallback(
     (
       key: string,
-      previous: ConnectionsMap,
-      next: ConnectionsMap,
+      previousConnection: ConnectionState | undefined,
+      nextConnection: ConnectionState | undefined,
       deliveryIds: readonly number[],
       connectionFrame?: AcceptedConnectionFrame,
-      liveMessageIsLive?: boolean
+      liveMessageIsLive?: boolean,
+      completionRuntimeConversationIds?: ReadonlySet<number>,
+      rejectedCompletionRuntimeConversationIds?: Set<number>
     ) => {
       const sinks = liveSinksRef.current.get(key)
       if (!sinks) return
-      // Sink is registered under the caller's key (tab alias or canonical);
-      // state always lives under the canonical connection id.
-      const stateKey = observerAliasesRef.current.get(key) ?? key
-      const nextConn = next.get(stateKey)
+      if (
+        completionRuntimeConversationIds &&
+        sinks.runtimeConversationId != null &&
+        !completionRuntimeConversationIds.has(sinks.runtimeConversationId)
+      ) {
+        return
+      }
+      const nextConn = nextConnection
       if (!nextConn || nextConn.liveMessage == null) return
       const liveChanged =
-        nextConn.liveMessage !== previous.get(stateKey)?.liveMessage
+        nextConn.liveMessage !== previousConnection?.liveMessage
       if (!liveChanged && !connectionFrame) return
+      const hasTurnComplete =
+        connectionFrame?.applyEvents.some(
+          (event) => event.type === "turn_complete"
+        ) ?? false
+      let canonicalAccepted = true
 
-      if (liveChanged) {
+      // A terminal-only frame can leave the canonical object unchanged while
+      // transcript.publish still marks it completing. Re-acknowledge that
+      // object so an earlier stale-replay rejection cannot be bypassed.
+      if (liveChanged || hasTurnComplete) {
         streamingPerfRecorder.setCurrentDeliveryIds(deliveryIds)
         try {
-          sinks.canonical(
-            nextConn.liveMessage,
-            liveMessageIsLive ?? nextConn.status === "prompting",
-            deliveryIds
-          )
+          canonicalAccepted =
+            sinks.canonical(
+              nextConn.liveMessage,
+              liveMessageIsLive ?? nextConn.status === "prompting",
+              deliveryIds
+            ) !== false
           streamingPerfRecorder.flushQueuedLivePublication()
         } finally {
           streamingPerfRecorder.setCurrentDeliveryIds(null)
         }
       }
 
-      if (!sinks.transcript) return
+      if (!canonicalAccepted && sinks.runtimeConversationId != null) {
+        rejectedCompletionRuntimeConversationIds?.add(
+          sinks.runtimeConversationId
+        )
+      }
+      if (!sinks.transcript || !canonicalAccepted) return
       if (connectionFrame) {
         // Per-event filter matching canonical out-of-turn transitions — not
         // whole-frame before/after status (mixed turn_complete+delta frames).
-        const previousStatus = previous.get(stateKey)?.status ?? nextConn.status
+        const previousStatus = previousConnection?.status ?? nextConn.status
+        const transcriptEvents = connectionFrame.applyEvents.filter((event) => {
+          if (event.type !== "turn_complete") {
+            return true
+          }
+          if (!connectionHasCompletionOwner(nextConn, event.session_id)) {
+            return false
+          }
+          if (event.termination_source !== "user_stop") return true
+          const conversationId = resolveCompletionRuntimeConversationId(
+            nextConn,
+            event.session_id
+          )
+          return (
+            conversationId == null || !isStaleUserStopEnvelope(conversationId)
+          )
+        })
         const projectedEvents = selectTranscriptApplyEvents(
-          connectionFrame.applyEvents,
+          transcriptEvents,
           previousStatus
         )
         if (projectedEvents.length > 0 || liveChanged) {
@@ -5963,35 +6460,113 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
   const mirrorLiveMessageForCanonical = useCallback(
     (
       canonical: string,
-      previous: ConnectionsMap,
-      next: ConnectionsMap,
+      previousConnection: ConnectionState | undefined,
+      nextConnection: ConnectionState | undefined,
       deliveryIds: readonly number[],
       connectionFrame?: AcceptedConnectionFrame,
-      liveMessageIsLive?: boolean
+      liveMessageIsLive?: boolean,
+      completionRuntimeConversationIds?: ReadonlySet<number>,
+      rejectedCompletionRuntimeConversationIds?: Set<number>
     ) => {
       // At most one sink invocation per registered key: canonical first,
       // then each open tab alias (two open aliases mirror into two sessions).
       mirrorLiveMessageOnce(
         canonical,
-        previous,
-        next,
+        previousConnection,
+        nextConnection,
         deliveryIds,
         connectionFrame,
-        liveMessageIsLive
+        liveMessageIsLive,
+        completionRuntimeConversationIds,
+        rejectedCompletionRuntimeConversationIds
       )
       for (const alias of aliasKeysFor(canonical)) {
         mirrorLiveMessageOnce(
           alias,
-          previous,
-          next,
+          previousConnection,
+          nextConnection,
           deliveryIds,
           connectionFrame,
-          liveMessageIsLive
+          liveMessageIsLive,
+          completionRuntimeConversationIds,
+          rejectedCompletionRuntimeConversationIds
         )
       }
     },
     [aliasKeysFor, mirrorLiveMessageOnce]
   )
+
+  const replayCurrentLiveMessageToSink = useCallback((key: string) => {
+    const sinks = liveSinksRef.current.get(key)
+    if (!sinks) return
+    const stateKey = observerAliasesRef.current.get(key) ?? key
+    const runtimeConversationId = sinks.runtimeConversationId
+    let conn = storeRef.current.connections.get(stateKey)
+    if (conn == null && runtimeConversationId != null) {
+      let retainedMatch: ConnectionState | null = null
+      for (const candidate of storeRef.current.connections.values()) {
+        if (
+          candidate.liveMessage == null ||
+          candidate.acceptedCompletionMessageId !== candidate.liveMessage.id ||
+          !(candidate.acceptedCompletionRuntimeConversationIds ?? []).includes(
+            runtimeConversationId
+          )
+        ) {
+          continue
+        }
+        if (retainedMatch != null) {
+          retainedMatch = null
+          break
+        }
+        retainedMatch = candidate
+      }
+      conn = retainedMatch ?? undefined
+    }
+    if (conn?.liveMessage == null) return
+
+    const isLive = conn.status === "prompting"
+    const runtime =
+      runtimeConversationId == null
+        ? null
+        : useConversationRuntimeStore
+            .getState()
+            .byConversationId.get(runtimeConversationId)
+    const runtimeOwnsAnotherMessage =
+      runtime?.liveMessage != null &&
+      runtime.liveMessage.id !== conn.liveMessage.id
+    const settledReplayAccepted =
+      conn.acceptedCompletionMessageId === conn.liveMessage.id &&
+      runtimeConversationId != null &&
+      (conn.acceptedCompletionRuntimeConversationIds ?? []).includes(
+        runtimeConversationId
+      )
+    const queuedOptimisticIds = new Set(runtime?.queuedOptimisticTurnIds ?? [])
+    const hasInFlightOptimistic =
+      runtime?.optimisticTurns.some(
+        (turn) => !queuedOptimisticIds.has(turn.id)
+      ) ?? false
+    const shouldAdoptSettledReplay =
+      settledReplayAccepted &&
+      runtime != null &&
+      runtime.detail == null &&
+      runtime.syncState !== "awaiting_persist" &&
+      !hasInFlightOptimistic
+    if (
+      runtimeOwnsAnotherMessage ||
+      (!isLive && runtimeConversationId != null && !shouldAdoptSettledReplay)
+    ) {
+      return
+    }
+
+    const accepted =
+      sinks.canonical(conn.liveMessage, isLive || shouldAdoptSettledReplay) !==
+      false
+    if (!accepted) return
+    sinks.transcript?.rebuild(conn.liveMessage, conn.lastAppliedSeq)
+    if (shouldAdoptSettledReplay) {
+      completeLiveTranscriptTurn(runtimeConversationId, conn.liveMessage)
+    }
+  }, [])
 
   const commitEventFrame = useCallback(
     (frame: AcceptedEventFrame): void => {
@@ -6047,24 +6622,350 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         }
       }
 
-      // Map contextKey → accepted connection frame for transcript.publish.
-      const framesByKey = new Map<string, AcceptedConnectionFrame>()
-      for (const connFrame of frame.connections) {
-        const key =
-          reverseMapRef.current.get(connFrame.connectionId) ??
-          connFrame.contextKey
-        framesByKey.set(key, connFrame)
-      }
-
-      for (const connection of prepared.changedConnections) {
-        mirrorLiveMessageForCanonical(
-          connection.contextKey,
-          previous,
-          next,
-          connection.deliveryIds,
-          framesByKey.get(connection.contextKey),
-          connection.liveMessageIsLive
+      const lastStepIndexByContext = new Map<string, number>()
+      for (let index = 0; index < prepared.connectionSteps.length; index += 1) {
+        lastStepIndexByContext.set(
+          prepared.connectionSteps[index]!.contextKey,
+          index
         )
+      }
+      for (
+        let stepIndex = 0;
+        stepIndex < prepared.connectionSteps.length;
+        stepIndex += 1
+      ) {
+        const step = prepared.connectionSteps[stepIndex]!
+        const { contextKey, previousConnection, connectionFrame } = step
+        // prepareEventFrame previews reducer state to expose intermediate turn
+        // boundaries. Its final prompting transition has a preview UUID; use
+        // the already-published reducer object for the last step so runtime and
+        // connection state retain exact LiveMessage identity across frames.
+        const nextConnection =
+          lastStepIndexByContext.get(contextKey) === stepIndex
+            ? (next.get(contextKey) ?? step.nextConnection)
+            : step.nextConnection
+        const finalLiveMessage = nextConnection.liveMessage
+        const hasCompletion = connectionFrame.applyEvents.some(
+          (event) => event.type === "turn_complete"
+        )
+        const rejectedCompletionRuntimeConversationIds = hasCompletion
+          ? new Set<number>()
+          : undefined
+        const sharedSession =
+          previousConnection.sharedSession ?? nextConnection.sharedSession
+        let dispatchedMessageId: string | null = null
+        if (sharedSession) {
+          for (const event of connectionFrame.applyEvents) {
+            if (
+              event.type === "prompt_dispatch_started" &&
+              event.generation === sharedSession.generation
+            ) {
+              dispatchedMessageId = event.turn.client_message_id
+            }
+          }
+        }
+        if (dispatchedMessageId) {
+          for (const [
+            runtimeConversationId,
+            runtime,
+          ] of useConversationRuntimeStore.getState().byConversationId) {
+            const mappedToConnection =
+              (nextConnection.sessionId != null &&
+                runtime.externalId === nextConnection.sessionId) ||
+              (nextConnection.conversationId != null &&
+                (runtime.conversationId === nextConnection.conversationId ||
+                  runtime.dbConversationId === nextConnection.conversationId))
+            if (!mappedToConnection) continue
+            const queuedTurn = runtime.optimisticTurns.find(
+              (turn) =>
+                turn.id === dispatchedMessageId &&
+                runtime.queuedOptimisticTurnIds?.includes(turn.id)
+            )
+            if (!queuedTurn) continue
+            useConversationRuntimeStore
+              .getState()
+              .actions.appendOptimisticTurn(
+                runtimeConversationId,
+                queuedTurn,
+                queuedTurn.id
+              )
+          }
+        }
+        const completion = selectFinalFrameCompletion(
+          connectionFrame.applyEvents,
+          sharedSession
+        )
+        const admittedRuntimeConversationIds = new Set(
+          step.completionRuntimeConversationIds ?? []
+        )
+        const terminalDeliveryIsAuthoritative =
+          completion != null &&
+          hasAuthoritativeTerminalDelivery(
+            connectionFrame,
+            completion.turnComplete.seq
+          )
+        const completionMessageId =
+          completion?.userMessage?.message_id ??
+          completion?.expectedSharedUserMessageId ??
+          previousConnection.pendingUserMessage?.messageId ??
+          null
+        const completionRuntimeConversationIds =
+          completion == null
+            ? undefined
+            : new Set(
+                [...admittedRuntimeConversationIds].filter(
+                  (runtimeConversationId) => {
+                    if (terminalDeliveryIsAuthoritative) return true
+                    const runtime = useConversationRuntimeStore
+                      .getState()
+                      .byConversationId.get(runtimeConversationId)
+                    if (!runtime) return false
+                    if (
+                      finalLiveMessage != null &&
+                      runtime.liveMessage?.id === finalLiveMessage.id
+                    ) {
+                      return true
+                    }
+                    if (
+                      completion.turnComplete.termination_source ===
+                        "user_stop" &&
+                      hasCurrentUserStopTurnOwnership(
+                        runtimeConversationId,
+                        completionMessageId
+                      )
+                    ) {
+                      return true
+                    }
+                    if (completionMessageId == null) return false
+                    const queuedIds = new Set(
+                      runtime.queuedOptimisticTurnIds ?? []
+                    )
+                    return runtime.optimisticTurns.some(
+                      (turn) =>
+                        turn.id === completionMessageId &&
+                        !queuedIds.has(turn.id)
+                    )
+                  }
+                )
+              )
+        if (
+          completion?.userMessage &&
+          (!sharedSession ||
+            completion.userMessage.message_id ===
+              completion.expectedSharedUserMessageId)
+        ) {
+          const userTurn = buildUserTurnFromMessageBlocks(
+            completion.userMessage.message_id,
+            completion.userMessage.blocks
+          )
+          for (const runtimeConversationId of completionRuntimeConversationIds ??
+            []) {
+            const runtime = useConversationRuntimeStore
+              .getState()
+              .byConversationId.get(runtimeConversationId)
+            if (!runtime) continue
+            useConversationRuntimeStore
+              .getState()
+              .actions.appendViewerUserTurn(
+                runtimeConversationId,
+                userTurn,
+                completion.turnComplete.termination_source === "user_stop"
+                  ? { preserveCancelOwnership: true }
+                  : undefined
+              )
+          }
+        }
+
+        mirrorLiveMessageForCanonical(
+          contextKey,
+          previousConnection,
+          nextConnection,
+          connectionFrame.deliveryIds,
+          connectionFrame,
+          step.liveMessageIsLive,
+          completionRuntimeConversationIds,
+          rejectedCompletionRuntimeConversationIds
+        )
+
+        if (!completion) continue
+        if (!finalLiveMessage) continue
+        const runtimeConversationIds = new Set(
+          [...(completionRuntimeConversationIds ?? [])].filter(
+            (conversationId) =>
+              !rejectedCompletionRuntimeConversationIds?.has(conversationId)
+          )
+        )
+        const sinkKeys = [contextKey, ...aliasKeysFor(contextKey)]
+        const hasRegisteredLiveSink = sinkKeys.some((key) =>
+          liveSinksRef.current.has(key)
+        )
+        if (
+          terminalDeliveryIsAuthoritative &&
+          runtimeConversationIds.size === 0 &&
+          !hasRegisteredLiveSink
+        ) {
+          const fallbackId = resolveCompletionRuntimeConversationId(
+            nextConnection,
+            completion.turnComplete.session_id
+          )
+          if (fallbackId != null) runtimeConversationIds.add(fallbackId)
+        }
+
+        for (const runtimeConversationId of runtimeConversationIds) {
+          const hasSinkForRuntime = sinkKeys.some((key) => {
+            const sinks = liveSinksRef.current.get(key)
+            return (
+              sinks != null &&
+              (sinks.runtimeConversationId == null ||
+                sinks.runtimeConversationId === runtimeConversationId)
+            )
+          })
+          if (
+            hasSinkForRuntime ||
+            !completionRuntimeConversationIds?.has(runtimeConversationId)
+          ) {
+            continue
+          }
+          const runtime = useConversationRuntimeStore
+            .getState()
+            .byConversationId.get(runtimeConversationId)
+          if (!runtime || runtime.liveMessage != null) continue
+          useConversationRuntimeStore
+            .getState()
+            .actions.setLiveMessage(
+              runtimeConversationId,
+              finalLiveMessage,
+              step.liveMessageIsLive ?? nextConnection.status === "prompting",
+              connectionFrame.deliveryIds
+            )
+        }
+
+        if (completionMessageId) {
+          for (const runtimeConversationId of runtimeConversationIds) {
+            const runtime = useConversationRuntimeStore
+              .getState()
+              .byConversationId.get(runtimeConversationId)
+            if (!runtime) continue
+            const queuedIds = new Set(runtime.queuedOptimisticTurnIds ?? [])
+            for (const turn of runtime.optimisticTurns) {
+              if (turn.id === completionMessageId || queuedIds.has(turn.id)) {
+                continue
+              }
+              useConversationRuntimeStore
+                .getState()
+                .actions.appendOptimisticTurn(
+                  runtimeConversationId,
+                  turn,
+                  turn.id,
+                  { queuePending: true }
+                )
+            }
+          }
+        }
+
+        const completionOwnerRuntimeConversationIds = new Set<number>()
+        const runtimeState = useConversationRuntimeStore.getState()
+        for (const runtimeConversationId of runtimeConversationIds) {
+          const runtime = runtimeState.byConversationId.get(
+            runtimeConversationId
+          )
+          if (!runtime) continue
+          const queuedIds = new Set(runtime.queuedOptimisticTurnIds ?? [])
+          const hasInFlightOptimistic = runtime.optimisticTurns.some(
+            (turn) => !queuedIds.has(turn.id)
+          )
+          const ownsCompletedTurn = runtime.liveMessage
+            ? runtime.liveMessage.id === finalLiveMessage.id
+            : runtime.syncState === "awaiting_persist" || hasInFlightOptimistic
+          if (!ownsCompletedTurn) continue
+          completionOwnerRuntimeConversationIds.add(runtimeConversationId)
+        }
+        if (terminalDeliveryIsAuthoritative) {
+          const markerRuntimeConversationIds = new Set<number>()
+          for (const runtimeConversationId of completionOwnerRuntimeConversationIds) {
+            const runtime = runtimeState.byConversationId.get(
+              runtimeConversationId
+            )!
+            markerRuntimeConversationIds.add(runtimeConversationId)
+            const dbConversationId = runtime.dbConversationId
+            if (
+              dbConversationId != null &&
+              (dbConversationId === runtimeConversationId ||
+                !runtimeState.byConversationId.has(dbConversationId) ||
+                completionOwnerRuntimeConversationIds.has(dbConversationId))
+            ) {
+              markerRuntimeConversationIds.add(dbConversationId)
+            }
+          }
+          if (
+            markerRuntimeConversationIds.size === 0 &&
+            !hasRegisteredLiveSink &&
+            resolveKnownConnectionSessionId(nextConnection) ===
+              completion.turnComplete.session_id &&
+            nextConnection.conversationId != null &&
+            runtimeState.conversationIdByExternalId.get(
+              completion.turnComplete.session_id
+            ) == null
+          ) {
+            markerRuntimeConversationIds.add(nextConnection.conversationId)
+          }
+          if (markerRuntimeConversationIds.size > 0) {
+            reduceSingleAction(
+              next,
+              {
+                type: "TURN_COMPLETION_ACCEPTED",
+                contextKey,
+                messageId: finalLiveMessage.id,
+                runtimeConversationIds: [...markerRuntimeConversationIds].sort(
+                  (a, b) => a - b
+                ),
+              },
+              true
+            )
+          }
+        }
+
+        if (completion.turnComplete.termination_source === "user_stop") {
+          acceptUserStopTurnComplete({
+            sessionId: completion.turnComplete.session_id,
+            connectionId: completion.turnComplete.connection_id,
+            completionSeq: completion.turnComplete.seq,
+            stopReason: completion.turnComplete.stop_reason,
+            terminationSource: "user_stop",
+            providerTurnId: completion.turnComplete.provider_turn_id ?? null,
+            snapshotConversationId: nextConnection.conversationId ?? null,
+            runtimeConversationIds: [...completionOwnerRuntimeConversationIds],
+            finalLiveMessage,
+          })
+          for (const runtimeConversationId of completionOwnerRuntimeConversationIds) {
+            const runtime = useConversationRuntimeStore
+              .getState()
+              .byConversationId.get(runtimeConversationId)
+            if (runtime?.pendingCleanup) {
+              useConversationRuntimeStore
+                .getState()
+                .actions.removeConversation(runtimeConversationId)
+            }
+          }
+          continue
+        }
+
+        for (const runtimeConversationId of completionOwnerRuntimeConversationIds) {
+          const runtime = useConversationRuntimeStore
+            .getState()
+            .byConversationId.get(runtimeConversationId)
+          if (!runtime) continue
+
+          completeLiveTranscriptTurn(runtimeConversationId, finalLiveMessage)
+          const completedRuntime = useConversationRuntimeStore
+            .getState()
+            .byConversationId.get(runtimeConversationId)
+          if (completedRuntime?.pendingCleanup) {
+            useConversationRuntimeStore
+              .getState()
+              .actions.removeConversation(runtimeConversationId)
+          }
+        }
       }
       for (const effect of prepared.afterCommit) effect()
       for (const connection of prepared.renderChangedConnections) {
@@ -6087,6 +6988,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     },
     [
       getPrepareEnv,
+      aliasKeysFor,
       mirrorLiveMessageForCanonical,
       notifyConnectionKeys,
       notifyRawSubscribers,
@@ -6113,7 +7015,13 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       for (const effect of reducerEffects) effect()
 
       const mirrorLiveMessage = (key: string) => {
-        mirrorLiveMessageForCanonical(key, prev, next, [])
+        const stateKey = observerAliasesRef.current.get(key) ?? key
+        mirrorLiveMessageForCanonical(
+          stateKey,
+          prev.get(stateKey),
+          next.get(stateKey),
+          []
+        )
       }
 
       if (action.type === "REMOVE_ALL") {
@@ -6137,7 +7045,10 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           liveSinksRef.current.delete(action.fromKey)
           liveSinksRef.current.set(action.toKey, sinks)
         }
-        mirrorLiveMessage(action.toKey)
+        replayCurrentLiveMessageToSink(action.toKey)
+        for (const alias of aliasKeysFor(action.toKey)) {
+          replayCurrentLiveMessageToSink(alias)
+        }
         notifyKeyListeners(action.fromKey)
         notifyConnectionKeys(action.toKey)
       } else {
@@ -6150,6 +7061,8 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     },
     [
       mirrorLiveMessageForCanonical,
+      replayCurrentLiveMessageToSink,
+      aliasKeysFor,
       notifyConnectionKeys,
       notifyKeyListeners,
       notifyAllKeyListeners,
@@ -6213,19 +7126,14 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
   const registerLiveSinks = useCallback(
     (contextKey: string, sinks: ConnectionLiveSinks) => {
       liveSinksRef.current.set(contextKey, sinks)
-      const stateKey = observerAliasesRef.current.get(contextKey) ?? contextKey
-      const conn = storeRef.current.connections.get(stateKey)
-      if (conn?.liveMessage != null) {
-        sinks.canonical(conn.liveMessage, conn.status === "prompting")
-        sinks.transcript?.rebuild(conn.liveMessage, conn.lastAppliedSeq)
-      }
+      replayCurrentLiveMessageToSink(contextKey)
       return () => {
         if (liveSinksRef.current.get(contextKey) === sinks) {
           liveSinksRef.current.delete(contextKey)
         }
       }
     },
-    []
+    [replayCurrentLiveMessageToSink]
   )
 
   const registerLiveMessageSink = useCallback(
@@ -6537,7 +7445,12 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
   // Push envelopes into the frame ingestor. Optional flush for connect-time
   // buffered drains that must apply before the next tick.
   const pushMappedEvents = useCallback(
-    (contextKey: string, events: readonly EventEnvelope[], flush = false) => {
+    (
+      contextKey: string,
+      events: readonly EventEnvelope[],
+      source: AcpEventDeliverySource,
+      flush = false
+    ) => {
       if (events.length === 0) return
       lastActivityRef.current.set(contextKey, Date.now())
       const ingestor = eventIngestorRef.current
@@ -6548,7 +7461,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         )
         return
       }
-      ingestor.pushMapped(contextKey, events)
+      ingestor.pushMapped(contextKey, events, source)
       if (flush) ingestor.flushNow()
     },
     []
@@ -6556,10 +7469,15 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
 
   // Apply a single envelope through the ingestor (attach / buffered drain).
   const applyMappedEnvelope = useCallback(
-    (contextKey: string, envelope: EventEnvelope, flush = true) => {
+    (
+      contextKey: string,
+      envelope: EventEnvelope,
+      flush = true,
+      source: "desktop" | "live" = "desktop"
+    ) => {
       const conn = storeRef.current.connections.get(contextKey)
       if (conn && envelope.seq <= conn.lastAppliedSeq) return
-      pushMappedEvents(contextKey, [envelope], flush)
+      pushMappedEvents(contextKey, [envelope], source, flush)
     },
     [pushMappedEvents]
   )
@@ -6717,11 +7635,16 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             }
           }
         },
-        onReplay: (events) => {
-          pushMappedEvents(contextKey, events, true)
+        onReplay: (events, _highWaterSeq, resumedFromSeq) => {
+          pushMappedEvents(
+            contextKey,
+            events,
+            resumedFromSeq == null ? "untrusted_replay" : "resume_replay",
+            true
+          )
         },
         onEvent: (envelope) => {
-          applyMappedEnvelope(contextKey, envelope, true)
+          applyMappedEnvelope(contextKey, envelope, true, "live")
         },
         onAttachError: (code, retryable) => {
           // Agent is still alive; only this attach frame failed. Keep
@@ -9431,16 +10354,29 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       const conn = storeRef.current.connections.get(key)
       if (!conn) return
       // Snapshot cancelled-turn ownership before turn_complete may arrive late.
-      // Prefer runtime session key via external session id (draft virtual id);
-      // conn.conversationId is often the positive DB id and is only a fallback.
-      const conversationId =
-        (conn.sessionId
-          ? getConversationIdByExternalIdFromStore(conn.sessionId)
-          : null) ??
-        conn.conversationId ??
-        null
-      if (conversationId != null) {
-        noteUserStopTurnOwnership(conversationId)
+      // Every open alias needs its own fence; the external-id index is
+      // intentionally one-to-one and therefore cannot represent them all.
+      const runtimeConversationIds = new Set<number>()
+      for (const [
+        runtimeConversationId,
+        runtime,
+      ] of useConversationRuntimeStore.getState().byConversationId) {
+        if (
+          (conn.sessionId != null && runtime.externalId === conn.sessionId) ||
+          (conn.liveMessage != null && runtime.liveMessage === conn.liveMessage)
+        ) {
+          runtimeConversationIds.add(runtimeConversationId)
+        }
+      }
+      if (conn.sessionId) {
+        const indexed = getConversationIdByExternalIdFromStore(conn.sessionId)
+        if (indexed != null) runtimeConversationIds.add(indexed)
+      }
+      if (conn.conversationId != null) {
+        runtimeConversationIds.add(conn.conversationId)
+      }
+      for (const runtimeConversationId of runtimeConversationIds) {
+        noteUserStopTurnOwnership(runtimeConversationId)
       }
       const shared = conn.sharedSession
       if (shared) {

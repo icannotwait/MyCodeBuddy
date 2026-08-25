@@ -5,6 +5,7 @@ import { useTranslations } from "next-intl"
 import { toast } from "sonner"
 import { AlertCircle, Loader2, Plus, RefreshCw } from "lucide-react"
 import {
+  buildUserTurnFromMessageBlocks,
   getCachedSelectors,
   useAcpActions,
   useAcpEvent,
@@ -66,7 +67,7 @@ import type { SessionFailureAction } from "@/lib/session-failures"
 import { continuationFailureI18nKey } from "@/lib/continuation-waiting"
 import { consumeDelegatedChildTabIntent } from "@/lib/delegated-child-tab-intent"
 import {
-  completeLiveTranscriptTurn,
+  getRuntimeSession,
   useConversationRuntimeActions,
   useConversationRuntimeStore,
 } from "@/stores/conversation-runtime-store"
@@ -87,7 +88,6 @@ import {
   type PlanApprovalAnswer,
   type PromptDraft,
   type QuestionAnswer,
-  type UserMessageBlock,
 } from "@/lib/types"
 import { getAgentLabel } from "@/lib/custom-agents"
 import type { ConnectionIntent } from "@/contexts/acp-connections-context"
@@ -107,6 +107,8 @@ import type { PromptDraftRestore } from "@/components/chat/message-input"
 
 const ROOT_ORCHESTRATION_RESUME_PROMPT =
   "Continue root orchestration from the durable workflow state."
+
+const pendingDraftCreateOwnerByTab = new Map<string, symbol>()
 
 /**
  * Durable auto-connect policy for a session surface root.
@@ -302,27 +304,6 @@ function buildOptimisticUserTurnFromDraft(
     id: `optimistic-${randomUUID()}`,
     role: "user",
     blocks,
-    timestamp: new Date().toISOString(),
-  }
-}
-
-/** Build a user `MessageTurn` from a broadcast `user_message` (event or
- *  snapshot `pending_user_message`). Used by cross-client VIEWERS to render the
- *  sender's prompt. The turn `id` is the broadcast `message_id` so the runtime
- *  reducer can dedup it idempotently. */
-function buildUserTurnFromMessageBlocks(
-  messageId: string,
-  blocks: UserMessageBlock[]
-): MessageTurn {
-  const contentBlocks: ContentBlock[] = blocks.map((b) =>
-    b.type === "image"
-      ? { type: "image", data: b.data, mime_type: b.mime_type, uri: null }
-      : { type: "text", text: b.text }
-  )
-  return {
-    id: messageId,
-    role: "user",
-    blocks: contentBlocks,
     timestamp: new Date().toISOString(),
   }
 }
@@ -974,22 +955,14 @@ export const ConversationSessionSurface = memo(
       setAcpLoadError(effectiveConversationId, connLoadError ?? null)
     }, [connLoadError, effectiveConversationId, setAcpLoadError])
 
-    // Promote the completed turn on the prompting→idle edge. (There is no longer
-    // an ordering constraint against a setLiveMessage cleanup: the liveMessage
-    // sink writes the runtime store from the connection dispatch, not a React
-    // effect — see registerLiveMessageSink.)
+    // Provider completion is authoritative. This edge handles only follow-up
+    // detail convergence and metadata sync.
     const prevConnStatusRef = useRef(connStatus)
     useEffect(() => {
       const wasPrompting = prevConnStatusRef.current === "prompting"
       prevConnStatusRef.current = connStatus
       if (!wasPrompting || connStatus === "prompting") return
 
-      // Turn completed — promote liveMessage + optimisticTurns to localTurns,
-      // and drop the live transcript projection in the same call stack (no
-      // blank/duplicate assistant frame). Don't pass conn.liveMessage: this
-      // panel no longer subscribes to it (see useConnection); COMPLETE_TURN
-      // falls back to session.liveMessage written by the sink before status change.
-      completeLiveTranscriptTurn(effectiveConversationId)
       if (isDelegateConversation) {
         syncDelegateTerminalDetail(effectiveConversationId)
       }
@@ -1144,12 +1117,18 @@ export const ConversationSessionSurface = memo(
     useEffect(() => {
       const conversationId = effectiveConversationId
       return acpActions.registerLiveSinks(tabId, {
+        runtimeConversationId: conversationId,
         canonical: (liveMessage, isLive, deliveryIds) => {
           if (deliveryIds && deliveryIds.length > 0) {
             setLiveMessage(conversationId, liveMessage, isLive, deliveryIds)
           } else {
             setLiveMessage(conversationId, liveMessage, isLive)
           }
+          return (
+            useConversationRuntimeStore
+              .getState()
+              .byConversationId.get(conversationId)?.liveMessage === liveMessage
+          )
         },
         transcript: createLiveTranscriptFrameSink(
           conversationId,
@@ -1174,13 +1153,9 @@ export const ConversationSessionSurface = memo(
         expectedSharedUserMessageIdRef.current = activeMessageId
     }, [conn.sharedSession?.activeTurn?.clientMessageId])
 
-    // Cross-client VIEWER (Bug 2): mirror the connection's in-flight user prompt
-    // (from a snapshot's `pending_user_message`, captured when we attach
-    // mid-turn) into the runtime as a synthesized user turn. The reducer
-    // sender-guards + dedups by id, so this is a no-op on the sender and
-    // idempotent against the live `user_message` event below. This branch covers
-    // the prompt that was sent BEFORE we attached; the live handler covers
-    // prompts sent AFTER.
+    // Mirror the provider's in-flight user prompt into the viewer runtime. This
+    // handles snapshot and live pending state; coalesced terminal frames are
+    // projected synchronously by the provider before it clears that state.
     useEffect(() => {
       const pending = conn.pendingUserMessage
       if (!pending) return
@@ -1201,11 +1176,9 @@ export const ConversationSessionSurface = memo(
       appendViewerUserTurn,
     ])
 
-    // Cross-client VIEWER (Bug 2): a `user_message` event for THIS connection
-    // that arrives while we're attached. The owner added its user turn
-    // optimistically; a viewer only receives the assistant stream, so without
-    // this the reply would render with no user message above it. Sender-guarded +
-    // idempotent in the reducer (the sender's own echo is a no-op).
+    // Track shared dispatch identity before the provider projects its
+    // pendingUserMessage. The provider is the sole user-message projector so a
+    // raw event delivered after completion cannot invalidate cancel ownership.
     useAcpEvent(
       useCallback(
         (envelope: EventEnvelope) => {
@@ -1217,27 +1190,9 @@ export const ConversationSessionSurface = memo(
           ) {
             expectedSharedUserMessageIdRef.current =
               envelope.turn.client_message_id
-            return
           }
-          if (envelope.type !== "user_message") return
-          if (envelope.connection_id !== conn.connectionId) return
-          if (
-            conn.sharedSession &&
-            envelope.message_id !== expectedSharedUserMessageIdRef.current
-          ) {
-            return
-          }
-          appendViewerUserTurn(
-            effectiveConversationId,
-            buildUserTurnFromMessageBlocks(envelope.message_id, envelope.blocks)
-          )
         },
-        [
-          conn.connectionId,
-          conn.sharedSession,
-          effectiveConversationId,
-          appendViewerUserTurn,
-        ]
+        [conn.connectionId, conn.sharedSession]
       )
     )
 
@@ -1387,15 +1342,18 @@ export const ConversationSessionSurface = memo(
       toast.success(t("reloaded"))
     }, [detailLoading, detailError, t])
 
-    // Cleanup runtime data on unmount (tab close)
+    // Cleanup runtime data on a real unmount. A split-group reparent remounts
+    // the same surface and must retain the provider-authorized live state.
     useEffect(() => {
       mountedRef.current = true
       return () => {
+        if (isTransientUnmount()) return
         mountedRef.current = false
+        pendingDraftCreateOwnerByTab.delete(tabId)
         syncCancelRef.current?.()
         if (connStatusRef.current === "prompting" && !isViewerRef.current) {
           // Owner, agent still responding — keep the session for deferred cleanup
-          // (the background turn_complete handler removes it once done).
+          // (the provider removes it after admitting the matching turn_complete).
           setPendingCleanup(effectiveConversationId, true)
         } else {
           // Idle owner, or a VIEWER (any status): remove immediately. A viewer's
@@ -1406,7 +1364,13 @@ export const ConversationSessionSurface = memo(
           removeConversation(effectiveConversationId)
         }
       }
-    }, [effectiveConversationId, removeConversation, setPendingCleanup])
+    }, [
+      effectiveConversationId,
+      isTransientUnmount,
+      removeConversation,
+      setPendingCleanup,
+      tabId,
+    ])
 
     const handleSend = useCallback(
       (
@@ -1456,7 +1420,8 @@ export const ConversationSessionSurface = memo(
         if (
           shouldRejectDuplicateCreate(
             dbConvIdRef.current != null,
-            createConversationPendingRef.current
+            createConversationPendingRef.current ||
+              pendingDraftCreateOwnerByTab.has(tabId)
           )
         ) {
           return
@@ -1586,11 +1551,30 @@ export const ConversationSessionSurface = memo(
         const onPromptAdmitted = (
           result: import("@/lib/types").PromptEnqueueResult | null
         ) => {
+          if (!conn.sharedSession || result?.state !== "queued") return
           if (
-            conn.sharedSession &&
-            result?.state === "queued" &&
-            !shouldRetainOptimisticTurnWhileQueued("shared_admission_queued")
+            connectionStore.getConnection(tabId)?.sharedSession?.activeTurn
+              ?.clientMessageId === optimisticTurn.id
           ) {
+            return
+          }
+          if (
+            !getRuntimeSession(effectiveConversationId)?.optimisticTurns.some(
+              (turn) => turn.id === optimisticTurn.id
+            )
+          ) {
+            return
+          }
+          if (
+            shouldRetainOptimisticTurnWhileQueued("shared_admission_queued")
+          ) {
+            appendOptimisticTurn(
+              effectiveConversationId,
+              optimisticTurn,
+              optimisticTurn.id,
+              { queuePending: true }
+            )
+          } else {
             removeOptimisticTurn(effectiveConversationId, optimisticTurn.id)
             setSyncState(effectiveConversationId, "idle")
           }
@@ -1643,8 +1627,17 @@ export const ConversationSessionSurface = memo(
         // a normal new conversation. This is the whole point of the fix: after the
         // scratch dir exists, chat mode shares the normal send path and never
         // depends on the flush-on-connect queue to deliver its first prompt.
-        if (createConversationPendingRef.current) return
+        if (
+          createConversationPendingRef.current ||
+          pendingDraftCreateOwnerByTab.has(tabId)
+        ) {
+          return
+        }
         createConversationPendingRef.current = true
+        const createOwner = Symbol(tabId)
+        pendingDraftCreateOwnerByTab.set(tabId, createOwner)
+        const ownsPendingCreate = () =>
+          pendingDraftCreateOwnerByTab.get(tabId) === createOwner
         const title = getPromptDraftDisplayText(
           draft,
           sharedT("attachedResources")
@@ -1667,20 +1660,18 @@ export const ConversationSessionSurface = memo(
               )
               newConversationId = res.conversationId
               sendFolderId = res.folderId
+              if (!ownsPendingCreate() || !mountedRef.current) {
+                refreshConversations()
+                return
+              }
               dbConvIdRef.current = newConversationId
               setExternalId(
                 effectiveConversationId,
                 sessionIdRef.current ?? null
               )
-              // Bind the DB id BEFORE the prompt goes out. The mirror effect
-              // below also binds, but only after a re-render — this closes that
-              // window and covers the unmounted-early return just under it.
+              // Bind the DB id before the prompt goes out. The mirror effect
+              // below also binds, but only after a re-render.
               setDbConversationId(effectiveConversationId, newConversationId)
-              if (!mountedRef.current) {
-                setPendingCleanup(effectiveConversationId, true)
-                refreshConversations()
-                return
-              }
               // Seed allFolders with the hidden chat folder so the tab's new
               // folderId resolves (cwd / active-folder) on the next render. bind
               // reuses the eager scratch dir as workingDir, so the connection's
@@ -1703,6 +1694,10 @@ export const ConversationSessionSurface = memo(
                 title,
                 sendOwnTab?.delegationRouteOverride ?? null
               )
+              if (!ownsPendingCreate() || !mountedRef.current) {
+                refreshConversations()
+                return
+              }
               dbConvIdRef.current = newConversationId
               // Set external ID on the stable virtual session (no migration needed —
               // effectiveConversationId never changes, so the session stays in place).
@@ -1714,13 +1709,6 @@ export const ConversationSessionSurface = memo(
               )
               // Bind the DB id BEFORE the prompt goes out (see the chat branch).
               setDbConversationId(effectiveConversationId, newConversationId)
-              if (!mountedRef.current) {
-                // Component unmounted while creating — mark for deferred cleanup
-                // so the background turn_complete handler can clean up later.
-                setPendingCleanup(effectiveConversationId, true)
-                refreshConversations()
-                return
-              }
               setCreatedConversationId(newConversationId)
               bindConversationTab(
                 tabId,
@@ -1730,6 +1718,7 @@ export const ConversationSessionSurface = memo(
                 effectiveConversationId
               )
             }
+            if (!ownsPendingCreate() || !mountedRef.current) return
             if (!conn.sharedSession) clearMessageInputDraft(draftStorageKey)
             refreshConversations()
 
@@ -1759,6 +1748,7 @@ export const ConversationSessionSurface = memo(
                     }),
             })
           } catch (e) {
+            if (!ownsPendingCreate()) return
             if (conn.sharedSession && dbConvIdRef.current != null) {
               throw e
             }
@@ -1787,6 +1777,9 @@ export const ConversationSessionSurface = memo(
             }
             if (conn.sharedSession) throw e
           } finally {
+            if (ownsPendingCreate()) {
+              pendingDraftCreateOwnerByTab.delete(tabId)
+            }
             createConversationPendingRef.current = false
           }
         }
@@ -1806,6 +1799,7 @@ export const ConversationSessionSurface = memo(
         mqGetQueueLength,
         bindConversationTab,
         canAutoConnect,
+        connectionStore,
         promptAdmissionReady,
         conn.sharedSession,
         retainWelcomeComposerForAdmission,
@@ -1823,7 +1817,6 @@ export const ConversationSessionSurface = memo(
         selectedAgent,
         setDbConversationId,
         setExternalId,
-        setPendingCleanup,
         setSyncState,
         sharedT,
         ownTab,

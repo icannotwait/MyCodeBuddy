@@ -16,7 +16,6 @@ import { useTranslations } from "next-intl"
 import { toast } from "sonner"
 import {
   useAcpActions,
-  useAcpEvent,
   useConnectionStore,
 } from "@/contexts/acp-connections-context"
 import { useActiveFolder } from "@/contexts/active-folder-context"
@@ -42,18 +41,11 @@ import { isWindowedDetail } from "@/lib/turn-window"
 import { isDesktop } from "@/lib/platform"
 import { leftChromeReserve, rightChromeReserve } from "@/lib/window-chrome"
 import {
-  completeLiveTranscriptTurn,
-  getConversationIdByExternalIdFromStore,
   getRuntimeSession,
-  useConversationRuntimeActions,
   useConversationRuntimeStore,
 } from "@/stores/conversation-runtime-store"
 import type { PointerEvent as ReactPointerEvent } from "react"
-import {
-  type AgentType,
-  type ConversationStatus,
-  type EventEnvelope,
-} from "@/lib/types"
+import { type AgentType, type ConversationStatus } from "@/lib/types"
 import {
   ContextMenu,
   ContextMenuContent,
@@ -145,8 +137,6 @@ function SplitStripCornerReserve({ side }: { side: "left" | "right" }) {
 export function ConversationDetailPanel() {
   const t = useTranslations("Folder.conversation")
   const tDetails = useTranslations("Folder.sessionDetails")
-  const { removeConversation: runtimeRemoveConversation } =
-    useConversationRuntimeActions()
   const { activeFolder: folder } = useActiveFolder()
   const conversations = useAppWorkspaceStore((s) => s.conversations)
   const allFolders = useAppWorkspaceStore((s) => s.allFolders)
@@ -192,68 +182,6 @@ export function ConversationDetailPanel() {
       disconnectIfIdle(replacedTabId).catch(() => {})
     })
   }, [onPreviewTabReplaced, disconnectIfIdle])
-
-  // Background turn_complete handler: for conversations not open in tabs.
-  // Subscribes via the context's primary `acp://event` listener (single
-  // physical Tauri/WebSocket subscription, plus seq dedup from Phase 3b).
-  // `useAcpEvent` stabilizes handler identity internally, so the callback
-  // can read closure values directly — no caller-side refs needed.
-  useAcpEvent(
-    useCallback(
-      (envelope: EventEnvelope) => {
-        if (envelope.type !== "turn_complete") return
-
-        const runtimeConversationId = getConversationIdByExternalIdFromStore(
-          envelope.session_id
-        )
-        // Event-time read: fresher than a render capture ("`conversations`
-        // may lag the tab update on fast turns" below applies to the render
-        // snapshot; getState() narrows that window).
-        const summary = useAppWorkspaceStore
-          .getState()
-          .conversations.find(
-            (item) => item.external_id === envelope.session_id
-          )
-        const matchedConversationId =
-          runtimeConversationId ?? summary?.id ?? null
-        if (!matchedConversationId) return
-
-        // Match against every identifier the panel may carry for the same
-        // runtime session — otherwise this background handler races the
-        // panel's own completeTurn effect and double-promotes streamingTurns
-        // into localTurns (visible as a duplicated assistant message until
-        // the conversation is reopened from DB).
-        //
-        // Invariant: `tab.runtimeConversationId` is only set when the panel's
-        // effectiveConversationId differs from its bound conversationId, i.e.
-        // for new conversations whose session lives under a virtual (negative)
-        // id. `dbId2` is always a real DB id, so a runtimeConversationId vs.
-        // dbId2 comparison is unreachable and intentionally omitted.
-        // `conversations` may lag the tab update on fast turns, so dbId2
-        // alone (without the runtime id branch) is not a reliable signal.
-        const dbId2 = summary?.id
-        const isOpenInTabs = tabs.some(
-          (tab) =>
-            tab.conversationId === matchedConversationId ||
-            tab.runtimeConversationId === matchedConversationId ||
-            (dbId2 != null && tab.conversationId === dbId2)
-        )
-        if (isOpenInTabs) return
-
-        // Promote liveMessage + optimisticTurns to localTurns immediately,
-        // coordinating the live-transcript footer handoff in the same stack.
-        completeLiveTranscriptTurn(matchedConversationId)
-
-        // If tab was closed while agent was responding, clean up now.
-        // Event-time read: fresh via getState(), no reactive subscription.
-        const session = getRuntimeSession(matchedConversationId)
-        if (session?.pendingCleanup) {
-          runtimeRemoveConversation(matchedConversationId)
-        }
-      },
-      [tabs, runtimeRemoveConversation]
-    )
-  )
 
   const hasNoTabs = tabs.length === 0 && !activeTabId
   const activeConversationTab = useMemo(

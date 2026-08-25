@@ -957,7 +957,8 @@ function lastRoundsCorrespond(
  */
 function retireCoveredLocalTurns(
   localTurns: MessageTurn[],
-  detail: DbConversationDetail | null
+  detail: DbConversationDetail | null,
+  batchBoundaryIndex: number | null
 ): MessageTurn[] {
   if (localTurns.length === 0) return localTurns
   const persisted = detail?.turns ?? []
@@ -979,12 +980,23 @@ function retireCoveredLocalTurns(
           .slice(lastPersistUserIdx + 1)
           .some((t) => t.role === "assistant")
       : persisted.some((t) => t.role === "assistant")
+  // A captured boundary is positive proof of where this local batch begins.
+  // Do not let an older, text-identical parser snapshot retire a newer round;
+  // the persisted transcript must first extend past the whole local overlay.
+  const persistedTurnTotal = turnsTotalOf(detail)
+  const persistCoversCapturedBatch =
+    batchBoundaryIndex == null ||
+    persistedTurnTotal >= batchBoundaryIndex + localTurns.length ||
+    // Background-task parsing folds [user, launch ack] into one terminal
+    // assistant record. Crossing the boundary is sufficient for that shape.
+    (lastPersistUserIdx < 0 && persistedTurnTotal > batchBoundaryIndex)
   // Persist with no user turn is a folded replacement of the last overlay
   // round (async-sub-agent launch ack → `[[codeg-background-task]]` marker).
   // Persist with a last user only covers the overlay when the assistant
   // bodies match — otherwise it is an earlier same-text prompt.
   const lastRoundCovered =
     persistSettled &&
+    persistCoversCapturedBatch &&
     lastLocalUserIdx >= 0 &&
     persistHasAssistantAfterLastUser &&
     (lastPersistUserIdx >= 0
@@ -2029,18 +2041,45 @@ export function computeTurnMetadataPatches(params: {
   return patches
 }
 
-function upsertExternalIdIndex(
-  index: Map<string, number>,
-  previousExternalId: string | null,
-  nextExternalId: string | null,
-  conversationId: number
+function rebuildExternalIdIndex(
+  sessions: Map<number, ConversationRuntimeSession>,
+  previous: Map<string, number>
 ): Map<string, number> {
-  const next = new Map(index)
-  if (previousExternalId) {
-    next.delete(previousExternalId)
+  const candidates = new Map<string, ConversationRuntimeSession[]>()
+  for (const session of sessions.values()) {
+    if (!session.externalId) continue
+    const entries = candidates.get(session.externalId) ?? []
+    entries.push(session)
+    candidates.set(session.externalId, entries)
   }
-  if (nextExternalId) {
-    next.set(nextExternalId, conversationId)
+
+  const rank = (session: ConversationRuntimeSession): number => {
+    const persistedId = session.dbConversationId ?? session.conversationId
+    if (session.conversationId > 0 && session.conversationId === persistedId) {
+      return 0
+    }
+    if (session.conversationId > 0) return 1
+    return persistedId > 0 ? 2 : 3
+  }
+
+  const next = new Map<string, number>()
+  for (const [externalId, entries] of candidates) {
+    const previousId = previous.get(externalId)
+    let selected = entries.find(
+      (session) => session.conversationId === previousId
+    )
+    for (const candidate of entries) {
+      if (
+        !selected ||
+        rank(candidate) < rank(selected) ||
+        (rank(candidate) === rank(selected) &&
+          previousId == null &&
+          candidate.conversationId < selected.conversationId)
+      ) {
+        selected = candidate
+      }
+    }
+    if (selected) next.set(externalId, selected.conversationId)
   }
   return next
 }
@@ -2256,7 +2295,11 @@ function reducer(
       // last-round window after the last corresponding user).
       const nextLocalTurns = detailIsInFlight
         ? current.localTurns
-        : retireCoveredLocalTurns(current.localTurns, detail)
+        : retireCoveredLocalTurns(
+            current.localTurns,
+            detail,
+            current.batchBoundaryIndex
+          )
 
       const nextSessionBase: ConversationRuntimeSession = {
         ...current,
@@ -2307,11 +2350,9 @@ function reducer(
 
       const nextByConversationId = new Map(state.byConversationId)
       nextByConversationId.set(action.conversationId, nextSession)
-      const nextExternalIndex = upsertExternalIdIndex(
-        state.conversationIdByExternalId,
-        current.externalId,
-        nextExternalId ?? current.externalId,
-        action.conversationId
+      const nextExternalIndex = rebuildExternalIdIndex(
+        nextByConversationId,
+        state.conversationIdByExternalId
       )
 
       return {
@@ -2432,7 +2473,11 @@ function reducer(
         ...s,
         detail: nextDetail,
         backgroundTurns: nextBackgroundTurns,
-        localTurns: retireCoveredLocalTurns(current.localTurns, nextDetail),
+        localTurns: retireCoveredLocalTurns(
+          current.localTurns,
+          nextDetail,
+          current.batchBoundaryIndex
+        ),
         loadingOlderTurns: false,
         // Explicit prepend signal for the virtualized thread's `shift`
         // derivation — see the field doc.
@@ -2443,26 +2488,18 @@ function reducer(
       const current = state.byConversationId.get(action.conversationId)
       if (!current) return state
 
-      // Idempotency guard — a single turn can be promoted twice when the
-      // panel's connStatus-edge effect and ConversationDetailPanel's
-      // background turn_complete listener both fire (e.g. when the bg
-      // listener's tab-membership check misses the new-conversation race
-      // and proceeds). The first call drains liveMessage + optimisticTurns
-      // into localTurns and lands syncState=idle; a second pass with a
-      // caller-provided action.liveMessage would otherwise rebuild
-      // streamingTurns from action.liveMessage and append them on top of
-      // the already-promoted turns, producing a duplicated assistant
-      // message in the timeline. If the session is already drained, the
-      // turn is a no-op regardless of action.liveMessage.
+      // Idempotency guard — callers may retry a completion after the provider
+      // already drained liveMessage + optimisticTurns into localTurns. A second
+      // pass with a caller-provided action.liveMessage would otherwise rebuild
+      // streamingTurns and duplicate the assistant message. If the session is
+      // already drained, the turn is a no-op regardless of action.liveMessage.
       if (
         current.liveMessage === null &&
         current.optimisticTurns.length === 0 &&
         current.syncState === "idle"
       ) {
-        // Surface the unexpected double-invocation so future regressions
-        // are noticed in the console rather than silently swallowed.
-        // Reaching this branch means an upstream guard (e.g. the bg
-        // listener's tab-membership check) failed to dedupe.
+        // Surface unexpected duplicate completion so regressions are noticed
+        // in the console rather than silently swallowed.
         console.warn(
           "[conversation-runtime] COMPLETE_TURN dispatched on an already-drained session; ignoring",
           { conversationId: action.conversationId }
@@ -2474,10 +2511,8 @@ function reducer(
       // is kept in sync by the connection dispatch's liveMessage sink (see
       // `registerLiveMessageSink` in the connections context), which writes
       // synchronously as each batch is applied — so by turn-end it already holds
-      // the final chunk. The conversation panel omits it (it no longer subscribes
-      // to conn.liveMessage) and relies on this sink-synced fallback; the
-      // background turn_complete listener likewise passes nothing. The sub-agent
-      // dialog's child bridge still passes its liveMessage explicitly.
+      // the final chunk. Callers can still omit it and rely on this sink-synced
+      // fallback.
       const sourceLiveMessage =
         action.liveMessage !== undefined
           ? action.liveMessage
@@ -2501,11 +2536,7 @@ function reducer(
 
       // Promote: optimisticTurns + streamingTurns → localTurns. Dedup by turn
       // id (keep the latest copy) so a re-promotion of an already-promoted turn
-      // doesn't leave two same-id turns in `localTurns`. This happens when the
-      // background `turn_complete` listener races the panel's own promotion
-      // after the same liveMessage was re-bridged: the first COMPLETE_TURN puts
-      // a snapshot into localTurns, the live turn re-streams under the same id,
-      // and a second COMPLETE_TURN would append it again. Identical ids mean the
+      // doesn't leave two same-id turns in `localTurns`. Identical ids mean the
       // same underlying turn, so the later (most complete) copy supersedes.
       const usageSnap = getPublishedRequestUsage(action.conversationId)
       const stampedStreaming =
@@ -2564,7 +2595,11 @@ function reducer(
 
       return updateSessionInState(state, action.conversationId, () => ({
         ...current,
-        localTurns: retireCoveredLocalTurns(promoted, current.detail),
+        localTurns: retireCoveredLocalTurns(
+          promoted,
+          current.detail,
+          current.batchBoundaryIndex
+        ),
         optimisticTurns: queuedOptimistic,
         queuedOptimisticTurnIds: queuedOptimistic.map((turn) => turn.id),
         liveMessage: null,
@@ -2873,6 +2908,8 @@ function reducer(
         // so a late RECONCILE cannot clear the new prompt's live turn.
         if (
           capture.baseline === current.historyAssistantBaseline &&
+          capture.boundaryIndex === current.batchBoundaryIndex &&
+          capture.boundaryHash === current.batchBoundaryPrefixHash &&
           current.pendingCancel == null &&
           !current.softFence &&
           !current.ownerPreserve
@@ -2882,6 +2919,8 @@ function reducer(
         return updateSessionInState(state, action.conversationId, (s) => ({
           ...s,
           historyAssistantBaseline: capture.baseline,
+          batchBoundaryIndex: capture.boundaryIndex,
+          batchBoundaryPrefixHash: capture.boundaryHash,
           pendingCancel: null,
           softFence: false,
           ownerPreserve: false,
@@ -2902,6 +2941,8 @@ function reducer(
         ...s,
         optimisticTurns: [...s.optimisticTurns, action.turn],
         historyAssistantBaseline: capture.baseline,
+        batchBoundaryIndex: capture.boundaryIndex,
+        batchBoundaryPrefixHash: capture.boundaryHash,
         pendingCancel: null,
         softFence: false,
         ownerPreserve: false,
@@ -2926,11 +2967,16 @@ function reducer(
       // liveMessage arrives before DB data, causing overlap after fetch.
       const hasExistingTurns =
         (session.detail?.turns.length ?? 0) > 0 || session.localTurns.length > 0
+      const queuedIds = new Set(session.queuedOptimisticTurnIds ?? [])
+      const hasInFlightOptimistic = session.optimisticTurns.some(
+        (turn) => !queuedIds.has(turn.id)
+      )
       if (
         !action.isLive &&
         action.liveMessage !== null &&
         session.liveMessage === null &&
         session.syncState !== "awaiting_persist" &&
+        !hasInFlightOptimistic &&
         (hasExistingTurns || session.detailLoading)
       ) {
         return state
@@ -2974,11 +3020,9 @@ function reducer(
       }
       const nextByConversationId = new Map(state.byConversationId)
       nextByConversationId.set(action.conversationId, nextSession)
-      const nextExternalIndex = upsertExternalIdIndex(
-        state.conversationIdByExternalId,
-        current.externalId,
-        action.externalId,
-        action.conversationId
+      const nextExternalIndex = rebuildExternalIdIndex(
+        nextByConversationId,
+        state.conversationIdByExternalId
       )
       return {
         byConversationId: nextByConversationId,
@@ -3006,7 +3050,14 @@ function reducer(
         softFence: identityReset ? false : base.softFence,
         ownerPreserve: identityReset ? false : base.ownerPreserve,
       })
-      return { ...state, byConversationId: nextByConversationId }
+      return {
+        ...state,
+        byConversationId: nextByConversationId,
+        conversationIdByExternalId: rebuildExternalIdIndex(
+          nextByConversationId,
+          state.conversationIdByExternalId
+        ),
+      }
     }
 
     case "SET_SYNC_STATE":
@@ -3075,15 +3126,10 @@ function reducer(
       nextByConversationId.delete(action.fromConversationId)
       nextByConversationId.set(action.toConversationId, merged)
 
-      const nextExternalIndex = new Map(state.conversationIdByExternalId)
-      for (const [externalId, conversationId] of nextExternalIndex.entries()) {
-        if (conversationId === action.fromConversationId) {
-          nextExternalIndex.set(externalId, action.toConversationId)
-        }
-      }
-      if (merged.externalId) {
-        nextExternalIndex.set(merged.externalId, action.toConversationId)
-      }
+      const nextExternalIndex = rebuildExternalIdIndex(
+        nextByConversationId,
+        state.conversationIdByExternalId
+      )
 
       // Drop both ids so the next select recomputes under the new conversation
       // id (keys rewrite with the new id). Never copy cache entries across.
@@ -3334,6 +3380,10 @@ function reducer(
         agentType
       )
       const nextExternalId = stamped.summary.external_id ?? current.externalId
+      const queuedIds = new Set(current.queuedOptimisticTurnIds ?? [])
+      const queuedOptimistic = current.optimisticTurns.filter((turn) =>
+        queuedIds.has(turn.id)
+      )
       const nextSession: ConversationRuntimeSession = {
         ...current,
         detail: stamped,
@@ -3344,7 +3394,8 @@ function reducer(
         // Preserve session stats not covered by the response when absent.
         sessionStats: stamped.session_stats ?? current.sessionStats,
         localTurns: [],
-        optimisticTurns: [],
+        optimisticTurns: queuedOptimistic,
+        queuedOptimisticTurnIds: queuedOptimistic.map((turn) => turn.id),
         liveMessage: null,
         backgroundTurns: retainedBackground,
         // Keep unresolved background settlements, bindings, cleanup, ACP errors.
@@ -3359,11 +3410,9 @@ function reducer(
       }
       const nextByConversationId = new Map(state.byConversationId)
       nextByConversationId.set(action.conversationId, nextSession)
-      const nextExternalIndex = upsertExternalIdIndex(
-        state.conversationIdByExternalId,
-        current.externalId,
-        nextExternalId,
-        action.conversationId
+      const nextExternalIndex = rebuildExternalIdIndex(
+        nextByConversationId,
+        state.conversationIdByExternalId
       )
       historicalTimelineCache.delete(action.conversationId)
       return {
@@ -3427,10 +3476,10 @@ function reducer(
       if (!current) return state
       const nextByConversationId = new Map(state.byConversationId)
       nextByConversationId.delete(action.conversationId)
-      const nextExternalIndex = new Map(state.conversationIdByExternalId)
-      if (current.externalId) {
-        nextExternalIndex.delete(current.externalId)
-      }
+      const nextExternalIndex = rebuildExternalIdIndex(
+        nextByConversationId,
+        state.conversationIdByExternalId
+      )
       // Drop the historical cache entry so session transcript isn't retained
       // after the conversation is removed from the store map.
       historicalTimelineCache.delete(action.conversationId)
@@ -3493,6 +3542,8 @@ export interface RuntimeActions {
     completionSeq: number
     providerTurnId: string
     activeTurnToken?: string | null
+    sessionId?: string | null
+    followerConversationIds?: readonly number[]
   }) => void
   /** Clear pending cancel key + stop coordinator timers (lifecycle table). */
   clearCancelReconcile: (conversationId: number) => void
@@ -3528,7 +3579,11 @@ export interface RuntimeActions {
     options?: { queuePending?: boolean }
   ) => void
   removeOptimisticTurn: (conversationId: number, id: string) => void
-  appendViewerUserTurn: (conversationId: number, turn: MessageTurn) => void
+  appendViewerUserTurn: (
+    conversationId: number,
+    turn: MessageTurn,
+    options?: { preserveCancelOwnership?: boolean }
+  ) => void
   applyBackgroundActivity: (
     conversationId: number,
     turns: MessageTurn[],
@@ -3651,6 +3706,142 @@ const recordedTurnOutcomeKeys = new Map<number, string>()
  * Keyed by `connectionId\0completionSeq` (not runtime conversation id).
  */
 const userStopNoCoordinatorCompletions = new Set<string>()
+
+interface UserStopCompletionFollowerFence {
+  runtimeConversationId: number
+  externalId: string | null
+  activeTurnToken: string | null
+  cancelGeneration: number
+}
+
+interface UserStopCompletionRegistry {
+  ownerRuntimeConversationId: number
+  connectionId: string
+  completionSeq: number
+  providerTurnId: string
+  sessionId: string | null
+  followers: Map<number, UserStopCompletionFollowerFence>
+}
+
+const userStopCompletionRegistries = new Map<
+  string,
+  UserStopCompletionRegistry
+>()
+
+function detachRuntimeFromUserStopCompletionRegistries(
+  runtimeConversationId: number,
+  transferOwner = true
+): void {
+  const transfers: Array<{
+    owner: UserStopCompletionFollowerFence
+    registry: UserStopCompletionRegistry
+    followers: number[]
+  }> = []
+  for (const [completionKey, registry] of userStopCompletionRegistries) {
+    if (registry.ownerRuntimeConversationId === runtimeConversationId) {
+      userStopCompletionRegistries.delete(completionKey)
+      if (!transferOwner) continue
+      const candidates = [...registry.followers.values()].filter((fence) => {
+        const session = useConversationRuntimeStore
+          .getState()
+          .byConversationId.get(fence.runtimeConversationId)
+        if (!session || session.externalId !== fence.externalId) return false
+        if (
+          registry.sessionId != null &&
+          session.externalId != null &&
+          session.externalId !== registry.sessionId
+        ) {
+          return false
+        }
+        if (
+          recordedTurnOutcomeKeys.get(fence.runtimeConversationId) !==
+            completionKey ||
+          getCancelGeneration(fence.runtimeConversationId) !==
+            fence.cancelGeneration
+        ) {
+          return false
+        }
+        if (
+          fence.activeTurnToken != null &&
+          session.activeTurnToken != null &&
+          session.activeTurnToken !== fence.activeTurnToken
+        ) {
+          return false
+        }
+        return (
+          resolvePersistedConversationId(session, fence.runtimeConversationId) >
+          0
+        )
+      })
+      candidates.sort((a, b) => {
+        const rank = (fence: UserStopCompletionFollowerFence) => {
+          const session = useConversationRuntimeStore
+            .getState()
+            .byConversationId.get(fence.runtimeConversationId)
+          const persistedId = resolvePersistedConversationId(
+            session,
+            fence.runtimeConversationId
+          )
+          return fence.runtimeConversationId > 0 &&
+            fence.runtimeConversationId === persistedId
+            ? 0
+            : fence.runtimeConversationId > 0
+              ? 1
+              : 2
+        }
+        return (
+          rank(a) - rank(b) || a.runtimeConversationId - b.runtimeConversationId
+        )
+      })
+      const owner = candidates[0]
+      if (owner) {
+        transfers.push({
+          owner,
+          registry,
+          followers: candidates
+            .slice(1)
+            .map((fence) => fence.runtimeConversationId),
+        })
+      }
+    } else {
+      registry.followers.delete(runtimeConversationId)
+    }
+  }
+  for (const { owner, registry, followers } of transfers) {
+    useConversationRuntimeStore.getState().actions.startCancelReconcile({
+      conversationId: owner.runtimeConversationId,
+      connectionId: registry.connectionId,
+      completionSeq: registry.completionSeq,
+      providerTurnId: registry.providerTurnId,
+      activeTurnToken: owner.activeTurnToken,
+      sessionId: registry.sessionId,
+      followerConversationIds: followers,
+    })
+  }
+}
+
+function migrateUserStopCompletionRegistries(
+  fromConversationId: number,
+  toConversationId: number
+): void {
+  for (const registry of userStopCompletionRegistries.values()) {
+    if (registry.ownerRuntimeConversationId === fromConversationId) {
+      registry.ownerRuntimeConversationId = toConversationId
+    }
+    const follower = registry.followers.get(fromConversationId)
+    registry.followers.delete(fromConversationId)
+    if (registry.ownerRuntimeConversationId === toConversationId) {
+      registry.followers.delete(toConversationId)
+      continue
+    }
+    if (!follower) continue
+    registry.followers.set(toConversationId, {
+      ...follower,
+      runtimeConversationId: toConversationId,
+      cancelGeneration: getCancelGeneration(toConversationId),
+    })
+  }
+}
 
 function userStopCompletionIdentityKey(
   connectionId: string,
@@ -3887,6 +4078,23 @@ export function isStaleUserStopEnvelope(conversationId: number): boolean {
   return getCancelGeneration(runtimeId) !== owned.cancelGeneration
 }
 
+/** Whether this runtime still owns the exact turn snapshotted at Cancel. */
+export function hasCurrentUserStopTurnOwnership(
+  conversationId: number,
+  activeTurnToken: string | null
+): boolean {
+  const runtimeId =
+    resolveRuntimeConversationIdForOwnership(conversationId) ?? conversationId
+  const owned = userStopOwnershipById.get(runtimeId)
+  return (
+    owned != null &&
+    activeTurnToken != null &&
+    owned.activeTurnToken === activeTurnToken &&
+    useConversationRuntimeStore.getState().byConversationId.has(runtimeId) &&
+    getCancelGeneration(runtimeId) === owned.cancelGeneration
+  )
+}
+
 /** Token to fence cancel reconcile / outcome for the cancelled completion. */
 export function getUserStopFenceToken(
   conversationId: number
@@ -3971,6 +4179,90 @@ function rekeyCancelReconcileRuntime(
  * mutable identity so mid-flight rekey still applies under the post-migration
  * conversation id. `attemptIndex` is the delay slot being spent.
  */
+function reconcileCancelledTurnWithFollowers(
+  runtime: CancelReconcileRuntime,
+  detail: DbConversationDetail
+): number[] {
+  const completionKey = userStopCompletionIdentityKey(
+    runtime.key.connectionId,
+    runtime.key.completionSeq
+  )
+  const registry = userStopCompletionRegistries.get(completionKey)
+  const appliedFollowers: number[] = []
+
+  useConversationRuntimeStore.setState((state) => {
+    let next = reducer(state, {
+      type: "RECONCILE_CANCELLED_TURN",
+      conversationId: runtime.conversationId,
+      detail,
+      key: runtime.key,
+    })
+    if (
+      !registry ||
+      registry.ownerRuntimeConversationId !== runtime.conversationId
+    ) {
+      return next
+    }
+
+    for (const fence of registry.followers.values()) {
+      const current = next.byConversationId.get(fence.runtimeConversationId)
+      if (!current) continue
+      if (current.externalId !== fence.externalId) continue
+      if (
+        registry.sessionId != null &&
+        current.externalId != null &&
+        current.externalId !== registry.sessionId
+      ) {
+        continue
+      }
+      if (
+        recordedTurnOutcomeKeys.get(fence.runtimeConversationId) !==
+        completionKey
+      ) {
+        continue
+      }
+      if (
+        getCancelGeneration(fence.runtimeConversationId) !==
+        fence.cancelGeneration
+      ) {
+        continue
+      }
+      if (
+        fence.activeTurnToken != null &&
+        current.activeTurnToken != null &&
+        current.activeTurnToken !== fence.activeTurnToken
+      ) {
+        continue
+      }
+
+      const followerKey: CancelCompletionKey = {
+        ...runtime.key,
+        conversationId: fence.runtimeConversationId,
+        activeTurnToken: fence.activeTurnToken,
+        cancelGeneration: fence.cancelGeneration,
+      }
+      next = reducer(next, {
+        type: "START_CANCEL_RECONCILE",
+        conversationId: fence.runtimeConversationId,
+        key: followerKey,
+      })
+      next = reducer(next, {
+        type: "RECONCILE_CANCELLED_TURN",
+        conversationId: fence.runtimeConversationId,
+        detail,
+        key: followerKey,
+      })
+      appliedFollowers.push(fence.runtimeConversationId)
+    }
+    return next
+  })
+
+  if (registry?.ownerRuntimeConversationId === runtime.conversationId) {
+    userStopCompletionRegistries.delete(completionKey)
+  }
+  return appliedFollowers
+}
+
 function runCancelReconcileAttempt(
   runtime: CancelReconcileRuntime,
   attemptIndex: number
@@ -4012,17 +4304,16 @@ function runCancelReconcileAttempt(
         }
         return
       }
-      // Fence matched — apply only via RECONCILE_CANCELLED_TURN.
-      useConversationRuntimeStore.setState((state) =>
-        reducer(state, {
-          type: "RECONCILE_CANCELLED_TURN",
-          conversationId: runtime.conversationId,
-          detail,
-          key: runtime.key,
-        })
+      // Fence matched — apply once to the owner and every unchanged follower.
+      const appliedFollowers = reconcileCancelledTurnWithFollowers(
+        runtime,
+        detail
       )
       stopCancelReconcileTimers(runtime.conversationId)
       bumpCancelGeneration(runtime.conversationId)
+      for (const followerConversationId of appliedFollowers) {
+        bumpCancelGeneration(followerConversationId)
+      }
     })
     .catch(() => {
       if (runtime.cancelled) return
@@ -4093,6 +4384,12 @@ function scheduleCancelReconcileAttempt(
 function finishCancelReconcileExhausted(runtime: CancelReconcileRuntime): void {
   if (runtime.cancelled) return
   const conversationId = runtime.conversationId
+  userStopCompletionRegistries.delete(
+    userStopCompletionIdentityKey(
+      runtime.key.connectionId,
+      runtime.key.completionSeq
+    )
+  )
   stopCancelReconcileTimers(conversationId)
   stopSoftFenceTimer(conversationId)
   bumpCancelGeneration(conversationId)
@@ -5099,6 +5396,7 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
     stopCancelReconcileTimers(conversationId)
     stopSoftFenceTimer(conversationId)
     bumpCancelGeneration(conversationId)
+    detachRuntimeFromUserStopCompletionRegistries(conversationId, false)
     dispatch({ type: "CLEAR_CANCEL_RECONCILE", conversationId })
     dispatch({ type: "CLEAR_CANCEL_SUPPRESS_FLAGS", conversationId })
   }
@@ -5112,18 +5410,9 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
     const { conversationId, connectionId, completionSeq, outcome } = params
     if (!get().byConversationId.has(conversationId)) return "skipped"
     const outcomeKey = `${connectionId}\0${completionSeq}`
-    // Idempotent across runtime-key migrate: key may already live on this id
-    // or on any sibling that recorded the same completion identity.
+    // Idempotent per runtime. Observer aliases each own a visible outcome.
     if (recordedTurnOutcomeKeys.get(conversationId) === outcomeKey) {
       return "duplicate"
-    }
-    for (const existing of recordedTurnOutcomeKeys.values()) {
-      if (existing === outcomeKey) {
-        // Same completion already recorded under another runtime id (e.g. pre-
-        // migrate). Mirror the key onto this id without a second footer.
-        recordedTurnOutcomeKeys.set(conversationId, outcomeKey)
-        return "duplicate"
-      }
     }
     recordedTurnOutcomeKeys.set(conversationId, outcomeKey)
     dispatch({
@@ -5142,6 +5431,8 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
     completionSeq: number
     providerTurnId: string
     activeTurnToken?: string | null
+    sessionId?: string | null
+    followerConversationIds?: readonly number[]
   }): void => {
     const {
       conversationId,
@@ -5149,6 +5440,8 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
       completionSeq,
       providerTurnId,
       activeTurnToken: activeTurnTokenOpt,
+      sessionId,
+      followerConversationIds = [],
     } = params
     const session = get().byConversationId.get(conversationId)
     if (!session) return
@@ -5160,6 +5453,33 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
     if (!providerTurnId) return
     const persistedId = resolvePersistedConversationId(session, conversationId)
     if (!(persistedId > 0)) return
+
+    const completionKey = userStopCompletionIdentityKey(
+      connectionId,
+      completionSeq
+    )
+    const followers = new Map<number, UserStopCompletionFollowerFence>()
+    for (const followerConversationId of followerConversationIds) {
+      if (followerConversationId === conversationId) continue
+      const follower = get().byConversationId.get(followerConversationId)
+      if (!follower) continue
+      followers.set(followerConversationId, {
+        runtimeConversationId: followerConversationId,
+        externalId: follower.externalId,
+        activeTurnToken:
+          userStopOwnershipById.get(followerConversationId)?.activeTurnToken ??
+          follower.activeTurnToken,
+        cancelGeneration: getCancelGeneration(followerConversationId),
+      })
+    }
+    userStopCompletionRegistries.set(completionKey, {
+      ownerRuntimeConversationId: conversationId,
+      connectionId,
+      completionSeq,
+      providerTurnId,
+      sessionId: sessionId ?? session.externalId,
+      followers,
+    })
 
     // Idempotent when the same completion is already coordinating.
     const existing = session.pendingCancel
@@ -5896,6 +6216,7 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
         stopCancelReconcileTimers(conversationId)
         stopSoftFenceTimer(conversationId)
         bumpCancelGeneration(conversationId)
+        detachRuntimeFromUserStopCompletionRegistries(conversationId)
       }
       dispatch({
         type: "APPEND_OPTIMISTIC_TURN",
@@ -5907,18 +6228,21 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
     },
     removeOptimisticTurn: (conversationId, id) =>
       dispatch({ type: "REMOVE_OPTIMISTIC_TURN", conversationId, id }),
-    appendViewerUserTurn: (conversationId, turn) => {
+    appendViewerUserTurn: (conversationId, turn, options) => {
       const sessionBefore = get().byConversationId.get(conversationId)
       // Exact-id sender-echo must keep cancel timers + ownership. Every other
       // path is a real co-controller/viewer prompt (visible append or
       // same-text content-dedup under a new id) and must invalidate even when
       // pendingCancel is still null (Stop before typed user_stop envelope).
+      // The provider's already-admitted coalesced user_stop projection is the
+      // exception: invalidating here would make that same terminal stale.
       const exactIdEcho = isExactIdViewerUserEcho(sessionBefore, turn.id)
       dispatch({ type: "APPEND_VIEWER_USER_TURN", conversationId, turn })
-      if (!exactIdEcho) {
+      if (!exactIdEcho && !options?.preserveCancelOwnership) {
         stopCancelReconcileTimers(conversationId)
         stopSoftFenceTimer(conversationId)
         bumpCancelGeneration(conversationId)
+        detachRuntimeFromUserStopCompletionRegistries(conversationId)
       }
     },
     applyBackgroundActivity: (
@@ -5974,6 +6298,7 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
         stopCancelReconcileTimers(conversationId)
         stopSoftFenceTimer(conversationId)
         bumpCancelGeneration(conversationId)
+        detachRuntimeFromUserStopCompletionRegistries(conversationId)
       }
       dispatch({ type: "SET_EXTERNAL_ID", conversationId, externalId })
     },
@@ -5983,6 +6308,7 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
         stopCancelReconcileTimers(conversationId)
         stopSoftFenceTimer(conversationId)
         bumpCancelGeneration(conversationId)
+        detachRuntimeFromUserStopCompletionRegistries(conversationId)
       }
       if (dbConversationId != null && conversationId !== dbConversationId) {
         aliasRequestUsageIds(conversationId, dbConversationId)
@@ -6050,6 +6376,7 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
       if (fromOwnership) {
         userStopOwnershipById.set(toConversationId, fromOwnership)
       }
+      migrateUserStopCompletionRegistries(fromConversationId, toConversationId)
 
       // Migrate recorded outcome idempotency keys to both ids (duplicate
       // envelope after migrate must not second footer on either key).
@@ -6123,6 +6450,7 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
       bumpCancelGeneration(conversationId)
       recordedTurnOutcomeKeys.delete(conversationId)
       userStopOwnershipById.delete(conversationId)
+      detachRuntimeFromUserStopCompletionRegistries(conversationId)
       // Stop a viewer-sync poll whose tab just closed (its own tick guard would
       // also stop it on the next fire, but cancelling now drops the pending
       // timer immediately).
@@ -6137,6 +6465,7 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
       cancelGenerationById.clear()
       recordedTurnOutcomeKeys.clear()
       userStopNoCoordinatorCompletions.clear()
+      userStopCompletionRegistries.clear()
       cancelReconcileRuntimes.clear()
       historyPageGeneration.clear()
       dispatch({ type: "RESET" })
@@ -6250,6 +6579,19 @@ export function completeLiveTranscriptTurn(
   const sourceLiveMessage =
     liveMessage !== undefined ? liveMessage : runtimeBefore?.liveMessage
   const live = liveTranscriptStore.getConversation(conversationId)
+  if (runtimeBefore && live == null) {
+    const queuedIds = new Set(runtimeBefore.queuedOptimisticTurnIds ?? [])
+    const hasInFlightOptimistic = runtimeBefore.optimisticTurns.some(
+      (turn) => !queuedIds.has(turn.id)
+    )
+    if (
+      runtimeBefore.liveMessage === null &&
+      runtimeBefore.syncState === "idle" &&
+      !hasInFlightOptimistic
+    ) {
+      return
+    }
+  }
   if (live) {
     liveTranscriptStore.markCompleting(conversationId, live.messageId)
     // Complete each text partition and cache by exact canonical text for
@@ -6299,6 +6641,7 @@ export function resetConversationRuntimeStore(): void {
   recordedTurnOutcomeKeys.clear()
   userStopOwnershipById.clear()
   userStopNoCoordinatorCompletions.clear()
+  userStopCompletionRegistries.clear()
   clearSoftFenceTimersAll()
   cancelAllDetailSyncs()
   // cancelAllDetailSyncs cancels runtimes; ensure map is empty after.

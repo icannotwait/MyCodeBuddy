@@ -14,6 +14,7 @@ import type { BackgroundOverlayEntry } from "@/stores/conversation-runtime-store
 import {
   buildStreamingTurnsFromLiveMessage,
   completeLiveTranscriptTurn,
+  getConversationIdByExternalIdFromStore,
   resetConversationRuntimeStore,
   selectDelegationActivities,
   selectHistoricalTimelineTurns,
@@ -238,6 +239,41 @@ describe("completeLiveTranscriptTurn", () => {
       messageId: "latest",
       status: "completing",
     })
+  })
+
+  it("silently ignores a recovery completion after the turn was promoted", () => {
+    const final = liveMessage("latest", "latest Codex reply")
+    seedRuntimeSession({
+      optimisticTurns: [userTurn("u1")],
+      liveMessage: final,
+      syncState: "awaiting_persist",
+    })
+    liveTranscriptStore.rebuild(CID, "owner-conn", final, 3)
+
+    completeLiveTranscriptTurn(CID, final)
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+    completeLiveTranscriptTurn(CID, final)
+
+    expect(warn).not.toHaveBeenCalled()
+    expect(
+      useConversationRuntimeStore
+        .getState()
+        .byConversationId.get(CID)
+        ?.localTurns.filter((turn) => turn.role === "assistant")
+    ).toHaveLength(1)
+  })
+})
+
+describe("external session index", () => {
+  it("re-elects an alias when late DB binding makes it durable", () => {
+    const { actions } = useConversationRuntimeStore.getState()
+    actions.setExternalId(-1, "shared-session")
+    actions.setExternalId(-2, "shared-session")
+    expect(getConversationIdByExternalIdFromStore("shared-session")).toBe(-1)
+
+    actions.setDbConversationId(-2, 42)
+
+    expect(getConversationIdByExternalIdFromStore("shared-session")).toBe(-2)
   })
 })
 

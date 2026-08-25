@@ -1,6 +1,7 @@
 import type {
   AcceptedConnectionFrame,
   AcceptedEventFrame,
+  AcpEventDeliverySource,
   DesktopAcpEventBatch,
   EventEnvelope,
   SequenceGap,
@@ -27,6 +28,7 @@ export interface EventIngestorDeps {
 interface PendingItem {
   deliveryId: number
   deliverySource: "desktop" | "mapped"
+  eventDeliverySource: AcpEventDeliverySource
   event: EventEnvelope
   /** Pre-resolved context key from `pushMapped` (attach path). */
   mappedKey?: string
@@ -107,6 +109,7 @@ export class EventIngestor {
       this.pending.push({
         deliveryId: batch.batch_id,
         deliverySource: "desktop",
+        eventDeliverySource: "desktop",
         event: prepareEventEnvelope(event),
       })
     }
@@ -117,7 +120,11 @@ export class EventIngestor {
    * Attach/replay path: events already mapped to a context key, with no
    * desktop batch id — allocate a process-local synthetic delivery id.
    */
-  pushMapped(contextKey: string, events: readonly EventEnvelope[]): void {
+  pushMapped(
+    contextKey: string,
+    events: readonly EventEnvelope[],
+    eventDeliverySource: AcpEventDeliverySource = "untrusted_replay"
+  ): void {
     if (this.disposed) return
     if (events.length === 0) return
     this.syntheticDeliveryId += 1
@@ -125,7 +132,9 @@ export class EventIngestor {
     for (const event of events) {
       this.pending.push({
         deliveryId,
-        deliverySource: "mapped",
+        deliverySource:
+          eventDeliverySource === "desktop" ? "desktop" : "mapped",
+        eventDeliverySource,
         event: prepareEventEnvelope(event),
         mappedKey: contextKey,
       })
@@ -278,6 +287,12 @@ export class EventIngestor {
         contextKey: state.contextKey,
         connectionId,
         deliverySource: state.deliverySource,
+        eventDeliverySourceBySeq: new Map(
+          state.acceptedItems.map((item) => [
+            item.event.seq,
+            item.eventDeliverySource,
+          ])
+        ),
         deliveryIds: state.deliveryIds,
         applyEvents: compactAdjacentDeltas(state.accepted),
         rawEvents: state.accepted,

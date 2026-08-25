@@ -41,7 +41,12 @@ export type AttachErrorCode = "snapshot_budget_exceeded" | "oversized_frame"
  */
 export interface AttachHandlers {
   onSnapshot(snapshot: LiveSessionSnapshot, eventSeq: number): void
-  onReplay(events: EventEnvelope[], highWaterSeq: number): void
+  onReplay(
+    events: EventEnvelope[],
+    highWaterSeq: number,
+    /** Cursor sent on the attach that produced this replay; absent is untrusted. */
+    resumedFromSeq?: number
+  ): void
   onEvent(envelope: EventEnvelope): void
   onDetached(reason: AttachDetachReason): void
   onAttachError(code: AttachErrorCode, retryable: boolean): void

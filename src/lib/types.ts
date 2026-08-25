@@ -3289,6 +3289,12 @@ export interface DesktopAcpEventHandlers {
   onFailure: (failure: DesktopDeliveryFailure) => void
 }
 
+export type AcpEventDeliverySource =
+  | "desktop"
+  | "live"
+  | "resume_replay"
+  | "untrusted_replay"
+
 /**
  * Per-connection slice of one accepted ingestor frame.
  * `applyEvents` may be compacted; `rawEvents` preserves originals.
@@ -3297,6 +3303,8 @@ export interface AcceptedConnectionFrame {
   contextKey: string
   connectionId: string
   deliverySource?: "desktop" | "mapped" | "mixed"
+  /** Exact delivery provenance retained per accepted envelope sequence. */
+  eventDeliverySourceBySeq?: ReadonlyMap<number, AcpEventDeliverySource>
   deliveryIds: readonly number[]
   applyEvents: readonly EventEnvelope[]
   rawEvents: readonly EventEnvelope[]

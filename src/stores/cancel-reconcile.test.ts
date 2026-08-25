@@ -274,6 +274,33 @@ describe("FE1 complete live buffer reconciles without duplication", () => {
     const assistants = s.detail?.turns.filter((t) => t.role === "assistant")
     expect(assistants?.filter((t) => t.id === "a1")).toHaveLength(1)
   })
+
+  it("preserves a queued future prompt when authoritative detail replaces the cancelled turn", async () => {
+    const queued = userTurn("u2", "future prompt")
+    seed({
+      localTurns: [
+        userTurn("u1"),
+        assistantTurn("a1", "cancelled local", interruptedOutcome()),
+      ],
+      optimisticTurns: [queued],
+      queuedOptimisticTurnIds: [queued.id],
+      lastTurnOwned: true,
+    })
+    startCoordinator()
+    mockGet.mockResolvedValueOnce(
+      detail([
+        userTurn("u1"),
+        assistantTurn("a1", "cancelled persisted", interruptedOutcome()),
+      ])
+    )
+
+    await vi.advanceTimersByTimeAsync(CANCEL_RECONCILE_DELAYS_MS[0])
+    await Promise.resolve()
+
+    expect(session().localTurns).toEqual([])
+    expect(session().optimisticTurns).toEqual([queued])
+    expect(session().queuedOptimisticTurnIds).toEqual([queued.id])
+  })
 })
 
 describe("cancel reconcile history window", () => {

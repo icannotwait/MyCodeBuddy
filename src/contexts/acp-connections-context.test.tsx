@@ -15,6 +15,7 @@ import {
   __getWritableConnectionsCloneCount,
 } from "@/contexts/acp-connections-context"
 import type {
+  DbConversationDetail,
   DbConversationSummary,
   DesktopAcpEventBatch,
   DesktopDeliveryFailure,
@@ -374,6 +375,1713 @@ describe("AcpConnectionsProvider shared server roots", () => {
       leaseId: "lease-1",
     })
   })
+
+  it("does not promote another client's optimistic turn while the shared owner completes", async () => {
+    const { useConversationRuntimeStore, resetConversationRuntimeStore } =
+      await import("@/stores/conversation-runtime-store")
+    resetConversationRuntimeStore()
+    const runtimeActions = useConversationRuntimeStore.getState().actions
+    runtimeActions.setExternalId(42, "sess")
+    runtimeActions.appendOptimisticTurn(
+      42,
+      {
+        id: "message-b",
+        role: "user",
+        blocks: [{ type: "text", text: "queued turn B" }],
+        timestamp: "2026-08-25T07:31:50.000Z",
+      },
+      "message-b"
+    )
+
+    try {
+      h.isDesktop = false
+      await mountProvider()
+      await act(async () => {
+        await h.actions!.connect(TAB, "claude_code", "/work", "sess", 42)
+      })
+      h.actions!.registerLiveMessageSink(TAB, (message, isLive) => {
+        runtimeActions.setLiveMessage(42, message, isLive)
+        return (
+          useConversationRuntimeStore.getState().byConversationId.get(42)
+            ?.liveMessage === message
+        )
+      })
+      const handlers = latestAttachHandlers()
+      emitAcpEvent(handlers, {
+        connection_id: "conn",
+        seq: 1,
+        type: "prompt_dispatch_started",
+        generation: 1,
+        turn: {
+          turn_id: "turn-a",
+          queue_item_id: "queue-a",
+          enqueue_seq: 1,
+          client_message_id: "message-a",
+          stop_requested: false,
+        },
+      })
+      emitAcpEvent(handlers, {
+        connection_id: "conn",
+        seq: 2,
+        type: "status_changed",
+        status: "prompting",
+      })
+      emitAcpEvent(handlers, content("conn", 3, "reply A"))
+      emitAcpEvent(handlers, {
+        connection_id: "conn",
+        seq: 4,
+        type: "turn_complete",
+        session_id: "sess",
+        stop_reason: "end_turn",
+        mark_awaiting_reply: false,
+      })
+
+      const runtime = useConversationRuntimeStore
+        .getState()
+        .byConversationId.get(42)
+      expect(runtime?.optimisticTurns.map((turn) => turn.id)).toEqual([
+        "message-b",
+      ])
+      expect(runtime?.queuedOptimisticTurnIds).toEqual(["message-b"])
+      expect(
+        runtime?.localTurns
+          .filter((turn) => turn.role === "assistant")
+          .map((turn) => turn.blocks)
+      ).toEqual([[{ type: "text", text: "reply A" }]])
+    } finally {
+      resetConversationRuntimeStore()
+    }
+  })
+
+  it("parks a future shared optimistic turn before a user-stop completion", async () => {
+    const {
+      noteUserStopTurnOwnership,
+      useConversationRuntimeStore,
+      resetConversationRuntimeStore,
+    } = await import("@/stores/conversation-runtime-store")
+    resetConversationRuntimeStore()
+    const runtimeActions = useConversationRuntimeStore.getState().actions
+    runtimeActions.setExternalId(42, "sess")
+    runtimeActions.appendOptimisticTurn(
+      42,
+      {
+        id: "message-b",
+        role: "user",
+        blocks: [{ type: "text", text: "queued turn B" }],
+        timestamp: "2026-08-25T07:31:50.000Z",
+      },
+      "message-b"
+    )
+    noteUserStopTurnOwnership(42)
+
+    try {
+      h.isDesktop = false
+      await mountProvider()
+      await act(async () => {
+        await h.actions!.connect(TAB, "claude_code", "/work", "sess", 42)
+      })
+      h.actions!.registerLiveMessageSink(TAB, (message, isLive) => {
+        runtimeActions.setLiveMessage(42, message, isLive)
+        return (
+          useConversationRuntimeStore.getState().byConversationId.get(42)
+            ?.liveMessage === message
+        )
+      })
+      const handlers = latestAttachHandlers()
+      emitAcpEvent(handlers, {
+        connection_id: "conn",
+        seq: 1,
+        type: "prompt_dispatch_started",
+        generation: 1,
+        turn: {
+          turn_id: "turn-a",
+          queue_item_id: "queue-a",
+          enqueue_seq: 1,
+          client_message_id: "message-a",
+          stop_requested: true,
+        },
+      })
+      emitAcpEvent(handlers, {
+        connection_id: "conn",
+        seq: 2,
+        type: "status_changed",
+        status: "prompting",
+      })
+      emitAcpEvent(handlers, content("conn", 3, "cancelled reply A"))
+      emitAcpEvent(handlers, {
+        connection_id: "conn",
+        seq: 4,
+        type: "turn_complete",
+        session_id: "sess",
+        stop_reason: "cancelled",
+        mark_awaiting_reply: false,
+        termination_source: "user_stop",
+      })
+
+      const runtime = useConversationRuntimeStore
+        .getState()
+        .byConversationId.get(42)
+      expect(runtime?.optimisticTurns.map((turn) => turn.id)).toEqual([
+        "message-b",
+      ])
+      expect(runtime?.queuedOptimisticTurnIds).toEqual(["message-b"])
+      expect(
+        runtime?.localTurns
+          .filter((turn) => turn.role === "assistant")
+          .map((turn) => turn.blocks)
+      ).toEqual([[{ type: "text", text: "cancelled reply A" }]])
+    } finally {
+      resetConversationRuntimeStore()
+    }
+  })
+
+  it("completes an admitted shared turn across a sink registration gap", async () => {
+    const { useConversationRuntimeStore, resetConversationRuntimeStore } =
+      await import("@/stores/conversation-runtime-store")
+    resetConversationRuntimeStore()
+    const runtimeActions = useConversationRuntimeStore.getState().actions
+    runtimeActions.setExternalId(42, "sess")
+    runtimeActions.appendOptimisticTurn(
+      42,
+      {
+        id: "message-b",
+        role: "user",
+        blocks: [{ type: "text", text: "future turn B" }],
+        timestamp: "2026-08-25T07:31:50.000Z",
+      },
+      "message-b"
+    )
+
+    try {
+      h.isDesktop = false
+      await mountProvider()
+      await act(async () => {
+        await h.actions!.connect(TAB, "claude_code", "/work", "sess", 42)
+      })
+      const handlers = latestAttachHandlers()
+      act(() => {
+        handlers.onReplay(
+          [
+            {
+              connection_id: "conn",
+              seq: 1,
+              type: "prompt_dispatch_started",
+              generation: 1,
+              turn: {
+                turn_id: "turn-a",
+                queue_item_id: "queue-a",
+                enqueue_seq: 1,
+                client_message_id: "message-a",
+                stop_requested: false,
+              },
+            },
+            {
+              connection_id: "conn",
+              seq: 2,
+              type: "user_message",
+              message_id: "message-a",
+              blocks: [{ type: "text", text: "turn A" }],
+            },
+            {
+              connection_id: "conn",
+              seq: 3,
+              type: "status_changed",
+              status: "prompting",
+            },
+            content("conn", 4, "reply A"),
+            {
+              connection_id: "conn",
+              seq: 5,
+              type: "turn_complete",
+              session_id: "sess",
+              stop_reason: "end_turn",
+              mark_awaiting_reply: false,
+            },
+          ],
+          5,
+          0
+        )
+      })
+
+      expect(
+        useConversationRuntimeStore
+          .getState()
+          .byConversationId.get(42)
+          ?.localTurns.map((turn) => ({
+            role: turn.role,
+            blocks: turn.blocks,
+          }))
+      ).toEqual([
+        { role: "user", blocks: [{ type: "text", text: "turn A" }] },
+        { role: "assistant", blocks: [{ type: "text", text: "reply A" }] },
+      ])
+      expect(
+        useConversationRuntimeStore
+          .getState()
+          .byConversationId.get(42)
+          ?.optimisticTurns.map((turn) => turn.id)
+      ).toEqual(["message-b"])
+      expect(
+        useConversationRuntimeStore.getState().byConversationId.get(42)
+          ?.queuedOptimisticTurnIds
+      ).toEqual(["message-b"])
+      expect(h.store!.getConnection(TAB)).toMatchObject({
+        acceptedCompletionMessageId: expect.any(String),
+        acceptedCompletionRuntimeConversationIds: [42],
+      })
+
+      const canonical = vi.fn((message: LiveMessage, isLive: boolean) => {
+        runtimeActions.setLiveMessage(42, message, isLive)
+        return (
+          useConversationRuntimeStore.getState().byConversationId.get(42)
+            ?.liveMessage === message
+        )
+      })
+      h.actions!.registerLiveSinks(TAB, {
+        runtimeConversationId: 42,
+        canonical,
+      })
+      expect(canonical).toHaveBeenCalledTimes(1)
+      expect(
+        useConversationRuntimeStore
+          .getState()
+          .byConversationId.get(42)
+          ?.localTurns.map((turn) => turn.role)
+      ).toEqual(["user", "assistant"])
+    } finally {
+      resetConversationRuntimeStore()
+    }
+  })
+
+  it.each([
+    { label: "without a sink", registerSink: false, queuePending: false },
+    {
+      label: "with a registered sink",
+      registerSink: true,
+      queuePending: false,
+    },
+    {
+      label: "from a queued dispatch with a registered sink",
+      registerSink: true,
+      queuePending: true,
+    },
+  ])(
+    "completes a fresh mapped turn $label when history already exists",
+    async ({ registerSink, queuePending }) => {
+      const { useConversationRuntimeStore, resetConversationRuntimeStore } =
+        await import("@/stores/conversation-runtime-store")
+      resetConversationRuntimeStore()
+      const runtimeActions = useConversationRuntimeStore.getState().actions
+      runtimeActions.setExternalId(42, "sess")
+      runtimeActions.appendViewerUserTurn(42, {
+        id: "history-user",
+        role: "user",
+        blocks: [{ type: "text", text: "history prompt" }],
+        timestamp: "2026-08-25T07:30:00.000Z",
+      })
+      const historyReply: LiveMessage = {
+        id: "history-reply",
+        role: "assistant",
+        content: [{ type: "text", text: "history reply" }],
+        startedAt: Date.parse("2026-08-25T07:30:01.000Z"),
+      }
+      runtimeActions.setLiveMessage(42, historyReply, true)
+      runtimeActions.completeTurn(42, historyReply)
+      if (queuePending) {
+        runtimeActions.appendOptimisticTurn(
+          42,
+          {
+            id: "message-a",
+            role: "user",
+            blocks: [{ type: "text", text: "turn A" }],
+            timestamp: "2026-08-25T07:31:50.000Z",
+          },
+          "message-a",
+          { queuePending: true }
+        )
+      }
+
+      try {
+        h.isDesktop = false
+        await mountProvider()
+        await act(async () => {
+          await h.actions!.connect(TAB, "claude_code", "/work", "sess", 42)
+        })
+        if (registerSink) {
+          h.actions!.registerLiveSinks(TAB, {
+            runtimeConversationId: 42,
+            canonical: (message, isLive) => {
+              runtimeActions.setLiveMessage(42, message, isLive)
+              return (
+                useConversationRuntimeStore.getState().byConversationId.get(42)
+                  ?.liveMessage === message
+              )
+            },
+          })
+        }
+        const handlers = latestAttachHandlers()
+        act(() => {
+          handlers.onReplay(
+            [
+              {
+                connection_id: "conn",
+                seq: 1,
+                type: "prompt_dispatch_started",
+                generation: 1,
+                turn: {
+                  turn_id: "turn-a",
+                  queue_item_id: "queue-a",
+                  enqueue_seq: 1,
+                  client_message_id: "message-a",
+                  stop_requested: false,
+                },
+              },
+              {
+                connection_id: "conn",
+                seq: 2,
+                type: "user_message",
+                message_id: "message-a",
+                blocks: [{ type: "text", text: "turn A" }],
+              },
+              {
+                connection_id: "conn",
+                seq: 3,
+                type: "status_changed",
+                status: "prompting",
+              },
+              content("conn", 4, "reply A"),
+              {
+                connection_id: "conn",
+                seq: 5,
+                type: "turn_complete",
+                session_id: "sess",
+                stop_reason: "end_turn",
+                mark_awaiting_reply: false,
+              },
+            ],
+            5,
+            0
+          )
+        })
+
+        expect(
+          useConversationRuntimeStore
+            .getState()
+            .byConversationId.get(42)
+            ?.localTurns.map((turn) => ({
+              id: turn.id,
+              role: turn.role,
+              blocks: turn.blocks,
+            }))
+        ).toEqual([
+          {
+            id: "history-user",
+            role: "user",
+            blocks: [{ type: "text", text: "history prompt" }],
+          },
+          {
+            id: "live-42-history-reply",
+            role: "assistant",
+            blocks: [{ type: "text", text: "history reply" }],
+          },
+          {
+            id: "message-a",
+            role: "user",
+            blocks: [{ type: "text", text: "turn A" }],
+          },
+          {
+            id: expect.stringMatching(/^live-42-/),
+            role: "assistant",
+            blocks: [{ type: "text", text: "reply A" }],
+          },
+        ])
+        expect(h.store!.getConnection(TAB)).toMatchObject({
+          acceptedCompletionMessageId: expect.any(String),
+          acceptedCompletionRuntimeConversationIds: [42],
+        })
+        expect(
+          useConversationRuntimeStore.getState().byConversationId.get(42)
+            ?.optimisticTurns
+        ).toEqual([])
+        expect(
+          useConversationRuntimeStore.getState().byConversationId.get(42)
+            ?.queuedOptimisticTurnIds
+        ).toEqual([])
+      } finally {
+        resetConversationRuntimeStore()
+      }
+    }
+  )
+
+  it.each(
+    [false, true].flatMap((registerSink) =>
+      (["empty", "tool-only", "partial"] as const).map((replayKind) => ({
+        label: `${replayKind} ${registerSink ? "with" : "without"} a sink`,
+        registerSink,
+        replayKind,
+      }))
+    )
+  )(
+    "keeps a parser-id settled replay $label",
+    async ({ registerSink, replayKind }) => {
+      const { useConversationRuntimeStore, resetConversationRuntimeStore } =
+        await import("@/stores/conversation-runtime-store")
+      resetConversationRuntimeStore()
+      const runtimeActions = useConversationRuntimeStore.getState().actions
+      runtimeActions.setExternalId(42, "sess")
+      const settledTurns = [
+        {
+          id: "parser-user-a",
+          role: "user" as const,
+          blocks: [{ type: "text" as const, text: "repeat prompt" }],
+          timestamp: "2026-08-25T07:30:00.000Z",
+        },
+        {
+          id: "parser-assistant-a",
+          role: "assistant" as const,
+          blocks: [
+            {
+              type: "text" as const,
+              text: "already persisted full reply",
+            },
+          ],
+          timestamp: "2026-08-25T07:30:01.000Z",
+        },
+      ]
+      useConversationRuntimeStore.setState((state) => {
+        const current = state.byConversationId.get(42)!
+        const byConversationId = new Map(state.byConversationId)
+        byConversationId.set(42, {
+          ...current,
+          detail: {
+            summary: {
+              id: 42,
+              folder_id: 1,
+              title: null,
+              title_locked: false,
+              auto_title_finalized: false,
+              agent_type: "claude_code",
+              status: "active",
+              awaiting_reply_token: null,
+              kind: "regular",
+              model: null,
+              git_branch: null,
+              external_id: "sess",
+              message_count: 2,
+              child_count: 0,
+              created_at: "2026-08-25T07:30:00.000Z",
+              updated_at: "2026-08-25T07:30:01.000Z",
+              pinned_at: null,
+            },
+            turns: settledTurns,
+          },
+        })
+        return { byConversationId }
+      })
+
+      try {
+        h.isDesktop = false
+        await mountProvider()
+        await act(async () => {
+          await h.actions!.connect(TAB, "claude_code", "/work", "sess", 42)
+        })
+        if (registerSink) {
+          h.actions!.registerLiveSinks(TAB, {
+            runtimeConversationId: 42,
+            canonical: (message, isLive) => {
+              runtimeActions.setLiveMessage(42, message, isLive)
+              return (
+                useConversationRuntimeStore.getState().byConversationId.get(42)
+                  ?.liveMessage === message
+              )
+            },
+          })
+        }
+
+        const outputEvents: EventEnvelope[] =
+          replayKind === "empty"
+            ? []
+            : replayKind === "partial"
+              ? [content("conn", 4, "already persisted")]
+              : [
+                  {
+                    connection_id: "conn",
+                    seq: 4,
+                    type: "tool_call",
+                    tool_call_id: "stale-tool",
+                    title: "Read",
+                    kind: "read",
+                    status: "completed",
+                    content: null,
+                    raw_input: '{"path":"old.txt"}',
+                    raw_output: "old output",
+                  },
+                ]
+        const terminalSeq = 4 + outputEvents.length
+        const handlers = latestAttachHandlers()
+        act(() => {
+          handlers.onReplay(
+            [
+              {
+                connection_id: "conn",
+                seq: 1,
+                type: "prompt_dispatch_started",
+                generation: 1,
+                turn: {
+                  turn_id: "turn-a",
+                  queue_item_id: "queue-a",
+                  enqueue_seq: 1,
+                  client_message_id: "message-a",
+                  stop_requested: false,
+                },
+              },
+              {
+                connection_id: "conn",
+                seq: 2,
+                type: "user_message",
+                message_id: "message-a",
+                blocks: [{ type: "text", text: "repeat prompt" }],
+              },
+              {
+                connection_id: "conn",
+                seq: 3,
+                type: "status_changed",
+                status: "prompting",
+              },
+              ...outputEvents,
+              {
+                connection_id: "conn",
+                seq: terminalSeq,
+                type: "turn_complete",
+                session_id: "sess",
+                stop_reason: "end_turn",
+                mark_awaiting_reply: false,
+              },
+            ],
+            terminalSeq
+          )
+        })
+
+        const runtime = useConversationRuntimeStore
+          .getState()
+          .byConversationId.get(42)
+        expect(runtime?.detail?.turns).toBe(settledTurns)
+        expect(runtime?.localTurns).toEqual([])
+        expect(runtime?.optimisticTurns).toEqual([])
+        expect(runtime?.liveMessage).toBeNull()
+        expect(h.store!.getConnection(TAB)).toMatchObject({
+          acceptedCompletionMessageId: null,
+          acceptedCompletionRuntimeConversationIds: null,
+        })
+      } finally {
+        resetConversationRuntimeStore()
+      }
+    }
+  )
+
+  it("does not authorize an untrusted settled replay for a runtime that mounts later", async () => {
+    const { useConversationRuntimeStore, resetConversationRuntimeStore } =
+      await import("@/stores/conversation-runtime-store")
+    resetConversationRuntimeStore()
+
+    try {
+      h.isDesktop = false
+      await mountProvider()
+      await act(async () => {
+        await h.actions!.connect(TAB, "claude_code", "/work", "sess", 42)
+      })
+      expect(
+        useConversationRuntimeStore.getState().byConversationId.has(42)
+      ).toBe(false)
+
+      const handlers = latestAttachHandlers()
+      act(() => {
+        handlers.onReplay(
+          [
+            {
+              connection_id: "conn",
+              seq: 1,
+              type: "prompt_dispatch_started",
+              generation: 1,
+              turn: {
+                turn_id: "turn-a",
+                queue_item_id: "queue-a",
+                enqueue_seq: 1,
+                client_message_id: "message-a",
+                stop_requested: false,
+              },
+            },
+            {
+              connection_id: "conn",
+              seq: 2,
+              type: "user_message",
+              message_id: "message-a",
+              blocks: [{ type: "text", text: "old prompt A" }],
+            },
+            {
+              connection_id: "conn",
+              seq: 3,
+              type: "status_changed",
+              status: "prompting",
+            },
+            content("conn", 4, "old reply A"),
+            {
+              connection_id: "conn",
+              seq: 5,
+              type: "turn_complete",
+              session_id: "sess",
+              stop_reason: "end_turn",
+              mark_awaiting_reply: false,
+            },
+          ],
+          5
+        )
+      })
+
+      const runtimeActions = useConversationRuntimeStore.getState().actions
+      runtimeActions.setExternalId(42, "sess")
+      const canonical = vi.fn((message: LiveMessage, isLive: boolean) => {
+        runtimeActions.setLiveMessage(42, message, isLive)
+        return (
+          useConversationRuntimeStore.getState().byConversationId.get(42)
+            ?.liveMessage === message
+        )
+      })
+      h.actions!.registerLiveSinks(TAB, {
+        runtimeConversationId: 42,
+        canonical,
+      })
+
+      expect(canonical).not.toHaveBeenCalled()
+      expect(
+        useConversationRuntimeStore.getState().byConversationId.get(42)
+          ?.liveMessage
+      ).toBeNull()
+      expect(h.store!.getConnection(TAB)).toMatchObject({
+        acceptedCompletionMessageId: null,
+        acceptedCompletionRuntimeConversationIds: null,
+      })
+    } finally {
+      resetConversationRuntimeStore()
+    }
+  })
+
+  it.each([
+    {
+      label: "ordinary",
+      stopReason: "end_turn" as const,
+      terminationSource: undefined,
+    },
+    {
+      label: "user-stop",
+      stopReason: "cancelled" as const,
+      terminationSource: "user_stop" as const,
+    },
+  ])(
+    "does not retain an accepted marker for an exact-owner untrusted $label replay",
+    async ({ stopReason, terminationSource }) => {
+      const {
+        noteUserStopTurnOwnership,
+        useConversationRuntimeStore,
+        resetConversationRuntimeStore,
+      } = await import("@/stores/conversation-runtime-store")
+      resetConversationRuntimeStore()
+      const runtimeActions = useConversationRuntimeStore.getState().actions
+      runtimeActions.setExternalId(42, "sess")
+      runtimeActions.appendOptimisticTurn(
+        42,
+        {
+          id: "message-a",
+          role: "user",
+          blocks: [{ type: "text", text: "current prompt A" }],
+          timestamp: "2026-08-25T07:31:50.000Z",
+        },
+        "message-a"
+      )
+      if (terminationSource === "user_stop") {
+        noteUserStopTurnOwnership(42)
+      }
+
+      try {
+        h.isDesktop = false
+        await mountProvider()
+        await act(async () => {
+          await h.actions!.connect(TAB, "claude_code", "/work", "sess", 42)
+        })
+
+        const handlers = latestAttachHandlers()
+        act(() => {
+          handlers.onReplay(
+            [
+              {
+                connection_id: "conn",
+                seq: 1,
+                type: "user_message",
+                message_id: "message-a",
+                blocks: [{ type: "text", text: "current prompt A" }],
+              },
+              {
+                connection_id: "conn",
+                seq: 2,
+                type: "status_changed",
+                status: "prompting",
+              },
+              content("conn", 3, "current reply A"),
+              {
+                connection_id: "conn",
+                seq: 4,
+                type: "turn_complete",
+                session_id: "sess",
+                stop_reason: stopReason,
+                mark_awaiting_reply: false,
+                ...(terminationSource
+                  ? {
+                      termination_source: terminationSource,
+                      provider_turn_id: null,
+                    }
+                  : {}),
+              },
+            ],
+            4
+          )
+        })
+
+        expect(
+          useConversationRuntimeStore
+            .getState()
+            .byConversationId.get(42)
+            ?.localTurns.map((turn) => turn.role)
+        ).toEqual(["user", "assistant"])
+        expect(h.store!.getConnection(TAB)).toMatchObject({
+          acceptedCompletionMessageId: null,
+          acceptedCompletionRuntimeConversationIds: null,
+        })
+
+        runtimeActions.removeConversation(42)
+        runtimeActions.setExternalId(42, "sess")
+        const canonical = vi.fn((message: LiveMessage, isLive: boolean) => {
+          runtimeActions.setLiveMessage(42, message, isLive)
+          return true
+        })
+        h.actions!.registerLiveSinks(TAB, {
+          runtimeConversationId: 42,
+          canonical,
+        })
+
+        expect(canonical).not.toHaveBeenCalled()
+        expect(
+          useConversationRuntimeStore.getState().byConversationId.get(42)
+            ?.localTurns
+        ).toEqual([])
+      } finally {
+        resetConversationRuntimeStore()
+      }
+    }
+  )
+
+  it("does not let an untrusted replay consume a different optimistic prompt", async () => {
+    const { useConversationRuntimeStore, resetConversationRuntimeStore } =
+      await import("@/stores/conversation-runtime-store")
+    resetConversationRuntimeStore()
+    const runtimeActions = useConversationRuntimeStore.getState().actions
+    runtimeActions.setExternalId(42, "codex-session")
+    runtimeActions.appendOptimisticTurn(
+      42,
+      {
+        id: "message-b",
+        role: "user",
+        blocks: [{ type: "text", text: "current prompt B" }],
+        timestamp: "2026-08-25T07:31:50.000Z",
+      },
+      "message-b"
+    )
+
+    try {
+      h.isDesktop = false
+      h.acpFindConnectionForConversation.mockResolvedValue(null)
+      await mountProvider()
+      await act(async () => {
+        await h.actions!.connect(TAB, "codex", "/work", "codex-session", 42)
+      })
+
+      const handlers = latestAttachHandlers()
+      act(() => {
+        handlers.onReplay(
+          [
+            {
+              connection_id: "spawned-conn",
+              seq: 1,
+              type: "user_message",
+              message_id: "message-a",
+              blocks: [{ type: "text", text: "old prompt A" }],
+            },
+            {
+              connection_id: "spawned-conn",
+              seq: 2,
+              type: "status_changed",
+              status: "prompting",
+            },
+            content("spawned-conn", 3, "old reply A"),
+            {
+              connection_id: "spawned-conn",
+              seq: 4,
+              type: "turn_complete",
+              session_id: "codex-session",
+              stop_reason: "end_turn",
+              mark_awaiting_reply: false,
+            },
+          ],
+          4
+        )
+      })
+
+      const runtime = useConversationRuntimeStore
+        .getState()
+        .byConversationId.get(42)
+      expect(runtime?.optimisticTurns.map((turn) => turn.id)).toEqual([
+        "message-b",
+      ])
+      expect(runtime?.localTurns).toEqual([])
+      expect(runtime?.liveMessage).toBeNull()
+      expect(runtime?.syncState).toBe("awaiting_persist")
+      expect(h.store!.getConnection(TAB)).toMatchObject({
+        acceptedCompletionMessageId: null,
+        acceptedCompletionRuntimeConversationIds: null,
+      })
+    } finally {
+      resetConversationRuntimeStore()
+    }
+  })
+
+  it("parks a newer optimistic prompt before an authoritative terminal-only frame", async () => {
+    const { useConversationRuntimeStore, resetConversationRuntimeStore } =
+      await import("@/stores/conversation-runtime-store")
+    resetConversationRuntimeStore()
+    const runtimeActions = useConversationRuntimeStore.getState().actions
+    runtimeActions.setExternalId(42, "sess-1")
+    runtimeActions.appendOptimisticTurn(
+      42,
+      {
+        id: "message-a",
+        role: "user",
+        blocks: [{ type: "text", text: "turn A" }],
+        timestamp: "2026-08-25T07:31:00.000Z",
+      },
+      "message-a"
+    )
+
+    try {
+      h.eventStreamValue = null
+      h.acpConnect.mockResolvedValue("owner-conn")
+      await mountProvider()
+      await act(async () => {
+        await Promise.resolve()
+        await Promise.resolve()
+        await h.actions!.connect(TAB, "claude_code", "/work", "sess-1", 42)
+      })
+      h.actions!.registerLiveSinks(TAB, {
+        runtimeConversationId: 42,
+        canonical: (message, isLive) => {
+          runtimeActions.setLiveMessage(42, message, isLive)
+          return (
+            useConversationRuntimeStore.getState().byConversationId.get(42)
+              ?.liveMessage === message
+          )
+        },
+      })
+
+      act(() => {
+        h.emitDesktopBatch(
+          batch(1, [
+            {
+              connection_id: "owner-conn",
+              seq: 1,
+              type: "user_message",
+              message_id: "message-a",
+              blocks: [{ type: "text", text: "turn A" }],
+            },
+            {
+              connection_id: "owner-conn",
+              seq: 2,
+              type: "status_changed",
+              status: "prompting",
+            },
+            content("owner-conn", 3, "reply A"),
+          ])
+        )
+        h.runAnimationFrame()
+      })
+
+      runtimeActions.appendOptimisticTurn(
+        42,
+        {
+          id: "message-b",
+          role: "user",
+          blocks: [{ type: "text", text: "future turn B" }],
+          timestamp: "2026-08-25T07:31:50.000Z",
+        },
+        "message-b"
+      )
+
+      act(() => {
+        h.emitDesktopBatch(
+          batch(2, [
+            {
+              connection_id: "owner-conn",
+              seq: 4,
+              type: "turn_complete",
+              session_id: "sess-1",
+              stop_reason: "end_turn",
+              mark_awaiting_reply: false,
+            },
+          ])
+        )
+        h.runAnimationFrame()
+      })
+
+      const runtime = useConversationRuntimeStore
+        .getState()
+        .byConversationId.get(42)
+      expect(
+        runtime?.localTurns
+          .filter((turn) => turn.role === "user")
+          .map((turn) => turn.id)
+      ).toEqual(["message-a"])
+      expect(
+        runtime?.localTurns
+          .filter((turn) => turn.role === "assistant")
+          .map((turn) => turn.blocks)
+      ).toEqual([[{ type: "text", text: "reply A" }]])
+      expect(runtime?.optimisticTurns.map((turn) => turn.id)).toEqual([
+        "message-b",
+      ])
+      expect(runtime?.queuedOptimisticTurnIds).toEqual(["message-b"])
+    } finally {
+      resetConversationRuntimeStore()
+    }
+  })
+
+  it("completes an authoritative terminal-only frame across a full sink gap", async () => {
+    const { useConversationRuntimeStore, resetConversationRuntimeStore } =
+      await import("@/stores/conversation-runtime-store")
+    resetConversationRuntimeStore()
+    const runtimeActions = useConversationRuntimeStore.getState().actions
+    runtimeActions.setExternalId(42, "sess-1")
+    runtimeActions.appendOptimisticTurn(
+      42,
+      {
+        id: "message-a",
+        role: "user",
+        blocks: [{ type: "text", text: "turn A" }],
+        timestamp: "2026-08-25T07:31:00.000Z",
+      },
+      "message-a"
+    )
+
+    try {
+      h.eventStreamValue = null
+      h.acpConnect.mockResolvedValue("owner-conn")
+      await mountProvider()
+      await act(async () => {
+        await Promise.resolve()
+        await Promise.resolve()
+        await h.actions!.connect(TAB, "claude_code", "/work", "sess-1", 42)
+      })
+
+      act(() => {
+        h.emitDesktopBatch(
+          batch(1, [
+            {
+              connection_id: "owner-conn",
+              seq: 1,
+              type: "status_changed",
+              status: "prompting",
+            },
+            {
+              connection_id: "owner-conn",
+              seq: 2,
+              type: "user_message",
+              message_id: "message-a",
+              blocks: [{ type: "text", text: "turn A" }],
+            },
+            content("owner-conn", 3, "reply A"),
+          ])
+        )
+        h.runAnimationFrame()
+      })
+
+      expect(
+        useConversationRuntimeStore.getState().byConversationId.get(42)
+          ?.liveMessage
+      ).toBeNull()
+      expect(h.store!.getConnection(TAB)).toMatchObject({
+        status: "prompting",
+        pendingUserMessage: { messageId: "message-a" },
+      })
+
+      act(() => {
+        h.emitDesktopBatch(
+          batch(2, [
+            {
+              connection_id: "owner-conn",
+              seq: 4,
+              type: "turn_complete",
+              session_id: "sess-1",
+              stop_reason: "end_turn",
+              mark_awaiting_reply: false,
+            },
+          ])
+        )
+        h.runAnimationFrame()
+      })
+
+      const runtime = useConversationRuntimeStore
+        .getState()
+        .byConversationId.get(42)
+      expect(runtime?.optimisticTurns).toEqual([])
+      expect(runtime?.liveMessage).toBeNull()
+      expect(runtime?.localTurns.map((turn) => turn.role)).toEqual([
+        "user",
+        "assistant",
+      ])
+      expect(runtime?.localTurns.at(-1)?.blocks).toEqual([
+        { type: "text", text: "reply A" },
+      ])
+      expect(h.store!.getConnection(TAB)).toMatchObject({
+        status: "connected",
+        lastAppliedSeq: 4,
+        acceptedCompletionRuntimeConversationIds: [42],
+      })
+    } finally {
+      resetConversationRuntimeStore()
+    }
+  })
+
+  it("does not let an untrusted user-stop replay borrow another turn's cancel fence", async () => {
+    const {
+      noteUserStopTurnOwnership,
+      useConversationRuntimeStore,
+      resetConversationRuntimeStore,
+    } = await import("@/stores/conversation-runtime-store")
+    resetConversationRuntimeStore()
+    const runtimeActions = useConversationRuntimeStore.getState().actions
+    runtimeActions.setExternalId(42, "codex-session")
+    runtimeActions.appendOptimisticTurn(
+      42,
+      {
+        id: "message-b",
+        role: "user",
+        blocks: [{ type: "text", text: "current prompt B" }],
+        timestamp: "2026-08-25T07:31:50.000Z",
+      },
+      "message-b"
+    )
+    noteUserStopTurnOwnership(42)
+
+    try {
+      h.isDesktop = false
+      h.acpFindConnectionForConversation.mockResolvedValue(null)
+      await mountProvider()
+      await act(async () => {
+        await h.actions!.connect(TAB, "codex", "/work", "codex-session", 42)
+      })
+
+      const handlers = latestAttachHandlers()
+      act(() => {
+        handlers.onReplay(
+          [
+            {
+              connection_id: "spawned-conn",
+              seq: 1,
+              type: "user_message",
+              message_id: "message-a",
+              blocks: [{ type: "text", text: "old prompt A" }],
+            },
+            {
+              connection_id: "spawned-conn",
+              seq: 2,
+              type: "status_changed",
+              status: "prompting",
+            },
+            content("spawned-conn", 3, "old cancelled reply A"),
+            {
+              connection_id: "spawned-conn",
+              seq: 4,
+              type: "turn_complete",
+              session_id: "codex-session",
+              stop_reason: "cancelled",
+              mark_awaiting_reply: false,
+              termination_source: "user_stop",
+            },
+          ],
+          4
+        )
+      })
+
+      const runtime = useConversationRuntimeStore
+        .getState()
+        .byConversationId.get(42)
+      expect(runtime?.optimisticTurns.map((turn) => turn.id)).toEqual([
+        "message-b",
+      ])
+      expect(runtime?.queuedOptimisticTurnIds).toEqual([])
+      expect(runtime?.localTurns).toEqual([])
+      expect(runtime?.liveMessage).toBeNull()
+      expect(runtime?.syncState).toBe("awaiting_persist")
+      expect(h.store!.getConnection(TAB)).toMatchObject({
+        acceptedCompletionMessageId: null,
+        acceptedCompletionRuntimeConversationIds: null,
+      })
+    } finally {
+      resetConversationRuntimeStore()
+    }
+  })
+
+  it("rejects an untrusted user-stop replay without an exact prompt id", async () => {
+    const {
+      noteUserStopTurnOwnership,
+      useConversationRuntimeStore,
+      resetConversationRuntimeStore,
+    } = await import("@/stores/conversation-runtime-store")
+    resetConversationRuntimeStore()
+    const runtimeActions = useConversationRuntimeStore.getState().actions
+    runtimeActions.setExternalId(42, "codex-session")
+    runtimeActions.appendOptimisticTurn(
+      42,
+      {
+        id: "message-b",
+        role: "user",
+        blocks: [{ type: "text", text: "current prompt B" }],
+        timestamp: "2026-08-25T07:31:50.000Z",
+      },
+      "message-b"
+    )
+    noteUserStopTurnOwnership(42)
+
+    try {
+      h.isDesktop = false
+      h.acpFindConnectionForConversation.mockResolvedValue(null)
+      await mountProvider()
+      await act(async () => {
+        await h.actions!.connect(TAB, "codex", "/work", "codex-session", 42)
+      })
+
+      const handlers = latestAttachHandlers()
+      act(() => {
+        handlers.onReplay(
+          [
+            {
+              connection_id: "spawned-conn",
+              seq: 1,
+              type: "status_changed",
+              status: "prompting",
+            },
+            content("spawned-conn", 2, "old cancelled reply A"),
+            {
+              connection_id: "spawned-conn",
+              seq: 3,
+              type: "turn_complete",
+              session_id: "codex-session",
+              stop_reason: "cancelled",
+              mark_awaiting_reply: false,
+              termination_source: "user_stop",
+            },
+          ],
+          3
+        )
+      })
+
+      const runtime = useConversationRuntimeStore
+        .getState()
+        .byConversationId.get(42)
+      expect(runtime?.optimisticTurns.map((turn) => turn.id)).toEqual([
+        "message-b",
+      ])
+      expect(runtime?.queuedOptimisticTurnIds).toEqual([])
+      expect(runtime?.localTurns).toEqual([])
+      expect(runtime?.liveMessage).toBeNull()
+      expect(runtime?.syncState).toBe("awaiting_persist")
+      expect(h.store!.getConnection(TAB)).toMatchObject({
+        acceptedCompletionMessageId: null,
+        acceptedCompletionRuntimeConversationIds: null,
+      })
+    } finally {
+      resetConversationRuntimeStore()
+    }
+  })
+
+  it.each(
+    [false, true].flatMap((registerSink) =>
+      (["empty", "tool-only", "same-text", "prefix-text"] as const).map(
+        (replyKind) => ({
+          label: `${replyKind} ${registerSink ? "with" : "without"} a sink`,
+          registerSink,
+          replyKind,
+        })
+      )
+    )
+  )(
+    "keeps a fresh repeated-prompt resume replay $label",
+    async ({ registerSink, replyKind }) => {
+      const { useConversationRuntimeStore, resetConversationRuntimeStore } =
+        await import("@/stores/conversation-runtime-store")
+      resetConversationRuntimeStore()
+      const runtimeActions = useConversationRuntimeStore.getState().actions
+      runtimeActions.setExternalId(42, "sess")
+      const settledTurns = [
+        {
+          id: "parser-user-old",
+          role: "user" as const,
+          blocks: [{ type: "text" as const, text: "repeat prompt" }],
+          timestamp: "2026-08-25T07:30:00.000Z",
+        },
+        {
+          id: "parser-assistant-old",
+          role: "assistant" as const,
+          blocks: [
+            {
+              type: "text" as const,
+              text: "already persisted full reply",
+            },
+          ],
+          timestamp: "2026-08-25T07:30:01.000Z",
+        },
+      ]
+      useConversationRuntimeStore.setState((state) => {
+        const current = state.byConversationId.get(42)!
+        const byConversationId = new Map(state.byConversationId)
+        byConversationId.set(42, {
+          ...current,
+          detail: {
+            summary: {
+              id: 42,
+              folder_id: 1,
+              title: null,
+              title_locked: false,
+              auto_title_finalized: false,
+              agent_type: "claude_code",
+              status: "active",
+              awaiting_reply_token: null,
+              kind: "regular",
+              model: null,
+              git_branch: null,
+              external_id: "sess",
+              message_count: 2,
+              child_count: 0,
+              created_at: "2026-08-25T07:30:00.000Z",
+              updated_at: "2026-08-25T07:30:01.000Z",
+              pinned_at: null,
+            },
+            turns: settledTurns,
+          },
+        })
+        return { byConversationId }
+      })
+
+      try {
+        h.isDesktop = false
+        await mountProvider()
+        await act(async () => {
+          await h.actions!.connect(TAB, "claude_code", "/work", "sess", 42)
+        })
+        const handlers = latestAttachHandlers()
+        h.denormalizeSnapshot.mockReturnValue(
+          estimatorSnapshotPatch({
+            connectionId: "conn",
+            conversationId: 42,
+            status: "connected",
+            sessionId: "sess",
+            liveMessage: null,
+            eventSeq: 10,
+          })
+        )
+        hydrateSnapshot(handlers, { event_seq: 10 } as LiveSessionSnapshot)
+
+        if (registerSink) {
+          h.actions!.registerLiveSinks(TAB, {
+            runtimeConversationId: 42,
+            canonical: (message, isLive) => {
+              runtimeActions.setLiveMessage(42, message, isLive)
+              return (
+                useConversationRuntimeStore.getState().byConversationId.get(42)
+                  ?.liveMessage === message
+              )
+            },
+          })
+        }
+
+        const outputEvents: EventEnvelope[] =
+          replyKind === "empty"
+            ? []
+            : replyKind === "tool-only"
+              ? [
+                  {
+                    connection_id: "conn",
+                    seq: 14,
+                    type: "tool_call",
+                    tool_call_id: "fresh-tool",
+                    title: "Read",
+                    kind: "read",
+                    status: "completed",
+                    content: null,
+                    raw_input: '{"path":"fresh.txt"}',
+                    raw_output: "fresh output",
+                  },
+                ]
+              : [
+                  content(
+                    "conn",
+                    14,
+                    replyKind === "same-text"
+                      ? "already persisted full reply"
+                      : "already persisted"
+                  ),
+                ]
+        const terminalSeq = 14 + outputEvents.length
+        act(() => {
+          handlers.onReplay(
+            [
+              {
+                connection_id: "conn",
+                seq: 11,
+                type: "prompt_dispatch_started",
+                generation: 1,
+                turn: {
+                  turn_id: "turn-new",
+                  queue_item_id: "queue-new",
+                  enqueue_seq: 2,
+                  client_message_id: "message-new",
+                  stop_requested: false,
+                },
+              },
+              {
+                connection_id: "conn",
+                seq: 12,
+                type: "user_message",
+                message_id: "message-new",
+                blocks: [{ type: "text", text: "repeat prompt" }],
+              },
+              {
+                connection_id: "conn",
+                seq: 13,
+                type: "status_changed",
+                status: "prompting",
+              },
+              ...outputEvents,
+              {
+                connection_id: "conn",
+                seq: terminalSeq,
+                type: "turn_complete",
+                session_id: "sess",
+                stop_reason: "end_turn",
+                mark_awaiting_reply: false,
+              },
+            ],
+            terminalSeq,
+            10
+          )
+        })
+
+        const runtime = useConversationRuntimeStore
+          .getState()
+          .byConversationId.get(42)
+        expect(runtime?.detail?.turns).toBe(settledTurns)
+        expect(
+          runtime?.localTurns
+            .filter((turn) => turn.role === "user")
+            .map((turn) => turn.id)
+        ).toEqual(["message-new"])
+        const localAssistants =
+          runtime?.localTurns.filter((turn) => turn.role === "assistant") ?? []
+        if (replyKind === "empty") {
+          expect(localAssistants).toEqual([])
+        } else if (replyKind === "tool-only") {
+          expect(localAssistants).toHaveLength(1)
+          expect(localAssistants[0]?.blocks).toEqual(
+            expect.arrayContaining([
+              expect.objectContaining({
+                type: "tool_use",
+                tool_use_id: "fresh-tool",
+              }),
+            ])
+          )
+        } else {
+          expect(
+            localAssistants.flatMap((turn) =>
+              turn.blocks.flatMap((block) =>
+                block.type === "text" ? [block.text] : []
+              )
+            )
+          ).toEqual([
+            replyKind === "same-text"
+              ? "already persisted full reply"
+              : "already persisted",
+          ])
+        }
+        expect(runtime?.optimisticTurns).toEqual([])
+        expect(runtime?.liveMessage).toBeNull()
+        expect(h.store!.getConnection(TAB)).toMatchObject({
+          acceptedCompletionMessageId: expect.any(String),
+          acceptedCompletionRuntimeConversationIds: [42],
+        })
+      } finally {
+        resetConversationRuntimeStore()
+      }
+    }
+  )
+
+  it("keeps an already-promoted mapped round settled without a sink", async () => {
+    const { useConversationRuntimeStore, resetConversationRuntimeStore } =
+      await import("@/stores/conversation-runtime-store")
+    resetConversationRuntimeStore()
+    const runtimeActions = useConversationRuntimeStore.getState().actions
+    runtimeActions.setExternalId(42, "sess")
+    runtimeActions.appendViewerUserTurn(42, {
+      id: "message-a",
+      role: "user",
+      blocks: [{ type: "text", text: "turn A" }],
+      timestamp: "2026-08-25T07:30:00.000Z",
+    })
+    const settledReply: LiveMessage = {
+      id: "settled-reply",
+      role: "assistant",
+      content: [{ type: "text", text: "reply A" }],
+      startedAt: Date.parse("2026-08-25T07:30:01.000Z"),
+    }
+    runtimeActions.setLiveMessage(42, settledReply, true)
+    runtimeActions.completeTurn(42, settledReply)
+    const originalTurns = useConversationRuntimeStore
+      .getState()
+      .byConversationId.get(42)?.localTurns
+
+    try {
+      h.isDesktop = false
+      await mountProvider()
+      await act(async () => {
+        await h.actions!.connect(TAB, "claude_code", "/work", "sess", 42)
+      })
+      const handlers = latestAttachHandlers()
+      act(() => {
+        handlers.onReplay(
+          [
+            {
+              connection_id: "conn",
+              seq: 1,
+              type: "prompt_dispatch_started",
+              generation: 1,
+              turn: {
+                turn_id: "turn-a",
+                queue_item_id: "queue-a",
+                enqueue_seq: 1,
+                client_message_id: "message-a",
+                stop_requested: false,
+              },
+            },
+            {
+              connection_id: "conn",
+              seq: 2,
+              type: "user_message",
+              message_id: "message-a",
+              blocks: [{ type: "text", text: "turn A" }],
+            },
+            {
+              connection_id: "conn",
+              seq: 3,
+              type: "status_changed",
+              status: "prompting",
+            },
+            content("conn", 4, "reply A"),
+            {
+              connection_id: "conn",
+              seq: 5,
+              type: "turn_complete",
+              session_id: "sess",
+              stop_reason: "end_turn",
+              mark_awaiting_reply: false,
+            },
+          ],
+          5
+        )
+      })
+
+      const runtime = useConversationRuntimeStore
+        .getState()
+        .byConversationId.get(42)
+      expect(runtime?.localTurns).toBe(originalTurns)
+      expect(runtime?.liveMessage).toBeNull()
+      expect(runtime?.optimisticTurns).toEqual([])
+      expect(h.store!.getConnection(TAB)).toMatchObject({
+        acceptedCompletionMessageId: null,
+        acceptedCompletionRuntimeConversationIds: null,
+      })
+    } finally {
+      resetConversationRuntimeStore()
+    }
+  })
+
+  it("promotes a queued optimistic turn after shared dispatch starts", async () => {
+    const { useConversationRuntimeStore, resetConversationRuntimeStore } =
+      await import("@/stores/conversation-runtime-store")
+    resetConversationRuntimeStore()
+    const runtimeActions = useConversationRuntimeStore.getState().actions
+    runtimeActions.setExternalId(42, "sess")
+    runtimeActions.appendOptimisticTurn(
+      42,
+      {
+        id: "message-b",
+        role: "user",
+        blocks: [{ type: "text", text: "queued turn B" }],
+        timestamp: "2026-08-25T07:31:50.000Z",
+      },
+      "message-b",
+      { queuePending: true }
+    )
+
+    try {
+      h.isDesktop = false
+      await mountProvider()
+      await act(async () => {
+        await h.actions!.connect(TAB, "claude_code", "/work", "sess", 42)
+      })
+      h.actions!.registerLiveMessageSink(TAB, (message, isLive) => {
+        runtimeActions.setLiveMessage(42, message, isLive)
+        return (
+          useConversationRuntimeStore.getState().byConversationId.get(42)
+            ?.liveMessage === message
+        )
+      })
+      const handlers = latestAttachHandlers()
+      emitAcpEvent(handlers, {
+        connection_id: "conn",
+        seq: 1,
+        type: "prompt_dispatch_started",
+        generation: 1,
+        turn: {
+          turn_id: "turn-b",
+          queue_item_id: "queue-b",
+          enqueue_seq: 2,
+          client_message_id: "message-b",
+          stop_requested: false,
+        },
+      })
+      emitAcpEvent(handlers, {
+        connection_id: "conn",
+        seq: 2,
+        type: "user_message",
+        message_id: "message-b",
+        blocks: [{ type: "text", text: "queued turn B" }],
+      })
+      emitAcpEvent(handlers, {
+        connection_id: "conn",
+        seq: 3,
+        type: "status_changed",
+        status: "prompting",
+      })
+      emitAcpEvent(handlers, content("conn", 4, "reply B"))
+      emitAcpEvent(handlers, {
+        connection_id: "conn",
+        seq: 5,
+        type: "turn_complete",
+        session_id: "sess",
+        stop_reason: "end_turn",
+        mark_awaiting_reply: false,
+      })
+
+      const runtime = useConversationRuntimeStore
+        .getState()
+        .byConversationId.get(42)
+      expect(runtime?.optimisticTurns).toEqual([])
+      expect(runtime?.queuedOptimisticTurnIds).toEqual([])
+      expect(
+        runtime?.localTurns.map((turn) => ({
+          role: turn.role,
+          blocks: turn.blocks,
+        }))
+      ).toEqual([
+        { role: "user", blocks: [{ type: "text", text: "queued turn B" }] },
+        { role: "assistant", blocks: [{ type: "text", text: "reply B" }] },
+      ])
+    } finally {
+      resetConversationRuntimeStore()
+    }
+  })
+
+  it.each([
+    ["sess-a", "sess-b", "sess-a"],
+    [null, null, undefined],
+  ] as const)(
+    "does not activate a same-id queued turn from another shared session",
+    async (ownerSessionId, otherSessionId, connectionSessionId) => {
+      const { useConversationRuntimeStore, resetConversationRuntimeStore } =
+        await import("@/stores/conversation-runtime-store")
+      resetConversationRuntimeStore()
+      const runtimeActions = useConversationRuntimeStore.getState().actions
+      for (const [conversationId, sessionId] of [
+        [42, ownerSessionId],
+        [43, otherSessionId],
+      ] as const) {
+        if (sessionId != null) {
+          runtimeActions.setExternalId(conversationId, sessionId)
+        }
+        runtimeActions.appendOptimisticTurn(
+          conversationId,
+          {
+            id: "shared-message-id",
+            role: "user",
+            blocks: [{ type: "text", text: `queued in ${conversationId}` }],
+            timestamp: "2026-08-25T07:31:50.000Z",
+          },
+          "shared-message-id",
+          { queuePending: true }
+        )
+      }
+
+      try {
+        h.isDesktop = false
+        await mountProvider()
+        await act(async () => {
+          await h.actions!.connect(
+            TAB,
+            "claude_code",
+            "/work",
+            connectionSessionId,
+            42
+          )
+        })
+
+        emitAcpEvent(latestAttachHandlers(), {
+          connection_id: "conn",
+          seq: 1,
+          type: "prompt_dispatch_started",
+          generation: 1,
+          turn: {
+            turn_id: "turn-a",
+            queue_item_id: "queue-a",
+            enqueue_seq: 1,
+            client_message_id: "shared-message-id",
+            stop_requested: false,
+          },
+        })
+
+        const owner = useConversationRuntimeStore
+          .getState()
+          .byConversationId.get(42)
+        const other = useConversationRuntimeStore
+          .getState()
+          .byConversationId.get(43)
+        expect(owner?.queuedOptimisticTurnIds).toEqual([])
+        expect(owner?.activeTurnToken).toBe("shared-message-id")
+        expect(other?.optimisticTurns.map((turn) => turn.id)).toEqual([
+          "shared-message-id",
+        ])
+        expect(other?.queuedOptimisticTurnIds).toEqual(["shared-message-id"])
+        expect(other?.activeTurnToken).toBeNull()
+        expect(other?.syncState).toBe("idle")
+      } finally {
+        resetConversationRuntimeStore()
+      }
+    }
+  )
 
   it("notifies useConnection for queue and queue-failure projections", async () => {
     h.isDesktop = false
@@ -2426,6 +4134,12 @@ describe("AcpConnectionsProvider AIR session-failure lifecycle", () => {
     emitAcpEvent(handlers, {
       seq: 4,
       connection_id: "spawned-conn",
+      type: "status_changed",
+      status: "prompting",
+    })
+    emitAcpEvent(handlers, {
+      seq: 5,
+      connection_id: "spawned-conn",
       type: "turn_complete",
       session_id: "sess-1",
       stop_reason: "end_turn",
@@ -3989,6 +5703,63 @@ describe("AcpConnectionsProvider liveMessage sink (mirror out of React)", () => 
     expect(calls[0]!.len).toBe(1) // the tool_call block already present
   })
 
+  it("does not replay a retained completion over another runtime live turn", async () => {
+    const handlers = await connectOwner()
+    emitAcpEvent(handlers, {
+      seq: 1,
+      connection_id: "spawned-conn",
+      type: "status_changed",
+      status: "prompting",
+    })
+    emitAcpEvent(handlers, {
+      seq: 2,
+      connection_id: "spawned-conn",
+      type: "content_delta",
+      text: "retained reply A",
+    })
+    emitAcpEvent(handlers, {
+      seq: 3,
+      connection_id: "spawned-conn",
+      type: "turn_complete",
+      session_id: "sess-1",
+      stop_reason: "end_turn",
+      mark_awaiting_reply: false,
+    })
+
+    const { useConversationRuntimeStore, resetConversationRuntimeStore } =
+      await import("@/stores/conversation-runtime-store")
+    resetConversationRuntimeStore()
+    const runtimeActions = useConversationRuntimeStore.getState().actions
+    const replyB: LiveMessage = {
+      id: "reply-b",
+      role: "assistant",
+      content: [{ type: "text", text: "live reply B" }],
+      startedAt: 1_700_000_000_001,
+    }
+    runtimeActions.setExternalId(42, "sess-1")
+    runtimeActions.setLiveMessage(42, replyB, true)
+    let calls = 0
+
+    try {
+      h.actions!.registerLiveSinks(TAB, {
+        runtimeConversationId: 42,
+        canonical: (message, isLive) => {
+          calls += 1
+          runtimeActions.setLiveMessage(42, message, isLive)
+          return true
+        },
+      })
+
+      expect(calls).toBe(0)
+      expect(
+        useConversationRuntimeStore.getState().byConversationId.get(42)
+          ?.liveMessage
+      ).toBe(replyB)
+    } finally {
+      resetConversationRuntimeStore()
+    }
+  })
+
   it("mirrors to the sink BEFORE notifying connection key subscribers", async () => {
     const handlers = await connectOwner()
     const order: string[] = []
@@ -4012,22 +5783,166 @@ describe("AcpConnectionsProvider liveMessage sink (mirror out of React)", () => 
     expect(order.indexOf("sink")).toBeLessThan(order.indexOf("notify"))
   })
 
-  it("keeps settled replay content behind the stale reconnect guard", async () => {
-    const handlers = await connectOwner()
+  it.each([
+    { label: "ordinary", terminationSource: null },
+    { label: "user-stop", terminationSource: "user_stop" as const },
+  ])(
+    "keeps settled $label replay content behind the stale reconnect guard",
+    async ({ terminationSource }) => {
+      h.acpFindConnectionForConversation.mockResolvedValue(null)
+      await mountProvider()
+      await act(async () => {
+        await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1", 42)
+      })
+      const handlers = latestAttachHandlers()
+      const { useConversationRuntimeStore, resetConversationRuntimeStore } =
+        await import("@/stores/conversation-runtime-store")
+      resetConversationRuntimeStore()
+      const runtimeActions = useConversationRuntimeStore.getState().actions
+      runtimeActions.setExternalId(42, "sess-1")
+      const settled: LiveMessage = {
+        id: "settled",
+        role: "assistant",
+        content: [{ type: "text", text: "already persisted" }],
+        startedAt: 1_700_000_000_000,
+      }
+      runtimeActions.setLiveMessage(42, settled, true)
+      runtimeActions.completeTurn(42, settled)
+      const originalAssistantId = useConversationRuntimeStore
+        .getState()
+        .byConversationId.get(42)
+        ?.localTurns.find((turn) => turn.role === "assistant")?.id
+      expect(originalAssistantId).toEqual(expect.any(String))
+      const { createLiveTranscriptStore, createLiveTranscriptFrameSink } =
+        await import("@/stores/live-transcript-store")
+      const transcriptStore = createLiveTranscriptStore()
+      h.actions!.registerLiveSinks(TAB, {
+        runtimeConversationId: 42,
+        canonical: (message, isLive) => {
+          runtimeActions.setLiveMessage(42, message, isLive)
+          return (
+            useConversationRuntimeStore.getState().byConversationId.get(42)
+              ?.liveMessage === message
+          )
+        },
+        transcript: createLiveTranscriptFrameSink(
+          42,
+          "spawned-conn",
+          transcriptStore
+        ),
+      })
+
+      try {
+        act(() => {
+          handlers.onReplay(
+            [
+              {
+                connection_id: "spawned-conn",
+                seq: 1,
+                type: "status_changed",
+                status: "prompting",
+              },
+              {
+                connection_id: "spawned-conn",
+                seq: 2,
+                type: "content_delta",
+                text: "already persisted",
+              },
+              {
+                connection_id: "spawned-conn",
+                seq: 3,
+                type: "turn_complete",
+                session_id: "sess-1",
+                stop_reason: terminationSource ? "cancelled" : "end_turn",
+                mark_awaiting_reply: false,
+                ...(terminationSource
+                  ? {
+                      termination_source: terminationSource,
+                      provider_turn_id: null,
+                    }
+                  : {}),
+              },
+            ],
+            3
+          )
+        })
+
+        expect(
+          useConversationRuntimeStore.getState().byConversationId.get(42)
+            ?.liveMessage
+        ).toBeNull()
+        expect(
+          useConversationRuntimeStore
+            .getState()
+            .byConversationId.get(42)
+            ?.localTurns.filter((turn) => turn.role === "assistant")
+            .map((turn) => ({ id: turn.id, blocks: turn.blocks }))
+        ).toEqual([
+          {
+            id: originalAssistantId,
+            blocks: [{ type: "text", text: "already persisted" }],
+          },
+        ])
+        expect(
+          useConversationRuntimeStore
+            .getState()
+            .byConversationId.get(42)
+            ?.localTurns.find((turn) => turn.role === "assistant")?.outcome
+        ).toBeUndefined()
+        expect(transcriptStore.getConversation(42)).toBeNull()
+        expect(
+          h.store!.getConnection(TAB)?.acceptedCompletionMessageId
+        ).toBeNull()
+        expect(
+          h.store!.getConnection(TAB)?.acceptedCompletionRuntimeConversationIds
+        ).toBeNull()
+      } finally {
+        resetConversationRuntimeStore()
+      }
+    }
+  )
+
+  it("keeps a rejected replay settled when turn-complete arrives in a later frame", async () => {
+    h.acpFindConnectionForConversation.mockResolvedValue(null)
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1", 42)
+    })
+    const handlers = latestAttachHandlers()
     const { useConversationRuntimeStore, resetConversationRuntimeStore } =
       await import("@/stores/conversation-runtime-store")
     resetConversationRuntimeStore()
     const runtimeActions = useConversationRuntimeStore.getState().actions
+    runtimeActions.setExternalId(42, "sess-1")
     const settled: LiveMessage = {
-      id: "settled",
+      id: "settled-split-replay",
       role: "assistant",
       content: [{ type: "text", text: "already persisted" }],
       startedAt: 1_700_000_000_000,
     }
     runtimeActions.setLiveMessage(42, settled, true)
     runtimeActions.completeTurn(42, settled)
-    h.actions!.registerLiveMessageSink(TAB, (message, isLive) => {
-      runtimeActions.setLiveMessage(42, message, isLive)
+    const originalAssistantId = useConversationRuntimeStore
+      .getState()
+      .byConversationId.get(42)
+      ?.localTurns.find((turn) => turn.role === "assistant")?.id
+    const { createLiveTranscriptStore, createLiveTranscriptFrameSink } =
+      await import("@/stores/live-transcript-store")
+    const transcriptStore = createLiveTranscriptStore()
+    h.actions!.registerLiveSinks(TAB, {
+      runtimeConversationId: 42,
+      canonical: (message, isLive) => {
+        runtimeActions.setLiveMessage(42, message, isLive)
+        return (
+          useConversationRuntimeStore.getState().byConversationId.get(42)
+            ?.liveMessage === message
+        )
+      },
+      transcript: createLiveTranscriptFrameSink(
+        42,
+        "spawned-conn",
+        transcriptStore
+      ),
     })
 
     try {
@@ -4049,20 +5964,46 @@ describe("AcpConnectionsProvider liveMessage sink (mirror out of React)", () => 
             {
               connection_id: "spawned-conn",
               seq: 3,
+              type: "status_changed",
+              status: "connected",
+            },
+          ],
+          3
+        )
+      })
+      expect(transcriptStore.getConversation(42)).toBeNull()
+
+      act(() => {
+        handlers.onReplay(
+          [
+            {
+              connection_id: "spawned-conn",
+              seq: 4,
               type: "turn_complete",
               session_id: "sess-1",
               stop_reason: "end_turn",
               mark_awaiting_reply: false,
             },
           ],
-          3
+          4
         )
       })
 
+      const runtime = useConversationRuntimeStore
+        .getState()
+        .byConversationId.get(42)
+      expect(runtime?.liveMessage).toBeNull()
       expect(
-        useConversationRuntimeStore.getState().byConversationId.get(42)
-          ?.liveMessage
-      ).toBeNull()
+        runtime?.localTurns
+          .filter((turn) => turn.role === "assistant")
+          .map((turn) => ({ id: turn.id, blocks: turn.blocks }))
+      ).toEqual([
+        {
+          id: originalAssistantId,
+          blocks: [{ type: "text", text: "already persisted" }],
+        },
+      ])
+      expect(transcriptStore.getConversation(42)).toBeNull()
     } finally {
       resetConversationRuntimeStore()
     }
@@ -5106,6 +7047,469 @@ describe("AcpConnectionsProvider frame transactions (raw order)", () => {
     expect(transcriptStore.getConversation(42)?.status).toBe("completing")
   })
 
+  it("accepts a terminal when the runtime holds the same message id in an older object", async () => {
+    const { useConversationRuntimeStore, resetConversationRuntimeStore } =
+      await import("@/stores/conversation-runtime-store")
+    resetConversationRuntimeStore()
+    const runtimeActions = useConversationRuntimeStore.getState().actions
+    runtimeActions.setExternalId(42, "sess-1")
+    runtimeActions.appendOptimisticTurn(
+      42,
+      {
+        id: "user-older-ref",
+        role: "user",
+        blocks: [{ type: "text", text: "finish this" }],
+        timestamp: "2026-08-25T07:31:49.000Z",
+      },
+      "user-older-ref"
+    )
+
+    try {
+      await mountDesktopOwner("owner-conn", TAB, "sess-1", 42)
+      const sinks = {
+        runtimeConversationId: 42,
+        canonical: (message: LiveMessage, isLive: boolean) => {
+          runtimeActions.setLiveMessage(42, message, isLive)
+          return (
+            useConversationRuntimeStore.getState().byConversationId.get(42)
+              ?.liveMessage === message
+          )
+        },
+      }
+      h.actions!.registerLiveSinks(TAB, sinks)
+
+      act(() => {
+        h.emitDesktopBatch(
+          batch(1, [
+            {
+              connection_id: "owner-conn",
+              seq: 1,
+              type: "status_changed",
+              status: "prompting",
+            },
+            content("owner-conn", 2, "complete reply"),
+          ])
+        )
+        h.runAnimationFrame()
+      })
+
+      const canonical = h.store!.getConnection(TAB)?.liveMessage
+      expect(canonical).toBeTruthy()
+      const olderRuntimeObject: LiveMessage = {
+        ...canonical!,
+        content: [...canonical!.content],
+      }
+      expect(olderRuntimeObject).not.toBe(canonical)
+      runtimeActions.setLiveMessage(42, olderRuntimeObject, true)
+
+      act(() => {
+        h.emitDesktopBatch(
+          batch(2, [
+            {
+              connection_id: "owner-conn",
+              seq: 3,
+              type: "turn_complete",
+              session_id: "sess-1",
+              stop_reason: "end_turn",
+              mark_awaiting_reply: false,
+            },
+          ])
+        )
+        h.runAnimationFrame()
+      })
+
+      const runtime = useConversationRuntimeStore
+        .getState()
+        .byConversationId.get(42)
+      expect(h.store!.getConnection(TAB)?.status).toBe("connected")
+      expect(runtime?.liveMessage).toBeNull()
+      expect(runtime?.localTurns.at(-1)).toMatchObject({
+        role: "assistant",
+        blocks: [{ type: "text", text: "complete reply" }],
+      })
+    } finally {
+      resetConversationRuntimeStore()
+    }
+  })
+
+  it("removes pending-cleanup runtime state only after an admitted terminal", async () => {
+    const { useConversationRuntimeStore, resetConversationRuntimeStore } =
+      await import("@/stores/conversation-runtime-store")
+    resetConversationRuntimeStore()
+    const runtimeActions = useConversationRuntimeStore.getState().actions
+    runtimeActions.setExternalId(42, "sess-1")
+    runtimeActions.appendOptimisticTurn(
+      42,
+      {
+        id: "user-cleanup",
+        role: "user",
+        blocks: [{ type: "text", text: "close tab" }],
+        timestamp: "2026-08-25T07:31:49.000Z",
+      },
+      "user-cleanup"
+    )
+    runtimeActions.setPendingCleanup(42, true)
+
+    try {
+      await mountDesktopOwner("owner-conn", TAB, "sess-1", 42)
+      const sinks = {
+        runtimeConversationId: 42,
+        canonical: (message: LiveMessage, isLive: boolean) => {
+          runtimeActions.setLiveMessage(42, message, isLive)
+          return (
+            useConversationRuntimeStore.getState().byConversationId.get(42)
+              ?.liveMessage === message
+          )
+        },
+      }
+      h.actions!.registerLiveSinks(TAB, sinks)
+
+      act(() => {
+        h.emitDesktopBatch(
+          batch(1, [
+            {
+              connection_id: "owner-conn",
+              seq: 1,
+              type: "status_changed",
+              status: "prompting",
+            },
+            content("owner-conn", 2, "closed-tab reply"),
+          ])
+        )
+        h.runAnimationFrame()
+      })
+
+      act(() => {
+        h.emitDesktopBatch(
+          batch(2, [
+            {
+              connection_id: "owner-conn",
+              seq: 3,
+              type: "turn_complete",
+              session_id: "other-session",
+              stop_reason: "end_turn",
+              mark_awaiting_reply: false,
+            },
+          ])
+        )
+        h.runAnimationFrame()
+      })
+      expect(
+        useConversationRuntimeStore.getState().byConversationId.has(42)
+      ).toBe(true)
+      expect(h.store!.getConnection(TAB)?.status).toBe("prompting")
+
+      act(() => {
+        h.emitDesktopBatch(
+          batch(3, [
+            {
+              connection_id: "owner-conn",
+              seq: 4,
+              type: "turn_complete",
+              session_id: "sess-1",
+              stop_reason: "end_turn",
+              mark_awaiting_reply: false,
+            },
+          ])
+        )
+        h.runAnimationFrame()
+      })
+
+      expect(
+        useConversationRuntimeStore.getState().byConversationId.has(42)
+      ).toBe(false)
+    } finally {
+      resetConversationRuntimeStore()
+    }
+  })
+
+  it("adopts an accepted completion while a cold reopen detail is loading", async () => {
+    const { getFolderConversation } = await import("@/lib/api")
+    const { useConversationRuntimeStore, resetConversationRuntimeStore } =
+      await import("@/stores/conversation-runtime-store")
+    resetConversationRuntimeStore()
+    const runtimeActions = useConversationRuntimeStore.getState().actions
+    runtimeActions.setExternalId(42, "sess-1")
+    runtimeActions.appendOptimisticTurn(
+      42,
+      {
+        id: "user-reopen",
+        role: "user",
+        blocks: [{ type: "text", text: "close and reopen" }],
+        timestamp: "2026-08-25T07:31:49.000Z",
+      },
+      "user-reopen"
+    )
+    runtimeActions.setPendingCleanup(42, true)
+
+    let resolveDetail!: (detail: DbConversationDetail) => void
+    vi.mocked(getFolderConversation).mockImplementationOnce(
+      () =>
+        new Promise<DbConversationDetail>((resolve) => {
+          resolveDetail = resolve
+        })
+    )
+
+    try {
+      await mountDesktopOwner("owner-conn", TAB, "sess-1", 42)
+      act(() => {
+        h.emitDesktopBatch(
+          batch(1, [
+            {
+              connection_id: "owner-conn",
+              seq: 1,
+              type: "status_changed",
+              status: "prompting",
+            },
+            content("owner-conn", 2, "retained final reply"),
+            {
+              connection_id: "owner-conn",
+              seq: 3,
+              type: "turn_complete",
+              session_id: "sess-1",
+              stop_reason: "end_turn",
+              mark_awaiting_reply: false,
+            },
+          ])
+        )
+        h.runAnimationFrame()
+      })
+
+      expect(
+        useConversationRuntimeStore.getState().byConversationId.has(42)
+      ).toBe(false)
+      const completedConnection = h.store!.getConnection(TAB)
+      expect(completedConnection?.acceptedCompletionMessageId).toBe(
+        completedConnection?.liveMessage?.id
+      )
+      expect(
+        completedConnection?.acceptedCompletionRuntimeConversationIds
+      ).toContain(42)
+
+      runtimeActions.fetchDetail(42)
+      expect(
+        useConversationRuntimeStore.getState().byConversationId.get(42)
+          ?.detailLoading
+      ).toBe(true)
+      h.actions!.registerLiveSinks(TAB, {
+        runtimeConversationId: 42,
+        canonical: (message, isLive) => {
+          runtimeActions.setLiveMessage(42, message, isLive)
+          return (
+            useConversationRuntimeStore.getState().byConversationId.get(42)
+              ?.liveMessage === message
+          )
+        },
+      })
+
+      expect(
+        useConversationRuntimeStore
+          .getState()
+          .byConversationId.get(42)
+          ?.localTurns.at(-1)
+      ).toMatchObject({
+        role: "assistant",
+        blocks: [{ type: "text", text: "retained final reply" }],
+      })
+
+      await act(async () => {
+        resolveDetail({
+          summary: {
+            id: 42,
+            folder_id: 1,
+            agent_type: "claude_code",
+            title: "reopened",
+            title_locked: false,
+            auto_title_finalized: false,
+            status: "in_progress",
+            awaiting_reply_token: null,
+            kind: "regular",
+            model: null,
+            git_branch: null,
+            external_id: "sess-1",
+            message_count: 1,
+            child_count: 0,
+            created_at: "2026-08-25T07:31:49.000Z",
+            updated_at: "2026-08-25T07:31:49.000Z",
+            pinned_at: null,
+          },
+          turns: [
+            {
+              id: "user-reopen",
+              role: "user",
+              blocks: [{ type: "text", text: "close and reopen" }],
+              timestamp: "2026-08-25T07:31:49.000Z",
+            },
+          ],
+          session_stats: null,
+        })
+        await Promise.resolve()
+      })
+
+      expect(
+        useConversationRuntimeStore
+          .getState()
+          .byConversationId.get(42)
+          ?.localTurns.at(-1)
+      ).toMatchObject({
+        role: "assistant",
+        blocks: [{ type: "text", text: "retained final reply" }],
+      })
+    } finally {
+      resetConversationRuntimeStore()
+    }
+  })
+
+  it("adopts an accepted completion after a cold reopen rekeys the owner", async () => {
+    const orphanKey = "new-reopen-owner"
+    const { getFolderConversation } = await import("@/lib/api")
+    const { useConversationRuntimeStore, resetConversationRuntimeStore } =
+      await import("@/stores/conversation-runtime-store")
+    resetConversationRuntimeStore()
+    const runtimeActions = useConversationRuntimeStore.getState().actions
+    runtimeActions.setExternalId(42, "sess-1")
+    runtimeActions.appendOptimisticTurn(
+      42,
+      {
+        id: "user-rekey-reopen",
+        role: "user",
+        blocks: [{ type: "text", text: "close before completion" }],
+        timestamp: "2026-08-25T07:31:49.000Z",
+      },
+      "user-rekey-reopen"
+    )
+    runtimeActions.setPendingCleanup(42, true)
+    let resolveDetail!: (detail: DbConversationDetail) => void
+    vi.mocked(getFolderConversation).mockImplementationOnce(
+      () =>
+        new Promise<DbConversationDetail>((resolve) => {
+          resolveDetail = resolve
+        })
+    )
+
+    try {
+      await mountDesktopOwner("owner-conn", orphanKey, "sess-1", 42)
+      act(() => {
+        h.emitDesktopBatch(
+          batch(1, [
+            {
+              connection_id: "owner-conn",
+              seq: 1,
+              type: "session_started",
+              session_id: "sess-1",
+            },
+            {
+              connection_id: "owner-conn",
+              seq: 2,
+              type: "status_changed",
+              status: "prompting",
+            },
+            content("owner-conn", 3, "rekeyed retained reply"),
+            {
+              connection_id: "owner-conn",
+              seq: 4,
+              type: "turn_complete",
+              session_id: "sess-1",
+              stop_reason: "end_turn",
+              mark_awaiting_reply: false,
+            },
+          ])
+        )
+        h.runAnimationFrame()
+      })
+
+      expect(
+        useConversationRuntimeStore.getState().byConversationId.has(42)
+      ).toBe(false)
+      runtimeActions.fetchDetail(42)
+      expect(
+        useConversationRuntimeStore.getState().byConversationId.get(42)
+          ?.detailLoading
+      ).toBe(true)
+
+      h.actions!.registerLiveSinks(TAB, {
+        runtimeConversationId: 42,
+        canonical: (message, isLive) => {
+          runtimeActions.setLiveMessage(42, message, isLive)
+          return (
+            useConversationRuntimeStore.getState().byConversationId.get(42)
+              ?.liveMessage === message
+          )
+        },
+      })
+      expect(
+        useConversationRuntimeStore
+          .getState()
+          .byConversationId.get(42)
+          ?.localTurns.at(-1)
+      ).toMatchObject({
+        role: "assistant",
+        blocks: [{ type: "text", text: "rekeyed retained reply" }],
+      })
+      await act(async () => {
+        resolveDetail({
+          summary: {
+            id: 42,
+            folder_id: 1,
+            agent_type: "claude_code",
+            title: "reopened after draft",
+            title_locked: false,
+            auto_title_finalized: false,
+            status: "in_progress",
+            awaiting_reply_token: null,
+            kind: "regular",
+            model: null,
+            git_branch: null,
+            external_id: "sess-1",
+            message_count: 1,
+            child_count: 0,
+            created_at: "2026-08-25T07:31:49.000Z",
+            updated_at: "2026-08-25T07:31:49.000Z",
+            pinned_at: null,
+          },
+          turns: [
+            {
+              id: "user-rekey-reopen",
+              role: "user",
+              blocks: [{ type: "text", text: "close before completion" }],
+              timestamp: "2026-08-25T07:31:49.000Z",
+            },
+          ],
+          session_stats: null,
+        })
+        await Promise.resolve()
+      })
+      expect(
+        useConversationRuntimeStore
+          .getState()
+          .byConversationId.get(42)
+          ?.localTurns.at(-1)
+      ).toMatchObject({
+        role: "assistant",
+        blocks: [{ type: "text", text: "rekeyed retained reply" }],
+      })
+      await act(async () => {
+        await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1", 42)
+      })
+
+      expect(h.store!.getConnection(orphanKey)).toBeUndefined()
+      expect(h.store!.getConnection(TAB)?.acceptedCompletionMessageId).toBe(
+        h.store!.getConnection(TAB)?.liveMessage?.id
+      )
+      expect(
+        useConversationRuntimeStore
+          .getState()
+          .byConversationId.get(42)
+          ?.localTurns.at(-1)
+      ).toMatchObject({
+        role: "assistant",
+        blocks: [{ type: "text", text: "rekeyed retained reply" }],
+      })
+    } finally {
+      resetConversationRuntimeStore()
+    }
+  })
+
   it("publishes final content as live when turn_complete shares its RAF frame", async () => {
     await mountDesktopOwner()
     const sink = vi.fn()
@@ -5148,6 +7552,1454 @@ describe("AcpConnectionsProvider frame transactions (raw order)", () => {
       { type: "text", text: "final answer" },
     ])
     expect(sink.mock.calls[0]![1]).toBe(true)
+  })
+
+  it("promotes a coalesced completed turn through its virtual runtime alias", async () => {
+    const { useConversationRuntimeStore, resetConversationRuntimeStore } =
+      await import("@/stores/conversation-runtime-store")
+    resetConversationRuntimeStore()
+    const runtimeActions = useConversationRuntimeStore.getState().actions
+    const runtimeConversationId = -42
+    runtimeActions.setExternalId(runtimeConversationId, "sess-1")
+    runtimeActions.setDbConversationId(runtimeConversationId, 42)
+    runtimeActions.appendOptimisticTurn(
+      runtimeConversationId,
+      {
+        id: "user-1",
+        role: "user",
+        blocks: [{ type: "text", text: "fix it" }],
+        timestamp: "2026-08-25T07:31:49.000Z",
+      },
+      "turn-1"
+    )
+
+    try {
+      await mountDesktopOwner("owner-conn", TAB, "sess-1", 42)
+
+      act(() => {
+        h.emitDesktopBatch(
+          batch(1, [
+            {
+              connection_id: "owner-conn",
+              seq: 1,
+              type: "user_message",
+              message_id: "user-1",
+              blocks: [{ type: "text", text: "fix it" }],
+            },
+            {
+              connection_id: "owner-conn",
+              seq: 2,
+              type: "status_changed",
+              status: "prompting",
+            },
+            content("owner-conn", 3, "final answer"),
+            {
+              connection_id: "owner-conn",
+              seq: 4,
+              type: "turn_complete",
+              session_id: "sess-1",
+              stop_reason: "end_turn",
+              mark_awaiting_reply: false,
+            },
+          ])
+        )
+        h.runAnimationFrame()
+      })
+
+      const runtime = useConversationRuntimeStore
+        .getState()
+        .byConversationId.get(runtimeConversationId)
+      expect(runtime?.syncState).toBe("idle")
+      expect(runtime?.optimisticTurns).toEqual([])
+      expect(
+        runtime?.localTurns.map((turn) => ({
+          role: turn.role,
+          blocks: turn.blocks,
+        }))
+      ).toEqual([
+        { role: "user", blocks: [{ type: "text", text: "fix it" }] },
+        {
+          role: "assistant",
+          blocks: [{ type: "text", text: "final answer" }],
+        },
+      ])
+    } finally {
+      resetConversationRuntimeStore()
+    }
+  })
+
+  it("does not retain a rejected durable alias for cold completion adoption", async () => {
+    const { useConversationRuntimeStore, resetConversationRuntimeStore } =
+      await import("@/stores/conversation-runtime-store")
+    resetConversationRuntimeStore()
+    const runtimeActions = useConversationRuntimeStore.getState().actions
+    const virtualConversationId = -42
+    runtimeActions.setExternalId(virtualConversationId, "sess-1")
+    runtimeActions.setDbConversationId(virtualConversationId, 42)
+    runtimeActions.appendOptimisticTurn(
+      virtualConversationId,
+      {
+        id: "user-a",
+        role: "user",
+        blocks: [{ type: "text", text: "owner prompt A" }],
+        timestamp: "2026-08-25T07:31:49.000Z",
+      },
+      "user-a"
+    )
+    runtimeActions.setExternalId(42, "sess-1")
+    runtimeActions.appendOptimisticTurn(
+      42,
+      {
+        id: "user-b",
+        role: "user",
+        blocks: [{ type: "text", text: "other prompt B" }],
+        timestamp: "2026-08-25T07:31:50.000Z",
+      },
+      "user-b"
+    )
+    const otherLive: LiveMessage = {
+      id: "reply-b",
+      role: "assistant",
+      content: [{ type: "text", text: "other reply B" }],
+      startedAt: 1_700_000_000_000,
+    }
+    runtimeActions.setLiveMessage(42, otherLive, true)
+
+    try {
+      await mountDesktopOwner("owner-conn", TAB, "sess-1", 42)
+      const unregister = h.actions!.registerLiveSinks(TAB, {
+        runtimeConversationId: virtualConversationId,
+        canonical: (message, isLive) => {
+          runtimeActions.setLiveMessage(virtualConversationId, message, isLive)
+          return (
+            useConversationRuntimeStore
+              .getState()
+              .byConversationId.get(virtualConversationId)?.liveMessage ===
+            message
+          )
+        },
+      })
+
+      act(() => {
+        h.emitDesktopBatch(
+          batch(1, [
+            {
+              connection_id: "owner-conn",
+              seq: 1,
+              type: "user_message",
+              message_id: "user-a",
+              blocks: [{ type: "text", text: "owner prompt A" }],
+            },
+            {
+              connection_id: "owner-conn",
+              seq: 2,
+              type: "status_changed",
+              status: "prompting",
+            },
+            content("owner-conn", 3, "owner reply A"),
+            {
+              connection_id: "owner-conn",
+              seq: 4,
+              type: "turn_complete",
+              session_id: "sess-1",
+              stop_reason: "end_turn",
+              mark_awaiting_reply: false,
+            },
+          ])
+        )
+        h.runAnimationFrame()
+      })
+
+      const completedConnection = h.store!.getConnection(TAB)
+      expect(
+        completedConnection?.acceptedCompletionRuntimeConversationIds
+      ).toEqual([virtualConversationId])
+      expect(
+        useConversationRuntimeStore.getState().byConversationId.get(42)
+          ?.liveMessage
+      ).toBe(otherLive)
+
+      unregister()
+      runtimeActions.removeConversation(42)
+      runtimeActions.setExternalId(42, "sess-1")
+      const canonical = vi.fn((message: LiveMessage, isLive: boolean) => {
+        runtimeActions.setLiveMessage(42, message, isLive)
+        return true
+      })
+      h.actions!.registerLiveSinks(TAB, {
+        runtimeConversationId: 42,
+        canonical,
+      })
+
+      expect(canonical).not.toHaveBeenCalled()
+      expect(
+        useConversationRuntimeStore.getState().byConversationId.get(42)
+          ?.localTurns
+      ).toEqual([])
+    } finally {
+      resetConversationRuntimeStore()
+    }
+  })
+
+  it("orders a coalesced viewer user message before its completed reply", async () => {
+    const { useConversationRuntimeStore, resetConversationRuntimeStore } =
+      await import("@/stores/conversation-runtime-store")
+    const { useAcpEvent } = await import("@/contexts/acp-connections-context")
+    resetConversationRuntimeStore()
+    const runtimeActions = useConversationRuntimeStore.getState().actions
+    runtimeActions.setExternalId(42, "sess-1")
+
+    function ViewerRuntimeProbe() {
+      const acpActions = useAcpActions()
+      useEffect(
+        () =>
+          acpActions.registerLiveMessageSink(
+            TAB,
+            (message, isLive, deliveryIds) => {
+              runtimeActions.setLiveMessage(42, message, isLive, deliveryIds)
+            }
+          ),
+        [acpActions]
+      )
+      useAcpEvent((event) => {
+        if (event.type !== "user_message") return
+        const turn: import("@/lib/types").MessageTurn = {
+          id: event.message_id,
+          role: "user",
+          blocks: event.blocks.map((block) =>
+            block.type === "image"
+              ? {
+                  type: "image",
+                  data: block.data,
+                  mime_type: block.mime_type,
+                  uri: null,
+                }
+              : { type: "text", text: block.text }
+          ),
+          timestamp: "2026-08-25T07:31:49.000Z",
+        }
+        runtimeActions.appendViewerUserTurn(42, turn)
+      })
+      return null
+    }
+
+    h.eventStreamValue = null
+    h.acpFindConnectionForConversation.mockResolvedValue({
+      connection_id: "viewer-conn",
+      event_seq: 0,
+    })
+    render(
+      <AcpConnectionsProvider>
+        <Probe />
+        <ViewerRuntimeProbe />
+      </AcpConnectionsProvider>
+    )
+
+    try {
+      await act(async () => {
+        await Promise.resolve()
+        await Promise.resolve()
+      })
+      await act(async () => {
+        await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1", 42)
+      })
+      expect(h.store!.getConnection(TAB)?.isViewer).toBe(true)
+
+      act(() => {
+        h.emitDesktopBatch(
+          batch(1, [
+            {
+              connection_id: "viewer-conn",
+              seq: 1,
+              type: "user_message",
+              message_id: "viewer-user-1",
+              blocks: [{ type: "text", text: "check this" }],
+            },
+            {
+              connection_id: "viewer-conn",
+              seq: 2,
+              type: "status_changed",
+              status: "prompting",
+            },
+            content("viewer-conn", 3, "viewer final answer"),
+            {
+              connection_id: "viewer-conn",
+              seq: 4,
+              type: "turn_complete",
+              session_id: "sess-1",
+              stop_reason: "end_turn",
+              mark_awaiting_reply: false,
+            },
+          ])
+        )
+        h.runAnimationFrame()
+      })
+
+      const runtime = useConversationRuntimeStore
+        .getState()
+        .byConversationId.get(42)
+      expect(runtime?.optimisticTurns).toEqual([])
+      expect(
+        runtime?.localTurns.map((turn) => ({
+          id: turn.id,
+          role: turn.role,
+          blocks: turn.blocks,
+        }))
+      ).toEqual([
+        {
+          id: "viewer-user-1",
+          role: "user",
+          blocks: [{ type: "text", text: "check this" }],
+        },
+        {
+          id: expect.any(String),
+          role: "assistant",
+          blocks: [{ type: "text", text: "viewer final answer" }],
+        },
+      ])
+    } finally {
+      resetConversationRuntimeStore()
+    }
+  })
+
+  it("orders a coalesced viewer user message before its user-stop reply", async () => {
+    const {
+      noteUserStopTurnOwnership,
+      useConversationRuntimeStore,
+      resetConversationRuntimeStore,
+    } = await import("@/stores/conversation-runtime-store")
+    const { useAcpEvent } = await import("@/contexts/acp-connections-context")
+    resetConversationRuntimeStore()
+    const runtimeActions = useConversationRuntimeStore.getState().actions
+    runtimeActions.setExternalId(42, "sess-1")
+    noteUserStopTurnOwnership(42)
+
+    function ViewerRuntimeProbe() {
+      const acpActions = useAcpActions()
+      useEffect(
+        () =>
+          acpActions.registerLiveSinks(TAB, {
+            runtimeConversationId: 42,
+            canonical: (message, isLive, deliveryIds) => {
+              runtimeActions.setLiveMessage(42, message, isLive, deliveryIds)
+              return (
+                useConversationRuntimeStore.getState().byConversationId.get(42)
+                  ?.liveMessage === message
+              )
+            },
+          }),
+        [acpActions]
+      )
+      useAcpEvent((event) => {
+        if (event.type !== "user_message") return
+        runtimeActions.appendViewerUserTurn(42, {
+          id: event.message_id,
+          role: "user",
+          blocks: event.blocks.map((block) =>
+            block.type === "image"
+              ? {
+                  type: "image",
+                  data: block.data,
+                  mime_type: block.mime_type,
+                  uri: null,
+                }
+              : { type: "text", text: block.text }
+          ),
+          timestamp: "2026-08-25T07:31:49.000Z",
+        })
+      })
+      return null
+    }
+
+    h.eventStreamValue = null
+    h.acpFindConnectionForConversation.mockResolvedValue({
+      connection_id: "viewer-conn",
+      event_seq: 0,
+    })
+    render(
+      <AcpConnectionsProvider>
+        <Probe />
+        <ViewerRuntimeProbe />
+      </AcpConnectionsProvider>
+    )
+
+    try {
+      await act(async () => {
+        await Promise.resolve()
+        await Promise.resolve()
+      })
+      await act(async () => {
+        await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1", 42)
+      })
+
+      act(() => {
+        h.emitDesktopBatch(
+          batch(1, [
+            {
+              connection_id: "viewer-conn",
+              seq: 1,
+              type: "user_message",
+              message_id: "viewer-user-stop",
+              blocks: [{ type: "text", text: "cancel this" }],
+            },
+            {
+              connection_id: "viewer-conn",
+              seq: 2,
+              type: "status_changed",
+              status: "prompting",
+            },
+            content("viewer-conn", 3, "partial answer"),
+            {
+              connection_id: "viewer-conn",
+              seq: 4,
+              type: "turn_complete",
+              session_id: "sess-1",
+              stop_reason: "cancelled",
+              mark_awaiting_reply: false,
+              termination_source: "user_stop",
+              provider_turn_id: null,
+            },
+          ])
+        )
+        h.runAnimationFrame()
+      })
+
+      const runtime = useConversationRuntimeStore
+        .getState()
+        .byConversationId.get(42)
+      expect(
+        runtime?.localTurns.map((turn) => ({
+          id: turn.id,
+          role: turn.role,
+          blocks: turn.blocks,
+          outcome: turn.outcome,
+        }))
+      ).toEqual([
+        {
+          id: "viewer-user-stop",
+          role: "user",
+          blocks: [{ type: "text", text: "cancel this" }],
+          outcome: undefined,
+        },
+        {
+          id: expect.any(String),
+          role: "assistant",
+          blocks: [{ type: "text", text: "partial answer" }],
+          outcome: {
+            status: "interrupted",
+            stop_reason: "cancelled",
+            source: "user_stop",
+            provider_turn_id: null,
+          },
+        },
+      ])
+      expect(runtime?.optimisticTurns).toEqual([])
+    } finally {
+      resetConversationRuntimeStore()
+    }
+  })
+
+  it("promotes an earlier completion without pairing it with a later turn", async () => {
+    const { useConversationRuntimeStore, resetConversationRuntimeStore } =
+      await import("@/stores/conversation-runtime-store")
+    resetConversationRuntimeStore()
+    const runtimeActions = useConversationRuntimeStore.getState().actions
+    runtimeActions.setExternalId(42, "sess-1")
+    runtimeActions.appendOptimisticTurn(
+      42,
+      {
+        id: "user-a",
+        role: "user",
+        blocks: [{ type: "text", text: "turn A" }],
+        timestamp: "2026-08-25T07:31:49.000Z",
+      },
+      "turn-a"
+    )
+
+    try {
+      await mountDesktopOwner("owner-conn", TAB, "sess-1", 42)
+
+      act(() => {
+        h.emitDesktopBatch(
+          batch(1, [
+            {
+              connection_id: "owner-conn",
+              seq: 1,
+              type: "status_changed",
+              status: "prompting",
+            },
+            content("owner-conn", 2, "answer A"),
+            {
+              connection_id: "owner-conn",
+              seq: 3,
+              type: "turn_complete",
+              session_id: "sess-1",
+              stop_reason: "end_turn",
+              mark_awaiting_reply: false,
+            },
+            {
+              connection_id: "owner-conn",
+              seq: 4,
+              type: "status_changed",
+              status: "prompting",
+            },
+            content("owner-conn", 5, "answer B in progress"),
+          ])
+        )
+        h.runAnimationFrame()
+      })
+
+      const runtime = useConversationRuntimeStore
+        .getState()
+        .byConversationId.get(42)
+      expect(
+        runtime?.localTurns.map((turn) => ({
+          role: turn.role,
+          blocks: turn.blocks,
+        }))
+      ).toEqual([
+        { role: "user", blocks: [{ type: "text", text: "turn A" }] },
+        { role: "assistant", blocks: [{ type: "text", text: "answer A" }] },
+      ])
+      expect(runtime?.optimisticTurns).toEqual([])
+      expect(runtime?.syncState).toBe("idle")
+      expect(h.store!.getConnection(TAB)?.liveMessage?.content).toEqual([
+        { type: "text", text: "answer B in progress" },
+      ])
+    } finally {
+      resetConversationRuntimeStore()
+    }
+  })
+
+  it("uses the last of two terminal completions in one frame", async () => {
+    const { useConversationRuntimeStore, resetConversationRuntimeStore } =
+      await import("@/stores/conversation-runtime-store")
+    resetConversationRuntimeStore()
+    const runtimeActions = useConversationRuntimeStore.getState().actions
+    runtimeActions.setExternalId(42, "sess-1")
+    runtimeActions.appendOptimisticTurn(
+      42,
+      {
+        id: "user-a",
+        role: "user",
+        blocks: [{ type: "text", text: "turn A" }],
+        timestamp: "2026-08-25T07:31:49.000Z",
+      },
+      "turn-a"
+    )
+
+    try {
+      await mountDesktopOwner("owner-conn", TAB, "sess-1", 42)
+      h.actions!.registerLiveMessageSink(TAB, (message, isLive) => {
+        runtimeActions.setLiveMessage(42, message, isLive)
+      })
+      act(() => {
+        h.emitDesktopBatch(
+          batch(1, [
+            {
+              connection_id: "owner-conn",
+              seq: 1,
+              type: "status_changed",
+              status: "prompting",
+            },
+            content("owner-conn", 2, "answer A"),
+            {
+              connection_id: "owner-conn",
+              seq: 3,
+              type: "turn_complete",
+              session_id: "sess-1",
+              stop_reason: "end_turn",
+              mark_awaiting_reply: false,
+            },
+          ])
+        )
+        h.runAnimationFrame()
+      })
+      runtimeActions.appendOptimisticTurn(
+        42,
+        {
+          id: "user-b",
+          role: "user",
+          blocks: [{ type: "text", text: "turn B" }],
+          timestamp: "2026-08-25T07:31:50.000Z",
+        },
+        "turn-b"
+      )
+
+      act(() => {
+        h.emitDesktopBatch(
+          batch(2, [
+            {
+              connection_id: "owner-conn",
+              seq: 4,
+              type: "turn_complete",
+              session_id: "sess-1",
+              stop_reason: "end_turn",
+              mark_awaiting_reply: false,
+            },
+            {
+              connection_id: "owner-conn",
+              seq: 5,
+              type: "user_message",
+              message_id: "user-b",
+              blocks: [{ type: "text", text: "turn B" }],
+            },
+            {
+              connection_id: "owner-conn",
+              seq: 6,
+              type: "status_changed",
+              status: "prompting",
+            },
+            content("owner-conn", 7, "answer B"),
+            {
+              connection_id: "owner-conn",
+              seq: 8,
+              type: "turn_complete",
+              session_id: "sess-1",
+              stop_reason: "end_turn",
+              mark_awaiting_reply: false,
+            },
+          ])
+        )
+        h.runAnimationFrame()
+      })
+
+      const runtime = useConversationRuntimeStore
+        .getState()
+        .byConversationId.get(42)
+      expect(
+        runtime?.localTurns.map((turn) => ({
+          role: turn.role,
+          blocks: turn.blocks,
+        }))
+      ).toEqual([
+        { role: "user", blocks: [{ type: "text", text: "turn A" }] },
+        { role: "assistant", blocks: [{ type: "text", text: "answer A" }] },
+        { role: "user", blocks: [{ type: "text", text: "turn B" }] },
+        { role: "assistant", blocks: [{ type: "text", text: "answer B" }] },
+      ])
+    } finally {
+      resetConversationRuntimeStore()
+    }
+  })
+
+  it("promotes two previously unprocessed turn boundaries in one frame", async () => {
+    const { useConversationRuntimeStore, resetConversationRuntimeStore } =
+      await import("@/stores/conversation-runtime-store")
+    resetConversationRuntimeStore()
+    const runtimeActions = useConversationRuntimeStore.getState().actions
+    runtimeActions.setExternalId(42, "sess-1")
+    runtimeActions.appendOptimisticTurn(
+      42,
+      {
+        id: "user-a",
+        role: "user",
+        blocks: [{ type: "text", text: "turn A" }],
+        timestamp: "2026-08-25T07:31:49.000Z",
+      },
+      "turn-a"
+    )
+
+    try {
+      await mountDesktopOwner("owner-conn", TAB, "sess-1", 42)
+      h.actions!.registerLiveMessageSink(TAB, (message, isLive) => {
+        runtimeActions.setLiveMessage(42, message, isLive)
+        return (
+          useConversationRuntimeStore.getState().byConversationId.get(42)
+            ?.liveMessage === message
+        )
+      })
+
+      act(() => {
+        h.emitDesktopBatch(
+          batch(1, [
+            {
+              connection_id: "owner-conn",
+              seq: 1,
+              type: "status_changed",
+              status: "prompting",
+            },
+            content("owner-conn", 2, "answer A"),
+            {
+              connection_id: "owner-conn",
+              seq: 3,
+              type: "turn_complete",
+              session_id: "sess-1",
+              stop_reason: "end_turn",
+              mark_awaiting_reply: false,
+            },
+            {
+              connection_id: "owner-conn",
+              seq: 4,
+              type: "user_message",
+              message_id: "user-b",
+              blocks: [{ type: "text", text: "turn B" }],
+            },
+            {
+              connection_id: "owner-conn",
+              seq: 5,
+              type: "status_changed",
+              status: "prompting",
+            },
+            content("owner-conn", 6, "answer B"),
+            {
+              connection_id: "owner-conn",
+              seq: 7,
+              type: "turn_complete",
+              session_id: "sess-1",
+              stop_reason: "end_turn",
+              mark_awaiting_reply: false,
+            },
+          ])
+        )
+        h.runAnimationFrame()
+      })
+
+      const runtime = useConversationRuntimeStore
+        .getState()
+        .byConversationId.get(42)
+      expect(
+        runtime?.localTurns.map((turn) => ({
+          role: turn.role,
+          blocks: turn.blocks,
+        }))
+      ).toEqual([
+        { role: "user", blocks: [{ type: "text", text: "turn A" }] },
+        { role: "assistant", blocks: [{ type: "text", text: "answer A" }] },
+        { role: "user", blocks: [{ type: "text", text: "turn B" }] },
+        { role: "assistant", blocks: [{ type: "text", text: "answer B" }] },
+      ])
+      expect(runtime?.optimisticTurns).toEqual([])
+      expect(runtime?.liveMessage).toBeNull()
+      const completedConnection = h.store!.getConnection(TAB)
+      expect(completedConnection?.liveMessage).toEqual(
+        expect.objectContaining({ id: expect.any(String) })
+      )
+      expect(completedConnection?.acceptedCompletionMessageId).toBe(
+        completedConnection?.liveMessage?.id
+      )
+      expect(
+        completedConnection?.acceptedCompletionRuntimeConversationIds
+      ).toEqual([42])
+    } finally {
+      resetConversationRuntimeStore()
+    }
+  })
+
+  it("does not authorize retained completion without connection session identity", async () => {
+    const { useConversationRuntimeStore, resetConversationRuntimeStore } =
+      await import("@/stores/conversation-runtime-store")
+    const { useAcpEvent } = await import("@/contexts/acp-connections-context")
+    const rawSeqs: number[] = []
+    function RawProbe() {
+      useAcpEvent((event) => rawSeqs.push(event.seq))
+      return null
+    }
+    resetConversationRuntimeStore()
+    useAppWorkspaceStore
+      .getState()
+      .applyConversationUpsert(
+        makeSummary({ id: 42, external_id: "expected-session" })
+      )
+
+    try {
+      h.eventStreamValue = null
+      h.acpConnect.mockResolvedValue("owner-conn")
+      await mountProvider(<RawProbe />)
+      await act(async () => {
+        await Promise.resolve()
+        await Promise.resolve()
+        await h.actions!.connect(TAB, "claude_code", "/work", undefined, 42)
+      })
+
+      act(() => {
+        h.emitDesktopBatch(
+          batch(1, [
+            {
+              connection_id: "owner-conn",
+              seq: 1,
+              type: "status_changed",
+              status: "prompting",
+            },
+            content("owner-conn", 2, "reply with unknown session"),
+          ])
+        )
+        h.runAnimationFrame()
+      })
+      expect(h.store!.getConnection(TAB)).toMatchObject({
+        status: "prompting",
+        sessionId: null,
+      })
+
+      act(() => {
+        h.emitDesktopBatch(
+          batch(2, [
+            {
+              connection_id: "owner-conn",
+              seq: 3,
+              type: "turn_complete",
+              session_id: "other-session",
+              stop_reason: "end_turn",
+              mark_awaiting_reply: false,
+            },
+          ])
+        )
+        h.runAnimationFrame()
+      })
+
+      expect(h.store!.getConnection(TAB)).toMatchObject({
+        status: "prompting",
+        lastAppliedSeq: 3,
+        acceptedCompletionMessageId: null,
+        acceptedCompletionRuntimeConversationIds: null,
+      })
+      expect(rawSeqs).toContain(3)
+
+      const runtimeActions = useConversationRuntimeStore.getState().actions
+      runtimeActions.setExternalId(42, "expected-session")
+      h.actions!.registerLiveSinks(TAB, {
+        runtimeConversationId: 42,
+        canonical: (message, isLive) => {
+          runtimeActions.setLiveMessage(42, message, isLive)
+          return true
+        },
+      })
+
+      const runtime = useConversationRuntimeStore
+        .getState()
+        .byConversationId.get(42)
+      expect(runtime?.localTurns).toEqual([])
+      expect(runtime?.liveMessage?.content).toEqual([
+        { type: "text", text: "reply with unknown session" },
+      ])
+    } finally {
+      resetConversationRuntimeStore()
+    }
+  })
+
+  it("does not complete a runtime from another session", async () => {
+    const { useConversationRuntimeStore, resetConversationRuntimeStore } =
+      await import("@/stores/conversation-runtime-store")
+    const { createLiveTranscriptFrameSink, liveTranscriptStore } =
+      await import("@/stores/live-transcript-store")
+    const { useAcpEvent } = await import("@/contexts/acp-connections-context")
+    const rawSeqs: number[] = []
+    function RawProbe() {
+      useAcpEvent((event) => rawSeqs.push(event.seq))
+      return null
+    }
+    resetConversationRuntimeStore()
+    const runtimeActions = useConversationRuntimeStore.getState().actions
+    runtimeActions.setExternalId(42, "sess-1")
+    runtimeActions.appendOptimisticTurn(
+      42,
+      {
+        id: "user-1",
+        role: "user",
+        blocks: [{ type: "text", text: "keep this in flight" }],
+        timestamp: "2026-08-25T07:31:49.000Z",
+      },
+      "turn-1"
+    )
+
+    try {
+      await mountDesktopOwner("owner-conn", TAB, "sess-1", 42, <RawProbe />)
+      h.actions!.registerLiveSinks(TAB, {
+        canonical: (message, isLive) => {
+          runtimeActions.setLiveMessage(42, message, isLive)
+          return (
+            useConversationRuntimeStore.getState().byConversationId.get(42)
+              ?.liveMessage === message
+          )
+        },
+        transcript: createLiveTranscriptFrameSink(42, "owner-conn"),
+      })
+
+      act(() => {
+        h.emitDesktopBatch(
+          batch(1, [
+            {
+              connection_id: "owner-conn",
+              seq: 1,
+              type: "session_started",
+              session_id: "sess-1",
+            },
+            {
+              connection_id: "owner-conn",
+              seq: 2,
+              type: "status_changed",
+              status: "prompting",
+            },
+            content("owner-conn", 3, "wrong-session reply"),
+            {
+              connection_id: "owner-conn",
+              seq: 4,
+              type: "turn_complete",
+              session_id: "other-session",
+              stop_reason: "end_turn",
+              mark_awaiting_reply: false,
+            },
+          ])
+        )
+        h.runAnimationFrame()
+      })
+
+      const runtime = useConversationRuntimeStore
+        .getState()
+        .byConversationId.get(42)
+      expect(runtime?.localTurns).toEqual([])
+      expect(runtime?.optimisticTurns.map((turn) => turn.id)).toEqual([
+        "user-1",
+      ])
+      expect(runtime?.liveMessage?.content).toEqual([
+        { type: "text", text: "wrong-session reply" },
+      ])
+      expect(runtime?.syncState).toBe("awaiting_persist")
+      expect(liveTranscriptStore.getConversation(42)?.status).toBe("streaming")
+      expect(h.store!.getConnection(TAB)).toMatchObject({
+        status: "prompting",
+        lastAppliedSeq: 4,
+        acceptedCompletionMessageId: null,
+        acceptedCompletionRuntimeConversationIds: null,
+      })
+      expect(rawSeqs).toContain(4)
+
+      act(() => {
+        h.emitDesktopBatch(
+          batch(2, [content("owner-conn", 5, " + still live")])
+        )
+        h.runAnimationFrame()
+      })
+
+      expect(
+        useConversationRuntimeStore.getState().byConversationId.get(42)
+          ?.liveMessage?.content
+      ).toEqual([{ type: "text", text: "wrong-session reply + still live" }])
+      expect(h.store!.getConnection(TAB)).toMatchObject({
+        status: "prompting",
+        lastAppliedSeq: 5,
+      })
+    } finally {
+      resetConversationRuntimeStore()
+    }
+  })
+
+  it("rejects a terminal when an exact-live runtime owns another session", async () => {
+    const { useConversationRuntimeStore, resetConversationRuntimeStore } =
+      await import("@/stores/conversation-runtime-store")
+    const { useAcpEvent } = await import("@/contexts/acp-connections-context")
+    const rawSeqs: number[] = []
+    function RawProbe() {
+      useAcpEvent((event) => rawSeqs.push(event.seq))
+      return null
+    }
+    resetConversationRuntimeStore()
+    const runtimeActions = useConversationRuntimeStore.getState().actions
+    runtimeActions.setExternalId(42, "owned-session")
+    runtimeActions.appendOptimisticTurn(
+      42,
+      {
+        id: "user-1",
+        role: "user",
+        blocks: [{ type: "text", text: "keep this in flight" }],
+        timestamp: "2026-08-25T07:31:49.000Z",
+      },
+      "turn-1"
+    )
+
+    try {
+      await mountDesktopOwner(
+        "owner-conn",
+        TAB,
+        "requested-session",
+        42,
+        <RawProbe />
+      )
+      h.actions!.registerLiveMessageSink(TAB, (message, isLive) => {
+        runtimeActions.setLiveMessage(42, message, isLive)
+        return (
+          useConversationRuntimeStore.getState().byConversationId.get(42)
+            ?.liveMessage === message
+        )
+      })
+
+      act(() => {
+        h.emitDesktopBatch(
+          batch(1, [
+            {
+              connection_id: "owner-conn",
+              seq: 1,
+              type: "status_changed",
+              status: "prompting",
+            },
+            content("owner-conn", 2, "owned reply"),
+          ])
+        )
+        h.runAnimationFrame()
+      })
+
+      const connectionLive = h.store!.getConnection(TAB)?.liveMessage
+      expect(h.store!.getConnection(TAB)?.sessionId).toBeNull()
+      expect(
+        useConversationRuntimeStore.getState().byConversationId.get(42)
+          ?.liveMessage
+      ).toBe(connectionLive)
+
+      act(() => {
+        h.emitDesktopBatch(
+          batch(2, [
+            {
+              connection_id: "owner-conn",
+              seq: 3,
+              type: "turn_complete",
+              session_id: "other-session",
+              stop_reason: "end_turn",
+              mark_awaiting_reply: false,
+            },
+          ])
+        )
+        h.runAnimationFrame()
+      })
+
+      expect(h.store!.getConnection(TAB)).toMatchObject({
+        status: "prompting",
+        lastAppliedSeq: 3,
+      })
+      expect(rawSeqs).toContain(3)
+
+      act(() => {
+        h.emitDesktopBatch(
+          batch(3, [content("owner-conn", 4, " + still live")])
+        )
+        h.runAnimationFrame()
+      })
+
+      expect(
+        useConversationRuntimeStore.getState().byConversationId.get(42)
+          ?.liveMessage?.content
+      ).toEqual([{ type: "text", text: "owned reply + still live" }])
+      expect(h.store!.getConnection(TAB)?.status).toBe("prompting")
+    } finally {
+      resetConversationRuntimeStore()
+    }
+  })
+
+  it("does not let a delayed user-stop completion consume the next turn", async () => {
+    const {
+      noteUserStopTurnOwnership,
+      useConversationRuntimeStore,
+      resetConversationRuntimeStore,
+    } = await import("@/stores/conversation-runtime-store")
+    const { createLiveTranscriptFrameSink, liveTranscriptStore } =
+      await import("@/stores/live-transcript-store")
+    const { useAcpEvent } = await import("@/contexts/acp-connections-context")
+    const rawSeqs: number[] = []
+    function RawProbe() {
+      useAcpEvent((event) => rawSeqs.push(event.seq))
+      return null
+    }
+    resetConversationRuntimeStore()
+    const runtimeActions = useConversationRuntimeStore.getState().actions
+    runtimeActions.setExternalId(42, "sess-1")
+    runtimeActions.appendOptimisticTurn(
+      42,
+      {
+        id: "user-a",
+        role: "user",
+        blocks: [{ type: "text", text: "turn A" }],
+        timestamp: "2026-08-25T07:31:49.000Z",
+      },
+      "turn-a"
+    )
+    const replyA: LiveMessage = {
+      id: "reply-a",
+      role: "assistant",
+      content: [{ type: "text", text: "partial A" }],
+      startedAt: 1_700_000_000_000,
+    }
+    runtimeActions.setLiveMessage(42, replyA, true)
+    noteUserStopTurnOwnership(42)
+    runtimeActions.completeTurn(42, replyA)
+    runtimeActions.appendOptimisticTurn(
+      42,
+      {
+        id: "user-b",
+        role: "user",
+        blocks: [{ type: "text", text: "turn B" }],
+        timestamp: "2026-08-25T07:31:50.000Z",
+      },
+      "turn-b"
+    )
+
+    try {
+      await mountDesktopOwner("owner-conn", TAB, "sess-1", 42, <RawProbe />)
+      h.actions!.registerLiveSinks(TAB, {
+        canonical: (message, isLive) => {
+          runtimeActions.setLiveMessage(42, message, isLive)
+          return (
+            useConversationRuntimeStore.getState().byConversationId.get(42)
+              ?.liveMessage === message
+          )
+        },
+        transcript: createLiveTranscriptFrameSink(42, "owner-conn"),
+      })
+
+      act(() => {
+        h.emitDesktopBatch(
+          batch(1, [
+            {
+              connection_id: "owner-conn",
+              seq: 1,
+              type: "status_changed",
+              status: "prompting",
+            },
+            content("owner-conn", 2, "reply B in progress"),
+          ])
+        )
+        h.runAnimationFrame()
+      })
+      const liveB = useConversationRuntimeStore
+        .getState()
+        .byConversationId.get(42)?.liveMessage
+      expect(liveB?.content).toEqual([
+        { type: "text", text: "reply B in progress" },
+      ])
+      expect(liveTranscriptStore.getConversation(42)?.status).toBe("streaming")
+
+      act(() => {
+        h.emitDesktopBatch(
+          batch(2, [
+            {
+              connection_id: "owner-conn",
+              seq: 3,
+              type: "turn_complete",
+              session_id: "sess-1",
+              stop_reason: "cancelled",
+              mark_awaiting_reply: false,
+              termination_source: "user_stop",
+              provider_turn_id: "provider-a",
+            },
+          ])
+        )
+        h.runAnimationFrame()
+      })
+
+      const runtime = useConversationRuntimeStore
+        .getState()
+        .byConversationId.get(42)
+      expect(runtime?.activeTurnToken).toBe("turn-b")
+      expect(runtime?.optimisticTurns.map((turn) => turn.id)).toEqual([
+        "user-b",
+      ])
+      expect(runtime?.liveMessage).toBe(liveB)
+      expect(
+        runtime?.localTurns
+          .filter((turn) => turn.role === "assistant")
+          .map((turn) => turn.blocks)
+      ).toEqual([[{ type: "text", text: "partial A" }]])
+      expect(liveTranscriptStore.getConversation(42)?.status).toBe("streaming")
+      expect(h.store!.getConnection(TAB)).toMatchObject({
+        status: "prompting",
+        lastAppliedSeq: 3,
+      })
+      expect(rawSeqs).toContain(3)
+
+      act(() => {
+        h.emitDesktopBatch(batch(3, [content("owner-conn", 4, " + tail")]))
+        h.runAnimationFrame()
+      })
+
+      expect(
+        useConversationRuntimeStore.getState().byConversationId.get(42)
+          ?.liveMessage?.content
+      ).toEqual([{ type: "text", text: "reply B in progress + tail" }])
+      expect(h.store!.getConnection(TAB)).toMatchObject({
+        status: "prompting",
+        lastAppliedSeq: 4,
+      })
+    } finally {
+      resetConversationRuntimeStore()
+    }
+  })
+
+  it("promotes an accepted user-stop completion through its ownership fence", async () => {
+    const {
+      noteUserStopTurnOwnership,
+      useConversationRuntimeStore,
+      resetConversationRuntimeStore,
+    } = await import("@/stores/conversation-runtime-store")
+    const { createLiveTranscriptFrameSink, liveTranscriptStore } =
+      await import("@/stores/live-transcript-store")
+    resetConversationRuntimeStore()
+    const runtimeActions = useConversationRuntimeStore.getState().actions
+    runtimeActions.setExternalId(42, "sess-1")
+    runtimeActions.appendOptimisticTurn(
+      42,
+      {
+        id: "user-a",
+        role: "user",
+        blocks: [{ type: "text", text: "cancel turn A" }],
+        timestamp: "2026-08-25T07:31:49.000Z",
+      },
+      "turn-a"
+    )
+    noteUserStopTurnOwnership(42)
+
+    try {
+      await mountDesktopOwner("owner-conn", TAB, "sess-1", 42)
+      h.actions!.registerLiveSinks(TAB, {
+        canonical: (message, isLive) => {
+          runtimeActions.setLiveMessage(42, message, isLive)
+          return (
+            useConversationRuntimeStore.getState().byConversationId.get(42)
+              ?.liveMessage === message
+          )
+        },
+        transcript: createLiveTranscriptFrameSink(42, "owner-conn"),
+      })
+      act(() => {
+        h.emitDesktopBatch(
+          batch(1, [
+            {
+              connection_id: "owner-conn",
+              seq: 1,
+              type: "status_changed",
+              status: "prompting",
+            },
+            content("owner-conn", 2, "cancelled final content"),
+            {
+              connection_id: "owner-conn",
+              seq: 3,
+              type: "turn_complete",
+              session_id: "sess-1",
+              stop_reason: "cancelled",
+              mark_awaiting_reply: false,
+              termination_source: "user_stop",
+              provider_turn_id: null,
+            },
+          ])
+        )
+        h.runAnimationFrame()
+      })
+
+      const runtime = useConversationRuntimeStore
+        .getState()
+        .byConversationId.get(42)
+      expect(runtime?.optimisticTurns).toEqual([])
+      expect(runtime?.liveMessage).toBeNull()
+      expect(runtime?.localTurns.at(-1)).toMatchObject({
+        role: "assistant",
+        blocks: [{ type: "text", text: "cancelled final content" }],
+        outcome: { source: "user_stop", stop_reason: "cancelled" },
+      })
+      expect(liveTranscriptStore.getConversation(42)).toBeNull()
+    } finally {
+      resetConversationRuntimeStore()
+    }
+  })
+
+  it("does not apply user-stop completion to a same-session runtime with another live turn", async () => {
+    const {
+      noteUserStopTurnOwnership,
+      useConversationRuntimeStore,
+      resetConversationRuntimeStore,
+    } = await import("@/stores/conversation-runtime-store")
+    resetConversationRuntimeStore()
+    const runtimeActions = useConversationRuntimeStore.getState().actions
+    for (const [conversationId, userId, text, token] of [
+      [42, "user-owner", "owner prompt", "turn-owner"],
+      [43, "user-other", "other prompt", "turn-other"],
+    ] as const) {
+      runtimeActions.setExternalId(conversationId, "sess-1")
+      runtimeActions.appendOptimisticTurn(
+        conversationId,
+        {
+          id: userId,
+          role: "user",
+          blocks: [{ type: "text", text }],
+          timestamp: "2026-08-25T07:31:49.000Z",
+        },
+        token
+      )
+    }
+    const otherLive: LiveMessage = {
+      id: "reply-other",
+      role: "assistant",
+      content: [{ type: "text", text: "other reply" }],
+      startedAt: 1_700_000_000_000,
+    }
+    runtimeActions.setLiveMessage(43, otherLive, true)
+
+    try {
+      await mountDesktopOwner("owner-conn", TAB, "sess-1", 42)
+      h.actions!.registerLiveMessageSink(TAB, (message, isLive) => {
+        runtimeActions.setLiveMessage(42, message, isLive)
+        return (
+          useConversationRuntimeStore.getState().byConversationId.get(42)
+            ?.liveMessage === message
+        )
+      })
+
+      act(() => {
+        h.emitDesktopBatch(
+          batch(1, [
+            {
+              connection_id: "owner-conn",
+              seq: 1,
+              type: "status_changed",
+              status: "prompting",
+            },
+            content("owner-conn", 2, "owner reply"),
+          ])
+        )
+        h.runAnimationFrame()
+      })
+      noteUserStopTurnOwnership(42)
+      noteUserStopTurnOwnership(43)
+
+      act(() => {
+        h.emitDesktopBatch(
+          batch(2, [
+            {
+              connection_id: "owner-conn",
+              seq: 3,
+              type: "turn_complete",
+              session_id: "sess-1",
+              stop_reason: "cancelled",
+              mark_awaiting_reply: false,
+              termination_source: "user_stop",
+              provider_turn_id: null,
+            },
+          ])
+        )
+        h.runAnimationFrame()
+      })
+
+      const owner = useConversationRuntimeStore
+        .getState()
+        .byConversationId.get(42)
+      const other = useConversationRuntimeStore
+        .getState()
+        .byConversationId.get(43)
+      expect(owner?.localTurns.at(-1)).toMatchObject({
+        role: "assistant",
+        blocks: [{ type: "text", text: "owner reply" }],
+        outcome: { source: "user_stop", stop_reason: "cancelled" },
+      })
+      expect(other?.localTurns).toEqual([])
+      expect(other?.optimisticTurns.map((turn) => turn.id)).toEqual([
+        "user-other",
+      ])
+      expect(other?.liveMessage).toBe(otherLive)
+    } finally {
+      resetConversationRuntimeStore()
+    }
+  })
+
+  it("completes a user-stop step before mirroring the next turn in the same frame", async () => {
+    const {
+      noteUserStopTurnOwnership,
+      useConversationRuntimeStore,
+      resetConversationRuntimeStore,
+    } = await import("@/stores/conversation-runtime-store")
+    const { createLiveTranscriptFrameSink, liveTranscriptStore } =
+      await import("@/stores/live-transcript-store")
+    resetConversationRuntimeStore()
+    const runtimeActions = useConversationRuntimeStore.getState().actions
+    runtimeActions.setExternalId(42, "sess-1")
+    runtimeActions.appendOptimisticTurn(
+      42,
+      {
+        id: "user-a",
+        role: "user",
+        blocks: [{ type: "text", text: "cancel A" }],
+        timestamp: "2026-08-25T07:31:49.000Z",
+      },
+      "turn-a"
+    )
+    noteUserStopTurnOwnership(42)
+
+    try {
+      await mountDesktopOwner("owner-conn", TAB, "sess-1", 42)
+      h.actions!.registerLiveSinks(TAB, {
+        canonical: (message, isLive) => {
+          runtimeActions.setLiveMessage(42, message, isLive)
+          return (
+            useConversationRuntimeStore.getState().byConversationId.get(42)
+              ?.liveMessage === message
+          )
+        },
+        transcript: createLiveTranscriptFrameSink(42, "owner-conn"),
+      })
+
+      act(() => {
+        h.emitDesktopBatch(
+          batch(1, [
+            {
+              connection_id: "owner-conn",
+              seq: 1,
+              type: "status_changed",
+              status: "prompting",
+            },
+            content("owner-conn", 2, "cancelled reply A"),
+            {
+              connection_id: "owner-conn",
+              seq: 3,
+              type: "turn_complete",
+              session_id: "sess-1",
+              stop_reason: "cancelled",
+              mark_awaiting_reply: false,
+              termination_source: "user_stop",
+              provider_turn_id: null,
+            },
+            {
+              connection_id: "owner-conn",
+              seq: 4,
+              type: "status_changed",
+              status: "prompting",
+            },
+            content("owner-conn", 5, "reply B in progress"),
+          ])
+        )
+        h.runAnimationFrame()
+      })
+
+      const runtime = useConversationRuntimeStore
+        .getState()
+        .byConversationId.get(42)
+      expect(
+        runtime?.localTurns.map((turn) => ({
+          role: turn.role,
+          blocks: turn.blocks,
+          outcome: turn.outcome,
+        }))
+      ).toEqual([
+        {
+          role: "user",
+          blocks: [{ type: "text", text: "cancel A" }],
+          outcome: undefined,
+        },
+        {
+          role: "assistant",
+          blocks: [{ type: "text", text: "cancelled reply A" }],
+          outcome: {
+            status: "interrupted",
+            stop_reason: "cancelled",
+            source: "user_stop",
+            provider_turn_id: null,
+          },
+        },
+      ])
+      expect(runtime?.liveMessage?.content).toEqual([
+        { type: "text", text: "reply B in progress" },
+      ])
+      expect(h.store!.getConnection(TAB)?.status).toBe("prompting")
+      expect(liveTranscriptStore.getConversation(42)).toMatchObject({
+        status: "streaming",
+      })
+    } finally {
+      resetConversationRuntimeStore()
+    }
   })
 
   it("raw subscribers run after commit in original envelope order", async () => {
@@ -5487,13 +9339,16 @@ describe("AcpConnectionsProvider frame transactions (raw order)", () => {
   async function mountDesktopOwner(
     connectionId = "owner-conn",
     contextKey = TAB,
-    sessionId = "sess-1"
+    sessionId = "sess-1",
+    conversationId?: number,
+    children?: ReactNode
   ) {
     h.eventStreamValue = null
     h.acpConnect.mockResolvedValue(connectionId)
     render(
       <AcpConnectionsProvider>
         <Probe />
+        {children}
       </AcpConnectionsProvider>
     )
     await act(async () => {
@@ -5501,7 +9356,13 @@ describe("AcpConnectionsProvider frame transactions (raw order)", () => {
       await Promise.resolve()
     })
     await act(async () => {
-      await h.actions!.connect(contextKey, "claude_code", "/tmp/x", sessionId)
+      await h.actions!.connect(
+        contextKey,
+        "claude_code",
+        "/tmp/x",
+        sessionId,
+        conversationId
+      )
     })
   }
 
@@ -5891,6 +9752,17 @@ describe("AcpConnectionsProvider frame transactions (raw order)", () => {
     })
     expect(h.store!.getConnection(TAB)?.connectionId).toBe("owner-conn")
 
+    const publish = vi.fn()
+    h.actions!.registerLiveSinks(TAB, {
+      canonical: () => true,
+      transcript: {
+        rebuild: vi.fn(),
+        publish,
+        markCompleting: vi.fn(),
+        clear: vi.fn(),
+      },
+    })
+
     act(() => {
       h.emitDesktopBatch(
         batch(1, [
@@ -5923,6 +9795,9 @@ describe("AcpConnectionsProvider frame transactions (raw order)", () => {
     expect(texts.join("")).toContain("only-live")
     expect(texts.join("")).not.toContain("dup-a")
     expect(texts.join("")).not.toContain("dup-b")
+    const drainedFrame = publish.mock.calls.at(-1)?.[0]
+    expect(drainedFrame?.deliverySource).toBe("desktop")
+    expect(drainedFrame?.eventDeliverySourceBySeq?.get(3)).toBe("desktop")
   })
 
   it("snapshot race mid-queue drops old seq and applies contiguous suffix", async () => {
@@ -6161,15 +10036,14 @@ describe("AcpConnectionsProvider frame transactions (raw order)", () => {
     const liveBefore = h.store!.getConnection(TAB)?.liveMessage
 
     act(() => {
-      // user_message produces no FrameAction store mutations — cursor only.
+      // user_prompt_sent is notification-only — cursor advance only.
       h.emitDesktopBatch(
         batch(2, [
           {
             connection_id: "owner-conn",
             seq: 2,
-            type: "user_message",
-            message_id: "m1",
-            blocks: [{ type: "text", text: "hi" }],
+            type: "user_prompt_sent",
+            text_preview: "hi",
           },
         ])
       )
@@ -8304,6 +12178,81 @@ describe("AcpConnectionsProvider canonical observer aliases", () => {
     expect(h.attach).toHaveBeenCalledTimes(1)
   })
 
+  it("snapshots user-stop ownership for every runtime alias", async () => {
+    const TAB2 = "conv-2-claude_code-99"
+    const {
+      __getUserStopOwnershipForTests,
+      resetConversationRuntimeStore,
+      useConversationRuntimeStore,
+    } = await import("@/stores/conversation-runtime-store")
+    resetConversationRuntimeStore()
+    const runtimeActions = useConversationRuntimeStore.getState().actions
+    const live: LiveMessage = {
+      id: "shared-cancel-live",
+      role: "assistant",
+      content: [{ type: "text", text: "partial shared reply" }],
+      startedAt: 1_700_000_000_000,
+    }
+    for (const conversationId of [42, 99]) {
+      runtimeActions.setExternalId(conversationId, "sess-shared")
+      runtimeActions.appendOptimisticTurn(
+        conversationId,
+        {
+          id: `user-${conversationId}`,
+          role: "user",
+          blocks: [{ type: "text", text: "cancel shared prompt" }],
+          timestamp: "2026-08-25T07:31:49.000Z",
+        },
+        `turn-${conversationId}`
+      )
+      runtimeActions.setLiveMessage(conversationId, live, true)
+    }
+
+    try {
+      h.acpFindConnectionForConversation.mockResolvedValue({
+        connection_id: "broker-child",
+        event_seq: 0,
+      })
+      await mountProvider()
+      await act(async () => {
+        await h.actions!.connect(
+          TAB,
+          "claude_code",
+          "/tmp/x",
+          "sess-shared",
+          42
+        )
+      })
+      emitAcpEvent(latestAttachHandlers(), {
+        seq: 1,
+        connection_id: "broker-child",
+        type: "session_started",
+        session_id: "sess-shared",
+      })
+      h.acpFindConnectionForConversation.mockResolvedValue(null)
+      await act(async () => {
+        await h.actions!.connect(
+          TAB2,
+          "claude_code",
+          "/tmp/x",
+          "sess-shared",
+          99
+        )
+        await h.actions!.cancel(TAB)
+      })
+
+      expect(__getUserStopOwnershipForTests(42)).toMatchObject({
+        activeTurnToken: "turn-42",
+      })
+      expect(__getUserStopOwnershipForTests(99)).toMatchObject({
+        activeTurnToken: "turn-99",
+      })
+      expect(h.acpCancel).toHaveBeenCalledTimes(1)
+    } finally {
+      resetConversationRuntimeStore()
+    }
+  })
+
   it("dismisses canonical session failures through a viewer tab alias", async () => {
     h.acpFindConnectionForConversation.mockResolvedValue({
       connection_id: "broker-child",
@@ -8413,6 +12362,545 @@ describe("AcpConnectionsProvider canonical observer aliases", () => {
     })
     offSink()
     off()
+  })
+
+  it("promotes a coalesced completion in every canonical observer alias", async () => {
+    const TAB2 = "conv-2-claude_code-99"
+    const { useConversationRuntimeStore, resetConversationRuntimeStore } =
+      await import("@/stores/conversation-runtime-store")
+    resetConversationRuntimeStore()
+    const runtimeActions = useConversationRuntimeStore.getState().actions
+    const userTurn = {
+      id: "shared-user",
+      role: "user" as const,
+      blocks: [{ type: "text" as const, text: "shared prompt" }],
+      timestamp: "2026-08-25T07:31:49.000Z",
+    }
+    runtimeActions.setExternalId(42, "sess-shared")
+    runtimeActions.appendOptimisticTurn(42, userTurn, userTurn.id)
+    runtimeActions.setExternalId(99, "sess-shared")
+    runtimeActions.appendOptimisticTurn(99, userTurn, userTurn.id)
+
+    try {
+      h.acpFindConnectionForConversation.mockResolvedValue({
+        connection_id: "broker-child",
+        event_seq: 0,
+      })
+      await mountProvider()
+      await act(async () => {
+        await h.actions!.connect(
+          TAB,
+          "claude_code",
+          "/tmp/x",
+          "sess-shared",
+          42
+        )
+      })
+      const handlers = latestAttachHandlers()
+      emitAcpEvent(handlers, {
+        seq: 1,
+        connection_id: "broker-child",
+        type: "session_started",
+        session_id: "sess-shared",
+      })
+      h.acpFindConnectionForConversation.mockResolvedValue(null)
+      await act(async () => {
+        await h.actions!.connect(
+          TAB2,
+          "claude_code",
+          "/tmp/x",
+          "sess-shared",
+          99
+        )
+      })
+      h.actions!.registerLiveMessageSink(TAB, (message, isLive) => {
+        runtimeActions.setLiveMessage(42, message, isLive)
+        return (
+          useConversationRuntimeStore.getState().byConversationId.get(42)
+            ?.liveMessage === message
+        )
+      })
+      h.actions!.registerLiveMessageSink(TAB2, (message, isLive) => {
+        runtimeActions.setLiveMessage(99, message, isLive)
+        return (
+          useConversationRuntimeStore.getState().byConversationId.get(99)
+            ?.liveMessage === message
+        )
+      })
+
+      act(() => {
+        handlers.onReplay(
+          [
+            {
+              seq: 2,
+              connection_id: "broker-child",
+              type: "user_message",
+              message_id: userTurn.id,
+              blocks: userTurn.blocks,
+            },
+            {
+              seq: 3,
+              connection_id: "broker-child",
+              type: "status_changed",
+              status: "prompting",
+            },
+            content("broker-child", 4, "shared reply"),
+            {
+              seq: 5,
+              connection_id: "broker-child",
+              type: "turn_complete",
+              session_id: "sess-shared",
+              stop_reason: "end_turn",
+              mark_awaiting_reply: false,
+            },
+          ],
+          5
+        )
+      })
+
+      for (const conversationId of [42, 99]) {
+        const runtime = useConversationRuntimeStore
+          .getState()
+          .byConversationId.get(conversationId)
+        expect(runtime?.optimisticTurns).toEqual([])
+        expect(
+          runtime?.localTurns.map((turn) => ({
+            role: turn.role,
+            blocks: turn.blocks,
+          }))
+        ).toEqual([
+          { role: "user", blocks: [{ type: "text", text: "shared prompt" }] },
+          {
+            role: "assistant",
+            blocks: [{ type: "text", text: "shared reply" }],
+          },
+        ])
+      }
+    } finally {
+      resetConversationRuntimeStore()
+    }
+  })
+
+  it("projects a terminal only into aliases that own its live message", async () => {
+    const TAB2 = "conv-2-claude_code-99"
+    const { useConversationRuntimeStore, resetConversationRuntimeStore } =
+      await import("@/stores/conversation-runtime-store")
+    resetConversationRuntimeStore()
+    const runtimeActions = useConversationRuntimeStore.getState().actions
+    runtimeActions.setExternalId(42, "sess-shared")
+    runtimeActions.appendOptimisticTurn(
+      42,
+      {
+        id: "user-a",
+        role: "user",
+        blocks: [{ type: "text", text: "turn A" }],
+        timestamp: "2026-08-25T07:31:49.000Z",
+      },
+      "user-a"
+    )
+    runtimeActions.setExternalId(99, "sess-shared")
+    runtimeActions.appendOptimisticTurn(
+      99,
+      {
+        id: "user-b",
+        role: "user",
+        blocks: [{ type: "text", text: "turn B" }],
+        timestamp: "2026-08-25T07:31:50.000Z",
+      },
+      "user-b"
+    )
+
+    try {
+      h.acpFindConnectionForConversation.mockResolvedValue({
+        connection_id: "broker-child",
+        event_seq: 0,
+      })
+      await mountProvider()
+      await act(async () => {
+        await h.actions!.connect(
+          TAB,
+          "claude_code",
+          "/tmp/x",
+          "sess-shared",
+          42
+        )
+      })
+      const handlers = latestAttachHandlers()
+      emitAcpEvent(handlers, {
+        seq: 1,
+        connection_id: "broker-child",
+        type: "session_started",
+        session_id: "sess-shared",
+      })
+      h.acpFindConnectionForConversation.mockResolvedValue(null)
+      await act(async () => {
+        await h.actions!.connect(
+          TAB2,
+          "claude_code",
+          "/tmp/x",
+          "sess-shared",
+          99
+        )
+      })
+
+      const sink42 = vi.fn((message: LiveMessage, isLive: boolean) => {
+        runtimeActions.setLiveMessage(42, message, isLive)
+        return (
+          useConversationRuntimeStore.getState().byConversationId.get(42)
+            ?.liveMessage === message
+        )
+      })
+      const sink99 = vi.fn((message: LiveMessage, isLive: boolean) => {
+        runtimeActions.setLiveMessage(99, message, isLive)
+        return (
+          useConversationRuntimeStore.getState().byConversationId.get(99)
+            ?.liveMessage === message
+        )
+      })
+      const sinks42 = { runtimeConversationId: 42, canonical: sink42 }
+      const sinks99 = { runtimeConversationId: 99, canonical: sink99 }
+      h.actions!.registerLiveSinks(TAB, sinks42)
+      h.actions!.registerLiveSinks(TAB2, sinks99)
+
+      act(() => {
+        handlers.onReplay(
+          [
+            {
+              seq: 2,
+              connection_id: "broker-child",
+              type: "status_changed",
+              status: "prompting",
+            },
+            content("broker-child", 3, "reply A"),
+          ],
+          3
+        )
+      })
+
+      const replyB: LiveMessage = {
+        id: "reply-b",
+        role: "assistant",
+        content: [{ type: "text", text: "reply B in progress" }],
+        startedAt: 1_700_000_000_001,
+      }
+      runtimeActions.setLiveMessage(99, replyB, true)
+      sink42.mockClear()
+      sink99.mockClear()
+
+      act(() => {
+        handlers.onReplay(
+          [
+            content("broker-child", 4, " final"),
+            {
+              seq: 5,
+              connection_id: "broker-child",
+              type: "turn_complete",
+              session_id: "sess-shared",
+              stop_reason: "end_turn",
+              mark_awaiting_reply: false,
+            },
+          ],
+          5
+        )
+      })
+
+      const runtime42 = useConversationRuntimeStore
+        .getState()
+        .byConversationId.get(42)
+      const runtime99 = useConversationRuntimeStore
+        .getState()
+        .byConversationId.get(99)
+      expect(runtime42?.liveMessage).toBeNull()
+      expect(runtime42?.localTurns.at(-1)).toMatchObject({
+        role: "assistant",
+        blocks: [{ type: "text", text: "reply A final" }],
+      })
+      expect(runtime99?.liveMessage).toBe(replyB)
+      expect(runtime99?.optimisticTurns.map((turn) => turn.id)).toEqual([
+        "user-b",
+      ])
+      expect(runtime99?.localTurns).toEqual([])
+      expect(sink42).toHaveBeenCalledTimes(1)
+      expect(sink99).not.toHaveBeenCalled()
+    } finally {
+      resetConversationRuntimeStore()
+    }
+  })
+
+  it("promotes an accepted user-stop completion in every canonical observer alias", async () => {
+    const TAB2 = "conv-2-claude_code-99"
+    const {
+      noteUserStopTurnOwnership,
+      useConversationRuntimeStore,
+      resetConversationRuntimeStore,
+    } = await import("@/stores/conversation-runtime-store")
+    const { createLiveTranscriptFrameSink, liveTranscriptStore } =
+      await import("@/stores/live-transcript-store")
+    resetConversationRuntimeStore()
+    const runtimeActions = useConversationRuntimeStore.getState().actions
+    const userTurn = {
+      id: "cancelled-shared-user",
+      role: "user" as const,
+      blocks: [{ type: "text" as const, text: "cancel shared prompt" }],
+      timestamp: "2026-08-25T07:31:49.000Z",
+    }
+    for (const conversationId of [42, 99]) {
+      runtimeActions.setExternalId(conversationId, "sess-shared")
+      runtimeActions.appendOptimisticTurn(conversationId, userTurn, userTurn.id)
+      noteUserStopTurnOwnership(conversationId)
+    }
+
+    try {
+      h.acpFindConnectionForConversation.mockResolvedValue({
+        connection_id: "broker-child",
+        event_seq: 0,
+      })
+      await mountProvider()
+      await act(async () => {
+        await h.actions!.connect(
+          TAB,
+          "claude_code",
+          "/tmp/x",
+          "sess-shared",
+          42
+        )
+      })
+      const handlers = latestAttachHandlers()
+      emitAcpEvent(handlers, {
+        seq: 1,
+        connection_id: "broker-child",
+        type: "session_started",
+        session_id: "sess-shared",
+      })
+      h.acpFindConnectionForConversation.mockResolvedValue(null)
+      await act(async () => {
+        await h.actions!.connect(
+          TAB2,
+          "claude_code",
+          "/tmp/x",
+          "sess-shared",
+          99
+        )
+      })
+      h.actions!.registerLiveSinks(TAB, {
+        canonical: (message, isLive) => {
+          runtimeActions.setLiveMessage(42, message, isLive)
+          return (
+            useConversationRuntimeStore.getState().byConversationId.get(42)
+              ?.liveMessage === message
+          )
+        },
+        transcript: createLiveTranscriptFrameSink(42, "broker-child"),
+      })
+      h.actions!.registerLiveSinks(TAB2, {
+        canonical: (message, isLive) => {
+          runtimeActions.setLiveMessage(99, message, isLive)
+          return (
+            useConversationRuntimeStore.getState().byConversationId.get(99)
+              ?.liveMessage === message
+          )
+        },
+        transcript: createLiveTranscriptFrameSink(99, "broker-child"),
+      })
+
+      act(() => {
+        handlers.onReplay(
+          [
+            {
+              seq: 2,
+              connection_id: "broker-child",
+              type: "status_changed",
+              status: "prompting",
+            },
+            content("broker-child", 3, "cancelled shared reply"),
+            {
+              seq: 4,
+              connection_id: "broker-child",
+              type: "turn_complete",
+              session_id: "sess-shared",
+              stop_reason: "cancelled",
+              mark_awaiting_reply: false,
+              termination_source: "user_stop",
+              provider_turn_id: null,
+            },
+          ],
+          4,
+          1
+        )
+      })
+
+      for (const conversationId of [42, 99]) {
+        const runtime = useConversationRuntimeStore
+          .getState()
+          .byConversationId.get(conversationId)
+        expect(runtime?.optimisticTurns).toEqual([])
+        expect(runtime?.liveMessage).toBeNull()
+        expect(runtime?.localTurns.at(-1)).toMatchObject({
+          role: "assistant",
+          blocks: [{ type: "text", text: "cancelled shared reply" }],
+        })
+        expect(liveTranscriptStore.getConversation(conversationId)).toBeNull()
+      }
+    } finally {
+      resetConversationRuntimeStore()
+    }
+  })
+
+  it("keeps the next turn live in every alias after a stale user-stop completion", async () => {
+    const TAB2 = "conv-2-claude_code-99"
+    const {
+      noteUserStopTurnOwnership,
+      useConversationRuntimeStore,
+      resetConversationRuntimeStore,
+    } = await import("@/stores/conversation-runtime-store")
+    const { createLiveTranscriptFrameSink, liveTranscriptStore } =
+      await import("@/stores/live-transcript-store")
+    resetConversationRuntimeStore()
+    const runtimeActions = useConversationRuntimeStore.getState().actions
+    const cancelledReply: LiveMessage = {
+      id: "cancelled-alias-reply-a",
+      role: "assistant",
+      content: [{ type: "text", text: "partial A" }],
+      startedAt: 1_700_000_000_000,
+    }
+    for (const conversationId of [42, 99]) {
+      runtimeActions.setExternalId(conversationId, "sess-shared")
+      runtimeActions.appendOptimisticTurn(
+        conversationId,
+        {
+          id: `user-a-${conversationId}`,
+          role: "user",
+          blocks: [{ type: "text", text: "turn A" }],
+          timestamp: "2026-08-25T07:31:49.000Z",
+        },
+        `turn-a-${conversationId}`
+      )
+      runtimeActions.setLiveMessage(conversationId, cancelledReply, true)
+      noteUserStopTurnOwnership(conversationId)
+      runtimeActions.completeTurn(conversationId, cancelledReply)
+      runtimeActions.appendOptimisticTurn(
+        conversationId,
+        {
+          id: `user-b-${conversationId}`,
+          role: "user",
+          blocks: [{ type: "text", text: "turn B" }],
+          timestamp: "2026-08-25T07:31:50.000Z",
+        },
+        `turn-b-${conversationId}`
+      )
+    }
+
+    try {
+      h.acpFindConnectionForConversation.mockResolvedValue({
+        connection_id: "broker-child",
+        event_seq: 0,
+      })
+      await mountProvider()
+      await act(async () => {
+        await h.actions!.connect(
+          TAB,
+          "claude_code",
+          "/tmp/x",
+          "sess-shared",
+          42
+        )
+      })
+      const handlers = latestAttachHandlers()
+      emitAcpEvent(handlers, {
+        seq: 1,
+        connection_id: "broker-child",
+        type: "session_started",
+        session_id: "sess-shared",
+      })
+      h.acpFindConnectionForConversation.mockResolvedValue(null)
+      await act(async () => {
+        await h.actions!.connect(
+          TAB2,
+          "claude_code",
+          "/tmp/x",
+          "sess-shared",
+          99
+        )
+      })
+      for (const [tabId, conversationId] of [
+        [TAB, 42],
+        [TAB2, 99],
+      ] as const) {
+        h.actions!.registerLiveSinks(tabId, {
+          canonical: (message, isLive) => {
+            runtimeActions.setLiveMessage(conversationId, message, isLive)
+            return (
+              useConversationRuntimeStore
+                .getState()
+                .byConversationId.get(conversationId)?.liveMessage === message
+            )
+          },
+          transcript: createLiveTranscriptFrameSink(
+            conversationId,
+            "broker-child"
+          ),
+        })
+      }
+
+      act(() => {
+        handlers.onReplay(
+          [
+            {
+              seq: 2,
+              connection_id: "broker-child",
+              type: "status_changed",
+              status: "prompting",
+            },
+            content("broker-child", 3, "reply B in progress"),
+          ],
+          3
+        )
+      })
+      const liveByConversation = new Map(
+        [42, 99].map((conversationId) => [
+          conversationId,
+          useConversationRuntimeStore
+            .getState()
+            .byConversationId.get(conversationId)?.liveMessage,
+        ])
+      )
+
+      act(() => {
+        handlers.onReplay(
+          [
+            {
+              seq: 4,
+              connection_id: "broker-child",
+              type: "turn_complete",
+              session_id: "sess-shared",
+              stop_reason: "cancelled",
+              mark_awaiting_reply: false,
+              termination_source: "user_stop",
+              provider_turn_id: "provider-a",
+            },
+          ],
+          4
+        )
+      })
+
+      for (const conversationId of [42, 99]) {
+        const runtime = useConversationRuntimeStore
+          .getState()
+          .byConversationId.get(conversationId)
+        expect(runtime?.activeTurnToken).toBe(`turn-b-${conversationId}`)
+        expect(runtime?.optimisticTurns.map((turn) => turn.id)).toEqual([
+          `user-b-${conversationId}`,
+        ])
+        expect(runtime?.liveMessage).toBe(
+          liveByConversation.get(conversationId)
+        )
+        expect(
+          liveTranscriptStore.getConversation(conversationId)?.status
+        ).toBe("streaming")
+      }
+    } finally {
+      resetConversationRuntimeStore()
+    }
   })
 
   it("merges delegation metadata into an existing canonical viewer", async () => {

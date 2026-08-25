@@ -14,12 +14,11 @@
  * delegation child already attached by its parent, the host also owns the
  * `attachDelegationChild`/`detachDelegationChild` lifecycle.
  *
- * Streaming: while mounted, the connection's live message and status (from
- * `acp-connections-context`) are mirrored into the runtime session for
- * `conversationId` so `MessageListView` shows real-time deltas. Persistence of
- * completed turns comes from the broker's own DB writes, surfaced via
- * `useConversationDetail`. On unmount the runtime session is dropped, so the
- * next mount starts from a fresh persisted fetch.
+ * Streaming: while mounted, a runtime-bound provider sink mirrors accepted
+ * canonical messages into `conversationId`, and the provider promotes admitted
+ * completions in the same commit. Persistence also comes from the broker's DB
+ * writes via `useConversationDetail`. On unmount the runtime session is dropped,
+ * so the next mount starts from a fresh persisted fetch.
  */
 
 import { useCallback, useEffect, useRef, useSyncExternalStore } from "react"
@@ -29,7 +28,10 @@ import {
   type ResolvedMessageGroup,
 } from "@/components/message/message-list-view"
 import { useConversationDetail } from "@/hooks/use-conversation-detail"
-import { useConversationRuntimeActions } from "@/stores/conversation-runtime-store"
+import {
+  useConversationRuntimeActions,
+  useConversationRuntimeStore,
+} from "@/stores/conversation-runtime-store"
 import {
   useAcpActions,
   useConnectionStore,
@@ -63,46 +65,39 @@ export function useConnectionStateById(
 }
 
 /**
- * Bridge the connection's `liveMessage` and status transitions into the
- * runtime session for `conversationId`, so the read-only `MessageListView`
- * sees streaming turns and turn completions while the viewer is open.
+ * Bridge the provider's accepted canonical `liveMessage` into the runtime
+ * session for `conversationId`, so the read-only `MessageListView` sees
+ * streaming turns and provider-admitted completions while the viewer is open.
+ * Binding the runtime id prevents another alias's terminal from projecting into
+ * this viewer.
  *
- * Mirrors the effects in `conversation-detail-panel.tsx`, with one concern
- * specific to a read-only viewer:
- *
- *  **Close-mid-stream / reopen-after-complete.** The cleanup of the
- *  mirror-live effect intentionally does not clear `liveMessage` while
- *  still prompting (so it remains promotable for the completeTurn edge).
- *  If the user closes the viewer during that window and the session later
- *  finishes, no bridge is running to dispatch `completeTurn`, leaving stale
- *  `liveMessage` in runtime state. On reopen, `fetchDetail`'s active-data
- *  guard would skip the refetch and the user would see a stale partial
- *  transcript. We solve this by calling `removeConversation` on the viewer
- *  body's full unmount — the runtime session is owned by this viewer alone,
- *  so dropping it forces the next open to fetch the persisted detail from
- *  scratch.
+ * **Close-mid-stream / reopen-after-complete.** The viewer owns this runtime
+ * session, so its full unmount drops the session and forces the next open to
+ * fetch persisted detail from scratch.
  *
  * The detail-fetch no longer races the streaming bridge: the viewer's mount
  * fetch uses `preserveLive: true`, so `FETCH_DETAIL_SUCCESS` keeps the bridged
  * `liveMessage` instead of wiping it — no re-bridge effect is needed.
  *
- * One more case is handled explicitly: **reopen-after-completion.** If the
- * viewer mounts onto a session that already finished but whose connection
- * still holds its final `liveMessage` (kept for a short grace period after
- * completion), the streaming→settled `completeTurn` edge never fires and the
- * non-live mirror is rejected while the detail loads — so the
- * adopt-settled-reply effect promotes that retained reply directly, covering
- * the window before the persisted transcript catches up.
+ * **Reopen-after-completion.** If the provider admitted the completion while no
+ * viewer sink was mounted, its accepted message marker allows the retained
+ * final `liveMessage` to be adopted while persisted detail catches up. Raw or
+ * status-only events cannot authorize this path.
  */
 export function useLiveTranscriptBridge(
   conversationId: number,
   connState: ConnectionState | undefined
 ) {
-  const { setLiveMessage, completeTurn, syncTurnMetadata, removeConversation } =
+  const { setLiveMessage, syncTurnMetadata, removeConversation } =
     useConversationRuntimeActions()
+  const { registerLiveSinks } = useAcpActions()
 
-  const connStatus = connState?.status ?? null
-  const liveMessage = connState?.liveMessage ?? null
+  const connectionId = connState?.connectionId ?? null
+  const acceptedCompletionMessageId = (
+    connState?.acceptedCompletionRuntimeConversationIds ?? []
+  ).includes(conversationId)
+    ? (connState?.acceptedCompletionMessageId ?? null)
+    : null
 
   // Backfill token usage / duration / model into the promoted reply once the
   // session's persisted transcript catches up. `completeTurn` lands the
@@ -120,72 +115,34 @@ export function useLiveTranscriptBridge(
     syncCancelRef.current = syncTurnMetadata(conversationId)
   }, [conversationId, syncTurnMetadata])
 
-  const connStatusRef = useRef(connStatus)
+  // Provider commit owns both canonical mirroring and turn completion. Binding
+  // the runtime id lets terminal projection exclude aliases on another turn.
   useEffect(() => {
-    connStatusRef.current = connStatus
-  }, [connStatus])
+    if (!connectionId) return
+    return registerLiveSinks(connectionId, {
+      runtimeConversationId: conversationId,
+      canonical: (message, isLive, deliveryIds) => {
+        setLiveMessage(conversationId, message, isLive, deliveryIds)
+        return (
+          useConversationRuntimeStore
+            .getState()
+            .byConversationId.get(conversationId)?.liveMessage === message
+        )
+      },
+    })
+  }, [connectionId, conversationId, registerLiveSinks, setLiveMessage])
 
-  // When connStatus transitions away from "prompting", completeTurn snapshots
-  // and promotes the live reply. This stays correct across the transition
-  // because the mirror-live effect's cleanup gates on `connStatusRef` (which
-  // still reads "prompting" at cleanup time, since React updates it only in a
-  // later setup pass) rather than on effect declaration order. We also latch
-  // whether we ever observed streaming this mount, so the adopt-settled-reply
-  // effect below can tell a fresh "reopened after the session already
-  // finished" mount from a normal streaming→settled handoff.
-  const prevStatusRef = useRef(connStatus)
-  const everPromptingRef = useRef(connStatus === "prompting")
+  const syncedCompletionRef = useRef<string | null>(null)
   useEffect(() => {
-    const wasPrompting = prevStatusRef.current === "prompting"
-    prevStatusRef.current = connStatus
-    if (connStatus === "prompting") everPromptingRef.current = true
-    if (!wasPrompting || connStatus === "prompting") return
-    completeTurn(conversationId, liveMessage)
-    startMetadataSync()
-  }, [connStatus, liveMessage, conversationId, completeTurn, startMetadataSync])
-
-  useEffect(() => {
-    if (liveMessage != null) {
-      setLiveMessage(conversationId, liveMessage, connStatus === "prompting")
+    if (
+      acceptedCompletionMessageId == null ||
+      syncedCompletionRef.current === acceptedCompletionMessageId
+    ) {
+      return
     }
-    return () => {
-      if (connStatusRef.current !== "prompting") {
-        setLiveMessage(conversationId, null)
-      }
-    }
-  }, [liveMessage, connStatus, conversationId, setLiveMessage])
-
-  // Adopt-settled-reply: handle reopening the viewer onto a session that
-  // ALREADY finished but whose connection still carries its final liveMessage
-  // (kept for CHILD_DETACH_GRACE_MS after completion to bridge DB lag). For
-  // such a mount the streaming→settled completeTurn edge never fires (we never
-  // saw "prompting"), and the non-live mirror above is rejected by the
-  // SET_LIVE_MESSAGE guard while the mount fetch is loading — so without this
-  // the final reply would vanish whenever the persisted transcript still lags
-  // (empty / user-only / partial detail). Adopt the retained reply directly:
-  // bridge it as live (a one-shot session's liveMessage is unambiguously its
-  // own reply, never a stale reconnect replay) then promote it to a COMPLETED
-  // local turn (no streaming affordance), where the `liveOwnsActiveTurn`
-  // projection keeps it and dedupes the persisted copy once the DB catches up.
-  // Runs at most once, and never when streaming was observed (that path
-  // promotes via the settled edge).
-  const adoptedRef = useRef(false)
-  useEffect(() => {
-    if (adoptedRef.current || everPromptingRef.current) return
-    if (connStatus == null || connStatus === "prompting") return
-    if (liveMessage == null) return
-    adoptedRef.current = true
-    setLiveMessage(conversationId, liveMessage, true)
-    completeTurn(conversationId, liveMessage)
+    syncedCompletionRef.current = acceptedCompletionMessageId
     startMetadataSync()
-  }, [
-    connStatus,
-    liveMessage,
-    conversationId,
-    setLiveMessage,
-    completeTurn,
-    startMetadataSync,
-  ])
+  }, [acceptedCompletionMessageId, startMetadataSync])
 
   // Full teardown on viewer close: cancel any in-flight metadata sync, then
   // drop the runtime session so the next open starts from a fresh
