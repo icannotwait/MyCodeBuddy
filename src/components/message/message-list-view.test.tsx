@@ -205,6 +205,7 @@ vi.mock("@/components/ai-elements/grok-session-image-context", () => ({
 vi.mock("./content-parts-renderer", () => ({
   ContentPartsRenderer: ({
     parts,
+    parentConversationId,
     autolinkLocalPathParts,
     grokSessionImagePhase,
     grokSessionImageTextParts,
@@ -213,11 +214,13 @@ vi.mock("./content-parts-renderer", () => ({
       type: string
       text?: string
       key?: string
+      toolCallId?: string
       sources?: Array<{
         meta?: Record<string, unknown> | null
       }>
       visibleTaskIds?: string[]
     }>
+    parentConversationId?: number | null
     autolinkLocalPathParts?: ReadonlySet<{
       type: string
       text?: string
@@ -231,6 +234,7 @@ vi.mock("./content-parts-renderer", () => ({
     <div
       data-testid="content-parts"
       data-grok-phase={grokSessionImagePhase ?? undefined}
+      data-parent-conversation-id={parentConversationId ?? undefined}
     >
       {parts.map((part, index) =>
         part.type === "text" ? (
@@ -252,6 +256,7 @@ vi.mock("./content-parts-renderer", () => ({
             data-testid="delegation-work-unit"
             data-work-unit-key={part.key}
             data-source-count={part.sources?.length ?? 0}
+            data-parent-conversation-id={parentConversationId ?? undefined}
             data-latest-status={String(
               (
                 part.sources?.[part.sources.length - 1]?.meta?.[
@@ -267,7 +272,15 @@ vi.mock("./content-parts-renderer", () => ({
             data-visible-task-ids={part.visibleTaskIds?.join(",") ?? "all"}
           />
         ) : (
-          <span key={index} data-part={part.type} />
+          <span
+            key={index}
+            data-testid={
+              part.type === "tool-call" && part.toolCallId
+                ? `tool-part-${part.toolCallId}`
+                : undefined
+            }
+            data-part={part.type}
+          />
         )
       )}
     </div>
@@ -310,7 +323,10 @@ const { subAgentOverlayPropsSpy } = vi.hoisted(() => ({
 vi.mock("@/components/chat/sub-agent-overlay", () => ({
   SubAgentOverlay: (props: {
     activities?: Array<{ task_id?: string; origin?: string }>
-    delegations?: Array<{ parentToolUseId: string }>
+    delegations?: Array<{
+      parentToolUseId: string
+      parentConversationId?: number | null
+    }>
     conversationId?: number | null
     defaultExpanded?: boolean
     overlayKey?: string | null
@@ -488,6 +504,7 @@ function workUnitRunTurn(
     terminal?: boolean
   } = {}
 ): MessageTurn {
+  const toolName = options.toolName ?? "delegate_to_agent"
   const targetTaskId = options.targetTaskId
   const workUnitKey = options.workUnitKey ?? "unit-a"
   const childConversationId = options.childConversationId ?? 3001
@@ -502,9 +519,9 @@ function workUnitRunTurn(
       {
         type: "tool_use",
         tool_use_id: toolCallId,
-        tool_name: options.toolName ?? "delegate_to_agent",
+        tool_name: toolName,
         input_preview: JSON.stringify({
-          agent_type: "codex",
+          ...(toolName === "delegate_to_agent" ? { agent_type: "codex" } : {}),
           task: "implement",
           work_unit_key: workUnitKey,
           ...(targetTaskId ? { task_id: targetTaskId } : {}),
@@ -608,7 +625,10 @@ function setStoreActivities(activities: DelegationActivityView[]) {
 
 function lastOverlayProps(): {
   activities?: Array<{ task_id?: string; origin?: string }>
-  delegations?: Array<{ parentToolUseId: string }>
+  delegations?: Array<{
+    parentToolUseId: string
+    parentConversationId?: number | null
+  }>
   conversationId?: number | null
   defaultExpanded?: boolean
   overlayKey?: string | null
@@ -1479,6 +1499,32 @@ describe("MessageListView delegation work-unit projection", () => {
     __resetStreamingPerformanceConfigForTests()
   })
 
+  it("uses the bound db parent id for virtual historical continuation cards", () => {
+    const runtimeId = -9
+    seedHistory(
+      [
+        userTurn("u1", "continue"),
+        workUnitRunTurn("a1", "continue-1", "run-2", {
+          toolName: "continue_delegation",
+          targetTaskId: "run-1",
+        }),
+      ],
+      { runtimeId, dbConversationId: CID }
+    )
+
+    renderMessageList({ conversationId: runtimeId })
+
+    expect(screen.getByTestId("delegation-work-unit")).toHaveAttribute(
+      "data-parent-conversation-id",
+      String(CID)
+    )
+    expect(
+      (lastOverlayProps().delegations ?? []).find(
+        (source) => source.parentToolUseId === "continue-1"
+      )
+    ).toMatchObject({ parentConversationId: CID })
+  })
+
   it("renders one historical card per turn and a complete mixed status call", () => {
     seedHistory([
       userTurn("u1", "start"),
@@ -1888,6 +1934,56 @@ describe("MessageListView sub-agent overlay composition", () => {
     expect(taskIds).toEqual(expect.arrayContaining(["task-store", "task-live"]))
     expect(taskIds.filter((id) => id === "task-store")).toHaveLength(1)
     expect(taskIds.filter((id) => id === "task-live")).toHaveLength(1)
+  })
+
+  it("keeps live lookup virtual while using the bound db parent id for continuation cards", () => {
+    const runtimeId = -9
+    const live: LiveMessage = {
+      id: "live-continuation",
+      role: "assistant",
+      content: [
+        {
+          type: "tool_call",
+          info: {
+            tool_call_id: "live-continue-1",
+            title: "continue_delegation",
+            kind: "other",
+            status: "in_progress",
+            content: null,
+            raw_input: JSON.stringify({
+              task_id: "run-1",
+              task: "continue",
+              work_unit_key: "unit-a",
+              correlation_id: "correlation-1",
+            }),
+            raw_output_chunks: [],
+            raw_output_total_bytes: 0,
+            locations: null,
+            meta: null,
+            images: [],
+          },
+        },
+      ],
+      startedAt: 1_700_000_000_000,
+    }
+    seedHistory([], { runtimeId, dbConversationId: CID })
+    act(() => {
+      liveTranscriptStore.rebuild(runtimeId, "c1", live, 1)
+    })
+
+    renderMessageList({ conversationId: runtimeId })
+
+    expect(screen.getByTestId("tool-part-live-continue-1")).toBeInTheDocument()
+    expect(
+      screen
+        .getByTestId("tool-part-live-continue-1")
+        .closest('[data-testid="content-parts"]')
+    ).toHaveAttribute("data-parent-conversation-id", String(CID))
+    expect(
+      (lastOverlayProps().delegations ?? []).find(
+        (source) => source.parentToolUseId === "live-continue-1"
+      )
+    ).toMatchObject({ parentConversationId: CID })
   })
 
   it("passes full-session Codeg delegations with conversation-scoped key and defaultExpanded", () => {

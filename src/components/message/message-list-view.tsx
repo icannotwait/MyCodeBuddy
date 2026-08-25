@@ -1182,9 +1182,9 @@ const LiveAwareSubAgentOverlay = memo(function LiveAwareSubAgentOverlay({
     if (!snap || !isStreaming) return EMPTY_DELEGATIONS
     return extractLiveDelegationSources(
       liveSnapshotToLiveMessage(snap),
-      conversationId
+      durableConversationId
     )
-  }, [snap, isStreaming, conversationId])
+  }, [snap, isStreaming, durableConversationId])
   // Always project live natives while streaming; merge/dedupe with the
   // parent store+historical set (deterministic by task_id / precedence rules).
   const liveActivities = useMemo(() => {
@@ -1643,6 +1643,7 @@ export function MessageListView({
     return (
       <LiveTranscriptRow
         conversationId={conversationId}
+        parentConversationId={durableConversationId}
         agentType={agentType}
         showThinking={showThinking}
         delegationRunRecords={delegationRunRecords}
@@ -1652,6 +1653,7 @@ export function MessageListView({
   }, [
     showLiveFooter,
     conversationId,
+    durableConversationId,
     agentType,
     showThinking,
     delegationRunRecords,
@@ -1689,7 +1691,7 @@ export function MessageListView({
               ) : null}
               <HistoricalMessageGroup
                 group={item.group}
-                parentConversationId={conversationId}
+                parentConversationId={durableConversationId}
                 dimmed={item.phase === "optimistic"}
                 showStats={item.showStats}
                 previousUserIndex={item.previousUserIndex}
@@ -1717,7 +1719,7 @@ export function MessageListView({
           return null
       }
     },
-    [showThinking, conversationId, userTurnHeader, agentType]
+    [showThinking, durableConversationId, userTurnHeader, agentType]
   )
 
   const emptyState = useMemo(
@@ -1750,11 +1752,11 @@ export function MessageListView({
     const out: DelegationCardSource[] = []
     for (const item of threadItems) {
       if (item.kind === "turn" && item.group.role === "assistant") {
-        collectDelegationSources(item.group.parts, out, conversationId)
+        collectDelegationSources(item.group.parts, out, durableConversationId)
       }
     }
     return out.length > 0 ? out : EMPTY_DELEGATIONS
-  }, [threadItems, conversationId])
+  }, [threadItems, durableConversationId])
   const allSessionDelegations = useMemo(() => {
     if (durableDelegationSources.length === 0) return transcriptDelegations
     const merged = mergeDelegationSourceLayers(

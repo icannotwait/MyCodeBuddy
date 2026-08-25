@@ -70,7 +70,10 @@ import { isDelegateToAgentToolName } from "@/lib/delegation-card"
 import { isConversationInterruptedAgentText } from "@/lib/delegation-conversation-interrupted"
 
 export interface LiveTranscriptRowProps {
+  /** Runtime key used by the in-memory live transcript store. */
   conversationId: number
+  /** Durable parent id used by delegation card snapshot queries. */
+  parentConversationId?: number | null
   agentType: AgentType
   /** When false, thinking segments are skipped before segment views mount. */
   showThinking: boolean
@@ -266,6 +269,7 @@ const LivePlanSegment = memo(function LivePlanSegment({
 
 export interface LiveToolCardProps {
   conversationId: number
+  parentConversationId?: number | null
   toolCallId: string
   onToolRender?: (toolCallId: string) => void
   /**
@@ -281,6 +285,7 @@ export interface LiveToolCardProps {
  */
 export const LiveToolCard = memo(function LiveToolCard({
   conversationId,
+  parentConversationId = conversationId,
   toolCallId,
   onToolRender,
   direct = false,
@@ -294,7 +299,11 @@ export const LiveToolCard = memo(function LiveToolCard({
   if (!part) return null
   if (direct) {
     return (
-      <ToolCallPart part={part} live parentConversationId={conversationId} />
+      <ToolCallPart
+        part={part}
+        live
+        parentConversationId={parentConversationId}
+      />
     )
   }
   // Single-part renderer reuses the full tool card stack without rebuilding
@@ -304,7 +313,7 @@ export const LiveToolCard = memo(function LiveToolCard({
     <ContentPartsRenderer
       parts={parts}
       role="assistant"
-      parentConversationId={conversationId}
+      parentConversationId={parentConversationId}
     />
   )
 })
@@ -315,10 +324,12 @@ export const LiveToolCard = memo(function LiveToolCard({
  */
 export const LiveToolGroupCard = memo(function LiveToolGroupCard({
   conversationId,
+  parentConversationId = conversationId,
   groupId,
   onToolRender,
 }: {
   conversationId: number
+  parentConversationId?: number | null
   groupId: string
   onToolRender?: (toolCallId: string) => void
 }) {
@@ -407,6 +418,7 @@ export const LiveToolGroupCard = memo(function LiveToolGroupCard({
               <LiveToolCard
                 key={toolCallId}
                 conversationId={conversationId}
+                parentConversationId={parentConversationId}
                 toolCallId={toolCallId}
                 onToolRender={onToolRender}
                 direct
@@ -441,11 +453,13 @@ const LiveGeneratedImageSegment = memo(function LiveGeneratedImageSegment({
 
 const LiveTranscriptSegmentView = memo(function LiveTranscriptSegmentView({
   conversationId,
+  parentConversationId = conversationId,
   segmentId,
   agentType,
   onToolRender,
 }: {
   conversationId: number
+  parentConversationId?: number | null
   segmentId: string
   agentType: AgentType
   onToolRender?: (toolCallId: string) => void
@@ -475,6 +489,7 @@ const LiveTranscriptSegmentView = memo(function LiveTranscriptSegmentView({
       return (
         <LiveToolCard
           conversationId={conversationId}
+          parentConversationId={parentConversationId}
           toolCallId={segment.toolCallId}
           onToolRender={onToolRender}
         />
@@ -604,6 +619,7 @@ export function buildLiveFooterItems(
  */
 export const LiveTranscriptRow = memo(function LiveTranscriptRow({
   conversationId,
+  parentConversationId = conversationId,
   agentType,
   showThinking,
   onToolRender,
@@ -664,6 +680,7 @@ export const LiveTranscriptRow = memo(function LiveTranscriptRow({
               <LiveToolGroupCard
                 key={item.groupId}
                 conversationId={conversationId}
+                parentConversationId={parentConversationId}
                 groupId={item.groupId}
                 onToolRender={onToolRender}
               />
@@ -671,6 +688,7 @@ export const LiveTranscriptRow = memo(function LiveTranscriptRow({
               <LiveTranscriptSegmentView
                 key={item.segmentId}
                 conversationId={conversationId}
+                parentConversationId={parentConversationId}
                 segmentId={item.segmentId}
                 agentType={agentType}
                 onToolRender={onToolRender}
