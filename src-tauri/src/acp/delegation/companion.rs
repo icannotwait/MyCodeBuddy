@@ -69,8 +69,10 @@ use crate::acp::delegation::transport::{
 };
 use crate::acp::delegation::types::{
     validate_correlation_id, BindingEvidenceV1, DelegationOrchestrationBindingPage,
-    DelegationReturnWhen, OrchestrationBindingArtifactDescriptor, OrchestrationBindingQueryError,
-    OrchestrationBindingQueryRequest,
+    DelegationReturnWhen, OrchestrationBindingArtifactDescriptor, OrchestrationBindingDelivery,
+    OrchestrationBindingQueryError, OrchestrationBindingQueryRequest,
+    OrchestrationBindingToolRequest, ORCHESTRATION_BINDING_DEFAULT_LIMIT,
+    ORCHESTRATION_BINDING_MAX_LIMIT,
 };
 use crate::acp::delegation::workflow::{
     CompleteWorkRequest, WorkflowIndexOmissionStep, WorkflowStateIndexDto,
@@ -711,6 +713,7 @@ pub const GET_ORCHESTRATION_BINDINGS_MAX_REQUEST_ID_BYTES: usize = 256;
 
 pub const ORCHESTRATION_BINDING_ARTIFACT_MAX_ROWS: usize = 4_096;
 pub const ORCHESTRATION_BINDING_ARTIFACT_MAX_BYTES: usize = 4 * 1024 * 1024;
+pub const ORCHESTRATION_BINDING_ARTIFACT_MAX_RESULT_BYTES: usize = 2_048;
 const ORCHESTRATION_BINDING_ARTIFACT_FORMAT: &str = "codeg-binding-evidence-v1";
 const ORCHESTRATION_BINDING_ARTIFACT_STALE_AGE: Duration = Duration::from_secs(10 * 60);
 
@@ -1251,9 +1254,10 @@ fn valid_binding_artifact_cursor(cursor: &Option<String>) -> bool {
     })
 }
 
-fn prepare_binding_evidence(
-    pages: Vec<DelegationOrchestrationBindingPage>,
-) -> Result<PreparedBindingEvidence, OrchestrationBindingQueryError> {
+fn validate_binding_evidence_pages(
+    pages: &[DelegationOrchestrationBindingPage],
+    require_complete: bool,
+) -> Result<usize, OrchestrationBindingQueryError> {
     let Some(first) = pages.first() else {
         return Err(OrchestrationBindingQueryError::Invalid);
     };
@@ -1323,11 +1327,21 @@ fn prepare_binding_evidence(
         seen_complete = page.complete;
         previous_next_cursor = page.next_cursor.as_deref();
     }
-    if !seen_complete || expected_start != first.total_rows {
+    if (require_complete && !seen_complete)
+        || (seen_complete && expected_start != first.total_rows)
+        || (!seen_complete && expected_start >= first.total_rows)
+    {
         return Err(OrchestrationBindingQueryError::Invalid);
     }
 
-    let total_rows = expected_start as usize;
+    Ok(expected_start as usize)
+}
+
+fn prepare_binding_evidence(
+    pages: Vec<DelegationOrchestrationBindingPage>,
+) -> Result<PreparedBindingEvidence, OrchestrationBindingQueryError> {
+    let total_rows = validate_binding_evidence_pages(&pages, true)?;
+
     let evidence = BindingEvidenceV1 {
         schema_version: 1,
         pages,
@@ -1373,7 +1387,11 @@ fn canonical_direct_child_directory(parent: &Path, name: &str) -> io::Result<Pat
     let metadata = match fs::symlink_metadata(&child) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            fs::create_dir(&child)?;
+            if let Err(error) = fs::create_dir(&child) {
+                if error.kind() != io::ErrorKind::AlreadyExists {
+                    return Err(error);
+                }
+            }
             fs::symlink_metadata(&child)?
         }
         Err(error) => return Err(error),
@@ -1597,7 +1615,6 @@ fn store_binding_artifact_at(
     Ok((descriptor, pending))
 }
 
-#[allow(dead_code)] // Activated by Task 4; Task 3 keeps artifact delivery private.
 pub(crate) fn store_binding_artifact(
     incarnation_id: &str,
     pages: Vec<DelegationOrchestrationBindingPage>,
@@ -1932,16 +1949,33 @@ async fn build_tools_call_spawn(
         }
         "get_delegation_orchestration_bindings" => {
             if arguments.as_object().is_some_and(|object| {
-                object.get("snapshot_id").is_some_and(Value::is_null)
-                    || object.get("cursor").is_some_and(Value::is_null)
+                ["delivery", "limit", "snapshot_id", "cursor"]
+                    .iter()
+                    .any(|field| object.get(*field).is_some_and(Value::is_null))
             }) {
                 return orchestration_binding_query_invalid_response(id);
             }
-            let query: OrchestrationBindingQueryRequest = match serde_json::from_value(arguments) {
-                Ok(query) => query,
-                Err(_) => return orchestration_binding_query_invalid_response(id),
+            let tool_request: OrchestrationBindingToolRequest =
+                match serde_json::from_value(arguments) {
+                    Ok(request) => request,
+                    Err(_) => return orchestration_binding_query_invalid_response(id),
+                };
+            let delivery = tool_request
+                .delivery
+                .unwrap_or(OrchestrationBindingDelivery::Page);
+            let query = OrchestrationBindingQueryRequest {
+                namespace: tool_request.namespace,
+                limit: tool_request.limit.unwrap_or(match delivery {
+                    OrchestrationBindingDelivery::Page => ORCHESTRATION_BINDING_DEFAULT_LIMIT,
+                    OrchestrationBindingDelivery::Artifact => ORCHESTRATION_BINDING_MAX_LIMIT,
+                }),
+                snapshot_id: tool_request.snapshot_id,
+                cursor: tool_request.cursor,
             };
-            if query.validate().is_err() {
+            if query.validate().is_err()
+                || (delivery == OrchestrationBindingDelivery::Artifact
+                    && (query.snapshot_id.is_some() || query.cursor.is_some()))
+            {
                 return orchestration_binding_query_invalid_response(id);
             }
             let req = BrokerOrchestrationBindingsRequest {
@@ -1952,7 +1986,25 @@ async fn build_tools_call_spawn(
                 snapshot_id: query.snapshot_id,
                 cursor: query.cursor,
             };
-            register_and_spawn_orchestration_bindings(inflight, id, socket, req).await
+            match delivery {
+                OrchestrationBindingDelivery::Page => {
+                    inflight
+                        .binding_artifacts
+                        .metrics
+                        .record_legacy_page_mode_call_after_artifact_capability();
+                    register_and_spawn_orchestration_bindings(inflight, id, socket, req).await
+                }
+                OrchestrationBindingDelivery::Artifact => {
+                    register_and_spawn_orchestration_binding_artifact(
+                        inflight,
+                        id,
+                        socket,
+                        ctx.connection_incarnation_id.clone(),
+                        req,
+                    )
+                    .await
+                }
+            }
         }
         "cancel_delegation" => {
             let task_id = match arguments.get("task_id").and_then(|v| v.as_str()) {
@@ -2647,6 +2699,13 @@ fn bounded_orchestration_binding_error(id: Value, code: &str) -> JsonRpcResponse
             "orchestration binding query exceeds the row limit"
         }
         "orchestration_binding_snapshot_stale" => "orchestration binding snapshot is stale",
+        "orchestration_binding_artifact_io_failed" => "orchestration binding artifact I/O failed",
+        "orchestration_binding_artifact_too_large" => {
+            "orchestration binding artifact exceeds the byte limit"
+        }
+        "orchestration_binding_artifact_result_too_large" => {
+            "orchestration binding artifact result exceeds the transport limit"
+        }
         "payload_too_large" => {
             "orchestration binding row exceeds the 7680-byte stdio transport budget"
         }
@@ -2786,6 +2845,163 @@ async fn orchestration_binding_response_with_budget(
             }
         }
     }
+}
+
+fn orchestration_binding_outcome_error(outcome: &Value) -> Option<OrchestrationBindingQueryError> {
+    outcome.get("error").map(
+        |_| match outcome.pointer("/error/code").and_then(Value::as_str) {
+            Some("orchestration_binding_query_invalid") => OrchestrationBindingQueryError::Invalid,
+            Some("orchestration_binding_query_too_large") => {
+                OrchestrationBindingQueryError::TooLarge
+            }
+            Some("orchestration_binding_snapshot_stale") => {
+                OrchestrationBindingQueryError::SnapshotStale
+            }
+            _ => OrchestrationBindingQueryError::Failed,
+        },
+    )
+}
+
+async fn collect_orchestration_binding_artifact_pages(
+    socket: &str,
+    first_request: &BrokerOrchestrationBindingsRequest,
+) -> Result<Vec<DelegationOrchestrationBindingPage>, OrchestrationBindingQueryError> {
+    let mut request = first_request.clone();
+    let mut pages = Vec::new();
+    loop {
+        let response = client_orchestration_bindings_round_trip(socket, &request)
+            .await
+            .map_err(|_| OrchestrationBindingQueryError::Failed)?;
+        if let Some(error) = orchestration_binding_outcome_error(&response.outcome) {
+            return Err(error);
+        }
+        let page: DelegationOrchestrationBindingPage = serde_json::from_value(response.outcome)
+            .map_err(|_| OrchestrationBindingQueryError::Failed)?;
+        let complete = page.complete;
+        let snapshot_id = page.snapshot_id.clone();
+        let next_cursor = page.next_cursor.clone();
+        pages.push(page);
+        validate_binding_evidence_pages(&pages, false).map_err(|error| match error {
+            OrchestrationBindingQueryError::Invalid => OrchestrationBindingQueryError::Failed,
+            error => error,
+        })?;
+        if complete {
+            return Ok(pages);
+        }
+        request.snapshot_id = Some(snapshot_id);
+        request.cursor = Some(next_cursor.ok_or(OrchestrationBindingQueryError::Failed)?);
+    }
+}
+
+fn render_orchestration_binding_artifact(
+    descriptor: &OrchestrationBindingArtifactDescriptor,
+) -> Value {
+    let rows = if descriptor.total_rows == 1 {
+        "row"
+    } else {
+        "rows"
+    };
+    let expires_at = descriptor
+        .snapshot_expires_at
+        .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true);
+    json!({
+        "content": [{
+            "type": "text",
+            "text": format!(
+                "Binding artifact: {} ({} {}, revision {}, expires {}, {}).",
+                descriptor.artifact_path,
+                descriptor.total_rows,
+                rows,
+                descriptor.snapshot_revision,
+                expires_at,
+                descriptor.artifact_sha256,
+            )
+        }],
+        "isError": false,
+        "structuredContent": descriptor,
+    })
+}
+
+fn finalize_orchestration_binding_artifact_response(
+    id: Value,
+    descriptor: OrchestrationBindingArtifactDescriptor,
+    mut pending: PendingBindingArtifact,
+) -> (JsonRpcResponse, Option<PendingBindingArtifact>) {
+    let response = ok(
+        id.clone(),
+        render_orchestration_binding_artifact(&descriptor),
+    );
+    let result_bytes = match serialize_jsonrpc_line(&response) {
+        Ok(line) => line.len(),
+        Err(_) => {
+            pending.record_outcome(ArtifactExportOutcome::SerializationFailed);
+            drop(pending);
+            return (
+                bounded_orchestration_binding_error(
+                    id,
+                    OrchestrationBindingQueryError::Failed.code(),
+                ),
+                None,
+            );
+        }
+    };
+    if result_bytes > ORCHESTRATION_BINDING_ARTIFACT_MAX_RESULT_BYTES {
+        pending.record_outcome(ArtifactExportOutcome::ResultTooLarge);
+        drop(pending);
+        return (
+            bounded_orchestration_binding_error(
+                id,
+                OrchestrationBindingQueryError::ArtifactResultTooLarge.code(),
+            ),
+            None,
+        );
+    }
+    (response, Some(pending.set_final_result_bytes(result_bytes)))
+}
+
+async fn orchestration_binding_artifact_response(
+    socket: &str,
+    request: BrokerOrchestrationBindingsRequest,
+    incarnation_id: &str,
+    id: Value,
+    inflight: &Arc<InflightCalls>,
+) -> (JsonRpcResponse, Option<PendingBindingArtifact>) {
+    let mut restarted = false;
+    let pages = loop {
+        match collect_orchestration_binding_artifact_pages(socket, &request).await {
+            Err(OrchestrationBindingQueryError::SnapshotStale) if !restarted => {
+                restarted = true;
+                inflight.record_binding_artifact_stale_restart();
+            }
+            Ok(pages) => break pages,
+            Err(error) => {
+                let outcome = match error {
+                    OrchestrationBindingQueryError::SnapshotStale => ArtifactExportOutcome::Stale,
+                    OrchestrationBindingQueryError::TooLarge => ArtifactExportOutcome::TooLarge,
+                    _ => ArtifactExportOutcome::BrokerFailed,
+                };
+                inflight
+                    .binding_artifacts
+                    .metrics
+                    .record_artifact_export(outcome);
+                return (bounded_orchestration_binding_error(id, error.code()), None);
+            }
+        }
+    };
+    let (descriptor, pending) = match store_binding_artifact(incarnation_id, pages, inflight) {
+        Ok(stored) => stored,
+        Err(OrchestrationBindingQueryError::Invalid) => {
+            return (
+                bounded_orchestration_binding_error(
+                    id,
+                    OrchestrationBindingQueryError::Failed.code(),
+                ),
+                None,
+            )
+        }
+        Err(error) => return (bounded_orchestration_binding_error(id, error.code()), None),
+    };
+    finalize_orchestration_binding_artifact_response(id, descriptor, pending)
 }
 
 fn orchestration_binding_query_invalid_response(id: Value) -> LineAction {
@@ -3199,6 +3415,61 @@ async fn register_and_spawn_orchestration_bindings(
         SpawnResult {
             response,
             after_relay: None,
+        }
+    });
+
+    LineAction::Spawn(SpawnedCall {
+        request_id: id,
+        request_id_key: id_key,
+        future,
+    })
+}
+
+async fn register_and_spawn_orchestration_binding_artifact(
+    inflight: Arc<InflightCalls>,
+    id: Value,
+    socket: String,
+    incarnation_id: String,
+    request: BrokerOrchestrationBindingsRequest,
+) -> LineAction {
+    let (cancel_tx, cancel_rx) = oneshot::channel();
+    let id_key = request_id_key(&id);
+    inflight
+        .register(
+            id_key.clone(),
+            InflightEntry {
+                external_handle: None,
+                cancel_tx,
+            },
+        )
+        .await;
+
+    let id_for_response = id.clone();
+    let id_key_for_task = id_key.clone();
+    let inflight_for_task = inflight.clone();
+    let future = Box::pin(async move {
+        tokio::select! {
+            biased;
+            _ = cancel_rx => {
+                let _ = inflight_for_task.take(&id_key_for_task).await;
+                SpawnResult {
+                    response: None,
+                    after_relay: None,
+                }
+            }
+            (response, pending) = orchestration_binding_artifact_response(
+                &socket,
+                request,
+                &incarnation_id,
+                id_for_response,
+                &inflight_for_task,
+            ) => {
+                let _ = inflight_for_task.take(&id_key_for_task).await;
+                SpawnResult {
+                    response: Some(response),
+                    after_relay: pending.map(PendingBindingArtifact::after_relay),
+                }
+            }
         }
     });
 
@@ -4623,6 +4894,47 @@ mod tests {
         (pipe_name, task)
     }
 
+    #[cfg(windows)]
+    fn orchestration_broker_with_outcomes(
+        outcomes: Vec<Value>,
+    ) -> (
+        String,
+        tokio::task::JoinHandle<Vec<BrokerOrchestrationBindingsRequest>>,
+    ) {
+        use crate::acp::delegation::transport::{
+            read_frame, write_frame, BrokerMessage, BrokerResponse,
+        };
+        use tokio::net::windows::named_pipe::ServerOptions;
+
+        let pipe_name = format!(
+            r"\\.\pipe\codeg-binding-artifact-test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        );
+        let task_pipe_name = pipe_name.clone();
+        let task = tokio::spawn(async move {
+            let mut requests = Vec::with_capacity(outcomes.len());
+            for (index, outcome) in outcomes.into_iter().enumerate() {
+                let mut options = ServerOptions::new();
+                if index == 0 {
+                    options.first_pipe_instance(true);
+                }
+                let mut server = options.create(&task_pipe_name).unwrap();
+                server.connect().await.unwrap();
+                let message: BrokerMessage = read_frame(&mut server).await.unwrap();
+                let BrokerMessage::OrchestrationBindings(request) = message else {
+                    panic!("expected orchestration binding query")
+                };
+                requests.push(request);
+                write_frame(&mut server, &BrokerResponse { outcome })
+                    .await
+                    .unwrap();
+            }
+            requests
+        });
+        (pipe_name, task)
+    }
+
     #[cfg(unix)]
     fn orchestration_broker_with_outcome(outcome: Value) -> (String, tokio::task::JoinHandle<()>) {
         use crate::acp::delegation::transport::{
@@ -4648,6 +4960,98 @@ mod tests {
                 .unwrap();
         });
         (socket, task)
+    }
+
+    #[cfg(unix)]
+    fn orchestration_broker_with_outcomes(
+        outcomes: Vec<Value>,
+    ) -> (
+        String,
+        tokio::task::JoinHandle<Vec<BrokerOrchestrationBindingsRequest>>,
+    ) {
+        use crate::acp::delegation::transport::{
+            read_frame, write_frame, BrokerMessage, BrokerResponse,
+        };
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("binding-artifact.sock");
+        let socket = socket_path.to_string_lossy().to_string();
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let task = tokio::spawn(async move {
+            let _dir = dir;
+            let mut requests = Vec::with_capacity(outcomes.len());
+            for outcome in outcomes {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let message: BrokerMessage = read_frame(&mut stream).await.unwrap();
+                let BrokerMessage::OrchestrationBindings(request) = message else {
+                    panic!("expected orchestration binding query")
+                };
+                requests.push(request);
+                write_frame(&mut stream, &BrokerResponse { outcome })
+                    .await
+                    .unwrap();
+            }
+            requests
+        });
+        (socket, task)
+    }
+
+    fn orchestration_binding_run(task_id: &str) -> Value {
+        json!({
+            "task_id": task_id,
+            "root_task_id": task_id,
+            "previous_task_id": Value::Null,
+            "lineage_root_task_id": task_id,
+            "replaced_task_id": Value::Null,
+            "replacement_reason": Value::Null,
+            "generic_generation": 1,
+            "work_unit_key": format!("work-unit-{task_id}"),
+            "child_conversation_id": 42,
+            "agent_type": "grok",
+            "profile_id": Value::Null,
+            "status": "completed",
+            "orchestration_binding": {
+                "schema_version": 1,
+                "namespace": "brainstorm-to-delivery",
+                "generation": 1,
+                "route_fingerprint": format!("sha256:{}", "a".repeat(64))
+            }
+        })
+    }
+
+    fn orchestration_binding_page(
+        total_rows: u64,
+        page_start: u64,
+        request_cursor: Option<&str>,
+        runs: Vec<Value>,
+        next_cursor: Option<&str>,
+    ) -> Value {
+        json!({
+            "schema_version": 1,
+            "namespace": "brainstorm-to-delivery",
+            "snapshot_id": "1a641e16-36f4-4ec5-aa4f-18d18e6ab107",
+            "snapshot_revision": "17",
+            "snapshot_created_at": "2026-08-26T08:00:00Z",
+            "snapshot_expires_at": "2026-08-26T08:01:00Z",
+            "total_rows": total_rows,
+            "page_start": page_start,
+            "request_cursor": request_cursor,
+            "runs": runs,
+            "next_cursor": next_cursor,
+            "complete": next_cursor.is_none()
+        })
+    }
+
+    fn value_contains_key(value: &Value, key: &str) -> bool {
+        match value {
+            Value::Object(object) => {
+                object.contains_key(key)
+                    || object.values().any(|value| value_contains_key(value, key))
+            }
+            Value::Array(values) => values.iter().any(|value| value_contains_key(value, key)),
+            _ => false,
+        }
     }
 
     fn large_orchestration_binding_page() -> Value {
@@ -7660,6 +8064,438 @@ mod tests {
             )
             .as_bytes()
         );
+    }
+
+    #[tokio::test]
+    async fn orchestration_binding_artifact_delivery_preserves_page_mode_wire_bytes() {
+        let page = json!({
+            "schema_version": 1,
+            "namespace": "brainstorm-to-delivery",
+            "snapshot_id": "1a641e16-36f4-4ec5-aa4f-18d18e6ab107",
+            "snapshot_revision": "17",
+            "snapshot_created_at": "2026-08-26T08:00:00Z",
+            "snapshot_expires_at": "2026-08-26T08:01:00Z",
+            "total_rows": 0,
+            "page_start": 0,
+            "request_cursor": "cursor_1",
+            "runs": [],
+            "next_cursor": null,
+            "complete": true
+        });
+        let expected_success = concat!(
+            r#"{"jsonrpc":"2.0","id":"page-fixture","result":{"content":[{"text":"{\"complete\":true,\"namespace\":\"brainstorm-to-delivery\",\"next_cursor\":null,\"page_start\":0,\"request_cursor\":\"cursor_1\",\"runs\":[],\"schema_version\":1,\"snapshot_created_at\":\"2026-08-26T08:00:00Z\",\"snapshot_expires_at\":\"2026-08-26T08:01:00Z\",\"snapshot_id\":\"1a641e16-36f4-4ec5-aa4f-18d18e6ab107\",\"snapshot_revision\":\"17\",\"total_rows\":0}","type":"text"}],"isError":false,"structuredContent":{"complete":true,"namespace":"brainstorm-to-delivery","next_cursor":null,"page_start":0,"request_cursor":"cursor_1","runs":[],"schema_version":1,"snapshot_created_at":"2026-08-26T08:00:00Z","snapshot_expires_at":"2026-08-26T08:01:00Z","snapshot_id":"1a641e16-36f4-4ec5-aa4f-18d18e6ab107","snapshot_revision":"17","total_rows":0}}}"#,
+            "\n"
+        )
+        .as_bytes();
+
+        for delivery in [None, Some("page")] {
+            let (socket_path, server) = orchestration_broker_with_outcomes(vec![page.clone()]);
+            let mut context = ctx_with(GROK_FEATURES);
+            context.socket_path = socket_path;
+            let mut arguments = json!({
+                "namespace": "brainstorm-to-delivery",
+                "snapshot_id": "1a641e16-36f4-4ec5-aa4f-18d18e6ab107",
+                "cursor": "cursor_1"
+            });
+            if let Some(delivery) = delivery {
+                arguments["delivery"] = json!(delivery);
+                arguments["limit"] = json!(100);
+            }
+            let raw_call = json!({
+                "jsonrpc": "2.0",
+                "id": "page-fixture",
+                "method": "tools/call",
+                "params": {
+                    "name": "get_delegation_orchestration_bindings",
+                    "arguments": arguments
+                }
+            })
+            .to_string();
+            let metrics = Arc::new(DelegationMetrics::default());
+            let inflight = Arc::new(InflightCalls::with_artifact_metrics(metrics.clone()));
+            let LineAction::Spawn(spawned) = dispatch_line(&context, inflight, &raw_call).await
+            else {
+                panic!("omitted and explicit page delivery must reach the broker")
+            };
+            let response = spawned.future.await.response.unwrap();
+            let requests = server.await.unwrap();
+            assert_eq!(requests.len(), 1);
+            let request_bytes = serde_json::to_vec(&requests[0].query()).unwrap();
+            assert_eq!(request_bytes.len(), 123);
+            assert_eq!(
+                request_bytes,
+                br#"{"namespace":"brainstorm-to-delivery","limit":100,"snapshot_id":"1a641e16-36f4-4ec5-aa4f-18d18e6ab107","cursor":"cursor_1"}"#
+            );
+            let success_line = serialize_jsonrpc_line(&response).unwrap();
+            assert_eq!(success_line.len(), 816);
+            assert_eq!(success_line, expected_success);
+            assert_eq!(
+                metrics
+                    .snapshot()
+                    .legacy_page_mode_calls_after_artifact_capability,
+                1
+            );
+        }
+
+        let invalid = call(
+            19,
+            "get_delegation_orchestration_bindings",
+            json!({ "namespace": 7, "delivery": "page" }),
+        );
+        let response = unwrap_respond(dispatch_with_features(GROK_FEATURES, &invalid).await);
+        let error_line = serialize_jsonrpc_line(&response).unwrap();
+        assert_eq!(error_line.len(), 250);
+        assert_eq!(
+            error_line,
+            concat!(
+                r#"{"jsonrpc":"2.0","id":19,"result":{"content":[{"text":"invalid orchestration binding query","type":"text"}],"isError":true,"structuredContent":{"error":{"code":"orchestration_binding_query_invalid","message":"invalid orchestration binding query"}}}}"#,
+                "\n"
+            )
+            .as_bytes()
+        );
+    }
+
+    #[tokio::test]
+    async fn orchestration_binding_artifact_delivery_catalog_stays_within_phase1_cap() {
+        let response = unwrap_respond(
+            dispatch_with_features(
+                GROK_FEATURES,
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+            )
+            .await,
+        );
+        let tool = response.result.as_ref().unwrap()["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "get_delegation_orchestration_bindings")
+            .unwrap();
+        assert_eq!(
+            tool["inputSchema"]["properties"]["delivery"]["enum"],
+            json!(["page", "artifact"])
+        );
+        assert_eq!(tool["inputSchema"]["properties"]["limit"]["default"], 100);
+        let line = serialize_jsonrpc_line(&response).unwrap();
+        println!("Phase 1 Grok tools/list JSONL bytes: {}", line.len());
+        assert!(line.len() <= 5_500);
+        assert!(7_680 - line.len() >= 2_180);
+    }
+
+    #[tokio::test]
+    async fn orchestration_binding_artifact_delivery_enforces_request_rules_and_defaults() {
+        for arguments in [
+            json!({ "namespace": "brainstorm-to-delivery", "delivery": null }),
+            json!({ "namespace": "brainstorm-to-delivery", "delivery": "artifact", "limit": null }),
+            json!({ "namespace": "brainstorm-to-delivery", "delivery": "artifact", "limit": 0 }),
+            json!({ "namespace": "brainstorm-to-delivery", "delivery": "artifact", "limit": 201 }),
+            json!({ "namespace": "brainstorm-to-delivery", "delivery": "artifact", "snapshot_id": "1a641e16-36f4-4ec5-aa4f-18d18e6ab107", "cursor": "cursor_1" }),
+            json!({ "namespace": "brainstorm-to-delivery", "delivery": "artifact", "unknown": true }),
+            json!({ "namespace": "brainstorm-to-delivery", "delivery": "other" }),
+            json!({ "namespace": "brainstorm-to-delivery", "delivery": "page", "limit": 201 }),
+        ] {
+            let invalid = call(21, "get_delegation_orchestration_bindings", arguments);
+            let response = unwrap_respond(dispatch_with_features(GROK_FEATURES, &invalid).await);
+            assert_eq!(
+                response.result.unwrap()["structuredContent"]["error"]["code"],
+                "orchestration_binding_query_invalid"
+            );
+        }
+
+        let page = orchestration_binding_page(
+            1,
+            0,
+            None,
+            vec![orchestration_binding_run("task-artifact")],
+            None,
+        );
+        let (socket_path, server) = orchestration_broker_with_outcomes(vec![page]);
+        let mut context = ctx_with(GROK_FEATURES);
+        context.socket_path = socket_path;
+        context.connection_incarnation_id = "00000000-0000-4000-8000-000000004123".into();
+        let inflight = Arc::new(InflightCalls::new());
+        let id =
+            ascii_string_id_with_serialized_len(GET_ORCHESTRATION_BINDINGS_MAX_REQUEST_ID_BYTES);
+        let raw_call = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {
+                "name": "get_delegation_orchestration_bindings",
+                "arguments": {
+                    "namespace": "brainstorm-to-delivery",
+                    "delivery": "artifact"
+                }
+            }
+        })
+        .to_string();
+        let LineAction::Spawn(spawned) = dispatch_line(&context, inflight.clone(), &raw_call).await
+        else {
+            panic!("valid artifact delivery must reach the broker")
+        };
+        let result = spawned.future.await;
+        let response = result.response.expect("artifact delivery response");
+        let after_relay = result.after_relay.unwrap_or_else(|| {
+            panic!(
+                "artifact delivery must return relay ownership: {}",
+                String::from_utf8(serialize_jsonrpc_line(&response).unwrap()).unwrap()
+            )
+        });
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 1, "artifact collection is model-internal");
+        assert_eq!(requests[0].limit, 200);
+        assert_eq!(requests[0].page_limit, None);
+        assert_eq!(requests[0].snapshot_id, None);
+        assert_eq!(requests[0].cursor, None);
+
+        let line = serialize_jsonrpc_line(&response).unwrap();
+        assert!(
+            line.len() <= 2_048,
+            "artifact result is {} bytes",
+            line.len()
+        );
+        let result = response.result.as_ref().unwrap();
+        assert_eq!(result.as_object().unwrap().len(), 3);
+        assert_eq!(result["content"].as_array().unwrap().len(), 1);
+        assert_eq!(result["isError"], false);
+        assert_eq!(result["structuredContent"]["delivery"], "artifact");
+        assert_eq!(result["structuredContent"]["total_rows"], 1);
+        assert!(result["structuredContent"].get("cursor").is_none());
+        assert!(!value_contains_key(result, "runs"));
+        let descriptor = &result["structuredContent"];
+        let artifact_path = descriptor["artifact_path"].as_str().unwrap();
+        println!(
+            "artifact delivery bytes: evidence={}, result={}",
+            descriptor["artifact_bytes"].as_u64().unwrap(),
+            line.len()
+        );
+        assert!(Path::new(artifact_path).is_file());
+        #[cfg(windows)]
+        assert!(artifact_path.contains(r"\codeg-mcp\orchestration-bindings\"));
+        let text = result["content"][0]["text"].as_str().unwrap();
+        for expected in [
+            artifact_path,
+            descriptor["snapshot_revision"].as_str().unwrap(),
+            descriptor["snapshot_expires_at"].as_str().unwrap(),
+            descriptor["artifact_sha256"].as_str().unwrap(),
+        ] {
+            assert!(text.contains(expected));
+        }
+        assert!(text.contains("1 row"));
+
+        after_relay.await;
+        assert_eq!(inflight.binding_artifact_count(), 1);
+        inflight.drain_binding_artifacts();
+        assert!(!Path::new(artifact_path).exists());
+    }
+
+    #[test]
+    fn orchestration_binding_artifact_delivery_deletes_oversized_result_before_relay() {
+        let metrics = Arc::new(DelegationMetrics::default());
+        let inflight = Arc::new(InflightCalls::with_artifact_metrics(metrics.clone()));
+        let page = serde_json::from_value(orchestration_binding_page(
+            1,
+            0,
+            None,
+            vec![orchestration_binding_run("task-oversized-result")],
+            None,
+        ))
+        .unwrap();
+        let incarnation_id = uuid::Uuid::new_v4().to_string();
+        let (mut descriptor, pending) =
+            store_binding_artifact(&incarnation_id, vec![page], &inflight).unwrap();
+        let stored_path = PathBuf::from(&descriptor.artifact_path);
+        descriptor.artifact_path = format!(r"C:\{}\artifact.json", "long-path".repeat(220));
+        let id =
+            ascii_string_id_with_serialized_len(GET_ORCHESTRATION_BINDINGS_MAX_REQUEST_ID_BYTES);
+        let oversized_bytes = serialize_jsonrpc_line(&ok(
+            id.clone(),
+            render_orchestration_binding_artifact(&descriptor),
+        ))
+        .unwrap()
+        .len();
+
+        let (response, pending) =
+            finalize_orchestration_binding_artifact_response(id, descriptor, pending);
+
+        assert!(pending.is_none());
+        let line = serialize_jsonrpc_line(&response).unwrap();
+        println!(
+            "oversized artifact result bytes: candidate={}, error={}, cleaned=1",
+            oversized_bytes,
+            line.len()
+        );
+        assert!(line.len() <= ORCHESTRATION_BINDING_ARTIFACT_MAX_RESULT_BYTES);
+        assert_eq!(
+            response.result.unwrap()["structuredContent"]["error"]["code"],
+            "orchestration_binding_artifact_result_too_large"
+        );
+        assert!(!stored_path.exists());
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.artifact_export_outcomes["result_too_large"], 1);
+        assert_eq!(snapshot.artifact_cleanup_success_count, 1);
+    }
+
+    #[tokio::test]
+    async fn orchestration_binding_artifact_delivery_restarts_one_stale_chain_then_succeeds() {
+        let first_page = orchestration_binding_page(
+            2,
+            0,
+            None,
+            vec![orchestration_binding_run("task-stale")],
+            Some("cursor_1"),
+        );
+        let stale = json!({
+            "error": {
+                "code": "orchestration_binding_snapshot_stale",
+                "message": "orchestration binding snapshot is stale"
+            }
+        });
+        let success = orchestration_binding_page(
+            1,
+            0,
+            None,
+            vec![orchestration_binding_run("task-restarted")],
+            None,
+        );
+        let (socket_path, server) =
+            orchestration_broker_with_outcomes(vec![first_page, stale, success]);
+        let metrics = Arc::new(DelegationMetrics::default());
+        let inflight = Arc::new(InflightCalls::with_artifact_metrics(metrics.clone()));
+        let mut context = ctx_with(GROK_FEATURES);
+        context.socket_path = socket_path;
+        context.connection_incarnation_id = "00000000-0000-4000-8000-000000004123".into();
+        let raw_call = call(
+            22,
+            "get_delegation_orchestration_bindings",
+            json!({
+                "namespace": "brainstorm-to-delivery",
+                "delivery": "artifact",
+                "limit": 2
+            }),
+        );
+        let LineAction::Spawn(spawned) = dispatch_line(&context, inflight.clone(), &raw_call).await
+        else {
+            panic!("valid artifact delivery must reach the broker")
+        };
+        let result = spawned.future.await;
+        let response = result.response.as_ref().unwrap();
+        assert_eq!(response.result.as_ref().unwrap()["isError"], false);
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0].limit, 2);
+        assert_eq!(requests[0].snapshot_id, None);
+        assert_eq!(
+            requests[1].snapshot_id.as_deref(),
+            Some("1a641e16-36f4-4ec5-aa4f-18d18e6ab107")
+        );
+        assert_eq!(requests[1].cursor.as_deref(), Some("cursor_1"));
+        assert_eq!(requests[2].snapshot_id, None);
+        assert_eq!(requests[2].cursor, None);
+        assert_eq!(metrics.snapshot().artifact_transparent_stale_restarts, 1);
+        result.after_relay.unwrap().await;
+        inflight.drain_binding_artifacts();
+    }
+
+    #[tokio::test]
+    async fn orchestration_binding_artifact_delivery_bounds_second_stale_and_cleans_attempts() {
+        let first_page = orchestration_binding_page(
+            2,
+            0,
+            None,
+            vec![orchestration_binding_run("task-partial")],
+            Some("cursor_1"),
+        );
+        let stale = json!({
+            "error": {
+                "code": "orchestration_binding_snapshot_stale",
+                "message": "private stale detail"
+            }
+        });
+        let (socket_path, server) = orchestration_broker_with_outcomes(vec![
+            first_page.clone(),
+            stale.clone(),
+            first_page,
+            stale,
+        ]);
+        let metrics = Arc::new(DelegationMetrics::default());
+        let inflight = Arc::new(InflightCalls::with_artifact_metrics(metrics.clone()));
+        let mut context = ctx_with(GROK_FEATURES);
+        context.socket_path = socket_path;
+        context.connection_incarnation_id = "00000000-0000-4000-8000-000000004123".into();
+        let raw_call = call(
+            23,
+            "get_delegation_orchestration_bindings",
+            json!({
+                "namespace": "brainstorm-to-delivery",
+                "delivery": "artifact"
+            }),
+        );
+        let LineAction::Spawn(spawned) = dispatch_line(&context, inflight.clone(), &raw_call).await
+        else {
+            panic!("valid artifact delivery must reach the broker")
+        };
+        let result = spawned.future.await;
+        assert!(result.after_relay.is_none());
+        let response = result.response.unwrap();
+        let line = serialize_jsonrpc_line(&response).unwrap();
+        assert!(line.len() <= 2_048);
+        let tool_result = response.result.unwrap();
+        assert_eq!(tool_result["isError"], true);
+        assert_eq!(
+            tool_result["structuredContent"]["error"]["code"],
+            "orchestration_binding_snapshot_stale"
+        );
+        assert!(!String::from_utf8(line)
+            .unwrap()
+            .contains("private stale detail"));
+        assert_eq!(server.await.unwrap().len(), 4);
+        assert_eq!(metrics.snapshot().artifact_transparent_stale_restarts, 1);
+        assert_eq!(metrics.snapshot().artifact_export_outcomes["stale"], 1);
+        assert_eq!(inflight.binding_artifact_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn orchestration_binding_artifact_delivery_rejects_invalid_prefix_before_following_cursor(
+    ) {
+        let mut invalid = orchestration_binding_page(
+            2,
+            0,
+            None,
+            vec![orchestration_binding_run("task-invalid-prefix")],
+            Some("cursor_1"),
+        );
+        invalid["snapshot_id"] = json!("not-a-canonical-uuid");
+        let (socket_path, server) = orchestration_broker_with_outcomes(vec![invalid]);
+        let metrics = Arc::new(DelegationMetrics::default());
+        let inflight = Arc::new(InflightCalls::with_artifact_metrics(metrics.clone()));
+        let mut context = ctx_with(GROK_FEATURES);
+        context.socket_path = socket_path;
+        context.connection_incarnation_id = "00000000-0000-4000-8000-000000004123".into();
+        let raw_call = call(
+            24,
+            "get_delegation_orchestration_bindings",
+            json!({
+                "namespace": "brainstorm-to-delivery",
+                "delivery": "artifact"
+            }),
+        );
+        let LineAction::Spawn(spawned) = dispatch_line(&context, inflight.clone(), &raw_call).await
+        else {
+            panic!("valid artifact request must reach the broker")
+        };
+
+        let result = spawned.future.await;
+        assert!(result.after_relay.is_none());
+        assert_eq!(
+            result.response.unwrap().result.unwrap()["structuredContent"]["error"]["code"],
+            "orchestration_binding_query_failed"
+        );
+        assert_eq!(server.await.unwrap().len(), 1);
+        assert_eq!(
+            metrics.snapshot().artifact_export_outcomes["broker_failed"],
+            1
+        );
+        assert_eq!(inflight.binding_artifact_count(), 0);
     }
 
     #[tokio::test]

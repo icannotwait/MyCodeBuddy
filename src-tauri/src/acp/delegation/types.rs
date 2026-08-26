@@ -74,6 +74,24 @@ fn default_orchestration_binding_limit() -> u16 {
     ORCHESTRATION_BINDING_DEFAULT_LIMIT
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OrchestrationBindingDelivery {
+    Page,
+    Artifact,
+}
+
+/// Strict companion-facing input; the broker continues to receive page DTOs.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OrchestrationBindingToolRequest {
+    pub namespace: String,
+    pub delivery: Option<OrchestrationBindingDelivery>,
+    pub limit: Option<u16>,
+    pub snapshot_id: Option<String>,
+    pub cursor: Option<String>,
+}
+
 /// Strict MCP input for a first page or continuation of one binding snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
