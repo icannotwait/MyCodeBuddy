@@ -5140,6 +5140,18 @@ mod tests {
             "/tests/fixtures/orchestration_binding_v1.json"
         )))
         .expect("valid orchestration binding corpus");
+        let high_fractional: Value =
+            serde_json::from_str("9007199254740992.5").expect("valid JSON number");
+        let u64_overflow: Value =
+            serde_json::from_str("18446744073709551616").expect("valid JSON number");
+        let binding_with = |key: &str, value: Value| {
+            let mut binding = corpus["cases"][0]["value"].clone();
+            binding
+                .as_object_mut()
+                .unwrap()
+                .insert(key.to_string(), value);
+            binding
+        };
         let tokens = Arc::new(TokenRegistry::default());
         tokens
             .register(
@@ -5321,6 +5333,42 @@ mod tests {
                 "invalid_replacement",
             ),
             (
+                "delegate binding schema high fractional",
+                delegate(
+                    "orchestration_binding",
+                    binding_with("schema_version", high_fractional.clone()),
+                ),
+                "pt-1",
+                "orchestration_binding_invalid",
+            ),
+            (
+                "delegate binding schema u64 overflow",
+                delegate(
+                    "orchestration_binding",
+                    binding_with("schema_version", u64_overflow.clone()),
+                ),
+                "pt-1",
+                "orchestration_binding_invalid",
+            ),
+            (
+                "delegate binding generation high fractional",
+                delegate(
+                    "orchestration_binding",
+                    binding_with("generation", high_fractional.clone()),
+                ),
+                "pt-1",
+                "orchestration_binding_invalid",
+            ),
+            (
+                "delegate binding generation u64 overflow",
+                delegate(
+                    "orchestration_binding",
+                    binding_with("generation", u64_overflow.clone()),
+                ),
+                "pt-1",
+                "orchestration_binding_invalid",
+            ),
+            (
                 "continue task id type",
                 continuation("task_id", json!(7)),
                 "pt-1",
@@ -5397,6 +5445,42 @@ mod tests {
                 continuation("recovery_authorization_id", json!("")),
                 "pt-1",
                 "invalid_recovery_authorization_id",
+            ),
+            (
+                "continue binding schema high fractional",
+                continuation(
+                    "orchestration_binding",
+                    binding_with("schema_version", high_fractional.clone()),
+                ),
+                "pt-1",
+                "orchestration_binding_invalid",
+            ),
+            (
+                "continue binding schema u64 overflow",
+                continuation(
+                    "orchestration_binding",
+                    binding_with("schema_version", u64_overflow.clone()),
+                ),
+                "pt-1",
+                "orchestration_binding_invalid",
+            ),
+            (
+                "continue binding generation high fractional",
+                continuation(
+                    "orchestration_binding",
+                    binding_with("generation", high_fractional),
+                ),
+                "pt-1",
+                "orchestration_binding_invalid",
+            ),
+            (
+                "continue binding generation u64 overflow",
+                continuation(
+                    "orchestration_binding",
+                    binding_with("generation", u64_overflow),
+                ),
+                "pt-1",
+                "orchestration_binding_invalid",
             ),
         ];
 

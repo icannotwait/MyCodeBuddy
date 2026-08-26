@@ -1167,18 +1167,10 @@ fn parse_get_workflow_state_args(
 
 fn is_nonnegative_json_integer(value: &Value) -> bool {
     value.as_u64().is_some()
-        || value
-            .as_f64()
-            .is_some_and(|number| number >= 0.0 && number.fract() == 0.0)
 }
 
 fn json_u64(value: &Value) -> Option<u64> {
-    value.as_u64().or_else(|| {
-        value.as_f64().and_then(|number| {
-            (number >= 0.0 && number <= u64::MAX as f64 && number.fract() == 0.0)
-                .then_some(number as u64)
-        })
-    })
+    value.as_u64()
 }
 
 fn validate_publish_workflow_compacted_fields(arguments: &Value) -> Result<(), String> {
@@ -6510,6 +6502,10 @@ mod tests {
 
     #[tokio::test]
     async fn delegation_catalog_compaction_removed_leaf_runtime_parity() {
+        let high_fractional: Value =
+            serde_json::from_str("9007199254740992.5").expect("valid JSON number");
+        let u64_overflow: Value =
+            serde_json::from_str("18446744073709551616").expect("valid JSON number");
         let publish = json!({
             "schema_version": 2,
             "workflow_kind": "simple",
@@ -6620,6 +6616,16 @@ mod tests {
                 "session max below minimum",
                 "get_session_info",
                 json!({"session_id": 1, "max_messages": -1}),
+            ),
+            (
+                "session max high fractional",
+                "get_session_info",
+                json!({"session_id": 1, "max_messages": high_fractional.clone()}),
+            ),
+            (
+                "session max u64 overflow",
+                "get_session_info",
+                json!({"session_id": 1, "max_messages": u64_overflow.clone()}),
             ),
             (
                 "reply request type",
@@ -6765,6 +6771,24 @@ mod tests {
                 with_argument(recover.clone(), "expected_manifest_revision", json!(0)),
             ),
             (
+                "recover revision high fractional",
+                "recover_workflow",
+                with_argument(
+                    recover.clone(),
+                    "expected_manifest_revision",
+                    high_fractional.clone(),
+                ),
+            ),
+            (
+                "recover revision u64 overflow",
+                "recover_workflow",
+                with_argument(
+                    recover.clone(),
+                    "expected_manifest_revision",
+                    u64_overflow.clone(),
+                ),
+            ),
+            (
                 "recover correlation type",
                 "recover_workflow",
                 with_argument(recover.clone(), "correlation_id", json!(7)),
@@ -6808,6 +6832,24 @@ mod tests {
                 "publish revision below minimum",
                 "publish_workflow_manifest",
                 with_argument(publish.clone(), "expected_manifest_revision", json!(-1)),
+            ),
+            (
+                "publish revision high fractional",
+                "publish_workflow_manifest",
+                with_argument(
+                    publish.clone(),
+                    "expected_manifest_revision",
+                    high_fractional.clone(),
+                ),
+            ),
+            (
+                "publish revision u64 overflow",
+                "publish_workflow_manifest",
+                with_argument(
+                    publish.clone(),
+                    "expected_manifest_revision",
+                    u64_overflow.clone(),
+                ),
             ),
             (
                 "publish plan target type",
@@ -6860,6 +6902,24 @@ mod tests {
                 with_argument(settle.clone(), "expected_graph_revision", json!(-1)),
             ),
             (
+                "settle graph revision high fractional",
+                "settle_workflow_gate",
+                with_argument(
+                    settle.clone(),
+                    "expected_graph_revision",
+                    high_fractional.clone(),
+                ),
+            ),
+            (
+                "settle graph revision u64 overflow",
+                "settle_workflow_gate",
+                with_argument(
+                    settle.clone(),
+                    "expected_graph_revision",
+                    u64_overflow.clone(),
+                ),
+            ),
+            (
                 "settle review round type",
                 "settle_workflow_gate",
                 with_argument(settle.clone(), "expected_review_round", json!("1")),
@@ -6870,6 +6930,24 @@ mod tests {
                 with_argument(settle.clone(), "expected_review_round", json!(0)),
             ),
             (
+                "settle review round high fractional",
+                "settle_workflow_gate",
+                with_argument(
+                    settle.clone(),
+                    "expected_review_round",
+                    high_fractional.clone(),
+                ),
+            ),
+            (
+                "settle review round u64 overflow",
+                "settle_workflow_gate",
+                with_argument(
+                    settle.clone(),
+                    "expected_review_round",
+                    u64_overflow.clone(),
+                ),
+            ),
+            (
                 "settle gate cycle type",
                 "settle_workflow_gate",
                 with_argument(settle.clone(), "expected_gate_cycle", json!("1")),
@@ -6878,6 +6956,20 @@ mod tests {
                 "settle gate cycle below minimum",
                 "settle_workflow_gate",
                 with_argument(settle.clone(), "expected_gate_cycle", json!(0)),
+            ),
+            (
+                "settle gate cycle high fractional",
+                "settle_workflow_gate",
+                with_argument(
+                    settle.clone(),
+                    "expected_gate_cycle",
+                    high_fractional.clone(),
+                ),
+            ),
+            (
+                "settle gate cycle u64 overflow",
+                "settle_workflow_gate",
+                with_argument(settle.clone(), "expected_gate_cycle", u64_overflow.clone()),
             ),
             (
                 "settle outcome type",
