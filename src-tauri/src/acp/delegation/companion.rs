@@ -37,15 +37,20 @@
 //!    removed normally and the response goes out on stdout; a late cancel
 //!    notification finds nothing and is silently ignored.
 
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Duration;
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tokio::sync::{oneshot, Mutex};
 
 use crate::acp::delegation::attention::ATTENTION_PAYLOAD_MAX_BYTES;
+use crate::acp::delegation::metrics::{ArtifactExportOutcome, DelegationMetrics};
 use crate::acp::delegation::transport::{
     client_ask_round_trip, client_cancel, client_cancel_task_round_trip, client_commit_feedback,
     client_complete_work_round_trip, client_feedback_round_trip,
@@ -63,8 +68,9 @@ use crate::acp::delegation::transport::{
     CancelDelegationReason, CompanionRole,
 };
 use crate::acp::delegation::types::{
-    validate_correlation_id, DelegationOrchestrationBindingPage, DelegationReturnWhen,
-    OrchestrationBindingQueryError, OrchestrationBindingQueryRequest,
+    validate_correlation_id, BindingEvidenceV1, DelegationOrchestrationBindingPage,
+    DelegationReturnWhen, OrchestrationBindingArtifactDescriptor, OrchestrationBindingQueryError,
+    OrchestrationBindingQueryRequest,
 };
 use crate::acp::delegation::workflow::{
     CompleteWorkRequest, WorkflowIndexOmissionStep, WorkflowStateIndexDto,
@@ -95,6 +101,544 @@ async fn send_broker_cancel(socket_path: &str, req: &BrokerCancelRequest) {
     let _ = tokio::time::timeout(BROKER_CANCEL_BUDGET, client_cancel(socket_path, req)).await;
 }
 
+#[cfg(test)]
+mod orchestration_binding_artifact_storage_tests {
+    use std::collections::BTreeSet;
+    use std::fs;
+    use std::path::Path;
+    use std::sync::Arc;
+    use std::time::{Duration, SystemTime};
+
+    use chrono::{TimeZone, Utc};
+    use serde_json::json;
+    use sha2::Digest;
+
+    use super::*;
+    use crate::acp::delegation::metrics::DelegationMetrics;
+    use crate::acp::delegation::transport::CompanionRole;
+    use crate::acp::delegation::types::{BindingEvidenceV1, DelegationOrchestrationBindingRun};
+
+    const INCARNATION_A: &str = "00000000-0000-4000-8000-000000000001";
+    #[cfg(unix)]
+    const INCARNATION_B: &str = "00000000-0000-4000-8000-000000000002";
+
+    fn run(task_id: impl Into<String>) -> DelegationOrchestrationBindingRun {
+        let task_id = task_id.into();
+        DelegationOrchestrationBindingRun {
+            root_task_id: task_id.clone(),
+            lineage_root_task_id: task_id.clone(),
+            task_id,
+            previous_task_id: None,
+            replaced_task_id: None,
+            replacement_reason: None,
+            generic_generation: 1,
+            work_unit_key: Some("task:1".into()),
+            child_conversation_id: 1,
+            agent_type: "grok".into(),
+            profile_id: None,
+            status: "running".into(),
+            orchestration_binding: None,
+        }
+    }
+
+    fn page(runs: Vec<DelegationOrchestrationBindingRun>) -> DelegationOrchestrationBindingPage {
+        DelegationOrchestrationBindingPage {
+            schema_version: 1,
+            namespace: "brainstorm-to-delivery".into(),
+            snapshot_id: "1a641e16-36f4-4ec5-aa4f-18d18e6ab107".into(),
+            snapshot_revision: "42".into(),
+            snapshot_created_at: Utc.with_ymd_and_hms(2026, 8, 26, 8, 0, 0).unwrap(),
+            snapshot_expires_at: Utc.with_ymd_and_hms(2026, 8, 26, 8, 1, 0).unwrap(),
+            total_rows: runs.len() as u64,
+            page_start: 0,
+            request_cursor: None,
+            runs,
+            next_cursor: None,
+            complete: true,
+        }
+    }
+
+    fn two_pages() -> Vec<DelegationOrchestrationBindingPage> {
+        let mut first = page(vec![run("task-1")]);
+        first.total_rows = 2;
+        first.next_cursor = Some("cursor-a".into());
+        first.complete = false;
+
+        let mut second = page(vec![run("task-2")]);
+        second.total_rows = 2;
+        second.page_start = 1;
+        second.request_cursor = Some("cursor-a".into());
+        vec![first, second]
+    }
+
+    fn exact_size_page(target_bytes: usize) -> DelegationOrchestrationBindingPage {
+        let mut page = page(vec![run("x")]);
+        let current = serde_json::to_vec(&BindingEvidenceV1 {
+            schema_version: 1,
+            pages: vec![page.clone()],
+        })
+        .unwrap()
+        .len();
+        page.runs[0].task_id = "x".repeat(1 + target_bytes - current);
+        assert_eq!(
+            serde_json::to_vec(&BindingEvidenceV1 {
+                schema_version: 1,
+                pages: vec![page.clone()],
+            })
+            .unwrap()
+            .len(),
+            target_bytes
+        );
+        page
+    }
+
+    fn context() -> CompanionContext {
+        CompanionContext {
+            parent_connection_id: "parent".into(),
+            socket_path: "unused".into(),
+            token: "token".into(),
+            features: CompanionFeatures {
+                delegation: true,
+                coordination_v1: true,
+                feedback: false,
+                ask: false,
+                sessions: false,
+                workflow_v2: false,
+                completion_v2: false,
+            },
+            role: CompanionRole::Root,
+            can_spawn_child: true,
+            connection_incarnation_id: INCARNATION_A.into(),
+            disabled_agents: Vec::new(),
+        }
+    }
+
+    fn json_files(root: &Path) -> Vec<std::path::PathBuf> {
+        let mut files = Vec::new();
+        if !root.exists() {
+            return files;
+        }
+        for directory in fs::read_dir(root).unwrap() {
+            let directory = directory.unwrap().path();
+            if !directory.is_dir() {
+                continue;
+            }
+            files.extend(
+                fs::read_dir(directory)
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.path())
+                    .filter(|path| {
+                        path.extension()
+                            .is_some_and(|extension| extension == "json")
+                    }),
+            );
+        }
+        files
+    }
+
+    #[test]
+    fn orchestration_binding_artifact_storage_accepts_empty_one_and_4096_rows() {
+        for rows in [0, 1, ORCHESTRATION_BINDING_ARTIFACT_MAX_ROWS] {
+            let runs = (0..rows)
+                .map(|index| run(format!("task-{index}")))
+                .collect();
+            let prepared = prepare_binding_evidence(vec![page(runs)]).unwrap();
+            assert_eq!(prepared.total_rows, rows);
+            let parsed: BindingEvidenceV1 = serde_json::from_slice(&prepared.bytes).unwrap();
+            assert_eq!(parsed.schema_version, 1);
+            assert_eq!(parsed.pages.len(), 1);
+            assert_eq!(parsed.pages[0].runs.len(), rows);
+        }
+    }
+
+    #[test]
+    fn orchestration_binding_artifact_storage_rejects_4097_rows() {
+        let runs = (0..=ORCHESTRATION_BINDING_ARTIFACT_MAX_ROWS)
+            .map(|index| run(format!("task-{index}")))
+            .collect();
+        assert_eq!(
+            prepare_binding_evidence(vec![page(runs)]).unwrap_err(),
+            OrchestrationBindingQueryError::TooLarge
+        );
+    }
+
+    #[test]
+    fn orchestration_binding_artifact_storage_accepts_exactly_4_mib_and_rejects_one_more_byte() {
+        let exact = prepare_binding_evidence(vec![exact_size_page(
+            ORCHESTRATION_BINDING_ARTIFACT_MAX_BYTES,
+        )])
+        .unwrap();
+        assert_eq!(exact.bytes.len(), ORCHESTRATION_BINDING_ARTIFACT_MAX_BYTES);
+
+        assert_eq!(
+            prepare_binding_evidence(vec![exact_size_page(
+                ORCHESTRATION_BINDING_ARTIFACT_MAX_BYTES + 1,
+            )])
+            .unwrap_err(),
+            OrchestrationBindingQueryError::ArtifactTooLarge
+        );
+    }
+
+    #[test]
+    fn orchestration_binding_artifact_storage_rejects_invalid_page_chains() {
+        let mut cases = Vec::new();
+
+        let mut duplicate = two_pages();
+        duplicate[1].runs[0].task_id = duplicate[0].runs[0].task_id.clone();
+        cases.push(("duplicate task id", duplicate));
+
+        let mut mixed_metadata = two_pages();
+        mixed_metadata[1].snapshot_revision = "43".into();
+        cases.push(("mixed snapshot metadata", mixed_metadata));
+
+        let mut wrong_first_start = two_pages();
+        wrong_first_start[0].page_start = 1;
+        cases.push(("wrong first page start", wrong_first_start));
+
+        let mut wrong_first_cursor = two_pages();
+        wrong_first_cursor[0].request_cursor = Some("cursor-before-first".into());
+        cases.push(("wrong first cursor", wrong_first_cursor));
+
+        let mut wrong_cursor_echo = two_pages();
+        wrong_cursor_echo[1].request_cursor = Some("cursor-b".into());
+        cases.push(("wrong cursor echo", wrong_cursor_echo));
+
+        let mut gap = two_pages();
+        gap[1].page_start = 2;
+        cases.push(("gap", gap));
+
+        let mut reordered = two_pages();
+        reordered.swap(0, 1);
+        cases.push(("reordered pages", reordered));
+
+        let mut trailing = two_pages();
+        let mut extra = page(Vec::new());
+        extra.total_rows = 2;
+        extra.page_start = 2;
+        trailing.push(extra);
+        cases.push(("trailing page", trailing));
+
+        let mut missing_completion = two_pages();
+        missing_completion[1].complete = false;
+        missing_completion[1].next_cursor = Some("cursor-c".into());
+        cases.push(("missing completion", missing_completion));
+
+        let mut changed_total = two_pages();
+        changed_total[1].total_rows = 3;
+        cases.push(("changed total count", changed_total));
+
+        for (name, pages) in cases {
+            assert_eq!(
+                prepare_binding_evidence(pages).unwrap_err(),
+                OrchestrationBindingQueryError::Invalid,
+                "{name} must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn orchestration_binding_artifact_storage_uses_random_atomic_private_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("codeg-mcp/orchestration-bindings");
+        let inflight = Arc::new(InflightCalls::new());
+
+        let (first, first_pending) = store_binding_artifact_at(
+            &root,
+            INCARNATION_A,
+            vec![page(vec![run("task-a")])],
+            &inflight,
+        )
+        .unwrap();
+        let (second, second_pending) = store_binding_artifact_at(
+            &root,
+            INCARNATION_A,
+            vec![page(vec![run("task-b")])],
+            &inflight,
+        )
+        .unwrap();
+
+        assert_ne!(first.artifact_path, second.artifact_path);
+        for descriptor in [&first, &second] {
+            let path = Path::new(&descriptor.artifact_path);
+            let stem = path.file_stem().unwrap().to_str().unwrap();
+            assert_eq!(uuid::Uuid::parse_str(stem).unwrap().to_string(), stem);
+            assert_eq!(path.extension().unwrap(), "json");
+            assert!(!descriptor.artifact_path.contains("brainstorm-to-delivery"));
+            let bytes = fs::read(path).unwrap();
+            assert_eq!(bytes.len() as u64, descriptor.artifact_bytes);
+            assert_eq!(
+                descriptor.artifact_sha256,
+                format!("sha256:{:x}", sha2::Sha256::digest(&bytes))
+            );
+            serde_json::from_slice::<BindingEvidenceV1>(&bytes).unwrap();
+        }
+        assert_eq!(
+            json_files(&root).len(),
+            2,
+            "no sibling partial files remain"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let owner = Path::new(&first.artifact_path).parent().unwrap();
+            assert_eq!(
+                fs::metadata(owner).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            assert_eq!(
+                fs::metadata(&first.artifact_path)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+
+        first_pending.mark_delivered();
+        second_pending.mark_delivered();
+    }
+
+    #[test]
+    fn orchestration_binding_artifact_storage_sweeps_only_verified_stale_root_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("codeg-mcp/orchestration-bindings");
+        let owner = root.join(INCARNATION_A);
+        fs::create_dir_all(&owner).unwrap();
+        let stale = owner.join("00000000-0000-4000-8000-000000000010.json");
+        let fresh = owner.join("00000000-0000-4000-8000-000000000011.json");
+        let partial = owner.join(".codeg-binding-crash-partial");
+        let sibling = temp.path().join("must-survive.json");
+        fs::write(&stale, b"stale").unwrap();
+        fs::write(&fresh, b"fresh").unwrap();
+        fs::write(&partial, b"partial").unwrap();
+        fs::write(&sibling, b"outside").unwrap();
+
+        let metrics = DelegationMetrics::default();
+        sweep_stale_binding_artifacts_at(
+            &root,
+            SystemTime::now() + ORCHESTRATION_BINDING_ARTIFACT_STALE_AGE + Duration::from_secs(1),
+            &metrics,
+        )
+        .unwrap();
+
+        assert!(!stale.exists());
+        assert!(!fresh.exists());
+        assert!(!partial.exists());
+        assert!(
+            sibling.exists(),
+            "sweep must remain under the verified root"
+        );
+        assert_eq!(metrics.snapshot().artifact_cleanup_success_count, 3);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn orchestration_binding_artifact_storage_skips_symlinked_owner_outside_verified_root() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("codeg-mcp/orchestration-bindings");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let outside_file = outside.join("00000000-0000-4000-8000-000000000012.json");
+        fs::write(&outside_file, b"outside").unwrap();
+        symlink(&outside, root.join(INCARNATION_B)).unwrap();
+
+        sweep_stale_binding_artifacts_at(
+            &root,
+            SystemTime::now() + ORCHESTRATION_BINDING_ARTIFACT_STALE_AGE + Duration::from_secs(1),
+            &DelegationMetrics::default(),
+        )
+        .unwrap();
+
+        assert!(outside_file.exists());
+    }
+
+    #[test]
+    fn orchestration_binding_artifact_storage_cleans_unpublished_partial_on_persist_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let owner = temp.path().join(INCARNATION_A);
+        fs::create_dir_all(&owner).unwrap();
+        let final_path = owner.join("00000000-0000-4000-8000-000000000020.json");
+        fs::write(&final_path, b"existing").unwrap();
+
+        assert!(atomic_publish_binding_artifact(&owner, &final_path, b"replacement").is_err());
+        let files = fs::read_dir(&owner)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect::<Vec<_>>();
+        assert_eq!(files.len(), 1);
+        assert_eq!(fs::read(final_path).unwrap(), b"existing");
+    }
+
+    #[test]
+    fn orchestration_binding_artifact_storage_cancellation_removes_published_pending_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("codeg-mcp/orchestration-bindings");
+        let inflight = Arc::new(InflightCalls::new());
+        let (descriptor, pending) = store_binding_artifact_at(
+            &root,
+            INCARNATION_A,
+            vec![page(vec![run("task-a")])],
+            &inflight,
+        )
+        .unwrap();
+
+        assert!(Path::new(&descriptor.artifact_path).exists());
+        assert_eq!(inflight.binding_artifact_count(), 1);
+        drop(pending);
+        assert!(!Path::new(&descriptor.artifact_path).exists());
+        assert_eq!(inflight.binding_artifact_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn orchestration_binding_artifact_storage_shutdown_cleans_delivered_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("codeg-mcp/orchestration-bindings");
+        let inflight = Arc::new(InflightCalls::new());
+        let (descriptor, pending) = store_binding_artifact_at(
+            &root,
+            INCARNATION_A,
+            vec![page(vec![run("task-a")])],
+            &inflight,
+        )
+        .unwrap();
+        pending.set_final_result_bytes(1_024).after_relay().await;
+
+        drain_and_cancel_all(&context(), &inflight, "test shutdown").await;
+
+        assert!(!Path::new(&descriptor.artifact_path).exists());
+        assert_eq!(inflight.binding_artifact_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn orchestration_binding_artifact_storage_pre_relay_shutdown_drains_registered_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("codeg-mcp/orchestration-bindings");
+        let inflight = Arc::new(InflightCalls::new());
+        let (descriptor, pending) = store_binding_artifact_at(
+            &root,
+            INCARNATION_A,
+            vec![page(vec![run("task-a")])],
+            &inflight,
+        )
+        .unwrap();
+        let relay_result = SpawnResult {
+            response: Some(ok(json!(1), json!(descriptor.clone()))),
+            after_relay: Some(pending.after_relay()),
+        };
+
+        drain_and_cancel_all(&context(), &inflight, "test hard exit").await;
+
+        assert!(!Path::new(&descriptor.artifact_path).exists());
+        assert_eq!(inflight.binding_artifact_count(), 0);
+        assert!(
+            relay_result.after_relay.is_some(),
+            "drain must not depend on running or dropping the relay callback"
+        );
+    }
+
+    #[test]
+    fn orchestration_binding_artifact_storage_metrics_are_identifier_free() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("codeg-mcp/orchestration-bindings");
+        let metrics = Arc::new(DelegationMetrics::default());
+        let inflight = Arc::new(InflightCalls::with_artifact_metrics(metrics.clone()));
+        let sensitive_task = "task-sensitive";
+        let sensitive_incarnation = "00000000-0000-4000-8000-000000004123";
+
+        let (descriptor, pending) = store_binding_artifact_at(
+            &root,
+            sensitive_incarnation,
+            vec![page(vec![run(sensitive_task)])],
+            &inflight,
+        )
+        .unwrap();
+        drop(pending.set_final_result_bytes(1_536));
+        let oversized = store_binding_artifact_at(
+            &root,
+            sensitive_incarnation,
+            vec![exact_size_page(
+                ORCHESTRATION_BINDING_ARTIFACT_MAX_BYTES + 1,
+            )],
+            &inflight,
+        )
+        .err()
+        .expect("oversized artifact must fail");
+        assert_eq!(oversized, OrchestrationBindingQueryError::ArtifactTooLarge);
+        inflight.record_binding_artifact_stale_restart();
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.artifact_cleanup_success_count, 1);
+        assert_eq!(snapshot.artifact_export_outcomes["cancelled"], 1);
+        assert_eq!(snapshot.artifact_export_outcomes["too_large"], 1);
+        assert_eq!(snapshot.artifact_transparent_stale_restarts, 1);
+        assert_eq!(
+            snapshot
+                .artifact_internal_page_count_buckets
+                .iter()
+                .sum::<u64>(),
+            1
+        );
+        assert_eq!(
+            snapshot
+                .artifact_selected_row_count_buckets
+                .iter()
+                .sum::<u64>(),
+            1
+        );
+        assert_eq!(
+            snapshot.artifact_evidence_bytes_buckets.iter().sum::<u64>(),
+            1
+        );
+        assert_eq!(
+            snapshot
+                .artifact_export_duration_ms_buckets
+                .iter()
+                .sum::<u64>(),
+            1
+        );
+        assert_eq!(
+            snapshot
+                .artifact_final_mcp_result_bytes_buckets
+                .iter()
+                .sum::<u64>(),
+            1
+        );
+        let serialized = serde_json::to_string(&snapshot).unwrap();
+        for sensitive in [
+            sensitive_task,
+            sensitive_incarnation,
+            descriptor.artifact_path.as_str(),
+            descriptor.artifact_sha256.as_str(),
+        ] {
+            assert!(!serialized.contains(sensitive));
+        }
+        assert_eq!(
+            snapshot
+                .artifact_export_outcomes
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "broker_failed",
+                "cancelled",
+                "io_failed",
+                "result_too_large",
+                "serialization_failed",
+                "stale",
+                "success",
+                "too_large",
+            ])
+        );
+    }
+}
+
 /// Static MCP tool schema. Lives next to this module so codeg-mcp ships
 /// a single embedded copy — no runtime file IO, no version skew with the
 /// broker's [`super::types::DelegationRequest`].
@@ -105,6 +649,11 @@ pub const GET_WORKFLOW_STATE_MAX_REQUEST_ID_BYTES: usize = 256;
 
 pub const GET_ORCHESTRATION_BINDINGS_MAX_RESULT_BYTES: usize = 7_680;
 pub const GET_ORCHESTRATION_BINDINGS_MAX_REQUEST_ID_BYTES: usize = 256;
+
+pub const ORCHESTRATION_BINDING_ARTIFACT_MAX_ROWS: usize = 4_096;
+pub const ORCHESTRATION_BINDING_ARTIFACT_MAX_BYTES: usize = 4 * 1024 * 1024;
+const ORCHESTRATION_BINDING_ARTIFACT_FORMAT: &str = "codeg-binding-evidence-v1";
+const ORCHESTRATION_BINDING_ARTIFACT_STALE_AGE: Duration = Duration::from_secs(10 * 60);
 
 /// Grok stdio host splits JSONL at 8,192 bytes without reassembly. Keep the
 /// same 512-byte headroom used by `tools/list` / `get_workflow_state`.
@@ -421,14 +970,179 @@ pub struct InflightEntry {
 /// JSON-RPC `id` so we can compare against the `requestId` payload of
 /// `notifications/cancelled` which is itself a JSON value (numbers serialize
 /// as their canonical string form here).
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BindingArtifactState {
+    PendingRelay,
+    Delivered,
+}
+
+struct BindingArtifactRegistry {
+    entries: StdMutex<HashMap<PathBuf, BindingArtifactState>>,
+    metrics: Arc<DelegationMetrics>,
+}
+
+impl BindingArtifactRegistry {
+    fn new(metrics: Arc<DelegationMetrics>) -> Self {
+        Self {
+            entries: StdMutex::new(HashMap::new()),
+            metrics,
+        }
+    }
+
+    fn register(
+        self: &Arc<Self>,
+        path: PathBuf,
+        export_metrics: PendingBindingArtifactMetrics,
+    ) -> PendingBindingArtifact {
+        self.entries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(path.clone(), BindingArtifactState::PendingRelay);
+        PendingBindingArtifact {
+            path,
+            registry: self.clone(),
+            cleanup_on_drop: true,
+            export_metrics: Some(export_metrics),
+        }
+    }
+
+    fn mark_delivered(&self, path: &Path) {
+        if let Some(state) = self
+            .entries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get_mut(path)
+        {
+            *state = BindingArtifactState::Delivered;
+        }
+    }
+
+    fn cleanup(&self, path: &Path) {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if !entries.contains_key(path) {
+            return;
+        }
+        match fs::remove_file(path) {
+            Ok(()) => {
+                entries.remove(path);
+                self.metrics.record_artifact_cleanup(true);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                entries.remove(path);
+                self.metrics.record_artifact_cleanup(true);
+            }
+            Err(_) => self.metrics.record_artifact_cleanup(false),
+        }
+    }
+
+    fn drain(&self) {
+        let paths = self
+            .entries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        for path in paths {
+            self.cleanup(&path);
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .len()
+    }
+}
+
+pub struct PendingBindingArtifact {
+    path: PathBuf,
+    registry: Arc<BindingArtifactRegistry>,
+    cleanup_on_drop: bool,
+    export_metrics: Option<PendingBindingArtifactMetrics>,
+}
+
+struct PendingBindingArtifactMetrics {
+    internal_page_count: usize,
+    selected_row_count: usize,
+    evidence_bytes: usize,
+    export_duration: Duration,
+    final_result_bytes: usize,
+}
+
+impl PendingBindingArtifact {
+    pub fn set_final_result_bytes(mut self, final_result_bytes: usize) -> Self {
+        if let Some(metrics) = &mut self.export_metrics {
+            metrics.final_result_bytes = final_result_bytes;
+        }
+        self
+    }
+
+    fn record_outcome(&mut self, outcome: ArtifactExportOutcome) {
+        let Some(export) = self.export_metrics.take() else {
+            return;
+        };
+        self.registry.metrics.record_artifact_export(outcome);
+        self.registry.metrics.record_artifact_shape(
+            export.internal_page_count,
+            export.selected_row_count,
+            export.evidence_bytes,
+            export.export_duration,
+            export.final_result_bytes,
+        );
+    }
+
+    fn mark_delivered(mut self) {
+        self.record_outcome(ArtifactExportOutcome::Success);
+        self.registry.mark_delivered(&self.path);
+        self.cleanup_on_drop = false;
+    }
+
+    pub fn after_relay(self) -> futures_util::future::BoxFuture<'static, ()> {
+        Box::pin(async move { self.mark_delivered() })
+    }
+}
+
+impl Drop for PendingBindingArtifact {
+    fn drop(&mut self) {
+        if self.cleanup_on_drop {
+            self.record_outcome(ArtifactExportOutcome::Cancelled);
+            self.registry.cleanup(&self.path);
+        }
+    }
+}
+
 pub struct InflightCalls {
     inner: Mutex<HashMap<String, InflightEntry>>,
+    binding_artifacts: Arc<BindingArtifactRegistry>,
+}
+
+impl Default for InflightCalls {
+    fn default() -> Self {
+        Self::with_artifact_metrics(Arc::new(DelegationMetrics::default()))
+    }
 }
 
 impl InflightCalls {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn with_artifact_metrics(metrics: Arc<DelegationMetrics>) -> Self {
+        Self {
+            inner: Mutex::new(HashMap::new()),
+            binding_artifacts: Arc::new(BindingArtifactRegistry::new(metrics)),
+        }
+    }
+
+    #[cfg(test)]
+    fn binding_artifact_count(&self) -> usize {
+        self.binding_artifacts.len()
     }
 
     async fn register(&self, id_key: String, entry: InflightEntry) {
@@ -449,6 +1163,378 @@ impl InflightCalls {
         let mut map = self.inner.lock().await;
         map.drain().map(|(_k, v)| v).collect()
     }
+
+    fn drain_binding_artifacts(&self) {
+        self.binding_artifacts.drain();
+    }
+
+    pub fn record_binding_artifact_stale_restart(&self) {
+        self.binding_artifacts
+            .metrics
+            .record_artifact_transparent_stale_restart();
+    }
+}
+
+#[derive(Debug)]
+struct PreparedBindingEvidence {
+    evidence: BindingEvidenceV1,
+    bytes: Vec<u8>,
+    total_rows: usize,
+}
+
+fn valid_binding_artifact_cursor(cursor: &Option<String>) -> bool {
+    cursor.as_ref().is_none_or(|cursor| {
+        !cursor.is_empty()
+            && cursor.len() <= 128
+            && cursor
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    })
+}
+
+fn prepare_binding_evidence(
+    pages: Vec<DelegationOrchestrationBindingPage>,
+) -> Result<PreparedBindingEvidence, OrchestrationBindingQueryError> {
+    let Some(first) = pages.first() else {
+        return Err(OrchestrationBindingQueryError::Invalid);
+    };
+    let namespace = first.namespace.as_bytes();
+    let snapshot_id = uuid::Uuid::parse_str(&first.snapshot_id)
+        .ok()
+        .filter(|snapshot_id| snapshot_id.to_string() == first.snapshot_id);
+    let snapshot_revision = first
+        .snapshot_revision
+        .parse::<u64>()
+        .ok()
+        .filter(|revision| revision.to_string() == first.snapshot_revision);
+    if first.schema_version != 1
+        || namespace.is_empty()
+        || namespace.len() > 64
+        || !namespace[0].is_ascii_lowercase()
+        || !namespace[1..]
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+        || snapshot_id.is_none()
+        || snapshot_revision.is_none()
+        || first.snapshot_expires_at <= first.snapshot_created_at
+        || first.snapshot_expires_at - first.snapshot_created_at > chrono::Duration::seconds(60)
+        || first.page_start != 0
+        || first.request_cursor.is_some()
+        || !valid_binding_artifact_cursor(&first.next_cursor)
+    {
+        return Err(OrchestrationBindingQueryError::Invalid);
+    }
+    if first.total_rows > ORCHESTRATION_BINDING_ARTIFACT_MAX_ROWS as u64 {
+        return Err(OrchestrationBindingQueryError::TooLarge);
+    }
+
+    let mut expected_start = 0u64;
+    let mut previous_next_cursor: Option<&str> = None;
+    let mut seen_complete = false;
+    let mut seen_task_ids = HashSet::new();
+    for (index, page) in pages.iter().enumerate() {
+        if page.schema_version != first.schema_version
+            || page.namespace != first.namespace
+            || page.snapshot_id != first.snapshot_id
+            || page.snapshot_revision != first.snapshot_revision
+            || page.snapshot_created_at != first.snapshot_created_at
+            || page.snapshot_expires_at != first.snapshot_expires_at
+            || page.total_rows != first.total_rows
+            || seen_complete
+            || page.page_start != expected_start
+            || !valid_binding_artifact_cursor(&page.request_cursor)
+            || !valid_binding_artifact_cursor(&page.next_cursor)
+            || (index > 0 && page.request_cursor.as_deref() != previous_next_cursor)
+            || (page.complete && page.next_cursor.is_some())
+            || (!page.complete && page.next_cursor.is_none())
+        {
+            return Err(OrchestrationBindingQueryError::Invalid);
+        }
+        expected_start = expected_start
+            .checked_add(page.runs.len() as u64)
+            .ok_or(OrchestrationBindingQueryError::TooLarge)?;
+        if expected_start > ORCHESTRATION_BINDING_ARTIFACT_MAX_ROWS as u64 {
+            return Err(OrchestrationBindingQueryError::TooLarge);
+        }
+        for run in &page.runs {
+            if run.task_id.is_empty() || !seen_task_ids.insert(run.task_id.as_str()) {
+                return Err(OrchestrationBindingQueryError::Invalid);
+            }
+        }
+        seen_complete = page.complete;
+        previous_next_cursor = page.next_cursor.as_deref();
+    }
+    if !seen_complete || expected_start != first.total_rows {
+        return Err(OrchestrationBindingQueryError::Invalid);
+    }
+
+    let total_rows = expected_start as usize;
+    let evidence = BindingEvidenceV1 {
+        schema_version: 1,
+        pages,
+    };
+    let bytes =
+        serde_json::to_vec(&evidence).map_err(|_| OrchestrationBindingQueryError::Failed)?;
+    if bytes.len() > ORCHESTRATION_BINDING_ARTIFACT_MAX_BYTES {
+        return Err(OrchestrationBindingQueryError::ArtifactTooLarge);
+    }
+    Ok(PreparedBindingEvidence {
+        evidence,
+        bytes,
+        total_rows,
+    })
+}
+
+#[cfg(unix)]
+fn set_private_directory_permissions(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+}
+
+#[cfg(not(unix))]
+fn set_private_directory_permissions(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_private_file_permissions(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(not(unix))]
+fn set_private_file_permissions(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+fn canonical_binding_artifact_root(root: &Path) -> io::Result<PathBuf> {
+    let parent = root.parent().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "artifact root has no parent")
+    })?;
+    fs::create_dir_all(parent)?;
+    set_private_directory_permissions(parent)?;
+    fs::create_dir_all(root)?;
+    set_private_directory_permissions(root)?;
+    let canonical_parent = parent.canonicalize()?;
+    let canonical_root = root.canonicalize()?;
+    if canonical_root.parent() != Some(canonical_parent.as_path()) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "artifact root escaped its fixed parent",
+        ));
+    }
+    Ok(canonical_root)
+}
+
+fn canonical_binding_artifact_owner(root: &Path, incarnation_id: &str) -> io::Result<PathBuf> {
+    let incarnation = uuid::Uuid::parse_str(incarnation_id)
+        .ok()
+        .filter(|incarnation| incarnation.to_string() == incarnation_id)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "connection incarnation is not a canonical UUID",
+            )
+        })?;
+    let canonical_root = canonical_binding_artifact_root(root)?;
+    let owner = canonical_root.join(incarnation.to_string());
+    fs::create_dir_all(&owner)?;
+    set_private_directory_permissions(&owner)?;
+    let canonical_owner = owner.canonicalize()?;
+    if canonical_owner.parent() != Some(canonical_root.as_path()) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "artifact owner escaped the fixed root",
+        ));
+    }
+    Ok(canonical_owner)
+}
+
+fn sweep_stale_binding_artifacts_at(
+    root: &Path,
+    now: SystemTime,
+    metrics: &DelegationMetrics,
+) -> io::Result<()> {
+    let canonical_root = canonical_binding_artifact_root(root)?;
+    for owner in fs::read_dir(&canonical_root)? {
+        let owner = owner?;
+        if !owner.file_type()?.is_dir() {
+            continue;
+        }
+        let owner_name = owner.file_name();
+        let Some(owner_name) = owner_name.to_str() else {
+            continue;
+        };
+        if uuid::Uuid::parse_str(owner_name)
+            .ok()
+            .is_none_or(|owner_id| owner_id.to_string() != owner_name)
+        {
+            continue;
+        }
+        let canonical_owner = owner.path().canonicalize()?;
+        if canonical_owner.parent() != Some(canonical_root.as_path()) {
+            continue;
+        }
+        for file in fs::read_dir(&canonical_owner)? {
+            let file = file?;
+            if !file.file_type()?.is_file() {
+                continue;
+            }
+            let path = file.path();
+            let canonical_file = path.canonicalize()?;
+            if canonical_file.parent() != Some(canonical_owner.as_path()) {
+                continue;
+            }
+            let modified = file.metadata()?.modified()?;
+            if now
+                .duration_since(modified)
+                .is_ok_and(|age| age > ORCHESTRATION_BINDING_ARTIFACT_STALE_AGE)
+            {
+                match fs::remove_file(&canonical_file) {
+                    Ok(()) => metrics.record_artifact_cleanup(true),
+                    Err(error) => {
+                        metrics.record_artifact_cleanup(false);
+                        return Err(error);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn atomic_publish_binding_artifact(
+    owner: &Path,
+    final_path: &Path,
+    bytes: &[u8],
+) -> io::Result<()> {
+    let mut partial = tempfile::NamedTempFile::new_in(owner)?;
+    set_private_file_permissions(partial.path())?;
+    partial.write_all(bytes)?;
+    partial.as_file_mut().sync_all()?;
+    partial
+        .persist_noclobber(final_path)
+        .map(|_| ())
+        .map_err(|error| error.error)
+}
+
+fn artifact_storage_metric_outcome(error: OrchestrationBindingQueryError) -> ArtifactExportOutcome {
+    match error {
+        OrchestrationBindingQueryError::SnapshotStale => ArtifactExportOutcome::Stale,
+        OrchestrationBindingQueryError::Failed => ArtifactExportOutcome::SerializationFailed,
+        OrchestrationBindingQueryError::ArtifactIoFailed => ArtifactExportOutcome::IoFailed,
+        OrchestrationBindingQueryError::TooLarge
+        | OrchestrationBindingQueryError::ArtifactTooLarge => ArtifactExportOutcome::TooLarge,
+        OrchestrationBindingQueryError::ArtifactResultTooLarge => {
+            ArtifactExportOutcome::ResultTooLarge
+        }
+        OrchestrationBindingQueryError::Invalid => ArtifactExportOutcome::BrokerFailed,
+    }
+}
+
+fn store_binding_artifact_at(
+    root: &Path,
+    incarnation_id: &str,
+    pages: Vec<DelegationOrchestrationBindingPage>,
+    inflight: &Arc<InflightCalls>,
+) -> Result<
+    (
+        OrchestrationBindingArtifactDescriptor,
+        PendingBindingArtifact,
+    ),
+    OrchestrationBindingQueryError,
+> {
+    let started = Instant::now();
+    let prepared = match prepare_binding_evidence(pages) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            inflight
+                .binding_artifacts
+                .metrics
+                .record_artifact_export(artifact_storage_metric_outcome(error));
+            return Err(error);
+        }
+    };
+    if sweep_stale_binding_artifacts_at(
+        root,
+        SystemTime::now(),
+        &inflight.binding_artifacts.metrics,
+    )
+    .is_err()
+    {
+        inflight
+            .binding_artifacts
+            .metrics
+            .record_artifact_export(ArtifactExportOutcome::IoFailed);
+        return Err(OrchestrationBindingQueryError::ArtifactIoFailed);
+    }
+    let owner = canonical_binding_artifact_owner(root, incarnation_id).map_err(|_| {
+        inflight
+            .binding_artifacts
+            .metrics
+            .record_artifact_export(ArtifactExportOutcome::IoFailed);
+        OrchestrationBindingQueryError::ArtifactIoFailed
+    })?;
+    let final_path = owner.join(format!("{}.json", uuid::Uuid::new_v4()));
+    let artifact_path = final_path.to_str().map(str::to_owned).ok_or_else(|| {
+        inflight
+            .binding_artifacts
+            .metrics
+            .record_artifact_export(ArtifactExportOutcome::IoFailed);
+        OrchestrationBindingQueryError::ArtifactIoFailed
+    })?;
+    let digest = format!("sha256:{:x}", Sha256::digest(&prepared.bytes));
+    if atomic_publish_binding_artifact(&owner, &final_path, &prepared.bytes).is_err() {
+        inflight
+            .binding_artifacts
+            .metrics
+            .record_artifact_export(ArtifactExportOutcome::IoFailed);
+        return Err(OrchestrationBindingQueryError::ArtifactIoFailed);
+    }
+    let pending = inflight.binding_artifacts.register(
+        final_path,
+        PendingBindingArtifactMetrics {
+            internal_page_count: prepared.evidence.pages.len(),
+            selected_row_count: prepared.total_rows,
+            evidence_bytes: prepared.bytes.len(),
+            export_duration: started.elapsed(),
+            final_result_bytes: 0,
+        },
+    );
+    let first = &prepared.evidence.pages[0];
+    let descriptor = OrchestrationBindingArtifactDescriptor {
+        schema_version: 1,
+        delivery: "artifact".into(),
+        namespace: first.namespace.clone(),
+        snapshot_id: first.snapshot_id.clone(),
+        snapshot_revision: first.snapshot_revision.clone(),
+        snapshot_created_at: first.snapshot_created_at,
+        snapshot_expires_at: first.snapshot_expires_at,
+        total_rows: prepared.total_rows as u64,
+        artifact_path,
+        artifact_format: ORCHESTRATION_BINDING_ARTIFACT_FORMAT.into(),
+        artifact_bytes: prepared.bytes.len() as u64,
+        artifact_sha256: digest,
+    };
+    Ok((descriptor, pending))
+}
+
+#[allow(dead_code)] // Activated by Task 4; Task 3 keeps artifact delivery private.
+pub(crate) fn store_binding_artifact(
+    incarnation_id: &str,
+    pages: Vec<DelegationOrchestrationBindingPage>,
+    inflight: &Arc<InflightCalls>,
+) -> Result<
+    (
+        OrchestrationBindingArtifactDescriptor,
+        PendingBindingArtifact,
+    ),
+    OrchestrationBindingQueryError,
+> {
+    let root = std::env::temp_dir().join("codeg-mcp/orchestration-bindings");
+    store_binding_artifact_at(&root, incarnation_id, pages, inflight)
 }
 
 /// Canonicalize a JSON-RPC `id` to a string suitable as a `HashMap` key.
@@ -2300,6 +3386,7 @@ pub async fn drain_and_cancel_all(
     inflight: &Arc<InflightCalls>,
     reason: &str,
 ) {
+    inflight.drain_binding_artifacts();
     for entry in inflight.drain_all().await {
         // Wake the round-trip task if it's still scheduled, so it can
         // exit promptly when the runtime tears down.

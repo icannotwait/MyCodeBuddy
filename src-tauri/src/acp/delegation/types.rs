@@ -158,6 +158,28 @@ pub struct DelegationOrchestrationBindingPage {
     pub complete: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BindingEvidenceV1 {
+    pub schema_version: u32,
+    pub pages: Vec<DelegationOrchestrationBindingPage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrchestrationBindingArtifactDescriptor {
+    pub schema_version: u32,
+    pub delivery: String,
+    pub namespace: String,
+    pub snapshot_id: String,
+    pub snapshot_revision: String,
+    pub snapshot_created_at: DateTime<Utc>,
+    pub snapshot_expires_at: DateTime<Utc>,
+    pub total_rows: u64,
+    pub artifact_path: String,
+    pub artifact_format: String,
+    pub artifact_bytes: u64,
+    pub artifact_sha256: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum OrchestrationBindingQueryError {
     #[error("invalid orchestration binding query")]
@@ -168,6 +190,12 @@ pub enum OrchestrationBindingQueryError {
     Failed,
     #[error("orchestration binding snapshot is stale")]
     SnapshotStale,
+    #[error("orchestration binding artifact I/O failed")]
+    ArtifactIoFailed,
+    #[error("orchestration binding artifact exceeds the byte limit")]
+    ArtifactTooLarge,
+    #[error("orchestration binding artifact result exceeds the transport limit")]
+    ArtifactResultTooLarge,
 }
 
 impl OrchestrationBindingQueryError {
@@ -177,6 +205,9 @@ impl OrchestrationBindingQueryError {
             Self::TooLarge => "orchestration_binding_query_too_large",
             Self::Failed => "orchestration_binding_query_failed",
             Self::SnapshotStale => "orchestration_binding_snapshot_stale",
+            Self::ArtifactIoFailed => "orchestration_binding_artifact_io_failed",
+            Self::ArtifactTooLarge => "orchestration_binding_artifact_too_large",
+            Self::ArtifactResultTooLarge => "orchestration_binding_artifact_result_too_large",
         }
     }
 }
