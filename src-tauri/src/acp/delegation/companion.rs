@@ -593,6 +593,7 @@ mod orchestration_binding_artifact_storage_tests {
         let relay_result = SpawnResult {
             response: Some(ok(json!(1), json!(descriptor.clone()))),
             after_relay: Some(pending.after_relay()),
+            before_relay: None,
         };
 
         drain_and_cancel_all(&context(), &inflight, "test hard exit").await;
@@ -1664,6 +1665,27 @@ pub enum LineAction {
 pub struct SpawnResult {
     pub response: Option<JsonRpcResponse>,
     pub after_relay: Option<futures_util::future::BoxFuture<'static, ()>>,
+    before_relay: Option<futures_util::future::BoxFuture<'static, bool>>,
+}
+
+impl SpawnResult {
+    /// Claim a completed response immediately before stdout relay. Artifact
+    /// delivery keeps its cancellation entry until this point so cancellation
+    /// can still suppress the response and drop-clean the pending file.
+    pub async fn claim_relay(
+        mut self,
+    ) -> Option<(
+        JsonRpcResponse,
+        Option<futures_util::future::BoxFuture<'static, ()>>,
+    )> {
+        let response = self.response.take()?;
+        if let Some(before_relay) = self.before_relay.take() {
+            if !before_relay.await {
+                return None;
+            }
+        }
+        Some((response, self.after_relay.take()))
+    }
 }
 
 /// Materialized async tools/call ready to drive in a tokio task. The binary
@@ -3283,6 +3305,7 @@ async fn register_and_spawn(
         SpawnResult {
             response,
             after_relay: None,
+            before_relay: None,
         }
     });
 
@@ -3364,6 +3387,7 @@ async fn register_and_spawn_workflow_state(
         SpawnResult {
             response,
             after_relay: None,
+            before_relay: None,
         }
     });
 
@@ -3415,6 +3439,7 @@ async fn register_and_spawn_orchestration_bindings(
         SpawnResult {
             response,
             after_relay: None,
+            before_relay: None,
         }
     });
 
@@ -3455,6 +3480,7 @@ async fn register_and_spawn_orchestration_binding_artifact(
                 SpawnResult {
                     response: None,
                     after_relay: None,
+                    before_relay: None,
                 }
             }
             (response, pending) = orchestration_binding_artifact_response(
@@ -3464,10 +3490,19 @@ async fn register_and_spawn_orchestration_binding_artifact(
                 id_for_response,
                 &inflight_for_task,
             ) => {
-                let _ = inflight_for_task.take(&id_key_for_task).await;
+                let before_relay = if pending.is_some() {
+                    let claim: futures_util::future::BoxFuture<'static, bool> = Box::pin(async move {
+                        inflight_for_task.take(&id_key_for_task).await.is_some()
+                    });
+                    Some(claim)
+                } else {
+                    let _ = inflight_for_task.take(&id_key_for_task).await;
+                    None
+                };
                 SpawnResult {
                     response: Some(response),
                     after_relay: pending.map(PendingBindingArtifact::after_relay),
+                    before_relay,
                 }
             }
         }
@@ -3551,6 +3586,7 @@ async fn register_and_spawn_session_info(
         SpawnResult {
             response,
             after_relay: None,
+            before_relay: None,
         }
     });
 
@@ -3607,6 +3643,7 @@ async fn register_and_spawn_feedback(
                 SpawnResult {
                     response: None,
                     after_relay: None,
+                    before_relay: None,
                 }
             }
             rt = client_feedback_round_trip(&socket, &req) => {
@@ -3628,6 +3665,7 @@ async fn register_and_spawn_feedback(
                         SpawnResult {
                             response: Some(response),
                             after_relay: Some(commit),
+                            before_relay: None,
                         }
                     }
                     Err(e) => SpawnResult {
@@ -3637,6 +3675,7 @@ async fn register_and_spawn_feedback(
                             format!("broker round-trip failed: {e}"),
                         )),
                         after_relay: None,
+                        before_relay: None,
                     },
                 }
             }
@@ -8233,8 +8272,11 @@ mod tests {
             panic!("valid artifact delivery must reach the broker")
         };
         let result = spawned.future.await;
-        let response = result.response.expect("artifact delivery response");
-        let after_relay = result.after_relay.unwrap_or_else(|| {
+        let (response, after_relay) = result
+            .claim_relay()
+            .await
+            .expect("artifact delivery response must win relay");
+        let after_relay = after_relay.unwrap_or_else(|| {
             panic!(
                 "artifact delivery must return relay ownership: {}",
                 String::from_utf8(serialize_jsonrpc_line(&response).unwrap()).unwrap()
@@ -8286,6 +8328,73 @@ mod tests {
         assert_eq!(inflight.binding_artifact_count(), 1);
         inflight.drain_binding_artifacts();
         assert!(!Path::new(artifact_path).exists());
+    }
+
+    #[tokio::test]
+    async fn orchestration_binding_artifact_delivery_cancellation_before_relay_suppresses_and_cleans(
+    ) {
+        let page = orchestration_binding_page(
+            1,
+            0,
+            None,
+            vec![orchestration_binding_run("task-cancel-before-relay")],
+            None,
+        );
+        let (socket_path, server) = orchestration_broker_with_outcomes(vec![page]);
+        let mut context = ctx_with(GROK_FEATURES);
+        context.socket_path = socket_path;
+        context.connection_incarnation_id = "00000000-0000-4000-8000-000000004123".into();
+        let inflight = Arc::new(InflightCalls::new());
+        let raw_call = call(
+            25,
+            "get_delegation_orchestration_bindings",
+            json!({
+                "namespace": "brainstorm-to-delivery",
+                "delivery": "artifact"
+            }),
+        );
+        let LineAction::Spawn(spawned) = dispatch_line(&context, inflight.clone(), &raw_call).await
+        else {
+            panic!("valid artifact request must reach the broker")
+        };
+        let request_id_key = spawned.request_id_key.clone();
+        let result = spawned.future.await;
+        assert_eq!(server.await.unwrap().len(), 1);
+        let artifact_path = PathBuf::from(
+            result.response.as_ref().unwrap().result.as_ref().unwrap()["structuredContent"]
+                ["artifact_path"]
+                .as_str()
+                .unwrap(),
+        );
+        assert!(
+            artifact_path.is_file(),
+            "publication must finish before cancellation"
+        );
+        assert_eq!(inflight.binding_artifact_count(), 1);
+        assert!(
+            inflight.inner.lock().await.contains_key(&request_id_key),
+            "cancellation authority must remain live until relay"
+        );
+
+        let cancellation = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": { "requestId": 25 }
+        })
+        .to_string();
+        assert!(matches!(
+            dispatch_line(&context, inflight.clone(), &cancellation).await,
+            LineAction::Silent
+        ));
+
+        let response = result.claim_relay().await.map(|(response, _)| response);
+        assert!(
+            response.is_none(),
+            "cancelled artifact response must not relay"
+        );
+        assert!(!artifact_path.exists());
+        assert_eq!(inflight.binding_artifact_count(), 0);
+        assert!(inflight.drain_all().await.is_empty());
     }
 
     #[test]
@@ -8378,7 +8487,10 @@ mod tests {
             panic!("valid artifact delivery must reach the broker")
         };
         let result = spawned.future.await;
-        let response = result.response.as_ref().unwrap();
+        let (response, after_relay) = result
+            .claim_relay()
+            .await
+            .expect("artifact delivery response must win relay");
         assert_eq!(response.result.as_ref().unwrap()["isError"], false);
         let requests = server.await.unwrap();
         assert_eq!(requests.len(), 3);
@@ -8392,7 +8504,7 @@ mod tests {
         assert_eq!(requests[2].snapshot_id, None);
         assert_eq!(requests[2].cursor, None);
         assert_eq!(metrics.snapshot().artifact_transparent_stale_restarts, 1);
-        result.after_relay.unwrap().await;
+        after_relay.unwrap().await;
         inflight.drain_binding_artifacts();
     }
 

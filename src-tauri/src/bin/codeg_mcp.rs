@@ -38,7 +38,7 @@ use std::sync::Arc;
 
 use codeg_lib::acp::delegation::companion::{
     dispatch_line, drain_and_cancel_all, serialize_jsonrpc_line, CompanionContext,
-    CompanionFeatures, InflightCalls, JsonRpcResponse, LineAction, SpawnResult,
+    CompanionFeatures, InflightCalls, JsonRpcResponse, LineAction,
 };
 use codeg_lib::acp::delegation::parent_watcher::{wait_for_parent_exit, DEFAULT_POLL_INTERVAL};
 use codeg_lib::acp::delegation::transport::{client_establish_ready_lease, CompanionRole};
@@ -203,12 +203,19 @@ async fn write_response<W: AsyncWrite + Unpin>(
     stdout: &Arc<Mutex<W>>,
     resp: &JsonRpcResponse,
 ) -> std::io::Result<()> {
+    let mut guard = stdout.lock().await;
+    write_response_locked(&mut *guard, resp).await
+}
+
+async fn write_response_locked<W: AsyncWrite + Unpin>(
+    stdout: &mut W,
+    resp: &JsonRpcResponse,
+) -> std::io::Result<()> {
     let frame = serialize_jsonrpc_line(resp).map_err(|e| {
         std::io::Error::new(std::io::ErrorKind::InvalidData, format!("encode: {e}"))
     })?;
-    let mut guard = stdout.lock().await;
-    guard.write_all(&frame).await?;
-    guard.flush().await?;
+    stdout.write_all(&frame).await?;
+    stdout.flush().await?;
     Ok(())
 }
 
@@ -346,15 +353,15 @@ async fn main() -> ExitCode {
                         // be a `notifications/cancelled` for THIS request.
                         let stdout = stdout.clone();
                         tokio::spawn(async move {
-                            let SpawnResult {
-                                response,
-                                after_relay,
-                            } = spawned.future.await;
-                            // `None` → cancellation won; suppress per MCP spec.
-                            let Some(resp) = response else {
+                            let result = spawned.future.await;
+                            let mut stdout = stdout.lock().await;
+                            // Claim under the stdout mutex so cancellation
+                            // remains authoritative while a response waits to
+                            // relay behind another writer.
+                            let Some((resp, after_relay)) = result.claim_relay().await else {
                                 return;
                             };
-                            if let Err(e) = write_response(&stdout, &resp).await {
+                            if let Err(e) = write_response_locked(&mut *stdout, &resp).await {
                                 let _ = writeln!(
                                     std::io::stderr(),
                                     "codeg-mcp: write stdout: {e}"
@@ -364,6 +371,7 @@ async fn main() -> ExitCode {
                                 // pending for the next check (at-least-once).
                                 return;
                             }
+                            drop(stdout);
                             // The response reached the agent's stdin. Only now
                             // run any post-relay action — for
                             // `check_user_feedback`, the delivery commit that
