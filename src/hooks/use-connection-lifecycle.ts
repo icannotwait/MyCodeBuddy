@@ -22,6 +22,7 @@ import {
 import { getAgentLabel } from "@/lib/custom-agents"
 import { isDelegateViewerOnlyRejection } from "@/lib/delegate-access"
 import { isConnectionBusy } from "@/lib/connection-teardown"
+import { recordFrontendTurnTrace } from "@/lib/acp/frontend-turn-trace"
 
 interface UseConnectionLifecycleOptions {
   contextKey: string
@@ -170,6 +171,7 @@ export function useConnectionLifecycle({
   // Destructure stable callbacks (depend only on actions + contextKey)
   // vs. volatile derived state (status, modes, etc.)
   const {
+    connectionId,
     status,
     selectorsReady,
     connect: connConnect,
@@ -566,6 +568,21 @@ export function useConnectionLifecycle({
         (() => onDelegateViewerOnlyRef.current?.())
       const onSendFailed = opts?.onSendFailed
       const onPromptAdmitted = opts?.onPromptAdmitted
+      const traceStartedAt = performance.now()
+      const traceIdentity = {
+        contextKey,
+        ...(connectionId ? { connectionId } : {}),
+        ...(opts?.conversationId != null
+          ? { conversationId: opts.conversationId }
+          : {}),
+        ...(opts?.clientMessageId
+          ? { clientMessageId: opts.clientMessageId }
+          : {}),
+      }
+      recordFrontendTurnTrace({
+        phase: "send_started",
+        ...traceIdentity,
+      })
       return (async () => {
         const currentModeId = modeIdRef.current
         if (modeId && modeId !== currentModeId) {
@@ -583,9 +600,29 @@ export function useConnectionLifecycle({
             locale: getCurrentEffectiveAppLocale(),
           },
         })
+        recordFrontendTurnTrace({
+          phase: "send_completed",
+          ...traceIdentity,
+          elapsedMs: performance.now() - traceStartedAt,
+          outcome: "success",
+        })
         onPromptAdmitted?.(result)
         return result
       })().catch((e: unknown) => {
+        const outcome =
+          e instanceof ContinuationWaitingError
+            ? "continuation_waiting"
+            : e instanceof TurnBusyError
+              ? "turn_busy"
+              : isDelegateViewerOnlyRejection(e)
+                ? "viewer_only"
+                : "failed"
+        recordFrontendTurnTrace({
+          phase: "send_completed",
+          ...traceIdentity,
+          elapsedMs: performance.now() - traceStartedAt,
+          outcome,
+        })
         if (e instanceof ContinuationWaitingError) {
           onContinuationWaiting?.()
           if (conn.sharedSession) throw e
@@ -616,7 +653,15 @@ export function useConnectionLifecycle({
         return null
       })
     },
-    [connSetMode, sendPrompt, contextKey, touchActivity, t, conn.sharedSession]
+    [
+      connSetMode,
+      sendPrompt,
+      contextKey,
+      connectionId,
+      touchActivity,
+      t,
+      conn.sharedSession,
+    ]
   )
 
   const handleCancel = useCallback(() => {

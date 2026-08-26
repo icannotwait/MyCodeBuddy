@@ -8,7 +8,7 @@
 //! ([`read_log_file_core`]) separately.
 
 use sea_orm::DatabaseConnection;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 #[cfg(feature = "tauri-runtime")]
 use tauri::State;
 
@@ -47,6 +47,140 @@ pub struct LogSettingsView {
     pub level: LogLevel,
     pub targets: Vec<TargetDirective>,
     pub env_locked: bool,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FrontendTurnTracePhase {
+    SendStarted,
+    SendCompleted,
+    PromptingFrame,
+    LivePublished,
+    BannerCommit,
+    BannerPaint,
+    FirstContent,
+}
+
+impl FrontendTurnTracePhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::SendStarted => "send_started",
+            Self::SendCompleted => "send_completed",
+            Self::PromptingFrame => "prompting_frame",
+            Self::LivePublished => "live_published",
+            Self::BannerCommit => "banner_commit",
+            Self::BannerPaint => "banner_paint",
+            Self::FirstContent => "first_content",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FrontendTurnTraceOutcome {
+    Success,
+    TurnBusy,
+    ContinuationWaiting,
+    ViewerOnly,
+    Failed,
+}
+
+impl FrontendTurnTraceOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::TurnBusy => "turn_busy",
+            Self::ContinuationWaiting => "continuation_waiting",
+            Self::ViewerOnly => "viewer_only",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FrontendTurnTrace {
+    pub phase: FrontendTurnTracePhase,
+    pub client_timestamp_ms: f64,
+    #[serde(default)]
+    pub context_key: Option<String>,
+    #[serde(default)]
+    pub connection_id: Option<String>,
+    #[serde(default)]
+    pub conversation_id: Option<i64>,
+    #[serde(default)]
+    pub client_message_id: Option<String>,
+    #[serde(default)]
+    pub live_message_id: Option<String>,
+    #[serde(default)]
+    pub event_seq: Option<u64>,
+    #[serde(default)]
+    pub received_at_ms: Option<f64>,
+    #[serde(default)]
+    pub elapsed_ms: Option<f64>,
+    #[serde(default)]
+    pub outcome: Option<FrontendTurnTraceOutcome>,
+    #[serde(default)]
+    pub sink_registered: Option<bool>,
+    #[serde(default)]
+    pub canonical_accepted: Option<bool>,
+    #[serde(default)]
+    pub transcript_published: Option<bool>,
+    #[serde(default)]
+    pub has_live_transcript: Option<bool>,
+}
+
+pub fn record_frontend_turn_trace_core(trace: FrontendTurnTrace) -> Result<(), AppCommandError> {
+    const MAX_CORRELATOR_BYTES: usize = 256;
+    let invalid_time = |value: f64| !value.is_finite() || value < 0.0;
+    if invalid_time(trace.client_timestamp_ms)
+        || trace.received_at_ms.is_some_and(invalid_time)
+        || trace.elapsed_ms.is_some_and(invalid_time)
+    {
+        return Err(AppCommandError::invalid_input(
+            "Invalid frontend turn trace timing",
+        ));
+    }
+    for value in [
+        trace.context_key.as_deref(),
+        trace.connection_id.as_deref(),
+        trace.client_message_id.as_deref(),
+        trace.live_message_id.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if value.len() > MAX_CORRELATOR_BYTES || value.chars().any(char::is_control) {
+            return Err(AppCommandError::invalid_input(
+                "Invalid frontend turn trace correlator",
+            ));
+        }
+    }
+    let optional_bool = |value: Option<bool>| match value {
+        Some(true) => "true",
+        Some(false) => "false",
+        None => "",
+    };
+    tracing::info!(
+        target: "codeg_frontend_turn",
+        phase = trace.phase.as_str(),
+        client_timestamp_ms = trace.client_timestamp_ms,
+        context_key = trace.context_key.as_deref().unwrap_or(""),
+        connection_id = trace.connection_id.as_deref().unwrap_or(""),
+        conversation_id = trace.conversation_id.unwrap_or_default(),
+        client_message_id = trace.client_message_id.as_deref().unwrap_or(""),
+        live_message_id = trace.live_message_id.as_deref().unwrap_or(""),
+        event_seq = trace.event_seq.unwrap_or_default(),
+        received_at_ms = trace.received_at_ms.unwrap_or_default(),
+        elapsed_ms = trace.elapsed_ms.unwrap_or_default(),
+        outcome = trace.outcome.map(FrontendTurnTraceOutcome::as_str).unwrap_or(""),
+        sink_registered = optional_bool(trace.sink_registered),
+        canonical_accepted = optional_bool(trace.canonical_accepted),
+        transcript_published = optional_bool(trace.transcript_published),
+        has_live_transcript = optional_bool(trace.has_live_transcript),
+        "frontend turn milestone"
+    );
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -257,6 +391,12 @@ pub fn read_log_file_core(name: &str, max_bytes: Option<usize>) -> Result<String
 
 #[cfg(feature = "tauri-runtime")]
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub fn record_frontend_turn_trace(trace: FrontendTurnTrace) -> Result<(), AppCommandError> {
+    record_frontend_turn_trace_core(trace)
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
 pub async fn get_log_settings(
     db: State<'_, AppDatabase>,
 ) -> Result<LogSettingsView, AppCommandError> {
@@ -299,6 +439,10 @@ pub async fn open_logs_dir() -> Result<String, AppCommandError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::logging::hub::{log_hub, LogHub};
+    use crate::logging::init::detached_reload_handle;
+    use crate::logging::layer::BufferEmitLayer;
+    use tracing_subscriber::prelude::*;
 
     fn rec(level: &'static str, target: &str, message: &str) -> LogRecord {
         LogRecord {
@@ -310,6 +454,81 @@ mod tests {
             fields: std::collections::BTreeMap::new(),
             spans: Vec::new(),
         }
+    }
+
+    fn sample_frontend_turn_trace() -> FrontendTurnTrace {
+        FrontendTurnTrace {
+            phase: FrontendTurnTracePhase::PromptingFrame,
+            client_timestamp_ms: 1_234.5,
+            context_key: Some("tab-1".to_string()),
+            connection_id: Some("conn-1".to_string()),
+            conversation_id: Some(42),
+            client_message_id: Some("message-1".to_string()),
+            live_message_id: Some("live-1".to_string()),
+            event_seq: Some(7),
+            received_at_ms: Some(1_230.0),
+            elapsed_ms: Some(4.5),
+            outcome: None,
+            sink_registered: Some(true),
+            canonical_accepted: Some(true),
+            transcript_published: Some(false),
+            has_live_transcript: Some(false),
+        }
+    }
+
+    #[test]
+    fn frontend_turn_trace_enters_the_existing_log_hub_as_secret_safe_fields() {
+        LogHub::install(detached_reload_handle());
+        let before = log_hub()
+            .unwrap()
+            .snapshot()
+            .into_iter()
+            .filter(|record| record.target == "codeg_frontend_turn")
+            .count();
+        let subscriber = tracing_subscriber::Registry::default().with(BufferEmitLayer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            record_frontend_turn_trace_core(sample_frontend_turn_trace()).unwrap();
+        });
+
+        let records: Vec<LogRecord> = log_hub()
+            .unwrap()
+            .snapshot()
+            .into_iter()
+            .filter(|record| record.target == "codeg_frontend_turn")
+            .skip(before)
+            .collect();
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record.level, "INFO");
+        assert_eq!(record.message, "frontend turn milestone");
+        assert_eq!(
+            record.fields.get("phase").map(String::as_str),
+            Some("prompting_frame")
+        );
+        assert_eq!(
+            record.fields.get("conversation_id").map(String::as_str),
+            Some("42")
+        );
+        assert_eq!(
+            record.fields.get("sink_registered").map(String::as_str),
+            Some("true")
+        );
+        assert!(!record.fields.keys().any(|key| matches!(
+            key.as_str(),
+            "prompt" | "prompt_text" | "content" | "content_text" | "text"
+        )));
+    }
+
+    #[test]
+    fn frontend_turn_trace_rejects_invalid_timing_and_oversized_correlators() {
+        let mut non_finite = sample_frontend_turn_trace();
+        non_finite.client_timestamp_ms = f64::INFINITY;
+        assert!(record_frontend_turn_trace_core(non_finite).is_err());
+
+        let mut oversized = sample_frontend_turn_trace();
+        oversized.context_key = Some("x".repeat(257));
+        assert!(record_frontend_turn_trace_core(oversized).is_err());
     }
 
     #[test]

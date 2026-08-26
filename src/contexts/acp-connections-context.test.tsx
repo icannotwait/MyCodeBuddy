@@ -81,6 +81,7 @@ const h = vi.hoisted(() => {
     buildDelegationSeedEnvelopes: vi.fn(() => []),
     denormalizeSnapshot: vi.fn(),
     pushAlert: vi.fn(),
+    recordFrontendTurnTrace: vi.fn(),
     isDesktop: true,
     subscribeHandlers,
     subscribe: vi.fn(
@@ -159,6 +160,11 @@ vi.mock("@/lib/delegation-seed", () => ({
 
 vi.mock("@/contexts/alert-context", () => ({
   useAlertContext: () => ({ pushAlert: h.pushAlert }),
+}))
+
+vi.mock("@/lib/acp/frontend-turn-trace", () => ({
+  recordFrontendTurnTrace: (...args: unknown[]) =>
+    h.recordFrontendTurnTrace(...args),
 }))
 
 vi.mock("@/contexts/active-folder-context", () => ({
@@ -2885,6 +2891,7 @@ beforeEach(() => {
   h.acpGetDesktopDeliveryCapabilities.mockReset()
   h.denormalizeSnapshot.mockReset()
   h.pushAlert.mockReset()
+  h.recordFrontendTurnTrace.mockReset()
   acpPromptMock.mockReset()
   acpPromptMock.mockResolvedValue(undefined)
   acpAnswerQuestionMock.mockReset()
@@ -5592,6 +5599,27 @@ describe("AcpConnectionsProvider liveMessage sink (mirror out of React)", () => 
     expect(calls).toHaveLength(1)
     expect(calls[0]!.isLive).toBe(true)
     expect(calls[0]!.content).toEqual([])
+    expect(h.recordFrontendTurnTrace).toHaveBeenCalledWith(
+      expect.objectContaining({
+        phase: "prompting_frame",
+        contextKey: TAB,
+        connectionId: "spawned-conn",
+        eventSeq: 1,
+        receivedAtMs: expect.any(Number),
+        elapsedMs: expect.any(Number),
+        sinkRegistered: true,
+      })
+    )
+    expect(h.recordFrontendTurnTrace).toHaveBeenCalledWith(
+      expect.objectContaining({
+        phase: "live_published",
+        contextKey: TAB,
+        connectionId: "spawned-conn",
+        eventSeq: 1,
+        canonicalAccepted: true,
+        transcriptPublished: false,
+      })
+    )
   })
 
   it("relays a subsequent liveMessage change (tool call appended) to the sink", async () => {
@@ -5624,6 +5652,43 @@ describe("AcpConnectionsProvider liveMessage sink (mirror out of React)", () => 
     const last = calls[calls.length - 1]!
     expect(last.isLive).toBe(true)
     expect(last.len).toBe(1) // the appended tool_call block
+    expect(h.recordFrontendTurnTrace).toHaveBeenCalledWith(
+      expect.objectContaining({
+        phase: "first_content",
+        contextKey: TAB,
+        connectionId: "spawned-conn",
+        eventSeq: 2,
+        receivedAtMs: expect.any(Number),
+        elapsedMs: expect.any(Number),
+      })
+    )
+  })
+
+  it("records a plan update as first content", async () => {
+    const handlers = await connectOwner()
+    h.actions!.registerLiveMessageSink(TAB, () => undefined)
+
+    emitAcpEvent(handlers, {
+      seq: 1,
+      connection_id: "spawned-conn",
+      type: "status_changed",
+      status: "prompting",
+    })
+    emitAcpEvent(handlers, {
+      seq: 2,
+      connection_id: "spawned-conn",
+      type: "plan_update",
+      entries: [{ content: "Inspect logs", status: "in_progress" }],
+    })
+
+    expect(h.recordFrontendTurnTrace).toHaveBeenCalledWith(
+      expect.objectContaining({
+        phase: "first_content",
+        contextKey: TAB,
+        connectionId: "spawned-conn",
+        eventSeq: 2,
+      })
+    )
   })
 
   it("stops firing after the returned unregister runs", async () => {
@@ -9365,6 +9430,39 @@ describe("AcpConnectionsProvider frame transactions (raw order)", () => {
       )
     })
   }
+
+  it("attributes first content to the event that creates it in a mixed frame", async () => {
+    await mountDesktopOwner()
+    h.actions!.registerLiveMessageSink(TAB, () => undefined)
+
+    act(() => {
+      h.emitDesktopBatch(
+        batch(1, [
+          {
+            connection_id: "owner-conn",
+            seq: 1,
+            type: "status_changed",
+            status: "prompting",
+          },
+          {
+            connection_id: "owner-conn",
+            seq: 2,
+            type: "plan_update",
+            entries: [],
+          },
+          content("owner-conn", 3, "first output"),
+        ])
+      )
+      h.runAnimationFrame()
+    })
+
+    expect(h.recordFrontendTurnTrace).toHaveBeenCalledWith(
+      expect.objectContaining({
+        phase: "first_content",
+        eventSeq: 3,
+      })
+    )
+  })
 
   it("applies control-event order in one batch after one RAF", async () => {
     const seenTypes: string[] = []

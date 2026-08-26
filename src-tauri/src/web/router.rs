@@ -751,6 +751,10 @@ pub fn build_router(
         )
         // ─── Logging ───
         .route(
+            "/record_frontend_turn_trace",
+            post(handlers::logging::record_frontend_turn_trace),
+        )
+        .route(
             "/get_log_settings",
             post(handlers::logging::get_log_settings),
         )

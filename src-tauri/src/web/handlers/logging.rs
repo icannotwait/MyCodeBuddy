@@ -6,7 +6,7 @@ use serde::Deserialize;
 use crate::app_error::AppCommandError;
 use crate::app_state::AppState;
 use crate::commands::logging as logging_commands;
-use crate::commands::logging::{LogFileInfo, LogSettingsView};
+use crate::commands::logging::{FrontendTurnTrace, LogFileInfo, LogSettingsView};
 use crate::logging::hub::LogRecord;
 use crate::logging::{LogLevel, LogSettings};
 
@@ -36,6 +36,18 @@ pub struct ReadLogFileParams {
     pub name: String,
     #[serde(default)]
     pub max_bytes: Option<usize>,
+}
+
+#[derive(Deserialize)]
+pub struct RecordFrontendTurnTraceParams {
+    pub trace: FrontendTurnTrace,
+}
+
+pub async fn record_frontend_turn_trace(
+    Json(params): Json<RecordFrontendTurnTraceParams>,
+) -> Result<Json<()>, AppCommandError> {
+    logging_commands::record_frontend_turn_trace_core(params.trace)?;
+    Ok(Json(()))
 }
 
 pub async fn get_log_settings(

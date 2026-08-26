@@ -14,6 +14,7 @@ import { getEventStream } from "@/lib/platform"
 import { getTransport, isRemoteDesktopMode } from "@/lib/transport"
 import { subscribeDesktopAcpEvents } from "@/lib/transport/desktop-acp-events"
 import { EventIngestor } from "@/lib/acp/event-ingestor"
+import { recordFrontendTurnTrace } from "@/lib/acp/frontend-turn-trace"
 import {
   getStreamingPerformanceConfig,
   initializeStreamingPerformanceConfig,
@@ -1723,6 +1724,49 @@ function requiredReceivedAt(event: EventEnvelope): number {
     throw new Error("accepted ACP event is missing received_at")
   }
   return event.received_at
+}
+
+function turnTraceFrameMilestones(
+  previous: ConnectionState | undefined,
+  next: ConnectionState,
+  frame: AcceptedConnectionFrame
+): Array<{
+  phase: "prompting_frame" | "first_content"
+  event: EventEnvelope
+}> {
+  const milestones: Array<{
+    phase: "prompting_frame" | "first_content"
+    event: EventEnvelope
+  }> = []
+  const promptingIndex = frame.applyEvents.findIndex(
+    (event) => event.type === "status_changed" && event.status === "prompting"
+  )
+  if (promptingIndex >= 0) {
+    milestones.push({
+      phase: "prompting_frame",
+      event: frame.applyEvents[promptingIndex]!,
+    })
+  }
+
+  const hadContent =
+    promptingIndex < 0 && (previous?.liveMessage?.content.length ?? 0) > 0
+  const hasContent = (next.liveMessage?.content.length ?? 0) > 0
+  if (!hadContent && hasContent) {
+    const firstOutput = frame.applyEvents.find(
+      (event, index) =>
+        index > promptingIndex &&
+        ((event.type === "content_delta" &&
+          event.text.length > 0 &&
+          !event.parent_tool_use_id) ||
+          (event.type === "thinking" && !event.parent_tool_use_id) ||
+          event.type === "tool_call" ||
+          (event.type === "plan_update" && event.entries.length > 0))
+    )
+    if (firstOutput) {
+      milestones.push({ phase: "first_content", event: firstOutput })
+    }
+  }
+  return milestones
 }
 
 function applyStreamingAction(
@@ -6384,6 +6428,40 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       }
       const nextConn = nextConnection
       if (!nextConn || nextConn.liveMessage == null) return
+      const traceLiveMessageId = nextConn.liveMessage.id
+      const traceMilestone = connectionFrame
+        ? turnTraceFrameMilestones(
+            previousConnection,
+            nextConn,
+            connectionFrame
+          )[0]
+        : undefined
+      const recordPublication = (
+        canonicalAccepted: boolean,
+        transcriptPublished: boolean
+      ) => {
+        if (!traceMilestone) return
+        const committedAt = performance.now()
+        const receivedAt = traceMilestone.event.received_at ?? committedAt
+        recordFrontendTurnTrace({
+          phase: "live_published",
+          contextKey: key,
+          connectionId: connectionFrame?.connectionId ?? nextConn.connectionId,
+          ...(sinks.runtimeConversationId != null
+            ? { conversationId: sinks.runtimeConversationId }
+            : {}),
+          ...(nextConn.pendingUserMessage?.messageId
+            ? { clientMessageId: nextConn.pendingUserMessage.messageId }
+            : {}),
+          liveMessageId: traceLiveMessageId,
+          eventSeq: traceMilestone.event.seq,
+          receivedAtMs: receivedAt,
+          elapsedMs: Math.max(0, committedAt - receivedAt),
+          sinkRegistered: true,
+          canonicalAccepted,
+          transcriptPublished,
+        })
+      }
       const liveChanged =
         nextConn.liveMessage !== previousConnection?.liveMessage
       if (!liveChanged && !connectionFrame) return
@@ -6416,7 +6494,11 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           sinks.runtimeConversationId
         )
       }
-      if (!sinks.transcript || !canonicalAccepted) return
+      if (!sinks.transcript || !canonicalAccepted) {
+        recordPublication(canonicalAccepted, false)
+        return
+      }
+      let transcriptPublished = false
       if (connectionFrame) {
         // Per-event filter matching canonical out-of-turn transitions — not
         // whole-frame before/after status (mixed turn_complete+delta frames).
@@ -6448,11 +6530,14 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
               : { ...connectionFrame, applyEvents: projectedEvents },
             nextConn.liveMessage
           )
+          transcriptPublished = true
         }
       } else if (liveChanged) {
         // Snapshot hydrate / non-frame dispatches: full rebuild at cursor.
         sinks.transcript.rebuild(nextConn.liveMessage, nextConn.lastAppliedSeq)
+        transcriptPublished = true
       }
+      recordPublication(canonicalAccepted, transcriptPublished)
     },
     []
   )
@@ -6645,6 +6730,35 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             ? (next.get(contextKey) ?? step.nextConnection)
             : step.nextConnection
         const finalLiveMessage = nextConnection.liveMessage
+        const traceSinkKeys = [contextKey, ...aliasKeysFor(contextKey)]
+        const traceSink = traceSinkKeys
+          .map((key) => liveSinksRef.current.get(key))
+          .find((sinks) => sinks != null)
+        const traceCommittedAt = performance.now()
+        for (const milestone of turnTraceFrameMilestones(
+          previousConnection,
+          nextConnection,
+          connectionFrame
+        )) {
+          const receivedAt = milestone.event.received_at ?? traceCommittedAt
+          const conversationId =
+            traceSink?.runtimeConversationId ?? nextConnection.conversationId
+          const clientMessageId =
+            nextConnection.pendingUserMessage?.messageId ??
+            previousConnection.pendingUserMessage?.messageId
+          recordFrontendTurnTrace({
+            phase: milestone.phase,
+            contextKey,
+            connectionId: connectionFrame.connectionId,
+            ...(conversationId != null ? { conversationId } : {}),
+            ...(clientMessageId ? { clientMessageId } : {}),
+            ...(finalLiveMessage ? { liveMessageId: finalLiveMessage.id } : {}),
+            eventSeq: milestone.event.seq,
+            receivedAtMs: receivedAt,
+            elapsedMs: Math.max(0, traceCommittedAt - receivedAt),
+            sinkRegistered: traceSink != null,
+          })
+        }
         const hasCompletion = connectionFrame.applyEvents.some(
           (event) => event.type === "turn_complete"
         )

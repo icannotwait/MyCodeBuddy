@@ -17,6 +17,7 @@ import {
   useConversationRuntimeStore,
 } from "@/stores/conversation-runtime-store"
 import { useStreamingPerformanceFlag } from "@/lib/acp/streaming-performance-config"
+import { recordFrontendTurnTrace } from "@/lib/acp/frontend-turn-trace"
 import { streamingPerfRecorder } from "@/lib/perf/streaming-perf-recorder"
 import {
   useHasLiveTranscript,
@@ -1062,7 +1063,57 @@ const LiveTurnStatsBanner = memo(function LiveTurnStatsBanner({
     (s) => s.byConversationId.get(conversationId)?.liveMessage ?? null
   )
   const activeLive = liveMessage ?? runtimeLiveMessage
+  const activeLiveId = activeLive?.id ?? null
+  const hasIncrementalLive = snap != null
   const [latchedLive, setLatchedLive] = useState<LiveMessage | null>(null)
+  const tracedBannerRef = useRef<string | null>(null)
+  const paintedBannerRef = useRef<string | null>(null)
+  const bannerPaintFrameRef = useRef<number | null>(null)
+
+  useLayoutEffect(() => {
+    if (!isStreaming || !activeLiveId) {
+      if (bannerPaintFrameRef.current != null) {
+        cancelAnimationFrame(bannerPaintFrameRef.current)
+        bannerPaintFrameRef.current = null
+      }
+      return
+    }
+    const traceKey = `${conversationId}:${activeLiveId}`
+    const trace = {
+      conversationId,
+      liveMessageId: activeLiveId,
+      hasLiveTranscript: hasIncrementalLive,
+    }
+    if (tracedBannerRef.current !== traceKey) {
+      if (bannerPaintFrameRef.current != null) {
+        cancelAnimationFrame(bannerPaintFrameRef.current)
+        bannerPaintFrameRef.current = null
+      }
+      tracedBannerRef.current = traceKey
+      recordFrontendTurnTrace({ phase: "banner_commit", ...trace })
+    }
+    if (
+      paintedBannerRef.current === traceKey ||
+      bannerPaintFrameRef.current != null
+    ) {
+      return
+    }
+    bannerPaintFrameRef.current = requestAnimationFrame(() => {
+      paintedBannerRef.current = traceKey
+      recordFrontendTurnTrace({ phase: "banner_paint", ...trace })
+      bannerPaintFrameRef.current = null
+    })
+  }, [activeLiveId, conversationId, hasIncrementalLive, isStreaming])
+
+  useLayoutEffect(
+    () => () => {
+      if (bannerPaintFrameRef.current != null) {
+        cancelAnimationFrame(bannerPaintFrameRef.current)
+        bannerPaintFrameRef.current = null
+      }
+    },
+    []
+  )
 
   useEffect(() => {
     // Preserve the last live metrics when the runtime clears them before waiting.

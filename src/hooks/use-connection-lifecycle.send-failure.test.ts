@@ -20,6 +20,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest"
 import { TurnBusyError } from "@/lib/turn-busy"
 
 const toastError = vi.fn()
+const recordFrontendTurnTrace = vi.fn()
 
 vi.mock("sonner", () => ({
   toast: {
@@ -33,6 +34,11 @@ vi.mock("sonner", () => ({
 vi.mock("next-intl", () => ({
   useTranslations: () => (key: string, params?: Record<string, unknown>) =>
     params ? `${key}:${JSON.stringify(params)}` : key,
+}))
+
+vi.mock("@/lib/acp/frontend-turn-trace", () => ({
+  recordFrontendTurnTrace: (...args: unknown[]) =>
+    recordFrontendTurnTrace(...args),
 }))
 
 const sendPrompt = vi.fn()
@@ -98,6 +104,38 @@ describe("useConnectionLifecycle send-failure surfacing", () => {
   beforeEach(() => {
     vi.clearAllMocks()
     sharedSession = null
+  })
+
+  it("records send start before the wire call and completion with elapsed time", async () => {
+    const milestones: string[] = []
+    recordFrontendTurnTrace.mockImplementation((trace: { phase: string }) =>
+      milestones.push(trace.phase)
+    )
+    sendPrompt.mockImplementation(async () => {
+      expect(milestones).toEqual(["send_started"])
+      return undefined
+    })
+    const { result } = renderLifecycle()
+    await act(async () => {
+      await result.current.handleSend(draft(), null, {
+        conversationId: 42,
+        clientMessageId: "message-1",
+      })
+    })
+
+    expect(milestones).toEqual(["send_started", "send_completed"])
+    expect(recordFrontendTurnTrace).toHaveBeenLastCalledWith({
+      phase: "send_completed",
+      contextKey: "ctx-1",
+      conversationId: 42,
+      clientMessageId: "message-1",
+      elapsedMs: expect.any(Number),
+      outcome: "success",
+    })
+    expect(
+      (recordFrontendTurnTrace.mock.calls.at(-1)?.[0] as { elapsedMs: number })
+        .elapsedMs
+    ).toBeGreaterThanOrEqual(0)
   })
 
   it("toasts a structured backend error with its message", async () => {

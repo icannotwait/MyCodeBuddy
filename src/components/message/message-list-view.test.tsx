@@ -9,7 +9,7 @@ import {
 import { NextIntlClientProvider } from "next-intl"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import type { ReactNode } from "react"
-import { forwardRef, useImperativeHandle, type Ref } from "react"
+import { forwardRef, StrictMode, useImperativeHandle, type Ref } from "react"
 import type { LiveMessage } from "@/contexts/acp-connections-context"
 import type {
   AcceptedConnectionFrame,
@@ -46,10 +46,17 @@ const {
   virtualizerScrollToIndex,
   virtualizerKeysSpy,
   listChildConversationsMock,
+  recordFrontendTurnTrace,
 } = vi.hoisted(() => ({
   virtualizerScrollToIndex: vi.fn(),
   virtualizerKeysSpy: vi.fn(),
   listChildConversationsMock: vi.fn(async () => [] as const),
+  recordFrontendTurnTrace: vi.fn(),
+}))
+
+vi.mock("@/lib/acp/frontend-turn-trace", () => ({
+  recordFrontendTurnTrace: (...args: unknown[]) =>
+    recordFrontendTurnTrace(...args),
 }))
 
 vi.mock("@/lib/api", async (importOriginal) => {
@@ -398,6 +405,11 @@ const CID = 501
 beforeEach(() => {
   listChildConversationsMock.mockReset()
   listChildConversationsMock.mockResolvedValue([])
+  recordFrontendTurnTrace.mockReset()
+})
+
+afterEach(() => {
+  vi.unstubAllGlobals()
 })
 
 function userTurn(id: string, text = id): MessageTurn {
@@ -1769,6 +1781,63 @@ describe("MessageListView waiting-for-subagents bottom banner", () => {
       connStatus: "connected",
     })
     expect(screen.queryByTestId("live-turn-stats")).not.toBeInTheDocument()
+  })
+
+  it("records the first streaming banner commit and next paint once", () => {
+    const frames = new Map<number, FrameRequestCallback>()
+    let nextFrameId = 0
+    vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
+      nextFrameId += 1
+      frames.set(nextFrameId, callback)
+      return nextFrameId
+    })
+    vi.stubGlobal("cancelAnimationFrame", (frameId: number) => {
+      frames.delete(frameId)
+    })
+    const live: LiveMessage = {
+      id: "live-banner-1",
+      role: "assistant",
+      content: [],
+      startedAt: 1,
+    }
+    liveTranscriptStore.rebuild(CID, "conn-1", live, 1)
+    useConversationRuntimeStore
+      .getState()
+      .actions.setLiveMessage(CID, live, true)
+
+    const { rerender } = render(
+      <StrictMode>{messageListUi({ connStatus: "prompting" })}</StrictMode>
+    )
+
+    expect(recordFrontendTurnTrace).toHaveBeenCalledWith({
+      phase: "banner_commit",
+      conversationId: CID,
+      liveMessageId: "live-banner-1",
+      hasLiveTranscript: true,
+    })
+    expect(recordFrontendTurnTrace).not.toHaveBeenCalledWith(
+      expect.objectContaining({ phase: "banner_paint" })
+    )
+    act(() => {
+      for (const callback of frames.values()) callback(16)
+    })
+    expect(recordFrontendTurnTrace).toHaveBeenCalledWith({
+      phase: "banner_paint",
+      conversationId: CID,
+      liveMessageId: "live-banner-1",
+      hasLiveTranscript: true,
+    })
+
+    rerender(
+      <StrictMode>{messageListUi({ connStatus: "prompting" })}</StrictMode>
+    )
+    expect(
+      recordFrontendTurnTrace.mock.calls.filter(
+        ([trace]) =>
+          (trace as { liveMessageId?: string }).liveMessageId ===
+          "live-banner-1"
+      )
+    ).toHaveLength(2)
   })
 
   it("latches pre-suspend live tools into the waiting banner", () => {
