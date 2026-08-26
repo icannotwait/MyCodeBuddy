@@ -3459,6 +3459,115 @@ mod tests {
         })
     }
 
+    #[test]
+    fn delegation_admission_context_phase0_session_4123_frozen_baseline() {
+        let fixture: Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/delegation_binding_session_4123.json"
+        )))
+        .unwrap();
+        let fixture = fixture.as_object().unwrap();
+        assert_eq!(fixture.len(), 5);
+        assert!([
+            "schema_version",
+            "session_id",
+            "baseline",
+            "rows",
+            "expected_sequence",
+        ]
+        .iter()
+        .all(|key| fixture.contains_key(*key)));
+        assert_eq!(fixture["schema_version"], 1);
+        assert_eq!(fixture["session_id"], 4123);
+
+        let baseline = fixture["baseline"].as_object().unwrap();
+        assert_eq!(baseline.len(), 6);
+        assert_eq!(baseline["first_page_calls"], 125);
+        assert_eq!(baseline["continuation_page_calls"], 670);
+        assert_eq!(baseline["total_binding_query_calls"], 795);
+        assert_eq!(baseline["model_visible_result_bytes"], 3_040_870);
+        assert_eq!(baseline["final_row_count"], 72);
+        assert_eq!(baseline["work_unit_key_count"], 34);
+
+        let rows = fixture["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 72);
+        let identity_fields = [
+            "agent_type",
+            "child_conversation_id",
+            "generic_generation",
+            "lineage_root_task_id",
+            "orchestration_binding",
+            "previous_task_id",
+            "profile_id",
+            "replaced_task_id",
+            "replacement_reason",
+            "root_task_id",
+            "status",
+            "task_id",
+            "work_unit_key",
+        ];
+        let mut work_unit_keys = HashSet::new();
+        for row in rows {
+            let row = row.as_object().unwrap();
+            assert_eq!(row.len(), identity_fields.len());
+            assert!(identity_fields.iter().all(|field| row.contains_key(*field)));
+            for field in ["task_id", "root_task_id", "lineage_root_task_id"] {
+                uuid::Uuid::parse_str(row[field].as_str().unwrap()).unwrap();
+            }
+            work_unit_keys.insert(row["work_unit_key"].as_str().unwrap());
+        }
+        assert_eq!(work_unit_keys.len(), 34);
+
+        let expected_sequence = json!([
+            { "label": "selected_identity_rows", "value": 72 },
+            { "label": "legacy_model_visible_first_page_calls", "value": 125 },
+            { "label": "artifact_model_visible_calls", "value": 125 },
+            { "label": "legacy_model_visible_continuation_page_calls", "value": 670 },
+            { "label": "artifact_model_visible_continuation_page_calls", "value": 0 },
+            { "label": "legacy_total_binding_query_calls", "value": 795 },
+            { "label": "legacy_model_visible_binding_result_jsonl_utf8_bytes", "value": 3_040_870 },
+            { "label": "artifact_aggregate_result_jsonl_utf8_bytes_max", "value": 262_144 },
+            { "label": "artifact_reduction_percent_min", "value": 90 },
+            { "label": "selected_identity_order", "value": "unchanged" },
+            { "label": "validator_reconciliation_decisions", "value": "unchanged" },
+            { "label": "dispatch_labels", "value": "unchanged" }
+        ]);
+        assert_eq!(fixture["expected_sequence"], expected_sequence);
+
+        let page: DelegationOrchestrationBindingPage = serde_json::from_value(json!({
+            "schema_version": 1,
+            "namespace": "brainstorm-to-delivery",
+            "snapshot_id": "00000000-0000-4000-8000-000000004123",
+            "snapshot_revision": "0",
+            "snapshot_created_at": "2026-08-26T08:00:00Z",
+            "snapshot_expires_at": "2026-08-26T08:01:00Z",
+            "total_rows": 72,
+            "page_start": 0,
+            "request_cursor": null,
+            "runs": rows,
+            "next_cursor": null,
+            "complete": true
+        }))
+        .unwrap();
+        let id = json!("session-4123-baseline");
+        let response = ok(
+            id.clone(),
+            render_orchestration_binding_page(&serde_json::to_value(&page).unwrap()),
+        );
+        assert!(
+            serialize_jsonrpc_line(&response).unwrap().len()
+                > GET_ORCHESTRATION_BINDINGS_MAX_RESULT_BYTES
+        );
+        let fitting = largest_fitting_orchestration_binding_page_limit(
+            &id,
+            &page,
+            GET_ORCHESTRATION_BINDINGS_MAX_RESULT_BYTES,
+        )
+        .unwrap()
+        .unwrap();
+        assert!((1..72).contains(&usize::from(fitting)));
+    }
+
     fn transport_sized_orchestration_page(page: &Value, page_limit: usize) -> Value {
         let mut bounded = page.clone();
         let runs = bounded["runs"].as_array_mut().unwrap();

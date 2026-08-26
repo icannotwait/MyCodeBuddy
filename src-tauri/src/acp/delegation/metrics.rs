@@ -399,6 +399,107 @@ pub enum SuppressionApplication {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtifactExportOutcome {
+    Success,
+    Stale,
+    BrokerFailed,
+    SerializationFailed,
+    IoFailed,
+    TooLarge,
+    ResultTooLarge,
+    Cancelled,
+}
+
+impl ArtifactExportOutcome {
+    const fn index(self) -> usize {
+        match self {
+            Self::Success => 0,
+            Self::Stale => 1,
+            Self::BrokerFailed => 2,
+            Self::SerializationFailed => 3,
+            Self::IoFailed => 4,
+            Self::TooLarge => 5,
+            Self::ResultTooLarge => 6,
+            Self::Cancelled => 7,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmissionTicketMetricOutcome {
+    Issued,
+    Consumed,
+    Stale,
+    Mismatched,
+    AlreadyAdmitted,
+}
+
+impl AdmissionTicketMetricOutcome {
+    const fn index(self) -> usize {
+        match self {
+            Self::Issued => 0,
+            Self::Consumed => 1,
+            Self::Stale => 2,
+            Self::Mismatched => 3,
+            Self::AlreadyAdmitted => 4,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatchIntentMetricOutcome {
+    ExactReplay,
+    Conflict,
+}
+
+impl DispatchIntentMetricOutcome {
+    const fn index(self) -> usize {
+        match self {
+            Self::ExactReplay => 0,
+            Self::Conflict => 1,
+        }
+    }
+}
+
+const ARTIFACT_EXPORT_OUTCOME_LABELS: [&str; 8] = [
+    "success",
+    "stale",
+    "broker_failed",
+    "serialization_failed",
+    "io_failed",
+    "too_large",
+    "result_too_large",
+    "cancelled",
+];
+const ADMISSION_TICKET_OUTCOME_LABELS: [&str; 5] = [
+    "issued",
+    "consumed",
+    "stale",
+    "mismatched",
+    "already_admitted",
+];
+const DISPATCH_INTENT_OUTCOME_LABELS: [&str; 2] = ["exact_replay", "conflict"];
+
+/// Histogram buckets are inclusive upper bounds; the final bucket is overflow.
+pub const ARTIFACT_INTERNAL_PAGE_COUNT_BUCKET_UPPER_BOUNDS: [u64; 7] =
+    [1, 2, 4, 8, 16, 32, u64::MAX];
+pub const ARTIFACT_SELECTED_ROW_COUNT_BUCKET_UPPER_BOUNDS: [u64; 8] =
+    [1, 8, 32, 72, 200, 1_024, 4_096, u64::MAX];
+pub const ARTIFACT_EVIDENCE_BYTES_BUCKET_UPPER_BOUNDS: [u64; 7] = [
+    1_024,
+    16 * 1_024,
+    64 * 1_024,
+    256 * 1_024,
+    1_024 * 1_024,
+    4 * 1_024 * 1_024,
+    u64::MAX,
+];
+pub const ARTIFACT_EXPORT_DURATION_MS_BUCKET_UPPER_BOUNDS: [u64; 11] =
+    [1, 5, 10, 25, 50, 100, 250, 500, 1_000, 5_000, u64::MAX];
+pub const ARTIFACT_FINAL_MCP_RESULT_BYTES_BUCKET_UPPER_BOUNDS: [u64; 6] =
+    [512, 1_024, 2_048, 4_096, 7_680, u64::MAX];
+
 // ── Snapshot ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -499,6 +600,30 @@ pub struct DelegationMetricsSnapshot {
     pub cursor_enrichment_duration_ms_count: u64,
     #[serde(default)]
     pub cursor_enrichment_duration_ms_total: u64,
+    #[serde(default)]
+    pub artifact_export_outcomes: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub artifact_internal_page_count_buckets: [u64; 7],
+    #[serde(default)]
+    pub artifact_selected_row_count_buckets: [u64; 8],
+    #[serde(default)]
+    pub artifact_evidence_bytes_buckets: [u64; 7],
+    #[serde(default)]
+    pub artifact_export_duration_ms_buckets: [u64; 11],
+    #[serde(default)]
+    pub artifact_final_mcp_result_bytes_buckets: [u64; 6],
+    #[serde(default)]
+    pub artifact_transparent_stale_restarts: u64,
+    #[serde(default)]
+    pub artifact_cleanup_success_count: u64,
+    #[serde(default)]
+    pub artifact_cleanup_failure_count: u64,
+    #[serde(default)]
+    pub admission_ticket_outcomes: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub dispatch_intent_outcomes: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub legacy_page_mode_calls_after_artifact_capability: u64,
 }
 
 /// Bounded completion-protocol observability. Every label is produced from a
@@ -610,6 +735,18 @@ pub struct DelegationMetrics {
     cursor_enrichment_backfill: Mutex<BTreeMap<String, u64>>,
     cursor_enrichment_duration_ms_count: AtomicU64,
     cursor_enrichment_duration_ms_total: AtomicU64,
+    artifact_export_outcomes: [AtomicU64; 8],
+    artifact_internal_page_count_buckets: [AtomicU64; 7],
+    artifact_selected_row_count_buckets: [AtomicU64; 8],
+    artifact_evidence_bytes_buckets: [AtomicU64; 7],
+    artifact_export_duration_ms_buckets: [AtomicU64; 11],
+    artifact_final_mcp_result_bytes_buckets: [AtomicU64; 6],
+    artifact_transparent_stale_restarts: AtomicU64,
+    artifact_cleanup_success_count: AtomicU64,
+    artifact_cleanup_failure_count: AtomicU64,
+    admission_ticket_outcomes: [AtomicU64; 5],
+    dispatch_intent_outcomes: [AtomicU64; 2],
+    legacy_page_mode_calls_after_artifact_capability: AtomicU64,
 }
 
 impl DelegationMetrics {
@@ -624,6 +761,105 @@ impl DelegationMetrics {
         let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
         let entry = guard.entry(key).or_insert(0);
         *entry = (*entry).saturating_add(n);
+    }
+
+    fn record_fixed_bucket<const N: usize>(
+        counters: &[AtomicU64; N],
+        upper_bounds: &[u64; N],
+        value: u64,
+    ) {
+        let index = upper_bounds
+            .iter()
+            .position(|upper_bound| value <= *upper_bound)
+            .unwrap_or(N - 1);
+        counters[index].fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn fixed_bucket_snapshot<const N: usize>(counters: &[AtomicU64; N]) -> [u64; N] {
+        std::array::from_fn(|index| counters[index].load(Ordering::Relaxed))
+    }
+
+    fn fixed_outcome_snapshot<const N: usize>(
+        labels: &[&str; N],
+        counters: &[AtomicU64; N],
+    ) -> BTreeMap<String, u64> {
+        labels
+            .iter()
+            .enumerate()
+            .map(|(index, label)| {
+                (
+                    (*label).to_string(),
+                    counters[index].load(Ordering::Relaxed),
+                )
+            })
+            .collect()
+    }
+
+    pub fn record_artifact_export(&self, outcome: ArtifactExportOutcome) {
+        self.artifact_export_outcomes[outcome.index()].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_artifact_shape(
+        &self,
+        internal_page_count: usize,
+        selected_row_count: usize,
+        evidence_bytes: usize,
+        export_duration: Duration,
+        final_mcp_result_bytes: usize,
+    ) {
+        let as_u64 = |value| u64::try_from(value).unwrap_or(u64::MAX);
+        Self::record_fixed_bucket(
+            &self.artifact_internal_page_count_buckets,
+            &ARTIFACT_INTERNAL_PAGE_COUNT_BUCKET_UPPER_BOUNDS,
+            as_u64(internal_page_count),
+        );
+        Self::record_fixed_bucket(
+            &self.artifact_selected_row_count_buckets,
+            &ARTIFACT_SELECTED_ROW_COUNT_BUCKET_UPPER_BOUNDS,
+            as_u64(selected_row_count),
+        );
+        Self::record_fixed_bucket(
+            &self.artifact_evidence_bytes_buckets,
+            &ARTIFACT_EVIDENCE_BYTES_BUCKET_UPPER_BOUNDS,
+            as_u64(evidence_bytes),
+        );
+        Self::record_fixed_bucket(
+            &self.artifact_export_duration_ms_buckets,
+            &ARTIFACT_EXPORT_DURATION_MS_BUCKET_UPPER_BOUNDS,
+            Self::duration_ms_saturating(export_duration),
+        );
+        Self::record_fixed_bucket(
+            &self.artifact_final_mcp_result_bytes_buckets,
+            &ARTIFACT_FINAL_MCP_RESULT_BYTES_BUCKET_UPPER_BOUNDS,
+            as_u64(final_mcp_result_bytes),
+        );
+    }
+
+    pub fn record_artifact_cleanup(&self, success: bool) {
+        let counter = if success {
+            &self.artifact_cleanup_success_count
+        } else {
+            &self.artifact_cleanup_failure_count
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_artifact_transparent_stale_restart(&self) {
+        self.artifact_transparent_stale_restarts
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_ticket_outcome(&self, outcome: AdmissionTicketMetricOutcome) {
+        self.admission_ticket_outcomes[outcome.index()].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_dispatch_intent_outcome(&self, outcome: DispatchIntentMetricOutcome) {
+        self.dispatch_intent_outcomes[outcome.index()].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_legacy_page_mode_call_after_artifact_capability(&self) {
+        self.legacy_page_mode_calls_after_artifact_capability
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_completion_resolution(
@@ -1501,6 +1737,45 @@ impl DelegationMetrics {
             cursor_enrichment_duration_ms_total: self
                 .cursor_enrichment_duration_ms_total
                 .load(Ordering::Relaxed),
+            artifact_export_outcomes: Self::fixed_outcome_snapshot(
+                &ARTIFACT_EXPORT_OUTCOME_LABELS,
+                &self.artifact_export_outcomes,
+            ),
+            artifact_internal_page_count_buckets: Self::fixed_bucket_snapshot(
+                &self.artifact_internal_page_count_buckets,
+            ),
+            artifact_selected_row_count_buckets: Self::fixed_bucket_snapshot(
+                &self.artifact_selected_row_count_buckets,
+            ),
+            artifact_evidence_bytes_buckets: Self::fixed_bucket_snapshot(
+                &self.artifact_evidence_bytes_buckets,
+            ),
+            artifact_export_duration_ms_buckets: Self::fixed_bucket_snapshot(
+                &self.artifact_export_duration_ms_buckets,
+            ),
+            artifact_final_mcp_result_bytes_buckets: Self::fixed_bucket_snapshot(
+                &self.artifact_final_mcp_result_bytes_buckets,
+            ),
+            artifact_transparent_stale_restarts: self
+                .artifact_transparent_stale_restarts
+                .load(Ordering::Relaxed),
+            artifact_cleanup_success_count: self
+                .artifact_cleanup_success_count
+                .load(Ordering::Relaxed),
+            artifact_cleanup_failure_count: self
+                .artifact_cleanup_failure_count
+                .load(Ordering::Relaxed),
+            admission_ticket_outcomes: Self::fixed_outcome_snapshot(
+                &ADMISSION_TICKET_OUTCOME_LABELS,
+                &self.admission_ticket_outcomes,
+            ),
+            dispatch_intent_outcomes: Self::fixed_outcome_snapshot(
+                &DISPATCH_INTENT_OUTCOME_LABELS,
+                &self.dispatch_intent_outcomes,
+            ),
+            legacy_page_mode_calls_after_artifact_capability: self
+                .legacy_page_mode_calls_after_artifact_capability
+                .load(Ordering::Relaxed),
         }
     }
 }
@@ -2241,6 +2516,180 @@ pub fn emit_promote_structured_log(
 mod tests {
     use super::*;
     use crate::acp::delegation::route::ROUTE_ADAPTER_CONTRACT_VERSION;
+    use serde_json::Value;
+
+    #[test]
+    fn delegation_admission_context_phase0_snapshot_shape_is_fixed_and_bounded() {
+        let snapshot = serde_json::to_value(DelegationMetrics::default().snapshot()).unwrap();
+        let snapshot = snapshot.as_object().unwrap();
+
+        for field in [
+            "artifact_transparent_stale_restarts",
+            "artifact_cleanup_success_count",
+            "artifact_cleanup_failure_count",
+            "legacy_page_mode_calls_after_artifact_capability",
+        ] {
+            assert!(
+                snapshot.get(field).is_some_and(Value::is_u64),
+                "missing or non-numeric Phase 0 metric field {field}"
+            );
+        }
+
+        for field in [
+            "artifact_internal_page_count_buckets",
+            "artifact_selected_row_count_buckets",
+            "artifact_evidence_bytes_buckets",
+            "artifact_export_duration_ms_buckets",
+            "artifact_final_mcp_result_bytes_buckets",
+        ] {
+            let buckets = snapshot
+                .get(field)
+                .and_then(Value::as_array)
+                .unwrap_or_else(|| panic!("missing Phase 0 metric buckets {field}"));
+            assert!(!buckets.is_empty());
+            assert!(buckets.iter().all(Value::is_u64));
+        }
+
+        for (field, outcomes) in [
+            (
+                "artifact_export_outcomes",
+                &[
+                    "broker_failed",
+                    "cancelled",
+                    "io_failed",
+                    "result_too_large",
+                    "serialization_failed",
+                    "stale",
+                    "success",
+                    "too_large",
+                ][..],
+            ),
+            (
+                "admission_ticket_outcomes",
+                &[
+                    "already_admitted",
+                    "consumed",
+                    "issued",
+                    "mismatched",
+                    "stale",
+                ][..],
+            ),
+            (
+                "dispatch_intent_outcomes",
+                &["conflict", "exact_replay"][..],
+            ),
+        ] {
+            let map = snapshot
+                .get(field)
+                .and_then(Value::as_object)
+                .unwrap_or_else(|| panic!("missing Phase 0 outcome map {field}"));
+            assert_eq!(map.len(), outcomes.len());
+            assert!(
+                outcomes
+                    .iter()
+                    .all(|outcome| map.get(*outcome).is_some_and(Value::is_u64)),
+                "Phase 0 outcome map {field} is not fixed and numeric"
+            );
+        }
+    }
+
+    #[test]
+    fn delegation_admission_context_phase0_recorders_use_fixed_outcomes_and_buckets() {
+        let metrics = DelegationMetrics::default();
+        for outcome in [
+            ArtifactExportOutcome::Success,
+            ArtifactExportOutcome::Stale,
+            ArtifactExportOutcome::BrokerFailed,
+            ArtifactExportOutcome::SerializationFailed,
+            ArtifactExportOutcome::IoFailed,
+            ArtifactExportOutcome::TooLarge,
+            ArtifactExportOutcome::ResultTooLarge,
+            ArtifactExportOutcome::Cancelled,
+        ] {
+            metrics.record_artifact_export(outcome);
+        }
+        metrics.record_artifact_shape(3, 72, 300_000, Duration::from_millis(30), 2_048);
+        metrics.record_artifact_cleanup(true);
+        metrics.record_artifact_cleanup(false);
+        metrics.record_artifact_transparent_stale_restart();
+        metrics.record_legacy_page_mode_call_after_artifact_capability();
+        for outcome in [
+            AdmissionTicketMetricOutcome::Issued,
+            AdmissionTicketMetricOutcome::Consumed,
+            AdmissionTicketMetricOutcome::Stale,
+            AdmissionTicketMetricOutcome::Mismatched,
+            AdmissionTicketMetricOutcome::AlreadyAdmitted,
+        ] {
+            metrics.record_ticket_outcome(outcome);
+        }
+        for outcome in [
+            DispatchIntentMetricOutcome::ExactReplay,
+            DispatchIntentMetricOutcome::Conflict,
+        ] {
+            metrics.record_dispatch_intent_outcome(outcome);
+        }
+
+        let snapshot = metrics.snapshot();
+        assert!(snapshot
+            .artifact_export_outcomes
+            .values()
+            .all(|count| *count == 1));
+        assert_eq!(
+            snapshot
+                .artifact_internal_page_count_buckets
+                .iter()
+                .sum::<u64>(),
+            1
+        );
+        assert_eq!(
+            snapshot
+                .artifact_selected_row_count_buckets
+                .iter()
+                .sum::<u64>(),
+            1
+        );
+        assert_eq!(
+            snapshot.artifact_evidence_bytes_buckets.iter().sum::<u64>(),
+            1
+        );
+        assert_eq!(
+            snapshot
+                .artifact_export_duration_ms_buckets
+                .iter()
+                .sum::<u64>(),
+            1
+        );
+        assert_eq!(
+            snapshot
+                .artifact_final_mcp_result_bytes_buckets
+                .iter()
+                .sum::<u64>(),
+            1
+        );
+        assert_eq!(snapshot.artifact_transparent_stale_restarts, 1);
+        assert_eq!(snapshot.artifact_cleanup_success_count, 1);
+        assert_eq!(snapshot.artifact_cleanup_failure_count, 1);
+        assert!(snapshot
+            .admission_ticket_outcomes
+            .values()
+            .all(|count| *count == 1));
+        assert!(snapshot
+            .dispatch_intent_outcomes
+            .values()
+            .all(|count| *count == 1));
+        assert_eq!(snapshot.legacy_page_mode_calls_after_artifact_capability, 1);
+
+        let serialized = serde_json::to_string(&snapshot).unwrap();
+        for sensitive in [
+            "00000000-0000-4000-8000-000000004123",
+            "task-sensitive",
+            "profile-sensitive",
+            "sha256:sensitive",
+            "prompt-sensitive",
+        ] {
+            assert!(!serialized.contains(sensitive));
+        }
+    }
 
     #[test]
     fn completion_metrics_v2_only() {
