@@ -2615,14 +2615,26 @@ impl DelegationListener {
                 }
             },
         };
+        if req
+            .input
+            .get("profile_label")
+            .is_some_and(|value| !value.is_string())
+        {
+            return report_failed(
+                "invalid_delegation_profile",
+                "profile_label must be a string",
+            );
+        }
         // The `working_dir` the LLM explicitly passed (before defaulting),
         // used by the broker's correlation key. `None` when omitted —
         // symmetric with the ACP `raw_input`, which also omits it then.
-        let requested_working_dir = req
-            .input
-            .get("working_dir")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
+        let requested_working_dir = match req.input.get("working_dir") {
+            None => None,
+            Some(Value::String(value)) => Some(value.clone()),
+            Some(_) => {
+                return report_failed("invalid_working_dir", "working_dir must be a string");
+            }
+        };
         let working_dir = requested_working_dir
             .clone()
             .or_else(|| Some(entry.working_dir.to_string_lossy().to_string()));
@@ -2705,13 +2717,14 @@ const WORK_UNIT_KEY_MAX_CHARS: usize = 200;
 
 /// Parse optional `work_unit_key` from `delegate_to_agent` tool input.
 ///
-/// - absent / null / blank → `None` (ad-hoc one-shot)
+/// - absent / blank → `None` (ad-hoc one-shot)
+/// - null / non-string → error
 /// - non-string → error
 /// - trimmed length > 200 Unicode scalars → error
 /// - otherwise → `Some(trimmed)`
 pub(crate) fn parse_work_unit_key(input: &Value) -> Result<Option<String>, String> {
     match input.get("work_unit_key") {
-        None | Some(Value::Null) => Ok(None),
+        None => Ok(None),
         Some(Value::String(raw)) => {
             let trimmed = raw.trim();
             if trimmed.is_empty() {
@@ -2734,7 +2747,7 @@ pub(crate) fn parse_replacement_inputs(
     input: &Value,
 ) -> Result<(Option<String>, Option<String>), String> {
     let replaces = match input.get("replaces_task_id") {
-        None | Some(Value::Null) => None,
+        None => None,
         Some(Value::String(s)) => {
             let t = s.trim();
             if t.is_empty() {
@@ -2746,7 +2759,7 @@ pub(crate) fn parse_replacement_inputs(
         Some(_) => return Err("replaces_task_id must be a string".into()),
     };
     let reason = match input.get("replacement_reason") {
-        None | Some(Value::Null) => None,
+        None => None,
         Some(Value::String(s)) => {
             let t = s.trim();
             if t.is_empty() {
@@ -5121,7 +5134,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn orchestration_binding_transport_listener_matches_shared_corpus_before_side_effects() {
+    async fn delegation_catalog_compaction_removed_leaf_runtime_parity() {
         let corpus: Value = serde_json::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/orchestration_binding_v1.json"
@@ -5136,6 +5149,272 @@ mod tests {
             .await;
         let mock = Arc::new(MockSpawner::new());
         let listener = make_listener(make_broker(Arc::clone(&mock)).await, tokens, Some(1));
+
+        let delegate = |key: &str, value: Value| {
+            let mut input = json!({
+                "agent_type": "grok",
+                "task": "catalog parity delegate",
+                "correlation_id": "catalog-parity-delegate"
+            });
+            input
+                .as_object_mut()
+                .unwrap()
+                .insert(key.to_string(), value);
+            input
+        };
+        let continuation = |key: &str, value: Value| {
+            let mut input = json!({
+                "_codeg_tool": "continue_delegation",
+                "task_id": "source-task",
+                "task": "catalog parity continuation",
+                "correlation_id": "catalog-parity-continuation"
+            });
+            input
+                .as_object_mut()
+                .unwrap()
+                .insert(key.to_string(), value);
+            input
+        };
+        let cases = vec![
+            (
+                "delegate agent type",
+                delegate("agent_type", json!(7)),
+                "pt-1",
+                "invalid_agent_type",
+            ),
+            (
+                "delegate agent enum",
+                delegate("agent_type", json!("other")),
+                "pt-1",
+                "invalid_agent_type",
+            ),
+            (
+                "delegate profile id type",
+                delegate("profile_id", json!(7)),
+                "pt-1",
+                "invalid_delegation_profile",
+            ),
+            (
+                "delegate profile id malformed",
+                delegate("profile_id", json!("not-a-uuid")),
+                "pt-1",
+                "invalid_delegation_profile",
+            ),
+            (
+                "delegate profile label type",
+                delegate("profile_label", json!(7)),
+                "pt-1",
+                "invalid_delegation_profile",
+            ),
+            (
+                "delegate profile label null",
+                delegate("profile_label", Value::Null),
+                "pt-1",
+                "invalid_delegation_profile",
+            ),
+            (
+                "delegate task type",
+                delegate("task", json!(7)),
+                "pt-1",
+                "invalid_working_dir",
+            ),
+            (
+                "delegate task empty",
+                delegate("task", json!("")),
+                "pt-1",
+                "invalid_working_dir",
+            ),
+            (
+                "delegate correlation type",
+                delegate("correlation_id", json!(7)),
+                "",
+                "delegation_correlation_missing",
+            ),
+            (
+                "delegate correlation empty",
+                delegate("correlation_id", json!("")),
+                "",
+                "delegation_correlation_missing",
+            ),
+            (
+                "delegate correlation malformed",
+                delegate("correlation_id", json!(".bad")),
+                "",
+                "delegation_correlation_missing",
+            ),
+            (
+                "delegate correlation overlength",
+                delegate("correlation_id", json!("a".repeat(129))),
+                "",
+                "delegation_correlation_missing",
+            ),
+            (
+                "delegate working dir type",
+                delegate("working_dir", json!(7)),
+                "pt-1",
+                "invalid_working_dir",
+            ),
+            (
+                "delegate working dir null",
+                delegate("working_dir", Value::Null),
+                "pt-1",
+                "invalid_working_dir",
+            ),
+            (
+                "delegate work unit type",
+                delegate("work_unit_key", json!(7)),
+                "pt-1",
+                "invalid_work_unit_key",
+            ),
+            (
+                "delegate work unit null",
+                delegate("work_unit_key", Value::Null),
+                "pt-1",
+                "invalid_work_unit_key",
+            ),
+            (
+                "delegate work unit overlength",
+                delegate("work_unit_key", json!("x".repeat(201))),
+                "pt-1",
+                "invalid_work_unit_key",
+            ),
+            (
+                "delegate recovery type",
+                delegate("recovery_authorization_id", json!(7)),
+                "pt-1",
+                "invalid_recovery_authorization_id",
+            ),
+            (
+                "delegate recovery empty",
+                delegate("recovery_authorization_id", json!("")),
+                "pt-1",
+                "invalid_recovery_authorization_id",
+            ),
+            (
+                "delegate replaces type",
+                delegate("replaces_task_id", json!(7)),
+                "pt-1",
+                "invalid_replacement",
+            ),
+            (
+                "delegate replaces null",
+                delegate("replaces_task_id", Value::Null),
+                "pt-1",
+                "invalid_replacement",
+            ),
+            (
+                "delegate replacement type",
+                delegate("replacement_reason", json!(7)),
+                "pt-1",
+                "invalid_replacement",
+            ),
+            (
+                "delegate replacement null",
+                delegate("replacement_reason", Value::Null),
+                "pt-1",
+                "invalid_replacement",
+            ),
+            (
+                "delegate replacement enum",
+                delegate("replacement_reason", json!("other")),
+                "pt-1",
+                "invalid_replacement",
+            ),
+            (
+                "continue task id type",
+                continuation("task_id", json!(7)),
+                "pt-1",
+                "not_found",
+            ),
+            (
+                "continue task id empty",
+                continuation("task_id", json!("")),
+                "pt-1",
+                "not_found",
+            ),
+            (
+                "continue task type",
+                continuation("task", json!(7)),
+                "pt-1",
+                "invalid_working_dir",
+            ),
+            (
+                "continue task empty",
+                continuation("task", json!("")),
+                "pt-1",
+                "invalid_working_dir",
+            ),
+            (
+                "continue correlation type",
+                continuation("correlation_id", json!(7)),
+                "",
+                "delegation_correlation_missing",
+            ),
+            (
+                "continue correlation empty",
+                continuation("correlation_id", json!("")),
+                "",
+                "delegation_correlation_missing",
+            ),
+            (
+                "continue correlation malformed",
+                continuation("correlation_id", json!(".bad")),
+                "",
+                "delegation_correlation_missing",
+            ),
+            (
+                "continue correlation overlength",
+                continuation("correlation_id", json!("a".repeat(129))),
+                "",
+                "delegation_correlation_missing",
+            ),
+            (
+                "continue work unit type",
+                continuation("work_unit_key", json!(7)),
+                "pt-1",
+                "invalid_work_unit_key",
+            ),
+            (
+                "continue work unit null",
+                continuation("work_unit_key", Value::Null),
+                "pt-1",
+                "invalid_work_unit_key",
+            ),
+            (
+                "continue work unit overlength",
+                continuation("work_unit_key", json!("x".repeat(201))),
+                "pt-1",
+                "invalid_work_unit_key",
+            ),
+            (
+                "continue recovery type",
+                continuation("recovery_authorization_id", json!(7)),
+                "pt-1",
+                "invalid_recovery_authorization_id",
+            ),
+            (
+                "continue recovery empty",
+                continuation("recovery_authorization_id", json!("")),
+                "pt-1",
+                "invalid_recovery_authorization_id",
+            ),
+        ];
+
+        for (label, input, host_id, expected_code) in cases {
+            let spawn_before = mock.spawn_args.lock().await.len();
+            let resume_before = mock.resume_args.lock().await.len();
+            let report = listener
+                .process(make_request_with_host_id(input, host_id).await)
+                .await;
+            assert_eq!(report.status, TaskStatus::Failed, "{label}");
+            assert_eq!(report.error_code.as_deref(), Some(expected_code), "{label}");
+            assert_eq!(mock.spawn_args.lock().await.len(), spawn_before, "{label}");
+            assert_eq!(
+                mock.resume_args.lock().await.len(),
+                resume_before,
+                "{label}"
+            );
+        }
 
         for case in corpus["cases"].as_array().unwrap() {
             let expected = case["valid"].as_bool().unwrap();
@@ -5566,10 +5845,7 @@ mod tests {
     #[test]
     fn parse_work_unit_key_absent_or_blank_is_none() {
         assert_eq!(parse_work_unit_key(&json!({})).unwrap(), None);
-        assert_eq!(
-            parse_work_unit_key(&json!({"work_unit_key": null})).unwrap(),
-            None
-        );
+        assert!(parse_work_unit_key(&json!({"work_unit_key": null})).is_err());
         assert_eq!(
             parse_work_unit_key(&json!({"work_unit_key": "  "})).unwrap(),
             None

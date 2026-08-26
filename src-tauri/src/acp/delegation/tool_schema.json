@@ -37,37 +37,6 @@
     "description": "ASYNCHRONOUS: returns task_id. Cold child cannot see this conversation; task must include all context. Fan out, then Join. For each distinct agent/profile mention, call once; pass profile_id for a profile.",
     "inputSchema": {
       "type": "object",
-      "$defs": {
-        "b": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": [
-            "schema_version",
-            "namespace",
-            "generation",
-            "route_fingerprint"
-          ],
-          "properties": {
-            "schema_version": {
-              "type": "integer",
-              "const": 1
-            },
-            "namespace": {
-              "type": "string",
-              "pattern": "^[a-z][a-z0-9-]{0,63}$"
-            },
-            "generation": {
-              "type": "integer",
-              "minimum": 1,
-              "maximum": 4294967295
-            },
-            "route_fingerprint": {
-              "type": "string",
-              "pattern": "^sha256:[0-9a-f]{64}$"
-            }
-          }
-        }
-      },
       "required": [
         "agent_type",
         "task",
@@ -75,7 +44,6 @@
       ],
       "properties": {
         "agent_type": {
-          "type": "string",
           "enum": [
             "claude_code",
             "codex",
@@ -89,41 +57,22 @@
             "grok",
             "cursor",
             "deepseek"
-          ],
-          "description": "Honor codeg://agent/<agent_type> slug."
+          ]
         },
-        "profile_id": {
-          "type": "string"
-        },
-        "profile_label": {
-          "type": "string"
-        },
-        "task": {
-          "type": "string"
-        },
-        "correlation_id": {
-          "type": "string",
-          "description": "Fresh."
-        },
+        "profile_id": {},
+        "profile_label": {},
+        "task": {},
+        "correlation_id": {},
         "recovery_authorization_id": {
-          "type": "string",
           "minLength": 1
         },
-        "orchestration_binding": {
-          "$ref": "#/$defs/b"
-        },
-        "working_dir": {
-          "type": "string"
-        },
+        "orchestration_binding": {},
+        "working_dir": {},
         "work_unit_key": {
-          "type": "string",
           "maxLength": 200
         },
-        "replaces_task_id": {
-          "type": "string"
-        },
+        "replaces_task_id": {},
         "replacement_reason": {
-          "type": "string",
           "enum": [
             "unresumable",
             "budget_exhausted_continue",
@@ -131,34 +80,26 @@
             "admission_failed",
             "admission_unknown"
           ],
-          "description": "admission_failed/admission_unknown: explicit replace, not continue."
+          "description": ""
         }
       }
     }
   },
   {
     "name": "register_simple_workflow",
-    "description": "Register Plan/progress",
     "inputSchema": {
       "type": "object",
       "required": [
         "plan_rel_path"
       ],
       "properties": {
-        "plan_rel_path": {
-          "type": "string",
-          "minLength": 1
-        },
-        "progress_rel_path": {
-          "type": "string",
-          "minLength": 1
-        }
+        "plan_rel_path": {},
+        "progress_rel_path": {}
       }
     }
   },
   {
     "name": "get_delegation_orchestration_bindings",
-    "description": "Read-only parent-scoped snapshot",
     "inputSchema": {
       "type": "object",
       "additionalProperties": false,
@@ -167,19 +108,14 @@
       ],
       "properties": {
         "namespace": {
-          "type": "string",
           "pattern": "^[a-z][a-z0-9-]{0,63}$"
         },
         "limit": {
-          "type": "integer",
           "minimum": 1,
           "default": 100
         },
-        "snapshot_id": {
-          "type": "string"
-        },
+        "snapshot_id": {},
         "cursor": {
-          "type": "string",
           "maxLength": 128,
           "pattern": "^[A-Za-z0-9_-]+$"
         }
@@ -196,65 +132,22 @@
   },
   {
     "name": "continue_delegation",
-    "description": "Continue terminal task_id;reuse child",
     "inputSchema": {
       "type": "object",
-      "$defs": {
-        "b": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": [
-            "schema_version",
-            "namespace",
-            "generation",
-            "route_fingerprint"
-          ],
-          "properties": {
-            "schema_version": {
-              "type": "integer",
-              "const": 1
-            },
-            "namespace": {
-              "type": "string",
-              "pattern": "^[a-z][a-z0-9-]{0,63}$"
-            },
-            "generation": {
-              "type": "integer",
-              "minimum": 1,
-              "maximum": 4294967295
-            },
-            "route_fingerprint": {
-              "type": "string",
-              "pattern": "^sha256:[0-9a-f]{64}$"
-            }
-          }
-        }
-      },
       "required": [
         "task_id",
         "task",
         "correlation_id"
       ],
       "properties": {
-        "task_id": {
-          "type": "string"
-        },
-        "task": {
-          "type": "string"
-        },
-        "correlation_id": {
-          "type": "string",
-          "description": "Fresh."
-        },
+        "task_id": {},
+        "task": {},
+        "correlation_id": {},
         "recovery_authorization_id": {
-          "type": "string",
           "minLength": 1
         },
-        "orchestration_binding": {
-          "$ref": "#/$defs/b"
-        },
+        "orchestration_binding": {},
         "work_unit_key": {
-          "type": "string",
           "maxLength": 200
         }
       }
@@ -276,12 +169,10 @@
           }
         },
         "wait_ms": {
-          "type": "integer",
           "minimum": 0,
           "maximum": 0
         },
         "return_when": {
-          "type": "string",
           "enum": [
             "all_terminal_or_attention"
           ]
@@ -299,11 +190,8 @@
         "reason"
       ],
       "properties": {
-        "task_id": {
-          "type": "string"
-        },
+        "task_id": {},
         "reason": {
-          "type": "string",
           "enum": [
             "timeout",
             "taskfail",
@@ -399,7 +287,6 @@
           "type": "integer"
         },
         "max_messages": {
-          "type": "integer",
           "minimum": 0
         }
       }
@@ -434,14 +321,8 @@
         "reply"
       ],
       "properties": {
-        "request_id": {
-          "type": "string",
-          "minLength": 1
-        },
-        "reply": {
-          "type": "string",
-          "minLength": 1
-        }
+        "request_id": {},
+        "reply": {}
       }
     }
   },
@@ -458,46 +339,34 @@
       ],
       "properties": {
         "subject_kind": {
-          "type": "string",
           "enum": [
             "delegation_task",
             "workflow"
           ]
         },
         "subject_id": {
-          "type": "string",
           "minLength": 1
         },
         "correlation_id": {
-          "type": "string",
           "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
         },
         "proposed_user_reason": {
-          "type": "string",
-          "maxLength": 4096,
-          "description": "reset_plan_lineage only"
+          "maxLength": 4096
         }
       }
     }
   },
   {
     "name": "get_workflow_capabilities",
-    "description": "workflow_manifest_v2",
-    "inputSchema": {
-      "type": "object"
-    }
+    "inputSchema": {}
   },
   {
     "name": "get_workflow_state",
-    "description": "compact workflow index: report_file, get_session_info, get_delegation_status.",
     "inputSchema": {
       "type": "object",
       "properties": {
-        "workflow_id": {
-          "type": "string"
-        },
+        "workflow_id": {},
         "detail": {
-          "type": "string",
           "enum": [
             "index"
           ],
@@ -508,7 +377,6 @@
   },
   {
     "name": "recover_workflow",
-    "description": "",
     "inputSchema": {
       "type": "object",
       "additionalProperties": false,
@@ -519,20 +387,12 @@
         "correlation_id"
       ],
       "properties": {
-        "workflow_id": {
-          "type": "string",
-          "minLength": 1
-        },
-        "recovery_authorization_id": {
-          "type": "string",
-          "minLength": 1
-        },
+        "workflow_id": {},
+        "recovery_authorization_id": {},
         "expected_manifest_revision": {
-          "type": "integer",
           "minimum": 1
         },
         "correlation_id": {
-          "type": "string",
           "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
         }
       }
@@ -540,7 +400,6 @@
   },
   {
     "name": "publish_workflow_manifest",
-    "description": "",
     "inputSchema": {
       "type": "object",
       "required": [
@@ -558,32 +417,22 @@
       ],
       "properties": {
         "schema_version": {
-          "type": "integer",
           "const": 2
         },
-        "workflow_id": {
-          "type": "string"
-        },
+        "workflow_id": {},
         "expected_manifest_revision": {
-          "type": "integer",
           "minimum": 0
         },
-        "plan_target_rel_path": {
-          "type": "string"
-        },
+        "plan_target_rel_path": {},
         "risk_policy_version": {
-          "type": "string",
           "const": "b2d_task_risk_v1"
         },
-        "task_policies": {
-          "type": "array"
-        }
+        "task_policies": {}
       }
     }
   },
   {
     "name": "settle_workflow_gate",
-    "description": "",
     "inputSchema": {
       "type": "object",
       "additionalProperties": false,
@@ -594,38 +443,26 @@
         "summary"
       ],
       "properties": {
-        "workflow_id": {
-          "type": "string"
-        },
-        "gate_id": {
-          "type": "string"
-        },
+        "workflow_id": {},
+        "gate_id": {},
         "expected_graph_revision": {
-          "type": "integer",
           "minimum": 0
         },
         "expected_review_round": {
-          "type": "integer",
           "minimum": 1
         },
         "expected_gate_cycle": {
-          "type": "integer",
           "minimum": 1
         },
         "expected_outcome": {
-          "type": "string",
           "enum": [
             "approved",
             "changes_requested",
             "blocked"
           ]
         },
-        "recovery_authorization_id": {
-          "type": "string"
-        },
-        "summary": {
-          "type": "string"
-        }
+        "recovery_authorization_id": {},
+        "summary": {}
       }
     }
   },

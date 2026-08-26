@@ -914,7 +914,18 @@ async fn build_tools_call_spawn(
                 }
             };
             // Default to a modest recent-message window; `0` means metadata-only.
-            // Robust against stringified / oversized values (see helper).
+            // Keep the catalog's integer contract at runtime; clamp oversized
+            // numeric values in the existing helper.
+            if arguments
+                .get("max_messages")
+                .is_some_and(|value| !is_nonnegative_json_integer(value))
+            {
+                return LineAction::Respond(err(
+                    id,
+                    -32602,
+                    "get_session_info max_messages must be a non-negative integer",
+                ));
+            }
             let max_messages = parse_max_messages(&arguments);
             let req = BrokerSessionRequest {
                 token: ctx.token.clone(),
@@ -1010,6 +1021,13 @@ async fn build_tools_call_spawn(
         }
         // A15.1: answer locally from CompanionFeatures — no UDS / no store.
         "get_workflow_capabilities" => {
+            if !arguments.is_object() {
+                return LineAction::Respond(err(
+                    id,
+                    -32602,
+                    "get_workflow_capabilities arguments must be an object",
+                ));
+            }
             let caps = local_workflow_capabilities(&ctx.features, ctx.role);
             LineAction::Respond(ok(id, render_workflow_local_result(&caps)))
         }
@@ -1025,6 +1043,9 @@ async fn build_tools_call_spawn(
             register_and_spawn_workflow_state(inflight, id, round_trip).await
         }
         "publish_workflow_manifest" => {
+            if let Err(message) = validate_publish_workflow_compacted_fields(&arguments) {
+                return LineAction::Respond(err(id, -32602, message));
+            }
             let req = BrokerPublishWorkflowRequest {
                 token: ctx.token.clone(),
                 document: arguments,
@@ -1034,6 +1055,16 @@ async fn build_tools_call_spawn(
             register_and_spawn(inflight, id, None, round_trip, render_workflow_result).await
         }
         "register_simple_workflow" => {
+            if arguments
+                .get("progress_rel_path")
+                .is_some_and(Value::is_null)
+            {
+                return LineAction::Respond(err(
+                    id,
+                    -32602,
+                    "invalid register_simple_workflow arguments: progress_rel_path must be a string",
+                ));
+            }
             let arguments: RegisterSimpleWorkflowArguments = match serde_json::from_value(arguments)
             {
                 Ok(arguments) => arguments,
@@ -1119,7 +1150,7 @@ fn parse_get_workflow_state_args(
         }
     }
     let workflow_id = match arguments.get("workflow_id") {
-        None | Some(Value::Null) => None,
+        None => None,
         Some(Value::String(workflow_id)) if !workflow_id.is_empty() => Some(workflow_id.clone()),
         Some(_) => {
             return Err(
@@ -1132,6 +1163,58 @@ fn parse_get_workflow_state_args(
         token: token.to_string(),
         workflow_id,
     })
+}
+
+fn is_nonnegative_json_integer(value: &Value) -> bool {
+    value.as_u64().is_some()
+        || value
+            .as_f64()
+            .is_some_and(|number| number >= 0.0 && number.fract() == 0.0)
+}
+
+fn json_u64(value: &Value) -> Option<u64> {
+    value.as_u64().or_else(|| {
+        value.as_f64().and_then(|number| {
+            (number >= 0.0 && number <= u64::MAX as f64 && number.fract() == 0.0)
+                .then_some(number as u64)
+        })
+    })
+}
+
+fn validate_publish_workflow_compacted_fields(arguments: &Value) -> Result<(), String> {
+    if arguments.get("schema_version").and_then(json_u64) != Some(2) {
+        return Err("publish_workflow_manifest schema_version must be integer 2".into());
+    }
+    if arguments
+        .get("workflow_id")
+        .is_some_and(|value| !value.is_string())
+    {
+        return Err("publish_workflow_manifest workflow_id must be a string".into());
+    }
+    if arguments
+        .get("expected_manifest_revision")
+        .is_some_and(|value| json_u64(value).is_none())
+    {
+        return Err(
+            "publish_workflow_manifest expected_manifest_revision must be a non-negative integer"
+                .into(),
+        );
+    }
+    if !arguments
+        .get("plan_target_rel_path")
+        .is_some_and(Value::is_string)
+    {
+        return Err("publish_workflow_manifest plan_target_rel_path must be a string".into());
+    }
+    if arguments.get("risk_policy_version").and_then(Value::as_str) != Some("b2d_task_risk_v1") {
+        return Err(
+            "publish_workflow_manifest risk_policy_version must be b2d_task_risk_v1".into(),
+        );
+    }
+    if !arguments.get("task_policies").is_some_and(Value::is_array) {
+        return Err("publish_workflow_manifest task_policies must be an array".into());
+    }
+    Ok(())
 }
 
 fn reject_unknown_arguments(arguments: &Value, tool: &str, allowed: &[&str]) -> Result<(), String> {
@@ -1227,15 +1310,13 @@ fn parse_recover_workflow_args(
     let correlation_id = required_string("correlation_id")?;
     validate_correlation_id(&correlation_id)
         .map_err(|message| format!("recover_workflow invalid correlation_id: {message}"))?;
-    let expected_manifest_revision = match arguments.get("expected_manifest_revision") {
-        Some(Value::Number(number)) => number.as_u64(),
-        Some(Value::String(value)) => value.parse::<u64>().ok(),
-        _ => None,
-    }
-    .filter(|revision| *revision > 0)
-    .ok_or_else(|| {
-        "recover_workflow expected_manifest_revision must be a positive integer".to_string()
-    })?;
+    let expected_manifest_revision = arguments
+        .get("expected_manifest_revision")
+        .and_then(json_u64)
+        .filter(|revision| *revision > 0)
+        .ok_or_else(|| {
+            "recover_workflow expected_manifest_revision must be a positive integer".to_string()
+        })?;
     Ok(BrokerRecoverWorkflowRequest {
         token: token.to_string(),
         workflow_id: required_string("workflow_id")?,
@@ -1283,6 +1364,12 @@ fn parse_settle_workflow_args(
     let expected_graph_revision = parse_u64_arg(arguments, "expected_graph_revision")?;
     let expected_review_round = parse_optional_u64_arg(arguments, "expected_review_round")?;
     let expected_gate_cycle = parse_optional_u64_arg(arguments, "expected_gate_cycle")?;
+    if expected_review_round == Some(0) {
+        return Err("settle_workflow_gate expected_review_round must be at least 1".into());
+    }
+    if expected_gate_cycle == Some(0) {
+        return Err("settle_workflow_gate expected_gate_cycle must be at least 1".into());
+    }
     let parse_outcome = |key: &str| -> Result<Option<String>, String> {
         let Some(value) = arguments.get(key) else {
             return Ok(None);
@@ -1324,31 +1411,18 @@ fn parse_settle_workflow_args(
 }
 
 fn parse_u64_arg(arguments: &Value, key: &str) -> Result<u64, String> {
-    match arguments.get(key) {
-        Some(Value::Number(n)) => n
-            .as_u64()
-            .ok_or_else(|| format!("settle_workflow_gate {key} must be a non-negative integer")),
-        Some(Value::String(s)) => s
-            .parse::<u64>()
-            .map_err(|_| format!("settle_workflow_gate {key} must be a non-negative integer")),
-        _ => Err(format!("settle_workflow_gate requires {key}")),
-    }
+    arguments
+        .get(key)
+        .and_then(json_u64)
+        .ok_or_else(|| format!("settle_workflow_gate {key} must be a non-negative integer"))
 }
 
 fn parse_optional_u64_arg(arguments: &Value, key: &str) -> Result<Option<u64>, String> {
     match arguments.get(key) {
         None => Ok(None),
-        Some(Value::Number(number)) => number
-            .as_u64()
+        Some(value) => json_u64(value)
             .map(Some)
             .ok_or_else(|| format!("settle_workflow_gate {key} must be a non-negative integer")),
-        Some(Value::String(value)) => value
-            .parse::<u64>()
-            .map(Some)
-            .map_err(|_| format!("settle_workflow_gate {key} must be a non-negative integer")),
-        Some(_) => Err(format!(
-            "settle_workflow_gate {key} must be a non-negative integer"
-        )),
     }
 }
 
@@ -2405,7 +2479,12 @@ fn parse_status_wait_arguments(
     arguments: &Value,
     coordination_v1: bool,
 ) -> Result<(Option<u64>, Option<DelegationReturnWhen>), String> {
-    let wait_ms = arguments.get("wait_ms").and_then(Value::as_u64);
+    let wait_ms = match arguments.get("wait_ms") {
+        None => None,
+        Some(value) => Some(
+            json_u64(value).ok_or_else(|| "wait_ms must be a non-negative integer".to_string())?,
+        ),
+    };
     let return_when = parse_return_when(arguments, coordination_v1)?;
     if coordination_v1 && return_when.is_none() && wait_ms.is_some_and(|ms| ms > 0) {
         return Err(COORDINATION_POSITIVE_WAIT_ERROR.into());
@@ -3734,7 +3813,7 @@ mod tests {
         // Optional orchestration key for concurrent first-dispatch fencing.
         let work_unit = &delegate["inputSchema"]["properties"]["work_unit_key"];
         assert!(work_unit.is_object());
-        assert_eq!(work_unit["type"], "string");
+        assert!(work_unit.get("type").is_none());
         assert_eq!(work_unit["maxLength"], 200);
         assert!(!delegate["inputSchema"]["required"]
             .as_array()
@@ -3767,15 +3846,8 @@ mod tests {
         let reason_desc = delegate["inputSchema"]["properties"]["replacement_reason"]
             ["description"]
             .as_str()
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        assert!(
-            reason_desc.contains("admission_failed")
-                && reason_desc.contains("admission_unknown")
-                && reason_desc.contains("explicit")
-                && reason_desc.contains("continue"),
-            "replacement_reason description must document explicit-replacement-only recovery: {reason_desc}"
-        );
+            .unwrap();
+        assert_eq!(reason_desc, "");
         let delegate_desc = delegate["description"]
             .as_str()
             .unwrap_or("")
@@ -3791,17 +3863,7 @@ mod tests {
         // invocation; server still accepts legacy missing when host tool id present).
         let corr = &delegate["inputSchema"]["properties"]["correlation_id"];
         assert!(corr.is_object());
-        assert_eq!(corr["type"], "string");
-        let corr_desc = corr["description"]
-            .as_str()
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        assert!(
-            corr_desc.contains("fresh")
-                || corr_desc.contains("each invocation")
-                || corr_desc.contains("every"),
-            "correlation_id description must mention fresh-per-invocation: {corr_desc}"
-        );
+        assert!(corr.as_object().unwrap().is_empty());
         assert!(delegate["inputSchema"]["required"]
             .as_array()
             .unwrap()
@@ -3819,17 +3881,7 @@ mod tests {
         assert!(continue_props["working_dir"].is_null());
         let continue_corr = &continue_props["correlation_id"];
         assert!(continue_corr.is_object());
-        assert_eq!(continue_corr["type"], "string");
-        let continue_corr_desc = continue_corr["description"]
-            .as_str()
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        assert!(
-            continue_corr_desc.contains("fresh")
-                || continue_corr_desc.contains("each invocation")
-                || continue_corr_desc.contains("every"),
-            "continue correlation_id description: {continue_corr_desc}"
-        );
+        assert!(continue_corr.as_object().unwrap().is_empty());
         let continue_required = continue_tool["inputSchema"]["required"].as_array().unwrap();
         assert!(continue_required.iter().any(|value| value == "task_id"));
         assert!(continue_required.iter().any(|value| value == "task"));
@@ -4745,6 +4797,14 @@ mod tests {
         .to_string()
     }
 
+    fn with_argument(mut arguments: Value, key: &str, value: Value) -> Value {
+        arguments
+            .as_object_mut()
+            .expect("tool arguments object")
+            .insert(key.to_string(), value);
+        arguments
+    }
+
     fn tool_names(action: LineAction) -> Vec<String> {
         list_tool_names(action)
     }
@@ -4894,10 +4954,9 @@ mod tests {
                     .unwrap()
                     .insert("orchestration_binding".into(), case["value"].clone());
                 let expected = case["valid"].as_bool().unwrap();
-                assert_eq!(
+                assert!(
                     schema_accepts(schema, schema, &input),
-                    expected,
-                    "{tool_name} schema disagrees for {}",
+                    "{tool_name} compact catalog must defer {} to runtime",
                     case["name"]
                 );
                 assert_eq!(
@@ -4980,7 +5039,7 @@ mod tests {
             ),
             "delegate guidance must not imply that ordinary agent mentions require profile_id"
         );
-        let cases: [(&str, &[&str]); 8] = [
+        let cases: [(&str, &[&str]); 9] = [
             (
                 "delegate_to_agent",
                 &[
@@ -5083,6 +5142,19 @@ mod tests {
                     "open direct-child join decision",
                     "first reply wins",
                     "idempotent",
+                ],
+            ),
+            (
+                "request_recovery_authorization",
+                &[
+                    "recovery_confirmation_required",
+                    "exact rejected call",
+                    "subject_kind",
+                    "allowed_action",
+                    "cause_code",
+                    "expires_at",
+                    "target_state",
+                    "replacement_reason",
                 ],
             ),
         ];
@@ -6109,7 +6181,8 @@ mod tests {
             .iter()
             .find(|tool| tool["name"] == "get_workflow_capabilities")
             .expect("capabilities tool");
-        assert!(tool_guidance(capabilities).contains("workflow_manifest_v2"));
+        assert_eq!(capabilities["inputSchema"], json!({}));
+        assert!(capabilities.get("description").is_none());
 
         let publish = tools
             .iter()
@@ -6190,20 +6263,12 @@ mod tests {
             json!({
                 "type": "object",
                 "properties": {
-                    "workflow_id": { "type": "string" },
-                    "detail": { "type": "string", "enum": ["index"], "default": "index" }
+                    "workflow_id": {},
+                    "detail": { "enum": ["index"], "default": "index" }
                 }
             })
         );
-        let description = state["description"].as_str().expect("tool description");
-        for phrase in [
-            "compact workflow index",
-            "report_file",
-            "get_session_info",
-            "get_delegation_status",
-        ] {
-            assert!(description.contains(phrase), "missing {phrase}");
-        }
+        assert!(state.get("description").is_none());
     }
 
     #[tokio::test]
@@ -6332,42 +6397,6 @@ mod tests {
             })
         );
 
-        let descriptions = [
-            (
-                "register_simple_workflow",
-                ["register", "plan/progress"].as_slice(),
-            ),
-            (
-                "get_delegation_orchestration_bindings",
-                ["read-only", "parent-scoped", "snapshot"].as_slice(),
-            ),
-            (
-                "continue_delegation",
-                ["continue terminal task_id", "reuse child"].as_slice(),
-            ),
-        ];
-        for (name, phrases) in descriptions {
-            let description = tools
-                .iter()
-                .find(|tool| tool["name"] == name)
-                .and_then(|tool| tool["description"].as_str())
-                .unwrap()
-                .to_ascii_lowercase();
-            for phrase in phrases {
-                assert!(description.contains(phrase), "{name} lost {phrase}");
-            }
-        }
-        let recovery = tools
-            .iter()
-            .find(|tool| tool["name"] == "request_recovery_authorization")
-            .unwrap();
-        assert!(
-            recovery["inputSchema"]["properties"]["proposed_user_reason"]["description"]
-                .as_str()
-                .unwrap()
-                .contains("reset_plan_lineage only")
-        );
-
         let page = json!({
             "schema_version": 1,
             "namespace": "brainstorm-to-delivery",
@@ -6409,6 +6438,548 @@ mod tests {
             .expect("successful binding page must be available to text-only MCP hosts");
         assert_eq!(serde_json::from_str::<Value>(text).unwrap(), page);
         assert_eq!(result["isError"], false);
+    }
+
+    #[tokio::test]
+    async fn delegation_catalog_compaction_page_mode_wire_bytes_are_unchanged() {
+        let raw_call = r#"{"jsonrpc":"2.0","id":"page-fixture","method":"tools/call","params":{"name":"get_delegation_orchestration_bindings","arguments":{"namespace":"brainstorm-to-delivery","limit":100,"snapshot_id":"1a641e16-36f4-4ec5-aa4f-18d18e6ab107","cursor":"cursor_1"}}}"#;
+        let request: JsonRpcRequest = serde_json::from_str(raw_call).unwrap();
+        let query: OrchestrationBindingQueryRequest =
+            serde_json::from_value(request.params["arguments"].clone()).unwrap();
+        let request_bytes = serde_json::to_vec(&query).unwrap();
+
+        let page = json!({
+            "schema_version": 1,
+            "namespace": "brainstorm-to-delivery",
+            "snapshot_id": "1a641e16-36f4-4ec5-aa4f-18d18e6ab107",
+            "snapshot_revision": "17",
+            "snapshot_created_at": "2026-08-26T08:00:00Z",
+            "snapshot_expires_at": "2026-08-26T08:01:00Z",
+            "total_rows": 0,
+            "page_start": 0,
+            "request_cursor": "cursor_1",
+            "runs": [],
+            "next_cursor": null,
+            "complete": true
+        });
+        let success_line = serialize_jsonrpc_line(&ok(
+            json!("page-fixture"),
+            render_orchestration_binding_page(&page),
+        ))
+        .unwrap();
+        let error_response = unwrap_respond(
+            dispatch_with_features(
+                GROK_FEATURES,
+                &call(
+                    19,
+                    "get_delegation_orchestration_bindings",
+                    json!({ "namespace": 7 }),
+                ),
+            )
+            .await,
+        );
+        let error_line = serialize_jsonrpc_line(&error_response).unwrap();
+
+        println!(
+            "page-mode bytes: request={}, success={}, error={}",
+            request_bytes.len(),
+            success_line.len(),
+            error_line.len()
+        );
+        assert_eq!(
+            request_bytes,
+            br#"{"namespace":"brainstorm-to-delivery","limit":100,"snapshot_id":"1a641e16-36f4-4ec5-aa4f-18d18e6ab107","cursor":"cursor_1"}"#
+        );
+        assert_eq!(
+            success_line,
+            concat!(
+                r#"{"jsonrpc":"2.0","id":"page-fixture","result":{"content":[{"text":"{\"complete\":true,\"namespace\":\"brainstorm-to-delivery\",\"next_cursor\":null,\"page_start\":0,\"request_cursor\":\"cursor_1\",\"runs\":[],\"schema_version\":1,\"snapshot_created_at\":\"2026-08-26T08:00:00Z\",\"snapshot_expires_at\":\"2026-08-26T08:01:00Z\",\"snapshot_id\":\"1a641e16-36f4-4ec5-aa4f-18d18e6ab107\",\"snapshot_revision\":\"17\",\"total_rows\":0}","type":"text"}],"isError":false,"structuredContent":{"complete":true,"namespace":"brainstorm-to-delivery","next_cursor":null,"page_start":0,"request_cursor":"cursor_1","runs":[],"schema_version":1,"snapshot_created_at":"2026-08-26T08:00:00Z","snapshot_expires_at":"2026-08-26T08:01:00Z","snapshot_id":"1a641e16-36f4-4ec5-aa4f-18d18e6ab107","snapshot_revision":"17","total_rows":0}}}"#,
+                "\n"
+            )
+            .as_bytes()
+        );
+        assert_eq!(
+            error_line,
+            concat!(
+                r#"{"jsonrpc":"2.0","id":19,"result":{"content":[{"text":"invalid orchestration binding query","type":"text"}],"isError":true,"structuredContent":{"error":{"code":"orchestration_binding_query_invalid","message":"invalid orchestration binding query"}}}}"#,
+                "\n"
+            )
+            .as_bytes()
+        );
+    }
+
+    #[tokio::test]
+    async fn delegation_catalog_compaction_removed_leaf_runtime_parity() {
+        let publish = json!({
+            "schema_version": 2,
+            "workflow_kind": "simple",
+            "publication_token": "publication-token",
+            "workflow_state": "draft",
+            "plan_target_rel_path": "docs/plan.md",
+            "risk_policy_version": "b2d_task_risk_v1",
+            "task_policies": [],
+            "phases": [],
+            "nodes": [],
+            "edges": [],
+            "gates": []
+        });
+        let settle = json!({
+            "workflow_id": "workflow-a",
+            "gate_id": "gate-a",
+            "expected_graph_revision": 0,
+            "summary": "reviewed"
+        });
+        let recover = json!({
+            "workflow_id": "workflow-a",
+            "recovery_authorization_id": "authorization-a",
+            "expected_manifest_revision": 1,
+            "correlation_id": "recovery-a"
+        });
+        let authorization = json!({
+            "subject_kind": "workflow",
+            "subject_id": "workflow-a",
+            "correlation_id": "authorization-a"
+        });
+        let cases = vec![
+            (
+                "registration plan type",
+                "register_simple_workflow",
+                json!({"plan_rel_path": 7}),
+            ),
+            (
+                "registration plan empty",
+                "register_simple_workflow",
+                json!({"plan_rel_path": ""}),
+            ),
+            (
+                "registration progress type",
+                "register_simple_workflow",
+                json!({"plan_rel_path": "docs/plan.md", "progress_rel_path": 7}),
+            ),
+            (
+                "registration progress null",
+                "register_simple_workflow",
+                json!({"plan_rel_path": "docs/plan.md", "progress_rel_path": null}),
+            ),
+            (
+                "registration progress empty",
+                "register_simple_workflow",
+                json!({"plan_rel_path": "docs/plan.md", "progress_rel_path": ""}),
+            ),
+            (
+                "status wait type",
+                "get_delegation_status",
+                json!({"task_ids": ["task-a"], "wait_ms": "0"}),
+            ),
+            (
+                "status wait below minimum",
+                "get_delegation_status",
+                json!({"task_ids": ["task-a"], "wait_ms": -1}),
+            ),
+            (
+                "status wait above maximum",
+                "get_delegation_status",
+                json!({"task_ids": ["task-a"], "wait_ms": 1}),
+            ),
+            (
+                "status return type",
+                "get_delegation_status",
+                json!({"task_ids": ["task-a"], "wait_ms": 0, "return_when": 7}),
+            ),
+            (
+                "status return enum",
+                "get_delegation_status",
+                json!({"task_ids": ["task-a"], "wait_ms": 0, "return_when": "later"}),
+            ),
+            (
+                "cancel task type",
+                "cancel_delegation",
+                json!({"task_id": 7, "reason": "taskfail"}),
+            ),
+            (
+                "cancel task empty",
+                "cancel_delegation",
+                json!({"task_id": "", "reason": "taskfail"}),
+            ),
+            (
+                "cancel reason type",
+                "cancel_delegation",
+                json!({"task_id": "task-a", "reason": 7}),
+            ),
+            (
+                "cancel reason enum",
+                "cancel_delegation",
+                json!({"task_id": "task-a", "reason": "later"}),
+            ),
+            (
+                "session max type",
+                "get_session_info",
+                json!({"session_id": 1, "max_messages": "20"}),
+            ),
+            (
+                "session max below minimum",
+                "get_session_info",
+                json!({"session_id": 1, "max_messages": -1}),
+            ),
+            (
+                "reply request type",
+                "reply_to_delegation",
+                json!({"request_id": 7, "reply": "yes"}),
+            ),
+            (
+                "reply request empty",
+                "reply_to_delegation",
+                json!({"request_id": "", "reply": "yes"}),
+            ),
+            (
+                "reply type",
+                "reply_to_delegation",
+                json!({"request_id": "request-a", "reply": 7}),
+            ),
+            (
+                "reply empty",
+                "reply_to_delegation",
+                json!({"request_id": "request-a", "reply": ""}),
+            ),
+            (
+                "reply overlength",
+                "reply_to_delegation",
+                json!({"request_id": "request-a", "reply": "x".repeat(16 * 1024 + 1)}),
+            ),
+            (
+                "authorization subject kind type",
+                "request_recovery_authorization",
+                with_argument(authorization.clone(), "subject_kind", json!(7)),
+            ),
+            (
+                "authorization subject kind enum",
+                "request_recovery_authorization",
+                with_argument(authorization.clone(), "subject_kind", json!("other")),
+            ),
+            (
+                "authorization subject type",
+                "request_recovery_authorization",
+                with_argument(authorization.clone(), "subject_id", json!(7)),
+            ),
+            (
+                "authorization subject empty",
+                "request_recovery_authorization",
+                with_argument(authorization.clone(), "subject_id", json!("")),
+            ),
+            (
+                "authorization correlation type",
+                "request_recovery_authorization",
+                with_argument(authorization.clone(), "correlation_id", json!(7)),
+            ),
+            (
+                "authorization correlation malformed",
+                "request_recovery_authorization",
+                with_argument(authorization.clone(), "correlation_id", json!(".bad")),
+            ),
+            (
+                "authorization correlation overlength",
+                "request_recovery_authorization",
+                with_argument(
+                    authorization.clone(),
+                    "correlation_id",
+                    json!("a".repeat(129)),
+                ),
+            ),
+            (
+                "authorization reason type",
+                "request_recovery_authorization",
+                with_argument(authorization.clone(), "proposed_user_reason", json!(7)),
+            ),
+            (
+                "authorization reason overlength",
+                "request_recovery_authorization",
+                with_argument(
+                    authorization.clone(),
+                    "proposed_user_reason",
+                    json!("x".repeat(4097)),
+                ),
+            ),
+            (
+                "capabilities null root",
+                "get_workflow_capabilities",
+                Value::Null,
+            ),
+            (
+                "capabilities array root",
+                "get_workflow_capabilities",
+                json!([]),
+            ),
+            (
+                "workflow state id type",
+                "get_workflow_state",
+                json!({"workflow_id": 7}),
+            ),
+            (
+                "workflow state id null",
+                "get_workflow_state",
+                json!({"workflow_id": null}),
+            ),
+            (
+                "workflow state id empty",
+                "get_workflow_state",
+                json!({"workflow_id": ""}),
+            ),
+            (
+                "workflow state detail type",
+                "get_workflow_state",
+                json!({"detail": 7}),
+            ),
+            (
+                "workflow state detail enum",
+                "get_workflow_state",
+                json!({"detail": "full"}),
+            ),
+            (
+                "recover workflow type",
+                "recover_workflow",
+                with_argument(recover.clone(), "workflow_id", json!(7)),
+            ),
+            (
+                "recover workflow empty",
+                "recover_workflow",
+                with_argument(recover.clone(), "workflow_id", json!("")),
+            ),
+            (
+                "recover authorization type",
+                "recover_workflow",
+                with_argument(recover.clone(), "recovery_authorization_id", json!(7)),
+            ),
+            (
+                "recover authorization empty",
+                "recover_workflow",
+                with_argument(recover.clone(), "recovery_authorization_id", json!("")),
+            ),
+            (
+                "recover revision type",
+                "recover_workflow",
+                with_argument(recover.clone(), "expected_manifest_revision", json!("1")),
+            ),
+            (
+                "recover revision below minimum",
+                "recover_workflow",
+                with_argument(recover.clone(), "expected_manifest_revision", json!(0)),
+            ),
+            (
+                "recover correlation type",
+                "recover_workflow",
+                with_argument(recover.clone(), "correlation_id", json!(7)),
+            ),
+            (
+                "recover correlation malformed",
+                "recover_workflow",
+                with_argument(recover.clone(), "correlation_id", json!(".bad")),
+            ),
+            (
+                "recover correlation overlength",
+                "recover_workflow",
+                with_argument(recover.clone(), "correlation_id", json!("a".repeat(129))),
+            ),
+            (
+                "publish schema type",
+                "publish_workflow_manifest",
+                with_argument(publish.clone(), "schema_version", json!("2")),
+            ),
+            (
+                "publish schema const",
+                "publish_workflow_manifest",
+                with_argument(publish.clone(), "schema_version", json!(1)),
+            ),
+            (
+                "publish workflow type",
+                "publish_workflow_manifest",
+                with_argument(publish.clone(), "workflow_id", json!(7)),
+            ),
+            (
+                "publish workflow null",
+                "publish_workflow_manifest",
+                with_argument(publish.clone(), "workflow_id", Value::Null),
+            ),
+            (
+                "publish revision type",
+                "publish_workflow_manifest",
+                with_argument(publish.clone(), "expected_manifest_revision", json!("0")),
+            ),
+            (
+                "publish revision below minimum",
+                "publish_workflow_manifest",
+                with_argument(publish.clone(), "expected_manifest_revision", json!(-1)),
+            ),
+            (
+                "publish plan target type",
+                "publish_workflow_manifest",
+                with_argument(publish.clone(), "plan_target_rel_path", json!(7)),
+            ),
+            (
+                "publish risk policy type",
+                "publish_workflow_manifest",
+                with_argument(publish.clone(), "risk_policy_version", json!(7)),
+            ),
+            (
+                "publish risk policy const",
+                "publish_workflow_manifest",
+                with_argument(publish.clone(), "risk_policy_version", json!("other")),
+            ),
+            (
+                "publish task policies type",
+                "publish_workflow_manifest",
+                with_argument(publish.clone(), "task_policies", json!({})),
+            ),
+            (
+                "settle workflow type",
+                "settle_workflow_gate",
+                with_argument(settle.clone(), "workflow_id", json!(7)),
+            ),
+            (
+                "settle workflow empty",
+                "settle_workflow_gate",
+                with_argument(settle.clone(), "workflow_id", json!("")),
+            ),
+            (
+                "settle gate type",
+                "settle_workflow_gate",
+                with_argument(settle.clone(), "gate_id", json!(7)),
+            ),
+            (
+                "settle gate empty",
+                "settle_workflow_gate",
+                with_argument(settle.clone(), "gate_id", json!("")),
+            ),
+            (
+                "settle graph revision type",
+                "settle_workflow_gate",
+                with_argument(settle.clone(), "expected_graph_revision", json!("0")),
+            ),
+            (
+                "settle graph revision below minimum",
+                "settle_workflow_gate",
+                with_argument(settle.clone(), "expected_graph_revision", json!(-1)),
+            ),
+            (
+                "settle review round type",
+                "settle_workflow_gate",
+                with_argument(settle.clone(), "expected_review_round", json!("1")),
+            ),
+            (
+                "settle review round below minimum",
+                "settle_workflow_gate",
+                with_argument(settle.clone(), "expected_review_round", json!(0)),
+            ),
+            (
+                "settle gate cycle type",
+                "settle_workflow_gate",
+                with_argument(settle.clone(), "expected_gate_cycle", json!("1")),
+            ),
+            (
+                "settle gate cycle below minimum",
+                "settle_workflow_gate",
+                with_argument(settle.clone(), "expected_gate_cycle", json!(0)),
+            ),
+            (
+                "settle outcome type",
+                "settle_workflow_gate",
+                with_argument(settle.clone(), "expected_outcome", json!(7)),
+            ),
+            (
+                "settle outcome enum",
+                "settle_workflow_gate",
+                with_argument(settle.clone(), "expected_outcome", json!("later")),
+            ),
+            (
+                "settle authorization type",
+                "settle_workflow_gate",
+                with_argument(settle.clone(), "recovery_authorization_id", json!(7)),
+            ),
+            (
+                "settle authorization null",
+                "settle_workflow_gate",
+                with_argument(settle.clone(), "recovery_authorization_id", Value::Null),
+            ),
+            (
+                "settle authorization empty",
+                "settle_workflow_gate",
+                with_argument(settle.clone(), "recovery_authorization_id", json!("")),
+            ),
+            (
+                "settle summary type",
+                "settle_workflow_gate",
+                with_argument(settle.clone(), "summary", json!(7)),
+            ),
+        ];
+
+        for (label, tool, arguments) in cases {
+            match dispatch_with_features(GROK_FEATURES, &call(91, tool, arguments)).await {
+                LineAction::Respond(response) => {
+                    let error = response
+                        .error
+                        .unwrap_or_else(|| panic!("{label}: invalid call returned success"));
+                    assert_eq!(error.code, -32602, "{label}");
+                }
+                LineAction::Spawn(_) => panic!("{label}: invalid call reached broker"),
+                LineAction::Silent => panic!("{label}: invalid call was silent"),
+            }
+        }
+
+        let snapshot_id = "1a641e16-36f4-4ec5-aa4f-18d18e6ab107";
+        for (label, arguments) in [
+            ("binding namespace type", json!({"namespace": 7})),
+            ("binding namespace empty", json!({"namespace": ""})),
+            ("binding namespace malformed", json!({"namespace": "Upper"})),
+            (
+                "binding limit type",
+                json!({"namespace": "brainstorm-to-delivery", "limit": "100"}),
+            ),
+            (
+                "binding limit below minimum",
+                json!({"namespace": "brainstorm-to-delivery", "limit": 0}),
+            ),
+            (
+                "binding limit above runtime maximum",
+                json!({"namespace": "brainstorm-to-delivery", "limit": 201}),
+            ),
+            (
+                "binding snapshot type",
+                json!({"namespace": "brainstorm-to-delivery", "snapshot_id": 7, "cursor": "cursor"}),
+            ),
+            (
+                "binding snapshot null",
+                json!({"namespace": "brainstorm-to-delivery", "snapshot_id": null, "cursor": "cursor"}),
+            ),
+            (
+                "binding cursor type",
+                json!({"namespace": "brainstorm-to-delivery", "snapshot_id": snapshot_id, "cursor": 7}),
+            ),
+            (
+                "binding cursor empty",
+                json!({"namespace": "brainstorm-to-delivery", "snapshot_id": snapshot_id, "cursor": ""}),
+            ),
+            (
+                "binding cursor malformed",
+                json!({"namespace": "brainstorm-to-delivery", "snapshot_id": snapshot_id, "cursor": "not+base64url"}),
+            ),
+            (
+                "binding cursor overlength",
+                json!({"namespace": "brainstorm-to-delivery", "snapshot_id": snapshot_id, "cursor": "x".repeat(129)}),
+            ),
+        ] {
+            let response = unwrap_respond(
+                dispatch_with_features(
+                    GROK_FEATURES,
+                    &call(92, "get_delegation_orchestration_bindings", arguments),
+                )
+                .await,
+            );
+            assert!(response.error.is_none(), "{label}");
+            assert_eq!(
+                response.result.unwrap()["structuredContent"]["error"]["code"],
+                "orchestration_binding_query_invalid",
+                "{label}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -6733,6 +7304,31 @@ mod tests {
                 "publish_workflow_manifest",
                 "settle_workflow_gate",
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn delegation_catalog_compaction_grok_base_is_at_most_5500_bytes() {
+        let response = unwrap_respond(
+            dispatch_with_features(
+                GROK_FEATURES,
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+            )
+            .await,
+        );
+        let mut line = serde_json::to_vec(&response).unwrap();
+        line.push(b'\n');
+
+        println!("Grok compact tools/list JSONL bytes: {}", line.len());
+        assert!(
+            line.len() <= 7_680,
+            "Grok tools/list line is {} bytes; fixed host-safe limit is 7680 bytes",
+            line.len()
+        );
+        assert!(
+            line.len() <= 5_500,
+            "compacted Grok catalog is {} bytes",
+            line.len()
         );
     }
 
