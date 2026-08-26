@@ -80,6 +80,7 @@ use crate::acp::delegation::workflow::{
 use crate::acp::question::parse_questions;
 use crate::acp::recovery_authorization::RecoverySubjectKind;
 use crate::acp::session_info::MAX_SESSION_MESSAGES;
+use crate::commands::confined_file::metadata_is_symlink_or_reparse;
 
 /// Upper bound on one broker-side cancel round-trip. Bounds both
 /// `handle_cancel_notification` (so stdin dispatch can't stall behind a
@@ -344,14 +345,14 @@ mod orchestration_binding_artifact_storage_tests {
         let inflight = Arc::new(InflightCalls::new());
 
         let (first, first_pending) = store_binding_artifact_at(
-            &root,
+            temp.path(),
             INCARNATION_A,
             vec![page(vec![run("task-a")])],
             &inflight,
         )
         .unwrap();
         let (second, second_pending) = store_binding_artifact_at(
-            &root,
+            temp.path(),
             INCARNATION_A,
             vec![page(vec![run("task-b")])],
             &inflight,
@@ -419,7 +420,7 @@ mod orchestration_binding_artifact_storage_tests {
 
         let metrics = DelegationMetrics::default();
         sweep_stale_binding_artifacts_at(
-            &root,
+            temp.path(),
             SystemTime::now() + ORCHESTRATION_BINDING_ARTIFACT_STALE_AGE + Duration::from_secs(1),
             &metrics,
         )
@@ -450,13 +451,75 @@ mod orchestration_binding_artifact_storage_tests {
         symlink(&outside, root.join(INCARNATION_B)).unwrap();
 
         sweep_stale_binding_artifacts_at(
-            &root,
+            temp.path(),
             SystemTime::now() + ORCHESTRATION_BINDING_ARTIFACT_STALE_AGE + Duration::from_secs(1),
             &DelegationMetrics::default(),
         )
         .unwrap();
 
         assert!(outside_file.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn orchestration_binding_artifact_storage_rejects_symlinked_fixed_parent_without_outside_changes(
+    ) {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let temp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_root = outside.path().join("orchestration-bindings");
+        let outside_owner = outside_root.join(INCARNATION_A);
+        fs::create_dir_all(&outside_owner).unwrap();
+        let outside_file = outside_owner.join("00000000-0000-4000-8000-000000000013.json");
+        fs::write(&outside_file, b"outside").unwrap();
+        fs::set_permissions(outside.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let outside_mode = fs::metadata(outside.path()).unwrap().permissions().mode() & 0o777;
+        let alias = temp.path().join("codeg-mcp");
+        symlink(outside.path(), &alias).unwrap();
+
+        let result = sweep_stale_binding_artifacts_at(
+            temp.path(),
+            SystemTime::now() + ORCHESTRATION_BINDING_ARTIFACT_STALE_AGE + Duration::from_secs(1),
+            &DelegationMetrics::default(),
+        );
+        let outside_bytes = fs::read(&outside_file);
+        let mode_after = fs::metadata(outside.path()).unwrap().permissions().mode() & 0o777;
+        fs::remove_file(&alias).unwrap();
+
+        assert_eq!(outside_bytes.unwrap(), b"outside");
+        assert_eq!(mode_after, outside_mode);
+        assert!(result.is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn orchestration_binding_artifact_storage_rejects_junctioned_fixed_parent_without_outside_changes(
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_root = outside.path().join("orchestration-bindings");
+        let outside_owner = outside_root.join(INCARNATION_A);
+        fs::create_dir_all(&outside_owner).unwrap();
+        let outside_file = outside_owner.join("00000000-0000-4000-8000-000000000013.json");
+        fs::write(&outside_file, b"outside").unwrap();
+        let alias = temp.path().join("codeg-mcp");
+        match junction::create(outside.path(), &alias) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("failed to create junction: {error}"),
+        }
+
+        let result = sweep_stale_binding_artifacts_at(
+            temp.path(),
+            SystemTime::now() + ORCHESTRATION_BINDING_ARTIFACT_STALE_AGE + Duration::from_secs(1),
+            &DelegationMetrics::default(),
+        );
+        let outside_bytes = fs::read(&outside_file);
+        junction::delete(&alias).unwrap();
+
+        assert_eq!(outside_bytes.unwrap(), b"outside");
+        assert!(result.is_err());
     }
 
     #[test]
@@ -479,10 +542,9 @@ mod orchestration_binding_artifact_storage_tests {
     #[test]
     fn orchestration_binding_artifact_storage_cancellation_removes_published_pending_file() {
         let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("codeg-mcp/orchestration-bindings");
         let inflight = Arc::new(InflightCalls::new());
         let (descriptor, pending) = store_binding_artifact_at(
-            &root,
+            temp.path(),
             INCARNATION_A,
             vec![page(vec![run("task-a")])],
             &inflight,
@@ -499,10 +561,9 @@ mod orchestration_binding_artifact_storage_tests {
     #[tokio::test]
     async fn orchestration_binding_artifact_storage_shutdown_cleans_delivered_files() {
         let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("codeg-mcp/orchestration-bindings");
         let inflight = Arc::new(InflightCalls::new());
         let (descriptor, pending) = store_binding_artifact_at(
-            &root,
+            temp.path(),
             INCARNATION_A,
             vec![page(vec![run("task-a")])],
             &inflight,
@@ -519,10 +580,9 @@ mod orchestration_binding_artifact_storage_tests {
     #[tokio::test]
     async fn orchestration_binding_artifact_storage_pre_relay_shutdown_drains_registered_file() {
         let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("codeg-mcp/orchestration-bindings");
         let inflight = Arc::new(InflightCalls::new());
         let (descriptor, pending) = store_binding_artifact_at(
-            &root,
+            temp.path(),
             INCARNATION_A,
             vec![page(vec![run("task-a")])],
             &inflight,
@@ -546,14 +606,13 @@ mod orchestration_binding_artifact_storage_tests {
     #[test]
     fn orchestration_binding_artifact_storage_metrics_are_identifier_free() {
         let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("codeg-mcp/orchestration-bindings");
         let metrics = Arc::new(DelegationMetrics::default());
         let inflight = Arc::new(InflightCalls::with_artifact_metrics(metrics.clone()));
         let sensitive_task = "task-sensitive";
         let sensitive_incarnation = "00000000-0000-4000-8000-000000004123";
 
         let (descriptor, pending) = store_binding_artifact_at(
-            &root,
+            temp.path(),
             sensitive_incarnation,
             vec![page(vec![run(sensitive_task)])],
             &inflight,
@@ -561,7 +620,7 @@ mod orchestration_binding_artifact_storage_tests {
         .unwrap();
         drop(pending.set_final_result_bytes(1_536));
         let oversized = store_binding_artifact_at(
-            &root,
+            temp.path(),
             sensitive_incarnation,
             vec![exact_size_page(
                 ORCHESTRATION_BINDING_ARTIFACT_MAX_BYTES + 1,
@@ -1309,26 +1368,50 @@ fn set_private_file_permissions(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn canonical_binding_artifact_root(root: &Path) -> io::Result<PathBuf> {
-    let parent = root.parent().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, "artifact root has no parent")
-    })?;
-    fs::create_dir_all(parent)?;
-    set_private_directory_permissions(parent)?;
-    fs::create_dir_all(root)?;
-    set_private_directory_permissions(root)?;
-    let canonical_parent = parent.canonicalize()?;
-    let canonical_root = root.canonicalize()?;
-    if canonical_root.parent() != Some(canonical_parent.as_path()) {
+fn canonical_direct_child_directory(parent: &Path, name: &str) -> io::Result<PathBuf> {
+    let child = parent.join(name);
+    let metadata = match fs::symlink_metadata(&child) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir(&child)?;
+            fs::symlink_metadata(&child)?
+        }
+        Err(error) => return Err(error),
+    };
+    if metadata_is_symlink_or_reparse(&metadata) || !metadata.is_dir() {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "artifact root escaped its fixed parent",
+            "artifact directory is not a direct directory child",
         ));
     }
+    let canonical_child = child.canonicalize()?;
+    if canonical_child.parent() != Some(parent) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "artifact directory escaped its fixed parent",
+        ));
+    }
+    Ok(canonical_child)
+}
+
+fn canonical_binding_artifact_root(temp_base: &Path) -> io::Result<PathBuf> {
+    let canonical_temp_base = temp_base.canonicalize()?;
+    let base_metadata = fs::symlink_metadata(&canonical_temp_base)?;
+    if metadata_is_symlink_or_reparse(&base_metadata) || !base_metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "artifact temp base is not a directory",
+        ));
+    }
+    let canonical_parent = canonical_direct_child_directory(&canonical_temp_base, "codeg-mcp")?;
+    let canonical_root =
+        canonical_direct_child_directory(&canonical_parent, "orchestration-bindings")?;
+    set_private_directory_permissions(&canonical_parent)?;
+    set_private_directory_permissions(&canonical_root)?;
     Ok(canonical_root)
 }
 
-fn canonical_binding_artifact_owner(root: &Path, incarnation_id: &str) -> io::Result<PathBuf> {
+fn canonical_binding_artifact_owner(temp_base: &Path, incarnation_id: &str) -> io::Result<PathBuf> {
     let incarnation = uuid::Uuid::parse_str(incarnation_id)
         .ok()
         .filter(|incarnation| incarnation.to_string() == incarnation_id)
@@ -1338,26 +1421,19 @@ fn canonical_binding_artifact_owner(root: &Path, incarnation_id: &str) -> io::Re
                 "connection incarnation is not a canonical UUID",
             )
         })?;
-    let canonical_root = canonical_binding_artifact_root(root)?;
-    let owner = canonical_root.join(incarnation.to_string());
-    fs::create_dir_all(&owner)?;
-    set_private_directory_permissions(&owner)?;
-    let canonical_owner = owner.canonicalize()?;
-    if canonical_owner.parent() != Some(canonical_root.as_path()) {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "artifact owner escaped the fixed root",
-        ));
-    }
+    let canonical_root = canonical_binding_artifact_root(temp_base)?;
+    let canonical_owner =
+        canonical_direct_child_directory(&canonical_root, &incarnation.to_string())?;
+    set_private_directory_permissions(&canonical_owner)?;
     Ok(canonical_owner)
 }
 
 fn sweep_stale_binding_artifacts_at(
-    root: &Path,
+    temp_base: &Path,
     now: SystemTime,
     metrics: &DelegationMetrics,
 ) -> io::Result<()> {
-    let canonical_root = canonical_binding_artifact_root(root)?;
+    let canonical_root = canonical_binding_artifact_root(temp_base)?;
     for owner in fs::read_dir(&canonical_root)? {
         let owner = owner?;
         if !owner.file_type()?.is_dir() {
@@ -1435,7 +1511,7 @@ fn artifact_storage_metric_outcome(error: OrchestrationBindingQueryError) -> Art
 }
 
 fn store_binding_artifact_at(
-    root: &Path,
+    temp_base: &Path,
     incarnation_id: &str,
     pages: Vec<DelegationOrchestrationBindingPage>,
     inflight: &Arc<InflightCalls>,
@@ -1458,7 +1534,7 @@ fn store_binding_artifact_at(
         }
     };
     if sweep_stale_binding_artifacts_at(
-        root,
+        temp_base,
         SystemTime::now(),
         &inflight.binding_artifacts.metrics,
     )
@@ -1470,7 +1546,7 @@ fn store_binding_artifact_at(
             .record_artifact_export(ArtifactExportOutcome::IoFailed);
         return Err(OrchestrationBindingQueryError::ArtifactIoFailed);
     }
-    let owner = canonical_binding_artifact_owner(root, incarnation_id).map_err(|_| {
+    let owner = canonical_binding_artifact_owner(temp_base, incarnation_id).map_err(|_| {
         inflight
             .binding_artifacts
             .metrics
@@ -1533,8 +1609,7 @@ pub(crate) fn store_binding_artifact(
     ),
     OrchestrationBindingQueryError,
 > {
-    let root = std::env::temp_dir().join("codeg-mcp/orchestration-bindings");
-    store_binding_artifact_at(&root, incarnation_id, pages, inflight)
+    store_binding_artifact_at(&std::env::temp_dir(), incarnation_id, pages, inflight)
 }
 
 /// Canonicalize a JSON-RPC `id` to a string suitable as a `HashMap` key.
