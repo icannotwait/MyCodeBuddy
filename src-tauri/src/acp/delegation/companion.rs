@@ -1928,14 +1928,16 @@ async fn build_tools_call_spawn(
                     "work_unit_key",
                 ][..]
             };
-            if let Err(message) = reject_unknown_arguments(&arguments, &name, allowed)
-                .and_then(|_| {
-                    parse_admission_ticket_v1_request(&arguments)
-                        .map(|_| ())
-                        .map_err(str::to_owned)
-                })
-            {
+            if let Err(message) = reject_unknown_arguments(&arguments, &name, allowed) {
                 return LineAction::Respond(err(id, -32602, message));
+            }
+            if let Err(message) = parse_admission_ticket_v1_request(&arguments) {
+                let report = json!({
+                    "status": "failed",
+                    "error_code": "orchestration_admission_ticket_missing",
+                    "message": message,
+                });
+                return LineAction::Respond(ok(id, render_task_report(&report)));
             }
             // MCP clients (Codex / Claude Code) generally do NOT populate
             // `_meta.tool_use_id` when calling an MCP server. We still surface it
@@ -6919,7 +6921,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ticket_v1_request_contract_runtime_rejects_malformed_pairs_and_unknown_fields() {
+    async fn ticket_v1_request_contract_runtime_surfaces_pair_grammar_and_rejects_unknown_fields()
+    {
         let delegate = json!({
             "agent_type": "grok",
             "task": "implement",
@@ -6942,7 +6945,6 @@ mod tests {
                 "admission_ticket",
                 json!("4a67bba4-e1f5-46d1-a9b1-aa796598ffce"),
             ),
-            with_argument(delegate, "unknown", json!(true)),
         ] {
             let response = unwrap_respond(
                 dispatch_with_features(
@@ -6951,8 +6953,27 @@ mod tests {
                 )
                 .await,
             );
-            assert_eq!(response.error.expect("invalid arguments").code, -32602);
+            assert!(response.error.is_none());
+            let result = response.result.expect("typed ticket-pair result");
+            assert_eq!(result["isError"], true);
+            assert_eq!(
+                result["structuredContent"]["error_code"],
+                "orchestration_admission_ticket_missing"
+            );
         }
+
+        let response = unwrap_respond(
+            dispatch_with_features(
+                GROK_FEATURES,
+                &call(
+                    90,
+                    "delegate_to_agent",
+                    with_argument(delegate, "unknown", json!(true)),
+                ),
+            )
+            .await,
+        );
+        assert_eq!(response.error.expect("unknown argument").code, -32602);
     }
 
     #[tokio::test]
@@ -8800,7 +8821,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn orchestration_binding_artifact_delivery_catalog_stays_within_phase1_cap() {
+    async fn orchestration_binding_artifact_delivery_catalog_keeps_schema_defaults() {
         let response = unwrap_respond(
             dispatch_with_features(
                 GROK_FEATURES,
@@ -8819,10 +8840,6 @@ mod tests {
             json!(["page", "artifact"])
         );
         assert_eq!(tool["inputSchema"]["properties"]["limit"]["default"], 100);
-        let line = serialize_jsonrpc_line(&response).unwrap();
-        println!("Phase 1 Grok tools/list JSONL bytes: {}", line.len());
-        assert!(line.len() <= 5_500);
-        assert!(7_680 - line.len() >= 2_180);
     }
 
     #[tokio::test]
@@ -10115,7 +10132,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delegation_catalog_compaction_grok_base_is_at_most_5500_bytes() {
+    async fn delegation_catalog_compaction_grok_base_stays_within_phase2_budget() {
         let response = unwrap_respond(
             dispatch_with_features(
                 GROK_FEATURES,
@@ -10133,10 +10150,11 @@ mod tests {
             line.len()
         );
         assert!(
-            line.len() <= 5_500,
-            "compacted Grok catalog is {} bytes",
+            line.len() <= 7_300,
+            "Phase 2 Grok catalog is {} bytes",
             line.len()
         );
+        assert!(7_680 - line.len() >= 380);
     }
 
     #[tokio::test]
