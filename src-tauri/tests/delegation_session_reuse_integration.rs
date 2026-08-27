@@ -331,9 +331,8 @@ async fn list_run_rows(
 
 const TICKET_V1_TEST_INTENT_ID: &str = "8f95dd45-9eca-42a8-9909-0ac00be8ad52";
 
-async fn issue_delegate_ticket(runs: &RunStore, req: &mut DelegationRequest) {
-    req.dispatch_intent_id = Some(TICKET_V1_TEST_INTENT_ID.into());
-    let request_fingerprint = ticket_v1_request_fingerprint(&TicketV1PendingCall {
+fn delegate_ticket_v1_pending_call(req: &DelegationRequest) -> TicketV1PendingCall {
+    TicketV1PendingCall {
         schema_version: 1,
         tool_name: DELEGATE_TO_AGENT_TOOL.into(),
         task: req.task.clone(),
@@ -346,7 +345,12 @@ async fn issue_delegate_ticket(runs: &RunStore, req: &mut DelegationRequest) {
         profile_id: req.profile_id.clone(),
         orchestration_binding: req.orchestration_binding.clone(),
         dispatch_intent_id: TICKET_V1_TEST_INTENT_ID.into(),
-    });
+    }
+}
+
+async fn issue_delegate_ticket(runs: &RunStore, req: &mut DelegationRequest) {
+    req.dispatch_intent_id = Some(TICKET_V1_TEST_INTENT_ID.into());
+    let request_fingerprint = ticket_v1_request_fingerprint(&delegate_ticket_v1_pending_call(req));
     let envelope = runs
         .prepare_orchestration_binding_admission(
             req.parent_conversation_id,
@@ -385,6 +389,201 @@ async fn issue_delegate_ticket(runs: &RunStore, req: &mut DelegationRequest) {
         panic!("new dispatch intent must issue a ticket");
     };
     req.admission_ticket = Some(ticket);
+}
+
+async fn seed_ticket_v1_dispatch_race(
+    db: &Arc<AppDatabase>,
+    req: &DelegationRequest,
+    request_fingerprint: String,
+    profile_id: Option<&str>,
+) -> (String, i32) {
+    let task_id = "ticket-v1-durable-race-winner".to_string();
+    let child = conversation_service::create_with_delegation(
+        &db.conn,
+        seed_folder(db, "/tmp/codeg-ticket-v1-durable-race-child").await,
+        req.agent_type,
+        Some("ticket-v1 durable race child".into()),
+        None,
+        Some(codeg_lib::acp::delegation::spawner::DelegationLink {
+            parent_conversation_id: req.parent_conversation_id,
+            parent_tool_use_id: req.parent_tool_use_id.clone(),
+            delegation_call_id: task_id.clone(),
+        }),
+    )
+    .await
+    .expect("durable race child");
+    let race_store = RunStore::new(db.clone());
+    race_store
+        .insert_reserving(ReservingRunInsert {
+            dispatch_intent_id: req.dispatch_intent_id.clone(),
+            orchestration_binding: req.orchestration_binding.clone(),
+            task_id: task_id.clone(),
+            root_task_id: task_id.clone(),
+            previous_task_id: None,
+            generation: 1,
+            parent_conversation_id: req.parent_conversation_id,
+            parent_tool_use_id: Some(req.parent_tool_use_id.clone()),
+            child_conversation_id: child.id,
+            agent_type: req.agent_type.as_wire().into(),
+            profile_id: profile_id.map(str::to_string),
+            workspace_path: Some(test_working_dir()),
+            route_fingerprint: Some("ticket-v1-route".into()),
+            launch_snapshot_version: Some("ticket-v1-launch".into()),
+            mode_id: None,
+            config_values_json: Some("{}".into()),
+            task_preview: Some(derive_task_preview(&req.task)),
+            request_fingerprint: Some(request_fingerprint),
+            admission_class: AdmissionClass::NormalRevision,
+            lineage_root_task_id: task_id.clone(),
+            work_unit_key: req.work_unit_key.clone(),
+            history_only: false,
+            replaced_task_id: None,
+            replacement_reason: None,
+            started_at: Some(Utc::now()),
+        })
+        .await
+        .expect("persist durable dispatch race winner");
+    (task_id, child.id)
+}
+
+#[tokio::test]
+async fn ticket_v1_atomic_admission_exact_replay_uses_v3_before_resolved_profile() {
+    let db = Arc::new(fresh_in_memory_db().await);
+    let folder = seed_folder(&db, "/tmp/codeg-ticket-v1-exact-replay").await;
+    let parent = conversation_service::create(
+        &db.conn,
+        folder,
+        AgentType::ClaudeCode,
+        Some("ticket-v1 exact replay parent".into()),
+        None,
+    )
+    .await
+    .expect("parent");
+    let runs = Arc::new(RunStore::new(db.clone()));
+    let mock = Arc::new(MockSpawner::new());
+    let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+    let mut request = delegate_req(
+        parent.id,
+        "ticket-v1-exact-replay",
+        AgentType::Codex,
+        "retry the exact dispatch",
+        &test_working_dir(),
+        Some("task|10|implementer|codex|none"),
+    );
+    request.requested_working_dir = Some(test_working_dir());
+    issue_delegate_ticket(&runs, &mut request).await;
+    let request_fingerprint =
+        ticket_v1_request_fingerprint(&delegate_ticket_v1_pending_call(&request));
+    let (task_id, child_id) = seed_ticket_v1_dispatch_race(
+        &db,
+        &request,
+        request_fingerprint,
+        Some("autofilled-profile"),
+    )
+    .await;
+
+    let replay = broker.start_delegation(request).await;
+    assert_eq!(
+        replay.task_id.as_deref(),
+        Some(task_id.as_str()),
+        "{replay:?}"
+    );
+    assert_eq!(replay.child_conversation_id, Some(child_id));
+    assert!(replay.is_idempotent_replay(), "{replay:?}");
+    assert_eq!(list_run_rows(&db, parent.id).await.len(), 1);
+    assert_eq!(
+        conversation::Entity::find()
+            .filter(conversation::Column::ParentId.eq(parent.id))
+            .all(&db.conn)
+            .await
+            .expect("list children")
+            .len(),
+        1
+    );
+    assert!(mock.spawn_args.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn ticket_v1_atomic_admission_semantic_changes_conflict_after_consume() {
+    let cases: [(&str, fn(&mut DelegationRequest)); 5] = [
+        ("task", |request| request.task = "changed task".into()),
+        ("cwd", |request| {
+            request.requested_working_dir = Some("D:/changed-ticket-cwd".into())
+        }),
+        ("profile", |request| {
+            request.profile_id = Some("changed-profile".into())
+        }),
+        ("binding", |request| {
+            request.orchestration_binding = Some(skill_task_binding())
+        }),
+        ("work-unit", |request| {
+            request.work_unit_key = Some("task|11|implementer|codex|none".into())
+        }),
+    ];
+
+    for (case, mutate) in cases {
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, &format!("/tmp/codeg-ticket-v1-conflict-{case}")).await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some(format!("ticket-v1 conflict {case} parent")),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+        let mut request = delegate_req(
+            parent.id,
+            &format!("ticket-v1-conflict-{case}"),
+            AgentType::Codex,
+            "original task",
+            &test_working_dir(),
+            Some("task|10|implementer|codex|none"),
+        );
+        request.requested_working_dir = Some(test_working_dir());
+        request.dispatch_intent_id = Some(TICKET_V1_TEST_INTENT_ID.into());
+        let durable_fingerprint =
+            ticket_v1_request_fingerprint(&delegate_ticket_v1_pending_call(&request));
+        mutate(&mut request);
+        issue_delegate_ticket(&runs, &mut request).await;
+        seed_ticket_v1_dispatch_race(
+            &db,
+            &request,
+            durable_fingerprint,
+            request.profile_id.as_deref(),
+        )
+        .await;
+
+        let conflict = broker.start_delegation(request.clone()).await;
+        assert_eq!(
+            conflict.error_code.as_deref(),
+            Some("delegation_dispatch_intent_conflict"),
+            "{case}: {conflict:?}"
+        );
+        assert_eq!(list_run_rows(&db, parent.id).await.len(), 1, "{case}");
+        assert_eq!(
+            conversation::Entity::find()
+                .filter(conversation::Column::ParentId.eq(parent.id))
+                .all(&db.conn)
+                .await
+                .expect("list children")
+                .len(),
+            1,
+            "{case}"
+        );
+        assert!(mock.spawn_args.lock().await.is_empty(), "{case}");
+
+        let consumed = broker.start_delegation(request).await;
+        assert_eq!(
+            consumed.error_code.as_deref(),
+            Some("orchestration_admission_ticket_consumed"),
+            "{case}: {consumed:?}"
+        );
+    }
 }
 
 #[tokio::test]
