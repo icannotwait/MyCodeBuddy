@@ -4,6 +4,7 @@
  */
 
 import { createHash } from "node:crypto"
+import { TextDecoder } from "node:util"
 
 export const MAX_PLAN_DOCUMENT_BYTES = 2 * 1024 * 1024
 export const MAX_PROGRESS_DOCUMENT_BYTES = 512 * 1024
@@ -58,6 +59,7 @@ const DISPATCH_INTENT_KEYS = [
   "replacement_reason",
   "replacement_target_task_id",
 ]
+const TICKET_V1_DISPATCH_INTENT_KEYS = [...DISPATCH_INTENT_KEYS, "intent_id"].sort()
 const PENDING_ROUTE_CHANGE_KEYS = [
   "affected_task_indices",
   "effective_from_task_index",
@@ -69,6 +71,21 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 const CURSOR_RE = /^[A-Za-z0-9_-]{1,128}$/
 const UTC_INSTANT_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/
 const MAX_U64 = 18446744073709551615n
+const SHA256_RE = /^sha256:[0-9a-f]{64}$/
+const TICKET_V1_PENDING_CALL_KEYS = [
+  "agent_type",
+  "dispatch_intent_id",
+  "orchestration_binding",
+  "profile_id",
+  "replacement_reason",
+  "replaces_task_id",
+  "schema_version",
+  "target_task_id",
+  "task",
+  "tool_name",
+  "work_unit_key",
+  "working_dir",
+]
 
 const MAX_I32 = 0x7fffffff
 const MAX_U32 = 0xffffffff
@@ -5699,6 +5716,54 @@ export function validateSkillMarkdown(skillMarkdown) {
       "Skill prose contradicts required v2 ownership or routing"
     )
   }
+  const compactProse = prose.replace(/\s+/g, " ")
+  const artifactFirstDirectives = [
+    /inspect the live binding-query schema/i,
+    /advertises artifact delivery, request `delivery: "artifact"` once/i,
+    /`artifact_path` directly to `--durable-evidence` and `artifact_sha256` directly to `--durable-evidence-sha256`/i,
+    /never open, read, print, copy, summarize, embed, or delegate inspection of the artifact/i,
+    /artifact request, descriptor, digest, stale, validator, and cleanup errors as blocking and never fall back to pages/i,
+    /legacy page pagination only when the live schema does not advertise artifact delivery/i,
+  ]
+  if (!artifactFirstDirectives.every((directive) => directive.test(compactProse))) {
+    fail(
+      failures,
+      "B2D-SKILL-006",
+      "Skill must use advertised binding artifacts directly and fail closed"
+    )
+  }
+  const ticketV1Directives = [
+    /write a canonical lowercase uuid `intent_id` to progress before constructing the pending call/i,
+    /`validate-contract\.mjs --ticket-v1-fingerprint --output-json` with the exact pending call on bounded stdin/i,
+    /copy only `request_fingerprint` and `normalized_working_dir`/i,
+    /artifact with the exact `admission_intent`/i,
+    /validate its returned path and digest through the validator/i,
+    /same intent id, returned admission ticket, same pending-call values, and a fresh physical correlation id/i,
+    /unknown acknowledgement retain the intent, pending call, and digest/i,
+    /`already_admitted` only through the validator's one adoption action/i,
+    /stale, consumed, or authorization failure discards the artifact and ticket and requires a fresh artifact, validation, and ticket/i,
+    /never expose artifact paths or admission tickets in cards or prose/i,
+  ]
+  const ticketV1DirectivePositions = ticketV1Directives.map((directive) =>
+    compactProse.search(directive)
+  )
+  const ticketV1DirectivesOrdered = ticketV1DirectivePositions.every(
+    (position, index) =>
+      position >= 0 &&
+      (index === 0 || position > ticketV1DirectivePositions[index - 1])
+  )
+  const ticketV1CompleteSnapshot =
+    /when ticket-v1 is advertised, the complete-snapshot procedure follows section 5's write-ahead uuid and bounded fingerprint steps through the exact `admission_intent` artifact request/i
+  if (
+    !ticketV1DirectivesOrdered ||
+    !ticketV1CompleteSnapshot.test(compactProse)
+  ) {
+    fail(
+      failures,
+      "B2D-SKILL-007",
+      "Skill must preserve ticket-v1 admission order and lost-ACK recovery"
+    )
+  }
 
   return { failures, notes }
 }
@@ -6160,6 +6225,120 @@ export function validateOrchestrationBinding(value) {
   return parseOrchestrationBinding(value).valid
 }
 
+/** Validate and hash the exact ticket-v1 pending-call wire object. */
+export function deriveTicketV1RequestFingerprint(pendingCall) {
+  if (
+    !isObject(pendingCall) ||
+    Object.keys(pendingCall).sort().join(",") !==
+      TICKET_V1_PENDING_CALL_KEYS.join(",")
+  ) {
+    throw new TypeError("pending call fields are not exact")
+  }
+  if (pendingCall.schema_version !== 1) {
+    throw new TypeError("pending call schema_version must be 1")
+  }
+  if (
+    !["delegate_to_agent", "continue_delegation"].includes(
+      pendingCall.tool_name
+    ) ||
+    !nonEmptyString(pendingCall.task) ||
+    !validAgentSelection({
+      agent_type: pendingCall.agent_type,
+      profile_id: pendingCall.profile_id,
+    }) ||
+    typeof pendingCall.dispatch_intent_id !== "string" ||
+    !UUID_RE.test(pendingCall.dispatch_intent_id)
+  ) {
+    throw new TypeError("pending call identity is invalid")
+  }
+  for (const field of [
+    "working_dir",
+    "work_unit_key",
+    "replaces_task_id",
+    "replacement_reason",
+    "target_task_id",
+  ]) {
+    const value = pendingCall[field]
+    if (value !== null && typeof value !== "string") {
+      throw new TypeError(`pending call ${field} must be a string or null`)
+    }
+  }
+  if (
+    pendingCall.work_unit_key !== null &&
+    (!nonEmptyString(pendingCall.work_unit_key) ||
+      [...pendingCall.work_unit_key].length > 200 ||
+      hasControl(pendingCall.work_unit_key))
+  ) {
+    throw new TypeError("pending call work_unit_key is invalid")
+  }
+  for (const field of ["replaces_task_id", "target_task_id"]) {
+    if (pendingCall[field] !== null && !nonEmptyString(pendingCall[field])) {
+      throw new TypeError(`pending call ${field} is invalid`)
+    }
+  }
+  const isFirst =
+    pendingCall.tool_name === "delegate_to_agent" &&
+    pendingCall.replaces_task_id === null &&
+    pendingCall.replacement_reason === null &&
+    pendingCall.target_task_id === null
+  const isContinue =
+    pendingCall.tool_name === "continue_delegation" &&
+    pendingCall.working_dir === null &&
+    pendingCall.replaces_task_id === null &&
+    pendingCall.replacement_reason === null &&
+    pendingCall.target_task_id !== null
+  const isReplacement =
+    pendingCall.tool_name === "delegate_to_agent" &&
+    pendingCall.replaces_task_id !== null &&
+    REPLACEMENT_REASONS.has(pendingCall.replacement_reason) &&
+    pendingCall.target_task_id === null
+  if (!isFirst && !isContinue && !isReplacement) {
+    throw new TypeError("pending call operation fields are invalid")
+  }
+
+  let binding = null
+  if (pendingCall.orchestration_binding !== null) {
+    const parsed = parseOrchestrationBinding(pendingCall.orchestration_binding)
+    if (!parsed.valid) {
+      throw new TypeError("pending call orchestration_binding is invalid")
+    }
+    binding = parsed.binding
+  }
+  for (const [field, value] of Object.entries(pendingCall)) {
+    if (typeof value === "string") assertRouteInputIsIJson(value, `$.${field}`)
+  }
+
+  const normalizedWorkingDir =
+    pendingCall.working_dir === null
+      ? ""
+      : pendingCall.working_dir.normalize("NFC").trim()
+  const fields = [
+    "delegation-request-v3",
+    pendingCall.tool_name,
+    pendingCall.task.normalize("NFC"),
+    normalizedWorkingDir,
+    pendingCall.work_unit_key ?? "",
+    pendingCall.replaces_task_id ?? "",
+    pendingCall.replacement_reason ?? "",
+    pendingCall.target_task_id ?? "",
+    pendingCall.agent_type,
+    pendingCall.profile_id ?? "",
+    pendingCall.dispatch_intent_id,
+    binding === null ? "" : String(binding.schema_version),
+    binding?.namespace ?? "",
+    binding === null ? "" : String(binding.generation),
+    binding?.route_fingerprint ?? "",
+  ]
+  const requestFingerprint = createHash("sha256")
+    .update(Buffer.from(JSON.stringify(fields), "utf8"))
+    .digest("hex")
+  return {
+    schema_version: 1,
+    request_fingerprint: requestFingerprint,
+    normalized_working_dir: normalizedWorkingDir,
+  }
+}
+
 /** Validate routing semantics and return normalized generations and Tasks. */
 export function validateRoutingSnapshot(snapshot, plan, failures) {
   const normalized = { generations: [], tasks: [] }
@@ -6562,13 +6741,25 @@ function objectKeysExact(value, expected) {
 }
 
 function validateDispatchIntent(intent, label, failures) {
-  if (!objectKeysExact(intent, DISPATCH_INTENT_KEYS)) {
+  const legacyShape = objectKeysExact(intent, DISPATCH_INTENT_KEYS)
+  const ticketV1Shape = objectKeysExact(intent, TICKET_V1_DISPATCH_INTENT_KEYS)
+  if (!legacyShape && !ticketV1Shape) {
     fail(
       failures,
       "B2D-PROGRESS-006",
       `${label} dispatch_intent fields are not exact`
     )
     return
+  }
+  if (
+    ticketV1Shape &&
+    (typeof intent.intent_id !== "string" || !UUID_RE.test(intent.intent_id))
+  ) {
+    fail(
+      failures,
+      "B2D-PROGRESS-006",
+      `${label} dispatch_intent.intent_id must be a canonical lowercase UUID`
+    )
   }
   if (!["first", "continue", "replacement"].includes(intent.kind)) {
     fail(
@@ -7509,8 +7700,50 @@ export function parseDurableBindingEvidence(source, options = {}) {
   const failures = []
   const now = options.now instanceof Date ? options.now.getTime() : Date.now()
   let value = source
-  if (typeof source === "string") {
-    if (byteLength(source) > MAX_DURABLE_EVIDENCE_BYTES) {
+  if (Buffer.isBuffer(source)) {
+    if (source.length > MAX_DURABLE_EVIDENCE_BYTES) {
+      fail(
+        failures,
+        "B2D-DURABLE-001",
+        "durable evidence exceeds the 4 MiB limit"
+      )
+      return { pages: [], runs: [], snapshot: null, failures }
+    }
+    if (options.sha256 !== undefined && options.sha256 !== null) {
+      if (typeof options.sha256 !== "string" || !SHA256_RE.test(options.sha256)) {
+        fail(
+          failures,
+          "B2D-DURABLE-010",
+          "durable evidence SHA-256 is malformed"
+        )
+        return { pages: [], runs: [], snapshot: null, failures }
+      }
+      const actual = `sha256:${createHash("sha256").update(source).digest("hex")}`
+      if (actual !== options.sha256) {
+        fail(
+          failures,
+          "B2D-DURABLE-010",
+          "durable evidence SHA-256 does not match the artifact bytes"
+        )
+        return { pages: [], runs: [], snapshot: null, failures }
+      }
+    }
+    try {
+      value = new TextDecoder("utf-8", { fatal: true }).decode(source)
+    } catch (error) {
+      if (error instanceof TypeError) {
+        fail(
+          failures,
+          "B2D-DURABLE-001",
+          "durable evidence is not valid UTF-8"
+        )
+        return { pages: [], runs: [], snapshot: null, failures }
+      }
+      throw error
+    }
+  }
+  if (typeof value === "string") {
+    if (byteLength(value) > MAX_DURABLE_EVIDENCE_BYTES) {
       fail(
         failures,
         "B2D-DURABLE-001",
@@ -7519,7 +7752,7 @@ export function parseDurableBindingEvidence(source, options = {}) {
       return { pages: [], runs: [], snapshot: null, failures }
     }
     try {
-      value = JSON.parse(source)
+      value = JSON.parse(value)
     } catch {
       fail(failures, "B2D-DURABLE-001", "durable evidence is not valid JSON")
       return { pages: [], runs: [], snapshot: null, failures }
@@ -8373,7 +8606,7 @@ function validationEnvelope(failures, taskBindings = [], extras = {}) {
   }
 }
 
-function parseEvidenceOption(raw, now) {
+function parseEvidenceOption(raw, now, sha256) {
   if (raw === undefined || raw === null) {
     return {
       pages: [],
@@ -8382,7 +8615,7 @@ function parseEvidenceOption(raw, now) {
       failures: ["[B2D-CLI-001] durable evidence is required"],
     }
   }
-  return parseDurableBindingEvidence(raw, { now })
+  return parseDurableBindingEvidence(raw, { now, sha256 })
 }
 
 function documentAdmissionBlocks(runs) {
@@ -8431,7 +8664,11 @@ export function runValidation(options = {}) {
         "document admission requires --durable-evidence and --output-json"
       )
     }
-    const evidence = parseEvidenceOption(options.durableEvidence, options.now)
+    const evidence = parseEvidenceOption(
+      options.durableEvidence,
+      options.now,
+      options.durableEvidenceSha256
+    )
     failures.push(...evidence.failures)
     if (failures.length > 0) return validationEnvelope(failures)
     if (documentAdmissionBlocks(evidence.runs)) {
@@ -8528,7 +8765,11 @@ export function runValidation(options = {}) {
       )
     }
     if (admission) {
-      const evidence = parseEvidenceOption(options.durableEvidence, options.now)
+      const evidence = parseEvidenceOption(
+        options.durableEvidence,
+        options.now,
+        options.durableEvidenceSha256
+      )
       failures.push(...evidence.failures)
       if (
         failures.length > 0 ||

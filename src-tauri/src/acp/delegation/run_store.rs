@@ -24,7 +24,8 @@ use unicode_normalization::UnicodeNormalization;
 
 use crate::acp::delegation::launch_snapshot::{snapshot_is_complete, LaunchSnapshot};
 use crate::acp::delegation::orchestration_binding_query::{
-    materialize_binding_rows, OrchestrationBindingSnapshotCache,
+    materialize_binding_rows, validate_admission_intent_source, AdmissionTicketClaims,
+    AdmissionTicketConsumeError, OrchestrationBindingSnapshotCache, OrchestrationMutationGuard,
 };
 use crate::acp::delegation::recovery_policy::{
     decide_delegation_recovery, hash_external_session_identity, RecoveryConfirmation,
@@ -40,9 +41,11 @@ use crate::acp::delegation::store::{
     TerminalCompletionProtocol, TerminalTaskWrite,
 };
 use crate::acp::delegation::types::{
+    is_canonical_uuid, AdmissionIntentKind, AdmissionIntentV1,
     DelegationOrchestrationBindingPage, DelegationRecoveryProjection,
-    OrchestrationBindingQueryError, OrchestrationBindingQueryRequest, OrchestrationBindingV1,
-    TaskStatus, WorkflowRetirementNavigation,
+    OrchestrationBindingFirstPageEnvelope, OrchestrationBindingQueryError,
+    OrchestrationBindingQueryRequest, OrchestrationBindingV1, TaskStatus, TicketV1PendingCall,
+    WorkflowRetirementNavigation,
 };
 use crate::acp::delegation::workflow::admission::{
     ensure_workflow_child_conversation_independent, resolve_and_stamp_terminal_artifact_txn,
@@ -277,6 +280,78 @@ pub fn request_fingerprint(
     hex_lower(&digest)
 }
 
+fn is_ecmascript_trim_code_point(value: char) -> bool {
+    matches!(
+        value,
+        '\u{0009}'
+            | '\u{000a}'
+            | '\u{000b}'
+            | '\u{000c}'
+            | '\u{000d}'
+            | '\u{0020}'
+            | '\u{00a0}'
+            | '\u{1680}'
+            | '\u{2000}'..='\u{200a}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{202f}'
+            | '\u{205f}'
+            | '\u{3000}'
+            | '\u{feff}'
+    )
+}
+
+fn normalize_ticket_v1_working_dir(value: Option<&str>) -> String {
+    let normalized = nfc(value.unwrap_or(""));
+    let start = normalized
+        .char_indices()
+        .find(|(_, value)| !is_ecmascript_trim_code_point(*value))
+        .map_or(normalized.len(), |(index, _)| index);
+    let end = normalized
+        .char_indices()
+        .rev()
+        .find(|(_, value)| !is_ecmascript_trim_code_point(*value))
+        .map_or(start, |(index, value)| index + value.len_utf8());
+    normalized[start..end].to_owned()
+}
+
+fn ticket_v1_request_fingerprint_fields(pending_call: &TicketV1PendingCall) -> Vec<String> {
+    let binding = pending_call.orchestration_binding.as_ref();
+    vec![
+        "delegation-request-v3".to_owned(),
+        pending_call.tool_name.clone(),
+        nfc(&pending_call.task),
+        normalize_ticket_v1_working_dir(pending_call.working_dir.as_deref()),
+        pending_call.work_unit_key.clone().unwrap_or_default(),
+        pending_call.replaces_task_id.clone().unwrap_or_default(),
+        pending_call.replacement_reason.clone().unwrap_or_default(),
+        pending_call.target_task_id.clone().unwrap_or_default(),
+        pending_call.agent_type.clone(),
+        pending_call.profile_id.clone().unwrap_or_default(),
+        pending_call.dispatch_intent_id.clone(),
+        binding
+            .map(|binding| binding.schema_version.to_string())
+            .unwrap_or_default(),
+        binding
+            .map(|binding| binding.namespace.clone())
+            .unwrap_or_default(),
+        binding
+            .map(|binding| binding.generation.to_string())
+            .unwrap_or_default(),
+        binding
+            .map(|binding| binding.route_fingerprint.clone())
+            .unwrap_or_default(),
+    ]
+}
+
+/// Lowercase SHA-256 of the ticket-v1 `delegation-request-v3` string array.
+pub fn ticket_v1_request_fingerprint(pending_call: &TicketV1PendingCall) -> String {
+    let fields = ticket_v1_request_fingerprint_fields(pending_call);
+    let canonical = serde_json::to_string(&fields)
+        .expect("ticket_v1_request_fingerprint fields are plain strings");
+    hex_lower(&Sha256::digest(canonical.as_bytes()))
+}
+
 /// Inputs for inserting a run in `reserving` status (durable claim before spawn/resume).
 #[derive(Debug, Clone)]
 pub struct ReservingRunInsert {
@@ -297,6 +372,7 @@ pub struct ReservingRunInsert {
     pub config_values_json: Option<String>,
     pub task_preview: Option<String>,
     pub request_fingerprint: Option<String>,
+    pub dispatch_intent_id: Option<String>,
     pub admission_class: AdmissionClass,
     pub lineage_root_task_id: String,
     pub work_unit_key: Option<String>,
@@ -357,6 +433,7 @@ pub struct PersistedRun {
     pub reached_running_at: Option<DateTime<Utc>>,
     pub child_connection_id: Option<String>,
     pub request_fingerprint: Option<String>,
+    pub dispatch_intent_id: Option<String>,
     pub task_preview: Option<String>,
     pub admission_class: AdmissionClass,
     pub lineage_root_task_id: String,
@@ -374,6 +451,53 @@ pub struct PersistedRun {
     pub replaced_task_id: Option<String>,
     pub replacement_reason: Option<String>,
     pub recovery_authorization_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatchIntentReplayProjection {
+    pub request_fingerprint: String,
+    pub previous_task_id: Option<String>,
+    pub work_unit_key: Option<String>,
+    pub agent_type: AgentType,
+    pub profile_id: Option<String>,
+    pub orchestration_binding: Option<OrchestrationBindingV1>,
+    pub replaced_task_id: Option<String>,
+    pub replacement_reason: Option<String>,
+}
+
+impl From<&ReservingRunInsert> for DispatchIntentReplayProjection {
+    fn from(insert: &ReservingRunInsert) -> Self {
+        Self {
+            request_fingerprint: insert.request_fingerprint.clone().unwrap_or_default(),
+            previous_task_id: insert.previous_task_id.clone(),
+            work_unit_key: insert.work_unit_key.clone(),
+            agent_type: parse_agent_type(&insert.agent_type),
+            profile_id: insert.profile_id.clone(),
+            orchestration_binding: insert.orchestration_binding.clone(),
+            replaced_task_id: insert.replaced_task_id.clone(),
+            replacement_reason: insert.replacement_reason.clone(),
+        }
+    }
+}
+
+fn admission_intent_replay_projection(
+    intent: &AdmissionIntentV1,
+) -> DispatchIntentReplayProjection {
+    DispatchIntentReplayProjection {
+        request_fingerprint: intent.request_fingerprint.clone(),
+        previous_task_id: (intent.kind == AdmissionIntentKind::Continue)
+            .then(|| intent.target_task_id.clone())
+            .flatten(),
+        work_unit_key: Some(intent.work_unit_key.clone()),
+        agent_type: AgentType::from_untrusted_wire(&intent.agent_type)
+            .expect("validated admission intent has a canonical agent type"),
+        profile_id: intent.profile_id.clone(),
+        orchestration_binding: intent.orchestration_binding.clone(),
+        replaced_task_id: (intent.kind == AdmissionIntentKind::Replacement)
+            .then(|| intent.target_task_id.clone())
+            .flatten(),
+        replacement_reason: intent.replacement_reason.clone(),
+    }
 }
 
 /// Retry metadata on every promote outcome (success or failure). Counts every
@@ -648,6 +772,7 @@ pub enum ContinueDecision {
 #[derive(Debug, Clone)]
 pub struct ContinueRunAdmission {
     pub task_id: String,
+    pub dispatch_intent_id: Option<String>,
     pub parent_conversation_id: i32,
     pub parent_tool_use_id: String,
     pub target_task_id: String,
@@ -980,6 +1105,29 @@ async fn child_is_superseded_conn<C: ConnectionTrait>(
 }
 
 impl PersistedRun {
+    pub fn ensure_dispatch_intent_replay(
+        &self,
+        candidate: &DispatchIntentReplayProjection,
+    ) -> Result<(), TaskStoreError> {
+        let exact = self.request_fingerprint.as_deref()
+            == Some(candidate.request_fingerprint.as_str())
+            && self.previous_task_id == candidate.previous_task_id
+            && (candidate.work_unit_key.is_none() || self.work_unit_key == candidate.work_unit_key)
+            && self.agent_type == candidate.agent_type
+            && (candidate.profile_id.is_none() || self.profile_id == candidate.profile_id)
+            && (candidate.orchestration_binding.is_none()
+                || self.orchestration_binding == candidate.orchestration_binding)
+            && self.replaced_task_id == candidate.replaced_task_id
+            && self.replacement_reason == candidate.replacement_reason;
+        if exact {
+            Ok(())
+        } else {
+            Err(TaskStoreError::DispatchIntentConflict(
+                "persisted dispatch intent has different request semantics".into(),
+            ))
+        }
+    }
+
     pub fn to_persisted_task(&self) -> PersistedTask {
         PersistedTask {
             task_id: self.task_id.clone(),
@@ -1092,6 +1240,9 @@ fn map_gen1_insert_err(err: sea_orm::DbErr) -> TaskStoreError {
         return TaskStoreError::Permanent(msg);
     }
     let lower = msg.to_ascii_lowercase();
+    if lower.contains("dispatch_intent_id") || lower.contains("idx_dtr_parent_dispatch_intent") {
+        return TaskStoreError::DispatchIntentConflict(msg);
+    }
     if lower.contains("parent_tool_use") || lower.contains("idx_dtr_parent_tool_use") {
         return TaskStoreError::DuplicateParentTool(msg);
     }
@@ -1281,6 +1432,7 @@ fn model_to_persisted_run(row: delegation_task_run::Model) -> Option<PersistedRu
         reached_running_at: row.reached_running_at,
         child_connection_id: row.child_connection_id,
         request_fingerprint: row.request_fingerprint,
+        dispatch_intent_id: row.dispatch_intent_id,
         task_preview: row.task_preview,
         admission_class: row.admission_class,
         lineage_root_task_id: row.lineage_root_task_id,
@@ -1309,6 +1461,15 @@ async fn insert_reserving_txn(
     insert: &ReservingRunInsert,
     recovery_authorization_id: Option<&str>,
 ) -> Result<(), TaskStoreError> {
+    if insert
+        .dispatch_intent_id
+        .as_deref()
+        .is_some_and(|intent_id| !is_canonical_uuid(intent_id))
+    {
+        return Err(TaskStoreError::Permanent(
+            "dispatch_intent_id must be a canonical lowercase UUID".into(),
+        ));
+    }
     if insert.generation > MAX_GENERATION {
         return Err(TaskStoreError::BudgetExhausted(format!(
             "generation {} exceeds hard ceiling {}",
@@ -1373,6 +1534,7 @@ async fn insert_reserving_txn(
         config_values_json: Set(insert.config_values_json.clone()),
         task_preview: Set(insert.task_preview.clone()),
         request_fingerprint: Set(insert.request_fingerprint.clone()),
+        dispatch_intent_id: Set(insert.dispatch_intent_id.clone()),
         admission_class: Set(insert.admission_class.clone()),
         reached_running_at: Set(None),
         lineage_root_task_id: Set(insert.lineage_root_task_id.clone()),
@@ -2189,6 +2351,50 @@ impl RunStore {
         &self.db
     }
 
+    pub(crate) async fn orchestration_mutation_guard(&self) -> OrchestrationMutationGuard<'_> {
+        self.orchestration_binding_snapshots.mutation_guard().await
+    }
+
+    pub(crate) async fn consume_admission_ticket_under_guard(
+        &self,
+        guard: &OrchestrationMutationGuard<'_>,
+        ticket_id: &str,
+        parent_id: i32,
+        connection_incarnation: &str,
+        namespace: &str,
+        intent: &AdmissionIntentV1,
+    ) -> Result<AdmissionTicketClaims, AdmissionTicketConsumeError> {
+        self.orchestration_binding_snapshots
+            .consume_admission_ticket_under_guard(
+                guard,
+                ticket_id,
+                parent_id,
+                connection_incarnation,
+                namespace,
+                intent,
+                Utc::now(),
+            )
+            .await
+    }
+
+    pub(crate) async fn load_dispatch_intent_under_guard(
+        &self,
+        guard: &OrchestrationMutationGuard<'_>,
+        parent_id: i32,
+        dispatch_intent_id: &str,
+        projection: &DispatchIntentReplayProjection,
+    ) -> Result<Option<PersistedRun>, TaskStoreError> {
+        self.orchestration_binding_snapshots
+            .assert_guard_owner(guard);
+        let existing = self
+            .load_by_dispatch_intent(parent_id, dispatch_intent_id)
+            .await?;
+        if let Some(existing) = existing.as_ref() {
+            existing.ensure_dispatch_intent_replay(projection)?;
+        }
+        Ok(existing)
+    }
+
     pub async fn get_orchestration_binding_page(
         &self,
         parent_id: i32,
@@ -2209,6 +2415,62 @@ impl RunStore {
             .page_with_loader_limit(parent_id, request, page_limit, Utc::now(), || async {
                 materialize_binding_rows(&self.db.conn, parent_id, &namespace).await
             })
+            .await
+    }
+
+    pub async fn prepare_orchestration_binding_admission(
+        &self,
+        parent_id: i32,
+        connection_incarnation: &str,
+        request: OrchestrationBindingQueryRequest,
+        page_limit: Option<u16>,
+        intent: AdmissionIntentV1,
+    ) -> Result<OrchestrationBindingFirstPageEnvelope, OrchestrationBindingQueryError> {
+        intent
+            .validate()
+            .map_err(|_| OrchestrationBindingQueryError::AdmissionIntentInvalid)?;
+        let namespace = request.namespace.clone();
+        let loader_intent = intent.clone();
+        let replay = admission_intent_replay_projection(&intent);
+        self.orchestration_binding_snapshots
+            .first_page_with_admission_loader(
+                parent_id,
+                connection_incarnation,
+                request,
+                page_limit,
+                intent,
+                Utc::now(),
+                || async {
+                    let rows = materialize_binding_rows(&self.db.conn, parent_id, &namespace).await?;
+                    let existing = self
+                        .load_by_dispatch_intent(
+                            parent_id,
+                            &loader_intent.dispatch_intent_id,
+                        )
+                        .await
+                        .map_err(|error| match error {
+                            TaskStoreError::DispatchIntentConflict(_) => {
+                                OrchestrationBindingQueryError::DispatchIntentConflict
+                            }
+                            _ => OrchestrationBindingQueryError::Failed,
+                        })?;
+                    let existing_task_id = if let Some(existing) = existing {
+                        existing
+                            .ensure_dispatch_intent_replay(&replay)
+                            .map_err(|error| match error {
+                                TaskStoreError::DispatchIntentConflict(_) => {
+                                    OrchestrationBindingQueryError::DispatchIntentConflict
+                                }
+                                _ => OrchestrationBindingQueryError::Failed,
+                            })?;
+                        Some(existing.task_id)
+                    } else {
+                        validate_admission_intent_source(&loader_intent, &rows)?;
+                        None
+                    };
+                    Ok((rows, existing_task_id))
+                },
+            )
             .await
     }
 
@@ -2515,7 +2777,7 @@ impl RunStore {
     /// fences → [`TaskStoreError::BusyThread`].
     pub async fn insert_reserving(&self, insert: ReservingRunInsert) -> Result<(), TaskStoreError> {
         let parent_id = insert.parent_conversation_id;
-        let _mutation_guard = self.orchestration_binding_snapshots.mutation_guard().await;
+        let mutation_guard = self.orchestration_binding_snapshots.mutation_guard().await;
         let outcome = self
             .db
             .conn
@@ -2528,7 +2790,7 @@ impl RunStore {
         match outcome {
             Ok(()) => {
                 self.orchestration_binding_snapshots
-                    .record_parent_mutation(parent_id)
+                    .record_parent_mutation(&mutation_guard, parent_id)
                     .await;
                 Ok(())
             }
@@ -2546,6 +2808,20 @@ impl RunStore {
         let row = DelegationTaskRun::find()
             .filter(delegation_task_run::Column::ParentConversationId.eq(parent_conversation_id))
             .filter(delegation_task_run::Column::ParentToolUseId.eq(parent_tool_use_id))
+            .one(&self.db.conn)
+            .await
+            .map_err(map_db_err)?;
+        Ok(row.and_then(model_to_persisted_run))
+    }
+
+    pub async fn load_by_dispatch_intent(
+        &self,
+        parent_conversation_id: i32,
+        dispatch_intent_id: &str,
+    ) -> Result<Option<PersistedRun>, TaskStoreError> {
+        let row = DelegationTaskRun::find()
+            .filter(delegation_task_run::Column::ParentConversationId.eq(parent_conversation_id))
+            .filter(delegation_task_run::Column::DispatchIntentId.eq(dispatch_intent_id))
             .one(&self.db.conn)
             .await
             .map_err(map_db_err)?;
@@ -2585,7 +2861,7 @@ impl RunStore {
         // Prefer a single transaction so run delete + run_binding cleanup +
         // graph_revision bump stay atomic (A10/B5 provisional abandon clock).
         let task_id_owned = task_id.to_string();
-        let _mutation_guard = self.orchestration_binding_snapshots.mutation_guard().await;
+        let mutation_guard = self.orchestration_binding_snapshots.mutation_guard().await;
         let outcome = self
             .db
             .conn
@@ -2661,7 +2937,10 @@ impl RunStore {
                 if reclaimed {
                     self.emit_workflow_effect(&effect);
                     self.orchestration_binding_snapshots
-                        .record_parent_mutation(parent_id.expect("deleted run has parent"))
+                        .record_parent_mutation(
+                            &mutation_guard,
+                            parent_id.expect("deleted run has parent"),
+                        )
                         .await;
                 }
                 Ok(reclaimed)
@@ -2700,8 +2979,20 @@ impl RunStore {
         insert: ReservingRunInsert,
         authorization: RecoveryAdmissionAuthorization,
     ) -> Result<Gen1AdmitOutcome, TaskStoreError> {
+        let mutation_guard = self.orchestration_mutation_guard().await;
+        self.admit_gen1_reserving_authorized_under_guard(&mutation_guard, insert, authorization)
+            .await
+    }
+
+    pub(crate) async fn admit_gen1_reserving_authorized_under_guard(
+        &self,
+        mutation_guard: &OrchestrationMutationGuard<'_>,
+        insert: ReservingRunInsert,
+        authorization: RecoveryAdmissionAuthorization,
+    ) -> Result<Gen1AdmitOutcome, TaskStoreError> {
         let parent_id = insert.parent_conversation_id;
-        let _mutation_guard = self.orchestration_binding_snapshots.mutation_guard().await;
+        self.orchestration_binding_snapshots
+            .assert_guard_owner(mutation_guard);
         // (idempotent_existing, post-commit workflow side effect)
         type Gen1Txn = (
             Option<PersistedRun>,
@@ -2922,7 +3213,7 @@ impl RunStore {
             Ok((None, effect, recovery_decision)) => {
                 self.emit_workflow_effect(&effect);
                 self.orchestration_binding_snapshots
-                    .record_parent_mutation(parent_id)
+                    .record_parent_mutation(mutation_guard, parent_id)
                     .await;
                 let run = self
                     .load_by_task_id(&insert.task_id)
@@ -3007,8 +3298,24 @@ impl RunStore {
         admission: ContinueRunAdmission,
         authorization: RecoveryAdmissionAuthorization,
     ) -> Result<ContinueAdmitOutcome, TaskStoreError> {
+        let mutation_guard = self.orchestration_mutation_guard().await;
+        self.admit_continue_reserving_authorized_under_guard(
+            &mutation_guard,
+            admission,
+            authorization,
+        )
+        .await
+    }
+
+    pub(crate) async fn admit_continue_reserving_authorized_under_guard(
+        &self,
+        mutation_guard: &OrchestrationMutationGuard<'_>,
+        admission: ContinueRunAdmission,
+        authorization: RecoveryAdmissionAuthorization,
+    ) -> Result<ContinueAdmitOutcome, TaskStoreError> {
         let parent_id = admission.parent_conversation_id;
-        let _mutation_guard = self.orchestration_binding_snapshots.mutation_guard().await;
+        self.orchestration_binding_snapshots
+            .assert_guard_owner(mutation_guard);
         #[cfg(any(test, feature = "test-utils"))]
         let mut continue_admission_gate = self.continue_admission_gate.lock().await.take();
 
@@ -3198,6 +3505,7 @@ impl RunStore {
                     }
 
                     let insert = ReservingRunInsert {
+                        dispatch_intent_id: admission.dispatch_intent_id,
                         orchestration_binding: effective_orchestration_binding,
                         task_id: admission.task_id.clone(),
                         root_task_id: target.root_task_id.clone(),
@@ -3272,7 +3580,7 @@ impl RunStore {
             Ok((None, effect, recovery_decision)) => {
                 self.emit_workflow_effect(&effect);
                 self.orchestration_binding_snapshots
-                    .record_parent_mutation(parent_id)
+                    .record_parent_mutation(mutation_guard, parent_id)
                     .await;
                 let run = self
                     .load_by_task_id(&admission.task_id)
@@ -3698,7 +4006,7 @@ impl RunStore {
         #[cfg(not(any(test, feature = "test-utils")))]
         let inject_identity_failure = false;
 
-        let _mutation_guard = self.orchestration_binding_snapshots.mutation_guard().await;
+        let mutation_guard = self.orchestration_binding_snapshots.mutation_guard().await;
         let outcome = self
             .db
             .conn
@@ -3857,7 +4165,7 @@ impl RunStore {
                 self.emit_workflow_effect(&effect);
                 if matches!(&settlement, Some(Settlement::Won(_))) {
                     self.orchestration_binding_snapshots
-                        .record_parent_mutation(parent_id)
+                        .record_parent_mutation(&mutation_guard, parent_id)
                         .await;
                 }
                 Ok(settlement)
@@ -3933,7 +4241,7 @@ impl RunStore {
         child_connection_id: &str,
         prompt_accepted_at: DateTime<Utc>,
     ) -> Result<PromoteRunningOutcome, TaskStoreError> {
-        let _mutation_guard = self.orchestration_binding_snapshots.mutation_guard().await;
+        let mutation_guard = self.orchestration_binding_snapshots.mutation_guard().await;
         let policy = PromoteRetryPolicy::production();
         let mut meta = PromoteAttemptMeta::default();
         let mut last_retry: Option<(PromoteRetryClass, String)> = None;
@@ -3953,7 +4261,7 @@ impl RunStore {
                 Ok(kind) => {
                     if let PromoteRunningKind::Promoted { run } = &kind {
                         self.orchestration_binding_snapshots
-                            .record_parent_mutation(run.parent_conversation_id)
+                            .record_parent_mutation(&mutation_guard, run.parent_conversation_id)
                             .await;
                     }
                     return Ok(PromoteRunningOutcome { kind, meta });
@@ -4509,7 +4817,7 @@ impl RunStore {
         #[cfg(not(any(test, feature = "test-utils")))]
         let inject_terminal_transaction_failure = false;
 
-        let _mutation_guard = self.orchestration_binding_snapshots.mutation_guard().await;
+        let mutation_guard = self.orchestration_binding_snapshots.mutation_guard().await;
         let mutation_parent_id = DelegationTaskRun::find_by_id(task_id)
             .one(&self.db.conn)
             .await
@@ -4847,6 +5155,7 @@ impl RunStore {
                 if matches!(&settlement, Settlement::Won(_)) {
                     self.orchestration_binding_snapshots
                         .record_parent_mutation(
+                            &mutation_guard,
                             mutation_parent_id.expect("settled run had a parent"),
                         )
                         .await;
@@ -5810,9 +6119,50 @@ mod tests {
 
     use super::*;
     use crate::acp::delegation::spawner::DelegationLink;
+    use crate::acp::delegation::types::TicketV1PendingCall;
     use crate::db::service::conversation_service;
     use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
     use crate::models::AgentType;
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct FingerprintFixture {
+        schema_version: u32,
+        cases: Vec<FingerprintFixtureCase>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct FingerprintFixtureCase {
+        name: String,
+        version: u32,
+        pending_call: Option<TicketV1PendingCall>,
+        legacy_input: Option<LegacyFingerprintInput>,
+        expected_array: Vec<String>,
+        expected_digest: String,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct LegacyFingerprintInput {
+        tool_name: String,
+        task: String,
+        work_unit_key: Option<String>,
+        replaces_task_id: Option<String>,
+        replacement_reason: Option<String>,
+        target_task_id: Option<String>,
+        route_fingerprint_hex: String,
+        orchestration_binding: Option<OrchestrationBindingV1>,
+    }
+
+    fn fingerprint_fixture() -> FingerprintFixture {
+        serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/delegation_request_fingerprints.json"
+        )))
+        .expect("valid delegation request fingerprint fixture")
+    }
 
     async fn on_terminal_settle_txn<C: ConnectionTrait>(
         conn: &C,
@@ -5973,6 +6323,266 @@ mod tests {
     // ---- request_fingerprint ------------------------------------------------
 
     #[test]
+    fn ticket_v1_request_fingerprint_matches_shared_fixture() {
+        let fixture = fingerprint_fixture();
+        assert_eq!(fixture.schema_version, 1);
+        let mut count = 0;
+        for case in fixture.cases.iter().filter(|case| case.version == 3) {
+            let pending_call = case.pending_call.as_ref().expect("v3 pending_call");
+            assert!(case.legacy_input.is_none(), "{}", case.name);
+            assert_eq!(
+                ticket_v1_request_fingerprint_fields(pending_call),
+                case.expected_array,
+                "{}",
+                case.name
+            );
+            assert_eq!(
+                ticket_v1_request_fingerprint(pending_call),
+                case.expected_digest,
+                "{}",
+                case.name
+            );
+            count += 1;
+        }
+        assert_eq!(count, 17);
+    }
+
+    #[test]
+    fn dispatch_intent_persistence_unique_index_maps_to_conflict() {
+        use sea_orm::{DbErr, RuntimeErr};
+
+        let error = map_gen1_insert_err(DbErr::Exec(RuntimeErr::Internal(
+            "UNIQUE constraint failed: delegation_task_runs.parent_conversation_id, \
+             delegation_task_runs.dispatch_intent_id"
+                .into(),
+        )));
+
+        assert_eq!(
+            error.wire_code(),
+            Some("delegation_dispatch_intent_conflict")
+        );
+    }
+
+    const TEST_DISPATCH_INTENT_ID: &str = "8f95dd45-9eca-42a8-9909-0ac00be8ad52";
+
+    #[tokio::test]
+    async fn dispatch_intent_persistence_rejects_noncanonical_uuid_before_insert() {
+        let db = Arc::new(fresh_in_memory_db().await);
+        let task_id = "dispatch-intent-invalid";
+        let (parent_id, child_id) = seed_parent_child(&db, task_id).await;
+        let store = RunStore::new(db);
+        let mut insert = sample_insert(task_id, parent_id, child_id, 1, None);
+        insert.dispatch_intent_id = Some(TEST_DISPATCH_INTENT_ID.to_ascii_uppercase());
+
+        let error = store
+            .insert_reserving(insert)
+            .await
+            .expect_err("noncanonical intent must fail before insert");
+        assert!(matches!(error, TaskStoreError::Permanent(ref message)
+            if message == "dispatch_intent_id must be a canonical lowercase UUID"));
+        assert!(store
+            .load_by_task_id(task_id)
+            .await
+            .expect("load rejected task")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn dispatch_intent_persistence_round_trips_and_loads_by_parent_scope() {
+        let db = Arc::new(fresh_in_memory_db().await);
+        let task_id = "dispatch-intent-round-trip";
+        let (parent_id, child_id) = seed_parent_child(&db, task_id).await;
+        let store = RunStore::new(db);
+        let mut insert = sample_insert(task_id, parent_id, child_id, 1, None);
+        insert.dispatch_intent_id = Some(TEST_DISPATCH_INTENT_ID.into());
+
+        store
+            .insert_reserving(insert)
+            .await
+            .expect("persist dispatch intent");
+
+        let loaded = store
+            .load_by_dispatch_intent(parent_id, TEST_DISPATCH_INTENT_ID)
+            .await
+            .expect("load dispatch intent")
+            .expect("dispatch intent row");
+        assert_eq!(loaded.task_id, task_id);
+        assert_eq!(
+            loaded.dispatch_intent_id.as_deref(),
+            Some(TEST_DISPATCH_INTENT_ID)
+        );
+        assert!(store
+            .load_by_dispatch_intent(parent_id + 1, TEST_DISPATCH_INTENT_ID)
+            .await
+            .expect("load wrong parent")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn dispatch_intent_persistence_duplicate_parent_intent_is_conflict() {
+        let db = Arc::new(fresh_in_memory_db().await);
+        let task_id = "dispatch-intent-first";
+        let (parent_id, child_id) = seed_parent_child(&db, task_id).await;
+        let store = RunStore::new(db.clone());
+        let mut first = sample_insert(task_id, parent_id, child_id, 1, None);
+        first.dispatch_intent_id = Some(TEST_DISPATCH_INTENT_ID.into());
+        store
+            .insert_reserving(first)
+            .await
+            .expect("persist first dispatch intent");
+        db.conn
+            .execute_unprepared(
+                "UPDATE delegation_task_runs SET status = 'completed' \
+                 WHERE task_id = 'dispatch-intent-first'",
+            )
+            .await
+            .expect("terminalize first raw fixture");
+
+        let mut duplicate = sample_insert(
+            "dispatch-intent-second",
+            parent_id,
+            child_id,
+            2,
+            Some(task_id),
+        );
+        duplicate.dispatch_intent_id = Some(TEST_DISPATCH_INTENT_ID.into());
+        let error = store
+            .insert_reserving(duplicate)
+            .await
+            .expect_err("same parent intent must conflict");
+        assert!(matches!(error, TaskStoreError::DispatchIntentConflict(_)));
+    }
+
+    #[tokio::test]
+    async fn dispatch_intent_persistence_exact_replay_uses_v3_and_immutable_identity() {
+        let db = Arc::new(fresh_in_memory_db().await);
+        let task_id = "dispatch-intent-replay";
+        let (parent_id, child_id) = seed_parent_child(&db, task_id).await;
+        let store = RunStore::new(db);
+        let mut insert = sample_insert(task_id, parent_id, child_id, 1, None);
+        insert.dispatch_intent_id = Some(TEST_DISPATCH_INTENT_ID.into());
+        insert.request_fingerprint =
+            Some("2a44be9d1662a314cbbd2c8111bcf83159be7bdc93abadff977d01447f986648".into());
+        insert.profile_id = Some("profile-a".into());
+        insert.orchestration_binding = Some(binding_fixture());
+        let exact = DispatchIntentReplayProjection::from(&insert);
+
+        store
+            .insert_reserving(insert)
+            .await
+            .expect("persist dispatch intent replay fixture");
+        let persisted = store
+            .load_by_dispatch_intent(parent_id, TEST_DISPATCH_INTENT_ID)
+            .await
+            .expect("load dispatch intent")
+            .expect("dispatch intent row");
+        persisted
+            .ensure_dispatch_intent_replay(&exact)
+            .expect("exact projected replay");
+
+        let mut omitted_projection = exact.clone();
+        omitted_projection.work_unit_key = None;
+        omitted_projection.profile_id = None;
+        omitted_projection.orchestration_binding = None;
+        persisted
+            .ensure_dispatch_intent_replay(&omitted_projection)
+            .expect("omitted fields accept persisted admission resolution");
+
+        let mut mismatches = Vec::new();
+        let mut candidate = exact.clone();
+        candidate.request_fingerprint = "b".repeat(64);
+        mismatches.push(candidate);
+        let mut candidate = exact.clone();
+        candidate.previous_task_id = Some("continued-task".into());
+        mismatches.push(candidate);
+        let mut candidate = exact.clone();
+        candidate.work_unit_key = Some("other-unit".into());
+        mismatches.push(candidate);
+        let mut candidate = exact.clone();
+        candidate.agent_type = AgentType::ClaudeCode;
+        mismatches.push(candidate);
+        let mut candidate = exact.clone();
+        candidate.profile_id = Some("profile-b".into());
+        mismatches.push(candidate);
+        let mut candidate = exact.clone();
+        let mut changed_binding = binding_fixture();
+        changed_binding.generation = 2;
+        candidate.orchestration_binding = Some(changed_binding);
+        mismatches.push(candidate);
+        let mut candidate = exact.clone();
+        candidate.replaced_task_id = Some("replaced-task".into());
+        mismatches.push(candidate);
+        let mut candidate = exact;
+        candidate.replacement_reason = Some("unresumable".into());
+        mismatches.push(candidate);
+
+        for mismatch in mismatches {
+            assert!(matches!(
+                persisted.ensure_dispatch_intent_replay(&mismatch),
+                Err(TaskStoreError::DispatchIntentConflict(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn ticket_v1_request_fingerprint_matches_ecmascript_whitespace() {
+        assert_eq!(
+            normalize_ticket_v1_working_dir(Some(
+                "\u{0009}\u{00a0}\u{feff}\u{2028}D:/repo\u{2029} \u{000d}"
+            )),
+            "D:/repo"
+        );
+        assert_eq!(
+            normalize_ticket_v1_working_dir(Some("\u{0085}D:/repo\u{0085}")),
+            "\u{0085}D:/repo\u{0085}"
+        );
+        assert_eq!(normalize_ticket_v1_working_dir(None), "");
+
+        let fixture = fingerprint_fixture();
+        let continue_case = fixture
+            .cases
+            .iter()
+            .find(|case| case.name == "ticket_v1_continue_bound_published")
+            .expect("continue fixture");
+        assert_eq!(continue_case.expected_array[3], "");
+        assert_eq!(
+            continue_case
+                .pending_call
+                .as_ref()
+                .expect("continue pending_call")
+                .working_dir,
+            None
+        );
+    }
+
+    #[test]
+    fn request_fingerprint_shared_fixture_retains_legacy_digests() {
+        let fixture = fingerprint_fixture();
+        let mut count = 0;
+        for case in fixture.cases.iter().filter(|case| case.version < 3) {
+            let input = case.legacy_input.as_ref().expect("legacy input");
+            assert!(case.pending_call.is_none(), "{}", case.name);
+            assert_eq!(
+                request_fingerprint(
+                    &input.tool_name,
+                    &input.task,
+                    input.work_unit_key.as_deref(),
+                    input.replaces_task_id.as_deref(),
+                    input.replacement_reason.as_deref(),
+                    input.target_task_id.as_deref(),
+                    &input.route_fingerprint_hex,
+                    input.orchestration_binding.as_ref(),
+                ),
+                case.expected_digest,
+                "{}",
+                case.name
+            );
+            count += 1;
+        }
+        assert_eq!(count, 3);
+    }
+
+    #[test]
     fn fingerprint_is_stable_for_identical_inputs() {
         let a = request_fingerprint(
             "delegate_to_agent",
@@ -6108,95 +6718,6 @@ mod tests {
         assert_ne!(left, right);
     }
 
-    #[test]
-    fn request_fingerprint_unbound_seven_string_inputs_retain_exact_digests() {
-        assert_eq!(
-            request_fingerprint(
-                "delegate_to_agent",
-                "do the thing",
-                Some("work-1"),
-                None,
-                None,
-                None,
-                "AbCdEf",
-                None,
-            ),
-            "55687507f1ed929a92190fb1e1039e422dd219d2238a4b1e10a6968c32e557f4"
-        );
-        assert_eq!(
-            request_fingerprint(
-                "continue_delegation",
-                "revise",
-                None,
-                None,
-                None,
-                Some("task-1"),
-                "deadbeef",
-                None,
-            ),
-            "f9487ae94c8b94155514942226be54829c3f5043fdf587d3c33886b01f04a97f"
-        );
-    }
-
-    #[test]
-    fn request_fingerprint_bound_uses_exact_twelve_string_v2_array() {
-        let binding = crate::acp::delegation::types::OrchestrationBindingV1 {
-            schema_version: 1,
-            namespace: "brainstorm-to-delivery".into(),
-            generation: 2,
-            route_fingerprint:
-                "sha256:b498416d87bf6ba928bd7ddb5f1a451daf82300584f3d40b606c3c56f169ba7a".into(),
-        };
-        let exact = request_fingerprint(
-            "delegate_to_agent",
-            "Implement Task 7 from the reviewed Plan.",
-            Some("task|7|implementer|codex|none"),
-            None,
-            None,
-            None,
-            "5ea0c72cf8b44015a7fe8e796a05dc22",
-            Some(&binding),
-        );
-        assert_eq!(
-            exact,
-            "aca47c464009a8f26bd36e0611b17f62cb7ed7942a387e38e878cf87087ff172"
-        );
-        assert_eq!(
-            exact,
-            request_fingerprint(
-                "delegate_to_agent",
-                "Implement Task 7 from the reviewed Plan.",
-                Some("task|7|implementer|codex|none"),
-                None,
-                None,
-                None,
-                "5ea0c72cf8b44015a7fe8e796a05dc22",
-                Some(&binding),
-            ),
-            "an exact bound retry must be stable"
-        );
-
-        let mut different_generation = binding.clone();
-        different_generation.generation = 3;
-        let mut different_fingerprint = binding.clone();
-        different_fingerprint.route_fingerprint = format!("sha256:{}", "0".repeat(64));
-        for different in [&different_generation, &different_fingerprint] {
-            assert_ne!(
-                exact,
-                request_fingerprint(
-                    "delegate_to_agent",
-                    "Implement Task 7 from the reviewed Plan.",
-                    Some("task|7|implementer|codex|none"),
-                    None,
-                    None,
-                    None,
-                    "5ea0c72cf8b44015a7fe8e796a05dc22",
-                    Some(different),
-                )
-            );
-        }
-    }
-
     // ---- RunStore -----------------------------------------------------------
 
     pub(crate) async fn seed_parent_child(db: &AppDatabase, call_id: &str) -> (i32, i32) {
@@ -6235,6 +6756,7 @@ mod tests {
         previous: Option<&str>,
     ) -> ReservingRunInsert {
         ReservingRunInsert {
+            dispatch_intent_id: None,
             orchestration_binding: None,
             task_id: task_id.into(),
             root_task_id: previous
@@ -6294,6 +6816,7 @@ mod tests {
     ) -> ContinueRunAdmission {
         ContinueRunAdmission {
             task_id: format!("binding-continue-{suffix}"),
+            dispatch_intent_id: None,
             parent_conversation_id: parent_id,
             parent_tool_use_id: format!("tu-binding-continue-{suffix}"),
             target_task_id: source_task_id.into(),
@@ -8816,6 +9339,7 @@ mod tests {
             live,
         );
         ReservingRunInsert {
+            dispatch_intent_id: None,
             orchestration_binding: None,
             task_id: task_id.into(),
             root_task_id: task_id.into(),
@@ -10471,6 +10995,7 @@ mod tests {
         );
         let admission = ContinueRunAdmission {
             task_id: "continue-next".into(),
+            dispatch_intent_id: None,
             parent_conversation_id: parent_id,
             parent_tool_use_id: "tu-continue".into(),
             target_task_id: root.into(),
@@ -10505,6 +11030,7 @@ mod tests {
         settle_completed(&store, "continue-next").await;
         let mismatched_work_unit = ContinueRunAdmission {
             task_id: "continue-wrong-unit".into(),
+            dispatch_intent_id: None,
             parent_conversation_id: parent_id,
             parent_tool_use_id: "tu-wrong-unit".into(),
             target_task_id: "continue-next".into(),
@@ -10523,7 +11049,8 @@ mod tests {
 
     /// Overlap precedence: busy_thread / stale_task_id beat work_unit_key mismatch.
     #[tokio::test]
-    async fn continue_error_precedence_busy_and_stale_before_work_unit_mismatch() {
+    async fn ticket_v1_authorization_precedence_continue_busy_and_stale_before_invalid_authorization(
+    ) {
         use crate::db::entities::conversation;
         use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
 
@@ -10552,6 +11079,7 @@ mod tests {
         // Root still running → busy. Wrong work_unit_key must not preempt busy.
         let busy_wrong_key = ContinueRunAdmission {
             task_id: "cont-busy".into(),
+            dispatch_intent_id: None,
             parent_conversation_id: parent_id,
             parent_tool_use_id: "tu-busy".into(),
             target_task_id: root.into(),
@@ -10562,7 +11090,13 @@ mod tests {
             effective_orchestration_binding: None,
         };
         let err = store
-            .admit_continue_reserving(busy_wrong_key)
+            .admit_continue_reserving_authorized(
+                busy_wrong_key,
+                RecoveryAdmissionAuthorization {
+                    authorization_id: Some("4a67bba4-e1f5-46d1-a9b1-aa796598ffce".into()),
+                    correlation_id: "ticket-v1-busy-precedence".into(),
+                },
+            )
             .await
             .unwrap_err();
         assert!(
@@ -10591,6 +11125,7 @@ mod tests {
 
         let stale_wrong_key = ContinueRunAdmission {
             task_id: "cont-stale".into(),
+            dispatch_intent_id: None,
             parent_conversation_id: parent_id,
             parent_tool_use_id: "tu-stale".into(),
             target_task_id: root.into(), // stale: not latest on child
@@ -10601,7 +11136,13 @@ mod tests {
             effective_orchestration_binding: None,
         };
         let err = store
-            .admit_continue_reserving(stale_wrong_key)
+            .admit_continue_reserving_authorized(
+                stale_wrong_key,
+                RecoveryAdmissionAuthorization {
+                    authorization_id: Some("4a67bba4-e1f5-46d1-a9b1-aa796598ffce".into()),
+                    correlation_id: "ticket-v1-stale-precedence".into(),
+                },
+            )
             .await
             .unwrap_err();
         assert!(
@@ -10643,6 +11184,7 @@ mod tests {
         let err = store
             .admit_continue_reserving(ContinueRunAdmission {
                 task_id: "deleted-parent-continue".into(),
+                dispatch_intent_id: None,
                 parent_conversation_id: parent_id,
                 parent_tool_use_id: "tu-deleted-parent-continue".into(),
                 target_task_id: root.into(),
@@ -10710,6 +11252,7 @@ mod tests {
         let err = store
             .admit_continue_reserving(ContinueRunAdmission {
                 task_id: "unknown-agent-continue".into(),
+                dispatch_intent_id: None,
                 parent_conversation_id: parent_id,
                 parent_tool_use_id: "tu-unknown-agent-continue".into(),
                 target_task_id: root.into(),
@@ -10789,6 +11332,7 @@ mod tests {
         let continuation = store
             .admit_continue_reserving(ContinueRunAdmission {
                 task_id: "continue-replacement-race-continuation".into(),
+                dispatch_intent_id: None,
                 parent_conversation_id: parent_id,
                 parent_tool_use_id: "tu-continue-replacement-race-continuation".into(),
                 target_task_id: source_task_id.into(),
@@ -12448,6 +12992,7 @@ mod tests {
             reached_running_at: None,
             child_connection_id: None,
             request_fingerprint: None,
+            dispatch_intent_id: None,
             task_preview: None,
             admission_class: AdmissionClass::NormalRevision,
             lineage_root_task_id: "t".into(),
@@ -12525,6 +13070,7 @@ mod tests {
             reached_running_at: Some(Utc::now()),
             child_connection_id: None,
             request_fingerprint: None,
+            dispatch_intent_id: None,
             task_preview: None,
             admission_class: AdmissionClass::NormalRevision,
             lineage_root_task_id: "t".into(),
@@ -12956,6 +13502,7 @@ mod tests {
                 store
                     .admit_continue_reserving(ContinueRunAdmission {
                         task_id: "continue-gate-timeout-child".into(),
+                        dispatch_intent_id: None,
                         parent_conversation_id: parent_id,
                         parent_tool_use_id: "tu-continue-gate-timeout".into(),
                         target_task_id: root.into(),
@@ -13039,6 +13586,7 @@ mod tests {
                 store
                     .admit_continue_reserving(ContinueRunAdmission {
                         task_id: "continue-gate-drop-child".into(),
+                        dispatch_intent_id: None,
                         parent_conversation_id: parent_id,
                         parent_tool_use_id: "tu-continue-gate-drop".into(),
                         target_task_id: root.into(),
@@ -15019,6 +15567,7 @@ mod termination_audit {
         let store = RunStore::new(db.clone());
         store
             .insert_reserving(ReservingRunInsert {
+                dispatch_intent_id: None,
                 orchestration_binding: None,
                 task_id: task_id.clone(),
                 root_task_id: task_id.clone(),
@@ -15250,6 +15799,7 @@ mod termination_audit {
         ) -> ContinueRunAdmission {
             ContinueRunAdmission {
                 task_id: format!("recovery-continue-{suffix}"),
+                dispatch_intent_id: None,
                 parent_conversation_id: parent_id,
                 parent_tool_use_id: format!("tu-recovery-continue-{suffix}"),
                 target_task_id: source_task_id.to_string(),
@@ -15310,6 +15860,8 @@ mod termination_audit {
                 work_unit_key: Some(format!("unit-{suffix}")),
                 external_handle: None,
                 correlation_id: Some(format!("recovery-correlation-{suffix}")),
+                dispatch_intent_id: None,
+                admission_ticket: None,
                 recovery_authorization_id: authorization_id,
                 orchestration_binding: None,
             }

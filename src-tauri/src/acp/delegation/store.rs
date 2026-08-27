@@ -329,6 +329,10 @@ pub enum TaskStoreError {
     /// `duplicate_parent_tool`.
     #[error("duplicate parent tool: {0}")]
     DuplicateParentTool(String),
+    /// Same parent-scoped logical dispatch intent was already persisted with
+    /// different request semantics.
+    #[error("delegation dispatch intent conflict: {0}")]
+    DispatchIntentConflict(String),
     /// Replacement-qualified dual first-dispatch loser (orchestrated key
     /// with established lineage without replaces). Wire code:
     /// `invalid_replacement`.
@@ -384,6 +388,7 @@ impl TaskStoreError {
             Self::BudgetExhausted(_) => Some("budget_exhausted"),
             Self::BusyThread(_) => Some("busy_thread"),
             Self::DuplicateParentTool(_) => Some("duplicate_parent_tool"),
+            Self::DispatchIntentConflict(_) => Some("delegation_dispatch_intent_conflict"),
             Self::InvalidReplacement(_) => Some("invalid_replacement"),
             Self::OrchestrationBindingLineageMismatch => {
                 Some("orchestration_binding_lineage_mismatch")
@@ -2698,6 +2703,7 @@ mod tests {
 
         let runs = RunStore::new(db.clone());
         runs.insert_reserving(ReservingRunInsert {
+            dispatch_intent_id: None,
             orchestration_binding: None,
             task_id: task_id.into(),
             root_task_id: task_id.into(),

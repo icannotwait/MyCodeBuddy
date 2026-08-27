@@ -84,17 +84,19 @@ use crate::acp::delegation::meta_writer::{
 #[cfg(test)]
 use crate::acp::delegation::metrics::DelegationMetrics;
 use crate::acp::delegation::metrics::{
-    CompletionMetricPhase, DelegationRecoveryMetricEvent, RecoveryMetricEventKind,
-    RuntimeProjectionErrorKind,
+    AdmissionTicketMetricOutcome, CompletionMetricPhase, DelegationRecoveryMetricEvent,
+    DispatchIntentMetricOutcome, RecoveryMetricEventKind, RuntimeProjectionErrorKind,
 };
+use crate::acp::delegation::orchestration_binding_query::AdmissionTicketConsumeError;
 use crate::acp::delegation::run_identity::{
     cold_resolve_allows, fence_allows_settlement, LiveRunRegistration, SettlementFenceDecision,
 };
 use crate::acp::delegation::run_store::{
     derive_task_preview, inherited_binding, launch_snapshot_from_run, request_fingerprint,
-    Gen1AdmitOutcome, PersistedRun, PromoteAttemptMeta, PromoteConflictClass, PromoteRetryClass,
-    PromoteRunningKind, PromoteRunningOutcome, RecoveryAdmissionAuthorization, ReservingRunInsert,
-    RunStore, TerminalCompletionAttentionMetric,
+    ticket_v1_request_fingerprint, DispatchIntentReplayProjection, Gen1AdmitOutcome, PersistedRun,
+    PromoteAttemptMeta, PromoteConflictClass, PromoteRetryClass, PromoteRunningKind,
+    PromoteRunningOutcome, RecoveryAdmissionAuthorization, ReservingRunInsert, RunStore,
+    TerminalCompletionAttentionMetric,
 };
 use crate::acp::delegation::runtime_stats::{DelegationRuntimeStats, RuntimeStatsProjector};
 use crate::acp::delegation::spawner::{ConnectionSpawner, DelegationLink};
@@ -105,11 +107,13 @@ use crate::acp::delegation::store::{
 use crate::acp::delegation::supervisor::SupervisorWake;
 use crate::acp::delegation::types::{
     cold_task_report_message, correlation_error_message, validate_correlation_id,
-    AgentDelegationDefaults, CorrelationEntryPoint, CorrelationFailureKind, DelegationError,
-    DelegationOutcome, DelegationProfile, DelegationRecoveryProjection, DelegationReplyResult,
-    DelegationRequest, DelegationStatusBatch, DelegationTaskReport, DelegationTaskReportExtension,
-    DelegationWakeReason, ObservationSnapshot, ParentDecisionResult, ParentTurnEndReason,
-    TaskObservation, TaskStatus, WorkflowRetirementNavigation, DELEGATE_TO_AGENT_TOOL,
+    AdmissionIntentKind, AdmissionIntentV1, AgentDelegationDefaults, CorrelationEntryPoint,
+    CorrelationFailureKind, DelegationError, DelegationOutcome, DelegationProfile,
+    DelegationRecoveryProjection, DelegationReplyResult, DelegationRequest, DelegationStatusBatch,
+    DelegationTaskReport, DelegationTaskReportExtension, DelegationWakeReason, ObservationSnapshot,
+    ParentDecisionResult, ParentTurnEndReason, TaskObservation, TaskStatus,
+    TicketV1AdmissionCandidate, TicketV1PendingCall, WorkflowRetirementNavigation,
+    DELEGATE_TO_AGENT_TOOL,
 };
 use crate::acp::delegation::workflow::admission::append_admitted_completion_instruction;
 #[cfg(test)]
@@ -2471,6 +2475,7 @@ fn store_err_to_delegation_error(err: TaskStoreError) -> DelegationError {
     match err {
         TaskStoreError::BusyThread(m) => DelegationError::BusyThread(m),
         TaskStoreError::DuplicateParentTool(m) => DelegationError::DuplicateParentTool(m),
+        TaskStoreError::DispatchIntentConflict(m) => DelegationError::DispatchIntentConflict(m),
         TaskStoreError::InvalidReplacement(m) => DelegationError::InvalidReplacement(m),
         TaskStoreError::OrchestrationBindingLineageMismatch => {
             DelegationError::OrchestrationBindingLineageMismatch
@@ -3703,6 +3708,138 @@ pub struct DelegationBroker {
     /// settle Existing / finalize / remove_retry between those steps.
     #[cfg(any(test, feature = "test-utils"))]
     post_accept_adopt_retry_recheck_gate: Arc<Mutex<Option<RuntimeGate>>>,
+}
+
+fn delegate_ticket_v1_candidate(req: &DelegationRequest) -> Option<TicketV1AdmissionCandidate> {
+    let dispatch_intent_id = req.dispatch_intent_id.clone()?;
+    let admission_ticket = req.admission_ticket.clone()?;
+    let request_fingerprint = ticket_v1_request_fingerprint(&TicketV1PendingCall {
+        schema_version: 1,
+        tool_name: DELEGATE_TO_AGENT_TOOL.into(),
+        task: req.task.clone(),
+        working_dir: req.requested_working_dir.clone(),
+        work_unit_key: req.work_unit_key.clone(),
+        replaces_task_id: req.replaces_task_id.clone(),
+        replacement_reason: req.replacement_reason.clone(),
+        target_task_id: None,
+        agent_type: req.agent_type.as_wire().into(),
+        profile_id: req.profile_id.clone(),
+        orchestration_binding: req.orchestration_binding.clone(),
+        dispatch_intent_id: dispatch_intent_id.clone(),
+    });
+    Some(TicketV1AdmissionCandidate {
+        dispatch_intent_id,
+        admission_ticket,
+        request_fingerprint,
+    })
+}
+
+fn continue_ticket_v1_candidate(
+    req: &crate::acp::delegation::types::ContinueDelegationRequest,
+    agent_type: AgentType,
+    profile_id: Option<&str>,
+) -> Option<TicketV1AdmissionCandidate> {
+    let dispatch_intent_id = req.dispatch_intent_id.clone()?;
+    let admission_ticket = req.admission_ticket.clone()?;
+    let request_fingerprint = ticket_v1_request_fingerprint(&TicketV1PendingCall {
+        schema_version: 1,
+        tool_name: crate::acp::delegation::types::CONTINUE_DELEGATION_TOOL.into(),
+        task: req.task.clone(),
+        working_dir: None,
+        work_unit_key: req.work_unit_key.clone(),
+        replaces_task_id: None,
+        replacement_reason: None,
+        target_task_id: Some(req.target_task_id.clone()),
+        agent_type: agent_type.as_wire().into(),
+        profile_id: profile_id.map(str::to_owned),
+        orchestration_binding: req.orchestration_binding.clone(),
+        dispatch_intent_id: dispatch_intent_id.clone(),
+    });
+    Some(TicketV1AdmissionCandidate {
+        dispatch_intent_id,
+        admission_ticket,
+        request_fingerprint,
+    })
+}
+
+const TICKET_V1_DEFAULT_NAMESPACE: &str = "brainstorm-to-delivery";
+
+fn ticket_v1_namespace(
+    binding: Option<&crate::acp::delegation::types::OrchestrationBindingV1>,
+) -> &str {
+    binding
+        .map(|binding| binding.namespace.as_str())
+        .unwrap_or(TICKET_V1_DEFAULT_NAMESPACE)
+}
+
+fn delegate_ticket_v1_intent(
+    req: &DelegationRequest,
+    candidate: &TicketV1AdmissionCandidate,
+) -> AdmissionIntentV1 {
+    AdmissionIntentV1 {
+        schema_version: 1,
+        dispatch_intent_id: candidate.dispatch_intent_id.clone(),
+        request_fingerprint: candidate.request_fingerprint.clone(),
+        kind: if req.replaces_task_id.is_some() {
+            AdmissionIntentKind::Replacement
+        } else {
+            AdmissionIntentKind::First
+        },
+        work_unit_key: req.work_unit_key.clone().unwrap_or_default(),
+        agent_type: req.agent_type.as_wire().into(),
+        profile_id: req.profile_id.clone(),
+        target_task_id: req.replaces_task_id.clone(),
+        replacement_reason: req.replacement_reason.clone(),
+        orchestration_binding: req.orchestration_binding.clone(),
+    }
+}
+
+fn continue_ticket_v1_intent(
+    req: &crate::acp::delegation::types::ContinueDelegationRequest,
+    candidate: &TicketV1AdmissionCandidate,
+    agent_type: AgentType,
+    profile_id: Option<&str>,
+) -> AdmissionIntentV1 {
+    AdmissionIntentV1 {
+        schema_version: 1,
+        dispatch_intent_id: candidate.dispatch_intent_id.clone(),
+        request_fingerprint: candidate.request_fingerprint.clone(),
+        kind: AdmissionIntentKind::Continue,
+        work_unit_key: req.work_unit_key.clone().unwrap_or_default(),
+        agent_type: agent_type.as_wire().into(),
+        profile_id: profile_id.map(str::to_owned),
+        target_task_id: Some(req.target_task_id.clone()),
+        replacement_reason: None,
+        orchestration_binding: req.orchestration_binding.clone(),
+    }
+}
+
+fn ticket_v1_consume_error(error: AdmissionTicketConsumeError) -> DelegationError {
+    let (code, message) = match error {
+        AdmissionTicketConsumeError::Stale => (
+            "orchestration_admission_ticket_stale",
+            "admission ticket is expired, revoked, or no longer current",
+        ),
+        AdmissionTicketConsumeError::Mismatch => (
+            "orchestration_admission_ticket_mismatch",
+            "admission ticket does not match the current request scope",
+        ),
+        AdmissionTicketConsumeError::Consumed => (
+            "orchestration_admission_ticket_consumed",
+            "admission ticket was already consumed",
+        ),
+    };
+    DelegationError::WorkflowAdmission {
+        code: code.into(),
+        message: message.into(),
+    }
+}
+
+fn mark_dispatch_intent_replay(mut report: DelegationTaskReport) -> DelegationTaskReport {
+    report.recovery = Some(DelegationTaskReportExtension::IdempotentReplay {
+        idempotent_replay: true,
+    });
+    report
 }
 
 impl DelegationBroker {
@@ -5955,6 +6092,12 @@ impl DelegationBroker {
     /// orthogonal to whether the caller then blocks. The only change vs. the old
     /// `handle_request` is that "park a `oneshot` and await it" becomes "insert a
     /// [`RunningTask`] and return the ack."
+    pub async fn start_delegation(&self, req: DelegationRequest) -> DelegationTaskReport {
+        let connection_incarnation = req.parent_connection_id.clone();
+        self.start_delegation_for_incarnation(req, &connection_incarnation)
+            .await
+    }
+
     #[tracing::instrument(
         name = "delegation_task",
         skip_all,
@@ -5967,7 +6110,11 @@ impl DelegationBroker {
             task_id = tracing::field::Empty,
         )
     )]
-    pub async fn start_delegation(&self, mut req: DelegationRequest) -> DelegationTaskReport {
+    pub async fn start_delegation_for_incarnation(
+        &self,
+        mut req: DelegationRequest,
+        connection_incarnation: &str,
+    ) -> DelegationTaskReport {
         if let Some(binding) = req.orchestration_binding.as_ref() {
             if let Err(message) = binding.validate() {
                 return report_err(
@@ -6160,6 +6307,92 @@ impl DelegationBroker {
                 },
                 None,
             );
+        }
+
+        let ticket_v1_candidate = delegate_ticket_v1_candidate(&req);
+        let mut ticket_mutation_guard = None;
+        if let Some(candidate) = ticket_v1_candidate.as_ref() {
+            let Some(runs) = self.run_store.as_ref() else {
+                self.drop_inflight(inflight_id).await;
+                return report_err(
+                    req.agent_type,
+                    ticket_v1_consume_error(AdmissionTicketConsumeError::Stale),
+                    None,
+                );
+            };
+            ticket_mutation_guard = Some(runs.orchestration_mutation_guard().await);
+            let guard = ticket_mutation_guard
+                .as_ref()
+                .expect("ticket-v1 mutation guard was just acquired");
+            let intent = delegate_ticket_v1_intent(&req, candidate);
+            match runs
+                .consume_admission_ticket_under_guard(
+                    guard,
+                    &candidate.admission_ticket,
+                    req.parent_conversation_id,
+                    connection_incarnation,
+                    ticket_v1_namespace(req.orchestration_binding.as_ref()),
+                    &intent,
+                )
+                .await
+            {
+                Ok(claims) => {
+                    debug_assert_eq!(claims.dispatch_intent_id, candidate.dispatch_intent_id);
+                    debug_assert_eq!(claims.request_fingerprint, candidate.request_fingerprint);
+                    debug_assert_eq!(claims.intent_digest, intent.canonical_digest());
+                    self.metrics
+                        .record_ticket_outcome(AdmissionTicketMetricOutcome::Consumed);
+                }
+                Err(error) => {
+                    match error {
+                        AdmissionTicketConsumeError::Stale => self
+                            .metrics
+                            .record_ticket_outcome(AdmissionTicketMetricOutcome::Stale),
+                        AdmissionTicketConsumeError::Mismatch => self
+                            .metrics
+                            .record_ticket_outcome(AdmissionTicketMetricOutcome::Mismatched),
+                        AdmissionTicketConsumeError::Consumed => {}
+                    }
+                    self.drop_inflight(inflight_id).await;
+                    return report_err(req.agent_type, ticket_v1_consume_error(error), None);
+                }
+            }
+
+            let replay = DispatchIntentReplayProjection {
+                request_fingerprint: candidate.request_fingerprint.clone(),
+                previous_task_id: None,
+                work_unit_key: req.work_unit_key.clone(),
+                agent_type: req.agent_type,
+                profile_id: req.profile_id.clone(),
+                orchestration_binding: req.orchestration_binding.clone(),
+                replaced_task_id: req.replaces_task_id.clone(),
+                replacement_reason: req.replacement_reason.clone(),
+            };
+            match runs
+                .load_dispatch_intent_under_guard(
+                    guard,
+                    req.parent_conversation_id,
+                    &candidate.dispatch_intent_id,
+                    &replay,
+                )
+                .await
+            {
+                Ok(Some(existing)) => {
+                    self.metrics
+                        .record_dispatch_intent_outcome(DispatchIntentMetricOutcome::ExactReplay);
+                    self.drop_inflight(inflight_id).await;
+                    return mark_dispatch_intent_replay(gen1_idempotent_ack(&existing));
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    if matches!(error, TaskStoreError::DispatchIntentConflict(_)) {
+                        self.metrics
+                            .record_dispatch_intent_outcome(DispatchIntentMetricOutcome::Conflict);
+                    }
+                    self.drop_inflight(inflight_id).await;
+                    return report_err(req.agent_type, store_err_to_delegation_error(error), None);
+                }
+            }
         }
 
         // Resolve archived ownership before completion-format repair, depth,
@@ -6648,6 +6881,9 @@ impl DelegationBroker {
                     )
                 };
             let insert = ReservingRunInsert {
+                dispatch_intent_id: ticket_v1_candidate
+                    .as_ref()
+                    .map(|candidate| candidate.dispatch_intent_id.clone()),
                 orchestration_binding: if replacement_source.is_some() {
                     req.orchestration_binding.clone()
                 } else {
@@ -6672,7 +6908,12 @@ impl DelegationBroker {
                 mode_id: live_launch.snapshot.mode_id.clone(),
                 config_values_json: Some(live_launch.snapshot.config_values_json.clone()),
                 task_preview: Some(durable_preview),
-                request_fingerprint: Some(request_fp.clone()),
+                request_fingerprint: Some(
+                    ticket_v1_candidate
+                        .as_ref()
+                        .map(|candidate| candidate.request_fingerprint.clone())
+                        .unwrap_or_else(|| request_fp.clone()),
+                ),
                 admission_class,
                 lineage_root_task_id,
                 work_unit_key: req.work_unit_key.clone(),
@@ -6737,10 +6978,14 @@ impl DelegationBroker {
                     })
                     .unwrap_or_else(|| call_id.clone()),
             };
-            let admitted = match runs
-                .admit_gen1_reserving_authorized(insert, authorization)
-                .await
-            {
+            let admission_result = if let Some(guard) = ticket_mutation_guard.as_ref() {
+                runs.admit_gen1_reserving_authorized_under_guard(guard, insert, authorization)
+                    .await
+            } else {
+                runs.admit_gen1_reserving_authorized(insert, authorization)
+                    .await
+            };
+            let admitted = match admission_result {
                 Ok(Gen1AdmitOutcome::AuthorizedCreated {
                     run,
                     recovery_decision,
@@ -6765,6 +7010,7 @@ impl DelegationBroker {
             };
             match admitted {
                 Ok(Gen1AdmitOutcome::Created(run)) => {
+                    drop(ticket_mutation_guard.take());
                     if let Some(authorization_id) = run.recovery_authorization_id.as_deref() {
                         for kind in [
                             RecoveryMetricEventKind::ConfirmationApproved,
@@ -6857,6 +7103,7 @@ impl DelegationBroker {
                         self.drop_inflight(inflight_id).await;
                         return report_err(req.agent_type, cleanup_err, Some(child_row.id));
                     }
+                    drop(ticket_mutation_guard.take());
                     self.drop_inflight(inflight_id).await;
                     return gen1_idempotent_ack(&existing);
                 }
@@ -6881,6 +7128,7 @@ impl DelegationBroker {
                         self.drop_inflight(inflight_id).await;
                         return report_err(req.agent_type, cleanup_err, Some(child_row.id));
                     }
+                    drop(ticket_mutation_guard.take());
                     self.drop_inflight(inflight_id).await;
                     return report_err(req.agent_type, store_err_to_delegation_error(e), None);
                 }
@@ -9207,7 +9455,17 @@ impl DelegationBroker {
     /// ack (or a typed error report).
     pub async fn continue_delegation(
         &self,
+        req: crate::acp::delegation::types::ContinueDelegationRequest,
+    ) -> DelegationTaskReport {
+        let connection_incarnation = req.parent_connection_id.clone();
+        self.continue_delegation_for_incarnation(req, &connection_incarnation)
+            .await
+    }
+
+    pub async fn continue_delegation_for_incarnation(
+        &self,
         mut req: crate::acp::delegation::types::ContinueDelegationRequest,
+        connection_incarnation: &str,
     ) -> DelegationTaskReport {
         use crate::acp::delegation::capability::gate_continue_session_reuse;
         use crate::acp::delegation::capability::ContinueCapabilityDecision;
@@ -9400,18 +9658,6 @@ impl DelegationBroker {
             );
         };
 
-        if let Err(error) =
-            require_writable_conversation_workflow(&runs.db().conn, req.parent_conversation_id)
-                .await
-        {
-            self.drop_inflight(inflight_id).await;
-            return report_err(
-                AgentType::ClaudeCode,
-                workflow_store_error_to_delegation_error(error),
-                None,
-            );
-        }
-
         // Load target for ownership / route material only (not_found on miss).
         let target = match runs.load_by_task_id(&req.target_task_id).await {
             Ok(Some(t)) if t.parent_conversation_id == req.parent_conversation_id => t,
@@ -9432,6 +9678,111 @@ impl DelegationBroker {
                 );
             }
         };
+        let ticket_v1_candidate =
+            continue_ticket_v1_candidate(&req, target.agent_type, target.profile_id.as_deref());
+        let mut ticket_mutation_guard = None;
+        if let Some(candidate) = ticket_v1_candidate.as_ref() {
+            ticket_mutation_guard = Some(runs.orchestration_mutation_guard().await);
+            let guard = ticket_mutation_guard
+                .as_ref()
+                .expect("ticket-v1 mutation guard was just acquired");
+            let intent = continue_ticket_v1_intent(
+                &req,
+                candidate,
+                target.agent_type,
+                target.profile_id.as_deref(),
+            );
+            match runs
+                .consume_admission_ticket_under_guard(
+                    guard,
+                    &candidate.admission_ticket,
+                    req.parent_conversation_id,
+                    connection_incarnation,
+                    ticket_v1_namespace(req.orchestration_binding.as_ref()),
+                    &intent,
+                )
+                .await
+            {
+                Ok(claims) => {
+                    debug_assert_eq!(claims.dispatch_intent_id, candidate.dispatch_intent_id);
+                    debug_assert_eq!(claims.request_fingerprint, candidate.request_fingerprint);
+                    debug_assert_eq!(claims.intent_digest, intent.canonical_digest());
+                    self.metrics
+                        .record_ticket_outcome(AdmissionTicketMetricOutcome::Consumed);
+                }
+                Err(error) => {
+                    match error {
+                        AdmissionTicketConsumeError::Stale => self
+                            .metrics
+                            .record_ticket_outcome(AdmissionTicketMetricOutcome::Stale),
+                        AdmissionTicketConsumeError::Mismatch => self
+                            .metrics
+                            .record_ticket_outcome(AdmissionTicketMetricOutcome::Mismatched),
+                        AdmissionTicketConsumeError::Consumed => {}
+                    }
+                    self.drop_inflight(inflight_id).await;
+                    return report_err(target.agent_type, ticket_v1_consume_error(error), None);
+                }
+            }
+
+            let replay = DispatchIntentReplayProjection {
+                request_fingerprint: candidate.request_fingerprint.clone(),
+                previous_task_id: Some(req.target_task_id.clone()),
+                work_unit_key: req.work_unit_key.clone(),
+                agent_type: target.agent_type,
+                profile_id: target.profile_id.clone(),
+                orchestration_binding: req.orchestration_binding.clone(),
+                replaced_task_id: None,
+                replacement_reason: None,
+            };
+            match runs
+                .load_dispatch_intent_under_guard(
+                    guard,
+                    req.parent_conversation_id,
+                    &candidate.dispatch_intent_id,
+                    &replay,
+                )
+                .await
+            {
+                Ok(Some(existing)) => {
+                    self.metrics
+                        .record_dispatch_intent_outcome(DispatchIntentMetricOutcome::ExactReplay);
+                    self.drop_inflight(inflight_id).await;
+                    return mark_dispatch_intent_replay(
+                        self.continue_idempotent_with_terminal_intent(
+                            &existing,
+                            req.target_task_id,
+                        )
+                        .await,
+                    );
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    if matches!(error, TaskStoreError::DispatchIntentConflict(_)) {
+                        self.metrics
+                            .record_dispatch_intent_outcome(DispatchIntentMetricOutcome::Conflict);
+                    }
+                    self.drop_inflight(inflight_id).await;
+                    return report_err(
+                        target.agent_type,
+                        store_err_to_delegation_error(error),
+                        None,
+                    );
+                }
+            }
+        }
+
+        if let Err(error) =
+            require_writable_conversation_workflow(&runs.db().conn, req.parent_conversation_id)
+                .await
+        {
+            self.drop_inflight(inflight_id).await;
+            return report_err(
+                target.agent_type,
+                workflow_store_error_to_delegation_error(error),
+                None,
+            );
+        }
         let effective_orchestration_binding = match inherited_binding(
             target.orchestration_binding.as_ref(),
             req.orchestration_binding.as_ref(),
@@ -9535,11 +9886,17 @@ impl DelegationBroker {
         let new_task_id = uuid::Uuid::new_v4().to_string();
         let admission = ContinueRunAdmission {
             task_id: new_task_id.clone(),
+            dispatch_intent_id: ticket_v1_candidate
+                .as_ref()
+                .map(|candidate| candidate.dispatch_intent_id.clone()),
             parent_conversation_id: req.parent_conversation_id,
             parent_tool_use_id: req.parent_tool_use_id.clone(),
             target_task_id: req.target_task_id.clone(),
             task_preview: derive_task_preview(&req.task),
-            request_fingerprint: request_fp,
+            request_fingerprint: ticket_v1_candidate
+                .as_ref()
+                .map(|candidate| candidate.request_fingerprint.clone())
+                .unwrap_or(request_fp),
             work_unit_key: req.work_unit_key.clone(),
             supplied_orchestration_binding: req.orchestration_binding.clone(),
             effective_orchestration_binding,
@@ -9592,10 +9949,14 @@ impl DelegationBroker {
                 })
                 .unwrap_or_else(|| new_task_id.clone()),
         };
-        let admitted = match runs
-            .admit_continue_reserving_authorized(admission, authorization)
-            .await
-        {
+        let admission_result = if let Some(guard) = ticket_mutation_guard.as_ref() {
+            runs.admit_continue_reserving_authorized_under_guard(guard, admission, authorization)
+                .await
+        } else {
+            runs.admit_continue_reserving_authorized(admission, authorization)
+                .await
+        };
+        let admitted = match admission_result {
             Ok(ContinueAdmitOutcome::AuthorizedCreated {
                 run,
                 recovery_decision,
@@ -9618,6 +9979,7 @@ impl DelegationBroker {
             }
             other => other,
         };
+        drop(ticket_mutation_guard.take());
         match &admitted {
             Ok(ContinueAdmitOutcome::Created(run)) => {
                 if let Some(authorization_id) = run.recovery_authorization_id.as_deref() {
@@ -16141,6 +16503,7 @@ mod tests {
                 .expect("agent type string")
                 .to_string();
             runs.insert_reserving(ReservingRunInsert {
+                dispatch_intent_id: None,
                 orchestration_binding: None,
                 task_id: source_task_id.clone(),
                 root_task_id: source_task_id.clone(),
@@ -16235,6 +16598,7 @@ mod tests {
             );
             let runs = Arc::new(RunStore::new(db.clone()));
             runs.insert_reserving(ReservingRunInsert {
+                dispatch_intent_id: None,
                 orchestration_binding: None,
                 task_id: source_task_id.into(),
                 root_task_id: source_task_id.into(),
@@ -16364,6 +16728,8 @@ mod tests {
                     work_unit_key: Some("resume-unit".into()),
                     external_handle: None,
                     correlation_id: Some("resume-correlation".into()),
+                    dispatch_intent_id: None,
+                    admission_ticket: None,
                     recovery_authorization_id: Some(approved.authorization_id.clone()),
                     orchestration_binding: None,
                 })
@@ -16595,6 +16961,7 @@ mod tests {
             );
             let runs = Arc::new(RunStore::new(db.clone()));
             runs.insert_reserving(ReservingRunInsert {
+                dispatch_intent_id: None,
                 orchestration_binding: None,
                 task_id: source_task_id.into(),
                 root_task_id: source_task_id.into(),
@@ -16711,6 +17078,8 @@ mod tests {
             replaces_task_id: None,
             replacement_reason: None,
             correlation_id: None,
+            dispatch_intent_id: None,
+            admission_ticket: None,
             recovery_authorization_id: None,
             orchestration_binding: None,
         }
@@ -16724,6 +17093,961 @@ mod tests {
             route_fingerprint:
                 "sha256:b498416d87bf6ba928bd7ddb5f1a451daf82300584f3d40b606c3c56f169ba7a".into(),
         }
+    }
+
+    const TICKET_V1_TEST_INTENT_ID: &str = "8f95dd45-9eca-42a8-9909-0ac00be8ad52";
+
+    async fn prepare_delegate_ticket(runs: &RunStore, req: &mut DelegationRequest) -> String {
+        use crate::acp::delegation::types::{
+            AdmissionIntentKind, AdmissionIntentV1, AdmissionPreparation,
+            OrchestrationBindingQueryRequest,
+        };
+
+        req.dispatch_intent_id = Some(TICKET_V1_TEST_INTENT_ID.into());
+        req.admission_ticket = Some("4a67bba4-e1f5-46d1-a9b1-aa796598ffce".into());
+        let candidate = delegate_ticket_v1_candidate(req).expect("ticket-v1 candidate");
+        let kind = if req.replaces_task_id.is_some() {
+            AdmissionIntentKind::Replacement
+        } else {
+            AdmissionIntentKind::First
+        };
+        let namespace = req
+            .orchestration_binding
+            .as_ref()
+            .map(|binding| binding.namespace.clone())
+            .unwrap_or_else(|| "brainstorm-to-delivery".into());
+        let envelope = runs
+            .prepare_orchestration_binding_admission(
+                req.parent_conversation_id,
+                &req.parent_connection_id,
+                OrchestrationBindingQueryRequest {
+                    namespace,
+                    limit: 200,
+                    snapshot_id: None,
+                    cursor: None,
+                },
+                None,
+                AdmissionIntentV1 {
+                    schema_version: 1,
+                    dispatch_intent_id: candidate.dispatch_intent_id,
+                    request_fingerprint: candidate.request_fingerprint,
+                    kind,
+                    work_unit_key: req.work_unit_key.clone().expect("ticket work-unit key"),
+                    agent_type: req.agent_type.as_wire().into(),
+                    profile_id: req.profile_id.clone(),
+                    target_task_id: req.replaces_task_id.clone(),
+                    replacement_reason: req.replacement_reason.clone(),
+                    orchestration_binding: req.orchestration_binding.clone(),
+                },
+            )
+            .await
+            .expect("prepare ticket-v1 admission");
+        let AdmissionPreparation::Prepared { ticket, .. } = envelope.admission else {
+            panic!("new dispatch intent must issue a ticket");
+        };
+        req.admission_ticket = Some(ticket.clone());
+        ticket
+    }
+
+    async fn prepare_continue_ticket(
+        runs: &RunStore,
+        req: &mut crate::acp::delegation::types::ContinueDelegationRequest,
+        agent_type: AgentType,
+        profile_id: Option<&str>,
+    ) -> String {
+        use crate::acp::delegation::types::{
+            AdmissionIntentV1, AdmissionPreparation, OrchestrationBindingQueryRequest,
+        };
+
+        req.dispatch_intent_id = Some(TICKET_V1_TEST_INTENT_ID.into());
+        req.admission_ticket = Some("4a67bba4-e1f5-46d1-a9b1-aa796598ffce".into());
+        let candidate = continue_ticket_v1_candidate(req, agent_type, profile_id)
+            .expect("ticket-v1 continue candidate");
+        let namespace = req
+            .orchestration_binding
+            .as_ref()
+            .map(|binding| binding.namespace.clone())
+            .unwrap_or_else(|| "brainstorm-to-delivery".into());
+        let envelope = runs
+            .prepare_orchestration_binding_admission(
+                req.parent_conversation_id,
+                &req.parent_connection_id,
+                OrchestrationBindingQueryRequest {
+                    namespace,
+                    limit: 200,
+                    snapshot_id: None,
+                    cursor: None,
+                },
+                None,
+                AdmissionIntentV1 {
+                    schema_version: 1,
+                    dispatch_intent_id: candidate.dispatch_intent_id,
+                    request_fingerprint: candidate.request_fingerprint,
+                    kind: AdmissionIntentKind::Continue,
+                    work_unit_key: req.work_unit_key.clone().expect("ticket work-unit key"),
+                    agent_type: agent_type.as_wire().into(),
+                    profile_id: profile_id.map(str::to_owned),
+                    target_task_id: Some(req.target_task_id.clone()),
+                    replacement_reason: None,
+                    orchestration_binding: req.orchestration_binding.clone(),
+                },
+            )
+            .await
+            .expect("prepare ticket-v1 continue admission");
+        let AdmissionPreparation::Prepared { ticket, .. } = envelope.admission else {
+            panic!("new continue dispatch intent must issue a ticket");
+        };
+        req.admission_ticket = Some(ticket.clone());
+        ticket
+    }
+
+    async fn wait_for_spawn_calls(mock: &MockSpawner, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if mock.spawn_args.lock().await.len() >= expected {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("spawn call must reach the installed gate");
+    }
+
+    struct TicketedAuthorizationFixture {
+        db: Arc<crate::db::AppDatabase>,
+        runs: Arc<RunStore>,
+        broker: Arc<DelegationBroker>,
+        mock: Arc<MockSpawner>,
+        parent_id: i32,
+        source_task_id: String,
+        authorization_id: String,
+        request: DelegationRequest,
+    }
+
+    async fn ticketed_authorization_fixture(case: &str) -> TicketedAuthorizationFixture {
+        use crate::acp::delegation::recovery_policy::{
+            decide_delegation_recovery, RecoveryRailSnapshot, ReplacementReason,
+            RequestedRecoveryOperation,
+        };
+        use crate::acp::delegation::run_store::{
+            recovery_action_payload, recovery_source_from_continue_eligibility,
+        };
+        use crate::acp::recovery_authorization::{
+            DelegationAuthorizationIdentity, RecoveryAllowedAction, RecoveryAuthorizationStore,
+            RecoveryChallenge, RecoverySubjectKind,
+        };
+        use crate::db::entities::delegation_task_run::{AdmissionClass, DelegationRunStatus};
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use chrono::Duration as ChronoDuration;
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, &format!("/tmp/codeg-ticket-v1-auth-{case}")).await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some(format!("ticket-v1 auth {case} parent")),
+            None,
+        )
+        .await
+        .expect("parent");
+        let source_task_id = "6b228a7d-4ac9-4bc7-a16e-f4ecf6f0fd45".to_string();
+        let source_child = conversation_service::create_with_delegation(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some(format!("ticket-v1 auth {case} source")),
+            None,
+            Some(DelegationLink {
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: format!("ticket-v1-auth-{case}-source-tool"),
+                delegation_call_id: source_task_id.clone(),
+            }),
+        )
+        .await
+        .expect("source child");
+        let workspace_path = test_working_dir();
+        let launch = build_live_launch_config(
+            AgentType::ClaudeCode,
+            None,
+            &workspace_path,
+            None,
+            BTreeMap::new(),
+        );
+        let runs = Arc::new(RunStore::new(db.clone()));
+        runs.insert_reserving(ReservingRunInsert {
+            dispatch_intent_id: None,
+            orchestration_binding: None,
+            task_id: source_task_id.clone(),
+            root_task_id: source_task_id.clone(),
+            previous_task_id: None,
+            generation: 1,
+            parent_conversation_id: parent.id,
+            parent_tool_use_id: Some(format!("ticket-v1-auth-{case}-source-tool")),
+            child_conversation_id: source_child.id,
+            agent_type: AgentType::ClaudeCode.as_wire().into(),
+            profile_id: None,
+            workspace_path: Some(launch.snapshot.workspace_path),
+            route_fingerprint: Some(launch.snapshot.route_fingerprint),
+            launch_snapshot_version: Some(launch.snapshot.launch_snapshot_version),
+            mode_id: launch.snapshot.mode_id,
+            config_values_json: Some(launch.snapshot.config_values_json),
+            task_preview: Some("ticket-v1 authorization source".into()),
+            request_fingerprint: Some(format!("ticket-v1-auth-{case}-source-fingerprint")),
+            admission_class: AdmissionClass::NormalRevision,
+            lineage_root_task_id: source_task_id.clone(),
+            work_unit_key: Some("task|10|implementer|codex|none".into()),
+            history_only: false,
+            replaced_task_id: None,
+            replacement_reason: None,
+            started_at: Some(Utc::now()),
+        })
+        .await
+        .expect("reserve source");
+        let finished_at = Utc::now();
+        runs.settle_terminal(
+            &source_task_id,
+            TerminalTaskWrite::failed_with_evidence(
+                "admission_unknown",
+                finished_at,
+                DelegationTerminationAuditV1::for_terminal_code(
+                    "admission_unknown",
+                    DelegationRunStatus::Reserving,
+                    true,
+                    finished_at,
+                ),
+            ),
+        )
+        .await
+        .expect("terminal source");
+        let source = runs
+            .load_by_task_id(&source_task_id)
+            .await
+            .expect("load source")
+            .expect("source");
+        let eligibility = runs
+            .build_continue_eligibility(&source)
+            .await
+            .expect("source eligibility");
+        let source_snapshot = recovery_source_from_continue_eligibility(&eligibility);
+        let operation = RequestedRecoveryOperation::Replace {
+            replacement_reason: ReplacementReason::AdmissionUnknown,
+        };
+        let decision = decide_delegation_recovery(
+            &source_snapshot,
+            &RecoveryRailSnapshot {
+                agent_supports_reuse: eligibility.agent_supports_reuse,
+                unexpected_continue_budget_available: eligibility
+                    .unexpected_continue_budget_available,
+                replacement_budget_available: eligibility.replacement_budget_available,
+            },
+            operation.clone(),
+        );
+        let projection = DelegationRecoveryProjection::from(&decision);
+        let challenge = RecoveryChallenge {
+            parent_conversation_id: parent.id,
+            subject_kind: RecoverySubjectKind::DelegationTask,
+            subject_id: source_task_id.clone(),
+            delegation_identity: Some(DelegationAuthorizationIdentity {
+                source_task_id: source_task_id.clone(),
+                child_conversation_id: Some(source_child.id),
+                lineage_root_task_id: source_task_id.clone(),
+                work_unit_key: source.work_unit_key.clone(),
+            }),
+            source_state_fingerprint: decision.source_state_fingerprint,
+            allowed_action: RecoveryAllowedAction::Replace,
+            action_payload: recovery_action_payload(&operation),
+            cause_code: projection.cause_code,
+            risk_class: projection.risk_class,
+            display_reason: None,
+        };
+        let authorizations = RecoveryAuthorizationStore::new(db.conn.clone());
+        let now = Utc::now();
+        let pending = authorizations
+            .insert_pending(&challenge, now)
+            .await
+            .expect("insert authorization");
+        authorizations
+            .approve_pending(
+                &pending.authorization_id,
+                now,
+                now + ChronoDuration::minutes(10),
+            )
+            .await
+            .expect("approve authorization");
+        let mock = Arc::new(MockSpawner::new());
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+        let mut request = request(parent.id, &format!("ticket-v1-auth-{case}-replacement"));
+        request.working_dir = Some(workspace_path.clone());
+        request.requested_working_dir = Some(workspace_path);
+        request.work_unit_key = source.work_unit_key;
+        request.replaces_task_id = Some(source_task_id.clone());
+        request.replacement_reason = Some("admission_unknown".into());
+        request.recovery_authorization_id = Some(pending.authorization_id.clone());
+        prepare_delegate_ticket(&runs, &mut request).await;
+        TicketedAuthorizationFixture {
+            db,
+            runs,
+            broker,
+            mock,
+            parent_id: parent.id,
+            source_task_id,
+            authorization_id: pending.authorization_id,
+            request,
+        }
+    }
+
+    #[tokio::test]
+    async fn ticket_v1_atomic_admission_scope_before_burn_and_retains_consumed_tombstone() {
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-ticket-v1-scope-before-burn").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("ticket-v1 scope parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db));
+        let mock = Arc::new(MockSpawner::new());
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+        broker.set_config(DelegationConfig::default()).await;
+
+        let mut rightful = request(parent.id, "ticket-v1-scope-tool");
+        rightful.agent_type = AgentType::Codex;
+        rightful.work_unit_key = Some("task|10|implementer|codex|none".into());
+        prepare_delegate_ticket(&runs, &mut rightful).await;
+
+        let wrong_incarnation = broker
+            .start_delegation_for_incarnation(
+                rightful.clone(),
+                "4a67bba4-e1f5-46d1-a9b1-aa796598ffce",
+            )
+            .await;
+        assert_eq!(
+            wrong_incarnation.error_code.as_deref(),
+            Some("orchestration_admission_ticket_mismatch")
+        );
+
+        let mut wrong = rightful.clone();
+        wrong.task = "different semantic request".into();
+        let mismatch = broker.start_delegation(wrong).await;
+        assert_eq!(
+            mismatch.error_code.as_deref(),
+            Some("orchestration_admission_ticket_mismatch")
+        );
+
+        let business = broker.start_delegation(rightful.clone()).await;
+        assert_eq!(business.error_code.as_deref(), Some("canceled"));
+        assert!(business
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("delegation disabled")));
+
+        let consumed = broker.start_delegation(rightful).await;
+        assert_eq!(
+            consumed.error_code.as_deref(),
+            Some("orchestration_admission_ticket_consumed")
+        );
+        assert!(mock.spawn_args.lock().await.is_empty());
+        assert!(mock.resume_args.lock().await.is_empty());
+
+        let metrics = broker.metrics().snapshot();
+        assert_eq!(metrics.admission_ticket_outcomes["mismatched"], 2);
+        assert_eq!(metrics.admission_ticket_outcomes["consumed"], 1);
+    }
+
+    #[tokio::test]
+    async fn ticket_v1_atomic_admission_delegate_guard_spans_reserve_not_spawn() {
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let parent = conversation_service::create(
+            &db.conn,
+            seed_folder(&db, "/tmp/codeg-ticket-v1-delegate-gate").await,
+            AgentType::ClaudeCode,
+            Some("ticket-v1 delegate gate parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("ticket-v1-delegate-child".into()))
+            .await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let spawn_release = mock.install_spawn_gate().await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+        let mut req = request(parent.id, "ticket-v1-delegate-gate");
+        req.agent_type = AgentType::Codex;
+        req.working_dir = Some(test_working_dir());
+        req.requested_working_dir = req.working_dir.clone();
+        req.work_unit_key = Some("task|10|implementer|codex|none".into());
+        prepare_delegate_ticket(&runs, &mut req).await;
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (reserve_release, reserve_rx) = tokio::sync::oneshot::channel();
+        broker
+            .install_gen1_pre_admit_gate(entered_tx, reserve_rx)
+            .await;
+        let driver = {
+            let broker = broker.clone();
+            tokio::spawn(async move { broker.start_delegation(req).await })
+        };
+
+        entered_rx.await.expect("delegate reserve gate entered");
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                runs.orchestration_mutation_guard()
+            )
+            .await
+            .is_err(),
+            "ticket reserve must retain the mutation guard"
+        );
+        reserve_release.send(()).expect("release delegate reserve");
+        wait_for_spawn_calls(&mock, 1).await;
+        let competing =
+            tokio::time::timeout(Duration::from_secs(1), runs.orchestration_mutation_guard())
+                .await
+                .expect("guard must be released before delegate spawn");
+        drop(competing);
+        spawn_release.send(()).expect("release delegate spawn");
+        let report = driver.await.expect("delegate join");
+        assert_eq!(report.status, TaskStatus::Running, "{report:?}");
+    }
+
+    #[tokio::test]
+    async fn ticket_v1_atomic_admission_provisional_create_failure_keeps_tombstone() {
+        use crate::db::entities::conversation;
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let parent = conversation_service::create(
+            &db.conn,
+            seed_folder(&db, "/tmp/codeg-ticket-v1-create-failure").await,
+            AgentType::ClaudeCode,
+            Some("ticket-v1 create failure parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+        let mut req = request(parent.id, "ticket-v1-create-failure");
+        req.agent_type = AgentType::Codex;
+        req.working_dir = Some(test_working_dir());
+        req.requested_working_dir = req.working_dir.clone();
+        req.work_unit_key = Some("task|10|implementer|codex|none".into());
+        prepare_delegate_ticket(&runs, &mut req).await;
+        db.conn
+            .execute_unprepared(
+                "CREATE TRIGGER ticket_v1_fail_child_create \
+                 BEFORE INSERT ON conversation WHEN NEW.parent_id IS NOT NULL \
+                 BEGIN SELECT RAISE(ABORT, 'ticket-v1 child create failure'); END;",
+            )
+            .await
+            .expect("install child-create trigger");
+
+        let failed = broker.start_delegation(req.clone()).await;
+        assert_eq!(failed.status, TaskStatus::Failed, "{failed:?}");
+        assert!(conversation::Entity::find()
+            .filter(conversation::Column::ParentId.eq(parent.id))
+            .all(&db.conn)
+            .await
+            .expect("list children")
+            .is_empty());
+        assert!(runs
+            .load_by_dispatch_intent(parent.id, TICKET_V1_TEST_INTENT_ID)
+            .await
+            .expect("dispatch lookup")
+            .is_none());
+        assert!(mock.spawn_args.lock().await.is_empty());
+        let consumed = broker.start_delegation(req).await;
+        assert_eq!(
+            consumed.error_code.as_deref(),
+            Some("orchestration_admission_ticket_consumed"),
+            "{consumed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ticket_v1_atomic_admission_cancel_after_provisional_compensates_and_burns() {
+        use crate::db::entities::conversation::{self, DelegationTaskStatus};
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let parent = conversation_service::create(
+            &db.conn,
+            seed_folder(&db, "/tmp/codeg-ticket-v1-cancel-provisional").await,
+            AgentType::ClaudeCode,
+            Some("ticket-v1 cancel provisional parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+        let mut req = request(parent.id, "ticket-v1-cancel-provisional");
+        req.agent_type = AgentType::Codex;
+        req.working_dir = Some(test_working_dir());
+        req.requested_working_dir = req.working_dir.clone();
+        req.work_unit_key = Some("task|10|implementer|codex|none".into());
+        prepare_delegate_ticket(&runs, &mut req).await;
+        let retry = req.clone();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        broker
+            .install_gen1_pre_admit_gate(entered_tx, release_rx)
+            .await;
+        let driver = {
+            let broker = broker.clone();
+            tokio::spawn(async move { broker.start_delegation(req).await })
+        };
+
+        entered_rx.await.expect("pre-admit gate entered");
+        broker
+            .cancel_parent_tree_for_test("parent-conn", ParentTurnEndReason::ParentCanceled)
+            .await;
+        release_tx.send(()).expect("release pre-admit gate");
+        let canceled = driver.await.expect("delegate join");
+        assert_eq!(canceled.status, TaskStatus::Canceled, "{canceled:?}");
+        assert_eq!(canceled.error_code.as_deref(), Some("parent_canceled"));
+        let children = conversation::Entity::find()
+            .filter(conversation::Column::ParentId.eq(parent.id))
+            .all(&db.conn)
+            .await
+            .expect("list children");
+        assert_eq!(children.len(), 1);
+        assert!(children[0].deleted_at.is_some());
+        assert_eq!(
+            children[0].delegation_task_status,
+            Some(DelegationTaskStatus::Failed)
+        );
+        assert!(runs
+            .load_by_dispatch_intent(parent.id, TICKET_V1_TEST_INTENT_ID)
+            .await
+            .expect("dispatch lookup")
+            .is_none());
+        assert!(mock.spawn_args.lock().await.is_empty());
+        let consumed = broker.start_delegation(retry).await;
+        assert_eq!(
+            consumed.error_code.as_deref(),
+            Some("orchestration_admission_ticket_consumed"),
+            "{consumed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ticket_v1_atomic_admission_continue_guard_spans_reserve_not_resume() {
+        use crate::db::entities::conversation;
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let parent = conversation_service::create(
+            &db.conn,
+            seed_folder(&db, "/tmp/codeg-ticket-v1-continue-gate").await,
+            AgentType::ClaudeCode,
+            Some("ticket-v1 continue gate parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db.clone()));
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("ticket-v1-root-child".into())).await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+        let mut root = request(parent.id, "ticket-v1-continue-root");
+        root.working_dir = Some(test_working_dir());
+        root.work_unit_key = Some("task|10|implementer|codex|none".into());
+        let root_report = broker.start_delegation(root).await;
+        let root_task_id = root_report.task_id.expect("root task");
+        let child_id = root_report.child_conversation_id.expect("root child");
+        broker
+            .complete_call(&root_task_id, completed_outcome("root complete"))
+            .await;
+        let child = conversation::Entity::find_by_id(child_id)
+            .one(&db.conn)
+            .await
+            .expect("load child")
+            .expect("child");
+        let mut child = child.into_active_model();
+        child.external_id = Set(Some("ticket-v1-existing-session".into()));
+        child.update(&db.conn).await.expect("set external session");
+        let target = runs
+            .load_by_task_id(&root_task_id)
+            .await
+            .expect("load root")
+            .expect("root run");
+        let mut req = crate::acp::delegation::types::ContinueDelegationRequest {
+            parent_connection_id: "parent-conn".into(),
+            parent_conversation_id: parent.id,
+            parent_tool_use_id: "ticket-v1-continue-gate".into(),
+            target_task_id: root_task_id.clone(),
+            task: "continue with an empty cwd claim".into(),
+            work_unit_key: Some("task|10|implementer|codex|none".into()),
+            external_handle: None,
+            correlation_id: None,
+            dispatch_intent_id: None,
+            admission_ticket: None,
+            recovery_authorization_id: None,
+            orchestration_binding: None,
+        };
+        prepare_continue_ticket(
+            &runs,
+            &mut req,
+            target.agent_type,
+            target.profile_id.as_deref(),
+        )
+        .await;
+        let expected_fingerprint =
+            continue_ticket_v1_candidate(&req, target.agent_type, target.profile_id.as_deref())
+                .expect("continue candidate")
+                .request_fingerprint;
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (reserve_release, reserve_rx) = tokio::sync::oneshot::channel();
+        runs.install_continue_admission_gate(entered_tx, reserve_rx)
+            .await;
+        mock.queue_spawn(Ok("ticket-v1-resume-child".into())).await;
+        mock.queue_send(Ok(accepted(child_id, Utc::now()))).await;
+        let spawn_release = mock.install_spawn_gate().await;
+        let driver = {
+            let broker = broker.clone();
+            tokio::spawn(async move { broker.continue_delegation(req).await })
+        };
+
+        entered_rx.await.expect("continue reserve gate entered");
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                runs.orchestration_mutation_guard()
+            )
+            .await
+            .is_err(),
+            "continue reserve must retain the mutation guard"
+        );
+        reserve_release.send(()).expect("release continue reserve");
+        wait_for_spawn_calls(&mock, 2).await;
+        let competing =
+            tokio::time::timeout(Duration::from_secs(1), runs.orchestration_mutation_guard())
+                .await
+                .expect("guard must be released before continue resume");
+        drop(competing);
+        spawn_release.send(()).expect("release continue resume");
+        let report = driver.await.expect("continue join");
+        assert_eq!(report.status, TaskStatus::Running, "{report:?}");
+        assert_eq!(report.reused_session, Some(true));
+        assert_eq!(report.child_conversation_id, Some(child_id));
+        let continued = runs
+            .load_by_task_id(report.task_id.as_deref().expect("continued task"))
+            .await
+            .expect("load continued")
+            .expect("continued run");
+        assert_eq!(
+            continued.previous_task_id.as_deref(),
+            Some(root_task_id.as_str())
+        );
+        assert_eq!(
+            continued.dispatch_intent_id.as_deref(),
+            Some(TICKET_V1_TEST_INTENT_ID)
+        );
+        assert_eq!(
+            continued.request_fingerprint.as_deref(),
+            Some(expected_fingerprint.as_str())
+        );
+        assert_eq!(continued.child_conversation_id, child_id);
+    }
+
+    #[tokio::test]
+    async fn ticket_v1_atomic_admission_authorization_failures_rollback_after_burn() {
+        use crate::acp::delegation::types::OrchestrationBindingQueryRequest;
+        use crate::db::entities::conversation::{self, DelegationTaskStatus};
+        use crate::db::entities::delegation_task_run::{self, Entity as DelegationTaskRun};
+        use crate::db::entities::recovery_authorization::{self, RecoveryAuthorizationStatus};
+        use chrono::Duration as ChronoDuration;
+        use sea_orm::{
+            ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, IntoActiveModel,
+            QueryFilter, Set,
+        };
+
+        for (case, expected_code) in [
+            ("expired", "recovery_authorization_expired"),
+            ("consumed", "recovery_authorization_consumed_conflict"),
+            ("cas-lost", "recovery_authorization_consumed_conflict"),
+        ] {
+            let fixture = ticketed_authorization_fixture(case).await;
+            let receipt = recovery_authorization::Entity::find_by_id(&fixture.authorization_id)
+                .one(&fixture.db.conn)
+                .await
+                .expect("load authorization")
+                .expect("authorization");
+            match case {
+                "expired" => {
+                    let mut receipt = receipt.into_active_model();
+                    receipt.expires_at = Set(Some(Utc::now() - ChronoDuration::minutes(1)));
+                    receipt
+                        .update(&fixture.db.conn)
+                        .await
+                        .expect("expire authorization clock");
+                }
+                "consumed" => {
+                    let mut receipt = receipt.into_active_model();
+                    receipt.status = Set(RecoveryAuthorizationStatus::Consumed);
+                    receipt.consumed_at = Set(Some(Utc::now()));
+                    receipt.consumed_by_kind = Set(Some("delegation_task_run".into()));
+                    receipt.consumed_by_id = Set(Some("different-task".into()));
+                    receipt.consumer_correlation_id = Set(Some("different-correlation".into()));
+                    receipt
+                        .update(&fixture.db.conn)
+                        .await
+                        .expect("consume authorization elsewhere");
+                }
+                "cas-lost" => {
+                    fixture
+                        .db
+                        .conn
+                        .execute_unprepared(
+                            "CREATE TRIGGER ticket_v1_auth_cas_loss \
+                             BEFORE UPDATE ON recovery_authorizations \
+                             WHEN OLD.status = 'approved' AND NEW.status = 'consumed' \
+                             BEGIN SELECT RAISE(IGNORE); END;",
+                        )
+                        .await
+                        .expect("install authorization CAS-loss trigger");
+                }
+                _ => unreachable!(),
+            }
+
+            let failed = fixture
+                .broker
+                .start_delegation(fixture.request.clone())
+                .await;
+            assert_eq!(
+                failed.error_code.as_deref(),
+                Some(expected_code),
+                "{case}: {failed:?}"
+            );
+            assert!(fixture.mock.spawn_args.lock().await.is_empty(), "{case}");
+            let rows = DelegationTaskRun::find()
+                .filter(delegation_task_run::Column::ParentConversationId.eq(fixture.parent_id))
+                .all(&fixture.db.conn)
+                .await
+                .expect("list runs");
+            assert_eq!(rows.len(), 1, "{case}: {rows:?}");
+            assert_eq!(rows[0].task_id, fixture.source_task_id, "{case}");
+            assert!(
+                fixture
+                    .runs
+                    .load_by_dispatch_intent(fixture.parent_id, TICKET_V1_TEST_INTENT_ID)
+                    .await
+                    .expect("dispatch lookup")
+                    .is_none(),
+                "{case}"
+            );
+            let children = conversation::Entity::find()
+                .filter(conversation::Column::ParentId.eq(fixture.parent_id))
+                .all(&fixture.db.conn)
+                .await
+                .expect("list children");
+            let provisional = children
+                .iter()
+                .find(|child| child.deleted_at.is_some())
+                .expect("failed admission must compensate its provisional child");
+            assert_eq!(
+                provisional.delegation_task_status,
+                Some(DelegationTaskStatus::Failed),
+                "{case}"
+            );
+            let attempted_task_id = provisional
+                .delegation_call_id
+                .as_deref()
+                .expect("provisional delegation id");
+            assert!(!rows.iter().any(|row| row.task_id == attempted_task_id));
+            let page = fixture
+                .runs
+                .get_orchestration_binding_page(
+                    fixture.parent_id,
+                    OrchestrationBindingQueryRequest {
+                        namespace: "brainstorm-to-delivery".into(),
+                        limit: 200,
+                        snapshot_id: None,
+                        cursor: None,
+                    },
+                )
+                .await
+                .expect("binding evidence");
+            assert!(
+                !page.runs.iter().any(|run| run.task_id == attempted_task_id),
+                "{case}"
+            );
+
+            let consumed = fixture.broker.start_delegation(fixture.request).await;
+            assert_eq!(
+                consumed.error_code.as_deref(),
+                Some("orchestration_admission_ticket_consumed"),
+                "{case}: {consumed:?}"
+            );
+            let receipt = recovery_authorization::Entity::find_by_id(&fixture.authorization_id)
+                .one(&fixture.db.conn)
+                .await
+                .expect("reload authorization")
+                .expect("authorization");
+            let expected_status = if case == "consumed" {
+                RecoveryAuthorizationStatus::Consumed
+            } else {
+                RecoveryAuthorizationStatus::Approved
+            };
+            assert_eq!(receipt.status, expected_status, "{case}");
+        }
+    }
+
+    #[test]
+    fn ticket_v1_atomic_admission_exact_replay_metadata_is_true_only_on_replay() {
+        let normal = running_ack(
+            "6b228a7d-4ac9-4bc7-a16e-f4ecf6f0fd45".into(),
+            42,
+            AgentType::Codex,
+        );
+        assert!(!normal.is_idempotent_replay());
+        assert!(serde_json::to_value(&normal)
+            .unwrap()
+            .get("idempotent_replay")
+            .is_none());
+
+        let replay = mark_dispatch_intent_replay(normal);
+        assert!(replay.is_idempotent_replay());
+        assert_eq!(
+            serde_json::to_value(replay).unwrap()["idempotent_replay"],
+            true
+        );
+    }
+
+    #[tokio::test]
+    async fn ticket_v1_authorization_precedence_parent_tool_conflict_wins_then_ticket_is_consumed()
+    {
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-ticket-v1-auth-precedence").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("ticket-v1 precedence parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db));
+        let mock = Arc::new(MockSpawner::new());
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        let mut source = request(parent.id, "ticket-v1-shared-parent-tool");
+        source.agent_type = AgentType::Codex;
+        source.working_dir = Some(test_working_dir());
+        source.work_unit_key = Some("task|10|implementer|codex|none".into());
+        mock.queue_spawn(Ok("ticket-v1-source-connection".into()))
+            .await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let source_ack = broker.start_delegation(source).await;
+        let source_task_id = source_ack.task_id.clone().expect("source task");
+        broker
+            .complete_call(&source_task_id, completed_outcome("source complete"))
+            .await;
+
+        let mut replacement = request(parent.id, "ticket-v1-shared-parent-tool");
+        replacement.agent_type = AgentType::Codex;
+        replacement.working_dir = Some(test_working_dir());
+        replacement.work_unit_key = Some("task|10|implementer|codex|none".into());
+        replacement.replaces_task_id = Some(source_task_id);
+        replacement.replacement_reason =
+            Some(crate::acp::delegation::run_store::REPLACEMENT_REASON_UNRESUMABLE.into());
+        replacement.recovery_authorization_id = Some("4a67bba4-e1f5-46d1-a9b1-aa796598ffce".into());
+        prepare_delegate_ticket(&runs, &mut replacement).await;
+
+        let conflict = broker.start_delegation(replacement.clone()).await;
+        assert_eq!(
+            conflict.error_code.as_deref(),
+            Some("duplicate_parent_tool")
+        );
+        let consumed = broker.start_delegation(replacement).await;
+        assert_eq!(
+            consumed.error_code.as_deref(),
+            Some("orchestration_admission_ticket_consumed")
+        );
+        assert_eq!(
+            mock.spawn_args.lock().await.len(),
+            1,
+            "ticket rejection must not spawn a replacement"
+        );
+    }
+
+    #[test]
+    fn ticket_v1_request_contract_broker_candidates_use_raw_delegate_and_empty_continue_cwd() {
+        let mut binding = orchestration_binding_fixture();
+        binding.generation = 2;
+        let mut delegate = request(1, "ticket-v1-delegate");
+        delegate.agent_type = AgentType::Codex;
+        delegate.task = "Implement Task 7 from the reviewed Plan.".into();
+        delegate.working_dir = Some(r"D:\canonical-launch-path".into());
+        delegate.requested_working_dir =
+            Some("\u{0009}\u{00a0}\u{feff}\u{2028}D:/repo\u{2029} \u{000d}".into());
+        delegate.work_unit_key = Some("task|7|implementer|codex|none".into());
+        delegate.orchestration_binding = Some(binding.clone());
+        delegate.dispatch_intent_id = Some("8f95dd45-9eca-42a8-9909-0ac00be8ad52".into());
+        delegate.admission_ticket = Some("4a67bba4-e1f5-46d1-a9b1-aa796598ffce".into());
+
+        let candidate = delegate_ticket_v1_candidate(&delegate).unwrap();
+        assert_eq!(
+            candidate.request_fingerprint,
+            "b80f59256b2d5268a015aca99f6c1f0df14aa6d71a96ab0bf46774476f0f2de8"
+        );
+        assert_eq!(
+            candidate.dispatch_intent_id,
+            "8f95dd45-9eca-42a8-9909-0ac00be8ad52"
+        );
+        assert_eq!(
+            candidate.admission_ticket,
+            "4a67bba4-e1f5-46d1-a9b1-aa796598ffce"
+        );
+
+        let continuation = crate::acp::delegation::types::ContinueDelegationRequest {
+            parent_connection_id: "parent-conn".into(),
+            parent_conversation_id: 1,
+            parent_tool_use_id: "ticket-v1-continue".into(),
+            target_task_id: "6b228a7d-4ac9-4bc7-a16e-f4ecf6f0fd45".into(),
+            task: "Continue the approved implementation".into(),
+            work_unit_key: Some("task|7|implementer|codex|none".into()),
+            external_handle: None,
+            correlation_id: None,
+            dispatch_intent_id: Some("8f95dd45-9eca-42a8-9909-0ac00be8ad52".into()),
+            admission_ticket: Some("4a67bba4-e1f5-46d1-a9b1-aa796598ffce".into()),
+            recovery_authorization_id: None,
+            orchestration_binding: Some(binding),
+        };
+        let candidate =
+            continue_ticket_v1_candidate(&continuation, AgentType::Codex, None).unwrap();
+        assert_eq!(
+            candidate.request_fingerprint,
+            "2a44be9d1662a314cbbd2c8111bcf83159be7bdc93abadff977d01447f986648"
+        );
     }
 
     #[tokio::test]
@@ -16880,6 +18204,7 @@ mod tests {
             );
             let runs = Arc::new(RunStore::new(db.clone()));
             runs.insert_reserving(ReservingRunInsert {
+                dispatch_intent_id: None,
                 orchestration_binding: source_binding.clone(),
                 task_id: source_task_id.clone(),
                 root_task_id: source_task_id.clone(),
@@ -16945,6 +18270,8 @@ mod tests {
                     work_unit_key: Some(work_unit_key.clone()),
                     external_handle: None,
                     correlation_id: Some(format!("binding-continue-{case}-mismatch")),
+                    dispatch_intent_id: None,
+                    admission_ticket: None,
                     recovery_authorization_id: Some(authorization_id.clone()),
                     orchestration_binding: mismatched_binding,
                 })
@@ -16979,6 +18306,8 @@ mod tests {
                     work_unit_key: Some(work_unit_key),
                     external_handle: None,
                     correlation_id: Some(format!("binding-continue-{case}-accepted")),
+                    dispatch_intent_id: None,
+                    admission_ticket: None,
                     recovery_authorization_id: Some(authorization_id.clone()),
                     orchestration_binding: accepted_binding,
                 })
@@ -17045,6 +18374,7 @@ mod tests {
         .await
         .expect("source child");
         runs.insert_reserving(ReservingRunInsert {
+            dispatch_intent_id: None,
             orchestration_binding: Some(orchestration_binding_fixture()),
             task_id: source_task_id.clone(),
             root_task_id: source_task_id.clone(),
@@ -24702,6 +26032,7 @@ mod tests {
         let runs = Arc::new(RunStore::new(db.clone()));
         let task_id = "task-preboot-continue".to_string();
         runs.insert_reserving(ReservingRunInsert {
+            dispatch_intent_id: None,
             orchestration_binding: None,
             task_id: task_id.clone(),
             root_task_id: task_id.clone(),
@@ -24909,6 +26240,7 @@ mod tests {
         let runs = Arc::new(RunStore::new(db.clone()));
         let task_id = "task-bind-fail-admission".to_string();
         runs.insert_reserving(ReservingRunInsert {
+            dispatch_intent_id: None,
             orchestration_binding: None,
             task_id: task_id.clone(),
             root_task_id: task_id.clone(),
@@ -25437,6 +26769,7 @@ mod tests {
         let runs = Arc::new(RunStore::new(db.clone()));
         let task_id = "task-same-conn-running".to_string();
         runs.insert_reserving(ReservingRunInsert {
+            dispatch_intent_id: None,
             orchestration_binding: None,
             task_id: task_id.clone(),
             root_task_id: task_id.clone(),
@@ -25746,6 +27079,8 @@ mod tests {
                     work_unit_key: None,
                     external_handle: None,
                     correlation_id: None,
+                    dispatch_intent_id: None,
+                    admission_ticket: None,
                     recovery_authorization_id: None,
                     orchestration_binding: None,
                 })
@@ -25900,6 +27235,8 @@ mod tests {
                     work_unit_key: None,
                     external_handle: None,
                     correlation_id: None,
+                    dispatch_intent_id: None,
+                    admission_ticket: None,
                     recovery_authorization_id: None,
                     orchestration_binding: None,
                 })
@@ -26007,6 +27344,7 @@ mod tests {
         let runs = Arc::new(RunStore::new(db.clone()));
         let task_id = "task-no-handoff".to_string();
         runs.insert_reserving(ReservingRunInsert {
+            dispatch_intent_id: None,
             orchestration_binding: None,
             task_id: task_id.clone(),
             root_task_id: task_id.clone(),
@@ -26187,6 +27525,8 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: None,
+                dispatch_intent_id: None,
+                admission_ticket: None,
                 recovery_authorization_id: None,
                 orchestration_binding: None,
             })
@@ -26591,6 +27931,8 @@ mod tests {
                         work_unit_key: None,
                         external_handle: None,
                         correlation_id: None,
+                        dispatch_intent_id: None,
+                        admission_ticket: None,
                         recovery_authorization_id: None,
                         orchestration_binding: None,
                     })
@@ -27130,6 +28472,8 @@ mod tests {
                         work_unit_key: None,
                         external_handle: None,
                         correlation_id: None,
+                        dispatch_intent_id: None,
+                        admission_ticket: None,
                         recovery_authorization_id: None,
                         orchestration_binding: None,
                     })
@@ -27636,6 +28980,8 @@ mod tests {
                         work_unit_key: None,
                         external_handle: None,
                         correlation_id: None,
+                        dispatch_intent_id: None,
+                        admission_ticket: None,
                         recovery_authorization_id: None,
                         orchestration_binding: None,
                     })
@@ -27718,6 +29064,7 @@ mod tests {
             let runs = Arc::new(RunStore::new(db.clone()));
             let task_id = format!("task-finalizer-{code}");
             runs.insert_reserving(ReservingRunInsert {
+                dispatch_intent_id: None,
                 orchestration_binding: None,
                 task_id: task_id.clone(),
                 root_task_id: task_id.clone(),
@@ -28050,6 +29397,8 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: None,
+                dispatch_intent_id: None,
+                admission_ticket: None,
                 recovery_authorization_id: None,
                 orchestration_binding: None,
             })
@@ -28224,6 +29573,8 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: None,
+                dispatch_intent_id: None,
+                admission_ticket: None,
                 recovery_authorization_id: None,
                 orchestration_binding: None,
             })
@@ -28702,6 +30053,7 @@ mod tests {
         let runs = Arc::new(RunStore::new(db.clone()));
         let task_id = format!("task-boot-{label}");
         runs.insert_reserving(ReservingRunInsert {
+            dispatch_intent_id: None,
             orchestration_binding: None,
             task_id: task_id.clone(),
             root_task_id: task_id.clone(),
@@ -28944,6 +30296,7 @@ mod tests {
         let runs = Arc::new(RunStore::new(db.clone()));
         let task_id = "task-boot-perm".to_string();
         runs.insert_reserving(ReservingRunInsert {
+            dispatch_intent_id: None,
             orchestration_binding: None,
             task_id: task_id.clone(),
             root_task_id: task_id.clone(),
@@ -29070,6 +30423,7 @@ mod tests {
         let task_id = "task-boot-perm-pe".to_string();
         let parent_conn = "parent-conn-perm-pe".to_string();
         runs.insert_reserving(ReservingRunInsert {
+            dispatch_intent_id: None,
             orchestration_binding: None,
             task_id: task_id.clone(),
             root_task_id: task_id.clone(),
@@ -29207,6 +30561,7 @@ mod tests {
         let task_id = "task-boot-perm-dur".to_string();
         let parent_conn = "parent-conn-perm-dur".to_string();
         runs.insert_reserving(ReservingRunInsert {
+            dispatch_intent_id: None,
             orchestration_binding: None,
             task_id: task_id.clone(),
             root_task_id: task_id.clone(),
@@ -29389,6 +30744,7 @@ mod tests {
         let task_id = "task-boot-pe-race".to_string();
         let parent_conn = "parent-conn-pe-race".to_string();
         runs.insert_reserving(ReservingRunInsert {
+            dispatch_intent_id: None,
             orchestration_binding: None,
             task_id: task_id.clone(),
             root_task_id: task_id.clone(),
@@ -29598,6 +30954,7 @@ mod tests {
         let task_id = "task-boot-cas-excl".to_string();
         let parent_conn = "parent-conn-cas-excl".to_string();
         runs.insert_reserving(ReservingRunInsert {
+            dispatch_intent_id: None,
             orchestration_binding: None,
             task_id: task_id.clone(),
             root_task_id: task_id.clone(),
@@ -29945,6 +31302,8 @@ mod tests {
                     work_unit_key: None,
                     external_handle: None,
                     correlation_id: None,
+                    dispatch_intent_id: None,
+                    admission_ticket: None,
                     recovery_authorization_id: None,
                     orchestration_binding: None,
                 })
@@ -30038,6 +31397,8 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: None,
+                dispatch_intent_id: None,
+                admission_ticket: None,
                 recovery_authorization_id: None,
                 orchestration_binding: None,
             })
@@ -30866,6 +32227,7 @@ mod tests {
         let runs = Arc::new(RunStore::new(db.clone()));
         let task_id = "task-preboot-parent-cancel".to_string();
         runs.insert_reserving(ReservingRunInsert {
+            dispatch_intent_id: None,
             orchestration_binding: None,
             task_id: task_id.clone(),
             root_task_id: task_id.clone(),
@@ -33804,6 +35166,7 @@ mod tests {
             reached_running_at: None,
             child_connection_id: None,
             request_fingerprint: None,
+            dispatch_intent_id: None,
             task_preview: None,
             admission_class:
                 crate::db::entities::delegation_task_run::AdmissionClass::NormalRevision,
@@ -36685,6 +38048,8 @@ mod tests {
                 work_unit_key: Some(v2_plan_author_work_unit_key()),
                 external_handle: None,
                 correlation_id: None,
+                dispatch_intent_id: None,
+                admission_ticket: None,
                 recovery_authorization_id: None,
                 orchestration_binding: None,
             })
@@ -36742,6 +38107,8 @@ mod tests {
                 work_unit_key: Some(v2_plan_author_work_unit_key()),
                 external_handle: None,
                 correlation_id: None,
+                dispatch_intent_id: None,
+                admission_ticket: None,
                 recovery_authorization_id: None,
                 orchestration_binding: None,
             })
@@ -36897,6 +38264,8 @@ mod tests {
                         work_unit_key: Some(v2_plan_author_work_unit_key()),
                         external_handle: None,
                         correlation_id: None,
+                        dispatch_intent_id: None,
+                        admission_ticket: None,
                         recovery_authorization_id: None,
                         orchestration_binding: None,
                     })
@@ -37159,6 +38528,8 @@ mod tests {
                     work_unit_key: Some(v2_plan_author_work_unit_key()),
                     external_handle: None,
                     correlation_id: None,
+                    dispatch_intent_id: None,
+                    admission_ticket: None,
                     recovery_authorization_id: None,
                     orchestration_binding: None,
                 })
@@ -37265,6 +38636,8 @@ mod tests {
                 work_unit_key: Some(v2_plan_author_work_unit_key()),
                 external_handle: None,
                 correlation_id: None,
+                dispatch_intent_id: None,
+                admission_ticket: None,
                 recovery_authorization_id: None,
                 orchestration_binding: None,
             })
@@ -37368,6 +38741,8 @@ mod tests {
                 work_unit_key: Some(v2_plan_author_work_unit_key()),
                 external_handle: None,
                 correlation_id: None,
+                dispatch_intent_id: None,
+                admission_ticket: None,
                 recovery_authorization_id: None,
                 orchestration_binding: None,
             })
@@ -37466,6 +38841,7 @@ mod tests {
             .expect("agent type string")
             .to_string();
         runs.admit_gen1_reserving(ReservingRunInsert {
+            dispatch_intent_id: None,
             orchestration_binding: None,
             task_id: task_id.into(),
             root_task_id: task_id.into(),
@@ -38857,6 +40233,8 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: None,
+                dispatch_intent_id: None,
+                admission_ticket: None,
                 recovery_authorization_id: None,
                 orchestration_binding: None,
             })
@@ -38902,6 +40280,8 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: None,
+                dispatch_intent_id: None,
+                admission_ticket: None,
                 recovery_authorization_id: None,
                 orchestration_binding: None,
             })
@@ -38937,6 +40317,8 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: Some("cont-corr-1".into()),
+                dispatch_intent_id: None,
+                admission_ticket: None,
                 recovery_authorization_id: None,
                 orchestration_binding: None,
             })
@@ -38975,6 +40357,8 @@ mod tests {
                 work_unit_key: None,
                 external_handle: Some("h-cont-claim-cancel".into()),
                 correlation_id: Some("cont-ext-cancel".into()),
+                dispatch_intent_id: None,
+                admission_ticket: None,
                 recovery_authorization_id: None,
                 orchestration_binding: None,
             })
@@ -39015,6 +40399,8 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: Some("cont-join-abandon".into()),
+                dispatch_intent_id: None,
+                admission_ticket: None,
                 recovery_authorization_id: None,
                 orchestration_binding: None,
             })
@@ -39095,6 +40481,8 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: Some("cont-bind".into()),
+                dispatch_intent_id: None,
+                admission_ticket: None,
                 recovery_authorization_id: None,
                 orchestration_binding: None,
             })
@@ -39194,6 +40582,8 @@ mod tests {
             work_unit_key: None,
             external_handle: None,
             correlation_id: Some("cont-mcp-first".into()),
+            dispatch_intent_id: None,
+            admission_ticket: None,
             recovery_authorization_id: None,
             orchestration_binding: None,
         };
@@ -39372,6 +40762,8 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: Some("corr-t2".into()),
+                dispatch_intent_id: None,
+                admission_ticket: None,
                 recovery_authorization_id: None,
                 orchestration_binding: None,
             })
@@ -39611,6 +41003,8 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: None,
+                dispatch_intent_id: None,
+                admission_ticket: None,
                 recovery_authorization_id: None,
                 orchestration_binding: None,
             })
@@ -39633,6 +41027,8 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: Some("corr-timeout-nf".into()),
+                dispatch_intent_id: None,
+                admission_ticket: None,
                 recovery_authorization_id: None,
                 orchestration_binding: None,
             })
@@ -39656,6 +41052,8 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: Some(".leading-dot-invalid".into()),
+                dispatch_intent_id: None,
+                admission_ticket: None,
                 recovery_authorization_id: None,
                 orchestration_binding: None,
             })
@@ -39695,6 +41093,8 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: None,
+                dispatch_intent_id: None,
+                admission_ticket: None,
                 recovery_authorization_id: None,
                 orchestration_binding: None,
             })
@@ -39974,6 +41374,8 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: Some(cont_secret.into()),
+                dispatch_intent_id: None,
+                admission_ticket: None,
                 recovery_authorization_id: None,
                 orchestration_binding: None,
             })
@@ -40089,6 +41491,8 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: Some(corr.into()),
+                dispatch_intent_id: None,
+                admission_ticket: None,
                 recovery_authorization_id: None,
                 orchestration_binding: None,
             })
@@ -40194,6 +41598,8 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: None,
+                dispatch_intent_id: None,
+                admission_ticket: None,
                 recovery_authorization_id: None,
                 orchestration_binding: None,
             })
@@ -40281,6 +41687,8 @@ mod tests {
             work_unit_key: None,
             external_handle: None,
             correlation_id: None,
+            dispatch_intent_id: None,
+            admission_ticket: None,
             recovery_authorization_id: None,
             orchestration_binding: None,
         };
@@ -40365,6 +41773,8 @@ mod tests {
             work_unit_key: None,
             external_handle: None,
             correlation_id: None,
+            dispatch_intent_id: None,
+            admission_ticket: None,
             recovery_authorization_id: None,
             orchestration_binding: None,
         };
@@ -40522,6 +41932,8 @@ mod tests {
                         work_unit_key: None,
                         external_handle: None,
                         correlation_id: None,
+                        dispatch_intent_id: None,
+                        admission_ticket: None,
                         recovery_authorization_id: None,
                         orchestration_binding: None,
                     })
@@ -40646,6 +42058,8 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: None,
+                dispatch_intent_id: None,
+                admission_ticket: None,
                 recovery_authorization_id: None,
                 orchestration_binding: None,
             })
@@ -40917,6 +42331,7 @@ mod tests {
             .expect("agent type string")
             .to_string();
         runs.insert_reserving(ReservingRunInsert {
+            dispatch_intent_id: None,
             orchestration_binding: None,
             task_id: source_task_id.into(),
             root_task_id: source_task_id.into(),
@@ -41125,6 +42540,8 @@ mod tests {
             work_unit_key: None,
             external_handle: None,
             correlation_id: None,
+            dispatch_intent_id: None,
+            admission_ticket: None,
             recovery_authorization_id: None,
             orchestration_binding: None,
         };
@@ -41272,6 +42689,8 @@ mod tests {
             work_unit_key: None,
             external_handle: None,
             correlation_id: None,
+            dispatch_intent_id: None,
+            admission_ticket: None,
             recovery_authorization_id: None,
             orchestration_binding: None,
         };
@@ -41414,6 +42833,8 @@ mod tests {
             work_unit_key: None,
             external_handle: None,
             correlation_id: None,
+            dispatch_intent_id: None,
+            admission_ticket: None,
             recovery_authorization_id: None,
             orchestration_binding: None,
         };
@@ -41523,6 +42944,8 @@ mod tests {
             work_unit_key: None,
             external_handle: None,
             correlation_id: None,
+            dispatch_intent_id: None,
+            admission_ticket: None,
             recovery_authorization_id: None,
             orchestration_binding: None,
         };
@@ -41626,6 +43049,8 @@ mod tests {
             work_unit_key: None,
             external_handle: None,
             correlation_id: None,
+            dispatch_intent_id: None,
+            admission_ticket: None,
             recovery_authorization_id: None,
             orchestration_binding: None,
         };
@@ -41754,6 +43179,8 @@ mod tests {
             work_unit_key: None,
             external_handle: None,
             correlation_id: None,
+            dispatch_intent_id: None,
+            admission_ticket: None,
             recovery_authorization_id: None,
             orchestration_binding: None,
         };
@@ -41870,6 +43297,8 @@ mod tests {
             work_unit_key: None,
             external_handle: None,
             correlation_id: None,
+            dispatch_intent_id: None,
+            admission_ticket: None,
             recovery_authorization_id: None,
             orchestration_binding: None,
         };
@@ -41966,6 +43395,8 @@ mod tests {
                 work_unit_key: None,
                 external_handle: Some("precancel-handle-1".into()),
                 correlation_id: None,
+                dispatch_intent_id: None,
+                admission_ticket: None,
                 recovery_authorization_id: None,
                 orchestration_binding: None,
             })
@@ -42033,6 +43464,8 @@ mod tests {
             work_unit_key: None,
             external_handle: None,
             correlation_id: None,
+            dispatch_intent_id: None,
+            admission_ticket: None,
             recovery_authorization_id: None,
             orchestration_binding: None,
         };
@@ -42547,6 +43980,8 @@ mod tests {
             work_unit_key: None,
             external_handle: None,
             correlation_id: None,
+            dispatch_intent_id: None,
+            admission_ticket: None,
             recovery_authorization_id: None,
             orchestration_binding: None,
         };
@@ -42774,6 +44209,8 @@ mod tests {
             work_unit_key: None,
             external_handle: None,
             correlation_id: None,
+            dispatch_intent_id: None,
+            admission_ticket: None,
             recovery_authorization_id: None,
             orchestration_binding: None,
         };
@@ -42885,6 +44322,8 @@ mod tests {
             work_unit_key: None,
             external_handle: None,
             correlation_id: None,
+            dispatch_intent_id: None,
+            admission_ticket: None,
             recovery_authorization_id: None,
             orchestration_binding: None,
         };
@@ -43033,6 +44472,8 @@ mod tests {
             work_unit_key: None,
             external_handle: None,
             correlation_id: None,
+            dispatch_intent_id: None,
+            admission_ticket: None,
             recovery_authorization_id: None,
             orchestration_binding: None,
         };
@@ -43197,6 +44638,8 @@ mod tests {
             work_unit_key: None,
             external_handle: None,
             correlation_id: None,
+            dispatch_intent_id: None,
+            admission_ticket: None,
             recovery_authorization_id: None,
             orchestration_binding: None,
         };
@@ -43383,6 +44826,8 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: Some("corr-1485-acp".into()),
+                dispatch_intent_id: None,
+                admission_ticket: None,
                 recovery_authorization_id: None,
                 orchestration_binding: None,
             })
@@ -43507,6 +44952,8 @@ mod tests {
             work_unit_key: None,
             external_handle: None,
             correlation_id: Some("corr-1485-mcp".into()),
+            dispatch_intent_id: None,
+            admission_ticket: None,
             recovery_authorization_id: None,
             orchestration_binding: None,
         };
@@ -43611,6 +45058,8 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: None,
+                dispatch_intent_id: None,
+                admission_ticket: None,
                 recovery_authorization_id: None,
                 orchestration_binding: None,
             })
@@ -43703,6 +45152,8 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: Some("corr-1485-dup".into()),
+                dispatch_intent_id: None,
+                admission_ticket: None,
                 recovery_authorization_id: None,
                 orchestration_binding: None,
             })
@@ -43928,6 +45379,7 @@ mod tests {
                 .expect("agent type string")
                 .to_string();
             runs.insert_reserving(ReservingRunInsert {
+                dispatch_intent_id: None,
                 orchestration_binding: None,
                 task_id: task_id.clone(),
                 root_task_id: task_id.clone(),

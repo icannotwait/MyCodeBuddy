@@ -68,6 +68,7 @@ mod m20260811_000001_simple_workflows;
 mod m20260817_000001_delegation_orchestration_bindings;
 mod m20260817_000001_work_task_conversation_title;
 mod m20260819_000001_turn_generation_stat;
+mod m20260827_000001_delegation_dispatch_intent;
 #[cfg(test)]
 pub(crate) use m20260817_000001_delegation_orchestration_bindings::install_for_historical_completion_fixture;
 pub struct Migrator;
@@ -143,6 +144,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260817_000001_delegation_orchestration_bindings::Migration),
             Box::new(m20260817_000001_work_task_conversation_title::Migration),
             Box::new(m20260819_000001_turn_generation_stat::Migration),
+            Box::new(m20260827_000001_delegation_dispatch_intent::Migration),
         ]
     }
 }

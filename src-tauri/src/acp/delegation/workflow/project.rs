@@ -5116,6 +5116,7 @@ mod tests {
             config_values_json: None,
             task_preview: None,
             request_fingerprint: None,
+            dispatch_intent_id: None,
             admission_class:
                 crate::db::entities::delegation_task_run::AdmissionClass::NormalRevision,
             reached_running_at: None,

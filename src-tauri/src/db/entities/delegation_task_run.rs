@@ -68,6 +68,7 @@ pub struct Model {
     pub config_values_json: Option<String>,
     pub task_preview: Option<String>,
     pub request_fingerprint: Option<String>,
+    pub dispatch_intent_id: Option<String>,
     pub admission_class: AdmissionClass,
     pub reached_running_at: Option<DateTimeUtc>,
     pub lineage_root_task_id: String,

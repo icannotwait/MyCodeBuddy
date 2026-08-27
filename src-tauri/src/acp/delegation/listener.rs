@@ -47,10 +47,10 @@ use crate::acp::delegation::transport::{
     CompanionRole,
 };
 use crate::acp::delegation::types::{
-    correlation_error_message, validate_correlation_id, CorrelationEntryPoint,
-    CorrelationFailureKind, DelegationReplyResult, DelegationRequest, DelegationReturnWhen,
-    DelegationStatusBatch, DelegationTaskReport, DelegationWakeReason, OrchestrationBindingV1,
-    ParentDecisionResult, TaskStatus,
+    correlation_error_message, parse_admission_ticket_v1_request, validate_correlation_id,
+    AdmissionPreparation, CorrelationEntryPoint, CorrelationFailureKind, DelegationReplyResult,
+    DelegationRequest, DelegationReturnWhen, DelegationStatusBatch, DelegationTaskReport,
+    DelegationWakeReason, OrchestrationBindingV1, ParentDecisionResult, TaskStatus,
 };
 #[cfg(test)]
 use crate::acp::delegation::workflow::{
@@ -96,7 +96,7 @@ use serde_json::Value;
 const STATUS_WAIT_MAX_MS: u64 = 60_000;
 
 /// Parent session context for full [`WaitStamp`] registration on Join waits.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParentWaitContext {
     pub conversation_id: i32,
     pub connection_incarnation: String,
@@ -1640,7 +1640,7 @@ impl DelegationListener {
     async fn orchestration_binding_query_auth_context(
         &self,
         token: &str,
-    ) -> Result<i32, OrchestrationBindingQueryAuthError> {
+    ) -> Result<ParentWaitContext, OrchestrationBindingQueryAuthError> {
         let entry = self
             .tokens
             .lookup(token)
@@ -1653,7 +1653,7 @@ impl DelegationListener {
             return Err(OrchestrationBindingQueryAuthError::CoordinationUnavailable);
         }
         self.parent_lookup
-            .current_conversation_id(&entry.parent_connection_id)
+            .parent_wait_context(&entry.parent_connection_id)
             .await
             .ok_or(OrchestrationBindingQueryAuthError::NoActiveConversation)
     }
@@ -1662,11 +1662,11 @@ impl DelegationListener {
         &self,
         req: BrokerOrchestrationBindingsRequest,
     ) -> Value {
-        let parent_id = match self
+        let parent = match self
             .orchestration_binding_query_auth_context(&req.token)
             .await
         {
-            Ok(parent_id) => parent_id,
+            Ok(parent) => parent,
             Err(error) => return error.to_value(),
         };
         let Some(runs) = self.broker.run_store() else {
@@ -1675,8 +1675,60 @@ impl DelegationListener {
             );
         };
         let page_limit = req.page_limit;
+        if let Some(intent) = req.admission_intent.clone() {
+            if parent.connection_incarnation.is_empty() {
+                return orchestration_binding_query_error_value(
+                    crate::acp::delegation::types::OrchestrationBindingQueryError::Failed,
+                );
+            }
+            return match runs
+                .prepare_orchestration_binding_admission(
+                    parent.conversation_id,
+                    &parent.connection_incarnation,
+                    req.query(),
+                    page_limit,
+                    intent,
+                )
+                .await
+            {
+                Ok(envelope) => {
+                    match &envelope.admission {
+                        AdmissionPreparation::Prepared { .. } => self.metrics.record_ticket_outcome(
+                            crate::acp::delegation::metrics::AdmissionTicketMetricOutcome::Issued,
+                        ),
+                        AdmissionPreparation::AlreadyAdmitted { .. } => {
+                            self.metrics.record_ticket_outcome(
+                                crate::acp::delegation::metrics::AdmissionTicketMetricOutcome::AlreadyAdmitted,
+                            );
+                            self.metrics.record_dispatch_intent_outcome(
+                                crate::acp::delegation::metrics::DispatchIntentMetricOutcome::ExactReplay,
+                            );
+                        }
+                    }
+                    serde_json::to_value(envelope).unwrap_or_else(|_| {
+                        orchestration_binding_query_error_value(
+                            crate::acp::delegation::types::OrchestrationBindingQueryError::Failed,
+                        )
+                    })
+                }
+                Err(error) => {
+                    if error
+                        == crate::acp::delegation::types::OrchestrationBindingQueryError::DispatchIntentConflict
+                    {
+                        self.metrics.record_dispatch_intent_outcome(
+                            crate::acp::delegation::metrics::DispatchIntentMetricOutcome::Conflict,
+                        );
+                    }
+                    orchestration_binding_query_error_value(error)
+                }
+            };
+        }
         match runs
-            .get_orchestration_binding_page_with_limit(parent_id, req.query(), page_limit)
+            .get_orchestration_binding_page_with_limit(
+                parent.conversation_id,
+                req.query(),
+                page_limit,
+            )
             .await
         {
             Ok(page) => serde_json::to_value(page).unwrap_or_else(|_| {
@@ -2485,38 +2537,6 @@ impl DelegationListener {
     }
 
     async fn process(&self, req: BrokerRequest) -> DelegationTaskReport {
-        // 1. Token + parent_connection_id consistency check. Treat both as
-        //    "canceled" since the LLM can't usefully react to either —
-        //    the parent has either been torn down or is impersonating.
-        let entry = match self.tokens.lookup(&req.token).await {
-            Some(e) => e,
-            None => return cancel("invalid token"),
-        };
-        if entry.parent_connection_id != req.parent_connection_id {
-            return cancel("token does not match parent connection");
-        }
-
-        // 2. Resolve the parent's current conversation. Without one the
-        //    broker can't link the child row to the parent.
-        let parent_conversation_id = match self
-            .parent_lookup
-            .current_conversation_id(&req.parent_connection_id)
-            .await
-        {
-            Some(id) => id,
-            None => return cancel("parent has no active conversation"),
-        };
-
-        let orchestration_binding = match parse_orchestration_binding(&req.input) {
-            Ok(binding) => binding,
-            Err(message) => return report_failed("orchestration_binding_invalid", &message),
-        };
-
-        let work_unit_key = match parse_work_unit_key(&req.input) {
-            Ok(key) => key,
-            Err(message) => return report_failed("invalid_work_unit_key", &message),
-        };
-
         // continue_delegation: tagged by companion or shape (task_id + task,
         // no agent_type). Must run before agent_type is required.
         let is_continue = req.input.get("_codeg_tool").and_then(|v| v.as_str())
@@ -2524,6 +2544,13 @@ impl DelegationListener {
             || (req.input.get("task_id").is_some()
                 && req.input.get("agent_type").is_none()
                 && req.input.get("task").is_some());
+
+        let admission = match parse_admission_ticket_v1_request(&req.input) {
+            Ok(pair) => pair,
+            Err(message) => {
+                return report_failed("orchestration_admission_ticket_missing", message)
+            }
+        };
 
         // Correlation resolution order (design): non-empty host `_meta.tool_use_id`
         // is authoritative and does not require argument-based correlation.
@@ -2555,6 +2582,39 @@ impl DelegationListener {
             }
         };
 
+        // Token + parent_connection_id consistency check. Treat both as
+        // "canceled" since the LLM can't usefully react to either.
+        let entry = match self.tokens.lookup(&req.token).await {
+            Some(e) => e,
+            None => return cancel("invalid token"),
+        };
+        if entry.parent_connection_id != req.parent_connection_id {
+            return cancel("token does not match parent connection");
+        }
+
+        // Resolve the parent's current conversation. Without one the broker
+        // cannot link the child row to the parent.
+        let parent_context = match self
+            .parent_lookup
+            .parent_wait_context(&req.parent_connection_id)
+            .await
+        {
+            Some(context) => context,
+            None => return cancel("parent has no active conversation"),
+        };
+        let parent_conversation_id = parent_context.conversation_id;
+        let connection_incarnation = parent_context.connection_incarnation;
+
+        let orchestration_binding = match parse_orchestration_binding(&req.input) {
+            Ok(binding) => binding,
+            Err(message) => return report_failed("orchestration_binding_invalid", &message),
+        };
+
+        let work_unit_key = match parse_work_unit_key(&req.input) {
+            Ok(key) => key,
+            Err(message) => return report_failed("invalid_work_unit_key", &message),
+        };
+
         let recovery_authorization_id = match parse_recovery_authorization_id(&req.input) {
             Ok(id) => id,
             Err(message) => return report_failed("invalid_recovery_authorization_id", &message),
@@ -2582,10 +2642,17 @@ impl DelegationListener {
                 work_unit_key,
                 external_handle: req.external_handle,
                 correlation_id,
+                dispatch_intent_id: admission
+                    .as_ref()
+                    .map(|pair| pair.dispatch_intent_id.clone()),
+                admission_ticket: admission.map(|pair| pair.admission_ticket),
                 recovery_authorization_id,
                 orchestration_binding,
             };
-            return self.broker.continue_delegation(continue_req).await;
+            return self
+                .broker
+                .continue_delegation_for_incarnation(continue_req, &connection_incarnation)
+                .await;
         }
 
         // 3. Parse the delegate_to_agent arguments. Schema validation lives
@@ -2615,14 +2682,26 @@ impl DelegationListener {
                 }
             },
         };
+        if req
+            .input
+            .get("profile_label")
+            .is_some_and(|value| !value.is_string())
+        {
+            return report_failed(
+                "invalid_delegation_profile",
+                "profile_label must be a string",
+            );
+        }
         // The `working_dir` the LLM explicitly passed (before defaulting),
         // used by the broker's correlation key. `None` when omitted —
         // symmetric with the ACP `raw_input`, which also omits it then.
-        let requested_working_dir = req
-            .input
-            .get("working_dir")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
+        let requested_working_dir = match req.input.get("working_dir") {
+            None => None,
+            Some(Value::String(value)) => Some(value.clone()),
+            Some(_) => {
+                return report_failed("invalid_working_dir", "working_dir must be a string");
+            }
+        };
         let working_dir = requested_working_dir
             .clone()
             .or_else(|| Some(entry.working_dir.to_string_lossy().to_string()));
@@ -2646,10 +2725,16 @@ impl DelegationListener {
             replaces_task_id,
             replacement_reason,
             correlation_id,
+            dispatch_intent_id: admission
+                .as_ref()
+                .map(|pair| pair.dispatch_intent_id.clone()),
+            admission_ticket: admission.map(|pair| pair.admission_ticket),
             recovery_authorization_id,
             orchestration_binding,
         };
-        self.broker.start_delegation(delegation_req).await
+        self.broker
+            .start_delegation_for_incarnation(delegation_req, &connection_incarnation)
+            .await
     }
 }
 
@@ -2705,13 +2790,14 @@ const WORK_UNIT_KEY_MAX_CHARS: usize = 200;
 
 /// Parse optional `work_unit_key` from `delegate_to_agent` tool input.
 ///
-/// - absent / null / blank → `None` (ad-hoc one-shot)
+/// - absent / blank → `None` (ad-hoc one-shot)
+/// - null / non-string → error
 /// - non-string → error
 /// - trimmed length > 200 Unicode scalars → error
 /// - otherwise → `Some(trimmed)`
 pub(crate) fn parse_work_unit_key(input: &Value) -> Result<Option<String>, String> {
     match input.get("work_unit_key") {
-        None | Some(Value::Null) => Ok(None),
+        None => Ok(None),
         Some(Value::String(raw)) => {
             let trimmed = raw.trim();
             if trimmed.is_empty() {
@@ -2734,7 +2820,7 @@ pub(crate) fn parse_replacement_inputs(
     input: &Value,
 ) -> Result<(Option<String>, Option<String>), String> {
     let replaces = match input.get("replaces_task_id") {
-        None | Some(Value::Null) => None,
+        None => None,
         Some(Value::String(s)) => {
             let t = s.trim();
             if t.is_empty() {
@@ -2746,7 +2832,7 @@ pub(crate) fn parse_replacement_inputs(
         Some(_) => return Err("replaces_task_id must be a string".into()),
     };
     let reason = match input.get("replacement_reason") {
-        None | Some(Value::Null) => None,
+        None => None,
         Some(Value::String(s)) => {
             let t = s.trim();
             if t.is_empty() {
@@ -3423,6 +3509,18 @@ mod tests {
     impl ParentSessionLookup for StaticParentLookup {
         async fn current_conversation_id(&self, _parent_connection_id: &str) -> Option<i32> {
             self.0
+        }
+
+        async fn parent_wait_context(
+            &self,
+            _parent_connection_id: &str,
+        ) -> Option<ParentWaitContext> {
+            Some(ParentWaitContext {
+                conversation_id: self.0?,
+                connection_incarnation: "test-connection-incarnation".into(),
+                turn_generation: 0,
+                parent_tool_use_id: None,
+            })
         }
     }
 
@@ -4775,8 +4873,10 @@ mod tests {
         assert_eq!(
             listener
                 .orchestration_binding_query_auth_context("root")
-                .await,
-            Ok(77),
+                .await
+                .expect("root auth context")
+                .conversation_id,
+            77,
             "workflow_v2=false must not block the read-only query"
         );
         for (token, expected) in [
@@ -4801,6 +4901,7 @@ mod tests {
                     page_limit: None,
                     snapshot_id: None,
                     cursor: None,
+                    admission_intent: None,
                 })
                 .await;
             assert_eq!(outcome["error"]["code"], expected.code());
@@ -4818,6 +4919,223 @@ mod tests {
                 .await,
             Err(OrchestrationBindingQueryAuthError::NoActiveConversation)
         );
+    }
+
+    #[tokio::test]
+    async fn orchestration_admission_ticket_issue_returns_private_preparation_envelope() {
+        use crate::acp::delegation::run_store::RunStore;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/admission-ticket-issue").await;
+        let parent_id = seed_conversation(&db, folder, AgentType::Codex).await;
+        let runs = Arc::new(RunStore::new(db));
+        let broker = Arc::new(
+            DelegationBroker::new(
+                Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+                Arc::new(AlwaysRootLookup) as Arc<dyn ConversationDepthLookup>,
+            )
+            .with_run_store(runs),
+        );
+        let tokens = Arc::new(TokenRegistry::default());
+        tokens
+            .register(
+                "root".into(),
+                TokenEntry {
+                    parent_connection_id: "parent-conn".into(),
+                    working_dir: test_working_dir(),
+                    coordination_v1: true,
+                    delegation_continuation_v1: true,
+                    role: CompanionRole::Root,
+                    workflow_v2: false,
+                    completion_v2: false,
+                    bound_task_id: None,
+                },
+            )
+            .await;
+        let listener = make_listener(broker, tokens, Some(parent_id));
+        let message: BrokerMessage = serde_json::from_value(json!({
+            "kind": "orchestration_bindings",
+            "token": "root",
+            "namespace": "brainstorm-to-delivery",
+            "limit": 200,
+            "admission_intent": {
+                "schema_version": 1,
+                "dispatch_intent_id": "8f95dd45-9eca-42a8-9909-0ac00be8ad52",
+                "request_fingerprint": "2a44be9d1662a314cbbd2c8111bcf83159be7bdc93abadff977d01447f986648",
+                "kind": "first",
+                "work_unit_key": "task|7|implementer|codex|none",
+                "agent_type": "codex",
+                "profile_id": null,
+                "target_task_id": null,
+                "replacement_reason": null,
+                "orchestration_binding": null
+            }
+        }))
+        .expect("private broker transport accepts admission intent");
+        let BrokerMessage::OrchestrationBindings(request) = message else {
+            panic!("expected orchestration binding request");
+        };
+
+        let outcome = listener.process_orchestration_bindings(request).await;
+        assert_eq!(outcome["page"]["page_start"], 0);
+        assert_eq!(outcome["admission"]["protocol"], "ticket_v1");
+        assert_eq!(outcome["admission"]["outcome"], "prepared");
+        assert_eq!(
+            outcome["admission"]["dispatch_intent_id"],
+            "8f95dd45-9eca-42a8-9909-0ac00be8ad52"
+        );
+        assert!(outcome["admission"]["ticket"].as_str().is_some_and(
+            crate::acp::delegation::types::is_canonical_uuid
+        ));
+        assert!(outcome["admission"]["expires_at"].is_string());
+    }
+
+    #[tokio::test]
+    async fn orchestration_admission_ticket_issue_replays_exact_intent_and_rejects_conflict() {
+        use crate::acp::delegation::run_store::RunStore;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
+        use sea_orm::ConnectionTrait;
+
+        const TASK_ID: &str = "6b228a7d-4ac9-4bc7-a16e-f4ecf6f0fd45";
+        const INTENT_ID: &str = "8f95dd45-9eca-42a8-9909-0ac00be8ad52";
+        const FINGERPRINT: &str =
+            "2a44be9d1662a314cbbd2c8111bcf83159be7bdc93abadff977d01447f986648";
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/admission-intent-replay").await;
+        let parent_id = seed_conversation(&db, folder, AgentType::Codex).await;
+        let child_id = seed_conversation(&db, folder, AgentType::Codex).await;
+        db.conn
+            .execute_unprepared(&format!(
+                "INSERT INTO delegation_task_runs (task_id, root_task_id, generation, \
+                 parent_conversation_id, child_conversation_id, agent_type, admission_class, \
+                 lineage_root_task_id, work_unit_key, request_fingerprint, dispatch_intent_id, \
+                 history_only, status, created_at, updated_at) VALUES \
+                 ('{TASK_ID}', '{TASK_ID}', 1, {parent_id}, {child_id}, 'codex', \
+                  'normal_revision', '{TASK_ID}', 'task|7|implementer|codex|none', \
+                  '{FINGERPRINT}', '{INTENT_ID}', 0, 'completed', \
+                  '2026-08-17T08:00:00Z', '2026-08-17T08:00:00Z')"
+            ))
+            .await
+            .unwrap();
+
+        let runs = Arc::new(RunStore::new(db));
+        let broker = Arc::new(
+            DelegationBroker::new(
+                Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+                Arc::new(AlwaysRootLookup) as Arc<dyn ConversationDepthLookup>,
+            )
+            .with_run_store(runs),
+        );
+        let tokens = Arc::new(TokenRegistry::default());
+        tokens
+            .register(
+                "root".into(),
+                TokenEntry {
+                    parent_connection_id: "parent-conn".into(),
+                    working_dir: test_working_dir(),
+                    coordination_v1: true,
+                    delegation_continuation_v1: true,
+                    role: CompanionRole::Root,
+                    workflow_v2: false,
+                    completion_v2: false,
+                    bound_task_id: None,
+                },
+            )
+            .await;
+        let listener = make_listener(broker, tokens, Some(parent_id));
+        let base_intent = json!({
+            "schema_version": 1,
+            "dispatch_intent_id": INTENT_ID,
+            "request_fingerprint": FINGERPRINT,
+            "kind": "first",
+            "work_unit_key": "task|7|implementer|codex|none",
+            "agent_type": "codex",
+            "profile_id": null,
+            "target_task_id": null,
+            "replacement_reason": null,
+            "orchestration_binding": null
+        });
+        let request = |intent: Value| {
+            let message: BrokerMessage = serde_json::from_value(json!({
+                "kind": "orchestration_bindings",
+                "token": "root",
+                "namespace": "brainstorm-to-delivery",
+                "limit": 200,
+                "admission_intent": intent
+            }))
+            .expect("private broker transport accepts admission intent");
+            let BrokerMessage::OrchestrationBindings(request) = message else {
+                panic!("expected orchestration binding request");
+            };
+            request
+        };
+
+        let exact = listener
+            .process_orchestration_bindings(request(base_intent.clone()))
+            .await;
+        assert_eq!(exact["page"]["runs"][0]["task_id"], TASK_ID);
+        assert_eq!(exact["admission"]["outcome"], "already_admitted");
+        assert_eq!(exact["admission"]["task_id"], TASK_ID);
+        assert!(exact["admission"].get("ticket").is_none());
+
+        let mut mismatches = Vec::new();
+        let mut intent = base_intent.clone();
+        intent["request_fingerprint"] = json!("b".repeat(64));
+        mismatches.push(intent);
+        let mut intent = base_intent.clone();
+        intent["work_unit_key"] = json!("task|8|implementer|codex|none");
+        mismatches.push(intent);
+        let mut intent = base_intent.clone();
+        intent["agent_type"] = json!("claude_code");
+        mismatches.push(intent);
+        let mut intent = base_intent.clone();
+        intent["profile_id"] = json!("profile-b");
+        mismatches.push(intent);
+        let mut intent = base_intent.clone();
+        intent["orchestration_binding"] = json!({
+            "schema_version": 1,
+            "namespace": "brainstorm-to-delivery",
+            "generation": 1,
+            "route_fingerprint": format!("sha256:{}", "a".repeat(64))
+        });
+        mismatches.push(intent);
+        let mut intent = base_intent.clone();
+        intent["kind"] = json!("continue");
+        intent["target_task_id"] = json!(TASK_ID);
+        mismatches.push(intent);
+        let mut intent = base_intent.clone();
+        intent["kind"] = json!("continue");
+        intent["target_task_id"] = json!("11111111-1111-4111-8111-111111111111");
+        mismatches.push(intent);
+        let mut intent = base_intent.clone();
+        intent["kind"] = json!("continue");
+        intent["target_task_id"] = json!(TASK_ID);
+        intent["work_unit_key"] = json!("task|8|implementer|codex|none");
+        mismatches.push(intent);
+        let mut intent = base_intent;
+        intent["kind"] = json!("replacement");
+        intent["target_task_id"] = json!(TASK_ID);
+        intent["replacement_reason"] = json!("unresumable");
+        mismatches.push(intent);
+
+        for intent in mismatches {
+            let conflict = listener
+                .process_orchestration_bindings(request(intent))
+                .await;
+            assert_eq!(
+                conflict["error"]["code"],
+                "delegation_dispatch_intent_conflict"
+            );
+            assert!(conflict.get("page").is_none());
+            assert!(conflict.get("admission").is_none());
+        }
+        let snapshot = listener.metrics.snapshot();
+        assert_eq!(snapshot.admission_ticket_outcomes["issued"], 0);
+        assert_eq!(snapshot.admission_ticket_outcomes["already_admitted"], 1);
+        assert_eq!(snapshot.dispatch_intent_outcomes["exact_replay"], 1);
+        assert_eq!(snapshot.dispatch_intent_outcomes["conflict"], 9);
     }
 
     #[tokio::test]
@@ -4880,6 +5198,7 @@ mod tests {
                 page_limit: Some(1),
                 snapshot_id: None,
                 cursor: None,
+                admission_intent: None,
             })
             .await;
         assert_eq!(first["page_start"], 0);
@@ -4900,6 +5219,7 @@ mod tests {
             page_limit: Some(2),
             snapshot_id: Some(snapshot_id),
             cursor: Some(cursor.clone()),
+            admission_intent: None,
         };
         let second = listener
             .process_orchestration_bindings(continuation.clone())
@@ -5042,6 +5362,142 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ticket_v1_request_contract_pair_grammar_precedes_correlation_without_child_effects() {
+        let mock = Arc::new(MockSpawner::new());
+        let tokens = Arc::new(TokenRegistry::default());
+        tokens
+            .register(
+                "tok".into(),
+                TokenEntry::legacy("parent-conn", test_working_dir()),
+            )
+            .await;
+        let listener = make_listener(make_broker(mock.clone()).await, tokens, Some(1));
+        let delegate = json!({
+            "agent_type": "codex",
+            "task": "implement",
+            "correlation_id": ".bad"
+        });
+        for input in [
+            {
+                let mut input = delegate.clone();
+                input["dispatch_intent_id"] =
+                    json!("8f95dd45-9eca-42a8-9909-0ac00be8ad52");
+                input
+            },
+            {
+                let mut input = delegate.clone();
+                input["dispatch_intent_id"] = Value::Null;
+                input["admission_ticket"] =
+                    json!("4a67bba4-e1f5-46d1-a9b1-aa796598ffce");
+                input
+            },
+            {
+                let mut input = delegate.clone();
+                input["dispatch_intent_id"] = json!(7);
+                input["admission_ticket"] =
+                    json!("4a67bba4-e1f5-46d1-a9b1-aa796598ffce");
+                input
+            },
+            {
+                let mut input = delegate;
+                input["dispatch_intent_id"] =
+                    json!("8F95DD45-9ECA-42A8-9909-0AC00BE8AD52");
+                input["admission_ticket"] =
+                    json!("4a67bba4-e1f5-46d1-a9b1-aa796598ffce");
+                input
+            },
+        ] {
+            let report = listener
+                .process(make_request_with_host_id(input, "").await)
+                .await;
+            assert_eq!(
+                report.error_code.as_deref(),
+                Some("orchestration_admission_ticket_missing")
+            );
+            let message = report.message.unwrap_or_default();
+            for forbidden in ["stale", "mismatch", "consumed"] {
+                assert!(!message.contains(forbidden));
+            }
+            assert!(mock.spawn_args.lock().await.is_empty());
+            assert!(mock.resume_args.lock().await.is_empty());
+        }
+
+        let report = listener
+            .process(
+                make_request_with_host_id(
+                    json!({
+                        "agent_type": "invalid",
+                        "task": "implement",
+                        "correlation_id": ".bad",
+                        "dispatch_intent_id": "8f95dd45-9eca-42a8-9909-0ac00be8ad52",
+                        "admission_ticket": "4a67bba4-e1f5-46d1-a9b1-aa796598ffce"
+                    }),
+                    "host-tool-id",
+                )
+                .await,
+            )
+            .await;
+        assert_eq!(report.error_code.as_deref(), Some("invalid_agent_type"));
+        assert!(mock.spawn_args.lock().await.is_empty());
+        assert!(mock.resume_args.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ticket_v1_request_contract_listener_preserves_raw_delegate_cwd_bytes() {
+        let mock = Arc::new(MockSpawner::new());
+        let broker = make_broker(mock.clone()).await;
+        let raw_cwd = r"  D:\repo/mixed/path  ";
+        broker
+            .register_pending_tool_call_with_key(
+                "parent-conn",
+                "ticket-v1-raw-cwd-card".into(),
+                Some(DelegationMatchKey::Delegate {
+                    correlation_id: "ticket-v1-raw-cwd".into(),
+                    agent_type: AgentType::Codex,
+                    task: "implement with raw cwd".into(),
+                    working_dir: Some(raw_cwd.into()),
+                }),
+            )
+            .await;
+        let tokens = Arc::new(TokenRegistry::default());
+        tokens
+            .register(
+                "tok".into(),
+                TokenEntry::legacy("parent-conn", test_working_dir()),
+            )
+            .await;
+        let listener = make_listener(broker.clone(), tokens, Some(1));
+        let report = listener
+            .process(
+                make_request_with_host_id(
+                    json!({
+                        "agent_type": "codex",
+                        "task": "implement with raw cwd",
+                        "working_dir": raw_cwd,
+                        "correlation_id": "ticket-v1-raw-cwd",
+                        "dispatch_intent_id": "8f95dd45-9eca-42a8-9909-0ac00be8ad52",
+                        "admission_ticket": "4a67bba4-e1f5-46d1-a9b1-aa796598ffce"
+                    }),
+                    "",
+                )
+                .await,
+            )
+            .await;
+
+        assert_ne!(
+            report.error_code.as_deref(),
+            Some("delegation_correlation_missing")
+        );
+        assert!(broker.take_pending_tool_call("parent-conn").await.is_none());
+        assert!(mock.spawn_args.lock().await.is_empty());
+        assert!(mock.resume_args.lock().await.is_empty());
+        assert_eq!(
+            report.error_code.as_deref(),
+            Some("orchestration_admission_ticket_stale")
+        );
+    }
+
+    #[tokio::test]
     async fn invalid_token_rejected() {
         let listener = make_listener(
             make_broker(Arc::new(MockSpawner::new())).await,
@@ -5121,12 +5577,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn orchestration_binding_transport_listener_matches_shared_corpus_before_side_effects() {
+    async fn delegation_catalog_compaction_removed_leaf_runtime_parity() {
         let corpus: Value = serde_json::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/orchestration_binding_v1.json"
         )))
         .expect("valid orchestration binding corpus");
+        let high_fractional: Value =
+            serde_json::from_str("9007199254740992.5").expect("valid JSON number");
+        let u64_overflow: Value =
+            serde_json::from_str("18446744073709551616").expect("valid JSON number");
+        let binding_with = |key: &str, value: Value| {
+            let mut binding = corpus["cases"][0]["value"].clone();
+            binding
+                .as_object_mut()
+                .unwrap()
+                .insert(key.to_string(), value);
+            binding
+        };
         let tokens = Arc::new(TokenRegistry::default());
         tokens
             .register(
@@ -5136,6 +5604,344 @@ mod tests {
             .await;
         let mock = Arc::new(MockSpawner::new());
         let listener = make_listener(make_broker(Arc::clone(&mock)).await, tokens, Some(1));
+
+        let delegate = |key: &str, value: Value| {
+            let mut input = json!({
+                "agent_type": "grok",
+                "task": "catalog parity delegate",
+                "correlation_id": "catalog-parity-delegate"
+            });
+            input
+                .as_object_mut()
+                .unwrap()
+                .insert(key.to_string(), value);
+            input
+        };
+        let continuation = |key: &str, value: Value| {
+            let mut input = json!({
+                "_codeg_tool": "continue_delegation",
+                "task_id": "source-task",
+                "task": "catalog parity continuation",
+                "correlation_id": "catalog-parity-continuation"
+            });
+            input
+                .as_object_mut()
+                .unwrap()
+                .insert(key.to_string(), value);
+            input
+        };
+        let cases = vec![
+            (
+                "delegate agent type",
+                delegate("agent_type", json!(7)),
+                "pt-1",
+                "invalid_agent_type",
+            ),
+            (
+                "delegate agent enum",
+                delegate("agent_type", json!("other")),
+                "pt-1",
+                "invalid_agent_type",
+            ),
+            (
+                "delegate profile id type",
+                delegate("profile_id", json!(7)),
+                "pt-1",
+                "invalid_delegation_profile",
+            ),
+            (
+                "delegate profile id malformed",
+                delegate("profile_id", json!("not-a-uuid")),
+                "pt-1",
+                "invalid_delegation_profile",
+            ),
+            (
+                "delegate profile label type",
+                delegate("profile_label", json!(7)),
+                "pt-1",
+                "invalid_delegation_profile",
+            ),
+            (
+                "delegate profile label null",
+                delegate("profile_label", Value::Null),
+                "pt-1",
+                "invalid_delegation_profile",
+            ),
+            (
+                "delegate task type",
+                delegate("task", json!(7)),
+                "pt-1",
+                "invalid_working_dir",
+            ),
+            (
+                "delegate task empty",
+                delegate("task", json!("")),
+                "pt-1",
+                "invalid_working_dir",
+            ),
+            (
+                "delegate correlation type",
+                delegate("correlation_id", json!(7)),
+                "",
+                "delegation_correlation_missing",
+            ),
+            (
+                "delegate correlation empty",
+                delegate("correlation_id", json!("")),
+                "",
+                "delegation_correlation_missing",
+            ),
+            (
+                "delegate correlation malformed",
+                delegate("correlation_id", json!(".bad")),
+                "",
+                "delegation_correlation_missing",
+            ),
+            (
+                "delegate correlation overlength",
+                delegate("correlation_id", json!("a".repeat(129))),
+                "",
+                "delegation_correlation_missing",
+            ),
+            (
+                "delegate working dir type",
+                delegate("working_dir", json!(7)),
+                "pt-1",
+                "invalid_working_dir",
+            ),
+            (
+                "delegate working dir null",
+                delegate("working_dir", Value::Null),
+                "pt-1",
+                "invalid_working_dir",
+            ),
+            (
+                "delegate work unit type",
+                delegate("work_unit_key", json!(7)),
+                "pt-1",
+                "invalid_work_unit_key",
+            ),
+            (
+                "delegate work unit null",
+                delegate("work_unit_key", Value::Null),
+                "pt-1",
+                "invalid_work_unit_key",
+            ),
+            (
+                "delegate work unit overlength",
+                delegate("work_unit_key", json!("x".repeat(201))),
+                "pt-1",
+                "invalid_work_unit_key",
+            ),
+            (
+                "delegate recovery type",
+                delegate("recovery_authorization_id", json!(7)),
+                "pt-1",
+                "invalid_recovery_authorization_id",
+            ),
+            (
+                "delegate recovery empty",
+                delegate("recovery_authorization_id", json!("")),
+                "pt-1",
+                "invalid_recovery_authorization_id",
+            ),
+            (
+                "delegate replaces type",
+                delegate("replaces_task_id", json!(7)),
+                "pt-1",
+                "invalid_replacement",
+            ),
+            (
+                "delegate replaces null",
+                delegate("replaces_task_id", Value::Null),
+                "pt-1",
+                "invalid_replacement",
+            ),
+            (
+                "delegate replacement type",
+                delegate("replacement_reason", json!(7)),
+                "pt-1",
+                "invalid_replacement",
+            ),
+            (
+                "delegate replacement null",
+                delegate("replacement_reason", Value::Null),
+                "pt-1",
+                "invalid_replacement",
+            ),
+            (
+                "delegate replacement enum",
+                delegate("replacement_reason", json!("other")),
+                "pt-1",
+                "invalid_replacement",
+            ),
+            (
+                "delegate binding schema high fractional",
+                delegate(
+                    "orchestration_binding",
+                    binding_with("schema_version", high_fractional.clone()),
+                ),
+                "pt-1",
+                "orchestration_binding_invalid",
+            ),
+            (
+                "delegate binding schema u64 overflow",
+                delegate(
+                    "orchestration_binding",
+                    binding_with("schema_version", u64_overflow.clone()),
+                ),
+                "pt-1",
+                "orchestration_binding_invalid",
+            ),
+            (
+                "delegate binding generation high fractional",
+                delegate(
+                    "orchestration_binding",
+                    binding_with("generation", high_fractional.clone()),
+                ),
+                "pt-1",
+                "orchestration_binding_invalid",
+            ),
+            (
+                "delegate binding generation u64 overflow",
+                delegate(
+                    "orchestration_binding",
+                    binding_with("generation", u64_overflow.clone()),
+                ),
+                "pt-1",
+                "orchestration_binding_invalid",
+            ),
+            (
+                "continue task id type",
+                continuation("task_id", json!(7)),
+                "pt-1",
+                "not_found",
+            ),
+            (
+                "continue task id empty",
+                continuation("task_id", json!("")),
+                "pt-1",
+                "not_found",
+            ),
+            (
+                "continue task type",
+                continuation("task", json!(7)),
+                "pt-1",
+                "invalid_working_dir",
+            ),
+            (
+                "continue task empty",
+                continuation("task", json!("")),
+                "pt-1",
+                "invalid_working_dir",
+            ),
+            (
+                "continue correlation type",
+                continuation("correlation_id", json!(7)),
+                "",
+                "delegation_correlation_missing",
+            ),
+            (
+                "continue correlation empty",
+                continuation("correlation_id", json!("")),
+                "",
+                "delegation_correlation_missing",
+            ),
+            (
+                "continue correlation malformed",
+                continuation("correlation_id", json!(".bad")),
+                "",
+                "delegation_correlation_missing",
+            ),
+            (
+                "continue correlation overlength",
+                continuation("correlation_id", json!("a".repeat(129))),
+                "",
+                "delegation_correlation_missing",
+            ),
+            (
+                "continue work unit type",
+                continuation("work_unit_key", json!(7)),
+                "pt-1",
+                "invalid_work_unit_key",
+            ),
+            (
+                "continue work unit null",
+                continuation("work_unit_key", Value::Null),
+                "pt-1",
+                "invalid_work_unit_key",
+            ),
+            (
+                "continue work unit overlength",
+                continuation("work_unit_key", json!("x".repeat(201))),
+                "pt-1",
+                "invalid_work_unit_key",
+            ),
+            (
+                "continue recovery type",
+                continuation("recovery_authorization_id", json!(7)),
+                "pt-1",
+                "invalid_recovery_authorization_id",
+            ),
+            (
+                "continue recovery empty",
+                continuation("recovery_authorization_id", json!("")),
+                "pt-1",
+                "invalid_recovery_authorization_id",
+            ),
+            (
+                "continue binding schema high fractional",
+                continuation(
+                    "orchestration_binding",
+                    binding_with("schema_version", high_fractional.clone()),
+                ),
+                "pt-1",
+                "orchestration_binding_invalid",
+            ),
+            (
+                "continue binding schema u64 overflow",
+                continuation(
+                    "orchestration_binding",
+                    binding_with("schema_version", u64_overflow.clone()),
+                ),
+                "pt-1",
+                "orchestration_binding_invalid",
+            ),
+            (
+                "continue binding generation high fractional",
+                continuation(
+                    "orchestration_binding",
+                    binding_with("generation", high_fractional),
+                ),
+                "pt-1",
+                "orchestration_binding_invalid",
+            ),
+            (
+                "continue binding generation u64 overflow",
+                continuation(
+                    "orchestration_binding",
+                    binding_with("generation", u64_overflow),
+                ),
+                "pt-1",
+                "orchestration_binding_invalid",
+            ),
+        ];
+
+        for (label, input, host_id, expected_code) in cases {
+            let spawn_before = mock.spawn_args.lock().await.len();
+            let resume_before = mock.resume_args.lock().await.len();
+            let report = listener
+                .process(make_request_with_host_id(input, host_id).await)
+                .await;
+            assert_eq!(report.status, TaskStatus::Failed, "{label}");
+            assert_eq!(report.error_code.as_deref(), Some(expected_code), "{label}");
+            assert_eq!(mock.spawn_args.lock().await.len(), spawn_before, "{label}");
+            assert_eq!(
+                mock.resume_args.lock().await.len(),
+                resume_before,
+                "{label}"
+            );
+        }
 
         for case in corpus["cases"].as_array().unwrap() {
             let expected = case["valid"].as_bool().unwrap();
@@ -5566,10 +6372,7 @@ mod tests {
     #[test]
     fn parse_work_unit_key_absent_or_blank_is_none() {
         assert_eq!(parse_work_unit_key(&json!({})).unwrap(), None);
-        assert_eq!(
-            parse_work_unit_key(&json!({"work_unit_key": null})).unwrap(),
-            None
-        );
+        assert!(parse_work_unit_key(&json!({"work_unit_key": null})).is_err());
         assert_eq!(
             parse_work_unit_key(&json!({"work_unit_key": "  "})).unwrap(),
             None
@@ -5744,6 +6547,8 @@ mod tests {
                 replaces_task_id: None,
                 replacement_reason: None,
                 correlation_id: None,
+                dispatch_intent_id: None,
+                admission_ticket: None,
                 recovery_authorization_id: None,
                 orchestration_binding: None,
             })
@@ -7417,6 +8222,8 @@ mod tests {
                         replaces_task_id: None,
                         replacement_reason: None,
                         correlation_id: None,
+                        dispatch_intent_id: None,
+                        admission_ticket: None,
                         recovery_authorization_id: None,
                         orchestration_binding: None,
                     })
@@ -7527,6 +8334,8 @@ mod tests {
                 replaces_task_id: None,
                 replacement_reason: None,
                 correlation_id: None,
+                dispatch_intent_id: None,
+                admission_ticket: None,
                 recovery_authorization_id: None,
                 orchestration_binding: None,
             })
@@ -7578,6 +8387,8 @@ mod tests {
                 replaces_task_id: None,
                 replacement_reason: None,
                 correlation_id: None,
+                dispatch_intent_id: None,
+                admission_ticket: None,
                 recovery_authorization_id: None,
                 orchestration_binding: None,
             })
@@ -7768,6 +8579,8 @@ mod tests {
                     replaces_task_id: None,
                     replacement_reason: None,
                     correlation_id: None,
+                    dispatch_intent_id: None,
+                    admission_ticket: None,
                     recovery_authorization_id: None,
                     orchestration_binding: None,
                 };
@@ -8871,6 +9684,7 @@ mod tests {
             let child = seed_conversation(&db, folder, AgentType::Codex).await;
             let runs = Arc::new(RunStore::new(Arc::clone(&db)));
             runs.insert_reserving(ReservingRunInsert {
+                dispatch_intent_id: None,
                 orchestration_binding: None,
                 task_id: TASK_ID.into(),
                 root_task_id: TASK_ID.into(),
@@ -10498,6 +11312,8 @@ mod tests {
                 replaces_task_id: None,
                 replacement_reason: None,
                 correlation_id: None,
+                dispatch_intent_id: None,
+                admission_ticket: None,
                 recovery_authorization_id: None,
                 orchestration_binding: None,
             })
@@ -10913,6 +11729,8 @@ mod tests {
                 replaces_task_id: None,
                 replacement_reason: None,
                 correlation_id: None,
+                dispatch_intent_id: None,
+                admission_ticket: None,
                 recovery_authorization_id: None,
                 orchestration_binding: None,
             })
@@ -10934,6 +11752,8 @@ mod tests {
                 replaces_task_id: None,
                 replacement_reason: None,
                 correlation_id: None,
+                dispatch_intent_id: None,
+                admission_ticket: None,
                 recovery_authorization_id: None,
                 orchestration_binding: None,
             })
@@ -11243,6 +12063,7 @@ mod tests {
             fixture
                 .runs
                 .insert_reserving(ReservingRunInsert {
+                    dispatch_intent_id: None,
                     orchestration_binding: None,
                     task_id: task_id.clone(),
                     root_task_id: task_id.clone(),

@@ -37,15 +37,20 @@
 //!    removed normally and the response goes out on stdout; a late cancel
 //!    notification finds nothing and is silently ignored.
 
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Duration;
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tokio::sync::{oneshot, Mutex};
 
 use crate::acp::delegation::attention::ATTENTION_PAYLOAD_MAX_BYTES;
+use crate::acp::delegation::metrics::{ArtifactExportOutcome, DelegationMetrics};
 use crate::acp::delegation::transport::{
     client_ask_round_trip, client_cancel, client_cancel_task_round_trip, client_commit_feedback,
     client_complete_work_round_trip, client_feedback_round_trip,
@@ -63,8 +68,13 @@ use crate::acp::delegation::transport::{
     CancelDelegationReason, CompanionRole,
 };
 use crate::acp::delegation::types::{
-    validate_correlation_id, DelegationOrchestrationBindingPage, DelegationReturnWhen,
-    OrchestrationBindingQueryError, OrchestrationBindingQueryRequest,
+    parse_admission_ticket_v1_request, validate_correlation_id, AdmissionIntentV1,
+    AdmissionPreparation, BindingEvidenceV1, DelegationOrchestrationBindingPage,
+    DelegationReturnWhen,
+    OrchestrationBindingArtifactDescriptor, OrchestrationBindingDelivery,
+    OrchestrationBindingFirstPageEnvelope, OrchestrationBindingQueryError,
+    OrchestrationBindingQueryRequest, OrchestrationBindingToolRequest,
+    ORCHESTRATION_BINDING_DEFAULT_LIMIT, ORCHESTRATION_BINDING_MAX_LIMIT,
 };
 use crate::acp::delegation::workflow::{
     CompleteWorkRequest, WorkflowIndexOmissionStep, WorkflowStateIndexDto,
@@ -74,6 +84,7 @@ use crate::acp::delegation::workflow::{
 use crate::acp::question::parse_questions;
 use crate::acp::recovery_authorization::RecoverySubjectKind;
 use crate::acp::session_info::MAX_SESSION_MESSAGES;
+use crate::commands::confined_file::metadata_is_symlink_or_reparse;
 
 /// Upper bound on one broker-side cancel round-trip. Bounds both
 /// `handle_cancel_notification` (so stdin dispatch can't stall behind a
@@ -95,6 +106,603 @@ async fn send_broker_cancel(socket_path: &str, req: &BrokerCancelRequest) {
     let _ = tokio::time::timeout(BROKER_CANCEL_BUDGET, client_cancel(socket_path, req)).await;
 }
 
+#[cfg(test)]
+mod orchestration_binding_artifact_storage_tests {
+    use std::collections::BTreeSet;
+    use std::fs;
+    use std::path::Path;
+    use std::sync::Arc;
+    use std::time::{Duration, SystemTime};
+
+    use chrono::{TimeZone, Utc};
+    use serde_json::json;
+    use sha2::Digest;
+
+    use super::*;
+    use crate::acp::delegation::metrics::DelegationMetrics;
+    use crate::acp::delegation::transport::CompanionRole;
+    use crate::acp::delegation::types::{BindingEvidenceV1, DelegationOrchestrationBindingRun};
+
+    const INCARNATION_A: &str = "00000000-0000-4000-8000-000000000001";
+    #[cfg(unix)]
+    const INCARNATION_B: &str = "00000000-0000-4000-8000-000000000002";
+
+    fn run(task_id: impl Into<String>) -> DelegationOrchestrationBindingRun {
+        let task_id = task_id.into();
+        DelegationOrchestrationBindingRun {
+            root_task_id: task_id.clone(),
+            lineage_root_task_id: task_id.clone(),
+            task_id,
+            previous_task_id: None,
+            replaced_task_id: None,
+            replacement_reason: None,
+            generic_generation: 1,
+            work_unit_key: Some("task:1".into()),
+            child_conversation_id: 1,
+            agent_type: "grok".into(),
+            profile_id: None,
+            status: "running".into(),
+            orchestration_binding: None,
+        }
+    }
+
+    fn page(runs: Vec<DelegationOrchestrationBindingRun>) -> DelegationOrchestrationBindingPage {
+        DelegationOrchestrationBindingPage {
+            schema_version: 1,
+            namespace: "brainstorm-to-delivery".into(),
+            snapshot_id: "1a641e16-36f4-4ec5-aa4f-18d18e6ab107".into(),
+            snapshot_revision: "42".into(),
+            snapshot_created_at: Utc.with_ymd_and_hms(2026, 8, 26, 8, 0, 0).unwrap(),
+            snapshot_expires_at: Utc.with_ymd_and_hms(2026, 8, 26, 8, 1, 0).unwrap(),
+            total_rows: runs.len() as u64,
+            page_start: 0,
+            request_cursor: None,
+            runs,
+            next_cursor: None,
+            complete: true,
+        }
+    }
+
+    fn two_pages() -> Vec<DelegationOrchestrationBindingPage> {
+        let mut first = page(vec![run("task-1")]);
+        first.total_rows = 2;
+        first.next_cursor = Some("cursor-a".into());
+        first.complete = false;
+
+        let mut second = page(vec![run("task-2")]);
+        second.total_rows = 2;
+        second.page_start = 1;
+        second.request_cursor = Some("cursor-a".into());
+        vec![first, second]
+    }
+
+    fn exact_size_page(target_bytes: usize) -> DelegationOrchestrationBindingPage {
+        let mut page = page(vec![run("x")]);
+        let current = serde_json::to_vec(&BindingEvidenceV1 {
+            schema_version: 1,
+            pages: vec![page.clone()],
+        })
+        .unwrap()
+        .len();
+        page.runs[0].task_id = "x".repeat(1 + target_bytes - current);
+        assert_eq!(
+            serde_json::to_vec(&BindingEvidenceV1 {
+                schema_version: 1,
+                pages: vec![page.clone()],
+            })
+            .unwrap()
+            .len(),
+            target_bytes
+        );
+        page
+    }
+
+    fn context() -> CompanionContext {
+        CompanionContext {
+            parent_connection_id: "parent".into(),
+            socket_path: "unused".into(),
+            token: "token".into(),
+            features: CompanionFeatures {
+                delegation: true,
+                coordination_v1: true,
+                feedback: false,
+                ask: false,
+                sessions: false,
+                workflow_v2: false,
+                completion_v2: false,
+            },
+            role: CompanionRole::Root,
+            can_spawn_child: true,
+            connection_incarnation_id: INCARNATION_A.into(),
+            disabled_agents: Vec::new(),
+        }
+    }
+
+    fn json_files(root: &Path) -> Vec<std::path::PathBuf> {
+        let mut files = Vec::new();
+        if !root.exists() {
+            return files;
+        }
+        for directory in fs::read_dir(root).unwrap() {
+            let directory = directory.unwrap().path();
+            if !directory.is_dir() {
+                continue;
+            }
+            files.extend(
+                fs::read_dir(directory)
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.path())
+                    .filter(|path| {
+                        path.extension()
+                            .is_some_and(|extension| extension == "json")
+                    }),
+            );
+        }
+        files
+    }
+
+    #[test]
+    fn orchestration_binding_artifact_storage_accepts_empty_one_and_4096_rows() {
+        for rows in [0, 1, ORCHESTRATION_BINDING_ARTIFACT_MAX_ROWS] {
+            let runs = (0..rows)
+                .map(|index| run(format!("task-{index}")))
+                .collect();
+            let prepared = prepare_binding_evidence(vec![page(runs)]).unwrap();
+            assert_eq!(prepared.total_rows, rows);
+            let parsed: BindingEvidenceV1 = serde_json::from_slice(&prepared.bytes).unwrap();
+            assert_eq!(parsed.schema_version, 1);
+            assert_eq!(parsed.pages.len(), 1);
+            assert_eq!(parsed.pages[0].runs.len(), rows);
+        }
+    }
+
+    #[test]
+    fn orchestration_binding_artifact_storage_rejects_4097_rows() {
+        let runs = (0..=ORCHESTRATION_BINDING_ARTIFACT_MAX_ROWS)
+            .map(|index| run(format!("task-{index}")))
+            .collect();
+        assert_eq!(
+            prepare_binding_evidence(vec![page(runs)]).unwrap_err(),
+            OrchestrationBindingQueryError::TooLarge
+        );
+    }
+
+    #[test]
+    fn orchestration_binding_artifact_storage_accepts_exactly_4_mib_and_rejects_one_more_byte() {
+        let exact = prepare_binding_evidence(vec![exact_size_page(
+            ORCHESTRATION_BINDING_ARTIFACT_MAX_BYTES,
+        )])
+        .unwrap();
+        assert_eq!(exact.bytes.len(), ORCHESTRATION_BINDING_ARTIFACT_MAX_BYTES);
+
+        assert_eq!(
+            prepare_binding_evidence(vec![exact_size_page(
+                ORCHESTRATION_BINDING_ARTIFACT_MAX_BYTES + 1,
+            )])
+            .unwrap_err(),
+            OrchestrationBindingQueryError::ArtifactTooLarge
+        );
+    }
+
+    #[test]
+    fn orchestration_binding_artifact_storage_rejects_invalid_page_chains() {
+        let mut cases = Vec::new();
+
+        let mut duplicate = two_pages();
+        duplicate[1].runs[0].task_id = duplicate[0].runs[0].task_id.clone();
+        cases.push(("duplicate task id", duplicate));
+
+        let mut mixed_metadata = two_pages();
+        mixed_metadata[1].snapshot_revision = "43".into();
+        cases.push(("mixed snapshot metadata", mixed_metadata));
+
+        let mut wrong_first_start = two_pages();
+        wrong_first_start[0].page_start = 1;
+        cases.push(("wrong first page start", wrong_first_start));
+
+        let mut wrong_first_cursor = two_pages();
+        wrong_first_cursor[0].request_cursor = Some("cursor-before-first".into());
+        cases.push(("wrong first cursor", wrong_first_cursor));
+
+        let mut wrong_cursor_echo = two_pages();
+        wrong_cursor_echo[1].request_cursor = Some("cursor-b".into());
+        cases.push(("wrong cursor echo", wrong_cursor_echo));
+
+        let mut gap = two_pages();
+        gap[1].page_start = 2;
+        cases.push(("gap", gap));
+
+        let mut reordered = two_pages();
+        reordered.swap(0, 1);
+        cases.push(("reordered pages", reordered));
+
+        let mut trailing = two_pages();
+        let mut extra = page(Vec::new());
+        extra.total_rows = 2;
+        extra.page_start = 2;
+        trailing.push(extra);
+        cases.push(("trailing page", trailing));
+
+        let mut missing_completion = two_pages();
+        missing_completion[1].complete = false;
+        missing_completion[1].next_cursor = Some("cursor-c".into());
+        cases.push(("missing completion", missing_completion));
+
+        let mut changed_total = two_pages();
+        changed_total[1].total_rows = 3;
+        cases.push(("changed total count", changed_total));
+
+        for (name, pages) in cases {
+            assert_eq!(
+                prepare_binding_evidence(pages).unwrap_err(),
+                OrchestrationBindingQueryError::Invalid,
+                "{name} must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn orchestration_binding_artifact_storage_uses_random_atomic_private_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("codeg-mcp/orchestration-bindings");
+        let inflight = Arc::new(InflightCalls::new());
+
+        let (first, first_pending) = store_binding_artifact_at(
+            temp.path(),
+            INCARNATION_A,
+            vec![page(vec![run("task-a")])],
+            &inflight,
+        )
+        .unwrap();
+        let (second, second_pending) = store_binding_artifact_at(
+            temp.path(),
+            INCARNATION_A,
+            vec![page(vec![run("task-b")])],
+            &inflight,
+        )
+        .unwrap();
+
+        assert_ne!(first.artifact_path, second.artifact_path);
+        for descriptor in [&first, &second] {
+            let path = Path::new(&descriptor.artifact_path);
+            let stem = path.file_stem().unwrap().to_str().unwrap();
+            assert_eq!(uuid::Uuid::parse_str(stem).unwrap().to_string(), stem);
+            assert_eq!(path.extension().unwrap(), "json");
+            assert!(!descriptor.artifact_path.contains("brainstorm-to-delivery"));
+            let bytes = fs::read(path).unwrap();
+            assert_eq!(bytes.len() as u64, descriptor.artifact_bytes);
+            assert_eq!(
+                descriptor.artifact_sha256,
+                format!("sha256:{:x}", sha2::Sha256::digest(&bytes))
+            );
+            serde_json::from_slice::<BindingEvidenceV1>(&bytes).unwrap();
+        }
+        assert_eq!(
+            json_files(&root).len(),
+            2,
+            "no sibling partial files remain"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let owner = Path::new(&first.artifact_path).parent().unwrap();
+            assert_eq!(
+                fs::metadata(owner).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            assert_eq!(
+                fs::metadata(&first.artifact_path)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+
+        first_pending.mark_delivered();
+        second_pending.mark_delivered();
+    }
+
+    #[test]
+    fn orchestration_binding_artifact_storage_sweeps_only_verified_stale_root_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("codeg-mcp/orchestration-bindings");
+        let owner = root.join(INCARNATION_A);
+        fs::create_dir_all(&owner).unwrap();
+        let stale = owner.join("00000000-0000-4000-8000-000000000010.json");
+        let fresh = owner.join("00000000-0000-4000-8000-000000000011.json");
+        let partial = owner.join(".codeg-binding-crash-partial");
+        let sibling = temp.path().join("must-survive.json");
+        fs::write(&stale, b"stale").unwrap();
+        fs::write(&fresh, b"fresh").unwrap();
+        fs::write(&partial, b"partial").unwrap();
+        fs::write(&sibling, b"outside").unwrap();
+
+        let metrics = DelegationMetrics::default();
+        sweep_stale_binding_artifacts_at(
+            temp.path(),
+            SystemTime::now() + ORCHESTRATION_BINDING_ARTIFACT_STALE_AGE + Duration::from_secs(1),
+            &metrics,
+        )
+        .unwrap();
+
+        assert!(!stale.exists());
+        assert!(!fresh.exists());
+        assert!(!partial.exists());
+        assert!(
+            sibling.exists(),
+            "sweep must remain under the verified root"
+        );
+        assert_eq!(metrics.snapshot().artifact_cleanup_success_count, 3);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn orchestration_binding_artifact_storage_skips_symlinked_owner_outside_verified_root() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("codeg-mcp/orchestration-bindings");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let outside_file = outside.join("00000000-0000-4000-8000-000000000012.json");
+        fs::write(&outside_file, b"outside").unwrap();
+        symlink(&outside, root.join(INCARNATION_B)).unwrap();
+
+        sweep_stale_binding_artifacts_at(
+            temp.path(),
+            SystemTime::now() + ORCHESTRATION_BINDING_ARTIFACT_STALE_AGE + Duration::from_secs(1),
+            &DelegationMetrics::default(),
+        )
+        .unwrap();
+
+        assert!(outside_file.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn orchestration_binding_artifact_storage_rejects_symlinked_fixed_parent_without_outside_changes(
+    ) {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let temp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_root = outside.path().join("orchestration-bindings");
+        let outside_owner = outside_root.join(INCARNATION_A);
+        fs::create_dir_all(&outside_owner).unwrap();
+        let outside_file = outside_owner.join("00000000-0000-4000-8000-000000000013.json");
+        fs::write(&outside_file, b"outside").unwrap();
+        fs::set_permissions(outside.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let outside_mode = fs::metadata(outside.path()).unwrap().permissions().mode() & 0o777;
+        let alias = temp.path().join("codeg-mcp");
+        symlink(outside.path(), &alias).unwrap();
+
+        let result = sweep_stale_binding_artifacts_at(
+            temp.path(),
+            SystemTime::now() + ORCHESTRATION_BINDING_ARTIFACT_STALE_AGE + Duration::from_secs(1),
+            &DelegationMetrics::default(),
+        );
+        let outside_bytes = fs::read(&outside_file);
+        let mode_after = fs::metadata(outside.path()).unwrap().permissions().mode() & 0o777;
+        fs::remove_file(&alias).unwrap();
+
+        assert_eq!(outside_bytes.unwrap(), b"outside");
+        assert_eq!(mode_after, outside_mode);
+        assert!(result.is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn orchestration_binding_artifact_storage_rejects_junctioned_fixed_parent_without_outside_changes(
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_root = outside.path().join("orchestration-bindings");
+        let outside_owner = outside_root.join(INCARNATION_A);
+        fs::create_dir_all(&outside_owner).unwrap();
+        let outside_file = outside_owner.join("00000000-0000-4000-8000-000000000013.json");
+        fs::write(&outside_file, b"outside").unwrap();
+        let alias = temp.path().join("codeg-mcp");
+        match junction::create(outside.path(), &alias) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("failed to create junction: {error}"),
+        }
+
+        let result = sweep_stale_binding_artifacts_at(
+            temp.path(),
+            SystemTime::now() + ORCHESTRATION_BINDING_ARTIFACT_STALE_AGE + Duration::from_secs(1),
+            &DelegationMetrics::default(),
+        );
+        let outside_bytes = fs::read(&outside_file);
+        junction::delete(&alias).unwrap();
+
+        assert_eq!(outside_bytes.unwrap(), b"outside");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn orchestration_binding_artifact_storage_cleans_unpublished_partial_on_persist_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let owner = temp.path().join(INCARNATION_A);
+        fs::create_dir_all(&owner).unwrap();
+        let final_path = owner.join("00000000-0000-4000-8000-000000000020.json");
+        fs::write(&final_path, b"existing").unwrap();
+
+        assert!(atomic_publish_binding_artifact(&owner, &final_path, b"replacement").is_err());
+        let files = fs::read_dir(&owner)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect::<Vec<_>>();
+        assert_eq!(files.len(), 1);
+        assert_eq!(fs::read(final_path).unwrap(), b"existing");
+    }
+
+    #[test]
+    fn orchestration_binding_artifact_storage_cancellation_removes_published_pending_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let inflight = Arc::new(InflightCalls::new());
+        let (descriptor, pending) = store_binding_artifact_at(
+            temp.path(),
+            INCARNATION_A,
+            vec![page(vec![run("task-a")])],
+            &inflight,
+        )
+        .unwrap();
+
+        assert!(Path::new(&descriptor.artifact_path).exists());
+        assert_eq!(inflight.binding_artifact_count(), 1);
+        drop(pending);
+        assert!(!Path::new(&descriptor.artifact_path).exists());
+        assert_eq!(inflight.binding_artifact_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn orchestration_binding_artifact_storage_shutdown_cleans_delivered_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let inflight = Arc::new(InflightCalls::new());
+        let (descriptor, pending) = store_binding_artifact_at(
+            temp.path(),
+            INCARNATION_A,
+            vec![page(vec![run("task-a")])],
+            &inflight,
+        )
+        .unwrap();
+        pending.set_final_result_bytes(1_024).after_relay().await;
+
+        drain_and_cancel_all(&context(), &inflight, "test shutdown").await;
+
+        assert!(!Path::new(&descriptor.artifact_path).exists());
+        assert_eq!(inflight.binding_artifact_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn orchestration_binding_artifact_storage_pre_relay_shutdown_drains_registered_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let inflight = Arc::new(InflightCalls::new());
+        let (descriptor, pending) = store_binding_artifact_at(
+            temp.path(),
+            INCARNATION_A,
+            vec![page(vec![run("task-a")])],
+            &inflight,
+        )
+        .unwrap();
+        let relay_result = SpawnResult {
+            response: Some(ok(json!(1), json!(descriptor.clone()))),
+            after_relay: Some(pending.after_relay()),
+            before_relay: None,
+        };
+
+        drain_and_cancel_all(&context(), &inflight, "test hard exit").await;
+
+        assert!(!Path::new(&descriptor.artifact_path).exists());
+        assert_eq!(inflight.binding_artifact_count(), 0);
+        assert!(
+            relay_result.after_relay.is_some(),
+            "drain must not depend on running or dropping the relay callback"
+        );
+    }
+
+    #[test]
+    fn orchestration_binding_artifact_storage_metrics_are_identifier_free() {
+        let temp = tempfile::tempdir().unwrap();
+        let metrics = Arc::new(DelegationMetrics::default());
+        let inflight = Arc::new(InflightCalls::with_artifact_metrics(metrics.clone()));
+        let sensitive_task = "task-sensitive";
+        let sensitive_incarnation = "00000000-0000-4000-8000-000000004123";
+
+        let (descriptor, pending) = store_binding_artifact_at(
+            temp.path(),
+            sensitive_incarnation,
+            vec![page(vec![run(sensitive_task)])],
+            &inflight,
+        )
+        .unwrap();
+        drop(pending.set_final_result_bytes(1_536));
+        let oversized = store_binding_artifact_at(
+            temp.path(),
+            sensitive_incarnation,
+            vec![exact_size_page(
+                ORCHESTRATION_BINDING_ARTIFACT_MAX_BYTES + 1,
+            )],
+            &inflight,
+        )
+        .err()
+        .expect("oversized artifact must fail");
+        assert_eq!(oversized, OrchestrationBindingQueryError::ArtifactTooLarge);
+        inflight.record_binding_artifact_stale_restart();
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.artifact_cleanup_success_count, 1);
+        assert_eq!(snapshot.artifact_export_outcomes["cancelled"], 1);
+        assert_eq!(snapshot.artifact_export_outcomes["too_large"], 1);
+        assert_eq!(snapshot.artifact_transparent_stale_restarts, 1);
+        assert_eq!(
+            snapshot
+                .artifact_internal_page_count_buckets
+                .iter()
+                .sum::<u64>(),
+            1
+        );
+        assert_eq!(
+            snapshot
+                .artifact_selected_row_count_buckets
+                .iter()
+                .sum::<u64>(),
+            1
+        );
+        assert_eq!(
+            snapshot.artifact_evidence_bytes_buckets.iter().sum::<u64>(),
+            1
+        );
+        assert_eq!(
+            snapshot
+                .artifact_export_duration_ms_buckets
+                .iter()
+                .sum::<u64>(),
+            1
+        );
+        assert_eq!(
+            snapshot
+                .artifact_final_mcp_result_bytes_buckets
+                .iter()
+                .sum::<u64>(),
+            1
+        );
+        let serialized = serde_json::to_string(&snapshot).unwrap();
+        for sensitive in [
+            sensitive_task,
+            sensitive_incarnation,
+            descriptor.artifact_path.as_str(),
+            descriptor.artifact_sha256.as_str(),
+        ] {
+            assert!(!serialized.contains(sensitive));
+        }
+        assert_eq!(
+            snapshot
+                .artifact_export_outcomes
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "broker_failed",
+                "cancelled",
+                "io_failed",
+                "result_too_large",
+                "serialization_failed",
+                "stale",
+                "success",
+                "too_large",
+            ])
+        );
+    }
+}
+
 /// Static MCP tool schema. Lives next to this module so codeg-mcp ships
 /// a single embedded copy — no runtime file IO, no version skew with the
 /// broker's [`super::types::DelegationRequest`].
@@ -105,6 +713,12 @@ pub const GET_WORKFLOW_STATE_MAX_REQUEST_ID_BYTES: usize = 256;
 
 pub const GET_ORCHESTRATION_BINDINGS_MAX_RESULT_BYTES: usize = 7_680;
 pub const GET_ORCHESTRATION_BINDINGS_MAX_REQUEST_ID_BYTES: usize = 256;
+
+pub const ORCHESTRATION_BINDING_ARTIFACT_MAX_ROWS: usize = 4_096;
+pub const ORCHESTRATION_BINDING_ARTIFACT_MAX_BYTES: usize = 4 * 1024 * 1024;
+pub const ORCHESTRATION_BINDING_ARTIFACT_MAX_RESULT_BYTES: usize = 2_048;
+const ORCHESTRATION_BINDING_ARTIFACT_FORMAT: &str = "codeg-binding-evidence-v1";
+const ORCHESTRATION_BINDING_ARTIFACT_STALE_AGE: Duration = Duration::from_secs(10 * 60);
 
 /// Grok stdio host splits JSONL at 8,192 bytes without reassembly. Keep the
 /// same 512-byte headroom used by `tools/list` / `get_workflow_state`.
@@ -421,14 +1035,179 @@ pub struct InflightEntry {
 /// JSON-RPC `id` so we can compare against the `requestId` payload of
 /// `notifications/cancelled` which is itself a JSON value (numbers serialize
 /// as their canonical string form here).
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BindingArtifactState {
+    PendingRelay,
+    Delivered,
+}
+
+struct BindingArtifactRegistry {
+    entries: StdMutex<HashMap<PathBuf, BindingArtifactState>>,
+    metrics: Arc<DelegationMetrics>,
+}
+
+impl BindingArtifactRegistry {
+    fn new(metrics: Arc<DelegationMetrics>) -> Self {
+        Self {
+            entries: StdMutex::new(HashMap::new()),
+            metrics,
+        }
+    }
+
+    fn register(
+        self: &Arc<Self>,
+        path: PathBuf,
+        export_metrics: PendingBindingArtifactMetrics,
+    ) -> PendingBindingArtifact {
+        self.entries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(path.clone(), BindingArtifactState::PendingRelay);
+        PendingBindingArtifact {
+            path,
+            registry: self.clone(),
+            cleanup_on_drop: true,
+            export_metrics: Some(export_metrics),
+        }
+    }
+
+    fn mark_delivered(&self, path: &Path) {
+        if let Some(state) = self
+            .entries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get_mut(path)
+        {
+            *state = BindingArtifactState::Delivered;
+        }
+    }
+
+    fn cleanup(&self, path: &Path) {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if !entries.contains_key(path) {
+            return;
+        }
+        match fs::remove_file(path) {
+            Ok(()) => {
+                entries.remove(path);
+                self.metrics.record_artifact_cleanup(true);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                entries.remove(path);
+                self.metrics.record_artifact_cleanup(true);
+            }
+            Err(_) => self.metrics.record_artifact_cleanup(false),
+        }
+    }
+
+    fn drain(&self) {
+        let paths = self
+            .entries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        for path in paths {
+            self.cleanup(&path);
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .len()
+    }
+}
+
+pub struct PendingBindingArtifact {
+    path: PathBuf,
+    registry: Arc<BindingArtifactRegistry>,
+    cleanup_on_drop: bool,
+    export_metrics: Option<PendingBindingArtifactMetrics>,
+}
+
+struct PendingBindingArtifactMetrics {
+    internal_page_count: usize,
+    selected_row_count: usize,
+    evidence_bytes: usize,
+    export_duration: Duration,
+    final_result_bytes: usize,
+}
+
+impl PendingBindingArtifact {
+    pub fn set_final_result_bytes(mut self, final_result_bytes: usize) -> Self {
+        if let Some(metrics) = &mut self.export_metrics {
+            metrics.final_result_bytes = final_result_bytes;
+        }
+        self
+    }
+
+    fn record_outcome(&mut self, outcome: ArtifactExportOutcome) {
+        let Some(export) = self.export_metrics.take() else {
+            return;
+        };
+        self.registry.metrics.record_artifact_export(outcome);
+        self.registry.metrics.record_artifact_shape(
+            export.internal_page_count,
+            export.selected_row_count,
+            export.evidence_bytes,
+            export.export_duration,
+            export.final_result_bytes,
+        );
+    }
+
+    fn mark_delivered(mut self) {
+        self.record_outcome(ArtifactExportOutcome::Success);
+        self.registry.mark_delivered(&self.path);
+        self.cleanup_on_drop = false;
+    }
+
+    pub fn after_relay(self) -> futures_util::future::BoxFuture<'static, ()> {
+        Box::pin(async move { self.mark_delivered() })
+    }
+}
+
+impl Drop for PendingBindingArtifact {
+    fn drop(&mut self) {
+        if self.cleanup_on_drop {
+            self.record_outcome(ArtifactExportOutcome::Cancelled);
+            self.registry.cleanup(&self.path);
+        }
+    }
+}
+
 pub struct InflightCalls {
     inner: Mutex<HashMap<String, InflightEntry>>,
+    binding_artifacts: Arc<BindingArtifactRegistry>,
+}
+
+impl Default for InflightCalls {
+    fn default() -> Self {
+        Self::with_artifact_metrics(Arc::new(DelegationMetrics::default()))
+    }
 }
 
 impl InflightCalls {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn with_artifact_metrics(metrics: Arc<DelegationMetrics>) -> Self {
+        Self {
+            inner: Mutex::new(HashMap::new()),
+            binding_artifacts: Arc::new(BindingArtifactRegistry::new(metrics)),
+        }
+    }
+
+    #[cfg(test)]
+    fn binding_artifact_count(&self) -> usize {
+        self.binding_artifacts.len()
     }
 
     async fn register(&self, id_key: String, entry: InflightEntry) {
@@ -449,6 +1228,412 @@ impl InflightCalls {
         let mut map = self.inner.lock().await;
         map.drain().map(|(_k, v)| v).collect()
     }
+
+    fn drain_binding_artifacts(&self) {
+        self.binding_artifacts.drain();
+    }
+
+    pub fn record_binding_artifact_stale_restart(&self) {
+        self.binding_artifacts
+            .metrics
+            .record_artifact_transparent_stale_restart();
+    }
+}
+
+#[derive(Debug)]
+struct PreparedBindingEvidence {
+    evidence: BindingEvidenceV1,
+    bytes: Vec<u8>,
+    total_rows: usize,
+}
+
+fn valid_binding_artifact_cursor(cursor: &Option<String>) -> bool {
+    cursor.as_ref().is_none_or(|cursor| {
+        !cursor.is_empty()
+            && cursor.len() <= 128
+            && cursor
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    })
+}
+
+fn validate_binding_evidence_pages(
+    pages: &[DelegationOrchestrationBindingPage],
+    require_complete: bool,
+) -> Result<usize, OrchestrationBindingQueryError> {
+    let Some(first) = pages.first() else {
+        return Err(OrchestrationBindingQueryError::Invalid);
+    };
+    let namespace = first.namespace.as_bytes();
+    let snapshot_id = uuid::Uuid::parse_str(&first.snapshot_id)
+        .ok()
+        .filter(|snapshot_id| snapshot_id.to_string() == first.snapshot_id);
+    let snapshot_revision = first
+        .snapshot_revision
+        .parse::<u64>()
+        .ok()
+        .filter(|revision| revision.to_string() == first.snapshot_revision);
+    if first.schema_version != 1
+        || namespace.is_empty()
+        || namespace.len() > 64
+        || !namespace[0].is_ascii_lowercase()
+        || !namespace[1..]
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+        || snapshot_id.is_none()
+        || snapshot_revision.is_none()
+        || first.snapshot_expires_at <= first.snapshot_created_at
+        || first.snapshot_expires_at - first.snapshot_created_at > chrono::Duration::seconds(60)
+        || first.page_start != 0
+        || first.request_cursor.is_some()
+        || !valid_binding_artifact_cursor(&first.next_cursor)
+    {
+        return Err(OrchestrationBindingQueryError::Invalid);
+    }
+    if first.total_rows > ORCHESTRATION_BINDING_ARTIFACT_MAX_ROWS as u64 {
+        return Err(OrchestrationBindingQueryError::TooLarge);
+    }
+
+    let mut expected_start = 0u64;
+    let mut previous_next_cursor: Option<&str> = None;
+    let mut seen_complete = false;
+    let mut seen_task_ids = HashSet::new();
+    for (index, page) in pages.iter().enumerate() {
+        if page.schema_version != first.schema_version
+            || page.namespace != first.namespace
+            || page.snapshot_id != first.snapshot_id
+            || page.snapshot_revision != first.snapshot_revision
+            || page.snapshot_created_at != first.snapshot_created_at
+            || page.snapshot_expires_at != first.snapshot_expires_at
+            || page.total_rows != first.total_rows
+            || seen_complete
+            || page.page_start != expected_start
+            || !valid_binding_artifact_cursor(&page.request_cursor)
+            || !valid_binding_artifact_cursor(&page.next_cursor)
+            || (index > 0 && page.request_cursor.as_deref() != previous_next_cursor)
+            || (page.complete && page.next_cursor.is_some())
+            || (!page.complete && page.next_cursor.is_none())
+        {
+            return Err(OrchestrationBindingQueryError::Invalid);
+        }
+        expected_start = expected_start
+            .checked_add(page.runs.len() as u64)
+            .ok_or(OrchestrationBindingQueryError::TooLarge)?;
+        if expected_start > ORCHESTRATION_BINDING_ARTIFACT_MAX_ROWS as u64 {
+            return Err(OrchestrationBindingQueryError::TooLarge);
+        }
+        for run in &page.runs {
+            if run.task_id.is_empty() || !seen_task_ids.insert(run.task_id.as_str()) {
+                return Err(OrchestrationBindingQueryError::Invalid);
+            }
+        }
+        seen_complete = page.complete;
+        previous_next_cursor = page.next_cursor.as_deref();
+    }
+    if (require_complete && !seen_complete)
+        || (seen_complete && expected_start != first.total_rows)
+        || (!seen_complete && expected_start >= first.total_rows)
+    {
+        return Err(OrchestrationBindingQueryError::Invalid);
+    }
+
+    Ok(expected_start as usize)
+}
+
+fn prepare_binding_evidence(
+    pages: Vec<DelegationOrchestrationBindingPage>,
+) -> Result<PreparedBindingEvidence, OrchestrationBindingQueryError> {
+    let total_rows = validate_binding_evidence_pages(&pages, true)?;
+
+    let evidence = BindingEvidenceV1 {
+        schema_version: 1,
+        pages,
+    };
+    let bytes =
+        serde_json::to_vec(&evidence).map_err(|_| OrchestrationBindingQueryError::Failed)?;
+    if bytes.len() > ORCHESTRATION_BINDING_ARTIFACT_MAX_BYTES {
+        return Err(OrchestrationBindingQueryError::ArtifactTooLarge);
+    }
+    Ok(PreparedBindingEvidence {
+        evidence,
+        bytes,
+        total_rows,
+    })
+}
+
+#[cfg(unix)]
+fn set_private_directory_permissions(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+}
+
+#[cfg(not(unix))]
+fn set_private_directory_permissions(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_private_file_permissions(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(not(unix))]
+fn set_private_file_permissions(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+fn canonical_direct_child_directory(parent: &Path, name: &str) -> io::Result<PathBuf> {
+    let child = parent.join(name);
+    let metadata = match fs::symlink_metadata(&child) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            if let Err(error) = fs::create_dir(&child) {
+                if error.kind() != io::ErrorKind::AlreadyExists {
+                    return Err(error);
+                }
+            }
+            fs::symlink_metadata(&child)?
+        }
+        Err(error) => return Err(error),
+    };
+    if metadata_is_symlink_or_reparse(&metadata) || !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "artifact directory is not a direct directory child",
+        ));
+    }
+    let canonical_child = child.canonicalize()?;
+    if canonical_child.parent() != Some(parent) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "artifact directory escaped its fixed parent",
+        ));
+    }
+    Ok(canonical_child)
+}
+
+fn canonical_binding_artifact_root(temp_base: &Path) -> io::Result<PathBuf> {
+    let canonical_temp_base = temp_base.canonicalize()?;
+    let base_metadata = fs::symlink_metadata(&canonical_temp_base)?;
+    if metadata_is_symlink_or_reparse(&base_metadata) || !base_metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "artifact temp base is not a directory",
+        ));
+    }
+    let canonical_parent = canonical_direct_child_directory(&canonical_temp_base, "codeg-mcp")?;
+    let canonical_root =
+        canonical_direct_child_directory(&canonical_parent, "orchestration-bindings")?;
+    set_private_directory_permissions(&canonical_parent)?;
+    set_private_directory_permissions(&canonical_root)?;
+    Ok(canonical_root)
+}
+
+fn canonical_binding_artifact_owner(temp_base: &Path, incarnation_id: &str) -> io::Result<PathBuf> {
+    let incarnation = uuid::Uuid::parse_str(incarnation_id)
+        .ok()
+        .filter(|incarnation| incarnation.to_string() == incarnation_id)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "connection incarnation is not a canonical UUID",
+            )
+        })?;
+    let canonical_root = canonical_binding_artifact_root(temp_base)?;
+    let canonical_owner =
+        canonical_direct_child_directory(&canonical_root, &incarnation.to_string())?;
+    set_private_directory_permissions(&canonical_owner)?;
+    Ok(canonical_owner)
+}
+
+fn sweep_stale_binding_artifacts_at(
+    temp_base: &Path,
+    now: SystemTime,
+    metrics: &DelegationMetrics,
+) -> io::Result<()> {
+    let canonical_root = canonical_binding_artifact_root(temp_base)?;
+    for owner in fs::read_dir(&canonical_root)? {
+        let owner = owner?;
+        if !owner.file_type()?.is_dir() {
+            continue;
+        }
+        let owner_name = owner.file_name();
+        let Some(owner_name) = owner_name.to_str() else {
+            continue;
+        };
+        if uuid::Uuid::parse_str(owner_name)
+            .ok()
+            .is_none_or(|owner_id| owner_id.to_string() != owner_name)
+        {
+            continue;
+        }
+        let canonical_owner = owner.path().canonicalize()?;
+        if canonical_owner.parent() != Some(canonical_root.as_path()) {
+            continue;
+        }
+        for file in fs::read_dir(&canonical_owner)? {
+            let file = file?;
+            if !file.file_type()?.is_file() {
+                continue;
+            }
+            let path = file.path();
+            let canonical_file = path.canonicalize()?;
+            if canonical_file.parent() != Some(canonical_owner.as_path()) {
+                continue;
+            }
+            let modified = file.metadata()?.modified()?;
+            if now
+                .duration_since(modified)
+                .is_ok_and(|age| age > ORCHESTRATION_BINDING_ARTIFACT_STALE_AGE)
+            {
+                match fs::remove_file(&canonical_file) {
+                    Ok(()) => metrics.record_artifact_cleanup(true),
+                    Err(error) => {
+                        metrics.record_artifact_cleanup(false);
+                        return Err(error);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn atomic_publish_binding_artifact(
+    owner: &Path,
+    final_path: &Path,
+    bytes: &[u8],
+) -> io::Result<()> {
+    let mut partial = tempfile::NamedTempFile::new_in(owner)?;
+    set_private_file_permissions(partial.path())?;
+    partial.write_all(bytes)?;
+    partial.as_file_mut().sync_all()?;
+    partial
+        .persist_noclobber(final_path)
+        .map(|_| ())
+        .map_err(|error| error.error)
+}
+
+fn artifact_storage_metric_outcome(error: OrchestrationBindingQueryError) -> ArtifactExportOutcome {
+    match error {
+        OrchestrationBindingQueryError::SnapshotStale => ArtifactExportOutcome::Stale,
+        OrchestrationBindingQueryError::Failed => ArtifactExportOutcome::SerializationFailed,
+        OrchestrationBindingQueryError::ArtifactIoFailed => ArtifactExportOutcome::IoFailed,
+        OrchestrationBindingQueryError::TooLarge
+        | OrchestrationBindingQueryError::ArtifactTooLarge => ArtifactExportOutcome::TooLarge,
+        OrchestrationBindingQueryError::ArtifactResultTooLarge => {
+            ArtifactExportOutcome::ResultTooLarge
+        }
+        OrchestrationBindingQueryError::Invalid
+        | OrchestrationBindingQueryError::AdmissionIntentInvalid
+        | OrchestrationBindingQueryError::DispatchIntentConflict => {
+            ArtifactExportOutcome::BrokerFailed
+        }
+    }
+}
+
+fn store_binding_artifact_at(
+    temp_base: &Path,
+    incarnation_id: &str,
+    pages: Vec<DelegationOrchestrationBindingPage>,
+    inflight: &Arc<InflightCalls>,
+) -> Result<
+    (
+        OrchestrationBindingArtifactDescriptor,
+        PendingBindingArtifact,
+    ),
+    OrchestrationBindingQueryError,
+> {
+    let started = Instant::now();
+    let prepared = match prepare_binding_evidence(pages) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            inflight
+                .binding_artifacts
+                .metrics
+                .record_artifact_export(artifact_storage_metric_outcome(error));
+            return Err(error);
+        }
+    };
+    if sweep_stale_binding_artifacts_at(
+        temp_base,
+        SystemTime::now(),
+        &inflight.binding_artifacts.metrics,
+    )
+    .is_err()
+    {
+        inflight
+            .binding_artifacts
+            .metrics
+            .record_artifact_export(ArtifactExportOutcome::IoFailed);
+        return Err(OrchestrationBindingQueryError::ArtifactIoFailed);
+    }
+    let owner = canonical_binding_artifact_owner(temp_base, incarnation_id).map_err(|_| {
+        inflight
+            .binding_artifacts
+            .metrics
+            .record_artifact_export(ArtifactExportOutcome::IoFailed);
+        OrchestrationBindingQueryError::ArtifactIoFailed
+    })?;
+    let final_path = owner.join(format!("{}.json", uuid::Uuid::new_v4()));
+    let artifact_path = final_path.to_str().map(str::to_owned).ok_or_else(|| {
+        inflight
+            .binding_artifacts
+            .metrics
+            .record_artifact_export(ArtifactExportOutcome::IoFailed);
+        OrchestrationBindingQueryError::ArtifactIoFailed
+    })?;
+    let digest = format!("sha256:{:x}", Sha256::digest(&prepared.bytes));
+    if atomic_publish_binding_artifact(&owner, &final_path, &prepared.bytes).is_err() {
+        inflight
+            .binding_artifacts
+            .metrics
+            .record_artifact_export(ArtifactExportOutcome::IoFailed);
+        return Err(OrchestrationBindingQueryError::ArtifactIoFailed);
+    }
+    let pending = inflight.binding_artifacts.register(
+        final_path,
+        PendingBindingArtifactMetrics {
+            internal_page_count: prepared.evidence.pages.len(),
+            selected_row_count: prepared.total_rows,
+            evidence_bytes: prepared.bytes.len(),
+            export_duration: started.elapsed(),
+            final_result_bytes: 0,
+        },
+    );
+    let first = &prepared.evidence.pages[0];
+    let descriptor = OrchestrationBindingArtifactDescriptor {
+        schema_version: 1,
+        delivery: "artifact".into(),
+        namespace: first.namespace.clone(),
+        snapshot_id: first.snapshot_id.clone(),
+        snapshot_revision: first.snapshot_revision.clone(),
+        snapshot_created_at: first.snapshot_created_at,
+        snapshot_expires_at: first.snapshot_expires_at,
+        total_rows: prepared.total_rows as u64,
+        artifact_path,
+        artifact_format: ORCHESTRATION_BINDING_ARTIFACT_FORMAT.into(),
+        artifact_bytes: prepared.bytes.len() as u64,
+        artifact_sha256: digest,
+    };
+    Ok((descriptor, pending))
+}
+
+pub(crate) fn store_binding_artifact(
+    incarnation_id: &str,
+    pages: Vec<DelegationOrchestrationBindingPage>,
+    inflight: &Arc<InflightCalls>,
+) -> Result<
+    (
+        OrchestrationBindingArtifactDescriptor,
+        PendingBindingArtifact,
+    ),
+    OrchestrationBindingQueryError,
+> {
+    store_binding_artifact_at(&std::env::temp_dir(), incarnation_id, pages, inflight)
 }
 
 /// Canonicalize a JSON-RPC `id` to a string suitable as a `HashMap` key.
@@ -486,6 +1671,27 @@ pub enum LineAction {
 pub struct SpawnResult {
     pub response: Option<JsonRpcResponse>,
     pub after_relay: Option<futures_util::future::BoxFuture<'static, ()>>,
+    before_relay: Option<futures_util::future::BoxFuture<'static, bool>>,
+}
+
+impl SpawnResult {
+    /// Claim a completed response immediately before stdout relay. Artifact
+    /// delivery keeps its cancellation entry until this point so cancellation
+    /// can still suppress the response and drop-clean the pending file.
+    pub async fn claim_relay(
+        mut self,
+    ) -> Option<(
+        JsonRpcResponse,
+        Option<futures_util::future::BoxFuture<'static, ()>>,
+    )> {
+        let response = self.response.take()?;
+        if let Some(before_relay) = self.before_relay.take() {
+            if !before_relay.await {
+                return None;
+            }
+        }
+        Some((response, self.after_relay.take()))
+    }
 }
 
 /// Materialized async tools/call ready to drive in a tokio task. The binary
@@ -694,6 +1900,45 @@ async fn build_tools_call_spawn(
     }
     match name.as_str() {
         "delegate_to_agent" | "continue_delegation" => {
+            let allowed = if name == "delegate_to_agent" {
+                &[
+                    "agent_type",
+                    "profile_id",
+                    "profile_label",
+                    "task",
+                    "correlation_id",
+                    "dispatch_intent_id",
+                    "admission_ticket",
+                    "recovery_authorization_id",
+                    "orchestration_binding",
+                    "working_dir",
+                    "work_unit_key",
+                    "replaces_task_id",
+                    "replacement_reason",
+                ][..]
+            } else {
+                &[
+                    "task_id",
+                    "task",
+                    "correlation_id",
+                    "dispatch_intent_id",
+                    "admission_ticket",
+                    "recovery_authorization_id",
+                    "orchestration_binding",
+                    "work_unit_key",
+                ][..]
+            };
+            if let Err(message) = reject_unknown_arguments(&arguments, &name, allowed) {
+                return LineAction::Respond(err(id, -32602, message));
+            }
+            if let Err(message) = parse_admission_ticket_v1_request(&arguments) {
+                let report = json!({
+                    "status": "failed",
+                    "error_code": "orchestration_admission_ticket_missing",
+                    "message": message,
+                });
+                return LineAction::Respond(ok(id, render_task_report(&report)));
+            }
             // MCP clients (Codex / Claude Code) generally do NOT populate
             // `_meta.tool_use_id` when calling an MCP server. We still surface it
             // when present (the most precise binding). For `continue_delegation`,
@@ -771,16 +2016,46 @@ async fn build_tools_call_spawn(
         }
         "get_delegation_orchestration_bindings" => {
             if arguments.as_object().is_some_and(|object| {
-                object.get("snapshot_id").is_some_and(Value::is_null)
-                    || object.get("cursor").is_some_and(Value::is_null)
+                ["delivery", "limit", "snapshot_id", "cursor", "admission_intent"]
+                    .iter()
+                    .any(|field| object.get(*field).is_some_and(Value::is_null))
             }) {
                 return orchestration_binding_query_invalid_response(id);
             }
-            let query: OrchestrationBindingQueryRequest = match serde_json::from_value(arguments) {
-                Ok(query) => query,
-                Err(_) => return orchestration_binding_query_invalid_response(id),
+            if arguments
+                .get("admission_intent")
+                .is_some_and(|intent| {
+                    serde_json::from_value::<AdmissionIntentV1>(intent.clone()).is_err()
+                })
+            {
+                return LineAction::Respond(bounded_orchestration_binding_error(
+                    id,
+                    OrchestrationBindingQueryError::AdmissionIntentInvalid.code(),
+                ));
+            }
+            let tool_request: OrchestrationBindingToolRequest =
+                match serde_json::from_value(arguments) {
+                    Ok(request) => request,
+                    Err(_) => return orchestration_binding_query_invalid_response(id),
+                };
+            let delivery = tool_request
+                .delivery
+                .unwrap_or(OrchestrationBindingDelivery::Page);
+            let query = OrchestrationBindingQueryRequest {
+                namespace: tool_request.namespace,
+                limit: tool_request.limit.unwrap_or(match delivery {
+                    OrchestrationBindingDelivery::Page => ORCHESTRATION_BINDING_DEFAULT_LIMIT,
+                    OrchestrationBindingDelivery::Artifact => ORCHESTRATION_BINDING_MAX_LIMIT,
+                }),
+                snapshot_id: tool_request.snapshot_id,
+                cursor: tool_request.cursor,
             };
-            if query.validate().is_err() {
+            if query.validate().is_err()
+                || (delivery == OrchestrationBindingDelivery::Artifact
+                    && (query.snapshot_id.is_some() || query.cursor.is_some()))
+                || (tool_request.admission_intent.is_some()
+                    && delivery != OrchestrationBindingDelivery::Artifact)
+            {
                 return orchestration_binding_query_invalid_response(id);
             }
             let req = BrokerOrchestrationBindingsRequest {
@@ -790,8 +2065,27 @@ async fn build_tools_call_spawn(
                 page_limit: None,
                 snapshot_id: query.snapshot_id,
                 cursor: query.cursor,
+                admission_intent: tool_request.admission_intent,
             };
-            register_and_spawn_orchestration_bindings(inflight, id, socket, req).await
+            match delivery {
+                OrchestrationBindingDelivery::Page => {
+                    inflight
+                        .binding_artifacts
+                        .metrics
+                        .record_legacy_page_mode_call_after_artifact_capability();
+                    register_and_spawn_orchestration_bindings(inflight, id, socket, req).await
+                }
+                OrchestrationBindingDelivery::Artifact => {
+                    register_and_spawn_orchestration_binding_artifact(
+                        inflight,
+                        id,
+                        socket,
+                        ctx.connection_incarnation_id.clone(),
+                        req,
+                    )
+                    .await
+                }
+            }
         }
         "cancel_delegation" => {
             let task_id = match arguments.get("task_id").and_then(|v| v.as_str()) {
@@ -914,7 +2208,18 @@ async fn build_tools_call_spawn(
                 }
             };
             // Default to a modest recent-message window; `0` means metadata-only.
-            // Robust against stringified / oversized values (see helper).
+            // Keep the catalog's integer contract at runtime; clamp oversized
+            // numeric values in the existing helper.
+            if arguments
+                .get("max_messages")
+                .is_some_and(|value| !is_nonnegative_json_integer(value))
+            {
+                return LineAction::Respond(err(
+                    id,
+                    -32602,
+                    "get_session_info max_messages must be a non-negative integer",
+                ));
+            }
             let max_messages = parse_max_messages(&arguments);
             let req = BrokerSessionRequest {
                 token: ctx.token.clone(),
@@ -1010,6 +2315,13 @@ async fn build_tools_call_spawn(
         }
         // A15.1: answer locally from CompanionFeatures — no UDS / no store.
         "get_workflow_capabilities" => {
+            if !arguments.is_object() {
+                return LineAction::Respond(err(
+                    id,
+                    -32602,
+                    "get_workflow_capabilities arguments must be an object",
+                ));
+            }
             let caps = local_workflow_capabilities(&ctx.features, ctx.role);
             LineAction::Respond(ok(id, render_workflow_local_result(&caps)))
         }
@@ -1025,6 +2337,9 @@ async fn build_tools_call_spawn(
             register_and_spawn_workflow_state(inflight, id, round_trip).await
         }
         "publish_workflow_manifest" => {
+            if let Err(message) = validate_publish_workflow_compacted_fields(&arguments) {
+                return LineAction::Respond(err(id, -32602, message));
+            }
             let req = BrokerPublishWorkflowRequest {
                 token: ctx.token.clone(),
                 document: arguments,
@@ -1034,6 +2349,16 @@ async fn build_tools_call_spawn(
             register_and_spawn(inflight, id, None, round_trip, render_workflow_result).await
         }
         "register_simple_workflow" => {
+            if arguments
+                .get("progress_rel_path")
+                .is_some_and(Value::is_null)
+            {
+                return LineAction::Respond(err(
+                    id,
+                    -32602,
+                    "invalid register_simple_workflow arguments: progress_rel_path must be a string",
+                ));
+            }
             let arguments: RegisterSimpleWorkflowArguments = match serde_json::from_value(arguments)
             {
                 Ok(arguments) => arguments,
@@ -1119,7 +2444,7 @@ fn parse_get_workflow_state_args(
         }
     }
     let workflow_id = match arguments.get("workflow_id") {
-        None | Some(Value::Null) => None,
+        None => None,
         Some(Value::String(workflow_id)) if !workflow_id.is_empty() => Some(workflow_id.clone()),
         Some(_) => {
             return Err(
@@ -1132,6 +2457,50 @@ fn parse_get_workflow_state_args(
         token: token.to_string(),
         workflow_id,
     })
+}
+
+fn is_nonnegative_json_integer(value: &Value) -> bool {
+    value.as_u64().is_some()
+}
+
+fn json_u64(value: &Value) -> Option<u64> {
+    value.as_u64()
+}
+
+fn validate_publish_workflow_compacted_fields(arguments: &Value) -> Result<(), String> {
+    if arguments.get("schema_version").and_then(json_u64) != Some(2) {
+        return Err("publish_workflow_manifest schema_version must be integer 2".into());
+    }
+    if arguments
+        .get("workflow_id")
+        .is_some_and(|value| !value.is_string())
+    {
+        return Err("publish_workflow_manifest workflow_id must be a string".into());
+    }
+    if arguments
+        .get("expected_manifest_revision")
+        .is_some_and(|value| json_u64(value).is_none())
+    {
+        return Err(
+            "publish_workflow_manifest expected_manifest_revision must be a non-negative integer"
+                .into(),
+        );
+    }
+    if !arguments
+        .get("plan_target_rel_path")
+        .is_some_and(Value::is_string)
+    {
+        return Err("publish_workflow_manifest plan_target_rel_path must be a string".into());
+    }
+    if arguments.get("risk_policy_version").and_then(Value::as_str) != Some("b2d_task_risk_v1") {
+        return Err(
+            "publish_workflow_manifest risk_policy_version must be b2d_task_risk_v1".into(),
+        );
+    }
+    if !arguments.get("task_policies").is_some_and(Value::is_array) {
+        return Err("publish_workflow_manifest task_policies must be an array".into());
+    }
+    Ok(())
 }
 
 fn reject_unknown_arguments(arguments: &Value, tool: &str, allowed: &[&str]) -> Result<(), String> {
@@ -1227,15 +2596,13 @@ fn parse_recover_workflow_args(
     let correlation_id = required_string("correlation_id")?;
     validate_correlation_id(&correlation_id)
         .map_err(|message| format!("recover_workflow invalid correlation_id: {message}"))?;
-    let expected_manifest_revision = match arguments.get("expected_manifest_revision") {
-        Some(Value::Number(number)) => number.as_u64(),
-        Some(Value::String(value)) => value.parse::<u64>().ok(),
-        _ => None,
-    }
-    .filter(|revision| *revision > 0)
-    .ok_or_else(|| {
-        "recover_workflow expected_manifest_revision must be a positive integer".to_string()
-    })?;
+    let expected_manifest_revision = arguments
+        .get("expected_manifest_revision")
+        .and_then(json_u64)
+        .filter(|revision| *revision > 0)
+        .ok_or_else(|| {
+            "recover_workflow expected_manifest_revision must be a positive integer".to_string()
+        })?;
     Ok(BrokerRecoverWorkflowRequest {
         token: token.to_string(),
         workflow_id: required_string("workflow_id")?,
@@ -1283,6 +2650,12 @@ fn parse_settle_workflow_args(
     let expected_graph_revision = parse_u64_arg(arguments, "expected_graph_revision")?;
     let expected_review_round = parse_optional_u64_arg(arguments, "expected_review_round")?;
     let expected_gate_cycle = parse_optional_u64_arg(arguments, "expected_gate_cycle")?;
+    if expected_review_round == Some(0) {
+        return Err("settle_workflow_gate expected_review_round must be at least 1".into());
+    }
+    if expected_gate_cycle == Some(0) {
+        return Err("settle_workflow_gate expected_gate_cycle must be at least 1".into());
+    }
     let parse_outcome = |key: &str| -> Result<Option<String>, String> {
         let Some(value) = arguments.get(key) else {
             return Ok(None);
@@ -1324,31 +2697,18 @@ fn parse_settle_workflow_args(
 }
 
 fn parse_u64_arg(arguments: &Value, key: &str) -> Result<u64, String> {
-    match arguments.get(key) {
-        Some(Value::Number(n)) => n
-            .as_u64()
-            .ok_or_else(|| format!("settle_workflow_gate {key} must be a non-negative integer")),
-        Some(Value::String(s)) => s
-            .parse::<u64>()
-            .map_err(|_| format!("settle_workflow_gate {key} must be a non-negative integer")),
-        _ => Err(format!("settle_workflow_gate requires {key}")),
-    }
+    arguments
+        .get(key)
+        .and_then(json_u64)
+        .ok_or_else(|| format!("settle_workflow_gate {key} must be a non-negative integer"))
 }
 
 fn parse_optional_u64_arg(arguments: &Value, key: &str) -> Result<Option<u64>, String> {
     match arguments.get(key) {
         None => Ok(None),
-        Some(Value::Number(number)) => number
-            .as_u64()
+        Some(value) => json_u64(value)
             .map(Some)
             .ok_or_else(|| format!("settle_workflow_gate {key} must be a non-negative integer")),
-        Some(Value::String(value)) => value
-            .parse::<u64>()
-            .map(Some)
-            .map_err(|_| format!("settle_workflow_gate {key} must be a non-negative integer")),
-        Some(_) => Err(format!(
-            "settle_workflow_gate {key} must be a non-negative integer"
-        )),
     }
 }
 
@@ -1420,6 +2780,17 @@ fn bounded_orchestration_binding_error(id: Value, code: &str) -> JsonRpcResponse
             "orchestration binding query exceeds the row limit"
         }
         "orchestration_binding_snapshot_stale" => "orchestration binding snapshot is stale",
+        "orchestration_binding_artifact_io_failed" => "orchestration binding artifact I/O failed",
+        "orchestration_binding_artifact_too_large" => {
+            "orchestration binding artifact exceeds the byte limit"
+        }
+        "orchestration_binding_artifact_result_too_large" => {
+            "orchestration binding artifact result exceeds the transport limit"
+        }
+        "orchestration_admission_intent_invalid" => "invalid orchestration admission intent",
+        "delegation_dispatch_intent_conflict" => {
+            "delegation dispatch intent conflicts with an existing run"
+        }
         "payload_too_large" => {
             "orchestration binding row exceeds the 7680-byte stdio transport budget"
         }
@@ -1559,6 +2930,197 @@ async fn orchestration_binding_response_with_budget(
             }
         }
     }
+}
+
+fn orchestration_binding_outcome_error(outcome: &Value) -> Option<OrchestrationBindingQueryError> {
+    outcome.get("error").map(
+        |_| match outcome.pointer("/error/code").and_then(Value::as_str) {
+            Some("orchestration_binding_query_invalid") => OrchestrationBindingQueryError::Invalid,
+            Some("orchestration_binding_query_too_large") => {
+                OrchestrationBindingQueryError::TooLarge
+            }
+            Some("orchestration_binding_snapshot_stale") => {
+                OrchestrationBindingQueryError::SnapshotStale
+            }
+            Some("orchestration_admission_intent_invalid") => {
+                OrchestrationBindingQueryError::AdmissionIntentInvalid
+            }
+            Some("delegation_dispatch_intent_conflict") => {
+                OrchestrationBindingQueryError::DispatchIntentConflict
+            }
+            _ => OrchestrationBindingQueryError::Failed,
+        },
+    )
+}
+
+async fn collect_orchestration_binding_artifact_pages(
+    socket: &str,
+    first_request: &BrokerOrchestrationBindingsRequest,
+) -> Result<
+    (Vec<DelegationOrchestrationBindingPage>, Option<AdmissionPreparation>),
+    OrchestrationBindingQueryError,
+> {
+    let mut request = first_request.clone();
+    let mut pages = Vec::new();
+    let mut admission = None;
+    loop {
+        let response = client_orchestration_bindings_round_trip(socket, &request)
+            .await
+            .map_err(|_| OrchestrationBindingQueryError::Failed)?;
+        if let Some(error) = orchestration_binding_outcome_error(&response.outcome) {
+            return Err(error);
+        }
+        let page = if pages.is_empty() && request.admission_intent.is_some() {
+            let envelope: OrchestrationBindingFirstPageEnvelope =
+                serde_json::from_value(response.outcome)
+                    .map_err(|_| OrchestrationBindingQueryError::Failed)?;
+            admission = Some(envelope.admission);
+            envelope.page
+        } else {
+            serde_json::from_value(response.outcome)
+                .map_err(|_| OrchestrationBindingQueryError::Failed)?
+        };
+        let complete = page.complete;
+        let snapshot_id = page.snapshot_id.clone();
+        let next_cursor = page.next_cursor.clone();
+        pages.push(page);
+        validate_binding_evidence_pages(&pages, false).map_err(|error| match error {
+            OrchestrationBindingQueryError::Invalid => OrchestrationBindingQueryError::Failed,
+            error => error,
+        })?;
+        if complete {
+            return Ok((pages, admission));
+        }
+        request.snapshot_id = Some(snapshot_id);
+        request.cursor = Some(next_cursor.ok_or(OrchestrationBindingQueryError::Failed)?);
+        request.admission_intent = None;
+    }
+}
+
+fn render_orchestration_binding_artifact(
+    descriptor: &OrchestrationBindingArtifactDescriptor,
+    admission: Option<&AdmissionPreparation>,
+) -> Value {
+    let rows = if descriptor.total_rows == 1 {
+        "row"
+    } else {
+        "rows"
+    };
+    let expires_at = descriptor
+        .snapshot_expires_at
+        .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true);
+    let mut structured_content = serde_json::to_value(descriptor)
+        .expect("artifact descriptor contains serializable fields");
+    if let Some(admission) = admission {
+        structured_content
+            .as_object_mut()
+            .expect("artifact descriptor serializes as an object")
+            .insert(
+                "admission".into(),
+                serde_json::to_value(admission)
+                    .expect("admission preparation contains serializable fields"),
+            );
+    }
+    json!({
+        "content": [{
+            "type": "text",
+            "text": format!(
+                "Binding artifact: {} ({} {}, revision {}, expires {}, {}).",
+                descriptor.artifact_path,
+                descriptor.total_rows,
+                rows,
+                descriptor.snapshot_revision,
+                expires_at,
+                descriptor.artifact_sha256,
+            )
+        }],
+        "isError": false,
+        "structuredContent": structured_content,
+    })
+}
+
+fn finalize_orchestration_binding_artifact_response(
+    id: Value,
+    descriptor: OrchestrationBindingArtifactDescriptor,
+    admission: Option<AdmissionPreparation>,
+    mut pending: PendingBindingArtifact,
+) -> (JsonRpcResponse, Option<PendingBindingArtifact>) {
+    let response = ok(
+        id.clone(),
+        render_orchestration_binding_artifact(&descriptor, admission.as_ref()),
+    );
+    let result_bytes = match serialize_jsonrpc_line(&response) {
+        Ok(line) => line.len(),
+        Err(_) => {
+            pending.record_outcome(ArtifactExportOutcome::SerializationFailed);
+            drop(pending);
+            return (
+                bounded_orchestration_binding_error(
+                    id,
+                    OrchestrationBindingQueryError::Failed.code(),
+                ),
+                None,
+            );
+        }
+    };
+    if result_bytes > ORCHESTRATION_BINDING_ARTIFACT_MAX_RESULT_BYTES {
+        pending.record_outcome(ArtifactExportOutcome::ResultTooLarge);
+        drop(pending);
+        return (
+            bounded_orchestration_binding_error(
+                id,
+                OrchestrationBindingQueryError::ArtifactResultTooLarge.code(),
+            ),
+            None,
+        );
+    }
+    (response, Some(pending.set_final_result_bytes(result_bytes)))
+}
+
+async fn orchestration_binding_artifact_response(
+    socket: &str,
+    request: BrokerOrchestrationBindingsRequest,
+    incarnation_id: &str,
+    id: Value,
+    inflight: &Arc<InflightCalls>,
+) -> (JsonRpcResponse, Option<PendingBindingArtifact>) {
+    let mut restarted = false;
+    let pages = loop {
+        match collect_orchestration_binding_artifact_pages(socket, &request).await {
+            Err(OrchestrationBindingQueryError::SnapshotStale) if !restarted => {
+                restarted = true;
+                inflight.record_binding_artifact_stale_restart();
+            }
+            Ok(materialized) => break materialized,
+            Err(error) => {
+                let outcome = match error {
+                    OrchestrationBindingQueryError::SnapshotStale => ArtifactExportOutcome::Stale,
+                    OrchestrationBindingQueryError::TooLarge => ArtifactExportOutcome::TooLarge,
+                    _ => ArtifactExportOutcome::BrokerFailed,
+                };
+                inflight
+                    .binding_artifacts
+                    .metrics
+                    .record_artifact_export(outcome);
+                return (bounded_orchestration_binding_error(id, error.code()), None);
+            }
+        }
+    };
+    let (pages, admission) = pages;
+    let (descriptor, pending) = match store_binding_artifact(incarnation_id, pages, inflight) {
+        Ok(stored) => stored,
+        Err(OrchestrationBindingQueryError::Invalid) => {
+            return (
+                bounded_orchestration_binding_error(
+                    id,
+                    OrchestrationBindingQueryError::Failed.code(),
+                ),
+                None,
+            )
+        }
+        Err(error) => return (bounded_orchestration_binding_error(id, error.code()), None),
+    };
+    finalize_orchestration_binding_artifact_response(id, descriptor, admission, pending)
 }
 
 fn orchestration_binding_query_invalid_response(id: Value) -> LineAction {
@@ -1840,6 +3402,7 @@ async fn register_and_spawn(
         SpawnResult {
             response,
             after_relay: None,
+            before_relay: None,
         }
     });
 
@@ -1921,6 +3484,7 @@ async fn register_and_spawn_workflow_state(
         SpawnResult {
             response,
             after_relay: None,
+            before_relay: None,
         }
     });
 
@@ -1972,6 +3536,72 @@ async fn register_and_spawn_orchestration_bindings(
         SpawnResult {
             response,
             after_relay: None,
+            before_relay: None,
+        }
+    });
+
+    LineAction::Spawn(SpawnedCall {
+        request_id: id,
+        request_id_key: id_key,
+        future,
+    })
+}
+
+async fn register_and_spawn_orchestration_binding_artifact(
+    inflight: Arc<InflightCalls>,
+    id: Value,
+    socket: String,
+    incarnation_id: String,
+    request: BrokerOrchestrationBindingsRequest,
+) -> LineAction {
+    let (cancel_tx, cancel_rx) = oneshot::channel();
+    let id_key = request_id_key(&id);
+    inflight
+        .register(
+            id_key.clone(),
+            InflightEntry {
+                external_handle: None,
+                cancel_tx,
+            },
+        )
+        .await;
+
+    let id_for_response = id.clone();
+    let id_key_for_task = id_key.clone();
+    let inflight_for_task = inflight.clone();
+    let future = Box::pin(async move {
+        tokio::select! {
+            biased;
+            _ = cancel_rx => {
+                let _ = inflight_for_task.take(&id_key_for_task).await;
+                SpawnResult {
+                    response: None,
+                    after_relay: None,
+                    before_relay: None,
+                }
+            }
+            (response, pending) = orchestration_binding_artifact_response(
+                &socket,
+                request,
+                &incarnation_id,
+                id_for_response,
+                &inflight_for_task,
+            ) => {
+                let before_relay = if pending.is_some() {
+                    let claim: futures_util::future::BoxFuture<'static, bool> = Box::pin(async move {
+                        inflight_for_task.take(&id_key_for_task).await.is_some()
+                    });
+                    Some(claim)
+                } else {
+                    let _ = inflight_for_task.take(&id_key_for_task).await;
+                    None
+                };
+                SpawnResult {
+                    response: Some(response),
+                    after_relay: pending.map(PendingBindingArtifact::after_relay),
+                    before_relay,
+                }
+            }
         }
     });
 
@@ -2053,6 +3683,7 @@ async fn register_and_spawn_session_info(
         SpawnResult {
             response,
             after_relay: None,
+            before_relay: None,
         }
     });
 
@@ -2109,6 +3740,7 @@ async fn register_and_spawn_feedback(
                 SpawnResult {
                     response: None,
                     after_relay: None,
+                    before_relay: None,
                 }
             }
             rt = client_feedback_round_trip(&socket, &req) => {
@@ -2130,6 +3762,7 @@ async fn register_and_spawn_feedback(
                         SpawnResult {
                             response: Some(response),
                             after_relay: Some(commit),
+                            before_relay: None,
                         }
                     }
                     Err(e) => SpawnResult {
@@ -2139,6 +3772,7 @@ async fn register_and_spawn_feedback(
                             format!("broker round-trip failed: {e}"),
                         )),
                         after_relay: None,
+                        before_relay: None,
                     },
                 }
             }
@@ -2234,6 +3868,7 @@ pub async fn drain_and_cancel_all(
     inflight: &Arc<InflightCalls>,
     reason: &str,
 ) {
+    inflight.drain_binding_artifacts();
     for entry in inflight.drain_all().await {
         // Wake the round-trip task if it's still scheduled, so it can
         // exit promptly when the runtime tears down.
@@ -2405,7 +4040,12 @@ fn parse_status_wait_arguments(
     arguments: &Value,
     coordination_v1: bool,
 ) -> Result<(Option<u64>, Option<DelegationReturnWhen>), String> {
-    let wait_ms = arguments.get("wait_ms").and_then(Value::as_u64);
+    let wait_ms = match arguments.get("wait_ms") {
+        None => None,
+        Some(value) => Some(
+            json_u64(value).ok_or_else(|| "wait_ms must be a non-negative integer".to_string())?,
+        ),
+    };
     let return_when = parse_return_when(arguments, coordination_v1)?;
     if coordination_v1 && return_when.is_none() && wait_ms.is_some_and(|ms| ms > 0) {
         return Err(COORDINATION_POSITIVE_WAIT_ERROR.into());
@@ -3390,6 +5030,47 @@ mod tests {
         (pipe_name, task)
     }
 
+    #[cfg(windows)]
+    fn orchestration_broker_with_outcomes(
+        outcomes: Vec<Value>,
+    ) -> (
+        String,
+        tokio::task::JoinHandle<Vec<BrokerOrchestrationBindingsRequest>>,
+    ) {
+        use crate::acp::delegation::transport::{
+            read_frame, write_frame, BrokerMessage, BrokerResponse,
+        };
+        use tokio::net::windows::named_pipe::ServerOptions;
+
+        let pipe_name = format!(
+            r"\\.\pipe\codeg-binding-artifact-test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        );
+        let task_pipe_name = pipe_name.clone();
+        let task = tokio::spawn(async move {
+            let mut requests = Vec::with_capacity(outcomes.len());
+            for (index, outcome) in outcomes.into_iter().enumerate() {
+                let mut options = ServerOptions::new();
+                if index == 0 {
+                    options.first_pipe_instance(true);
+                }
+                let mut server = options.create(&task_pipe_name).unwrap();
+                server.connect().await.unwrap();
+                let message: BrokerMessage = read_frame(&mut server).await.unwrap();
+                let BrokerMessage::OrchestrationBindings(request) = message else {
+                    panic!("expected orchestration binding query")
+                };
+                requests.push(request);
+                write_frame(&mut server, &BrokerResponse { outcome })
+                    .await
+                    .unwrap();
+            }
+            requests
+        });
+        (pipe_name, task)
+    }
+
     #[cfg(unix)]
     fn orchestration_broker_with_outcome(outcome: Value) -> (String, tokio::task::JoinHandle<()>) {
         use crate::acp::delegation::transport::{
@@ -3415,6 +5096,98 @@ mod tests {
                 .unwrap();
         });
         (socket, task)
+    }
+
+    #[cfg(unix)]
+    fn orchestration_broker_with_outcomes(
+        outcomes: Vec<Value>,
+    ) -> (
+        String,
+        tokio::task::JoinHandle<Vec<BrokerOrchestrationBindingsRequest>>,
+    ) {
+        use crate::acp::delegation::transport::{
+            read_frame, write_frame, BrokerMessage, BrokerResponse,
+        };
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("binding-artifact.sock");
+        let socket = socket_path.to_string_lossy().to_string();
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let task = tokio::spawn(async move {
+            let _dir = dir;
+            let mut requests = Vec::with_capacity(outcomes.len());
+            for outcome in outcomes {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let message: BrokerMessage = read_frame(&mut stream).await.unwrap();
+                let BrokerMessage::OrchestrationBindings(request) = message else {
+                    panic!("expected orchestration binding query")
+                };
+                requests.push(request);
+                write_frame(&mut stream, &BrokerResponse { outcome })
+                    .await
+                    .unwrap();
+            }
+            requests
+        });
+        (socket, task)
+    }
+
+    fn orchestration_binding_run(task_id: &str) -> Value {
+        json!({
+            "task_id": task_id,
+            "root_task_id": task_id,
+            "previous_task_id": Value::Null,
+            "lineage_root_task_id": task_id,
+            "replaced_task_id": Value::Null,
+            "replacement_reason": Value::Null,
+            "generic_generation": 1,
+            "work_unit_key": format!("work-unit-{task_id}"),
+            "child_conversation_id": 42,
+            "agent_type": "grok",
+            "profile_id": Value::Null,
+            "status": "completed",
+            "orchestration_binding": {
+                "schema_version": 1,
+                "namespace": "brainstorm-to-delivery",
+                "generation": 1,
+                "route_fingerprint": format!("sha256:{}", "a".repeat(64))
+            }
+        })
+    }
+
+    fn orchestration_binding_page(
+        total_rows: u64,
+        page_start: u64,
+        request_cursor: Option<&str>,
+        runs: Vec<Value>,
+        next_cursor: Option<&str>,
+    ) -> Value {
+        json!({
+            "schema_version": 1,
+            "namespace": "brainstorm-to-delivery",
+            "snapshot_id": "1a641e16-36f4-4ec5-aa4f-18d18e6ab107",
+            "snapshot_revision": "17",
+            "snapshot_created_at": "2026-08-26T08:00:00Z",
+            "snapshot_expires_at": "2026-08-26T08:01:00Z",
+            "total_rows": total_rows,
+            "page_start": page_start,
+            "request_cursor": request_cursor,
+            "runs": runs,
+            "next_cursor": next_cursor,
+            "complete": next_cursor.is_none()
+        })
+    }
+
+    fn value_contains_key(value: &Value, key: &str) -> bool {
+        match value {
+            Value::Object(object) => {
+                object.contains_key(key)
+                    || object.values().any(|value| value_contains_key(value, key))
+            }
+            Value::Array(values) => values.iter().any(|value| value_contains_key(value, key)),
+            _ => false,
+        }
     }
 
     fn large_orchestration_binding_page() -> Value {
@@ -3457,6 +5230,242 @@ mod tests {
             "next_cursor": Value::Null,
             "complete": true
         })
+    }
+
+    #[test]
+    fn delegation_admission_context_phase0_session_4123_frozen_baseline() {
+        let fixture: Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/delegation_binding_session_4123.json"
+        )))
+        .unwrap();
+        let fixture = fixture.as_object().unwrap();
+        assert_eq!(fixture.len(), 5);
+        assert!([
+            "schema_version",
+            "session_id",
+            "baseline",
+            "rows",
+            "expected_sequence",
+        ]
+        .iter()
+        .all(|key| fixture.contains_key(*key)));
+        assert_eq!(fixture["schema_version"], 1);
+        assert_eq!(fixture["session_id"], 4123);
+
+        let baseline = fixture["baseline"].as_object().unwrap();
+        assert_eq!(baseline.len(), 6);
+        assert_eq!(baseline["first_page_calls"], 125);
+        assert_eq!(baseline["continuation_page_calls"], 670);
+        assert_eq!(baseline["total_binding_query_calls"], 795);
+        assert_eq!(baseline["model_visible_result_bytes"], 3_040_870);
+        assert_eq!(baseline["final_row_count"], 72);
+        assert_eq!(baseline["work_unit_key_count"], 34);
+
+        let rows = fixture["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 72);
+        let identity_fields = [
+            "agent_type",
+            "child_conversation_id",
+            "generic_generation",
+            "lineage_root_task_id",
+            "orchestration_binding",
+            "previous_task_id",
+            "profile_id",
+            "replaced_task_id",
+            "replacement_reason",
+            "root_task_id",
+            "status",
+            "task_id",
+            "work_unit_key",
+        ];
+        let mut work_unit_keys = HashSet::new();
+        for row in rows {
+            let row = row.as_object().unwrap();
+            assert_eq!(row.len(), identity_fields.len());
+            assert!(identity_fields.iter().all(|field| row.contains_key(*field)));
+            for field in ["task_id", "root_task_id", "lineage_root_task_id"] {
+                uuid::Uuid::parse_str(row[field].as_str().unwrap()).unwrap();
+            }
+            work_unit_keys.insert(row["work_unit_key"].as_str().unwrap());
+        }
+        assert_eq!(work_unit_keys.len(), 34);
+
+        let expected_sequence = json!([
+            { "label": "selected_identity_rows", "value": 72 },
+            { "label": "legacy_model_visible_first_page_calls", "value": 125 },
+            { "label": "artifact_model_visible_calls", "value": 125 },
+            { "label": "legacy_model_visible_continuation_page_calls", "value": 670 },
+            { "label": "artifact_model_visible_continuation_page_calls", "value": 0 },
+            { "label": "legacy_total_binding_query_calls", "value": 795 },
+            { "label": "legacy_model_visible_binding_result_jsonl_utf8_bytes", "value": 3_040_870 },
+            { "label": "artifact_aggregate_result_jsonl_utf8_bytes_max", "value": 262_144 },
+            { "label": "artifact_reduction_percent_min", "value": 90 },
+            { "label": "selected_identity_order", "value": "unchanged" },
+            { "label": "validator_reconciliation_decisions", "value": "unchanged" },
+            { "label": "dispatch_labels", "value": "unchanged" }
+        ]);
+        assert_eq!(fixture["expected_sequence"], expected_sequence);
+
+        let page: DelegationOrchestrationBindingPage = serde_json::from_value(json!({
+            "schema_version": 1,
+            "namespace": "brainstorm-to-delivery",
+            "snapshot_id": "00000000-0000-4000-8000-000000004123",
+            "snapshot_revision": "0",
+            "snapshot_created_at": "2026-08-26T08:00:00Z",
+            "snapshot_expires_at": "2026-08-26T08:01:00Z",
+            "total_rows": 72,
+            "page_start": 0,
+            "request_cursor": null,
+            "runs": rows,
+            "next_cursor": null,
+            "complete": true
+        }))
+        .unwrap();
+        let id = json!("session-4123-baseline");
+        let response = ok(
+            id.clone(),
+            render_orchestration_binding_page(&serde_json::to_value(&page).unwrap()),
+        );
+        assert!(
+            serialize_jsonrpc_line(&response).unwrap().len()
+                > GET_ORCHESTRATION_BINDINGS_MAX_RESULT_BYTES
+        );
+        let fitting = largest_fitting_orchestration_binding_page_limit(
+            &id,
+            &page,
+            GET_ORCHESTRATION_BINDINGS_MAX_RESULT_BYTES,
+        )
+        .unwrap()
+        .unwrap();
+        assert!((1..72).contains(&usize::from(fitting)));
+    }
+
+    #[test]
+    fn delegation_binding_session_4123_phase1_artifact_replay() {
+        let fixture: Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/delegation_binding_session_4123.json"
+        )))
+        .unwrap();
+        let baseline = &fixture["baseline"];
+        let legacy_bytes = baseline["model_visible_result_bytes"].as_u64().unwrap() as usize;
+        assert_eq!(legacy_bytes, 3_040_870);
+        let rows = fixture["rows"].as_array().unwrap();
+        let expected_task_ids = rows
+            .iter()
+            .map(|row| row["task_id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        let page: DelegationOrchestrationBindingPage = serde_json::from_value(json!({
+            "schema_version": 1,
+            "namespace": "brainstorm-to-delivery",
+            "snapshot_id": "00000000-0000-4000-8000-000000004123",
+            "snapshot_revision": "0",
+            "snapshot_created_at": "2026-08-26T08:00:00Z",
+            "snapshot_expires_at": "2026-08-26T08:01:00Z",
+            "total_rows": rows.len(),
+            "page_start": 0,
+            "request_cursor": null,
+            "runs": rows,
+            "next_cursor": null,
+            "complete": true
+        }))
+        .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let inflight = Arc::new(InflightCalls::new());
+        let mut model_history = Vec::with_capacity(125);
+
+        for scan_index in 0..125 {
+            let (descriptor, pending) = store_binding_artifact_at(
+                temp.path(),
+                "00000000-0000-4000-8000-000000004123",
+                vec![page.clone()],
+                &inflight,
+            )
+            .unwrap();
+            let local_bytes = std::fs::read(&descriptor.artifact_path).unwrap();
+            let local_evidence: BindingEvidenceV1 = serde_json::from_slice(&local_bytes).unwrap();
+            let artifact_task_ids = local_evidence.pages[0]
+                .runs
+                .iter()
+                .map(|run| run.task_id.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(artifact_task_ids, expected_task_ids);
+            assert_eq!(descriptor.artifact_bytes as usize, local_bytes.len());
+            assert_eq!(
+                descriptor.artifact_sha256,
+                format!("sha256:{:x}", Sha256::digest(&local_bytes))
+            );
+
+            let (response, pending) = finalize_orchestration_binding_artifact_response(
+                json!(format!("session-4123-artifact-{scan_index}")),
+                descriptor,
+                None,
+                pending,
+            );
+            let pending = pending.expect("fixture artifact result must fit the public budget");
+            assert!(!value_contains_key(
+                response.result.as_ref().unwrap(),
+                "runs"
+            ));
+            let line = serialize_jsonrpc_line(&response).unwrap();
+            assert!(line.len() <= ORCHESTRATION_BINDING_ARTIFACT_MAX_RESULT_BYTES);
+            model_history.push(line);
+            pending.mark_delivered();
+        }
+
+        let artifact_results = model_history
+            .iter()
+            .filter(|line| {
+                serde_json::from_slice::<Value>(line)
+                    .unwrap()
+                    .pointer("/result/structuredContent/delivery")
+                    .and_then(Value::as_str)
+                    == Some("artifact")
+            })
+            .count();
+        let continuation_results = model_history
+            .iter()
+            .filter(|line| {
+                serde_json::from_slice::<Value>(line)
+                    .unwrap()
+                    .pointer("/result/structuredContent/next_cursor")
+                    .is_some()
+            })
+            .count();
+        let artifact_result_bytes = model_history.iter().map(Vec::len).sum::<usize>();
+        let reduction_percent = 100 - artifact_result_bytes * 100 / legacy_bytes;
+
+        assert_eq!(artifact_results, 125);
+        assert_eq!(continuation_results, 0);
+        assert!(artifact_result_bytes <= 262_144);
+        assert!(artifact_result_bytes * 10 <= legacy_bytes);
+        assert!(reduction_percent >= 90);
+        assert_eq!(baseline["first_page_calls"], 125);
+        assert_eq!(baseline["continuation_page_calls"], 670);
+        assert_eq!(baseline["total_binding_query_calls"], 795);
+        assert_eq!(baseline["final_row_count"], 72);
+        assert_eq!(
+            fixture["expected_sequence"],
+            json!([
+                { "label": "selected_identity_rows", "value": 72 },
+                { "label": "legacy_model_visible_first_page_calls", "value": 125 },
+                { "label": "artifact_model_visible_calls", "value": 125 },
+                { "label": "legacy_model_visible_continuation_page_calls", "value": 670 },
+                { "label": "artifact_model_visible_continuation_page_calls", "value": 0 },
+                { "label": "legacy_total_binding_query_calls", "value": 795 },
+                { "label": "legacy_model_visible_binding_result_jsonl_utf8_bytes", "value": 3_040_870 },
+                { "label": "artifact_aggregate_result_jsonl_utf8_bytes_max", "value": 262_144 },
+                { "label": "artifact_reduction_percent_min", "value": 90 },
+                { "label": "selected_identity_order", "value": "unchanged" },
+                { "label": "validator_reconciliation_decisions", "value": "unchanged" },
+                { "label": "dispatch_labels", "value": "unchanged" }
+            ])
+        );
+        println!(
+            "session-4123 Phase 1: artifact_results={artifact_results}, continuation_results={continuation_results}, result_bytes={artifact_result_bytes}, reduction={reduction_percent}%"
+        );
+        inflight.drain_binding_artifacts();
     }
 
     fn transport_sized_orchestration_page(page: &Value, page_limit: usize) -> Value {
@@ -3625,7 +5634,7 @@ mod tests {
         // Optional orchestration key for concurrent first-dispatch fencing.
         let work_unit = &delegate["inputSchema"]["properties"]["work_unit_key"];
         assert!(work_unit.is_object());
-        assert_eq!(work_unit["type"], "string");
+        assert!(work_unit.get("type").is_none());
         assert_eq!(work_unit["maxLength"], 200);
         assert!(!delegate["inputSchema"]["required"]
             .as_array()
@@ -3658,15 +5667,8 @@ mod tests {
         let reason_desc = delegate["inputSchema"]["properties"]["replacement_reason"]
             ["description"]
             .as_str()
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        assert!(
-            reason_desc.contains("admission_failed")
-                && reason_desc.contains("admission_unknown")
-                && reason_desc.contains("explicit")
-                && reason_desc.contains("continue"),
-            "replacement_reason description must document explicit-replacement-only recovery: {reason_desc}"
-        );
+            .unwrap();
+        assert_eq!(reason_desc, "");
         let delegate_desc = delegate["description"]
             .as_str()
             .unwrap_or("")
@@ -3682,17 +5684,7 @@ mod tests {
         // invocation; server still accepts legacy missing when host tool id present).
         let corr = &delegate["inputSchema"]["properties"]["correlation_id"];
         assert!(corr.is_object());
-        assert_eq!(corr["type"], "string");
-        let corr_desc = corr["description"]
-            .as_str()
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        assert!(
-            corr_desc.contains("fresh")
-                || corr_desc.contains("each invocation")
-                || corr_desc.contains("every"),
-            "correlation_id description must mention fresh-per-invocation: {corr_desc}"
-        );
+        assert!(corr.as_object().unwrap().is_empty());
         assert!(delegate["inputSchema"]["required"]
             .as_array()
             .unwrap()
@@ -3710,17 +5702,7 @@ mod tests {
         assert!(continue_props["working_dir"].is_null());
         let continue_corr = &continue_props["correlation_id"];
         assert!(continue_corr.is_object());
-        assert_eq!(continue_corr["type"], "string");
-        let continue_corr_desc = continue_corr["description"]
-            .as_str()
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        assert!(
-            continue_corr_desc.contains("fresh")
-                || continue_corr_desc.contains("each invocation")
-                || continue_corr_desc.contains("every"),
-            "continue correlation_id description: {continue_corr_desc}"
-        );
+        assert!(continue_corr.as_object().unwrap().is_empty());
         let continue_required = continue_tool["inputSchema"]["required"].as_array().unwrap();
         assert!(continue_required.iter().any(|value| value == "task_id"));
         assert!(continue_required.iter().any(|value| value == "task"));
@@ -4636,6 +6618,14 @@ mod tests {
         .to_string()
     }
 
+    fn with_argument(mut arguments: Value, key: &str, value: Value) -> Value {
+        arguments
+            .as_object_mut()
+            .expect("tool arguments object")
+            .insert(key.to_string(), value);
+        arguments
+    }
+
     fn tool_names(action: LineAction) -> Vec<String> {
         list_tool_names(action)
     }
@@ -4683,6 +6673,23 @@ mod tests {
                             .iter()
                             .filter_map(Value::as_str)
                             .any(|key| !object.contains_key(key))
+                    })
+                {
+                    return false;
+                }
+                if schema
+                    .get("dependentRequired")
+                    .and_then(Value::as_object)
+                    .is_some_and(|dependencies| {
+                        dependencies.iter().any(|(key, required)| {
+                            object.contains_key(key)
+                                && required.as_array().is_some_and(|required| {
+                                    required
+                                        .iter()
+                                        .filter_map(Value::as_str)
+                                        .any(|required| !object.contains_key(required))
+                                })
+                        })
                     })
                 {
                     return false;
@@ -4785,10 +6792,9 @@ mod tests {
                     .unwrap()
                     .insert("orchestration_binding".into(), case["value"].clone());
                 let expected = case["valid"].as_bool().unwrap();
-                assert_eq!(
+                assert!(
                     schema_accepts(schema, schema, &input),
-                    expected,
-                    "{tool_name} schema disagrees for {}",
+                    "{tool_name} compact catalog must defer {} to runtime",
                     case["name"]
                 );
                 assert_eq!(
@@ -4800,6 +6806,228 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn ticket_v1_request_contract_catalog_publishes_strict_paired_uuids() {
+        let catalog: Value = serde_json::from_str(TOOL_SCHEMA_JSON).unwrap();
+        for tool_name in ["delegate_to_agent", "continue_delegation"] {
+            let schema = &catalog
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool["name"] == tool_name)
+                .unwrap()["inputSchema"];
+            assert_eq!(schema["additionalProperties"], false);
+            assert!(schema["properties"].get("working_dir").is_some() == (tool_name == "delegate_to_agent"));
+            assert_eq!(schema["properties"]["dispatch_intent_id"]["$ref"], "#/$defs/u");
+            assert_eq!(schema["properties"]["admission_ticket"]["$ref"], "#/$defs/u");
+            assert_eq!(schema["$defs"].as_object().unwrap().len(), 1);
+            assert_eq!(
+                schema["dependentRequired"],
+                json!({
+                    "dispatch_intent_id": ["admission_ticket"],
+                    "admission_ticket": ["dispatch_intent_id"]
+                })
+            );
+
+            let base = if tool_name == "delegate_to_agent" {
+                json!({
+                    "agent_type": "grok",
+                    "task": "implement",
+                    "correlation_id": "physical-call"
+                })
+            } else {
+                json!({
+                    "task_id": "source-task",
+                    "task": "continue",
+                    "correlation_id": "physical-call"
+                })
+            };
+            assert!(schema_accepts(schema, schema, &base));
+            let paired = with_argument(
+                with_argument(
+                    base.clone(),
+                    "dispatch_intent_id",
+                    json!("8f95dd45-9eca-42a8-9909-0ac00be8ad52"),
+                ),
+                "admission_ticket",
+                json!("4a67bba4-e1f5-46d1-a9b1-aa796598ffce"),
+            );
+            assert!(schema_accepts(schema, schema, &paired));
+            for invalid in [
+                with_argument(
+                    base.clone(),
+                    "dispatch_intent_id",
+                    json!("8f95dd45-9eca-42a8-9909-0ac00be8ad52"),
+                ),
+                with_argument(
+                    base.clone(),
+                    "admission_ticket",
+                    json!("4a67bba4-e1f5-46d1-a9b1-aa796598ffce"),
+                ),
+                with_argument(base.clone(), "dispatch_intent_id", Value::Null),
+                with_argument(base.clone(), "dispatch_intent_id", json!(7)),
+                with_argument(
+                    with_argument(
+                        base.clone(),
+                        "dispatch_intent_id",
+                        json!("8F95DD45-9ECA-42A8-9909-0AC00BE8AD52"),
+                    ),
+                    "admission_ticket",
+                    json!("4a67bba4-e1f5-46d1-a9b1-aa796598ffce"),
+                ),
+                with_argument(base, "unknown", json!(true)),
+            ] {
+                assert!(!schema_accepts(schema, schema, &invalid));
+            }
+        }
+    }
+
+    #[test]
+    fn ticket_v1_request_contract_binding_tool_publishes_one_strict_intent_and_binding() {
+        let catalog: Value = serde_json::from_str(TOOL_SCHEMA_JSON).unwrap();
+        let schema = &catalog
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "get_delegation_orchestration_bindings")
+            .unwrap()["inputSchema"];
+        assert_eq!(schema["properties"]["admission_intent"]["$ref"], "#/$defs/i");
+        assert_eq!(schema["$defs"].as_object().unwrap().len(), 2);
+        assert_eq!(schema["$defs"]["i"]["additionalProperties"], false);
+        assert_eq!(
+            schema["$defs"]["i"]["required"],
+            json!([
+                "schema_version",
+                "dispatch_intent_id",
+                "request_fingerprint",
+                "kind",
+                "work_unit_key",
+                "agent_type",
+                "profile_id",
+                "target_task_id",
+                "replacement_reason",
+                "orchestration_binding"
+            ])
+        );
+        assert_eq!(schema["$defs"]["b"]["additionalProperties"], false);
+        assert_eq!(
+            schema["$defs"]["b"]["required"],
+            json!(["schema_version", "namespace", "generation", "route_fingerprint"])
+        );
+        assert_eq!(
+            schema["$defs"]["i"]["properties"]["orchestration_binding"]["anyOf"][0]
+                ["$ref"],
+            "#/$defs/b"
+        );
+    }
+
+    #[tokio::test]
+    async fn ticket_v1_request_contract_runtime_surfaces_pair_grammar_and_rejects_unknown_fields()
+    {
+        let delegate = json!({
+            "agent_type": "grok",
+            "task": "implement",
+            "correlation_id": "physical-call"
+        });
+        for arguments in [
+            with_argument(
+                delegate.clone(),
+                "dispatch_intent_id",
+                json!("8f95dd45-9eca-42a8-9909-0ac00be8ad52"),
+            ),
+            with_argument(delegate.clone(), "admission_ticket", Value::Null),
+            with_argument(delegate.clone(), "admission_ticket", json!(7)),
+            with_argument(
+                with_argument(
+                    delegate.clone(),
+                    "dispatch_intent_id",
+                    json!("8F95DD45-9ECA-42A8-9909-0AC00BE8AD52"),
+                ),
+                "admission_ticket",
+                json!("4a67bba4-e1f5-46d1-a9b1-aa796598ffce"),
+            ),
+        ] {
+            let response = unwrap_respond(
+                dispatch_with_features(
+                    GROK_FEATURES,
+                    &call(90, "delegate_to_agent", arguments),
+                )
+                .await,
+            );
+            assert!(response.error.is_none());
+            let result = response.result.expect("typed ticket-pair result");
+            assert_eq!(result["isError"], true);
+            assert_eq!(
+                result["structuredContent"]["error_code"],
+                "orchestration_admission_ticket_missing"
+            );
+        }
+
+        let response = unwrap_respond(
+            dispatch_with_features(
+                GROK_FEATURES,
+                &call(
+                    90,
+                    "delegate_to_agent",
+                    with_argument(delegate, "unknown", json!(true)),
+                ),
+            )
+            .await,
+        );
+        assert_eq!(response.error.expect("unknown argument").code, -32602);
+    }
+
+    #[tokio::test]
+    async fn ticket_v1_request_contract_admission_intent_is_artifact_only_at_runtime() {
+        let intent = json!({
+            "schema_version": 1,
+            "dispatch_intent_id": "8f95dd45-9eca-42a8-9909-0ac00be8ad52",
+            "request_fingerprint": "2a44be9d1662a314cbbd2c8111bcf83159be7bdc93abadff977d01447f986648",
+            "kind": "first",
+            "work_unit_key": "task|7|implementer|codex|none",
+            "agent_type": "codex",
+            "profile_id": null,
+            "target_task_id": null,
+            "replacement_reason": null,
+            "orchestration_binding": null
+        });
+        let page = unwrap_respond(
+            dispatch_with_features(
+                GROK_FEATURES,
+                &call(
+                    91,
+                    "get_delegation_orchestration_bindings",
+                    json!({
+                        "namespace": "brainstorm-to-delivery",
+                        "delivery": "page",
+                        "admission_intent": intent.clone()
+                    }),
+                ),
+            )
+            .await,
+        );
+        assert_eq!(
+            page.result.unwrap()["structuredContent"]["error"]["code"],
+            "orchestration_binding_query_invalid"
+        );
+        assert!(matches!(
+            dispatch_with_features(
+                GROK_FEATURES,
+                &call(
+                    92,
+                    "get_delegation_orchestration_bindings",
+                    json!({
+                        "namespace": "brainstorm-to-delivery",
+                        "delivery": "artifact",
+                        "admission_intent": intent
+                    }),
+                ),
+            )
+            .await,
+            LineAction::Spawn(_)
+        ));
     }
 
     fn assert_no_generic_coordination_side_channel_tools(names: &[String]) {
@@ -4871,7 +7099,7 @@ mod tests {
             ),
             "delegate guidance must not imply that ordinary agent mentions require profile_id"
         );
-        let cases: [(&str, &[&str]); 8] = [
+        let cases: [(&str, &[&str]); 9] = [
             (
                 "delegate_to_agent",
                 &[
@@ -4974,6 +7202,19 @@ mod tests {
                     "open direct-child join decision",
                     "first reply wins",
                     "idempotent",
+                ],
+            ),
+            (
+                "request_recovery_authorization",
+                &[
+                    "recovery_confirmation_required",
+                    "exact rejected call",
+                    "subject_kind",
+                    "allowed_action",
+                    "cause_code",
+                    "expires_at",
+                    "target_state",
+                    "replacement_reason",
                 ],
             ),
         ];
@@ -6000,7 +8241,8 @@ mod tests {
             .iter()
             .find(|tool| tool["name"] == "get_workflow_capabilities")
             .expect("capabilities tool");
-        assert!(tool_guidance(capabilities).contains("workflow_manifest_v2"));
+        assert_eq!(capabilities["inputSchema"], json!({}));
+        assert!(capabilities.get("description").is_none());
 
         let publish = tools
             .iter()
@@ -6081,20 +8323,12 @@ mod tests {
             json!({
                 "type": "object",
                 "properties": {
-                    "workflow_id": { "type": "string" },
-                    "detail": { "type": "string", "enum": ["index"], "default": "index" }
+                    "workflow_id": {},
+                    "detail": { "enum": ["index"], "default": "index" }
                 }
             })
         );
-        let description = state["description"].as_str().expect("tool description");
-        for phrase in [
-            "compact workflow index",
-            "report_file",
-            "get_session_info",
-            "get_delegation_status",
-        ] {
-            assert!(description.contains(phrase), "missing {phrase}");
-        }
+        assert!(state.get("description").is_none());
     }
 
     #[tokio::test]
@@ -6223,42 +8457,6 @@ mod tests {
             })
         );
 
-        let descriptions = [
-            (
-                "register_simple_workflow",
-                ["register", "plan/progress"].as_slice(),
-            ),
-            (
-                "get_delegation_orchestration_bindings",
-                ["read-only", "parent-scoped", "snapshot"].as_slice(),
-            ),
-            (
-                "continue_delegation",
-                ["continue terminal task_id", "reuse child"].as_slice(),
-            ),
-        ];
-        for (name, phrases) in descriptions {
-            let description = tools
-                .iter()
-                .find(|tool| tool["name"] == name)
-                .and_then(|tool| tool["description"].as_str())
-                .unwrap()
-                .to_ascii_lowercase();
-            for phrase in phrases {
-                assert!(description.contains(phrase), "{name} lost {phrase}");
-            }
-        }
-        let recovery = tools
-            .iter()
-            .find(|tool| tool["name"] == "request_recovery_authorization")
-            .unwrap();
-        assert!(
-            recovery["inputSchema"]["properties"]["proposed_user_reason"]["description"]
-                .as_str()
-                .unwrap()
-                .contains("reset_plan_lineage only")
-        );
-
         let page = json!({
             "schema_version": 1,
             "namespace": "brainstorm-to-delivery",
@@ -6300,6 +8498,1317 @@ mod tests {
             .expect("successful binding page must be available to text-only MCP hosts");
         assert_eq!(serde_json::from_str::<Value>(text).unwrap(), page);
         assert_eq!(result["isError"], false);
+    }
+
+    #[tokio::test]
+    async fn delegation_catalog_compaction_page_mode_wire_bytes_are_unchanged() {
+        let raw_call = r#"{"jsonrpc":"2.0","id":"page-fixture","method":"tools/call","params":{"name":"get_delegation_orchestration_bindings","arguments":{"namespace":"brainstorm-to-delivery","limit":100,"snapshot_id":"1a641e16-36f4-4ec5-aa4f-18d18e6ab107","cursor":"cursor_1"}}}"#;
+        let request: JsonRpcRequest = serde_json::from_str(raw_call).unwrap();
+        let query: OrchestrationBindingQueryRequest =
+            serde_json::from_value(request.params["arguments"].clone()).unwrap();
+        let request_bytes = serde_json::to_vec(&query).unwrap();
+
+        let page = json!({
+            "schema_version": 1,
+            "namespace": "brainstorm-to-delivery",
+            "snapshot_id": "1a641e16-36f4-4ec5-aa4f-18d18e6ab107",
+            "snapshot_revision": "17",
+            "snapshot_created_at": "2026-08-26T08:00:00Z",
+            "snapshot_expires_at": "2026-08-26T08:01:00Z",
+            "total_rows": 0,
+            "page_start": 0,
+            "request_cursor": "cursor_1",
+            "runs": [],
+            "next_cursor": null,
+            "complete": true
+        });
+        let success_line = serialize_jsonrpc_line(&ok(
+            json!("page-fixture"),
+            render_orchestration_binding_page(&page),
+        ))
+        .unwrap();
+        let error_response = unwrap_respond(
+            dispatch_with_features(
+                GROK_FEATURES,
+                &call(
+                    19,
+                    "get_delegation_orchestration_bindings",
+                    json!({ "namespace": 7 }),
+                ),
+            )
+            .await,
+        );
+        let error_line = serialize_jsonrpc_line(&error_response).unwrap();
+
+        println!(
+            "page-mode bytes: request={}, success={}, error={}",
+            request_bytes.len(),
+            success_line.len(),
+            error_line.len()
+        );
+        assert_eq!(
+            request_bytes,
+            br#"{"namespace":"brainstorm-to-delivery","limit":100,"snapshot_id":"1a641e16-36f4-4ec5-aa4f-18d18e6ab107","cursor":"cursor_1"}"#
+        );
+        assert_eq!(
+            success_line,
+            concat!(
+                r#"{"jsonrpc":"2.0","id":"page-fixture","result":{"content":[{"text":"{\"complete\":true,\"namespace\":\"brainstorm-to-delivery\",\"next_cursor\":null,\"page_start\":0,\"request_cursor\":\"cursor_1\",\"runs\":[],\"schema_version\":1,\"snapshot_created_at\":\"2026-08-26T08:00:00Z\",\"snapshot_expires_at\":\"2026-08-26T08:01:00Z\",\"snapshot_id\":\"1a641e16-36f4-4ec5-aa4f-18d18e6ab107\",\"snapshot_revision\":\"17\",\"total_rows\":0}","type":"text"}],"isError":false,"structuredContent":{"complete":true,"namespace":"brainstorm-to-delivery","next_cursor":null,"page_start":0,"request_cursor":"cursor_1","runs":[],"schema_version":1,"snapshot_created_at":"2026-08-26T08:00:00Z","snapshot_expires_at":"2026-08-26T08:01:00Z","snapshot_id":"1a641e16-36f4-4ec5-aa4f-18d18e6ab107","snapshot_revision":"17","total_rows":0}}}"#,
+                "\n"
+            )
+            .as_bytes()
+        );
+        assert_eq!(
+            error_line,
+            concat!(
+                r#"{"jsonrpc":"2.0","id":19,"result":{"content":[{"text":"invalid orchestration binding query","type":"text"}],"isError":true,"structuredContent":{"error":{"code":"orchestration_binding_query_invalid","message":"invalid orchestration binding query"}}}}"#,
+                "\n"
+            )
+            .as_bytes()
+        );
+    }
+
+    #[tokio::test]
+    async fn orchestration_binding_artifact_delivery_preserves_page_mode_wire_bytes() {
+        let page = json!({
+            "schema_version": 1,
+            "namespace": "brainstorm-to-delivery",
+            "snapshot_id": "1a641e16-36f4-4ec5-aa4f-18d18e6ab107",
+            "snapshot_revision": "17",
+            "snapshot_created_at": "2026-08-26T08:00:00Z",
+            "snapshot_expires_at": "2026-08-26T08:01:00Z",
+            "total_rows": 0,
+            "page_start": 0,
+            "request_cursor": "cursor_1",
+            "runs": [],
+            "next_cursor": null,
+            "complete": true
+        });
+        let expected_success = concat!(
+            r#"{"jsonrpc":"2.0","id":"page-fixture","result":{"content":[{"text":"{\"complete\":true,\"namespace\":\"brainstorm-to-delivery\",\"next_cursor\":null,\"page_start\":0,\"request_cursor\":\"cursor_1\",\"runs\":[],\"schema_version\":1,\"snapshot_created_at\":\"2026-08-26T08:00:00Z\",\"snapshot_expires_at\":\"2026-08-26T08:01:00Z\",\"snapshot_id\":\"1a641e16-36f4-4ec5-aa4f-18d18e6ab107\",\"snapshot_revision\":\"17\",\"total_rows\":0}","type":"text"}],"isError":false,"structuredContent":{"complete":true,"namespace":"brainstorm-to-delivery","next_cursor":null,"page_start":0,"request_cursor":"cursor_1","runs":[],"schema_version":1,"snapshot_created_at":"2026-08-26T08:00:00Z","snapshot_expires_at":"2026-08-26T08:01:00Z","snapshot_id":"1a641e16-36f4-4ec5-aa4f-18d18e6ab107","snapshot_revision":"17","total_rows":0}}}"#,
+            "\n"
+        )
+        .as_bytes();
+
+        for delivery in [None, Some("page")] {
+            let (socket_path, server) = orchestration_broker_with_outcomes(vec![page.clone()]);
+            let mut context = ctx_with(GROK_FEATURES);
+            context.socket_path = socket_path;
+            let mut arguments = json!({
+                "namespace": "brainstorm-to-delivery",
+                "snapshot_id": "1a641e16-36f4-4ec5-aa4f-18d18e6ab107",
+                "cursor": "cursor_1"
+            });
+            if let Some(delivery) = delivery {
+                arguments["delivery"] = json!(delivery);
+                arguments["limit"] = json!(100);
+            }
+            let raw_call = json!({
+                "jsonrpc": "2.0",
+                "id": "page-fixture",
+                "method": "tools/call",
+                "params": {
+                    "name": "get_delegation_orchestration_bindings",
+                    "arguments": arguments
+                }
+            })
+            .to_string();
+            let metrics = Arc::new(DelegationMetrics::default());
+            let inflight = Arc::new(InflightCalls::with_artifact_metrics(metrics.clone()));
+            let LineAction::Spawn(spawned) = dispatch_line(&context, inflight, &raw_call).await
+            else {
+                panic!("omitted and explicit page delivery must reach the broker")
+            };
+            let response = spawned.future.await.response.unwrap();
+            let requests = server.await.unwrap();
+            assert_eq!(requests.len(), 1);
+            let request_bytes = serde_json::to_vec(&requests[0].query()).unwrap();
+            assert_eq!(request_bytes.len(), 123);
+            assert_eq!(
+                request_bytes,
+                br#"{"namespace":"brainstorm-to-delivery","limit":100,"snapshot_id":"1a641e16-36f4-4ec5-aa4f-18d18e6ab107","cursor":"cursor_1"}"#
+            );
+            let success_line = serialize_jsonrpc_line(&response).unwrap();
+            assert_eq!(success_line.len(), 816);
+            assert_eq!(success_line, expected_success);
+            assert_eq!(
+                metrics
+                    .snapshot()
+                    .legacy_page_mode_calls_after_artifact_capability,
+                1
+            );
+        }
+
+        let invalid = call(
+            19,
+            "get_delegation_orchestration_bindings",
+            json!({ "namespace": 7, "delivery": "page" }),
+        );
+        let response = unwrap_respond(dispatch_with_features(GROK_FEATURES, &invalid).await);
+        let error_line = serialize_jsonrpc_line(&response).unwrap();
+        assert_eq!(error_line.len(), 250);
+        assert_eq!(
+            error_line,
+            concat!(
+                r#"{"jsonrpc":"2.0","id":19,"result":{"content":[{"text":"invalid orchestration binding query","type":"text"}],"isError":true,"structuredContent":{"error":{"code":"orchestration_binding_query_invalid","message":"invalid orchestration binding query"}}}}"#,
+                "\n"
+            )
+            .as_bytes()
+        );
+    }
+
+    #[tokio::test]
+    async fn orchestration_admission_intent_grammar_errors_use_stable_code() {
+        let base_intent = json!({
+            "schema_version": 1,
+            "dispatch_intent_id": "8f95dd45-9eca-42a8-9909-0ac00be8ad52",
+            "request_fingerprint": "2a44be9d1662a314cbbd2c8111bcf83159be7bdc93abadff977d01447f986648",
+            "kind": "first",
+            "work_unit_key": "task|7|implementer|codex|none",
+            "agent_type": "codex",
+            "profile_id": null,
+            "target_task_id": null,
+            "replacement_reason": null,
+            "orchestration_binding": null
+        });
+        let mut invalid_intents = Vec::new();
+        let mut intent = base_intent.clone();
+        intent["unknown"] = json!(true);
+        invalid_intents.push(intent);
+        let mut intent = base_intent.clone();
+        intent["request_fingerprint"] = json!("not-a-fingerprint");
+        invalid_intents.push(intent);
+        let mut intent = base_intent.clone();
+        intent.as_object_mut().unwrap().remove("profile_id");
+        invalid_intents.push(intent);
+        let mut intent = base_intent;
+        intent["kind"] = json!("continue");
+        invalid_intents.push(intent);
+
+        for admission_intent in invalid_intents {
+            let response = unwrap_respond(
+                dispatch_with_features(
+                    GROK_FEATURES,
+                    &call(
+                        21,
+                        "get_delegation_orchestration_bindings",
+                        json!({
+                            "namespace": "brainstorm-to-delivery",
+                            "delivery": "artifact",
+                            "admission_intent": admission_intent
+                        }),
+                    ),
+                )
+                .await,
+            );
+            assert_eq!(
+                response.result.unwrap()["structuredContent"]["error"]["code"],
+                "orchestration_admission_intent_invalid"
+            );
+        }
+    }
+
+    #[test]
+    fn orchestration_admission_ticket_issue_artifact_metadata_is_structured_only() {
+        let descriptor = OrchestrationBindingArtifactDescriptor {
+            schema_version: 1,
+            delivery: "artifact".into(),
+            namespace: "brainstorm-to-delivery".into(),
+            snapshot_id: "1a641e16-36f4-4ec5-aa4f-18d18e6ab107".into(),
+            snapshot_revision: "17".into(),
+            snapshot_created_at: "2026-08-26T08:00:00Z".parse().unwrap(),
+            snapshot_expires_at: "2026-08-26T08:01:00Z".parse().unwrap(),
+            total_rows: 0,
+            artifact_path: "C:/private/artifact.json".into(),
+            artifact_format: "codeg-orchestration-bindings-v1+json".into(),
+            artifact_bytes: 32,
+            artifact_sha256: format!("sha256:{}", "a".repeat(64)),
+        };
+        let admission = AdmissionPreparation::prepared(
+            "8f95dd45-9eca-42a8-9909-0ac00be8ad52".into(),
+            "4a67bba4-e1f5-46d1-a9b1-aa796598ffce".into(),
+            descriptor.snapshot_expires_at,
+        );
+
+        let result = render_orchestration_binding_artifact(&descriptor, Some(&admission));
+        assert_eq!(
+            result["structuredContent"]["admission"],
+            json!({
+                "outcome": "prepared",
+                "protocol": "ticket_v1",
+                "dispatch_intent_id": "8f95dd45-9eca-42a8-9909-0ac00be8ad52",
+                "ticket": "4a67bba4-e1f5-46d1-a9b1-aa796598ffce",
+                "expires_at": "2026-08-26T08:01:00Z"
+            })
+        );
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(!text.contains("4a67bba4-e1f5-46d1-a9b1-aa796598ffce"));
+        assert!(!text.contains("8f95dd45-9eca-42a8-9909-0ac00be8ad52"));
+        assert!(result["structuredContent"].get("runs").is_none());
+        assert!(
+            serialize_jsonrpc_line(&ok(json!(i64::MAX), result))
+                .unwrap()
+                .len()
+                <= ORCHESTRATION_BINDING_ARTIFACT_MAX_RESULT_BYTES
+        );
+
+        let already_admitted = AdmissionPreparation::already_admitted(
+            "8f95dd45-9eca-42a8-9909-0ac00be8ad52".into(),
+            "6b228a7d-4ac9-4bc7-a16e-f4ecf6f0fd45".into(),
+        );
+        let result =
+            render_orchestration_binding_artifact(&descriptor, Some(&already_admitted));
+        assert_eq!(
+            result["structuredContent"]["admission"],
+            json!({
+                "outcome": "already_admitted",
+                "protocol": "ticket_v1",
+                "dispatch_intent_id": "8f95dd45-9eca-42a8-9909-0ac00be8ad52",
+                "task_id": "6b228a7d-4ac9-4bc7-a16e-f4ecf6f0fd45"
+            })
+        );
+        assert!(result["structuredContent"]["admission"]
+            .get("ticket")
+            .is_none());
+        assert!(result["structuredContent"].get("runs").is_none());
+    }
+
+    #[test]
+    fn ticket_v1_catalog_full_artifact_result_stays_within_fixed_budget_without_rows() {
+        let descriptor = OrchestrationBindingArtifactDescriptor {
+            schema_version: 1,
+            delivery: "artifact".into(),
+            namespace: "brainstorm-to-delivery".into(),
+            snapshot_id: "1a641e16-36f4-4ec5-aa4f-18d18e6ab107".into(),
+            snapshot_revision: u64::MAX.to_string(),
+            snapshot_created_at: "2026-08-26T08:00:00Z".parse().unwrap(),
+            snapshot_expires_at: "2026-08-26T08:01:00Z".parse().unwrap(),
+            total_rows: 4_096,
+            artifact_path: concat!(
+                r"C:\Users\developer\AppData\Local\Temp\codeg-mcp\orchestration-bindings\",
+                r"00000000-0000-4000-8000-000000004123\",
+                "4a67bba4-e1f5-46d1-a9b1-aa796598ffce.json"
+            )
+            .into(),
+            artifact_format: "codeg-orchestration-bindings-v1+json".into(),
+            artifact_bytes: 4 * 1024 * 1024,
+            artifact_sha256: format!("sha256:{}", "f".repeat(64)),
+        };
+        let admission = AdmissionPreparation::prepared(
+            "8f95dd45-9eca-42a8-9909-0ac00be8ad52".into(),
+            "4a67bba4-e1f5-46d1-a9b1-aa796598ffce".into(),
+            descriptor.snapshot_expires_at,
+        );
+        let id =
+            ascii_string_id_with_serialized_len(GET_ORCHESTRATION_BINDINGS_MAX_REQUEST_ID_BYTES);
+        let result = render_orchestration_binding_artifact(&descriptor, Some(&admission));
+        assert!(!value_contains_key(&result, "runs"));
+        let line = serialize_jsonrpc_line(&ok(id, result)).unwrap();
+        println!("ticket-v1 full artifact JSONL bytes: {}", line.len());
+        assert_eq!(ORCHESTRATION_BINDING_ARTIFACT_MAX_RESULT_BYTES, 2_048);
+        assert!(line.len() <= ORCHESTRATION_BINDING_ARTIFACT_MAX_RESULT_BYTES);
+    }
+
+    #[tokio::test]
+    async fn ticket_v1_catalog_grok_tools_list_keeps_phase2_headroom() {
+        let response = unwrap_respond(
+            dispatch_with_features(
+                GROK_FEATURES,
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+            )
+            .await,
+        );
+        let line = serialize_jsonrpc_line(&response).unwrap();
+        println!("Phase 2 Grok tools/list JSONL bytes: {}", line.len());
+        assert!(line.len() <= 7_300);
+        assert!(line.len() <= 7_680);
+        assert!(7_680 - line.len() >= 380);
+    }
+
+    #[tokio::test]
+    async fn orchestration_binding_artifact_delivery_catalog_keeps_schema_defaults() {
+        let response = unwrap_respond(
+            dispatch_with_features(
+                GROK_FEATURES,
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+            )
+            .await,
+        );
+        let tool = response.result.as_ref().unwrap()["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "get_delegation_orchestration_bindings")
+            .unwrap();
+        assert_eq!(
+            tool["inputSchema"]["properties"]["delivery"]["enum"],
+            json!(["page", "artifact"])
+        );
+        assert_eq!(tool["inputSchema"]["properties"]["limit"]["default"], 100);
+    }
+
+    #[tokio::test]
+    async fn orchestration_binding_artifact_delivery_enforces_request_rules_and_defaults() {
+        for arguments in [
+            json!({ "namespace": "brainstorm-to-delivery", "delivery": null }),
+            json!({ "namespace": "brainstorm-to-delivery", "delivery": "artifact", "limit": null }),
+            json!({ "namespace": "brainstorm-to-delivery", "delivery": "artifact", "limit": 0 }),
+            json!({ "namespace": "brainstorm-to-delivery", "delivery": "artifact", "limit": 201 }),
+            json!({ "namespace": "brainstorm-to-delivery", "delivery": "artifact", "snapshot_id": "1a641e16-36f4-4ec5-aa4f-18d18e6ab107", "cursor": "cursor_1" }),
+            json!({ "namespace": "brainstorm-to-delivery", "delivery": "artifact", "unknown": true }),
+            json!({ "namespace": "brainstorm-to-delivery", "delivery": "other" }),
+            json!({ "namespace": "brainstorm-to-delivery", "delivery": "page", "limit": 201 }),
+        ] {
+            let invalid = call(21, "get_delegation_orchestration_bindings", arguments);
+            let response = unwrap_respond(dispatch_with_features(GROK_FEATURES, &invalid).await);
+            assert_eq!(
+                response.result.unwrap()["structuredContent"]["error"]["code"],
+                "orchestration_binding_query_invalid"
+            );
+        }
+
+        let page = orchestration_binding_page(
+            1,
+            0,
+            None,
+            vec![orchestration_binding_run("task-artifact")],
+            None,
+        );
+        let (socket_path, server) = orchestration_broker_with_outcomes(vec![page]);
+        let mut context = ctx_with(GROK_FEATURES);
+        context.socket_path = socket_path;
+        context.connection_incarnation_id = "00000000-0000-4000-8000-000000004123".into();
+        let inflight = Arc::new(InflightCalls::new());
+        let id =
+            ascii_string_id_with_serialized_len(GET_ORCHESTRATION_BINDINGS_MAX_REQUEST_ID_BYTES);
+        let raw_call = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {
+                "name": "get_delegation_orchestration_bindings",
+                "arguments": {
+                    "namespace": "brainstorm-to-delivery",
+                    "delivery": "artifact"
+                }
+            }
+        })
+        .to_string();
+        let LineAction::Spawn(spawned) = dispatch_line(&context, inflight.clone(), &raw_call).await
+        else {
+            panic!("valid artifact delivery must reach the broker")
+        };
+        let result = spawned.future.await;
+        let (response, after_relay) = result
+            .claim_relay()
+            .await
+            .expect("artifact delivery response must win relay");
+        let after_relay = after_relay.unwrap_or_else(|| {
+            panic!(
+                "artifact delivery must return relay ownership: {}",
+                String::from_utf8(serialize_jsonrpc_line(&response).unwrap()).unwrap()
+            )
+        });
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 1, "artifact collection is model-internal");
+        assert_eq!(requests[0].limit, 200);
+        assert_eq!(requests[0].page_limit, None);
+        assert_eq!(requests[0].snapshot_id, None);
+        assert_eq!(requests[0].cursor, None);
+
+        let line = serialize_jsonrpc_line(&response).unwrap();
+        assert!(
+            line.len() <= 2_048,
+            "artifact result is {} bytes",
+            line.len()
+        );
+        let result = response.result.as_ref().unwrap();
+        assert_eq!(result.as_object().unwrap().len(), 3);
+        assert_eq!(result["content"].as_array().unwrap().len(), 1);
+        assert_eq!(result["isError"], false);
+        assert_eq!(result["structuredContent"]["delivery"], "artifact");
+        assert_eq!(result["structuredContent"]["total_rows"], 1);
+        assert!(result["structuredContent"].get("cursor").is_none());
+        assert!(!value_contains_key(result, "runs"));
+        let descriptor = &result["structuredContent"];
+        let artifact_path = descriptor["artifact_path"].as_str().unwrap();
+        println!(
+            "artifact delivery bytes: evidence={}, result={}",
+            descriptor["artifact_bytes"].as_u64().unwrap(),
+            line.len()
+        );
+        assert!(Path::new(artifact_path).is_file());
+        #[cfg(windows)]
+        assert!(artifact_path.contains(r"\codeg-mcp\orchestration-bindings\"));
+        let text = result["content"][0]["text"].as_str().unwrap();
+        for expected in [
+            artifact_path,
+            descriptor["snapshot_revision"].as_str().unwrap(),
+            descriptor["snapshot_expires_at"].as_str().unwrap(),
+            descriptor["artifact_sha256"].as_str().unwrap(),
+        ] {
+            assert!(text.contains(expected));
+        }
+        assert!(text.contains("1 row"));
+
+        after_relay.await;
+        assert_eq!(inflight.binding_artifact_count(), 1);
+        inflight.drain_binding_artifacts();
+        assert!(!Path::new(artifact_path).exists());
+    }
+
+    #[tokio::test]
+    async fn orchestration_binding_artifact_delivery_cancellation_before_relay_suppresses_and_cleans(
+    ) {
+        let page = orchestration_binding_page(
+            1,
+            0,
+            None,
+            vec![orchestration_binding_run("task-cancel-before-relay")],
+            None,
+        );
+        let (socket_path, server) = orchestration_broker_with_outcomes(vec![page]);
+        let mut context = ctx_with(GROK_FEATURES);
+        context.socket_path = socket_path;
+        context.connection_incarnation_id = "00000000-0000-4000-8000-000000004123".into();
+        let inflight = Arc::new(InflightCalls::new());
+        let raw_call = call(
+            25,
+            "get_delegation_orchestration_bindings",
+            json!({
+                "namespace": "brainstorm-to-delivery",
+                "delivery": "artifact"
+            }),
+        );
+        let LineAction::Spawn(spawned) = dispatch_line(&context, inflight.clone(), &raw_call).await
+        else {
+            panic!("valid artifact request must reach the broker")
+        };
+        let request_id_key = spawned.request_id_key.clone();
+        let result = spawned.future.await;
+        assert_eq!(server.await.unwrap().len(), 1);
+        let artifact_path = PathBuf::from(
+            result.response.as_ref().unwrap().result.as_ref().unwrap()["structuredContent"]
+                ["artifact_path"]
+                .as_str()
+                .unwrap(),
+        );
+        assert!(
+            artifact_path.is_file(),
+            "publication must finish before cancellation"
+        );
+        assert_eq!(inflight.binding_artifact_count(), 1);
+        assert!(
+            inflight.inner.lock().await.contains_key(&request_id_key),
+            "cancellation authority must remain live until relay"
+        );
+
+        let cancellation = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": { "requestId": 25 }
+        })
+        .to_string();
+        assert!(matches!(
+            dispatch_line(&context, inflight.clone(), &cancellation).await,
+            LineAction::Silent
+        ));
+
+        let response = result.claim_relay().await.map(|(response, _)| response);
+        assert!(
+            response.is_none(),
+            "cancelled artifact response must not relay"
+        );
+        assert!(!artifact_path.exists());
+        assert_eq!(inflight.binding_artifact_count(), 0);
+        assert!(inflight.drain_all().await.is_empty());
+    }
+
+    #[test]
+    fn orchestration_binding_artifact_delivery_deletes_oversized_result_before_relay() {
+        let metrics = Arc::new(DelegationMetrics::default());
+        let inflight = Arc::new(InflightCalls::with_artifact_metrics(metrics.clone()));
+        let page = serde_json::from_value(orchestration_binding_page(
+            1,
+            0,
+            None,
+            vec![orchestration_binding_run("task-oversized-result")],
+            None,
+        ))
+        .unwrap();
+        let incarnation_id = uuid::Uuid::new_v4().to_string();
+        let (mut descriptor, pending) =
+            store_binding_artifact(&incarnation_id, vec![page], &inflight).unwrap();
+        let stored_path = PathBuf::from(&descriptor.artifact_path);
+        descriptor.artifact_path = format!(r"C:\{}\artifact.json", "long-path".repeat(220));
+        let id =
+            ascii_string_id_with_serialized_len(GET_ORCHESTRATION_BINDINGS_MAX_REQUEST_ID_BYTES);
+        let oversized_bytes = serialize_jsonrpc_line(&ok(
+            id.clone(),
+            render_orchestration_binding_artifact(&descriptor, None),
+        ))
+        .unwrap()
+        .len();
+
+        let (response, pending) =
+            finalize_orchestration_binding_artifact_response(id, descriptor, None, pending);
+
+        assert!(pending.is_none());
+        let line = serialize_jsonrpc_line(&response).unwrap();
+        println!(
+            "oversized artifact result bytes: candidate={}, error={}, cleaned=1",
+            oversized_bytes,
+            line.len()
+        );
+        assert!(line.len() <= ORCHESTRATION_BINDING_ARTIFACT_MAX_RESULT_BYTES);
+        assert_eq!(
+            response.result.unwrap()["structuredContent"]["error"]["code"],
+            "orchestration_binding_artifact_result_too_large"
+        );
+        assert!(!stored_path.exists());
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.artifact_export_outcomes["result_too_large"], 1);
+        assert_eq!(snapshot.artifact_cleanup_success_count, 1);
+    }
+
+    #[tokio::test]
+    async fn orchestration_binding_artifact_delivery_restarts_one_stale_chain_then_succeeds() {
+        let first_page = orchestration_binding_page(
+            2,
+            0,
+            None,
+            vec![orchestration_binding_run("task-stale")],
+            Some("cursor_1"),
+        );
+        let stale = json!({
+            "error": {
+                "code": "orchestration_binding_snapshot_stale",
+                "message": "orchestration binding snapshot is stale"
+            }
+        });
+        let success = orchestration_binding_page(
+            1,
+            0,
+            None,
+            vec![orchestration_binding_run("task-restarted")],
+            None,
+        );
+        let (socket_path, server) =
+            orchestration_broker_with_outcomes(vec![first_page, stale, success]);
+        let metrics = Arc::new(DelegationMetrics::default());
+        let inflight = Arc::new(InflightCalls::with_artifact_metrics(metrics.clone()));
+        let mut context = ctx_with(GROK_FEATURES);
+        context.socket_path = socket_path;
+        context.connection_incarnation_id = "00000000-0000-4000-8000-000000004123".into();
+        let raw_call = call(
+            22,
+            "get_delegation_orchestration_bindings",
+            json!({
+                "namespace": "brainstorm-to-delivery",
+                "delivery": "artifact",
+                "limit": 2
+            }),
+        );
+        let LineAction::Spawn(spawned) = dispatch_line(&context, inflight.clone(), &raw_call).await
+        else {
+            panic!("valid artifact delivery must reach the broker")
+        };
+        let result = spawned.future.await;
+        let (response, after_relay) = result
+            .claim_relay()
+            .await
+            .expect("artifact delivery response must win relay");
+        assert_eq!(response.result.as_ref().unwrap()["isError"], false);
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0].limit, 2);
+        assert_eq!(requests[0].snapshot_id, None);
+        assert_eq!(
+            requests[1].snapshot_id.as_deref(),
+            Some("1a641e16-36f4-4ec5-aa4f-18d18e6ab107")
+        );
+        assert_eq!(requests[1].cursor.as_deref(), Some("cursor_1"));
+        assert_eq!(requests[2].snapshot_id, None);
+        assert_eq!(requests[2].cursor, None);
+        assert_eq!(metrics.snapshot().artifact_transparent_stale_restarts, 1);
+        after_relay.unwrap().await;
+        inflight.drain_binding_artifacts();
+    }
+
+    #[tokio::test]
+    async fn orchestration_binding_artifact_delivery_bounds_second_stale_and_cleans_attempts() {
+        let first_page = orchestration_binding_page(
+            2,
+            0,
+            None,
+            vec![orchestration_binding_run("task-partial")],
+            Some("cursor_1"),
+        );
+        let stale = json!({
+            "error": {
+                "code": "orchestration_binding_snapshot_stale",
+                "message": "private stale detail"
+            }
+        });
+        let (socket_path, server) = orchestration_broker_with_outcomes(vec![
+            first_page.clone(),
+            stale.clone(),
+            first_page,
+            stale,
+        ]);
+        let metrics = Arc::new(DelegationMetrics::default());
+        let inflight = Arc::new(InflightCalls::with_artifact_metrics(metrics.clone()));
+        let mut context = ctx_with(GROK_FEATURES);
+        context.socket_path = socket_path;
+        context.connection_incarnation_id = "00000000-0000-4000-8000-000000004123".into();
+        let raw_call = call(
+            23,
+            "get_delegation_orchestration_bindings",
+            json!({
+                "namespace": "brainstorm-to-delivery",
+                "delivery": "artifact"
+            }),
+        );
+        let LineAction::Spawn(spawned) = dispatch_line(&context, inflight.clone(), &raw_call).await
+        else {
+            panic!("valid artifact delivery must reach the broker")
+        };
+        let result = spawned.future.await;
+        assert!(result.after_relay.is_none());
+        let response = result.response.unwrap();
+        let line = serialize_jsonrpc_line(&response).unwrap();
+        assert!(line.len() <= 2_048);
+        let tool_result = response.result.unwrap();
+        assert_eq!(tool_result["isError"], true);
+        assert_eq!(
+            tool_result["structuredContent"]["error"]["code"],
+            "orchestration_binding_snapshot_stale"
+        );
+        assert!(!String::from_utf8(line)
+            .unwrap()
+            .contains("private stale detail"));
+        assert_eq!(server.await.unwrap().len(), 4);
+        assert_eq!(metrics.snapshot().artifact_transparent_stale_restarts, 1);
+        assert_eq!(metrics.snapshot().artifact_export_outcomes["stale"], 1);
+        assert_eq!(inflight.binding_artifact_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn orchestration_binding_artifact_delivery_rejects_invalid_prefix_before_following_cursor(
+    ) {
+        let mut invalid = orchestration_binding_page(
+            2,
+            0,
+            None,
+            vec![orchestration_binding_run("task-invalid-prefix")],
+            Some("cursor_1"),
+        );
+        invalid["snapshot_id"] = json!("not-a-canonical-uuid");
+        let (socket_path, server) = orchestration_broker_with_outcomes(vec![invalid]);
+        let metrics = Arc::new(DelegationMetrics::default());
+        let inflight = Arc::new(InflightCalls::with_artifact_metrics(metrics.clone()));
+        let mut context = ctx_with(GROK_FEATURES);
+        context.socket_path = socket_path;
+        context.connection_incarnation_id = "00000000-0000-4000-8000-000000004123".into();
+        let raw_call = call(
+            24,
+            "get_delegation_orchestration_bindings",
+            json!({
+                "namespace": "brainstorm-to-delivery",
+                "delivery": "artifact"
+            }),
+        );
+        let LineAction::Spawn(spawned) = dispatch_line(&context, inflight.clone(), &raw_call).await
+        else {
+            panic!("valid artifact request must reach the broker")
+        };
+
+        let result = spawned.future.await;
+        assert!(result.after_relay.is_none());
+        assert_eq!(
+            result.response.unwrap().result.unwrap()["structuredContent"]["error"]["code"],
+            "orchestration_binding_query_failed"
+        );
+        assert_eq!(server.await.unwrap().len(), 1);
+        assert_eq!(
+            metrics.snapshot().artifact_export_outcomes["broker_failed"],
+            1
+        );
+        assert_eq!(inflight.binding_artifact_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn delegation_catalog_compaction_removed_leaf_runtime_parity() {
+        let high_fractional: Value =
+            serde_json::from_str("9007199254740992.5").expect("valid JSON number");
+        let u64_overflow: Value =
+            serde_json::from_str("18446744073709551616").expect("valid JSON number");
+        let publish = json!({
+            "schema_version": 2,
+            "workflow_kind": "simple",
+            "publication_token": "publication-token",
+            "workflow_state": "draft",
+            "plan_target_rel_path": "docs/plan.md",
+            "risk_policy_version": "b2d_task_risk_v1",
+            "task_policies": [],
+            "phases": [],
+            "nodes": [],
+            "edges": [],
+            "gates": []
+        });
+        let settle = json!({
+            "workflow_id": "workflow-a",
+            "gate_id": "gate-a",
+            "expected_graph_revision": 0,
+            "summary": "reviewed"
+        });
+        let recover = json!({
+            "workflow_id": "workflow-a",
+            "recovery_authorization_id": "authorization-a",
+            "expected_manifest_revision": 1,
+            "correlation_id": "recovery-a"
+        });
+        let authorization = json!({
+            "subject_kind": "workflow",
+            "subject_id": "workflow-a",
+            "correlation_id": "authorization-a"
+        });
+        let cases = vec![
+            (
+                "registration plan type",
+                "register_simple_workflow",
+                json!({"plan_rel_path": 7}),
+            ),
+            (
+                "registration plan empty",
+                "register_simple_workflow",
+                json!({"plan_rel_path": ""}),
+            ),
+            (
+                "registration progress type",
+                "register_simple_workflow",
+                json!({"plan_rel_path": "docs/plan.md", "progress_rel_path": 7}),
+            ),
+            (
+                "registration progress null",
+                "register_simple_workflow",
+                json!({"plan_rel_path": "docs/plan.md", "progress_rel_path": null}),
+            ),
+            (
+                "registration progress empty",
+                "register_simple_workflow",
+                json!({"plan_rel_path": "docs/plan.md", "progress_rel_path": ""}),
+            ),
+            (
+                "status wait type",
+                "get_delegation_status",
+                json!({"task_ids": ["task-a"], "wait_ms": "0"}),
+            ),
+            (
+                "status wait below minimum",
+                "get_delegation_status",
+                json!({"task_ids": ["task-a"], "wait_ms": -1}),
+            ),
+            (
+                "status wait above maximum",
+                "get_delegation_status",
+                json!({"task_ids": ["task-a"], "wait_ms": 1}),
+            ),
+            (
+                "status return type",
+                "get_delegation_status",
+                json!({"task_ids": ["task-a"], "wait_ms": 0, "return_when": 7}),
+            ),
+            (
+                "status return enum",
+                "get_delegation_status",
+                json!({"task_ids": ["task-a"], "wait_ms": 0, "return_when": "later"}),
+            ),
+            (
+                "cancel task type",
+                "cancel_delegation",
+                json!({"task_id": 7, "reason": "taskfail"}),
+            ),
+            (
+                "cancel task empty",
+                "cancel_delegation",
+                json!({"task_id": "", "reason": "taskfail"}),
+            ),
+            (
+                "cancel reason type",
+                "cancel_delegation",
+                json!({"task_id": "task-a", "reason": 7}),
+            ),
+            (
+                "cancel reason enum",
+                "cancel_delegation",
+                json!({"task_id": "task-a", "reason": "later"}),
+            ),
+            (
+                "session max type",
+                "get_session_info",
+                json!({"session_id": 1, "max_messages": "20"}),
+            ),
+            (
+                "session max below minimum",
+                "get_session_info",
+                json!({"session_id": 1, "max_messages": -1}),
+            ),
+            (
+                "session max high fractional",
+                "get_session_info",
+                json!({"session_id": 1, "max_messages": high_fractional.clone()}),
+            ),
+            (
+                "session max u64 overflow",
+                "get_session_info",
+                json!({"session_id": 1, "max_messages": u64_overflow.clone()}),
+            ),
+            (
+                "reply request type",
+                "reply_to_delegation",
+                json!({"request_id": 7, "reply": "yes"}),
+            ),
+            (
+                "reply request empty",
+                "reply_to_delegation",
+                json!({"request_id": "", "reply": "yes"}),
+            ),
+            (
+                "reply type",
+                "reply_to_delegation",
+                json!({"request_id": "request-a", "reply": 7}),
+            ),
+            (
+                "reply empty",
+                "reply_to_delegation",
+                json!({"request_id": "request-a", "reply": ""}),
+            ),
+            (
+                "reply overlength",
+                "reply_to_delegation",
+                json!({"request_id": "request-a", "reply": "x".repeat(16 * 1024 + 1)}),
+            ),
+            (
+                "authorization subject kind type",
+                "request_recovery_authorization",
+                with_argument(authorization.clone(), "subject_kind", json!(7)),
+            ),
+            (
+                "authorization subject kind enum",
+                "request_recovery_authorization",
+                with_argument(authorization.clone(), "subject_kind", json!("other")),
+            ),
+            (
+                "authorization subject type",
+                "request_recovery_authorization",
+                with_argument(authorization.clone(), "subject_id", json!(7)),
+            ),
+            (
+                "authorization subject empty",
+                "request_recovery_authorization",
+                with_argument(authorization.clone(), "subject_id", json!("")),
+            ),
+            (
+                "authorization correlation type",
+                "request_recovery_authorization",
+                with_argument(authorization.clone(), "correlation_id", json!(7)),
+            ),
+            (
+                "authorization correlation malformed",
+                "request_recovery_authorization",
+                with_argument(authorization.clone(), "correlation_id", json!(".bad")),
+            ),
+            (
+                "authorization correlation overlength",
+                "request_recovery_authorization",
+                with_argument(
+                    authorization.clone(),
+                    "correlation_id",
+                    json!("a".repeat(129)),
+                ),
+            ),
+            (
+                "authorization reason type",
+                "request_recovery_authorization",
+                with_argument(authorization.clone(), "proposed_user_reason", json!(7)),
+            ),
+            (
+                "authorization reason overlength",
+                "request_recovery_authorization",
+                with_argument(
+                    authorization.clone(),
+                    "proposed_user_reason",
+                    json!("x".repeat(4097)),
+                ),
+            ),
+            (
+                "capabilities null root",
+                "get_workflow_capabilities",
+                Value::Null,
+            ),
+            (
+                "capabilities array root",
+                "get_workflow_capabilities",
+                json!([]),
+            ),
+            (
+                "workflow state id type",
+                "get_workflow_state",
+                json!({"workflow_id": 7}),
+            ),
+            (
+                "workflow state id null",
+                "get_workflow_state",
+                json!({"workflow_id": null}),
+            ),
+            (
+                "workflow state id empty",
+                "get_workflow_state",
+                json!({"workflow_id": ""}),
+            ),
+            (
+                "workflow state detail type",
+                "get_workflow_state",
+                json!({"detail": 7}),
+            ),
+            (
+                "workflow state detail enum",
+                "get_workflow_state",
+                json!({"detail": "full"}),
+            ),
+            (
+                "recover workflow type",
+                "recover_workflow",
+                with_argument(recover.clone(), "workflow_id", json!(7)),
+            ),
+            (
+                "recover workflow empty",
+                "recover_workflow",
+                with_argument(recover.clone(), "workflow_id", json!("")),
+            ),
+            (
+                "recover authorization type",
+                "recover_workflow",
+                with_argument(recover.clone(), "recovery_authorization_id", json!(7)),
+            ),
+            (
+                "recover authorization empty",
+                "recover_workflow",
+                with_argument(recover.clone(), "recovery_authorization_id", json!("")),
+            ),
+            (
+                "recover revision type",
+                "recover_workflow",
+                with_argument(recover.clone(), "expected_manifest_revision", json!("1")),
+            ),
+            (
+                "recover revision below minimum",
+                "recover_workflow",
+                with_argument(recover.clone(), "expected_manifest_revision", json!(0)),
+            ),
+            (
+                "recover revision high fractional",
+                "recover_workflow",
+                with_argument(
+                    recover.clone(),
+                    "expected_manifest_revision",
+                    high_fractional.clone(),
+                ),
+            ),
+            (
+                "recover revision u64 overflow",
+                "recover_workflow",
+                with_argument(
+                    recover.clone(),
+                    "expected_manifest_revision",
+                    u64_overflow.clone(),
+                ),
+            ),
+            (
+                "recover correlation type",
+                "recover_workflow",
+                with_argument(recover.clone(), "correlation_id", json!(7)),
+            ),
+            (
+                "recover correlation malformed",
+                "recover_workflow",
+                with_argument(recover.clone(), "correlation_id", json!(".bad")),
+            ),
+            (
+                "recover correlation overlength",
+                "recover_workflow",
+                with_argument(recover.clone(), "correlation_id", json!("a".repeat(129))),
+            ),
+            (
+                "publish schema type",
+                "publish_workflow_manifest",
+                with_argument(publish.clone(), "schema_version", json!("2")),
+            ),
+            (
+                "publish schema const",
+                "publish_workflow_manifest",
+                with_argument(publish.clone(), "schema_version", json!(1)),
+            ),
+            (
+                "publish workflow type",
+                "publish_workflow_manifest",
+                with_argument(publish.clone(), "workflow_id", json!(7)),
+            ),
+            (
+                "publish workflow null",
+                "publish_workflow_manifest",
+                with_argument(publish.clone(), "workflow_id", Value::Null),
+            ),
+            (
+                "publish revision type",
+                "publish_workflow_manifest",
+                with_argument(publish.clone(), "expected_manifest_revision", json!("0")),
+            ),
+            (
+                "publish revision below minimum",
+                "publish_workflow_manifest",
+                with_argument(publish.clone(), "expected_manifest_revision", json!(-1)),
+            ),
+            (
+                "publish revision high fractional",
+                "publish_workflow_manifest",
+                with_argument(
+                    publish.clone(),
+                    "expected_manifest_revision",
+                    high_fractional.clone(),
+                ),
+            ),
+            (
+                "publish revision u64 overflow",
+                "publish_workflow_manifest",
+                with_argument(
+                    publish.clone(),
+                    "expected_manifest_revision",
+                    u64_overflow.clone(),
+                ),
+            ),
+            (
+                "publish plan target type",
+                "publish_workflow_manifest",
+                with_argument(publish.clone(), "plan_target_rel_path", json!(7)),
+            ),
+            (
+                "publish risk policy type",
+                "publish_workflow_manifest",
+                with_argument(publish.clone(), "risk_policy_version", json!(7)),
+            ),
+            (
+                "publish risk policy const",
+                "publish_workflow_manifest",
+                with_argument(publish.clone(), "risk_policy_version", json!("other")),
+            ),
+            (
+                "publish task policies type",
+                "publish_workflow_manifest",
+                with_argument(publish.clone(), "task_policies", json!({})),
+            ),
+            (
+                "settle workflow type",
+                "settle_workflow_gate",
+                with_argument(settle.clone(), "workflow_id", json!(7)),
+            ),
+            (
+                "settle workflow empty",
+                "settle_workflow_gate",
+                with_argument(settle.clone(), "workflow_id", json!("")),
+            ),
+            (
+                "settle gate type",
+                "settle_workflow_gate",
+                with_argument(settle.clone(), "gate_id", json!(7)),
+            ),
+            (
+                "settle gate empty",
+                "settle_workflow_gate",
+                with_argument(settle.clone(), "gate_id", json!("")),
+            ),
+            (
+                "settle graph revision type",
+                "settle_workflow_gate",
+                with_argument(settle.clone(), "expected_graph_revision", json!("0")),
+            ),
+            (
+                "settle graph revision below minimum",
+                "settle_workflow_gate",
+                with_argument(settle.clone(), "expected_graph_revision", json!(-1)),
+            ),
+            (
+                "settle graph revision high fractional",
+                "settle_workflow_gate",
+                with_argument(
+                    settle.clone(),
+                    "expected_graph_revision",
+                    high_fractional.clone(),
+                ),
+            ),
+            (
+                "settle graph revision u64 overflow",
+                "settle_workflow_gate",
+                with_argument(
+                    settle.clone(),
+                    "expected_graph_revision",
+                    u64_overflow.clone(),
+                ),
+            ),
+            (
+                "settle review round type",
+                "settle_workflow_gate",
+                with_argument(settle.clone(), "expected_review_round", json!("1")),
+            ),
+            (
+                "settle review round below minimum",
+                "settle_workflow_gate",
+                with_argument(settle.clone(), "expected_review_round", json!(0)),
+            ),
+            (
+                "settle review round high fractional",
+                "settle_workflow_gate",
+                with_argument(
+                    settle.clone(),
+                    "expected_review_round",
+                    high_fractional.clone(),
+                ),
+            ),
+            (
+                "settle review round u64 overflow",
+                "settle_workflow_gate",
+                with_argument(
+                    settle.clone(),
+                    "expected_review_round",
+                    u64_overflow.clone(),
+                ),
+            ),
+            (
+                "settle gate cycle type",
+                "settle_workflow_gate",
+                with_argument(settle.clone(), "expected_gate_cycle", json!("1")),
+            ),
+            (
+                "settle gate cycle below minimum",
+                "settle_workflow_gate",
+                with_argument(settle.clone(), "expected_gate_cycle", json!(0)),
+            ),
+            (
+                "settle gate cycle high fractional",
+                "settle_workflow_gate",
+                with_argument(
+                    settle.clone(),
+                    "expected_gate_cycle",
+                    high_fractional.clone(),
+                ),
+            ),
+            (
+                "settle gate cycle u64 overflow",
+                "settle_workflow_gate",
+                with_argument(settle.clone(), "expected_gate_cycle", u64_overflow.clone()),
+            ),
+            (
+                "settle outcome type",
+                "settle_workflow_gate",
+                with_argument(settle.clone(), "expected_outcome", json!(7)),
+            ),
+            (
+                "settle outcome enum",
+                "settle_workflow_gate",
+                with_argument(settle.clone(), "expected_outcome", json!("later")),
+            ),
+            (
+                "settle authorization type",
+                "settle_workflow_gate",
+                with_argument(settle.clone(), "recovery_authorization_id", json!(7)),
+            ),
+            (
+                "settle authorization null",
+                "settle_workflow_gate",
+                with_argument(settle.clone(), "recovery_authorization_id", Value::Null),
+            ),
+            (
+                "settle authorization empty",
+                "settle_workflow_gate",
+                with_argument(settle.clone(), "recovery_authorization_id", json!("")),
+            ),
+            (
+                "settle summary type",
+                "settle_workflow_gate",
+                with_argument(settle.clone(), "summary", json!(7)),
+            ),
+        ];
+
+        for (label, tool, arguments) in cases {
+            match dispatch_with_features(GROK_FEATURES, &call(91, tool, arguments)).await {
+                LineAction::Respond(response) => {
+                    let error = response
+                        .error
+                        .unwrap_or_else(|| panic!("{label}: invalid call returned success"));
+                    assert_eq!(error.code, -32602, "{label}");
+                }
+                LineAction::Spawn(_) => panic!("{label}: invalid call reached broker"),
+                LineAction::Silent => panic!("{label}: invalid call was silent"),
+            }
+        }
+
+        let snapshot_id = "1a641e16-36f4-4ec5-aa4f-18d18e6ab107";
+        for (label, arguments) in [
+            ("binding namespace type", json!({"namespace": 7})),
+            ("binding namespace empty", json!({"namespace": ""})),
+            ("binding namespace malformed", json!({"namespace": "Upper"})),
+            (
+                "binding limit type",
+                json!({"namespace": "brainstorm-to-delivery", "limit": "100"}),
+            ),
+            (
+                "binding limit below minimum",
+                json!({"namespace": "brainstorm-to-delivery", "limit": 0}),
+            ),
+            (
+                "binding limit above runtime maximum",
+                json!({"namespace": "brainstorm-to-delivery", "limit": 201}),
+            ),
+            (
+                "binding snapshot type",
+                json!({"namespace": "brainstorm-to-delivery", "snapshot_id": 7, "cursor": "cursor"}),
+            ),
+            (
+                "binding snapshot null",
+                json!({"namespace": "brainstorm-to-delivery", "snapshot_id": null, "cursor": "cursor"}),
+            ),
+            (
+                "binding cursor type",
+                json!({"namespace": "brainstorm-to-delivery", "snapshot_id": snapshot_id, "cursor": 7}),
+            ),
+            (
+                "binding cursor empty",
+                json!({"namespace": "brainstorm-to-delivery", "snapshot_id": snapshot_id, "cursor": ""}),
+            ),
+            (
+                "binding cursor malformed",
+                json!({"namespace": "brainstorm-to-delivery", "snapshot_id": snapshot_id, "cursor": "not+base64url"}),
+            ),
+            (
+                "binding cursor overlength",
+                json!({"namespace": "brainstorm-to-delivery", "snapshot_id": snapshot_id, "cursor": "x".repeat(129)}),
+            ),
+        ] {
+            let response = unwrap_respond(
+                dispatch_with_features(
+                    GROK_FEATURES,
+                    &call(92, "get_delegation_orchestration_bindings", arguments),
+                )
+                .await,
+            );
+            assert!(response.error.is_none(), "{label}");
+            assert_eq!(
+                response.result.unwrap()["structuredContent"]["error"]["code"],
+                "orchestration_binding_query_invalid",
+                "{label}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -6625,6 +10134,32 @@ mod tests {
                 "settle_workflow_gate",
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn delegation_catalog_compaction_grok_base_stays_within_phase2_budget() {
+        let response = unwrap_respond(
+            dispatch_with_features(
+                GROK_FEATURES,
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+            )
+            .await,
+        );
+        let mut line = serde_json::to_vec(&response).unwrap();
+        line.push(b'\n');
+
+        println!("Grok compact tools/list JSONL bytes: {}", line.len());
+        assert!(
+            line.len() <= 7_680,
+            "Grok tools/list line is {} bytes; fixed host-safe limit is 7680 bytes",
+            line.len()
+        );
+        assert!(
+            line.len() <= 7_300,
+            "Phase 2 Grok catalog is {} bytes",
+            line.len()
+        );
+        assert!(7_680 - line.len() >= 380);
     }
 
     #[tokio::test]

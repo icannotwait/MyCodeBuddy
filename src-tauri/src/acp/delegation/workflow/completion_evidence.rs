@@ -3898,6 +3898,7 @@ mod tests {
             let runs = RunStore::new(db.clone());
             super::super::with_historical_workflow_fixture_mutations(runs.admit_gen1_reserving(
                 ReservingRunInsert {
+                    dispatch_intent_id: None,
                     orchestration_binding: None,
                     task_id: task_id.clone(),
                     root_task_id: task_id.clone(),
@@ -4261,6 +4262,7 @@ mod tests {
             let error = super::super::with_historical_workflow_fixture_mutations(
                 runs.admit_continue_reserving(ContinueRunAdmission {
                     task_id: format!("{}-continue", fixture.task_id),
+                    dispatch_intent_id: None,
                     parent_conversation_id: fixture.parent_conversation_id,
                     parent_tool_use_id: format!("continue-{}", fixture.task_id),
                     target_task_id: fixture.task_id.clone(),
@@ -4279,6 +4281,7 @@ mod tests {
             let replacement_task_id = format!("{}-replacement", fixture.task_id);
             let replacement_error = super::super::with_historical_workflow_fixture_mutations(
                 runs.admit_gen1_reserving(ReservingRunInsert {
+                    dispatch_intent_id: None,
                     orchestration_binding: None,
                     task_id: replacement_task_id.clone(),
                     root_task_id: replacement_task_id.clone(),

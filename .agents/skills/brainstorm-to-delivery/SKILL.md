@@ -114,27 +114,25 @@ Keep the parent focused on coordination, adjudication, progress, and delivery.
 -->
 
 ## 1. Establish current truth
+Read the invocation, Brainstorm, repository instructions, current Plan and progress when present, Task reports, reviews, commits, and worktree state.
+Inspect live Agent discovery and the schemas for get_delegation_orchestration_bindings, register_simple_workflow,
+delegate_to_agent, continue_delegation, get_delegation_status, and request_recovery_authorization. Require the query tool.
+For every complete snapshot, run this procedure before the applicable admission mode:
 
-Read the invocation, Brainstorm, repository instructions, current Plan and
-progress when present, Task reports, reviews, commits, and worktree state.
-Inspect live Agent discovery and the schemas for
-get_delegation_orchestration_bindings, register_simple_workflow,
-delegate_to_agent, continue_delegation, get_delegation_status, and
-request_recovery_authorization. Require the query tool. Fetch every page of
-one complete parent-scoped snapshot into one OS-temporary raw evidence file.
-Reject and restart a stale, mixed, truncated, or oversized scan from page
-one. Remove the file after validation. Refresh discovery after compaction.
-Treat simulated Agent responses only as labeled test doubles. Preserve user
-files. Assign Design, Plan, implementation, fix, and review writing to child
-work units; keep the parent in the coordinator role. Query unavailability,
-DB failure, incomplete evidence, a missing query tool, wrong namespace, an
-unbound routed row, a deleted mirror, ambiguous adoption, an unavailable
-Agent or profile, or an exhausted rail blocks. Copy the validator's exact
-binding. Independent parent or Plan Author hashing is forbidden.
+1. Inspect the live binding-query schema.
+2. When ticket-v1 is advertised, the complete-snapshot procedure follows section 5's write-ahead UUID and bounded fingerprint steps through the exact `admission_intent` artifact request. For legacy artifact mode, when it advertises artifact delivery, request `delivery: "artifact"` once. Pass `artifact_path` directly to `--durable-evidence` and `artifact_sha256` directly to `--durable-evidence-sha256` in the validator invocation.
+3. Never open, read, print, copy, summarize, embed, or delegate inspection of the artifact. Delete the exact artifact after the validator exits.
+4. Treat artifact request, descriptor, digest, stale, validator, and cleanup errors as blocking and never fall back to pages.
+5. Use legacy page pagination only when the live schema does not advertise artifact delivery. In legacy mode, collect one complete parent-scoped snapshot in an OS-temporary evidence file, restart stale, mixed, truncated, or oversized pagination from page one, invoke the validator without a digest, and remove the file.
+
+Refresh discovery after compaction. Treat simulated Agent responses only as labeled test doubles. Preserve user files.
+Assign Design, Plan, implementation, fix, and review writing to child work units; keep the parent in the coordinator role.
+Query unavailability, DB failure, incomplete evidence, a missing query tool, wrong namespace, an unbound routed row,
+a deleted mirror, ambiguous adoption, an unavailable Agent or profile, or an exhausted rail blocks.
+Copy the validator's exact binding. Independent parent or Plan Author hashing is forbidden.
 get_delegation_status remains the join tool after admission.
 
 ## 2. Resolve the Task Agent
-
 Resolve one Task Agent identity from the invocation before document work.
 Record an omitted selection as generation 1 with agent_type grok and a null
 profile. Validate an explicit built-in or custom Agent and profile against live
@@ -144,14 +142,14 @@ request an explicit user choice before recording a different identity.
 Keep generations contiguous from 1. For a boundary change, run this exact
 ordered mutation and recovery sequence:
 
-1. Fetch every page of a fresh snapshot and pass full admission against the unchanged Plan/progress.
+1. Run fresh full admission against the unchanged Plan/progress with the complete-snapshot procedure.
 2. Prove every affected Task is pending with an empty run list and no selected durable row in any status.
 3. Persist `pending_route_change` with the requested Agent/profile, next generation, first affected index, and complete affected suffix.
 4. Confirm that exact Agent/profile is currently available; keep the intent and block on unavailability rather than substituting.
 5. Continue the same Plan Author to append the generation and rewrite only that suffix.
-6. Run Author then parent Plan-only derivation, resynchronize only those entries from the parent's exact output, pass combined static validation and a newly queried full admission, then continue every Plan Reviewer for complete re-review.
-7. After approval, fetch a new complete snapshot, pass full admission, clear `pending_route_change` to null, persist, and fetch/pass full admission again before the next Task.
-8. At any interruption, retain the intent, re-read Plan/progress/reviews, fetch a new complete snapshot, and identify the checkpoint. Resume synchronized states with full admission; resume the one Plan-ahead/progress-old state only through Plan-only derivation and the non-authorizing combined-static transition check, then replace the complete suffix and requery for full admission. Never infer, partially patch, or erase a half-applied change.
+6. Run Author then parent Plan-only derivation, resynchronize only those entries from the parent's exact output, pass combined static validation and fresh full admission with the procedure, then continue every Plan Reviewer for complete re-review.
+7. After approval, run the procedure for full admission, clear `pending_route_change` to null, persist, and run it again before the next Task.
+8. At any interruption, retain the intent, re-read Plan/progress/reviews, run the procedure, and identify the checkpoint. Resume synchronized states with full admission; resume the one Plan-ahead/progress-old state only through Plan-only derivation and the non-authorizing combined-static transition check, then replace the complete suffix and rerun the procedure. Never infer, partially patch, or erase a half-applied change.
 
 Block Task dispatch while pending_route_change is non-null. A missing or
 altered intent, a partial resync, or any affected durable row blocks. Defer
@@ -159,7 +157,6 @@ an active-Task change and request a user decision while preserving its
 admitted route.
 
 ## 3. Review and revise Design
-
 Trigger Design review when the Brainstorm spans modules, migration,
 concurrency, security, persistence, externally visible compatibility, or
 material ambiguity. Always dispatch an independent Codex Design Reviewer when
@@ -167,8 +164,8 @@ any trigger is present. Dispatch every user-named Design Reviewer as an
 additional separate document-only work unit. Use
 design|DESIGN_PATH|reviewer|AGENT|PROFILE for each reviewer. Dispatch an
 independent Codex Design Fixer on design|DESIGN_PATH|fixer|codex|none. Record
-an unbound intent, fetch a fresh snapshot, and run the applicable admission
-mode before every reviewer or Fixer dispatch or continuation. Use document
+an unbound intent and run the complete-snapshot procedure in the applicable
+admission mode before every reviewer or Fixer dispatch or continuation. Use document
 admission only before a routed Plan and synchronized progress exist. Use
 full admission for every later Design decision. Any intervening delegation
 action invalidates the prior snapshot. These document runs stay unbound.
@@ -239,20 +236,19 @@ KiB. Keep the progress document at or below 512 KiB and its structured block
 at or below 64 KiB.
 
 ## 4. Author and review Plan
-
 Create only a bounded codeg-simple-progress-v1 shell. Pass document admission.
 Dispatch an independent Codex Plan Author with writing-plans on
 plan|PLAN_PATH|author|codex|none. Require ordered Task headings and exactly one
 bounded unfenced codeg-b2d-routing-v1 JSON block.
 
 Run Plan-only derivation twice: Author, then parent. Initialize route fields
-only from the parent's exact rerun. Run combined static validation, then
-fetch a new complete snapshot and run full admission. Dispatch an independent
+only from the parent's exact rerun. Run combined static validation, then the
+complete-snapshot procedure for full admission. Dispatch an independent
 Codex Plan Reviewer on plan|PLAN_PATH|reviewer|codex|none plus any user-named
 Plan reviewers. Review the complete latest Plan rather than a diff.
 
-Before every later Author or reviewer continuation, fetch a new complete
-snapshot and run full admission against synchronized Plan and progress. Route
+Before every later Author or reviewer continuation, run the procedure for
+fresh full admission against synchronized Plan and progress. Route
 accepted findings to the same Plan Author. After approval, call
 register_simple_workflow. These document runs stay unbound.
 
@@ -304,7 +300,6 @@ headings.
 ```
 
 ## 5. Maintain progress
-
 Keep Plan Task indices, risk level, Task Agent generation, expected work-unit
 keys, status, commit, and runs synchronized in one progress block. Derive
 normal implementer keys as task|N|implementer|TASK_AGENT|PROFILE and high
@@ -313,15 +308,21 @@ as task|N|reviewer|primary|codex|none and high auxiliary reviewer keys as
 task|N|reviewer|auxiliary|TASK_AGENT|PROFILE. Use
 final_review|reviewer|codex|none for final review.
 
-Before each call, append a new reserving run with the exact validator-copied
-orchestration_binding, full null durable identity, and an operation-specific
-dispatch_intent. After acknowledgement, fill every returned and durable field
-without deleting intent history. A definitive pre-reservation failure can
-close its dispatch intent with null durable identity. Only unknown
-acknowledgement stays reserving and adoption-eligible.
+Before each logical call, append a reserving run with the exact validator-copied binding, null durable identity, and operation fields; write a canonical lowercase UUID `intent_id` to progress before constructing the pending call. Run `validate-contract.mjs --ticket-v1-fingerprint --output-json` with the exact
+pending call on bounded stdin; continue has null cwd. Copy only
+`request_fingerprint` and `normalized_working_dir`, and retain the pending call
+and digest. Request the artifact with the exact `admission_intent`, then validate
+its returned path and digest through the validator.
 
-Keep task_id globally unique and attach one non-null child conversation to
-only one complete work-unit key.
+On `prepared`, call delegate or continue with the same intent ID, returned admission ticket, same pending-call values, and a fresh physical correlation ID;
+delegate uses the non-empty normalized cwd and continue has no cwd. On acknowledgement, fill returned durable identity without deleting intent history. On unknown
+acknowledgement retain the intent, pending call, and digest. Process
+`already_admitted` only through the validator's one adoption action. Stale,
+consumed, or authorization failure discards the artifact and ticket and requires
+a fresh artifact, validation, and ticket. Never expose artifact paths or
+admission tickets in cards or prose. A definitive pre-reservation failure may
+close the intent with null durable identity; otherwise preserve intent history.
+Keep task_id globally unique and one non-null child per complete work-unit key.
 
 ### Progress JSON
 
@@ -369,6 +370,7 @@ change records the object below.
           "replaced_task_id": null,
           "replacement_reason": null,
           "dispatch_intent": {
+            "intent_id": "8f95dd45-9eca-42a8-9909-0ac00be8ad52",
             "kind": "first",
             "continuation_target_task_id": null,
             "replacement_target_task_id": null,
@@ -413,7 +415,6 @@ another full admission.
 ```
 
 ## 6. Apply the workspace gate
-
 Inspect git status, staged and unstaged diffs, recent commits, ignored
 delivery reports, and repository instructions before each producer dispatch.
 Record ownership and expected files. Preserve unrelated user changes, build
@@ -424,10 +425,10 @@ ownership, destructive operations, secrets, external side effects, or
 user-owned decisions. Request direction and resume from refreshed truth.
 
 ## 7. Execute Tasks serially
-
 Use subagent-driven-development and execute one Plan Task at a time. Before
-every first, continue, or replacement action, fetch a fresh complete snapshot
-and run full admission. Pass the exact emitted binding. Route changed
+every first, continue, or replacement action, follow section 5; its artifact
+validation is the complete-snapshot procedure for fresh full admission. Pass
+the exact emitted binding. Route changed
 pre-admission risk evidence through the same Plan Author, rerun validation,
 and continue every Plan reviewer for full re-review. Block changed
 post-admission evidence, including a coordinated Plan and progress generation
@@ -449,7 +450,6 @@ all expected key lineages end completed, checks pass, reviewers approve, and
 the owned commit and report are current.
 
 ## 8. Recover generic runs
-
 Continue a run with continue_delegation only on its stable key and child
 conversation. Join observed tasks through get_delegation_status. For recovery
 confirmation, call request_recovery_authorization and replay the authorized
@@ -464,14 +464,14 @@ unresolved intent. Deleting the intent or mirror remains blocking.
 Only when every failure is B2D-DURABLE-005 with exact prefix
 `status-only refresh required:` and the validator reports no identity or
 binding failure, update each named progress run's state from its matched
-durable status, persist, discard the snapshot, fetch every page again, and
-rerun full admission. Treat a validator-confirmed status-only lifecycle
-advance as that state-only refresh loop, not a permanent identity failure.
+durable status, persist, discard the snapshot, and rerun the complete-snapshot
+procedure for full admission. Treat a validator-confirmed status-only
+lifecycle advance as that state-only refresh loop, not a permanent identity failure.
 Never rewrite Task ID, child, lineage, Agent/profile, key, generation, or
 binding, and never idempotently replay an unresolved call before
 reconciliation.
 
-If pending_route_change exists, start by fetching a fresh complete snapshot
+If pending_route_change exists, start with the complete-snapshot procedure
 and resume the section 2 checkpoint sequence. Preserve at most two unexpected
 continuations and one logical replacement per complete key lineage. Surface
 the typed blocker and retain the recorded route.
@@ -482,14 +482,13 @@ simple_orchestration_binding_orphan. Those warnings stay warning-only. They
 never create a Gate, Card, or completion decision.
 
 ## 9. Complete final review
-
 After all Tasks complete, re-read the Brainstorm, Design, Plan, routing,
 progress, reports, reviews, commits, full branch diff, and worktree state.
-Run covering tests, lint, build, and project checks. Fetch a new complete
-snapshot and run full admission before dispatching a fresh independent Codex
+Run covering tests, lint, build, and project checks. Run the complete-snapshot
+procedure for fresh full admission before dispatching a fresh independent Codex
 final reviewer on final_review|reviewer|codex|none. That work unit stays
-unbound. After each owning producer fix, fetch another fresh complete
-snapshot and run full admission before continuing the same final reviewer.
+unbound. After each owning producer fix, run the procedure for fresh full
+admission before continuing the same final reviewer.
 Bound final fixes return to the owning Task producer and reopen Task and
 final review. Complete local delivery only when covering checks and
 independent final review approve the same latest state. Commit only owned

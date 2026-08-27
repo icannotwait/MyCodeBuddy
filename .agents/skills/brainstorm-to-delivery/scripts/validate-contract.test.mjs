@@ -1,5 +1,6 @@
 import assert from "node:assert/strict"
 import { spawnSync } from "node:child_process"
+import { createHash } from "node:crypto"
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { dirname, join } from "node:path"
 import { describe, it } from "node:test"
@@ -27,6 +28,270 @@ const here = dirname(fileURLToPath(import.meta.url))
 const realSkill = readFileSync(join(here, "..", "SKILL.md"), "utf8")
 const planRelPath = "docs/superpowers/plans/example.md"
 const copy = structuredClone
+
+const TICKET_V1_PENDING_CALL = {
+  schema_version: 1,
+  tool_name: "continue_delegation",
+  task: "Continue the approved implementation",
+  working_dir: null,
+  work_unit_key: "task|7|implementer|codex|none",
+  replaces_task_id: null,
+  replacement_reason: null,
+  target_task_id: "6b228a7d-4ac9-4bc7-a16e-f4ecf6f0fd45",
+  agent_type: "codex",
+  profile_id: null,
+  orchestration_binding: {
+    schema_version: 1,
+    namespace: "brainstorm-to-delivery",
+    generation: 2,
+    route_fingerprint:
+      "sha256:b498416d87bf6ba928bd7ddb5f1a451daf82300584f3d40b606c3c56f169ba7a",
+  },
+  dispatch_intent_id: "8f95dd45-9eca-42a8-9909-0ac00be8ad52",
+}
+
+describe("ticket-v1 request fingerprint", () => {
+  it("matches every frozen shared fingerprint vector", () => {
+    assert.equal(
+      typeof contractLib.deriveTicketV1RequestFingerprint,
+      "function"
+    )
+    const fixture = JSON.parse(
+      readFileSync(
+        join(
+          here,
+          "../../../../src-tauri/tests/fixtures/delegation_request_fingerprints.json"
+        ),
+        "utf8"
+      )
+    )
+    assert.deepEqual(Object.keys(fixture), ["schema_version", "cases"])
+    assert.equal(fixture.schema_version, 1)
+    assert.equal(fixture.cases.length, 20)
+    assert.deepEqual(
+      fixture.cases.slice(0, 3).map((entry) => entry.expected_digest),
+      [
+        "55687507f1ed929a92190fb1e1039e422dd219d2238a4b1e10a6968c32e557f4",
+        "f9487ae94c8b94155514942226be54829c3f5043fdf587d3c33886b01f04a97f",
+        "aca47c464009a8f26bd36e0611b17f62cb7ed7942a387e38e878cf87087ff172",
+      ]
+    )
+    for (const entry of fixture.cases) {
+      assert.deepEqual(
+        Object.keys(entry),
+        entry.version === 3
+          ? [
+              "name",
+              "version",
+              "pending_call",
+              "expected_array",
+              "expected_digest",
+            ]
+          : [
+              "name",
+              "version",
+              "legacy_input",
+              "expected_array",
+              "expected_digest",
+            ]
+      )
+      if (entry.version !== 3) continue
+      assert.equal(entry.expected_array.length, 15, entry.name)
+      assert.equal(entry.expected_array[0], "delegation-request-v3", entry.name)
+      const actual = contractLib.deriveTicketV1RequestFingerprint(
+        entry.pending_call
+      )
+      assert.equal(
+        actual.request_fingerprint,
+        entry.expected_digest,
+        entry.name
+      )
+      assert.equal(
+        actual.normalized_working_dir,
+        entry.expected_array[3],
+        entry.name
+      )
+    }
+  })
+
+  it("exports the authoritative helper and derives the published vector", () => {
+    assert.equal(
+      typeof contractLib.deriveTicketV1RequestFingerprint,
+      "function"
+    )
+    assert.deepEqual(
+      contractLib.deriveTicketV1RequestFingerprint(TICKET_V1_PENDING_CALL),
+      {
+        schema_version: 1,
+        request_fingerprint:
+          "2a44be9d1662a314cbbd2c8111bcf83159be7bdc93abadff977d01447f986648",
+        normalized_working_dir: "",
+      }
+    )
+  })
+
+  it("requires the exact pending-call fields and operation matrix", () => {
+    assert.equal(
+      typeof contractLib.deriveTicketV1RequestFingerprint,
+      "function"
+    )
+    for (const key of Object.keys(TICKET_V1_PENDING_CALL)) {
+      const missing = copy(TICKET_V1_PENDING_CALL)
+      delete missing[key]
+      assert.throws(
+        () => contractLib.deriveTicketV1RequestFingerprint(missing),
+        /pending call/i,
+        key
+      )
+    }
+    assert.throws(
+      () =>
+        contractLib.deriveTicketV1RequestFingerprint({
+          ...TICKET_V1_PENDING_CALL,
+          unknown: true,
+        }),
+      /pending call/i
+    )
+    for (const dispatch_intent_id of [
+      [TICKET_V1_PENDING_CALL.dispatch_intent_id],
+      {},
+      7,
+      true,
+    ]) {
+      assert.throws(
+        () =>
+          contractLib.deriveTicketV1RequestFingerprint({
+            ...TICKET_V1_PENDING_CALL,
+            dispatch_intent_id,
+          }),
+        /pending call identity/i
+      )
+    }
+
+    const first = {
+      ...TICKET_V1_PENDING_CALL,
+      tool_name: "delegate_to_agent",
+      target_task_id: null,
+    }
+    const replacement = {
+      ...first,
+      replaces_task_id: "6b228a7d-4ac9-4bc7-a16e-f4ecf6f0fd45",
+      replacement_reason: "unresumable",
+    }
+    const unbound = { ...first, orchestration_binding: null }
+    for (const pendingCall of [
+      first,
+      TICKET_V1_PENDING_CALL,
+      replacement,
+      unbound,
+    ]) {
+      assert.doesNotThrow(() =>
+        contractLib.deriveTicketV1RequestFingerprint(pendingCall)
+      )
+    }
+
+    for (const invalid of [
+      { ...first, target_task_id: TICKET_V1_PENDING_CALL.target_task_id },
+      { ...TICKET_V1_PENDING_CALL, target_task_id: null },
+      { ...TICKET_V1_PENDING_CALL, working_dir: "D:/repo" },
+      { ...replacement, replacement_reason: null },
+      { ...replacement, replaces_task_id: null },
+      { ...replacement, target_task_id: TICKET_V1_PENDING_CALL.target_task_id },
+    ]) {
+      assert.throws(
+        () => contractLib.deriveTicketV1RequestFingerprint(invalid),
+        /operation/i
+      )
+    }
+  })
+
+  it("keeps the fingerprint CLI exclusive, bounded, and task-text-free", () => {
+    const taskText = "DO_NOT_EMIT_THIS_TICKET_TASK_TEXT"
+    const pendingCall = { ...TICKET_V1_PENDING_CALL, task: taskText }
+    const success = spawnCli(
+      ["--ticket-v1-fingerprint", "--output-json"],
+      {},
+      JSON.stringify(pendingCall)
+    )
+    assert.equal(success.status, 0)
+    assert.equal(success.stderr, "")
+    assert.doesNotMatch(success.stdout, new RegExp(taskText))
+    assert.deepEqual(Object.keys(JSON.parse(success.stdout)), [
+      "schema_version",
+      "request_fingerprint",
+      "normalized_working_dir",
+    ])
+
+    const emptyTaskJson = JSON.stringify({ ...pendingCall, task: "" })
+    const exactBoundary = spawnCli(
+      ["--ticket-v1-fingerprint", "--output-json"],
+      {},
+      JSON.stringify({
+        ...pendingCall,
+        task: "x".repeat(
+          contractLib.MAX_PLAN_DOCUMENT_BYTES - emptyTaskJson.length
+        ),
+      })
+    )
+    assert.equal(exactBoundary.status, 0)
+    assert.equal(exactBoundary.stderr, "")
+
+    for (const args of [
+      ["--ticket-v1-fingerprint"],
+      ["--output-json"],
+      ["--ticket-v1-fingerprint", "--output-json", "--admission"],
+      ["--ticket-v1-fingerprint", "--output-json", "--plan", "plan.md"],
+      ["--ticket-v1-fingerprint", "--output-json", "--unknown-flag"],
+    ]) {
+      const invalid = spawnCli(args, {}, JSON.stringify(pendingCall))
+      assert.notEqual(invalid.status, 0)
+      assert.equal(invalid.stderr, "")
+      assert.doesNotMatch(invalid.stdout, new RegExp(taskText))
+      const output = JSON.parse(invalid.stdout)
+      if (args.includes("--ticket-v1-fingerprint")) {
+        assert.deepEqual(Object.keys(output), [
+          "schema_version",
+          "request_fingerprint",
+          "normalized_working_dir",
+        ])
+        assert.equal(output.request_fingerprint, null)
+        assert.equal(output.normalized_working_dir, null)
+      }
+    }
+
+    for (const input of [
+      JSON.stringify({ ...pendingCall, unknown: true }),
+      Buffer.from([0xff]),
+    ]) {
+      const invalid = spawnCli(
+        ["--ticket-v1-fingerprint", "--output-json"],
+        {},
+        input
+      )
+      assert.notEqual(invalid.status, 0)
+      assert.equal(invalid.stderr, "")
+      assert.doesNotMatch(invalid.stdout, new RegExp(taskText))
+      assert.deepEqual(Object.keys(JSON.parse(invalid.stdout)), [
+        "schema_version",
+        "request_fingerprint",
+        "normalized_working_dir",
+      ])
+    }
+
+    const oversized = spawnCli(
+      ["--ticket-v1-fingerprint", "--output-json"],
+      {},
+      "x".repeat(contractLib.MAX_PLAN_DOCUMENT_BYTES + 1)
+    )
+    assert.notEqual(oversized.status, 0)
+    assert.equal(oversized.stderr, "")
+    assert.deepEqual(Object.keys(JSON.parse(oversized.stdout)), [
+      "schema_version",
+      "request_fingerprint",
+      "normalized_working_dir",
+    ])
+  })
+})
 
 const SKILL_CONTRACT = {
   schema_version: 2,
@@ -143,6 +408,17 @@ ${block("codeg-b2d-skill-contract-v2", SKILL_CONTRACT)}
 
 ## 1. Establish current truth
 Inspect current files and live delegation schemas. Preserve user decisions.
+For every complete snapshot, inspect the live binding-query schema. When
+ticket-v1 is advertised, the complete-snapshot procedure follows section 5's
+write-ahead UUID and bounded fingerprint steps through the exact
+\`admission_intent\` artifact request. For legacy artifact mode, when it
+advertises artifact delivery, request \`delivery: "artifact"\` once. Pass
+\`artifact_path\` directly to \`--durable-evidence\` and \`artifact_sha256\`
+directly to \`--durable-evidence-sha256\`. Never open, read, print, copy,
+summarize, embed, or delegate inspection of the artifact. Treat artifact
+request, descriptor, digest, stale, validator, and cleanup errors as blocking
+and never fall back to pages. Use legacy page pagination only when the live
+schema does not advertise artifact delivery.
 
 ## 2. Resolve the Task Agent
 Inspect discovery and choose the invocation selection. Record an omitted selection as Grok and block invalid identities.
@@ -155,6 +431,19 @@ Create progress first. Dispatch an independent Codex Plan Author with writing-pl
 
 ## 5. Maintain progress
 Record reserving intent, delegation, admission, and observed state in order. Keep route metadata.
+For ticket-v1, write a canonical lowercase UUID \`intent_id\` to progress before
+constructing the pending call. Run
+\`validate-contract.mjs --ticket-v1-fingerprint --output-json\` with the exact
+pending call on bounded stdin; copy only \`request_fingerprint\` and
+\`normalized_working_dir\`, and retain the pending call and digest. Request the
+artifact with the exact \`admission_intent\`, then validate its returned path
+and digest through the validator. On \`prepared\`, call delegate or continue
+with the same intent ID, returned admission ticket, same pending-call values,
+and a fresh physical correlation ID. On unknown acknowledgement retain the
+intent, pending call, and digest; process \`already_admitted\` only through the
+validator's one adoption action. Stale, consumed, or authorization failure
+discards the artifact and ticket and requires a fresh artifact, validation,
+and ticket. Never expose artifact paths or admission tickets in cards or prose.
 
 ## 6. Apply the workspace gate
 Inspect status and diffs. Preserve user changes and request user-owned decisions.
@@ -398,7 +687,7 @@ function fencedJsonAfterHeading(markdown, heading) {
   assert.notEqual(headingIndex, -1, `missing Skill heading: ${heading}`)
   const match = markdown
     .slice(headingIndex + heading.length)
-    .match(/\n```json\n([\s\S]*?)\n```/)
+    .match(/\r?\n```json\r?\n([\s\S]*?)\r?\n```/)
   assert.ok(match, `missing JSON contract after: ${heading}`)
   return JSON.parse(match[1])
 }
@@ -5396,6 +5685,7 @@ describe("Skill contract v2", () => {
     assert.deepEqual(
       Object.keys(progressShape.tasks[0].runs[0].dispatch_intent),
       [
+        "intent_id",
         "kind",
         "continuation_target_task_id",
         "replacement_target_task_id",
@@ -6498,6 +6788,7 @@ describe("durable route binding derivation", () => {
       ...process.env,
       FORCE_COLOR: "1",
       NO_COLOR: "1",
+      NODE_NO_WARNINGS: "1",
     }
     const spawnCli = (args) =>
       spawnSync(process.execPath, [script, ...args], {
@@ -6791,16 +7082,22 @@ const ZERO_FINGERPRINT =
   "sha256:0000000000000000000000000000000000000000000000000000000000000000"
 
 function conflictingColorEnv() {
-  return { ...process.env, FORCE_COLOR: "1", NO_COLOR: "1" }
+  return {
+    ...process.env,
+    FORCE_COLOR: "1",
+    NO_COLOR: "1",
+    NODE_NO_WARNINGS: "1",
+  }
 }
 
-function spawnCli(args, extraEnv = {}) {
+function spawnCli(args, extraEnv = {}, input) {
   return spawnSync(
     process.execPath,
     [join(here, "validate-contract.mjs"), ...args],
     {
       encoding: "utf8",
       env: { ...conflictingColorEnv(), ...extraEnv },
+      input,
     }
   )
 }
@@ -6835,6 +7132,10 @@ function evidencePage(overrides = {}, runs = []) {
 
 function evidenceWrapper(pages) {
   return { schema_version: 1, pages }
+}
+
+function sha256(bytes) {
+  return `sha256:${createHash("sha256").update(bytes).digest("hex")}`
 }
 
 function emptyEvidence() {
@@ -7114,6 +7415,44 @@ function twoTaskBoundState() {
   return { snapshot, planMarkdown, bindings, state }
 }
 
+describe("dispatch intent ticket-v1 shape", () => {
+  const intentId = "8f95dd45-9eca-42a8-9909-0ac00be8ad52"
+
+  function validateIntent(intent) {
+    const { planMarkdown, state } = twoTaskBoundState()
+    state.tasks[0].runs[0].dispatch_intent = intent
+    return staticValidation(planMarkdown, state)
+  }
+
+  it("accepts exactly the legacy shape or that shape plus a canonical intent_id", () => {
+    assert.deepEqual(validateIntent(firstIntent()).failures, [])
+    const ticket = validateIntent(firstIntent({ intent_id: intentId }))
+    assert.deepEqual(ticket.failures, [])
+    assert.doesNotMatch(JSON.stringify(ticket), new RegExp(intentId))
+  })
+
+  it("rejects malformed, null, unknown-key, and partial alternate shapes", () => {
+    const { expected_root_task_id, ...partial } = firstIntent({
+      intent_id: intentId,
+    })
+    const invalid = [
+      firstIntent({ intent_id: null }),
+      firstIntent({ intent_id: intentId.toUpperCase() }),
+      firstIntent({ intent_id: "not-a-uuid" }),
+      firstIntent({ intent_id: [intentId] }),
+      firstIntent({ intent_id: {} }),
+      firstIntent({ intent_id: 7 }),
+      firstIntent({ intent_id: true }),
+      firstIntent({ intent_id: intentId, extra: true }),
+      partial,
+      firstIntent({ dispatch_intent_id: intentId }),
+    ]
+    for (const intent of invalid) {
+      hasRule(validateIntent(intent).failures, "B2D-PROGRESS-006")
+    }
+  })
+})
+
 describe("durable page envelopes", () => {
   it("exports the exact 4 MiB cap and preserves raw multi-page cursor envelopes", () => {
     assert.equal(contractLib.MAX_DURABLE_EVIDENCE_BYTES, 4 * 1024 * 1024)
@@ -7363,6 +7702,344 @@ describe("durable page envelopes", () => {
         "B2D-DURABLE-002"
       )
     }
+  })
+})
+
+describe("durable artifact buffer verification", () => {
+  it("hashes and parses the same already-read buffer after path replacement", () => {
+    const tempRoot = mkdtempSync(join(tmpdir(), "b2d-artifact-buffer-"))
+    try {
+      const artifactPath = join(tempRoot, "bindings.json")
+      const original = Buffer.from(JSON.stringify(emptyEvidence()))
+      writeFileSync(artifactPath, original)
+      const durableEvidence = readFileSync(artifactPath)
+      writeFileSync(artifactPath, Buffer.from("replacement"))
+
+      const result = runValidation({
+        skillMarkdown: skill,
+        documentAdmission: true,
+        outputJson: true,
+        durableEvidence,
+        durableEvidenceSha256: sha256(original),
+      })
+
+      assert.deepEqual(result.failures, [])
+      assert.equal(result.admission_authorized, true)
+      assert.deepEqual(result.durable_snapshot, {
+        snapshot_id: SNAPSHOT_ID,
+        snapshot_revision: "0",
+      })
+    } finally {
+      rmSync(tempRoot, { recursive: true, force: true })
+    }
+  })
+
+  it("uses B2D-DURABLE-010 only for malformed or mismatched digests", () => {
+    const bytes = Buffer.from(JSON.stringify(emptyEvidence()))
+    const digests = [
+      "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "sha256:ABCDEF",
+      "sha256:abc",
+      "not-sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    ]
+    for (const durableEvidenceSha256 of digests) {
+      const result = runValidation({
+        skillMarkdown: skill,
+        documentAdmission: true,
+        outputJson: true,
+        durableEvidence: bytes,
+        durableEvidenceSha256,
+      })
+      hasRule(result.failures, "B2D-DURABLE-010")
+      assert.equal(result.admission_authorized, false)
+      assert.equal(result.durable_snapshot, null)
+    }
+  })
+
+  it("preserves legacy page failures when evidence arrives as a verified buffer", () => {
+    const first = evidencePage(
+      { total_rows: 2, complete: false, next_cursor: CURSOR_A },
+      [durableRun({ task_id: "row-1", child_conversation_id: 11 })]
+    )
+    const second = evidencePage(
+      {
+        total_rows: 2,
+        page_start: 1,
+        request_cursor: CURSOR_A,
+      },
+      [durableRun({ task_id: "row-2", child_conversation_id: 12 })]
+    )
+    const cases = [
+      [
+        "expired",
+        evidenceWrapper([
+          evidencePage(
+            {
+              snapshot_created_at: "2020-01-01T00:00:00.000Z",
+              snapshot_expires_at: "2020-01-01T00:01:00.000Z",
+            },
+            []
+          ),
+        ]),
+      ],
+      [
+        "mixed",
+        evidenceWrapper([
+          first,
+          { ...second, snapshot_revision: "43" },
+        ]),
+      ],
+      [
+        "incomplete",
+        evidenceWrapper([{ ...first, total_rows: 2 }]),
+      ],
+      [
+        "duplicate",
+        evidenceWrapper([
+          evidencePage({ total_rows: 2 }, [
+            durableRun(),
+            durableRun({ child_conversation_id: 12 }),
+          ]),
+        ]),
+      ],
+      ["reordered", evidenceWrapper([second, first])],
+    ]
+
+    for (const [label, value] of cases) {
+      const source = JSON.stringify(value)
+      const legacy = contractLib.parseDurableBindingEvidence(source)
+      const bytes = Buffer.from(source)
+      const verified = contractLib.parseDurableBindingEvidence(bytes, {
+        sha256: sha256(bytes),
+      })
+      assert.deepEqual(verified, legacy, label)
+      hasRule(verified.failures, "B2D-DURABLE-001")
+    }
+  })
+
+  it("rejects invalid UTF-8 and the 4 MiB plus one-byte boundary", () => {
+    for (const bytes of [
+      Buffer.from([0xc3, 0x28]),
+      Buffer.alloc(contractLib.MAX_DURABLE_EVIDENCE_BYTES + 1, 0x20),
+    ]) {
+      const parsed = contractLib.parseDurableBindingEvidence(bytes, {
+        sha256: sha256(bytes),
+      })
+      hasRule(parsed.failures, "B2D-DURABLE-001")
+      assert.deepEqual(parsed.runs, [])
+    }
+  })
+
+  it("enforces the digest flag at the bounded CLI file boundary", () => {
+    const tempRoot = mkdtempSync(join(tmpdir(), "b2d-artifact-cli-"))
+    try {
+      const artifactPath = join(tempRoot, "bindings.json")
+      const valid = Buffer.from(JSON.stringify(emptyEvidence()))
+      writeFileSync(artifactPath, valid)
+      const baseArgs = [
+        "--document-admission",
+        "--durable-evidence",
+        artifactPath,
+        "--output-json",
+      ]
+
+      const verified = spawnCli([
+        ...baseArgs,
+        "--durable-evidence-sha256",
+        sha256(valid),
+      ])
+      assert.equal(verified.status, 0)
+      assert.equal(verified.stderr, "")
+      assert.equal(JSON.parse(verified.stdout).admission_authorized, true)
+
+      const legacy = spawnCli(baseArgs)
+      assert.equal(legacy.status, 0)
+      assert.equal(JSON.parse(legacy.stdout).admission_authorized, true)
+
+      for (const digest of [
+        "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "sha256:ABCDEF",
+      ]) {
+        const rejected = spawnCli([
+          ...baseArgs,
+          "--durable-evidence-sha256",
+          digest,
+        ])
+        assert.notEqual(rejected.status, 0)
+        assert.equal(rejected.stderr, "")
+        hasRule(JSON.parse(rejected.stdout).failures, "B2D-DURABLE-010")
+      }
+
+      const durableTaskId = "00000000-0000-4000-8000-000000009999"
+      const blocked = Buffer.from(
+        JSON.stringify(
+          evidenceWrapper([
+            evidencePage(
+              {},
+              [
+                durableRun({
+                  task_id: durableTaskId,
+                  work_unit_key: "task|1|implementer|grok|none",
+                }),
+              ]
+            ),
+          ])
+        )
+      )
+      writeFileSync(artifactPath, blocked)
+      const blockedResult = spawnCli([
+        ...baseArgs,
+        "--durable-evidence-sha256",
+        sha256(blocked),
+      ])
+      assert.notEqual(blockedResult.status, 0)
+      const blockedJson = JSON.parse(blockedResult.stdout)
+      assert.doesNotMatch(JSON.stringify(blockedJson), /"runs"/)
+      assert.doesNotMatch(JSON.stringify(blockedJson), new RegExp(durableTaskId))
+
+      for (const bytes of [
+        Buffer.from([0xc3, 0x28]),
+        Buffer.alloc(contractLib.MAX_DURABLE_EVIDENCE_BYTES + 1, 0x20),
+      ]) {
+        writeFileSync(artifactPath, bytes)
+        const rejected = spawnCli([
+          ...baseArgs,
+          "--durable-evidence-sha256",
+          sha256(bytes),
+        ])
+        assert.notEqual(rejected.status, 0)
+        assert.equal(rejected.stderr, "")
+        hasRule(JSON.parse(rejected.stdout).failures, "B2D-DURABLE-001")
+      }
+    } finally {
+      rmSync(tempRoot, { recursive: true, force: true })
+    }
+  })
+})
+
+describe("artifact-first Skill contract", () => {
+  it("rejects every mutation that exposes or falls back from advertised artifacts", () => {
+    assert.deepEqual(validateSkillMarkdown(skill).failures, [])
+    const mutations = [
+      [
+        "Inspect the live binding-query schema.",
+        "Inspect the cached binding-query schema.",
+        realSkill,
+      ],
+      [
+        'request `delivery: "artifact"` once',
+        'request `delivery: "page"` once',
+      ],
+      [
+        "`artifact_path` directly to `--durable-evidence`",
+        "`artifact_path` indirectly to `--durable-evidence`",
+        realSkill,
+      ],
+      [
+        "`artifact_sha256`\ndirectly to `--durable-evidence-sha256`",
+        "a recomputed digest\ndirectly to `--durable-evidence-sha256`",
+      ],
+      [
+        "Never open, read, print, copy,\nsummarize, embed, or delegate inspection of the artifact",
+        "Never print the artifact",
+      ],
+      ["never fall back to pages", "fall back to pages"],
+      [
+        "Use legacy page pagination only when the live\nschema does not advertise artifact delivery",
+        "Use legacy page pagination after artifact errors",
+      ],
+    ]
+    for (const [required, replacement, source = skill] of mutations) {
+      assert.ok(source.includes(required), required)
+      hasRule(
+        validateSkillMarkdown(source.replace(required, replacement)).failures,
+        "B2D-SKILL-006"
+      )
+    }
+    assert.deepEqual(validateSkillMarkdown(realSkill).failures, [])
+  })
+})
+
+describe("ticket-v1 Skill contract", () => {
+  it("rejects every mutation that weakens ordered admission or lost-ACK recovery", () => {
+    const mutations = [
+      [
+        "write a canonical lowercase UUID `intent_id` to progress before constructing the pending call",
+        "construct the pending call before writing its intent to progress",
+      ],
+      [
+        "`validate-contract.mjs --ticket-v1-fingerprint --output-json` with the exact pending call on bounded stdin",
+        "a local fingerprint helper with the pending call",
+      ],
+      [
+        "copy only `request_fingerprint` and `normalized_working_dir`",
+        "copy the pending call output",
+      ],
+      [
+        "artifact with the exact `admission_intent`",
+        "artifact before constructing admission intent",
+      ],
+      [
+        "validate its returned path and digest through the validator",
+        "trust its returned path and digest",
+      ],
+      [
+        "same intent ID, returned admission ticket, same pending-call values, and a fresh physical correlation ID",
+        "returned admission ticket and the prior correlation ID",
+      ],
+      [
+        "unknown acknowledgement retain the intent, pending call, and digest",
+        "unknown acknowledgement clears the pending state",
+      ],
+      [
+        "`already_admitted` only through the validator's one adoption action",
+        "`already_admitted` directly from the artifact descriptor",
+      ],
+      [
+        "Stale, consumed, or authorization failure discards the artifact and ticket and requires a fresh artifact, validation, and ticket",
+        "Stale, consumed, or authorization failure retries the prior ticket",
+      ],
+      [
+        "Never expose artifact paths or admission tickets in cards or prose",
+        "Include artifact paths and admission tickets in recovery prose",
+      ],
+      [
+        "When ticket-v1 is advertised, the complete-snapshot procedure follows section 5's write-ahead UUID and bounded fingerprint steps through the exact `admission_intent` artifact request",
+        "Ticket-v1 complete snapshots request an artifact directly",
+      ],
+    ]
+    for (const [required, replacement] of mutations) {
+      const pattern = new RegExp(
+        required
+          .split(" ")
+          .map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+          .join("\\s+")
+      )
+      assert.match(skill, pattern, required)
+      hasRule(
+        validateSkillMarkdown(skill.replace(pattern, replacement)).failures,
+        "B2D-SKILL-007"
+      )
+    }
+  })
+
+  it("rejects physical-call instructions reordered before write-ahead", () => {
+    const writeAhead =
+      "write a canonical lowercase UUID `intent_id` to progress before constructing the pending call"
+    const physicalCall =
+      "same intent ID, returned admission ticket, same pending-call values, and a fresh physical correlation ID"
+    const pattern = (value) =>
+      new RegExp(
+        value
+          .split(" ")
+          .map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+          .join("\\s+")
+      )
+    const reordered = skill
+      .replace(pattern(writeAhead), "__WRITE_AHEAD__")
+      .replace(pattern(physicalCall), writeAhead)
+      .replace("__WRITE_AHEAD__", physicalCall)
+    hasRule(validateSkillMarkdown(reordered).failures, "B2D-SKILL-007")
   })
 })
 
@@ -7828,6 +8505,8 @@ describe("durable reconciliation and root-cause", () => {
 })
 
 describe("lost acknowledgement adoption", () => {
+  const intentId = "8f95dd45-9eca-42a8-9909-0ac00be8ad52"
+
   function adoptionFixture(kind) {
     const { snapshot, planMarkdown, bindings, state } = twoTaskBoundState()
     const target = state.tasks[0].runs[0]
@@ -7836,7 +8515,7 @@ describe("lost acknowledgement adoption", () => {
     let intent
     let candidate
     if (kind === "first") {
-      intent = firstIntent()
+      intent = firstIntent({ intent_id: intentId })
       candidate = durableRun({
         task_id: "adopt-first",
         work_unit_key: key,
@@ -7846,7 +8525,7 @@ describe("lost acknowledgement adoption", () => {
         orchestration_binding: binding,
       })
     } else if (kind === "continue") {
-      intent = continueIntent(target)
+      intent = continueIntent(target, { intent_id: intentId })
       candidate = durableRun({
         task_id: "adopt-continue",
         root_task_id: target.root_task_id,
@@ -7861,7 +8540,9 @@ describe("lost acknowledgement adoption", () => {
         orchestration_binding: target.orchestration_binding,
       })
     } else {
-      intent = replacementIntent(target)
+      intent = replacementIntent(target, "unresumable", {
+        intent_id: intentId,
+      })
       candidate = durableRun({
         task_id: "adopt-replace",
         root_task_id: "adopt-replace",
@@ -7972,6 +8653,8 @@ describe("lost acknowledgement adoption", () => {
         action.orchestration_binding,
         fixture.candidate.orchestration_binding
       )
+      assert.equal("intent_id" in action, false)
+      assert.doesNotMatch(JSON.stringify(result), new RegExp(intentId))
     })
   }
 

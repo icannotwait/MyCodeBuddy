@@ -1,0 +1,764 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "name": "legacy_unbound_delegate",
+      "version": 1,
+      "legacy_input": {
+        "tool_name": "delegate_to_agent",
+        "task": "do the thing",
+        "work_unit_key": "work-1",
+        "replaces_task_id": null,
+        "replacement_reason": null,
+        "target_task_id": null,
+        "route_fingerprint_hex": "AbCdEf",
+        "orchestration_binding": null
+      },
+      "expected_array": [
+        "delegate_to_agent",
+        "do the thing",
+        "work-1",
+        "",
+        "",
+        "",
+        "abcdef"
+      ],
+      "expected_digest": "55687507f1ed929a92190fb1e1039e422dd219d2238a4b1e10a6968c32e557f4"
+    },
+    {
+      "name": "legacy_unbound_continue",
+      "version": 1,
+      "legacy_input": {
+        "tool_name": "continue_delegation",
+        "task": "revise",
+        "work_unit_key": null,
+        "replaces_task_id": null,
+        "replacement_reason": null,
+        "target_task_id": "task-1",
+        "route_fingerprint_hex": "deadbeef",
+        "orchestration_binding": null
+      },
+      "expected_array": [
+        "continue_delegation",
+        "revise",
+        "",
+        "",
+        "",
+        "task-1",
+        "deadbeef"
+      ],
+      "expected_digest": "f9487ae94c8b94155514942226be54829c3f5043fdf587d3c33886b01f04a97f"
+    },
+    {
+      "name": "legacy_bound_v2",
+      "version": 2,
+      "legacy_input": {
+        "tool_name": "delegate_to_agent",
+        "task": "Implement Task 7 from the reviewed Plan.",
+        "work_unit_key": "task|7|implementer|codex|none",
+        "replaces_task_id": null,
+        "replacement_reason": null,
+        "target_task_id": null,
+        "route_fingerprint_hex": "5ea0c72cf8b44015a7fe8e796a05dc22",
+        "orchestration_binding": {
+          "schema_version": 1,
+          "namespace": "brainstorm-to-delivery",
+          "generation": 2,
+          "route_fingerprint": "sha256:b498416d87bf6ba928bd7ddb5f1a451daf82300584f3d40b606c3c56f169ba7a"
+        }
+      },
+      "expected_array": [
+        "delegation-request-v2",
+        "delegate_to_agent",
+        "Implement Task 7 from the reviewed Plan.",
+        "task|7|implementer|codex|none",
+        "",
+        "",
+        "",
+        "5ea0c72cf8b44015a7fe8e796a05dc22",
+        "1",
+        "brainstorm-to-delivery",
+        "2",
+        "sha256:b498416d87bf6ba928bd7ddb5f1a451daf82300584f3d40b606c3c56f169ba7a"
+      ],
+      "expected_digest": "aca47c464009a8f26bd36e0611b17f62cb7ed7942a387e38e878cf87087ff172"
+    },
+    {
+      "name": "ticket_v1_continue_bound_published",
+      "version": 3,
+      "pending_call": {
+        "schema_version": 1,
+        "tool_name": "continue_delegation",
+        "task": "Continue the approved implementation",
+        "working_dir": null,
+        "work_unit_key": "task|7|implementer|codex|none",
+        "replaces_task_id": null,
+        "replacement_reason": null,
+        "target_task_id": "6b228a7d-4ac9-4bc7-a16e-f4ecf6f0fd45",
+        "agent_type": "codex",
+        "profile_id": null,
+        "orchestration_binding": {
+          "schema_version": 1,
+          "namespace": "brainstorm-to-delivery",
+          "generation": 2,
+          "route_fingerprint": "sha256:b498416d87bf6ba928bd7ddb5f1a451daf82300584f3d40b606c3c56f169ba7a"
+        },
+        "dispatch_intent_id": "8f95dd45-9eca-42a8-9909-0ac00be8ad52"
+      },
+      "expected_array": [
+        "delegation-request-v3",
+        "continue_delegation",
+        "Continue the approved implementation",
+        "",
+        "task|7|implementer|codex|none",
+        "",
+        "",
+        "6b228a7d-4ac9-4bc7-a16e-f4ecf6f0fd45",
+        "codex",
+        "",
+        "8f95dd45-9eca-42a8-9909-0ac00be8ad52",
+        "1",
+        "brainstorm-to-delivery",
+        "2",
+        "sha256:b498416d87bf6ba928bd7ddb5f1a451daf82300584f3d40b606c3c56f169ba7a"
+      ],
+      "expected_digest": "2a44be9d1662a314cbbd2c8111bcf83159be7bdc93abadff977d01447f986648"
+    },
+    {
+      "name": "ticket_v1_task_nfc_composed",
+      "version": 3,
+      "pending_call": {
+        "schema_version": 1,
+        "tool_name": "delegate_to_agent",
+        "task": "caf\u00e9",
+        "working_dir": null,
+        "work_unit_key": null,
+        "replaces_task_id": null,
+        "replacement_reason": null,
+        "target_task_id": null,
+        "agent_type": "codex",
+        "profile_id": null,
+        "orchestration_binding": null,
+        "dispatch_intent_id": "11111111-1111-4111-8111-111111111111"
+      },
+      "expected_array": [
+        "delegation-request-v3",
+        "delegate_to_agent",
+        "caf\u00e9",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "codex",
+        "",
+        "11111111-1111-4111-8111-111111111111",
+        "",
+        "",
+        "",
+        ""
+      ],
+      "expected_digest": "aee9bff957c1f6ed7a09f1c74209cee0af41bade6aab8bb08ed236a683621613"
+    },
+    {
+      "name": "ticket_v1_task_nfc_decomposed",
+      "version": 3,
+      "pending_call": {
+        "schema_version": 1,
+        "tool_name": "delegate_to_agent",
+        "task": "cafe\u0301",
+        "working_dir": null,
+        "work_unit_key": null,
+        "replaces_task_id": null,
+        "replacement_reason": null,
+        "target_task_id": null,
+        "agent_type": "codex",
+        "profile_id": null,
+        "orchestration_binding": null,
+        "dispatch_intent_id": "11111111-1111-4111-8111-111111111111"
+      },
+      "expected_array": [
+        "delegation-request-v3",
+        "delegate_to_agent",
+        "caf\u00e9",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "codex",
+        "",
+        "11111111-1111-4111-8111-111111111111",
+        "",
+        "",
+        "",
+        ""
+      ],
+      "expected_digest": "aee9bff957c1f6ed7a09f1c74209cee0af41bade6aab8bb08ed236a683621613"
+    },
+    {
+      "name": "ticket_v1_all_nullable_slots_empty",
+      "version": 3,
+      "pending_call": {
+        "schema_version": 1,
+        "tool_name": "delegate_to_agent",
+        "task": "All nullable slots are empty",
+        "working_dir": null,
+        "work_unit_key": null,
+        "replaces_task_id": null,
+        "replacement_reason": null,
+        "target_task_id": null,
+        "agent_type": "codex",
+        "profile_id": null,
+        "orchestration_binding": null,
+        "dispatch_intent_id": "11111111-1111-4111-8111-111111111111"
+      },
+      "expected_array": [
+        "delegation-request-v3",
+        "delegate_to_agent",
+        "All nullable slots are empty",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "codex",
+        "",
+        "11111111-1111-4111-8111-111111111111",
+        "",
+        "",
+        "",
+        ""
+      ],
+      "expected_digest": "ff7b3b3bc850097656844c1b037c1859334e648c9a7a3c649897ca511a50c96e"
+    },
+    {
+      "name": "ticket_v1_first_bound_cwd_forward_slash",
+      "version": 3,
+      "pending_call": {
+        "schema_version": 1,
+        "tool_name": "delegate_to_agent",
+        "task": "Implement Task 7 from the reviewed Plan.",
+        "working_dir": "D:/repo",
+        "work_unit_key": "task|7|implementer|codex|none",
+        "replaces_task_id": null,
+        "replacement_reason": null,
+        "target_task_id": null,
+        "agent_type": "codex",
+        "profile_id": null,
+        "orchestration_binding": {
+          "schema_version": 1,
+          "namespace": "brainstorm-to-delivery",
+          "generation": 2,
+          "route_fingerprint": "sha256:b498416d87bf6ba928bd7ddb5f1a451daf82300584f3d40b606c3c56f169ba7a"
+        },
+        "dispatch_intent_id": "8f95dd45-9eca-42a8-9909-0ac00be8ad52"
+      },
+      "expected_array": [
+        "delegation-request-v3",
+        "delegate_to_agent",
+        "Implement Task 7 from the reviewed Plan.",
+        "D:/repo",
+        "task|7|implementer|codex|none",
+        "",
+        "",
+        "",
+        "codex",
+        "",
+        "8f95dd45-9eca-42a8-9909-0ac00be8ad52",
+        "1",
+        "brainstorm-to-delivery",
+        "2",
+        "sha256:b498416d87bf6ba928bd7ddb5f1a451daf82300584f3d40b606c3c56f169ba7a"
+      ],
+      "expected_digest": "b80f59256b2d5268a015aca99f6c1f0df14aa6d71a96ab0bf46774476f0f2de8"
+    },
+    {
+      "name": "ticket_v1_cwd_backslash_distinct",
+      "version": 3,
+      "pending_call": {
+        "schema_version": 1,
+        "tool_name": "delegate_to_agent",
+        "task": "Implement Task 7 from the reviewed Plan.",
+        "working_dir": "D:\\repo",
+        "work_unit_key": "task|7|implementer|codex|none",
+        "replaces_task_id": null,
+        "replacement_reason": null,
+        "target_task_id": null,
+        "agent_type": "codex",
+        "profile_id": null,
+        "orchestration_binding": {
+          "schema_version": 1,
+          "namespace": "brainstorm-to-delivery",
+          "generation": 2,
+          "route_fingerprint": "sha256:b498416d87bf6ba928bd7ddb5f1a451daf82300584f3d40b606c3c56f169ba7a"
+        },
+        "dispatch_intent_id": "8f95dd45-9eca-42a8-9909-0ac00be8ad52"
+      },
+      "expected_array": [
+        "delegation-request-v3",
+        "delegate_to_agent",
+        "Implement Task 7 from the reviewed Plan.",
+        "D:\\repo",
+        "task|7|implementer|codex|none",
+        "",
+        "",
+        "",
+        "codex",
+        "",
+        "8f95dd45-9eca-42a8-9909-0ac00be8ad52",
+        "1",
+        "brainstorm-to-delivery",
+        "2",
+        "sha256:b498416d87bf6ba928bd7ddb5f1a451daf82300584f3d40b606c3c56f169ba7a"
+      ],
+      "expected_digest": "b044de9dac6b4f5e2551641a0c80699f60267140b7f2bde30f0b66d3190ac4ce"
+    },
+    {
+      "name": "ticket_v1_cwd_ecmascript_whitespace_trimmed",
+      "version": 3,
+      "pending_call": {
+        "schema_version": 1,
+        "tool_name": "delegate_to_agent",
+        "task": "Implement Task 7 from the reviewed Plan.",
+        "working_dir": "\t\u00a0\ufeff\u2028D:/repo\u2029 \r",
+        "work_unit_key": "task|7|implementer|codex|none",
+        "replaces_task_id": null,
+        "replacement_reason": null,
+        "target_task_id": null,
+        "agent_type": "codex",
+        "profile_id": null,
+        "orchestration_binding": {
+          "schema_version": 1,
+          "namespace": "brainstorm-to-delivery",
+          "generation": 2,
+          "route_fingerprint": "sha256:b498416d87bf6ba928bd7ddb5f1a451daf82300584f3d40b606c3c56f169ba7a"
+        },
+        "dispatch_intent_id": "8f95dd45-9eca-42a8-9909-0ac00be8ad52"
+      },
+      "expected_array": [
+        "delegation-request-v3",
+        "delegate_to_agent",
+        "Implement Task 7 from the reviewed Plan.",
+        "D:/repo",
+        "task|7|implementer|codex|none",
+        "",
+        "",
+        "",
+        "codex",
+        "",
+        "8f95dd45-9eca-42a8-9909-0ac00be8ad52",
+        "1",
+        "brainstorm-to-delivery",
+        "2",
+        "sha256:b498416d87bf6ba928bd7ddb5f1a451daf82300584f3d40b606c3c56f169ba7a"
+      ],
+      "expected_digest": "b80f59256b2d5268a015aca99f6c1f0df14aa6d71a96ab0bf46774476f0f2de8"
+    },
+    {
+      "name": "ticket_v1_cwd_u0085_retained",
+      "version": 3,
+      "pending_call": {
+        "schema_version": 1,
+        "tool_name": "delegate_to_agent",
+        "task": "Implement Task 7 from the reviewed Plan.",
+        "working_dir": "\u0085D:/repo\u0085",
+        "work_unit_key": "task|7|implementer|codex|none",
+        "replaces_task_id": null,
+        "replacement_reason": null,
+        "target_task_id": null,
+        "agent_type": "codex",
+        "profile_id": null,
+        "orchestration_binding": {
+          "schema_version": 1,
+          "namespace": "brainstorm-to-delivery",
+          "generation": 2,
+          "route_fingerprint": "sha256:b498416d87bf6ba928bd7ddb5f1a451daf82300584f3d40b606c3c56f169ba7a"
+        },
+        "dispatch_intent_id": "8f95dd45-9eca-42a8-9909-0ac00be8ad52"
+      },
+      "expected_array": [
+        "delegation-request-v3",
+        "delegate_to_agent",
+        "Implement Task 7 from the reviewed Plan.",
+        "\u0085D:/repo\u0085",
+        "task|7|implementer|codex|none",
+        "",
+        "",
+        "",
+        "codex",
+        "",
+        "8f95dd45-9eca-42a8-9909-0ac00be8ad52",
+        "1",
+        "brainstorm-to-delivery",
+        "2",
+        "sha256:b498416d87bf6ba928bd7ddb5f1a451daf82300584f3d40b606c3c56f169ba7a"
+      ],
+      "expected_digest": "88f61593d1fbb5c0843379c057cd55d0f7b98b319d5830aaedb3f313c414e95e"
+    },
+    {
+      "name": "ticket_v1_intentionally_unbound",
+      "version": 3,
+      "pending_call": {
+        "schema_version": 1,
+        "tool_name": "delegate_to_agent",
+        "task": "Review the design document",
+        "working_dir": null,
+        "work_unit_key": "document|design",
+        "replaces_task_id": null,
+        "replacement_reason": null,
+        "target_task_id": null,
+        "agent_type": "codex",
+        "profile_id": null,
+        "orchestration_binding": null,
+        "dispatch_intent_id": "11111111-1111-4111-8111-111111111111"
+      },
+      "expected_array": [
+        "delegation-request-v3",
+        "delegate_to_agent",
+        "Review the design document",
+        "",
+        "document|design",
+        "",
+        "",
+        "",
+        "codex",
+        "",
+        "11111111-1111-4111-8111-111111111111",
+        "",
+        "",
+        "",
+        ""
+      ],
+      "expected_digest": "9fa256c77513161008deeecbc5be2e0a17664ec1e51b27bd625f811e33e4e223"
+    },
+    {
+      "name": "ticket_v1_replacement_bound",
+      "version": 3,
+      "pending_call": {
+        "schema_version": 1,
+        "tool_name": "delegate_to_agent",
+        "task": "Implement Task 7 from the reviewed Plan.",
+        "working_dir": "D:/repo",
+        "work_unit_key": "task|7|implementer|codex|none",
+        "replaces_task_id": "6b228a7d-4ac9-4bc7-a16e-f4ecf6f0fd45",
+        "replacement_reason": "unresumable",
+        "target_task_id": null,
+        "agent_type": "codex",
+        "profile_id": null,
+        "orchestration_binding": {
+          "schema_version": 1,
+          "namespace": "brainstorm-to-delivery",
+          "generation": 2,
+          "route_fingerprint": "sha256:b498416d87bf6ba928bd7ddb5f1a451daf82300584f3d40b606c3c56f169ba7a"
+        },
+        "dispatch_intent_id": "8f95dd45-9eca-42a8-9909-0ac00be8ad52"
+      },
+      "expected_array": [
+        "delegation-request-v3",
+        "delegate_to_agent",
+        "Implement Task 7 from the reviewed Plan.",
+        "D:/repo",
+        "task|7|implementer|codex|none",
+        "6b228a7d-4ac9-4bc7-a16e-f4ecf6f0fd45",
+        "unresumable",
+        "",
+        "codex",
+        "",
+        "8f95dd45-9eca-42a8-9909-0ac00be8ad52",
+        "1",
+        "brainstorm-to-delivery",
+        "2",
+        "sha256:b498416d87bf6ba928bd7ddb5f1a451daf82300584f3d40b606c3c56f169ba7a"
+      ],
+      "expected_digest": "7ea181567a6e4c218af9d4ca5b8fe216ea73fc857a232afcf2972aba18c1d7a5"
+    },
+    {
+      "name": "ticket_v1_dispatch_intent_changed",
+      "version": 3,
+      "pending_call": {
+        "schema_version": 1,
+        "tool_name": "delegate_to_agent",
+        "task": "Implement Task 7 from the reviewed Plan.",
+        "working_dir": "D:/repo",
+        "work_unit_key": "task|7|implementer|codex|none",
+        "replaces_task_id": null,
+        "replacement_reason": null,
+        "target_task_id": null,
+        "agent_type": "codex",
+        "profile_id": null,
+        "orchestration_binding": {
+          "schema_version": 1,
+          "namespace": "brainstorm-to-delivery",
+          "generation": 2,
+          "route_fingerprint": "sha256:b498416d87bf6ba928bd7ddb5f1a451daf82300584f3d40b606c3c56f169ba7a"
+        },
+        "dispatch_intent_id": "11111111-1111-4111-8111-111111111111"
+      },
+      "expected_array": [
+        "delegation-request-v3",
+        "delegate_to_agent",
+        "Implement Task 7 from the reviewed Plan.",
+        "D:/repo",
+        "task|7|implementer|codex|none",
+        "",
+        "",
+        "",
+        "codex",
+        "",
+        "11111111-1111-4111-8111-111111111111",
+        "1",
+        "brainstorm-to-delivery",
+        "2",
+        "sha256:b498416d87bf6ba928bd7ddb5f1a451daf82300584f3d40b606c3c56f169ba7a"
+      ],
+      "expected_digest": "146fef6268886d552c24aa7ea991940adec5d37940807070023c6b1082ee82b2"
+    },
+    {
+      "name": "ticket_v1_task_changed",
+      "version": 3,
+      "pending_call": {
+        "schema_version": 1,
+        "tool_name": "delegate_to_agent",
+        "task": "Implement revised Task 7.",
+        "working_dir": "D:/repo",
+        "work_unit_key": "task|7|implementer|codex|none",
+        "replaces_task_id": null,
+        "replacement_reason": null,
+        "target_task_id": null,
+        "agent_type": "codex",
+        "profile_id": null,
+        "orchestration_binding": {
+          "schema_version": 1,
+          "namespace": "brainstorm-to-delivery",
+          "generation": 2,
+          "route_fingerprint": "sha256:b498416d87bf6ba928bd7ddb5f1a451daf82300584f3d40b606c3c56f169ba7a"
+        },
+        "dispatch_intent_id": "8f95dd45-9eca-42a8-9909-0ac00be8ad52"
+      },
+      "expected_array": [
+        "delegation-request-v3",
+        "delegate_to_agent",
+        "Implement revised Task 7.",
+        "D:/repo",
+        "task|7|implementer|codex|none",
+        "",
+        "",
+        "",
+        "codex",
+        "",
+        "8f95dd45-9eca-42a8-9909-0ac00be8ad52",
+        "1",
+        "brainstorm-to-delivery",
+        "2",
+        "sha256:b498416d87bf6ba928bd7ddb5f1a451daf82300584f3d40b606c3c56f169ba7a"
+      ],
+      "expected_digest": "6b01b052ab0c35129ed7ce1a9049656ea7d007876b6e43fffb6d7f2ad2138063"
+    },
+    {
+      "name": "ticket_v1_agent_changed",
+      "version": 3,
+      "pending_call": {
+        "schema_version": 1,
+        "tool_name": "delegate_to_agent",
+        "task": "Implement Task 7 from the reviewed Plan.",
+        "working_dir": "D:/repo",
+        "work_unit_key": "task|7|implementer|codex|none",
+        "replaces_task_id": null,
+        "replacement_reason": null,
+        "target_task_id": null,
+        "agent_type": "grok",
+        "profile_id": null,
+        "orchestration_binding": {
+          "schema_version": 1,
+          "namespace": "brainstorm-to-delivery",
+          "generation": 2,
+          "route_fingerprint": "sha256:b498416d87bf6ba928bd7ddb5f1a451daf82300584f3d40b606c3c56f169ba7a"
+        },
+        "dispatch_intent_id": "8f95dd45-9eca-42a8-9909-0ac00be8ad52"
+      },
+      "expected_array": [
+        "delegation-request-v3",
+        "delegate_to_agent",
+        "Implement Task 7 from the reviewed Plan.",
+        "D:/repo",
+        "task|7|implementer|codex|none",
+        "",
+        "",
+        "",
+        "grok",
+        "",
+        "8f95dd45-9eca-42a8-9909-0ac00be8ad52",
+        "1",
+        "brainstorm-to-delivery",
+        "2",
+        "sha256:b498416d87bf6ba928bd7ddb5f1a451daf82300584f3d40b606c3c56f169ba7a"
+      ],
+      "expected_digest": "d41e4d23300b183549ba0cdb88181fd1cded982f82bb32b5ee7933bebd95c49a"
+    },
+    {
+      "name": "ticket_v1_profile_changed",
+      "version": 3,
+      "pending_call": {
+        "schema_version": 1,
+        "tool_name": "delegate_to_agent",
+        "task": "Implement Task 7 from the reviewed Plan.",
+        "working_dir": "D:/repo",
+        "work_unit_key": "task|7|implementer|codex|none",
+        "replaces_task_id": null,
+        "replacement_reason": null,
+        "target_task_id": null,
+        "agent_type": "codex",
+        "profile_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        "orchestration_binding": {
+          "schema_version": 1,
+          "namespace": "brainstorm-to-delivery",
+          "generation": 2,
+          "route_fingerprint": "sha256:b498416d87bf6ba928bd7ddb5f1a451daf82300584f3d40b606c3c56f169ba7a"
+        },
+        "dispatch_intent_id": "8f95dd45-9eca-42a8-9909-0ac00be8ad52"
+      },
+      "expected_array": [
+        "delegation-request-v3",
+        "delegate_to_agent",
+        "Implement Task 7 from the reviewed Plan.",
+        "D:/repo",
+        "task|7|implementer|codex|none",
+        "",
+        "",
+        "",
+        "codex",
+        "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        "8f95dd45-9eca-42a8-9909-0ac00be8ad52",
+        "1",
+        "brainstorm-to-delivery",
+        "2",
+        "sha256:b498416d87bf6ba928bd7ddb5f1a451daf82300584f3d40b606c3c56f169ba7a"
+      ],
+      "expected_digest": "1ec8f6aaf43524505444cf64c4d8f36b6384f8ffce25ef5d4c50cdc3e109adcb"
+    },
+    {
+      "name": "ticket_v1_continue_target_changed",
+      "version": 3,
+      "pending_call": {
+        "schema_version": 1,
+        "tool_name": "continue_delegation",
+        "task": "Continue the approved implementation",
+        "working_dir": null,
+        "work_unit_key": "task|7|implementer|codex|none",
+        "replaces_task_id": null,
+        "replacement_reason": null,
+        "target_task_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        "agent_type": "codex",
+        "profile_id": null,
+        "orchestration_binding": {
+          "schema_version": 1,
+          "namespace": "brainstorm-to-delivery",
+          "generation": 2,
+          "route_fingerprint": "sha256:b498416d87bf6ba928bd7ddb5f1a451daf82300584f3d40b606c3c56f169ba7a"
+        },
+        "dispatch_intent_id": "8f95dd45-9eca-42a8-9909-0ac00be8ad52"
+      },
+      "expected_array": [
+        "delegation-request-v3",
+        "continue_delegation",
+        "Continue the approved implementation",
+        "",
+        "task|7|implementer|codex|none",
+        "",
+        "",
+        "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        "codex",
+        "",
+        "8f95dd45-9eca-42a8-9909-0ac00be8ad52",
+        "1",
+        "brainstorm-to-delivery",
+        "2",
+        "sha256:b498416d87bf6ba928bd7ddb5f1a451daf82300584f3d40b606c3c56f169ba7a"
+      ],
+      "expected_digest": "7cbfd34d1d30447c4d0970d669784341e3cfa4bb454becc295d8c06c9373033d"
+    },
+    {
+      "name": "ticket_v1_replacement_reason_changed",
+      "version": 3,
+      "pending_call": {
+        "schema_version": 1,
+        "tool_name": "delegate_to_agent",
+        "task": "Implement Task 7 from the reviewed Plan.",
+        "working_dir": "D:/repo",
+        "work_unit_key": "task|7|implementer|codex|none",
+        "replaces_task_id": "6b228a7d-4ac9-4bc7-a16e-f4ecf6f0fd45",
+        "replacement_reason": "admission_unknown",
+        "target_task_id": null,
+        "agent_type": "codex",
+        "profile_id": null,
+        "orchestration_binding": {
+          "schema_version": 1,
+          "namespace": "brainstorm-to-delivery",
+          "generation": 2,
+          "route_fingerprint": "sha256:b498416d87bf6ba928bd7ddb5f1a451daf82300584f3d40b606c3c56f169ba7a"
+        },
+        "dispatch_intent_id": "8f95dd45-9eca-42a8-9909-0ac00be8ad52"
+      },
+      "expected_array": [
+        "delegation-request-v3",
+        "delegate_to_agent",
+        "Implement Task 7 from the reviewed Plan.",
+        "D:/repo",
+        "task|7|implementer|codex|none",
+        "6b228a7d-4ac9-4bc7-a16e-f4ecf6f0fd45",
+        "admission_unknown",
+        "",
+        "codex",
+        "",
+        "8f95dd45-9eca-42a8-9909-0ac00be8ad52",
+        "1",
+        "brainstorm-to-delivery",
+        "2",
+        "sha256:b498416d87bf6ba928bd7ddb5f1a451daf82300584f3d40b606c3c56f169ba7a"
+      ],
+      "expected_digest": "5505cba28f0c407cd6c4135c3b2efc79bea35a56c1df15044dab604581eeb91c"
+    },
+    {
+      "name": "ticket_v1_binding_changed",
+      "version": 3,
+      "pending_call": {
+        "schema_version": 1,
+        "tool_name": "delegate_to_agent",
+        "task": "Implement Task 7 from the reviewed Plan.",
+        "working_dir": "D:/repo",
+        "work_unit_key": "task|7|implementer|codex|none",
+        "replaces_task_id": null,
+        "replacement_reason": null,
+        "target_task_id": null,
+        "agent_type": "codex",
+        "profile_id": null,
+        "orchestration_binding": {
+          "schema_version": 1,
+          "namespace": "brainstorm-to-delivery",
+          "generation": 2,
+          "route_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+        },
+        "dispatch_intent_id": "8f95dd45-9eca-42a8-9909-0ac00be8ad52"
+      },
+      "expected_array": [
+        "delegation-request-v3",
+        "delegate_to_agent",
+        "Implement Task 7 from the reviewed Plan.",
+        "D:/repo",
+        "task|7|implementer|codex|none",
+        "",
+        "",
+        "",
+        "codex",
+        "",
+        "8f95dd45-9eca-42a8-9909-0ac00be8ad52",
+        "1",
+        "brainstorm-to-delivery",
+        "2",
+        "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      ],
+      "expected_digest": "2c9ca12ed7660eeb5f76b1196d8937dd9d7b3771c01d775d026afa33494950d6"
+    }
+  ]
+}

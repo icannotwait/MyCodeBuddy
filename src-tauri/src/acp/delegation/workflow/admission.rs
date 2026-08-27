@@ -3861,6 +3861,7 @@ mod tests {
     ) -> ReservingRunInsert {
         let workspace = AdmissionGitFixture::new().dir.keep();
         ReservingRunInsert {
+            dispatch_intent_id: None,
             orchestration_binding: None,
             task_id: task_id.into(),
             root_task_id: task_id.into(),
