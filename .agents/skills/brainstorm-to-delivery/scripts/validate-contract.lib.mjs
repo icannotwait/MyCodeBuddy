@@ -5744,7 +5744,20 @@ export function validateSkillMarkdown(skillMarkdown) {
     /stale, consumed, or authorization failure discards the artifact and ticket and requires a fresh artifact, validation, and ticket/i,
     /never expose artifact paths or admission tickets in cards or prose/i,
   ]
-  if (!ticketV1Directives.every((directive) => directive.test(compactProse))) {
+  const ticketV1DirectivePositions = ticketV1Directives.map((directive) =>
+    compactProse.search(directive)
+  )
+  const ticketV1DirectivesOrdered = ticketV1DirectivePositions.every(
+    (position, index) =>
+      position >= 0 &&
+      (index === 0 || position > ticketV1DirectivePositions[index - 1])
+  )
+  const ticketV1CompleteSnapshot =
+    /when ticket-v1 is advertised, the complete-snapshot procedure follows section 5's write-ahead uuid and bounded fingerprint steps through the exact `admission_intent` artifact request/i
+  if (
+    !ticketV1DirectivesOrdered ||
+    !ticketV1CompleteSnapshot.test(compactProse)
+  ) {
     fail(
       failures,
       "B2D-SKILL-007",
@@ -6233,6 +6246,7 @@ export function deriveTicketV1RequestFingerprint(pendingCall) {
       agent_type: pendingCall.agent_type,
       profile_id: pendingCall.profile_id,
     }) ||
+    typeof pendingCall.dispatch_intent_id !== "string" ||
     !UUID_RE.test(pendingCall.dispatch_intent_id)
   ) {
     throw new TypeError("pending call identity is invalid")
@@ -6737,7 +6751,10 @@ function validateDispatchIntent(intent, label, failures) {
     )
     return
   }
-  if (ticketV1Shape && !UUID_RE.test(intent.intent_id)) {
+  if (
+    ticketV1Shape &&
+    (typeof intent.intent_id !== "string" || !UUID_RE.test(intent.intent_id))
+  ) {
     fail(
       failures,
       "B2D-PROGRESS-006",

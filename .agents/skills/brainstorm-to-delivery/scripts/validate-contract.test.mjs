@@ -152,6 +152,21 @@ describe("ticket-v1 request fingerprint", () => {
         }),
       /pending call/i
     )
+    for (const dispatch_intent_id of [
+      [TICKET_V1_PENDING_CALL.dispatch_intent_id],
+      {},
+      7,
+      true,
+    ]) {
+      assert.throws(
+        () =>
+          contractLib.deriveTicketV1RequestFingerprint({
+            ...TICKET_V1_PENDING_CALL,
+            dispatch_intent_id,
+          }),
+        /pending call identity/i
+      )
+    }
 
     const first = {
       ...TICKET_V1_PENDING_CALL,
@@ -393,7 +408,10 @@ ${block("codeg-b2d-skill-contract-v2", SKILL_CONTRACT)}
 
 ## 1. Establish current truth
 Inspect current files and live delegation schemas. Preserve user decisions.
-For every complete snapshot, inspect the live binding-query schema. When it
+For every complete snapshot, inspect the live binding-query schema. When
+ticket-v1 is advertised, the complete-snapshot procedure follows section 5's
+write-ahead UUID and bounded fingerprint steps through the exact
+\`admission_intent\` artifact request. For legacy artifact mode, when it
 advertises artifact delivery, request \`delivery: "artifact"\` once. Pass
 \`artifact_path\` directly to \`--durable-evidence\` and \`artifact_sha256\`
 directly to \`--durable-evidence-sha256\`. Never open, read, print, copy,
@@ -7421,6 +7439,10 @@ describe("dispatch intent ticket-v1 shape", () => {
       firstIntent({ intent_id: null }),
       firstIntent({ intent_id: intentId.toUpperCase() }),
       firstIntent({ intent_id: "not-a-uuid" }),
+      firstIntent({ intent_id: [intentId] }),
+      firstIntent({ intent_id: {} }),
+      firstIntent({ intent_id: 7 }),
+      firstIntent({ intent_id: true }),
       firstIntent({ intent_id: intentId, extra: true }),
       partial,
       firstIntent({ dispatch_intent_id: intentId }),
@@ -7981,6 +8003,10 @@ describe("ticket-v1 Skill contract", () => {
         "Never expose artifact paths or admission tickets in cards or prose",
         "Include artifact paths and admission tickets in recovery prose",
       ],
+      [
+        "When ticket-v1 is advertised, the complete-snapshot procedure follows section 5's write-ahead UUID and bounded fingerprint steps through the exact `admission_intent` artifact request",
+        "Ticket-v1 complete snapshots request an artifact directly",
+      ],
     ]
     for (const [required, replacement] of mutations) {
       const pattern = new RegExp(
@@ -7995,6 +8021,25 @@ describe("ticket-v1 Skill contract", () => {
         "B2D-SKILL-007"
       )
     }
+  })
+
+  it("rejects physical-call instructions reordered before write-ahead", () => {
+    const writeAhead =
+      "write a canonical lowercase UUID `intent_id` to progress before constructing the pending call"
+    const physicalCall =
+      "same intent ID, returned admission ticket, same pending-call values, and a fresh physical correlation ID"
+    const pattern = (value) =>
+      new RegExp(
+        value
+          .split(" ")
+          .map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+          .join("\\s+")
+      )
+    const reordered = skill
+      .replace(pattern(writeAhead), "__WRITE_AHEAD__")
+      .replace(pattern(physicalCall), writeAhead)
+      .replace("__WRITE_AHEAD__", physicalCall)
+    hasRule(validateSkillMarkdown(reordered).failures, "B2D-SKILL-007")
   })
 })
 

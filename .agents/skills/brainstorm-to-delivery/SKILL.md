@@ -120,7 +120,7 @@ delegate_to_agent, continue_delegation, get_delegation_status, and request_recov
 For every complete snapshot, run this procedure before the applicable admission mode:
 
 1. Inspect the live binding-query schema.
-2. When it advertises artifact delivery, request `delivery: "artifact"` once. Pass `artifact_path` directly to `--durable-evidence` and `artifact_sha256` directly to `--durable-evidence-sha256` in the validator invocation.
+2. When ticket-v1 is advertised, the complete-snapshot procedure follows section 5's write-ahead UUID and bounded fingerprint steps through the exact `admission_intent` artifact request. For legacy artifact mode, when it advertises artifact delivery, request `delivery: "artifact"` once. Pass `artifact_path` directly to `--durable-evidence` and `artifact_sha256` directly to `--durable-evidence-sha256` in the validator invocation.
 3. Never open, read, print, copy, summarize, embed, or delegate inspection of the artifact. Delete the exact artifact after the validator exits.
 4. Treat artifact request, descriptor, digest, stale, validator, and cleanup errors as blocking and never fall back to pages.
 5. Use legacy page pagination only when the live schema does not advertise artifact delivery. In legacy mode, collect one complete parent-scoped snapshot in an OS-temporary evidence file, restart stale, mixed, truncated, or oversized pagination from page one, invoke the validator without a digest, and remove the file.
@@ -315,7 +315,7 @@ and digest. Request the artifact with the exact `admission_intent`, then validat
 its returned path and digest through the validator.
 
 On `prepared`, call delegate or continue with the same intent ID, returned admission ticket, same pending-call values, and a fresh physical correlation ID;
-delegate uses the non-empty normalized cwd and continue has no cwd. On unknown
+delegate uses the non-empty normalized cwd and continue has no cwd. On acknowledgement, fill returned durable identity without deleting intent history. On unknown
 acknowledgement retain the intent, pending call, and digest. Process
 `already_admitted` only through the validator's one adoption action. Stale,
 consumed, or authorization failure discards the artifact and ticket and requires
