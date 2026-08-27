@@ -7602,8 +7602,18 @@ describe("artifact-first Skill contract", () => {
     assert.deepEqual(validateSkillMarkdown(skill).failures, [])
     const mutations = [
       [
+        "Inspect the live binding-query schema.",
+        "Inspect the cached binding-query schema.",
+        realSkill,
+      ],
+      [
         'request `delivery: "artifact"` once',
         'request `delivery: "page"` once',
+      ],
+      [
+        "`artifact_path` directly to `--durable-evidence`",
+        "`artifact_path` indirectly to `--durable-evidence`",
+        realSkill,
       ],
       [
         "`artifact_sha256`\ndirectly to `--durable-evidence-sha256`",
@@ -7619,10 +7629,10 @@ describe("artifact-first Skill contract", () => {
         "Use legacy page pagination after artifact errors",
       ],
     ]
-    for (const [required, replacement] of mutations) {
-      assert.ok(skill.includes(required), required)
+    for (const [required, replacement, source = skill] of mutations) {
+      assert.ok(source.includes(required), required)
       hasRule(
-        validateSkillMarkdown(skill.replace(required, replacement)).failures,
+        validateSkillMarkdown(source.replace(required, replacement)).failures,
         "B2D-SKILL-006"
       )
     }
