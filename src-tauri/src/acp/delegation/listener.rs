@@ -11202,18 +11202,24 @@ mod tests {
         let mut v1 = manifest;
         v1["schema_version"] = json!(1);
         v1["publication_token"] = json!("listener-v1-rejected");
-        let v1_result = call_companion_workflow(
-            &companion,
-            Arc::clone(&inflight),
-            2,
-            "publish_workflow_manifest",
-            v1,
-        )
-        .await;
-        assert_eq!(
-            v1_result["structuredContent"]["error"]["code"],
-            "workflow_v2_retired"
-        );
+        let v1_line = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "publish_workflow_manifest",
+                "arguments": v1
+            }
+        })
+        .to_string();
+        let LineAction::Respond(v1_result) =
+            dispatch_line(&companion, Arc::clone(&inflight), &v1_line).await
+        else {
+            panic!("v1 schema_version must fail before transport")
+        };
+        let v1_error = v1_result.error.expect("v1 schema error");
+        assert_eq!(v1_error.code, -32602);
+        assert!(v1_error.message.contains("schema_version"));
 
         let reduced = call_companion_workflow(
             &companion,

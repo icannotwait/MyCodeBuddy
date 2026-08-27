@@ -59,6 +59,43 @@ impl MigrationTrait for Migration {
     }
 }
 
+/// Historical completion-protocol tests freeze the schema before v2-only
+/// while still writing through the current SeaORM entity. Install this later
+/// independent column out of order and record it so the normal migrator does
+/// not apply it twice when those fixtures advance.
+#[cfg(test)]
+pub(crate) async fn install_for_historical_completion_fixture(
+    db: &crate::db::AppDatabase,
+) -> Result<(), DbErr> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use sea_orm::{ConnectionTrait, DbBackend, Statement};
+
+    let manager = SchemaManager::new(&db.conn);
+    if !manager
+        .has_column("delegation_task_runs", "dispatch_intent_id")
+        .await?
+    {
+        Migration.up(&manager).await?;
+    }
+
+    let applied_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time after Unix epoch")
+        .as_secs() as i64;
+    db.conn
+        .execute(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT OR IGNORE INTO seaql_migrations (version, applied_at) VALUES (?, ?)",
+            vec![
+                "m20260827_000001_delegation_dispatch_intent".into(),
+                applied_at.into(),
+            ],
+        ))
+        .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use sea_orm::{ConnectionTrait, Database, DbBackend, Statement};
