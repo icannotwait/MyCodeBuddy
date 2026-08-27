@@ -1044,6 +1044,8 @@ fn continue_request(
         work_unit_key: Some("legacy-unit".into()),
         external_handle: None,
         correlation_id: Some("legacy-continue-correlation".into()),
+        dispatch_intent_id: None,
+        admission_ticket: None,
         recovery_authorization_id: authorization_id,
         orchestration_binding: None,
     }

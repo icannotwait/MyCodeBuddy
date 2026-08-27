@@ -37,6 +37,13 @@
     "description": "ASYNCHRONOUS: returns task_id. Cold child cannot see this conversation; task must include all context. Fan out, then Join. For each distinct agent/profile mention, call once; pass profile_id for a profile.",
     "inputSchema": {
       "type": "object",
+      "additionalProperties": false,
+      "$defs": {
+        "u": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        }
+      },
       "required": [
         "agent_type",
         "task",
@@ -63,6 +70,12 @@
         "profile_label": {},
         "task": {},
         "correlation_id": {},
+        "dispatch_intent_id": {
+          "$ref": "#/$defs/u"
+        },
+        "admission_ticket": {
+          "$ref": "#/$defs/u"
+        },
         "recovery_authorization_id": {
           "minLength": 1
         },
@@ -82,6 +95,14 @@
           ],
           "description": ""
         }
+      },
+      "dependentRequired": {
+        "dispatch_intent_id": [
+          "admission_ticket"
+        ],
+        "admission_ticket": [
+          "dispatch_intent_id"
+        ]
       }
     }
   },
@@ -103,6 +124,107 @@
     "inputSchema": {
       "type": "object",
       "additionalProperties": false,
+      "$defs": {
+        "b": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "schema_version",
+            "namespace",
+            "generation",
+            "route_fingerprint"
+          ],
+          "properties": {
+            "schema_version": {
+              "const": 1
+            },
+            "namespace": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9-]{0,63}$"
+            },
+            "generation": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "route_fingerprint": {
+              "type": "string",
+              "pattern": "^sha256:[0-9a-f]{64}$"
+            }
+          }
+        },
+        "i": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "schema_version",
+            "dispatch_intent_id",
+            "request_fingerprint",
+            "kind",
+            "work_unit_key",
+            "agent_type",
+            "profile_id",
+            "target_task_id",
+            "replacement_reason",
+            "orchestration_binding"
+          ],
+          "properties": {
+            "schema_version": {
+              "const": 1
+            },
+            "dispatch_intent_id": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+            },
+            "request_fingerprint": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "kind": {
+              "enum": [
+                "first",
+                "continue",
+                "replacement"
+              ]
+            },
+            "work_unit_key": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200
+            },
+            "agent_type": {
+              "type": "string"
+            },
+            "profile_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "target_task_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "replacement_reason": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "orchestration_binding": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/b"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          }
+        }
+      },
       "required": [
         "namespace"
       ],
@@ -124,6 +246,9 @@
         "cursor": {
           "maxLength": 128,
           "pattern": "^[A-Za-z0-9_-]+$"
+        },
+        "admission_intent": {
+          "$ref": "#/$defs/i"
         }
       },
       "dependentRequired": {
@@ -140,6 +265,13 @@
     "name": "continue_delegation",
     "inputSchema": {
       "type": "object",
+      "additionalProperties": false,
+      "$defs": {
+        "u": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        }
+      },
       "required": [
         "task_id",
         "task",
@@ -149,6 +281,12 @@
         "task_id": {},
         "task": {},
         "correlation_id": {},
+        "dispatch_intent_id": {
+          "$ref": "#/$defs/u"
+        },
+        "admission_ticket": {
+          "$ref": "#/$defs/u"
+        },
         "recovery_authorization_id": {
           "minLength": 1
         },
@@ -156,6 +294,14 @@
         "work_unit_key": {
           "maxLength": 200
         }
+      },
+      "dependentRequired": {
+        "dispatch_intent_id": [
+          "admission_ticket"
+        ],
+        "admission_ticket": [
+          "dispatch_intent_id"
+        ]
       }
     }
   },

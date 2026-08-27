@@ -999,7 +999,17 @@ mod tests {
             conn.connect().await.unwrap();
             let msg: BrokerMessage = read_frame(&mut conn).await.unwrap();
             match msg {
-                BrokerMessage::Call(req) => assert_eq!(req.token, "tok"),
+                BrokerMessage::Call(req) => {
+                    assert_eq!(req.token, "tok");
+                    assert_eq!(
+                        req.input["dispatch_intent_id"],
+                        "8f95dd45-9eca-42a8-9909-0ac00be8ad52"
+                    );
+                    assert_eq!(
+                        req.input["admission_ticket"],
+                        "4a67bba4-e1f5-46d1-a9b1-aa796598ffce"
+                    );
+                }
                 other => panic!("expected Call, got {other:?}"),
             }
             let resp = BrokerResponse {
@@ -1015,7 +1025,12 @@ mod tests {
             parent_connection_id: "p1".into(),
             parent_tool_use_id: "pt1".into(),
             external_handle: None,
-            input: json!({"agent_type": "codex", "task": "do x"}),
+            input: json!({
+                "agent_type": "codex",
+                "task": "do x",
+                "dispatch_intent_id": "8f95dd45-9eca-42a8-9909-0ac00be8ad52",
+                "admission_ticket": "4a67bba4-e1f5-46d1-a9b1-aa796598ffce"
+            }),
         };
         let resp = client_round_trip(&pipe_name, &req).await.unwrap();
         assert_eq!(resp.outcome["kind"], "ok");

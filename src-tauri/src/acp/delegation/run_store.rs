@@ -15747,6 +15747,8 @@ mod termination_audit {
                 work_unit_key: Some(format!("unit-{suffix}")),
                 external_handle: None,
                 correlation_id: Some(format!("recovery-correlation-{suffix}")),
+                dispatch_intent_id: None,
+                admission_ticket: None,
                 recovery_authorization_id: authorization_id,
                 orchestration_binding: None,
             }

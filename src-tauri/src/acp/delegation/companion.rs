@@ -68,8 +68,9 @@ use crate::acp::delegation::transport::{
     CancelDelegationReason, CompanionRole,
 };
 use crate::acp::delegation::types::{
-    validate_correlation_id, AdmissionIntentV1, AdmissionPreparation, BindingEvidenceV1,
-    DelegationOrchestrationBindingPage, DelegationReturnWhen,
+    parse_admission_ticket_v1_request, validate_correlation_id, AdmissionIntentV1,
+    AdmissionPreparation, BindingEvidenceV1, DelegationOrchestrationBindingPage,
+    DelegationReturnWhen,
     OrchestrationBindingArtifactDescriptor, OrchestrationBindingDelivery,
     OrchestrationBindingFirstPageEnvelope, OrchestrationBindingQueryError,
     OrchestrationBindingQueryRequest, OrchestrationBindingToolRequest,
@@ -1899,6 +1900,43 @@ async fn build_tools_call_spawn(
     }
     match name.as_str() {
         "delegate_to_agent" | "continue_delegation" => {
+            let allowed = if name == "delegate_to_agent" {
+                &[
+                    "agent_type",
+                    "profile_id",
+                    "profile_label",
+                    "task",
+                    "correlation_id",
+                    "dispatch_intent_id",
+                    "admission_ticket",
+                    "recovery_authorization_id",
+                    "orchestration_binding",
+                    "working_dir",
+                    "work_unit_key",
+                    "replaces_task_id",
+                    "replacement_reason",
+                ][..]
+            } else {
+                &[
+                    "task_id",
+                    "task",
+                    "correlation_id",
+                    "dispatch_intent_id",
+                    "admission_ticket",
+                    "recovery_authorization_id",
+                    "orchestration_binding",
+                    "work_unit_key",
+                ][..]
+            };
+            if let Err(message) = reject_unknown_arguments(&arguments, &name, allowed)
+                .and_then(|_| {
+                    parse_admission_ticket_v1_request(&arguments)
+                        .map(|_| ())
+                        .map_err(str::to_owned)
+                })
+            {
+                return LineAction::Respond(err(id, -32602, message));
+            }
             // MCP clients (Codex / Claude Code) generally do NOT populate
             // `_meta.tool_use_id` when calling an MCP server. We still surface it
             // when present (the most precise binding). For `continue_delegation`,
@@ -6634,6 +6672,23 @@ mod tests {
                 {
                     return false;
                 }
+                if schema
+                    .get("dependentRequired")
+                    .and_then(Value::as_object)
+                    .is_some_and(|dependencies| {
+                        dependencies.iter().any(|(key, required)| {
+                            object.contains_key(key)
+                                && required.as_array().is_some_and(|required| {
+                                    required
+                                        .iter()
+                                        .filter_map(Value::as_str)
+                                        .any(|required| !object.contains_key(required))
+                                })
+                        })
+                    })
+                {
+                    return false;
+                }
                 object.iter().all(|(key, value)| {
                     properties
                         .get(key)
@@ -6746,6 +6801,209 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn ticket_v1_request_contract_catalog_publishes_strict_paired_uuids() {
+        let catalog: Value = serde_json::from_str(TOOL_SCHEMA_JSON).unwrap();
+        for tool_name in ["delegate_to_agent", "continue_delegation"] {
+            let schema = &catalog
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool["name"] == tool_name)
+                .unwrap()["inputSchema"];
+            assert_eq!(schema["additionalProperties"], false);
+            assert!(schema["properties"].get("working_dir").is_some() == (tool_name == "delegate_to_agent"));
+            assert_eq!(schema["properties"]["dispatch_intent_id"]["$ref"], "#/$defs/u");
+            assert_eq!(schema["properties"]["admission_ticket"]["$ref"], "#/$defs/u");
+            assert_eq!(schema["$defs"].as_object().unwrap().len(), 1);
+            assert_eq!(
+                schema["dependentRequired"],
+                json!({
+                    "dispatch_intent_id": ["admission_ticket"],
+                    "admission_ticket": ["dispatch_intent_id"]
+                })
+            );
+
+            let base = if tool_name == "delegate_to_agent" {
+                json!({
+                    "agent_type": "grok",
+                    "task": "implement",
+                    "correlation_id": "physical-call"
+                })
+            } else {
+                json!({
+                    "task_id": "source-task",
+                    "task": "continue",
+                    "correlation_id": "physical-call"
+                })
+            };
+            assert!(schema_accepts(schema, schema, &base));
+            let paired = with_argument(
+                with_argument(
+                    base.clone(),
+                    "dispatch_intent_id",
+                    json!("8f95dd45-9eca-42a8-9909-0ac00be8ad52"),
+                ),
+                "admission_ticket",
+                json!("4a67bba4-e1f5-46d1-a9b1-aa796598ffce"),
+            );
+            assert!(schema_accepts(schema, schema, &paired));
+            for invalid in [
+                with_argument(
+                    base.clone(),
+                    "dispatch_intent_id",
+                    json!("8f95dd45-9eca-42a8-9909-0ac00be8ad52"),
+                ),
+                with_argument(
+                    base.clone(),
+                    "admission_ticket",
+                    json!("4a67bba4-e1f5-46d1-a9b1-aa796598ffce"),
+                ),
+                with_argument(base.clone(), "dispatch_intent_id", Value::Null),
+                with_argument(base.clone(), "dispatch_intent_id", json!(7)),
+                with_argument(
+                    with_argument(
+                        base.clone(),
+                        "dispatch_intent_id",
+                        json!("8F95DD45-9ECA-42A8-9909-0AC00BE8AD52"),
+                    ),
+                    "admission_ticket",
+                    json!("4a67bba4-e1f5-46d1-a9b1-aa796598ffce"),
+                ),
+                with_argument(base, "unknown", json!(true)),
+            ] {
+                assert!(!schema_accepts(schema, schema, &invalid));
+            }
+        }
+    }
+
+    #[test]
+    fn ticket_v1_request_contract_binding_tool_publishes_one_strict_intent_and_binding() {
+        let catalog: Value = serde_json::from_str(TOOL_SCHEMA_JSON).unwrap();
+        let schema = &catalog
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "get_delegation_orchestration_bindings")
+            .unwrap()["inputSchema"];
+        assert_eq!(schema["properties"]["admission_intent"]["$ref"], "#/$defs/i");
+        assert_eq!(schema["$defs"].as_object().unwrap().len(), 2);
+        assert_eq!(schema["$defs"]["i"]["additionalProperties"], false);
+        assert_eq!(
+            schema["$defs"]["i"]["required"],
+            json!([
+                "schema_version",
+                "dispatch_intent_id",
+                "request_fingerprint",
+                "kind",
+                "work_unit_key",
+                "agent_type",
+                "profile_id",
+                "target_task_id",
+                "replacement_reason",
+                "orchestration_binding"
+            ])
+        );
+        assert_eq!(schema["$defs"]["b"]["additionalProperties"], false);
+        assert_eq!(
+            schema["$defs"]["b"]["required"],
+            json!(["schema_version", "namespace", "generation", "route_fingerprint"])
+        );
+        assert_eq!(
+            schema["$defs"]["i"]["properties"]["orchestration_binding"]["anyOf"][0]
+                ["$ref"],
+            "#/$defs/b"
+        );
+    }
+
+    #[tokio::test]
+    async fn ticket_v1_request_contract_runtime_rejects_malformed_pairs_and_unknown_fields() {
+        let delegate = json!({
+            "agent_type": "grok",
+            "task": "implement",
+            "correlation_id": "physical-call"
+        });
+        for arguments in [
+            with_argument(
+                delegate.clone(),
+                "dispatch_intent_id",
+                json!("8f95dd45-9eca-42a8-9909-0ac00be8ad52"),
+            ),
+            with_argument(delegate.clone(), "admission_ticket", Value::Null),
+            with_argument(delegate.clone(), "admission_ticket", json!(7)),
+            with_argument(
+                with_argument(
+                    delegate.clone(),
+                    "dispatch_intent_id",
+                    json!("8F95DD45-9ECA-42A8-9909-0AC00BE8AD52"),
+                ),
+                "admission_ticket",
+                json!("4a67bba4-e1f5-46d1-a9b1-aa796598ffce"),
+            ),
+            with_argument(delegate, "unknown", json!(true)),
+        ] {
+            let response = unwrap_respond(
+                dispatch_with_features(
+                    GROK_FEATURES,
+                    &call(90, "delegate_to_agent", arguments),
+                )
+                .await,
+            );
+            assert_eq!(response.error.expect("invalid arguments").code, -32602);
+        }
+    }
+
+    #[tokio::test]
+    async fn ticket_v1_request_contract_admission_intent_is_artifact_only_at_runtime() {
+        let intent = json!({
+            "schema_version": 1,
+            "dispatch_intent_id": "8f95dd45-9eca-42a8-9909-0ac00be8ad52",
+            "request_fingerprint": "2a44be9d1662a314cbbd2c8111bcf83159be7bdc93abadff977d01447f986648",
+            "kind": "first",
+            "work_unit_key": "task|7|implementer|codex|none",
+            "agent_type": "codex",
+            "profile_id": null,
+            "target_task_id": null,
+            "replacement_reason": null,
+            "orchestration_binding": null
+        });
+        let page = unwrap_respond(
+            dispatch_with_features(
+                GROK_FEATURES,
+                &call(
+                    91,
+                    "get_delegation_orchestration_bindings",
+                    json!({
+                        "namespace": "brainstorm-to-delivery",
+                        "delivery": "page",
+                        "admission_intent": intent.clone()
+                    }),
+                ),
+            )
+            .await,
+        );
+        assert_eq!(
+            page.result.unwrap()["structuredContent"]["error"]["code"],
+            "orchestration_binding_query_invalid"
+        );
+        assert!(matches!(
+            dispatch_with_features(
+                GROK_FEATURES,
+                &call(
+                    92,
+                    "get_delegation_orchestration_bindings",
+                    json!({
+                        "namespace": "brainstorm-to-delivery",
+                        "delivery": "artifact",
+                        "admission_intent": intent
+                    }),
+                ),
+            )
+            .await,
+            LineAction::Spawn(_)
+        ));
     }
 
     fn assert_no_generic_coordination_side_channel_tools(names: &[String]) {
@@ -8489,6 +8747,56 @@ mod tests {
             .get("ticket")
             .is_none());
         assert!(result["structuredContent"].get("runs").is_none());
+    }
+
+    #[test]
+    fn ticket_v1_catalog_full_artifact_result_stays_within_fixed_budget_without_rows() {
+        let descriptor = OrchestrationBindingArtifactDescriptor {
+            schema_version: 1,
+            delivery: "artifact".into(),
+            namespace: "brainstorm-to-delivery".into(),
+            snapshot_id: "1a641e16-36f4-4ec5-aa4f-18d18e6ab107".into(),
+            snapshot_revision: u64::MAX.to_string(),
+            snapshot_created_at: "2026-08-26T08:00:00Z".parse().unwrap(),
+            snapshot_expires_at: "2026-08-26T08:01:00Z".parse().unwrap(),
+            total_rows: 4_096,
+            artifact_path: concat!(
+                r"C:\Users\developer\AppData\Local\Temp\codeg-mcp\orchestration-bindings\",
+                r"00000000-0000-4000-8000-000000004123\",
+                "4a67bba4-e1f5-46d1-a9b1-aa796598ffce.json"
+            )
+            .into(),
+            artifact_format: "codeg-orchestration-bindings-v1+json".into(),
+            artifact_bytes: 4 * 1024 * 1024,
+            artifact_sha256: format!("sha256:{}", "f".repeat(64)),
+        };
+        let admission = AdmissionPreparation::prepared(
+            "8f95dd45-9eca-42a8-9909-0ac00be8ad52".into(),
+            "4a67bba4-e1f5-46d1-a9b1-aa796598ffce".into(),
+            descriptor.snapshot_expires_at,
+        );
+        let id =
+            ascii_string_id_with_serialized_len(GET_ORCHESTRATION_BINDINGS_MAX_REQUEST_ID_BYTES);
+        let result = render_orchestration_binding_artifact(&descriptor, Some(&admission));
+        assert!(!value_contains_key(&result, "runs"));
+        let line = serialize_jsonrpc_line(&ok(id, result)).unwrap();
+        println!("ticket-v1 full artifact JSONL bytes: {}", line.len());
+        assert!(line.len() <= ORCHESTRATION_BINDING_ARTIFACT_MAX_RESULT_BYTES);
+    }
+
+    #[tokio::test]
+    async fn ticket_v1_catalog_grok_tools_list_keeps_phase2_headroom() {
+        let response = unwrap_respond(
+            dispatch_with_features(
+                GROK_FEATURES,
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+            )
+            .await,
+        );
+        let line = serialize_jsonrpc_line(&response).unwrap();
+        println!("Phase 2 Grok tools/list JSONL bytes: {}", line.len());
+        assert!(line.len() <= 7_300);
+        assert!(7_680 - line.len() >= 380);
     }
 
     #[tokio::test]

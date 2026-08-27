@@ -16319,6 +16319,8 @@ mod tests {
                 replaces_task_id: None,
                 replacement_reason: None,
                 correlation_id: None,
+                dispatch_intent_id: None,
+                admission_ticket: None,
                 recovery_authorization_id: None,
                 orchestration_binding: None,
             })

@@ -47,10 +47,10 @@ use crate::acp::delegation::transport::{
     CompanionRole,
 };
 use crate::acp::delegation::types::{
-    correlation_error_message, validate_correlation_id, AdmissionPreparation,
-    CorrelationEntryPoint, CorrelationFailureKind, DelegationReplyResult, DelegationRequest,
-    DelegationReturnWhen, DelegationStatusBatch, DelegationTaskReport, DelegationWakeReason,
-    OrchestrationBindingV1, ParentDecisionResult, TaskStatus,
+    correlation_error_message, parse_admission_ticket_v1_request, validate_correlation_id,
+    AdmissionPreparation, CorrelationEntryPoint, CorrelationFailureKind, DelegationReplyResult,
+    DelegationRequest, DelegationReturnWhen, DelegationStatusBatch, DelegationTaskReport,
+    DelegationWakeReason, OrchestrationBindingV1, ParentDecisionResult, TaskStatus,
 };
 #[cfg(test)]
 use crate::acp::delegation::workflow::{
@@ -2537,38 +2537,6 @@ impl DelegationListener {
     }
 
     async fn process(&self, req: BrokerRequest) -> DelegationTaskReport {
-        // 1. Token + parent_connection_id consistency check. Treat both as
-        //    "canceled" since the LLM can't usefully react to either —
-        //    the parent has either been torn down or is impersonating.
-        let entry = match self.tokens.lookup(&req.token).await {
-            Some(e) => e,
-            None => return cancel("invalid token"),
-        };
-        if entry.parent_connection_id != req.parent_connection_id {
-            return cancel("token does not match parent connection");
-        }
-
-        // 2. Resolve the parent's current conversation. Without one the
-        //    broker can't link the child row to the parent.
-        let parent_conversation_id = match self
-            .parent_lookup
-            .current_conversation_id(&req.parent_connection_id)
-            .await
-        {
-            Some(id) => id,
-            None => return cancel("parent has no active conversation"),
-        };
-
-        let orchestration_binding = match parse_orchestration_binding(&req.input) {
-            Ok(binding) => binding,
-            Err(message) => return report_failed("orchestration_binding_invalid", &message),
-        };
-
-        let work_unit_key = match parse_work_unit_key(&req.input) {
-            Ok(key) => key,
-            Err(message) => return report_failed("invalid_work_unit_key", &message),
-        };
-
         // continue_delegation: tagged by companion or shape (task_id + task,
         // no agent_type). Must run before agent_type is required.
         let is_continue = req.input.get("_codeg_tool").and_then(|v| v.as_str())
@@ -2576,6 +2544,13 @@ impl DelegationListener {
             || (req.input.get("task_id").is_some()
                 && req.input.get("agent_type").is_none()
                 && req.input.get("task").is_some());
+
+        let admission = match parse_admission_ticket_v1_request(&req.input) {
+            Ok(pair) => pair,
+            Err(message) => {
+                return report_failed("orchestration_admission_ticket_missing", message)
+            }
+        };
 
         // Correlation resolution order (design): non-empty host `_meta.tool_use_id`
         // is authoritative and does not require argument-based correlation.
@@ -2607,6 +2582,37 @@ impl DelegationListener {
             }
         };
 
+        // Token + parent_connection_id consistency check. Treat both as
+        // "canceled" since the LLM can't usefully react to either.
+        let entry = match self.tokens.lookup(&req.token).await {
+            Some(e) => e,
+            None => return cancel("invalid token"),
+        };
+        if entry.parent_connection_id != req.parent_connection_id {
+            return cancel("token does not match parent connection");
+        }
+
+        // Resolve the parent's current conversation. Without one the broker
+        // cannot link the child row to the parent.
+        let parent_conversation_id = match self
+            .parent_lookup
+            .current_conversation_id(&req.parent_connection_id)
+            .await
+        {
+            Some(id) => id,
+            None => return cancel("parent has no active conversation"),
+        };
+
+        let orchestration_binding = match parse_orchestration_binding(&req.input) {
+            Ok(binding) => binding,
+            Err(message) => return report_failed("orchestration_binding_invalid", &message),
+        };
+
+        let work_unit_key = match parse_work_unit_key(&req.input) {
+            Ok(key) => key,
+            Err(message) => return report_failed("invalid_work_unit_key", &message),
+        };
+
         let recovery_authorization_id = match parse_recovery_authorization_id(&req.input) {
             Ok(id) => id,
             Err(message) => return report_failed("invalid_recovery_authorization_id", &message),
@@ -2634,6 +2640,10 @@ impl DelegationListener {
                 work_unit_key,
                 external_handle: req.external_handle,
                 correlation_id,
+                dispatch_intent_id: admission
+                    .as_ref()
+                    .map(|pair| pair.dispatch_intent_id.clone()),
+                admission_ticket: admission.map(|pair| pair.admission_ticket),
                 recovery_authorization_id,
                 orchestration_binding,
             };
@@ -2710,6 +2720,10 @@ impl DelegationListener {
             replaces_task_id,
             replacement_reason,
             correlation_id,
+            dispatch_intent_id: admission
+                .as_ref()
+                .map(|pair| pair.dispatch_intent_id.clone()),
+            admission_ticket: admission.map(|pair| pair.admission_ticket),
             recovery_authorization_id,
             orchestration_binding,
         };
@@ -5341,6 +5355,141 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ticket_v1_request_contract_pair_grammar_precedes_correlation_without_child_effects() {
+        let mock = Arc::new(MockSpawner::new());
+        let tokens = Arc::new(TokenRegistry::default());
+        tokens
+            .register(
+                "tok".into(),
+                TokenEntry::legacy("parent-conn", test_working_dir()),
+            )
+            .await;
+        let listener = make_listener(make_broker(mock.clone()).await, tokens, Some(1));
+        let delegate = json!({
+            "agent_type": "codex",
+            "task": "implement",
+            "correlation_id": ".bad"
+        });
+        for input in [
+            {
+                let mut input = delegate.clone();
+                input["dispatch_intent_id"] =
+                    json!("8f95dd45-9eca-42a8-9909-0ac00be8ad52");
+                input
+            },
+            {
+                let mut input = delegate.clone();
+                input["dispatch_intent_id"] = Value::Null;
+                input["admission_ticket"] =
+                    json!("4a67bba4-e1f5-46d1-a9b1-aa796598ffce");
+                input
+            },
+            {
+                let mut input = delegate.clone();
+                input["dispatch_intent_id"] = json!(7);
+                input["admission_ticket"] =
+                    json!("4a67bba4-e1f5-46d1-a9b1-aa796598ffce");
+                input
+            },
+            {
+                let mut input = delegate;
+                input["dispatch_intent_id"] =
+                    json!("8F95DD45-9ECA-42A8-9909-0AC00BE8AD52");
+                input["admission_ticket"] =
+                    json!("4a67bba4-e1f5-46d1-a9b1-aa796598ffce");
+                input
+            },
+        ] {
+            let report = listener
+                .process(make_request_with_host_id(input, "").await)
+                .await;
+            assert_eq!(
+                report.error_code.as_deref(),
+                Some("orchestration_admission_ticket_missing")
+            );
+            let message = report.message.unwrap_or_default();
+            for forbidden in ["stale", "mismatch", "consumed"] {
+                assert!(!message.contains(forbidden));
+            }
+            assert!(mock.spawn_args.lock().await.is_empty());
+            assert!(mock.resume_args.lock().await.is_empty());
+        }
+
+        let report = listener
+            .process(
+                make_request_with_host_id(
+                    json!({
+                        "agent_type": "invalid",
+                        "task": "implement",
+                        "correlation_id": ".bad",
+                        "dispatch_intent_id": "8f95dd45-9eca-42a8-9909-0ac00be8ad52",
+                        "admission_ticket": "4a67bba4-e1f5-46d1-a9b1-aa796598ffce"
+                    }),
+                    "host-tool-id",
+                )
+                .await,
+            )
+            .await;
+        assert_eq!(report.error_code.as_deref(), Some("invalid_agent_type"));
+        assert!(mock.spawn_args.lock().await.is_empty());
+        assert!(mock.resume_args.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ticket_v1_request_contract_listener_preserves_raw_delegate_cwd_bytes() {
+        let mock = Arc::new(MockSpawner::new());
+        let broker = make_broker(mock.clone()).await;
+        let raw_cwd = r"  D:\repo/mixed/path  ";
+        broker
+            .register_pending_tool_call_with_key(
+                "parent-conn",
+                "ticket-v1-raw-cwd-card".into(),
+                Some(DelegationMatchKey::Delegate {
+                    correlation_id: "ticket-v1-raw-cwd".into(),
+                    agent_type: AgentType::Codex,
+                    task: "implement with raw cwd".into(),
+                    working_dir: Some(raw_cwd.into()),
+                }),
+            )
+            .await;
+        let tokens = Arc::new(TokenRegistry::default());
+        tokens
+            .register(
+                "tok".into(),
+                TokenEntry::legacy("parent-conn", test_working_dir()),
+            )
+            .await;
+        let listener = make_listener(broker.clone(), tokens, Some(1));
+        let report = listener
+            .process(
+                make_request_with_host_id(
+                    json!({
+                        "agent_type": "codex",
+                        "task": "implement with raw cwd",
+                        "working_dir": raw_cwd,
+                        "correlation_id": "ticket-v1-raw-cwd",
+                        "dispatch_intent_id": "8f95dd45-9eca-42a8-9909-0ac00be8ad52",
+                        "admission_ticket": "4a67bba4-e1f5-46d1-a9b1-aa796598ffce"
+                    }),
+                    "",
+                )
+                .await,
+            )
+            .await;
+
+        assert_ne!(
+            report.error_code.as_deref(),
+            Some("delegation_correlation_missing")
+        );
+        assert!(broker.take_pending_tool_call("parent-conn").await.is_none());
+        assert!(mock.spawn_args.lock().await.is_empty());
+        assert!(mock.resume_args.lock().await.is_empty());
+        for forbidden in ["stale", "mismatch", "consumed"] {
+            assert!(!report.message.as_deref().unwrap_or_default().contains(forbidden));
+        }
+    }
+
+    #[tokio::test]
     async fn invalid_token_rejected() {
         let listener = make_listener(
             make_broker(Arc::new(MockSpawner::new())).await,
@@ -6390,6 +6539,8 @@ mod tests {
                 replaces_task_id: None,
                 replacement_reason: None,
                 correlation_id: None,
+                dispatch_intent_id: None,
+                admission_ticket: None,
                 recovery_authorization_id: None,
                 orchestration_binding: None,
             })
@@ -8063,6 +8214,8 @@ mod tests {
                         replaces_task_id: None,
                         replacement_reason: None,
                         correlation_id: None,
+                        dispatch_intent_id: None,
+                        admission_ticket: None,
                         recovery_authorization_id: None,
                         orchestration_binding: None,
                     })
@@ -8173,6 +8326,8 @@ mod tests {
                 replaces_task_id: None,
                 replacement_reason: None,
                 correlation_id: None,
+                dispatch_intent_id: None,
+                admission_ticket: None,
                 recovery_authorization_id: None,
                 orchestration_binding: None,
             })
@@ -8224,6 +8379,8 @@ mod tests {
                 replaces_task_id: None,
                 replacement_reason: None,
                 correlation_id: None,
+                dispatch_intent_id: None,
+                admission_ticket: None,
                 recovery_authorization_id: None,
                 orchestration_binding: None,
             })
@@ -8414,6 +8571,8 @@ mod tests {
                     replaces_task_id: None,
                     replacement_reason: None,
                     correlation_id: None,
+                    dispatch_intent_id: None,
+                    admission_ticket: None,
                     recovery_authorization_id: None,
                     orchestration_binding: None,
                 };
@@ -11145,6 +11304,8 @@ mod tests {
                 replaces_task_id: None,
                 replacement_reason: None,
                 correlation_id: None,
+                dispatch_intent_id: None,
+                admission_ticket: None,
                 recovery_authorization_id: None,
                 orchestration_binding: None,
             })
@@ -11560,6 +11721,8 @@ mod tests {
                 replaces_task_id: None,
                 replacement_reason: None,
                 correlation_id: None,
+                dispatch_intent_id: None,
+                admission_ticket: None,
                 recovery_authorization_id: None,
                 orchestration_binding: None,
             })
@@ -11581,6 +11744,8 @@ mod tests {
                 replaces_task_id: None,
                 replacement_reason: None,
                 correlation_id: None,
+                dispatch_intent_id: None,
+                admission_ticket: None,
                 recovery_authorization_id: None,
                 orchestration_binding: None,
             })

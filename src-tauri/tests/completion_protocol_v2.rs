@@ -3255,6 +3255,8 @@ async fn run_session_2889_fixture() -> Session2889Result {
             work_unit_key: first_reviewer.work_unit_key.clone(),
             external_handle: None,
             correlation_id: None,
+            dispatch_intent_id: None,
+            admission_ticket: None,
             recovery_authorization_id: None,
             orchestration_binding: None,
         },
@@ -4638,6 +4640,8 @@ async fn v2_only_aggregate_acceptance() {
         replaces_task_id: None,
         replacement_reason: None,
         correlation_id: None,
+        dispatch_intent_id: None,
+        admission_ticket: None,
         recovery_authorization_id: None,
         orchestration_binding: None,
     };
@@ -4771,6 +4775,8 @@ async fn v2_only_aggregate_acceptance() {
             replaces_task_id: None,
             replacement_reason: None,
             correlation_id: None,
+            dispatch_intent_id: None,
+            admission_ticket: None,
             recovery_authorization_id: None,
             orchestration_binding: None,
         })

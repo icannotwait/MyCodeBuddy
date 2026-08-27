@@ -90,6 +90,41 @@ pub struct TicketV1PendingCall {
     pub dispatch_intent_id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AdmissionTicketV1Request {
+    pub dispatch_intent_id: String,
+    pub admission_ticket: String,
+}
+
+pub(crate) fn parse_admission_ticket_v1_request(
+    input: &serde_json::Value,
+) -> Result<Option<AdmissionTicketV1Request>, &'static str> {
+    match (
+        input.get("dispatch_intent_id"),
+        input.get("admission_ticket"),
+    ) {
+        (None, None) => Ok(None),
+        (Some(serde_json::Value::String(intent)), Some(serde_json::Value::String(ticket)))
+            if is_canonical_uuid(intent) && is_canonical_uuid(ticket) =>
+        {
+            Ok(Some(AdmissionTicketV1Request {
+                dispatch_intent_id: intent.clone(),
+                admission_ticket: ticket.clone(),
+            }))
+        }
+        _ => Err(
+            "dispatch_intent_id and admission_ticket must be canonical lowercase UUIDs supplied together",
+        ),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TicketV1AdmissionCandidate {
+    pub dispatch_intent_id: String,
+    pub admission_ticket: String,
+    pub request_fingerprint: String,
+}
+
 pub const ORCHESTRATION_BINDING_DEFAULT_LIMIT: u16 = 100;
 pub const ORCHESTRATION_BINDING_MAX_LIMIT: u16 = 200;
 
@@ -446,7 +481,11 @@ mod orchestration_binding_tests {
 
     use serde_json::{json, Value};
 
-    use super::{OrchestrationBindingToolRequest, OrchestrationBindingV1};
+    use super::{
+        ContinueDelegationRequest, DelegationRequest, OrchestrationBindingToolRequest,
+        OrchestrationBindingV1, TicketV1PendingCall,
+    };
+    use crate::acp::delegation::run_store::ticket_v1_request_fingerprint;
 
     fn admission_intent(kind: &str, target: Value, replacement_reason: Value) -> Value {
         json!({
@@ -580,6 +619,91 @@ mod orchestration_binding_tests {
         assert_eq!(
             intent.canonical_digest(),
             "133c7b500e6569787f652c7a6f095a69446ef08a818599d6a941bfda325f046c"
+        );
+    }
+
+    #[test]
+    fn ticket_v1_request_contract_request_round_trip_preserves_pair_and_raw_cwd() {
+        let raw_cwd = r#"  D:\repo/mixed\path  "#;
+        let delegate: DelegationRequest = serde_json::from_value(json!({
+            "parent_connection_id": "parent-conn",
+            "parent_conversation_id": 7,
+            "parent_tool_use_id": "tool-call",
+            "agent_type": "codex",
+            "task": "implement",
+            "working_dir": raw_cwd,
+            "requested_working_dir": raw_cwd,
+            "dispatch_intent_id": "8f95dd45-9eca-42a8-9909-0ac00be8ad52",
+            "admission_ticket": "4a67bba4-e1f5-46d1-a9b1-aa796598ffce"
+        }))
+        .unwrap();
+        let delegate = serde_json::to_value(delegate).unwrap();
+        assert_eq!(delegate["requested_working_dir"], raw_cwd);
+        assert_eq!(
+            delegate["dispatch_intent_id"],
+            "8f95dd45-9eca-42a8-9909-0ac00be8ad52"
+        );
+        assert_eq!(
+            delegate["admission_ticket"],
+            "4a67bba4-e1f5-46d1-a9b1-aa796598ffce"
+        );
+
+        let continuation: ContinueDelegationRequest = serde_json::from_value(json!({
+            "parent_connection_id": "parent-conn",
+            "parent_conversation_id": 7,
+            "parent_tool_use_id": "tool-call",
+            "target_task_id": "source-task",
+            "task": "continue",
+            "dispatch_intent_id": "8f95dd45-9eca-42a8-9909-0ac00be8ad52",
+            "admission_ticket": "4a67bba4-e1f5-46d1-a9b1-aa796598ffce"
+        }))
+        .unwrap();
+        let continuation = serde_json::to_value(continuation).unwrap();
+        assert!(continuation.get("working_dir").is_none());
+        assert_eq!(
+            continuation["dispatch_intent_id"],
+            "8f95dd45-9eca-42a8-9909-0ac00be8ad52"
+        );
+        assert_eq!(
+            continuation["admission_ticket"],
+            "4a67bba4-e1f5-46d1-a9b1-aa796598ffce"
+        );
+    }
+
+    #[test]
+    fn ticket_v1_request_contract_candidate_digest_uses_exact_physical_inputs() {
+        let pending = TicketV1PendingCall {
+            schema_version: 1,
+            tool_name: "delegate_to_agent".into(),
+            task: "Implement Task 9".into(),
+            working_dir: Some(r#"  D:\repo/mixed\path  "#.into()),
+            work_unit_key: Some("task|9|implementer|codex|none".into()),
+            replaces_task_id: None,
+            replacement_reason: None,
+            target_task_id: None,
+            agent_type: "codex".into(),
+            profile_id: None,
+            orchestration_binding: None,
+            dispatch_intent_id: "8f95dd45-9eca-42a8-9909-0ac00be8ad52".into(),
+        };
+        let base = ticket_v1_request_fingerprint(&pending);
+        let mut changed_task = pending.clone();
+        changed_task.task.push_str(" changed");
+        let mut changed_cwd = pending.clone();
+        changed_cwd.working_dir = Some(r#"  D:/repo/mixed/path  "#.into());
+        let mut changed_intent = pending.clone();
+        changed_intent.dispatch_intent_id = "11111111-1111-4111-8111-111111111111".into();
+        assert_ne!(base, ticket_v1_request_fingerprint(&changed_task));
+        assert_ne!(base, ticket_v1_request_fingerprint(&changed_cwd));
+        assert_ne!(base, ticket_v1_request_fingerprint(&changed_intent));
+
+        let mut omitted_cwd = pending.clone();
+        omitted_cwd.working_dir = None;
+        let mut empty_cwd = pending;
+        empty_cwd.working_dir = Some(String::new());
+        assert_eq!(
+            ticket_v1_request_fingerprint(&omitted_cwd),
+            ticket_v1_request_fingerprint(&empty_cwd)
         );
     }
 
@@ -782,6 +906,10 @@ pub struct DelegationRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub correlation_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_intent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission_ticket: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery_authorization_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orchestration_binding: Option<OrchestrationBindingV1>,
@@ -803,6 +931,10 @@ pub struct ContinueDelegationRequest {
     /// [`DelegationRequest::correlation_id`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub correlation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_intent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission_ticket: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery_authorization_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

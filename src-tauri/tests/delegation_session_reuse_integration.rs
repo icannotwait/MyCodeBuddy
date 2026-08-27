@@ -171,6 +171,8 @@ fn delegate_req_bound(
         replacement_reason: None,
         // Explicit parent_tool_use_id fixtures do not need correlation_id.
         correlation_id: None,
+        dispatch_intent_id: None,
+        admission_ticket: None,
         recovery_authorization_id: None,
         orchestration_binding,
     }
@@ -204,6 +206,8 @@ fn continue_req_bound(
         external_handle: None,
         // Explicit parent_tool_use_id fixtures do not need correlation_id.
         correlation_id: None,
+        dispatch_intent_id: None,
+        admission_ticket: None,
         recovery_authorization_id: None,
         orchestration_binding,
     }

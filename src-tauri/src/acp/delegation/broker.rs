@@ -92,9 +92,9 @@ use crate::acp::delegation::run_identity::{
 };
 use crate::acp::delegation::run_store::{
     derive_task_preview, inherited_binding, launch_snapshot_from_run, request_fingerprint,
-    Gen1AdmitOutcome, PersistedRun, PromoteAttemptMeta, PromoteConflictClass, PromoteRetryClass,
-    PromoteRunningKind, PromoteRunningOutcome, RecoveryAdmissionAuthorization, ReservingRunInsert,
-    RunStore, TerminalCompletionAttentionMetric,
+    ticket_v1_request_fingerprint, Gen1AdmitOutcome, PersistedRun, PromoteAttemptMeta,
+    PromoteConflictClass, PromoteRetryClass, PromoteRunningKind, PromoteRunningOutcome,
+    RecoveryAdmissionAuthorization, ReservingRunInsert, RunStore, TerminalCompletionAttentionMetric,
 };
 use crate::acp::delegation::runtime_stats::{DelegationRuntimeStats, RuntimeStatsProjector};
 use crate::acp::delegation::spawner::{ConnectionSpawner, DelegationLink};
@@ -109,7 +109,8 @@ use crate::acp::delegation::types::{
     DelegationOutcome, DelegationProfile, DelegationRecoveryProjection, DelegationReplyResult,
     DelegationRequest, DelegationStatusBatch, DelegationTaskReport, DelegationTaskReportExtension,
     DelegationWakeReason, ObservationSnapshot, ParentDecisionResult, ParentTurnEndReason,
-    TaskObservation, TaskStatus, WorkflowRetirementNavigation, DELEGATE_TO_AGENT_TOOL,
+    TaskObservation, TaskStatus, TicketV1AdmissionCandidate, TicketV1PendingCall,
+    WorkflowRetirementNavigation, DELEGATE_TO_AGENT_TOOL,
 };
 use crate::acp::delegation::workflow::admission::append_admitted_completion_instruction;
 #[cfg(test)]
@@ -3706,6 +3707,58 @@ pub struct DelegationBroker {
     post_accept_adopt_retry_recheck_gate: Arc<Mutex<Option<RuntimeGate>>>,
 }
 
+fn delegate_ticket_v1_candidate(req: &DelegationRequest) -> Option<TicketV1AdmissionCandidate> {
+    let dispatch_intent_id = req.dispatch_intent_id.clone()?;
+    let admission_ticket = req.admission_ticket.clone()?;
+    let request_fingerprint = ticket_v1_request_fingerprint(&TicketV1PendingCall {
+        schema_version: 1,
+        tool_name: DELEGATE_TO_AGENT_TOOL.into(),
+        task: req.task.clone(),
+        working_dir: req.requested_working_dir.clone(),
+        work_unit_key: req.work_unit_key.clone(),
+        replaces_task_id: req.replaces_task_id.clone(),
+        replacement_reason: req.replacement_reason.clone(),
+        target_task_id: None,
+        agent_type: req.agent_type.as_wire().into(),
+        profile_id: req.profile_id.clone(),
+        orchestration_binding: req.orchestration_binding.clone(),
+        dispatch_intent_id: dispatch_intent_id.clone(),
+    });
+    Some(TicketV1AdmissionCandidate {
+        dispatch_intent_id,
+        admission_ticket,
+        request_fingerprint,
+    })
+}
+
+fn continue_ticket_v1_candidate(
+    req: &crate::acp::delegation::types::ContinueDelegationRequest,
+    agent_type: AgentType,
+    profile_id: Option<&str>,
+) -> Option<TicketV1AdmissionCandidate> {
+    let dispatch_intent_id = req.dispatch_intent_id.clone()?;
+    let admission_ticket = req.admission_ticket.clone()?;
+    let request_fingerprint = ticket_v1_request_fingerprint(&TicketV1PendingCall {
+        schema_version: 1,
+        tool_name: crate::acp::delegation::types::CONTINUE_DELEGATION_TOOL.into(),
+        task: req.task.clone(),
+        working_dir: None,
+        work_unit_key: req.work_unit_key.clone(),
+        replaces_task_id: None,
+        replacement_reason: None,
+        target_task_id: Some(req.target_task_id.clone()),
+        agent_type: agent_type.as_wire().into(),
+        profile_id: profile_id.map(str::to_owned),
+        orchestration_binding: req.orchestration_binding.clone(),
+        dispatch_intent_id: dispatch_intent_id.clone(),
+    });
+    Some(TicketV1AdmissionCandidate {
+        dispatch_intent_id,
+        admission_ticket,
+        request_fingerprint,
+    })
+}
+
 impl DelegationBroker {
     pub fn new(
         spawner: Arc<dyn ConnectionSpawner>,
@@ -5969,6 +6022,7 @@ impl DelegationBroker {
         )
     )]
     pub async fn start_delegation(&self, mut req: DelegationRequest) -> DelegationTaskReport {
+        let _ticket_v1_candidate = delegate_ticket_v1_candidate(&req);
         if let Some(binding) = req.orchestration_binding.as_ref() {
             if let Err(message) = binding.validate() {
                 return report_err(
@@ -9434,6 +9488,8 @@ impl DelegationBroker {
                 );
             }
         };
+        let _ticket_v1_candidate =
+            continue_ticket_v1_candidate(&req, target.agent_type, target.profile_id.as_deref());
         let effective_orchestration_binding = match inherited_binding(
             target.orchestration_binding.as_ref(),
             req.orchestration_binding.as_ref(),
@@ -16368,6 +16424,8 @@ mod tests {
                     work_unit_key: Some("resume-unit".into()),
                     external_handle: None,
                     correlation_id: Some("resume-correlation".into()),
+                    dispatch_intent_id: None,
+                    admission_ticket: None,
                     recovery_authorization_id: Some(approved.authorization_id.clone()),
                     orchestration_binding: None,
                 })
@@ -16716,6 +16774,8 @@ mod tests {
             replaces_task_id: None,
             replacement_reason: None,
             correlation_id: None,
+            dispatch_intent_id: None,
+            admission_ticket: None,
             recovery_authorization_id: None,
             orchestration_binding: None,
         }
@@ -16729,6 +16789,57 @@ mod tests {
             route_fingerprint:
                 "sha256:b498416d87bf6ba928bd7ddb5f1a451daf82300584f3d40b606c3c56f169ba7a".into(),
         }
+    }
+
+    #[test]
+    fn ticket_v1_request_contract_broker_candidates_use_raw_delegate_and_empty_continue_cwd() {
+        let mut binding = orchestration_binding_fixture();
+        binding.generation = 2;
+        let mut delegate = request(1, "ticket-v1-delegate");
+        delegate.agent_type = AgentType::Codex;
+        delegate.task = "Implement Task 7 from the reviewed Plan.".into();
+        delegate.working_dir = Some(r"D:\canonical-launch-path".into());
+        delegate.requested_working_dir =
+            Some("\u{0009}\u{00a0}\u{feff}\u{2028}D:/repo\u{2029} \u{000d}".into());
+        delegate.work_unit_key = Some("task|7|implementer|codex|none".into());
+        delegate.orchestration_binding = Some(binding.clone());
+        delegate.dispatch_intent_id = Some("8f95dd45-9eca-42a8-9909-0ac00be8ad52".into());
+        delegate.admission_ticket = Some("4a67bba4-e1f5-46d1-a9b1-aa796598ffce".into());
+
+        let candidate = delegate_ticket_v1_candidate(&delegate).unwrap();
+        assert_eq!(
+            candidate.request_fingerprint,
+            "b80f59256b2d5268a015aca99f6c1f0df14aa6d71a96ab0bf46774476f0f2de8"
+        );
+        assert_eq!(
+            candidate.dispatch_intent_id,
+            "8f95dd45-9eca-42a8-9909-0ac00be8ad52"
+        );
+        assert_eq!(
+            candidate.admission_ticket,
+            "4a67bba4-e1f5-46d1-a9b1-aa796598ffce"
+        );
+
+        let continuation = crate::acp::delegation::types::ContinueDelegationRequest {
+            parent_connection_id: "parent-conn".into(),
+            parent_conversation_id: 1,
+            parent_tool_use_id: "ticket-v1-continue".into(),
+            target_task_id: "6b228a7d-4ac9-4bc7-a16e-f4ecf6f0fd45".into(),
+            task: "Continue the approved implementation".into(),
+            work_unit_key: Some("task|7|implementer|codex|none".into()),
+            external_handle: None,
+            correlation_id: None,
+            dispatch_intent_id: Some("8f95dd45-9eca-42a8-9909-0ac00be8ad52".into()),
+            admission_ticket: Some("4a67bba4-e1f5-46d1-a9b1-aa796598ffce".into()),
+            recovery_authorization_id: None,
+            orchestration_binding: Some(binding),
+        };
+        let candidate =
+            continue_ticket_v1_candidate(&continuation, AgentType::Codex, None).unwrap();
+        assert_eq!(
+            candidate.request_fingerprint,
+            "2a44be9d1662a314cbbd2c8111bcf83159be7bdc93abadff977d01447f986648"
+        );
     }
 
     #[tokio::test]
@@ -16951,6 +17062,8 @@ mod tests {
                     work_unit_key: Some(work_unit_key.clone()),
                     external_handle: None,
                     correlation_id: Some(format!("binding-continue-{case}-mismatch")),
+                    dispatch_intent_id: None,
+                    admission_ticket: None,
                     recovery_authorization_id: Some(authorization_id.clone()),
                     orchestration_binding: mismatched_binding,
                 })
@@ -16985,6 +17098,8 @@ mod tests {
                     work_unit_key: Some(work_unit_key),
                     external_handle: None,
                     correlation_id: Some(format!("binding-continue-{case}-accepted")),
+                    dispatch_intent_id: None,
+                    admission_ticket: None,
                     recovery_authorization_id: Some(authorization_id.clone()),
                     orchestration_binding: accepted_binding,
                 })
@@ -25756,6 +25871,8 @@ mod tests {
                     work_unit_key: None,
                     external_handle: None,
                     correlation_id: None,
+                    dispatch_intent_id: None,
+                    admission_ticket: None,
                     recovery_authorization_id: None,
                     orchestration_binding: None,
                 })
@@ -25910,6 +26027,8 @@ mod tests {
                     work_unit_key: None,
                     external_handle: None,
                     correlation_id: None,
+                    dispatch_intent_id: None,
+                    admission_ticket: None,
                     recovery_authorization_id: None,
                     orchestration_binding: None,
                 })
@@ -26198,6 +26317,8 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: None,
+                dispatch_intent_id: None,
+                admission_ticket: None,
                 recovery_authorization_id: None,
                 orchestration_binding: None,
             })
@@ -26602,6 +26723,8 @@ mod tests {
                         work_unit_key: None,
                         external_handle: None,
                         correlation_id: None,
+                        dispatch_intent_id: None,
+                        admission_ticket: None,
                         recovery_authorization_id: None,
                         orchestration_binding: None,
                     })
@@ -27141,6 +27264,8 @@ mod tests {
                         work_unit_key: None,
                         external_handle: None,
                         correlation_id: None,
+                        dispatch_intent_id: None,
+                        admission_ticket: None,
                         recovery_authorization_id: None,
                         orchestration_binding: None,
                     })
@@ -27647,6 +27772,8 @@ mod tests {
                         work_unit_key: None,
                         external_handle: None,
                         correlation_id: None,
+                        dispatch_intent_id: None,
+                        admission_ticket: None,
                         recovery_authorization_id: None,
                         orchestration_binding: None,
                     })
@@ -28062,6 +28189,8 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: None,
+                dispatch_intent_id: None,
+                admission_ticket: None,
                 recovery_authorization_id: None,
                 orchestration_binding: None,
             })
@@ -28236,6 +28365,8 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: None,
+                dispatch_intent_id: None,
+                admission_ticket: None,
                 recovery_authorization_id: None,
                 orchestration_binding: None,
             })
@@ -29963,6 +30094,8 @@ mod tests {
                     work_unit_key: None,
                     external_handle: None,
                     correlation_id: None,
+                    dispatch_intent_id: None,
+                    admission_ticket: None,
                     recovery_authorization_id: None,
                     orchestration_binding: None,
                 })
@@ -30056,6 +30189,8 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: None,
+                dispatch_intent_id: None,
+                admission_ticket: None,
                 recovery_authorization_id: None,
                 orchestration_binding: None,
             })
@@ -36705,6 +36840,8 @@ mod tests {
                 work_unit_key: Some(v2_plan_author_work_unit_key()),
                 external_handle: None,
                 correlation_id: None,
+                dispatch_intent_id: None,
+                admission_ticket: None,
                 recovery_authorization_id: None,
                 orchestration_binding: None,
             })
@@ -36762,6 +36899,8 @@ mod tests {
                 work_unit_key: Some(v2_plan_author_work_unit_key()),
                 external_handle: None,
                 correlation_id: None,
+                dispatch_intent_id: None,
+                admission_ticket: None,
                 recovery_authorization_id: None,
                 orchestration_binding: None,
             })
@@ -36917,6 +37056,8 @@ mod tests {
                         work_unit_key: Some(v2_plan_author_work_unit_key()),
                         external_handle: None,
                         correlation_id: None,
+                        dispatch_intent_id: None,
+                        admission_ticket: None,
                         recovery_authorization_id: None,
                         orchestration_binding: None,
                     })
@@ -37179,6 +37320,8 @@ mod tests {
                     work_unit_key: Some(v2_plan_author_work_unit_key()),
                     external_handle: None,
                     correlation_id: None,
+                    dispatch_intent_id: None,
+                    admission_ticket: None,
                     recovery_authorization_id: None,
                     orchestration_binding: None,
                 })
@@ -37285,6 +37428,8 @@ mod tests {
                 work_unit_key: Some(v2_plan_author_work_unit_key()),
                 external_handle: None,
                 correlation_id: None,
+                dispatch_intent_id: None,
+                admission_ticket: None,
                 recovery_authorization_id: None,
                 orchestration_binding: None,
             })
@@ -37388,6 +37533,8 @@ mod tests {
                 work_unit_key: Some(v2_plan_author_work_unit_key()),
                 external_handle: None,
                 correlation_id: None,
+                dispatch_intent_id: None,
+                admission_ticket: None,
                 recovery_authorization_id: None,
                 orchestration_binding: None,
             })
@@ -38878,6 +39025,8 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: None,
+                dispatch_intent_id: None,
+                admission_ticket: None,
                 recovery_authorization_id: None,
                 orchestration_binding: None,
             })
@@ -38923,6 +39072,8 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: None,
+                dispatch_intent_id: None,
+                admission_ticket: None,
                 recovery_authorization_id: None,
                 orchestration_binding: None,
             })
@@ -38958,6 +39109,8 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: Some("cont-corr-1".into()),
+                dispatch_intent_id: None,
+                admission_ticket: None,
                 recovery_authorization_id: None,
                 orchestration_binding: None,
             })
@@ -38996,6 +39149,8 @@ mod tests {
                 work_unit_key: None,
                 external_handle: Some("h-cont-claim-cancel".into()),
                 correlation_id: Some("cont-ext-cancel".into()),
+                dispatch_intent_id: None,
+                admission_ticket: None,
                 recovery_authorization_id: None,
                 orchestration_binding: None,
             })
@@ -39036,6 +39191,8 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: Some("cont-join-abandon".into()),
+                dispatch_intent_id: None,
+                admission_ticket: None,
                 recovery_authorization_id: None,
                 orchestration_binding: None,
             })
@@ -39116,6 +39273,8 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: Some("cont-bind".into()),
+                dispatch_intent_id: None,
+                admission_ticket: None,
                 recovery_authorization_id: None,
                 orchestration_binding: None,
             })
@@ -39215,6 +39374,8 @@ mod tests {
             work_unit_key: None,
             external_handle: None,
             correlation_id: Some("cont-mcp-first".into()),
+            dispatch_intent_id: None,
+            admission_ticket: None,
             recovery_authorization_id: None,
             orchestration_binding: None,
         };
@@ -39393,6 +39554,8 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: Some("corr-t2".into()),
+                dispatch_intent_id: None,
+                admission_ticket: None,
                 recovery_authorization_id: None,
                 orchestration_binding: None,
             })
@@ -39632,6 +39795,8 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: None,
+                dispatch_intent_id: None,
+                admission_ticket: None,
                 recovery_authorization_id: None,
                 orchestration_binding: None,
             })
@@ -39654,6 +39819,8 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: Some("corr-timeout-nf".into()),
+                dispatch_intent_id: None,
+                admission_ticket: None,
                 recovery_authorization_id: None,
                 orchestration_binding: None,
             })
@@ -39677,6 +39844,8 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: Some(".leading-dot-invalid".into()),
+                dispatch_intent_id: None,
+                admission_ticket: None,
                 recovery_authorization_id: None,
                 orchestration_binding: None,
             })
@@ -39716,6 +39885,8 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: None,
+                dispatch_intent_id: None,
+                admission_ticket: None,
                 recovery_authorization_id: None,
                 orchestration_binding: None,
             })
@@ -39995,6 +40166,8 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: Some(cont_secret.into()),
+                dispatch_intent_id: None,
+                admission_ticket: None,
                 recovery_authorization_id: None,
                 orchestration_binding: None,
             })
@@ -40110,6 +40283,8 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: Some(corr.into()),
+                dispatch_intent_id: None,
+                admission_ticket: None,
                 recovery_authorization_id: None,
                 orchestration_binding: None,
             })
@@ -40215,6 +40390,8 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: None,
+                dispatch_intent_id: None,
+                admission_ticket: None,
                 recovery_authorization_id: None,
                 orchestration_binding: None,
             })
@@ -40302,6 +40479,8 @@ mod tests {
             work_unit_key: None,
             external_handle: None,
             correlation_id: None,
+            dispatch_intent_id: None,
+            admission_ticket: None,
             recovery_authorization_id: None,
             orchestration_binding: None,
         };
@@ -40386,6 +40565,8 @@ mod tests {
             work_unit_key: None,
             external_handle: None,
             correlation_id: None,
+            dispatch_intent_id: None,
+            admission_ticket: None,
             recovery_authorization_id: None,
             orchestration_binding: None,
         };
@@ -40543,6 +40724,8 @@ mod tests {
                         work_unit_key: None,
                         external_handle: None,
                         correlation_id: None,
+                        dispatch_intent_id: None,
+                        admission_ticket: None,
                         recovery_authorization_id: None,
                         orchestration_binding: None,
                     })
@@ -40667,6 +40850,8 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: None,
+                dispatch_intent_id: None,
+                admission_ticket: None,
                 recovery_authorization_id: None,
                 orchestration_binding: None,
             })
@@ -41147,6 +41332,8 @@ mod tests {
             work_unit_key: None,
             external_handle: None,
             correlation_id: None,
+            dispatch_intent_id: None,
+            admission_ticket: None,
             recovery_authorization_id: None,
             orchestration_binding: None,
         };
@@ -41294,6 +41481,8 @@ mod tests {
             work_unit_key: None,
             external_handle: None,
             correlation_id: None,
+            dispatch_intent_id: None,
+            admission_ticket: None,
             recovery_authorization_id: None,
             orchestration_binding: None,
         };
@@ -41436,6 +41625,8 @@ mod tests {
             work_unit_key: None,
             external_handle: None,
             correlation_id: None,
+            dispatch_intent_id: None,
+            admission_ticket: None,
             recovery_authorization_id: None,
             orchestration_binding: None,
         };
@@ -41545,6 +41736,8 @@ mod tests {
             work_unit_key: None,
             external_handle: None,
             correlation_id: None,
+            dispatch_intent_id: None,
+            admission_ticket: None,
             recovery_authorization_id: None,
             orchestration_binding: None,
         };
@@ -41648,6 +41841,8 @@ mod tests {
             work_unit_key: None,
             external_handle: None,
             correlation_id: None,
+            dispatch_intent_id: None,
+            admission_ticket: None,
             recovery_authorization_id: None,
             orchestration_binding: None,
         };
@@ -41776,6 +41971,8 @@ mod tests {
             work_unit_key: None,
             external_handle: None,
             correlation_id: None,
+            dispatch_intent_id: None,
+            admission_ticket: None,
             recovery_authorization_id: None,
             orchestration_binding: None,
         };
@@ -41892,6 +42089,8 @@ mod tests {
             work_unit_key: None,
             external_handle: None,
             correlation_id: None,
+            dispatch_intent_id: None,
+            admission_ticket: None,
             recovery_authorization_id: None,
             orchestration_binding: None,
         };
@@ -41988,6 +42187,8 @@ mod tests {
                 work_unit_key: None,
                 external_handle: Some("precancel-handle-1".into()),
                 correlation_id: None,
+                dispatch_intent_id: None,
+                admission_ticket: None,
                 recovery_authorization_id: None,
                 orchestration_binding: None,
             })
@@ -42055,6 +42256,8 @@ mod tests {
             work_unit_key: None,
             external_handle: None,
             correlation_id: None,
+            dispatch_intent_id: None,
+            admission_ticket: None,
             recovery_authorization_id: None,
             orchestration_binding: None,
         };
@@ -42569,6 +42772,8 @@ mod tests {
             work_unit_key: None,
             external_handle: None,
             correlation_id: None,
+            dispatch_intent_id: None,
+            admission_ticket: None,
             recovery_authorization_id: None,
             orchestration_binding: None,
         };
@@ -42796,6 +43001,8 @@ mod tests {
             work_unit_key: None,
             external_handle: None,
             correlation_id: None,
+            dispatch_intent_id: None,
+            admission_ticket: None,
             recovery_authorization_id: None,
             orchestration_binding: None,
         };
@@ -42907,6 +43114,8 @@ mod tests {
             work_unit_key: None,
             external_handle: None,
             correlation_id: None,
+            dispatch_intent_id: None,
+            admission_ticket: None,
             recovery_authorization_id: None,
             orchestration_binding: None,
         };
@@ -43055,6 +43264,8 @@ mod tests {
             work_unit_key: None,
             external_handle: None,
             correlation_id: None,
+            dispatch_intent_id: None,
+            admission_ticket: None,
             recovery_authorization_id: None,
             orchestration_binding: None,
         };
@@ -43219,6 +43430,8 @@ mod tests {
             work_unit_key: None,
             external_handle: None,
             correlation_id: None,
+            dispatch_intent_id: None,
+            admission_ticket: None,
             recovery_authorization_id: None,
             orchestration_binding: None,
         };
@@ -43405,6 +43618,8 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: Some("corr-1485-acp".into()),
+                dispatch_intent_id: None,
+                admission_ticket: None,
                 recovery_authorization_id: None,
                 orchestration_binding: None,
             })
@@ -43529,6 +43744,8 @@ mod tests {
             work_unit_key: None,
             external_handle: None,
             correlation_id: Some("corr-1485-mcp".into()),
+            dispatch_intent_id: None,
+            admission_ticket: None,
             recovery_authorization_id: None,
             orchestration_binding: None,
         };
@@ -43633,6 +43850,8 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: None,
+                dispatch_intent_id: None,
+                admission_ticket: None,
                 recovery_authorization_id: None,
                 orchestration_binding: None,
             })
@@ -43725,6 +43944,8 @@ mod tests {
                 work_unit_key: None,
                 external_handle: None,
                 correlation_id: Some("corr-1485-dup".into()),
+                dispatch_intent_id: None,
+                admission_ticket: None,
                 recovery_authorization_id: None,
                 orchestration_binding: None,
             })
