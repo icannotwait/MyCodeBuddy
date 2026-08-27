@@ -1,5 +1,6 @@
 import assert from "node:assert/strict"
 import { spawnSync } from "node:child_process"
+import { createHash } from "node:crypto"
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { dirname, join } from "node:path"
 import { describe, it } from "node:test"
@@ -143,6 +144,14 @@ ${block("codeg-b2d-skill-contract-v2", SKILL_CONTRACT)}
 
 ## 1. Establish current truth
 Inspect current files and live delegation schemas. Preserve user decisions.
+For every complete snapshot, inspect the live binding-query schema. When it
+advertises artifact delivery, request \`delivery: "artifact"\` once. Pass
+\`artifact_path\` directly to \`--durable-evidence\` and \`artifact_sha256\`
+directly to \`--durable-evidence-sha256\`. Never open, read, print, copy,
+summarize, embed, or delegate inspection of the artifact. Treat artifact
+request, descriptor, digest, stale, validator, and cleanup errors as blocking
+and never fall back to pages. Use legacy page pagination only when the live
+schema does not advertise artifact delivery.
 
 ## 2. Resolve the Task Agent
 Inspect discovery and choose the invocation selection. Record an omitted selection as Grok and block invalid identities.
@@ -398,7 +407,7 @@ function fencedJsonAfterHeading(markdown, heading) {
   assert.notEqual(headingIndex, -1, `missing Skill heading: ${heading}`)
   const match = markdown
     .slice(headingIndex + heading.length)
-    .match(/\n```json\n([\s\S]*?)\n```/)
+    .match(/\r?\n```json\r?\n([\s\S]*?)\r?\n```/)
   assert.ok(match, `missing JSON contract after: ${heading}`)
   return JSON.parse(match[1])
 }
@@ -6498,6 +6507,7 @@ describe("durable route binding derivation", () => {
       ...process.env,
       FORCE_COLOR: "1",
       NO_COLOR: "1",
+      NODE_NO_WARNINGS: "1",
     }
     const spawnCli = (args) =>
       spawnSync(process.execPath, [script, ...args], {
@@ -6791,7 +6801,12 @@ const ZERO_FINGERPRINT =
   "sha256:0000000000000000000000000000000000000000000000000000000000000000"
 
 function conflictingColorEnv() {
-  return { ...process.env, FORCE_COLOR: "1", NO_COLOR: "1" }
+  return {
+    ...process.env,
+    FORCE_COLOR: "1",
+    NO_COLOR: "1",
+    NODE_NO_WARNINGS: "1",
+  }
 }
 
 function spawnCli(args, extraEnv = {}) {
@@ -6835,6 +6850,10 @@ function evidencePage(overrides = {}, runs = []) {
 
 function evidenceWrapper(pages) {
   return { schema_version: 1, pages }
+}
+
+function sha256(bytes) {
+  return `sha256:${createHash("sha256").update(bytes).digest("hex")}`
 }
 
 function emptyEvidence() {
@@ -7363,6 +7382,251 @@ describe("durable page envelopes", () => {
         "B2D-DURABLE-002"
       )
     }
+  })
+})
+
+describe("durable artifact buffer verification", () => {
+  it("hashes and parses the same already-read buffer after path replacement", () => {
+    const tempRoot = mkdtempSync(join(tmpdir(), "b2d-artifact-buffer-"))
+    try {
+      const artifactPath = join(tempRoot, "bindings.json")
+      const original = Buffer.from(JSON.stringify(emptyEvidence()))
+      writeFileSync(artifactPath, original)
+      const durableEvidence = readFileSync(artifactPath)
+      writeFileSync(artifactPath, Buffer.from("replacement"))
+
+      const result = runValidation({
+        skillMarkdown: skill,
+        documentAdmission: true,
+        outputJson: true,
+        durableEvidence,
+        durableEvidenceSha256: sha256(original),
+      })
+
+      assert.deepEqual(result.failures, [])
+      assert.equal(result.admission_authorized, true)
+      assert.deepEqual(result.durable_snapshot, {
+        snapshot_id: SNAPSHOT_ID,
+        snapshot_revision: "0",
+      })
+    } finally {
+      rmSync(tempRoot, { recursive: true, force: true })
+    }
+  })
+
+  it("uses B2D-DURABLE-010 only for malformed or mismatched digests", () => {
+    const bytes = Buffer.from(JSON.stringify(emptyEvidence()))
+    const digests = [
+      "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "sha256:ABCDEF",
+      "sha256:abc",
+      "not-sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    ]
+    for (const durableEvidenceSha256 of digests) {
+      const result = runValidation({
+        skillMarkdown: skill,
+        documentAdmission: true,
+        outputJson: true,
+        durableEvidence: bytes,
+        durableEvidenceSha256,
+      })
+      hasRule(result.failures, "B2D-DURABLE-010")
+      assert.equal(result.admission_authorized, false)
+      assert.equal(result.durable_snapshot, null)
+    }
+  })
+
+  it("preserves legacy page failures when evidence arrives as a verified buffer", () => {
+    const first = evidencePage(
+      { total_rows: 2, complete: false, next_cursor: CURSOR_A },
+      [durableRun({ task_id: "row-1", child_conversation_id: 11 })]
+    )
+    const second = evidencePage(
+      {
+        total_rows: 2,
+        page_start: 1,
+        request_cursor: CURSOR_A,
+      },
+      [durableRun({ task_id: "row-2", child_conversation_id: 12 })]
+    )
+    const cases = [
+      [
+        "expired",
+        evidenceWrapper([
+          evidencePage(
+            {
+              snapshot_created_at: "2020-01-01T00:00:00.000Z",
+              snapshot_expires_at: "2020-01-01T00:01:00.000Z",
+            },
+            []
+          ),
+        ]),
+      ],
+      [
+        "mixed",
+        evidenceWrapper([
+          first,
+          { ...second, snapshot_revision: "43" },
+        ]),
+      ],
+      [
+        "incomplete",
+        evidenceWrapper([{ ...first, total_rows: 2 }]),
+      ],
+      [
+        "duplicate",
+        evidenceWrapper([
+          evidencePage({ total_rows: 2 }, [
+            durableRun(),
+            durableRun({ child_conversation_id: 12 }),
+          ]),
+        ]),
+      ],
+      ["reordered", evidenceWrapper([second, first])],
+    ]
+
+    for (const [label, value] of cases) {
+      const source = JSON.stringify(value)
+      const legacy = contractLib.parseDurableBindingEvidence(source)
+      const bytes = Buffer.from(source)
+      const verified = contractLib.parseDurableBindingEvidence(bytes, {
+        sha256: sha256(bytes),
+      })
+      assert.deepEqual(verified, legacy, label)
+      hasRule(verified.failures, "B2D-DURABLE-001")
+    }
+  })
+
+  it("rejects invalid UTF-8 and the 4 MiB plus one-byte boundary", () => {
+    for (const bytes of [
+      Buffer.from([0xc3, 0x28]),
+      Buffer.alloc(contractLib.MAX_DURABLE_EVIDENCE_BYTES + 1, 0x20),
+    ]) {
+      const parsed = contractLib.parseDurableBindingEvidence(bytes, {
+        sha256: sha256(bytes),
+      })
+      hasRule(parsed.failures, "B2D-DURABLE-001")
+      assert.deepEqual(parsed.runs, [])
+    }
+  })
+
+  it("enforces the digest flag at the bounded CLI file boundary", () => {
+    const tempRoot = mkdtempSync(join(tmpdir(), "b2d-artifact-cli-"))
+    try {
+      const artifactPath = join(tempRoot, "bindings.json")
+      const valid = Buffer.from(JSON.stringify(emptyEvidence()))
+      writeFileSync(artifactPath, valid)
+      const baseArgs = [
+        "--document-admission",
+        "--durable-evidence",
+        artifactPath,
+        "--output-json",
+      ]
+
+      const verified = spawnCli([
+        ...baseArgs,
+        "--durable-evidence-sha256",
+        sha256(valid),
+      ])
+      assert.equal(verified.status, 0)
+      assert.equal(verified.stderr, "")
+      assert.equal(JSON.parse(verified.stdout).admission_authorized, true)
+
+      const legacy = spawnCli(baseArgs)
+      assert.equal(legacy.status, 0)
+      assert.equal(JSON.parse(legacy.stdout).admission_authorized, true)
+
+      for (const digest of [
+        "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "sha256:ABCDEF",
+      ]) {
+        const rejected = spawnCli([
+          ...baseArgs,
+          "--durable-evidence-sha256",
+          digest,
+        ])
+        assert.notEqual(rejected.status, 0)
+        assert.equal(rejected.stderr, "")
+        hasRule(JSON.parse(rejected.stdout).failures, "B2D-DURABLE-010")
+      }
+
+      const durableTaskId = "00000000-0000-4000-8000-000000009999"
+      const blocked = Buffer.from(
+        JSON.stringify(
+          evidenceWrapper([
+            evidencePage(
+              {},
+              [
+                durableRun({
+                  task_id: durableTaskId,
+                  work_unit_key: "task|1|implementer|grok|none",
+                }),
+              ]
+            ),
+          ])
+        )
+      )
+      writeFileSync(artifactPath, blocked)
+      const blockedResult = spawnCli([
+        ...baseArgs,
+        "--durable-evidence-sha256",
+        sha256(blocked),
+      ])
+      assert.notEqual(blockedResult.status, 0)
+      const blockedJson = JSON.parse(blockedResult.stdout)
+      assert.doesNotMatch(JSON.stringify(blockedJson), /"runs"/)
+      assert.doesNotMatch(JSON.stringify(blockedJson), new RegExp(durableTaskId))
+
+      for (const bytes of [
+        Buffer.from([0xc3, 0x28]),
+        Buffer.alloc(contractLib.MAX_DURABLE_EVIDENCE_BYTES + 1, 0x20),
+      ]) {
+        writeFileSync(artifactPath, bytes)
+        const rejected = spawnCli([
+          ...baseArgs,
+          "--durable-evidence-sha256",
+          sha256(bytes),
+        ])
+        assert.notEqual(rejected.status, 0)
+        assert.equal(rejected.stderr, "")
+        hasRule(JSON.parse(rejected.stdout).failures, "B2D-DURABLE-001")
+      }
+    } finally {
+      rmSync(tempRoot, { recursive: true, force: true })
+    }
+  })
+})
+
+describe("artifact-first Skill contract", () => {
+  it("rejects every mutation that exposes or falls back from advertised artifacts", () => {
+    assert.deepEqual(validateSkillMarkdown(skill).failures, [])
+    const mutations = [
+      [
+        'request `delivery: "artifact"` once',
+        'request `delivery: "page"` once',
+      ],
+      [
+        "`artifact_sha256`\ndirectly to `--durable-evidence-sha256`",
+        "a recomputed digest\ndirectly to `--durable-evidence-sha256`",
+      ],
+      [
+        "Never open, read, print, copy,\nsummarize, embed, or delegate inspection of the artifact",
+        "Never print the artifact",
+      ],
+      ["never fall back to pages", "fall back to pages"],
+      [
+        "Use legacy page pagination only when the live\nschema does not advertise artifact delivery",
+        "Use legacy page pagination after artifact errors",
+      ],
+    ]
+    for (const [required, replacement] of mutations) {
+      assert.ok(skill.includes(required), required)
+      hasRule(
+        validateSkillMarkdown(skill.replace(required, replacement)).failures,
+        "B2D-SKILL-006"
+      )
+    }
+    assert.deepEqual(validateSkillMarkdown(realSkill).failures, [])
   })
 })
 

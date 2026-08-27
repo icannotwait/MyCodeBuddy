@@ -4,6 +4,7 @@
  */
 
 import { createHash } from "node:crypto"
+import { TextDecoder } from "node:util"
 
 export const MAX_PLAN_DOCUMENT_BYTES = 2 * 1024 * 1024
 export const MAX_PROGRESS_DOCUMENT_BYTES = 512 * 1024
@@ -69,6 +70,7 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 const CURSOR_RE = /^[A-Za-z0-9_-]{1,128}$/
 const UTC_INSTANT_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/
 const MAX_U64 = 18446744073709551615n
+const SHA256_RE = /^sha256:[0-9a-f]{64}$/
 
 const MAX_I32 = 0x7fffffff
 const MAX_U32 = 0xffffffff
@@ -5699,6 +5701,22 @@ export function validateSkillMarkdown(skillMarkdown) {
       "Skill prose contradicts required v2 ownership or routing"
     )
   }
+  const compactProse = prose.replace(/\s+/g, " ")
+  const artifactFirstDirectives = [
+    /inspect the live binding-query schema/i,
+    /advertises artifact delivery, request `delivery: "artifact"` once/i,
+    /`artifact_path` directly to `--durable-evidence` and `artifact_sha256` directly to `--durable-evidence-sha256`/i,
+    /never open, read, print, copy, summarize, embed, or delegate inspection of the artifact/i,
+    /artifact request, descriptor, digest, stale, validator, and cleanup errors as blocking and never fall back to pages/i,
+    /legacy page pagination only when the live schema does not advertise artifact delivery/i,
+  ]
+  if (!artifactFirstDirectives.every((directive) => directive.test(compactProse))) {
+    fail(
+      failures,
+      "B2D-SKILL-006",
+      "Skill must use advertised binding artifacts directly and fail closed"
+    )
+  }
 
   return { failures, notes }
 }
@@ -7509,8 +7527,50 @@ export function parseDurableBindingEvidence(source, options = {}) {
   const failures = []
   const now = options.now instanceof Date ? options.now.getTime() : Date.now()
   let value = source
-  if (typeof source === "string") {
-    if (byteLength(source) > MAX_DURABLE_EVIDENCE_BYTES) {
+  if (Buffer.isBuffer(source)) {
+    if (source.length > MAX_DURABLE_EVIDENCE_BYTES) {
+      fail(
+        failures,
+        "B2D-DURABLE-001",
+        "durable evidence exceeds the 4 MiB limit"
+      )
+      return { pages: [], runs: [], snapshot: null, failures }
+    }
+    if (options.sha256 !== undefined && options.sha256 !== null) {
+      if (typeof options.sha256 !== "string" || !SHA256_RE.test(options.sha256)) {
+        fail(
+          failures,
+          "B2D-DURABLE-010",
+          "durable evidence SHA-256 is malformed"
+        )
+        return { pages: [], runs: [], snapshot: null, failures }
+      }
+      const actual = `sha256:${createHash("sha256").update(source).digest("hex")}`
+      if (actual !== options.sha256) {
+        fail(
+          failures,
+          "B2D-DURABLE-010",
+          "durable evidence SHA-256 does not match the artifact bytes"
+        )
+        return { pages: [], runs: [], snapshot: null, failures }
+      }
+    }
+    try {
+      value = new TextDecoder("utf-8", { fatal: true }).decode(source)
+    } catch (error) {
+      if (error instanceof TypeError) {
+        fail(
+          failures,
+          "B2D-DURABLE-001",
+          "durable evidence is not valid UTF-8"
+        )
+        return { pages: [], runs: [], snapshot: null, failures }
+      }
+      throw error
+    }
+  }
+  if (typeof value === "string") {
+    if (byteLength(value) > MAX_DURABLE_EVIDENCE_BYTES) {
       fail(
         failures,
         "B2D-DURABLE-001",
@@ -7519,7 +7579,7 @@ export function parseDurableBindingEvidence(source, options = {}) {
       return { pages: [], runs: [], snapshot: null, failures }
     }
     try {
-      value = JSON.parse(source)
+      value = JSON.parse(value)
     } catch {
       fail(failures, "B2D-DURABLE-001", "durable evidence is not valid JSON")
       return { pages: [], runs: [], snapshot: null, failures }
@@ -8373,7 +8433,7 @@ function validationEnvelope(failures, taskBindings = [], extras = {}) {
   }
 }
 
-function parseEvidenceOption(raw, now) {
+function parseEvidenceOption(raw, now, sha256) {
   if (raw === undefined || raw === null) {
     return {
       pages: [],
@@ -8382,7 +8442,7 @@ function parseEvidenceOption(raw, now) {
       failures: ["[B2D-CLI-001] durable evidence is required"],
     }
   }
-  return parseDurableBindingEvidence(raw, { now })
+  return parseDurableBindingEvidence(raw, { now, sha256 })
 }
 
 function documentAdmissionBlocks(runs) {
@@ -8431,7 +8491,11 @@ export function runValidation(options = {}) {
         "document admission requires --durable-evidence and --output-json"
       )
     }
-    const evidence = parseEvidenceOption(options.durableEvidence, options.now)
+    const evidence = parseEvidenceOption(
+      options.durableEvidence,
+      options.now,
+      options.durableEvidenceSha256
+    )
     failures.push(...evidence.failures)
     if (failures.length > 0) return validationEnvelope(failures)
     if (documentAdmissionBlocks(evidence.runs)) {
@@ -8528,7 +8592,11 @@ export function runValidation(options = {}) {
       )
     }
     if (admission) {
-      const evidence = parseEvidenceOption(options.durableEvidence, options.now)
+      const evidence = parseEvidenceOption(
+        options.durableEvidence,
+        options.now,
+        options.durableEvidenceSha256
+      )
       failures.push(...evidence.failures)
       if (
         failures.length > 0 ||

@@ -5244,6 +5244,129 @@ mod tests {
         assert!((1..72).contains(&usize::from(fitting)));
     }
 
+    #[test]
+    fn delegation_binding_session_4123_phase1_artifact_replay() {
+        let fixture: Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/delegation_binding_session_4123.json"
+        )))
+        .unwrap();
+        let baseline = &fixture["baseline"];
+        let legacy_bytes = baseline["model_visible_result_bytes"].as_u64().unwrap() as usize;
+        let rows = fixture["rows"].as_array().unwrap();
+        let expected_task_ids = rows
+            .iter()
+            .map(|row| row["task_id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        let page: DelegationOrchestrationBindingPage = serde_json::from_value(json!({
+            "schema_version": 1,
+            "namespace": "brainstorm-to-delivery",
+            "snapshot_id": "00000000-0000-4000-8000-000000004123",
+            "snapshot_revision": "0",
+            "snapshot_created_at": "2026-08-26T08:00:00Z",
+            "snapshot_expires_at": "2026-08-26T08:01:00Z",
+            "total_rows": rows.len(),
+            "page_start": 0,
+            "request_cursor": null,
+            "runs": rows,
+            "next_cursor": null,
+            "complete": true
+        }))
+        .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let inflight = Arc::new(InflightCalls::new());
+        let mut model_history = Vec::with_capacity(125);
+
+        for scan_index in 0..125 {
+            let (descriptor, pending) = store_binding_artifact_at(
+                temp.path(),
+                "00000000-0000-4000-8000-000000004123",
+                vec![page.clone()],
+                &inflight,
+            )
+            .unwrap();
+            let local_bytes = std::fs::read(&descriptor.artifact_path).unwrap();
+            let local_evidence: BindingEvidenceV1 = serde_json::from_slice(&local_bytes).unwrap();
+            let artifact_task_ids = local_evidence.pages[0]
+                .runs
+                .iter()
+                .map(|run| run.task_id.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(artifact_task_ids, expected_task_ids);
+            assert_eq!(descriptor.artifact_bytes as usize, local_bytes.len());
+            assert_eq!(
+                descriptor.artifact_sha256,
+                format!("sha256:{:x}", Sha256::digest(&local_bytes))
+            );
+
+            let (response, pending) = finalize_orchestration_binding_artifact_response(
+                json!(format!("session-4123-artifact-{scan_index}")),
+                descriptor,
+                pending,
+            );
+            let pending = pending.expect("fixture artifact result must fit the public budget");
+            assert!(!value_contains_key(
+                response.result.as_ref().unwrap(),
+                "runs"
+            ));
+            model_history.push(serialize_jsonrpc_line(&response).unwrap());
+            pending.mark_delivered();
+        }
+
+        let artifact_results = model_history
+            .iter()
+            .filter(|line| {
+                serde_json::from_slice::<Value>(line)
+                    .unwrap()
+                    .pointer("/result/structuredContent/delivery")
+                    .and_then(Value::as_str)
+                    == Some("artifact")
+            })
+            .count();
+        let continuation_results = model_history
+            .iter()
+            .filter(|line| {
+                serde_json::from_slice::<Value>(line)
+                    .unwrap()
+                    .pointer("/result/structuredContent/next_cursor")
+                    .is_some()
+            })
+            .count();
+        let artifact_result_bytes = model_history.iter().map(Vec::len).sum::<usize>();
+        let reduction_percent = 100 - artifact_result_bytes * 100 / legacy_bytes;
+
+        assert_eq!(artifact_results, 125);
+        assert_eq!(continuation_results, 0);
+        assert!(artifact_result_bytes <= 262_144);
+        assert!(artifact_result_bytes * 10 <= legacy_bytes);
+        assert!(reduction_percent >= 90);
+        assert_eq!(baseline["first_page_calls"], 125);
+        assert_eq!(baseline["continuation_page_calls"], 670);
+        assert_eq!(baseline["total_binding_query_calls"], 795);
+        assert_eq!(baseline["final_row_count"], 72);
+        assert_eq!(
+            fixture["expected_sequence"],
+            json!([
+                { "label": "selected_identity_rows", "value": 72 },
+                { "label": "legacy_model_visible_first_page_calls", "value": 125 },
+                { "label": "artifact_model_visible_calls", "value": 125 },
+                { "label": "legacy_model_visible_continuation_page_calls", "value": 670 },
+                { "label": "artifact_model_visible_continuation_page_calls", "value": 0 },
+                { "label": "legacy_total_binding_query_calls", "value": 795 },
+                { "label": "legacy_model_visible_binding_result_jsonl_utf8_bytes", "value": 3_040_870 },
+                { "label": "artifact_aggregate_result_jsonl_utf8_bytes_max", "value": 262_144 },
+                { "label": "artifact_reduction_percent_min", "value": 90 },
+                { "label": "selected_identity_order", "value": "unchanged" },
+                { "label": "validator_reconciliation_decisions", "value": "unchanged" },
+                { "label": "dispatch_labels", "value": "unchanged" }
+            ])
+        );
+        println!(
+            "session-4123 Phase 1: artifact_results={artifact_results}, continuation_results={continuation_results}, result_bytes={artifact_result_bytes}, reduction={reduction_percent}%"
+        );
+        inflight.drain_binding_artifacts();
+    }
+
     fn transport_sized_orchestration_page(page: &Value, page_limit: usize) -> Value {
         let mut bounded = page.clone();
         let runs = bounded["runs"].as_array_mut().unwrap();

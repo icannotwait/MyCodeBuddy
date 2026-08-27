@@ -1594,7 +1594,7 @@ fn skill_forward_published_high_vector_digest() {
 }
 
 #[test]
-fn skill_forward_route_change_and_admission_cadence() {
+fn phase1_artifact_skill_forward_route_change_and_admission_cadence() {
     let skill_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join(".agents")
@@ -1603,6 +1603,10 @@ fn skill_forward_route_change_and_admission_cadence() {
         .join("SKILL.md");
     let skill = std::fs::read_to_string(&skill_path)
         .unwrap_or_else(|error| panic!("read {}: {error}", skill_path.display()));
+    assert!(
+        skill.lines().count() < 500,
+        "Skill must stay below 500 lines"
+    );
     for needle in [
         "pending_route_change",
         "status-only refresh required:",
@@ -1614,6 +1618,13 @@ fn skill_forward_route_change_and_admission_cadence() {
         "simple_orchestration_binding_mismatch",
         "simple_orchestration_binding_orphan",
         "adopted_after_lost_acknowledgement",
+        "Inspect the live binding-query schema.",
+        "request `delivery: \"artifact\"` once",
+        "`artifact_path` directly to `--durable-evidence`",
+        "`artifact_sha256` directly to `--durable-evidence-sha256`",
+        "Never open, read, print, copy, summarize, embed, or delegate inspection of the artifact.",
+        "never fall back to pages",
+        "Use legacy page pagination only when the live schema does not advertise artifact delivery.",
     ] {
         assert!(
             skill.contains(needle),
@@ -1621,20 +1632,63 @@ fn skill_forward_route_change_and_admission_cadence() {
         );
     }
     for checkpoint in [
-        "Fetch every page of a fresh snapshot and pass full admission against the unchanged Plan/progress.",
+        "Run fresh full admission against the unchanged Plan/progress with the complete-snapshot procedure.",
         "Prove every affected Task is pending with an empty run list and no selected durable row in any status.",
         "Persist `pending_route_change` with the requested Agent/profile, next generation, first affected index, and complete affected suffix.",
         "Confirm that exact Agent/profile is currently available; keep the intent and block on unavailability rather than substituting.",
         "Continue the same Plan Author to append the generation and rewrite only that suffix.",
-        "Run Author then parent Plan-only derivation, resynchronize only those entries from the parent's exact output, pass combined static validation and a newly queried full admission, then continue every Plan Reviewer for complete re-review.",
-        "After approval, fetch a new complete snapshot, pass full admission, clear `pending_route_change` to null, persist, and fetch/pass full admission again before the next Task.",
-        "At any interruption, retain the intent, re-read Plan/progress/reviews, fetch a new complete snapshot, and identify the checkpoint.",
+        "Run Author then parent Plan-only derivation, resynchronize only those entries from the parent's exact output, pass combined static validation and fresh full admission with the procedure, then continue every Plan Reviewer for complete re-review.",
+        "After approval, run the procedure for full admission, clear `pending_route_change` to null, persist, and run it again before the next Task.",
+        "At any interruption, retain the intent, re-read Plan/progress/reviews, run the procedure, and identify the checkpoint.",
     ] {
         assert!(
             skill.contains(checkpoint),
             "Skill must encode route-change checkpoint: {checkpoint}"
         );
     }
+
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "fixtures/delegation_binding_session_4123.json"
+    ))
+    .unwrap();
+    let rows = fixture["rows"].as_array().unwrap();
+    let expected_task_ids = rows
+        .iter()
+        .map(|row| row["task_id"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    let artifact_bytes = serde_json::to_vec(&serde_json::json!({
+        "schema_version": 1,
+        "pages": [{
+            "schema_version": 1,
+            "namespace": "brainstorm-to-delivery",
+            "snapshot_id": "00000000-0000-4000-8000-000000004123",
+            "snapshot_revision": "0",
+            "snapshot_created_at": "2026-08-26T08:00:00Z",
+            "snapshot_expires_at": "2026-08-26T08:01:00Z",
+            "total_rows": rows.len(),
+            "page_start": 0,
+            "request_cursor": null,
+            "runs": rows,
+            "next_cursor": null,
+            "complete": true
+        }]
+    }))
+    .unwrap();
+    let artifact: serde_json::Value = serde_json::from_slice(&artifact_bytes).unwrap();
+    let artifact_task_ids = artifact["pages"][0]["runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["task_id"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(artifact_task_ids, expected_task_ids);
+    assert_eq!(
+        format!("sha256:{:x}", Sha256::digest(&artifact_bytes)).len(),
+        71
+    );
+    assert_eq!(fixture["expected_sequence"][9]["value"], "unchanged");
+    assert_eq!(fixture["expected_sequence"][10]["value"], "unchanged");
+    assert_eq!(fixture["expected_sequence"][11]["value"], "unchanged");
 }
 
 #[tokio::test]
