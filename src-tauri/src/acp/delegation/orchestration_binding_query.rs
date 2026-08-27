@@ -33,6 +33,7 @@ struct SnapshotState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AdmissionTicketState {
     Issued,
+    Consumed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,6 +49,25 @@ pub(crate) struct AdmissionTicketEntry {
     pub request_fingerprint: String,
     pub intent_digest: String,
     pub state: AdmissionTicketState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AdmissionTicketClaims {
+    pub dispatch_intent_id: String,
+    pub request_fingerprint: String,
+    pub intent_digest: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AdmissionTicketConsumeError {
+    Stale,
+    Mismatch,
+    Consumed,
+}
+
+pub(crate) struct OrchestrationMutationGuard<'a> {
+    owner: &'a OrchestrationBindingSnapshotCache,
+    _guard: tokio::sync::RwLockWriteGuard<'a, ()>,
 }
 
 #[derive(Clone)]
@@ -84,20 +104,98 @@ impl OrchestrationBindingSnapshotCache {
         Self::default()
     }
 
-    pub(crate) async fn mutation_guard(&self) -> tokio::sync::RwLockWriteGuard<'_, ()> {
-        self.mutation_gate.write().await
+    pub(crate) async fn mutation_guard(&self) -> OrchestrationMutationGuard<'_> {
+        OrchestrationMutationGuard {
+            owner: self,
+            _guard: self.mutation_gate.write().await,
+        }
     }
 
-    pub(crate) async fn record_parent_mutation(&self, parent_id: i32) {
+    pub(crate) fn assert_guard_owner(&self, guard: &OrchestrationMutationGuard<'_>) {
+        assert!(
+            std::ptr::eq(self, guard.owner),
+            "orchestration mutation guard belongs to another cache"
+        );
+    }
+
+    pub(crate) async fn consume_admission_ticket_under_guard(
+        &self,
+        guard: &OrchestrationMutationGuard<'_>,
+        ticket_id: &str,
+        parent_id: i32,
+        connection_incarnation: &str,
+        namespace: &str,
+        intent: &AdmissionIntentV1,
+        now: DateTime<Utc>,
+    ) -> Result<AdmissionTicketClaims, AdmissionTicketConsumeError> {
+        self.assert_guard_owner(guard);
+        let mut state = self.state.lock().await;
+        state
+            .snapshots
+            .retain(|_, snapshot| snapshot.expires_at > now);
+        state.tickets.retain(|_, ticket| ticket.expires_at > now);
+
+        let current_revision = state.revisions.get(&parent_id).copied().unwrap_or(0);
+        let Some(ticket) = state.tickets.get(ticket_id) else {
+            return Err(AdmissionTicketConsumeError::Stale);
+        };
+        let intent_digest = intent.canonical_digest();
+        if ticket.parent_id != parent_id
+            || ticket.connection_incarnation != connection_incarnation
+            || ticket.namespace != namespace
+            || intent
+                .orchestration_binding
+                .as_ref()
+                .is_some_and(|binding| binding.namespace != namespace)
+            || ticket.dispatch_intent_id != intent.dispatch_intent_id
+            || ticket.request_fingerprint != intent.request_fingerprint
+            || ticket.intent_digest != intent_digest
+        {
+            return Err(AdmissionTicketConsumeError::Mismatch);
+        }
+        if ticket.state == AdmissionTicketState::Consumed {
+            return Err(AdmissionTicketConsumeError::Consumed);
+        }
+        let snapshot_is_current =
+            state
+                .snapshots
+                .get(&ticket.snapshot_id)
+                .is_some_and(|snapshot| {
+                    snapshot.parent_id == ticket.parent_id
+                        && snapshot.namespace == ticket.namespace
+                        && snapshot.revision == ticket.snapshot_revision
+                });
+        if !snapshot_is_current || ticket.snapshot_revision != current_revision {
+            return Err(AdmissionTicketConsumeError::Stale);
+        }
+
+        let ticket = state
+            .tickets
+            .get_mut(ticket_id)
+            .expect("ticket remained present while state lock was held");
+        ticket.state = AdmissionTicketState::Consumed;
+        Ok(AdmissionTicketClaims {
+            dispatch_intent_id: ticket.dispatch_intent_id.clone(),
+            request_fingerprint: ticket.request_fingerprint.clone(),
+            intent_digest: ticket.intent_digest.clone(),
+        })
+    }
+
+    pub(crate) async fn record_parent_mutation(
+        &self,
+        guard: &OrchestrationMutationGuard<'_>,
+        parent_id: i32,
+    ) {
+        self.assert_guard_owner(guard);
         let mut state = self.state.lock().await;
         let revision = state.revisions.entry(parent_id).or_default();
         *revision = revision.saturating_add(1);
         state
             .snapshots
             .retain(|_, snapshot| snapshot.parent_id != parent_id);
-        state
-            .tickets
-            .retain(|_, ticket| ticket.parent_id != parent_id);
+        state.tickets.retain(|_, ticket| {
+            ticket.parent_id != parent_id || ticket.state == AdmissionTicketState::Consumed
+        });
     }
 
     pub(crate) async fn first_page_with_admission_loader<F, Fut>(
@@ -576,6 +674,224 @@ mod tests {
         assert_eq!(entry.state, AdmissionTicketState::Issued);
     }
 
+    async fn issue_test_ticket(
+        cache: &OrchestrationBindingSnapshotCache,
+        intent: AdmissionIntentV1,
+        now: DateTime<Utc>,
+    ) -> String {
+        let envelope = cache
+            .first_page_with_admission_loader(
+                20,
+                "connection-incarnation-a",
+                query("brainstorm-to-delivery", 200),
+                None,
+                intent,
+                now,
+                || async { Ok((Vec::new(), None)) },
+            )
+            .await
+            .unwrap();
+        let AdmissionPreparation::Prepared { ticket, .. } = envelope.admission else {
+            panic!("new intent must issue a ticket");
+        };
+        ticket
+    }
+
+    #[tokio::test]
+    async fn ticket_v1_atomic_admission_scope_before_burn_stale_and_tombstone_classes() {
+        let cache = OrchestrationBindingSnapshotCache::new();
+        let now = Utc.with_ymd_and_hms(2026, 8, 26, 8, 0, 0).unwrap();
+        let intent = admission_intent(AdmissionIntentKind::First, None, None);
+        let ticket = issue_test_ticket(&cache, intent.clone(), now).await;
+        let guard = cache.mutation_guard().await;
+
+        assert_eq!(
+            cache
+                .consume_admission_ticket_under_guard(
+                    &guard,
+                    &ticket,
+                    21,
+                    "connection-incarnation-a",
+                    "brainstorm-to-delivery",
+                    &intent,
+                    now,
+                )
+                .await,
+            Err(AdmissionTicketConsumeError::Mismatch)
+        );
+        assert_eq!(
+            cache
+                .consume_admission_ticket_under_guard(
+                    &guard,
+                    &ticket,
+                    20,
+                    "connection-incarnation-b",
+                    "brainstorm-to-delivery",
+                    &intent,
+                    now,
+                )
+                .await,
+            Err(AdmissionTicketConsumeError::Mismatch)
+        );
+        assert_eq!(
+            cache
+                .consume_admission_ticket_under_guard(
+                    &guard,
+                    &ticket,
+                    20,
+                    "connection-incarnation-a",
+                    "other-namespace",
+                    &intent,
+                    now,
+                )
+                .await,
+            Err(AdmissionTicketConsumeError::Mismatch)
+        );
+
+        let mut wrong_intent = intent.clone();
+        wrong_intent.dispatch_intent_id = "4a67bba4-e1f5-46d1-a9b1-aa796598ffce".into();
+        assert_eq!(
+            cache
+                .consume_admission_ticket_under_guard(
+                    &guard,
+                    &ticket,
+                    20,
+                    "connection-incarnation-a",
+                    "brainstorm-to-delivery",
+                    &wrong_intent,
+                    now,
+                )
+                .await,
+            Err(AdmissionTicketConsumeError::Mismatch)
+        );
+        wrong_intent = intent.clone();
+        wrong_intent.request_fingerprint = "b".repeat(64);
+        assert_eq!(
+            cache
+                .consume_admission_ticket_under_guard(
+                    &guard,
+                    &ticket,
+                    20,
+                    "connection-incarnation-a",
+                    "brainstorm-to-delivery",
+                    &wrong_intent,
+                    now,
+                )
+                .await,
+            Err(AdmissionTicketConsumeError::Mismatch)
+        );
+        wrong_intent = intent.clone();
+        wrong_intent.work_unit_key = "task|10|reviewer|codex|none".into();
+        assert_eq!(
+            cache
+                .consume_admission_ticket_under_guard(
+                    &guard,
+                    &ticket,
+                    20,
+                    "connection-incarnation-a",
+                    "brainstorm-to-delivery",
+                    &wrong_intent,
+                    now,
+                )
+                .await,
+            Err(AdmissionTicketConsumeError::Mismatch)
+        );
+        assert_eq!(
+            cache.state.lock().await.tickets[&ticket].state,
+            AdmissionTicketState::Issued
+        );
+
+        cache
+            .consume_admission_ticket_under_guard(
+                &guard,
+                &ticket,
+                20,
+                "connection-incarnation-a",
+                "brainstorm-to-delivery",
+                &intent,
+                now,
+            )
+            .await
+            .expect("rightful caller consumes ticket");
+        cache.record_parent_mutation(&guard, 20).await;
+        assert_eq!(
+            cache
+                .consume_admission_ticket_under_guard(
+                    &guard,
+                    &ticket,
+                    20,
+                    "connection-incarnation-a",
+                    "brainstorm-to-delivery",
+                    &intent,
+                    now,
+                )
+                .await,
+            Err(AdmissionTicketConsumeError::Consumed)
+        );
+        drop(guard);
+
+        let stale_intent = admission_intent(AdmissionIntentKind::First, None, None);
+        let stale_ticket = issue_test_ticket(&cache, stale_intent.clone(), now).await;
+        let guard = cache.mutation_guard().await;
+        cache.record_parent_mutation(&guard, 20).await;
+        assert_eq!(
+            cache
+                .consume_admission_ticket_under_guard(
+                    &guard,
+                    &stale_ticket,
+                    20,
+                    "connection-incarnation-a",
+                    "brainstorm-to-delivery",
+                    &stale_intent,
+                    now,
+                )
+                .await,
+            Err(AdmissionTicketConsumeError::Stale)
+        );
+    }
+
+    #[tokio::test]
+    async fn ticket_v1_concurrent_consume_one_winner_one_consumed_tombstone() {
+        let cache = Arc::new(OrchestrationBindingSnapshotCache::new());
+        let now = Utc.with_ymd_and_hms(2026, 8, 26, 8, 0, 0).unwrap();
+        let intent = admission_intent(AdmissionIntentKind::First, None, None);
+        let ticket = issue_test_ticket(&cache, intent.clone(), now).await;
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+
+        let consume = |cache: Arc<OrchestrationBindingSnapshotCache>| {
+            let barrier = barrier.clone();
+            let ticket = ticket.clone();
+            let intent = intent.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                let guard = cache.mutation_guard().await;
+                cache
+                    .consume_admission_ticket_under_guard(
+                        &guard,
+                        &ticket,
+                        20,
+                        "connection-incarnation-a",
+                        "brainstorm-to-delivery",
+                        &intent,
+                        now,
+                    )
+                    .await
+            })
+        };
+        let first = consume(cache.clone());
+        let second = consume(cache);
+        barrier.wait().await;
+        let outcomes = [first.await.unwrap(), second.await.unwrap()];
+        assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| { **outcome == Err(AdmissionTicketConsumeError::Consumed) })
+                .count(),
+            1
+        );
+    }
+
     #[tokio::test]
     async fn orchestration_admission_ticket_issue_expires_restarts_invalidates_and_purges() {
         let cache = OrchestrationBindingSnapshotCache::new();
@@ -613,7 +929,9 @@ mod tests {
         let AdmissionPreparation::Prepared { ticket, .. } = current.admission else {
             panic!("new intent must issue a ticket");
         };
-        cache.record_parent_mutation(20).await;
+        let guard = cache.mutation_guard().await;
+        cache.record_parent_mutation(&guard, 20).await;
+        drop(guard);
         assert!(
             !cache.state.lock().await.tickets.contains_key(&ticket),
             "parent mutation must invalidate issued tickets"
@@ -897,7 +1215,7 @@ mod tests {
             cursor: fresh.next_cursor,
         };
         let guard = cache.mutation_guard().await;
-        cache.record_parent_mutation(20).await;
+        cache.record_parent_mutation(&guard, 20).await;
         drop(guard);
         assert_eq!(
             cache

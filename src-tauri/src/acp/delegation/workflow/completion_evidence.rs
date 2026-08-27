@@ -4262,6 +4262,7 @@ mod tests {
             let error = super::super::with_historical_workflow_fixture_mutations(
                 runs.admit_continue_reserving(ContinueRunAdmission {
                     task_id: format!("{}-continue", fixture.task_id),
+                    dispatch_intent_id: None,
                     parent_conversation_id: fixture.parent_conversation_id,
                     parent_tool_use_id: format!("continue-{}", fixture.task_id),
                     target_task_id: fixture.task_id.clone(),

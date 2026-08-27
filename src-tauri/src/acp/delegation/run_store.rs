@@ -24,7 +24,8 @@ use unicode_normalization::UnicodeNormalization;
 
 use crate::acp::delegation::launch_snapshot::{snapshot_is_complete, LaunchSnapshot};
 use crate::acp::delegation::orchestration_binding_query::{
-    materialize_binding_rows, validate_admission_intent_source, OrchestrationBindingSnapshotCache,
+    materialize_binding_rows, validate_admission_intent_source, AdmissionTicketClaims,
+    AdmissionTicketConsumeError, OrchestrationBindingSnapshotCache, OrchestrationMutationGuard,
 };
 use crate::acp::delegation::recovery_policy::{
     decide_delegation_recovery, hash_external_session_identity, RecoveryConfirmation,
@@ -771,6 +772,7 @@ pub enum ContinueDecision {
 #[derive(Debug, Clone)]
 pub struct ContinueRunAdmission {
     pub task_id: String,
+    pub dispatch_intent_id: Option<String>,
     pub parent_conversation_id: i32,
     pub parent_tool_use_id: String,
     pub target_task_id: String,
@@ -2348,6 +2350,50 @@ impl RunStore {
         &self.db
     }
 
+    pub(crate) async fn orchestration_mutation_guard(&self) -> OrchestrationMutationGuard<'_> {
+        self.orchestration_binding_snapshots.mutation_guard().await
+    }
+
+    pub(crate) async fn consume_admission_ticket_under_guard(
+        &self,
+        guard: &OrchestrationMutationGuard<'_>,
+        ticket_id: &str,
+        parent_id: i32,
+        connection_incarnation: &str,
+        namespace: &str,
+        intent: &AdmissionIntentV1,
+    ) -> Result<AdmissionTicketClaims, AdmissionTicketConsumeError> {
+        self.orchestration_binding_snapshots
+            .consume_admission_ticket_under_guard(
+                guard,
+                ticket_id,
+                parent_id,
+                connection_incarnation,
+                namespace,
+                intent,
+                Utc::now(),
+            )
+            .await
+    }
+
+    pub(crate) async fn load_dispatch_intent_under_guard(
+        &self,
+        guard: &OrchestrationMutationGuard<'_>,
+        parent_id: i32,
+        dispatch_intent_id: &str,
+        projection: &DispatchIntentReplayProjection,
+    ) -> Result<Option<PersistedRun>, TaskStoreError> {
+        self.orchestration_binding_snapshots
+            .assert_guard_owner(guard);
+        let existing = self
+            .load_by_dispatch_intent(parent_id, dispatch_intent_id)
+            .await?;
+        if let Some(existing) = existing.as_ref() {
+            existing.ensure_dispatch_intent_replay(projection)?;
+        }
+        Ok(existing)
+    }
+
     pub async fn get_orchestration_binding_page(
         &self,
         parent_id: i32,
@@ -2730,7 +2776,7 @@ impl RunStore {
     /// fences → [`TaskStoreError::BusyThread`].
     pub async fn insert_reserving(&self, insert: ReservingRunInsert) -> Result<(), TaskStoreError> {
         let parent_id = insert.parent_conversation_id;
-        let _mutation_guard = self.orchestration_binding_snapshots.mutation_guard().await;
+        let mutation_guard = self.orchestration_binding_snapshots.mutation_guard().await;
         let outcome = self
             .db
             .conn
@@ -2743,7 +2789,7 @@ impl RunStore {
         match outcome {
             Ok(()) => {
                 self.orchestration_binding_snapshots
-                    .record_parent_mutation(parent_id)
+                    .record_parent_mutation(&mutation_guard, parent_id)
                     .await;
                 Ok(())
             }
@@ -2814,7 +2860,7 @@ impl RunStore {
         // Prefer a single transaction so run delete + run_binding cleanup +
         // graph_revision bump stay atomic (A10/B5 provisional abandon clock).
         let task_id_owned = task_id.to_string();
-        let _mutation_guard = self.orchestration_binding_snapshots.mutation_guard().await;
+        let mutation_guard = self.orchestration_binding_snapshots.mutation_guard().await;
         let outcome = self
             .db
             .conn
@@ -2890,7 +2936,10 @@ impl RunStore {
                 if reclaimed {
                     self.emit_workflow_effect(&effect);
                     self.orchestration_binding_snapshots
-                        .record_parent_mutation(parent_id.expect("deleted run has parent"))
+                        .record_parent_mutation(
+                            &mutation_guard,
+                            parent_id.expect("deleted run has parent"),
+                        )
                         .await;
                 }
                 Ok(reclaimed)
@@ -2929,8 +2978,20 @@ impl RunStore {
         insert: ReservingRunInsert,
         authorization: RecoveryAdmissionAuthorization,
     ) -> Result<Gen1AdmitOutcome, TaskStoreError> {
+        let mutation_guard = self.orchestration_mutation_guard().await;
+        self.admit_gen1_reserving_authorized_under_guard(&mutation_guard, insert, authorization)
+            .await
+    }
+
+    pub(crate) async fn admit_gen1_reserving_authorized_under_guard(
+        &self,
+        mutation_guard: &OrchestrationMutationGuard<'_>,
+        insert: ReservingRunInsert,
+        authorization: RecoveryAdmissionAuthorization,
+    ) -> Result<Gen1AdmitOutcome, TaskStoreError> {
         let parent_id = insert.parent_conversation_id;
-        let _mutation_guard = self.orchestration_binding_snapshots.mutation_guard().await;
+        self.orchestration_binding_snapshots
+            .assert_guard_owner(mutation_guard);
         // (idempotent_existing, post-commit workflow side effect)
         type Gen1Txn = (
             Option<PersistedRun>,
@@ -3151,7 +3212,7 @@ impl RunStore {
             Ok((None, effect, recovery_decision)) => {
                 self.emit_workflow_effect(&effect);
                 self.orchestration_binding_snapshots
-                    .record_parent_mutation(parent_id)
+                    .record_parent_mutation(mutation_guard, parent_id)
                     .await;
                 let run = self
                     .load_by_task_id(&insert.task_id)
@@ -3236,8 +3297,24 @@ impl RunStore {
         admission: ContinueRunAdmission,
         authorization: RecoveryAdmissionAuthorization,
     ) -> Result<ContinueAdmitOutcome, TaskStoreError> {
+        let mutation_guard = self.orchestration_mutation_guard().await;
+        self.admit_continue_reserving_authorized_under_guard(
+            &mutation_guard,
+            admission,
+            authorization,
+        )
+        .await
+    }
+
+    pub(crate) async fn admit_continue_reserving_authorized_under_guard(
+        &self,
+        mutation_guard: &OrchestrationMutationGuard<'_>,
+        admission: ContinueRunAdmission,
+        authorization: RecoveryAdmissionAuthorization,
+    ) -> Result<ContinueAdmitOutcome, TaskStoreError> {
         let parent_id = admission.parent_conversation_id;
-        let _mutation_guard = self.orchestration_binding_snapshots.mutation_guard().await;
+        self.orchestration_binding_snapshots
+            .assert_guard_owner(mutation_guard);
         #[cfg(any(test, feature = "test-utils"))]
         let mut continue_admission_gate = self.continue_admission_gate.lock().await.take();
 
@@ -3427,7 +3504,7 @@ impl RunStore {
                     }
 
                     let insert = ReservingRunInsert {
-                        dispatch_intent_id: None,
+                        dispatch_intent_id: admission.dispatch_intent_id,
                         orchestration_binding: effective_orchestration_binding,
                         task_id: admission.task_id.clone(),
                         root_task_id: target.root_task_id.clone(),
@@ -3502,7 +3579,7 @@ impl RunStore {
             Ok((None, effect, recovery_decision)) => {
                 self.emit_workflow_effect(&effect);
                 self.orchestration_binding_snapshots
-                    .record_parent_mutation(parent_id)
+                    .record_parent_mutation(mutation_guard, parent_id)
                     .await;
                 let run = self
                     .load_by_task_id(&admission.task_id)
@@ -3928,7 +4005,7 @@ impl RunStore {
         #[cfg(not(any(test, feature = "test-utils")))]
         let inject_identity_failure = false;
 
-        let _mutation_guard = self.orchestration_binding_snapshots.mutation_guard().await;
+        let mutation_guard = self.orchestration_binding_snapshots.mutation_guard().await;
         let outcome = self
             .db
             .conn
@@ -4087,7 +4164,7 @@ impl RunStore {
                 self.emit_workflow_effect(&effect);
                 if matches!(&settlement, Some(Settlement::Won(_))) {
                     self.orchestration_binding_snapshots
-                        .record_parent_mutation(parent_id)
+                        .record_parent_mutation(&mutation_guard, parent_id)
                         .await;
                 }
                 Ok(settlement)
@@ -4163,7 +4240,7 @@ impl RunStore {
         child_connection_id: &str,
         prompt_accepted_at: DateTime<Utc>,
     ) -> Result<PromoteRunningOutcome, TaskStoreError> {
-        let _mutation_guard = self.orchestration_binding_snapshots.mutation_guard().await;
+        let mutation_guard = self.orchestration_binding_snapshots.mutation_guard().await;
         let policy = PromoteRetryPolicy::production();
         let mut meta = PromoteAttemptMeta::default();
         let mut last_retry: Option<(PromoteRetryClass, String)> = None;
@@ -4183,7 +4260,7 @@ impl RunStore {
                 Ok(kind) => {
                     if let PromoteRunningKind::Promoted { run } = &kind {
                         self.orchestration_binding_snapshots
-                            .record_parent_mutation(run.parent_conversation_id)
+                            .record_parent_mutation(&mutation_guard, run.parent_conversation_id)
                             .await;
                     }
                     return Ok(PromoteRunningOutcome { kind, meta });
@@ -4739,7 +4816,7 @@ impl RunStore {
         #[cfg(not(any(test, feature = "test-utils")))]
         let inject_terminal_transaction_failure = false;
 
-        let _mutation_guard = self.orchestration_binding_snapshots.mutation_guard().await;
+        let mutation_guard = self.orchestration_binding_snapshots.mutation_guard().await;
         let mutation_parent_id = DelegationTaskRun::find_by_id(task_id)
             .one(&self.db.conn)
             .await
@@ -5077,6 +5154,7 @@ impl RunStore {
                 if matches!(&settlement, Settlement::Won(_)) {
                     self.orchestration_binding_snapshots
                         .record_parent_mutation(
+                            &mutation_guard,
                             mutation_parent_id.expect("settled run had a parent"),
                         )
                         .await;
@@ -6727,6 +6805,7 @@ mod tests {
     ) -> ContinueRunAdmission {
         ContinueRunAdmission {
             task_id: format!("binding-continue-{suffix}"),
+            dispatch_intent_id: None,
             parent_conversation_id: parent_id,
             parent_tool_use_id: format!("tu-binding-continue-{suffix}"),
             target_task_id: source_task_id.into(),
@@ -10905,6 +10984,7 @@ mod tests {
         );
         let admission = ContinueRunAdmission {
             task_id: "continue-next".into(),
+            dispatch_intent_id: None,
             parent_conversation_id: parent_id,
             parent_tool_use_id: "tu-continue".into(),
             target_task_id: root.into(),
@@ -10939,6 +11019,7 @@ mod tests {
         settle_completed(&store, "continue-next").await;
         let mismatched_work_unit = ContinueRunAdmission {
             task_id: "continue-wrong-unit".into(),
+            dispatch_intent_id: None,
             parent_conversation_id: parent_id,
             parent_tool_use_id: "tu-wrong-unit".into(),
             target_task_id: "continue-next".into(),
@@ -10957,7 +11038,8 @@ mod tests {
 
     /// Overlap precedence: busy_thread / stale_task_id beat work_unit_key mismatch.
     #[tokio::test]
-    async fn continue_error_precedence_busy_and_stale_before_work_unit_mismatch() {
+    async fn ticket_v1_authorization_precedence_continue_busy_and_stale_before_invalid_authorization(
+    ) {
         use crate::db::entities::conversation;
         use sea_orm::{ActiveModelTrait, EntityTrait, IntoActiveModel, Set};
 
@@ -10986,6 +11068,7 @@ mod tests {
         // Root still running → busy. Wrong work_unit_key must not preempt busy.
         let busy_wrong_key = ContinueRunAdmission {
             task_id: "cont-busy".into(),
+            dispatch_intent_id: None,
             parent_conversation_id: parent_id,
             parent_tool_use_id: "tu-busy".into(),
             target_task_id: root.into(),
@@ -10996,7 +11079,13 @@ mod tests {
             effective_orchestration_binding: None,
         };
         let err = store
-            .admit_continue_reserving(busy_wrong_key)
+            .admit_continue_reserving_authorized(
+                busy_wrong_key,
+                RecoveryAdmissionAuthorization {
+                    authorization_id: Some("4a67bba4-e1f5-46d1-a9b1-aa796598ffce".into()),
+                    correlation_id: "ticket-v1-busy-precedence".into(),
+                },
+            )
             .await
             .unwrap_err();
         assert!(
@@ -11025,6 +11114,7 @@ mod tests {
 
         let stale_wrong_key = ContinueRunAdmission {
             task_id: "cont-stale".into(),
+            dispatch_intent_id: None,
             parent_conversation_id: parent_id,
             parent_tool_use_id: "tu-stale".into(),
             target_task_id: root.into(), // stale: not latest on child
@@ -11035,7 +11125,13 @@ mod tests {
             effective_orchestration_binding: None,
         };
         let err = store
-            .admit_continue_reserving(stale_wrong_key)
+            .admit_continue_reserving_authorized(
+                stale_wrong_key,
+                RecoveryAdmissionAuthorization {
+                    authorization_id: Some("4a67bba4-e1f5-46d1-a9b1-aa796598ffce".into()),
+                    correlation_id: "ticket-v1-stale-precedence".into(),
+                },
+            )
             .await
             .unwrap_err();
         assert!(
@@ -11077,6 +11173,7 @@ mod tests {
         let err = store
             .admit_continue_reserving(ContinueRunAdmission {
                 task_id: "deleted-parent-continue".into(),
+                dispatch_intent_id: None,
                 parent_conversation_id: parent_id,
                 parent_tool_use_id: "tu-deleted-parent-continue".into(),
                 target_task_id: root.into(),
@@ -11144,6 +11241,7 @@ mod tests {
         let err = store
             .admit_continue_reserving(ContinueRunAdmission {
                 task_id: "unknown-agent-continue".into(),
+                dispatch_intent_id: None,
                 parent_conversation_id: parent_id,
                 parent_tool_use_id: "tu-unknown-agent-continue".into(),
                 target_task_id: root.into(),
@@ -11223,6 +11321,7 @@ mod tests {
         let continuation = store
             .admit_continue_reserving(ContinueRunAdmission {
                 task_id: "continue-replacement-race-continuation".into(),
+                dispatch_intent_id: None,
                 parent_conversation_id: parent_id,
                 parent_tool_use_id: "tu-continue-replacement-race-continuation".into(),
                 target_task_id: source_task_id.into(),
@@ -13392,6 +13491,7 @@ mod tests {
                 store
                     .admit_continue_reserving(ContinueRunAdmission {
                         task_id: "continue-gate-timeout-child".into(),
+                        dispatch_intent_id: None,
                         parent_conversation_id: parent_id,
                         parent_tool_use_id: "tu-continue-gate-timeout".into(),
                         target_task_id: root.into(),
@@ -13475,6 +13575,7 @@ mod tests {
                 store
                     .admit_continue_reserving(ContinueRunAdmission {
                         task_id: "continue-gate-drop-child".into(),
+                        dispatch_intent_id: None,
                         parent_conversation_id: parent_id,
                         parent_tool_use_id: "tu-continue-gate-drop".into(),
                         target_task_id: root.into(),
@@ -15687,6 +15788,7 @@ mod termination_audit {
         ) -> ContinueRunAdmission {
             ContinueRunAdmission {
                 task_id: format!("recovery-continue-{suffix}"),
+                dispatch_intent_id: None,
                 parent_conversation_id: parent_id,
                 parent_tool_use_id: format!("tu-recovery-continue-{suffix}"),
                 target_task_id: source_task_id.to_string(),

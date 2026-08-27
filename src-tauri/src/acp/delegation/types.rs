@@ -1398,6 +1398,9 @@ pub enum DelegationTaskReportExtension {
     WorkflowRetirement {
         workflow_retirement: WorkflowRetirementNavigation,
     },
+    IdempotentReplay {
+        idempotent_replay: bool,
+    },
 }
 
 impl<'de> Deserialize<'de> for DelegationRecoveryProjection {
@@ -1572,6 +1575,15 @@ impl DelegationTaskReport {
             }) => Some(workflow_retirement),
             _ => None,
         }
+    }
+
+    pub fn is_idempotent_replay(&self) -> bool {
+        matches!(
+            self.recovery.as_ref(),
+            Some(DelegationTaskReportExtension::IdempotentReplay {
+                idempotent_replay: true
+            })
+        )
     }
 }
 

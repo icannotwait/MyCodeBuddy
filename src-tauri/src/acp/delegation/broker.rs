@@ -84,17 +84,19 @@ use crate::acp::delegation::meta_writer::{
 #[cfg(test)]
 use crate::acp::delegation::metrics::DelegationMetrics;
 use crate::acp::delegation::metrics::{
-    CompletionMetricPhase, DelegationRecoveryMetricEvent, RecoveryMetricEventKind,
-    RuntimeProjectionErrorKind,
+    AdmissionTicketMetricOutcome, CompletionMetricPhase, DelegationRecoveryMetricEvent,
+    DispatchIntentMetricOutcome, RecoveryMetricEventKind, RuntimeProjectionErrorKind,
 };
+use crate::acp::delegation::orchestration_binding_query::AdmissionTicketConsumeError;
 use crate::acp::delegation::run_identity::{
     cold_resolve_allows, fence_allows_settlement, LiveRunRegistration, SettlementFenceDecision,
 };
 use crate::acp::delegation::run_store::{
     derive_task_preview, inherited_binding, launch_snapshot_from_run, request_fingerprint,
-    ticket_v1_request_fingerprint, Gen1AdmitOutcome, PersistedRun, PromoteAttemptMeta,
-    PromoteConflictClass, PromoteRetryClass, PromoteRunningKind, PromoteRunningOutcome,
-    RecoveryAdmissionAuthorization, ReservingRunInsert, RunStore, TerminalCompletionAttentionMetric,
+    ticket_v1_request_fingerprint, DispatchIntentReplayProjection, Gen1AdmitOutcome, PersistedRun,
+    PromoteAttemptMeta, PromoteConflictClass, PromoteRetryClass, PromoteRunningKind,
+    PromoteRunningOutcome, RecoveryAdmissionAuthorization, ReservingRunInsert, RunStore,
+    TerminalCompletionAttentionMetric,
 };
 use crate::acp::delegation::runtime_stats::{DelegationRuntimeStats, RuntimeStatsProjector};
 use crate::acp::delegation::spawner::{ConnectionSpawner, DelegationLink};
@@ -105,12 +107,13 @@ use crate::acp::delegation::store::{
 use crate::acp::delegation::supervisor::SupervisorWake;
 use crate::acp::delegation::types::{
     cold_task_report_message, correlation_error_message, validate_correlation_id,
-    AgentDelegationDefaults, CorrelationEntryPoint, CorrelationFailureKind, DelegationError,
-    DelegationOutcome, DelegationProfile, DelegationRecoveryProjection, DelegationReplyResult,
-    DelegationRequest, DelegationStatusBatch, DelegationTaskReport, DelegationTaskReportExtension,
-    DelegationWakeReason, ObservationSnapshot, ParentDecisionResult, ParentTurnEndReason,
-    TaskObservation, TaskStatus, TicketV1AdmissionCandidate, TicketV1PendingCall,
-    WorkflowRetirementNavigation, DELEGATE_TO_AGENT_TOOL,
+    AdmissionIntentKind, AdmissionIntentV1, AgentDelegationDefaults, CorrelationEntryPoint,
+    CorrelationFailureKind, DelegationError, DelegationOutcome, DelegationProfile,
+    DelegationRecoveryProjection, DelegationReplyResult, DelegationRequest, DelegationStatusBatch,
+    DelegationTaskReport, DelegationTaskReportExtension, DelegationWakeReason, ObservationSnapshot,
+    ParentDecisionResult, ParentTurnEndReason, TaskObservation, TaskStatus,
+    TicketV1AdmissionCandidate, TicketV1PendingCall, WorkflowRetirementNavigation,
+    DELEGATE_TO_AGENT_TOOL,
 };
 use crate::acp::delegation::workflow::admission::append_admitted_completion_instruction;
 #[cfg(test)]
@@ -3759,6 +3762,86 @@ fn continue_ticket_v1_candidate(
     })
 }
 
+const TICKET_V1_DEFAULT_NAMESPACE: &str = "brainstorm-to-delivery";
+
+fn ticket_v1_namespace(
+    binding: Option<&crate::acp::delegation::types::OrchestrationBindingV1>,
+) -> &str {
+    binding
+        .map(|binding| binding.namespace.as_str())
+        .unwrap_or(TICKET_V1_DEFAULT_NAMESPACE)
+}
+
+fn delegate_ticket_v1_intent(
+    req: &DelegationRequest,
+    candidate: &TicketV1AdmissionCandidate,
+) -> AdmissionIntentV1 {
+    AdmissionIntentV1 {
+        schema_version: 1,
+        dispatch_intent_id: candidate.dispatch_intent_id.clone(),
+        request_fingerprint: candidate.request_fingerprint.clone(),
+        kind: if req.replaces_task_id.is_some() {
+            AdmissionIntentKind::Replacement
+        } else {
+            AdmissionIntentKind::First
+        },
+        work_unit_key: req.work_unit_key.clone().unwrap_or_default(),
+        agent_type: req.agent_type.as_wire().into(),
+        profile_id: req.profile_id.clone(),
+        target_task_id: req.replaces_task_id.clone(),
+        replacement_reason: req.replacement_reason.clone(),
+        orchestration_binding: req.orchestration_binding.clone(),
+    }
+}
+
+fn continue_ticket_v1_intent(
+    req: &crate::acp::delegation::types::ContinueDelegationRequest,
+    candidate: &TicketV1AdmissionCandidate,
+    agent_type: AgentType,
+    profile_id: Option<&str>,
+) -> AdmissionIntentV1 {
+    AdmissionIntentV1 {
+        schema_version: 1,
+        dispatch_intent_id: candidate.dispatch_intent_id.clone(),
+        request_fingerprint: candidate.request_fingerprint.clone(),
+        kind: AdmissionIntentKind::Continue,
+        work_unit_key: req.work_unit_key.clone().unwrap_or_default(),
+        agent_type: agent_type.as_wire().into(),
+        profile_id: profile_id.map(str::to_owned),
+        target_task_id: Some(req.target_task_id.clone()),
+        replacement_reason: None,
+        orchestration_binding: req.orchestration_binding.clone(),
+    }
+}
+
+fn ticket_v1_consume_error(error: AdmissionTicketConsumeError) -> DelegationError {
+    let (code, message) = match error {
+        AdmissionTicketConsumeError::Stale => (
+            "orchestration_admission_ticket_stale",
+            "admission ticket is expired, revoked, or no longer current",
+        ),
+        AdmissionTicketConsumeError::Mismatch => (
+            "orchestration_admission_ticket_mismatch",
+            "admission ticket does not match the current request scope",
+        ),
+        AdmissionTicketConsumeError::Consumed => (
+            "orchestration_admission_ticket_consumed",
+            "admission ticket was already consumed",
+        ),
+    };
+    DelegationError::WorkflowAdmission {
+        code: code.into(),
+        message: message.into(),
+    }
+}
+
+fn mark_dispatch_intent_replay(mut report: DelegationTaskReport) -> DelegationTaskReport {
+    report.recovery = Some(DelegationTaskReportExtension::IdempotentReplay {
+        idempotent_replay: true,
+    });
+    report
+}
+
 impl DelegationBroker {
     pub fn new(
         spawner: Arc<dyn ConnectionSpawner>,
@@ -6009,6 +6092,12 @@ impl DelegationBroker {
     /// orthogonal to whether the caller then blocks. The only change vs. the old
     /// `handle_request` is that "park a `oneshot` and await it" becomes "insert a
     /// [`RunningTask`] and return the ack."
+    pub async fn start_delegation(&self, req: DelegationRequest) -> DelegationTaskReport {
+        let connection_incarnation = req.parent_connection_id.clone();
+        self.start_delegation_for_incarnation(req, &connection_incarnation)
+            .await
+    }
+
     #[tracing::instrument(
         name = "delegation_task",
         skip_all,
@@ -6021,8 +6110,11 @@ impl DelegationBroker {
             task_id = tracing::field::Empty,
         )
     )]
-    pub async fn start_delegation(&self, mut req: DelegationRequest) -> DelegationTaskReport {
-        let _ticket_v1_candidate = delegate_ticket_v1_candidate(&req);
+    pub async fn start_delegation_for_incarnation(
+        &self,
+        mut req: DelegationRequest,
+        connection_incarnation: &str,
+    ) -> DelegationTaskReport {
         if let Some(binding) = req.orchestration_binding.as_ref() {
             if let Err(message) = binding.validate() {
                 return report_err(
@@ -6215,6 +6307,92 @@ impl DelegationBroker {
                 },
                 None,
             );
+        }
+
+        let ticket_v1_candidate = delegate_ticket_v1_candidate(&req);
+        let mut ticket_mutation_guard = None;
+        if let Some(candidate) = ticket_v1_candidate.as_ref() {
+            let Some(runs) = self.run_store.as_ref() else {
+                self.drop_inflight(inflight_id).await;
+                return report_err(
+                    req.agent_type,
+                    ticket_v1_consume_error(AdmissionTicketConsumeError::Stale),
+                    None,
+                );
+            };
+            ticket_mutation_guard = Some(runs.orchestration_mutation_guard().await);
+            let guard = ticket_mutation_guard
+                .as_ref()
+                .expect("ticket-v1 mutation guard was just acquired");
+            let intent = delegate_ticket_v1_intent(&req, candidate);
+            match runs
+                .consume_admission_ticket_under_guard(
+                    guard,
+                    &candidate.admission_ticket,
+                    req.parent_conversation_id,
+                    connection_incarnation,
+                    ticket_v1_namespace(req.orchestration_binding.as_ref()),
+                    &intent,
+                )
+                .await
+            {
+                Ok(claims) => {
+                    debug_assert_eq!(claims.dispatch_intent_id, candidate.dispatch_intent_id);
+                    debug_assert_eq!(claims.request_fingerprint, candidate.request_fingerprint);
+                    debug_assert_eq!(claims.intent_digest, intent.canonical_digest());
+                    self.metrics
+                        .record_ticket_outcome(AdmissionTicketMetricOutcome::Consumed);
+                }
+                Err(error) => {
+                    match error {
+                        AdmissionTicketConsumeError::Stale => self
+                            .metrics
+                            .record_ticket_outcome(AdmissionTicketMetricOutcome::Stale),
+                        AdmissionTicketConsumeError::Mismatch => self
+                            .metrics
+                            .record_ticket_outcome(AdmissionTicketMetricOutcome::Mismatched),
+                        AdmissionTicketConsumeError::Consumed => {}
+                    }
+                    self.drop_inflight(inflight_id).await;
+                    return report_err(req.agent_type, ticket_v1_consume_error(error), None);
+                }
+            }
+
+            let replay = DispatchIntentReplayProjection {
+                request_fingerprint: candidate.request_fingerprint.clone(),
+                previous_task_id: None,
+                work_unit_key: req.work_unit_key.clone(),
+                agent_type: req.agent_type,
+                profile_id: req.profile_id.clone(),
+                orchestration_binding: req.orchestration_binding.clone(),
+                replaced_task_id: req.replaces_task_id.clone(),
+                replacement_reason: req.replacement_reason.clone(),
+            };
+            match runs
+                .load_dispatch_intent_under_guard(
+                    guard,
+                    req.parent_conversation_id,
+                    &candidate.dispatch_intent_id,
+                    &replay,
+                )
+                .await
+            {
+                Ok(Some(existing)) => {
+                    self.metrics
+                        .record_dispatch_intent_outcome(DispatchIntentMetricOutcome::ExactReplay);
+                    self.drop_inflight(inflight_id).await;
+                    return mark_dispatch_intent_replay(gen1_idempotent_ack(&existing));
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    if matches!(error, TaskStoreError::DispatchIntentConflict(_)) {
+                        self.metrics
+                            .record_dispatch_intent_outcome(DispatchIntentMetricOutcome::Conflict);
+                    }
+                    self.drop_inflight(inflight_id).await;
+                    return report_err(req.agent_type, store_err_to_delegation_error(error), None);
+                }
+            }
         }
 
         // Resolve archived ownership before completion-format repair, depth,
@@ -6703,7 +6881,9 @@ impl DelegationBroker {
                     )
                 };
             let insert = ReservingRunInsert {
-                dispatch_intent_id: None,
+                dispatch_intent_id: ticket_v1_candidate
+                    .as_ref()
+                    .map(|candidate| candidate.dispatch_intent_id.clone()),
                 orchestration_binding: if replacement_source.is_some() {
                     req.orchestration_binding.clone()
                 } else {
@@ -6728,7 +6908,12 @@ impl DelegationBroker {
                 mode_id: live_launch.snapshot.mode_id.clone(),
                 config_values_json: Some(live_launch.snapshot.config_values_json.clone()),
                 task_preview: Some(durable_preview),
-                request_fingerprint: Some(request_fp.clone()),
+                request_fingerprint: Some(
+                    ticket_v1_candidate
+                        .as_ref()
+                        .map(|candidate| candidate.request_fingerprint.clone())
+                        .unwrap_or_else(|| request_fp.clone()),
+                ),
                 admission_class,
                 lineage_root_task_id,
                 work_unit_key: req.work_unit_key.clone(),
@@ -6793,10 +6978,14 @@ impl DelegationBroker {
                     })
                     .unwrap_or_else(|| call_id.clone()),
             };
-            let admitted = match runs
-                .admit_gen1_reserving_authorized(insert, authorization)
-                .await
-            {
+            let admission_result = if let Some(guard) = ticket_mutation_guard.as_ref() {
+                runs.admit_gen1_reserving_authorized_under_guard(guard, insert, authorization)
+                    .await
+            } else {
+                runs.admit_gen1_reserving_authorized(insert, authorization)
+                    .await
+            };
+            let admitted = match admission_result {
                 Ok(Gen1AdmitOutcome::AuthorizedCreated {
                     run,
                     recovery_decision,
@@ -6821,6 +7010,7 @@ impl DelegationBroker {
             };
             match admitted {
                 Ok(Gen1AdmitOutcome::Created(run)) => {
+                    drop(ticket_mutation_guard.take());
                     if let Some(authorization_id) = run.recovery_authorization_id.as_deref() {
                         for kind in [
                             RecoveryMetricEventKind::ConfirmationApproved,
@@ -6913,6 +7103,7 @@ impl DelegationBroker {
                         self.drop_inflight(inflight_id).await;
                         return report_err(req.agent_type, cleanup_err, Some(child_row.id));
                     }
+                    drop(ticket_mutation_guard.take());
                     self.drop_inflight(inflight_id).await;
                     return gen1_idempotent_ack(&existing);
                 }
@@ -6937,6 +7128,7 @@ impl DelegationBroker {
                         self.drop_inflight(inflight_id).await;
                         return report_err(req.agent_type, cleanup_err, Some(child_row.id));
                     }
+                    drop(ticket_mutation_guard.take());
                     self.drop_inflight(inflight_id).await;
                     return report_err(req.agent_type, store_err_to_delegation_error(e), None);
                 }
@@ -9263,7 +9455,17 @@ impl DelegationBroker {
     /// ack (or a typed error report).
     pub async fn continue_delegation(
         &self,
+        req: crate::acp::delegation::types::ContinueDelegationRequest,
+    ) -> DelegationTaskReport {
+        let connection_incarnation = req.parent_connection_id.clone();
+        self.continue_delegation_for_incarnation(req, &connection_incarnation)
+            .await
+    }
+
+    pub async fn continue_delegation_for_incarnation(
+        &self,
         mut req: crate::acp::delegation::types::ContinueDelegationRequest,
+        connection_incarnation: &str,
     ) -> DelegationTaskReport {
         use crate::acp::delegation::capability::gate_continue_session_reuse;
         use crate::acp::delegation::capability::ContinueCapabilityDecision;
@@ -9456,18 +9658,6 @@ impl DelegationBroker {
             );
         };
 
-        if let Err(error) =
-            require_writable_conversation_workflow(&runs.db().conn, req.parent_conversation_id)
-                .await
-        {
-            self.drop_inflight(inflight_id).await;
-            return report_err(
-                AgentType::ClaudeCode,
-                workflow_store_error_to_delegation_error(error),
-                None,
-            );
-        }
-
         // Load target for ownership / route material only (not_found on miss).
         let target = match runs.load_by_task_id(&req.target_task_id).await {
             Ok(Some(t)) if t.parent_conversation_id == req.parent_conversation_id => t,
@@ -9488,8 +9678,111 @@ impl DelegationBroker {
                 );
             }
         };
-        let _ticket_v1_candidate =
+        let ticket_v1_candidate =
             continue_ticket_v1_candidate(&req, target.agent_type, target.profile_id.as_deref());
+        let mut ticket_mutation_guard = None;
+        if let Some(candidate) = ticket_v1_candidate.as_ref() {
+            ticket_mutation_guard = Some(runs.orchestration_mutation_guard().await);
+            let guard = ticket_mutation_guard
+                .as_ref()
+                .expect("ticket-v1 mutation guard was just acquired");
+            let intent = continue_ticket_v1_intent(
+                &req,
+                candidate,
+                target.agent_type,
+                target.profile_id.as_deref(),
+            );
+            match runs
+                .consume_admission_ticket_under_guard(
+                    guard,
+                    &candidate.admission_ticket,
+                    req.parent_conversation_id,
+                    connection_incarnation,
+                    ticket_v1_namespace(req.orchestration_binding.as_ref()),
+                    &intent,
+                )
+                .await
+            {
+                Ok(claims) => {
+                    debug_assert_eq!(claims.dispatch_intent_id, candidate.dispatch_intent_id);
+                    debug_assert_eq!(claims.request_fingerprint, candidate.request_fingerprint);
+                    debug_assert_eq!(claims.intent_digest, intent.canonical_digest());
+                    self.metrics
+                        .record_ticket_outcome(AdmissionTicketMetricOutcome::Consumed);
+                }
+                Err(error) => {
+                    match error {
+                        AdmissionTicketConsumeError::Stale => self
+                            .metrics
+                            .record_ticket_outcome(AdmissionTicketMetricOutcome::Stale),
+                        AdmissionTicketConsumeError::Mismatch => self
+                            .metrics
+                            .record_ticket_outcome(AdmissionTicketMetricOutcome::Mismatched),
+                        AdmissionTicketConsumeError::Consumed => {}
+                    }
+                    self.drop_inflight(inflight_id).await;
+                    return report_err(target.agent_type, ticket_v1_consume_error(error), None);
+                }
+            }
+
+            let replay = DispatchIntentReplayProjection {
+                request_fingerprint: candidate.request_fingerprint.clone(),
+                previous_task_id: Some(req.target_task_id.clone()),
+                work_unit_key: req.work_unit_key.clone(),
+                agent_type: target.agent_type,
+                profile_id: target.profile_id.clone(),
+                orchestration_binding: req.orchestration_binding.clone(),
+                replaced_task_id: None,
+                replacement_reason: None,
+            };
+            match runs
+                .load_dispatch_intent_under_guard(
+                    guard,
+                    req.parent_conversation_id,
+                    &candidate.dispatch_intent_id,
+                    &replay,
+                )
+                .await
+            {
+                Ok(Some(existing)) => {
+                    self.metrics
+                        .record_dispatch_intent_outcome(DispatchIntentMetricOutcome::ExactReplay);
+                    self.drop_inflight(inflight_id).await;
+                    return mark_dispatch_intent_replay(
+                        self.continue_idempotent_with_terminal_intent(
+                            &existing,
+                            req.target_task_id,
+                        )
+                        .await,
+                    );
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    if matches!(error, TaskStoreError::DispatchIntentConflict(_)) {
+                        self.metrics
+                            .record_dispatch_intent_outcome(DispatchIntentMetricOutcome::Conflict);
+                    }
+                    self.drop_inflight(inflight_id).await;
+                    return report_err(
+                        target.agent_type,
+                        store_err_to_delegation_error(error),
+                        None,
+                    );
+                }
+            }
+        }
+
+        if let Err(error) =
+            require_writable_conversation_workflow(&runs.db().conn, req.parent_conversation_id)
+                .await
+        {
+            self.drop_inflight(inflight_id).await;
+            return report_err(
+                target.agent_type,
+                workflow_store_error_to_delegation_error(error),
+                None,
+            );
+        }
         let effective_orchestration_binding = match inherited_binding(
             target.orchestration_binding.as_ref(),
             req.orchestration_binding.as_ref(),
@@ -9593,11 +9886,17 @@ impl DelegationBroker {
         let new_task_id = uuid::Uuid::new_v4().to_string();
         let admission = ContinueRunAdmission {
             task_id: new_task_id.clone(),
+            dispatch_intent_id: ticket_v1_candidate
+                .as_ref()
+                .map(|candidate| candidate.dispatch_intent_id.clone()),
             parent_conversation_id: req.parent_conversation_id,
             parent_tool_use_id: req.parent_tool_use_id.clone(),
             target_task_id: req.target_task_id.clone(),
             task_preview: derive_task_preview(&req.task),
-            request_fingerprint: request_fp,
+            request_fingerprint: ticket_v1_candidate
+                .as_ref()
+                .map(|candidate| candidate.request_fingerprint.clone())
+                .unwrap_or(request_fp),
             work_unit_key: req.work_unit_key.clone(),
             supplied_orchestration_binding: req.orchestration_binding.clone(),
             effective_orchestration_binding,
@@ -9650,10 +9949,14 @@ impl DelegationBroker {
                 })
                 .unwrap_or_else(|| new_task_id.clone()),
         };
-        let admitted = match runs
-            .admit_continue_reserving_authorized(admission, authorization)
-            .await
-        {
+        let admission_result = if let Some(guard) = ticket_mutation_guard.as_ref() {
+            runs.admit_continue_reserving_authorized_under_guard(guard, admission, authorization)
+                .await
+        } else {
+            runs.admit_continue_reserving_authorized(admission, authorization)
+                .await
+        };
+        let admitted = match admission_result {
             Ok(ContinueAdmitOutcome::AuthorizedCreated {
                 run,
                 recovery_decision,
@@ -9676,6 +9979,7 @@ impl DelegationBroker {
             }
             other => other,
         };
+        drop(ticket_mutation_guard.take());
         match &admitted {
             Ok(ContinueAdmitOutcome::Created(run)) => {
                 if let Some(authorization_id) = run.recovery_authorization_id.as_deref() {
@@ -16789,6 +17093,207 @@ mod tests {
             route_fingerprint:
                 "sha256:b498416d87bf6ba928bd7ddb5f1a451daf82300584f3d40b606c3c56f169ba7a".into(),
         }
+    }
+
+    const TICKET_V1_TEST_INTENT_ID: &str = "8f95dd45-9eca-42a8-9909-0ac00be8ad52";
+
+    async fn prepare_delegate_ticket(runs: &RunStore, req: &mut DelegationRequest) -> String {
+        use crate::acp::delegation::types::{
+            AdmissionIntentKind, AdmissionIntentV1, AdmissionPreparation,
+            OrchestrationBindingQueryRequest,
+        };
+
+        req.dispatch_intent_id = Some(TICKET_V1_TEST_INTENT_ID.into());
+        req.admission_ticket = Some("4a67bba4-e1f5-46d1-a9b1-aa796598ffce".into());
+        let candidate = delegate_ticket_v1_candidate(req).expect("ticket-v1 candidate");
+        let kind = if req.replaces_task_id.is_some() {
+            AdmissionIntentKind::Replacement
+        } else {
+            AdmissionIntentKind::First
+        };
+        let namespace = req
+            .orchestration_binding
+            .as_ref()
+            .map(|binding| binding.namespace.clone())
+            .unwrap_or_else(|| "brainstorm-to-delivery".into());
+        let envelope = runs
+            .prepare_orchestration_binding_admission(
+                req.parent_conversation_id,
+                &req.parent_connection_id,
+                OrchestrationBindingQueryRequest {
+                    namespace,
+                    limit: 200,
+                    snapshot_id: None,
+                    cursor: None,
+                },
+                None,
+                AdmissionIntentV1 {
+                    schema_version: 1,
+                    dispatch_intent_id: candidate.dispatch_intent_id,
+                    request_fingerprint: candidate.request_fingerprint,
+                    kind,
+                    work_unit_key: req.work_unit_key.clone().expect("ticket work-unit key"),
+                    agent_type: req.agent_type.as_wire().into(),
+                    profile_id: req.profile_id.clone(),
+                    target_task_id: req.replaces_task_id.clone(),
+                    replacement_reason: req.replacement_reason.clone(),
+                    orchestration_binding: req.orchestration_binding.clone(),
+                },
+            )
+            .await
+            .expect("prepare ticket-v1 admission");
+        let AdmissionPreparation::Prepared { ticket, .. } = envelope.admission else {
+            panic!("new dispatch intent must issue a ticket");
+        };
+        req.admission_ticket = Some(ticket.clone());
+        ticket
+    }
+
+    #[tokio::test]
+    async fn ticket_v1_atomic_admission_scope_before_burn_and_retains_consumed_tombstone() {
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-ticket-v1-scope-before-burn").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("ticket-v1 scope parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db));
+        let mock = Arc::new(MockSpawner::new());
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+        broker.set_config(DelegationConfig::default()).await;
+
+        let mut rightful = request(parent.id, "ticket-v1-scope-tool");
+        rightful.agent_type = AgentType::Codex;
+        rightful.work_unit_key = Some("task|10|implementer|codex|none".into());
+        prepare_delegate_ticket(&runs, &mut rightful).await;
+
+        let wrong_incarnation = broker
+            .start_delegation_for_incarnation(
+                rightful.clone(),
+                "4a67bba4-e1f5-46d1-a9b1-aa796598ffce",
+            )
+            .await;
+        assert_eq!(
+            wrong_incarnation.error_code.as_deref(),
+            Some("orchestration_admission_ticket_mismatch")
+        );
+
+        let mut wrong = rightful.clone();
+        wrong.task = "different semantic request".into();
+        let mismatch = broker.start_delegation(wrong).await;
+        assert_eq!(
+            mismatch.error_code.as_deref(),
+            Some("orchestration_admission_ticket_mismatch")
+        );
+
+        let business = broker.start_delegation(rightful.clone()).await;
+        assert_eq!(business.error_code.as_deref(), Some("canceled"));
+        assert!(business
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("delegation disabled")));
+
+        let consumed = broker.start_delegation(rightful).await;
+        assert_eq!(
+            consumed.error_code.as_deref(),
+            Some("orchestration_admission_ticket_consumed")
+        );
+        assert!(mock.spawn_args.lock().await.is_empty());
+        assert!(mock.resume_args.lock().await.is_empty());
+
+        let metrics = broker.metrics().snapshot();
+        assert_eq!(metrics.admission_ticket_outcomes["mismatched"], 2);
+        assert_eq!(metrics.admission_ticket_outcomes["consumed"], 1);
+    }
+
+    #[test]
+    fn ticket_v1_atomic_admission_exact_replay_metadata_is_true_only_on_replay() {
+        let normal = running_ack(
+            "6b228a7d-4ac9-4bc7-a16e-f4ecf6f0fd45".into(),
+            42,
+            AgentType::Codex,
+        );
+        assert!(!normal.is_idempotent_replay());
+        assert!(serde_json::to_value(&normal)
+            .unwrap()
+            .get("idempotent_replay")
+            .is_none());
+
+        let replay = mark_dispatch_intent_replay(normal);
+        assert!(replay.is_idempotent_replay());
+        assert_eq!(
+            serde_json::to_value(replay).unwrap()["idempotent_replay"],
+            true
+        );
+    }
+
+    #[tokio::test]
+    async fn ticket_v1_authorization_precedence_parent_tool_conflict_wins_then_ticket_is_consumed()
+    {
+        use crate::db::service::conversation_service;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/codeg-ticket-v1-auth-precedence").await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some("ticket-v1 precedence parent".into()),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = Arc::new(RunStore::new(db));
+        let mock = Arc::new(MockSpawner::new());
+        let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+        let mut source = request(parent.id, "ticket-v1-shared-parent-tool");
+        source.agent_type = AgentType::Codex;
+        source.working_dir = Some(test_working_dir());
+        source.work_unit_key = Some("task|10|implementer|codex|none".into());
+        mock.queue_spawn(Ok("ticket-v1-source-connection".into()))
+            .await;
+        mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+        let source_ack = broker.start_delegation(source).await;
+        let source_task_id = source_ack.task_id.clone().expect("source task");
+        broker
+            .complete_call(&source_task_id, completed_outcome("source complete"))
+            .await;
+
+        let mut replacement = request(parent.id, "ticket-v1-shared-parent-tool");
+        replacement.agent_type = AgentType::Codex;
+        replacement.working_dir = Some(test_working_dir());
+        replacement.work_unit_key = Some("task|10|implementer|codex|none".into());
+        replacement.replaces_task_id = Some(source_task_id);
+        replacement.replacement_reason =
+            Some(crate::acp::delegation::run_store::REPLACEMENT_REASON_UNRESUMABLE.into());
+        replacement.recovery_authorization_id = Some("4a67bba4-e1f5-46d1-a9b1-aa796598ffce".into());
+        prepare_delegate_ticket(&runs, &mut replacement).await;
+
+        let conflict = broker.start_delegation(replacement.clone()).await;
+        assert_eq!(
+            conflict.error_code.as_deref(),
+            Some("duplicate_parent_tool")
+        );
+        let consumed = broker.start_delegation(replacement).await;
+        assert_eq!(
+            consumed.error_code.as_deref(),
+            Some("orchestration_admission_ticket_consumed")
+        );
+        assert_eq!(
+            mock.spawn_args.lock().await.len(),
+            1,
+            "ticket rejection must not spawn a replacement"
+        );
     }
 
     #[test]

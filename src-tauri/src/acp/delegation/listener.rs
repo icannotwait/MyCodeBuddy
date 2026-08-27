@@ -2594,14 +2594,16 @@ impl DelegationListener {
 
         // Resolve the parent's current conversation. Without one the broker
         // cannot link the child row to the parent.
-        let parent_conversation_id = match self
+        let parent_context = match self
             .parent_lookup
-            .current_conversation_id(&req.parent_connection_id)
+            .parent_wait_context(&req.parent_connection_id)
             .await
         {
-            Some(id) => id,
+            Some(context) => context,
             None => return cancel("parent has no active conversation"),
         };
+        let parent_conversation_id = parent_context.conversation_id;
+        let connection_incarnation = parent_context.connection_incarnation;
 
         let orchestration_binding = match parse_orchestration_binding(&req.input) {
             Ok(binding) => binding,
@@ -2647,7 +2649,10 @@ impl DelegationListener {
                 recovery_authorization_id,
                 orchestration_binding,
             };
-            return self.broker.continue_delegation(continue_req).await;
+            return self
+                .broker
+                .continue_delegation_for_incarnation(continue_req, &connection_incarnation)
+                .await;
         }
 
         // 3. Parse the delegate_to_agent arguments. Schema validation lives
@@ -2727,7 +2732,9 @@ impl DelegationListener {
             recovery_authorization_id,
             orchestration_binding,
         };
-        self.broker.start_delegation(delegation_req).await
+        self.broker
+            .start_delegation_for_incarnation(delegation_req, &connection_incarnation)
+            .await
     }
 }
 
@@ -5484,9 +5491,10 @@ mod tests {
         assert!(broker.take_pending_tool_call("parent-conn").await.is_none());
         assert!(mock.spawn_args.lock().await.is_empty());
         assert!(mock.resume_args.lock().await.is_empty());
-        for forbidden in ["stale", "mismatch", "consumed"] {
-            assert!(!report.message.as_deref().unwrap_or_default().contains(forbidden));
-        }
+        assert_eq!(
+            report.error_code.as_deref(),
+            Some("orchestration_admission_ticket_stale")
+        );
     }
 
     #[tokio::test]

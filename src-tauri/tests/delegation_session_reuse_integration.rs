@@ -18,18 +18,19 @@ use codeg_lib::acp::delegation::broker::{
 };
 use codeg_lib::acp::delegation::card_summary::{extract_card_summary, CARD_SUMMARY_MARKER};
 use codeg_lib::acp::delegation::run_store::{
-    derive_task_preview, request_fingerprint, ReservingRunInsert, RunStore, REPLACEMENT_LIMIT,
-    REPLACEMENT_REASON_BUDGET_EXHAUSTED_CONTINUE, REPLACEMENT_REASON_UNRESUMABLE,
-    UNEXPECTED_CONTINUE_LIMIT,
+    derive_task_preview, request_fingerprint, ticket_v1_request_fingerprint, ReservingRunInsert,
+    RunStore, REPLACEMENT_LIMIT, REPLACEMENT_REASON_BUDGET_EXHAUSTED_CONTINUE,
+    REPLACEMENT_REASON_UNRESUMABLE, UNEXPECTED_CONTINUE_LIMIT,
 };
 use codeg_lib::acp::delegation::spawner::{
     accepted, mock::MockSpawner, ConnectionSpawner, DelegationLink,
 };
 use codeg_lib::acp::delegation::store::{DbDelegationTaskStore, DelegationTaskStore};
 use codeg_lib::acp::delegation::types::{
-    ContinueDelegationRequest, DelegationError, DelegationOutcome, DelegationRequest,
-    DelegationSuccess, OrchestrationBindingV1, TaskStatus, CONTINUE_DELEGATION_TOOL,
-    DELEGATE_TO_AGENT_TOOL,
+    AdmissionIntentKind, AdmissionIntentV1, AdmissionPreparation, ContinueDelegationRequest,
+    DelegationError, DelegationOutcome, DelegationRequest, DelegationSuccess,
+    OrchestrationBindingQueryRequest, OrchestrationBindingV1, TaskStatus, TicketV1PendingCall,
+    CONTINUE_DELEGATION_TOOL, DELEGATE_TO_AGENT_TOOL,
 };
 use codeg_lib::acp::termination::{
     AcpTerminationClassification, AcpTerminationReason, AcpTerminationSource,
@@ -45,7 +46,9 @@ use codeg_lib::db::service::conversation_service;
 use codeg_lib::db::test_helpers::{fresh_in_memory_db, seed_folder};
 use codeg_lib::db::AppDatabase;
 use codeg_lib::models::AgentType;
-use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, IntoActiveModel, QueryFilter, Set};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, IntoActiveModel, QueryFilter, Set,
+};
 use sha2::{Digest, Sha256};
 use tokio::sync::Barrier;
 
@@ -324,6 +327,213 @@ async fn list_run_rows(
         .all(&db.conn)
         .await
         .expect("list runs")
+}
+
+const TICKET_V1_TEST_INTENT_ID: &str = "8f95dd45-9eca-42a8-9909-0ac00be8ad52";
+
+async fn issue_delegate_ticket(runs: &RunStore, req: &mut DelegationRequest) {
+    req.dispatch_intent_id = Some(TICKET_V1_TEST_INTENT_ID.into());
+    let request_fingerprint = ticket_v1_request_fingerprint(&TicketV1PendingCall {
+        schema_version: 1,
+        tool_name: DELEGATE_TO_AGENT_TOOL.into(),
+        task: req.task.clone(),
+        working_dir: req.requested_working_dir.clone(),
+        work_unit_key: req.work_unit_key.clone(),
+        replaces_task_id: req.replaces_task_id.clone(),
+        replacement_reason: req.replacement_reason.clone(),
+        target_task_id: None,
+        agent_type: req.agent_type.as_wire().into(),
+        profile_id: req.profile_id.clone(),
+        orchestration_binding: req.orchestration_binding.clone(),
+        dispatch_intent_id: TICKET_V1_TEST_INTENT_ID.into(),
+    });
+    let envelope = runs
+        .prepare_orchestration_binding_admission(
+            req.parent_conversation_id,
+            &req.parent_connection_id,
+            OrchestrationBindingQueryRequest {
+                namespace: req
+                    .orchestration_binding
+                    .as_ref()
+                    .map(|binding| binding.namespace.clone())
+                    .unwrap_or_else(|| "brainstorm-to-delivery".into()),
+                limit: 200,
+                snapshot_id: None,
+                cursor: None,
+            },
+            None,
+            AdmissionIntentV1 {
+                schema_version: 1,
+                dispatch_intent_id: TICKET_V1_TEST_INTENT_ID.into(),
+                request_fingerprint,
+                kind: if req.replaces_task_id.is_some() {
+                    AdmissionIntentKind::Replacement
+                } else {
+                    AdmissionIntentKind::First
+                },
+                work_unit_key: req.work_unit_key.clone().expect("ticket work-unit key"),
+                agent_type: req.agent_type.as_wire().into(),
+                profile_id: req.profile_id.clone(),
+                target_task_id: req.replaces_task_id.clone(),
+                replacement_reason: req.replacement_reason.clone(),
+                orchestration_binding: req.orchestration_binding.clone(),
+            },
+        )
+        .await
+        .expect("issue ticket-v1 admission");
+    let AdmissionPreparation::Prepared { ticket, .. } = envelope.admission else {
+        panic!("new dispatch intent must issue a ticket");
+    };
+    req.admission_ticket = Some(ticket);
+}
+
+#[tokio::test]
+async fn ticket_v1_concurrent_consume_one_winner_one_consumed_one_row_one_child() {
+    let db = Arc::new(fresh_in_memory_db().await);
+    let folder = seed_folder(&db, "/tmp/codeg-ticket-v1-concurrent").await;
+    let parent = conversation_service::create(
+        &db.conn,
+        folder,
+        AgentType::ClaudeCode,
+        Some("ticket-v1 concurrent parent".into()),
+        None,
+    )
+    .await
+    .expect("parent");
+    let runs = Arc::new(RunStore::new(db.clone()));
+    let mock = Arc::new(MockSpawner::new());
+    let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+    let mut request = delegate_req(
+        parent.id,
+        "ticket-v1-concurrent-a",
+        AgentType::Codex,
+        "implement Task 10 atomically",
+        &test_working_dir(),
+        Some("task|10|implementer|codex|none"),
+    );
+    issue_delegate_ticket(&runs, &mut request).await;
+    let mut sibling = request.clone();
+    sibling.parent_tool_use_id = "ticket-v1-concurrent-b".into();
+
+    mock.queue_spawn(Ok("ticket-v1-concurrent-child".into()))
+        .await;
+    mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+    let barrier = Arc::new(Barrier::new(3));
+    let first = {
+        let broker = broker.clone();
+        let barrier = barrier.clone();
+        tokio::spawn(async move {
+            barrier.wait().await;
+            broker.start_delegation(request).await
+        })
+    };
+    let second = {
+        let broker = broker.clone();
+        let barrier = barrier.clone();
+        tokio::spawn(async move {
+            barrier.wait().await;
+            broker.start_delegation(sibling).await
+        })
+    };
+    barrier.wait().await;
+    let reports = [first.await.unwrap(), second.await.unwrap()];
+    assert_eq!(
+        reports
+            .iter()
+            .filter(|report| report.status == TaskStatus::Running)
+            .count(),
+        1,
+        "one correctly scoped consumer must win: {reports:?}"
+    );
+    assert_eq!(
+        reports
+            .iter()
+            .filter(|report| {
+                report.error_code.as_deref() == Some("orchestration_admission_ticket_consumed")
+            })
+            .count(),
+        1,
+        "the other correctly scoped consumer must see the tombstone: {reports:?}"
+    );
+
+    let rows = list_run_rows(&db, parent.id).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].dispatch_intent_id.as_deref(),
+        Some(TICKET_V1_TEST_INTENT_ID)
+    );
+    let children = conversation::Entity::find()
+        .filter(conversation::Column::ParentId.eq(parent.id))
+        .all(&db.conn)
+        .await
+        .expect("list child rows");
+    assert_eq!(
+        children.len(),
+        1,
+        "loser must not allocate a provisional child"
+    );
+    assert_eq!(mock.spawn_args.lock().await.len(), 1);
+}
+
+#[tokio::test]
+async fn ticket_v1_atomic_admission_insert_failure_compensates_and_keeps_tombstone() {
+    let db = Arc::new(fresh_in_memory_db().await);
+    let folder = seed_folder(&db, "/tmp/codeg-ticket-v1-insert-rollback").await;
+    let parent = conversation_service::create(
+        &db.conn,
+        folder,
+        AgentType::ClaudeCode,
+        Some("ticket-v1 rollback parent".into()),
+        None,
+    )
+    .await
+    .expect("parent");
+    let runs = Arc::new(RunStore::new(db.clone()));
+    let mock = Arc::new(MockSpawner::new());
+    let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+    let mut request = delegate_req(
+        parent.id,
+        "ticket-v1-insert-rollback",
+        AgentType::Codex,
+        "fail reserving insert",
+        &test_working_dir(),
+        Some("task|10|implementer|codex|none"),
+    );
+    issue_delegate_ticket(&runs, &mut request).await;
+    db.conn
+        .execute_unprepared(
+            "CREATE TRIGGER ticket_v1_fail_run_insert BEFORE INSERT ON delegation_task_runs \
+             BEGIN SELECT RAISE(ABORT, 'ticket-v1 injected run failure'); END;",
+        )
+        .await
+        .expect("install insert trigger");
+
+    let failed = broker.start_delegation(request.clone()).await;
+    assert_eq!(failed.status, TaskStatus::Failed, "{failed:?}");
+    assert!(list_run_rows(&db, parent.id).await.is_empty());
+    let child = conversation::Entity::find()
+        .filter(conversation::Column::ParentId.eq(parent.id))
+        .one(&db.conn)
+        .await
+        .expect("load provisional child")
+        .expect("provisional child retained as cleanup evidence");
+    assert!(
+        child.deleted_at.is_some(),
+        "provisional child must be compensated"
+    );
+    assert!(mock.spawn_args.lock().await.is_empty());
+
+    db.conn
+        .execute_unprepared("DROP TRIGGER ticket_v1_fail_run_insert")
+        .await
+        .expect("drop insert trigger");
+    let consumed = broker.start_delegation(request).await;
+    assert_eq!(
+        consumed.error_code.as_deref(),
+        Some("orchestration_admission_ticket_consumed")
+    );
+    assert!(list_run_rows(&db, parent.id).await.is_empty());
 }
 
 fn unexpected_continue_insert(
