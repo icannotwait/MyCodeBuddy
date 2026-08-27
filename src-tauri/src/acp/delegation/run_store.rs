@@ -24,7 +24,7 @@ use unicode_normalization::UnicodeNormalization;
 
 use crate::acp::delegation::launch_snapshot::{snapshot_is_complete, LaunchSnapshot};
 use crate::acp::delegation::orchestration_binding_query::{
-    materialize_binding_rows, OrchestrationBindingSnapshotCache,
+    materialize_binding_rows, validate_admission_intent_source, OrchestrationBindingSnapshotCache,
 };
 use crate::acp::delegation::recovery_policy::{
     decide_delegation_recovery, hash_external_session_identity, RecoveryConfirmation,
@@ -40,9 +40,11 @@ use crate::acp::delegation::store::{
     TerminalCompletionProtocol, TerminalTaskWrite,
 };
 use crate::acp::delegation::types::{
-    is_canonical_uuid, DelegationOrchestrationBindingPage, DelegationRecoveryProjection,
-    OrchestrationBindingQueryError, OrchestrationBindingQueryRequest, OrchestrationBindingV1,
-    TaskStatus, TicketV1PendingCall, WorkflowRetirementNavigation,
+    is_canonical_uuid, AdmissionIntentKind, AdmissionIntentV1,
+    DelegationOrchestrationBindingPage, DelegationRecoveryProjection,
+    OrchestrationBindingFirstPageEnvelope, OrchestrationBindingQueryError,
+    OrchestrationBindingQueryRequest, OrchestrationBindingV1, TaskStatus, TicketV1PendingCall,
+    WorkflowRetirementNavigation,
 };
 use crate::acp::delegation::workflow::admission::{
     ensure_workflow_child_conversation_independent, resolve_and_stamp_terminal_artifact_txn,
@@ -474,6 +476,26 @@ impl From<&ReservingRunInsert> for DispatchIntentReplayProjection {
             replaced_task_id: insert.replaced_task_id.clone(),
             replacement_reason: insert.replacement_reason.clone(),
         }
+    }
+}
+
+fn admission_intent_replay_projection(
+    intent: &AdmissionIntentV1,
+) -> DispatchIntentReplayProjection {
+    DispatchIntentReplayProjection {
+        request_fingerprint: intent.request_fingerprint.clone(),
+        previous_task_id: (intent.kind == AdmissionIntentKind::Continue)
+            .then(|| intent.target_task_id.clone())
+            .flatten(),
+        work_unit_key: Some(intent.work_unit_key.clone()),
+        agent_type: AgentType::from_untrusted_wire(&intent.agent_type)
+            .expect("validated admission intent has a canonical agent type"),
+        profile_id: intent.profile_id.clone(),
+        orchestration_binding: intent.orchestration_binding.clone(),
+        replaced_task_id: (intent.kind == AdmissionIntentKind::Replacement)
+            .then(|| intent.target_task_id.clone())
+            .flatten(),
+        replacement_reason: intent.replacement_reason.clone(),
     }
 }
 
@@ -2346,6 +2368,62 @@ impl RunStore {
             .page_with_loader_limit(parent_id, request, page_limit, Utc::now(), || async {
                 materialize_binding_rows(&self.db.conn, parent_id, &namespace).await
             })
+            .await
+    }
+
+    pub async fn prepare_orchestration_binding_admission(
+        &self,
+        parent_id: i32,
+        connection_incarnation: &str,
+        request: OrchestrationBindingQueryRequest,
+        page_limit: Option<u16>,
+        intent: AdmissionIntentV1,
+    ) -> Result<OrchestrationBindingFirstPageEnvelope, OrchestrationBindingQueryError> {
+        intent
+            .validate()
+            .map_err(|_| OrchestrationBindingQueryError::AdmissionIntentInvalid)?;
+        let namespace = request.namespace.clone();
+        let loader_intent = intent.clone();
+        let replay = admission_intent_replay_projection(&intent);
+        self.orchestration_binding_snapshots
+            .first_page_with_admission_loader(
+                parent_id,
+                connection_incarnation,
+                request,
+                page_limit,
+                intent,
+                Utc::now(),
+                || async {
+                    let rows = materialize_binding_rows(&self.db.conn, parent_id, &namespace).await?;
+                    validate_admission_intent_source(&loader_intent, &rows)?;
+                    let existing = self
+                        .load_by_dispatch_intent(
+                            parent_id,
+                            &loader_intent.dispatch_intent_id,
+                        )
+                        .await
+                        .map_err(|error| match error {
+                            TaskStoreError::DispatchIntentConflict(_) => {
+                                OrchestrationBindingQueryError::DispatchIntentConflict
+                            }
+                            _ => OrchestrationBindingQueryError::Failed,
+                        })?;
+                    let existing_task_id = if let Some(existing) = existing {
+                        existing
+                            .ensure_dispatch_intent_replay(&replay)
+                            .map_err(|error| match error {
+                                TaskStoreError::DispatchIntentConflict(_) => {
+                                    OrchestrationBindingQueryError::DispatchIntentConflict
+                                }
+                                _ => OrchestrationBindingQueryError::Failed,
+                            })?;
+                        Some(existing.task_id)
+                    } else {
+                        None
+                    };
+                    Ok((rows, existing_task_id))
+                },
+            )
             .await
     }
 

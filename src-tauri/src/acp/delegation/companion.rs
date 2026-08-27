@@ -68,11 +68,12 @@ use crate::acp::delegation::transport::{
     CancelDelegationReason, CompanionRole,
 };
 use crate::acp::delegation::types::{
-    validate_correlation_id, BindingEvidenceV1, DelegationOrchestrationBindingPage,
-    DelegationReturnWhen, OrchestrationBindingArtifactDescriptor, OrchestrationBindingDelivery,
-    OrchestrationBindingQueryError, OrchestrationBindingQueryRequest,
-    OrchestrationBindingToolRequest, ORCHESTRATION_BINDING_DEFAULT_LIMIT,
-    ORCHESTRATION_BINDING_MAX_LIMIT,
+    validate_correlation_id, AdmissionPreparation, BindingEvidenceV1,
+    DelegationOrchestrationBindingPage, DelegationReturnWhen,
+    OrchestrationBindingArtifactDescriptor, OrchestrationBindingDelivery,
+    OrchestrationBindingFirstPageEnvelope, OrchestrationBindingQueryError,
+    OrchestrationBindingQueryRequest, OrchestrationBindingToolRequest,
+    ORCHESTRATION_BINDING_DEFAULT_LIMIT, ORCHESTRATION_BINDING_MAX_LIMIT,
 };
 use crate::acp::delegation::workflow::{
     CompleteWorkRequest, WorkflowIndexOmissionStep, WorkflowStateIndexDto,
@@ -1525,7 +1526,11 @@ fn artifact_storage_metric_outcome(error: OrchestrationBindingQueryError) -> Art
         OrchestrationBindingQueryError::ArtifactResultTooLarge => {
             ArtifactExportOutcome::ResultTooLarge
         }
-        OrchestrationBindingQueryError::Invalid => ArtifactExportOutcome::BrokerFailed,
+        OrchestrationBindingQueryError::Invalid
+        | OrchestrationBindingQueryError::AdmissionIntentInvalid
+        | OrchestrationBindingQueryError::DispatchIntentConflict => {
+            ArtifactExportOutcome::BrokerFailed
+        }
     }
 }
 
@@ -1971,7 +1976,7 @@ async fn build_tools_call_spawn(
         }
         "get_delegation_orchestration_bindings" => {
             if arguments.as_object().is_some_and(|object| {
-                ["delivery", "limit", "snapshot_id", "cursor"]
+                ["delivery", "limit", "snapshot_id", "cursor", "admission_intent"]
                     .iter()
                     .any(|field| object.get(*field).is_some_and(Value::is_null))
             }) {
@@ -1997,6 +2002,8 @@ async fn build_tools_call_spawn(
             if query.validate().is_err()
                 || (delivery == OrchestrationBindingDelivery::Artifact
                     && (query.snapshot_id.is_some() || query.cursor.is_some()))
+                || (tool_request.admission_intent.is_some()
+                    && delivery != OrchestrationBindingDelivery::Artifact)
             {
                 return orchestration_binding_query_invalid_response(id);
             }
@@ -2007,6 +2014,7 @@ async fn build_tools_call_spawn(
                 page_limit: None,
                 snapshot_id: query.snapshot_id,
                 cursor: query.cursor,
+                admission_intent: tool_request.admission_intent,
             };
             match delivery {
                 OrchestrationBindingDelivery::Page => {
@@ -2728,6 +2736,10 @@ fn bounded_orchestration_binding_error(id: Value, code: &str) -> JsonRpcResponse
         "orchestration_binding_artifact_result_too_large" => {
             "orchestration binding artifact result exceeds the transport limit"
         }
+        "orchestration_admission_intent_invalid" => "invalid orchestration admission intent",
+        "delegation_dispatch_intent_conflict" => {
+            "delegation dispatch intent conflicts with an existing run"
+        }
         "payload_too_large" => {
             "orchestration binding row exceeds the 7680-byte stdio transport budget"
         }
@@ -2879,6 +2891,12 @@ fn orchestration_binding_outcome_error(outcome: &Value) -> Option<OrchestrationB
             Some("orchestration_binding_snapshot_stale") => {
                 OrchestrationBindingQueryError::SnapshotStale
             }
+            Some("orchestration_admission_intent_invalid") => {
+                OrchestrationBindingQueryError::AdmissionIntentInvalid
+            }
+            Some("delegation_dispatch_intent_conflict") => {
+                OrchestrationBindingQueryError::DispatchIntentConflict
+            }
             _ => OrchestrationBindingQueryError::Failed,
         },
     )
@@ -2887,9 +2905,13 @@ fn orchestration_binding_outcome_error(outcome: &Value) -> Option<OrchestrationB
 async fn collect_orchestration_binding_artifact_pages(
     socket: &str,
     first_request: &BrokerOrchestrationBindingsRequest,
-) -> Result<Vec<DelegationOrchestrationBindingPage>, OrchestrationBindingQueryError> {
+) -> Result<
+    (Vec<DelegationOrchestrationBindingPage>, Option<AdmissionPreparation>),
+    OrchestrationBindingQueryError,
+> {
     let mut request = first_request.clone();
     let mut pages = Vec::new();
+    let mut admission = None;
     loop {
         let response = client_orchestration_bindings_round_trip(socket, &request)
             .await
@@ -2897,8 +2919,16 @@ async fn collect_orchestration_binding_artifact_pages(
         if let Some(error) = orchestration_binding_outcome_error(&response.outcome) {
             return Err(error);
         }
-        let page: DelegationOrchestrationBindingPage = serde_json::from_value(response.outcome)
-            .map_err(|_| OrchestrationBindingQueryError::Failed)?;
+        let page = if pages.is_empty() && request.admission_intent.is_some() {
+            let envelope: OrchestrationBindingFirstPageEnvelope =
+                serde_json::from_value(response.outcome)
+                    .map_err(|_| OrchestrationBindingQueryError::Failed)?;
+            admission = Some(envelope.admission);
+            envelope.page
+        } else {
+            serde_json::from_value(response.outcome)
+                .map_err(|_| OrchestrationBindingQueryError::Failed)?
+        };
         let complete = page.complete;
         let snapshot_id = page.snapshot_id.clone();
         let next_cursor = page.next_cursor.clone();
@@ -2908,15 +2938,17 @@ async fn collect_orchestration_binding_artifact_pages(
             error => error,
         })?;
         if complete {
-            return Ok(pages);
+            return Ok((pages, admission));
         }
         request.snapshot_id = Some(snapshot_id);
         request.cursor = Some(next_cursor.ok_or(OrchestrationBindingQueryError::Failed)?);
+        request.admission_intent = None;
     }
 }
 
 fn render_orchestration_binding_artifact(
     descriptor: &OrchestrationBindingArtifactDescriptor,
+    admission: Option<&AdmissionPreparation>,
 ) -> Value {
     let rows = if descriptor.total_rows == 1 {
         "row"
@@ -2926,6 +2958,18 @@ fn render_orchestration_binding_artifact(
     let expires_at = descriptor
         .snapshot_expires_at
         .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true);
+    let mut structured_content = serde_json::to_value(descriptor)
+        .expect("artifact descriptor contains serializable fields");
+    if let Some(admission) = admission {
+        structured_content
+            .as_object_mut()
+            .expect("artifact descriptor serializes as an object")
+            .insert(
+                "admission".into(),
+                serde_json::to_value(admission)
+                    .expect("admission preparation contains serializable fields"),
+            );
+    }
     json!({
         "content": [{
             "type": "text",
@@ -2940,18 +2984,19 @@ fn render_orchestration_binding_artifact(
             )
         }],
         "isError": false,
-        "structuredContent": descriptor,
+        "structuredContent": structured_content,
     })
 }
 
 fn finalize_orchestration_binding_artifact_response(
     id: Value,
     descriptor: OrchestrationBindingArtifactDescriptor,
+    admission: Option<AdmissionPreparation>,
     mut pending: PendingBindingArtifact,
 ) -> (JsonRpcResponse, Option<PendingBindingArtifact>) {
     let response = ok(
         id.clone(),
-        render_orchestration_binding_artifact(&descriptor),
+        render_orchestration_binding_artifact(&descriptor, admission.as_ref()),
     );
     let result_bytes = match serialize_jsonrpc_line(&response) {
         Ok(line) => line.len(),
@@ -2995,7 +3040,7 @@ async fn orchestration_binding_artifact_response(
                 restarted = true;
                 inflight.record_binding_artifact_stale_restart();
             }
-            Ok(pages) => break pages,
+            Ok(materialized) => break materialized,
             Err(error) => {
                 let outcome = match error {
                     OrchestrationBindingQueryError::SnapshotStale => ArtifactExportOutcome::Stale,
@@ -3010,6 +3055,7 @@ async fn orchestration_binding_artifact_response(
             }
         }
     };
+    let (pages, admission) = pages;
     let (descriptor, pending) = match store_binding_artifact(incarnation_id, pages, inflight) {
         Ok(stored) => stored,
         Err(OrchestrationBindingQueryError::Invalid) => {
@@ -3023,7 +3069,7 @@ async fn orchestration_binding_artifact_response(
         }
         Err(error) => return (bounded_orchestration_binding_error(id, error.code()), None),
     };
-    finalize_orchestration_binding_artifact_response(id, descriptor, pending)
+    finalize_orchestration_binding_artifact_response(id, descriptor, admission, pending)
 }
 
 fn orchestration_binding_query_invalid_response(id: Value) -> LineAction {
@@ -5302,6 +5348,7 @@ mod tests {
             let (response, pending) = finalize_orchestration_binding_artifact_response(
                 json!(format!("session-4123-artifact-{scan_index}")),
                 descriptor,
+                None,
                 pending,
             );
             let pending = pending.expect("fixture artifact result must fit the public budget");
@@ -8317,6 +8364,71 @@ mod tests {
         );
     }
 
+    #[test]
+    fn orchestration_admission_ticket_issue_artifact_metadata_is_structured_only() {
+        let descriptor = OrchestrationBindingArtifactDescriptor {
+            schema_version: 1,
+            delivery: "artifact".into(),
+            namespace: "brainstorm-to-delivery".into(),
+            snapshot_id: "1a641e16-36f4-4ec5-aa4f-18d18e6ab107".into(),
+            snapshot_revision: "17".into(),
+            snapshot_created_at: "2026-08-26T08:00:00Z".parse().unwrap(),
+            snapshot_expires_at: "2026-08-26T08:01:00Z".parse().unwrap(),
+            total_rows: 0,
+            artifact_path: "C:/private/artifact.json".into(),
+            artifact_format: "codeg-orchestration-bindings-v1+json".into(),
+            artifact_bytes: 32,
+            artifact_sha256: format!("sha256:{}", "a".repeat(64)),
+        };
+        let admission = AdmissionPreparation::prepared(
+            "8f95dd45-9eca-42a8-9909-0ac00be8ad52".into(),
+            "4a67bba4-e1f5-46d1-a9b1-aa796598ffce".into(),
+            descriptor.snapshot_expires_at,
+        );
+
+        let result = render_orchestration_binding_artifact(&descriptor, Some(&admission));
+        assert_eq!(
+            result["structuredContent"]["admission"],
+            json!({
+                "outcome": "prepared",
+                "protocol": "ticket_v1",
+                "dispatch_intent_id": "8f95dd45-9eca-42a8-9909-0ac00be8ad52",
+                "ticket": "4a67bba4-e1f5-46d1-a9b1-aa796598ffce",
+                "expires_at": "2026-08-26T08:01:00Z"
+            })
+        );
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(!text.contains("4a67bba4-e1f5-46d1-a9b1-aa796598ffce"));
+        assert!(!text.contains("8f95dd45-9eca-42a8-9909-0ac00be8ad52"));
+        assert!(result["structuredContent"].get("runs").is_none());
+        assert!(
+            serialize_jsonrpc_line(&ok(json!(i64::MAX), result))
+                .unwrap()
+                .len()
+                <= ORCHESTRATION_BINDING_ARTIFACT_MAX_RESULT_BYTES
+        );
+
+        let already_admitted = AdmissionPreparation::already_admitted(
+            "8f95dd45-9eca-42a8-9909-0ac00be8ad52".into(),
+            "6b228a7d-4ac9-4bc7-a16e-f4ecf6f0fd45".into(),
+        );
+        let result =
+            render_orchestration_binding_artifact(&descriptor, Some(&already_admitted));
+        assert_eq!(
+            result["structuredContent"]["admission"],
+            json!({
+                "outcome": "already_admitted",
+                "protocol": "ticket_v1",
+                "dispatch_intent_id": "8f95dd45-9eca-42a8-9909-0ac00be8ad52",
+                "task_id": "6b228a7d-4ac9-4bc7-a16e-f4ecf6f0fd45"
+            })
+        );
+        assert!(result["structuredContent"]["admission"]
+            .get("ticket")
+            .is_none());
+        assert!(result["structuredContent"].get("runs").is_none());
+    }
+
     #[tokio::test]
     async fn orchestration_binding_artifact_delivery_catalog_stays_within_phase1_cap() {
         let response = unwrap_respond(
@@ -8541,13 +8653,13 @@ mod tests {
             ascii_string_id_with_serialized_len(GET_ORCHESTRATION_BINDINGS_MAX_REQUEST_ID_BYTES);
         let oversized_bytes = serialize_jsonrpc_line(&ok(
             id.clone(),
-            render_orchestration_binding_artifact(&descriptor),
+            render_orchestration_binding_artifact(&descriptor, None),
         ))
         .unwrap()
         .len();
 
         let (response, pending) =
-            finalize_orchestration_binding_artifact_response(id, descriptor, pending);
+            finalize_orchestration_binding_artifact_response(id, descriptor, None, pending);
 
         assert!(pending.is_none());
         let line = serialize_jsonrpc_line(&response).unwrap();

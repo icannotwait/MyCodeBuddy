@@ -14,6 +14,7 @@ use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::acp::delegation::attention::AttentionResolutionCode;
 use crate::acp::delegation::recovery_policy::{
@@ -103,6 +104,180 @@ pub enum OrchestrationBindingDelivery {
     Artifact,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AdmissionIntentKind {
+    First,
+    Continue,
+    Replacement,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AdmissionIntentV1 {
+    pub schema_version: u32,
+    pub dispatch_intent_id: String,
+    pub request_fingerprint: String,
+    pub kind: AdmissionIntentKind,
+    pub work_unit_key: String,
+    pub agent_type: String,
+    pub profile_id: Option<String>,
+    pub target_task_id: Option<String>,
+    pub replacement_reason: Option<String>,
+    pub orchestration_binding: Option<OrchestrationBindingV1>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdmissionIntentV1Wire {
+    schema_version: u32,
+    dispatch_intent_id: String,
+    request_fingerprint: String,
+    kind: AdmissionIntentKind,
+    work_unit_key: String,
+    agent_type: String,
+    profile_id: serde_json::Value,
+    target_task_id: serde_json::Value,
+    replacement_reason: serde_json::Value,
+    orchestration_binding: serde_json::Value,
+}
+
+impl<'de> Deserialize<'de> for AdmissionIntentV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = AdmissionIntentV1Wire::deserialize(deserializer)?;
+        let profile_id: Option<String> =
+            serde_json::from_value(wire.profile_id).map_err(serde::de::Error::custom)?;
+        let target_task_id: Option<String> =
+            serde_json::from_value(wire.target_task_id).map_err(serde::de::Error::custom)?;
+        let replacement_reason: Option<String> =
+            serde_json::from_value(wire.replacement_reason).map_err(serde::de::Error::custom)?;
+        let orchestration_binding: Option<OrchestrationBindingV1> =
+            serde_json::from_value(wire.orchestration_binding)
+                .map_err(serde::de::Error::custom)?;
+        let intent = Self {
+            schema_version: wire.schema_version,
+            dispatch_intent_id: wire.dispatch_intent_id,
+            request_fingerprint: wire.request_fingerprint,
+            kind: wire.kind,
+            work_unit_key: wire.work_unit_key,
+            agent_type: wire.agent_type,
+            profile_id,
+            target_task_id,
+            replacement_reason,
+            orchestration_binding,
+        };
+        intent.validate().map_err(serde::de::Error::custom)?;
+        Ok(intent)
+    }
+}
+
+impl AdmissionIntentV1 {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.schema_version != 1 {
+            return Err("schema_version must be 1");
+        }
+        if !is_canonical_uuid(&self.dispatch_intent_id) {
+            return Err("dispatch_intent_id must be a canonical lowercase UUID");
+        }
+        let fingerprint = self.request_fingerprint.as_bytes();
+        if fingerprint.len() != 64
+            || !fingerprint
+                .iter()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+        {
+            return Err("request_fingerprint must be lowercase SHA-256 hex");
+        }
+        if self.work_unit_key.is_empty()
+            || self.work_unit_key.trim() != self.work_unit_key
+            || self.work_unit_key.chars().count() > 200
+        {
+            return Err("work_unit_key is invalid");
+        }
+        let agent_type = AgentType::from_untrusted_wire(&self.agent_type)
+            .ok_or("agent_type is invalid")?;
+        if agent_type.as_wire() != self.agent_type {
+            return Err("agent_type is invalid");
+        }
+        if self.profile_id.as_ref().is_some_and(|profile_id| {
+            profile_id.is_empty() || profile_id.trim() != profile_id
+        }) {
+            return Err("profile_id is invalid");
+        }
+        if let Some(binding) = self.orchestration_binding.as_ref() {
+            binding.validate()?;
+        }
+        match self.kind {
+            AdmissionIntentKind::First
+                if self.target_task_id.is_none() && self.replacement_reason.is_none() => {}
+            AdmissionIntentKind::Continue
+                if self
+                    .target_task_id
+                    .as_deref()
+                    .is_some_and(is_canonical_uuid)
+                    && self.replacement_reason.is_none() => {}
+            AdmissionIntentKind::Replacement
+                if self
+                    .target_task_id
+                    .as_deref()
+                    .is_some_and(is_canonical_uuid)
+                    && self
+                        .replacement_reason
+                        .as_deref()
+                        .and_then(ReplacementReason::parse)
+                        .is_some() => {}
+            _ => return Err("admission operation fields are invalid"),
+        }
+        Ok(())
+    }
+
+    pub fn canonical_digest(&self) -> String {
+        let bytes = serde_json::to_vec(self).expect("admission intent contains serializable fields");
+        let digest = Sha256::digest(bytes);
+        digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum AdmissionPreparation {
+    Prepared {
+        protocol: String,
+        dispatch_intent_id: String,
+        ticket: String,
+        expires_at: DateTime<Utc>,
+    },
+    AlreadyAdmitted {
+        protocol: String,
+        dispatch_intent_id: String,
+        task_id: String,
+    },
+}
+
+impl AdmissionPreparation {
+    pub(crate) fn prepared(
+        dispatch_intent_id: String,
+        ticket: String,
+        expires_at: DateTime<Utc>,
+    ) -> Self {
+        Self::Prepared {
+            protocol: "ticket_v1".into(),
+            dispatch_intent_id,
+            ticket,
+            expires_at,
+        }
+    }
+
+    pub(crate) fn already_admitted(dispatch_intent_id: String, task_id: String) -> Self {
+        Self::AlreadyAdmitted {
+            protocol: "ticket_v1".into(),
+            dispatch_intent_id,
+            task_id,
+        }
+    }
+}
+
 /// Strict companion-facing input; the broker continues to receive page DTOs.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -112,6 +287,7 @@ pub struct OrchestrationBindingToolRequest {
     pub limit: Option<u16>,
     pub snapshot_id: Option<String>,
     pub cursor: Option<String>,
+    pub admission_intent: Option<AdmissionIntentV1>,
 }
 
 /// Strict MCP input for a first page or continuation of one binding snapshot.
@@ -199,6 +375,12 @@ pub struct DelegationOrchestrationBindingPage {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrchestrationBindingFirstPageEnvelope {
+    pub page: DelegationOrchestrationBindingPage,
+    pub admission: AdmissionPreparation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BindingEvidenceV1 {
     pub schema_version: u32,
     pub pages: Vec<DelegationOrchestrationBindingPage>,
@@ -236,6 +418,10 @@ pub enum OrchestrationBindingQueryError {
     ArtifactTooLarge,
     #[error("orchestration binding artifact result exceeds the transport limit")]
     ArtifactResultTooLarge,
+    #[error("invalid orchestration admission intent")]
+    AdmissionIntentInvalid,
+    #[error("delegation dispatch intent conflicts with an existing run")]
+    DispatchIntentConflict,
 }
 
 impl OrchestrationBindingQueryError {
@@ -248,6 +434,8 @@ impl OrchestrationBindingQueryError {
             Self::ArtifactIoFailed => "orchestration_binding_artifact_io_failed",
             Self::ArtifactTooLarge => "orchestration_binding_artifact_too_large",
             Self::ArtifactResultTooLarge => "orchestration_binding_artifact_result_too_large",
+            Self::AdmissionIntentInvalid => "orchestration_admission_intent_invalid",
+            Self::DispatchIntentConflict => "delegation_dispatch_intent_conflict",
         }
     }
 }
@@ -256,9 +444,144 @@ impl OrchestrationBindingQueryError {
 mod orchestration_binding_tests {
     use std::collections::BTreeSet;
 
-    use serde_json::Value;
+    use serde_json::{json, Value};
 
-    use super::OrchestrationBindingV1;
+    use super::{OrchestrationBindingToolRequest, OrchestrationBindingV1};
+
+    fn admission_intent(kind: &str, target: Value, replacement_reason: Value) -> Value {
+        json!({
+            "schema_version": 1,
+            "dispatch_intent_id": "8f95dd45-9eca-42a8-9909-0ac00be8ad52",
+            "request_fingerprint": "2a44be9d1662a314cbbd2c8111bcf83159be7bdc93abadff977d01447f986648",
+            "kind": kind,
+            "work_unit_key": "task|7|implementer|codex|none",
+            "agent_type": "codex",
+            "profile_id": null,
+            "target_task_id": target,
+            "replacement_reason": replacement_reason,
+            "orchestration_binding": null
+        })
+    }
+
+    fn artifact_request(intent: Value) -> Value {
+        json!({
+            "namespace": "brainstorm-to-delivery",
+            "delivery": "artifact",
+            "admission_intent": intent
+        })
+    }
+
+    #[test]
+    fn orchestration_admission_intent_strict_json_and_operation_matrix() {
+        for intent in [
+            admission_intent("first", Value::Null, Value::Null),
+            admission_intent(
+                "continue",
+                json!("6b228a7d-4ac9-4bc7-a16e-f4ecf6f0fd45"),
+                Value::Null,
+            ),
+            admission_intent(
+                "replacement",
+                json!("6b228a7d-4ac9-4bc7-a16e-f4ecf6f0fd45"),
+                json!("unresumable"),
+            ),
+        ] {
+            serde_json::from_value::<OrchestrationBindingToolRequest>(artifact_request(intent))
+                .expect("strict admission intent should be accepted");
+        }
+
+        let invalid = [
+            admission_intent(
+                "first",
+                json!("6b228a7d-4ac9-4bc7-a16e-f4ecf6f0fd45"),
+                Value::Null,
+            ),
+            admission_intent("continue", Value::Null, Value::Null),
+            admission_intent(
+                "continue",
+                json!("6b228a7d-4ac9-4bc7-a16e-f4ecf6f0fd45"),
+                json!("unresumable"),
+            ),
+            admission_intent(
+                "replacement",
+                json!("6b228a7d-4ac9-4bc7-a16e-f4ecf6f0fd45"),
+                Value::Null,
+            ),
+        ];
+        for intent in invalid {
+            assert!(
+                serde_json::from_value::<OrchestrationBindingToolRequest>(artifact_request(intent))
+                    .is_err(),
+                "invalid operation matrix must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn orchestration_admission_intent_rejects_noncanonical_identity_and_unknown_keys() {
+        let mut cases = Vec::new();
+        let mut value = admission_intent("first", Value::Null, Value::Null);
+        value["dispatch_intent_id"] =
+            json!("8F95DD45-9ECA-42A8-9909-0AC00BE8AD52");
+        cases.push(value);
+        let mut value = admission_intent("first", Value::Null, Value::Null);
+        value["request_fingerprint"] = json!("A".repeat(64));
+        cases.push(value);
+        let mut value = admission_intent("continue", json!("not-a-uuid"), Value::Null);
+        value["orchestration_binding"] = json!({
+            "schema_version": 1,
+            "namespace": "brainstorm-to-delivery",
+            "generation": 1,
+            "route_fingerprint": format!("sha256:{}", "a".repeat(64))
+        });
+        cases.push(value);
+        let mut value = admission_intent("first", Value::Null, Value::Null);
+        value["unknown"] = json!(true);
+        cases.push(value);
+        let mut value = admission_intent("first", Value::Null, Value::Null);
+        value["orchestration_binding"] = json!({
+            "schema_version": 1,
+            "namespace": "INVALID",
+            "generation": 1,
+            "route_fingerprint": format!("sha256:{}", "a".repeat(64))
+        });
+        cases.push(value);
+        for field in [
+            "profile_id",
+            "target_task_id",
+            "replacement_reason",
+            "orchestration_binding",
+        ] {
+            let mut value = admission_intent("first", Value::Null, Value::Null);
+            value.as_object_mut().unwrap().remove(field);
+            cases.push(value);
+        }
+
+        for intent in cases {
+            assert!(
+                serde_json::from_value::<OrchestrationBindingToolRequest>(artifact_request(intent))
+                    .is_err(),
+                "noncanonical or unknown intent input must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn orchestration_admission_intent_digest_hashes_exact_compact_strict_object() {
+        let request: OrchestrationBindingToolRequest = serde_json::from_value(artifact_request(
+            admission_intent("first", Value::Null, Value::Null),
+        ))
+        .unwrap();
+        let intent = request.admission_intent.expect("admission intent");
+        assert_eq!(
+            serde_json::to_value(&intent).unwrap(),
+            admission_intent("first", Value::Null, Value::Null)
+        );
+        assert_eq!(
+            intent.canonical_digest(),
+            "133c7b500e6569787f652c7a6f095a69446ef08a818599d6a941bfda325f046c"
+        );
+    }
 
     #[test]
     fn delegation_orchestration_bindings_shared_corpus_is_exact_and_strict() {

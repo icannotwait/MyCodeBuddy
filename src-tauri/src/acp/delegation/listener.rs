@@ -47,10 +47,10 @@ use crate::acp::delegation::transport::{
     CompanionRole,
 };
 use crate::acp::delegation::types::{
-    correlation_error_message, validate_correlation_id, CorrelationEntryPoint,
-    CorrelationFailureKind, DelegationReplyResult, DelegationRequest, DelegationReturnWhen,
-    DelegationStatusBatch, DelegationTaskReport, DelegationWakeReason, OrchestrationBindingV1,
-    ParentDecisionResult, TaskStatus,
+    correlation_error_message, validate_correlation_id, AdmissionPreparation,
+    CorrelationEntryPoint, CorrelationFailureKind, DelegationReplyResult, DelegationRequest,
+    DelegationReturnWhen, DelegationStatusBatch, DelegationTaskReport, DelegationWakeReason,
+    OrchestrationBindingV1, ParentDecisionResult, TaskStatus,
 };
 #[cfg(test)]
 use crate::acp::delegation::workflow::{
@@ -96,7 +96,7 @@ use serde_json::Value;
 const STATUS_WAIT_MAX_MS: u64 = 60_000;
 
 /// Parent session context for full [`WaitStamp`] registration on Join waits.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParentWaitContext {
     pub conversation_id: i32,
     pub connection_incarnation: String,
@@ -1640,7 +1640,7 @@ impl DelegationListener {
     async fn orchestration_binding_query_auth_context(
         &self,
         token: &str,
-    ) -> Result<i32, OrchestrationBindingQueryAuthError> {
+    ) -> Result<ParentWaitContext, OrchestrationBindingQueryAuthError> {
         let entry = self
             .tokens
             .lookup(token)
@@ -1653,7 +1653,7 @@ impl DelegationListener {
             return Err(OrchestrationBindingQueryAuthError::CoordinationUnavailable);
         }
         self.parent_lookup
-            .current_conversation_id(&entry.parent_connection_id)
+            .parent_wait_context(&entry.parent_connection_id)
             .await
             .ok_or(OrchestrationBindingQueryAuthError::NoActiveConversation)
     }
@@ -1662,11 +1662,11 @@ impl DelegationListener {
         &self,
         req: BrokerOrchestrationBindingsRequest,
     ) -> Value {
-        let parent_id = match self
+        let parent = match self
             .orchestration_binding_query_auth_context(&req.token)
             .await
         {
-            Ok(parent_id) => parent_id,
+            Ok(parent) => parent,
             Err(error) => return error.to_value(),
         };
         let Some(runs) = self.broker.run_store() else {
@@ -1675,8 +1675,60 @@ impl DelegationListener {
             );
         };
         let page_limit = req.page_limit;
+        if let Some(intent) = req.admission_intent.clone() {
+            if parent.connection_incarnation.is_empty() {
+                return orchestration_binding_query_error_value(
+                    crate::acp::delegation::types::OrchestrationBindingQueryError::Failed,
+                );
+            }
+            return match runs
+                .prepare_orchestration_binding_admission(
+                    parent.conversation_id,
+                    &parent.connection_incarnation,
+                    req.query(),
+                    page_limit,
+                    intent,
+                )
+                .await
+            {
+                Ok(envelope) => {
+                    match &envelope.admission {
+                        AdmissionPreparation::Prepared { .. } => self.metrics.record_ticket_outcome(
+                            crate::acp::delegation::metrics::AdmissionTicketMetricOutcome::Issued,
+                        ),
+                        AdmissionPreparation::AlreadyAdmitted { .. } => {
+                            self.metrics.record_ticket_outcome(
+                                crate::acp::delegation::metrics::AdmissionTicketMetricOutcome::AlreadyAdmitted,
+                            );
+                            self.metrics.record_dispatch_intent_outcome(
+                                crate::acp::delegation::metrics::DispatchIntentMetricOutcome::ExactReplay,
+                            );
+                        }
+                    }
+                    serde_json::to_value(envelope).unwrap_or_else(|_| {
+                        orchestration_binding_query_error_value(
+                            crate::acp::delegation::types::OrchestrationBindingQueryError::Failed,
+                        )
+                    })
+                }
+                Err(error) => {
+                    if error
+                        == crate::acp::delegation::types::OrchestrationBindingQueryError::DispatchIntentConflict
+                    {
+                        self.metrics.record_dispatch_intent_outcome(
+                            crate::acp::delegation::metrics::DispatchIntentMetricOutcome::Conflict,
+                        );
+                    }
+                    orchestration_binding_query_error_value(error)
+                }
+            };
+        }
         match runs
-            .get_orchestration_binding_page_with_limit(parent_id, req.query(), page_limit)
+            .get_orchestration_binding_page_with_limit(
+                parent.conversation_id,
+                req.query(),
+                page_limit,
+            )
             .await
         {
             Ok(page) => serde_json::to_value(page).unwrap_or_else(|_| {
@@ -3437,6 +3489,18 @@ mod tests {
         async fn current_conversation_id(&self, _parent_connection_id: &str) -> Option<i32> {
             self.0
         }
+
+        async fn parent_wait_context(
+            &self,
+            _parent_connection_id: &str,
+        ) -> Option<ParentWaitContext> {
+            Some(ParentWaitContext {
+                conversation_id: self.0?,
+                connection_incarnation: "test-connection-incarnation".into(),
+                turn_generation: 0,
+                parent_tool_use_id: None,
+            })
+        }
     }
 
     /// Gates `bind_delegation_wait` so tests can peer-close after register but
@@ -4788,8 +4852,10 @@ mod tests {
         assert_eq!(
             listener
                 .orchestration_binding_query_auth_context("root")
-                .await,
-            Ok(77),
+                .await
+                .expect("root auth context")
+                .conversation_id,
+            77,
             "workflow_v2=false must not block the read-only query"
         );
         for (token, expected) in [
@@ -4814,6 +4880,7 @@ mod tests {
                     page_limit: None,
                     snapshot_id: None,
                     cursor: None,
+                    admission_intent: None,
                 })
                 .await;
             assert_eq!(outcome["error"]["code"], expected.code());
@@ -4831,6 +4898,214 @@ mod tests {
                 .await,
             Err(OrchestrationBindingQueryAuthError::NoActiveConversation)
         );
+    }
+
+    #[tokio::test]
+    async fn orchestration_admission_ticket_issue_returns_private_preparation_envelope() {
+        use crate::acp::delegation::run_store::RunStore;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/admission-ticket-issue").await;
+        let parent_id = seed_conversation(&db, folder, AgentType::Codex).await;
+        let runs = Arc::new(RunStore::new(db));
+        let broker = Arc::new(
+            DelegationBroker::new(
+                Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+                Arc::new(AlwaysRootLookup) as Arc<dyn ConversationDepthLookup>,
+            )
+            .with_run_store(runs),
+        );
+        let tokens = Arc::new(TokenRegistry::default());
+        tokens
+            .register(
+                "root".into(),
+                TokenEntry {
+                    parent_connection_id: "parent-conn".into(),
+                    working_dir: test_working_dir(),
+                    coordination_v1: true,
+                    delegation_continuation_v1: true,
+                    role: CompanionRole::Root,
+                    workflow_v2: false,
+                    completion_v2: false,
+                    bound_task_id: None,
+                },
+            )
+            .await;
+        let listener = make_listener(broker, tokens, Some(parent_id));
+        let message: BrokerMessage = serde_json::from_value(json!({
+            "kind": "orchestration_bindings",
+            "token": "root",
+            "namespace": "brainstorm-to-delivery",
+            "limit": 200,
+            "admission_intent": {
+                "schema_version": 1,
+                "dispatch_intent_id": "8f95dd45-9eca-42a8-9909-0ac00be8ad52",
+                "request_fingerprint": "2a44be9d1662a314cbbd2c8111bcf83159be7bdc93abadff977d01447f986648",
+                "kind": "first",
+                "work_unit_key": "task|7|implementer|codex|none",
+                "agent_type": "codex",
+                "profile_id": null,
+                "target_task_id": null,
+                "replacement_reason": null,
+                "orchestration_binding": null
+            }
+        }))
+        .expect("private broker transport accepts admission intent");
+        let BrokerMessage::OrchestrationBindings(request) = message else {
+            panic!("expected orchestration binding request");
+        };
+
+        let outcome = listener.process_orchestration_bindings(request).await;
+        assert_eq!(outcome["page"]["page_start"], 0);
+        assert_eq!(outcome["admission"]["protocol"], "ticket_v1");
+        assert_eq!(outcome["admission"]["outcome"], "prepared");
+        assert_eq!(
+            outcome["admission"]["dispatch_intent_id"],
+            "8f95dd45-9eca-42a8-9909-0ac00be8ad52"
+        );
+        assert!(outcome["admission"]["ticket"].as_str().is_some_and(
+            crate::acp::delegation::types::is_canonical_uuid
+        ));
+        assert!(outcome["admission"]["expires_at"].is_string());
+    }
+
+    #[tokio::test]
+    async fn orchestration_admission_ticket_issue_replays_exact_intent_and_rejects_conflict() {
+        use crate::acp::delegation::run_store::RunStore;
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
+        use sea_orm::ConnectionTrait;
+
+        const TASK_ID: &str = "6b228a7d-4ac9-4bc7-a16e-f4ecf6f0fd45";
+        const INTENT_ID: &str = "8f95dd45-9eca-42a8-9909-0ac00be8ad52";
+        const FINGERPRINT: &str =
+            "2a44be9d1662a314cbbd2c8111bcf83159be7bdc93abadff977d01447f986648";
+
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, "/tmp/admission-intent-replay").await;
+        let parent_id = seed_conversation(&db, folder, AgentType::Codex).await;
+        let child_id = seed_conversation(&db, folder, AgentType::Codex).await;
+        db.conn
+            .execute_unprepared(&format!(
+                "INSERT INTO delegation_task_runs (task_id, root_task_id, generation, \
+                 parent_conversation_id, child_conversation_id, agent_type, admission_class, \
+                 lineage_root_task_id, work_unit_key, request_fingerprint, dispatch_intent_id, \
+                 history_only, status, created_at, updated_at) VALUES \
+                 ('{TASK_ID}', '{TASK_ID}', 1, {parent_id}, {child_id}, 'codex', \
+                  'normal_revision', '{TASK_ID}', 'task|7|implementer|codex|none', \
+                  '{FINGERPRINT}', '{INTENT_ID}', 0, 'completed', \
+                  '2026-08-17T08:00:00Z', '2026-08-17T08:00:00Z')"
+            ))
+            .await
+            .unwrap();
+
+        let runs = Arc::new(RunStore::new(db));
+        let broker = Arc::new(
+            DelegationBroker::new(
+                Arc::new(MockSpawner::new()) as Arc<dyn ConnectionSpawner>,
+                Arc::new(AlwaysRootLookup) as Arc<dyn ConversationDepthLookup>,
+            )
+            .with_run_store(runs),
+        );
+        let tokens = Arc::new(TokenRegistry::default());
+        tokens
+            .register(
+                "root".into(),
+                TokenEntry {
+                    parent_connection_id: "parent-conn".into(),
+                    working_dir: test_working_dir(),
+                    coordination_v1: true,
+                    delegation_continuation_v1: true,
+                    role: CompanionRole::Root,
+                    workflow_v2: false,
+                    completion_v2: false,
+                    bound_task_id: None,
+                },
+            )
+            .await;
+        let listener = make_listener(broker, tokens, Some(parent_id));
+        let base_intent = json!({
+            "schema_version": 1,
+            "dispatch_intent_id": INTENT_ID,
+            "request_fingerprint": FINGERPRINT,
+            "kind": "first",
+            "work_unit_key": "task|7|implementer|codex|none",
+            "agent_type": "codex",
+            "profile_id": null,
+            "target_task_id": null,
+            "replacement_reason": null,
+            "orchestration_binding": null
+        });
+        let request = |intent: Value| {
+            let message: BrokerMessage = serde_json::from_value(json!({
+                "kind": "orchestration_bindings",
+                "token": "root",
+                "namespace": "brainstorm-to-delivery",
+                "limit": 200,
+                "admission_intent": intent
+            }))
+            .expect("private broker transport accepts admission intent");
+            let BrokerMessage::OrchestrationBindings(request) = message else {
+                panic!("expected orchestration binding request");
+            };
+            request
+        };
+
+        let exact = listener
+            .process_orchestration_bindings(request(base_intent.clone()))
+            .await;
+        assert_eq!(exact["page"]["runs"][0]["task_id"], TASK_ID);
+        assert_eq!(exact["admission"]["outcome"], "already_admitted");
+        assert_eq!(exact["admission"]["task_id"], TASK_ID);
+        assert!(exact["admission"].get("ticket").is_none());
+
+        let mut mismatches = Vec::new();
+        let mut intent = base_intent.clone();
+        intent["request_fingerprint"] = json!("b".repeat(64));
+        mismatches.push(intent);
+        let mut intent = base_intent.clone();
+        intent["work_unit_key"] = json!("task|8|implementer|codex|none");
+        mismatches.push(intent);
+        let mut intent = base_intent.clone();
+        intent["agent_type"] = json!("claude_code");
+        mismatches.push(intent);
+        let mut intent = base_intent.clone();
+        intent["profile_id"] = json!("profile-b");
+        mismatches.push(intent);
+        let mut intent = base_intent.clone();
+        intent["orchestration_binding"] = json!({
+            "schema_version": 1,
+            "namespace": "brainstorm-to-delivery",
+            "generation": 1,
+            "route_fingerprint": format!("sha256:{}", "a".repeat(64))
+        });
+        mismatches.push(intent);
+        let mut intent = base_intent.clone();
+        intent["kind"] = json!("continue");
+        intent["target_task_id"] = json!(TASK_ID);
+        mismatches.push(intent);
+        let mut intent = base_intent;
+        intent["kind"] = json!("replacement");
+        intent["target_task_id"] = json!(TASK_ID);
+        intent["replacement_reason"] = json!("unresumable");
+        mismatches.push(intent);
+
+        for intent in mismatches {
+            let conflict = listener
+                .process_orchestration_bindings(request(intent))
+                .await;
+            assert_eq!(
+                conflict["error"]["code"],
+                "delegation_dispatch_intent_conflict"
+            );
+            assert!(conflict.get("page").is_none());
+            assert!(conflict.get("admission").is_none());
+        }
+        let snapshot = listener.metrics.snapshot();
+        assert_eq!(snapshot.admission_ticket_outcomes["issued"], 0);
+        assert_eq!(snapshot.admission_ticket_outcomes["already_admitted"], 1);
+        assert_eq!(snapshot.dispatch_intent_outcomes["exact_replay"], 1);
+        assert_eq!(snapshot.dispatch_intent_outcomes["conflict"], 7);
     }
 
     #[tokio::test]
@@ -4893,6 +5168,7 @@ mod tests {
                 page_limit: Some(1),
                 snapshot_id: None,
                 cursor: None,
+                admission_intent: None,
             })
             .await;
         assert_eq!(first["page_start"], 0);
@@ -4913,6 +5189,7 @@ mod tests {
             page_limit: Some(2),
             snapshot_id: Some(snapshot_id),
             cursor: Some(cursor.clone()),
+            admission_intent: None,
         };
         let second = listener
             .process_orchestration_bindings(continuation.clone())

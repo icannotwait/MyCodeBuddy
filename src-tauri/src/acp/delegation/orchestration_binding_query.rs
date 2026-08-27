@@ -12,8 +12,10 @@ use crate::db::entities::delegation_task_run::{self, Entity as DelegationTaskRun
 use crate::models::AgentType;
 
 use super::types::{
+    AdmissionIntentKind, AdmissionIntentV1, AdmissionPreparation,
     DelegationOrchestrationBindingPage, DelegationOrchestrationBindingRun,
-    OrchestrationBindingQueryError, OrchestrationBindingQueryRequest, OrchestrationBindingV1,
+    OrchestrationBindingFirstPageEnvelope, OrchestrationBindingQueryError,
+    OrchestrationBindingQueryRequest, OrchestrationBindingV1,
 };
 
 pub use super::types::{ORCHESTRATION_BINDING_DEFAULT_LIMIT, ORCHESTRATION_BINDING_MAX_LIMIT};
@@ -25,6 +27,27 @@ pub const ORCHESTRATION_BINDING_MAX_ROWS: u64 = 4096;
 struct SnapshotState {
     revisions: HashMap<i32, u64>,
     snapshots: HashMap<String, SnapshotEntry>,
+    tickets: HashMap<String, AdmissionTicketEntry>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AdmissionTicketState {
+    Issued,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AdmissionTicketEntry {
+    pub ticket_id: String,
+    pub parent_id: i32,
+    pub connection_incarnation: String,
+    pub namespace: String,
+    pub snapshot_id: String,
+    pub snapshot_revision: u64,
+    pub expires_at: DateTime<Utc>,
+    pub dispatch_intent_id: String,
+    pub request_fingerprint: String,
+    pub intent_digest: String,
+    pub state: AdmissionTicketState,
 }
 
 #[derive(Clone)]
@@ -72,6 +95,107 @@ impl OrchestrationBindingSnapshotCache {
         state
             .snapshots
             .retain(|_, snapshot| snapshot.parent_id != parent_id);
+        state
+            .tickets
+            .retain(|_, ticket| ticket.parent_id != parent_id);
+    }
+
+    pub(crate) async fn first_page_with_admission_loader<F, Fut>(
+        &self,
+        parent_id: i32,
+        connection_incarnation: &str,
+        request: OrchestrationBindingQueryRequest,
+        page_limit: Option<u16>,
+        intent: AdmissionIntentV1,
+        now: DateTime<Utc>,
+        loader: F,
+    ) -> Result<OrchestrationBindingFirstPageEnvelope, OrchestrationBindingQueryError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<
+            Output = Result<
+                (Vec<DelegationOrchestrationBindingRun>, Option<String>),
+                OrchestrationBindingQueryError,
+            >,
+        >,
+    {
+        request.validate()?;
+        intent
+            .validate()
+            .map_err(|_| OrchestrationBindingQueryError::AdmissionIntentInvalid)?;
+        if request.snapshot_id.is_some()
+            || request.cursor.is_some()
+            || intent
+                .orchestration_binding
+                .as_ref()
+                .is_some_and(|binding| binding.namespace != request.namespace)
+        {
+            return Err(OrchestrationBindingQueryError::AdmissionIntentInvalid);
+        }
+        let effective_limit = page_limit.unwrap_or(request.limit);
+        if effective_limit == 0 || effective_limit > request.limit {
+            return Err(OrchestrationBindingQueryError::Invalid);
+        }
+
+        let _read_guard = self.mutation_gate.read().await;
+        let revision = self
+            .state
+            .lock()
+            .await
+            .revisions
+            .get(&parent_id)
+            .copied()
+            .unwrap_or(0);
+        let (mut rows, existing_task_id) = loader().await?;
+        let mut seen = HashSet::with_capacity(rows.len());
+        rows.retain(|row| seen.insert(row.task_id.clone()));
+        if rows.len() as u64 > ORCHESTRATION_BINDING_MAX_ROWS {
+            return Err(OrchestrationBindingQueryError::TooLarge);
+        }
+
+        let snapshot_id = uuid::Uuid::new_v4().to_string();
+        let expires_at = now
+            + chrono::Duration::from_std(ORCHESTRATION_BINDING_SNAPSHOT_TTL)
+                .expect("60-second TTL fits chrono");
+        let mut snapshot = SnapshotEntry {
+            snapshot_id: snapshot_id.clone(),
+            parent_id,
+            namespace: request.namespace.clone(),
+            limit: request.limit,
+            revision,
+            created_at: now,
+            expires_at,
+            rows,
+            cursors: HashMap::new(),
+            cursor_by_start: HashMap::new(),
+        };
+        let page = page_from_snapshot(&mut snapshot, 0, None, effective_limit);
+        let mut state = self.state.lock().await;
+        state.snapshots.retain(|_, entry| entry.expires_at > now);
+        state.tickets.retain(|_, entry| entry.expires_at > now);
+        state.snapshots.insert(snapshot_id.clone(), snapshot);
+
+        let admission = if let Some(task_id) = existing_task_id {
+            AdmissionPreparation::already_admitted(intent.dispatch_intent_id, task_id)
+        } else {
+            let ticket_id = uuid::Uuid::new_v4().to_string();
+            let entry = AdmissionTicketEntry {
+                ticket_id: ticket_id.clone(),
+                parent_id,
+                connection_incarnation: connection_incarnation.to_string(),
+                namespace: request.namespace,
+                snapshot_id,
+                snapshot_revision: revision,
+                expires_at,
+                dispatch_intent_id: intent.dispatch_intent_id.clone(),
+                request_fingerprint: intent.request_fingerprint.clone(),
+                intent_digest: intent.canonical_digest(),
+                state: AdmissionTicketState::Issued,
+            };
+            state.tickets.insert(ticket_id.clone(), entry);
+            AdmissionPreparation::prepared(intent.dispatch_intent_id, ticket_id, expires_at)
+        };
+        Ok(OrchestrationBindingFirstPageEnvelope { page, admission })
     }
 
     #[cfg(test)]
@@ -120,6 +244,7 @@ impl OrchestrationBindingSnapshotCache {
             state
                 .snapshots
                 .retain(|_, snapshot| snapshot.expires_at > now);
+            state.tickets.retain(|_, ticket| ticket.expires_at > now);
             let current_revision = state.revisions.get(&parent_id).copied().unwrap_or(0);
             let snapshot = state
                 .snapshots
@@ -178,10 +303,36 @@ impl OrchestrationBindingSnapshotCache {
         let page = page_from_snapshot(&mut snapshot, 0, None, effective_limit);
         let mut state = self.state.lock().await;
         state.snapshots.retain(|_, entry| entry.expires_at > now);
+        state.tickets.retain(|_, entry| entry.expires_at > now);
         state.snapshots.insert(snapshot_id.clone(), snapshot);
         debug_assert_eq!(page.snapshot_id, snapshot_id);
         Ok(page)
     }
+}
+
+pub(crate) fn validate_admission_intent_source(
+    intent: &AdmissionIntentV1,
+    rows: &[DelegationOrchestrationBindingRun],
+) -> Result<(), OrchestrationBindingQueryError> {
+    if intent.kind == AdmissionIntentKind::First {
+        return Ok(());
+    }
+    let target_task_id = intent
+        .target_task_id
+        .as_deref()
+        .ok_or(OrchestrationBindingQueryError::AdmissionIntentInvalid)?;
+    let source = rows
+        .iter()
+        .find(|row| row.task_id == target_task_id)
+        .ok_or(OrchestrationBindingQueryError::AdmissionIntentInvalid)?;
+    if source.work_unit_key.as_deref() != Some(intent.work_unit_key.as_str())
+        || source.agent_type != intent.agent_type
+        || source.profile_id != intent.profile_id
+        || source.orchestration_binding != intent.orchestration_binding
+    {
+        return Err(OrchestrationBindingQueryError::AdmissionIntentInvalid);
+    }
+    Ok(())
 }
 
 fn page_from_snapshot(
@@ -342,6 +493,150 @@ mod tests {
             status: "running".into(),
             orchestration_binding: None,
         }
+    }
+
+    fn admission_intent(
+        kind: AdmissionIntentKind,
+        target_task_id: Option<&str>,
+        replacement_reason: Option<&str>,
+    ) -> AdmissionIntentV1 {
+        AdmissionIntentV1 {
+            schema_version: 1,
+            dispatch_intent_id: "8f95dd45-9eca-42a8-9909-0ac00be8ad52".into(),
+            request_fingerprint:
+                "2a44be9d1662a314cbbd2c8111bcf83159be7bdc93abadff977d01447f986648"
+                    .into(),
+            kind,
+            work_unit_key: "task|7|implementer|codex|none".into(),
+            agent_type: "codex".into(),
+            profile_id: None,
+            target_task_id: target_task_id.map(str::to_string),
+            replacement_reason: replacement_reason.map(str::to_string),
+            orchestration_binding: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn orchestration_admission_ticket_issue_stores_exact_claims_and_unused_state() {
+        let cache = OrchestrationBindingSnapshotCache::new();
+        let now = Utc.with_ymd_and_hms(2026, 8, 26, 8, 0, 0).unwrap();
+        let intent = admission_intent(AdmissionIntentKind::First, None, None);
+        let envelope = cache
+            .first_page_with_admission_loader(
+                20,
+                "connection-incarnation-a",
+                query("brainstorm-to-delivery", 200),
+                None,
+                intent,
+                now,
+                || async { Ok((Vec::new(), None)) },
+            )
+            .await
+            .unwrap();
+        let AdmissionPreparation::Prepared {
+            protocol,
+            dispatch_intent_id,
+            ticket,
+            expires_at,
+        } = envelope.admission
+        else {
+            panic!("new intent must issue a ticket");
+        };
+        assert_eq!(protocol, "ticket_v1");
+        assert_eq!(
+            dispatch_intent_id,
+            "8f95dd45-9eca-42a8-9909-0ac00be8ad52"
+        );
+        assert!(crate::acp::delegation::types::is_canonical_uuid(&ticket));
+        assert_eq!(expires_at, envelope.page.snapshot_expires_at);
+
+        let state = cache.state.lock().await;
+        let entry = state.tickets.get(&ticket).expect("issued ticket entry");
+        assert_eq!(entry.ticket_id, ticket);
+        assert_eq!(entry.parent_id, 20);
+        assert_ne!(entry.parent_id, 21, "wrong parent must not match");
+        assert_eq!(entry.connection_incarnation, "connection-incarnation-a");
+        assert_ne!(
+            entry.connection_incarnation, "connection-incarnation-b",
+            "wrong incarnation must not match"
+        );
+        assert_eq!(entry.namespace, "brainstorm-to-delivery");
+        assert_eq!(entry.snapshot_id, envelope.page.snapshot_id);
+        assert_eq!(entry.snapshot_revision, 0);
+        assert_eq!(entry.expires_at, envelope.page.snapshot_expires_at);
+        assert_eq!(entry.dispatch_intent_id, dispatch_intent_id);
+        assert_eq!(
+            entry.request_fingerprint,
+            "2a44be9d1662a314cbbd2c8111bcf83159be7bdc93abadff977d01447f986648"
+        );
+        assert_eq!(
+            entry.intent_digest,
+            "133c7b500e6569787f652c7a6f095a69446ef08a818599d6a941bfda325f046c"
+        );
+        assert_eq!(entry.state, AdmissionTicketState::Issued);
+    }
+
+    #[tokio::test]
+    async fn orchestration_admission_ticket_issue_expires_restarts_invalidates_and_purges() {
+        let cache = OrchestrationBindingSnapshotCache::new();
+        let now = Utc.with_ymd_and_hms(2026, 8, 26, 8, 0, 0).unwrap();
+        let issue = |now| {
+            cache.first_page_with_admission_loader(
+                20,
+                "connection-incarnation-a",
+                query("brainstorm-to-delivery", 200),
+                None,
+                admission_intent(AdmissionIntentKind::First, None, None),
+                now,
+                || async { Ok((Vec::new(), None)) },
+            )
+        };
+        let first = issue(now).await.unwrap();
+        let AdmissionPreparation::Prepared { ticket, .. } = first.admission else {
+            panic!("new intent must issue a ticket");
+        };
+        assert!(cache.state.lock().await.tickets.contains_key(&ticket));
+        assert!(OrchestrationBindingSnapshotCache::new()
+            .state
+            .lock()
+            .await
+            .tickets
+            .is_empty());
+
+        issue(now + chrono::Duration::seconds(60)).await.unwrap();
+        assert!(
+            !cache.state.lock().await.tickets.contains_key(&ticket),
+            "expired ticket must be purged"
+        );
+
+        let current = issue(now + chrono::Duration::seconds(61)).await.unwrap();
+        let AdmissionPreparation::Prepared { ticket, .. } = current.admission else {
+            panic!("new intent must issue a ticket");
+        };
+        cache.record_parent_mutation(20).await;
+        assert!(
+            !cache.state.lock().await.tickets.contains_key(&ticket),
+            "parent mutation must invalidate issued tickets"
+        );
+    }
+
+    #[test]
+    fn orchestration_admission_ticket_issue_requires_exact_captured_source_identity() {
+        const SOURCE_ID: &str = "6b228a7d-4ac9-4bc7-a16e-f4ecf6f0fd45";
+        let mut source = sample_row(SOURCE_ID);
+        source.work_unit_key = Some("task|7|implementer|codex|none".into());
+        let intent = admission_intent(AdmissionIntentKind::Continue, Some(SOURCE_ID), None);
+        assert!(validate_admission_intent_source(&intent, &[source.clone()]).is_ok());
+
+        source.profile_id = Some("different-profile".into());
+        assert_eq!(
+            validate_admission_intent_source(&intent, &[source]),
+            Err(OrchestrationBindingQueryError::AdmissionIntentInvalid)
+        );
+        assert_eq!(
+            validate_admission_intent_source(&intent, &[]),
+            Err(OrchestrationBindingQueryError::AdmissionIntentInvalid)
+        );
     }
 
     #[test]

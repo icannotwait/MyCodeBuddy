@@ -67,7 +67,7 @@ use super::workflow::CompleteWorkRequest;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::acp::delegation::types::DelegationReturnWhen;
-use crate::acp::delegation::types::OrchestrationBindingQueryRequest;
+use crate::acp::delegation::types::{AdmissionIntentV1, OrchestrationBindingQueryRequest};
 use crate::acp::question::QuestionSpec;
 use crate::acp::recovery_authorization::RecoverySubjectKind;
 
@@ -168,6 +168,8 @@ pub struct BrokerOrchestrationBindingsRequest {
     pub snapshot_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission_intent: Option<AdmissionIntentV1>,
 }
 
 impl BrokerOrchestrationBindingsRequest {
@@ -896,6 +898,7 @@ mod tests {
             page_limit: None,
             snapshot_id: None,
             cursor: None,
+            admission_intent: None,
         };
         let encoded = serde_json::to_value(BrokerMessage::OrchestrationBindings(request))
             .expect("serialize query transport");

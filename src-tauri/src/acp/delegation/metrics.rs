@@ -2519,6 +2519,28 @@ mod tests {
     use serde_json::Value;
 
     #[test]
+    fn orchestration_admission_ticket_issue_metrics_use_fixed_outcomes_only() {
+        let metrics = DelegationMetrics::default();
+        metrics.record_ticket_outcome(AdmissionTicketMetricOutcome::Issued);
+        metrics.record_ticket_outcome(AdmissionTicketMetricOutcome::AlreadyAdmitted);
+        metrics.record_dispatch_intent_outcome(DispatchIntentMetricOutcome::ExactReplay);
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.admission_ticket_outcomes["issued"], 1);
+        assert_eq!(snapshot.admission_ticket_outcomes["already_admitted"], 1);
+        assert_eq!(snapshot.dispatch_intent_outcomes["exact_replay"], 1);
+        let serialized = serde_json::to_string(&snapshot).unwrap();
+        for sensitive in [
+            "8f95dd45-9eca-42a8-9909-0ac00be8ad52",
+            "4a67bba4-e1f5-46d1-a9b1-aa796598ffce",
+            "C:/private/artifact.json",
+            "2a44be9d1662a314cbbd2c8111bcf83159be7bdc93abadff977d01447f986648",
+        ] {
+            assert!(!serialized.contains(sensitive), "sensitive value {sensitive}");
+        }
+    }
+
+    #[test]
     fn delegation_admission_context_phase0_snapshot_shape_is_fixed_and_bounded() {
         let snapshot = serde_json::to_value(DelegationMetrics::default().snapshot()).unwrap();
         let snapshot = snapshot.as_object().unwrap();
