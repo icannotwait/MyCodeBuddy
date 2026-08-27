@@ -598,6 +598,28 @@ describe("LiveTranscriptRow", () => {
     ).not.toBeInTheDocument()
   })
 
+  it("hides the live Codex compaction advisory", () => {
+    liveTranscriptStore.rebuild(
+      CID,
+      "c1",
+      liveMessage(
+        "Warning: Heads up: Long threads and multiple compactions can cause the model to be less accurate. Start a new thread when possible to keep threads small and targeted.\n\n"
+      ),
+      1
+    )
+    render(
+      <NextIntlClientProvider locale="en" messages={enMessages}>
+        <LiveTranscriptRow
+          conversationId={CID}
+          agentType="codex"
+          showThinking
+        />
+      </NextIntlClientProvider>
+    )
+
+    expect(screen.queryByText(/Heads up:/)).not.toBeInTheDocument()
+  })
+
   it("updates text without remounting the row when chunks append", () => {
     liveTranscriptStore.rebuild(CID, "c1", liveMessage("a"), 1)
     renderRow()

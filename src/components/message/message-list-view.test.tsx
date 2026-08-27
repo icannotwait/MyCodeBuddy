@@ -1741,6 +1741,32 @@ describe("MessageListView interruption marker", () => {
   })
 })
 
+describe("MessageListView Codex compaction advisory", () => {
+  beforeEach(() => {
+    resetConversationRuntimeStore()
+    __resetLiveTranscriptStoreForTests()
+    __resetStreamingPerformanceConfigForTests()
+    seedHistory([
+      assistantTurn(
+        "a1",
+        "Warning: Heads up: Long threads and multiple compactions can cause the model to be less accurate. Start a new thread when possible to keep threads small and targeted.\n\n"
+      ),
+    ])
+  })
+
+  afterEach(() => {
+    cleanup()
+    resetConversationRuntimeStore()
+    __resetLiveTranscriptStoreForTests()
+    __resetStreamingPerformanceConfigForTests()
+  })
+
+  it("hides the historical compaction advisory on parent and child sessions", () => {
+    renderMessageList()
+    expect(screen.queryByText(/Heads up:/)).not.toBeInTheDocument()
+  })
+})
+
 describe("MessageListView waiting-for-subagents bottom banner", () => {
   beforeEach(() => {
     resetConversationRuntimeStore()

@@ -68,6 +68,7 @@ import {
   deriveNativeActivitiesFromToolCalls,
 } from "@/lib/delegation-activity"
 import { projectDelegationTranscript } from "@/lib/delegation-transcript-projection"
+import { filterCodexCompactionAdvisoryParts } from "@/lib/codex-compaction-advisory"
 import { filterConversationInterruptedParts } from "@/lib/delegation-conversation-interrupted"
 import type { DelegationActivityView } from "@/lib/types"
 import { projectNativeActivitiesFromTranscript } from "@/lib/acp/live-transcript-projector"
@@ -1544,7 +1545,9 @@ export function MessageListView({
     // The marker is a turn-abort fence, not a user-facing answer.
     const displayAdapted = allAdapted.map((message) => {
       if (message.role !== "assistant") return message
-      const content = filterConversationInterruptedParts(message.content)
+      const content = filterCodexCompactionAdvisoryParts(
+        filterConversationInterruptedParts(message.content)
+      )
       return content === message.content ? message : { ...message, content }
     })
     const projected = projectDelegationTranscript(

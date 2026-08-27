@@ -67,6 +67,7 @@ import {
   shouldFoldLiveDelegationTool,
 } from "@/lib/delegation-transcript-projection"
 import { isDelegateToAgentToolName } from "@/lib/delegation-card"
+import { isCodexCompactionAdvisoryText } from "@/lib/codex-compaction-advisory"
 import { isConversationInterruptedAgentText } from "@/lib/delegation-conversation-interrupted"
 
 export interface LiveTranscriptRowProps {
@@ -579,7 +580,8 @@ export function buildLiveFooterItems(
     // Parent and child: pure interrupt fence is not a useful live answer.
     if (
       segment?.type === "text" &&
-      isConversationInterruptedAgentText(segment.text)
+      (isConversationInterruptedAgentText(segment.text) ||
+        isCodexCompactionAdvisoryText(segment.text))
     ) {
       continue
     }
