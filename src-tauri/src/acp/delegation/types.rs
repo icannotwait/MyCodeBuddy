@@ -27,6 +27,10 @@ pub const DELEGATE_TO_AGENT_TOOL: &str = "delegate_to_agent";
 /// MCP tool name for session reuse — field 0 of `request_fingerprint`.
 pub const CONTINUE_DELEGATION_TOOL: &str = "continue_delegation";
 
+pub(crate) fn is_canonical_uuid(value: &str) -> bool {
+    uuid::Uuid::parse_str(value).is_ok_and(|parsed| parsed.to_string() == value)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OrchestrationBindingV1 {
@@ -801,6 +805,8 @@ pub enum DelegationError {
     /// different or missing request fingerprint.
     #[error("duplicate parent tool use: {0}")]
     DuplicateParentTool(String),
+    #[error("delegation dispatch intent conflict: {0}")]
+    DispatchIntentConflict(String),
     /// Concurrent gen-1 / continue insert lost the non-terminal fence.
     #[error("busy thread: {0}")]
     BusyThread(String),
@@ -1463,6 +1469,7 @@ impl DelegationOutcome {
             },
             DelegationError::ParentSessionGone => "canceled",
             DelegationError::DuplicateParentTool(_) => "duplicate_parent_tool",
+            DelegationError::DispatchIntentConflict(_) => "delegation_dispatch_intent_conflict",
             DelegationError::BusyThread(_) => "busy_thread",
             DelegationError::NotFound(_) => "not_found",
             DelegationError::StaleTaskId(_) => "stale_task_id",

@@ -3898,6 +3898,7 @@ mod tests {
             let runs = RunStore::new(db.clone());
             super::super::with_historical_workflow_fixture_mutations(runs.admit_gen1_reserving(
                 ReservingRunInsert {
+                    dispatch_intent_id: None,
                     orchestration_binding: None,
                     task_id: task_id.clone(),
                     root_task_id: task_id.clone(),
@@ -4279,6 +4280,7 @@ mod tests {
             let replacement_task_id = format!("{}-replacement", fixture.task_id);
             let replacement_error = super::super::with_historical_workflow_fixture_mutations(
                 runs.admit_gen1_reserving(ReservingRunInsert {
+                    dispatch_intent_id: None,
                     orchestration_binding: None,
                     task_id: replacement_task_id.clone(),
                     root_task_id: replacement_task_id.clone(),

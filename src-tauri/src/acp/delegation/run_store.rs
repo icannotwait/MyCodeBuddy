@@ -40,7 +40,7 @@ use crate::acp::delegation::store::{
     TerminalCompletionProtocol, TerminalTaskWrite,
 };
 use crate::acp::delegation::types::{
-    DelegationOrchestrationBindingPage, DelegationRecoveryProjection,
+    is_canonical_uuid, DelegationOrchestrationBindingPage, DelegationRecoveryProjection,
     OrchestrationBindingQueryError, OrchestrationBindingQueryRequest, OrchestrationBindingV1,
     TaskStatus, TicketV1PendingCall, WorkflowRetirementNavigation,
 };
@@ -369,6 +369,7 @@ pub struct ReservingRunInsert {
     pub config_values_json: Option<String>,
     pub task_preview: Option<String>,
     pub request_fingerprint: Option<String>,
+    pub dispatch_intent_id: Option<String>,
     pub admission_class: AdmissionClass,
     pub lineage_root_task_id: String,
     pub work_unit_key: Option<String>,
@@ -429,6 +430,7 @@ pub struct PersistedRun {
     pub reached_running_at: Option<DateTime<Utc>>,
     pub child_connection_id: Option<String>,
     pub request_fingerprint: Option<String>,
+    pub dispatch_intent_id: Option<String>,
     pub task_preview: Option<String>,
     pub admission_class: AdmissionClass,
     pub lineage_root_task_id: String,
@@ -446,6 +448,33 @@ pub struct PersistedRun {
     pub replaced_task_id: Option<String>,
     pub replacement_reason: Option<String>,
     pub recovery_authorization_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatchIntentReplayProjection {
+    pub request_fingerprint: String,
+    pub previous_task_id: Option<String>,
+    pub work_unit_key: Option<String>,
+    pub agent_type: AgentType,
+    pub profile_id: Option<String>,
+    pub orchestration_binding: Option<OrchestrationBindingV1>,
+    pub replaced_task_id: Option<String>,
+    pub replacement_reason: Option<String>,
+}
+
+impl From<&ReservingRunInsert> for DispatchIntentReplayProjection {
+    fn from(insert: &ReservingRunInsert) -> Self {
+        Self {
+            request_fingerprint: insert.request_fingerprint.clone().unwrap_or_default(),
+            previous_task_id: insert.previous_task_id.clone(),
+            work_unit_key: insert.work_unit_key.clone(),
+            agent_type: parse_agent_type(&insert.agent_type),
+            profile_id: insert.profile_id.clone(),
+            orchestration_binding: insert.orchestration_binding.clone(),
+            replaced_task_id: insert.replaced_task_id.clone(),
+            replacement_reason: insert.replacement_reason.clone(),
+        }
+    }
 }
 
 /// Retry metadata on every promote outcome (success or failure). Counts every
@@ -1052,6 +1081,28 @@ async fn child_is_superseded_conn<C: ConnectionTrait>(
 }
 
 impl PersistedRun {
+    pub fn ensure_dispatch_intent_replay(
+        &self,
+        candidate: &DispatchIntentReplayProjection,
+    ) -> Result<(), TaskStoreError> {
+        let exact = self.request_fingerprint.as_deref()
+            == Some(candidate.request_fingerprint.as_str())
+            && self.previous_task_id == candidate.previous_task_id
+            && self.work_unit_key == candidate.work_unit_key
+            && self.agent_type == candidate.agent_type
+            && self.profile_id == candidate.profile_id
+            && self.orchestration_binding == candidate.orchestration_binding
+            && self.replaced_task_id == candidate.replaced_task_id
+            && self.replacement_reason == candidate.replacement_reason;
+        if exact {
+            Ok(())
+        } else {
+            Err(TaskStoreError::DispatchIntentConflict(
+                "persisted dispatch intent has different request semantics".into(),
+            ))
+        }
+    }
+
     pub fn to_persisted_task(&self) -> PersistedTask {
         PersistedTask {
             task_id: self.task_id.clone(),
@@ -1164,6 +1215,9 @@ fn map_gen1_insert_err(err: sea_orm::DbErr) -> TaskStoreError {
         return TaskStoreError::Permanent(msg);
     }
     let lower = msg.to_ascii_lowercase();
+    if lower.contains("dispatch_intent_id") || lower.contains("idx_dtr_parent_dispatch_intent") {
+        return TaskStoreError::DispatchIntentConflict(msg);
+    }
     if lower.contains("parent_tool_use") || lower.contains("idx_dtr_parent_tool_use") {
         return TaskStoreError::DuplicateParentTool(msg);
     }
@@ -1353,6 +1407,7 @@ fn model_to_persisted_run(row: delegation_task_run::Model) -> Option<PersistedRu
         reached_running_at: row.reached_running_at,
         child_connection_id: row.child_connection_id,
         request_fingerprint: row.request_fingerprint,
+        dispatch_intent_id: row.dispatch_intent_id,
         task_preview: row.task_preview,
         admission_class: row.admission_class,
         lineage_root_task_id: row.lineage_root_task_id,
@@ -1381,6 +1436,15 @@ async fn insert_reserving_txn(
     insert: &ReservingRunInsert,
     recovery_authorization_id: Option<&str>,
 ) -> Result<(), TaskStoreError> {
+    if insert
+        .dispatch_intent_id
+        .as_deref()
+        .is_some_and(|intent_id| !is_canonical_uuid(intent_id))
+    {
+        return Err(TaskStoreError::Permanent(
+            "dispatch_intent_id must be a canonical lowercase UUID".into(),
+        ));
+    }
     if insert.generation > MAX_GENERATION {
         return Err(TaskStoreError::BudgetExhausted(format!(
             "generation {} exceeds hard ceiling {}",
@@ -1445,6 +1509,7 @@ async fn insert_reserving_txn(
         config_values_json: Set(insert.config_values_json.clone()),
         task_preview: Set(insert.task_preview.clone()),
         request_fingerprint: Set(insert.request_fingerprint.clone()),
+        dispatch_intent_id: Set(insert.dispatch_intent_id.clone()),
         admission_class: Set(insert.admission_class.clone()),
         reached_running_at: Set(None),
         lineage_root_task_id: Set(insert.lineage_root_task_id.clone()),
@@ -2624,6 +2689,20 @@ impl RunStore {
         Ok(row.and_then(model_to_persisted_run))
     }
 
+    pub async fn load_by_dispatch_intent(
+        &self,
+        parent_conversation_id: i32,
+        dispatch_intent_id: &str,
+    ) -> Result<Option<PersistedRun>, TaskStoreError> {
+        let row = DelegationTaskRun::find()
+            .filter(delegation_task_run::Column::ParentConversationId.eq(parent_conversation_id))
+            .filter(delegation_task_run::Column::DispatchIntentId.eq(dispatch_intent_id))
+            .one(&self.db.conn)
+            .await
+            .map_err(map_db_err)?;
+        Ok(row.and_then(model_to_persisted_run))
+    }
+
     /// Abandon a pure pre-spawn gen-1 claim so provisional compensation can
     /// still terminalize + soft-delete the unused child shell (no durable
     /// cancelled run left behind).
@@ -3270,6 +3349,7 @@ impl RunStore {
                     }
 
                     let insert = ReservingRunInsert {
+                        dispatch_intent_id: None,
                         orchestration_binding: effective_orchestration_binding,
                         task_id: admission.task_id.clone(),
                         root_task_id: target.root_task_id.clone(),
@@ -6111,6 +6191,173 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_intent_persistence_unique_index_maps_to_conflict() {
+        use sea_orm::{DbErr, RuntimeErr};
+
+        let error = map_gen1_insert_err(DbErr::Exec(RuntimeErr::Internal(
+            "UNIQUE constraint failed: delegation_task_runs.parent_conversation_id, \
+             delegation_task_runs.dispatch_intent_id"
+                .into(),
+        )));
+
+        assert_eq!(
+            error.wire_code(),
+            Some("delegation_dispatch_intent_conflict")
+        );
+    }
+
+    const TEST_DISPATCH_INTENT_ID: &str = "8f95dd45-9eca-42a8-9909-0ac00be8ad52";
+
+    #[tokio::test]
+    async fn dispatch_intent_persistence_rejects_noncanonical_uuid_before_insert() {
+        let db = Arc::new(fresh_in_memory_db().await);
+        let task_id = "dispatch-intent-invalid";
+        let (parent_id, child_id) = seed_parent_child(&db, task_id).await;
+        let store = RunStore::new(db);
+        let mut insert = sample_insert(task_id, parent_id, child_id, 1, None);
+        insert.dispatch_intent_id = Some(TEST_DISPATCH_INTENT_ID.to_ascii_uppercase());
+
+        let error = store
+            .insert_reserving(insert)
+            .await
+            .expect_err("noncanonical intent must fail before insert");
+        assert!(matches!(error, TaskStoreError::Permanent(ref message)
+            if message == "dispatch_intent_id must be a canonical lowercase UUID"));
+        assert!(store
+            .load_by_task_id(task_id)
+            .await
+            .expect("load rejected task")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn dispatch_intent_persistence_round_trips_and_loads_by_parent_scope() {
+        let db = Arc::new(fresh_in_memory_db().await);
+        let task_id = "dispatch-intent-round-trip";
+        let (parent_id, child_id) = seed_parent_child(&db, task_id).await;
+        let store = RunStore::new(db);
+        let mut insert = sample_insert(task_id, parent_id, child_id, 1, None);
+        insert.dispatch_intent_id = Some(TEST_DISPATCH_INTENT_ID.into());
+
+        store
+            .insert_reserving(insert)
+            .await
+            .expect("persist dispatch intent");
+
+        let loaded = store
+            .load_by_dispatch_intent(parent_id, TEST_DISPATCH_INTENT_ID)
+            .await
+            .expect("load dispatch intent")
+            .expect("dispatch intent row");
+        assert_eq!(loaded.task_id, task_id);
+        assert_eq!(
+            loaded.dispatch_intent_id.as_deref(),
+            Some(TEST_DISPATCH_INTENT_ID)
+        );
+        assert!(store
+            .load_by_dispatch_intent(parent_id + 1, TEST_DISPATCH_INTENT_ID)
+            .await
+            .expect("load wrong parent")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn dispatch_intent_persistence_duplicate_parent_intent_is_conflict() {
+        let db = Arc::new(fresh_in_memory_db().await);
+        let task_id = "dispatch-intent-first";
+        let (parent_id, child_id) = seed_parent_child(&db, task_id).await;
+        let store = RunStore::new(db.clone());
+        let mut first = sample_insert(task_id, parent_id, child_id, 1, None);
+        first.dispatch_intent_id = Some(TEST_DISPATCH_INTENT_ID.into());
+        store
+            .insert_reserving(first)
+            .await
+            .expect("persist first dispatch intent");
+        db.conn
+            .execute_unprepared(
+                "UPDATE delegation_task_runs SET status = 'completed' \
+                 WHERE task_id = 'dispatch-intent-first'",
+            )
+            .await
+            .expect("terminalize first raw fixture");
+
+        let mut duplicate = sample_insert(
+            "dispatch-intent-second",
+            parent_id,
+            child_id,
+            2,
+            Some(task_id),
+        );
+        duplicate.dispatch_intent_id = Some(TEST_DISPATCH_INTENT_ID.into());
+        let error = store
+            .insert_reserving(duplicate)
+            .await
+            .expect_err("same parent intent must conflict");
+        assert!(matches!(error, TaskStoreError::DispatchIntentConflict(_)));
+    }
+
+    #[tokio::test]
+    async fn dispatch_intent_persistence_exact_replay_requires_all_projected_fields() {
+        let db = Arc::new(fresh_in_memory_db().await);
+        let task_id = "dispatch-intent-replay";
+        let (parent_id, child_id) = seed_parent_child(&db, task_id).await;
+        let store = RunStore::new(db);
+        let mut insert = sample_insert(task_id, parent_id, child_id, 1, None);
+        insert.dispatch_intent_id = Some(TEST_DISPATCH_INTENT_ID.into());
+        insert.request_fingerprint =
+            Some("2a44be9d1662a314cbbd2c8111bcf83159be7bdc93abadff977d01447f986648".into());
+        insert.profile_id = Some("profile-a".into());
+        insert.orchestration_binding = Some(binding_fixture());
+        let exact = DispatchIntentReplayProjection::from(&insert);
+
+        store
+            .insert_reserving(insert)
+            .await
+            .expect("persist dispatch intent replay fixture");
+        let persisted = store
+            .load_by_dispatch_intent(parent_id, TEST_DISPATCH_INTENT_ID)
+            .await
+            .expect("load dispatch intent")
+            .expect("dispatch intent row");
+        persisted
+            .ensure_dispatch_intent_replay(&exact)
+            .expect("exact projected replay");
+
+        let mut mismatches = Vec::new();
+        let mut candidate = exact.clone();
+        candidate.request_fingerprint = "b".repeat(64);
+        mismatches.push(candidate);
+        let mut candidate = exact.clone();
+        candidate.previous_task_id = Some("continued-task".into());
+        mismatches.push(candidate);
+        let mut candidate = exact.clone();
+        candidate.work_unit_key = Some("other-unit".into());
+        mismatches.push(candidate);
+        let mut candidate = exact.clone();
+        candidate.agent_type = AgentType::ClaudeCode;
+        mismatches.push(candidate);
+        let mut candidate = exact.clone();
+        candidate.profile_id = Some("profile-b".into());
+        mismatches.push(candidate);
+        let mut candidate = exact.clone();
+        candidate.orchestration_binding = None;
+        mismatches.push(candidate);
+        let mut candidate = exact.clone();
+        candidate.replaced_task_id = Some("replaced-task".into());
+        mismatches.push(candidate);
+        let mut candidate = exact;
+        candidate.replacement_reason = Some("unresumable".into());
+        mismatches.push(candidate);
+
+        for mismatch in mismatches {
+            assert!(matches!(
+                persisted.ensure_dispatch_intent_replay(&mismatch),
+                Err(TaskStoreError::DispatchIntentConflict(_))
+            ));
+        }
+    }
+
+    #[test]
     fn ticket_v1_request_fingerprint_matches_ecmascript_whitespace() {
         assert_eq!(
             normalize_ticket_v1_working_dir(Some(
@@ -6342,6 +6589,7 @@ mod tests {
         previous: Option<&str>,
     ) -> ReservingRunInsert {
         ReservingRunInsert {
+            dispatch_intent_id: None,
             orchestration_binding: None,
             task_id: task_id.into(),
             root_task_id: previous
@@ -8923,6 +9171,7 @@ mod tests {
             live,
         );
         ReservingRunInsert {
+            dispatch_intent_id: None,
             orchestration_binding: None,
             task_id: task_id.into(),
             root_task_id: task_id.into(),
@@ -12555,6 +12804,7 @@ mod tests {
             reached_running_at: None,
             child_connection_id: None,
             request_fingerprint: None,
+            dispatch_intent_id: None,
             task_preview: None,
             admission_class: AdmissionClass::NormalRevision,
             lineage_root_task_id: "t".into(),
@@ -12632,6 +12882,7 @@ mod tests {
             reached_running_at: Some(Utc::now()),
             child_connection_id: None,
             request_fingerprint: None,
+            dispatch_intent_id: None,
             task_preview: None,
             admission_class: AdmissionClass::NormalRevision,
             lineage_root_task_id: "t".into(),
@@ -15126,6 +15377,7 @@ mod termination_audit {
         let store = RunStore::new(db.clone());
         store
             .insert_reserving(ReservingRunInsert {
+                dispatch_intent_id: None,
                 orchestration_binding: None,
                 task_id: task_id.clone(),
                 root_task_id: task_id.clone(),

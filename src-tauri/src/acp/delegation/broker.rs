@@ -2471,6 +2471,7 @@ fn store_err_to_delegation_error(err: TaskStoreError) -> DelegationError {
     match err {
         TaskStoreError::BusyThread(m) => DelegationError::BusyThread(m),
         TaskStoreError::DuplicateParentTool(m) => DelegationError::DuplicateParentTool(m),
+        TaskStoreError::DispatchIntentConflict(m) => DelegationError::DispatchIntentConflict(m),
         TaskStoreError::InvalidReplacement(m) => DelegationError::InvalidReplacement(m),
         TaskStoreError::OrchestrationBindingLineageMismatch => {
             DelegationError::OrchestrationBindingLineageMismatch
@@ -6648,6 +6649,7 @@ impl DelegationBroker {
                     )
                 };
             let insert = ReservingRunInsert {
+                dispatch_intent_id: None,
                 orchestration_binding: if replacement_source.is_some() {
                     req.orchestration_binding.clone()
                 } else {
@@ -16141,6 +16143,7 @@ mod tests {
                 .expect("agent type string")
                 .to_string();
             runs.insert_reserving(ReservingRunInsert {
+                dispatch_intent_id: None,
                 orchestration_binding: None,
                 task_id: source_task_id.clone(),
                 root_task_id: source_task_id.clone(),
@@ -16235,6 +16238,7 @@ mod tests {
             );
             let runs = Arc::new(RunStore::new(db.clone()));
             runs.insert_reserving(ReservingRunInsert {
+                dispatch_intent_id: None,
                 orchestration_binding: None,
                 task_id: source_task_id.into(),
                 root_task_id: source_task_id.into(),
@@ -16595,6 +16599,7 @@ mod tests {
             );
             let runs = Arc::new(RunStore::new(db.clone()));
             runs.insert_reserving(ReservingRunInsert {
+                dispatch_intent_id: None,
                 orchestration_binding: None,
                 task_id: source_task_id.into(),
                 root_task_id: source_task_id.into(),
@@ -16880,6 +16885,7 @@ mod tests {
             );
             let runs = Arc::new(RunStore::new(db.clone()));
             runs.insert_reserving(ReservingRunInsert {
+                dispatch_intent_id: None,
                 orchestration_binding: source_binding.clone(),
                 task_id: source_task_id.clone(),
                 root_task_id: source_task_id.clone(),
@@ -17045,6 +17051,7 @@ mod tests {
         .await
         .expect("source child");
         runs.insert_reserving(ReservingRunInsert {
+            dispatch_intent_id: None,
             orchestration_binding: Some(orchestration_binding_fixture()),
             task_id: source_task_id.clone(),
             root_task_id: source_task_id.clone(),
@@ -24702,6 +24709,7 @@ mod tests {
         let runs = Arc::new(RunStore::new(db.clone()));
         let task_id = "task-preboot-continue".to_string();
         runs.insert_reserving(ReservingRunInsert {
+            dispatch_intent_id: None,
             orchestration_binding: None,
             task_id: task_id.clone(),
             root_task_id: task_id.clone(),
@@ -24909,6 +24917,7 @@ mod tests {
         let runs = Arc::new(RunStore::new(db.clone()));
         let task_id = "task-bind-fail-admission".to_string();
         runs.insert_reserving(ReservingRunInsert {
+            dispatch_intent_id: None,
             orchestration_binding: None,
             task_id: task_id.clone(),
             root_task_id: task_id.clone(),
@@ -25437,6 +25446,7 @@ mod tests {
         let runs = Arc::new(RunStore::new(db.clone()));
         let task_id = "task-same-conn-running".to_string();
         runs.insert_reserving(ReservingRunInsert {
+            dispatch_intent_id: None,
             orchestration_binding: None,
             task_id: task_id.clone(),
             root_task_id: task_id.clone(),
@@ -26007,6 +26017,7 @@ mod tests {
         let runs = Arc::new(RunStore::new(db.clone()));
         let task_id = "task-no-handoff".to_string();
         runs.insert_reserving(ReservingRunInsert {
+            dispatch_intent_id: None,
             orchestration_binding: None,
             task_id: task_id.clone(),
             root_task_id: task_id.clone(),
@@ -27718,6 +27729,7 @@ mod tests {
             let runs = Arc::new(RunStore::new(db.clone()));
             let task_id = format!("task-finalizer-{code}");
             runs.insert_reserving(ReservingRunInsert {
+                dispatch_intent_id: None,
                 orchestration_binding: None,
                 task_id: task_id.clone(),
                 root_task_id: task_id.clone(),
@@ -28702,6 +28714,7 @@ mod tests {
         let runs = Arc::new(RunStore::new(db.clone()));
         let task_id = format!("task-boot-{label}");
         runs.insert_reserving(ReservingRunInsert {
+            dispatch_intent_id: None,
             orchestration_binding: None,
             task_id: task_id.clone(),
             root_task_id: task_id.clone(),
@@ -28944,6 +28957,7 @@ mod tests {
         let runs = Arc::new(RunStore::new(db.clone()));
         let task_id = "task-boot-perm".to_string();
         runs.insert_reserving(ReservingRunInsert {
+            dispatch_intent_id: None,
             orchestration_binding: None,
             task_id: task_id.clone(),
             root_task_id: task_id.clone(),
@@ -29070,6 +29084,7 @@ mod tests {
         let task_id = "task-boot-perm-pe".to_string();
         let parent_conn = "parent-conn-perm-pe".to_string();
         runs.insert_reserving(ReservingRunInsert {
+            dispatch_intent_id: None,
             orchestration_binding: None,
             task_id: task_id.clone(),
             root_task_id: task_id.clone(),
@@ -29207,6 +29222,7 @@ mod tests {
         let task_id = "task-boot-perm-dur".to_string();
         let parent_conn = "parent-conn-perm-dur".to_string();
         runs.insert_reserving(ReservingRunInsert {
+            dispatch_intent_id: None,
             orchestration_binding: None,
             task_id: task_id.clone(),
             root_task_id: task_id.clone(),
@@ -29389,6 +29405,7 @@ mod tests {
         let task_id = "task-boot-pe-race".to_string();
         let parent_conn = "parent-conn-pe-race".to_string();
         runs.insert_reserving(ReservingRunInsert {
+            dispatch_intent_id: None,
             orchestration_binding: None,
             task_id: task_id.clone(),
             root_task_id: task_id.clone(),
@@ -29598,6 +29615,7 @@ mod tests {
         let task_id = "task-boot-cas-excl".to_string();
         let parent_conn = "parent-conn-cas-excl".to_string();
         runs.insert_reserving(ReservingRunInsert {
+            dispatch_intent_id: None,
             orchestration_binding: None,
             task_id: task_id.clone(),
             root_task_id: task_id.clone(),
@@ -30866,6 +30884,7 @@ mod tests {
         let runs = Arc::new(RunStore::new(db.clone()));
         let task_id = "task-preboot-parent-cancel".to_string();
         runs.insert_reserving(ReservingRunInsert {
+            dispatch_intent_id: None,
             orchestration_binding: None,
             task_id: task_id.clone(),
             root_task_id: task_id.clone(),
@@ -33804,6 +33823,7 @@ mod tests {
             reached_running_at: None,
             child_connection_id: None,
             request_fingerprint: None,
+            dispatch_intent_id: None,
             task_preview: None,
             admission_class:
                 crate::db::entities::delegation_task_run::AdmissionClass::NormalRevision,
@@ -37466,6 +37486,7 @@ mod tests {
             .expect("agent type string")
             .to_string();
         runs.admit_gen1_reserving(ReservingRunInsert {
+            dispatch_intent_id: None,
             orchestration_binding: None,
             task_id: task_id.into(),
             root_task_id: task_id.into(),
@@ -40917,6 +40938,7 @@ mod tests {
             .expect("agent type string")
             .to_string();
         runs.insert_reserving(ReservingRunInsert {
+            dispatch_intent_id: None,
             orchestration_binding: None,
             task_id: source_task_id.into(),
             root_task_id: source_task_id.into(),
@@ -43928,6 +43950,7 @@ mod tests {
                 .expect("agent type string")
                 .to_string();
             runs.insert_reserving(ReservingRunInsert {
+                dispatch_intent_id: None,
                 orchestration_binding: None,
                 task_id: task_id.clone(),
                 root_task_id: task_id.clone(),

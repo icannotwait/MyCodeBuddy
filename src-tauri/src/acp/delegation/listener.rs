@@ -9231,6 +9231,7 @@ mod tests {
             let child = seed_conversation(&db, folder, AgentType::Codex).await;
             let runs = Arc::new(RunStore::new(Arc::clone(&db)));
             runs.insert_reserving(ReservingRunInsert {
+                dispatch_intent_id: None,
                 orchestration_binding: None,
                 task_id: TASK_ID.into(),
                 root_task_id: TASK_ID.into(),
@@ -11603,6 +11604,7 @@ mod tests {
             fixture
                 .runs
                 .insert_reserving(ReservingRunInsert {
+                    dispatch_intent_id: None,
                     orchestration_binding: None,
                     task_id: task_id.clone(),
                     root_task_id: task_id.clone(),

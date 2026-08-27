@@ -332,6 +332,7 @@ fn unexpected_continue_insert(
     work_unit_key: &str,
 ) -> ReservingRunInsert {
     ReservingRunInsert {
+        dispatch_intent_id: None,
         orchestration_binding: None,
         task_id: task_id.into(),
         root_task_id: lineage_root_task_id.into(),
@@ -2513,6 +2514,7 @@ async fn pre_admission_host_restart_allows_fresh_gen1_redispatch() {
     let runs = Arc::new(RunStore::new(db.clone()));
     let work_unit_key = "task|8|implementer|none";
     runs.insert_reserving(ReservingRunInsert {
+        dispatch_intent_id: None,
         orchestration_binding: None,
         task_id: source_task_id.into(),
         root_task_id: source_task_id.into(),

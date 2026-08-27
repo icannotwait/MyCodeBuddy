@@ -26760,6 +26760,7 @@ mod tests {
         let runs = Arc::new(RunStore::new(db.clone()));
         let task_id = format!("task-resume-contract-{label}");
         runs.insert_reserving(ReservingRunInsert {
+            dispatch_intent_id: None,
             orchestration_binding: None,
             task_id: task_id.clone(),
             root_task_id: task_id.clone(),

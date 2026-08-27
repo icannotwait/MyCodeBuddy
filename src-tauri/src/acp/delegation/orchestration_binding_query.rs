@@ -652,6 +652,7 @@ mod tests {
         generation: i64,
     ) -> ReservingRunInsert {
         ReservingRunInsert {
+            dispatch_intent_id: None,
             task_id: task_id.into(),
             root_task_id: task_id.into(),
             previous_task_id: None,
