@@ -29,6 +29,255 @@ const realSkill = readFileSync(join(here, "..", "SKILL.md"), "utf8")
 const planRelPath = "docs/superpowers/plans/example.md"
 const copy = structuredClone
 
+const TICKET_V1_PENDING_CALL = {
+  schema_version: 1,
+  tool_name: "continue_delegation",
+  task: "Continue the approved implementation",
+  working_dir: null,
+  work_unit_key: "task|7|implementer|codex|none",
+  replaces_task_id: null,
+  replacement_reason: null,
+  target_task_id: "6b228a7d-4ac9-4bc7-a16e-f4ecf6f0fd45",
+  agent_type: "codex",
+  profile_id: null,
+  orchestration_binding: {
+    schema_version: 1,
+    namespace: "brainstorm-to-delivery",
+    generation: 2,
+    route_fingerprint:
+      "sha256:b498416d87bf6ba928bd7ddb5f1a451daf82300584f3d40b606c3c56f169ba7a",
+  },
+  dispatch_intent_id: "8f95dd45-9eca-42a8-9909-0ac00be8ad52",
+}
+
+describe("ticket-v1 request fingerprint", () => {
+  it("matches every frozen shared fingerprint vector", () => {
+    assert.equal(
+      typeof contractLib.deriveTicketV1RequestFingerprint,
+      "function"
+    )
+    const fixture = JSON.parse(
+      readFileSync(
+        join(
+          here,
+          "../../../../src-tauri/tests/fixtures/delegation_request_fingerprints.json"
+        ),
+        "utf8"
+      )
+    )
+    assert.deepEqual(Object.keys(fixture), ["schema_version", "cases"])
+    assert.equal(fixture.schema_version, 1)
+    assert.equal(fixture.cases.length, 20)
+    assert.deepEqual(
+      fixture.cases.slice(0, 3).map((entry) => entry.expected_digest),
+      [
+        "55687507f1ed929a92190fb1e1039e422dd219d2238a4b1e10a6968c32e557f4",
+        "f9487ae94c8b94155514942226be54829c3f5043fdf587d3c33886b01f04a97f",
+        "aca47c464009a8f26bd36e0611b17f62cb7ed7942a387e38e878cf87087ff172",
+      ]
+    )
+    for (const entry of fixture.cases) {
+      assert.deepEqual(
+        Object.keys(entry),
+        entry.version === 3
+          ? [
+              "name",
+              "version",
+              "pending_call",
+              "expected_array",
+              "expected_digest",
+            ]
+          : [
+              "name",
+              "version",
+              "legacy_input",
+              "expected_array",
+              "expected_digest",
+            ]
+      )
+      if (entry.version !== 3) continue
+      assert.equal(entry.expected_array.length, 15, entry.name)
+      assert.equal(entry.expected_array[0], "delegation-request-v3", entry.name)
+      const actual = contractLib.deriveTicketV1RequestFingerprint(
+        entry.pending_call
+      )
+      assert.equal(
+        actual.request_fingerprint,
+        entry.expected_digest,
+        entry.name
+      )
+      assert.equal(
+        actual.normalized_working_dir,
+        entry.expected_array[3],
+        entry.name
+      )
+    }
+  })
+
+  it("exports the authoritative helper and derives the published vector", () => {
+    assert.equal(
+      typeof contractLib.deriveTicketV1RequestFingerprint,
+      "function"
+    )
+    assert.deepEqual(
+      contractLib.deriveTicketV1RequestFingerprint(TICKET_V1_PENDING_CALL),
+      {
+        schema_version: 1,
+        request_fingerprint:
+          "2a44be9d1662a314cbbd2c8111bcf83159be7bdc93abadff977d01447f986648",
+        normalized_working_dir: "",
+      }
+    )
+  })
+
+  it("requires the exact pending-call fields and operation matrix", () => {
+    assert.equal(
+      typeof contractLib.deriveTicketV1RequestFingerprint,
+      "function"
+    )
+    for (const key of Object.keys(TICKET_V1_PENDING_CALL)) {
+      const missing = copy(TICKET_V1_PENDING_CALL)
+      delete missing[key]
+      assert.throws(
+        () => contractLib.deriveTicketV1RequestFingerprint(missing),
+        /pending call/i,
+        key
+      )
+    }
+    assert.throws(
+      () =>
+        contractLib.deriveTicketV1RequestFingerprint({
+          ...TICKET_V1_PENDING_CALL,
+          unknown: true,
+        }),
+      /pending call/i
+    )
+
+    const first = {
+      ...TICKET_V1_PENDING_CALL,
+      tool_name: "delegate_to_agent",
+      target_task_id: null,
+    }
+    const replacement = {
+      ...first,
+      replaces_task_id: "6b228a7d-4ac9-4bc7-a16e-f4ecf6f0fd45",
+      replacement_reason: "unresumable",
+    }
+    const unbound = { ...first, orchestration_binding: null }
+    for (const pendingCall of [
+      first,
+      TICKET_V1_PENDING_CALL,
+      replacement,
+      unbound,
+    ]) {
+      assert.doesNotThrow(() =>
+        contractLib.deriveTicketV1RequestFingerprint(pendingCall)
+      )
+    }
+
+    for (const invalid of [
+      { ...first, target_task_id: TICKET_V1_PENDING_CALL.target_task_id },
+      { ...TICKET_V1_PENDING_CALL, target_task_id: null },
+      { ...TICKET_V1_PENDING_CALL, working_dir: "D:/repo" },
+      { ...replacement, replacement_reason: null },
+      { ...replacement, replaces_task_id: null },
+      { ...replacement, target_task_id: TICKET_V1_PENDING_CALL.target_task_id },
+    ]) {
+      assert.throws(
+        () => contractLib.deriveTicketV1RequestFingerprint(invalid),
+        /operation/i
+      )
+    }
+  })
+
+  it("keeps the fingerprint CLI exclusive, bounded, and task-text-free", () => {
+    const taskText = "DO_NOT_EMIT_THIS_TICKET_TASK_TEXT"
+    const pendingCall = { ...TICKET_V1_PENDING_CALL, task: taskText }
+    const success = spawnCli(
+      ["--ticket-v1-fingerprint", "--output-json"],
+      {},
+      JSON.stringify(pendingCall)
+    )
+    assert.equal(success.status, 0)
+    assert.equal(success.stderr, "")
+    assert.doesNotMatch(success.stdout, new RegExp(taskText))
+    assert.deepEqual(Object.keys(JSON.parse(success.stdout)), [
+      "schema_version",
+      "request_fingerprint",
+      "normalized_working_dir",
+    ])
+
+    const emptyTaskJson = JSON.stringify({ ...pendingCall, task: "" })
+    const exactBoundary = spawnCli(
+      ["--ticket-v1-fingerprint", "--output-json"],
+      {},
+      JSON.stringify({
+        ...pendingCall,
+        task: "x".repeat(
+          contractLib.MAX_PLAN_DOCUMENT_BYTES - emptyTaskJson.length
+        ),
+      })
+    )
+    assert.equal(exactBoundary.status, 0)
+    assert.equal(exactBoundary.stderr, "")
+
+    for (const args of [
+      ["--ticket-v1-fingerprint"],
+      ["--output-json"],
+      ["--ticket-v1-fingerprint", "--output-json", "--admission"],
+      ["--ticket-v1-fingerprint", "--output-json", "--plan", "plan.md"],
+      ["--ticket-v1-fingerprint", "--output-json", "--unknown-flag"],
+    ]) {
+      const invalid = spawnCli(args, {}, JSON.stringify(pendingCall))
+      assert.notEqual(invalid.status, 0)
+      assert.equal(invalid.stderr, "")
+      assert.doesNotMatch(invalid.stdout, new RegExp(taskText))
+      const output = JSON.parse(invalid.stdout)
+      if (args.includes("--ticket-v1-fingerprint")) {
+        assert.deepEqual(Object.keys(output), [
+          "schema_version",
+          "request_fingerprint",
+          "normalized_working_dir",
+        ])
+        assert.equal(output.request_fingerprint, null)
+        assert.equal(output.normalized_working_dir, null)
+      }
+    }
+
+    for (const input of [
+      JSON.stringify({ ...pendingCall, unknown: true }),
+      Buffer.from([0xff]),
+    ]) {
+      const invalid = spawnCli(
+        ["--ticket-v1-fingerprint", "--output-json"],
+        {},
+        input
+      )
+      assert.notEqual(invalid.status, 0)
+      assert.equal(invalid.stderr, "")
+      assert.doesNotMatch(invalid.stdout, new RegExp(taskText))
+      assert.deepEqual(Object.keys(JSON.parse(invalid.stdout)), [
+        "schema_version",
+        "request_fingerprint",
+        "normalized_working_dir",
+      ])
+    }
+
+    const oversized = spawnCli(
+      ["--ticket-v1-fingerprint", "--output-json"],
+      {},
+      "x".repeat(contractLib.MAX_PLAN_DOCUMENT_BYTES + 1)
+    )
+    assert.notEqual(oversized.status, 0)
+    assert.equal(oversized.stderr, "")
+    assert.deepEqual(Object.keys(JSON.parse(oversized.stdout)), [
+      "schema_version",
+      "request_fingerprint",
+      "normalized_working_dir",
+    ])
+  })
+})
+
 const SKILL_CONTRACT = {
   schema_version: 2,
   phase_order: [
@@ -6809,13 +7058,14 @@ function conflictingColorEnv() {
   }
 }
 
-function spawnCli(args, extraEnv = {}) {
+function spawnCli(args, extraEnv = {}, input) {
   return spawnSync(
     process.execPath,
     [join(here, "validate-contract.mjs"), ...args],
     {
       encoding: "utf8",
       env: { ...conflictingColorEnv(), ...extraEnv },
+      input,
     }
   )
 }

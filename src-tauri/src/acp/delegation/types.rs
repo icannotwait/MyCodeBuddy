@@ -67,6 +67,24 @@ impl OrchestrationBindingV1 {
     }
 }
 
+/// Strict cross-runtime input for the ticket-v1 request fingerprint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TicketV1PendingCall {
+    pub schema_version: u32,
+    pub tool_name: String,
+    pub task: String,
+    pub working_dir: Option<String>,
+    pub work_unit_key: Option<String>,
+    pub replaces_task_id: Option<String>,
+    pub replacement_reason: Option<String>,
+    pub target_task_id: Option<String>,
+    pub agent_type: String,
+    pub profile_id: Option<String>,
+    pub orchestration_binding: Option<OrchestrationBindingV1>,
+    pub dispatch_intent_id: String,
+}
+
 pub const ORCHESTRATION_BINDING_DEFAULT_LIMIT: u16 = 100;
 pub const ORCHESTRATION_BINDING_MAX_LIMIT: u16 = 200;
 

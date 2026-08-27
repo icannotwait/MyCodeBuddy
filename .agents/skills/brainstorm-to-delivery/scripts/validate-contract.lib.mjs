@@ -71,6 +71,20 @@ const CURSOR_RE = /^[A-Za-z0-9_-]{1,128}$/
 const UTC_INSTANT_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/
 const MAX_U64 = 18446744073709551615n
 const SHA256_RE = /^sha256:[0-9a-f]{64}$/
+const TICKET_V1_PENDING_CALL_KEYS = [
+  "agent_type",
+  "dispatch_intent_id",
+  "orchestration_binding",
+  "profile_id",
+  "replacement_reason",
+  "replaces_task_id",
+  "schema_version",
+  "target_task_id",
+  "task",
+  "tool_name",
+  "work_unit_key",
+  "working_dir",
+]
 
 const MAX_I32 = 0x7fffffff
 const MAX_U32 = 0xffffffff
@@ -6176,6 +6190,119 @@ export function parseOrchestrationBinding(value) {
 
 export function validateOrchestrationBinding(value) {
   return parseOrchestrationBinding(value).valid
+}
+
+/** Validate and hash the exact ticket-v1 pending-call wire object. */
+export function deriveTicketV1RequestFingerprint(pendingCall) {
+  if (
+    !isObject(pendingCall) ||
+    Object.keys(pendingCall).sort().join(",") !==
+      TICKET_V1_PENDING_CALL_KEYS.join(",")
+  ) {
+    throw new TypeError("pending call fields are not exact")
+  }
+  if (pendingCall.schema_version !== 1) {
+    throw new TypeError("pending call schema_version must be 1")
+  }
+  if (
+    !["delegate_to_agent", "continue_delegation"].includes(
+      pendingCall.tool_name
+    ) ||
+    !nonEmptyString(pendingCall.task) ||
+    !validAgentSelection({
+      agent_type: pendingCall.agent_type,
+      profile_id: pendingCall.profile_id,
+    }) ||
+    !UUID_RE.test(pendingCall.dispatch_intent_id)
+  ) {
+    throw new TypeError("pending call identity is invalid")
+  }
+  for (const field of [
+    "working_dir",
+    "work_unit_key",
+    "replaces_task_id",
+    "replacement_reason",
+    "target_task_id",
+  ]) {
+    const value = pendingCall[field]
+    if (value !== null && typeof value !== "string") {
+      throw new TypeError(`pending call ${field} must be a string or null`)
+    }
+  }
+  if (
+    pendingCall.work_unit_key !== null &&
+    (!nonEmptyString(pendingCall.work_unit_key) ||
+      [...pendingCall.work_unit_key].length > 200 ||
+      hasControl(pendingCall.work_unit_key))
+  ) {
+    throw new TypeError("pending call work_unit_key is invalid")
+  }
+  for (const field of ["replaces_task_id", "target_task_id"]) {
+    if (pendingCall[field] !== null && !nonEmptyString(pendingCall[field])) {
+      throw new TypeError(`pending call ${field} is invalid`)
+    }
+  }
+  const isFirst =
+    pendingCall.tool_name === "delegate_to_agent" &&
+    pendingCall.replaces_task_id === null &&
+    pendingCall.replacement_reason === null &&
+    pendingCall.target_task_id === null
+  const isContinue =
+    pendingCall.tool_name === "continue_delegation" &&
+    pendingCall.working_dir === null &&
+    pendingCall.replaces_task_id === null &&
+    pendingCall.replacement_reason === null &&
+    pendingCall.target_task_id !== null
+  const isReplacement =
+    pendingCall.tool_name === "delegate_to_agent" &&
+    pendingCall.replaces_task_id !== null &&
+    REPLACEMENT_REASONS.has(pendingCall.replacement_reason) &&
+    pendingCall.target_task_id === null
+  if (!isFirst && !isContinue && !isReplacement) {
+    throw new TypeError("pending call operation fields are invalid")
+  }
+
+  let binding = null
+  if (pendingCall.orchestration_binding !== null) {
+    const parsed = parseOrchestrationBinding(pendingCall.orchestration_binding)
+    if (!parsed.valid) {
+      throw new TypeError("pending call orchestration_binding is invalid")
+    }
+    binding = parsed.binding
+  }
+  for (const [field, value] of Object.entries(pendingCall)) {
+    if (typeof value === "string") assertRouteInputIsIJson(value, `$.${field}`)
+  }
+
+  const normalizedWorkingDir =
+    pendingCall.working_dir === null
+      ? ""
+      : pendingCall.working_dir.normalize("NFC").trim()
+  const fields = [
+    "delegation-request-v3",
+    pendingCall.tool_name,
+    pendingCall.task.normalize("NFC"),
+    normalizedWorkingDir,
+    pendingCall.work_unit_key ?? "",
+    pendingCall.replaces_task_id ?? "",
+    pendingCall.replacement_reason ?? "",
+    pendingCall.target_task_id ?? "",
+    pendingCall.agent_type,
+    pendingCall.profile_id ?? "",
+    pendingCall.dispatch_intent_id,
+    binding === null ? "" : String(binding.schema_version),
+    binding?.namespace ?? "",
+    binding === null ? "" : String(binding.generation),
+    binding?.route_fingerprint ?? "",
+  ]
+  const requestFingerprint = createHash("sha256")
+    .update(Buffer.from(JSON.stringify(fields), "utf8"))
+    .digest("hex")
+  return {
+    schema_version: 1,
+    request_fingerprint: requestFingerprint,
+    normalized_working_dir: normalizedWorkingDir,
+  }
 }
 
 /** Validate routing semantics and return normalized generations and Tasks. */

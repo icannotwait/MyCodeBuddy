@@ -42,7 +42,7 @@ use crate::acp::delegation::store::{
 use crate::acp::delegation::types::{
     DelegationOrchestrationBindingPage, DelegationRecoveryProjection,
     OrchestrationBindingQueryError, OrchestrationBindingQueryRequest, OrchestrationBindingV1,
-    TaskStatus, WorkflowRetirementNavigation,
+    TaskStatus, TicketV1PendingCall, WorkflowRetirementNavigation,
 };
 use crate::acp::delegation::workflow::admission::{
     ensure_workflow_child_conversation_independent, resolve_and_stamp_terminal_artifact_txn,
@@ -275,6 +275,78 @@ pub fn request_fingerprint(
         serde_json::to_string(&fields).expect("request_fingerprint fields are plain strings");
     let digest = Sha256::digest(canonical.as_bytes());
     hex_lower(&digest)
+}
+
+fn is_ecmascript_trim_code_point(value: char) -> bool {
+    matches!(
+        value,
+        '\u{0009}'
+            | '\u{000a}'
+            | '\u{000b}'
+            | '\u{000c}'
+            | '\u{000d}'
+            | '\u{0020}'
+            | '\u{00a0}'
+            | '\u{1680}'
+            | '\u{2000}'..='\u{200a}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{202f}'
+            | '\u{205f}'
+            | '\u{3000}'
+            | '\u{feff}'
+    )
+}
+
+fn normalize_ticket_v1_working_dir(value: Option<&str>) -> String {
+    let normalized = nfc(value.unwrap_or(""));
+    let start = normalized
+        .char_indices()
+        .find(|(_, value)| !is_ecmascript_trim_code_point(*value))
+        .map_or(normalized.len(), |(index, _)| index);
+    let end = normalized
+        .char_indices()
+        .rev()
+        .find(|(_, value)| !is_ecmascript_trim_code_point(*value))
+        .map_or(start, |(index, value)| index + value.len_utf8());
+    normalized[start..end].to_owned()
+}
+
+fn ticket_v1_request_fingerprint_fields(pending_call: &TicketV1PendingCall) -> Vec<String> {
+    let binding = pending_call.orchestration_binding.as_ref();
+    vec![
+        "delegation-request-v3".to_owned(),
+        pending_call.tool_name.clone(),
+        nfc(&pending_call.task),
+        normalize_ticket_v1_working_dir(pending_call.working_dir.as_deref()),
+        pending_call.work_unit_key.clone().unwrap_or_default(),
+        pending_call.replaces_task_id.clone().unwrap_or_default(),
+        pending_call.replacement_reason.clone().unwrap_or_default(),
+        pending_call.target_task_id.clone().unwrap_or_default(),
+        pending_call.agent_type.clone(),
+        pending_call.profile_id.clone().unwrap_or_default(),
+        pending_call.dispatch_intent_id.clone(),
+        binding
+            .map(|binding| binding.schema_version.to_string())
+            .unwrap_or_default(),
+        binding
+            .map(|binding| binding.namespace.clone())
+            .unwrap_or_default(),
+        binding
+            .map(|binding| binding.generation.to_string())
+            .unwrap_or_default(),
+        binding
+            .map(|binding| binding.route_fingerprint.clone())
+            .unwrap_or_default(),
+    ]
+}
+
+/// Lowercase SHA-256 of the ticket-v1 `delegation-request-v3` string array.
+pub fn ticket_v1_request_fingerprint(pending_call: &TicketV1PendingCall) -> String {
+    let fields = ticket_v1_request_fingerprint_fields(pending_call);
+    let canonical = serde_json::to_string(&fields)
+        .expect("ticket_v1_request_fingerprint fields are plain strings");
+    hex_lower(&Sha256::digest(canonical.as_bytes()))
 }
 
 /// Inputs for inserting a run in `reserving` status (durable claim before spawn/resume).
@@ -5810,9 +5882,50 @@ mod tests {
 
     use super::*;
     use crate::acp::delegation::spawner::DelegationLink;
+    use crate::acp::delegation::types::TicketV1PendingCall;
     use crate::db::service::conversation_service;
     use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
     use crate::models::AgentType;
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct FingerprintFixture {
+        schema_version: u32,
+        cases: Vec<FingerprintFixtureCase>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct FingerprintFixtureCase {
+        name: String,
+        version: u32,
+        pending_call: Option<TicketV1PendingCall>,
+        legacy_input: Option<LegacyFingerprintInput>,
+        expected_array: Vec<String>,
+        expected_digest: String,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct LegacyFingerprintInput {
+        tool_name: String,
+        task: String,
+        work_unit_key: Option<String>,
+        replaces_task_id: Option<String>,
+        replacement_reason: Option<String>,
+        target_task_id: Option<String>,
+        route_fingerprint_hex: String,
+        orchestration_binding: Option<OrchestrationBindingV1>,
+    }
+
+    fn fingerprint_fixture() -> FingerprintFixture {
+        serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/delegation_request_fingerprints.json"
+        )))
+        .expect("valid delegation request fingerprint fixture")
+    }
 
     async fn on_terminal_settle_txn<C: ConnectionTrait>(
         conn: &C,
@@ -5973,6 +6086,89 @@ mod tests {
     // ---- request_fingerprint ------------------------------------------------
 
     #[test]
+    fn ticket_v1_request_fingerprint_matches_shared_fixture() {
+        let fixture = fingerprint_fixture();
+        assert_eq!(fixture.schema_version, 1);
+        let mut count = 0;
+        for case in fixture.cases.iter().filter(|case| case.version == 3) {
+            let pending_call = case.pending_call.as_ref().expect("v3 pending_call");
+            assert!(case.legacy_input.is_none(), "{}", case.name);
+            assert_eq!(
+                ticket_v1_request_fingerprint_fields(pending_call),
+                case.expected_array,
+                "{}",
+                case.name
+            );
+            assert_eq!(
+                ticket_v1_request_fingerprint(pending_call),
+                case.expected_digest,
+                "{}",
+                case.name
+            );
+            count += 1;
+        }
+        assert_eq!(count, 17);
+    }
+
+    #[test]
+    fn ticket_v1_request_fingerprint_matches_ecmascript_whitespace() {
+        assert_eq!(
+            normalize_ticket_v1_working_dir(Some(
+                "\u{0009}\u{00a0}\u{feff}\u{2028}D:/repo\u{2029} \u{000d}"
+            )),
+            "D:/repo"
+        );
+        assert_eq!(
+            normalize_ticket_v1_working_dir(Some("\u{0085}D:/repo\u{0085}")),
+            "\u{0085}D:/repo\u{0085}"
+        );
+        assert_eq!(normalize_ticket_v1_working_dir(None), "");
+
+        let fixture = fingerprint_fixture();
+        let continue_case = fixture
+            .cases
+            .iter()
+            .find(|case| case.name == "ticket_v1_continue_bound_published")
+            .expect("continue fixture");
+        assert_eq!(continue_case.expected_array[3], "");
+        assert_eq!(
+            continue_case
+                .pending_call
+                .as_ref()
+                .expect("continue pending_call")
+                .working_dir,
+            None
+        );
+    }
+
+    #[test]
+    fn request_fingerprint_shared_fixture_retains_legacy_digests() {
+        let fixture = fingerprint_fixture();
+        let mut count = 0;
+        for case in fixture.cases.iter().filter(|case| case.version < 3) {
+            let input = case.legacy_input.as_ref().expect("legacy input");
+            assert!(case.pending_call.is_none(), "{}", case.name);
+            assert_eq!(
+                request_fingerprint(
+                    &input.tool_name,
+                    &input.task,
+                    input.work_unit_key.as_deref(),
+                    input.replaces_task_id.as_deref(),
+                    input.replacement_reason.as_deref(),
+                    input.target_task_id.as_deref(),
+                    &input.route_fingerprint_hex,
+                    input.orchestration_binding.as_ref(),
+                ),
+                case.expected_digest,
+                "{}",
+                case.name
+            );
+            count += 1;
+        }
+        assert_eq!(count, 3);
+    }
+
+    #[test]
     fn fingerprint_is_stable_for_identical_inputs() {
         let a = request_fingerprint(
             "delegate_to_agent",
@@ -6106,95 +6302,6 @@ mod tests {
         );
         let right = request_fingerprint("t", "task", Some("w"), Some("x"), None, None, "aa", None);
         assert_ne!(left, right);
-    }
-
-    #[test]
-    fn request_fingerprint_unbound_seven_string_inputs_retain_exact_digests() {
-        assert_eq!(
-            request_fingerprint(
-                "delegate_to_agent",
-                "do the thing",
-                Some("work-1"),
-                None,
-                None,
-                None,
-                "AbCdEf",
-                None,
-            ),
-            "55687507f1ed929a92190fb1e1039e422dd219d2238a4b1e10a6968c32e557f4"
-        );
-        assert_eq!(
-            request_fingerprint(
-                "continue_delegation",
-                "revise",
-                None,
-                None,
-                None,
-                Some("task-1"),
-                "deadbeef",
-                None,
-            ),
-            "f9487ae94c8b94155514942226be54829c3f5043fdf587d3c33886b01f04a97f"
-        );
-    }
-
-    #[test]
-    fn request_fingerprint_bound_uses_exact_twelve_string_v2_array() {
-        let binding = crate::acp::delegation::types::OrchestrationBindingV1 {
-            schema_version: 1,
-            namespace: "brainstorm-to-delivery".into(),
-            generation: 2,
-            route_fingerprint:
-                "sha256:b498416d87bf6ba928bd7ddb5f1a451daf82300584f3d40b606c3c56f169ba7a".into(),
-        };
-        let exact = request_fingerprint(
-            "delegate_to_agent",
-            "Implement Task 7 from the reviewed Plan.",
-            Some("task|7|implementer|codex|none"),
-            None,
-            None,
-            None,
-            "5ea0c72cf8b44015a7fe8e796a05dc22",
-            Some(&binding),
-        );
-        assert_eq!(
-            exact,
-            "aca47c464009a8f26bd36e0611b17f62cb7ed7942a387e38e878cf87087ff172"
-        );
-        assert_eq!(
-            exact,
-            request_fingerprint(
-                "delegate_to_agent",
-                "Implement Task 7 from the reviewed Plan.",
-                Some("task|7|implementer|codex|none"),
-                None,
-                None,
-                None,
-                "5ea0c72cf8b44015a7fe8e796a05dc22",
-                Some(&binding),
-            ),
-            "an exact bound retry must be stable"
-        );
-
-        let mut different_generation = binding.clone();
-        different_generation.generation = 3;
-        let mut different_fingerprint = binding.clone();
-        different_fingerprint.route_fingerprint = format!("sha256:{}", "0".repeat(64));
-        for different in [&different_generation, &different_fingerprint] {
-            assert_ne!(
-                exact,
-                request_fingerprint(
-                    "delegate_to_agent",
-                    "Implement Task 7 from the reviewed Plan.",
-                    Some("task|7|implementer|codex|none"),
-                    None,
-                    None,
-                    None,
-                    "5ea0c72cf8b44015a7fe8e796a05dc22",
-                    Some(different),
-                )
-            );
-        }
     }
 
     // ---- RunStore -----------------------------------------------------------

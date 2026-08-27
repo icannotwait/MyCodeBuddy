@@ -7,6 +7,7 @@ import {
   MAX_DURABLE_EVIDENCE_BYTES,
   MAX_PLAN_DOCUMENT_BYTES,
   MAX_PROGRESS_DOCUMENT_BYTES,
+  deriveTicketV1RequestFingerprint,
   runValidation,
   validateSkillMarkdown,
 } from "./validate-contract.lib.mjs"
@@ -22,29 +23,45 @@ function boundedReadError(message, ruleId) {
   return error
 }
 
+function readHandleBounded(handle, maxBytes, label, ruleId) {
+  const chunks = []
+  let total = 0
+  while (total <= maxBytes) {
+    const capacity = Math.min(READ_CHUNK_BYTES, maxBytes + 1 - total)
+    const chunk = Buffer.allocUnsafe(capacity)
+    const bytesRead = readSync(handle, chunk, 0, capacity, null)
+    if (bytesRead === 0) break
+    total += bytesRead
+    if (total > maxBytes) {
+      throw boundedReadError(`${label} exceeds ${maxBytes} bytes`, ruleId)
+    }
+    chunks.push(chunk.subarray(0, bytesRead))
+  }
+  return Buffer.concat(chunks, total)
+}
+
 export function readFileBounded(path, maxBytes, label, ruleId) {
   const handle = openSync(path, "r")
   try {
     if (fstatSync(handle).size > maxBytes) {
       throw boundedReadError(`${label} exceeds ${maxBytes} bytes`, ruleId)
     }
-    const chunks = []
-    let total = 0
-    while (total <= maxBytes) {
-      const capacity = Math.min(READ_CHUNK_BYTES, maxBytes + 1 - total)
-      const chunk = Buffer.allocUnsafe(capacity)
-      const bytesRead = readSync(handle, chunk, 0, capacity, null)
-      if (bytesRead === 0) break
-      total += bytesRead
-      if (total > maxBytes) {
-        throw boundedReadError(`${label} exceeds ${maxBytes} bytes`, ruleId)
-      }
-      chunks.push(chunk.subarray(0, bytesRead))
-    }
-    return Buffer.concat(chunks, total)
+    return readHandleBounded(handle, maxBytes, label, ruleId)
   } finally {
     closeSync(handle)
   }
+}
+
+function readTicketV1PendingCall() {
+  return decodeUtf8(
+    readHandleBounded(
+      0,
+      MAX_PLAN_DOCUMENT_BYTES,
+      "ticket-v1 pending call",
+      "B2D-TICKET-001"
+    ),
+    "ticket-v1 pending call"
+  )
 }
 
 export function decodeUtf8(buffer, label) {
@@ -88,6 +105,7 @@ const BOOLEAN_FLAGS = new Set([
   "--output-json",
   "--document-admission",
   "--admission",
+  "--ticket-v1-fingerprint",
 ])
 
 export function parseArguments(args) {
@@ -101,6 +119,7 @@ export function parseArguments(args) {
     outputJson: false,
     documentAdmission: false,
     admission: false,
+    ticketV1Fingerprint: false,
   }
   const seen = new Set()
   for (let index = 0; index < args.length; index += 1) {
@@ -115,6 +134,9 @@ export function parseArguments(args) {
       if (flag === "--output-json") options.outputJson = true
       if (flag === "--document-admission") options.documentAdmission = true
       if (flag === "--admission") options.admission = true
+      if (flag === "--ticket-v1-fingerprint") {
+        options.ticketV1Fingerprint = true
+      }
       continue
     }
     const value = args[index + 1]
@@ -133,6 +155,12 @@ export function parseArguments(args) {
 
   const hasFlags = seen.size > 0
   if (!hasFlags) return { ...options, mode: "skill" }
+  if (options.ticketV1Fingerprint) {
+    if (seen.size !== 2 || !options.outputJson) {
+      throw new Error("--ticket-v1-fingerprint accepts only --output-json")
+    }
+    return { ...options, mode: "ticket-v1-fingerprint" }
+  }
   if (
     options.durableEvidenceSha256 !== null &&
     options.durableEvidence === null
@@ -246,6 +274,14 @@ function cliFailureEnvelope(message, ruleId = "B2D-CLI-002") {
   }
 }
 
+function ticketV1FailureEnvelope() {
+  return {
+    schema_version: 1,
+    request_fingerprint: null,
+    normalized_working_dir: null,
+  }
+}
+
 function neutralizeInheritedColorConflict() {
   // Node emits a process warning on first console use when FORCE_COLOR and
   // NO_COLOR are both set. Drop both so CLI stderr stays contract-empty.
@@ -258,6 +294,13 @@ function run(args) {
   let options
   try {
     options = parseArguments(args)
+    if (options.mode === "ticket-v1-fingerprint") {
+      const result = deriveTicketV1RequestFingerprint(
+        JSON.parse(readTicketV1PendingCall())
+      )
+      console.log(JSON.stringify(result))
+      return 0
+    }
     const skillMarkdown = decodeUtf8(
       readFileBounded(skillPath, MAX_SKILL_DOCUMENT_BYTES, "SKILL.md"),
       "SKILL.md"
@@ -307,6 +350,10 @@ function run(args) {
     return result.failures.length === 0 ? 0 : 1
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
+    if (args.includes("--ticket-v1-fingerprint")) {
+      console.log(JSON.stringify(ticketV1FailureEnvelope()))
+      return 1
+    }
     if (args.includes("--output-json")) {
       console.log(
         JSON.stringify(cliFailureEnvelope(message, error?.ruleId), null, 2)
