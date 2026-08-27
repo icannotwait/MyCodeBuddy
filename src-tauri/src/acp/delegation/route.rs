@@ -18,7 +18,7 @@ pub const ROUTE_ADAPTER_CONTRACT_VERSION: &str = "delegation-route-v1";
 pub const PINNED_CODEX_CLI_VERSION: &str = "0.144.1";
 /// Recommended Grok package version for smoke/docs and missing-install fallback.
 ///
-/// Unlike Codex/Claude, Grok native suppression (`--no-subagents` /
+/// Unlike Codex, Grok native suppression (`--no-subagents` /
 /// `GROK_SUBAGENTS=0`) is treated as available on **any** installed host
 /// version — this constant is not an exclusive capability gate.
 pub const PINNED_GROK_VERSION: &str = "0.2.103";
@@ -30,9 +30,21 @@ pub const PINNED_GROK_VERSION: &str = "0.2.103";
 /// assumed to keep the same flag contract. This constant is not an exclusive
 /// capability gate.
 pub const PINNED_CODEBUDDY_VERSION: &str = "2.125.5";
-/// Pinned Claude Code product version covered by the route-adapter contract.
+/// Recommended Claude Code product version for smoke/docs and missing-install
+/// fallback.
+///
+/// Like Grok, Claude native suppression (the wrapper's `_meta.claudeCode.options`
+/// user-options passthrough, which unions `disallowedTools`) is treated as
+/// available on **any** installed wrapper version — this constant is not an
+/// exclusive capability gate.
 pub const PINNED_CLAUDE_CODE_VERSION: &str = "2.1.205";
-/// Pinned Claude ACP wrapper version covered by the route-adapter contract.
+/// Recommended Claude ACP wrapper version for smoke/docs and missing-install
+/// fallback.
+///
+/// Like Grok, Claude native suppression rides the wrapper's
+/// `_meta.claudeCode.options` user-options passthrough — newer builds are
+/// assumed to keep the passthrough contract, so this constant is not an
+/// exclusive capability gate.
 pub const PINNED_CLAUDE_ACP_VERSION: &str = "0.58.1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -202,7 +214,8 @@ pub fn managed_host_contract_version(agent_type: AgentType) -> Option<&'static s
         AgentType::Codex => Some(PINNED_CODEX_CLI_VERSION),
         AgentType::Grok => Some(PINNED_GROK_VERSION),
         AgentType::CodeBuddy => Some(PINNED_CODEBUDDY_VERSION),
-        // Wrapper is the primary host contract; product pin is also accepted.
+        // Wrapper smoke pin is the host-contract fallback; the product smoke
+        // pin stays smoke/docs only.
         AgentType::ClaudeCode => Some(PINNED_CLAUDE_ACP_VERSION),
         _ => None,
     }
@@ -230,9 +243,11 @@ fn installed_matches_managed_pin(agent_type: AgentType, installed: &str) -> bool
         // Grok / CodeBuddy suppression is stable across host builds; never
         // treat a non-smoke version as an unverified custom executable.
         AgentType::Grok | AgentType::CodeBuddy => true,
-        AgentType::ClaudeCode => {
-            installed == PINNED_CLAUDE_ACP_VERSION || installed == PINNED_CLAUDE_CODE_VERSION
-        }
+        // Claude suppression rides the wrapper's `_meta.claudeCode.options`
+        // user-options passthrough (which unions `disallowedTools`) — stable
+        // across wrapper builds, so never treat a non-smoke version as an
+        // unverified custom executable either.
+        AgentType::ClaudeCode => true,
         // Codex host contract is CLI pin, not installed ACP adapter version.
         AgentType::Codex => installed == PINNED_CODEX_CLI_VERSION,
         _ => false,
@@ -248,9 +263,9 @@ fn installed_matches_managed_pin(agent_type: AgentType, installed: &str) -> bool
 /// - **Grok / CodeBuddy:** any installed host version is managed (native
 ///   suppression is not exclusive-pinned). Missing installed version falls
 ///   back to the smoke pin.
-/// - **Claude:** an installed version that differs from the managed pin(s) →
-///   custom; missing installed version is treated as managed (uses the host
-///   contract pin). Claude accepts wrapper `0.58.1` or product `2.1.205`.
+/// - **Claude:** any installed wrapper version is managed (the `_meta.claudeCode.options`
+///   suppression passthrough is not exclusive-pinned). Missing installed
+///   version falls back to the wrapper smoke pin.
 pub fn classify_managed_host_contract(
     agent_type: AgentType,
     installed_version: Option<&str>,
@@ -367,8 +382,9 @@ impl RouteCapabilitySnapshot {
 /// is true when the user points at an unverified custom binary; that path is
 /// always unsupported without a per-connect `--help` probe.
 ///
-/// **Grok / CodeBuddy exception:** native suppression is accepted for any
-/// non-custom host version (exact equality with the smoke pin is not required).
+/// **Grok / CodeBuddy / Claude exception:** native suppression is accepted for
+/// any non-custom host version (exact equality with the smoke pin is not
+/// required).
 pub fn suppression_capability(
     agent_type: AgentType,
     version: Option<&str>,
@@ -388,11 +404,9 @@ pub fn suppression_capability(
 
     let compatible = match agent_type {
         AgentType::Codex => version == PINNED_CODEX_CLI_VERSION,
-        // Any installed Grok / CodeBuddy host build: suppression flags are stable.
-        AgentType::Grok | AgentType::CodeBuddy => true,
-        AgentType::ClaudeCode => {
-            version == PINNED_CLAUDE_ACP_VERSION || version == PINNED_CLAUDE_CODE_VERSION
-        }
+        // Any installed Grok / CodeBuddy / Claude host build: the suppression
+        // contract (CLI flags / `_meta` options passthrough) is stable.
+        AgentType::Grok | AgentType::CodeBuddy | AgentType::ClaudeCode => true,
         _ => false,
     };
 
@@ -991,6 +1005,83 @@ mod tests {
         );
         assert!(
             resolve_managed_host_suppression(AgentType::CodeBuddy, None, &empty)
+                .failure
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn claude_any_installed_version_supports_native_suppression() {
+        let empty = BTreeMap::new();
+        // Smoke pins, registry current (0.69.0 — the version detection records
+        // for the registry install), and older/future wrappers all share the
+        // same `_meta.claudeCode.options` passthrough contract — exact
+        // equality with the smoke pin is not a gate.
+        for version in [
+            PINNED_CLAUDE_ACP_VERSION,
+            PINNED_CLAUDE_CODE_VERSION,
+            "0.40.0",
+            "0.69.0",
+            "9.9.9",
+        ] {
+            let facts =
+                classify_managed_host_contract(AgentType::ClaudeCode, Some(version), &empty);
+            assert!(
+                !facts.custom_executable,
+                "Claude {version} must not be treated as custom"
+            );
+            assert_eq!(facts.contract_version.as_deref(), Some(version));
+            let cap = resolve_managed_host_suppression(AgentType::ClaudeCode, Some(version), &empty);
+            assert!(
+                cap.failure.is_none(),
+                "Claude {version} must support native suppression"
+            );
+
+            let root = resolve_route(RouteResolutionInput {
+                agent_type: AgentType::ClaudeCode,
+                origin: DelegationConnectionOrigin::Root,
+                session_override: None,
+                global_policy: DelegationRoutePolicy::Codeg,
+                delegation_enabled: true,
+                suppression: cap.clone(),
+                agent_mcp_supported: true,
+                companion_binary_available: true,
+            })
+            .expect("Claude root Codeg route");
+            assert_eq!(root.effective, DelegationRoutePolicy::Codeg);
+            assert_eq!(root.source, DelegationRouteSource::GlobalDefault);
+            assert!(matches!(
+                root.native_suppression,
+                NativeSuppressionPlan::ClaudeDisallowedTools { .. }
+            ));
+            assert!(root.degraded_reason.is_none());
+
+            // Children must resolve Codeg too — this is the production failure
+            // mode when a non-pin host was wrongly marked unsupported.
+            let child = resolve_route(RouteResolutionInput {
+                agent_type: AgentType::ClaudeCode,
+                origin: DelegationConnectionOrigin::CodegChild,
+                session_override: None,
+                global_policy: DelegationRoutePolicy::Codeg,
+                delegation_enabled: true,
+                suppression: cap,
+                agent_mcp_supported: true,
+                companion_binary_available: true,
+            })
+            .expect("Claude child with any host version must resolve");
+            assert_eq!(child.effective, DelegationRoutePolicy::Codeg);
+            assert_eq!(child.source, DelegationRouteSource::ForcedChild);
+        }
+
+        // Missing installed version still falls back to the smoke pin.
+        let missing = classify_managed_host_contract(AgentType::ClaudeCode, None, &empty);
+        assert!(!missing.custom_executable);
+        assert_eq!(
+            missing.contract_version.as_deref(),
+            Some(PINNED_CLAUDE_ACP_VERSION)
+        );
+        assert!(
+            resolve_managed_host_suppression(AgentType::ClaudeCode, None, &empty)
                 .failure
                 .is_none()
         );
