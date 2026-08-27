@@ -114,7 +114,6 @@ Keep the parent focused on coordination, adjudication, progress, and delivery.
 -->
 
 ## 1. Establish current truth
-
 Read the invocation, Brainstorm, repository instructions, current Plan and progress when present, Task reports, reviews, commits, and worktree state.
 Inspect live Agent discovery and the schemas for get_delegation_orchestration_bindings, register_simple_workflow,
 delegate_to_agent, continue_delegation, get_delegation_status, and request_recovery_authorization. Require the query tool.
@@ -134,7 +133,6 @@ Copy the validator's exact binding. Independent parent or Plan Author hashing is
 get_delegation_status remains the join tool after admission.
 
 ## 2. Resolve the Task Agent
-
 Resolve one Task Agent identity from the invocation before document work.
 Record an omitted selection as generation 1 with agent_type grok and a null
 profile. Validate an explicit built-in or custom Agent and profile against live
@@ -159,7 +157,6 @@ an active-Task change and request a user decision while preserving its
 admitted route.
 
 ## 3. Review and revise Design
-
 Trigger Design review when the Brainstorm spans modules, migration,
 concurrency, security, persistence, externally visible compatibility, or
 material ambiguity. Always dispatch an independent Codex Design Reviewer when
@@ -239,7 +236,6 @@ KiB. Keep the progress document at or below 512 KiB and its structured block
 at or below 64 KiB.
 
 ## 4. Author and review Plan
-
 Create only a bounded codeg-simple-progress-v1 shell. Pass document admission.
 Dispatch an independent Codex Plan Author with writing-plans on
 plan|PLAN_PATH|author|codex|none. Require ordered Task headings and exactly one
@@ -304,7 +300,6 @@ headings.
 ```
 
 ## 5. Maintain progress
-
 Keep Plan Task indices, risk level, Task Agent generation, expected work-unit
 keys, status, commit, and runs synchronized in one progress block. Derive
 normal implementer keys as task|N|implementer|TASK_AGENT|PROFILE and high
@@ -313,15 +308,21 @@ as task|N|reviewer|primary|codex|none and high auxiliary reviewer keys as
 task|N|reviewer|auxiliary|TASK_AGENT|PROFILE. Use
 final_review|reviewer|codex|none for final review.
 
-Before each call, append a new reserving run with the exact validator-copied
-orchestration_binding, full null durable identity, and an operation-specific
-dispatch_intent. After acknowledgement, fill every returned and durable field
-without deleting intent history. A definitive pre-reservation failure can
-close its dispatch intent with null durable identity. Only unknown
-acknowledgement stays reserving and adoption-eligible.
+Before each logical call, append a reserving run with the exact validator-copied binding, null durable identity, and operation fields; write a canonical lowercase UUID `intent_id` to progress before constructing the pending call. Run `validate-contract.mjs --ticket-v1-fingerprint --output-json` with the exact
+pending call on bounded stdin; continue has null cwd. Copy only
+`request_fingerprint` and `normalized_working_dir`, and retain the pending call
+and digest. Request the artifact with the exact `admission_intent`, then validate
+its returned path and digest through the validator.
 
-Keep task_id globally unique and attach one non-null child conversation to
-only one complete work-unit key.
+On `prepared`, call delegate or continue with the same intent ID, returned admission ticket, same pending-call values, and a fresh physical correlation ID;
+delegate uses the non-empty normalized cwd and continue has no cwd. On unknown
+acknowledgement retain the intent, pending call, and digest. Process
+`already_admitted` only through the validator's one adoption action. Stale,
+consumed, or authorization failure discards the artifact and ticket and requires
+a fresh artifact, validation, and ticket. Never expose artifact paths or
+admission tickets in cards or prose. A definitive pre-reservation failure may
+close the intent with null durable identity; otherwise preserve intent history.
+Keep task_id globally unique and one non-null child per complete work-unit key.
 
 ### Progress JSON
 
@@ -369,6 +370,7 @@ change records the object below.
           "replaced_task_id": null,
           "replacement_reason": null,
           "dispatch_intent": {
+            "intent_id": "8f95dd45-9eca-42a8-9909-0ac00be8ad52",
             "kind": "first",
             "continuation_target_task_id": null,
             "replacement_target_task_id": null,
@@ -413,7 +415,6 @@ another full admission.
 ```
 
 ## 6. Apply the workspace gate
-
 Inspect git status, staged and unstaged diffs, recent commits, ignored
 delivery reports, and repository instructions before each producer dispatch.
 Record ownership and expected files. Preserve unrelated user changes, build
@@ -424,10 +425,10 @@ ownership, destructive operations, secrets, external side effects, or
 user-owned decisions. Request direction and resume from refreshed truth.
 
 ## 7. Execute Tasks serially
-
 Use subagent-driven-development and execute one Plan Task at a time. Before
-every first, continue, or replacement action, run the complete-snapshot
-procedure for fresh full admission. Pass the exact emitted binding. Route changed
+every first, continue, or replacement action, follow section 5; its artifact
+validation is the complete-snapshot procedure for fresh full admission. Pass
+the exact emitted binding. Route changed
 pre-admission risk evidence through the same Plan Author, rerun validation,
 and continue every Plan reviewer for full re-review. Block changed
 post-admission evidence, including a coordinated Plan and progress generation
@@ -449,7 +450,6 @@ all expected key lineages end completed, checks pass, reviewers approve, and
 the owned commit and report are current.
 
 ## 8. Recover generic runs
-
 Continue a run with continue_delegation only on its stable key and child
 conversation. Join observed tasks through get_delegation_status. For recovery
 confirmation, call request_recovery_authorization and replay the authorized
@@ -482,7 +482,6 @@ simple_orchestration_binding_orphan. Those warnings stay warning-only. They
 never create a Gate, Card, or completion decision.
 
 ## 9. Complete final review
-
 After all Tasks complete, re-read the Brainstorm, Design, Plan, routing,
 progress, reports, reviews, commits, full branch diff, and worktree state.
 Run covering tests, lint, build, and project checks. Run the complete-snapshot

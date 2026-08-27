@@ -413,6 +413,19 @@ Create progress first. Dispatch an independent Codex Plan Author with writing-pl
 
 ## 5. Maintain progress
 Record reserving intent, delegation, admission, and observed state in order. Keep route metadata.
+For ticket-v1, write a canonical lowercase UUID \`intent_id\` to progress before
+constructing the pending call. Run
+\`validate-contract.mjs --ticket-v1-fingerprint --output-json\` with the exact
+pending call on bounded stdin; copy only \`request_fingerprint\` and
+\`normalized_working_dir\`, and retain the pending call and digest. Request the
+artifact with the exact \`admission_intent\`, then validate its returned path
+and digest through the validator. On \`prepared\`, call delegate or continue
+with the same intent ID, returned admission ticket, same pending-call values,
+and a fresh physical correlation ID. On unknown acknowledgement retain the
+intent, pending call, and digest; process \`already_admitted\` only through the
+validator's one adoption action. Stale, consumed, or authorization failure
+discards the artifact and ticket and requires a fresh artifact, validation,
+and ticket. Never expose artifact paths or admission tickets in cards or prose.
 
 ## 6. Apply the workspace gate
 Inspect status and diffs. Preserve user changes and request user-owned decisions.
@@ -5654,6 +5667,7 @@ describe("Skill contract v2", () => {
     assert.deepEqual(
       Object.keys(progressShape.tasks[0].runs[0].dispatch_intent),
       [
+        "intent_id",
         "kind",
         "continuation_target_task_id",
         "replacement_target_task_id",
@@ -7383,6 +7397,40 @@ function twoTaskBoundState() {
   return { snapshot, planMarkdown, bindings, state }
 }
 
+describe("dispatch intent ticket-v1 shape", () => {
+  const intentId = "8f95dd45-9eca-42a8-9909-0ac00be8ad52"
+
+  function validateIntent(intent) {
+    const { planMarkdown, state } = twoTaskBoundState()
+    state.tasks[0].runs[0].dispatch_intent = intent
+    return staticValidation(planMarkdown, state)
+  }
+
+  it("accepts exactly the legacy shape or that shape plus a canonical intent_id", () => {
+    assert.deepEqual(validateIntent(firstIntent()).failures, [])
+    const ticket = validateIntent(firstIntent({ intent_id: intentId }))
+    assert.deepEqual(ticket.failures, [])
+    assert.doesNotMatch(JSON.stringify(ticket), new RegExp(intentId))
+  })
+
+  it("rejects malformed, null, unknown-key, and partial alternate shapes", () => {
+    const { expected_root_task_id, ...partial } = firstIntent({
+      intent_id: intentId,
+    })
+    const invalid = [
+      firstIntent({ intent_id: null }),
+      firstIntent({ intent_id: intentId.toUpperCase() }),
+      firstIntent({ intent_id: "not-a-uuid" }),
+      firstIntent({ intent_id: intentId, extra: true }),
+      partial,
+      firstIntent({ dispatch_intent_id: intentId }),
+    ]
+    for (const intent of invalid) {
+      hasRule(validateIntent(intent).failures, "B2D-PROGRESS-006")
+    }
+  })
+})
+
 describe("durable page envelopes", () => {
   it("exports the exact 4 MiB cap and preserves raw multi-page cursor envelopes", () => {
     assert.equal(contractLib.MAX_DURABLE_EVIDENCE_BYTES, 4 * 1024 * 1024)
@@ -7890,6 +7938,66 @@ describe("artifact-first Skill contract", () => {
   })
 })
 
+describe("ticket-v1 Skill contract", () => {
+  it("rejects every mutation that weakens ordered admission or lost-ACK recovery", () => {
+    const mutations = [
+      [
+        "write a canonical lowercase UUID `intent_id` to progress before constructing the pending call",
+        "construct the pending call before writing its intent to progress",
+      ],
+      [
+        "`validate-contract.mjs --ticket-v1-fingerprint --output-json` with the exact pending call on bounded stdin",
+        "a local fingerprint helper with the pending call",
+      ],
+      [
+        "copy only `request_fingerprint` and `normalized_working_dir`",
+        "copy the pending call output",
+      ],
+      [
+        "artifact with the exact `admission_intent`",
+        "artifact before constructing admission intent",
+      ],
+      [
+        "validate its returned path and digest through the validator",
+        "trust its returned path and digest",
+      ],
+      [
+        "same intent ID, returned admission ticket, same pending-call values, and a fresh physical correlation ID",
+        "returned admission ticket and the prior correlation ID",
+      ],
+      [
+        "unknown acknowledgement retain the intent, pending call, and digest",
+        "unknown acknowledgement clears the pending state",
+      ],
+      [
+        "`already_admitted` only through the validator's one adoption action",
+        "`already_admitted` directly from the artifact descriptor",
+      ],
+      [
+        "Stale, consumed, or authorization failure discards the artifact and ticket and requires a fresh artifact, validation, and ticket",
+        "Stale, consumed, or authorization failure retries the prior ticket",
+      ],
+      [
+        "Never expose artifact paths or admission tickets in cards or prose",
+        "Include artifact paths and admission tickets in recovery prose",
+      ],
+    ]
+    for (const [required, replacement] of mutations) {
+      const pattern = new RegExp(
+        required
+          .split(" ")
+          .map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+          .join("\\s+")
+      )
+      assert.match(skill, pattern, required)
+      hasRule(
+        validateSkillMarkdown(skill.replace(pattern, replacement)).failures,
+        "B2D-SKILL-007"
+      )
+    }
+  })
+})
+
 describe("durable reconciliation and root-cause", () => {
   it("rejects an admitted progress Task ID with no durable row", () => {
     const { planMarkdown, state } = twoTaskBoundState()
@@ -8352,6 +8460,8 @@ describe("durable reconciliation and root-cause", () => {
 })
 
 describe("lost acknowledgement adoption", () => {
+  const intentId = "8f95dd45-9eca-42a8-9909-0ac00be8ad52"
+
   function adoptionFixture(kind) {
     const { snapshot, planMarkdown, bindings, state } = twoTaskBoundState()
     const target = state.tasks[0].runs[0]
@@ -8360,7 +8470,7 @@ describe("lost acknowledgement adoption", () => {
     let intent
     let candidate
     if (kind === "first") {
-      intent = firstIntent()
+      intent = firstIntent({ intent_id: intentId })
       candidate = durableRun({
         task_id: "adopt-first",
         work_unit_key: key,
@@ -8370,7 +8480,7 @@ describe("lost acknowledgement adoption", () => {
         orchestration_binding: binding,
       })
     } else if (kind === "continue") {
-      intent = continueIntent(target)
+      intent = continueIntent(target, { intent_id: intentId })
       candidate = durableRun({
         task_id: "adopt-continue",
         root_task_id: target.root_task_id,
@@ -8385,7 +8495,9 @@ describe("lost acknowledgement adoption", () => {
         orchestration_binding: target.orchestration_binding,
       })
     } else {
-      intent = replacementIntent(target)
+      intent = replacementIntent(target, "unresumable", {
+        intent_id: intentId,
+      })
       candidate = durableRun({
         task_id: "adopt-replace",
         root_task_id: "adopt-replace",
@@ -8496,6 +8608,8 @@ describe("lost acknowledgement adoption", () => {
         action.orchestration_binding,
         fixture.candidate.orchestration_binding
       )
+      assert.equal("intent_id" in action, false)
+      assert.doesNotMatch(JSON.stringify(result), new RegExp(intentId))
     })
   }
 

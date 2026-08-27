@@ -59,6 +59,7 @@ const DISPATCH_INTENT_KEYS = [
   "replacement_reason",
   "replacement_target_task_id",
 ]
+const TICKET_V1_DISPATCH_INTENT_KEYS = [...DISPATCH_INTENT_KEYS, "intent_id"].sort()
 const PENDING_ROUTE_CHANGE_KEYS = [
   "affected_task_indices",
   "effective_from_task_index",
@@ -5731,6 +5732,25 @@ export function validateSkillMarkdown(skillMarkdown) {
       "Skill must use advertised binding artifacts directly and fail closed"
     )
   }
+  const ticketV1Directives = [
+    /write a canonical lowercase uuid `intent_id` to progress before constructing the pending call/i,
+    /`validate-contract\.mjs --ticket-v1-fingerprint --output-json` with the exact pending call on bounded stdin/i,
+    /copy only `request_fingerprint` and `normalized_working_dir`/i,
+    /artifact with the exact `admission_intent`/i,
+    /validate its returned path and digest through the validator/i,
+    /same intent id, returned admission ticket, same pending-call values, and a fresh physical correlation id/i,
+    /unknown acknowledgement retain the intent, pending call, and digest/i,
+    /`already_admitted` only through the validator's one adoption action/i,
+    /stale, consumed, or authorization failure discards the artifact and ticket and requires a fresh artifact, validation, and ticket/i,
+    /never expose artifact paths or admission tickets in cards or prose/i,
+  ]
+  if (!ticketV1Directives.every((directive) => directive.test(compactProse))) {
+    fail(
+      failures,
+      "B2D-SKILL-007",
+      "Skill must preserve ticket-v1 admission order and lost-ACK recovery"
+    )
+  }
 
   return { failures, notes }
 }
@@ -6707,13 +6727,22 @@ function objectKeysExact(value, expected) {
 }
 
 function validateDispatchIntent(intent, label, failures) {
-  if (!objectKeysExact(intent, DISPATCH_INTENT_KEYS)) {
+  const legacyShape = objectKeysExact(intent, DISPATCH_INTENT_KEYS)
+  const ticketV1Shape = objectKeysExact(intent, TICKET_V1_DISPATCH_INTENT_KEYS)
+  if (!legacyShape && !ticketV1Shape) {
     fail(
       failures,
       "B2D-PROGRESS-006",
       `${label} dispatch_intent fields are not exact`
     )
     return
+  }
+  if (ticketV1Shape && !UUID_RE.test(intent.intent_id)) {
+    fail(
+      failures,
+      "B2D-PROGRESS-006",
+      `${label} dispatch_intent.intent_id must be a canonical lowercase UUID`
+    )
   }
   if (!["first", "continue", "replacement"].includes(intent.kind)) {
     fail(

@@ -41,7 +41,9 @@ use codeg_lib::commands::delegation::get_delegation_run_snapshot_core;
 use codeg_lib::db::entities::delegation_task_run::{
     AdmissionClass, DelegationRunStatus, Entity as DelegationTaskRun,
 };
-use codeg_lib::db::entities::{conversation, delegation_lineage_budget};
+use codeg_lib::db::entities::{
+    conversation, delegation_lineage_budget, delegation_work_unit_budget,
+};
 use codeg_lib::db::service::conversation_service;
 use codeg_lib::db::test_helpers::{fresh_in_memory_db, seed_folder};
 use codeg_lib::db::AppDatabase;
@@ -504,6 +506,304 @@ async fn ticket_v1_atomic_admission_exact_replay_uses_v3_before_resolved_profile
 }
 
 #[tokio::test]
+async fn ticket_v1_lost_ack_adopts_first_continue_and_replacement_without_side_effects() {
+    struct Case {
+        name: &'static str,
+        kind: AdmissionIntentKind,
+        intent_id: &'static str,
+        task_id: &'static str,
+        target_task_id: Option<&'static str>,
+        task: &'static str,
+        working_dir: Option<&'static str>,
+        original_correlation: &'static str,
+        retry_correlation: &'static str,
+    }
+
+    let cases = [
+        Case {
+            name: "first",
+            kind: AdmissionIntentKind::First,
+            intent_id: "11111111-1111-4111-8111-111111111111",
+            task_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1",
+            target_task_id: None,
+            task: "first lost acknowledgement",
+            working_dir: Some("D:/repo"),
+            original_correlation: "lost-ack-first-original",
+            retry_correlation: "lost-ack-first-retry",
+        },
+        Case {
+            name: "continue",
+            kind: AdmissionIntentKind::Continue,
+            intent_id: "22222222-2222-4222-8222-222222222222",
+            task_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2",
+            target_task_id: Some("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb2"),
+            task: "continue lost acknowledgement",
+            working_dir: None,
+            original_correlation: "lost-ack-continue-original",
+            retry_correlation: "lost-ack-continue-retry",
+        },
+        Case {
+            name: "replacement",
+            kind: AdmissionIntentKind::Replacement,
+            intent_id: "33333333-3333-4333-8333-333333333333",
+            task_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa3",
+            target_task_id: Some("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb3"),
+            task: "replacement lost acknowledgement",
+            working_dir: Some("D:/repo"),
+            original_correlation: "lost-ack-replacement-original",
+            retry_correlation: "lost-ack-replacement-retry",
+        },
+    ];
+
+    for case in cases {
+        let db = Arc::new(fresh_in_memory_db().await);
+        let folder = seed_folder(&db, &format!("/tmp/codeg-lost-ack-{}", case.name)).await;
+        let parent = conversation_service::create(
+            &db.conn,
+            folder,
+            AgentType::ClaudeCode,
+            Some(format!("{} lost-ack parent", case.name)),
+            None,
+        )
+        .await
+        .expect("parent");
+        let runs = RunStore::new(db.clone());
+        let work_unit_key = format!("task|11|{}|codex|none", case.name);
+        let binding = skill_task_binding();
+        let replacement_reason = (case.kind == AdmissionIntentKind::Replacement)
+            .then(|| REPLACEMENT_REASON_UNRESUMABLE.to_string());
+        let pending_call = TicketV1PendingCall {
+            schema_version: 1,
+            tool_name: if case.kind == AdmissionIntentKind::Continue {
+                CONTINUE_DELEGATION_TOOL
+            } else {
+                DELEGATE_TO_AGENT_TOOL
+            }
+            .into(),
+            task: case.task.into(),
+            working_dir: case.working_dir.map(str::to_string),
+            work_unit_key: Some(work_unit_key.clone()),
+            replaces_task_id: (case.kind == AdmissionIntentKind::Replacement)
+                .then(|| case.target_task_id.unwrap().to_string()),
+            replacement_reason: replacement_reason.clone(),
+            target_task_id: (case.kind == AdmissionIntentKind::Continue)
+                .then(|| case.target_task_id.unwrap().to_string()),
+            agent_type: "codex".into(),
+            profile_id: None,
+            orchestration_binding: Some(binding.clone()),
+            dispatch_intent_id: case.intent_id.into(),
+        };
+        let request_fingerprint = ticket_v1_request_fingerprint(&pending_call);
+        let child = conversation_service::create_with_delegation(
+            &db.conn,
+            seed_folder(&db, &format!("/tmp/codeg-lost-ack-{}-child", case.name)).await,
+            AgentType::Codex,
+            Some(format!("{} lost-ack child", case.name)),
+            None,
+            Some(DelegationLink {
+                parent_conversation_id: parent.id,
+                parent_tool_use_id: case.original_correlation.into(),
+                delegation_call_id: case.task_id.into(),
+            }),
+        )
+        .await
+        .expect("lost-ack child");
+        let lineage_root = case.target_task_id.unwrap_or(case.task_id);
+        runs.insert_reserving(ReservingRunInsert {
+            dispatch_intent_id: Some(case.intent_id.into()),
+            orchestration_binding: Some(binding.clone()),
+            task_id: case.task_id.into(),
+            root_task_id: if case.kind == AdmissionIntentKind::Continue {
+                lineage_root.into()
+            } else {
+                case.task_id.into()
+            },
+            previous_task_id: (case.kind == AdmissionIntentKind::Continue)
+                .then(|| lineage_root.to_string()),
+            generation: if case.kind == AdmissionIntentKind::Continue {
+                2
+            } else {
+                1
+            },
+            parent_conversation_id: parent.id,
+            parent_tool_use_id: Some(case.original_correlation.into()),
+            child_conversation_id: child.id,
+            agent_type: "codex".into(),
+            profile_id: None,
+            workspace_path: Some(test_working_dir()),
+            route_fingerprint: Some("lost-ack-route".into()),
+            launch_snapshot_version: Some("lost-ack-launch".into()),
+            mode_id: None,
+            config_values_json: Some("{}".into()),
+            task_preview: Some(derive_task_preview(case.task)),
+            request_fingerprint: Some(request_fingerprint.clone()),
+            admission_class: AdmissionClass::NormalRevision,
+            lineage_root_task_id: lineage_root.into(),
+            work_unit_key: Some(work_unit_key.clone()),
+            history_only: false,
+            replaced_task_id: (case.kind == AdmissionIntentKind::Replacement)
+                .then(|| lineage_root.to_string()),
+            replacement_reason: replacement_reason.clone(),
+            started_at: Some(Utc::now()),
+        })
+        .await
+        .expect("persist lost-ack run");
+
+        let (unexpected_continue_count, replacement_count) = match case.kind {
+            AdmissionIntentKind::First => (0, 0),
+            AdmissionIntentKind::Continue => (1, 0),
+            AdmissionIntentKind::Replacement => (0, 1),
+        };
+        delegation_lineage_budget::ActiveModel {
+            lineage_root_task_id: Set(lineage_root.into()),
+            unexpected_continue_count: Set(unexpected_continue_count),
+            replacement_count: Set(replacement_count),
+        }
+        .insert(&db.conn)
+        .await
+        .expect("seed lineage budget");
+        delegation_work_unit_budget::ActiveModel {
+            parent_conversation_id: Set(parent.id),
+            work_unit_key: Set(work_unit_key.clone()),
+            unexpected_continue_count: Set(unexpected_continue_count),
+            replacement_count: Set(replacement_count),
+        }
+        .insert(&db.conn)
+        .await
+        .expect("seed work-unit budget");
+
+        let intent = AdmissionIntentV1 {
+            schema_version: 1,
+            dispatch_intent_id: case.intent_id.into(),
+            request_fingerprint: request_fingerprint.clone(),
+            kind: case.kind,
+            work_unit_key: work_unit_key.clone(),
+            agent_type: "codex".into(),
+            profile_id: None,
+            target_task_id: case.target_task_id.map(str::to_string),
+            replacement_reason,
+            orchestration_binding: Some(binding),
+        };
+        let query = OrchestrationBindingQueryRequest {
+            namespace: "brainstorm-to-delivery".into(),
+            limit: 200,
+            snapshot_id: None,
+            cursor: None,
+        };
+        assert_ne!(case.original_correlation, case.retry_correlation);
+        let envelope = runs
+            .prepare_orchestration_binding_admission(
+                parent.id,
+                "parent-conn",
+                query.clone(),
+                None,
+                intent.clone(),
+            )
+            .await
+            .expect("exact lost-ack retry must produce an artifact envelope");
+        assert!(matches!(
+            envelope.admission,
+            AdmissionPreparation::AlreadyAdmitted {
+                ref dispatch_intent_id,
+                ref task_id,
+                ..
+            } if dispatch_intent_id == case.intent_id && task_id == case.task_id
+        ));
+        assert_eq!(
+            envelope
+                .page
+                .runs
+                .iter()
+                .filter(|run| run.task_id == case.task_id)
+                .count(),
+            1,
+            "{} artifact must contain the admitted row once",
+            case.name
+        );
+
+        let mut changed = pending_call.clone();
+        changed.task.push_str(" changed");
+        let mut changed_intent = intent.clone();
+        changed_intent.request_fingerprint = ticket_v1_request_fingerprint(&changed);
+        assert_eq!(
+            runs.prepare_orchestration_binding_admission(
+                parent.id,
+                "parent-conn",
+                query.clone(),
+                None,
+                changed_intent,
+            )
+            .await
+            .expect_err("changed task must conflict before artifact issuance"),
+            codeg_lib::acp::delegation::types::OrchestrationBindingQueryError::DispatchIntentConflict
+        );
+        if case.working_dir.is_some() {
+            let mut changed = pending_call.clone();
+            changed.working_dir = Some("D:/changed-repo".into());
+            let mut changed_intent = intent.clone();
+            changed_intent.request_fingerprint = ticket_v1_request_fingerprint(&changed);
+            assert_eq!(
+                runs.prepare_orchestration_binding_admission(
+                    parent.id,
+                    "parent-conn",
+                    query.clone(),
+                    None,
+                    changed_intent,
+                )
+                .await
+                .expect_err("changed cwd must conflict before artifact issuance"),
+                codeg_lib::acp::delegation::types::OrchestrationBindingQueryError::DispatchIntentConflict
+            );
+        }
+
+        assert_eq!(
+            list_run_rows(&db, parent.id).await.len(),
+            1,
+            "{}",
+            case.name
+        );
+        assert_eq!(
+            conversation::Entity::find()
+                .filter(conversation::Column::ParentId.eq(parent.id))
+                .all(&db.conn)
+                .await
+                .expect("list children")
+                .len(),
+            1,
+            "{} replay must not create a second child",
+            case.name
+        );
+        let lineage_budget = delegation_lineage_budget::Entity::find_by_id(lineage_root)
+            .one(&db.conn)
+            .await
+            .expect("load lineage budget")
+            .expect("lineage budget");
+        let work_unit_budget =
+            delegation_work_unit_budget::Entity::find_by_id((parent.id, work_unit_key))
+                .one(&db.conn)
+                .await
+                .expect("load work-unit budget")
+                .expect("work-unit budget");
+        assert_eq!(
+            (
+                lineage_budget.unexpected_continue_count,
+                lineage_budget.replacement_count,
+                work_unit_budget.unexpected_continue_count,
+                work_unit_budget.replacement_count,
+            ),
+            (
+                unexpected_continue_count,
+                replacement_count,
+                unexpected_continue_count,
+                replacement_count,
+            ),
+            "{} replay must not charge either budget again",
+            case.name
+        );
+    }
+}
+
+#[tokio::test]
 async fn ticket_v1_atomic_admission_semantic_changes_conflict_after_consume() {
     let cases: [(&str, fn(&mut DelegationRequest)); 5] = [
         ("task", |request| request.task = "changed task".into()),
@@ -733,6 +1033,124 @@ async fn ticket_v1_atomic_admission_insert_failure_compensates_and_keeps_tombsto
         Some("orchestration_admission_ticket_consumed")
     );
     assert!(list_run_rows(&db, parent.id).await.is_empty());
+}
+
+#[tokio::test]
+async fn rollout_intervening_mutation_keeps_legacy_business_checks_but_stales_ticket_v1() {
+    let db = Arc::new(fresh_in_memory_db().await);
+    let folder = seed_folder(&db, "/tmp/codeg-rollout-mutation").await;
+    let parent = conversation_service::create(
+        &db.conn,
+        folder,
+        AgentType::ClaudeCode,
+        Some("rollout mutation parent".into()),
+        None,
+    )
+    .await
+    .expect("parent");
+    let runs = Arc::new(RunStore::new(db.clone()));
+    let mock = Arc::new(MockSpawner::new());
+    let broker = broker_with_run_store(mock.clone(), parent.id, runs.clone()).await;
+
+    let captured = runs
+        .get_orchestration_binding_page(
+            parent.id,
+            OrchestrationBindingQueryRequest {
+                namespace: "brainstorm-to-delivery".into(),
+                limit: 200,
+                snapshot_id: None,
+                cursor: None,
+            },
+        )
+        .await
+        .expect("capture legacy artifact snapshot");
+    assert!(captured.runs.is_empty());
+    start_and_complete(
+        &broker,
+        &mock,
+        delegate_req(
+            parent.id,
+            "rollout-legacy-mutation",
+            AgentType::Codex,
+            "intervening legacy mutation",
+            &test_working_dir(),
+            Some("rollout|legacy|mutation"),
+        ),
+        "rollout-legacy-mutation",
+    )
+    .await;
+    mock.queue_spawn(Ok("rollout-legacy-after-snapshot-spawn".into()))
+        .await;
+    mock.queue_send(Ok(accepted(0, Utc::now()))).await;
+    let legacy = broker
+        .start_delegation(delegate_req(
+            parent.id,
+            "rollout-legacy-after-snapshot",
+            AgentType::Codex,
+            "legacy dispatch after validated artifact",
+            &test_working_dir(),
+            Some("rollout|legacy|after-snapshot"),
+        ))
+        .await;
+    assert_eq!(legacy.status, TaskStatus::Running, "{legacy:?}");
+    assert_eq!(list_run_rows(&db, parent.id).await.len(), 2);
+
+    let ticket_folder = seed_folder(&db, "/tmp/codeg-rollout-ticket-mutation").await;
+    let ticket_parent = conversation_service::create(
+        &db.conn,
+        ticket_folder,
+        AgentType::ClaudeCode,
+        Some("rollout ticket mutation parent".into()),
+        None,
+    )
+    .await
+    .expect("ticket parent");
+    let ticket_runs = Arc::new(RunStore::new(db.clone()));
+    let ticket_mock = Arc::new(MockSpawner::new());
+    let ticket_broker =
+        broker_with_run_store(ticket_mock.clone(), ticket_parent.id, ticket_runs.clone()).await;
+    let mut ticket_request = delegate_req_bound(
+        ticket_parent.id,
+        "rollout-ticket-stale",
+        AgentType::Codex,
+        "ticket dispatch after validated artifact",
+        &test_working_dir(),
+        Some("task|11|implementer|codex|none"),
+        Some(skill_task_binding()),
+    );
+    issue_delegate_ticket(&ticket_runs, &mut ticket_request).await;
+    start_and_complete(
+        &ticket_broker,
+        &ticket_mock,
+        delegate_req(
+            ticket_parent.id,
+            "rollout-ticket-intervening-mutation",
+            AgentType::Codex,
+            "invalidate the issued ticket",
+            &test_working_dir(),
+            Some("rollout|ticket|mutation"),
+        ),
+        "rollout-ticket-mutation",
+    )
+    .await;
+    let spawn_count = ticket_mock.spawn_args.lock().await.len();
+    let stale = ticket_broker.start_delegation(ticket_request).await;
+    assert_eq!(
+        stale.error_code.as_deref(),
+        Some("orchestration_admission_ticket_stale"),
+        "{stale:?}"
+    );
+    assert_eq!(list_run_rows(&db, ticket_parent.id).await.len(), 1);
+    assert_eq!(
+        conversation::Entity::find()
+            .filter(conversation::Column::ParentId.eq(ticket_parent.id))
+            .all(&db.conn)
+            .await
+            .expect("list ticket children")
+            .len(),
+        1
+    );
+    assert_eq!(ticket_mock.spawn_args.lock().await.len(), spawn_count);
 }
 
 fn unexpected_continue_insert(

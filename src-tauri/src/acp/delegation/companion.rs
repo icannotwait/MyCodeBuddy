@@ -5350,6 +5350,7 @@ mod tests {
         .unwrap();
         let baseline = &fixture["baseline"];
         let legacy_bytes = baseline["model_visible_result_bytes"].as_u64().unwrap() as usize;
+        assert_eq!(legacy_bytes, 3_040_870);
         let rows = fixture["rows"].as_array().unwrap();
         let expected_task_ids = rows
             .iter()
@@ -5407,7 +5408,9 @@ mod tests {
                 response.result.as_ref().unwrap(),
                 "runs"
             ));
-            model_history.push(serialize_jsonrpc_line(&response).unwrap());
+            let line = serialize_jsonrpc_line(&response).unwrap();
+            assert!(line.len() <= ORCHESTRATION_BINDING_ARTIFACT_MAX_RESULT_BYTES);
+            model_history.push(line);
             pending.mark_delivered();
         }
 
@@ -8802,6 +8805,7 @@ mod tests {
         assert!(!value_contains_key(&result, "runs"));
         let line = serialize_jsonrpc_line(&ok(id, result)).unwrap();
         println!("ticket-v1 full artifact JSONL bytes: {}", line.len());
+        assert_eq!(ORCHESTRATION_BINDING_ARTIFACT_MAX_RESULT_BYTES, 2_048);
         assert!(line.len() <= ORCHESTRATION_BINDING_ARTIFACT_MAX_RESULT_BYTES);
     }
 
@@ -8817,6 +8821,7 @@ mod tests {
         let line = serialize_jsonrpc_line(&response).unwrap();
         println!("Phase 2 Grok tools/list JSONL bytes: {}", line.len());
         assert!(line.len() <= 7_300);
+        assert!(line.len() <= 7_680);
         assert!(7_680 - line.len() >= 380);
     }
 
