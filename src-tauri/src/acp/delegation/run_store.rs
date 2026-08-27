@@ -1112,7 +1112,11 @@ impl PersistedRun {
         let exact = self.request_fingerprint.as_deref()
             == Some(candidate.request_fingerprint.as_str())
             && self.previous_task_id == candidate.previous_task_id
+            && (candidate.work_unit_key.is_none() || self.work_unit_key == candidate.work_unit_key)
             && self.agent_type == candidate.agent_type
+            && (candidate.profile_id.is_none() || self.profile_id == candidate.profile_id)
+            && (candidate.orchestration_binding.is_none()
+                || self.orchestration_binding == candidate.orchestration_binding)
             && self.replaced_task_id == candidate.replaced_task_id
             && self.replacement_reason == candidate.replacement_reason;
         if exact {
@@ -6476,13 +6480,13 @@ mod tests {
             .ensure_dispatch_intent_replay(&exact)
             .expect("exact projected replay");
 
-        let mut resolved_projection = exact.clone();
-        resolved_projection.work_unit_key = Some("resolved-unit".into());
-        resolved_projection.profile_id = Some("resolved-profile".into());
-        resolved_projection.orchestration_binding = None;
+        let mut omitted_projection = exact.clone();
+        omitted_projection.work_unit_key = None;
+        omitted_projection.profile_id = None;
+        omitted_projection.orchestration_binding = None;
         persisted
-            .ensure_dispatch_intent_replay(&resolved_projection)
-            .expect("admission-resolved fields are already committed by v3");
+            .ensure_dispatch_intent_replay(&omitted_projection)
+            .expect("omitted fields accept persisted admission resolution");
 
         let mut mismatches = Vec::new();
         let mut candidate = exact.clone();
@@ -6492,7 +6496,18 @@ mod tests {
         candidate.previous_task_id = Some("continued-task".into());
         mismatches.push(candidate);
         let mut candidate = exact.clone();
+        candidate.work_unit_key = Some("other-unit".into());
+        mismatches.push(candidate);
+        let mut candidate = exact.clone();
         candidate.agent_type = AgentType::ClaudeCode;
+        mismatches.push(candidate);
+        let mut candidate = exact.clone();
+        candidate.profile_id = Some("profile-b".into());
+        mismatches.push(candidate);
+        let mut candidate = exact.clone();
+        let mut changed_binding = binding_fixture();
+        changed_binding.generation = 2;
+        candidate.orchestration_binding = Some(changed_binding);
         mismatches.push(candidate);
         let mut candidate = exact.clone();
         candidate.replaced_task_id = Some("replaced-task".into());
