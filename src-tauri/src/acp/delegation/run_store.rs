@@ -2395,7 +2395,6 @@ impl RunStore {
                 Utc::now(),
                 || async {
                     let rows = materialize_binding_rows(&self.db.conn, parent_id, &namespace).await?;
-                    validate_admission_intent_source(&loader_intent, &rows)?;
                     let existing = self
                         .load_by_dispatch_intent(
                             parent_id,
@@ -2419,6 +2418,7 @@ impl RunStore {
                             })?;
                         Some(existing.task_id)
                     } else {
+                        validate_admission_intent_source(&loader_intent, &rows)?;
                         None
                     };
                     Ok((rows, existing_task_id))

@@ -68,7 +68,7 @@ use crate::acp::delegation::transport::{
     CancelDelegationReason, CompanionRole,
 };
 use crate::acp::delegation::types::{
-    validate_correlation_id, AdmissionPreparation, BindingEvidenceV1,
+    validate_correlation_id, AdmissionIntentV1, AdmissionPreparation, BindingEvidenceV1,
     DelegationOrchestrationBindingPage, DelegationReturnWhen,
     OrchestrationBindingArtifactDescriptor, OrchestrationBindingDelivery,
     OrchestrationBindingFirstPageEnvelope, OrchestrationBindingQueryError,
@@ -1981,6 +1981,17 @@ async fn build_tools_call_spawn(
                     .any(|field| object.get(*field).is_some_and(Value::is_null))
             }) {
                 return orchestration_binding_query_invalid_response(id);
+            }
+            if arguments
+                .get("admission_intent")
+                .is_some_and(|intent| {
+                    serde_json::from_value::<AdmissionIntentV1>(intent.clone()).is_err()
+                })
+            {
+                return LineAction::Respond(bounded_orchestration_binding_error(
+                    id,
+                    OrchestrationBindingQueryError::AdmissionIntentInvalid.code(),
+                ));
             }
             let tool_request: OrchestrationBindingToolRequest =
                 match serde_json::from_value(arguments) {
@@ -8362,6 +8373,57 @@ mod tests {
             )
             .as_bytes()
         );
+    }
+
+    #[tokio::test]
+    async fn orchestration_admission_intent_grammar_errors_use_stable_code() {
+        let base_intent = json!({
+            "schema_version": 1,
+            "dispatch_intent_id": "8f95dd45-9eca-42a8-9909-0ac00be8ad52",
+            "request_fingerprint": "2a44be9d1662a314cbbd2c8111bcf83159be7bdc93abadff977d01447f986648",
+            "kind": "first",
+            "work_unit_key": "task|7|implementer|codex|none",
+            "agent_type": "codex",
+            "profile_id": null,
+            "target_task_id": null,
+            "replacement_reason": null,
+            "orchestration_binding": null
+        });
+        let mut invalid_intents = Vec::new();
+        let mut intent = base_intent.clone();
+        intent["unknown"] = json!(true);
+        invalid_intents.push(intent);
+        let mut intent = base_intent.clone();
+        intent["request_fingerprint"] = json!("not-a-fingerprint");
+        invalid_intents.push(intent);
+        let mut intent = base_intent.clone();
+        intent.as_object_mut().unwrap().remove("profile_id");
+        invalid_intents.push(intent);
+        let mut intent = base_intent;
+        intent["kind"] = json!("continue");
+        invalid_intents.push(intent);
+
+        for admission_intent in invalid_intents {
+            let response = unwrap_respond(
+                dispatch_with_features(
+                    GROK_FEATURES,
+                    &call(
+                        21,
+                        "get_delegation_orchestration_bindings",
+                        json!({
+                            "namespace": "brainstorm-to-delivery",
+                            "delivery": "artifact",
+                            "admission_intent": admission_intent
+                        }),
+                    ),
+                )
+                .await,
+            );
+            assert_eq!(
+                response.result.unwrap()["structuredContent"]["error"]["code"],
+                "orchestration_admission_intent_invalid"
+            );
+        }
     }
 
     #[test]

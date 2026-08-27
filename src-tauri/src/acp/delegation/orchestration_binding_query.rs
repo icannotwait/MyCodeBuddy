@@ -620,6 +620,63 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn orchestration_admission_ticket_issue_holds_read_fence_through_insertion() {
+        let cache = Arc::new(OrchestrationBindingSnapshotCache::new());
+        let now = Utc.with_ymd_and_hms(2026, 8, 26, 8, 0, 0).unwrap();
+        let (loader_entered_tx, loader_entered_rx) = tokio::sync::oneshot::channel();
+        let (loader_release_tx, loader_release_rx) = tokio::sync::oneshot::channel();
+        let issue_cache = cache.clone();
+        let issue = tokio::spawn(async move {
+            issue_cache
+                .first_page_with_admission_loader(
+                    20,
+                    "connection-incarnation-a",
+                    query("brainstorm-to-delivery", 200),
+                    None,
+                    admission_intent(AdmissionIntentKind::First, None, None),
+                    now,
+                    || async move {
+                        loader_entered_tx.send(()).unwrap();
+                        loader_release_rx.await.unwrap();
+                        Ok((Vec::new(), None))
+                    },
+                )
+                .await
+        });
+        loader_entered_rx.await.unwrap();
+
+        let (writer_started_tx, writer_started_rx) = tokio::sync::oneshot::channel();
+        let (writer_acquired_tx, mut writer_acquired_rx) = tokio::sync::oneshot::channel();
+        let writer_cache = cache.clone();
+        let writer = tokio::spawn(async move {
+            writer_started_tx.send(()).unwrap();
+            let _guard = writer_cache.mutation_guard().await;
+            writer_acquired_tx.send(()).unwrap();
+            let state = writer_cache.state.lock().await;
+            (state.snapshots.len(), state.tickets.len())
+        });
+        writer_started_rx.await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut writer_acquired_rx)
+                .await
+                .is_err(),
+            "mutation writer must remain blocked during durable lookup"
+        );
+
+        loader_release_tx.send(()).unwrap();
+        let envelope = issue.await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(1), &mut writer_acquired_rx)
+            .await
+            .expect("writer should acquire after issuance")
+            .unwrap();
+        assert_eq!(writer.await.unwrap(), (1, 1));
+        assert!(matches!(
+            envelope.admission,
+            AdmissionPreparation::Prepared { .. }
+        ));
+    }
+
     #[test]
     fn orchestration_admission_ticket_issue_requires_exact_captured_source_identity() {
         const SOURCE_ID: &str = "6b228a7d-4ac9-4bc7-a16e-f4ecf6f0fd45";

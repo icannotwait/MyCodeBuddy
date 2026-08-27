@@ -5084,6 +5084,15 @@ mod tests {
         intent["kind"] = json!("continue");
         intent["target_task_id"] = json!(TASK_ID);
         mismatches.push(intent);
+        let mut intent = base_intent.clone();
+        intent["kind"] = json!("continue");
+        intent["target_task_id"] = json!("11111111-1111-4111-8111-111111111111");
+        mismatches.push(intent);
+        let mut intent = base_intent.clone();
+        intent["kind"] = json!("continue");
+        intent["target_task_id"] = json!(TASK_ID);
+        intent["work_unit_key"] = json!("task|8|implementer|codex|none");
+        mismatches.push(intent);
         let mut intent = base_intent;
         intent["kind"] = json!("replacement");
         intent["target_task_id"] = json!(TASK_ID);
@@ -5105,7 +5114,7 @@ mod tests {
         assert_eq!(snapshot.admission_ticket_outcomes["issued"], 0);
         assert_eq!(snapshot.admission_ticket_outcomes["already_admitted"], 1);
         assert_eq!(snapshot.dispatch_intent_outcomes["exact_replay"], 1);
-        assert_eq!(snapshot.dispatch_intent_outcomes["conflict"], 7);
+        assert_eq!(snapshot.dispatch_intent_outcomes["conflict"], 9);
     }
 
     #[tokio::test]
