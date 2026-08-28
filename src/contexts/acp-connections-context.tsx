@@ -5218,9 +5218,11 @@ function prepareEventFrame(
           highestSeq,
         },
         liveMessageIsLive:
-          connFrame.deliverySource === "desktop"
-            ? stepLiveMessageIsLive
-            : undefined,
+          stepCheckpointRuntimeConversationIds != null
+            ? true
+            : connFrame.deliverySource === "desktop"
+              ? stepLiveMessageIsLive
+              : undefined,
         checkpointRuntimeConversationIds: stepCheckpointRuntimeConversationIds,
         completionRuntimeConversationIds: stepCompletionRuntimeConversationIds,
       })

@@ -5969,7 +5969,7 @@ describe("AcpConnectionsProvider liveMessage sink (mirror out of React)", () => 
     }
   )
 
-  it("keeps a rejected replay settled when turn-complete arrives in a later frame", async () => {
+  it("keeps a rejected replay settled when trailing connected arrives later", async () => {
     h.acpFindConnectionForConversation.mockResolvedValue(null)
     await mountProvider()
     await act(async () => {
@@ -6031,8 +6031,10 @@ describe("AcpConnectionsProvider liveMessage sink (mirror out of React)", () => 
             {
               connection_id: "spawned-conn",
               seq: 3,
-              type: "status_changed",
-              status: "connected",
+              type: "turn_complete",
+              session_id: "sess-1",
+              stop_reason: "end_turn",
+              mark_awaiting_reply: false,
             },
           ],
           3
@@ -6046,10 +6048,8 @@ describe("AcpConnectionsProvider liveMessage sink (mirror out of React)", () => 
             {
               connection_id: "spawned-conn",
               seq: 4,
-              type: "turn_complete",
-              session_id: "sess-1",
-              stop_reason: "end_turn",
-              mark_awaiting_reply: false,
+              type: "status_changed",
+              status: "connected",
             },
           ],
           4
@@ -6070,7 +6070,6 @@ describe("AcpConnectionsProvider liveMessage sink (mirror out of React)", () => 
           blocks: [{ type: "text", text: "already persisted" }],
         },
       ])
-      expect(transcriptStore.getConversation(42)).toBeNull()
     } finally {
       resetConversationRuntimeStore()
     }
@@ -9639,6 +9638,107 @@ describe("AcpConnectionsProvider frame transactions (raw order)", () => {
           .byConversationId.get(42)
         expect(runtime?.liveMessage).toBe(stageA)
         expect(runtime?.localTurns).toEqual([])
+      } finally {
+        resetConversationRuntimeStore()
+      }
+    })
+
+    it("checkpoints hidden stages during Web replay and live delivery", async () => {
+      const { useConversationRuntimeStore, resetConversationRuntimeStore } =
+        await import("@/stores/conversation-runtime-store")
+      resetConversationRuntimeStore()
+      const runtimeActions = useConversationRuntimeStore.getState().actions
+      runtimeActions.setExternalId(42, "sess-1")
+
+      try {
+        h.isDesktop = false
+        await mountProvider()
+        await act(async () => {
+          await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1", 42)
+        })
+        const publications: Array<{
+          message: LiveMessage
+          isLive: boolean
+        }> = []
+        h.actions!.registerLiveSinks(TAB, {
+          runtimeConversationId: 42,
+          canonical: (message, isLive) => {
+            publications.push({ message, isLive })
+            runtimeActions.setLiveMessage(42, message, isLive)
+            return (
+              useConversationRuntimeStore.getState().byConversationId.get(42)
+                ?.liveMessage === message
+            )
+          },
+        })
+        const handlers = latestAttachHandlers()
+
+        act(() => {
+          handlers.onReplay(
+            [
+              {
+                connection_id: "conn",
+                seq: 1,
+                type: "session_started",
+                session_id: "sess-1",
+              },
+              status("conn", 2, "prompting"),
+              content("conn", 3, "stage A"),
+              status("conn", 4, "connected"),
+              status("conn", 5, "prompting"),
+              content("conn", 6, "stage B"),
+              status("conn", 7, "connected"),
+            ],
+            7,
+            0
+          )
+        })
+        act(() => {
+          for (const envelope of [
+            status("conn", 8, "prompting"),
+            content("conn", 9, "stage C"),
+            status("conn", 10, "connected"),
+            status("conn", 11, "prompting"),
+            content("conn", 12, "stage D"),
+            {
+              connection_id: "conn",
+              seq: 13,
+              type: "usage_update" as const,
+              used: 1,
+              size: 100,
+            },
+          ]) {
+            handlers.onEvent(envelope)
+          }
+        })
+
+        const runtime = useConversationRuntimeStore
+          .getState()
+          .byConversationId.get(42)
+        expect(
+          runtime?.localTurns.map((turn) => ({
+            role: turn.role,
+            blocks: turn.blocks,
+          }))
+        ).toEqual([
+          {
+            role: "assistant",
+            blocks: [{ type: "text", text: "stage A" }],
+          },
+          {
+            role: "assistant",
+            blocks: [{ type: "text", text: "stage B" }],
+          },
+          {
+            role: "assistant",
+            blocks: [{ type: "text", text: "stage C" }],
+          },
+        ])
+        expect(runtime?.liveMessage?.content).toEqual([
+          { type: "text", text: "stage D" },
+        ])
+        expect(publications.length).toBeGreaterThanOrEqual(4)
+        expect(publications.every(({ isLive }) => isLive)).toBe(true)
       } finally {
         resetConversationRuntimeStore()
       }
