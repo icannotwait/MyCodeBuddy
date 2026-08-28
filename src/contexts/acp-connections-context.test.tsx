@@ -8116,13 +8116,9 @@ describe("AcpConnectionsProvider frame transactions (raw order)", () => {
               stop_reason: "end_turn",
               mark_awaiting_reply: false,
             },
-            {
-              connection_id: "owner-conn",
-              seq: 4,
-              type: "status_changed",
-              status: "prompting",
-            },
-            content("owner-conn", 5, "answer B in progress"),
+            status("owner-conn", 4, "connected"),
+            status("owner-conn", 5, "prompting"),
+            content("owner-conn", 6, "answer B in progress"),
           ])
         )
         h.runAnimationFrame()
@@ -9739,6 +9735,159 @@ describe("AcpConnectionsProvider frame transactions (raw order)", () => {
         ])
         expect(publications.length).toBeGreaterThanOrEqual(4)
         expect(publications.every(({ isLive }) => isLive)).toBe(true)
+      } finally {
+        resetConversationRuntimeStore()
+      }
+    })
+
+    it("requires exact post-mirror live ownership", async () => {
+      const { useConversationRuntimeStore, resetConversationRuntimeStore } =
+        await import("@/stores/conversation-runtime-store")
+      resetConversationRuntimeStore()
+      const runtimeActions = useConversationRuntimeStore.getState().actions
+      runtimeActions.setExternalId(42, "sess-1")
+      runtimeActions.appendOptimisticTurn(
+        42,
+        {
+          id: "user-in-flight",
+          role: "user",
+          blocks: [{ type: "text", text: "keep this pending" }],
+          timestamp: "2026-08-25T07:31:49.000Z",
+        },
+        "turn-in-flight"
+      )
+
+      try {
+        await mountDesktopOwner("owner-conn", TAB, "sess-1", 42)
+        const canonical = vi.fn(
+          (_message: LiveMessage, _isLive: boolean) => true
+        )
+        h.actions!.registerLiveSinks(TAB, {
+          runtimeConversationId: 42,
+          canonical,
+        })
+        act(() => {
+          h.emitDesktopBatch(
+            batch(1, [
+              {
+                connection_id: "owner-conn",
+                seq: 1,
+                type: "session_started",
+                session_id: "sess-1",
+              },
+              status("owner-conn", 2, "prompting"),
+              content("owner-conn", 3, "stage A"),
+            ])
+          )
+          h.runAnimationFrame()
+        })
+        canonical.mockClear()
+
+        act(() => {
+          h.emitDesktopBatch(batch(2, [status("owner-conn", 4, "connected")]))
+          h.runAnimationFrame()
+        })
+
+        expect(canonical).toHaveBeenCalledTimes(1)
+        expect(canonical.mock.calls[0]![1]).toBe(true)
+        const runtime = useConversationRuntimeStore
+          .getState()
+          .byConversationId.get(42)
+        expect(runtime?.liveMessage).toBeNull()
+        expect(runtime?.localTurns).toEqual([])
+        expect(runtime?.optimisticTurns.map((turn) => turn.id)).toEqual([
+          "user-in-flight",
+        ])
+      } finally {
+        resetConversationRuntimeStore()
+      }
+    })
+
+    it("does not materialize a runtime for an ownerless checkpoint", async () => {
+      const { useConversationRuntimeStore, resetConversationRuntimeStore } =
+        await import("@/stores/conversation-runtime-store")
+      resetConversationRuntimeStore()
+
+      try {
+        await mountDesktopOwner("owner-conn", TAB, "sess-1")
+        const runtimeCount =
+          useConversationRuntimeStore.getState().byConversationId.size
+        act(() => {
+          h.emitDesktopBatch(
+            batch(1, [
+              status("owner-conn", 1, "prompting"),
+              content("owner-conn", 2, "unowned stage"),
+              status("owner-conn", 3, "connected"),
+            ])
+          )
+          h.runAnimationFrame()
+        })
+
+        expect(
+          useConversationRuntimeStore.getState().byConversationId.size
+        ).toBe(runtimeCount)
+        expect(h.store!.getConnection(TAB)?.status).toBe("connected")
+      } finally {
+        resetConversationRuntimeStore()
+      }
+    })
+
+    it("does not replace a mapped runtime that owns another live message", async () => {
+      const { useConversationRuntimeStore, resetConversationRuntimeStore } =
+        await import("@/stores/conversation-runtime-store")
+      resetConversationRuntimeStore()
+      const runtimeActions = useConversationRuntimeStore.getState().actions
+      runtimeActions.setExternalId(42, "sess-1")
+
+      try {
+        await mountDesktopOwner("owner-conn", TAB, "sess-1", 42)
+        act(() => {
+          h.emitDesktopBatch(
+            batch(1, [
+              {
+                connection_id: "owner-conn",
+                seq: 1,
+                type: "session_started",
+                session_id: "sess-1",
+              },
+              status("owner-conn", 2, "prompting"),
+              content("owner-conn", 3, "connection stage"),
+            ])
+          )
+          h.runAnimationFrame()
+        })
+
+        const otherLive: LiveMessage = {
+          id: "other-live",
+          role: "assistant",
+          content: [{ type: "text", text: "other turn" }],
+          startedAt: 1_700_000_000_000,
+        }
+        runtimeActions.setLiveMessage(42, otherLive, true)
+        const canonical = vi.fn((message: LiveMessage, isLive: boolean) => {
+          runtimeActions.setLiveMessage(42, message, isLive)
+          return (
+            useConversationRuntimeStore.getState().byConversationId.get(42)
+              ?.liveMessage === message
+          )
+        })
+        h.actions!.registerLiveSinks(TAB, {
+          runtimeConversationId: 42,
+          canonical,
+        })
+        canonical.mockClear()
+
+        act(() => {
+          h.emitDesktopBatch(batch(2, [status("owner-conn", 4, "connected")]))
+          h.runAnimationFrame()
+        })
+
+        const runtime = useConversationRuntimeStore
+          .getState()
+          .byConversationId.get(42)
+        expect(runtime?.liveMessage).toBe(otherLive)
+        expect(runtime?.localTurns).toEqual([])
+        expect(canonical).not.toHaveBeenCalled()
       } finally {
         resetConversationRuntimeStore()
       }
@@ -12916,6 +13065,100 @@ describe("AcpConnectionsProvider canonical observer aliases", () => {
             role: "assistant",
             blocks: [{ type: "text", text: "shared reply" }],
           },
+        ])
+      }
+    } finally {
+      resetConversationRuntimeStore()
+    }
+  })
+
+  it("checkpoints a suspended stage in every canonical observer alias", async () => {
+    const TAB2 = "conv-2-claude_code-99"
+    const { useConversationRuntimeStore, resetConversationRuntimeStore } =
+      await import("@/stores/conversation-runtime-store")
+    resetConversationRuntimeStore()
+    const runtimeActions = useConversationRuntimeStore.getState().actions
+    runtimeActions.setExternalId(42, "sess-shared")
+    runtimeActions.setExternalId(99, "sess-shared")
+
+    try {
+      h.acpFindConnectionForConversation.mockResolvedValue({
+        connection_id: "broker-child",
+        event_seq: 0,
+      })
+      await mountProvider()
+      await act(async () => {
+        await h.actions!.connect(
+          TAB,
+          "claude_code",
+          "/tmp/x",
+          "sess-shared",
+          42
+        )
+      })
+      const handlers = latestAttachHandlers()
+      emitAcpEvent(handlers, {
+        seq: 1,
+        connection_id: "broker-child",
+        type: "session_started",
+        session_id: "sess-shared",
+      })
+      h.acpFindConnectionForConversation.mockResolvedValue(null)
+      await act(async () => {
+        await h.actions!.connect(
+          TAB2,
+          "claude_code",
+          "/tmp/x",
+          "sess-shared",
+          99
+        )
+      })
+
+      for (const [contextKey, conversationId] of [
+        [TAB, 42],
+        [TAB2, 99],
+      ] as const) {
+        h.actions!.registerLiveSinks(contextKey, {
+          runtimeConversationId: conversationId,
+          canonical: (message, isLive) => {
+            runtimeActions.setLiveMessage(conversationId, message, isLive)
+            return (
+              useConversationRuntimeStore
+                .getState()
+                .byConversationId.get(conversationId)?.liveMessage === message
+            )
+          },
+        })
+      }
+
+      act(() => {
+        handlers.onReplay(
+          [
+            status("broker-child", 2, "prompting"),
+            content("broker-child", 3, "shared stage A"),
+            status("broker-child", 4, "connected"),
+            status("broker-child", 5, "prompting"),
+            content("broker-child", 6, "shared stage B"),
+          ],
+          6,
+          1
+        )
+      })
+
+      for (const conversationId of [42, 99]) {
+        const runtime = useConversationRuntimeStore
+          .getState()
+          .byConversationId.get(conversationId)
+        expect(runtime?.localTurns).toEqual([
+          {
+            id: expect.stringMatching(new RegExp(`^live-${conversationId}-`)),
+            role: "assistant",
+            blocks: [{ type: "text", text: "shared stage A" }],
+            timestamp: expect.any(String),
+          },
+        ])
+        expect(runtime?.liveMessage?.content).toEqual([
+          { type: "text", text: "shared stage B" },
         ])
       }
     } finally {
