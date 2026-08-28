@@ -4959,6 +4959,7 @@ interface PreparedEventFrame {
     nextConnection: ConnectionState
     connectionFrame: AcceptedConnectionFrame
     liveMessageIsLive: boolean | undefined
+    checkpointRuntimeConversationIds: readonly number[] | undefined
     completionRuntimeConversationIds: readonly number[] | undefined
   }>
   changedConnections: Array<{
@@ -5116,6 +5117,39 @@ function admitTurnComplete(
   }
 }
 
+function admitSuspensionCheckpoint(snapshot: ConnectionState): number[] {
+  if (snapshot.status !== "prompting" || snapshot.liveMessage == null) {
+    return []
+  }
+
+  const knownSessionId = resolveKnownConnectionSessionId(snapshot)
+  const owners: number[] = []
+  for (const [
+    runtimeConversationId,
+    runtime,
+  ] of useConversationRuntimeStore.getState().byConversationId) {
+    const runtimeLiveMatches =
+      runtime.liveMessage?.id === snapshot.liveMessage.id
+    const mappedToConnection =
+      (knownSessionId != null && runtime.externalId === knownSessionId) ||
+      (snapshot.conversationId != null &&
+        (runtime.conversationId === snapshot.conversationId ||
+          runtime.dbConversationId === snapshot.conversationId))
+    if (!mappedToConnection && !runtimeLiveMatches) continue
+    if (
+      knownSessionId != null &&
+      runtime.externalId != null &&
+      runtime.externalId !== knownSessionId
+    ) {
+      continue
+    }
+    if (runtime.liveMessage != null && !runtimeLiveMatches) continue
+    owners.push(runtimeConversationId)
+  }
+
+  return owners
+}
+
 function hasAuthoritativeTerminalDelivery(
   frame: AcceptedConnectionFrame,
   terminalSeq: number
@@ -5161,6 +5195,7 @@ function prepareEventFrame(
     let stepEvents: EventEnvelope[] = []
     let stepRawFloor = before.lastAppliedSeq
     let stepLiveMessageIsLive: boolean | undefined
+    let stepCheckpointRuntimeConversationIds: readonly number[] | undefined
     let stepCompletionRuntimeConversationIds: readonly number[] | undefined
     const pushConnectionStep = (
       highestSeq: number,
@@ -5186,12 +5221,14 @@ function prepareEventFrame(
           connFrame.deliverySource === "desktop"
             ? stepLiveMessageIsLive
             : undefined,
+        checkpointRuntimeConversationIds: stepCheckpointRuntimeConversationIds,
         completionRuntimeConversationIds: stepCompletionRuntimeConversationIds,
       })
       stepBefore = stepNext
       stepEvents = []
       stepRawFloor = highestSeq
       stepLiveMessageIsLive = undefined
+      stepCheckpointRuntimeConversationIds = undefined
       stepCompletionRuntimeConversationIds = undefined
     }
 
@@ -5201,6 +5238,17 @@ function prepareEventFrame(
       eventIndex += 1
     ) {
       const event = connFrame.applyEvents[eventIndex]!
+      const checkpointRuntimeConversationIds =
+        event.type === "status_changed" &&
+        event.status === "connected" &&
+        snapshot.status === "prompting" &&
+        snapshot.liveMessage != null
+          ? admitSuspensionCheckpoint(snapshot)
+          : []
+      if (checkpointRuntimeConversationIds.length > 0) {
+        stepCheckpointRuntimeConversationIds = checkpointRuntimeConversationIds
+        stepLiveMessageIsLive = true
+      }
       if (event.type === "turn_complete") {
         const admission = admitTurnComplete(
           snapshot,
@@ -5227,7 +5275,10 @@ function prepareEventFrame(
         }
         snapshot = nextSnap
       }
-      if (event.type === "turn_complete") {
+      if (
+        event.type === "turn_complete" ||
+        checkpointRuntimeConversationIds.length > 0
+      ) {
         pushConnectionStep(event.seq, snapshot)
       }
     }
@@ -6414,15 +6465,15 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       deliveryIds: readonly number[],
       connectionFrame?: AcceptedConnectionFrame,
       liveMessageIsLive?: boolean,
-      completionRuntimeConversationIds?: ReadonlySet<number>,
-      rejectedCompletionRuntimeConversationIds?: Set<number>
+      boundaryRuntimeConversationIds?: ReadonlySet<number>,
+      rejectedBoundaryRuntimeConversationIds?: Set<number>
     ) => {
       const sinks = liveSinksRef.current.get(key)
       if (!sinks) return
       if (
-        completionRuntimeConversationIds &&
+        boundaryRuntimeConversationIds &&
         sinks.runtimeConversationId != null &&
-        !completionRuntimeConversationIds.has(sinks.runtimeConversationId)
+        !boundaryRuntimeConversationIds.has(sinks.runtimeConversationId)
       ) {
         return
       }
@@ -6469,12 +6520,11 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         connectionFrame?.applyEvents.some(
           (event) => event.type === "turn_complete"
         ) ?? false
+      const hasTranscriptBoundary =
+        hasTurnComplete || boundaryRuntimeConversationIds !== undefined
       let canonicalAccepted = true
 
-      // A terminal-only frame can leave the canonical object unchanged while
-      // transcript.publish still marks it completing. Re-acknowledge that
-      // object so an earlier stale-replay rejection cannot be bypassed.
-      if (liveChanged || hasTurnComplete) {
+      if (liveChanged || hasTranscriptBoundary) {
         streamingPerfRecorder.setCurrentDeliveryIds(deliveryIds)
         try {
           canonicalAccepted =
@@ -6490,9 +6540,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       }
 
       if (!canonicalAccepted && sinks.runtimeConversationId != null) {
-        rejectedCompletionRuntimeConversationIds?.add(
-          sinks.runtimeConversationId
-        )
+        rejectedBoundaryRuntimeConversationIds?.add(sinks.runtimeConversationId)
       }
       if (!sinks.transcript || !canonicalAccepted) {
         recordPublication(canonicalAccepted, false)
@@ -6550,8 +6598,8 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       deliveryIds: readonly number[],
       connectionFrame?: AcceptedConnectionFrame,
       liveMessageIsLive?: boolean,
-      completionRuntimeConversationIds?: ReadonlySet<number>,
-      rejectedCompletionRuntimeConversationIds?: Set<number>
+      boundaryRuntimeConversationIds?: ReadonlySet<number>,
+      rejectedBoundaryRuntimeConversationIds?: Set<number>
     ) => {
       // At most one sink invocation per registered key: canonical first,
       // then each open tab alias (two open aliases mirror into two sessions).
@@ -6562,8 +6610,8 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         deliveryIds,
         connectionFrame,
         liveMessageIsLive,
-        completionRuntimeConversationIds,
-        rejectedCompletionRuntimeConversationIds
+        boundaryRuntimeConversationIds,
+        rejectedBoundaryRuntimeConversationIds
       )
       for (const alias of aliasKeysFor(canonical)) {
         mirrorLiveMessageOnce(
@@ -6573,8 +6621,8 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           deliveryIds,
           connectionFrame,
           liveMessageIsLive,
-          completionRuntimeConversationIds,
-          rejectedCompletionRuntimeConversationIds
+          boundaryRuntimeConversationIds,
+          rejectedBoundaryRuntimeConversationIds
         )
       }
     },
@@ -6759,12 +6807,17 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             sinkRegistered: traceSink != null,
           })
         }
+        const checkpointRuntimeConversationIds =
+          step.checkpointRuntimeConversationIds == null
+            ? undefined
+            : new Set(step.checkpointRuntimeConversationIds)
         const hasCompletion = connectionFrame.applyEvents.some(
           (event) => event.type === "turn_complete"
         )
-        const rejectedCompletionRuntimeConversationIds = hasCompletion
-          ? new Set<number>()
-          : undefined
+        const rejectedBoundaryRuntimeConversationIds =
+          hasCompletion || checkpointRuntimeConversationIds != null
+            ? new Set<number>()
+            : undefined
         const sharedSession =
           previousConnection.sharedSession ?? nextConnection.sharedSession
         let dispatchedMessageId: string | null = null
@@ -6862,6 +6915,8 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
                   }
                 )
               )
+        const boundaryRuntimeConversationIds =
+          completionRuntimeConversationIds ?? checkpointRuntimeConversationIds
         if (
           completion?.userMessage &&
           (!sharedSession ||
@@ -6897,16 +6952,32 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           connectionFrame.deliveryIds,
           connectionFrame,
           step.liveMessageIsLive,
-          completionRuntimeConversationIds,
-          rejectedCompletionRuntimeConversationIds
+          boundaryRuntimeConversationIds,
+          rejectedBoundaryRuntimeConversationIds
         )
+
+        if (checkpointRuntimeConversationIds && finalLiveMessage) {
+          const runtimeState = useConversationRuntimeStore.getState()
+          for (const runtimeConversationId of checkpointRuntimeConversationIds) {
+            if (
+              rejectedBoundaryRuntimeConversationIds?.has(runtimeConversationId)
+            ) {
+              continue
+            }
+            const runtime = runtimeState.byConversationId.get(
+              runtimeConversationId
+            )
+            if (runtime?.liveMessage?.id !== finalLiveMessage.id) continue
+            completeLiveTranscriptTurn(runtimeConversationId, finalLiveMessage)
+          }
+        }
 
         if (!completion) continue
         if (!finalLiveMessage) continue
         const runtimeConversationIds = new Set(
           [...(completionRuntimeConversationIds ?? [])].filter(
             (conversationId) =>
-              !rejectedCompletionRuntimeConversationIds?.has(conversationId)
+              !rejectedBoundaryRuntimeConversationIds?.has(conversationId)
           )
         )
         const sinkKeys = [contextKey, ...aliasKeysFor(contextKey)]
