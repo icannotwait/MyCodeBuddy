@@ -2,7 +2,9 @@
 
 ## Status
 
-Proposed on 2026-08-26. The selected direction is a staged migration:
+Proposed on 2026-08-26 and revised on 2026-08-27 after two review rounds. This
+revision addresses the latest two Important findings; status remains Proposed
+pending independent re-review. The selected direction is a staged migration:
 
 1. move complete durable binding evidence out of the model context into an
    opaque local artifact; and
@@ -161,13 +163,17 @@ identity are still admissible. None of these proofs substitutes for another.
    never authorizes an action.
 6. A ticket is parent-scoped, snapshot-scoped, intent-scoped, short-lived, and
    single-use.
-7. Ticket validation and durable run reservation occur under the same existing
-   parent mutation fence. Child startup happens only after reservation.
+7. Ticket validation, required recovery-authorization consumption, and durable
+   run reservation occur under the same existing parent mutation fence. The
+   authorization consume and reserving insert share one database transaction;
+   child startup happens only after gate release.
 8. `dispatch_intent_id` identifies one logical operation and is stable across
    its physical retries. `correlation_id` identifies one physical tool call,
    remains transport-only, and is fresh on every retry.
-9. A matching persisted dispatch intent may return the existing run. The same
-   intent ID with different semantic input fails closed.
+9. A matching persisted dispatch intent may return the existing run only when
+   its durable request fingerprint also matches exactly. The same intent ID
+   with different semantic input, including task or working directory, fails
+   closed.
 10. Ticket admission does not approve Plan/progress semantics and does not
     bypass recovery authorization or budget checks.
 11. Legacy page requests and delegation requests without ticket fields retain
@@ -260,7 +266,9 @@ the partial file and transparently restarts once from page one. A second stale
 result returns the existing typed stale error. There is no unbounded retry.
 
 Cancellation, broker error, serialization error, byte-cap overflow, or process
-shutdown removes any unpublished partial file.
+shutdown removes any unpublished partial file. The companion retains ownership
+after atomic publication until the MCP response is relayed; cancellation in
+that interval deletes the published artifact before suppressing the response.
 
 ### Artifact format
 
@@ -316,6 +324,8 @@ descriptor is never returned before the final file exists. The companion owns
 cleanup:
 
 - delete partial files on every failure and cancellation path;
+- delete a published artifact if cancellation wins before its MCP response is
+  relayed;
 - delete owned artifacts on normal companion shutdown;
 - before a new export, remove artifact files in the fixed Codeg temp root whose
   modification time is more than 10 minutes old; and
@@ -424,6 +434,7 @@ Phase 2 adds an optional `admission_intent` to the same artifact request:
   "admission_intent": {
     "schema_version": 1,
     "dispatch_intent_id": "8f95dd45-9eca-42a8-9909-0ac00be8ad52",
+    "request_fingerprint": "2a44be9d1662a314cbbd2c8111bcf83159be7bdc93abadff977d01447f986648",
     "kind": "continue",
     "work_unit_key": "task|7|implementer|codex|none",
     "agent_type": "codex",
@@ -455,9 +466,150 @@ source run. For an intentionally unbound document work unit,
 `orchestration_binding` is null; key, Agent/profile, and operation identity
 remain bound.
 
-Task prompt and working directory are not duplicated into the intent. They are
-already covered by the existing durable request fingerprint and are not part
-of Plan/progress/durable binding reconciliation.
+`request_fingerprint` is a lowercase 64-hex SHA-256 digest in the exact form
+persisted by the reserving insert. Legacy calls and ticket-v1 calls use
+separate canonical inputs.
+
+#### Legacy fingerprint compatibility
+
+Calls without the ticket pair keep `run_store.rs::request_fingerprint`
+byte-for-byte. The unbound input remains this seven-string array:
+
+```text
+[
+  tool_name,
+  NFC(task),
+  work_unit_key || "",
+  replaces_task_id || "",
+  replacement_reason || "",
+  target_task_id || "",
+  lowercase(launch_route_fingerprint_hex)
+]
+```
+
+The bound input remains the 12-string v2 array:
+
+```text
+[
+  "delegation-request-v2",
+  tool_name,
+  NFC(task),
+  work_unit_key || "",
+  replaces_task_id || "",
+  replacement_reason || "",
+  target_task_id || "",
+  lowercase(launch_route_fingerprint_hex),
+  decimal(binding.schema_version),
+  binding.namespace,
+  decimal(binding.generation),
+  binding.route_fingerprint
+]
+```
+
+Both continue to hash the UTF-8 bytes of the compact JSON string array. Their
+existing Rust golden digests remain compatibility fixtures.
+
+#### Ticket-v1 v3 fingerprint
+
+Ticket-v1 does not call `canonicalize`, `realpath`, `resolve`, `path.normalize`,
+or current-directory lookup while constructing its fingerprint. It hashes one
+fixed 15-string array:
+
+```text
+[
+  "delegation-request-v3",
+  tool_name,
+  NFC(task),
+  normalize_supplied_working_dir(working_dir),
+  work_unit_key || "",
+  replaces_task_id || "",
+  replacement_reason || "",
+  target_task_id || "",
+  agent_type,
+  profile_id || "",
+  dispatch_intent_id,
+  binding ? decimal(binding.schema_version) : "",
+  binding ? binding.namespace : "",
+  binding ? decimal(binding.generation) : "",
+  binding ? binding.route_fingerprint : ""
+]
+```
+
+All entries are strings. Node serializes the array with `JSON.stringify` and
+hashes those exact UTF-8 bytes; Rust serializes the same strings as compact
+JSON and must match the shared vectors. `task` is NFC-normalized but not
+trimmed. Other non-null fields retain their validated wire spelling.
+
+`normalize_supplied_working_dir` is the Node-authoritative expression
+`value.normalize("NFC").trim()`. A null, omitted, or empty value produces
+`""`; it never substitutes the Node process cwd, parent cwd, or child launch
+cwd. For `delegate_to_agent`, the Skill passes the resulting non-empty string
+unchanged as the physical `working_dir` argument, or omits the argument when
+the result is empty. The current `continue_delegation` contract has no cwd
+override, so its v3 slot is always `""`; no continuation cwd field is added.
+
+Launch setup remains independent. After ticket-v1 fingerprint verification,
+the broker may default and canonicalize the workspace for its launch snapshot,
+durable route fingerprint, and child spawn exactly as it does today. Those
+derived path bytes are not ticket-v1 fingerprint inputs. Rust recomputes v3
+from the physical call's preserved pre-default `requested_working_dir` (or
+`""` for continue), before launch canonicalization, and rejects any mismatch
+before child side effects.
+
+Task prompt and working directory are not duplicated into `admission_intent`.
+Only their opaque v3 digest is present; the model never derives the digest from
+artifact contents.
+
+#### Pending-call construction contract
+
+`validate-contract.lib.mjs` owns the pure
+`deriveTicketV1RequestFingerprint(pendingCall)` helper. The Skill invokes it
+through the exact pre-artifact CLI mode
+`validate-contract.mjs --ticket-v1-fingerprint --output-json`. That mode reads
+one UTF-8 pending-call JSON object from stdin, bounded by the existing 2 MiB
+Plan-document cap, and accepts no Plan, progress, evidence, derivation,
+document-admission, or admission flags. The strict object is:
+
+```json
+{
+  "schema_version": 1,
+  "tool_name": "continue_delegation",
+  "task": "Continue the approved implementation",
+  "working_dir": null,
+  "work_unit_key": "task|7|implementer|codex|none",
+  "replaces_task_id": null,
+  "replacement_reason": null,
+  "target_task_id": "6b228a7d-4ac9-4bc7-a16e-f4ecf6f0fd45",
+  "agent_type": "codex",
+  "profile_id": null,
+  "orchestration_binding": {
+    "schema_version": 1,
+    "namespace": "brainstorm-to-delivery",
+    "generation": 2,
+    "route_fingerprint": "sha256:b498416d87bf6ba928bd7ddb5f1a451daf82300584f3d40b606c3c56f169ba7a"
+  },
+  "dispatch_intent_id": "8f95dd45-9eca-42a8-9909-0ac00be8ad52"
+}
+```
+
+Every listed key is required; nullable operation fields use JSON null and
+unknown keys fail. The helper validates the first/continue/replacement matrix.
+Its bounded output is exactly:
+
+```json
+{
+  "schema_version": 1,
+  "request_fingerprint": "2a44be9d1662a314cbbd2c8111bcf83159be7bdc93abadff977d01447f986648",
+  "normalized_working_dir": ""
+}
+```
+
+It never returns task text. The CLI receives the object through stdin rather
+than a command argument or persistent evidence file. The Skill runs this mode
+before the artifact request, copies the digest into
+`admission_intent.request_fingerprint`, and uses the same pending-call values
+for the later physical call. Plan/progress reconciliation remains a separate
+validator step after artifact creation.
 
 ### Ticket issuance
 
@@ -470,6 +622,7 @@ durable rows and stores an in-memory ticket entry containing:
 - namespace, snapshot ID, and snapshot revision;
 - expiry no later than the snapshot expiry;
 - dispatch intent ID;
+- exact request fingerprint;
 - canonical digest of the strict intent object; and
 - unused state.
 
@@ -494,15 +647,19 @@ The artifact result adds:
 
 The complete artifact result remains under the 2,048-byte JSONL limit.
 
-If the same parent and `dispatch_intent_id` already identify a durable row whose
-projected kind, target, key, Agent/profile, binding, and replacement reason
-match the strict intent, the outcome is `already_admitted` with only the
-existing `task_id`; no ticket is issued. The artifact still contains that row,
-so the validator performs the existing lost-acknowledgement adoption before
-the parent takes another action. A different projected durable identity
-returns `delegation_dispatch_intent_conflict` and no artifact or ticket. The
-full request fingerprint, including task and working directory, is compared if
-a physical dispatch reaches the exact replay path.
+If the same parent and `dispatch_intent_id` already identify a durable row, the
+broker requires exact equality of projected kind, target, key, Agent/profile,
+binding, replacement reason, **and the persisted `request_fingerprint`**. Only
+then is the outcome `already_admitted` with the existing `task_id`; no ticket
+is issued. The artifact still contains that row, so the validator performs the
+existing lost-acknowledgement adoption before the parent takes another action.
+
+A fingerprint mismatch on that same intent ID, including one caused by changed
+task or working directory, returns `delegation_dispatch_intent_conflict` with
+no artifact and no ticket. A lost-acknowledgement retry of the same operation
+retains the same fingerprint and still reaches `already_admitted` plus
+validator adoption. Physical dispatch recomputation remains a second line of
+defense; it is not the first place task/cwd divergence can be detected.
 
 ### Progress intent identity
 
@@ -529,9 +686,10 @@ UUID. A ticket-v1 admission requires the latter. The progress marker remains
 `codeg-simple-progress-v1`; this is an additive recovery identity, not a new
 workflow state format.
 
-The parent writes the intent ID to progress before requesting the artifact and
-retains it until the operation is definitively failed or reconciled. It reuses
-that ID only for a retry of the same logical operation.
+The parent writes the intent ID to progress before constructing the pending
+call, then retains the pending-call values and resulting v3 digest until the
+operation is definitively failed or reconciled. It reuses that ID and digest
+only for a retry of the same logical operation.
 
 ### Delegation request contract
 
@@ -547,7 +705,9 @@ that ID only for a retry of the same logical operation.
 Both fields must be present together or absent together. Calls participating
 in ticket-v1 always supply both. Legacy calls supply neither and retain current
 behavior. A ticket-v1 call still supplies a fresh `correlation_id`; the two
-identities are not interchangeable.
+identities are not interchangeable. A ticket-v1 delegate also uses the exact
+non-empty normalized `working_dir` returned by the Node helper, or omits the
+field when the normalized value is empty.
 
 ### Atomic consume sequence
 
@@ -557,32 +717,62 @@ The consume order is:
 physical MCP call
   -> existing correlation validation/claim
   -> parse ticket and dispatch intent
-  -> acquire existing run-store mutation write gate
+  -> broker acquires existing run-store mutation write gate
   -> find and remove one correctly scoped unexpired ticket
-  -> compare parent, incarnation, revision, intent ID, and intent digest
+  -> compare parent, incarnation, revision, intent ID, intent digest,
+     and request fingerprint
   -> check exact durable intent replay/conflict
-  -> execute existing reserving DB transaction
-  -> persist dispatch_intent_id with the run
+  -> for gen-1/replacement, create the provisional child conversation row
+     required by the non-null child_conversation_id FK
+  -> for continuation, retain the existing child conversation
+  -> execute existing reserving DB transaction:
+       validate and consume any required recovery authorization
+       run existing admission/business checks
+       insert the reserving run with dispatch_intent_id
   -> increment parent snapshot revision and invalidate remaining tickets
   -> release gate
-  -> perform existing child spawn/resume and promotion flow
+  -> perform existing child process/session spawn or resume and promotion flow
 ```
 
-Ticket validation occurs before provisional child creation, session spawn or
-resume, recovery-authorization consumption, or recovery-budget charge. The
-reserving row remains the durable admission boundary. The ticket does not hold
-a database transaction open across child startup.
+The broker, not a new policy component, owns the existing write guard from
+ticket burn through successful reserving insert and revision invalidation. The
+run store exposes a gate-aware internal admission entry point so the broker-held
+guard is not reacquired; legacy entry points continue to acquire the same guard
+themselves. Existing transaction-local uniqueness, lineage, binding, writable
+workflow, recovery-authorization validation/consume, and budget rules remain
+in the run store.
+
+`child_conversation_id` remains a non-null foreign key. This is an ownership
+clarification of the current gen-1 sequence: provisional creation moves inside
+the broker-held mutation fence, before the reserving insert, rather than
+changing the database relationship. The ticket does not hold a database
+transaction open across child startup.
 
 A correctly scoped ticket is burned when a consume attempt enters the mutation
 gate, whether the later business check succeeds or fails. Retrying after a
 failure requires a new artifact, validator run, and ticket. This avoids
 ambiguous ticket reuse and keeps recovery simple.
 
-The existing run-store transaction continues to enforce work-unit uniqueness,
-lineage, actual Agent/profile, binding inheritance, replacement authorization,
-continuation and replacement budgets, writable workflow state, and request
-fingerprints. Ticket checks are an additional revision/intent fence, not a
-replacement implementation.
+If provisional creation fails, the transaction does not run and no durable run
+is persisted. If provisional creation succeeds but recovery authorization is
+expired, already consumed, loses its CAS, or any later reserving check/insert
+fails, the database transaction rolls back and persists no run. Before
+releasing the write gate, the broker rolls back the child when transaction
+ownership permits; otherwise it terminalizes/marks it for the existing
+provisional-orphan cleanup path. A cleanup failure retains the existing visible
+failed-provisional behavior, but still persists no delegation run. The burned
+ticket is never restored; every such path requires a fresh artifact and
+ticket, while the unchanged parent snapshot revision may be captured again.
+
+Required recovery authorization is therefore fully consumed before a
+model-visible reserving row can exist. No reserved/claimed authorization state
+is added, and no unauthorized reserving row is exposed for replay adoption.
+Child process/session spawn and resume remain after gate release. Existing
+budget accounting retains its run-store admission/lifecycle boundary; ticket
+checks do not duplicate it. Two concurrent consumers can produce at most one
+reserving row. The winner reserves; the loser receives consumed, stale,
+authorization failure, or exact-replay handling, never a second admitted run
+or provisional child.
 
 ### Durable intent idempotency
 
@@ -594,11 +784,14 @@ Add nullable `dispatch_intent_id` to `delegation_task_runs` with:
 - immutability after insert; and
 - no historical backfill.
 
-The field is included in the existing request fingerprint and reserving insert
-but omitted from legacy binding-page DTOs and user-facing cards. Omitting it
-from the evidence DTO preserves the exact v1 validator format; recovery uses
-the artifact's existing row identity while the broker uses the internal column
-for exact replay classification.
+For ticket-v1 calls, the field is included in the existing request fingerprint
+and reserving insert. The same fingerprint is carried in
+`admission_intent.request_fingerprint`; legacy fingerprint construction is
+unchanged. The intent column and fingerprint remain omitted from legacy
+binding-page DTOs and user-facing cards. Omitting them from the evidence DTO
+preserves the exact v1 validator format; recovery uses the artifact's existing
+row identity while the broker uses the internal columns for exact replay
+classification.
 
 An exact replay returns the existing run through the normal delegation result
 shape and may set bounded structured metadata `idempotent_replay: true`. A
@@ -628,13 +821,18 @@ Parent writes/updates progress intent
 
 ```text
 Parent writes progress intent with intent_id
+  -> Node v3 helper hashes the strict pending call without filesystem reads
+  -> parent copies the digest to admission_intent and retains the pending call
   -> artifact request includes exact admission_intent
   -> broker captures revision R and issues ticket T
   -> companion returns artifact descriptor + T
   -> validator reconciles Plan/progress/artifact R
   -> delegate/continue sends T + same intent_id + fresh correlation_id
-  -> run store consumes T and reserves under revision R
+  -> broker recomputes v3 from the physical call's supplied cwd bytes
+  -> run store consumes required recovery authorization and reserves
+     in one DB transaction under revision R
   -> mutation advances revision to R+1
+  -> gate releases; child process/session spawns or resumes
 ```
 
 ### Phase 2 concurrent mutation
@@ -651,8 +849,8 @@ Artifact/ticket captured at R
 ```text
 Run reserved with dispatch_intent_id D
   -> MCP result is lost
-  -> parent keeps unresolved progress intent D
-  -> next artifact request with D observes existing durable row
+  -> parent keeps unresolved progress intent D, pending call, and v3 digest
+  -> next artifact request with D and that fingerprint observes the durable row
   -> response says already_admitted and artifact contains the row
   -> validator returns the existing exact adoption action
   -> parent updates progress; no second child or budget charge
@@ -683,15 +881,95 @@ cancel an existing child.
 Error precedence for a ticket-v1 dispatch is: input grammar, physical call
 correlation, ticket scope/revision, exact intent replay/conflict, existing
 recovery authorization, existing admission/business rules, then child
-lifecycle. Earlier failure performs none of the later side effects.
+lifecycle. Earlier failure performs none of the later side effects. Once the
+ticket has been burned, an authorization expiry/CAS error retains its existing
+typed authorization code but always returns with no durable run and a consumed
+ticket; retry requires a fresh artifact and ticket.
 
 ## Compatibility and Rollout
 
 ### Phase 0: measurement
 
 Land counters and a deterministic 72-row/session-4123 benchmark fixture before
-changing Skill behavior. Record baseline visible calls and serialized result
-bytes.
+changing Skill behavior. The fixture and counters form a separately runnable
+benchmark target with a frozen baseline of 125 first-page calls, 670
+continuation-page calls, and approximately 2.9 MiB of model-visible binding
+result bytes. Record any baseline revision explicitly rather than silently
+regenerating it from current behavior.
+
+### Grok catalog compaction and phase budgets
+
+The current `GROK_FEATURES` fixture serializes to 7,673 bytes, leaving only 7
+bytes below the literal `7_680` ceiling. Schema additions must not land on that
+shape. Before Phase 1, compact the existing catalog in place while preserving
+tool names, order, feature/role gating, runtime validation, and the exact
+page-mode request/response behavior. No new tool is added.
+
+The compact catalog shape is fixed as follows. These are catalog-only cuts;
+the Rust request DTOs and parsers retain their current strict validation.
+
+- Keep the current descriptions and every phrase asserted by
+  `tool_schema_retains_essential_agent_guidance` for delegate, status/Join,
+  cancel, feedback, ask, session info, parent decision, and reply. Keep the
+  recovery-authorization result guidance.
+- Remove top-level `description` from `register_simple_workflow`,
+  `get_delegation_orchestration_bindings`, `continue_delegation`,
+  `get_workflow_capabilities`, `get_workflow_state`, `recover_workflow`,
+  `publish_workflow_manifest`, and `settle_workflow_gate`. Remove leaf
+  descriptions from delegate `agent_type`/`correlation_id`, continue
+  `correlation_id`, and recovery authorization `proposed_user_reason`; retain
+  delegate `replacement_reason.description` as `""` because the existing
+  recovery contract test reads that node.
+- Remove `$defs.b` from delegate and continue; advertise each
+  `orchestration_binding` property as `{}`. Strict binding grammar remains in
+  the Rust DTO.
+- Collapse these leaves to `{}`: delegate `profile_id`, `profile_label`,
+  `task`, `correlation_id`, `working_dir`, `replaces_task_id`; registration
+  `plan_rel_path`, `progress_rel_path`; binding query `snapshot_id`; continue
+  `task_id`, `task`, `correlation_id`; cancel `task_id`; reply `request_id`,
+  `reply`; workflow state `workflow_id`; recover `workflow_id`,
+  `recovery_authorization_id`; publish `workflow_id`, `plan_target_rel_path`;
+  and settle `workflow_id`, `gate_id`, `recovery_authorization_id`, `summary`.
+- Remove redundant `type` from delegate `agent_type`,
+  `recovery_authorization_id`, `work_unit_key`, `replacement_reason`; binding
+  query `namespace`, `limit`, `cursor`; continue `recovery_authorization_id`,
+  `work_unit_key`; status `wait_ms`, `return_when`; cancel `reason`; session
+  info `max_messages`; all four recovery-authorization properties; workflow
+  state `detail`; recover `expected_manifest_revision`, `correlation_id`;
+  publish `schema_version`, `expected_manifest_revision`,
+  `risk_policy_version`, `task_policies`; and settle
+  `expected_graph_revision`, `expected_review_round`, `expected_gate_cycle`,
+  `expected_outcome`. Remove `inputSchema.type` from
+  `get_workflow_capabilities`. The remaining enum, pattern, const, minimum,
+  maximum, default, and `maxLength` keywords stay.
+- Phase 2 uses one compact local UUID `$defs` entry in each delegation tool for
+  `dispatch_intent_id` and `admission_ticket`, with `dependentRequired` in both
+  directions. The binding tool adds one compact strict `admission_intent`,
+  including `request_fingerprint`, and one local strict binding definition.
+  Operation-specific nullable combinations remain parser-enforced.
+
+All existing tool names, order, `required` arrays, root
+`additionalProperties`, feature/role gating, and runtime error behavior remain
+unchanged. Page-mode request and response bytes do not depend on these catalog
+description/schema-leaf reductions and remain byte-for-byte compatible.
+
+Measured with the current Grok tool order and exact JSON-RPC wrapper, this
+shape is 5,393 bytes before additions, 5,433 bytes with Phase 1 `delivery`, and
+7,211 bytes with the complete Phase 2 intent and ticket pair. Release gates use
+slightly wider hard budgets so implementation details are not forced to match
+one property order:
+
+| Catalog gate | Maximum JSONL bytes | Required remainder below 7680 |
+| --- | ---: | ---: |
+| Phase 1: compact catalog plus `delivery` only | 5,500 | 2,180 |
+| Phase 2: Phase 1 plus intent and both ticket pairs | 7,300 | 380 |
+
+The existing test retains the Rust literal `7_680` and the user-facing message
+`7680 bytes`; phase-specific assertions add the 5,500 and 7,300 caps. If a
+phase cannot meet both its phase cap and the absolute 7,680-byte ceiling, that
+phase fails closed and is not advertised or released. The remedy is further
+catalog compaction, never truncation, removing a required tool, raising the
+literal, adding a second tool, or changing page mode.
 
 ### Phase 1: artifact preferred
 
@@ -709,6 +987,8 @@ incident even if Phase 2 is delayed.
 
 - Add `admission_intent`, ticket state, delegation ticket fields, and the
   nullable durable dispatch intent column.
+- Add the Node-owned pending-call preflight and cross-runtime v3 fingerprint;
+  legacy unbound/v2 fingerprint bytes remain unchanged.
 - Update Skill and validator so every new logical action has an intent ID and
   every ticket-capable action uses the ticket pair.
 - Requests without `dispatch_intent_id` remain legacy-compatible.
@@ -783,11 +1063,13 @@ measure them.
   cleans both attempts.
 - Cancellation, broker failure, serialization failure, and shutdown remove
   partial files.
+- Cancellation after atomic publication but before response relay deletes the
+  published artifact.
 - Cleanup resolves and verifies the fixed temp root before deleting stale
   files.
 - Root/coordination feature gates and parent-token isolation remain exact.
-- Grok's complete `tools/list` JSONL line remains at or below 7,680 bytes after
-  the schema extension.
+- Grok's complete Phase 1 `tools/list` JSONL line is at most 5,500 bytes and
+  retains at least 2,180 bytes below the absolute 7,680-byte ceiling.
 
 ### Validator and Skill tests
 
@@ -804,27 +1086,57 @@ measure them.
 - Skill mutation fixtures reject silent page fallback after an artifact error.
 - Existing Plan/progress/durable reconciliation and lost-ACK fixtures produce
   the same decisions from artifact bytes as from manually assembled evidence.
+- The pre-artifact fingerprint mode accepts only bounded stdin plus
+  `--ticket-v1-fingerprint --output-json`, rejects missing/extra/wrongly typed
+  pending-call fields, and never emits task text.
+- Shared Node/Rust golden fixtures retain the current unbound seven-string and
+  bound v2 legacy digests, then add ticket-v1 vectors for composed/decomposed
+  NFC task text, every omitted/null slot, unbound and bound requests, JSON cwd
+  values `"D:\\repo"` versus `"D:/repo"` as distinct supplied strings,
+  surrounding cwd whitespace trimming, and `dispatch_intent_id` changes.
 
 ### Phase 2 Rust tests
 
 - Ticket claims are exact for parent, connection incarnation, namespace,
-  snapshot, revision, expiry, intent ID, and intent digest.
+  snapshot, revision, expiry, intent ID, request fingerprint, and intent digest.
 - Any parent mutation between issue and consume makes the ticket stale.
 - Expiry, restart, wrong parent, wrong intent, partial ticket fields, reuse,
   and concurrent consume fail without child side effects.
 - Exactly one of two concurrent consumers reserves a new run; the other
-  obtains exact replay or a consumed result and never creates a second admitted
-  run.
-- Ticket validation occurs before provisional child creation, resume,
-  recovery-authorization consumption, and budget charge.
+  obtains consumed, stale, or exact-replay handling and never creates a second
+  admitted run or provisional child.
+- The broker holds the mutation write gate across ticket burn, provisional
+  child creation where required, reserving insert, and revision invalidation.
+- Provisional creation failure and reserving-insert failure persist no durable
+  run; an allocated child is rolled back or enters the existing provisional
+  cleanup path, and the ticket cannot be reused.
+- Rust v3 recomputation uses the physical request's pre-default supplied
+  `working_dir`, never canonicalized launch workspace bytes; omitted/empty is
+  `""`, and Windows slash variants remain distinct.
+- Ticket validation occurs before provisional child creation. Required
+  recovery authorization is consumed in the same reserving DB transaction;
+  spawn and resume occur after gate release.
+- Authorization expiry, prior consumption, or CAS loss rolls back the
+  reserving insert, persists no run, cleans the provisional child, leaves the
+  ticket burned, and requires a fresh artifact/ticket.
+- No recovery-authorization reserved/claimed state is added and no
+  unauthorized reserving row can appear in binding evidence or replay lookup.
+- `child_conversation_id` remains non-null; no migration weakens its foreign
+  key contract.
 - The durable partial unique index rejects duplicate parent/intent pairs.
 - The intent column is immutable and historical rows remain null.
 - Same intent plus same request fingerprint returns the existing run; any
   semantic change returns `delegation_dispatch_intent_conflict`.
+- An artifact-time retry with the same intent ID but changed task or working
+  directory returns `delegation_dispatch_intent_conflict` with no artifact or
+  ticket; it cannot reach validator adoption.
 - A lost result followed by a fresh physical call uses the same intent ID and
   a fresh correlation ID, then converges through existing adoption.
 - Existing parent-tool idempotency, correlation, continuation, replacement,
   recovery authorization, and provisional cleanup tests remain green.
+- Grok's complete Phase 2 `tools/list` JSONL line is at most 7,300 bytes,
+  retaining at least 380 bytes below the absolute 7,680-byte ceiling while all
+  essential-guidance assertions remain green.
 
 ### Integration and benchmark tests
 
@@ -840,6 +1152,8 @@ measure them.
   as stale by ticket-v1 before reservation.
 - An intentionally lost dispatch response creates one durable run and one
   child lineage, then adopts it without a second budget charge.
+- The Node and Rust implementations produce byte-identical v3 arrays and
+  digests from every shared golden vector without reading the filesystem.
 
 ## Acceptance Criteria
 
@@ -857,13 +1171,21 @@ measure them.
 7. Phase 2 rejects every revision mutation between snapshot capture and run
    reservation for ticket-v1 calls.
 8. The same logical dispatch intent cannot admit two runs; exact replay returns
-   the existing run and changed semantics fail closed.
-9. Existing correlation, recovery authorization, lineage, budget, and binding
-   rules remain authoritative and tested.
-10. Plan/progress semantic authority remains in the Node validator; Codeg does
+   the existing run only on exact request-fingerprint equality, while changed
+   task, working directory, or other semantics fail closed before artifact or
+   ticket issuance.
+9. Node and Rust produce the same ticket-v1 v3 digest from the strict pending
+   call without path resolution, while legacy unbound and v2 digest bytes stay
+   unchanged.
+10. Required recovery authorization is consumed atomically with the reserving
+   insert under the broker-held gate; authorization failure exposes no run and
+   requires a fresh artifact/ticket.
+11. Existing correlation, recovery authorization, lineage, budget, and binding
+    rules remain authoritative and tested.
+12. Plan/progress semantic authority remains in the Node validator; Codeg does
     not parse them for ticket admission.
-11. No frontend or user-visible card change is required.
-12. Temporary evidence is removed on normal paths and is unusable after its
+13. No frontend or user-visible card change is required.
+14. Temporary evidence is removed on normal paths and is unusable after its
     snapshot expires.
 
 ## File Ownership
@@ -899,21 +1221,33 @@ measure them.
 - `src-tauri/src/acp/delegation/companion.rs` and `tool_schema.json`: intent
   input, ticket output, and delegation ticket pair.
 - `src-tauri/src/acp/delegation/transport.rs` and `listener.rs`: broker wire
-  fields and parent/role authorization.
+  fields, parent/role authorization, and preservation of the caller-supplied
+  pre-default working-directory string for v3 recomputation.
 - `src-tauri/src/acp/delegation/broker.rs`: pre-side-effect ticket handoff and
-  exact replay result.
-- `src-tauri/src/acp/delegation/run_store.rs`: atomic ticket consume, intent
-  fingerprinting, unique replay classification, and reserving persistence.
-- `src-tauri/src/db/entities/delegation_task_run.rs`: nullable intent column.
-- A new additive migration: nullable column, partial unique index, validation,
-  and immutability protection without backfill.
+  exact replay result, plus ownership of the mutation guard across ticket burn,
+  provisional child creation, and reserving admission.
+- `src-tauri/src/acp/delegation/run_store.rs`: gate-aware internal reserving
+  admission, legacy-compatible fingerprinting, ticket-v1 v3 fingerprinting,
+  unique replay classification, transaction-local recovery-authorization
+  consume, and durable persistence without reacquiring the broker-held guard.
+- `src-tauri/src/db/entities/delegation_task_run.rs`: nullable dispatch-intent
+  column; the existing non-null child conversation FK is unchanged.
+- A new additive migration: nullable dispatch-intent column, partial unique
+  index, validation, and immutability protection without backfill. It does not
+  alter `child_conversation_id` nullability.
 
 ### Phase 2 Skill package
 
 - Skill write-ahead intent UUID and ticket-required flow.
-- Validator dual exact dispatch-intent shapes and ticket-v1 requirements.
+- `scripts/validate-contract.mjs`: bounded-stdin
+  `--ticket-v1-fingerprint --output-json` pre-artifact mode.
+- `scripts/validate-contract.lib.mjs`: strict pending-call parser and the
+  authoritative `deriveTicketV1RequestFingerprint` helper.
+- Validator dual exact dispatch-intent shapes and ticket-v1 requirements;
+  Plan/progress semantic reconciliation remains unchanged.
+- Shared Node/Rust legacy and v3 golden-vector fixture.
 - Lost-acknowledgement fixtures that distinguish stable intent ID from fresh
-  physical correlation ID.
+  physical correlation ID and retain the exact pending-call digest.
 
 ## Risks and Mitigations
 
@@ -922,13 +1256,15 @@ measure them.
 | Artifact mode merely moves data to a file the model later reads | Skill contract and mutation tests prohibit inspection; validator output stays bounded |
 | ACP CLI and companion do not share a filesystem | Advertise artifact mode only for same-host companion launches; fail closed otherwise |
 | Temp evidence survives a crash | 60-second semantic expiry, private directory, normal cleanup, and 10-minute stale sweep |
-| Tool schema growth breaks Grok framing | Extend one existing tool, keep descriptions compact, and retain the literal 7,680-byte catalog test |
+| Tool schema growth breaks Grok framing | Compact before adding fields; enforce Phase 1 at 5,500 bytes, Phase 2 at 7,300, and retain the literal 7,680-byte absolute test |
 | Validator takes longer than snapshot/ticket TTL | Return typed stale, discard result, and repeat one fresh artifact/validation cycle |
 | Ticket becomes a second policy engine | Ticket validates only revision and durable identity; Node remains semantic authority |
 | Old Skill still causes context growth | Legacy support is intentional; new Skill uses artifact mode whenever advertised and telemetry exposes legacy use |
 | Process restart invalidates a valid-looking file | Snapshot expiry plus missing in-process ticket forces fresh validation; startup files are never trusted by path alone |
 | New intent identity conflicts with correlation ID | Separate field names, persistence rules, retry rules, and regression tests |
 | Ticket validation is placed after child side effects | Explicit error precedence and pre-side-effect integration tests |
+| Node and Rust hash different path bytes | V3 hashes the supplied NFC/trimmed string, never an OS-resolved path, and both runtimes consume one golden-vector fixture |
+| Authorization expires after an unauthorized run is reserved | Authorization consume and reserving insert share one guarded DB transaction; failure rolls back the run and cleans the provisional child |
 
 ## Deliberate Simplifications
 
