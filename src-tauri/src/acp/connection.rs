@@ -17542,6 +17542,18 @@ mod tests {
         assert_eq!(state.active_turn_generation, None);
         assert!(!state.turn_in_flight);
         let events = state.recent_events_after(0).expect("contiguous events");
+        let connected_count = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.payload,
+                    AcpEvent::StatusChanged {
+                        status: ConnectionStatus::Connected
+                    }
+                )
+            })
+            .count();
+        assert_eq!(connected_count, 1, "suspension restores connected once");
         assert!(events
             .iter()
             .all(|event| !matches!(event.payload, AcpEvent::TurnComplete { .. })));
