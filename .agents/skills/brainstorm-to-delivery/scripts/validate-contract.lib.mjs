@@ -155,6 +155,11 @@ const REQUIRED_SKILL_CONTRACT = {
     design_fixer: "independent_codex",
     plan_author: "independent_codex",
     plan_reviewer: "independent_codex",
+    design_plan_review: {
+      skill: "ponytail:ponytail-review",
+      execution: "supplemental_same_work_unit_after_normal_review",
+      rereview: "repeat_both_passes",
+    },
     producer_reviewer_independence: true,
     plan_rereview: "full_latest_plan",
     user_named_reviewers: "design_and_plan_only",

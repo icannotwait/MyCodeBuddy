@@ -50,6 +50,7 @@ Keep the parent focused on coordination, adjudication, progress, and delivery.
     "design_fixer": "independent_codex",
     "plan_author": "independent_codex",
     "plan_reviewer": "independent_codex",
+    "design_plan_review": { "skill": "ponytail:ponytail-review", "execution": "supplemental_same_work_unit_after_normal_review", "rereview": "repeat_both_passes" },
     "producer_reviewer_independence": true,
     "plan_rereview": "full_latest_plan",
     "user_named_reviewers": "design_and_plan_only",
@@ -159,8 +160,7 @@ admitted route.
 ## 3. Review and revise Design
 Trigger Design review when the Brainstorm spans modules, migration,
 concurrency, security, persistence, externally visible compatibility, or
-material ambiguity. Always dispatch an independent Codex Design Reviewer when
-any trigger is present. Dispatch every user-named Design Reviewer as an
+material ambiguity. Always dispatch an independent Codex Design Reviewer when any trigger is present. In that same work unit, **REQUIRED SUB-SKILL:** Use `ponytail:ponytail-review` after the normal architecture and correctness review; it supplements rather than replaces that review. Dispatch every user-named Design Reviewer as an
 additional separate document-only work unit. Use
 design|DESIGN_PATH|reviewer|AGENT|PROFILE for each reviewer. Dispatch an
 independent Codex Design Fixer on design|DESIGN_PATH|fixer|codex|none. Record
@@ -170,7 +170,7 @@ admission only before a routed Plan and synchronized progress exist. Use
 full admission for every later Design decision. Any intervening delegation
 action invalidates the prior snapshot. These document runs stay unbound.
 Adjudicate findings against current artifacts. Continue the same Design Fixer
-for revisions and continue each separate reviewer for re-review. Request a
+for revisions and continue each separate reviewer for re-review; rerun both normal and `ponytail:ponytail-review` passes in the independent Codex review. Request a
 user decision for requirement, scope, architecture, or user-data changes.
 Require covering Design reviews to approve the same latest Design.
 
@@ -244,11 +244,10 @@ bounded unfenced codeg-b2d-routing-v1 JSON block.
 Run Plan-only derivation twice: Author, then parent. Initialize route fields
 only from the parent's exact rerun. Run combined static validation, then the
 complete-snapshot procedure for full admission. Dispatch an independent
-Codex Plan Reviewer on plan|PLAN_PATH|reviewer|codex|none plus any user-named
-Plan reviewers. Review the complete latest Plan rather than a diff.
+Codex Plan Reviewer on plan|PLAN_PATH|reviewer|codex|none plus any user-named Plan reviewers. In that same Codex work unit, **REQUIRED SUB-SKILL:** Use `ponytail:ponytail-review` after the normal completeness, ordering, risk, and testability review; it supplements rather than replaces that review. Review the complete latest Plan rather than a diff.
 
 Before every later Author or reviewer continuation, run the procedure for
-fresh full admission against synchronized Plan and progress. Route
+fresh full admission against synchronized Plan and progress; rerun both normal and `ponytail:ponytail-review` passes for every Codex Plan re-review. Route
 accepted findings to the same Plan Author. After approval, call
 register_simple_workflow. These document runs stay unbound.
 

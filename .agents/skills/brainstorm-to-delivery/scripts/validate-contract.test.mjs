@@ -333,6 +333,11 @@ const SKILL_CONTRACT = {
     design_fixer: "independent_codex",
     plan_author: "independent_codex",
     plan_reviewer: "independent_codex",
+    design_plan_review: {
+      skill: "ponytail:ponytail-review",
+      execution: "supplemental_same_work_unit_after_normal_review",
+      rereview: "repeat_both_passes",
+    },
     producer_reviewer_independence: true,
     plan_rereview: "full_latest_plan",
     user_named_reviewers: "design_and_plan_only",
@@ -424,10 +429,10 @@ schema does not advertise artifact delivery.
 Inspect discovery and choose the invocation selection. Record an omitted selection as Grok and block invalid identities.
 
 ## 3. Review and revise Design
-Dispatch a conditional independent Codex Design Reviewer. Continue a separate Codex Design Fixer for every revision.
+Dispatch a conditional independent Codex Design Reviewer. In that work unit, use ponytail:ponytail-review after the normal review. Continue a separate Codex Design Fixer for every revision.
 
 ## 4. Author and review Plan
-Create progress first. Dispatch an independent Codex Plan Author with writing-plans, validate routing, and use a separate Codex Plan Reviewer for full latest Plan review before registration.
+Create progress first. Dispatch an independent Codex Plan Author with writing-plans, validate routing, and use a separate Codex Plan Reviewer with ponytail:ponytail-review for full latest Plan review before registration.
 
 ## 5. Maintain progress
 Record reserving intent, delegation, admission, and observed state in order. Keep route metadata.
