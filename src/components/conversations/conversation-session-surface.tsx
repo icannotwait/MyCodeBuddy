@@ -1108,11 +1108,12 @@ export const ConversationSessionSurface = memo(
     // The connection dispatch invokes these sinks synchronously whenever liveMessage
     // changes (streaming deltas, tool updates, the prompt-start reset), so the
     // streaming content flows straight to the runtime / transcript stores WITHOUT
-    // this keep-alive panel re-rendering per token. Canonical writes non-null values
-    // with isLive = (status === "prompting"), which tells the runtime reducer to
-    // bypass its stale-reconnect-replay guard. Turn-end clearing is owned by
-    // COMPLETE_TURN; unmount clearing by removeConversation. `tabId` is the
-    // connection contextKey.
+    // this keep-alive panel re-rendering per token. Canonical writes non-null
+    // values with the frame-provided `isLive` bit (prompting, or `true` at a
+    // suspension checkpoint even when status is already `connected`). That
+    // tells the runtime reducer to bypass its stale-reconnect-replay guard.
+    // Turn-end clearing is owned by COMPLETE_TURN; unmount clearing by
+    // removeConversation. `tabId` is the connection contextKey.
     const connectionIdForSink = conn.connectionId
     useEffect(() => {
       const conversationId = effectiveConversationId

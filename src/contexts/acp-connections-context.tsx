@@ -5150,6 +5150,42 @@ function admitSuspensionCheckpoint(snapshot: ConnectionState): number[] {
   return owners
 }
 
+function liveMessageText(message: LiveMessage): string {
+  let text = ""
+  for (const block of message.content) {
+    if (block.type === "text") text += block.text
+  }
+  return text
+}
+
+function messageTurnText(turn: MessageTurn): string {
+  let text = ""
+  for (const block of turn.blocks) {
+    if (block.type === "text") text += block.text
+  }
+  return text
+}
+
+function liveStageAlreadyInRuntime(
+  runtime: {
+    localTurns: MessageTurn[]
+    detail: { turns: MessageTurn[] } | null
+  },
+  runtimeConversationId: number,
+  liveMessage: LiveMessage
+): boolean {
+  const liveTurnId = `live-${runtimeConversationId}-${liveMessage.id}`
+  const turns = runtime.detail
+    ? [...runtime.localTurns, ...runtime.detail.turns]
+    : runtime.localTurns
+  if (turns.some((turn) => turn.id === liveTurnId)) return true
+  const liveText = liveMessageText(liveMessage)
+  if (liveText.length === 0) return false
+  return turns.some(
+    (turn) => turn.role === "assistant" && messageTurnText(turn) === liveText
+  )
+}
+
 function hasAuthoritativeTerminalDelivery(
   frame: AcceptedConnectionFrame,
   terminalSeq: number
@@ -6526,6 +6562,11 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         hasTurnComplete || boundaryRuntimeConversationIds !== undefined
       let canonicalAccepted = true
 
+      // A terminal or checkpoint frame can leave the canonical object
+      // unchanged while transcript.publish still marks it completing.
+      // Re-acknowledge that object so an earlier stale-replay rejection
+      // cannot be bypassed by either turn_complete or a suspension
+      // checkpoint.
       if (liveChanged || hasTranscriptBoundary) {
         streamingPerfRecorder.setCurrentDeliveryIds(deliveryIds)
         try {
@@ -6970,6 +7011,18 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
               runtimeConversationId
             )
             if (runtime?.liveMessage?.id !== finalLiveMessage.id) continue
+            if (
+              liveStageAlreadyInRuntime(
+                runtime,
+                runtimeConversationId,
+                finalLiveMessage
+              )
+            ) {
+              useConversationRuntimeStore
+                .getState()
+                .actions.setLiveMessage(runtimeConversationId, null, true)
+              continue
+            }
             completeLiveTranscriptTurn(runtimeConversationId, finalLiveMessage)
           }
         }

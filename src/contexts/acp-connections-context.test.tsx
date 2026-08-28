@@ -9474,6 +9474,9 @@ describe("AcpConnectionsProvider frame transactions (raw order)", () => {
           status: "connected",
           acceptedCompletionMessageId: null,
           acceptedCompletionRuntimeConversationIds: null,
+          sessionFailures: [],
+          pendingQuestion: null,
+          pendingAskQuestion: null,
         })
         expect(h.sendSystemNotification).not.toHaveBeenCalled()
 
@@ -9795,8 +9798,164 @@ describe("AcpConnectionsProvider frame transactions (raw order)", () => {
           .byConversationId.get(42)
         expect(runtime?.liveMessage).toBeNull()
         expect(runtime?.localTurns).toEqual([])
+        expect(runtime?.syncState).toBe("awaiting_persist")
         expect(runtime?.optimisticTurns.map((turn) => turn.id)).toEqual([
           "user-in-flight",
+        ])
+        expect(h.store!.getConnection(TAB)).toMatchObject({
+          acceptedCompletionMessageId: null,
+          acceptedCompletionRuntimeConversationIds: null,
+        })
+      } finally {
+        resetConversationRuntimeStore()
+      }
+    })
+
+    it("promotes an awaiting_persist owner after canonical installs the checkpoint", async () => {
+      const { useConversationRuntimeStore, resetConversationRuntimeStore } =
+        await import("@/stores/conversation-runtime-store")
+      resetConversationRuntimeStore()
+      const runtimeActions = useConversationRuntimeStore.getState().actions
+      runtimeActions.setExternalId(42, "sess-1")
+      runtimeActions.appendOptimisticTurn(
+        42,
+        {
+          id: "user-awaiting",
+          role: "user",
+          blocks: [{ type: "text", text: "owner prompt" }],
+          timestamp: "2026-08-25T07:31:49.000Z",
+        },
+        "turn-awaiting"
+      )
+      expect(
+        useConversationRuntimeStore.getState().byConversationId.get(42)
+          ?.syncState
+      ).toBe("awaiting_persist")
+
+      try {
+        await mountDesktopOwner("owner-conn", TAB, "sess-1", 42)
+        h.actions!.registerLiveSinks(TAB, {
+          runtimeConversationId: 42,
+          canonical: (message, isLive) => {
+            runtimeActions.setLiveMessage(42, message, isLive)
+            return (
+              useConversationRuntimeStore.getState().byConversationId.get(42)
+                ?.liveMessage === message
+            )
+          },
+        })
+        act(() => {
+          h.emitDesktopBatch(
+            batch(1, [
+              {
+                connection_id: "owner-conn",
+                seq: 1,
+                type: "session_started",
+                session_id: "sess-1",
+              },
+              status("owner-conn", 2, "prompting"),
+              content("owner-conn", 3, "stage A"),
+              status("owner-conn", 4, "connected"),
+            ])
+          )
+          h.runAnimationFrame()
+        })
+
+        const runtime = useConversationRuntimeStore
+          .getState()
+          .byConversationId.get(42)
+        expect(runtime?.liveMessage).toBeNull()
+        expect(
+          runtime?.localTurns.map((turn) => ({
+            role: turn.role,
+            blocks: turn.blocks,
+          }))
+        ).toEqual([
+          {
+            role: "user",
+            blocks: [{ type: "text", text: "owner prompt" }],
+          },
+          {
+            role: "assistant",
+            blocks: [{ type: "text", text: "stage A" }],
+          },
+        ])
+        expect(h.store!.getConnection(TAB)).toMatchObject({
+          acceptedCompletionMessageId: null,
+          acceptedCompletionRuntimeConversationIds: null,
+        })
+      } finally {
+        resetConversationRuntimeStore()
+      }
+    })
+
+    it("does not duplicate a checkpointed stage when Web replay redelivers the boundary", async () => {
+      const { useConversationRuntimeStore, resetConversationRuntimeStore } =
+        await import("@/stores/conversation-runtime-store")
+      resetConversationRuntimeStore()
+      const runtimeActions = useConversationRuntimeStore.getState().actions
+      runtimeActions.setExternalId(42, "sess-1")
+      const settled: LiveMessage = {
+        id: "settled-checkpoint-replay",
+        role: "assistant",
+        content: [{ type: "text", text: "already persisted" }],
+        startedAt: 1_700_000_000_000,
+      }
+      runtimeActions.setLiveMessage(42, settled, true)
+      runtimeActions.completeTurn(42, settled)
+      const originalAssistantId = useConversationRuntimeStore
+        .getState()
+        .byConversationId.get(42)
+        ?.localTurns.find((turn) => turn.role === "assistant")?.id
+
+      try {
+        h.isDesktop = false
+        await mountProvider()
+        await act(async () => {
+          await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1", 42)
+        })
+        h.actions!.registerLiveSinks(TAB, {
+          runtimeConversationId: 42,
+          canonical: (message, isLive) => {
+            runtimeActions.setLiveMessage(42, message, isLive)
+            return (
+              useConversationRuntimeStore.getState().byConversationId.get(42)
+                ?.liveMessage === message
+            )
+          },
+        })
+        const handlers = latestAttachHandlers()
+        act(() => {
+          handlers.onReplay(
+            [
+              {
+                connection_id: "conn",
+                seq: 1,
+                type: "session_started",
+                session_id: "sess-1",
+              },
+              status("conn", 2, "prompting"),
+              content("conn", 3, "already persisted"),
+              status("conn", 4, "connected"),
+            ],
+            4,
+            0
+          )
+        })
+
+        const runtime = useConversationRuntimeStore
+          .getState()
+          .byConversationId.get(42)
+        expect(runtime?.liveMessage).toBeNull()
+        expect(
+          runtime?.localTurns
+            .filter((turn) => turn.role === "assistant")
+            .map((turn) => ({ id: turn.id, blocks: turn.blocks }))
+        ).toEqual([
+          {
+            id: originalAssistantId,
+            blocks: [{ type: "text", text: "already persisted" }],
+          },
         ])
       } finally {
         resetConversationRuntimeStore()
