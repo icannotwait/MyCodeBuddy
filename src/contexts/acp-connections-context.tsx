@@ -821,6 +821,7 @@ type Action =
       type: "STATUS_CHANGED"
       contextKey: string
       status: ConnectionStatus
+      eventSeq?: number
     }
   | {
       type: "PENDING_USER_MESSAGE_CHANGED"
@@ -2702,7 +2703,10 @@ function reduceSingleAction(
         updated.acceptedCompletionMessageId = null
         updated.acceptedCompletionRuntimeConversationIds = null
         updated.liveMessage = {
-          id: randomUUID(),
+          id:
+            action.eventSeq == null
+              ? randomUUID()
+              : `acp:${conn.connectionId}:${action.eventSeq}`,
           role: "assistant",
           content: [],
           startedAt: Date.now(),
@@ -4296,7 +4300,12 @@ function prepareMappedEnvelope(
       actions.push({ type: "SHARED_SESSION_EVENT", contextKey, event: e })
       break
     case "status_changed":
-      actions.push({ type: "STATUS_CHANGED", contextKey, status: e.status })
+      actions.push({
+        type: "STATUS_CHANGED",
+        contextKey,
+        status: e.status,
+        eventSeq: e.seq,
+      })
       break
     case "content_delta":
       if (!e.parent_tool_use_id && snapshot.generationClockStartedAt == null) {
@@ -5150,22 +5159,6 @@ function admitSuspensionCheckpoint(snapshot: ConnectionState): number[] {
   return owners
 }
 
-function liveMessageText(message: LiveMessage): string {
-  let text = ""
-  for (const block of message.content) {
-    if (block.type === "text") text += block.text
-  }
-  return text
-}
-
-function messageTurnText(turn: MessageTurn): string {
-  let text = ""
-  for (const block of turn.blocks) {
-    if (block.type === "text") text += block.text
-  }
-  return text
-}
-
 function liveStageAlreadyInRuntime(
   runtime: {
     localTurns: MessageTurn[]
@@ -5178,12 +5171,7 @@ function liveStageAlreadyInRuntime(
   const turns = runtime.detail
     ? [...runtime.localTurns, ...runtime.detail.turns]
     : runtime.localTurns
-  if (turns.some((turn) => turn.id === liveTurnId)) return true
-  const liveText = liveMessageText(liveMessage)
-  if (liveText.length === 0) return false
-  return turns.some(
-    (turn) => turn.role === "assistant" && messageTurnText(turn) === liveText
-  )
+  return turns.some((turn) => turn.id === liveTurnId)
 }
 
 function hasAuthoritativeTerminalDelivery(
@@ -6864,9 +6852,23 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         const sharedSession =
           previousConnection.sharedSession ?? nextConnection.sharedSession
         let dispatchedMessageId: string | null = null
-        if (sharedSession) {
+        let checkpointUserMessage =
+          checkpointRuntimeConversationIds == null
+            ? null
+            : previousConnection.pendingUserMessage
+        if (sharedSession || checkpointRuntimeConversationIds) {
           for (const event of connectionFrame.applyEvents) {
             if (
+              checkpointRuntimeConversationIds &&
+              event.type === "user_message"
+            ) {
+              checkpointUserMessage = {
+                messageId: event.message_id,
+                blocks: event.blocks,
+              }
+            }
+            if (
+              sharedSession &&
               event.type === "prompt_dispatch_started" &&
               event.generation === sharedSession.generation
             ) {
@@ -6988,6 +6990,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           }
         }
 
+        const sinkKeys = [contextKey, ...aliasKeysFor(contextKey)]
         mirrorLiveMessageForCanonical(
           contextKey,
           previousConnection,
@@ -7000,6 +7003,18 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         )
 
         if (checkpointRuntimeConversationIds && finalLiveMessage) {
+          const checkpointUserTurn =
+            checkpointUserMessage &&
+            (!sharedSession ||
+              checkpointUserMessage.messageId ===
+                (dispatchedMessageId ??
+                  sharedSession.activeTurn?.clientMessageId ??
+                  null))
+              ? buildUserTurnFromMessageBlocks(
+                  checkpointUserMessage.messageId,
+                  checkpointUserMessage.blocks
+                )
+              : null
           const runtimeState = useConversationRuntimeStore.getState()
           for (const runtimeConversationId of checkpointRuntimeConversationIds) {
             if (
@@ -7018,10 +7033,22 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
                 finalLiveMessage
               )
             ) {
+              for (const key of sinkKeys) {
+                const sinks = liveSinksRef.current.get(key)
+                if (sinks?.runtimeConversationId === runtimeConversationId) {
+                  sinks.transcript?.clear(finalLiveMessage.id)
+                }
+              }
               useConversationRuntimeStore
                 .getState()
                 .actions.setLiveMessage(runtimeConversationId, null, true)
               continue
+            }
+            if (checkpointUserTurn) {
+              runtimeState.actions.appendViewerUserTurn(
+                runtimeConversationId,
+                checkpointUserTurn
+              )
             }
             completeLiveTranscriptTurn(runtimeConversationId, finalLiveMessage)
           }
@@ -7035,7 +7062,6 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
               !rejectedBoundaryRuntimeConversationIds?.has(conversationId)
           )
         )
-        const sinkKeys = [contextKey, ...aliasKeysFor(contextKey)]
         const hasRegisteredLiveSink = sinkKeys.some((key) =>
           liveSinksRef.current.has(key)
         )

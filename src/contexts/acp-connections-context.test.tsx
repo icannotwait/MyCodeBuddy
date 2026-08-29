@@ -9512,6 +9512,62 @@ describe("AcpConnectionsProvider frame transactions (raw order)", () => {
       }
     })
 
+    it("preserves distinct live checkpoints with identical assistant text", async () => {
+      const { useConversationRuntimeStore, resetConversationRuntimeStore } =
+        await import("@/stores/conversation-runtime-store")
+      resetConversationRuntimeStore()
+      const runtimeActions = useConversationRuntimeStore.getState().actions
+      runtimeActions.setExternalId(42, "sess-1")
+
+      try {
+        await mountDesktopOwner("owner-conn", TAB, "sess-1", 42)
+        h.actions!.registerLiveSinks(TAB, {
+          runtimeConversationId: 42,
+          canonical: (message, isLive) => {
+            runtimeActions.setLiveMessage(42, message, isLive)
+            return (
+              useConversationRuntimeStore.getState().byConversationId.get(42)
+                ?.liveMessage === message
+            )
+          },
+        })
+
+        act(() => {
+          h.emitDesktopBatch(
+            batch(1, [
+              {
+                connection_id: "owner-conn",
+                seq: 1,
+                type: "session_started",
+                session_id: "sess-1",
+              },
+              status("owner-conn", 2, "prompting"),
+              content("owner-conn", 3, "same reply"),
+              status("owner-conn", 4, "connected"),
+              status("owner-conn", 5, "prompting"),
+              content("owner-conn", 6, "same reply"),
+              status("owner-conn", 7, "connected"),
+            ])
+          )
+          h.runAnimationFrame()
+        })
+
+        const runtime = useConversationRuntimeStore
+          .getState()
+          .byConversationId.get(42)
+        const assistantTurns =
+          runtime?.localTurns.filter((turn) => turn.role === "assistant") ?? []
+        expect(assistantTurns.map((turn) => turn.blocks)).toEqual([
+          [{ type: "text", text: "same reply" }],
+          [{ type: "text", text: "same reply" }],
+        ])
+        expect(assistantTurns[0]?.id).not.toBe(assistantTurns[1]?.id)
+        expect(runtime?.liveMessage).toBeNull()
+      } finally {
+        resetConversationRuntimeStore()
+      }
+    })
+
     it("preserves checkpoint identity in a coalesced continuation frame", async () => {
       const { useConversationRuntimeStore, resetConversationRuntimeStore } =
         await import("@/stores/conversation-runtime-store")
@@ -9611,8 +9667,15 @@ describe("AcpConnectionsProvider frame transactions (raw order)", () => {
                 type: "session_started",
                 session_id: "sess-1",
               },
-              status("owner-conn", 2, "prompting"),
-              content("owner-conn", 3, "stage A"),
+              {
+                connection_id: "owner-conn",
+                seq: 2,
+                type: "user_message",
+                message_id: "rejected-user-1",
+                blocks: [{ type: "text", text: "stale prompt" }],
+              },
+              status("owner-conn", 3, "prompting"),
+              content("owner-conn", 4, "stage A"),
             ])
           )
           h.runAnimationFrame()
@@ -9625,7 +9688,7 @@ describe("AcpConnectionsProvider frame transactions (raw order)", () => {
         rejectBoundary = true
         canonical.mockClear()
         act(() => {
-          h.emitDesktopBatch(batch(2, [status("owner-conn", 4, "connected")]))
+          h.emitDesktopBatch(batch(2, [status("owner-conn", 5, "connected")]))
           h.runAnimationFrame()
         })
 
@@ -9637,6 +9700,7 @@ describe("AcpConnectionsProvider frame transactions (raw order)", () => {
           .byConversationId.get(42)
         expect(runtime?.liveMessage).toBe(stageA)
         expect(runtime?.localTurns).toEqual([])
+        expect(runtime?.optimisticTurns).toEqual([])
       } finally {
         resetConversationRuntimeStore()
       }
@@ -9681,27 +9745,47 @@ describe("AcpConnectionsProvider frame transactions (raw order)", () => {
                 type: "session_started",
                 session_id: "sess-1",
               },
-              status("conn", 2, "prompting"),
-              content("conn", 3, "stage A"),
-              status("conn", 4, "connected"),
-              status("conn", 5, "prompting"),
-              content("conn", 6, "stage B"),
-              status("conn", 7, "connected"),
+              {
+                connection_id: "conn",
+                seq: 2,
+                type: "prompt_dispatch_started",
+                generation: 1,
+                turn: {
+                  turn_id: "turn-1",
+                  queue_item_id: "queue-1",
+                  enqueue_seq: 1,
+                  client_message_id: "viewer-user-1",
+                  stop_requested: false,
+                },
+              },
+              {
+                connection_id: "conn",
+                seq: 3,
+                type: "user_message",
+                message_id: "viewer-user-1",
+                blocks: [{ type: "text", text: "check this" }],
+              },
+              status("conn", 4, "prompting"),
+              content("conn", 5, "stage A"),
+              status("conn", 6, "connected"),
+              status("conn", 7, "prompting"),
+              content("conn", 8, "stage B"),
+              status("conn", 9, "connected"),
             ],
-            7,
+            9,
             0
           )
         })
         act(() => {
           for (const envelope of [
-            status("conn", 8, "prompting"),
-            content("conn", 9, "stage C"),
-            status("conn", 10, "connected"),
-            status("conn", 11, "prompting"),
-            content("conn", 12, "stage D"),
+            status("conn", 10, "prompting"),
+            content("conn", 11, "stage C"),
+            status("conn", 12, "connected"),
+            status("conn", 13, "prompting"),
+            content("conn", 14, "stage D"),
             {
               connection_id: "conn",
-              seq: 13,
+              seq: 15,
               type: "usage_update" as const,
               used: 1,
               size: 100,
@@ -9720,6 +9804,10 @@ describe("AcpConnectionsProvider frame transactions (raw order)", () => {
             blocks: turn.blocks,
           }))
         ).toEqual([
+          {
+            role: "user",
+            blocks: [{ type: "text", text: "check this" }],
+          },
           {
             role: "assistant",
             blocks: [{ type: "text", text: "stage A" }],
@@ -9762,9 +9850,7 @@ describe("AcpConnectionsProvider frame transactions (raw order)", () => {
 
       try {
         await mountDesktopOwner("owner-conn", TAB, "sess-1", 42)
-        const canonical = vi.fn(
-          (_message: LiveMessage, _isLive: boolean) => true
-        )
+        const canonical = vi.fn(() => true)
         h.actions!.registerLiveSinks(TAB, {
           runtimeConversationId: 42,
           canonical,
@@ -9890,15 +9976,134 @@ describe("AcpConnectionsProvider frame transactions (raw order)", () => {
     })
 
     it("does not duplicate a checkpointed stage when Web replay redelivers the boundary", async () => {
+      const {
+        __getCancelGenerationForTests,
+        noteUserStopTurnOwnership,
+        useConversationRuntimeStore,
+        resetConversationRuntimeStore,
+      } = await import("@/stores/conversation-runtime-store")
+      const { createLiveTranscriptFrameSink, liveTranscriptStore } =
+        await import("@/stores/live-transcript-store")
+      resetConversationRuntimeStore()
+      const runtimeActions = useConversationRuntimeStore.getState().actions
+      runtimeActions.setExternalId(42, "sess-1")
+      const settled: LiveMessage = {
+        id: "acp:conn:4",
+        role: "assistant",
+        content: [{ type: "text", text: "already persisted" }],
+        startedAt: 1_700_000_000_000,
+      }
+      runtimeActions.setLiveMessage(42, settled, true)
+      runtimeActions.completeTurn(42, settled)
+      const originalAssistantId = useConversationRuntimeStore
+        .getState()
+        .byConversationId.get(42)
+        ?.localTurns.find((turn) => turn.role === "assistant")?.id
+      runtimeActions.appendOptimisticTurn(
+        42,
+        {
+          id: "active-user-2",
+          role: "user",
+          blocks: [{ type: "text", text: "active prompt" }],
+          timestamp: "2026-08-25T07:31:50.000Z",
+        },
+        "active-user-2"
+      )
+      noteUserStopTurnOwnership(42)
+      const cancelGenerationBeforeReplay = __getCancelGenerationForTests(42)
+
+      try {
+        h.isDesktop = false
+        await mountProvider()
+        await act(async () => {
+          await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1", 42)
+        })
+        h.actions!.registerLiveSinks(TAB, {
+          runtimeConversationId: 42,
+          canonical: (message, isLive) => {
+            runtimeActions.setLiveMessage(42, message, isLive)
+            return (
+              useConversationRuntimeStore.getState().byConversationId.get(42)
+                ?.liveMessage === message
+            )
+          },
+          transcript: createLiveTranscriptFrameSink(42, "conn"),
+        })
+        const handlers = latestAttachHandlers()
+        act(() => {
+          handlers.onReplay(
+            [
+              {
+                connection_id: "conn",
+                seq: 1,
+                type: "session_started",
+                session_id: "sess-1",
+              },
+              {
+                connection_id: "conn",
+                seq: 2,
+                type: "prompt_dispatch_started",
+                generation: 1,
+                turn: {
+                  turn_id: "turn-1",
+                  queue_item_id: "queue-1",
+                  enqueue_seq: 1,
+                  client_message_id: "viewer-user-1",
+                  stop_requested: false,
+                },
+              },
+              {
+                connection_id: "conn",
+                seq: 3,
+                type: "user_message",
+                message_id: "viewer-user-1",
+                blocks: [{ type: "text", text: "checkpoint prompt" }],
+              },
+              status("conn", 4, "prompting"),
+              content("conn", 5, "already persisted"),
+              status("conn", 6, "connected"),
+            ],
+            6,
+            0
+          )
+        })
+
+        const runtime = useConversationRuntimeStore
+          .getState()
+          .byConversationId.get(42)
+        expect(runtime?.liveMessage).toBeNull()
+        expect(
+          runtime?.localTurns
+            .filter((turn) => turn.role === "assistant")
+            .map((turn) => ({ id: turn.id, blocks: turn.blocks }))
+        ).toEqual([
+          {
+            id: originalAssistantId,
+            blocks: [{ type: "text", text: "already persisted" }],
+          },
+        ])
+        expect(__getCancelGenerationForTests(42)).toBe(
+          cancelGenerationBeforeReplay
+        )
+        expect(runtime?.optimisticTurns.map((turn) => turn.id)).toEqual([
+          "active-user-2",
+        ])
+        expect(liveTranscriptStore.getConversation(42)).toBeNull()
+      } finally {
+        resetConversationRuntimeStore()
+      }
+    })
+
+    it("does not duplicate a thinking-only checkpoint when Web replay redelivers the boundary", async () => {
       const { useConversationRuntimeStore, resetConversationRuntimeStore } =
         await import("@/stores/conversation-runtime-store")
       resetConversationRuntimeStore()
       const runtimeActions = useConversationRuntimeStore.getState().actions
       runtimeActions.setExternalId(42, "sess-1")
       const settled: LiveMessage = {
-        id: "settled-checkpoint-replay",
+        id: "acp:conn:2",
         role: "assistant",
-        content: [{ type: "text", text: "already persisted" }],
+        content: [{ type: "thinking", text: "already reasoned" }],
         startedAt: 1_700_000_000_000,
       }
       runtimeActions.setLiveMessage(42, settled, true)
@@ -9935,7 +10140,7 @@ describe("AcpConnectionsProvider frame transactions (raw order)", () => {
                 session_id: "sess-1",
               },
               status("conn", 2, "prompting"),
-              content("conn", 3, "already persisted"),
+              thinking("conn", 3, "already reasoned"),
               status("conn", 4, "connected"),
             ],
             4,
@@ -9946,17 +10151,12 @@ describe("AcpConnectionsProvider frame transactions (raw order)", () => {
         const runtime = useConversationRuntimeStore
           .getState()
           .byConversationId.get(42)
-        expect(runtime?.liveMessage).toBeNull()
         expect(
           runtime?.localTurns
             .filter((turn) => turn.role === "assistant")
-            .map((turn) => ({ id: turn.id, blocks: turn.blocks }))
-        ).toEqual([
-          {
-            id: originalAssistantId,
-            blocks: [{ type: "text", text: "already persisted" }],
-          },
-        ])
+            .map((turn) => turn.id)
+        ).toEqual([originalAssistantId])
+        expect(runtime?.liveMessage).toBeNull()
       } finally {
         resetConversationRuntimeStore()
       }
