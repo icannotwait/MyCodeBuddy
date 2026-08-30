@@ -55,6 +55,7 @@ import {
 } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
+import { isCodexCompactionAdvisoryText } from "@/lib/codex-compaction-advisory"
 import { cn } from "@/lib/utils"
 import type { SessionFailureRecord } from "@/lib/types"
 import {
@@ -124,9 +125,12 @@ interface Props {
 }
 
 export function SessionFailureBanner({ failures, onAction, onDismiss }: Props) {
+  const visibleFailures = failures.filter(
+    (failure) => !isCodexCompactionAdvisoryText(failure.title)
+  )
   const { errors, warning, hiddenWarnings, warningIds } =
-    activeSessionFailureView(failures)
-  const recovered = mostRecentRecoveredWarning(failures)
+    activeSessionFailureView(visibleFailures)
+  const recovered = mostRecentRecoveredWarning(visibleFailures)
   const hasActive = errors.length > 0 || warning !== null
   if (!hasActive && !recovered) return null
   return (

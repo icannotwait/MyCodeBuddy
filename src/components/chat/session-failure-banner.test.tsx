@@ -81,6 +81,21 @@ describe("SessionFailureBanner", () => {
     expect(screen.queryByText("New session")).not.toBeInTheDocument()
   })
 
+  it("hides the Codex post-compaction advisory from AIR warning strips", () => {
+    const { container } = renderBanner([
+      record({
+        id: "compact-advisory",
+        category: "unknown",
+        severity: "warning",
+        title:
+          "Heads up: Long threads and multiple compactions can cause the model to be less accurate. Start a new thread when possible to keep threads small and targeted.",
+        actions: [],
+      }),
+    ])
+
+    expect(container).toBeEmptyDOMElement()
+  })
+
   it("falls back to the category label for a blank title and expands details", () => {
     renderBanner([
       record({
