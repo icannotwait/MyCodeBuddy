@@ -383,7 +383,28 @@ describe("refetchDetail DB-id resolution", () => {
       detail({
         summary: { ...detail().summary, id: 42 },
         transcript_watermark: 35582,
-        turns: [turn("turn-0", "[[codeg-background-task]] terminal state")],
+        turns: [
+          {
+            id: "turn-0",
+            role: "assistant",
+            blocks: [
+              {
+                type: "tool_result",
+                tool_use_id: "toolu-01",
+                output_preview:
+                  BACKGROUND_TASK_MARKER +
+                  JSON.stringify({
+                    task_id: "agent-1",
+                    status: "completed",
+                    summary: null,
+                    result: null,
+                  }),
+                is_error: false,
+              },
+            ],
+            timestamp: "2026-07-07T08:39:06.000Z",
+          },
+        ],
       })
     )
     actions().refetchDetail(VIRTUAL, { preserveLive: false })

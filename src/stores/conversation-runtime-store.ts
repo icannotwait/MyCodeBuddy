@@ -72,7 +72,10 @@ import {
   deriveNativeActivitiesFromToolCalls,
   type ToolFieldForActivity,
 } from "@/lib/delegation-activity"
-import { BACKGROUND_TASK_MARKER } from "@/lib/background-agent"
+import {
+  BACKGROUND_TASK_MARKER,
+  parseBackgroundTaskMarker,
+} from "@/lib/background-agent"
 
 /**
  * Conversation-runtime shared state as a Zustand store — the per-conversation
@@ -373,6 +376,7 @@ interface HistoricalTimelineCacheKey {
   localTurns: MessageTurn[]
   backgroundTurns: BackgroundOverlayEntry[]
   optimisticTurns: MessageTurn[]
+  batchBoundaryIndex: number | null
   liveOwnsActiveTurn: boolean
   delegationKickoffText: string | null
   liveMessageId: string | null
@@ -396,6 +400,7 @@ function sameHistoricalKey(
     left.localTurns === right.localTurns &&
     left.backgroundTurns === right.backgroundTurns &&
     left.optimisticTurns === right.optimisticTurns &&
+    left.batchBoundaryIndex === right.batchBoundaryIndex &&
     left.liveOwnsActiveTurn === right.liveOwnsActiveTurn &&
     left.delegationKickoffText === right.delegationKickoffText &&
     left.liveMessageId === right.liveMessageId &&
@@ -411,6 +416,7 @@ function buildHistoricalKey(
     localTurns: session.localTurns,
     backgroundTurns: session.backgroundTurns,
     optimisticTurns: session.optimisticTurns,
+    batchBoundaryIndex: session.batchBoundaryIndex,
     liveOwnsActiveTurn: session.liveOwnsActiveTurn,
     delegationKickoffText: session.delegationKickoffText,
     liveMessageId: session.liveMessage?.id ?? null,
@@ -890,6 +896,46 @@ function turnTextContent(turn: MessageTurn): string {
   return out
 }
 
+function turnHasBackgroundTaskMarker(turn: MessageTurn | undefined): boolean {
+  return (
+    turn?.blocks.some(
+      (block) =>
+        block.type === "tool_result" &&
+        parseBackgroundTaskMarker(block.output_preview) != null
+    ) === true
+  )
+}
+
+function settledAssistantOnlyPartialIndex(
+  localTurns: readonly MessageTurn[],
+  detail: DbConversationDetail | null,
+  batchBoundaryIndex: number | null
+): number {
+  if (
+    detail == null ||
+    detail.in_flight_user_turn_id != null ||
+    batchBoundaryIndex == null ||
+    lastIndexOfRole(detail.turns, "user") >= 0
+  ) {
+    return -1
+  }
+  const lastLocalUserIdx = lastIndexOfRole(localTurns, "user")
+  if (
+    lastLocalUserIdx < 0 ||
+    !localTurns
+      .slice(lastLocalUserIdx + 1)
+      .some((turn) => turn.role === "assistant")
+  ) {
+    return -1
+  }
+  const lastPersistedAssistantIdx = lastIndexOfRole(detail.turns, "assistant")
+  return lastPersistedAssistantIdx >= 0 &&
+    turnsOffsetOf(detail) + lastPersistedAssistantIdx >= batchBoundaryIndex &&
+    !turnHasBackgroundTaskMarker(detail.turns[lastPersistedAssistantIdx])
+    ? lastPersistedAssistantIdx
+    : -1
+}
+
 /**
  * Last-round window: the persist snapshot has caught up to the overlay's
  * last user without needing equal clocks. Only matching last-user text
@@ -963,6 +1009,12 @@ function retireCoveredLocalTurns(
   if (localTurns.length === 0) return localTurns
   const persisted = detail?.turns ?? []
   if (persisted.length === 0) return localTurns
+  if (
+    settledAssistantOnlyPartialIndex(localTurns, detail, batchBoundaryIndex) >=
+    0
+  ) {
+    return localTurns
+  }
   const persistedIds = new Set(persisted.map((t) => t.id))
   const persistedIdentity = new Set<string>()
   for (const turn of persisted) {
@@ -973,7 +1025,12 @@ function retireCoveredLocalTurns(
   // Last-round retirement needs a settled assistant after the last user.
   const lastLocalUserIdx = lastIndexOfRole(localTurns, "user")
   const lastPersistUserIdx = lastIndexOfRole(persisted, "user")
+  const lastPersistAssistantIdx = lastIndexOfRole(persisted, "assistant")
   const persistSettled = detail?.in_flight_user_turn_id == null
+  const persistHasFoldedBackgroundTask =
+    lastPersistUserIdx < 0 &&
+    lastPersistAssistantIdx >= 0 &&
+    turnHasBackgroundTaskMarker(persisted[lastPersistAssistantIdx])
   const persistHasAssistantAfterLastUser =
     lastPersistUserIdx >= 0
       ? persisted
@@ -989,9 +1046,9 @@ function retireCoveredLocalTurns(
     persistedTurnTotal >= batchBoundaryIndex + localTurns.length ||
     // Background-task parsing folds [user, launch ack] into one terminal
     // assistant record. Crossing the boundary is sufficient for that shape.
-    (lastPersistUserIdx < 0 && persistedTurnTotal > batchBoundaryIndex)
-  // Persist with no user turn is a folded replacement of the last overlay
-  // round (async-sub-agent launch ack → `[[codeg-background-task]]` marker).
+    (persistHasFoldedBackgroundTask && persistedTurnTotal > batchBoundaryIndex)
+  // An assistant-only window covers the last overlay round only when it
+  // explicitly contains the folded async-sub-agent lifecycle marker.
   // Persist with a last user only covers the overlay when the assistant
   // bodies match — otherwise it is an earlier same-text prompt.
   const lastRoundCovered =
@@ -1006,7 +1063,7 @@ function retireCoveredLocalTurns(
           lastLocalUserIdx,
           lastPersistUserIdx
         )
-      : true)
+      : persistHasFoldedBackgroundTask)
   const retained = localTurns.filter((t, i) => {
     if (persistedIds.has(t.id)) return false
     const key = persistIdentityKey(t)
@@ -4989,6 +5046,21 @@ function computeHistoricalTimeline(
   const persistedTurns =
     stripFrom !== -1 ? rawPersistedTurns.slice(0, stripFrom) : rawPersistedTurns
 
+  // A long settled round can exceed the backend's round-alignment cap, so a
+  // windowed refetch may contain only the parser's latest partial assistant.
+  // Keep the complete local round authoritative until a user boundary lands.
+  const settledLocalPartialIdx = hasLiveOrLocalReply
+    ? -1
+    : settledAssistantOnlyPartialIndex(
+        session.localTurns,
+        session.detail,
+        session.batchBoundaryIndex
+      )
+  const persistedWithoutLocalPartial =
+    settledLocalPartialIdx >= 0
+      ? persistedTurns.filter((_, i) => i !== settledLocalPartialIdx)
+      : persistedTurns
+
   // Suppress the persisted PARTIAL in-flight reply for a non-delegation
   // cross-client viewer. While a reply is streaming, some agents (OpenCode,
   // Gemini) persist a partial assistant turn for it under a parser id; loaded
@@ -5014,14 +5086,14 @@ function computeHistoricalTimeline(
   const inFlightPromptId = session.detail?.in_flight_user_turn_id ?? null
   const inFlightPromptIdx =
     !hasLiveOrLocalReply && liveMessageId !== null && inFlightPromptId !== null
-      ? persistedTurns.findIndex(
+      ? persistedWithoutLocalPartial.findIndex(
           (t) => t.role === "user" && t.id === inFlightPromptId
         )
       : -1
   const visiblePersistedTurns =
     inFlightPromptIdx === -1
-      ? persistedTurns
-      : persistedTurns.filter(
+      ? persistedWithoutLocalPartial
+      : persistedWithoutLocalPartial.filter(
           (t, i) => i <= inFlightPromptIdx || t.role !== "assistant"
         )
 

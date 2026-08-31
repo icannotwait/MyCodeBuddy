@@ -22,6 +22,7 @@ import type {
 import type { LiveMessage } from "@/contexts/acp-connections-context"
 import {
   resetConversationRuntimeStore,
+  selectTimelineTurns,
   useConversationRuntimeStore,
   type ConversationRuntimeSession,
 } from "@/stores/conversation-runtime-store"
@@ -253,6 +254,237 @@ describe("syncViewerDetail — owner/guard no-ops", () => {
       "user",
       "assistant",
     ])
+  })
+})
+
+describe("refetchDetail — assistant-only window", () => {
+  it("keeps a complete local round when a settled tail window has no user", async () => {
+    vi.useFakeTimers()
+    const localTurns = [
+      userTurn("wire-u", "continue diagnosing"),
+      assistantTurn("wire-a-stage-a", "Stage A complete"),
+      assistantTurn("wire-a-stage-b", "complete Stage B answer"),
+    ]
+    seed({
+      detail: {
+        ...detail([], 100),
+        turns_offset: 120,
+        turns_total: 120,
+        prefix_hash: "0000000000000120",
+      },
+      localTurns,
+      batchBoundaryIndex: 120,
+    })
+    mockGet.mockResolvedValue({
+      ...detail([assistantTurn("parser-a", "partial Stage B")], 110),
+      turns_offset: 120,
+      turns_total: 121,
+      prefix_hash: "0000000000000120",
+    })
+
+    useConversationRuntimeStore
+      .getState()
+      .actions.refetchDetail(CID, { preserveLive: true })
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(mockGet).toHaveBeenCalledWith(CID, { fromIndex: 120 })
+    expect(session()?.localTurns).toEqual(localTurns)
+    expect(
+      selectTimelineTurns(useConversationRuntimeStore.getState(), CID).map(
+        (entry) => entry.turn.id
+      )
+    ).toEqual(["wire-u", "wire-a-stage-a", "wire-a-stage-b"])
+  })
+
+  it("does not treat an older folded marker as proof for a newer partial", async () => {
+    vi.useFakeTimers()
+    const localTurns = [
+      userTurn("wire-u", "continue diagnosing"),
+      assistantTurn("wire-a", "complete latest answer"),
+    ]
+    seed({
+      detail: {
+        ...detail([], 100),
+        turns_offset: 120,
+        turns_total: 120,
+        prefix_hash: "0000000000000120",
+      },
+      localTurns,
+      batchBoundaryIndex: 120,
+    })
+    mockGet.mockResolvedValue({
+      ...detail(
+        [
+          {
+            id: "old-background-task",
+            role: "assistant",
+            blocks: [
+              {
+                type: "tool_result",
+                tool_use_id: "toolu-old",
+                output_preview:
+                  '[[codeg-background-task]]{"task_id":"old-task","status":"completed","summary":null,"result":null}',
+                is_error: false,
+              },
+            ],
+            timestamp: "",
+          },
+          assistantTurn("parser-a", "partial latest answer"),
+        ],
+        110
+      ),
+      turns_offset: 120,
+      turns_total: 122,
+      prefix_hash: "0000000000000120",
+    })
+
+    useConversationRuntimeStore
+      .getState()
+      .actions.refetchDetail(CID, { preserveLive: true })
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(session()?.localTurns).toEqual(localTurns)
+    expect(
+      selectTimelineTurns(useConversationRuntimeStore.getState(), CID).map(
+        (entry) => entry.turn.id
+      )
+    ).toEqual(["old-background-task", "wire-u", "wire-a"])
+  })
+
+  it.each([
+    [
+      "ordinary assistant text",
+      assistantTurn(
+        "parser-a",
+        '[[codeg-background-task]] {"task_id":"not-a-tool-result"}'
+      ),
+    ],
+    [
+      "malformed tool result",
+      {
+        id: "parser-a",
+        role: "assistant" as const,
+        blocks: [
+          {
+            type: "tool_result" as const,
+            tool_use_id: "toolu-1",
+            output_preview: "[[codeg-background-task]] {not json",
+            is_error: false,
+          },
+        ],
+        timestamp: "",
+      },
+    ],
+  ])(
+    "does not retire local turns for an unverified marker in %s",
+    async (_, persistedTurn) => {
+      vi.useFakeTimers()
+      const localTurns = [
+        userTurn("wire-u", "continue diagnosing"),
+        assistantTurn("wire-a", "complete latest answer"),
+      ]
+      seed({
+        detail: {
+          ...detail([], 100),
+          turns_offset: 120,
+          turns_total: 120,
+          prefix_hash: "0000000000000120",
+        },
+        localTurns,
+        batchBoundaryIndex: 120,
+      })
+      mockGet.mockResolvedValue({
+        ...detail([persistedTurn], 110),
+        turns_offset: 120,
+        turns_total: 121,
+        prefix_hash: "0000000000000120",
+      })
+
+      useConversationRuntimeStore
+        .getState()
+        .actions.refetchDetail(CID, { preserveLive: true })
+      await vi.advanceTimersByTimeAsync(0)
+
+      expect(session()?.localTurns).toEqual(localTurns)
+    }
+  )
+
+  it("keeps an exact-id persisted stage in the complete local round order", async () => {
+    vi.useFakeTimers()
+    const localTurns = [
+      userTurn("wire-u", "continue diagnosing"),
+      assistantTurn("wire-a-stage-a", "Stage A complete"),
+      assistantTurn("wire-a-stage-b", "complete Stage B answer"),
+    ]
+    seed({
+      detail: {
+        ...detail([], 100),
+        turns_offset: 120,
+        turns_total: 120,
+        prefix_hash: "0000000000000120",
+      },
+      localTurns,
+      batchBoundaryIndex: 120,
+    })
+    mockGet.mockResolvedValue({
+      ...detail(
+        [
+          assistantTurn("wire-a-stage-a", "Stage A complete"),
+          assistantTurn("parser-a", "partial Stage B"),
+        ],
+        110
+      ),
+      turns_offset: 120,
+      turns_total: 122,
+      prefix_hash: "0000000000000120",
+    })
+
+    useConversationRuntimeStore
+      .getState()
+      .actions.refetchDetail(CID, { preserveLive: true })
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(session()?.localTurns).toEqual(localTurns)
+    expect(
+      selectTimelineTurns(useConversationRuntimeStore.getState(), CID).map(
+        (entry) => entry.turn.id
+      )
+    ).toEqual(["wire-u", "wire-a-stage-a", "wire-a-stage-b"])
+  })
+
+  it("invalidates the timeline cache when the batch boundary is captured", () => {
+    const localTurns = [
+      userTurn("wire-u", "continue diagnosing"),
+      assistantTurn("wire-a", "complete answer"),
+    ]
+    seed({
+      detail: {
+        ...detail([assistantTurn("parser-a", "partial answer")], 110),
+        turns_offset: 120,
+        turns_total: 121,
+        prefix_hash: "0000000000000120",
+      },
+      localTurns,
+      batchBoundaryIndex: null,
+    })
+    expect(
+      selectTimelineTurns(useConversationRuntimeStore.getState(), CID).map(
+        (entry) => entry.turn.id
+      )
+    ).toEqual(["parser-a", "wire-u", "wire-a"])
+
+    useConversationRuntimeStore.setState((state) => {
+      const current = state.byConversationId.get(CID)!
+      const next = new Map(state.byConversationId)
+      next.set(CID, { ...current, batchBoundaryIndex: 120 })
+      return { byConversationId: next }
+    })
+
+    expect(
+      selectTimelineTurns(useConversationRuntimeStore.getState(), CID).map(
+        (entry) => entry.turn.id
+      )
+    ).toEqual(["wire-u", "wire-a"])
   })
 })
 
