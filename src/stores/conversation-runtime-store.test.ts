@@ -241,6 +241,73 @@ describe("completeLiveTranscriptTurn", () => {
     })
   })
 
+  it("keeps an owner's final when cached detail has a same-id partial", () => {
+    const final = liveMessage(
+      "latest",
+      "complete latest Codex reply",
+      Date.parse("2026-05-28T00:00:01.000Z")
+    )
+    seedRuntimeSession({
+      detail: detailWithTurns([
+        assistantTurn(
+          `live-${CID}-latest`,
+          "partial latest Codex reply",
+          "2026-05-28T00:00:01.000Z"
+        ),
+      ]),
+      optimisticTurns: [userTurn("u-latest", "continue diagnosing")],
+      liveMessage: final,
+      syncState: "awaiting_persist",
+    })
+    liveTranscriptStore.rebuild(CID, "owner-conn", final, 3)
+
+    completeLiveTranscriptTurn(CID, final)
+
+    const state = useConversationRuntimeStore.getState()
+    expect(
+      state.byConversationId.get(CID)?.localTurns.map((turn) => turn.id)
+    ).toEqual(["u-latest", `live-${CID}-latest`])
+    const assistants = selectTimelineTurns(state, CID).filter(
+      (entry) => entry.turn.role === "assistant"
+    )
+    expect(assistants).toHaveLength(1)
+    expect(assistants[0]?.turn).toMatchObject({
+      id: `live-${CID}-latest`,
+      blocks: [{ type: "text", text: "complete latest Codex reply" }],
+    })
+    expect(liveTranscriptStore.getConversation(CID)).toBeNull()
+  })
+
+  it("still retires a viewer's already-persisted final", () => {
+    const final = liveMessage(
+      "latest",
+      "complete latest Codex reply",
+      Date.parse("2026-05-28T00:00:01.000Z")
+    )
+    const persisted = assistantTurn(
+      `live-${CID}-latest`,
+      "complete latest Codex reply",
+      "2026-05-28T00:00:01.000Z"
+    )
+    seedRuntimeSession({
+      detail: detailWithTurns([persisted]),
+      liveMessage: final,
+      syncState: "idle",
+    })
+    liveTranscriptStore.rebuild(CID, "viewer-conn", final, 3)
+
+    completeLiveTranscriptTurn(CID, final)
+
+    const state = useConversationRuntimeStore.getState()
+    expect(state.byConversationId.get(CID)?.localTurns).toEqual([])
+    const assistants = selectTimelineTurns(state, CID).filter(
+      (entry) => entry.turn.role === "assistant"
+    )
+    expect(assistants).toHaveLength(1)
+    expect(assistants[0]?.turn).toEqual(persisted)
+    expect(liveTranscriptStore.getConversation(CID)).toBeNull()
+  })
+
   it("silently ignores a recovery completion after the turn was promoted", () => {
     const final = liveMessage("latest", "latest Codex reply")
     seedRuntimeSession({

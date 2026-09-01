@@ -2650,13 +2650,22 @@ function reducer(
             : stillPending
       }
 
+      const wasAwaitingPersist = current.syncState === "awaiting_persist"
+      // An owner's completed wire reply is authoritative at this edge. The
+      // cached detail predates completion and may still hold a parser partial
+      // with the same id/timestamp, so it cannot retire the new promotion.
+      // Viewer/replay completions are already persisted and still converge.
+      const completedLocalTurns = wasAwaitingPersist
+        ? promoted
+        : retireCoveredLocalTurns(
+            promoted,
+            current.detail,
+            current.batchBoundaryIndex
+          )
+
       return updateSessionInState(state, action.conversationId, () => ({
         ...current,
-        localTurns: retireCoveredLocalTurns(
-          promoted,
-          current.detail,
-          current.batchBoundaryIndex
-        ),
+        localTurns: completedLocalTurns,
         optimisticTurns: queuedOptimistic,
         queuedOptimisticTurnIds: queuedOptimistic.map((turn) => turn.id),
         liveMessage: null,
@@ -2669,7 +2678,7 @@ function reducer(
         // `isPureViewerSession` uses this to keep an owner's possibly-unflushed
         // reply out of viewer-sync while still admitting a viewer whose promoted
         // reply is already persisted.
-        lastTurnOwned: current.syncState === "awaiting_persist",
+        lastTurnOwned: wasAwaitingPersist,
         pendingBackgroundSettlements: remainingSettlements,
       }))
     }
