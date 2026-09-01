@@ -377,6 +377,7 @@ interface HistoricalTimelineCacheKey {
   backgroundTurns: BackgroundOverlayEntry[]
   optimisticTurns: MessageTurn[]
   batchBoundaryIndex: number | null
+  lastTurnOwned: boolean
   liveOwnsActiveTurn: boolean
   delegationKickoffText: string | null
   liveMessageId: string | null
@@ -401,6 +402,7 @@ function sameHistoricalKey(
     left.backgroundTurns === right.backgroundTurns &&
     left.optimisticTurns === right.optimisticTurns &&
     left.batchBoundaryIndex === right.batchBoundaryIndex &&
+    left.lastTurnOwned === right.lastTurnOwned &&
     left.liveOwnsActiveTurn === right.liveOwnsActiveTurn &&
     left.delegationKickoffText === right.delegationKickoffText &&
     left.liveMessageId === right.liveMessageId &&
@@ -417,6 +419,7 @@ function buildHistoricalKey(
     backgroundTurns: session.backgroundTurns,
     optimisticTurns: session.optimisticTurns,
     batchBoundaryIndex: session.batchBoundaryIndex,
+    lastTurnOwned: session.lastTurnOwned,
     liveOwnsActiveTurn: session.liveOwnsActiveTurn,
     delegationKickoffText: session.delegationKickoffText,
     liveMessageId: session.liveMessage?.id ?? null,
@@ -993,6 +996,76 @@ function lastRoundsCorrespond(
     persistAssistant != null &&
     localAssistant === persistAssistant
   )
+}
+
+function ownerPersistedRound(
+  session: ConversationRuntimeSession,
+  persisted: readonly MessageTurn[]
+): {
+  persistedStart: number
+  persistedEnd: number
+  localStart: number
+} | null {
+  if (!session.lastTurnOwned || session.localTurns.length === 0) return null
+  const lastLocalUserIdx = lastIndexOfRole(session.localTurns, "user")
+  if (
+    lastLocalUserIdx < 0 ||
+    !session.localTurns
+      .slice(lastLocalUserIdx + 1)
+      .some((turn) => turn.role === "assistant")
+  ) {
+    return null
+  }
+
+  const localUser = session.localTurns[lastLocalUserIdx]!
+  const localIdentity = persistIdentityKey(localUser)
+  let persistedStart = persisted.findIndex(
+    (turn) => turn.role === "user" && turn.id === localUser.id
+  )
+  if (persistedStart < 0 && localIdentity != null) {
+    let identityMatch = -1
+    for (let i = 0; i < persisted.length; i++) {
+      if (persistIdentityKey(persisted[i]!) !== localIdentity) continue
+      if (identityMatch >= 0) {
+        identityMatch = -1
+        break
+      }
+      identityMatch = i
+    }
+    persistedStart = identityMatch
+  }
+
+  const boundary = session.batchBoundaryIndex
+  if (persistedStart < 0 && boundary != null) {
+    const boundaryIdx = boundary - turnsOffsetOf(session.detail)
+    if (
+      boundaryIdx >= 0 &&
+      boundaryIdx < persisted.length &&
+      persisted[boundaryIdx]!.role === "user" &&
+      lastUsersCorrespond(
+        session.localTurns,
+        persisted,
+        lastLocalUserIdx,
+        boundaryIdx
+      )
+    ) {
+      persistedStart = boundaryIdx
+    }
+  }
+  if (persistedStart < 0) return null
+
+  let persistedEnd = persisted.length
+  for (let i = persistedStart + 1; i < persisted.length; i++) {
+    const turn = persisted[i]!
+    if (turn.role === "assistant" && turn.autonomous_origin == null) continue
+    persistedEnd = i
+    break
+  }
+  return {
+    persistedStart,
+    persistedEnd,
+    localStart: lastLocalUserIdx,
+  }
 }
 
 /**
@@ -2608,8 +2681,16 @@ function reducer(
       const queuedOptimistic = current.optimisticTurns.filter((turn) =>
         queuedIds.has(turn.id)
       )
+      const wasAwaitingPersist = current.syncState === "awaiting_persist"
+      const previousLocalTurns = wasAwaitingPersist
+        ? retireCoveredLocalTurns(
+            current.localTurns,
+            current.detail,
+            current.batchBoundaryIndex
+          )
+        : current.localTurns
       const promotedRaw = [
-        ...current.localTurns,
+        ...previousLocalTurns,
         ...inFlightOptimistic,
         ...stampedStreaming,
       ]
@@ -2650,13 +2731,17 @@ function reducer(
             : stillPending
       }
 
+      const completedLocalTurns = wasAwaitingPersist
+        ? promoted
+        : retireCoveredLocalTurns(
+            promoted,
+            current.detail,
+            current.batchBoundaryIndex
+          )
+
       return updateSessionInState(state, action.conversationId, () => ({
         ...current,
-        localTurns: retireCoveredLocalTurns(
-          promoted,
-          current.detail,
-          current.batchBoundaryIndex
-        ),
+        localTurns: completedLocalTurns,
         optimisticTurns: queuedOptimistic,
         queuedOptimisticTurnIds: queuedOptimistic.map((turn) => turn.id),
         liveMessage: null,
@@ -2669,7 +2754,7 @@ function reducer(
         // `isPureViewerSession` uses this to keep an owner's possibly-unflushed
         // reply out of viewer-sync while still admitting a viewer whose promoted
         // reply is already persisted.
-        lastTurnOwned: current.syncState === "awaiting_persist",
+        lastTurnOwned: wasAwaitingPersist,
         pendingBackgroundSettlements: remainingSettlements,
       }))
     }
@@ -5022,6 +5107,23 @@ function computeHistoricalTimeline(
   const liveMessageId = key.liveMessageId
   const liveStartedAt = key.liveStartedAt
   const rawPersistedTurns = session.detail?.turns ?? []
+  const ownerRound = ownerPersistedRound(session, rawPersistedTurns)
+  const ownerLocalTurns = ownerRound
+    ? session.localTurns.slice(ownerRound.localStart)
+    : []
+  const ownerLocalKeys = ownerRound
+    ? new Set(ownerLocalTurns.map((turn) => `${turn.role}\0${turn.id}`))
+    : null
+  const persistedWithOwnerReplacement = ownerRound
+    ? [
+        ...rawPersistedTurns.slice(0, ownerRound.persistedStart),
+        ...ownerLocalTurns,
+        ...rawPersistedTurns.slice(ownerRound.persistedEnd),
+      ]
+    : rawPersistedTurns
+  const remainingLocalTurns = ownerRound
+    ? session.localTurns.slice(0, ownerRound.localStart)
+    : session.localTurns
   const hasLiveOrLocalReply =
     session.liveOwnsActiveTurn &&
     (liveMessageId !== null || session.localTurns.length > 0)
@@ -5032,19 +5134,21 @@ function computeHistoricalTimeline(
   let stripFrom = -1
   if (hasLiveOrLocalReply) {
     let lastUserIdx = -1
-    for (let i = rawPersistedTurns.length - 1; i >= 0; i--) {
-      if (rawPersistedTurns[i]!.role === "user") {
+    for (let i = persistedWithOwnerReplacement.length - 1; i >= 0; i--) {
+      if (persistedWithOwnerReplacement[i]!.role === "user") {
         lastUserIdx = i
         break
       }
     }
     stripFrom =
       lastUserIdx === -1
-        ? rawPersistedTurns.findIndex((t) => t.role === "assistant")
+        ? persistedWithOwnerReplacement.findIndex((t) => t.role === "assistant")
         : lastUserIdx + 1
   }
   const persistedTurns =
-    stripFrom !== -1 ? rawPersistedTurns.slice(0, stripFrom) : rawPersistedTurns
+    stripFrom !== -1
+      ? persistedWithOwnerReplacement.slice(0, stripFrom)
+      : persistedWithOwnerReplacement
 
   // A long settled round can exceed the backend's round-alignment cap, so a
   // windowed refetch may contain only the parser's latest partial assistant.
@@ -5123,7 +5227,9 @@ function computeHistoricalTimeline(
   // collision-free here.
   const persisted: ConversationTimelineTurn[] = visiblePersistedTurns.map(
     (turn, i) => ({
-      key: `persisted-${conversationId}-${turn.id}`,
+      key: ownerLocalKeys?.has(`${turn.role}\0${turn.id}`)
+        ? `local-${conversationId}-${turn.id}`
+        : `persisted-${conversationId}-${turn.id}`,
       turn,
       phase: "persisted" as const,
       inProgressToolCallIds: inFlightToolCallIdsByIndex.get(i),
@@ -5164,7 +5270,7 @@ function computeHistoricalTimeline(
   }
 
   // Phase 2: Locally completed turns (promoted optimistic + completed streaming)
-  const local: ConversationTimelineTurn[] = session.localTurns.map((turn) => ({
+  const local: ConversationTimelineTurn[] = remainingLocalTurns.map((turn) => ({
     key: `local-${conversationId}-${turn.id}`,
     turn,
     phase: "persisted",
@@ -6651,6 +6757,15 @@ export function completeLiveTranscriptTurn(
   const sourceLiveMessage =
     liveMessage !== undefined ? liveMessage : runtimeBefore?.liveMessage
   const live = liveTranscriptStore.getConversation(conversationId)
+  const expectedOwnerTurnIds =
+    runtimeBefore?.syncState === "awaiting_persist" && sourceLiveMessage
+      ? buildStreamingTurnsForSession(
+          runtimeBefore,
+          sourceLiveMessage,
+          undefined,
+          false
+        ).turns.map((turn) => turn.id)
+      : null
   if (runtimeBefore && live == null) {
     const queuedIds = new Set(runtimeBefore.queuedOptimisticTurnIds ?? [])
     const hasInFlightOptimistic = runtimeBefore.optimisticTurns.some(
@@ -6688,7 +6803,13 @@ export function completeLiveTranscriptTurn(
     sourceLiveMessage != null &&
     sourceLiveMessage.id === live?.messageId &&
     runtimeAfter !== runtimeBefore &&
-    runtimeAfter?.liveMessage === null
+    runtimeAfter?.liveMessage === null &&
+    (expectedOwnerTurnIds === null ||
+      (expectedOwnerTurnIds.length > 0
+        ? expectedOwnerTurnIds.every((id) =>
+            runtimeAfter.localTurns.some((turn) => turn.id === id)
+          )
+        : live.segmentIds.length === 0))
   if (live && promoted) {
     liveTranscriptStore.removeIfMessage(conversationId, live.messageId)
   }

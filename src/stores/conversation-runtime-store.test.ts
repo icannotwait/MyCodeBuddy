@@ -123,6 +123,7 @@ type SeedInput = {
   delegationKickoffText?: string | null
   sessionStats?: SessionStats | null
   syncState?: "idle" | "awaiting_persist"
+  batchBoundaryIndex?: number | null
 }
 
 function seedRuntimeSession(input: SeedInput = {}) {
@@ -152,6 +153,7 @@ function seedRuntimeSession(input: SeedInput = {}) {
           sessionStats: input.sessionStats ?? null,
           delegationActivities: [],
           historyAssistantBaseline: null,
+          batchBoundaryIndex: input.batchBoundaryIndex ?? null,
           pendingCleanup: false,
           delegateSyncError: null,
           pendingCancel: null,
@@ -239,6 +241,269 @@ describe("completeLiveTranscriptTurn", () => {
       messageId: "latest",
       status: "completing",
     })
+  })
+
+  it("keeps the live projection when an owner final does not land", () => {
+    const final = liveMessage("latest", "complete latest Codex reply")
+    const staleFinal: LiveMessage = { ...final, content: [] }
+    seedRuntimeSession({
+      optimisticTurns: [userTurn("wire-latest-user", "continue diagnosing")],
+      liveMessage: final,
+      syncState: "awaiting_persist",
+    })
+    liveTranscriptStore.rebuild(CID, "owner-conn", final, 3)
+
+    completeLiveTranscriptTurn(CID, staleFinal)
+
+    expect(
+      useConversationRuntimeStore
+        .getState()
+        .byConversationId.get(CID)
+        ?.localTurns.some((turn) => turn.role === "assistant")
+    ).toBe(false)
+    expect(liveTranscriptStore.getConversation(CID)).toMatchObject({
+      messageId: "latest",
+      status: "completing",
+    })
+  })
+
+  it("keeps one complete owner final over a cached parser partial", () => {
+    const final = liveMessage(
+      "latest",
+      "complete latest Codex reply",
+      Date.parse("2026-05-28T00:00:03.000Z")
+    )
+    seedRuntimeSession({
+      detail: detailWithTurns(
+        [
+          userTurn("turn-100", "earlier prompt"),
+          assistantTurn(
+            "turn-101",
+            "earlier reply",
+            "2026-05-28T00:00:01.000Z"
+          ),
+          userTurn(
+            "turn-102",
+            "continue diagnosing",
+            "2026-05-28T00:00:02.000Z"
+          ),
+          assistantTurn(
+            "turn-103",
+            "partial latest Codex reply",
+            "2026-05-28T00:00:03.000Z"
+          ),
+        ],
+        { turns_total: 4 }
+      ),
+      optimisticTurns: [
+        userTurn(
+          "wire-latest-user",
+          "continue diagnosing",
+          "2026-05-28T00:00:02.000Z"
+        ),
+      ],
+      liveMessage: final,
+      syncState: "awaiting_persist",
+      batchBoundaryIndex: 2,
+    })
+    liveTranscriptStore.rebuild(CID, "owner-conn", final, 3)
+
+    completeLiveTranscriptTurn(CID, final)
+
+    const state = useConversationRuntimeStore.getState()
+    const runtime = state.byConversationId.get(CID)!
+    expect(runtime.localTurns.map((turn) => turn.id)).toEqual([
+      "wire-latest-user",
+      `live-${CID}-latest`,
+    ])
+    const latestTurns = selectTimelineTurns(state, CID).filter(
+      (entry) =>
+        entry.turn.timestamp === "2026-05-28T00:00:02.000Z" ||
+        entry.turn.timestamp === "2026-05-28T00:00:03.000Z"
+    )
+    expect(latestTurns.map((entry) => entry.turn.id)).toEqual([
+      "wire-latest-user",
+      `live-${CID}-latest`,
+    ])
+    expect(latestTurns[1]?.turn.blocks).toEqual([
+      { type: "text", text: "complete latest Codex reply" },
+    ])
+    expect(liveTranscriptStore.getConversation(CID)).toBeNull()
+  })
+
+  it.each(["newer prompt", "owned prompt"])(
+    "replaces only the owned round before a later persisted %s",
+    (newerPrompt) => {
+      const final = liveMessage(
+        "latest",
+        "complete owned reply",
+        Date.parse("2026-05-28T00:00:03.000Z")
+      )
+      seedRuntimeSession({
+        detail: detailWithTurns(
+          [
+            userTurn("turn-100", "earlier prompt"),
+            assistantTurn(
+              "turn-101",
+              "earlier reply",
+              "2026-05-28T00:00:01.000Z"
+            ),
+            userTurn("turn-102", "owned prompt", "2026-05-28T00:00:02.000Z"),
+            assistantTurn(
+              "turn-103",
+              "partial owned reply",
+              "2026-05-28T00:00:03.000Z"
+            ),
+            {
+              id: "turn-system",
+              role: "system",
+              blocks: [{ type: "text", text: "system notice" }],
+              timestamp: "2026-05-28T00:00:03.250Z",
+            },
+            {
+              ...assistantTurn(
+                "turn-autonomous",
+                "background completion",
+                "2026-05-28T00:00:03.500Z"
+              ),
+              autonomous_origin: "background_task",
+            },
+            userTurn("turn-104", newerPrompt, "2026-05-28T00:00:04.000Z"),
+            assistantTurn(
+              "turn-105",
+              "newer reply",
+              "2026-05-28T00:00:05.000Z"
+            ),
+          ],
+          { turns_total: 8 }
+        ),
+        optimisticTurns: [
+          userTurn(
+            "wire-latest-user",
+            "owned prompt",
+            "2026-05-28T00:00:02.500Z"
+          ),
+        ],
+        liveMessage: final,
+        syncState: "awaiting_persist",
+        batchBoundaryIndex: 2,
+      })
+      liveTranscriptStore.rebuild(CID, "owner-conn", final, 3)
+
+      completeLiveTranscriptTurn(CID, final)
+
+      const timelineIds = selectTimelineTurns(
+        useConversationRuntimeStore.getState(),
+        CID
+      ).map((entry) => entry.turn.id)
+      expect(timelineIds).toEqual([
+        "turn-100",
+        "turn-101",
+        "wire-latest-user",
+        `live-${CID}-latest`,
+        "turn-system",
+        "turn-autonomous",
+        "turn-104",
+        "turn-105",
+      ])
+    }
+  )
+
+  it("retires an older covered overlay while preserving the current owner round", () => {
+    const final = liveMessage(
+      "latest",
+      "complete latest Codex reply",
+      Date.parse("2026-05-28T00:00:03.000Z")
+    )
+    seedRuntimeSession({
+      detail: detailWithTurns(
+        [
+          userTurn("turn-100", "earlier prompt"),
+          assistantTurn(
+            "turn-101",
+            "earlier reply",
+            "2026-05-28T00:00:01.000Z"
+          ),
+          userTurn(
+            "turn-102",
+            "continue diagnosing",
+            "2026-05-28T00:00:02.000Z"
+          ),
+          assistantTurn(
+            "turn-103",
+            "partial latest Codex reply",
+            "2026-05-28T00:00:03.000Z"
+          ),
+        ],
+        { turns_total: 4 }
+      ),
+      localTurns: [
+        userTurn("wire-old-user", "earlier prompt"),
+        assistantTurn(
+          "live-old-assistant",
+          "earlier reply",
+          "2026-05-28T00:00:01.000Z"
+        ),
+      ],
+      optimisticTurns: [
+        userTurn(
+          "wire-latest-user",
+          "continue diagnosing",
+          "2026-05-28T00:00:02.000Z"
+        ),
+      ],
+      liveMessage: final,
+      syncState: "awaiting_persist",
+      batchBoundaryIndex: 0,
+    })
+    liveTranscriptStore.rebuild(CID, "owner-conn", final, 3)
+
+    completeLiveTranscriptTurn(CID, final)
+
+    const state = useConversationRuntimeStore.getState()
+    expect(
+      state.byConversationId.get(CID)?.localTurns.map((turn) => turn.id)
+    ).toEqual(["wire-latest-user", `live-${CID}-latest`])
+    expect(
+      selectTimelineTurns(state, CID).map((entry) => entry.turn.id)
+    ).toEqual([
+      "turn-100",
+      "turn-101",
+      "wire-latest-user",
+      `live-${CID}-latest`,
+    ])
+  })
+
+  it("does not match an older persisted user by empty timestamps", () => {
+    const final = liveMessage(
+      "latest",
+      "complete latest Codex reply",
+      Date.parse("2026-05-28T00:00:03.000Z")
+    )
+    seedRuntimeSession({
+      detail: detailWithTurns([
+        userTurn("turn-100", "earlier prompt", ""),
+        assistantTurn("turn-101", "earlier reply", "2026-05-28T00:00:01.000Z"),
+      ]),
+      optimisticTurns: [userTurn("wire-latest-user", "new prompt", "")],
+      liveMessage: final,
+      syncState: "awaiting_persist",
+      batchBoundaryIndex: null,
+    })
+    liveTranscriptStore.rebuild(CID, "owner-conn", final, 3)
+
+    completeLiveTranscriptTurn(CID, final)
+
+    expect(
+      selectTimelineTurns(useConversationRuntimeStore.getState(), CID).map(
+        (entry) => entry.turn.id
+      )
+    ).toEqual([
+      "turn-100",
+      "turn-101",
+      "wire-latest-user",
+      `live-${CID}-latest`,
+    ])
   })
 
   it("silently ignores a recovery completion after the turn was promoted", () => {
