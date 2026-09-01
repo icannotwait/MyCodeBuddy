@@ -377,6 +377,7 @@ interface HistoricalTimelineCacheKey {
   backgroundTurns: BackgroundOverlayEntry[]
   optimisticTurns: MessageTurn[]
   batchBoundaryIndex: number | null
+  batchBoundaryPrefixHash: string | null
   lastTurnOwned: boolean
   liveOwnsActiveTurn: boolean
   delegationKickoffText: string | null
@@ -402,6 +403,7 @@ function sameHistoricalKey(
     left.backgroundTurns === right.backgroundTurns &&
     left.optimisticTurns === right.optimisticTurns &&
     left.batchBoundaryIndex === right.batchBoundaryIndex &&
+    left.batchBoundaryPrefixHash === right.batchBoundaryPrefixHash &&
     left.lastTurnOwned === right.lastTurnOwned &&
     left.liveOwnsActiveTurn === right.liveOwnsActiveTurn &&
     left.delegationKickoffText === right.delegationKickoffText &&
@@ -419,6 +421,7 @@ function buildHistoricalKey(
     backgroundTurns: session.backgroundTurns,
     optimisticTurns: session.optimisticTurns,
     batchBoundaryIndex: session.batchBoundaryIndex,
+    batchBoundaryPrefixHash: session.batchBoundaryPrefixHash,
     lastTurnOwned: session.lastTurnOwned,
     liveOwnsActiveTurn: session.liveOwnsActiveTurn,
     delegationKickoffText: session.delegationKickoffText,
@@ -461,6 +464,7 @@ type Action =
   | {
       type: "FETCH_DETAIL_START"
       conversationId: number
+      authoritative?: boolean
     }
   | {
       type: "FETCH_DETAIL_SUCCESS"
@@ -476,6 +480,10 @@ type Action =
        * it, and a late-resolving partial could momentarily replace it).
        */
       preserveLive?: boolean
+      /** Manual Reload explicitly authorizes disk to replace all live overlays. */
+      authoritative?: boolean
+      /** Proven absolute transcript boundary for aligning this local overlay. */
+      localAlignmentBoundaryIndex?: number
     }
   | {
       type: "LOAD_OLDER_HISTORY_START"
@@ -881,24 +889,6 @@ function persistIdentityKey(turn: MessageTurn): string | null {
   return `${turn.role}\0${turn.timestamp}`
 }
 
-function lastIndexOfRole(
-  turns: readonly MessageTurn[],
-  role: MessageTurn["role"]
-): number {
-  for (let i = turns.length - 1; i >= 0; i--) {
-    if (turns[i]!.role === role) return i
-  }
-  return -1
-}
-
-function turnTextContent(turn: MessageTurn): string {
-  let out = ""
-  for (const block of turn.blocks) {
-    if (block.type === "text") out += block.text
-  }
-  return out
-}
-
 function turnHasBackgroundTaskMarker(turn: MessageTurn | undefined): boolean {
   return (
     turn?.blocks.some(
@@ -909,245 +899,452 @@ function turnHasBackgroundTaskMarker(turn: MessageTurn | undefined): boolean {
   )
 }
 
-function settledAssistantOnlyPartialIndex(
+interface TurnGroup {
+  start: number
+  end: number
+}
+
+interface TurnGroupAlignment {
+  localGroups: TurnGroup[]
+  persistedRangeByLocalGroup: Map<number, TurnGroup>
+  verifiedBoundaryIndex: number | null
+}
+
+function splitTurnGroups(turns: readonly MessageTurn[]): TurnGroup[] {
+  const groups: TurnGroup[] = []
+  for (let start = 0; start < turns.length; ) {
+    let end = start + 1
+    if (turns[start]!.role === "user") {
+      while (
+        end < turns.length &&
+        turns[end]!.role === "assistant" &&
+        turns[end]!.autonomous_origin == null
+      ) {
+        end += 1
+      }
+    }
+    groups.push({ start, end })
+    start = end
+  }
+  return groups
+}
+
+function contentValueEquivalent(left: unknown, right: unknown): boolean {
+  if (left === right) return true
+  if (left == null || right == null) return left == null && right == null
+  if (Array.isArray(left) || Array.isArray(right)) {
+    return (
+      Array.isArray(left) &&
+      Array.isArray(right) &&
+      left.length === right.length &&
+      left.every((value, index) => contentValueEquivalent(value, right[index]))
+    )
+  }
+  if (typeof left !== "object" || typeof right !== "object") return false
+  const leftRecord = left as Record<string, unknown>
+  const rightRecord = right as Record<string, unknown>
+  const leftKeys = Object.keys(leftRecord)
+    .filter((key) => leftRecord[key] !== undefined)
+    .sort()
+  const rightKeys = Object.keys(rightRecord)
+    .filter((key) => rightRecord[key] !== undefined)
+    .sort()
+  return (
+    leftKeys.length === rightKeys.length &&
+    leftKeys.every(
+      (key, index) =>
+        key === rightKeys[index] &&
+        contentValueEquivalent(leftRecord[key], rightRecord[key])
+    )
+  )
+}
+
+function contentBlockEquivalent(
+  left: ContentBlock,
+  right: ContentBlock
+): boolean {
+  if (left.type !== right.type) return false
+  switch (left.type) {
+    case "text":
+    case "thinking":
+      return left.text === (right as typeof left).text
+    case "image": {
+      const other = right as typeof left
+      return (
+        left.data === other.data &&
+        left.mime_type === other.mime_type &&
+        (left.uri ?? null) === (other.uri ?? null)
+      )
+    }
+    case "image_generation": {
+      const other = right as typeof left
+      return (
+        (left.revised_prompt ?? null) === (other.revised_prompt ?? null) &&
+        contentValueEquivalent(left.image ?? null, other.image ?? null)
+      )
+    }
+    case "tool_use": {
+      const other = right as typeof left
+      return (
+        left.tool_use_id === other.tool_use_id &&
+        left.tool_name === other.tool_name &&
+        left.input_preview === other.input_preview &&
+        contentValueEquivalent(left.meta ?? null, other.meta ?? null)
+      )
+    }
+    case "tool_result": {
+      const other = right as typeof left
+      return (
+        left.tool_use_id === other.tool_use_id &&
+        left.output_preview === other.output_preview &&
+        left.is_error === other.is_error &&
+        contentValueEquivalent(
+          left.agent_stats ?? null,
+          other.agent_stats ?? null
+        ) &&
+        contentValueEquivalent(left.images ?? [], other.images ?? [])
+      )
+    }
+    case "plan":
+      return contentValueEquivalent(
+        left.entries,
+        (right as typeof left).entries
+      )
+  }
+}
+
+function contentBlocksEquivalent(
+  left: readonly ContentBlock[],
+  right: readonly ContentBlock[]
+): boolean {
+  return (
+    left.length === right.length &&
+    left.every((block, index) => contentBlockEquivalent(block, right[index]!))
+  )
+}
+
+function turnGroupsContentEquivalent(
+  localTurns: readonly MessageTurn[],
+  localGroup: TurnGroup,
+  persisted: readonly MessageTurn[],
+  persistedGroup: TurnGroup
+): boolean {
+  return (
+    localGroup.end - localGroup.start ===
+      persistedGroup.end - persistedGroup.start &&
+    localTurns.slice(localGroup.start, localGroup.end).every((turn, index) => {
+      const other = persisted[persistedGroup.start + index]!
+      return (
+        turn.role === other.role &&
+        contentBlocksEquivalent(turn.blocks, other.blocks) &&
+        contentValueEquivalent(turn.outcome ?? null, other.outcome ?? null)
+      )
+    })
+  )
+}
+
+function uniqueTurnIndexes(
+  turns: readonly MessageTurn[],
+  keyForTurn: (turn: MessageTurn) => string | null
+): Map<string, number> {
+  const indexes = new Map<string, number>()
+  const duplicates = new Set<string>()
+  turns.forEach((turn, index) => {
+    const key = keyForTurn(turn)
+    if (key == null || duplicates.has(key)) return
+    if (indexes.has(key)) {
+      indexes.delete(key)
+      duplicates.add(key)
+    } else {
+      indexes.set(key, index)
+    }
+  })
+  return indexes
+}
+
+function verifiedAlignmentBoundaryIndex(
+  detail: DbConversationDetail | null,
+  boundaryIndex: number | null,
+  boundaryPrefixHash: string | null | undefined
+): number | null {
+  if (detail == null || boundaryIndex == null) return null
+  if (boundaryPrefixHash === undefined) return boundaryIndex
+  if (!isWindowedDetail(detail)) {
+    return boundaryPrefixHash === null ? boundaryIndex : null
+  }
+  if (boundaryPrefixHash === null) return null
+  const relativeIndex = boundaryIndex - detail.turns_offset
+  if (relativeIndex < 0 || relativeIndex > detail.turns.length) return null
+  return extendPrefixFingerprint(
+    detail.prefix_hash,
+    detail.turns.slice(0, relativeIndex)
+  ) === boundaryPrefixHash
+    ? boundaryIndex
+    : null
+}
+
+function alignTurnGroups(
   localTurns: readonly MessageTurn[],
   detail: DbConversationDetail | null,
+  batchBoundaryIndex: number | null,
+  batchBoundaryPrefixHash: string | null | undefined
+): TurnGroupAlignment {
+  const persisted = detail?.turns ?? []
+  const localGroups = splitTurnGroups(localTurns)
+  const persistedGroups = splitTurnGroups(persisted)
+  const persistedRangeByLocalGroup = new Map<number, TurnGroup>()
+  const verifiedBoundaryIndex = verifiedAlignmentBoundaryIndex(
+    detail,
+    batchBoundaryIndex,
+    batchBoundaryPrefixHash
+  )
+  if (localGroups.length === 0 || persistedGroups.length === 0) {
+    return { localGroups, persistedRangeByLocalGroup, verifiedBoundaryIndex }
+  }
+
+  const localGroupByTurn = new Array<number>(localTurns.length)
+  const persistedGroupByTurn = new Array<number>(persisted.length)
+  localGroups.forEach((group, groupIndex) => {
+    for (let index = group.start; index < group.end; index += 1) {
+      localGroupByTurn[index] = groupIndex
+    }
+  })
+  persistedGroups.forEach((group, groupIndex) => {
+    for (let index = group.start; index < group.end; index += 1) {
+      persistedGroupByTurn[index] = groupIndex
+    }
+  })
+  const usedPersistedTurns = new Set<number>()
+  const rangeIsFree = (range: TurnGroup) => {
+    for (let index = range.start; index < range.end; index += 1) {
+      if (usedPersistedTurns.has(index)) return false
+    }
+    return true
+  }
+  const occupyRange = (range: TurnGroup) => {
+    for (let index = range.start; index < range.end; index += 1) {
+      usedPersistedTurns.add(index)
+    }
+  }
+  const persistedRangeForMatch = (
+    localGroup: number,
+    persistedIndex: number
+  ): TurnGroup =>
+    localTurns[localGroups[localGroup]!.start]!.role === "user"
+      ? persistedGroups[persistedGroupByTurn[persistedIndex]!]!
+      : { start: persistedIndex, end: persistedIndex + 1 }
+
+  const matchByUniqueTurnKey = (
+    keyForTurn: (turn: MessageTurn) => string | null
+  ) => {
+    const localIndexes = uniqueTurnIndexes(localTurns, keyForTurn)
+    const persistedIndexes = uniqueTurnIndexes(persisted, keyForTurn)
+    const candidates = new Map<number, Map<string, TurnGroup>>()
+    for (const [key, localIndex] of localIndexes) {
+      const persistedIndex = persistedIndexes.get(key)
+      if (persistedIndex === undefined) continue
+      const localGroup = localGroupByTurn[localIndex]!
+      const range = persistedRangeForMatch(localGroup, persistedIndex)
+      const groupCandidates =
+        candidates.get(localGroup) ?? new Map<string, TurnGroup>()
+      groupCandidates.set(`${range.start}:${range.end}`, range)
+      candidates.set(localGroup, groupCandidates)
+    }
+    const targetCounts = new Map<string, number>()
+    for (const groupCandidates of candidates.values()) {
+      if (groupCandidates.size !== 1) continue
+      const target = groupCandidates.keys().next().value as string
+      targetCounts.set(target, (targetCounts.get(target) ?? 0) + 1)
+    }
+    for (const [localGroup, groupCandidates] of candidates) {
+      if (
+        persistedRangeByLocalGroup.has(localGroup) ||
+        groupCandidates.size !== 1
+      ) {
+        continue
+      }
+      const target = groupCandidates.keys().next().value as string
+      const range = groupCandidates.values().next().value as TurnGroup
+      if (targetCounts.get(target) === 1 && rangeIsFree(range)) {
+        persistedRangeByLocalGroup.set(localGroup, range)
+        occupyRange(range)
+      }
+    }
+  }
+
+  if (
+    detail?.in_flight_user_turn_id == null &&
+    verifiedBoundaryIndex != null &&
+    !persisted.some((turn) => turn.role === "user")
+  ) {
+    let localGroup = -1
+    for (let index = localGroups.length - 1; index >= 0; index -= 1) {
+      const group = localGroups[index]!
+      if (
+        localTurns[group.start]!.role === "user" &&
+        group.end > group.start + 1
+      ) {
+        localGroup = index
+        break
+      }
+    }
+    let persistedGroup = -1
+    for (let index = persistedGroups.length - 1; index >= 0; index -= 1) {
+      const group = persistedGroups[index]!
+      if (
+        persisted[group.start]!.role === "assistant" &&
+        turnsOffsetOf(detail) + group.start >= verifiedBoundaryIndex
+      ) {
+        persistedGroup = index
+        break
+      }
+    }
+    if (localGroup >= 0 && persistedGroup >= 0) {
+      let firstPersistedGroup = persistedGroup
+      if (
+        !turnHasBackgroundTaskMarker(
+          persisted[persistedGroups[persistedGroup]!.start]
+        )
+      ) {
+        while (firstPersistedGroup > 0) {
+          const previous = persistedGroups[firstPersistedGroup - 1]!
+          if (
+            turnsOffsetOf(detail) + previous.start < verifiedBoundaryIndex ||
+            turnHasBackgroundTaskMarker(persisted[previous.start])
+          ) {
+            break
+          }
+          firstPersistedGroup -= 1
+        }
+      }
+      const range = {
+        start: persistedGroups[firstPersistedGroup]!.start,
+        end: persistedGroups[persistedGroup]!.end,
+      }
+      persistedRangeByLocalGroup.set(localGroup, range)
+      occupyRange(range)
+    }
+  }
+
+  matchByUniqueTurnKey((turn) => `${turn.role}\0${turn.id}`)
+  matchByUniqueTurnKey(persistIdentityKey)
+
+  const boundaryIndex =
+    detail == null || verifiedBoundaryIndex == null
+      ? -1
+      : verifiedBoundaryIndex - turnsOffsetOf(detail)
+  if (boundaryIndex >= 0 && boundaryIndex < persisted.length) {
+    const localGroup = 0
+    const persistedGroup = persistedGroupByTurn[boundaryIndex]!
+    const localFirst = localTurns[localGroups[localGroup]!.start]!
+    const persistedFirst = persisted[persistedGroups[persistedGroup]!.start]!
+    if (
+      !persistedRangeByLocalGroup.has(localGroup) &&
+      rangeIsFree(persistedGroups[persistedGroup]!) &&
+      localFirst.role === "user" &&
+      localGroups[localGroup]!.end > localGroups[localGroup]!.start + 1 &&
+      persistedFirst.role === "user" &&
+      contentBlocksEquivalent(localFirst.blocks, persistedFirst.blocks)
+    ) {
+      const range = persistedGroups[persistedGroup]!
+      persistedRangeByLocalGroup.set(localGroup, range)
+      occupyRange(range)
+    }
+  }
+
+  let previousPersistedEnd = -1
+  for (const localGroup of [...persistedRangeByLocalGroup.keys()].sort(
+    (left, right) => left - right
+  )) {
+    const range = persistedRangeByLocalGroup.get(localGroup)!
+    if (range.start < previousPersistedEnd) {
+      persistedRangeByLocalGroup.clear()
+      break
+    }
+    previousPersistedEnd = range.end
+  }
+
+  return { localGroups, persistedRangeByLocalGroup, verifiedBoundaryIndex }
+}
+
+function foldedBackgroundGroupCovers(
+  localTurns: readonly MessageTurn[],
+  localGroup: TurnGroup,
+  detail: DbConversationDetail,
+  persistedRange: TurnGroup,
   batchBoundaryIndex: number | null
-): number {
+): boolean {
   if (
-    detail == null ||
     detail.in_flight_user_turn_id != null ||
-    batchBoundaryIndex == null ||
-    lastIndexOfRole(detail.turns, "user") >= 0
-  ) {
-    return -1
-  }
-  const lastLocalUserIdx = lastIndexOfRole(localTurns, "user")
-  if (
-    lastLocalUserIdx < 0 ||
-    !localTurns
-      .slice(lastLocalUserIdx + 1)
-      .some((turn) => turn.role === "assistant")
-  ) {
-    return -1
-  }
-  const lastPersistedAssistantIdx = lastIndexOfRole(detail.turns, "assistant")
-  return lastPersistedAssistantIdx >= 0 &&
-    turnsOffsetOf(detail) + lastPersistedAssistantIdx >= batchBoundaryIndex &&
-    !turnHasBackgroundTaskMarker(detail.turns[lastPersistedAssistantIdx])
-    ? lastPersistedAssistantIdx
-    : -1
-}
-
-/**
- * Last-round window: the persist snapshot has caught up to the overlay's
- * last user without needing equal clocks. Only matching last-user text
- * is proof — a sole overlay user plus any persist history is not.
- */
-function lastUsersCorrespond(
-  localTurns: readonly MessageTurn[],
-  persisted: readonly MessageTurn[],
-  lastLocalUserIdx: number,
-  lastPersistUserIdx: number
-): boolean {
-  const localText = turnTextContent(localTurns[lastLocalUserIdx]!)
-  const persistText = turnTextContent(persisted[lastPersistUserIdx]!)
-  return localText.length > 0 && localText === persistText
-}
-
-function lastAssistantTextAfter(
-  turns: readonly MessageTurn[],
-  afterIdx: number
-): string | null {
-  for (let i = turns.length - 1; i > afterIdx; i--) {
-    if (turns[i]!.role !== "assistant") continue
-    const text = turnTextContent(turns[i]!)
-    return text.length > 0 ? text : null
-  }
-  return null
-}
-
-/**
- * Same completed round, not a repeated prompt: persist last-user text matches
- * the overlay, AND the settled assistant bodies match. A prior "continue"
- * that already has its own reply must not retire a new overlay with the same
- * user text (delegate baseline / awaiting_persist completeTurn).
- */
-function lastRoundsCorrespond(
-  localTurns: readonly MessageTurn[],
-  persisted: readonly MessageTurn[],
-  lastLocalUserIdx: number,
-  lastPersistUserIdx: number
-): boolean {
-  if (
-    !lastUsersCorrespond(
-      localTurns,
-      persisted,
-      lastLocalUserIdx,
-      lastPersistUserIdx
-    )
+    localTurns[localGroup.start]!.role !== "user" ||
+    detail.turns.some((turn) => turn.role === "user") ||
+    (batchBoundaryIndex != null && turnsTotalOf(detail) <= batchBoundaryIndex)
   ) {
     return false
   }
-  const localAssistant = lastAssistantTextAfter(localTurns, lastLocalUserIdx)
-  const persistAssistant = lastAssistantTextAfter(persisted, lastPersistUserIdx)
+  const lastPersistedAssistant = [...detail.turns]
+    .reverse()
+    .find((turn) => turn.role === "assistant")
   return (
-    localAssistant != null &&
-    persistAssistant != null &&
-    localAssistant === persistAssistant
+    lastPersistedAssistant != null &&
+    persistedRange.end - 1 === detail.turns.indexOf(lastPersistedAssistant) &&
+    turnHasBackgroundTaskMarker(lastPersistedAssistant)
   )
-}
-
-function ownerPersistedRound(
-  session: ConversationRuntimeSession,
-  persisted: readonly MessageTurn[]
-): {
-  persistedStart: number
-  persistedEnd: number
-  localStart: number
-} | null {
-  if (!session.lastTurnOwned || session.localTurns.length === 0) return null
-  const lastLocalUserIdx = lastIndexOfRole(session.localTurns, "user")
-  if (
-    lastLocalUserIdx < 0 ||
-    !session.localTurns
-      .slice(lastLocalUserIdx + 1)
-      .some((turn) => turn.role === "assistant")
-  ) {
-    return null
-  }
-
-  const localUser = session.localTurns[lastLocalUserIdx]!
-  const localIdentity = persistIdentityKey(localUser)
-  let persistedStart = persisted.findIndex(
-    (turn) => turn.role === "user" && turn.id === localUser.id
-  )
-  if (persistedStart < 0 && localIdentity != null) {
-    let identityMatch = -1
-    for (let i = 0; i < persisted.length; i++) {
-      if (persistIdentityKey(persisted[i]!) !== localIdentity) continue
-      if (identityMatch >= 0) {
-        identityMatch = -1
-        break
-      }
-      identityMatch = i
-    }
-    persistedStart = identityMatch
-  }
-
-  const boundary = session.batchBoundaryIndex
-  if (persistedStart < 0 && boundary != null) {
-    const boundaryIdx = boundary - turnsOffsetOf(session.detail)
-    if (
-      boundaryIdx >= 0 &&
-      boundaryIdx < persisted.length &&
-      persisted[boundaryIdx]!.role === "user" &&
-      lastUsersCorrespond(
-        session.localTurns,
-        persisted,
-        lastLocalUserIdx,
-        boundaryIdx
-      )
-    ) {
-      persistedStart = boundaryIdx
-    }
-  }
-  if (persistedStart < 0) return null
-
-  let persistedEnd = persisted.length
-  for (let i = persistedStart + 1; i < persisted.length; i++) {
-    const turn = persisted[i]!
-    if (turn.role === "assistant" && turn.autonomous_origin == null) continue
-    persistedEnd = i
-    break
-  }
-  return {
-    persistedStart,
-    persistedEnd,
-    localStart: lastLocalUserIdx,
-  }
 }
 
 /**
- * Drop localTurns already proven persisted in `detail.turns` by id,
- * role+timestamp, or a settled last-round window. Unpersisted remainder
- * is the only copy in an owner tab that does not refetch, so it is
- * never truncated by count.
+ * Drop local groups only after the aligned persisted group has equivalent
+ * content. IDs and timestamps align records; neither proves a parser snapshot
+ * is complete. Unpersisted or partial groups remain the authoritative overlay.
  */
 function retireCoveredLocalTurns(
   localTurns: MessageTurn[],
   detail: DbConversationDetail | null,
-  batchBoundaryIndex: number | null
+  batchBoundaryIndex: number | null,
+  batchBoundaryPrefixHash: string | null | undefined
 ): MessageTurn[] {
   if (localTurns.length === 0) return localTurns
   const persisted = detail?.turns ?? []
-  if (persisted.length === 0) return localTurns
-  if (
-    settledAssistantOnlyPartialIndex(localTurns, detail, batchBoundaryIndex) >=
-    0
+  if (persisted.length === 0 || detail == null) return localTurns
+  const alignment = alignTurnGroups(
+    localTurns,
+    detail,
+    batchBoundaryIndex,
+    batchBoundaryPrefixHash
+  )
+  let retiredGroupCount = 0
+  for (
+    let localGroupIndex = 0;
+    localGroupIndex < alignment.localGroups.length;
+    localGroupIndex += 1
   ) {
-    return localTurns
+    const persistedRange =
+      alignment.persistedRangeByLocalGroup.get(localGroupIndex)
+    if (!persistedRange) break
+    const localGroup = alignment.localGroups[localGroupIndex]!
+    if (
+      turnGroupsContentEquivalent(
+        localTurns,
+        localGroup,
+        persisted,
+        persistedRange
+      ) ||
+      foldedBackgroundGroupCovers(
+        localTurns,
+        localGroup,
+        detail,
+        persistedRange,
+        alignment.verifiedBoundaryIndex
+      )
+    ) {
+      retiredGroupCount += 1
+    } else {
+      break
+    }
   }
-  const persistedIds = new Set(persisted.map((t) => t.id))
-  const persistedIdentity = new Set<string>()
-  for (const turn of persisted) {
-    const key = persistIdentityKey(turn)
-    if (key) persistedIdentity.add(key)
-  }
-  // Mid-turn snapshots can carry a partial persist of the same reply.
-  // Last-round retirement needs a settled assistant after the last user.
-  const lastLocalUserIdx = lastIndexOfRole(localTurns, "user")
-  const lastPersistUserIdx = lastIndexOfRole(persisted, "user")
-  const lastPersistAssistantIdx = lastIndexOfRole(persisted, "assistant")
-  const persistSettled = detail?.in_flight_user_turn_id == null
-  const persistHasFoldedBackgroundTask =
-    lastPersistUserIdx < 0 &&
-    lastPersistAssistantIdx >= 0 &&
-    turnHasBackgroundTaskMarker(persisted[lastPersistAssistantIdx])
-  const persistHasAssistantAfterLastUser =
-    lastPersistUserIdx >= 0
-      ? persisted
-          .slice(lastPersistUserIdx + 1)
-          .some((t) => t.role === "assistant")
-      : persisted.some((t) => t.role === "assistant")
-  // A captured boundary is positive proof of where this local batch begins.
-  // Do not let an older, text-identical parser snapshot retire a newer round;
-  // the persisted transcript must first extend past the whole local overlay.
-  const persistedTurnTotal = turnsTotalOf(detail)
-  const persistCoversCapturedBatch =
-    batchBoundaryIndex == null ||
-    persistedTurnTotal >= batchBoundaryIndex + localTurns.length ||
-    // Background-task parsing folds [user, launch ack] into one terminal
-    // assistant record. Crossing the boundary is sufficient for that shape.
-    (persistHasFoldedBackgroundTask && persistedTurnTotal > batchBoundaryIndex)
-  // An assistant-only window covers the last overlay round only when it
-  // explicitly contains the folded async-sub-agent lifecycle marker.
-  // Persist with a last user only covers the overlay when the assistant
-  // bodies match — otherwise it is an earlier same-text prompt.
-  const lastRoundCovered =
-    persistSettled &&
-    persistCoversCapturedBatch &&
-    lastLocalUserIdx >= 0 &&
-    persistHasAssistantAfterLastUser &&
-    (lastPersistUserIdx >= 0
-      ? lastRoundsCorrespond(
-          localTurns,
-          persisted,
-          lastLocalUserIdx,
-          lastPersistUserIdx
-        )
-      : persistHasFoldedBackgroundTask)
-  const retained = localTurns.filter((t, i) => {
-    if (persistedIds.has(t.id)) return false
-    const key = persistIdentityKey(t)
-    if (key && persistedIdentity.has(key)) return false
-    return !(
-      lastRoundCovered &&
-      ((i === lastLocalUserIdx && t.role === "user") ||
-        (i > lastLocalUserIdx && t.role === "assistant"))
-    )
-  })
-  return retained.length === localTurns.length ? localTurns : retained
+  if (retiredGroupCount === 0) return localTurns
+  const firstRetained = alignment.localGroups[retiredGroupCount]?.start
+  return firstRetained === undefined ? [] : localTurns.slice(firstRetained)
 }
 
 function batchStartCapture(
@@ -2368,16 +2565,22 @@ function reducer(
         ...current,
         detailLoading: true,
         detailError: null,
+        detailHistoryLoadingOlder: action.authoritative
+          ? false
+          : current.detailHistoryLoadingOlder,
+        loadingOlderTurns: action.authoritative
+          ? false
+          : current.loadingOlderTurns,
       }))
 
     case "FETCH_DETAIL_SUCCESS": {
       const current =
         state.byConversationId.get(action.conversationId) ??
         createEmptySession(action.conversationId)
-      const detail = preserveLoadedHistoryOnRefetch(
-        current.detail,
-        action.detail
-      )
+      const authoritative = action.authoritative === true
+      const detail = authoritative
+        ? action.detail
+        : preserveLoadedHistoryOnRefetch(current.detail, action.detail)
       const nextExternalId = detail.summary.external_id ?? null
 
       // DB data is authoritative for completed turns. Normally clear all the
@@ -2400,11 +2603,12 @@ function reducer(
       // proves — even when `preserveLive` keeps liveMessage.
       const detailIsInFlight = detail.in_flight_user_turn_id != null
       const isActivelyInteracting =
-        current.syncState === "awaiting_persist" ||
-        action.preserveLive === true ||
-        detailIsInFlight
+        !authoritative &&
+        (current.syncState === "awaiting_persist" ||
+          action.preserveLive === true ||
+          detailIsInFlight)
       const keepAllLiveBuffers =
-        action.preserveLive === true || detailIsInFlight
+        !authoritative && (action.preserveLive === true || detailIsInFlight)
 
       // Retire overlay turns the refetched detail now covers: both sides
       // measure byte offsets of the SAME transcript, so `entry.watermark <=
@@ -2413,23 +2617,31 @@ function reducer(
       // parsed from bytes appended after this fetch read the file). A detail
       // without a watermark (non-Claude parser) retires nothing — its overlay
       // is never populated anyway.
-      const nextBackgroundTurns = retireCoveredBackgroundTurns(
-        current.backgroundTurns,
-        detail.transcript_watermark ?? null,
-        detail.uncovered_prefix_max_ts ?? null
-      )
+      const nextBackgroundTurns = authoritative
+        ? []
+        : retireCoveredBackgroundTurns(
+            current.backgroundTurns,
+            detail.transcript_watermark ?? null,
+            detail.uncovered_prefix_max_ts ?? null
+          )
       // Mid-turn snapshots can carry a partial persist of the same reply.
       // Do not retire the more-complete overlay against that partial.
       // Settled refetches — including idle `preserveLive` detail_refetch —
-      // still drop overlays proven persisted (id, role+timestamp, or a
-      // last-round window after the last corresponding user).
-      const nextLocalTurns = detailIsInFlight
-        ? current.localTurns
-        : retireCoveredLocalTurns(
-            current.localTurns,
-            detail,
-            current.batchBoundaryIndex
-          )
+      // still drop overlays whose aligned persisted content is complete.
+      const nextLocalTurns = authoritative
+        ? []
+        : detailIsInFlight
+          ? current.localTurns
+          : retireCoveredLocalTurns(
+              current.localTurns,
+              detail,
+              action.localAlignmentBoundaryIndex ?? current.batchBoundaryIndex,
+              action.localAlignmentBoundaryIndex !== undefined
+                ? undefined
+                : current.batchBoundaryPrefixHash
+            )
+      const retiredLocalPrefix =
+        nextLocalTurns.length < current.localTurns.length
 
       const nextSessionBase: ConversationRuntimeSession = {
         ...current,
@@ -2441,6 +2653,21 @@ function reducer(
         externalId: nextExternalId ?? current.externalId,
         sessionStats: detail.session_stats ?? current.sessionStats,
         backgroundTurns: nextBackgroundTurns,
+        syncState: authoritative ? "idle" : current.syncState,
+        activeTurnToken: authoritative ? null : current.activeTurnToken,
+        lastTurnOwned: authoritative ? false : current.lastTurnOwned,
+        liveOwnsActiveTurn: authoritative ? false : current.liveOwnsActiveTurn,
+        historyAssistantBaseline: authoritative
+          ? null
+          : current.historyAssistantBaseline,
+        batchBoundaryIndex:
+          authoritative || retiredLocalPrefix
+            ? null
+            : current.batchBoundaryIndex,
+        batchBoundaryPrefixHash:
+          authoritative || retiredLocalPrefix
+            ? null
+            : current.batchBoundaryPrefixHash,
         ...(isActivelyInteracting
           ? { localTurns: nextLocalTurns }
           : {
@@ -2599,15 +2826,23 @@ function reducer(
         detail.transcript_watermark ?? null,
         page.uncovered_prefix_max_ts ?? null
       )
+      const nextLocalTurns = retireCoveredLocalTurns(
+        current.localTurns,
+        nextDetail,
+        current.batchBoundaryIndex,
+        current.batchBoundaryPrefixHash
+      )
+      const retiredLocalPrefix =
+        nextLocalTurns.length < current.localTurns.length
       return updateSessionInState(state, action.conversationId, (s) => ({
         ...s,
         detail: nextDetail,
         backgroundTurns: nextBackgroundTurns,
-        localTurns: retireCoveredLocalTurns(
-          current.localTurns,
-          nextDetail,
-          current.batchBoundaryIndex
-        ),
+        localTurns: nextLocalTurns,
+        batchBoundaryIndex: retiredLocalPrefix ? null : s.batchBoundaryIndex,
+        batchBoundaryPrefixHash: retiredLocalPrefix
+          ? null
+          : s.batchBoundaryPrefixHash,
         loadingOlderTurns: false,
         // Explicit prepend signal for the virtualized thread's `shift`
         // derivation — see the field doc.
@@ -2686,9 +2921,12 @@ function reducer(
         ? retireCoveredLocalTurns(
             current.localTurns,
             current.detail,
-            current.batchBoundaryIndex
+            current.batchBoundaryIndex,
+            current.batchBoundaryPrefixHash
           )
         : current.localTurns
+      const retiredBeforePromotion =
+        previousLocalTurns.length < current.localTurns.length
       const promotedRaw = [
         ...previousLocalTurns,
         ...inFlightOptimistic,
@@ -2736,8 +2974,11 @@ function reducer(
         : retireCoveredLocalTurns(
             promoted,
             current.detail,
-            current.batchBoundaryIndex
+            current.batchBoundaryIndex,
+            current.batchBoundaryPrefixHash
           )
+      const retiredLocalPrefix =
+        retiredBeforePromotion || completedLocalTurns.length < promoted.length
 
       return updateSessionInState(state, action.conversationId, () => ({
         ...current,
@@ -2747,6 +2988,12 @@ function reducer(
         liveMessage: null,
         syncState: "idle",
         activeTurnToken: null,
+        batchBoundaryIndex: retiredLocalPrefix
+          ? null
+          : current.batchBoundaryIndex,
+        batchBoundaryPrefixHash: retiredLocalPrefix
+          ? null
+          : current.batchBoundaryPrefixHash,
         // Persist projected activities for overlay consumers (I3).
         delegationActivities,
         // Capture WHO drove this turn before `syncState` collapses to `idle`:
@@ -3786,6 +4033,7 @@ export interface ConversationRuntimeContextValue extends RuntimeActions {
 // per conversation); a cleanup sweep isn't needed for the expected cardinality.
 const fetchGeneration = new Map<number, number>()
 const historyPageGeneration = new Map<number, number>()
+const authoritativeFetchGeneration = new Map<number, number>()
 
 function bumpFetchGeneration(conversationId: number): number {
   const next = (fetchGeneration.get(conversationId) ?? 0) + 1
@@ -3811,6 +4059,15 @@ function isLatestHistoryPageGeneration(
   generation: number
 ): boolean {
   return historyPageGeneration.get(conversationId) === generation
+}
+
+function invalidateOutstandingDetailRequests(): void {
+  for (const conversationId of fetchGeneration.keys()) {
+    bumpFetchGeneration(conversationId)
+  }
+  for (const conversationId of historyPageGeneration.keys()) {
+    bumpHistoryPageGeneration(conversationId)
+  }
 }
 
 // ─── User-stop cancel reconciliation ─────────────────────────────────────
@@ -4911,6 +5168,7 @@ interface DelegateTerminalSyncAnchor {
   persistedUserId: string | null
   contentKey: string
   minPersistedIndex: number
+  alignmentPersistedIndex: number | null
 }
 
 function captureDelegateTerminalSyncAnchor(
@@ -4947,6 +5205,7 @@ function captureDelegateTerminalSyncAnchor(
       persistedIndex = inFlightIndex
     }
   }
+  const alignmentPersistedIndex = persistedIndex >= 0 ? persistedIndex : null
   if (persistedIndex < 0) {
     let trailingUserIndex = -1
     for (let index = persisted.length - 1; index >= 0; index -= 1) {
@@ -4971,6 +5230,7 @@ function captureDelegateTerminalSyncAnchor(
     persistedUserId: persistedIndex >= 0 ? persisted[persistedIndex].id : null,
     contentKey,
     minPersistedIndex: persistedIndex >= 0 ? persistedIndex : persisted.length,
+    alignmentPersistedIndex,
   }
 }
 
@@ -5107,22 +5367,70 @@ function computeHistoricalTimeline(
   const liveMessageId = key.liveMessageId
   const liveStartedAt = key.liveStartedAt
   const rawPersistedTurns = session.detail?.turns ?? []
-  const ownerRound = ownerPersistedRound(session, rawPersistedTurns)
-  const ownerLocalTurns = ownerRound
-    ? session.localTurns.slice(ownerRound.localStart)
-    : []
-  const ownerLocalKeys = ownerRound
-    ? new Set(ownerLocalTurns.map((turn) => `${turn.role}\0${turn.id}`))
-    : null
-  const persistedWithOwnerReplacement = ownerRound
-    ? [
-        ...rawPersistedTurns.slice(0, ownerRound.persistedStart),
-        ...ownerLocalTurns,
-        ...rawPersistedTurns.slice(ownerRound.persistedEnd),
-      ]
-    : rawPersistedTurns
-  const remainingLocalTurns = ownerRound
-    ? session.localTurns.slice(0, ownerRound.localStart)
+  const alignment = session.liveOwnsActiveTurn
+    ? null
+    : alignTurnGroups(
+        session.localTurns,
+        session.detail,
+        session.batchBoundaryIndex,
+        session.batchBoundaryPrefixHash
+      )
+  const localGroupByPersistedStart = new Map<
+    number,
+    { localGroup: number; persistedEnd: number }
+  >()
+  const consumedLocalGroups = new Set<number>()
+  alignment?.persistedRangeByLocalGroup.forEach(
+    (persistedRange, localGroup) => {
+      const group = alignment.localGroups[localGroup]!
+      if (
+        session.localTurns[group.start]!.role === "user" &&
+        group.end === group.start + 1
+      ) {
+        consumedLocalGroups.add(localGroup)
+        return
+      }
+      localGroupByPersistedStart.set(persistedRange.start, {
+        localGroup,
+        persistedEnd: persistedRange.end,
+      })
+    }
+  )
+  const replacementLocalKeys = new Set<string>()
+  const persistedWithLocalReplacement: MessageTurn[] = []
+  if (alignment) {
+    let nextLocalGroup = 0
+    for (let persistedIndex = 0; persistedIndex < rawPersistedTurns.length; ) {
+      const matched = localGroupByPersistedStart.get(persistedIndex)
+      if (!matched) {
+        persistedWithLocalReplacement.push(rawPersistedTurns[persistedIndex]!)
+        persistedIndex += 1
+        continue
+      }
+      for (; nextLocalGroup <= matched.localGroup; nextLocalGroup += 1) {
+        if (consumedLocalGroups.has(nextLocalGroup)) continue
+        const localGroup = alignment.localGroups[nextLocalGroup]!
+        const replacement = session.localTurns.slice(
+          localGroup.start,
+          localGroup.end
+        )
+        persistedWithLocalReplacement.push(...replacement)
+        replacement.forEach((turn) =>
+          replacementLocalKeys.add(`${turn.role}\0${turn.id}`)
+        )
+        consumedLocalGroups.add(nextLocalGroup)
+      }
+      persistedIndex = matched.persistedEnd
+    }
+  } else {
+    persistedWithLocalReplacement.push(...rawPersistedTurns)
+  }
+  const remainingLocalTurns = alignment
+    ? alignment.localGroups.flatMap((group, groupIndex) =>
+        consumedLocalGroups.has(groupIndex)
+          ? []
+          : session.localTurns.slice(group.start, group.end)
+      )
     : session.localTurns
   const hasLiveOrLocalReply =
     session.liveOwnsActiveTurn &&
@@ -5134,36 +5442,21 @@ function computeHistoricalTimeline(
   let stripFrom = -1
   if (hasLiveOrLocalReply) {
     let lastUserIdx = -1
-    for (let i = persistedWithOwnerReplacement.length - 1; i >= 0; i--) {
-      if (persistedWithOwnerReplacement[i]!.role === "user") {
+    for (let i = persistedWithLocalReplacement.length - 1; i >= 0; i--) {
+      if (persistedWithLocalReplacement[i]!.role === "user") {
         lastUserIdx = i
         break
       }
     }
     stripFrom =
       lastUserIdx === -1
-        ? persistedWithOwnerReplacement.findIndex((t) => t.role === "assistant")
+        ? persistedWithLocalReplacement.findIndex((t) => t.role === "assistant")
         : lastUserIdx + 1
   }
   const persistedTurns =
     stripFrom !== -1
-      ? persistedWithOwnerReplacement.slice(0, stripFrom)
-      : persistedWithOwnerReplacement
-
-  // A long settled round can exceed the backend's round-alignment cap, so a
-  // windowed refetch may contain only the parser's latest partial assistant.
-  // Keep the complete local round authoritative until a user boundary lands.
-  const settledLocalPartialIdx = hasLiveOrLocalReply
-    ? -1
-    : settledAssistantOnlyPartialIndex(
-        session.localTurns,
-        session.detail,
-        session.batchBoundaryIndex
-      )
-  const persistedWithoutLocalPartial =
-    settledLocalPartialIdx >= 0
-      ? persistedTurns.filter((_, i) => i !== settledLocalPartialIdx)
-      : persistedTurns
+      ? persistedWithLocalReplacement.slice(0, stripFrom)
+      : persistedWithLocalReplacement
 
   // Suppress the persisted PARTIAL in-flight reply for a non-delegation
   // cross-client viewer. While a reply is streaming, some agents (OpenCode,
@@ -5190,14 +5483,14 @@ function computeHistoricalTimeline(
   const inFlightPromptId = session.detail?.in_flight_user_turn_id ?? null
   const inFlightPromptIdx =
     !hasLiveOrLocalReply && liveMessageId !== null && inFlightPromptId !== null
-      ? persistedWithoutLocalPartial.findIndex(
+      ? persistedTurns.findIndex(
           (t) => t.role === "user" && t.id === inFlightPromptId
         )
       : -1
   const visiblePersistedTurns =
     inFlightPromptIdx === -1
-      ? persistedWithoutLocalPartial
-      : persistedWithoutLocalPartial.filter(
+      ? persistedTurns
+      : persistedTurns.filter(
           (t, i) => i <= inFlightPromptIdx || t.role !== "assistant"
         )
 
@@ -5227,7 +5520,7 @@ function computeHistoricalTimeline(
   // collision-free here.
   const persisted: ConversationTimelineTurn[] = visiblePersistedTurns.map(
     (turn, i) => ({
-      key: ownerLocalKeys?.has(`${turn.role}\0${turn.id}`)
+      key: replacementLocalKeys.has(`${turn.role}\0${turn.id}`)
         ? `local-${conversationId}-${turn.id}`
         : `persisted-${conversationId}-${turn.id}`,
       turn,
@@ -5412,6 +5705,7 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
   }
 
   const fetchDetail = (conversationId: number): void => {
+    if (authoritativeFetchGeneration.has(conversationId)) return
     const session = get().byConversationId.get(conversationId)
     if (session?.detail || session?.detailLoading) return
     if (sessionHasPendingCancel(session)) return
@@ -5482,6 +5776,7 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
     conversationId: number,
     options?: { preserveLive?: boolean }
   ): void => {
+    if (authoritativeFetchGeneration.has(conversationId)) return
     // The session key is not always a fetchable DB id: a conversation started
     // as a new-chat draft keeps its virtual (negative) key for the tab's whole
     // life. Fetch with the bound DB row id (see `dbConversationId`) and store
@@ -5731,9 +6026,18 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
     clearCancelReconcile(conversationId)
     const session = get().byConversationId.get(conversationId)
     if (!session) return
+    cancelViewerDetailSync(conversationId)
+    delegateTerminalSyncCancels.get(conversationId)?.()
+    pendingDelegateTerminalSync.delete(conversationId)
+    bumpHistoryPageGeneration(conversationId)
     const fetchId = resolvePersistedConversationId(session, conversationId)
     const generation = bumpFetchGeneration(conversationId)
-    dispatch({ type: "FETCH_DETAIL_START", conversationId })
+    authoritativeFetchGeneration.set(conversationId, generation)
+    dispatch({
+      type: "FETCH_DETAIL_START",
+      conversationId,
+      authoritative: true,
+    })
     getFolderConversation(fetchId, runtimeRefetchHistoryFetchOptions(session))
       .then((detail) => {
         if (!isLatestGeneration(conversationId, generation)) return
@@ -5742,11 +6046,18 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
           conversationId,
           detail,
           preserveLive: false,
+          authoritative: true,
         })
-        afterDetailFetchSuccess(conversationId, detail)
+        if (authoritativeFetchGeneration.get(conversationId) === generation) {
+          authoritativeFetchGeneration.delete(conversationId)
+        }
+        installWorkflowGraphFromDetail(conversationId, detail)
       })
       .catch((error: unknown) => {
         if (!isLatestGeneration(conversationId, generation)) return
+        if (authoritativeFetchGeneration.get(conversationId) === generation) {
+          authoritativeFetchGeneration.delete(conversationId)
+        }
         dispatch({
           type: "FETCH_DETAIL_ERROR",
           conversationId,
@@ -5756,6 +6067,7 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
   }
 
   const loadOlderHistory = (conversationId: number): void => {
+    if (authoritativeFetchGeneration.has(conversationId)) return
     const session = get().byConversationId.get(conversationId)
     if (!session?.detail?.turns.length) return
     if (session.detailHistoryLoadingOlder || session.detailLoading) return
@@ -5806,6 +6118,7 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
    * and any fetch issued after the page invalidates the page.
    */
   const loadOlderTurns = (conversationId: number): void => {
+    if (authoritativeFetchGeneration.has(conversationId)) return
     const session = get().byConversationId.get(conversationId)
     const detail = session?.detail ?? null
     if (!session || !detail || !isWindowedDetail(detail)) return
@@ -5814,11 +6127,14 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
     const expectedSeamHash = detail.prefix_hash
     const fetchId = session.dbConversationId ?? conversationId
     const generation = bumpFetchGeneration(conversationId)
+    const pageGeneration = bumpHistoryPageGeneration(conversationId)
     dispatch({ type: "LOAD_OLDER_TURNS_START", conversationId })
     getFolderConversationTurns(fetchId, beforeIndex, OLDER_TURNS_PAGE_SIZE)
       .then((page) => {
         if (!isLatestGeneration(conversationId, generation)) {
-          dispatch({ type: "LOAD_OLDER_TURNS_DONE", conversationId })
+          if (isLatestHistoryPageGeneration(conversationId, pageGeneration)) {
+            dispatch({ type: "LOAD_OLDER_TURNS_DONE", conversationId })
+          }
           return
         }
         // Seam broken by a prefix rewrite between requests: the loaded
@@ -5841,6 +6157,9 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
         // Transient (old server: the endpoint 501s — unreachable in practice
         // because a legacy detail never reports turns_offset > 0). Clear the
         // flag; the top sentinel retriggers on the next scroll.
+        if (!isLatestHistoryPageGeneration(conversationId, pageGeneration)) {
+          return
+        }
         dispatch({ type: "LOAD_OLDER_TURNS_DONE", conversationId })
       })
   }
@@ -5860,6 +6179,7 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
       nudgedConversationId
     )
     if (conversationId == null) return
+    if (authoritativeFetchGeneration.has(conversationId)) return
     const session = get().byConversationId.get(conversationId)
     if (!session || !isPureViewerSession(session)) return
     // Exclusive path: pending cancel fence blocks unfenced viewer destructive sync.
@@ -6000,6 +6320,7 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
       nudgedConversationId
     )
     if (conversationId == null) return
+    if (authoritativeFetchGeneration.has(conversationId)) return
     const initial = get().byConversationId.get(conversationId)
     if (!initial) return
     // Exclusive path: do not unfenced-replace while cancel fence is pending.
@@ -6090,6 +6411,10 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
     })
 
     const anchor = captureDelegateTerminalSyncAnchor(get(), conversationId)
+    const localAlignmentBoundaryIndex =
+      anchor?.alignmentPersistedIndex != null
+        ? turnsOffsetOf(initial.detail) + anchor.alignmentPersistedIndex
+        : undefined
     let cancelled = false
     let timer: ReturnType<typeof setTimeout> | null = null
     const cancel = (): void => {
@@ -6153,6 +6478,7 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
               conversationId,
               detail,
               preserveLive: !converged,
+              localAlignmentBoundaryIndex,
             })
             installWorkflowGraphFromDetail(conversationId, detail)
           }
@@ -6623,6 +6949,7 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
       // detail. See `fetchGeneration` above.
       bumpFetchGeneration(conversationId)
       bumpHistoryPageGeneration(conversationId)
+      authoritativeFetchGeneration.delete(conversationId)
       stopCancelReconcileTimers(conversationId)
       stopSoftFenceTimer(conversationId)
       bumpCancelGeneration(conversationId)
@@ -6640,12 +6967,13 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
     },
     reset: () => {
       cancelAllDetailSyncs()
+      invalidateOutstandingDetailRequests()
       cancelGenerationById.clear()
       recordedTurnOutcomeKeys.clear()
       userStopNoCoordinatorCompletions.clear()
       userStopCompletionRegistries.clear()
       cancelReconcileRuntimes.clear()
-      historyPageGeneration.clear()
+      authoritativeFetchGeneration.clear()
       dispatch({ type: "RESET" })
       liveTranscriptStore.reset()
     },
@@ -6823,13 +7151,8 @@ export function completeLiveTranscriptTurn(
  * lifetime and is never reset.
  */
 export function resetConversationRuntimeStore(): void {
-  // NOTE: clearing (vs. epoch-bumping) means a pre-reset in-flight fetch could
-  // re-match a post-reset generation and commit stale detail. Harmless today —
-  // the only production caller (the backend-identity guard) never fires and tests
-  // have no concurrent fetches — but a real in-place backend switch would need a
-  // backend epoch here. See `RemoteConnectionGate`.
-  fetchGeneration.clear()
-  historyPageGeneration.clear()
+  invalidateOutstandingDetailRequests()
+  authoritativeFetchGeneration.clear()
   cancelGenerationById.clear()
   recordedTurnOutcomeKeys.clear()
   userStopOwnershipById.clear()

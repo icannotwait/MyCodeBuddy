@@ -274,6 +274,7 @@ describe("refetchDetail — assistant-only window", () => {
       },
       localTurns,
       batchBoundaryIndex: 120,
+      batchBoundaryPrefixHash: "0000000000000120",
     })
     mockGet.mockResolvedValue({
       ...detail([assistantTurn("parser-a", "partial Stage B")], 110),
@@ -311,6 +312,7 @@ describe("refetchDetail — assistant-only window", () => {
       },
       localTurns,
       batchBoundaryIndex: 120,
+      batchBoundaryPrefixHash: "0000000000000120",
     })
     mockGet.mockResolvedValue({
       ...detail(
@@ -392,6 +394,7 @@ describe("refetchDetail — assistant-only window", () => {
         },
         localTurns,
         batchBoundaryIndex: 120,
+        batchBoundaryPrefixHash: "0000000000000120",
       })
       mockGet.mockResolvedValue({
         ...detail([persistedTurn], 110),
@@ -425,6 +428,7 @@ describe("refetchDetail — assistant-only window", () => {
       },
       localTurns,
       batchBoundaryIndex: 120,
+      batchBoundaryPrefixHash: "0000000000000120",
     })
     mockGet.mockResolvedValue({
       ...detail(
@@ -476,7 +480,11 @@ describe("refetchDetail — assistant-only window", () => {
     useConversationRuntimeStore.setState((state) => {
       const current = state.byConversationId.get(CID)!
       const next = new Map(state.byConversationId)
-      next.set(CID, { ...current, batchBoundaryIndex: 120 })
+      next.set(CID, {
+        ...current,
+        batchBoundaryIndex: 120,
+        batchBoundaryPrefixHash: "0000000000000120",
+      })
       return { byConversationId: next }
     })
 
@@ -816,7 +824,7 @@ describe("syncDelegateTerminalDetail", () => {
     expect(session()?.liveMessage).toBeNull()
   })
 
-  it("does not match a repeated prompt before the captured baseline", async () => {
+  it("does not use repeated prompt content as retirement identity", async () => {
     vi.useFakeTimers()
     const delegateSummary: DbConversationSummary = {
       ...detail([]).summary,
@@ -863,8 +871,17 @@ describe("syncDelegateTerminalDetail", () => {
     await vi.advanceTimersByTimeAsync(0)
     expect(session()?.localTurns).toHaveLength(2)
     await vi.advanceTimersByTimeAsync(300)
-    expect(session()?.localTurns).toEqual([])
+    expect(session()?.localTurns.map((turn) => turn.id)).toEqual([
+      "wire-new-u",
+      "wire-new-a",
+    ])
     expect(session()?.detail?.turns.at(-1)?.id).toBe("parser-new-a")
+    const timelineIds = selectTimelineTurns(
+      useConversationRuntimeStore.getState(),
+      CID
+    ).map((entry) => entry.turn.id)
+    expect(timelineIds).toContain("wire-new-a")
+    expect(timelineIds).not.toContain("parser-new-a")
   })
 
   it("waits for in_flight_user_turn_id to clear even when an assistant tail exists", async () => {

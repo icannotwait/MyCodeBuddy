@@ -353,6 +353,42 @@ describe("loadOlderTurns", () => {
     expect(session()?.loadingOlderTurns).toBe(false)
   })
 
+  it.each(["resolve", "reject"] as const)(
+    "does not let a pre-reload page %s clear a newer page's loading flag",
+    async (settlement) => {
+      let resolveOldPage!: (value: ConversationTurnsPage) => void
+      let rejectOldPage!: (reason: unknown) => void
+      let resolveReload!: (value: DbConversationDetail) => void
+      const oldPage = new Promise<ConversationTurnsPage>((resolve, reject) => {
+        resolveOldPage = resolve
+        rejectOldPage = reject
+      })
+      const reload = new Promise<DbConversationDetail>((resolve) => {
+        resolveReload = resolve
+      })
+      const freshPage = new Promise<ConversationTurnsPage>(() => undefined)
+      seed({ detail: windowedDetail(4) })
+      mockGetTurns.mockReturnValueOnce(oldPage).mockReturnValueOnce(freshPage)
+      mockGet.mockReturnValueOnce(reload)
+
+      actions().loadOlderTurns(CID)
+      actions().reloadDetail(CID, { reason: "manual_reload" })
+      resolveReload(windowedDetail(4))
+      await flush()
+
+      actions().loadOlderTurns(CID)
+      expect(session()?.loadingOlderTurns).toBe(true)
+      if (settlement === "resolve") {
+        resolveOldPage(page(2, 4))
+      } else {
+        rejectOldPage(new Error("stale page failed"))
+      }
+      await flush()
+
+      expect(session()?.loadingOlderTurns).toBe(true)
+    }
+  )
+
   it("dedupes turns already present at the seam", async () => {
     seed({ detail: windowedDetail(4) })
     // Malformed page that also carries the first loaded turn (turn-4).

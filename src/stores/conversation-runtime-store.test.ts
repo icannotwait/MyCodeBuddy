@@ -6,6 +6,7 @@ import type {
   ToolCallInfo,
 } from "@/contexts/acp-connections-context"
 import type {
+  ContentBlock,
   DbConversationDetail,
   MessageTurn,
   SessionStats,
@@ -70,6 +71,14 @@ function assistantTurn(
   }
 }
 
+function assistantTurnWithBlocks(
+  id: string,
+  blocks: ContentBlock[],
+  timestamp = "2026-05-28T00:00:01.000Z"
+): MessageTurn {
+  return { id, role: "assistant", blocks, timestamp }
+}
+
 function detailWithTurns(
   turns: MessageTurn[],
   overrides: Partial<DbConversationDetail> = {}
@@ -118,12 +127,19 @@ type SeedInput = {
   localTurns?: MessageTurn[]
   backgroundTurns?: BackgroundOverlayEntry[]
   optimisticTurns?: MessageTurn[]
+  queuedOptimisticTurnIds?: string[]
   liveMessage?: LiveMessage | null
   liveOwnsActiveTurn?: boolean
   delegationKickoffText?: string | null
   sessionStats?: SessionStats | null
   syncState?: "idle" | "awaiting_persist"
+  activeTurnToken?: string | null
+  lastTurnOwned?: boolean
+  historyAssistantBaseline?: number | null
   batchBoundaryIndex?: number | null
+  batchBoundaryPrefixHash?: string | null
+  detailHistoryLoadingOlder?: boolean
+  loadingOlderTurns?: boolean
 }
 
 function seedRuntimeSession(input: SeedInput = {}) {
@@ -138,22 +154,26 @@ function seedRuntimeSession(input: SeedInput = {}) {
           detail: input.detail ?? null,
           detailLoading: false,
           detailError: null,
-          detailHistoryLoadingOlder: false,
+          detailHistoryLoadingOlder: input.detailHistoryLoadingOlder ?? false,
           acpLoadError: null,
           localTurns: input.localTurns ?? [],
           backgroundTurns: input.backgroundTurns ?? [],
           pendingBackgroundSettlements: [],
           optimisticTurns: input.optimisticTurns ?? [],
+          queuedOptimisticTurnIds: input.queuedOptimisticTurnIds ?? [],
           liveMessage: input.liveMessage ?? null,
           syncState: input.syncState ?? "idle",
-          activeTurnToken: null,
-          lastTurnOwned: false,
+          activeTurnToken: input.activeTurnToken ?? null,
+          lastTurnOwned: input.lastTurnOwned ?? false,
           liveOwnsActiveTurn: input.liveOwnsActiveTurn ?? false,
           delegationKickoffText: input.delegationKickoffText ?? null,
           sessionStats: input.sessionStats ?? null,
           delegationActivities: [],
-          historyAssistantBaseline: null,
+          historyAssistantBaseline: input.historyAssistantBaseline ?? null,
           batchBoundaryIndex: input.batchBoundaryIndex ?? null,
+          batchBoundaryPrefixHash: input.batchBoundaryPrefixHash ?? null,
+          loadingOlderTurns: input.loadingOlderTurns ?? false,
+          olderTurnsPrependEpoch: 0,
           pendingCleanup: false,
           delegateSyncError: null,
           pendingCancel: null,
@@ -1375,7 +1395,9 @@ describe("runtime store — production agentType + delegationActivities", () => 
       const next = new Map(s.byConversationId)
       next.set(CID, {
         ...session,
-        detail: detailWithTurns([assistantTurn("live-42-keep-me")]),
+        detail: detailWithTurns([
+          assistantTurn("live-42-keep-me", "already persisted"),
+        ]),
         detailLoading: false,
       })
       return { byConversationId: next }
@@ -1422,7 +1444,9 @@ describe("runtime store — production agentType + delegationActivities", () => 
       const next = new Map(s.byConversationId)
       next.set(CID, {
         ...session,
-        detail: detailWithTurns([assistantTurn("live-42-keep-me")]),
+        detail: detailWithTurns([
+          assistantTurn("live-42-keep-me", "already persisted"),
+        ]),
         detailLoading: false,
         syncState: "idle",
       })
@@ -1455,8 +1479,8 @@ describe("runtime store — production agentType + delegationActivities", () => 
 
     mockGetFolderConversation.mockResolvedValueOnce(
       detailWithTurns([
-        assistantTurn("live-42-keep-me"),
-        assistantTurn("live-42-cap-0"),
+        assistantTurn("live-42-keep-me", "already persisted"),
+        assistantTurn("live-42-cap-0", "t0"),
       ])
     )
     actions.refetchDetail(CID, { preserveLive: false })
@@ -1475,6 +1499,1141 @@ describe("runtime store — production agentType + delegationActivities", () => 
 })
 
 describe("owner overlay retirement without live-* persist ids", () => {
+  it("keeps an owned final when a late refetch contains only its parser partial", async () => {
+    const userTimestamp = "2026-09-01T08:50:14.923Z"
+    const assistantTimestamp = "2026-09-01T08:50:42.568Z"
+    seedRuntimeSession({
+      detail: detailWithTurns([
+        userTurn("u-old", "old prompt", "2026-09-01T08:40:00.000Z"),
+        assistantTurn("a-old", "old reply", "2026-09-01T08:40:01.000Z"),
+      ]),
+      localTurns: [
+        userTurn("wire-latest-user", "continue", userTimestamp),
+        assistantTurn(
+          "live-42-latest",
+          "complete latest reply",
+          assistantTimestamp
+        ),
+      ],
+      syncState: "idle",
+      lastTurnOwned: true,
+      batchBoundaryIndex: 2,
+    })
+    mockGetFolderConversation.mockResolvedValueOnce(
+      detailWithTurns(
+        [
+          userTurn("u-old", "old prompt", "2026-09-01T08:40:00.000Z"),
+          assistantTurn("a-old", "old reply", "2026-09-01T08:40:01.000Z"),
+          userTurn("parser-user", "continue", userTimestamp),
+          assistantTurn(
+            "parser-assistant",
+            "partial latest reply",
+            assistantTimestamp
+          ),
+        ],
+        { turns_total: 4 }
+      )
+    )
+
+    useConversationRuntimeStore
+      .getState()
+      .actions.refetchDetail(CID, { preserveLive: true })
+    await Promise.resolve()
+    await Promise.resolve()
+
+    const state = useConversationRuntimeStore.getState()
+    expect(
+      state.byConversationId.get(CID)?.localTurns.map((turn) => turn.id)
+    ).toEqual(["wire-latest-user", "live-42-latest"])
+    expect(
+      selectHistoricalTimelineTurns(state, CID).map((entry) => entry.turn.id)
+    ).toEqual(["u-old", "a-old", "wire-latest-user", "live-42-latest"])
+    expect(selectHistoricalTimelineTurns(state, CID)[3]?.turn.blocks).toEqual([
+      { type: "text", text: "complete latest reply" },
+    ])
+  })
+
+  it("keeps consecutive owned finals ordered across completion and another stale refetch", async () => {
+    const previousUserTimestamp = "2026-09-01T08:50:14.923Z"
+    const previousAssistantTimestamp = "2026-09-01T08:50:42.568Z"
+    seedRuntimeSession({
+      detail: detailWithTurns(
+        [
+          userTurn("parser-user", "continue", previousUserTimestamp),
+          assistantTurn(
+            "parser-assistant",
+            "partial previous reply",
+            previousAssistantTimestamp
+          ),
+        ],
+        { turns_total: 2 }
+      ),
+      localTurns: [
+        userTurn("wire-previous-user", "continue", previousUserTimestamp),
+        assistantTurn(
+          "live-42-previous",
+          "complete previous reply",
+          previousAssistantTimestamp
+        ),
+      ],
+      optimisticTurns: [
+        userTurn("wire-current-user", "next prompt", "2026-09-01T08:51:00Z"),
+      ],
+      liveMessage: liveMessage(
+        "current",
+        "complete current reply",
+        Date.parse("2026-09-01T08:51:10Z")
+      ),
+      syncState: "awaiting_persist",
+      lastTurnOwned: true,
+      batchBoundaryIndex: 0,
+    })
+
+    useConversationRuntimeStore.getState().actions.completeTurn(CID)
+
+    const expectedIds = [
+      "wire-previous-user",
+      "live-42-previous",
+      "wire-current-user",
+      "live-42-current",
+    ]
+    let state = useConversationRuntimeStore.getState()
+    expect(
+      state.byConversationId.get(CID)?.localTurns.map((turn) => turn.id)
+    ).toEqual(expectedIds)
+    expect(
+      selectHistoricalTimelineTurns(state, CID).map((entry) => entry.turn.id)
+    ).toEqual(expectedIds)
+
+    mockGetFolderConversation.mockResolvedValueOnce(
+      detailWithTurns(
+        [
+          userTurn("parser-user", "continue", previousUserTimestamp),
+          assistantTurn(
+            "parser-assistant",
+            "partial previous reply",
+            previousAssistantTimestamp
+          ),
+        ],
+        { turns_total: 2 }
+      )
+    )
+    useConversationRuntimeStore
+      .getState()
+      .actions.refetchDetail(CID, { preserveLive: true })
+    await Promise.resolve()
+    await Promise.resolve()
+
+    state = useConversationRuntimeStore.getState()
+    expect(
+      state.byConversationId.get(CID)?.localTurns.map((turn) => turn.id)
+    ).toEqual(expectedIds)
+    expect(
+      selectHistoricalTimelineTurns(state, CID).map((entry) => entry.turn.id)
+    ).toEqual(expectedIds)
+  })
+
+  it("does not reuse a retired owner boundary for the newly completed round", async () => {
+    const previous = [
+      userTurn("wire-user-1", "continue", "2026-09-01T08:52:00Z"),
+      assistantTurn("wire-a-1", "done", "2026-09-01T08:52:01Z"),
+    ]
+    const persistedPrevious = detailWithTurns(previous)
+    seedRuntimeSession({
+      detail: persistedPrevious,
+      localTurns: previous,
+      optimisticTurns: [
+        userTurn("wire-user-2", "continue", "2026-09-01T08:53:00Z"),
+      ],
+      liveMessage: liveMessage(
+        "current",
+        "done",
+        Date.parse("2026-09-01T08:53:01Z")
+      ),
+      syncState: "awaiting_persist",
+      lastTurnOwned: true,
+      batchBoundaryIndex: 0,
+    })
+
+    const actions = useConversationRuntimeStore.getState().actions
+    actions.completeTurn(CID)
+    mockGetFolderConversation.mockResolvedValueOnce(persistedPrevious)
+    actions.refetchDetail(CID)
+    await Promise.resolve()
+    await Promise.resolve()
+
+    const state = useConversationRuntimeStore.getState()
+    expect(
+      state.byConversationId.get(CID)?.localTurns.map((turn) => turn.id)
+    ).toEqual(["wire-user-2", "live-42-current"])
+    expect(
+      selectHistoricalTimelineTurns(state, CID).map((entry) => entry.turn.id)
+    ).toEqual(["wire-user-1", "wire-a-1", "wire-user-2", "live-42-current"])
+  })
+
+  it("clears a retired boundary while the next owner round is in flight", async () => {
+    const previous = [
+      userTurn("wire-user-1", "continue", "2026-09-01T08:54:00Z"),
+      assistantTurn("wire-a-1", "done", "2026-09-01T08:54:01Z"),
+    ]
+    const persistedPrevious = detailWithTurns(previous)
+    seedRuntimeSession({
+      detail: detailWithTurns([]),
+      localTurns: previous,
+      optimisticTurns: [
+        userTurn("wire-user-2", "continue", "2026-09-01T08:55:00Z"),
+      ],
+      liveMessage: liveMessage(
+        "current",
+        "done",
+        Date.parse("2026-09-01T08:55:01Z")
+      ),
+      syncState: "awaiting_persist",
+      lastTurnOwned: true,
+      batchBoundaryIndex: 0,
+    })
+    mockGetFolderConversation
+      .mockResolvedValueOnce(persistedPrevious)
+      .mockResolvedValueOnce(persistedPrevious)
+
+    const actions = useConversationRuntimeStore.getState().actions
+    actions.refetchDetail(CID, { preserveLive: true })
+    await Promise.resolve()
+    await Promise.resolve()
+    actions.completeTurn(CID)
+    actions.refetchDetail(CID)
+    await Promise.resolve()
+    await Promise.resolve()
+
+    const state = useConversationRuntimeStore.getState()
+    expect(
+      state.byConversationId.get(CID)?.localTurns.map((turn) => turn.id)
+    ).toEqual(["wire-user-2", "live-42-current"])
+    expect(
+      selectHistoricalTimelineTurns(state, CID).map((entry) => entry.turn.id)
+    ).toEqual(["wire-user-1", "wire-a-1", "wire-user-2", "live-42-current"])
+  })
+
+  it("keeps a previous owner final when a viewer completes the next turn", () => {
+    const previousUserTimestamp = "2026-09-01T08:50:14.923Z"
+    const previousAssistantTimestamp = "2026-09-01T08:50:42.568Z"
+    seedRuntimeSession({
+      detail: detailWithTurns([
+        userTurn("parser-user", "continue", previousUserTimestamp),
+        assistantTurn(
+          "parser-assistant",
+          "partial previous reply",
+          previousAssistantTimestamp
+        ),
+      ]),
+      localTurns: [
+        userTurn("wire-previous-user", "continue", previousUserTimestamp),
+        assistantTurn(
+          "live-42-previous",
+          "complete previous reply",
+          previousAssistantTimestamp
+        ),
+      ],
+      optimisticTurns: [
+        userTurn("wire-viewer-user", "viewer prompt", "2026-09-01T08:51:00Z"),
+      ],
+      liveMessage: liveMessage(
+        "viewer",
+        "complete viewer reply",
+        Date.parse("2026-09-01T08:51:10Z")
+      ),
+      syncState: "idle",
+      lastTurnOwned: true,
+      batchBoundaryIndex: 0,
+    })
+
+    useConversationRuntimeStore.getState().actions.completeTurn(CID)
+
+    const state = useConversationRuntimeStore.getState()
+    const expectedIds = [
+      "wire-previous-user",
+      "live-42-previous",
+      "wire-viewer-user",
+      "live-42-viewer",
+    ]
+    expect(
+      state.byConversationId.get(CID)?.localTurns.map((turn) => turn.id)
+    ).toEqual(expectedIds)
+    expect(
+      selectHistoricalTimelineTurns(state, CID).map((entry) => entry.turn.id)
+    ).toEqual(expectedIds)
+  })
+
+  it("keeps the complete body when an exact-id persisted turn only has its final text", async () => {
+    const localTurns = [
+      userTurn("shared-user", "inspect everything", "2026-09-01T09:00:00Z"),
+      assistantTurnWithBlocks(
+        "shared-assistant",
+        [
+          { type: "thinking", text: "full reasoning" },
+          {
+            type: "tool_use",
+            tool_use_id: "tool-1",
+            tool_name: "Read",
+            input_preview: '{"path":"a.ts"}',
+          },
+          {
+            type: "tool_result",
+            tool_use_id: "tool-1",
+            output_preview: "file contents",
+            is_error: false,
+            images: [
+              { data: "image-bytes", mime_type: "image/png", uri: null },
+            ],
+          },
+          { type: "text", text: "same final text" },
+        ],
+        "2026-09-01T09:00:10Z"
+      ),
+    ]
+    seedRuntimeSession({
+      detail: detailWithTurns([]),
+      localTurns,
+      lastTurnOwned: true,
+      batchBoundaryIndex: 0,
+    })
+    mockGetFolderConversation.mockResolvedValueOnce(
+      detailWithTurns([
+        userTurn("shared-user", "inspect everything", "2026-09-01T09:00:00Z"),
+        assistantTurn(
+          "shared-assistant",
+          "same final text",
+          "2026-09-01T09:00:10Z"
+        ),
+      ])
+    )
+
+    useConversationRuntimeStore.getState().actions.refetchDetail(CID)
+    await Promise.resolve()
+    await Promise.resolve()
+
+    const state = useConversationRuntimeStore.getState()
+    expect(state.byConversationId.get(CID)?.localTurns).toEqual(localTurns)
+    expect(
+      selectHistoricalTimelineTurns(state, CID).map((entry) => entry.turn.id)
+    ).toEqual(["shared-user", "shared-assistant"])
+    expect(selectHistoricalTimelineTurns(state, CID)[1]?.turn.blocks).toEqual(
+      localTurns[1]?.blocks
+    )
+  })
+
+  it.each([
+    [
+      "tool-only",
+      [
+        {
+          type: "tool_use" as const,
+          tool_use_id: "tool-1",
+          tool_name: "Read",
+          input_preview: '{"path":"a.ts"}',
+        },
+        {
+          type: "tool_result" as const,
+          tool_use_id: "tool-1",
+          output_preview: "done",
+          is_error: false,
+        },
+      ],
+    ],
+    [
+      "image-only",
+      [
+        {
+          type: "image" as const,
+          data: "image-bytes",
+          mime_type: "image/png",
+          uri: null,
+        },
+      ],
+    ],
+  ])("retires a fully persisted %s owner round", async (_, blocks) => {
+    const localTurns = [
+      userTurn("wire-user", "show result", "2026-09-01T09:10:00Z"),
+      assistantTurnWithBlocks("live-assistant", blocks, "2026-09-01T09:10:10Z"),
+    ]
+    seedRuntimeSession({
+      detail: detailWithTurns([]),
+      localTurns,
+      lastTurnOwned: true,
+      batchBoundaryIndex: 0,
+    })
+    mockGetFolderConversation.mockResolvedValueOnce(
+      detailWithTurns([
+        userTurn("parser-user", "show result", "2026-09-01T10:10:00Z"),
+        assistantTurnWithBlocks(
+          "parser-assistant",
+          blocks,
+          "2026-09-01T10:10:10Z"
+        ),
+      ])
+    )
+
+    useConversationRuntimeStore.getState().actions.refetchDetail(CID)
+    await Promise.resolve()
+    await Promise.resolve()
+
+    const state = useConversationRuntimeStore.getState()
+    expect(state.byConversationId.get(CID)?.localTurns).toEqual([])
+    expect(
+      selectHistoricalTimelineTurns(state, CID).map((entry) => entry.turn.id)
+    ).toEqual(["parser-user", "parser-assistant"])
+  })
+
+  it("retires a fully persisted assistant-only overlay", async () => {
+    const blocks: ContentBlock[] = [
+      { type: "thinking", text: "analysis" },
+      { type: "text", text: "final" },
+    ]
+    seedRuntimeSession({
+      detail: detailWithTurns([]),
+      localTurns: [
+        assistantTurnWithBlocks(
+          "live-assistant",
+          blocks,
+          "2026-09-01T09:20:00Z"
+        ),
+      ],
+    })
+    mockGetFolderConversation.mockResolvedValueOnce(
+      detailWithTurns([
+        assistantTurnWithBlocks(
+          "parser-assistant",
+          blocks,
+          "2026-09-01T09:20:00Z"
+        ),
+      ])
+    )
+
+    useConversationRuntimeStore.getState().actions.refetchDetail(CID)
+    await Promise.resolve()
+    await Promise.resolve()
+
+    const state = useConversationRuntimeStore.getState()
+    expect(state.byConversationId.get(CID)?.localTurns).toEqual([])
+    expect(
+      selectHistoricalTimelineTurns(state, CID).map((entry) => entry.turn.id)
+    ).toEqual(["parser-assistant"])
+  })
+
+  it("keeps an assistant-only overlay when only its content matches", async () => {
+    const blocks: ContentBlock[] = [
+      { type: "thinking", text: "analysis" },
+      { type: "text", text: "final" },
+    ]
+    const localTurns = [
+      assistantTurnWithBlocks("live-assistant", blocks, "2026-09-01T09:21:00Z"),
+    ]
+    seedRuntimeSession({ detail: detailWithTurns([]), localTurns })
+    mockGetFolderConversation.mockResolvedValueOnce(
+      detailWithTurns([
+        assistantTurnWithBlocks(
+          "parser-assistant",
+          blocks,
+          "2026-09-01T10:21:00Z"
+        ),
+      ])
+    )
+
+    useConversationRuntimeStore.getState().actions.refetchDetail(CID)
+    await Promise.resolve()
+    await Promise.resolve()
+
+    const state = useConversationRuntimeStore.getState()
+    expect(state.byConversationId.get(CID)?.localTurns).toEqual(localTurns)
+    expect(
+      selectHistoricalTimelineTurns(state, CID).map((entry) => entry.turn.id)
+    ).toEqual(["parser-assistant", "live-assistant"])
+  })
+
+  it("replaces every parser partial in a proven assistant-only window", async () => {
+    const localTurns = [
+      userTurn("wire-user", "inspect", "2026-09-01T09:22:00Z"),
+      assistantTurn(
+        "wire-assistant",
+        "complete answer",
+        "2026-09-01T09:22:10Z"
+      ),
+    ]
+    seedRuntimeSession({
+      detail: detailWithTurns([], {
+        turns_offset: 120,
+        turns_total: 120,
+        prefix_hash: "0000000000000120",
+      }),
+      localTurns,
+      batchBoundaryIndex: 120,
+      batchBoundaryPrefixHash: "0000000000000120",
+    })
+    mockGetFolderConversation.mockResolvedValueOnce(
+      detailWithTurns(
+        [
+          assistantTurn("parser-head", "partial head", "2026-09-01T09:22:05Z"),
+          assistantTurn("parser-tail", "partial tail", "2026-09-01T09:22:06Z"),
+        ],
+        {
+          turns_offset: 120,
+          turns_total: 122,
+          prefix_hash: "0000000000000120",
+        }
+      )
+    )
+
+    useConversationRuntimeStore.getState().actions.refetchDetail(CID, {
+      preserveLive: true,
+    })
+    await Promise.resolve()
+    await Promise.resolve()
+
+    const state = useConversationRuntimeStore.getState()
+    expect(state.byConversationId.get(CID)?.localTurns).toEqual(localTurns)
+    expect(
+      selectHistoricalTimelineTurns(state, CID).map((entry) => entry.turn.id)
+    ).toEqual(["wire-user", "wire-assistant"])
+  })
+
+  it("keeps an interrupted assistant when persisted detail ends at its user", async () => {
+    const prompt = userTurn(
+      "shared-user",
+      "cancel this",
+      "2026-09-01T09:25:00Z"
+    )
+    const interrupted: MessageTurn = {
+      id: "cancel-outcome",
+      role: "assistant",
+      blocks: [],
+      timestamp: "2026-09-01T09:25:01Z",
+      outcome: {
+        status: "interrupted",
+        stop_reason: "cancelled",
+        source: "user_stop",
+        provider_turn_id: "provider-turn-1",
+      },
+    }
+    const localTurns = [prompt, interrupted]
+    seedRuntimeSession({ detail: detailWithTurns([]), localTurns })
+    mockGetFolderConversation.mockResolvedValueOnce(detailWithTurns([prompt]))
+
+    useConversationRuntimeStore.getState().actions.refetchDetail(CID)
+    await Promise.resolve()
+    await Promise.resolve()
+
+    const state = useConversationRuntimeStore.getState()
+    expect(state.byConversationId.get(CID)?.localTurns).toEqual(localTurns)
+    expect(
+      selectHistoricalTimelineTurns(state, CID).map((entry) => entry.turn.id)
+    ).toEqual(["shared-user", "cancel-outcome"])
+  })
+
+  it("does not append a timestamp-aligned local user after its persisted reply", async () => {
+    const localPrompt = userTurn(
+      "wire-user",
+      "finish this",
+      "2026-09-01T09:25:30Z"
+    )
+    seedRuntimeSession({
+      detail: detailWithTurns([]),
+      localTurns: [localPrompt],
+    })
+    mockGetFolderConversation.mockResolvedValueOnce(
+      detailWithTurns([
+        userTurn("parser-user", "finish this", "2026-09-01T09:25:30Z"),
+        assistantTurn(
+          "parser-assistant",
+          "persisted reply",
+          "2026-09-01T09:25:31Z"
+        ),
+      ])
+    )
+
+    useConversationRuntimeStore.getState().actions.refetchDetail(CID)
+    await Promise.resolve()
+    await Promise.resolve()
+
+    const state = useConversationRuntimeStore.getState()
+    expect(state.byConversationId.get(CID)?.localTurns).toEqual([localPrompt])
+    expect(
+      selectHistoricalTimelineTurns(state, CID).map((entry) => entry.turn.id)
+    ).toEqual(["parser-user", "parser-assistant"])
+  })
+
+  it("does not reinsert an aligned user-only group before a later local replacement", async () => {
+    const localTurns = [
+      userTurn("wire-user-1", "first", "2026-09-01T09:25:30Z"),
+      userTurn("wire-user-2", "second", "2026-09-01T09:26:30Z"),
+      assistantTurn("wire-a-2", "complete second", "2026-09-01T09:26:31Z"),
+    ]
+    seedRuntimeSession({ detail: detailWithTurns([]), localTurns })
+    mockGetFolderConversation.mockResolvedValueOnce(
+      detailWithTurns([
+        userTurn("parser-user-1", "first", "2026-09-01T09:25:30Z"),
+        assistantTurn("parser-a-1", "persisted first", "2026-09-01T09:25:31Z"),
+        userTurn("parser-user-2", "second", "2026-09-01T09:26:30Z"),
+        assistantTurn("parser-a-2", "partial second", "2026-09-01T09:26:31Z"),
+      ])
+    )
+
+    useConversationRuntimeStore.getState().actions.refetchDetail(CID)
+    await Promise.resolve()
+    await Promise.resolve()
+
+    const state = useConversationRuntimeStore.getState()
+    expect(state.byConversationId.get(CID)?.localTurns).toEqual(localTurns)
+    expect(
+      selectHistoricalTimelineTurns(state, CID).map((entry) => entry.turn.id)
+    ).toEqual(["parser-user-1", "parser-a-1", "wire-user-2", "wire-a-2"])
+  })
+
+  it("does not retire a later aligned round before an earlier local round", async () => {
+    const localTurns = [
+      userTurn("local-user-1", "first prompt", "2026-09-01T09:26:00Z"),
+      assistantTurn("local-a-1", "first complete", "2026-09-01T09:26:01Z"),
+      userTurn("shared-user-2", "second prompt", "2026-09-01T09:27:00Z"),
+      assistantTurn("shared-a-2", "second complete", "2026-09-01T09:27:01Z"),
+    ]
+    seedRuntimeSession({ detail: detailWithTurns([]), localTurns })
+    mockGetFolderConversation.mockResolvedValueOnce(
+      detailWithTurns([
+        userTurn("shared-user-2", "second prompt", "2026-09-01T09:27:00Z"),
+        assistantTurn("shared-a-2", "second complete", "2026-09-01T09:27:01Z"),
+      ])
+    )
+
+    useConversationRuntimeStore.getState().actions.refetchDetail(CID)
+    await Promise.resolve()
+    await Promise.resolve()
+
+    const state = useConversationRuntimeStore.getState()
+    expect(state.byConversationId.get(CID)?.localTurns).toEqual(localTurns)
+    expect(
+      selectHistoricalTimelineTurns(state, CID).map((entry) => entry.turn.id)
+    ).toEqual(["local-user-1", "local-a-1", "shared-user-2", "shared-a-2"])
+  })
+
+  it("keeps local rounds when their persisted identities cross", async () => {
+    const localTurns = [
+      userTurn("local-user-2", "second prompt", "2026-09-01T09:29:00Z"),
+      assistantTurn("local-a-2", "second reply", "2026-09-01T09:29:01Z"),
+      userTurn("local-user-1", "first prompt", "2026-09-01T09:28:00Z"),
+      assistantTurn("local-a-1", "first reply", "2026-09-01T09:28:01Z"),
+    ]
+    seedRuntimeSession({ detail: detailWithTurns([]), localTurns })
+    mockGetFolderConversation.mockResolvedValueOnce(
+      detailWithTurns([
+        userTurn("parser-user-1", "first prompt", "2026-09-01T09:28:00Z"),
+        assistantTurn("parser-a-1", "first reply", "2026-09-01T09:28:01Z"),
+        userTurn("parser-user-2", "second prompt", "2026-09-01T09:29:00Z"),
+        assistantTurn("parser-a-2", "second reply", "2026-09-01T09:29:01Z"),
+      ])
+    )
+
+    useConversationRuntimeStore.getState().actions.refetchDetail(CID)
+    await Promise.resolve()
+    await Promise.resolve()
+
+    const state = useConversationRuntimeStore.getState()
+    expect(state.byConversationId.get(CID)?.localTurns).toEqual(localTurns)
+    const timelineIds = selectHistoricalTimelineTurns(state, CID).map(
+      (entry) => entry.turn.id
+    )
+    expect(timelineIds.indexOf("local-user-2")).toBeLessThan(
+      timelineIds.indexOf("local-user-1")
+    )
+  })
+
+  it("does not reuse a retired batch boundary for an identical newer round", async () => {
+    const older = [
+      userTurn("wire-user-1", "continue", "2026-09-01T09:34:00Z"),
+      assistantTurn("wire-a-1", "done", "2026-09-01T09:34:01Z"),
+    ]
+    const newer = [
+      userTurn("wire-user-2", "continue", "2026-09-01T09:35:00Z"),
+      assistantTurn("wire-a-2", "done", "2026-09-01T09:35:01Z"),
+    ]
+    const persistedOlder = detailWithTurns([
+      userTurn("wire-user-1", "continue", "2026-09-01T09:34:00Z"),
+      assistantTurn("wire-a-1", "done", "2026-09-01T09:34:01Z"),
+    ])
+    seedRuntimeSession({
+      detail: detailWithTurns([]),
+      localTurns: [...older, ...newer],
+      batchBoundaryIndex: 0,
+    })
+    mockGetFolderConversation
+      .mockResolvedValueOnce(persistedOlder)
+      .mockResolvedValueOnce(persistedOlder)
+
+    const actions = useConversationRuntimeStore.getState().actions
+    actions.refetchDetail(CID)
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(
+      useConversationRuntimeStore
+        .getState()
+        .byConversationId.get(CID)
+        ?.localTurns.map((turn) => turn.id)
+    ).toEqual(["wire-user-2", "wire-a-2"])
+
+    actions.refetchDetail(CID)
+    await Promise.resolve()
+    await Promise.resolve()
+
+    const state = useConversationRuntimeStore.getState()
+    expect(
+      state.byConversationId.get(CID)?.localTurns.map((turn) => turn.id)
+    ).toEqual(["wire-user-2", "wire-a-2"])
+    expect(
+      selectHistoricalTimelineTurns(state, CID).map((entry) => entry.turn.id)
+    ).toEqual(["wire-user-1", "wire-a-1", "wire-user-2", "wire-a-2"])
+  })
+
+  it("does not trust a batch boundary after its prefix was rewritten", async () => {
+    const localTurns = [
+      userTurn("wire-user", "continue", "2026-09-01T09:34:10Z"),
+      assistantTurn("wire-a", "done", "2026-09-01T09:34:11Z"),
+    ]
+    seedRuntimeSession({
+      detail: detailWithTurns([], {
+        turns_offset: 2,
+        turns_total: 2,
+        prefix_hash: "00000000000000aa",
+      }),
+      localTurns,
+      batchBoundaryIndex: 2,
+      batchBoundaryPrefixHash: "00000000000000aa",
+    })
+    mockGetFolderConversation
+      .mockResolvedValueOnce(
+        detailWithTurns([], {
+          turns_offset: 2,
+          turns_total: 4,
+          prefix_hash: "00000000000000bb",
+        })
+      )
+      .mockResolvedValueOnce(
+        detailWithTurns([
+          userTurn("history-user", "history", "2026-09-01T08:34:00Z"),
+          assistantTurn("history-a", "history", "2026-09-01T08:34:01Z"),
+          userTurn("parser-user", "continue", "2026-09-01T08:34:10Z"),
+          assistantTurn("parser-a", "done", "2026-09-01T08:34:11Z"),
+        ])
+      )
+
+    useConversationRuntimeStore.getState().actions.refetchDetail(CID)
+    await Promise.resolve()
+    await Promise.resolve()
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(
+      useConversationRuntimeStore
+        .getState()
+        .byConversationId.get(CID)
+        ?.localTurns.map((turn) => turn.id)
+    ).toEqual(["wire-user", "wire-a"])
+  })
+
+  it("does not promote delegate content fallback into retirement identity", async () => {
+    vi.useFakeTimers()
+    const delegateSummary = {
+      ...detailWithTurns([]).summary,
+      kind: "delegate" as const,
+      parent_id: 1,
+      delegation_task_status: "completed" as const,
+    }
+    const localTurns = [
+      userTurn("wire-new-user", "continue", "2026-09-01T09:35:00Z"),
+      assistantTurn("wire-new-a", "done", "2026-09-01T09:35:01Z"),
+    ]
+    seedRuntimeSession({
+      detail: detailWithTurns(
+        [userTurn("old-unanswered-user", "continue", "2026-09-01T08:35:00Z")],
+        { summary: delegateSummary }
+      ),
+      localTurns,
+      liveOwnsActiveTurn: true,
+    })
+    mockGetFolderConversation.mockResolvedValueOnce(
+      detailWithTurns(
+        [
+          userTurn("old-unanswered-user", "continue", "2026-09-01T08:35:00Z"),
+          assistantTurn("old-a", "done", "2026-09-01T08:35:01Z"),
+        ],
+        { summary: delegateSummary }
+      )
+    )
+
+    useConversationRuntimeStore
+      .getState()
+      .actions.syncDelegateTerminalDetail(CID)
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(
+      useConversationRuntimeStore
+        .getState()
+        .byConversationId.get(CID)
+        ?.localTurns.map((turn) => turn.id)
+    ).toEqual(["wire-new-user", "wire-new-a"])
+  })
+
+  it("lets Manual Reload replace unrelated local overlays with disk", async () => {
+    seedRuntimeSession({
+      detail: detailWithTurns([userTurn("old-user"), assistantTurn("old-a")]),
+      localTurns: [
+        userTurn("wire-user", "local prompt", "2026-09-01T09:30:00Z"),
+        assistantTurn(
+          "live-assistant",
+          "local complete reply",
+          "2026-09-01T09:30:10Z"
+        ),
+      ],
+      backgroundTurns: [
+        {
+          turn: assistantTurn(
+            "background-a",
+            "background overlay",
+            "2026-09-01T09:30:20Z"
+          ),
+          watermark: 100,
+        },
+      ],
+      lastTurnOwned: true,
+    })
+    mockGetFolderConversation.mockResolvedValueOnce(
+      detailWithTurns([
+        userTurn("parser-user", "disk prompt", "2026-09-01T10:30:00Z"),
+        assistantTurn("parser-assistant", "disk reply", "2026-09-01T10:30:10Z"),
+      ])
+    )
+
+    useConversationRuntimeStore
+      .getState()
+      .actions.reloadDetail(CID, { reason: "manual_reload" })
+    await Promise.resolve()
+    await Promise.resolve()
+
+    const state = useConversationRuntimeStore.getState()
+    expect(state.byConversationId.get(CID)?.localTurns).toEqual([])
+    expect(state.byConversationId.get(CID)?.backgroundTurns).toEqual([])
+    expect(
+      selectHistoricalTimelineTurns(state, CID).map((entry) => entry.turn.id)
+    ).toEqual(["parser-user", "parser-assistant"])
+  })
+
+  it("resets active owner proof while preserving queued prompts on Manual Reload", async () => {
+    const queued = userTurn(
+      "queued-user",
+      "next prompt",
+      "2026-09-01T10:30:20Z"
+    )
+    seedRuntimeSession({
+      detail: detailWithTurns([userTurn("old-user"), assistantTurn("old-a")]),
+      localTurns: [
+        userTurn("wire-user", "active prompt", "2026-09-01T10:30:00Z"),
+      ],
+      optimisticTurns: [queued],
+      queuedOptimisticTurnIds: [queued.id],
+      liveMessage: liveMessage("active-live", "active reply"),
+      syncState: "awaiting_persist",
+      activeTurnToken: "active-token",
+      lastTurnOwned: true,
+      liveOwnsActiveTurn: true,
+      historyAssistantBaseline: 20,
+      batchBoundaryIndex: 40,
+      batchBoundaryPrefixHash: "0000000000000040",
+    })
+    mockGetFolderConversation.mockResolvedValueOnce(
+      detailWithTurns([
+        userTurn("disk-user", "disk prompt", "2026-09-01T10:29:00Z"),
+        assistantTurn("disk-a", "disk reply", "2026-09-01T10:29:01Z"),
+      ])
+    )
+
+    useConversationRuntimeStore
+      .getState()
+      .actions.reloadDetail(CID, { reason: "manual_reload" })
+    await Promise.resolve()
+    await Promise.resolve()
+
+    const session = useConversationRuntimeStore
+      .getState()
+      .byConversationId.get(CID)
+    expect(session?.optimisticTurns.map((turn) => turn.id)).toEqual([
+      "queued-user",
+    ])
+    expect(session?.queuedOptimisticTurnIds).toEqual(["queued-user"])
+    expect(session).toMatchObject({
+      localTurns: [],
+      liveMessage: null,
+      syncState: "idle",
+      activeTurnToken: null,
+      lastTurnOwned: false,
+      liveOwnsActiveTurn: false,
+      historyAssistantBaseline: null,
+      batchBoundaryIndex: null,
+      batchBoundaryPrefixHash: null,
+    })
+  })
+
+  it("does not auto-start delegate polling after Manual Reload", async () => {
+    const delegateSummary = {
+      ...detailWithTurns([]).summary,
+      kind: "delegate" as const,
+      parent_id: 1,
+      delegation_task_status: "completed" as const,
+    }
+    const disk = detailWithTurns(
+      [
+        userTurn("disk-user", "inspect", "2026-09-01T10:30:30Z"),
+        assistantTurn("disk-a", "complete", "2026-09-01T10:30:31Z"),
+      ],
+      { summary: delegateSummary }
+    )
+    seedRuntimeSession({ detail: disk })
+    mockGetFolderConversation.mockResolvedValue(disk)
+
+    useConversationRuntimeStore
+      .getState()
+      .actions.reloadDetail(CID, { reason: "manual_reload" })
+    await Promise.resolve()
+    await Promise.resolve()
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(mockGetFolderConversation).toHaveBeenCalledTimes(1)
+  })
+
+  it("lets Manual Reload replace a stale loaded prefix with a fresh window", async () => {
+    seedRuntimeSession({
+      detail: detailWithTurns([userTurn("old-user"), assistantTurn("old-a")], {
+        history_window: {
+          has_more_before: true,
+          total_turn_count: 2,
+          total_user_turn_count: 1,
+          user_turn_limit: 20,
+          returned_user_turn_count: 1,
+        },
+      }),
+    })
+    const fresh = detailWithTurns(
+      [
+        userTurn("parser-user", "fresh prompt", "2026-09-01T10:31:00Z"),
+        assistantTurn(
+          "parser-assistant",
+          "fresh reply",
+          "2026-09-01T10:31:10Z"
+        ),
+      ],
+      {
+        history_window: {
+          has_more_before: true,
+          total_turn_count: 4,
+          total_user_turn_count: 2,
+          user_turn_limit: 20,
+          returned_user_turn_count: 1,
+        },
+      }
+    )
+    mockGetFolderConversation.mockResolvedValueOnce(fresh)
+
+    useConversationRuntimeStore
+      .getState()
+      .actions.reloadDetail(CID, { reason: "manual_reload" })
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(
+      useConversationRuntimeStore
+        .getState()
+        .byConversationId.get(CID)
+        ?.detail?.turns.map((turn) => turn.id)
+    ).toEqual(["parser-user", "parser-assistant"])
+  })
+
+  it("does not let a passive refetch supersede Manual Reload", async () => {
+    let resolveReload!: (detail: DbConversationDetail) => void
+    let resolveRefetch!: (detail: DbConversationDetail) => void
+    const reload = new Promise<DbConversationDetail>((resolve) => {
+      resolveReload = resolve
+    })
+    const refetch = new Promise<DbConversationDetail>((resolve) => {
+      resolveRefetch = resolve
+    })
+    seedRuntimeSession({
+      detail: detailWithTurns([userTurn("old-user"), assistantTurn("old-a")]),
+      localTurns: [
+        userTurn("local-user", "local prompt", "2026-09-01T09:32:00Z"),
+        assistantTurn("local-a", "local reply", "2026-09-01T09:32:01Z"),
+      ],
+    })
+    mockGetFolderConversation
+      .mockReturnValueOnce(reload)
+      .mockReturnValueOnce(refetch)
+
+    const actions = useConversationRuntimeStore.getState().actions
+    actions.reloadDetail(CID, { reason: "manual_reload" })
+    actions.refetchDetail(CID)
+    resolveReload(
+      detailWithTurns([
+        userTurn("reloaded-user", "disk prompt", "2026-09-01T10:32:00Z"),
+        assistantTurn("reloaded-a", "disk reply", "2026-09-01T10:32:01Z"),
+      ])
+    )
+    await Promise.resolve()
+    await Promise.resolve()
+    resolveRefetch(
+      detailWithTurns([
+        userTurn("stale-user", "stale prompt", "2026-09-01T08:32:00Z"),
+      ])
+    )
+    await Promise.resolve()
+    await Promise.resolve()
+
+    const session = useConversationRuntimeStore
+      .getState()
+      .byConversationId.get(CID)
+    expect(session?.detail?.turns.map((turn) => turn.id)).toEqual([
+      "reloaded-user",
+      "reloaded-a",
+    ])
+    expect(session?.localTurns).toEqual([])
+  })
+
+  it("does not let viewer sync supersede Manual Reload", async () => {
+    let resolveReload!: (detail: DbConversationDetail) => void
+    let resolveViewer!: (detail: DbConversationDetail) => void
+    const reload = new Promise<DbConversationDetail>((resolve) => {
+      resolveReload = resolve
+    })
+    const viewer = new Promise<DbConversationDetail>((resolve) => {
+      resolveViewer = resolve
+    })
+    seedRuntimeSession({
+      detail: detailWithTurns([userTurn("old-user"), assistantTurn("old-a")]),
+    })
+    mockGetFolderConversation
+      .mockReturnValueOnce(reload)
+      .mockReturnValueOnce(viewer)
+
+    const actions = useConversationRuntimeStore.getState().actions
+    actions.reloadDetail(CID, { reason: "manual_reload" })
+    actions.syncViewerDetail(CID)
+    resolveReload(
+      detailWithTurns([
+        userTurn("reloaded-user", "disk prompt", "2026-09-01T10:33:00Z"),
+        assistantTurn("reloaded-a", "disk reply", "2026-09-01T10:33:01Z"),
+      ])
+    )
+    await Promise.resolve()
+    await Promise.resolve()
+    resolveViewer(
+      detailWithTurns([
+        userTurn("stale-user", "stale prompt", "2026-09-01T08:33:00Z"),
+      ])
+    )
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(
+      useConversationRuntimeStore
+        .getState()
+        .byConversationId.get(CID)
+        ?.detail?.turns.map((turn) => turn.id)
+    ).toEqual(["reloaded-user", "reloaded-a"])
+  })
+
+  it("clears invalidated pagination loading state when Manual Reload starts", async () => {
+    let resolveReload!: (detail: DbConversationDetail) => void
+    const reload = new Promise<DbConversationDetail>((resolve) => {
+      resolveReload = resolve
+    })
+    seedRuntimeSession({
+      detail: detailWithTurns([userTurn("old-user"), assistantTurn("old-a")]),
+      detailHistoryLoadingOlder: true,
+      loadingOlderTurns: true,
+    })
+    mockGetFolderConversation.mockReturnValueOnce(reload)
+
+    useConversationRuntimeStore
+      .getState()
+      .actions.reloadDetail(CID, { reason: "manual_reload" })
+
+    expect(
+      useConversationRuntimeStore.getState().byConversationId.get(CID)
+    ).toMatchObject({
+      detailHistoryLoadingOlder: false,
+      loadingOlderTurns: false,
+    })
+
+    resolveReload(
+      detailWithTurns([userTurn("disk-user"), assistantTurn("disk-a")])
+    )
+    await Promise.resolve()
+    await Promise.resolve()
+  })
+
+  it.each(["actions", "exported"] as const)(
+    "does not retain the Manual Reload exclusion across an %s runtime reset",
+    async (resetKind) => {
+      let resolveReload!: (detail: DbConversationDetail) => void
+      const pendingReload = new Promise<DbConversationDetail>((resolve) => {
+        resolveReload = resolve
+      })
+      seedRuntimeSession({
+        detail: detailWithTurns([userTurn("old-user"), assistantTurn("old-a")]),
+      })
+      mockGetFolderConversation
+        .mockReturnValueOnce(pendingReload)
+        .mockResolvedValueOnce(
+          detailWithTurns([userTurn("fresh-user"), assistantTurn("fresh-a")])
+        )
+
+      useConversationRuntimeStore
+        .getState()
+        .actions.reloadDetail(CID, { reason: "manual_reload" })
+      if (resetKind === "actions") {
+        useConversationRuntimeStore.getState().actions.reset()
+      } else {
+        resetConversationRuntimeStore()
+      }
+      seedRuntimeSession({
+        detail: detailWithTurns([
+          userTurn("seed-user"),
+          assistantTurn("seed-a"),
+        ]),
+      })
+      useConversationRuntimeStore.getState().actions.refetchDetail(CID)
+
+      expect(mockGetFolderConversation).toHaveBeenCalledTimes(2)
+      await Promise.resolve()
+      await Promise.resolve()
+
+      expect(
+        useConversationRuntimeStore
+          .getState()
+          .byConversationId.get(CID)
+          ?.detail?.turns.map((turn) => turn.id)
+      ).toEqual(["fresh-user", "fresh-a"])
+
+      resolveReload(
+        detailWithTurns([userTurn("stale-user"), assistantTurn("stale-a")])
+      )
+      await Promise.resolve()
+      await Promise.resolve()
+
+      expect(
+        useConversationRuntimeStore
+          .getState()
+          .byConversationId.get(CID)
+          ?.detail?.turns.map((turn) => turn.id)
+      ).toEqual(["fresh-user", "fresh-a"])
+    }
+  )
+
   // Production parsers persist UUID / cursor-turn-N / grok-turn-N ids.
   // Promoted overlays always use live-${cid}-${msgId}. If retirement still
   // requires an id match, a settled refetch keeps both copies and the last
@@ -1551,7 +2710,7 @@ describe("owner overlay retirement without live-* persist ids", () => {
     }
   )
 
-  it("settled refetch retires last-round overlay when parser and live clocks differ", async () => {
+  it("settled refetch retires an aligned round when assistant clocks differ", async () => {
     const { actions } = useConversationRuntimeStore.getState()
     seedRuntimeSession({
       detail: detailWithTurns([
@@ -1559,11 +2718,6 @@ describe("owner overlay retirement without live-* persist ids", () => {
         assistantTurn("a-old", "old reply", "2026-08-20T11:00:01.000Z"),
       ]),
       localTurns: [
-        assistantTurn(
-          "live-42-earlier",
-          "earlier overlay",
-          "2026-08-20T11:30:00.000Z"
-        ),
         userTurn("msg-latest", "latest prompt", "2026-08-20T12:00:00.000Z"),
         assistantTurn(
           "live-42-latest",
@@ -1582,7 +2736,7 @@ describe("owner overlay retirement without live-* persist ids", () => {
         userTurn(
           "550e8400-e29b-41d4-a716-446655440000",
           "latest prompt",
-          "2026-08-20T14:00:00.000Z"
+          "2026-08-20T12:00:00.000Z"
         ),
         assistantTurn(
           "cursor-turn-0",
@@ -1602,9 +2756,6 @@ describe("owner overlay retirement without live-* persist ids", () => {
       false
     )
     expect(session.localTurns.some((t) => t.id === "msg-latest")).toBe(false)
-    expect(session.localTurns.some((t) => t.id === "live-42-earlier")).toBe(
-      true
-    )
 
     const promptCopies = selectHistoricalTimelineTurns(
       useConversationRuntimeStore.getState(),
