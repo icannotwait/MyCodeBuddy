@@ -1,9 +1,11 @@
 import {
   type AcpAgentInfo,
+  type DbConversationSummary,
   type DelegationProfile,
   type ReferenceCandidate,
 } from "@/lib/types"
 import { getAgentLabel } from "@/lib/custom-agents"
+import { formatConversationTitle } from "@/lib/conversation-title"
 
 import type { SuggestionItem } from "./types"
 
@@ -102,6 +104,29 @@ export function agentToSuggestion(
     detail: agent.description || null,
     keywords: agent.agent_type,
     sourceOrdinal,
+  })
+}
+
+/** Conversation → the same stable session reference used by the @ catalogue. */
+export function sessionToSuggestion(
+  conversation: DbConversationSummary
+): SuggestionItem {
+  const label =
+    formatConversationTitle(conversation.title).trim() || `#${conversation.id}`
+  return withControllerDefaults({
+    reference: {
+      refType: "session",
+      id: String(conversation.id),
+      label,
+      uri: `codeg://session/${conversation.id}`,
+      meta: {
+        agentType: conversation.agent_type,
+        status: conversation.status,
+        branch: conversation.git_branch,
+      },
+    },
+    detail: conversation.git_branch || conversation.status,
+    keywords: `${label} ${conversation.agent_type}`,
   })
 }
 

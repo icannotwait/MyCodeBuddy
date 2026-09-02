@@ -23,6 +23,7 @@ Codeg(Code Generation)는 멀티 에이전트 코딩 워크스페이스입니다
 
 ![gallery](../images/workspace-light.png#gh-light-mode-only)
 ![gallery](../images/workspace-dark.png#gh-dark-mode-only)
+지원되는 모든 에이전트 CLI의 세션을 검색 가능한 하나의 워크스페이스로 모으고, 하나의 작업 안에서 메인 에이전트가 다른 종류의 서브 에이전트에게 위임할 수 있습니다. 지켜보고 앉아 있기 아까운 일은 할 일 보드에 적어 두세요. 각 작업이 자기 브랜치에서 무인으로 돌아가고, 반영되기 전에 당신의 검토를 기다립니다. Codeg는 데스크톱 앱·독립 서버·Docker 컨테이너 어느 형태로든 실행되고, 네이티브 iOS·Android 클라이언트가 있어 자리를 비운 사이에도 작업을 이어갈 수 있습니다. 열다섯 개의 에이전트가 기본 내장되며, ACP를 지원하는 다른 에이전트를 직접 등록할 수도 있습니다.
 
 ## 스폰서
 
@@ -63,6 +64,7 @@ Codeg(Code Generation)는 멀티 에이전트 코딩 워크스페이스입니다
 
 ![Codeg Light](../images/workspace-light.png#gh-light-mode-only)
 ![Codeg Dark](../images/workspace-dark.png#gh-dark-mode-only)
+Claude Code · Codex · Gemini · OpenClaw · OpenCode · Cline · Hermes · CodeBuddy · Kimi Code · Pi · Grok · Cursor · DeepSeek Harness · Qoder · Google Antigravity
 
 ## 멀티 에이전트 협업
 

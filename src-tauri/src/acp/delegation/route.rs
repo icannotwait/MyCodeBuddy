@@ -1031,7 +1031,8 @@ mod tests {
                 "Claude {version} must not be treated as custom"
             );
             assert_eq!(facts.contract_version.as_deref(), Some(version));
-            let cap = resolve_managed_host_suppression(AgentType::ClaudeCode, Some(version), &empty);
+            let cap =
+                resolve_managed_host_suppression(AgentType::ClaudeCode, Some(version), &empty);
             assert!(
                 cap.failure.is_none(),
                 "Claude {version} must support native suppression"

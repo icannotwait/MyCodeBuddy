@@ -70,8 +70,7 @@ use crate::acp::delegation::transport::{
 use crate::acp::delegation::types::{
     parse_admission_ticket_v1_request, validate_correlation_id, AdmissionIntentV1,
     AdmissionPreparation, BindingEvidenceV1, DelegationOrchestrationBindingPage,
-    DelegationReturnWhen,
-    OrchestrationBindingArtifactDescriptor, OrchestrationBindingDelivery,
+    DelegationReturnWhen, OrchestrationBindingArtifactDescriptor, OrchestrationBindingDelivery,
     OrchestrationBindingFirstPageEnvelope, OrchestrationBindingQueryError,
     OrchestrationBindingQueryRequest, OrchestrationBindingToolRequest,
     ORCHESTRATION_BINDING_DEFAULT_LIMIT, ORCHESTRATION_BINDING_MAX_LIMIT,
@@ -2016,18 +2015,21 @@ async fn build_tools_call_spawn(
         }
         "get_delegation_orchestration_bindings" => {
             if arguments.as_object().is_some_and(|object| {
-                ["delivery", "limit", "snapshot_id", "cursor", "admission_intent"]
-                    .iter()
-                    .any(|field| object.get(*field).is_some_and(Value::is_null))
+                [
+                    "delivery",
+                    "limit",
+                    "snapshot_id",
+                    "cursor",
+                    "admission_intent",
+                ]
+                .iter()
+                .any(|field| object.get(*field).is_some_and(Value::is_null))
             }) {
                 return orchestration_binding_query_invalid_response(id);
             }
-            if arguments
-                .get("admission_intent")
-                .is_some_and(|intent| {
-                    serde_json::from_value::<AdmissionIntentV1>(intent.clone()).is_err()
-                })
-            {
+            if arguments.get("admission_intent").is_some_and(|intent| {
+                serde_json::from_value::<AdmissionIntentV1>(intent.clone()).is_err()
+            }) {
                 return LineAction::Respond(bounded_orchestration_binding_error(
                     id,
                     OrchestrationBindingQueryError::AdmissionIntentInvalid.code(),
@@ -2957,7 +2959,10 @@ async fn collect_orchestration_binding_artifact_pages(
     socket: &str,
     first_request: &BrokerOrchestrationBindingsRequest,
 ) -> Result<
-    (Vec<DelegationOrchestrationBindingPage>, Option<AdmissionPreparation>),
+    (
+        Vec<DelegationOrchestrationBindingPage>,
+        Option<AdmissionPreparation>,
+    ),
     OrchestrationBindingQueryError,
 > {
     let mut request = first_request.clone();
@@ -3009,8 +3014,8 @@ fn render_orchestration_binding_artifact(
     let expires_at = descriptor
         .snapshot_expires_at
         .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true);
-    let mut structured_content = serde_json::to_value(descriptor)
-        .expect("artifact descriptor contains serializable fields");
+    let mut structured_content =
+        serde_json::to_value(descriptor).expect("artifact descriptor contains serializable fields");
     if let Some(admission) = admission {
         structured_content
             .as_object_mut()
@@ -5623,6 +5628,8 @@ mod tests {
                 "grok",
                 "cursor",
                 "deepseek",
+                "qoder",
+                "antigravity",
             ]
         );
         assert!(delegate["inputSchema"]["properties"]["profile_id"].is_object());
@@ -5761,7 +5768,7 @@ mod tests {
             .as_array()
             .unwrap();
 
-        assert_eq!(agents.len(), 10);
+        assert_eq!(agents.len(), 12);
         assert!(!agents.iter().any(|agent| agent == "codex"));
         assert!(!agents.iter().any(|agent| agent == "grok"));
         assert!(agents.iter().any(|agent| agent == "code_buddy"));
@@ -5773,6 +5780,9 @@ mod tests {
         }));
     }
 
+    // An empty disabled list (the parent omitted `--disabled-agents`) leaves
+    // the schema byte-identical to the embedded builtin set — the exact
+    // behavior every pre-flag parent relies on.
     #[tokio::test]
     async fn empty_disabled_list_serves_the_embedded_builtin_enum_unchanged() {
         let line = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#;
@@ -5789,9 +5799,9 @@ mod tests {
             .as_array()
             .unwrap()
             .clone();
-        assert_eq!(agents.len(), 12);
+        assert_eq!(agents.len(), 14);
         assert_eq!(agents[0], "claude_code");
-        assert_eq!(agents[11], "deepseek");
+        assert_eq!(agents[13], "antigravity");
     }
 
     #[tokio::test]
@@ -6819,9 +6829,18 @@ mod tests {
                 .find(|tool| tool["name"] == tool_name)
                 .unwrap()["inputSchema"];
             assert_eq!(schema["additionalProperties"], false);
-            assert!(schema["properties"].get("working_dir").is_some() == (tool_name == "delegate_to_agent"));
-            assert_eq!(schema["properties"]["dispatch_intent_id"]["$ref"], "#/$defs/u");
-            assert_eq!(schema["properties"]["admission_ticket"]["$ref"], "#/$defs/u");
+            assert!(
+                schema["properties"].get("working_dir").is_some()
+                    == (tool_name == "delegate_to_agent")
+            );
+            assert_eq!(
+                schema["properties"]["dispatch_intent_id"]["$ref"],
+                "#/$defs/u"
+            );
+            assert_eq!(
+                schema["properties"]["admission_ticket"]["$ref"],
+                "#/$defs/u"
+            );
             assert_eq!(schema["$defs"].as_object().unwrap().len(), 1);
             assert_eq!(
                 schema["dependentRequired"],
@@ -6893,7 +6912,10 @@ mod tests {
             .iter()
             .find(|tool| tool["name"] == "get_delegation_orchestration_bindings")
             .unwrap()["inputSchema"];
-        assert_eq!(schema["properties"]["admission_intent"]["$ref"], "#/$defs/i");
+        assert_eq!(
+            schema["properties"]["admission_intent"]["$ref"],
+            "#/$defs/i"
+        );
         assert_eq!(schema["$defs"].as_object().unwrap().len(), 2);
         assert_eq!(schema["$defs"]["i"]["additionalProperties"], false);
         assert_eq!(
@@ -6914,18 +6936,21 @@ mod tests {
         assert_eq!(schema["$defs"]["b"]["additionalProperties"], false);
         assert_eq!(
             schema["$defs"]["b"]["required"],
-            json!(["schema_version", "namespace", "generation", "route_fingerprint"])
+            json!([
+                "schema_version",
+                "namespace",
+                "generation",
+                "route_fingerprint"
+            ])
         );
         assert_eq!(
-            schema["$defs"]["i"]["properties"]["orchestration_binding"]["anyOf"][0]
-                ["$ref"],
+            schema["$defs"]["i"]["properties"]["orchestration_binding"]["anyOf"][0]["$ref"],
             "#/$defs/b"
         );
     }
 
     #[tokio::test]
-    async fn ticket_v1_request_contract_runtime_surfaces_pair_grammar_and_rejects_unknown_fields()
-    {
+    async fn ticket_v1_request_contract_runtime_surfaces_pair_grammar_and_rejects_unknown_fields() {
         let delegate = json!({
             "agent_type": "grok",
             "task": "implement",
@@ -6950,11 +6975,8 @@ mod tests {
             ),
         ] {
             let response = unwrap_respond(
-                dispatch_with_features(
-                    GROK_FEATURES,
-                    &call(90, "delegate_to_agent", arguments),
-                )
-                .await,
+                dispatch_with_features(GROK_FEATURES, &call(90, "delegate_to_agent", arguments))
+                    .await,
             );
             assert!(response.error.is_none());
             let result = response.result.expect("typed ticket-pair result");
@@ -8756,8 +8778,7 @@ mod tests {
             "8f95dd45-9eca-42a8-9909-0ac00be8ad52".into(),
             "6b228a7d-4ac9-4bc7-a16e-f4ecf6f0fd45".into(),
         );
-        let result =
-            render_orchestration_binding_artifact(&descriptor, Some(&already_admitted));
+        let result = render_orchestration_binding_artifact(&descriptor, Some(&already_admitted));
         assert_eq!(
             result["structuredContent"]["admission"],
             json!({
@@ -8820,9 +8841,9 @@ mod tests {
         );
         let line = serialize_jsonrpc_line(&response).unwrap();
         println!("Phase 2 Grok tools/list JSONL bytes: {}", line.len());
-        assert!(line.len() <= 7_300);
+        assert!(line.len() <= 7_460);
         assert!(line.len() <= 7_680);
-        assert!(7_680 - line.len() >= 380);
+        assert!(7_680 - line.len() >= 220);
     }
 
     #[tokio::test]
@@ -10155,11 +10176,11 @@ mod tests {
             line.len()
         );
         assert!(
-            line.len() <= 7_300,
+            line.len() <= 7_460,
             "Phase 2 Grok catalog is {} bytes",
             line.len()
         );
-        assert!(7_680 - line.len() >= 380);
+        assert!(7_680 - line.len() >= 220);
     }
 
     #[tokio::test]

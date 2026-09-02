@@ -116,6 +116,16 @@ fn tokens_backup_path(path: &std::path::Path) -> std::path::PathBuf {
 #[cfg(not(feature = "tauri-runtime"))]
 fn read_tokens_map() -> Result<std::collections::HashMap<String, String>, String> {
     let path = tokens_file_path();
+    #[cfg(unix)]
+    if path.exists() {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(err) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)) {
+            tracing::warn!(
+                "[tokens] could not tighten {} to 0600: {err}",
+                path.display()
+            );
+        }
+    }
     match std::fs::read_to_string(&path) {
         Ok(s) => {
             let trimmed = s.trim();
@@ -220,6 +230,21 @@ fn write_tokens_map(tokens: &std::collections::HashMap<String, String>) -> Resul
     let tmp_path = path.with_file_name("tokens.json.tmp");
     {
         use std::io::Write;
+        #[cfg(unix)]
+        let mut f = {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp_path)
+                .map_err(|e| format!("failed to create token store temp: {e}"))?;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| format!("failed to secure token store temp: {e}"))?;
+            file
+        };
+        #[cfg(not(unix))]
         let mut f = std::fs::File::create(&tmp_path)
             .map_err(|e| format!("failed to create token store temp: {e}"))?;
         f.write_all(json.as_bytes())

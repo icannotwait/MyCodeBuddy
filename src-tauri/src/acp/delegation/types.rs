@@ -189,8 +189,7 @@ impl<'de> Deserialize<'de> for AdmissionIntentV1 {
         let replacement_reason: Option<String> =
             serde_json::from_value(wire.replacement_reason).map_err(serde::de::Error::custom)?;
         let orchestration_binding: Option<OrchestrationBindingV1> =
-            serde_json::from_value(wire.orchestration_binding)
-                .map_err(serde::de::Error::custom)?;
+            serde_json::from_value(wire.orchestration_binding).map_err(serde::de::Error::custom)?;
         let intent = Self {
             schema_version: wire.schema_version,
             dispatch_intent_id: wire.dispatch_intent_id,
@@ -230,14 +229,16 @@ impl AdmissionIntentV1 {
         {
             return Err("work_unit_key is invalid");
         }
-        let agent_type = AgentType::from_untrusted_wire(&self.agent_type)
-            .ok_or("agent_type is invalid")?;
+        let agent_type =
+            AgentType::from_untrusted_wire(&self.agent_type).ok_or("agent_type is invalid")?;
         if agent_type.as_wire() != self.agent_type {
             return Err("agent_type is invalid");
         }
-        if self.profile_id.as_ref().is_some_and(|profile_id| {
-            profile_id.is_empty() || profile_id.trim() != profile_id
-        }) {
+        if self
+            .profile_id
+            .as_ref()
+            .is_some_and(|profile_id| profile_id.is_empty() || profile_id.trim() != profile_id)
+        {
             return Err("profile_id is invalid");
         }
         if let Some(binding) = self.orchestration_binding.as_ref() {
@@ -268,7 +269,8 @@ impl AdmissionIntentV1 {
     }
 
     pub fn canonical_digest(&self) -> String {
-        let bytes = serde_json::to_vec(self).expect("admission intent contains serializable fields");
+        let bytes =
+            serde_json::to_vec(self).expect("admission intent contains serializable fields");
         let digest = Sha256::digest(bytes);
         digest.iter().map(|byte| format!("{byte:02x}")).collect()
     }
@@ -560,8 +562,7 @@ mod orchestration_binding_tests {
     fn orchestration_admission_intent_rejects_noncanonical_identity_and_unknown_keys() {
         let mut cases = Vec::new();
         let mut value = admission_intent("first", Value::Null, Value::Null);
-        value["dispatch_intent_id"] =
-            json!("8F95DD45-9ECA-42A8-9909-0AC00BE8AD52");
+        value["dispatch_intent_id"] = json!("8F95DD45-9ECA-42A8-9909-0AC00BE8AD52");
         cases.push(value);
         let mut value = admission_intent("first", Value::Null, Value::Null);
         value["request_fingerprint"] = json!("A".repeat(64));

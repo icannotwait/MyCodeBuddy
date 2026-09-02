@@ -1843,6 +1843,8 @@ pub fn agent_type_label(agent: AgentType) -> &'static str {
         AgentType::Grok => "grok",
         AgentType::Cursor => "cursor",
         AgentType::DeepSeek => "deepseek",
+        AgentType::Qoder => "qoder",
+        AgentType::Antigravity => "antigravity",
         AgentType::Custom(_) => "custom",
     }
 }
@@ -2536,7 +2538,10 @@ mod tests {
             "C:/private/artifact.json",
             "2a44be9d1662a314cbbd2c8111bcf83159be7bdc93abadff977d01447f986648",
         ] {
-            assert!(!serialized.contains(sensitive), "sensitive value {sensitive}");
+            assert!(
+                !serialized.contains(sensitive),
+                "sensitive value {sensitive}"
+            );
         }
     }
 

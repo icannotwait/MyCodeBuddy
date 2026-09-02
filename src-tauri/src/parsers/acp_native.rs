@@ -1203,7 +1203,13 @@ earlier terminal context records.\n\
             update(11, text_chunk("agent_message_chunk", "ok2")),
         ]);
         let recorded_user = user_turn_texts(&recorded);
-        assert_eq!(recorded_user, vec!["hello".to_string(), "是在Worktable的Actor里加么".to_string()]);
+        assert_eq!(
+            recorded_user,
+            vec![
+                "hello".to_string(),
+                "是在Worktable的Actor里加么".to_string()
+            ]
+        );
         assert!(!recorded_user.iter().any(|t| t.contains("Selected shell:")));
 
         let replayed = project_turns(&[

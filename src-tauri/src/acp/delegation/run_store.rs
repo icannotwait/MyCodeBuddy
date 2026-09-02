@@ -41,11 +41,10 @@ use crate::acp::delegation::store::{
     TerminalCompletionProtocol, TerminalTaskWrite,
 };
 use crate::acp::delegation::types::{
-    is_canonical_uuid, AdmissionIntentKind, AdmissionIntentV1,
-    DelegationOrchestrationBindingPage, DelegationRecoveryProjection,
-    OrchestrationBindingFirstPageEnvelope, OrchestrationBindingQueryError,
-    OrchestrationBindingQueryRequest, OrchestrationBindingV1, TaskStatus, TicketV1PendingCall,
-    WorkflowRetirementNavigation,
+    is_canonical_uuid, AdmissionIntentKind, AdmissionIntentV1, DelegationOrchestrationBindingPage,
+    DelegationRecoveryProjection, OrchestrationBindingFirstPageEnvelope,
+    OrchestrationBindingQueryError, OrchestrationBindingQueryRequest, OrchestrationBindingV1,
+    TaskStatus, TicketV1PendingCall, WorkflowRetirementNavigation,
 };
 use crate::acp::delegation::workflow::admission::{
     ensure_workflow_child_conversation_independent, resolve_and_stamp_terminal_artifact_txn,
@@ -291,13 +290,14 @@ fn is_ecmascript_trim_code_point(value: char) -> bool {
             | '\u{0020}'
             | '\u{00a0}'
             | '\u{1680}'
-            | '\u{2000}'..='\u{200a}'
-            | '\u{2028}'
-            | '\u{2029}'
-            | '\u{202f}'
-            | '\u{205f}'
-            | '\u{3000}'
-            | '\u{feff}'
+            | '\u{2000}'
+            ..='\u{200a}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202f}'
+                | '\u{205f}'
+                | '\u{3000}'
+                | '\u{feff}'
     )
 }
 
@@ -2441,12 +2441,10 @@ impl RunStore {
                 intent,
                 Utc::now(),
                 || async {
-                    let rows = materialize_binding_rows(&self.db.conn, parent_id, &namespace).await?;
+                    let rows =
+                        materialize_binding_rows(&self.db.conn, parent_id, &namespace).await?;
                     let existing = self
-                        .load_by_dispatch_intent(
-                            parent_id,
-                            &loader_intent.dispatch_intent_id,
-                        )
+                        .load_by_dispatch_intent(parent_id, &loader_intent.dispatch_intent_id)
                         .await
                         .map_err(|error| match error {
                             TaskStoreError::DispatchIntentConflict(_) => {
@@ -2455,14 +2453,14 @@ impl RunStore {
                             _ => OrchestrationBindingQueryError::Failed,
                         })?;
                     let existing_task_id = if let Some(existing) = existing {
-                        existing
-                            .ensure_dispatch_intent_replay(&replay)
-                            .map_err(|error| match error {
+                        existing.ensure_dispatch_intent_replay(&replay).map_err(
+                            |error| match error {
                                 TaskStoreError::DispatchIntentConflict(_) => {
                                     OrchestrationBindingQueryError::DispatchIntentConflict
                                 }
                                 _ => OrchestrationBindingQueryError::Failed,
-                            })?;
+                            },
+                        )?;
                         Some(existing.task_id)
                     } else {
                         validate_admission_intent_source(&loader_intent, &rows)?;

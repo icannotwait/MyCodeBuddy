@@ -28,6 +28,7 @@ import { cn, copyTextFromMenu } from "@/lib/utils"
 import { DelegationRouteMenu } from "@/components/conversations/delegation-route-menu"
 import { TileScrollContainer } from "@/components/conversations/tile-scroll-container"
 import { GroupSplitHandle } from "@/components/conversations/group-split-handle"
+import { OverlayHostHiddenProvider } from "@/components/ui/overlay-host-hidden"
 import { TabBar } from "@/components/tabs/tab-bar"
 import { TabDragGhost } from "@/components/tabs/tab-drag-ghost"
 import { useSidebarContext } from "@/contexts/sidebar-context"
@@ -521,7 +522,9 @@ export function ConversationDetailPanel() {
         {(isSplit || canTileGroup) && active && (
           <span className="sr-only">{t("activeConversationIndicator")}</span>
         )}
-        {view}
+        <OverlayHostHiddenProvider hidden={!canTileGroup && !visible}>
+          {view}
+        </OverlayHostHiddenProvider>
       </div>
     )
   }

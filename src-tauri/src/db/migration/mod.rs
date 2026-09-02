@@ -67,7 +67,9 @@ mod m20260809_000001_completion_protocol_v2_only;
 mod m20260811_000001_simple_workflows;
 mod m20260817_000001_delegation_orchestration_bindings;
 mod m20260817_000001_work_task_conversation_title;
+mod m20260818_000001_work_task_source;
 mod m20260819_000001_turn_generation_stat;
+mod m20260819_000001_work_task_completion_kind;
 mod m20260827_000001_delegation_dispatch_intent;
 
 #[cfg(test)]
@@ -80,7 +82,6 @@ pub(crate) async fn install_for_historical_completion_fixture(
     .await?;
     m20260827_000001_delegation_dispatch_intent::install_for_historical_completion_fixture(db).await
 }
-
 pub struct Migrator;
 
 #[async_trait::async_trait]
@@ -153,6 +154,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20260811_000001_simple_workflows::Migration),
             Box::new(m20260817_000001_delegation_orchestration_bindings::Migration),
             Box::new(m20260817_000001_work_task_conversation_title::Migration),
+            Box::new(m20260818_000001_work_task_source::Migration),
+            Box::new(m20260819_000001_work_task_completion_kind::Migration),
             Box::new(m20260819_000001_turn_generation_stat::Migration),
             Box::new(m20260827_000001_delegation_dispatch_intent::Migration),
         ]

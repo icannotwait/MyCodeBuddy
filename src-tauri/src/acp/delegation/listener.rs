@@ -1693,7 +1693,9 @@ impl DelegationListener {
             {
                 Ok(envelope) => {
                     match &envelope.admission {
-                        AdmissionPreparation::Prepared { .. } => self.metrics.record_ticket_outcome(
+                        AdmissionPreparation::Prepared { .. } => self
+                            .metrics
+                            .record_ticket_outcome(
                             crate::acp::delegation::metrics::AdmissionTicketMetricOutcome::Issued,
                         ),
                         AdmissionPreparation::AlreadyAdmitted { .. } => {
@@ -4985,9 +4987,9 @@ mod tests {
             outcome["admission"]["dispatch_intent_id"],
             "8f95dd45-9eca-42a8-9909-0ac00be8ad52"
         );
-        assert!(outcome["admission"]["ticket"].as_str().is_some_and(
-            crate::acp::delegation::types::is_canonical_uuid
-        ));
+        assert!(outcome["admission"]["ticket"]
+            .as_str()
+            .is_some_and(crate::acp::delegation::types::is_canonical_uuid));
         assert!(outcome["admission"]["expires_at"].is_string());
     }
 
@@ -5380,30 +5382,25 @@ mod tests {
         for input in [
             {
                 let mut input = delegate.clone();
-                input["dispatch_intent_id"] =
-                    json!("8f95dd45-9eca-42a8-9909-0ac00be8ad52");
+                input["dispatch_intent_id"] = json!("8f95dd45-9eca-42a8-9909-0ac00be8ad52");
                 input
             },
             {
                 let mut input = delegate.clone();
                 input["dispatch_intent_id"] = Value::Null;
-                input["admission_ticket"] =
-                    json!("4a67bba4-e1f5-46d1-a9b1-aa796598ffce");
+                input["admission_ticket"] = json!("4a67bba4-e1f5-46d1-a9b1-aa796598ffce");
                 input
             },
             {
                 let mut input = delegate.clone();
                 input["dispatch_intent_id"] = json!(7);
-                input["admission_ticket"] =
-                    json!("4a67bba4-e1f5-46d1-a9b1-aa796598ffce");
+                input["admission_ticket"] = json!("4a67bba4-e1f5-46d1-a9b1-aa796598ffce");
                 input
             },
             {
                 let mut input = delegate;
-                input["dispatch_intent_id"] =
-                    json!("8F95DD45-9ECA-42A8-9909-0AC00BE8AD52");
-                input["admission_ticket"] =
-                    json!("4a67bba4-e1f5-46d1-a9b1-aa796598ffce");
+                input["dispatch_intent_id"] = json!("8F95DD45-9ECA-42A8-9909-0AC00BE8AD52");
+                input["admission_ticket"] = json!("4a67bba4-e1f5-46d1-a9b1-aa796598ffce");
                 input
             },
         ] {

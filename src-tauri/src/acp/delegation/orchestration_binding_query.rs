@@ -601,9 +601,8 @@ mod tests {
         AdmissionIntentV1 {
             schema_version: 1,
             dispatch_intent_id: "8f95dd45-9eca-42a8-9909-0ac00be8ad52".into(),
-            request_fingerprint:
-                "2a44be9d1662a314cbbd2c8111bcf83159be7bdc93abadff977d01447f986648"
-                    .into(),
+            request_fingerprint: "2a44be9d1662a314cbbd2c8111bcf83159be7bdc93abadff977d01447f986648"
+                .into(),
             kind,
             work_unit_key: "task|7|implementer|codex|none".into(),
             agent_type: "codex".into(),
@@ -641,10 +640,7 @@ mod tests {
             panic!("new intent must issue a ticket");
         };
         assert_eq!(protocol, "ticket_v1");
-        assert_eq!(
-            dispatch_intent_id,
-            "8f95dd45-9eca-42a8-9909-0ac00be8ad52"
-        );
+        assert_eq!(dispatch_intent_id, "8f95dd45-9eca-42a8-9909-0ac00be8ad52");
         assert!(crate::acp::delegation::types::is_canonical_uuid(&ticket));
         assert_eq!(expires_at, envelope.page.snapshot_expires_at);
 

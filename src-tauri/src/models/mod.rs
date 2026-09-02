@@ -40,13 +40,13 @@ pub use message::{
 };
 pub use quick_message::QuickMessageInfo;
 pub use remote_workspace_connection::RemoteWorkspaceConnectionInfo;
-#[cfg(feature = "tauri-runtime")]
-pub use system::SystemRenderingSettings;
 pub use system::{
-    AvailableTerminalShells, GitCredentials, GitDetectResult, GitHubAccountsSettings,
-    GitHubTokenValidation, GitSettings, SystemLanguageSettings, SystemProxySettings,
-    SystemTerminalSettings, TerminalShellOption,
+    AvailableTerminalShells, GitCredentials, GitDetectResult, GitHubAccount,
+    GitHubAccountsSettings, GitHubTokenValidation, GitSettings, SystemLanguageSettings,
+    SystemProxySettings, SystemTerminalSettings, TerminalShellOption,
 };
+#[cfg(feature = "tauri-runtime")]
+pub use system::{SystemAutostartSettings, SystemRenderingSettings};
 pub use token_usage::{
     TokenUsageBreakdownItem, TokenUsageBucket, TokenUsageConversationItem, TokenUsageFacets,
     TokenUsageFilter, TokenUsageFolderFacet, TokenUsageHeatCell, TokenUsagePoint, TokenUsageReport,
@@ -55,7 +55,7 @@ pub use token_usage::{
 };
 pub use work_task::{
     FollowUpIntent, WorkTaskChangedFile, WorkTaskConfig, WorkTaskDraft, WorkTaskEventInfo,
-    WorkTaskFolderSettings, WorkTaskInfo, WorkTaskMergeState, WorkTaskPreflight,
-    WorkTaskQueuedMerge, WorkTaskStatus, WorkTaskTemplateDraft, WorkTaskTemplateInfo,
-    STAGE_PROMPT_ALL,
+    WorkTaskFolderSettings, WorkTaskInfo, WorkTaskMergeOp, WorkTaskMergeState, WorkTaskPreflight,
+    WorkTaskQueuedMerge, WorkTaskSource, WorkTaskStatus, WorkTaskTemplateDraft,
+    WorkTaskTemplateInfo, DELIVERABLE_REPORT, STAGE_PROMPT_ALL,
 };

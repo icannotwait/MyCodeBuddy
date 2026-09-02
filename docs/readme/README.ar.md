@@ -23,6 +23,7 @@ Codeg (Code Generation) هو مساحة عمل للبرمجة متعددة ال�
 
 ![gallery](../images/workspace-light.png#gh-light-mode-only)
 ![gallery](../images/workspace-dark.png#gh-dark-mode-only)
+يجمع جلساتك من كل واجهات الوكلاء المدعومة في مساحة عمل واحدة قابلة للبحث، ويتيح للوكيل الرئيسي أن يفوّض إلى وكلاء فرعيين من أنواع أخرى داخل المهمة نفسها. أما العمل الذي لا تريد الجلوس لمتابعته فيذهب إلى لوحة المهام قيد الانتظار: كل مهمة في فرعها الخاص، تعمل دون إشراف، وتنتظر مراجعتك قبل أن تُدمج. ويعمل Codeg كتطبيق سطح مكتب أو خادم مستقل أو حاوية Docker، إضافةً إلى تطبيقَي iOS وAndroid الأصليين لمواصلة العمل بعيدًا عن مكتبك؛ يأتي بخمسة عشر وكيلاً مدمجًا، ويمكنك تسجيل أي وكيل آخر متوافق مع ACP بنفسك.
 
 ## الرعاة
 
@@ -63,6 +64,7 @@ Codeg (Code Generation) هو مساحة عمل للبرمجة متعددة ال�
 
 ![Codeg Light](../images/workspace-light.png#gh-light-mode-only)
 ![Codeg Dark](../images/workspace-dark.png#gh-dark-mode-only)
+Claude Code · Codex · Gemini · OpenClaw · OpenCode · Cline · Hermes · CodeBuddy · Kimi Code · Pi · Grok · Cursor · DeepSeek Harness · Qoder · Google Antigravity
 
 ## التعاون متعدد الوكلاء
 

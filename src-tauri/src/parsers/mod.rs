@@ -1,4 +1,5 @@
 pub mod acp_native;
+pub mod antigravity;
 pub mod claude;
 pub mod cline;
 pub mod codebuddy;
@@ -12,6 +13,7 @@ pub mod hermes;
 pub mod kimi_code;
 pub mod opencode;
 pub mod pi;
+pub mod qoder;
 mod summary_cache;
 
 use std::borrow::Cow;
@@ -166,6 +168,55 @@ pub(crate) fn external_transcript_sources_for_runtime_env(
             is_file: false,
             include_top: None,
         },
+        ExternalSource {
+            // Since deepseek-acp 0.6.0 a prompt can carry images, and the log
+            // keeps only a `sha256:` reference — the pixels live in the
+            // content-addressed store at `$DSH_HOME/attachments/v1/objects/`.
+            // Without this source a backup restores every image as the
+            // `[image …]` placeholder `parsers::deepseek` falls back to, which
+            // is unrecoverable: the bytes exist nowhere else.
+            //
+            // A SEPARATE source rather than widening the one above, for two
+            // reasons. `DEEPSEEK_ACP_SESSIONS_ROOT` relocates the logs
+            // INDEPENDENTLY of `DSH_HOME`, so re-rooting both at `$DSH_HOME`
+            // would silently stop archiving the logs of any deployment that
+            // uses it. And `agent` is the restore key — `map_external_to_target`
+            // resolves `external/<agent>/…` by `find(|s| s.agent == agent)`, so
+            // two sources sharing a name would restore this one's entries under
+            // the sessions root.
+            //
+            // Scoped to `objects/`: the siblings are `tmp/` (upload staging)
+            // and `request-images/` (per-provider re-encodings derived from
+            // `objects/`), neither of which is conversation content, and both
+            // of which the agent rebuilds on demand.
+            agent: "deepseek-attachments",
+            root: deepseek::resolve_deepseek_attachments_root(),
+            is_file: false,
+            include_top: Some(&["objects"]),
+        },
+        ExternalSource {
+            // Qoder keeps one JSONL per session under
+            // `~/.qoder/projects/<encoded-cwd>/<sessionId>.jsonl` (relocatable
+            // via `QODER_CONFIG_DIR`). The resolver already points at the
+            // `projects/` subtree, so the sibling `settings.json` /
+            // `security/` / `cache/` under `~/.qoder` are never archived.
+            agent: "qoder",
+            root: qoder::resolve_qoder_config_dir().join("projects"),
+            is_file: false,
+            include_top: None,
+        },
+        ExternalSource {
+            // Antigravity keeps one SQLite trajectory + `.meta` sidecar per
+            // session under `<GEMINI_HOME>/antigravity-acp/conversations`
+            // (default `~/.gemini/...`). The root points at `conversations`
+            // and NOT at `antigravity-acp` itself, whose siblings are the
+            // OAuth token files (`acp_token.json`, `acp_business_token.json`)
+            // — those must never end up in a backup archive.
+            agent: "antigravity",
+            root: antigravity::resolve_antigravity_sessions_dir(),
+            is_file: false,
+            include_top: None,
+        },
     ];
     if let Some(root) = deepseek::resolve_deepseek_sessions_root_for_runtime_env(deepseek_env) {
         // DeepSeek Harness (deepseek-acp) keeps a directory-per-session log
@@ -305,6 +356,48 @@ pub trait AgentParser {
         let _ = (query, accept);
         Ok(None)
     }
+}
+
+/// Expand a leading `~` in a relocation env var, for the agents whose OWN
+/// resolver does that.
+///
+/// Handles a bare `~` and a `~/` — or, on Windows, `~\` — prefix.
+///
+/// A `~user` form is left VERBATIM, which is a deliberate divergence rather
+/// than a match: Python's `os.path.expanduser` does attempt a passwd lookup for
+/// it on unix, and Node's does not. Resolving another account's home here would
+/// mean duplicating that lookup to guess at a directory, so the value is passed
+/// through instead — and because a literal `~user/...` is not an absolute path,
+/// every consumer of this treats it as unresolvable and fails closed (the fs
+/// sandbox refuses the slot; the Antigravity settings sync refuses the write).
+/// The cost is that this rare form is unsupported, not that it resolves wrongly.
+///
+/// Deliberately NOT applied everywhere. Antigravity runs `os.path.expanduser`
+/// on `GEMINI_HOME` (`acp_server/paths.py`) and DeepSeek expands `DSH_HOME`
+/// (`dsh-home-paths`' `expandHomePath`), but Hermes's `get_hermes_home` is a
+/// bare `Path(val.strip())` and Codex, Claude and the rest are likewise
+/// verbatim. Expanding for one of those would point codeg at `$HOME/...` while
+/// the agent used a literal `~` directory — and, in the fs sandbox, would hand
+/// out `$HOME` as a writable root the user never selected.
+///
+/// Shared so the rule lives in ONE place: it is mirrored by
+/// `acp::file_system_runtime`'s root table (`EXPANDS_TILDE`), and a copy that
+/// drifts from the resolver it mirrors is exactly how the agent ends up unable
+/// to write its own directory.
+pub fn expand_home_prefix(value: &str, home_dir: Option<&PathBuf>) -> PathBuf {
+    let Some(home) = home_dir else {
+        return PathBuf::from(value);
+    };
+    if value == "~" {
+        return home.clone();
+    }
+    if let Some(rest) = value
+        .strip_prefix("~/")
+        .or_else(|| value.strip_prefix("~\\"))
+    {
+        return home.join(rest);
+    }
+    PathBuf::from(value)
 }
 
 /// Truncate a string to `max_len` characters, appending "..." if truncated.
@@ -628,13 +721,20 @@ fn advance_duration_cursor(cursor: &mut Option<DateTime<Utc>>, candidate: DateTi
 }
 
 /// Aggregate turn-level usage and duration into a single `SessionStats`.
+///
+/// The two halves stand on their own: an agent that times its turns but reports
+/// no token split still gets its duration (mirrors `acp_native::session_stats`,
+/// which already had to hand-roll this). Token totals stay `None` in that case
+/// rather than becoming a row of zeros — the footer reads `None` as "this agent
+/// doesn't say" and omits the breakdown, where zeros would read as "it says the
+/// reply was free".
 pub fn compute_session_stats(turns: &[MessageTurn]) -> Option<SessionStats> {
     let mut total_in = 0u64;
     let mut total_out = 0u64;
     let mut total_cache_create = 0u64;
     let mut total_cache_read = 0u64;
     let mut total_duration = 0u64;
-    let mut has_data = false;
+    let mut has_usage = false;
 
     for turn in turns {
         if let Some(ref u) = turn.usage {
@@ -642,25 +742,26 @@ pub fn compute_session_stats(turns: &[MessageTurn]) -> Option<SessionStats> {
             total_out += u.output_tokens;
             total_cache_create += u.cache_creation_input_tokens;
             total_cache_read += u.cache_read_input_tokens;
-            has_data = true;
+            has_usage = true;
         }
         if let Some(d) = turn.duration_ms {
             total_duration += d;
         }
     }
 
-    if !has_data {
+    if !has_usage && total_duration == 0 {
         return None;
     }
 
     Some(SessionStats {
-        total_usage: Some(TurnUsage {
+        total_usage: has_usage.then_some(TurnUsage {
             input_tokens: total_in,
             output_tokens: total_out,
             cache_creation_input_tokens: total_cache_create,
             cache_read_input_tokens: total_cache_read,
         }),
-        total_tokens: Some(total_in + total_out + total_cache_create + total_cache_read),
+        total_tokens: has_usage
+            .then_some(total_in + total_out + total_cache_create + total_cache_read),
         total_duration_ms: total_duration,
         context_window_used_tokens: None,
         context_window_max_tokens: None,
@@ -809,6 +910,26 @@ pub fn latest_turn_total_usage_tokens(turns: &[MessageTurn]) -> Option<u64> {
                 .saturating_add(usage.output_tokens)
                 .saturating_add(usage.cache_creation_input_tokens)
                 .saturating_add(usage.cache_read_input_tokens)
+        })
+    })
+}
+
+/// Context-window occupancy for agents whose transcripts carry ANTHROPIC-SHAPED
+/// usage counters (`input_tokens` + `cache_creation_input_tokens` +
+/// `cache_read_input_tokens` are the whole prompt; `output_tokens` is the reply).
+///
+/// Deliberately NOT [`latest_turn_total_usage_tokens`], which adds
+/// `output_tokens` too: for this counter shape the reply is not resident in the
+/// prompt window that produced it, so including it over-reports the gauge by
+/// the last turn's output. Claude Code and Qoder both write this shape.
+pub fn latest_turn_prompt_usage_tokens(turns: &[MessageTurn]) -> Option<u64> {
+    turns.iter().rev().find_map(|turn| {
+        turn.usage.as_ref().and_then(|usage| {
+            let used = usage
+                .input_tokens
+                .saturating_add(usage.cache_creation_input_tokens)
+                .saturating_add(usage.cache_read_input_tokens);
+            (used > 0).then_some(used)
         })
     })
 }

@@ -319,6 +319,8 @@ export function TaskMessageComposer({
         referenceController={referenceController}
         mentionUiLabels={uiLabels}
         tabLabels={groupLabels}
+        // Same box the `/` menu hangs off, so both panels span the composer.
+        mentionAnchorRef={containerRef}
         submitShortcut={submitShortcut}
         newlineShortcut={newlineShortcut}
         onReady={handleReady}

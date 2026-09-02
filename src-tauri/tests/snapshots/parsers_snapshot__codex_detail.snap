@@ -43,5 +43,9 @@ expression: detail
       "completed_at": "[ts]"
     }
   ],
+  "session_stats": {
+    "total_usage": null,
+    "total_duration_ms": 1000
+  },
   "transcript_watermark": 471
 }
