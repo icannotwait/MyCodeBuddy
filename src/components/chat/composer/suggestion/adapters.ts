@@ -87,7 +87,9 @@ export function profileToSuggestion(
 /**
  * ACP agent → agent reference. Carries a `codeg://agent/<agent_type>` uri as a
  * routing anchor: it serializes inline as `[@label](codeg://agent/…)` and
- * renders as a badge in the transcript.
+ * renders as a badge in the transcript. The readable link IS the routing
+ * anchor: the backend derives the delegation reminder from it at send time, so
+ * nothing has to travel out-of-band alongside the prompt.
  */
 export function agentToSuggestion(
   agent: AcpAgentInfo,

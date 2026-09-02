@@ -243,7 +243,8 @@ export const ConversationDetailHeader = memo(function ConversationDetailHeader({
     try {
       await deleteConversation(deleteTarget.id)
       // The deleted conversation is gone — close its tab and refresh the list.
-      closeTab(deleteTarget.tabId)
+      // Not recorded for reopen: there is no longer a conversation to reopen.
+      closeTab(deleteTarget.tabId, { recordForReopen: false })
       refreshConversations()
       setDeleteTarget(null)
     } catch (err) {

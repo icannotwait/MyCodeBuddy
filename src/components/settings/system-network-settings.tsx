@@ -572,7 +572,7 @@ export function SystemNetworkSettings() {
 
             {canRollback && (
               <div className="flex items-center justify-between gap-3 pt-1">
-                <span className="text-muted-foreground/80 text-[11px] leading-5">
+                <span className="text-muted-foreground/80 text-2xs leading-5">
                   {t("rollbackDescription")}
                 </span>
                 <Button
@@ -599,7 +599,7 @@ export function SystemNetworkSettings() {
             {availableUpdate &&
               serverSelfUpdate &&
               serverRuntime === "docker" && (
-                <p className="text-muted-foreground/80 text-[11px] leading-5">
+                <p className="text-muted-foreground/80 text-2xs leading-5">
                   {t("dockerUpgradeHint")}
                 </p>
               )}
@@ -611,7 +611,7 @@ export function SystemNetworkSettings() {
                     {t("upgradableVersion")}：v{availableUpdate.version}
                   </span>
                   {formattedUpdateDate && (
-                    <span className="text-muted-foreground text-[11px]">
+                    <span className="text-muted-foreground text-2xs">
                       {formattedUpdateDate}
                     </span>
                   )}
@@ -657,7 +657,7 @@ export function SystemNetworkSettings() {
             }
           >
             {autostartError !== null && (
-              <p className="text-[11px] text-amber-500">
+              <p className="text-2xs text-amber-500">
                 {t("autostartUnavailable", { message: autostartError })}
               </p>
             )}
@@ -722,9 +722,9 @@ export function SystemNetworkSettings() {
               aria-invalid={proxyUrlError ? true : undefined}
             />
             {proxyUrlError && (
-              <p className="text-[11px] text-destructive">{proxyUrlError}</p>
+              <p className="text-2xs text-destructive">{proxyUrlError}</p>
             )}
-            <p className="text-[11px] text-muted-foreground">
+            <p className="text-2xs text-muted-foreground">
               {t("proxyHint", { example: PROXY_EXAMPLE })}
             </p>
           </div>

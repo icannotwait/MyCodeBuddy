@@ -7,6 +7,7 @@ import { Loader2 } from "lucide-react"
 import { cloneRepository } from "@/lib/api"
 import { toErrorMessage } from "@/lib/app-error"
 import { openFolderWithDraft } from "@/lib/open-folder-with-draft"
+import { joinFsPath } from "@/lib/path-utils"
 import { useGitCredential } from "@/contexts/git-credential-context"
 import {
   Dialog,
@@ -34,13 +35,27 @@ export function CloneDialog({ open, onOpenChange }: CloneDialogProps) {
   const [cloning, setCloning] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
+  // Derived from the remote URL, so `/` is the right separator to split on
+  // regardless of the local OS. Trailing slashes come off before `.git` so
+  // `…/codeg.git/` still names the repo `codeg` — the same directory `git
+  // clone` would have picked on its own.
   const repoName = useMemo(
     () =>
       url
+        .replace(/\/+$/, "")
         .replace(/\.git$/, "")
         .split("/")
-        .pop() ?? "repo",
+        .filter(Boolean)
+        .pop() || "repo",
     [url]
+  )
+
+  // The target directory is an OS path the user typed or picked, so the clone
+  // target has to be joined with THAT path's separator — a hardcoded "/" left
+  // Windows previews reading `C:\work/codeg`.
+  const fullPath = useMemo(
+    () => joinFsPath(targetDir, repoName),
+    [targetDir, repoName]
   )
 
   const resetForm = () => {
@@ -51,7 +66,6 @@ export function CloneDialog({ open, onOpenChange }: CloneDialogProps) {
 
   const handleClone = async () => {
     if (!url || !targetDir) return
-    const fullPath = `${targetDir}/${repoName}`
     setCloning(true)
     setError(null)
     try {
@@ -107,7 +121,7 @@ export function CloneDialog({ open, onOpenChange }: CloneDialogProps) {
             />
             {targetDir && url && (
               <p className="text-xs text-muted-foreground">
-                {t("clonePath", { path: `${targetDir}/${repoName}` })}
+                {t("clonePath", { path: fullPath })}
               </p>
             )}
           </div>

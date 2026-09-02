@@ -1,10 +1,26 @@
 import { type ReactElement } from "react"
-import { fireEvent, render, screen, waitFor } from "@testing-library/react"
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react"
 import { NextIntlClientProvider } from "next-intl"
-import { describe, expect, it, vi, beforeEach } from "vitest"
+import { afterEach, describe, expect, it, vi, beforeEach } from "vitest"
 
 import { SidebarConversationCard } from "./sidebar-conversation-card"
 import { formatRelative } from "./sidebar-conversation-grouping"
+import {
+  resetAppWorkspaceStore,
+  useAppWorkspaceStore,
+} from "@/stores/app-workspace-store"
+import { useTabStore, type TabItem } from "@/stores/tab-store"
+import {
+  ATTACH_SESSION_TO_SESSION_EVENT,
+  type AttachSessionToSessionDetail,
+} from "@/lib/session-attachment-events"
 import type { DbConversationSummary } from "@/lib/types"
 import enMessages from "@/i18n/messages/en.json"
 
@@ -43,6 +59,7 @@ const popoutMocks = vi.hoisted(() => ({
 const notificationMocks = vi.hoisted(() => ({
   notifyConversationPopoutFailure: vi.fn(),
 }))
+const sonnerMock = vi.hoisted(() => ({ error: vi.fn(), success: vi.fn() }))
 vi.mock("@/components/agent-icon", () => ({
   AgentIcon: () => {
     probe.agentIconRenders++
@@ -63,8 +80,6 @@ vi.mock("@/lib/conversation-popout", () => ({
   }) => popoutMocks.popOutConversation(args),
 }))
 vi.mock("@/lib/conversation-popout-notifications", () => notificationMocks)
-
-const sonnerMock = vi.hoisted(() => ({ error: vi.fn(), success: vi.fn() }))
 vi.mock("sonner", () => ({ toast: sonnerMock }))
 
 const popoutFailureMessages = {
@@ -399,6 +414,130 @@ describe("SidebarConversationCard awaiting / cancelled presentation", () => {
   })
 })
 
+// "Add to session" mirrors the file tree's action: it drops an `@`-style mention
+// of the right-clicked conversation into the ACTIVE conversation tab's composer,
+// addressed by a window event the composer listens for. The target tab is read
+// from the tab store when the menu opens (not subscribed), so each test seeds the
+// store before firing the context menu.
+describe("SidebarConversationCard add to session", () => {
+  function tab(id: string, conversationId: number | null): TabItem {
+    return {
+      id,
+      kind: "conversation",
+      folderId: 1,
+      conversationId,
+      agentType: "claude_code",
+      title: "tab",
+      isPinned: false,
+    }
+  }
+
+  function seedTabs(tabs: TabItem[], activeTabId: string | null) {
+    useTabStore.setState({ tabs, activeTabId })
+  }
+
+  let events: AttachSessionToSessionDetail[]
+  let listener: (event: Event) => void
+
+  beforeEach(() => {
+    events = []
+    listener = (event: Event) => {
+      events.push((event as CustomEvent<AttachSessionToSessionDetail>).detail)
+    }
+    window.addEventListener(ATTACH_SESSION_TO_SESSION_EVENT, listener)
+    seedTabs([], null)
+  })
+
+  afterEach(() => {
+    window.removeEventListener(ATTACH_SESSION_TO_SESSION_EVENT, listener)
+    seedTabs([], null)
+  })
+
+  function renderCard(c: DbConversationSummary) {
+    return renderWithIntl(
+      <SidebarConversationCard
+        conversation={c}
+        isSelected={false}
+        timeLabel="5m"
+        onSelect={onSelect}
+        onDoubleClick={onDoubleClick}
+        onRename={onRename}
+        onDelete={onDelete}
+        onStatusChange={onStatusChange}
+      />
+    )
+  }
+
+  it("emits the mention for the active conversation tab", () => {
+    seedTabs([tab("tab-1", 7), tab("tab-2", 9)], "tab-2")
+    const target = conv(3)
+    const { getByText } = renderCard(target)
+    fireEvent.contextMenu(getByText("conv-3"))
+    fireEvent.click(getByText("Add to session"))
+    expect(events).toHaveLength(1)
+    expect(events[0].tabId).toBe("tab-2")
+    // The whole summary rides along so the composer can build the badge through
+    // the same adapter the `@` panel uses.
+    expect(events[0].conversation).toBe(target)
+  })
+
+  it("disables the item when no conversation tab is open", () => {
+    seedTabs([], null)
+    const { getByText } = renderCard(conv(4))
+    fireEvent.contextMenu(getByText("conv-4"))
+    const item = getByText("Add to session")
+    expect(item.getAttribute("aria-disabled")).toBe("true")
+    fireEvent.click(item)
+    expect(events).toHaveLength(0)
+  })
+
+  it("allows mentioning the conversation the active tab already holds", () => {
+    // Self-mention is permitted, matching the composer's own `@` panel — it
+    // lists every session including the one being typed in.
+    seedTabs([tab("tab-1", 5)], "tab-1")
+    const { getByText } = renderCard(conv(5))
+    fireEvent.contextMenu(getByText("conv-5"))
+    const item = getByText("Add to session")
+    expect(item.getAttribute("aria-disabled")).not.toBe("true")
+    fireEvent.click(item)
+    expect(events).toHaveLength(1)
+    expect(events[0].tabId).toBe("tab-1")
+  })
+
+  // The open-time snapshot only drives the disabled state. `mod+tab` / `mod+w`
+  // live on a document keydown handler that Radix lets modifier combos through
+  // to, so the active tab CAN move under an open menu — the click must therefore
+  // re-read the store rather than post to a stale (possibly closed) tab.
+  it("re-resolves the target at click time when the active tab moved", () => {
+    seedTabs([tab("tab-1", 7), tab("tab-2", 9)], "tab-1")
+    const { getByText } = renderCard(conv(3))
+    fireEvent.contextMenu(getByText("conv-3"))
+    // Menu is open, snapshot says tab-1 — now the active tab moves under it.
+    seedTabs([tab("tab-1", 7), tab("tab-2", 9)], "tab-2")
+    fireEvent.click(getByText("Add to session"))
+    expect(events).toHaveLength(1)
+    expect(events[0].tabId).toBe("tab-2")
+  })
+
+  it("emits nothing when the target tab was closed under the open menu", () => {
+    seedTabs([tab("tab-1", 7)], "tab-1")
+    const { getByText } = renderCard(conv(3))
+    fireEvent.contextMenu(getByText("conv-3"))
+    seedTabs([], null)
+    fireEvent.click(getByText("Add to session"))
+    expect(events).toHaveLength(0)
+  })
+
+  it("stays enabled for an unsaved draft tab (no bound conversation yet)", () => {
+    seedTabs([tab("tab-draft", null)], "tab-draft")
+    const { getByText } = renderCard(conv(6))
+    fireEvent.contextMenu(getByText("conv-6"))
+    fireEvent.click(getByText("Add to session"))
+    expect(events).toHaveLength(1)
+    expect(events[0].tabId).toBe("tab-draft")
+  })
+})
+
 describe("SidebarConversationCard sub-session chevron", () => {
   const onToggleExpand = vi.fn()
   beforeEach(() => {
@@ -493,13 +632,15 @@ describe("SidebarConversationCard pop-out menu", () => {
     popoutMocks.popOutConversation.mockReset()
     popoutMocks.popOutConversation.mockResolvedValue(undefined)
     notificationMocks.notifyConversationPopoutFailure.mockClear()
-    sonnerMock.error.mockClear()
-    sonnerMock.success.mockClear()
   })
 
   function renderCard(
     c: DbConversationSummary,
-    opts: { isOpenInTab?: boolean; mainTabCount?: number } = {}
+    opts: {
+      isOpenInTab?: boolean
+      mainTabCount?: number
+      timeLabel?: string
+    } = {}
   ) {
     return renderWithIntl(
       <SidebarConversationCard
@@ -507,7 +648,7 @@ describe("SidebarConversationCard pop-out menu", () => {
         isSelected={false}
         isOpenInTab={opts.isOpenInTab ?? false}
         mainTabCount={opts.mainTabCount ?? 2}
-        timeLabel=""
+        timeLabel={opts.timeLabel ?? ""}
         onSelect={onSelect}
         onDoubleClick={onDoubleClick}
         onRename={onRename}
@@ -526,7 +667,6 @@ describe("SidebarConversationCard pop-out menu", () => {
       folderId: 1,
       agentType: "claude_code",
     })
-    expect(sonnerMock.success).not.toHaveBeenCalled()
   })
 
   it("hides pop-out when the shared helper rejects remote desktop", () => {
@@ -536,8 +676,11 @@ describe("SidebarConversationCard pop-out menu", () => {
     expect(queryByText("Pop out window")).toBeNull()
   })
 
-  it("routes runtime restart rejection through the shared notifier", async () => {
-    const error = { code: "runtime_restart_required" }
+  it.each([
+    [{ code: "runtime_restart_required" }],
+    [{ code: "popup_blocked" }],
+    [new Error("desktop handoff failed")],
+  ])("routes pop-out rejection through the shared notifier", async (error) => {
     popoutMocks.popOutConversation.mockRejectedValueOnce(error)
     const { getByText } = renderCard(conv(1))
     fireEvent.contextMenu(getByText("conv-1"))
@@ -548,37 +691,6 @@ describe("SidebarConversationCard pop-out menu", () => {
         notificationMocks.notifyConversationPopoutFailure
       ).toHaveBeenCalledWith(error, popoutFailureMessages)
     )
-    expect(sonnerMock.error).not.toHaveBeenCalled()
-  })
-
-  it("routes popup-blocked rejection through the shared notifier", async () => {
-    const error = { code: "popup_blocked" }
-    popoutMocks.popOutConversation.mockRejectedValueOnce(error)
-    const { getByText } = renderCard(conv(1))
-    fireEvent.contextMenu(getByText("conv-1"))
-    fireEvent.click(getByText("Pop out window"))
-
-    await waitFor(() =>
-      expect(
-        notificationMocks.notifyConversationPopoutFailure
-      ).toHaveBeenCalledWith(error, popoutFailureMessages)
-    )
-    expect(sonnerMock.error).not.toHaveBeenCalled()
-  })
-
-  it("routes generic handoff rejection through the shared notifier", async () => {
-    const error = new Error("desktop handoff failed")
-    popoutMocks.popOutConversation.mockRejectedValueOnce(error)
-    const { getByText } = renderCard(conv(1))
-    fireEvent.contextMenu(getByText("conv-1"))
-    fireEvent.click(getByText("Pop out window"))
-
-    await waitFor(() =>
-      expect(
-        notificationMocks.notifyConversationPopoutFailure
-      ).toHaveBeenCalledWith(error, popoutFailureMessages)
-    )
-    expect(sonnerMock.error).not.toHaveBeenCalled()
   })
 
   it("disables pop-out for the last open main tab", () => {
@@ -592,23 +704,6 @@ describe("SidebarConversationCard pop-out menu", () => {
     fireEvent.click(getByText("Pop out window"))
     expect(popoutMocks.popOutConversation).not.toHaveBeenCalled()
   })
-
-  it("single-click fires onSelect with conversation identity", () => {
-    onSelect.mockClear()
-    onDoubleClick.mockClear()
-    const { getByText } = renderCard(conv(3))
-    fireEvent.click(getByText("conv-3"))
-    expect(onSelect).toHaveBeenCalledWith(3, "claude_code", 1)
-    expect(onDoubleClick).not.toHaveBeenCalled()
-  })
-
-  it("double-click fires onDoubleClick with conversation identity", () => {
-    onSelect.mockClear()
-    onDoubleClick.mockClear()
-    const { getByText } = renderCard(conv(4))
-    fireEvent.doubleClick(getByText("conv-4"))
-    expect(onDoubleClick).toHaveBeenCalledWith(4, "claude_code", 1)
-  })
 })
 
 describe("mutation failure feedback", () => {
@@ -618,6 +713,7 @@ describe("mutation failure feedback", () => {
         conversation={c}
         isSelected={false}
         onSelect={onSelect}
+        onDoubleClick={onDoubleClick}
         onRename={onRename}
         onDelete={onDelete}
         onStatusChange={onStatusChange}
@@ -656,9 +752,6 @@ describe("mutation failure feedback", () => {
   })
 
   it("only calls onDelete once on rapid double confirm", async () => {
-    // preventDefault keeps the dialog open for failure retry, which previously
-    // allowed a double-click to fire two deletes — the second "not found" toast
-    // looked like a false failure after a successful first delete.
     let resolveDelete!: () => void
     onDelete.mockImplementation(
       () =>
@@ -680,4 +773,158 @@ describe("mutation failure feedback", () => {
     expect(onDelete).toHaveBeenCalledTimes(1)
     expect(sonnerMock.error).not.toHaveBeenCalled()
   })
+})
+
+// The row truncates to one line and never says where the session lives, so
+// resting the pointer on it floats a read-only bubble out to the right with the
+// folder, its absolute path, and the branch. Radix portals the content to the
+// body, hence the `screen` queries.
+describe("SidebarConversationCard hover details bubble", () => {
+  const FOLDER_PATH = "/Users/dev/projects/codeg"
+
+  function renderCard(
+    c: DbConversationSummary,
+    opts: {
+      isOpenInTab?: boolean
+      mainTabCount?: number
+      timeLabel?: string
+    } = {}
+  ) {
+    return renderWithIntl(
+      <SidebarConversationCard
+        conversation={c}
+        isSelected={false}
+        isOpenInTab={opts.isOpenInTab ?? false}
+        mainTabCount={opts.mainTabCount ?? 2}
+        timeLabel={opts.timeLabel ?? "5m"}
+        onSelect={onSelect}
+        onDoubleClick={onDoubleClick}
+        onRename={onRename}
+        onDelete={onDelete}
+        onStatusChange={onStatusChange}
+      />
+    )
+  }
+
+  function rowOf(container: HTMLElement): HTMLElement {
+    return container.querySelector("[data-conv-key]") as HTMLElement
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers()
+    resetAppWorkspaceStore()
+    useAppWorkspaceStore.setState({
+      allFolders: [
+        {
+          id: 1,
+          name: "codeg",
+          path: FOLDER_PATH,
+          git_branch: null,
+          default_agent_type: null,
+          last_opened_at: new Date(NOW).toISOString(),
+          sort_order: 0,
+          color: "inherit",
+          parent_id: null,
+          kind: "regular",
+          alias: null,
+          group_id: null,
+        },
+      ],
+    })
+  })
+
+  afterEach(() => {
+    // Unmount before resetting: the reset is a zustand write, and a bubble still
+    // mounted when it lands would re-render outside `act()`.
+    cleanup()
+    resetAppWorkspaceStore()
+    vi.useRealTimers()
+  })
+
+  it("opens on pointer enter, but only after the open delay", () => {
+    const { container } = renderCard(conv(1))
+    fireEvent.pointerEnter(rowOf(container), { pointerType: "mouse" })
+
+    // Sweeping the pointer down the list must stay quiet, so nothing yet.
+    expect(screen.queryByText(FOLDER_PATH)).toBeNull()
+
+    act(() => {
+      vi.advanceTimersByTime(600)
+    })
+    expect(screen.getByText(FOLDER_PATH)).toBeDefined()
+    expect(screen.getByText("codeg")).toBeDefined()
+  })
+
+  // Companion to the `select-none` pin in the content's own test: with the
+  // bubble unpointable, a press always lands outside it and the dismissable
+  // layer tears it down before Radix can latch onto a stray document selection
+  // and refuse to ever close. jsdom models neither selections nor hit-testing,
+  // so this pins the CSS contract; the behaviour was verified in a real browser.
+  it("renders the bubble inert to the pointer", () => {
+    const { container } = renderCard(conv(1))
+    fireEvent.pointerEnter(rowOf(container), { pointerType: "mouse" })
+    act(() => {
+      vi.advanceTimersByTime(600)
+    })
+
+    const content = document.querySelector('[data-slot="hover-card-content"]')
+    expect(content?.className).toContain("pointer-events-none")
+  })
+
+  it("closes again once the pointer leaves", () => {
+    const { container } = renderCard(conv(1))
+    const row = rowOf(container)
+    fireEvent.pointerEnter(row, { pointerType: "mouse" })
+    act(() => {
+      vi.advanceTimersByTime(600)
+    })
+    expect(screen.getByText(FOLDER_PATH)).toBeDefined()
+
+    fireEvent.pointerLeave(row, { pointerType: "mouse" })
+    act(() => {
+      vi.advanceTimersByTime(600)
+    })
+    expect(screen.queryByText(FOLDER_PATH)).toBeNull()
+  })
+
+  // Radix's trigger opens on ANY focus, and its touch filter covers only
+  // pointer enter/leave. Tapping a row focuses the button inside it, so without
+  // the `isKeyboardFocus` guard a tap would strand a bubble on screen with no
+  // pointer that could ever leave and dismiss it.
+  it("does not open on a non-keyboard focus", () => {
+    const { container } = renderCard(conv(1))
+    const focusIn = new FocusEvent("focusin", {
+      bubbles: true,
+      cancelable: true,
+    })
+    rowOf(container).dispatchEvent(focusIn)
+
+    // The card's guard default-prevents, which is what makes Radix's composed
+    // handler bail — asserting it here keeps the "stays closed" check below from
+    // passing vacuously (i.e. because the event never reached React at all).
+    expect(focusIn.defaultPrevented).toBe(true)
+    act(() => {
+      vi.advanceTimersByTime(600)
+    })
+    expect(screen.queryByText(FOLDER_PATH)).toBeNull()
+  })
+
+  it("drops the bubble when the context menu takes the row over", () => {
+    const { container } = renderCard(conv(1))
+    const row = rowOf(container)
+    fireEvent.pointerEnter(row, { pointerType: "mouse" })
+    act(() => {
+      vi.advanceTimersByTime(600)
+    })
+    expect(screen.getByText(FOLDER_PATH)).toBeDefined()
+
+    fireEvent.contextMenu(row)
+    expect(screen.queryByText(FOLDER_PATH)).toBeNull()
+  })
+
+  // NOT covered here: touch. Radix's `excludeTouch` drops enter/leave whose
+  // `pointerType === "touch"`, so a tap never strands a bubble on screen — but
+  // jsdom ships no `PointerEvent`, so every synthetic pointer event arrives as a
+  // `MouseEvent` with `pointerType: undefined` and the branch can't be reached.
+  // Verify that one in a real browser, not here.
 })

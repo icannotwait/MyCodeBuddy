@@ -51,6 +51,7 @@ import {
   splitAbsPath,
 } from "@/lib/file-open-target"
 import { isAbsoluteFilePath } from "@/lib/file-path-display"
+import { pushClosedTab, snapshotFileTab } from "@/lib/closed-tab-stack"
 import {
   isHiddenPath,
   isHtmlPreviewable,
@@ -341,8 +342,12 @@ function normalizePath(path: string): string {
   return path.replace(/\\/g, "/")
 }
 
+// Most callers pass an already-normalized path, but the working-diff overview
+// titles the tab after the FOLDER path, which is native — on Windows a
+// "/"-only split handed back `C:\work\repo` as the file name.
 function fileName(path: string): string {
-  return path.split("/").pop() || path
+  const index = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"))
+  return (index >= 0 ? path.slice(index + 1) : path) || path
 }
 
 function isDirtyFileTab(tab: FileWorkspaceTab): boolean {
@@ -2950,6 +2955,13 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
         const idx = prev.findIndex((tab) => tab.id === tabId)
         if (idx < 0) return prev
 
+        const tab = prev[idx]
+        // `pushClosedTab` keys on the tab id and moves an existing entry to the
+        // top, so recording from inside this updater survives React invoking it
+        // more than once (StrictMode, or a discarded render replayed).
+        const closed = snapshotFileTab(tab)
+        if (closed) pushClosedTab(closed)
+
         const next = prev.filter((candidate) => candidate.id !== tabId)
 
         setActiveFileTabId((current) => {
@@ -3028,6 +3040,10 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
         for (const closing of closingTabs) {
           finishOpenSettleClosed(closing.id)
           pendingMaximizeOnSuccessRef.current.delete(closing.id)
+          // `pushClosedTab` is idempotent per tab id, which is what makes this
+          // safe inside an updater React may invoke more than once.
+          const closed = snapshotFileTab(closing)
+          if (closed) pushClosedTab(closed)
         }
 
         setActiveFileTabId(tabId)
@@ -3067,7 +3083,10 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
     setFileTabs((prev) => {
       for (const tab of prev) {
         finishOpenSettleClosed(tab.id)
+        const closed = snapshotFileTab(tab)
+        if (closed) pushClosedTab(closed)
       }
+
       inFlightLoadsRef.current.clear()
       openSettleDeferredRef.current.clear()
       pendingMaximizeOnSuccessRef.current.clear()
@@ -3104,6 +3123,8 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
         for (const tab of closing) {
           finishOpenSettleClosed(tab.id)
           pendingMaximizeOnSuccessRef.current.delete(tab.id)
+          const closed = snapshotFileTab(tab)
+          if (closed) pushClosedTab(closed)
         }
         const next = prev.filter((tab) => !idSet.has(tab.id))
         setPreviewFileTabIds((prevPreview) => {

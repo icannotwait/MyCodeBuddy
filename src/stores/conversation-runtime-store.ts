@@ -1,5 +1,6 @@
 import { create } from "zustand"
 import type {
+  LiveContentBlock,
   LiveMessage,
   ToolCallInfo,
 } from "@/contexts/acp-connections-context"
@@ -76,6 +77,7 @@ import {
   BACKGROUND_TASK_MARKER,
   parseBackgroundTaskMarker,
 } from "@/lib/background-agent"
+import { imageCardLabel } from "@/lib/image-tool-label"
 
 /**
  * Conversation-runtime shared state as a Zustand store — the per-conversation
@@ -133,6 +135,23 @@ export interface ConversationTimelineTurn {
   // Tool call IDs whose results are still streaming (only set for streaming-phase items).
   // The adapter uses this to keep the tool in "running" state while exposing partial output.
   inProgressToolCallIds?: Set<string>
+  /**
+   * This is a DB-persisted record of the round the backend says is STILL
+   * RUNNING (it follows `detail.in_flight_user_turn_id`), so its "persisted"
+   * phase does NOT mean finished — a passive viewer reads these blocks as the
+   * agent writes them. Consumers that treat persisted as complete (the
+   * completed-turn collapse, the per-reply stats row and artifacts card) must
+   * check this too.
+   *
+   * Only ever set on turns projected from `detail.turns`. A locally promoted
+   * turn is complete by construction (`COMPLETE_TURN` fires at TurnComplete),
+   * and the marker in `detail` can outlive that completion indefinitely —
+   * `completeTurn` deliberately never refetches, and the live-transcript viewer
+   * has no settle-time refetch — so deriving this from the raw marker over the
+   * whole timeline would strand a finished reply as "running" for the life of
+   * the view.
+   */
+  isInFlightRound?: boolean
 }
 
 /**
@@ -204,11 +223,11 @@ export interface ConversationRuntimeSession {
   /** True while a "load older history" page fetch is in flight. */
   detailHistoryLoadingOlder: boolean
 
-  // ACP `session/load` failed in a non-recoverable way (currently only when
-  // the agent reports ResourceNotFound for the historical session_id). Set
-  // by the connections layer via setAcpLoadError; cleared by the user
-  // pressing Reload, by a successful detail refetch, or when a new ACP
-  // session takes over.
+  // ACP `session/load` failed in a way codeg cannot paper over: the agent
+  // reports ResourceNotFound for the historical session_id, the session or
+  // process died, or the session is archived. Set by the connections layer
+  // via setAcpLoadError; cleared by the user pressing Reload, by a successful
+  // detail refetch, or when a new ACP session takes over.
   acpLoadError: string | null
 
   // Active session accumulated turns (promoted optimistic + completed streaming)
@@ -428,36 +447,6 @@ function buildHistoricalKey(
     liveMessageId: session.liveMessage?.id ?? null,
     liveStartedAt: session.liveMessage?.startedAt ?? null,
   }
-}
-
-function dedupeTimelineByRoleAwareId(
-  result: ConversationTimelineTurn[]
-): ConversationTimelineTurn[] {
-  // Retain rule is role-aware (all entries sharing an id are the same
-  // underlying turn, so the role is unambiguous):
-  //   - ASSISTANT (and any non-user): keep the LAST occurrence.
-  //   - USER: keep the FIRST occurrence.
-  // The key includes the role, not just the id, so the merge only ever
-  // collapses entries that are genuinely the same turn (same id AND role).
-  // Runs for every timeline entry on every streaming token, so avoid
-  // `JSON.stringify`. `role` is a fixed enum with no spaces, so the first space
-  // unambiguously splits role from id — a collision-free, far cheaper key.
-  const retainKey = (turn: MessageTurn) => `${turn.role} ${turn.id}`
-  const retainIndexByKey = new Map<string, number>()
-  result.forEach((entry, i) => {
-    const key = retainKey(entry.turn)
-    const existing = retainIndexByKey.get(key)
-    // First sighting always records; later sightings overwrite only for
-    // non-user turns (keep-last). User turns keep their first index.
-    if (existing === undefined || entry.turn.role !== "user") {
-      retainIndexByKey.set(key, i)
-    }
-  })
-  return retainIndexByKey.size === result.length
-    ? result
-    : result.filter(
-        (entry, i) => retainIndexByKey.get(retainKey(entry.turn)) === i
-      )
 }
 
 type Action =
@@ -1723,6 +1712,112 @@ function resolveLiveToolInput(
   return info.raw_input
 }
 
+/**
+ * Append a main-thread prose block, re-joining it with the trailing block when
+ * `continuesRun` says the two were one run the wire happened to tear apart.
+ *
+ * `liveMessage.content` is split at kind AND subagent-attribution boundaries
+ * (the reducer and the backend's `append_text_delta` share that predicate, so
+ * a snapshot-hydrated client sees the same block list a streaming one does).
+ * Attribution is a wire-level property, though, not a rendering one: parented
+ * blocks are routed out to their Agent capsule above, and what is left is one
+ * uninterrupted run of the main agent's own output that only *looks* split
+ * because a sub-agent chunk landed between two of its deltas.
+ *
+ * Rejoining is therefore a display concern and belongs here, not in the split
+ * predicate — moving it there would merge a sub-agent's prose into the main
+ * thread's. Without it, one thought renders as a wall of separate reasoning
+ * cards torn mid-word whenever sub-agents stream concurrently (#494).
+ *
+ * The tail check is a guard, not the decision: `continuesRun` is computed
+ * against the ORIGINAL event stream by `mainProseContinuations`, because a
+ * same-kind tail alone cannot tell a sub-agent tear from a real boundary that
+ * something upstream removed.
+ */
+function appendProse(
+  blocks: MessageTurn["blocks"],
+  type: "text" | "thinking",
+  text: string,
+  continuesRun: boolean
+): void {
+  const tail = blocks[blocks.length - 1]
+  if (continuesRun && tail && tail.type === type) {
+    blocks[blocks.length - 1] = { type, text: tail.text + text }
+    return
+  }
+  blocks.push({ type, text })
+}
+
+/**
+ * The main-thread prose blocks that continue the previous one — i.e. the wire
+ * put at least one SUB-AGENT block between them (parented prose, routed to the
+ * Agent capsule; or the sub-agent's own child tool calls, nested into the Agent
+ * card) and nothing else. Those are out-of-band for the main thread, so the
+ * split they caused is an artifact, not a boundary.
+ *
+ * Two rules keep this from fusing across a real boundary that something
+ * upstream erased:
+ *
+ * 1. Computed over `liveMessage.content`, NOT the array Phase 2 walks: by then
+ *    `collapseLiveCollabBlocks` has dropped a completed codex `closeAgent`,
+ *    and prose on either side of it must stay two blocks. That collapse never
+ *    drops or rewrites prose and preserves order, so prose blocks are
+ *    identity-stable across it.
+ * 2. A sub-agent block must ACTUALLY sit between the two. The split predicate
+ *    (`applyStreamingAction` / `append_text_delta`) merges same-kind same-
+ *    attribution deltas, so it can never leave two same-kind main-thread prose
+ *    blocks directly adjacent — that shape means something was removed. The
+ *    `PLAN_UPDATE` reducer is one such remover: it keeps at most one plan block
+ *    and relocates it to the end, so `thinking → plan(v1) → thinking → plan(v2)`
+ *    reaches us as two adjacent thinking blocks.
+ *
+ * Rule 2 is positional, so it cannot recover a plan that was relocated out from
+ * between two prose blocks that ALSO have a sub-agent block between them; the
+ * plan's original position is simply not in the state we are given. Closing
+ * that would mean making `PLAN_UPDATE` replace in place instead of relocating —
+ * a deliberate, separately-specified invariant on both sides of the wire.
+ */
+function mainProseContinuations(
+  content: LiveContentBlock[],
+  childToolCallIds: Set<string>
+): Set<LiveContentBlock> {
+  const continues = new Set<LiveContentBlock>()
+  let run: "text" | "thinking" | null = null
+  let bridgedBySubAgent = false
+  for (const block of content) {
+    if (block.type === "text" || block.type === "thinking") {
+      // A sub-agent's own prose: out-of-band, and not a boundary either.
+      if (block.parentToolUseId) {
+        bridgedBySubAgent = true
+        continue
+      }
+      // Phase 2 drops an empty main-thread text block, so it renders nothing
+      // and cannot be a boundary — it bridges, like a sub-agent block. Neither
+      // producer of `content` should emit one (the reducer drops empty
+      // `CONTENT_DELTA`, and so does `append_text_delta`), but a snapshot from
+      // a build that predates that symmetry would otherwise re-split a run.
+      if (block.type === "text" && block.text.length === 0) {
+        bridgedBySubAgent = true
+        continue
+      }
+      if (run === block.type && bridgedBySubAgent) continues.add(block)
+      run = block.type
+      bridgedBySubAgent = false
+      continue
+    }
+    if (
+      block.type === "tool_call" &&
+      childToolCallIds.has(block.info.tool_call_id)
+    ) {
+      bridgedBySubAgent = true
+      continue
+    }
+    run = null
+    bridgedBySubAgent = false
+  }
+  return continues
+}
+
 export function buildStreamingTurnsFromLiveMessage(
   conversationId: number,
   liveMessage: LiveMessage,
@@ -1774,9 +1869,11 @@ export function buildStreamingTurnsFromLiveMessage(
   // Live subagent transcripts, keyed by the launching Agent tool call's id.
   // Fed by parented text/thinking blocks (claude-agent-acp ≥0.63 subagent
   // transcripts); attached to the in-progress Agent card's tool_result as
-  // `agent_transcript`. Entries arrive pre-merged (the reducer splits blocks
-  // only at kind/attribution boundaries), so they are pushed as-is.
+  // `agent_transcript`.
   const agentTranscripts = new Map<string, AgentTranscriptEntry[]>()
+  // Agent id → the kind of prose that agent is currently in the middle of, or
+  // absent once its own tool call ended that run. Drives the rejoin above.
+  const transcriptRun = new Map<string, "text" | "thinking">()
 
   // Cache inferred tool names — inferLiveToolName is called per tool_call
   // in both Phase 1 and Phase 2; caching avoids redundant computation.
@@ -1857,6 +1954,9 @@ export function buildStreamingTurnsFromLiveMessage(
           agentChildren
             .get(resolvedParent)
             ?.push({ info: block.info, toolName })
+          // This agent stopped talking to run a tool: its next chunk starts a
+          // new transcript entry rather than rejoining the previous one.
+          transcriptRun.delete(resolvedParent)
         }
       }
     } else {
@@ -1866,16 +1966,38 @@ export function buildStreamingTurnsFromLiveMessage(
       // tool_call and attaches it. A parented block whose parent is not a
       // classified agent (snapshot-path orphan — the reducer's
       // parent-presence gate does not cover snapshot-sourced content) is
-      // dropped by the `agentIds` check. Entries arrive pre-merged (the
-      // reducer splits blocks only at kind/attribution boundaries).
+      // dropped by the `agentIds` check.
+      //
+      // The reducer splits blocks at kind/attribution boundaries, so ONE
+      // subagent's prose arrives pre-merged only while nothing else streams:
+      // with two sub-agents running (or any main-thread chunk in between),
+      // sub-A → sub-B → sub-A is three blocks, and this transcript would show
+      // A's single paragraph as two entries torn at a chunk boundary. Re-join
+      // them via `transcriptRun`, which tracks each agent's OWN run: another
+      // agent's chunk (or the main thread's) never interrupts it, but this
+      // agent's own tool call does — that is a real boundary in its output,
+      // and fusing across it would run two paragraphs together. See #494.
       if (
         (block.type === "text" || block.type === "thinking") &&
         block.parentToolUseId
       ) {
         if (agentIds.has(block.parentToolUseId)) {
           const list = agentTranscripts.get(block.parentToolUseId) ?? []
-          list.push({ type: block.type, text: block.text })
+          const tail = list[list.length - 1]
+          if (
+            transcriptRun.get(block.parentToolUseId) === block.type &&
+            tail &&
+            tail.type === block.type
+          ) {
+            list[list.length - 1] = {
+              type: tail.type,
+              text: tail.text + block.text,
+            }
+          } else {
+            list.push({ type: block.type, text: block.text })
+          }
           agentTranscripts.set(block.parentToolUseId, list)
+          transcriptRun.set(block.parentToolUseId, block.type)
         }
       } else if (positionalAgentId) {
         // A non-tool block (text/thinking/plan) means the main agent is
@@ -1896,6 +2018,12 @@ export function buildStreamingTurnsFromLiveMessage(
   const groups: MessageTurn["blocks"][] = [[]]
   let currentGroupHasCompletedTool = false
   const inProgressToolCallIds = new Set<string>()
+  // Which main-thread prose blocks are a continuation of the previous one
+  // (computed against the pre-collapse stream — see mainProseContinuations).
+  const continuesProse = mainProseContinuations(
+    liveMessage.content,
+    childToolCallIds
+  )
 
   for (const block of content) {
     // Parented subagent text/thinking never enters the main thread: it was
@@ -1925,7 +2053,12 @@ export function buildStreamingTurnsFromLiveMessage(
     switch (block.type) {
       case "text":
         if (block.text.length > 0) {
-          currentBlocks.push({ type: "text", text: block.text })
+          appendProse(
+            currentBlocks,
+            "text",
+            block.text,
+            continuesProse.has(block)
+          )
         }
         break
       case "thinking":
@@ -1933,7 +2066,12 @@ export function buildStreamingTurnsFromLiveMessage(
         // can show its "Thinking..." indicator before any reasoning text
         // arrives (and for newer Claude models that redact reasoning text
         // entirely while still emitting thinking blocks).
-        currentBlocks.push({ type: "thinking", text: block.text })
+        appendProse(
+          currentBlocks,
+          "thinking",
+          block.text,
+          continuesProse.has(block)
+        )
         break
       case "plan": {
         // Carry the live plan through as a first-class `plan` block so it
@@ -1972,6 +2110,10 @@ export function buildStreamingTurnsFromLiveMessage(
           // each renders as its own card.
           const imgs = block.info.images ?? []
           const revisedPrompt = extractRevisedPrompt(block.info.content)
+          const label = imageCardLabel({
+            title: block.info.title,
+            input: block.info.raw_input,
+          })
           // Live ToolCallStatus is forwarded so the renderer can show a
           // failure slot when codex reports the call failed before any
           // image bytes arrived. Without this the in-flight skeleton would
@@ -1985,6 +2127,7 @@ export function buildStreamingTurnsFromLiveMessage(
               revised_prompt: revisedPrompt,
               image: null,
               status,
+              label,
             })
           } else {
             for (const img of imgs) {
@@ -1997,6 +2140,7 @@ export function buildStreamingTurnsFromLiveMessage(
                   uri: img.uri ?? null,
                 },
                 status,
+                label,
               })
             }
           }
@@ -5297,16 +5441,87 @@ function mergeTimelineByTimestamp(
   return merged
 }
 
+// Runs for every timeline entry on every streaming token, so avoid
+// `JSON.stringify`. `role` is a fixed enum with no spaces, so the first space
+// unambiguously splits role from id — a collision-free, far cheaper key.
+const retainKey = (turn: MessageTurn) => `${turn.role} ${turn.id}`
+
+/**
+ * Invariant: the timeline never contains two turns with the same id. A
+ * premature/duplicate COMPLETE_TURN (e.g. the background `turn_complete`
+ * listener in ConversationDetailPanel racing the panel's own promotion)
+ * can leave the in-flight turn in BOTH `localTurns` (a promoted snapshot)
+ * and the still-streaming `liveMessage`, or — after a final re-promotion
+ * once the same liveMessage was re-bridged — twice in `localTurns`. All
+ * copies are built by `buildStreamingTurnsFromLiveMessage` from that one
+ * liveMessage, so they share `live-<cid>-<liveMessageId>[-i]` ids.
+ * Rendering both duplicates the whole assistant turn (visible doubling +
+ * React duplicate-key warnings once `mergeConsecutiveAssistantTurns`
+ * flat-maps their parts).
+ *
+ * Retain rule is role-aware (all entries sharing an id are the same
+ * underlying turn, so the role is unambiguous):
+ *   - ASSISTANT (and any non-user): keep the LAST occurrence. The live
+ *     streaming copy (appended last) wins over an earlier promoted
+ *     snapshot, and a re-promoted local turn wins over its stale copy.
+ *   - USER: keep the FIRST occurrence. When the detail endpoint stamps the
+ *     persisted in-flight user turn with the broadcast id, that persisted
+ *     copy is emitted first, in its correct position before any partial
+ *     assistant reply; a same-id optimistic/synthesized copy is appended
+ *     later (and, for the sender, survives a mid-turn `awaiting_persist`
+ *     refetch). Keeping the persisted copy preserves ordering — otherwise
+ *     the prompt would render after its own streaming reply.
+ * Real turns always have distinct ids (liveMessage.id is minted fresh per
+ * prompt cycle, DB turn ids are unique), so a normal multi-turn timeline
+ * has no collisions and is returned untouched.
+ *
+ * The key includes the role, not just the id, so the merge only ever
+ * collapses entries that are genuinely the same turn (same id AND role).
+ * Should two DIFFERENT-role turns ever share an id — only reachable via a
+ * client id that collided into another namespace — they are kept separately
+ * (a recoverable visible duplicate) instead of one silently overwriting the
+ * other, which could hide a user prompt.
+ */
+function dedupeTimeline(
+  entries: ConversationTimelineTurn[]
+): ConversationTimelineTurn[] {
+  const retainIndexByKey = new Map<string, number>()
+  entries.forEach((entry, i) => {
+    const key = retainKey(entry.turn)
+    const existing = retainIndexByKey.get(key)
+    // First sighting always records; later sightings overwrite only for
+    // non-user turns (keep-last). User turns keep their first index.
+    if (existing === undefined || entry.turn.role !== "user") {
+      retainIndexByKey.set(key, i)
+    }
+  })
+  return retainIndexByKey.size === entries.length
+    ? entries
+    : entries.filter(
+        (entry, i) => retainIndexByKey.get(retainKey(entry.turn)) === i
+      )
+}
+
+/**
+ * Per-turn-index sets of tool_call ids that are STILL RUNNING inside a
+ * persisted transcript: every `tool_use` that follows the backend's in-flight
+ * prompt and whose `tool_result` hasn't been written yet.
+ *
+ * Matching is deliberately WITHIN a turn — the exact rule `adaptMessageTurn`
+ * uses (`buildToolResultMap(turn.blocks)`) — so the ids collected here are
+ * precisely the ones the adapter would otherwise paint as settled. Blocks
+ * without a `tool_use_id` are skipped: the adapter can't key them either.
+ *
+ * `promptIdx` is the in-flight prompt's index in `turns`, or -1 when the backend
+ * reports no in-flight turn or named a prompt outside this window (older
+ * history page); the map is then empty and the caller behaves exactly as before.
+ */
 function collectInFlightPersistedToolCalls(
   turns: MessageTurn[],
-  inFlightPromptId: string | null
+  promptIdx: number
 ): Map<number, Set<string>> {
   const out = new Map<number, Set<string>>()
-  if (inFlightPromptId === null) return out
-  const promptIdx = turns.findIndex(
-    (t) => t.role === "user" && t.id === inFlightPromptId
-  )
-  if (promptIdx === -1) return out
+  if (promptIdx < 0) return out
   for (let i = promptIdx + 1; i < turns.length; i++) {
     const turn = turns[i]
     if (turn.role !== "assistant") continue
@@ -5509,9 +5724,19 @@ function computeHistoricalTimeline(
   // codex code-mode script that never `text()`s its call settles with none.
   // Scoping to turns AFTER that prompt is what keeps an orphan left by an
   // earlier interrupted round from re-acquiring a spinner it will never lose.
+  // Where the still-running round starts inside the persisted projection. -1
+  // when the backend reports no in-flight prompt, or names one this window
+  // doesn't contain — the whole projection then reads as settled history.
+  const inFlightRoundStart =
+    inFlightPromptId === null
+      ? -1
+      : visiblePersistedTurns.findIndex(
+          (t) => t.role === "user" && t.id === inFlightPromptId
+        )
+
   const inFlightToolCallIdsByIndex = collectInFlightPersistedToolCalls(
     visiblePersistedTurns,
-    inFlightPromptId
+    inFlightRoundStart
   )
 
   // Keys carry NO positional index: prepending older history (reverse
@@ -5526,6 +5751,7 @@ function computeHistoricalTimeline(
       turn,
       phase: "persisted" as const,
       inProgressToolCallIds: inFlightToolCallIdsByIndex.get(i),
+      isInFlightRound: inFlightRoundStart >= 0 && i > inFlightRoundStart,
     })
   )
 
@@ -5604,7 +5830,7 @@ function computeHistoricalTimeline(
   // id+role. Streaming-phase dedup against historical runs in
   // `appendCanonicalStreamingTurns` so this cache stays free of live content.
   const result = [...persisted, ...localAndBackground, ...optimistic]
-  const deduped = dedupeTimelineByRoleAwareId(result)
+  const deduped = dedupeTimeline(result)
 
   historicalTimelineCache.set(conversationId, { key, value: deduped })
   return deduped
@@ -5637,7 +5863,7 @@ function appendCanonicalStreamingTurns(
       inProgressToolCallIds: built.inProgressToolCallIds,
     })
   }
-  return dedupeTimelineByRoleAwareId(result)
+  return dedupeTimeline(result)
 }
 
 /**

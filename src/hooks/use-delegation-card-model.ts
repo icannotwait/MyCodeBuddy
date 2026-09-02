@@ -37,6 +37,7 @@ import {
   buildEditRollupViewModel,
   computeDelegationElapsedMs,
   formatDelegationDisplaySecondary,
+  isAffirmedResume,
   isUncorrelatedDelegationFailure,
   parseDelegateTaskId,
   parseDelegationMeta,
@@ -78,6 +79,13 @@ export interface DelegationCardSource {
   errorText?: string | null
   state?: ToolCallState
   meta?: Record<string, unknown> | null
+  /**
+   * A broker task id to resolve the live binding by when `parentToolUseId`
+   * matches none. Set by `ResumedDelegationCard`: a resume re-binds the child
+   * to the ORIGINAL `delegate_to_agent` call's tool_use_id, so the resume
+   * call's own id is never a binding key — the task id in its arguments is.
+   */
+  taskIdHint?: string | null
 }
 
 export type DelegationLifecycleStatus = "running" | "ok" | "err"
@@ -402,7 +410,7 @@ function pickFinishedAt(
   }
 
   if (binding) {
-    return binding.finishedAt ?? binding.runtimeStats.finished_at ?? null
+    return binding.finishedAt ?? binding.runtimeStats?.finished_at ?? null
   }
   if (parsedMeta) {
     if (parsedMeta.finishedAt) return parsedMeta.finishedAt
@@ -671,6 +679,7 @@ export function buildDelegationCardModel(input: {
   const agentType: AgentType | null =
     effectiveBinding?.agentType ??
     parsedInput.agentType ??
+    toolOutput?.agentType ??
     parsedMeta?.agentType ??
     agentTypeFromRunSnapshot(effectiveRunSnapshot)
   // Cold recovery may only have summary error_code — fold projection last.
@@ -715,7 +724,9 @@ export function buildDelegationCardModel(input: {
     parsedInput.agentType ||
     parsedInput.task ||
     parsedMeta ||
-    runSnapshot
+    runSnapshot ||
+    toolOutput?.agentType ||
+    toolOutput?.childConversationId != null
   )
 
   return {
@@ -799,7 +810,7 @@ function sourceObservation(
     }),
     errorCode:
       parsedMeta?.errorCode ??
-      (toolOutput?.kind === "outcome" ? toolOutput.errorCode : null),
+      (toolOutput?.kind === "outcome" ? (toolOutput.errorCode ?? null) : null),
     startedAt: parsedMeta?.startedAt ?? runtimeStats?.started_at ?? null,
     finishedAt: parsedMeta?.finishedAt ?? runtimeStats?.finished_at ?? null,
     lastAgentActivityAt:
@@ -1004,7 +1015,8 @@ export function useDelegationCardModel(
 
   // Source-local task id before live binding (may be contaminated by a later
   // continue on the shared child). Used to scope binding + snapshot fetch.
-  const sourceTaskId = parsedMeta?.taskId ?? displayTaskId
+  const sourceTaskId =
+    parsedMeta?.taskId ?? displayTaskId ?? source.taskIdHint ?? null
 
   // `enabled: false` — the model never fetches the child's persisted detail
   // here; cold title/stats come from `delegationChildProjectionCache`.
@@ -1013,12 +1025,37 @@ export function useDelegationCardModel(
   const { binding: rawBinding } = useDelegatedSubSession(parentToolUseId, {
     enabled: false,
     fallbackChildConversationId,
+    fallbackTaskId: source.taskIdHint,
   })
-  const binding = scopeDelegationBindingForCard(
+  // Task-id lookup is workspace-wide. Adopt that fallback only when this call's
+  // own report/meta names the same child, or the text affirms a real resume.
+  const binding = useMemo(() => {
+    if (!rawBinding) return undefined
+    if (rawBinding.parentToolUseId === parentToolUseId) {
+      return scopeDelegationBindingForCard(
+        rawBinding,
+        parentToolUseId,
+        sourceTaskId
+      )
+    }
+    if (sourceTaskId != null && rawBinding.taskId !== sourceTaskId) {
+      return undefined
+    }
+    const named =
+      toolOutput?.childConversationId ?? parsedMeta?.childConversationId
+    if (named != null) {
+      return named === rawBinding.childConversationId ? rawBinding : undefined
+    }
+    return isAffirmedResume(output, errorText) ? rawBinding : undefined
+  }, [
     rawBinding,
     parentToolUseId,
-    sourceTaskId
-  )
+    sourceTaskId,
+    toolOutput,
+    parsedMeta,
+    output,
+    errorText,
+  ])
 
   const snapshotTaskId = binding?.taskId ?? sourceTaskId
   const runSnapshot = useDelegationRunSnapshot(

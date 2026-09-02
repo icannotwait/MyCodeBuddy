@@ -64,7 +64,7 @@ function StepRail({ current }: { current: Step }) {
   const currentIndex = STEP_ORDER.indexOf(current)
 
   return (
-    <ol className="flex items-center gap-1.5 text-[11px]">
+    <ol className="flex items-center gap-1.5 text-2xs">
       {STEP_ORDER.map((step, i) => {
         const isDone = i < currentIndex
         const isCurrent = i === currentIndex
@@ -267,7 +267,7 @@ export function StatusBarUpdate() {
                 ? t("updateAvailableTitle")
                 : t("updateTitle")}
           </div>
-          <div className="flex items-center justify-between gap-2 text-[11px] text-muted-foreground">
+          <div className="flex items-center justify-between gap-2 text-2xs text-muted-foreground">
             <span className="font-mono">
               {currentVersion ? `v${currentVersion}` : "—"}
               {targetVersion ? ` → v${targetVersion}` : ""}
@@ -291,7 +291,7 @@ export function StatusBarUpdate() {
                     <div className="h-full w-1/3 rounded-full bg-primary animate-pulse" />
                   )}
                 </div>
-                <div className="text-[11px] text-muted-foreground">
+                <div className="text-2xs text-muted-foreground">
                   {formatBytes(state.downloaded ?? 0)}
                   {state.total ? ` / ${formatBytes(state.total)}` : ""}
                 </div>
@@ -303,7 +303,7 @@ export function StatusBarUpdate() {
               </div>
             )}
             {restarting && (
-              <div className="flex items-center gap-2 text-[11px] text-muted-foreground">
+              <div className="flex items-center gap-2 text-2xs text-muted-foreground">
                 <Spinner className="h-3 w-3" />
                 {restartCountdown !== null && restartCountdown > 0
                   ? t("restartingIn", { seconds: restartCountdown })
@@ -311,7 +311,7 @@ export function StatusBarUpdate() {
               </div>
             )}
             {ready && (
-              <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+              <div className="flex items-center gap-1.5 text-2xs text-muted-foreground">
                 <Check className="h-3 w-3 text-primary" />
                 {t("updateReadyHint")}
               </div>
@@ -320,14 +320,14 @@ export function StatusBarUpdate() {
         )}
 
         {errorMessage && (
-          <div className="rounded-md border border-red-500/30 bg-red-500/5 px-2 py-1.5 text-[11px] text-red-400">
+          <div className="rounded-md border border-red-500/30 bg-red-500/5 px-2 py-1.5 text-2xs text-red-400">
             {t("updateError", { message: errorMessage })}
           </div>
         )}
 
         {available && (
           <div className="space-y-1.5">
-            <div className="text-[11px] font-medium text-muted-foreground">
+            <div className="text-2xs font-medium text-muted-foreground">
               {t("releaseNotesTitle")}
             </div>
             <ReleaseNotes
@@ -340,7 +340,7 @@ export function StatusBarUpdate() {
 
         {/* Docker upgrades only live as long as the container does. */}
         {available && selfUpdateSupported && runtime === "docker" && (
-          <p className="text-[11px] leading-5 text-muted-foreground/80">
+          <p className="text-2xs leading-5 text-muted-foreground/80">
             {t("dockerUpgradeHint")}
           </p>
         )}

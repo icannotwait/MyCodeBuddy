@@ -27,11 +27,16 @@ use tokio::sync::{Mutex, Notify};
 use tokio::time::MissedTickBehavior;
 
 use crate::acp::manager::ConnectionManager;
-use crate::acp::types::{AcpEvent, EventEnvelope, PromptCapabilitiesInfo, PromptInputBlock};
+use crate::acp::types::{
+    AcpEvent, ConnectionStatus, EventEnvelope, PromptCapabilitiesInfo, PromptInputBlock,
+};
 use crate::acp::work_task_tools::{TaskReportAck, WorkTaskToolAccess};
-use crate::acp::InternalEventBus;
+use crate::acp::{InternalEventBus, InternalEventEnvelope};
+use crate::auto_title::InternalAgentSessionRegistry;
 use crate::commands::acp::verify_agent_installed;
-use crate::commands::conversations::{create_conversation_core, emit_conversation_upsert};
+use crate::commands::conversations::{
+    create_conversation_core, emit_conversation_upsert, get_folder_conversation_core,
+};
 use crate::commands::folders::{
     emit_folder_deleted, emit_folder_upsert, get_folder_core, git_worktree_add,
     open_worktree_folder_core, resolve_git_head,
@@ -53,6 +58,7 @@ use crate::models::{
     STAGE_PROMPT_ALL,
 };
 use crate::web::event_bridge::{emit_event, EventEmitter, WorkTaskChange, WORK_TASK_CHANGED_EVENT};
+use crate::work_task::compact;
 use crate::work_task::git as task_git;
 
 /// Reconcile sweep cadence.
@@ -66,6 +72,71 @@ const SCHEDULE_INTERVAL_SECS: u64 = 15;
 /// Cap on the preflight output tail persisted with a red light.
 const PREFLIGHT_TAIL_CHARS: usize = 4000;
 
+/// How often a waiting pre-prompt compaction re-checks that its connection is
+/// still alive. NOT a deadline on the turn — see `await_compaction_turn`, which
+/// only ever ends the wait on evidence the turn is over or the connection is
+/// gone. Loose enough to cost nothing on a turn that runs for minutes.
+const COMPACTION_LIVENESS_TICK: Duration = Duration::from_secs(5);
+
+/// Why a worktree removal declined to run, as one clause. Every surface that
+/// can decline one composes its message from THIS — `complete_task`'s checkbox,
+/// `cleanup_task`, the delivered-PR keep reason, and the task delete — so the
+/// card, the toast and the timeline cannot drift into describing the same
+/// condition differently. Only the remedy changes, because only the remedy
+/// depends on what the user was doing.
+const WORKTREE_HOLDS_UNCOMMITTED: &str = "it still holds uncommitted files";
+
+/// The reason plus the way out of it.
+pub(crate) fn worktree_kept(remedy: &str) -> String {
+    format!("the worktree was kept: {WORKTREE_HOLDS_UNCOMMITTED}. {remedy}")
+}
+
+/// The remedy for the surfaces whose retry IS the cleanup itself.
+pub(crate) const RETRY_THE_CLEANUP: &str = "Remove them, then retry the cleanup.";
+
+/// The probe every worktree-removal gate shares: does this checkout still hold
+/// work (tracked edits or files git has never seen)?
+///
+/// FAILS CLOSED. Exactly one reason for git being unable to answer is safe to
+/// read as "clean" — the checkout is already off disk, so there is nothing left
+/// to lose, and the removal paths handle a missing directory on their own. Any
+/// OTHER failure (a corrupt index, a permission error, a transient git fault)
+/// means we could not prove the directory is safe to destroy, and the operation
+/// waiting on this answer is `git worktree remove --force`. Guessing "clean"
+/// there trades a recoverable stall for unrecoverable files.
+async fn path_holds_uncommitted(path: &str) -> bool {
+    match task_git::has_changes(path).await {
+        Ok(dirty) => dirty,
+        Err(_) => Path::new(path).exists(),
+    }
+}
+
+/// Why [`TaskEngine::cleanup_task`] did not remove a worktree.
+///
+/// The two answers are not interchangeable to `work_task_delete_core`, which
+/// tombstones the task immediately afterwards. A cleanup that TRIED AND FAILED
+/// leaves stale bookkeeping behind and the delete may proceed over it. A
+/// cleanup that was REFUSED to protect work must stop it: the tombstone takes
+/// the card, its `cleanup_state` and its retry entry all at once, stranding a
+/// directory the user was told would be deleted with nothing left anywhere to
+/// say why — the failure mode a plain `Err` swallowed by a `warn!` produces.
+#[derive(Debug)]
+pub struct CleanupBlocked {
+    pub message: String,
+    /// The worktree was left standing deliberately, and still holds work.
+    pub holds_work: bool,
+}
+
+impl CleanupBlocked {
+    /// Tried, could not finish. Callers may proceed past it.
+    fn failed(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            holds_work: false,
+        }
+    }
+}
+
 static ENGINE: OnceLock<Arc<TaskEngine>> = OnceLock::new();
 
 /// The process-global engine, set once at boot by [`build_task_engine`]. Read
@@ -76,6 +147,7 @@ pub fn engine() -> Option<Arc<TaskEngine>> {
 
 pub struct TaskEngine {
     db: AppDatabase,
+    internal_sessions: Arc<InternalAgentSessionRegistry>,
     manager: ConnectionManager,
     emitter: EventEmitter,
     bus: Arc<InternalEventBus>,
@@ -112,6 +184,31 @@ pub struct TaskEngine {
     /// process TREE so a long `pnpm install` stops with the task instead of
     /// running to completion in the background.
     setup_children: Arc<Mutex<HashMap<i32, SetupChild>>>,
+    /// Tasks whose launch is currently waiting out a pre-prompt compaction
+    /// turn, and the connection running it. Serves the same role
+    /// `setup_children` does for a long init command: the launch holds the task
+    /// lock across the whole compaction, so a cancel has to be able to reach
+    /// the turn WITHOUT that lock — otherwise "stop" would sit behind the very
+    /// turn it is trying to stop. The compaction connection is deliberately NOT
+    /// in `index`: its `TurnComplete` is the launch's own signal, and an
+    /// indexed one would settle the task into review before its work ever
+    /// started.
+    compacting: Arc<Mutex<HashMap<i32, CompactRun>>>,
+    /// `connection_id -> event seq` of a compaction `TurnComplete` the launch
+    /// has already consumed as its own signal.
+    ///
+    /// The bus is a BROADCAST: this engine's own receiver and the launch's
+    /// waiter each get their own copy of that envelope. The waiter is awaiting
+    /// exactly it, so it always reacts first; the engine's loop awaits DB work
+    /// per event and can be arbitrarily far behind. "The connection was not in
+    /// `index` when this was emitted" is therefore something `on_event` cannot
+    /// observe — by the time it dequeues, the launch may have indexed the
+    /// connection and sent the round's real prompt, and the compaction's
+    /// completion would settle THAT turn (and disconnect the agent mid-round).
+    /// The seq is the discriminator: per-connection and monotonic (assigned
+    /// under the state write lock in `emit_with_state_gated`), so it names one
+    /// exact envelope rather than "a turn on this connection".
+    compaction_turns: Arc<Mutex<HashMap<String, u64>>>,
     /// Tasks whose merge/delivery is executing in THIS process — the reconcile
     /// tick must not run crash recovery against them. A merge only needs it
     /// for the dispatch window (a live agent connection covers the rest); a
@@ -149,6 +246,7 @@ pub fn build_task_engine(
     manager: ConnectionManager,
     emitter: EventEmitter,
     bus: Arc<InternalEventBus>,
+    internal_sessions: Arc<InternalAgentSessionRegistry>,
     data_dir: PathBuf,
 ) -> Option<Arc<TaskEngine>> {
     let engine_lock = match acquire_engine_ownership(&data_dir) {
@@ -172,6 +270,7 @@ pub fn build_task_engine(
     };
     let engine = Arc::new(TaskEngine {
         db,
+        internal_sessions,
         manager,
         emitter,
         bus,
@@ -182,6 +281,8 @@ pub fn build_task_engine(
         launching: Arc::new(Mutex::new(HashMap::new())),
         launch_token: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         setup_children: Arc::new(Mutex::new(HashMap::new())),
+        compacting: Arc::new(Mutex::new(HashMap::new())),
+        compaction_turns: Arc::new(Mutex::new(HashMap::new())),
         merging: Arc::new(Mutex::new(HashMap::new())),
         in_flight_token: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         forge: Arc::new(crate::forge::deliver::ForgeDelivery),
@@ -214,21 +315,40 @@ fn test_engine(db: AppDatabase) -> Arc<TaskEngine> {
 /// the credential store.
 #[cfg(test)]
 fn test_engine_with_forge(db: AppDatabase, forge: Arc<dyn ForgeDeliveryApi>) -> Arc<TaskEngine> {
+    test_engine_full(db, forge, EventEmitter::Noop)
+}
+
+/// As [`test_engine_with_forge`], with the emitter chosen by the caller — the
+/// broadcast-ordering tests need a real `WebEventBroadcaster` behind it to read
+/// back what the engine announced, and in what order.
+#[cfg(test)]
+fn test_engine_full(
+    db: AppDatabase,
+    forge: Arc<dyn ForgeDeliveryApi>,
+    emitter: EventEmitter,
+) -> Arc<TaskEngine> {
+    let data_dir = std::env::temp_dir();
+    let internal_sessions =
+        InternalAgentSessionRegistry::new_empty_for_test(db.conn.clone(), &data_dir)
+            .expect("empty internal session registry for tests");
     Arc::new(TaskEngine {
         db,
+        internal_sessions,
         manager: ConnectionManager::new(),
-        emitter: EventEmitter::Noop,
+        emitter,
         bus: Arc::new(InternalEventBus::new(Default::default())),
         // An anonymous temp file, not a handle on `data_dir`: opening a
         // DIRECTORY as a File succeeds on Unix but fails on Windows.
         _engine_lock: tempfile::tempfile().expect("temp file"),
-        data_dir: std::env::temp_dir(),
+        data_dir,
         index: Arc::new(Mutex::new(HashMap::new())),
         awaiting: Arc::new(Mutex::new(HashMap::new())),
         delegation_parents: Arc::new(Mutex::new(HashMap::new())),
         launching: Arc::new(Mutex::new(HashMap::new())),
         launch_token: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         setup_children: Arc::new(Mutex::new(HashMap::new())),
+        compacting: Arc::new(Mutex::new(HashMap::new())),
+        compaction_turns: Arc::new(Mutex::new(HashMap::new())),
         merging: Arc::new(Mutex::new(HashMap::new())),
         in_flight_token: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         forge,
@@ -278,6 +398,19 @@ fn acquire_engine_ownership(data_dir: &Path) -> Ownership {
 /// Long-running driver: boot recovery, then a select loop over the event bus +
 /// the reconcile tick. Spawn once per process in each boot path.
 pub async fn run_task_engine(engine: Arc<TaskEngine>) {
+    // Subscribed BEFORE the boot work below, not after it: a broadcast receiver
+    // only ever sees what is published after it subscribes, and the boot work
+    // is not instant (a git probe per merging row, a re-measure per review
+    // row). A task the user starts inside that window would emit its events
+    // into a bus nobody is listening to, and a missed `TurnComplete` leaves it
+    // running forever — the reconcile sweep deliberately leaves rows whose
+    // connection is still live to `on_event`. Anything that piles up while boot
+    // finishes is processed right after, which is safe by construction: every
+    // settle is a CAS on `(connection_id, run_seq)`, so an event for a
+    // generation boot already failed is a no-op. A backlog past the channel's
+    // capacity surfaces as `Lagged`, which the loop already handles.
+    let mut rx = engine.bus.subscribe();
+
     // Boot recovery: no connections (and no setup child processes) survive a
     // restart, so queued / preparing / running / awaiting_input are
     // interruptions → failed(interrupted); retry is idempotent (the worktree is
@@ -300,8 +433,8 @@ pub async fn run_task_engine(engine: Arc<TaskEngine>) {
         }
         Err(e) => tracing::warn!("[work_task] boot merging scan error: {e}"),
     }
+    engine.refresh_review_diff_stats().await;
 
-    let mut rx = engine.bus.subscribe();
     let mut reconcile = {
         let mut i = tokio::time::interval(Duration::from_secs(RECONCILE_INTERVAL_SECS));
         i.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -430,6 +563,10 @@ enum LaunchMode {
         strategy: String,
         /// `None` → the agent writes the commit message itself.
         message: Option<String>,
+        /// Whatever the user added in the merge dialog, verbatim. `None` when
+        /// they left it empty — which is every merge dispatched before this
+        /// existed, and the auto-merge sweep's every landing.
+        instructions: Option<String>,
     },
 }
 
@@ -691,10 +828,14 @@ impl TaskEngine {
         Ok(())
     }
 
-    /// Cancel a task from any non-terminal state except merging. Worktree is
-    /// kept (the card offers cleanup separately). `reason` is the user's own
-    /// note for the timeline; internal cancels (a conversation the user stopped
-    /// from the chat UI, a delete) pass None.
+    /// Cancel a task from any non-terminal state except merging. The worktree
+    /// is kept — removing it is a separate call the callers chain on when the
+    /// user asked for it (`work_task_cancel_core`'s checkbox, the delete path),
+    /// and it has to come after this one returns: the removal refuses while a
+    /// live agent connection is still on the task, and shedding that connection
+    /// is the last thing we do below. `reason` is the user's own note for the
+    /// timeline; internal cancels (a conversation the user stopped from the
+    /// chat UI, a delete) pass None.
     pub async fn cancel(
         self: &Arc<Self>,
         task_id: i32,
@@ -708,13 +849,15 @@ impl TaskEngine {
         }
         self.emit_upsert(task_id);
 
-        // Kill a running init command BEFORE waiting on the task lock: the
-        // launch holds that lock for its whole setup, so waiting first would
-        // mean waiting out the very `pnpm install` we are trying to stop. The
-        // run_seq we just canceled scopes the kill to this generation (cancel
-        // does not bump it, so the row still carries it).
+        // Stop a running init command / pre-prompt compaction BEFORE waiting on
+        // the task lock: the launch holds that lock for its whole setup, so
+        // waiting first would mean waiting out the very `pnpm install` — or the
+        // very compaction turn — we are trying to stop. The run_seq we just
+        // canceled scopes both to this generation (cancel does not bump it, so
+        // the row still carries it).
         if let Ok(task) = work_task_service::get_model(&self.db.conn, task_id).await {
             self.kill_setup_child(task_id, task.run_seq).await;
+            self.abort_compaction(task_id, task.run_seq).await;
         }
 
         // Serialize the teardown with a possibly in-flight launch: the launch
@@ -735,7 +878,7 @@ impl TaskEngine {
         };
         if let Some(conn_id) = conn_id {
             let _ = self.manager.cancel(&self.db.conn, &conn_id).await;
-            self.index.lock().await.remove(&conn_id);
+            self.forget_connection(&conn_id).await;
             self.forget_delegation_children_of(&conn_id).await;
             let _ = self.manager.disconnect(&conn_id).await;
         }
@@ -1174,8 +1317,35 @@ impl TaskEngine {
         };
         emit_conversation_upsert(&self.emitter, &self.db.conn, conversation_id).await;
 
+        // A resumed session carries every earlier round's context. Give the
+        // folder's threshold (when set) a chance to shrink it BEFORE this
+        // round's prompt goes in — see `compact_before_prompt` for why this
+        // sits ahead of the index insert.
+        if resumed {
+            self.compact_before_prompt(CompactRequest {
+                task_id,
+                run_seq,
+                conn_id: &conn_id,
+                agent_type,
+                settings: &settings,
+                folder_id: wt.folder_id,
+                conversation_id,
+                in_flight: mode.in_flight_status(),
+            })
+            .await;
+        }
+
         let mut blocks =
-            compose_prompt(&cfg, &task, &mode, &settings, resumed, &self.db.conn).await?;
+            match compose_prompt(&cfg, &task, &mode, &settings, resumed, &self.db.conn).await {
+                Ok(blocks) => blocks,
+                // The one path that abandons the connection without a teardown
+                // (it always has). A compaction just fenced this connection's
+                // completion, and nothing downstream would ever lift that fence.
+                Err(e) => {
+                    self.compaction_turns.lock().await.remove(&conn_id);
+                    return Err(e);
+                }
+            };
         // Re-encode attached images for the agent that actually answered the
         // handshake. A task's blocks are STORED — the composer picked their
         // encoding from a transient probe that may not have landed, possibly
@@ -1219,7 +1389,6 @@ impl TaskEngine {
                 &conn_id,
             )
             .await
-            .map_err(|e| e.to_string())?
         } else {
             work_task_service::mark_running(
                 &self.db.conn,
@@ -1229,10 +1398,26 @@ impl TaskEngine {
                 &conn_id,
             )
             .await
-            .map_err(|e| e.to_string())?
+        };
+        // A write that FAILED (a busy database, say) leaves this generation in
+        // exactly the state a lost CAS does — never marked live, no prompt
+        // sent — so it unwinds the same way instead of propagating out with the
+        // connection still registered. `launch`'s caller fails the row on an
+        // `Err`, and a failed row holding an index entry for a live connection
+        // is the stale-binding hazard the run_seq CAS exists to prevent.
+        let marked = match marked {
+            Ok(marked) => marked,
+            Err(e) => {
+                self.forget_connection(&conn_id).await;
+                let _ = self.manager.disconnect(&conn_id).await;
+                if !resumed {
+                    self.cancel_conversation(conversation_id).await;
+                }
+                return Err(e.to_string());
+            }
         };
         if !marked {
-            self.index.lock().await.remove(&conn_id);
+            self.forget_connection(&conn_id).await;
             let _ = self.manager.disconnect(&conn_id).await;
             if !resumed {
                 self.cancel_conversation(conversation_id).await;
@@ -1275,7 +1460,7 @@ impl TaskEngine {
                 Ok(())
             }
             Err(e) => {
-                self.index.lock().await.remove(&conn_id);
+                self.forget_connection(&conn_id).await;
                 let _ = self.manager.disconnect(&conn_id).await;
                 if !resumed {
                     self.cancel_conversation(conversation_id).await;
@@ -1788,6 +1973,488 @@ impl TaskEngine {
         wake.notify_one();
     }
 
+    /// Compact the resumed session's context before this round's prompt, when
+    /// the folder's settings ask for it (`auto_compact_percent`).
+    ///
+    /// Placement is the whole design. It runs AFTER the spawn (only a live
+    /// session can be compacted, and only a live session can say how full it
+    /// is) and BEFORE the `index` insert and `mark_running`, so:
+    /// - the compaction turn's `TurnComplete` reaches `on_event` with no index
+    ///   entry behind it and is dropped — an indexed one would settle the task
+    ///   into review before its actual work started;
+    /// - the round's own prompt is sent only once this turn has landed, which
+    ///   is the point of the feature.
+    ///
+    /// The cost of staying out of `index` is that a compaction turn which
+    /// somehow blocked on a permission would not flip the card to
+    /// `awaiting_input` — it would sit in `preparing` until the user cancels.
+    /// Accepted deliberately: compaction is a self-contained summarisation
+    /// turn, and the alternative (indexing it) trades a rare stall for a
+    /// systematic mis-settle of every task that compacts.
+    ///
+    /// Never fails the launch. A compaction that could not be measured, has no
+    /// command to run, or ends badly records itself on the timeline and lets
+    /// the round proceed: an over-full context makes the next prompt likely to
+    /// fail, but refusing to send it makes it certain.
+    ///
+    /// Only called for a launch that RESUMED — a fresh session's context is
+    /// empty by construction.
+    async fn compact_before_prompt(&self, req: CompactRequest<'_>) {
+        let CompactRequest {
+            task_id,
+            run_seq,
+            conn_id,
+            agent_type,
+            settings,
+            folder_id,
+            conversation_id,
+            in_flight,
+        } = req;
+        let threshold = settings.auto_compact_percent;
+        if threshold <= 0 {
+            return;
+        }
+        let Some(before) = self.context_reading(conn_id, conversation_id).await else {
+            // The agent reports no usable occupancy (no live `usage_update`, and
+            // a transcript that carries no window either). Recorded rather than
+            // silent: with the threshold switched on, "nothing happened" is a
+            // result the user needs an explanation for.
+            self.record_compact_event(
+                task_id,
+                serde_json::json!({
+                    "status": "skipped",
+                    "reason": "usage_unknown",
+                    "threshold_percent": threshold,
+                }),
+            )
+            .await;
+            return;
+        };
+        if !compact::trips_threshold(before.percent, threshold) {
+            return;
+        }
+
+        let advertised = match self.manager.get_state(conn_id).await {
+            Some(state) => state.read().await.available_commands.clone(),
+            None => Vec::new(),
+        };
+        let Some(command) = compact::resolve_compact_command(
+            settings.compact_command.as_deref(),
+            agent_type,
+            &advertised,
+        ) else {
+            self.record_compact_event(
+                task_id,
+                serde_json::json!({
+                    "status": "skipped",
+                    "reason": "no_command",
+                    "threshold_percent": threshold,
+                    "before_percent": round1(before.percent),
+                }),
+            )
+            .await;
+            return;
+        };
+
+        // Cancel gate, then the kill slot, then the gate AGAIN — the same
+        // ordering `reserve_setup_slot` uses for the init command. A cancel
+        // that lands before the slot exists is caught by the re-check (it flips
+        // the row first); one that lands after finds the slot and aborts the
+        // turn. Without the re-check, a cancel in between would fall through to
+        // the task lock, which this launch holds until the compaction it is
+        // trying to stop has finished.
+        if !still_expected(&self.db.conn, task_id, run_seq, in_flight).await {
+            return;
+        }
+        self.compacting.lock().await.insert(
+            task_id,
+            CompactRun {
+                run_seq,
+                conn_id: conn_id.to_string(),
+            },
+        );
+        if !still_expected(&self.db.conn, task_id, run_seq, in_flight).await {
+            self.release_compact_slot(task_id, run_seq).await;
+            return;
+        }
+
+        // Subscribed BEFORE the send: the turn can complete the instant it is
+        // enqueued, and a receiver only ever sees what is published after it
+        // subscribes.
+        let mut rx = self.bus.subscribe();
+        let sent = self
+            .manager
+            .send_prompt_linked_with_message_id(
+                &self.db,
+                conn_id,
+                vec![PromptInputBlock::Text {
+                    text: command.clone(),
+                }],
+                Some(folder_id),
+                Some(conversation_id),
+                None,
+                None,
+                None,
+            )
+            .await;
+        if let Err(e) = sent {
+            self.release_compact_slot(task_id, run_seq).await;
+            self.record_compact_event(
+                task_id,
+                serde_json::json!({
+                    "status": "failed",
+                    "command": command,
+                    "threshold_percent": threshold,
+                    "before_percent": round1(before.percent),
+                    "error": e.to_string(),
+                }),
+            )
+            .await;
+            return;
+        }
+
+        let outcome = self.await_compaction_turn(&mut rx, conn_id).await;
+        self.release_compact_slot(task_id, run_seq).await;
+
+        // Read the occupancy back from the LIVE session only. The transcript
+        // fallback is write-behind, so re-parsing here would report the
+        // pre-compaction figure as the result of the compaction.
+        let after = self.live_context_reading(conn_id).await;
+        let mut payload = serde_json::json!({
+            "status": outcome.status,
+            "command": command,
+            "threshold_percent": threshold,
+            "before_percent": round1(before.percent),
+            "before_source": before.source,
+        });
+        if let Some(map) = payload.as_object_mut() {
+            if let Some(used) = before.used {
+                map.insert("before_used_tokens".into(), used.into());
+            }
+            if let Some(size) = before.size {
+                map.insert("before_size_tokens".into(), size.into());
+            }
+            if let Some(after) = after.as_ref() {
+                map.insert("after_percent".into(), round1(after.percent).into());
+                if let Some(used) = after.used {
+                    map.insert("after_used_tokens".into(), used.into());
+                }
+            }
+            if let Some(detail) = outcome.detail {
+                map.insert("detail".into(), detail.into());
+            }
+        }
+        self.record_compact_event(task_id, payload).await;
+    }
+
+    /// Wait out the compaction turn on `conn_id`.
+    ///
+    /// Deliberately unbounded in TIME — compacting a full context is a real
+    /// model turn, and a deadline here would just send the round's prompt into
+    /// the very context we were told to shrink. What ends the wait is evidence:
+    /// the turn completing, the connection dying, or a cancel (which aborts the
+    /// turn through [`Self::abort_compaction`], producing a
+    /// `TurnComplete{cancelled}` of its own).
+    ///
+    /// The bus alone is not enough evidence, which is why the wait also polls
+    /// liveness. `apply_event` clears `turn_in_flight` on `TurnComplete` but
+    /// NOT on a terminal `Error` or `StatusChanged{Disconnected}` — and a
+    /// receiver that lags drops whichever of those arrived. Blocking purely on
+    /// `recv()` would then park forever on a connection that is already gone,
+    /// holding the task lock and taking any later cancel down with it. The tick
+    /// never shortens a live turn; it only notices a dead one.
+    ///
+    /// Records the completing envelope's seq in `compaction_turns` BEFORE
+    /// returning, so the engine's own (possibly lagging) receiver can still
+    /// recognise it later and refuse to settle the round with it.
+    async fn await_compaction_turn(
+        &self,
+        rx: &mut tokio::sync::broadcast::Receiver<Arc<InternalEventEnvelope>>,
+        conn_id: &str,
+    ) -> CompactOutcome {
+        loop {
+            let event = tokio::select! {
+                received = rx.recv() => received,
+                _ = tokio::time::sleep(COMPACTION_LIVENESS_TICK) => {
+                    match self.compaction_still_running(conn_id).await {
+                        Some(outcome) => return outcome,
+                        None => continue,
+                    }
+                }
+            };
+            match event {
+                Ok(env) if env.connection_id == conn_id => match &env.payload {
+                    AcpEvent::TurnComplete { stop_reason, .. } => {
+                        self.mark_compaction_turn(conn_id, env.seq).await;
+                        return match stop_reason.as_str() {
+                            "cancelled" | "canceled" => CompactOutcome::new("canceled", None),
+                            "end_turn" | "" => CompactOutcome::new("ok", None),
+                            other => CompactOutcome::new("ok", Some(other.to_string())),
+                        };
+                    }
+                    // A terminal error tears the connection down without a
+                    // `TurnComplete` (the state is discarded, not settled), so
+                    // it has to end the wait itself. Fenced on the way out for
+                    // the same reason the liveness exit is: in-order delivery
+                    // proves no completion is queued on THIS receiver, but not
+                    // that the dying connection emits none after this event.
+                    AcpEvent::Error {
+                        message,
+                        terminal: true,
+                        ..
+                    } => {
+                        self.fence_completed_turns(conn_id).await;
+                        return CompactOutcome::new("failed", Some(message.clone()));
+                    }
+                    AcpEvent::StatusChanged {
+                        status: ConnectionStatus::Disconnected | ConnectionStatus::Error,
+                    } => {
+                        self.fence_completed_turns(conn_id).await;
+                        return CompactOutcome::new("failed", Some("connection lost".into()));
+                    }
+                    _ => {}
+                },
+                Ok(_) => {}
+                // Whatever ended this turn may be among the events the lag
+                // dropped, so ask the connection directly instead of waiting
+                // for a message that may never come again. Only OUR receiver
+                // dropped them — the engine's own copy may still be pending,
+                // which is why the probe fences before ending the wait.
+                Err(RecvError::Lagged(_)) => {
+                    if let Some(outcome) = self.compaction_still_running(conn_id).await {
+                        return outcome;
+                    }
+                }
+                Err(RecvError::Closed) => {
+                    return CompactOutcome::new("failed", Some("event bus closed".into()))
+                }
+            }
+        }
+    }
+
+    /// Liveness probe for a compaction turn: `None` means "still running, keep
+    /// waiting", `Some(outcome)` means the wait is over.
+    ///
+    /// Reads the same flag the send gate itself owns. `send_prompt_inner` sets
+    /// `turn_in_flight` synchronously before the send returns, so by the time
+    /// this can run, `false` means this turn has already ended and its event
+    /// was missed. A connection the manager no longer knows is gone for good —
+    /// its state (and any flag on it) was discarded, not settled.
+    ///
+    /// Ending the wait WITHOUT having seen the completion still has to fence
+    /// that completion off, because it may be sitting in the engine's own
+    /// receiver right now: the flag is cleared by `apply_event` BEFORE the
+    /// envelope is broadcast, so this can observe a finished turn whose event
+    /// nobody has delivered yet. The watermark is the connection's current
+    /// `event_seq` — every event already emitted is at or below it, and the
+    /// round's own completion, which cannot even be prompted until this
+    /// function has returned, is necessarily above it.
+    async fn compaction_still_running(&self, conn_id: &str) -> Option<CompactOutcome> {
+        let Some(state) = self.manager.get_state(conn_id).await else {
+            self.fence_completed_turns(conn_id).await;
+            return Some(CompactOutcome::new(
+                "failed",
+                Some("connection lost".into()),
+            ));
+        };
+        let seq = {
+            let s = state.read().await;
+            if s.turn_in_flight {
+                return None;
+            }
+            s.event_seq
+        };
+        self.mark_compaction_turn(conn_id, seq).await;
+        Some(CompactOutcome::new(
+            "ok",
+            Some("turn end not observed".into()),
+        ))
+    }
+
+    /// Fence every `TurnComplete` this connection has emitted so far, for a
+    /// wait that is ending without having read one.
+    ///
+    /// The watermark is the connection's current `event_seq`: everything
+    /// already emitted is at or below it, and the round's own completion —
+    /// which cannot be prompted until this wait returns — is above it. A
+    /// connection the manager has already dropped can report no seq, so its
+    /// whole id is fenced; ids are per-launch UUIDs and never reused.
+    async fn fence_completed_turns(&self, conn_id: &str) {
+        let seq = match self.manager.get_state(conn_id).await {
+            Some(state) => state.read().await.event_seq,
+            None => u64::MAX,
+        };
+        self.mark_compaction_turn(conn_id, seq).await;
+    }
+
+    /// Fence off every `TurnComplete` up to `seq` on this connection: they
+    /// belong to the launch's pre-prompt compaction, not to the round.
+    async fn mark_compaction_turn(&self, conn_id: &str, seq: u64) {
+        self.compaction_turns
+            .lock()
+            .await
+            .insert(conn_id.to_string(), seq);
+    }
+
+    /// Whether this `TurnComplete` is fenced off as a launch's own compaction
+    /// signal — in which case `on_event` must not treat it as the round's turn.
+    ///
+    /// A watermark rather than an exact seq: the wait can end without ever
+    /// seeing the completion (see `compaction_still_running`), and it must
+    /// still be able to fence one it never read. Self-cleaning — a seq ABOVE
+    /// the watermark can only be the round's own turn, which both lets it
+    /// through and retires the mark. A connection that never completes another
+    /// turn is cleared by `retire_connection` / `forget_connection`.
+    async fn claim_compaction_turn(&self, conn_id: &str, seq: u64) -> bool {
+        let mut marks = self.compaction_turns.lock().await;
+        match marks.get(conn_id).copied() {
+            Some(marked) if marked >= seq => true,
+            Some(_) => {
+                marks.remove(conn_id);
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// Drop the in-memory traces of a connection this engine is done with: its
+    /// run binding and its compaction fence. Paired with the `disconnect` calls
+    /// on the launch's teardown paths, which — unlike `retire_connection` —
+    /// unwind a generation that never became live.
+    async fn forget_connection(&self, conn_id: &str) {
+        self.index.lock().await.remove(conn_id);
+        self.compaction_turns.lock().await.remove(conn_id);
+    }
+
+    /// Abort a pre-prompt compaction this task's launch is waiting on. Called
+    /// by `cancel` BEFORE it takes the task lock, for the same reason
+    /// [`Self::kill_setup_child`] is: the launch holds that lock across the
+    /// whole compaction turn.
+    ///
+    /// Only cancels the turn — the launch's own teardown (disconnect, and the
+    /// conversation when it was not resumed) happens where it always has, on
+    /// the `mark_running` CAS it is about to lose.
+    async fn abort_compaction(&self, task_id: i32, run_seq: i32) {
+        let conn_id = {
+            let compacting = self.compacting.lock().await;
+            match compacting.get(&task_id) {
+                Some(run) if run.run_seq == run_seq => run.conn_id.clone(),
+                _ => return,
+            }
+        };
+        let _ = self.manager.cancel(&self.db.conn, &conn_id).await;
+    }
+
+    /// Drop this generation's compaction slot. Generation-checked so a slow
+    /// unwind can never drop a newer launch's slot.
+    async fn release_compact_slot(&self, task_id: i32, run_seq: i32) {
+        let mut compacting = self.compacting.lock().await;
+        if matches!(compacting.get(&task_id), Some(run) if run.run_seq == run_seq) {
+            compacting.remove(&task_id);
+        }
+    }
+
+    async fn record_compact_event(&self, task_id: i32, payload: serde_json::Value) {
+        let _ = work_task_service::record_event(
+            &self.db.conn,
+            task_id,
+            "context_compact",
+            "engine",
+            Some(payload),
+        )
+        .await;
+    }
+
+    /// Context-window occupancy of the session about to be prompted: the live
+    /// connection first, the parsed transcript second.
+    ///
+    /// The live reading is the agent's own accounting of the session it just
+    /// loaded, and costs a lock. The transcript is what the Session Details
+    /// dialog shows and covers every agent that reports usage in its own files
+    /// but publishes no ACP `usage_update` — at the price of a full parse,
+    /// which is why it only runs when the threshold is switched on and the live
+    /// value is missing.
+    async fn context_reading(&self, conn_id: &str, conversation_id: i32) -> Option<ContextReading> {
+        if let Some(live) = self.live_context_reading(conn_id).await {
+            return Some(live);
+        }
+        // The transcript belongs to the session the ROW names; the compaction
+        // goes to the one the CONNECTION holds. Those are the same session on
+        // an ordinary resume — but not when a `session/load` failure the
+        // adapter swallowed fell through to `session/new`, which `spawn_agent`
+        // still reports as success, so the launch still reads as `resumed`
+        // (see the codeg#500 note in `send_prompt_linked_with_message_id`).
+        // Measuring the old session and compacting the new one would spend a
+        // whole turn shrinking a context that is already empty, so the fallback
+        // is only trusted when the two ids match exactly.
+        //
+        // Exactly, not through `continued_session_ids`: that relation answers
+        // "is this the same CONVERSATION", and a continuation is precisely the
+        // case where the agent restarted and its context was rebuilt — the old
+        // transcript's occupancy would not describe the new session.
+        let live_session = self
+            .manager
+            .get_state(conn_id)
+            .await?
+            .read()
+            .await
+            .external_id
+            .clone()?;
+        let row = conversation_service::get_by_id(&self.db.conn, conversation_id)
+            .await
+            .ok()?;
+        if !compact::transcript_describes_live_session(
+            row.external_id.as_deref(),
+            Some(live_session.as_str()),
+        ) {
+            tracing::info!(
+                conversation_id,
+                row_session = row.external_id.as_deref().unwrap_or("<none>"),
+                live_session = %live_session,
+                "[work_task] transcript occupancy refused: the connection holds a \
+                 different session than the row"
+            );
+            return None;
+        }
+        let (detail, _) = get_folder_conversation_core(
+            &self.db.conn,
+            self.internal_sessions.as_ref(),
+            conversation_id,
+        )
+        .await
+        .ok()?;
+        let stats = detail.session_stats?;
+        let percent = stats
+            .context_window_usage_percent
+            .filter(|p| p.is_finite() && *p > 0.0)
+            .or_else(|| {
+                compact::occupancy_percent(
+                    stats.context_window_used_tokens,
+                    stats.context_window_max_tokens,
+                )
+            })?;
+        Some(ContextReading {
+            percent,
+            used: stats.context_window_used_tokens,
+            size: stats.context_window_max_tokens,
+            source: "transcript",
+        })
+    }
+
+    /// The live connection's own `usage_update` reading, if it has published
+    /// one.
+    async fn live_context_reading(&self, conn_id: &str) -> Option<ContextReading> {
+        let state = self.manager.get_state(conn_id).await?;
+        let usage = state.read().await.usage.clone()?;
+        let percent = compact::occupancy_percent(Some(usage.used), Some(usage.size))?;
+        Some(ContextReading {
+            percent,
+            used: Some(usage.used),
+            size: Some(usage.size),
+            source: "live",
+        })
+    }
+
     /// Start preflight: the target folder must exist, be live, and be a
     /// project root (not a worktree).
     async fn preflight_folder(&self, folder_id: i32) -> Result<(), String> {
@@ -1808,6 +2475,15 @@ impl TaskEngine {
     async fn on_event(self: &Arc<Self>, env: &EventEnvelope) {
         match &env.payload {
             AcpEvent::TurnComplete { stop_reason, .. } => {
+                // A pre-prompt compaction's completion is the LAUNCH's signal,
+                // never the round's — see `compaction_turns` for why the index
+                // alone cannot tell them apart from in here.
+                if self
+                    .claim_compaction_turn(&env.connection_id, env.seq)
+                    .await
+                {
+                    return;
+                }
                 self.on_turn_complete(&env.connection_id, stop_reason).await;
             }
             AcpEvent::QuestionRequest { question_id, .. } => {
@@ -1967,12 +2643,123 @@ impl TaskEngine {
         }
     }
 
-    /// Drop every delegation-child mapping belonging to a retired run. Called
-    /// wherever a run leaves `index`; the run's outstanding-request set is
-    /// cleared wholesale by those same call sites.
-    async fn forget_delegation_children_of(&self, parent_conn_id: &str) {
+    /// Drop every delegation-child mapping belonging to a retired run, and
+    /// return the connection ids that were detached — their outstanding
+    /// requests are now unanswerable, so whoever does not clear the task's set
+    /// wholesale has to retract those keys by hand (see
+    /// [`Self::retire_connection`]).
+    async fn forget_delegation_children_of(&self, parent_conn_id: &str) -> Vec<String> {
         // `parent_conn_id` is a run connection, never a key in this map.
-        self.detach_delegation_subtree(parent_conn_id, false).await;
+        self.detach_delegation_subtree(parent_conn_id, false).await
+    }
+
+    /// Drop every engine-side trace of a run connection: its `index` entry, the
+    /// task's outstanding-request set, and its delegation children.
+    ///
+    /// `index` is what attributes an incoming event to a task, so an entry that
+    /// outlives its connection keeps answering for a row that has moved on —
+    /// and `remove_worktree_locked` reads the same map as "a live agent is
+    /// working in there". Whoever takes over from a settle that will never
+    /// arrive calls this; the entry has no other way out (`reconcile_once`
+    /// only ever looks at `running` / `awaiting_input` rows).
+    async fn retire_connection(&self, conn_id: &str, task_id: i32) {
+        // A connection that is being retired will never complete another turn,
+        // so an unspent compaction marker on it would linger for the life of
+        // the process. (`claim_compaction_turn` clears every marker whose
+        // connection does complete one.)
+        self.compaction_turns.lock().await.remove(conn_id);
+
+        // Unmap this run's delegation children FIRST: the purge below needs
+        // their ids, and a child that is already detached can no longer publish
+        // a fresh key (`track_request` resolves a child through
+        // `delegation_parents`, and an unmapped one resolves to nothing).
+        let orphaned: Vec<String> = self
+            .forget_delegation_children_of(conn_id)
+            .await
+            .iter()
+            .map(|child| format!("{child}#"))
+            .collect();
+
+        // The outstanding-request set is keyed by TASK, not by connection, so
+        // clearing it while another generation still owns the row would drop
+        // ITS pending permissions — resolving one of the survivors then empties
+        // an already-empty set and flips the card back to `running` with the
+        // agent still parked. Hence "was this the last connection on the task",
+        // and hence the `index` guard held ACROSS the clear rather than just
+        // the test: a launch registers its generation in `index` before it can
+        // publish any request (and a delegation child's keys only exist while
+        // its parent is indexed), so holding it is what keeps the answer true
+        // until the set is gone. Lock order is index → awaiting; every other
+        // `awaiting` critical section is a leaf, so it cannot invert.
+        let emptied_for = {
+            let mut index = self.index.lock().await;
+            index.remove(conn_id);
+            let survivor = index
+                .values()
+                .find(|(tid, _)| *tid == task_id)
+                .map(|(_, run_seq)| *run_seq);
+            let mut awaiting = self.awaiting.lock().await;
+            match survivor {
+                // Last one out, so the whole set goes — orphans included. A set
+                // inherited by the next generation would never flip the row to
+                // `awaiting_input` again.
+                None => {
+                    awaiting.remove(&task_id);
+                    None
+                }
+                // Someone else still owns the row: keep THEIR requests, but
+                // retract this run's children's. Sparing those is the opposite
+                // error and the worse one — the chain that named them is gone,
+                // so neither `track_request` nor `forget_delegation_child` can
+                // resolve them any more, and one key stuck in a shared set pins
+                // the survivor on the wrong side of the `running` ⇄
+                // `awaiting_input` edge until something clears the set
+                // wholesale. Only a LATER retirement that is the last one out
+                // (or a cancel) does that, so it outlasts every generation the
+                // orphan is actually lying about.
+                Some(run_seq) => {
+                    Self::retract_keys(&mut awaiting, task_id, &orphaned).then_some(run_seq)
+                }
+            }
+        };
+
+        // Emptied by the retraction alone: the row is parked on requests that
+        // just became unanswerable, so return it to the survivor's `running`
+        // through the same flip `track_request` would have used.
+        if let Some(run_seq) = emptied_for {
+            let flipped = work_task_service::flip_awaiting(&self.db.conn, task_id, run_seq, false)
+                .await
+                .unwrap_or(false);
+            if flipped {
+                self.emit_upsert(task_id);
+            }
+        }
+    }
+
+    /// Drop every key under `prefixes` from the task's outstanding set,
+    /// reporting whether that is what emptied it (and so owes a flip back to
+    /// `running`). An untouched set never reports `true`, however empty.
+    fn retract_keys(
+        awaiting: &mut HashMap<i32, HashSet<String>>,
+        task_id: i32,
+        prefixes: &[String],
+    ) -> bool {
+        if prefixes.is_empty() {
+            return false;
+        }
+        let Some(set) = awaiting.get_mut(&task_id) else {
+            return false;
+        };
+        let before = set.len();
+        set.retain(|k| !prefixes.iter().any(|p| k.starts_with(p.as_str())));
+        if set.len() == before {
+            return false; // nothing of this subtree's was outstanding
+        }
+        if set.is_empty() {
+            awaiting.remove(&task_id);
+            return true;
+        }
+        false
     }
 
     /// Drop a finished delegation child (and anything it delegated in turn) plus
@@ -1994,20 +2781,7 @@ impl TaskEngine {
         let prefixes: Vec<String> = detached.iter().map(|c| format!("{c}#")).collect();
         let emptied = {
             let mut awaiting = self.awaiting.lock().await;
-            let Some(set) = awaiting.get_mut(&task_id) else {
-                return;
-            };
-            let before = set.len();
-            set.retain(|k| !prefixes.iter().any(|p| k.starts_with(p.as_str())));
-            if set.len() == before {
-                return; // nothing of this subtree's was outstanding
-            }
-            if set.is_empty() {
-                awaiting.remove(&task_id);
-                true
-            } else {
-                false
-            }
+            Self::retract_keys(&mut awaiting, task_id, &prefixes)
         };
         if emptied {
             let flipped = work_task_service::flip_awaiting(&self.db.conn, task_id, run_seq, false)
@@ -2026,9 +2800,7 @@ impl TaskEngine {
         };
 
         let summary = self.capture_summary(conn_id).await;
-        self.index.lock().await.remove(conn_id);
-        self.awaiting.lock().await.remove(&task_id);
-        self.forget_delegation_children_of(conn_id).await;
+        self.retire_connection(conn_id, task_id).await;
         let _ = self.manager.disconnect(conn_id).await;
 
         let task = work_task_service::get_model(&self.db.conn, task_id)
@@ -2317,18 +3089,73 @@ impl TaskEngine {
         }
     }
 
-    /// Best-effort diff-stat snapshot of the task worktree vs its base.
+    /// Best-effort diff-stat snapshot of what THIS TASK produced — measured
+    /// from [`own_work_anchor`], not from the review baseline (see that
+    /// function for why the two differ on a pull-request task).
     async fn snapshot_diff_stats(&self, task_id: i32) -> Option<(i32, i32, i32)> {
         let task = work_task_service::get_model(&self.db.conn, task_id)
             .await
             .ok()?;
         let wt_id = task.worktree_folder_id?;
-        let base = task.base_sha.clone()?;
         let wt = get_folder_core(&self.db, wt_id).await.ok()?;
-        let files = task_git::diff_numstat(&wt.path, &base).await.ok()?;
-        let adds: i32 = files.iter().map(|f| f.additions).sum();
-        let dels: i32 = files.iter().map(|f| f.deletions).sum();
-        Some((files.len() as i32, adds, dels))
+        let anchor = own_work_anchor(&wt.path, &task).await?;
+        diff_stats_from(&wt.path, &anchor).await
+    }
+
+    /// Boot pass: re-measure the counters of every task sitting in review.
+    ///
+    /// They were snapshotted when the run settled and nothing rewrites them
+    /// afterwards, so a row can outlive the state it describes — a worktree the
+    /// user committed to (or reverted) in the meantime, and rows written before
+    /// [`own_work_anchor`] existed, which credited a pull-request task with the
+    /// pull request's own change set and cost it the "complete" button. The
+    /// counters decide which acceptance the board offers, so the correction has
+    /// to reach the row itself; recomputing per card is not an option (the list
+    /// endpoint would run one `git diff` per task, per refresh).
+    ///
+    /// Best-effort throughout: an unreadable worktree keeps whatever the row
+    /// already says, which is exactly the pre-existing behaviour.
+    async fn refresh_review_diff_stats(self: &Arc<Self>) {
+        let Ok(rows) =
+            work_task_service::list_by_status(&self.db.conn, &[WorkTaskStatus::Review]).await
+        else {
+            return;
+        };
+        for task in rows {
+            let Some(wt) = self.live_worktree(&task).await else {
+                continue;
+            };
+            let Some(anchor) = own_work_anchor(&wt.path, &task).await else {
+                continue;
+            };
+            let Some(stats) = diff_stats_from(&wt.path, &anchor).await else {
+                continue;
+            };
+            if (task.files_changed, task.additions, task.deletions)
+                == (Some(stats.0), Some(stats.1), Some(stats.2))
+            {
+                continue;
+            }
+            match work_task_service::refresh_diff_stats(&self.db.conn, task.id, task.run_seq, stats)
+                .await
+            {
+                Ok(true) => {
+                    tracing::info!(
+                        "[work_task] task {}: diff stat corrected to {} file(s), +{}/-{}",
+                        task.id,
+                        stats.0,
+                        stats.1,
+                        stats.2
+                    );
+                    self.emit_upsert(task.id);
+                }
+                Ok(false) => {} // left review meanwhile — its own settle owns the row
+                Err(e) => tracing::warn!(
+                    "[work_task] task {}: could not refresh the diff stat: {e}",
+                    task.id
+                ),
+            }
+        }
     }
 
     /// Best-effort: the turn's final assistant text (cleared at next turn
@@ -2360,10 +3187,13 @@ impl TaskEngine {
     /// cleared it and the `branch -D` that would take it away.
     ///
     /// Two probes on the live-worktree path, because neither alone sees
-    /// everything the removal destroys: a commit made on the work branch is
-    /// invisible to `git status` but shows up in the diff against the base, and
-    /// an untracked file is the reverse. Anything either one finds keeps the
-    /// worktree on disk.
+    /// everything the removal destroys. The anchor diff
+    /// ([`Self::has_landable_changes`]) covers commits made on the branch after
+    /// the run settled — invisible to `git status` — as well as uncommitted
+    /// files, untracked ones included. What it cannot see is a worktree that
+    /// differs from its own HEAD while matching the anchor: work committed and
+    /// then edited back out is a `git status` finding and an empty diff.
+    /// Anything either one finds keeps the worktree on disk.
     pub async fn complete_task(
         self: &Arc<Self>,
         task_id: i32,
@@ -2424,17 +3254,14 @@ impl TaskEngine {
                     &self.db.conn,
                     task_id,
                     true,
-                    Some(
-                        "the worktree was kept: it still holds uncommitted files. Remove them, \
-                         then retry the cleanup."
-                            .to_string(),
-                    ),
+                    Some(worktree_kept(RETRY_THE_CLEANUP)),
                 )
                 .await;
+                self.emit_upsert(task_id);
             } else {
-                self.remove_worktree_locked(task_id).await;
+                // Broadcast omitted: the removal announces its own outcome.
+                self.remove_worktree_locked(task_id, None).await;
             }
-            self.emit_upsert(task_id);
         }
         Ok(())
     }
@@ -2500,7 +3327,7 @@ impl TaskEngine {
             }
         }
         if let Err(e) =
-            task_git::remove_worktree_and_branch(&root.path, &wt.path, branch_to_delete).await
+            task_git::remove_worktree_and_branch(&root.path, &wt.path, branch_to_delete, None).await
         {
             let _ = work_task_service::set_cleanup_state(
                 &self.db.conn,
@@ -2523,9 +3350,8 @@ impl TaskEngine {
     }
 
     /// Whether the task worktree still has anything uncommitted (tracked edits
-    /// or untracked files). A git error reads as "clean": the removal path is
-    /// itself tolerant of a worktree that is already off disk, which is the
-    /// likeliest reason git could not answer here.
+    /// or untracked files). No worktree recorded and no folder row both read as
+    /// "nothing to lose" — there is no checkout for a removal to destroy.
     async fn worktree_holds_uncommitted(
         &self,
         task: &crate::db::entities::work_task::Model,
@@ -2536,24 +3362,25 @@ impl TaskEngine {
         let Ok(wt) = get_folder_core(&self.db, wt_id).await else {
             return false;
         };
-        task_git::has_changes(&wt.path).await.unwrap_or(false)
+        path_holds_uncommitted(&wt.path).await
     }
 
-    /// Live git truth for "would a merge still have something to take from this
-    /// task?" — including work committed on the branch after the run settled,
-    /// which `git status` reports as a clean worktree. Mirrors the changed-files
-    /// view the user reviewed (same base fallback), so the board's offer and
-    /// this check cannot disagree. `wt_path` is the already-verified live
-    /// worktree (see [`Self::live_worktree`]).
+    /// Live git truth for "would an acceptance still have something to take
+    /// from this task?" — work committed on the branch after the run settled
+    /// (which `git status` reports as a clean worktree) as well as work the
+    /// agent never committed, new files included. Measured from
+    /// [`own_work_anchor`], the same place the recorded diff stat is taken
+    /// from, so the board's offer and this check cannot disagree. `wt_path` is
+    /// the already-verified live worktree (see [`Self::live_worktree`]).
     async fn has_landable_changes(
         &self,
         task: &crate::db::entities::work_task::Model,
         wt_path: &str,
     ) -> Result<bool, String> {
-        let Some(base) = task.base_sha.clone().or_else(|| task.base_branch.clone()) else {
+        let Some(anchor) = own_work_anchor(wt_path, task).await else {
             return Ok(false);
         };
-        let files = task_git::diff_numstat(wt_path, &base)
+        let files = task_git::diff_numstat_with_untracked(wt_path, &anchor)
             .await
             .map_err(|e| format!("could not read the task's changes: {e}"))?;
         Ok(!files.is_empty())
@@ -2587,9 +3414,10 @@ impl TaskEngine {
         task_id: i32,
         message: Option<String>,
         delete_worktree: bool,
+        instructions: Option<String>,
         auto: bool,
     ) -> Result<MergeDispatch, String> {
-        self.merge_task_inner(task_id, message, delete_worktree, auto, None)
+        self.merge_task_inner(task_id, message, delete_worktree, instructions, auto, None)
             .await
     }
 
@@ -2598,6 +3426,7 @@ impl TaskEngine {
         task_id: i32,
         message: Option<String>,
         delete_worktree: bool,
+        instructions: Option<String>,
         auto: bool,
         claim: Option<&QueuedMergeClaim>,
     ) -> Result<MergeDispatch, String> {
@@ -2624,6 +3453,11 @@ impl TaskEngine {
         let message = message
             .map(|m| m.trim().to_string())
             .filter(|m| !m.is_empty());
+        // Same normalization as the message: whitespace-only is "the user typed
+        // nothing", and nothing is what the prompt must then omit entirely.
+        let instructions = instructions
+            .map(|i| i.trim().to_string())
+            .filter(|i| !i.is_empty());
         let settings = work_task_service::settings_get_effective(&self.db.conn, task.folder_id)
             .await
             .unwrap_or_default();
@@ -2669,6 +3503,7 @@ impl TaskEngine {
             let intent = WorkTaskQueuedMerge {
                 message,
                 delete_worktree,
+                instructions,
                 queued_at,
             };
             let queued = work_task_service::queue_merge(
@@ -2716,6 +3551,7 @@ impl TaskEngine {
             strategy: strategy.clone(),
             delete_worktree,
             auto_message: message.is_none(),
+            instructions: instructions.clone(),
             ..Default::default()
         };
         // Keep recovery away from the dispatch window (begin → live conn).
@@ -2765,6 +3601,7 @@ impl TaskEngine {
                             work_branch: work_branch.clone(),
                             strategy,
                             message,
+                            instructions,
                         },
                         &merge_seq,
                     )
@@ -2829,7 +3666,7 @@ impl TaskEngine {
                     // second settle of the same generation posts nothing.
                     self.spawn_forge_writeback(task_id, WritebackOutcome::Merged(commit));
                     if state.delete_worktree {
-                        self.remove_worktree_locked(task_id).await;
+                        self.remove_worktree_locked(task_id, None).await;
                     }
                 }
             }
@@ -3010,11 +3847,16 @@ impl TaskEngine {
     /// refused delivery leaves the task exactly as it was. After the CAS, any
     /// failure returns the task to review with the reason on the card; every
     /// step is idempotent, so the retry is just another click.
+    ///
+    /// `delete_worktree` is the same offer the other two acceptances make, and
+    /// it rides on the delivery rather than gating it — see
+    /// [`Self::remove_delivered_worktree`].
     pub async fn deliver_pr(
         self: &Arc<Self>,
         task_id: i32,
         pr_title: Option<String>,
         draft: bool,
+        delete_worktree: bool,
     ) -> Result<String, String> {
         let task = work_task_service::get_model(&self.db.conn, task_id)
             .await
@@ -3081,13 +3923,18 @@ impl TaskEngine {
             }
             Err(e) => return Err(format!("could not read the task worktree's state: {e}")),
         }
-        // GitHub answers an empty pull request with a 422; refuse before the
-        // CAS and point at the button that actually applies.
+        // GitHub answers an empty pull request with a 422, and a push back that
+        // carries nothing leaves the pull request untouched while the task
+        // records a delivery. Refuse before the CAS and point at the button that
+        // actually applies — the likeliest task here is a review-only one,
+        // whose worktree holds the pull request and nothing else.
         if !self.has_landable_changes(&task, &wt.path).await? {
-            return Err(
+            return Err(if from_pull {
+                "this task added nothing to the pull request — complete it instead of pushing back"
+            } else {
                 "this task has nothing to deliver — complete it instead of opening a pull request"
-                    .to_string(),
-            );
+            }
+            .to_string());
         }
         // The pull request is diffed against the base branch AS THE REMOTE HAS
         // IT, not against the local one the task branched from. If those have
@@ -3174,9 +4021,105 @@ impl TaskEngine {
                 &state,
             )
             .await;
+        // Only after the delivery SUCCEEDED: one that bounced back to review
+        // still needs its checkout for the retry. Still inside the claim, so a
+        // second click cannot start a delivery on a task whose worktree is
+        // half removed. `expected_head` is the OID the push published, and the
+        // cleanup is allowed to destroy the branch only while it is still that.
+        if outcome.is_ok() && delete_worktree {
+            self.remove_delivered_worktree(task_id, task.folder_id, &expected_head)
+                .await;
+        }
         self.release_in_flight(task_id, token).await;
         self.emit_upsert(task_id);
         outcome
+    }
+
+    /// Take a delivered task's worktree with it, the way the merge and the
+    /// no-merge acceptances do. Runs AFTER the settle, on a task that is
+    /// already `done`, and deliberately returns nothing: the delivery is what
+    /// the button promised and it has happened — a removal that fails flags
+    /// `cleanup_state` and stays retryable from the card, which must not
+    /// re-read as "the push failed".
+    ///
+    /// TWO probes, because each is blind to exactly what the other sees — the
+    /// pairing `complete_task` documents, aimed at what a DELIVERY publishes
+    /// rather than at what a merge lands:
+    ///
+    /// - `deliver_pr` refused a dirty worktree before the CAS, but that was
+    ///   before the push and the REST calls. `worktree remove --force` drops
+    ///   whatever appeared since without a word, and a file that was never
+    ///   committed is on no forge at all;
+    /// - a COMMIT made in that same window leaves `git status` spotless and is
+    ///   just as unpublished — the delivery pushed `published_head`, not it. So
+    ///   the branch tip is checked against the OID that actually reached the
+    ///   forge, which is the only thing that ever made `branch -D` safe here.
+    ///   `has_landable_changes` cannot serve as that probe: it is true of every
+    ///   delivery by construction.
+    ///
+    /// Either probe keeps the worktree, says why, and leaves the retry on the
+    /// card. The tip then rides along to the removal itself, so the read above
+    /// and the delete cannot straddle a ref that moves in between.
+    ///
+    /// Takes the folder git lock, so no caller may already hold it.
+    async fn remove_delivered_worktree(
+        self: &Arc<Self>,
+        task_id: i32,
+        folder_id: i32,
+        published_head: &str,
+    ) {
+        let lock = self.folder_lock(folder_id).await;
+        let _guard = lock.lock().await;
+        let Ok(task) = work_task_service::get_model(&self.db.conn, task_id).await else {
+            return;
+        };
+        if let Some(reason) = self
+            .delivered_worktree_keep_reason(&task, published_head)
+            .await
+        {
+            let _ =
+                work_task_service::set_cleanup_state(&self.db.conn, task_id, true, Some(reason))
+                    .await;
+            self.emit_upsert(task_id);
+            return;
+        }
+        // Broadcast omitted: the removal announces its own outcome.
+        self.remove_worktree_locked(task_id, Some(published_head))
+            .await;
+    }
+
+    /// Why a delivered task's checkout must outlive the cleanup its user asked
+    /// for, or `None` when nothing objects. See
+    /// [`Self::remove_delivered_worktree`] for what the two answers protect.
+    ///
+    /// The tip half FAILS CLOSED: a branch git declines to resolve is not a
+    /// branch anyone may `-D`. The `None`s above it are the opposite case and
+    /// deliberately so — no worktree recorded, no folder row, no work branch
+    /// means there is nothing here for the removal to destroy, and it already
+    /// handles each of those itself.
+    async fn delivered_worktree_keep_reason(
+        &self,
+        task: &crate::db::entities::work_task::Model,
+        published_head: &str,
+    ) -> Option<String> {
+        let wt_id = task.worktree_folder_id?;
+        let wt = get_folder_core(&self.db, wt_id).await.ok()?;
+        if path_holds_uncommitted(&wt.path).await {
+            return Some(worktree_kept(RETRY_THE_CLEANUP));
+        }
+        let branch = task.work_branch.as_deref()?;
+        match task_git::rev_parse(&wt.path, branch).await {
+            Ok(tip) if tip.eq_ignore_ascii_case(published_head) => None,
+            Ok(_) => Some(format!(
+                "the worktree was kept: '{branch}' moved on after the delivery, so it holds \
+                 commits that were never pushed. Deliver again to publish them, or remove the \
+                 worktree by hand once they are safe."
+            )),
+            Err(e) => Some(format!(
+                "the worktree was kept: '{branch}' could not be read, so there is no telling \
+                 whether it still holds only the delivered work ({e})"
+            )),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3357,12 +4300,15 @@ impl TaskEngine {
         let pushed = !before.head_sha.eq_ignore_ascii_case(expected_head);
         let after = if !pushed {
             // The pull request already sits at the commit this task would
-            // push — a review turn that added nothing. There is nothing to
-            // publish, so nothing is pushed: this is what lets a task on a
-            // fork the account cannot write to still settle, and it is why
-            // the closed/merged refusal below does not run here — a merged
-            // pull request that carries this exact head IS the delivery, and
-            // `settle_pull_target` says so.
+            // push: a retry of a delivery whose push landed before something
+            // interrupted the settle. There is nothing left to publish, so
+            // nothing is pushed — which is also what lets such a retry finish
+            // on a fork the account cannot write to. A task with nothing of
+            // its own never reaches this branch; `has_landable_changes`
+            // refuses it in favour of completing. It is why the closed/merged
+            // refusal below does not run here, too: a merged pull request that
+            // carries this exact head IS the delivery, and `settle_pull_target`
+            // says so.
             before.clone()
         } else {
             if before.merged || before.state != "open" {
@@ -4019,6 +4965,7 @@ impl TaskEngine {
                     task.id,
                     intent.message.clone(),
                     intent.delete_worktree,
+                    intent.instructions.clone(),
                     false,
                     Some(&claim),
                 )
@@ -4155,7 +5102,8 @@ impl TaskEngine {
                 continue;
             }
             match self
-                .merge_task(task.id, None, settings.delete_worktree_default, true)
+                // No instructions: nobody was at the keyboard to write any.
+                .merge_task(task.id, None, settings.delete_worktree_default, None, true)
                 .await
             {
                 // An unattended dispatch never queues (see `merge_task`), so
@@ -4203,6 +5151,13 @@ impl TaskEngine {
             if self.manager.get_state_and_emitter(conn_id).await.is_some() {
                 return; // live merge generation — on_turn_complete owns the settle
             }
+            // Dead: its TurnComplete is never coming, so this pass inherits the
+            // teardown that settle owed. Retire it BEFORE deciding anything —
+            // this very pass calls `remove_worktree_locked` when the merge
+            // landed, and a leftover entry reads there as "a live agent is
+            // still working in that worktree" and refuses the cleanup the user
+            // asked for. Nothing below re-reads the connection.
+            self.retire_connection(conn_id, task_id).await;
         }
         let Some(state) = task
             .merge_state
@@ -4247,7 +5202,7 @@ impl TaskEngine {
                     self.emit_upsert(task_id);
                     self.spawn_forge_writeback(task_id, WritebackOutcome::Merged(commit));
                     if state.delete_worktree {
-                        self.remove_worktree_locked(task_id).await;
+                        self.remove_worktree_locked(task_id, None).await;
                     }
                 }
             }
@@ -4269,40 +5224,146 @@ impl TaskEngine {
 
     // ── worktree cleanup ────────────────────────────────────────────────────
 
-    /// Remove a task's worktree + branch (user action from the card, or the
-    /// post-merge checkbox). Takes the per-folder git lock.
-    pub async fn cleanup_task(&self, task_id: i32) -> Result<(), String> {
+    /// Remove a task's worktree + branch (user action from the card, the
+    /// post-merge checkbox, or the cancel dialog's). Takes the task lock and
+    /// then the per-folder git lock, in that order.
+    ///
+    /// Refuses — with the reason both returned and flagged on the row — while
+    /// the worktree still holds uncommitted files. See the check itself for why
+    /// that line is drawn here and not at the confirmation.
+    ///
+    /// The TASK lock is what makes this safe against a launch, and the folder
+    /// lock cannot stand in for it: [`Self::launch`] holds the task lock across
+    /// its whole setup — `ensure_worktree` included — and takes no folder lock
+    /// at all, so a folder-scoped removal runs straight through a checkout that
+    /// is being created. Reachable whenever the row leaves a launchable state
+    /// and comes back: cancel (`canceled`) → the user requeues (`todo`, a pure
+    /// DB write that waits on nothing) → the pump claims and launches, all
+    /// while this call sits between its status read and its removal. Nothing
+    /// else about that sequence is wrong — the fresh run mints its own worktree
+    /// — but deleting the directory out from under `ensure_worktree` is.
+    ///
+    /// Hence read the status twice: once before the lock so a `running` task
+    /// fails fast instead of queueing behind its own init command (which can be
+    /// a whole `pnpm install`), and once after, because only the second read is
+    /// serialized against the launch it is trying to exclude.
+    ///
+    /// Ordering is deadlock-free by inspection: the task lock is only ever
+    /// taken here, in [`Self::cancel`], and in [`Self::launch`], and none of
+    /// those three is reachable while a folder lock is held (`launch` runs in
+    /// its own spawned task, and `cancel`'s only nested wait is the pump lock).
+    pub async fn cleanup_task(&self, task_id: i32) -> Result<(), CleanupBlocked> {
+        /// Statuses whose worktree is either in use or about to be — the launch
+        /// path owns it, not the user.
+        fn in_use(status: &WorkTaskStatus) -> bool {
+            matches!(
+                status,
+                WorkTaskStatus::Queued
+                    | WorkTaskStatus::Preparing
+                    | WorkTaskStatus::Running
+                    | WorkTaskStatus::AwaitingInput
+                    | WorkTaskStatus::Merging
+            )
+        }
+        const REFUSAL: &str = "cancel or finish the task before removing its worktree";
+
         let task = work_task_service::get_model(&self.db.conn, task_id)
             .await
-            .map_err(|e| e.to_string())?;
-        if matches!(
-            task.status,
-            WorkTaskStatus::Queued
-                | WorkTaskStatus::Preparing
-                | WorkTaskStatus::Running
-                | WorkTaskStatus::AwaitingInput
-                | WorkTaskStatus::Merging
-        ) {
-            return Err("cancel or finish the task before removing its worktree".to_string());
+            .map_err(|e| CleanupBlocked::failed(e.to_string()))?;
+        if in_use(&task.status) {
+            return Err(CleanupBlocked::failed(REFUSAL));
+        }
+        let task_guard = self.task_lock(task_id).await;
+        let _task_guard = task_guard.lock().await;
+        // Re-read under the lock: whatever claimed the row while we waited is
+        // now either fully set up (and refused here) or still blocked on this
+        // lock at the top of `launch` — where it re-reads its own status and
+        // gives up if a cancel moved the row on.
+        let task = work_task_service::get_model(&self.db.conn, task_id)
+            .await
+            .map_err(|e| CleanupBlocked::failed(e.to_string()))?;
+        if in_use(&task.status) {
+            return Err(CleanupBlocked::failed(REFUSAL));
         }
         let lock = self.folder_lock(task.folder_id).await;
         let _guard = lock.lock().await;
-        self.remove_worktree_locked(task_id).await;
-        self.emit_upsert(task_id);
+        // Uncommitted work is the one thing behind this call that git cannot
+        // give back, and nothing on the way in ever named it: the cancel
+        // dialog's checkbox promises "its worktree and work branch", the card's
+        // button says "Delete worktree", and neither mentions files the agent
+        // left unstaged. The removal underneath is `worktree remove --force`,
+        // so without this check a stop pressed mid-edit — the very moment a
+        // checkout is most likely to be dirty — takes the edits with it.
+        //
+        // The other two surfaces that remove a worktree already draw this line:
+        // `complete_task` refuses with this same sentence, and the branch
+        // dropdown's removal re-asks under an explicit "those changes cannot be
+        // recovered" confirmation. This one just took it. Committed work is a
+        // different matter and stays deletable — `branch -D` is what the
+        // checkbox spells out, and the reflog still holds those commits.
+        //
+        // Recorded AND returned, because the callers hear different channels:
+        // the direct button surfaces the `Err` as a toast, `work_task_cancel_core`
+        // swallows it and reads `cleanup_state` off the card instead, and the
+        // delete path — which would otherwise tombstone that card and the reason
+        // with it — stops on `holds_work` rather than swallowing.
+        if self.worktree_holds_uncommitted(&task).await {
+            let _ = work_task_service::set_cleanup_state(
+                &self.db.conn,
+                task_id,
+                true,
+                Some(worktree_kept(RETRY_THE_CLEANUP)),
+            )
+            .await;
+            self.emit_upsert(task_id);
+            return Err(CleanupBlocked {
+                message: worktree_kept(RETRY_THE_CLEANUP),
+                holds_work: true,
+            });
+        }
+        // No `emit_upsert` here: the removal owns that broadcast now, and only
+        // it can tell a pass that changed the row from one that found nothing
+        // to do.
+        self.remove_worktree_locked(task_id, None).await;
         Ok(())
     }
 
-    /// Git-first-then-DB worktree removal. Caller holds the folder git lock.
+    /// Git-first-then-DB worktree removal, and the `task://changed` that tells
+    /// clients about it. Caller holds the folder git lock.
+    ///
+    /// The broadcast lives HERE rather than at the call sites: this is the only
+    /// thing that knows whether the row moved, and the acceptance paths reach it
+    /// AFTER their own `emit_upsert` (`settle_merge_generation`,
+    /// `recover_merging`) — so a caller-side convention leaves the card holding
+    /// a snapshot taken before the worktree was detached, and its "worktree
+    /// removed" badge (`worktreeWasRemoved`, keyed on `worktree_folder_id`)
+    /// never appears until a full refetch. `converge_worktree_removal` owns its
+    /// folder / conversation / tab broadcasts for the same reason.
+    ///
+    /// `expected_tip` is forwarded to [`task_git::remove_worktree_and_branch`]:
+    /// `Some(oid)` deletes the work branch only while it still points there.
+    /// The local-merge paths pass `None` — they settle from git truth about the
+    /// base, not from an OID they published.
+    async fn remove_worktree_locked(&self, task_id: i32, expected_tip: Option<&str>) {
+        if self.remove_worktree_inner(task_id, expected_tip).await {
+            self.emit_upsert(task_id);
+        }
+    }
+
+    /// The removal itself. Returns whether it wrote to the task row — the
+    /// broadcast in [`Self::remove_worktree_locked`] rides that answer, so a
+    /// pass that decided there was nothing to do stays silent.
     ///
     /// Order matters: the git removal runs first; only after it succeeds does
     /// the DB transaction re-parent the worktree's conversations onto the
     /// project folder (stamping `origin_cwd`), close its tabs, and soft-delete
     /// the folder row. A git failure flags `cleanup_state='failed'` (retryable
     /// from the card) and leaves the DB untouched; a `done` task never leaves
-    /// `done` either way.
-    async fn remove_worktree_locked(&self, task_id: i32) {
+    /// `done` either way — including a branch that moved out from under an
+    /// `expected_tip`, which lands here as exactly that kind of git failure.
+    async fn remove_worktree_inner(&self, task_id: i32, expected_tip: Option<&str>) -> bool {
         let Ok(task) = work_task_service::get_model(&self.db.conn, task_id).await else {
-            return;
+            return false;
         };
         let Some(wt_id) = task.worktree_folder_id else {
             // Nothing left to remove. A cleanup flag surviving past the
@@ -4310,17 +5371,34 @@ impl TaskEngine {
             if task.cleanup_state.is_some() {
                 let _ =
                     work_task_service::set_cleanup_state(&self.db.conn, task_id, false, None).await;
+                return true;
             }
-            return;
+            return false;
         };
-        // Precondition: no live connection of ours on this task.
-        let has_conn = {
+        // Precondition: no live connection of ours on this task. `index` alone
+        // cannot answer that — it is a correlation table, not a liveness one,
+        // and an entry whose connection died stays put until something retires
+        // it. Believing such an entry costs the user a worktree they asked to
+        // remove and a `failed` flag whose retry can never clear (nothing will
+        // ever arrive to remove the entry). Ask the manager, and retire what it
+        // says is gone.
+        let mut has_conn = false;
+        let claimed: Vec<String> = {
             self.index
                 .lock()
                 .await
-                .values()
-                .any(|(tid, _)| *tid == task_id)
+                .iter()
+                .filter(|(_, (tid, _))| *tid == task_id)
+                .map(|(conn_id, _)| conn_id.clone())
+                .collect()
         };
+        for conn_id in claimed {
+            if self.manager.get_state_and_emitter(&conn_id).await.is_some() {
+                has_conn = true;
+            } else {
+                self.retire_connection(&conn_id, task_id).await;
+            }
+        }
         if has_conn {
             let _ = work_task_service::set_cleanup_state(
                 &self.db.conn,
@@ -4329,7 +5407,7 @@ impl TaskEngine {
                 Some("task still has a live agent connection".to_string()),
             )
             .await;
-            return;
+            return true;
         }
 
         let root = match get_folder_core(&self.db, task.folder_id).await {
@@ -4342,7 +5420,7 @@ impl TaskEngine {
                     Some(e.to_string()),
                 )
                 .await;
-                return;
+                return true;
             }
         };
         let Ok(wt) = get_folder_core(&self.db, wt_id).await else {
@@ -4351,12 +5429,16 @@ impl TaskEngine {
             // otherwise keep rendering a worktree no refetch would return.
             let _ = work_task_service::clear_worktree(&self.db.conn, task_id).await;
             emit_folder_deleted(&self.emitter, wt_id);
-            return;
+            return true;
         };
 
-        if let Err(e) =
-            task_git::remove_worktree_and_branch(&root.path, &wt.path, task.work_branch.as_deref())
-                .await
+        if let Err(e) = task_git::remove_worktree_and_branch(
+            &root.path,
+            &wt.path,
+            task.work_branch.as_deref(),
+            expected_tip,
+        )
+        .await
         {
             let _ = work_task_service::set_cleanup_state(
                 &self.db.conn,
@@ -4365,7 +5447,7 @@ impl TaskEngine {
                 Some(e.to_string()),
             )
             .await;
-            return;
+            return true;
         }
 
         converge_worktree_removal(
@@ -4377,6 +5459,7 @@ impl TaskEngine {
             &wt.path,
         )
         .await;
+        true
     }
 
     // ── reconcile ───────────────────────────────────────────────────────────
@@ -4398,9 +5481,7 @@ impl TaskEngine {
             }
             // Connection gone. If the produced conversation reached a terminal
             // status the TurnComplete was merely dropped — settle from it.
-            self.index.lock().await.remove(&conn_id);
-            self.awaiting.lock().await.remove(&task.id);
-            self.forget_delegation_children_of(&conn_id).await;
+            self.retire_connection(&conn_id, task.id).await;
             let conv_status = match task.conversation_id {
                 Some(cid) => self.conversation_status(cid).await,
                 None => None,
@@ -4665,6 +5746,91 @@ async fn converge_worktree_removal(
     if folder_gone {
         emit_folder_deleted(emitter, wt_id);
     }
+}
+
+/// The commit THIS TASK's own work sits on top of: the point its worktree was
+/// checked out at, which is also the point an acceptance would deliver from.
+/// The counters on the row and every "is there anything to land" probe measure
+/// from here — deliberately not from the review baseline, which answers a
+/// different question ("what is under review", pull request included).
+///
+/// For an ordinary task the two coincide: the branch was minted at the recorded
+/// base, so "diff against the base" and "what the agent did" are one set. Two
+/// things move the anchor off it:
+///
+/// - **A task triggered from a pull request starts ON that pull request's
+///   head**, while its base is the MERGE BASE — because the review is meant to
+///   show the pull request plus whatever the agent did (see
+///   [`TaskEngine::pr_checkout_point`]). Measuring the task's own work from
+///   there would credit it with every file the pull request itself changed: a
+///   review-only task that committed nothing would report a full change set,
+///   the board would offer to push it back (a delivery with nothing in it),
+///   and "complete" — the acceptance that actually applies — would never
+///   appear. The head comes from the task's source snapshot, which is what the
+///   checkout used; it must still be a commit HERE, since a force-push can
+///   leave the row naming one this repository never had.
+/// - **The branch absorbing base content** (the agent merged the base branch
+///   in, or rebased onto it) moves the merge base forward, and everything the
+///   base contributed would otherwise read as this task's work. Taken only
+///   when it moved FORWARD from the recorded base: a base branch that is
+///   behind locally, or a same-name branch of unrelated history, must not drag
+///   the anchor backwards and inflate the count it was meant to correct.
+///
+/// `wt_path` is the task's worktree — where every ref here is resolved.
+async fn own_work_anchor(
+    wt_path: &str,
+    task: &crate::db::entities::work_task::Model,
+) -> Option<String> {
+    if task.source_kind.as_deref() == Some(SOURCE_KIND_PR) {
+        let head = task
+            .source_meta
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<ForgeSourceMeta>(s).ok())
+            .and_then(|m| m.head_sha)
+            .filter(|s| !s.trim().is_empty());
+        if let Some(head) = head {
+            if task_git::commit_present(wt_path, &head)
+                .await
+                .unwrap_or(false)
+            {
+                return Some(head);
+            }
+        }
+    }
+    let recorded = task.base_sha.clone().or_else(|| task.base_branch.clone());
+    let Some(base_branch) = task.base_branch.as_deref() else {
+        return recorded;
+    };
+    let Ok(Some(tip)) = task_git::local_branch_tip(wt_path, base_branch).await else {
+        return recorded;
+    };
+    let Ok(merge_base) = task_git::merge_base(wt_path, &tip, "HEAD").await else {
+        return recorded;
+    };
+    match task.base_sha.as_deref() {
+        Some(sha) => task_git::is_ancestor(wt_path, sha, &merge_base)
+            .await
+            .unwrap_or(false)
+            .then_some(merge_base)
+            .or(recorded),
+        // No recorded sha to move forward from — the merge base is strictly
+        // better than the branch NAME this would otherwise diff against, which
+        // measures against its tip and calls the base's own progress a change.
+        None => Some(merge_base),
+    }
+}
+
+/// `(files, additions, deletions)` of the worktree against `anchor`,
+/// uncommitted work included — nothing forces the agent to commit before the
+/// task lands in review, and a task whose new files are still untracked has
+/// done work all the same.
+async fn diff_stats_from(wt_path: &str, anchor: &str) -> Option<(i32, i32, i32)> {
+    let files = task_git::diff_numstat_with_untracked(wt_path, anchor)
+        .await
+        .ok()?;
+    let adds: i32 = files.iter().map(|f| f.additions).sum();
+    let dels: i32 = files.iter().map(|f| f.deletions).sum();
+    Some((files.len() as i32, adds, dels))
 }
 
 /// Row-level auto-merge eligibility: everything the sweep can decide without
@@ -4969,6 +6135,7 @@ async fn compose_prompt(
             work_branch,
             strategy,
             message,
+            instructions,
         } => {
             if !resumed {
                 blocks.push(PromptInputBlock::Text {
@@ -4987,11 +6154,22 @@ async fn compose_prompt(
                      git -C \"{root_path}\" commit -m \"<message>\""
                 )
             };
+            // Indented under step 3 rather than left dangling after it: it says
+            // what to substitute for that step's `<message>`, and read as a
+            // fourth line it looked like a fourth instruction.
             let message_rule = match message {
-                Some(m) => format!("Use exactly this commit message:\n{m}"),
-                None => "Write a concise Conventional Commits message yourself, \
-                         summarizing what this task changed."
+                Some(m) => format!("   Use exactly this commit message:\n   {m}"),
+                None => "   For `<message>`, write a concise Conventional Commits \
+                         message yourself, summarizing what this task changed."
                     .to_string(),
+            };
+            // The user's own words get their own paragraph, before the closing
+            // rules — those rules stay last on purpose (same reason the standing
+            // worktree guard below is the last built-in block): whatever the
+            // user asked for, it does not license a push or a self-deletion.
+            let extra = match instructions {
+                Some(i) => format!("\nAlso follow these instructions from the user:\n{i}\n"),
+                None => String::new(),
             };
             blocks.push(PromptInputBlock::Text {
                 text: format!(
@@ -5004,9 +6182,11 @@ async fn compose_prompt(
                      merge commit.\n\
                      3. Land onto the base checkout at `{root_path}`:\n   {land_command}\n\
                      {message_rule}\n\
+                     {extra}\n\
                      Do NOT push, do NOT delete this worktree or its branch, and do not \
-                     change anything else on the base branch. Finish with one short line \
-                     saying what landed."
+                     change anything else on the base branch — leave the checkout at \
+                     `{root_path}` on `{base_branch}`, never switch branches there. \
+                     Finish with one short line saying what landed."
                 ),
             });
         }
@@ -5039,7 +6219,7 @@ async fn compose_prompt(
                  change instead of making it."
             )
         } else if original_work_order && cfg.deliverable.as_deref() == Some(DELIVERABLE_REPORT) {
-            // Report-deliverable order (forge investigate / plan / review-only):
+            // Report-deliverable order (forge plan-first / review-only):
             // the generic "commit as you like" grant would quietly undo the
             // task's own "analysis only" instruction several blocks earlier —
             // the licence must defer to the task text, not overrule it.
@@ -5429,6 +6609,65 @@ struct SetupChild {
     run_seq: i32,
     /// Rung by the canceller, awaited by whoever is running the child.
     wake: Arc<Notify>,
+}
+
+/// A launch's in-flight pre-prompt compaction, keyed by task in
+/// [`TaskEngine::compacting`]. Holds the connection the compaction turn runs
+/// on so a cancel can abort that turn without the task lock, and the generation
+/// that owns it so a stale cancel cannot abort a newer run's compaction.
+struct CompactRun {
+    run_seq: i32,
+    conn_id: String,
+}
+
+/// Everything [`TaskEngine::compact_before_prompt`] needs about the launch it
+/// is running inside. A struct rather than a parameter list because four of
+/// the fields are bare `i32`s in a row — named at the call site, a transposed
+/// pair is a compile error instead of a task compacting someone else's session.
+struct CompactRequest<'a> {
+    task_id: i32,
+    run_seq: i32,
+    conn_id: &'a str,
+    agent_type: AgentType,
+    settings: &'a WorkTaskFolderSettings,
+    /// The WORKTREE folder the conversation belongs to — same value the round's
+    /// own prompt is linked with.
+    folder_id: i32,
+    conversation_id: i32,
+    /// Status this generation holds for the rest of the launch, which the
+    /// cancel gates re-check (`preparing`, or `merging` for a merge round).
+    in_flight: WorkTaskStatus,
+}
+
+/// One context-window occupancy reading, plus where it came from — the source
+/// rides the timeline event because "live" and "transcript" answer slightly
+/// different questions (what the agent has loaded vs. what its last turn
+/// recorded), and a surprising percentage is only debuggable with it.
+struct ContextReading {
+    percent: f64,
+    used: Option<u64>,
+    size: Option<u64>,
+    source: &'static str,
+}
+
+/// How a compaction turn ended: `"ok"` / `"canceled"` / `"failed"`, plus the
+/// stop reason or error worth showing beside it.
+struct CompactOutcome {
+    status: &'static str,
+    detail: Option<String>,
+}
+
+impl CompactOutcome {
+    fn new(status: &'static str, detail: Option<String>) -> Self {
+        Self { status, detail }
+    }
+}
+
+/// One decimal place, for percentages written to the timeline — the same
+/// precision the composer's context ring shows, so the two never read as
+/// disagreeing about the same session.
+fn round1(percent: f64) -> f64 {
+    (percent * 10.0).round() / 10.0
 }
 
 /// Marker file (in the worktree's PRIVATE git dir, so it can never show up in
@@ -5908,6 +7147,7 @@ mod tests {
             serde_json::to_string(&WorkTaskQueuedMerge {
                 message: Some("feat: land it".into()),
                 delete_worktree: false,
+                instructions: None,
                 queued_at: chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap(),
             })
             .unwrap(),
@@ -5995,6 +7235,7 @@ mod tests {
         let intent = |secs: i64| WorkTaskQueuedMerge {
             message: None,
             delete_worktree: true,
+            instructions: None,
             queued_at: chrono::DateTime::from_timestamp(1_800_000_000 + secs, 0)
                 .expect("valid instant"),
         };
@@ -6094,6 +7335,7 @@ mod tests {
             work_branch: "task/7".to_string(),
             strategy: "squash".to_string(),
             message: None,
+            instructions: None,
         }
     }
 
@@ -6229,7 +7471,7 @@ mod tests {
             .any(|t| t.contains("Commit to the current branch as you like")));
     }
 
-    /// A report-deliverable task (forge investigate / plan-first / review-only)
+    /// A report-deliverable task (forge plan-first / review-only)
     /// swaps the commit licence on its ORIGINAL order — otherwise the guard's
     /// "commit as you like", being the last block read, would quietly undo the
     /// task's own "analysis only" instruction.
@@ -6969,6 +8211,78 @@ mod tests {
             .contains("Write the commit message in Chinese."));
     }
 
+    /// What the user typed in the merge dialog has to reach the agent — and has
+    /// to land BEFORE the closing rules, which are what keep "also do X" from
+    /// being read as licence to push or to delete the worktree.
+    #[tokio::test]
+    async fn merge_prompt_carries_the_users_instructions_ahead_of_the_rules() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let LaunchMode::Merge {
+            root_path,
+            base_branch,
+            work_branch,
+            strategy,
+            message,
+            ..
+        } = merge_mode()
+        else {
+            unreachable!("merge_mode is a merge")
+        };
+        let mode = LaunchMode::Merge {
+            root_path,
+            base_branch,
+            work_branch,
+            strategy,
+            message,
+            instructions: Some("Prefer this branch's side on any conflict.".to_string()),
+        };
+        let blocks = compose_prompt(
+            &task_config(),
+            &task_row(),
+            &mode,
+            &WorkTaskFolderSettings::default(),
+            true,
+            &db.conn,
+        )
+        .await
+        .expect("compose");
+
+        let recipe = &texts(&blocks)[0];
+        let said = recipe
+            .find("Prefer this branch's side on any conflict.")
+            .expect("the user's own words reach the agent");
+        let rules = recipe.find("Do NOT push").expect("the closing rules");
+        assert!(
+            said < rules,
+            "the rules must stay last — they are what an over-eager reading of \
+             the user's request would otherwise override"
+        );
+    }
+
+    /// …and an empty box adds nothing: no dangling header, no stray blank
+    /// section between the numbered steps and the rules.
+    #[tokio::test]
+    async fn merge_prompt_says_nothing_when_there_are_no_instructions() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let blocks = compose_prompt(
+            &task_config(),
+            &task_row(),
+            &merge_mode(), // `instructions: None`
+            &WorkTaskFolderSettings::default(),
+            true,
+            &db.conn,
+        )
+        .await
+        .expect("compose");
+
+        let recipe = &texts(&blocks)[0];
+        assert!(
+            !recipe.contains("instructions from the user"),
+            "no header without a body"
+        );
+        assert!(recipe.contains("land it onto the base branch"));
+    }
+
     #[tokio::test]
     async fn blank_stage_prompts_add_nothing() {
         let db = crate::db::test_helpers::fresh_in_memory_db().await;
@@ -7257,6 +8571,131 @@ mod tests {
         // The old connection's cancel finally arrives.
         engine.on_turn_complete(PARENT_CONN, "cancelled").await;
 
+        assert_eq!(status_of(&engine, task_id).await, WorkTaskStatus::Running);
+    }
+
+    /// Walk the row on to a fresh generation running on `conn_id`, WITHOUT
+    /// retiring the previous one's `index` entry — the state a delayed
+    /// `TurnComplete` from the old connection lands in. Returns the new run_seq.
+    async fn relaunch_on(engine: &TaskEngine, task_id: i32, conn_id: &str) -> i32 {
+        let row = work_task_service::get_model(&engine.db.conn, task_id)
+            .await
+            .expect("task row");
+        let conv_id = row.conversation_id.expect("conversation");
+
+        assert!(work_task_service::settle_review(
+            &engine.db.conn,
+            task_id,
+            row.run_seq,
+            None,
+            None,
+        )
+        .await
+        .expect("settle review"));
+        let next_seq = work_task_service::claim_for_run(
+            &engine.db.conn,
+            task_id,
+            WorkTaskStatus::Review,
+            "test",
+        )
+        .await
+        .expect("claim")
+        .expect("claimed");
+        assert!(
+            work_task_service::begin_setup(&engine.db.conn, task_id, next_seq)
+                .await
+                .expect("begin_setup")
+        );
+        assert!(work_task_service::mark_running(
+            &engine.db.conn,
+            task_id,
+            next_seq,
+            conv_id,
+            conn_id,
+        )
+        .await
+        .expect("mark_running"));
+        engine
+            .index
+            .lock()
+            .await
+            .insert(conn_id.into(), (task_id, next_seq));
+        next_seq
+    }
+
+    #[tokio::test]
+    async fn a_previous_generation_cancel_does_not_clear_current_waits() {
+        let (engine, task_id) = running_task().await;
+        relaunch_on(&engine, task_id, "conn-next").await;
+
+        engine
+            .track_request("conn-next", "permission-a".into(), true)
+            .await;
+        engine
+            .track_request("conn-next", "permission-b".into(), true)
+            .await;
+        assert_eq!(
+            status_of(&engine, task_id).await,
+            WorkTaskStatus::AwaitingInput
+        );
+
+        engine.on_turn_complete(PARENT_CONN, "cancelled").await;
+        engine
+            .track_request("conn-next", "permission-a".into(), false)
+            .await;
+
+        assert_eq!(
+            status_of(&engine, task_id).await,
+            WorkTaskStatus::AwaitingInput,
+            "the second request in the current generation is still outstanding"
+        );
+
+        engine
+            .track_request("conn-next", "permission-b".into(), false)
+            .await;
+        assert_eq!(status_of(&engine, task_id).await, WorkTaskStatus::Running);
+    }
+
+    /// The mirror image of the case above, and the half sparing the set opens:
+    /// a retired run's DELEGATION children are namespaced by connection id, so
+    /// keeping the task's set keeps THEIR keys too — with nothing left that
+    /// could ever answer them, because the same retirement just unmapped the
+    /// chain (`track_request` and `forget_delegation_child` both resolve a
+    /// detached child to nothing). One orphan pins the set non-empty until a
+    /// wholesale clear comes along — a later retirement that IS the last one
+    /// out, or a cancel — and until then every generation's first request
+    /// misses the `len() == 1` edge: the board says `running` for a run parked
+    /// on the user, which is bug #447 all over again. Unlike the transient
+    /// over-clear, answering the request is not what gets you out of it.
+    #[tokio::test]
+    async fn retiring_a_run_takes_its_orphaned_delegation_requests_with_it() {
+        let (engine, task_id) = running_task().await;
+        engine
+            .on_event(&delegation_started(PARENT_CONN, CHILD_CONN))
+            .await;
+        engine.on_event(&permission_request(CHILD_CONN, "r1")).await;
+        assert_eq!(
+            status_of(&engine, task_id).await,
+            WorkTaskStatus::AwaitingInput
+        );
+
+        relaunch_on(&engine, task_id, "conn-next").await;
+        engine.on_turn_complete(PARENT_CONN, "cancelled").await;
+
+        assert!(
+            engine.awaiting.lock().await.get(&task_id).is_none(),
+            "a child's key cannot outlive the delegation chain that named it"
+        );
+
+        // ...and the surviving generation's own edge still swings both ways.
+        engine.track_request("conn-next", "p:r9".into(), true).await;
+        assert_eq!(
+            status_of(&engine, task_id).await,
+            WorkTaskStatus::AwaitingInput
+        );
+        engine
+            .track_request("conn-next", "p:r9".into(), false)
+            .await;
         assert_eq!(status_of(&engine, task_id).await, WorkTaskStatus::Running);
     }
 
@@ -7550,6 +8989,16 @@ mod tests {
         /// a test says "someone closed / retargeted / merged it while codeg
         /// was pushing", which is the whole window the settle check guards.
         after_push: Mutex<Option<ForgePr>>,
+        /// A file dropped into the worktree the moment the push runs. Opens
+        /// the other window of the same kind: the worktree was clean when
+        /// `deliver_pr` checked it and is dirty by the time the post-delivery
+        /// cleanup would run `worktree remove --force` over it.
+        dirty_on_push: Option<String>,
+        /// A file COMMITTED onto the work branch the moment the push runs —
+        /// the half `dirty_on_push` cannot reach. `git status` stays spotless,
+        /// so only a check against the OID the delivery actually published can
+        /// tell that the branch has outrun it.
+        commit_on_push: Option<String>,
     }
 
     #[async_trait::async_trait]
@@ -7557,13 +9006,23 @@ mod tests {
         async fn push_branch(
             &self,
             _ctx: &DeliveryCtx<'_>,
-            _worktree_path: &str,
+            worktree_path: &str,
             repo: &str,
             work_branch: &str,
             remote_branch: &str,
         ) -> Result<(), String> {
             if let Some(e) = &self.push_error {
                 return Err(e.clone());
+            }
+            if let Some(name) = &self.dirty_on_push {
+                std::fs::write(std::path::Path::new(worktree_path).join(name), "scratch\n")
+                    .expect("write");
+            }
+            if let Some(name) = &self.commit_on_push {
+                let dir = std::path::Path::new(worktree_path);
+                std::fs::write(dir.join(name), "landed after the push\n").expect("write");
+                git_run(dir, &["add", "-A"]);
+                git_run(dir, &["commit", "-qm", "never published"]);
             }
             self.pushes.lock().await.push((
                 repo.to_string(),
@@ -7688,11 +9147,35 @@ mod tests {
             "git {args:?} failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
+        // A fixture repository must not translate line endings, whoever's git
+        // opens it. The env above neuters the global and system config for the
+        // commands THIS helper runs — but the engine's git, spawned through
+        // `crate::process`, inherits the real environment, and Git for Windows
+        // ships `core.autocrlf=true` in its system config. The two then disagree
+        // about one worktree: the engine checks a file out as CRLF while a
+        // `git add` here stores those bytes verbatim, so a file nobody touched
+        // reads as rewritten, and a diff measured from a commit credits the task
+        // with work it never did. Repo-LOCAL config is the one layer both sides
+        // read.
+        match args.first() {
+            // `init` runs with the repository as its cwd; `clone` names the
+            // destination last.
+            Some(&"init") => git_run(dir, &["config", "core.autocrlf", "false"]),
+            Some(&"clone") => {
+                let dest = std::path::PathBuf::from(args.last().expect("clone destination"));
+                git_run(&dest, &["config", "core.autocrlf", "false"]);
+            }
+            _ => {}
+        }
     }
 
     struct Delivery {
         engine: Arc<TaskEngine>,
         forge: Arc<FakeForge>,
+        /// Everything the engine broadcast, in order — the ordering tests read
+        /// it, and holding it also keeps the sender from reporting no
+        /// receivers for every other test on this fixture.
+        events: tokio::sync::broadcast::Receiver<crate::web::event_bridge::WebEvent>,
         task_id: i32,
         head: String,
         /// The commit the task branched from — a real commit that is NOT a
@@ -7788,9 +9271,12 @@ mod tests {
         // Default posture: the remote base is exactly where this task branched
         // from, so nothing unpushed can leak into the pull request.
         *forge.remote_base.lock().await = Some(base_sha.clone());
+        let broadcaster = Arc::new(crate::web::event_bridge::WebEventBroadcaster::new());
+        let events = broadcaster.subscribe();
         Delivery {
-            engine: test_engine_with_forge(db, forge.clone()),
+            engine: test_engine_full(db, forge.clone(), EventEmitter::test_web_only(broadcaster)),
             forge,
+            events,
             task_id: task.id,
             head,
             base_sha,
@@ -7815,7 +9301,7 @@ mod tests {
         let f = delivery_fixture(FakeForge::default()).await;
         let url = f
             .engine
-            .deliver_pr(f.task_id, Some("  Fix login  ".into()), false)
+            .deliver_pr(f.task_id, Some("  Fix login  ".into()), false, false)
             .await
             .expect("delivery");
         assert_eq!(url, "https://github.test/acme/app/pull/42");
@@ -7849,11 +9335,132 @@ mod tests {
         let meta: serde_json::Value =
             serde_json::from_str(task.source_meta.as_deref().unwrap()).unwrap();
         assert_eq!(meta["result_pr"], "https://github.test/acme/app/pull/42");
-        // The worktree is deliberately kept: the pull request points at this
-        // branch and another round on it is a normal next step.
+        // The worktree is kept because this caller did not ask for it to go —
+        // the pull request points at this branch and another round on it is a
+        // normal next step.
         assert!(f.worktree.exists());
         // Nothing is left in the in-flight set for the reconcile tick to trip on.
         assert!(f.engine.merging.lock().await.is_empty());
+    }
+
+    /// The delivery's own version of the offer both other acceptances make:
+    /// take the checkout along. Safe here in a way a bare `branch -D` is not —
+    /// by the time this runs the commits it destroys locally are on the forge.
+    #[tokio::test]
+    async fn a_delivery_takes_the_worktree_along_when_asked() {
+        let f = delivery_fixture(FakeForge::default()).await;
+        let url = f
+            .engine
+            .deliver_pr(f.task_id, None, false, true)
+            .await
+            .expect("delivery");
+        assert_eq!(url, "https://github.test/acme/app/pull/42");
+
+        let task = row(&f.engine, f.task_id).await;
+        assert_eq!(task.status, WorkTaskStatus::Done);
+        assert_eq!(task.completion_kind.as_deref(), Some("delivered_pr"));
+        assert!(!f.worktree.exists(), "the checkout is gone from disk");
+        assert!(
+            task.worktree_folder_id.is_none(),
+            "and the row's pointer with it"
+        );
+        assert!(
+            task.cleanup_state.is_none(),
+            "a removal that worked flags nothing"
+        );
+        assert!(
+            task_git::rev_parse(f.root.to_str().unwrap(), "refs/heads/task/7")
+                .await
+                .is_err(),
+            "the local branch goes too — the push that just ran is what makes that safe"
+        );
+        assert!(f.engine.merging.lock().await.is_empty());
+    }
+
+    /// The worktree turned dirty between `deliver_pr`'s pre-flight clean check
+    /// and the removal. `worktree remove --force` would drop those files
+    /// without a word and they are on no forge, so the checkout is KEPT and
+    /// flagged for a retry from the card — while the delivery itself, which is
+    /// what the button promised, still reports success.
+    #[tokio::test]
+    async fn a_worktree_that_turned_dirty_is_kept_rather_than_forced_away() {
+        let f = delivery_fixture(FakeForge {
+            dirty_on_push: Some("scratch.txt".into()),
+            ..Default::default()
+        })
+        .await;
+        let url = f
+            .engine
+            .deliver_pr(f.task_id, None, false, true)
+            .await
+            .expect("delivery");
+        assert_eq!(url, "https://github.test/acme/app/pull/42");
+
+        let task = row(&f.engine, f.task_id).await;
+        assert_eq!(
+            task.status,
+            WorkTaskStatus::Done,
+            "the delivery still landed"
+        );
+        assert_eq!(task.completion_kind.as_deref(), Some("delivered_pr"));
+        assert!(
+            f.worktree.join("scratch.txt").exists(),
+            "the stray file survives"
+        );
+        assert!(
+            task.worktree_folder_id.is_some(),
+            "the checkout is still the task's"
+        );
+        assert_eq!(
+            task.cleanup_state.as_deref(),
+            Some("failed"),
+            "so the card can offer the cleanup again once the file is dealt with"
+        );
+    }
+
+    /// The blind spot `git status` cannot cover: a COMMIT made in the same
+    /// window leaves the worktree spotless while putting the branch ahead of
+    /// everything the delivery published. `worktree remove --force` plus
+    /// `branch -D` would take that commit with them, and it is on no forge —
+    /// so the tip is checked against the OID that actually went out, and a
+    /// branch that outran it keeps both its checkout and its commit.
+    #[tokio::test]
+    async fn a_branch_that_outran_the_delivery_keeps_its_unpublished_commit() {
+        let f = delivery_fixture(FakeForge {
+            commit_on_push: Some("later.txt".into()),
+            ..Default::default()
+        })
+        .await;
+        let url = f
+            .engine
+            .deliver_pr(f.task_id, None, false, true)
+            .await
+            .expect("delivery");
+        assert_eq!(url, "https://github.test/acme/app/pull/42");
+
+        let task = row(&f.engine, f.task_id).await;
+        assert_eq!(
+            task.status,
+            WorkTaskStatus::Done,
+            "the delivery still landed"
+        );
+        assert_eq!(task.completion_kind.as_deref(), Some("delivered_pr"));
+        assert!(f.worktree.exists(), "the checkout survives");
+        assert!(task.worktree_folder_id.is_some(), "and stays the task's");
+        assert_eq!(
+            task.cleanup_state.as_deref(),
+            Some("failed"),
+            "retryable once the extra commit is delivered or moved somewhere safe"
+        );
+        // Spotless — which is exactly why the other probe could not have
+        // caught this, and why the tip check has to exist.
+        assert!(!task_git::has_changes(f.worktree.to_str().unwrap())
+            .await
+            .expect("status"));
+        let tip = task_git::rev_parse(f.root.to_str().unwrap(), "refs/heads/task/7")
+            .await
+            .expect("the branch is still there");
+        assert_ne!(tip, f.head, "and it holds the commit nobody pushed");
     }
 
     /// A pull request that already matches all four criteria is ADOPTED. This
@@ -7875,7 +9482,7 @@ mod tests {
 
         let url = f
             .engine
-            .deliver_pr(f.task_id, None, false)
+            .deliver_pr(f.task_id, None, false, false)
             .await
             .expect("delivery");
         assert_eq!(url, "https://github.test/acme/app/pull/11");
@@ -7905,7 +9512,7 @@ mod tests {
 
         let url = f
             .engine
-            .deliver_pr(f.task_id, None, false)
+            .deliver_pr(f.task_id, None, false, false)
             .await
             .expect("delivery");
         assert_eq!(
@@ -7947,7 +9554,7 @@ mod tests {
             let f = delivery_fixture(forge).await;
             let err = f
                 .engine
-                .deliver_pr(f.task_id, None, false)
+                .deliver_pr(f.task_id, None, false, false)
                 .await
                 .expect_err("must fail");
             assert!(err.contains(expected), "got {err}");
@@ -7978,7 +9585,7 @@ mod tests {
         });
         let err = f
             .engine
-            .deliver_pr(f.task_id, None, false)
+            .deliver_pr(f.task_id, None, false, false)
             .await
             .expect_err("must stop");
         assert!(err.contains("closed without merging"), "got {err}");
@@ -7999,7 +9606,7 @@ mod tests {
         std::fs::write(dirty.worktree.join("scratch.txt"), "junk\n").expect("write");
         let err = dirty
             .engine
-            .deliver_pr(dirty.task_id, None, false)
+            .deliver_pr(dirty.task_id, None, false, false)
             .await
             .expect_err("dirty worktree");
         assert!(err.contains("uncommitted changes"), "got {err}");
@@ -8010,7 +9617,7 @@ mod tests {
         git_run(&empty.worktree, &["reset", "-q", "--hard", "HEAD~1"]);
         let err = empty
             .engine
-            .deliver_pr(empty.task_id, None, false)
+            .deliver_pr(empty.task_id, None, false, false)
             .await
             .expect_err("nothing to deliver");
         assert!(err.contains("nothing to deliver"), "got {err}");
@@ -8047,7 +9654,7 @@ mod tests {
 
             let err = f
                 .engine
-                .deliver_pr(f.task_id, None, false)
+                .deliver_pr(f.task_id, None, false, false)
                 .await
                 .expect_err("must refuse");
             assert!(err.contains(needle), "got {err}");
@@ -8189,7 +9796,7 @@ mod tests {
 
         let err = f
             .engine
-            .deliver_pr(f.task_id, None, false)
+            .deliver_pr(f.task_id, None, false, false)
             .await
             .expect_err("must refuse");
         assert!(err.contains("not on the remote yet"), "got {err}");
@@ -8208,7 +9815,7 @@ mod tests {
         *f.forge.remote_base.lock().await = None;
         let err = f
             .engine
-            .deliver_pr(f.task_id, None, false)
+            .deliver_pr(f.task_id, None, false, false)
             .await
             .expect_err("an unreadable base must refuse");
         assert!(err.contains("could not read"), "got {err}");
@@ -8230,7 +9837,7 @@ mod tests {
 
         let err = f
             .engine
-            .merge_task(f.task_id, None, false, false)
+            .merge_task(f.task_id, None, false, None, false)
             .await
             .expect_err("must not dispatch");
         assert!(err.contains("already merging"), "got {err}");
@@ -8262,7 +9869,7 @@ mod tests {
 
         let err = f
             .engine
-            .deliver_pr(f.task_id, None, false)
+            .deliver_pr(f.task_id, None, false, false)
             .await
             .expect_err("the second must not run");
         assert!(err.contains("already merging"), "got {err}");
@@ -8325,7 +9932,7 @@ mod tests {
 
         let err = f
             .engine
-            .deliver_pr(f.task_id, None, false)
+            .deliver_pr(f.task_id, None, false, false)
             .await
             .expect_err("must bounce");
         assert!(err.contains("different commit"), "got {err}");
@@ -8412,7 +10019,7 @@ mod tests {
         f.forge.existing.lock().await.push(pr);
 
         f.engine
-            .deliver_pr(f.task_id, None, false)
+            .deliver_pr(f.task_id, None, false, false)
             .await
             .expect("push back");
 
@@ -8452,7 +10059,7 @@ mod tests {
             .expect("record the run's result");
 
         f.engine
-            .deliver_pr(f.task_id, None, false)
+            .deliver_pr(f.task_id, None, false, false)
             .await
             .expect("delivery");
 
@@ -8491,7 +10098,7 @@ mod tests {
         let f = delivery_fixture(FakeForge::default()).await;
         set_writeback(&f, false).await;
         f.engine
-            .deliver_pr(f.task_id, None, false)
+            .deliver_pr(f.task_id, None, false, false)
             .await
             .expect("delivery");
         // The settle emitted; give a spawned write-back the same chance to run
@@ -8518,7 +10125,7 @@ mod tests {
             "the fixture stands in for a pre-choice row"
         );
         f.engine
-            .deliver_pr(f.task_id, None, false)
+            .deliver_pr(f.task_id, None, false, false)
             .await
             .expect("delivery");
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -8539,7 +10146,7 @@ mod tests {
         .await;
         enable_writeback(&f).await;
         f.engine
-            .deliver_pr(f.task_id, None, false)
+            .deliver_pr(f.task_id, None, false, false)
             .await
             .expect("delivery");
 
@@ -8626,6 +10233,324 @@ mod tests {
         assert_eq!(f.forge.comments.lock().await.len(), 1);
     }
 
+    // ── the dead merge generation's connection ──────────────────────────────
+
+    /// Park the fixture's task exactly where a process that died mid-merge left
+    /// it: `merging`, pointing at a connection that no longer exists, with that
+    /// connection still in the engine's correlation index.
+    async fn interrupt_merge(f: &Delivery, conn_id: &str, delete_worktree: bool) {
+        use sea_orm::{ActiveModelTrait, IntoActiveModel, Set};
+        let state = WorkTaskMergeState {
+            op: WorkTaskMergeOp::Land,
+            pre_merge_head: task_git::rev_parse(f.root.to_str().unwrap(), "HEAD")
+                .await
+                .expect("base head"),
+            strategy: "merge".into(),
+            delete_worktree,
+            ..Default::default()
+        };
+        let task = row(&f.engine, f.task_id).await;
+        let run_seq = task.run_seq;
+        let mut active = task.into_active_model();
+        active.status = Set(WorkTaskStatus::Merging);
+        active.merge_state = Set(Some(serde_json::to_string(&state).expect("state")));
+        active.connection_id = Set(Some(conn_id.to_string()));
+        active.update(&f.engine.db.conn).await.expect("to merging");
+        // Registered at launch, and only a TurnComplete ever takes it out.
+        f.engine
+            .index
+            .lock()
+            .await
+            .insert(conn_id.into(), (f.task_id, run_seq));
+    }
+
+    /// The dead generation's index entry has no other way out — `reconcile_once`
+    /// only scans `running` / `awaiting_input`, and the TurnComplete that would
+    /// have retired it is the very thing that went missing. Recovery inherits
+    /// that teardown, and must do it before it acts: this same pass honors the
+    /// "delete the worktree" the user ticked, and worktree removal reads that
+    /// same map as "an agent is still working in there".
+    #[tokio::test]
+    async fn recovery_retires_the_dead_merge_generations_connection() {
+        const DEAD_CONN: &str = "conn-of-a-dead-merge";
+        let f = delivery_fixture(FakeForge::default()).await;
+        interrupt_merge(&f, DEAD_CONN, true).await;
+        // The landing itself, which the dead process did complete.
+        git_run(&f.root, &["merge", "--no-ff", "-q", "-m", "land", "task/7"]);
+
+        f.engine.recover_merging(f.task_id).await;
+
+        assert!(
+            !f.engine.index.lock().await.contains_key(DEAD_CONN),
+            "the dead generation must not outlive its recovery"
+        );
+        let task = row(&f.engine, f.task_id).await;
+        assert_eq!(task.status, WorkTaskStatus::Done);
+        assert_eq!(
+            task.cleanup_state, None,
+            "nothing is working in that worktree — the removal must not be refused"
+        );
+        assert_eq!(task.worktree_folder_id, None, "detached");
+        assert!(!f.worktree.exists(), "and really gone from disk");
+    }
+
+    /// The other outcome, same teardown: a recovery that cannot prove the merge
+    /// landed bounces the row to `review` — where a surviving entry would keep
+    /// attributing the dead connection's late events to a task that has moved
+    /// on, and would block the worktree cleanup offered right there on the card.
+    #[tokio::test]
+    async fn a_bounced_recovery_retires_the_dead_connection_too() {
+        const DEAD_CONN: &str = "conn-of-a-lost-merge";
+        let f = delivery_fixture(FakeForge::default()).await;
+        // No merge commit: the process died before landing anything.
+        interrupt_merge(&f, DEAD_CONN, false).await;
+
+        f.engine.recover_merging(f.task_id).await;
+
+        let task = row(&f.engine, f.task_id).await;
+        assert_eq!(task.status, WorkTaskStatus::Review);
+        assert!(task.last_error.is_some(), "bounced with a reason");
+        assert!(
+            !f.engine.index.lock().await.contains_key(DEAD_CONN),
+            "a task back in review has no run to correlate events to"
+        );
+    }
+
+    /// Retiring one generation must not disarm another. The outstanding-request
+    /// set is keyed by task, so a stale pass that reaches a task someone else
+    /// has already relaunched would otherwise drop the live generation's
+    /// pending permissions — and the next resolution would empty a set that is
+    /// already empty and put the card back to `running` while the agent is
+    /// still parked on the request nobody answered.
+    #[tokio::test]
+    async fn retiring_a_connection_spares_the_requests_of_one_still_on_the_task() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let engine = test_engine(db);
+        {
+            let mut index = engine.index.lock().await;
+            index.insert("conn-old".into(), (7, 1));
+            index.insert("conn-new".into(), (7, 2));
+        }
+        engine
+            .awaiting
+            .lock()
+            .await
+            .insert(7, ["p:req-1".to_string()].into_iter().collect());
+
+        engine.retire_connection("conn-old", 7).await;
+
+        {
+            let index = engine.index.lock().await;
+            assert!(!index.contains_key("conn-old"), "the retired one is gone");
+            assert!(index.contains_key("conn-new"), "and only that one");
+        }
+        assert_eq!(
+            engine.awaiting.lock().await.get(&7).map(|s| s.len()),
+            Some(1),
+            "the live generation is still waiting on its permission"
+        );
+
+        // The last one out does clear it — a set inherited by the next
+        // generation would never flip the row to `awaiting_input` again.
+        engine.retire_connection("conn-new", 7).await;
+        assert!(engine.awaiting.lock().await.get(&7).is_none());
+    }
+
+    /// `index` is a correlation table, not a liveness one. Whatever leaves an
+    /// entry behind, the user's "remove worktree" must not be refused on behalf
+    /// of a connection that is gone — the refusal sets a `failed` flag whose
+    /// retry can never clear, because nothing would ever arrive to remove the
+    /// entry. The manager is the truth, and what it says is gone is retired.
+    #[tokio::test]
+    async fn worktree_removal_is_not_refused_by_a_dead_connection() {
+        const ZOMBIE: &str = "conn-nobody-holds";
+        let f = delivery_fixture(FakeForge::default()).await;
+        let run_seq = row(&f.engine, f.task_id).await.run_seq;
+        f.engine
+            .index
+            .lock()
+            .await
+            .insert(ZOMBIE.into(), (f.task_id, run_seq));
+
+        f.engine.cleanup_task(f.task_id).await.expect("cleanup");
+
+        let task = row(&f.engine, f.task_id).await;
+        assert_eq!(task.cleanup_state, None, "not a live agent");
+        assert_eq!(task.worktree_folder_id, None, "detached");
+        assert!(!f.worktree.exists(), "and really gone from disk");
+        assert!(!f.engine.index.lock().await.contains_key(ZOMBIE), "retired");
+    }
+
+    /// The removal underneath is `worktree remove --force`, and a stop pressed
+    /// while the agent is editing is exactly when a checkout is dirty. Nothing
+    /// the user clicked named those files — the cancel dialog's checkbox offers
+    /// "its worktree and work branch" — so this has to refuse, the same line
+    /// `complete_task` draws and the branch dropdown re-asks about.
+    #[tokio::test]
+    async fn worktree_removal_refuses_to_take_uncommitted_work() {
+        let f = delivery_fixture(FakeForge::default()).await;
+        // Both shapes `git status` reports: an edit to a tracked file, and a
+        // file git has never seen. Either one on its own is unrecoverable.
+        std::fs::write(f.worktree.join("a.txt"), "one\ntwo\nthree\n").expect("write");
+        std::fs::write(f.worktree.join("notes.md"), "half a thought\n").expect("write");
+
+        let err = f
+            .engine
+            .cleanup_task(f.task_id)
+            .await
+            .expect_err("must not take uncommitted work");
+        assert!(err.holds_work, "declined to protect work, not a failure");
+        assert!(
+            err.message.contains("uncommitted files"),
+            "and says why: {}",
+            err.message
+        );
+
+        assert!(f.worktree.exists(), "the checkout survives");
+        assert_eq!(
+            std::fs::read_to_string(f.worktree.join("notes.md")).expect("read"),
+            "half a thought\n",
+            "and so does the work inside it"
+        );
+        let task = row(&f.engine, f.task_id).await;
+        assert_eq!(
+            task.cleanup_state.as_deref(),
+            Some("failed"),
+            "flagged, because the cancel and delete paths swallow the error and \
+             the card is the only place left to say it"
+        );
+        assert!(
+            task.worktree_folder_id.is_some(),
+            "still attached, so the retry has something to remove"
+        );
+    }
+
+    /// The probe fails CLOSED. `git status` can stop answering for reasons that
+    /// have nothing to do with the checkout being gone — a corrupt index, a
+    /// permission error — and the operation waiting on that answer is
+    /// `worktree remove --force`. Reading "could not ask" as "clean" would
+    /// trade a recoverable stall for unrecoverable files.
+    #[tokio::test]
+    async fn a_worktree_git_cannot_read_is_not_assumed_clean() {
+        let f = delivery_fixture(FakeForge::default()).await;
+        // A linked worktree's `.git` is a FILE pointing back at the real gitdir.
+        // Pointing it nowhere makes every git command in here fail while the
+        // directory — and whatever the user left in it — stays on disk.
+        std::fs::write(f.worktree.join("unsaved.txt"), "not committed\n").expect("write");
+        std::fs::write(f.worktree.join(".git"), "gitdir: /nowhere/at/all\n").expect("write");
+
+        let err = f
+            .engine
+            .cleanup_task(f.task_id)
+            .await
+            .expect_err("must not force-remove a checkout it could not read");
+        assert!(err.holds_work, "unprovable is treated as unsafe");
+
+        assert!(f.worktree.exists(), "the checkout survives");
+        assert_eq!(
+            std::fs::read_to_string(f.worktree.join("unsaved.txt")).expect("read"),
+            "not committed\n"
+        );
+    }
+
+    /// The removal has to serialize against a LAUNCH, and the folder git lock
+    /// cannot do that: `launch` holds the TASK lock across its whole setup —
+    /// `ensure_worktree` included — and takes no folder lock at all.
+    ///
+    /// The sequence that gets there is ordinary board use: a cancel that was
+    /// asked to take the worktree along leaves the row `canceled`, the user
+    /// requeues it (a pure DB write that waits on no lock), and the pump
+    /// launches it — all while the removal sits between its status read and its
+    /// `git worktree remove`. Nothing about the requeue is wrong; the fresh run
+    /// would mint its own checkout. Deleting the directory out from under
+    /// `ensure_worktree` is.
+    ///
+    /// Holding the task lock here stands in for that launch: without the lock
+    /// on the removal's side, the worktree is gone before the guard is dropped.
+    #[tokio::test]
+    async fn worktree_removal_waits_for_the_task_lock() {
+        let f = delivery_fixture(FakeForge::default()).await;
+        let engine = f.engine.clone();
+        let task_id = f.task_id;
+
+        // Stand in for a launch that has the row and is inside its setup.
+        let held = engine.task_lock(task_id).await;
+        let guard = held.lock().await;
+
+        let removal = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.cleanup_task(task_id).await }
+        });
+
+        // Long enough that an unserialized removal — a few DB reads and a
+        // `git worktree remove` — would have finished several times over.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            f.worktree.exists(),
+            "the checkout must survive while the launch holds the task lock"
+        );
+        assert!(
+            !removal.is_finished(),
+            "and the removal must still be parked"
+        );
+
+        drop(guard);
+        removal.await.expect("join").expect("cleanup");
+        assert!(!f.worktree.exists(), "and go once the lock is free");
+        assert_eq!(row(&engine, task_id).await.worktree_folder_id, None);
+    }
+
+    /// Drain everything the fixture's engine has broadcast so far.
+    fn drained(f: &mut Delivery) -> Vec<crate::web::event_bridge::WebEvent> {
+        let mut out = Vec::new();
+        while let Ok(ev) = f.events.try_recv() {
+            out.push(ev);
+        }
+        out
+    }
+
+    /// An acceptance that removes the worktree has to say so on the TASK
+    /// channel, not just the folder one. Both acceptance paths broadcast the
+    /// row BEFORE the cleanup runs (`settle_merge_generation` and this one), so
+    /// a removal that stays silent leaves every open board holding the snapshot
+    /// taken while the worktree still existed: the card flips to `done` but its
+    /// "worktree removed" badge — keyed on `worktree_folder_id` going null —
+    /// never appears until someone refetches the whole table.
+    #[tokio::test]
+    async fn removing_the_worktree_announces_the_task_after_the_folder() {
+        let mut f = delivery_fixture(FakeForge::default()).await;
+        interrupt_merge(&f, "conn-of-a-dead-merge", true).await;
+        git_run(&f.root, &["merge", "--no-ff", "-q", "-m", "land", "task/7"]);
+        let _ = drained(&mut f); // everything up to the merge is setup noise
+
+        f.engine.recover_merging(f.task_id).await;
+
+        assert_eq!(
+            row(&f.engine, f.task_id).await.worktree_folder_id,
+            None,
+            "precondition: this run really did detach the worktree"
+        );
+        let events = drained(&mut f);
+        let folder_gone = events
+            .iter()
+            .position(|e| {
+                e.channel == crate::web::event_bridge::FOLDER_CHANGED_EVENT
+                    && e.payload["kind"] == "deleted"
+            })
+            .expect("the worktree folder drop is broadcast");
+        assert!(
+            events.iter().skip(folder_gone).any(|e| {
+                e.channel == WORK_TASK_CHANGED_EVENT
+                    && e.payload["kind"] == "upsert"
+                    && e.payload["id"] == f.task_id
+            }),
+            "the task must be re-announced AFTER the detach — an upsert from \
+             before it carries the worktree the client is being told to drop; \
+             saw {:?}",
+            events.iter().map(|e| &e.channel).collect::<Vec<_>>()
+        );
+    }
+
     /// A task nobody triggered from a forge has no thread to comment on — the
     /// write-back must never invent one from the folder's remote.
     #[tokio::test]
@@ -8645,6 +10570,238 @@ mod tests {
             .forge_writeback(f.task_id, WritebackOutcome::Merged("abc1234".into()))
             .await;
         assert!(f.forge.comments.lock().await.is_empty());
+    }
+
+    /// The engine has to be listening to the event bus BEFORE it starts its
+    /// boot work, not after: the bus drops what it broadcasts while nobody is
+    /// subscribed, so a task the user starts during boot would emit its
+    /// `TurnComplete` into nothing and sit `running` forever — the reconcile
+    /// sweep deliberately leaves rows whose connection is still live to
+    /// `on_event`.
+    ///
+    /// Pinned without timing games. A `merging` row parks the boot pass on the
+    /// folder's git lock, which this test holds, so the engine is provably
+    /// still inside boot work when the event goes out; and the queued row
+    /// flipping to `failed` is the boot pass announcing it got that far.
+    #[tokio::test]
+    async fn boot_work_does_not_swallow_the_events_published_under_it() {
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+        use sea_orm::{ActiveModelTrait, Set};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        git_run(dir.path(), &["init", "-q", "-b", "main"]);
+        std::fs::write(dir.path().join("a.txt"), "one\n").expect("write");
+        git_run(dir.path(), &["add", "-A"]);
+        git_run(dir.path(), &["commit", "-q", "-m", "base"]);
+
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, dir.path().to_str().expect("utf-8 path")).await;
+        let draft = |title: &str| crate::models::WorkTaskDraft {
+            folder_id,
+            title: title.to_string(),
+            config: serde_json::json!({ "display_text": title }),
+        };
+
+        // Interrupted by the restart — the boot pass fails it, which is how
+        // this test learns the pass has begun.
+        let interrupted = work_task_service::create(&db.conn, draft("interrupted"))
+            .await
+            .expect("task");
+        work_task_service::claim_for_run(&db.conn, interrupted.id, WorkTaskStatus::Todo, "test")
+            .await
+            .expect("claim")
+            .expect("claimed");
+
+        // The row that parks the boot pass on the folder's git lock.
+        let now = chrono::Utc::now();
+        let merging = crate::db::entities::work_task::ActiveModel {
+            folder_id: Set(folder_id),
+            title: Set("mid-merge".to_string()),
+            config: Set("{}".to_string()),
+            status: Set(WorkTaskStatus::Merging),
+            run_seq: Set(1),
+            sort_order: Set(0),
+            base_branch: Set(Some("main".to_string())),
+            work_branch: Set(Some("task/1".to_string())),
+            merge_state: Set(Some(
+                serde_json::to_string(&WorkTaskMergeState {
+                    op: WorkTaskMergeOp::Land,
+                    strategy: "merge".into(),
+                    ..Default::default()
+                })
+                .expect("state"),
+            )),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(&db.conn)
+        .await
+        .expect("merging row");
+
+        let engine = test_engine(db);
+        let lock = engine.folder_lock(folder_id).await;
+        let guard = lock.lock().await;
+
+        let driver = engine.clone();
+        tokio::spawn(async move { run_task_engine(driver).await });
+
+        let probe = engine.clone();
+        wait_for("the boot pass to start", move || {
+            let probe = probe.clone();
+            async move { row(&probe, interrupted.id).await.status == WorkTaskStatus::Failed }
+        })
+        .await;
+
+        // A run the user starts while boot is still going. Created HERE, after
+        // the boot pass swept the interrupted rows, so nothing but the event
+        // below can settle it.
+        let live = work_task_service::create(&engine.db.conn, draft("started during boot"))
+            .await
+            .expect("task");
+        let conv = conversation_service::create(
+            &engine.db.conn,
+            folder_id,
+            AgentType::ClaudeCode,
+            None,
+            None,
+        )
+        .await
+        .expect("conversation");
+        let run_seq = work_task_service::claim_for_run(
+            &engine.db.conn,
+            live.id,
+            WorkTaskStatus::Todo,
+            "test",
+        )
+        .await
+        .expect("claim")
+        .expect("claimed");
+        assert!(
+            work_task_service::begin_setup(&engine.db.conn, live.id, run_seq)
+                .await
+                .expect("begin_setup")
+        );
+        assert!(work_task_service::mark_running(
+            &engine.db.conn,
+            live.id,
+            run_seq,
+            conv.id,
+            PARENT_CONN
+        )
+        .await
+        .expect("mark_running"));
+        engine
+            .index
+            .lock()
+            .await
+            .insert(PARENT_CONN.into(), (live.id, run_seq));
+        // A LIVE connection, so the reconcile sweep keeps its hands off the row
+        // — which is exactly the production shape that makes a lost
+        // `TurnComplete` permanent.
+        engine
+            .manager
+            .insert_test_connection(
+                PARENT_CONN,
+                AgentType::ClaudeCode,
+                None,
+                crate::web::event_bridge::EventEmitter::Noop,
+            )
+            .await;
+
+        engine.bus.send(std::sync::Arc::new(env(
+            PARENT_CONN,
+            AcpEvent::TurnComplete {
+                session_id: "s-1".into(),
+                stop_reason: "end_turn".into(),
+                agent_type: "claude_code".into(),
+                mark_awaiting_reply: false,
+                termination_source: None,
+                provider_turn_id: None,
+            },
+        )));
+
+        // Boot can finish now; the event has to survive it.
+        drop(guard);
+        let probe = engine.clone();
+        wait_for(
+            "the settle from an event published during boot",
+            move || {
+                let probe = probe.clone();
+                async move { row(&probe, live.id).await.status == WorkTaskStatus::Review }
+            },
+        )
+        .await;
+        assert_eq!(
+            row(&engine, merging.id).await.status,
+            WorkTaskStatus::Review,
+            "the parked boot pass still ran to completion"
+        );
+    }
+
+    /// Nothing makes an agent commit before its task lands in review — the
+    /// merge generation's prompt starts by committing whatever is left over —
+    /// so a task whose new files are still untracked has done work all the
+    /// same. Reading it as "changed nothing" would put "complete" on the card
+    /// and let the user close a task whose work never lands.
+    #[tokio::test]
+    async fn work_the_agent_never_committed_still_counts() {
+        let f = delivery_fixture(FakeForge::default()).await;
+        // Undo the fixture's commit, leaving its content in the worktree as an
+        // uncommitted edit, and add a new file nobody ran `git add` on.
+        git_run(&f.worktree, &["reset", "-q", "--mixed", "HEAD~1"]);
+        std::fs::write(f.worktree.join("fresh.txt"), "a\nb\n").expect("write");
+
+        let stats = f
+            .engine
+            .snapshot_diff_stats(f.task_id)
+            .await
+            .expect("stats");
+        assert_eq!(stats, (2, 3, 0), "the edit and the new file both count");
+        let task = row(&f.engine, f.task_id).await;
+        assert!(
+            f.engine
+                .has_landable_changes(&task, f.worktree.to_str().unwrap())
+                .await
+                .expect("landable probe"),
+            "completing this task would strand real work"
+        );
+    }
+
+    /// Base content the branch ABSORBED is not this task's work. An agent that
+    /// merges the base branch in — or rebases onto it — brings every commit the
+    /// base gained along, and measuring from the commit the task branched off
+    /// would count all of it: a task that added one line would report the whole
+    /// week's work, and the counters decide which acceptance the board offers.
+    #[tokio::test]
+    async fn base_content_the_branch_absorbed_is_not_the_tasks_work() {
+        let f = delivery_fixture(FakeForge::default()).await;
+        // The task's own contribution, as the fixture left it.
+        assert_eq!(
+            f.engine.snapshot_diff_stats(f.task_id).await,
+            Some((1, 1, 0))
+        );
+
+        // The base branch moves on, and the worktree takes it in.
+        git_run(&f.root, &["checkout", "-q", "main"]);
+        std::fs::write(f.root.join("later.txt"), "one\ntwo\nthree\n").expect("write");
+        git_run(&f.root, &["add", "-A"]);
+        git_run(&f.root, &["commit", "-qm", "the base moves on"]);
+        git_run(&f.worktree, &["merge", "-q", "--no-edit", "main"]);
+
+        assert_eq!(
+            f.engine.snapshot_diff_stats(f.task_id).await,
+            Some((1, 1, 0)),
+            "the merged-in base branch is not this task's change set"
+        );
+        let task = row(&f.engine, f.task_id).await;
+        assert!(
+            f.engine
+                .has_landable_changes(&task, f.worktree.to_str().unwrap())
+                .await
+                .expect("landable probe"),
+            "…and its own commit is still there to land"
+        );
     }
 
     // ── tasks that ARE a pull request ───────────────────────────────────────
@@ -8843,6 +11000,158 @@ mod tests {
         drop(home);
     }
 
+    /// The counters on the row are the TASK's own work, which on a
+    /// pull-request task is NOT the review diff: the worktree starts on the
+    /// pull request, so the whole contribution is already there before the
+    /// agent does anything. A review-only run — findings reported, nothing
+    /// committed — has to settle at zero, or the board hides "complete" behind
+    /// a delivery that would push an empty change.
+    #[tokio::test]
+    async fn a_pull_request_task_counts_only_what_the_agent_added() {
+        let (engine, task_id, home, _pull_head, branch_point) =
+            pull_checkout_fixture(None, crate::forge::ForgeProvider::GitHub).await;
+        let task = row(&engine, task_id).await;
+        let root = get_folder_core(&engine.db, task.folder_id)
+            .await
+            .expect("root");
+        let wt = engine
+            .ensure_worktree(&task, &root, &WorkTaskFolderSettings::default())
+            .await
+            .expect("worktree");
+        let task = row(&engine, task_id).await;
+
+        // What the user reviews still holds the pull request itself…
+        let reviewed = task_git::diff_numstat(&wt.path, &branch_point)
+            .await
+            .expect("review diff");
+        assert!(
+            reviewed.iter().any(|f| f.file == "feature.txt"),
+            "the review diff is unchanged: {reviewed:?}"
+        );
+        // …while the task's own contribution is empty, on both the recorded
+        // stat and the live probe the acceptances re-ask.
+        assert_eq!(
+            engine.snapshot_diff_stats(task_id).await,
+            Some((0, 0, 0)),
+            "a review-only run changed nothing"
+        );
+        assert!(!engine
+            .has_landable_changes(&task, &wt.path)
+            .await
+            .expect("landable probe"));
+
+        // A round that does commit is counted — and only its own file.
+        std::fs::write(Path::new(&wt.path).join("fix.txt"), "the agent's work\n").expect("write");
+        git_run(Path::new(&wt.path), &["add", "-A"]);
+        git_run(Path::new(&wt.path), &["commit", "-qm", "the agent's fix"]);
+        assert_eq!(
+            engine.snapshot_diff_stats(task_id).await,
+            Some((1, 1, 0)),
+            "the agent's file, not the pull request's"
+        );
+        assert!(engine
+            .has_landable_changes(&task, &wt.path)
+            .await
+            .expect("landable probe"));
+        drop(home);
+    }
+
+    /// The same rule on the path that made it matter: a pull-request task whose
+    /// agent wrote a file and never added it. The counters have to say the task
+    /// did something, the drawer has to list the same file the counters count,
+    /// and completing has to refuse — closing it here would leave work that
+    /// nothing is going to land (delivery cannot push an uncommitted tree
+    /// either; it says so and asks for another round). The ignore rules are
+    /// pinned where they are applied, in
+    /// `git::tests::the_acceptance_measure_sees_work_that_was_never_committed`.
+    #[tokio::test]
+    async fn an_untracked_file_keeps_a_pull_request_task_out_of_complete() {
+        use sea_orm::{ActiveModelTrait, IntoActiveModel, Set};
+        let (engine, task_id, home, _pull_head, _branch_point) =
+            pull_checkout_fixture(None, crate::forge::ForgeProvider::GitHub).await;
+        let task = row(&engine, task_id).await;
+        let root = get_folder_core(&engine.db, task.folder_id)
+            .await
+            .expect("root");
+        let wt = engine
+            .ensure_worktree(&task, &root, &WorkTaskFolderSettings::default())
+            .await
+            .expect("worktree");
+
+        std::fs::write(Path::new(&wt.path).join("findings.md"), "one\ntwo\n").expect("write");
+
+        assert_eq!(
+            engine.snapshot_diff_stats(task_id).await,
+            Some((1, 2, 0)),
+            "an uncommitted new file is still this task's work"
+        );
+        let listed = crate::commands::work_task::work_task_changed_files_core(&engine.db, task_id)
+            .await
+            .expect("changed files");
+        assert!(
+            listed.iter().any(|f| f.file == "findings.md"),
+            "the drawer must list what the card counts: {listed:?}"
+        );
+
+        let mut active = row(&engine, task_id).await.into_active_model();
+        active.status = Set(WorkTaskStatus::Review);
+        active.update(&engine.db.conn).await.expect("into review");
+        let refused = engine
+            .complete_task(task_id, false)
+            .await
+            .expect_err("the work is still sitting there");
+        assert!(refused.contains("changed files after all"), "{refused}");
+        assert_eq!(
+            row(&engine, task_id).await.status,
+            WorkTaskStatus::Review,
+            "a refused completion leaves the task where it was"
+        );
+        drop(home);
+    }
+
+    /// The counters are written once, when the run settles, and every board
+    /// decision reads them afterwards — so a row can outlive what it describes
+    /// (a worktree committed to since, or a pull-request task settled by a
+    /// build that credited it with the pull request's own files). The boot pass
+    /// re-measures whatever is still sitting in review.
+    #[tokio::test]
+    async fn the_boot_pass_re_measures_a_review_row() {
+        use sea_orm::{ActiveModelTrait, IntoActiveModel, Set};
+        let (engine, task_id, home, _pull_head, _branch_point) =
+            pull_checkout_fixture(None, crate::forge::ForgeProvider::GitHub).await;
+        let task = row(&engine, task_id).await;
+        let root = get_folder_core(&engine.db, task.folder_id)
+            .await
+            .expect("root");
+        engine
+            .ensure_worktree(&task, &root, &WorkTaskFolderSettings::default())
+            .await
+            .expect("worktree");
+
+        // The row an older build left behind: in review, carrying the pull
+        // request's change set as if the task had written it.
+        let mut active = row(&engine, task_id).await.into_active_model();
+        active.status = Set(WorkTaskStatus::Review);
+        active.files_changed = Set(Some(1));
+        active.additions = Set(Some(1));
+        active.deletions = Set(Some(0));
+        active
+            .update(&engine.db.conn)
+            .await
+            .expect("stale review row");
+
+        engine.refresh_review_diff_stats().await;
+
+        let after = row(&engine, task_id).await;
+        assert_eq!(
+            (after.files_changed, after.additions, after.deletions),
+            (Some(0), Some(0), Some(0)),
+            "the corrected counters are what the board reads"
+        );
+        assert_eq!(after.status, WorkTaskStatus::Review, "nothing else moved");
+        drop(home);
+    }
+
     /// The same setup against GitLab. Everything downstream — the merge-base
     /// baseline, the pinned OID, the review diff — is shared code; what is NOT
     /// shared is the ref the head is published under, and fetching GitHub's
@@ -8929,7 +11238,7 @@ mod tests {
 
             let err = f
                 .engine
-                .deliver_pr(f.task_id, None, false)
+                .deliver_pr(f.task_id, None, false, false)
                 .await
                 .err()
                 .unwrap_or_else(|| panic!("{label}: must not settle"));
@@ -8962,7 +11271,7 @@ mod tests {
         merged_ours.head_sha = f.head.clone();
         *f.forge.after_push.lock().await = Some(merged_ours);
         f.engine
-            .deliver_pr(f.task_id, None, false)
+            .deliver_pr(f.task_id, None, false, false)
             .await
             .expect("merged at our commit is a delivery");
         assert_eq!(row(&f.engine, f.task_id).await.status, WorkTaskStatus::Done);
@@ -8993,7 +11302,7 @@ mod tests {
         merged_on_top.head_sha = descendant;
         *f.forge.after_push.lock().await = Some(merged_on_top);
         f.engine
-            .deliver_pr(f.task_id, None, false)
+            .deliver_pr(f.task_id, None, false, false)
             .await
             .expect("a merge that contains our commit is a delivery");
         assert_eq!(row(&f.engine, f.task_id).await.status, WorkTaskStatus::Done);
@@ -9018,7 +11327,7 @@ mod tests {
         *f.forge.after_push.lock().await = Some(merged_theirs);
         let err = f
             .engine
-            .deliver_pr(f.task_id, None, false)
+            .deliver_pr(f.task_id, None, false, false)
             .await
             .expect_err("a merge without our commit is not a delivery");
         assert!(err.contains("does not contain it"), "{err}");
@@ -9062,7 +11371,7 @@ mod tests {
 
         let url = f
             .engine
-            .deliver_pr(f.task_id, Some("ignored".into()), false)
+            .deliver_pr(f.task_id, Some("ignored".into()), false, false)
             .await
             .expect("push back");
         assert_eq!(url, "https://github.test/acme/app/pull/7");
@@ -9109,7 +11418,7 @@ mod tests {
         f.forge.existing.lock().await.push(pr);
 
         f.engine
-            .deliver_pr(f.task_id, None, false)
+            .deliver_pr(f.task_id, None, false, false)
             .await
             .expect("fork push back");
         assert_eq!(
@@ -9126,12 +11435,19 @@ mod tests {
         assert_eq!(task.completion_kind.as_deref(), Some("delivered_pr"));
     }
 
-    /// A delivery whose commit the pull request ALREADY has (a review turn
-    /// that added nothing) settles without pushing at all. That is what lets a
-    /// review-only task on a fork this account cannot write to still be
-    /// accepted — the fake here would fail any push, and none may happen.
+    /// A push back with nothing new is REFUSED, and the acceptance that fits
+    /// takes over. The task's branch is the pull request's own head — a review
+    /// turn that committed nothing — so a delivery would push nothing, leave
+    /// the pull request exactly as it was, and still record the task as
+    /// delivered to it. The board offers "complete" for this row (nothing of
+    /// its own to land); the backend has to agree, or the two disagree about
+    /// the same task.
+    ///
+    /// The review-only task on a fork this account cannot write to is still
+    /// accepted — completing needs no write access at all, and the fake here
+    /// would fail any push.
     #[tokio::test]
-    async fn a_push_back_with_nothing_new_settles_without_pushing() {
+    async fn a_push_back_with_nothing_new_is_refused_for_completing() {
         let forge = FakeForge {
             push_error: Some("403: permission denied".into()),
             ..FakeForge::default()
@@ -9142,8 +11458,56 @@ mod tests {
         as_pull_request_task(&f, pr.clone()).await;
         f.forge.existing.lock().await.push(pr);
 
+        let refused = f
+            .engine
+            .deliver_pr(f.task_id, None, false, false)
+            .await
+            .expect_err("a delivery with nothing in it");
+        assert!(refused.contains("complete it instead"), "{refused}");
+        assert!(f.forge.pushes.lock().await.is_empty(), "no push may run");
+        assert_eq!(
+            row(&f.engine, f.task_id).await.status,
+            WorkTaskStatus::Review,
+            "a refused delivery leaves the task exactly as it was"
+        );
+
         f.engine
-            .deliver_pr(f.task_id, None, false)
+            .complete_task(f.task_id, false)
+            .await
+            .expect("accepted without touching the fork");
+        let task = row(&f.engine, f.task_id).await;
+        assert_eq!(task.status, WorkTaskStatus::Done);
+        assert_eq!(
+            task.completion_kind.as_deref(),
+            Some("accepted_without_merge"),
+            "…and recorded as what it was, not as a delivery"
+        );
+    }
+
+    /// The OTHER way a delivery finds nothing to push: its push already landed
+    /// and something interrupted the settle. The retry must recognize the pull
+    /// request as carrying this task's commit and finish — without pushing
+    /// again, which is what lets it complete on a fork this account cannot
+    /// write to (the fake here fails any push). Distinguished from the refused
+    /// case above by the task actually having work: it was triggered on the
+    /// pull request's earlier head and committed on top of it.
+    #[tokio::test]
+    async fn a_delivery_whose_push_already_landed_settles_without_pushing_again() {
+        let forge = FakeForge {
+            push_error: Some("403: permission denied".into()),
+            ..FakeForge::default()
+        };
+        let f = delivery_fixture(forge).await;
+        as_pull_request_task(&f, open_pull(&f.base_sha, "feature", "contributor/app")).await;
+        // What the forge answers today: the task's own commit is already there.
+        f.forge
+            .existing
+            .lock()
+            .await
+            .push(open_pull(&f.head, "feature", "contributor/app"));
+
+        f.engine
+            .deliver_pr(f.task_id, None, false, false)
             .await
             .expect("settled without a push");
         assert!(f.forge.pushes.lock().await.is_empty(), "no push may run");
@@ -9168,7 +11532,7 @@ mod tests {
         ));
 
         f.engine
-            .deliver_pr(f.task_id, None, false)
+            .deliver_pr(f.task_id, None, false, false)
             .await
             .expect("push back");
         assert_eq!(
@@ -9195,7 +11559,7 @@ mod tests {
         closed.forge.existing.lock().await.push(pr);
         let err = closed
             .engine
-            .deliver_pr(closed.task_id, None, false)
+            .deliver_pr(closed.task_id, None, false, false)
             .await
             .expect_err("closed");
         assert!(err.contains("no longer open"), "{err}");
@@ -9211,7 +11575,7 @@ mod tests {
         as_pull_request_task(&fork, open_pull("x", "feature", "project-4711")).await;
         let err = fork
             .engine
-            .deliver_pr(fork.task_id, None, false)
+            .deliver_pr(fork.task_id, None, false, false)
             .await
             .expect_err("unnameable fork");
         assert!(err.contains("cannot see"), "{err}");
@@ -9233,7 +11597,7 @@ mod tests {
             .push(open_pull("x", "someone-elses-branch", "acme/app"));
         let err = moved
             .engine
-            .deliver_pr(moved.task_id, None, false)
+            .deliver_pr(moved.task_id, None, false, false)
             .await
             .expect_err("retargeted");
         assert!(err.contains("now tracks branch"), "{err}");
@@ -9253,7 +11617,7 @@ mod tests {
         as_pull_request_task(&f, open_pull("x", "feature", "acme/app")).await;
         let err = f
             .engine
-            .merge_task(f.task_id, None, false, false)
+            .merge_task(f.task_id, None, false, None, false)
             .await
             .expect_err("must refuse");
         assert!(err.contains("deliver it back"), "{err}");
@@ -9324,5 +11688,460 @@ mod tests {
             .on_event(&delegation_started("conn-chat", "conn-other-child"))
             .await;
         assert!(engine.delegation_parents.lock().await.is_empty());
+    }
+
+    // ── pre-prompt context compaction ───────────────────────────────────────
+
+    const COMPACT_CONN: &str = "conn-compact";
+
+    /// A generation parked exactly where `compact_before_prompt` runs: claimed,
+    /// setup begun (`preparing`), agent connection live, and — as in the real
+    /// launch at this point — nothing in `index` yet.
+    struct CompactFixture {
+        engine: Arc<TaskEngine>,
+        task_id: i32,
+        run_seq: i32,
+        folder_id: i32,
+        conversation_id: i32,
+        /// The connection's command channel. Held for the test's duration: a
+        /// dropped receiver makes every send fail before it reaches the gate.
+        rx: tokio::sync::mpsc::Receiver<crate::acp::connection::ConnectionCommand>,
+    }
+
+    async fn compact_fixture(usage: Option<(u64, u64)>) -> CompactFixture {
+        use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/task-compact").await;
+        let conv =
+            conversation_service::create(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
+                .await
+                .expect("conversation");
+        let task = work_task_service::create(
+            &db.conn,
+            crate::models::WorkTaskDraft {
+                folder_id,
+                title: "fix login".to_string(),
+                config: serde_json::json!({
+                    "display_text": "fix login",
+                    "prompt_blocks": [{ "type": "text", "text": "fix login" }],
+                }),
+            },
+        )
+        .await
+        .expect("task");
+        let run_seq =
+            work_task_service::claim_for_run(&db.conn, task.id, WorkTaskStatus::Todo, "test")
+                .await
+                .expect("claim")
+                .expect("claimed");
+        assert!(work_task_service::begin_setup(&db.conn, task.id, run_seq)
+            .await
+            .expect("begin_setup"));
+
+        let engine = test_engine(db);
+        let rx = engine
+            .manager
+            .insert_test_connection_live(
+                COMPACT_CONN,
+                AgentType::ClaudeCode,
+                None,
+                EventEmitter::Noop,
+            )
+            .await;
+        if let Some((used, size)) = usage {
+            let state = engine.manager.get_state(COMPACT_CONN).await.expect("state");
+            state.write().await.usage = Some(crate::acp::session_state::UsageInfo { used, size });
+        }
+        CompactFixture {
+            engine,
+            task_id: task.id,
+            run_seq,
+            folder_id,
+            conversation_id: conv.id,
+            rx,
+        }
+    }
+
+    fn compact_settings(percent: i32, command: Option<&str>) -> WorkTaskFolderSettings {
+        WorkTaskFolderSettings {
+            auto_compact_percent: percent,
+            compact_command: command.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    /// Drive `compact_before_prompt` to completion, answering the compaction
+    /// turn with `stop_reason` once its prompt has actually been enqueued.
+    /// Returns the text of the prompt it sent, or `None` when it sent none.
+    async fn run_compaction(
+        f: &mut CompactFixture,
+        settings: WorkTaskFolderSettings,
+        stop_reason: &str,
+    ) -> Option<String> {
+        let engine = f.engine.clone();
+        let (task_id, run_seq, folder_id, conversation_id) =
+            (f.task_id, f.run_seq, f.folder_id, f.conversation_id);
+        let handle = tokio::spawn(async move {
+            engine
+                .compact_before_prompt(CompactRequest {
+                    task_id,
+                    run_seq,
+                    conn_id: COMPACT_CONN,
+                    agent_type: AgentType::ClaudeCode,
+                    settings: &settings,
+                    folder_id,
+                    conversation_id,
+                    in_flight: WorkTaskStatus::Preparing,
+                })
+                .await;
+        });
+
+        // Either a prompt shows up (compaction ran) or the call returns having
+        // sent nothing. Waiting on the two together is what keeps the "no
+        // compaction" assertions from depending on a sleep.
+        let sent = tokio::select! {
+            cmd = f.rx.recv() => match cmd.expect("connection alive") {
+                crate::acp::connection::ConnectionCommand::Prompt { blocks, .. } => blocks
+                    .iter()
+                    .find_map(|b| match b {
+                        PromptInputBlock::Text { text } => Some(text.clone()),
+                        _ => None,
+                    }),
+                _ => panic!("the compaction must arrive as a prompt"),
+            },
+            _ = &mut Box::pin(async {
+                while !handle.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            }) => None,
+        };
+        if sent.is_some() {
+            // The waiter subscribed before it sent, so the bus has a receiver.
+            f.engine.bus.send(Arc::new(EventEnvelope {
+                seq: 1,
+                connection_id: COMPACT_CONN.to_string(),
+                payload: AcpEvent::TurnComplete {
+                    session_id: "sess".to_string(),
+                    stop_reason: stop_reason.to_string(),
+                    agent_type: AgentType::ClaudeCode.to_string(),
+                    mark_awaiting_reply: false,
+                    termination_source: None,
+                    provider_turn_id: None,
+                },
+            }));
+        }
+        handle.await.expect("compaction finished");
+        sent
+    }
+
+    async fn compact_events(engine: &TaskEngine, task_id: i32) -> Vec<serde_json::Value> {
+        work_task_service::list_events(&engine.db.conn, task_id, 500)
+            .await
+            .expect("events")
+            .into_iter()
+            .filter(|e| e.kind == "context_compact")
+            .map(|e| e.payload.unwrap_or(serde_json::Value::Null))
+            .collect()
+    }
+
+    /// The feature's whole point: a nearly full session is compacted, and the
+    /// round's own prompt only goes out after that turn has landed.
+    #[tokio::test]
+    async fn a_full_context_is_compacted_before_the_round_prompt() {
+        let mut f = compact_fixture(Some((90_000, 100_000))).await;
+
+        let sent = run_compaction(&mut f, compact_settings(80, None), "end_turn").await;
+
+        assert_eq!(sent.as_deref(), Some("/compact"));
+        let events = compact_events(&f.engine, f.task_id).await;
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["status"], "ok");
+        assert_eq!(events[0]["before_percent"], 90.0);
+        assert_eq!(events[0]["before_source"], "live");
+        assert_eq!(events[0]["command"], "/compact");
+        // The slot the canceller reaches through must not outlive the turn.
+        assert!(f.engine.compacting.lock().await.is_empty());
+    }
+
+    /// Below the threshold nothing is sent and nothing is written — the
+    /// ordinary case has to stay free of both an extra turn and timeline noise.
+    #[tokio::test]
+    async fn a_session_below_the_threshold_is_left_alone() {
+        let mut f = compact_fixture(Some((50_000, 100_000))).await;
+
+        let sent = run_compaction(&mut f, compact_settings(80, None), "end_turn").await;
+
+        assert_eq!(sent, None);
+        assert!(compact_events(&f.engine, f.task_id).await.is_empty());
+    }
+
+    /// The off switch. A full context with the setting at 0 is exactly today's
+    /// behaviour — no reading, no turn, no event.
+    #[tokio::test]
+    async fn a_zero_threshold_disables_the_check() {
+        let mut f = compact_fixture(Some((99_000, 100_000))).await;
+
+        let sent = run_compaction(&mut f, compact_settings(0, None), "end_turn").await;
+
+        assert_eq!(sent, None);
+        assert!(compact_events(&f.engine, f.task_id).await.is_empty());
+    }
+
+    /// The explicit setting is what gets sent, verbatim — it exists precisely
+    /// for the agents codeg has no default for.
+    #[tokio::test]
+    async fn the_configured_command_is_sent_verbatim() {
+        let mut f = compact_fixture(Some((90_000, 100_000))).await;
+
+        let sent =
+            run_compaction(&mut f, compact_settings(80, Some("/summarize")), "end_turn").await;
+
+        assert_eq!(sent.as_deref(), Some("/summarize"));
+    }
+
+    /// A session that reports no occupancy can't be measured against a
+    /// threshold. It must not be compacted on a guess — and the skip is
+    /// recorded, because with the setting switched on "nothing happened" needs
+    /// an explanation.
+    #[tokio::test]
+    async fn an_unmeasurable_session_is_not_compacted_but_is_recorded() {
+        let mut f = compact_fixture(None).await;
+
+        let sent = run_compaction(&mut f, compact_settings(80, None), "end_turn").await;
+
+        assert_eq!(sent, None);
+        let events = compact_events(&f.engine, f.task_id).await;
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["status"], "skipped");
+        assert_eq!(events[0]["reason"], "usage_unknown");
+    }
+
+    /// A cancel that lands while the compaction turn is in flight ends the
+    /// wait through the same `TurnComplete{cancelled}` the manager emits — the
+    /// launch must not sit on it, and the round is recorded as canceled rather
+    /// than compacted.
+    #[tokio::test]
+    async fn a_canceled_compaction_turn_releases_the_launch() {
+        let mut f = compact_fixture(Some((90_000, 100_000))).await;
+
+        let sent = run_compaction(&mut f, compact_settings(80, None), "cancelled").await;
+
+        assert_eq!(sent.as_deref(), Some("/compact"));
+        let events = compact_events(&f.engine, f.task_id).await;
+        assert_eq!(events[0]["status"], "canceled");
+        assert!(f.engine.compacting.lock().await.is_empty());
+    }
+
+    fn turn_complete_envelope(conn_id: &str, seq: u64, stop_reason: &str) -> EventEnvelope {
+        EventEnvelope {
+            seq,
+            connection_id: conn_id.to_string(),
+            payload: AcpEvent::TurnComplete {
+                session_id: "sess".to_string(),
+                stop_reason: stop_reason.to_string(),
+                agent_type: AgentType::ClaudeCode.to_string(),
+                mark_awaiting_reply: false,
+                termination_source: None,
+                provider_turn_id: None,
+            },
+        }
+    }
+
+    /// The race the `compaction_turns` marker exists for. The bus is a
+    /// broadcast: the launch's waiter reacts to the compaction's `TurnComplete`
+    /// at once, but the engine's own receiver awaits DB work per event and can
+    /// dequeue that same envelope only after the launch has indexed the
+    /// connection and sent the round's real prompt. Handled naively, the
+    /// compaction's completion would settle the round it preceded — and
+    /// disconnect the agent mid-work.
+    #[tokio::test]
+    async fn a_late_compaction_completion_does_not_settle_the_round() {
+        let mut f = compact_fixture(Some((90_000, 100_000))).await;
+        let sent = run_compaction(&mut f, compact_settings(80, None), "end_turn").await;
+        assert_eq!(sent.as_deref(), Some("/compact"));
+
+        // The launch goes on to bind the connection to the run and prompt it.
+        assert!(work_task_service::mark_running(
+            &f.engine.db.conn,
+            f.task_id,
+            f.run_seq,
+            f.conversation_id,
+            COMPACT_CONN,
+        )
+        .await
+        .expect("mark_running"));
+        f.engine
+            .index
+            .lock()
+            .await
+            .insert(COMPACT_CONN.into(), (f.task_id, f.run_seq));
+
+        // Only NOW does the engine's own loop get to the compaction's envelope
+        // (seq 1 — the one `run_compaction` published).
+        f.engine
+            .on_event(&turn_complete_envelope(COMPACT_CONN, 1, "end_turn"))
+            .await;
+
+        assert_eq!(
+            status_of(&f.engine, f.task_id).await,
+            WorkTaskStatus::Running,
+            "the compaction's completion must not settle the round it preceded"
+        );
+
+        // The other direction: the ROUND's own completion, a later seq on the
+        // same connection, still settles normally.
+        f.engine
+            .on_event(&turn_complete_envelope(COMPACT_CONN, 2, "end_turn"))
+            .await;
+        assert_eq!(
+            status_of(&f.engine, f.task_id).await,
+            WorkTaskStatus::Review
+        );
+    }
+
+    /// The fence covers everything up to its watermark — the wait can end
+    /// without ever reading the completion, and must still be able to fence one
+    /// it never saw — but nothing above it. A higher seq can only be the round's
+    /// own turn, so it passes AND retires the fence.
+    #[tokio::test]
+    async fn the_compaction_fence_stops_at_the_rounds_own_turn() {
+        let f = compact_fixture(Some((90_000, 100_000))).await;
+        f.engine.mark_compaction_turn(COMPACT_CONN, 4).await;
+
+        assert!(f.engine.claim_compaction_turn(COMPACT_CONN, 4).await);
+        assert!(
+            f.engine.claim_compaction_turn(COMPACT_CONN, 2).await,
+            "a completion emitted before the watermark is the launch's too"
+        );
+
+        assert!(!f.engine.claim_compaction_turn(COMPACT_CONN, 9).await);
+        assert!(
+            f.engine.compaction_turns.lock().await.is_empty(),
+            "the round's own turn retires the fence"
+        );
+        // Another connection's turns are never fenced by this one's mark.
+        f.engine.mark_compaction_turn(COMPACT_CONN, 4).await;
+        assert!(!f.engine.claim_compaction_turn("conn-other", 1).await);
+    }
+
+    /// Ending the wait on liveness rather than on the event itself is exactly
+    /// when the completion is most likely to still be sitting in the engine's
+    /// receiver: `apply_event` clears `turn_in_flight` BEFORE the envelope is
+    /// broadcast. The probe has to fence it on the way out, or the fix for the
+    /// settle race has a hole the size of the tick.
+    #[tokio::test]
+    async fn ending_the_wait_on_liveness_still_fences_the_completion() {
+        let f = compact_fixture(Some((90_000, 100_000))).await;
+        let state = f
+            .engine
+            .manager
+            .get_state(COMPACT_CONN)
+            .await
+            .expect("state");
+        {
+            let mut s = state.write().await;
+            s.turn_in_flight = false;
+            s.event_seq = 7;
+        }
+
+        let outcome = f
+            .engine
+            .compaction_still_running(COMPACT_CONN)
+            .await
+            .expect("the wait ends");
+        assert_eq!(outcome.status, "ok");
+        assert!(
+            f.engine.claim_compaction_turn(COMPACT_CONN, 7).await,
+            "a completion the wait never read must still be fenced"
+        );
+
+        // A connection that vanished cannot report a seq, so its whole id is
+        // fenced — ids are per-launch UUIDs, never reused.
+        let outcome = f
+            .engine
+            .compaction_still_running("conn-vanished")
+            .await
+            .expect("the wait ends");
+        assert_eq!(outcome.status, "failed");
+        assert!(f.engine.claim_compaction_turn("conn-vanished", 99).await);
+    }
+
+    /// The fence must not outlive the launch that set it. A generation torn
+    /// down before it ever went live (lost CAS, failed prompt, cancel) is
+    /// retired by `forget_connection`, not by `retire_connection`.
+    #[tokio::test]
+    async fn a_torn_down_launch_takes_its_fence_with_it() {
+        let f = compact_fixture(Some((90_000, 100_000))).await;
+        f.engine.mark_compaction_turn(COMPACT_CONN, 4).await;
+        f.engine
+            .index
+            .lock()
+            .await
+            .insert(COMPACT_CONN.into(), (f.task_id, f.run_seq));
+
+        f.engine.forget_connection(COMPACT_CONN).await;
+
+        assert!(f.engine.compaction_turns.lock().await.is_empty());
+        assert!(f.engine.index.lock().await.is_empty());
+    }
+
+    /// `apply_event` clears `turn_in_flight` on `TurnComplete` but not on a
+    /// terminal error or a disconnect — so a receiver that lagged one of those
+    /// away would block on `recv()` for a connection that is never going to
+    /// speak again, holding the task lock and taking any later cancel with it.
+    /// The liveness tick is what ends those waits.
+    #[tokio::test]
+    async fn a_wait_with_no_events_still_ends_on_liveness() {
+        let f = compact_fixture(Some((90_000, 100_000))).await;
+        // Paused only now, and never around DB work: the sqlite pool's acquire
+        // timeout runs on the same clock, so a test that freezes it before the
+        // fixture exists dies with `PoolTimedOut`. With the runtime otherwise
+        // idle, the tick's sleep auto-advances, so the wait costs no wall time.
+        tokio::time::pause();
+
+        // The connection is gone and no event is coming.
+        let mut rx = f.engine.bus.subscribe();
+        let outcome = f
+            .engine
+            .await_compaction_turn(&mut rx, "conn-never-registered")
+            .await;
+        assert_eq!(outcome.status, "failed");
+
+        // Alive, but the turn already ended and its event was missed.
+        let state = f
+            .engine
+            .manager
+            .get_state(COMPACT_CONN)
+            .await
+            .expect("state");
+        state.write().await.turn_in_flight = false;
+        let outcome = f.engine.await_compaction_turn(&mut rx, COMPACT_CONN).await;
+        assert_eq!(outcome.status, "ok");
+    }
+
+    /// The kill slot is generation-scoped like every other one on this engine:
+    /// a cancel of an older run must not abort the compaction of a newer one.
+    #[tokio::test]
+    async fn a_stale_cancel_does_not_abort_a_newer_compaction() {
+        let f = compact_fixture(Some((90_000, 100_000))).await;
+        f.engine.compacting.lock().await.insert(
+            f.task_id,
+            CompactRun {
+                run_seq: f.run_seq,
+                conn_id: COMPACT_CONN.to_string(),
+            },
+        );
+
+        f.engine
+            .release_compact_slot(f.task_id, f.run_seq - 1)
+            .await;
+        assert!(
+            f.engine.compacting.lock().await.contains_key(&f.task_id),
+            "an older generation must not release the live slot"
+        );
+
+        f.engine.release_compact_slot(f.task_id, f.run_seq).await;
+        assert!(f.engine.compacting.lock().await.is_empty());
     }
 }

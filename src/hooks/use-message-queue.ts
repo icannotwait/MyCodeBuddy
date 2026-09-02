@@ -7,9 +7,33 @@ import { randomUUID } from "@/lib/utils"
 export interface QueuedMessage {
   id: string
   draft: PromptDraft
+  /**
+   * The mode this message will be sent under. `null` means "leave the agent's
+   * mode alone" — an explicit choice for the answer / plan-notes retry paths,
+   * which must not switch mode on their way out.
+   *
+   * That is why {@link QueuedMessage.adoptSendTimeMode} exists as a separate
+   * flag rather than being spelled `modeId === null`: "unknown yet" and
+   * "deliberately none" are different intents.
+   */
   modeId: string | null
   /** Timeline bubble id retained while this item waits to dispatch. */
   optimisticTurnId?: string
+  /**
+   * Resolve the mode when this message actually SENDS, ignoring `modeId`.
+   *
+   * For messages queued before their tab could know its modes — a prompt parked
+   * on a brand-new draft by "ask about this selection", which is enqueued while
+   * the connection is still coming up. Without it the agent would run in
+   * whatever mode it happened to start in while the composer above displayed the
+   * user's saved mode.
+   */
+  adoptSendTimeMode?: boolean
+}
+
+interface QueueMessageOptions {
+  optimisticTurnId?: string
+  adoptSendTimeMode?: boolean
 }
 
 export interface UseMessageQueueReturn {
@@ -17,7 +41,7 @@ export interface UseMessageQueueReturn {
   enqueue: (
     draft: PromptDraft,
     modeId: string | null,
-    options?: { optimisticTurnId?: string }
+    options?: QueueMessageOptions
   ) => void
   /**
    * Put a draft back at the FRONT of the queue. Used when an auto-flushed item
@@ -27,7 +51,7 @@ export interface UseMessageQueueReturn {
   requeueFront: (
     draft: PromptDraft,
     modeId: string | null,
-    options?: { optimisticTurnId?: string }
+    options?: QueueMessageOptions
   ) => void
   dequeue: () => QueuedMessage | undefined
   remove: (id: string) => void
@@ -70,7 +94,7 @@ export function useMessageQueue(): UseMessageQueueReturn {
     (
       draft: PromptDraft,
       modeId: string | null,
-      options?: { optimisticTurnId?: string }
+      options?: QueueMessageOptions
     ) => {
       commit([
         ...queueRef.current,
@@ -79,6 +103,7 @@ export function useMessageQueue(): UseMessageQueueReturn {
           draft,
           modeId,
           optimisticTurnId: options?.optimisticTurnId,
+          ...(options?.adoptSendTimeMode ? { adoptSendTimeMode: true } : {}),
         },
       ])
     },
@@ -89,7 +114,7 @@ export function useMessageQueue(): UseMessageQueueReturn {
     (
       draft: PromptDraft,
       modeId: string | null,
-      options?: { optimisticTurnId?: string }
+      options?: QueueMessageOptions
     ) => {
       commit([
         {
@@ -97,6 +122,7 @@ export function useMessageQueue(): UseMessageQueueReturn {
           draft,
           modeId,
           optimisticTurnId: options?.optimisticTurnId,
+          ...(options?.adoptSendTimeMode ? { adoptSendTimeMode: true } : {}),
         },
         ...queueRef.current,
       ])

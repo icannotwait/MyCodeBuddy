@@ -31,8 +31,9 @@ import type {
 import { useAgentThinkingVisibility } from "@/hooks/use-acp-agents"
 import { isWindowedDetail } from "@/lib/turn-window"
 import { GrokConversationProvider } from "@/components/ai-elements/grok-session-image-context"
-import { ContentPartsRenderer } from "./content-parts-renderer"
+import { ContentPartsRendererOptionsProvider } from "./content-parts-renderer"
 import { LiveTranscriptRow } from "./live-transcript-row"
+import { CompletedTurnContent } from "./completed-turn-content"
 import { ContextCompactionCard } from "./context-compaction-card"
 import { CollapsibleUserMessage } from "./collapsible-user-message"
 import { CollapsibleSystemMessage } from "./collapsible-system-message"
@@ -61,7 +62,11 @@ import {
   normalizeToolName,
 } from "@/lib/tool-call-normalization"
 import { SessionViewerHost } from "@/components/message/session-viewer-host"
-import { isDelegateToAgentToolName } from "@/lib/delegation-card"
+import { parseResumeTaskId } from "@/lib/codeg-mcp-tool"
+import {
+  isDelegateToAgentToolName,
+  isRefusedResume,
+} from "@/lib/delegation-card"
 import type { DelegationCardSource } from "@/hooks/use-delegation-card-model"
 import { useDurableDelegationSources } from "@/hooks/use-durable-delegation-sources"
 import { mergeDelegationSourceLayers } from "@/lib/delegation-overlay-history"
@@ -179,6 +184,19 @@ interface MessageListViewProps {
    * copy alone. MUST be referentially stable.
    */
   onQuoteSelection?: (text: string) => void
+  /**
+   * Ask a question about a text selection made in this transcript: the host
+   * opens a new conversation on the same agent and sends the quoted selection
+   * followed by the question. Enables the "ask" entry on the selection bubble,
+   * on the same terms as `onQuoteSelection`. MUST be referentially stable.
+   */
+  onAskSelection?: (selection: string, question: string) => void
+  /**
+   * Keep a text selection from this transcript as a note next to it. Only the
+   * canvas has a board to put one on, so every other surface omits it and the
+   * action isn't offered. MUST be referentially stable.
+   */
+  onSaveNoteSelection?: (text: string) => void
 }
 
 export function canReloadSessionLoadError(
@@ -253,9 +271,14 @@ export type ThreadRenderItem =
       kind: "turn"
       group: ResolvedMessageGroup
       phase: "persisted" | "optimistic" | "streaming"
+      isResponseComplete: boolean
       showStats: boolean
       isRoleTransition: boolean
       previousUserIndex: number | null
+      /** The newest assistant reply in the thread. Together with the view's
+       *  `armed` flag this is what makes a run "the current round" — see the
+       *  fold state below. */
+      isLastAssistantRun: boolean
       /** Raw assistant sub-turn(s) that compose this reply — fed to the
        *  per-reply artifacts card so it can list files changed this reply. */
       sourceTurns: MessageTurn[]
@@ -277,6 +300,156 @@ export type ThreadRenderItem =
       kind: "compaction"
       meta: Record<string, unknown> | null
     }
+
+/**
+ * Fold state for a thread's assistant replies, owned by the view rather than by
+ * the turns themselves.
+ *
+ * - `armed` — the agent has started replying since the last send, so the newest
+ *   assistant run is "the current round" and shows expanded. Within an epoch it
+ *   only ever latches TRUE: a round must not fold itself up the moment it
+ *   finishes.
+ * - `roundOpen` — that round's toggle, so folding it by hand sticks through the
+ *   re-adaptations a reply goes through on its way into history.
+ * - `epoch` — bumped on every send. `CompletedTurnContent` stamps its manual
+ *   fold overrides with it, so one bump folds every reply above the new message
+ *   without having to walk the thread.
+ *
+ * Positional (the newest run) on purpose: a reply's identity changes twice on
+ * the way into history — the stream settling into a promoted local turn, then
+ * the authoritative detail refetch renaming it — so an id-keyed flag would drop
+ * the expansion mid-read, which is the "it folds itself up as soon as it
+ * finishes" behaviour this replaces.
+ */
+export interface ReplyFoldState {
+  signal: number
+  epoch: number
+  armed: boolean
+  /**
+   * Last observed running flag. A new round has to be detected as an EDGE, not
+   * a level: `armed` latches for the life of a round, so on its own it cannot
+   * see round two begin.
+   */
+  running: boolean
+  /**
+   * Id of the reply this round was armed on, so a rising `running` edge can be
+   * told apart from the SAME reply resuming. Only ever compared on that edge.
+   */
+  runId: string | null
+  roundOpen: boolean
+}
+
+/** One render's observation of the thread, fed to `advanceReplyFold`. */
+export interface ReplyFoldInput {
+  sendSignal: number
+  /** The newest assistant reply is still being written. */
+  running: boolean
+  /**
+   * Identity of the reply being written: the live message's id, or null when
+   * nothing is streaming locally (a passive viewer reading a round the backend
+   * flags in-flight, where every rising edge really is a new round).
+   *
+   * Deliberately NOT the render item's id. A render item is a presentation
+   * block: `mergeConsecutiveAssistantTurns` folds consecutive assistant runs
+   * into one and pins its id to the FIRST member, so a settled reply and a
+   * brand-new streaming one that merge behind it (background / loop turns,
+   * which arrive with no user turn between) would share an id and the new one
+   * would be mistaken for the old one resuming — arriving folded, with its live
+   * content hidden. The live message is the logical run, one per reply.
+   */
+  runId: string | null
+}
+
+/**
+ * Advance the fold state for one render, returning `prev` unchanged when
+ * nothing moved so the caller can apply it as a render-phase update.
+ *
+ * Exported for tests.
+ */
+export function advanceReplyFold(
+  prev: ReplyFoldState,
+  next: ReplyFoldInput
+): ReplyFoldState {
+  const { sendSignal, running, runId } = next
+  if (prev.signal !== sendSignal) {
+    return {
+      signal: sendSignal,
+      epoch: prev.epoch + 1,
+      // Normally false — the previous reply has settled, so the thread folds
+      // shut behind the new message. True only for steering, where the send
+      // lands mid-reply and the reply being written is at once the new round.
+      armed: running,
+      running,
+      runId,
+      roundOpen: true,
+    }
+  }
+  if (running && !prev.running) {
+    // Same reply resuming rather than a new one. The runtime completes a live
+    // reply prematurely and then re-bridges the SAME `liveMessage` while it is
+    // still streaming (see "drops the promoted snapshot when the same
+    // liveMessage is still streaming" in `conversation-runtime-context.test`),
+    // which reaches here as running true → false → true for ONE reply. Treating
+    // that as a new round would fold history the reader had opened and re-open
+    // a reply they had folded by hand. A genuinely new reply carries a
+    // different live-message id — see `ReplyFoldInput.runId` for why this must
+    // be the live message rather than the render item.
+    if (runId !== null && runId === prev.runId) {
+      return { ...prev, running: true }
+    }
+    // A reply just STARTED: it is the new round — armed, expanded, and folding
+    // whatever sat open above it, exactly as a send does.
+    //
+    // Keyed off this edge rather than off `sendSignal` alone because not every
+    // host has a send: `live-transcript-view` mounts this component for a
+    // work-task transcript that the engine drives through many rounds
+    // (work / retry / return / merge — that is what its `userTurnHeader`
+    // labels) without a single local send. There, a `sendSignal` that never
+    // moves would leave every finished round expanded, and a round the reader
+    // folded by hand would hand its `roundOpen: false` straight to the next
+    // one, so a live reply would arrive already collapsed.
+    return {
+      ...prev,
+      epoch: prev.epoch + 1,
+      armed: true,
+      running: true,
+      runId,
+      roundOpen: true,
+    }
+  }
+  if (running && prev.running && runId !== prev.runId) {
+    // The identity moved while ONE reply kept running, so this is a
+    // re-identification, never a new round — a new round dips `running` first,
+    // because the previous reply has to settle before the next can start.
+    // Two ways it happens, and both must leave the round alone:
+    //   - it arrived late: a viewer attaching mid-turn sees the reply through
+    //     the backend's in-flight marker first and bridges the live stream a
+    //     beat later, so the round starts anonymous;
+    //   - it was rebased: `STATUS_CHANGED(prompting)` mints a client-side
+    //     `randomUUID` live message, and a reconnect that hydrates from a
+    //     snapshot swaps it wholesale for the backend's (see the SNAPSHOT case
+    //     in `acp-connections-context`), mid-reply.
+    // Latching is not optional: without it a later re-bridge has nothing to
+    // recognise the reply by and would read as new, folding history the reader
+    // opened and re-opening a reply they folded by hand.
+    //
+    // Known gap, deliberately left: `(running, runId)` cannot see a round
+    // boundary the client never observed. Fold a reply by hand, disconnect,
+    // let it finish and a SECOND client start the next one, then reconnect
+    // straight onto that snapshot, and the change reads as a rebase — so the
+    // new reply inherits the fold and arrives collapsed under a "working"
+    // header (one click away, and self-correcting at the next boundary).
+    // Closing it needs an explicit turn-boundary signal plumbed out of the
+    // connection layer; not worth that for a disclosure widget's default.
+    return { ...prev, runId }
+  }
+  if (!running && prev.running) {
+    // The round settled. Only `running` moves — `armed` and `roundOpen` must
+    // survive, or the reply would fold itself up the moment it finishes.
+    return { ...prev, running: false }
+  }
+  return prev
+}
 
 // Module-scope so the reference is stable across renders — lets the memoized
 // VirtualizedMessageThread bail out when `items` is unchanged.
@@ -306,21 +479,35 @@ export function singletonSourceTurns(turn: MessageTurn): MessageTurn[] {
   return cached
 }
 
-// Collect the `delegate_to_agent` tool calls within a turn's adapted parts,
-// recursing through tool-groups and goal-runs (a delegate call is normally a
-// standalone part — `isAgentLikeToolName` keeps it out of tool-groups — but we
-// scan nested containers defensively so a delegation is never missed).
+// Collect the sub-agent delegations within a turn's adapted parts, recursing
+// through tool-groups and goal-runs (both kinds are normally standalone parts —
+// `isAgentLikeToolName` keeps them out of tool-groups — but we scan nested
+// containers defensively so a delegation is never missed).
+//
+// Two kinds qualify:
+//   - `delegate_to_agent`, which STARTED a sub-agent, keyed by its own
+//     tool_use_id;
+//   - `resume_delegation`, which brought an interrupted one BACK. Its own
+//     tool_call_id is not a binding key (the broker re-binds the child to the
+//     original delegate call, usually in an earlier turn), so it is keyed by
+//     the task id in its arguments — `taskIdHint`, exactly as
+//     `ResumedDelegationCard` does. Without this arm a resumed sub-agent would
+//     be missing from the overlay while it runs, because the reply that
+//     resumed it contains no `delegate_to_agent` call at all.
+//
+// `seenTaskIds` de-dupes repeated resumes of one task inside a single reply
+// (the second is refused, but the overlay renders a row per source regardless).
 function collectDelegationSources(
   parts: readonly AdaptedContentPart[],
   out: DelegationCardSource[],
-  parentConversationId: number
+  parentConversationId: number | null | undefined,
+  seenTaskIds: Set<string>
 ): void {
   for (const part of parts) {
     if (part.type === "tool-call") {
-      if (
-        part.toolCallId &&
-        isDelegateToAgentToolName(normalizeToolName(part.toolName))
-      ) {
+      if (!part.toolCallId) continue
+      const name = normalizeToolName(part.toolName)
+      if (isDelegateToAgentToolName(name)) {
         out.push({
           parentToolUseId: part.toolCallId,
           parentConversationId,
@@ -330,15 +517,65 @@ function collectDelegationSources(
           state: part.state,
           meta: part.meta ?? null,
         })
+      } else if (name === "resume_delegation") {
+        // A refusal names the task's agent and child but revived nothing —
+        // listing it would put a sub-agent in the overlay that is not running
+        // on this turn's behalf. Same judgement as `ResumedDelegationCard`,
+        // which falls back to the plain tool card here.
+        if (isRefusedResume(part.output ?? null, part.errorText ?? null)) {
+          continue
+        }
+        const taskId = parseResumeTaskId(part.input ?? null)
+        // No task id ⇒ nothing to resolve the sub-agent by; a duplicate ⇒
+        // already listed.
+        if (!taskId || seenTaskIds.has(taskId)) continue
+        seenTaskIds.add(taskId)
+        out.push({
+          parentToolUseId: part.toolCallId,
+          parentConversationId,
+          taskIdHint: taskId,
+          // Deliberately not the resume's `{task_id, reason}` arguments —
+          // `parseInput` looks for `task`/`agent_type`/`working_dir` and would
+          // only warn about an unrecognized shape. See `ResumedDelegationCard`.
+          input: null,
+          output: part.output ?? null,
+          errorText: part.errorText ?? null,
+          state: part.state,
+          meta: part.meta ?? null,
+        })
       }
     } else if (part.type === "delegation-work-unit") {
-      collectDelegationSources(part.sources, out, parentConversationId)
+      collectDelegationSources(
+        part.sources,
+        out,
+        parentConversationId,
+        seenTaskIds
+      )
     } else if (part.type === "tool-group") {
-      collectDelegationSources(part.items, out, parentConversationId)
+      collectDelegationSources(
+        part.items,
+        out,
+        parentConversationId,
+        seenTaskIds
+      )
     } else if (part.type === "goal-run") {
-      collectDelegationSources(part.items, out, parentConversationId)
+      collectDelegationSources(
+        part.items,
+        out,
+        parentConversationId,
+        seenTaskIds
+      )
     }
   }
+}
+
+export function extractDelegationSources(
+  parts: readonly AdaptedContentPart[],
+  parentConversationId?: number | null
+): DelegationCardSource[] {
+  const out: DelegationCardSource[] = []
+  collectDelegationSources(parts, out, parentConversationId, new Set())
+  return out
 }
 
 export function extractTextFromParts(parts: AdaptedContentPart[]): string {
@@ -407,6 +644,7 @@ function shouldFlushAutonomousAssistantRun(
 export interface MergedAssistantRunCacheEntry {
   memberGroups: ResolvedMessageGroup[]
   memberKeys: string[]
+  memberCompletion: boolean[]
   item: AssistantTurnItem
 }
 export type MergedAssistantRunCache = WeakMap<
@@ -480,7 +718,8 @@ export function mergeConsecutiveAssistantTurns(
     for (let i = 0; i < buffer.length; i++) {
       if (
         buffer[i].group !== cached.memberGroups[i] ||
-        buffer[i].key !== cached.memberKeys[i]
+        buffer[i].key !== cached.memberKeys[i] ||
+        buffer[i].isResponseComplete !== cached.memberCompletion[i]
       ) {
         return false
       }
@@ -603,6 +842,7 @@ export function mergeConsecutiveAssistantTurns(
       const merged: AssistantTurnItem = {
         ...last,
         key: `merged-${first.key}`,
+        isResponseComplete: buffer.every((it) => it.isResponseComplete),
         // Concatenate every sub-turn's raw turns so the artifacts card sees all
         // file edits across the merged reply, not just the last sub-turn.
         sourceTurns: buffer.flatMap((b) => b.sourceTurns),
@@ -640,6 +880,7 @@ export function mergeConsecutiveAssistantTurns(
       mergeCache?.set(first.group, {
         memberGroups: buffer.map((it) => it.group),
         memberKeys: buffer.map((it) => it.key),
+        memberCompletion: buffer.map((it) => it.isResponseComplete),
         item: merged,
       })
     }
@@ -758,6 +999,10 @@ const HistoricalMessageGroup = memo(function HistoricalMessageGroup({
   renderKind = "historicalRow",
   showThinking = true,
   agentType,
+  currentRound = false,
+  roundOpen = true,
+  onRoundOpenChange,
+  foldEpoch = 0,
 }: {
   group: ResolvedMessageGroup
   parentConversationId?: number | null
@@ -769,6 +1014,10 @@ const HistoricalMessageGroup = memo(function HistoricalMessageGroup({
   renderKind?: "historicalRow" | "liveRow"
   showThinking?: boolean
   agentType: AgentType
+  currentRound?: boolean
+  roundOpen?: boolean
+  onRoundOpenChange?: (open: boolean) => void
+  foldEpoch?: number
 }) {
   streamingPerfRecorder.countRender(renderKind)
   const t = useTranslations("Folder.chat.messageList")
@@ -816,17 +1065,27 @@ const HistoricalMessageGroup = memo(function HistoricalMessageGroup({
             </div>
           ) : (
             <MessageContent>
-              <ContentPartsRenderer
-                parts={group.parts}
-                role={group.role}
-                parentConversationId={parentConversationId}
-                autolinkLocalPathParts={
-                  isResponseComplete ? group.autolinkableTextParts : undefined
-                }
-                grokSessionImageTextParts={group.grokSessionImageTextParts}
-                showThinking={showThinking}
-                grokSessionImagePhase={grokSessionImagePhase}
-              />
+              <ContentPartsRendererOptionsProvider
+                value={{
+                  parentConversationId,
+                  autolinkLocalPathParts: isResponseComplete
+                    ? group.autolinkableTextParts
+                    : undefined,
+                  grokSessionImageTextParts: group.grokSessionImageTextParts,
+                  showThinking,
+                  grokSessionImagePhase,
+                }}
+              >
+                <CompletedTurnContent
+                  parts={group.parts}
+                  durationMs={group.duration_ms}
+                  completed={isResponseComplete}
+                  currentRound={currentRound}
+                  roundOpen={roundOpen}
+                  onRoundOpenChange={onRoundOpenChange}
+                  foldEpoch={foldEpoch}
+                />
+              </ContentPartsRendererOptionsProvider>
             </MessageContent>
           )}
           {group.role === "user" && group.resources.length > 0 ? (
@@ -1265,6 +1524,8 @@ export function MessageListView({
   onOpenRootConversation,
   userTurnHeader = null,
   onQuoteSelection,
+  onAskSelection,
+  onSaveNoteSelection,
 }: MessageListViewProps) {
   const isWaitingForSubagents =
     waitingForSubagentsArmedAtMs != null &&
@@ -1479,7 +1740,7 @@ export function MessageListView({
     () => new WeakMap()
   )
 
-  const adaptedThread = useMemo(() => {
+  const threadState = useMemo(() => {
     const allTurns = timelineTurns.map((item) => item.turn)
     const streamingIndices = new Set<number>()
     const inProgressToolCallIdsByIndex = new Map<number, Set<string>>()
@@ -1567,9 +1828,17 @@ export function MessageListView({
         kind: "turn" as const,
         group,
         phase,
+        // Persisted does not always mean completed: a passive viewer reads
+        // transcript blocks the agent is still writing. The store flags exactly
+        // those DB records (`isInFlightRound`); reading the raw
+        // `in_flight_user_turn_id` here instead would also catch locally
+        // promoted — i.e. finished — replies, which the marker outlives.
+        isResponseComplete:
+          phase === "persisted" && !timelineTurns[i].isInFlightRound,
         showStats: false,
         isRoleTransition: false,
         previousUserIndex: null,
+        isLastAssistantRun: false,
         sourceTurns: singletonSourceTurns(allTurns[i]),
       }
     })
@@ -1582,6 +1851,7 @@ export function MessageListView({
     // previousUserIndex points at the closest preceding user turn (used by the
     // post-stream stats row's "jump to previous user message" button).
     let lastUserIdx: number | null = null
+    let lastAssistantItem: AssistantTurnItem | null = null
     for (let idx = 0; idx < items.length; idx++) {
       const item = items[idx]
       if (item.kind !== "turn") continue
@@ -1591,6 +1861,7 @@ export function MessageListView({
       item.showStats = false
       item.isRoleTransition = false
       item.previousUserIndex = null
+      item.isLastAssistantRun = false
 
       // isRoleTransition: role differs from previous turn item
       if (idx > 0) {
@@ -1606,12 +1877,18 @@ export function MessageListView({
 
       // showStats: only on the last assistant turn before a non-assistant or end
       if (item.group.role === "assistant") {
+        lastAssistantItem = item
         const next = items[idx + 1]
         if (!next || next.kind !== "turn" || next.group.role !== "assistant") {
           item.showStats = true
           item.previousUserIndex = lastUserIdx
         }
       }
+    }
+    let lastAssistantRunning = false
+    if (lastAssistantItem) {
+      lastAssistantItem.isLastAssistantRun = true
+      lastAssistantRunning = !lastAssistantItem.isResponseComplete
     }
 
     // Pending typing is a footer concern under incremental live (outside
@@ -1630,6 +1907,10 @@ export function MessageListView({
       nonStreamingAdapted: nonStreaming,
       delegationIdentityIndex: projected.identityIndex,
       delegationRunRecords: projected.runRecords,
+      // "The agent is replying right now." True for the local stream and for a
+      // passive viewer reading a round the backend still flags in-flight, and
+      // false the instant the reply settles — see `ReplyFoldState`.
+      lastAssistantRunning,
     }
   }, [
     adapterText,
@@ -1647,7 +1928,8 @@ export function MessageListView({
     nonStreamingAdapted,
     delegationIdentityIndex,
     delegationRunRecords,
-  } = adaptedThread
+    lastAssistantRunning,
+  } = threadState
 
   const lastTimelinePhase =
     timelineTurns[timelineTurns.length - 1]?.phase ?? null
@@ -1678,6 +1960,28 @@ export function MessageListView({
     delegationRunRecords,
     delegationIdentityIndex,
   ])
+  // See `ReplyFoldState`. Derived during render rather than in an effect so a
+  // send and the fold it causes land in the same commit — an effect would paint
+  // one frame of the previous reply still expanded under the new message.
+  const [storedFold, setFold] = useState<ReplyFoldState>(() => ({
+    signal: sendSignal,
+    epoch: 0,
+    armed: false,
+    running: false,
+    runId: null,
+    roundOpen: true,
+  }))
+  const fold = advanceReplyFold(storedFold, {
+    sendSignal,
+    running: lastAssistantRunning,
+    runId: liveMessage?.id ?? null,
+  })
+  if (fold !== storedFold) setFold(fold)
+  const handleRoundOpenChange = useCallback((open: boolean) => {
+    setFold((prev) =>
+      prev.roundOpen === open ? prev : { ...prev, roundOpen: open }
+    )
+  }, [])
 
   const historicalPlanEntries = useMemo(
     () => extractLatestPlanEntriesFromMessages(nonStreamingAdapted),
@@ -1714,13 +2018,17 @@ export function MessageListView({
                 dimmed={item.phase === "optimistic"}
                 showStats={item.showStats}
                 previousUserIndex={item.previousUserIndex}
-                isResponseComplete={item.phase === "persisted"}
+                isResponseComplete={item.isResponseComplete}
                 sourceTurns={item.sourceTurns}
                 renderKind={
                   item.phase === "streaming" ? "liveRow" : "historicalRow"
                 }
                 showThinking={showThinking}
                 agentType={agentType}
+                currentRound={item.isLastAssistantRun && fold.armed}
+                roundOpen={fold.roundOpen}
+                onRoundOpenChange={handleRoundOpenChange}
+                foldEpoch={fold.epoch}
               />
             </div>
           )
@@ -1738,7 +2046,16 @@ export function MessageListView({
           return null
       }
     },
-    [showThinking, durableConversationId, userTurnHeader, agentType]
+    [
+      showThinking,
+      durableConversationId,
+      userTurnHeader,
+      agentType,
+      fold.armed,
+      fold.roundOpen,
+      fold.epoch,
+      handleRoundOpenChange,
+    ]
   )
 
   const emptyState = useMemo(
@@ -1771,7 +2088,9 @@ export function MessageListView({
     const out: DelegationCardSource[] = []
     for (const item of threadItems) {
       if (item.kind === "turn" && item.group.role === "assistant") {
-        collectDelegationSources(item.group.parts, out, durableConversationId)
+        out.push(
+          ...extractDelegationSources(item.group.parts, durableConversationId)
+        )
       }
     }
     return out.length > 0 ? out : EMPTY_DELEGATIONS
@@ -2193,6 +2512,8 @@ export function MessageListView({
           <SelectionActionBubble
             containerRef={selectionBoxRef}
             onQuote={onQuoteSelection}
+            onAsk={onAskSelection}
+            onSaveAsNote={onSaveNoteSelection}
           />
         </div>
       </SessionViewerHost>

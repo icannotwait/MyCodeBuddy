@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod automation;
 pub mod background;
+pub mod canvas;
 pub mod chat_channel;
 pub mod conversation;
 pub mod delegate_access;
@@ -19,6 +20,7 @@ pub use automation::{
     AutomationAction, AutomationConfig, AutomationDraft, AutomationInfo, AutomationRunInfo,
     AutomationRunStatus, IsolationMode, TriggerKind,
 };
+pub use canvas::{CanvasMutation, CanvasNode, CanvasSnapshot};
 #[allow(unused_imports)]
 pub use chat_channel::{ChannelStatusInfo, ChatChannelInfo, ChatChannelMessageLogInfo};
 pub use conversation::{
@@ -30,8 +32,8 @@ pub use conversation::{
 };
 pub use delegate_access::{DelegateAccessMode, DelegateAccessReason, DelegateAccessState};
 pub use folder::{
-    FolderCommandInfo, FolderDetail, FolderHistoryEntry, OpenedTab, OpenedTabsSnapshot,
-    SaveTabsOutcome,
+    FolderCommandInfo, FolderDetail, FolderGroupDetail, FolderHistoryEntry, OpenedTab,
+    OpenedTabsSnapshot, SaveTabsOutcome, SidebarEntryKind, SidebarLayoutEntry,
 };
 pub use message::{
     AgentExecutionStats, AgentToolCall, ContentBlock, ImageData, MessageRole, MessageTurn,
@@ -39,7 +41,9 @@ pub use message::{
     TurnUsage, UnifiedMessage,
 };
 pub use quick_message::QuickMessageInfo;
-pub use remote_workspace_connection::RemoteWorkspaceConnectionInfo;
+pub use remote_workspace_connection::{
+    RemoteWorkspaceConnectionInfo, RemoteWorkspaceHeader, ToHeaderMap,
+};
 pub use system::{
     AvailableTerminalShells, GitCredentials, GitDetectResult, GitHubAccount,
     GitHubAccountsSettings, GitHubTokenValidation, GitSettings, SystemLanguageSettings,

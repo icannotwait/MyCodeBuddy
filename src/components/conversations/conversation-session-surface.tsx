@@ -3,7 +3,14 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { useTranslations } from "next-intl"
 import { toast } from "sonner"
-import { AlertCircle, Loader2, Plus, RefreshCw } from "lucide-react"
+import {
+  AlertCircle,
+  Check,
+  Copy,
+  Loader2,
+  Plus,
+  RefreshCw,
+} from "lucide-react"
 import {
   buildUserTurnFromMessageBlocks,
   getCachedSelectors,
@@ -15,7 +22,14 @@ import { useAcpAgents } from "@/hooks/use-acp-agents"
 import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
 import { useTabActions, useTabStore } from "@/contexts/tab-context"
 import { isReparentUnmount } from "@/stores/tab-store"
-import { randomUUID } from "@/lib/utils"
+import { copyTextToClipboard, randomUUID } from "@/lib/utils"
+import { buildAskPrompt } from "@/lib/message-quote"
+import {
+  ASK_SELECTION_PARKED_EVENT,
+  consumeAskSelectionPrompts,
+  parkAskSelectionPrompt,
+  type AskSelectionParkedDetail,
+} from "@/lib/ask-selection-handoff"
 import { useConnectionLifecycle } from "@/hooks/use-connection-lifecycle"
 import { useMessageQueue, type QueuedMessage } from "@/hooks/use-message-queue"
 import { MessageListView } from "@/components/message/message-list-view"
@@ -28,6 +42,7 @@ import { useInitialHistoryScrollEligibility } from "@/components/message/initial
 import { ConversationShell } from "@/components/chat/conversation-shell"
 import { DelegateAccessStatus } from "@/components/chat/delegate-access-status"
 import { SessionConfigStaleBanner } from "@/components/chat/session-config-stale-banner"
+import { PiProjectTrustBanner } from "@/components/chat/pi-project-trust-banner"
 import { ToolWatchdogBanner } from "@/components/conversations/tool-watchdog-banner"
 import { DelegationRouteNotice } from "@/components/chat/delegation-route-notice"
 import { BackgroundTasksChip } from "@/components/chat/background-tasks-chip"
@@ -366,10 +381,10 @@ export const ConversationSessionSurface = memo(
     const ownTab = useTabStore(
       (s) => s.tabs.find((tab) => tab.id === tabId) ?? null
     )
-    // Prefer explicit props.folderId so detached pages do not depend on tab-store
-    // row lookup for session identity. Fall back to the tab row when present.
+    // The tab row is authoritative after an async draft retarget. Detached
+    // surfaces may not have one, so retain the explicit prop as their fallback.
     const ownFolderId =
-      folderIdProp > 0 ? folderIdProp : (ownTab?.folderId ?? null)
+      ownTab?.folderId ?? (folderIdProp > 0 ? folderIdProp : null)
     const folder = useAppWorkspaceStore((s) =>
       ownFolderId != null
         ? (s.allFolders.find((f) => f.id === ownFolderId) ?? null)
@@ -883,13 +898,15 @@ export const ConversationSessionSurface = memo(
     // No-op for normal conversations, whose connected cwd always equals intended.
     // A connection still bound to a different agent is never "ready" for the
     // selected one — it would otherwise let a send reach the previous agent.
-    const connectionReady =
-      !connIsForOtherAgent &&
-      isConnectionReady(
-        connStatus,
-        conn.connectedWorkingDir,
-        workingDirForConnection
-      )
+    const connectionReady = isConnectionReady(
+      connStatus,
+      conn.connectedWorkingDir,
+      workingDirForConnection,
+      conn.agentType,
+      selectedAgent
+    )
+    const connectionReadyRef = useRef(connectionReady)
+    connectionReadyRef.current = connectionReady
     const promptAdmissionReady =
       connectionReady ||
       (conn.sharedSession != null &&
@@ -1046,7 +1063,7 @@ export const ConversationSessionSurface = memo(
 
     useEffect(() => {
       if (conn.sharedSession) return
-      if (connStatus !== "connected") return
+      if (!connectionReady) return
       // Do not dequeue / auto-flush while a durable continuation owns this
       // conversation — waiting is independent of status/turn_in_flight.
       if (conn.waitingForSubagents) return
@@ -1055,25 +1072,13 @@ export const ConversationSessionSurface = memo(
       // Terminal disconnect pause: never auto-drain historical queue items until
       // the user explicitly resumes. Reconnect alone keeps the pause.
       if (queuePausedByTerminalDisconnect) return
-      // Don't flush onto a connection whose cwd doesn't match the tab's intended
-      // working dir. This matters for a just-bound chat conversation: bind switches
-      // the tab's workingDir from the draft's previous folder to the scratch dir,
-      // and for one render `connStatus` can still read the stale "connected" of the
-      // old-folder session before the reconnect lands. Flushing then would deliver
-      // the queued prompt to the wrong folder's agent. (No-op for normal
-      // conversations, whose connection cwd always equals the intended one.)
-      if (
-        (conn.connectedWorkingDir ?? null) !== (workingDirForConnection ?? null)
-      ) {
-        return
-      }
       if (runtimeSyncState === "awaiting_persist") return
       if (msgQueue.length === 0) return
       // setTimeout (not microtask) so a COMPLETE_TURN commit settles first AND so
       // a just-bounced retry waits out the backoff window before re-sending.
       const wait = flushRetryDelayMs(Date.now(), lastFlushBounceAtRef.current)
       const timer = setTimeout(() => {
-        if (connStatusRef.current !== "connected") return
+        if (!connectionReadyRef.current) return
         // Re-check waiting inside the timer: Connected-before-waiting-event race.
         if (waitingForSubagentsRef.current) return
         // Re-check access lock inside the timer (relock can land after schedule).
@@ -1092,11 +1097,9 @@ export const ConversationSessionSurface = memo(
       }, wait)
       return () => clearTimeout(timer)
     }, [
-      connStatus,
+      connectionReady,
       runtimeSyncState,
       msgQueue.length,
-      conn.connectedWorkingDir,
-      workingDirForConnection,
       conn.waitingForSubagents,
       interactionLocked,
       queuePausedByTerminalDisconnect,
@@ -2288,6 +2291,60 @@ export const ConversationSessionSurface = memo(
       setQuickActionInject(null)
     }, [])
 
+    const askFolderId = folder?.id ?? null
+    const canAskSelection =
+      askFolderId != null && workingDirForConnection != null
+    const handleAskSelection = useCallback(
+      (selected: string, question: string) => {
+        if (askFolderId == null || workingDirForConnection == null) return
+        const target = openNewConversationTab(
+          askFolderId,
+          workingDirForConnection,
+          {
+            ...(groupId ? { targetGroup: groupId } : {}),
+            forceAgent: selectedAgent,
+          }
+        )
+        parkAskSelectionPrompt(target.tabId, {
+          prompt: buildAskPrompt(selected, question),
+          agentType: target.agentType,
+          folderId: target.folderId,
+        })
+      },
+      [
+        askFolderId,
+        groupId,
+        openNewConversationTab,
+        selectedAgent,
+        workingDirForConnection,
+      ]
+    )
+
+    useEffect(() => {
+      const drain = () => {
+        const prompts = consumeAskSelectionPrompts(tabId, {
+          agentType: selectedAgent,
+          folderId,
+        })
+        for (const text of prompts) {
+          mqEnqueue(
+            { blocks: [{ type: "text", text }], displayText: text },
+            null,
+            { adoptSendTimeMode: true }
+          )
+        }
+      }
+      drain()
+      const onParked = (event: Event) => {
+        const detail = (event as CustomEvent<AskSelectionParkedDetail>).detail
+        if (detail?.tabId !== tabId) return
+        drain()
+      }
+      window.addEventListener(ASK_SELECTION_PARKED_EVENT, onParked)
+      return () =>
+        window.removeEventListener(ASK_SELECTION_PARKED_EVENT, onParked)
+    }, [folderId, mqEnqueue, selectedAgent, tabId])
+
     const canShowDetailErrorActions =
       hasPersistedConversation && dbConversationId != null && !!folder
     const handleReloadDetail = useCallback(() => {
@@ -2371,19 +2428,54 @@ export const ConversationSessionSurface = memo(
       )
     }, [delegatedOpenIntent, effectiveConversationId, setLiveOwnsActiveTurn])
 
+    const recoveryCommand = conn.loadErrorCommand
+    const [commandCopied, setCommandCopied] = useState(false)
+    const copiedResetRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+    useEffect(
+      () => () => {
+        if (copiedResetRef.current) clearTimeout(copiedResetRef.current)
+      },
+      []
+    )
+    const handleCopyRecoveryCommand = useCallback(async () => {
+      if (!recoveryCommand) return
+      const ok = await copyTextToClipboard(recoveryCommand)
+      if (!ok) return
+      setCommandCopied(true)
+      if (copiedResetRef.current) clearTimeout(copiedResetRef.current)
+      copiedResetRef.current = setTimeout(() => setCommandCopied(false), 1500)
+    }, [recoveryCommand])
+
     const acpLoadErrorBanner =
       hasPersistedConversation && acpLoadError ? (
         <div
           role="alert"
-          className="flex w-full items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive"
+          className="flex w-full flex-wrap items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive"
         >
           <AlertCircle aria-hidden="true" className="h-4 w-4 shrink-0" />
           <span
-            className="min-w-0 flex-1 overflow-hidden text-ellipsis whitespace-nowrap"
+            className="min-w-40 flex-1 overflow-hidden text-ellipsis whitespace-nowrap"
             title={acpLoadError}
           >
             {acpLoadError}
           </span>
+          {recoveryCommand && (
+            <button
+              type="button"
+              onClick={handleCopyRecoveryCommand}
+              title={recoveryCommand}
+              className="flex shrink-0 items-center gap-1 rounded border border-destructive/40 px-2 py-0.5 font-medium transition-colors hover:bg-destructive/10"
+            >
+              {commandCopied ? (
+                <Check aria-hidden="true" className="h-3 w-3" />
+              ) : (
+                <Copy aria-hidden="true" className="h-3 w-3" />
+              )}
+              {commandCopied
+                ? tMessageList("errorActionCommandCopied")
+                : tMessageList("errorActionCopyCommand")}
+            </button>
+          )}
           {canShowDetailErrorActions && (
             <>
               <button
@@ -2505,6 +2597,7 @@ export const ConversationSessionSurface = memo(
           waitingForSubagentsArmedAtMs={waitingForSubagentsArmedAtMs}
           onResumeRoot={handleResumeRoot}
           onOpenRootConversation={handleOpenRootConversation}
+          onAskSelection={canAskSelection ? handleAskSelection : undefined}
         />
       </GoalControlProvider>
     )
@@ -2548,6 +2641,11 @@ export const ConversationSessionSurface = memo(
         topBanner={
           <>
             <SessionConfigStaleBanner contextKey={tabId} />
+            <PiProjectTrustBanner
+              contextKey={tabId}
+              agentType={selectedAgent}
+              workingDir={workingDirForConnection}
+            />
             <ToolWatchdogBanner contextKey={tabId} />
             <BackgroundTasksChip contextKey={tabId} />
             {isDelegateConversation ? (

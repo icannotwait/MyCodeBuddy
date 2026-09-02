@@ -22,15 +22,18 @@ const h = vi.hoisted(() => ({
   handler: null as null | ((change: unknown) => void),
   folderHandler: null as null | ((change: unknown) => void),
   bulkHandler: null as null | ((change: unknown) => void),
+  groupHandler: null as null | ((change: unknown) => void),
   reconnect: null as null | (() => void),
   folderReconnect: null as null | (() => void),
   disposeSpy: vi.fn(),
   folderDisposeSpy: vi.fn(),
   bulkDisposeSpy: vi.fn(),
+  groupDisposeSpy: vi.fn(),
   reconnectUnsubSpy: vi.fn(),
   folderReconnectUnsubSpy: vi.fn(),
   listAll: vi.fn(async () => [] as unknown[]),
   listOpenFolders: vi.fn(async () => [] as unknown[]),
+  listFolderGroups: vi.fn(async () => [] as unknown[]),
   listAllFolders: vi.fn(async () => [] as unknown[]),
   openFolderById: vi.fn(async (folderId: number) => ({
     id: folderId,
@@ -78,15 +81,21 @@ vi.mock("@/lib/delegation-child-projection-cache", () => ({
 }))
 
 vi.mock("@/lib/platform", () => ({
-  // The provider registers three subscriptions — `conversation://changed`,
-  // `conversations://bulk-changed`, and `folder://changed` — so route by exact
-  // channel and capture each handler / dispose spy independently; the
-  // conversation-sync tests keep asserting against `h.handler`/`h.disposeSpy`
-  // unchanged.
+  // The provider registers four subscriptions — `conversation://changed`,
+  // `conversations://bulk-changed`, `folder://changed` and
+  // `folder-group://changed` — so route by exact channel and capture each
+  // handler / dispose spy independently; the conversation-sync tests keep
+  // asserting against `h.handler`/`h.disposeSpy` unchanged. Routing every
+  // unmatched channel to `h.handler` would silently hand the newest
+  // subscription the conversation tests' handler slot.
   subscribe: vi.fn(async (event: string, handler: (c: unknown) => void) => {
     if (event === "folder://changed") {
       h.folderHandler = handler
       return h.folderDisposeSpy
+    }
+    if (event === "folder-group://changed") {
+      h.groupHandler = handler
+      return h.groupDisposeSpy
     }
     if (event === "conversations://bulk-changed") {
       h.bulkHandler = handler
@@ -113,12 +122,17 @@ vi.mock("@/lib/api", () => ({
   listAllConversations: h.listAll,
   listAllFolderDetails: h.listAllFolders,
   listOpenFolderDetails: h.listOpenFolders,
+  listFolderGroups: h.listFolderGroups,
   getGitBranch: vi.fn(async () => null),
   getGitHead: h.getGitHead,
   openFolder: vi.fn(),
   openFolderById: h.openFolderById,
   removeFolderFromWorkspace: vi.fn(),
-  reorderFolders: vi.fn(),
+  applySidebarLayout: vi.fn(),
+  createFolderGroup: vi.fn(),
+  updateFolderGroup: vi.fn(),
+  deleteFolderGroup: vi.fn(),
+  setFolderGroup: vi.fn(),
   getFolder: vi.fn(),
 }))
 
@@ -183,6 +197,7 @@ function makeFolder(
     parent_id: null,
     kind: "regular",
     alias: null,
+    group_id: null,
     ...overrides,
   }
 }
@@ -250,6 +265,7 @@ beforeEach(() => {
   h.disposeSpy.mockClear()
   h.folderDisposeSpy.mockClear()
   h.bulkDisposeSpy.mockClear()
+  h.groupDisposeSpy.mockClear()
   h.reconnectUnsubSpy.mockClear()
   h.folderReconnectUnsubSpy.mockClear()
   h.listAll.mockClear()

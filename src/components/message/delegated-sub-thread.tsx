@@ -14,7 +14,8 @@
  *
  * All agent-type / task / status / child-id / projection resolution lives in
  * `useDelegationCardModel` (shared with the top-right `SubAgentOverlay`), so the
- * card and the overlay never disagree about a sub-agent.
+ * card and the overlay never disagree about a sub-agent; the row itself is
+ * `DelegationCardRow`, shared with `ResumedDelegationCard`.
  */
 
 import { useCallback, useState } from "react"

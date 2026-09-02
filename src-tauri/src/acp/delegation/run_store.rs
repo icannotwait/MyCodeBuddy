@@ -3914,6 +3914,258 @@ impl RunStore {
         Ok(())
     }
 
+    /// Reopen an interrupted run under its existing task identity before the
+    /// resumed prompt is sent. The ownership and status predicates are part of
+    /// the write so completed, failed, historical, or foreign rows can never be
+    /// reopened by a stale broker pre-read.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn resume_interrupted(
+        &self,
+        task_id: &str,
+        parent_conversation_id: i32,
+        child_conversation_id: i32,
+        expected_status: DelegationRunStatus,
+        expected_child_connection_id: Option<&str>,
+        child_connection_id: &str,
+        resumed_at: DateTime<Utc>,
+    ) -> Result<bool, TaskStoreError> {
+        if !matches!(
+            expected_status,
+            DelegationRunStatus::Canceled | DelegationRunStatus::Running
+        ) {
+            return Ok(false);
+        }
+        let mutation_guard = self.orchestration_binding_snapshots.mutation_guard().await;
+        let task_id = task_id.to_string();
+        let expected_child_connection_id = expected_child_connection_id.map(str::to_string);
+        let child_connection_id = child_connection_id.to_string();
+        let outcome = self
+            .db
+            .conn
+            .transaction::<_, (bool, WorkflowTxnSideEffect), TaskStoreError>(|txn| {
+                let task_id = task_id.clone();
+                let expected_status = expected_status.clone();
+                let expected_child_connection_id = expected_child_connection_id.clone();
+                let child_connection_id = child_connection_id.clone();
+                Box::pin(async move {
+                    let Some(row) = DelegationTaskRun::find_by_id(&task_id)
+                        .one(txn)
+                        .await
+                        .map_err(map_db_err)?
+                    else {
+                        return Ok((false, WorkflowTxnSideEffect::None));
+                    };
+                    if row.parent_conversation_id != parent_conversation_id
+                        || row.child_conversation_id != child_conversation_id
+                        || row.history_only
+                        || row.status != expected_status
+                        || row.child_connection_id != expected_child_connection_id
+                    {
+                        return Ok((false, WorkflowTxnSideEffect::None));
+                    }
+
+                    let now = Utc::now();
+                    let update = DelegationTaskRun::update_many()
+                        .col_expr(
+                            delegation_task_run::Column::Status,
+                            Expr::value(DelegationRunStatus::Running),
+                        )
+                        .col_expr(
+                            delegation_task_run::Column::ErrorCode,
+                            Expr::value(Option::<String>::None),
+                        )
+                        .col_expr(
+                            delegation_task_run::Column::TerminationAuditJson,
+                            Expr::value(Option::<String>::None),
+                        )
+                        .col_expr(
+                            delegation_task_run::Column::StartedAt,
+                            Expr::value(resumed_at),
+                        )
+                        .col_expr(
+                            delegation_task_run::Column::ReachedRunningAt,
+                            Expr::value(resumed_at),
+                        )
+                        .col_expr(
+                            delegation_task_run::Column::FinishedAt,
+                            Expr::value(Option::<DateTime<Utc>>::None),
+                        )
+                        .col_expr(
+                            delegation_task_run::Column::ToolCallCount,
+                            Expr::value(Option::<i64>::None),
+                        )
+                        .col_expr(
+                            delegation_task_run::Column::EditToolCallCount,
+                            Expr::value(Option::<i64>::None),
+                        )
+                        .col_expr(
+                            delegation_task_run::Column::TouchedFilesJson,
+                            Expr::value(Option::<String>::None),
+                        )
+                        .col_expr(
+                            delegation_task_run::Column::TouchedFilesTruncated,
+                            Expr::value(Option::<bool>::None),
+                        )
+                        .col_expr(
+                            delegation_task_run::Column::Additions,
+                            Expr::value(Option::<i64>::None),
+                        )
+                        .col_expr(
+                            delegation_task_run::Column::Deletions,
+                            Expr::value(Option::<i64>::None),
+                        )
+                        .col_expr(
+                            delegation_task_run::Column::LineCountsComplete,
+                            Expr::value(Option::<bool>::None),
+                        )
+                        .col_expr(
+                            delegation_task_run::Column::CardSummaryJson,
+                            Expr::value(Option::<String>::None),
+                        )
+                        .col_expr(
+                            delegation_task_run::Column::ChildTurnAnchor,
+                            Expr::value(Option::<String>::None),
+                        )
+                        .col_expr(
+                            delegation_task_run::Column::ChildConnectionId,
+                            Expr::value(child_connection_id),
+                        )
+                        .col_expr(
+                            delegation_task_run::Column::CompletionState,
+                            Expr::value(Option::<String>::None),
+                        )
+                        .col_expr(
+                            delegation_task_run::Column::CompletionOutcome,
+                            Expr::value(Option::<String>::None),
+                        )
+                        .col_expr(
+                            delegation_task_run::Column::CompletionEvidenceJson,
+                            Expr::value(Option::<String>::None),
+                        )
+                        .col_expr(
+                            delegation_task_run::Column::FinalRemediationContextsJson,
+                            Expr::value(Option::<String>::None),
+                        )
+                        .col_expr(delegation_task_run::Column::UpdatedAt, Expr::value(now))
+                        .filter(delegation_task_run::Column::TaskId.eq(&task_id))
+                        .filter(
+                            delegation_task_run::Column::ParentConversationId
+                                .eq(parent_conversation_id),
+                        )
+                        .filter(
+                            delegation_task_run::Column::ChildConversationId
+                                .eq(child_conversation_id),
+                        )
+                        .filter(delegation_task_run::Column::HistoryOnly.eq(false))
+                        .filter(delegation_task_run::Column::Status.eq(expected_status));
+                    let update = match expected_child_connection_id {
+                        Some(expected) => update
+                            .filter(delegation_task_run::Column::ChildConnectionId.eq(expected)),
+                        None => {
+                            update.filter(delegation_task_run::Column::ChildConnectionId.is_null())
+                        }
+                    };
+                    let result = update.exec(txn).await.map_err(map_db_err)?;
+                    if result.rows_affected != 1 {
+                        return Ok((false, WorkflowTxnSideEffect::None));
+                    }
+
+                    let projected =
+                        conversation::Entity::update_many()
+                            .col_expr(
+                                conversation::Column::DelegationRunGeneration,
+                                Expr::value(row.generation),
+                            )
+                            .col_expr(
+                                conversation::Column::DelegationTaskStatus,
+                                Expr::value(DelegationTaskStatus::Running),
+                            )
+                            .col_expr(
+                                conversation::Column::DelegationErrorCode,
+                                Expr::value(Option::<String>::None),
+                            )
+                            .col_expr(
+                                conversation::Column::DelegationStartedAt,
+                                Expr::value(resumed_at),
+                            )
+                            .col_expr(
+                                conversation::Column::DelegationFinishedAt,
+                                Expr::value(Option::<DateTime<Utc>>::None),
+                            )
+                            .col_expr(
+                                conversation::Column::DelegationToolCallCount,
+                                Expr::value(Option::<i64>::None),
+                            )
+                            .col_expr(
+                                conversation::Column::DelegationEditToolCallCount,
+                                Expr::value(Option::<i64>::None),
+                            )
+                            .col_expr(
+                                conversation::Column::DelegationTouchedFilesJson,
+                                Expr::value(Option::<String>::None),
+                            )
+                            .col_expr(
+                                conversation::Column::DelegationTouchedFilesTruncated,
+                                Expr::value(Option::<bool>::None),
+                            )
+                            .col_expr(
+                                conversation::Column::DelegationAdditions,
+                                Expr::value(Option::<i64>::None),
+                            )
+                            .col_expr(
+                                conversation::Column::DelegationDeletions,
+                                Expr::value(Option::<i64>::None),
+                            )
+                            .col_expr(
+                                conversation::Column::DelegationLineCountsComplete,
+                                Expr::value(Option::<bool>::None),
+                            )
+                            .col_expr(
+                                conversation::Column::LastTerminationAuditJson,
+                                Expr::value(Option::<String>::None),
+                            )
+                            .col_expr(
+                                conversation::Column::Status,
+                                Expr::value(ConversationStatus::InProgress),
+                            )
+                            .col_expr(conversation::Column::UpdatedAt, Expr::value(now))
+                            .filter(conversation::Column::Id.eq(child_conversation_id))
+                            .filter(conversation::Column::ParentId.eq(parent_conversation_id))
+                            .filter(conversation::Column::DelegationCallId.eq(&task_id))
+                            .filter(conversation::Column::DelegationRunGeneration.is_null().or(
+                                conversation::Column::DelegationRunGeneration.lte(row.generation),
+                            ))
+                            .exec(txn)
+                            .await
+                            .map_err(map_db_err)?;
+                    if projected.rows_affected != 1 {
+                        return Err(TaskStoreError::Permanent(format!(
+                            "resume_interrupted: child projection rejected task {task_id}"
+                        )));
+                    }
+
+                    let effect =
+                        on_mapped_run_transition_txn(txn, &task_id, parent_conversation_id).await?;
+                    Ok((true, effect))
+                })
+            })
+            .await;
+
+        match outcome {
+            Ok((resumed, effect)) => {
+                if resumed {
+                    self.emit_workflow_effect(&effect);
+                    self.orchestration_binding_snapshots
+                        .record_parent_mutation(&mutation_guard, parent_conversation_id)
+                        .await;
+                }
+                Ok(resumed)
+            }
+            Err(sea_orm::TransactionError::Connection(err)) => Err(map_db_err(err)),
+            Err(sea_orm::TransactionError::Transaction(err)) => Err(err),
+        }
+    }
+
     /// Pre-admission `spawn_failed` settle with **atomic ownership CAS**.
     ///
     /// The terminal write is filtered in the same transaction as:

@@ -1,4 +1,13 @@
+import { readFileSync } from "node:fs"
+import { resolve } from "node:path"
 import { createTranslator } from "next-intl"
+import {
+  isObjectLiteralExpression,
+  isPropertyAssignment,
+  isStringLiteral,
+  parseJsonText,
+  type Node,
+} from "typescript"
 import { describe, expect, it } from "vitest"
 
 import ar from "./messages/ar.json"
@@ -28,10 +37,54 @@ function collectKeys(node: MessageNode, prefix = ""): string[] {
 
 const reference = new Set(collectKeys(en as MessageNode))
 const locales = [ar, de, en, es, fr, ja, ko, pt, zhCN, zhTW] as const
+const localeFiles = [
+  "ar.json",
+  "de.json",
+  "en.json",
+  "es.json",
+  "fr.json",
+  "ja.json",
+  "ko.json",
+  "pt.json",
+  "zh-CN.json",
+  "zh-TW.json",
+] as const
+
+function collectDuplicateKeys(filename: string): string[] {
+  const text = readFileSync(resolve("src/i18n/messages", filename), "utf8")
+  const source = parseJsonText(filename, text)
+  const duplicates: string[] = []
+
+  function visit(node: Node, path: string) {
+    if (!isObjectLiteralExpression(node)) {
+      node.forEachChild((child) => visit(child, path))
+      return
+    }
+
+    const seen = new Set<string>()
+    for (const property of node.properties) {
+      if (!isPropertyAssignment(property) || !isStringLiteral(property.name)) {
+        continue
+      }
+      const key = property.name.text
+      const nextPath = path ? `${path}.${key}` : key
+      if (seen.has(key)) duplicates.push(nextPath)
+      seen.add(key)
+      visit(property.initializer, nextPath)
+    }
+  }
+
+  source.forEachChild((node) => visit(node, ""))
+  return duplicates
+}
 
 // `en.json` is the source of truth. Any missing key in another locale fails
 // the test with the exact dotted path, making translation gaps grep-able.
 describe("i18n locale key parity vs en.json", () => {
+  it.each(localeFiles)("%s has no duplicate message keys", (filename) => {
+    expect(collectDuplicateKeys(filename)).toEqual([])
+  })
+
   it.each([
     ["ar", ar],
     ["de", de],

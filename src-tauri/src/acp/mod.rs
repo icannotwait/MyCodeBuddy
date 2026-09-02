@@ -1,3 +1,5 @@
+pub mod agent_mentions;
+pub mod antigravity_login;
 pub mod autonomous_activity;
 pub mod background_watch;
 pub mod binary_cache;

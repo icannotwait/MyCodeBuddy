@@ -64,8 +64,6 @@ export function TurnStats({
 }: TurnStatsProps) {
   const locale = useLocale()
   const t = useTranslations("Folder.chat.messageList")
-  // Reuse the live timer's elapsed-unit strings so the per-turn duration
-  // tooltip renders the exact same localized "Xh Ym Zs" format.
   const tLive = useTranslations("Folder.chat.liveTurnStats")
   const tTasks = useTranslations("Tasks")
   const scroll = useMessageScroll()
@@ -116,6 +114,9 @@ export function TurnStats({
   const hasModel = displayModels.length > 0
   const hasEffort = displayEfforts.length > 0
   const hasUsage = Boolean(usage)
+  // The duration itself is shown by the reply's fold header
+  // (`CompletedTurnContent`), not here — this row only uses it as a signal that
+  // the turn was substantial.
   const hasDuration = typeof duration_ms === "number" && duration_ms > 0
   const hasGeneration =
     agentType != null &&
@@ -133,7 +134,7 @@ export function TurnStats({
       : null
   const hasCompletedAt = Boolean(completedLabel)
   // Usage OR duration: some agents (Cursor) never report per-turn token
-  // usage, but a turn with a duration chip is still a substantial reply
+  // usage, but a turn that took real time is still a substantial reply
   // worth jumping back from.
   const hasJump =
     isResponseComplete &&

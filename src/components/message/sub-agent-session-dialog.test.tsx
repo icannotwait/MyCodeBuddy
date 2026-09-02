@@ -4,7 +4,10 @@ import { beforeEach, describe, expect, it, vi } from "vitest"
 
 import { SubAgentSessionDialog } from "./sub-agent-session-dialog"
 import enMessages from "@/i18n/messages/en.json"
-import type { ConnectionState } from "@/contexts/acp-connections-context"
+import type {
+  ConnectionLiveSinks,
+  ConnectionState,
+} from "@/contexts/acp-connections-context"
 
 // Runtime context — record dispatch calls so we can assert the bridge
 // runs at the right moments without booting the real reducer.
@@ -22,6 +25,7 @@ const mockAnswerQuestion = vi.fn()
 // assert both that the backfill is kicked off and that it's cancelled on close.
 const mockSyncCancel = vi.fn()
 const mockSyncTurnMetadata = vi.fn(() => mockSyncCancel)
+const mockRuntimeLiveMessages = new Map<number, unknown>()
 
 vi.mock("@/stores/conversation-runtime-store", async () => {
   const actual = await vi.importActual<
@@ -53,11 +57,22 @@ vi.mock("@/stores/conversation-runtime-store", async () => {
     // + MessageListView); the timeline read flows through `selectTimelineTurns`.
     // Route both back to the same spies the old `getSession`/`getTimelineTurns`
     // mock drove.
-    useConversationRuntimeStore: (selector: (s: unknown) => unknown) =>
-      selector({
-        byConversationId: { get: (id: number) => mockGetSession(id) },
-        conversationIdByExternalId: { get: () => undefined },
-      }),
+    useConversationRuntimeStore: Object.assign(
+      (selector: (s: unknown) => unknown) =>
+        selector({
+          byConversationId: { get: (id: number) => mockGetSession(id) },
+          conversationIdByExternalId: { get: () => undefined },
+        }),
+      {
+        getState: () => ({
+          byConversationId: {
+            get: (id: number) => ({
+              liveMessage: mockRuntimeLiveMessages.get(id),
+            }),
+          },
+        }),
+      }
+    ),
     selectTimelineTurns: () => mockGetTimelineTurns(),
   }
 })
@@ -66,8 +81,66 @@ vi.mock("@/stores/conversation-runtime-store", async () => {
 // by the bridge. Mutating `mockChildConnection` + calling `notifyStore()`
 // simulates a STATE update from the connections reducer.
 let mockChildConnection: ConnectionState | undefined = undefined
+let previousMockChildConnection: ConnectionState | undefined = undefined
 let storeCallbacks: Array<() => void> = []
+let liveSinks: ConnectionLiveSinks | null = null
+let liveSinksConnectionId: string | null = null
+
+function registerMockLiveSinks(
+  connectionId: string,
+  sinks: ConnectionLiveSinks
+) {
+  liveSinks = sinks
+  liveSinksConnectionId = connectionId
+  const conn = mockChildConnection
+  const runtimeId = sinks.runtimeConversationId
+  const settledReplayAccepted =
+    conn?.liveMessage != null &&
+    conn.acceptedCompletionMessageId === conn.liveMessage.id &&
+    runtimeId != null &&
+    (conn.acceptedCompletionRuntimeConversationIds ?? []).includes(runtimeId)
+  if (
+    conn?.connectionId === connectionId &&
+    conn.liveMessage != null &&
+    (conn.status === "prompting" || settledReplayAccepted)
+  ) {
+    const accepted = sinks.canonical(conn.liveMessage, true) !== false
+    if (accepted && settledReplayAccepted) {
+      mockCompleteTurn(runtimeId, conn.liveMessage)
+    }
+  }
+  previousMockChildConnection = conn
+  return () => {
+    if (liveSinks === sinks) {
+      liveSinks = null
+      liveSinksConnectionId = null
+    }
+  }
+}
+
 function notifyStore() {
+  const conn = mockChildConnection
+  const runtimeId = liveSinks?.runtimeConversationId
+  const completed =
+    previousMockChildConnection?.status === "prompting" &&
+    conn?.status !== "prompting"
+  if (
+    conn?.connectionId === liveSinksConnectionId &&
+    conn.liveMessage != null &&
+    liveSinks != null &&
+    completed
+  ) {
+    const accepted = liveSinks.canonical(conn.liveMessage, false) !== false
+    if (accepted && runtimeId != null) {
+      mockCompleteTurn(runtimeId, conn.liveMessage)
+      mockChildConnection = {
+        ...conn,
+        acceptedCompletionMessageId: conn.liveMessage.id,
+        acceptedCompletionRuntimeConversationIds: [runtimeId],
+      }
+    }
+  }
+  previousMockChildConnection = mockChildConnection
   for (const cb of storeCallbacks) cb()
 }
 
@@ -89,6 +162,7 @@ vi.mock("@/contexts/acp-connections-context", async () => {
       subscribeActiveKey: () => () => {},
     }),
     useAcpActions: () => ({
+      registerLiveSinks: registerMockLiveSinks,
       respondPermission: mockRespondPermission,
       answerQuestion: mockAnswerQuestion,
     }),
@@ -204,6 +278,8 @@ function makeConnState(overrides: Partial<ConnectionState>): ConnectionState {
     availableCommands: null,
     usage: null,
     liveMessage: null,
+    acceptedCompletionMessageId: null,
+    acceptedCompletionRuntimeConversationIds: null,
     pendingPermission: null,
     pendingQuestion: null,
     pendingAskQuestion: null,
@@ -212,6 +288,7 @@ function makeConnState(overrides: Partial<ConnectionState>): ConnectionState {
     sessionFailures: [],
     error: null,
     loadError: null,
+    loadErrorCommand: null,
     lastAppliedSeq: 0,
     isDelegationChild: true,
     parentToolUseId: "pt-1",
@@ -230,6 +307,10 @@ function makeConnState(overrides: Partial<ConnectionState>): ConnectionState {
 describe("SubAgentSessionDialog", () => {
   beforeEach(() => {
     mockSetLiveMessage.mockReset()
+    mockRuntimeLiveMessages.clear()
+    mockSetLiveMessage.mockImplementation((id, message) => {
+      mockRuntimeLiveMessages.set(id, message)
+    })
     mockCompleteTurn.mockReset()
     mockRemoveConversation.mockReset()
     mockFetchDetail.mockReset()
@@ -243,7 +324,10 @@ describe("SubAgentSessionDialog", () => {
     mockSyncTurnMetadata.mockClear()
     mockSyncTurnMetadata.mockReturnValue(mockSyncCancel)
     mockChildConnection = undefined
+    previousMockChildConnection = undefined
     storeCallbacks = []
+    liveSinks = null
+    liveSinksConnectionId = null
     mockDetailState = {
       detail: null,
       loading: false,
@@ -433,7 +517,12 @@ describe("SubAgentSessionDialog", () => {
     )
     // First mount forwards the current liveMessage with isLive=true so the
     // SET_LIVE_MESSAGE guard at acp-connections doesn't reject an active stream.
-    expect(mockSetLiveMessage).toHaveBeenCalledWith(99, liveMessage, true)
+    expect(mockSetLiveMessage).toHaveBeenCalledWith(
+      99,
+      liveMessage,
+      true,
+      undefined
+    )
 
     // Closing the dialog (body unmount) must wipe the entire runtime session
     // so a later reopen starts from a fresh fetchDetail — otherwise a
@@ -505,7 +594,12 @@ describe("SubAgentSessionDialog", () => {
     expect(mockRefetchDetail).toHaveBeenCalledWith(99, { preserveLive: true })
     // The live stream is still bridged for display, with isLive=true so the
     // SET_LIVE_MESSAGE guard accepts the active stream.
-    expect(mockSetLiveMessage).toHaveBeenCalledWith(99, liveMessage, true)
+    expect(mockSetLiveMessage).toHaveBeenCalledWith(
+      99,
+      liveMessage,
+      true,
+      undefined
+    )
   })
 
   it("does not refetch on the streaming → settled edge — the promoted local reply is kept, never replaced from the lagging DB", () => {
@@ -583,7 +677,12 @@ describe("SubAgentSessionDialog", () => {
     // (connected) but the connection still carries the final liveMessage for
     // its post-completion grace window. There is no streaming→settled edge to
     // promote it, and the persisted transcript may still lag.
-    mockChildConnection = makeConnState({ status: "connected", liveMessage })
+    mockChildConnection = makeConnState({
+      status: "connected",
+      liveMessage,
+      acceptedCompletionMessageId: liveMessage.id,
+      acceptedCompletionRuntimeConversationIds: [99],
+    })
     renderWithIntl(
       <SubAgentSessionDialog
         open
@@ -596,7 +695,12 @@ describe("SubAgentSessionDialog", () => {
     // The retained reply is bridged as live (bypassing the reconnect-replay
     // guard, since a one-shot child's liveMessage is unambiguously its reply)
     // and promoted to a completed local turn so it survives the DB lag.
-    expect(mockSetLiveMessage).toHaveBeenCalledWith(99, liveMessage, true)
+    expect(mockSetLiveMessage).toHaveBeenCalledWith(
+      99,
+      liveMessage,
+      true,
+      undefined
+    )
     expect(mockCompleteTurn).toHaveBeenCalledWith(99, liveMessage)
   })
 
@@ -657,7 +761,12 @@ describe("SubAgentSessionDialog", () => {
       startedAt: Date.now(),
     }
     // Reopened onto an already-settled child still holding its final reply.
-    mockChildConnection = makeConnState({ status: "connected", liveMessage })
+    mockChildConnection = makeConnState({
+      status: "connected",
+      liveMessage,
+      acceptedCompletionMessageId: liveMessage.id,
+      acceptedCompletionRuntimeConversationIds: [99],
+    })
     renderWithIntl(
       <SubAgentSessionDialog
         open

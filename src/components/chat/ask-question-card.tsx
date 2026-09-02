@@ -580,7 +580,7 @@ function GenericAskQuestionCard({
       <span className="flex flex-wrap items-center gap-1.5 text-sm font-medium">
         {text}
         {recommended && (
-          <Badge variant="secondary" className="text-[10px]">
+          <Badge variant="secondary" className="text-3xs">
             {t("recommended")}
           </Badge>
         )}
@@ -719,7 +719,7 @@ function GenericAskQuestionCard({
 
   const questionHeading = (q: QuestionSpec) => (
     <div className="flex items-center gap-2">
-      <Badge variant="outline" className="shrink-0 text-[10px]">
+      <Badge variant="outline" className="shrink-0 text-3xs">
         {q.multi_select ? t("multiSelect") : t("singleSelect")}
       </Badge>
       <p className="text-sm text-foreground/90">{q.question}</p>
@@ -798,7 +798,7 @@ function GenericAskQuestionCard({
                     {done ? (
                       <Check className="size-3.5 shrink-0 text-primary" />
                     ) : (
-                      <span className="flex size-4 shrink-0 items-center justify-center rounded-full border border-current text-[10px] leading-none">
+                      <span className="flex size-4 shrink-0 items-center justify-center rounded-full border border-current text-3xs leading-none">
                         {i + 1}
                       </span>
                     )}

@@ -168,7 +168,7 @@ pub struct WorkTaskConfig {
     pub label_snapshot: Option<serde_json::Value>,
     /// What the task's original work order produces. `Some("report")` marks a
     /// task whose first turn delivers findings in the reply rather than code
-    /// changes (forge "investigate" / "plan first" / "review only" scenarios);
+    /// changes (forge "plan first" / "review only" scenarios);
     /// the engine swaps the worktree guard's commit licence to match. `None`
     /// or an unrecognized value reads as a normal change-producing task — a
     /// config written by a newer build must still launch here.
@@ -231,6 +231,21 @@ pub struct WorkTaskFolderSettings {
     /// starts (deps install, env seeding). Not re-run on reused worktrees.
     #[serde(default)]
     pub init_command: Option<String>,
+    /// Context-window occupancy (percent, 0–100) at or above which a launch
+    /// that RESUMES the task's session compacts before it prompts: the engine
+    /// sends [`Self::compact_command`], waits for that turn to finish, and only
+    /// then sends the round's own message. `0` (the default) disables the whole
+    /// check — nothing is measured and no extra turn is ever sent.
+    ///
+    /// Only resumed launches (retry / follow-up / merge) are eligible: a fresh
+    /// session starts empty, so there is nothing to compact.
+    #[serde(default)]
+    pub auto_compact_percent: i32,
+    /// The command sent to compact, verbatim (e.g. `/compact`). Blank/`None`
+    /// resolves per agent — see `work_task::compact::resolve_compact_command`
+    /// — which is why this is an override rather than a required setting.
+    #[serde(default)]
+    pub compact_command: Option<String>,
     /// User-authored instructions appended *after* the built-in prompt of a
     /// launch stage — project conventions or personal preferences the standard
     /// wording can't cover. Keys are the stage identifiers the engine already
@@ -257,6 +272,8 @@ impl Default for WorkTaskFolderSettings {
             preflight_command_id: None,
             preflight_command: None,
             init_command: None,
+            auto_compact_percent: 0,
+            compact_command: None,
             stage_prompts: Default::default(),
         }
     }
@@ -386,6 +403,12 @@ pub struct WorkTaskMergeState {
     /// The agent writes the commit message itself (`message` is empty then).
     #[serde(default)]
     pub auto_message: bool,
+    /// Land only: free-form instructions the user typed for THIS landing (how
+    /// to resolve conflicts, what else to touch on the way). Persisted with the
+    /// rest of the dispatch so a merge generation relaunched from this row is
+    /// told the same thing the first one was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
     /// Delivery only: the branch name pushed to the source repository.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_branch: Option<String>,
@@ -414,6 +437,11 @@ pub struct WorkTaskQueuedMerge {
     pub message: Option<String>,
     #[serde(default)]
     pub delete_worktree: bool,
+    /// Extra instructions for the merge agent, kept with the parked intent so a
+    /// merge that waited its turn lands under the same directions the user gave
+    /// when they queued it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
     /// When the task took its place in line — the pump's ordering key, kept
     /// across a re-queue so changing the options doesn't jump the line.
     pub queued_at: DateTime<Utc>,

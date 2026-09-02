@@ -650,6 +650,7 @@ async fn async_main() -> ExitCode {
         state.connection_manager.clone_ref(),
         state.emitter.clone(),
         state.acp_event_bus.clone(),
+        state.internal_sessions.clone(),
         state.data_dir.clone(),
     ) {
         tokio::spawn(codeg_lib::work_task::run_task_engine(engine));

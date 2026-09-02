@@ -40,6 +40,8 @@ import {
   moveMessageInputDraft,
   sweepOrphanDraftKeys,
 } from "@/lib/message-input-draft"
+import { discardAskSelectionPrompts } from "@/lib/ask-selection-handoff"
+import { pushClosedTab, snapshotConversationTab } from "@/lib/closed-tab-stack"
 import type {
   AgentType,
   ConversationChange,
@@ -127,6 +129,24 @@ interface DraftRetargetRequest {
   workingDir: string
   agentType: AgentType
   provisional: boolean
+}
+
+/**
+ * What a "new conversation" open resolved to: the draft tab that ended up
+ * serving the request — the freshly created one, or the target group's existing
+ * draft it reused — and the identity that tab will be carrying once the open has
+ * fully settled.
+ *
+ * `agentType`/`folderId` are a PROMISE, not necessarily the tab's state right
+ * now: reusing a draft that belongs to another folder or agent retargets it
+ * asynchronously (see `consumeDraftRetargets`), so the tab only takes on this
+ * identity after its stale ACP session has been torn down. Callers that hand
+ * work to the tab must gate on it rather than acting the moment they get the id.
+ */
+export interface OpenedDraftTarget {
+  tabId: string
+  agentType: AgentType
+  folderId: number
 }
 
 /** i18n strings the store needs for seed titles, injected from `TabProvider`
@@ -226,10 +246,16 @@ export interface TabStoreState {
     pin?: boolean,
     title?: string
   ) => Promise<boolean>
-  closeTab: (tabId: string) => void
   detachTab: (tabId: string) => DetachTabResult
   restoreDetachedTab: (token: DetachRestoreToken) => void
   flushOpenedTabsSave: () => Promise<{ accepted: boolean; version: number }>
+  /**
+   * `recordForReopen: false` closes without offering the tab to
+   * `reopen_last_closed_tab`. Pass it whenever the tab is going away because
+   * its conversation no longer exists — resurrecting it would mint a tab (and
+   * an `opened_tabs` row) pointing at a deleted conversation.
+   */
+  closeTab: (tabId: string, options?: { recordForReopen?: boolean }) => void
   closeConversationTab: (
     folderId: number,
     conversationId: number,
@@ -274,9 +300,18 @@ export interface TabStoreState {
       folderDefaultAgent?: AgentType | null
       folderRecentAgent?: AgentType | null
       targetGroup?: string
+      /** Pin the draft to this agent, outranking BOTH the folder default and
+       *  the inherit/fallback chain. For callers that must reproduce a specific
+       *  agent (e.g. "ask about this selection" continues the conversation the
+       *  text came from), not merely suggest one. */
+      forceAgent?: AgentType
     }
-  ) => void
-  openChatModeTab: (options?: { targetGroup?: string }) => void
+  ) => OpenedDraftTarget
+  openChatModeTab: (options?: {
+    targetGroup?: string
+    /** See `openNewConversationTab`'s `forceAgent`. */
+    forceAgent?: AgentType
+  }) => OpenedDraftTarget
   setChatDraftWorkingDir: (tabId: string, workingDir: string) => void
   confirmDraftAgent: (tabId: string, agentType: AgentType) => void
   setDraftAgentFromFallback: (tabId: string, agentType: AgentType) => void
@@ -1447,13 +1482,16 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
     return true
   },
 
-  closeTab: (tabId) => {
+  closeTab: (tabId, options) => {
     const shouldActivateConversation = tabId === get().activeTabId
 
     const prevState = get()
     const index = prevState.rawTabs.findIndex((t) => t.id === tabId)
     if (index >= 0) {
       const closingTab = prevState.rawTabs[index]
+      if (options?.recordForReopen !== false) {
+        pushClosedTab(snapshotConversationTab(closingTab))
+      }
       const next = prevState.rawTabs.filter((t) => t.id !== tabId)
       const leftFolderId = isDraftLeaveFromFolder(closingTab)
 
@@ -1477,6 +1515,11 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
         closingTab.conversationId == null
           ? buildNewConversationDraftStorageKey(closingTab.id)
           : null
+      // An "ask about this selection" prompt parked for this tab has no panel
+      // left to drain it. Drop it rather than leave it in the module buffer for
+      // the rest of the session — the tab id is never reused, so it could only
+      // sit there.
+      discardAskSelectionPrompts(closingTab.id)
 
       let draftKeyHandedOver = false
 
@@ -1674,7 +1717,9 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
         tab.agentType === agentType
     )
     if (!target) return
-    get().closeTab(target.id)
+    // Every caller reaches here right after `deleteConversation` — the row is
+    // gone, so the tab must not be offered back by "reopen closed tab".
+    get().closeTab(target.id, { recordForReopen: false })
   },
 
   closeOtherTabs: (tabId) => {
@@ -1702,6 +1747,7 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
     const keepIds = new Set(keep.map((tab) => tab.id))
     for (const tab of prevState.rawTabs) {
       if (keepIds.has(tab.id)) continue
+      pushClosedTab(snapshotConversationTab(tab))
       const left = isDraftLeaveFromFolder(tab)
       if (left != null) leftFolderIds.add(left)
     }
@@ -1722,6 +1768,9 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
       if (prevState.rawTabs.length === 0 && prevState.activeTabId == null) {
         return
       }
+      for (const tab of prevState.rawTabs) {
+        pushClosedTab(snapshotConversationTab(tab))
+      }
       set({ rawTabs: [], activeTabId: null })
       recomputeTabs()
       return
@@ -1733,6 +1782,9 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
       prevState.rawTabs.find((t) => t.id === prevState.activeTabId) ??
       prevState.rawTabs[0]
     const replacementTab = makeReplacementDraftTab(seedTab)
+    for (const tab of prevState.rawTabs) {
+      pushClosedTab(snapshotConversationTab(tab))
+    }
     set({
       rawTabs: stampActiveTab([replacementTab], replacementTab.id),
       activeTabId: replacementTab.id,
@@ -1745,6 +1797,9 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
     const prevState = get()
     const remaining = prevState.rawTabs.filter((t) => t.folderId !== folderId)
     if (remaining.length === prevState.rawTabs.length) return
+    // Deliberately not recorded for reopen: this runs when the folder itself
+    // stops existing (a removed worktree, or the sidebar's "remove folder"),
+    // so every tab it drops points at a cwd that is gone.
 
     const currentActive = prevState.activeTabId
     const stillActive =
@@ -2050,12 +2105,14 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
       useAppWorkspaceStore.getState().allFolders.find((f) => f.id === folderId)
         ?.kind === "chat"
     ) {
-      get().openChatModeTab(
-        options?.targetGroup != null
+      return get().openChatModeTab({
+        ...(options?.targetGroup != null
           ? { targetGroup: options.targetGroup }
-          : undefined
-      )
-      return
+          : {}),
+        ...(options?.forceAgent != null
+          ? { forceAgent: options.forceAgent }
+          : {}),
+      })
     }
     const inheritFromActive = options?.inheritFromActive === true
     let inherit: AgentType | null = null
@@ -2069,12 +2126,19 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
         inherit = activeTab.agentType
       }
     }
-    const { agentType: targetAgent, provisional } = resolveAgentForFolder(
-      folderId,
-      inherit,
-      options?.folderDefaultAgent,
-      options?.folderRecentAgent
-    )
+    // A forced agent short-circuits resolution entirely (it outranks the folder
+    // default, which `inherit` would lose to) and is never provisional — it is
+    // explicit caller intent, not a guess to be corrected once the agent list
+    // goes fresh.
+    const { agentType: targetAgent, provisional } =
+      options?.forceAgent != null
+        ? { agentType: options.forceAgent, provisional: false }
+        : resolveAgentForFolder(
+            folderId,
+            inherit,
+            options?.folderDefaultAgent,
+            options?.folderRecentAgent
+          )
 
     const tabId = makeNewConversationTabId()
     const prevState = get()
@@ -2111,7 +2175,7 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
       })
       recomputeTabs()
       runtime.activateConversationPane()
-      return
+      return { tabId, agentType: targetAgent, folderId }
     }
 
     const folderChanged = existingTab.folderId !== folderId
@@ -2150,6 +2214,9 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
       focusTab(existingTab.id)
     }
     runtime.activateConversationPane()
+    // Every branch above leaves the tab on `targetAgent` in `folderId` — either
+    // already there, or once its queued retarget lands.
+    return { tabId: existingTab.id, agentType: targetAgent, folderId }
   },
 
   openChatModeTab: (options) => {
@@ -2161,11 +2228,12 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
       (activeTab.conversationId != null || !activeTab.agentTypeProvisional)
         ? activeTab.agentType
         : null
-    const { agentType: targetAgent, provisional } = resolveAgentForFolder(
-      0,
-      inherit,
-      null
-    )
+    // Same short-circuit as openNewConversationTab: an explicitly forced agent
+    // is caller intent and skips resolution.
+    const { agentType: targetAgent, provisional } =
+      options?.forceAgent != null
+        ? { agentType: options.forceAgent, provisional: false }
+        : resolveAgentForFolder(0, inherit, null)
 
     // Per-group draft singleton — all draft handling below is scoped to the
     // target group. Capture its existing draft (if any) up front so a stale
@@ -2213,8 +2281,34 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
       })
       recomputeTabs()
     } else if (existingTab.isChat && existingTab.folderId === 0) {
-      // Already a chat-mode draft — just focus it.
-      focusTab(existingTab.id)
+      // Already a chat-mode draft. Normally there is nothing to do but focus it
+      // — it keeps whatever agent it was on, because `inherit` is only ever a
+      // suggestion. A FORCED agent is not: the caller needs this draft to run on
+      // that agent (an "ask about this selection" continuing a chat
+      // conversation), so re-point it. No explicit disconnect: the connection
+      // lifecycle is keyed on the agent and tears the old one down itself, the
+      // same way the agent picker's `confirmDraftAgent` relies on.
+      if (
+        options?.forceAgent != null &&
+        (existingTab.agentType !== targetAgent ||
+          (existingTab.agentTypeProvisional ?? false) !== provisional)
+      ) {
+        set({
+          activeTabId: existingTab.id,
+          rawTabs: prevState.rawTabs.map((tab) =>
+            tab.id === existingTab.id
+              ? {
+                  ...tab,
+                  agentType: targetAgent,
+                  agentTypeProvisional: provisional,
+                }
+              : tab
+          ),
+        })
+        recomputeTabs()
+      } else {
+        focusTab(existingTab.id)
+      }
     } else {
       // Existing draft on a real folder: flip it to chat mode SYNCHRONOUSLY
       // (folderId + isChat together), so a send issued before any async teardown
@@ -2250,6 +2344,19 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
         })
     }
     runtime.activateConversationPane()
+    // A reused chat draft that was NOT force-agented keeps its own agent (the
+    // focus-only branch above), so report that rather than the resolved one.
+    const settledAgent =
+      existingTab && existingTab.isChat && existingTab.folderId === 0
+        ? options?.forceAgent != null
+          ? targetAgent
+          : existingTab.agentType
+        : targetAgent
+    return {
+      tabId: existingTab ? existingTab.id : tabId,
+      agentType: settledAgent,
+      folderId: 0,
+    }
   },
 
   setChatDraftWorkingDir: (tabId, workingDir) => {

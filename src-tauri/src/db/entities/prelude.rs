@@ -4,6 +4,7 @@ pub use super::agent_setting::Entity as AgentSetting;
 pub use super::app_metadata::Entity as AppMetadata;
 pub use super::automation::Entity as Automation;
 pub use super::automation_run::Entity as AutomationRun;
+pub use super::canvas_node::Entity as CanvasNode;
 pub use super::chat_channel::Entity as ChatChannel;
 pub use super::chat_channel_message_log::Entity as ChatChannelMessageLog;
 pub use super::chat_channel_sender_context::Entity as ChatChannelSenderContext;
@@ -29,6 +30,7 @@ pub use super::delegation_workflow_restart_context::Entity as DelegationWorkflow
 pub use super::delegation_workflow_run_binding::Entity as DelegationWorkflowRunBinding;
 pub use super::folder::Entity as Folder;
 pub use super::folder_command::Entity as FolderCommand;
+pub use super::folder_group::Entity as FolderGroup;
 pub use super::folder_link::Entity as FolderLink;
 pub use super::model_provider::Entity as ModelProvider;
 pub use super::opened_tab::Entity as OpenedTab;

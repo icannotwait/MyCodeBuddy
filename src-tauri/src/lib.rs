@@ -69,18 +69,20 @@ mod tauri_app {
     use crate::chat_channel::manager::ChatChannelManager;
     use crate::commands::{
         acp as acp_commands, app_update as app_update_commands, automation as automation_commands,
-        background as background_commands, backup, chat_authoring as chat_authoring_commands,
-        chat_channel as chat_channel_commands, conversation_popout, conversations,
-        custom_skills as custom_skills_commands, delegation as delegation_commands,
-        experts as experts_commands, feedback as feedback_commands, file_io, folder_commands,
-        folder_links, folders, forge as forge_commands, logging as logging_commands,
-        mcp as mcp_commands, model_provider as model_provider_commands, notification,
-        office_tools as office_tools_commands, pet as pet_commands, project_boot,
+        background as background_commands, backup, canvas as canvas_commands,
+        chat_authoring as chat_authoring_commands, chat_channel as chat_channel_commands,
+        conversation_popout, conversations, custom_skills as custom_skills_commands,
+        delegation as delegation_commands, experts as experts_commands,
+        feedback as feedback_commands, file_io, folder_commands, folder_links, folders,
+        forge as forge_commands, logging as logging_commands, mcp as mcp_commands,
+        model_provider as model_provider_commands, notification,
+        office_tools as office_tools_commands, open_in, pet as pet_commands, project_boot,
         question as question_commands, quick_messages as quick_messages_commands,
         remote_proxy as remote_proxy_commands, remote_workspace as remote_workspace_commands,
         science as science_commands, session_info as session_info_commands, system_settings,
-        terminal as terminal_commands, token_usage as token_usage_commands, version_control,
-        windows, work_task as work_task_commands, workspace_state as workspace_state_commands,
+        terminal as terminal_commands, token_usage as token_usage_commands, tool_watchdog,
+        version_control, windows, work_task as work_task_commands,
+        workspace_state as workspace_state_commands,
     };
     use crate::terminal::manager::TerminalManager;
     use crate::{db, git_credential, network, paths, process, web};
@@ -140,9 +142,15 @@ mod tauri_app {
                 folders::resolve_worktree_folder,
                 folders::open_folder_in_workspace,
                 folders::open_folder_by_id,
+                open_in::open_in_code,
                 folders::close_folder_if_empty,
                 folders::remove_folder_from_workspace,
-                folders::reorder_folders,
+                folders::list_folder_groups,
+                folders::create_folder_group,
+                folders::update_folder_group,
+                folders::delete_folder_group,
+                folders::apply_sidebar_layout,
+                folders::set_folder_group,
                 folders::update_folder_color,
                 folders::update_folder_alias,
                 folders::update_folder_default_agent,
@@ -473,6 +481,14 @@ mod tauri_app {
                 folder_links::rename_folder_link,
                 folder_links::repair_folder_link,
                 folder_links::remove_folder_link,
+                canvas_commands::canvas_list_nodes,
+                canvas_commands::canvas_create_node,
+                canvas_commands::canvas_group_into_region,
+                canvas_commands::canvas_update_node,
+                canvas_commands::canvas_move_nodes,
+                canvas_commands::canvas_detach_member,
+                canvas_commands::canvas_delete_node,
+                canvas_commands::canvas_delete_nodes,
                 chat_authoring_commands::get_chat_authoring_settings,
                 chat_authoring_commands::set_chat_authoring_settings,
                 token_usage_commands::token_usage_report,
@@ -514,6 +530,15 @@ mod tauri_app {
                 forge_commands::forge_list_issues,
                 forge_commands::forge_tab_count,
                 forge_commands::forge_list_labels,
+                forge_commands::forge_list_comments,
+                forge_commands::forge_create_comment,
+                forge_commands::forge_set_item_state,
+                forge_commands::forge_create_issue,
+                forge_commands::forge_change_detail,
+                forge_commands::forge_change_files,
+                forge_commands::forge_identity,
+                forge_commands::forge_merge_options,
+                forge_commands::forge_merge_change,
                 forge_commands::work_task_create_from_forge,
                 forge_commands::work_task_lookup_by_source,
                 forge_commands::forge_settings_get,
@@ -1162,7 +1187,7 @@ mod tauri_app {
                         // Clamp + apply tool-watchdog settings before the supervisor
                         // starts. Registry remains empty; old in_progress rows are
                         // not rehydrated here (existing boot reconciliation owns that).
-                        crate::commands::tool_watchdog::apply_persisted_tool_watchdog_settings(
+                        tool_watchdog::apply_persisted_tool_watchdog_settings(
                             &db_for_init,
                             &cm_for_watchdog,
                         )
@@ -1456,6 +1481,7 @@ mod tauri_app {
                     app.state::<std::sync::Arc<crate::acp::InternalEventBus>>()
                         .inner()
                         .clone(),
+                    internal_sessions.clone(),
                     effective_data_dir.clone(),
                 ) {
                     tauri::async_runtime::spawn(crate::work_task::run_task_engine(engine));

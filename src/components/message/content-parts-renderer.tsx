@@ -1,4 +1,11 @@
-import { memo, useMemo, useState, type ReactNode } from "react"
+import {
+  createContext,
+  memo,
+  useContext,
+  useMemo,
+  useState,
+  type ReactNode,
+} from "react"
 import type { AdaptedContentPart } from "@/lib/adapters/ai-elements-adapter"
 import {
   joinStreamingMarkdown,
@@ -59,6 +66,7 @@ import {
 import { AgentToolCallPart } from "./agent-tool-call"
 import { AskQuestionResultCard } from "./ask-question-result-card"
 import { CodegMcpToolCard } from "./codeg-mcp-tool-card"
+import { ResumedDelegationCard } from "./resumed-delegation-card"
 import { CollabAgentCard } from "./collab-agent-card"
 import {
   ContextCompactionCard,
@@ -82,6 +90,7 @@ import {
 } from "@/lib/shell-session-tool"
 import { COLLAB_AGENT_TOOL_NAME } from "@/lib/collab-tool"
 import { isCodegMcpWorkbenchTool } from "@/lib/codeg-mcp-tool"
+import { fsSeparator } from "@/lib/path-utils"
 import { DelegatedSubThread } from "./delegated-sub-thread"
 import { DelegationStatusCard } from "./delegation-status-card"
 import { DelegationStatusGroupCard } from "./delegation-status-group-card"
@@ -252,9 +261,17 @@ function isLikelyIdField(key: string): boolean {
   )
 }
 
-/** Shorten an absolute path to its last 2 segments. */
-function shortPath(p: string): string {
-  return p.split("/").slice(-2).join("/")
+/**
+ * Shorten an absolute path to its last 2 segments. Agents running on Windows
+ * report backslash paths (`C:\work\repo\src\a.ts`), so both separators have to
+ * split — otherwise the tool title fell back to the whole path — and the
+ * shortened form is rejoined with the path's own separator rather than mixing
+ * the two.
+ */
+export function shortPath(p: string): string {
+  const segments = p.split(/[\\/]/)
+  if (segments.length <= 2) return p
+  return segments.slice(-2).join(fsSeparator(p))
 }
 
 /** Truncate text to maxLen, appending "…" if truncated. */
@@ -1615,9 +1632,9 @@ function FileToolInput({
   }, [isRead, output, content, newSource])
 
   return (
-    <section className="flex max-h-[420px] flex-col rounded-lg border border-border bg-background">
-      <header className="flex shrink-0 items-center gap-2 border-b border-border bg-muted/40 px-3 py-2 text-[11px]">
-        <span className="shrink-0 rounded border border-border bg-background px-1.5 py-0.5 text-[10px] text-muted-foreground">
+    <section className="flex max-h-[26.25rem] flex-col rounded-lg border border-border bg-background">
+      <header className="flex shrink-0 items-center gap-2 border-b border-border bg-muted/40 px-3 py-2 text-2xs">
+        <span className="shrink-0 rounded border border-border bg-background px-1.5 py-0.5 text-3xs text-muted-foreground">
           {isRead ? "READ" : "WRITE"}
         </span>
         {/* No path in the input is not worth an "unknown" placeholder: the
@@ -1636,7 +1653,7 @@ function FileToolInput({
           <span className="min-w-0 flex-1" />
         )}
         {badges.length > 0 && (
-          <span className="ml-auto inline-flex shrink-0 items-center gap-2 text-[10px] text-muted-foreground">
+          <span className="ml-auto inline-flex shrink-0 items-center gap-2 text-3xs text-muted-foreground">
             {badges.map((b) => (
               <span key={b}>{b}</span>
             ))}
@@ -1972,7 +1989,7 @@ function StructuredToolInput({
     isTruncatedInput(input)
 
   const truncationBanner = truncated ? (
-    <div className="rounded-md bg-yellow-500/10 px-2.5 py-1.5 text-[11px] text-yellow-700 dark:text-yellow-400">
+    <div className="rounded-md bg-yellow-500/10 px-2.5 py-1.5 text-2xs text-yellow-700 dark:text-yellow-400">
       {t("inputTruncated")}
     </div>
   ) : null
@@ -2297,12 +2314,14 @@ const TextPart = memo(function TextPart({
   text,
   isUser = false,
   autolinkLocalPaths = false,
+  isStreaming = false,
 }: {
   text: string
   // User messages render as plain text + inline reference badges (no Markdown),
   // matching the plain-text composer. Assistant / system text keeps full Markdown.
   isUser?: boolean
   autolinkLocalPaths?: boolean
+  isStreaming?: boolean
 }) {
   if (isUser) {
     return (
@@ -2332,7 +2351,11 @@ const TextPart = memo(function TextPart({
   }
   return (
     <div className='break-words text-sm prose prose-sm dark:prose-invert max-w-none [&_ul]:list-inside [&_ol]:list-inside [&_[data-streamdown="code-block-body"]]:max-h-96 [&_[data-streamdown="code-block-body"]]:overflow-auto'>
-      <MessageResponse autolinkLocalPaths={autolinkLocalPaths}>
+      <MessageResponse
+        autolinkLocalPaths={autolinkLocalPaths}
+        mode={isStreaming ? "streaming" : "static"}
+        parseIncompleteMarkdown={isStreaming}
+      >
         {text}
       </MessageResponse>
     </div>
@@ -2573,7 +2596,7 @@ export const ToolCallPart = memo(function ToolCallPart({
     return (
       <span className="flex items-center gap-1.5 text-xs font-medium">
         {codexScript?.label && (
-          <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
+          <span className="rounded-full bg-muted px-1.5 py-0.5 text-3xs font-medium text-muted-foreground">
             {codexScript.label}
           </span>
         )}
@@ -2596,7 +2619,7 @@ export const ToolCallPart = memo(function ToolCallPart({
         )}
         {backgroundLaunch && (
           <span
-            className="inline-flex items-center gap-1 rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground"
+            className="inline-flex items-center gap-1 rounded-full bg-muted px-1.5 py-0.5 text-3xs font-medium text-muted-foreground"
             title={backgroundLaunch.taskId}
           >
             <TerminalIcon className="size-3" />
@@ -2931,6 +2954,36 @@ export const ToolCallPart = memo(function ToolCallPart({
     )
   }
 
+  // codeg-mcp resume_delegation: the sub-agent that came back. Rendered as the
+  // delegation card itself (with a ⟳ marker) rather than a task-id row above
+  // one, and tried BEFORE the generic workbench card below — which stays as the
+  // fallback for a REFUSED resume (`not_resumable`, unknown task), where there
+  // is no sub-agent to draw and only the reason is worth reading.
+  if (toolNameLower === "resume_delegation" && part.toolCallId) {
+    return (
+      <ResumedDelegationCard
+        toolCallId={part.toolCallId}
+        input={part.input ?? null}
+        output={part.output ?? null}
+        errorText={part.errorText ?? null}
+        state={part.state}
+        meta={part.meta ?? null}
+        // Whether a sub-agent resolves is only known inside the card (it takes
+        // a hook to find out), so the fallback goes in rather than the decision
+        // coming out.
+        fallback={
+          <CodegMcpToolCard
+            tool="resume_delegation"
+            input={part.input ?? null}
+            output={part.output ?? null}
+            errorText={part.errorText ?? null}
+            state={part.state}
+          />
+        }
+      />
+    )
+  }
+
   // The remaining codeg-mcp workbench companions (session lookup, work-task
   // reporting, chat authoring). One compact line stating what the call was
   // about, in the same visual language as the delegation cards, instead of the
@@ -2971,7 +3024,7 @@ export const ToolCallPart = memo(function ToolCallPart({
           )}
           {taskProgress && (
             <div className="mt-2 rounded-md border bg-muted/30 px-3 py-2">
-              <div className="text-[11px] font-medium text-muted-foreground mb-1">
+              <div className="text-2xs font-medium text-muted-foreground mb-1">
                 Progress
               </div>
               <div className="text-xs prose prose-sm dark:prose-invert max-w-none [&_ul]:list-inside [&_ol]:list-inside">
@@ -3019,6 +3072,9 @@ export const ToolCallPart = memo(function ToolCallPart({
       {/* Genuinely unmount bodies when collapsed — no force-mount. */}
       {open ? (
         <ToolContent>
+          {/* Codex may truncate a combined script by deleting the separator
+              that attributes output to each command. Keep the surviving
+              attribution explicit instead of presenting it as this command's. */}
           {codexScript?.sharedWith.length ? (
             <div className="text-[11px] text-muted-foreground">
               {t("codexScript.sharedWith", {
@@ -3233,23 +3289,59 @@ interface ContentPartsRendererProps {
   /** When false, reasoning parts are not mounted. Defaults true for non-conversation callers. */
   showThinking?: boolean
   grokSessionImagePhase?: GrokSessionImagePhase | null
+  isStreaming?: boolean
 }
 
-export const ContentPartsRenderer = memo(function ContentPartsRenderer({
-  parts,
-  role,
-  parentConversationId,
-  autolinkLocalPathParts,
-  grokSessionImageTextParts,
-  showThinking = true,
-  grokSessionImagePhase,
-}: ContentPartsRendererProps) {
+type InheritedContentPartsRendererProps = Omit<
+  ContentPartsRendererProps,
+  "parts" | "role" | "isStreaming"
+>
+
+const ContentPartsRendererContext =
+  createContext<InheritedContentPartsRendererProps | null>(null)
+
+export function ContentPartsRendererOptionsProvider({
+  value,
+  children,
+}: {
+  value: InheritedContentPartsRendererProps
+  children: ReactNode
+}) {
+  return (
+    <ContentPartsRendererContext.Provider value={value}>
+      {children}
+    </ContentPartsRendererContext.Provider>
+  )
+}
+
+export const ContentPartsRenderer = memo(function ContentPartsRenderer(
+  props: ContentPartsRendererProps
+) {
+  const inherited = useContext(ContentPartsRendererContext)
+  const { parts, role, isStreaming = false } = props
+  const parentConversationId =
+    props.parentConversationId !== undefined
+      ? props.parentConversationId
+      : inherited?.parentConversationId
+  const autolinkLocalPathParts =
+    props.autolinkLocalPathParts ?? inherited?.autolinkLocalPathParts
+  const grokSessionImageTextParts =
+    props.grokSessionImageTextParts ?? inherited?.grokSessionImageTextParts
+  const showThinking = props.showThinking ?? inherited?.showThinking ?? true
+  const grokSessionImagePhase =
+    props.grokSessionImagePhase !== undefined
+      ? props.grokSessionImagePhase
+      : inherited?.grokSessionImagePhase
+
   const renderPart = (
     part: AdaptedContentPart,
     keyId: string,
     isTopLevel: boolean
   ): ReactNode => {
     if (part.type === "text") {
+      // User turns are final by render time; an empty text part is parser residue
+      // and should not reserve a blank `space-y-4` band inside the bubble.
+      if (role === "user" && part.text.trim().length === 0) return null
       if (
         isTopLevel &&
         role === "assistant" &&
@@ -3266,6 +3358,7 @@ export const ContentPartsRenderer = memo(function ContentPartsRenderer({
               text={part.text}
               isUser={false}
               autolinkLocalPaths={autolinkLocalPathParts?.has(part) ?? false}
+              isStreaming={isStreaming}
             />
           </GrokSessionImageScope>
         )
@@ -3280,6 +3373,7 @@ export const ContentPartsRenderer = memo(function ContentPartsRenderer({
             role === "assistant" &&
             (autolinkLocalPathParts?.has(part) ?? false)
           }
+          isStreaming={isStreaming}
         />
       )
     }
@@ -3380,6 +3474,7 @@ export const ContentPartsRenderer = memo(function ContentPartsRenderer({
       return (
         <GeneratedImagesBlock
           key={`gimg-${keyId}`}
+          label={part.label}
           revisedPrompt={part.revisedPrompt}
           image={part.image}
           status={part.status}

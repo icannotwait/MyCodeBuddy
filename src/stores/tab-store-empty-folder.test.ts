@@ -16,6 +16,7 @@ vi.mock("@/lib/api", () => ({
   closeFolderIfEmpty: (...args: unknown[]) => closeFolderIfEmpty(...args),
   listOpenFolderDetails: (...args: unknown[]) => listOpenFolderDetails(...args),
   listAllFolderDetails: (...args: unknown[]) => listAllFolderDetails(...args),
+  listFolderGroups: vi.fn(async () => []),
   listAllConversations: vi.fn(async () => []),
   openFolder: vi.fn(),
   openFolderById: (...args: unknown[]) => openFolderById(...args),

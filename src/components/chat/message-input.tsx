@@ -75,6 +75,7 @@ import {
   ConversationContextBar,
   ConversationFolderBranchPicker,
   useConversationFolderBranchPickerVisible,
+  type ConversationFolderPickerOverride,
 } from "@/components/chat/conversation-context-bar"
 import { ComposerContextUsage } from "@/components/chat/composer-context-usage"
 import { ComposerConnectionStatus } from "@/components/chat/composer-connection-status"
@@ -84,6 +85,7 @@ import {
   InlineSessionConfigToggle,
 } from "@/components/chat/session-config-selector"
 import { ModelOptionPicker } from "@/components/chat/model-option-picker"
+import { SelectorTooltip } from "@/components/chat/selector-tooltip"
 import {
   SessionSelectorsPanel,
   type SessionSelectorGroup,
@@ -221,6 +223,10 @@ interface MessageInputProps {
   commandsLoading?: boolean
   promptCapabilities: PromptCapabilitiesInfo
   attachmentTabId?: string | null
+  /** Identity + switching for a composer that isn't in a tab (a canvas card).
+   *  Passed straight to the folder picker below the composer; without it that
+   *  picker falls back to the workspace's active tab. */
+  folderPickerOverride?: ConversationFolderPickerOverride
   draftStorageKey?: string | null
   isActive?: boolean
   /** Paint the flowing active-session gradient on the composer border. Set only
@@ -351,6 +357,7 @@ export function MessageInput({
   commandsLoading = false,
   promptCapabilities,
   attachmentTabId,
+  folderPickerOverride,
   draftStorageKey,
   isActive = false,
   showActiveFlow = false,
@@ -874,8 +881,10 @@ export function MessageInput({
   const hasAnySelector =
     showConfigLoading || hasConfigOptions || showModeLoading || showModeSelector
   const hasInlineSelectors = hasConfigOptions || showModeSelector
-  const hasFolderBranchPicker =
-    useConversationFolderBranchPickerVisible(attachmentTabId)
+  const hasFolderBranchPicker = useConversationFolderBranchPickerVisible(
+    attachmentTabId,
+    folderPickerOverride
+  )
   const folderBranchPickerAttached = hasFolderBranchPicker
   const imageAttachments = attach.imageAttachments
   const hasAttachments = attachments.length > 0
@@ -2238,25 +2247,34 @@ export function MessageInput({
                           setCollapsedSelectorsOpen(open)
                         }}
                       >
-                        <PopoverTrigger asChild>
-                          <Button
-                            variant="ghost"
-                            size="icon-xs"
-                            className="shrink-0"
-                            title={t("agentSettings")}
-                            aria-label={t("agentSettings")}
-                            disabled={interactionLocked || sendAdmissionPending}
-                          >
-                            {agentType ? (
-                              <AgentIcon
-                                agentType={agentType}
-                                className="size-3"
-                              />
-                            ) : (
-                              <Cog className="size-3" />
-                            )}
-                          </Button>
-                        </PopoverTrigger>
+                        {/* Suppressed while the panel is open — the Popover is
+                            non-modal, so the trigger keeps taking hover under
+                            it (see SelectorTooltip). */}
+                        <SelectorTooltip
+                          label={t("agentSettings")}
+                          suppressed={collapsedSelectorsOpen}
+                        >
+                          <PopoverTrigger asChild>
+                            <Button
+                              variant="ghost"
+                              size="icon-xs"
+                              className="shrink-0"
+                              aria-label={t("agentSettings")}
+                              disabled={
+                                interactionLocked || sendAdmissionPending
+                              }
+                            >
+                              {agentType ? (
+                                <AgentIcon
+                                  agentType={agentType}
+                                  className="size-3"
+                                />
+                              ) : (
+                                <Cog className="size-3" />
+                              )}
+                            </Button>
+                          </PopoverTrigger>
+                        </SelectorTooltip>
                         <PopoverContent
                           ref={collapsedSelectorsGuard.contentRef}
                           side="top"
@@ -2388,7 +2406,10 @@ export function MessageInput({
           // right-align at the trailing edge.
           <div className="flex items-center justify-between gap-2 rounded-b-xl px-2 pt-1 text-xs text-muted-foreground">
             <div className="flex min-w-0 items-center gap-1">
-              <ConversationFolderBranchPicker tabId={attachmentTabId} />
+              <ConversationFolderBranchPicker
+                tabId={attachmentTabId}
+                override={folderPickerOverride}
+              />
             </div>
             {/* `pr-px` offsets the composer chrome's 1px border: the send button
                 sits INSIDE that border while this status row sits outside it, so

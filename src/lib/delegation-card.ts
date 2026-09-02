@@ -15,6 +15,7 @@ import { formatConversationTitle } from "@/lib/conversation-title"
 import { peelMcpResultEnvelope } from "@/lib/mcp-result-envelope"
 import {
   ALL_AGENT_TYPES,
+  isCustomAgentType,
   type AgentType,
   type AttentionRequestSummary,
   type DelegationRuntimeStats,
@@ -79,6 +80,21 @@ export interface DelegationRunIdentity {
 const KNOWN_AGENT_TYPES: ReadonlySet<AgentType> = new Set<AgentType>(
   ALL_AGENT_TYPES
 )
+
+/**
+ * Narrow an untrusted wire string to an `AgentType`, or `null`.
+ *
+ * Accepts the built-ins plus any `custom:<id>` slug — a user-registered ACP
+ * agent is as delegatable as a built-in, and `AgentIcon` / `getAgentLabel`
+ * already render one.
+ */
+export function coerceAgentType(value: unknown): AgentType | null {
+  if (typeof value !== "string") return null
+  const trimmed = value.trim()
+  if (!trimmed) return null
+  if (KNOWN_AGENT_TYPES.has(trimmed)) return trimmed as AgentType
+  return isCustomAgentType(trimmed) ? (trimmed as AgentType) : null
+}
 
 export type ParsedMeta = {
   status: DelegationStatus
@@ -277,11 +293,7 @@ export function parseDelegationMeta(
   const generation = obj["generation"]
   return {
     status,
-    agentType:
-      typeof agent_type === "string" &&
-      KNOWN_AGENT_TYPES.has(agent_type as AgentType)
-        ? (agent_type as AgentType)
-        : null,
+    agentType: coerceAgentType(agent_type),
     task:
       typeof task_preview === "string" && task_preview ? task_preview : null,
     taskId: readNonEmptyString(task_id),
@@ -436,10 +448,8 @@ export function parseInput(raw: string | null | undefined): ParsedInput {
     }
     return EMPTY_PARSED_INPUT
   }
-  const at = typeof obj.agent_type === "string" ? obj.agent_type : null
   return {
-    agentType:
-      at && KNOWN_AGENT_TYPES.has(at as AgentType) ? (at as AgentType) : null,
+    agentType: coerceAgentType(obj.agent_type),
     profileLabel:
       typeof obj.profile_label === "string" ? obj.profile_label : null,
     task: typeof obj.task === "string" ? obj.task : null,
@@ -478,21 +488,29 @@ export function parseCancelDelegationReason(
  * from prematurely flipping the status badge to "ok".
  *
  * `durationMs` is retained from non-negative wire `duration_ms` on terminal
- * reports so cold cards can fall back when `finishedAt - startedAt` is absent.
+ * reports so cold cards can fall back when `finishedAt - startedAt` is absent;
+ * structured non-terminal reports carry `null`.
  */
 export type ParsedToolOutput =
-  | { kind: "ack"; childConversationId: number | null }
+  | {
+      kind: "ack"
+      childConversationId: number | null
+      durationMs?: number | null
+      agentType?: AgentType | null
+      errorCode?: string | null
+    }
   | {
       kind: "outcome"
       text: string
       isError: boolean
       childConversationId: number | null
       durationMs: number | null
+      agentType?: AgentType | null
       /**
        * Stable wire `error_code` / legacy `code` when present.
        * Never a call `correlation_id` — that token is transport-only.
        */
-      errorCode: string | null
+      errorCode?: string | null
     }
 
 /**
@@ -507,6 +525,133 @@ export function isUncorrelatedDelegationFailure(
 ): boolean {
   if (options?.syntheticHistorical) return false
   return !currentTaskId && output?.kind === "outcome" && output.isError === true
+}
+
+/**
+ * `DelegationTaskReport.error_code` for a refused `resume_delegation`
+ * (`broker.rs::NOT_RESUMABLE_CODE`). Mirror of the Rust constant.
+ */
+export const NOT_RESUMABLE_CODE = "not_resumable"
+
+/**
+ * Opening words of the two `resume_delegation` messages that must stay
+ * readable when the structured report is gone. `companion.rs::render_task_report`
+ * puts the whole report — `error_code`, `child_conversation_id`, everything —
+ * in `structuredContent` and renders only `message` as content text, and some
+ * hosts keep only the text: OpenCode "drops the MCP `structuredContent`
+ * entirely, so the human-readable lines ARE the whole record"
+ * (`acp/connection.rs`, verified against opencode 1.18.23).
+ *
+ * The backend writes these prefixes deliberately for that case — see
+ * `broker.rs::not_resumable_report` ("a message that opens with 'Not resumed'
+ * — unambiguous against the ack even on hosts that only surface the content
+ * text") and `resume_ack`. Both sides must keep spelling them the same way.
+ */
+const REFUSED_RESUME_TEXT = "Not resumed:"
+const RESUMED_ACK_TEXT = "Delegation resumed"
+
+/**
+ * Whether a real `DelegationTaskReport` was recovered, as opposed to opaque
+ * result text. `interpretReport` sets `agentType` on every branch — to `null`
+ * when the report carried no agent — while generic text fallbacks omit it.
+ */
+function isStructuredReport(parsed: ParsedToolOutput | null): boolean {
+  return (
+    parsed != null && Object.prototype.hasOwnProperty.call(parsed, "agentType")
+  )
+}
+
+/**
+ * Does this result OPEN with one of the backend's markers?
+ *
+ * Anchored, never a substring search, because the text channel is not always
+ * the backend's own message: `render_task_report` renders `text` in preference
+ * to `message` for a `completed` report, and a resume whose child finished
+ * during setup (`broker.rs`'s `Disposition::ChildTerminal`) reports exactly
+ * that child's LLM-written output. A sub-agent that merely discusses
+ * delegation would otherwise be read as a verdict about its own card.
+ *
+ * Checks the parsed outcome text as well as the raw string so a host envelope
+ * around the message doesn't hide the marker.
+ */
+function opensWith(
+  parsed: ParsedToolOutput | null,
+  raw: string | null | undefined,
+  marker: string
+): boolean {
+  const parsedText = parsed?.kind === "outcome" ? parsed.text : null
+  return [parsedText, raw].some(
+    (candidate) => candidate?.trimStart().startsWith(marker) ?? false
+  )
+}
+
+/**
+ * Whether a `resume_delegation` result is the broker REFUSING to resume.
+ *
+ * This cannot be read off `status`: a refusal deliberately reports the task's
+ * ACTUAL state (`broker.rs::not_resumable_report`), so "already completed"
+ * arrives as `status: "completed"` and "still running" as `status: "running"`
+ * — indistinguishable from a real resume by status alone. Only `error_code`
+ * separates them — or, where no structure survived, the message prefix.
+ *
+ * It matters because a refusal still carries `agent_type` and
+ * `child_conversation_id`, which is otherwise exactly the evidence a resumed
+ * sub-agent card runs on: without this check the card paints a live-looking
+ * (or done-looking) sub-agent for a resume that never happened, and buries the
+ * one thing the user needs — the "Not resumed: …" explanation.
+ */
+export function isRefusedResume(
+  output?: string | null,
+  errorText?: string | null
+): boolean {
+  const parsed = parseResumeResult(output, errorText)
+  // Structure survived ⇒ it is the whole answer. Falling through to the text
+  // would be reading a child's own output for a verdict about the call.
+  if (isStructuredReport(parsed)) {
+    return parsed?.errorCode === NOT_RESUMABLE_CODE
+  }
+  return (
+    opensWith(parsed, output, REFUSED_RESUME_TEXT) ||
+    opensWith(parsed, errorText, REFUSED_RESUME_TEXT)
+  )
+}
+
+/**
+ * Whether a `resume_delegation` result is the broker CONFIRMING the resume —
+ * as opposed to refusing it, or reporting an unknown task
+ * (`broker.rs::unknown_report`, which a foreign task id lands on).
+ *
+ * Used to corroborate a task-id binding lookup when the report itself named no
+ * child conversation: on a host that drops `structuredContent` the ack's
+ * `child_conversation_id` is gone, so the confirmation text is the only thing
+ * left that distinguishes "this call really did revive that task" from "the
+ * model named somebody else's task id".
+ */
+export function isAffirmedResume(
+  output?: string | null,
+  errorText?: string | null
+): boolean {
+  if (isRefusedResume(output, errorText)) return false
+  const parsed = parseResumeResult(output, errorText)
+  // With the report intact, naming a child IS the confirmation — and its
+  // absence is what marks `unknown_report`. No need to read prose for it.
+  if (isStructuredReport(parsed)) {
+    return parsed?.childConversationId != null
+  }
+  return (
+    opensWith(parsed, output, RESUMED_ACK_TEXT) ||
+    opensWith(parsed, errorText, RESUMED_ACK_TEXT)
+  )
+}
+
+function parseResumeResult(
+  output?: string | null,
+  errorText?: string | null
+): ParsedToolOutput | null {
+  return (
+    (errorText ? parseToolOutput(errorText, true) : null) ??
+    parseToolOutput(output)
+  )
 }
 
 function readChildConversationId(obj: Record<string, unknown>): number | null {
@@ -540,6 +685,7 @@ function outcomeResult(fields: {
   isError: boolean
   childConversationId: number | null
   durationMs: number | null
+  agentType?: AgentType | null
   errorCode?: string | null
 }): ParsedToolOutput {
   return {
@@ -548,6 +694,9 @@ function outcomeResult(fields: {
     isError: fields.isError,
     childConversationId: fields.childConversationId,
     durationMs: fields.durationMs,
+    ...(Object.prototype.hasOwnProperty.call(fields, "agentType")
+      ? { agentType: fields.agentType ?? null }
+      : {}),
     errorCode: fields.errorCode ?? null,
   }
 }
@@ -563,19 +712,38 @@ function interpretReport(
 ): ParsedToolOutput | null {
   const childConversationId = readChildConversationId(obj)
   const durationMs = readDurationMs(obj)
+  // `DelegationTaskReport.agent_type` (types.rs). For `delegate_to_agent` this
+  // merely echoes the `agent_type` argument the card already parsed; it earns
+  // its keep on `resume_delegation`, whose arguments are only
+  // `{task_id, reason}` — the report is the ONLY place a reloaded resume card
+  // can learn which agent it revived.
+  const agentType = coerceAgentType(obj.agent_type)
+  // Carried on EVERY variant, not just the failed ones: a refused resume pairs
+  // `not_resumable` with the task's real status, so the code is the only thing
+  // that distinguishes it from the report of a genuine resume. See
+  // `isRefusedResume`.
+  const errorCode = typeof obj.error_code === "string" ? obj.error_code : null
   const status = typeof obj.status === "string" ? obj.status : null
   if (status) {
     switch (status) {
       case "running":
       case "unknown":
         // No terminal result to show on the card — it's an ack.
-        return { kind: "ack", childConversationId }
+        return {
+          kind: "ack",
+          childConversationId,
+          durationMs: null,
+          agentType,
+          errorCode,
+        }
       case "completed":
         return outcomeResult({
           text: typeof obj.text === "string" ? obj.text : "",
           isError: false,
           childConversationId,
           durationMs,
+          agentType,
+          errorCode,
         })
       case "failed":
       case "canceled": {
@@ -586,14 +754,26 @@ function interpretReport(
           isError: true,
           childConversationId,
           durationMs,
+          agentType,
           errorCode: code || null,
         })
       }
       default:
-        return { kind: "ack", childConversationId }
+        return {
+          kind: "ack",
+          childConversationId,
+          durationMs: null,
+          agentType,
+          errorCode,
+        }
     }
   }
-  // Legacy synchronous outcome shape.
+  // Legacy synchronous outcome shape. These branches must set `errorCode` too
+  // — `null` where there is none — because its ABSENCE is what
+  // `isStructuredReport` reads as "no report survived, fall back to the text".
+  // Leaving it off here would send a perfectly well-formed legacy result down
+  // the text path, where a result that merely opens with "Not resumed:" would
+  // be taken for a refusal.
   const kind = typeof obj.kind === "string" ? obj.kind : null
   if (kind === "ok") {
     return outcomeResult({
@@ -601,6 +781,8 @@ function interpretReport(
       isError: false,
       childConversationId,
       durationMs,
+      agentType,
+      errorCode: null,
     })
   }
   if (kind === "err") {
@@ -611,6 +793,7 @@ function interpretReport(
       isError: true,
       childConversationId,
       durationMs,
+      agentType,
       errorCode: code || null,
     })
   }

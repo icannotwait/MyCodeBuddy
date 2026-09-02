@@ -98,6 +98,9 @@ describe("childConversationToDelegationSource", () => {
     expect(parseToolOutput(source.output)).toEqual({
       kind: "ack",
       childConversationId: 3879,
+      durationMs: null,
+      agentType: null,
+      errorCode: null,
     })
     expect(parseDelegationMeta(source.meta)?.status).toBe("running")
   })
@@ -115,6 +118,9 @@ describe("childConversationToDelegationSource", () => {
     expect(parseToolOutput(source.output)).toEqual({
       kind: "ack",
       childConversationId: 3881,
+      durationMs: null,
+      agentType: null,
+      errorCode: null,
     })
     expect(parseDelegationMeta(source.meta)?.status).toBe("running")
   })

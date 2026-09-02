@@ -12,21 +12,7 @@ use crate::db::entities::conversation;
 use crate::db::error::DbError;
 use crate::db::service::conversation_service;
 use crate::models::{AgentType, ConversationSummary, ImportResult};
-use crate::parsers::antigravity::AntigravityParser;
-use crate::parsers::claude::ClaudeParser;
-use crate::parsers::cline::ClineParser;
-use crate::parsers::codebuddy::CodeBuddyParser;
-use crate::parsers::codex::CodexParser;
-use crate::parsers::cursor::CursorParser;
-use crate::parsers::deepseek::DeepSeekParser;
-use crate::parsers::gemini::GeminiParser;
-use crate::parsers::grok::GrokParser;
-use crate::parsers::hermes::HermesParser;
-use crate::parsers::kimi_code::KimiCodeParser;
-use crate::parsers::opencode::OpenCodeParser;
-use crate::parsers::pi::PiParser;
-use crate::parsers::qoder::QoderParser;
-use crate::parsers::{path_eq_for_matching, AgentParser};
+use crate::parsers::{build_agent_parser_with_runtime_env, path_eq_for_matching, AgentParser};
 
 /// Every locally-parsable agent, in the canonical parser order.
 const ALL_PARSER_AGENTS: [AgentType; 14] = [
@@ -50,26 +36,7 @@ fn build_parser(
     agent_type: AgentType,
     deepseek_env: &BTreeMap<String, String>,
 ) -> Option<Box<dyn AgentParser>> {
-    Some(match agent_type {
-        AgentType::ClaudeCode => Box::new(ClaudeParser::new()),
-        AgentType::Codex => Box::new(CodexParser::new()),
-        AgentType::OpenCode => Box::new(OpenCodeParser::new()),
-        AgentType::Gemini => Box::new(GeminiParser::new()),
-        AgentType::Cline => Box::new(ClineParser::new()),
-        AgentType::Hermes => Box::new(HermesParser::new()),
-        AgentType::CodeBuddy => Box::new(CodeBuddyParser::new()),
-        AgentType::KimiCode => Box::new(KimiCodeParser::new()),
-        AgentType::Pi => Box::new(PiParser::new()),
-        AgentType::Grok => Box::new(GrokParser::new()),
-        AgentType::Cursor => Box::new(CursorParser::new()),
-        AgentType::DeepSeek => Box::new(DeepSeekParser::from_runtime_env(deepseek_env)?),
-        AgentType::Qoder => Box::new(QoderParser::new()),
-        AgentType::Antigravity => Box::new(AntigravityParser::new()),
-        // Custom agents' history lives in codeg's own ACP transcript.
-        AgentType::Custom(_) => {
-            Box::new(crate::parsers::acp_native::AcpNativeParser::new(agent_type))
-        }
-    })
+    build_agent_parser_with_runtime_env(agent_type, deepseek_env)
 }
 
 /// List every local agent's sessions — one `spawn_blocking` per parser so the

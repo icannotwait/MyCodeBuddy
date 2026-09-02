@@ -19,6 +19,7 @@ use std::path::Path;
 
 use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
 use tracing_appender::rolling::Rotation;
+use tracing_subscriber::filter::filter_fn;
 use tracing_subscriber::{fmt, prelude::*, reload, EnvFilter, Registry};
 
 use crate::logging::budget::{self, BudgetedWriter};
@@ -40,35 +41,303 @@ pub struct LogGuard {
     _guard: Option<WorkerGuard>,
 }
 
-/// Standing per-target backstops appended to EVERY constructed filter — the
+/// Standing per-target ceilings applied to EVERY constructed filter — the
 /// default/configured level, a persisted level, AND an explicit `RUST_LOG` /
-/// `CODEG_LOG` override. Two entries, both appended last so they win over a
-/// broader global level:
+/// `CODEG_LOG` override. Each entry is the MOST VERBOSE level that target may
+/// ever reach; see [`clamped_backstops`] for why that is a ceiling rather than a
+/// pin.
 ///
-/// - `kill_tree=warn` — the `kill_tree` crate emits one DEBUG line per inspected
-///   PID (~1500 on macOS, mostly EPERM on SIP-protected processes) on every
-///   `kill_tree()` call. Under a global `debug` level that firehose grew a
+/// - `kill_tree` → `Warn` — the `kill_tree` crate emits one DEBUG line per
+///   inspected PID (~1500 on macOS, mostly EPERM on SIP-protected processes) on
+///   every `kill_tree()` call. Under a global `debug` level that firehose grew a
 ///   server's log file to 217GB. We never want it: real kill failures are
-///   already surfaced at our own call sites via `error!`. Pinned here so even
+///   already surfaced at our own call sites via `error!`. Clamped here so even
 ///   `RUST_LOG=debug` can't re-open it.
-/// - `codeg_lib::logging=off` — the logging stack must not log about itself
+/// - `sacp` / `sacp_tokio` → `Warn` — the ACP transport logs **every JSON-RPC
+///   message in full**, several times per message: the `transport_actor` TRACEs
+///   each serialized outgoing line, `incoming_actor` TRACEs the parsed incoming
+///   message and again on every handler attempt, and `sacp::role` TRACEs each
+///   dispatch. Agent traffic is the largest data stream in the process (reply
+///   text, file contents, tool output), so at `debug` / `trace` this multiplies
+///   it several-fold onto disk — the shape behind the 34GB-in-8.8h field report
+///   on 0.23.3 (issue #427). It also carries one **INFO** line per unhandled
+///   method (`incoming_actor` "Rejecting message with error, no handler") which
+///   fires on the per-message hot path at the DEFAULT level. codeg keeps its own
+///   throttled account of dropped / unclaimed messages
+///   (`maybe_emit_ext_notification`, `TurnOutputProbe`), so none of that is
+///   load-bearing.
+///
+///   `Warn` — not lower — because two of the crate's three `warn!` sites are
+///   genuinely actionable transport faults (`outgoing_actor` "Sending error
+///   response", `incoming_actor` "Transport parse error"). Note both of those
+///   are ALSO per-message under a misbehaving agent, so this ceiling does not by
+///   itself bound sacp's output; it removes the payload dumps and the INFO line,
+///   and [`crate::logging::budget`] bounds whatever is left.
+///
+///   Protocol-level debugging stays reachable: a MORE SPECIFIC target beats a
+///   crate-level ceiling, so setting `CODEG_LOG` to
+///   `info,sacp::jsonrpc::transport_actor=trace` still dumps the wire.
+/// - `tungstenite` → `Debug` — `handshake/client.rs` TRACEs the serialized
+///   handshake **in full**: `trace!("Request: {:?}", …)` over the raw request
+///   bytes. For a remote workspace connection that request carries the
+///   connection's credentials — the bearer token (which travels as a
+///   `Sec-WebSocket-Protocol` value) and every custom header the user
+///   configured, which for the case the feature exists to serve is a Cloudflare
+///   Access service token. `HeaderValue::set_sensitive` does not help: that
+///   only governs HTTP/2 HPACK indexing and the `Debug` of the value itself,
+///   and this line formats bytes tungstenite has already written out. So a user
+///   who raises the level to trace to diagnose a connection problem and then
+///   attaches the log to a bug report ships their secrets with it.
+///
+///   `Debug` — not lower — because the crate's `debug!` lines are the useful,
+///   harmless ones ("Client handshake done.", "Trying to contact {uri}",
+///   "Received close frame"). `trace!` is where both problems live: this dump,
+///   and a line per WebSocket frame read and written (`protocol/frame/mod.rs`),
+///   which is the sacp firehose shape again — every ACP event twice over.
+/// - `tungstenite::handshake::client` → `Debug` — the same ceiling again, on
+///   the exact target the dump is emitted from, and this one is not negotiable.
+///   The crate-level entry above is a ceiling in the usual sense: a MORE
+///   specific directive beats it, which is what keeps `tungstenite::protocol`
+///   pinnable to trace for frame-level debugging. That escape hatch is right
+///   for a firehose and wrong for a credential, so the dump gets its own entry.
+///   Backstops are appended last and win at equal specificity (see
+///   [`build_env_filter`]), so a plain `tungstenite::handshake::client=trace`
+///   from the Settings UI or `CODEG_LOG` loses to this entry at any module
+///   depth. Asking for LESS is still honored: the clamp never raises
+///   verbosity, so `off` still means off.
+///
+///   This entry is not by itself sufficient, because a level table can only
+///   answer directives that are about levels — a field-qualified directive
+///   outranks it. [`is_credential_dump_target`] is what actually closes the
+///   target; this keeps the level story coherent alongside it.
+/// - `sqlx::query` → `Warn` — sqlx logs every executed statement, with its SQL
+///   text, at INFO by default. Every `ConnectOptions` in the tree sets
+///   `.sqlx_logging(false)`, but that is a per-call-site opt-out that a new
+///   connection can forget; this makes forgetting harmless. Slow-query lines are
+///   WARN and survive.
+/// - `codeg_lib::logging` → `Off` — the logging stack must not log about itself
 ///   (cross-thread feedback-loop backstop; the layer's thread-local guard
 ///   handles the same-thread case).
-const TARGET_BACKSTOPS: &str = "kill_tree=warn,codeg_lib::logging=off";
+///
+/// Per-target ceilings close firehoses one at a time and only the ones we know
+/// about; [`crate::logging::budget`] bounds the disk cost of the ones we don't.
+const TARGET_BACKSTOPS: &[(&str, LogLevel)] = &[
+    ("kill_tree", LogLevel::Warn),
+    ("sacp", LogLevel::Warn),
+    ("sacp_tokio", LogLevel::Warn),
+    ("tungstenite", LogLevel::Debug),
+    ("tungstenite::handshake::client", LogLevel::Debug),
+    ("sqlx::query", LogLevel::Warn),
+    ("codeg_lib::logging", LogLevel::Off),
+];
 
-/// Directive string for an explicit env-override level `s`, with the standing
-/// [`TARGET_BACKSTOPS`] appended. Extracted so the backstop application on the
-/// env-override path is unit-testable without installing a global subscriber.
-fn env_override_directives(s: &str) -> String {
-    format!("{s},{TARGET_BACKSTOPS}")
+/// The one target that is refused structurally rather than by level.
+///
+/// [`TARGET_BACKSTOPS`] is a table of *levels*, and a level is negotiable:
+/// `EnvFilter` ranks a field-qualified directive above a plain target one, so
+/// `CODEG_LOG='tungstenite::handshake::client[{message}]=trace'` outranks the
+/// entry there — and that `trace!` is a formatted event, so it has a `message`
+/// field to match on. The entry in the table still earns its place (it keeps
+/// the crate ceiling coherent and it is what the directive tests read), but it
+/// cannot be the whole answer.
+///
+/// A ceiling is the wrong shape for this line anyway. There is no verbosity to
+/// trade off: `handshake/client.rs` prints the serialized request, and in this
+/// codebase the only tungstenite client is the remote-workspace WebSocket, so
+/// every time that line prints at all it prints a bearer token and whatever
+/// custom credential headers the connection carries. So it is dropped before
+/// the level filter is consulted, and no directive in any syntax reaches it.
+///
+/// Anyone who genuinely needs the handshake bytes has `tungstenite::protocol`
+/// for frames, or a local edit here.
+fn is_credential_dump_target(target: &str) -> bool {
+    target == "tungstenite::handshake::client"
 }
 
-/// Build the `EnvFilter` for the full settings: the global level followed by
-/// each non-empty per-target override (`target=level`), then always appending
-/// [`TARGET_BACKSTOPS`] (the `kill_tree` clamp + the logging module's own target
-/// off). The backstops are appended last so they win. `parse_lossy` silently
-/// drops any malformed target directive — the UI constrains the input to avoid
-/// that.
+/// How much a level lets through, ascending. Distinct from [`LogLevel::rank`],
+/// which is a *severity* rank for filtering records (and puts `Off` at 0
+/// alongside the most severe end); comparing verbosity needs `Off` to be the
+/// least of all.
+fn verbosity(level: LogLevel) -> u8 {
+    match level {
+        LogLevel::Off => 0,
+        LogLevel::Error => 1,
+        LogLevel::Warn => 2,
+        LogLevel::Info => 3,
+        LogLevel::Debug => 4,
+        LogLevel::Trace => 5,
+    }
+}
+
+/// The [`TARGET_BACKSTOPS`] directives, each clamped to no more verbose than
+/// `asked_for` reports for that target.
+///
+/// A backstop exists to make a noisy target QUIETER than the level asks for. It
+/// must never make one LOUDER — but a bare `target=warn` appended after a global
+/// level does exactly that when the global is quieter, because `EnvFilter` treats
+/// the more specific directive as authoritative rather than as a bound. Three
+/// user-visible consequences before this clamped:
+///
+/// - `LogLevel::Off` is documented as "disables capture entirely"
+///   ([`crate::logging::LogLevel`]), yet `off,sacp=warn` still captured sacp
+///   warnings — and sacp warns per message under a misbehaving agent, so
+///   "logging off" could still write on the hot path.
+/// - A global `Error` silently gained back WARN lines from every clamped target.
+/// - A user turning a clamped target DOWN (`sacp=off` in the Settings UI) was
+///   overruled back up to `warn` — the backstop refusing a request to be
+///   quieter, which is the opposite of its job.
+///
+/// Taking the less verbose of the two fixes all three, and makes `Off` collapse
+/// every entry to `off`.
+fn clamped_backstops(asked_for: impl Fn(&str) -> LogLevel) -> String {
+    TARGET_BACKSTOPS
+        .iter()
+        .map(|(target, backstop)| {
+            let asked = asked_for(target);
+            let level = if verbosity(*backstop) <= verbosity(asked) {
+                *backstop
+            } else {
+                asked
+            };
+            format!("{target}={}", level.directive())
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Directive string for an explicit env-override level `s`, with the standing
+/// backstops appended, each clamped to what `s` itself grants that target.
+/// Extracted so the backstop application on the env-override path is
+/// unit-testable without installing a global subscriber.
+fn env_override_directives(s: &str) -> String {
+    format!(
+        "{s},{}",
+        clamped_backstops(|target| env_level_for_target(s, target))
+    )
+}
+
+/// The level a `RUST_LOG`-style expression grants `target`, as far as a ceiling
+/// needs to know.
+///
+/// This has to predict `EnvFilter`'s own choice, because the ceiling is emitted
+/// as another directive and therefore competes with the user's under
+/// `EnvFilter`'s rules. Those rules, from
+/// `tracing-subscriber-0.3.22/src/filter/env/directive.rs`:
+///
+/// - a directive's target matches by **raw `starts_with`** (`directive.rs:246`),
+///   not module-awareness — so `sacp=off` also governs `sacp_tokio`;
+/// - the longest matching target wins, and among equal ones the last;
+/// - a level may be named (case-insensitive) **or numeric** `0`..`5`
+///   (`LevelFilter::from_str`);
+/// - a bare word that isn't a level is a target at `TRACE` (`directive.rs:163`),
+///   and so is `target=` with the level left off (`directive.rs:203`) — note
+///   that is NOT `LevelFilter::from_str("")`, which would be `ERROR`;
+/// - **whitespace is not normalized anywhere.** `Directive::parse` walks
+///   `from.trim()` for its indices but slices the *untrimmed* `from`
+///   (`directive.rs:143` vs `:215`/`:232`), so a padded part like `"info "`
+///   fails `LevelFilter::from_str` and lands as the inert target `"info "`
+///   rather than the global level. Trimming here — which an earlier draft did —
+///   read that as `Info` and emitted a ceiling that `EnvFilter` had granted
+///   nothing, i.e. louder than asked. So nothing is trimmed: parts come straight
+///   out of `split(',')` and both sides of `=` are compared as-is.
+///
+/// **With nothing applicable the answer is `Off`, not "unbounded".** An
+/// expression like `codeg_lib=info` enables nothing else — `EnvFilter::builder()`
+/// leaves `default_directive` unset (`builder.rs:353`), so an unmatched target is
+/// disabled — and a ceiling emitted as `sacp=warn` there would *turn sacp on*, a
+/// floor masquerading as a ceiling, which is the whole bug this clamp prevents.
+///
+/// A directive naming a target this one does not cover is skipped, including a
+/// MORE specific one: `EnvFilter` prefers it for events beneath it, which is
+/// exactly the documented escape hatch and needs no help from us.
+fn env_level_for_target(expr: &str, target: &str) -> LogLevel {
+    // Specificity of the best candidate so far, so a later but broader directive
+    // can't displace a narrower earlier one. `0` is the bare global level.
+    let mut best: Option<(usize, LogLevel)> = None;
+    // Untrimmed, matching `parse_lossy`'s `split(',').filter(|s| !s.is_empty())`.
+    for part in expr.split(',') {
+        if part.is_empty() {
+            continue;
+        }
+        let (directive_target, level) = match part.split_once('=') {
+            // `target=level`. An OMITTED level is TRACE (`directive.rs:203`); an
+            // INVALID one makes the whole directive unparseable, and
+            // `parse_lossy` drops those — so must we, or we'd emit a ceiling for
+            // a directive `EnvFilter` never accepted. `CODEG_LOG=off,sacp=bogus`
+            // is the case that matters: EnvFilter keeps only `off`, so appending
+            // `sacp=warn` there would turn sacp back on.
+            //
+            // Neither side is trimmed, per the whitespace note above: `sacp = warn`
+            // really does yield the target `"sacp "` (which nothing matches) and
+            // the level `" warn"` (invalid).
+            Some((lhs, "")) => (Some(lhs), LogLevel::Trace),
+            Some((lhs, rhs)) => match parse_level(rhs) {
+                Some(level) => (Some(lhs), level),
+                None => continue,
+            },
+            // No `=`: a bare level, or else a bare target meaning TRACE
+            // (`directive.rs:163`).
+            None => match parse_level(part) {
+                Some(level) => (None, level),
+                None => (Some(part), LogLevel::Trace),
+            },
+        };
+        let specificity = match directive_target {
+            None => 0,
+            // Malformed (`=info`); `parse_lossy` drops it, so should we.
+            Some("") => continue,
+            // +1 so an empty-target match could never tie with the global level.
+            Some(t) if target.starts_with(t) => t.len() + 1,
+            Some(_) => continue,
+        };
+        if best.is_none_or(|(best_specificity, _)| specificity >= best_specificity) {
+            best = Some((specificity, level));
+        }
+    }
+    best.map_or(LogLevel::Off, |(_, level)| level)
+}
+
+/// `s` as a level, mirroring `LevelFilter::from_str`: numeric first (through
+/// `usize`, so `00` and `005` are the same as `0` and `5`), then the named levels
+/// case-insensitively. `None` if it is neither — which on a directive's left-hand
+/// side means it is a target, and on the right-hand side means the directive is
+/// invalid.
+///
+/// **Does not trim.** `LevelFilter::from_str` doesn't either, and the caller
+/// hands over slices that deliberately keep the whitespace `Directive::parse`
+/// would have kept (see the call site), so a padded level must read as invalid
+/// exactly as it does there.
+///
+/// Does NOT map `""`, whose meaning depends on position: `EnvFilter`'s directive
+/// parser reads an omitted level as `TRACE`, so the caller supplies that.
+fn parse_level(s: &str) -> Option<LogLevel> {
+    if let Ok(n) = s.parse::<usize>() {
+        return match n {
+            0 => Some(LogLevel::Off),
+            1 => Some(LogLevel::Error),
+            2 => Some(LogLevel::Warn),
+            3 => Some(LogLevel::Info),
+            4 => Some(LogLevel::Debug),
+            5 => Some(LogLevel::Trace),
+            _ => None,
+        };
+    }
+    match s.to_ascii_lowercase().as_str() {
+        "off" => Some(LogLevel::Off),
+        "error" => Some(LogLevel::Error),
+        "warn" => Some(LogLevel::Warn),
+        "info" => Some(LogLevel::Info),
+        "debug" => Some(LogLevel::Debug),
+        "trace" => Some(LogLevel::Trace),
+        _ => None,
+    }
+}
+
+/// Build the `EnvFilter` for the full settings: the global level, then each
+/// non-empty per-target override (`target=level`), then the standing backstops
+/// clamped to the global level (see [`clamped_backstops`]). The backstops go last
+/// so they win at equal specificity. `parse_lossy` silently drops any malformed
+/// target directive — the UI constrains the input to avoid that.
 pub fn build_env_filter(settings: &LogSettings) -> EnvFilter {
     let mut directives = settings.level.directive().to_string();
     for t in &settings.targets {
@@ -81,7 +350,18 @@ pub fn build_env_filter(settings: &LogSettings) -> EnvFilter {
         }
     }
     directives.push(',');
-    directives.push_str(TARGET_BACKSTOPS);
+    // What the settings asked for a backstopped target: its own override if the
+    // user set one, else the global level. A per-target override that is QUIETER
+    // than the backstop then stands — asking for less is always honored, and only
+    // asking for more is what the backstop refuses.
+    directives.push_str(&clamped_backstops(|target| {
+        settings
+            .targets
+            .iter()
+            .find(|t| t.target.trim() == target)
+            .map(|t| t.level)
+            .unwrap_or(settings.level)
+    }));
     EnvFilter::builder().parse_lossy(directives)
 }
 
@@ -226,6 +506,9 @@ fn build_subscriber(
         Some((non_blocking, guard)) => {
             Registry::default()
                 .with(filter_layer)
+                // A second global filter: an event must clear BOTH, so this one
+                // cannot be argued with by any `EnvFilter` directive.
+                .with(filter_fn(|meta| !is_credential_dump_target(meta.target())))
                 .with(fmt::layer().with_writer(std::io::stderr))
                 .with(BufferEmitLayer)
                 .with(fmt::layer().json().with_writer(non_blocking))
@@ -235,6 +518,9 @@ fn build_subscriber(
         None => {
             Registry::default()
                 .with(filter_layer)
+                // A second global filter: an event must clear BOTH, so this one
+                // cannot be argued with by any `EnvFilter` directive.
+                .with(filter_fn(|meta| !is_credential_dump_target(meta.target())))
                 .with(fmt::layer().with_writer(std::io::stderr))
                 .with(BufferEmitLayer)
                 .init();
@@ -377,41 +663,492 @@ mod tests {
 
     #[test]
     fn build_env_filter_pins_noisy_third_party_targets() {
-        // Every constructed filter clamps `kill_tree` to warn — its per-PID
-        // DEBUG firehose once grew a server log to 217GB — and keeps the
+        // Every constructed filter clamps the known firehoses and keeps the
         // logging module's own target off.
         let rendered = build_env_filter(&LogSettings {
             level: LogLevel::Info,
             targets: Vec::new(),
         })
         .to_string();
+        for pin in [
+            // Per-PID DEBUG firehose; once grew a server log to 217GB.
+            "kill_tree=warn",
+            // Full JSON-RPC payload per message (TRACE), plus a per-message
+            // INFO line — the 34GB-in-8.8h shape.
+            "sacp=warn",
+            "sacp_tokio=warn",
+            // The serialized WS handshake at TRACE — bearer token and every
+            // custom header of a remote workspace connection, in the clear.
+            // Clamped to the global `info` here: the ceiling never adds volume,
+            // it only refuses trace.
+            "tungstenite=info",
+            // Every SQL statement at INFO if a ConnectOptions forgets to opt out.
+            "sqlx::query=warn",
+            "codeg_lib::logging=off",
+        ] {
+            assert!(rendered.contains(pin), "missing backstop {pin}: {rendered}");
+        }
+    }
+
+    /// The specific accident the `tungstenite` ceiling exists to prevent: a user
+    /// raises the level to trace to diagnose a remote-workspace connection, and
+    /// the WS handshake dump takes their bearer token and every custom header —
+    /// the Cloudflare Access secret the feature exists to carry — to disk with
+    /// it. Both filter paths have to hold, since the env override builds its own.
+    #[test]
+    fn a_global_trace_cannot_capture_the_websocket_handshake_dump() {
+        let rendered = build_env_filter(&LogSettings {
+            level: LogLevel::Trace,
+            targets: Vec::new(),
+        })
+        .to_string();
         assert!(
-            rendered.contains("kill_tree=warn"),
-            "kill_tree must be pinned to warn: {rendered}"
+            rendered.contains("tungstenite=debug"),
+            "global trace re-opened the handshake dump: {rendered}"
+        );
+        let env = env_override_directives("trace");
+        assert!(
+            EnvFilter::builder()
+                .parse_lossy(&env)
+                .to_string()
+                .contains("tungstenite=debug"),
+            "CODEG_LOG=trace re-opened the handshake dump: {env}"
+        );
+    }
+
+    /// The crate ceiling stops the accident; this stops the deliberate act.
+    /// A firehose ceiling is meant to be re-openable by naming a submodule —
+    /// that is how `tungstenite::protocol=trace` stays available for frame
+    /// debugging. A credential dump is not, so the exact target it is emitted
+    /// on carries its own backstop, which wins at equal specificity, and no
+    /// target is more specific than the module holding the `trace!`.
+    #[test]
+    fn the_handshake_dump_cannot_be_reopened_even_by_naming_its_target() {
+        for asked in [
+            "tungstenite::handshake::client=trace",
+            "trace,tungstenite::handshake::client=trace",
+        ] {
+            let rendered = EnvFilter::builder()
+                .parse_lossy(env_override_directives(asked))
+                .to_string();
+            assert!(
+                !rendered.contains("tungstenite::handshake::client=trace"),
+                "CODEG_LOG={asked} reopened the dump: {rendered}"
+            );
+        }
+
+        // The Settings UI builds its filter down a different path.
+        let rendered = build_env_filter(&LogSettings {
+            level: LogLevel::Trace,
+            targets: vec![TargetDirective {
+                target: "tungstenite::handshake::client".into(),
+                level: LogLevel::Trace,
+            }],
+        })
+        .to_string();
+        assert!(
+            !rendered.contains("tungstenite::handshake::client=trace"),
+            "the Settings UI reopened the dump: {rendered}"
+        );
+
+        // Asking for less is still honored — a ceiling never raises verbosity.
+        assert!(
+            env_override_directives("tungstenite::handshake::client=off")
+                .contains("tungstenite::handshake::client=off"),
+            "off must still mean off"
+        );
+
+        // And frame-level debugging stays reachable, which is the whole reason
+        // the crate-level entry remains a re-openable ceiling.
+        let frames = EnvFilter::builder()
+            .parse_lossy(env_override_directives("info,tungstenite::protocol=trace"))
+            .to_string();
+        assert!(
+            frames.contains("tungstenite::protocol=trace"),
+            "frame tracing must survive the crate ceiling: {frames}"
+        );
+    }
+
+    /// Why the level table cannot be the whole answer, pinned as a fact rather
+    /// than an argument: `EnvFilter` ranks a field-qualified directive above a
+    /// plain target one, and the dump is a formatted event so it has a
+    /// `message` field to qualify on. The first assertion shows the ceiling
+    /// losing; the second shows what actually holds the line.
+    #[test]
+    fn a_field_qualified_directive_defeats_the_ceiling_but_not_the_denial() {
+        let rendered = EnvFilter::builder()
+            .parse_lossy(env_override_directives(
+                "tungstenite::handshake::client[{message}]=trace",
+            ))
+            .to_string();
+        assert!(
+            rendered.contains("tungstenite::handshake::client[{message}]=trace"),
+            "expected the level table to be outranked here: {rendered}"
+        );
+
+        assert!(
+            is_credential_dump_target("tungstenite::handshake::client"),
+            "the dump's target must be denied outright, whatever the filter says"
+        );
+        // Exact match only — the denial must not swallow its neighbours.
+        for neighbour in [
+            "tungstenite::handshake::server",
+            "tungstenite::handshake",
+            "tungstenite::protocol",
+            "tungstenite",
+        ] {
+            assert!(
+                !is_credential_dump_target(neighbour),
+                "{neighbour} must stay reachable"
+            );
+        }
+    }
+
+    /// The predicate above is only half the claim; this exercises the wiring,
+    /// with the same two global filters the real subscriber is built from and
+    /// the most permissive directive anyone could write for the dump.
+    #[test]
+    fn the_denial_layer_drops_the_dump_and_nothing_else() {
+        use std::sync::{Arc, Mutex};
+
+        struct CaptureTargets(Arc<Mutex<Vec<String>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CaptureTargets {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(event.metadata().target().to_string());
+            }
+        }
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = Registry::default()
+            .with(
+                EnvFilter::builder()
+                    .parse_lossy("trace,tungstenite::handshake::client[{message}]=trace"),
+            )
+            .with(filter_fn(|meta| !is_credential_dump_target(meta.target())))
+            .with(CaptureTargets(seen.clone()));
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::trace!(target: "tungstenite::handshake::client", "Request: bearer s3cret");
+            tracing::trace!(target: "tungstenite::protocol", "frame");
+            tracing::trace!(target: "codeg_lib::acp", "unrelated");
+        });
+
+        let seen = seen.lock().unwrap();
+        assert!(
+            !seen.iter().any(|t| t == "tungstenite::handshake::client"),
+            "the dump reached a sink: {seen:?}"
         );
         assert!(
-            rendered.contains("codeg_lib::logging=off"),
-            "logging backstop must remain: {rendered}"
+            seen.iter().any(|t| t == "tungstenite::protocol"),
+            "frame tracing must still arrive: {seen:?}"
+        );
+        assert!(
+            seen.iter().any(|t| t == "codeg_lib::acp"),
+            "unrelated targets must still arrive: {seen:?}"
         );
     }
 
     #[test]
-    fn env_override_appends_backstops_so_debug_cannot_reopen_kill_tree() {
+    fn env_override_appends_backstops_so_debug_cannot_reopen_them() {
         // The explicit RUST_LOG/CODEG_LOG path bypasses build_env_filter, so it
         // must apply the same backstops itself — otherwise `RUST_LOG=debug`
-        // re-opens the kill_tree per-PID firehose.
+        // re-opens the kill_tree per-PID firehose and the sacp wire dump.
         assert_eq!(
             env_override_directives("debug"),
-            "debug,kill_tree=warn,codeg_lib::logging=off"
+            "debug,kill_tree=warn,sacp=warn,sacp_tokio=warn,tungstenite=debug,\
+             tungstenite::handshake::client=debug,sqlx::query=warn,codeg_lib::logging=off"
         );
-        // And the parsed filter still carries the clamp under a global debug.
+        // And the parsed filter still carries the clamps under a global debug.
         let rendered = EnvFilter::builder()
             .parse_lossy(env_override_directives("debug"))
             .to_string();
-        assert!(
-            rendered.contains("kill_tree=warn"),
-            "kill_tree clamp must survive a global debug override: {rendered}"
+        for pin in ["kill_tree=warn", "sacp=warn", "sqlx::query=warn"] {
+            assert!(
+                rendered.contains(pin),
+                "{pin} clamp must survive a global debug override: {rendered}"
+            );
+        }
+    }
+
+    /// A backstop is a CEILING, not a pin. `LogLevel::Off` is documented as
+    /// "disables capture entirely", so a bare `target=warn` appended after it —
+    /// which is what this used to emit — made "logging off" still write, and
+    /// two of sacp's `warn!` sites fire per message under a misbehaving agent.
+    #[test]
+    fn off_means_off_and_backstops_never_raise_verbosity() {
+        let off = build_env_filter(&LogSettings {
+            level: LogLevel::Off,
+            targets: Vec::new(),
+        })
+        .to_string();
+        for target in ["kill_tree", "sacp", "sacp_tokio", "sqlx::query"] {
+            assert!(
+                off.contains(&format!("{target}=off")),
+                "{target} must collapse to off under a global Off: {off}"
+            );
+            assert!(
+                !off.contains(&format!("{target}=warn")),
+                "{target} must not be re-enabled under a global Off: {off}"
+            );
+        }
+
+        // Same rule one step up: a global Error must not gain WARN lines back.
+        let error = build_env_filter(&LogSettings {
+            level: LogLevel::Error,
+            targets: Vec::new(),
+        })
+        .to_string();
+        assert!(error.contains("sacp=error"), "{error}");
+        assert!(!error.contains("sacp=warn"), "{error}");
+
+        // And the env-override path. `RUST_LOG=off` must be silent too.
+        assert_eq!(
+            env_override_directives("OFF"),
+            "OFF,kill_tree=off,sacp=off,sacp_tokio=off,tungstenite=off,\
+             tungstenite::handshake::client=off,sqlx::query=off,codeg_lib::logging=off",
+            "a bare off override collapses the ceilings, case-insensitively"
         );
+    }
+
+    /// The env path has no single global level to clamp against, so the ceiling
+    /// is resolved per target against the expression itself. Clamping only when
+    /// the whole expression was a bare level (the first attempt) left the two
+    /// cases below still emitting `sacp=warn` — overruling an explicit request
+    /// for silence on a per-message path.
+    #[test]
+    fn env_override_clamps_per_target_not_just_bare_levels() {
+        // An explicit directive for a backstopped target must be honored when it
+        // asks for LESS. `sacp=off` alone also enables nothing else, so every
+        // other ceiling collapses to off too.
+        assert_eq!(
+            env_override_directives("sacp=off"),
+            "sacp=off,kill_tree=off,sacp=off,sacp_tokio=off,tungstenite=off,\
+             tungstenite::handshake::client=off,sqlx::query=off,codeg_lib::logging=off"
+        );
+        // ...but the same target asking for MORE is still refused: that is the
+        // firehose this whole clamp exists to keep shut.
+        assert!(
+            env_override_directives("sacp=trace").contains("sacp=warn"),
+            "a crate-wide trace request must still be clamped"
+        );
+        // A compound expression's bare level is the ceiling for targets it
+        // doesn't name.
+        let compound = env_override_directives("off,codeg_lib::acp=trace");
+        assert!(compound.contains("sacp=off"), "{compound}");
+        assert!(!compound.contains("sacp=warn"), "{compound}");
+        let error_compound = env_override_directives("error,codeg_lib::acp=info");
+        assert!(error_compound.contains("sacp=error"), "{error_compound}");
+        assert!(!error_compound.contains("sacp=warn"), "{error_compound}");
+        // No bare level at all: EnvFilter leaves unmatched targets disabled, so a
+        // ceiling of `off` is the honest answer — emitting `warn` here would turn
+        // sacp ON in an expression that never asked for it.
+        let targeted = env_override_directives("codeg_lib::acp=info");
+        assert!(targeted.contains("sacp=off"), "{targeted}");
+        assert!(!targeted.contains("sacp=warn"), "{targeted}");
+    }
+
+    #[test]
+    fn env_level_for_target_resolves_like_env_filter_would() {
+        // Exact target beats the global, and the last exact wins.
+        assert_eq!(env_level_for_target("info,sacp=off", "sacp"), LogLevel::Off);
+        assert_eq!(
+            env_level_for_target("sacp=warn,sacp=debug", "sacp"),
+            LogLevel::Debug
+        );
+        // A later but BROADER directive can't displace a narrower earlier one.
+        assert_eq!(
+            env_level_for_target("sacp=off,trace", "sacp"),
+            LogLevel::Off
+        );
+        // A different target doesn't answer for this one.
+        assert_eq!(
+            env_level_for_target("info,other=trace", "sacp"),
+            LogLevel::Info
+        );
+        // A MORE specific target doesn't either — EnvFilter prefers it for events
+        // beneath it, which is the escape hatch.
+        assert_eq!(
+            env_level_for_target("info,sacp::jsonrpc=trace", "sacp"),
+            LogLevel::Info
+        );
+        // Span/field syntax falls through to the global by design.
+        assert_eq!(
+            env_level_for_target("info,sacp[span]=trace", "sacp"),
+            LogLevel::Info
+        );
+        // Nothing applicable at all ⇒ off, not unbounded.
+        assert_eq!(env_level_for_target("other=trace", "sacp"), LogLevel::Off);
+        assert_eq!(env_level_for_target("", "sacp"), LogLevel::Off);
+        // Case is tolerated in a level.
+        assert_eq!(
+            env_level_for_target("INFO,sacp=WARN", "sacp"),
+            LogLevel::Warn
+        );
+        // Malformed `=level` is dropped, like `parse_lossy` does.
+        assert_eq!(env_level_for_target("=info", "sacp"), LogLevel::Off);
+    }
+
+    /// `EnvFilter` normalizes whitespace NOWHERE: `Directive::parse` walks
+    /// `from.trim()` for its indices but slices the untrimmed `from`
+    /// (`directive.rs:143` vs `:215`), so `"info "` fails `LevelFilter::from_str`
+    /// and becomes the inert target `"info "`. A resolver that trimmed read it as
+    /// the global `Info` and emitted a ceiling for something the filter had
+    /// granted nothing — louder than asked.
+    ///
+    /// Asserted on the **parsed filter**, not just the resolver, so the two can't
+    /// drift apart silently.
+    #[test]
+    fn padded_directives_are_inert_to_both_the_filter_and_the_ceiling() {
+        for expr in ["info ,sacp =off", " info,sacp = off", "info , sacp=off"] {
+            let level = env_level_for_target(expr, "sacp");
+            assert_eq!(
+                level,
+                LogLevel::Off,
+                "a padded directive grants nothing, so the ceiling is off: {expr}"
+            );
+            let rendered = EnvFilter::builder()
+                .parse_lossy(env_override_directives(expr))
+                .to_string();
+            assert!(
+                !rendered.contains("sacp=warn"),
+                "padded `{expr}` must not end up enabling sacp: {rendered}"
+            );
+            assert!(
+                !rendered.contains("sacp_tokio=warn"),
+                "...nor sacp_tokio: {rendered}"
+            );
+        }
+
+        // The unpadded spelling of the same intent still works normally, so this
+        // is fidelity to EnvFilter rather than a blanket refusal.
+        assert_eq!(env_level_for_target("info,sacp=off", "sacp"), LogLevel::Off);
+        assert_eq!(
+            env_level_for_target("info,other=off", "sacp"),
+            LogLevel::Info
+        );
+    }
+
+    /// `parse_lossy` DROPS a directive whose level is invalid — it does not
+    /// reinterpret it. Treating an unparseable level as `Trace` made the ceiling
+    /// louder than the expression: EnvFilter kept only the global, and we appended
+    /// a `warn` for a target it had discarded.
+    #[test]
+    fn an_invalid_level_drops_the_directive_instead_of_widening_it() {
+        // EnvFilter keeps only `off` here, so the ceiling must stay `off` too.
+        assert_eq!(
+            env_level_for_target("off,sacp=bogus", "sacp"),
+            LogLevel::Off
+        );
+        let rendered = env_override_directives("off,sacp=bogus");
+        assert!(rendered.contains("sacp=off"), "{rendered}");
+        assert!(!rendered.contains("sacp=warn"), "{rendered}");
+        assert!(!rendered.contains("sacp_tokio=warn"), "{rendered}");
+
+        // Numeric spellings go through `usize` in `LevelFilter::from_str`, so
+        // these are levels, not garbage — and `00` is `off`, not `trace`.
+        assert_eq!(env_level_for_target("sacp=00", "sacp"), LogLevel::Off);
+        assert_eq!(env_level_for_target("sacp=005", "sacp"), LogLevel::Trace);
+        // Out-of-range numbers are invalid, so that directive drops.
+        assert_eq!(env_level_for_target("off,sacp=9", "sacp"), LogLevel::Off);
+        // A padded level is invalid to `LevelFilter::from_str`, so it drops too.
+        assert_eq!(
+            env_level_for_target("off,sacp= warn", "sacp"),
+            LogLevel::Off
+        );
+    }
+
+    /// The forms `EnvFilter` accepts that a naive "is it a bare level?" reader
+    /// misses. Each of these used to resolve to `Off` and thus emit `sacp=off`,
+    /// silently disabling a target the expression had asked to see.
+    #[test]
+    fn env_level_for_target_understands_every_directive_form() {
+        // Numeric levels (`LevelFilter::from_str`): 0=off .. 5=trace.
+        assert_eq!(env_level_for_target("5", "sacp"), LogLevel::Trace);
+        assert_eq!(env_level_for_target("0", "sacp"), LogLevel::Off);
+        assert_eq!(env_level_for_target("sacp=2", "sacp"), LogLevel::Warn);
+        // A bare target with no level means TRACE for it (directive.rs:163).
+        assert_eq!(env_level_for_target("sacp", "sacp"), LogLevel::Trace);
+        // So does `target=` with the level omitted (directive.rs:203) — NOT the
+        // `ERROR` that `LevelFilter::from_str("")` alone would give.
+        assert_eq!(env_level_for_target("sacp=", "sacp"), LogLevel::Trace);
+
+        // EnvFilter matches targets by raw `starts_with`, so a shorter directive
+        // target also governs longer ones: `sacp=off` covers `sacp_tokio` too,
+        // and the ceiling for `sacp_tokio` must not re-enable it.
+        assert_eq!(
+            env_level_for_target("info,sacp=off", "sacp_tokio"),
+            LogLevel::Off
+        );
+        assert!(
+            env_override_directives("info,sacp=off").contains("sacp_tokio=off"),
+            "a prefix directive governs the longer target as EnvFilter would"
+        );
+
+        // And the clamp still refuses "louder" for each of these forms.
+        for expr in ["sacp", "sacp=", "sacp=5", "5"] {
+            assert!(
+                env_override_directives(expr).contains("sacp=warn"),
+                "{expr} must still be clamped to warn"
+            );
+        }
+    }
+
+    /// The other direction: a user turning a clamped target DOWN must be obeyed.
+    /// The backstop exists to refuse "louder", never "quieter".
+    #[test]
+    fn a_quieter_per_target_override_beats_the_backstop() {
+        let rendered = build_env_filter(&LogSettings {
+            level: LogLevel::Info,
+            targets: vec![TargetDirective {
+                target: "sacp".into(),
+                level: LogLevel::Off,
+            }],
+        })
+        .to_string();
+        assert!(rendered.contains("sacp=off"), "{rendered}");
+        assert!(!rendered.contains("sacp=warn"), "{rendered}");
+    }
+
+    #[test]
+    fn a_more_specific_target_still_beats_the_crate_level_backstop() {
+        // The backstops are a floor for the *crate*, not a gag order: pinning
+        // `sacp=warn` must not take away protocol-level debugging. EnvFilter
+        // matches the most specific directive, so a submodule override wins even
+        // though the backstop is appended after it. This is the documented
+        // escape hatch for capturing the ACP wire.
+        let rendered = EnvFilter::builder()
+            .parse_lossy(env_override_directives(
+                "info,sacp::jsonrpc::transport_actor=trace",
+            ))
+            .to_string();
+        assert!(
+            rendered.contains("sacp::jsonrpc::transport_actor=trace"),
+            "submodule override must survive the crate backstop: {rendered}"
+        );
+        assert!(
+            rendered.contains("sacp=warn"),
+            "the crate-level floor stays for every other sacp module: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_same_target_override_loses_to_the_backstop() {
+        // The other half of the contract: a directive on the *same* target as a
+        // backstop is overwritten by it (last one wins for equal specificity),
+        // so neither the Settings UI nor `RUST_LOG=sacp=trace` can reopen the
+        // whole-crate firehose by accident.
+        let rendered = EnvFilter::builder()
+            .parse_lossy(env_override_directives("sacp=trace"))
+            .to_string();
+        assert!(rendered.contains("sacp=warn"), "{rendered}");
+        assert!(!rendered.contains("sacp=trace"), "{rendered}");
     }
 
     #[test]

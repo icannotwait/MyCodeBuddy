@@ -10,6 +10,7 @@ use sea_orm::{
     TransactionTrait,
 };
 
+use crate::acp::agent_mentions::strip_route_separator_from_prompt;
 #[cfg(any(test, feature = "test-utils"))]
 use crate::acp::connection::{connection_channel, matching_config_pair};
 use crate::acp::connection::{
@@ -4707,7 +4708,7 @@ impl ConnectionManager {
         &self,
         db: Option<&AppDatabase>,
         conn_id: &str,
-        blocks: Vec<PromptInputBlock>,
+        mut blocks: Vec<PromptInputBlock>,
         user_message: Option<(String, Vec<crate::acp::UserMessageBlock>)>,
         // True only for broker-generated delegation kickoffs. They must reach
         // the child before pre-kickoff telemetry can hold the foreground prompt.
@@ -4733,6 +4734,11 @@ impl ConnectionManager {
             return Err(AcpError::protocol(
                 "prompt must contain at least one content block".to_string(),
             ));
+        }
+        if strip_route_separator_from_prompt(&mut blocks) {
+            tracing::debug!(
+                "[ACP][{conn_id}] removed the reserved routing separator from an outgoing prompt"
+            );
         }
         // Precompute mandatory ids only if this is a root user prompt. Applied
         // AFTER the turn is admitted (below) so a rejected concurrent send
@@ -5249,6 +5255,14 @@ impl ConnectionManager {
             return Err(AcpError::protocol(
                 "prompt must contain at least one content block".to_string(),
             ));
+        }
+        // Scrub the reserved separator HERE, before the conversation row, the
+        // optimistic broadcast, and the ledger all take their copy of `blocks`,
+        // so every persisted / displayed / on-the-wire copy is byte-identical.
+        if strip_route_separator_from_prompt(&mut blocks) {
+            tracing::debug!(
+                "[ACP][{conn_id}] removed the reserved routing separator from an outgoing prompt"
+            );
         }
         // Caller-supplied conversation_id requires folder_id (we include it in
         // the emitted ConversationLinked event so subscribers don't have to
@@ -10065,6 +10079,116 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
                 })
             }
         }
+    }
+
+    async fn spawn_for_resume(
+        &self,
+        parent_connection_id: &str,
+        agent_type: AgentType,
+        working_dir: Option<String>,
+        external_session_id: &str,
+        preferred_mode_id: Option<String>,
+        preferred_config_values: BTreeMap<String, String>,
+    ) -> Result<
+        crate::acp::delegation::spawner::ResumedSpawn,
+        crate::acp::delegation::spawner::SpawnerError,
+    > {
+        use crate::acp::delegation::spawner::{ResumedSpawn, SpawnerError};
+        let parent = self
+            .resolve_parent_spawn_launch_snapshot(parent_connection_id, false)
+            .await?;
+        let effective_working_dir = working_dir.or(parent.parent_working_dir);
+        let runtime = self.runtime.snapshot();
+        let launch_inputs = crate::acp::terminal_context::build_acp_launch_inputs(
+            &self.db,
+            agent_type,
+            None,
+            self.data_dir.as_path(),
+            crate::acp::terminal_context::AcpRouteRequest::codeg_child(),
+            &runtime,
+        )
+        .await
+        .map_err(|e| SpawnerError::Spawn(e.to_string()))?;
+
+        // Detect dedup reuse BEFORE spawning, with the SAME lookup
+        // `spawn_agent` runs at its own entry: a live connection for this
+        // (agent, working_dir, session_id) — e.g. the user has the canceled
+        // child session open in a tab — makes `spawn_agent` return that
+        // connection instead of creating one. The broker must know, because
+        // its failure teardown may only disconnect a connection this call
+        // actually created. A connection appearing in the pre-check→spawn
+        // window is missed, but that window is milliseconds and a misfire
+        // additionally requires the send itself to fail.
+        let working_dir_path = effective_working_dir.as_ref().map(std::path::PathBuf::from);
+        let pre_existing = self
+            .manager
+            .find_connection_for_reuse(
+                agent_type,
+                working_dir_path.as_ref(),
+                Some(external_session_id),
+            )
+            .await;
+
+        // `session_id = Some(..)` is the whole difference vs `spawn`: the
+        // connection loads the child's prior agent session (and its context)
+        // instead of minting a fresh one.
+        let connection_id = self
+            .manager
+            .spawn_agent(
+                agent_type,
+                effective_working_dir,
+                Some(external_session_id.to_string()),
+                launch_inputs,
+                parent.owner_window_label,
+                parent.emitter,
+                preferred_mode_id,
+                preferred_config_values,
+                parent.launch_context,
+                parent.owner_operation_id,
+                Some(parent_connection_id.to_string()),
+            )
+            .await
+            .map_err(|e| SpawnerError::Spawn(e.to_string()))?;
+        let reused = pre_existing.as_deref() == Some(connection_id.as_str());
+        Ok(ResumedSpawn {
+            connection_id,
+            reused,
+        })
+    }
+
+    async fn send_resume_prompt(
+        &self,
+        conn_id: &str,
+        prompt: String,
+        folder_id: i32,
+        child_conversation_id: i32,
+    ) -> Result<(), crate::acp::delegation::spawner::SpawnerError> {
+        use crate::acp::delegation::spawner::SpawnerError;
+        // Adopt the child's EXISTING row (caller-supplied path) — no delegation
+        // link: the row already carries parent_id / parent_tool_use_id /
+        // delegation_call_id from the original delegation, and
+        // `send_prompt_linked` rejects a link combined with an explicit
+        // conversation_id precisely because adopted rows own their linkage.
+        self.manager
+            .send_prompt_linked(
+                &self.db,
+                conn_id,
+                vec![PromptInputBlock::Text { text: prompt }],
+                Some(folder_id),
+                Some(child_conversation_id),
+                None,
+                None,
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| SpawnerError::send_with_child(e.to_string(), child_conversation_id))
+    }
+
+    async fn has_live_connection_for_conversation(&self, conversation_id: i32) -> bool {
+        self.manager
+            .find_connection_by_conversation_id(conversation_id)
+            .await
+            .is_some()
     }
 
     async fn cancel(
@@ -18116,6 +18240,132 @@ mod tests {
             um.1.iter().all(|t| !t.contains("codeg_terminal_context")),
             "user_message must never leak terminal context block, got {um:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn linked_ui_prompt_leaves_the_user_blocks_untouched() {
+        use crate::db::test_helpers;
+
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/agent-routes").await;
+        let mgr = ConnectionManager::new();
+        let conn_id = "conn-agent-routes";
+        let mut cmd_rx = insert_live_connection(
+            &mgr,
+            conn_id,
+            AgentType::Codex,
+            Some(PathBuf::from("/tmp/agent-routes")),
+        )
+        .await;
+
+        mgr.send_prompt_linked_with_message_id(
+            &db,
+            conn_id,
+            vec![PromptInputBlock::Text {
+                text: "ask [@Antigravity](codeg://agent/antigravity) to review".into(),
+            }],
+            Some(folder_id),
+            None,
+            None,
+            Some("optimistic-route".into()),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let command = cmd_rx.try_recv().expect("one prompt command");
+        let ConnectionCommand::Prompt {
+            blocks,
+            user_message,
+            ..
+        } = command
+        else {
+            panic!("expected prompt command");
+        };
+        // The routing frame is appended at the agent boundary in the connection
+        // loop, never here: what the manager enqueues, persists and broadcasts
+        // is exactly what the user typed.
+        assert!(matches!(
+            blocks.as_slice(),
+            [PromptInputBlock::Text { text }]
+                if text == "ask [@Antigravity](codeg://agent/antigravity) to review"
+        ));
+        let (message_id, user_blocks) = user_message.expect("root prompt is broadcast");
+        assert_eq!(message_id, "optimistic-route");
+        assert!(matches!(
+            user_blocks.as_slice(),
+            [crate::acp::types::UserMessageBlock::Text { text }]
+                if text == "ask [@Antigravity](codeg://agent/antigravity) to review"
+        ));
+    }
+
+    #[tokio::test]
+    async fn reserved_route_separator_is_scrubbed_not_rejected() {
+        // The separator is invisible and usually arrives inside content the user
+        // did not author — an attached file's bytes land in `Resource.text`.
+        // Rejecting made such a message permanently unsendable; the prompt must
+        // go through with the character removed from EVERY copy.
+        use crate::db::test_helpers;
+
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/route-separator").await;
+        let mgr = ConnectionManager::new();
+        let conn_id = "conn-route-separator";
+        let mut cmd_rx = insert_live_connection(
+            &mgr,
+            conn_id,
+            AgentType::Codex,
+            Some(PathBuf::from("/tmp/route-separator")),
+        )
+        .await;
+
+        mgr.send_prompt_linked_with_message_id(
+            &db,
+            conn_id,
+            vec![
+                PromptInputBlock::Text {
+                    text: "user\u{001e}frame".into(),
+                },
+                PromptInputBlock::Resource {
+                    uri: "file:///tmp/records.dat".into(),
+                    mime_type: Some("text/plain".into()),
+                    text: Some("row-a\u{001e}row-b".into()),
+                    blob: None,
+                },
+            ],
+            Some(folder_id),
+            None,
+            None,
+            Some("optimistic-reserved".into()),
+            None,
+        )
+        .await
+        .expect("an invisible control character must not block the send");
+
+        let ConnectionCommand::Prompt {
+            blocks,
+            user_message,
+            ..
+        } = cmd_rx
+            .try_recv()
+            .expect("the prompt still reaches the agent")
+        else {
+            panic!("expected prompt command");
+        };
+        assert!(matches!(
+            blocks.as_slice(),
+            [
+                PromptInputBlock::Text { text },
+                PromptInputBlock::Resource { text: Some(resource), .. },
+            ] if text == "userframe" && resource == "row-arow-b"
+        ));
+        // The broadcast copy is projected from the SAME scrubbed blocks, so the
+        // stored, displayed, and on-the-wire messages cannot drift apart.
+        let (_, user_blocks) = user_message.expect("root prompt is broadcast");
+        assert!(matches!(
+            user_blocks.first(),
+            Some(crate::acp::types::UserMessageBlock::Text { text }) if text == "userframe"
+        ));
     }
 
     #[tokio::test]

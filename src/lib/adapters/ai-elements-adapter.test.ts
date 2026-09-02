@@ -9,6 +9,7 @@ import {
   groupConsecutiveDelegationStatus,
   groupGoalRuns,
   groupConsecutiveToolCalls,
+  isTurnAnswerPart,
   mergeAdjacentDelegationStatusGroups,
   type AdaptedContentPart,
   type AdaptedToolCallPart,
@@ -25,6 +26,17 @@ function poll(toolName: string, taskId?: string): AdaptedToolCallPart {
 }
 
 const text: AdaptedContentPart = { type: "text", text: "checking again" }
+
+it("classifies a delegation work unit as progress", () => {
+  expect(
+    isTurnAnswerPart({
+      type: "delegation-work-unit",
+      key: "task-1",
+      sources: [poll("delegate_to_agent", "task-1")],
+      explicitUserCancel: false,
+    })
+  ).toBe(false)
+})
 
 function pollsOf(part: AdaptedContentPart): AdaptedToolCallPart[] {
   if (part.type !== "delegation-status-group") {
@@ -1314,6 +1326,7 @@ describe("adaptMessageTurn — image tool results", () => {
     expect(part.image?.data).toBe("QUJD")
     expect(part.image?.mime_type).toBe("image/png")
     expect(part.revisedPrompt).toBeNull()
+    expect(part.label).toBe("Clean V1")
   })
 
   it("emits one generated-image part per image (multi-page PDF read)", () => {
@@ -1349,6 +1362,45 @@ describe("adaptMessageTurn — image tool results", () => {
       "generated-image",
       "generated-image",
     ])
+    expect(
+      adapted.content
+        .filter((p) => p.type === "generated-image")
+        .every((p) => p.type === "generated-image" && p.label === "Doc")
+    ).toBe(true)
+  })
+
+  it("names a fetched page from its URL, not Image generation", () => {
+    const adapted = adaptMessageTurn(
+      {
+        id: "fetch-page",
+        role: "assistant",
+        timestamp: "2026-06-02T00:00:00.000Z",
+        blocks: [
+          {
+            type: "tool_use",
+            tool_use_id: "toolu_3",
+            tool_name: "WebFetch",
+            input_preview: JSON.stringify({
+              url: "https://example.com/docs/getting-started",
+            }),
+          },
+          {
+            type: "tool_result",
+            tool_use_id: "toolu_3",
+            output_preview: null,
+            is_error: false,
+            images: [{ data: "UAGE3", mime_type: "image/png" }],
+          },
+        ],
+      },
+      msgText,
+      false
+    )
+    const part = adapted.content[0]
+    if (part.type !== "generated-image") {
+      throw new Error("expected a generated-image part")
+    }
+    expect(part.label).toBe("Getting Started")
   })
 
   it("leaves a normal text Read result as a tool card (no regression)", () => {

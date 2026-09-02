@@ -118,6 +118,7 @@ impl OrchestrationBindingSnapshotCache {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn consume_admission_ticket_under_guard(
         &self,
         guard: &OrchestrationMutationGuard<'_>,
@@ -198,6 +199,7 @@ impl OrchestrationBindingSnapshotCache {
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn first_page_with_admission_loader<F, Fut>(
         &self,
         parent_id: i32,

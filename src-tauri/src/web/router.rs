@@ -295,6 +295,7 @@ pub fn build_router(
         )
         .route("/get_folder", post(handlers::folders::get_folder))
         .route("/open_folder", post(handlers::folders::open_folder))
+        .route("/open_in_code", post(handlers::folders::open_in_code))
         .route(
             "/open_worktree_folder",
             post(handlers::folders::open_worktree_folder),
@@ -319,7 +320,30 @@ pub fn build_router(
             "/remove_folder_from_workspace",
             post(handlers::folders::remove_folder_from_workspace),
         )
-        .route("/reorder_folders", post(handlers::folders::reorder_folders))
+        .route(
+            "/list_folder_groups",
+            post(handlers::folders::list_folder_groups),
+        )
+        .route(
+            "/create_folder_group",
+            post(handlers::folders::create_folder_group),
+        )
+        .route(
+            "/update_folder_group",
+            post(handlers::folders::update_folder_group),
+        )
+        .route(
+            "/delete_folder_group",
+            post(handlers::folders::delete_folder_group),
+        )
+        .route(
+            "/apply_sidebar_layout",
+            post(handlers::folders::apply_sidebar_layout),
+        )
+        .route(
+            "/set_folder_group",
+            post(handlers::folders::set_folder_group),
+        )
         .route(
             "/update_folder_color",
             post(handlers::folders::update_folder_color),
@@ -331,6 +355,39 @@ pub fn build_router(
         .route(
             "/update_folder_default_agent",
             post(handlers::folders::update_folder_default_agent),
+        )
+        // ─── Canvas ───
+        .route(
+            "/canvas_list_nodes",
+            post(handlers::canvas::canvas_list_nodes),
+        )
+        .route(
+            "/canvas_create_node",
+            post(handlers::canvas::canvas_create_node),
+        )
+        .route(
+            "/canvas_group_into_region",
+            post(handlers::canvas::canvas_group_into_region),
+        )
+        .route(
+            "/canvas_update_node",
+            post(handlers::canvas::canvas_update_node),
+        )
+        .route(
+            "/canvas_move_nodes",
+            post(handlers::canvas::canvas_move_nodes),
+        )
+        .route(
+            "/canvas_detach_member",
+            post(handlers::canvas::canvas_detach_member),
+        )
+        .route(
+            "/canvas_delete_node",
+            post(handlers::canvas::canvas_delete_node),
+        )
+        .route(
+            "/canvas_delete_nodes",
+            post(handlers::canvas::canvas_delete_nodes),
         )
         .route(
             "/add_folder_to_history",
@@ -926,6 +983,18 @@ pub fn build_router(
             post(handlers::acp::acp_sync_antigravity_settings),
         )
         .route(
+            "/acp_antigravity_login_start",
+            post(handlers::acp::acp_antigravity_login_start),
+        )
+        .route(
+            "/acp_antigravity_login_finish",
+            post(handlers::acp::acp_antigravity_login_finish),
+        )
+        .route(
+            "/acp_antigravity_login_cancel",
+            post(handlers::acp::acp_antigravity_login_cancel),
+        )
+        .route(
             "/acp_pi_project_trust_state",
             post(handlers::acp::acp_pi_project_trust_state),
         )
@@ -1510,6 +1579,39 @@ pub fn build_router(
         .route(
             "/forge_list_labels",
             post(handlers::forge::forge_list_labels),
+        )
+        .route(
+            "/forge_list_comments",
+            post(handlers::forge::forge_list_comments),
+        )
+        .route(
+            "/forge_create_comment",
+            post(handlers::forge::forge_create_comment),
+        )
+        .route(
+            "/forge_set_item_state",
+            post(handlers::forge::forge_set_item_state),
+        )
+        .route(
+            "/forge_create_issue",
+            post(handlers::forge::forge_create_issue),
+        )
+        .route(
+            "/forge_change_detail",
+            post(handlers::forge::forge_change_detail),
+        )
+        .route(
+            "/forge_change_files",
+            post(handlers::forge::forge_change_files),
+        )
+        .route("/forge_identity", post(handlers::forge::forge_identity))
+        .route(
+            "/forge_merge_options",
+            post(handlers::forge::forge_merge_options),
+        )
+        .route(
+            "/forge_merge_change",
+            post(handlers::forge::forge_merge_change),
         )
         .route(
             "/work_task_create_from_forge",

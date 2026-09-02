@@ -1149,6 +1149,11 @@ pub(crate) struct ClaudeRecordAccumulator {
     /// `message.id` → index in `messages` of the line currently carrying that
     /// API call's usage. See [`Self::claim_assistant_usage`].
     usage_owner_by_message_id: std::collections::HashMap<String, usize>,
+    /// API response id for the immediately preceding assistant record. Claude
+    /// writes each content block on its own JSONL line, so this lets adjacent
+    /// thinking-only fragments from one response share a message without
+    /// crossing text, tool, or user boundaries.
+    pending_assistant_message_id: Option<String>,
 }
 
 impl ClaudeRecordAccumulator {
@@ -1173,6 +1178,7 @@ impl ClaudeRecordAccumulator {
             last_slash_command_prompt_id: None,
             assistant_origins: std::collections::HashMap::new(),
             usage_owner_by_message_id: std::collections::HashMap::new(),
+            pending_assistant_message_id: None,
         }
     }
 
@@ -1181,10 +1187,10 @@ impl ClaudeRecordAccumulator {
     /// Claude Code writes **one JSONL line per content block**, not one per API
     /// call: a response that thinks, then answers, then calls two tools becomes
     /// four `assistant` lines sharing a single `message.id` — and every one of
-    /// them repeats that call's *complete* usage object. Each line becomes its
-    /// own [`UnifiedMessage`], its own turn, and (for the dashboard) its own
-    /// fact row, so summing them multiplies one API call's tokens by its block
-    /// count. Measured over a real transcript tree that is a 2.4× over-count
+    /// them repeats that call's *complete* usage object. Most block lines become
+    /// separate [`UnifiedMessage`]s and dashboard fact rows, so summing them
+    /// multiplies one API call's tokens by its block count. Measured over a real
+    /// transcript tree that is a 2.4× over-count
     /// (17.1 B counted vs 7.0 B actually spent), and 74 % of all calls are
     /// affected — a tool-heavy session inflates the most.
     ///
@@ -1201,10 +1207,10 @@ impl ClaudeRecordAccumulator {
     /// reported.
     ///
     /// `owner_index` is the slot the claiming message WILL occupy — normally
-    /// `messages.len()` (a fresh push). `parsers::qoder` merges the fragments of
-    /// one `message.id` into a single bubble, so it claims for
-    /// `messages.len() - 1` instead; passing it explicitly keeps the demotion
-    /// bookkeeping correct for both shapes.
+    /// `messages.len()` (a fresh push). `parsers::qoder` merges all adjacent
+    /// response fragments, while this parser merges adjacent thinking-only
+    /// fragments, so both may claim for `messages.len() - 1`; passing the index
+    /// explicitly keeps the demotion bookkeeping correct for every shape.
     pub(crate) fn claim_assistant_usage(
         messages: &mut [UnifiedMessage],
         usage_owner_by_message_id: &mut std::collections::HashMap<String, usize>,
@@ -1282,9 +1288,16 @@ impl ClaudeRecordAccumulator {
             last_slash_command_prompt_id,
             assistant_origins,
             usage_owner_by_message_id,
+            pending_assistant_message_id,
         } = self;
 
         let msg_type = value.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+        // Even filtered user bookkeeping (for example an interrupt marker) is
+        // a response boundary and must not reconnect thinking on either side.
+        if msg_type == "user" {
+            *pending_assistant_message_id = None;
+        }
 
         if msg_type == "file-history-snapshot" || msg_type == "progress" {
             return;
@@ -1332,6 +1345,13 @@ impl ClaudeRecordAccumulator {
             return;
         }
 
+        if msg_type != "assistant" && msg_type != "user" {
+            *pending_assistant_message_id = None;
+        }
+
+        // Claude Code records the user-set name (`/rename`) and its own
+        // generated title as dedicated entries — prefer both over the first
+        // user message. See `capture_title_record`.
         capture_title_record(&value, msg_type, custom_title, ai_title);
 
         if cwd.is_none() {
@@ -1391,6 +1411,7 @@ impl ClaudeRecordAccumulator {
         match msg_type {
             "assistant" if is_synthetic_assistant(&value) => {
                 // Skip synthetic assistant placeholders for local commands
+                *pending_assistant_message_id = None;
             }
             "user" => {
                 // Capture `<task-notification>` payloads for the background
@@ -1575,31 +1596,71 @@ impl ClaudeRecordAccumulator {
                 if let Some(origin) = *pending_autonomous_origin {
                     assistant_origins.insert(uuid.clone(), origin);
                 }
+                let message_id = value
+                    .get("message")
+                    .and_then(|m| m.get("id"))
+                    .and_then(|id| id.as_str())
+                    .filter(|id| !id.is_empty());
+                let merges_thinking_fragment = message_id.is_some()
+                    && pending_assistant_message_id.as_deref() == message_id
+                    && matches!(
+                        (messages.last(), content.as_slice()),
+                        (
+                            Some(UnifiedMessage {
+                                role: MessageRole::Assistant,
+                                content: previous,
+                                ..
+                            }),
+                            [ContentBlock::Thinking { .. }]
+                        ) if matches!(previous.last(), Some(ContentBlock::Thinking { .. }))
+                    );
                 // One API call is spread over several lines that each repeat
                 // its full usage; only one of them may keep it.
-                let owner_index = messages.len();
+                let owner_index = if merges_thinking_fragment {
+                    messages.len() - 1
+                } else {
+                    messages.len()
+                };
                 let usage = Self::claim_assistant_usage(
                     messages,
                     usage_owner_by_message_id,
-                    value
-                        .get("message")
-                        .and_then(|m| m.get("id"))
-                        .and_then(|id| id.as_str()),
+                    message_id,
                     extract_usage(&value),
                     owner_index,
                 );
 
-                messages.push(UnifiedMessage {
-                    id: uuid,
-                    role: MessageRole::Assistant,
-                    content,
-                    timestamp,
-                    usage,
-                    duration_ms: None,
-                    model: msg_model,
-                    reasoning_effort: None,
-                    completed_at: Some(timestamp),
-                });
+                if merges_thinking_fragment {
+                    let last = messages.last_mut().expect("checked non-empty");
+                    let ContentBlock::Thinking { text: fragment } =
+                        content.into_iter().next().expect("checked one block")
+                    else {
+                        unreachable!("checked thinking block")
+                    };
+                    let Some(ContentBlock::Thinking { text }) = last.content.last_mut() else {
+                        unreachable!("checked trailing thinking block")
+                    };
+                    text.push_str(&fragment);
+                    last.completed_at = Some(timestamp);
+                    if usage.is_some() {
+                        last.usage = usage;
+                    }
+                    if msg_model.is_some() {
+                        last.model = msg_model;
+                    }
+                } else {
+                    messages.push(UnifiedMessage {
+                        id: uuid,
+                        role: MessageRole::Assistant,
+                        content,
+                        timestamp,
+                        usage,
+                        duration_ms: None,
+                        model: msg_model,
+                        reasoning_effort: None,
+                        completed_at: Some(timestamp),
+                    });
+                }
+                *pending_assistant_message_id = message_id.map(str::to_string);
             }
             "attachment" => {
                 // `/goal` transitions ride on attachment records; everything
@@ -3235,6 +3296,731 @@ mod tests {
         assert_eq!(stats.context_window_max_tokens, Some(1_000_000));
         let total = stats.total_tokens.expect("total tokens");
         assert_eq!(total, 1900); // 1000 + 200 + 300 + 400
+    }
+
+    /// Build the `assistant` line Claude Code writes for one content block of a
+    /// response — `id` identifies the API call, so several lines share it.
+    fn assistant_block_line(
+        uuid: &str,
+        message_id: &str,
+        at: &str,
+        block: serde_json::Value,
+        usage: serde_json::Value,
+    ) -> String {
+        json!({
+            "type": "assistant",
+            "sessionId": "dedup-test",
+            "timestamp": at,
+            "uuid": uuid,
+            "message": {
+                "id": message_id,
+                "model": "claude-opus-5",
+                "content": [block],
+                "usage": usage,
+            }
+        })
+        .to_string()
+    }
+
+    fn parse_lines_into_detail(lines: &[String]) -> crate::models::ConversationDetail {
+        let path =
+            std::env::temp_dir().join(format!("codeg-claude-usage-{}.jsonl", uuid::Uuid::new_v4()));
+        let mut file = fs::File::create(&path).expect("create temp jsonl");
+        for line in lines {
+            writeln!(file, "{line}").unwrap();
+        }
+        drop(file);
+        let parser = ClaudeParser {
+            base_dir: PathBuf::new(),
+        };
+        let detail = parser
+            .parse_conversation_detail(&path, "dedup-test")
+            .expect("parse detail");
+        fs::remove_file(&path).unwrap();
+        detail
+    }
+
+    fn total_usage_tokens(detail: &crate::models::ConversationDetail) -> u64 {
+        detail
+            .turns
+            .iter()
+            .filter_map(|t| t.usage.as_ref())
+            .map(|u| {
+                u.input_tokens
+                    + u.output_tokens
+                    + u.cache_creation_input_tokens
+                    + u.cache_read_input_tokens
+            })
+            .sum()
+    }
+
+    #[test]
+    fn adjacent_thinking_fragments_from_one_response_share_one_turn() {
+        let usage = json!({
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0
+        });
+        let lines = [
+            assistant_block_line(
+                "first-record",
+                "msg-one-response",
+                "2026-03-01T10:00:00Z",
+                json!({"type": "thinking", "thinking": "inspect"}),
+                usage.clone(),
+            ),
+            assistant_block_line(
+                "second-record",
+                "msg-one-response",
+                "2026-03-01T10:00:02Z",
+                json!({"type": "thinking", "thinking": " result"}),
+                usage,
+            ),
+        ];
+
+        let detail = parse_lines_into_detail(&lines);
+        assert_eq!(detail.turns.len(), 1);
+        assert!(matches!(
+            detail.turns[0].blocks.as_slice(),
+            [ContentBlock::Thinking { text }] if text == "inspect result"
+        ));
+        assert_eq!(
+            detail.turns[0].timestamp.to_rfc3339(),
+            "2026-03-01T10:00:00+00:00"
+        );
+        assert_eq!(
+            detail.turns[0]
+                .completed_at
+                .expect("last fragment completion")
+                .to_rfc3339(),
+            "2026-03-01T10:00:02+00:00"
+        );
+        assert_eq!(total_usage_tokens(&detail), 120);
+
+        let mut acc = ClaudeRecordAccumulator::new(PathBuf::from("/nonexistent.jsonl"));
+        for line in &lines {
+            acc.feed_line(line);
+        }
+        assert_eq!(acc.messages.len(), 1);
+        assert_eq!(acc.messages[0].id, "first-record");
+    }
+
+    #[test]
+    fn thinking_fragments_do_not_cross_response_or_content_boundaries() {
+        let usage = json!({
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0
+        });
+
+        let different_responses = parse_lines_into_detail(&[
+            assistant_block_line(
+                "a1",
+                "msg-first",
+                "2026-03-01T10:00:00Z",
+                json!({"type": "thinking", "thinking": "one"}),
+                usage.clone(),
+            ),
+            assistant_block_line(
+                "a2",
+                "msg-second",
+                "2026-03-01T10:00:01Z",
+                json!({"type": "thinking", "thinking": "two"}),
+                usage.clone(),
+            ),
+        ]);
+        assert_eq!(different_responses.turns.len(), 2);
+
+        let separated_by_text = parse_lines_into_detail(&[
+            assistant_block_line(
+                "a1",
+                "msg-same",
+                "2026-03-01T10:00:00Z",
+                json!({"type": "thinking", "thinking": "one"}),
+                usage.clone(),
+            ),
+            assistant_block_line(
+                "a2",
+                "msg-same",
+                "2026-03-01T10:00:01Z",
+                json!({"type": "text", "text": "answer"}),
+                usage.clone(),
+            ),
+            assistant_block_line(
+                "a3",
+                "msg-same",
+                "2026-03-01T10:00:02Z",
+                json!({"type": "thinking", "thinking": "two"}),
+                usage,
+            ),
+        ]);
+        assert_eq!(separated_by_text.turns.len(), 3);
+        let thinking: Vec<_> = separated_by_text
+            .turns
+            .iter()
+            .flat_map(|turn| &turn.blocks)
+            .filter_map(|block| match block {
+                ContentBlock::Thinking { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(thinking, ["one", "two"]);
+
+        let interrupted = parse_lines_into_detail(&[
+            assistant_block_line(
+                "a1",
+                "msg-interrupted",
+                "2026-03-01T10:00:00Z",
+                json!({"type": "thinking", "thinking": "before"}),
+                json!({}),
+            ),
+            json!({
+                "type": "user",
+                "timestamp": "2026-03-01T10:00:01Z",
+                "uuid": "u-interrupt",
+                "message": {"content": [{
+                    "type": "text",
+                    "text": "[Request interrupted by user]"
+                }]}
+            })
+            .to_string(),
+            assistant_block_line(
+                "a2",
+                "msg-interrupted",
+                "2026-03-01T10:00:02Z",
+                json!({"type": "thinking", "thinking": "after"}),
+                json!({}),
+            ),
+        ]);
+        assert_eq!(interrupted.turns.len(), 2);
+    }
+
+    #[test]
+    fn thinking_fragments_do_not_cross_tool_result_boundaries() {
+        let usage = json!({
+            "input_tokens": 10,
+            "output_tokens": 5,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0
+        });
+        let lines = [
+            assistant_block_line(
+                "a1",
+                "msg-same",
+                "2026-03-01T10:00:00Z",
+                json!({"type": "thinking", "thinking": "before"}),
+                usage.clone(),
+            ),
+            assistant_block_line(
+                "a2",
+                "msg-same",
+                "2026-03-01T10:00:01Z",
+                json!({"type": "tool_use", "id": "tu1", "name": "Read", "input": {}}),
+                usage.clone(),
+            ),
+            json!({
+                "type": "user",
+                "timestamp": "2026-03-01T10:00:02Z",
+                "uuid": "u1",
+                "message": {"content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "tu1",
+                    "content": "done"
+                }]}
+            })
+            .to_string(),
+            assistant_block_line(
+                "a3",
+                "msg-same",
+                "2026-03-01T10:00:03Z",
+                json!({"type": "thinking", "thinking": "after"}),
+                usage,
+            ),
+        ];
+
+        let detail = parse_lines_into_detail(&lines);
+        let assistant_turns: Vec<_> = detail
+            .turns
+            .iter()
+            .filter(|turn| matches!(turn.role, TurnRole::Assistant))
+            .collect();
+        assert_eq!(assistant_turns.len(), 3);
+        assert!(matches!(
+            assistant_turns[0].blocks.as_slice(),
+            [ContentBlock::Thinking { text }] if text == "before"
+        ));
+        assert!(assistant_turns[1]
+            .blocks
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolResult { .. })));
+        assert!(matches!(
+            assistant_turns[2].blocks.as_slice(),
+            [ContentBlock::Thinking { text }] if text == "after"
+        ));
+        assert_eq!(total_usage_tokens(&detail), 15);
+    }
+
+    #[test]
+    fn merged_thinking_keeps_largest_usage_payload() {
+        let zeros = json!({
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0
+        });
+        let real = json!({
+            "input_tokens": 2,
+            "output_tokens": 383,
+            "cache_creation_input_tokens": 418,
+            "cache_read_input_tokens": 177_892
+        });
+
+        for (first, second) in [(zeros.clone(), real.clone()), (real.clone(), zeros.clone())] {
+            let detail = parse_lines_into_detail(&[
+                assistant_block_line(
+                    "a1",
+                    "msg-mixed",
+                    "2026-03-01T10:00:00Z",
+                    json!({"type": "thinking", "thinking": "one"}),
+                    first,
+                ),
+                assistant_block_line(
+                    "a2",
+                    "msg-mixed",
+                    "2026-03-01T10:00:01Z",
+                    json!({"type": "thinking", "thinking": "two"}),
+                    second,
+                ),
+            ]);
+            assert_eq!(detail.turns.len(), 1);
+            assert_eq!(total_usage_tokens(&detail), 178_695);
+        }
+    }
+
+    #[test]
+    fn thinking_merge_state_survives_incremental_feed_calls() {
+        let usage = json!({
+            "input_tokens": 1,
+            "output_tokens": 2,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0
+        });
+        let lines = [
+            assistant_block_line(
+                "a1",
+                "msg-incremental",
+                "2026-03-01T10:00:00Z",
+                json!({"type": "thinking", "thinking": "part one"}),
+                usage.clone(),
+            ),
+            assistant_block_line(
+                "a2",
+                "msg-incremental",
+                "2026-03-01T10:00:01Z",
+                json!({"type": "thinking", "thinking": " part two"}),
+                usage,
+            ),
+        ];
+
+        let whole = parse_lines_into_detail(&lines);
+
+        let mut incremental = ClaudeRecordAccumulator::new(PathBuf::from("/nonexistent.jsonl"));
+        incremental.feed_line(&lines[0]);
+        incremental.feed_line(&lines[1]);
+
+        assert_eq!(
+            serde_json::to_value(group_into_turns(incremental.messages)).unwrap(),
+            serde_json::to_value(whole.turns).unwrap()
+        );
+    }
+
+    #[test]
+    fn one_api_call_is_counted_once_however_many_lines_it_was_written_as() {
+        // Claude Code writes one line per content block and repeats the call's
+        // complete usage on every one of them. Summing the lines multiplied a
+        // single call's spend by its block count — a 2.4× inflation measured
+        // over a real transcript tree, worst on the tool-heavy sessions.
+        let usage = json!({
+            "input_tokens": 2990,
+            "output_tokens": 288,
+            "cache_creation_input_tokens": 50908,
+            "cache_read_input_tokens": 0
+        });
+        let lines = vec![
+            assistant_block_line(
+                "a1",
+                "msg_one_call",
+                "2026-03-01T10:00:00Z",
+                json!({"type": "thinking", "thinking": "…"}),
+                usage.clone(),
+            ),
+            assistant_block_line(
+                "a2",
+                "msg_one_call",
+                "2026-03-01T10:00:01Z",
+                json!({"type": "text", "text": "answer"}),
+                usage.clone(),
+            ),
+            assistant_block_line(
+                "a3",
+                "msg_one_call",
+                "2026-03-01T10:00:02Z",
+                json!({"type": "tool_use", "id": "tu1", "name": "Read", "input": {}}),
+                usage.clone(),
+            ),
+        ];
+
+        let detail = parse_lines_into_detail(&lines);
+        // Every block still renders — only the usage is attributed once.
+        assert_eq!(detail.turns.len(), 3);
+        assert_eq!(
+            detail.turns.iter().filter(|t| t.usage.is_some()).count(),
+            1,
+            "exactly one turn of the group may carry the call's usage"
+        );
+        assert_eq!(total_usage_tokens(&detail), 54_186);
+        assert_eq!(
+            detail
+                .session_stats
+                .as_ref()
+                .and_then(|s| s.total_tokens)
+                .expect("total tokens"),
+            54_186
+        );
+    }
+
+    #[test]
+    fn a_group_whose_siblings_report_zeros_keeps_the_real_payload() {
+        // A handful of real groups carry one billed payload plus all-zero
+        // siblings, in either order. Whichever line holds the real numbers wins,
+        // so the tie-break can't quietly zero out a paid call.
+        let real = json!({
+            "input_tokens": 2,
+            "output_tokens": 383,
+            "cache_creation_input_tokens": 418,
+            "cache_read_input_tokens": 177_892
+        });
+        let zeros = json!({
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0
+        });
+
+        for (first, second) in [(zeros.clone(), real.clone()), (real.clone(), zeros.clone())] {
+            let detail = parse_lines_into_detail(&[
+                assistant_block_line(
+                    "a1",
+                    "msg_mixed",
+                    "2026-03-01T10:00:00Z",
+                    json!({"type": "text", "text": "one"}),
+                    first,
+                ),
+                assistant_block_line(
+                    "a2",
+                    "msg_mixed",
+                    "2026-03-01T10:00:01Z",
+                    json!({"type": "text", "text": "two"}),
+                    second,
+                ),
+            ]);
+            assert_eq!(total_usage_tokens(&detail), 178_695);
+        }
+    }
+
+    #[test]
+    fn separate_api_calls_still_add_up() {
+        // The dedup is per `message.id`, so two real calls that happen to report
+        // identical usage must both count.
+        let usage = json!({
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0
+        });
+        let detail = parse_lines_into_detail(&[
+            assistant_block_line(
+                "a1",
+                "msg_first",
+                "2026-03-01T10:00:00Z",
+                json!({"type": "text", "text": "one"}),
+                usage.clone(),
+            ),
+            assistant_block_line(
+                "a2",
+                "msg_second",
+                "2026-03-01T10:05:00Z",
+                json!({"type": "text", "text": "two"}),
+                usage.clone(),
+            ),
+        ]);
+        assert_eq!(total_usage_tokens(&detail), 240);
+    }
+
+    #[test]
+    fn an_assistant_line_with_no_message_id_keeps_its_own_usage() {
+        // Nothing to group by, so nothing may be dropped.
+        let usage = json!({
+            "input_tokens": 10,
+            "output_tokens": 5,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0
+        });
+        let line = |uuid: &str, at: &str| {
+            json!({
+                "type": "assistant",
+                "sessionId": "dedup-test",
+                "timestamp": at,
+                "uuid": uuid,
+                "message": {
+                    "model": "claude-opus-5",
+                    "content": [{"type": "text", "text": "hi"}],
+                    "usage": usage.clone(),
+                }
+            })
+            .to_string()
+        };
+        let detail = parse_lines_into_detail(&[
+            line("a1", "2026-03-01T10:00:00Z"),
+            line("a2", "2026-03-01T10:00:01Z"),
+        ]);
+        assert_eq!(total_usage_tokens(&detail), 30);
+    }
+
+    /// Write a session transcript plus the sub-agent transcripts that live
+    /// beside it, and parse the result.
+    fn parse_with_subagents(
+        lines: &[String],
+        subagents: &[(&str, Vec<String>)],
+    ) -> crate::models::ConversationDetail {
+        let stem = std::env::temp_dir().join(format!("codeg-claude-sub-{}", uuid::Uuid::new_v4()));
+        let path = stem.with_extension("jsonl");
+        let mut file = fs::File::create(&path).expect("create session jsonl");
+        for line in lines {
+            writeln!(file, "{line}").unwrap();
+        }
+        drop(file);
+
+        let dir = stem.join("subagents");
+        fs::create_dir_all(&dir).expect("create subagents dir");
+        for (agent_id, agent_lines) in subagents {
+            let mut f = fs::File::create(dir.join(format!("agent-{agent_id}.jsonl")))
+                .expect("create subagent jsonl");
+            for line in agent_lines {
+                writeln!(f, "{line}").unwrap();
+            }
+        }
+
+        let detail = ClaudeParser {
+            base_dir: PathBuf::new(),
+        }
+        .parse_conversation_detail(&path, "dedup-test")
+        .expect("parse detail");
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir_all(&stem);
+        detail
+    }
+
+    fn subagent_line(uuid: &str, message_id: &str, at: &str, tokens: u64) -> String {
+        json!({
+            "type": "assistant",
+            "timestamp": at,
+            "uuid": uuid,
+            "message": {
+                "id": message_id,
+                "model": "claude-sonnet-5",
+                "content": [{"type": "text", "text": "sub"}],
+                "usage": {
+                    "input_tokens": tokens,
+                    "output_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0
+                }
+            }
+        })
+        .to_string()
+    }
+
+    /// A session that launches a sub-agent, whose `toolUseResult` names it
+    /// twice — the shape that makes reference-following double count.
+    fn session_launching(agent_id: &str, references: usize) -> Vec<String> {
+        let mut lines = vec![assistant_block_line(
+            "a1",
+            "msg_launch",
+            "2026-03-01T10:00:00Z",
+            json!({"type": "tool_use", "id": "tu1", "name": "Task", "input": {}}),
+            json!({
+                "input_tokens": 1000,
+                "output_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0
+            }),
+        )];
+        for i in 0..references {
+            lines.push(
+                json!({
+                    "type": "user",
+                    "timestamp": "2026-03-01T10:09:00Z",
+                    "uuid": format!("r{i}"),
+                    "message": {
+                        "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": "tu1",
+                            "content": "done"
+                        }]
+                    },
+                    "toolUseResult": {"agentType": "general-purpose", "agentId": agent_id}
+                })
+                .to_string(),
+            );
+        }
+        lines
+    }
+
+    #[test]
+    fn a_sub_agents_own_spend_is_counted_against_the_session_that_launched_it() {
+        // `Task` sub-agents keep their own transcript under the session, which
+        // is never opened as a conversation — so nothing counted those tokens.
+        let detail = parse_with_subagents(
+            &session_launching("abc", 1),
+            &[(
+                "abc",
+                vec![subagent_line(
+                    "s1",
+                    "msg_sub",
+                    "2026-03-01T10:02:00Z",
+                    7_000,
+                )],
+            )],
+        );
+        assert_eq!(total_usage_tokens(&detail), 8_000);
+    }
+
+    #[test]
+    fn a_sub_agent_named_by_several_tool_results_is_still_counted_once() {
+        // The same `agentId` is reported by more than one result line in real
+        // transcripts, so attribution follows the directory, not the mentions.
+        let detail = parse_with_subagents(
+            &session_launching("abc", 3),
+            &[(
+                "abc",
+                vec![subagent_line(
+                    "s1",
+                    "msg_sub",
+                    "2026-03-01T10:02:00Z",
+                    7_000,
+                )],
+            )],
+        );
+        assert_eq!(total_usage_tokens(&detail), 8_000);
+    }
+
+    #[test]
+    fn a_sub_agent_no_tool_result_ever_referenced_still_counts() {
+        // Interrupted, or still running when the session ended: 217 of 295
+        // transcripts in a real tree have no completed result naming them, and
+        // they spent their tokens all the same.
+        let detail = parse_with_subagents(
+            &session_launching("abc", 0),
+            &[(
+                "orphan",
+                vec![subagent_line(
+                    "s1",
+                    "msg_sub",
+                    "2026-03-01T10:02:00Z",
+                    7_000,
+                )],
+            )],
+        );
+        assert_eq!(total_usage_tokens(&detail), 8_000);
+    }
+
+    #[test]
+    fn delegated_spend_does_not_inflate_the_parents_context_window() {
+        // The gauge answers "how full is *this* conversation's prompt". A
+        // sub-agent runs in a context of its own, so its tokens are the
+        // session's spend but never its occupancy.
+        let launcher = json!({
+            "input_tokens": 1000,
+            "output_tokens": 200,
+            "cache_creation_input_tokens": 300,
+            "cache_read_input_tokens": 400
+        });
+        let detail = parse_with_subagents(
+            &[assistant_block_line(
+                "a1",
+                "msg_launch",
+                "2026-03-01T10:00:00Z",
+                json!({"type": "tool_use", "id": "tu1", "name": "Task", "input": {}}),
+                launcher,
+            )],
+            &[(
+                "abc",
+                vec![subagent_line(
+                    "s1",
+                    "msg_sub",
+                    "2026-03-01T10:02:00Z",
+                    900_000,
+                )],
+            )],
+        );
+        let stats = detail.session_stats.expect("session stats");
+        assert_eq!(stats.context_window_used_tokens, Some(1_700));
+        // The spend, however, does include it.
+        assert_eq!(stats.total_tokens, Some(901_900));
+    }
+
+    #[test]
+    fn sub_agent_spend_lands_on_the_turn_that_was_running_when_it_started() {
+        // A session working across midnight must not report a sub-agent's
+        // tokens on whichever day the session happened to end.
+        let mut lines = vec![assistant_block_line(
+            "a1",
+            "msg_before",
+            "2026-03-01T23:00:00Z",
+            json!({"type": "tool_use", "id": "tu1", "name": "Task", "input": {}}),
+            json!({"input_tokens": 10, "output_tokens": 0, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}),
+        )];
+        lines.push(assistant_block_line(
+            "a2",
+            "msg_after",
+            "2026-03-02T01:00:00Z",
+            json!({"type": "text", "text": "later"}),
+            json!({"input_tokens": 20, "output_tokens": 0, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}),
+        ));
+
+        let detail = parse_with_subagents(
+            &lines,
+            &[(
+                "abc",
+                vec![subagent_line(
+                    "s1",
+                    "msg_sub",
+                    "2026-03-01T23:10:00Z",
+                    5_000,
+                )],
+            )],
+        );
+        let carrying: Vec<_> = detail
+            .turns
+            .iter()
+            .filter(|t| t.usage.is_some())
+            .map(|t| {
+                (
+                    t.timestamp.to_rfc3339(),
+                    t.usage.as_ref().map(|u| u.input_tokens).unwrap_or(0),
+                )
+            })
+            .collect();
+        assert_eq!(total_usage_tokens(&detail), 5_030);
+        assert!(
+            carrying
+                .iter()
+                .any(|(ts, n)| ts.starts_with("2026-03-01") && *n == 5_010),
+            "sub-agent spend belongs to the turn that launched it, got {carrying:?}"
+        );
     }
 
     #[test]
