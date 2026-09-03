@@ -3085,6 +3085,26 @@ struct PermissionQueue<R = PendingPermission> {
     /// sparse terminal update may race the later terminal drain.
     published_plan_review_tool_call_ids: HashSet<String>,
     waiting: VecDeque<QueuedPermission>,
+    /// Abort handles for permission requests this connection answers on ANOTHER
+    /// surface — today only pi's extension-UI `select`, which renders on the
+    /// interactive question card (`try_bridge_pi_select_ask`). They publish no
+    /// permission card, so they are deliberately outside `responders` /
+    /// `showing` / `waiting` and the invariant above.
+    ///
+    /// They still have to be parked HERE rather than tracked separately,
+    /// because a drain is the connection's "everything waiting on the user is
+    /// moot now" signal and fires from several places (both turn-completion
+    /// paths, an idle cancel, a mid-turn disconnect). pi is the first asker that
+    /// can outlive its turn — pi-acp dispatches the dialog detached, and pi
+    /// resolves a timed / aborted one locally without telling it — so a missed
+    /// drain leaves the agent blocked AND wedges the connection's
+    /// one-ask-at-a-time slot, sending every later select back to the raw
+    /// approval card this bridge exists to replace. Sitting in the queue makes
+    /// that coverage structural: a new drain site cannot forget them.
+    ///
+    /// Dropping the sender is the signal; the bridged task then cancels its
+    /// question and answers the agent `Cancelled`.
+    detached: Vec<oneshot::Sender<()>>,
 }
 
 impl<R> Default for PermissionQueue<R> {
@@ -3094,6 +3114,7 @@ impl<R> Default for PermissionQueue<R> {
             showing: None,
             published_plan_review_tool_call_ids: HashSet::new(),
             waiting: VecDeque::new(),
+            detached: Vec::new(),
         }
     }
 }
@@ -3150,12 +3171,18 @@ impl<R: PermissionResponder> PermissionQueue<R> {
             pending.respond_cancelled();
         }
         self.waiting.clear();
+        self.detached.clear();
         DrainedPermissions {
             visible_request_id: self.showing.take(),
             published_plan_review_tool_call_ids: std::mem::take(
                 &mut self.published_plan_review_tool_call_ids,
             ),
         }
+    }
+
+    fn park_detached(&mut self, abort: oneshot::Sender<()>) {
+        self.detached.retain(|sender| !sender.is_closed());
+        self.detached.push(abort);
     }
 
     fn waiting_len(&self) -> usize {
@@ -6295,14 +6322,16 @@ async fn run_connection(
     let perms = pending_perms.clone();
     let state_outer = Arc::clone(&state);
 
-    // Grok's native `ask_user_question` (verified against 0.2.101) arrives as an
-    // `_x.ai/ask_user_question` ACP ext request that BLOCKS on the reply — rather
-    // than the codeg-mcp tool. Capture the shared question access + feature toggle
-    // (both live on the delegation injection) so the ext handler can register the
-    // questions through the SAME interactive-card pipeline and answer grok once the
-    // user submits. `None` when the companion isn't injected — the handler then
-    // lets grok fall back to its inert rendering.
-    let grok_ask_access = delegation_injection
+    // Shared question access + feature toggle (both live on the delegation
+    // injection) for the agents that ask NATIVELY, over a blocking request of
+    // their own rather than the codeg-mcp tool: grok's `_x.ai/ask_user_question`
+    // ext request (verified against 0.2.101) and pi's extension-UI `select`,
+    // which pi-acp folds into `session/request_permission`. Both handlers
+    // register the questions through the SAME interactive-card pipeline and
+    // answer the blocked request once the user submits. `None` when the
+    // companion isn't injected — the handlers then leave the agent on its
+    // pre-bridge rendering.
+    let native_ask_access = delegation_injection
         .as_ref()
         .map(|inj| (Arc::clone(&inj.questions), inj.ask.clone()));
     let grok_ask_conn_id = connection_id.clone();
@@ -6369,9 +6398,33 @@ async fn run_connection(
                 let perms = perms.clone();
                 let perm_cwd = cwd_string.clone();
                 let state_inner = Arc::clone(&state);
+                // pi routes its `ctx.ui.select` questions through this channel;
+                // diverting them needs the shared question access (and the ask
+                // feature toggle).
+                let perm_ask_access = native_ask_access.clone();
+                let perm_conn_id = connection_id.clone();
                 async move |req: RequestPermissionRequest,
                             responder: Responder<RequestPermissionResponse>,
                             _cx: ConnectionTo<Agent>| {
+                    // pi asks the user a question THROUGH this channel (see
+                    // `try_bridge_pi_select_ask`); route it to the interactive
+                    // question card instead of an approval card. Every reject
+                    // path hands the responder back, so the request continues
+                    // down the normal permission path untouched.
+                    let responder = match try_bridge_pi_select_ask(
+                        &perm_ask_access,
+                        &perm_conn_id,
+                        &state_inner,
+                        &emitter_inner,
+                        &perms,
+                        &req,
+                        responder,
+                    )
+                    .await
+                    {
+                        Ok(()) => return Ok(()),
+                        Err(responder) => responder,
+                    };
                     handle_permission_request(
                         &state_inner,
                         &emitter_inner,
@@ -6537,7 +6590,7 @@ async fn run_connection(
         )
         .on_receive_request(
             {
-                let access = grok_ask_access.clone();
+                let access = native_ask_access.clone();
                 let conn_id = grok_ask_conn_id.clone();
                 let card_state = Arc::clone(&grok_ask_state);
                 let card_emitter = grok_ask_emitter.clone();
@@ -6579,7 +6632,7 @@ async fn run_connection(
                 // access + kill switch); approval-style requests (MCP
                 // tool-call approvals, message-only confirms) route through
                 // the permission card via `pending_perms`.
-                let access = grok_ask_access.clone();
+                let access = native_ask_access.clone();
                 let conn_id = grok_ask_conn_id.clone();
                 let perms = perms.clone();
                 let state_inner = Arc::clone(&state);
@@ -8048,6 +8101,176 @@ async fn handle_grok_ask_user_question(
             }
         }
     });
+}
+
+/// Bridge pi's extension-UI `select` — the way a pi extension asks the user a
+/// multiple-choice question (`ctx.ui.select`) — into codeg's interactive question
+/// card.
+///
+/// pi has no dedicated ask channel: pi-acp turns the dialog into a plain
+/// `session/request_permission` (see
+/// [`crate::acp::question::parse_pi_select_ask`] for the wire shape), so codeg
+/// used to render it as a generic approval card that dumped the synthetic tool
+/// call as raw JSON, and — because pi never emits a `session/update` for that
+/// `pi-ui-*` id — left NO record of the answer once the card was dismissed
+/// (#644). This registers the choices through the shared
+/// [`crate::acp::question::SessionQuestionAccess`] (the SAME path the codeg-mcp
+/// ask tool uses), answers the blocked permission request with the option the
+/// user picked, and emits the answered `AskQuestionResultCard` into the stream.
+///
+/// `Err(responder)` hands the request back for the ordinary permission path,
+/// which is the outcome for everything that isn't a pi select, for a select the
+/// card cannot represent faithfully, and for a connection with an ask already
+/// pending — none of those are worse than the pre-bridge behavior.
+///
+/// A bridged select still parks an abort handle on `perms`, so every permission
+/// drain reclaims it exactly as it reclaimed the approval card this replaces —
+/// see [`PermissionQueue::detached`] for why that matters for pi specifically.
+async fn try_bridge_pi_select_ask(
+    access: &Option<(
+        Arc<dyn crate::acp::question::SessionQuestionAccess>,
+        crate::acp::question::QuestionRuntimeConfig,
+    )>,
+    connection_id: &str,
+    state: &Arc<RwLock<SessionState>>,
+    emitter: &EventEmitter,
+    perms: &PendingPermissions,
+    req: &RequestPermissionRequest,
+    responder: Responder<RequestPermissionResponse>,
+) -> Result<(), Responder<RequestPermissionResponse>> {
+    // Gated on pi's OWN marker rather than `AgentType::Pi`: the id prefix +
+    // `method: "select"` + `choice-*` option ids are pi-acp's fingerprint, and
+    // that also covers a pi registered under a custom agent id (which does not
+    // resolve to `AgentType::Pi`).
+    let tool_call_id = req.tool_call.tool_call_id.to_string();
+    if !tool_call_id.starts_with(crate::acp::question::PI_EXTENSION_UI_ID_PREFIX) {
+        return Err(responder);
+    }
+    let Some((questions, ask_cfg)) = access else {
+        return Err(responder);
+    };
+    // Same kill switch as the codeg-mcp ask tool: when the feature is off, the
+    // approval card stays the way to answer.
+    if !ask_cfg.is_enabled().await {
+        return Err(responder);
+    }
+    let tool_call = serde_json::to_value(&req.tool_call).unwrap_or_default();
+    let options: Vec<(String, String)> = req
+        .options
+        .iter()
+        .map(|o| (o.option_id.to_string(), o.name.clone()))
+        .collect();
+    let Some(ask) = crate::acp::question::parse_pi_select_ask(&tool_call, &options) else {
+        return Err(responder);
+    };
+    // Park the abort handle BEFORE registering, never after: both are await
+    // points, so a drain can land between them, and a handle parked afterwards
+    // would be one the drain never saw — leaving the ask alive across it, which
+    // is the wedge this exists to prevent. Ordering it first is what closes the
+    // window rather than narrowing it: dropping the sender is STICKY, so a drain
+    // in the gap is still observed by the task below on its first poll, which
+    // then cancels the question it just registered. (A re-check after parking
+    // would not close it — the same reasoning as `PermissionQueue`'s emit-inside-
+    // the-lock note.) An early return from here leaves the handle behind with its
+    // receiver dropped; `park_detached` sweeps those, and a drain clears them.
+    let (abort_tx, abort_rx) = oneshot::channel();
+    perms.lock().await.park_detached(abort_tx);
+    // `register_question` consumes the spec; keep the ask to map the answer back
+    // to pi's option id and to render the answered in-stream card.
+    let Some(registered) = questions
+        .register_question(connection_id, vec![ask.spec.clone()])
+        .await
+    else {
+        return Err(responder);
+    };
+    let state = Arc::clone(state);
+    let emitter = emitter.clone();
+    let questions = Arc::clone(questions);
+    let connection_id = connection_id.to_string();
+    let question_id = registered.question_id;
+    // The user answers out-of-band (the `answer_question` endpoint resolves the
+    // one-shot below), so await it on a task — keeping the ACP dispatch loop free
+    // — then unblock pi.
+    tokio::spawn(async move {
+        // `biased` so an answer that lands in the same instant as a drain still
+        // counts: the user clicked, and pi can still be told what they picked.
+        let answer = tokio::select! {
+            biased;
+            answered = registered.answer_rx => answered.ok(),
+            _ = abort_rx => None,
+        };
+        match answer {
+            Some(outcome) => {
+                let option_id = crate::acp::question::pi_select_option_id(&outcome, &ask);
+                // Keep the record honest: an answer pi could not be given (a
+                // decline, or free text typed into the card's always-present
+                // "Other" box) is reported as a decline, which is exactly what
+                // pi is about to be told.
+                let recorded = if option_id.is_some() {
+                    outcome
+                } else {
+                    crate::acp::question::QuestionOutcome {
+                        answers: Vec::new(),
+                        declined: true,
+                    }
+                };
+                // The in-stream "提问回答" capsule. pi resolves the answer over
+                // THIS permission round-trip and never emits a tool_call for the
+                // `pi-ui-*` id, so without this the pick vanishes with the card.
+                // Emitted BEFORE unblocking pi so it lands ahead of pi's
+                // follow-up output; pi is blocked on the reply, so nothing races.
+                emit_with_state(
+                    &state,
+                    &emitter,
+                    AcpEvent::ToolCall {
+                        // pi's own id for the dialog, so the one card is keyed
+                        // to the request it answers.
+                        tool_call_id,
+                        title: "ask_user_question".to_string(),
+                        kind: "other".to_string(),
+                        status: "completed".to_string(),
+                        content: None,
+                        raw_input: Some(
+                            crate::acp::question::grok_result_card_input(std::slice::from_ref(
+                                &ask.spec,
+                            ))
+                            .to_string(),
+                        ),
+                        raw_input_is_model_authored: None,
+                        raw_output: Some(
+                            crate::acp::question::grok_result_card_output(&recorded).to_string(),
+                        ),
+                        locations: None,
+                        meta: None,
+                        images: None,
+                    },
+                )
+                .await;
+                let outcome = match option_id {
+                    Some(option_id) => RequestPermissionOutcome::Selected(
+                        SelectedPermissionOutcome::new(option_id),
+                    ),
+                    None => RequestPermissionOutcome::Cancelled,
+                };
+                let _ = responder.respond(RequestPermissionResponse::new(outcome));
+            }
+            // Either the ask was canceled outright (turn cancel, teardown) or a
+            // permission drain reclaimed it — the connection's "everything
+            // waiting on the user is moot now" signal, which for pi also means
+            // pi has abandoned the dialog on its side. Nothing to render; clear
+            // the ask so the NEXT select can register, and unblock pi with the
+            // cancel it would have gotten from the drained permission queue.
+            None => {
+                questions
+                    .cancel_question(&connection_id, &question_id)
+                    .await;
+                let _ = responder.respond(RequestPermissionResponse::new(
+                    RequestPermissionOutcome::Cancelled,
+                ));
+            }
+        }
+    });
+    Ok(())
 }
 
 /// Bridge grok's native `_x.ai/exit_plan_mode` ext request into codeg's
@@ -18305,6 +18528,80 @@ mod tests {
                 ("b".into(), StubPermissionOutcome::Cancelled),
                 ("c".into(), StubPermissionOutcome::Cancelled),
             ]
+        );
+    }
+
+    #[test]
+    fn permission_queue_drain_aborts_detached_requests_and_leaves_no_dead_handles() {
+        let (mut queue, log) = stub_permission_queue();
+        admit_stub_permission(&mut queue, &log, "a");
+        let (abort_tx, mut abort_rx) = oneshot::channel::<()>();
+        queue.park_detached(abort_tx);
+        assert!(matches!(
+            abort_rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+
+        let drained = queue.drain();
+        assert_eq!(drained.visible_request_id.as_deref(), Some("a"));
+        assert!(matches!(
+            abort_rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Closed)
+        ));
+
+        let (dead_tx, dead_rx) = oneshot::channel::<()>();
+        queue.park_detached(dead_tx);
+        drop(dead_rx);
+        let (live_tx, _live_rx) = oneshot::channel::<()>();
+        queue.park_detached(live_tx);
+        assert_eq!(queue.detached.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_detached_request_drained_before_its_task_starts_still_aborts() {
+        let (mut queue, _log) = stub_permission_queue();
+        let (abort_tx, abort_rx) = oneshot::channel::<()>();
+        queue.park_detached(abort_tx);
+        queue.drain();
+
+        let (_answer_tx, answer_rx) = oneshot::channel::<u8>();
+        let answered = tokio::select! {
+            biased;
+            answered = answer_rx => answered.ok(),
+            _ = abort_rx => None,
+        };
+        assert!(answered.is_none());
+    }
+
+    #[test]
+    fn permission_queue_drain_with_nothing_shown_needs_no_compensation() {
+        let (mut queue, _log) = stub_permission_queue();
+        assert!(queue.drain().visible_request_id.is_none());
+    }
+
+    #[test]
+    fn permission_queue_admits_again_after_drain() {
+        let (mut queue, log) = stub_permission_queue();
+        admit_stub_permission(&mut queue, &log, "a");
+        admit_stub_permission(&mut queue, &log, "b");
+        queue.drain();
+
+        let fresh = admit_stub_permission(&mut queue, &log, "c");
+        assert_eq!(fresh.map(|card| card.request_id).as_deref(), Some("c"));
+        assert_eq!(queue.showing.as_deref(), Some("c"));
+    }
+
+    #[test]
+    fn permission_queue_admit_then_drain_never_leaves_an_inert_card() {
+        let (mut queue, log) = stub_permission_queue();
+        let shown = admit_stub_permission(&mut queue, &log, "a").expect("shown");
+        assert_eq!(
+            queue.drain().visible_request_id.as_deref(),
+            Some(shown.request_id.as_str())
+        );
+        assert_eq!(
+            log.lock().unwrap().clone(),
+            vec![("a".into(), StubPermissionOutcome::Cancelled)]
         );
     }
 

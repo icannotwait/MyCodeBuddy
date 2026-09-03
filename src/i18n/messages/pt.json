@@ -636,6 +636,8 @@
     "local": {
       "filterPlaceholder": "Filtrar MCP local...",
       "loadFailed": "Falha ao carregar: {message}",
+      "sourceUnreadable": "Não foi possível ler a configuração MCP de {app}, portanto os seus servidores estão ocultos: {message}",
+      "saveBlockedByUnreadableSource": "Corrija ou remova esse ficheiro e atualize antes de guardar: as atribuições são calculadas a partir dos agentes que esta página conseguiu ler, pelo que guardar agora poderá remover este servidor de um que não conseguiu ler.",
       "empty": "Nenhum MCP local detectado.",
       "description": "A configuração local de MCP pode ser editada e salva diretamente.",
       "enabledApps": "Apps habilitados",
@@ -3264,6 +3266,7 @@
         "systemMessage": "Mensagem do sistema",
         "copyMessage": "Copiar",
         "forkFromHere": "Bifurcar a partir daqui",
+        "forkBusy": "Não é possível bifurcar enquanto há um turno em andamento",
         "copied": "Copiado",
         "selectionActions": "Ações de seleção",
         "selectionCopy": "Copiar texto",

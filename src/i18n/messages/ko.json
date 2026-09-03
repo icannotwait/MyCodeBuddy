@@ -636,6 +636,8 @@
     "local": {
       "filterPlaceholder": "로컬 MCP 필터...",
       "loadFailed": "로드 실패: {message}",
+      "sourceUnreadable": "{app}의 MCP 구성을 읽을 수 없어 해당 서버가 표시되지 않습니다: {message}",
+      "saveBlockedByUnreadableSource": "저장하기 전에 해당 파일을 수정하거나 삭제한 뒤 새로 고치세요. 할당은 이 페이지가 읽을 수 있었던 에이전트를 기준으로 계산되므로, 지금 저장하면 읽지 못한 에이전트에서 이 서버가 제거될 수 있습니다.",
       "empty": "감지된 로컬 MCP가 없습니다.",
       "description": "로컬 MCP 구성은 직접 수정하고 저장할 수 있습니다.",
       "enabledApps": "활성화된 앱",
@@ -3264,6 +3266,7 @@
         "systemMessage": "시스템 메시지",
         "copyMessage": "복사",
         "forkFromHere": "여기서 분기",
+        "forkBusy": "턴이 실행 중일 때는 분기할 수 없습니다",
         "copied": "복사됨",
         "selectionActions": "선택 영역 작업",
         "selectionCopy": "텍스트 복사",

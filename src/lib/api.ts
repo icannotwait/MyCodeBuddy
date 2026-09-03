@@ -185,6 +185,7 @@ import type {
   GitHubAccountsSettings,
   GitHubTokenValidation,
   McpAppType,
+  LocalMcpScan,
   LocalMcpServer,
   McpMarketplaceProvider,
   McpMarketplaceItem,
@@ -561,10 +562,10 @@ export async function acpFork(
   connectionId: string,
   // Linkage for a conversation opened from history: its connection resumed via
   // session_id but the row isn't bound to the connection until the first prompt
-  // fires, and a fork-send forks BEFORE that prompt. Passing these lets the
-  // backend adopt the row so the fork doesn't reject as unlinked. Ignored once
-  // the connection is already linked (a new-conversation-then-fork). See
-  // `ConnectionManager::fork_session`.
+  // fires, and forking from a rendered turn needs no prompt at all. Passing
+  // these lets the backend adopt the row so the fork doesn't reject as
+  // unlinked. Ignored once the connection is already linked (a
+  // new-conversation-then-fork). See `ConnectionManager::fork_session`.
   conversationId?: number | null,
   folderId?: number | null,
   // "Fork from here": the rendered turn to fork at. Omit to fork at the tail,
@@ -2194,7 +2195,7 @@ export async function deleteAccountToken(accountId: string): Promise<void> {
   return getTransport().call("delete_account_token", { accountId })
 }
 
-export async function mcpScanLocal(): Promise<LocalMcpServer[]> {
+export async function mcpScanLocal(): Promise<LocalMcpScan> {
   return getTransport().call("mcp_scan_local")
 }
 

@@ -11,7 +11,7 @@
 #   irm https://raw.githubusercontent.com/icannotwait/MyCodeBuddy/main/uninstall-server.ps1 | iex
 #
 # Usage:
-#   .\install.ps1 -Version v0.30.1-mycodebuddy.1
+#   .\install.ps1 -Version v0.30.2-mycodebuddy.1
 #   irm https://raw.githubusercontent.com/icannotwait/MyCodeBuddy/main/install.ps1 | iex
 #
 

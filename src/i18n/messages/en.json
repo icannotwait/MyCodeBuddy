@@ -636,6 +636,8 @@
     "local": {
       "filterPlaceholder": "Filter local MCP...",
       "loadFailed": "Load failed: {message}",
+      "sourceUnreadable": "Could not read the MCP config for {app}, so its servers are hidden: {message}",
+      "saveBlockedByUnreadableSource": "Fix or remove that file and refresh before saving: assignments are computed from the agents this page could read, so saving now could drop this server from one it could not.",
       "empty": "No local MCP detected.",
       "description": "Local MCP configuration can be edited and saved directly.",
       "enabledApps": "Enabled Apps",
@@ -3264,6 +3266,7 @@
         "systemMessage": "System message",
         "copyMessage": "Copy",
         "forkFromHere": "Fork from here",
+        "forkBusy": "Can't fork while a turn is running",
         "copied": "Copied",
         "selectionActions": "Selection actions",
         "selectionCopy": "Copy Text",

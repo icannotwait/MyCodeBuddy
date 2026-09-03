@@ -636,6 +636,8 @@
     "local": {
       "filterPlaceholder": "تصفية MCP المحلي...",
       "loadFailed": "فشل التحميل: {message}",
+      "sourceUnreadable": "تعذّرت قراءة إعدادات MCP الخاصة بـ {app}، لذا تم إخفاء خوادمها: {message}",
+      "saveBlockedByUnreadableSource": "أصلح هذا الملف أو احذفه ثم حدّث الصفحة قبل الحفظ: تُحتسب الإسنادات من الوكلاء الذين تمكّنت الصفحة من قراءتهم، لذا قد يؤدي الحفظ الآن إلى إزالة هذا الخادم من وكيل تعذّرت قراءته.",
       "empty": "لم يتم اكتشاف MCP محلي.",
       "description": "يمكن تعديل إعداد MCP المحلي وحفظه مباشرة.",
       "enabledApps": "التطبيقات المفعلة",
@@ -3264,6 +3266,7 @@
         "systemMessage": "رسالة النظام",
         "copyMessage": "نسخ",
         "forkFromHere": "تفريع من هنا",
+        "forkBusy": "لا يمكن التفريع أثناء تنفيذ دور",
         "copied": "تم النسخ",
         "selectionActions": "إجراءات التحديد",
         "selectionCopy": "نسخ النص",

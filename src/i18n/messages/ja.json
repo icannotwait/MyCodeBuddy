@@ -636,6 +636,8 @@
     "local": {
       "filterPlaceholder": "ローカルMCPを絞り込み...",
       "loadFailed": "読み込み失敗: {message}",
+      "sourceUnreadable": "{app} の MCP 設定を読み取れませんでした。そのサーバーは表示されません: {message}",
+      "saveBlockedByUnreadableSource": "保存する前にそのファイルを修正または削除して再読み込みしてください。割り当てはこのページが読み取れたエージェントから計算されるため、今保存すると読み取れなかったエージェントからこのサーバーが削除される可能性があります。",
       "empty": "ローカルMCPが見つかりません。",
       "description": "ローカルMCP設定は直接編集して保存できます。",
       "enabledApps": "有効なアプリ",
@@ -3264,6 +3266,7 @@
         "systemMessage": "システムメッセージ",
         "copyMessage": "コピー",
         "forkFromHere": "ここから分岐",
+        "forkBusy": "ターンの実行中は分岐できません",
         "copied": "コピー済み",
         "selectionActions": "選択範囲の操作",
         "selectionCopy": "テキストをコピー",

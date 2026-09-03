@@ -54,6 +54,7 @@ import { normalizeMcpType } from "@/lib/mcp-types"
 import { cn } from "@/lib/utils"
 import type {
   LocalMcpServer,
+  LocalMcpSourceWarning,
   McpAppType,
   McpMarketplaceItem,
   McpMarketplaceInstallOption,
@@ -99,6 +100,10 @@ const APP_OPTIONS: { value: McpAppType; label: string }[] = [
   { value: "qoder", label: "Qoder" },
   { value: "antigravity", label: "Google Antigravity" },
 ]
+
+function appLabel(app: McpAppType): string {
+  return APP_OPTIONS.find((option) => option.value === app)?.label ?? app
+}
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value)
@@ -333,6 +338,9 @@ export function McpSettings() {
   const [selection, setSelection] = useState<Selection>(null)
 
   const [installedServers, setInstalledServers] = useState<LocalMcpServer[]>([])
+  const [sourceWarnings, setSourceWarnings] = useState<LocalMcpSourceWarning[]>(
+    []
+  )
   const [localFilter, setLocalFilter] = useState("")
 
   const [providers, setProviders] = useState<McpMarketplaceProvider[]>([])
@@ -404,6 +412,13 @@ export function McpSettings() {
     [localSpecText]
   )
 
+  // A scan that could not read every agent is fine to LIST from but not to
+  // reassign from: the app checkboxes it seeds drive removals, so an agent
+  // missing only because its file was unreadable would be stripped. The
+  // backend refuses such a save; the UI blocks composing one, which also stops
+  // the draft outliving the repair (fix the file, hit Refresh, then edit).
+  const scanDegraded = sourceWarnings.length > 0
+
   const filteredLocalServers = useMemo(() => {
     const q = localFilter.trim().toLowerCase()
     if (!q) return installedServers
@@ -415,9 +430,10 @@ export function McpSettings() {
   }, [installedServers, localFilter, mcpT])
 
   const refreshLocalServers = useCallback(async () => {
-    const servers = await mcpScanLocal()
-    setInstalledServers(servers)
-    return servers
+    const scan = await mcpScanLocal()
+    setInstalledServers(scan.servers)
+    setSourceWarnings(scan.warnings)
+    return scan.servers
   }, [])
 
   const loadInitial = useCallback(async () => {
@@ -425,18 +441,19 @@ export function McpSettings() {
     setLoadingError(null)
 
     try {
-      const [servers, marketProviders] = await Promise.all([
+      const [scan, marketProviders] = await Promise.all([
         mcpScanLocal(),
         mcpListMarketplaces(),
       ])
-      setInstalledServers(servers)
+      setInstalledServers(scan.servers)
+      setSourceWarnings(scan.warnings)
       setProviders(marketProviders)
       setSelectedProvider(
         (current) => current || marketProviders[0]?.id || "official_registry"
       )
 
-      if (servers[0]) {
-        setSelection({ kind: "local", id: servers[0].id })
+      if (scan.servers[0]) {
+        setSelection({ kind: "local", id: scan.servers[0].id })
       }
     } catch (err) {
       const message = toLocalizedErrorMessage(err, mcpT)
@@ -1067,6 +1084,21 @@ export function McpSettings() {
                 </div>
               ) : null}
 
+              {/* One agent's config being unreadable hides only that agent's
+                  servers — the rest of the list below is still real, so this
+                  is a warning beside it rather than an error instead of it. */}
+              {sourceWarnings.map((warning) => (
+                <div
+                  key={warning.app}
+                  className="rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs text-amber-500 break-all"
+                >
+                  {t("local.sourceUnreadable", {
+                    app: appLabel(warning.app),
+                    message: warning.message,
+                  })}
+                </div>
+              ))}
+
               <div className="flex-1 min-h-0 overflow-auto space-y-1">
                 {filteredLocalServers.length === 0 ? (
                   <div className="rounded-md border border-dashed p-3 text-xs text-muted-foreground">
@@ -1396,6 +1428,15 @@ export function McpSettings() {
                 </div>
               ) : null}
 
+              {/* Creating writes through the same command, which refuses while
+                  any agent's config is unreadable — an id that already exists
+                  in the unread one would be assigned away from it. */}
+              {scanDegraded ? (
+                <div className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-600 dark:text-amber-400">
+                  {t("local.saveBlockedByUnreadableSource")}
+                </div>
+              ) : null}
+
               <div className="flex justify-end gap-2">
                 <Button
                   variant="outline"
@@ -1410,7 +1451,10 @@ export function McpSettings() {
                       console.error("[Settings] create local MCP failed:", err)
                     })
                   }}
-                  disabled={Boolean(runningAction?.startsWith("create:"))}
+                  disabled={
+                    scanDegraded ||
+                    Boolean(runningAction?.startsWith("create:"))
+                  }
                 >
                   {runningAction?.startsWith("create:") ? (
                     <>
@@ -1502,6 +1546,18 @@ export function McpSettings() {
                 </div>
               ) : null}
 
+              {/* The checkboxes above were seeded from a scan that could not
+                  read every agent, so an agent that holds this server may be
+                  showing as unchecked — and saving means "remove it from every
+                  unchecked agent". The backend refuses such a save too; this
+                  keeps the user from composing one whose stale draft would
+                  still be accepted once they repair the file out of band. */}
+              {scanDegraded ? (
+                <div className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-600 dark:text-amber-400">
+                  {t("local.saveBlockedByUnreadableSource")}
+                </div>
+              ) : null}
+
               <div className="flex justify-end">
                 <Button
                   onClick={() => {
@@ -1509,7 +1565,9 @@ export function McpSettings() {
                       console.error("[Settings] save local MCP failed:", err)
                     })
                   }}
-                  disabled={runningAction === `save:${selectedLocal.id}`}
+                  disabled={
+                    scanDegraded || runningAction === `save:${selectedLocal.id}`
+                  }
                 >
                   {runningAction === `save:${selectedLocal.id}` ? (
                     <>

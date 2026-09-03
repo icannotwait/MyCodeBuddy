@@ -636,6 +636,8 @@
     "local": {
       "filterPlaceholder": "筛选本地 MCP...",
       "loadFailed": "加载失败：{message}",
+      "sourceUnreadable": "无法读取 {app} 的 MCP 配置，其服务器已隐藏：{message}",
+      "saveBlockedByUnreadableSource": "保存前请先修复或删除该文件并刷新：分配结果按本页能读到的智能体计算，现在保存可能会把该服务器从读不到的智能体中移除。",
       "empty": "当前未检测到本地 MCP。",
       "description": "本地 MCP 配置可直接编辑并保存。",
       "enabledApps": "启用应用",
@@ -3264,6 +3266,7 @@
         "systemMessage": "系统消息",
         "copyMessage": "复制",
         "forkFromHere": "从此处分叉",
+        "forkBusy": "当前有回合正在进行，暂不可分叉",
         "copied": "已复制",
         "selectionActions": "选中内容操作",
         "selectionCopy": "复制文本",

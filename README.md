@@ -361,7 +361,7 @@ irm https://raw.githubusercontent.com/icannotwait/MyCodeBuddy/main/uninstall-ser
 Windows operators can install from the release zip:
 
 ```powershell
-.\install.ps1 -Version v0.30.1-mycodebuddy.1
+.\install.ps1 -Version v0.30.2-mycodebuddy.1
 ```
 
 #### Option 1: Docker

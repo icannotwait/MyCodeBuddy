@@ -44,9 +44,13 @@ interface TurnStatsProps {
   generationTokens?: number | null
   agentType?: AgentType | null
   /** Fork the session at THIS reply. Undefined hides the affordance — the
-   * session has no live connection, the agent has no `session/fork`, or a turn
-   * is in flight. */
+   * session has no live connection, the agent has no `session/fork`, or this
+   * surface doesn't own the conversation. */
   onForkFromHere?: () => void
+  /** Forking is possible here but not right now (a turn is in flight). The
+   * button stays in place, greyed out, and says why on hover — it used to
+   * vanish for the length of every reply, which moved the whole icon row. */
+  forkDisabled?: boolean
 }
 
 const iconButtonClass =
@@ -67,6 +71,7 @@ export function TurnStats({
   generationTokens,
   agentType,
   onForkFromHere,
+  forkDisabled = false,
 }: TurnStatsProps) {
   const locale = useLocale()
   const t = useTranslations("Folder.chat.messageList")
@@ -230,16 +235,27 @@ export function TurnStats({
         {onForkFromHere && (
           <Tooltip>
             <TooltipTrigger asChild>
+              {/* `aria-disabled`, deliberately NOT the native `disabled`: a
+                  disabled element receives no pointer events, so the tooltip —
+                  the only thing that says WHY the button is dead — would never
+                  open. Staying focusable also keeps it reachable by keyboard. */}
               <button
                 type="button"
-                onClick={onForkFromHere}
-                className={iconButtonClass}
+                onClick={forkDisabled ? undefined : onForkFromHere}
+                aria-disabled={forkDisabled || undefined}
+                className={cn(
+                  iconButtonClass,
+                  forkDisabled &&
+                    "cursor-not-allowed opacity-50 hover:bg-transparent hover:text-muted-foreground"
+                )}
                 aria-label={t("forkFromHere")}
               >
                 <Split aria-hidden="true" className="h-3.5 w-3.5" />
               </button>
             </TooltipTrigger>
-            <TooltipContent side="top">{t("forkFromHere")}</TooltipContent>
+            <TooltipContent side="top">
+              {forkDisabled ? t("forkBusy") : t("forkFromHere")}
+            </TooltipContent>
           </Tooltip>
         )}
         {displayModels.length > 0 && (

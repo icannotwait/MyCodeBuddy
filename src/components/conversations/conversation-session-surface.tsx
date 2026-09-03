@@ -1988,7 +1988,7 @@ export const ConversationSessionSurface = memo(
       async (turnId: string) => {
         if (interactionLocked || forkFromTurnInFlightRef.current) return
         const connectionId = conn.connectionId
-        if (!connectionId || connStatus !== "connected") return
+        if (!connectionId || connStatusRef.current !== "connected") return
         forkFromTurnInFlightRef.current = true
 
         try {
@@ -2030,7 +2030,6 @@ export const ConversationSessionSurface = memo(
       },
       [
         conn.connectionId,
-        connStatus,
         effectiveConversationId,
         folderId,
         handleDelegateViewerOnlyRejection,
@@ -2700,7 +2699,7 @@ export const ConversationSessionSurface = memo(
           onForkFromTurn={
             !interactionLocked &&
             !conn.sharedSession &&
-            connStatus === "connected" &&
+            (connStatus === "connected" || connStatus === "prompting") &&
             hasPersistedConversation &&
             conn.supportsFork &&
             !conn.waitingForSubagents

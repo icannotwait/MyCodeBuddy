@@ -3024,6 +3024,20 @@ describe("ConversationSessionSurface chosen-turn fork and async tasks", () => {
   beforeEach(resetSurfaceHarness)
   afterEach(cleanup)
 
+  it("keeps the chosen-turn fork handler visible while a reply is in progress", () => {
+    surfaceH.conversations = [fullSummary(42, "completed")]
+    surfaceH.connStatus = "prompting"
+    surfaceH.supportsFork = true
+
+    act(() => {
+      renderSurface(42)
+    })
+
+    expect(surfaceH.messageListProps?.onForkFromTurn).toEqual(
+      expect.any(Function)
+    )
+  })
+
   it("forks from the chosen turn and refetches only pre-fork local turns", async () => {
     vi.mocked(acpFork).mockResolvedValueOnce({
       forkedSessionId: "ext-forked",

@@ -636,6 +636,8 @@
     "local": {
       "filterPlaceholder": "Lokales MCP filtern...",
       "loadFailed": "Laden fehlgeschlagen: {message}",
+      "sourceUnreadable": "Die MCP-Konfiguration von {app} konnte nicht gelesen werden, daher werden ihre Server ausgeblendet: {message}",
+      "saveBlockedByUnreadableSource": "Reparieren oder entfernen Sie diese Datei und aktualisieren Sie, bevor Sie speichern: Zuweisungen werden aus den Agenten berechnet, die diese Seite lesen konnte, sodass ein Speichern jetzt diesen Server aus einem nicht lesbaren Agenten entfernen könnte.",
       "empty": "Kein lokales MCP erkannt.",
       "description": "Die lokale MCP-Konfiguration kann direkt bearbeitet und gespeichert werden.",
       "enabledApps": "Aktivierte Apps",
@@ -3264,6 +3266,7 @@
         "systemMessage": "Systemnachricht",
         "copyMessage": "Kopieren",
         "forkFromHere": "Ab hier verzweigen",
+        "forkBusy": "Verzweigen nicht möglich, während ein Zug läuft",
         "copied": "Kopiert",
         "selectionActions": "Auswahlaktionen",
         "selectionCopy": "Text kopieren",
