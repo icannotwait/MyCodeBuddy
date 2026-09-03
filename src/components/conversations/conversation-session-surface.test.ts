@@ -7,9 +7,11 @@ import {
 } from "react"
 import { flushSync } from "react-dom"
 import { act, cleanup, render, waitFor } from "@testing-library/react"
+import { toast } from "sonner"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import type {
+  AsyncTaskRecord,
   CreateChatConversationResult,
   EventEnvelope,
   SessionFailureRecord,
@@ -30,7 +32,12 @@ import {
   type TerminalDisconnectLatch,
 } from "@/lib/terminal-reconnect"
 import { shouldQueueDirectSend } from "@/lib/queue-flush"
-import { createChatConversation, createConversation } from "@/lib/api"
+import {
+  acpFork,
+  acpStopAsyncTask,
+  createChatConversation,
+  createConversation,
+} from "@/lib/api"
 import { emitAttachFileToSession } from "@/lib/session-attachment-events"
 import { completeLiveTranscriptTurn } from "@/stores/conversation-runtime-store"
 import type { RichComposerHandle } from "@/components/chat/composer/rich-composer"
@@ -498,6 +505,8 @@ type CapturedShellProps = {
     failure: SessionFailureRecord
   ) => void
   onSessionFailureDismiss?: (ids: string[]) => void
+  asyncTasks?: AsyncTaskRecord[]
+  onStopAsyncTask?: (taskId: string) => Promise<boolean>
   topBanner?: unknown
   onSend?: (
     draft: {
@@ -532,6 +541,7 @@ type CapturedShellProps = {
 type CapturedMessageListProps = {
   onResumeRoot?: () => void
   onOpenRootConversation?: (conversationId: number) => Promise<void>
+  onForkFromTurn?: (turnId: string) => void | Promise<void>
 }
 
 type QueueItem = {
@@ -661,6 +671,9 @@ const surfaceH = vi.hoisted(() => ({
   runtimeOptimisticTurns: [] as Array<{ id: string; role: "user" }>,
   runtimeQueuedOptimisticTurnIds: [] as string[],
   runtimeUserTurns: [] as Array<{ id: string; role: "user" }>,
+  runtimeLocalTurns: [] as Array<{ id: string }>,
+  asyncTasks: [] as AsyncTaskRecord[],
+  setExternalId: vi.fn(),
   pendingUserMessage: null as PendingUserMessage | null,
   tabStoreState: {
     tabs: [{ id: "tab-1", folderId: 1, isPinned: true }] as HarnessTab[],
@@ -717,7 +730,10 @@ vi.mock("@/components/chat/composer/rich-composer", async (importOriginal) => {
 })
 
 vi.mock("next-intl", () => ({
-  useTranslations: () => (key: string) => key,
+  useTranslations: () => (key: string, values?: Record<string, unknown>) =>
+    (key === "stopFailed" || key === "forkSessionFailed") && values?.error
+      ? `${key}:${String(values.error)}`
+      : key,
   useLocale: () => "en",
 }))
 
@@ -806,6 +822,7 @@ vi.mock("@/hooks/use-connection-lifecycle", () => ({
         waitingForSubagents: null,
         claudeApiRetry: null,
         sessionFailures: surfaceH.sessionFailures,
+        asyncTasks: surfaceH.asyncTasks,
         agentType: "claude",
         connectedWorkingDir: "/tmp/project",
         supportsFork: surfaceH.supportsFork,
@@ -1049,46 +1066,51 @@ vi.mock("@/stores/conversation-runtime-store", () => ({
     removeConversation: surfaceH.removeConversation,
     setAcpLoadError: vi.fn(),
     setDbConversationId: vi.fn(),
-    setExternalId: vi.fn(),
+    setExternalId: surfaceH.setExternalId,
     setLiveMessage: vi.fn(),
     setLiveOwnsActiveTurn: vi.fn(),
     setPendingCleanup: surfaceH.setPendingCleanup,
     setSyncState: surfaceH.setSyncState,
   }),
-  useConversationRuntimeStore: (
-    sel: (s: {
-      byConversationId: Map<
-        number,
-        {
-          externalId: string | null
-          sessionStats: null
-          syncState: string
-          delegateSyncError: string | null
-        }
-      >
-    }) => unknown
-  ) => {
-    const byConversationId = new Map<
-      number,
-      {
-        externalId: string | null
-        sessionStats: null
-        syncState: string
-        delegateSyncError: string | null
-      }
-    >()
-    // Always expose a session entry for the harness conversation so the
-    // shallow selector can read delegateSyncError even without a runtime
-    // external id (identity still comes from detail.summary.external_id).
-    byConversationId.set(42, {
-      externalId: surfaceH.runtimeExternalId,
-      sessionStats: null,
-      syncState: "idle",
-      delegateSyncError: surfaceH.delegateSyncError,
-    })
-    return sel({ byConversationId })
-  },
+  useConversationRuntimeStore: Object.assign(
+    (
+      sel: (s: {
+        byConversationId: Map<
+          number,
+          {
+            externalId: string | null
+            sessionStats: null
+            syncState: string
+            delegateSyncError: string | null
+            localTurns: Array<{ id: string }>
+          }
+        >
+      }) => unknown
+    ) => sel(runtimeStoreState()),
+    { getState: () => runtimeStoreState() }
+  ),
 }))
+
+function runtimeStoreState() {
+  const byConversationId = new Map<
+    number,
+    {
+      externalId: string | null
+      sessionStats: null
+      syncState: string
+      delegateSyncError: string | null
+      localTurns: Array<{ id: string }>
+    }
+  >()
+  byConversationId.set(42, {
+    externalId: surfaceH.runtimeExternalId,
+    sessionStats: null,
+    syncState: "idle",
+    delegateSyncError: surfaceH.delegateSyncError,
+    localTurns: surfaceH.runtimeLocalTurns,
+  })
+  return { byConversationId }
+}
 
 vi.mock("@/stores/live-transcript-store", () => ({
   createLiveTranscriptFrameSink: () => vi.fn(),
@@ -1128,6 +1150,8 @@ vi.mock("@/components/chat/conversation-shell", async () => {
         sessionFailures: props.sessionFailures,
         onSessionFailureAction: props.onSessionFailureAction,
         onSessionFailureDismiss: props.onSessionFailureDismiss,
+        asyncTasks: props.asyncTasks,
+        onStopAsyncTask: props.onStopAsyncTask,
         topBanner: props.topBanner,
         onSend: props.onSend,
         onEnqueue: props.onEnqueue,
@@ -1236,6 +1260,7 @@ vi.mock("@/hooks/use-session-feedback", () => ({
 vi.mock("@/lib/api", () => ({
   acpConnect: vi.fn(),
   acpFork: vi.fn(),
+  acpStopAsyncTask: vi.fn(),
   acpGetSessionSnapshot: vi.fn().mockResolvedValue({ goal_actions: [] }),
   createChatConversation: vi.fn(),
   createChatDir: vi.fn(),
@@ -1496,6 +1521,9 @@ function resetSurfaceHarness() {
   vi.mocked(createConversation).mockReset()
   vi.mocked(createConversation).mockResolvedValue(99)
   vi.mocked(createChatConversation).mockReset()
+  vi.mocked(acpFork).mockReset()
+  vi.mocked(acpStopAsyncTask).mockReset()
+  vi.mocked(acpStopAsyncTask).mockResolvedValue(true)
   surfaceH.conversations = []
   surfaceH.acpEventHandlers = []
   surfaceH.connStatus = null
@@ -1545,6 +1573,9 @@ function resetSurfaceHarness() {
   surfaceH.runtimeOptimisticTurns = []
   surfaceH.runtimeQueuedOptimisticTurnIds = []
   surfaceH.runtimeUserTurns = []
+  surfaceH.runtimeLocalTurns = []
+  surfaceH.asyncTasks = []
+  surfaceH.setExternalId.mockClear()
   surfaceH.pendingUserMessage = null
   surfaceH.tabStoreState = {
     tabs: [{ id: "tab-1", folderId: 1, isPinned: true }] as HarnessTab[],
@@ -1662,6 +1693,7 @@ describe("ConversationSessionSurface authoritative shared queue", () => {
     mountSharedSurface()
 
     expect(surfaceH.shellProps?.onForkSend).toBeUndefined()
+    expect(surfaceH.messageListProps?.onForkFromTurn).toBeUndefined()
   })
 
   it("preserves the legacy fork action for a non-shared connected root", () => {
@@ -2973,6 +3005,231 @@ describe("ConversationSessionSurface explicit reconnect identity gate", () => {
       surfaceH.shellProps!.onReconnect!()
     })
     expect(lifecycleCapture.handleReconnect).toHaveBeenCalledTimes(1)
+  })
+
+  it("prefers a newly forked runtime id over stale persisted detail", () => {
+    surfaceH.conversations = [fullSummary(42, "completed")]
+    surfaceH.detailExternalId = "ext-before-fork"
+    surfaceH.runtimeExternalId = "ext-after-fork"
+
+    act(() => {
+      renderSurface(42)
+    })
+
+    expect(lifecycleCapture.lastOptions!.sessionId).toBe("ext-after-fork")
+  })
+})
+
+describe("ConversationSessionSurface chosen-turn fork and async tasks", () => {
+  beforeEach(resetSurfaceHarness)
+  afterEach(cleanup)
+
+  it("forks from the chosen turn and refetches only pre-fork local turns", async () => {
+    vi.mocked(acpFork).mockResolvedValueOnce({
+      forkedSessionId: "ext-forked",
+      originalSessionId: "ext-original",
+      siblingConversationId: 43,
+    })
+    surfaceH.conversations = [fullSummary(42, "completed")]
+    surfaceH.connStatus = "connected"
+    surfaceH.supportsFork = true
+    surfaceH.runtimeLocalTurns = [{ id: "live-parent-reply" }]
+    surfaceH.queueItems = [historicalHead("queued-after-fork")]
+
+    act(() => {
+      renderSurface(42)
+    })
+
+    const onForkFromTurn = surfaceH.messageListProps?.onForkFromTurn
+    expect(onForkFromTurn).toEqual(expect.any(Function))
+    await act(async () => {
+      await onForkFromTurn!("turn-3")
+    })
+
+    expect(acpFork).toHaveBeenLastCalledWith(CONN, 42, 1, "turn-3")
+    expect(surfaceH.setExternalId).toHaveBeenCalledWith(42, "ext-forked")
+    expect(surfaceH.refetchDetail).toHaveBeenCalledWith(42, {
+      preserveLive: true,
+      dropLiveTurnIds: ["live-parent-reply"],
+      supersedeAuthoritative: true,
+    })
+  })
+
+  it("shows structured fork-send error details", async () => {
+    vi.mocked(acpFork).mockRejectedValueOnce({
+      code: "fork_point_unavailable",
+      message: "Fork point unavailable",
+      detail: "The selected turn is no longer available",
+    })
+    vi.mocked(toast.error).mockClear()
+    surfaceH.conversations = [fullSummary(42, "completed")]
+    surfaceH.connStatus = "connected"
+    surfaceH.supportsFork = true
+
+    act(() => {
+      renderSurface(42)
+    })
+    await act(async () => {
+      await surfaceH.shellProps!.onForkSend!(
+        {
+          blocks: [{ type: "text", text: "fork body" }],
+          displayText: "fork body",
+        },
+        null
+      )
+    })
+
+    expect(toast.error).toHaveBeenCalledWith(
+      "forkSessionFailed:The selected turn is no longer available"
+    )
+  })
+
+  it("shows structured chosen-turn fork error details", async () => {
+    vi.mocked(acpFork).mockRejectedValueOnce({
+      code: "fork_point_unavailable",
+      message: "Fork point unavailable",
+      detail: "The selected turn is no longer available",
+    })
+    vi.mocked(toast.error).mockClear()
+    surfaceH.conversations = [fullSummary(42, "completed")]
+    surfaceH.connStatus = "connected"
+    surfaceH.supportsFork = true
+
+    act(() => {
+      renderSurface(42)
+    })
+    await act(async () => {
+      await surfaceH.messageListProps!.onForkFromTurn!("turn-3")
+    })
+
+    expect(toast.error).toHaveBeenCalledWith(
+      "forkSessionFailed:The selected turn is no longer available"
+    )
+  })
+
+  it("allows only one chosen-turn fork while the request is pending", async () => {
+    const forkResult = {
+      forkedSessionId: "ext-forked",
+      originalSessionId: "ext-original",
+      siblingConversationId: 43,
+    }
+    let resolveFork!: (result: typeof forkResult) => void
+    vi.mocked(acpFork)
+      .mockImplementationOnce(
+        () => new Promise((resolve) => (resolveFork = resolve))
+      )
+      .mockResolvedValueOnce(forkResult)
+    surfaceH.conversations = [fullSummary(42, "completed")]
+    surfaceH.connStatus = "connected"
+    surfaceH.supportsFork = true
+
+    act(() => {
+      renderSurface(42)
+    })
+
+    const onForkFromTurn = surfaceH.messageListProps!.onForkFromTurn!
+    const firstFork = onForkFromTurn("turn-3")
+    const duplicateFork = onForkFromTurn("turn-3")
+
+    expect(acpFork).toHaveBeenCalledTimes(1)
+    await act(async () => {
+      resolveFork(forkResult)
+      await Promise.all([firstFork, duplicateFork])
+    })
+
+    await act(async () => {
+      await onForkFromTurn("turn-4")
+    })
+    expect(acpFork).toHaveBeenCalledTimes(2)
+  })
+
+  it("refreshes delegate access when a chosen-turn fork loses ownership", async () => {
+    vi.mocked(acpFork).mockRejectedValueOnce({
+      code: "delegate_viewer_only",
+      message: "Delegated conversation is read-only",
+      detail: "parent_turn_active",
+    })
+    surfaceH.conversations = [fullSummary(42, "completed")]
+    surfaceH.connStatus = "connected"
+    surfaceH.supportsFork = true
+
+    act(() => {
+      renderSurface(42)
+    })
+
+    await act(async () => {
+      await surfaceH.messageListProps!.onForkFromTurn!("turn-3")
+    })
+
+    expect(surfaceH.refreshDelegateAccess).toHaveBeenCalledTimes(1)
+  })
+
+  it("passes shared-session fencing when an owner stops an async task", async () => {
+    mountSharedSurface()
+
+    await expect(
+      surfaceH.shellProps!.onStopAsyncTask!("task-shared")
+    ).resolves.toBe(true)
+    expect(acpStopAsyncTask).toHaveBeenCalledWith(CONN, "task-shared", {
+      generation: 1,
+      leaseId: "lease-1",
+    })
+  })
+
+  it("shows structured async-stop error details", async () => {
+    vi.mocked(acpStopAsyncTask).mockRejectedValueOnce({
+      code: "shared_session_stale_generation",
+      message: "Shared session changed",
+      detail: "lease expired",
+    })
+    vi.mocked(toast.error).mockClear()
+    surfaceH.conversations = [fullSummary(42, "in_progress")]
+    surfaceH.connStatus = "connected"
+
+    act(() => {
+      renderSurface(42)
+    })
+
+    await expect(surfaceH.shellProps!.onStopAsyncTask!("task-1")).resolves.toBe(
+      false
+    )
+    expect(toast.error).toHaveBeenCalledWith("stopFailed:lease expired")
+  })
+
+  it("shows async tasks to viewers but exposes stop only to the owner", async () => {
+    const task: AsyncTaskRecord = {
+      task_id: "task-1",
+      name: "Build",
+      task_type: "shell",
+      description: "Build project",
+      show_in_transcript: false,
+      can_stop: true,
+      state: "running",
+    }
+    surfaceH.asyncTasks = [task]
+    surfaceH.conversations = [fullSummary(42, "in_progress")]
+    surfaceH.connStatus = "connected"
+
+    const view = renderSurface(42)
+
+    expect(surfaceH.shellProps?.asyncTasks).toEqual([task])
+    expect(surfaceH.shellProps?.onStopAsyncTask).toEqual(expect.any(Function))
+    await expect(surfaceH.shellProps!.onStopAsyncTask!("task-1")).resolves.toBe(
+      true
+    )
+    expect(acpStopAsyncTask).toHaveBeenCalledWith(CONN, "task-1", undefined)
+
+    surfaceH.isViewer = true
+    act(() => {
+      view.rerender(
+        createElement(ConversationSessionSurface, {
+          ...surfaceProps(42),
+          reloadSignal: 1,
+        })
+      )
+    })
+    expect(surfaceH.shellProps?.asyncTasks).toEqual([task])
+    expect(surfaceH.shellProps?.onStopAsyncTask).toBeUndefined()
   })
 })
 

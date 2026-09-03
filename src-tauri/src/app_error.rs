@@ -96,6 +96,9 @@ pub enum AppErrorCode {
     /// connection (a second, concurrent send). Maps to HTTP 409 — an expected,
     /// recoverable condition in multi-client co-control, not a server fault.
     TurnInProgress,
+    /// An explicit fork target is missing or unsupported by the selected agent.
+    /// Maps to HTTP 400; an absent target still means a valid tail fork.
+    ForkPointUnavailable,
     /// A prompt was rejected because its conversation has an active delegation
     /// continuation which still owns prompt admission. Maps to HTTP 409.
     ConversationWaitingForSubagents,

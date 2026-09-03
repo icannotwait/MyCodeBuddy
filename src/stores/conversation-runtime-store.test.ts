@@ -123,6 +123,7 @@ function liveMessage(
 }
 
 type SeedInput = {
+  externalId?: string | null
   detail?: DbConversationDetail | null
   localTurns?: MessageTurn[]
   backgroundTurns?: BackgroundOverlayEntry[]
@@ -149,7 +150,8 @@ function seedRuntimeSession(input: SeedInput = {}) {
         CID,
         {
           conversationId: CID,
-          externalId: "sid-1",
+          externalId:
+            input.externalId === undefined ? "sid-1" : input.externalId,
           dbConversationId: null,
           detail: input.detail ?? null,
           detailLoading: false,
@@ -559,6 +561,43 @@ describe("external session index", () => {
     actions.setDbConversationId(-2, 42)
 
     expect(getConversationIdByExternalIdFromStore("shared-session")).toBe(-2)
+  })
+
+  it("clears background overlays when the external session is rebound", () => {
+    seedRuntimeSession({
+      backgroundTurns: [
+        {
+          turn: assistantTurn("old-session-overlay"),
+          watermark: 10,
+        },
+      ],
+    })
+
+    useConversationRuntimeStore.getState().actions.setExternalId(CID, "sid-2")
+
+    expect(
+      useConversationRuntimeStore.getState().byConversationId.get(CID)
+        ?.backgroundTurns
+    ).toEqual([])
+  })
+
+  it("keeps background overlays on initial and repeated identity writes", () => {
+    const backgroundTurns = [
+      {
+        turn: assistantTurn("current-session-overlay"),
+        watermark: 10,
+      },
+    ]
+    seedRuntimeSession({ externalId: null, backgroundTurns })
+    const actions = useConversationRuntimeStore.getState().actions
+
+    actions.setExternalId(CID, "sid-1")
+    actions.setExternalId(CID, "sid-1")
+
+    expect(
+      useConversationRuntimeStore.getState().byConversationId.get(CID)
+        ?.backgroundTurns
+    ).toBe(backgroundTurns)
   })
 })
 
@@ -2505,6 +2544,56 @@ describe("owner overlay retirement without live-* persist ids", () => {
       "reloaded-a",
     ])
     expect(session?.localTurns).toEqual([])
+  })
+
+  it("lets a fork refetch supersede a pre-fork Manual Reload", async () => {
+    let resolveReload!: (detail: DbConversationDetail) => void
+    let resolveForkRefetch!: (detail: DbConversationDetail) => void
+    const reload = new Promise<DbConversationDetail>((resolve) => {
+      resolveReload = resolve
+    })
+    const forkRefetch = new Promise<DbConversationDetail>((resolve) => {
+      resolveForkRefetch = resolve
+    })
+    seedRuntimeSession({
+      detail: detailWithTurns([userTurn("parent-user")]),
+      localTurns: [assistantTurn("live-parent-reply")],
+    })
+    mockGetFolderConversation
+      .mockReturnValueOnce(reload)
+      .mockReturnValueOnce(forkRefetch)
+
+    const actions = useConversationRuntimeStore.getState().actions
+    actions.reloadDetail(CID, { reason: "manual_reload" })
+    actions.refetchDetail(CID, {
+      preserveLive: true,
+      supersedeAuthoritative: true,
+    })
+
+    expect(mockGetFolderConversation).toHaveBeenCalledTimes(2)
+    resolveForkRefetch(
+      detailWithTurns([userTurn("fork-user"), assistantTurn("fork-reply")])
+    )
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(
+      useConversationRuntimeStore
+        .getState()
+        .byConversationId.get(CID)
+        ?.detail?.turns.map((turn) => turn.id)
+    ).toEqual(["fork-user", "fork-reply"])
+
+    resolveReload(
+      detailWithTurns([userTurn("parent-user"), assistantTurn("parent-reply")])
+    )
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(
+      useConversationRuntimeStore
+        .getState()
+        .byConversationId.get(CID)
+        ?.detail?.turns.map((turn) => turn.id)
+    ).toEqual(["fork-user", "fork-reply"])
   })
 
   it("does not let viewer sync supersede Manual Reload", async () => {

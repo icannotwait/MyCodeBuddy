@@ -1160,6 +1160,7 @@ fn parse_updates_from_bytes_with_context(
                         autonomous_origin: None,
                         generation_ms: None,
                         generation_tokens: None,
+                        agent_message_id: None,
                     });
                 }
             }
@@ -2000,6 +2001,7 @@ fn ensure_assistant<'a>(
             autonomous_origin: origin,
             generation_ms: None,
             generation_tokens: None,
+            agent_message_id: None,
         });
     }
     assistant.as_mut().expect("assistant just set")

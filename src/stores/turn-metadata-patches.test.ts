@@ -61,6 +61,7 @@ describe("computeTurnMetadataPatches", () => {
       localAssistantIndices: [1],
       parsedAssistantTurns,
       persistedAssistantCount: 3,
+      parseEndsWithAssistant: true,
     })
 
     // The new reply gets ITS OWN duration/usage — not 1234 + 5000+7000+9000.
@@ -71,6 +72,7 @@ describe("computeTurnMetadataPatches", () => {
         usage: usage(50),
         model: undefined,
         completed_at: undefined,
+        source_turn_id: "new",
       },
     ])
   })
@@ -95,6 +97,7 @@ describe("computeTurnMetadataPatches", () => {
       localAssistantIndices: [0],
       parsedAssistantTurns,
       persistedAssistantCount: 0,
+      parseEndsWithAssistant: true,
     })
 
     expect(patches).toEqual([
@@ -105,6 +108,10 @@ describe("computeTurnMetadataPatches", () => {
         model: "gpt-x",
         // Completion time is the matched (last) sub-turn's, not aggregated.
         completed_at: "2026-01-01T00:05:00Z",
+        // No fork anchor: a surplus of parsed turns is not provably a split
+        // of THIS reply (it is equally an out-of-turn record), so the id is
+        // withheld and "fork from here" falls back to a tail fork.
+        source_turn_id: undefined,
       },
     ])
   })
@@ -124,6 +131,7 @@ describe("computeTurnMetadataPatches", () => {
       localAssistantIndices: [1],
       parsedAssistantTurns,
       persistedAssistantCount: 3,
+      parseEndsWithAssistant: true,
     })
 
     // 400 + 600 = 1000 (only n0 + n1), usage 4 + 6 = 10 — history excluded.
@@ -134,8 +142,68 @@ describe("computeTurnMetadataPatches", () => {
         usage: usage(10),
         model: "m",
         completed_at: undefined,
+        source_turn_id: undefined,
       },
     ])
+  })
+
+  it("names nothing when the parse holds more turns than this session streamed", () => {
+    // A surplus has two indistinguishable causes and neither is placeable.
+    // Sub-turn split: locals [A, B] against parsed [A, B1, B2] where B is the
+    // one that split — tail alignment maps A onto B1, so naming A would fork
+    // past A's own reply AND the user prompt after it. Out-of-turn record: the
+    // extra is a turn this client never streamed (an async sub-agent reply, a
+    // co-controlling client) and even the tail is then someone else's. Both
+    // are frozen by first-write-wins, so neither turn is named. Stats keep the
+    // old whole-batch alignment: only the id is withheld.
+    const parsedAssistantTurns = [
+      asst({ id: "A", duration_ms: 100, usage: usage(1) }),
+      asst({ id: "B1", duration_ms: 200, usage: usage(2) }),
+      asst({ id: "B2", duration_ms: 300, usage: usage(3) }),
+    ]
+
+    const patches = computeTurnMetadataPatches({
+      localAssistantIndices: [1, 3],
+      parsedAssistantTurns,
+      persistedAssistantCount: 0,
+      parseEndsWithAssistant: true,
+    })
+
+    expect(patches.map((patch) => patch.source_turn_id)).toEqual([
+      undefined,
+      undefined,
+    ])
+  })
+
+  it("names nothing when an out-of-turn reply lands after the streamed one", () => {
+    // Locals [B]; a Claude async sub-agent appended its own assistant reply C
+    // after B, so the parse is [B, C] and ends on an assistant turn. Treating
+    // the parse tail as "the reply that just completed" would name B with C's
+    // id and fork from B at C.
+    const parsedAssistantTurns = [
+      asst({
+        id: "B",
+        duration_ms: 100,
+        usage: usage(1),
+        agent_message_id: "msg-B",
+      }),
+      asst({
+        id: "C",
+        duration_ms: 200,
+        usage: usage(2),
+        agent_message_id: "msg-C",
+      }),
+    ]
+
+    const patches = computeTurnMetadataPatches({
+      localAssistantIndices: [1],
+      parsedAssistantTurns,
+      persistedAssistantCount: 0,
+      parseEndsWithAssistant: true,
+    })
+
+    expect(patches.map((patch) => patch.source_turn_id)).toEqual([undefined])
+    expect(patches.map((patch) => patch.agent_message_id)).toEqual([undefined])
   })
 
   it("emits no patch when the parse has not caught up to the new reply", () => {
@@ -154,6 +222,7 @@ describe("computeTurnMetadataPatches", () => {
       localAssistantIndices: [1],
       parsedAssistantTurns,
       persistedAssistantCount: 3,
+      parseEndsWithAssistant: true,
     })
 
     expect(patches).toEqual([])
@@ -172,6 +241,7 @@ describe("computeTurnMetadataPatches", () => {
       localAssistantIndices: [1, 3],
       parsedAssistantTurns,
       persistedAssistantCount: 2,
+      parseEndsWithAssistant: true,
     })
 
     expect(patches).toEqual([
@@ -181,6 +251,7 @@ describe("computeTurnMetadataPatches", () => {
         usage: usage(11),
         model: undefined,
         completed_at: undefined,
+        source_turn_id: "a1",
       },
       {
         index: 3,
@@ -188,6 +259,7 @@ describe("computeTurnMetadataPatches", () => {
         usage: usage(22),
         model: undefined,
         completed_at: undefined,
+        source_turn_id: "a2",
       },
     ])
   })
@@ -197,6 +269,8 @@ describe("computeTurnMetadataPatches", () => {
     // only has a1 yet (a2 not flushed). Tail-aligning a negative offset would
     // map a1's parse onto a2 and — with first-write-wins metadata — lock a1's
     // duration/tokens onto the second reply. a1 gets its own stats; a2 none.
+    // The transcript ends on u2 (agents write the prompt before the reply), so
+    // no turn is NAMED here either — see the lagging-split case below.
     const parsedAssistantTurns = [
       asst({ id: "h0", duration_ms: 5000 }),
       asst({ id: "h1", duration_ms: 7000 }),
@@ -207,6 +281,7 @@ describe("computeTurnMetadataPatches", () => {
       localAssistantIndices: [1, 3],
       parsedAssistantTurns,
       persistedAssistantCount: 2,
+      parseEndsWithAssistant: false,
     })
 
     expect(patches).toEqual([
@@ -216,6 +291,60 @@ describe("computeTurnMetadataPatches", () => {
         usage: usage(11),
         model: undefined,
         completed_at: undefined,
+        source_turn_id: undefined,
+      },
+    ])
+  })
+
+  it("names nothing while the transcript still ends on a user turn", () => {
+    // The case counts cannot catch: reply A split three ways AND reply B has
+    // not flushed, so locals [A,B] meet parsed [A1,A2,A3] at offset 1. B looks
+    // like the tail and would be named "A3" — forking from B would fork at A,
+    // frozen there by first-write-wins. The transcript ending on B's user
+    // prompt is what gives it away, and the sync retries, so refusing to name
+    // costs a round rather than the feature.
+    const parsedAssistantTurns = [
+      asst({ id: "A1", duration_ms: 100, usage: usage(1) }),
+      asst({ id: "A2", duration_ms: 200, usage: usage(2) }),
+      asst({ id: "A3", duration_ms: 300, usage: usage(3) }),
+    ]
+
+    const patches = computeTurnMetadataPatches({
+      localAssistantIndices: [1, 3],
+      parsedAssistantTurns,
+      persistedAssistantCount: 0,
+      parseEndsWithAssistant: false,
+    })
+
+    expect(patches.map((patch) => patch.source_turn_id)).toEqual([
+      undefined,
+      undefined,
+    ])
+  })
+
+  it("names a turn the parser recorded with no stats of its own", () => {
+    // The reported "fork from here" bug. A turn produced in this session is
+    // named `live-<conv>-<msg>`, which the backend cannot resolve against its
+    // own parse — so forking from it silently forked at the TAIL and the new
+    // session came out identical to its parent. The parser's name has to reach
+    // the local turn, and it has to reach it even when the parsed turn carries
+    // no usage/duration at all (a plain codex reply does not), or the guard
+    // that skips empty patches would drop the one field that matters.
+    const patches = computeTurnMetadataPatches({
+      localAssistantIndices: [1],
+      parsedAssistantTurns: [asst({ id: "turn-3" })],
+      persistedAssistantCount: 0,
+      parseEndsWithAssistant: true,
+    })
+
+    expect(patches).toEqual([
+      {
+        index: 1,
+        duration_ms: undefined,
+        usage: undefined,
+        model: undefined,
+        completed_at: undefined,
+        source_turn_id: "turn-3",
       },
     ])
   })
@@ -230,6 +359,7 @@ describe("computeTurnMetadataPatches", () => {
       localAssistantIndices: [1],
       parsedAssistantTurns,
       persistedAssistantCount: 5,
+      parseEndsWithAssistant: true,
     })
 
     expect(patches).toEqual([])
@@ -240,6 +370,7 @@ describe("computeTurnMetadataPatches", () => {
       localAssistantIndices: [1],
       parsedAssistantTurns: [asst({ id: "new", reasoning_effort: "high" })],
       persistedAssistantCount: 0,
+      parseEndsWithAssistant: false,
     })
 
     expect(patches).toEqual([
@@ -262,6 +393,7 @@ describe("computeTurnMetadataPatches", () => {
         asst({ id: "new", model: "gpt-5.6-sol" }),
       ],
       persistedAssistantCount: 1,
+      parseEndsWithAssistant: false,
     })
 
     expect(patches).toHaveLength(1)
@@ -278,6 +410,7 @@ describe("computeTurnMetadataPatches", () => {
         asst({ id: "s2", reasoning_effort: "high" }),
       ],
       persistedAssistantCount: 0,
+      parseEndsWithAssistant: false,
     })
 
     expect(patches).toHaveLength(1)
@@ -293,6 +426,7 @@ describe("computeTurnMetadataPatches", () => {
         asst({ id: "s2", model: "gpt-5.6-sol" }),
       ],
       persistedAssistantCount: 0,
+      parseEndsWithAssistant: false,
     })
 
     expect(patches).toHaveLength(1)
@@ -428,6 +562,30 @@ describe("syncTurnMetadata archived reasoning effort", () => {
     vi.useRealTimers()
   })
 
+  it("backfills parser and Claude message identity onto a live turn", async () => {
+    seedMetadataSyncSession(asst({ id: "live-claude-reply" }))
+    const parsed = detailWith([
+      asst({
+        id: "turn-3",
+        agent_message_id: "msg_01CLAUDE",
+      }),
+    ])
+    parsed.summary.agent_type = "claude_code"
+    mockGetFolderConversation.mockResolvedValueOnce(parsed)
+
+    const cancel = useConversationRuntimeStore
+      .getState()
+      .actions.syncTurnMetadata(CID)
+    await flushMetadataSync()
+    cancel()
+
+    expect(currentMetadataSyncSession().localTurns[0]).toMatchObject({
+      id: "live-claude-reply",
+      source_turn_id: "turn-3",
+      agent_message_id: "msg_01CLAUDE",
+    })
+  })
+
   it("fills missing local effort and resolves archived model plus high", async () => {
     seedMetadataSyncSession(
       asst({ id: "live", model: "gpt-5.6-sol", reasoning_effort: null })
@@ -466,6 +624,8 @@ describe("syncTurnMetadata archived reasoning effort", () => {
         id: "live",
         model: "live-model",
         reasoning_effort: "medium",
+        source_turn_id: "live-turn-id",
+        agent_message_id: "live-message-id",
       })
     )
     mockGetFolderConversation.mockResolvedValueOnce(
@@ -475,6 +635,7 @@ describe("syncTurnMetadata archived reasoning effort", () => {
           model: "archive-model",
           reasoning_effort: "high",
           usage: usage(10, 2),
+          agent_message_id: "archive-message-id",
         }),
       ])
     )
@@ -488,6 +649,8 @@ describe("syncTurnMetadata archived reasoning effort", () => {
     expect(currentMetadataSyncSession().localTurns[0]).toMatchObject({
       model: "live-model",
       reasoning_effort: "medium",
+      source_turn_id: "live-turn-id",
+      agent_message_id: "live-message-id",
     })
   })
 

@@ -1891,6 +1891,7 @@
       "forkSession": "Dupliquer la session",
       "forkSessionSuccess": "Session dupliquée avec succès",
       "forkSessionFailed": "Échec de la duplication de la session : {error}",
+      "forkSessionBusy": "Échec de la bifurcation : un tour est en cours",
       "exportConversation": "Exporter la conversation",
       "exportImage": "Image",
       "exportMarkdown": "Markdown",
@@ -2868,6 +2869,7 @@
           "downloadFailed": "Échec du téléchargement de {agent} : {message}",
           "sessionLoadResourceNotFound": "Échec du chargement de la session de {agent}. Rechargez pour réessayer ou démarrez une nouvelle conversation.",
           "sessionLoadUnavailable": "{agent} n'a pas pu restaurer cette session ; elle a peut-être pris fin ou l'agent s'est arrêté. Rechargez pour réessayer ou démarrez une nouvelle conversation.",
+          "sessionLoadBusy": "Cet historique est occupé par la session qui en a été dérivée. Fermez cette session, puis rechargez pour l'ouvrir.",
           "sessionArchived": "La session précédente a été archivée côté {agent}. Exécutez {command} dans un terminal pour la restaurer et la recharger, ou démarrez une nouvelle conversation.",
           "turnFailedRefusal": "{agent} a refusé de poursuivre ce tour. Cela indique souvent une erreur de backend ou de passerelle. Vérifiez les journaux de l'agent.",
           "turnFailedMaxTokens": "{agent} a atteint la limite maximale de jetons pour ce tour.",
@@ -3034,7 +3036,7 @@
           "pasteDropFiles": "Collez une capture d'écran ou déposez un fichier directement dans la zone de saisie pour le joindre.",
           "queueMessage": "Pendant que l'agent répond, continuez à écrire : votre message suivant est mis en file et envoyé automatiquement à la fin.",
           "draftAutoSave": "Les brouillons non envoyés sont sauvegardés automatiquement par conversation et restaurés à votre retour.",
-          "forkSend": "Le menu déroulant du bouton d'envoi propose Bifurquer et envoyer pour ouvrir une branche dans un nouvel onglet à partir du point actuel.",
+          "forkFromTurn": "Chaque réponse terminée propose Bifurquer d'ici pour ouvrir une branche dans un nouvel onglet à partir de ce message.",
           "exportConversation": "Faites un clic droit dans la conversation pour l'exporter en Markdown, HTML ou image.",
           "chatChannels": "Connectez Telegram / Lark / WeChat dans Paramètres → Canaux de discussion pour continuer depuis votre téléphone.",
           "shortcutsAuxPanel": "<shortcut>{toggleAuxPanel}</shortcut> bascule le panneau droit pour voir les fichiers modifiés et les changements Git de cette session.",
@@ -3261,6 +3263,7 @@
         "emptyConversation": "Aucun message dans cette conversation.",
         "systemMessage": "Message système",
         "copyMessage": "Copier",
+        "forkFromHere": "Bifurquer d'ici",
         "copied": "Copié",
         "selectionActions": "Actions de sélection",
         "selectionCopy": "Copier le texte",
@@ -3580,7 +3583,6 @@
         },
         "planMode": {
           "entered": "Mode planification activé",
-          "planLabel": "Plan",
           "reviewApproved": "Plan approuvé — mise en œuvre",
           "reviewKept": "Reste en mode plan",
           "reviewPending": "En attente de la décision sur le plan",
@@ -3860,6 +3862,13 @@
         "cardResultPending": "Résultat pas encore reçu",
         "running": "{count, plural, one {# tâche en arrière-plan en cours} other {# tâches en arrière-plan en cours}}",
         "settling": "Synchronisation des résultats d'arrière-plan…"
+      },
+      "asyncTasks": {
+        "openOutput": "Sortie",
+        "stop": "Arrêter",
+        "tokens": "{count} jetons",
+        "stopDeclined": "Impossible d'arrêter cette tâche : elle est peut-être déjà terminée.",
+        "stopFailed": "Échec de l'arrêt de la tâche : {error}"
       },
       "proposedPlan": {
         "title": "Plan proposé",

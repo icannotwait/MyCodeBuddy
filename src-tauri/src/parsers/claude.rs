@@ -544,6 +544,7 @@ fn push_goal_marker(messages: &mut Vec<UnifiedMessage>, goal: &PendingGoal) -> O
         model: None,
         completed_at: Some(goal.timestamp),
         reasoning_effort: None,
+        agent_message_id: None,
     });
     Some(marker.objective)
 }
@@ -1401,6 +1402,7 @@ impl ClaudeRecordAccumulator {
                         model: None,
                         reasoning_effort: None,
                         completed_at: Some(timestamp),
+                        agent_message_id: None,
                     },
                     prompt_id,
                 ));
@@ -1566,6 +1568,7 @@ impl ClaudeRecordAccumulator {
                     model: None,
                     reasoning_effort: None,
                     completed_at: Some(timestamp),
+                    agent_message_id: None,
                 });
             }
             "assistant" => {
@@ -1649,6 +1652,16 @@ impl ClaudeRecordAccumulator {
                     }
                 } else {
                     messages.push(UnifiedMessage {
+                        // `messageIdForGrouping` in claude-agent-acp: the API
+                        // message id when the record carries one, else the
+                        // record uuid. Deriving it here rather than capturing
+                        // the live `messageId` chunk field is what lets a
+                        // RELOADED conversation still offer a fork point — the
+                        // rule is a pure function of the record, so the offline
+                        // parse names the message exactly as the adapter does.
+                        agent_message_id: Some(
+                            message_id.map_or_else(|| uuid.clone(), str::to_string),
+                        ),
                         id: uuid,
                         role: MessageRole::Assistant,
                         content,
@@ -1765,6 +1778,7 @@ impl ClaudeRecordAccumulator {
                         model: None,
                         reasoning_effort: None,
                         completed_at: Some(timestamp),
+                        agent_message_id: None,
                     });
                 }
             }
@@ -1890,6 +1904,7 @@ impl ClaudeRecordAccumulator {
                         model: None,
                         reasoning_effort: None,
                         completed_at: Some(timestamp),
+                        agent_message_id: None,
                     });
                 }
             }
@@ -2639,6 +2654,11 @@ pub(crate) fn group_into_turns_with_origins(
             let mut blocks: Vec<ContentBlock> = msg.content.clone();
             let timestamp = msg.timestamp;
             let id = format!("turn-{}", turns.len());
+            // The turn's fork point is the assistant message that OPENS it —
+            // the tool-result-only messages absorbed below are the same API
+            // call continuing, and forking "up to" one of those would cut the
+            // turn in half. Absent on synthesized turns, which name no record.
+            let agent_message_id = msg.agent_message_id.clone();
             let usage = msg.usage.clone();
             let duration_ms = msg.duration_ms;
             let turn_model = msg.model.clone();
@@ -2675,6 +2695,7 @@ pub(crate) fn group_into_turns_with_origins(
                 autonomous_origin,
                 generation_ms: None,
                 generation_tokens: None,
+                agent_message_id,
             });
         } else if matches!(msg.role, MessageRole::System) {
             turns.push(MessageTurn {
@@ -2691,6 +2712,7 @@ pub(crate) fn group_into_turns_with_origins(
                 autonomous_origin: None,
                 generation_ms: None,
                 generation_tokens: None,
+                agent_message_id: None,
             });
             i += 1;
         } else {
@@ -2708,6 +2730,7 @@ pub(crate) fn group_into_turns_with_origins(
                 autonomous_origin: None,
                 generation_ms: None,
                 generation_tokens: None,
+                agent_message_id: None,
             });
             i += 1;
         }
@@ -3005,6 +3028,7 @@ mod tests {
                 autonomous_origin: None,
                 generation_ms: None,
                 generation_tokens: None,
+                agent_message_id: None,
             },
             MessageTurn {
                 id: "turn-1".to_string(),
@@ -3025,6 +3049,7 @@ mod tests {
                 autonomous_origin: None,
                 generation_ms: None,
                 generation_tokens: None,
+                agent_message_id: None,
             },
         ];
 
@@ -3432,6 +3457,56 @@ mod tests {
             .expect("parse detail");
         fs::remove_file(&path).unwrap();
         detail
+    }
+
+    /// The fork point codeg sends must be the id the ADAPTER would look up.
+    /// claude-agent-acp's `messageIdForGrouping` takes the API message id when
+    /// the record has one, so an assistant turn must carry that — not the
+    /// record uuid `MessageTurn::id`-adjacent code uses everywhere else.
+    #[test]
+    fn assistant_turns_carry_the_api_message_id_as_the_fork_point() {
+        let usage = json!({
+            "input_tokens": 1, "output_tokens": 1,
+            "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0
+        });
+        let detail = parse_lines_into_detail(&[assistant_block_line(
+            "record-uuid-1",
+            "msg_01ABC",
+            "2026-03-01T10:00:00Z",
+            json!({"type": "text", "text": "hello"}),
+            usage,
+        )]);
+        let turn = detail
+            .turns
+            .iter()
+            .find(|t| matches!(t.role, TurnRole::Assistant))
+            .expect("an assistant turn");
+        assert_eq!(turn.agent_message_id.as_deref(), Some("msg_01ABC"));
+    }
+
+    /// `messageIdForGrouping` falls back to the record uuid when the message
+    /// carries no id, and so must codeg — otherwise those turns would silently
+    /// lose their fork point.
+    #[test]
+    fn assistant_turns_fall_back_to_the_record_uuid() {
+        let line = json!({
+            "type": "assistant",
+            "sessionId": "dedup-test",
+            "timestamp": "2026-03-01T10:00:00Z",
+            "uuid": "record-uuid-2",
+            "message": {
+                "model": "claude-opus-5",
+                "content": [{"type": "text", "text": "hello"}],
+            }
+        })
+        .to_string();
+        let detail = parse_lines_into_detail(&[line]);
+        let turn = detail
+            .turns
+            .iter()
+            .find(|t| matches!(t.role, TurnRole::Assistant))
+            .expect("an assistant turn");
+        assert_eq!(turn.agent_message_id.as_deref(), Some("record-uuid-2"));
     }
 
     fn total_usage_tokens(detail: &crate::models::ConversationDetail) -> u64 {

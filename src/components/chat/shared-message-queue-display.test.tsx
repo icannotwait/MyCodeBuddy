@@ -127,6 +127,7 @@ function snapshotPatch(
     backgroundDetailRevision: 0,
     backgroundTranscriptGeneration: 0,
     sessionFailures: [],
+    asyncTasks: [],
     lastError: null,
     lastErrorDetails: null,
     eventSeq,

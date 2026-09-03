@@ -23,7 +23,7 @@ Codeg (Code Generation) is a multi-agent coding workspace. It brings multiple ag
 
 ![gallery](./docs/images/workspace-light.png#gh-light-mode-only)
 ![gallery](./docs/images/workspace-dark.png#gh-dark-mode-only)
-It aggregates your sessions from every supported agent CLI into one searchable workspace, and lets a main agent delegate to sub-agents of other types within a single task. Work you'd rather not sit through goes on a to-do board instead — each task in its own branch, running unattended, waiting for your review before it lands. Codeg runs as a desktop app, a standalone server, or a Docker container, with native iOS and Android clients for when you're away from your desk; fifteen agents come built in, and you can register any other ACP-compatible agent yourself.
+It aggregates your sessions from every supported agent CLI into one searchable workspace, and lets a main agent delegate to sub-agents of other types within a single task. Work you'd rather not sit through goes on a to-do board instead — each task in its own branch, running unattended, waiting for your review before it lands. Codeg runs as a desktop app, a standalone server, or a Docker container, with native iOS and Android clients for when you're away from your desk; fourteen agents come built in, and you can register any other ACP-compatible agent yourself.
 
 ## Sponsors
 
@@ -361,7 +361,7 @@ irm https://raw.githubusercontent.com/icannotwait/MyCodeBuddy/main/uninstall-ser
 Windows operators can install from the release zip:
 
 ```powershell
-.\install.ps1 -Version v0.30.0-mycodebuddy.1
+.\install.ps1 -Version v0.30.1-mycodebuddy.1
 ```
 
 #### Option 1: Docker

@@ -10,6 +10,7 @@ import {
   Gauge,
   ListTodo,
   Plane,
+  Split,
   Timer,
 } from "lucide-react"
 import { useLocale, useTranslations } from "next-intl"
@@ -42,6 +43,10 @@ interface TurnStatsProps {
   generationMs?: number | null
   generationTokens?: number | null
   agentType?: AgentType | null
+  /** Fork the session at THIS reply. Undefined hides the affordance — the
+   * session has no live connection, the agent has no `session/fork`, or a turn
+   * is in flight. */
+  onForkFromHere?: () => void
 }
 
 const iconButtonClass =
@@ -61,6 +66,7 @@ export function TurnStats({
   generationMs,
   generationTokens,
   agentType,
+  onForkFromHere,
 }: TurnStatsProps) {
   const locale = useLocale()
   const t = useTranslations("Folder.chat.messageList")
@@ -175,7 +181,8 @@ export function TurnStats({
     !hasDuration &&
     !hasGeneration &&
     !hasCompletedAt &&
-    !hasJump
+    !hasJump &&
+    !onForkFromHere
   )
     return null
 
@@ -218,6 +225,21 @@ export function TurnStats({
             <TooltipContent side="top">
               {tTasks("createFromMessage")}
             </TooltipContent>
+          </Tooltip>
+        )}
+        {onForkFromHere && (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                onClick={onForkFromHere}
+                className={iconButtonClass}
+                aria-label={t("forkFromHere")}
+              >
+                <Split aria-hidden="true" className="h-3.5 w-3.5" />
+              </button>
+            </TooltipTrigger>
+            <TooltipContent side="top">{t("forkFromHere")}</TooltipContent>
           </Tooltip>
         )}
         {displayModels.length > 0 && (

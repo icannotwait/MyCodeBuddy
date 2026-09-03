@@ -1232,6 +1232,7 @@ mod tests {
             model: Some("  claude-opus-5  ".into()),
             reasoning_effort: None,
             completed_at: None,
+            agent_message_id: None,
             outcome: None,
             autonomous_origin: None,
             generation_ms: None,

@@ -19,6 +19,8 @@ pub enum AcpError {
     ConnectionNotFound(String),
     #[error("ACP protocol error: {0}")]
     Protocol(String),
+    #[error("selected fork point is unavailable: {detail}")]
+    ForkPointUnavailable { detail: String },
     #[error("selected terminal shell is unavailable: {display_name} ({executable})")]
     TerminalShellUnavailable {
         display_name: String,
@@ -52,10 +54,10 @@ pub enum AcpError {
         state: ContinuationState,
     },
     /// Live feedback was submitted while no turn was in flight. Feedback only
-    /// makes sense while the agent is working (it is pulled mid-turn via the
-    /// `check_user_feedback` MCP tool); with no active turn there is nothing to
-    /// steer. The frontend recognizes this (stable Display text) and falls back
-    /// to sending the text as an ordinary prompt instead.
+    /// makes sense while the agent is working, whether pushed through native
+    /// steering or pulled through `check_user_feedback`; with no active turn
+    /// there is nothing to steer. The frontend recognizes this (stable Display
+    /// text) and falls back to sending the text as an ordinary prompt instead.
     #[error("no active turn to send feedback to")]
     NoActiveTurn,
     /// Live feedback was submitted while the feature is disabled. The settings
@@ -165,6 +167,7 @@ impl AcpError {
             Self::ProbeTimedOut => Some("probe_timed_out"),
             Self::ProcessExited => Some("process_exited"),
             Self::TurnInProgress => Some("turn_in_progress"),
+            Self::ForkPointUnavailable { .. } => Some("fork_point_unavailable"),
             Self::ContinuationInProgress { .. } => Some("conversation_waiting_for_subagents"),
             Self::NoActiveTurn => Some("no_active_turn"),
             Self::FeedbackDisabled => Some("feedback_disabled"),
@@ -204,6 +207,13 @@ impl AcpError {
                 AppErrorCode::TurnInProgress,
                 "turn already in progress for this connection",
             )),
+            AcpError::ForkPointUnavailable { detail } => Some(
+                AppCommandError::new(
+                    AppErrorCode::ForkPointUnavailable,
+                    "Selected fork point is unavailable",
+                )
+                .with_detail(detail.clone()),
+            ),
             AcpError::TerminalShellUnavailable {
                 display_name,
                 executable,
@@ -555,6 +565,22 @@ mod tests {
             json!({
                 "code": "turn_in_progress",
                 "message": "turn already in progress for this connection",
+            })
+        );
+    }
+
+    #[test]
+    fn round1_explicit_fork_error_serializes_stable_desktop_code() {
+        let error = AcpError::ForkPointUnavailable {
+            detail: "the selected turn is missing or unsupported by codex".into(),
+        };
+        assert_eq!(error.code(), Some("fork_point_unavailable"));
+        assert_eq!(
+            serde_json::to_value(error).expect("serialize fork-point error"),
+            json!({
+                "code": "fork_point_unavailable",
+                "message": "Selected fork point is unavailable",
+                "detail": "the selected turn is missing or unsupported by codex",
             })
         );
     }

@@ -678,6 +678,7 @@ impl GeminiParser {
                         model: None,
                         reasoning_effort: None,
                         completed_at: Some(timestamp),
+                        agent_message_id: None,
                     });
                 }
                 "gemini" | "assistant" | "model" => {
@@ -698,6 +699,7 @@ impl GeminiParser {
                             .map(|s| s.to_string()),
                         reasoning_effort: None,
                         completed_at: Some(timestamp),
+                        agent_message_id: None,
                     });
                 }
                 "system" => {
@@ -714,6 +716,7 @@ impl GeminiParser {
                         model: None,
                         reasoning_effort: None,
                         completed_at: Some(timestamp),
+                        agent_message_id: None,
                     });
                 }
                 _ => {}
@@ -871,6 +874,7 @@ fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn> {
                 autonomous_origin: None,
                 generation_ms: None,
                 generation_tokens: None,
+                agent_message_id: None,
             });
             i += 1;
             continue;
@@ -891,6 +895,7 @@ fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn> {
                 autonomous_origin: None,
                 generation_ms: None,
                 generation_tokens: None,
+                agent_message_id: None,
             });
             i += 1;
             continue;
@@ -939,6 +944,7 @@ fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn> {
             autonomous_origin: None,
             generation_ms: None,
             generation_tokens: None,
+            agent_message_id: None,
         });
     }
 

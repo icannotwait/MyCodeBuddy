@@ -23,7 +23,7 @@ Codeg（Code Generation）是一個多智慧體編碼工作台，它將多個智
 
 ![gallery](../images/workspace-light.png#gh-light-mode-only)
 ![gallery](../images/workspace-dark.png#gh-dark-mode-only)
-它將所有支援的智慧體 CLI 的工作階段聚合進一個可搜尋的工作區，讓主智慧體在同一個任務內委派給其它類型的子智慧體。不想守著做完的活，可以寫進待辦任務：每個任務待在自己的分支上無人看管地跑，做完了等你驗收才落地。Codeg 可作為桌面應用、獨立伺服器或 Docker 容器執行，還有原生 iOS 與 Android 用戶端，讓你離開電腦後也能接手正在跑的任務；內建十五個智慧體，你也可以自行註冊任何其它相容 ACP 的智慧體。
+它將所有支援的智慧體 CLI 的工作階段聚合進一個可搜尋的工作區，讓主智慧體在同一個任務內委派給其它類型的子智慧體。不想守著做完的活，可以寫進待辦任務：每個任務待在自己的分支上無人看管地跑，做完了等你驗收才落地。Codeg 可作為桌面應用、獨立伺服器或 Docker 容器執行，還有原生 iOS 與 Android 用戶端，讓你離開電腦後也能接手正在跑的任務；內建十四個智慧體，你也可以自行註冊任何其它相容 ACP 的智慧體。
 
 ## 贊助
 
@@ -318,7 +318,7 @@ Self-host with the release archive, Docker, or a source build (`--features serve
 Windows install:
 
 ```powershell
-.\install.ps1 -Version v0.30.0-mycodebuddy.1
+.\install.ps1 -Version v0.30.1-mycodebuddy.1
 ```
 
 #### 方式三：Docker

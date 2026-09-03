@@ -1891,6 +1891,7 @@
       "forkSession": "分叉会话",
       "forkSessionSuccess": "会话分叉成功",
       "forkSessionFailed": "会话分叉失败：{error}",
+      "forkSessionBusy": "分叉失败：当前有回合正在进行",
       "exportConversation": "导出会话",
       "exportImage": "图片",
       "exportMarkdown": "Markdown",
@@ -2868,6 +2869,7 @@
           "downloadFailed": "{agent} 下载失败：{message}",
           "sessionLoadResourceNotFound": "{agent} 会话加载失败，可重新加载重试，或开始新会话。",
           "sessionLoadUnavailable": "{agent} 无法恢复此会话，它可能已结束或 agent 已停止。可重新加载重试，或开始新会话。",
+          "sessionLoadBusy": "这份历史正被从它分叉出来的会话占用。关掉那个会话，再重新加载即可打开。",
           "sessionArchived": "原会话已在 {agent} 侧归档，可在终端运行 {command} 找回历史后重载，或直接开始新会话。",
           "turnFailedRefusal": "{agent} 拒绝继续本轮回复，通常意味着后端或网关出错，请检查代理日志。",
           "turnFailedMaxTokens": "{agent} 已达到本轮回复的最大 Token 限制。",
@@ -3034,7 +3036,7 @@
           "pasteDropFiles": "直接粘贴截图或把文件拖到输入框，即可作为附件",
           "queueMessage": "智能体回复中也能继续输入并排队，回答完毕会自动续发",
           "draftAutoSave": "未发送的草稿会自动保存，重新打开会话仍在",
-          "forkSend": "发送按钮旁的下拉选择「分叉发送」，从当前位置开一条新分支",
+          "forkFromTurn": "任意已完成的回复上都有「从此处分叉」，从那条消息开一条新分支",
           "exportConversation": "右键会话内容区可导出为 Markdown / HTML / 图片",
           "chatChannels": "在「设置 → 聊天频道」接入 Telegram / 飞书 / 微信，从手机继续操作",
           "shortcutsAuxPanel": "<shortcut>{toggleAuxPanel}</shortcut> 切换右侧面板，查看本次会话改动的文件与 Git 变更",
@@ -3261,6 +3263,7 @@
         "emptyConversation": "当前会话暂无消息。",
         "systemMessage": "系统消息",
         "copyMessage": "复制",
+        "forkFromHere": "从此处分叉",
         "copied": "已复制",
         "selectionActions": "选中内容操作",
         "selectionCopy": "复制文本",
@@ -3580,7 +3583,6 @@
         },
         "planMode": {
           "entered": "进入计划模式",
-          "planLabel": "计划",
           "reviewApproved": "已批准执行计划",
           "reviewKept": "保持在计划模式",
           "reviewPending": "等待计划决定",
@@ -3860,6 +3862,13 @@
         "cardResultPending": "结果尚未返回",
         "running": "{count} 个后台任务运行中",
         "settling": "正在同步后台结果…"
+      },
+      "asyncTasks": {
+        "openOutput": "输出",
+        "stop": "停止",
+        "tokens": "{count} tokens",
+        "stopDeclined": "无法停止该任务，它可能已经结束。",
+        "stopFailed": "停止任务失败：{error}"
       },
       "proposedPlan": {
         "title": "计划提案",

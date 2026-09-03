@@ -16,7 +16,7 @@ use crate::acp::connection::{connection_channel, matching_config_pair};
 use crate::acp::connection::{
     spawn_agent_connection, AgentConnection, ConnectionCommand, ConnectionControl,
     GoalControlAction, LaneSender, RegisteredSpawnAttempt, RouteBootstrapOutcome, SpawnHandshake,
-    SuspensionAck,
+    SteerOutcome, SuspensionAck,
 };
 use crate::acp::delegation::continuation::build_continuation_prompt_text;
 use crate::acp::delegation::continuation::coordinator::{
@@ -5946,6 +5946,42 @@ impl ConnectionManager {
         self.cancel(db, conn_id).await
     }
 
+    /// Stop one AIR async task (`_session/async_task/stop`).
+    ///
+    /// Returns the adapter's own verdict, not "the request went through": it
+    /// answers `false` for a task it declines to stop. Unshielded, unlike
+    /// `submit_feedback_native` — there is nothing to persist on this path, so a
+    /// caller that disconnects mid-await leaves no half-written state, and the
+    /// user-visible result arrives on the session channel regardless of who is
+    /// still listening for the reply.
+    ///
+    /// The task id is NOT pre-validated against `SessionState.async_tasks`. The
+    /// adapter owns that table's real lifecycle (its `claimStop` already refuses
+    /// unknown, terminal, and already-stopping tasks), and a local check could
+    /// only ever be staler than the adapter's — it would turn a race into a
+    /// silent no-op rather than the `false` the caller can report.
+    pub async fn stop_async_task(&self, conn_id: &str, task_id: &str) -> Result<bool, AcpError> {
+        let cmd_tx = {
+            let connections = self.connections.lock().await;
+            connections
+                .get(conn_id)
+                .ok_or_else(|| AcpError::ConnectionNotFound(conn_id.into()))?
+                .cmd_tx
+                .clone()
+        };
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        cmd_tx
+            .send(ConnectionCommand::StopAsyncTask {
+                task_id: task_id.to_string(),
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| AcpError::ProcessExited)?;
+        reply_rx
+            .await
+            .map_err(|_| AcpError::protocol("Async task stop reply channel closed".to_string()))?
+    }
+
     pub async fn cancel(&self, db: &DatabaseConnection, conn_id: &str) -> Result<(), AcpError> {
         self.cancel_with_admission(db, conn_id, None)
             .await
@@ -6094,6 +6130,7 @@ impl ConnectionManager {
     pub async fn fork_session(
         &self,
         db: &AppDatabase,
+        internal_sessions: &crate::auto_title::InternalAgentSessionRegistry,
         conn_id: &str,
         // Caller-supplied linkage for a connection that resumed a historical
         // conversation but hasn't sent a prompt through it yet. Such a
@@ -6107,6 +6144,10 @@ impl ConnectionManager {
         // `send_prompt_linked`'s Branch A contract).
         link_conversation_id: Option<i32>,
         link_folder_id: Option<i32>,
+        // Fork at this rendered turn instead of at the tail ("fork from here").
+        // Resolved to an agent-specific `ForkPoint` below. Only an absent id
+        // means tail; an explicit id that cannot resolve is an error.
+        fork_from_turn_id: Option<String>,
     ) -> Result<ForkResultInfo, AcpError> {
         let _permit = self.admission.admit()?;
         let (state_arc, cmd_tx, emitter) = {
@@ -6166,6 +6207,42 @@ impl ConnectionManager {
             AcpError::protocol("fork_session requires a linked conversation row".to_string())
         })?;
 
+        // Resolve the fork point BEFORE the cancellation shield below: this is
+        // a read-only parse, so a caller that disappears here has changed
+        // nothing. An explicit turn must never silently become a tail fork.
+        let fork_point = match fork_from_turn_id {
+            None => None,
+            Some(turn_id) => {
+                let agent_type = state_arc.read().await.agent_type;
+                let (detail, _) = crate::commands::conversations::get_folder_conversation_core(
+                    &db.conn,
+                    internal_sessions,
+                    conversation_id,
+                )
+                .await
+                .map_err(|error| {
+                    tracing::warn!(
+                        connection_id = %conn_id,
+                        turn_id = %turn_id,
+                        %error,
+                        "[ACP] could not read the conversation for an explicit fork"
+                    );
+                    AcpError::ForkPointUnavailable {
+                        detail: "the conversation could not be read to resolve the selected turn"
+                            .into(),
+                    }
+                })?;
+                Some(
+                    crate::acp::fork::resolve_fork_point(&detail.turns, &turn_id, agent_type)
+                        .ok_or_else(|| AcpError::ForkPointUnavailable {
+                            detail: format!(
+                                "the selected turn is missing or unsupported by {agent_type}"
+                            ),
+                        })?,
+                )
+            }
+        };
+
         // Reject if a turn is already in flight. `prompt_lock` is FREE between a
         // prompt's enqueue and its `TurnComplete` (it is released the moment the
         // command is queued), so the lock alone can't catch a turn the loop is
@@ -6203,7 +6280,10 @@ impl ConnectionManager {
                 // Protocol-only round trip — no DB writes inside the loop.
                 let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                 cmd_tx
-                    .send(ConnectionCommand::Fork { reply: reply_tx })
+                    .send(ConnectionCommand::Fork {
+                        fork_point,
+                        reply: reply_tx,
+                    })
                     .await
                     .map_err(|_| AcpError::ProcessExited)?;
                 let protocol_result = reply_rx
@@ -6367,6 +6447,7 @@ impl ConnectionManager {
                     let folder_id = current.folder_id;
                     let agent_type_str = current.agent_type.clone();
                     let git_branch = current.git_branch.clone();
+                    let title_locked = current.title_locked;
                     // Capture before `into()` so the live row retains its guard
                     // and the historical sibling copies the same finalized flag.
                     // Fork never inserts a sibling auto-title job.
@@ -6388,6 +6469,7 @@ impl ConnectionManager {
                     let mut active: conversation::ActiveModel = current.into();
                     if let Some(ref clean) = clean_title {
                         active.title = Set(Some(format!("[Fork] {clean}")));
+                        active.title_locked = Set(true);
                     }
                     active.external_id = Set(Some(forked_session_id));
                     active.updated_at = Set(now);
@@ -6427,7 +6509,7 @@ impl ConnectionManager {
                         id: NotSet,
                         folder_id: Set(folder_id),
                         title: Set(clean_title),
-                        title_locked: Set(false),
+                        title_locked: Set(title_locked),
                         auto_title_finalized: Set(auto_title_finalized),
                         agent_type: Set(agent_type_str),
                         status: Set(ConversationStatus::PendingReview),
@@ -8712,17 +8794,19 @@ impl ConnectionManager {
     ///
     /// Validation: the text is trimmed and rejected when empty
     /// ([`AcpError::InvalidFeedback`]) or longer than [`MAX_FEEDBACK_CHARS`] —
-    /// the full text rides in the broadcast event, the snapshot, and the MCP
-    /// response, so a sanity bound keeps one pathological note from bloating
-    /// them. (There is deliberately no per-turn COUNT cap: the set is cleared
-    /// every turn, so its size scales with human typing, not unboundedly.)
+    /// the full text rides in the broadcast event and snapshot, plus the MCP
+    /// response on the pull channel, so a sanity bound keeps one pathological
+    /// note from bloating them. (There is deliberately no per-turn COUNT cap:
+    /// the set is cleared every turn, so its size scales with human typing, not
+    /// unboundedly.)
     ///
     /// Rejected with [`AcpError::NoActiveTurn`] unless a turn is in flight —
-    /// feedback is mid-turn steering, pulled by the agent via the
-    /// `check_user_feedback` MCP tool; with no active turn there is nothing to
-    /// steer and the note would strand (the frontend falls back to an ordinary
-    /// prompt). The append rides `emit_with_state` so `SessionState.feedback`,
-    /// the ring buffer, and every attached client stay in lockstep.
+    /// feedback is mid-turn steering, either pushed through native ACP steering
+    /// or pulled via `check_user_feedback`; with no active turn there is nothing
+    /// to steer and the note would strand (the frontend falls back to an
+    /// ordinary prompt). Recording rides the state-aware emit helpers so
+    /// `SessionState.feedback`, the ring buffer, and every attached client stay
+    /// in lockstep.
     pub async fn submit_feedback(
         &self,
         conn_id: &str,
@@ -8738,16 +8822,29 @@ impl ConnectionManager {
             )));
         }
         let text = trimmed.to_string();
-        let (state, emitter) = self
-            .get_state_and_emitter(conn_id)
-            .await
-            .ok_or_else(|| AcpError::ConnectionNotFound(conn_id.to_string()))?;
-        // Per-connection capability gate: reject if THIS agent never got the
-        // `check_user_feedback` tool (e.g. its session started before the feature
-        // was enabled) — the note could never be read. `feedback_tool_available`
-        // is fixed at launch, so a plain read is race-free.
-        if !state.read().await.feedback_tool_available {
+        let (state, cmd_tx, emitter) = {
+            let connections = self.connections.lock().await;
+            let conn = connections
+                .get(conn_id)
+                .ok_or_else(|| AcpError::ConnectionNotFound(conn_id.to_string()))?;
+            (
+                conn.state.clone(),
+                conn.cmd_tx.clone(),
+                conn.emitter.clone(),
+            )
+        };
+        let (native, tool_available) = {
+            let state = state.read().await;
+            (
+                state.native_steering_available,
+                state.feedback_tool_available,
+            )
+        };
+        if !native && !tool_available {
             return Err(AcpError::FeedbackDisabled);
+        }
+        if native {
+            return Self::submit_feedback_native(conn_id, state, cmd_tx, emitter, text).await;
         }
         let item =
             FeedbackItem::new_pending(uuid::Uuid::new_v4().to_string(), text, chrono::Utc::now());
@@ -8766,6 +8863,70 @@ impl ConnectionManager {
             return Err(AcpError::NoActiveTurn);
         }
         Ok(item)
+    }
+
+    async fn submit_feedback_native(
+        conn_id: &str,
+        state: Arc<RwLock<SessionState>>,
+        cmd_tx: LaneSender<ConnectionCommand>,
+        emitter: EventEmitter,
+        text: String,
+    ) -> Result<FeedbackItem, AcpError> {
+        if !state.read().await.turn_in_flight {
+            return Err(AcpError::NoActiveTurn);
+        }
+        let conn_id = conn_id.to_string();
+        let handle = tokio::spawn(async move {
+            let outcome: Result<FeedbackItem, AcpError> = async {
+                let (reply, receiver) = tokio::sync::oneshot::channel();
+                cmd_tx
+                    .send(ConnectionCommand::Steer {
+                        text: text.clone(),
+                        reply,
+                    })
+                    .await
+                    .map_err(|_| AcpError::ProcessExited)?;
+                match receiver.await.map_err(|_| {
+                    AcpError::protocol("Steer reply channel closed".to_string())
+                })?? {
+                    SteerOutcome::PromptRequired => return Err(AcpError::NoActiveTurn),
+                    SteerOutcome::Injected => {}
+                    SteerOutcome::StartedNewTurn => {
+                        tracing::warn!(
+                            connection_id = %conn_id,
+                            "[ACP][feedback] native steering started a new turn; downgrading to pull"
+                        );
+                        state.write().await.native_steering_available = false;
+                    }
+                }
+                let item = FeedbackItem::new_delivered(
+                    uuid::Uuid::new_v4().to_string(),
+                    text,
+                    chrono::Utc::now(),
+                );
+                emit_with_state(
+                    &state,
+                    &emitter,
+                    AcpEvent::FeedbackSubmitted { item: item.clone() },
+                )
+                .await;
+                Ok(item)
+            }
+            .await;
+            if let Err(error) = &outcome {
+                if !matches!(error, AcpError::NoActiveTurn) {
+                    tracing::error!(
+                        connection_id = %conn_id,
+                        %error,
+                        "[ACP][feedback] native feedback submit failed"
+                    );
+                }
+            }
+            outcome
+        });
+        handle
+            .await
+            .map_err(|error| AcpError::protocol(format!("steer task did not complete: {error}")))?
     }
 
     /// Read the pending feedback for a connection WITHOUT marking it delivered.
@@ -13110,10 +13271,11 @@ mod tests {
 
     #[tokio::test]
     async fn shared_legacy_build_failure_with_dedup_lock_returns_typed_fatal_promptly() {
-        let manager = ConnectionManager::new();
+        let mut manager = ConnectionManager::new();
+        manager.spawn_handshake_timeout = Duration::from_secs(SPAWN_HANDSHAKE_TIMEOUT_SECS);
         let agent_type = AgentType::custom("missing-shared-fixture").expect("valid fixture id");
         let result = tokio::time::timeout(
-            Duration::from_millis(100),
+            Duration::from_secs(1),
             manager.spawn_agent(
                 agent_type,
                 None,
@@ -18988,7 +19150,16 @@ mod tests {
             s.turn_in_flight = true; // a turn is already running
         }
 
-        let res = mgr.fork_session(&db, conn_id, None, None).await;
+        let res = mgr
+            .fork_session(
+                &db,
+                fork_test_registry(&db).as_ref(),
+                conn_id,
+                None,
+                None,
+                None,
+            )
+            .await;
         assert!(
             matches!(res, Err(AcpError::TurnInProgress)),
             "fork must reject with TurnInProgress while a turn is in flight, got {res:?}"
@@ -18997,6 +19168,44 @@ mod tests {
             cmd_rx.try_recv().is_err(),
             "a rejected fork must NOT enqueue a Fork command"
         );
+    }
+
+    #[tokio::test]
+    async fn round1_explicit_unresolved_fork_never_reaches_the_agent() {
+        use crate::db::test_helpers;
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/fork-explicit-missing").await;
+        let conversation =
+            conversation_service::create(&db.conn, folder_id, AgentType::Codex, None, None)
+                .await
+                .unwrap();
+        let mgr = ConnectionManager::new();
+        let conn_id = "conn-fork-explicit-missing";
+        let mut cmd_rx = insert_live_connection(&mgr, conn_id, AgentType::Codex, None).await;
+        mgr.get_state(conn_id)
+            .await
+            .unwrap()
+            .write()
+            .await
+            .conversation_id = Some(conversation.id);
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            mgr.fork_session(
+                &db,
+                fork_test_registry(&db).as_ref(),
+                conn_id,
+                None,
+                None,
+                Some("live-501-a".into()),
+            ),
+        )
+        .await
+        .expect("an unresolved explicit fork must reject before protocol dispatch")
+        .expect_err("an unresolved explicit fork must not become a tail fork");
+
+        assert!(matches!(result, AcpError::ForkPointUnavailable { .. }));
+        assert!(cmd_rx.try_recv().is_err(), "no Fork command may be queued");
     }
 
     #[tokio::test]
@@ -19027,7 +19236,16 @@ mod tests {
             .await
             .conversation_id = Some(9);
 
-        let res = mgr.fork_session(&db, conn_id, None, None).await;
+        let res = mgr
+            .fork_session(
+                &db,
+                fork_test_registry(&db).as_ref(),
+                conn_id,
+                None,
+                None,
+                None,
+            )
+            .await;
         assert!(res.is_err(), "fork with a dead receiver must fail");
         assert!(
             !mgr.get_state(conn_id)
@@ -19131,7 +19349,7 @@ mod tests {
 
         let (go_tx, go_rx) = tokio::sync::oneshot::channel::<()>();
         let fake_loop = tokio::spawn(async move {
-            if let Some(ConnectionCommand::Fork { reply }) = rx.recv().await {
+            if let Some(ConnectionCommand::Fork { reply, .. }) = rx.recv().await {
                 go_rx.await.ok(); // withhold the reply until the test releases it
                 let _ = reply.send(Ok(crate::acp::types::ForkProtocolResult {
                     forked_session_id: "session-S2".into(),
@@ -19146,7 +19364,14 @@ mod tests {
         // DROPS this caller future. The detached persistence task must survive.
         let timed = tokio::time::timeout(
             std::time::Duration::from_millis(100),
-            mgr.fork_session(&db, "c-shield", None, None),
+            mgr.fork_session(
+                &db,
+                fork_test_registry(&db).as_ref(),
+                "c-shield",
+                None,
+                None,
+                None,
+            ),
         )
         .await;
         assert!(
@@ -21345,6 +21570,17 @@ mod tests {
     /// fakes the protocol-level fork reply. Returns the manager so the test
     /// can call `fork_session`. The fake reply task lives until it processes
     /// one Fork command, then exits.
+    fn fork_test_registry(
+        db: &AppDatabase,
+    ) -> Arc<crate::auto_title::InternalAgentSessionRegistry> {
+        let data_dir = tempfile::tempdir().unwrap();
+        crate::auto_title::InternalAgentSessionRegistry::new_empty_for_test(
+            db.conn.clone(),
+            data_dir.path(),
+        )
+        .unwrap()
+    }
+
     async fn manager_with_fake_fork(
         conn_id: &str,
         conversation_id: i32,
@@ -21408,7 +21644,7 @@ mod tests {
         let original = original_session_id.to_string();
         let join = tokio::spawn(async move {
             while let Some(cmd) = rx.recv().await {
-                if let ConnectionCommand::Fork { reply } = cmd {
+                if let ConnectionCommand::Fork { reply, .. } = cmd {
                     let _ = reply.send(Ok(crate::acp::types::ForkProtocolResult {
                         forked_session_id: forked.clone(),
                         original_session_id: original.clone(),
@@ -21445,7 +21681,14 @@ mod tests {
         let (mgr, join) =
             manager_with_fake_fork("c-fork", pre.id, "session-S2", "session-S1").await;
         let result = mgr
-            .fork_session(&db, "c-fork", None, None)
+            .fork_session(
+                &db,
+                fork_test_registry(&db).as_ref(),
+                "c-fork",
+                None,
+                None,
+                None,
+            )
             .await
             .expect("fork_session should succeed");
         let _ = join.await;
@@ -21527,7 +21770,14 @@ mod tests {
         let (mgr, join) =
             manager_with_fake_fork("c-fork-guard", pre.id, "session-S2", "session-S1").await;
         let result = mgr
-            .fork_session(&db, "c-fork-guard", None, None)
+            .fork_session(
+                &db,
+                fork_test_registry(&db).as_ref(),
+                "c-fork-guard",
+                None,
+                None,
+                None,
+            )
             .await
             .expect("fork");
         let _ = join.await;
@@ -21584,7 +21834,14 @@ mod tests {
         let (mgr, join) =
             manager_with_fake_fork("c-restack", pre.id, "session-S2", "session-S1").await;
         let result = mgr
-            .fork_session(&db, "c-restack", None, None)
+            .fork_session(
+                &db,
+                fork_test_registry(&db).as_ref(),
+                "c-restack",
+                None,
+                None,
+                None,
+            )
             .await
             .unwrap();
         let _ = join.await;
@@ -21642,7 +21899,14 @@ mod tests {
         let (mgr, join) =
             manager_with_fake_fork("c-raced", pre.id, "session-S2", "session-S1").await;
         let result = mgr
-            .fork_session(&db, "c-raced", None, None)
+            .fork_session(
+                &db,
+                fork_test_registry(&db).as_ref(),
+                "c-raced",
+                None,
+                None,
+                None,
+            )
             .await
             .expect("fork must survive the lifecycle subscriber winning the race");
         let _ = join.await;
@@ -21694,7 +21958,16 @@ mod tests {
         .unwrap();
         let (mgr, join) =
             manager_with_fake_fork("c-nosp", pre.id, "session-S2", "session-S1").await;
-        mgr.fork_session(&db, "c-nosp", None, None).await.unwrap();
+        mgr.fork_session(
+            &db,
+            fork_test_registry(&db).as_ref(),
+            "c-nosp",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         let _ = join.await;
 
         let current = conversation_service::get_by_id(&db.conn, pre.id)
@@ -21740,7 +22013,17 @@ mod tests {
 
         let (mgr, join) =
             manager_with_fake_fork("c-latest", pre.id, "session-S2", "session-S1").await;
-        let result = mgr.fork_session(&db, "c-latest", None, None).await.unwrap();
+        let result = mgr
+            .fork_session(
+                &db,
+                fork_test_registry(&db).as_ref(),
+                "c-latest",
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
         let _ = join.await;
 
         let current = conversation_service::get_by_id(&db.conn, pre.id)
@@ -21758,6 +22041,270 @@ mod tests {
             sibling.title.as_deref(),
             Some("Renamed By User"),
             "sibling must preserve the LATEST committed title, not a stale snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_session_sibling_inherits_the_manual_title_lock() {
+        // A rename locks the row (`update_title` sets `title_locked`) precisely
+        // so the per-turn auto-title backfill can never overwrite the user's
+        // name. The sibling the fork inserts IS that conversation's pre-fork
+        // history, so it must inherit the lock: without it the user's name
+        // survives only until the sibling's first detail load, which re-parses
+        // S1 and adopts the session-file title (rename → fork → the original
+        // conversation silently reverts to its pre-rename name).
+        use crate::db::test_helpers;
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/fork-lock").await;
+
+        // "XXX" stands in for the session-file (parser-derived) title.
+        let pre = conversation_service::create(
+            &db.conn,
+            folder_id,
+            AgentType::ClaudeCode,
+            Some("XXX".into()),
+            None,
+        )
+        .await
+        .unwrap();
+        conversation_service::update_title(&db.conn, pre.id, "YYY".into())
+            .await
+            .unwrap();
+
+        let (mgr, join) =
+            manager_with_fake_fork("c-fork-lock", pre.id, "session-S2", "session-S1").await;
+        let result = mgr
+            .fork_session(
+                &db,
+                fork_test_registry(&db).as_ref(),
+                "c-fork-lock",
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let _ = join.await;
+
+        let sibling_id = result.sibling_conversation_id;
+        let sibling = conversation_service::get_by_id(&db.conn, sibling_id)
+            .await
+            .unwrap();
+        assert_eq!(sibling.title.as_deref(), Some("YYY"));
+        assert!(
+            sibling.title_locked,
+            "the sibling carries the renamed conversation's history, so it must \
+             inherit the manual title lock"
+        );
+        // The forked row keeps the lock it already had (it is the same row).
+        let current = conversation_service::get_by_id(&db.conn, pre.id)
+            .await
+            .unwrap();
+        assert_eq!(current.title.as_deref(), Some("[Fork] YYY"));
+        assert!(current.title_locked);
+
+        // End-to-end guard: this is exactly what the next detail load does
+        // (`get_folder_conversation_with_live_core` → `refresh_auto_title` with
+        // the title parsed out of the S1 transcript). It must be a no-op on
+        // both rows.
+        assert!(
+            !conversation_service::refresh_auto_title(&db.conn, sibling_id, "XXX".into())
+                .await
+                .unwrap(),
+            "the auto-title backfill must not revert the sibling's user-set name"
+        );
+        assert!(
+            !conversation_service::refresh_auto_title(&db.conn, pre.id, "XXX".into())
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            conversation_service::get_by_id(&db.conn, sibling_id)
+                .await
+                .unwrap()
+                .title
+                .as_deref(),
+            Some("YYY")
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_session_locks_the_prefixed_title_it_writes() {
+        // The `[Fork] ` marker exists nowhere in the transcript, so on an
+        // unlocked row the very next detail load erases it: the auto-title
+        // backfill adopts the parsed session-file title, leaving the forked row
+        // and its sibling wearing the same name with nothing to tell them
+        // apart. The fork therefore locks the title it writes.
+        use crate::db::test_helpers;
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/fork-prefix-lock").await;
+
+        let pre = conversation_service::create(
+            &db.conn,
+            folder_id,
+            AgentType::ClaudeCode,
+            Some("Auto Title".into()),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!pre.title_locked, "an auto-titled row starts unlocked");
+
+        let (mgr, join) =
+            manager_with_fake_fork("c-fork-prefix", pre.id, "session-S2", "session-S1").await;
+        let result = mgr
+            .fork_session(
+                &db,
+                fork_test_registry(&db).as_ref(),
+                "c-fork-prefix",
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let _ = join.await;
+
+        let current = conversation_service::get_by_id(&db.conn, pre.id)
+            .await
+            .unwrap();
+        assert_eq!(current.title.as_deref(), Some("[Fork] Auto Title"));
+        assert!(
+            current.title_locked,
+            "the fork's own title must be protected from the auto-title backfill"
+        );
+        // The backfill the next detail load runs, with the title parsed out of
+        // the forked transcript (a copy of S1, so the pre-fork title).
+        assert!(
+            !conversation_service::refresh_auto_title(&db.conn, pre.id, "Auto Title".into())
+                .await
+                .unwrap(),
+            "the backfill must not strip the `[Fork] ` marker"
+        );
+        assert_eq!(
+            conversation_service::get_by_id(&db.conn, pre.id)
+                .await
+                .unwrap()
+                .title
+                .as_deref(),
+            Some("[Fork] Auto Title")
+        );
+        // The sibling wears the parsed title itself, so it needs no such
+        // protection — see `fork_session_sibling_stays_unlocked_for_an_auto_title`.
+        assert!(
+            !conversation_service::get_by_id(&db.conn, result.sibling_conversation_id)
+                .await
+                .unwrap()
+                .title_locked
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_session_leaves_a_titleless_row_unlocked() {
+        // Nothing to prefix means nothing to protect: a row forked before it
+        // ever got a title must stay unlocked, or the auto-title backfill could
+        // never give it its first name and it would read "Untitled" forever.
+        use crate::db::test_helpers;
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/fork-untitled").await;
+
+        let pre =
+            conversation_service::create(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
+                .await
+                .unwrap();
+
+        let (mgr, join) =
+            manager_with_fake_fork("c-fork-untitled", pre.id, "session-S2", "session-S1").await;
+        let result = mgr
+            .fork_session(
+                &db,
+                fork_test_registry(&db).as_ref(),
+                "c-fork-untitled",
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let _ = join.await;
+
+        let current = conversation_service::get_by_id(&db.conn, pre.id)
+            .await
+            .unwrap();
+        assert_eq!(current.title, None, "no title to prefix");
+        assert!(
+            !current.title_locked,
+            "an unwritten title must stay unlocked"
+        );
+        let sibling = conversation_service::get_by_id(&db.conn, result.sibling_conversation_id)
+            .await
+            .unwrap();
+        assert_eq!(sibling.title, None);
+        assert!(!sibling.title_locked);
+        // Both rows can still be named by the backfill.
+        assert!(
+            conversation_service::refresh_auto_title(&db.conn, pre.id, "First Name".into())
+                .await
+                .unwrap()
+        );
+        assert!(conversation_service::refresh_auto_title(
+            &db.conn,
+            sibling.id,
+            "First Name".into()
+        )
+        .await
+        .unwrap());
+    }
+
+    #[tokio::test]
+    async fn fork_session_sibling_stays_unlocked_for_an_auto_title() {
+        // Inheriting the lock must mean INHERITING it, not always setting it:
+        // an auto-titled conversation's sibling stays eligible for the
+        // auto-title backfill, so a title the agent regenerates later still
+        // lands on the preserved history.
+        use crate::db::test_helpers;
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/fork-unlocked").await;
+
+        let pre = conversation_service::create(
+            &db.conn,
+            folder_id,
+            AgentType::ClaudeCode,
+            Some("Auto Title".into()),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!pre.title_locked, "a fresh row starts unlocked");
+
+        let (mgr, join) =
+            manager_with_fake_fork("c-fork-unlocked", pre.id, "session-S2", "session-S1").await;
+        let result = mgr
+            .fork_session(
+                &db,
+                fork_test_registry(&db).as_ref(),
+                "c-fork-unlocked",
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let _ = join.await;
+
+        let sibling_id = result.sibling_conversation_id;
+        assert!(
+            !conversation_service::get_by_id(&db.conn, sibling_id)
+                .await
+                .unwrap()
+                .title_locked,
+            "an auto-derived title must not become locked by forking"
+        );
+        assert!(
+            conversation_service::refresh_auto_title(&db.conn, sibling_id, "Newer Title".into())
+                .await
+                .unwrap(),
+            "the backfill must still be able to update an unlocked sibling"
         );
     }
 
@@ -21783,7 +22330,14 @@ mod tests {
         )
         .await;
         let err = mgr
-            .fork_session(&db, "c-missing", None, None)
+            .fork_session(
+                &db,
+                fork_test_registry(&db).as_ref(),
+                "c-missing",
+                None,
+                None,
+                None,
+            )
             .await
             .expect_err("fork against a missing row must error");
         let _ = join.await;
@@ -21832,7 +22386,14 @@ mod tests {
         let (mgr, join) =
             manager_with_fake_fork("c-deleted", pre.id, "session-S2", "session-S1").await;
         let err = mgr
-            .fork_session(&db, "c-deleted", None, None)
+            .fork_session(
+                &db,
+                fork_test_registry(&db).as_ref(),
+                "c-deleted",
+                None,
+                None,
+                None,
+            )
             .await
             .expect_err("fork against a soft-deleted row must error");
         let _ = join.await;
@@ -21878,7 +22439,14 @@ mod tests {
             map.insert("c-unbound".into(), fake_connection("c-unbound", None));
         }
         let err = mgr
-            .fork_session(&db, "c-unbound", None, None)
+            .fork_session(
+                &db,
+                fork_test_registry(&db).as_ref(),
+                "c-unbound",
+                None,
+                None,
+                None,
+            )
             .await
             .expect_err("unbound fork must error");
         assert!(
@@ -21967,7 +22535,7 @@ mod tests {
         }
         let join = tokio::spawn(async move {
             while let Some(cmd) = rx.recv().await {
-                if let ConnectionCommand::Fork { reply } = cmd {
+                if let ConnectionCommand::Fork { reply, .. } = cmd {
                     let _ = reply.send(Ok(crate::acp::types::ForkProtocolResult {
                         forked_session_id: "session-S2".to_string(),
                         original_session_id: "session-S1".to_string(),
@@ -21978,7 +22546,14 @@ mod tests {
         });
 
         let result = mgr
-            .fork_session(&db, "c-relink", Some(pre.id), Some(folder_id))
+            .fork_session(
+                &db,
+                fork_test_registry(&db).as_ref(),
+                "c-relink",
+                Some(pre.id),
+                Some(folder_id),
+                None,
+            )
             .await
             .expect("fork must link the unbound row from caller ids and succeed");
         let _ = join.await;
@@ -22273,6 +22848,132 @@ mod tests {
         let s = state.read().await;
         assert_eq!(s.feedback.len(), 1);
         assert_eq!(s.feedback[0].text, "use UserService");
+    }
+
+    #[tokio::test]
+    async fn merge_regression_native_feedback_produces_a_steer_command() {
+        let mgr = ConnectionManager::new();
+        let mut rx = mgr
+            .insert_test_connection_live(
+                "c-native",
+                AgentType::ClaudeCode,
+                None,
+                EventEmitter::Noop,
+            )
+            .await;
+        let state = mgr.get_state("c-native").await.unwrap();
+        {
+            let mut state = state.write().await;
+            state.native_steering_available = true;
+            state.feedback_tool_available = true;
+            state.turn_in_flight = true;
+        }
+        let fake_loop = tokio::spawn(async move {
+            match rx.recv().await {
+                Some(ConnectionCommand::Steer { text, reply }) => {
+                    let _ = reply.send(Ok(crate::acp::connection::SteerOutcome::Injected));
+                    text
+                }
+                _ => panic!("expected a Steer command"),
+            }
+        });
+
+        let item = mgr
+            .submit_feedback("c-native", " steer this ".into())
+            .await
+            .unwrap();
+
+        assert_eq!(item.status, FeedbackStatus::Delivered);
+        assert_eq!(fake_loop.await.unwrap(), "steer this");
+    }
+
+    async fn mark_native_steering_ready(mgr: &ConnectionManager, conn_id: &str) {
+        let state = mgr.get_state(conn_id).await.unwrap();
+        let mut state = state.write().await;
+        state.native_steering_available = true;
+        state.turn_in_flight = true;
+    }
+
+    fn answer_steer(
+        mut rx: tokio::sync::mpsc::Receiver<ConnectionCommand>,
+        outcome: SteerOutcome,
+    ) -> tokio::task::JoinHandle<String> {
+        tokio::spawn(async move {
+            match rx.recv().await {
+                Some(ConnectionCommand::Steer { text, reply }) => {
+                    let _ = reply.send(Ok(outcome));
+                    text
+                }
+                _ => panic!("expected a Steer command"),
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn round1_native_feedback_prompt_required_signals_resend_without_recording() {
+        let mgr = ConnectionManager::new();
+        let rx = mgr
+            .insert_test_connection_live(
+                "c-native-prompt-required",
+                AgentType::ClaudeCode,
+                None,
+                EventEmitter::Noop,
+            )
+            .await;
+        mark_native_steering_ready(&mgr, "c-native-prompt-required").await;
+        let fake_loop = answer_steer(rx, SteerOutcome::PromptRequired);
+
+        let error = mgr
+            .submit_feedback("c-native-prompt-required", "resend this".into())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AcpError::NoActiveTurn));
+        assert_eq!(fake_loop.await.unwrap(), "resend this");
+
+        let state = mgr.get_state("c-native-prompt-required").await.unwrap();
+        let state = state.read().await;
+        assert!(state.feedback.is_empty());
+        assert!(state.native_steering_available);
+    }
+
+    #[tokio::test]
+    async fn round1_native_feedback_started_new_turn_delivers_and_downgrades_to_pull() {
+        let mgr = ConnectionManager::new();
+        let rx = mgr
+            .insert_test_connection_live(
+                "c-native-started-turn",
+                AgentType::ClaudeCode,
+                None,
+                EventEmitter::Noop,
+            )
+            .await;
+        mark_native_steering_ready(&mgr, "c-native-started-turn").await;
+        set_feedback_tool_available(&mgr, "c-native-started-turn").await;
+        let fake_loop = answer_steer(rx, SteerOutcome::StartedNewTurn);
+
+        let delivered = mgr
+            .submit_feedback("c-native-started-turn", "note one".into())
+            .await
+            .unwrap();
+        assert_eq!(delivered.status, FeedbackStatus::Delivered);
+        assert_eq!(fake_loop.await.unwrap(), "note one");
+        assert!(
+            !mgr.get_state("c-native-started-turn")
+                .await
+                .unwrap()
+                .read()
+                .await
+                .native_steering_available
+        );
+
+        let pending = mgr
+            .submit_feedback("c-native-started-turn", "note two".into())
+            .await
+            .unwrap();
+        assert_eq!(pending.status, FeedbackStatus::Pending);
+        let pending = mgr.read_pending_feedback("c-native-started-turn").await;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].text, "note two");
     }
 
     #[tokio::test]

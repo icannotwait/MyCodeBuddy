@@ -1093,6 +1093,10 @@ pub struct AcpForkParams {
     pub conversation_id: Option<i32>,
     #[serde(default)]
     pub folder_id: Option<i32>,
+    /// "Fork from here": the rendered turn to fork at. Absent = fork at the
+    /// tail, the composer's fork-send behaviour.
+    #[serde(default)]
+    pub fork_from_turn_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1311,9 +1315,11 @@ pub async fn acp_fork(
     let result = manager
         .fork_session(
             &state.db,
+            state.internal_sessions.as_ref(),
             &params.connection_id,
             params.conversation_id,
             params.folder_id,
+            params.fork_from_turn_id,
         )
         .await
         .map_err(|error| {
@@ -1324,6 +1330,46 @@ pub async fn acp_fork(
                 .unwrap_or_else(|| AppCommandError::task_execution_failed(error.to_string()))
         })?;
     Ok(Json(result))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcpStopAsyncTaskParams {
+    pub connection_id: String,
+    pub task_id: String,
+    #[serde(default)]
+    pub generation: Option<u64>,
+    #[serde(default)]
+    pub lease_id: Option<String>,
+}
+
+/// `Ok(false)` = the adapter declined to stop the task — a real answer, not a
+/// failure, so it is a 200 with `false` rather than an error status.
+pub async fn acp_stop_async_task(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<AcpStopAsyncTaskParams>,
+) -> Result<Json<bool>, AppCommandError> {
+    let manager = &state.connection_manager;
+    crate::commands::delegate_access::ensure_web_shared_or_delegate_interactive(
+        &state.db,
+        manager,
+        &params.connection_id,
+        None,
+    )
+    .await
+    .map_err(map_acp_error)?;
+    validate_shared_mutation_if_managed(
+        manager,
+        &params.connection_id,
+        params.generation,
+        params.lease_id,
+    )
+    .await?;
+    let stopped = manager
+        .stop_async_task(&params.connection_id, &params.task_id)
+        .await
+        .map_err(map_acp_error)?;
+    Ok(Json(stopped))
 }
 
 #[derive(Deserialize)]
@@ -2570,6 +2616,45 @@ mod tests {
         .unwrap();
         assert_eq!(guard.connection_id, "shared");
         assert_eq!(guard.generation, 7);
+    }
+
+    #[tokio::test]
+    async fn merge_regression_shared_async_task_stop_requires_fencing() {
+        let (state, _dir, _attachment) = broker_owned_mutation_state(
+            "async-stop-owner",
+            1966,
+            crate::auto_title::ConnectionPurpose::User,
+        )
+        .await;
+        let params: AcpStopAsyncTaskParams = serde_json::from_value(serde_json::json!({
+            "connectionId": "async-stop-owner",
+            "taskId": "task-1"
+        }))
+        .unwrap();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            acp_stop_async_task(Extension(state), Json(params)),
+        )
+        .await
+        .expect("an unfenced shared stop must reject before command dispatch")
+        .unwrap_err();
+
+        assert_eq!(result.code, AppErrorCode::SharedSessionProtocolRequired);
+    }
+
+    #[test]
+    fn round1_explicit_fork_error_maps_to_stable_web_code() {
+        let error = map_acp_error(crate::acp::error::AcpError::ForkPointUnavailable {
+            detail: "the selected turn is missing or unsupported by codex".into(),
+        });
+
+        assert_eq!(error.code, AppErrorCode::ForkPointUnavailable);
+        assert_eq!(error.message, "Selected fork point is unavailable");
+        assert_eq!(
+            error.detail.as_deref(),
+            Some("the selected turn is missing or unsupported by codex")
+        );
     }
 
     #[tokio::test]

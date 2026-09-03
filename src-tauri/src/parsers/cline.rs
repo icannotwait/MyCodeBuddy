@@ -346,6 +346,7 @@ impl AgentParser for ClineParser {
                         autonomous_origin: None,
                         generation_ms: None,
                         generation_tokens: None,
+                        agent_message_id: None,
                     });
                 }
                 "user" => {
@@ -371,6 +372,7 @@ impl AgentParser for ClineParser {
                             autonomous_origin: None,
                             generation_ms: None,
                             generation_tokens: None,
+                            agent_message_id: None,
                         });
                     }
 
@@ -391,6 +393,7 @@ impl AgentParser for ClineParser {
                             autonomous_origin: None,
                             generation_ms: None,
                             generation_tokens: None,
+                            agent_message_id: None,
                         });
                     }
                 }

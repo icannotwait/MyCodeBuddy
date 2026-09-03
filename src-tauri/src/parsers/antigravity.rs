@@ -746,6 +746,7 @@ impl PendingAssistant {
             autonomous_origin: None,
             generation_ms: None,
             generation_tokens: None,
+            agent_message_id: None,
         }
     }
 }
@@ -856,6 +857,7 @@ fn project_steps(steps: &[Step]) -> SessionParse {
                 autonomous_origin: None,
                 generation_ms: None,
                 generation_tokens: None,
+                agent_message_id: None,
             });
             parsed.message_count = parsed.message_count.saturating_add(1);
             continue;

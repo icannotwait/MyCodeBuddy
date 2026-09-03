@@ -1891,6 +1891,7 @@
       "forkSession": "Fork Session",
       "forkSessionSuccess": "Session forked successfully",
       "forkSessionFailed": "Failed to fork session: {error}",
+      "forkSessionBusy": "Failed to fork session: a turn is running",
       "exportConversation": "Export Conversation",
       "exportImage": "Image",
       "exportMarkdown": "Markdown",
@@ -2868,6 +2869,7 @@
           "downloadFailed": "{agent} download failed: {message}",
           "sessionLoadResourceNotFound": "{agent} session failed to load. Reload to retry, or start a new conversation.",
           "sessionLoadUnavailable": "{agent} couldn't restore this session — it may have ended or the agent stopped. Reload to retry, or start a new conversation.",
+          "sessionLoadBusy": "This history is held open by the session forked from it. Close that session, then reload to open this one.",
           "sessionArchived": "The previous session was archived on the {agent} side. Run {command} in a terminal to restore it and reload, or start a new conversation.",
           "turnFailedRefusal": "{agent} refused to continue this turn. This often indicates a backend or gateway error — check the agent's logs.",
           "turnFailedMaxTokens": "{agent} reached the maximum token limit for this turn.",
@@ -3034,7 +3036,7 @@
           "pasteDropFiles": "Paste a screenshot or drop a file directly onto the input to attach it.",
           "queueMessage": "While the agent is replying, keep typing — your next message gets queued and auto-sent when it finishes.",
           "draftAutoSave": "Unsent drafts are auto-saved per conversation and restored when you come back.",
-          "forkSend": "The send button's dropdown has Fork and Send — branch from the current turn into a new tab.",
+          "forkFromTurn": "Any completed reply has Fork from here — branch the conversation at that message into a new tab.",
           "exportConversation": "Right-click inside the conversation to export it as Markdown, HTML, or an image.",
           "chatChannels": "Connect Telegram / Lark / WeChat under Settings → Chat Channels to continue from your phone.",
           "shortcutsAuxPanel": "<shortcut>{toggleAuxPanel}</shortcut> toggles the right panel to view this session's touched files and Git changes.",
@@ -3261,6 +3263,7 @@
         "emptyConversation": "No messages in this conversation.",
         "systemMessage": "System message",
         "copyMessage": "Copy",
+        "forkFromHere": "Fork from here",
         "copied": "Copied",
         "selectionActions": "Selection actions",
         "selectionCopy": "Copy Text",
@@ -3580,7 +3583,6 @@
         },
         "planMode": {
           "entered": "Entered plan mode",
-          "planLabel": "Plan",
           "reviewApproved": "Plan approved — implementing",
           "reviewKept": "Kept in plan mode",
           "reviewPending": "Awaiting plan decision",
@@ -3860,6 +3862,13 @@
         "cardResultPending": "Result not returned yet",
         "running": "{count, plural, one {# background task running} other {# background tasks running}}",
         "settling": "Syncing background results…"
+      },
+      "asyncTasks": {
+        "openOutput": "Output",
+        "stop": "Stop",
+        "tokens": "{count} tokens",
+        "stopDeclined": "That task could not be stopped — it may have already finished.",
+        "stopFailed": "Failed to stop the task: {error}"
       },
       "proposedPlan": {
         "title": "Proposed plan",

@@ -4425,6 +4425,7 @@ mod tests {
             model: None,
             reasoning_effort: None,
             completed_at: None,
+            agent_message_id: None,
             outcome: None,
             autonomous_origin: Some(AutonomousTurnOrigin::BackgroundTask),
             generation_ms: None,

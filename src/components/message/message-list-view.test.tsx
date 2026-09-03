@@ -13,6 +13,7 @@ import { forwardRef, StrictMode, useImperativeHandle, type Ref } from "react"
 import type { LiveMessage } from "@/contexts/acp-connections-context"
 import type {
   AcceptedConnectionFrame,
+  AgentType,
   DbConversationSummary,
   EventEnvelope,
   MessageTurn,
@@ -51,6 +52,7 @@ const {
   virtualizerKeysSpy,
   listChildConversationsMock,
   recordFrontendTurnTrace,
+  turnStatsPropsSpy,
 } = vi.hoisted(() => ({
   virtualizerScrollToIndex: vi.fn(),
   virtualizerKeysSpy: vi.fn(),
@@ -58,6 +60,7 @@ const {
     async (_parentId: number): Promise<DbConversationSummary[]> => []
   ),
   recordFrontendTurnTrace: vi.fn(),
+  turnStatsPropsSpy: vi.fn(),
 }))
 
 vi.mock("@/lib/acp/frontend-turn-trace", () => ({
@@ -340,7 +343,14 @@ vi.mock("./live-turn-stats", () => ({
 }))
 
 vi.mock("./turn-stats", () => ({
-  TurnStats: () => null,
+  TurnStats: (props: { onForkFromHere?: () => void }) => {
+    turnStatsPropsSpy(props)
+    return props.onForkFromHere ? (
+      <button type="button" onClick={props.onForkFromHere}>
+        Fork from here
+      </button>
+    ) : null
+  },
 }))
 
 vi.mock("./reply-artifacts", () => ({
@@ -434,6 +444,7 @@ beforeEach(() => {
   listChildConversationsMock.mockReset()
   listChildConversationsMock.mockResolvedValue([])
   recordFrontendTurnTrace.mockReset()
+  turnStatsPropsSpy.mockReset()
 })
 
 afterEach(() => {
@@ -865,7 +876,8 @@ function messageListUi(options?: {
   isActive?: boolean
   workspaceRootPath?: string | null
   conversationId?: number
-  agentType?: "codex" | "grok"
+  agentType?: AgentType
+  onForkFromTurn?: (turnId: string) => void
 }) {
   return (
     <NextIntlClientProvider locale="en" messages={enMessages}>
@@ -879,6 +891,7 @@ function messageListUi(options?: {
         waitingForSubagentsArmedAtMs={
           options?.waitingForSubagentsArmedAtMs ?? null
         }
+        onForkFromTurn={options?.onForkFromTurn}
       />
     </NextIntlClientProvider>
   )
@@ -890,10 +903,71 @@ function renderMessageList(options?: {
   isActive?: boolean
   workspaceRootPath?: string | null
   conversationId?: number
-  agentType?: "codex" | "grok"
+  agentType?: AgentType
+  onForkFromTurn?: (turnId: string) => void
 }) {
   return render(messageListUi(options))
 }
+
+describe("MessageListView fork point eligibility", () => {
+  beforeEach(() => {
+    resetConversationRuntimeStore()
+    __resetLiveTranscriptStoreForTests()
+    __resetStreamingPerformanceConfigForTests()
+  })
+
+  afterEach(() => {
+    cleanup()
+    resetConversationRuntimeStore()
+    __resetLiveTranscriptStoreForTests()
+    __resetStreamingPerformanceConfigForTests()
+  })
+
+  it.each([
+    ["codex", assistantTurn("live-501-a", "reply")],
+    [
+      "codex",
+      { ...assistantTurn("turn-1", "reply"), source_turn_id: "live-501-a" },
+    ],
+    ["claude_code", assistantTurn("turn-1", "reply")],
+    [
+      "grok",
+      { ...assistantTurn("turn-1", "reply"), agent_message_id: "msg-1" },
+    ],
+  ] satisfies Array<[AgentType, MessageTurn]>)(
+    "hides an unresolvable %s fork action",
+    (agentType, turn) => {
+      seedHistory([userTurn("u1", "hello"), turn], {
+        persistedAgentType: agentType,
+      })
+
+      renderMessageList({
+        agentType,
+        onForkFromTurn: vi.fn(),
+      })
+
+      expect(
+        screen.queryByRole("button", { name: "Fork from here" })
+      ).not.toBeInTheDocument()
+    }
+  )
+
+  it("uses the parser turn id for a resolvable fork action", () => {
+    const onForkFromTurn = vi.fn()
+    seedHistory([
+      userTurn("u1", "hello"),
+      {
+        ...assistantTurn("live-501-a", "reply"),
+        source_turn_id: "turn-3",
+      },
+    ])
+
+    renderMessageList({ agentType: "codex", onForkFromTurn })
+    fireEvent.click(screen.getByRole("button", { name: "Fork from here" }))
+
+    expect(onForkFromTurn).toHaveBeenCalledWith("turn-3")
+  })
+})
 
 describe("MessageListView Grok durable identity and phases", () => {
   beforeEach(() => {

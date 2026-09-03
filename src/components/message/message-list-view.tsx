@@ -197,12 +197,39 @@ interface MessageListViewProps {
    * action isn't offered. MUST be referentially stable.
    */
   onSaveNoteSelection?: (text: string) => void
+  /**
+   * Fork the session at a rendered assistant turn ("fork from here"). Undefined
+   * hides the affordance everywhere in this view — pass it only where a fork
+   * can actually run (live connection, agent supports `session/fork`, no turn
+   * in flight). Embeds that are not the owning conversation surface leave it
+   * unset.
+   */
+  onForkFromTurn?: (turnId: string) => void
 }
 
 export function canReloadSessionLoadError(
   code: string | null | undefined
 ): boolean {
   return code !== "legacy_cli_session"
+}
+
+function resolvableForkTurnId(
+  turn: MessageTurn | undefined,
+  agentType: AgentType
+): string | undefined {
+  if (!turn || turn.role !== "assistant") return undefined
+  const turnId = (
+    turn.source_turn_id ?? (!turn.id.startsWith("live-") ? turn.id : undefined)
+  )?.trim()
+  if (!turnId || turnId.startsWith("live-")) return undefined
+  const hasText = turn.blocks.some(
+    (block) => block.type === "text" && block.text.trim().length > 0
+  )
+  const hasAgentMessageId = Boolean(turn.agent_message_id?.trim())
+  if (agentType === "claude_code" && hasAgentMessageId) return turnId
+  if (agentType === "codex" && hasText) return turnId
+  if (agentType === "deepseek" && (hasAgentMessageId || hasText)) return turnId
+  return undefined
 }
 
 type AutolinkableTextPart = Extract<AdaptedContentPart, { type: "text" }>
@@ -1003,6 +1030,7 @@ const HistoricalMessageGroup = memo(function HistoricalMessageGroup({
   roundOpen = true,
   onRoundOpenChange,
   foldEpoch = 0,
+  onForkFromTurn,
 }: {
   group: ResolvedMessageGroup
   parentConversationId?: number | null
@@ -1018,6 +1046,7 @@ const HistoricalMessageGroup = memo(function HistoricalMessageGroup({
   roundOpen?: boolean
   onRoundOpenChange?: (open: boolean) => void
   foldEpoch?: number
+  onForkFromTurn?: (turnId: string) => void
 }) {
   streamingPerfRecorder.countRender(renderKind)
   const t = useTranslations("Folder.chat.messageList")
@@ -1033,6 +1062,7 @@ const HistoricalMessageGroup = memo(function HistoricalMessageGroup({
     group.role === "assistant" && group.outcome?.status === "interrupted"
   const grokSessionImagePhase =
     agentType === "grok" ? (isResponseComplete ? "complete" : "live") : null
+  const forkTurnId = resolvableForkTurnId(sourceTurns?.at(-1), agentType)
 
   return (
     <div className={dimmed ? "opacity-70" : undefined}>
@@ -1126,6 +1156,18 @@ const HistoricalMessageGroup = memo(function HistoricalMessageGroup({
           isResponseComplete={isResponseComplete}
           copyText={extractTextFromParts(group.parts)}
           completedAt={group.completed_at}
+          onForkFromHere={
+            // The group's LAST turn: forking is "up to and including this
+            // reply", and a merged group ends where the reply does. Gated on a
+            // settled turn — forking mid-stream would name a message the agent
+            // is still writing.
+            //
+            // Only parser-named turns with an agent-supported lookup key can
+            // be offered. Explicit unresolved ids are rejected by the backend.
+            onForkFromTurn && isResponseComplete && forkTurnId
+              ? () => onForkFromTurn(forkTurnId)
+              : undefined
+          }
         />
       )}
     </div>
@@ -1526,6 +1568,7 @@ export function MessageListView({
   onQuoteSelection,
   onAskSelection,
   onSaveNoteSelection,
+  onForkFromTurn,
 }: MessageListViewProps) {
   const isWaitingForSubagents =
     waitingForSubagentsArmedAtMs != null &&
@@ -2029,6 +2072,7 @@ export function MessageListView({
                 roundOpen={fold.roundOpen}
                 onRoundOpenChange={handleRoundOpenChange}
                 foldEpoch={fold.epoch}
+                onForkFromTurn={onForkFromTurn}
               />
             </div>
           )
@@ -2055,6 +2099,7 @@ export function MessageListView({
       fold.roundOpen,
       fold.epoch,
       handleRoundOpenChange,
+      onForkFromTurn,
     ]
   )
 

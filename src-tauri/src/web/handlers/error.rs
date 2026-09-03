@@ -9,6 +9,7 @@ use crate::app_error::{AppCommandError, AppErrorCode};
 fn status_for_app_error_code(code: AppErrorCode) -> StatusCode {
     match code {
         AppErrorCode::InvalidInput
+        | AppErrorCode::ForkPointUnavailable
         | AppErrorCode::CompletionProtocolConfigurationRemoved
         | AppErrorCode::TerminalShellUnavailable
         | AppErrorCode::TerminalShellUnsupported

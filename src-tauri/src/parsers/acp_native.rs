@@ -392,6 +392,7 @@ pub fn project_turns(entries: &[TranscriptEntry]) -> Vec<MessageTurn> {
                         autonomous_origin: None,
                         generation_ms: None,
                         generation_tokens: None,
+                        agent_message_id: None,
                     });
                     seq += 1;
                 }
@@ -457,6 +458,7 @@ fn flush(pending: &mut Option<PendingTurn>, turns: &mut Vec<MessageTurn>, seq: &
         autonomous_origin: None,
         generation_ms: None,
         generation_tokens: None,
+        agent_message_id: None,
     });
     *seq += 1;
 }
@@ -562,6 +564,7 @@ fn apply_update(
                         autonomous_origin: None,
                         generation_ms: None,
                         generation_tokens: None,
+                        agent_message_id: None,
                     });
                     *seq += 1;
                 }

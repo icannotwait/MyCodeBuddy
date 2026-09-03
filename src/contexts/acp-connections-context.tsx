@@ -140,6 +140,8 @@ import type {
   AcpEvent,
   AcpEventDeliverySource,
   ActiveDelegationState,
+  AsyncTaskDelta,
+  AsyncTaskRecord,
   AvailableCommandInfo,
   ConfigStaleKind,
   ConnectionStatus,
@@ -188,6 +190,12 @@ import type {
   SharedQueuedPrompt,
   SharedSessionPhaseView,
 } from "@/lib/snapshot-denormalize"
+import {
+  adoptUnknownAsyncTasks,
+  liveAsyncTasks,
+  mergeAsyncTasks,
+  upsertAsyncTask,
+} from "@/lib/async-tasks"
 import { getAgentLabel } from "@/lib/custom-agents"
 import {
   CONNECTION_IDLE_TIMEOUT_MS,
@@ -361,6 +369,11 @@ export interface ConnectionState {
    *  merge/settle contract). Retained resolved — entries double as per-id
    *  revision watermarks; the banner splits active from resolved itself. */
   sessionFailures: SessionFailureRecord[]
+  /** AIR async tasks — Claude's background shells / workflows / monitors (see
+   *  `lib/async-tasks.ts` for the merge contract). Retained after they settle,
+   *  because the adapter keeps revising a finished task; the strip filters to
+   *  the live ones itself. */
+  asyncTasks: AsyncTaskRecord[]
   error: string | null
   /**
    * Recoverable attach-protocol error. The agent process is still alive.
@@ -860,6 +873,13 @@ type Action =
       type: "SESSION_FAILURE"
       contextKey: string
       record: SessionFailureRecord
+    }
+  | {
+      // One AIR async-task delta (`async_task` event). PARTIAL — merged into
+      // the task table by `lib/async-tasks.ts`; only a `spawned` delta creates.
+      type: "ASYNC_TASK"
+      contextKey: string
+      delta: AsyncTaskDelta
     }
   | {
       // Lifecycle settle for the AIR failure table (mirrors
@@ -2039,6 +2059,7 @@ function reduceSingleAction(
         pendingPlanApproval: null,
         claudeApiRetry: null,
         sessionFailures: [],
+        asyncTasks: [],
         error: null,
         attachError: null,
         loadError: null,
@@ -2334,6 +2355,7 @@ function reduceSingleAction(
         pendingPlanApproval: null,
         claudeApiRetry: null,
         sessionFailures: [],
+        asyncTasks: [],
         error: null,
         attachError: null,
         loadError: null,
@@ -2487,8 +2509,36 @@ function reduceSingleAction(
         current.sessionFailures,
         action.patch.sessionFailures
       )
+      // Async tasks contribute on both branches — a client that attached
+      // mid-episode has no other way to learn about work already running — but
+      // NOT by the same rule, because the rows carry no revision. On the fresh
+      // branch the snapshot is the backend's merge of every delta up to a seq
+      // this client hasn't reached, so replacing by id is right. On the stale
+      // branch it predates deltas already applied here, and replacing would
+      // walk a task the client watched finish back to `running` with no live
+      // event left to correct it. There it may only ADD ids we don't have.
+      //
+      // Both branches are additionally gated on the snapshot describing the
+      // SESSION we are on. The rows are session-scoped and the fork transition
+      // clears them, but a snapshot fetch that started before the fork can land
+      // after it — a viewer hydrating while the owner's route consumed the fork
+      // event is the ordinary way there — and would re-add rows whose terminal
+      // frames now publish on a session id this connection has left. Nothing
+      // would ever settle them: no live event, no valid stop target, and a live
+      // row defers the idle sweep. The same identity-guard shape as the
+      // `connectionId` check above, one level down.
+      const sameSession =
+        action.patch.sessionId === null ||
+        current.sessionId === null ||
+        action.patch.sessionId === current.sessionId
+      const isStaleSnapshot = action.patch.eventSeq <= current.lastAppliedSeq
+      const mergedAsyncTasks = !sameSession
+        ? current.asyncTasks
+        : isStaleSnapshot
+          ? adoptUnknownAsyncTasks(current.asyncTasks, action.patch.asyncTasks)
+          : mergeAsyncTasks(current.asyncTasks, action.patch.asyncTasks)
 
-      if (action.patch.eventSeq <= current.lastAppliedSeq) {
+      if (isStaleSnapshot) {
         if (
           mergedSelectorsReady === current.selectorsReady &&
           mergedSupportsFork === current.supportsFork &&
@@ -2498,7 +2548,8 @@ function reduceSingleAction(
           mergedPromptCapabilities === current.promptCapabilities &&
           mergedConversationId === current.conversationId &&
           mergedSessionFailures === current.sessionFailures &&
-          mergedSharedSession === current.sharedSession
+          mergedSharedSession === current.sharedSession &&
+          mergedAsyncTasks === current.asyncTasks
         ) {
           return state
         }
@@ -2514,6 +2565,7 @@ function reduceSingleAction(
           conversationId: mergedConversationId,
           sessionFailures: mergedSessionFailures,
           sharedSession: mergedSharedSession,
+          asyncTasks: mergedAsyncTasks,
         })
         return next
       }
@@ -2601,6 +2653,7 @@ function reduceSingleAction(
         // Fill-null conversation binding (draft tab → linked row).
         conversationId: mergedConversationId,
         sessionFailures: mergedSessionFailures,
+        asyncTasks: mergedAsyncTasks,
         // Recover the latest runtime error only from a fresh snapshot. The
         // stale path above deliberately preserves the current cleared value.
         error: action.patch.lastError,
@@ -3436,9 +3489,19 @@ function reduceSingleAction(
       const conn = state.get(action.contextKey)
       if (!conn) return state
       const next = writableConnections(state, mutateUnpublished)
+      // Mirrors the backend's `SessionStarted` arm: a CHANGED session id (a
+      // fork) strands the AIR task rows, because their terminal frames are
+      // published on the id this connection has left and never route here
+      // again. The backend drops its table, and an empty snapshot table can't
+      // clear ours for us (`mergeAsyncTasks` treats empty as "nothing to say"),
+      // so without this the strip shows tasks that can never finish AND the
+      // idle sweep below defers on them forever. Guarded on the id actually
+      // changing, so a replayed announcement stays idempotent.
+      const forked = conn.sessionId !== action.sessionId
       next.set(action.contextKey, {
         ...conn,
         sessionId: action.sessionId,
+        asyncTasks: forked ? [] : conn.asyncTasks,
       })
       return next
     }
@@ -3707,6 +3770,18 @@ function reduceSingleAction(
       if (merged === conn.sessionFailures) return state
       const next = writableConnections(state, mutateUnpublished)
       next.set(action.contextKey, { ...conn, sessionFailures: merged })
+      return next
+    }
+
+    case "ASYNC_TASK": {
+      const conn = state.get(action.contextKey)
+      if (!conn) return state
+      const merged = upsertAsyncTask(conn.asyncTasks, action.delta)
+      // A delta for a task we never saw announced changes nothing — same
+      // reference, no re-render.
+      if (merged === conn.asyncTasks) return state
+      const next = writableConnections(state, mutateUnpublished)
+      next.set(action.contextKey, { ...conn, asyncTasks: merged })
       return next
     }
 
@@ -4769,6 +4844,13 @@ function prepareMappedEnvelope(
         record: e.record,
       })
       break
+    case "async_task":
+      actions.push({
+        type: "ASYNC_TASK",
+        contextKey,
+        delta: e.delta,
+      })
+      break
     case "turn_retrying":
       actions.push({
         type: "CLAUDE_API_RETRY",
@@ -4929,6 +5011,10 @@ function prepareMappedEnvelope(
             return env.t("backendErrors.sessionLoadUnavailable", {
               agent: agentLabel,
             })
+          case "session_busy":
+            return env.t("backendErrors.sessionLoadBusy", {
+              agent: agentLabel,
+            })
           case "legacy_cli_session":
             return env.t("backendErrors.sessionLoadLegacyCliSession", {
               agent: agentLabel,
@@ -5084,6 +5170,7 @@ function onlyCursorChanged(
       after.backgroundSettleSyncingSince &&
     before.sharedSession === after.sharedSession &&
     before.sessionFailures === after.sessionFailures &&
+    before.asyncTasks === after.asyncTasks &&
     before.outOfTurnToolCalls === after.outOfTurnToolCalls &&
     before.isViewer === after.isViewer &&
     before.isDelegationChild === after.isDelegationChild &&
@@ -8891,6 +8978,13 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         ) {
           continue
         }
+        // The AIR channel's half of the same rule. The watcher above only sees
+        // background work that leaves a transcript trace; a workflow or monitor
+        // task announces itself here and nowhere else, so without this check a
+        // quiet interval would disconnect the connection and kill a task the
+        // strip is actively showing as running. Mirrors the backend's
+        // `has_active_background_work`, which ORs the two the same way.
+        if (liveAsyncTasks(conn.asyncTasks).length > 0) continue
         const lastActive = lastActivityRef.current.get(contextKey) ?? 0
         if (now - lastActive > CONNECTION_IDLE_TIMEOUT_MS) {
           toDisconnect.push({

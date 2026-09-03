@@ -59,6 +59,7 @@ import { ScrollArea } from "@/components/ui/scroll-area"
 import type { ComposerInjectContent } from "@/components/chat/message-input"
 import {
   acpFork,
+  acpStopAsyncTask,
   createChatConversation,
   createChatDir,
   createConversation,
@@ -78,6 +79,7 @@ import {
   type TerminalDisconnectLatch,
 } from "@/lib/terminal-reconnect"
 import { TurnBusyError } from "@/lib/turn-busy"
+import { toErrorMessage } from "@/lib/app-error"
 import type { SessionFailureAction } from "@/lib/session-failures"
 import { continuationFailureI18nKey } from "@/lib/continuation-waiting"
 import { consumeDelegatedChildTabIntent } from "@/lib/delegated-child-tab-intent"
@@ -370,6 +372,7 @@ export const ConversationSessionSurface = memo(
     const tDiag = useTranslations("DiagnosticsSettings")
     const sharedT = useTranslations("Folder.chat.shared")
     const tMessageList = useTranslations("Folder.chat.messageList")
+    const tAsyncTasks = useTranslations("Folder.chat.asyncTasks")
     const refreshConversations = useAppWorkspaceStore(
       (s) => s.refreshConversations
     )
@@ -406,6 +409,7 @@ export const ConversationSessionSurface = memo(
       appendOptimisticTurn,
       removeOptimisticTurn,
       appendViewerUserTurn,
+      refetchDetail,
       reloadDetail,
       syncTurnMetadata,
       syncDelegateTerminalDetail,
@@ -657,10 +661,10 @@ export const ConversationSessionSurface = memo(
     )
 
     // Two-source resolution for the session id passed to acp_connect:
-    //   1. detail.summary.external_id — DB value, available for tabs opened
-    //      from the sidebar (effectiveConversationId equals the real cid).
-    //   2. runtimeExternalId — populated by the connSessionId effect
-    //      below when SessionStarted fires. This is the ONLY source for tabs
+    //   1. runtimeExternalId — updated immediately when a fork returns, while
+    //      detail can still identify the pre-fork session.
+    //   2. detail.summary.external_id — cold-open fallback before runtime state
+    //      has been hydrated. runtimeExternalId is also the ONLY source for tabs
     //      that started as a new conversation: their effectiveConversationId
     //      is locked to a virtual negative id (line 186 useState initializer
     //      runs once), useConversationDetail skips fetching for virtual ids,
@@ -669,7 +673,7 @@ export const ConversationSessionSurface = memo(
     //      backend takes session/new → DB.external_id is overwritten on the
     //      next prompt → original sid orphaned, agent loses prior context.
     const externalId =
-      detail?.summary.external_id ?? runtimeExternalId ?? undefined
+      runtimeExternalId ?? detail?.summary.external_id ?? undefined
     // For persisted conversations opened from the sidebar, wait until the
     // session's external_id has been resolved before auto-connecting.
     // Otherwise the auto-connect effect fires with sessionId=undefined and
@@ -1957,12 +1961,7 @@ export const ConversationSessionSurface = memo(
           // on the current (un-forked) session.
           toast.error(
             t("forkSessionFailed", {
-              error:
-                err instanceof Error
-                  ? err.message
-                  : typeof err === "object" && err !== null
-                    ? JSON.stringify(err)
-                    : String(err),
+              error: toErrorMessage(err),
             })
           )
           mqEnqueue(draft, selectedModeIdArg ?? null)
@@ -1981,6 +1980,100 @@ export const ConversationSessionSurface = memo(
         refreshConversations,
         setExternalId,
         t,
+      ]
+    )
+
+    const forkFromTurnInFlightRef = useRef(false)
+    const handleForkFromTurn = useCallback(
+      async (turnId: string) => {
+        if (interactionLocked || forkFromTurnInFlightRef.current) return
+        const connectionId = conn.connectionId
+        if (!connectionId || connStatus !== "connected") return
+        forkFromTurnInFlightRef.current = true
+
+        try {
+          const preForkSession = useConversationRuntimeStore
+            .getState()
+            .byConversationId.get(effectiveConversationId)
+          const staleLiveTurnIds = (preForkSession?.localTurns ?? []).map(
+            (turn) => turn.id
+          )
+          const { forkedSessionId } = await acpFork(
+            connectionId,
+            dbConvIdRef.current,
+            folderId,
+            turnId
+          )
+          sessionIdRef.current = forkedSessionId
+          setExternalId(effectiveConversationId, forkedSessionId)
+          refreshConversations()
+          refetchDetail(effectiveConversationId, {
+            preserveLive: true,
+            dropLiveTurnIds: staleLiveTurnIds,
+            supersedeAuthoritative: true,
+          })
+        } catch (err) {
+          if (isDelegateViewerOnlyRejection(err)) {
+            handleDelegateViewerOnlyRejection()
+            return
+          }
+          toast.error(
+            err instanceof TurnBusyError
+              ? t("forkSessionBusy")
+              : t("forkSessionFailed", {
+                  error: toErrorMessage(err),
+                })
+          )
+        } finally {
+          forkFromTurnInFlightRef.current = false
+        }
+      },
+      [
+        conn.connectionId,
+        connStatus,
+        effectiveConversationId,
+        folderId,
+        handleDelegateViewerOnlyRejection,
+        interactionLocked,
+        refetchDetail,
+        refreshConversations,
+        setExternalId,
+        t,
+      ]
+    )
+
+    const handleStopAsyncTask = useCallback(
+      async (taskId: string) => {
+        const connectionId = conn.connectionId
+        if (!connectionId || conn.isViewer || interactionLocked) return false
+        try {
+          const stopped = await acpStopAsyncTask(
+            connectionId,
+            taskId,
+            conn.sharedSession
+              ? {
+                  generation: conn.sharedSession.generation,
+                  leaseId: conn.sharedSession.leaseId,
+                }
+              : undefined
+          )
+          if (!stopped) toast.warning(tAsyncTasks("stopDeclined"))
+          return stopped
+        } catch (err) {
+          toast.error(
+            tAsyncTasks("stopFailed", {
+              error: toErrorMessage(err),
+            })
+          )
+          return false
+        }
+      },
+      [
+        conn.connectionId,
+        conn.isViewer,
+        conn.sharedSession,
+        interactionLocked,
+        tAsyncTasks,
       ]
     )
 
@@ -2604,6 +2697,16 @@ export const ConversationSessionSurface = memo(
           onResumeRoot={handleResumeRoot}
           onOpenRootConversation={handleOpenRootConversation}
           onAskSelection={canAskSelection ? handleAskSelection : undefined}
+          onForkFromTurn={
+            !interactionLocked &&
+            !conn.sharedSession &&
+            connStatus === "connected" &&
+            hasPersistedConversation &&
+            conn.supportsFork &&
+            !conn.waitingForSubagents
+              ? handleForkFromTurn
+              : undefined
+          }
         />
       </GoalControlProvider>
     )
@@ -2679,6 +2782,12 @@ export const ConversationSessionSurface = memo(
             : undefined
         }
         onSessionFailureDismiss={handleSessionFailureDismiss}
+        asyncTasks={conn.asyncTasks}
+        onStopAsyncTask={
+          conn.connectionId !== null && !conn.isViewer && !interactionLocked
+            ? handleStopAsyncTask
+            : undefined
+        }
         pendingPermission={conn.pendingPermission}
         pendingQuestion={conn.pendingQuestion}
         pendingAskQuestion={conn.pendingAskQuestion}

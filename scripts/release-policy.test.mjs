@@ -133,7 +133,7 @@ test("finds upstream URLs in runtime-owned files", () => {
 })
 
 test("repository identity matches the MyCodeBuddy release policy", () => {
-  const version = "0.30.0-mycodebuddy.1"
+  const version = "0.30.1-mycodebuddy.1"
   const packageJson = JSON.parse(readRepositoryFile("package.json"))
   const cargoToml = readRepositoryFile("src-tauri/Cargo.toml")
   const tauriConfig = JSON.parse(
@@ -156,7 +156,7 @@ test("repository identity matches the MyCodeBuddy release policy", () => {
   assert.equal(packageJson.version, version)
   assert.match(readRepositoryFile("install.ps1"), new RegExp(`v${version}`))
   const syncGuide = readRepositoryFile("docs/UPSTREAM_SYNC.md")
-  assert.match(syncGuide, /sync\/codeg-0\.30\.0/)
+  assert.match(syncGuide, /sync\/codeg-0\.30\.1/)
   assert.match(syncGuide, new RegExp(version.replaceAll(".", String.raw`\.`)))
   assertComplianceResources(tauriConfig)
   for (const path of [
@@ -167,6 +167,24 @@ test("repository identity matches the MyCodeBuddy release policy", () => {
     assert.ok(readRepositoryFile(path).trim().length > 0, `${path} is empty`)
   }
   assert.deepEqual(findForbiddenRuntimeUrls(runtimeFiles), [])
+})
+
+test("desktop-visible branding matches the DrawCode Tauri identity", () => {
+  const tauriConfig = JSON.parse(
+    readRepositoryFile("src-tauri/tauri.conf.json")
+  )
+  const libRs = readRepositoryFile("src-tauri/src/lib.rs")
+
+  assert.equal(tauriConfig.productName, "DrawCode")
+  assert.equal(tauriConfig.mainBinaryName, tauriConfig.productName)
+  assert.ok(
+    libRs.includes(`"${tauriConfig.productName} Web service".to_string()`),
+    "notification title must use the Tauri product name"
+  )
+  assert.ok(
+    libRs.includes(`.title("${tauriConfig.productName}")`),
+    "main window title must use the Tauri product name"
+  )
 })
 
 test("release workflow publishes Windows desktop plus signed server archives", () => {

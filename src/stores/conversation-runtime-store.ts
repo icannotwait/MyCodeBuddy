@@ -473,6 +473,12 @@ type Action =
       authoritative?: boolean
       /** Proven absolute transcript boundary for aligning this local overlay. */
       localAlignmentBoundaryIndex?: number
+      /**
+       * Live turns this response supersedes, by id. Set only by a fork: it
+       * re-points the row at a session whose history stops at the chosen turn,
+       * so only the completed turns present when the fork started are stale.
+       */
+      dropLiveTurnIds?: string[]
     }
   | {
       type: "LOAD_OLDER_HISTORY_START"
@@ -634,18 +640,7 @@ type Action =
   | {
       type: "PATCH_TURN_METADATA"
       conversationId: number
-      turnPatches: Array<{
-        index: number
-        usage?: TurnUsage | null
-        duration_ms?: number | null
-        model?: string | null
-        reasoning_effort?: string | null
-        completed_at?: string | null
-        tool_meta?: Array<{
-          tool_use_id: string
-          meta: Record<string, unknown> | null
-        }>
-      }>
+      turnPatches: TurnMetadataPatch[]
       sessionStats?: SessionStats | null
     }
   | {
@@ -2372,6 +2367,14 @@ export interface TurnMetadataPatch {
     tool_use_id: string
     meta: Record<string, unknown> | null
   }>
+  /** The id the PARSER gave this turn (`turn-3`). A turn produced in this
+   *  session is named `live-<conversationId>-<liveMessageId>` and the backend
+   *  has never heard of that id, so anything asking the backend to act on "this
+   *  turn" — "fork from here" is the one today — has to send the parser's name
+   *  instead. See `MessageTurn.source_turn_id`. */
+  source_turn_id?: string | null
+  /** Provider message identity copied from the same safely matched parse turn. */
+  agent_message_id?: string | null
 }
 
 /**
@@ -2411,6 +2414,14 @@ export function computeTurnMetadataPatches(params: {
   localAssistantIndices: number[]
   parsedAssistantTurns: MessageTurn[]
   persistedAssistantCount: number
+  /**
+   * Whether the LAST turn of the parse (any role) is an assistant turn — i.e.
+   * the reply that just completed has reached disk. Agents append the user
+   * prompt before the reply, so a trailing USER turn is the transcript telling
+   * us it is still behind. Only `source_turn_id` consults this; the stats keep
+   * their existing best-effort alignment.
+   */
+  parseEndsWithAssistant: boolean
 }): TurnMetadataPatch[] {
   const { localAssistantIndices, parsedAssistantTurns } = params
   // Drop the persisted history at the front of the parse; only this session's
@@ -2443,6 +2454,45 @@ export function computeTurnMetadataPatches(params: {
     // rolled-in parsed turns precede it in time, so we don't aggregate
     // completion timestamps.
     let completedAtToApply: string | null | undefined
+    // The parser's name for this turn. Deliberately the MATCHED sub-turn and
+    // not the first of a rolled-in group: the stats above are summed across the
+    // group, but a fork point is a position, and "keep everything up to and
+    // including this reply" means the last sub-turn of it.
+    //
+    // Naming a turn is a POSITION claim, and counts alone can never establish
+    // one: `offset` conflates a parser sub-turn split (surplus) with a
+    // transcript that hasn't flushed the newest reply yet (deficit), and the
+    // two can cancel to any value including zero. Get identity from the
+    // transcript's shape instead, in two steps.
+    //
+    // 1. `parseEndsWithAssistant` says the reply that just completed is on
+    //    disk. Agents write the user prompt before the reply, so a trailing
+    //    USER turn means the parse is behind and NOTHING here can be placed —
+    //    locals [A,B] against parsed [A1,A2,A3] (A split three ways, B not
+    //    flushed) would otherwise call B the tail and name it "A3", forking at
+    //    A. The sync retries, so refusing costs a round, not the feature.
+    // 2. `offset === 0` — the parse holds exactly as many assistant turns as
+    //    this session streamed — is then the only shape where each position is
+    //    provably the same reply. A surplus is NOT necessarily a sub-turn
+    //    split the roll-in can attribute to local[0]: it is equally a turn
+    //    this client never streamed (a Claude async sub-agent's out-of-turn
+    //    reply, a co-controlling client's prompt), and nothing here can tell
+    //    the two apart. Allowing the tail through on a surplus looked safe and
+    //    is not — locals [B] against parsed [B,C] names B with C's id.
+    //
+    // Unnamed simply means "fork from here" on that turn degrades to a tail
+    // fork, the feature's documented fallback. Turns are normally named by the
+    // sync that runs right after they complete, when the parse is 1:1; they go
+    // unnamed when that sync was cancelled by the next reply landing inside
+    // its 1.5s delay, or when a split/out-of-turn record leaves a surplus
+    // standing for the rest of the session. That is the accepted price: a fork
+    // one message off is worse than a fork at the tail, because only one of
+    // them is visible to the person who clicked. Stats deliberately keep the
+    // old whole-batch alignment — a summed number in the wrong row is
+    // cosmetic.
+    let sourceTurnIdToApply: string | null | undefined
+    let agentMessageIdToApply: string | null | undefined
+    const idIsPlaceable = params.parseEndsWithAssistant && offset === 0
 
     if (parsedIdx >= 0 && parsedIdx < sessionParsedTurns.length) {
       const pt = sessionParsedTurns[parsedIdx]
@@ -2451,6 +2501,10 @@ export function computeTurnMetadataPatches(params: {
       modelToApply = pt.model
       reasoningEffortToApply = pt.reasoning_effort
       completedAtToApply = pt.completed_at
+      if (idIsPlaceable) {
+        sourceTurnIdToApply = pt.id
+        agentMessageIdToApply = pt.agent_message_id
+      }
     }
 
     // When the parser splits the response into more sub-turns than the live
@@ -2491,12 +2545,17 @@ export function computeTurnMetadataPatches(params: {
       }
     }
 
+    // `source_turn_id` counts as something worth emitting on its own: a turn
+    // the parser recorded with no stats at all (a plain codex reply carries no
+    // per-turn usage) still needs its name, or "fork from here" on it silently
+    // degrades to a tail fork.
     if (
       !usageToApply &&
       !durationToApply &&
       !modelToApply &&
       !reasoningEffortToApply &&
-      !completedAtToApply
+      !completedAtToApply &&
+      !sourceTurnIdToApply
     )
       continue
     patches.push({
@@ -2506,6 +2565,8 @@ export function computeTurnMetadataPatches(params: {
       model: modelToApply,
       reasoning_effort: reasoningEffortToApply,
       completed_at: completedAtToApply,
+      source_turn_id: sourceTurnIdToApply,
+      agent_message_id: agentMessageIdToApply,
     })
   }
 
@@ -2753,6 +2814,10 @@ function reducer(
           detailIsInFlight)
       const keepAllLiveBuffers =
         !authoritative && (action.preserveLive === true || detailIsInFlight)
+      const dropIds =
+        !authoritative && action.dropLiveTurnIds?.length
+          ? new Set(action.dropLiveTurnIds)
+          : null
 
       // Retire overlay turns the refetched detail now covers: both sides
       // measure byte offsets of the SAME transcript, so `entry.watermark <=
@@ -2822,13 +2887,23 @@ function reducer(
               queuedOptimisticTurnIds: current.queuedOptimisticTurnIds ?? [],
               liveMessage: null,
             }),
+        ...(dropIds
+          ? {
+              localTurns: nextLocalTurns.filter(
+                (turn) => !dropIds.has(turn.id)
+              ),
+              optimisticTurns: current.optimisticTurns.filter(
+                (turn) => !dropIds.has(turn.id)
+              ),
+            }
+          : {}),
       }
       // When live buffers are cleared, re-derive activities from the last
       // assistant turn in detail (+ any remaining localTurns). While live is
       // preserved, keep existing store activities (live path owns them).
       const agentType = detail.summary.agent_type
       let delegationActivities = nextSessionBase.delegationActivities
-      if (!isActivelyInteracting || !keepAllLiveBuffers) {
+      if (dropIds || !isActivelyInteracting || !keepAllLiveBuffers) {
         const sourceTurns = [...detail.turns, ...nextSessionBase.localTurns]
         delegationActivities = deriveActivitiesFromAssistantTurns(
           sourceTurns,
@@ -3547,6 +3622,7 @@ function reducer(
       const nextSession: ConversationRuntimeSession = {
         ...current,
         externalId: action.externalId,
+        backgroundTurns: rebind ? [] : current.backgroundTurns,
         pendingCancel: rebind ? null : current.pendingCancel,
         softFence: rebind ? false : current.softFence,
         ownerPreserve: rebind ? false : current.ownerPreserve,
@@ -3700,6 +3776,14 @@ function reducer(
           patch.completed_at === undefined
             ? turn.completed_at
             : (turn.completed_at ?? patch.completed_at)
+        const newSourceTurnId =
+          patch.source_turn_id === undefined
+            ? turn.source_turn_id
+            : (turn.source_turn_id ?? patch.source_turn_id)
+        const newAgentMessageId =
+          patch.agent_message_id === undefined
+            ? turn.agent_message_id
+            : (turn.agent_message_id ?? patch.agent_message_id)
         const toolMetaById =
           patch.tool_meta && patch.tool_meta.length > 0
             ? new Map(
@@ -3731,7 +3815,9 @@ function reducer(
           newModel !== turn.model ||
           newReasoningEffort !== turn.reasoning_effort ||
           newCompletedAt !== turn.completed_at ||
-          nextBlocks !== turn.blocks
+          nextBlocks !== turn.blocks ||
+          newSourceTurnId !== turn.source_turn_id ||
+          newAgentMessageId !== turn.agent_message_id
         ) {
           patchedTurns[patch.index] = {
             ...turn,
@@ -3741,6 +3827,8 @@ function reducer(
             model: newModel,
             reasoning_effort: newReasoningEffort,
             completed_at: newCompletedAt,
+            source_turn_id: newSourceTurnId,
+            agent_message_id: newAgentMessageId,
           }
           changed = true
         }
@@ -4036,7 +4124,11 @@ export interface RuntimeActions {
   fetchDetail: (conversationId: number) => void
   refetchDetail: (
     conversationId: number,
-    options?: { preserveLive?: boolean }
+    options?: {
+      preserveLive?: boolean
+      dropLiveTurnIds?: string[]
+      supersedeAuthoritative?: boolean
+    }
   ) => void
   /**
    * Manual Reload: clear any pending cancel fence, then perform an
@@ -6000,9 +6092,16 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
 
   const refetchDetail = (
     conversationId: number,
-    options?: { preserveLive?: boolean }
+    options?: {
+      preserveLive?: boolean
+      dropLiveTurnIds?: string[]
+      supersedeAuthoritative?: boolean
+    }
   ): void => {
-    if (authoritativeFetchGeneration.has(conversationId)) return
+    if (authoritativeFetchGeneration.has(conversationId)) {
+      if (!options?.supersedeAuthoritative) return
+      authoritativeFetchGeneration.delete(conversationId)
+    }
     // The session key is not always a fetchable DB id: a conversation started
     // as a new-chat draft keeps its virtual (negative) key for the tab's whole
     // life. Fetch with the bound DB row id (see `dbConversationId`) and store
@@ -6051,6 +6150,7 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
           conversationId,
           detail,
           preserveLive,
+          dropLiveTurnIds: options?.dropLiveTurnIds,
         })
         afterDetailFetchSuccess(conversationId, detail)
       })
@@ -6824,6 +6924,9 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
                     localAssistantIndices,
                     parsedAssistantTurns,
                     persistedAssistantCount,
+                    parseEndsWithAssistant:
+                      parsed.turns[parsed.turns.length - 1]?.role ===
+                      "assistant",
                   })
 
             // Preserve broker-stamped tool metadata (including delegation

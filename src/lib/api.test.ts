@@ -27,6 +27,7 @@ import {
   acpRespondPermission,
   acpSetConfigOption,
   acpSetMode,
+  acpStopAsyncTask,
   acpTerminateSharedSession,
   cancelReferenceSearch,
   cancelToolWatchdogLease,
@@ -541,6 +542,30 @@ describe("shared ACP transport payloads", () => {
       generation: 7,
       leaseId: "lease-7",
     })
+  })
+
+  it("adds optional fencing to async task stop payloads", async () => {
+    await acpStopAsyncTask("connection-7", "task-3", shared)
+    await acpStopAsyncTask("legacy", "task-4")
+
+    expect(mockTransport.call).toHaveBeenNthCalledWith(
+      1,
+      "acp_stop_async_task",
+      {
+        connectionId: "connection-7",
+        taskId: "task-3",
+        generation: 7,
+        leaseId: "lease-7",
+      }
+    )
+    expect(mockTransport.call).toHaveBeenNthCalledWith(
+      2,
+      "acp_stop_async_task",
+      {
+        connectionId: "legacy",
+        taskId: "task-4",
+      }
+    )
   })
 
   it("preserves unfenced legacy mode, configuration, and goal payloads", async () => {

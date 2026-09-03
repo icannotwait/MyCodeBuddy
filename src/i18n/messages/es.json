@@ -1891,6 +1891,7 @@
       "forkSession": "Bifurcar sesión",
       "forkSessionSuccess": "Sesión bifurcada exitosamente",
       "forkSessionFailed": "Error al bifurcar la sesión: {error}",
+      "forkSessionBusy": "Error al bifurcar: hay un turno en curso",
       "exportConversation": "Exportar conversación",
       "exportImage": "Imagen",
       "exportMarkdown": "Markdown",
@@ -2868,6 +2869,7 @@
           "downloadFailed": "La descarga de {agent} falló: {message}",
           "sessionLoadResourceNotFound": "Error al cargar la sesión de {agent}. Recarga para reintentar o inicia una nueva conversación.",
           "sessionLoadUnavailable": "{agent} no pudo restaurar esta sesión; es posible que haya finalizado o que el agente se haya detenido. Recarga para reintentar o inicia una nueva conversación.",
+          "sessionLoadBusy": "La sesión bifurcada a partir de este historial lo mantiene abierto. Cierra esa sesión y vuelve a cargar para abrir esta.",
           "sessionArchived": "La sesión anterior fue archivada por {agent}. Ejecuta {command} en una terminal para restaurarla y recargarla, o inicia una conversación nueva.",
           "turnFailedRefusal": "{agent} rechazó continuar este turno. Suele indicar un error de backend o pasarela. Revisa los registros del agente.",
           "turnFailedMaxTokens": "{agent} alcanzó el límite máximo de tokens para este turno.",
@@ -3034,7 +3036,7 @@
           "pasteDropFiles": "Pega una captura de pantalla o arrastra un archivo a la entrada para adjuntarlo.",
           "queueMessage": "Mientras el agente responde, sigue escribiendo: tu próximo mensaje se pone en cola y se envía al terminar.",
           "draftAutoSave": "Los borradores sin enviar se guardan automáticamente por conversación y se restauran al volver.",
-          "forkSend": "El desplegable del botón de enviar incluye Bifurcar y enviar, que ramifica desde el punto actual a una pestaña nueva.",
+          "forkFromTurn": "Cada respuesta completada tiene Bifurcar desde aquí: ramifica la conversación en ese mensaje hacia una pestaña nueva.",
           "exportConversation": "Haz clic derecho dentro de la conversación para exportarla como Markdown, HTML o imagen.",
           "chatChannels": "Conecta Telegram / Lark / WeChat en Ajustes → Canales de chat para continuar desde el móvil.",
           "shortcutsAuxPanel": "<shortcut>{toggleAuxPanel}</shortcut> alterna el panel derecho para ver los archivos tocados y los cambios de Git de esta sesión.",
@@ -3261,6 +3263,7 @@
         "emptyConversation": "No hay mensajes en esta conversación.",
         "systemMessage": "Mensaje del sistema",
         "copyMessage": "Copiar",
+        "forkFromHere": "Bifurcar desde aquí",
         "copied": "Copiado",
         "selectionActions": "Acciones de selección",
         "selectionCopy": "Copiar texto",
@@ -3580,7 +3583,6 @@
         },
         "planMode": {
           "entered": "Modo de planificación iniciado",
-          "planLabel": "Plan",
           "reviewApproved": "Plan aprobado: implementando",
           "reviewKept": "Se mantuvo en modo plan",
           "reviewPending": "Esperando la decisión sobre el plan",
@@ -3860,6 +3862,13 @@
         "cardResultPending": "El resultado aún no ha llegado",
         "running": "{count, plural, one {# tarea en segundo plano en ejecución} other {# tareas en segundo plano en ejecución}}",
         "settling": "Sincronizando resultados en segundo plano…"
+      },
+      "asyncTasks": {
+        "openOutput": "Salida",
+        "stop": "Detener",
+        "tokens": "{count} tokens",
+        "stopDeclined": "No se pudo detener esa tarea; puede que ya haya terminado.",
+        "stopFailed": "No se pudo detener la tarea: {error}"
       },
       "proposedPlan": {
         "title": "Plan propuesto",

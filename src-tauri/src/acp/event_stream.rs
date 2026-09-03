@@ -1160,6 +1160,7 @@ mod tests {
             autonomous_origin: None,
             generation_ms: None,
             generation_tokens: None,
+            agent_message_id: None,
         };
         let env = Arc::new(EventEnvelope {
             seq: u64::MAX,

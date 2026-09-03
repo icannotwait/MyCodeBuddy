@@ -805,7 +805,8 @@ async fn ticket_v1_lost_ack_adopts_first_continue_and_replacement_without_side_e
 
 #[tokio::test]
 async fn ticket_v1_atomic_admission_semantic_changes_conflict_after_consume() {
-    let cases: [(&str, fn(&mut DelegationRequest)); 5] = [
+    type RequestMutation = fn(&mut DelegationRequest);
+    let cases: [(&str, RequestMutation); 5] = [
         ("task", |request| request.task = "changed task".into()),
         ("cwd", |request| {
             request.requested_working_dir = Some("D:/changed-ticket-cwd".into())

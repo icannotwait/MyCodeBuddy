@@ -1644,6 +1644,7 @@ mod route_sanitizer_tests {
             autonomous_origin: None,
             generation_ms: None,
             generation_tokens: None,
+            agent_message_id: None,
         }
     }
 
@@ -2445,6 +2446,7 @@ earlier terminal context records.\n\
                 autonomous_origin: None,
                 generation_ms: None,
                 generation_tokens: None,
+                agent_message_id: None,
             },
             MessageTurn {
                 id: "turn-1".to_string(),
@@ -2465,6 +2467,7 @@ earlier terminal context records.\n\
                 autonomous_origin: None,
                 generation_ms: None,
                 generation_tokens: None,
+                agent_message_id: None,
             },
         ];
 

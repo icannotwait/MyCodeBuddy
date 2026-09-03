@@ -1891,6 +1891,7 @@
       "forkSession": "Sitzung forken",
       "forkSessionSuccess": "Sitzung erfolgreich geforkt",
       "forkSessionFailed": "Sitzung konnte nicht geforkt werden: {error}",
+      "forkSessionBusy": "Verzweigen fehlgeschlagen: Ein Zug läuft",
       "exportConversation": "Konversation exportieren",
       "exportImage": "Bild",
       "exportMarkdown": "Markdown",
@@ -2868,6 +2869,7 @@
           "downloadFailed": "{agent}-Download fehlgeschlagen: {message}",
           "sessionLoadResourceNotFound": "{agent}-Sitzung konnte nicht geladen werden. Neu laden, um es erneut zu versuchen, oder eine neue Konversation starten.",
           "sessionLoadUnavailable": "{agent} konnte diese Sitzung nicht wiederherstellen – sie wurde möglicherweise beendet oder der Agent wurde gestoppt. Neu laden, um es erneut zu versuchen, oder eine neue Konversation starten.",
+          "sessionLoadBusy": "Dieser Verlauf wird von der daraus abgezweigten Sitzung offen gehalten. Schließe diese Sitzung und lade neu, um ihn zu öffnen.",
           "sessionArchived": "Die vorherige Sitzung wurde auf {agent}-Seite archiviert. Führe {command} im Terminal aus, um sie wiederherzustellen und neu zu laden, oder starte eine neue Unterhaltung.",
           "turnFailedRefusal": "{agent} hat die Fortsetzung dieser Runde abgelehnt. Häufig deutet das auf einen Backend- oder Gateway-Fehler hin. Bitte prüfen Sie die Agent-Logs.",
           "turnFailedMaxTokens": "{agent} hat das Token-Limit für diese Runde erreicht.",
@@ -3034,7 +3036,7 @@
           "pasteDropFiles": "Füge einen Screenshot ein oder ziehe eine Datei direkt ins Eingabefeld, um sie anzuhängen.",
           "queueMessage": "Während der Agent antwortet, kannst du weitertippen – deine nächste Nachricht wird in die Warteschlange gestellt und automatisch gesendet.",
           "draftAutoSave": "Nicht gesendete Entwürfe werden pro Konversation automatisch gespeichert und beim Zurückkehren wiederhergestellt.",
-          "forkSend": "Im Dropdown der Senden-Schaltfläche gibt es Verzweigen und senden – verzweige vom aktuellen Punkt in einen neuen Tab.",
+          "forkFromTurn": "Jede abgeschlossene Antwort bietet Ab hier verzweigen – verzweige das Gespräch an dieser Nachricht in einen neuen Tab.",
           "exportConversation": "Klicke mit der rechten Maustaste in die Konversation, um sie als Markdown, HTML oder Bild zu exportieren.",
           "chatChannels": "Verbinde Telegram / Lark / WeChat unter Einstellungen → Chat-Kanäle, um vom Handy aus weiterzuarbeiten.",
           "shortcutsAuxPanel": "<shortcut>{toggleAuxPanel}</shortcut> blendet das rechte Panel ein – mit den geänderten Dateien und Git-Änderungen dieser Sitzung.",
@@ -3261,6 +3263,7 @@
         "emptyConversation": "Keine Nachrichten in dieser Unterhaltung.",
         "systemMessage": "Systemnachricht",
         "copyMessage": "Kopieren",
+        "forkFromHere": "Ab hier verzweigen",
         "copied": "Kopiert",
         "selectionActions": "Auswahlaktionen",
         "selectionCopy": "Text kopieren",
@@ -3580,7 +3583,6 @@
         },
         "planMode": {
           "entered": "Planungsmodus gestartet",
-          "planLabel": "Plan",
           "reviewApproved": "Plan genehmigt – wird umgesetzt",
           "reviewKept": "Im Planmodus geblieben",
           "reviewPending": "Warte auf Planentscheidung",
@@ -3860,6 +3862,13 @@
         "cardResultPending": "Ergebnis steht noch aus",
         "running": "{count, plural, one {# Hintergrundaufgabe läuft} other {# Hintergrundaufgaben laufen}}",
         "settling": "Hintergrundergebnisse werden synchronisiert…"
+      },
+      "asyncTasks": {
+        "openOutput": "Ausgabe",
+        "stop": "Stoppen",
+        "tokens": "{count} Tokens",
+        "stopDeclined": "Diese Aufgabe konnte nicht gestoppt werden – sie ist möglicherweise bereits beendet.",
+        "stopFailed": "Aufgabe konnte nicht gestoppt werden: {error}"
       },
       "proposedPlan": {
         "title": "Vorgeschlagener Plan",
