@@ -74,7 +74,7 @@ impl MigrationTrait for Migration {
 /// the v2-only migration while exercising run-store writes. Install this later
 /// independent migration out of order and record it so the normal migrator
 /// does not apply it twice when those fixtures advance.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-utils"))]
 pub(crate) async fn install_for_historical_completion_fixture(
     db: &crate::db::AppDatabase,
 ) -> Result<(), DbErr> {

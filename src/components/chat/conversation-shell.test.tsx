@@ -48,7 +48,10 @@ vi.mock("@/components/chat/ask-question-card", () => ({
 // Real PermissionDialog — assert approve/reject still works when locked.
 
 function renderShell(
-  props: Partial<React.ComponentProps<typeof ConversationShell>> = {}
+  props: Pick<
+    React.ComponentProps<typeof ConversationShell>,
+    "interactionLocked"
+  > = {}
 ) {
   const onRespondPermission = vi.fn()
   const onAnswerQuestion = vi.fn()
@@ -101,12 +104,14 @@ function renderShell(
           question: "Free text?",
         }}
         pendingAskQuestion={pendingAskQuestion}
+        pendingPlanApproval={null}
         onFocus={onFocus}
         onSend={onSend}
         onCancel={onCancel}
         onRespondPermission={onRespondPermission}
         onAnswerQuestion={onAnswerQuestion}
         onAnswerAskQuestion={onAnswerAskQuestion}
+        onAnswerPlanApproval={vi.fn()}
         interactionLocked={true}
         {...props}
       >
@@ -150,7 +155,6 @@ describe("ConversationShell interactionLocked capability", () => {
     // Explicit undefined still reaches mocked ChatInput from default param —
     // when the prop is omitted entirely, shell should pass false / undefined
     // that ChatInput treats as unlocked. Re-render without the key.
-    chatInputProps.last = null
     render(
       <NextIntlClientProvider locale="en" messages={enMessages}>
         <ConversationShell
@@ -161,12 +165,14 @@ describe("ConversationShell interactionLocked capability", () => {
           pendingPermission={null}
           pendingQuestion={null}
           pendingAskQuestion={null}
+          pendingPlanApproval={null}
           onFocus={() => {}}
           onSend={() => {}}
           onCancel={() => {}}
           onRespondPermission={() => {}}
           onAnswerQuestion={() => {}}
           onAnswerAskQuestion={() => {}}
+          onAnswerPlanApproval={() => {}}
         >
           <div />
         </ConversationShell>

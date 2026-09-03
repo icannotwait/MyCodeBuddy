@@ -2481,6 +2481,7 @@ const HISTORICAL_WORKFLOW_ROOT_FEATURES: CompanionFeatures = CompanionFeatures {
     feedback: false,
     ask: false,
     sessions: false,
+    compact_catalog: false,
     workflow_v2: true,
     completion_v2: false,
 };
@@ -2491,6 +2492,7 @@ const HISTORICAL_COMPLETION_CHILD_FEATURES: CompanionFeatures = CompanionFeature
     feedback: false,
     ask: false,
     sessions: false,
+    compact_catalog: false,
     workflow_v2: false,
     completion_v2: true,
 };

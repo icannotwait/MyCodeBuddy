@@ -78,7 +78,7 @@ Reúne las sesiones de todas las CLI de agentes compatibles en un único espacio
 
 ![Codeg Light](../images/workspace-light.png#gh-light-mode-only)
 ![Codeg Dark](../images/workspace-dark.png#gh-dark-mode-only)
-Claude Code · Codex · Gemini · OpenClaw · OpenCode · Cline · Hermes · CodeBuddy · Kimi Code · Pi · Grok · Cursor · DeepSeek Harness · Qoder · Google Antigravity
+Claude Code · Codex · Gemini · OpenCode · Cline · Hermes · CodeBuddy · Kimi Code · Pi · Grok · Cursor · DeepSeek Harness · Qoder · Google Antigravity
 
 ## Colaboración Multi-Agente
 

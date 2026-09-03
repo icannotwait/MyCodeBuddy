@@ -1,3 +1,5 @@
+import { readFileSync, readdirSync } from "node:fs"
+import { resolve } from "node:path"
 import { describe, expect, it } from "vitest"
 
 import type {
@@ -34,6 +36,7 @@ describe("merge repair transport contracts", () => {
       skills_capable: true,
       registry_id: "codex",
       registry_version: "1.1.9",
+      supports_custom_version: false,
       name: "Codex",
       description: "Codex through its ACP adapter",
       available: true,
@@ -45,6 +48,7 @@ describe("merge repair transport contracts", () => {
       sort_order: 0,
       installed_version: "1.1.9",
       env: {},
+      host_tools_agent_mode: false,
       config_json: null,
       config_file_path: null,
       opencode_auth_json: null,
@@ -145,5 +149,21 @@ describe("merge repair transport contracts", () => {
 
     expect(indexWindow.turns_offset).toBe(40)
     expect(userWindow.history_window.user_turn_limit).toBe(20)
+  })
+})
+
+describe("merge repair README contracts", () => {
+  it("does not advertise removed OpenClaw support", () => {
+    const publishedReadmes = [
+      "README.md",
+      ...readdirSync(resolve(process.cwd(), "docs/readme"))
+        .filter((name) => name.startsWith("README.") && name.endsWith(".md"))
+        .map((name) => `docs/readme/${name}`),
+    ]
+    const offenders = publishedReadmes.filter((readme) =>
+      /\bopenclaw\b/i.test(readFileSync(resolve(process.cwd(), readme), "utf8"))
+    )
+
+    expect(offenders).toEqual([])
   })
 })

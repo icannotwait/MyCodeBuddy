@@ -5590,14 +5590,18 @@ fn companion_features_arg_for_agent(
     sessions_enabled: bool,
     workflow_v2: bool,
 ) -> Option<String> {
-    companion_features_arg(
+    let mut features = companion_features_arg(
         delegation_enabled,
         coordination_v1 && delegation_enabled,
         feedback_enabled,
         ask_enabled && agent_type != AgentType::Grok,
         sessions_enabled,
         workflow_v2,
-    )
+    )?;
+    if agent_type == AgentType::Grok {
+        features.push_str(",compact_catalog");
+    }
+    Some(features)
 }
 
 fn continuation_enabled_for_launch(
@@ -31467,7 +31471,10 @@ mod tests {
     fn companion_features_arg_uses_native_ask_for_grok_only() {
         assert_eq!(
             companion_features_arg_for_agent(AgentType::Grok, true, true, true, true, true, true,),
-            Some("delegation,coordination_v1,feedback,sessions,workflow_v2".to_string())
+            Some(
+                "delegation,coordination_v1,feedback,sessions,workflow_v2,compact_catalog"
+                    .to_string()
+            )
         );
         assert_eq!(
             companion_features_arg_for_agent(AgentType::Codex, true, true, true, true, true, true,),

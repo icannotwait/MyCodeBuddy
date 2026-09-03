@@ -753,7 +753,6 @@
       "saveCodexConfig": "حفظ إعداد Codex",
       "saveGeminiConfig": "حفظ إعداد Gemini",
       "saveOpenCodeConfig": "حفظ إعداد OpenCode",
-      "saveOpenClawConfig": "حفظ إعداد OpenClaw",
       "saveConfigManagement": "حفظ إدارة الإعدادات",
       "saveCurrentProvider": "حفظ المزود الحالي",
       "showApiKey": "إظهار مفتاح API",
@@ -1161,14 +1160,6 @@
         }
       }
     },
-    "openClaw": {
-      "gatewayConfig": "إعداد Gateway",
-      "gatewayDescription": "قم بإعداد اتصال OpenClaw Gateway. يدعم gateway محليًا أو بعيدًا.",
-      "gatewayUrlHint": "اتركه فارغًا لاستخدام gateway.remote.url من إعداد openclaw المحلي.",
-      "gatewayTokenPlaceholder": "رمز مصادقة Gateway",
-      "gatewayTokenHint": "يُفضّل استخدام token-file بدل الرمز النصي متى أمكن؛ قم بالإعداد عبر openclaw CLI.",
-      "sessionKeyHint": "اختياري. حدّد مفتاح جلسة gateway؛ واتركه فارغًا للتعيين التلقائي لجلسة معزولة."
-    },
     "hermes": {
       "configManagement": "تكوين Hermes",
       "configDescription": "يدير Hermes بيانات اعتماده الخاصة في ~/.hermes/.env والإعدادات في ~/.hermes/config.yaml. اختر مزوّدًا، ثم عيّن مفتاح API والنموذج — وسيكتب codeg كلا الملفين نيابةً عنك.",
@@ -1368,8 +1359,6 @@
       "openCodeConfigSynced": "تمت مزامنة إعداد OpenCode وauth JSON.",
       "openCodeSaved": "تم حفظ إعداد OpenCode",
       "saveOpenCodeFailed": "فشل حفظ إعداد OpenCode",
-      "openClawSaved": "تم حفظ إعداد OpenClaw",
-      "saveOpenClawFailed": "فشل حفظ إعداد OpenClaw",
       "configSaved": "تم حفظ الإعداد",
       "configSavedHint": "يجب إعادة فتح الجلسات الحالية لتطبيق التغييرات",
       "saveConfigManagementFailed": "فشل حفظ إدارة الإعدادات",

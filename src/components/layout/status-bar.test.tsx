@@ -10,15 +10,6 @@ vi.mock("@/hooks/use-mobile", () => ({
 vi.mock("./status-bar-stats", () => ({
   StatusBarStats: () => <span data-testid="status-bar-stats" />,
 }))
-vi.mock(
-  "./status-bar-session-model",
-  () => ({
-    StatusBarSessionModel: () => (
-      <span data-testid="status-bar-session-model" />
-    ),
-  }),
-  { virtual: true }
-)
 vi.mock("./status-bar-tasks", () => ({
   StatusBarTasks: () => <span data-testid="status-bar-tasks" />,
 }))

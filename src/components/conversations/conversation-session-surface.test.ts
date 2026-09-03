@@ -542,6 +542,15 @@ type QueueItem = {
   }
   modeId: string | null
   optimisticTurnId?: string
+  adoptSendTimeMode?: boolean
+}
+
+type HarnessTab = {
+  id: string
+  folderId: number
+  isPinned: boolean
+  isChat?: boolean
+  workingDir?: string
 }
 
 const lifecycleCapture = vi.hoisted(() => ({
@@ -631,6 +640,14 @@ const surfaceH = vi.hoisted(() => ({
   delegateAccessLoading: false,
   /** Lifecycle mock conn.error (owner shell error path). */
   connError: null as string | null,
+  modes: null as {
+    current_mode_id: string
+    available_modes: Array<{
+      id: string
+      name: string
+      description: string | null
+    }>
+  } | null,
   isViewer: false,
   sessionFailures: [] as SessionFailureRecord[],
   dismissSessionFailures: vi.fn(),
@@ -646,7 +663,7 @@ const surfaceH = vi.hoisted(() => ({
   runtimeUserTurns: [] as Array<{ id: string; role: "user" }>,
   pendingUserMessage: null as PendingUserMessage | null,
   tabStoreState: {
-    tabs: [{ id: "tab-1", folderId: 1, isPinned: true }],
+    tabs: [{ id: "tab-1", folderId: 1, isPinned: true }] as HarnessTab[],
     rawTabs: [{ id: "tab-1" }],
     groupOf: { "tab-1": "g-main" } as Record<string, string>,
     groupLayout: { type: "group" as const, id: "g-main" },
@@ -774,7 +791,7 @@ vi.mock("@/hooks/use-connection-lifecycle", () => ({
         loadError: null,
         loadErrorCode: null,
         liveMessage: null,
-        modes: null,
+        modes: surfaceH.modes,
         configOptions: null,
         availableCommands: null,
         promptCapabilities: {
@@ -943,13 +960,17 @@ vi.mock("@/hooks/use-message-queue", () => ({
       (
         draft: QueueItem["draft"],
         modeId: string | null = null,
-        options?: { optimisticTurnId?: string }
+        options?: {
+          optimisticTurnId?: string
+          adoptSendTimeMode?: boolean
+        }
       ): QueueItem => {
         const item: QueueItem = {
           id: `q-${surfaceH.queueItems.length + 1}`,
           draft,
           modeId,
           optimisticTurnId: options?.optimisticTurnId,
+          adoptSendTimeMode: options?.adoptSendTimeMode,
         }
         surfaceH.queueItems.push(item)
         return item
@@ -1492,6 +1513,7 @@ function resetSurfaceHarness() {
   surfaceH.delegateAccessLoading = false
   surfaceH.delegateSyncError = null
   surfaceH.connError = null
+  surfaceH.modes = null
   surfaceH.isViewer = false
   surfaceH.sessionFailures = []
   surfaceH.dismissSessionFailures.mockClear()
@@ -1525,7 +1547,7 @@ function resetSurfaceHarness() {
   surfaceH.runtimeUserTurns = []
   surfaceH.pendingUserMessage = null
   surfaceH.tabStoreState = {
-    tabs: [{ id: "tab-1", folderId: 1, isPinned: true }],
+    tabs: [{ id: "tab-1", folderId: 1, isPinned: true }] as HarnessTab[],
     rawTabs: [{ id: "tab-1" }],
     groupOf: { "tab-1": "g-main" },
     groupLayout: { type: "group", id: "g-main" },
@@ -2038,6 +2060,7 @@ describe("ConversationSessionSurface useConnectionLifecycle options harness", ()
                     parent_id: null,
                     kind: "chat",
                     alias: null,
+                    group_id: null,
                   },
                 })
             })
@@ -2691,6 +2714,36 @@ describe("ConversationSessionSurface queued follow-up user turns", () => {
 describe("ConversationSessionSurface queue pause / Resume Queue wiring", () => {
   beforeEach(() => {
     resetSurfaceHarness()
+  })
+
+  it("resolves a parked prompt's mode when the queue flushes", () => {
+    vi.useFakeTimers()
+    try {
+      surfaceH.conversations = [fullSummary(42, "in_progress")]
+      surfaceH.connStatus = "connected"
+      surfaceH.modes = {
+        current_mode_id: "plan",
+        available_modes: [
+          { id: "default", name: "Default", description: null },
+          { id: "plan", name: "Plan", description: null },
+        ],
+      }
+      surfaceH.queueItems = [
+        { ...historicalHead("ask-selection"), adoptSendTimeMode: true },
+      ]
+
+      act(() => {
+        renderSurface(42)
+      })
+      act(() => {
+        vi.runOnlyPendingTimers()
+      })
+
+      expect(lifecycleCapture.handleSend).toHaveBeenCalled()
+      expect(lifecycleCapture.handleSend.mock.calls[0]?.[1]).toBe("plan")
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it("direct send during terminal pause does not dequeue the historical head", () => {

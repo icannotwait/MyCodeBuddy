@@ -753,7 +753,6 @@
       "saveCodexConfig": "Codex 설정 저장",
       "saveGeminiConfig": "Gemini 설정 저장",
       "saveOpenCodeConfig": "OpenCode 설정 저장",
-      "saveOpenClawConfig": "OpenClaw 설정 저장",
       "saveConfigManagement": "구성 관리 저장",
       "saveCurrentProvider": "현재 Provider 저장",
       "showApiKey": "API 키 보기",
@@ -1161,14 +1160,6 @@
         }
       }
     },
-    "openClaw": {
-      "gatewayConfig": "Gateway 구성",
-      "gatewayDescription": "OpenClaw Gateway 연결을 구성합니다. 로컬 또는 원격 gateway를 지원합니다.",
-      "gatewayUrlHint": "비워두면 로컬 openclaw 설정의 gateway.remote.url을 사용합니다.",
-      "gatewayTokenPlaceholder": "Gateway 인증 토큰",
-      "gatewayTokenHint": "가능하면 평문 토큰 대신 token-file을 사용하세요. openclaw CLI로 설정하세요.",
-      "sessionKeyHint": "선택 사항입니다. gateway 세션 키를 지정합니다. 비워두면 격리된 세션이 자동 할당됩니다."
-    },
     "hermes": {
       "configManagement": "Hermes 구성",
       "configDescription": "Hermes는 자격 증명을 ~/.hermes/.env에, 설정을 ~/.hermes/config.yaml에 직접 관리합니다. 공급자를 선택한 다음 API 키와 모델을 설정하세요. DrawCode가 두 파일을 모두 작성해 줍니다.",
@@ -1368,8 +1359,6 @@
       "openCodeConfigSynced": "OpenCode config와 auth JSON이 동기화되었습니다.",
       "openCodeSaved": "OpenCode 설정 저장됨",
       "saveOpenCodeFailed": "OpenCode 설정 저장 실패",
-      "openClawSaved": "OpenClaw 설정 저장됨",
-      "saveOpenClawFailed": "OpenClaw 설정 저장 실패",
       "configSaved": "구성이 저장되었습니다",
       "configSavedHint": "기존 세션은 다시 열어야 적용됩니다",
       "saveConfigManagementFailed": "구성 관리 저장 실패",

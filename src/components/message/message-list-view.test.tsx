@@ -54,7 +54,9 @@ const {
 } = vi.hoisted(() => ({
   virtualizerScrollToIndex: vi.fn(),
   virtualizerKeysSpy: vi.fn(),
-  listChildConversationsMock: vi.fn(async () => [] as const),
+  listChildConversationsMock: vi.fn(
+    async (_parentId: number): Promise<DbConversationSummary[]> => []
+  ),
   recordFrontendTurnTrace: vi.fn(),
 }))
 
@@ -326,7 +328,11 @@ vi.mock("./live-turn-stats", () => ({
       data-status-mode={props.statusMode ?? "auto"}
       data-tool-count={
         props.message?.content?.filter(
-          (b: { type?: string }) => b.type === "tool_call"
+          (block) =>
+            typeof block === "object" &&
+            block !== null &&
+            "type" in block &&
+            block.type === "tool_call"
         ).length ?? 0
       }
     />
@@ -452,10 +458,10 @@ function assistantTurn(id: string, text: string): MessageTurn {
   }
 }
 
-function toolTurn(id: string, text: string): MessageTurn {
+function nonAssistantTurn(id: string, text: string): MessageTurn {
   return {
     id,
-    role: "tool",
+    role: "system",
     blocks: [{ type: "text", text }],
     timestamp: "2026-05-28T00:00:02.000Z",
   }
@@ -808,6 +814,10 @@ function seedHistory(
           pendingCleanup: false,
           delegationActivities: [],
           historyAssistantBaseline: null,
+          batchBoundaryIndex: null,
+          batchBoundaryPrefixHash: null,
+          loadingOlderTurns: false,
+          olderTurnsPrependEpoch: 0,
           delegateSyncError: null,
           pendingCancel: null,
           softFence: false,
@@ -1648,13 +1658,13 @@ describe("MessageListView live footer isolation", () => {
     )
   })
 
-  it("keeps source tool text ineligible after assistant-display merging", () => {
+  it("keeps non-assistant text ineligible after assistant-display merging", () => {
     const assistantText = String.raw`D:\assistant\src\app.ts`
-    const toolText = String.raw`D:\tool-output\src\app.ts`
+    const sourceText = String.raw`D:\source-output\src\app.ts`
     seedHistory([
       userTurn("u1", "hello"),
       assistantTurn("a1", assistantText),
-      toolTurn("t1", toolText),
+      nonAssistantTurn("t1", sourceText),
     ])
 
     renderMessageList({ agentType: "grok" })
@@ -1667,25 +1677,25 @@ describe("MessageListView live footer isolation", () => {
       "data-grok-session-image-eligible",
       "true"
     )
-    expect(screen.getByText(toolText)).toHaveAttribute(
+    expect(screen.getByText(sourceText)).toHaveAttribute(
       "data-autolink-local-paths",
       "false"
     )
-    expect(screen.getByText(toolText)).toHaveAttribute(
+    expect(screen.getByText(sourceText)).toHaveAttribute(
       "data-grok-session-image-eligible",
       "false"
     )
   })
 
-  it("keeps standalone source-tool Markdown outside Grok image scope", () => {
-    const toolText = "![tool](images/tool.png)"
-    seedHistory([userTurn("u1", "hello"), toolTurn("t1", toolText)], {
+  it("keeps standalone non-assistant Markdown outside Grok image scope", () => {
+    const sourceText = "![source](images/source.png)"
+    seedHistory([userTurn("u1", "hello"), nonAssistantTurn("t1", sourceText)], {
       persistedAgentType: "grok",
     })
 
     renderMessageList({ agentType: "grok" })
 
-    expect(screen.getByText(toolText)).toHaveAttribute(
+    expect(screen.getByText(sourceText)).toHaveAttribute(
       "data-grok-session-image-eligible",
       "false"
     )

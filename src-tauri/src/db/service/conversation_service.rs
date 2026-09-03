@@ -981,7 +981,7 @@ pub async fn update_pin(
 /// `update_external_id`: `SessionStarted` writes are not serialized against
 /// deletes (deleting only soft-marks the row; the agent stays connected and
 /// bound), so a late event must not half-resurrect an invisible row.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-utils"))]
 pub async fn update_external_id(
     conn: &DatabaseConnection,
     conversation_id: i32,

@@ -13,7 +13,6 @@ import type { ReferenceAttrs } from "../types"
 import type {
   ReferenceGroupKind,
   ReferenceGroupSnapshot,
-  ReferenceSearchController,
   ReferenceSearchSnapshot,
 } from "../reference-search-controller"
 import { FakeReferenceSearchController } from "./fake-reference-search-controller"
@@ -52,7 +51,7 @@ function emptyGroup(
 }
 
 function makeSnapshot(
-  over: Partial<ReferenceSearchSnapshot> & {
+  over: Omit<Partial<ReferenceSearchSnapshot>, "groups"> & {
     groups?: Partial<Record<ReferenceGroupKind, ReferenceGroupSnapshot>>
   } = {}
 ): ReferenceSearchSnapshot {
@@ -237,7 +236,7 @@ const defaultState = {
 
 function mountPopup(
   overrides: {
-    controller?: ReferenceSearchController | FakeReferenceSearchController
+    controller?: FakeReferenceSearchController
     state?: typeof defaultState
     onSelect?: ReturnType<typeof vi.fn>
     onClose?: ReturnType<typeof vi.fn>
@@ -254,12 +253,12 @@ function mountPopup(
   const onSelect = overrides.onSelect ?? vi.fn()
   const onClose = overrides.onClose ?? vi.fn()
   const controller = overrides.controller ?? fakeController(defaultSnapshot)
-  controller.markActive?.()
+  controller.markActive()
   render(
     <SuggestionPopup
       ref={ref}
       state={overrides.state ?? defaultState}
-      controller={controller as ReferenceSearchController}
+      controller={controller.asController()}
       onSelect={onSelect}
       onClose={onClose}
       emptyLabel={overrides.emptyLabel}
@@ -479,9 +478,7 @@ describe("SuggestionPopup", () => {
           getClientRect: () =>
             ({ left: 100, top: 600, bottom: 620 }) as DOMRect,
         }}
-        controller={
-          fakeController(defaultSnapshot) as ReferenceSearchController
-        }
+        controller={fakeController(defaultSnapshot).asController()}
         onSelect={vi.fn()}
         onClose={vi.fn()}
       />
@@ -513,9 +510,7 @@ describe("SuggestionPopup", () => {
           getClientRect: () =>
             ({ left: 1000, top: 600, bottom: 620 }) as DOMRect,
         }}
-        controller={
-          fakeController(defaultSnapshot) as ReferenceSearchController
-        }
+        controller={fakeController(defaultSnapshot).asController()}
         onSelect={vi.fn()}
         onClose={vi.fn()}
       />
@@ -541,9 +536,7 @@ describe("SuggestionPopup", () => {
       <SuggestionPopup
         ref={createRef<SuggestionPopupHandle>()}
         state={{ query: "a", range: { from: 1, to: 3 }, getClientRect }}
-        controller={
-          fakeController(defaultSnapshot) as ReferenceSearchController
-        }
+        controller={fakeController(defaultSnapshot).asController()}
         onSelect={vi.fn()}
         onClose={vi.fn()}
       />
@@ -765,7 +758,7 @@ describe("SuggestionPopup", () => {
           <SuggestionPopup
             ref={ref}
             state={state}
-            controller={controller as ReferenceSearchController}
+            controller={controller.asController()}
             onSelect={onSelect}
             onClose={onClose}
           />

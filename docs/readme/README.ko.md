@@ -78,7 +78,7 @@ Codeg(Code Generation)는 멀티 에이전트 코딩 워크스페이스입니다
 
 ![Codeg Light](../images/workspace-light.png#gh-light-mode-only)
 ![Codeg Dark](../images/workspace-dark.png#gh-dark-mode-only)
-Claude Code · Codex · Gemini · OpenClaw · OpenCode · Cline · Hermes · CodeBuddy · Kimi Code · Pi · Grok · Cursor · DeepSeek Harness · Qoder · Google Antigravity
+Claude Code · Codex · Gemini · OpenCode · Cline · Hermes · CodeBuddy · Kimi Code · Pi · Grok · Cursor · DeepSeek Harness · Qoder · Google Antigravity
 
 ## 멀티 에이전트 협업
 

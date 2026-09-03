@@ -30,7 +30,7 @@ import {
 const ALL_FLAGS_TRUE = {
   mode: "batched" as const,
   perf_replay_available: true,
-  failure_event: "streaming-performance-failure" as const,
+  failure_event: "acp://delivery-failed" as const,
   flags: {
     desktop_acp_event_batching: true,
     incremental_live_transcript: true,

@@ -14,15 +14,14 @@ vi.mock("@/lib/api", () => ({
   })),
   getFolderConversation: vi.fn(),
   closeFolderIfEmpty: (...args: unknown[]) => closeFolderIfEmpty(...args),
-  listOpenFolderDetails: (...args: unknown[]) => listOpenFolderDetails(...args),
-  listAllFolderDetails: (...args: unknown[]) => listAllFolderDetails(...args),
+  listOpenFolderDetails: () => listOpenFolderDetails(),
+  listAllFolderDetails: () => listAllFolderDetails(),
   listFolderGroups: vi.fn(async () => []),
   listAllConversations: vi.fn(async () => []),
   openFolder: vi.fn(),
   openFolderById: (...args: unknown[]) => openFolderById(...args),
   openWorktreeFolder: vi.fn(),
   removeFolderFromWorkspace: vi.fn(),
-  reorderFolders: vi.fn(),
   getFolder: vi.fn(),
 }))
 
@@ -57,9 +56,11 @@ import type { DbConversationSummary, FolderDetail } from "@/lib/types"
 function makeFolder(
   overrides: Partial<FolderDetail> & { id: number; path?: string }
 ): FolderDetail {
+  const { id, path, ...rest } = overrides
   return {
-    name: `folder-${overrides.id}`,
-    path: overrides.path ?? `/repo/folder-${overrides.id}`,
+    id,
+    name: `folder-${id}`,
+    path: path ?? `/repo/folder-${id}`,
     git_branch: null,
     default_agent_type: null,
     last_agent_type: null,
@@ -69,7 +70,8 @@ function makeFolder(
     parent_id: null,
     kind: "regular",
     alias: null,
-    ...overrides,
+    group_id: null,
+    ...rest,
   }
 }
 

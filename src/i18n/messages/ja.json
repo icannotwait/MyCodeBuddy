@@ -753,7 +753,6 @@
       "saveCodexConfig": "Codex設定を保存",
       "saveGeminiConfig": "Gemini設定を保存",
       "saveOpenCodeConfig": "OpenCode設定を保存",
-      "saveOpenClawConfig": "OpenClaw設定を保存",
       "saveConfigManagement": "設定管理を保存",
       "saveCurrentProvider": "現在のプロバイダーを保存",
       "showApiKey": "APIキーを表示",
@@ -1161,14 +1160,6 @@
         }
       }
     },
-    "openClaw": {
-      "gatewayConfig": "Gateway 設定",
-      "gatewayDescription": "OpenClaw Gateway 接続を設定します。ローカルまたはリモートの gateway をサポートします。",
-      "gatewayUrlHint": "空欄の場合はローカル openclaw 設定の gateway.remote.url を使用します。",
-      "gatewayTokenPlaceholder": "Gateway 認証トークン",
-      "gatewayTokenHint": "可能な場合は平文トークンではなく token-file の使用を推奨します。openclaw CLI で設定してください。",
-      "sessionKeyHint": "任意。gateway の session key を指定します。空欄の場合は分離されたセッションが自動割り当てされます。"
-    },
     "hermes": {
       "configManagement": "Hermes 設定",
       "configDescription": "Hermes は認証情報を ~/.hermes/.env に、設定を ~/.hermes/config.yaml に独自に管理します。プロバイダーを選択し、API キーとモデルを設定してください。codeg が両方のファイルを書き込みます。",
@@ -1368,8 +1359,6 @@
       "openCodeConfigSynced": "OpenCode config と auth JSON が同期されました。",
       "openCodeSaved": "OpenCode設定を保存しました",
       "saveOpenCodeFailed": "OpenCode設定の保存に失敗しました",
-      "openClawSaved": "OpenClaw設定を保存しました",
-      "saveOpenClawFailed": "OpenClaw設定の保存に失敗しました",
       "configSaved": "設定を保存しました",
       "configSavedHint": "既存のセッションは再度開く必要があります",
       "saveConfigManagementFailed": "設定管理の保存に失敗しました",

@@ -208,6 +208,7 @@ mod orchestration_binding_artifact_storage_tests {
                 feedback: false,
                 ask: false,
                 sessions: false,
+                compact_catalog: false,
                 workflow_v2: false,
                 completion_v2: false,
             },
@@ -827,6 +828,8 @@ pub struct CompanionFeatures {
     pub feedback: bool,
     pub ask: bool,
     pub sessions: bool,
+    /// Use the reduced catalog required by fixed-size stdio hosts such as Grok.
+    pub compact_catalog: bool,
     /// Retired workflow_manifest_v2 feature bit. Production launch parsing
     /// leaves this false; historical protocol tests construct it explicitly.
     pub workflow_v2: bool,
@@ -904,6 +907,7 @@ impl CompanionFeatures {
                 feedback: false,
                 ask: false,
                 sessions: false,
+                compact_catalog: false,
                 workflow_v2: false,
                 completion_v2: false,
             };
@@ -914,6 +918,7 @@ impl CompanionFeatures {
             feedback: false,
             ask: false,
             sessions: false,
+            compact_catalog: false,
             workflow_v2: false,
             completion_v2: false,
         };
@@ -924,6 +929,7 @@ impl CompanionFeatures {
                 "feedback" => f.feedback = true,
                 "ask" => f.ask = true,
                 "sessions" => f.sessions = true,
+                "compact_catalog" => f.compact_catalog = true,
                 "workflow_v2" | "completion_v2" => {}
                 _ => {}
             }
@@ -1821,11 +1827,59 @@ pub async fn dispatch_line(
                 }
                 None => all,
             };
+            if ctx.features.compact_catalog {
+                compact_tools_for_fixed_stdio(&mut tools);
+            }
             remove_disabled_agents_from_delegate_enum(&mut tools, &ctx.disabled_agents);
             LineAction::Respond(ok(id, json!({ "tools": tools })))
         }
         "tools/call" => build_tools_call_spawn(ctx.clone(), inflight, id, req.params).await,
         _ => LineAction::Respond(err(id, -32601, format!("method not found: {}", req.method))),
+    }
+}
+
+fn compact_tools_for_fixed_stdio(tools: &mut Value) {
+    let Some(tools) = tools.as_array_mut() else {
+        return;
+    };
+    for tool in tools {
+        match tool.get("name").and_then(Value::as_str) {
+            Some("resume_delegation") => {
+                if let Some(tool) = tool.as_object_mut() {
+                    tool.insert(
+                        "description".into(),
+                        Value::String(
+                            "Resume only interrupted/canceled work under the same task_id, child session, and original task. No new task text: use delegate_to_agent for follow-up/retry. Running, completed, and failed tasks are refused; reason only explains the interruption."
+                                .into(),
+                        ),
+                    );
+                    if let Some(properties) = tool
+                        .get_mut("inputSchema")
+                        .and_then(|schema| schema.get_mut("properties"))
+                        .and_then(Value::as_object_mut)
+                    {
+                        for name in ["task_id", "reason"] {
+                            if let Some(property) =
+                                properties.get_mut(name).and_then(Value::as_object_mut)
+                            {
+                                property.remove("description");
+                            }
+                        }
+                    }
+                }
+            }
+            Some("get_delegation_orchestration_bindings") => {
+                if let Some(schema) = tool.get_mut("inputSchema").and_then(Value::as_object_mut) {
+                    schema.remove("$defs");
+                    if let Some(properties) =
+                        schema.get_mut("properties").and_then(Value::as_object_mut)
+                    {
+                        properties.insert("admission_intent".into(), json!({}));
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -2166,6 +2220,11 @@ async fn build_tools_call_spawn(
             register_and_spawn(inflight, id, None, round_trip, render_workflow_result).await
         }
         "resume_delegation" => {
+            if let Err(message) =
+                reject_unknown_arguments(&arguments, "resume_delegation", &["task_id", "reason"])
+            {
+                return LineAction::Respond(err(id, -32602, message));
+            }
             let task_id = match arguments.get("task_id").and_then(|v| v.as_str()) {
                 Some(s) if !s.is_empty() => s.to_string(),
                 _ => {
@@ -4780,6 +4839,7 @@ mod tests {
             feedback: false,
             ask: false,
             sessions: false,
+            compact_catalog: false,
             workflow_v2: false,
             completion_v2: false,
         })
@@ -5654,6 +5714,7 @@ mod tests {
             .iter()
             .find(|t| t["name"] == "resume_delegation")
             .unwrap();
+        assert_eq!(resume["inputSchema"]["additionalProperties"], false);
         assert!(resume["inputSchema"]["properties"]["task_id"].is_object());
         assert!(resume["inputSchema"]["properties"]["reason"].is_object());
         assert!(resume["inputSchema"]["properties"]["task"].is_null());
@@ -6565,6 +6626,7 @@ mod tests {
         feedback: true,
         ask: false,
         sessions: false,
+        compact_catalog: false,
         workflow_v2: false,
         completion_v2: false,
     };
@@ -6574,6 +6636,7 @@ mod tests {
         feedback: true,
         ask: false,
         sessions: false,
+        compact_catalog: false,
         workflow_v2: false,
         completion_v2: false,
     };
@@ -6583,6 +6646,7 @@ mod tests {
         feedback: false,
         ask: true,
         sessions: false,
+        compact_catalog: false,
         workflow_v2: false,
         completion_v2: false,
     };
@@ -6592,6 +6656,7 @@ mod tests {
         feedback: false,
         ask: false,
         sessions: true,
+        compact_catalog: false,
         workflow_v2: false,
         completion_v2: false,
     };
@@ -6601,6 +6666,7 @@ mod tests {
         feedback: true,
         ask: false,
         sessions: true,
+        compact_catalog: true,
         workflow_v2: true,
         completion_v2: false,
     };
@@ -6610,6 +6676,7 @@ mod tests {
         feedback: false,
         ask: false,
         sessions: false,
+        compact_catalog: false,
         workflow_v2: false,
         completion_v2: false,
     };
@@ -6619,6 +6686,7 @@ mod tests {
         feedback: false,
         ask: false,
         sessions: false,
+        compact_catalog: false,
         workflow_v2: true,
         completion_v2: false,
     };
@@ -6628,6 +6696,7 @@ mod tests {
         feedback: false,
         ask: false,
         sessions: false,
+        compact_catalog: false,
         workflow_v2: false,
         completion_v2: true,
     };
@@ -6649,6 +6718,7 @@ mod tests {
             feedback: false,
             ask: false,
             sessions: false,
+            compact_catalog: false,
             workflow_v2: false,
             completion_v2: false,
         })
@@ -7316,13 +7386,15 @@ mod tests {
         assert!(def.delegation && !def.feedback && !def.coordination_v1);
         assert!(!def.ask);
         assert!(!def.sessions);
+        assert!(!def.compact_catalog);
         assert!(!def.workflow_v2);
         // Explicit list, whitespace + unknown tokens tolerated.
         let all = CompanionFeatures::parse(Some(concat!(
             " delegation , coordination_v1 , feedback , ask , sessions , ",
-            "workflow_v2 , completion_v2 ,bogus"
+            "compact_catalog , workflow_v2 , completion_v2 ,bogus"
         )));
         assert!(all.delegation && all.coordination_v1 && all.feedback && all.ask && all.sessions);
+        assert!(all.compact_catalog);
         assert!(!all.workflow_v2 && !all.completion_v2);
         let fb = CompanionFeatures::parse(Some("feedback"));
         assert!(!fb.delegation && fb.feedback && !fb.ask && !fb.coordination_v1);
@@ -8430,6 +8502,7 @@ mod tests {
             feedback: false,
             ask: false,
             sessions: false,
+            compact_catalog: false,
             workflow_v2: false,
             completion_v2: false,
         };
@@ -8509,6 +8582,7 @@ mod tests {
             feedback: false,
             ask: false,
             sessions: false,
+            compact_catalog: false,
             workflow_v2: false,
             completion_v2: false,
         };
@@ -9897,6 +9971,7 @@ mod tests {
             feedback: false,
             ask: false,
             sessions: false,
+            compact_catalog: false,
             workflow_v2: false,
             completion_v2: false,
         };
@@ -9986,6 +10061,7 @@ mod tests {
             feedback: false,
             ask: false,
             sessions: false,
+            compact_catalog: false,
             workflow_v2: false,
             completion_v2: false,
         });
@@ -10035,6 +10111,7 @@ mod tests {
             feedback: false,
             ask: false,
             sessions: false,
+            compact_catalog: false,
             workflow_v2: false,
             completion_v2: false,
         });
@@ -10102,6 +10179,7 @@ mod tests {
             feedback: false,
             ask: false,
             sessions: false,
+            compact_catalog: false,
             workflow_v2: false,
             completion_v2: false,
         };
@@ -10201,6 +10279,7 @@ mod tests {
                 "continue_delegation",
                 "get_delegation_status",
                 "cancel_delegation",
+                "resume_delegation",
                 "check_user_feedback",
                 "get_session_info",
                 "reply_to_delegation",
@@ -10361,6 +10440,22 @@ mod tests {
                 LineAction::Spawn(_)
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn resume_rejects_unknown_arguments() {
+        let line = json!({
+            "jsonrpc": "2.0", "id": 36, "method": "tools/call",
+            "params": {
+                "name": "resume_delegation",
+                "arguments": {"task_id": "t-1", "task": "do different work"}
+            }
+        })
+        .to_string();
+        let response = unwrap_respond(dispatch_for_test(&line).await);
+        let error = response.error.expect("unknown arguments must be rejected");
+        assert_eq!(error.code, -32602);
+        assert_eq!(error.message, "resume_delegation does not accept `task`");
     }
 
     #[tokio::test]

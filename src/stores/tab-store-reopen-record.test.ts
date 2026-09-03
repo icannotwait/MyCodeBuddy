@@ -13,10 +13,21 @@ import {
 import { resetTabStore, useTabStore } from "./tab-store"
 import type { FolderDetail } from "@/lib/types"
 
+const api = vi.hoisted(() => ({
+  closeFolderIfEmpty: vi.fn(async () => ({ closed: false })),
+  listOpenFolderDetails: vi.fn(async () => [] as FolderDetail[]),
+  listAllFolderDetails: vi.fn(async () => [] as FolderDetail[]),
+  listFolderGroups: vi.fn(async () => []),
+}))
+
 vi.mock("@/lib/api", () => ({
   listOpenedTabs: vi.fn(),
   saveOpenedTabs: vi.fn(),
   getFolderConversation: vi.fn(),
+  closeFolderIfEmpty: api.closeFolderIfEmpty,
+  listOpenFolderDetails: api.listOpenFolderDetails,
+  listAllFolderDetails: api.listAllFolderDetails,
+  listFolderGroups: api.listFolderGroups,
 }))
 
 vi.mock("@/lib/platform", () => ({
@@ -58,6 +69,7 @@ function seedTabs() {
 }
 
 beforeEach(() => {
+  vi.clearAllMocks()
   resetTabStore()
   resetAppWorkspaceStore()
   resetClosedTabStackForTests()

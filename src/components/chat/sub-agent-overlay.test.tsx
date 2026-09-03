@@ -13,6 +13,9 @@ import { delegationRunSnapshotCache } from "@/lib/delegation-run-snapshot"
 import { getActiveBackendCacheKey } from "@/lib/transport"
 import type { DelegationRunSnapshot, WorkflowGraphSnapshot } from "@/lib/types"
 
+type OpenDelegatedChildSession =
+  typeof import("@/lib/open-delegated-child-session").openDelegatedChildSession
+
 // The rows resolve their model from `useDelegatedSubSession` (live binding) and
 // the connections store (child pending-permission). Stub both — the same
 // contexts DelegatedSubThread's own test stubs.
@@ -38,11 +41,10 @@ vi.mock("@/contexts/acp-connections-context", async () => {
 // Open path goes through openDelegatedChildSession (main tab). Stub the helper
 // so overlay tests stay unit-scoped.
 const { openDelegatedChildSession } = vi.hoisted(() => ({
-  openDelegatedChildSession: vi.fn(async () => true),
+  openDelegatedChildSession: vi.fn<OpenDelegatedChildSession>(async () => true),
 }))
 vi.mock("@/lib/open-delegated-child-session", () => ({
-  openDelegatedChildSession: (...args: unknown[]) =>
-    openDelegatedChildSession(...args),
+  openDelegatedChildSession,
 }))
 
 vi.mock("@/components/ai-elements/link-safety", () => ({

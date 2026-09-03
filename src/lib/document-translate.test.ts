@@ -75,12 +75,6 @@ describe("isTranslationEligible", () => {
         baseTab({
           transient: {
             type: "translation",
-            sourceTabId: "src",
-            sourcePath: "/repo/README.md",
-            sourceContentHash: "abc",
-            locale: "zh_cn",
-            format: "markdown",
-            suggestedName: "README.zh_cn.md",
           },
         })
       )

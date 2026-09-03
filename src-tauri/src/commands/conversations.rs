@@ -1348,6 +1348,25 @@ fn collect_delegation_task_ids_from_text(text: &str, task_ids: &mut HashSet<Stri
             collect_delegation_task_ids_from_value(&value, task_ids);
         }
     }
+    // The field value can be complete even when the surrounding preview is not.
+    for (idx, _) in trimmed.match_indices("\"task_id\"") {
+        let Some(value) = trimmed[idx + "\"task_id\"".len()..]
+            .trim_start()
+            .strip_prefix(':')
+        else {
+            continue;
+        };
+        let Some(Ok(task_id)) = serde_json::Deserializer::from_str(value.trim_start())
+            .into_iter::<String>()
+            .next()
+        else {
+            continue;
+        };
+        let task_id = task_id.trim();
+        if !task_id.is_empty() {
+            task_ids.insert(task_id.to_string());
+        }
+    }
     for (idx, _) in trimmed.match_indices("task_id=") {
         let has_identifier_boundary = trimmed[..idx]
             .chars()
@@ -1450,12 +1469,10 @@ fn find_task_id_in_value(value: &serde_json::Value, depth: u8) -> Option<String>
 /// wrappers are peeled first; truncated previews fall back to the tolerant
 /// task-id scan used for delegation results.
 fn parse_resume_task_id(input: &str) -> Option<String> {
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(input) {
-        if let Some(task_id) = find_task_id_in_value(&value, 0) {
-            return Some(task_id);
-        }
+    match serde_json::from_str::<serde_json::Value>(input) {
+        Ok(value) => find_task_id_in_value(&value, 0),
+        Err(_) => parse_delegate_task_id(input),
     }
-    parse_delegate_task_id(input)
 }
 
 /// Bind historical delegate/resume ToolUse blocks to a child conversation and
@@ -8288,7 +8305,6 @@ Call get_delegation_status with the returned task_id to collect the result.";
         // legacy import racing a batch import could double-insert on a DB with no
         // unique index. With the guard held it is rejected BEFORE the folder
         // lookup, so even a valid folder id surfaces the guard error, not a hit.
-        let _serialized = IMPORT_GUARD_SERIALIZER.lock().await;
         let db = fresh_in_memory_db().await;
         let data_dir = TempDir::new().expect("tempdir");
         let registry = inert_internal_session_registry(&db, data_dir.path()).await;

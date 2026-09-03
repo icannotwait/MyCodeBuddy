@@ -41,7 +41,10 @@ vi.mock("sonner", () => ({
   toast: { error: vi.fn(), info: vi.fn(), success: vi.fn() },
 }))
 
-import { useSessionFeedback } from "./use-session-feedback"
+import {
+  useSessionFeedback,
+  type UseSessionFeedbackArgs,
+} from "./use-session-feedback"
 import { acpGetSessionSnapshot, submitSessionFeedback } from "@/lib/api"
 import { isNoActiveTurnRejection } from "@/lib/turn-busy"
 import { toast } from "sonner"
@@ -68,7 +71,7 @@ function snapshot(
   } as LiveSessionSnapshot
 }
 
-const baseProps = {
+const baseProps: UseSessionFeedbackArgs = {
   connectionId: "c1",
   connStatus: "prompting" as ConnectionStatus,
   enabled: true,

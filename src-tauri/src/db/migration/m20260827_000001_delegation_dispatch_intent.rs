@@ -63,7 +63,7 @@ impl MigrationTrait for Migration {
 /// while still writing through the current SeaORM entity. Install this later
 /// independent column out of order and record it so the normal migrator does
 /// not apply it twice when those fixtures advance.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-utils"))]
 pub(crate) async fn install_for_historical_completion_fixture(
     db: &crate::db::AppDatabase,
 ) -> Result<(), DbErr> {
@@ -212,7 +212,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delegation_dispatch_intent_migration_registers_after_current_latest() {
+    async fn delegation_dispatch_intent_migration_registers_once_after_predecessor() {
         let names = Migrator::migrations()
             .iter()
             .map(|migration| migration.name().to_string())
@@ -221,11 +221,18 @@ mod tests {
             .iter()
             .position(|name| name == PRIOR_MIGRATION)
             .expect("prior migration registered");
+        let intent_index = names
+            .iter()
+            .position(|name| name == INTENT_MIGRATION)
+            .expect("dispatch intent migration registered");
         assert_eq!(
-            names.get(prior_index + 1).map(String::as_str),
-            Some(INTENT_MIGRATION)
+            names
+                .iter()
+                .filter(|name| name.as_str() == INTENT_MIGRATION)
+                .count(),
+            1
         );
-        assert_eq!(prior_index + 2, names.len());
+        assert!(intent_index > prior_index);
     }
 
     #[tokio::test]

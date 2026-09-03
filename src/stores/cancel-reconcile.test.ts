@@ -9,6 +9,7 @@ import type {
   DbConversationDetail,
   MessageTurn,
   TurnOutcome,
+  WorkflowGraphSnapshot,
 } from "@/lib/types"
 import type { LiveMessage } from "@/contexts/acp-connections-context"
 import {
@@ -139,6 +140,10 @@ function emptySession(
     sessionStats: null,
     delegationActivities: [],
     historyAssistantBaseline: null,
+    batchBoundaryIndex: null,
+    batchBoundaryPrefixHash: null,
+    loadingOlderTurns: false,
+    olderTurnsPrependEpoch: 0,
     pendingCleanup: false,
     delegateSyncError: null,
     pendingCancel: null,
@@ -1218,15 +1223,15 @@ describe("FE15 Manual Reload during pending is authoritative", () => {
 
   it("seeds detail workflow graph under the bound db id", async () => {
     const runtimeId = -7
-    const workflowGraph = {
+    const workflowGraph: WorkflowGraphSnapshot = {
       schema_version: 1,
       workflow_id: "wf-durable-key",
       workflow_kind: "brainstorm_to_delivery",
       manifest_revision: 1,
       graph_revision: 1,
       manifest_state: "published",
-      compatibility: "manifest" as const,
-      overall_state: "running" as const,
+      compatibility: "manifest",
+      overall_state: "in_progress",
       projection_warning_codes: [],
       current_phase_id: "plan",
       current_node_ids: [],

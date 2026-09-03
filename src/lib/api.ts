@@ -2336,10 +2336,6 @@ export async function closeFolderIfEmpty(
   return getTransport().call("close_folder_if_empty", { folderId })
 }
 
-export async function reorderFolders(ids: number[]): Promise<void> {
-  return getTransport().call("reorder_folders", { ids })
-}
-
 export async function listFolderGroups(): Promise<FolderGroupDetail[]> {
   return getTransport().call("list_folder_groups", {})
 }

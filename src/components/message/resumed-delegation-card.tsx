@@ -52,6 +52,7 @@ import { useDelegationCardModel } from "@/hooks/use-delegation-card-model"
 interface Props {
   /** This `resume_delegation` call's own tool_call_id. */
   toolCallId: string
+  parentConversationId?: number | null
   /** Raw JSON arguments: `{ task_id, reason? }`. */
   input?: string | null
   output?: string | null
@@ -64,6 +65,7 @@ interface Props {
 
 export function ResumedDelegationCard({
   toolCallId,
+  parentConversationId,
   input,
   output,
   errorText,
@@ -94,13 +96,22 @@ export function ResumedDelegationCard({
   const source = useMemo(
     () => ({
       parentToolUseId: toolCallId,
+      parentConversationId,
       taskIdHint: call.detail,
       output,
       errorText,
       state,
       meta,
     }),
-    [toolCallId, call.detail, output, errorText, state, meta]
+    [
+      toolCallId,
+      parentConversationId,
+      call.detail,
+      output,
+      errorText,
+      state,
+      meta,
+    ]
   )
 
   const {

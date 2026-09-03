@@ -5,6 +5,7 @@ import {
   parseDelegationMeta,
   parseInput,
   parseToolOutput,
+  type DelegationRunIdentityInput,
 } from "@/lib/delegation-card"
 import type { DelegationCardSource } from "@/hooks/use-delegation-card-model"
 import type { DbConversationSummary } from "@/lib/types"
@@ -52,6 +53,15 @@ function source(
   }
 }
 
+function identityInput(
+  source: DelegationCardSource
+): DelegationRunIdentityInput {
+  if (source.parentConversationId == null) {
+    throw new Error("delegation source is missing its parent conversation")
+  }
+  return { ...source, parentConversationId: source.parentConversationId }
+}
+
 describe("childConversationToDelegationSource", () => {
   it("keeps the durable exec parent_tool_use_id without treating the root call id as the current run", () => {
     const source = childConversationToDelegationSource(
@@ -70,8 +80,10 @@ describe("childConversationToDelegationSource", () => {
     expect(source.parentConversationId).toBe(3866)
     expect(parseInput(source.input).agentType).toBe("codex")
     expect(parseInput(source.input).task).toBe("Sale/ATM P1 review")
-    expect(parseDelegateRunIdentity(source).taskId).toBeNull()
-    expect(parseDelegateRunIdentity(source).childConversationId).toBe(3867)
+    expect(parseDelegateRunIdentity(identityInput(source)).taskId).toBeNull()
+    expect(
+      parseDelegateRunIdentity(identityInput(source)).childConversationId
+    ).toBe(3867)
     expect(parseToolOutput(source.output)?.kind).toBe("outcome")
     expect(parseDelegationMeta(source.meta)?.status).toBe("ok")
     expect(parseDelegationMeta(source.meta)?.taskId).toBeNull()
@@ -135,8 +147,13 @@ describe("childConversationToDelegationSource", () => {
       })
     )
     expect(source.state).toBe("output-error")
-    expect(parseToolOutput(source.output, true)?.isError).toBe(true)
-    expect(parseDelegateRunIdentity(source).childConversationId).toBe(3880)
+    expect(parseToolOutput(source.output, true)).toMatchObject({
+      kind: "outcome",
+      isError: true,
+    })
+    expect(
+      parseDelegateRunIdentity(identityInput(source)).childConversationId
+    ).toBe(3880)
     expect(parseDelegationMeta(source.meta)?.status).toBe("err")
   })
 })
@@ -195,7 +212,9 @@ describe("mergeDelegationSourceLayers", () => {
     const merged = mergeDelegationSourceLayers([durable], [continued])
     expect(merged).toHaveLength(1)
     expect(merged[0].parentToolUseId).toBe("exec-continue")
-    expect(parseDelegateRunIdentity(merged[0]).childConversationId).toBe(3869)
+    expect(
+      parseDelegateRunIdentity(identityInput(merged[0])).childConversationId
+    ).toBe(3869)
   })
 
   it("correlates a transcript root task id with the durable child without exposing that id as the current run", () => {
@@ -217,7 +236,7 @@ describe("mergeDelegationSourceLayers", () => {
     const merged = mergeDelegationSourceLayers([durable], [inflight])
     expect(merged).toHaveLength(1)
     expect(merged[0].parentToolUseId).toBe("pt-live")
-    expect(parseDelegateRunIdentity(durable).taskId).toBeNull()
+    expect(parseDelegateRunIdentity(identityInput(durable)).taskId).toBeNull()
   })
 
   it("lets a live continuation replace the latest historical row of the same child", () => {

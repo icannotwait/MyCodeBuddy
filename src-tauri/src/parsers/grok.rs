@@ -3364,13 +3364,16 @@ context_window = 131072
     /// grok through codeg) → the name heuristic still supplies a window.
     #[test]
     fn context_window_falls_back_to_the_name_heuristic() {
+        let empty_home = tempfile::tempdir().unwrap();
         let (_tmp, sessions) = fixture(SUMMARY, RING_UPDATES);
         let parser = GrokParser::with_base_dir(sessions);
-        let stats = parser
-            .get_conversation("019f45e3-e1ef-7690-a29f-fe2554382b49")
-            .unwrap()
-            .session_stats
-            .expect("session stats");
+        let stats = with_temp_grok_home(empty_home.path(), || {
+            parser
+                .get_conversation("019f45e3-e1ef-7690-a29f-fe2554382b49")
+                .unwrap()
+                .session_stats
+                .expect("session stats")
+        });
         assert_eq!(stats.context_window_max_tokens, Some(500_000));
     }
 

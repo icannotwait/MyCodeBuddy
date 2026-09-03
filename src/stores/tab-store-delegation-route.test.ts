@@ -20,11 +20,13 @@ import {
 function draftTab(overrides: Partial<TabItemInternal> = {}): TabItemInternal {
   return {
     id: "new-1",
+    kind: "conversation",
     conversationId: null,
     agentType: "codex",
     title: "New",
     folderId: 1,
     workingDir: "/repo",
+    isPinned: false,
     isChat: false,
     ...overrides,
   }

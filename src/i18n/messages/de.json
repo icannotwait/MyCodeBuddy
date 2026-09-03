@@ -753,7 +753,6 @@
       "saveCodexConfig": "Codex-Konfiguration speichern",
       "saveGeminiConfig": "Gemini-Konfiguration speichern",
       "saveOpenCodeConfig": "OpenCode-Konfiguration speichern",
-      "saveOpenClawConfig": "OpenClaw-Konfiguration speichern",
       "saveConfigManagement": "Konfigurationsverwaltung speichern",
       "saveCurrentProvider": "Aktuellen Provider speichern",
       "showApiKey": "API-Key anzeigen",
@@ -1161,14 +1160,6 @@
         }
       }
     },
-    "openClaw": {
-      "gatewayConfig": "Gateway-Konfiguration",
-      "gatewayDescription": "OpenClaw-Gateway-Verbindung konfigurieren. Unterstützt lokales oder entferntes Gateway.",
-      "gatewayUrlHint": "Leer lassen, um gateway.remote.url aus der lokalen openclaw-Konfiguration zu verwenden.",
-      "gatewayTokenPlaceholder": "Gateway-Auth-Token",
-      "gatewayTokenHint": "Wenn möglich token-file statt Klartext-Token verwenden; über openclaw CLI konfigurieren.",
-      "sessionKeyHint": "Optional. Gateway-Session-Key angeben; leer lassen für automatische Zuweisung einer isolierten Session."
-    },
     "hermes": {
       "configManagement": "Hermes-Konfiguration",
       "configDescription": "Hermes verwaltet seine eigenen Anmeldedaten in ~/.hermes/.env und die Einstellungen in ~/.hermes/config.yaml. Wähle einen Anbieter und lege dann den API-Schlüssel und das Modell fest – codeg schreibt beide Dateien für dich.",
@@ -1368,8 +1359,6 @@
       "openCodeConfigSynced": "OpenCode-Konfiguration und auth JSON wurden synchronisiert.",
       "openCodeSaved": "OpenCode-Konfiguration gespeichert",
       "saveOpenCodeFailed": "Speichern der OpenCode-Konfiguration fehlgeschlagen",
-      "openClawSaved": "OpenClaw-Konfiguration gespeichert",
-      "saveOpenClawFailed": "Speichern der OpenClaw-Konfiguration fehlgeschlagen",
       "configSaved": "Konfiguration gespeichert",
       "configSavedHint": "Bestehende Sitzungen müssen neu geöffnet werden, damit die Änderungen wirksam werden",
       "saveConfigManagementFailed": "Speichern der Konfigurationsverwaltung fehlgeschlagen",

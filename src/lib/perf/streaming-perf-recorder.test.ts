@@ -31,7 +31,9 @@ describe("StreamingPerfRecorder", () => {
 
   it("matches a delivery to its commit and next paint", () => {
     const clock = manualClock()
-    let pendingPaintRaf: FrameRequestCallback | null = null
+    let pendingPaintRaf: FrameRequestCallback = () => {
+      throw new Error("paint callback was not scheduled")
+    }
     const deferredRaf = (callback: FrameRequestCallback): number => {
       pendingPaintRaf = callback
       return 1
@@ -58,7 +60,7 @@ describe("StreamingPerfRecorder", () => {
     const committed = recorder.markReactCommit()
     expect(committed).toEqual([7])
     clock.set(12)
-    pendingPaintRaf?.(12)
+    pendingPaintRaf(12)
     expect(recorder.snapshot().batchToPaintMs).toEqual([12])
   })
 
@@ -66,7 +68,9 @@ describe("StreamingPerfRecorder", () => {
     // Simulates rapid React re-renders: multiple commits drain pending IDs
     // before the browser paints; coalesced RAF must still flush all of them.
     const clock = manualClock()
-    let pendingPaintRaf: FrameRequestCallback | null = null
+    let pendingPaintRaf: FrameRequestCallback = () => {
+      throw new Error("paint callback was not scheduled")
+    }
     let rafSchedules = 0
     const deferredRaf = (callback: FrameRequestCallback): number => {
       pendingPaintRaf = callback
@@ -108,7 +112,7 @@ describe("StreamingPerfRecorder", () => {
     expect(recorder.snapshot().batchToPaintMs).toEqual([])
 
     clock.set(10)
-    pendingPaintRaf?.(10)
+    pendingPaintRaf(10)
     // delivery 1 received at 0 → 10ms; delivery 2 received at 4 → 6ms
     expect(recorder.snapshot().batchToPaintMs).toEqual([10, 6])
     expect(recorder.snapshot().pipelineCounts.paints).toBe(1)
@@ -268,7 +272,9 @@ describe("StreamingPerfRecorder", () => {
 
   it("freezes cadence duration so quiet drain does not inflate UPS window", async () => {
     const clock = manualClock()
-    let pendingPaintRaf: FrameRequestCallback | null = null
+    let pendingPaintRaf: FrameRequestCallback = () => {
+      throw new Error("paint callback was not scheduled")
+    }
     const deferredRaf = (callback: FrameRequestCallback): number => {
       pendingPaintRaf = callback
       return 1
@@ -311,7 +317,7 @@ describe("StreamingPerfRecorder", () => {
     clock.set(15)
     recorder.markReactCommit()
     clock.set(20)
-    pendingPaintRaf?.(20)
+    pendingPaintRaf(20)
 
     // Start quiet wait at t=20; freeze should use lastActivity (~20), not t after drain.
     const quiet = recorder.waitForQuiet(250, 5_000)

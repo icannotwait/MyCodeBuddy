@@ -99,7 +99,7 @@ pub async fn fresh_in_memory_db() -> AppDatabase {
     AppDatabase { conn }
 }
 
-/// Open a database at the last schema version before v2-only triggers are installed.
+/// Open a database before v2-only triggers, with current-entity compatibility migrations.
 pub async fn historical_completion_protocol_db_before_v2_only() -> AppDatabase {
     let conn = Database::connect("sqlite::memory:")
         .await
@@ -113,7 +113,11 @@ pub async fn historical_completion_protocol_db_before_v2_only() -> AppDatabase {
     BeforeCompletionProtocolV2Only::up(&conn, None)
         .await
         .expect("run predecessor migrations");
-    AppDatabase { conn }
+    let db = AppDatabase { conn };
+    crate::db::migration::install_for_historical_completion_fixture(&db)
+        .await
+        .expect("install historical fixture compatibility migrations");
+    db
 }
 
 /// Install all migrations that follow the historical fixture boundary.

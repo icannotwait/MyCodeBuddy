@@ -60,6 +60,7 @@ const folder = (overrides: Partial<FolderDetail> = {}): FolderDetail => ({
   path: "/home/me/root",
   git_branch: null,
   default_agent_type: null,
+  last_agent_type: null,
   last_opened_at: "2026-08-03T00:00:00Z",
   sort_order: 1,
   color: "inherit",

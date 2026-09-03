@@ -78,7 +78,7 @@ Codeg（Code Generation）是一個多智慧體編碼工作台，它將多個智
 
 ![Codeg Light](../images/workspace-light.png#gh-light-mode-only)
 ![Codeg Dark](../images/workspace-dark.png#gh-dark-mode-only)
-Claude Code · Codex · Gemini · OpenClaw · OpenCode · Cline · Hermes · CodeBuddy · Kimi Code · Pi · Grok · Cursor · DeepSeek Harness · Qoder · Google Antigravity
+Claude Code · Codex · Gemini · OpenCode · Cline · Hermes · CodeBuddy · Kimi Code · Pi · Grok · Cursor · DeepSeek Harness · Qoder · Google Antigravity
 
 ## 多智慧體協作
 

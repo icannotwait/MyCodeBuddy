@@ -2963,6 +2963,7 @@ export const ToolCallPart = memo(function ToolCallPart({
     return (
       <ResumedDelegationCard
         toolCallId={part.toolCallId}
+        parentConversationId={parentConversationId}
         input={part.input ?? null}
         output={part.output ?? null}
         errorText={part.errorText ?? null}

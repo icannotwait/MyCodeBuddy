@@ -14,6 +14,9 @@ import type {
   FolderDetail,
 } from "@/lib/types"
 
+type OpenFolderById = typeof import("@/lib/api").openFolderById
+type GetGitHead = typeof import("@/lib/api").getGitHead
+
 // Capture the `conversation://changed` handler + reconnect callback the
 // provider registers, plus dispose/unsub spies, so tests can drive events and
 // assert cleanup. `vi.hoisted` runs before the (hoisted) mock factories so they
@@ -35,7 +38,7 @@ const h = vi.hoisted(() => ({
   listOpenFolders: vi.fn(async () => [] as unknown[]),
   listFolderGroups: vi.fn(async () => [] as unknown[]),
   listAllFolders: vi.fn(async () => [] as unknown[]),
-  openFolderById: vi.fn(async (folderId: number) => ({
+  openFolderById: vi.fn<OpenFolderById>(async (folderId) => ({
     id: folderId,
     name: `folder-${folderId}`,
     path: `/repo/folder-${folderId}`,
@@ -48,8 +51,9 @@ const h = vi.hoisted(() => ({
     parent_id: null,
     kind: "regular",
     alias: null,
+    group_id: null,
   })),
-  getGitHead: vi.fn(async () => ({
+  getGitHead: vi.fn<GetGitHead>(async () => ({
     is_repo: false,
     branch: null,
     detached: false,

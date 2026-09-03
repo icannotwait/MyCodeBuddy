@@ -30,6 +30,7 @@ function runningBinding(
     childConversationId: 99,
     agentType: "codex",
     status: "running",
+    task: null,
     taskId: "task-1",
     startedAt: STARTED_AT,
     runtimeStats: emptyRuntimeStats(STARTED_AT),
@@ -82,7 +83,7 @@ function completed(
     task_id: string
     runtime_stats: ReturnType<typeof emptyRuntimeStats>
   }> = {}
-): EventEnvelope {
+): Extract<EventEnvelope, { type: "delegation_completed" }> {
   return {
     seq: 2,
     connection_id: "p1",

@@ -5,6 +5,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest"
 import { ResumedDelegationCard } from "./resumed-delegation-card"
 import enMessages from "@/i18n/messages/en.json"
 import type { DelegationBinding } from "@/contexts/delegation-context"
+import { delegationRunSnapshotCache } from "@/lib/delegation-run-snapshot"
 import { emptyRuntimeStats } from "@/lib/types"
 
 // Binding resolution lives in `useDelegatedSubSession`; this card's angle on it
@@ -50,6 +51,9 @@ vi.mock("@/components/message/sub-agent-session-dialog", () => ({
 const { useDelegatedSubSession } =
   await import("@/hooks/use-delegated-sub-session")
 const mockedSubSession = vi.mocked(useDelegatedSubSession)
+const ensureRunSnapshot = vi
+  .spyOn(delegationRunSnapshotCache, "ensure")
+  .mockImplementation(() => {})
 
 function renderWithIntl(ui: React.ReactElement) {
   return render(
@@ -80,6 +84,7 @@ const PERSISTED_ACK = JSON.stringify({
 
 describe("ResumedDelegationCard", () => {
   beforeEach(() => {
+    ensureRunSnapshot.mockClear()
     mockedSubSession.mockReset()
     mockedSubSession.mockReturnValue({
       binding: undefined,
@@ -87,6 +92,20 @@ describe("ResumedDelegationCard", () => {
       loading: false,
       error: null,
     })
+  })
+
+  it("queries the durable run with the parent conversation id", () => {
+    renderWithIntl(
+      <ResumedDelegationCard
+        toolCallId="tu-resume"
+        parentConversationId={42}
+        input={RESUME_INPUT}
+        output={PERSISTED_ACK}
+        state="output-available"
+      />
+    )
+
+    expect(ensureRunSnapshot).toHaveBeenCalledWith(42, TASK_ID)
   })
 
   // The reported bug: reopening the conversation from history showed only a

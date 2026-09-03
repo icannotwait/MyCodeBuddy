@@ -4378,7 +4378,6 @@ describe("document translation transient tabs", () => {
         beginTranslateRequest,
         openTranslationResultTab,
         openFilePreview,
-        switchFileTab,
         fileTabs,
         activeFileTab,
       } = useWorkspaceContext()

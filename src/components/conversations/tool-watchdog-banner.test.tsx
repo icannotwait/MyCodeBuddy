@@ -10,10 +10,15 @@ import {
   ToolWatchdogBanner,
 } from "./tool-watchdog-banner"
 
+type ExtendToolWatchdogLease =
+  typeof import("@/lib/api").extendToolWatchdogLease
+type CancelToolWatchdogLease =
+  typeof import("@/lib/api").cancelToolWatchdogLease
+
 const h = vi.hoisted(() => ({
   projections: {} as Record<string, ToolWatchdogProjection>,
-  extend: vi.fn(async () => undefined),
-  cancel: vi.fn(async () => undefined),
+  extend: vi.fn<ExtendToolWatchdogLease>(async () => undefined),
+  cancel: vi.fn<CancelToolWatchdogLease>(async () => undefined),
 }))
 
 vi.mock("@/hooks/use-connection", () => ({
@@ -23,8 +28,8 @@ vi.mock("@/hooks/use-connection", () => ({
 }))
 
 vi.mock("@/lib/api", () => ({
-  extendToolWatchdogLease: (...args: unknown[]) => h.extend(...args),
-  cancelToolWatchdogLease: (...args: unknown[]) => h.cancel(...args),
+  extendToolWatchdogLease: h.extend,
+  cancelToolWatchdogLease: h.cancel,
 }))
 
 vi.mock("sonner", () => ({
@@ -198,7 +203,7 @@ describe("tool-watchdog pure helpers", () => {
         phase: "warning",
       }),
     }
-    let maxVersionByLease = { ...floors }
+    let maxVersionByLease: Record<string, number> = { ...floors }
 
     ;({ map, maxVersionByLease } = reduceToolWatchdogProjection(
       map,

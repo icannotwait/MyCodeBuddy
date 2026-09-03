@@ -3,7 +3,7 @@ import type {
   LiveMessage,
   ToolCallInfo,
 } from "@/contexts/acp-connections-context"
-import type { EventEnvelope, PlanEntryInfo } from "@/lib/types"
+import type { AcpEvent, EventEnvelope, PlanEntryInfo } from "@/lib/types"
 import { buildStreamingTurnsFromLiveMessage } from "@/stores/conversation-runtime-store"
 import {
   applyEventsToCanonicalLiveMessage,
@@ -29,13 +29,13 @@ function liveMessageWithText(
 function envelope(
   seq: number,
   connectionId: string,
-  payload: Omit<EventEnvelope, "seq" | "connection_id">
+  payload: AcpEvent
 ): EventEnvelope {
   return {
     connection_id: connectionId,
     seq,
     ...payload,
-  } as EventEnvelope
+  }
 }
 
 function toolCreate(

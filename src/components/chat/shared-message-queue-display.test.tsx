@@ -3,14 +3,23 @@ import { NextIntlClientProvider } from "next-intl"
 import { afterEach, describe, expect, it, vi } from "vitest"
 
 import enMessages from "@/i18n/messages/en.json"
-import type { SharedQueuedPrompt } from "@/lib/snapshot-denormalize"
-import type { EventEnvelope } from "@/lib/types"
+import type {
+  SharedActiveTurn,
+  SharedQueuedPrompt,
+  SnapshotPatch,
+} from "@/lib/snapshot-denormalize"
 import {
   __connectionsReducerForTests,
   type ConnectionState,
 } from "@/contexts/acp-connections-context"
 
 import { SharedMessageQueueDisplay } from "./shared-message-queue-display"
+
+type ConnectionsAction = Parameters<typeof __connectionsReducerForTests>[1]
+type SharedSessionEvent = Extract<
+  ConnectionsAction,
+  { type: "SHARED_SESSION_EVENT" }
+>["event"]
 
 function queued(
   queueItemId: string,
@@ -57,37 +66,100 @@ function renderQueue(
   )
 }
 
-function initialSharedConnection(): Map<string, ConnectionState> {
-  return new Map([
-    [
-      "tab-1",
-      {
-        connectionId: "conn-1",
-        lastAppliedSeq: 0,
-        sharedSession: {
-          generation: 1,
-          queue: [],
-          activeTurn: null,
-        },
-      } as ConnectionState,
-    ],
-  ])
+function initialSharedConnection(
+  queue: SharedQueuedPrompt[] = [],
+  lastAppliedSeq = 0
+): Map<string, ConnectionState> {
+  let state = __connectionsReducerForTests(new Map(), {
+    type: "CONNECTION_CREATED",
+    contextKey: "tab-1",
+    connectionId: "conn-1",
+    agentType: "codex",
+    workingDir: null,
+    sharedSession: {
+      generation: 1,
+      leaseId: "lease-1",
+      leaseExpiresAt: "2026-08-16T00:05:00.000Z",
+      connectRequestId: "request-1",
+      phase: { phase: "ready" },
+      queue,
+      activeTurn: null,
+    },
+  })
+  if (lastAppliedSeq > 0) {
+    state = __connectionsReducerForTests(state, {
+      type: "EVENT_APPLIED",
+      contextKey: "tab-1",
+      seq: lastAppliedSeq,
+    })
+  }
+  return state
+}
+
+function snapshotPatch(
+  eventSeq: number,
+  activeTurn: SharedActiveTurn | null = null
+): SnapshotPatch {
+  return {
+    connectionId: "conn-1",
+    conversationId: null,
+    status: "connected",
+    sessionId: null,
+    modes: null,
+    configOptions: null,
+    availableCommands: null,
+    usage: null,
+    liveMessage: null,
+    pendingPermission: null,
+    pendingAskQuestion: null,
+    pendingPlanApproval: null,
+    pendingUserMessage: null,
+    promptCapabilities: {
+      image: false,
+      audio: false,
+      embedded_context: false,
+    },
+    selectorsReady: true,
+    supportsFork: false,
+    configStale: false,
+    configStaleKind: null,
+    backgroundOutstanding: 0,
+    backgroundDetailRevision: 0,
+    backgroundTranscriptGeneration: 0,
+    sessionFailures: [],
+    lastError: null,
+    lastErrorDetails: null,
+    eventSeq,
+    activeDelegations: [],
+    delegationRoute: null,
+    waitingForSubagents: null,
+    toolWatchdogProjections: {},
+    toolWatchdogMaxVersions: {},
+    lastToolWatchdogDiagnostic: null,
+    sharedSession: {
+      generation: 1,
+      phase: { phase: "ready" },
+      queue: [],
+      activeTurn,
+      leaseExpiresAt: null,
+    },
+  }
 }
 
 function reduceSharedEvent(
   state: Map<string, ConnectionState>,
-  event: EventEnvelope
+  event: SharedSessionEvent
 ): Map<string, ConnectionState> {
   const reduced = __connectionsReducerForTests(state, {
     type: "SHARED_SESSION_EVENT",
     contextKey: "tab-1",
     event,
-  } as never)
+  })
   return __connectionsReducerForTests(reduced, {
     type: "EVENT_APPLIED",
     contextKey: "tab-1",
     seq: event.seq,
-  } as never)
+  })
 }
 
 function failedLifecycleState(): Map<string, ConnectionState> {
@@ -112,24 +184,13 @@ function hydrateEmptyQueue(
   return __connectionsReducerForTests(state, {
     type: "HYDRATE_FROM_SNAPSHOT",
     contextKey: "tab-1",
-    patch: {
-      connectionId: "conn-1",
-      eventSeq,
-      sharedSession: {
-        generation: 1,
-        phase: { phase: "ready" },
-        queue: [],
-        activeTurn: null,
-        leaseExpiresAt: null,
-      },
-    },
-  } as never)
+    patch: snapshotPatch(eventSeq),
+  })
 }
 
-function queuedEvent(seq = 1): EventEnvelope {
+function queuedEvent(seq = 1): SharedSessionEvent {
   return {
     seq,
-    connection_id: "conn-1",
     type: "prompt_queued",
     generation: 1,
     item: {
@@ -145,10 +206,9 @@ function queuedEvent(seq = 1): EventEnvelope {
   }
 }
 
-function dispatchStartedEvent(seq = 2): EventEnvelope {
+function dispatchStartedEvent(seq = 2): SharedSessionEvent {
   return {
     seq,
-    connection_id: "conn-1",
     type: "prompt_dispatch_started",
     generation: 1,
     turn: {
@@ -161,10 +221,9 @@ function dispatchStartedEvent(seq = 2): EventEnvelope {
   }
 }
 
-function failedEvent(seq = 3): EventEnvelope {
+function failedEvent(seq = 3): SharedSessionEvent {
   return {
     seq,
-    connection_id: "conn-1",
     type: "prompt_queue_item_failed",
     generation: 1,
     queue_item_id: "q2",
@@ -175,10 +234,9 @@ function failedEvent(seq = 3): EventEnvelope {
 function settledEvent(
   outcome: "completed" | "cancelled" | "failed",
   seq = 4
-): EventEnvelope {
+): SharedSessionEvent {
   return {
     seq,
-    connection_id: "conn-1",
     type: "shared_turn_settled",
     generation: 1,
     turn_id: "turn-q2",
@@ -235,46 +293,23 @@ describe("SharedMessageQueueDisplay", () => {
 
   it("keeps a reducer-failed prompt visible across hydrate with a local dismiss action", () => {
     const initialQueue = [queued("q2", 2, "do not lose me")]
-    const initial = new Map([
-      [
-        "tab-1",
-        {
-          connectionId: "conn-1",
-          lastAppliedSeq: 7,
-          sharedSession: {
-            generation: 1,
-            queue: initialQueue,
-          },
-        } as ConnectionState,
-      ],
-    ])
+    const initial = initialSharedConnection(initialQueue, 7)
     const reduced = __connectionsReducerForTests(initial, {
       type: "SHARED_SESSION_EVENT",
       contextKey: "tab-1",
       event: {
         seq: 7,
-        connection_id: "conn-1",
         type: "prompt_queue_item_failed",
         generation: 1,
         queue_item_id: "q2",
         error_code: "prompt_hydration_failed",
       },
-    } as never)
+    })
     const hydrated = __connectionsReducerForTests(reduced, {
       type: "HYDRATE_FROM_SNAPSHOT",
       contextKey: "tab-1",
-      patch: {
-        connectionId: "conn-1",
-        eventSeq: 7,
-        sharedSession: {
-          generation: 1,
-          phase: { phase: "ready" },
-          queue: [],
-          activeTurn: null,
-          leaseExpiresAt: null,
-        },
-      },
-    } as never)
+      patch: snapshotPatch(7),
+    })
     const queue = hydrated.get("tab-1")?.sharedSession?.queue ?? []
     const onCancel = vi.fn(async () => {})
     const onDismissFailed = vi.fn()
@@ -340,7 +375,7 @@ describe("SharedMessageQueueDisplay", () => {
       type: "DISMISS_FAILED_SHARED_PROMPT",
       contextKey: "tab-1",
       queueItemId: "q2",
-    } as never)
+    })
     expect(dismissed.get("tab-1")?.sharedSession?.queue).toEqual([])
   })
 
@@ -380,24 +415,14 @@ describe("SharedMessageQueueDisplay", () => {
     state = __connectionsReducerForTests(state, {
       type: "HYDRATE_FROM_SNAPSHOT",
       contextKey: "tab-1",
-      patch: {
-        connectionId: "conn-1",
-        eventSeq: 2,
-        sharedSession: {
-          generation: 1,
-          phase: { phase: "ready" },
-          queue: [],
-          activeTurn: {
-            turnId: "turn-q2",
-            queueItemId: "q2",
-            enqueueSeq: 2,
-            clientMessageId: "m-q2",
-            stopRequested: false,
-          },
-          leaseExpiresAt: null,
-        },
-      },
-    } as never)
+      patch: snapshotPatch(2, {
+        turnId: "turn-q2",
+        queueItemId: "q2",
+        enqueueSeq: 2,
+        clientMessageId: "m-q2",
+        stopRequested: false,
+      }),
+    })
     state = reduceSharedEvent(state, failedEvent())
     state = reduceSharedEvent(state, settledEvent("failed"))
 
@@ -428,7 +453,7 @@ describe("SharedMessageQueueDisplay", () => {
       type: "DISMISS_FAILED_SHARED_PROMPT",
       contextKey: "tab-1",
       queueItemId: "q2",
-    } as never)
+    })
 
     expect(dismissed.get("tab-1")?.sharedSession?.queue).toEqual([])
   })

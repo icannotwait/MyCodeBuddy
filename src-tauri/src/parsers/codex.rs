@@ -3817,30 +3817,6 @@ impl CodexParser {
                                         });
                                         continue;
                                     }
-                                } else if role == "assistant" {
-                                    if let Some(text) = extract_codex_output_text(payload) {
-                                        let provider_id = payload_provider_id(payload);
-                                        if !adopt_duplicate_assistant_text(
-                                            &mut messages,
-                                            &text,
-                                            provider_id.as_deref(),
-                                        ) {
-                                            messages.push(UnifiedMessage {
-                                                id: provider_id.unwrap_or_else(|| {
-                                                    format!("assistant-{}", messages.len())
-                                                }),
-                                                role: MessageRole::Assistant,
-                                                content: vec![ContentBlock::Text { text }],
-                                                timestamp,
-                                                usage: None,
-                                                duration_ms: None,
-                                                model: None,
-                                                completed_at: Some(timestamp),
-
-                                                reasoning_effort: None,
-                                            });
-                                        }
-                                    }
                                 }
 
                                 // Everything the arm above did not emit: text-only
@@ -4660,26 +4636,6 @@ fn native_span_covers(span: &CodexNativeTurnSpan, ts: DateTime<Utc>) -> bool {
     }
 }
 
-fn extract_codex_output_text(payload: &serde_json::Value) -> Option<String> {
-    let content = payload.get("content")?.as_array()?;
-    let mut parts = Vec::new();
-    for item in content {
-        if item.get("type").and_then(|t| t.as_str()) != Some("output_text") {
-            continue;
-        }
-        if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
-            if !text.is_empty() {
-                parts.push(text);
-            }
-        }
-    }
-    if parts.is_empty() {
-        None
-    } else {
-        Some(parts.join(""))
-    }
-}
-
 fn adopt_duplicate_assistant_text(
     messages: &mut [UnifiedMessage],
     text: &str,
@@ -5182,6 +5138,12 @@ impl ResponseItemPromotion {
             self.task_segments.push(SegmentCoverage::default());
         } else if msg_type == "turn_context" {
             self.ctx_segments.push(SegmentCoverage::default());
+        } else if msg_type == "event_msg" && payload_type == "user_message" {
+            // Interrupted turns can omit both `task_complete` and the next
+            // `task_started`. A later user message still starts a new turn, but
+            // only split when an assistant fallback is actually waiting; a
+            // normal response-item user twin must keep this event's coverage.
+            self.split_after_pending_assistant();
         }
 
         // Canonical-channel coverage — "did the event channel already speak for
@@ -5226,6 +5188,9 @@ impl ResponseItemPromotion {
     /// deny-lists passed, blocks non-empty). Returns its candidate index, which
     /// is also its index into the caller's own parallel payload vector.
     fn push_candidate(&mut self, ordinal: u64, is_user: bool) -> usize {
+        if is_user {
+            self.split_after_pending_assistant();
+        }
         let index = self.candidates.len();
         self.candidates.push(PromotionCandidate {
             ordinal,
@@ -5238,6 +5203,23 @@ impl ResponseItemPromotion {
             self.compaction_watch = Some(index);
         }
         index
+    }
+
+    fn split_after_pending_assistant(&mut self) {
+        let task_seg = self.task_segments.len() - 1;
+        let ctx_seg = self.ctx_segments.len() - 1;
+        let split_task = self.candidates.iter().any(|candidate| {
+            !candidate.denied && !candidate.is_user && candidate.task_seg == task_seg
+        });
+        let split_ctx = self.candidates.iter().any(|candidate| {
+            !candidate.denied && !candidate.is_user && candidate.ctx_seg == ctx_seg
+        });
+        if split_task {
+            self.task_segments.push(SegmentCoverage::default());
+        }
+        if split_ctx {
+            self.ctx_segments.push(SegmentCoverage::default());
+        }
     }
 
     /// Which candidates survive, as a mask parallel to `candidates` (and to the
@@ -6637,6 +6619,23 @@ earlier terminal context records.\n\
         "\n",
     );
 
+    const INCOMPLETE_GOAL_WITH_CANONICAL_FOLLOW_UP_JSONL: &str = concat!(
+        r#"{"timestamp":"2026-08-18T00:00:00Z","type":"session_meta","payload":{"id":"01abc","cwd":"/tmp"}}"#,
+        "\n",
+        r#"{"timestamp":"2026-08-18T00:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn_goal_1"}}"#,
+        "\n",
+        r#"{"timestamp":"2026-08-18T00:00:02Z","type":"response_item","payload":{"type":"message","role":"user","id":"msg_hidden","content":[{"type":"input_text","text":"<codex_internal_context source=\"goal\">\nContinue working toward the active thread goal.\n</codex_internal_context>"}]}}"#,
+        "\n",
+        r#"{"timestamp":"2026-08-18T00:00:03Z","type":"response_item","payload":{"type":"message","role":"assistant","id":"msg_live","content":[{"type":"output_text","text":"working"}]}}"#,
+        "\n",
+        r#"{"timestamp":"2026-08-18T00:00:04Z","type":"response_item","payload":{"type":"message","role":"user","id":"msg_follow_up","content":[{"type":"input_text","text":"follow up"}]}}"#,
+        "\n",
+        r#"{"timestamp":"2026-08-18T00:00:05Z","type":"event_msg","payload":{"type":"user_message","message":"follow up"}}"#,
+        "\n",
+        r#"{"timestamp":"2026-08-18T00:00:06Z","type":"event_msg","payload":{"type":"agent_message","message":"later"}}"#,
+        "\n",
+    );
+
     #[test]
     fn rollout_watermark_ignores_trailing_partial_line() {
         let complete = concat!(
@@ -6792,21 +6791,17 @@ earlier terminal context records.\n\
 
     #[test]
     fn later_user_turn_is_not_swallowed_by_an_incomplete_goal_span() {
-        let jsonl = concat!(
-            r#"{"timestamp":"2026-08-18T00:00:00Z","type":"session_meta","payload":{"id":"01abc","cwd":"/tmp"}}"#,
-            "\n",
-            r#"{"timestamp":"2026-08-18T00:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn_goal_1"}}"#,
-            "\n",
-            r#"{"timestamp":"2026-08-18T00:00:02Z","type":"response_item","payload":{"type":"message","role":"user","id":"msg_hidden","content":[{"type":"input_text","text":"<codex_internal_context source=\"goal\">\nContinue working toward the active thread goal.\n</codex_internal_context>"}]}}"#,
-            "\n",
-            r#"{"timestamp":"2026-08-18T00:00:03Z","type":"response_item","payload":{"type":"message","role":"assistant","id":"msg_live","content":[{"type":"output_text","text":"working"}]}}"#,
-            "\n",
-            r#"{"timestamp":"2026-08-18T00:00:04Z","type":"event_msg","payload":{"type":"user_message","message":"follow up"}}"#,
-            "\n",
-            r#"{"timestamp":"2026-08-18T00:00:05Z","type":"event_msg","payload":{"type":"agent_message","message":"later"}}"#,
-            "\n",
+        let detail = parse_path(&write_rollout(
+            INCOMPLETE_GOAL_WITH_CANONICAL_FOLLOW_UP_JSONL,
+        ));
+        assert_eq!(
+            turn_texts(&detail),
+            vec![
+                ("assistant", Some("working".into())),
+                ("user", Some("follow up".into())),
+                ("assistant", Some("later".into())),
+            ]
         );
-        let detail = parse_path(&write_rollout(jsonl));
         let assistants: Vec<&MessageTurn> = detail
             .turns
             .iter()
@@ -6823,6 +6818,16 @@ earlier terminal context records.\n\
         assert!(
             matches!(&assistants[1].blocks[0], ContentBlock::Text { text } if text.contains("later"))
         );
+    }
+
+    #[test]
+    fn incomplete_goal_with_canonical_follow_up_has_matching_summary_count() {
+        let summary = summary_of(
+            "incomplete-goal-canonical-follow-up",
+            INCOMPLETE_GOAL_WITH_CANONICAL_FOLLOW_UP_JSONL,
+        );
+
+        assert_eq!(summary.message_count, 3);
     }
 
     #[test]

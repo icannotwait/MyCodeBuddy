@@ -19,19 +19,15 @@ function batch(
   return { batch_id, events }
 }
 
-function event(
+function event<T extends AcpEvent>(
   connection_id: string,
   seq: number,
-  payload: AcpEvent
-): EventEnvelope {
+  payload: T
+) {
   return { connection_id, seq, ...payload }
 }
 
-function content(
-  connectionId: string,
-  seq: number,
-  text: string
-): EventEnvelope {
+function content(connectionId: string, seq: number, text: string) {
   return event(connectionId, seq, { type: "content_delta", text })
 }
 

@@ -288,6 +288,7 @@ function makeConnState(overrides: Partial<ConnectionState>): ConnectionState {
     sessionFailures: [],
     error: null,
     loadError: null,
+    loadErrorCode: null,
     loadErrorCommand: null,
     lastAppliedSeq: 0,
     isDelegationChild: true,
@@ -299,7 +300,9 @@ function makeConnState(overrides: Partial<ConnectionState>): ConnectionState {
     configStaleKind: null,
     configStaleDismissed: false,
     backgroundOutstanding: 0,
+    backgroundSettleSyncingSince: null,
     outOfTurnToolCalls: null,
+    sharedSession: null,
     ...overrides,
   }
 }

@@ -490,6 +490,7 @@ mod tests {
                 feedback: false,
                 ask: false,
                 sessions: false,
+                compact_catalog: false,
                 workflow_v2: true,
                 completion_v2: false,
             },

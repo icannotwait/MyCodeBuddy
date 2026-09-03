@@ -20,7 +20,6 @@ vi.mock("@/lib/api", () => ({
   openFolderById: (...args: unknown[]) => openFolderByIdApi(...args),
   openWorktreeFolder: (...args: unknown[]) => openWorktreeFolderApi(...args),
   removeFolderFromWorkspace: vi.fn(),
-  reorderFolders: vi.fn(),
   getFolder: vi.fn(),
 }))
 
@@ -56,9 +55,11 @@ import type { FolderDetail } from "@/lib/types"
 function makeFolder(
   overrides: Partial<FolderDetail> & { id: number; path: string }
 ): FolderDetail {
+  const { id, path, ...rest } = overrides
   return {
-    name: overrides.name ?? `folder-${overrides.id}`,
-    path: overrides.path,
+    id,
+    name: overrides.name ?? `folder-${id}`,
+    path,
     git_branch: null,
     default_agent_type: overrides.default_agent_type ?? null,
     last_agent_type: overrides.last_agent_type ?? null,
@@ -68,7 +69,8 @@ function makeFolder(
     parent_id: null,
     kind: "regular",
     alias: null,
-    ...overrides,
+    group_id: null,
+    ...rest,
   }
 }
 

@@ -5,6 +5,7 @@ import type {
   WorkflowGraphSnapshot,
   WorkflowNodeSnapshot,
 } from "@/lib/types"
+import type { CompletionDecisionResolvedEventPayload } from "@/lib/api"
 
 const {
   WORKFLOW_GRAPH_CHANGED_EVENT,
@@ -646,7 +647,7 @@ describe("workflow-graph-store revision gate", () => {
         }),
       ],
     })
-    const event = {
+    const event: CompletionDecisionResolvedEventPayload = {
       version: 1,
       event_id: "event-1",
       workflow_id: "wf-1",

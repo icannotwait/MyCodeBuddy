@@ -115,6 +115,10 @@ function emptySession(
     sessionStats: null,
     delegationActivities: [],
     historyAssistantBaseline: null,
+    batchBoundaryIndex: null,
+    batchBoundaryPrefixHash: null,
+    loadingOlderTurns: false,
+    olderTurnsPrependEpoch: 0,
     pendingCleanup: false,
     delegateSyncError: null,
     pendingCancel: null,
@@ -843,10 +847,10 @@ describe("FE11 completion orderings", () => {
   it("transfers an invalidated coordinator to an unchanged durable follower", async () => {
     seedAliasPair()
     const runtimeActions = actions()
-    const outcome = {
-      status: "interrupted" as const,
+    const outcome: TurnOutcome = {
+      status: "interrupted",
       stop_reason: "cancelled",
-      source: "user_stop" as const,
+      source: "user_stop",
       provider_turn_id: PROVIDER,
     }
     for (const conversationId of [VIRTUAL_ALIAS, CID]) {

@@ -13,7 +13,9 @@ import {
   __connectionsReducerForTests,
   __resetWritableConnectionsCloneCount,
   __getWritableConnectionsCloneCount,
+  type ConnectionState,
   type LiveMessage,
+  type LiveMessageSink,
 } from "@/contexts/acp-connections-context"
 import type {
   ConnectionStatus,
@@ -46,7 +48,8 @@ import {
   isFrontendDisconnectSuppressed,
   isTransferringOut,
 } from "@/lib/conversation-popout-acp-bridge"
-import type { AttachHandlers } from "@/lib/transport/types"
+import type { AttachHandlers, EventStream } from "@/lib/transport/types"
+import type { LiveTranscriptFrameSink } from "@/stores/live-transcript-store"
 import type {
   AcpEventMetricsSnapshot,
   EventEnvelope,
@@ -62,8 +65,11 @@ import type {
 // no-op) and `connectAsViewer` / the owner spawn both route through
 // `stream.attach`.
 const h = vi.hoisted(() => {
-  const attach = vi.fn(() => ({ detach: vi.fn() }))
-  const stream = { attach }
+  const attach = vi.fn<EventStream["attach"]>(() => ({
+    subscriptionId: "test-subscription",
+    detach: vi.fn(),
+  }))
+  const stream: EventStream = { attach }
   const rafQueue: FrameRequestCallback[] = []
   const subscribeHandlers = new Map<string, (payload: unknown) => void>()
   const state: {
@@ -75,7 +81,7 @@ const h = vi.hoisted(() => {
     stream,
     // getEventStream() returns this — default the web/attach stub; set to null
     // per-test to exercise the desktop firehose path.
-    eventStreamValue: stream as { attach: typeof attach } | null,
+    eventStreamValue: stream as EventStream | null,
     actions: null as unknown as ReturnType<typeof useAcpActions> | null,
     store: null as unknown as ReturnType<typeof useConnectionStore> | null,
     // api spies
@@ -1469,7 +1475,7 @@ describe("AcpConnectionsProvider shared server roots", () => {
         "user",
         "assistant",
       ])
-      expect(runtime?.localTurns.at(-1)?.blocks).toEqual([
+      expect(runtime?.localTurns.slice(-1)[0]?.blocks).toEqual([
         { type: "text", text: "reply A" },
       ])
       expect(h.store!.getConnection(TAB)).toMatchObject({
@@ -2367,11 +2373,13 @@ describe("AcpConnectionsProvider shared server roots", () => {
     act(() => latestAttachHandlers().onDetached("lease_expired"))
     await waitFor(() => expect(h.acpConnectOrAttach).toHaveBeenCalledTimes(2))
 
-    expect(h.attach.mock.calls.at(-1)?.[1]).toMatchObject({
+    expect(h.attach.mock.calls.slice(-1)[0]?.[1]).toMatchObject({
       sinceSeq: 7,
       shared: { generation: 1, leaseId: "lease-2" },
     })
-    expect(h.attach.mock.calls.at(-1)?.[1]).not.toHaveProperty("reconnectMode")
+    expect(h.attach.mock.calls.slice(-1)[0]?.[1]).not.toHaveProperty(
+      "reconnectMode"
+    )
     expect(h.acpConnectOrAttach.mock.calls[1]?.[0].requestId).toBe(
       h.acpConnectOrAttach.mock.calls[0]?.[0].requestId
     )
@@ -2495,18 +2503,16 @@ describe("AcpConnectionsProvider shared server roots", () => {
     act(() => latestAttachHandlers().onDetached("session_replaced"))
     await waitFor(() => expect(h.acpConnectOrAttach).toHaveBeenCalledTimes(2))
 
-    expect(h.attach.mock.calls.at(-1)?.[1]).toMatchObject({
+    expect(h.attach.mock.calls.slice(-1)[0]?.[1]).toMatchObject({
       reconnectMode: "cold",
       shared: { generation: 2, leaseId: "lease-2" },
     })
-    expect(h.attach.mock.calls.at(-1)?.[1]).not.toHaveProperty("sinceSeq")
+    expect(h.attach.mock.calls.slice(-1)[0]?.[1]).not.toHaveProperty("sinceSeq")
   })
 
   it("coalesces duplicate shared detach reconnect signals into one broker call", async () => {
     h.isDesktop = false
-    let resolveReconnect:
-      | ((response: ReturnType<typeof sharedResponse>) => void)
-      | null = null
+    let resolveReconnect!: (response: ReturnType<typeof sharedResponse>) => void
     const reconnectResponse = new Promise<ReturnType<typeof sharedResponse>>(
       (resolve) => {
         resolveReconnect = resolve
@@ -2525,7 +2531,7 @@ describe("AcpConnectionsProvider shared server roots", () => {
       handlers.onDetached("generation_stale")
     })
     await waitFor(() => expect(h.acpConnectOrAttach).toHaveBeenCalledTimes(2))
-    resolveReconnect?.(sharedResponse({ leaseId: "lease-2" }))
+    resolveReconnect(sharedResponse({ leaseId: "lease-2" }))
     await waitFor(() => expect(h.attach).toHaveBeenCalledTimes(2))
   })
 
@@ -2535,7 +2541,11 @@ describe("AcpConnectionsProvider shared server roots", () => {
       .mockResolvedValueOnce(
         sharedResponse({
           phase: "failed",
-          error: { code: "bootstrap_failed", cleanupComplete: true },
+          error: {
+            code: "bootstrap_failed",
+            retryable: true,
+            cleanupComplete: true,
+          },
         })
       )
       .mockResolvedValueOnce(
@@ -2668,7 +2678,11 @@ describe("AcpConnectionsProvider shared server roots", () => {
     h.acpConnectOrAttach.mockResolvedValue(
       sharedResponse({
         phase: "failed",
-        error: { code: "bootstrap_failed", cleanupComplete: false },
+        error: {
+          code: "bootstrap_failed",
+          retryable: true,
+          cleanupComplete: false,
+        },
       })
     )
     await mountProvider()
@@ -2851,7 +2865,7 @@ describe("AcpConnectionsProvider shared server roots", () => {
     })
 
     await expect(h.actions!.cancel(TAB)).resolves.toBeUndefined()
-    expect(h.attach.mock.calls.at(-1)?.[1]).toEqual({
+    expect(h.attach.mock.calls.slice(-1)[0]?.[1]).toEqual({
       reconnectMode: "cold",
       shared: { generation: 1, leaseId: "lease-1" },
     })
@@ -3003,10 +3017,7 @@ beforeEach(() => {
 })
 
 function latestAttachHandlers(): AttachHandlers {
-  const calls = h.attach.mock.calls as unknown as Array<
-    [unknown, unknown, AttachHandlers]
-  >
-  const call = calls[calls.length - 1]
+  const call = h.attach.mock.calls[h.attach.mock.calls.length - 1]
   expect(call).toBeTruthy()
   if (!call) throw new Error("expected attach handlers")
   return call[2]
@@ -4168,6 +4179,7 @@ describe("AcpConnectionsProvider AIR session-failure lifecycle", () => {
       type: "turn_complete",
       session_id: "sess-1",
       stop_reason: "end_turn",
+      mark_awaiting_reply: false,
     })
 
     const failures = h.store!.getConnection(TAB)?.sessionFailures
@@ -4206,6 +4218,7 @@ describe("AcpConnectionsProvider AIR session-failure lifecycle", () => {
       type: "turn_complete",
       session_id: "sess-1",
       stop_reason: "cancelled",
+      mark_awaiting_reply: false,
     })
     expect(h.store!.getConnection(TAB)?.sessionFailures?.[0]).toMatchObject({
       id: "t1:error",
@@ -4225,6 +4238,7 @@ describe("AcpConnectionsProvider AIR session-failure lifecycle", () => {
       type: "turn_complete",
       session_id: "sess-1",
       stop_reason: "end_turn",
+      mark_awaiting_reply: false,
     })
     expect(h.store!.getConnection(TAB)?.sessionFailures?.[0]).toMatchObject({
       id: "t1:error",
@@ -4336,6 +4350,7 @@ describe("AcpConnectionsProvider AIR session-failure lifecycle", () => {
       type: "turn_complete",
       session_id: "sess-1",
       stop_reason: "end_turn",
+      mark_awaiting_reply: false,
     })
     expect(failuresNow()).toMatchObject({ notice: true, err: false })
   })
@@ -5616,7 +5631,7 @@ describe("AcpConnectionsProvider continuation waiting projection", () => {
       terminal: false,
     })
     expect(h.pushAlert).toHaveBeenCalled()
-    let call = h.pushAlert.mock.calls.at(-1)!
+    let call = h.pushAlert.mock.calls.slice(-1)[0]!
     expect(String(call[2])).toContain("backendErrors.parentConnectionLost")
     expect(String(call[2])).not.toMatch(/raw parent lost/i)
 
@@ -5629,7 +5644,7 @@ describe("AcpConnectionsProvider continuation waiting projection", () => {
       code: "suspend_drain_timeout",
       terminal: false,
     })
-    call = h.pushAlert.mock.calls.at(-1)!
+    call = h.pushAlert.mock.calls.slice(-1)[0]!
     expect(String(call[2])).toContain("backendErrors.suspendDrainTimeout")
 
     emitAcpEvent(handlers, {
@@ -5641,7 +5656,7 @@ describe("AcpConnectionsProvider continuation waiting projection", () => {
       code: "arm_failed",
       terminal: false,
     })
-    call = h.pushAlert.mock.calls.at(-1)!
+    call = h.pushAlert.mock.calls.slice(-1)[0]!
     expect(String(call[2])).toContain("backendErrors.continuationFailed")
   })
 })
@@ -5659,9 +5674,9 @@ describe("AcpConnectionsProvider liveMessage sink (mirror out of React)", () => 
   it("fires with isLive=true and a fresh non-null liveMessage when a turn starts", async () => {
     const handlers = await connectOwner()
     const calls: Array<{ content: unknown; isLive: boolean }> = []
-    h.actions!.registerLiveMessageSink(TAB, (lm, isLive) =>
+    h.actions!.registerLiveMessageSink(TAB, (lm, isLive) => {
       calls.push({ content: lm.content, isLive })
-    )
+    })
 
     // status → prompting resets liveMessage to a fresh empty assistant message.
     emitAcpEvent(handlers, {
@@ -5700,9 +5715,9 @@ describe("AcpConnectionsProvider liveMessage sink (mirror out of React)", () => 
   it("relays a subsequent liveMessage change (tool call appended) to the sink", async () => {
     const handlers = await connectOwner()
     const calls: Array<{ len: number; isLive: boolean }> = []
-    h.actions!.registerLiveMessageSink(TAB, (lm, isLive) =>
+    h.actions!.registerLiveMessageSink(TAB, (lm, isLive) => {
       calls.push({ len: lm.content.length, isLive })
-    )
+    })
 
     emitAcpEvent(handlers, {
       seq: 1,
@@ -5753,7 +5768,9 @@ describe("AcpConnectionsProvider liveMessage sink (mirror out of React)", () => 
       seq: 2,
       connection_id: "spawned-conn",
       type: "plan_update",
-      entries: [{ content: "Inspect logs", status: "in_progress" }],
+      entries: [
+        { content: "Inspect logs", priority: "medium", status: "in_progress" },
+      ],
     })
 
     expect(h.recordFrontendTurnTrace).toHaveBeenCalledWith(
@@ -5835,9 +5852,9 @@ describe("AcpConnectionsProvider liveMessage sink (mirror out of React)", () => 
     // otherwise a paused stream (no further delta) would leave the message list
     // blank until the next change.
     const calls: Array<{ len: number; isLive: boolean }> = []
-    h.actions!.registerLiveMessageSink(TAB, (lm, isLive) =>
+    h.actions!.registerLiveMessageSink(TAB, (lm, isLive) => {
       calls.push({ len: lm.content.length, isLive })
-    )
+    })
     expect(calls).toHaveLength(1)
     expect(calls[0]!.isLive).toBe(true) // still prompting
     expect(calls[0]!.len).toBe(1) // the tool_call block already present
@@ -5903,7 +5920,9 @@ describe("AcpConnectionsProvider liveMessage sink (mirror out of React)", () => 
   it("mirrors to the sink BEFORE notifying connection key subscribers", async () => {
     const handlers = await connectOwner()
     const order: string[] = []
-    h.actions!.registerLiveMessageSink(TAB, () => order.push("sink"))
+    h.actions!.registerLiveMessageSink(TAB, () => {
+      order.push("sink")
+    })
     const unsub = h.store!.subscribeKey(TAB, () => order.push("notify"))
 
     emitAcpEvent(handlers, {
@@ -7280,7 +7299,7 @@ describe("AcpConnectionsProvider frame transactions (raw order)", () => {
         .byConversationId.get(42)
       expect(h.store!.getConnection(TAB)?.status).toBe("connected")
       expect(runtime?.liveMessage).toBeNull()
-      expect(runtime?.localTurns.at(-1)).toMatchObject({
+      expect(runtime?.localTurns.slice(-1)[0]).toMatchObject({
         role: "assistant",
         blocks: [{ type: "text", text: "complete reply" }],
       })
@@ -7463,7 +7482,7 @@ describe("AcpConnectionsProvider frame transactions (raw order)", () => {
         useConversationRuntimeStore
           .getState()
           .byConversationId.get(42)
-          ?.localTurns.at(-1)
+          ?.localTurns.slice(-1)[0]
       ).toMatchObject({
         role: "assistant",
         blocks: [{ type: "text", text: "retained final reply" }],
@@ -7507,7 +7526,7 @@ describe("AcpConnectionsProvider frame transactions (raw order)", () => {
         useConversationRuntimeStore
           .getState()
           .byConversationId.get(42)
-          ?.localTurns.at(-1)
+          ?.localTurns.slice(-1)[0]
       ).toMatchObject({
         role: "assistant",
         blocks: [{ type: "text", text: "retained final reply" }],
@@ -7598,7 +7617,7 @@ describe("AcpConnectionsProvider frame transactions (raw order)", () => {
         useConversationRuntimeStore
           .getState()
           .byConversationId.get(42)
-          ?.localTurns.at(-1)
+          ?.localTurns.slice(-1)[0]
       ).toMatchObject({
         role: "assistant",
         blocks: [{ type: "text", text: "rekeyed retained reply" }],
@@ -7640,7 +7659,7 @@ describe("AcpConnectionsProvider frame transactions (raw order)", () => {
         useConversationRuntimeStore
           .getState()
           .byConversationId.get(42)
-          ?.localTurns.at(-1)
+          ?.localTurns.slice(-1)[0]
       ).toMatchObject({
         role: "assistant",
         blocks: [{ type: "text", text: "rekeyed retained reply" }],
@@ -7657,7 +7676,7 @@ describe("AcpConnectionsProvider frame transactions (raw order)", () => {
         useConversationRuntimeStore
           .getState()
           .byConversationId.get(42)
-          ?.localTurns.at(-1)
+          ?.localTurns.slice(-1)[0]
       ).toMatchObject({
         role: "assistant",
         blocks: [{ type: "text", text: "rekeyed retained reply" }],
@@ -8966,7 +8985,7 @@ describe("AcpConnectionsProvider frame transactions (raw order)", () => {
         .byConversationId.get(42)
       expect(runtime?.optimisticTurns).toEqual([])
       expect(runtime?.liveMessage).toBeNull()
-      expect(runtime?.localTurns.at(-1)).toMatchObject({
+      expect(runtime?.localTurns.slice(-1)[0]).toMatchObject({
         role: "assistant",
         blocks: [{ type: "text", text: "cancelled final content" }],
         outcome: { source: "user_stop", stop_reason: "cancelled" },
@@ -9060,7 +9079,7 @@ describe("AcpConnectionsProvider frame transactions (raw order)", () => {
       const other = useConversationRuntimeStore
         .getState()
         .byConversationId.get(43)
-      expect(owner?.localTurns.at(-1)).toMatchObject({
+      expect(owner?.localTurns.slice(-1)[0]).toMatchObject({
         role: "assistant",
         blocks: [{ type: "text", text: "owner reply" }],
         outcome: { source: "user_stop", stop_reason: "cancelled" },
@@ -9333,7 +9352,7 @@ describe("AcpConnectionsProvider frame transactions (raw order)", () => {
             // @ts-expect-error intentional unknown wire type
             type: "future_extension_event",
             secret_payload: "must-not-log",
-          } as EventEnvelope,
+          },
         ])
       )
       h.runAnimationFrame()
@@ -9954,7 +9973,7 @@ describe("AcpConnectionsProvider frame transactions (raw order)", () => {
 
       try {
         await mountDesktopOwner("owner-conn", TAB, "sess-1", 42)
-        const canonical = vi.fn(() => true)
+        const canonical = vi.fn<LiveMessageSink>(() => true)
         h.actions!.registerLiveSinks(TAB, {
           runtimeConversationId: 42,
           canonical,
@@ -10807,7 +10826,7 @@ describe("AcpConnectionsProvider frame transactions (raw order)", () => {
     })
     expect(h.store!.getConnection(TAB)?.connectionId).toBe("owner-conn")
 
-    const publish = vi.fn()
+    const publish = vi.fn<LiveTranscriptFrameSink["publish"]>()
     h.actions!.registerLiveSinks(TAB, {
       canonical: () => true,
       transcript: {
@@ -10850,7 +10869,7 @@ describe("AcpConnectionsProvider frame transactions (raw order)", () => {
     expect(texts.join("")).toContain("only-live")
     expect(texts.join("")).not.toContain("dup-a")
     expect(texts.join("")).not.toContain("dup-b")
-    const drainedFrame = publish.mock.calls.at(-1)?.[0]
+    const drainedFrame = publish.mock.calls.slice(-1)[0]?.[0]
     expect(drainedFrame?.deliverySource).toBe("desktop")
     expect(drainedFrame?.eventDeliverySourceBySeq?.get(3)).toBe("desktop")
   })
@@ -11181,6 +11200,7 @@ describe("APPLY_EVENT_FRAME reducer parity", () => {
       error: null,
       loadError: null,
       loadErrorCode: null,
+      loadErrorCommand: null,
       lastAppliedSeq: 0,
       isDelegationChild: false,
       parentToolUseId: null,
@@ -11194,6 +11214,7 @@ describe("APPLY_EVENT_FRAME reducer parity", () => {
       outOfTurnToolCalls: null,
       waitingForSubagents: null,
       sessionFailures: [],
+      sharedSession: null,
       ...overrides,
     }
   }
@@ -11433,6 +11454,7 @@ describe("APPLY_EVENT_FRAME reducer parity", () => {
           error: "rate limit",
           errorStatus: 429,
           retryDelayMs: 1000,
+          reportsError: true,
         },
       },
     },
@@ -11560,7 +11582,7 @@ describe("APPLY_EVENT_FRAME reducer parity", () => {
         type: "SET_BACKGROUND_OUTSTANDING",
         contextKey: "k1",
         outstanding: 2,
-        settledCount: 0,
+        outOfTurnSettleCount: 0,
         turnsCount: 0,
       },
     },
@@ -12492,7 +12514,7 @@ describe("tool_watchdog_changed reduction and desktop notification", () => {
   })
 
   it("two-window winner/loser converge on the higher version", () => {
-    const minimal = {
+    const minimal: ConnectionState = {
       connectionId: "c1",
       contextKey: "k1",
       agentType: "claude_code" as const,
@@ -12515,10 +12537,13 @@ describe("tool_watchdog_changed reduction and desktop notification", () => {
       pendingUserMessage: null,
       pendingQuestion: null,
       pendingAskQuestion: null,
+      pendingPlanApproval: null,
       claudeApiRetry: null,
+      sessionFailures: [],
       error: null,
       loadError: null,
       loadErrorCode: null,
+      loadErrorCommand: null,
       lastAppliedSeq: 0,
       isDelegationChild: false,
       parentToolUseId: null,
@@ -12534,6 +12559,7 @@ describe("tool_watchdog_changed reduction and desktop notification", () => {
       toolWatchdogProjections: {
         "lease-w1": projection({ version: 2, phase: "grace" }),
       },
+      sharedSession: null,
     }
     const winnerEvent = {
       type: "TOOL_WATCHDOG_CHANGED" as const,
@@ -12558,7 +12584,7 @@ describe("tool_watchdog_changed reduction and desktop notification", () => {
     const map = {
       "lease-a": projection({ lease_id: "lease-a", version: 7 }),
     }
-    const before = {
+    const before: ConnectionState = {
       connectionId: "spawned-conn",
       contextKey: "k1",
       agentType: "claude_code" as const,
@@ -12581,10 +12607,13 @@ describe("tool_watchdog_changed reduction and desktop notification", () => {
       pendingUserMessage: null,
       pendingQuestion: null,
       pendingAskQuestion: null,
+      pendingPlanApproval: null,
       claudeApiRetry: null,
+      sessionFailures: [],
       error: null,
       loadError: null,
       loadErrorCode: null,
+      loadErrorCommand: null,
       lastAppliedSeq: 0,
       isDelegationChild: false,
       parentToolUseId: null,
@@ -12598,11 +12627,12 @@ describe("tool_watchdog_changed reduction and desktop notification", () => {
       outOfTurnToolCalls: null,
       waitingForSubagents: null,
       toolWatchdogProjections: {},
+      sharedSession: null,
     }
     const next = __connectionsReducerForTests(new Map([["k1", before]]), {
       type: "HYDRATE_FROM_SNAPSHOT",
       contextKey: "k1",
-      patch: {
+      patch: estimatorSnapshotPatch({
         connectionId: "spawned-conn",
         conversationId: null,
         status: "connected",
@@ -12628,7 +12658,7 @@ describe("tool_watchdog_changed reduction and desktop notification", () => {
         delegationRoute: null,
         waitingForSubagents: null,
         backgroundOutstanding: 0,
-      },
+      }),
     }).get("k1")!
     expect(next.toolWatchdogProjections?.["lease-a"]?.version).toBe(7)
   })
@@ -12642,7 +12672,7 @@ describe("tool_watchdog_changed reduction and desktop notification", () => {
       error_code: "tool_stalled_timeout",
       grace_deadline: null,
     })
-    const before = {
+    const before: ConnectionState = {
       connectionId: "spawned-conn",
       contextKey: "k1",
       agentType: "claude_code" as const,
@@ -12665,10 +12695,13 @@ describe("tool_watchdog_changed reduction and desktop notification", () => {
       pendingUserMessage: null,
       pendingQuestion: null,
       pendingAskQuestion: null,
+      pendingPlanApproval: null,
       claudeApiRetry: null,
+      sessionFailures: [],
       error: null,
       loadError: null,
       loadErrorCode: null,
+      loadErrorCommand: null,
       lastAppliedSeq: 0,
       isDelegationChild: false,
       parentToolUseId: null,
@@ -12683,11 +12716,12 @@ describe("tool_watchdog_changed reduction and desktop notification", () => {
       waitingForSubagents: null,
       toolWatchdogProjections: {},
       lastToolWatchdogDiagnostic: null,
+      sharedSession: null,
     }
     const next = __connectionsReducerForTests(new Map([["k1", before]]), {
       type: "HYDRATE_FROM_SNAPSHOT",
       contextKey: "k1",
-      patch: {
+      patch: estimatorSnapshotPatch({
         connectionId: "spawned-conn",
         conversationId: null,
         status: "connected",
@@ -12713,7 +12747,7 @@ describe("tool_watchdog_changed reduction and desktop notification", () => {
         delegationRoute: null,
         waitingForSubagents: null,
         backgroundOutstanding: 0,
-      },
+      }),
     }).get("k1")!
     expect(next.toolWatchdogProjections).toEqual({})
     expect(next.lastToolWatchdogDiagnostic?.phase).toBe("timed_out")
@@ -12729,7 +12763,7 @@ describe("tool_watchdog_changed reduction and desktop notification", () => {
     // I1 R3: A TimedOut(v3), B is sole last diagnostic; snapshot carries A's
     // floor via toolWatchdogMaxVersions; delayed A Cancelling(v2) must not
     // resurrect A's banner after cold attach.
-    const before = {
+    const before: ConnectionState = {
       connectionId: "spawned-conn",
       contextKey: "k1",
       agentType: "claude_code" as const,
@@ -12752,10 +12786,13 @@ describe("tool_watchdog_changed reduction and desktop notification", () => {
       pendingUserMessage: null,
       pendingQuestion: null,
       pendingAskQuestion: null,
+      pendingPlanApproval: null,
       claudeApiRetry: null,
+      sessionFailures: [],
       error: null,
       loadError: null,
       loadErrorCode: null,
+      loadErrorCommand: null,
       lastAppliedSeq: 0,
       isDelegationChild: false,
       parentToolUseId: null,
@@ -12770,6 +12807,7 @@ describe("tool_watchdog_changed reduction and desktop notification", () => {
       waitingForSubagents: null,
       toolWatchdogProjections: {},
       lastToolWatchdogDiagnostic: null,
+      sharedSession: null,
     }
     const leaseB = projection({
       lease_id: "lease-b",
@@ -12780,7 +12818,7 @@ describe("tool_watchdog_changed reduction and desktop notification", () => {
     const hydrated = __connectionsReducerForTests(new Map([["k1", before]]), {
       type: "HYDRATE_FROM_SNAPSHOT",
       contextKey: "k1",
-      patch: {
+      patch: estimatorSnapshotPatch({
         connectionId: "spawned-conn",
         conversationId: null,
         status: "connected",
@@ -12807,7 +12845,7 @@ describe("tool_watchdog_changed reduction and desktop notification", () => {
         delegationRoute: null,
         waitingForSubagents: null,
         backgroundOutstanding: 0,
-      },
+      }),
     })
     expect(hydrated.get("k1")?.toolWatchdogMaxVersions?.["lease-a"]).toBe(3)
 
@@ -12839,7 +12877,7 @@ describe("tool_watchdog_changed reduction and desktop notification", () => {
       phase: "warning",
       transition_at: "2026-07-23T00:15:00.000Z",
     })
-    const before = {
+    const before: ConnectionState = {
       connectionId: "spawned-conn",
       contextKey: "k1",
       agentType: "claude_code" as const,
@@ -12862,10 +12900,13 @@ describe("tool_watchdog_changed reduction and desktop notification", () => {
       pendingUserMessage: null,
       pendingQuestion: null,
       pendingAskQuestion: null,
+      pendingPlanApproval: null,
       claudeApiRetry: null,
+      sessionFailures: [],
       error: null,
       loadError: null,
       loadErrorCode: null,
+      loadErrorCommand: null,
       lastAppliedSeq: 0,
       isDelegationChild: false,
       parentToolUseId: null,
@@ -12880,11 +12921,12 @@ describe("tool_watchdog_changed reduction and desktop notification", () => {
       waitingForSubagents: null,
       toolWatchdogProjections: {},
       lastToolWatchdogDiagnostic: null,
+      sharedSession: null,
     }
     const next = __connectionsReducerForTests(new Map([["k1", before]]), {
       type: "HYDRATE_FROM_SNAPSHOT",
       contextKey: "k1",
-      patch: {
+      patch: estimatorSnapshotPatch({
         connectionId: "spawned-conn",
         conversationId: null,
         status: "connected",
@@ -12913,7 +12955,7 @@ describe("tool_watchdog_changed reduction and desktop notification", () => {
         delegationRoute: null,
         waitingForSubagents: null,
         backgroundOutstanding: 0,
-      },
+      }),
     }).get("k1")!
     expect(next.lastToolWatchdogDiagnostic?.lease_id).toBe("lease-new")
     expect(next.lastToolWatchdogDiagnostic?.phase).toBe("warning")
@@ -12943,7 +12985,7 @@ describe("tool_watchdog_changed reduction and desktop notification", () => {
       transition_at: "2026-07-23T00:00:00.000Z",
       transition_seq: 12,
     })
-    const before = {
+    const before: ConnectionState = {
       connectionId: "spawned-conn",
       contextKey: "k1",
       agentType: "claude_code" as const,
@@ -12966,10 +13008,13 @@ describe("tool_watchdog_changed reduction and desktop notification", () => {
       pendingUserMessage: null,
       pendingQuestion: null,
       pendingAskQuestion: null,
+      pendingPlanApproval: null,
       claudeApiRetry: null,
+      sessionFailures: [],
       error: null,
       loadError: null,
       loadErrorCode: null,
+      loadErrorCommand: null,
       lastAppliedSeq: 0,
       isDelegationChild: false,
       parentToolUseId: null,
@@ -12984,11 +13029,12 @@ describe("tool_watchdog_changed reduction and desktop notification", () => {
       waitingForSubagents: null,
       toolWatchdogProjections: {},
       lastToolWatchdogDiagnostic: null,
+      sharedSession: null,
     }
     const next = __connectionsReducerForTests(new Map([["k1", before]]), {
       type: "HYDRATE_FROM_SNAPSHOT",
       contextKey: "k1",
-      patch: {
+      patch: estimatorSnapshotPatch({
         connectionId: "spawned-conn",
         conversationId: null,
         status: "connected",
@@ -13017,7 +13063,7 @@ describe("tool_watchdog_changed reduction and desktop notification", () => {
         delegationRoute: null,
         waitingForSubagents: null,
         backgroundOutstanding: 0,
-      },
+      }),
     }).get("k1")!
     expect(next.lastToolWatchdogDiagnostic?.lease_id).toBe("lease-a")
     expect(next.lastToolWatchdogDiagnostic?.transition_seq).toBe(12)
@@ -13760,7 +13806,7 @@ describe("AcpConnectionsProvider canonical observer aliases", () => {
         .getState()
         .byConversationId.get(99)
       expect(runtime42?.liveMessage).toBeNull()
-      expect(runtime42?.localTurns.at(-1)).toMatchObject({
+      expect(runtime42?.localTurns.slice(-1)[0]).toMatchObject({
         role: "assistant",
         blocks: [{ type: "text", text: "reply A final" }],
       })
@@ -13884,7 +13930,7 @@ describe("AcpConnectionsProvider canonical observer aliases", () => {
           .byConversationId.get(conversationId)
         expect(runtime?.optimisticTurns).toEqual([])
         expect(runtime?.liveMessage).toBeNull()
-        expect(runtime?.localTurns.at(-1)).toMatchObject({
+        expect(runtime?.localTurns.slice(-1)[0]).toMatchObject({
           role: "assistant",
           blocks: [{ type: "text", text: "cancelled shared reply" }],
         })
@@ -14280,7 +14326,9 @@ describe("AcpConnectionsProvider canonical observer aliases", () => {
       h.actions!.retryAttach("broker-child")
     })
     expect(h.attach).toHaveBeenCalledTimes(2)
-    expect(h.attach.mock.calls.at(-1)?.[1]).toEqual({ reconnectMode: "cold" })
+    expect(h.attach.mock.calls.slice(-1)[0]?.[1]).toEqual({
+      reconnectMode: "cold",
+    })
     expect(h.store!.getConnection("broker-child")?.attachError).toBeNull()
     expect(h.store!.getConnection("broker-child")).toBeTruthy()
 
@@ -14293,7 +14341,9 @@ describe("AcpConnectionsProvider canonical observer aliases", () => {
       h.fireReconnect()
     })
     expect(h.attach).toHaveBeenCalledTimes(3)
-    expect(h.attach.mock.calls.at(-1)?.[1]).toEqual({ reconnectMode: "cold" })
+    expect(h.attach.mock.calls.slice(-1)[0]?.[1]).toEqual({
+      reconnectMode: "cold",
+    })
 
     act(() => {
       latestAttachHandlers().onAttachError("snapshot_budget_exceeded", true)
@@ -14350,7 +14400,7 @@ describe("AcpConnectionsProvider canonical observer aliases", () => {
     await act(async () => {
       await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sid", 42)
     })
-    expect(h.attach.mock.calls.at(-1)?.[1]).toEqual({})
+    expect(h.attach.mock.calls.slice(-1)[0]?.[1]).toEqual({})
 
     act(() => {
       latestAttachHandlers().onAttachError("snapshot_budget_exceeded", true)
@@ -14358,7 +14408,9 @@ describe("AcpConnectionsProvider canonical observer aliases", () => {
     act(() => {
       h.actions!.retryAttach(TAB)
     })
-    expect(h.attach.mock.calls.at(-1)?.[1]).toEqual({ reconnectMode: "cold" })
+    expect(h.attach.mock.calls.slice(-1)[0]?.[1]).toEqual({
+      reconnectMode: "cold",
+    })
   })
 
   it("orphan rescue does not rekey viewer off connectionId; second observer reuses state", async () => {

@@ -25,6 +25,7 @@ function makeFolder(
     parent_id: null,
     kind: "regular",
     alias: null,
+    group_id: null,
     ...overrides,
   }
 }

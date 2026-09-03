@@ -52,9 +52,6 @@ struct RegistryAgentItem {
     distribution: CustomAgentSpec,
 }
 
-#[cfg(test)]
-const BUILTIN_REGISTRY_ALIASES: &[&str] = &["kimi", "qoder"];
-
 async fn fetch_registry_payload() -> Result<RegistryPayload, AppCommandError> {
     let response = reqwest::Client::new()
         .get(REGISTRY_URL)
@@ -495,20 +492,16 @@ mod tests {
         assert!(!is_builtin_registry_id("qwen-code"));
     }
 
-    // Why a missing alias is a BUG and not just noise. The two entries in the
-    // table fail differently, and Qoder is the worse of the two:
-    //
-    // * `kimi` IS a legal custom-agent id (codeg's wire name is `kimi_code`),
-    //   so without the alias the picker would let the user add a SECOND,
-    //   redundant Kimi alongside the built-in.
-    // * `qoder` is NOT (it is codeg's wire name, blocked outright), so without
-    //   the alias the picker lists an entry whose "Add" button can only ever
-    //   error — a dead end with no way for the user to understand it.
+    // Every public-registry alias is reserved from custom-agent ids. The
+    // catalog must also recognize it as built-in; otherwise it would offer an
+    // entry whose "Add" action can only fail validation.
     #[test]
-    fn aliases_that_are_addable_would_duplicate_and_the_rest_would_dead_end() {
-        assert!(crate::models::agent::is_valid_custom_agent_id("kimi"));
-        assert!(!crate::models::agent::is_valid_custom_agent_id("qoder"));
-        for alias in BUILTIN_REGISTRY_ALIASES {
+    fn reserved_aliases_are_recognized_as_builtins() {
+        for alias in crate::models::agent::BUILTIN_AGENT_REGISTRY_ALIASES {
+            assert!(
+                !crate::models::agent::is_valid_custom_agent_id(alias),
+                "alias `{alias}` must be reserved from custom agents"
+            );
             assert!(
                 is_builtin_registry_id(alias),
                 "alias `{alias}` must read as built-in"

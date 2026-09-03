@@ -1956,11 +1956,19 @@ describe("flatIndexOfConversation", () => {
         kind: "conversation",
         conversation: conv(1, 10),
         depth: 0,
+        rootId: 1,
+        bucketKey: "folder:10",
         recent: true,
       },
       { kind: "section", section: "folders", expanded: true, count: 1 },
       { kind: "folder", folderId: 10 },
-      { kind: "conversation", conversation: conv(1, 10), depth: 0 },
+      {
+        kind: "conversation",
+        conversation: conv(1, 10),
+        depth: 0,
+        rootId: 1,
+        bucketKey: "folder:10",
+      },
     ]
     expect(flatIndexOfConversation(withRecentFirst, 1, "claude_code")).toBe(4)
   })
@@ -1975,6 +1983,8 @@ describe("flatIndexOfConversation", () => {
         kind: "conversation",
         conversation: conv(1, 10),
         depth: 0,
+        rootId: 1,
+        bucketKey: "folder:10",
         recent: true,
       },
     ]
@@ -2049,12 +2059,14 @@ describe("sticky overlay helpers", () => {
       const acrossSections: SidebarRow[] = [
         { kind: "section", section: "folders", expanded: true, count: 1 }, // 0
         { kind: "folder", folderId: 10 }, // 1
-        { kind: "conversation", conversation: conv(1, 10), depth: 0 }, // 2
+        conversationRow(conv(1, 10), 0, 1, "folder:10"), // 2
         { kind: "section", section: "recent", expanded: true, count: 1 }, // 3
         {
           kind: "conversation",
           conversation: conv(1, 10),
           depth: 0,
+          rootId: 1,
+          bucketKey: "folder:10",
           recent: true,
         }, // 4
       ]

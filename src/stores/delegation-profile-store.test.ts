@@ -1,8 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+import type { DelegationProfileCatalog } from "@/lib/types"
 
 const mocks = vi.hoisted(() => ({
   getDelegationProfileCatalog: vi.fn(),
-  subscribe: vi.fn(async () => () => {}),
+  subscribe: vi.fn(
+    async (
+      _event: string,
+      _handler: (catalog: DelegationProfileCatalog) => void
+    ) =>
+      () => {}
+  ),
   onReconnect: vi.fn(() => () => {}),
 }))
 
@@ -54,11 +61,7 @@ describe("useDelegationProfileStore", () => {
 
   it("subscribes before bootstrap fetch and applies mid-bootstrap catalog events", async () => {
     let resolveBootstrap:
-      | ((catalog: {
-          profiles: []
-          delegation_enabled: boolean
-          revision: number
-        }) => void)
+      | ((catalog: DelegationProfileCatalog) => void)
       | undefined
     mocks.getDelegationProfileCatalog.mockImplementation(
       () =>
@@ -67,15 +70,9 @@ describe("useDelegationProfileStore", () => {
         })
     )
 
-    let eventHandler:
-      | ((catalog: {
-          profiles: []
-          delegation_enabled: boolean
-          revision: number
-        }) => void)
-      | undefined
+    let eventHandler: ((catalog: DelegationProfileCatalog) => void) | undefined
     mocks.subscribe.mockImplementation(async (_event, handler) => {
-      eventHandler = handler as typeof eventHandler
+      eventHandler = handler
       return () => {}
     })
 

@@ -5,6 +5,7 @@ import type {
   DesktopDeliveryMode,
 } from "@/lib/types"
 import { subscribeDesktopAcpEvents } from "./desktop-acp-events"
+import type { Transport } from "./types"
 
 const handlers: DesktopAcpEventHandlers = {
   onBatch: vi.fn(),
@@ -28,13 +29,14 @@ function capabilities(mode: DesktopDeliveryMode): DesktopDeliveryCapabilities {
 function fakeTransport() {
   const events: string[] = []
   let unsubscribeCount = 0
+  const subscribe = vi.fn<Transport["subscribe"]>(async (event) => {
+    events.push(event)
+    return () => {
+      unsubscribeCount += 1
+    }
+  })
   return {
-    subscribe: vi.fn(async (event: string) => {
-      events.push(event)
-      return () => {
-        unsubscribeCount += 1
-      }
-    }),
+    subscribe,
     subscribedEvents: () => events.slice(),
     subscribedDataEvents: () =>
       events.filter((event) => event !== "acp://delivery-failed"),
@@ -85,21 +87,15 @@ describe("subscribeDesktopAcpEvents", () => {
 
   it("wraps legacy envelopes as one-event batches with monotonic ids", async () => {
     const transport = fakeTransport()
-    type Handler = (payload: unknown) => void
-    const handlersByEvent = new Map<string, Handler>()
-    transport.subscribe.mockImplementation(
-      async (event: string, handler: Handler) => {
-        handlersByEvent.set(event, handler)
-        return () => undefined
-      }
-    )
     const onBatch = vi.fn()
     await subscribeDesktopAcpEvents(
       capabilities("legacy"),
       { onBatch, onFailure: vi.fn() },
       transport
     )
-    const legacyHandler = handlersByEvent.get("acp://event")
+    const legacyHandler = transport.subscribe.mock.calls.find(
+      ([event]) => event === "acp://event"
+    )?.[1]
     expect(legacyHandler).toBeTypeOf("function")
     legacyHandler?.({
       connection_id: "c1",

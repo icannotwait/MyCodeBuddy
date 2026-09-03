@@ -4,6 +4,12 @@ import type { FileWorkspaceTab } from "@/contexts/workspace-context"
 import enMessages from "@/i18n/messages/en.json"
 import { DEFAULT_SHORTCUTS } from "@/lib/keyboard-shortcuts"
 
+type WorkspaceActions = ReturnType<
+  typeof import("@/contexts/workspace-context").useWorkspaceActions
+>
+type TranslateDocument = typeof import("@/lib/api").translateDocument
+type SaveTranslationAs = typeof import("@/lib/api").saveTranslationAs
+
 const closeFileTab = vi.fn()
 const closeAllFileTabs = vi.fn()
 const switchFileTab = vi.fn()
@@ -11,11 +17,17 @@ const closeOtherFileTabs = vi.fn()
 const reorderFileTabs = vi.fn()
 const toggleFileTabPreview = vi.fn()
 const toggleFilesMaximized = vi.fn()
-const beginTranslateRequest = vi.fn(() => 1)
-const openTranslationResultTab = vi.fn(() => "translate:file-1:zh_cn:1")
-const openFilePreview = vi.fn(
-  async () =>
-    ({ ok: true as const, tabId: "file:/ws/README.zh_cn.md" }) as const
+const beginTranslateRequest = vi.fn<WorkspaceActions["beginTranslateRequest"]>(
+  () => 1
+)
+const openTranslationResultTab = vi.fn<
+  WorkspaceActions["openTranslationResultTab"]
+>(() => "translate:file-1:zh_cn:1")
+const openFilePreview = vi.fn<WorkspaceActions["openFilePreview"]>(
+  async () => ({
+    ok: true,
+    tabId: "file:/ws/README.zh_cn.md",
+  })
 )
 
 const viewState = {
@@ -39,7 +51,7 @@ const experienceState = vi.hoisted(() => ({
 }))
 
 const translateDocument = vi.hoisted(() =>
-  vi.fn(async () => ({
+  vi.fn<TranslateDocument>(async () => ({
     translatedContent: "你好",
     locale: "zh_cn",
     format: "markdown" as const,
@@ -47,7 +59,7 @@ const translateDocument = vi.hoisted(() =>
 )
 
 const saveTranslationAs = vi.hoisted(() =>
-  vi.fn(async () => ({
+  vi.fn<SaveTranslationAs>(async () => ({
     absolutePath: "/ws/README.zh_cn.md",
   }))
 )
@@ -88,8 +100,8 @@ vi.mock("@/lib/platform", () => ({
 }))
 
 vi.mock("@/lib/api", () => ({
-  translateDocument: (...args: unknown[]) => translateDocument(...args),
-  saveTranslationAs: (...args: unknown[]) => saveTranslationAs(...args),
+  translateDocument,
+  saveTranslationAs,
 }))
 
 vi.mock("@/stores/conversation-experience-store", () => ({
@@ -190,7 +202,6 @@ function makeFileTab(
   overrides: Partial<FileWorkspaceTab> & { id: string } = { id: "file-1" }
 ): FileWorkspaceTab {
   return {
-    id: overrides.id,
     kind: "file",
     folderId: null,
     title: overrides.title ?? "readme.md",

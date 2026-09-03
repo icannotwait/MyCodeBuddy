@@ -796,7 +796,7 @@ function renderDagCanvas(
       "currentNodeIds" | "selectedNodeId" | "onSelect"
     >
   > = {},
-  locale = "en"
+  locale: React.ComponentProps<typeof NextIntlClientProvider>["locale"] = "en"
 ) {
   const onSelect = overrides.onSelect ?? vi.fn()
   const view = render(

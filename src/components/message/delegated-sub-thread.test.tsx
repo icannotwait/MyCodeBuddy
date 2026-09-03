@@ -10,6 +10,9 @@ import { delegationRunSnapshotCache } from "@/lib/delegation-run-snapshot"
 import { getActiveBackendCacheKey } from "@/lib/transport"
 import type { DelegationRunSnapshot } from "@/lib/types"
 
+type OpenDelegatedChildSession =
+  typeof import("@/lib/open-delegated-child-session").openDelegatedChildSession
+
 vi.mock("@/hooks/use-delegated-sub-session", () => ({
   useDelegatedSubSession: vi.fn(),
 }))
@@ -38,11 +41,10 @@ vi.mock("@/contexts/acp-connections-context", async () => {
 // Open path goes through openDelegatedChildSession (main tab). Stub the helper
 // so card tests stay unit-scoped.
 const { openDelegatedChildSession } = vi.hoisted(() => ({
-  openDelegatedChildSession: vi.fn(async () => true),
+  openDelegatedChildSession: vi.fn<OpenDelegatedChildSession>(async () => true),
 }))
 vi.mock("@/lib/open-delegated-child-session", () => ({
-  openDelegatedChildSession: (...args: unknown[]) =>
-    openDelegatedChildSession(...args),
+  openDelegatedChildSession,
 }))
 
 const { useDelegatedSubSession } =

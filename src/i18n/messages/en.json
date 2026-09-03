@@ -753,7 +753,6 @@
       "saveCodexConfig": "Save Codex Config",
       "saveGeminiConfig": "Save Gemini Config",
       "saveOpenCodeConfig": "Save OpenCode Config",
-      "saveOpenClawConfig": "Save OpenClaw Config",
       "saveConfigManagement": "Save Config Management",
       "saveCurrentProvider": "Save Current Provider",
       "showApiKey": "Show API Key",
@@ -1161,14 +1160,6 @@
         }
       }
     },
-    "openClaw": {
-      "gatewayConfig": "Gateway Config",
-      "gatewayDescription": "Configure OpenClaw Gateway connection. Supports local or remote gateway.",
-      "gatewayUrlHint": "Leave empty to use gateway.remote.url from local openclaw config.",
-      "gatewayTokenPlaceholder": "Gateway auth token",
-      "gatewayTokenHint": "Use token-file instead of plain token when possible; configure via openclaw CLI.",
-      "sessionKeyHint": "Optional. Specify gateway session key; leave empty to auto-assign isolated session."
-    },
     "hermes": {
       "configManagement": "Hermes Configuration",
       "configDescription": "Hermes manages its own credentials in ~/.hermes/.env and settings in ~/.hermes/config.yaml. Pick a provider, then set the API key and model — codeg writes both files for you.",
@@ -1368,8 +1359,6 @@
       "openCodeConfigSynced": "OpenCode config and auth JSON have been synced.",
       "openCodeSaved": "OpenCode config saved",
       "saveOpenCodeFailed": "Failed to save OpenCode config",
-      "openClawSaved": "OpenClaw config saved",
-      "saveOpenClawFailed": "Failed to save OpenClaw config",
       "configSaved": "Config saved",
       "configSavedHint": "Existing sessions need to be reopened to take effect",
       "saveConfigManagementFailed": "Failed to save config management",

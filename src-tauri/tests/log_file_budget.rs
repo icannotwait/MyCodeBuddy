@@ -24,6 +24,7 @@
 //! read during that install.
 
 use std::io::Write;
+use std::time::{Duration, Instant};
 
 /// Small enough to blow through quickly, large enough to hold several lines
 /// first (so the test proves "capped", not "wrote nothing").
@@ -82,6 +83,16 @@ fn file_log_stops_growing_at_the_daily_ceiling() {
     // the time this returns.
     drop(guard);
     std::io::stderr().flush().ok();
+
+    // `WorkerGuard` uses a bounded shutdown handshake but does not join its
+    // writer thread. On Windows, the guard can return just before file metadata
+    // observes the final flush, so wait on the observable condition we assert.
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while std::fs::metadata(&today_file).map_or(0, |metadata| metadata.len()) <= SEEDED
+        && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(5));
+    }
 
     let mut total = 0u64;
     let mut files = Vec::new();

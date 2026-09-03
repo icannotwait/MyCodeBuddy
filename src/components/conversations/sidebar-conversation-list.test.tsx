@@ -22,6 +22,8 @@ import {
 } from "@/stores/app-workspace-store"
 import enMessages from "@/i18n/messages/en.json"
 
+type ListChildConversations = typeof import("@/lib/api").listChildConversations
+
 // ── Probes ────────────────────────────────────────────────────────────────
 // AgentIcon renders once per card body → counts card re-renders. The Folder /
 // FolderOpen lucide icon renders once per FolderHeader body → counts folder
@@ -101,9 +103,7 @@ const reorderAnimationCtl = vi.hoisted(() => ({
 // Hangable children fetch so an expanded root can keep its loading placeholder
 // long enough for ownership metadata assertions.
 const apiMocks = vi.hoisted(() => ({
-  listChildConversations: vi.fn(
-    async (): Promise<DbConversationSummary[]> => []
-  ),
+  listChildConversations: vi.fn<ListChildConversations>(async () => []),
 }))
 
 vi.mock("@/components/agent-icon", () => ({

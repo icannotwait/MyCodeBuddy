@@ -2082,7 +2082,10 @@ fn annotate_npm_bootstrap_failure(package: &str, error: AcpError) -> AcpError {
         return error;
     }
     AcpError::Protocol(format!(
-        "{message}\n\nThe Hermes bootstrap downloads its runtime from github.com with Node's own fetch. Behind a proxy on Node older than 24, upgrade Node or use the official installer; Codeg will use a `hermes` executable on PATH."
+        "{message}\n\nThe Hermes bootstrap downloads its runtime from github.com with Node's own \
+         fetch, which reads HTTP(S)_PROXY only on Node 24+. Behind a proxy on an older \
+         Node, upgrade Node or use the official installer; Codeg will use a `hermes` \
+         executable on PATH."
     ))
 }
 

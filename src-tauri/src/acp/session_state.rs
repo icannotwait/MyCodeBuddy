@@ -6443,9 +6443,10 @@ mod tests {
 
     #[test]
     fn turn_complete_clears_stale_when_live_message_is_none() {
-        // When live_message is already gone, TurnComplete must still clear
+        // When an active turn has no live_message, TurnComplete must still clear
         // stale last_assistant_text rather than leave it for the next consumer.
         let mut s = fresh_state();
+        s.turn_in_flight = true;
         s.last_assistant_text = Some("stale".into());
         s.live_message = None;
         s.apply_event(&AcpEvent::TurnComplete {

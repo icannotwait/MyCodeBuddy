@@ -946,6 +946,8 @@ export const ConversationSessionSurface = memo(
       }
       return effectiveModes?.current_mode_id ?? connectionModes[0]?.id ?? null
     }, [effectiveModes, connectionModes, modeId])
+    const selectedModeIdRef = useRef(selectedModeId)
+    selectedModeIdRef.current = selectedModeId
 
     // The single blocking message shown in the composer's inline banner (clicking
     // it opens Agent Settings). The not-installed prompt takes priority: it's the
@@ -1089,10 +1091,14 @@ export const ConversationSessionSurface = memo(
         if (next) {
           // Mark this as the queue auto-flush: it sends the dequeued head now and,
           // on a bounce, returns it to the FRONT (vs a direct send → tail).
-          handleSendRef.current(next.draft, next.modeId, {
-            fromQueueFlush: true,
-            optimisticTurnId: next.optimisticTurnId,
-          })
+          handleSendRef.current(
+            next.draft,
+            next.adoptSendTimeMode ? selectedModeIdRef.current : next.modeId,
+            {
+              fromQueueFlush: true,
+              optimisticTurnId: next.optimisticTurnId,
+            }
+          )
         }
       }, wait)
       return () => clearTimeout(timer)

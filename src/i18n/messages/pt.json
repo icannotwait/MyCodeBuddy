@@ -753,7 +753,6 @@
       "saveCodexConfig": "Salvar configuração do Codex",
       "saveGeminiConfig": "Salvar configuração do Gemini",
       "saveOpenCodeConfig": "Salvar configuração do OpenCode",
-      "saveOpenClawConfig": "Salvar configuração do OpenClaw",
       "saveConfigManagement": "Salvar gerenciamento de configuração",
       "saveCurrentProvider": "Salvar provedor atual",
       "showApiKey": "Mostrar API Key",
@@ -1161,14 +1160,6 @@
         }
       }
     },
-    "openClaw": {
-      "gatewayConfig": "Configuração de Gateway",
-      "gatewayDescription": "Configure a conexão do OpenClaw Gateway. Suporta gateway local ou remoto.",
-      "gatewayUrlHint": "Deixe vazio para usar gateway.remote.url da configuração local do openclaw.",
-      "gatewayTokenPlaceholder": "Token de autenticação do Gateway",
-      "gatewayTokenHint": "Use token-file em vez de token em texto puro quando possível; configure via CLI do openclaw.",
-      "sessionKeyHint": "Opcional. Especifique a session key do gateway; deixe vazio para atribuição automática de sessão isolada."
-    },
     "hermes": {
       "configManagement": "Configuração do Hermes",
       "configDescription": "O Hermes gerencia suas próprias credenciais em ~/.hermes/.env e as configurações em ~/.hermes/config.yaml. Escolha um provedor e, em seguida, defina a chave de API e o modelo — o DrawCode grava os dois arquivos para você.",
@@ -1368,8 +1359,6 @@
       "openCodeConfigSynced": "A configuração do OpenCode e o auth JSON foram sincronizados.",
       "openCodeSaved": "Configuração do OpenCode salva",
       "saveOpenCodeFailed": "Falha ao salvar configuração do OpenCode",
-      "openClawSaved": "Configuração do OpenClaw salva",
-      "saveOpenClawFailed": "Falha ao salvar configuração do OpenClaw",
       "configSaved": "Configuração salva",
       "configSavedHint": "Sessões existentes precisam ser reabertas para que as alterações tenham efeito",
       "saveConfigManagementFailed": "Falha ao salvar o gerenciamento de configuração",

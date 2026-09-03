@@ -4,10 +4,7 @@ import { createRef } from "react"
 import { describe, expect, it, vi } from "vitest"
 
 import { RichComposer, type RichComposerHandle } from "./rich-composer"
-import type {
-  ReferenceSearchController,
-  ReferenceSearchSnapshot,
-} from "./reference-search-controller"
+import type { ReferenceSearchSnapshot } from "./reference-search-controller"
 import type { ReferenceAttrs } from "./types"
 import { FakeReferenceSearchController } from "./suggestion/fake-reference-search-controller"
 
@@ -102,13 +99,13 @@ function findReference(doc: JSONContent): JSONContent | undefined {
 
 async function mount(
   onSubmit?: () => void,
-  controller: FakeReferenceSearchController | null = makeController()
+  controller: FakeReferenceSearchController = makeController()
 ) {
   const ref = createRef<RichComposerHandle>()
   const view = render(
     <RichComposer
       ref={ref}
-      referenceController={controller as ReferenceSearchController | null}
+      referenceController={controller.asController()}
       onSubmit={onSubmit}
     />
   )
@@ -221,7 +218,7 @@ describe("RichComposer @ mention integration", () => {
     const { rerender } = render(
       <RichComposer
         ref={ref}
-        referenceController={controller as ReferenceSearchController}
+        referenceController={controller.asController()}
         onSubmit={onSubmit}
       />
     )
@@ -284,10 +281,7 @@ describe("RichComposer @ mention integration", () => {
 
     const controller = makeController()
     rerender(
-      <RichComposer
-        ref={ref}
-        referenceController={controller as ReferenceSearchController}
-      />
+      <RichComposer ref={ref} referenceController={controller.asController()} />
     )
     expect(ref.current?.getEditor()).toBe(editor)
 
@@ -375,7 +369,7 @@ describe("RichComposer @ mention integration", () => {
     const { rerender } = render(
       <RichComposer
         ref={ref}
-        referenceController={controllerA as ReferenceSearchController}
+        referenceController={controllerA.asController()}
       />
     )
     await waitFor(() => expect(ref.current?.getEditor()).not.toBeNull(), {
@@ -394,7 +388,7 @@ describe("RichComposer @ mention integration", () => {
       rerender(
         <RichComposer
           ref={ref}
-          referenceController={controllerB as ReferenceSearchController}
+          referenceController={controllerB.asController()}
         />
       )
       await Promise.resolve()

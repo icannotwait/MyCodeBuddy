@@ -16,6 +16,9 @@ function turnComplete(seq: number): EventEnvelope {
     connection_id: "c1",
     seq,
     type: "turn_complete",
+    session_id: "s1",
+    stop_reason: "end_turn",
+    mark_awaiting_reply: false,
   }
 }
 

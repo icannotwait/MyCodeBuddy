@@ -821,6 +821,7 @@ describe("SidebarConversationCard hover details bubble", () => {
           path: FOLDER_PATH,
           git_branch: null,
           default_agent_type: null,
+          last_agent_type: null,
           last_opened_at: new Date(NOW).toISOString(),
           sort_order: 0,
           color: "inherit",

@@ -1530,7 +1530,7 @@ impl ClaudeRecordAccumulator {
                                 let subagent_path =
                                     subagent_dir.join(format!("agent-{}.jsonl", agent_id));
                                 if subagent_path.exists() {
-                                    stats.tool_calls = parse_subagent_tool_calls(&subagent_path);
+                                    stats.tool_calls = parse_subagent_tool_calls(&subagent_path).0;
                                 }
                             }
                         }
@@ -2023,9 +2023,12 @@ impl ClaudeParser {
         // Runs before the facts are derived, so the usage dashboard's elapsed
         // time is backfilled too.
         super::backfill_turn_durations(&mut turns, &[]);
+        // Read the context window before folding in delegated spend: a
+        // sub-agent's context is its own, not this conversation's.
         let context_window_used_tokens = latest_claude_context_window_used_tokens(&turns);
         let context_window_max_tokens =
             claude_context_window_max_tokens_for_model(model.as_deref());
+        attribute_subagent_usage(path, &mut turns);
         let session_stats = merge_claude_context_window_stats(
             super::compute_session_stats(&turns),
             context_window_used_tokens,
@@ -2351,16 +2354,65 @@ fn extract_agent_execution_stats(tur: &serde_json::Value) -> AgentExecutionStats
     }
 }
 
-/// Parse a subagent's JSONL transcript and extract its tool calls.
-///
-/// The subagent JSONL has the same format as the main session:
-/// assistant messages with tool_use blocks, followed by user messages
-/// with tool_result blocks. We pair them by tool_use_id and produce
-/// a compact list of `AgentToolCall` records.
-fn parse_subagent_tool_calls(path: &PathBuf) -> Vec<AgentToolCall> {
+/// Fold each sub-agent transcript's spend into the assistant turn active when
+/// it started. Directory discovery counts referenced and unfinished agents once.
+fn attribute_subagent_usage(session_path: &Path, turns: &mut [MessageTurn]) {
+    let subagent_dir = session_path.with_extension("").join("subagents");
+    let Ok(entries) = fs::read_dir(&subagent_dir) else {
+        return;
+    };
+
+    let mut transcripts: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "jsonl")
+        })
+        .collect();
+    transcripts.sort();
+
+    for transcript in transcripts {
+        let (_, usage, started_at) = parse_subagent_tool_calls(&transcript);
+        let Some(extra) = usage else { continue };
+        let target = started_at
+            .and_then(|start| {
+                turns.iter().rposition(|turn| {
+                    matches!(turn.role, TurnRole::Assistant) && turn.timestamp <= start
+                })
+            })
+            .or_else(|| {
+                turns
+                    .iter()
+                    .rposition(|turn| matches!(turn.role, TurnRole::Assistant))
+            });
+        let Some(launcher) = target.and_then(|index| turns.get_mut(index)) else {
+            continue;
+        };
+        launcher.usage = Some(match launcher.usage {
+            Some(ref own) => TurnUsage {
+                input_tokens: own.input_tokens.saturating_add(extra.input_tokens),
+                output_tokens: own.output_tokens.saturating_add(extra.output_tokens),
+                cache_creation_input_tokens: own
+                    .cache_creation_input_tokens
+                    .saturating_add(extra.cache_creation_input_tokens),
+                cache_read_input_tokens: own
+                    .cache_read_input_tokens
+                    .saturating_add(extra.cache_read_input_tokens),
+            },
+            None => extra,
+        });
+    }
+}
+
+/// Parse a subagent's JSONL transcript into tool calls, deduplicated usage, and
+/// its first timestamp.
+fn parse_subagent_tool_calls(
+    path: &PathBuf,
+) -> (Vec<AgentToolCall>, Option<TurnUsage>, Option<DateTime<Utc>>) {
     let file = match fs::File::open(path) {
         Ok(f) => f,
-        Err(_) => return Vec::new(),
+        Err(_) => return (Vec::new(), None, None),
     };
     let reader = BufReader::new(file);
 
@@ -2368,6 +2420,9 @@ fn parse_subagent_tool_calls(path: &PathBuf) -> Vec<AgentToolCall> {
     let mut calls: Vec<(String, String, Option<String>)> = Vec::new(); // (id, name, input)
     let mut results: std::collections::HashMap<String, (Option<String>, bool)> =
         std::collections::HashMap::new();
+    let mut usage_by_message_id: std::collections::HashMap<String, TurnUsage> =
+        std::collections::HashMap::new();
+    let mut started_at: Option<DateTime<Utc>> = None;
 
     for line in reader.lines() {
         let line = match line {
@@ -2384,7 +2439,31 @@ fn parse_subagent_tool_calls(path: &PathBuf) -> Vec<AgentToolCall> {
 
         let msg_type = value.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
+        if started_at.is_none() {
+            started_at = parse_timestamp(&value);
+        }
+
         if msg_type == "assistant" {
+            if let Some(usage) = extract_usage(&value) {
+                let billable = |usage: &TurnUsage| {
+                    usage
+                        .input_tokens
+                        .saturating_add(usage.output_tokens)
+                        .saturating_add(usage.cache_creation_input_tokens)
+                        .saturating_add(usage.cache_read_input_tokens)
+                };
+                let key = value
+                    .get("message")
+                    .and_then(|message| message.get("id"))
+                    .and_then(|id| id.as_str())
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("__ungrouped-{}__", usage_by_message_id.len()));
+                let slot = usage_by_message_id.entry(key).or_default();
+                if billable(&usage) > billable(slot) {
+                    *slot = usage;
+                }
+            }
             if let Some(content) = value
                 .get("message")
                 .and_then(|m| m.get("content"))
@@ -2438,7 +2517,21 @@ fn parse_subagent_tool_calls(path: &PathBuf) -> Vec<AgentToolCall> {
         }
     }
 
-    calls
+    let usage = usage_by_message_id
+        .into_values()
+        .reduce(|acc, usage| TurnUsage {
+            input_tokens: acc.input_tokens.saturating_add(usage.input_tokens),
+            output_tokens: acc.output_tokens.saturating_add(usage.output_tokens),
+            cache_creation_input_tokens: acc
+                .cache_creation_input_tokens
+                .saturating_add(usage.cache_creation_input_tokens),
+            cache_read_input_tokens: acc
+                .cache_read_input_tokens
+                .saturating_add(usage.cache_read_input_tokens),
+        })
+        .filter(|usage| usage != &TurnUsage::default());
+
+    let calls = calls
         .into_iter()
         .map(|(id, name, input)| {
             let (output, is_error) = results.remove(&id).unwrap_or((None, false));
@@ -2449,7 +2542,8 @@ fn parse_subagent_tool_calls(path: &PathBuf) -> Vec<AgentToolCall> {
                 is_error,
             }
         })
-        .collect()
+        .collect();
+    (calls, usage, started_at)
 }
 
 fn extract_tool_result_text(item: &serde_json::Value) -> Option<String> {

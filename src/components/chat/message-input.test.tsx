@@ -76,20 +76,19 @@ vi.mock("@/hooks/use-enabled-skill-ids", () => ({
     supported: true,
   }),
 }))
+
+type ReferenceSearchOptions = {
+  folderId: number | null
+  defaultPath: string | null
+  enabled: boolean
+}
+
 const referenceSearchHook = vi.hoisted(() => ({
-  options: null as null | {
-    folderId: number | null
-    defaultPath: string | null
-    enabled: boolean
-  },
-  mock: vi.fn(() => null),
+  options: null as ReferenceSearchOptions | null,
+  mock: vi.fn((_options: ReferenceSearchOptions) => null),
 }))
 vi.mock("@/components/chat/composer/use-reference-search", () => ({
-  useReferenceSearchController: (options: {
-    folderId: number | null
-    defaultPath: string | null
-    enabled: boolean
-  }) => {
+  useReferenceSearchController: (options: ReferenceSearchOptions) => {
     referenceSearchHook.options = options
     return referenceSearchHook.mock(options)
   },
@@ -481,7 +480,10 @@ describe("MessageInput admission-aware clearing", () => {
     vi.stubGlobal("FileReader", DeferredFileReader)
 
     const admission = deferred<void>()
-    const onSend = vi.fn(() => admission.promise)
+    const onSend = vi.fn(
+      (_draft: Parameters<ComponentProps<typeof MessageInput>["onSend"]>[0]) =>
+        admission.promise
+    )
     renderInput({ onSend, sendClearMode: "after-admission" })
     const editor = await mountedEditor()
     act(() => editor.commands.insertContent("send without late image"))
@@ -833,8 +835,10 @@ describe("MessageInput session-mention attach", () => {
       folder_id: 1,
       title,
       title_locked: false,
+      auto_title_finalized: false,
       agent_type: "claude_code",
       status: "pending",
+      awaiting_reply_token: null,
       kind: "regular",
       model: null,
       git_branch: null,

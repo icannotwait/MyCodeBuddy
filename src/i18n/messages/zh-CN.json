@@ -753,7 +753,6 @@
       "saveCodexConfig": "保存 Codex 配置",
       "saveGeminiConfig": "保存 Gemini 配置",
       "saveOpenCodeConfig": "保存 OpenCode 配置",
-      "saveOpenClawConfig": "保存 OpenClaw 配置",
       "saveConfigManagement": "保存配置管理",
       "saveCurrentProvider": "保存当前 Provider",
       "showApiKey": "显示 API Key",
@@ -1161,14 +1160,6 @@
         }
       }
     },
-    "openClaw": {
-      "gatewayConfig": "Gateway 配置",
-      "gatewayDescription": "配置 OpenClaw Gateway 连接信息。支持本地或远程 Gateway。",
-      "gatewayUrlHint": "留空则使用 openclaw 本地配置的 gateway.remote.url。",
-      "gatewayTokenPlaceholder": "Gateway 认证 Token",
-      "gatewayTokenHint": "建议使用 token-file 替代明文 Token，可通过 openclaw 命令行配置。",
-      "sessionKeyHint": "可选。指定 Gateway Session Key，留空则自动分配隔离会话。"
-    },
     "hermes": {
       "configManagement": "Hermes 配置",
       "configDescription": "Hermes 在 ~/.hermes/.env 中管理自己的凭据，在 ~/.hermes/config.yaml 中管理设置。选择一个供应商，然后设置 API 密钥和模型——codeg 会替你写入这两个文件。",
@@ -1368,8 +1359,6 @@
       "openCodeConfigSynced": "OpenCode 配置与认证 JSON 已同步保存。",
       "openCodeSaved": "OpenCode 配置已保存",
       "saveOpenCodeFailed": "保存 OpenCode 配置失败",
-      "openClawSaved": "OpenClaw 配置已保存",
-      "saveOpenClawFailed": "保存 OpenClaw 配置失败",
       "configSaved": "配置已保存",
       "configSavedHint": "已有会话需要重新打开才能生效",
       "saveConfigManagementFailed": "保存配置管理失败",
