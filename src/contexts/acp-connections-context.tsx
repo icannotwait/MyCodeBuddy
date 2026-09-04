@@ -8124,6 +8124,11 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
               reason === "generation_stale" ||
               reason === "session_replaced")
           ) {
+            // New conversations connect with no sessionId. Capture the live
+            // SessionStarted / snapshot id before the store entry goes away
+            // so this auto-reconnect can session/load instead of session/new.
+            // Cursor advertises resume=false; a null id looks like a storm.
+            captureIdentityBeforeRemoval(contextKey)
             const request = lastConnectParamsRef.current.get(contextKey)
             const cursor =
               storeRef.current.connections.get(contextKey)?.lastAppliedSeq
@@ -8136,6 +8141,8 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
                 },
               })
             }
+            const reconnect =
+              lastConnectParamsRef.current.get(contextKey) ?? request
             attachSubscriptionsRef.current.delete(contextKey)
             attachRetryRef.current.delete(contextKey)
             acpReleaseLease(
@@ -8144,19 +8151,19 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
               shared.leaseId
             ).catch(() => {})
             dispatch({ type: "CONNECTION_REMOVED", contextKey })
-            if (request) {
+            if (reconnect) {
               queueMicrotask(() => {
                 connectRef
                   .current?.(
                     contextKey,
-                    request.agentType,
-                    request.workingDir,
-                    request.sessionId,
-                    request.conversationId,
-                    request.delegationRouteOverride,
-                    request.ownerOperationId,
-                    request.intent,
-                    request.retryObserverDiscovery
+                    reconnect.agentType,
+                    reconnect.workingDir,
+                    reconnect.sessionId,
+                    reconnect.conversationId,
+                    reconnect.delegationRouteOverride,
+                    reconnect.ownerOperationId,
+                    reconnect.intent,
+                    reconnect.retryObserverDiscovery
                   )
                   .catch(() => {})
               })
@@ -8203,6 +8210,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     },
     [
       applyMappedEnvelope,
+      captureIdentityBeforeRemoval,
       clearAliasesPointingTo,
       dispatch,
       pushMappedEvents,
@@ -9330,8 +9338,12 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       const request: ConnectRequest = {
         agentType,
         workingDir,
-        sessionId,
-        conversationId,
+        sessionId:
+          sessionId ??
+          (launchIdentityChanged ? undefined : remembered?.sessionId),
+        conversationId:
+          conversationId ??
+          (launchIdentityChanged ? undefined : remembered?.conversationId),
         delegationRouteOverride,
         ownerOperationId: ownerOperationId ?? null,
         intent,

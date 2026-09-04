@@ -2416,6 +2416,37 @@ describe("AcpConnectionsProvider shared server roots", () => {
     )
   })
 
+  it("shared idle detach resumes the session id resolved after a cold connect", async () => {
+    // New conversation: connect() has no sessionId. Cursor then advertises
+    // resume=false, so a reconnect that still sends externalSessionId=null
+    // falls through to session/new and looks like a reconnect storm.
+    h.isDesktop = false
+    h.acpConnectOrAttach
+      .mockResolvedValueOnce(sharedResponse())
+      .mockResolvedValueOnce(sharedResponse({ leaseId: "lease-2" }))
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "cursor", "/work", undefined, 42)
+    })
+    expect(h.acpConnectOrAttach.mock.calls[0]?.[0].externalSessionId).toBeNull()
+
+    h.denormalizeSnapshot.mockReturnValueOnce({
+      ...h.denormalizeSnapshot(),
+      connectionId: "conn",
+      sessionId: "cursor-sess-live",
+      eventSeq: 3,
+    })
+    hydrateSnapshot(latestAttachHandlers(), {} as LiveSessionSnapshot)
+    expect(h.store!.getConnection(TAB)?.sessionId).toBe("cursor-sess-live")
+
+    act(() => latestAttachHandlers().onDetached("lease_expired"))
+    await waitFor(() => expect(h.acpConnectOrAttach).toHaveBeenCalledTimes(2))
+
+    expect(h.acpConnectOrAttach.mock.calls[1]?.[0].externalSessionId).toBe(
+      "cursor-sess-live"
+    )
+  })
+
   it("hydrates equal-sequence authoritative shared phase, queue, and active turn", async () => {
     h.isDesktop = false
     h.acpConnectOrAttach.mockResolvedValue(
