@@ -5819,6 +5819,186 @@ fn continuation_enabled_for_launch(
     }
 }
 
+/// Redact a credential-bearing env/header value for inject diagnostics.
+/// Keeps key names; shows a short prefix + length, never the full secret.
+fn redact_mcp_secret_value(key: &str, value: &str) -> String {
+    let lower = key.to_ascii_lowercase();
+    let key_secretish = [
+        "token",
+        "secret",
+        "key",
+        "password",
+        "passwd",
+        "auth",
+        "credential",
+        "authorization",
+        "bearer",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
+    let value_secretish = value_looks_like_secret(value);
+    if !(key_secretish || value_secretish) {
+        return value.to_string();
+    }
+    let len = value.chars().count();
+    let prefix: String = value.chars().take(8).collect();
+    if len == 0 {
+        return format!("(len=0)");
+    }
+    format!("{prefix}…(len={len})")
+}
+
+fn value_looks_like_secret(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.len() >= 7 && trimmed[..7].eq_ignore_ascii_case("bearer ") {
+        return true;
+    }
+    // Long random hex / base64-ish blobs (tokens, keys).
+    let alnum: String = trimmed
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '+' || *c == '/' || *c == '=' || *c == '-' || *c == '_')
+        .collect();
+    if alnum.len() >= 32 && alnum.len() * 10 >= trimmed.len() * 9 {
+        let hexish = alnum.chars().all(|c| c.is_ascii_hexdigit());
+        let b64ish = alnum
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=' | '-' | '_'));
+        return hexish || b64ish;
+    }
+    false
+}
+
+/// Redact CLI args that embed secrets (e.g. value after `--token`).
+fn redact_mcp_args(args: &[String]) -> Vec<serde_json::Value> {
+    let mut out = Vec::with_capacity(args.len());
+    let mut redact_next = false;
+    for arg in args {
+        if redact_next {
+            let len = arg.chars().count();
+            let prefix: String = arg.chars().take(8).collect();
+            out.push(serde_json::Value::String(format!("{prefix}…(len={len})")));
+            redact_next = false;
+            continue;
+        }
+        let lower = arg.to_ascii_lowercase();
+        if arg == "--token"
+            || lower == "--authorization"
+            || lower == "--api-key"
+            || lower == "--secret"
+        {
+            out.push(serde_json::Value::String(arg.clone()));
+            redact_next = true;
+            continue;
+        }
+        if let Some((key, val)) = arg.split_once('=') {
+            let key_l = key.to_ascii_lowercase();
+            if key_l.contains("token")
+                || key_l.contains("secret")
+                || key_l.contains("key")
+                || key_l.contains("auth")
+            {
+                out.push(serde_json::Value::String(format!(
+                    "{}={}",
+                    key,
+                    redact_mcp_secret_value(key, val)
+                )));
+                continue;
+            }
+        }
+        if value_looks_like_secret(arg) {
+            let len = arg.chars().count();
+            let prefix: String = arg.chars().take(8).collect();
+            out.push(serde_json::Value::String(format!("{prefix}…(len={len})")));
+        } else {
+            out.push(serde_json::Value::String(arg.clone()));
+        }
+    }
+    out
+}
+
+fn redacted_mcp_server_json(server: &McpServer) -> serde_json::Value {
+    match server {
+        McpServer::Stdio(s) => {
+            let env: serde_json::Map<String, serde_json::Value> = s
+                .env
+                .iter()
+                .map(|e| {
+                    (
+                        e.name.clone(),
+                        serde_json::Value::String(redact_mcp_secret_value(&e.name, &e.value)),
+                    )
+                })
+                .collect();
+            let mut obj = serde_json::Map::new();
+            obj.insert("name".into(), serde_json::Value::String(s.name.clone()));
+            obj.insert(
+                "command".into(),
+                serde_json::Value::String(s.command.display().to_string()),
+            );
+            obj.insert("args".into(), serde_json::Value::Array(redact_mcp_args(&s.args)));
+            obj.insert("env".into(), serde_json::Value::Object(env));
+            // Surface --features from args when present (handy for diagnosis).
+            if let Some(idx) = s.args.iter().position(|a| a == "--features") {
+                if let Some(features) = s.args.get(idx + 1) {
+                    obj.insert(
+                        "features".into(),
+                        serde_json::Value::String(features.clone()),
+                    );
+                }
+            }
+            serde_json::Value::Object(obj)
+        }
+        McpServer::Http(s) => {
+            let headers: serde_json::Map<String, serde_json::Value> = s
+                .headers
+                .iter()
+                .map(|h| {
+                    (
+                        h.name.clone(),
+                        serde_json::Value::String(redact_mcp_secret_value(&h.name, &h.value)),
+                    )
+                })
+                .collect();
+            serde_json::json!({
+                "type": "http",
+                "name": s.name,
+                "url": s.url,
+                "headers": headers,
+            })
+        }
+        McpServer::Sse(s) => {
+            let headers: serde_json::Map<String, serde_json::Value> = s
+                .headers
+                .iter()
+                .map(|h| {
+                    (
+                        h.name.clone(),
+                        serde_json::Value::String(redact_mcp_secret_value(&h.name, &h.value)),
+                    )
+                })
+                .collect();
+            serde_json::json!({
+                "type": "sse",
+                "name": s.name,
+                "url": s.url,
+                "headers": headers,
+            })
+        }
+        _ => serde_json::json!({ "unsupported": "unknown McpServer variant" }),
+    }
+}
+
+
+/// Compact INFO dump of mcpServers with secrets redacted.
+fn log_redacted_mcp_servers_dump(servers: &[McpServer], context: &str) {
+    let dump: Vec<serde_json::Value> = servers.iter().map(redacted_mcp_server_json).collect();
+    let json = serde_json::to_string(&dump).unwrap_or_else(|_| "[]".to_string());
+    tracing::info!("mcpServers inject dump (redacted) [{context}]: {json}");
+}
+
 /// Outcome of injecting the `codeg-mcp` companion: the per-launch token to
 /// stash for revocation, whether feedback was exposed, and an optional ready
 /// lease waiter (required only when the plan exposes Codeg delegation).
@@ -5937,7 +6117,9 @@ async fn inject_codeg_mcp(
         crate::acp::delegation::transport::CompanionRole::Root => "root",
         crate::acp::delegation::transport::CompanionRole::DelegationChild => "delegation_child",
     };
+    let binary_path_for_log = binary_path.display().to_string();
     let mut server = McpServerStdio::new("codeg-mcp", binary_path);
+    let features_for_log = features_arg.clone();
     let mut args = vec![
         "--parent-connection-id".to_string(),
         parent_connection_id.to_string(),
@@ -5972,6 +6154,18 @@ async fn inject_codeg_mcp(
     }
     server = server.args(args);
     servers.push(McpServer::Stdio(server));
+    log_redacted_mcp_servers_dump(servers, "applied");
+    let token_prefix: String = token.chars().take(8).collect();
+    tracing::info!(
+        agent_type = ?agent_type,
+        connection_id = %parent_connection_id,
+        binary_path = %binary_path_for_log,
+        mcp_servers_after = servers.len(),
+        delegation_lease = delegation_lease.is_some(),
+        token_prefix = %token_prefix,
+        features = %features_for_log,
+        "[ACP] inject_codeg_mcp succeeded"
+    );
     Some(CompanionInjection {
         token,
         feedback_available: feedback_enabled,
@@ -6139,6 +6333,29 @@ async fn finish_route_ready(
     if delegation_enabled(route_plan.expose_codeg_delegation, host_tools) || pending_lease.is_some()
     {
         let Some(mut waiter) = pending_lease.take() else {
+            // Antigravity: inject_codeg_mcp is intentionally skipped, so no
+            // companion lease exists. Continue Connected without delegation
+            // instead of failing the shared session as unavailable.
+            // Wire companion unsupported for agy (does not spawn mcpServers);
+            // do not wait on lease. File mcp_config companion deferred.
+            if state.read().await.agent_type == AgentType::Antigravity {
+                tracing::warn!(
+                    "[ACP][Google Antigravity] continuing Connected without delegation after intentional codeg-mcp skip (ready lease missing)"
+                );
+                emit_with_state(
+                    state,
+                    emitter,
+                    AcpEvent::StatusChanged {
+                        status: ConnectionStatus::Connected,
+                    },
+                )
+                .await;
+                let mut guard = route_bootstrap_tx.lock().await;
+                if let Some(tx) = guard.take() {
+                    let _ = tx.send(RouteBootstrapOutcome::Ready);
+                }
+                return Ok(());
+            }
             let mut guard = route_bootstrap_tx.lock().await;
             if let Some(tx) = guard.take() {
                 let _ = tx.send(RouteBootstrapOutcome::RouteSpecific(
@@ -6845,10 +7062,29 @@ async fn run_connection(
             // filter needed. The returned token is stashed on the session
             // state so connection teardown can revoke it. Skipped entirely
             // for agents that don't accept MCP over the wire (above).
+            //
+            // Antigravity: treat wire companion as unsupported. agy ACP does
+            // not spawn session/new.mcpServers, so inject+ready-lease would
+            // hang ~30s waiting for a lease that never arrives. Always skip
+            // inject here; finish_route_ready continues Connected when the
+            // ready-lease is missing for Antigravity. User MCP via
+            // ~/.gemini/config/mcp_config.json is separate; a file-based
+            // companion write was considered and deferred.
             let mut delegate_injection =
-                if agent_supports_mcp && agent_delivers_wire_mcp(agent_type) {
+                if agent_type == AgentType::Antigravity {
+                    tracing::info!(
+                        "[ACP] skipping codeg-mcp inject for Antigravity (agy does not spawn wire mcpServers; companion unsupported)"
+                    );
+                    None
+                } else if agent_supports_mcp && agent_delivers_wire_mcp(agent_type) {
                     if let Some(inj) = delegation_injection.as_ref() {
-                        inject_codeg_mcp(
+                        tracing::info!(
+                            agent_type = ?agent_type,
+                            connection_id = %conn_id,
+                            mcp_servers_before = mcp_servers.len(),
+                            "[ACP] injecting codeg-mcp companion"
+                        );
+                        let injected = inject_codeg_mcp(
                             &mut mcp_servers,
                             inj,
                             &conn_id,
@@ -6861,7 +7097,16 @@ async fn run_connection(
                             delegation_can_spawn_child,
                             workflow_child_mcp_binding.as_ref(),
                         )
-                        .await
+                        .await;
+                        tracing::info!(
+                            agent_type = ?agent_type,
+                            connection_id = %conn_id,
+                            mcp_servers_after = mcp_servers.len(),
+                            delegation_lease = injected.as_ref().map(|i| i.delegation_lease.is_some()),
+                            injected = injected.is_some(),
+                            "[ACP] codeg-mcp companion inject result"
+                        );
+                        injected
                     } else {
                         None
                     }
