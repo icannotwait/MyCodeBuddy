@@ -1,9 +1,11 @@
 ---
 name: brainstorm-to-delivery
-description: Use when a Codeg conversation has an approved or completed Brainstorm artifact and needs the work carried through to a high-quality local delivery.
+description: Use when explicitly requested in Codeg for an approved or completed Brainstorm and the live delegation, binding-query, and admission tools are available. Not for generic DevSpace, read-only audits, or single-agent tasks.
 ---
 
 # Brainstorm to Delivery
+
+**Host admission:** This protocol is **Codeg-only**. Before entering it, read [host-admission.md](references/host-admission.md): it requires the live orchestration tools, treats host agent labels as routing identities rather than provider model IDs, and makes explicit commit authorization a prerequisite in a no-commit host such as GF.
 
 Coordinate delivery through Simple Markdown documents and generic delegation.
 Keep requirement, scope, architecture, and user-data decisions with the user.

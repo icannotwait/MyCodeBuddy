@@ -1,7 +1,13 @@
 import assert from "node:assert/strict"
 import { spawnSync } from "node:child_process"
 import { createHash } from "node:crypto"
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs"
 import { dirname, join } from "node:path"
 import { describe, it } from "node:test"
 import { fileURLToPath } from "node:url"
@@ -25,6 +31,16 @@ import {
 import * as contractLib from "./validate-contract.lib.mjs"
 
 const here = dirname(fileURLToPath(import.meta.url))
+// The shared fingerprint corpus, the shared binding grammar corpus, and the
+// production Plan are Codeg host artifacts outside this skill directory.
+// Mirrors of this skill in other repositories cannot carry them, so the tests
+// that compare against them skip there with an explicit reason. Inside the
+// Codeg repository src-tauri/Cargo.toml always exists, so a deleted fixture
+// still fails loudly instead of skipping.
+const codegHostOnly = existsSync(join(here, "../../../../src-tauri/Cargo.toml"))
+  ? false
+  : "Codeg host-only fixture: src-tauri/Cargo.toml is not at the repository root"
+const codegHostIt = (name, fn) => it(name, { skip: codegHostOnly }, fn)
 const realSkill = readFileSync(join(here, "..", "SKILL.md"), "utf8")
 const planRelPath = "docs/superpowers/plans/example.md"
 const copy = structuredClone
@@ -51,7 +67,7 @@ const TICKET_V1_PENDING_CALL = {
 }
 
 describe("ticket-v1 request fingerprint", () => {
-  it("matches every frozen shared fingerprint vector", () => {
+  codegHostIt("matches every frozen shared fingerprint vector", () => {
     assert.equal(
       typeof contractLib.deriveTicketV1RequestFingerprint,
       "function"
@@ -6680,7 +6696,7 @@ describe("durable route binding derivation", () => {
     )
   })
 
-  it("matches every unchanged shared binding grammar corpus result", () => {
+  codegHostIt("matches every unchanged shared binding grammar corpus result", () => {
     const fixture = JSON.parse(
       readFileSync(
         join(
@@ -6941,7 +6957,7 @@ describe("durable route binding derivation", () => {
     }
   })
 
-  it("derives seven stable non-authorizing bindings from the production Plan", () => {
+  codegHostIt("derives seven stable non-authorizing bindings from the production Plan", () => {
     const productionPlan = readFileSync(
       join(
         here,
