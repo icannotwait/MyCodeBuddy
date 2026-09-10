@@ -5096,7 +5096,7 @@ async fn clear_kimi_model_env(db: &AppDatabase) -> Result<(), AcpError> {
     let setting = agent_setting_service::get_by_agent_type(&db.conn, AgentType::KimiCode)
         .await
         .map_err(|e| AcpError::protocol(e.to_string()))?;
-    let enabled = setting.as_ref().map(|m| m.enabled).unwrap_or(true);
+    let enabled = setting.as_ref().map(|m| m.enabled).unwrap_or(false);
     let model_provider_id = setting.as_ref().and_then(|m| m.model_provider_id);
     let mut env: BTreeMap<String, String> = setting
         .and_then(|m| m.env_json)
@@ -10398,7 +10398,7 @@ pub(crate) async fn acp_get_agent_status_core(
     Ok(crate::acp::types::AcpAgentStatus {
         agent_type,
         available,
-        enabled: setting.map(|m| m.enabled).unwrap_or(true),
+        enabled: setting.map(|m| m.enabled).unwrap_or(false),
         installed_version,
         is_acp_adapter: registry::acp_adapter_relation(agent_type).is_some(),
     })
@@ -10639,7 +10639,7 @@ pub(crate) async fn acp_list_agents_core(db: &AppDatabase) -> Result<Vec<AcpAgen
                 .custom_id()
                 .and_then(crate::acp::custom_registry::source_of)
                 .map(|s| s.as_str().to_string()),
-            enabled: setting.map(|m| m.enabled).unwrap_or(true),
+            enabled: setting.map(|m| m.enabled).unwrap_or(false),
             show_thinking: setting.map(|model| model.show_thinking).unwrap_or(false),
             sort_order,
             installed_version: local_installed_version,

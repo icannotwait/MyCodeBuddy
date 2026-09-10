@@ -82,3 +82,14 @@ src-tauri/resources/codex-acp-seed/
 # executable then sits untracked in the repo root — which is enough to fail a
 # work task's "worktree is clean" check at delivery.
 /rust_out
+
+# Personal one-click setup (local endpoints and API keys)
+scripts/apply-personal-setup.bat
+scripts/apply-personal-setup.ps1
+scripts/apply-personal-setup.py
+scripts/_personal_setup_dump.json
+scripts/_dump_personal_setup.py
+scripts/_schema_peek.py
+scripts/_build_apply_setup.py
+scripts/__pycache__/
+scripts/share/

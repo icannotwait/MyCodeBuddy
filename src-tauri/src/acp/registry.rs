@@ -1187,13 +1187,13 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             // `models` that the composer's selectors and context ring read, and
             // prompting straight after it works. It also skips `session/load`'s
             // history replay, which codeg only drained to discard. The 1.0.1–
-            // 1.0.13 patches add nothing further here: re-probed live against
-            // the 1.0.13 binary, `initialize` still answers
+            // 1.0.25 patches add nothing further here: last re-probed live
+            // against the 1.0.13 binary, `initialize` still answers
             // `sessionCapabilities: {list, resume, close}` plus the same
             // `promptCapabilities.embeddedContext`, so the resume rung stands.
             distribution: AgentDistribution::Npx {
-                version: "1.0.13",
-                package: "@xai-official/grok@1.0.13",
+                version: "1.0.25",
+                package: "@xai-official/grok@1.0.25",
                 cmd: "grok",
                 // Only the ACP subcommand lives here. Grok's ROOT-level launch
                 // flags (`--no-auto-update` always, `--permission-mode <value>`
@@ -1210,7 +1210,7 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
                 // auto/dontAsk/bypassPermissions/plan).
                 args: &["agent", "stdio"],
                 env: &[],
-                // `@xai-official/grok@1.0.13` declares `engines.node: ">=20"`;
+                // `@xai-official/grok@1.0.25` declares `engines.node: ">=20"`;
                 // surface that in preflight so Node 18 isn't silently accepted.
                 node_required: Some("20.0.0"),
             },
@@ -1820,8 +1820,8 @@ mod tests {
         assert_npx_version(AgentType::Pi, "0.0.33", "pi-acp@0.0.33", Some("22.0.0"));
         assert_npx_version(
             AgentType::Grok,
-            "1.0.13",
-            "@xai-official/grok@1.0.13",
+            "1.0.25",
+            "@xai-official/grok@1.0.25",
             Some("20.0.0"),
         );
         assert_npx_version(

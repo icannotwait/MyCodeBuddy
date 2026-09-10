@@ -25,26 +25,11 @@ pub struct AgentSettingsUpdate {
     pub model_provider_id: Option<i32>,
 }
 
-fn default_enabled(agent_type: AgentType) -> bool {
-    matches!(
-        agent_type,
-        AgentType::ClaudeCode
-            | AgentType::Codex
-            | AgentType::Gemini
-            | AgentType::OpenCode
-            | AgentType::Cline
-            | AgentType::Hermes
-            | AgentType::CodeBuddy
-            | AgentType::KimiCode
-            | AgentType::Pi
-            | AgentType::Grok
-            | AgentType::Cursor
-            | AgentType::DeepSeek
-            | AgentType::Qoder
-            | AgentType::Antigravity
-            // A user who just registered a custom agent wants to use it.
-            | AgentType::Custom(_)
-    )
+/// Fresh `agent_setting` rows start disabled. Users opt in from Settings →
+/// Agents. Custom agents follow the same rule so a newly registered agent is
+/// not silently injected into the composer.
+fn default_enabled(_agent_type: AgentType) -> bool {
+    false
 }
 
 pub async fn ensure_defaults(
@@ -300,5 +285,65 @@ mod tests {
         assert_eq!(after.env_json.as_deref(), Some(r#"{"KEEP":"1"}"#));
         assert_eq!(after.sort_order, 3);
         assert_eq!(after.model_provider_id, None);
+    }
+
+    #[tokio::test]
+    async fn new_agent_rows_default_to_disabled() {
+        let db = fresh_in_memory_db().await;
+        let defaults = [
+            AgentDefaultInput {
+                agent_type: AgentType::Grok,
+                registry_id: "grok-build".to_string(),
+                default_sort_order: 0,
+            },
+            AgentDefaultInput {
+                agent_type: AgentType::Codex,
+                registry_id: "codex-acp".to_string(),
+                default_sort_order: 1,
+            },
+            AgentDefaultInput {
+                agent_type: AgentType::Custom("mine"),
+                registry_id: "custom:mine".to_string(),
+                default_sort_order: 2,
+            },
+        ];
+        ensure_defaults(&db.conn, &defaults)
+            .await
+            .expect("ensure defaults");
+
+        for agent in [AgentType::Grok, AgentType::Codex, AgentType::Custom("mine")] {
+            let row = get_by_agent_type(&db.conn, agent)
+                .await
+                .expect("read")
+                .expect("agent row");
+            assert!(
+                !row.enabled,
+                "{agent:?} must default to disabled on first insert"
+            );
+        }
+
+        // Re-running must not flip an explicit enable back off.
+        update(
+            &db.conn,
+            AgentType::Grok,
+            AgentSettingsUpdate {
+                enabled: true,
+                env_json: None,
+                model_provider_id: None,
+            },
+        )
+        .await
+        .expect("enable grok");
+        ensure_defaults(&db.conn, &defaults)
+            .await
+            .expect("ensure defaults again");
+        let grok = get_by_agent_type(&db.conn, AgentType::Grok)
+            .await
+            .expect("read grok")
+            .expect("grok row");
+        assert!(
+            grok.enabled,
+            "ensure_defaults must not clobber existing rows"
+        );
     }
 }
