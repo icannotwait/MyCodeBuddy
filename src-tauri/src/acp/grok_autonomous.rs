@@ -25,7 +25,7 @@ use crate::parsers::grok::{
     grok_autonomous_terminal_match, grok_autonomous_turn_from_segment, grok_autonomous_turn_id,
     grok_complete_records, grok_record_payload, grok_reminder_task_ids,
     grok_task_completed_prompt_task_id, is_grok_background_task_reminder,
-    GrokAutonomousTerminalMatch,
+    is_grok_monitor_event_trigger, GrokAutonomousTerminalMatch,
 };
 
 /// Connection-loop ownership of the dispatch currently being observed.
@@ -669,7 +669,12 @@ impl GrokAutonomousAdapter {
             return GrokDispatchClaim::Unclaimed;
         }
 
-        if !is_legacy_reminder && !matches_settled && !adjacent {
+        // A wake needs completion evidence (settled or adjacent) — except the
+        // Grok 4.6 `<monitor-event>`, which by contract arrives *before* its
+        // `task_completed`. `<system-reminder>` shapes always follow theirs, so
+        // one without evidence is a replay and stays unclaimed.
+        let precedes_completion = is_grok_monitor_event_trigger(text);
+        if !precedes_completion && !matches_settled && !adjacent {
             return GrokDispatchClaim::Unclaimed;
         }
 
@@ -883,16 +888,16 @@ impl GrokAutonomousAdapter {
                     .iter()
                     .any(|id| id == &task_id));
         // Empty wake_generations means the episode opened from a pre-completion
-        // trigger (`<monitor-event>`). `will_wake=true` confirms it. A later
-        // completion for an already-generationed episode is a new cycle.
+        // trigger (`<monitor-event>`). `will_wake=true` confirms it, so the
+        // episode stays open for the notification wake. The generation is NOT
+        // handed to that episode: Grok 4.6 answers the same completion a second
+        // time through the legacy `<system-reminder>` wake, which must still
+        // find this generation live (and not tombstoned) to open its own
+        // episode. A later completion for an already-generationed episode is a
+        // new cycle and supersedes the unstarted trigger.
         let confirming_precompletion_trigger =
             will_wake == Some(true) && self.episode.wake_generations.is_empty();
-        if supersedes_unstarted_episode && confirming_precompletion_trigger {
-            self.episode.wake_generations.push(WakeGeneration {
-                id: task_id.clone(),
-                generation,
-            });
-        } else if supersedes_unstarted_episode {
+        if supersedes_unstarted_episode && !confirming_precompletion_trigger {
             self.episode = Episode::dormant();
         }
         self.expected_wakes.retain(|wake| wake.id != task_id);
@@ -3558,10 +3563,7 @@ mod tests {
             "task_snapshot":{"task_id":"01a08ae8-53f7-7201-81a5-e3288f84d2a2"},
             "will_wake":true
         });
-        append_line(
-            &path,
-            &jsonl_update("_x.ai/session/update", &completed, 5),
-        );
+        append_line(&path, &jsonl_update("_x.ai/session/update", &completed, 5));
         adapter.on_raw_dispatch(
             "_x.ai/session/update",
             &json!({"update":completed}),
@@ -3574,19 +3576,170 @@ mod tests {
 
         let wake = agent_text_update("build done");
         append_line(&path, &jsonl_update("session/update", &wake, 6));
-        let wake_claim = adapter.on_raw_dispatch(
-            "session/update",
-            &json!({"update":wake}),
-            Ownership::Idle,
-        );
+        let wake_claim =
+            adapter.on_raw_dispatch("session/update", &json!({"update":wake}), Ownership::Idle);
         assert_eq!(wake_claim, GrokDispatchClaim::AutonomousContent);
         let emitted = adapter.take_emitted();
+        let first_wake = emitted
+            .turns
+            .iter()
+            .find(|turn| {
+                turn.autonomous_origin == Some(AutonomousTurnOrigin::BackgroundTask)
+                    && turn.blocks.iter().any(
+                        |block| matches!(block, ContentBlock::Text { text } if text == "build done"),
+                    )
+            })
+            .expect("monitor-event wake is emitted as an autonomous turn");
+        let first_wake_id = first_wake.id.clone();
+
+        // The notification wake ends with `prompt_id: notifications-<uuid>`
+        // (no task id). It must close this episode: otherwise `autonomous_busy`
+        // pins the prompt gate until the keepalive expiry.
+        let notification_terminal = json!({
+            "sessionUpdate":"turn_completed",
+            "prompt_id":"notifications-01a08b02-4afa-7d43-a7d5-733da8268946",
+            "stop_reason":"end_turn"
+        });
+        append_line(
+            &path,
+            &jsonl_update("_x.ai/session/update", &notification_terminal, 7),
+        );
+        let terminal_claim = adapter.on_raw_dispatch(
+            "_x.ai/session/update",
+            &json!({"update":notification_terminal}),
+            Ownership::Idle,
+        );
+        assert!(terminal_claim.is_idle_terminal());
+        assert!(
+            !adapter.autonomous_busy(),
+            "notifications-* terminal must close the monitor-event episode"
+        );
+        assert!(!should_hold_prompt(Some(&adapter)));
+        let emitted = adapter.take_emitted();
         assert!(emitted.turns.iter().any(|turn| {
-            turn.autonomous_origin == Some(AutonomousTurnOrigin::BackgroundTask)
+            turn.id == first_wake_id
+                && turn.completed_at.is_some()
                 && turn.blocks.iter().any(
                     |block| matches!(block, ContentBlock::Text { text } if text == "build done"),
                 )
         }));
+
+        // Grok then answers the same completion again through the legacy
+        // `<system-reminder>` wake. That is a second, distinct episode.
+        let reminder = json!({
+            "sessionUpdate":"user_message_chunk",
+            "content":{"type":"text","text":"<system-reminder>\nMonitor \"01a08ae8-53f7-7201-81a5-e3288f84d2a2\" ended: [monitor ended: exited (code 0)].\nDescription: Watch Windows Tauri build until completion\n</system-reminder>"},
+            "_meta":{"hideFromScrollback":true,"promptIndex":2}
+        });
+        append_line(&path, &jsonl_update("session/update", &reminder, 8));
+        let reminder_claim = adapter.on_raw_dispatch(
+            "session/update",
+            &json!({"update":reminder}),
+            Ownership::Idle,
+        );
+        assert_eq!(
+            reminder_claim,
+            GrokDispatchClaim::AutonomousContent,
+            "the legacy reminder for the same completion must open a second episode"
+        );
+        assert!(adapter.autonomous_busy());
+
+        let second_wake = agent_text_update("monitor ended");
+        append_line(&path, &jsonl_update("session/update", &second_wake, 9));
+        let second_wake_claim = adapter.on_raw_dispatch(
+            "session/update",
+            &json!({"update":second_wake}),
+            Ownership::Idle,
+        );
+        assert_eq!(second_wake_claim, GrokDispatchClaim::AutonomousContent);
+        let emitted = adapter.take_emitted();
+        assert!(emitted.turns.iter().any(|turn| {
+            turn.autonomous_origin == Some(AutonomousTurnOrigin::BackgroundTask)
+                && turn.id != first_wake_id
+                && turn.blocks.iter().any(
+                    |block| matches!(block, ContentBlock::Text { text } if text == "monitor ended"),
+                )
+        }));
+
+        let task_terminal = json!({
+            "sessionUpdate":"turn_completed",
+            "prompt_id":"task-completed-01a08ae8-53f7-7201-81a5-e3288f84d2a2",
+            "stop_reason":"end_turn"
+        });
+        append_line(
+            &path,
+            &jsonl_update("_x.ai/session/update", &task_terminal, 10),
+        );
+        let task_terminal_claim = adapter.on_raw_dispatch(
+            "_x.ai/session/update",
+            &json!({"update":task_terminal}),
+            Ownership::Idle,
+        );
+        assert!(task_terminal_claim.is_idle_terminal());
+        assert!(!adapter.autonomous_busy());
+        let emitted = adapter.take_emitted();
+        let second = emitted
+            .turns
+            .iter()
+            .rev()
+            .find(|turn| {
+                turn.autonomous_origin == Some(AutonomousTurnOrigin::BackgroundTask)
+                    && turn.blocks.iter().any(
+                        |block| matches!(block, ContentBlock::Text { text } if text == "monitor ended"),
+                    )
+            })
+            .expect("legacy reminder wake is closed as its own autonomous turn");
+        assert_ne!(second.id, first_wake_id);
+        assert!(second.completed_at.is_some());
+        assert!(!second.blocks.iter().any(
+            |block| matches!(block, ContentBlock::Text { text } if text.contains("build done"))
+        ));
+    }
+
+    /// The pre-completion admission is specific to `<monitor-event>`. A
+    /// verified `<system-reminder>` always follows its `task_completed`, so one
+    /// arriving with no settled/adjacent evidence is a replay and must not open
+    /// an episode (which would pin the prompt gate on a wake that never comes).
+    #[test]
+    fn system_reminder_without_completion_evidence_stays_unclaimed() {
+        let (_dir, path) = tmp_updates("");
+        for (update, timestamp) in [
+            (agent_text_update("started"), 1),
+            (turn_completed_update(), 2),
+        ] {
+            append_line(&path, &jsonl_update("session/update", &update, timestamp));
+        }
+        let mut adapter = GrokAutonomousAdapter::new_for_test(path.clone());
+        adapter.on_session_ready("session-replay", &path);
+
+        append_line(
+            &path,
+            &jsonl_update("session/update", &hidden_trigger_update(), 3),
+        );
+        let claim = adapter.on_raw_dispatch(
+            "session/update",
+            &json!({"update":hidden_trigger_update()}),
+            Ownership::Idle,
+        );
+        assert_eq!(claim, GrokDispatchClaim::Unclaimed);
+        assert!(!adapter.autonomous_busy());
+        assert!(!should_hold_prompt(Some(&adapter)));
+
+        // A monitor-event for a task with the same lack of evidence is the
+        // pre-completion trigger and is admitted.
+        let monitor_event = json!({
+            "sessionUpdate":"user_message_chunk",
+            "content":{"type":"text","text":"<monitor-event task_id=\"mon-1\">\n[watch] DONE\n</monitor-event>"},
+            "_meta":{"hideFromScrollback":true}
+        });
+        append_line(&path, &jsonl_update("session/update", &monitor_event, 4));
+        let claim = adapter.on_raw_dispatch(
+            "session/update",
+            &json!({"update":monitor_event}),
+            Ownership::Idle,
+        );
+        assert_eq!(claim, GrokDispatchClaim::AutonomousContent);
+        assert!(adapter.autonomous_busy());
     }
 
     #[test]

@@ -829,6 +829,22 @@ pub(crate) fn grok_reminder_task_ids(text: &str) -> Vec<String> {
     ids
 }
 
+/// Whether `text` is a Grok 4.6 `<monitor-event>` terminal body. Unlike the
+/// `<system-reminder>` completion templates, this trigger is injected *before*
+/// its `task_completed`, so a live observer has no settled/adjacent completion
+/// evidence yet when it arrives.
+pub(crate) fn is_grok_monitor_event_trigger(text: &str) -> bool {
+    grok_monitor_event_task_id(text.trim()).is_some()
+}
+
+/// `turn_completed.prompt_id` of a Grok 4.6 notification wake (the turn that
+/// answers a `<monitor-event>`): `notifications-<uuid>`.
+fn is_grok_notification_prompt_id(prompt_id: &str) -> bool {
+    prompt_id
+        .strip_prefix("notifications-")
+        .is_some_and(|rest| !rest.is_empty())
+}
+
 /// Grok 4.6 hidden wake: `<monitor-event task_id="…">[desc] DONE</monitor-event>`.
 /// Terminal statuses match the monitor tool contract (DONE / FAILED / CANCELLED).
 fn grok_monitor_event_task_id(text: &str) -> Option<String> {
@@ -894,17 +910,31 @@ pub(crate) enum GrokAutonomousTerminalMatch<'a> {
     Task(&'a str),
 }
 
+/// Classify a `turn_completed` as the terminal of an autonomous wake.
+///
+/// - `prompt_id: "task-completed-<task_id>"` names the task; it must be one of
+///   the episode's expected ids.
+/// - No `prompt_id` is the pre-`will_wake` promptless terminal; it only closes a
+///   singleton episode that opened without structured wake evidence.
+/// - `prompt_id: "notifications-<uuid>"` closes a Grok 4.6 `<monitor-event>`
+///   wake. It carries no task id, and that trigger always precedes its own
+///   `task_completed`, so the episode it opened is always a legacy-fallback
+///   singleton — the same admission rule as the promptless shape.
 pub(crate) fn grok_autonomous_terminal_match<'a>(
     update: &'a Value,
     task_ids: &[String],
     candidate_task_ids: &[String],
     allow_legacy_terminal: bool,
 ) -> Option<GrokAutonomousTerminalMatch<'a>> {
+    let legacy_singleton =
+        allow_legacy_terminal && candidate_task_ids.is_empty() && !task_ids.is_empty();
     let Some(prompt_id) = update.get("prompt_id") else {
-        return (allow_legacy_terminal && candidate_task_ids.is_empty() && !task_ids.is_empty())
-            .then_some(GrokAutonomousTerminalMatch::Legacy);
+        return legacy_singleton.then_some(GrokAutonomousTerminalMatch::Legacy);
     };
     let prompt_id = prompt_id.as_str()?;
+    if is_grok_notification_prompt_id(prompt_id) {
+        return legacy_singleton.then_some(GrokAutonomousTerminalMatch::Legacy);
+    }
     let task_id = prompt_id
         .strip_prefix("task-completed-")
         .filter(|task_id| !task_id.is_empty())?;
@@ -2815,7 +2845,19 @@ mod tests {
             "\n",
             r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"build done"}}},"timestamp":6}"#,
             "\n",
-            r#"{"method":"_x.ai/session/update","params":{"sessionId":"s","update":{"sessionUpdate":"turn_completed","prompt_id":"notifications-wake","stop_reason":"end_turn"}},"timestamp":7}"#,
+            // The notification wake ends with `prompt_id: notifications-<uuid>`
+            // (no task id), then Grok also runs the legacy reminder wake.
+            r#"{"method":"_x.ai/session/update","params":{"sessionId":"s","update":{"sessionUpdate":"turn_completed","prompt_id":"notifications-01a08b02-4afa-7d43-a7d5-733da8268946","stop_reason":"end_turn","usage":{"inputTokens":7,"outputTokens":3}}},"timestamp":7}"#,
+            "\n",
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"<system-reminder>\nMonitor \"01a08ae8-53f7-7201-81a5-e3288f84d2a2\" ended: [monitor ended: exited (code 0)].\nDescription: Watch Windows Tauri build until completion\n</system-reminder>"},"_meta":{"hideFromScrollback":true,"promptIndex":2}}},"timestamp":8}"#,
+            "\n",
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"monitor ended"}}},"timestamp":9}"#,
+            "\n",
+            r#"{"method":"_x.ai/session/update","params":{"sessionId":"s","update":{"sessionUpdate":"turn_completed","prompt_id":"task-completed-01a08ae8-53f7-7201-81a5-e3288f84d2a2","stop_reason":"end_turn"}},"timestamp":10}"#,
+            "\n",
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"next prompt"},"_meta":{"promptIndex":3}}},"timestamp":11}"#,
+            "\n",
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"foreground again"}}},"timestamp":12}"#,
             "\n",
         );
         let (_tmp, sessions) = fixture(SUMMARY, updates);
@@ -2828,22 +2870,90 @@ mod tests {
             .iter()
             .filter(|t| matches!(t.role, TurnRole::Assistant))
             .collect();
-        assert_eq!(assistants.len(), 2);
+        assert_eq!(assistants.len(), 4);
         assert!(assistants[0].autonomous_origin.is_none());
         assert!(
             matches!(&assistants[0].blocks[0], ContentBlock::Text { text } if text == "started")
         );
+        // Wake 1 (`<monitor-event>` trigger) is labeled and closed by its own
+        // `notifications-*` terminal: one block, `completed_at` and `usage` set.
         assert_eq!(
             assistants[1].autonomous_origin,
             Some(AutonomousTurnOrigin::BackgroundTask)
         );
         assert!(assistants[1].id.starts_with("grok-autonomous:"));
+        assert_eq!(assistants[1].blocks.len(), 1);
         assert!(
             matches!(&assistants[1].blocks[0], ContentBlock::Text { text } if text == "build done")
         );
+        assert!(assistants[1].completed_at.is_some());
+        assert!(assistants[1].usage.is_some());
+        // Wake 2 (`<system-reminder>` trigger) is its own labeled turn with a
+        // distinct episode id, closed by `task-completed-<id>`.
+        assert_eq!(
+            assistants[2].autonomous_origin,
+            Some(AutonomousTurnOrigin::BackgroundTask)
+        );
+        assert!(assistants[2].id.starts_with("grok-autonomous:"));
+        assert_ne!(assistants[1].id, assistants[2].id);
+        assert!(
+            matches!(&assistants[2].blocks[0], ContentBlock::Text { text } if text == "monitor ended")
+        );
+        assert!(assistants[2].completed_at.is_some());
+        assert!(assistants[3].autonomous_origin.is_none());
+        assert!(
+            matches!(&assistants[3].blocks[0], ContentBlock::Text { text } if text == "foreground again")
+        );
         assert!(!detail.turns.iter().any(|t| t.blocks.iter().any(
-            |b| matches!(b, ContentBlock::Text { text } if text.contains("monitor-event"))
+            |b| matches!(b, ContentBlock::Text { text } if text.contains("monitor-event") || text.contains("system-reminder"))
         )));
+    }
+
+    #[test]
+    fn notification_terminal_closes_only_a_legacy_singleton_episode() {
+        let notification = serde_json::json!({
+            "sessionUpdate": "turn_completed",
+            "prompt_id": "notifications-01a08b02-4afa-7d43-a7d5-733da8268946",
+            "stop_reason": "end_turn"
+        });
+        let task = vec!["mon-1".to_string()];
+        assert_eq!(
+            grok_autonomous_terminal_match(&notification, &task, &[], true),
+            Some(GrokAutonomousTerminalMatch::Legacy)
+        );
+        // Structured episodes still wait for their `task-completed-<id>`.
+        assert_eq!(
+            grok_autonomous_terminal_match(&notification, &task, &[], false),
+            None
+        );
+        // Candidate episodes need a task id to resolve; a notification has none.
+        assert_eq!(
+            grok_autonomous_terminal_match(&notification, &[], &task, true),
+            None
+        );
+        assert_eq!(
+            grok_autonomous_terminal_match(&notification, &[], &[], true),
+            None
+        );
+        let bare_prefix = serde_json::json!({
+            "sessionUpdate": "turn_completed",
+            "prompt_id": "notifications-",
+            "stop_reason": "end_turn"
+        });
+        assert_eq!(
+            grok_autonomous_terminal_match(&bare_prefix, &task, &[], true),
+            None
+        );
+        // A foreground prompt id never closes an autonomous episode.
+        let foreground = serde_json::json!({
+            "sessionUpdate": "turn_completed",
+            "prompt_id": "6d9d57f8-f68a-49f4-bea5-78ac51e0c2cc",
+            "stop_reason": "end_turn"
+        });
+        assert_eq!(
+            grok_autonomous_terminal_match(&foreground, &task, &[], true),
+            None
+        );
     }
 
     #[test]
