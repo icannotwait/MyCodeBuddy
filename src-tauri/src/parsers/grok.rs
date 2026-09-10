@@ -788,11 +788,15 @@ pub(crate) fn is_grok_background_task_reminder(text: &str) -> bool {
     !grok_reminder_task_ids(text).is_empty()
 }
 
-/// Task IDs from the verified Grok Bash and Monitor completion templates.
+/// Task IDs from verified Grok completion templates: `<system-reminder>` Bash /
+/// Monitor lines, and Grok 4.6 `<monitor-event task_id>` terminal bodies.
 /// Does not scan arbitrary English continuation text.
 pub(crate) fn grok_reminder_task_ids(text: &str) -> Vec<String> {
-    let Some(body) = text
-        .trim()
+    let trimmed = text.trim();
+    if let Some(id) = grok_monitor_event_task_id(trimmed) {
+        return vec![id];
+    }
+    let Some(body) = trimmed
         .strip_prefix("<system-reminder>")
         .and_then(|text| text.strip_suffix("</system-reminder>"))
     else {
@@ -823,6 +827,40 @@ pub(crate) fn grok_reminder_task_ids(text: &str) -> Vec<String> {
     ids.sort();
     ids.dedup();
     ids
+}
+
+/// Grok 4.6 hidden wake: `<monitor-event task_id="…">[desc] DONE</monitor-event>`.
+/// Terminal statuses match the monitor tool contract (DONE / FAILED / CANCELLED).
+fn grok_monitor_event_task_id(text: &str) -> Option<String> {
+    let rest = text.strip_prefix("<monitor-event")?;
+    let (attrs, after_open) = rest.split_once('>')?;
+    let body = after_open.trim().strip_suffix("</monitor-event>")?.trim();
+    if !grok_monitor_event_body_is_terminal(body) {
+        return None;
+    }
+    let marker = "task_id=\"";
+    let after_marker = attrs.split(marker).nth(1)?;
+    let id = after_marker.split('"').next()?.trim();
+    if id.is_empty() {
+        return None;
+    }
+    Some(id.to_string())
+}
+
+fn grok_monitor_event_body_is_terminal(body: &str) -> bool {
+    let Some(line) = body
+        .lines()
+        .map(str::trim)
+        .rev()
+        .find(|line| !line.is_empty())
+    else {
+        return false;
+    };
+    let status = line
+        .rsplit_once(']')
+        .map(|(_, rest)| rest.trim())
+        .unwrap_or(line);
+    status == "DONE" || status == "CANCELLED" || status == "FAILED" || status.starts_with("FAILED:")
 }
 
 fn task_completion_wake_disposition(update: &Value) -> Option<(String, Option<bool>)> {
@@ -959,7 +997,14 @@ fn parse_updates_from_bytes_with_context(
                 pending.task_ids.iter().any(|id| id == &task_id)
                     || pending.candidate_task_ids.iter().any(|id| id == &task_id)
             }) {
-                pending_autonomous = None;
+                // Grok 4.6 emits `<monitor-event>` *before* the matching
+                // `will_wake=true` completion. Keep that parked trigger so the
+                // following assistant stays labeled. A later completion for an
+                // id already seen is a new generation and must supersede.
+                let already_completed = recent_completion_ids.contains(&task_id);
+                if will_wake != Some(true) || already_completed {
+                    pending_autonomous = None;
+                }
             }
             expected_wakes.retain(|(id, _)| id != &task_id);
             structured_wake_dispositions.remove(&task_id);
@@ -2129,6 +2174,50 @@ mod tests {
         ));
     }
 
+    /// Grok 4.6 injects monitor completion as `<monitor-event>` *before*
+    /// `task_completed` and the later `<system-reminder> Monitor "id" ended`.
+    /// Session 4972 used this shape; treating it as a wake trigger is what
+    /// keeps the follow-up assistant from merging into the first bubble.
+    #[test]
+    fn monitor_event_terminal_is_a_verified_wake_trigger() {
+        let done = concat!(
+            "<monitor-event task_id=\"01a08ae8-53f7-7201-81a5-e3288f84d2a2\">\n",
+            "[Watch Windows Tauri build until completion] DONE\n",
+            "</monitor-event>",
+        );
+        let failed = concat!(
+            "<monitor-event task_id=\"mon-fail\">\n",
+            "[watch] FAILED\n",
+            "</monitor-event>",
+        );
+        let cancelled = concat!(
+            "<monitor-event task_id=\"mon-cancel\">\n",
+            "[watch] CANCELLED\n",
+            "</monitor-event>",
+        );
+
+        assert_eq!(
+            grok_reminder_task_ids(done),
+            vec!["01a08ae8-53f7-7201-81a5-e3288f84d2a2"]
+        );
+        assert_eq!(grok_reminder_task_ids(failed), vec!["mon-fail"]);
+        assert_eq!(grok_reminder_task_ids(cancelled), vec!["mon-cancel"]);
+        assert!(is_grok_background_task_reminder(done));
+        assert!(!is_grok_background_task_reminder(concat!(
+            "<monitor-event task_id=\"mon-1\">\n",
+            "[watch] running\n",
+            "</monitor-event>",
+        )));
+        assert!(!is_grok_background_task_reminder(concat!(
+            "<monitor-event task_id=\"\">\n",
+            "[watch] DONE\n",
+            "</monitor-event>",
+        )));
+        assert!(!is_grok_background_task_reminder(
+            "[Watch Windows Tauri build until completion] DONE"
+        ));
+    }
+
     #[test]
     fn injected_locator_prefers_one_strict_match_over_loose_matches() {
         let root = tempfile::tempdir().unwrap();
@@ -2705,6 +2794,56 @@ mod tests {
             .find(|t| t.autonomous_origin.is_some())
             .unwrap();
         assert_eq!(auto.id, auto2.id);
+    }
+
+    /// Session 4972 order: hidden `<monitor-event> DONE` arrives *before*
+    /// `task_completed will_wake=true`, then the wake reply. Clearing the
+    /// parked trigger on that completion would leave the wake unlabeled, and
+    /// the UI would fold it into the first assistant bubble.
+    #[test]
+    fn monitor_event_before_task_completed_marks_following_assistant() {
+        let updates = concat!(
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"rebuild windows"},"_meta":{"promptIndex":0}}},"timestamp":1}"#,
+            "\n",
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"started"}}},"timestamp":2}"#,
+            "\n",
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"turn_completed","stop_reason":"end_turn"}},"timestamp":3}"#,
+            "\n",
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"<monitor-event task_id=\"01a08ae8-53f7-7201-81a5-e3288f84d2a2\">\n[Watch Windows Tauri build until completion] DONE\n</monitor-event>"},"_meta":{"hideFromScrollback":true,"promptIndex":1}}},"timestamp":4}"#,
+            "\n",
+            r#"{"method":"_x.ai/session/update","params":{"sessionId":"s","update":{"sessionUpdate":"task_completed","task_snapshot":{"task_id":"01a08ae8-53f7-7201-81a5-e3288f84d2a2"},"will_wake":true}},"timestamp":5}"#,
+            "\n",
+            r#"{"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"build done"}}},"timestamp":6}"#,
+            "\n",
+            r#"{"method":"_x.ai/session/update","params":{"sessionId":"s","update":{"sessionUpdate":"turn_completed","prompt_id":"notifications-wake","stop_reason":"end_turn"}},"timestamp":7}"#,
+            "\n",
+        );
+        let (_tmp, sessions) = fixture(SUMMARY, updates);
+        let detail = GrokParser::with_base_dir(sessions)
+            .get_conversation("019f45e3-e1ef-7690-a29f-fe2554382b49")
+            .unwrap();
+
+        let assistants: Vec<&MessageTurn> = detail
+            .turns
+            .iter()
+            .filter(|t| matches!(t.role, TurnRole::Assistant))
+            .collect();
+        assert_eq!(assistants.len(), 2);
+        assert!(assistants[0].autonomous_origin.is_none());
+        assert!(
+            matches!(&assistants[0].blocks[0], ContentBlock::Text { text } if text == "started")
+        );
+        assert_eq!(
+            assistants[1].autonomous_origin,
+            Some(AutonomousTurnOrigin::BackgroundTask)
+        );
+        assert!(assistants[1].id.starts_with("grok-autonomous:"));
+        assert!(
+            matches!(&assistants[1].blocks[0], ContentBlock::Text { text } if text == "build done")
+        );
+        assert!(!detail.turns.iter().any(|t| t.blocks.iter().any(
+            |b| matches!(b, ContentBlock::Text { text } if text.contains("monitor-event"))
+        )));
     }
 
     #[test]

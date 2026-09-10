@@ -669,7 +669,7 @@ impl GrokAutonomousAdapter {
             return GrokDispatchClaim::Unclaimed;
         }
 
-        if !matches_settled && !adjacent {
+        if !is_legacy_reminder && !matches_settled && !adjacent {
             return GrokDispatchClaim::Unclaimed;
         }
 
@@ -882,7 +882,17 @@ impl GrokAutonomousAdapter {
                     .candidate_task_ids
                     .iter()
                     .any(|id| id == &task_id));
-        if supersedes_unstarted_episode {
+        // Empty wake_generations means the episode opened from a pre-completion
+        // trigger (`<monitor-event>`). `will_wake=true` confirms it. A later
+        // completion for an already-generationed episode is a new cycle.
+        let confirming_precompletion_trigger =
+            will_wake == Some(true) && self.episode.wake_generations.is_empty();
+        if supersedes_unstarted_episode && confirming_precompletion_trigger {
+            self.episode.wake_generations.push(WakeGeneration {
+                id: task_id.clone(),
+                generation,
+            });
+        } else if supersedes_unstarted_episode {
             self.episode = Episode::dormant();
         }
         self.expected_wakes.retain(|wake| wake.id != task_id);
@@ -3500,6 +3510,83 @@ mod tests {
             .find(|turn| turn.autonomous_origin == Some(AutonomousTurnOrigin::BackgroundTask))
             .expect("will_wake=true must be sufficient structured evidence");
         assert!(autonomous.id.contains("+monitor-1+"));
+    }
+
+    /// Session 4972: hidden `<monitor-event>` arrives before `task_completed
+    /// will_wake=true`. The live observer must claim that wake so the
+    /// streaming reducer does not fold it into the first assistant bubble.
+    #[test]
+    fn monitor_event_before_task_completed_emits_autonomous_wake() {
+        let (_dir, path) = tmp_updates("");
+        let user = json!({
+            "sessionUpdate":"user_message_chunk",
+            "content":{"type":"text","text":"rebuild windows"},
+            "_meta":{"promptIndex":0}
+        });
+        let first = agent_text_update("started");
+        let first_terminal = json!({
+            "sessionUpdate":"turn_completed",
+            "stop_reason":"end_turn"
+        });
+        for (method, update, timestamp) in [
+            ("session/update", user, 1),
+            ("session/update", first, 2),
+            ("_x.ai/session/update", first_terminal, 3),
+        ] {
+            append_line(&path, &jsonl_update(method, &update, timestamp));
+        }
+
+        let mut adapter = GrokAutonomousAdapter::new_for_test(path.clone());
+        adapter.on_session_ready("session-4972", &path);
+
+        let monitor_event = json!({
+            "sessionUpdate":"user_message_chunk",
+            "content":{"type":"text","text":"<monitor-event task_id=\"01a08ae8-53f7-7201-81a5-e3288f84d2a2\">\n[Watch Windows Tauri build until completion] DONE\n</monitor-event>"},
+            "_meta":{"hideFromScrollback":true,"promptIndex":1}
+        });
+        append_line(&path, &jsonl_update("session/update", &monitor_event, 4));
+        let monitor_claim = adapter.on_raw_dispatch(
+            "session/update",
+            &json!({"update":monitor_event}),
+            Ownership::Idle,
+        );
+        assert_eq!(monitor_claim, GrokDispatchClaim::AutonomousContent);
+        assert!(adapter.autonomous_busy());
+
+        let completed = json!({
+            "sessionUpdate":"task_completed",
+            "task_snapshot":{"task_id":"01a08ae8-53f7-7201-81a5-e3288f84d2a2"},
+            "will_wake":true
+        });
+        append_line(
+            &path,
+            &jsonl_update("_x.ai/session/update", &completed, 5),
+        );
+        adapter.on_raw_dispatch(
+            "_x.ai/session/update",
+            &json!({"update":completed}),
+            Ownership::Idle,
+        );
+        assert!(
+            adapter.autonomous_busy(),
+            "will_wake=true must not close the unstarted monitor-event episode"
+        );
+
+        let wake = agent_text_update("build done");
+        append_line(&path, &jsonl_update("session/update", &wake, 6));
+        let wake_claim = adapter.on_raw_dispatch(
+            "session/update",
+            &json!({"update":wake}),
+            Ownership::Idle,
+        );
+        assert_eq!(wake_claim, GrokDispatchClaim::AutonomousContent);
+        let emitted = adapter.take_emitted();
+        assert!(emitted.turns.iter().any(|turn| {
+            turn.autonomous_origin == Some(AutonomousTurnOrigin::BackgroundTask)
+                && turn.blocks.iter().any(
+                    |block| matches!(block, ContentBlock::Text { text } if text == "build done"),
+                )
+        }));
     }
 
     #[test]
