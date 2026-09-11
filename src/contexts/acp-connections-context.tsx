@@ -5235,7 +5235,11 @@ function admitTurnComplete(
       runtime.externalId != null
         ? runtime.externalId === event.session_id
         : snapshot.sessionId === event.session_id
-    if (!sessionMatches) continue
+    // Live-message identity is sufficient: a draft/virtual runtime can keep a
+    // stale persisted `externalId` (detail refetch / conversation://changed)
+    // while this connection's current ACP session emitted end_turn. Requiring
+    // both left status stuck on Prompting after a real TurnComplete.
+    if (!runtimeLiveMatches && !sessionMatches) continue
     if (runtime.liveMessage != null && !runtimeLiveMatches) {
       continue
     }

@@ -7984,6 +7984,110 @@ describe("AcpConnectionsProvider frame transactions (raw order)", () => {
     }
   })
 
+  it("settles a late end_turn on a virtual runtime whose persisted external_id is stale", async () => {
+    const { useConversationRuntimeStore, resetConversationRuntimeStore } =
+      await import("@/stores/conversation-runtime-store")
+    resetConversationRuntimeStore()
+    const runtimeActions = useConversationRuntimeStore.getState().actions
+    // Production shape: draft tab streams under a virtual key while the
+    // persisted row (7) already has a prior external_id. A mid-turn detail
+    // refetch / conversation://changed can restamp that stale id onto the
+    // live runtime; turn_complete still carries the current ACP session.
+    const virtualConversationId = -1049581191
+    runtimeActions.setExternalId(virtualConversationId, "stale-persisted-sess")
+    runtimeActions.setDbConversationId(virtualConversationId, 7)
+    runtimeActions.appendOptimisticTurn(
+      virtualConversationId,
+      {
+        id: "user-stale-ext",
+        role: "user",
+        blocks: [{ type: "text", text: "cursor turn" }],
+        timestamp: "2026-09-11T02:26:30.000Z",
+      },
+      "user-stale-ext"
+    )
+    runtimeActions.setExternalId(7, "sess-1")
+
+    try {
+      await mountDesktopOwner("owner-conn", TAB, "sess-1", 7)
+      h.actions!.registerLiveSinks(TAB, {
+        runtimeConversationId: virtualConversationId,
+        canonical: (message, isLive) => {
+          runtimeActions.setLiveMessage(virtualConversationId, message, isLive)
+          return (
+            useConversationRuntimeStore
+              .getState()
+              .byConversationId.get(virtualConversationId)?.liveMessage ===
+            message
+          )
+        },
+      })
+
+      act(() => {
+        h.emitDesktopBatch(
+          batch(1, [
+            {
+              connection_id: "owner-conn",
+              seq: 1,
+              type: "status_changed",
+              status: "prompting",
+            },
+            content("owner-conn", 2, "first content"),
+          ])
+        )
+        h.runAnimationFrame()
+      })
+      expect(h.store!.getConnection(TAB)?.status).toBe("prompting")
+      expect(
+        useConversationRuntimeStore
+          .getState()
+          .byConversationId.get(virtualConversationId)?.liveMessage
+      ).toBeTruthy()
+
+      act(() => {
+        h.emitDesktopBatch(
+          batch(2, [
+            {
+              connection_id: "owner-conn",
+              seq: 3,
+              type: "turn_complete",
+              session_id: "sess-1",
+              stop_reason: "end_turn",
+              mark_awaiting_reply: true,
+            },
+          ])
+        )
+        h.runAnimationFrame()
+      })
+
+      expect(h.store!.getConnection(TAB)?.status).toBe("connected")
+      const virtual = useConversationRuntimeStore
+        .getState()
+        .byConversationId.get(virtualConversationId)
+      expect(virtual?.liveMessage).toBeNull()
+      expect(virtual?.syncState).toBe("idle")
+      expect(virtual?.optimisticTurns).toEqual([])
+      expect(
+        virtual?.localTurns.map((turn) => ({
+          role: turn.role,
+          blocks: turn.blocks,
+        }))
+      ).toEqual([
+        { role: "user", blocks: [{ type: "text", text: "cursor turn" }] },
+        {
+          role: "assistant",
+          blocks: [{ type: "text", text: "first content" }],
+        },
+      ])
+      expect(
+        useConversationRuntimeStore.getState().byConversationId.get(7)
+          ?.liveMessage
+      ).toBeNull()
+    } finally {
+      resetConversationRuntimeStore()
+    }
+  })
+
   it("does not retain a rejected durable alias for cold completion adoption", async () => {
     const { useConversationRuntimeStore, resetConversationRuntimeStore } =
       await import("@/stores/conversation-runtime-store")
