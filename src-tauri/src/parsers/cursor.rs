@@ -11,8 +11,9 @@ use crate::models::{
 };
 use crate::parsers::{
     backfill_turn_durations, compute_session_stats, folder_name_from_path,
-    merge_context_window_stats, relocate_orphaned_tool_results, structurize_read_tool_output,
-    title_from_user_text, truncate_str, visible_user_text, AgentParser, ParseError,
+    merge_context_window_stats, relocate_orphaned_tool_results, select_unique_recovery_match,
+    structurize_read_tool_output, title_from_user_text, truncate_str, visible_user_text,
+    AgentParser, ParseError, RecoveryQuery,
 };
 
 /// Caps mirroring the Grok parser: bound a single tool output / input preview
@@ -288,6 +289,18 @@ impl AgentParser for CursorParser {
             .ok_or_else(|| ParseError::ConversationNotFound(conversation_id.to_string()))?;
         self.build_detail(&chat_dir, conversation_id)
             .ok_or_else(|| ParseError::ConversationNotFound(conversation_id.to_string()))
+    }
+
+    fn recover_conversation(
+        &self,
+        query: &RecoveryQuery<'_>,
+        accept: &dyn Fn(&ConversationSummary) -> bool,
+    ) -> Result<Option<ConversationDetail>, ParseError> {
+        let summaries = self.list_conversations()?;
+        let Some(winner) = select_unique_recovery_match(&summaries, query, accept) else {
+            return Ok(None);
+        };
+        self.get_conversation(&winner.id).map(Some)
     }
 }
 
@@ -2290,6 +2303,15 @@ mod tests {
     /// agent turn. `store_name` controls whether the store meta carries a
     /// `name` (the sidecar `title` is the fallback).
     fn build_acp_fixture(root: &Path, session_id: &str, store_name: Option<&str>) {
+        build_acp_fixture_at(root, session_id, store_name, 1_784_000_000_000);
+    }
+
+    fn build_acp_fixture_at(
+        root: &Path,
+        session_id: &str,
+        store_name: Option<&str>,
+        created_at_ms: u64,
+    ) {
         let session_dir = root.join("acp-sessions").join(session_id);
         std::fs::create_dir_all(&session_dir).unwrap();
         let mut store = StoreBuilder::create(&session_dir.join("store.db"));
@@ -2312,13 +2334,13 @@ mod tests {
 
         let mut state = Vec::new();
         field_bytes(8, &turn_id, &mut state);
-        field_varint(26, 1_784_000_000_000, &mut state);
+        field_varint(26, created_at_ms, &mut state);
         let root_id = store.put_blob(&state);
 
         let mut meta = serde_json::json!({
             "agentId": session_id,
             "latestRootBlobId": hex_encode(&root_id),
-            "createdAt": 1_784_000_000_000_u64,
+            "createdAt": created_at_ms,
         });
         if let Some(name) = store_name {
             meta["name"] = Value::String(name.to_string());
@@ -2362,6 +2384,50 @@ mod tests {
         assert_eq!(
             detail.summary.folder_path.as_deref(),
             Some("/Users/me/acp-proj")
+        );
+    }
+
+    #[test]
+    fn recover_conversation_picks_cwd_time_winner_for_stale_acp_id() {
+        // Codeg sometimes binds an ACP UUID that is not the store directory
+        // name (or leaves the row unbound). Reopen must recover the unique
+        // cwd+time winner instead of painting an empty session.
+        let tmp = tempfile::tempdir().unwrap();
+        let chats = tmp.path().join("chats");
+        std::fs::create_dir_all(&chats).unwrap();
+        build_acp_fixture_at(
+            tmp.path(),
+            "cursor-real-store",
+            Some("Winner"),
+            1_784_000_000_000,
+        );
+        build_acp_fixture_at(
+            tmp.path(),
+            "cursor-far-decoy",
+            Some("Decoy"),
+            1_784_000_000_000 + 20 * 60 * 1000,
+        );
+
+        let parser = CursorParser::with_base_dir(chats);
+        let approx = Utc
+            .timestamp_millis_opt(1_784_000_000_000)
+            .single()
+            .unwrap();
+        let query = crate::parsers::RecoveryQuery {
+            cwd: "/Users/me/acp-proj",
+            approx,
+            max_skew: chrono::Duration::minutes(5),
+            ambiguity: chrono::Duration::seconds(60),
+        };
+        let recovered = parser
+            .recover_conversation(&query, &|_| true)
+            .expect("recover")
+            .expect("stale Cursor ACP id must recover the cwd+time winner");
+        assert_eq!(recovered.summary.id, "cursor-real-store");
+        assert_eq!(recovered.summary.title.as_deref(), Some("Winner"));
+        assert!(
+            !recovered.turns.is_empty(),
+            "recovered session must still show the agent-side turns"
         );
     }
 

@@ -641,6 +641,30 @@ async fn reconcile_orphaned_in_progress_after_turn_complete(
     Ok(())
 }
 
+/// Bind `session_id` onto a live conversation row and re-broadcast the
+/// summary. Shared by `SessionStarted` (row already linked) and
+/// `ConversationLinked` (session already live). See codeg#500: the bind is
+/// guarded so a reminted session cannot silently overwrite history.
+async fn persist_live_external_id(
+    db_conn: &DatabaseConnection,
+    emitter: &EventEmitter,
+    conversation_id: i32,
+    agent_type: AgentType,
+    session_id: &str,
+) -> Result<(), DbError> {
+    let continues = crate::acp::continued_session_ids(agent_type, session_id);
+    let preserved =
+        conversation_service::bind_external_id(db_conn, conversation_id, session_id, &continues)
+            .await?;
+    // The create-time sidebar upsert carried `external_id: null` (no session
+    // yet), so re-broadcast the full summary on `conversation://changed` to
+    // converge every client. Root-only (the helper skips delegation children).
+    crate::commands::conversations::emit_conversation_upsert(emitter, db_conn, conversation_id)
+        .await;
+    crate::commands::conversations::emit_preserved_conversation(emitter, db_conn, preserved).await;
+    Ok(())
+}
+
 pub(crate) async fn handle_event(
     db_conn: &DatabaseConnection,
     manager: &ConnectionManager,
@@ -665,29 +689,36 @@ pub(crate) async fn handle_event(
                 (snap.conversation_id, snap.agent_type)
             };
             if let Some(cid) = conversation_id {
-                // Guarded bind: the row may already be bound to a DIFFERENT
-                // session. That is legitimate for a fork (which has already
-                // inserted the sibling holding the outgoing id, so this is a
-                // plain re-point) and for a custom agent continuing its
-                // conversation under a new session (`continues`), and
-                // destructive otherwise — a session re-minted under a live
-                // binding would otherwise overwrite the id the row's whole
-                // history hangs off. See codeg#500.
-                let continues = crate::acp::continued_session_ids(agent_type, session_id);
-                let preserved =
-                    conversation_service::bind_external_id(db_conn, cid, session_id, &continues)
-                        .await?;
-                // The external_id just landed on the row. The create-time
-                // sidebar upsert carried `external_id: null` (no session yet),
-                // so re-broadcast the full summary on `conversation://changed`
-                // to converge every client. Root-only (the helper skips
-                // delegation children). Best-effort, after the DB write.
-                crate::commands::conversations::emit_conversation_upsert(&emitter, db_conn, cid)
-                    .await;
-                crate::commands::conversations::emit_preserved_conversation(
-                    &emitter, db_conn, preserved,
+                persist_live_external_id(db_conn, &emitter, cid, agent_type, session_id).await?;
+            }
+            Ok(())
+        }
+        AcpEvent::ConversationLinked {
+            conversation_id, ..
+        } => {
+            // UI new-conversation: SessionStarted often fires while
+            // conversation_id is still None, so the arm above skipped the DB
+            // write. The first prompt then links the row. Persist the
+            // already-known live session id here so reopen can find the
+            // agent's store (Cursor 0.30 left rows unbound and showed empty).
+            let Some((state_arc, emitter)) =
+                manager.get_state_and_emitter(&envelope.connection_id).await
+            else {
+                return Ok(());
+            };
+            let (session_id, agent_type) = {
+                let snap = state_arc.read().await;
+                (snap.external_id.clone(), snap.agent_type)
+            };
+            if let Some(session_id) = session_id {
+                persist_live_external_id(
+                    db_conn,
+                    &emitter,
+                    *conversation_id,
+                    agent_type,
+                    &session_id,
                 )
-                .await;
+                .await?;
             }
             Ok(())
         }
@@ -2794,6 +2825,9 @@ async fn connection_worker_loop(
                 conversation_id, ..
             } => {
                 try_cache_link(&mut cache, &manager, &connection_id, *conversation_id).await;
+                // Cache first, then persist: SessionStarted may already have
+                // the live id while this is the first moment a row exists.
+                handle_internal_event_with_retry(&db, &manager, internal, broker.as_ref()).await;
             }
             AcpEvent::StatusChanged {
                 status: ConnectionStatus::Disconnected,
@@ -3427,6 +3461,49 @@ mod tests {
                 crate::acp::delegation::route::RouteCapabilitySnapshot::test_supported(),
             child_pid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         }
+    }
+
+    #[tokio::test]
+    async fn handle_event_conversation_linked_binds_session_started_before_row() {
+        // UI new-conversation: SessionStarted lands while conversation_id is
+        // still None, so the SessionStarted arm skips the DB write. The first
+        // prompt then links the row. If ConversationLinked does not persist
+        // the already-known external_id, reopen shows an empty transcript
+        // even though the agent store still has the turns (Cursor 0.30).
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/test-link-bind").await;
+        let conv = conversation_service::create(&db.conn, folder_id, AgentType::Cursor, None, None)
+            .await
+            .unwrap();
+        assert!(conv.external_id.is_none(), "create leaves the row unbound");
+        let mgr = ConnectionManager::new();
+        {
+            let mut map = mgr.connections.lock().await;
+            let conn = fake_connection_with_state("c-link", Some(conv.id));
+            conn.state.write().await.external_id = Some("cursor-sess-live".into());
+            conn.state.write().await.agent_type = AgentType::Cursor;
+            map.insert("c-link".to_string(), conn);
+        }
+        let env = EventEnvelope {
+            seq: 1,
+            connection_id: "c-link".to_string(),
+            payload: AcpEvent::ConversationLinked {
+                conversation_id: conv.id,
+                folder_id,
+                parent_conversation_id: None,
+                parent_tool_use_id: None,
+            },
+        };
+        handle_event(&db.conn, &mgr, &env, None).await.unwrap();
+        let reloaded = conversation_service::get_by_id(&db.conn, conv.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            reloaded.external_id.as_deref(),
+            Some("cursor-sess-live"),
+            "ConversationLinked must persist the SessionStarted id that the \
+             earlier arm could not write"
+        );
     }
 
     #[tokio::test]

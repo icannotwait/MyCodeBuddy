@@ -1681,6 +1681,30 @@ pub async fn get_folder_conversation_core(
         .await
         .map_err(AppCommandError::from)?;
 
+    let at = summary.agent_type;
+    let ext_id = summary.external_id.clone();
+    let deepseek_env = deepseek_effective_env(conn, at == AgentType::DeepSeek).await?;
+    // Prefer the recorded origin cwd (set when a removed task worktree's
+    // conversations were re-parented) over the current folder's path — the
+    // session file still carries the ORIGINAL cwd, so matching on the new
+    // parent folder would never find it.
+    let cwd_hint = match summary.origin_cwd.clone() {
+        Some(origin) if !origin.trim().is_empty() => Some(origin),
+        _ => folder_service::get_folder_by_id(conn, summary.folder_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|f| f.path),
+    };
+    // Rank against row creation, not last-write: `updated_at` moves
+    // with every turn and can pick a later task in the same cwd.
+    let approx_time = summary.created_at;
+    // Hold the shared discovery lease across the entire direct/fallback
+    // parser boundary so a concurrent register cannot race mid-recovery.
+    let (guard, filter) = registry.shared_filter().await.map_err(|e| {
+        AppCommandError::database_error("Failed to acquire internal session filter")
+            .with_detail(e.to_string())
+    })?;
     let (
         mut turns,
         session_stats,
@@ -1688,41 +1712,58 @@ pub async fn get_folder_conversation_core(
         parsed_title,
         parsed_model,
         transcript_watermark,
-    ) = if let Some(ref ext_id) = summary.external_id {
-        let at = summary.agent_type;
-        let eid = ext_id.clone();
-        let deepseek_env = deepseek_effective_env(conn, at == AgentType::DeepSeek).await?;
-        // Prefer the recorded origin cwd (set when a removed task worktree's
-        // conversations were re-parented) over the current folder's path — the
-        // session file still carries the ORIGINAL cwd, so matching on the new
-        // parent folder would never find it.
-        let cwd_hint = match summary.origin_cwd.clone() {
-            Some(origin) if !origin.trim().is_empty() => Some(origin),
-            _ => folder_service::get_folder_by_id(conn, summary.folder_id)
-                .await
-                .ok()
-                .flatten()
-                .map(|f| f.path),
+    ) = tokio::task::spawn_blocking(move || -> Result<_, AppCommandError> {
+        let _guard = guard;
+        let parser = match build_agent_parser_with_runtime_env(at, &deepseek_env) {
+            Some(parser) => parser,
+            // Unbound DeepSeek rows used to skip the parser entirely. Keep
+            // that empty transcript rather than failing the reopen.
+            None if ext_id.is_none() => {
+                return Ok((vec![], None, None, None, None, None));
+            }
+            None => {
+                return Err(AppCommandError::not_found(
+                    "DeepSeek conversation history is unavailable",
+                )
+                .with_detail("the DeepSeek child home cannot be resolved"));
+            }
         };
-        // Rank against row creation, not last-write: `updated_at` moves
-        // with every turn and can pick a later task in the same cwd.
-        let approx_time = summary.created_at;
-        // Hold the shared discovery lease across the entire direct/fallback
-        // parser boundary so a concurrent register cannot race mid-recovery.
-        let (guard, filter) = registry.shared_filter().await.map_err(|e| {
-            AppCommandError::database_error("Failed to acquire internal session filter")
-                .with_detail(e.to_string())
-        })?;
-        tokio::task::spawn_blocking(move || -> Result<_, AppCommandError> {
-            let _guard = guard;
-            let parser =
-                build_agent_parser_with_runtime_env(at, &deepseek_env).ok_or_else(|| {
-                    AppCommandError::not_found("DeepSeek conversation history is unavailable")
-                        .with_detail("the DeepSeek child home cannot be resolved")
-                })?;
-            match parser.get_conversation(&eid) {
+        let recovered_or_empty = |parser: &dyn AgentParser, missing: Option<&str>| {
+            // Unbound rows (SessionStarted raced ConversationLinked) and
+            // stale ACP UUIDs / session/new fallbacks recover inside one
+            // parser walk using cwd+time bounds. Internals are excluded
+            // before ranking so a hidden nearest row cannot mask a legal
+            // second candidate.
+            if let Some(recovered) =
+                try_recover_stale_session(parser, at, cwd_hint.as_deref(), approx_time, &filter)
+            {
+                let new_id = recovered.summary.id.clone();
+                let title = recovered.summary.title.clone();
+                let model = recovered.summary.model.clone();
+                return Ok((
+                    recovered.turns,
+                    recovered.session_stats,
+                    Some(new_id),
+                    title,
+                    model,
+                    recovered.transcript_watermark,
+                ));
+            }
+            if let Some(eid) = missing {
+                if matches!(at, AgentType::Cline | AgentType::Gemini | AgentType::Cursor) {
+                    tracing::warn!(
+                        agent = ?at,
+                        external_id = %eid,
+                        "[conversations] session file not found; skipping full-list fallback"
+                    );
+                }
+            }
+            Ok((vec![], None, None, None, None, None))
+        };
+        match ext_id.as_deref() {
+            Some(eid) => match parser.get_conversation(eid) {
                 Ok(d) => {
-                    let d = reject_internal_detail(at, &eid, d, &filter)?;
+                    let d = reject_internal_detail(at, eid, d, &filter)?;
                     Ok((
                         d.turns,
                         d.session_stats,
@@ -1733,52 +1774,20 @@ pub async fn get_folder_conversation_core(
                     ))
                 }
                 Err(crate::parsers::ParseError::ConversationNotFound(_)) => {
-                    // ACP UUIDs / Gemini session/new fallback can leave a
-                    // stale external_id. Recover inside one parser walk
-                    // using cwd+time bounds, with internals excluded
-                    // before ranking so a hidden nearest row cannot mask
-                    // a legal second candidate.
-                    if let Some(recovered) = try_recover_stale_session(
-                        parser.as_ref(),
-                        at,
-                        cwd_hint.as_deref(),
-                        approx_time,
-                        &filter,
-                    ) {
-                        let new_id = recovered.summary.id.clone();
-                        let title = recovered.summary.title.clone();
-                        let model = recovered.summary.model.clone();
-                        return Ok((
-                            recovered.turns,
-                            recovered.session_stats,
-                            Some(new_id),
-                            title,
-                            model,
-                            recovered.transcript_watermark,
-                        ));
-                    }
-                    if matches!(at, AgentType::Cline | AgentType::Gemini) {
-                        tracing::warn!(
-                            agent = ?at,
-                            external_id = %eid,
-                            "[conversations] session file not found; skipping full-list fallback"
-                        );
-                    }
-                    Ok((vec![], None, None, None, None, None))
+                    recovered_or_empty(parser.as_ref(), Some(eid))
                 }
                 Err(e) => Err(parse_error_to_app_error(e)),
-            }
-        })
-        .await
-        .map_err(|e| {
-            AppCommandError::task_execution_failed(
-                "Failed to read conversation turns from session file",
-            )
-            .with_detail(e.to_string())
-        })??
-    } else {
-        (vec![], None, None, None, None, None)
-    };
+            },
+            None => recovered_or_empty(parser.as_ref(), None),
+        }
+    })
+    .await
+    .map_err(|e| {
+        AppCommandError::task_execution_failed(
+            "Failed to read conversation turns from session file",
+        )
+        .with_detail(e.to_string())
+    })??;
 
     // If we resolved a different external_id (e.g. ACP UUID → parser branch ID),
     // update the database so future lookups are direct.
