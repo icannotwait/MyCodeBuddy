@@ -7357,8 +7357,11 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             const runtime = runtimeState.byConversationId.get(
               runtimeConversationId
             )
+            if (!runtime) {
+              continue
+            }
             if (
-              !liveMessageOwnsSameTurn(runtime?.liveMessage, finalLiveMessage)
+              !liveMessageOwnsSameTurn(runtime.liveMessage, finalLiveMessage)
             ) {
               continue
             }
