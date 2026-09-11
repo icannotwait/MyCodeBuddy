@@ -3214,15 +3214,6 @@ impl ConnectionManager {
         self.continuation_store.get().cloned()
     }
 
-    /// Test-only constructor that overrides the spawn-handshake timeout.
-    /// Production code should use `new()`.
-    #[cfg(test)]
-    fn with_spawn_handshake_timeout(timeout: Duration) -> Self {
-        let mut manager = Self::new();
-        manager.spawn_handshake_timeout = timeout;
-        manager
-    }
-
     /// Insert a synthetic `AgentConnection` for tests that need to exercise
     /// downstream code (attach, event broadcast, conversation linking)
     /// without spawning a real agent process. The returned connection is

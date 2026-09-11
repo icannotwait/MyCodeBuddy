@@ -196,7 +196,6 @@ import {
   mergeAsyncTasks,
   upsertAsyncTask,
 } from "@/lib/async-tasks"
-import { contentBlocksFromUserMessage } from "@/lib/user-message-blocks"
 import { getAgentLabel } from "@/lib/custom-agents"
 import {
   CONNECTION_IDLE_TIMEOUT_MS,
