@@ -1065,8 +1065,8 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             name: "CodeBuddy",
             description: "Tencent Cloud's official AI coding assistant (ACP)",
             distribution: AgentDistribution::Npx {
-                version: "2.143.0",
-                package: "@tencent-ai/codebuddy-code@2.143.0",
+                version: "2.148.0",
+                package: "@tencent-ai/codebuddy-code@2.148.0",
                 cmd: "codebuddy",
                 args: &["--acp"],
                 env: &[],
@@ -1799,8 +1799,8 @@ mod tests {
         assert_npx_version(AgentType::Cline, "3.0.61", "cline@3.0.61", Some("22.0.0"));
         assert_npx_version(
             AgentType::CodeBuddy,
-            "2.143.0",
-            "@tencent-ai/codebuddy-code@2.143.0",
+            "2.148.0",
+            "@tencent-ai/codebuddy-code@2.148.0",
             Some("22.0.0"),
         );
         // Kimi Code must never land on 0.37.0–0.38.0: every session in that
